@@ -1,0 +1,22 @@
+[package]
+name = "rustllama-tokenizer"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Tokenizer wrapper around the HuggingFace `tokenizers` crate."
+
+[dependencies]
+tokenizers.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+minijinja.workspace = true
+minijinja-contrib.workspace = true
+rustllama-gguf = { path = "../rustllama-gguf", default-features = false }
+
+[dev-dependencies]
+rustllama-gguf = { path = "../rustllama-gguf", features = ["synth"] }

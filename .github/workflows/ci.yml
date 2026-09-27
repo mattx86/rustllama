@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # The compute kernels are real-only: `rustllama-kernels-sycl` needs Intel
+  # oneAPI (icx/icpx) and `rustllama-kernels-cuda` needs the CUDA Toolkit
+  # (nvcc), so the GPU-dependent crates (models, engine, server, cli, app,
+  # tuner — and safetensors/rag/client/lsp which pull them) can't build on a
+  # plain runner. This job checks/tests the crates with NO GPU-toolchain
+  # dependency; `cargo fmt` still covers every crate. The full workspace
+  # (incl. the GPU crates) is validated on a Windows box with both oneAPI
+  # and the CUDA Toolkit installed, and in the scripts/Dockerfile.linux-gpu
+  # image (which carries both toolchains).
+  cargo-check:
+    runs-on: windows-latest
+    env:
+      # The 8 crates with no transitive kernels-sycl / kernels-cuda dep.
+      FREE_CRATES: >-
+        -p rustllama-config -p rustllama-tensor -p rustllama-tokenizer
+        -p rustllama-gguf -p rustllama-kernels-cpu -p rustllama-l0-sys
+        -p rustllama-runtime -p rustllama-hub
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt (all crates)
+        run: cargo fmt --all -- --check
+      - name: cargo check (toolchain-free crates)
+        run: cargo check ${{ env.FREE_CRATES }}
+      # Clippy runs informationally (does not fail CI): the tree still
+      # carries many style lints. Once those are cleaned up, add
+      # `-- -D warnings` to make this a gate.
+      - name: cargo clippy (toolchain-free crates)
+        run: cargo clippy --all-targets ${{ env.FREE_CRATES }}
+      - name: cargo test (toolchain-free crates)
+        run: cargo test --lib ${{ env.FREE_CRATES }}
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: app/ui/pnpm-lock.yaml
+      - name: install
+        working-directory: app/ui
+        run: pnpm install --frozen-lockfile
+      - name: build
+        working-directory: app/ui
+        run: pnpm build

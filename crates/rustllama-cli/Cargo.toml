@@ -1,0 +1,70 @@
+[package]
+name = "rustllama-cli"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Clap-based CLI subcommand library for rustllama (no main; dispatched from app/src-tauri)."
+
+[features]
+# All ON by default so plain builds and the shipped GUI binary are
+# unchanged; the slim server build (`scripts\build-slim-server.bat`)
+# passes `--no-default-features` to drop them.
+default = ["encoder", "history", "tree-sitter", "tui"]
+# `rustllama quantize` / GPU IQ encode. Gates the clap subcommand and
+# the gguf encode-side tables (~3-6 MB .text).
+encoder = ["rustllama-gguf/encoder", "rustllama-kernels-sycl/encoder", "rustllama-engine/kv-bias-write"]
+# Conversation-history sqlite store (GUI Chat sidebar + `rustllama
+# conv`). ~10.9 MB of bundled sqlite in the static binary.
+history = ["rustllama-server/history"]
+# Code-aware RAG chunking grammars (rust + python, ~300 KB each).
+tree-sitter = ["rustllama-server/tree-sitter"]
+# Full-screen ncurses-style TUI for `rustllama chat --tui` (ratatui +
+# crossterm, pure-Rust, cross-platform). Dropped by the slim server.
+tui = ["dep:ratatui"]
+
+[dependencies]
+tokio.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+futures.workspace = true
+indicatif.workspace = true
+rustyline.workspace = true
+# Full-screen chat TUI (`chat --tui`). Brings crossterm (re-exported as
+# `ratatui::crossterm`) for the terminal backend + input events.
+ratatui = { version = "0.29", optional = true }
+rustllama-config = { path = "../rustllama-config" }
+rustllama-runtime = { path = "../rustllama-runtime" }
+rustllama-hub = { path = "../rustllama-hub" }
+rustllama-server = { path = "../rustllama-server" }
+rustllama-engine = { path = "../rustllama-engine" }
+rustllama-client = { path = "../rustllama-client" }
+rustllama-lsp = { path = "../rustllama-lsp" }
+rustllama-tuner = { path = "../rustllama-tuner" }
+rustllama-gguf = { path = "../rustllama-gguf", default-features = false }
+# `doctor --sycl-smoke` round-trips f32 ↔ f16 to drive the SYCL kernel.
+half.workspace = true
+# kernels-sycl: real-only, always compiled — its C++ TU is built by
+# icx/icpx on every build, so `device_count()` reflects the real
+# hardware. Requires Intel oneAPI on PATH.
+rustllama-kernels-sycl = { path = "../rustllama-kernels-sycl", default-features = false }
+# kernels-cuda: real-only, always compiled — its .cu TU is built by
+# nvcc on every build (requires the CUDA toolkit on PATH), so
+# `device_count()` reflects the real NVIDIA hardware. Native CUDA
+# compute backend surface; `doctor --cuda-parity` exercises it.
+rustllama-kernels-cuda = { path = "../rustllama-kernels-cuda" }
+# Threads sweep installs the rayon thread pool at engine load; the
+# CPU kernels crate owns the actual `install_thread_pool` entrypoint.
+rustllama-kernels-cpu = { path = "../rustllama-kernels-cpu" }
+
+[dev-dependencies]
+rustllama-gguf = { path = "../rustllama-gguf", features = ["synth"] }

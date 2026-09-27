@@ -1,0 +1,21 @@
+[package]
+name = "rustllama-lsp"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Language Server Protocol bridge for rustllama — exposes the FIM completion endpoint as textDocument/inlineCompletion + textDocument/completion so Helix, Zed, Neovim, and other LSP-capable editors can use rustllama as an AI inline-completion provider."
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rustllama-client = { path = "../rustllama-client" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

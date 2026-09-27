@@ -1,0 +1,79 @@
+[package]
+name = "rustllama"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "rustllama — local LLM runtime for Intel (SYCL) + NVIDIA (CUDA) + CPU (CLI + server + GUI)."
+build = "build.rs"
+
+[[bin]]
+name = "rustllama"
+path = "src/main.rs"
+
+[features]
+# All three compute backends — SYCL (Intel), CUDA (NVIDIA), CPU — are
+# ALWAYS compiled into the binary; there are no `sycl`/`cuda` build
+# features. Startup device detection selects which to run (or all).
+# Building therefore always requires Intel oneAPI (`icx`/`icpx`) AND the
+# CUDA Toolkit (`nvcc`). See the `rustllama-kernels-{sycl,cuda}` deps.
+#
+# encoder/history/tree-sitter default ON: plain builds and the shipped
+# GUI binary are unchanged. `scripts\build-slim-server.bat` passes
+# `--no-default-features` to drop them (server-only deployment: no
+# quantizer tables, no bundled sqlite, no tree-sitter grammars, no GUI).
+default = ["encoder", "history", "tree-sitter", "tui"]
+# `rustllama quantize` + the GUI's quantize_model command.
+encoder = ["rustllama-gguf/encoder", "rustllama-cli/encoder"]
+# Conversation-history sqlite store (GUI Chat sidebar, `rustllama conv`).
+history = ["rustllama-cli/history"]
+# Code-aware RAG chunking grammars.
+tree-sitter = ["rustllama-cli/tree-sitter"]
+# Full-screen chat TUI (`rustllama chat --tui`; ratatui + crossterm).
+tui = ["rustllama-cli/tui"]
+# Enables the Tauri GUI subcommand. Requires Node 20+ and pnpm (see app/ui).
+# Implies `encoder`: the GUI's quantize_model command drives the
+# gguf encode pipeline directly.
+gui = ["encoder", "dep:tauri", "dep:tauri-build", "dep:reqwest", "dep:serde", "dep:serde_json", "dep:futures"]
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rustllama-cli = { path = "../../crates/rustllama-cli", default-features = false }
+rustllama-runtime = { path = "../../crates/rustllama-runtime" }
+# The GUI's `quantize_model` Tauri command drives the pipeline directly.
+rustllama-gguf = { path = "../../crates/rustllama-gguf", default-features = false }
+# Used directly by `run_gui` for the startup SYCL device-probe log
+# (so the user can see "GPU detected: ... driver_ver ... vram_mb"
+# the moment the GUI process boots). Real-only, always compiled —
+# requires Intel oneAPI (`icx`/`icpx`) at build time.
+rustllama-kernels-sycl = { path = "../../crates/rustllama-kernels-sycl", default-features = false }
+# NVIDIA CUDA compute kernels — real-only, always compiled into the
+# binary (needs the CUDA Toolkit `nvcc` at build time; only the NVIDIA
+# driver at runtime, since the kernels + static cudart are linked in).
+rustllama-kernels-cuda = { path = "../../crates/rustllama-kernels-cuda" }
+
+# GUI integration — gated behind feature `gui` so phase-0 builds work without
+# Node or the Tauri frontend dist dir.
+tauri = { workspace = true, optional = true, features = ["tray-icon", "image-ico"] }
+# Tiny HTTP client used by the IPC command adapters — `tauri::command`
+# fns can't run the React frontend's `fetch`, so commands that need to
+# proxy to the embedded HTTP server (e.g. `list_models`, `start_tune`)
+# go through this client. `default-features = false` keeps the dep
+# footprint small; `rustls-tls` so the binary doesn't drag in OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"], optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+# `futures::StreamExt::next` for reading SSE chunks from reqwest's
+# byte stream inside the `stream_chat` Tauri command. Gated behind
+# the gui feature so non-GUI builds skip the dep.
+futures = { workspace = true, optional = true }
+
+[build-dependencies]
+tauri-build = { workspace = true, optional = true }

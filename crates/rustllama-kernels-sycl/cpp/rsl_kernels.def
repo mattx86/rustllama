@@ -1,0 +1,158 @@
+; Module-definition file for rsl_kernels.dll.
+;
+; Lists every extern "C" function the DLL exports for consumption by
+; the Rust crate's FFI shims. Needed because we build the DLL with
+; icx (clang-cl mode) without per-declaration `__declspec(dllexport)`
+; — the linker uses this file to populate the export table + import
+; lib (.lib) for downstream Rust consumers.
+;
+; KEEP IN SYNC with the function list in `include/rsl_kernels.h`.
+; If a new entry is added there, add it here too. The build will
+; fail loudly at the Rust-side link step (`error LNK2019: unresolved
+; external symbol rsl_xxx`) if anything is missing.
+
+LIBRARY rsl_kernels
+EXPORTS
+    ; Stream / device lifecycle
+    rsl_stream_create
+    rsl_stream_destroy
+    rsl_stream_backend
+    rsl_stream_sycl_queue
+    rsl_stream_sycl_device
+    rsl_stream_sycl_context
+    rsl_sycl_device_count
+    rsl_sycl_device_info
+    rsl_consume_error_count
+    rsl_consume_last_l0_import_code
+    rsl_consume_last_usm_alloc_diag
+    rsl_get_last_error_message
+
+    ; USM allocation
+    rsl_usm_alloc_shared
+    rsl_usm_free
+    rsl_usm_alloc_device_from_host
+
+    ; Host-pointer kernels
+    rsl_gemm_f16
+    rsl_gemm_q4k_f16
+    rsl_gemm_q8_0_f16
+    rsl_rmsnorm
+    rsl_rope
+    rsl_softmax_attn
+    rsl_silu_mul
+    rsl_embedding_lookup
+    rsl_sample_argmax
+
+    ; NVFP4
+    rsl_dequant_nvfp4
+    rsl_matvec_nvfp4_f16
+
+    ; USM-resident kernels
+    rsl_rmsnorm_usm
+    rsl_rmsnorm_residual_usm
+    rsl_add_rmsnorm_usm
+    rsl_add_rmsnorm_f32_usm
+    rsl_flash_attn_decode_usm
+    rsl_flash_attn_decode_v2_usm
+    rsl_flash_attn_decode_v3_usm
+    rsl_flash_attn_prefill_usm
+    rsl_flash_attn_prefill_v2_usm
+    rsl_flash_attn_prefill_v3_usm
+    rsl_gemm_f16_usm
+    rsl_matvec_q8_0_f32_usm
+    rsl_matvec_q8_0_packed_f32_usm
+    rsl_matvec_q4_k_packed_f32_usm
+    rsl_matvec_ptq1_0_packed_f32_usm
+    rsl_matvec_ptq1_0_packed_f32_batched_usm
+    rsl_hadamard_forward_usm
+    rsl_matvec_q5_k_packed_f32_usm
+    rsl_matvec_q6_k_packed_f32_usm
+    rsl_matvec_iq4_nl_packed_f32_usm
+    rsl_matvec_iq4_xs_packed_f32_usm
+    rsl_matvec_iq4_nl_packed_f32_batched_usm
+    rsl_matvec_iq4_xs_packed_f32_batched_usm
+    rsl_matvec_iq1_s_packed_f32_usm
+    rsl_matvec_iq1_s_packed_f32_batched_usm
+    rsl_matvec_iq2_xxs_packed_f32_usm
+    rsl_matvec_iq2_xxs_packed_f32_batched_usm
+    rsl_matvec_iq1_m_packed_f32_usm
+    rsl_matvec_iq1_m_packed_f32_batched_usm
+    rsl_matvec_iq2_xs_packed_f32_usm
+    rsl_matvec_iq2_xs_packed_f32_batched_usm
+    rsl_matvec_iq2_s_packed_f32_usm
+    rsl_matvec_iq2_s_packed_f32_batched_usm
+    rsl_matvec_iq3_xxs_packed_f32_usm
+    rsl_matvec_iq3_xxs_packed_f32_batched_usm
+    rsl_matvec_iq3_s_packed_f32_usm
+    rsl_matvec_iq3_s_packed_f32_batched_usm
+    rsl_iq_search_8elt_delta_iq1s
+    rsl_iq_search_8elt_delta_iq1s_all3
+    rsl_iq_search_8elt_delta_iq1s_all3_w
+    rsl_iq_search_8elt_signed
+    rsl_iq_search_4elt_paired_signed
+    rsl_sampler_argmax_usm
+    rsl_sampler_temp_softmax_usm
+    rsl_sampler_multinomial_usm
+    rsl_sampler_penalty_usm
+    rsl_sampler_top_k_usm
+    rsl_sampler_top_p_usm
+    rsl_matvec_q8_0_packed_f32_batched_usm
+    rsl_matvec_q4_k_packed_f32_batched_usm
+    rsl_matvec_q5_k_packed_f32_batched_usm
+    rsl_matvec_q6_k_packed_f32_batched_usm
+    rsl_try_import_win32_handle_as_usm
+    rsl_release_imported_usm
+    rsl_try_alloc_host_baseline
+    rsl_rope_usm
+    rsl_silu_mul_usm
+    rsl_embedding_lookup_usm
+    rsl_kv_quantize_q8_0_store_usm
+    rsl_encode_q6_k_blocks_usm
+    rsl_encode_q3_k_blocks_usm
+    rsl_encode_q4_k_blocks_usm
+    rsl_encode_q5_k_blocks_usm
+    rsl_matvec_q4_k_gate_up_fused_usm
+    rsl_matvec_q8_0_gate_up_fused_usm
+    rsl_matvec_q5_k_gate_up_fused_usm
+    rsl_matvec_q6_k_gate_up_fused_usm
+    rsl_matvec_iq4_nl_gate_up_fused_usm
+    rsl_matvec_iq4_xs_gate_up_fused_usm
+    rsl_matvec_iq1_s_gate_up_fused_usm
+    rsl_matvec_iq2_xxs_gate_up_fused_usm
+    rsl_matvec_iq1_m_gate_up_fused_usm
+    rsl_matvec_iq2_xs_gate_up_fused_usm
+    rsl_matvec_iq2_s_gate_up_fused_usm
+    rsl_matvec_iq3_xxs_gate_up_fused_usm
+    rsl_matvec_iq3_s_gate_up_fused_usm
+    rsl_matvec_q4_k_add_rmsnorm_usm
+    rsl_matvec_q8_0_add_rmsnorm_usm
+    rsl_matvec_q5_k_add_rmsnorm_usm
+    rsl_matvec_q6_k_add_rmsnorm_usm
+    rsl_matvec_iq4_nl_add_rmsnorm_usm
+    rsl_matvec_iq4_xs_add_rmsnorm_usm
+    rsl_matvec_iq1_s_add_rmsnorm_usm
+    rsl_matvec_iq1_m_add_rmsnorm_usm
+    rsl_matvec_iq2_xxs_add_rmsnorm_usm
+    rsl_matvec_iq2_xs_add_rmsnorm_usm
+    rsl_matvec_iq2_s_add_rmsnorm_usm
+    rsl_matvec_iq3_xxs_add_rmsnorm_usm
+    rsl_matvec_iq3_s_add_rmsnorm_usm
+    rsl_matvec_q8_0_f16in_packed_f32_usm
+    rsl_matvec_q4_k_f16in_packed_f32_usm
+    rsl_matvec_q5_k_f16in_packed_f32_usm
+    rsl_matvec_q6_k_f16in_packed_f32_usm
+    rsl_matvec_iq4_nl_f16in_packed_f32_usm
+    rsl_matvec_iq4_xs_f16in_packed_f32_usm
+    rsl_matvec_iq1_s_f16in_packed_f32_usm
+    rsl_matvec_iq1_m_f16in_packed_f32_usm
+    rsl_matvec_iq2_xxs_f16in_packed_f32_usm
+    rsl_matvec_iq2_xs_f16in_packed_f32_usm
+    rsl_matvec_iq2_s_f16in_packed_f32_usm
+    rsl_matvec_iq3_xxs_f16in_packed_f32_usm
+    rsl_matvec_iq3_s_f16in_packed_f32_usm
+
+    ; G5: K-quant → F32 dequant (USM-in / USM-out)
+    rsl_dequant_q4_k_to_f32_usm
+    rsl_dequant_q3_k_to_f32_usm
+    rsl_dequant_q5_k_to_f32_usm
+    rsl_dequant_q6_k_to_f32_usm

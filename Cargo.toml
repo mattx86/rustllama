@@ -1,0 +1,157 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rustllama-gguf",
+    "crates/rustllama-rag",
+    "crates/rustllama-safetensors",
+    "crates/rustllama-tensor",
+    "crates/rustllama-tokenizer",
+    "crates/rustllama-kernels-cpu",
+    "crates/rustllama-kernels-sycl",
+    "crates/rustllama-kernels-cuda",
+    "crates/rustllama-l0-sys",
+    "crates/rustllama-models",
+    "crates/rustllama-tuner",
+    "crates/rustllama-engine",
+    "crates/rustllama-config",
+    "crates/rustllama-hub",
+    "crates/rustllama-runtime",
+    "crates/rustllama-server",
+    "crates/rustllama-client",
+    "crates/rustllama-lsp",
+    "crates/rustllama-cli",
+    "app/src-tauri",
+    "xtask",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.83"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+authors = ["rustllama contributors"]
+repository = "https://github.com/mcsx86/rustllama"
+# This is an application workspace, not a set of crates.io libraries.
+# Every member sets `publish.workspace = true` to inherit this and stay
+# unpublishable (path-only deps would fail `cargo publish` anyway).
+publish = false
+
+[workspace.dependencies]
+# async + runtime
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+async-stream = "0.3"
+
+# http
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+eventsource-stream = "0.2"
+
+# data
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+bytemuck = "1"
+half = { version = "2", features = ["bytemuck", "serde"] }
+memmap2 = "0.9"
+
+# error / logging
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+rustyline = "14"
+indicatif = "0.17"
+
+# paths / fs / proc
+directories = "5"
+notify = "6"
+notify-debouncer-full = "0.3"
+fs2 = "0.4"
+sysinfo = "0.31"
+walkdir = "2"
+# Gitignore-aware directory walker (ripgrep's). Used by `rustllama-rag`
+# to skip `.git/`, `target/`, `node_modules/`, `.gitignore`-listed
+# paths, etc. when indexing a workspace.
+ignore = "0.4"
+# Tree-sitter runtime + per-language grammars for the code-aware
+# chunker in `rustllama-rag`. Pinned to 0.22 (the grammar crates
+# below pre-compile their C TUs against this ABI). Off by default
+# in `rustllama-rag` — opt in via its `tree-sitter` feature. Each
+# language adds ~300 KB of compiled grammar; we only ship the ones
+# coding LLMs see most: rust + python.
+tree-sitter = "0.22"
+tree-sitter-rust = "0.21"
+tree-sitter-python = "0.21"
+
+# domain
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+minijinja = "2"
+# Python-method compatibility for chat templates: HF templates are
+# written against real Jinja2, where `"str".startswith(...)`,
+# `.strip()`, `.split()`, dict `.get()` etc. come from Python itself.
+# minijinja-contrib's pycompat callback implements that method
+# surface; without it, most modern model templates 500 at render.
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rustls-tls"] }
+# Image decode for the VLM preprocessor. `default-features = false` so we
+# don't pull every codec; PNG + JPEG cover the OpenAI / Anthropic
+# image_url shape (data:image/png;base64,... and data:image/jpeg;base64,...).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Base64 decode for `data:` URIs on the HTTP side. The OpenAI multimodal
+# wire shape sends images as `data:image/<png|jpeg>;base64,<payload>`; the
+# server decodes the payload to raw bytes before handing them to the
+# image preprocessor in `rustllama-models`. `0.22` matches the modern
+# rust-base64 crate; the `Engine::STANDARD` constant is what we use.
+base64 = "0.22"
+# Safetensors parser. AWQ + GPTQ quantized models ship as .safetensors
+# files (4-bit packed weights + per-group fp16 scales + zero points)
+# rather than GGUF; this crate gives us the on-disk header + mmap +
+# typed tensor view we need to read them. `0.4` ties to HF's
+# current release line. We pin the workspace version here so the
+# rustllama-safetensors loader and any future HF-format tooling
+# stay on the same major.
+safetensors = "0.4"
+
+# native build
+cc = "1"
+bindgen = "0.69"
+
+# Parallel CPU matmul + threads sweep. Used by `rustllama-kernels-cpu`
+# to par_chunks over the M axis on shapes large enough to amortize
+# rayon's work-stealing overhead (~10-30µs); below that the scalar
+# path stays serial. Pool sized by `[inference].threads` at engine
+# load — `0` lets rayon's heuristic pick.
+rayon = "1.10"
+
+# tauri
+tauri = { version = "2", features = [] }
+tauri-build = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+# Ship profile: `cargo build --profile dist`. Same optimization story
+# as release plus fat LTO, with debuginfo stripped from the binary
+# (release keeps `debug = 1` so cdb.exe can symbolize hangs during
+# development — that workflow found the 2026-09-06 OnceLock deadlock).
+# NEVER set `panic = "abort"` here: the embedded server thread relies
+# on `catch_unwind` (app/src-tauri/src/main.rs) and the engine asserts
+# liberally — an abort would take down the whole GUI process where
+# today a request fails cleanly.
+[profile.dist]
+inherits = "release"
+debug = 0
+strip = "debuginfo"
+lto = "fat"
+
+[profile.dev.package."*"]
+opt-level = 1

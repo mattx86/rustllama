@@ -1,0 +1,39 @@
+[package]
+name = "rustllama-kernels-sycl"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "SYCL GPU compute kernels for rustllama, compiled by Intel icx via cc-rs."
+build = "build.rs"
+
+[features]
+# REAL-ONLY crate: the SYCL backend is ALWAYS compiled — there is no
+# `mock`/`sycl` feature any more. Building this crate therefore always
+# requires Intel oneAPI (`icx`/`icpx`) on PATH. Runtime selection of
+# SYCL vs CUDA vs CPU happens at engine startup, not via build features.
+#
+# GPU-side IQ quant encoder (`iq_encoder`, implements
+# `rustllama_gguf::iq_gpu::IqGpuEncoder`). Pulled in by the CLI's
+# `encoder` feature; off in the slim server build so the gguf
+# encode-side tables stay out of the binary.
+encoder = ["rustllama-gguf/encoder"]
+
+[dependencies]
+tracing.workspace = true
+thiserror.workspace = true
+half.workspace = true
+rustllama-gguf = { path = "../rustllama-gguf", default-features = false }
+
+[dev-dependencies]
+# Dev-only: hardware-validation tests for the IQ4 batched matvec
+# kernels need a CPU reference. The kernels-cpu crate's
+# `matvec_iq4_{nl,xs}_w_f32_a_scalar` is the canonical reference
+# the GPU kernel was ported from.
+rustllama-kernels-cpu = { path = "../rustllama-kernels-cpu" }
+
+[build-dependencies]
+cc.workspace = true

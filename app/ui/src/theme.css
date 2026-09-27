@@ -1,0 +1,504 @@
+/*
+ * rustllama GUI theme tokens — an LM Studio-style dark palette.
+ *
+ * The app was originally styled with hardcoded GitHub-dark hex literals
+ * inlined into every component. This file introduces a single source of
+ * truth as CSS custom properties plus a small set of reusable component
+ * classes (sidebar, nav, status bar, buttons, cards, badges, meters).
+ * New chrome (the shell, the status bar, the model-loader bar) is built
+ * against these tokens; the individual page bodies are migrated to them
+ * incrementally.
+ *
+ * Palette is a warm-neutral near-black with an indigo accent, generous
+ * radii and padding — the LM Studio look, distinct from the previous
+ * flat GitHub aesthetic.
+ */
+
+:root {
+  /* Surfaces */
+  --ll-bg: #17181c; /* app background (main content) */
+  --ll-bg-elev: #1e1f25; /* cards / panels */
+  --ll-bg-elev-2: #262832; /* inputs, hover states */
+  --ll-sidebar-bg: #121317; /* sidebar (recessed, darker than app) */
+  --ll-topbar-bg: #1a1b21; /* top model-loader bar */
+  --ll-statusbar-bg: #121317; /* bottom status bar */
+
+  /* Lines */
+  --ll-border: #2a2c35;
+  --ll-border-strong: #383a46;
+
+  /* Text */
+  --ll-text: #e7e8ee;
+  --ll-text-muted: #9a9cab;
+  --ll-text-faint: #6a6c7a;
+
+  /* Accent + semantic */
+  --ll-accent: #6172f3;
+  --ll-accent-hover: #7d8bf6;
+  --ll-accent-soft: rgba(97, 114, 243, 0.16);
+  --ll-green: #35c759;
+  --ll-yellow: #f0b429;
+  --ll-red: #f5544b;
+  --ll-purple: #a371f7;
+
+  /* Soft semantic backgrounds for status boxes (error/warn/success/info).
+   * Theme-aware so the boxes stay legible in both dark and light. */
+  --ll-red-soft: rgba(245, 84, 75, 0.15);
+  --ll-yellow-soft: rgba(240, 180, 41, 0.15);
+  --ll-green-soft: rgba(53, 199, 89, 0.15);
+  --ll-info-soft: rgba(97, 114, 243, 0.15);
+
+  /* Geometry */
+  --ll-radius: 10px;
+  --ll-radius-sm: 7px;
+  --ll-radius-pill: 999px;
+
+  /* Type */
+  --ll-font:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+    sans-serif;
+  --ll-mono:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    monospace;
+
+  --ll-sidebar-w: 216px;
+  /* Tall enough for the tallest status column: CPU / RAM / Swap (three
+   * stacked rows); the GPU util/VRAM pairs are shorter and center within.
+   * Tallest column is now the Swap / Page-I/O / Model-I/O 3-row pair. */
+  --ll-statusbar-h: 62px;
+}
+
+/* Light theme — activated by data-theme="light" on <html> (toggle in the
+ * sidebar footer, persisted to localStorage). Same accent, inverted
+ * surfaces. Only the two themes exist; there is no pluggable theme system. */
+:root[data-theme="light"] {
+  --ll-bg: #f6f7f9;
+  --ll-bg-elev: #ffffff;
+  --ll-bg-elev-2: #eceef2;
+  --ll-sidebar-bg: #eceef1;
+  --ll-topbar-bg: #ffffff;
+  --ll-statusbar-bg: #eceef1;
+
+  --ll-border: #e0e3e8;
+  --ll-border-strong: #cbcfd7;
+
+  --ll-text: #1c1e24;
+  --ll-text-muted: #585b66;
+  --ll-text-faint: #888b96;
+
+  --ll-accent: #4b5bdc;
+  --ll-accent-hover: #3a4ad0;
+  --ll-accent-soft: rgba(75, 91, 220, 0.12);
+  --ll-green: #1f9d4d;
+  --ll-yellow: #b8860b;
+  --ll-red: #d33a30;
+  --ll-purple: #8250df;
+  --ll-red-soft: rgba(211, 58, 48, 0.1);
+  --ll-yellow-soft: rgba(184, 134, 11, 0.13);
+  --ll-green-soft: rgba(31, 157, 77, 0.1);
+  --ll-info-soft: rgba(75, 91, 220, 0.1);
+}
+
+/* Window surface follows the active theme (index.html sets a fallback so
+ * there's no flash before this stylesheet loads). */
+html,
+body,
+#root {
+  background: var(--ll-bg);
+  color: var(--ll-text);
+}
+
+/* Sidebar footer + theme toggle */
+.ll-sidebar-footer {
+  padding: 8px 10px 12px;
+  border-top: 1px solid var(--ll-border);
+}
+.ll-theme-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 11px;
+  border: none;
+  border-radius: var(--ll-radius-sm);
+  background: transparent;
+  color: var(--ll-text-muted);
+  font-size: 13px;
+  font-family: var(--ll-font);
+  cursor: pointer;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
+}
+.ll-theme-toggle:hover {
+  background: var(--ll-bg-elev);
+  color: var(--ll-text);
+}
+.ll-theme-toggle svg {
+  width: 17px;
+  height: 17px;
+  flex: none;
+}
+
+/* ---- Reasoning ("thinking") block --------------------------------- */
+/* The raw chain-of-thought from a reasoning model is collapsed to a
+ * status chip: "Thinking…" while it streams, "Thought" once done. The
+ * content stays hidden unless the user expands it. */
+.ll-think {
+  margin: 2px 0 8px;
+}
+.ll-think-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 10px;
+  border-radius: var(--ll-radius-pill);
+  border: 1px solid var(--ll-border);
+  background: var(--ll-bg-elev);
+  color: var(--ll-text-muted);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.ll-think-chip:hover {
+  color: var(--ll-text);
+}
+.ll-think-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ll-accent);
+  flex: none;
+}
+.ll-think-dot.active {
+  animation: ll-pulse 1s ease-in-out infinite;
+}
+@keyframes ll-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.8);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.15);
+  }
+}
+.ll-think-body {
+  margin-top: 6px;
+  padding: 10px 12px;
+  border-left: 2px solid var(--ll-border-strong);
+  background: var(--ll-bg-elev);
+  border-radius: var(--ll-radius-sm);
+  color: var(--ll-text-muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  max-height: 320px;
+  overflow: auto;
+}
+
+/* ---- Shell layout: sidebar | main / status bar --------------------- */
+
+.ll-shell {
+  display: grid;
+  grid-template-columns: var(--ll-sidebar-w) 1fr;
+  grid-template-rows: 1fr var(--ll-statusbar-h);
+  grid-template-areas:
+    "sidebar main"
+    "statusbar statusbar";
+  height: 100vh;
+  background: var(--ll-bg);
+  color: var(--ll-text);
+  font-family: var(--ll-font);
+  overflow: hidden;
+}
+
+.ll-sidebar {
+  grid-area: sidebar;
+  background: var(--ll-sidebar-bg);
+  border-right: 1px solid var(--ll-border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.ll-main {
+  grid-area: main;
+  overflow: auto;
+  min-height: 0;
+  min-width: 0;
+}
+
+/* ---- Brand -------------------------------------------------------- */
+
+.ll-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 16px 14px;
+  text-decoration: none;
+  color: var(--ll-text);
+}
+.ll-brand-mark {
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, var(--ll-accent), var(--ll-purple));
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-weight: 800;
+  font-size: 14px;
+  flex: none;
+}
+.ll-brand-name {
+  font-weight: 650;
+  font-size: 15px;
+  letter-spacing: 0.2px;
+}
+
+/* ---- Nav ---------------------------------------------------------- */
+
+.ll-nav {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ll-nav-section {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--ll-text-faint);
+  padding: 12px 10px 4px;
+}
+.ll-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 9px 11px;
+  border-radius: var(--ll-radius-sm);
+  text-decoration: none;
+  color: var(--ll-text-muted);
+  font-size: 13.5px;
+  font-weight: 500;
+  line-height: 1;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
+  user-select: none;
+}
+.ll-nav-item:hover {
+  background: var(--ll-bg-elev);
+  color: var(--ll-text);
+}
+.ll-nav-item.active {
+  background: var(--ll-accent-soft);
+  color: var(--ll-text);
+}
+.ll-nav-item.active .ll-nav-icon {
+  color: var(--ll-accent);
+}
+.ll-nav-icon {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  color: var(--ll-text-faint);
+}
+
+/* ---- Status bar (bottom) ------------------------------------------ */
+
+.ll-statusbar {
+  grid-area: statusbar;
+  background: var(--ll-statusbar-bg);
+  border-top: 1px solid var(--ll-border);
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 14px;
+  font-size: 11.5px;
+  color: var(--ll-text-muted);
+  overflow: hidden;
+  white-space: nowrap;
+}
+.ll-status-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: none;
+}
+/* Paired status column: a utilization bar (top) stacked over its memory
+ * bar (bottom) — CPU over RAM, GPU N over VRAM. */
+.ll-status-pair {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  flex: none;
+}
+.ll-status-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+/* Keep the two rows' meters vertically aligned regardless of label. */
+.ll-status-pair .ll-status-label {
+  min-width: 38px;
+}
+.ll-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+.ll-status-label {
+  color: var(--ll-text-faint);
+}
+.ll-status-value {
+  color: var(--ll-text);
+  font-variant-numeric: tabular-nums;
+}
+.ll-status-model {
+  margin-left: auto;
+  font-family: var(--ll-mono);
+  font-size: 11px;
+  color: var(--ll-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
+  flex: 1 1 auto;
+  text-align: right;
+}
+
+/* Compact meter (RAM/VRAM) */
+.ll-meter {
+  width: 70px;
+  height: 6px;
+  border-radius: var(--ll-radius-pill);
+  background: var(--ll-bg-elev-2);
+  overflow: hidden;
+  flex: none;
+}
+.ll-meter-fill {
+  height: 100%;
+  border-radius: var(--ll-radius-pill);
+  transition: width 0.4s ease;
+}
+
+/* ---- Buttons ------------------------------------------------------ */
+
+.ll-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 13px;
+  border-radius: var(--ll-radius-sm);
+  border: 1px solid var(--ll-border-strong);
+  background: var(--ll-bg-elev-2);
+  color: var(--ll-text);
+  font-size: 13px;
+  font-weight: 500;
+  font-family: var(--ll-font);
+  cursor: pointer;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease;
+}
+.ll-btn:hover:not(:disabled) {
+  background: var(--ll-border);
+  border-color: var(--ll-border-strong);
+}
+.ll-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.ll-btn-primary {
+  background: var(--ll-accent);
+  border-color: var(--ll-accent);
+  color: #fff;
+}
+.ll-btn-primary:hover:not(:disabled) {
+  background: var(--ll-accent-hover);
+  border-color: var(--ll-accent-hover);
+}
+
+/* ---- Cards / badges / inputs -------------------------------------- */
+
+.ll-card {
+  background: var(--ll-bg-elev);
+  border: 1px solid var(--ll-border);
+  border-radius: var(--ll-radius);
+  padding: 16px;
+}
+.ll-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border-radius: var(--ll-radius-pill);
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--ll-bg-elev-2);
+  color: var(--ll-text-muted);
+  border: 1px solid var(--ll-border);
+}
+.ll-badge-accent {
+  background: var(--ll-accent-soft);
+  color: var(--ll-accent-hover);
+  border-color: transparent;
+}
+.ll-select {
+  appearance: none;
+  background: var(--ll-bg-elev-2);
+  color: var(--ll-text);
+  border: 1px solid var(--ll-border-strong);
+  border-radius: var(--ll-radius-sm);
+  padding: 8px 30px 8px 12px;
+  font-size: 13.5px;
+  font-family: var(--ll-font);
+  cursor: pointer;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239a9cab' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+.ll-select:hover {
+  border-color: var(--ll-accent);
+}
+
+/* ---- Top model-loader bar ----------------------------------------- */
+
+.ll-topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  /* 20px horizontal to line up with the Chat header, message history, and
+     composer below it (all 20px) — 16px left the model bar 4px out of flush. */
+  padding: 10px 20px;
+  background: var(--ll-topbar-bg);
+  border-bottom: 1px solid var(--ll-border);
+  min-height: 52px;
+  box-sizing: border-box;
+}
+
+/* Thin, unobtrusive scrollbars in the dark theme */
+.ll-main ::-webkit-scrollbar,
+.ll-nav::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.ll-main ::-webkit-scrollbar-thumb,
+.ll-nav::-webkit-scrollbar-thumb {
+  background: var(--ll-border-strong);
+  border-radius: var(--ll-radius-pill);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.ll-main ::-webkit-scrollbar-thumb:hover,
+.ll-nav::-webkit-scrollbar-thumb:hover {
+  background: #4a4c58;
+  background-clip: padding-box;
+}

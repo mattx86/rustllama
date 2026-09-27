@@ -1,0 +1,63 @@
+# ARM64 / ARMv9 GPU build image for NVIDIA Grace-class boxes — the DGX
+# Spark (GB10 Grace-Blackwell) target. Ubuntu 24.04 (aarch64) + the CUDA
+# Toolkit for ARM (nvcc + static cudart) + Rust.
+#
+# NO Intel oneAPI: SYCL / DPC++ is x86_64-only, so there is no Intel GPU
+# backend on ARM. rustllama-kernels-sycl detects the non-x86 target in
+# its build.rs and compiles a no-op stub (rsl_sycl_device_count()==0), so
+# the crate still links; at runtime the engine sees no SYCL device and
+# runs on CPU + the native CUDA backend (rustllama-kernels-cuda, built by
+# the ARM nvcc here). CPU kernels use their scalar path (the AVX2 fast
+# paths are #[cfg(target_arch="x86_64")]-gated).
+#
+# Compiling here validates the ARM *build*; EXECUTION needs the physical
+# NVIDIA GPU + driver (a DGX Spark / Grace box), which a build container
+# on a non-GPU host doesn't have.
+#
+# Build (native ARM host):
+#   docker build -t rustllama-build-arm64-gpu -f scripts/Dockerfile.linux-arm64-gpu scripts
+# Build (x86 host, emulated via QEMU/buildx):
+#   docker buildx build --platform linux/arm64 -t rustllama-build-arm64-gpu \
+#       -f scripts/Dockerfile.linux-arm64-gpu --load scripts
+FROM --platform=linux/arm64 ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Base toolchain + libs. build-essential brings gcc/g++ (the SYCL stub is
+# compiled by `cc`; the CPU kernels + the rest of the C deps build here).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl gnupg pkg-config git \
+        libssl-dev patchelf \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- NVIDIA CUDA Toolkit (aarch64: nvcc + static cudart) -----------------
+# From NVIDIA's Ubuntu 24.04 **SBSA** CUDA apt repo — the Server Base System
+# Architecture (Grace-class) arm64 repo that Grace-Hopper (GH200) and the
+# DGX Spark's Grace-Blackwell (GB10) use. (The `arm64` repo is the Jetson/
+# Tegra one and lacks the standalone cuda-cudart-dev / cuda-cccl packages.)
+# Only the compiler + runtime dev headers are needed to BUILD the kernels
+# (cudart is linked statically; only the driver is a runtime dep). CUDA 13.0
+# matches the Spark's shipped 13.0.2 (static cudart → driver 580 suffices).
+RUN curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb -o /tmp/cuda-keyring.deb \
+    && dpkg -i /tmp/cuda-keyring.deb && rm -f /tmp/cuda-keyring.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-cccl-13-0 \
+    && rm -rf /var/lib/apt/lists/*
+ENV CUDA_PATH=/usr/local/cuda \
+    CUDACXX=/usr/local/cuda/bin/nvcc \
+    PATH=/usr/local/cuda/bin:${PATH}
+
+# ---- Rust (stable, via rustup) -------------------------------------------
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH=/root/.cargo/bin:${PATH}
+
+# ---- Optional Tauri GUI deps (webkit2gtk-4.1 + GTK, arm64) ---------------
+# Only needed for a `--gui` build; headless server builds skip them. Kept
+# in a separate layer so a headless-only image can drop it.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN nvcc --version | tail -2 && rustc --version && cc --version | head -1
+WORKDIR /work

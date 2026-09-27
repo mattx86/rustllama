@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>rustllama</title>
+    <style>
+      /*
+        WebView2's user-agent stylesheet gives `<body>` an 8px margin
+        and a white background. Without overriding both, the dark
+        Shell renders inside a thin white frame. Resetting both here
+        keeps the Tauri window edge-to-edge.
+      */
+      html, body, #root {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        /* Fallbacks apply before theme.css loads; the CSS custom
+           properties (set in theme.css) take over once it does and
+           follow the dark/light toggle. */
+        background: var(--ll-bg, #17181c);
+        color: var(--ll-text, #e7e8ee);
+      }
+      body {
+        font-family:
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          Roboto,
+          Oxygen,
+          Ubuntu,
+          sans-serif;
+        overflow: hidden;
+      }
+      /* Tame WebView2's default focus ring on dark backgrounds. */
+      *:focus-visible {
+        outline: 2px solid var(--ll-accent, #6172f3);
+        outline-offset: 1px;
+      }
+      /*
+        Markdown rendering for assistant chat messages. ReactMarkdown
+        emits standard HTML (`<p>`, `<ul>`, `<h*>`, `<pre>`, `<code>`,
+        `<table>`) with no styles attached — these rules give it a
+        consistent look against the dark Shell background. The
+        `.markdown :where(...)` pattern keeps specificity low so the
+        rehype-highlight token classes (hljs-keyword, hljs-string, …)
+        still win for syntax colours inside `<pre><code>`.
+      */
+      .markdown :where(p, ul, ol) {
+        margin: 0.5em 0;
+      }
+      .markdown :where(h1, h2, h3, h4) {
+        margin: 1em 0 0.4em;
+        font-weight: 600;
+        line-height: 1.3;
+      }
+      .markdown h1 { font-size: 1.4em; }
+      .markdown h2 { font-size: 1.25em; }
+      .markdown h3 { font-size: 1.1em; }
+      .markdown h4 { font-size: 1em; }
+      .markdown :where(ul, ol) {
+        padding-left: 1.5em;
+      }
+      .markdown li {
+        margin: 0.15em 0;
+      }
+      .markdown a {
+        color: var(--ll-accent, #6172f3);
+        text-decoration: underline;
+        text-underline-offset: 2px;
+      }
+      .markdown :where(strong) { font-weight: 600; }
+      .markdown :where(em) { font-style: italic; }
+      .markdown blockquote {
+        margin: 0.5em 0;
+        padding-left: 1em;
+        border-left: 3px solid var(--ll-border-strong, #30363d);
+        color: var(--ll-text-muted, #8b949e);
+      }
+      /* Inline code. Block code is styled via the highlight.js CSS. */
+      .markdown :not(pre) > code {
+        font-family:
+          ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 0.9em;
+        background: var(--ll-bg-elev-2, #21262d);
+        padding: 1px 6px;
+        border-radius: 3px;
+      }
+      .markdown pre {
+        margin: 0.6em 0;
+        padding: 12px 14px;
+        background: #161b22;
+        border: 1px solid var(--ll-border-strong, #30363d);
+        border-radius: 6px;
+        overflow-x: auto;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+      .markdown pre code {
+        background: transparent !important;
+        padding: 0;
+        font-family:
+          ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      }
+      .markdown table {
+        border-collapse: collapse;
+        margin: 0.6em 0;
+      }
+      .markdown th, .markdown td {
+        border: 1px solid var(--ll-border-strong, #30363d);
+        padding: 4px 10px;
+      }
+      .markdown th {
+        background: var(--ll-bg-elev, #161b22);
+        font-weight: 600;
+      }
+      .markdown hr {
+        border: none;
+        border-top: 1px solid var(--ll-border-strong, #30363d);
+        margin: 1em 0;
+      }
+      /*
+        github-dark highlight.js theme, inlined from
+        node_modules/highlight.js/styles/github-dark.min.css. Keeps
+        bundler-resolution simple — highlight.js is a transitive dep
+        of rehype-highlight, not a direct one, so importing the CSS
+        from the JS side trips Rollup's strict resolution.
+      */
+      pre code.hljs { display: block; overflow-x: auto; padding: 1em }
+      code.hljs { padding: 3px 5px }
+      .hljs { color: #c9d1d9; background: #0d1117 }
+      .hljs-doctag, .hljs-keyword, .hljs-meta .hljs-keyword,
+      .hljs-template-tag, .hljs-template-variable, .hljs-type,
+      .hljs-variable.language_ { color: #ff7b72 }
+      .hljs-title, .hljs-title.class_, .hljs-title.class_.inherited__,
+      .hljs-title.function_ { color: #d2a8ff }
+      .hljs-attr, .hljs-attribute, .hljs-literal, .hljs-meta,
+      .hljs-number, .hljs-operator, .hljs-selector-attr,
+      .hljs-selector-class, .hljs-selector-id, .hljs-variable { color: #79c0ff }
+      .hljs-meta .hljs-string, .hljs-regexp, .hljs-string { color: #a5d6ff }
+      .hljs-built_in, .hljs-symbol { color: #ffa657 }
+      .hljs-code, .hljs-comment, .hljs-formula { color: #8b949e }
+      .hljs-name, .hljs-quote, .hljs-selector-pseudo,
+      .hljs-selector-tag { color: #7ee787 }
+      .hljs-subst { color: #c9d1d9 }
+      .hljs-section { color: #1f6feb; font-weight: 700 }
+      .hljs-bullet { color: #f2cc60 }
+      .hljs-emphasis { color: #c9d1d9; font-style: italic }
+      .hljs-strong { color: #c9d1d9; font-weight: 700 }
+      .hljs-addition { color: #aff5b4; background-color: #033a16 }
+      .hljs-deletion { color: #ffdcd7; background-color: #67060c }
+    </style>
+    <script>
+      // Apply the persisted dark/light choice before first paint so
+      // there is no flash. The React toggle keeps this in sync.
+      try {
+        var t = localStorage.getItem("ll-theme");
+        if (t === "light" || t === "dark") {
+          document.documentElement.setAttribute("data-theme", t);
+        }
+      } catch (e) {
+        /* private mode / blocked storage — default (dark) applies */
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,38 @@
+# Rocky Linux 10 build environment for rustllama's Linux builds and tests
+# — headless (CPU server/CLI) and the Tauri GUI. Rocky 10 (RHEL 10,
+# glibc 2.39) is the first enterprise-Linux release with the modern
+# desktop stack Tauri 2 needs: libsoup3 + gtk3 (AppStream) and
+# webkit2gtk4.1 (EPEL). Rocky 8/9 ship only webkit2gtk-4.0 (libsoup2),
+# which Tauri 2 / wry cannot use, so they can build headless only.
+#
+# Binaries built here need glibc 2.39+ (el10 / Ubuntu 24.04 / Fedora 40+).
+# This is the Linux counterpart to the Windows oneAPI/MSVC toolchain used
+# by scripts/build.bat.
+#
+# Build:  docker build -t rustllama-build-linux -f scripts/Dockerfile.linux scripts
+# (scripts/build-linux-docker.bat does this for you.)
+FROM rockylinux/rockylinux:10
+
+# CRB (libsoup3/gtk3 -devel live here) + EPEL (webkit2gtk4.1). RHEL 10
+# ships a modern gcc (14) by default, so no gcc-toolset is needed.
+RUN dnf -y install dnf-plugins-core \
+    && dnf config-manager --set-enabled crb \
+    && dnf -y install epel-release \
+    && dnf -y install --setopt=install_weak_deps=False \
+        gcc gcc-c++ make cmake perl-core git which \
+        curl ca-certificates pkgconf-pkg-config file patchelf \
+        gtk3-devel webkit2gtk4.1-devel libsoup3-devel librsvg2-devel \
+        libayatana-appindicator-gtk3-devel \
+    && dnf clean all && rm -rf /var/cache/dnf
+
+# Rust via rustup. rust-toolchain.toml (stable) drives the toolchain;
+# rustup auto-installs it on first cargo invocation.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y \
+        --profile minimal --default-toolchain stable \
+    && rustup component add rustfmt clippy \
+    && rustc --version && cargo --version
+
+WORKDIR /work

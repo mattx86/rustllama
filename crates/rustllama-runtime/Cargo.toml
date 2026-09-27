@@ -1,0 +1,42 @@
+[package]
+name = "rustllama-runtime"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Runtime paths, server-record lockfile, and process discovery."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+fs2.workspace = true
+sysinfo.workspace = true
+directories.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Runtime dlopen of the NVIDIA CUDA driver (nvcuda.dll / libcuda.so.1)
+# for GPU detection — no build-time CUDA SDK dependency.
+libloading = "0.8"
+
+# Windows Job Object sandboxing — limits damage from a malformed
+# GGUF or runaway model. Only the Job/Process subset of the Win32
+# API; ~30 KB compiled. Cross-platform builds skip this dep via
+# the `cfg(windows)` gate.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    # GlobalMemoryStatusEx — surfaces the commit limit (RAM + page
+    # file) so the load pre-flight can account for swap, not just
+    # physical RAM.
+    "Win32_System_SystemInformation",
+    # PDH GPU-Engine perf counters — GPU utilization % for the status
+    # bar. Works on integrated Iris Xe (which Level-Zero Sysman engine-
+    # activity does NOT), and covers NVIDIA/AMD on Windows too.
+    "Win32_System_Performance",
+] }

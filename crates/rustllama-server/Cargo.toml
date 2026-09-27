@@ -1,0 +1,92 @@
+[package]
+name = "rustllama-server"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Axum OpenAI-compatible HTTP server for rustllama."
+
+[features]
+default = []
+# Conversation history persistence (sqlite). The GUI uses this for the
+# Chat page sidebar; CLI/server-only deployments can opt out by leaving
+# this feature off, which keeps `rusqlite` (a bundled C compile) out of
+# the build.
+history = ["dep:rusqlite"]
+# Code-aware RAG chunking (tree-sitter grammars for rust + python).
+# Off: the rag index still works with the plain-text chunker. The
+# CLI's default features turn this on for normal builds.
+tree-sitter = ["rustllama-rag/tree-sitter"]
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rustllama-engine = { path = "../rustllama-engine" }
+rustllama-config = { path = "../rustllama-config" }
+rustllama-runtime = { path = "../rustllama-runtime" }
+rustllama-tokenizer = { path = "../rustllama-tokenizer" }
+rustllama-hub = { path = "../rustllama-hub" }
+rustllama-models = { path = "../rustllama-models" }
+rustllama-gguf = { path = "../rustllama-gguf", default-features = false }
+# Workspace-aware RAG: file walker, chunker, in-memory cosine vector
+# store. Wired into `/v1/rag/index` and `/v1/rag/query`. The index
+# itself lives behind an `AppState` Arc<RwLock<RagIndex>> slot —
+# in-memory only in v1; sqlite persistence + file watching are
+# follow-ups in `rustllama-rag` itself.
+rustllama-rag = { path = "../rustllama-rag" }
+# Used by `load_model` to consult the per-device + per-model
+# placement / batch_size cache populated by `rustllama tune`.
+# Cache misses + hosts with no SYCL device fall back to config defaults.
+rustllama-tuner = { path = "../rustllama-tuner" }
+# Only used for `device_count()` in /v1/metrics. Default-features off to
+# keep the encoder/IQ tables out; the SYCL backend is always compiled,
+# and device_count() returns 0 when no SYCL device is present.
+rustllama-kernels-sycl = { path = "../rustllama-kernels-sycl", default-features = false }
+# CUDA compute-readiness probe for /v1/capabilities + /v1/tuning_summary
+# (`device_count()` = how many NVIDIA GPUs the runtime can launch kernels on).
+# Already built transitively via rustllama-engine, so this direct dep adds no
+# build cost; inert (returns 0) on non-NVIDIA hosts.
+rustllama-kernels-cuda = { path = "../rustllama-kernels-cuda" }
+# Level Zero Sysman probes (VRAM total/free, temperature, energy).
+# Surfaced via /v1/metrics; falls back to None on non-Intel hosts
+# or when the driver doesn't expose Sysman (Iris Xe shared-memory
+# integrated graphics returns VRAM but typically not temp/power).
+rustllama-l0-sys = { path = "../rustllama-l0-sys" }
+# Optional: sqlite for conversation history. Gated behind `history`
+# feature so non-GUI builds skip the bundled C compile.
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+# QR encoding for /v1/lan_info — emits SVG only (no image-rs / no PNG
+# encoding), so the dep footprint stays tiny. The GUI Settings page
+# embeds the SVG directly so a phone on the same LAN can scan it.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# Base64 decoder for `data:image/{png,jpeg};base64,...` URIs on the
+# chat/completions wire. The decoder runs before bytes reach the
+# `rustllama-models` image preprocessor. Workspace-pinned so the
+# version matches anything else that decodes base64 later.
+base64.workspace = true
+# Constant-time comparison for the bearer-token auth middleware.
+# Defends against timing side-channels when an attacker fishes for
+# the api_key over the network. `subtle` is the canonical pick;
+# tiny dep, no_std-friendly, used by every Rust crypto crate.
+subtle = "2"
+# Best-effort wipe of the parsed bearer token after compare. The
+# token sits in a `Vec<u8>` for ~microseconds during auth, but
+# zeroizing it costs nothing and removes one footgun.
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+rustllama-gguf = { path = "../rustllama-gguf", features = ["synth"] }

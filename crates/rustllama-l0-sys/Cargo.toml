@@ -1,0 +1,29 @@
+[package]
+name = "rustllama-l0-sys"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = """
+Dynamic-loading FFI wrapper for Intel Level Zero. Calls into the
+driver-supplied `ze_loader.dll` at runtime via `libloading` — no
+header dependency at build time. Used by the SYCL kernel path to
+import GGUF mmap pages directly as device-accessible memory, so
+weight bytes don't have to be memcpy'd into a separate USM
+allocation at load time.
+"""
+
+[features]
+# This crate is pure dynamic-loading FFI (dlopen of `ze_loader` at
+# runtime), so it ALWAYS compiles regardless of host — there is no
+# mock. On a host without the Level Zero loader, the probes return
+# `Unavailable` gracefully, so callers get a clean `Result` either way.
+default = []
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+libloading = "0.8"

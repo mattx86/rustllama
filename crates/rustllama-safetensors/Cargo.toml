@@ -1,0 +1,31 @@
+[package]
+name = "rustllama-safetensors"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Loader for HuggingFace AWQ / GPTQ safetensors models — parse headers, classify quant scheme, decode 4-bit packed weights, and convert to rustllama-tensor layouts."
+
+[dependencies]
+safetensors.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+memmap2.workspace = true
+half.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Reinterpret &[u8] payloads from safetensors as &[i32] / &[f16] for
+# the dequant kernels. `cast_slice` enforces alignment + length at
+# runtime so a malformed file surfaces a Pod panic rather than UB.
+bytemuck.workspace = true
+rustllama-tensor = { path = "../rustllama-tensor" }
+# A-2c-1: `LlamaConfig::from_hf_config_json` returns a `LlamaConfig`
+# from the rustllama-models crate. No reverse dependency exists, so
+# adding this here doesn't introduce a cycle.
+rustllama-models = { path = "../rustllama-models" }
+
+[dev-dependencies]
+bytemuck.workspace = true

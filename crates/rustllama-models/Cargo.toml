@@ -1,0 +1,59 @@
+[package]
+name = "rustllama-models"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Per-architecture transformer code for rustllama."
+
+[features]
+default = []
+# GGUF sidecar WRITING for the KV mean-centering bias (`kv_bias::
+# KvBiasData::save_with_geometry`) — pulls the gguf encoder tables.
+# Reading a sidecar needs no feature. The CLI's calibration
+# subcommand enables this via its own `encoder` feature.
+kv-bias-write = ["rustllama-gguf/encoder"]
+# The SYCL and CUDA backends are always compiled (real-only kernel
+# crates); there are no GPU build features.
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+half.workspace = true
+rustllama-tensor = { path = "../rustllama-tensor" }
+rustllama-gguf = { path = "../rustllama-gguf", default-features = false }
+rustllama-kernels-cpu = { path = "../rustllama-kernels-cpu" }
+# q★ co-execution in `moe.rs`: `rayon::join` runs the CPU expert
+# branch on a pool worker while the GPU branch keeps the engine
+# thread (and its SYCL-stream TLS). Same rayon the CPU kernels
+# already use internally, so no new pool is created.
+rayon.workspace = true
+# Used by the per-thread accelerator hook in `accel.rs`. Real-only,
+# always compiled — building this crate (and its tests) requires Intel
+# oneAPI (`icx`/`icpx`) on PATH.
+rustllama-kernels-sycl = { path = "../rustllama-kernels-sycl", default-features = false }
+# kernels-cuda: real-only, always compiled (nvcc). The native CUDA
+# packed-matvec dispatch (CudaMatvecCache) routes the dominant matmuls
+# to an NVIDIA GPU when one is present; inert (never constructed) when
+# device_count()==0, so non-NVIDIA hosts are unaffected.
+rustllama-kernels-cuda = { path = "../rustllama-kernels-cuda" }
+# Reads the on-disk autotuner cache at engine load to populate the
+# per-(M, K) tuned LWS map consulted by the matvec dispatch in
+# `accel::tuned_q4k_lws`. Falls back to the kernel's hand-picked
+# default when no entry exists. The cache itself is produced by
+# `rustllama tune` (Stage C).
+rustllama-tuner = { path = "../rustllama-tuner" }
+# VLM image preprocessor: decode PNG/JPEG, resize, channel-normalize.
+# Vendored into the model crate since the patch-flattening step is
+# tightly coupled to `VisionConfig` (patch_size + n_channels + image_size).
+image.workspace = true
+
+[dev-dependencies]
+bytemuck.workspace = true
+half.workspace = true
+rustllama-gguf = { path = "../rustllama-gguf", features = ["synth"] }
+# Read the Phase 8 DeltaNet parity fixture in tests/fixtures/.
+serde_json.workspace = true

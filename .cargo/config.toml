@@ -1,0 +1,18 @@
+# Build-environment configuration for rustllama.
+#
+# The compute kernels are REAL-ONLY: the SYCL kernel crate
+# (rustllama-kernels-sycl) and the NVIDIA CUDA crate (rustllama-kernels-cuda)
+# are always compiled into the binary, so building requires Intel oneAPI
+# (icx/icpx) AND the CUDA Toolkit (nvcc). Startup detection selects which
+# backend(s) to run (SYCL / CUDA / CPU). There is no mock/no-toolchain build.
+
+[env]
+ONEAPI_ROOT_DEFAULT = { value = "C:\\Program Files (x86)\\Intel\\oneAPI", force = false }
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+]
+
+[alias]
+xtask = "run --package xtask --"

@@ -1,0 +1,17 @@
+[package]
+name = "rustllama-tensor"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Tensor and Device abstractions for rustllama."
+
+[dependencies]
+half.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rustllama-gguf = { path = "../rustllama-gguf", default-features = false }

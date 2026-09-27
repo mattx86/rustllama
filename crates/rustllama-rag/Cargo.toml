@@ -1,0 +1,50 @@
+[package]
+name = "rustllama-rag"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Workspace-aware RAG: file walker, chunker, and in-memory cosine-similarity vector store. Library API; HTTP wrapping lives in `rustllama-server`."
+
+[features]
+default = []
+# `watcher` enables the optional notify-backed file watcher. Off by
+# default so non-watching callers (CLI one-shot indexers, the simple
+# /v1/rag/index handler) don't pull `notify` + `notify-debouncer-full`
+# into their dep tree.
+watcher = ["dep:notify", "dep:notify-debouncer-full"]
+# `tree-sitter` enables the code-aware chunker. Pulls in the
+# tree-sitter runtime + per-language grammar crates (rust, python in
+# v1; each grammar compiles a small C TU via the upstream crate's
+# build.rs). Off by default — the line-based chunker is a fine first
+# stage and adding the C compiles to every build is expensive.
+tree-sitter = ["dep:tree-sitter", "dep:tree-sitter-rust", "dep:tree-sitter-python"]
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Gitignore-aware walker. `.git/`, `target/`, `node_modules/`, and
+# `.gitignore`-listed paths are skipped by default — matching the
+# behavior every coding-assistant indexer should have out of the box.
+ignore.workspace = true
+# Optional file-watching backends (opt-in via the `watcher` feature).
+# `notify` for the raw FS events, `notify-debouncer-full` to coalesce
+# bursty event streams (editors write-modify-rename in quick succession).
+notify = { workspace = true, optional = true }
+notify-debouncer-full = { workspace = true, optional = true }
+# Optional tree-sitter code-aware chunker. The runtime crate + the
+# per-language grammars (Rust, Python in v1) are pulled in only when
+# this crate's `tree-sitter` feature is enabled. Other languages
+# (typescript, go, …) can be added later by extending the language
+# dispatch table in `src/ts_chunker.rs` — each grammar compiles via
+# its upstream crate's build.rs so no kernel-layer changes needed.
+tree-sitter = { workspace = true, optional = true }
+tree-sitter-rust = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"

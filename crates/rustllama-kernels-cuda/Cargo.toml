@@ -1,0 +1,24 @@
+[package]
+name = "rustllama-kernels-cuda"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "NVIDIA CUDA GPU compute kernels for rustllama, compiled by nvcc."
+build = "build.rs"
+
+# No mock: this crate always compiles the real nvcc kernels, and it is a
+# NON-optional dependency of the app — the CUDA backend is always built
+# into the binary (real-only, like SYCL and CPU), so every build requires
+# `nvcc` on PATH (the dedicated GPU build image, or any CUDA-Toolkit host).
+# Runtime detection decides whether CUDA is actually used. NOTE: the compute
+# path is linked but not yet wired into engine dispatch (roadmap) — NVIDIA
+# device *detection* today goes through rustllama_runtime::gpu_detect.
+
+[dependencies]
+tracing.workspace = true
+thiserror.workspace = true
+half.workspace = true

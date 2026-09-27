@@ -1,0 +1,20 @@
+[package]
+name = "rustllama-config"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Config schema (serde TOML), defaults, load/save, and live-reload watcher."
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+notify.workspace = true
+notify-debouncer-full.workspace = true
+tokio = { workspace = true }
+rustllama-runtime = { path = "../rustllama-runtime" }

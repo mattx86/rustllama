@@ -1,0 +1,38 @@
+[package]
+name = "rustllama-gguf"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "GGUF v3 parser and quantization decoders for rustllama."
+
+[features]
+default = ["encoder"]
+# Encode-side pipeline: quantize/re-encode (encode*, quantize, recipe,
+# apex, iq_gpu, write). Decode (dequant/parse/iq1_grid/imatrix) is
+# always compiled. Default ON so every normal build ships `rustllama
+# quantize` unchanged; the slim server build opts out for ~3-6 MB of
+# .text (the IQ grid-search tables dominate).
+encoder = []
+# Test-only: enable a synthetic GGUF writer used by integration tests.
+# The writer sits on the encode-side `write` module.
+synth = ["encoder"]
+
+[dependencies]
+memmap2.workspace = true
+bytemuck.workspace = true
+half.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Parallel chunked encoding in the quantize pipeline. The pipeline's
+# per-tensor encode loop is embarrassingly parallel (each chunk is
+# independent block-by-block work); rayon partitions chunks across
+# the worker pool and the writer remains single-threaded sequential.
+rayon = { workspace = true }
+
+[dev-dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true

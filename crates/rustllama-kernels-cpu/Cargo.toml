@@ -1,0 +1,27 @@
+[package]
+name = "rustllama-kernels-cpu"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Reference and SIMD CPU compute kernels for rustllama."
+
+[features]
+# No build features: AVX2/AVX-512 paths are selected at runtime via CPU
+# feature detection (and `cfg(target_feature)`), not a Cargo feature.
+default = []
+
+[dependencies]
+half.workspace = true
+bytemuck.workspace = true
+tracing.workspace = true
+rustllama-tensor = { path = "../rustllama-tensor" }
+rustllama-gguf = { path = "../rustllama-gguf", default-features = false }
+# Parallel CPU matmul. Used to par_chunks the M axis of packed-quant
+# matvec on shapes large enough to amortize work-stealing overhead.
+# Pool sized at engine load via `rayon::ThreadPoolBuilder` keyed on
+# `[inference].threads`; default global pool when threads = 0.
+rayon = { workspace = true }

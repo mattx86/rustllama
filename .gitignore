@@ -1,0 +1,31 @@
+/target
+/dist
+**/node_modules
+**/.DS_Store
+**/Thumbs.db
+**/test-models
+.env
+.env.*
+!.env.example
+*.gguf
+*.bin
+*.safetensors
+
+# editors
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# local Claude Code state (settings, plans, scheduled tasks) — never commit
+.claude/
+
+# tauri build artifacts
+app/src-tauri/target
+app/ui/dist
+
+# tuner caches (when run locally outside %LOCALAPPDATA%)
+/tuning-cache
+
+# release artifacts (scripts/release-*.bat output)
+/release

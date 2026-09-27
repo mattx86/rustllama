@@ -1,0 +1,18 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capabilities for the rustllama main window. Permits the core IPC primitives the webview needs to boot, plus the `server_url` custom command exposed by `app/src-tauri/src/main.rs`. Network access goes through plain `fetch` against `http://127.0.0.1:11434` — that's already allowed by the CSP in `tauri.conf.json` and doesn't need a Tauri permission.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:webview:default",
+    "core:event:default",
+    "core:app:default",
+    "core:resources:default",
+    "core:menu:default",
+    "core:tray:default",
+    "core:image:default",
+    "core:path:default"
+  ]
+}

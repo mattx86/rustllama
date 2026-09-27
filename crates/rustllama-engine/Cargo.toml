@@ -1,0 +1,97 @@
+[package]
+name = "rustllama-engine"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Generation loop, sampling, KV cache, and chat templating."
+
+[features]
+default = []
+# KV mean-centering sidecar WRITING (calibration). Forwards to
+# `rustllama-models/kv-bias-write`; reading a sidecar needs no feature.
+kv-bias-write = ["rustllama-models/kv-bias-write"]
+
+[dependencies]
+tokio.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+minijinja.workspace = true
+half.workspace = true
+# regex-automata exposes a step-able DFA so the regex grammar can
+# transition byte-by-byte against the candidate token's text and
+# decide accept/reject at sampling time. `dfa-build` enables the
+# `dense::DFA` constructor we use; `syntax` pulls in the parser
+# that converts the user's pattern string into HIR. Default-features
+# off so we don't pull the unused `meta` / `nfa` engines.
+regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-search", "syntax", "std"] }
+rustllama-gguf = { path = "../rustllama-gguf", default-features = false }
+rustllama-tensor = { path = "../rustllama-tensor" }
+rustllama-models = { path = "../rustllama-models" }
+# Direct dep on the kernel crate so the sampler can call into the
+# SIMD-accelerated softmax dispatcher (the Tier A AVX2/AVX-512
+# variants land via the same entry point the model forward uses).
+rustllama-kernels-cpu = { path = "../rustllama-kernels-cpu" }
+rustllama-tokenizer = { path = "../rustllama-tokenizer" }
+rustllama-tuner = { path = "../rustllama-tuner" }
+# A-3: AWQ / GPTQ safetensors load path. Used by
+# `CpuEngine::load_safetensors` to read HF-format checkpoints; the
+# auto-dispatcher routes here on `.safetensors` paths.
+rustllama-safetensors = { path = "../rustllama-safetensors" }
+# SYCL kernel layer — real-only, always compiled, so building this crate
+# (and its tests) always requires Intel oneAPI (`icx`/`icpx`) on PATH.
+rustllama-kernels-sycl = { path = "../rustllama-kernels-sycl", default-features = false }
+# VRAM-fit placement must see NVIDIA GPUs too — otherwise an NVIDIA-only host
+# (e.g. the DGX Spark, where SYCL is a no-op stub) plans 0 GPU layers and runs
+# CPU-only. Inert on non-NVIDIA hosts (`device_count()` returns 0).
+rustllama-kernels-cuda = { path = "../rustllama-kernels-cuda" }
+# Level Zero Sysman probe — used by the measurement loop in
+# `measurement.rs` to read the GPU energy counter pre/post each
+# candidate, deriving watts + tokens-per-joule for the power-aware
+# tuning win metric. Returns `None` on non-Intel hosts so the
+# measurement code degrades to throughput-only.
+rustllama-l0-sys = { path = "../rustllama-l0-sys" }
+# Phase 5 heat-placement planner (`multi_gpu.rs`) reads per-GPU free VRAM
+# (`gpu_detect::nvidia_free_vram_bytes`), total system RAM (`memory_info`),
+# and the disabled-GPU/CPU sets to size + rank placement tiers. Leaf crate
+# (no path deps) so this adds no dependency cycle; already in the build
+# closure transitively via `rustllama-tuner`.
+rustllama-runtime = { path = "../rustllama-runtime" }
+
+# Windows memory-residency: VirtualLock/Unlock hot weight tiers into the
+# working set + PrefetchVirtualMemory warm-up + SetProcessWorkingSetSizeEx
+# to raise the WS min, and QueryWorkingSetEx for the locked-bit verify.
+# Same major version the workspace already builds for rustllama-runtime.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+] }
+
+[dev-dependencies]
+bytemuck.workspace = true
+half.workspace = true
+rustllama-gguf = { path = "../rustllama-gguf", features = ["synth"] }
+# kv_bias integration tests write bias sidecars with the fork-format
+# writer, which is behind the models crate's `kv-bias-write` feature.
+rustllama-models = { path = "../rustllama-models", features = ["kv-bias-write"] }
+# Used only by the V-6b-3c vlm_prefill integration test to mint
+# synthetic PNG bytes — the rustllama-models vision pipeline already
+# pulls in the same crate, so this just makes it visible at test
+# scope as well.
+image.workspace = true
+# A-3 integration tests mint a minimal AWQ safetensors directory on
+# disk before exercising `load_safetensors` / `load_auto`. The dep
+# is dev-only — production builds reach safetensors via
+# `rustllama-safetensors`.
+safetensors.workspace = true
