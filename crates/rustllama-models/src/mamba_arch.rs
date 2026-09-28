@@ -435,6 +435,27 @@ fn load_tensor_f32(gguf: &Gguf, name: &str) -> Result<Vec<f32>, MambaError> {
         GgmlType::F16 => {
             rustllama_gguf::dequant::dequant_f16(&bytes[..n * 2], &mut out);
         }
+        GgmlType::Bf16 => {
+            rustllama_gguf::dequant::dequant_bf16(&bytes[..n * 2], &mut out);
+        }
+        // Quantized weights: dequantize to F32 via the shared GGUF
+        // decoders (the same routines `rustllama-tensor`'s dense load
+        // path uses), so quantized Mamba GGUFs (Q4_K / Q8_0 / …) can
+        // load through the library loader instead of being rejected.
+        // NOTE: this only unblocks the LOADER — the CpuEngine
+        // MambaEngine forward-pass wiring remains gated (out of scope),
+        // so a quantized Mamba model loads but still can't inference yet.
+        GgmlType::Q8_0 => rustllama_gguf::dequant::dequant_q8_0(bytes, &mut out),
+        GgmlType::Q4_0 => rustllama_gguf::dequant::dequant_q4_0(bytes, &mut out),
+        GgmlType::Q5_0 => rustllama_gguf::dequant::dequant_q5_0(bytes, &mut out),
+        GgmlType::Q4_1 => rustllama_gguf::dequant::dequant_q4_1(bytes, &mut out),
+        GgmlType::Q5_1 => rustllama_gguf::dequant::dequant_q5_1(bytes, &mut out),
+        GgmlType::Q2_K => rustllama_gguf::dequant::dequant_q2_k(bytes, &mut out),
+        GgmlType::Q3_K => rustllama_gguf::dequant::dequant_q3_k(bytes, &mut out),
+        GgmlType::Q4_K => rustllama_gguf::dequant::dequant_q4_k(bytes, &mut out),
+        GgmlType::Q5_K => rustllama_gguf::dequant::dequant_q5_k(bytes, &mut out),
+        GgmlType::Q6_K => rustllama_gguf::dequant::dequant_q6_k(bytes, &mut out),
+        GgmlType::Q8_K => rustllama_gguf::dequant::dequant_q8_k(bytes, &mut out),
         other => {
             return Err(MambaError::UnsupportedDtype {
                 tensor: name.to_string(),

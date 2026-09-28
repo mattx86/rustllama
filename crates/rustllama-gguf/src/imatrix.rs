@@ -81,7 +81,13 @@ impl Imatrix {
             ));
         }
         let n_tensors = read_u32(&mut cur)? as usize;
-        let mut map = HashMap::with_capacity(n_tensors);
+        // `n_tensors` and `n_cols` are untrusted length prefixes — cap
+        // the up-front allocation hints (mirroring `parse.rs`'s
+        // `.min(1 << 16)` guard) so a malformed header can't request a
+        // multi-GB allocation before any bytes are read. The loops
+        // still read the true count and fail cleanly at
+        // `read_exact`/`read_f32` if the stream is short.
+        let mut map = HashMap::with_capacity(n_tensors.min(1 << 16));
         for _ in 0..n_tensors {
             let name_len = read_u32(&mut cur)? as usize;
             let mut name_bytes = vec![0u8; name_len];
@@ -90,9 +96,9 @@ impl Imatrix {
                 io::Error::new(io::ErrorKind::InvalidData, format!("imatrix: bad utf8 name: {e}"))
             })?;
             let n_cols = read_u32(&mut cur)? as usize;
-            let mut vals = vec![0f32; n_cols];
-            for v in vals.iter_mut() {
-                *v = read_f32(&mut cur)?;
+            let mut vals = Vec::with_capacity(n_cols.min(1 << 16));
+            for _ in 0..n_cols {
+                vals.push(read_f32(&mut cur)?);
             }
             map.insert(name, vals);
         }

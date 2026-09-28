@@ -58,6 +58,14 @@ EXPORTS
     rsl_flash_attn_prefill_usm
     rsl_flash_attn_prefill_v2_usm
     rsl_flash_attn_prefill_v3_usm
+    rsl_flash_attn_decode_q4_0_usm
+    rsl_flash_attn_prefill_q4_0_usm
+    rsl_flash_attn_decode_nvfp4_usm
+    rsl_flash_attn_prefill_nvfp4_usm
+    rsl_flash_attn_decode_tq_usm
+    rsl_flash_attn_prefill_tq_usm
+    rsl_flash_attn_decode_q8_0_usm
+    rsl_flash_attn_prefill_q8_0_usm
     rsl_gemm_f16_usm
     rsl_matvec_q8_0_f32_usm
     rsl_matvec_q8_0_packed_f32_usm
@@ -67,6 +75,14 @@ EXPORTS
     rsl_hadamard_forward_usm
     rsl_matvec_q5_k_packed_f32_usm
     rsl_matvec_q6_k_packed_f32_usm
+    rsl_matvec_q4_0_packed_f32_usm
+    rsl_matvec_q5_0_packed_f32_usm
+    rsl_matvec_q4_1_packed_f32_usm
+    rsl_matvec_q5_1_packed_f32_usm
+    rsl_matvec_q2_k_packed_f32_usm
+    rsl_matvec_q3_k_packed_f32_usm
+    rsl_matvec_q8_k_packed_f32_usm
+    rsl_matvec_pq2_0_packed_f32_usm
     rsl_matvec_iq4_nl_packed_f32_usm
     rsl_matvec_iq4_xs_packed_f32_usm
     rsl_matvec_iq4_nl_packed_f32_batched_usm
@@ -124,6 +140,7 @@ EXPORTS
     rsl_matvec_iq2_s_gate_up_fused_usm
     rsl_matvec_iq3_xxs_gate_up_fused_usm
     rsl_matvec_iq3_s_gate_up_fused_usm
+    rsl_matvec_ptq1_0_gate_up_fused_usm
     rsl_matvec_q4_k_add_rmsnorm_usm
     rsl_matvec_q8_0_add_rmsnorm_usm
     rsl_matvec_q5_k_add_rmsnorm_usm
@@ -137,6 +154,7 @@ EXPORTS
     rsl_matvec_iq2_s_add_rmsnorm_usm
     rsl_matvec_iq3_xxs_add_rmsnorm_usm
     rsl_matvec_iq3_s_add_rmsnorm_usm
+    rsl_matvec_ptq1_0_add_rmsnorm_usm
     rsl_matvec_q8_0_f16in_packed_f32_usm
     rsl_matvec_q4_k_f16in_packed_f32_usm
     rsl_matvec_q5_k_f16in_packed_f32_usm
@@ -150,6 +168,7 @@ EXPORTS
     rsl_matvec_iq2_s_f16in_packed_f32_usm
     rsl_matvec_iq3_xxs_f16in_packed_f32_usm
     rsl_matvec_iq3_s_f16in_packed_f32_usm
+    rsl_matvec_ptq1_0_f16in_packed_f32_usm
 
     ; G5: K-quant → F32 dequant (USM-in / USM-out)
     rsl_dequant_q4_k_to_f32_usm

@@ -2283,40 +2283,143 @@ async fn load_model(
         .await;
     }
 
+    // Config + tuner-cache-driven knobs applied at (and around) load.
+    // Loaded here — AFTER the mandatory first-load autotune above populated
+    // the cache, but BEFORE the blocking load — so the kv_dtype /
+    // kv_cache_layout / kv_page_size winners (which must be passed at load)
+    // and the env-transported kernel knobs are in effect for this model.
+    // The auto_apply flags are read live so a PUT /v1/config toggle takes
+    // effect without a restart. Mirrors the CLI serve load path.
+    let cfg_for_tuning = state
+        .config_path
+        .as_ref()
+        .and_then(|p| rustllama_config::load(p.as_ref()).ok())
+        .unwrap_or_default();
+    let model_key = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown-model")
+        .to_string();
+
+    // ENV-transported tuner winners (system-level; read by the kernels at
+    // dispatch time). Guarded by `is_none()` so a value the operator — or the
+    // `serve` startup load — already set always wins; only ever applied when a
+    // real cache winner exists, so the no-winner path is left untouched.
+    if cfg_for_tuning.tuning.auto_apply_ssm_prefill_chunked
+        && std::env::var_os("RUSTLLAMA_SSM_PREFILL_CHUNKED").is_none()
+        && tuner_cached_ssm_prefill_chunked() == Some(true)
+    {
+        std::env::set_var("RUSTLLAMA_SSM_PREFILL_CHUNKED", "1");
+        tracing::info!(model = %model_key, "load_model: applied ssm_prefill_chunked winner (env)");
+    }
+    if cfg_for_tuning.tuning.auto_apply_flash_v3_kv_tile
+        && std::env::var_os("RUSTLLAMA_FLASH_V3_KV_TILE").is_none()
+    {
+        if let Some(t) = tuner_cached_flash_v3_kv_tile() {
+            std::env::set_var("RUSTLLAMA_FLASH_V3_KV_TILE", t.to_string());
+            tracing::info!(model = %model_key, applied = t, "load_model: applied flash_v3_kv_tile winner (env)");
+        }
+    }
+    if cfg_for_tuning.tuning.auto_apply_flash_kv_min
+        && std::env::var_os("RUSTLLAMA_FLASH_KV_LEN_MIN").is_none()
+    {
+        if let Some(v) = tuner_cached_flash_kv_min() {
+            std::env::set_var("RUSTLLAMA_FLASH_KV_LEN_MIN", v.to_string());
+            tracing::info!(model = %model_key, applied = v, "load_model: applied flash_attention_kv_min winner (env)");
+        }
+    }
+
     // Load happens on a blocking pool — mapping a multi-GB GGUF and
     // memcpy-ing weights into per-layer tensors easily blows past the
     // tokio worker timing budget.
-    let kv_dtype = match req.kv_dtype.as_deref() {
-        None | Some("") => rustllama_engine::KvDtype::F32,
-        Some(s) => {
-            // Coherence guardrail (1d): downgrade an aggressive quant
-            // KV to f32 when this model isn't validated for it.
-            let (safe, warn) = rustllama_config::coherence_safe_kv_dtype(
-                s,
-                &path,
-                rustllama_config::force_quant_kv_from_env(),
-            );
-            if let Some(w) = warn {
-                tracing::warn!("{w}");
+    //
+    // kv_dtype precedence (highest first):
+    //   1. request override (`req.kv_dtype`) — strict coherence guard
+    //      (force only via RUSTLLAMA_FORCE_QUANT_KV);
+    //   2. tuner-cache winner (gated by auto_apply_kv_dtype) — trusted
+    //      (force=true): the sweep already cleared it past the 0.90
+    //      coherence gate, matching the CLI serve path;
+    //   3. F32 default (unchanged when neither is present).
+    let kv_dtype = {
+        let (dtype_str, trust_winner): (Option<String>, bool) = match req.kv_dtype.as_deref() {
+            Some(s) if !s.is_empty() => (Some(s.to_string()), false),
+            _ => {
+                let cached = if cfg_for_tuning.tuning.auto_apply_kv_dtype {
+                    tuner_cached_kv_dtype()
+                } else {
+                    None
+                };
+                if let Some(c) = cached.as_deref() {
+                    tracing::info!(model = %model_key, applied = %c, "load_model: applied kv_dtype from tuner cache");
+                }
+                (cached, true)
             }
-            match rustllama_engine::KvDtype::parse(&safe) {
-                Some(d) => d,
-                None => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        format!(
-                            "unknown kv_dtype `{s}` (expected: f32, q8_0, q4_0, \
-                             tq1/tq2/tq4/tq8, or nvfp4)"
-                        ),
-                    )
-                        .into_response();
+        };
+        match dtype_str {
+            None => rustllama_engine::KvDtype::F32,
+            Some(s) => {
+                // Coherence guardrail (1d): downgrade an aggressive quant
+                // KV to f32 when this model isn't validated for it — unless
+                // the winner came from the cache (trusted) or the operator
+                // forced it via env.
+                let (safe, warn) = rustllama_config::coherence_safe_kv_dtype(
+                    &s,
+                    &path,
+                    trust_winner || rustllama_config::force_quant_kv_from_env(),
+                );
+                if let Some(w) = warn {
+                    tracing::warn!("{w}");
+                }
+                match rustllama_engine::KvDtype::parse(&safe) {
+                    Some(d) => d,
+                    None => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!(
+                                "unknown kv_dtype `{s}` (expected: f32, q8_0, q4_0, \
+                                 tq1/tq2/tq4/tq8, or nvfp4)"
+                            ),
+                        )
+                            .into_response();
+                    }
                 }
             }
         }
     };
+
+    // kv_cache_layout + kv_page_size winners (passed at load). Fall back to
+    // the historical `load_with_options` defaults ("contiguous", page_size 0)
+    // when no winner exists, so the no-cache path is byte-identical to before.
+    let applied_layout = cfg_for_tuning
+        .tuning
+        .auto_apply_kv_cache_layout
+        .then(tuner_cached_kv_cache_layout)
+        .flatten()
+        .unwrap_or_else(|| "contiguous".to_string());
+    if applied_layout != "contiguous" {
+        tracing::info!(model = %model_key, applied = %applied_layout, "load_model: applied kv_cache_layout winner");
+    }
+    let applied_page_size = cfg_for_tuning
+        .tuning
+        .auto_apply_kv_page_size
+        .then(tuner_cached_kv_page_size)
+        .flatten()
+        .unwrap_or(0u32);
+    if applied_page_size != 0 {
+        tracing::info!(model = %model_key, applied = applied_page_size, "load_model: applied kv_page_size winner");
+    }
+
     let load_path = path.clone();
+    let load_layout = applied_layout.clone();
     let load_result = tokio::task::spawn_blocking(move || {
-        rustllama_engine::CpuEngine::load_with_options(&load_path, max_ctx, true, kv_dtype)
+        rustllama_engine::CpuEngine::load_with_options_layout_and_page_size(
+            &load_path,
+            max_ctx,
+            true,
+            kv_dtype,
+            &load_layout,
+            applied_page_size,
+        )
     })
     .await;
     let mut cpu = match load_result {
@@ -2350,16 +2453,9 @@ async fn load_model(
     // The cache reads happen here (not inside the blocking load
     // task) so the auto_apply flags can be flipped via PUT
     // /v1/config without a restart.
-    let cfg_for_tuning = state
-        .config_path
-        .as_ref()
-        .and_then(|p| rustllama_config::load(p.as_ref()).ok())
-        .unwrap_or_default();
-    let model_key = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown-model")
-        .to_string();
+    // `cfg_for_tuning` + `model_key` were resolved above the load so the
+    // load-time winners (kv_dtype / kv_cache_layout / kv_page_size) could be
+    // passed to the load call; reuse them here for the post-load knobs.
     let resolved_batch_size = match req.batch_size {
         Some(size) => Some(size),
         None => {
@@ -2379,6 +2475,31 @@ async fn load_model(
     };
     if let Some(size) = resolved_batch_size {
         cpu.set_prefill_chunk_size(size as usize);
+    }
+    // flash_attention winner (post-load applicable). Only applied when a
+    // cache winner exists, so a model with no tuned value keeps the engine's
+    // load-time default. Mirrors the CLI serve path's `set_flash_attention`.
+    if cfg_for_tuning.tuning.auto_apply_flash_attention {
+        if let Some(fa) = tuner_cached_flash_attention() {
+            tracing::info!(
+                model = %model_key,
+                applied = fa,
+                "load_model: applied flash_attention winner"
+            );
+            cpu.set_flash_attention(fa);
+        }
+    }
+    // prefix_cache_max_snapshots winner (post-load applicable). Same
+    // apply-only-when-present rule as flash_attention above.
+    if cfg_for_tuning.tuning.auto_apply_prefix_cache_max_snapshots {
+        if let Some(n) = tuner_cached_prefix_cache_max_snapshots() {
+            tracing::info!(
+                model = %model_key,
+                applied = n,
+                "load_model: applied prefix_cache_max_snapshots winner"
+            );
+            cpu.set_prefix_cache_max_snapshots(n as usize);
+        }
     }
     // Placement precedence (mirrors the CLI `serve` load path):
     //   1. an explicit `[inference].n_gpu_layers` override (any value other
@@ -2448,10 +2569,11 @@ async fn load_model(
     // [tuning].auto_apply_speculative_mtp) over the config default, mirroring
     // the CLI serve load path. A non-capable model (not hybrid / no NextN head)
     // silently no-ops on the engine side, so this is safe to set
-    // unconditionally. (kv_dtype trust-the-winner + the chunked-SSM-prefill
-    // env transport are CLI-serve-only for now — see the combined-build
-    // follow-up; the HTTP load path here reads only placement / batch_size /
-    // MTP from the cache today.)
+    // unconditionally. (The HTTP load path now also applies the kv_dtype /
+    // kv_cache_layout / kv_page_size / flash_attention /
+    // prefix_cache_max_snapshots winners plus the env-transported
+    // ssm_prefill_chunked / flash_v3_kv_tile / flash_attention_kv_min knobs —
+    // see the blocks above — bringing it to parity with the CLI serve load.)
     let applied_mtp = if cfg_for_tuning.tuning.auto_apply_speculative_mtp {
         tuner_cached_speculative_mtp().unwrap_or(cfg_for_tuning.inference.speculative_mtp)
     } else {
@@ -3608,6 +3730,79 @@ fn tuner_cached_speculative_mtp() -> Option<bool> {
     tuning.speculative_mtp
 }
 
+// --- additional tuner-cache siblings (mirror the CLI serve load path) --------
+//
+// The HTTP `/v1/models/load` path can't call the CLI's
+// `*_from_cache_or_default` helpers (the cli crate depends on the server
+// crate, not vice-versa), so these read the same per-system tuner cache
+// directly. Each returns `None` on cache miss / unresolvable dir so the
+// caller falls back to its existing default unchanged.
+
+/// Cached `kv_dtype` winner (config-string). Mirrors the CLI's
+/// `kv_dtype_from_cache_or_default`.
+fn tuner_cached_kv_dtype() -> Option<String> {
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    let tuning = rustllama_tuner::load_cache(&cache_dir, &key).ok()??;
+    tuning.kv_dtype
+}
+
+/// Cached `kv_cache_layout` winner (`"contiguous"` | `"paged"`).
+fn tuner_cached_kv_cache_layout() -> Option<String> {
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    let tuning = rustllama_tuner::load_cache(&cache_dir, &key).ok()??;
+    tuning.kv_cache_layout
+}
+
+/// Cached `kv_page_size` winner (paged layout only).
+fn tuner_cached_kv_page_size() -> Option<u32> {
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    let tuning = rustllama_tuner::load_cache(&cache_dir, &key).ok()??;
+    tuning.kv_page_size
+}
+
+/// Cached `flash_attention` winner.
+fn tuner_cached_flash_attention() -> Option<bool> {
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    let tuning = rustllama_tuner::load_cache(&cache_dir, &key).ok()??;
+    tuning.flash_attention
+}
+
+/// Cached `prefix_cache_max_snapshots` winner.
+fn tuner_cached_prefix_cache_max_snapshots() -> Option<u32> {
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    let tuning = rustllama_tuner::load_cache(&cache_dir, &key).ok()??;
+    tuning.prefix_cache_max_snapshots
+}
+
+/// Cached chunked-SSM-prefill winner (env-transported to the kernel).
+fn tuner_cached_ssm_prefill_chunked() -> Option<bool> {
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    let tuning = rustllama_tuner::load_cache(&cache_dir, &key).ok()??;
+    tuning.ssm_prefill_chunked
+}
+
+/// Cached flash-attn-v3 KV tile winner (env-transported to the kernel).
+fn tuner_cached_flash_v3_kv_tile() -> Option<u32> {
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    let tuning = rustllama_tuner::load_cache(&cache_dir, &key).ok()??;
+    tuning.flash_v3_kv_tile
+}
+
+/// Cached flash-attention `KV_LEN_MIN` winner (env-transported to the kernel).
+fn tuner_cached_flash_kv_min() -> Option<u32> {
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    let tuning = rustllama_tuner::load_cache(&cache_dir, &key).ok()??;
+    tuning.flash_kv_min
+}
+
 /// Peek at a GGUF file's `<arch>.context_length` metadata without
 /// loading the model. Used by `load_model` to pick a sensible
 /// default `ctx_size` from what the model was actually trained for.
@@ -3876,7 +4071,12 @@ async fn healthz(State(state): State<AppState>) -> Json<Health> {
         status: if state.is_shutting_down() { "draining" } else { "ok" },
         model_id,
         version: state.version.clone(),
-        uptime_s: 0,
+        // Real process uptime, computed the same way as `/v1/metrics`
+        // (shared `SERVER_START` Instant) so the two endpoints agree.
+        uptime_s: SERVER_START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_secs(),
         lan_urls: enumerate_lan_urls(&state),
         draining: state.is_shutting_down(),
         portable: rustllama_runtime::paths().portable,

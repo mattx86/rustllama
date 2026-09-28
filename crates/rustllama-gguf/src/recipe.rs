@@ -44,7 +44,8 @@ pub enum RecipeError {
     #[error(
         "recipe {path} line {line}: unknown target dtype {dtype:?}. \
          Supported targets: f32, f16, bf16, q4_0, q4_1, q5_0, q5_1, q8_0, q8_1, \
-         q2_k, q3_k, q4_k, q5_k, q6_k, q8_k, tq1_0, tq2_0, iq4_nl, iq4_xs."
+         q2_k, q3_k, q4_k, q5_k, q6_k, q8_k, tq1_0, tq2_0, iq4_nl, iq4_xs, \
+         iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq1_s, iq1_m."
     )]
     UnknownDtype {
         path: String,

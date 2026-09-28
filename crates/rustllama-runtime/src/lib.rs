@@ -18,6 +18,7 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 pub mod crash;
@@ -185,8 +186,57 @@ pub fn lock_path() -> Result<PathBuf> {
     Ok(runtime_dir()?.join("server.lock"))
 }
 
-/// Read the live-server record from disk if it exists and the recorded PID
-/// is still alive. Stale records are removed.
+/// Single-instance server lock. Holds an OS advisory *exclusive* lock on
+/// `runtime/server.lock` for as long as it's alive; dropping it releases the
+/// lock and removes the file. `rustllama serve` (and the GUI-embedded server)
+/// should acquire this at startup and keep the guard for the process lifetime,
+/// so a second `serve` against the same runtime dir fails fast with a clear
+/// "already running" instead of silently clobbering `server.json`. The OS TCP
+/// port bind is the ultimate backstop — two servers can't bind the same port —
+/// but this is an earlier, port-independent signal keyed to the runtime dir.
+#[derive(Debug)]
+pub struct ServerLock {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl Drop for ServerLock {
+    fn drop(&mut self) {
+        // Advisory lock releases on handle close too, but be explicit, then
+        // remove the (now-unlocked) marker file.
+        let _ = FileExt::unlock(&self.file);
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Try to acquire the exclusive single-instance [`ServerLock`]. Creates the
+/// runtime dir + `server.lock` and takes a NON-blocking advisory exclusive
+/// lock on it:
+///   - `Ok(Some(guard))` — acquired; hold the guard for the server's lifetime.
+///   - `Ok(None)`        — another live process already holds it (a server is
+///                         already running against this runtime dir).
+///   - `Err(_)`          — filesystem error creating/opening the lock file.
+pub fn acquire_server_lock() -> Result<Option<ServerLock>> {
+    let dir = runtime_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let path = lock_path()?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(ServerLock { file, path })),
+        // Contention (another process holds it) is the "already running"
+        // signal, not a hard error. fs2 surfaces it with a platform-specific
+        // error whose kind matches `lock_contended_error()`.
+        Err(e) if e.kind() == fs2::lock_contended_error().kind() => Ok(None),
+        Err(e) => Err(RuntimeError::Io(e)),
+    }
+}
+
+/// Read the live-server record from disk if it exists and the recorded
+/// process is still the same live server. Stale records are removed.
 pub fn read_alive_record() -> Result<Option<ServerRecord>> {
     let p = record_path()?;
     if !p.exists() {
@@ -194,12 +244,15 @@ pub fn read_alive_record() -> Result<Option<ServerRecord>> {
     }
     let raw = std::fs::read_to_string(&p)?;
     let rec: ServerRecord = serde_json::from_str(&raw)?;
-    if is_alive(rec.pid) {
+    if is_record_alive(&rec) {
         Ok(Some(rec))
     } else {
-        // best-effort cleanup
+        // Best-effort cleanup of the stale discovery record ONLY. We do NOT
+        // remove `server.lock` here: its lifetime is owned by the live
+        // `ServerLock` guard (a freshly-started server may already hold it),
+        // and deleting a held advisory-lock file would undermine the
+        // single-instance guarantee.
         let _ = std::fs::remove_file(&p);
-        let _ = std::fs::remove_file(lock_path()?);
         Ok(None)
     }
 }
@@ -224,6 +277,47 @@ pub fn is_alive(pid: u32) -> bool {
     let mut s = sysinfo::System::new();
     s.refresh_processes(sysinfo::ProcessesToUpdate::All);
     s.process(sysinfo::Pid::from_u32(pid)).is_some()
+}
+
+/// Max allowed gap (seconds) between a live process's OS start time and the
+/// `started_at` stamp in its [`ServerRecord`] before we treat the PID as
+/// having been *reused* by an unrelated process. The stamp is written within a
+/// short startup window of process launch, so a healthy server's gap is a few
+/// seconds; a recycled PID's is not.
+const PID_REUSE_TOLERANCE_SECS: u64 = 120;
+
+/// Parse the `epoch-<unix-secs>` stamp `serve` writes into
+/// [`ServerRecord::started_at`]. Returns `None` for any other / legacy format
+/// so callers fall back to a PID-only liveness check rather than mis-reading a
+/// valid record as stale.
+fn parse_started_at_epoch(started_at: &str) -> Option<u64> {
+    started_at
+        .trim()
+        .strip_prefix("epoch-")?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+/// Liveness check for a specific [`ServerRecord`] that defends against PID
+/// reuse. Bare [`is_alive`] only asks "does *some* process with this PID
+/// exist?" — after a server dies its PID can be recycled by an unrelated
+/// process, which [`is_alive`] would misreport as a running server. This
+/// additionally cross-checks the live process's start time against the
+/// record's `started_at` (both UNIX seconds); a mismatch beyond
+/// [`PID_REUSE_TOLERANCE_SECS`] means the PID was reused ⇒ not our server.
+/// When `started_at` can't be parsed we fall back to the PID-only check, so a
+/// legacy / foreign stamp never causes a false "dead".
+pub fn is_record_alive(rec: &ServerRecord) -> bool {
+    let mut s = sysinfo::System::new();
+    s.refresh_processes(sysinfo::ProcessesToUpdate::All);
+    let Some(proc_) = s.process(sysinfo::Pid::from_u32(rec.pid)) else {
+        return false;
+    };
+    match parse_started_at_epoch(&rec.started_at) {
+        Some(recorded) => proc_.start_time().abs_diff(recorded) <= PID_REUSE_TOLERANCE_SECS,
+        None => true,
+    }
 }
 
 /// Snapshot of the host's RAM situation in bytes. Refreshes memory
@@ -1016,7 +1110,10 @@ fn enumerate_logical_processors() -> Vec<LogicalProcessor> {
     let Ok(rd) = std::fs::read_dir(base) else {
         return Vec::new();
     };
-    let mut cores: Vec<(u32, u8)> = Vec::new();
+    // First pass: collect each CPU's raw capacity + core_type hint. We can't
+    // bucket until the peak capacity is known (see below), so defer the
+    // P/E classification.
+    let mut raw: Vec<(u32, Option<u32>, Option<u8>)> = Vec::new();
     for entry in rd.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -1028,23 +1125,52 @@ fn enumerate_logical_processors() -> Vec<LogicalProcessor> {
         let cap = std::fs::read_to_string(entry.path().join("cpu_capacity"))
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok());
-        // Some Intel hybrid kernels expose `topology/core_type`.
-        let core_type = std::fs::read_to_string(entry.path().join("topology/core_type"))
+        // Some Intel hybrid kernels expose `topology/core_type`
+        // ("intel_core"=P > "intel_atom"=E); reduce it to the same rank the
+        // shared classifier buckets.
+        let ct_rank = std::fs::read_to_string(entry.path().join("topology/core_type"))
             .ok()
-            .map(|s| s.trim().to_string());
-        // Encode a class-rank into the u8 the shared classifier buckets:
-        // prefer capacity; else core_type ("intel_core"=P > "intel_atom"=E);
-        // else 0 (single-class ⇒ Unknown).
-        let rank: u8 = if let Some(c) = cap {
-            (c.min(255)) as u8
-        } else if let Some(ct) = core_type {
-            if ct.contains("core") { 2 } else if ct.contains("atom") { 1 } else { 0 }
-        } else {
-            0
-        };
-        cores.push((index, rank));
+            .map(|s| {
+                let ct = s.trim();
+                if ct.contains("core") {
+                    2u8
+                } else if ct.contains("atom") {
+                    1
+                } else {
+                    0
+                }
+            });
+        raw.push((index, cap, ct_rank));
     }
-    cores.sort_by_key(|(i, _)| *i);
+
+    // Peak reported capacity across all cores. ARM DynamIQ reports
+    // `cpu_capacity` on a scale whose max is ~1024 (e.g. big=1024,
+    // LITTLE=~512), so the OLD absolute `.min(255) as u8` clamp collapsed BOTH
+    // clusters onto 255 — a single distinct rank ⇒ every core misclassified as
+    // Unknown. Bucket by capacity RELATIVE to the peak instead, so big.LITTLE
+    // (and 3-tier DynamIQ) split correctly at any scale: a core within
+    // `PERF_CAPACITY_PERCENT`% of the peak is Performance-class, the rest are
+    // Efficiency-class. Cores with no `cpu_capacity` fall back to the
+    // core_type hint (or Unknown). A homogeneous set collapses to one rank and
+    // the shared classifier tags every core Unknown, as before.
+    const PERF_CAPACITY_PERCENT: u64 = 60;
+    let max_cap = raw.iter().filter_map(|(_, c, _)| *c).max().unwrap_or(0);
+    let cores: Vec<(u32, u8)> = raw
+        .into_iter()
+        .map(|(index, cap, ct_rank)| {
+            let rank: u8 = match cap {
+                Some(c) if max_cap > 0 => {
+                    if u64::from(c) * 100 >= u64::from(max_cap) * PERF_CAPACITY_PERCENT {
+                        2
+                    } else {
+                        1
+                    }
+                }
+                _ => ct_rank.unwrap_or(0),
+            };
+            (index, rank)
+        })
+        .collect();
     classify(cores)
 }
 
@@ -1140,6 +1266,12 @@ pub fn process_rss_bytes() -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate process-global env vars (the path-mode
+    /// detection reads `RUSTLLAMA_SYSTEM_DIRS`). cargo runs unit tests in one
+    /// process across many threads, so without this two env-mutating tests can
+    /// interleave and read each other's state.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn record_path_resolves() {
         let p = record_path();
@@ -1172,58 +1304,53 @@ mod tests {
         assert!(is_alive(me));
     }
 
-    /// Env var `RUSTLLAMA_PORTABLE` (any value) → portable mode.
-    /// Resolved paths root under `<exe-dir>/rustllama-data/`. We
-    /// directly exercise `resolve_paths()` rather than `paths()` so
-    /// the OnceLock from other tests doesn't leak in.
+    /// CURRENT default = binary-relative. With no `RUSTLLAMA_SYSTEM_DIRS` and
+    /// no `system.flag`, all state roots beside the exe: `config.toml` *is* the
+    /// exe dir, and `models/` `sessions/` `tuning/` `runtime/` `logs/` are
+    /// subdirectories. We exercise `resolve_paths()` directly (not the cached
+    /// `paths()`) so an earlier test's OnceLock init doesn't leak in.
     #[test]
-    fn portable_env_var_routes_paths_under_exe_dir() {
-        // SAFETY: setting an env var in a unit test races with other
-        // threads that read it. The remediation is process isolation
-        // (cargo runs each test in the same process by default), so we
-        // accept the small risk in exchange for a fast test.
-        std::env::set_var("RUSTLLAMA_PORTABLE", "1");
+    fn default_routes_paths_under_exe_dir() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("RUSTLLAMA_SYSTEM_DIRS");
         let p = resolve_paths();
-        std::env::remove_var("RUSTLLAMA_PORTABLE");
-
-        assert!(p.portable, "expected portable=true with env var set");
-        let exe_dir = std::env::current_exe()
+        // In a normal test run the exe dir resolves; if it somehow doesn't,
+        // `resolve_paths` falls back to OS dirs and there is nothing to assert.
+        if let Some(exe_dir) = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-            .expect("current_exe");
-        let portable_root = exe_dir.join("rustllama-data");
-        assert!(
-            p.config_dir.starts_with(&portable_root),
-            "config_dir {} not under {}",
-            p.config_dir.display(),
-            portable_root.display()
-        );
-        assert!(p.cache_dir.starts_with(&portable_root));
-        assert!(p.sessions_dir.starts_with(&portable_root));
-        assert!(p.tuning_dir.starts_with(&portable_root));
-        assert!(p.runtime_dir.starts_with(&portable_root));
-        assert!(p.crash_log_dir.starts_with(&portable_root));
+        {
+            assert!(p.portable, "expected portable=true by default (binary-relative)");
+            assert_eq!(p.config_dir, exe_dir, "config.toml sits beside the exe");
+            assert_eq!(p.cache_dir, exe_dir.join("models"));
+            assert_eq!(p.sessions_dir, exe_dir.join("sessions"));
+            assert_eq!(p.tuning_dir, exe_dir.join("tuning"));
+            assert_eq!(p.runtime_dir, exe_dir.join("runtime"));
+            assert_eq!(p.crash_log_dir, exe_dir.join("logs"));
+        }
     }
 
+    /// Opt out to the OS standard dirs via `RUSTLLAMA_SYSTEM_DIRS`.
     #[test]
-    fn system_mode_routes_paths_under_os_dirs() {
-        // No env var, no flag file: should be system mode.
-        std::env::remove_var("RUSTLLAMA_PORTABLE");
+    fn system_dirs_env_routes_paths_under_os_dirs() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RUSTLLAMA_SYSTEM_DIRS", "1");
         let p = resolve_paths();
-        assert!(!p.portable, "expected portable=false in system mode");
-        // System paths contain "rustllama" somewhere in the chain.
+        std::env::remove_var("RUSTLLAMA_SYSTEM_DIRS");
+        assert!(!p.portable, "expected portable=false with RUSTLLAMA_SYSTEM_DIRS set");
+        // System paths carry "rustllama" somewhere in the chain.
         assert!(p.config_dir.to_string_lossy().contains("rustllama"));
         assert!(p.cache_dir.to_string_lossy().contains("rustllama"));
     }
 
     #[test]
-    fn portable_mode_subdir_layout_is_distinct() {
-        // The six subdirs must be distinct so a `rm -rf` of one doesn't
-        // nuke another. A regression where (e.g.) sessions and tuning
-        // collide would silently corrupt state.
-        std::env::set_var("RUSTLLAMA_PORTABLE", "1");
+    fn default_layout_subdirs_are_distinct() {
+        // The six roots must be distinct so a `rm -rf` of one doesn't nuke
+        // another. A regression where (e.g.) sessions and tuning collide would
+        // silently corrupt state.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("RUSTLLAMA_SYSTEM_DIRS");
         let p = resolve_paths();
-        std::env::remove_var("RUSTLLAMA_PORTABLE");
         let dirs = [
             &p.config_dir,
             &p.cache_dir,
@@ -1237,5 +1364,66 @@ mod tests {
                 assert_ne!(dirs[i], dirs[j], "dirs[{i}] collides with dirs[{j}]");
             }
         }
+    }
+
+    #[test]
+    fn server_lock_is_exclusive() {
+        // Acquire the single-instance lock; a second attempt while it's held
+        // must report contention (Ok(None)), and it must be re-acquirable once
+        // the guard drops.
+        let first = acquire_server_lock().expect("acquire server lock");
+        assert!(first.is_some(), "first acquisition should succeed");
+        let second = acquire_server_lock().expect("second attempt should not error");
+        assert!(second.is_none(), "second acquisition should observe the held lock");
+        drop(first);
+        let third = acquire_server_lock().expect("re-acquire after release");
+        assert!(third.is_some(), "lock should be free again after the guard drops");
+    }
+
+    fn test_record(pid: u32, started_at: String) -> ServerRecord {
+        ServerRecord {
+            pid,
+            port: 0,
+            bind_addr: String::new(),
+            started_at,
+            model_id: None,
+            version: String::new(),
+            owner: "test".into(),
+        }
+    }
+
+    #[test]
+    fn is_record_alive_matches_current_process() {
+        // Stamp the record with THIS process's real start time so the
+        // start-time cross-check lines up regardless of how long the suite
+        // runs (using "now" would false-fail on a slow suite once uptime
+        // exceeds the tolerance).
+        let mut s = sysinfo::System::new();
+        s.refresh_processes(sysinfo::ProcessesToUpdate::All);
+        let start = s
+            .process(sysinfo::Pid::from_u32(std::process::id()))
+            .map(|p| p.start_time())
+            .expect("current process visible to sysinfo");
+        let rec = test_record(std::process::id(), format!("epoch-{start}"));
+        assert!(is_record_alive(&rec));
+    }
+
+    #[test]
+    fn is_record_alive_rejects_pid_reuse_by_start_time() {
+        // Same live PID, but a start-time stamp far in the past ⇒ the PID must
+        // be judged reused (record stale).
+        let rec = test_record(std::process::id(), "epoch-1000000000".to_string());
+        assert!(
+            !is_record_alive(&rec),
+            "a start-time far from the live process's should read as not-alive"
+        );
+    }
+
+    #[test]
+    fn is_record_alive_unparseable_stamp_falls_back_to_pid() {
+        // A legacy / foreign stamp can't be parsed → PID-only liveness, never a
+        // false "dead" for a live PID.
+        let rec = test_record(std::process::id(), "2026-09-28T12:00:00Z".to_string());
+        assert!(is_record_alive(&rec));
     }
 }

@@ -102,15 +102,36 @@ fn cuda_cache() -> Option<&'static Mutex<ck::CudaMatvecCache>> {
 }
 
 /// Map a weight [`Dtype`] to the CUDA cache's packed kind, or `None`
-/// for the kinds the CUDA backend doesn't implement yet (all IQ
-/// families, Q5_K, and non-packed dtypes) — those fall through to the
-/// SYCL/CPU ladder.
+/// for dtypes the CUDA backend doesn't dispatch (non-packed F16/BF16
+/// and NVFP4's non-`Raw` markers) — those fall through to the SYCL/CPU
+/// ladder. Every packed-quant `*Raw` dtype the loader produces now has
+/// a CUDA arm (the kernel surface + `CudaMatvecCache` cover all of
+/// them; `k_alignment`/`row_bytes` on `CudaPackedKind` gate each shape).
 fn dtype_to_cuda_kind(dtype: Dtype) -> Option<ck::CudaPackedKind> {
     match dtype {
         Dtype::PTQ1_0Raw => Some(ck::CudaPackedKind::Ptq1_0),
         Dtype::Q8_0Raw => Some(ck::CudaPackedKind::Q8_0),
         Dtype::Q4_KRaw => Some(ck::CudaPackedKind::Q4_K),
         Dtype::Q6_KRaw => Some(ck::CudaPackedKind::Q6_K),
+        Dtype::Q5_KRaw => Some(ck::CudaPackedKind::Q5_K),
+        Dtype::Q2_KRaw => Some(ck::CudaPackedKind::Q2_K),
+        Dtype::Q8_KRaw => Some(ck::CudaPackedKind::Q8_K),
+        Dtype::Q4_0Raw => Some(ck::CudaPackedKind::Q4_0),
+        Dtype::Q5_0Raw => Some(ck::CudaPackedKind::Q5_0),
+        Dtype::Q4_1Raw => Some(ck::CudaPackedKind::Q4_1),
+        Dtype::Q5_1Raw => Some(ck::CudaPackedKind::Q5_1),
+        Dtype::IQ4_NLRaw => Some(ck::CudaPackedKind::Iq4_Nl),
+        Dtype::IQ4_XSRaw => Some(ck::CudaPackedKind::Iq4_Xs),
+        Dtype::IQ2_XXSRaw => Some(ck::CudaPackedKind::Iq2_Xxs),
+        Dtype::IQ2_XSRaw => Some(ck::CudaPackedKind::Iq2_Xs),
+        Dtype::IQ2_SRaw => Some(ck::CudaPackedKind::Iq2_S),
+        Dtype::IQ3_XXSRaw => Some(ck::CudaPackedKind::Iq3_Xxs),
+        Dtype::IQ3_SRaw => Some(ck::CudaPackedKind::Iq3_S),
+        Dtype::IQ1_SRaw => Some(ck::CudaPackedKind::Iq1_S),
+        Dtype::IQ1_MRaw => Some(ck::CudaPackedKind::Iq1_M),
+        Dtype::Nvfp4Raw => Some(ck::CudaPackedKind::Nvfp4),
+        Dtype::Q3_KRaw => Some(ck::CudaPackedKind::Q3_K),
+        Dtype::PQ2_0Raw => Some(ck::CudaPackedKind::Pq2_0),
         _ => None,
     }
 }
@@ -3020,6 +3041,76 @@ struct UsmAttnContext {
     prefill_k_f32: Option<sk::SyclSharedBuffer<'static, f32>>,
     prefill_v_f32: Option<sk::SyclSharedBuffer<'static, f32>>,
     prefill_out_f32: Option<sk::SyclSharedBuffer<'static, f32>>,
+    /// Per-call USM scratch for the QUANTIZED-KV prefill flash-attention
+    /// kernels (`try_flash_attn_prefill_usm_quant`). Siblings of the F32
+    /// prefill slabs above, but holding the format-specific PACKED bytes
+    /// (Q4_0 blocks / Q8_0 i8 slab / NVFP4 blocks / TurboQuant levels) for
+    /// the whole `[n_kv_heads, max_ctx, bytes_per_row]` slab. Prefill
+    /// re-uploads the entire packed slab on every call (no incremental
+    /// residency / valid-len gate — the same whole-slab model the F32
+    /// prefill helper uses), so there is one shared pair reused across all
+    /// layers of a forward pass rather than a per-layer mirror. The `_f32`
+    /// Q / output scratch above is reused for the quant path's f32 Q/out.
+    /// `*_scales` are allocated only for the formats that carry an
+    /// out-of-band scale (Q8_0 per-row absmax, TurboQuant per-row scale),
+    /// sized `[n_kv_heads * max_ctx]` and indexed `kv_h * max_ctx + t`.
+    prefill_k_packed: Option<sk::SyclSharedBuffer<'static, u8>>,
+    prefill_v_packed: Option<sk::SyclSharedBuffer<'static, u8>>,
+    prefill_k_scales: Option<sk::SyclSharedBuffer<'static, f32>>,
+    prefill_v_scales: Option<sk::SyclSharedBuffer<'static, f32>>,
+    // -------- Quantized-KV flash-attention decode mirror --------
+    //
+    // A SECOND, fully independent per-layer KV mirror used by the
+    // quantized-KV decode helpers (`try_flash_attn_decode_usm_q4_0`
+    // and friends). Where the f16 `k_caches` / `v_caches` above hold
+    // an f16 copy of the KV rows for the F32 path, these hold the
+    // format-specific PACKED bytes (Q4_0 blocks / Q8_0 i8 slab /
+    // NVFP4 blocks / TurboQuant levels) that the quant kernels read
+    // directly — the same bytes the engine's host slab holds, so the
+    // GPU output matches the CPU reference bit-for-bit modulo the
+    // fp-reduction-order tolerance the F32 path already carries.
+    //
+    // Design note — WHY a separate mirror + separate validity gate:
+    // the two mirrors MUST NOT share staleness state. The F32 path
+    // gates on `kv_valid_len` / `kv_epoch`; the quant path gates on
+    // `kv_valid_len_q` / `kv_epoch_q`. A model uses exactly one KV
+    // dtype per layer for the whole generation, so in practice only
+    // one mirror is ever populated — but keeping the gates disjoint
+    // means a stray call on the "wrong" path can never validate a row
+    // it did not write, and the F32 helper stays byte-for-byte
+    // unchanged. Buffers are lazily allocated PER LAYER on first use
+    // (unlike the eager f16 caches) so hybrid stacks don't pay a full
+    // KV mirror for their SSM / non-attention layers.
+    q_k_packed: Vec<Option<sk::SyclSharedBuffer<'static, u8>>>,
+    q_v_packed: Vec<Option<sk::SyclSharedBuffer<'static, u8>>>,
+    /// Per-row f32 scale mirrors — allocated only for the formats that
+    /// carry an out-of-band scale (Q8_0 per-row absmax, TurboQuant
+    /// per-row max-abs). `[n_kv_heads * max_ctx]` when present, indexed
+    /// `kv_h * max_ctx + t` to match the host slab + the kernel. Left
+    /// `None` for Q4_0 / NVFP4 which embed their scale in the packed
+    /// block bytes.
+    q_k_scales: Vec<Option<sk::SyclSharedBuffer<'static, f32>>>,
+    q_v_scales: Vec<Option<sk::SyclSharedBuffer<'static, f32>>>,
+    /// `bytes_per_row` the layer's packed mirror was last allocated
+    /// for. `0` = unallocated. A change (only possible if a layer's KV
+    /// format changed mid-run, which never happens today) forces a
+    /// re-alloc + a validity reset for that layer.
+    q_bytes_per_row: Vec<u32>,
+    /// Contiguous-valid-row tracker for the quant mirror, mirroring
+    /// `kv_valid_len` for the f16 path (see its doc). Independent so a
+    /// gap on one path can't mask a gap on the other.
+    kv_valid_len_q: Vec<u32>,
+    /// Epoch the quant mirror's rows were written under. Independent of
+    /// the f16 mirror's `kv_epoch`; both track the global
+    /// [`USM_KV_EPOCH`] but reset their own valid-lens separately.
+    kv_epoch_q: u64,
+    /// F32 Q / output scratch for the quant kernels. The quant flash
+    /// kernels take an F32 `q` and write an F32 `out` (unlike the f16
+    /// `q_scratch` / `out_scratch` the F32 path uses), so these are
+    /// separate slabs. Shared across all quant layers — only one layer
+    /// computes at a time. Sized `n_heads * head_dim`.
+    q_scratch_f32: Option<sk::SyclSharedBuffer<'static, f32>>,
+    out_scratch_f32: Option<sk::SyclSharedBuffer<'static, f32>>,
 }
 
 impl UsmAttnContext {
@@ -3086,6 +3177,22 @@ impl UsmAttnContext {
             prefill_k_f32: None,
             prefill_v_f32: None,
             prefill_out_f32: None,
+            prefill_k_packed: None,
+            prefill_v_packed: None,
+            prefill_k_scales: None,
+            prefill_v_scales: None,
+            // Quant-KV mirror: lazily allocated per layer, so start
+            // every layer empty. `n_layers`-sized so `layer_idx` (the
+            // same index used for the f16 caches) is always in range.
+            q_k_packed: (0..cfg.n_layers).map(|_| None).collect(),
+            q_v_packed: (0..cfg.n_layers).map(|_| None).collect(),
+            q_k_scales: (0..cfg.n_layers).map(|_| None).collect(),
+            q_v_scales: (0..cfg.n_layers).map(|_| None).collect(),
+            q_bytes_per_row: vec![0; cfg.n_layers as usize],
+            kv_valid_len_q: vec![0; cfg.n_layers as usize],
+            kv_epoch_q: 0,
+            q_scratch_f32: None,
+            out_scratch_f32: None,
         };
         let kv_buf_len =
             (cfg.n_kv_heads as usize) * (cfg.max_ctx as usize) * (cfg.head_dim as usize);
@@ -3400,6 +3507,20 @@ impl Drop for UsmAttnContext {
         self.prefill_k_f32 = None;
         self.prefill_v_f32 = None;
         self.prefill_out_f32 = None;
+        // Quant-KV prefill packed scratch — same Drop-before-stream order.
+        self.prefill_k_packed = None;
+        self.prefill_v_packed = None;
+        self.prefill_k_scales = None;
+        self.prefill_v_scales = None;
+        // Quantized-KV decode mirror — `Vec::clear()` runs each
+        // buffer's Drop (usm_free on `self.stream`) before the stream
+        // is destroyed, matching the K/V cache ordering above.
+        self.q_k_packed.clear();
+        self.q_v_packed.clear();
+        self.q_k_scales.clear();
+        self.q_v_scales.clear();
+        self.q_scratch_f32 = None;
+        self.out_scratch_f32 = None;
         // `self.stream` drops here.
     }
 }
@@ -4274,6 +4395,14 @@ pub fn preload_packed_tensor_to_usm(w: &Tensor) -> bool {
         Dtype::IQ3_XXSRaw => PackedMatvecKind::IQ3_XXS,
         Dtype::IQ3_SRaw => PackedMatvecKind::IQ3_S,
         Dtype::PTQ1_0Raw => PackedMatvecKind::PTQ1_0,
+        Dtype::Q4_0Raw => PackedMatvecKind::Q4_0,
+        Dtype::Q5_0Raw => PackedMatvecKind::Q5_0,
+        Dtype::Q4_1Raw => PackedMatvecKind::Q4_1,
+        Dtype::Q5_1Raw => PackedMatvecKind::Q5_1,
+        Dtype::Q2_KRaw => PackedMatvecKind::Q2_K,
+        Dtype::Q3_KRaw => PackedMatvecKind::Q3_K,
+        Dtype::Q8_KRaw => PackedMatvecKind::Q8_K,
+        Dtype::PQ2_0Raw => PackedMatvecKind::PQ2_0,
         _ => return false,
     };
     // Weight tensors are shaped `[M, K]` (out × in). The engine's
@@ -4716,6 +4845,1514 @@ pub fn try_flash_attn_decode_usm_f32(
         }
         true
     })
+}
+
+// ------------------------------------------------------------------
+// Quantized-KV flash-attention decode (USM-resident)
+// ------------------------------------------------------------------
+//
+// These mirror `try_flash_attn_decode_usm_f32` EXACTLY — same env +
+// placement gate, same per-thread `UsmAttnContext`, same
+// epoch/valid-len staleness gate, same "write the new row into the
+// USM mirror at `pos`, run the kernel over `[0, pos+1)`, read `out`
+// back" shape — with two differences:
+//   1. The mirror holds format-specific PACKED bytes (+ per-row f32
+//      scales for Q8_0 / TurboQuant) instead of f16, produced by the
+//      SAME CPU quantizers the engine's host slab uses. That keeps
+//      the mirror byte-identical to the host slab, so the GPU result
+//      equals the CPU flash-decode result to the fp-reduction
+//      tolerance the F32 path already tolerates.
+//   2. Validity is tracked on `kv_valid_len_q` / `kv_epoch_q`, which
+//      are disjoint from the f16 path's `kv_valid_len` / `kv_epoch`.
+//      The quant path never writes the f16 mirror and vice-versa, so
+//      the two can't corrupt each other's staleness gate.
+//
+// PREFILL (batched) is wired separately below in
+// `try_flash_attn_prefill_usm_quant` / `try_flash_attn_prefill_cuda_quant`
+// and their `try_flash_attn_prefill_gpu_*` combinators — same packed
+// formats, but the whole-slab re-upload residency model rather than this
+// decode path's per-row incremental mirror.
+
+/// Which quantized KV format a decode call targets. Carries the
+/// TurboQuant bit-width inline (the only format with a runtime
+/// parameter). `Copy` so it threads through the helper cheaply.
+#[derive(Clone, Copy)]
+enum QuantKv {
+    Q4_0,
+    Q8_0,
+    Nvfp4,
+    Tq { bits: u8 },
+}
+
+impl QuantKv {
+    /// Packed bytes per KV row for this format — must match the
+    /// engine host slab's `bytes_per_row` exactly.
+    fn bytes_per_row(self, head_dim: usize) -> usize {
+        use rustllama_kernels_cpu::{nvfp4, q4_0_kv, turboquant};
+        match self {
+            QuantKv::Q4_0 => (head_dim / q4_0_kv::Q4_0_BLOCK_ELEMS) * q4_0_kv::Q4_0_BLOCK_BYTES,
+            // Q8_0 KV is stored as a raw i8 slab (1 byte / element),
+            // NOT ggml 34B/32 blocks — matching the CPU Q8_0 kernel.
+            QuantKv::Q8_0 => head_dim,
+            QuantKv::Nvfp4 => (head_dim / nvfp4::NVFP4_BLOCK_ELEMS) * nvfp4::NVFP4_BLOCK_BYTES,
+            QuantKv::Tq { bits } => turboquant::bytes_per_block(head_dim, bits),
+        }
+    }
+
+    /// Whether the format keeps per-row scales in a side buffer.
+    fn has_scales(self) -> bool {
+        matches!(self, QuantKv::Q8_0 | QuantKv::Tq { .. })
+    }
+}
+
+/// Ensure `slot` holds a `u8` USM buffer of EXACTLY `len` bytes on
+/// `stream`. Reallocates on a size mismatch (packed mirrors are sized
+/// to the full `n_kv_heads * max_ctx * bytes_per_row` slab, so exact
+/// sizing — not grow-only — keeps the layout the kernel expects).
+/// Returns false on alloc failure so the caller can fall back to CPU.
+fn ensure_u8_exact(
+    stream: &sk::SyclStream,
+    slot: &mut Option<sk::SyclSharedBuffer<'static, u8>>,
+    len: usize,
+) -> bool {
+    if slot.as_ref().map_or(false, |b| b.len() == len) {
+        return true;
+    }
+    // Free the mismatched buffer before allocating its replacement so
+    // peak USM doesn't double.
+    *slot = None;
+    match sk::SyclSharedBuffer::<u8>::alloc(stream, len) {
+        Ok(buf) => {
+            // SAFETY: same '_-to-'static transmute the other scratch
+            // uses — the UsmAttnContext Drop frees these before the
+            // stream goes.
+            *slot = Some(unsafe {
+                std::mem::transmute::<
+                    sk::SyclSharedBuffer<'_, u8>,
+                    sk::SyclSharedBuffer<'static, u8>,
+                >(buf)
+            });
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Shared body for every quantized-KV decode helper. See the module
+/// comment above for the design. Returns `true` iff the GPU produced
+/// the attention output (written to `out`); `false` for any gate /
+/// shape / alloc / kernel failure, on which the caller runs its
+/// existing CPU attention over the host slab.
+///
+/// `k_row` / `v_row` are the NEW (post-RoPE, post-whiten, post-bias)
+/// f32 K/V rows for `pos`, length `n_kv_heads * head_dim`. They are
+/// quantized here into the per-layer USM mirror with the SAME CPU
+/// quantizer the engine used for the host slab, so the two stay
+/// byte-identical.
+#[allow(clippy::too_many_arguments)]
+fn try_flash_attn_decode_usm_quant(
+    fmt: QuantKv,
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    if !usm_attn_enabled() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    let cfg = UsmAttnConfig {
+        n_layers,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        // Attention-only entry (same as the F32 helper) — the
+        // rmsnorm / silu dispatchers set `d` / `d_ff` lazily.
+        d: 0,
+        d_ff: 0,
+    };
+    let hd = head_dim as usize;
+    let n_kv = n_kv_heads as usize;
+    let mc = max_ctx as usize;
+    let posu = pos as usize;
+    let q_len = (n_heads as usize) * hd;
+    let kv_row_len = n_kv * hd;
+    // Shape gate. Same divisibility rules as the F32 kernel; decline
+    // (→ CPU) on any mismatch rather than risk a kernel-side assert.
+    if q.len() != q_len
+        || k_row.len() != kv_row_len
+        || v_row.len() != kv_row_len
+        || out.len() != q_len
+        || layer_idx >= n_layers as usize
+        || pos >= max_ctx
+        || n_kv_heads == 0
+        || n_heads % n_kv_heads != 0
+    {
+        return false;
+    }
+    // Per-format block constraint (matches each CPU quantizer's /
+    // kernel's own asserts — we decline instead of panicking).
+    let ok_shape = match fmt {
+        QuantKv::Q4_0 => hd % 32 == 0,
+        QuantKv::Q8_0 => true,
+        QuantKv::Nvfp4 => hd % 16 == 0,
+        QuantKv::Tq { bits } => matches!(bits, 1 | 2 | 4 | 8) && hd.is_power_of_two(),
+    };
+    if !ok_shape {
+        return false;
+    }
+    let bytes_per_row = fmt.bytes_per_row(hd);
+    let mirror_len = n_kv * mc * bytes_per_row;
+    let scales_len = n_kv * mc;
+    let kv_len = pos + 1;
+    let has_scales = fmt.has_scales();
+
+    USM_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        // Rebuild the context on first use or config change — same as
+        // the F32 helper.
+        let needs_rebuild = match slot.as_ref() {
+            Some(ctx) => ctx.cfg != cfg,
+            None => true,
+        };
+        if needs_rebuild {
+            *slot = UsmAttnContext::try_new(cfg);
+            if slot.is_none() {
+                return false;
+            }
+        }
+        let ctx = slot.as_mut().expect("usm ctx just built");
+
+        // Quant-mirror staleness gate (independent of the f16 path).
+        let epoch = USM_KV_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if ctx.kv_epoch_q != epoch {
+            for v in ctx.kv_valid_len_q.iter_mut() {
+                *v = 0;
+            }
+            ctx.kv_epoch_q = epoch;
+        }
+        let valid = ctx.kv_valid_len_q[layer_idx];
+        if pos > valid {
+            log_usm_kv_gap_once(layer_idx, pos, valid);
+            return false;
+        }
+
+        // A format change for this layer (never in practice) invalidates
+        // the mirror + its valid range.
+        if ctx.q_bytes_per_row[layer_idx] as usize != bytes_per_row {
+            ctx.q_k_packed[layer_idx] = None;
+            ctx.q_v_packed[layer_idx] = None;
+            ctx.q_k_scales[layer_idx] = None;
+            ctx.q_v_scales[layer_idx] = None;
+            ctx.kv_valid_len_q[layer_idx] = 0;
+            ctx.q_bytes_per_row[layer_idx] = bytes_per_row as u32;
+        }
+
+        // Lazily allocate this layer's mirror (+ scales) and the shared
+        // f32 q / out scratch. Any failure → CPU.
+        if !ensure_u8_exact(&ctx.stream, &mut ctx.q_k_packed[layer_idx], mirror_len)
+            || !ensure_u8_exact(&ctx.stream, &mut ctx.q_v_packed[layer_idx], mirror_len)
+            || !ensure_scratch_f32(&ctx.stream, &mut ctx.q_scratch_f32, q_len)
+            || !ensure_scratch_f32(&ctx.stream, &mut ctx.out_scratch_f32, q_len)
+        {
+            return false;
+        }
+        if has_scales
+            && (!ensure_scratch_f32(&ctx.stream, &mut ctx.q_k_scales[layer_idx], scales_len)
+                || !ensure_scratch_f32(&ctx.stream, &mut ctx.q_v_scales[layer_idx], scales_len))
+        {
+            return false;
+        }
+
+        // Quantize the new K/V rows into the USM mirror at `pos`, using
+        // the SAME quantizers the engine's host slab uses (byte-identical
+        // mirror ⇒ GPU output == CPU output within fp-reduction order).
+        // Disjoint struct-field borrows (packed vs scales are separate
+        // Vecs) let K's packed + scale buffers be written together.
+        match fmt {
+            QuantKv::Q4_0 => {
+                use rustllama_kernels_cpu::q4_0_kv;
+                {
+                    let kb = ctx.q_k_packed[layer_idx].as_mut().expect("k mirror").as_mut_slice();
+                    for h in 0..n_kv {
+                        let p = (h * mc + posu) * bytes_per_row;
+                        q4_0_kv::quantize_row(&k_row[h * hd..(h + 1) * hd], &mut kb[p..p + bytes_per_row]);
+                    }
+                }
+                {
+                    let vb = ctx.q_v_packed[layer_idx].as_mut().expect("v mirror").as_mut_slice();
+                    for h in 0..n_kv {
+                        let p = (h * mc + posu) * bytes_per_row;
+                        q4_0_kv::quantize_row(&v_row[h * hd..(h + 1) * hd], &mut vb[p..p + bytes_per_row]);
+                    }
+                }
+            }
+            QuantKv::Q8_0 => {
+                {
+                    let kb = ctx.q_k_packed[layer_idx].as_mut().expect("k mirror").as_mut_slice();
+                    // The mirror stores i8; reinterpret the USM bytes as
+                    // i8 for the quantizer (identical bit layout — the
+                    // kernel reads them back as i8 internally).
+                    let kb_i8: &mut [i8] =
+                        unsafe { std::slice::from_raw_parts_mut(kb.as_mut_ptr() as *mut i8, kb.len()) };
+                    let ks = ctx.q_k_scales[layer_idx].as_mut().expect("k scales").as_mut_slice();
+                    for h in 0..n_kv {
+                        let row_idx = h * mc + posu;
+                        let dst = row_idx * hd;
+                        ks[row_idx] = crate::llama_arch::quantize_row_q8_0(
+                            &k_row[h * hd..(h + 1) * hd],
+                            &mut kb_i8[dst..dst + hd],
+                        );
+                    }
+                }
+                {
+                    let vb = ctx.q_v_packed[layer_idx].as_mut().expect("v mirror").as_mut_slice();
+                    let vb_i8: &mut [i8] =
+                        unsafe { std::slice::from_raw_parts_mut(vb.as_mut_ptr() as *mut i8, vb.len()) };
+                    let vs = ctx.q_v_scales[layer_idx].as_mut().expect("v scales").as_mut_slice();
+                    for h in 0..n_kv {
+                        let row_idx = h * mc + posu;
+                        let dst = row_idx * hd;
+                        vs[row_idx] = crate::llama_arch::quantize_row_q8_0(
+                            &v_row[h * hd..(h + 1) * hd],
+                            &mut vb_i8[dst..dst + hd],
+                        );
+                    }
+                }
+            }
+            QuantKv::Nvfp4 => {
+                use rustllama_kernels_cpu::nvfp4;
+                let blocks_per_row = hd / nvfp4::NVFP4_BLOCK_ELEMS;
+                {
+                    let kb = ctx.q_k_packed[layer_idx].as_mut().expect("k mirror").as_mut_slice();
+                    for h in 0..n_kv {
+                        let p = (h * mc + posu) * bytes_per_row;
+                        for b in 0..blocks_per_row {
+                            let elem_off = h * hd + b * nvfp4::NVFP4_BLOCK_ELEMS;
+                            let blk_dst = p + b * nvfp4::NVFP4_BLOCK_BYTES;
+                            nvfp4::quantize_block(
+                                &k_row[elem_off..elem_off + nvfp4::NVFP4_BLOCK_ELEMS],
+                                &mut kb[blk_dst..blk_dst + nvfp4::NVFP4_BLOCK_BYTES],
+                            );
+                        }
+                    }
+                }
+                {
+                    let vb = ctx.q_v_packed[layer_idx].as_mut().expect("v mirror").as_mut_slice();
+                    for h in 0..n_kv {
+                        let p = (h * mc + posu) * bytes_per_row;
+                        for b in 0..blocks_per_row {
+                            let elem_off = h * hd + b * nvfp4::NVFP4_BLOCK_ELEMS;
+                            let blk_dst = p + b * nvfp4::NVFP4_BLOCK_BYTES;
+                            nvfp4::quantize_block(
+                                &v_row[elem_off..elem_off + nvfp4::NVFP4_BLOCK_ELEMS],
+                                &mut vb[blk_dst..blk_dst + nvfp4::NVFP4_BLOCK_BYTES],
+                            );
+                        }
+                    }
+                }
+            }
+            QuantKv::Tq { bits } => {
+                use rustllama_kernels_cpu::turboquant;
+                // quantize_row does an in-place WHT, so copy each row
+                // into scratch first (matches the engine host path).
+                let mut tq_row = vec![0f32; hd];
+                {
+                    let kb = ctx.q_k_packed[layer_idx].as_mut().expect("k mirror").as_mut_slice();
+                    let ks = ctx.q_k_scales[layer_idx].as_mut().expect("k scales").as_mut_slice();
+                    for h in 0..n_kv {
+                        let row_idx = h * mc + posu;
+                        let p = row_idx * bytes_per_row;
+                        tq_row.copy_from_slice(&k_row[h * hd..(h + 1) * hd]);
+                        ks[row_idx] = turboquant::quantize_row(&mut tq_row, bits, &mut kb[p..p + bytes_per_row]);
+                    }
+                }
+                {
+                    let vb = ctx.q_v_packed[layer_idx].as_mut().expect("v mirror").as_mut_slice();
+                    let vs = ctx.q_v_scales[layer_idx].as_mut().expect("v scales").as_mut_slice();
+                    for h in 0..n_kv {
+                        let row_idx = h * mc + posu;
+                        let p = row_idx * bytes_per_row;
+                        tq_row.copy_from_slice(&v_row[h * hd..(h + 1) * hd]);
+                        vs[row_idx] = turboquant::quantize_row(&mut tq_row, bits, &mut vb[p..p + bytes_per_row]);
+                    }
+                }
+            }
+        }
+
+        // A contiguous append extends the valid range; an in-place
+        // overwrite (pos < valid) leaves it. Same rule as the F32 path.
+        if pos == valid {
+            ctx.kv_valid_len_q[layer_idx] = pos + 1;
+        }
+
+        // Write Q into the f32 q-scratch.
+        {
+            let qs = ctx.q_scratch_f32.as_mut().expect("q scratch").as_mut_slice();
+            qs[..q_len].copy_from_slice(q);
+        }
+
+        // Run the kernel via the raw FFI entries — the same raw-pointer
+        // dance the rmsnorm helper uses to avoid simultaneous &mut
+        // borrows across struct fields. All pointers reference live USM
+        // on `stream`; the kernel `.wait()`s before returning, so the
+        // read-back below doesn't race the device.
+        let stream_raw: *const sk::SyclStream = &ctx.stream;
+        let q_ptr = ctx.q_scratch_f32.as_ref().unwrap().as_ptr();
+        let k_ptr = ctx.q_k_packed[layer_idx].as_ref().unwrap().as_ptr();
+        let v_ptr = ctx.q_v_packed[layer_idx].as_ref().unwrap().as_ptr();
+        let out_ptr = ctx.out_scratch_f32.as_mut().unwrap().as_mut_ptr();
+        let (ks_ptr, vs_ptr) = if has_scales {
+            (
+                ctx.q_k_scales[layer_idx].as_ref().unwrap().as_ptr(),
+                ctx.q_v_scales[layer_idx].as_ref().unwrap().as_ptr(),
+            )
+        } else {
+            (std::ptr::null::<f32>(), std::ptr::null::<f32>())
+        };
+        let ok = unsafe {
+            match fmt {
+                QuantKv::Q4_0 => sk::flash_attn_decode_q4_0_usm_raw(
+                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                ),
+                QuantKv::Q8_0 => sk::flash_attn_decode_q8_0_usm_raw(
+                    &*stream_raw, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                ),
+                QuantKv::Nvfp4 => sk::flash_attn_decode_nvfp4_usm_raw(
+                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                ),
+                QuantKv::Tq { bits } => sk::flash_attn_decode_tq_usm_raw(
+                    &*stream_raw, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                ),
+            }
+        }
+        .is_ok();
+        if !ok {
+            return false;
+        }
+
+        // Read the f32 result back into the caller's buffer.
+        let out_buf = ctx.out_scratch_f32.as_ref().expect("out scratch");
+        out.copy_from_slice(&out_buf.as_slice()[..q_len]);
+        true
+    })
+}
+
+/// Quantized-KV (Q4_0) flash-attention decode. See
+/// [`try_flash_attn_decode_usm_quant`]. `false` ⇒ caller uses CPU.
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_usm_q4_0(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    try_flash_attn_decode_usm_quant(
+        QuantKv::Q4_0, q, k_row, v_row, out, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// Quantized-KV (Q8_0 i8 slab + per-row absmax) flash-attention decode.
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_usm_q8_0(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    try_flash_attn_decode_usm_quant(
+        QuantKv::Q8_0, q, k_row, v_row, out, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// Quantized-KV (NVFP4) flash-attention decode.
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_usm_nvfp4(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    try_flash_attn_decode_usm_quant(
+        QuantKv::Nvfp4, q, k_row, v_row, out, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// Quantized-KV (TurboQuant, `bits` ∈ {1,2,4,8}) flash-attention decode.
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_usm_tq(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    bits: u8,
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    try_flash_attn_decode_usm_quant(
+        QuantKv::Tq { bits }, q, k_row, v_row, out, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+// ==================================================================
+// CUDA-resident flash-attention decode (F32 + 4 quant KV dtypes)
+// ==================================================================
+//
+// The native-CUDA analogue of the SYCL `try_flash_attn_decode_usm_*`
+// helpers above. It mirrors their DESIGN — a per-thread context that
+// keeps K/V resident on the accelerator, an epoch/valid-len staleness
+// gate, "write the new row, run the kernel over `[0, pos+1)`, read the
+// output back" — but with the fundamental CUDA difference the matvec
+// layer already lives with (see `CudaMatvecCache`): CUDA device memory
+// is NOT host-accessible the way SYCL's shared USM is. The kernel reads
+// device pointers, so every input has to be memcpy'd host→device and
+// the result device→host.
+//
+// DEVICE-RESIDENT KV MIRROR (incremental, no host shadow):
+//   Each layer keeps a PERSISTENT device-resident K/V mirror sized to
+//   the full `[n_kv_heads, max_ctx, bytes_per_row]` slab, allocated
+//   lazily on the layer's first decode step. Every step writes ONLY the
+//   new row for `pos` into that mirror with an OFFSET H2D copy
+//   (`CudaDeviceBuffer::copy_from_host_at`) — `bytes_per_row` at
+//   `(h*max_ctx + pos)*bytes_per_row` per kv-head — then launches the
+//   kernel over `[0, pos+1)` against the resident mirror. There is NO
+//   per-step full-slab re-upload and NO host shadow of the KV history:
+//     * F32 stages nothing — the mirror holds raw f32 identical to the
+//       caller's `k_row`/`v_row`, so those rows upload straight in.
+//     * The quant path quantizes the new row into a tiny reusable host
+//       staging buffer (one position's worth, all kv-heads) with the
+//       SAME CPU quantizers the engine's host slab uses, then offset-
+//       copies that packed row (+ its per-row scale, for Q8_0 /
+//       TurboQuant) into the packed mirror.
+//   Cost is O(1) H2D per layer per token (a handful of per-kv-head row
+//   copies) instead of the old O(context) re-upload, and the redundant
+//   second host copy of the KV is gone. This is exactly the SYCL USM
+//   decode's per-layer residency model; the only difference is CUDA
+//   needs the explicit offset memcpy where SYCL writes the shared page
+//   directly. The head-major layout (`h*max_ctx+pos`) means the kv-heads
+//   of one new row are `max_ctx*bytes_per_row` apart, so each head is a
+//   separate offset copy — still O(1) in the context length.
+//
+// The gate is fully INDEPENDENT of the SYCL context: its own thread-local
+// (`CUDA_ATTN`), its own `kv_valid_len_*` / `kv_epoch_*`. The SYCL path is
+// byte-for-byte unchanged; a stray call on one backend can never validate
+// a row the other backend wrote.
+
+/// Sized parameters for the CUDA attention context. A mismatch forces a
+/// rebuild (different model loaded in the same process/thread). Slimmer
+/// than [`UsmAttnConfig`] — the CUDA path only does attention decode, so
+/// there are no rmsnorm/silu (`d` / `d_ff`) fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CudaAttnConfig {
+    n_layers: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+}
+
+/// Per-thread CUDA attention context. Holds a CUDA stream, PER-LAYER
+/// persistent device-resident K/V mirrors (each written one row at a time
+/// via an offset H2D copy — no host shadow, no full re-upload), a small
+/// reusable host staging buffer for the quant path's new row, shared
+/// Q / out device scratch, and disjoint F32 / quant staleness gates.
+///
+/// FIELD ORDER MATTERS: every `CudaDeviceBuffer<'static>` here — including
+/// the ones held inside the per-layer `Vec<Option<..>>` mirrors — actually
+/// borrows `self.stream` (the `'static` is the same lifetime lie the SYCL
+/// context tells). They are declared BEFORE `stream` so Rust's
+/// declaration-order field drop frees them while the stream is still
+/// alive — exactly how `CudaMatvecCache` orders its buffers. Dropping a
+/// `Vec<Option<CudaDeviceBuffer>>` drops each element (freeing it on the
+/// still-live stream) before `stream` itself, so no manual `Drop` is
+/// needed as a result.
+struct CudaAttnContext {
+    cfg: CudaAttnConfig,
+    // ---- per-layer persistent F32 K/V device mirrors ----
+    /// F32 path: per-layer `[n_kv_heads, max_ctx, head_dim]` f32 device
+    /// mirror (`n_kv_heads*max_ctx*head_dim*4` bytes). Allocated lazily on
+    /// the layer's first decode step; the new row is written at `pos` with
+    /// an offset H2D copy and stays resident across steps.
+    dev_k_mirror: Vec<Option<ck::CudaDeviceBuffer<'static>>>,
+    dev_v_mirror: Vec<Option<ck::CudaDeviceBuffer<'static>>>,
+    // ---- per-layer persistent quant K/V device mirrors (+ scales) ----
+    /// Quant path: per-layer packed-byte device mirror
+    /// (`n_kv_heads*max_ctx*bytes_per_row` bytes), lazily allocated and
+    /// re-allocated on a per-layer format change (see `q_bytes_per_row`).
+    dev_qk_mirror: Vec<Option<ck::CudaDeviceBuffer<'static>>>,
+    dev_qv_mirror: Vec<Option<ck::CudaDeviceBuffer<'static>>>,
+    /// Per-layer per-row f32 scale mirror — allocated only for the formats
+    /// that carry out-of-band scales (Q8_0, TurboQuant).
+    /// `[n_kv_heads, max_ctx]` f32.
+    dev_qk_scales: Vec<Option<ck::CudaDeviceBuffer<'static>>>,
+    dev_qv_scales: Vec<Option<ck::CudaDeviceBuffer<'static>>>,
+    // ---- shared per-step device scratch (reused across layers) ----
+    /// Q input / attention output device scratch, `n_heads*head_dim` f32.
+    dev_q: Option<ck::CudaDeviceBuffer<'static>>,
+    dev_out: Option<ck::CudaDeviceBuffer<'static>>,
+    // ---- reusable host staging for ONE new KV row (quant path only) ----
+    /// One position's packed bytes across all kv-heads
+    /// (`n_kv_heads*bytes_per_row`), reused for K then V each step: the
+    /// new row is quantized here, then offset-copied into the device
+    /// mirror. The F32 path needs no staging (it uploads `k_row`/`v_row`
+    /// straight into the mirror). Sized lazily; never holds KV history.
+    stage_row: Vec<u8>,
+    /// One position's per-kv-head f32 scales (`n_kv_heads`), reused for K
+    /// then V; only the scale-carrying quant formats touch it.
+    stage_scales: Vec<f32>,
+    // ---- disjoint staleness gates (F32 vs quant; independent of SYCL) --
+    kv_valid_len_f32: Vec<u32>,
+    kv_epoch_f32: u64,
+    /// Per-layer packed `bytes_per_row` last used, so a format change
+    /// (never in practice) re-allocates that layer's quant mirror.
+    q_bytes_per_row: Vec<u32>,
+    kv_valid_len_q: Vec<u32>,
+    kv_epoch_q: u64,
+    // ---- prefill device scratch (batched flash-prefill) ----
+    // Independent of the decode scratch above: prefill's Q/out are the
+    // batched `[n_new, n_heads, head_dim]` shape (not decode's single
+    // `[n_heads, head_dim]` row), and prefill uploads the WHOLE K/V slab
+    // provided by the caller each call (no per-layer host shadow — the
+    // engine already holds the packed/f32 slab, so there is nothing to
+    // accumulate). `dev_prefill_k` / `dev_prefill_v` hold either the f32
+    // slab (F32 path) or the packed byte slab (quant path); the scales
+    // pair is used only by Q8_0 / TurboQuant. Reused across layers — one
+    // prefill runs at a time. Declared BEFORE `stream` so field-drop order
+    // frees them while the stream is still alive.
+    dev_prefill_k: Option<ck::CudaDeviceBuffer<'static>>,
+    dev_prefill_v: Option<ck::CudaDeviceBuffer<'static>>,
+    dev_prefill_k_scales: Option<ck::CudaDeviceBuffer<'static>>,
+    dev_prefill_v_scales: Option<ck::CudaDeviceBuffer<'static>>,
+    dev_prefill_q: Option<ck::CudaDeviceBuffer<'static>>,
+    dev_prefill_out: Option<ck::CudaDeviceBuffer<'static>>,
+    // ---- owning stream (declared LAST so the buffers above free first) --
+    stream: ck::CudaStream,
+}
+
+impl CudaAttnContext {
+    /// Build a fresh CUDA attention context for the given model shape.
+    /// `None` when no CUDA device / stream creation fails (callers fall
+    /// back to SYCL or CPU). Uses device 0 — the same device the CUDA
+    /// matvec cache binds to (`CudaMatvecCache::new(0, ...)`).
+    fn try_new(cfg: CudaAttnConfig) -> Option<Self> {
+        let stream = ck::CudaStream::create(0)?;
+        let n = cfg.n_layers as usize;
+        Some(Self {
+            cfg,
+            dev_k_mirror: (0..n).map(|_| None).collect(),
+            dev_v_mirror: (0..n).map(|_| None).collect(),
+            dev_qk_mirror: (0..n).map(|_| None).collect(),
+            dev_qv_mirror: (0..n).map(|_| None).collect(),
+            dev_qk_scales: (0..n).map(|_| None).collect(),
+            dev_qv_scales: (0..n).map(|_| None).collect(),
+            dev_q: None,
+            dev_out: None,
+            stage_row: Vec::new(),
+            stage_scales: Vec::new(),
+            kv_valid_len_f32: vec![0; n],
+            kv_epoch_f32: 0,
+            q_bytes_per_row: vec![0; n],
+            kv_valid_len_q: vec![0; n],
+            kv_epoch_q: 0,
+            dev_prefill_k: None,
+            dev_prefill_v: None,
+            dev_prefill_k_scales: None,
+            dev_prefill_v_scales: None,
+            dev_prefill_q: None,
+            dev_prefill_out: None,
+            stream,
+        })
+    }
+}
+
+thread_local! {
+    /// Per-thread CUDA attention context. Built lazily on the first
+    /// `try_flash_attn_decode_cuda_*` call once `cuda_active()` is true
+    /// and a matching config is presented; rebuilt on a config change.
+    /// Independent of [`USM_ATTN`] — the two backends never share state.
+    static CUDA_ATTN: std::cell::RefCell<Option<CudaAttnContext>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Ensure `buf` is a `len`-element zero-initialized `Vec<u8>`, allocating
+/// fault-tolerantly (declines instead of aborting the process on OOM). A
+/// size-match short-circuits WITHOUT re-zeroing — fine for the one-row
+/// host STAGING buffer, whose contents are overwritten in full each decode
+/// step. Returns false → caller falls back to CPU.
+fn ensure_cuda_shadow_u8(buf: &mut Vec<u8>, len: usize) -> bool {
+    if buf.len() == len {
+        return true;
+    }
+    buf.clear();
+    if buf.try_reserve_exact(len).is_err() {
+        return false;
+    }
+    buf.resize(len, 0);
+    true
+}
+
+/// F32 sibling of [`ensure_cuda_shadow_u8`] (used for the one-row scale
+/// staging buffer).
+fn ensure_cuda_shadow_f32(buf: &mut Vec<f32>, len: usize) -> bool {
+    if buf.len() == len {
+        return true;
+    }
+    buf.clear();
+    if buf.try_reserve_exact(len).is_err() {
+        return false;
+    }
+    buf.resize(len, 0.0);
+    true
+}
+
+/// Ensure `slot` holds a device buffer of at least `need_bytes`. Grows
+/// (free-before-alloc) on a size increase, reused otherwise. Returns
+/// false on alloc failure so the caller can fall back to CPU. `need_bytes`
+/// must be `> 0` (the sole caller only passes attention slabs, which are).
+fn ensure_cuda_dev(
+    slot: &mut Option<ck::CudaDeviceBuffer<'static>>,
+    stream: &ck::CudaStream,
+    need_bytes: usize,
+) -> bool {
+    if slot.as_ref().map_or(false, |b| b.len_bytes() >= need_bytes) {
+        return true;
+    }
+    // Free the too-small buffer before allocating its replacement so peak
+    // device memory doesn't double.
+    *slot = None;
+    match ck::CudaDeviceBuffer::alloc(stream, need_bytes) {
+        Some(b) => {
+            // SAFETY: the `'_`→`'static` widening is the same lifetime lie
+            // the SYCL context tells — the buffer borrows `stream` (a field
+            // of the owning context), which is declared last and so
+            // outlives every buffer via declaration-order field drop.
+            *slot = Some(unsafe {
+                std::mem::transmute::<
+                    ck::CudaDeviceBuffer<'_>,
+                    ck::CudaDeviceBuffer<'static>,
+                >(b)
+            });
+            true
+        }
+        None => false,
+    }
+}
+
+/// Quantize the NEW K/V row (`src_row`, `[n_kv, head_dim]` f32) into the
+/// one-position host staging buffer, using the SAME CPU quantizers the
+/// engine's host slab uses — so the staged bytes (and hence the device
+/// mirror) are byte-identical to the host slab and the GPU result matches
+/// the CPU reference. `stage_row` is `[n_kv, bytes_per_row]`; `stage_scales`
+/// is `[n_kv]` (written only by the scale-carrying formats). Both hold ONE
+/// position's worth of data (all kv-heads), packed contiguously per head so
+/// the subsequent per-head offset upload can slice them cleanly.
+fn cuda_quantize_row_into_stage(
+    fmt: QuantKv,
+    src_row: &[f32],
+    stage_row: &mut [u8],
+    stage_scales: &mut [f32],
+    n_kv: usize,
+    hd: usize,
+    bytes_per_row: usize,
+) {
+    match fmt {
+        QuantKv::Q4_0 => {
+            use rustllama_kernels_cpu::q4_0_kv;
+            for h in 0..n_kv {
+                let p = h * bytes_per_row;
+                q4_0_kv::quantize_row(
+                    &src_row[h * hd..(h + 1) * hd],
+                    &mut stage_row[p..p + bytes_per_row],
+                );
+            }
+        }
+        QuantKv::Q8_0 => {
+            // Q8_0 KV stores a raw i8 slab (bytes_per_row == head_dim);
+            // reinterpret the staging bytes as i8 for the quantizer (same
+            // bit layout the kernel reads back).
+            let row_i8: &mut [i8] = unsafe {
+                std::slice::from_raw_parts_mut(stage_row.as_mut_ptr() as *mut i8, stage_row.len())
+            };
+            for h in 0..n_kv {
+                let dst = h * hd;
+                stage_scales[h] = crate::llama_arch::quantize_row_q8_0(
+                    &src_row[h * hd..(h + 1) * hd],
+                    &mut row_i8[dst..dst + hd],
+                );
+            }
+        }
+        QuantKv::Nvfp4 => {
+            use rustllama_kernels_cpu::nvfp4;
+            let blocks_per_row = hd / nvfp4::NVFP4_BLOCK_ELEMS;
+            for h in 0..n_kv {
+                let p = h * bytes_per_row;
+                for b in 0..blocks_per_row {
+                    let elem_off = h * hd + b * nvfp4::NVFP4_BLOCK_ELEMS;
+                    let blk_dst = p + b * nvfp4::NVFP4_BLOCK_BYTES;
+                    nvfp4::quantize_block(
+                        &src_row[elem_off..elem_off + nvfp4::NVFP4_BLOCK_ELEMS],
+                        &mut stage_row[blk_dst..blk_dst + nvfp4::NVFP4_BLOCK_BYTES],
+                    );
+                }
+            }
+        }
+        QuantKv::Tq { bits } => {
+            use rustllama_kernels_cpu::turboquant;
+            // `quantize_row` does an in-place WHT, so copy each row into
+            // scratch first (matches the engine host path + the SYCL helper).
+            let mut tq_row = vec![0f32; hd];
+            for h in 0..n_kv {
+                let p = h * bytes_per_row;
+                tq_row.copy_from_slice(&src_row[h * hd..(h + 1) * hd]);
+                stage_scales[h] = turboquant::quantize_row(
+                    &mut tq_row,
+                    bits,
+                    &mut stage_row[p..p + bytes_per_row],
+                );
+            }
+        }
+    }
+}
+
+/// Offset-upload ONE staged position's packed K (or V) row (+ optional
+/// per-row scales) into its persistent device mirror at `pos`. The mirror
+/// is head-major `[n_kv, max_ctx, bytes_per_row]`, so each kv-head's new
+/// row lands at `(h*max_ctx + pos)*bytes_per_row` — a separate bounds-
+/// checked `copy_from_host_at` per head (heads are `max_ctx*bytes_per_row`
+/// apart, so they can't be coalesced). Scales go to `(h*max_ctx+pos)` in
+/// the `[n_kv, max_ctx]` f32 scale mirror. Returns false on any H2D error
+/// (→ caller falls back to CPU) — and, crucially, WITHOUT the caller having
+/// extended `kv_valid_len`, so a half-written row is never marked valid.
+#[allow(clippy::too_many_arguments)]
+fn cuda_upload_staged_row(
+    mirror: &mut ck::CudaDeviceBuffer<'static>,
+    scales_mirror: Option<&mut ck::CudaDeviceBuffer<'static>>,
+    stage_row: &[u8],
+    stage_scales: &[f32],
+    n_kv: usize,
+    mc: usize,
+    pos: usize,
+    bytes_per_row: usize,
+    has_scales: bool,
+) -> bool {
+    for h in 0..n_kv {
+        let off = (h * mc + pos) * bytes_per_row;
+        if mirror
+            .copy_from_host_at(off, &stage_row[h * bytes_per_row..(h + 1) * bytes_per_row])
+            .is_err()
+        {
+            return false;
+        }
+    }
+    if has_scales {
+        let sm = match scales_mirror {
+            Some(s) => s,
+            None => return false,
+        };
+        let sb: &[u8] = unsafe {
+            std::slice::from_raw_parts(stage_scales.as_ptr() as *const u8, n_kv * 4)
+        };
+        for h in 0..n_kv {
+            let off = (h * mc + pos) * 4;
+            if sm.copy_from_host_at(off, &sb[h * 4..(h + 1) * 4]).is_err() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Try to run F32 KV flash-attention decode on the native CUDA backend.
+/// Same public signature as [`try_flash_attn_decode_usm_f32`], so the two
+/// are interchangeable at the call site. Returns `true` iff the GPU
+/// produced the attention output (written to `out`); `false` for any gate
+/// / shape / alloc / kernel failure, on which the caller runs SYCL or CPU.
+///
+/// `k_row` / `v_row` are the NEW K/V rows for `pos` (`n_kv_heads*head_dim`
+/// f32). Only that row is written — one offset H2D copy per kv-head — into
+/// this layer's PERSISTENT device-resident f32 mirror; the kernel then runs
+/// over `[0, pos+1)` against the mirror. No host shadow, no full re-upload.
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_cuda_f32(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    if !cuda_active() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    let cfg = CudaAttnConfig { n_layers, n_heads, n_kv_heads, head_dim, max_ctx };
+    let hd = head_dim as usize;
+    let n_kv = n_kv_heads as usize;
+    let mc = max_ctx as usize;
+    let posu = pos as usize;
+    let q_len = (n_heads as usize) * hd;
+    let kv_row_len = n_kv * hd;
+    if q.len() != q_len
+        || k_row.len() != kv_row_len
+        || v_row.len() != kv_row_len
+        || out.len() != q_len
+        || layer_idx >= n_layers as usize
+        || pos >= max_ctx
+        || n_kv_heads == 0
+        || n_heads % n_kv_heads != 0
+    {
+        return false;
+    }
+    let mirror_bytes = n_kv * mc * hd * 4; // full f32 device-mirror bytes
+    let row_bytes = hd * 4; // one kv-head's f32 row
+    let q_bytes = q_len * 4;
+    let kv_len = pos + 1;
+
+    CUDA_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let needs_rebuild = match slot.as_ref() {
+            Some(ctx) => ctx.cfg != cfg,
+            None => true,
+        };
+        if needs_rebuild {
+            *slot = CudaAttnContext::try_new(cfg);
+            if slot.is_none() {
+                return false;
+            }
+        }
+        let ctx = slot.as_mut().expect("cuda ctx just built");
+
+        // F32 staleness gate (independent of the quant gate + of SYCL).
+        let epoch = USM_KV_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if ctx.kv_epoch_f32 != epoch {
+            for v in ctx.kv_valid_len_f32.iter_mut() {
+                *v = 0;
+            }
+            ctx.kv_epoch_f32 = epoch;
+        }
+        let valid = ctx.kv_valid_len_f32[layer_idx];
+        if pos > valid {
+            log_usm_kv_gap_once(layer_idx, pos, valid);
+            return false;
+        }
+
+        // Ensure this layer's persistent F32 device mirror (survives
+        // across steps; lazily allocated on the layer's first use) plus the
+        // shared Q / out scratch. Each `[layer_idx]` mut-borrows a distinct
+        // Vec field, disjoint from the `&ctx.stream` borrow.
+        if !ensure_cuda_dev(&mut ctx.dev_k_mirror[layer_idx], &ctx.stream, mirror_bytes)
+            || !ensure_cuda_dev(&mut ctx.dev_v_mirror[layer_idx], &ctx.stream, mirror_bytes)
+            || !ensure_cuda_dev(&mut ctx.dev_q, &ctx.stream, q_bytes)
+            || !ensure_cuda_dev(&mut ctx.dev_out, &ctx.stream, q_bytes)
+        {
+            return false;
+        }
+
+        // Write ONLY the new K/V row into the resident mirror at `pos`, one
+        // kv-head at a time (head-major layout ⇒ heads are `max_ctx*head_dim`
+        // apart, so they can't be coalesced). The mirror stores raw f32
+        // identical to `k_row`/`v_row`, so those rows upload straight in —
+        // no host staging, no shadow, no full re-upload.
+        {
+            let k_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(k_row.as_ptr() as *const u8, kv_row_len * 4)
+            };
+            let kmir = ctx.dev_k_mirror[layer_idx].as_mut().unwrap();
+            for h in 0..n_kv {
+                let off = (h * mc + posu) * row_bytes;
+                if kmir
+                    .copy_from_host_at(off, &k_bytes[h * row_bytes..(h + 1) * row_bytes])
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+        }
+        {
+            let v_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(v_row.as_ptr() as *const u8, kv_row_len * 4)
+            };
+            let vmir = ctx.dev_v_mirror[layer_idx].as_mut().unwrap();
+            for h in 0..n_kv {
+                let off = (h * mc + posu) * row_bytes;
+                if vmir
+                    .copy_from_host_at(off, &v_bytes[h * row_bytes..(h + 1) * row_bytes])
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+        }
+        // Extend the valid range ONLY after the row is fully resident, so a
+        // half-written row is never marked valid (a contiguous append at
+        // `pos == valid`; an in-place overwrite at `pos < valid` leaves it).
+        if pos == valid {
+            ctx.kv_valid_len_f32[layer_idx] = pos + 1;
+        }
+
+        // Upload Q into the shared scratch.
+        {
+            let q_src: &[u8] =
+                unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u8, q_bytes) };
+            if ctx.dev_q.as_mut().unwrap().copy_from_host(q_src).is_err() {
+                return false;
+            }
+        }
+
+        // Gather raw device pointers (disjoint fields) and launch over
+        // `[0, pos+1)` against the persistent mirror. No full re-upload.
+        let stream = &ctx.stream;
+        let q_ptr = ctx.dev_q.as_ref().unwrap().as_ptr() as *const f32;
+        let k_ptr = ctx.dev_k_mirror[layer_idx].as_ref().unwrap().as_ptr() as *const f32;
+        let v_ptr = ctx.dev_v_mirror[layer_idx].as_ref().unwrap().as_ptr() as *const f32;
+        let out_ptr = ctx.dev_out.as_mut().unwrap().as_mut_ptr() as *mut f32;
+        // SAFETY: all four are live device pointers on `stream`, sized for
+        // the shapes below; the wrapper synchronizes before returning so
+        // the read-back doesn't race the kernel.
+        let launched = unsafe {
+            ck::flash_attn_decode_f32(
+                stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                n_heads as usize, n_kv, hd, mc, kv_len as usize,
+            )
+        }
+        .is_ok();
+        if !launched || ck::consume_error_count() != 0 {
+            return false;
+        }
+
+        // Read the result back into the caller's f32 buffer.
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, q_bytes) };
+        ctx.dev_out.as_ref().unwrap().copy_to_host(out_bytes).is_ok()
+    })
+}
+
+/// Shared body for every native-CUDA quantized-KV decode helper. Mirrors
+/// [`try_flash_attn_decode_usm_quant`] (same shape gate, same CPU
+/// quantizers, same epoch/valid-len gate): quantizes ONLY the new row into
+/// a tiny reusable host staging buffer and offset-uploads it into this
+/// layer's PERSISTENT device-resident packed mirror at `pos` (see the
+/// module note) — no host shadow, no full re-upload. Returns `true` iff the
+/// GPU produced the output (in `out`); `false` for any gate / shape / alloc
+/// / kernel failure, on which the caller runs SYCL or CPU.
+#[allow(clippy::too_many_arguments)]
+fn try_flash_attn_decode_cuda_quant(
+    fmt: QuantKv,
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    if !cuda_active() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    let cfg = CudaAttnConfig { n_layers, n_heads, n_kv_heads, head_dim, max_ctx };
+    let hd = head_dim as usize;
+    let n_kv = n_kv_heads as usize;
+    let mc = max_ctx as usize;
+    let posu = pos as usize;
+    let q_len = (n_heads as usize) * hd;
+    let kv_row_len = n_kv * hd;
+    if q.len() != q_len
+        || k_row.len() != kv_row_len
+        || v_row.len() != kv_row_len
+        || out.len() != q_len
+        || layer_idx >= n_layers as usize
+        || pos >= max_ctx
+        || n_kv_heads == 0
+        || n_heads % n_kv_heads != 0
+    {
+        return false;
+    }
+    // Per-format block constraint (same rules as the SYCL quant helper).
+    let ok_shape = match fmt {
+        QuantKv::Q4_0 => hd % 32 == 0,
+        QuantKv::Q8_0 => true,
+        QuantKv::Nvfp4 => hd % 16 == 0,
+        QuantKv::Tq { bits } => matches!(bits, 1 | 2 | 4 | 8) && hd.is_power_of_two(),
+    };
+    if !ok_shape {
+        return false;
+    }
+    let bytes_per_row = fmt.bytes_per_row(hd);
+    let mirror_len = n_kv * mc * bytes_per_row; // packed bytes
+    let scales_len = n_kv * mc; // f32 elements
+    let q_bytes = q_len * 4;
+    let kv_len = pos + 1;
+    let has_scales = fmt.has_scales();
+
+    CUDA_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let needs_rebuild = match slot.as_ref() {
+            Some(ctx) => ctx.cfg != cfg,
+            None => true,
+        };
+        if needs_rebuild {
+            *slot = CudaAttnContext::try_new(cfg);
+            if slot.is_none() {
+                return false;
+            }
+        }
+        let ctx = slot.as_mut().expect("cuda ctx just built");
+
+        // Quant staleness gate (independent of the F32 gate + of SYCL).
+        let epoch = USM_KV_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if ctx.kv_epoch_q != epoch {
+            for v in ctx.kv_valid_len_q.iter_mut() {
+                *v = 0;
+            }
+            ctx.kv_epoch_q = epoch;
+        }
+        let valid = ctx.kv_valid_len_q[layer_idx];
+        if pos > valid {
+            log_usm_kv_gap_once(layer_idx, pos, valid);
+            return false;
+        }
+
+        // A format change for this layer (never in practice) re-allocates
+        // the device mirror (+ scales) and resets its valid range — mirrors
+        // the SYCL quant gate.
+        if ctx.q_bytes_per_row[layer_idx] as usize != bytes_per_row {
+            ctx.dev_qk_mirror[layer_idx] = None;
+            ctx.dev_qv_mirror[layer_idx] = None;
+            ctx.dev_qk_scales[layer_idx] = None;
+            ctx.dev_qv_scales[layer_idx] = None;
+            ctx.kv_valid_len_q[layer_idx] = 0;
+            ctx.q_bytes_per_row[layer_idx] = bytes_per_row as u32;
+        }
+
+        // Ensure this layer's persistent packed device mirror (+ scales),
+        // the shared Q / out scratch, and the reusable one-row host staging.
+        // Each `[layer_idx]` mut-borrows a distinct Vec field, disjoint from
+        // the `&ctx.stream` borrow. Any alloc failure → CPU.
+        if !ensure_cuda_dev(&mut ctx.dev_qk_mirror[layer_idx], &ctx.stream, mirror_len)
+            || !ensure_cuda_dev(&mut ctx.dev_qv_mirror[layer_idx], &ctx.stream, mirror_len)
+            || !ensure_cuda_dev(&mut ctx.dev_q, &ctx.stream, q_bytes)
+            || !ensure_cuda_dev(&mut ctx.dev_out, &ctx.stream, q_bytes)
+        {
+            return false;
+        }
+        if has_scales
+            && (!ensure_cuda_dev(&mut ctx.dev_qk_scales[layer_idx], &ctx.stream, scales_len * 4)
+                || !ensure_cuda_dev(&mut ctx.dev_qv_scales[layer_idx], &ctx.stream, scales_len * 4))
+        {
+            return false;
+        }
+        // Host staging for ONE position's new row (all kv-heads), reused for
+        // K then V. Packed: `n_kv*bytes_per_row` bytes; scales: `n_kv` f32.
+        let stage_bytes = n_kv * bytes_per_row;
+        if !ensure_cuda_shadow_u8(&mut ctx.stage_row, stage_bytes) {
+            return false;
+        }
+        if has_scales && !ensure_cuda_shadow_f32(&mut ctx.stage_scales, n_kv) {
+            return false;
+        }
+
+        // Quantize + offset-upload the new K row, then the new V row,
+        // reusing the one staging buffer. The SAME CPU quantizers the
+        // engine's host slab uses keep each mirror row byte-identical, so
+        // the GPU output equals the CPU flash-decode result to the
+        // fp-reduction tolerance the F32 path already tolerates. Only ONE
+        // row moves host→device per call — no full re-upload, no host
+        // shadow. `cuda_upload_staged_row` writes the packed row (+ scales)
+        // at `pos` via per-kv-head `copy_from_host_at`, and returns false
+        // (→ CPU) on any H2D error BEFORE the valid range is extended, so a
+        // half-written row is never marked valid.
+        cuda_quantize_row_into_stage(
+            fmt, k_row, &mut ctx.stage_row, &mut ctx.stage_scales, n_kv, hd, bytes_per_row,
+        );
+        if !cuda_upload_staged_row(
+            ctx.dev_qk_mirror[layer_idx].as_mut().unwrap(),
+            ctx.dev_qk_scales[layer_idx].as_mut(),
+            &ctx.stage_row,
+            &ctx.stage_scales,
+            n_kv, mc, posu, bytes_per_row, has_scales,
+        ) {
+            return false;
+        }
+        cuda_quantize_row_into_stage(
+            fmt, v_row, &mut ctx.stage_row, &mut ctx.stage_scales, n_kv, hd, bytes_per_row,
+        );
+        if !cuda_upload_staged_row(
+            ctx.dev_qv_mirror[layer_idx].as_mut().unwrap(),
+            ctx.dev_qv_scales[layer_idx].as_mut(),
+            &ctx.stage_row,
+            &ctx.stage_scales,
+            n_kv, mc, posu, bytes_per_row, has_scales,
+        ) {
+            return false;
+        }
+        // Extend the valid range ONLY after both rows are fully resident
+        // (contiguous append at `pos == valid`; in-place overwrite at
+        // `pos < valid` leaves it). Same rule as the SYCL quant path.
+        if pos == valid {
+            ctx.kv_valid_len_q[layer_idx] = pos + 1;
+        }
+
+        // Upload Q into the shared scratch.
+        {
+            let q_src: &[u8] =
+                unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u8, q_bytes) };
+            if ctx.dev_q.as_mut().unwrap().copy_from_host(q_src).is_err() {
+                return false;
+            }
+        }
+
+        // Gather raw device pointers (disjoint fields) and launch the
+        // format-matching kernel against the persistent packed mirror.
+        // Packed K/V are passed as `*const c_void` (the kernel's type);
+        // scales / q / out as f32 pointers.
+        let stream = &ctx.stream;
+        let q_ptr = ctx.dev_q.as_ref().unwrap().as_ptr() as *const f32;
+        let k_ptr = ctx.dev_qk_mirror[layer_idx].as_ref().unwrap().as_ptr();
+        let v_ptr = ctx.dev_qv_mirror[layer_idx].as_ref().unwrap().as_ptr();
+        let out_ptr = ctx.dev_out.as_mut().unwrap().as_mut_ptr() as *mut f32;
+        let (ks_ptr, vs_ptr) = if has_scales {
+            (
+                ctx.dev_qk_scales[layer_idx].as_ref().unwrap().as_ptr() as *const f32,
+                ctx.dev_qv_scales[layer_idx].as_ref().unwrap().as_ptr() as *const f32,
+            )
+        } else {
+            (std::ptr::null::<f32>(), std::ptr::null::<f32>())
+        };
+        // SAFETY: every pointer is a live device allocation on `stream`,
+        // sized for the shapes below; the wrappers synchronize before
+        // returning so the read-back doesn't race the kernel.
+        let launched = unsafe {
+            match fmt {
+                QuantKv::Q4_0 => ck::flash_attn_decode_q4_0(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                ),
+                QuantKv::Q8_0 => ck::flash_attn_decode_q8_0(
+                    stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, out_ptr,
+                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                ),
+                QuantKv::Nvfp4 => ck::flash_attn_decode_nvfp4(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                ),
+                QuantKv::Tq { bits } => ck::flash_attn_decode_tq(
+                    stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
+                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                ),
+            }
+        }
+        .is_ok();
+        if !launched || ck::consume_error_count() != 0 {
+            return false;
+        }
+
+        // Read the f32 result back into the caller's buffer.
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, q_bytes) };
+        ctx.dev_out.as_ref().unwrap().copy_to_host(out_bytes).is_ok()
+    })
+}
+
+/// Native-CUDA quantized-KV (Q4_0) flash-attention decode. Same signature
+/// as [`try_flash_attn_decode_usm_q4_0`]. `false` ⇒ caller uses SYCL/CPU.
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_cuda_q4_0(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    try_flash_attn_decode_cuda_quant(
+        QuantKv::Q4_0, q, k_row, v_row, out, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// Native-CUDA quantized-KV (Q8_0 i8 slab + per-row absmax) decode.
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_cuda_q8_0(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    try_flash_attn_decode_cuda_quant(
+        QuantKv::Q8_0, q, k_row, v_row, out, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// Native-CUDA quantized-KV (NVFP4) flash-attention decode.
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_cuda_nvfp4(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    try_flash_attn_decode_cuda_quant(
+        QuantKv::Nvfp4, q, k_row, v_row, out, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// Native-CUDA quantized-KV (TurboQuant, `bits` ∈ {1,2,4,8}) decode.
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_cuda_tq(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    bits: u8,
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    try_flash_attn_decode_cuda_quant(
+        QuantKv::Tq { bits }, q, k_row, v_row, out, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// Diagnostic: clear the per-thread CUDA attention context. Sibling of
+/// [`clear_usm_attn_context`].
+pub fn clear_cuda_attn_context() {
+    CUDA_ATTN.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
+// ------------------------------------------------------------------
+// GPU flash-attention decode dispatchers (CUDA → SYCL → CPU)
+// ------------------------------------------------------------------
+//
+// One combinator per KV dtype. Each tries the native CUDA backend first
+// when a CUDA device is present (`cuda_active()`), else the SYCL-USM path,
+// returning `true` iff a GPU produced the output. The CPU fallback lives
+// at the single call site (`if !try_flash_attn_decode_gpu_*(...) { CPU }`),
+// so both backends are covered without duplicating it per site. On a
+// SYCL-only / CPU-only host the `cuda_active()` short-circuit means these
+// behave EXACTLY like calling the SYCL helper directly — no F32/SYCL/CPU
+// regression.
+
+/// F32 KV flash-attention decode: CUDA → SYCL → (caller's CPU on `false`).
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_gpu_f32(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    if cuda_active()
+        && try_flash_attn_decode_cuda_f32(
+            q, k_row, v_row, out, layer_idx, pos,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        )
+    {
+        return true;
+    }
+    try_flash_attn_decode_usm_f32(
+        q, k_row, v_row, out, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// Q4_0 KV flash-attention decode: CUDA → SYCL → (caller's CPU).
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_gpu_q4_0(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    if cuda_active()
+        && try_flash_attn_decode_cuda_q4_0(
+            q, k_row, v_row, out, layer_idx, pos,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        )
+    {
+        return true;
+    }
+    try_flash_attn_decode_usm_q4_0(
+        q, k_row, v_row, out, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// Q8_0 KV flash-attention decode: CUDA → SYCL → (caller's CPU).
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_gpu_q8_0(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    if cuda_active()
+        && try_flash_attn_decode_cuda_q8_0(
+            q, k_row, v_row, out, layer_idx, pos,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        )
+    {
+        return true;
+    }
+    try_flash_attn_decode_usm_q8_0(
+        q, k_row, v_row, out, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// NVFP4 KV flash-attention decode: CUDA → SYCL → (caller's CPU).
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_gpu_nvfp4(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    if cuda_active()
+        && try_flash_attn_decode_cuda_nvfp4(
+            q, k_row, v_row, out, layer_idx, pos,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        )
+    {
+        return true;
+    }
+    try_flash_attn_decode_usm_nvfp4(
+        q, k_row, v_row, out, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// TurboQuant KV flash-attention decode: CUDA → SYCL → (caller's CPU).
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_gpu_tq(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    bits: u8,
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    if cuda_active()
+        && try_flash_attn_decode_cuda_tq(
+            q, k_row, v_row, out, bits, layer_idx, pos,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        )
+    {
+        return true;
+    }
+    try_flash_attn_decode_usm_tq(
+        q, k_row, v_row, out, bits, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
 }
 
 /// Diagnostic: clear the per-thread USM attention context.
@@ -5220,11 +6857,36 @@ enum PackedMatvecKind {
     /// tensor in; decode value = (trit − 1)·d with the 8-bit
     /// multiply-high trit extraction.
     PTQ1_0,
+    /// Q4_0Raw: 18 bytes per 32-weight block, K%32==0. Legacy
+    /// symmetric 4-bit baseline (pre-K-quant, no min/high-bit).
+    Q4_0,
+    /// Q5_0Raw: 22 bytes per 32-weight block, K%32==0. Symmetric
+    /// 5-bit (Q4_0 plus a 4-byte `qh` high-bit stream).
+    Q5_0,
+    /// Q4_1Raw: 20 bytes per 32-weight block, K%32==0. Asymmetric
+    /// 4-bit (per-block `(d, m)` min/offset).
+    Q4_1,
+    /// Q5_1Raw: 24 bytes per 32-weight block, K%32==0. Asymmetric
+    /// 5-bit sibling of Q4_1 (extra `qh` + a second f16 for `m`).
+    Q5_1,
+    /// Q2_KRaw: 84 bytes per 256-weight super-block, K%256==0. The
+    /// smallest K-quant (2.625 bpw).
+    Q2_K,
+    /// Q3_KRaw: 110 bytes per 256-weight super-block, K%256==0.
+    /// 3-bit K-quant (3.4375 bpw).
+    Q3_K,
+    /// Q8_KRaw: 292 bytes per 256-weight super-block, K%256==0. The
+    /// largest quant (9.125 bpw); usually an activation dtype but we
+    /// accept it on the weight side too.
+    Q8_K,
+    /// PQ2_0Raw (PrismML Bonsai 2-bit): 34 bytes per 128-weight
+    /// block, K%128==0. Group-128 sibling of Prism's Q2_0.
+    PQ2_0,
 }
 
 /// Number of [`PackedMatvecKind`] variants (sizes the failure-latch
 /// array below; `kind as usize` indexes it).
-const PACKED_KIND_COUNT: usize = 14;
+const PACKED_KIND_COUNT: usize = 22;
 
 /// Consecutive failures before a packed kind stops dispatching.
 const PACKED_KIND_DISABLE_AFTER: u32 = 3;
@@ -5324,6 +6986,14 @@ impl PackedMatvecKind {
             PackedMatvecKind::IQ3_XXS => "iq3_xxs",
             PackedMatvecKind::IQ3_S => "iq3_s",
             PackedMatvecKind::PTQ1_0 => "ptq1_0",
+            PackedMatvecKind::Q4_0 => "q4_0",
+            PackedMatvecKind::Q5_0 => "q5_0",
+            PackedMatvecKind::Q4_1 => "q4_1",
+            PackedMatvecKind::Q5_1 => "q5_1",
+            PackedMatvecKind::Q2_K => "q2_k",
+            PackedMatvecKind::Q3_K => "q3_k",
+            PackedMatvecKind::Q8_K => "q8_k",
+            PackedMatvecKind::PQ2_0 => "pq2_0",
         }
     }
 
@@ -5346,13 +7016,26 @@ impl PackedMatvecKind {
             PackedMatvecKind::IQ3_XXS => (k / 256) * 98,
             PackedMatvecKind::IQ3_S => (k / 256) * 110,
             PackedMatvecKind::PTQ1_0 => (k / 128) * 28,
+            PackedMatvecKind::Q4_0 => (k / 32) * 18,
+            PackedMatvecKind::Q5_0 => (k / 32) * 22,
+            PackedMatvecKind::Q4_1 => (k / 32) * 20,
+            PackedMatvecKind::Q5_1 => (k / 32) * 24,
+            PackedMatvecKind::Q2_K => (k / 256) * 84,
+            PackedMatvecKind::Q3_K => (k / 256) * 110,
+            PackedMatvecKind::Q8_K => (k / 256) * 292,
+            PackedMatvecKind::PQ2_0 => (k / 128) * 34,
         }
     }
 
     /// K alignment requirement for the format's block size.
     fn k_alignment(self) -> usize {
         match self {
-            PackedMatvecKind::Q8_0 | PackedMatvecKind::IQ4_NL => 32,
+            PackedMatvecKind::Q8_0
+            | PackedMatvecKind::IQ4_NL
+            | PackedMatvecKind::Q4_0
+            | PackedMatvecKind::Q5_0
+            | PackedMatvecKind::Q4_1
+            | PackedMatvecKind::Q5_1 => 32,
             PackedMatvecKind::Q4_K
             | PackedMatvecKind::Q5_K
             | PackedMatvecKind::Q6_K
@@ -5363,8 +7046,11 @@ impl PackedMatvecKind {
             | PackedMatvecKind::IQ2_XS
             | PackedMatvecKind::IQ2_S
             | PackedMatvecKind::IQ3_XXS
-            | PackedMatvecKind::IQ3_S => 256,
-            PackedMatvecKind::PTQ1_0 => 128,
+            | PackedMatvecKind::IQ3_S
+            | PackedMatvecKind::Q2_K
+            | PackedMatvecKind::Q3_K
+            | PackedMatvecKind::Q8_K => 256,
+            PackedMatvecKind::PTQ1_0 | PackedMatvecKind::PQ2_0 => 128,
         }
     }
 }
@@ -5577,6 +7263,14 @@ pub fn try_matvec_tensor_usm_f32(
         Dtype::IQ3_XXSRaw => PackedMatvecKind::IQ3_XXS,
         Dtype::IQ3_SRaw => PackedMatvecKind::IQ3_S,
         Dtype::PTQ1_0Raw => PackedMatvecKind::PTQ1_0,
+        Dtype::Q4_0Raw => PackedMatvecKind::Q4_0,
+        Dtype::Q5_0Raw => PackedMatvecKind::Q5_0,
+        Dtype::Q4_1Raw => PackedMatvecKind::Q4_1,
+        Dtype::Q5_1Raw => PackedMatvecKind::Q5_1,
+        Dtype::Q2_KRaw => PackedMatvecKind::Q2_K,
+        Dtype::Q3_KRaw => PackedMatvecKind::Q3_K,
+        Dtype::Q8_KRaw => PackedMatvecKind::Q8_K,
+        Dtype::PQ2_0Raw => PackedMatvecKind::PQ2_0,
         _ => {
             // Log every unique dtype we see fall through to CPU
             // so we get a complete dtype-distribution map of the
@@ -5852,6 +7546,62 @@ pub fn try_matvec_tensor_usm_f32(
                 )
             }
             .is_ok(),
+            // The 8 CPU-parity packed formats (legacy Q4_0/Q5_0/Q4_1/
+            // Q5_1, K-quant Q2_K/Q3_K/Q8_K, PrismML PQ2_0) route through
+            // the DIRECT single-row call with `lws = 0` — the
+            // kernel-TU-picked default work-group size. These have no
+            // autotuner `KERNEL_*` const, so we skip `tuned_lws_for`
+            // (no new tuner consts needed); the batched twin below has no
+            // arm for them, so PREFILL correctly falls to the CPU batched
+            // path while DECODE (this site) uses the GPU.
+            PackedMatvecKind::Q4_0 => unsafe {
+                sk::matvec_q4_0_packed_f32_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::Q5_0 => unsafe {
+                sk::matvec_q5_0_packed_f32_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::Q4_1 => unsafe {
+                sk::matvec_q4_1_packed_f32_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::Q5_1 => unsafe {
+                sk::matvec_q5_1_packed_f32_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::Q2_K => unsafe {
+                sk::matvec_q2_k_packed_f32_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::Q3_K => unsafe {
+                sk::matvec_q3_k_packed_f32_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::Q8_K => unsafe {
+                sk::matvec_q8_k_packed_f32_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::PQ2_0 => unsafe {
+                sk::matvec_pq2_0_packed_f32_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                )
+            }
+            .is_ok(),
         };
         note_packed_kind_result(kind, ok);
         if !ok {
@@ -5933,6 +7683,18 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
         Dtype::IQ3_XXSRaw => PackedMatvecKind::IQ3_XXS,
         Dtype::IQ3_SRaw => PackedMatvecKind::IQ3_S,
         Dtype::PTQ1_0Raw => PackedMatvecKind::PTQ1_0,
+        // Mapped for kind-consistency with the single-row gate; there is
+        // no fused gate+up kernel for these 8 formats, so they land on
+        // the `_ => return false` launch arm below and the caller falls
+        // back to two separate `try_matvec_tensor_usm_f32` calls.
+        Dtype::Q4_0Raw => PackedMatvecKind::Q4_0,
+        Dtype::Q5_0Raw => PackedMatvecKind::Q5_0,
+        Dtype::Q4_1Raw => PackedMatvecKind::Q4_1,
+        Dtype::Q5_1Raw => PackedMatvecKind::Q5_1,
+        Dtype::Q2_KRaw => PackedMatvecKind::Q2_K,
+        Dtype::Q3_KRaw => PackedMatvecKind::Q3_K,
+        Dtype::Q8_KRaw => PackedMatvecKind::Q8_K,
+        Dtype::PQ2_0Raw => PackedMatvecKind::PQ2_0,
         _ => return false,
     };
     if packed_kind_disabled(kind) {
@@ -6143,6 +7905,22 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
                 )
             }
             .is_ok(),
+            // PTQ1_0 (Bonsai ternary) fused gate+up — mirrors the Q8_0/
+            // Q4_K arms above (same guards, tuner-const LWS source). The
+            // remaining 8 packed formats have no fused gate+up kernel and
+            // fall to the `_ => return false` arm (caller runs two
+            // separate matvecs).
+            PackedMatvecKind::PTQ1_0 => unsafe {
+                let lws = tuned_lws_for(rustllama_tuner::KERNEL_PTQ1_0_PACKED_USM, m, k);
+                sk::matvec_ptq1_0_gate_up_fused_usm_raw(
+                    &*stream_raw,
+                    g_ptr, u_ptr,
+                    x_ptr,
+                    gate_ptr, up_ptr,
+                    m as u32, k as u32, lws,
+                )
+            }
+            .is_ok(),
             _ => return false,
         };
         note_packed_kind_result(kind, ok);
@@ -6241,6 +8019,18 @@ pub fn try_matvec_out_proj_add_rmsnorm_usm_f32(
         Dtype::IQ3_XXSRaw => PackedMatvecKind::IQ3_XXS,
         Dtype::IQ3_SRaw => PackedMatvecKind::IQ3_S,
         Dtype::PTQ1_0Raw => PackedMatvecKind::PTQ1_0,
+        // Mapped for kind-consistency; there is no fused
+        // matvec+add+rmsnorm path for these 8 formats, so stage 1's
+        // launch match falls them to `_ => return false` and the caller
+        // takes the legacy unfused matvec + F16 add_rmsnorm pair.
+        Dtype::Q4_0Raw => PackedMatvecKind::Q4_0,
+        Dtype::Q5_0Raw => PackedMatvecKind::Q5_0,
+        Dtype::Q4_1Raw => PackedMatvecKind::Q4_1,
+        Dtype::Q5_1Raw => PackedMatvecKind::Q5_1,
+        Dtype::Q2_KRaw => PackedMatvecKind::Q2_K,
+        Dtype::Q3_KRaw => PackedMatvecKind::Q3_K,
+        Dtype::Q8_KRaw => PackedMatvecKind::Q8_K,
+        Dtype::PQ2_0Raw => PackedMatvecKind::PQ2_0,
         _ => return false,
     };
     if packed_kind_disabled(kind) {
@@ -6333,9 +8123,19 @@ pub fn try_matvec_out_proj_add_rmsnorm_usm_f32(
             PackedMatvecKind::IQ2_S => h6_matvec!(sk::matvec_iq2_s_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ2_S_PACKED_USM),
             PackedMatvecKind::IQ3_XXS => h6_matvec!(sk::matvec_iq3_xxs_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ3_XXS_PACKED_USM),
             PackedMatvecKind::IQ3_S => h6_matvec!(sk::matvec_iq3_s_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ3_S_PACKED_USM),
-            // No fused H6 kernel for PTQ1_0 — signal miss so the
-            // caller takes the unfused ladder.
-            PackedMatvecKind::PTQ1_0 => return false,
+            // PTQ1_0 stage-1 matvec — mirrors the Q8_0/Q4_K arms (packed
+            // matvec into `dot`, then the SHARED stage-2
+            // `add_rmsnorm_f32_usm` below). We deliberately route through
+            // `matvec_ptq1_0_packed_f32_usm_raw`, NOT the single-kernel
+            // `matvec_ptq1_0_add_rmsnorm_usm`: this function was rewritten
+            // (2026-05-29) to chain two proven kernels precisely because
+            // the 1-workgroup fused `matvec_X_add_rmsnorm_usm` topology
+            // produced gibberish on Q4_K. The packed matvec keeps PTQ1_0
+            // on that proven two-stage path.
+            PackedMatvecKind::PTQ1_0 => h6_matvec!(sk::matvec_ptq1_0_packed_f32_usm_raw, rustllama_tuner::KERNEL_PTQ1_0_PACKED_USM),
+            // The 8 CPU-parity packed formats have no H6 arm — signal
+            // miss so the caller takes the unfused ladder.
+            _ => return false,
         };
         note_packed_kind_result(kind, ok_matvec);
         if !ok_matvec {
@@ -6494,8 +8294,12 @@ pub fn try_matvec_tensor_f16in_usm_f32(
             PackedMatvecKind::IQ2_S => h8_call!(sk::matvec_iq2_s_f16in_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ2_S_PACKED_USM),
             PackedMatvecKind::IQ3_XXS => h8_call!(sk::matvec_iq3_xxs_f16in_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ3_XXS_PACKED_USM),
             PackedMatvecKind::IQ3_S => h8_call!(sk::matvec_iq3_s_f16in_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ3_S_PACKED_USM),
-            // No f16-in H8 kernel for PTQ1_0 — miss to the F32-in path.
-            PackedMatvecKind::PTQ1_0 => return false,
+            // PTQ1_0 f16-in packed matvec — mirrors the Q8_0/Q4_K arms
+            // (same guards, same tuner-const LWS source).
+            PackedMatvecKind::PTQ1_0 => h8_call!(sk::matvec_ptq1_0_f16in_packed_f32_usm_raw, rustllama_tuner::KERNEL_PTQ1_0_PACKED_USM),
+            // The 8 CPU-parity packed formats have no f16-in H8 kernel —
+            // miss to the F32-in path.
+            _ => return false,
         };
         note_packed_kind_result(kind, ok);
         if !ok {
@@ -7072,6 +8876,21 @@ pub fn try_matvec_tensor_batched_usm_f32(
         Dtype::Q6_KRaw => PackedMatvecKind::Q6_K,
         Dtype::IQ4_NLRaw => PackedMatvecKind::IQ4_NL,
         Dtype::IQ4_XSRaw => PackedMatvecKind::IQ4_XS,
+        // The IQ / PTQ1_0 batched USM kernels below were live but
+        // UNREACHABLE: this gate mapped only the 6 formats above, so
+        // batched PREFILL of these 8 formats fell through to the CPU
+        // batched matvec while the single-row DECODE gate
+        // (`try_matvec_tensor_usm_f32`) already routed them to the GPU.
+        // Map them here too so all 14 packed dtypes reach the GPU on
+        // prefill, matching the single-row gate exactly.
+        Dtype::IQ1_SRaw => PackedMatvecKind::IQ1_S,
+        Dtype::IQ2_XXSRaw => PackedMatvecKind::IQ2_XXS,
+        Dtype::IQ1_MRaw => PackedMatvecKind::IQ1_M,
+        Dtype::IQ2_XSRaw => PackedMatvecKind::IQ2_XS,
+        Dtype::IQ2_SRaw => PackedMatvecKind::IQ2_S,
+        Dtype::IQ3_XXSRaw => PackedMatvecKind::IQ3_XXS,
+        Dtype::IQ3_SRaw => PackedMatvecKind::IQ3_S,
+        Dtype::PTQ1_0Raw => PackedMatvecKind::PTQ1_0,
         _ => {
             log_unmatched_dtype(w.dtype);
             return false;
@@ -7233,10 +9052,13 @@ pub fn try_matvec_tensor_batched_usm_f32(
                 )
             }
             .is_ok(),
-            // G1: IQ-quant batched USM kernels — same arithmetic as
-            // the single-row paths above, just iterating over N input
-            // activations in one kernel launch. Closes the prior
-            // GPU-decode / CPU-prefill asymmetry for all 7 IQ formats.
+            // G1: IQ-quant + PTQ1_0 batched USM kernels — same
+            // arithmetic as the single-row paths above, just iterating
+            // over N input activations in one kernel launch. With the
+            // dtype→kind gate above now mapping these 8 formats (see the
+            // note there), batched PREFILL reaches these GPU arms, so
+            // the prior GPU-decode / CPU-prefill asymmetry is closed for
+            // every packed format — not just the K-quants.
             PackedMatvecKind::PTQ1_0 => unsafe {
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_PTQ1_0_PACKED_USM, m, k);
                 sk::matvec_ptq1_0_packed_f32_batched_usm_raw(
@@ -7301,6 +9123,13 @@ pub fn try_matvec_tensor_batched_usm_f32(
                 )
             }
             .is_ok(),
+            // The 8 CPU-parity packed formats (Q4_0/Q5_0/Q4_1/Q5_1,
+            // Q2_K/Q3_K/Q8_K, PQ2_0) have no batched SYCL kernel and are
+            // intentionally NOT mapped in the dtype gate above — this arm
+            // is unreachable in practice but keeps the match exhaustive.
+            // Their batched PREFILL correctly falls to the CPU batched
+            // matvec while single-row DECODE uses the GPU.
+            _ => return false,
         };
         note_packed_kind_result(kind, ok);
         if !ok {
@@ -7469,6 +9298,620 @@ pub fn try_flash_attn_prefill_usm_f32(
         });
         true
     })
+}
+
+// ==================================================================
+// Quantized-KV FlashAttention PREFILL (SYCL-USM + native CUDA)
+// ==================================================================
+//
+// The batched-prefill analogue of the quantized-KV decode helpers. Where
+// decode writes ONE new row into a persistent per-layer mirror and walks
+// `[0, pos+1)`, prefill re-uploads the WHOLE packed K/V slab the engine
+// already holds (`[n_kv_heads, max_ctx, bytes_per_row]`) and the kernel
+// walks each query `q_pos in [0, n_new)` over its causal window
+// `[0, kv_len_base + q_pos]`. This mirrors `try_flash_attn_prefill_usm_f32`
+// exactly (whole-slab re-upload, no incremental valid-len gate) — so there
+// is no staleness epoch here: the caller hands us the full, current slab.
+//
+// KEY DEVIATION FROM DECODE (intentional, flagged in the task report): the
+// decode helper receives the NEW f32 K/V rows and re-quantizes them into
+// its own mirror. Prefill CANNOT do that — the raw f32 K/V for earlier
+// rows is long gone by the time the sub-chunk attends (only the packed
+// cache survives), so re-quantizing would not be byte-exact with the CPU
+// reference. Instead prefill takes the ALREADY-PACKED slab (+ optional
+// per-row scales) straight from the engine's `KvLayer`, uploads it
+// verbatim, and runs the kernel — byte-identical to what the CPU prefill
+// kernel reads, so GPU == CPU within the fp-reduction-order tolerance the
+// F32 path already carries. The f32 Q / output scratch is shared with the
+// F32 prefill helper (only one prefill runs at a time).
+
+/// Shared body for every SYCL-USM quantized-KV prefill helper. `q` / `out`
+/// are f32 `[n_new, n_heads, head_dim]`; `k_packed` / `v_packed` are the
+/// packed slab `[n_kv_heads, max_ctx, bytes_per_row]`; `k_scales` /
+/// `v_scales` are `[n_kv_heads * max_ctx]` per-row f32 scales (empty slices
+/// for the formats that embed their scale in the packed bytes). Returns
+/// `true` iff the GPU produced the output (in `out`); `false` (→ caller's
+/// CPU prefill) for any gate / shape / alloc / kernel failure. Relies on
+/// the USM context already being built by `prepare_usm_context` (same as
+/// the F32 prefill helper); if it is not, declines to CPU.
+#[allow(clippy::too_many_arguments)]
+fn try_flash_attn_prefill_usm_quant(
+    fmt: QuantKv,
+    q: &[f32],
+    k_packed: &[u8],
+    v_packed: &[u8],
+    k_scales: &[f32],
+    v_scales: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+) -> bool {
+    if !usm_attn_enabled() {
+        log_prefill_attn_skip_once("usm_attn_enabled = false");
+        return false;
+    }
+    if !gpu_active_for_current_layer() {
+        return false;
+    }
+    if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || max_ctx == 0 || n_new == 0 {
+        log_prefill_attn_skip_once("zero-dim shape");
+        return false;
+    }
+    if n_heads % n_kv_heads != 0 {
+        log_prefill_attn_skip_once("n_heads not divisible by n_kv_heads");
+        return false;
+    }
+    if kv_len_base + n_new > max_ctx {
+        log_prefill_attn_skip_once("kv_len_base + n_new > max_ctx");
+        return false;
+    }
+    // Per-format block constraint (same rules as the quant decode helper +
+    // each kernel's own asserts — decline instead of risking a device-side
+    // assert).
+    let ok_shape = match fmt {
+        QuantKv::Q4_0 => head_dim % 32 == 0,
+        QuantKv::Q8_0 => true,
+        QuantKv::Nvfp4 => head_dim % 16 == 0,
+        QuantKv::Tq { bits } => matches!(bits, 1 | 2 | 4 | 8) && head_dim.is_power_of_two(),
+    };
+    if !ok_shape {
+        log_prefill_attn_skip_once("quant prefill block-shape constraint");
+        return false;
+    }
+    let bytes_per_row = fmt.bytes_per_row(head_dim);
+    let need_q = n_new * n_heads * head_dim;
+    let need_kv = n_kv_heads * max_ctx * bytes_per_row;
+    let need_scales = n_kv_heads * max_ctx;
+    let need_out = need_q;
+    let has_scales = fmt.has_scales();
+    if q.len() != need_q
+        || k_packed.len() != need_kv
+        || v_packed.len() != need_kv
+        || out.len() != need_out
+    {
+        log_prefill_attn_skip_once("quant prefill input slice length mismatch");
+        return false;
+    }
+    if has_scales && (k_scales.len() != need_scales || v_scales.len() != need_scales) {
+        log_prefill_attn_skip_once("quant prefill scales length mismatch");
+        return false;
+    }
+    USM_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(ctx) = slot.as_mut() else {
+            log_prefill_attn_skip_once("USM_ATTN slot is None (prepare_usm_context failed)");
+            return false;
+        };
+        // f32 Q/out reuse the F32 prefill slabs; packed K/V + scales use
+        // the dedicated quant-prefill scratch.
+        if !ensure_scratch_f32(&ctx.stream, &mut ctx.prefill_q_f32, need_q)
+            || !ensure_scratch_f32(&ctx.stream, &mut ctx.prefill_out_f32, need_out)
+            || !ensure_u8_exact(&ctx.stream, &mut ctx.prefill_k_packed, need_kv)
+            || !ensure_u8_exact(&ctx.stream, &mut ctx.prefill_v_packed, need_kv)
+        {
+            log_prefill_attn_skip_once("quant prefill scratch alloc failed");
+            return false;
+        }
+        if has_scales
+            && (!ensure_scratch_f32(&ctx.stream, &mut ctx.prefill_k_scales, need_scales)
+                || !ensure_scratch_f32(&ctx.stream, &mut ctx.prefill_v_scales, need_scales))
+        {
+            log_prefill_attn_skip_once("quant prefill scales alloc failed");
+            return false;
+        }
+        // Upload Q + the whole packed K/V slab (+ scales) on every call —
+        // the prefill residency model (see the F32 prefill helper's doc).
+        ctx.prefill_q_f32.as_mut().unwrap().as_mut_slice()[..need_q].copy_from_slice(q);
+        ctx.prefill_k_packed.as_mut().unwrap().as_mut_slice()[..need_kv].copy_from_slice(k_packed);
+        ctx.prefill_v_packed.as_mut().unwrap().as_mut_slice()[..need_kv].copy_from_slice(v_packed);
+        if has_scales {
+            ctx.prefill_k_scales.as_mut().unwrap().as_mut_slice()[..need_scales]
+                .copy_from_slice(k_scales);
+            ctx.prefill_v_scales.as_mut().unwrap().as_mut_slice()[..need_scales]
+                .copy_from_slice(v_scales);
+        }
+        // Raw-pointer dance to avoid simultaneous &mut borrows across
+        // fields — the same pattern the F32 prefill helper uses. SAFETY:
+        // all USM pointers come from `ctx.stream`'s allocator, sized by the
+        // ensure_* calls above; the kernel `.wait()`s before returning.
+        let stream_raw: *const sk::SyclStream = &ctx.stream;
+        let q_ptr = ctx.prefill_q_f32.as_ref().unwrap().as_ptr();
+        let k_ptr = ctx.prefill_k_packed.as_ref().unwrap().as_ptr();
+        let v_ptr = ctx.prefill_v_packed.as_ref().unwrap().as_ptr();
+        let out_ptr = ctx.prefill_out_f32.as_mut().unwrap().as_mut_ptr();
+        let (ks_ptr, vs_ptr) = if has_scales {
+            (
+                ctx.prefill_k_scales.as_ref().unwrap().as_ptr(),
+                ctx.prefill_v_scales.as_ref().unwrap().as_ptr(),
+            )
+        } else {
+            (std::ptr::null::<f32>(), std::ptr::null::<f32>())
+        };
+        let ok = unsafe {
+            match fmt {
+                QuantKv::Q4_0 => sk::flash_attn_prefill_q4_0_usm_raw(
+                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads as u32, n_kv_heads as u32, head_dim as u32,
+                    max_ctx as u32, kv_len_base as u32, n_new as u32,
+                ),
+                QuantKv::Q8_0 => sk::flash_attn_prefill_q8_0_usm_raw(
+                    &*stream_raw, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, out_ptr,
+                    n_heads as u32, n_kv_heads as u32, head_dim as u32,
+                    max_ctx as u32, kv_len_base as u32, n_new as u32,
+                ),
+                QuantKv::Nvfp4 => sk::flash_attn_prefill_nvfp4_usm_raw(
+                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads as u32, n_kv_heads as u32, head_dim as u32,
+                    max_ctx as u32, kv_len_base as u32, n_new as u32,
+                ),
+                QuantKv::Tq { bits } => sk::flash_attn_prefill_tq_usm_raw(
+                    &*stream_raw, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
+                    n_heads as u32, n_kv_heads as u32, head_dim as u32,
+                    max_ctx as u32, kv_len_base as u32, n_new as u32,
+                ),
+            }
+        }
+        .is_ok();
+        if !ok {
+            log_prefill_attn_skip_once("quant prefill kernel call returned Err");
+            return false;
+        }
+        out.copy_from_slice(&ctx.prefill_out_f32.as_ref().unwrap().as_slice()[..need_out]);
+        true
+    })
+}
+
+/// Try to run F32 KV flash-attention PREFILL on the native CUDA backend.
+/// Same public signature as [`try_flash_attn_prefill_usm_f32`]. `k` / `v`
+/// are the full f32 slab `[n_kv_heads, max_ctx, head_dim]` the caller
+/// already holds; the whole slab + Q are uploaded and the kernel walks each
+/// query's causal window. `true` iff the GPU produced `out`; else the
+/// combinator falls through to SYCL / CPU.
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_prefill_cuda_f32(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+) -> bool {
+    if !cuda_active() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || max_ctx == 0 || n_new == 0 {
+        return false;
+    }
+    if n_heads % n_kv_heads != 0 || kv_len_base + n_new > max_ctx {
+        return false;
+    }
+    let need_q = n_new * n_heads * head_dim;
+    let need_kv = n_kv_heads * max_ctx * head_dim;
+    if q.len() != need_q || k.len() != need_kv || v.len() != need_kv || out.len() != need_q {
+        return false;
+    }
+    let mirror_bytes = need_kv * 4;
+    let q_bytes = need_q * 4;
+    let out_bytes = need_q * 4;
+    CUDA_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        // Prefill runs before any decode, so the context is normally None
+        // here. Build a minimal one (n_layers = 1: prefill never indexes
+        // the per-layer decode shadows) purely to own a stream + the shared
+        // prefill scratch. A later decode with the real per-model config
+        // rebuilds harmlessly (prefill's scratch is done with by then).
+        if slot.is_none() {
+            *slot = CudaAttnContext::try_new(CudaAttnConfig {
+                n_layers: 1,
+                n_heads: n_heads as u32,
+                n_kv_heads: n_kv_heads as u32,
+                head_dim: head_dim as u32,
+                max_ctx: max_ctx as u32,
+            });
+            if slot.is_none() {
+                return false;
+            }
+        }
+        let ctx = slot.as_mut().expect("cuda ctx just built");
+        if !ensure_cuda_dev(&mut ctx.dev_prefill_k, &ctx.stream, mirror_bytes)
+            || !ensure_cuda_dev(&mut ctx.dev_prefill_v, &ctx.stream, mirror_bytes)
+            || !ensure_cuda_dev(&mut ctx.dev_prefill_q, &ctx.stream, q_bytes)
+            || !ensure_cuda_dev(&mut ctx.dev_prefill_out, &ctx.stream, out_bytes)
+        {
+            return false;
+        }
+        {
+            let s: &[u8] =
+                unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, mirror_bytes) };
+            if ctx.dev_prefill_k.as_mut().unwrap().copy_from_host(s).is_err() {
+                return false;
+            }
+        }
+        {
+            let s: &[u8] =
+                unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, mirror_bytes) };
+            if ctx.dev_prefill_v.as_mut().unwrap().copy_from_host(s).is_err() {
+                return false;
+            }
+        }
+        {
+            let s: &[u8] = unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u8, q_bytes) };
+            if ctx.dev_prefill_q.as_mut().unwrap().copy_from_host(s).is_err() {
+                return false;
+            }
+        }
+        let stream = &ctx.stream;
+        let q_ptr = ctx.dev_prefill_q.as_ref().unwrap().as_ptr() as *const f32;
+        let k_ptr = ctx.dev_prefill_k.as_ref().unwrap().as_ptr() as *const f32;
+        let v_ptr = ctx.dev_prefill_v.as_ref().unwrap().as_ptr() as *const f32;
+        let out_ptr = ctx.dev_prefill_out.as_mut().unwrap().as_mut_ptr() as *mut f32;
+        // SAFETY: live device pointers on `stream`, sized above; the wrapper
+        // synchronizes before returning so the read-back doesn't race.
+        let launched = unsafe {
+            ck::flash_attn_prefill_f32(
+                stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            )
+        }
+        .is_ok();
+        if !launched || ck::consume_error_count() != 0 {
+            return false;
+        }
+        let out_b: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out_bytes) };
+        ctx.dev_prefill_out.as_ref().unwrap().copy_to_host(out_b).is_ok()
+    })
+}
+
+/// Shared body for every native-CUDA quantized-KV prefill helper. Mirrors
+/// [`try_flash_attn_prefill_usm_quant`] (packed slab in, f32 out) but
+/// uploads to device scratch instead of USM-shared. `k_packed` / `v_packed`
+/// are the packed slab bytes; `k_scales` / `v_scales` the per-row f32
+/// scales (empty for scale-embedded formats). `true` iff the GPU produced
+/// `out`.
+#[allow(clippy::too_many_arguments)]
+fn try_flash_attn_prefill_cuda_quant(
+    fmt: QuantKv,
+    q: &[f32],
+    k_packed: &[u8],
+    v_packed: &[u8],
+    k_scales: &[f32],
+    v_scales: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+) -> bool {
+    if !cuda_active() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || max_ctx == 0 || n_new == 0 {
+        return false;
+    }
+    if n_heads % n_kv_heads != 0 || kv_len_base + n_new > max_ctx {
+        return false;
+    }
+    let ok_shape = match fmt {
+        QuantKv::Q4_0 => head_dim % 32 == 0,
+        QuantKv::Q8_0 => true,
+        QuantKv::Nvfp4 => head_dim % 16 == 0,
+        QuantKv::Tq { bits } => matches!(bits, 1 | 2 | 4 | 8) && head_dim.is_power_of_two(),
+    };
+    if !ok_shape {
+        return false;
+    }
+    let bytes_per_row = fmt.bytes_per_row(head_dim);
+    let need_q = n_new * n_heads * head_dim;
+    let need_kv = n_kv_heads * max_ctx * bytes_per_row;
+    let need_scales = n_kv_heads * max_ctx;
+    let has_scales = fmt.has_scales();
+    if q.len() != need_q
+        || k_packed.len() != need_kv
+        || v_packed.len() != need_kv
+        || out.len() != need_q
+    {
+        return false;
+    }
+    if has_scales && (k_scales.len() != need_scales || v_scales.len() != need_scales) {
+        return false;
+    }
+    let q_bytes = need_q * 4;
+    let out_bytes = need_q * 4;
+    let scales_bytes = need_scales * 4;
+    CUDA_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = CudaAttnContext::try_new(CudaAttnConfig {
+                n_layers: 1,
+                n_heads: n_heads as u32,
+                n_kv_heads: n_kv_heads as u32,
+                head_dim: head_dim as u32,
+                max_ctx: max_ctx as u32,
+            });
+            if slot.is_none() {
+                return false;
+            }
+        }
+        let ctx = slot.as_mut().expect("cuda ctx just built");
+        if !ensure_cuda_dev(&mut ctx.dev_prefill_k, &ctx.stream, need_kv)
+            || !ensure_cuda_dev(&mut ctx.dev_prefill_v, &ctx.stream, need_kv)
+            || !ensure_cuda_dev(&mut ctx.dev_prefill_q, &ctx.stream, q_bytes)
+            || !ensure_cuda_dev(&mut ctx.dev_prefill_out, &ctx.stream, out_bytes)
+        {
+            return false;
+        }
+        if has_scales
+            && (!ensure_cuda_dev(&mut ctx.dev_prefill_k_scales, &ctx.stream, scales_bytes)
+                || !ensure_cuda_dev(&mut ctx.dev_prefill_v_scales, &ctx.stream, scales_bytes))
+        {
+            return false;
+        }
+        // Upload the packed slab (+ scales) + Q verbatim. `k_packed` etc.
+        // are caller-owned slices (not `ctx` fields), so there is no
+        // aliasing with the device buffers they copy into.
+        if ctx.dev_prefill_k.as_mut().unwrap().copy_from_host(k_packed).is_err() {
+            return false;
+        }
+        if ctx.dev_prefill_v.as_mut().unwrap().copy_from_host(v_packed).is_err() {
+            return false;
+        }
+        if has_scales {
+            {
+                let s: &[u8] = unsafe {
+                    std::slice::from_raw_parts(k_scales.as_ptr() as *const u8, scales_bytes)
+                };
+                if ctx.dev_prefill_k_scales.as_mut().unwrap().copy_from_host(s).is_err() {
+                    return false;
+                }
+            }
+            {
+                let s: &[u8] = unsafe {
+                    std::slice::from_raw_parts(v_scales.as_ptr() as *const u8, scales_bytes)
+                };
+                if ctx.dev_prefill_v_scales.as_mut().unwrap().copy_from_host(s).is_err() {
+                    return false;
+                }
+            }
+        }
+        {
+            let s: &[u8] = unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u8, q_bytes) };
+            if ctx.dev_prefill_q.as_mut().unwrap().copy_from_host(s).is_err() {
+                return false;
+            }
+        }
+        let stream = &ctx.stream;
+        let q_ptr = ctx.dev_prefill_q.as_ref().unwrap().as_ptr() as *const f32;
+        let k_ptr = ctx.dev_prefill_k.as_ref().unwrap().as_ptr();
+        let v_ptr = ctx.dev_prefill_v.as_ref().unwrap().as_ptr();
+        let out_ptr = ctx.dev_prefill_out.as_mut().unwrap().as_mut_ptr() as *mut f32;
+        let (ks_ptr, vs_ptr) = if has_scales {
+            (
+                ctx.dev_prefill_k_scales.as_ref().unwrap().as_ptr() as *const f32,
+                ctx.dev_prefill_v_scales.as_ref().unwrap().as_ptr() as *const f32,
+            )
+        } else {
+            (std::ptr::null::<f32>(), std::ptr::null::<f32>())
+        };
+        // SAFETY: live device pointers on `stream`, sized above; the
+        // wrappers synchronize before returning.
+        let launched = unsafe {
+            match fmt {
+                QuantKv::Q4_0 => ck::flash_attn_prefill_q4_0(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                ),
+                QuantKv::Q8_0 => ck::flash_attn_prefill_q8_0(
+                    stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                ),
+                QuantKv::Nvfp4 => ck::flash_attn_prefill_nvfp4(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                ),
+                QuantKv::Tq { bits } => ck::flash_attn_prefill_tq(
+                    stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                ),
+            }
+        }
+        .is_ok();
+        if !launched || ck::consume_error_count() != 0 {
+            return false;
+        }
+        let out_b: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out_bytes) };
+        ctx.dev_prefill_out.as_ref().unwrap().copy_to_host(out_b).is_ok()
+    })
+}
+
+// ------------------------------------------------------------------
+// GPU flash-attention PREFILL dispatchers (CUDA → SYCL → CPU)
+// ------------------------------------------------------------------
+//
+// One combinator per KV dtype, mirroring the decode dispatchers: try native
+// CUDA first when a CUDA device is present, else the SYCL-USM path, else
+// (on `false`) the caller's CPU prefill kernel. On a SYCL-only / CPU-only
+// host the `cuda_active()` short-circuit makes these behave exactly like
+// the SYCL helper — no F32 / SYCL / CPU regression.
+
+/// F32 KV flash-attention prefill: CUDA → SYCL → (caller's CPU on `false`).
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_prefill_gpu_f32(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+) -> bool {
+    if cuda_active()
+        && try_flash_attn_prefill_cuda_f32(
+            q, k, v, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        )
+    {
+        return true;
+    }
+    try_flash_attn_prefill_usm_f32(
+        q, k, v, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+    )
+}
+
+/// Q4_0 KV flash-attention prefill: CUDA → SYCL → (caller's CPU).
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_prefill_gpu_q4_0(
+    q: &[f32],
+    k_packed: &[u8],
+    v_packed: &[u8],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+) -> bool {
+    if cuda_active()
+        && try_flash_attn_prefill_cuda_quant(
+            QuantKv::Q4_0, q, k_packed, v_packed, &[], &[], out,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        )
+    {
+        return true;
+    }
+    try_flash_attn_prefill_usm_quant(
+        QuantKv::Q4_0, q, k_packed, v_packed, &[], &[], out,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+    )
+}
+
+/// Q8_0 KV flash-attention prefill: CUDA → SYCL → (caller's CPU). The i8
+/// KV slabs are reinterpreted as raw bytes (identical layout — the kernels
+/// read them back as i8 internally).
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_prefill_gpu_q8_0(
+    q: &[f32],
+    k_q: &[i8],
+    k_scales: &[f32],
+    v_q: &[i8],
+    v_scales: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+) -> bool {
+    let k_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(k_q.as_ptr() as *const u8, k_q.len()) };
+    let v_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(v_q.as_ptr() as *const u8, v_q.len()) };
+    if cuda_active()
+        && try_flash_attn_prefill_cuda_quant(
+            QuantKv::Q8_0, q, k_bytes, v_bytes, k_scales, v_scales, out,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        )
+    {
+        return true;
+    }
+    try_flash_attn_prefill_usm_quant(
+        QuantKv::Q8_0, q, k_bytes, v_bytes, k_scales, v_scales, out,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+    )
+}
+
+/// NVFP4 KV flash-attention prefill: CUDA → SYCL → (caller's CPU).
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_prefill_gpu_nvfp4(
+    q: &[f32],
+    k_packed: &[u8],
+    v_packed: &[u8],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+) -> bool {
+    if cuda_active()
+        && try_flash_attn_prefill_cuda_quant(
+            QuantKv::Nvfp4, q, k_packed, v_packed, &[], &[], out,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        )
+    {
+        return true;
+    }
+    try_flash_attn_prefill_usm_quant(
+        QuantKv::Nvfp4, q, k_packed, v_packed, &[], &[], out,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+    )
+}
+
+/// TurboQuant KV flash-attention prefill: CUDA → SYCL → (caller's CPU).
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_prefill_gpu_tq(
+    q: &[f32],
+    k_packed: &[u8],
+    k_scales: &[f32],
+    v_packed: &[u8],
+    v_scales: &[f32],
+    bits: u8,
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+) -> bool {
+    if cuda_active()
+        && try_flash_attn_prefill_cuda_quant(
+            QuantKv::Tq { bits }, q, k_packed, v_packed, k_scales, v_scales, out,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        )
+    {
+        return true;
+    }
+    try_flash_attn_prefill_usm_quant(
+        QuantKv::Tq { bits }, q, k_packed, v_packed, k_scales, v_scales, out,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+    )
 }
 
 /// Log the FIRST time the USM attention KV-mirror validity gate

@@ -583,7 +583,7 @@ mod tests {
         // the test asserts the fallback contract for mock builds.
         if decision.device_global_mem_bytes == 0 {
             assert_eq!(decision.n_gpu_layers, 0);
-            assert!(decision.reason.contains("device_info"));
+            assert!(decision.reason.contains("no usable SYCL or CUDA GPU"));
         }
     }
 }

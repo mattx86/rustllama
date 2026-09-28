@@ -67,6 +67,15 @@ pub struct Tokenizer {
     add_bos: bool,
     add_eos: bool,
     chat_template: Option<String>,
+    /// True only for byte-level BPE (`gpt2` family). Gates
+    /// [`Self::encode_streaming`]'s split-at-`<|` fast path: splitting a
+    /// rendered prompt at special-token boundaries and encoding the
+    /// segments independently reproduces a single `encode` ONLY for
+    /// byte-level BPE (special tokens are atomic and no per-segment
+    /// pre-tokenizer prefix is injected). Metaspace/SPM and
+    /// WordPiece/BERT diverge, so they route through a whole-string
+    /// encode instead.
+    byte_level_streaming: bool,
 }
 
 impl Tokenizer {
@@ -82,6 +91,10 @@ impl Tokenizer {
             add_bos: false,
             add_eos: false,
             chat_template: None,
+            // Loaded from a raw tokenizer.json: the pre-tokenizer family
+            // is unknown here, so take the safe route (whole-string
+            // streaming encode).
+            byte_level_streaming: false,
         })
     }
 
@@ -127,6 +140,10 @@ impl Tokenizer {
             other => return Err(TokenizerError::UnsupportedModel(other.to_string())),
         };
 
+        // Only byte-level BPE (`gpt2`) may use the split-at-`<|`
+        // streaming encode; SPM/BERT would diverge from a single encode.
+        let byte_level_streaming = model == "gpt2";
+
         Ok(Self {
             inner,
             bos_token_id: bos,
@@ -134,6 +151,7 @@ impl Tokenizer {
             add_bos,
             add_eos,
             chat_template,
+            byte_level_streaming,
         })
     }
 
@@ -270,8 +288,24 @@ impl Tokenizer {
         text: &str,
         add_special_tokens: bool,
     ) -> Result<TokenStream> {
-        let segments = split_at_special_tokens(text);
         let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u32>>>();
+
+        // The split-at-`<|` fast path only reproduces a single `encode`
+        // for byte-level BPE (gpt2), where special tokens are atomic and
+        // no per-segment pre-tokenizer prefix is injected. For
+        // Metaspace/SPM (`llama`) each segment would gain a spurious
+        // leading `▁`; for WordPiece/BERT each would be wrapped in
+        // `[CLS]…[SEP]` — so the concatenated ids would diverge. Encode
+        // the whole string as one chunk in those cases: correctness over
+        // the (small) prefill-overlap win.
+        if !self.byte_level_streaming {
+            let ids = self.encode(text, add_special_tokens)?;
+            let _ = tx.send(Ok(ids));
+            drop(tx);
+            return Ok(TokenStream { rx });
+        }
+
+        let segments = split_at_special_tokens(text);
         if segments.is_empty() {
             // Empty prompt — close the channel immediately.
             drop(tx);
@@ -797,7 +831,22 @@ fn build_unigram_spm(
             tokens.len()
         )));
     }
+    build_unigram_spm_from_parts(tokens, &scores, token_types, bos, eos, pad, unk)
+}
 
+/// Assemble the Unigram (SPM) tokenizer JSON from already-extracted
+/// vocab parts and hand it to `tokenizers`. Split out of
+/// [`build_unigram_spm`] so it can be unit-tested with a synthetic
+/// byte-token vocab without constructing a full GGUF fixture.
+fn build_unigram_spm_from_parts(
+    tokens: &[String],
+    scores: &[f32],
+    token_types: &Option<Vec<i32>>,
+    bos: Option<u32>,
+    eos: Option<u32>,
+    pad: Option<u32>,
+    unk: Option<u32>,
+) -> Result<HfTokenizer> {
     let vocab: Vec<Value> = tokens
         .iter()
         .zip(scores.iter())
@@ -827,12 +876,51 @@ fn build_unigram_spm(
         }
     }
 
+    // Real Llama/Mistral SPM tokenizers carry the 256 `<0xNN>` byte
+    // tokens (token_type == 6) and enable SentencePiece byte fallback:
+    // any character with no vocab piece is emitted as its raw UTF-8
+    // bytes (the `<0xNN>` tokens) and reassembled on decode. Detect
+    // their presence and, only then, turn on the Unigram model's
+    // `byte_fallback` + a ByteFallback decode step. Gate on actually
+    // having the byte tokens — enabling byte fallback without the
+    // `<0xNN>` pieces in the vocab would make unknown chars
+    // unencodable.
+    let has_byte_tokens = token_types
+        .as_ref()
+        .map(|tt| tt.iter().any(|&t| t == 6))
+        .unwrap_or(false);
+
     let mut model = serde_json::Map::new();
     model.insert("type".into(), json!("Unigram"));
     if let Some(unk_id) = unk {
         model.insert("unk_id".into(), json!(unk_id));
     }
     model.insert("vocab".into(), Value::Array(vocab));
+    if has_byte_tokens {
+        model.insert("byte_fallback".into(), json!(true));
+    }
+
+    // Decoder: Metaspace (▁ → space) in all cases. When byte fallback is
+    // on, run ByteFallback first so consecutive `<0xNN>` tokens are
+    // turned back into their UTF-8 text before the metaspace
+    // substitution (a Sequence decoder, mirroring real Llama
+    // tokenizer.json).
+    let metaspace_decoder = json!({
+        "type": "Metaspace",
+        "replacement": "▁",
+        "prepend_scheme": "always",
+    });
+    let decoder = if has_byte_tokens {
+        json!({
+            "type": "Sequence",
+            "decoders": [
+                { "type": "ByteFallback" },
+                metaspace_decoder,
+            ],
+        })
+    } else {
+        metaspace_decoder
+    };
 
     let tokenizer_json = json!({
         "version": "1.0",
@@ -847,11 +935,7 @@ fn build_unigram_spm(
             "split": true,
         },
         "post_processor": null,
-        "decoder": {
-            "type": "Metaspace",
-            "replacement": "▁",
-            "prepend_scheme": "always",
-        },
+        "decoder": decoder,
         "model": model,
     });
 
@@ -1222,5 +1306,69 @@ mod tests {
         assert!(segs[1].starts_with("<|im_start|>"));
         assert!(segs[2].starts_with("<|im_end|>"));
         assert_eq!(segs.concat(), text);
+    }
+
+    /// SPM byte fallback: a Unigram vocab that carries the 256 `<0xNN>`
+    /// byte tokens (token_type == 6) must encode an out-of-vocab
+    /// character as its raw UTF-8 bytes and reassemble it on decode.
+    /// Without `byte_fallback: true` + the ByteFallback decoder step the
+    /// char would collapse to `<unk>` and the round trip would be lossy.
+    #[test]
+    fn unigram_byte_fallback_round_trips_rare_char() {
+        // Vocab: <unk>, ▁, then all 256 <0xNN> byte tokens (type 6).
+        let mut tokens: Vec<String> = vec!["<unk>".into(), "\u{2581}".into()];
+        let mut types: Vec<i32> = vec![2, 1];
+        let mut scores: Vec<f32> = vec![0.0, -1.0];
+        for b in 0u16..=255 {
+            tokens.push(format!("<0x{b:02X}>"));
+            types.push(6);
+            scores.push(-10.0);
+        }
+        let unk_id = 0u32;
+        let tok = build_unigram_spm_from_parts(
+            &tokens,
+            &scores,
+            &Some(types),
+            None,
+            None,
+            None,
+            Some(unk_id),
+        )
+        .expect("build unigram with byte fallback");
+
+        // "€" (U+20AC) is not a vocab piece → must byte-fall-back to
+        // <0xE2><0x82><0xAC> and decode back to "€".
+        let enc = tok.encode("€", false).expect("encode");
+        let ids = enc.get_ids();
+        assert!(
+            !ids.contains(&unk_id),
+            "byte fallback must avoid <unk>; got ids {ids:?}",
+        );
+        let decoded = tok.decode(ids, false).expect("decode");
+        assert_eq!(decoded, "€", "round trip through byte fallback");
+    }
+
+    /// Gating check: a Unigram vocab with no byte tokens must NOT enable
+    /// byte fallback, and the plain Metaspace decoder still round-trips
+    /// in-vocab text.
+    #[test]
+    fn unigram_without_byte_tokens_round_trips_ascii() {
+        let tokens: Vec<String> =
+            vec!["<unk>".into(), "\u{2581}".into(), "\u{2581}hi".into()];
+        let types: Vec<i32> = vec![2, 1, 1];
+        let scores: Vec<f32> = vec![0.0, -1.0, -0.5];
+        let tok = build_unigram_spm_from_parts(
+            &tokens,
+            &scores,
+            &Some(types),
+            None,
+            None,
+            None,
+            Some(0),
+        )
+        .expect("build unigram without byte fallback");
+        let enc = tok.encode("hi", false).expect("encode");
+        let decoded = tok.decode(enc.get_ids(), false).expect("decode");
+        assert_eq!(decoded, "hi");
     }
 }

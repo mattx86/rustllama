@@ -17,9 +17,10 @@
 //! with a dtype conversion to f16 if the source isn't already f16
 //! or f32.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
-use bytemuck::cast_slice;
+use bytemuck::try_cast_slice;
 use half::f16;
 use safetensors::tensor::TensorView;
 use safetensors::{Dtype as StDtype, SafeTensors};
@@ -267,6 +268,41 @@ fn convert_plain(
     }
 }
 
+/// Reinterpret a safetensors `i32` payload as `&[i32]` without copying
+/// when the mmap slice is already 4-byte aligned. safetensors tensors
+/// are borrowed straight from an mmap whose per-tensor offset carries
+/// no alignment guarantee, so a direct `bytemuck::cast_slice::<u8, i32>`
+/// would panic (`TargetAlignmentGreaterAndInputNotAligned`) on an
+/// unaligned tensor. Fall back to an owned, correctly-aligned
+/// `Vec<i32>` decoded from little-endian bytes in that case.
+fn as_i32_slice(bytes: &[u8]) -> Cow<'_, [i32]> {
+    match try_cast_slice::<u8, i32>(bytes) {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => {
+            let mut v = Vec::with_capacity(bytes.len() / 4);
+            for c in bytes.chunks_exact(4) {
+                v.push(i32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            }
+            Cow::Owned(v)
+        }
+    }
+}
+
+/// f16 analogue of [`as_i32_slice`]. AWQ/GPTQ scales ship as fp16 and
+/// share the same unaligned-mmap hazard (2-byte alignment for `f16`).
+fn as_f16_slice(bytes: &[u8]) -> Cow<'_, [f16]> {
+    match try_cast_slice::<u8, f16>(bytes) {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => {
+            let mut v = Vec::with_capacity(bytes.len() / 2);
+            for c in bytes.chunks_exact(2) {
+                v.push(f16::from_bits(u16::from_le_bytes([c[0], c[1]])));
+            }
+            Cow::Owned(v)
+        }
+    }
+}
+
 fn convert_quant_trio(
     gguf_name: &str,
     qweight: TensorView<'_>,
@@ -305,9 +341,13 @@ fn convert_quant_trio(
             dims: scales.shape().len(),
         });
     }
-    let qweight_i32: &[i32] = cast_slice(qweight.data());
-    let scales_f16: &[f16] = cast_slice(scales.data());
-    let qzeros_i32: &[i32] = cast_slice(qzeros.data());
+    // safetensors payloads are borrowed straight from the mmap; a
+    // tensor whose byte offset isn't 4-/2-aligned would make a direct
+    // `cast_slice` panic. `as_*_slice` borrows when aligned and copies
+    // into an aligned buffer otherwise.
+    let qweight_i32 = as_i32_slice(qweight.data());
+    let scales_f16 = as_f16_slice(scales.data());
+    let qzeros_i32 = as_i32_slice(qzeros.data());
 
     // Dispatch: AWQ if no g_idx; GPTQ if g_idx is present.
     let (in_features, out_features, dequant) = match g_idx {
@@ -329,9 +369,9 @@ fn convert_quant_trio(
             }
             let group_size = in_f / n_groups;
             let buf = dequant_awq_int4_to_f16(
-                qweight_i32,
-                scales_f16,
-                qzeros_i32,
+                &qweight_i32,
+                &scales_f16,
+                &qzeros_i32,
                 in_f,
                 out_f,
                 group_size,
@@ -349,12 +389,12 @@ fn convert_quant_trio(
             let in_packs = qweight.shape()[0];
             let in_f = in_packs * 8;
             let out_f = qweight.shape()[1];
-            let g_idx_i32: &[i32] = cast_slice(g_idx_view.data());
+            let g_idx_i32 = as_i32_slice(g_idx_view.data());
             let buf = dequant_gptq_int4_to_f16(
-                qweight_i32,
-                scales_f16,
-                qzeros_i32,
-                g_idx_i32,
+                &qweight_i32,
+                &scales_f16,
+                &qzeros_i32,
+                &g_idx_i32,
                 in_f,
                 out_f,
             )?;
@@ -385,6 +425,8 @@ fn convert_quant_trio(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dequant::AWQ_PACK_ORDER;
+    use bytemuck::cast_slice;
     use std::collections::BTreeMap;
 
     fn pack8(lanes: [u8; 8]) -> i32 {
@@ -487,13 +529,18 @@ mod tests {
         // one group covers the whole input dimension. Pinned via the
         // shape declaration of `scales` below ([n_groups=1, out_f]).
         let n_groups = 1;
-        // qweight: row i, col j has int4 = (i+j) mod 16. Pack 8 lanes per int32.
+        // qweight: output column j holds int4 = (i+j) mod 16. autoawq
+        // interleaves the 8 columns of a pack, so nibble position k
+        // stores the value destined for output column
+        // jp*8 + AWQ_PACK_ORDER[k]. Packing this way keeps the
+        // post-dequant assertion below in clean output-column order —
+        // and it fails loudly if the dequant ignores the interleave.
         let mut qw: Vec<i32> = Vec::with_capacity(in_f * out_packs);
         for i in 0..in_f {
             for jp in 0..out_packs {
                 let mut lanes = [0u8; 8];
                 for k in 0..8 {
-                    let j = jp * 8 + k;
+                    let j = jp * 8 + AWQ_PACK_ORDER[k];
                     lanes[k] = ((i + j) % 16) as u8;
                 }
                 qw.push(pack8(lanes));

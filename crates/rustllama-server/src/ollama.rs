@@ -868,6 +868,13 @@ pub struct OllamaChatRequest {
     /// `message.tool_calls`. See [`chat`].
     #[serde(default)]
     pub tools: Option<Value>,
+    /// Ollama's native structured-output field. `"json"` puts the model in
+    /// JSON mode (plain JSON-validity grammar); a JSON-schema object
+    /// constrains output to that schema. Maps onto the same grammar
+    /// machinery OpenAI's `response_format` uses. See
+    /// [`grammar_from_ollama_format`].
+    #[serde(default)]
+    pub format: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -885,6 +892,13 @@ pub struct OllamaMessage {
     pub tool_call_id: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    /// Ollama's `messages[].images` (vision attachments — base64 strings or
+    /// paths). We have no VLM, so a request carrying a non-empty `images`
+    /// array is rejected with 400 (see [`chat`]) instead of being silently
+    /// dropped by serde and answered text-only. Documented in the module
+    /// header as a deliberate difference from upstream Ollama.
+    #[serde(default)]
+    pub images: Option<Vec<Value>>,
 }
 
 /// Deserialize a string field leniently: absent OR `null` → empty.
@@ -921,6 +935,23 @@ fn default_true() -> bool {
 }
 
 pub async fn chat(State(state): State<AppState>, Json(req): Json<OllamaChatRequest>) -> Response {
+    // Vision (`messages[].images`) is not supported — we have no VLM. Reject
+    // with a 400 (matching the module header) rather than letting serde drop
+    // the field and silently answering text-only.
+    if req
+        .messages
+        .iter()
+        .any(|m| m.images.as_ref().map(|i| !i.is_empty()).unwrap_or(false))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "images (vision) are not supported by this server; \
+                          `messages[].images` cannot be served (no vision model)"
+            })),
+        )
+            .into_response();
+    }
     let Some(serving) = state.resolve(req.model.as_deref()).await else {
         return ollama_model_not_found(req.model.as_deref());
     };
@@ -930,9 +961,16 @@ pub async fn chat(State(state): State<AppState>, Json(req): Json<OllamaChatReque
     // tool_calls array in the message, so a single non-streamed response
     // is the right shape.
     if req.tools.as_ref().map(|t| !t.is_null()).unwrap_or(false) {
-        return ollama_chat_with_tools(serving, req).await;
+        return ollama_chat_with_tools(state, serving, req).await;
     }
-    let sampling = sampling_from_options(req.options.as_ref());
+    let mut sampling = sampling_from_options(req.options.as_ref());
+    // Native `format` structured output (JSON mode / schema). No tools on this
+    // path, so the format grammar always applies when present.
+    if sampling.grammar.is_none() {
+        if let Some(g) = grammar_from_ollama_format(req.format.as_ref()) {
+            sampling.grammar = Some(g);
+        }
+    }
     let model_id = req.model.clone().unwrap_or_else(|| serving.model_id.clone());
     let msgs: Vec<ChatMessage> = req
         .messages
@@ -983,18 +1021,23 @@ pub async fn chat(State(state): State<AppState>, Json(req): Json<OllamaChatReque
     }
 }
 
-/// `/api/chat` tools path (non-streaming). Renders the tools into the
-/// prompt via the tokenizer chat template, engages the tool-call
-/// grammar, then parses the output into Ollama's
-/// `message.tool_calls: [{ function: { name, arguments(object) } }]`
-/// shape (note: Ollama's `arguments` is a JSON OBJECT, not the OpenAI
-/// stringified form).
+/// `/api/chat` tools path. Renders the tools into the prompt via the
+/// tokenizer chat template, engages the tool-call grammar, then parses the
+/// output into Ollama's `message.tool_calls: [{ function: { name,
+/// arguments(object) } }]` shape (note: Ollama's `arguments` is a JSON
+/// OBJECT, not the OpenAI stringified form).
 ///
-// TODO(ollama stream tools): stream tool_call deltas as NDJSON when
-// `stream: true` + tools. Real Ollama streams partial tool calls; for
-// now the tools path always collects and returns a single response,
-// which the common tool-using clients accept.
-async fn ollama_chat_with_tools(serving: crate::ServingModel, req: OllamaChatRequest) -> Response {
+/// Honors `stream`: with `stream: false` a single JSON object is returned;
+/// with `stream: true` the token stream is driven through the incremental
+/// [`crate::chat::StreamingToolCallParser`] and emitted as line-delimited
+/// NDJSON — content deltas plus one `tool_calls` object per completed call —
+/// terminated by the final `done: true` object, mirroring the OpenAI
+/// streaming tool-call delta shape adapted to Ollama's message format.
+async fn ollama_chat_with_tools(
+    state: AppState,
+    serving: crate::ServingModel,
+    req: OllamaChatRequest,
+) -> Response {
     let tools_value = req.tools.clone().unwrap_or(Value::Null);
     let model_id = req.model.clone().unwrap_or_else(|| serving.model_id.clone());
 
@@ -1041,6 +1084,14 @@ async fn ollama_chat_with_tools(serving: crate::ServingModel, req: OllamaChatReq
             });
         }
     }
+    // Native `format` structured output takes effect only when the tool-call
+    // grammar wasn't engaged (no tool schemas), so a tools request that also
+    // pins `format` still gets well-formed tool calls first.
+    if sampling.grammar.is_none() {
+        if let Some(g) = grammar_from_ollama_format(req.format.as_ref()) {
+            sampling.grammar = Some(g);
+        }
+    }
 
     let prompt_eval_count = tokenizer
         .encode(&prompt, tokenizer.add_bos_token())
@@ -1062,6 +1113,26 @@ async fn ollama_chat_with_tools(serving: crate::ServingModel, req: OllamaChatReq
                 .into_response();
         }
     };
+
+    // Streaming tools path: drive the token stream through the incremental
+    // tool-call parser and emit NDJSON message chunks (content deltas plus one
+    // `tool_calls` object per completed call), terminated by the final
+    // `done: true` object — instead of a single bare JSON object.
+    if req.stream {
+        let id = format!("ollama-{:032x}", now_unix_secs() as u128);
+        let cancel_guard = state.register_cancel(&id);
+        return stream_ndjson_chat_tools(
+            model_id,
+            tok_stream,
+            handle,
+            prompt_eval_count,
+            started,
+            cancel_guard,
+            id,
+            sampling.max_tokens,
+        );
+    }
+
     let mut raw = String::new();
     let mut eval_count = 0u32;
     while let Some(tok) = tok_stream.next().await {
@@ -1118,6 +1189,151 @@ async fn ollama_chat_with_tools(serving: crate::ServingModel, req: OllamaChatReq
         "eval_duration": total_ns,
     }))
     .into_response()
+}
+
+/// NDJSON streaming for the `/api/chat` tools path. Drives the token stream
+/// through the shared incremental [`crate::chat::StreamingToolCallParser`],
+/// emitting one NDJSON line per content delta and one line per completed tool
+/// call (Ollama `tool_calls` shape: `arguments` is a JSON OBJECT), then a
+/// final `done: true` object with the timing/usage counters.
+#[allow(clippy::too_many_arguments)]
+fn stream_ndjson_chat_tools(
+    model_id: String,
+    mut tok_stream: rustllama_engine::TokenStream,
+    permit: crate::PermitGuard,
+    prompt_eval_count: u32,
+    started: Instant,
+    cancel_guard: crate::CancelGuard,
+    id: String,
+    max_tokens: u32,
+) -> Response {
+    let s = async_stream::stream! {
+        let cancel_flag = cancel_guard.flag.clone();
+        let mut parser = crate::chat::StreamingToolCallParser::new();
+        // A tool-call header (name) arrives just before its args; buffer the
+        // name so we can emit a single Ollama tool_calls object carrying both.
+        let mut pending_name: Option<String> = None;
+        let mut any_tool_call = false;
+        let mut eval_count = 0u32;
+        let mut done_reason = "stop";
+        while let Some(tok) = tok_stream.next().await {
+            if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
+                done_reason = "cancelled";
+                break;
+            }
+            match tok {
+                Ok(t) => {
+                    eval_count += 1;
+                    let events = parser.feed(&t.text);
+                    for line in ollama_tool_stream_chunks(
+                        events, &model_id, &mut pending_name, &mut any_tool_call,
+                    ) {
+                        yield Ok::<_, Infallible>(format!("{line}\n"));
+                    }
+                }
+                Err(e) => {
+                    let line = json!({
+                        "model": model_id,
+                        "error": e.to_string(),
+                        "done": true,
+                    });
+                    yield Ok(format!("{line}\n"));
+                    drop(permit);
+                    drop(cancel_guard);
+                    return;
+                }
+            }
+        }
+        // Flush any trailing parser state (unterminated tool_call falls back to
+        // content per StreamingToolCallParser::finish). Skip on cancel.
+        if done_reason != "cancelled" {
+            let events = parser.finish();
+            for line in ollama_tool_stream_chunks(
+                events, &model_id, &mut pending_name, &mut any_tool_call,
+            ) {
+                yield Ok(format!("{line}\n"));
+            }
+        }
+        // Termination reason precedence: cancelled (latched) > tool_calls >
+        // length (max_tokens hit) > stop.
+        if done_reason == "stop" {
+            if any_tool_call {
+                done_reason = "tool_calls";
+            } else if eval_count >= max_tokens {
+                done_reason = "length";
+            }
+        }
+        let total_ns = started.elapsed().as_nanos() as u64;
+        let line = json!({
+            "model": model_id,
+            "created_at": now_rfc3339(),
+            "message": {"role": "assistant", "content": ""},
+            "done": true,
+            "done_reason": done_reason,
+            "total_duration": total_ns,
+            "load_duration": 0u64,
+            "prompt_eval_count": prompt_eval_count,
+            "prompt_eval_duration": 0u64,
+            "eval_count": eval_count,
+            "eval_duration": total_ns,
+        });
+        yield Ok(format!("{line}\n"));
+        drop(permit);
+        drop(cancel_guard);
+    };
+    ndjson_response_with_id(s, &id)
+}
+
+/// Convert a batch of [`crate::chat::StreamEvent`]s into Ollama NDJSON chat
+/// chunks. Content events become `{message:{content}, done:false}`; a
+/// tool-call header+args pair becomes a single
+/// `{message:{content:"", tool_calls:[{function:{name, arguments(object)}}]}, done:false}`.
+/// `pending_name` carries the header across `feed()` calls; `any_tool_call`
+/// latches so the final `done_reason` can report `"tool_calls"`.
+fn ollama_tool_stream_chunks(
+    events: Vec<crate::chat::StreamEvent>,
+    model_id: &str,
+    pending_name: &mut Option<String>,
+    any_tool_call: &mut bool,
+) -> Vec<Value> {
+    use crate::chat::StreamEvent as SE;
+    let mut out = Vec::new();
+    for ev in events {
+        match ev {
+            SE::Content(s) if !s.is_empty() => {
+                out.push(json!({
+                    "model": model_id,
+                    "created_at": now_rfc3339(),
+                    "message": {"role": "assistant", "content": s},
+                    "done": false,
+                }));
+            }
+            SE::Content(_) => {}
+            SE::ToolCallHeader { name, .. } => {
+                *pending_name = Some(name);
+            }
+            SE::ToolCallArgs { args, .. } => {
+                let name = pending_name.take().unwrap_or_default();
+                // Ollama's `arguments` is a JSON object, not the OpenAI
+                // stringified form — parse it back (falling back to the raw
+                // string on non-JSON payloads).
+                let args_val: Value = serde_json::from_str(&args)
+                    .unwrap_or_else(|_| Value::String(args.clone()));
+                *any_tool_call = true;
+                out.push(json!({
+                    "model": model_id,
+                    "created_at": now_rfc3339(),
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"function": {"name": name, "arguments": args_val}}],
+                    },
+                    "done": false,
+                }));
+            }
+        }
+    }
+    out
 }
 
 /// One Ollama message → the raw-JSON object the chat template consumes,
@@ -1332,6 +1548,10 @@ pub struct OllamaGenerateRequest {
     pub keep_alive: Option<Value>,
     #[serde(default)]
     pub raw: bool,
+    /// Ollama's native structured-output field (`"json"` or a JSON schema).
+    /// Same mapping as [`OllamaChatRequest::format`].
+    #[serde(default)]
+    pub format: Option<Value>,
 }
 
 pub async fn generate(
@@ -1341,7 +1561,13 @@ pub async fn generate(
     let Some(serving) = state.resolve(req.model.as_deref()).await else {
         return ollama_model_not_found(req.model.as_deref());
     };
-    let sampling = sampling_from_options(req.options.as_ref());
+    let mut sampling = sampling_from_options(req.options.as_ref());
+    // Native `format` structured output (JSON mode / schema).
+    if sampling.grammar.is_none() {
+        if let Some(g) = grammar_from_ollama_format(req.format.as_ref()) {
+            sampling.grammar = Some(g);
+        }
+    }
     let model_id = req.model.clone().unwrap_or_else(|| serving.model_id.clone());
 
     // Two-phase admission: chat-template detection + msgs build +
@@ -1629,6 +1855,22 @@ fn sampling_from_options(opts: Option<&OllamaOptions>) -> SamplingParams {
         s.mirostat_eta = e;
     }
     s
+}
+
+/// Map Ollama's native `format` field to a sampling grammar, reusing the
+/// same `GrammarKind` machinery the OpenAI `response_format` path uses:
+///   - `"json"`             → plain JSON-validity grammar,
+///   - a JSON-schema object → schema-constrained JSON,
+///   - anything else        → `None` (no grammar engaged).
+fn grammar_from_ollama_format(format: Option<&Value>) -> Option<rustllama_engine::GrammarKind> {
+    match format? {
+        Value::String(s) if s.as_str() == "json" => Some(rustllama_engine::GrammarKind::Json),
+        v @ Value::Object(_) => {
+            let schema = rustllama_engine::grammar::Schema::from_json_value(v);
+            Some(rustllama_engine::GrammarKind::JsonSchema { schema })
+        }
+        _ => None,
+    }
 }
 
 fn now_rfc3339() -> String {

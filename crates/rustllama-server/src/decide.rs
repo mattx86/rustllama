@@ -796,6 +796,24 @@ pub async fn best_of(State(state): State<AppState>, Json(req): Json<DecideReques
 
 // ----- /v1/decide/tool -------------------------------------------------------
 
+/// Pick the tool-call opener to fold into the scoring context, matching the
+/// model's chat-template framing. Every supported format wraps the call in a
+/// JSON object that begins `{"name": "`, so the family marker (when the
+/// template reveals one) just puts that JSON on-distribution:
+///   - Qwen / DeepSeek → `<tool_call>\n{"name": "`
+///   - Llama-3.1       → `<|python_tag|>{"name": "`
+///   - Mistral         → `[TOOL_CALLS][{"name": "`
+///   - unknown / none  → bare `{"name": "` (format-agnostic; fits them all)
+fn tool_call_opener(template: Option<&str>) -> String {
+    const JSON: &str = "{\"name\": \"";
+    match template {
+        Some(t) if t.contains("<tool_call>") => format!("<tool_call>\n{JSON}"),
+        Some(t) if t.contains("python_tag") => format!("<|python_tag|>{JSON}"),
+        Some(t) if t.contains("[TOOL_CALLS]") => format!("[TOOL_CALLS][{JSON}"),
+        _ => JSON.to_string(),
+    }
+}
+
 pub async fn tool(State(state): State<AppState>, Json(req): Json<DecideRequest>) -> Response {
     let tools = match req.tools.as_ref() {
         Some(t) => t.clone(),
@@ -820,14 +838,31 @@ pub async fn tool(State(state): State<AppState>, Json(req): Json<DecideRequest>)
     if names.is_empty() {
         return (StatusCode::BAD_REQUEST, "no named functions in `tools`").into_response();
     }
-    // Render the prompt with the tools exposed, then fold the `<tool_call>`
-    // opener so each option scores just the tool NAME (the discriminating
-    // suffix), with the shared opener living in the context.
+    // Derive the tool-call opener from the model's chat template so scoring
+    // primes the model in its NATIVE framing (Qwen `<tool_call>`, Llama-3.1
+    // `<|python_tag|>`, Mistral `[TOOL_CALLS]`) instead of hardcoding the Qwen
+    // form — mirrors the multi-format handling the chat tool path does. Falls
+    // back to a neutral JSON opener that fits every format when the template
+    // is unrecognized / absent.
+    let template = state
+        .resolve(req.model.as_deref())
+        .await
+        .and_then(|s| {
+            s.cpu_engine
+                .as_ref()
+                .and_then(|c| c.tokenizer())
+                .and_then(|t| t.chat_template())
+                .map(|t| t.to_string())
+        });
+    let opener = tool_call_opener(template.as_deref());
+    // Render the prompt with the tools exposed, then fold the derived opener
+    // so each option scores just the tool NAME (the discriminating suffix),
+    // with the shared opener living in the context.
     let base = match resolve_context_text(&state, &req, Some(&tools)).await {
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let folded = format!("{base}<tool_call>\n{{\"name\": \"");
+    let folded = format!("{base}{opener}");
     let options: Vec<String> = names.iter().map(|n| format!("{n}\"")).collect();
 
     let mut sub = req.clone();
@@ -932,7 +967,11 @@ pub async fn sequence_score(
                 content: &m.content,
             })
             .collect();
-        match tokenizer.render_chat(&tok_msgs, true) {
+        // Score the conversation as written — NOT with `add_generation_prompt`.
+        // Appending the assistant generation prompt would fold the template's
+        // trailing role tokens into the sequence, inflating `sequence_logprob`
+        // with tokens the caller never supplied.
+        match tokenizer.render_chat(&tok_msgs, false) {
             Ok(s) => s,
             Err(e) => {
                 return (StatusCode::BAD_REQUEST, format!("chat render failed: {e}"))

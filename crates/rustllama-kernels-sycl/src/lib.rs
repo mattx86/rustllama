@@ -279,6 +279,121 @@ mod imp {
             n_new: c_int,
         );
 
+        // Quantized-KV flash attention (F32 Q/out, packed K/V + optional
+        // per-row f32 scales for TurboQuant). Packed K/V are `*const u8`
+        // (ABI-compatible with the C `const void*`).
+        pub(super) fn rsl_flash_attn_decode_q4_0_usm(
+            s: *mut rsl_stream,
+            q_usm: *const f32,
+            k_packed_usm: *const u8,
+            v_packed_usm: *const u8,
+            out_usm: *mut f32,
+            n_heads: c_int,
+            n_kv_heads: c_int,
+            head_dim: c_int,
+            max_ctx: c_int,
+            kv_len: c_int,
+        );
+        pub(super) fn rsl_flash_attn_prefill_q4_0_usm(
+            s: *mut rsl_stream,
+            q_usm: *const f32,
+            k_packed_usm: *const u8,
+            v_packed_usm: *const u8,
+            out_usm: *mut f32,
+            n_heads: c_int,
+            n_kv_heads: c_int,
+            head_dim: c_int,
+            max_ctx: c_int,
+            kv_len_base: c_int,
+            n_new: c_int,
+        );
+        pub(super) fn rsl_flash_attn_decode_nvfp4_usm(
+            s: *mut rsl_stream,
+            q_usm: *const f32,
+            k_packed_usm: *const u8,
+            v_packed_usm: *const u8,
+            out_usm: *mut f32,
+            n_heads: c_int,
+            n_kv_heads: c_int,
+            head_dim: c_int,
+            max_ctx: c_int,
+            kv_len: c_int,
+        );
+        pub(super) fn rsl_flash_attn_prefill_nvfp4_usm(
+            s: *mut rsl_stream,
+            q_usm: *const f32,
+            k_packed_usm: *const u8,
+            v_packed_usm: *const u8,
+            out_usm: *mut f32,
+            n_heads: c_int,
+            n_kv_heads: c_int,
+            head_dim: c_int,
+            max_ctx: c_int,
+            kv_len_base: c_int,
+            n_new: c_int,
+        );
+        pub(super) fn rsl_flash_attn_decode_tq_usm(
+            s: *mut rsl_stream,
+            q_usm: *const f32,
+            k_packed_usm: *const u8,
+            v_packed_usm: *const u8,
+            k_scales_usm: *const f32,
+            v_scales_usm: *const f32,
+            bits: c_int,
+            out_usm: *mut f32,
+            n_heads: c_int,
+            n_kv_heads: c_int,
+            head_dim: c_int,
+            max_ctx: c_int,
+            kv_len: c_int,
+        );
+        pub(super) fn rsl_flash_attn_prefill_tq_usm(
+            s: *mut rsl_stream,
+            q_usm: *const f32,
+            k_packed_usm: *const u8,
+            v_packed_usm: *const u8,
+            k_scales_usm: *const f32,
+            v_scales_usm: *const f32,
+            bits: c_int,
+            out_usm: *mut f32,
+            n_heads: c_int,
+            n_kv_heads: c_int,
+            head_dim: c_int,
+            max_ctx: c_int,
+            kv_len_base: c_int,
+            n_new: c_int,
+        );
+        // Q8_0-KV flash: i8 K/V slab + per-row f32 scale (like TQ, no bits).
+        pub(super) fn rsl_flash_attn_decode_q8_0_usm(
+            s: *mut rsl_stream,
+            q_usm: *const f32,
+            k_packed_usm: *const u8,
+            v_packed_usm: *const u8,
+            k_scales_usm: *const f32,
+            v_scales_usm: *const f32,
+            out_usm: *mut f32,
+            n_heads: c_int,
+            n_kv_heads: c_int,
+            head_dim: c_int,
+            max_ctx: c_int,
+            kv_len: c_int,
+        );
+        pub(super) fn rsl_flash_attn_prefill_q8_0_usm(
+            s: *mut rsl_stream,
+            q_usm: *const f32,
+            k_packed_usm: *const u8,
+            v_packed_usm: *const u8,
+            k_scales_usm: *const f32,
+            v_scales_usm: *const f32,
+            out_usm: *mut f32,
+            n_heads: c_int,
+            n_kv_heads: c_int,
+            head_dim: c_int,
+            max_ctx: c_int,
+            kv_len_base: c_int,
+            n_new: c_int,
+        );
+
         pub(super) fn rsl_gemm_f16_usm(
             s: *mut rsl_stream,
             a_usm: *const u16,
@@ -371,6 +486,34 @@ mod imp {
             k: c_int,
             lws: c_int,
         );
+
+        // CPU-parity packed matvecs (legacy Q4_0/Q5_0/Q4_1/Q5_1 block 32,
+        // K-quant Q2_K/Q3_K/Q8_K block 256, PrismML PQ2_0 block 128). Same
+        // signature shape as the other packed matvecs.
+        pub(super) fn rsl_matvec_q4_0_packed_f32_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+        pub(super) fn rsl_matvec_q5_0_packed_f32_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+        pub(super) fn rsl_matvec_q4_1_packed_f32_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+        pub(super) fn rsl_matvec_q5_1_packed_f32_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+        pub(super) fn rsl_matvec_q2_k_packed_f32_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+        pub(super) fn rsl_matvec_q3_k_packed_f32_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+        pub(super) fn rsl_matvec_q8_k_packed_f32_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+        pub(super) fn rsl_matvec_pq2_0_packed_f32_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
 
         pub(super) fn rsl_matvec_iq1_s_packed_f32_usm(
             s: *mut rsl_stream,
@@ -945,6 +1088,18 @@ mod imp {
             lws: c_int,
         );
 
+        pub(super) fn rsl_matvec_ptq1_0_gate_up_fused_usm(
+            s: *mut rsl_stream,
+            gate_w_bytes_usm: *const std::ffi::c_void,
+            up_w_bytes_usm: *const std::ffi::c_void,
+            x_usm: *const f32,
+            gate_out_usm: *mut f32,
+            up_out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
+
         // H6: fused matvec + residual-add + rmsnorm. One kernel
         // replaces the (matvec → add_rmsnorm) sequence at the post-
         // attn site. Per packed-quant dtype.
@@ -1008,6 +1163,10 @@ mod imp {
             s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
             attn_usm: *const f32, hidden_usm: *mut f32, w_norm_usm: *const f32,
             y_norm_usm: *mut f32, m: c_int, k: c_int, eps: f32, lws: c_int);
+        pub(super) fn rsl_matvec_ptq1_0_add_rmsnorm_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
+            attn_usm: *const f32, hidden_usm: *mut f32, w_norm_usm: *const f32,
+            y_norm_usm: *mut f32, m: c_int, k: c_int, eps: f32, lws: c_int);
 
         // H8: F16-input mixed-precision matvec. `x_f16` is the
         // activation vector as F16 bits; weights + output stay packed
@@ -1049,6 +1208,9 @@ mod imp {
             s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
             x_f16: *const u16, out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
         pub(super) fn rsl_matvec_iq3_s_f16in_packed_f32_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
+            x_f16: *const u16, out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+        pub(super) fn rsl_matvec_ptq1_0_f16in_packed_f32_usm(
             s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
             x_f16: *const u16, out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
 
@@ -1838,6 +2000,277 @@ mod imp {
         consume_error()
     }
 
+    // ---- Quantized-KV flash attention (F32 Q/out, packed K/V) ----
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_decode_q4_0_usm(
+        stream: &SyclStream,
+        q_usm: *const f32,
+        k_packed_usm: *const u8,
+        v_packed_usm: *const u8,
+        out_usm: *mut f32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_ctx: u32,
+        kv_len: u32,
+    ) -> Result<()> {
+        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_decode_q4_0_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
+            )));
+        }
+        // SAFETY: USM pointer ownership / sizing is the caller's
+        // responsibility. We just forward to the C ABI.
+        unsafe {
+            rsl_flash_attn_decode_q4_0_usm(
+                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
+                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
+                max_ctx as c_int, kv_len as c_int,
+            );
+        }
+        consume_error()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_prefill_q4_0_usm(
+        stream: &SyclStream,
+        q_usm: *const f32,
+        k_packed_usm: *const u8,
+        v_packed_usm: *const u8,
+        out_usm: *mut f32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_ctx: u32,
+        kv_len_base: u32,
+        n_new: u32,
+    ) -> Result<()> {
+        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_q4_0_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
+            )));
+        }
+        if kv_len_base.saturating_add(n_new) > max_ctx {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_q4_0_usm: kv_len_base={kv_len_base} + n_new={n_new} > max_ctx={max_ctx}"
+            )));
+        }
+        // SAFETY: as above.
+        unsafe {
+            rsl_flash_attn_prefill_q4_0_usm(
+                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
+                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
+                max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
+            );
+        }
+        consume_error()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_decode_nvfp4_usm(
+        stream: &SyclStream,
+        q_usm: *const f32,
+        k_packed_usm: *const u8,
+        v_packed_usm: *const u8,
+        out_usm: *mut f32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_ctx: u32,
+        kv_len: u32,
+    ) -> Result<()> {
+        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_decode_nvfp4_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
+            )));
+        }
+        // SAFETY: as above.
+        unsafe {
+            rsl_flash_attn_decode_nvfp4_usm(
+                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
+                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
+                max_ctx as c_int, kv_len as c_int,
+            );
+        }
+        consume_error()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_prefill_nvfp4_usm(
+        stream: &SyclStream,
+        q_usm: *const f32,
+        k_packed_usm: *const u8,
+        v_packed_usm: *const u8,
+        out_usm: *mut f32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_ctx: u32,
+        kv_len_base: u32,
+        n_new: u32,
+    ) -> Result<()> {
+        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_nvfp4_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
+            )));
+        }
+        if kv_len_base.saturating_add(n_new) > max_ctx {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_nvfp4_usm: kv_len_base={kv_len_base} + n_new={n_new} > max_ctx={max_ctx}"
+            )));
+        }
+        // SAFETY: as above.
+        unsafe {
+            rsl_flash_attn_prefill_nvfp4_usm(
+                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
+                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
+                max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
+            );
+        }
+        consume_error()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_decode_tq_usm(
+        stream: &SyclStream,
+        q_usm: *const f32,
+        k_packed_usm: *const u8,
+        v_packed_usm: *const u8,
+        k_scales_usm: *const f32,
+        v_scales_usm: *const f32,
+        bits: u32,
+        out_usm: *mut f32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_ctx: u32,
+        kv_len: u32,
+    ) -> Result<()> {
+        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_decode_tq_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
+            )));
+        }
+        // SAFETY: as above.
+        unsafe {
+            rsl_flash_attn_decode_tq_usm(
+                stream.raw, q_usm, k_packed_usm, v_packed_usm, k_scales_usm,
+                v_scales_usm, bits as c_int, out_usm, n_heads as c_int,
+                n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
+                kv_len as c_int,
+            );
+        }
+        consume_error()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_prefill_tq_usm(
+        stream: &SyclStream,
+        q_usm: *const f32,
+        k_packed_usm: *const u8,
+        v_packed_usm: *const u8,
+        k_scales_usm: *const f32,
+        v_scales_usm: *const f32,
+        bits: u32,
+        out_usm: *mut f32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_ctx: u32,
+        kv_len_base: u32,
+        n_new: u32,
+    ) -> Result<()> {
+        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_tq_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
+            )));
+        }
+        if kv_len_base.saturating_add(n_new) > max_ctx {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_tq_usm: kv_len_base={kv_len_base} + n_new={n_new} > max_ctx={max_ctx}"
+            )));
+        }
+        // SAFETY: as above.
+        unsafe {
+            rsl_flash_attn_prefill_tq_usm(
+                stream.raw, q_usm, k_packed_usm, v_packed_usm, k_scales_usm,
+                v_scales_usm, bits as c_int, out_usm, n_heads as c_int,
+                n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
+                kv_len_base as c_int, n_new as c_int,
+            );
+        }
+        consume_error()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_decode_q8_0_usm(
+        stream: &SyclStream,
+        q_usm: *const f32,
+        k_packed_usm: *const u8,
+        v_packed_usm: *const u8,
+        k_scales_usm: *const f32,
+        v_scales_usm: *const f32,
+        out_usm: *mut f32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_ctx: u32,
+        kv_len: u32,
+    ) -> Result<()> {
+        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_decode_q8_0_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
+            )));
+        }
+        // SAFETY: as above.
+        unsafe {
+            rsl_flash_attn_decode_q8_0_usm(
+                stream.raw, q_usm, k_packed_usm, v_packed_usm, k_scales_usm,
+                v_scales_usm, out_usm, n_heads as c_int, n_kv_heads as c_int,
+                head_dim as c_int, max_ctx as c_int, kv_len as c_int,
+            );
+        }
+        consume_error()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_prefill_q8_0_usm(
+        stream: &SyclStream,
+        q_usm: *const f32,
+        k_packed_usm: *const u8,
+        v_packed_usm: *const u8,
+        k_scales_usm: *const f32,
+        v_scales_usm: *const f32,
+        out_usm: *mut f32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_ctx: u32,
+        kv_len_base: u32,
+        n_new: u32,
+    ) -> Result<()> {
+        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_q8_0_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
+            )));
+        }
+        if kv_len_base.saturating_add(n_new) > max_ctx {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_q8_0_usm: kv_len_base={kv_len_base} + n_new={n_new} > max_ctx={max_ctx}"
+            )));
+        }
+        // SAFETY: as above.
+        unsafe {
+            rsl_flash_attn_prefill_q8_0_usm(
+                stream.raw, q_usm, k_packed_usm, v_packed_usm, k_scales_usm,
+                v_scales_usm, out_usm, n_heads as c_int, n_kv_heads as c_int,
+                head_dim as c_int, max_ctx as c_int, kv_len_base as c_int,
+                n_new as c_int,
+            );
+        }
+        consume_error()
+    }
+
     /// FA-v2 prefill entry point (sub-group cooperation). Same
     /// shape constraints as [`flash_attn_decode_v2_usm`]: head_dim
     /// must be a multiple of 16 and ≤ 256.
@@ -2208,6 +2641,41 @@ mod imp {
         }
         consume_error()
     }
+
+    // CPU-parity packed matvec safe wrappers — identical shape to the
+    // Q4_K/Q6_K wrappers above; only the FFI symbol + K-alignment differ.
+    macro_rules! packed_matvec_real_wrapper {
+        ($name:ident, $ffi:ident, $align:expr) => {
+            pub fn $name(
+                stream: &SyclStream, w_bytes_usm: *const u8, x_usm: *const f32,
+                out_usm: *mut f32, m: u32, k: u32, lws: u32,
+            ) -> Result<()> {
+                if m == 0 || k == 0 {
+                    return Err(SyclError::InvalidShape(format!(
+                        concat!(stringify!($name), ": zero dim (M={}, K={})"), m, k)));
+                }
+                if k % $align != 0 {
+                    return Err(SyclError::InvalidShape(format!(
+                        concat!(stringify!($name), ": K must be a multiple of ", stringify!($align), ", got {}"), k)));
+                }
+                // SAFETY: caller owns the USM pointers + ensures they
+                // outlive the call. The kernel `.wait()`s before returning.
+                unsafe {
+                    $ffi(stream.raw, w_bytes_usm, x_usm, out_usm,
+                         m as c_int, k as c_int, lws as c_int);
+                }
+                consume_error()
+            }
+        };
+    }
+    packed_matvec_real_wrapper!(matvec_q4_0_packed_f32_usm, rsl_matvec_q4_0_packed_f32_usm, 32);
+    packed_matvec_real_wrapper!(matvec_q5_0_packed_f32_usm, rsl_matvec_q5_0_packed_f32_usm, 32);
+    packed_matvec_real_wrapper!(matvec_q4_1_packed_f32_usm, rsl_matvec_q4_1_packed_f32_usm, 32);
+    packed_matvec_real_wrapper!(matvec_q5_1_packed_f32_usm, rsl_matvec_q5_1_packed_f32_usm, 32);
+    packed_matvec_real_wrapper!(matvec_q2_k_packed_f32_usm, rsl_matvec_q2_k_packed_f32_usm, 256);
+    packed_matvec_real_wrapper!(matvec_q3_k_packed_f32_usm, rsl_matvec_q3_k_packed_f32_usm, 256);
+    packed_matvec_real_wrapper!(matvec_q8_k_packed_f32_usm, rsl_matvec_q8_k_packed_f32_usm, 256);
+    packed_matvec_real_wrapper!(matvec_pq2_0_packed_f32_usm, rsl_matvec_pq2_0_packed_f32_usm, 128);
 
     pub fn matvec_iq1_s_packed_f32_usm(
         stream: &SyclStream,
@@ -3958,6 +4426,40 @@ mod imp {
         consume_error()
     }
 
+    /// H4: PTQ1_0 (Bonsai ternary) gate+up FUSED matvec.
+    pub fn matvec_ptq1_0_gate_up_fused_usm(
+        stream: &SyclStream,
+        gate_w_bytes_usm: *const u8,
+        up_w_bytes_usm: *const u8,
+        x_usm: *const f32,
+        gate_out_usm: *mut f32,
+        up_out_usm: *mut f32,
+        m: u32,
+        k: u32,
+        lws: u32,
+    ) -> Result<()> {
+        if m == 0 || k == 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "matvec_ptq1_0_gate_up_fused_usm: zero dim (M={m}, K={k})"
+            )));
+        }
+        if k % 128 != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "matvec_ptq1_0_gate_up_fused_usm: K must be a multiple of 128, got {k}"
+            )));
+        }
+        unsafe {
+            rsl_matvec_ptq1_0_gate_up_fused_usm(
+                stream.raw,
+                gate_w_bytes_usm as *const std::ffi::c_void,
+                up_w_bytes_usm as *const std::ffi::c_void,
+                x_usm, gate_out_usm, up_out_usm,
+                m as c_int, k as c_int, lws as c_int,
+            );
+        }
+        consume_error()
+    }
+
     /// H6: Q4_K fused matvec + residual-add + rmsnorm. One workgroup
     /// per token, LWS work-items collaborating on M outputs with SLM
     /// staging + workgroup sum_sq reduce. Replaces the (matvec_q4_k
@@ -4038,6 +4540,7 @@ mod imp {
     h6_real_wrapper!(matvec_iq2_s_add_rmsnorm_usm, rsl_matvec_iq2_s_add_rmsnorm_usm, 256);
     h6_real_wrapper!(matvec_iq3_xxs_add_rmsnorm_usm, rsl_matvec_iq3_xxs_add_rmsnorm_usm, 256);
     h6_real_wrapper!(matvec_iq3_s_add_rmsnorm_usm, rsl_matvec_iq3_s_add_rmsnorm_usm, 256);
+    h6_real_wrapper!(matvec_ptq1_0_add_rmsnorm_usm, rsl_matvec_ptq1_0_add_rmsnorm_usm, 128);
 
     // H8: F16-input matvec safe wrappers — identical shape, only the
     // FFI symbol + K-alignment differ.
@@ -4076,6 +4579,7 @@ mod imp {
     h8_real_wrapper!(matvec_iq2_s_f16in_packed_f32_usm, rsl_matvec_iq2_s_f16in_packed_f32_usm, 256);
     h8_real_wrapper!(matvec_iq3_xxs_f16in_packed_f32_usm, rsl_matvec_iq3_xxs_f16in_packed_f32_usm, 256);
     h8_real_wrapper!(matvec_iq3_s_f16in_packed_f32_usm, rsl_matvec_iq3_s_f16in_packed_f32_usm, 256);
+    h8_real_wrapper!(matvec_ptq1_0_f16in_packed_f32_usm, rsl_matvec_ptq1_0_f16in_packed_f32_usm, 128);
 
     /// G5: K-quant → F32 dequant (USM-in / USM-out). `format` selects
     /// the kernel; `bytes_usm` must point to `n_blocks * block_size`
@@ -4843,6 +5347,35 @@ pub unsafe fn matvec_q6_k_packed_f32_usm_raw(
 ) -> Result<()> {
     imp::matvec_q6_k_packed_f32_usm(stream, w_bytes_usm, x_usm, out_usm, m, k, lws)
 }
+
+/// CPU-parity packed matvec raw-pointer entries — legacy Q4_0/Q5_0/Q4_1/
+/// Q5_1 (block 32, `M*(K/32)*{18,22,20,24}` bytes), K-quant Q2_K/Q3_K/Q8_K
+/// (block 256, `M*(K/256)*{84,110,292}` bytes), PrismML PQ2_0 (block 128,
+/// `M*(K/128)*34` bytes). Each forwards to its `imp` pointer wrapper.
+macro_rules! packed_matvec_raw_wrapper {
+    ($raw:ident, $imp:ident) => {
+        /// Raw-pointer packed matvec. `out[m] = W[m, :] · x[:]`.
+        ///
+        /// # Safety
+        /// See [`matvec_q4_k_packed_f32_usm_raw`]: `w_bytes_usm` sized per
+        /// the dtype's packed layout, `x_usm` ≥ K f32, `out_usm` ≥ M f32,
+        /// all on the same `stream`; the kernel `.wait()`s before return.
+        pub unsafe fn $raw(
+            stream: &SyclStream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: u32, k: u32, lws: u32,
+        ) -> Result<()> {
+            imp::$imp(stream, w_bytes_usm, x_usm, out_usm, m, k, lws)
+        }
+    };
+}
+packed_matvec_raw_wrapper!(matvec_q4_0_packed_f32_usm_raw, matvec_q4_0_packed_f32_usm);
+packed_matvec_raw_wrapper!(matvec_q5_0_packed_f32_usm_raw, matvec_q5_0_packed_f32_usm);
+packed_matvec_raw_wrapper!(matvec_q4_1_packed_f32_usm_raw, matvec_q4_1_packed_f32_usm);
+packed_matvec_raw_wrapper!(matvec_q5_1_packed_f32_usm_raw, matvec_q5_1_packed_f32_usm);
+packed_matvec_raw_wrapper!(matvec_q2_k_packed_f32_usm_raw, matvec_q2_k_packed_f32_usm);
+packed_matvec_raw_wrapper!(matvec_q3_k_packed_f32_usm_raw, matvec_q3_k_packed_f32_usm);
+packed_matvec_raw_wrapper!(matvec_q8_k_packed_f32_usm_raw, matvec_q8_k_packed_f32_usm);
+packed_matvec_raw_wrapper!(matvec_pq2_0_packed_f32_usm_raw, matvec_pq2_0_packed_f32_usm);
 
 /// F4: Raw-pointer USM IQ4_NL packed matvec. Consumes the GGUF
 /// IQ4_NL byte layout (18 bytes per 32-weight block: f16 d + 16
@@ -6856,6 +7389,229 @@ pub unsafe fn flash_attn_prefill_usm_raw(
     )
 }
 
+// ============================================================
+// Quantized-KV FlashAttention (raw-pointer entry points). F32 Q/out,
+// packed K/V dequantized on the fly — byte-exact ports of the CPU
+// reference kernels (q4_0_kv.rs / nvfp4.rs / turboquant.rs), matched
+// by `doctor --sycl-parity`. These are the accel-layer entries (the
+// packed KV cache is naturally held as raw USM byte pointers).
+// ============================================================
+
+/// Raw-pointer quantized-KV FlashAttention decode (Q4_0 KV cache).
+/// `q`/`out` are F32 `[n_heads, head_dim]`; `k_packed`/`v_packed` are
+/// the packed Q4_0 cache `[n_kv_heads, max_ctx, (head_dim/32)*18]`.
+///
+/// # Safety
+/// All pointers must reference live USM allocations on `stream`'s
+/// context with the sizing above. `n_heads % n_kv_heads == 0`,
+/// `head_dim % 32 == 0`, `head_dim <= 256`. Kernel `.wait()`s.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_decode_q4_0_usm_raw(
+    stream: &SyclStream,
+    q_usm: *const f32,
+    k_packed_usm: *const u8,
+    v_packed_usm: *const u8,
+    out_usm: *mut f32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    kv_len: u32,
+) -> Result<()> {
+    imp::flash_attn_decode_q4_0_usm(
+        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+    )
+}
+
+/// Raw-pointer quantized-KV FlashAttention prefill (Q4_0 KV cache).
+/// `q`/`out` are F32 `[n_new, n_heads, head_dim]`.
+///
+/// # Safety
+/// USM pointers as [`flash_attn_decode_q4_0_usm_raw`];
+/// `kv_len_base + n_new <= max_ctx`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_prefill_q4_0_usm_raw(
+    stream: &SyclStream,
+    q_usm: *const f32,
+    k_packed_usm: *const u8,
+    v_packed_usm: *const u8,
+    out_usm: *mut f32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    kv_len_base: u32,
+    n_new: u32,
+) -> Result<()> {
+    imp::flash_attn_prefill_q4_0_usm(
+        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+    )
+}
+
+/// Raw-pointer quantized-KV FlashAttention decode (NVFP4 KV cache).
+/// `bytes_per_row = (head_dim/16)*9`.
+///
+/// # Safety
+/// USM pointers as above; `head_dim % 16 == 0`, `head_dim <= 256`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_decode_nvfp4_usm_raw(
+    stream: &SyclStream,
+    q_usm: *const f32,
+    k_packed_usm: *const u8,
+    v_packed_usm: *const u8,
+    out_usm: *mut f32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    kv_len: u32,
+) -> Result<()> {
+    imp::flash_attn_decode_nvfp4_usm(
+        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+    )
+}
+
+/// Raw-pointer quantized-KV FlashAttention prefill (NVFP4 KV cache).
+///
+/// # Safety
+/// USM pointers as above; `head_dim % 16 == 0`, `head_dim <= 256`,
+/// `kv_len_base + n_new <= max_ctx`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_prefill_nvfp4_usm_raw(
+    stream: &SyclStream,
+    q_usm: *const f32,
+    k_packed_usm: *const u8,
+    v_packed_usm: *const u8,
+    out_usm: *mut f32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    kv_len_base: u32,
+    n_new: u32,
+) -> Result<()> {
+    imp::flash_attn_prefill_nvfp4_usm(
+        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+    )
+}
+
+/// Raw-pointer quantized-KV FlashAttention decode (TurboQuant KV cache).
+/// `k_scales`/`v_scales` are `[n_kv_heads*max_ctx]` F32 per-row scales
+/// (indexed `kv_h*max_ctx + t`); `bits` in {1,2,4,8};
+/// `bytes_per_row = ceil(head_dim*bits/8)`.
+///
+/// # Safety
+/// USM pointers as above; `head_dim` a power of two `<= 256`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_decode_tq_usm_raw(
+    stream: &SyclStream,
+    q_usm: *const f32,
+    k_packed_usm: *const u8,
+    v_packed_usm: *const u8,
+    k_scales_usm: *const f32,
+    v_scales_usm: *const f32,
+    bits: u32,
+    out_usm: *mut f32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    kv_len: u32,
+) -> Result<()> {
+    imp::flash_attn_decode_tq_usm(
+        stream, q_usm, k_packed_usm, v_packed_usm, k_scales_usm, v_scales_usm,
+        bits, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+    )
+}
+
+/// Raw-pointer quantized-KV FlashAttention prefill (TurboQuant KV cache).
+///
+/// # Safety
+/// USM pointers as above; `head_dim` a power of two `<= 256`, `bits` in
+/// {1,2,4,8}, `kv_len_base + n_new <= max_ctx`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_prefill_tq_usm_raw(
+    stream: &SyclStream,
+    q_usm: *const f32,
+    k_packed_usm: *const u8,
+    v_packed_usm: *const u8,
+    k_scales_usm: *const f32,
+    v_scales_usm: *const f32,
+    bits: u32,
+    out_usm: *mut f32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    kv_len_base: u32,
+    n_new: u32,
+) -> Result<()> {
+    imp::flash_attn_prefill_tq_usm(
+        stream, q_usm, k_packed_usm, v_packed_usm, k_scales_usm, v_scales_usm,
+        bits, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+    )
+}
+
+/// Raw-pointer quantized-KV FlashAttention decode (Q8_0 KV cache). K/V are
+/// i8 slabs `[n_kv_heads, max_ctx, head_dim]`; `k_scales`/`v_scales` are
+/// per-row absmax f32 `[n_kv_heads*max_ctx]` (indexed `kv_h*max_ctx + t`).
+/// Byte-exact port of the CPU `gqa_attention_flash_decode_q8_0`.
+///
+/// # Safety
+/// All pointers must reference live USM allocations on `stream`'s context
+/// sized as above.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_decode_q8_0_usm_raw(
+    stream: &SyclStream,
+    q_usm: *const f32,
+    k_packed_usm: *const u8,
+    v_packed_usm: *const u8,
+    k_scales_usm: *const f32,
+    v_scales_usm: *const f32,
+    out_usm: *mut f32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    kv_len: u32,
+) -> Result<()> {
+    imp::flash_attn_decode_q8_0_usm(
+        stream, q_usm, k_packed_usm, v_packed_usm, k_scales_usm, v_scales_usm,
+        out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+    )
+}
+
+/// Raw-pointer quantized-KV FlashAttention prefill (Q8_0 KV cache).
+///
+/// # Safety
+/// USM pointers as [`flash_attn_decode_q8_0_usm_raw`];
+/// `kv_len_base + n_new <= max_ctx`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_prefill_q8_0_usm_raw(
+    stream: &SyclStream,
+    q_usm: *const f32,
+    k_packed_usm: *const u8,
+    v_packed_usm: *const u8,
+    k_scales_usm: *const f32,
+    v_scales_usm: *const f32,
+    out_usm: *mut f32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    kv_len_base: u32,
+    n_new: u32,
+) -> Result<()> {
+    imp::flash_attn_prefill_q8_0_usm(
+        stream, q_usm, k_packed_usm, v_packed_usm, k_scales_usm, v_scales_usm,
+        out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+    )
+}
+
 /// Raw-pointer FA-v2 decode (sub-group cooperation). Same calling
 /// contract as [`flash_attn_decode_usm_raw`] plus the v2 shape
 /// constraint: `head_dim` must be a multiple of 16 and ≤ 256.
@@ -8090,6 +8846,31 @@ pub unsafe fn matvec_iq3_s_gate_up_fused_usm_raw(
     )
 }
 
+/// H4: PTQ1_0 (Bonsai ternary) gate+up fused matvec, raw-pointer entry.
+///
+/// # Safety
+///
+/// All five USM pointers must be allocations on the same `stream`.
+/// Gate + up weight buffers must each be sized `M × (K/128) × 28`
+/// bytes (PTQ1_0 layout). `x_usm` ≥ `K` f32; `gate_out_usm` and
+/// `up_out_usm` each ≥ `M` f32. `K` must be a multiple of 128.
+pub unsafe fn matvec_ptq1_0_gate_up_fused_usm_raw(
+    stream: &SyclStream,
+    gate_w_bytes_usm: *const u8,
+    up_w_bytes_usm: *const u8,
+    x_usm: *const f32,
+    gate_out_usm: *mut f32,
+    up_out_usm: *mut f32,
+    m: u32,
+    k: u32,
+    lws: u32,
+) -> Result<()> {
+    imp::matvec_ptq1_0_gate_up_fused_usm(
+        stream, gate_w_bytes_usm, up_w_bytes_usm,
+        x_usm, gate_out_usm, up_out_usm, m, k, lws,
+    )
+}
+
 /// H6: Q4_K matvec + residual-add + rmsnorm, raw-pointer entry.
 ///
 /// # Safety
@@ -8146,6 +8927,7 @@ h6_raw_wrapper!(matvec_iq2_xs_add_rmsnorm_usm_raw, matvec_iq2_xs_add_rmsnorm_usm
 h6_raw_wrapper!(matvec_iq2_s_add_rmsnorm_usm_raw, matvec_iq2_s_add_rmsnorm_usm);
 h6_raw_wrapper!(matvec_iq3_xxs_add_rmsnorm_usm_raw, matvec_iq3_xxs_add_rmsnorm_usm);
 h6_raw_wrapper!(matvec_iq3_s_add_rmsnorm_usm_raw, matvec_iq3_s_add_rmsnorm_usm);
+h6_raw_wrapper!(matvec_ptq1_0_add_rmsnorm_usm_raw, matvec_ptq1_0_add_rmsnorm_usm);
 
 /// H8: F16-input matvec raw-pointer entries. `x_f16` is the F16-bit
 /// activation vector (≥ K u16); `w_bytes_usm` packed weights; output
@@ -8175,6 +8957,7 @@ h8_raw_wrapper!(matvec_iq2_xs_f16in_packed_f32_usm_raw, matvec_iq2_xs_f16in_pack
 h8_raw_wrapper!(matvec_iq2_s_f16in_packed_f32_usm_raw, matvec_iq2_s_f16in_packed_f32_usm);
 h8_raw_wrapper!(matvec_iq3_xxs_f16in_packed_f32_usm_raw, matvec_iq3_xxs_f16in_packed_f32_usm);
 h8_raw_wrapper!(matvec_iq3_s_f16in_packed_f32_usm_raw, matvec_iq3_s_f16in_packed_f32_usm);
+h8_raw_wrapper!(matvec_ptq1_0_f16in_packed_f32_usm_raw, matvec_ptq1_0_f16in_packed_f32_usm);
 
 /// USM-resident embedding gather. `table` is the embedding matrix
 /// `[V, d]` in USM; `ids` is a host-side slice (typically very

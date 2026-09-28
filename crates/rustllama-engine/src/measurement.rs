@@ -2063,8 +2063,23 @@ pub struct SsmPrefillChunkedReport {
 ///
 /// Deterministic (temp=0) synthetic decode, mirroring the decode
 /// sweeps' prompt/token sizing (`tune`'s `--prompt-tokens=64` /
-/// `--decode-tokens=32` defaults), so the off/on medians are directly
-/// comparable.
+/// `--decode-tokens=32` defaults).
+///
+/// The two arms exercise the paths they name so the tok/s delta is real:
+/// the OFF arm drives `generate_token_ids` (the classic single-token
+/// decode loop, which never routes through MTP), while the ON arm drives
+/// the actual MTP self-speculation stream
+/// (`speculate_mtp_stream_from_ids`). The MTP flag does NOT gate either
+/// call — `generate_token_ids` is always classic and the stream is the
+/// explicit MTP entry — so `set_mtp_speculative` toggling is irrelevant
+/// to what's measured; only the capability probe below needs it.
+///
+/// Comparability: both arms report a DECODE-only tok/s that excludes
+/// prefill. OFF uses the engine's forward-only `decode_ms`; ON times
+/// wall-clock from the first yielded token to the last
+/// (`(generated - 1) / (t_last - t_first)`), which excludes prefill but
+/// includes MTP's verify + sampling overhead — a conservative (against
+/// ON) estimate, so a declared MTP win is a genuine one.
 pub fn measure_speculative_mtp(
     model_path: &std::path::Path,
     cfg: &MeasurementConfig,
@@ -2120,10 +2135,12 @@ pub fn measure_speculative_mtp(
         ..SamplingParams::default()
     };
 
-    // Median decode tok/s for the engine's current toggle state: one
-    // untimed warmup + `repeats` timed runs. Returns `(None, Some(err))`
-    // when every run failed. Mirrors the decode-metric pattern used by
-    // `measure_placement_candidates` / `measure_per_device_perf`.
+    // Median CLASSIC decode tok/s (the OFF arm): `generate_token_ids` is
+    // the single-token decode loop and never routes through MTP, so this
+    // measures the classic path regardless of the `mtp_speculative` flag.
+    // One untimed warmup + `repeats` timed runs; returns `(None,
+    // Some(err))` when every run failed. Mirrors the decode-metric pattern
+    // used by `measure_placement_candidates` / `measure_per_device_perf`.
     let bench = |cpu: &mut CpuEngine| -> (Option<f64>, Option<String>) {
         cpu.clear_prefix_cache();
         if let Err(e) = cpu.generate_token_ids(&prompt_ids, DECODE_TOKENS, &sampling) {
@@ -2158,13 +2175,104 @@ pub fn measure_speculative_mtp(
         (Some(median), None)
     };
 
-    // OFF arm (classic single-token decode).
+    // Decode wall-clock throughput for the REAL MTP stream: one untimed
+    // warmup drain + `repeats` timed drains of
+    // `speculate_mtp_stream_from_ids`. The stream is async, so we drive it
+    // with `futures::executor::block_on` (runtime-agnostic — the SYCL
+    // worker's `run_blocking` returns a plain `tokio::sync::oneshot`
+    // receiver that resolves without a tokio runtime context; the same
+    // `futures::StreamExt` drain the engine's own streaming callers use).
+    // Timing runs from the first yielded token to the last so prefill is
+    // excluded — comparable to the OFF arm's decode-only tok/s.
+    let bench_mtp = |cpu: &mut CpuEngine| -> (Option<f64>, Option<String>) {
+        use futures::StreamExt;
+        // Untimed warmup: drain one full stream.
+        cpu.clear_prefix_cache();
+        match cpu.speculate_mtp_stream_from_ids(prompt_ids.clone(), sampling.clone()) {
+            Ok(mut stream) => {
+                let warm = futures::executor::block_on(async {
+                    while let Some(item) = stream.next().await {
+                        if let Err(e) = item {
+                            return Err(e.to_string());
+                        }
+                    }
+                    Ok(())
+                });
+                if let Err(e) = warm {
+                    return (None, Some(format!("warmup failed: {e}")));
+                }
+            }
+            Err(e) => return (None, Some(format!("warmup stream init failed: {e}"))),
+        }
+
+        let mut runs: Vec<f64> = Vec::with_capacity(repeats);
+        let mut last_err: Option<String> = None;
+        for _ in 0..repeats {
+            cpu.clear_prefix_cache();
+            let mut stream = match cpu
+                .speculate_mtp_stream_from_ids(prompt_ids.clone(), sampling.clone())
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    continue;
+                }
+            };
+            let drained = futures::executor::block_on(async {
+                let mut generated = 0usize;
+                let mut t_first: Option<std::time::Instant> = None;
+                let mut t_last = std::time::Instant::now();
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(_) => {
+                            let now = std::time::Instant::now();
+                            if t_first.is_none() {
+                                t_first = Some(now);
+                            }
+                            t_last = now;
+                            generated += 1;
+                        }
+                        Err(e) => return Err(e.to_string()),
+                    }
+                }
+                Ok((generated, t_first, t_last))
+            });
+            match drained {
+                Ok((generated, Some(t_first), t_last)) if generated >= 2 => {
+                    let decode_s = (t_last - t_first).as_secs_f64();
+                    if decode_s > 0.0 {
+                        runs.push((generated - 1) as f64 / decode_s);
+                    }
+                }
+                // Fewer than 2 tokens (e.g. immediate EOS on the synthetic
+                // prompt) leaves no inter-token interval to time — skip.
+                Ok(_) => {}
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if runs.is_empty() {
+            return (
+                None,
+                Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
+            );
+        }
+        runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = if runs.len() % 2 == 1 {
+            runs[runs.len() / 2]
+        } else {
+            (runs[runs.len() / 2 - 1] + runs[runs.len() / 2]) / 2.0
+        };
+        (Some(median), None)
+    };
+
+    // OFF arm: classic single-token decode via `generate_token_ids` (never
+    // routes through MTP). ON arm: the real MTP self-speculation stream.
+    // The `mtp_speculative` flag gates neither call, so both arms
+    // genuinely exercise the paths they name.
     cpu.set_mtp_speculative(false);
     let (off_tps, off_err) = bench(&mut cpu);
 
-    // ON arm (MTP self-speculation) — hot toggle, no reload.
-    cpu.set_mtp_speculative(true);
-    let (on_tps, on_err) = bench(&mut cpu);
+    let (on_tps, on_err) = bench_mtp(&mut cpu);
 
     // Restore the engine's default state (classic decode).
     cpu.set_mtp_speculative(false);

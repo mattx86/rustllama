@@ -95,12 +95,15 @@ pub fn encode_tq2_0(src: &[f32], dst: &mut [u8]) {
 // ----------------------------------------------------------------------
 
 const BLOCK_TQ1_0_BYTES: usize = 54;
-const POW3: [u32; 5] = [1, 3, 9, 27, 81];
 
-/// Encode TQ1_0. Base-3 packing: 5 trits per qs byte for the bulk
-/// (240 weights), 4 trits per qh byte for the 16-weight tail.
-/// Iteration order matches the dequant: HIGH digit first
-/// (pass `n` reads digit `4 - n` for `qs`, `3 - n` for `qh`).
+/// Encode TQ1_0 in ggml's **fixed-point** wire layout (see
+/// [`crate::dequant::dequant_tq1_0`] for the decode side and the format
+/// rationale). Per byte we build the plain base-3 value
+/// `v = t0*3^4 + t1*3^3 + … + t4` (most-significant trit first) and
+/// then store `ceil(v * 256 / 243)` so the decoder's wrapping-multiply
+/// trick recovers each trit. The 4-trit `qh` tail is shifted up by one
+/// trit (`v *= 3`) before scaling so its digits land in the top 4
+/// positions, matching `quantize_row_tq1_0_ref`.
 pub fn encode_tq1_0(src: &[f32], dst: &mut [u8]) {
     assert_eq!(src.len() % QK_K, 0, "encode_tq1_0: src.len() must be multiple of 256");
     let n_blocks = src.len() / QK_K;
@@ -109,6 +112,9 @@ pub fn encode_tq1_0(src: &[f32], dst: &mut [u8]) {
         n_blocks * BLOCK_TQ1_0_BYTES,
         "encode_tq1_0: dst.len() must be n_blocks * 54"
     );
+    // ceil(v * 256 / 243) — biases toward the base-3 digit boundaries
+    // so `((byte * 3^n) * 3) >> 8` reads back the exact trit.
+    let ceil_scale = |v: u32| ((v * 256 + 242) / 243) as u8;
     for b in 0..n_blocks {
         let xs: &[f32; QK_K] = src[b * QK_K..(b + 1) * QK_K].try_into().unwrap();
         let off = b * BLOCK_TQ1_0_BYTES;
@@ -118,34 +124,34 @@ pub fn encode_tq1_0(src: &[f32], dst: &mut [u8]) {
         let mut qh = [0u8; 4];
 
         // Chunk 0: qs[0..32], 5 trits per byte → 160 weights
-        // (output positions 0..160). Pass n reads digit 4-n; output
-        // position for that pass is `n*32 + m`.
-        for n in 0..5 {
-            let pow = POW3[4 - n];
-            for m in 0..32 {
-                let o = n * 32 + m;
-                qs[m] += (trits[o] as u32 * pow) as u8;
+        // (output positions 0..160). Output element `n*32 + m` is the
+        // digit with coefficient `3^(4-n)` of byte qs[m] (n=0 = MSB).
+        for m in 0..32 {
+            let mut v: u32 = 0;
+            for n in 0..5 {
+                v = v * 3 + trits[n * 32 + m] as u32;
             }
+            qs[m] = ceil_scale(v);
         }
         // Chunk 1: qs[32..48], 5 trits per byte → 80 weights
-        // (positions 160..240). Output position for pass n =
-        // 160 + n*16 + m.
-        for n in 0..5 {
-            let pow = POW3[4 - n];
-            for m in 0..16 {
-                let o = 160 + n * 16 + m;
-                qs[32 + m] += (trits[o] as u32 * pow) as u8;
+        // (positions 160..240). Output element `160 + n*16 + m`.
+        for m in 0..16 {
+            let mut v: u32 = 0;
+            for n in 0..5 {
+                v = v * 3 + trits[160 + n * 16 + m] as u32;
             }
+            qs[32 + m] = ceil_scale(v);
         }
         // Tail: qh[0..4], 4 trits per byte → 16 weights
-        // (positions 240..256). Output position for pass n =
-        // 240 + n*4 + m. Digit is 3 - n (4-trit packing).
-        for n in 0..4 {
-            let pow = POW3[3 - n];
-            for m in 0..4 {
-                let o = 240 + n * 4 + m;
-                qh[m] += (trits[o] as u32 * pow) as u8;
+        // (positions 240..256). Output element `240 + n*4 + h`. The
+        // extra `* 3` shifts the 4 trits into the top 4 digit slots.
+        for h in 0..4 {
+            let mut v: u32 = 0;
+            for n in 0..4 {
+                v = v * 3 + trits[240 + n * 4 + h] as u32;
             }
+            v *= 3;
+            qh[h] = ceil_scale(v);
         }
 
         dst[off..off + 48].copy_from_slice(&qs);
@@ -230,6 +236,57 @@ mod tests {
                 max_err < 0.05,
                 "tq1_0 n_blocks={n_blocks}: max_err={max_err}"
             );
+        }
+    }
+
+    /// Pins the TQ1_0 ggml fixed-point wire layout with a hand-computed
+    /// reference. `amp = 4.0` is exactly f16-representable so `d == amp`
+    /// and the round-trip is bit-exact. The two asserted bytes are
+    /// derived directly from `ceil(v * 256 / 243)` where `v` is the
+    /// plain base-3 value (MSB = first output element of the byte); the
+    /// `qh` value carries the extra `* 3` top-shift.
+    ///
+    /// NOTE: this validates our encoder ↔ decoder pair against the ggml
+    /// *formula*, not against a byte dump from a real llama.cpp TQ1_0
+    /// GGUF (none is available in-tree). A live-file diff is still the
+    /// gold standard for wire compatibility.
+    #[test]
+    fn tq1_0_matches_ggml_fixed_point_reference() {
+        let amp = 4.0f32;
+        let mut src = vec![0f32; QK_K]; // all-zero ⇒ trit "1" (ternary 0)
+
+        // qs[0] packs output elements {0, 32, 64, 96, 128}, MSB = elem 0.
+        // Trits [2, 1, 0, 2, 1] ⇒ +amp, 0, -amp, +amp, 0.
+        src[0] = amp; // trit 2
+        src[64] = -amp; // trit 0
+        src[96] = amp; // trit 2
+        // src[32], src[128] stay 0.0 ⇒ trit 1.
+
+        // qh[0] packs output elements {240, 244, 248, 252}, MSB = 240.
+        // Trits [0, 2, 1, 2] ⇒ -amp, +amp, 0, +amp.
+        src[240] = -amp; // trit 0
+        src[244] = amp; // trit 2
+        src[252] = amp; // trit 2
+        // src[248] stays 0.0 ⇒ trit 1.
+
+        let mut enc = vec![0u8; BLOCK_TQ1_0_BYTES];
+        encode_tq1_0(&src, &mut enc);
+
+        // qs[0]: v = 2*81 + 1*27 + 0*9 + 2*3 + 1 = 196; ceil(196*256/243) = 207.
+        assert_eq!(enc[0], 207, "qs[0] wire byte");
+        // qh[0] (byte offset 48): v = (0*27 + 2*9 + 1*3 + 2) * 3 = 69;
+        // ceil(69*256/243) = 73.
+        assert_eq!(enc[48], 73, "qh[0] wire byte");
+
+        // d little-endian f16 at bytes 52..54.
+        let d = f16::from_le_bytes([enc[52], enc[53]]).to_f32();
+        assert_eq!(d, amp, "d must equal amax exactly for f16-exact amp");
+
+        // Full round-trip is bit-exact for this input.
+        let mut dec = vec![0f32; QK_K];
+        dequant::dequant_tq1_0(&enc, &mut dec);
+        for i in 0..QK_K {
+            assert_eq!(dec[i], src[i], "element {i} round-trip");
         }
     }
 

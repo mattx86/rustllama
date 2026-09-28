@@ -1252,6 +1252,7 @@ fn dequant_to_f32(src_dtype: GgmlType, src_bytes: &[u8], out: &mut [f32]) -> Res
         GgmlType::F16 => dequant::dequant_f16(src_bytes, out),
         GgmlType::Bf16 => dequant::dequant_bf16(src_bytes, out),
         GgmlType::Q8_0 => dequant::dequant_q8_0(src_bytes, out),
+        GgmlType::Q8_1 => dequant::dequant_q8_1(src_bytes, out),
         GgmlType::Q8_K => dequant::dequant_q8_k(src_bytes, out),
         GgmlType::Q2_K => dequant::dequant_q2_k(src_bytes, out),
         GgmlType::Q3_K => dequant::dequant_q3_k(src_bytes, out),
@@ -1279,7 +1280,6 @@ fn dequant_to_f32(src_dtype: GgmlType, src_bytes: &[u8], out: &mut [f32]) -> Res
         // never a target.
         GgmlType::PQ2_0 => dequant::dequant_pq2_0(src_bytes, out),
         GgmlType::PTQ1_0 => dequant::dequant_ptq1_0(src_bytes, out),
-        GgmlType::Q8_1 => return Err(()), // No reader-side dequant for Q8_1 yet.
     }
     Ok(())
 }

@@ -13,10 +13,15 @@
 //! or RUST_LOG-configured) panic hook still runs so stderr behavior is
 //! preserved.
 
+use std::cell::Cell;
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 
-use crate::paths;
+thread_local! {
+    /// Set while this thread is executing the crash-log panic hook. Lets the
+    /// hook detect (and refuse) re-entry on the same thread — see the hook.
+    static IN_CRASH_HOOK: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Install the panic hook. Idempotent — only the first call sticks.
 /// Pass the rustllama version + a tag (e.g. "serve", "chat", "lsp") so
@@ -30,8 +35,26 @@ pub fn install_panic_hook(version: &str, tag: &str) {
     let tag = tag.to_string();
     let prior = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Make sure we don't recursively panic inside the hook itself.
+        // Re-entrancy guard. `write_crash_log` touches the paths OnceLock; if
+        // THIS panic fired while that OnceLock was still initializing on this
+        // thread (i.e. the first `paths()` call is on the stack and
+        // `resolve_paths` panicked), re-entering it would panic *inside* the
+        // hook — which the panic runtime turns into an immediate abort with no
+        // crash log at all. If we find ourselves re-entered on the same
+        // thread, skip the paths-dependent work and just leave a stderr
+        // breadcrumb before deferring to the prior hook. (`write_crash_log`
+        // itself also avoids re-initializing the OnceLock; this flag is the
+        // belt to that suspenders.)
+        if IN_CRASH_HOOK.with(|f| f.replace(true)) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "rustllama: panic while handling a panic; crash log skipped"
+            );
+            prior(info);
+            return;
+        }
         let _ = write_crash_log(&version, &tag, info);
+        IN_CRASH_HOOK.with(|f| f.set(false));
         prior(info);
     }));
 }
@@ -46,17 +69,24 @@ fn write_crash_log(
     static WRITE_LOCK: Mutex<()> = Mutex::new(());
     let _g = WRITE_LOCK.lock().ok();
 
-    let paths = paths();
-    std::fs::create_dir_all(&paths.crash_log_dir)?;
+    // Resolve the crash-log dir WITHOUT initializing the paths OnceLock. If a
+    // panic fired inside the very first `paths()` call, `get_or_init` is still
+    // on this thread's stack; calling `paths()` again here would reenter the
+    // OnceLock and panic — a panic *inside* the panic hook, which the runtime
+    // turns into an abort with no log. Use the already-resolved value when
+    // present; otherwise fall back to the process CWD so we still leave a file.
+    let crash_log_dir = crate::PATHS
+        .get()
+        .map(|p| p.crash_log_dir.clone())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    std::fs::create_dir_all(&crash_log_dir)?;
 
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let pid = std::process::id();
-    let path = paths
-        .crash_log_dir
-        .join(format!("crash-{secs}-{pid}.log"));
+    let path = crash_log_dir.join(format!("crash-{secs}-{pid}.log"));
 
     let mut file = std::fs::File::create(&path)?;
     writeln!(file, "rustllama crash log")?;
@@ -95,8 +125,6 @@ fn write_crash_log(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn write_crash_log_creates_a_file() {
         // We don't trigger an actual panic in the test (that'd kill the
@@ -107,7 +135,7 @@ mod tests {
         // a synthetic crash log via the helper machinery. Since
         // PanicHookInfo can't be constructed publicly, this test only
         // confirms the crash_log_dir resolves and is writable.
-        let p = paths();
+        let p = crate::paths();
         std::fs::create_dir_all(&p.crash_log_dir).expect("mkdir crash dir");
         // Touch a marker file to prove the dir is writable.
         let marker = p.crash_log_dir.join(".rustllama-crash-log-test");

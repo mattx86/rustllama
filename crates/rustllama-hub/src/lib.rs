@@ -151,11 +151,32 @@ impl HubRef {
         format!("{}/{}", self.owner, self.repo)
     }
 
-    /// Cache subdirectory: `<owner>__<repo>/<filename>`.
+    /// Cache subdirectory: `<owner>__<repo>/<filename>`, sanitized so no
+    /// component can escape `cache_dir`.
+    ///
+    /// The fields come from user / config input, and `filename` may also come
+    /// from the HF tree API (which reports nested paths like `sub/dir/x.gguf`
+    /// when `recursive=true`). Left unsanitized, a `..` segment — in the repo
+    /// id or the filename — would let the join walk out of the cache and
+    /// clobber arbitrary files. Separators are honored as directory boundaries,
+    /// but any `.` / `..` / empty / NUL-bearing segment is dropped, so the
+    /// result always stays under `cache_dir`.
     pub fn local_path(&self, cache_dir: &Path) -> PathBuf {
-        cache_dir
-            .join(format!("{}__{}", self.owner, self.repo))
-            .join(&self.filename)
+        let repo_dir = format!("{}__{}", self.owner, self.repo);
+        let mut out = cache_dir.to_path_buf();
+        // Repo id first (its own separators become nested dirs), then the
+        // filename (which may itself be a nested path).
+        for raw in [repo_dir.as_str(), self.filename.as_str()] {
+            for seg in raw.split(['/', '\\']) {
+                // Strip NUL bytes, then reject the traversal vectors.
+                let seg = seg.replace('\0', "");
+                if seg.is_empty() || seg == "." || seg == ".." {
+                    continue;
+                }
+                out.push(seg);
+            }
+        }
+        out
     }
 }
 
@@ -212,8 +233,15 @@ pub async fn download(
         .map_err(|e| HubError::HfHub(e.to_string()))?;
 
     // hf-hub stores under its own cache dir; copy into our cache layout so
-    // tools and the GUI can list models predictably.
-    std::fs::copy(&cached, &dst)?;
+    // tools and the GUI can list models predictably. Copy to a `.part` sibling
+    // then atomically rename, mirroring `download_with_progress` — an
+    // interrupted copy must never leave a partial file that the `dst.exists()`
+    // short-circuit above would later treat as a complete download.
+    let mut tmp_os = dst.clone().into_os_string();
+    tmp_os.push(".part");
+    let tmp = PathBuf::from(tmp_os);
+    std::fs::copy(&cached, &tmp)?;
+    std::fs::rename(&tmp, &dst)?;
 
     if let Some(p) = progress {
         p.finish_with_message(format!("downloaded {}", hub_ref.filename));
@@ -316,5 +344,31 @@ mod tests {
         let r = HubRef::parse("a/b:c.gguf").unwrap();
         let p = r.local_path(Path::new("/tmp/cache"));
         assert!(p.ends_with("a__b/c.gguf"));
+    }
+
+    #[test]
+    fn local_path_rejects_parent_dir_traversal() {
+        let cache = Path::new("/tmp/cache");
+        // `..` in the filename must not escape the cache dir.
+        let r = HubRef {
+            owner: "a".into(),
+            repo: "b".into(),
+            filename: "../../etc/passwd".into(),
+        };
+        let p = r.local_path(cache);
+        assert!(p.starts_with(cache), "sanitized path {p:?} escaped {cache:?}");
+        assert!(
+            !p.components().any(|c| c.as_os_str() == ".."),
+            "path {p:?} must contain no `..` component"
+        );
+        // Traversal via the repo id (its `/` split into segments) too.
+        let r2 = HubRef {
+            owner: "x".into(),
+            repo: "../..".into(),
+            filename: "m.gguf".into(),
+        };
+        let p2 = r2.local_path(cache);
+        assert!(p2.starts_with(cache));
+        assert!(!p2.components().any(|c| c.as_os_str() == ".."));
     }
 }

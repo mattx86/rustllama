@@ -47,7 +47,7 @@ pub enum Command {
         /// compiled in — there is no build flag to toggle).
         #[arg(long, default_value_t = false)]
         sycl_smoke: bool,
-        /// Run the GPU kernel parity + stability harness: every GPU
+        /// Run the SYCL kernel parity + stability harness: every SYCL
         /// kernel family (packed matvecs, fused gate_up, the flash-
         /// attention chains) against its CPU reference on identical
         /// inputs, each probe in its own subprocess so a kernel that
@@ -56,12 +56,12 @@ pub enum Command {
         /// Prints a per-kernel OK / MISCOMPUTE / KERNEL_ERR / CRASH /
         /// HANG matrix for the backend the launch PATH selects.
         #[arg(long, default_value_t = false)]
-        gpu_parity: bool,
+        sycl_parity: bool,
         /// Internal: run a single named parity probe in-process and
         /// print its machine-readable result line. Spawned by
-        /// `--gpu-parity`; not for direct use.
+        /// `--sycl-parity`; not for direct use.
         #[arg(long, hide = true)]
-        gpu_parity_probe: Option<String>,
+        sycl_parity_probe: Option<String>,
         /// Run the native CUDA kernel parity harness: every CUDA kernel
         /// (packed matvecs PTQ1_0/Q8_0/Q4_K/Q6_K, dense matvec, rmsnorm,
         /// rope, swiglu, embedding, flash-attn decode/prefill, argmax)
@@ -69,6 +69,14 @@ pub enum Command {
         /// (NVIDIA target); SKIPs cleanly when no CUDA device is present.
         #[arg(long, default_value_t = false)]
         cuda_parity: bool,
+        /// Run the CPU kernel self-parity harness: the CPU matvec SIMD
+        /// (AVX-512 / AVX2 / NEON) and rayon-parallel paths against a
+        /// naive scalar reference on this host's actual CPU (f32, f16,
+        /// and the PTQ1_0 ternary fastdot/batched paths). In-process
+        /// (no device to lose). The scalar-only quant matvecs are the
+        /// reference themselves and are covered by the SYCL/CUDA modes.
+        #[arg(long, default_value_t = false)]
+        cpu_parity: bool,
     },
     /// Print the rustllama version.
     Version,
@@ -865,16 +873,19 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Doctor {
             sycl_smoke,
-            gpu_parity,
-            gpu_parity_probe,
+            sycl_parity,
+            sycl_parity_probe,
             cuda_parity,
+            cpu_parity,
         } => {
-            if let Some(probe) = gpu_parity_probe {
+            if let Some(probe) = sycl_parity_probe {
                 crate::gpu_parity::run_probe(&probe)
-            } else if gpu_parity {
+            } else if sycl_parity {
                 crate::gpu_parity::run_parent()
             } else if cuda_parity {
                 crate::gpu_parity::run_cuda_parity()
+            } else if cpu_parity {
+                crate::gpu_parity::run_cpu_parity()
             } else {
                 doctor(&config_path, sycl_smoke).await
             }

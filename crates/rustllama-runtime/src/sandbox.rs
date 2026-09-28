@@ -51,11 +51,16 @@ pub struct SandboxConfig {
 
 impl Default for SandboxConfig {
     fn default() -> Self {
-        // Default 32 GiB memory cap — generous enough for a 70B Q4_K_M
-        // model with ctx=8192 (~38 GiB total weight + KV) is over the
-        // limit so the OS kills us before the swap thrashes. Tune via
-        // `[server].sandbox_memory_limit_mb` once that config field
-        // is wired through.
+        // 32 GiB fallback memory cap — generous enough that a 70B Q4_K_M model
+        // with ctx=8192 (~38 GiB total weight + KV) is over the limit, so the
+        // OS kills us before swap thrashes.
+        //
+        // This `Default` is only the library fallback for callers that don't
+        // supply a value. The real knob IS wired: `rustllama serve` constructs
+        // `SandboxConfig { memory_limit_bytes: sandbox_memory_limit_mb * MiB }`
+        // from `[server].sandbox_memory_limit_mb` (see `cli::serve`), where
+        // `0` keeps the process unsandboxed. The GUI-embedded server does not
+        // install a sandbox today (a separate app-crate gap).
         Self {
             memory_limit_bytes: 32 * 1024 * 1024 * 1024,
             kill_on_close: true,

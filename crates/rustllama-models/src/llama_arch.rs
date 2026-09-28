@@ -63,6 +63,22 @@ pub(crate) fn matvec_tensor_dispatch(
     k::matvec_tensor(w, x, out, m, k_dim);
 }
 
+/// Numerically-stable logistic sigmoid `1 / (1 + e^-x)`, evaluated as
+/// `e^x / (1 + e^x)` for `x < 0` so the `exp` never overflows on large
+/// negative inputs. Factored out of the ~8 identical per-head Q-gate /
+/// DeltaNet-beta loops in this module; the two-branch form is preserved
+/// bit-for-bit (same operations, same order), so gate outputs are
+/// unchanged.
+#[inline]
+fn sigmoid_stable(x: f32) -> f32 {
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
+}
+
 /// Batched analogue of [`matvec_tensor_dispatch`] — computes
 /// `out[n, m] = sum_k W[m, k] * x[n, k]` for all `n in 0..n_rows`,
 /// `m in 0..m_dim` in one shot. Tries the batched USM kernel first;
@@ -88,8 +104,10 @@ pub(crate) fn matvec_tensor_batched_dispatch(
     // below, ~n× less extraction work and weight DRAM traffic. This
     // was the structural cause of the per-token prefill floor: the
     // "batched" fallback re-streamed all 5.65 GB of weights once per
-    // token. GPU runs are unaffected (the batched USM arm above hits
-    // first for PTQ1_0).
+    // token. GPU runs never reach this CPU fallback for PTQ1_0: the
+    // batched USM gate above now maps PTQ1_0 (matching the single-row
+    // gate), so `try_matvec_tensor_batched_usm_f32` handles it on-device
+    // first — this fallback is the CPU-placed / no-GPU path only.
     if w.dtype == rustllama_tensor::Dtype::PTQ1_0Raw && n_rows > 1 {
         k::matvec_tensor_batched(w, x, out, m_dim, k_dim, n_rows);
         return;
@@ -3830,7 +3848,7 @@ impl LlamaModel {
         assert_eq!(embed_row.len(), cfg.d_model, "embed_row must be d_model long");
         assert_eq!(logits_out.len(), cfg.vocab_size);
         assert_eq!(kv.layers.len(), cfg.n_layers);
-        assert!(pos as usize <= kv.max_ctx, "pos exceeds max_ctx");
+        assert!((pos as usize) < kv.max_ctx, "pos exceeds max_ctx");
 
         let d = cfg.d_model;
         let n_heads = cfg.n_heads;
@@ -3945,10 +3963,27 @@ impl LlamaModel {
     /// Returns the logit vector of length `vocab_size`.
     pub fn forward_one(&self, token_id: i32, pos: u32, kv: &mut KvCache, logits_out: &mut [f32]) {
         let cfg = &self.cfg;
+        // Guard the dense forward against a mis-dispatched hybrid model
+        // (mirrors `forward_one_from_embed`): a hybrid model routed here
+        // would run ZERO layers and emit gibberish instead of failing
+        // loudly. Phase 3 of the qwen35moe roadmap lifts this.
+        assert!(
+            !self.weights.is_hybrid(),
+            "hybrid attention+SSM forward (arch `{}`) not yet implemented \
+             — Phase 3 of the qwen35moe roadmap (see docs/qwen35moe-roadmap.md). \
+             Phase 2 binds all tensors; the model loaded successfully but \
+             cannot inference yet.",
+            cfg.arch
+        );
         assert_eq!(logits_out.len(), cfg.vocab_size);
         assert_eq!(kv.layers.len(), cfg.n_layers);
-        assert_eq!(kv.max_ctx, kv.max_ctx);
-        assert!(pos as usize <= kv.max_ctx, "pos exceeds max_ctx");
+        // KV-cache geometry must match this model's config — a cache
+        // built for a different model would corrupt the per-head KV
+        // writes (indexed by `head_dim`/`n_kv_heads`). Replaces a former
+        // tautological `assert_eq!(kv.max_ctx, kv.max_ctx)`.
+        assert_eq!(kv.n_kv_heads, cfg.n_kv_heads, "kv cache n_kv_heads mismatch");
+        assert_eq!(kv.head_dim, cfg.head_dim, "kv cache head_dim mismatch");
+        assert!((pos as usize) < kv.max_ctx, "pos exceeds max_ctx");
 
         let d = cfg.d_model;
         let n_heads = cfg.n_heads;
@@ -4087,7 +4122,7 @@ impl LlamaModel {
         kv: &mut KvCache,
         dn_cache: &mut DeltaNetCache,
     ) -> Vec<f32> {
-        assert!(pos as usize <= kv.max_ctx, "pos exceeds max_ctx");
+        assert!((pos as usize) < kv.max_ctx, "pos exceeds max_ctx");
         let cfg = &self.cfg;
         assert!(
             self.weights.is_hybrid(),
@@ -4279,21 +4314,6 @@ impl LlamaModel {
         // output observed in the end-to-end smoke test. Layer 40
         // gets consumed by `forward_one_hybrid_with_nextn_logits`
         // (Phase 6 follow-up that hasn't yet wired this skip).
-        // Process ALL layers including the last one even when MTP is
-        // present. On qwen35moe, `blk.{N-1}` carries BOTH a full
-        // transformer layer (attn_*, ffn_*_exps, ffn_*_shexp, etc.)
-        // AND the MTP-specific tensors (`nextn.eh_proj`,
-        // `nextn.enorm`, `nextn.hnorm`, `nextn.shared_head_norm`).
-        // The NextN composition (`nextn_compose_logits_f32`) consumes
-        // ONLY the `nextn.*` subset; the regular transformer
-        // tensors of `blk.{N-1}` are real main-pass weights that
-        // must be executed. Earlier we skipped the last layer
-        // entirely on the assumption that it was the "NextN slot,
-        // not a regular layer" — but that lost the last layer's
-        // transformer step. Skipping is what produced gibberish
-        // output even after every other composition bug was fixed.
-        // RUSTLLAMA_SKIP_LAST_LAYER=1 reinstates the old behavior
-        // for A/B testing.
         // The qwen35moe converter (`_Qwen35MtpMixin`) extends block_count
         // by `mtp_num_hidden_layers`, packing the MTP draft head as the
         // last block. The main forward MUST exclude those layers — the
@@ -4412,12 +4432,7 @@ impl LlamaModel {
                     matvec_tensor_dispatch(&block.ssm_beta, &tmp_d, &mut beta, n_v_heads, d);
                     // Sigmoid on beta (numerically stable).
                     for b in beta.iter_mut() {
-                        let s = if *b >= 0.0 {
-                            1.0 / (1.0 + (-*b).exp())
-                        } else {
-                            let e = b.exp();
-                            e / (1.0 + e)
-                        };
+                        let s = sigmoid_stable(*b);
                         *b = s;
                     }
 
@@ -4757,18 +4772,34 @@ impl LlamaModel {
                                 v[dst..dst + head_dim]
                                     .copy_from_slice(&v_buf[h * head_dim..(h + 1) * head_dim]);
                             }
-                            // 6. Attention over K/V history. Falls
-                            //    through to the existing CPU GQA
-                            //    flash-decode kernel; for `qwen35moe`
-                            //    on Iris Xe the SYCL `flash_attn_decode`
-                            //    USM path would also work but the
-                            //    hybrid path's K/V cache hasn't been
-                            //    USM-uploaded (that's a Phase 7
-                            //    follow-up).
-                            k::gqa_attention_flash_decode(
-                                &q_buf, k, v, &mut attn_out,
-                                n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                            );
+                            // 6. Attention over K/V history. Try the GPU
+                            //    flash-decode first (CUDA → SYCL): the
+                            //    helper re-writes the new K/V row into its
+                            //    own resident F32 mirror from k_buf/v_buf
+                            //    (exactly as the quant hybrid arms do), so
+                            //    it does NOT depend on the hybrid host K/V
+                            //    slab being uploaded. Decline → the
+                            //    existing CPU GQA flash-decode kernel, so
+                            //    F32 behavior is unchanged when no GPU
+                            //    path engages.
+                            if !crate::accel::try_flash_attn_decode_gpu_f32(
+                                &q_buf,
+                                &k_buf[..n_kv_heads * head_dim],
+                                &v_buf[..n_kv_heads * head_dim],
+                                &mut attn_out,
+                                li,
+                                cur_pos as u32,
+                                n_heads as u32,
+                                n_kv_heads as u32,
+                                head_dim as u32,
+                                max_ctx as u32,
+                                cfg.n_layers as u32,
+                            ) {
+                                k::gqa_attention_flash_decode(
+                                    &q_buf, k, v, &mut attn_out,
+                                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                                );
+                            }
                             // 7. Apply the per-head sigmoid gate
                             //    (chunked from q_proj above). The
                             //    multiply is element-wise across the
@@ -4777,12 +4808,7 @@ impl LlamaModel {
                             // multiplication for A/B testing.
                             if !no_qgate_enabled() {
                                 for (a, g) in attn_out.iter_mut().zip(attn_gate_buf.iter()) {
-                                    let s = if *g >= 0.0 {
-                                        1.0 / (1.0 + (-*g).exp())
-                                    } else {
-                                        let e = g.exp();
-                                        e / (1.0 + e)
-                                    };
+                                    let s = sigmoid_stable(*g);
                                     *a *= s;
                                 }
                             }
@@ -4832,21 +4858,35 @@ impl LlamaModel {
                                     &mut v_q[p_dst..p_dst + bytes_per_row],
                                 );
                             }
-                            q4_0_kv::gqa_attention_flash_decode_q4_0(
-                                &q_buf, k_q, v_q, &mut attn_out,
-                                n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                            );
+                            // GPU quant-KV flash decode first (USM). k_buf/
+                            // v_buf are already whitened + K-bias-subtracted,
+                            // matching the host slab the helper's mirror is
+                            // re-quantized from. Decline → CPU. The un-whiten
+                            // below applies to either output.
+                            if !crate::accel::try_flash_attn_decode_gpu_q4_0(
+                                &q_buf,
+                                &k_buf[..n_kv_heads * head_dim],
+                                &v_buf[..n_kv_heads * head_dim],
+                                &mut attn_out,
+                                li,
+                                cur_pos as u32,
+                                n_heads as u32,
+                                n_kv_heads as u32,
+                                head_dim as u32,
+                                max_ctx as u32,
+                                cfg.n_layers as u32,
+                            ) {
+                                q4_0_kv::gqa_attention_flash_decode_q4_0(
+                                    &q_buf, k_q, v_q, &mut attn_out,
+                                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                                );
+                            }
                             if whiten {
                                 whiten_chunks_inplace(&mut attn_out, KV_WHITEN_CHUNK);
                             }
                             if !no_qgate_enabled() {
                                 for (a, g) in attn_out.iter_mut().zip(attn_gate_buf.iter()) {
-                                    let s = if *g >= 0.0 {
-                                        1.0 / (1.0 + (-*g).exp())
-                                    } else {
-                                        let e = g.exp();
-                                        e / (1.0 + e)
-                                    };
+                                    let s = sigmoid_stable(*g);
                                     *a *= s;
                                 }
                             }
@@ -4869,18 +4909,29 @@ impl LlamaModel {
                                     &mut v_q[dst..dst + head_dim],
                                 );
                             }
-                            k::gqa_attention_flash_decode_q8_0(
-                                &q_buf, k_q, k_scales, v_q, v_scales, &mut attn_out,
-                                n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                            );
+                            // GPU quant-KV flash decode first (USM); host
+                            // slab written above, so decline → CPU.
+                            if !crate::accel::try_flash_attn_decode_gpu_q8_0(
+                                &q_buf,
+                                &k_buf[..n_kv_heads * head_dim],
+                                &v_buf[..n_kv_heads * head_dim],
+                                &mut attn_out,
+                                li,
+                                cur_pos as u32,
+                                n_heads as u32,
+                                n_kv_heads as u32,
+                                head_dim as u32,
+                                max_ctx as u32,
+                                cfg.n_layers as u32,
+                            ) {
+                                k::gqa_attention_flash_decode_q8_0(
+                                    &q_buf, k_q, k_scales, v_q, v_scales, &mut attn_out,
+                                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                                );
+                            }
                             if !no_qgate_enabled() {
                                 for (a, g) in attn_out.iter_mut().zip(attn_gate_buf.iter()) {
-                                    let s = if *g >= 0.0 {
-                                        1.0 / (1.0 + (-*g).exp())
-                                    } else {
-                                        let e = g.exp();
-                                        e / (1.0 + e)
-                                    };
+                                    let s = sigmoid_stable(*g);
                                     *a *= s;
                                 }
                             }
@@ -4905,18 +4956,30 @@ impl LlamaModel {
                                     &mut tq_row, *bits, &mut v_packed[p_dst..p_dst + bytes_per_row],
                                 );
                             }
-                            rustllama_kernels_cpu::turboquant::gqa_attention_flash_decode_tq(
-                                &q_buf, k_packed, k_scales, v_packed, v_scales, *bits, &mut attn_out,
-                                n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                            );
+                            // GPU quant-KV flash decode first (USM); host
+                            // slab written above, so decline → CPU.
+                            if !crate::accel::try_flash_attn_decode_gpu_tq(
+                                &q_buf,
+                                &k_buf[..n_kv_heads * head_dim],
+                                &v_buf[..n_kv_heads * head_dim],
+                                &mut attn_out,
+                                *bits,
+                                li,
+                                cur_pos as u32,
+                                n_heads as u32,
+                                n_kv_heads as u32,
+                                head_dim as u32,
+                                max_ctx as u32,
+                                cfg.n_layers as u32,
+                            ) {
+                                rustllama_kernels_cpu::turboquant::gqa_attention_flash_decode_tq(
+                                    &q_buf, k_packed, k_scales, v_packed, v_scales, *bits, &mut attn_out,
+                                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                                );
+                            }
                             if !no_qgate_enabled() {
                                 for (a, g) in attn_out.iter_mut().zip(attn_gate_buf.iter()) {
-                                    let s = if *g >= 0.0 {
-                                        1.0 / (1.0 + (-*g).exp())
-                                    } else {
-                                        let e = g.exp();
-                                        e / (1.0 + e)
-                                    };
+                                    let s = sigmoid_stable(*g);
                                     *a *= s;
                                 }
                             }
@@ -4949,18 +5012,29 @@ impl LlamaModel {
                                     );
                                 }
                             }
-                            rustllama_kernels_cpu::nvfp4::gqa_attention_flash_decode_nvfp4(
-                                &q_buf, k_packed, v_packed, &mut attn_out,
-                                n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                            );
+                            // GPU quant-KV flash decode first (USM); host
+                            // slab written above, so decline → CPU.
+                            if !crate::accel::try_flash_attn_decode_gpu_nvfp4(
+                                &q_buf,
+                                &k_buf[..n_kv_heads * head_dim],
+                                &v_buf[..n_kv_heads * head_dim],
+                                &mut attn_out,
+                                li,
+                                cur_pos as u32,
+                                n_heads as u32,
+                                n_kv_heads as u32,
+                                head_dim as u32,
+                                max_ctx as u32,
+                                cfg.n_layers as u32,
+                            ) {
+                                rustllama_kernels_cpu::nvfp4::gqa_attention_flash_decode_nvfp4(
+                                    &q_buf, k_packed, v_packed, &mut attn_out,
+                                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                                );
+                            }
                             if !no_qgate_enabled() {
                                 for (a, g) in attn_out.iter_mut().zip(attn_gate_buf.iter()) {
-                                    let s = if *g >= 0.0 {
-                                        1.0 / (1.0 + (-*g).exp())
-                                    } else {
-                                        let e = g.exp();
-                                        e / (1.0 + e)
-                                    };
+                                    let s = sigmoid_stable(*g);
                                     *a *= s;
                                 }
                             }
@@ -5379,12 +5453,7 @@ impl LlamaModel {
                         &mut hoist_beta[..nb * n_v_heads], n_v_heads, d, nb,
                     );
                     for b in hoist_beta[..nb * n_v_heads].iter_mut() {
-                        let s = if *b >= 0.0 {
-                            1.0 / (1.0 + (-*b).exp())
-                        } else {
-                            let e = b.exp();
-                            e / (1.0 + e)
-                        };
+                        let s = sigmoid_stable(*b);
                         *b = s;
                     }
                     if pp_on { pp[0] += pp_mark.elapsed().as_secs_f64() * 1e3; pp_mark = std::time::Instant::now(); }
@@ -5685,6 +5754,11 @@ impl LlamaModel {
                     // per sub-chunk). RoPE, q/k norms, whitening, the
                     // KV write, attention, and the output projection
                     // stay per-token and byte-identical.
+                    //
+                    // `kv_bias` is constant for the whole layer forward
+                    // (read-only), so clone the `Option<Arc<_>>` once here
+                    // rather than once per token inside the KV-write loop.
+                    let kv_bias_l = kv.kv_bias.clone();
                     for t0 in (0..n).step_by(PREFILL_HOIST_SUB) {
                     let t1 = (t0 + PREFILL_HOIST_SUB).min(n);
                     let nb = t1 - t0;
@@ -5765,7 +5839,6 @@ impl LlamaModel {
                         }
                         let cur_pos = pos as usize;
                         let max_ctx = kv.max_ctx;
-                        let kv_bias_l = kv.kv_bias.clone();
                         let kv_layer = &mut kv.layers[li];
                         match kv_layer {
                             KvLayer::F32 { k, v } => {
@@ -5920,48 +5993,83 @@ impl LlamaModel {
                         match kv_layer {
                             KvLayer::F32 { k, v } => {
                                 sub_whiten = false;
-                                k::gqa_attention_flash_prefill(
+                                if !crate::accel::try_flash_attn_prefill_gpu_f32(
                                     &hoist_qrows[..nb * d_q], k, v,
                                     &mut hoist_attn_out[..nb * d_q],
                                     n_heads, n_kv_heads, head_dim, max_ctx,
                                     kv_len_base, nb,
-                                );
+                                ) {
+                                    k::gqa_attention_flash_prefill(
+                                        &hoist_qrows[..nb * d_q], k, v,
+                                        &mut hoist_attn_out[..nb * d_q],
+                                        n_heads, n_kv_heads, head_dim, max_ctx,
+                                        kv_len_base, nb,
+                                    );
+                                }
                             }
                             KvLayer::Q4_0 { k_q, v_q } => {
                                 sub_whiten = q4_0_whiten_active(head_dim);
-                                q4_0_kv::gqa_attention_flash_prefill_q4_0(
+                                if !crate::accel::try_flash_attn_prefill_gpu_q4_0(
                                     &hoist_qrows[..nb * d_q], k_q, v_q,
                                     &mut hoist_attn_out[..nb * d_q],
                                     n_heads, n_kv_heads, head_dim, max_ctx,
                                     kv_len_base, nb,
-                                );
+                                ) {
+                                    q4_0_kv::gqa_attention_flash_prefill_q4_0(
+                                        &hoist_qrows[..nb * d_q], k_q, v_q,
+                                        &mut hoist_attn_out[..nb * d_q],
+                                        n_heads, n_kv_heads, head_dim, max_ctx,
+                                        kv_len_base, nb,
+                                    );
+                                }
                             }
                             KvLayer::Q8_0 { k_q, k_scales, v_q, v_scales } => {
                                 sub_whiten = false;
-                                k::gqa_attention_flash_prefill_q8_0(
+                                if !crate::accel::try_flash_attn_prefill_gpu_q8_0(
                                     &hoist_qrows[..nb * d_q], k_q, k_scales, v_q, v_scales,
                                     &mut hoist_attn_out[..nb * d_q],
                                     n_heads, n_kv_heads, head_dim, max_ctx,
                                     kv_len_base, nb,
-                                );
+                                ) {
+                                    k::gqa_attention_flash_prefill_q8_0(
+                                        &hoist_qrows[..nb * d_q], k_q, k_scales, v_q, v_scales,
+                                        &mut hoist_attn_out[..nb * d_q],
+                                        n_heads, n_kv_heads, head_dim, max_ctx,
+                                        kv_len_base, nb,
+                                    );
+                                }
                             }
                             KvLayer::TurboQuant { bits, k_packed, k_scales, v_packed, v_scales } => {
                                 sub_whiten = false;
-                                rustllama_kernels_cpu::turboquant::gqa_attention_flash_prefill_tq(
+                                if !crate::accel::try_flash_attn_prefill_gpu_tq(
                                     &hoist_qrows[..nb * d_q], k_packed, k_scales, v_packed, v_scales,
                                     *bits, &mut hoist_attn_out[..nb * d_q],
                                     n_heads, n_kv_heads, head_dim, max_ctx,
                                     kv_len_base, nb,
-                                );
+                                ) {
+                                    rustllama_kernels_cpu::turboquant::gqa_attention_flash_prefill_tq(
+                                        &hoist_qrows[..nb * d_q], k_packed, k_scales, v_packed, v_scales,
+                                        *bits, &mut hoist_attn_out[..nb * d_q],
+                                        n_heads, n_kv_heads, head_dim, max_ctx,
+                                        kv_len_base, nb,
+                                    );
+                                }
                             }
                             KvLayer::Nvfp4 { k_packed, v_packed } => {
                                 sub_whiten = false;
-                                rustllama_kernels_cpu::nvfp4::gqa_attention_flash_prefill_nvfp4(
+                                if !crate::accel::try_flash_attn_prefill_gpu_nvfp4(
                                     &hoist_qrows[..nb * d_q], k_packed, v_packed,
                                     &mut hoist_attn_out[..nb * d_q],
                                     n_heads, n_kv_heads, head_dim, max_ctx,
                                     kv_len_base, nb,
-                                );
+                                ) {
+                                    rustllama_kernels_cpu::nvfp4::gqa_attention_flash_prefill_nvfp4(
+                                        &hoist_qrows[..nb * d_q], k_packed, v_packed,
+                                        &mut hoist_attn_out[..nb * d_q],
+                                        n_heads, n_kv_heads, head_dim, max_ctx,
+                                        kv_len_base, nb,
+                                    );
+                                }
                             }
                         }
                     }
@@ -5976,12 +6084,7 @@ impl LlamaModel {
                         if !no_qgate {
                             let gate = &hoist_gaterows[bi * d_q..(bi + 1) * d_q];
                             for (a, g) in row.iter_mut().zip(gate.iter()) {
-                                let s = if *g >= 0.0 {
-                                    1.0 / (1.0 + (-*g).exp())
-                                } else {
-                                    let e = g.exp();
-                                    e / (1.0 + e)
-                                };
+                                let s = sigmoid_stable(*g);
                                 *a *= s;
                             }
                         }
@@ -6653,7 +6756,7 @@ impl LlamaModel {
                     // to the GPU. The kernel reads them in place.
                     // Returns true if the kernel ran; false falls
                     // through to the CPU flash/standard path below.
-                    let gpu_handled = crate::accel::try_flash_attn_decode_usm_f32(
+                    let gpu_handled = crate::accel::try_flash_attn_decode_gpu_f32(
                         &q_buf,
                         &k_buf,
                         &v_buf,
@@ -6740,6 +6843,25 @@ impl LlamaModel {
                     // the same floor we use for F32 with AVX-2. On
                     // a CPU without AVX-2+FMA the threshold should
                     // be raised via the env var.
+                    // GPU quant-KV flash-attention decode first (USM,
+                    // opt-in via RUSTLLAMA_USM_ATTN). The host slab was
+                    // quantized above, so a decline falls cleanly back
+                    // to the CPU flash/standard split below. The helper
+                    // re-quantizes k_buf/v_buf into its own USM mirror
+                    // with the same quantizer, so its bytes match k_q/v_q.
+                    if !crate::accel::try_flash_attn_decode_gpu_q8_0(
+                        &q_buf,
+                        &k_buf,
+                        &v_buf,
+                        &mut attn_out,
+                        layer_idx,
+                        cur_pos as u32,
+                        n_heads as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        max_ctx as u32,
+                        cfg.n_layers as u32,
+                    ) {
                     let flash_min = flash_kv_len_min();
                     if crate::accel::flash_attention_enabled() && kv_len >= flash_min {
                         k::gqa_attention_flash_decode_q8_0(
@@ -6770,6 +6892,7 @@ impl LlamaModel {
                             kv_len,
                         );
                     }
+                    } // end else: CPU Q8_0 attention (GPU declined)
                 }
                 KvLayer::TurboQuant {
                     bits,
@@ -6827,6 +6950,22 @@ impl LlamaModel {
                     //    inner loop (the dequant scratch is f32 — same
                     //    shape as the F32 flash kernel). Threshold drops
                     //    to 256 to match.
+                    // GPU quant-KV flash decode first (USM). Decline →
+                    // CPU flash/standard split below over the host slab.
+                    if !crate::accel::try_flash_attn_decode_gpu_tq(
+                        &q_buf,
+                        &k_buf,
+                        &v_buf,
+                        &mut attn_out,
+                        *bits,
+                        layer_idx,
+                        cur_pos as u32,
+                        n_heads as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        max_ctx as u32,
+                        cfg.n_layers as u32,
+                    ) {
                     let flash_min = flash_kv_len_min();
                     if crate::accel::flash_attention_enabled() && kv_len >= flash_min {
                         rustllama_kernels_cpu::turboquant::gqa_attention_flash_decode_tq(
@@ -6859,6 +6998,7 @@ impl LlamaModel {
                             kv_len,
                         );
                     }
+                    } // end else: CPU TurboQuant attention (GPU declined)
                 }
                 KvLayer::Nvfp4 { k_packed, v_packed } => {
                     let blocks_per_row =
@@ -6903,6 +7043,21 @@ impl LlamaModel {
                     // AVX-2 inner loop (after per-kv_h block-dequant
                     // into f32 scratch), so the same 256 threshold
                     // applies as F32 / Q8_0 / TQ.
+                    // GPU quant-KV flash decode first (USM). Decline →
+                    // CPU flash/slab split below over the host slab.
+                    if !crate::accel::try_flash_attn_decode_gpu_nvfp4(
+                        &q_buf,
+                        &k_buf,
+                        &v_buf,
+                        &mut attn_out,
+                        layer_idx,
+                        cur_pos as u32,
+                        n_heads as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        max_ctx as u32,
+                        cfg.n_layers as u32,
+                    ) {
                     let flash_min = flash_kv_len_min();
                     if crate::accel::flash_attention_enabled() && kv_len >= flash_min {
                         rustllama_kernels_cpu::nvfp4::gqa_attention_flash_decode_nvfp4(
@@ -6960,6 +7115,7 @@ impl LlamaModel {
                             kv_len,
                         );
                     }
+                    } // end else: CPU NVFP4 attention (GPU declined)
                 }
                 KvLayer::Q4_0 { k_q, v_q } => {
                     use rustllama_kernels_cpu::q4_0_kv;
@@ -7008,6 +7164,24 @@ impl LlamaModel {
                     //    flash dequantizes one kv_h's live rows at a
                     //    time with online softmax; below the threshold,
                     //    slab-dequant + the SIMD F32 kernel.
+                    // GPU quant-KV flash decode first (USM). k_buf/v_buf
+                    // are already whitened + K-bias-subtracted (steps 0/0b),
+                    // exactly what the host slab was quantized from, so the
+                    // helper's mirror matches k_q/v_q. Decline → CPU below.
+                    // The un-whiten in step 3 applies to either output.
+                    if !crate::accel::try_flash_attn_decode_gpu_q4_0(
+                        &q_buf,
+                        &k_buf,
+                        &v_buf,
+                        &mut attn_out,
+                        layer_idx,
+                        cur_pos as u32,
+                        n_heads as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        max_ctx as u32,
+                        cfg.n_layers as u32,
+                    ) {
                     let flash_min = flash_kv_len_min();
                     if crate::accel::flash_attention_enabled() && kv_len >= flash_min {
                         q4_0_kv::gqa_attention_flash_decode_q4_0(
@@ -7051,6 +7225,7 @@ impl LlamaModel {
                             kv_len,
                         );
                     }
+                    } // end else: CPU Q4_0 attention (GPU declined)
                     // 3. Un-whiten the attention output (self-inverse
                     //    transform re-applied — see step 0).
                     if whiten {
@@ -7989,6 +8164,20 @@ impl LlamaModel {
     /// and returning only the logits for the *final* token (typical for
     /// prefill — the intermediate logits are not needed).
     pub fn forward_prefill(&self, tokens: &[i32], start_pos: u32, kv: &mut KvCache) -> Vec<f32> {
+        // Guard the dense prefill against a mis-dispatched hybrid model
+        // (mirrors `forward_one_from_embed`): hybrid models have their
+        // own `forward_prefill_hybrid_impl`, and routing one through the
+        // dense path here would run ZERO layers and emit gibberish
+        // instead of failing loudly. Phase 3 of the qwen35moe roadmap
+        // lifts this.
+        assert!(
+            !self.weights.is_hybrid(),
+            "hybrid attention+SSM forward (arch `{}`) not yet implemented \
+             — Phase 3 of the qwen35moe roadmap (see docs/qwen35moe-roadmap.md). \
+             Phase 2 binds all tensors; the model loaded successfully but \
+             cannot inference yet.",
+            self.cfg.arch
+        );
         // Opt-in batched path. Uses the new multi-query flash-prefill
         // kernel for the attention compute; the F32 KV path is
         // supported today, quantized KV paths fall back to the serial
@@ -8269,7 +8458,7 @@ impl LlamaModel {
                     // The hook is internally a one-shot copy in,
                     // kernel, copy out — see `try_flash_attn_prefill_usm_f32`
                     // for the layout contract.
-                    let used_gpu = crate::accel::try_flash_attn_prefill_usm_f32(
+                    let used_gpu = crate::accel::try_flash_attn_prefill_gpu_f32(
                         &q_buf,
                         k,
                         v,
@@ -8599,7 +8788,7 @@ impl LlamaModel {
             // (passes max_ctx = kv_len because the slab is sized
             // exactly there); fall back to CPU if SYCL is off /
             // hook returns false.
-            let used_gpu = crate::accel::try_flash_attn_prefill_usm_f32(
+            let used_gpu = crate::accel::try_flash_attn_prefill_gpu_f32(
                 &q_buf,
                 &k_slab,
                 &v_slab,
@@ -8890,7 +9079,7 @@ impl LlamaModel {
                                 );
                         }
                     }
-                    rustllama_kernels_cpu::turboquant::gqa_attention_flash_prefill_tq(
+                    if !crate::accel::try_flash_attn_prefill_gpu_tq(
                         &q_buf,
                         k_packed,
                         k_scales,
@@ -8904,7 +9093,23 @@ impl LlamaModel {
                         max_ctx,
                         kv_len_base,
                         n_new,
-                    );
+                    ) {
+                        rustllama_kernels_cpu::turboquant::gqa_attention_flash_prefill_tq(
+                            &q_buf,
+                            k_packed,
+                            k_scales,
+                            v_packed,
+                            v_scales,
+                            *bits,
+                            &mut attn_out,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            kv_len_base,
+                            n_new,
+                        );
+                    }
                 }
                 _ => unreachable!("forward_prefill_batched_tq entered with non-TQ KV"),
             }
@@ -9212,7 +9417,7 @@ impl LlamaModel {
                                 quantize_row_q8_0(v_src, &mut v_q[dst..dst + head_dim]);
                         }
                     }
-                    k::gqa_attention_flash_prefill_q8_0(
+                    if !crate::accel::try_flash_attn_prefill_gpu_q8_0(
                         &q_buf,
                         k_q,
                         k_scales,
@@ -9225,7 +9430,22 @@ impl LlamaModel {
                         max_ctx,
                         kv_len_base,
                         n_new,
-                    );
+                    ) {
+                        k::gqa_attention_flash_prefill_q8_0(
+                            &q_buf,
+                            k_q,
+                            k_scales,
+                            v_q,
+                            v_scales,
+                            &mut attn_out,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            kv_len_base,
+                            n_new,
+                        );
+                    }
                 }
                 _ => unreachable!("forward_prefill_batched_q8_0 entered with non-Q8_0 KV"),
             }
@@ -9544,7 +9764,7 @@ impl LlamaModel {
                             }
                         }
                     }
-                    rustllama_kernels_cpu::nvfp4::gqa_attention_flash_prefill_nvfp4(
+                    if !crate::accel::try_flash_attn_prefill_gpu_nvfp4(
                         &q_buf,
                         k_packed,
                         v_packed,
@@ -9555,7 +9775,20 @@ impl LlamaModel {
                         max_ctx,
                         kv_len_base,
                         n_new,
-                    );
+                    ) {
+                        rustllama_kernels_cpu::nvfp4::gqa_attention_flash_prefill_nvfp4(
+                            &q_buf,
+                            k_packed,
+                            v_packed,
+                            &mut attn_out,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            kv_len_base,
+                            n_new,
+                        );
+                    }
                 }
                 _ => unreachable!("forward_prefill_batched_nvfp4 entered with non-NVFP4 KV"),
             }
@@ -9888,7 +10121,7 @@ impl LlamaModel {
                             );
                         }
                     }
-                    q4_0_kv::gqa_attention_flash_prefill_q4_0(
+                    if !crate::accel::try_flash_attn_prefill_gpu_q4_0(
                         &q_buf,
                         k_q,
                         v_q,
@@ -9899,7 +10132,20 @@ impl LlamaModel {
                         max_ctx,
                         kv_len_base,
                         n_new,
-                    );
+                    ) {
+                        q4_0_kv::gqa_attention_flash_prefill_q4_0(
+                            &q_buf,
+                            k_q,
+                            v_q,
+                            &mut attn_out,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            kv_len_base,
+                            n_new,
+                        );
+                    }
                     if whiten {
                         whiten_chunks_inplace(&mut attn_out, KV_WHITEN_CHUNK);
                     }

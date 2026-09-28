@@ -63,6 +63,30 @@ pub fn dequant_q8_0(bytes: &[u8], out: &mut [f32]) {
     }
 }
 
+/// Q8_1 block: `{ d: f16, s: f16, qs: [i8; 32] }` = 36 bytes per 32
+/// values. Identical per-weight reconstruction to Q8_0 (`value = d *
+/// q`); the extra `s` field is a *precomputed* per-block sum
+/// (`s = d * sum(qs)`) that dot-product kernels consume — it carries
+/// no information not already in `d`/`qs`, so the dequant simply skips
+/// it. Matches ggml's `block_q8_1`.
+///
+/// `out.len()` must be a multiple of 32 equal to `bytes.len() / 36 * 32`.
+pub fn dequant_q8_1(bytes: &[u8], out: &mut [f32]) {
+    const BLOCK_BYTES: usize = 36;
+    let n_blocks = bytes.len() / BLOCK_BYTES;
+    debug_assert_eq!(bytes.len(), n_blocks * BLOCK_BYTES);
+    debug_assert_eq!(out.len(), n_blocks * QK8_0);
+    for b in 0..n_blocks {
+        let off = b * BLOCK_BYTES;
+        let d = f16::from_le_bytes([bytes[off], bytes[off + 1]]).to_f32();
+        // bytes[off + 2 .. off + 4] = s (precomputed sum) — unused here.
+        for i in 0..QK8_0 {
+            let q = bytes[off + 4 + i] as i8;
+            out[b * QK8_0 + i] = d * (q as f32);
+        }
+    }
+}
+
 /// Q8_K super-block: 292 bytes per 256 weights. ~9.125 bpw.
 /// Layout (matching ggml's `block_q8_K`):
 ///   { d: f32, qs: [i8; 256], bsums: [i16; 16] }
@@ -659,39 +683,45 @@ pub fn dequant_tq2_0(bytes: &[u8], out: &mut [f32]) {
 }
 
 /// TQ1_0: 54 bytes per 256 weights (1.6875 bpw). The tightest
-/// production ternary quant — uses base-3 packing to squeeze 5 trits
-/// into a single byte for the bulk of the data, plus a smaller 4-trit
-/// packing for the tail.
+/// production ternary quant — packs 5 trits into a single byte for the
+/// bulk of the data, plus a smaller 4-trit packing for the tail.
 ///
 /// Layout (matching ggml's `block_tq1_0`):
 ///   { qs: [u8; 48], qh: [u8; 4], d: f16 }
 ///
-/// Each `qs` byte encodes 5 trits in base 3:
-///   `byte = t0 + 3*t1 + 9*t2 + 27*t3 + 81*t4`   with `ti ∈ {0,1,2}`
-/// (max value 2 + 6 + 18 + 54 + 162 = 242, fits in `u8`).
-/// Each `qh` byte encodes 4 trits the same way (max 80).
+/// **Wire format (ggml fixed-point, not plain base-3).** ggml does
+/// NOT store the raw base-3 value `v = t0*81 + t1*27 + … + t4`.
+/// Instead each byte holds `ceil(v * 256 / 243)` — a *ceiling*
+/// fixed-point scaling — so that individual trits can be recovered
+/// without a division:
+///   `q  = byte * 3^n`            (u8, wraps mod 256)
+///   `xi = ((q as u16) * 3) >> 8` ∈ {0, 1, 2}
+/// with `n = 0` yielding the most-significant trit. This is the exact
+/// trick the in-tree PTQ1_0 codec ([`dequant_ptq1_0`]) uses, and it is
+/// what makes us byte-compatible with `dequantize_row_tq1_0`. (The
+/// earlier plain `(byte / 3^k) % 3` decode round-tripped against our
+/// own encoder but produced garbage on real llama.cpp TQ1_0 files.)
 ///
-/// Iteration order (mirrors `dequantize_row_tq1_0` in ggml-quants.c —
-/// trit indices walked **high-to-low** within each chunk):
-///   - chunk 0: `qs[0..32]`, 5 trits each → 160 weights, trit_4 first
-///   - chunk 1: `qs[32..48]`, 5 trits each → 80 weights, trit_4 first
-///   - tail: `qh[0..4]`, 4 trits each → 16 weights, trit_3 first
+/// The 4-trit `qh` tail is packed into the *top* 4 digit positions
+/// (the encoder shifts the accumulated value up by one trit before the
+/// ceiling scale), so it is extracted with `n = 0..4` too.
+///
+/// Iteration order (mirrors `dequantize_row_tq1_0` in ggml-quants.c):
+///   - chunk 0: `qs[0..32]`, 5 trits each → 160 weights
+///   - chunk 1: `qs[32..48]`, 5 trits each → 80 weights
+///   - tail: `qh[0..4]`, 4 trits each → 16 weights
+///
+/// NOTE: byte layout matches ggml by construction/derivation but has
+/// not been diffed against a real llama.cpp-produced TQ1_0 GGUF (we
+/// have none in-tree) — see the module tests for the hand-computed
+/// reference vector that pins the format.
 ///
 /// `out.len()` must equal `bytes.len() / 54 * 256`.
 pub fn dequant_tq1_0(bytes: &[u8], out: &mut [f32]) {
     const BLOCK_BYTES: usize = 54;
-    // pow3[k] = 3^k. Trit at digit `k` of base-3-encoded `byte` is
-    // `(byte / pow3[k]) % 3`. Iteration order is HIGH-first
-    // (digit `4 - n` at pass `n` for the 5-trit qs section, digit
-    // `3 - n` for the 4-trit qh section) so it round-trips against
-    // the in-tree `build_tq1_0_block` encoder used by the test suite.
-    //
-    // CAVEAT: internally consistent but NOT byte-validated against a
-    // live llama.cpp `dequantize_row_tq1_0`. If a real TQ1_0 GGUF
-    // produces gibberish, the most likely fix is to reverse the
-    // digit order — replace `POW3[4 - n]` with `POW3[n]` (qs) and
-    // `POW3[3 - n]` with `POW3[n]` (qh).
-    const POW3: [u32; 5] = [1, 3, 9, 27, 81];
+    // pow3[n] as u8 so the `byte * pow3[n]` product wraps mod 256,
+    // exactly like ggml's `uint8_t q`.
+    const POW3: [u8; 5] = [1, 3, 9, 27, 81];
     let n_blocks = bytes.len() / BLOCK_BYTES;
     debug_assert_eq!(bytes.len(), n_blocks * BLOCK_BYTES);
     debug_assert_eq!(out.len(), n_blocks * QK_K);
@@ -702,30 +732,31 @@ pub fn dequant_tq1_0(bytes: &[u8], out: &mut [f32]) {
         let qs = &bytes[block_off..block_off + 48];
         let qh = &bytes[block_off + 48..block_off + 52];
         let d = f16::from_le_bytes([bytes[block_off + 52], bytes[block_off + 53]]).to_f32();
-        // Chunk 0: qs[0..32], 5 trits per byte (high digit first).
-        for n in 0..5 {
-            let pow = POW3[4 - n];
+        // Chunk 0: qs[0..32], 5 trits per byte → 160 weights.
+        for &pow in POW3.iter() {
             for m in 0..32 {
-                let trit = ((qs[m] as u32 / pow) % 3) as i32;
-                out[o] = d * (trit - 1) as f32;
+                let q = qs[m].wrapping_mul(pow);
+                let xi = ((q as u16) * 3) >> 8;
+                out[o] = d * (xi as i32 - 1) as f32;
                 o += 1;
             }
         }
-        // Chunk 1: qs[32..48], 5 trits per byte (high digit first).
-        for n in 0..5 {
-            let pow = POW3[4 - n];
+        // Chunk 1: qs[32..48], 5 trits per byte → 80 weights.
+        for &pow in POW3.iter() {
             for m in 0..16 {
-                let trit = ((qs[32 + m] as u32 / pow) % 3) as i32;
-                out[o] = d * (trit - 1) as f32;
+                let q = qs[32 + m].wrapping_mul(pow);
+                let xi = ((q as u16) * 3) >> 8;
+                out[o] = d * (xi as i32 - 1) as f32;
                 o += 1;
             }
         }
-        // Tail: qh[0..4], 4 trits per byte (high digit first).
-        for n in 0..4 {
-            let pow = POW3[3 - n];
+        // Tail: qh[0..4], 4 trits per byte → 16 weights. Only the top
+        // 4 digit positions are used (POW3[0..4]).
+        for &pow in POW3[..4].iter() {
             for m in 0..4 {
-                let trit = ((qh[m] as u32 / pow) % 3) as i32;
-                out[o] = d * (trit - 1) as f32;
+                let q = qh[m].wrapping_mul(pow);
+                let xi = ((q as u16) * 3) >> 8;
+                out[o] = d * (xi as i32 - 1) as f32;
                 o += 1;
             }
         }
@@ -3157,51 +3188,42 @@ mod tests {
     // ---- TQ1_0 ----
 
     fn build_tq1_0_block(d: f32, trits: &[u8; 256]) -> Vec<u8> {
-        // Inverse of the canonical `dequant_tq1_0` — use the exact
-        // pow exponents the decoder uses (`POW3[4-n]` for qs,
-        // `POW3[3-n]` for qh) so the encoder/decoder pair round-trips
-        // identity. If the decoder's pow indexing is later flipped to
-        // low-first, mirror the change here.
+        // Inverse of the canonical `dequant_tq1_0` in ggml's
+        // fixed-point wire layout: per byte, assemble the base-3 value
+        // most-significant-trit first, then store `ceil(v * 256 / 243)`
+        // so the decoder's wrapping-multiply extraction reads each trit
+        // back. The 4-trit `qh` tail is shifted up one trit (`v *= 3`)
+        // so its digits occupy the top 4 positions. `trits` holds the
+        // stored ternary form {0,1,2} (decoded value = d * (trit - 1)).
         //
-        // Chunk 0: qs[0..32], 5 trits each → 160 outputs
-        // Chunk 1: qs[32..48], 5 trits each → 80 outputs
-        // Tail:    qh[0..4],   4 trits each → 16 outputs
-        // Total: 256 ✓
+        // Chunk 0: qs[0..32], 5 trits each → outputs `n*32 + m`
+        // Chunk 1: qs[32..48], 5 trits each → outputs `160 + n*16 + m`
+        // Tail:    qh[0..4],   4 trits each → outputs `240 + n*4 + j`
         let mut qs = [0u8; 48];
         let mut qh = [0u8; 4];
-        const POW3: [u32; 5] = [1, 3, 9, 27, 81];
-        let mut wi = 0usize;
-        for n in 0..5 {
-            let pow = POW3[4 - n];
-            for m in 0..32 {
-                let trit = trits[wi] as u32 & 0x3;
-                let mut cur = qs[m] as u32;
-                cur = cur.wrapping_add(trit * pow);
-                qs[m] = (cur & 0xFF) as u8;
-                wi += 1;
+        let ceil_scale = |v: u32| ((v * 256 + 242) / 243) as u8;
+        for m in 0..32 {
+            let mut v: u32 = 0;
+            for n in 0..5 {
+                v = v * 3 + (trits[n * 32 + m] as u32 & 0x3);
             }
+            qs[m] = ceil_scale(v);
         }
-        for n in 0..5 {
-            let pow = POW3[4 - n];
-            for m in 32..48 {
-                let trit = trits[wi] as u32 & 0x3;
-                let mut cur = qs[m] as u32;
-                cur = cur.wrapping_add(trit * pow);
-                qs[m] = (cur & 0xFF) as u8;
-                wi += 1;
+        for m in 0..16 {
+            let mut v: u32 = 0;
+            for n in 0..5 {
+                v = v * 3 + (trits[160 + n * 16 + m] as u32 & 0x3);
             }
+            qs[32 + m] = ceil_scale(v);
         }
-        for n in 0..4 {
-            let pow = POW3[3 - n];
-            for j in 0..4 {
-                let trit = trits[wi] as u32 & 0x3;
-                let mut cur = qh[j] as u32;
-                cur = cur.wrapping_add(trit * pow);
-                qh[j] = (cur & 0xFF) as u8;
-                wi += 1;
+        for j in 0..4 {
+            let mut v: u32 = 0;
+            for n in 0..4 {
+                v = v * 3 + (trits[240 + n * 4 + j] as u32 & 0x3);
             }
+            v *= 3;
+            qh[j] = ceil_scale(v);
         }
-        assert_eq!(wi, 256);
         let mut block = vec![0u8; 54];
         block[0..48].copy_from_slice(&qs);
         block[48..52].copy_from_slice(&qh);

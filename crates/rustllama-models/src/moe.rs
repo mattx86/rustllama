@@ -236,6 +236,81 @@ pub fn route_topk_into(
 /// call — kept as a convenience for tests / one-shot callers. The
 /// production forward path uses [`moe_ffn_one_into`] which writes
 /// into a caller-provided buffer and uses pre-allocated scratch.
+/// MoE disk-spill read-redirect (completes the opt-in spill feature #5).
+///
+/// When the disk-spill store is armed (`accel::moe_spill_enabled()`) and
+/// the routed expert whose gate weight is `w_gate_e` was evicted — and
+/// therefore spilled — reconstruct its three weight parts from the
+/// secondary store and hand back owned CPU [`Tensor`]s to matvec against,
+/// instead of re-faulting the weight pages from the GGUF mmap.
+///
+/// Returns `None` (caller then uses the mmap tensors, byte-identically)
+/// when the expert has no spill record (never evicted) or its gate weight
+/// isn't file-backed (`mmap_borrowed_ptr_len` is `None`, so it was never
+/// spill-eligible).
+///
+/// With the default `RUSTLLAMA_MOE_STORE_BITS=0` (native spill) the
+/// reconstructed bytes are bit-identical to the mmap, so matvec output is
+/// unchanged; a nonzero store-bits requantizes the cold tier (lossy — the
+/// caller's explicit opt-in).
+///
+/// The caller MUST gate this behind `accel::moe_spill_enabled()` so the
+/// default (feature-off) path never allocates or touches the store.
+///
+/// PERF: reconstruction reads the spill file + rebuilds tensors on every
+/// routed token that hits a spilled expert — it fires whenever a spill
+/// record exists, not only on a true residency miss. A residency-aware
+/// gate (reconstruct only when the pin cache reports the expert
+/// non-resident) is a follow-up that needs the pin cache to expose the
+/// hit/miss it already computes internally.
+fn moe_spill_redirect_expert(
+    w_gate_e: &Tensor,
+    w_up_e: &Tensor,
+    w_down_e: &Tensor,
+) -> Option<(Tensor, Tensor, Tensor)> {
+    // Key = the gate weight's mmap start address (the exact key the pin
+    // cache + spill store use). Non-mmap experts are never spilled.
+    let gate_key = w_gate_e.storage.mmap_borrowed_ptr_len()?.0 as usize;
+    let spilled = crate::accel::moe_spill_reconstruct(gate_key)?;
+    // Parts are (gate, up, down) in that order (see `SpilledExpert`).
+    let mut parts = spilled.parts.into_iter();
+    let g = spill_part_to_tensor(parts.next()?, w_gate_e)?;
+    let u = spill_part_to_tensor(parts.next()?, w_up_e)?;
+    let d = spill_part_to_tensor(parts.next()?, w_down_e)?;
+    Some((g, u, d))
+}
+
+/// Turn one reconstructed [`crate::accel::SpilledPart`] into an owned CPU
+/// [`Tensor`] shaped like `orig` (the mmap tensor it stands in for).
+fn spill_part_to_tensor(part: crate::accel::SpilledPart, orig: &Tensor) -> Option<Tensor> {
+    match part {
+        // Verbatim native bytes: reuse the ORIGINAL dtype + shape (the
+        // record's own `dtype` is a placeholder for native spill). Bytes
+        // equal the mmap bytes, so matvec output is unchanged.
+        crate::accel::SpilledPart::Native { bytes, .. } => {
+            if bytes.len() != orig.storage.len_bytes() {
+                return None;
+            }
+            Some(Tensor {
+                device: orig.device.clone(),
+                dtype: orig.dtype,
+                shape: orig.shape.clone(),
+                strides: orig.strides.clone(),
+                storage: rustllama_tensor::Storage::CpuOwned(bytes.into()),
+                name: orig.name.clone(),
+            })
+        }
+        // Low-bit spill decoded back to f32 (lossy vs the source): build
+        // an F32 tensor with the original shape.
+        crate::accel::SpilledPart::Dequant { values, .. } => {
+            if values.len() as u64 != orig.element_count() {
+                return None;
+            }
+            Some(Tensor::from_vec_f32(orig.name.clone(), orig.shape.clone(), values))
+        }
+    }
+}
+
 pub fn moe_ffn_one(
     hidden: &[f32],
     block: &LlamaMoeBlockWeights,
@@ -356,15 +431,36 @@ pub fn moe_ffn_one_into(
             // the matvecs so eviction can reclaim it once cold.
             let pin = crate::accel::expert_pin_touch(*expert_idx, w_gate_e, w_up_e, w_down_e);
 
-            // H4: fused gate+up matvec when the dtype has a fused
-            // kernel (currently Q4_K, Q8_0); otherwise falls back to
-            // two dispatches inside the helper. Saves one Level-Zero
-            // dispatch + activation re-load per expert.
-            crate::llama_arch::matvec_tensor_gate_up_fused_dispatch(
-                w_gate_e, w_up_e, hidden, gate_buf, up_buf, d_ff, d_model,
-            );
-            k::silu_mul_f32(gate_buf, up_buf, ff_buf);
-            crate::llama_arch::matvec_tensor_dispatch(w_down_e, ff_buf, down_buf, d_model, d_ff);
+            // MoE disk-spill read-redirect (feature #5, opt-in). Default-
+            // OFF: `moe_spill_enabled()` is false → this whole block is
+            // skipped and the mmap path below runs byte-identically. When
+            // armed, an evicted+spilled expert is served from the
+            // secondary store instead of re-faulting its GGUF pages.
+            let spilled = if crate::accel::moe_spill_enabled() {
+                moe_spill_redirect_expert(w_gate_e, w_up_e, w_down_e)
+            } else {
+                None
+            };
+            if let Some((sg, su, sd)) = spilled.as_ref() {
+                // Reconstructed tensors are freshly-allocated CPU buffers
+                // whose address changes per token; routing them through
+                // the USM dispatch (host-pointer-keyed weight cache) could
+                // serve a stale upload, so run the CPU kernels directly.
+                k::matvec_tensor(sg, hidden, gate_buf, d_ff, d_model);
+                k::matvec_tensor(su, hidden, up_buf, d_ff, d_model);
+                k::silu_mul_f32(gate_buf, up_buf, ff_buf);
+                k::matvec_tensor(sd, ff_buf, down_buf, d_model, d_ff);
+            } else {
+                // H4: fused gate+up matvec when the dtype has a fused
+                // kernel (currently Q4_K, Q8_0); otherwise falls back to
+                // two dispatches inside the helper. Saves one Level-Zero
+                // dispatch + activation re-load per expert.
+                crate::llama_arch::matvec_tensor_gate_up_fused_dispatch(
+                    w_gate_e, w_up_e, hidden, gate_buf, up_buf, d_ff, d_model,
+                );
+                k::silu_mul_f32(gate_buf, up_buf, ff_buf);
+                crate::llama_arch::matvec_tensor_dispatch(w_down_e, ff_buf, down_buf, d_model, d_ff);
+            }
 
             for j in 0..d_model {
                 out[j] += weight * down_buf[j];
@@ -471,11 +567,27 @@ pub fn moe_ffn_one_into_parts(
             // RUSTLLAMA_MOE_EXPERT_CACHE_MB=0 or weights aren't file-backed.
             let pin = crate::accel::expert_pin_touch(*expert_idx, w_gate_e, w_up_e, w_down_e);
 
-            crate::llama_arch::matvec_tensor_gate_up_fused_dispatch(
-                w_gate_e, w_up_e, hidden, gate_buf, up_buf, d_ff, d_model,
-            );
-            k::silu_mul_f32(gate_buf, up_buf, ff_buf);
-            crate::llama_arch::matvec_tensor_dispatch(w_down_e, ff_buf, down_buf, d_model, d_ff);
+            // MoE disk-spill read-redirect (feature #5, opt-in). Default-
+            // OFF (`moe_spill_enabled()` == false) → the mmap path below
+            // runs byte-identically. See `moe_ffn_one_into` for the full
+            // rationale (CPU-only kernels avoid the USM stale-upload race).
+            let spilled = if crate::accel::moe_spill_enabled() {
+                moe_spill_redirect_expert(w_gate_e, w_up_e, w_down_e)
+            } else {
+                None
+            };
+            if let Some((sg, su, sd)) = spilled.as_ref() {
+                k::matvec_tensor(sg, hidden, gate_buf, d_ff, d_model);
+                k::matvec_tensor(su, hidden, up_buf, d_ff, d_model);
+                k::silu_mul_f32(gate_buf, up_buf, ff_buf);
+                k::matvec_tensor(sd, ff_buf, down_buf, d_model, d_ff);
+            } else {
+                crate::llama_arch::matvec_tensor_gate_up_fused_dispatch(
+                    w_gate_e, w_up_e, hidden, gate_buf, up_buf, d_ff, d_model,
+                );
+                k::silu_mul_f32(gate_buf, up_buf, ff_buf);
+                crate::llama_arch::matvec_tensor_dispatch(w_down_e, ff_buf, down_buf, d_model, d_ff);
+            }
 
             for j in 0..d_model {
                 out[j] += weight * down_buf[j];

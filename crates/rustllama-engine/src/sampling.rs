@@ -666,7 +666,16 @@ fn logit_guard_enabled() -> bool {
     })
 }
 
-fn apply_all_penalties(
+/// Apply the repetition / frequency / presence penalties to `logits` in
+/// place, using `recent` as the token history. Shared with the
+/// speculative decode paths (`verify_and_commit_speculation` /
+/// `mtp_round`), which apply the SAME penalties to the target logits
+/// before their accept/reject verify so greedy-with-penalties stays
+/// token-for-token identical to the classic sampler (which calls this
+/// from `sample_with_grammar` before its greedy short-circuit). A no-op
+/// when all three penalties are at their defaults (`repeat == 1.0`,
+/// `frequency == 0.0`, `presence == 0.0`).
+pub(crate) fn apply_all_penalties(
     logits: &mut [f32],
     recent: &[u32],
     repeat: f32,

@@ -1223,40 +1223,70 @@ pub(crate) enum StreamEvent {
 }
 
 /// Incrementally parses a stream of text tokens, splitting it into plaintext
-/// content and `<tool_call>...</tool_call>` blocks. Token boundaries are not
-/// aligned with the markers, so the parser holds back trailing characters
-/// that could be the start of an OPEN/CLOSE tag.
+/// content and tool-call blocks. Token boundaries are not aligned with the
+/// markers, so the parser holds back trailing characters that could be the
+/// start of a marker.
 ///
-/// NOTE: this streaming parser recognizes ONLY the canonical Qwen /
-/// DeepSeek `<tool_call>` marker form. The non-streaming path
-/// ([`parse_tool_calls`]) additionally recovers the Llama-3.1
-/// `<|python_tag|>`, Mistral `[TOOL_CALLS]`, and bare-JSON encodings
-/// post-hoc; those can't be reliably detected incrementally (their
-/// framing only resolves once the whole message is in hand), so they
-/// are intentionally not handled here.
+/// Recognizes the same tool-call encodings as the non-streaming
+/// [`parse_tool_calls`], so the streaming and blocking paths agree:
+///   - the canonical Qwen / DeepSeek `<tool_call>...</tool_call>` block
+///     (fully incremental — content around it streams live);
+///   - the Llama-3.1 `<|python_tag|>` and Mistral `[TOOL_CALLS]` markers
+///     (content BEFORE the marker streams live; everything after is buffered
+///     and recovered at [`finish`](Self::finish) via `parse_tool_calls`, since
+///     the JSON payload only resolves once the whole tail is in hand);
+///   - a bare-JSON / ```json-fenced tool call that IS the whole message
+///     (detected when the stream starts with `{` / `[` / a code fence; the
+///     output is buffered and recovered at `finish`).
+///
+/// The marker/bare-JSON tail forms defer to `finish` on purpose — their
+/// framing can't be validated mid-stream — but the shared recovery keeps
+/// their result identical to the blocking path. Since this parser is only
+/// used on tool-enabled requests, buffering a JSON-leading response until
+/// `finish` is safe: a tools request emitting bare JSON is almost always a
+/// tool call.
 pub(crate) struct StreamingToolCallParser {
     state: ParserState,
-    /// Outside tool_call: text pending content emission.
-    /// Inside tool_call: JSON body accumulated so far.
+    /// Outside a block: text pending content emission. Inside `<tool_call>`:
+    /// JSON body so far. In the alt / maybe-JSON tail states: the accumulated
+    /// text parsed at `finish`.
     buf: String,
     next_call_index: usize,
+    /// Set once the first non-whitespace char is seen, so the "stream starts
+    /// with JSON / a fence" detection only fires at the very start.
+    started: bool,
+    /// The alt-format marker (`<|python_tag|>` / `[TOOL_CALLS]`) that put the
+    /// parser into `AltToEnd`, so `finish` can rebuild the original text.
+    alt_marker: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParserState {
     Outside,
+    /// Inside a `<tool_call>...</tool_call>` block.
     Inside,
+    /// After a `<|python_tag|>` / `[TOOL_CALLS]` marker — accumulate the rest
+    /// of the stream; parse it at `finish` via the shared recovery.
+    AltToEnd,
+    /// The stream began with `{` / `[` / a ``` fence — accumulate everything
+    /// and, at `finish`, run `parse_tool_calls`: emit tool calls if it
+    /// recovers any, else flush the buffer as plain content.
+    MaybeJson,
 }
 
 impl StreamingToolCallParser {
     const OPEN: &'static str = "<tool_call>";
     const CLOSE: &'static str = "</tool_call>";
+    const PYTAG: &'static str = "<|python_tag|>";
+    const MISTRAL: &'static str = "[TOOL_CALLS]";
 
     pub(crate) fn new() -> Self {
         Self {
             state: ParserState::Outside,
             buf: String::new(),
             next_call_index: 0,
+            started: false,
+            alt_marker: "",
         }
     }
 
@@ -1266,19 +1296,52 @@ impl StreamingToolCallParser {
         loop {
             match self.state {
                 ParserState::Outside => {
-                    if let Some(p) = self.buf.find(Self::OPEN) {
+                    // At the very start, route a JSON- / fence-leading stream
+                    // into `MaybeJson` so a bare-JSON or fenced tool call
+                    // (which carries no `<tool_call>` framing) is recovered
+                    // whole at `finish` rather than streamed out as content.
+                    if !self.started {
+                        match first_non_ws(&self.buf) {
+                            // Only whitespace so far — wait for a real char.
+                            None => break,
+                            Some(c) => {
+                                self.started = true;
+                                if c == '{' || c == '[' || c == '`' {
+                                    self.state = ParserState::MaybeJson;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    // Find the earliest recognized open marker.
+                    let hit = [Self::OPEN, Self::PYTAG, Self::MISTRAL]
+                        .into_iter()
+                        .filter_map(|m| self.buf.find(m).map(|p| (p, m)))
+                        .min_by_key(|(p, _)| *p);
+                    if let Some((p, marker)) = hit {
                         let before = self.buf[..p].to_string();
                         if !before.is_empty() {
                             events.push(StreamEvent::Content(before));
                         }
-                        let rest = self.buf[p + Self::OPEN.len()..].to_string();
+                        let rest = self.buf[p + marker.len()..].to_string();
                         self.buf = rest;
-                        self.state = ParserState::Inside;
+                        if marker == Self::OPEN {
+                            self.state = ParserState::Inside;
+                        } else {
+                            // `<|python_tag|>` / `[TOOL_CALLS]`: the JSON tail
+                            // is recovered at `finish`.
+                            self.alt_marker = marker;
+                            self.state = ParserState::AltToEnd;
+                        }
                         continue;
                     }
-                    // No complete OPEN — flush content up to a safe boundary
-                    // (holding back any prefix that could become "<tool_call>").
-                    let holdback = longest_suffix_that_is_prefix_of(&self.buf, Self::OPEN);
+                    // No complete marker — flush content up to a safe boundary,
+                    // holding back any suffix that could still become one of
+                    // the markers once more tokens arrive.
+                    let holdback = longest_suffix_that_is_prefix_of_any(
+                        &self.buf,
+                        &[Self::OPEN, Self::PYTAG, Self::MISTRAL],
+                    );
                     if holdback < self.buf.len() {
                         let cut = self.buf.len() - holdback;
                         let emit = self.buf[..cut].to_string();
@@ -1318,6 +1381,9 @@ impl StreamingToolCallParser {
                     // No CLOSE yet — wait for more tokens.
                     break;
                 }
+                // Alt-marker tail + maybe-JSON: accumulate to end of stream;
+                // both are resolved in `finish`.
+                ParserState::AltToEnd | ParserState::MaybeJson => break,
             }
         }
         events
@@ -1337,9 +1403,64 @@ impl StreamingToolCallParser {
                 let partial = format!("{}{}", Self::OPEN, self.buf);
                 events.push(StreamEvent::Content(partial));
             }
+            ParserState::AltToEnd => {
+                // Rebuild the original alt-format text (marker + tail) and
+                // reuse the non-streaming recovery so `<|python_tag|>` /
+                // `[TOOL_CALLS]` parse identically to the blocking path.
+                let full = format!("{}{}", self.alt_marker, self.buf);
+                events.extend(recover_streaming_tool_calls(&full, &mut self.next_call_index));
+            }
+            ParserState::MaybeJson => {
+                let full = std::mem::take(&mut self.buf);
+                events.extend(recover_streaming_tool_calls(&full, &mut self.next_call_index));
+            }
         }
         events
     }
+}
+
+/// The first non-whitespace `char` of `s`, or `None` when `s` is empty or all
+/// whitespace. Used to decide whether a stream begins with a JSON value / code
+/// fence (→ [`ParserState::MaybeJson`]).
+fn first_non_ws(s: &str) -> Option<char> {
+    s.chars().find(|c| !c.is_whitespace())
+}
+
+/// Run the shared non-streaming [`parse_tool_calls`] over a buffered tail and
+/// turn the result into streaming events: any leading content first, then a
+/// `ToolCallHeader` + `ToolCallArgs` pair per recovered call. When no call is
+/// recovered, the whole text is flushed as content so nothing is lost.
+fn recover_streaming_tool_calls(raw: &str, next_index: &mut usize) -> Vec<StreamEvent> {
+    let (content, calls) = parse_tool_calls(raw);
+    let mut events = Vec::new();
+    match calls {
+        Some(calls) if !calls.is_empty() => {
+            if let Some(c) = content {
+                if !c.is_empty() {
+                    events.push(StreamEvent::Content(c));
+                }
+            }
+            for call in calls {
+                let index = *next_index;
+                *next_index += 1;
+                events.push(StreamEvent::ToolCallHeader {
+                    index,
+                    id: call.id,
+                    name: call.function.name,
+                });
+                events.push(StreamEvent::ToolCallArgs {
+                    index,
+                    args: call.function.arguments,
+                });
+            }
+        }
+        _ => {
+            if !raw.is_empty() {
+                events.push(StreamEvent::Content(raw.to_string()));
+            }
+        }
+    }
+    events
 }
 
 fn parse_streaming_tool_call_body(body: &str, index: usize) -> Option<(String, String, String)> {
@@ -1366,6 +1487,18 @@ fn longest_suffix_that_is_prefix_of(s: &str, marker: &str) -> usize {
         }
     }
     0
+}
+
+/// Longest suffix of `s` that is a prefix of ANY of `markers` — the multi-
+/// marker generalization used by [`StreamingToolCallParser`] to hold back a
+/// tail that could still become `<tool_call>`, `<|python_tag|>`, or
+/// `[TOOL_CALLS]`.
+fn longest_suffix_that_is_prefix_of_any(s: &str, markers: &[&str]) -> usize {
+    markers
+        .iter()
+        .map(|m| longest_suffix_that_is_prefix_of(s, m))
+        .max()
+        .unwrap_or(0)
 }
 
 /// Pull tool calls out of the model's text output and return

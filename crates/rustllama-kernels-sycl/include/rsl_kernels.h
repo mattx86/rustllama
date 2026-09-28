@@ -324,6 +324,101 @@ void rsl_flash_attn_prefill_v3_usm(rsl_stream* s,
                                    int head_dim, int max_ctx,
                                    int kv_len_base, int n_new);
 
+/* Quantized-KV FlashAttention (F32 Q / F32 out, packed K/V dequantized
+ * on the fly). Byte-exact ports of the CPU reference kernels in
+ * rustllama-kernels-cpu (q4_0_kv.rs / nvfp4.rs / turboquant.rs): each
+ * work-item dequantizes one K (then V) row into a private buffer per kv
+ * position, then runs the same online-softmax recurrence as the F32
+ * flash entries. Shapes match the F32 entries — q/out F32
+ * `[..,n_heads,head_dim]`; k/v packed as `[n_kv_heads, max_ctx,
+ * bytes_per_row]`:
+ *   Q4_0  : bytes_per_row = (head_dim/32)*18, head_dim % 32 == 0
+ *   NVFP4 : bytes_per_row = (head_dim/16)*9,  head_dim % 16 == 0
+ *   TQ    : bytes_per_row = ceil(head_dim*bits/8), head_dim a power of
+ *           two, bits in {1,2,4,8}; per-row f32 scales in
+ *           k_scales_usm/v_scales_usm = `[n_kv_heads*max_ctx]` (indexed
+ *           kv_h*max_ctx + t, matching the packed row layout).
+ * head_dim is capped at 256; the kernel early-returns on larger /
+ * mis-shaped inputs so the caller falls back to CPU. All pointers are
+ * USM allocations on the bound device's context. */
+void rsl_flash_attn_decode_q4_0_usm(rsl_stream* s,
+                                    const float* q_usm,
+                                    const void* k_packed_usm,
+                                    const void* v_packed_usm,
+                                    float* out_usm,
+                                    int n_heads, int n_kv_heads,
+                                    int head_dim, int max_ctx, int kv_len);
+void rsl_flash_attn_prefill_q4_0_usm(rsl_stream* s,
+                                     const float* q_usm,
+                                     const void* k_packed_usm,
+                                     const void* v_packed_usm,
+                                     float* out_usm,
+                                     int n_heads, int n_kv_heads,
+                                     int head_dim, int max_ctx,
+                                     int kv_len_base, int n_new);
+void rsl_flash_attn_decode_nvfp4_usm(rsl_stream* s,
+                                     const float* q_usm,
+                                     const void* k_packed_usm,
+                                     const void* v_packed_usm,
+                                     float* out_usm,
+                                     int n_heads, int n_kv_heads,
+                                     int head_dim, int max_ctx, int kv_len);
+void rsl_flash_attn_prefill_nvfp4_usm(rsl_stream* s,
+                                      const float* q_usm,
+                                      const void* k_packed_usm,
+                                      const void* v_packed_usm,
+                                      float* out_usm,
+                                      int n_heads, int n_kv_heads,
+                                      int head_dim, int max_ctx,
+                                      int kv_len_base, int n_new);
+void rsl_flash_attn_decode_tq_usm(rsl_stream* s,
+                                  const float* q_usm,
+                                  const void* k_packed_usm,
+                                  const void* v_packed_usm,
+                                  const float* k_scales_usm,
+                                  const float* v_scales_usm,
+                                  int bits,
+                                  float* out_usm,
+                                  int n_heads, int n_kv_heads,
+                                  int head_dim, int max_ctx, int kv_len);
+void rsl_flash_attn_prefill_tq_usm(rsl_stream* s,
+                                   const float* q_usm,
+                                   const void* k_packed_usm,
+                                   const void* v_packed_usm,
+                                   const float* k_scales_usm,
+                                   const float* v_scales_usm,
+                                   int bits,
+                                   float* out_usm,
+                                   int n_heads, int n_kv_heads,
+                                   int head_dim, int max_ctx,
+                                   int kv_len_base, int n_new);
+/* Q8_0-KV FlashAttention: F32 Q / F32 out, i8 K/V slab + per-row f32 scale.
+ * Byte-exact port of the CPU gqa_attention_flash_decode_q8_0 / _prefill_q8_0.
+ * K/V are PLAIN i8 slabs [n_kv_heads, max_ctx, head_dim] (one byte per
+ * element, NOT the 34B/32 GGUF Q8_0 block layout); k_scales/v_scales are
+ * per-row absmax f32 [n_kv_heads*max_ctx] (indexed kv_h*max_ctx + t, same
+ * shape as the TQ scales). The kernel dots the raw i8 codes and factors the
+ * row scale out of the inner loop (no materialized row, no head_dim cap). */
+void rsl_flash_attn_decode_q8_0_usm(rsl_stream* s,
+                                    const float* q_usm,
+                                    const void* k_packed_usm,
+                                    const void* v_packed_usm,
+                                    const float* k_scales_usm,
+                                    const float* v_scales_usm,
+                                    float* out_usm,
+                                    int n_heads, int n_kv_heads,
+                                    int head_dim, int max_ctx, int kv_len);
+void rsl_flash_attn_prefill_q8_0_usm(rsl_stream* s,
+                                     const float* q_usm,
+                                     const void* k_packed_usm,
+                                     const void* v_packed_usm,
+                                     const float* k_scales_usm,
+                                     const float* v_scales_usm,
+                                     float* out_usm,
+                                     int n_heads, int n_kv_heads,
+                                     int head_dim, int max_ctx,
+                                     int kv_len_base, int n_new);
+
 /* USM-resident F16 GEMM: `C[M,N] = A[M,K] @ B[K,N]`, row-major.
  * Pointers MUST be USM allocations on the bound device's context.
  * Same algorithm as `rsl_gemm_f16` (naive tiled, conservative
@@ -929,6 +1024,171 @@ void rsl_embedding_lookup(rsl_stream* s,
 /* Sampling (single-token greedy for now; full sampler stays on the CPU). */
 void rsl_sample_argmax(rsl_stream* s,
                        const uint16_t* logits, int vocab, int32_t* out_token);
+
+/* ============================================================
+ * ABI sync block — declarations for kernels that live in
+ * cpp/rsl_kernels.def + the Rust FFI (src/lib.rs) but were
+ * historically missing here. Kept together so the header stays
+ * a faithful mirror of the .def export table (see the KEEP IN
+ * SYNC note at the top of the .def). Signatures below match the
+ * `extern "C"` definitions in cpp/rsl_kernels.cpp exactly.
+ * ============================================================ */
+
+/* CPU-parity packed matvecs (mirror the CPU scalar references in
+ * rustllama-kernels-cpu). `out[m] = W[m, :] · x[:]`, one work-item per
+ * output row. Legacy formats use 32-weight blocks; K-quants + PQ2_0 use
+ * their native block size. Same `lws` candidate set {16,32,64,128,256}
+ * as the other packed matvecs (0 = default). Byte layouts:
+ *   Q4_0:  18 B / 32   (f16 d + 16 nibble bytes; weight = d*(nib-8))
+ *   Q5_0:  22 B / 32   (f16 d + u32 qh + 16 nibbles; 5-bit signed -16)
+ *   Q4_1:  20 B / 32   (f16 d + f16 min + 16 nibbles; d*nib + min)
+ *   Q5_1:  24 B / 32   (f16 d + f16 min + u32 qh + 16 nibbles)
+ *   Q2_K:  84 B / 256  (16 scale bytes + 64 qs + f16 d + f16 dmin)
+ *   Q3_K: 110 B / 256  (32 hmask + 64 qs + 12 scales + f16 d)
+ *   Q8_K: 292 B / 256  (f32 d + 256 i8 + 16 i16 bsums; d is F32)
+ *   PQ2_0: 34 B / 128  (f16 d + 32 packed 2-bit; weight = d*(code-1)) */
+void rsl_matvec_q4_0_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm,
+                                    const float* x_usm, float* out_usm,
+                                    int M, int K, int lws);
+void rsl_matvec_q5_0_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm,
+                                    const float* x_usm, float* out_usm,
+                                    int M, int K, int lws);
+void rsl_matvec_q4_1_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm,
+                                    const float* x_usm, float* out_usm,
+                                    int M, int K, int lws);
+void rsl_matvec_q5_1_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm,
+                                    const float* x_usm, float* out_usm,
+                                    int M, int K, int lws);
+void rsl_matvec_q2_k_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm,
+                                    const float* x_usm, float* out_usm,
+                                    int M, int K, int lws);
+void rsl_matvec_q3_k_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm,
+                                    const float* x_usm, float* out_usm,
+                                    int M, int K, int lws);
+void rsl_matvec_q8_k_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm,
+                                    const float* x_usm, float* out_usm,
+                                    int M, int K, int lws);
+void rsl_matvec_pq2_0_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm,
+                                     const float* x_usm, float* out_usm,
+                                     int M, int K, int lws);
+
+/* Batched IQ packed matvecs — N contiguous input rows per launch.
+ * See the batched I/O layout note earlier in this header. */
+void rsl_matvec_iq1_s_packed_f32_batched_usm(rsl_stream* s, const void* w_bytes_usm,
+                                             const float* x_usm, float* out_usm,
+                                             int M, int K, int N, int lws);
+void rsl_matvec_iq2_xxs_packed_f32_batched_usm(rsl_stream* s, const void* w_bytes_usm,
+                                               const float* x_usm, float* out_usm,
+                                               int M, int K, int N, int lws);
+void rsl_matvec_iq1_m_packed_f32_batched_usm(rsl_stream* s, const void* w_bytes_usm,
+                                             const float* x_usm, float* out_usm,
+                                             int M, int K, int N, int lws);
+void rsl_matvec_iq2_xs_packed_f32_batched_usm(rsl_stream* s, const void* w_bytes_usm,
+                                              const float* x_usm, float* out_usm,
+                                              int M, int K, int N, int lws);
+void rsl_matvec_iq2_s_packed_f32_batched_usm(rsl_stream* s, const void* w_bytes_usm,
+                                             const float* x_usm, float* out_usm,
+                                             int M, int K, int N, int lws);
+void rsl_matvec_iq3_xxs_packed_f32_batched_usm(rsl_stream* s, const void* w_bytes_usm,
+                                               const float* x_usm, float* out_usm,
+                                               int M, int K, int N, int lws);
+void rsl_matvec_iq3_s_packed_f32_batched_usm(rsl_stream* s, const void* w_bytes_usm,
+                                             const float* x_usm, float* out_usm,
+                                             int M, int K, int N, int lws);
+
+/* Fused "add residual + RMSNorm" — F32 variant of rsl_add_rmsnorm_usm.
+ *   hidden[i] = hidden[i] + branch[i]; y_norm[i] = rmsnorm(hidden)[i]*w[i] */
+void rsl_add_rmsnorm_f32_usm(rsl_stream* s,
+                             float* hidden_usm, const float* branch_usm,
+                             const float* w_usm, float* y_norm_usm,
+                             int n_rows, int d, float eps);
+
+/* IQ1_S codebook search, all-three-deltas variant + imatrix-weighted
+ * companion. Each writes the (abs, pos, neg) winner triple per chunk. */
+void rsl_iq_search_8elt_delta_iq1s_all3(rsl_stream* s,
+                                        const float* targets, float delta,
+                                        const float* grid_f32,
+                                        uint16_t* out_grid_idx_abs, float* out_signed_score_abs, float* out_norm_sq_abs,
+                                        uint16_t* out_grid_idx_pos, float* out_signed_score_pos, float* out_norm_sq_pos,
+                                        uint16_t* out_grid_idx_neg, float* out_signed_score_neg, float* out_norm_sq_neg,
+                                        int n_chunks);
+void rsl_iq_search_8elt_delta_iq1s_all3_w(rsl_stream* s,
+                                          const float* targets, const float* weights, float delta,
+                                          const float* grid_f32,
+                                          uint16_t* out_grid_idx_abs, float* out_signed_score_abs, float* out_norm_sq_abs,
+                                          uint16_t* out_grid_idx_pos, float* out_signed_score_pos, float* out_norm_sq_pos,
+                                          uint16_t* out_grid_idx_neg, float* out_signed_score_neg, float* out_norm_sq_neg,
+                                          int n_chunks);
+
+/* G2: KV-cache Q8_0 quantize-on-store. Strided write into the KV cache
+ * layout [n_kv_heads × max_ctx × head_dim] from a contiguous activation
+ * buffer [n_new × n_kv_heads × head_dim]. */
+void rsl_kv_quantize_q8_0_store_usm(rsl_stream* s,
+                                    const float* src_usm,
+                                    int8_t* q_dst_usm,
+                                    float* scales_dst_usm,
+                                    int n_new, int n_kv_heads,
+                                    int head_dim, int max_ctx, int kv_len_base);
+
+/* G6: K-quant block encoders (analytical, USM-in/USM-out). `src_usm` is
+ * [n_blocks × 256] f32; `dst_usm` receives the packed block bytes. */
+void rsl_encode_q6_k_blocks_usm(rsl_stream* s, const float* src_usm, uint8_t* dst_usm, int n_blocks);
+void rsl_encode_q3_k_blocks_usm(rsl_stream* s, const float* src_usm, uint8_t* dst_usm, int n_blocks);
+void rsl_encode_q4_k_blocks_usm(rsl_stream* s, const float* src_usm, uint8_t* dst_usm, int n_blocks);
+void rsl_encode_q5_k_blocks_usm(rsl_stream* s, const float* src_usm, uint8_t* dst_usm, int n_blocks);
+
+/* H4: gate+up FUSED matvec — one launch computes both gate_out[m] and
+ * up_out[m] against the shared x_usm row. Per packed-quant dtype. */
+void rsl_matvec_q4_k_gate_up_fused_usm(rsl_stream* s, const void* gate_w_bytes_usm, const void* up_w_bytes_usm, const float* x_usm, float* gate_out_usm, float* up_out_usm, int M, int K, int lws);
+void rsl_matvec_q8_0_gate_up_fused_usm(rsl_stream* s, const void* gate_w_bytes_usm, const void* up_w_bytes_usm, const float* x_usm, float* gate_out_usm, float* up_out_usm, int M, int K, int lws);
+void rsl_matvec_q5_k_gate_up_fused_usm(rsl_stream* s, const void* gate_w_bytes_usm, const void* up_w_bytes_usm, const float* x_usm, float* gate_out_usm, float* up_out_usm, int M, int K, int lws);
+void rsl_matvec_q6_k_gate_up_fused_usm(rsl_stream* s, const void* gate_w_bytes_usm, const void* up_w_bytes_usm, const float* x_usm, float* gate_out_usm, float* up_out_usm, int M, int K, int lws);
+void rsl_matvec_iq4_nl_gate_up_fused_usm(rsl_stream* s, const void* gate_w_bytes_usm, const void* up_w_bytes_usm, const float* x_usm, float* gate_out_usm, float* up_out_usm, int M, int K, int lws);
+void rsl_matvec_iq4_xs_gate_up_fused_usm(rsl_stream* s, const void* gate_w_bytes_usm, const void* up_w_bytes_usm, const float* x_usm, float* gate_out_usm, float* up_out_usm, int M, int K, int lws);
+void rsl_matvec_iq1_s_gate_up_fused_usm(rsl_stream* s, const void* gate_w_bytes_usm, const void* up_w_bytes_usm, const float* x_usm, float* gate_out_usm, float* up_out_usm, int M, int K, int lws);
+void rsl_matvec_iq2_xxs_gate_up_fused_usm(rsl_stream* s, const void* gate_w_bytes_usm, const void* up_w_bytes_usm, const float* x_usm, float* gate_out_usm, float* up_out_usm, int M, int K, int lws);
+void rsl_matvec_iq1_m_gate_up_fused_usm(rsl_stream* s, const void* gate_w_bytes_usm, const void* up_w_bytes_usm, const float* x_usm, float* gate_out_usm, float* up_out_usm, int M, int K, int lws);
+void rsl_matvec_iq2_xs_gate_up_fused_usm(rsl_stream* s, const void* gate_w_bytes_usm, const void* up_w_bytes_usm, const float* x_usm, float* gate_out_usm, float* up_out_usm, int M, int K, int lws);
+void rsl_matvec_iq2_s_gate_up_fused_usm(rsl_stream* s, const void* gate_w_bytes_usm, const void* up_w_bytes_usm, const float* x_usm, float* gate_out_usm, float* up_out_usm, int M, int K, int lws);
+void rsl_matvec_iq3_xxs_gate_up_fused_usm(rsl_stream* s, const void* gate_w_bytes_usm, const void* up_w_bytes_usm, const float* x_usm, float* gate_out_usm, float* up_out_usm, int M, int K, int lws);
+void rsl_matvec_iq3_s_gate_up_fused_usm(rsl_stream* s, const void* gate_w_bytes_usm, const void* up_w_bytes_usm, const float* x_usm, float* gate_out_usm, float* up_out_usm, int M, int K, int lws);
+void rsl_matvec_ptq1_0_gate_up_fused_usm(rsl_stream* s, const void* gate_w_bytes_usm, const void* up_w_bytes_usm, const float* x_usm, float* gate_out_usm, float* up_out_usm, int M, int K, int lws);
+
+/* H6: fused matvec + residual-add + RMSNorm (post-attn norm site). One
+ * workgroup per token; hidden_usm is read+written, y_norm_usm receives
+ * the normalized+scaled output. Per packed-quant dtype. */
+void rsl_matvec_q4_k_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm, const float* attn_usm, float* hidden_usm, const float* w_norm_usm, float* y_norm_usm, int M, int K, float eps, int lws);
+void rsl_matvec_q8_0_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm, const float* attn_usm, float* hidden_usm, const float* w_norm_usm, float* y_norm_usm, int M, int K, float eps, int lws);
+void rsl_matvec_q5_k_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm, const float* attn_usm, float* hidden_usm, const float* w_norm_usm, float* y_norm_usm, int M, int K, float eps, int lws);
+void rsl_matvec_q6_k_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm, const float* attn_usm, float* hidden_usm, const float* w_norm_usm, float* y_norm_usm, int M, int K, float eps, int lws);
+void rsl_matvec_iq4_nl_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm, const float* attn_usm, float* hidden_usm, const float* w_norm_usm, float* y_norm_usm, int M, int K, float eps, int lws);
+void rsl_matvec_iq4_xs_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm, const float* attn_usm, float* hidden_usm, const float* w_norm_usm, float* y_norm_usm, int M, int K, float eps, int lws);
+void rsl_matvec_iq1_s_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm, const float* attn_usm, float* hidden_usm, const float* w_norm_usm, float* y_norm_usm, int M, int K, float eps, int lws);
+void rsl_matvec_iq1_m_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm, const float* attn_usm, float* hidden_usm, const float* w_norm_usm, float* y_norm_usm, int M, int K, float eps, int lws);
+void rsl_matvec_iq2_xxs_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm, const float* attn_usm, float* hidden_usm, const float* w_norm_usm, float* y_norm_usm, int M, int K, float eps, int lws);
+void rsl_matvec_iq2_xs_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm, const float* attn_usm, float* hidden_usm, const float* w_norm_usm, float* y_norm_usm, int M, int K, float eps, int lws);
+void rsl_matvec_iq2_s_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm, const float* attn_usm, float* hidden_usm, const float* w_norm_usm, float* y_norm_usm, int M, int K, float eps, int lws);
+void rsl_matvec_iq3_xxs_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm, const float* attn_usm, float* hidden_usm, const float* w_norm_usm, float* y_norm_usm, int M, int K, float eps, int lws);
+void rsl_matvec_iq3_s_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm, const float* attn_usm, float* hidden_usm, const float* w_norm_usm, float* y_norm_usm, int M, int K, float eps, int lws);
+void rsl_matvec_ptq1_0_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm, const float* attn_usm, float* hidden_usm, const float* w_norm_usm, float* y_norm_usm, int M, int K, float eps, int lws);
+
+/* H8: F16-input mixed-precision matvec. `x_f16` is the activation vector
+ * as F16 bits; weights stay packed, accumulator + output stay F32. Gated
+ * behind RUSTLLAMA_MIXED_PRECISION_MATVEC at the call site. */
+void rsl_matvec_q8_0_f16in_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm, const uint16_t* x_f16, float* out_usm, int M, int K, int lws);
+void rsl_matvec_q4_k_f16in_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm, const uint16_t* x_f16, float* out_usm, int M, int K, int lws);
+void rsl_matvec_q5_k_f16in_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm, const uint16_t* x_f16, float* out_usm, int M, int K, int lws);
+void rsl_matvec_q6_k_f16in_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm, const uint16_t* x_f16, float* out_usm, int M, int K, int lws);
+void rsl_matvec_iq4_nl_f16in_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm, const uint16_t* x_f16, float* out_usm, int M, int K, int lws);
+void rsl_matvec_iq4_xs_f16in_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm, const uint16_t* x_f16, float* out_usm, int M, int K, int lws);
+void rsl_matvec_iq1_s_f16in_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm, const uint16_t* x_f16, float* out_usm, int M, int K, int lws);
+void rsl_matvec_iq1_m_f16in_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm, const uint16_t* x_f16, float* out_usm, int M, int K, int lws);
+void rsl_matvec_iq2_xxs_f16in_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm, const uint16_t* x_f16, float* out_usm, int M, int K, int lws);
+void rsl_matvec_iq2_xs_f16in_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm, const uint16_t* x_f16, float* out_usm, int M, int K, int lws);
+void rsl_matvec_iq2_s_f16in_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm, const uint16_t* x_f16, float* out_usm, int M, int K, int lws);
+void rsl_matvec_iq3_xxs_f16in_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm, const uint16_t* x_f16, float* out_usm, int M, int K, int lws);
+void rsl_matvec_iq3_s_f16in_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm, const uint16_t* x_f16, float* out_usm, int M, int K, int lws);
+void rsl_matvec_ptq1_0_f16in_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm, const uint16_t* x_f16, float* out_usm, int M, int K, int lws);
 
 /* G5: K-quant → F32 dequant kernels (USM-in / USM-out). One work-item
  * per 256-element super-block. `bytes_usm` and `out_usm` are caller-

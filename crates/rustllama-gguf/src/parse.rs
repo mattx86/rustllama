@@ -277,6 +277,7 @@ impl GgmlType {
                 | Self::Q5_0
                 | Self::Q5_1
                 | Self::Q8_0
+                | Self::Q8_1
                 | Self::Q8_K
                 | Self::Q2_K
                 | Self::Q3_K
@@ -392,13 +393,17 @@ impl<'a> Cursor<'a> {
         Self { buf, pos: 0 }
     }
     fn need(&self, n: usize) -> Result<()> {
-        if self.pos + n > self.buf.len() {
-            Err(GgufError::UnexpectedEof {
+        // `n` can originate from an untrusted u64 length prefix (string
+        // / array / tensor-dim counts), so `self.pos + n` could wrap on
+        // a 64-bit `usize` and spuriously pass the bounds check. Use a
+        // checked add and treat overflow as EOF — the requested span
+        // cannot possibly fit in the buffer.
+        match self.pos.checked_add(n) {
+            Some(end) if end <= self.buf.len() => Ok(()),
+            _ => Err(GgufError::UnexpectedEof {
                 offset: self.pos,
                 need: n,
-            })
-        } else {
-            Ok(())
+            }),
         }
     }
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
@@ -554,6 +559,13 @@ pub(crate) fn parse(buf: &[u8]) -> Result<Parsed> {
         });
     }
 
+    // `general.alignment` is attacker-controlled metadata. Reject
+    // zero (division by zero below) and non-powers-of-two (ggml only
+    // ever writes powers of two, and the padding math assumes it)
+    // before using it as a divisor.
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return Err(GgufError::InvalidAlignment(alignment));
+    }
     let header_end = cur.pos as u64;
     let pad = (alignment - (header_end % alignment)) % alignment;
     let data_start = header_end + pad;

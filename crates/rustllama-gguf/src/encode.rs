@@ -425,6 +425,25 @@ mod tests {
         }
     }
 
+    /// `dequant_q8_1` must reconstruct the same per-weight values as
+    /// `dequant_q8_0` (the `s` field is redundant precomputed state and
+    /// must not perturb decode). Pins the reader that pairs with
+    /// `encode_q8_1`.
+    #[test]
+    fn q8_1_dequant_matches_q8_0_dequant() {
+        let n = 3 * QK;
+        let src = make_row(n, 3.0, 13);
+        let mut q80 = vec![0u8; 3 * BLOCK_Q8_0_BYTES];
+        encode_q8_0(&src, &mut q80);
+        let mut q81 = vec![0u8; 3 * BLOCK_Q8_1_BYTES];
+        encode_q8_1(&src, &mut q81);
+        let mut d80 = vec![0f32; n];
+        let mut d81 = vec![0f32; n];
+        dequant::dequant_q8_0(&q80, &mut d80);
+        dequant::dequant_q8_1(&q81, &mut d81);
+        assert_eq!(d80, d81, "q8_1 decode must equal q8_0 decode");
+    }
+
     #[test]
     fn q4_0_round_trip_within_bound() {
         // 4-bit symmetric: step ≈ 2*amp / 16; bound ~2*step.

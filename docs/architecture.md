@@ -47,8 +47,10 @@ aarch64 build); on aarch64 `rustllama-kernels-sycl` compiles a no-op stub,
 so inference runs on CPU + CUDA. CPU kernels use **AVX2 on x86_64** and
 **NEON on aarch64** (scalar fallback elsewhere). The CUDA backend is wired
 into the forward pass — packed matvecs dispatch to a device-resident
-weight cache on the NVIDIA GPU (inert when none is present); validate its
-kernels against the CPU reference with `rustllama doctor --cuda-parity`.
+weight cache on the NVIDIA GPU (inert when none is present). Validate each
+backend's kernels against the CPU reference with `rustllama doctor
+--cuda-parity` (CUDA) or `--sycl-parity` (SYCL); `--cpu-parity` self-checks the
+CPU SIMD / parallel matvec paths against a naive scalar reference.
 One physical Intel GPU exposed via both Level Zero and OpenCL is reported
 as a single device, and dispatch prefers Level Zero.
 
@@ -67,8 +69,9 @@ as a single device, and dispatch prefers Level Zero.
    delete/search` for saved history), `gui`, `generate`, `embed`,
    `model` (a group: `list`/`pull`/`rm`/`use`/`inspect`/`load`/`unload`/
    `default`/`bench`), `config`, `tune` (`--show` for cached state),
-   `quantize`, `imatrix`, `kv-calibrate`, `doctor` (`--cuda-parity` runs
-   CUDA-vs-CPU kernel parity), `lsp`, `version`. Every command and
+   `quantize`, `imatrix`, `kv-calibrate`, `doctor` (`--sycl-parity` /
+   `--cuda-parity` / `--cpu-parity` run per-backend kernel parity), `lsp`,
+   `version`. Every command and
    subcommand also takes `--help` / a `help` subcommand. Run
    `rustllama <cmd> --help` for the authoritative set.
 8. **Autotuner** is a first-class subsystem (`rustllama-tuner`).

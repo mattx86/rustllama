@@ -1,4 +1,4 @@
-//! GPU kernel parity + stability harness (`rustllama doctor --gpu-parity`).
+//! SYCL kernel parity + stability harness (`rustllama doctor --sycl-parity`).
 //!
 //! Runs every GPU kernel family against its CPU reference on identical
 //! inputs and reports a per-kernel verdict. Born from the 2026-09-06
@@ -11,7 +11,7 @@
 //! **Subprocess isolation**: a kernel that kills the device poisons
 //! the whole SYCL context — an in-process loop would die with its
 //! patient and never report the rest of the matrix. So the parent
-//! spawns `rustllama doctor --gpu-parity-probe <name>` per kernel:
+//! spawns `rustllama doctor --sycl-parity-probe <name>` per kernel:
 //! the child prints one `PARITY <name> <verdict> ...` line; a crash
 //! or hang is the child's problem and becomes a CRASH / HANG verdict
 //! in the parent's table.
@@ -757,7 +757,7 @@ pub fn run_parent() -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     let names = probe_names();
     println!(
-        "GPU kernel parity harness — {} probes, one subprocess each \
+        "SYCL kernel parity harness — {} probes, one subprocess each \
          (a probe that crashes or hangs the device only takes its child down)",
         names.len()
     );
@@ -771,7 +771,7 @@ pub fn run_parent() -> anyhow::Result<()> {
     let mut counts: std::collections::BTreeMap<&'static str, usize> = Default::default();
     for name in &names {
         let mut child = std::process::Command::new(&exe)
-            .args(["doctor", "--gpu-parity-probe", name])
+            .args(["doctor", "--sycl-parity-probe", name])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()?;
@@ -1418,6 +1418,164 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         );
     } else if counts.get("OK").copied().unwrap_or(0) > 0 {
         println!("\nall exercised CUDA kernels match their CPU references.");
+    }
+    Ok(())
+}
+
+// ===============================================================
+// CPU parity (`rustllama doctor --cpu-parity`)
+// ===============================================================
+//
+// The CPU kernel layer is the *reference* the SYCL and CUDA harnesses
+// above grade their GPU kernels against — so a CPU self-check can't
+// compare the CPU against a GPU. What it CAN do is exercise the CPU
+// layer's own fast paths against a slow, obviously-correct reference:
+// the SIMD (AVX-512 / AVX2 / NEON) and rayon-parallel matvecs against a
+// naive scalar loop, on THIS host's actual CPU. Which path a kernel
+// takes is chosen at runtime by `is_x86_feature_detected!`, so the SIMD
+// code that actually ran is a property of the machine, not the build —
+// exactly what a `doctor` self-test should confirm. Runs in-process (no
+// device to lose); the per-family PASS/FAIL output mirrors the CUDA
+// harness above (reusing `cu_grade` / `cu_emit` / `compare`).
+//
+// Only the matvec families carry a SIMD/parallel seam worth checking
+// (f32, f16, and the PTQ1_0 ternary fastdot/batched paths). The
+// scalar-only quant matvecs (Q*/IQ*) ARE the reference here — there is
+// no second CPU implementation to compare them against — so they are
+// validated indirectly by the SYCL/CUDA harnesses (which grade the GPU
+// kernels against them) and by the crate's own unit tests, not here.
+
+/// Naive scalar f32 matvec — the obviously-correct reference the SIMD
+/// and rayon-parallel f32 paths are graded against. Deliberately
+/// un-optimized (single accumulator, source order) so it shares no
+/// code with the kernels under test.
+fn ref_matvec_f32_scalar(w: &[f32], x: &[f32], out: &mut [f32], m: usize, k: usize) {
+    for i in 0..m {
+        let row = &w[i * k..(i + 1) * k];
+        let mut acc = 0f32;
+        for p in 0..k {
+            acc += row[p] * x[p];
+        }
+        out[i] = acc;
+    }
+}
+
+/// Which CPU SIMD ISA the matvec kernels will dispatch to on this host,
+/// for the harness banner. Informational only — the kernels detect the
+/// same features the same way at call time.
+fn cpu_simd_level() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx512f") {
+            "AVX-512"
+        } else if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            "AVX2+FMA"
+        } else {
+            "scalar (no AVX2/FMA)"
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        "NEON"
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        "scalar"
+    }
+}
+
+pub fn run_cpu_parity() -> anyhow::Result<()> {
+    println!(
+        "CPU kernel parity harness (matvec SIMD / rayon-parallel paths vs a naive scalar \
+         reference, in-process)"
+    );
+    println!("CPU SIMD dispatch on this host: {}", cpu_simd_level());
+    println!();
+    let mut counts: std::collections::BTreeMap<&'static str, usize> = Default::default();
+
+    // ---- Dense f32 matvec: SIMD-serial + rayon-parallel vs naive scalar ----
+    // MV_M (512) is above the parallel crossover (256 default), so the
+    // auto-dispatcher `matvec_f32` takes its rayon path here.
+    {
+        let (m, kd) = (MV_M, MV_K);
+        let w = gen_x(m * kd, 101);
+        let x = gen_x(kd, 103);
+        let mut refv = vec![0f32; m];
+        ref_matvec_f32_scalar(&w, &x, &mut refv, m, kd);
+
+        let mut simd = vec![0f32; m];
+        k::matvec_f32_serial(&w, &x, &mut simd, m, kd);
+        cu_grade("matvec:f32 simd-serial", &simd, &refv, 0.9999, 0.01, &mut counts);
+
+        let mut par = vec![0f32; m];
+        k::matvec_f32(&w, &x, &mut par, m, kd);
+        cu_grade("matvec:f32 parallel", &par, &refv, 0.9999, 0.01, &mut counts);
+    }
+
+    // ---- F16 matvec: SIMD-serial + rayon-parallel vs the naive scalar gemm ----
+    // `gemm_f16_w_f32_a` (N=1) is the always-scalar reference the serial
+    // matvec itself falls back to when no AVX2/F16C is detected.
+    {
+        let (m, kd) = (MV_M, MV_K);
+        let wf = gen_x(m * kd, 111);
+        let w: Vec<half::f16> = wf.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let x = gen_x(kd, 113);
+        let mut refv = vec![0f32; m];
+        k::gemm_f16_w_f32_a(&w, &x, &mut refv, m, 1, kd);
+
+        let mut simd = vec![0f32; m];
+        k::matvec_f16_w_f32_a_serial(&w, &x, &mut simd, m, kd);
+        cu_grade("matvec:f16 simd-serial", &simd, &refv, 0.9999, 0.01, &mut counts);
+
+        let mut par = vec![0f32; m];
+        k::matvec_f16_w_f32_a(&w, &x, &mut par, m, kd);
+        cu_grade("matvec:f16 parallel", &par, &refv, 0.9999, 0.01, &mut counts);
+    }
+
+    // ---- PTQ1_0 ternary: production fastdot + batched vs the reference kernel ----
+    // Reuses the SYCL harness's quant-byte synthesis + finite-reference
+    // guard. `matvec_ptq1_0_w_f32_a` is the reference (AVX2 → scalar);
+    // `_fast` and `_batched` are the reassociated SIMD paths, gated to
+    // tolerance (not bitwise) by their own contracts.
+    {
+        let layout = LAYOUTS
+            .iter()
+            .find(|l| l.name == "ptq1_0")
+            .expect("ptq1_0 layout");
+        let x = gen_x(MV_K, 121);
+        match finite_ref(layout, cpu_matvec_for("ptq1_0"), &x) {
+            Some((w, refv)) => {
+                let mut fast = vec![0f32; MV_M];
+                k::matvec_ptq1_0_w_f32_a_fast(&w, &x, &mut fast, MV_M, MV_K);
+                cu_grade("matvec:ptq1_0 fastdot", &fast, &refv, 0.999, 0.02, &mut counts);
+
+                // Batched decode/replay path, single activation row.
+                let mut batched = vec![0f32; MV_M];
+                k::matvec_ptq1_0_w_f32_a_batched(&w, &x, &mut batched, MV_M, MV_K, 1);
+                cu_grade("matvec:ptq1_0 batched", &batched, &refv, 0.999, 0.02, &mut counts);
+            }
+            None => {
+                cu_emit("matvec:ptq1_0", "SKIP", "no-finite-reference");
+                *counts.entry("SKIP").or_default() += 1;
+            }
+        }
+    }
+
+    println!();
+    let summary: Vec<String> = counts.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    println!("summary: {}", summary.join("  "));
+    let bad = counts.get("MISCOMPUTE").copied().unwrap_or(0);
+    if bad > 0 {
+        println!(
+            "\n{bad} CPU matvec path(s) diverged from the scalar reference beyond tolerance \
+             (MISCOMPUTE) — a SIMD/parallel kernel is miscomputing on this CPU. Investigate \
+             before trusting the CPU layer as the parity reference / inference fallback."
+        );
+    } else if counts.get("OK").copied().unwrap_or(0) > 0 {
+        println!(
+            "\nall exercised CPU SIMD / parallel matvec paths match the scalar reference on \
+             this host."
+        );
     }
     Ok(())
 }

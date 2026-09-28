@@ -151,9 +151,10 @@ commands in the chat REPL/TUI mirror this verb set):
   `--flash-attention`, `--kv-layout`, `--placement`, `--batch-size`,
   `--threads`, `--moe-placement`, `--flash-kv-min`, etc.
 - `quantize` / `imatrix` / `kv-calibrate` — quantization + calibration tooling.
-- `doctor` — diagnostics. `--sycl-smoke`, `--gpu-parity`, `--cuda-parity` run
-  the kernel parity/stability harnesses (each probe subprocessed so a
-  DEVICE_LOST only kills its child).
+- `doctor` — diagnostics. `--sycl-smoke`, `--sycl-parity`, `--cuda-parity`,
+  `--cpu-parity` run the kernel parity/stability harnesses against the CPU
+  reference (`--sycl-parity` subprocesses each probe so a DEVICE_LOST only
+  kills its child; `--cuda-parity` and `--cpu-parity` run in-process).
 - `gui` — launch the Tauri GUI. `lsp` — LSP bridge over stdio. `version`.
 
 ## Config & server
@@ -184,9 +185,11 @@ they work on SYCL/CUDA/CPU hosts alike) and auto-apply on next load per the
 ## Testing & validation
 
 - `cargo test --lib -p <crate>` for the 8 toolchain-free crates (what CI runs).
-- Kernel correctness: `rustllama doctor --gpu-parity` (SYCL) /
-  `--cuda-parity` (CUDA) — every kernel family vs its CPU reference on identical
-  inputs, per-probe subprocessed.
+- Kernel correctness: `rustllama doctor --sycl-parity` (SYCL, per-probe
+  subprocessed) / `--cuda-parity` (CUDA, in-process) — every GPU kernel family
+  vs its CPU reference on identical inputs. `--cpu-parity` self-checks the CPU
+  matvec SIMD / rayon-parallel paths against a naive scalar reference on this
+  host (f32, f16, PTQ1_0 ternary fastdot/batched).
 - GPU/multi-GPU code that can't be exercised on available hardware is validated
   by parity harness + review; on-device confirmation happens on the user's HW.
 - Windows hang debugging: attach `cdb.exe` non-invasively for symbolized stacks;

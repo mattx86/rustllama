@@ -9,6 +9,12 @@
 //!   out_features]`). The bit order inside the int32 is little-endian
 //!   nibbles in both cases: bits `0..4` hold lane 0, bits `4..8` hold
 //!   lane 1, …
+//! * **Output-column interleave (AWQ only).** autoawq's
+//!   `WQLinear_GEMM` does NOT lay the 8 nibbles of a pack out in
+//!   output-column order — it permutes them by
+//!   `AWQ_PACK_ORDER = [0, 2, 4, 6, 1, 3, 5, 7]`. So the nibble at bit
+//!   position `k` is output column `pack*8 + AWQ_PACK_ORDER[k]`, for
+//!   both `qweight` and `qzeros`. GPTQ packs sequentially (identity).
 //! * **Group mapping.** AWQ uses fixed-stride groups
 //!   (`g = i / group_size`); GPTQ uses an explicit per-row remap
 //!   table `g_idx[i]` so the algorithm can apply "actorder" grouping
@@ -25,6 +31,15 @@
 
 use half::f16;
 use thiserror::Error;
+
+/// autoawq's `WQLinear_GEMM` packs the 8 output-column nibbles of each
+/// int32 in this interleaved order rather than sequentially: the nibble
+/// at bit position `k` (`(pack >> (k * 4)) & 0xF`) holds output column
+/// `pack_base + AWQ_PACK_ORDER[k]`. Applies to BOTH `qweight` and
+/// `qzeros`. GPTQ uses plain sequential order, so this table is
+/// AWQ-only. It is the inverse of the `[0, 4, 1, 5, 2, 6, 3, 7]`
+/// reverse-order permutation autoawq applies when it unpacks.
+pub(crate) const AWQ_PACK_ORDER: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
 
 #[derive(Debug, Error)]
 pub enum DequantError {
@@ -84,9 +99,10 @@ pub enum DequantError {
 /// # Layout (AWQ convention, matching autoawq's `WQLinear_GEMM`)
 ///
 /// - `qweight`: `[in_features, out_features / 8]` row-major i32. Each
-///   int32 packs 8 4-bit weights along the **output** axis:
-///   `qweight[i, j]` carries `w[i, j*8 + 0..8]` in nibbles
-///   `0..4, 4..8, 8..12, …, 28..32`.
+///   int32 packs 8 4-bit weights along the **output** axis in the
+///   interleaved `AWQ_PACK_ORDER` (see module docs): the nibble at bit
+///   position `k` is output column `jp*8 + AWQ_PACK_ORDER[k]`, NOT
+///   `jp*8 + k`.
 /// - `scales`: `[in_features / group_size, out_features]` row-major
 ///   `f16`.
 /// - `qzeros`: `[in_features / group_size, out_features / 8]` row-major
@@ -97,12 +113,14 @@ pub enum DequantError {
 ///
 /// # Formula
 ///
-/// For each `(i, j)`:
+/// For each row `i` and pack `jp` we walk the 8 nibbles `k = 0..8`;
+/// nibble `k` carries output column `j = jp*8 + AWQ_PACK_ORDER[k]`:
 ///
 /// ```text
 ///   group       = i / group_size
-///   weight_int4 = nibble j%8 of qweight[i, j/8]
-///   zero_int4   = nibble j%8 of qzeros[group, j/8]
+///   j           = jp*8 + AWQ_PACK_ORDER[k]
+///   weight_int4 = nibble k of qweight[i, jp]
+///   zero_int4   = nibble k of qzeros[group, jp]
 ///   out[i, j]   = (weight_int4 - zero_int4) * scales[group, j]
 /// ```
 ///
@@ -169,7 +187,10 @@ pub fn dequant_awq_int4_to_f16(
                 let shift = (k * 4) as u32;
                 let w_int4 = ((w_pack >> shift) & 0xF) as i32;
                 let z_int4 = ((z_pack >> shift) & 0xF) as i32;
-                let j = jp * LANES + k;
+                // autoawq interleaves the 8 output columns of a pack;
+                // the nibble at position `k` is column AWQ_PACK_ORDER[k]
+                // (same permutation for qweight and qzeros).
+                let j = jp * LANES + AWQ_PACK_ORDER[k];
                 let scale = scales[g * out_features + j].to_f32();
                 let val = (w_int4 - z_int4) as f32 * scale;
                 out[i * out_features + j] = f16::from_f32(val);
@@ -313,19 +334,21 @@ mod tests {
         acc as i32
     }
 
-    /// Reference AWQ dequant of one row segment: returns the
-    /// expected f16 row for `(i, j_base..j_base+8)` given the int4
-    /// weight nibbles, int4 zero nibbles, and the per-output-column
-    /// scale row.
+    /// Reference AWQ dequant of one row segment. `w_int4` / `z_int4`
+    /// are in **nibble (bit-position) order**: the value at nibble `k`
+    /// lands in output column `AWQ_PACK_ORDER[k]`, and `scale_col` is
+    /// indexed by that output column. Returns the row in output-column
+    /// order (matching the dequant output layout).
     fn awq_reference_row_chunk(
         w_int4: [u8; 8],
         z_int4: [u8; 8],
-        scale_row: [f32; 8],
+        scale_col: [f32; 8],
     ) -> [f16; 8] {
         let mut out = [f16::ZERO; 8];
         for k in 0..8 {
-            let val = (w_int4[k] as i32 - z_int4[k] as i32) as f32 * scale_row[k];
-            out[k] = f16::from_f32(val);
+            let j = AWQ_PACK_ORDER[k];
+            let val = (w_int4[k] as i32 - z_int4[k] as i32) as f32 * scale_col[j];
+            out[j] = f16::from_f32(val);
         }
         out
     }
@@ -393,16 +416,21 @@ mod tests {
         let got =
             dequant_awq_int4_to_f16(&qweight, &scales, &qzeros, in_f, out_f, group_size)
                 .unwrap();
-        // Row 0: group 0, w=[0,1,2,3,4,5,6,7], z=1, s=1 -> [-1,0,1,2,3,4,5,6]
-        // Row 1: group 0, w=[1,2,3,4,5,6,7,8], z=1, s=1 -> [0,1,2,3,4,5,6,7]
-        // Row 2: group 1, w=[2,3,4,5,6,7,8,9], z=2, s=2 -> [0,2,4,6,8,10,12,14]
-        // Row 3: group 1, w=[3,4,5,6,7,8,9,10], z=2, s=2 -> [2,4,6,8,10,12,14,16]
-        let expected = [
-            [-1.0f32, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
-            [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0],
-            [2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0],
-        ];
+        // Reference: nibble `k` of row `r` carries value `r + k`, which
+        // lands in output column `AWQ_PACK_ORDER[k]`. Row `r` belongs to
+        // group `r / group_size`, whose zero is `g + 1` and scale is
+        // `g + 1`. Build the expected `[out_f]` row per row in
+        // output-column order so a wrong (identity) unpack is caught.
+        let mut expected = [[0f32; 8]; 4];
+        for (r, row) in expected.iter_mut().enumerate() {
+            let g = r / group_size;
+            let z = (g + 1) as i32;
+            let s = (g + 1) as f32;
+            for k in 0..8usize {
+                let w = (r + k) as i32;
+                row[AWQ_PACK_ORDER[k]] = (w - z) as f32 * s;
+            }
+        }
         for r in 0..4 {
             for c in 0..8 {
                 let g = got[r * 8 + c].to_f32();
@@ -413,6 +441,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn awq_dequant_applies_pack_order_permutation() {
+        // One pack, zeros=0, scale=1: nibble `k` holds value `k`, so
+        // output column `AWQ_PACK_ORDER[k]` must dequant to exactly `k`.
+        // This pins the interleave — a naive identity unpack would read
+        // nibble 1 (=1) into column 1 instead of nibble 4 (=4).
+        let qw = pack_int4_lane([0, 1, 2, 3, 4, 5, 6, 7]);
+        let qz = pack_int4_lane([0; 8]);
+        let scales = vec![f16::from_f32(1.0); 8];
+        let got = dequant_awq_int4_to_f16(&[qw], &scales, &[qz], 1, 8, 1).unwrap();
+        for k in 0..8 {
+            let j = AWQ_PACK_ORDER[k];
+            assert_eq!(
+                got[j].to_f32(),
+                k as f32,
+                "nibble {k} should land in output column {j}",
+            );
+        }
+        // Spell out the resulting output-column order for good measure.
+        let cols: Vec<f32> = got.iter().map(|h| h.to_f32()).collect();
+        assert_eq!(cols, vec![0.0, 4.0, 1.0, 5.0, 2.0, 6.0, 3.0, 7.0]);
     }
 
     #[test]

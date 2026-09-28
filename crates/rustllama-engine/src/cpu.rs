@@ -4295,6 +4295,9 @@ fn verify_and_commit_speculation(
     drafts: &[DraftToken],
     greedy: bool,
     rng: &mut Rng,
+    repeat_penalty: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
 ) -> Result<crate::speculative::SpeculationOutcome> {
     if prompt_ids.is_empty() {
         return Err(CpuEngineError::Other(
@@ -4312,6 +4315,15 @@ fn verify_and_commit_speculation(
     let mut state = state.lock().expect("state lock");
     let p_len = prompt_ids.len();
     let hybrid = model.weights.is_hybrid();
+    // Whether the request carries non-default sampling penalties. When it
+    // does we must apply them to the TARGET logits before the accept/reject
+    // verify — exactly as the classic sampler applies them before its
+    // greedy short-circuit (`Sampler::sample_with_grammar`) — or greedy
+    // decode with `repeat_penalty != 1.0` would diverge from classic
+    // greedy. Default penalties ⇒ this is a no-op, so we keep the original
+    // softmax path with zero behavior change (the common case).
+    let penalize =
+        repeat_penalty != 1.0 || frequency_penalty != 0.0 || presence_penalty != 0.0;
     let (dists, dn_base) = spec_prefill_and_forward(
         &model,
         &mut state,
@@ -4320,8 +4332,38 @@ fn verify_and_commit_speculation(
         prompt_ids,
         &candidates,
         hybrid && k > 0,
-        false,
+        penalize, // raw logits when penalizing (we softmax after penalizing)
     )?;
+    let dists: Vec<Vec<f32>> = if penalize {
+        // Row i is the model's next-token distribution CONDITIONED on
+        // `[prompt, candidates[0..i]]` (the batched forward is fed
+        // `[prompt.last(), candidates..]`), so the penalty history that
+        // mirrors the classic path's per-step `history` is exactly
+        // `prompt ++ candidates[0..i]`. In greedy accept/reject the walk
+        // only reaches row i after accepting `candidates[0..i]`, so this
+        // history equals the tokens the classic sampler would have seen.
+        let base: Vec<u32> = prompt_ids.iter().map(|&t| t as u32).collect();
+        dists
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut row)| {
+                let take = i.min(candidates.len());
+                let mut recent = Vec::with_capacity(base.len() + take);
+                recent.extend_from_slice(&base);
+                recent.extend_from_slice(&candidates[..take]);
+                crate::sampling::apply_all_penalties(
+                    &mut row,
+                    &recent,
+                    repeat_penalty,
+                    frequency_penalty,
+                    presence_penalty,
+                );
+                softmax_to_vec(&row)
+            })
+            .collect()
+    } else {
+        dists
+    };
     let refs: Vec<&[f32]> = dists.iter().map(|d| d.as_slice()).collect();
     let outcome = if greedy {
         accept_reject_greedy(drafts, &refs)
@@ -4452,7 +4494,20 @@ fn mtp_round(
     greedy: bool,
     rng: &mut Rng,
     vocab: usize,
+    repeat: f32,
+    frequency: f32,
+    presence: f32,
 ) -> Result<MtpRoundOutcome> {
+    // Non-default sampling penalties must be applied to the TARGET logits
+    // before the accept/reject verify — mirroring the classic sampler,
+    // which penalizes before its greedy short-circuit — so greedy decode
+    // with `repeat_penalty != 1.0` stays token-for-token identical to the
+    // classic path. Default penalties ⇒ this stays a no-op. The penalty
+    // history for a row is the full left context of the token that row
+    // predicts, which equals `state.last_ids` (the KV/DeltaNet coverage,
+    // == positions `[0, base_pos)`) plus the tokens forwarded ahead of
+    // that row this round (`next_input`, then the draft).
+    let penalize = repeat != 1.0 || frequency != 0.0 || presence != 0.0;
     let mut state = state.lock().expect("state lock");
     let base_pos = next_pos;
 
@@ -4497,7 +4552,25 @@ fn mtp_round(
             }
         }
         // Verify the single draft against row0 (the true next-token
-        // distribution); raw-softmax dists, matching the ngram path.
+        // distribution). When penalties are active they are applied to the
+        // target logits before the softmax (so the greedy verify matches
+        // the classic penalized sampler); otherwise this is the raw-softmax
+        // path shared with the ngram verify.
+        if penalize {
+            // row0 predicts the token at base_pos+1: its left context is
+            // last_ids (== [0, base_pos)) plus the forwarded `next_input`.
+            let mut recent = state.last_ids.clone();
+            recent.push(next_input as u32);
+            crate::sampling::apply_all_penalties(
+                &mut two[0..vocab], &recent, repeat, frequency, presence,
+            );
+            // row1 (bonus) predicts the token at base_pos+2: extend the
+            // context by the forwarded draft.
+            recent.push(draft.id);
+            crate::sampling::apply_all_penalties(
+                &mut two[vocab..2 * vocab], &recent, repeat, frequency, presence,
+            );
+        }
         let row0 = softmax_to_vec(&two[0..vocab]);
         let row1 = softmax_to_vec(&two[vocab..2 * vocab]);
         let target: [&[f32]; 2] = [row0.as_slice(), row1.as_slice()];
@@ -4610,8 +4683,18 @@ fn mtp_round(
         // Commit the main token with the SAME policy the has-draft round
         // uses: an empty-draft `accept_reject` == "sample one token from
         // this position" (argmax when greedy, else multinomial over the
-        // raw softmax), so greedy MTP output is token-for-token identical
-        // to classic greedy.
+        // softmax), so greedy MTP output is token-for-token identical
+        // to classic greedy — including under penalties, which are applied
+        // to the target logits here before the softmax when non-default.
+        if penalize {
+            // The main token is at base_pos+1: its left context is last_ids
+            // (== [0, base_pos)) plus the forwarded `next_input`.
+            let mut recent = state.last_ids.clone();
+            recent.push(next_input as u32);
+            crate::sampling::apply_all_penalties(
+                main_logits.as_mut_slice(), &recent, repeat, frequency, presence,
+            );
+        }
         let row0 = softmax_to_vec(&main_logits);
         let target: [&[f32]; 1] = [row0.as_slice()];
         let no_drafts: [DraftToken; 0] = [];
@@ -5044,10 +5127,14 @@ impl Engine for CpuEngine {
                 let mut rng_c = rng_slot.take().expect("rng slot");
                 let joined = worker
                     .run_blocking(move || {
+                        // Two-engine speculation stays on raw softmax by
+                        // design (p and q must share a distribution across
+                        // two arbitrary engines — see this method's doc), so
+                        // no penalties are applied here (no-op args).
                         let out = verify_and_commit_speculation(
                             model_c, state_c, prefix_cache, prefill_chunk_size, max_ctx,
                             &prompt_ids_for_verify, &drafts_for_verify, greedy_spec,
-                            &mut rng_c,
+                            &mut rng_c, 1.0, 0.0, 0.0,
                         );
                         (out, rng_c)
                     })
@@ -5156,13 +5243,16 @@ impl CpuEngine {
     /// microsecond-scale history scan, and is a clear win whenever recent
     /// context repeats (code, structured text, copy-and-edit).
     ///
-    /// SAMPLING SEMANTICS — IMPORTANT: like [`Engine::speculate`],
-    /// verification samples from the target's **raw softmax**. The
-    /// request's `temperature` / `top_k` / `top_p` / grammar are NOT
-    /// applied on this path. Callers route here only for grammar-free
-    /// requests (see `chat` / `generate`); the temperature caveat is the
-    /// documented trade-off of the v1 speculative path and a shared
-    /// "speculation temperature" knob is the follow-up.
+    /// SAMPLING SEMANTICS — IMPORTANT: verification samples from the
+    /// target's softmax with the request's `temperature` / `top_k` /
+    /// `top_p` / grammar NOT applied on this path, but repeat / frequency /
+    /// presence PENALTIES ARE applied to the target logits before the
+    /// verify (so greedy decode with `repeat_penalty != 1.0` stays
+    /// token-for-token identical to the classic path). Callers route here
+    /// only for grammar-free requests (see `chat` / `generate`); the
+    /// temperature caveat is the documented trade-off of the v1
+    /// speculative path and a shared "speculation temperature" knob is the
+    /// follow-up.
     pub fn speculate_ngram_stream(
         &self,
         prompt: String,
@@ -5212,6 +5302,12 @@ impl CpuEngine {
         let model_eos = self.model.cfg.eos_token_id;
         let stop_strings = s.stop.clone();
         let greedy_spec = s.temperature <= 0.0;
+        // Sampling penalties applied to the target logits before each
+        // round's accept/reject verify (keeps greedy-with-penalties
+        // token-for-token identical to the classic path).
+        let repeat_pen = s.repeat_penalty;
+        let freq_pen = s.frequency_penalty;
+        let pres_pen = s.presence_penalty;
 
         // Snapshot Arc handles so the async stream owns them without
         // borrowing `&self` for its whole lifetime (mirrors `speculate`).
@@ -5311,7 +5407,7 @@ impl CpuEngine {
                         let out = verify_and_commit_speculation(
                             model_c, state_c, prefix_cache, prefill_chunk_size, max_ctx,
                             &prompt_ids_for_verify, &drafts_for_verify, greedy_spec,
-                            &mut rng_c,
+                            &mut rng_c, repeat_pen, freq_pen, pres_pen,
                         );
                         (out, rng_c)
                     })
@@ -5431,8 +5527,11 @@ impl CpuEngine {
     /// DeltaNet position discipline.
     ///
     /// SAMPLING SEMANTICS — like the ngram path, verification samples the
-    /// target's RAW softmax (per-request temperature / top_k / top_p are
-    /// not applied). Callers route here only for grammar-free requests.
+    /// target's softmax with per-request temperature / top_k / top_p NOT
+    /// applied, but repeat / frequency / presence PENALTIES ARE applied to
+    /// the target logits before the verify (so greedy decode with
+    /// `repeat_penalty != 1.0` stays token-for-token identical to the
+    /// classic path). Callers route here only for grammar-free requests.
     pub fn speculate_mtp_stream_from_ids(
         &self,
         initial_prompt_ids: Vec<i32>,
@@ -5453,6 +5552,12 @@ impl CpuEngine {
         let model_eos = self.model.cfg.eos_token_id;
         let stop_strings = s.stop.clone();
         let greedy_spec = s.temperature <= 0.0;
+        // Sampling penalties applied to the target logits before each
+        // round's accept/reject verify (keeps greedy-with-penalties
+        // token-for-token identical to the classic path).
+        let repeat_pen = s.repeat_penalty;
+        let freq_pen = s.frequency_penalty;
+        let pres_pen = s.presence_penalty;
         let vocab = self.model.cfg.vocab_size;
 
         // Snapshot Arc handles so the async stream owns them without
@@ -5604,6 +5709,7 @@ impl CpuEngine {
                         let out = mtp_round(
                             &model_c, &state_c, ni, np, pend, allow_spec,
                             greedy_spec, &mut rng_c, vocab_c,
+                            repeat_pen, freq_pen, pres_pen,
                         );
                         (out, rng_c)
                     })

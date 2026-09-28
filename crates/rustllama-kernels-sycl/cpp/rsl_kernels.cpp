@@ -147,6 +147,118 @@ inline void log_ffi_exception(const char* fn, const char* what) {
     }
 }
 
+// ------------------------------------------------------------
+// Quantized-KV dequant helpers (device-side). Byte-exact ports of
+// the CPU reference dequant in rustllama-kernels-cpu
+// (q4_0_kv.rs / nvfp4.rs / turboquant.rs). Each writes one
+// dequantized KV row of `head_dim` f32 into `row`. Used by the
+// quantized-KV FlashAttention kernels below, which dequantize a
+// whole K (then V) row per kv position — same element order as the
+// CPU kernels' dequant-into-scratch + online_softmax_attn_f32_scratch
+// so `doctor --sycl-parity` matches within tolerance.
+// ------------------------------------------------------------
+
+// Cap on head_dim so the per-work-item dequant buffer is fixed-size
+// (private memory). The kernels reject larger head_dim so the caller
+// falls back to the CPU kernel.
+constexpr int RSL_FLASH_MAX_HEAD_DIM = 256;
+
+// Q4_0 KV row: 18 B / 32 elems, embedded f16 scale;
+// weight = (nibble - 8) * d.
+inline void deq_q4_0_row(const uint8_t* p, float* row, int head_dim) {
+    int nb = head_dim / 32;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = p + b * 18;
+        uint16_t d_bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        float d = bits_to_f32(d_bits);
+        const uint8_t* qs = blk + 2;
+        int o = b * 32;
+        for (int j = 0; j < 16; ++j) {
+            row[o + j]      = (float)((int)(qs[j] & 0x0F) - 8) * d;
+            row[o + j + 16] = (float)((int)(qs[j] >> 4) - 8) * d;
+        }
+    }
+}
+
+// FP8 E4M3 -> f32 (byte-exact port of nvfp4::e4m3_to_f32). Named
+// distinctly from the NVFP4 matvec TU's `e4m3_to_f32_dev` (same
+// anonymous namespace) to avoid a redefinition; uses `ldexp` (exact
+// 2^e scaling) to match the CPU reference's `powi(2, e)` bit-for-bit.
+// The 0x7F/0xFF NaN slot never occurs for real KV scales.
+inline float rsl_flash_e4m3_to_f32(uint8_t b) {
+    bool sign = (b & 0x80) != 0;
+    int exp = (b >> 3) & 0x0F;
+    int mant = b & 0x07;
+    float val;
+    if (exp == 0x0F && mant == 0x07) {
+        val = sycl::nan(0u);
+    } else if (exp == 0) {
+        val = (float)mant * (1.0f / 512.0f);  // subnormal: mant * 2^-9
+    } else {
+        float m = 1.0f + (float)mant / 8.0f;  // normal: (1 + mant/8) * 2^(exp-7)
+        val = sycl::ldexp(m, exp - 7);
+    }
+    return sign ? -val : val;
+}
+
+// NVFP4 KV row: 9 B / 16 elems, interleaved nibbles (lo->2j, hi->2j+1)
+// + FP8 E4M3 scale byte. Codebook = E2M1 signed table.
+inline void deq_nvfp4_row(const uint8_t* p, float* row, int head_dim) {
+    const float codebook[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+    int nb = head_dim / 16;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = p + b * 9;
+        float scale = rsl_flash_e4m3_to_f32(blk[8]);
+        int o = b * 16;
+        for (int j = 0; j < 8; ++j) {
+            uint8_t byte = blk[j];
+            int lo = byte & 0x0F;
+            int hi = (byte >> 4) & 0x0F;
+            row[o + j * 2]     = codebook[lo] * scale;
+            row[o + j * 2 + 1] = codebook[hi] * scale;
+        }
+    }
+}
+
+// TurboQuant KV row: unpack signed codes (bits in {1,2,4,8}), multiply
+// by the row's separate scale, then inverse WHT (forward butterfly +
+// 1/N). Matches turboquant::dequantize_row's op order (scale BEFORE the
+// transform). head_dim must be a power of two.
+inline void deq_tq_row(const uint8_t* p, float scale, int bits,
+                       float* row, int head_dim) {
+    int max_level = (bits == 1) ? 1 : ((bits == 2) ? 1 : ((bits == 4) ? 7 : 127));
+    unsigned mask = (bits == 1) ? 0x1u : ((bits == 2) ? 0x3u : ((bits == 4) ? 0xFu : 0xFFu));
+    for (int i = 0; i < head_dim; ++i) {
+        int bit_off = i * bits;
+        int byte_idx = bit_off >> 3;
+        int bit_in = bit_off & 7;
+        unsigned cell = (unsigned)p[byte_idx] >> bit_in;
+        if (bit_in + bits > 8) {
+            int spill = bit_in + bits - 8;
+            int shift = bits - spill;
+            cell |= (unsigned)p[byte_idx + 1] << shift;
+        }
+        unsigned u = cell & mask;
+        int code = (bits == 1) ? ((u == 0) ? -1 : 1) : ((int)u - max_level);
+        row[i] = (float)code * scale;
+    }
+    // Inverse WHT = forward WHT (butterfly) then * (1/N).
+    for (int h = 1; h < head_dim; h <<= 1) {
+        for (int i = 0; i < head_dim; i += (h << 1)) {
+            for (int j = i; j < i + h; ++j) {
+                float a = row[j];
+                float bqv = row[j + h];
+                row[j]     = a + bqv;
+                row[j + h] = a - bqv;
+            }
+        }
+    }
+    float inv_n = 1.0f / (float)head_dim;
+    for (int i = 0; i < head_dim; ++i) row[i] *= inv_n;
+}
+
 }  // namespace
 
 // Wrap a function body in `try { ... } catch` so any SYCL or std
@@ -1373,6 +1485,516 @@ void rsl_flash_attn_prefill_usm(rsl_stream* s,
                 for (int i = 0; i < head_dim; ++i) {
                     out_usm[out_off + i] *= inv_l;
                 }
+            });
+    }).wait();
+})
+
+// ============================================================
+// Quantized-KV FlashAttention (F32 Q / F32 out, packed K/V
+// dequantized on the fly). Same online-softmax recurrence as the
+// v1 F32 decode/prefill above; only the K/V source differs. Each
+// work-item dequantizes one K (then V) row into a private buffer per
+// kv position via the deq_* helpers, reproducing the CPU reference's
+// dequant-then-attend float op order (q4_0_kv.rs / nvfp4.rs /
+// turboquant.rs). One WI per head (decode) / per (head,q_pos)
+// (prefill). head_dim capped at RSL_FLASH_MAX_HEAD_DIM; kernels
+// early-return on larger / mis-shaped inputs (caller falls back to
+// CPU). Q is F32, K/V are packed bytes; TQ also takes per-row f32
+// scales (indexed kv_h*max_ctx + t) + bit width.
+// ============================================================
+
+void rsl_flash_attn_decode_q4_0_usm(rsl_stream* s,
+                                    const float* q_usm,
+                                    const void* k_packed_usm,
+                                    const void* v_packed_usm,
+                                    float* out_usm,
+                                    int n_heads, int n_kv_heads,
+                                    int head_dim, int max_ctx,
+                                    int kv_len) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_q4_0_usm", {
+    if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
+        || v_packed_usm == nullptr || out_usm == nullptr) return;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
+    if ((n_heads % n_kv_heads) != 0) return;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return;
+    auto& q = s->q;
+    if (kv_len <= 0) {
+        std::size_t total = static_cast<std::size_t>(n_heads) * head_dim;
+        q.memset(out_usm, 0, total * sizeof(float)).wait();
+        return;
+    }
+    const int n_gqa = n_heads / n_kv_heads;
+    const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    const int bytes_per_row = (head_dim / 32) * 18;
+    const uint8_t* k_bytes = static_cast<const uint8_t*>(k_packed_usm);
+    const uint8_t* v_bytes = static_cast<const uint8_t*>(v_packed_usm);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(n_heads)),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int hh = static_cast<int>(it.get_global_id(0));
+                if (hh >= n_heads) return;
+                const int kv_h = hh / n_gqa;
+                const int q_base = hh * head_dim;
+                const int out_base = hh * head_dim;
+                float row[RSL_FLASH_MAX_HEAD_DIM];
+                for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] = 0.0f;
+                float m = -INFINITY, l = 0.0f;
+                for (int t = 0; t < kv_len; ++t) {
+                    const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_q4_0_row(kp, row, head_dim);
+                    float s_dot = 0.0f;
+                    for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_base + i] * row[i];
+                    s_dot *= scale;
+                    const float m_new = sycl::fmax(m, s_dot);
+                    const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
+                    const float p = sycl::exp(s_dot - m_new);
+                    l = l * rescale + p;
+                    const uint8_t* vp = v_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_q4_0_row(vp, row, head_dim);
+                    for (int i = 0; i < head_dim; ++i)
+                        out_usm[out_base + i] = out_usm[out_base + i] * rescale + p * row[i];
+                    m = m_new;
+                }
+                const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+                for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] *= inv_l;
+            });
+    }).wait();
+})
+
+void rsl_flash_attn_prefill_q4_0_usm(rsl_stream* s,
+                                     const float* q_usm,
+                                     const void* k_packed_usm,
+                                     const void* v_packed_usm,
+                                     float* out_usm,
+                                     int n_heads, int n_kv_heads,
+                                     int head_dim, int max_ctx,
+                                     int kv_len_base, int n_new) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_q4_0_usm", {
+    if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
+        || v_packed_usm == nullptr || out_usm == nullptr) return;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return;
+    if ((n_heads % n_kv_heads) != 0) return;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return;
+    auto& q = s->q;
+    const int n_gqa = n_heads / n_kv_heads;
+    const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    const int bytes_per_row = (head_dim / 32) * 18;
+    const uint8_t* k_bytes = static_cast<const uint8_t*>(k_packed_usm);
+    const uint8_t* v_bytes = static_cast<const uint8_t*>(v_packed_usm);
+    const std::size_t global_h = round_up_to_lws(n_heads);
+    sycl::range<2> global(global_h, static_cast<std::size_t>(n_new));
+    sycl::range<2> local(RSL_LWS, 1);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) {
+                const int hh = static_cast<int>(it.get_global_id(0));
+                const int q_pos = static_cast<int>(it.get_global_id(1));
+                if (hh >= n_heads || q_pos >= n_new) return;
+                const int kv_h = hh / n_gqa;
+                const int q_off = (q_pos * n_heads + hh) * head_dim;
+                const int out_off = q_off;
+                const int kv_len_for_q = kv_len_base + q_pos + 1;
+                float row[RSL_FLASH_MAX_HEAD_DIM];
+                for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] = 0.0f;
+                float m = -INFINITY, l = 0.0f;
+                for (int t = 0; t < kv_len_for_q; ++t) {
+                    const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_q4_0_row(kp, row, head_dim);
+                    float s_dot = 0.0f;
+                    for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_off + i] * row[i];
+                    s_dot *= scale;
+                    const float m_new = sycl::fmax(m, s_dot);
+                    const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
+                    const float p = sycl::exp(s_dot - m_new);
+                    l = l * rescale + p;
+                    const uint8_t* vp = v_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_q4_0_row(vp, row, head_dim);
+                    for (int i = 0; i < head_dim; ++i)
+                        out_usm[out_off + i] = out_usm[out_off + i] * rescale + p * row[i];
+                    m = m_new;
+                }
+                const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+                for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] *= inv_l;
+            });
+    }).wait();
+})
+
+// ---- Q8_0-KV decode / prefill (i8 slab + per-row f32 scale) ----
+// Byte-exact port of the CPU reference gqa_attention_flash_decode_q8_0 /
+// _prefill_q8_0 (rustllama-kernels-cpu/src/lib.rs). Unlike the Q4_0/NVFP4/TQ
+// KV kernels above, the engine's KvLayer::Q8_0 stores K/V as a PLAIN i8 slab
+// [n_kv_heads, max_ctx, head_dim] (one byte per element, NO 34B/32 GGUF
+// blocks) + a separate per-row absmax f32 scale in k_scales/v_scales =
+// [n_kv_heads*max_ctx] (indexed kv_h*max_ctx + t, same shape as the TQ
+// scales). The CPU Q8_0 reference does NOT materialize a dequantized row — it
+// dots the raw i8 codes then factors the row scale out of the inner loop
+// (s *= k_scale*attn_scale; out += (p*v_scale)*i8). We reproduce that
+// factoring exactly for float parity, so there is NO private row buffer here
+// and head_dim is unconstrained (no block-alignment, no power-of-two).
+void rsl_flash_attn_decode_q8_0_usm(rsl_stream* s,
+                                    const float* q_usm,
+                                    const void* k_packed_usm,
+                                    const void* v_packed_usm,
+                                    const float* k_scales_usm,
+                                    const float* v_scales_usm,
+                                    float* out_usm,
+                                    int n_heads, int n_kv_heads,
+                                    int head_dim, int max_ctx,
+                                    int kv_len) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_q8_0_usm", {
+    if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
+        || v_packed_usm == nullptr || k_scales_usm == nullptr
+        || v_scales_usm == nullptr || out_usm == nullptr) return;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
+    if ((n_heads % n_kv_heads) != 0) return;
+    auto& q = s->q;
+    if (kv_len <= 0) {
+        std::size_t total = static_cast<std::size_t>(n_heads) * head_dim;
+        q.memset(out_usm, 0, total * sizeof(float)).wait();
+        return;
+    }
+    const int n_gqa = n_heads / n_kv_heads;
+    const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    const int8_t* k_bytes = static_cast<const int8_t*>(k_packed_usm);
+    const int8_t* v_bytes = static_cast<const int8_t*>(v_packed_usm);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(n_heads)),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int hh = static_cast<int>(it.get_global_id(0));
+                if (hh >= n_heads) return;
+                const int kv_h = hh / n_gqa;
+                const int q_base = hh * head_dim;
+                const int out_base = hh * head_dim;
+                for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] = 0.0f;
+                float m = -INFINITY, l = 0.0f;
+                for (int t = 0; t < kv_len; ++t) {
+                    const std::size_t ridx = static_cast<std::size_t>(kv_h * max_ctx + t);
+                    const int8_t* kp = k_bytes + ridx * head_dim;
+                    float s_dot = 0.0f;
+                    for (int i = 0; i < head_dim; ++i)
+                        s_dot += q_usm[q_base + i] * static_cast<float>(kp[i]);
+                    s_dot *= k_scales_usm[ridx] * scale;
+                    const float m_new = sycl::fmax(m, s_dot);
+                    const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
+                    const float p = sycl::exp(s_dot - m_new);
+                    l = l * rescale + p;
+                    const int8_t* vp = v_bytes + ridx * head_dim;
+                    const float p_eff = p * v_scales_usm[ridx];
+                    for (int i = 0; i < head_dim; ++i)
+                        out_usm[out_base + i] = out_usm[out_base + i] * rescale
+                                              + p_eff * static_cast<float>(vp[i]);
+                    m = m_new;
+                }
+                const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+                for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] *= inv_l;
+            });
+    }).wait();
+})
+
+void rsl_flash_attn_prefill_q8_0_usm(rsl_stream* s,
+                                     const float* q_usm,
+                                     const void* k_packed_usm,
+                                     const void* v_packed_usm,
+                                     const float* k_scales_usm,
+                                     const float* v_scales_usm,
+                                     float* out_usm,
+                                     int n_heads, int n_kv_heads,
+                                     int head_dim, int max_ctx,
+                                     int kv_len_base, int n_new) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_q8_0_usm", {
+    if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
+        || v_packed_usm == nullptr || k_scales_usm == nullptr
+        || v_scales_usm == nullptr || out_usm == nullptr) return;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return;
+    if ((n_heads % n_kv_heads) != 0) return;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return;
+    auto& q = s->q;
+    const int n_gqa = n_heads / n_kv_heads;
+    const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    const int8_t* k_bytes = static_cast<const int8_t*>(k_packed_usm);
+    const int8_t* v_bytes = static_cast<const int8_t*>(v_packed_usm);
+    const std::size_t global_h = round_up_to_lws(n_heads);
+    sycl::range<2> global(global_h, static_cast<std::size_t>(n_new));
+    sycl::range<2> local(RSL_LWS, 1);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) {
+                const int hh = static_cast<int>(it.get_global_id(0));
+                const int q_pos = static_cast<int>(it.get_global_id(1));
+                if (hh >= n_heads || q_pos >= n_new) return;
+                const int kv_h = hh / n_gqa;
+                const int q_off = (q_pos * n_heads + hh) * head_dim;
+                const int out_off = q_off;
+                const int kv_len_for_q = kv_len_base + q_pos + 1;
+                for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] = 0.0f;
+                float m = -INFINITY, l = 0.0f;
+                for (int t = 0; t < kv_len_for_q; ++t) {
+                    const std::size_t ridx = static_cast<std::size_t>(kv_h * max_ctx + t);
+                    const int8_t* kp = k_bytes + ridx * head_dim;
+                    float s_dot = 0.0f;
+                    for (int i = 0; i < head_dim; ++i)
+                        s_dot += q_usm[q_off + i] * static_cast<float>(kp[i]);
+                    s_dot *= k_scales_usm[ridx] * scale;
+                    const float m_new = sycl::fmax(m, s_dot);
+                    const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
+                    const float p = sycl::exp(s_dot - m_new);
+                    l = l * rescale + p;
+                    const int8_t* vp = v_bytes + ridx * head_dim;
+                    const float p_eff = p * v_scales_usm[ridx];
+                    for (int i = 0; i < head_dim; ++i)
+                        out_usm[out_off + i] = out_usm[out_off + i] * rescale
+                                             + p_eff * static_cast<float>(vp[i]);
+                    m = m_new;
+                }
+                const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+                for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] *= inv_l;
+            });
+    }).wait();
+})
+
+void rsl_flash_attn_decode_nvfp4_usm(rsl_stream* s,
+                                     const float* q_usm,
+                                     const void* k_packed_usm,
+                                     const void* v_packed_usm,
+                                     float* out_usm,
+                                     int n_heads, int n_kv_heads,
+                                     int head_dim, int max_ctx,
+                                     int kv_len) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_nvfp4_usm", {
+    if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
+        || v_packed_usm == nullptr || out_usm == nullptr) return;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
+    if ((n_heads % n_kv_heads) != 0) return;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 16) != 0) return;
+    auto& q = s->q;
+    if (kv_len <= 0) {
+        std::size_t total = static_cast<std::size_t>(n_heads) * head_dim;
+        q.memset(out_usm, 0, total * sizeof(float)).wait();
+        return;
+    }
+    const int n_gqa = n_heads / n_kv_heads;
+    const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    const int bytes_per_row = (head_dim / 16) * 9;
+    const uint8_t* k_bytes = static_cast<const uint8_t*>(k_packed_usm);
+    const uint8_t* v_bytes = static_cast<const uint8_t*>(v_packed_usm);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(n_heads)),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int hh = static_cast<int>(it.get_global_id(0));
+                if (hh >= n_heads) return;
+                const int kv_h = hh / n_gqa;
+                const int q_base = hh * head_dim;
+                const int out_base = hh * head_dim;
+                float row[RSL_FLASH_MAX_HEAD_DIM];
+                for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] = 0.0f;
+                float m = -INFINITY, l = 0.0f;
+                for (int t = 0; t < kv_len; ++t) {
+                    const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_nvfp4_row(kp, row, head_dim);
+                    float s_dot = 0.0f;
+                    for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_base + i] * row[i];
+                    s_dot *= scale;
+                    const float m_new = sycl::fmax(m, s_dot);
+                    const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
+                    const float p = sycl::exp(s_dot - m_new);
+                    l = l * rescale + p;
+                    const uint8_t* vp = v_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_nvfp4_row(vp, row, head_dim);
+                    for (int i = 0; i < head_dim; ++i)
+                        out_usm[out_base + i] = out_usm[out_base + i] * rescale + p * row[i];
+                    m = m_new;
+                }
+                const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+                for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] *= inv_l;
+            });
+    }).wait();
+})
+
+void rsl_flash_attn_prefill_nvfp4_usm(rsl_stream* s,
+                                      const float* q_usm,
+                                      const void* k_packed_usm,
+                                      const void* v_packed_usm,
+                                      float* out_usm,
+                                      int n_heads, int n_kv_heads,
+                                      int head_dim, int max_ctx,
+                                      int kv_len_base, int n_new) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_nvfp4_usm", {
+    if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
+        || v_packed_usm == nullptr || out_usm == nullptr) return;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return;
+    if ((n_heads % n_kv_heads) != 0) return;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 16) != 0) return;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return;
+    auto& q = s->q;
+    const int n_gqa = n_heads / n_kv_heads;
+    const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    const int bytes_per_row = (head_dim / 16) * 9;
+    const uint8_t* k_bytes = static_cast<const uint8_t*>(k_packed_usm);
+    const uint8_t* v_bytes = static_cast<const uint8_t*>(v_packed_usm);
+    const std::size_t global_h = round_up_to_lws(n_heads);
+    sycl::range<2> global(global_h, static_cast<std::size_t>(n_new));
+    sycl::range<2> local(RSL_LWS, 1);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) {
+                const int hh = static_cast<int>(it.get_global_id(0));
+                const int q_pos = static_cast<int>(it.get_global_id(1));
+                if (hh >= n_heads || q_pos >= n_new) return;
+                const int kv_h = hh / n_gqa;
+                const int q_off = (q_pos * n_heads + hh) * head_dim;
+                const int out_off = q_off;
+                const int kv_len_for_q = kv_len_base + q_pos + 1;
+                float row[RSL_FLASH_MAX_HEAD_DIM];
+                for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] = 0.0f;
+                float m = -INFINITY, l = 0.0f;
+                for (int t = 0; t < kv_len_for_q; ++t) {
+                    const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_nvfp4_row(kp, row, head_dim);
+                    float s_dot = 0.0f;
+                    for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_off + i] * row[i];
+                    s_dot *= scale;
+                    const float m_new = sycl::fmax(m, s_dot);
+                    const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
+                    const float p = sycl::exp(s_dot - m_new);
+                    l = l * rescale + p;
+                    const uint8_t* vp = v_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_nvfp4_row(vp, row, head_dim);
+                    for (int i = 0; i < head_dim; ++i)
+                        out_usm[out_off + i] = out_usm[out_off + i] * rescale + p * row[i];
+                    m = m_new;
+                }
+                const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+                for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] *= inv_l;
+            });
+    }).wait();
+})
+
+void rsl_flash_attn_decode_tq_usm(rsl_stream* s,
+                                  const float* q_usm,
+                                  const void* k_packed_usm,
+                                  const void* v_packed_usm,
+                                  const float* k_scales_usm,
+                                  const float* v_scales_usm,
+                                  int bits,
+                                  float* out_usm,
+                                  int n_heads, int n_kv_heads,
+                                  int head_dim, int max_ctx,
+                                  int kv_len) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_tq_usm", {
+    if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
+        || v_packed_usm == nullptr || k_scales_usm == nullptr
+        || v_scales_usm == nullptr || out_usm == nullptr) return;
+    if (bits != 1 && bits != 2 && bits != 4 && bits != 8) return;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
+    if ((n_heads % n_kv_heads) != 0) return;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim & (head_dim - 1)) != 0) return;
+    auto& q = s->q;
+    if (kv_len <= 0) {
+        std::size_t total = static_cast<std::size_t>(n_heads) * head_dim;
+        q.memset(out_usm, 0, total * sizeof(float)).wait();
+        return;
+    }
+    const int n_gqa = n_heads / n_kv_heads;
+    const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    const int bytes_per_row = (head_dim * bits + 7) / 8;
+    const uint8_t* k_bytes = static_cast<const uint8_t*>(k_packed_usm);
+    const uint8_t* v_bytes = static_cast<const uint8_t*>(v_packed_usm);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(n_heads)),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int hh = static_cast<int>(it.get_global_id(0));
+                if (hh >= n_heads) return;
+                const int kv_h = hh / n_gqa;
+                const int q_base = hh * head_dim;
+                const int out_base = hh * head_dim;
+                float row[RSL_FLASH_MAX_HEAD_DIM];
+                for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] = 0.0f;
+                float m = -INFINITY, l = 0.0f;
+                for (int t = 0; t < kv_len; ++t) {
+                    const std::size_t ridx = static_cast<std::size_t>(kv_h * max_ctx + t);
+                    deq_tq_row(k_bytes + ridx * bytes_per_row, k_scales_usm[ridx], bits, row, head_dim);
+                    float s_dot = 0.0f;
+                    for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_base + i] * row[i];
+                    s_dot *= scale;
+                    const float m_new = sycl::fmax(m, s_dot);
+                    const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
+                    const float p = sycl::exp(s_dot - m_new);
+                    l = l * rescale + p;
+                    deq_tq_row(v_bytes + ridx * bytes_per_row, v_scales_usm[ridx], bits, row, head_dim);
+                    for (int i = 0; i < head_dim; ++i)
+                        out_usm[out_base + i] = out_usm[out_base + i] * rescale + p * row[i];
+                    m = m_new;
+                }
+                const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+                for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] *= inv_l;
+            });
+    }).wait();
+})
+
+void rsl_flash_attn_prefill_tq_usm(rsl_stream* s,
+                                   const float* q_usm,
+                                   const void* k_packed_usm,
+                                   const void* v_packed_usm,
+                                   const float* k_scales_usm,
+                                   const float* v_scales_usm,
+                                   int bits,
+                                   float* out_usm,
+                                   int n_heads, int n_kv_heads,
+                                   int head_dim, int max_ctx,
+                                   int kv_len_base, int n_new) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_tq_usm", {
+    if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
+        || v_packed_usm == nullptr || k_scales_usm == nullptr
+        || v_scales_usm == nullptr || out_usm == nullptr) return;
+    if (bits != 1 && bits != 2 && bits != 4 && bits != 8) return;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return;
+    if ((n_heads % n_kv_heads) != 0) return;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim & (head_dim - 1)) != 0) return;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return;
+    auto& q = s->q;
+    const int n_gqa = n_heads / n_kv_heads;
+    const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    const int bytes_per_row = (head_dim * bits + 7) / 8;
+    const uint8_t* k_bytes = static_cast<const uint8_t*>(k_packed_usm);
+    const uint8_t* v_bytes = static_cast<const uint8_t*>(v_packed_usm);
+    const std::size_t global_h = round_up_to_lws(n_heads);
+    sycl::range<2> global(global_h, static_cast<std::size_t>(n_new));
+    sycl::range<2> local(RSL_LWS, 1);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) {
+                const int hh = static_cast<int>(it.get_global_id(0));
+                const int q_pos = static_cast<int>(it.get_global_id(1));
+                if (hh >= n_heads || q_pos >= n_new) return;
+                const int kv_h = hh / n_gqa;
+                const int q_off = (q_pos * n_heads + hh) * head_dim;
+                const int out_off = q_off;
+                const int kv_len_for_q = kv_len_base + q_pos + 1;
+                float row[RSL_FLASH_MAX_HEAD_DIM];
+                for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] = 0.0f;
+                float m = -INFINITY, l = 0.0f;
+                for (int t = 0; t < kv_len_for_q; ++t) {
+                    const std::size_t ridx = static_cast<std::size_t>(kv_h * max_ctx + t);
+                    deq_tq_row(k_bytes + ridx * bytes_per_row, k_scales_usm[ridx], bits, row, head_dim);
+                    float s_dot = 0.0f;
+                    for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_off + i] * row[i];
+                    s_dot *= scale;
+                    const float m_new = sycl::fmax(m, s_dot);
+                    const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
+                    const float p = sycl::exp(s_dot - m_new);
+                    l = l * rescale + p;
+                    deq_tq_row(v_bytes + ridx * bytes_per_row, v_scales_usm[ridx], bits, row, head_dim);
+                    for (int i = 0; i < head_dim; ++i)
+                        out_usm[out_off + i] = out_usm[out_off + i] * rescale + p * row[i];
+                    m = m_new;
+                }
+                const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+                for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] *= inv_l;
             });
     }).wait();
 })
@@ -7960,6 +8582,776 @@ void rsl_hadamard_forward_usm(rsl_stream* s,
     hadamard_forward_usm_impl(q, x_usm, signs_usm, out_usm, n_elems, block);
 })
 
+// =========================================================================
+// CPU-parity packed matvecs: legacy Q4_0/Q5_0/Q4_1/Q5_1 (block 32), K-quant
+// Q2_K/Q3_K/Q8_K (block 256), PrismML PQ2_0 (block 128). Each mirrors the
+// CPU scalar reference in `rustllama-kernels-cpu` byte-for-byte (same block
+// layout, same per-element decode + accumulation order) so the GPU output
+// matches the CPU reference under `doctor --gpu-parity`. One work-item per
+// output row; templated on LWS like the other packed matvecs.
+// =========================================================================
+}  // extern "C" — close so we can declare the new-format templates
+
+// ---- Q4_0 (18 bytes / 32 weights: f16 d + 16 packed-nibble bytes) ----
+// weight = d * (nibble - 8); low nibble -> x[j], high nibble -> x[j+16].
+template <std::size_t LWS_T>
+inline void matvec_q4_0_packed_f32_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 32;
+    const int bytes_per_row = blocks_per_row * 18;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                if (m >= M) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 18;
+                    const float d = bits_to_f32(static_cast<uint16_t>(blk[0])
+                                                | (static_cast<uint16_t>(blk[1]) << 8));
+                    const uint8_t* qs = blk + 2;
+                    const int x_off = b * 32;
+                    for (int j = 0; j < 16; ++j) {
+                        const int x0 = static_cast<int>(qs[j] & 0x0F) - 8;
+                        const int x1 = static_cast<int>(qs[j] >> 4) - 8;
+                        acc += d * static_cast<float>(x0) * x_usm[x_off + j];
+                        acc += d * static_cast<float>(x1) * x_usm[x_off + j + 16];
+                    }
+                }
+                out_usm[m] = acc;
+            });
+    }).wait();
+}
+
+// ---- Q5_0 (22 bytes / 32: f16 d + u32 qh + 16 nibble bytes) ----
+// 5-bit signed: value = (nibble | 5th_bit<<4) - 16. The 5th bit for the
+// low-nibble weight j is qh bit j; for the high-nibble weight it is bit
+// j+16 (matches the CPU `((qh>>j)<<4)&0x10` / `(qh>>(j+12))&0x10` trick).
+template <std::size_t LWS_T>
+inline void matvec_q5_0_packed_f32_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 32;
+    const int bytes_per_row = blocks_per_row * 22;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                if (m >= M) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 22;
+                    const float d = bits_to_f32(static_cast<uint16_t>(blk[0])
+                                                | (static_cast<uint16_t>(blk[1]) << 8));
+                    const uint32_t qh =
+                        static_cast<uint32_t>(blk[2])
+                        | (static_cast<uint32_t>(blk[3]) << 8)
+                        | (static_cast<uint32_t>(blk[4]) << 16)
+                        | (static_cast<uint32_t>(blk[5]) << 24);
+                    const uint8_t* qs = blk + 6;
+                    const int x_off = b * 32;
+                    for (int j = 0; j < 16; ++j) {
+                        const uint32_t xh_0 = ((qh >> j) << 4) & 0x10u;
+                        const uint32_t xh_1 = (qh >> (j + 12)) & 0x10u;
+                        const int x0 = (static_cast<int>(qs[j] & 0x0F)
+                                        | static_cast<int>(xh_0)) - 16;
+                        const int x1 = (static_cast<int>(qs[j] >> 4)
+                                        | static_cast<int>(xh_1)) - 16;
+                        acc += d * static_cast<float>(x0) * x_usm[x_off + j];
+                        acc += d * static_cast<float>(x1) * x_usm[x_off + j + 16];
+                    }
+                }
+                out_usm[m] = acc;
+            });
+    }).wait();
+}
+
+// ---- Q4_1 (20 bytes / 32: f16 d + f16 min + 16 nibble bytes) ----
+// weight = d * nibble + min (no -8 zero-point; min carries the offset).
+template <std::size_t LWS_T>
+inline void matvec_q4_1_packed_f32_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 32;
+    const int bytes_per_row = blocks_per_row * 20;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                if (m >= M) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 20;
+                    const float d = bits_to_f32(static_cast<uint16_t>(blk[0])
+                                                | (static_cast<uint16_t>(blk[1]) << 8));
+                    const float mn = bits_to_f32(static_cast<uint16_t>(blk[2])
+                                                 | (static_cast<uint16_t>(blk[3]) << 8));
+                    const uint8_t* qs = blk + 4;
+                    const int x_off = b * 32;
+                    for (int j = 0; j < 16; ++j) {
+                        const int q0 = static_cast<int>(qs[j] & 0x0F);
+                        const int q1 = static_cast<int>(qs[j] >> 4);
+                        acc += (d * static_cast<float>(q0) + mn) * x_usm[x_off + j];
+                        acc += (d * static_cast<float>(q1) + mn) * x_usm[x_off + j + 16];
+                    }
+                }
+                out_usm[m] = acc;
+            });
+    }).wait();
+}
+
+// ---- Q5_1 (24 bytes / 32: f16 d + f16 min + u32 qh + 16 nibble bytes) ----
+// weight = d * (nibble | 5th_bit<<4) + min. Same qh bit-selection as Q5_0.
+template <std::size_t LWS_T>
+inline void matvec_q5_1_packed_f32_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 32;
+    const int bytes_per_row = blocks_per_row * 24;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                if (m >= M) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 24;
+                    const float d = bits_to_f32(static_cast<uint16_t>(blk[0])
+                                                | (static_cast<uint16_t>(blk[1]) << 8));
+                    const float mn = bits_to_f32(static_cast<uint16_t>(blk[2])
+                                                 | (static_cast<uint16_t>(blk[3]) << 8));
+                    const uint32_t qh =
+                        static_cast<uint32_t>(blk[4])
+                        | (static_cast<uint32_t>(blk[5]) << 8)
+                        | (static_cast<uint32_t>(blk[6]) << 16)
+                        | (static_cast<uint32_t>(blk[7]) << 24);
+                    const uint8_t* qs = blk + 8;
+                    const int x_off = b * 32;
+                    for (int j = 0; j < 16; ++j) {
+                        const uint32_t xh_0 = ((qh >> j) << 4) & 0x10u;
+                        const uint32_t xh_1 = (qh >> (j + 12)) & 0x10u;
+                        const int q0 = static_cast<int>(qs[j] & 0x0F)
+                                       | static_cast<int>(xh_0);
+                        const int q1 = static_cast<int>(qs[j] >> 4)
+                                       | static_cast<int>(xh_1);
+                        acc += (d * static_cast<float>(q0) + mn) * x_usm[x_off + j];
+                        acc += (d * static_cast<float>(q1) + mn) * x_usm[x_off + j + 16];
+                    }
+                }
+                out_usm[m] = acc;
+            });
+    }).wait();
+}
+
+// ---- Q2_K (84 bytes / 256: 16 scale bytes + 64 qs + f16 d + f16 dmin) ----
+// 8 sub-blocks of 32 (two 16-wide halves) traversed as 2 chunks x 4 shifts;
+// each 6-bit scale byte packs dl=(sc&0xF) and ml=(sc>>4). weight = dl*q - ml.
+template <std::size_t LWS_T>
+inline void matvec_q2_k_packed_f32_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 256;
+    const int bytes_per_row = blocks_per_row * 84;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                if (m >= M) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 84;
+                    const uint8_t* scales = blk;          // [0..16)
+                    const uint8_t* qs = blk + 16;         // [16..80)
+                    const float d = bits_to_f32(static_cast<uint16_t>(blk[80])
+                                                | (static_cast<uint16_t>(blk[81]) << 8));
+                    const float dmin = bits_to_f32(static_cast<uint16_t>(blk[82])
+                                                 | (static_cast<uint16_t>(blk[83]) << 8));
+                    const int x_base = b * 256;
+                    int x_off = 0;
+                    int is = 0;
+                    for (int chunk = 0; chunk < 2; ++chunk) {
+                        const uint8_t* qc = qs + chunk * 32;
+                        for (int sh = 0; sh < 4; ++sh) {
+                            const uint32_t shift = static_cast<uint32_t>(sh * 2);
+                            // Sub-block A: qc[0..16] >> shift
+                            const uint8_t sc_a = scales[is];
+                            const float dl_a = d * static_cast<float>(sc_a & 0x0F);
+                            const float ml_a = dmin * static_cast<float>(sc_a >> 4);
+                            for (int l = 0; l < 16; ++l) {
+                                const float qv = static_cast<float>((qc[l] >> shift) & 3);
+                                acc += (dl_a * qv - ml_a) * x_usm[x_base + x_off + l];
+                            }
+                            x_off += 16;
+                            ++is;
+                            // Sub-block B: qc[16..32] >> shift
+                            const uint8_t sc_b = scales[is];
+                            const float dl_b = d * static_cast<float>(sc_b & 0x0F);
+                            const float ml_b = dmin * static_cast<float>(sc_b >> 4);
+                            for (int l = 0; l < 16; ++l) {
+                                const float qv = static_cast<float>((qc[l + 16] >> shift) & 3);
+                                acc += (dl_b * qv - ml_b) * x_usm[x_base + x_off + l];
+                            }
+                            x_off += 16;
+                            ++is;
+                        }
+                    }
+                }
+                out_usm[m] = acc;
+            });
+    }).wait();
+}
+
+// ---- Q3_K (110 bytes / 256: 32 hmask + 64 qs + 12 scales + f16 d) ----
+// 6-bit scales are unpacked via the KMASK1/KMASK2 shuffle into 16 signed
+// scales (biased -32). Each weight = (low2 - (hmask_bit ? 0 : 4)); the
+// m_bit walks 1..128 across the two chunks. Mirrors the CPU scalar +
+// the on-device `rsl_dequant_q3_k_to_f32_usm` unpack.
+template <std::size_t LWS_T>
+inline void matvec_q3_k_packed_f32_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 256;
+    const int bytes_per_row = blocks_per_row * 110;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                if (m >= M) return;
+                const uint32_t KMASK1 = 0x03030303u;
+                const uint32_t KMASK2 = 0x0f0f0f0fu;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 110;
+                    const uint8_t* hmask = blk;            // [0..32)
+                    const uint8_t* qs = blk + 32;          // [32..96)
+                    const uint8_t* sc_raw = blk + 96;      // [96..108)
+                    const float d_all = bits_to_f32(static_cast<uint16_t>(blk[108])
+                                                 | (static_cast<uint16_t>(blk[109]) << 8));
+                    uint32_t aux[4];
+                    aux[0] = static_cast<uint32_t>(sc_raw[0])
+                             | (static_cast<uint32_t>(sc_raw[1]) << 8)
+                             | (static_cast<uint32_t>(sc_raw[2]) << 16)
+                             | (static_cast<uint32_t>(sc_raw[3]) << 24);
+                    aux[1] = static_cast<uint32_t>(sc_raw[4])
+                             | (static_cast<uint32_t>(sc_raw[5]) << 8)
+                             | (static_cast<uint32_t>(sc_raw[6]) << 16)
+                             | (static_cast<uint32_t>(sc_raw[7]) << 24);
+                    aux[2] = static_cast<uint32_t>(sc_raw[8])
+                             | (static_cast<uint32_t>(sc_raw[9]) << 8)
+                             | (static_cast<uint32_t>(sc_raw[10]) << 16)
+                             | (static_cast<uint32_t>(sc_raw[11]) << 24);
+                    const uint32_t tmp = aux[2];
+                    aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+                    aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+                    aux[0] = (aux[0] & KMASK2) | ((tmp & KMASK1) << 4);
+                    aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+                    int8_t scales[16];
+                    for (int j = 0; j < 16; ++j) {
+                        scales[j] = static_cast<int8_t>(
+                            static_cast<uint8_t>((aux[j >> 2] >> ((j & 3) * 8)) & 0xFF));
+                    }
+                    const int x_base = b * 256;
+                    int q_cursor = 0;
+                    int x_off = 0;
+                    uint8_t m_bit = 1;
+                    int is = 0;
+                    for (int chunk = 0; chunk < 2; ++chunk) {
+                        uint32_t shift = 0;
+                        for (int j4 = 0; j4 < 4; ++j4) {
+                            float dl = d_all * (static_cast<float>(scales[is]) - 32.0f);
+                            ++is;
+                            for (int l = 0; l < 16; ++l) {
+                                const int lo = static_cast<int>((qs[q_cursor + l] >> shift) & 3);
+                                const int hi_sub = (hmask[l] & m_bit) != 0 ? 0 : 4;
+                                acc += dl * static_cast<float>(lo - hi_sub)
+                                          * x_usm[x_base + x_off + l];
+                            }
+                            x_off += 16;
+                            dl = d_all * (static_cast<float>(scales[is]) - 32.0f);
+                            ++is;
+                            for (int l = 0; l < 16; ++l) {
+                                const int lo = static_cast<int>((qs[q_cursor + l + 16] >> shift) & 3);
+                                const int hi_sub = (hmask[l + 16] & m_bit) != 0 ? 0 : 4;
+                                acc += dl * static_cast<float>(lo - hi_sub)
+                                          * x_usm[x_base + x_off + l];
+                            }
+                            x_off += 16;
+                            shift += 2;
+                            m_bit = static_cast<uint8_t>(m_bit << 1);
+                        }
+                        q_cursor += 32;
+                    }
+                }
+                out_usm[m] = acc;
+            });
+    }).wait();
+}
+
+// ---- Q8_K (292 bytes / 256: f32 d + 256 i8 qs + 16 i16 bsums) ----
+// weight = d * i8. The f32 scale is little-endian (GGUF); bsums unused by
+// matvec. NOTE: d is F32 here, not the f16 used by the other formats.
+template <std::size_t LWS_T>
+inline void matvec_q8_k_packed_f32_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 256;
+    const int bytes_per_row = blocks_per_row * 292;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                if (m >= M) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 292;
+                    const uint32_t d_bits =
+                        static_cast<uint32_t>(blk[0])
+                        | (static_cast<uint32_t>(blk[1]) << 8)
+                        | (static_cast<uint32_t>(blk[2]) << 16)
+                        | (static_cast<uint32_t>(blk[3]) << 24);
+                    float d;
+                    std::memcpy(&d, &d_bits, sizeof(float));
+                    const uint8_t* qs = blk + 4;
+                    const int x_off = b * 256;
+                    for (int j = 0; j < 256; ++j) {
+                        const int8_t w_i8 = static_cast<int8_t>(qs[j]);
+                        acc += d * static_cast<float>(w_i8) * x_usm[x_off + j];
+                    }
+                }
+                out_usm[m] = acc;
+            });
+    }).wait();
+}
+
+// ---- PQ2_0 (PrismML Bonsai, 34 bytes / 128: f16 d + 32 packed 2-bit) ----
+// weight = d * (code - 1), code in [0,3] read low-to-high 2 bits per byte.
+template <std::size_t LWS_T>
+inline void matvec_pq2_0_packed_f32_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 128;
+    const int bytes_per_row = blocks_per_row * 34;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                if (m >= M) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 34;
+                    const float d = bits_to_f32(static_cast<uint16_t>(blk[0])
+                                                | (static_cast<uint16_t>(blk[1]) << 8));
+                    const uint8_t* qs = blk + 2;
+                    const int x_off = b * 128;
+                    // Accumulate in the integer-code domain then scale once
+                    // per block: acc += d * sum((code-1) * x).
+                    float sum = 0.0f;
+                    for (int j = 0; j < 128; ++j) {
+                        const int qv = static_cast<int>((qs[j / 4] >> ((j % 4) * 2)) & 0x3) - 1;
+                        sum += static_cast<float>(qv) * x_usm[x_off + j];
+                    }
+                    acc += d * sum;
+                }
+                out_usm[m] = acc;
+            });
+    }).wait();
+}
+
+// PTQ1_0 gate+up FUSED matvec — one launch, shares x_usm across gate + up.
+// Same trit decode as `rsl_matvec_ptq1_0_packed_f32_usm`; d folds per block.
+template <std::size_t LWS_T>
+inline void matvec_ptq1_0_gate_up_fused_usm_impl(
+    sycl::queue& q,
+    const void* gate_w_bytes_usm,
+    const void* up_w_bytes_usm,
+    const float* x_usm,
+    float* gate_out_usm,
+    float* up_out_usm,
+    int M, int K) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 128;
+    const int bytes_per_row = blocks_per_row * 28;
+    const uint8_t* g_bytes = static_cast<const uint8_t*>(gate_w_bytes_usm);
+    const uint8_t* u_bytes = static_cast<const uint8_t*>(up_w_bytes_usm);
+    const std::size_t global =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                if (m >= M) return;
+                const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+                const uint8_t* g_row = g_bytes + m * bytes_per_row;
+                const uint8_t* u_row = u_bytes + m * bytes_per_row;
+                float gate_acc = 0.0f;
+                float up_acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* g_blk = g_row + b * 28;
+                    const uint8_t* u_blk = u_row + b * 28;
+                    const float g_d = bits_to_f32(static_cast<uint16_t>(g_blk[26])
+                                                  | (static_cast<uint16_t>(g_blk[27]) << 8));
+                    const float u_d = bits_to_f32(static_cast<uint16_t>(u_blk[26])
+                                                  | (static_cast<uint16_t>(u_blk[27]) << 8));
+                    const int x_base = b * 128;
+                    float g_sum = 0.0f;
+                    float u_sum = 0.0f;
+                    // Chunk 1: qs[0..16], 5 digit stages x 16 lanes.
+                    for (int n = 0; n < 5; ++n) {
+                        const uint8_t p3 = pow3[n];
+                        const int e0 = x_base + n * 16;
+                        for (int mm = 0; mm < 16; ++mm) {
+                            const float xv = x_usm[e0 + mm];
+                            const int gt = ((static_cast<int>(static_cast<uint8_t>(g_blk[mm] * p3)) * 3) >> 8) - 1;
+                            const int ut = ((static_cast<int>(static_cast<uint8_t>(u_blk[mm] * p3)) * 3) >> 8) - 1;
+                            g_sum += static_cast<float>(gt) * xv;
+                            u_sum += static_cast<float>(ut) * xv;
+                        }
+                    }
+                    // Chunk 2: qs[16..24], 5 digit stages x 8 lanes.
+                    for (int n = 0; n < 5; ++n) {
+                        const uint8_t p3 = pow3[n];
+                        const int e0 = x_base + 80 + n * 8;
+                        for (int mm = 0; mm < 8; ++mm) {
+                            const float xv = x_usm[e0 + mm];
+                            const int gt = ((static_cast<int>(static_cast<uint8_t>(g_blk[16 + mm] * p3)) * 3) >> 8) - 1;
+                            const int ut = ((static_cast<int>(static_cast<uint8_t>(u_blk[16 + mm] * p3)) * 3) >> 8) - 1;
+                            g_sum += static_cast<float>(gt) * xv;
+                            u_sum += static_cast<float>(ut) * xv;
+                        }
+                    }
+                    // qh: 2 bytes x 4 digit stages.
+                    for (int n = 0; n < 4; ++n) {
+                        const uint8_t p3 = pow3[n];
+                        const int e0 = x_base + 120 + n * 2;
+                        for (int hh = 0; hh < 2; ++hh) {
+                            const float xv = x_usm[e0 + hh];
+                            const int gt = ((static_cast<int>(static_cast<uint8_t>(g_blk[24 + hh] * p3)) * 3) >> 8) - 1;
+                            const int ut = ((static_cast<int>(static_cast<uint8_t>(u_blk[24 + hh] * p3)) * 3) >> 8) - 1;
+                            g_sum += static_cast<float>(gt) * xv;
+                            u_sum += static_cast<float>(ut) * xv;
+                        }
+                    }
+                    gate_acc += g_d * g_sum;
+                    up_acc += u_d * u_sum;
+                }
+                gate_out_usm[m] = gate_acc;
+                up_out_usm[m] = up_acc;
+            });
+    }).wait();
+}
+
+extern "C" {
+
+void rsl_matvec_q4_0_packed_f32_usm(rsl_stream* s,
+                                    const void* w_bytes_usm,
+                                    const float* x_usm,
+                                    float* out_usm,
+                                    int M, int K,
+                                    int lws) RSL_FFI_BODY_VOID(
+    "rsl_matvec_q4_0_packed_f32_usm", {
+    if (s == nullptr || w_bytes_usm == nullptr
+        || x_usm == nullptr || out_usm == nullptr) {
+        return;
+    }
+    if (M <= 0 || K <= 0 || (K % 32) != 0) {
+        return;
+    }
+    auto& q = s->q;
+    const int eff_lws = (lws <= 0) ? static_cast<int>(RSL_LWS) : lws;
+    switch (eff_lws) {
+        case 16:  matvec_q4_0_packed_f32_usm_impl<16>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 32:  matvec_q4_0_packed_f32_usm_impl<32>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 64:  matvec_q4_0_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 128: matvec_q4_0_packed_f32_usm_impl<128>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 256: matvec_q4_0_packed_f32_usm_impl<256>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        default:  matvec_q4_0_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+    }
+})
+
+void rsl_matvec_q5_0_packed_f32_usm(rsl_stream* s,
+                                    const void* w_bytes_usm,
+                                    const float* x_usm,
+                                    float* out_usm,
+                                    int M, int K,
+                                    int lws) RSL_FFI_BODY_VOID(
+    "rsl_matvec_q5_0_packed_f32_usm", {
+    if (s == nullptr || w_bytes_usm == nullptr
+        || x_usm == nullptr || out_usm == nullptr) {
+        return;
+    }
+    if (M <= 0 || K <= 0 || (K % 32) != 0) {
+        return;
+    }
+    auto& q = s->q;
+    const int eff_lws = (lws <= 0) ? static_cast<int>(RSL_LWS) : lws;
+    switch (eff_lws) {
+        case 16:  matvec_q5_0_packed_f32_usm_impl<16>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 32:  matvec_q5_0_packed_f32_usm_impl<32>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 64:  matvec_q5_0_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 128: matvec_q5_0_packed_f32_usm_impl<128>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 256: matvec_q5_0_packed_f32_usm_impl<256>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        default:  matvec_q5_0_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+    }
+})
+
+void rsl_matvec_q4_1_packed_f32_usm(rsl_stream* s,
+                                    const void* w_bytes_usm,
+                                    const float* x_usm,
+                                    float* out_usm,
+                                    int M, int K,
+                                    int lws) RSL_FFI_BODY_VOID(
+    "rsl_matvec_q4_1_packed_f32_usm", {
+    if (s == nullptr || w_bytes_usm == nullptr
+        || x_usm == nullptr || out_usm == nullptr) {
+        return;
+    }
+    if (M <= 0 || K <= 0 || (K % 32) != 0) {
+        return;
+    }
+    auto& q = s->q;
+    const int eff_lws = (lws <= 0) ? static_cast<int>(RSL_LWS) : lws;
+    switch (eff_lws) {
+        case 16:  matvec_q4_1_packed_f32_usm_impl<16>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 32:  matvec_q4_1_packed_f32_usm_impl<32>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 64:  matvec_q4_1_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 128: matvec_q4_1_packed_f32_usm_impl<128>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 256: matvec_q4_1_packed_f32_usm_impl<256>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        default:  matvec_q4_1_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+    }
+})
+
+void rsl_matvec_q5_1_packed_f32_usm(rsl_stream* s,
+                                    const void* w_bytes_usm,
+                                    const float* x_usm,
+                                    float* out_usm,
+                                    int M, int K,
+                                    int lws) RSL_FFI_BODY_VOID(
+    "rsl_matvec_q5_1_packed_f32_usm", {
+    if (s == nullptr || w_bytes_usm == nullptr
+        || x_usm == nullptr || out_usm == nullptr) {
+        return;
+    }
+    if (M <= 0 || K <= 0 || (K % 32) != 0) {
+        return;
+    }
+    auto& q = s->q;
+    const int eff_lws = (lws <= 0) ? static_cast<int>(RSL_LWS) : lws;
+    switch (eff_lws) {
+        case 16:  matvec_q5_1_packed_f32_usm_impl<16>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 32:  matvec_q5_1_packed_f32_usm_impl<32>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 64:  matvec_q5_1_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 128: matvec_q5_1_packed_f32_usm_impl<128>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 256: matvec_q5_1_packed_f32_usm_impl<256>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        default:  matvec_q5_1_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+    }
+})
+
+void rsl_matvec_q2_k_packed_f32_usm(rsl_stream* s,
+                                    const void* w_bytes_usm,
+                                    const float* x_usm,
+                                    float* out_usm,
+                                    int M, int K,
+                                    int lws) RSL_FFI_BODY_VOID(
+    "rsl_matvec_q2_k_packed_f32_usm", {
+    if (s == nullptr || w_bytes_usm == nullptr
+        || x_usm == nullptr || out_usm == nullptr) {
+        return;
+    }
+    if (M <= 0 || K <= 0 || (K % 256) != 0) {
+        return;
+    }
+    auto& q = s->q;
+    const int eff_lws = (lws <= 0) ? static_cast<int>(RSL_LWS) : lws;
+    switch (eff_lws) {
+        case 16:  matvec_q2_k_packed_f32_usm_impl<16>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 32:  matvec_q2_k_packed_f32_usm_impl<32>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 64:  matvec_q2_k_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 128: matvec_q2_k_packed_f32_usm_impl<128>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 256: matvec_q2_k_packed_f32_usm_impl<256>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        default:  matvec_q2_k_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+    }
+})
+
+void rsl_matvec_q3_k_packed_f32_usm(rsl_stream* s,
+                                    const void* w_bytes_usm,
+                                    const float* x_usm,
+                                    float* out_usm,
+                                    int M, int K,
+                                    int lws) RSL_FFI_BODY_VOID(
+    "rsl_matvec_q3_k_packed_f32_usm", {
+    if (s == nullptr || w_bytes_usm == nullptr
+        || x_usm == nullptr || out_usm == nullptr) {
+        return;
+    }
+    if (M <= 0 || K <= 0 || (K % 256) != 0) {
+        return;
+    }
+    auto& q = s->q;
+    const int eff_lws = (lws <= 0) ? static_cast<int>(RSL_LWS) : lws;
+    switch (eff_lws) {
+        case 16:  matvec_q3_k_packed_f32_usm_impl<16>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 32:  matvec_q3_k_packed_f32_usm_impl<32>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 64:  matvec_q3_k_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 128: matvec_q3_k_packed_f32_usm_impl<128>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 256: matvec_q3_k_packed_f32_usm_impl<256>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        default:  matvec_q3_k_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+    }
+})
+
+void rsl_matvec_q8_k_packed_f32_usm(rsl_stream* s,
+                                    const void* w_bytes_usm,
+                                    const float* x_usm,
+                                    float* out_usm,
+                                    int M, int K,
+                                    int lws) RSL_FFI_BODY_VOID(
+    "rsl_matvec_q8_k_packed_f32_usm", {
+    if (s == nullptr || w_bytes_usm == nullptr
+        || x_usm == nullptr || out_usm == nullptr) {
+        return;
+    }
+    if (M <= 0 || K <= 0 || (K % 256) != 0) {
+        return;
+    }
+    auto& q = s->q;
+    const int eff_lws = (lws <= 0) ? static_cast<int>(RSL_LWS) : lws;
+    switch (eff_lws) {
+        case 16:  matvec_q8_k_packed_f32_usm_impl<16>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 32:  matvec_q8_k_packed_f32_usm_impl<32>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 64:  matvec_q8_k_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 128: matvec_q8_k_packed_f32_usm_impl<128>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 256: matvec_q8_k_packed_f32_usm_impl<256>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        default:  matvec_q8_k_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+    }
+})
+
+void rsl_matvec_pq2_0_packed_f32_usm(rsl_stream* s,
+                                     const void* w_bytes_usm,
+                                     const float* x_usm,
+                                     float* out_usm,
+                                     int M, int K,
+                                     int lws) RSL_FFI_BODY_VOID(
+    "rsl_matvec_pq2_0_packed_f32_usm", {
+    if (s == nullptr || w_bytes_usm == nullptr
+        || x_usm == nullptr || out_usm == nullptr) {
+        return;
+    }
+    if (M <= 0 || K <= 0 || (K % 128) != 0) {
+        return;
+    }
+    auto& q = s->q;
+    const int eff_lws = (lws <= 0) ? static_cast<int>(RSL_LWS) : lws;
+    switch (eff_lws) {
+        case 16:  matvec_pq2_0_packed_f32_usm_impl<16>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 32:  matvec_pq2_0_packed_f32_usm_impl<32>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 64:  matvec_pq2_0_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 128: matvec_pq2_0_packed_f32_usm_impl<128>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 256: matvec_pq2_0_packed_f32_usm_impl<256>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        default:  matvec_pq2_0_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+    }
+})
+
+void rsl_matvec_ptq1_0_gate_up_fused_usm(rsl_stream* s,
+                                         const void* gate_w_bytes_usm,
+                                         const void* up_w_bytes_usm,
+                                         const float* x_usm,
+                                         float* gate_out_usm,
+                                         float* up_out_usm,
+                                         int M, int K,
+                                         int lws) RSL_FFI_BODY_VOID(
+    "rsl_matvec_ptq1_0_gate_up_fused_usm", {
+    if (s == nullptr || gate_w_bytes_usm == nullptr || up_w_bytes_usm == nullptr
+        || x_usm == nullptr || gate_out_usm == nullptr || up_out_usm == nullptr) {
+        return;
+    }
+    if (M <= 0 || K <= 0 || (K % 128) != 0) {
+        return;
+    }
+    auto& q = s->q;
+    const int eff_lws = (lws <= 0) ? static_cast<int>(RSL_LWS) : lws;
+    switch (eff_lws) {
+        case 16:  matvec_ptq1_0_gate_up_fused_usm_impl<16>(q, gate_w_bytes_usm, up_w_bytes_usm, x_usm, gate_out_usm, up_out_usm, M, K); break;
+        case 32:  matvec_ptq1_0_gate_up_fused_usm_impl<32>(q, gate_w_bytes_usm, up_w_bytes_usm, x_usm, gate_out_usm, up_out_usm, M, K); break;
+        case 64:  matvec_ptq1_0_gate_up_fused_usm_impl<64>(q, gate_w_bytes_usm, up_w_bytes_usm, x_usm, gate_out_usm, up_out_usm, M, K); break;
+        case 128: matvec_ptq1_0_gate_up_fused_usm_impl<128>(q, gate_w_bytes_usm, up_w_bytes_usm, x_usm, gate_out_usm, up_out_usm, M, K); break;
+        case 256: matvec_ptq1_0_gate_up_fused_usm_impl<256>(q, gate_w_bytes_usm, up_w_bytes_usm, x_usm, gate_out_usm, up_out_usm, M, K); break;
+        default:  matvec_ptq1_0_gate_up_fused_usm_impl<64>(q, gate_w_bytes_usm, up_w_bytes_usm, x_usm, gate_out_usm, up_out_usm, M, K); break;
+    }
+})
+
 // USM-resident Q5_K_M packed matvec — batched over N input rows.
 // See `rsl_matvec_q5_k_packed_f32_usm` for the super-block layout.
 }  // extern "C" — temporary close for the Q5_K batched template
@@ -9736,6 +11128,58 @@ inline void matvec_iq3_s_add_rmsnorm_usm_impl(
     RSL_H6_END
 }
 
+// ---- PTQ1_0 (block 128, 28 bytes) ----
+// Trit decode identical to `matvec_ptq1_0_packed_f32_usm_impl`; the d scale
+// folds per block into `dot`, then RSL_H6_END adds the residual + rmsnorm.
+template <std::size_t LWS_T>
+inline void matvec_ptq1_0_add_rmsnorm_usm_impl(
+    sycl::queue& q, const void* w_bytes_usm, const float* attn_usm,
+    float* hidden_usm, const float* w_norm_usm, float* y_norm_usm,
+    int M, int K, float eps) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 128;
+    const int bytes_per_row = blocks_per_row * 28;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    RSL_H6_BEGIN(LWS)
+        const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+        const uint8_t* row = w_bytes + m * bytes_per_row;
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const uint8_t* blk = row + b * 28;
+            const uint8_t* qs = blk;
+            const uint8_t* qh = blk + 24;
+            const float d = bits_to_f32(static_cast<uint16_t>(blk[26])
+                                        | (static_cast<uint16_t>(blk[27]) << 8));
+            const int x_base = b * 128;
+            float sum = 0.0f;
+            for (int n = 0; n < 5; ++n) {
+                const uint8_t p3 = pow3[n];
+                const int e0 = x_base + n * 16;
+                for (int mm = 0; mm < 16; ++mm) {
+                    const int trit = ((static_cast<int>(static_cast<uint8_t>(qs[mm] * p3)) * 3) >> 8) - 1;
+                    sum += static_cast<float>(trit) * attn_usm[e0 + mm];
+                }
+            }
+            for (int n = 0; n < 5; ++n) {
+                const uint8_t p3 = pow3[n];
+                const int e0 = x_base + 80 + n * 8;
+                for (int mm = 0; mm < 8; ++mm) {
+                    const int trit = ((static_cast<int>(static_cast<uint8_t>(qs[16 + mm] * p3)) * 3) >> 8) - 1;
+                    sum += static_cast<float>(trit) * attn_usm[e0 + mm];
+                }
+            }
+            for (int n = 0; n < 4; ++n) {
+                const uint8_t p3 = pow3[n];
+                const int e0 = x_base + 120 + n * 2;
+                for (int hh = 0; hh < 2; ++hh) {
+                    const int trit = ((static_cast<int>(static_cast<uint8_t>(qh[hh] * p3)) * 3) >> 8) - 1;
+                    sum += static_cast<float>(trit) * attn_usm[e0 + hh];
+                }
+            }
+            dot += d * sum;
+        }
+    RSL_H6_END
+}
+
 extern "C" {
 
 #define RSL_H6_WRAPPER_BODY(IMPL) \
@@ -9846,6 +11290,14 @@ void rsl_matvec_iq3_s_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm,
     RSL_FFI_BODY_VOID("rsl_matvec_iq3_s_add_rmsnorm_usm", {
     if (K % 256 != 0) return;
     RSL_H6_WRAPPER_BODY(matvec_iq3_s_add_rmsnorm_usm_impl)
+})
+
+void rsl_matvec_ptq1_0_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm,
+    const float* attn_usm, float* hidden_usm, const float* w_norm_usm,
+    float* y_norm_usm, int M, int K, float eps, int lws)
+    RSL_FFI_BODY_VOID("rsl_matvec_ptq1_0_add_rmsnorm_usm", {
+    if (K % 128 != 0) return;
+    RSL_H6_WRAPPER_BODY(matvec_ptq1_0_add_rmsnorm_usm_impl)
 })
 
 }  // extern "C" — close before the H8 mixed-precision templates
@@ -10371,6 +11823,56 @@ inline void matvec_iq3_s_f16in_packed_f32_usm_impl(
     RSL_H8_END
 }
 
+// ---- PTQ1_0 ----
+// Same trit decode as the packed matvec; activation read as F16 via XLD.
+// The d scale folds per block into `dot`.
+template <std::size_t LWS_T>
+inline void matvec_ptq1_0_f16in_packed_f32_usm_impl(
+    sycl::queue& q, const void* w_bytes_usm, const uint16_t* x_f16, float* out_usm, int M, int K) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 128;
+    const int bytes_per_row = blocks_per_row * 28;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    RSL_H8_BEGIN(LWS)
+        const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+        const uint8_t* row = w_bytes + m * bytes_per_row;
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const uint8_t* blk = row + b * 28;
+            const uint8_t* qs = blk;
+            const uint8_t* qh = blk + 24;
+            const float d = bits_to_f32(static_cast<uint16_t>(blk[26])
+                                        | (static_cast<uint16_t>(blk[27]) << 8));
+            const int x_base = b * 128;
+            float sum = 0.0f;
+            for (int n = 0; n < 5; ++n) {
+                const uint8_t p3 = pow3[n];
+                const int e0 = x_base + n * 16;
+                for (int mm = 0; mm < 16; ++mm) {
+                    const int trit = ((static_cast<int>(static_cast<uint8_t>(qs[mm] * p3)) * 3) >> 8) - 1;
+                    sum += static_cast<float>(trit) * XLD(e0 + mm);
+                }
+            }
+            for (int n = 0; n < 5; ++n) {
+                const uint8_t p3 = pow3[n];
+                const int e0 = x_base + 80 + n * 8;
+                for (int mm = 0; mm < 8; ++mm) {
+                    const int trit = ((static_cast<int>(static_cast<uint8_t>(qs[16 + mm] * p3)) * 3) >> 8) - 1;
+                    sum += static_cast<float>(trit) * XLD(e0 + mm);
+                }
+            }
+            for (int n = 0; n < 4; ++n) {
+                const uint8_t p3 = pow3[n];
+                const int e0 = x_base + 120 + n * 2;
+                for (int hh = 0; hh < 2; ++hh) {
+                    const int trit = ((static_cast<int>(static_cast<uint8_t>(qh[hh] * p3)) * 3) >> 8) - 1;
+                    sum += static_cast<float>(trit) * XLD(e0 + hh);
+                }
+            }
+            dot += d * sum;
+        }
+    RSL_H8_END
+}
+
 extern "C" {
 
 #define RSL_H8_WRAPPER(NAME, IMPL, ALIGN) \
@@ -10403,6 +11905,7 @@ RSL_H8_WRAPPER(rsl_matvec_iq2_xs_f16in_packed_f32_usm, matvec_iq2_xs_f16in_packe
 RSL_H8_WRAPPER(rsl_matvec_iq2_s_f16in_packed_f32_usm,  matvec_iq2_s_f16in_packed_f32_usm_impl,  256)
 RSL_H8_WRAPPER(rsl_matvec_iq3_xxs_f16in_packed_f32_usm, matvec_iq3_xxs_f16in_packed_f32_usm_impl, 256)
 RSL_H8_WRAPPER(rsl_matvec_iq3_s_f16in_packed_f32_usm,  matvec_iq3_s_f16in_packed_f32_usm_impl,  256)
+RSL_H8_WRAPPER(rsl_matvec_ptq1_0_f16in_packed_f32_usm, matvec_ptq1_0_f16in_packed_f32_usm_impl, 128)
 
 // Rotary positional embedding, half-split (neox / HF-converted-GGUF
 // convention): for each head, pair (qk[j], qk[j + head_dim/2]) gets

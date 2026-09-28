@@ -414,18 +414,21 @@ pub async fn messages(
     let model = req_model.unwrap_or_else(|| serving.model_id.clone());
     let id = format!("msg_{:032x}", unix_ts() as u128);
 
-    let input_tokens = serving
-        .cpu_engine
-        .as_ref()
-        .and_then(|e| e.count_chat_prompt(&msgs).ok())
-        .unwrap_or(0);
-
-    // Tools: convert Anthropic shape → OpenAI shape (templates were
-    // trained against the OpenAI form). When present, we pre-render the
-    // prompt with the tools branch and drive the engine via `generate`
-    // rather than `chat`, mirroring the OpenAI tools path.
+    // Tools: convert Anthropic shape → OpenAI shape (templates were trained
+    // against the OpenAI form). When present, we pre-render the prompt with the
+    // tools branch and drive the engine via `generate` rather than `chat`,
+    // mirroring the OpenAI tools path. Determined first so the env-hint
+    // injection + tool-aware render + input-token count all see the tools.
     let tools_openai = req_tools.map(anthropic_tools_to_openai);
     let has_tools = tools_openai.is_some();
+
+    // Host-environment hint for tool/function-calling: inject the same
+    // `[Host environment]` block the OpenAI (chat.rs) and Ollama adapters add,
+    // so the model emits shell/command tool calls in the right dialect. Gated
+    // by `[server].tool_environment_hint`; only on tool requests.
+    if has_tools {
+        msgs = inject_anthropic_env_hint(msgs);
+    }
 
     let pre_rendered_prompt = if has_tools {
         match serving.cpu_engine.as_ref().and_then(|e| e.tokenizer()) {
@@ -462,6 +465,26 @@ pub async fn messages(
         }
     } else {
         None
+    };
+
+    // input_tokens: count the ACTUAL prompt. On the tools path the pre-rendered
+    // prompt already includes the tool schemas + the injected env hint, so
+    // tokenize it directly (mirrors chat.rs); otherwise count the chat
+    // messages. Computed here — after the render — so the reported count is
+    // never the pre-tools message count.
+    let input_tokens = match pre_rendered_prompt.as_ref() {
+        Some(prompt) => serving
+            .cpu_engine
+            .as_ref()
+            .and_then(|e| e.tokenizer())
+            .and_then(|t| t.encode(prompt, t.add_bos_token()).ok())
+            .map(|ids| ids.len() as u32)
+            .unwrap_or(0),
+        None => serving
+            .cpu_engine
+            .as_ref()
+            .and_then(|e| e.count_chat_prompt(&msgs).ok())
+            .unwrap_or(0),
     };
 
     if stream {
@@ -520,6 +543,32 @@ fn anthropic_tools_to_openai(tools: Value) -> Value {
         })
         .collect();
     Value::Array(out)
+}
+
+/// Inject the SERVER host-environment `[Host environment]` block into an
+/// Anthropic tool request's messages when `[server].tool_environment_hint`
+/// is on. Appends the block (blank-line separated) to a leading system
+/// message, else prepends a fresh system message — the `Vec<ChatMessage>`
+/// analogue of `chat::maybe_inject_env_hint` / `ollama::inject_env_hint_json`.
+/// The Anthropic adapter builds every message via `ChatMessage::text` (no
+/// image bytes on this path), so rebuilding the system turn as text is lossless.
+fn inject_anthropic_env_hint(mut msgs: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    if !crate::env_hint::tool_environment_hint_enabled() {
+        return msgs;
+    }
+    let block = crate::env_hint::host_environment_hint();
+    if matches!(msgs.first(), Some(m) if m.role == "system") {
+        let first = msgs.remove(0);
+        let merged = if first.content.is_empty() {
+            block.to_string()
+        } else {
+            format!("{}\n\n{block}", first.content)
+        };
+        msgs.insert(0, ChatMessage::text("system", merged));
+    } else {
+        msgs.insert(0, ChatMessage::text("system", block.to_string()));
+    }
+    msgs
 }
 
 /// Sentinel `stop_sequence` value used to surface a tool-call iteration

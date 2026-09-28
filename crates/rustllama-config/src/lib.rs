@@ -1220,6 +1220,19 @@ pub fn validate(cfg: &Config) -> Result<()> {
         }
         _ => {}
     }
+    // `[embeddings]` and `[reranker]` mirror `[model]`'s mutually-exclusive
+    // `path` / `hub` selectors — enforce the same rule so a config that sets
+    // both fails loudly at load instead of silently preferring one.
+    if cfg.embeddings.path.is_some() && cfg.embeddings.hub.is_some() {
+        return Err(ConfigError::Validation(
+            "[embeddings] specify exactly one of `path` or `hub`, not both".into(),
+        ));
+    }
+    if cfg.reranker.path.is_some() && cfg.reranker.hub.is_some() {
+        return Err(ConfigError::Validation(
+            "[reranker] specify exactly one of `path` or `hub`, not both".into(),
+        ));
+    }
     let mb = cfg.inference.memory_budget.trim();
     if !(mb.eq_ignore_ascii_case("manual") || mb.eq_ignore_ascii_case("auto")) {
         return Err(ConfigError::Validation(format!(
@@ -1247,6 +1260,14 @@ pub struct ChangeSet {
     pub server: bool,
     pub ui: bool,
     pub tuning: bool,
+    /// `[embeddings]` changed.
+    pub embeddings: bool,
+    /// `[reranker]` changed.
+    pub reranker: bool,
+    /// The `[[system_prompts]]` library changed.
+    pub system_prompts: bool,
+    /// The `[[profiles]]` list changed.
+    pub profiles: bool,
     /// The `[inference]` diff touches ONLY `moe_expert_cache_mb` —
     /// the one inference knob the server can hot-apply to a loaded
     /// engine at a request-safe point (elastic expert-cache budget,
@@ -1257,7 +1278,15 @@ pub struct ChangeSet {
 
 impl ChangeSet {
     pub fn any(&self) -> bool {
-        self.model || self.inference || self.server || self.ui || self.tuning
+        self.model
+            || self.inference
+            || self.server
+            || self.ui
+            || self.tuning
+            || self.embeddings
+            || self.reranker
+            || self.system_prompts
+            || self.profiles
     }
     pub fn diff(old: &Config, new: &Config) -> Self {
         let inference = old.inference != new.inference;
@@ -1272,6 +1301,10 @@ impl ChangeSet {
             server: old.server != new.server,
             ui: old.ui != new.ui,
             tuning: old.tuning != new.tuning,
+            embeddings: old.embeddings != new.embeddings,
+            reranker: old.reranker != new.reranker,
+            system_prompts: old.system_prompts != new.system_prompts,
+            profiles: old.profiles != new.profiles,
             inference_budget_only,
         }
     }
@@ -1475,6 +1508,62 @@ mod tests {
         c.model.path = Some("a.gguf".into());
         c.model.hub = Some("a/b:c".into());
         assert!(validate(&c).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_both_embeddings_sources() {
+        let mut c = Config::default();
+        c.embeddings.path = Some("e.gguf".into());
+        c.embeddings.hub = Some("a/b:e.gguf".into());
+        assert!(validate(&c).is_err());
+        // Either alone is fine.
+        c.embeddings.hub = None;
+        assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_both_reranker_sources() {
+        let mut c = Config::default();
+        c.reranker.path = Some("r.gguf".into());
+        c.reranker.hub = Some("a/b:r.gguf".into());
+        assert!(validate(&c).is_err());
+        c.reranker.path = None;
+        assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn changeset_detects_embeddings_reranker_prompts_profiles() {
+        // Edits touching only these sections must still be detected + notified
+        // (previously diff()/any() ignored them, so the snapshot updated
+        // silently and no ConfigDelta was broadcast).
+        let base = Config::default();
+
+        let mut b = base.clone();
+        b.embeddings.hub = Some("a/b:e.gguf".into());
+        let cs = ChangeSet::diff(&base, &b);
+        assert!(cs.embeddings && cs.any());
+
+        let mut b = base.clone();
+        b.reranker.hub = Some("a/b:r.gguf".into());
+        let cs = ChangeSet::diff(&base, &b);
+        assert!(cs.reranker && cs.any());
+
+        let mut b = base.clone();
+        b.system_prompts.push(SystemPrompt {
+            name: "x".into(),
+            body: "y".into(),
+            default_for_model: String::new(),
+        });
+        let cs = ChangeSet::diff(&base, &b);
+        assert!(cs.system_prompts && cs.any());
+
+        let mut b = base.clone();
+        b.profiles.push(ProfileOverride {
+            name: "p".into(),
+            ..Default::default()
+        });
+        let cs = ChangeSet::diff(&base, &b);
+        assert!(cs.profiles && cs.any());
     }
 
     #[test]

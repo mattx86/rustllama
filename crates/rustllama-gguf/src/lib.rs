@@ -67,6 +67,8 @@ pub enum GgufError {
     UnknownMetadataType(u32),
     #[error("unknown ggml type id {0}")]
     UnknownGgmlType(u32),
+    #[error("invalid general.alignment {0}: must be a non-zero power of two")]
+    InvalidAlignment(u64),
     #[error("string at offset {offset} is not valid utf-8: {source}")]
     BadUtf8 {
         offset: usize,
