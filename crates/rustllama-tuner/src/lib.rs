@@ -316,6 +316,14 @@ pub struct TuningResult {
     /// entry.
     #[serde(default)]
     pub moe_gpu_split_permille: Option<u32>,
+    /// Autotune winner: enable MTP/NextN self-speculation decode for this
+    /// model. Some(true)=faster with MTP, Some(false)=faster without, None=untuned.
+    #[serde(default)]
+    pub speculative_mtp: Option<bool>,
+    /// Autotune winner: use the chunked-parallel SSM prefill scan (hybrid
+    /// models). Some(true)=chunked prefill was faster, None=untuned.
+    #[serde(default)]
+    pub ssm_prefill_chunked: Option<bool>,
     /// Per-model decision-probability calibration, keyed by model file
     /// stem like `placement`. Fit by the decision-calibration stage of
     /// `tune --all`: the temperature that best calibrates the model's
@@ -389,6 +397,8 @@ impl TuningResult {
             flash_v3_kv_tile: None,
             moe_placement: None,
             moe_gpu_split_permille: None,
+            speculative_mtp: None,
+            ssm_prefill_chunked: None,
             decision_calibration: HashMap::new(),
             per_device_perf: HashMap::new(),
             last_tuned: None,

@@ -2444,6 +2444,26 @@ async fn load_model(
             );
         }
     }
+    // MTP / NextN self-speculation: honor the tuner-cache winner (gated by
+    // [tuning].auto_apply_speculative_mtp) over the config default, mirroring
+    // the CLI serve load path. A non-capable model (not hybrid / no NextN head)
+    // silently no-ops on the engine side, so this is safe to set
+    // unconditionally. (kv_dtype trust-the-winner + the chunked-SSM-prefill
+    // env transport are CLI-serve-only for now — see the combined-build
+    // follow-up; the HTTP load path here reads only placement / batch_size /
+    // MTP from the cache today.)
+    let applied_mtp = if cfg_for_tuning.tuning.auto_apply_speculative_mtp {
+        tuner_cached_speculative_mtp().unwrap_or(cfg_for_tuning.inference.speculative_mtp)
+    } else {
+        cfg_for_tuning.inference.speculative_mtp
+    };
+    if applied_mtp {
+        tracing::info!(
+            model = %model_key,
+            "load_model: MTP / NextN self-speculative decoding enabled (hybrid + NextN only)"
+        );
+    }
+    cpu.set_mtp_speculative(applied_mtp);
     let model_id = cpu.model_id().to_string();
     let cpu = Arc::new(cpu);
     // Pre-upload packed-quant weights to USM on a blocking-pool
@@ -3574,6 +3594,18 @@ fn tuner_cached_batch_size() -> Option<u32> {
     let key = rustllama_tuner::system_fingerprint();
     let tuning = rustllama_tuner::load_cache(&cache_dir, &key).ok()??;
     tuning.batch_size
+}
+
+/// Look up the cached MTP / NextN self-speculation winner for this system
+/// (whole-system fingerprint). `None` on cache miss (fresh install, model
+/// never tuned) or an unresolvable cache dir — the caller then falls back to
+/// the config default unchanged. Mirrors the CLI serve load path's
+/// `speculative_mtp_from_cache_or_default`.
+fn tuner_cached_speculative_mtp() -> Option<bool> {
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    let tuning = rustllama_tuner::load_cache(&cache_dir, &key).ok()??;
+    tuning.speculative_mtp
 }
 
 /// Peek at a GGUF file's `<arch>.context_length` metadata without

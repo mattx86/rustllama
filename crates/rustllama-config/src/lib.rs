@@ -509,6 +509,11 @@ pub struct InferenceConfig {
     /// raw-softmax sampling caveat as the other speculative paths.
     #[serde(default)]
     pub speculative_mtp: bool,
+    /// Use the chunked-parallel SSM prefill scan for hybrid (DeltaNet)
+    /// models. Autotuner-selected; promoted to RUSTLLAMA_SSM_PREFILL_CHUNKED
+    /// at serve load. Default false.
+    #[serde(default)]
+    pub ssm_prefill_chunked: bool,
     /// Trailing-token match window for the n-gram drafter. Default 3 —
     /// good for code without ballooning lookup cost. Ignored when
     /// `speculative_ngram = false`.
@@ -837,6 +842,7 @@ impl Default for InferenceConfig {
             kv_page_size: default_kv_page_size(),
             speculative_ngram: false,
             speculative_mtp: false,
+            ssm_prefill_chunked: false,
             speculative_draft_path: None,
             speculative_draft_k: default_speculative_draft_k(),
             ngram_n_match: 3,
@@ -1052,6 +1058,10 @@ pub struct TuningConfig {
     /// kernel and context length — let the tuner decide.
     #[serde(default = "default_true_serde")]
     pub auto_apply_flash_attention: bool,
+    #[serde(default = "default_true_serde")]
+    pub auto_apply_speculative_mtp: bool,
+    #[serde(default = "default_true_serde")]
+    pub auto_apply_ssm_prefill_chunked: bool,
     /// When `true` (default), the engine overrides
     /// `[inference].kv_cache_layout` with the cached winner.
     /// Contiguous wins for single-flight today; paged is wired but
@@ -1112,6 +1122,8 @@ impl Default for TuningConfig {
             auto_apply_batch_size: true,
             auto_apply_kv_dtype: true,
             auto_apply_flash_attention: true,
+            auto_apply_speculative_mtp: true,
+            auto_apply_ssm_prefill_chunked: true,
             auto_apply_kv_cache_layout: true,
             auto_apply_flash_kv_min: true,
             auto_apply_prefix_cache_max_snapshots: true,

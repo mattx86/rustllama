@@ -205,7 +205,7 @@ pub fn run_autotune_blocking(
         .and_then(|s| s.to_str())
         .unwrap_or("model")
         .to_string();
-    let stage_total = if scope == TuneScope::Placement { 1 } else { 8 };
+    let stage_total = if scope == TuneScope::Placement { 1 } else { 10 };
     begin(&model_id, stage_total);
 
     let exe = std::env::current_exe()

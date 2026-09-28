@@ -424,6 +424,28 @@ pub enum Command {
         /// `[tuning].auto_apply_moe_placement`).
         #[arg(long)]
         moe_placement: bool,
+        /// MTP / NextN self-speculation A/B sweep: measure decode tok/s
+        /// with MTP self-speculative decode off vs on and pick the
+        /// faster arm. Hybrid + NextN-head models only; a non-capable
+        /// model records `false` (nothing to tune). Persists winner
+        /// under `speculative_mtp`; auto-applied on next load when
+        /// `[tuning].auto_apply_speculative_mtp = true`.
+        #[arg(long)]
+        speculative_mtp: bool,
+        /// Repeats per arm for the MTP sweep (median picks the winner).
+        #[arg(long, default_value_t = 3)]
+        speculative_mtp_repeats: u32,
+        /// Chunked-parallel SSM (DeltaNet) prefill A/B sweep: measure
+        /// prefill tok/s with the chunked path off vs on and pick the
+        /// faster arm. Hybrid models only; a non-hybrid model records
+        /// `false` (nothing to tune). Persists winner under
+        /// `ssm_prefill_chunked`; auto-applied on next load when
+        /// `[tuning].auto_apply_ssm_prefill_chunked = true`.
+        #[arg(long)]
+        ssm_prefill_chunked: bool,
+        /// Repeats per arm for the chunked-SSM-prefill sweep.
+        #[arg(long, default_value_t = 3)]
+        ssm_prefill_chunked_repeats: u32,
         /// **Comprehensive autotune**: run every sweep in coordinate-
         /// descent order — kernel LWS → kv_dtype → flash_attention →
         /// kv_cache_layout → placement → batch_size → threads — and
@@ -1105,6 +1127,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             flash_v3_kv_tile,
             flash_v3_kv_tile_candidates,
             moe_placement,
+            speculative_mtp,
+            speculative_mtp_repeats,
+            ssm_prefill_chunked,
+            ssm_prefill_chunked_repeats,
             all,
             skip_cached,
             force,
@@ -1130,6 +1156,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 kv_page_size,
                 flash_v3_kv_tile,
                 moe_placement,
+                speculative_mtp,
+                ssm_prefill_chunked,
                 all,
             ]
             .iter()
@@ -1140,7 +1168,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     "tune: --placement / --batch-size / --threads / --kv-dtype / \
                      --flash-attention / --kv-layout / --flash-kv-min / \
                      --prefix-snapshots / --kv-page-size / --flash-v3-kv-tile / \
-                     --moe-placement / --all are exclusive; pick at most one"
+                     --moe-placement / --speculative-mtp / --ssm-prefill-chunked / \
+                     --all are exclusive; pick at most one"
                 );
             }
             if all {
@@ -1253,6 +1282,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     prompt_tokens,
                     decode_tokens,
                     repeats,
+                );
+            }
+            if speculative_mtp {
+                return cmd_tune_speculative_mtp(&config_path, model, speculative_mtp_repeats);
+            }
+            if ssm_prefill_chunked {
+                return cmd_tune_ssm_prefill_chunked(
+                    &config_path,
+                    model,
+                    ssm_prefill_chunked_repeats,
                 );
             }
             if threads {
@@ -1795,6 +1834,14 @@ fn promote_memory_env_from_config(
         std::env::set_var("RUSTLLAMA_PREFILL_BATCHED_HYBRID", "1");
         tracing::info!(
             "prefill_batched_hybrid: hybrid chunk prefill with grouped-expert execution enabled"
+        );
+    }
+    if inference.ssm_prefill_chunked
+        && std::env::var_os("RUSTLLAMA_SSM_PREFILL_CHUNKED").is_none()
+    {
+        std::env::set_var("RUSTLLAMA_SSM_PREFILL_CHUNKED", "1");
+        tracing::info!(
+            "ssm_prefill_chunked: chunked-parallel SSM (DeltaNet) prefill path enabled from config"
         );
     }
     if inference.kv_persist_mb > 0 && std::env::var_os("RUSTLLAMA_KV_PERSIST_MB").is_none() {
@@ -2372,8 +2419,10 @@ fn infer_n_layers_from_gguf(src: &rustllama_gguf::Gguf) -> usize {
 /// True when the GGUF declares a hybrid transformer+SSM architecture — the
 /// same trigger `LlamaConfig::from_gguf` uses (`{arch}.full_attention_interval`
 /// AND `{arch}.ssm.state_size` both present). Hybrid models (qwen35 / qwen35moe
-/// / Ornith) coerce every non-f32 KV dtype to f32 on the hybrid attention path,
-/// so the kv_dtype sweep would just measure f32 repeatedly — we skip it.
+/// / Ornith) honor only f32 + q4_0 KV verbatim on the hybrid attention path
+/// (q4_0 has the calibrated arm); any other non-f32 dtype requires
+/// `RUSTLLAMA_HYBRID_KV_ANY`. The kv_dtype sweep therefore restricts hybrids to
+/// the `{f32,q4_0}` candidate list rather than skipping it.
 fn gguf_is_hybrid(model_path: &std::path::Path) -> bool {
     let Ok(g) = rustllama_gguf::Gguf::open(model_path) else {
         return false;
@@ -3226,6 +3275,18 @@ async fn serve(
                 );
             }
             promote_memory_env_from_config(&cfg.inference, &cfg.tuning);
+            // Chunked-parallel SSM (DeltaNet) prefill: honor the tuner-cache
+            // winner too. The config→env promotion already ran inside
+            // `promote_memory_env_from_config` above; this additionally enables
+            // the path when the cache holds a `true` winner and config left it
+            // off. A user-set env var wins over both (checked via `is_none`).
+            if ssm_prefill_chunked_from_cache_or_default(cfg.tuning.auto_apply_ssm_prefill_chunked)
+                == Some(true)
+                && std::env::var_os("RUSTLLAMA_SSM_PREFILL_CHUNKED").is_none()
+            {
+                std::env::set_var("RUSTLLAMA_SSM_PREFILL_CHUNKED", "1");
+                tracing::info!("tuner cache: applied ssm_prefill_chunked winner");
+            }
             // Export the autotuned flash-attn-v3 KV_TILE to the env
             // var the SYCL kernel reads at dispatch time. Only set
             // when the cache holds an entry AND the user hasn't
@@ -3286,9 +3347,9 @@ async fn serve(
             // config string on cache miss / no-SYCL builds, so
             // fresh installs behave identically to the legacy path.
             let configured_kv_dtype = k_str.to_string();
-            let applied_kv_dtype_str =
-                kv_dtype_from_cache_or_default(cfg.tuning.auto_apply_kv_dtype)
-                    .unwrap_or_else(|| configured_kv_dtype.clone());
+            let cache_kv = kv_dtype_from_cache_or_default(cfg.tuning.auto_apply_kv_dtype);
+            let from_cache = cache_kv.is_some();
+            let applied_kv_dtype_str = cache_kv.unwrap_or_else(|| configured_kv_dtype.clone());
             if applied_kv_dtype_str != configured_kv_dtype {
                 tracing::info!(
                     configured = %configured_kv_dtype,
@@ -3299,11 +3360,16 @@ async fn serve(
             // Coherence guardrail (1d): auto-downgrade an aggressive
             // quantized KV cache to f32 when the model isn't
             // validated for it (no kvbias calibration sidecar) —
-            // prevents the Qwen 2.5 gibberish class silently.
+            // prevents the Qwen 2.5 gibberish class silently. When the
+            // dtype came from the tuner CACHE, trust it (force=true): the
+            // tuner already validated the winner via its 0.90 coherence
+            // gate, so a coherent q4_0 winner isn't second-guessed back
+            // to f32. A user-CONFIGURED (non-cache) dtype keeps the strict
+            // guard (force only when RUSTLLAMA_FORCE_QUANT_KV is set).
             let (safe_kv_dtype_str, kv_guard_warn) = rustllama_config::coherence_safe_kv_dtype(
                 &applied_kv_dtype_str,
                 path,
-                rustllama_config::force_quant_kv_from_env(),
+                from_cache || rustllama_config::force_quant_kv_from_env(),
             );
             if let Some(w) = kv_guard_warn {
                 tracing::warn!("{w}");
@@ -3457,9 +3523,21 @@ async fn serve(
             }
             // MTP / NextN self-speculation (hybrid + NextN-head models
             // only; a silent no-op otherwise). Takes precedence over
-            // n-gram at dispatch time when both are enabled.
-            cpu.set_mtp_speculative(cfg.inference.speculative_mtp);
-            if cfg.inference.speculative_mtp {
+            // n-gram at dispatch time when both are enabled. Tuner-cache
+            // winner (gated by auto_apply_speculative_mtp) overrides the
+            // config default; falls back to config on cache miss.
+            let applied_mtp =
+                speculative_mtp_from_cache_or_default(cfg.tuning.auto_apply_speculative_mtp)
+                    .unwrap_or(cfg.inference.speculative_mtp);
+            if applied_mtp != cfg.inference.speculative_mtp {
+                tracing::info!(
+                    configured = cfg.inference.speculative_mtp,
+                    applied = applied_mtp,
+                    "tuner cache: applied speculative_mtp winner"
+                );
+            }
+            cpu.set_mtp_speculative(applied_mtp);
+            if applied_mtp {
                 tracing::info!(
                     "MTP / NextN self-speculative decoding enabled (raw-softmax \
                          sampling; used only on hybrid models with a NextN head; \
@@ -5313,22 +5391,16 @@ fn cmd_tune_kv_dtype(
         })?,
     };
 
-    // Hybrid (transformer+SSM) models coerce every non-f32 KV dtype to f32 on
-    // the hybrid attention path (quantized KV isn't supported there yet), so the
-    // sweep would measure f32 for every candidate (~8 min/reload of wasted work
-    // on Qwen3.5 / Ornith). Skip it and record f32 as the winner.
-    if gguf_is_hybrid(&model_path) {
-        println!("rustllama tune --kv-dtype");
-        println!("  model  = {}", model_path.display());
-        println!(
-            "  hybrid attention path detected — KV dtype is coerced to f32; \
-             skipping the sweep (winner = f32)."
-        );
-        if let Err(e) = persist_kv_dtype_winner("f32") {
-            tracing::warn!(error = %e, "failed to persist kv_dtype winner (f32)");
-        }
-        return Ok(());
-    }
+    // Hybrid (transformer+SSM) models honor only f32 + q4_0 KV verbatim on the
+    // hybrid attention path (q4_0 has the calibrated arm); any other non-f32
+    // dtype requires RUSTLLAMA_HYBRID_KV_ANY. Rather than skip the sweep and
+    // always force f32 (~8 min/reload of wasted work on Qwen3.5 / Ornith when
+    // sweeping the full grid), restrict the candidate list to {f32,q4_0} and
+    // fall through to the normal measure + coherence-first pick + persist flow,
+    // so a coherent q4_0 winner can still win and save KV memory. Non-hybrids
+    // sweep the full candidate list unchanged.
+    let is_hybrid = gguf_is_hybrid(&model_path);
+    let candidates_csv: &str = if is_hybrid { "f32,q4_0" } else { candidates_csv };
 
     let candidates: Vec<rustllama_engine::KvDtype> = candidates_csv
         .split(',')
@@ -5364,6 +5436,9 @@ fn cmd_tune_kv_dtype(
             .collect::<Vec<_>>()
             .join(", ")
     );
+    if is_hybrid {
+        println!("  hybrid model: restricting KV sweep to {{f32,q4_0}}");
+    }
     println!("  ctx_size      = {ctx_size}");
     println!("  prompt_tokens = {prompt_tokens}");
     println!("  decode_tokens = {decode_tokens}");
@@ -5568,6 +5643,161 @@ fn cmd_tune_flash_attention(
             }
         }
         None => println!("  → no candidate completed; falling back to config value"),
+    }
+    Ok(())
+}
+
+/// A/B MTP (NextN) self-speculative decode by measured decode tok/s.
+/// Loads the model once and flips the hot `set_mtp_speculative` toggle
+/// between arms (no reload). Hybrid + NextN-head models only: a
+/// non-capable model records `Some(false)` (nothing to tune) and the
+/// axis is skipped. Persists winner under `speculative_mtp`; engine
+/// auto-applies on next load when `[tuning].auto_apply_speculative_mtp
+/// = true`.
+fn cmd_tune_speculative_mtp(
+    config_path: &std::path::Path,
+    model_override: Option<String>,
+    repeats: u32,
+) -> anyhow::Result<()> {
+    use rustllama_engine::measurement::{measure_speculative_mtp, MeasurementConfig};
+
+    let cfg = rustllama_config::load(config_path).unwrap_or_default();
+    let model_path = match model_override {
+        Some(p) => std::path::PathBuf::from(p),
+        None => cfg.model.path.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no model: pass --model or set [model].path in {}",
+                config_path.display()
+            )
+        })?,
+    };
+    if repeats == 0 {
+        anyhow::bail!("--speculative-mtp-repeats must be >= 1");
+    }
+
+    let (k, _) = cfg.inference.resolved_kv_dtypes();
+    let m_cfg = MeasurementConfig {
+        kv_dtype: parse_kv_dtype(k)?,
+        kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
+        flash_attention: cfg.inference.flash_attention,
+        n_gpu_layers: cfg.inference.n_gpu_layers,
+    };
+
+    println!("rustllama tune --speculative-mtp");
+    println!("  model   = {}", model_path.display());
+    println!("  repeats = {repeats} (median per arm)");
+    println!();
+
+    let report = measure_speculative_mtp(&model_path, &m_cfg, repeats as usize)
+        .map_err(|e| anyhow::anyhow!("MTP measurement failed: {e}"))?;
+
+    // A non-capable model (not hybrid, or no NextN head) can never use MTP —
+    // record `false` so the axis reads as tuned (an instant no-op next run)
+    // rather than re-measuring every load.
+    if !report.capable {
+        println!("  skipped: no NextN head (MTP n/a)");
+        if let Err(e) = persist_speculative_mtp_winner(false) {
+            tracing::warn!(error = %e, "failed to persist speculative_mtp winner (false)");
+        }
+        return Ok(());
+    }
+
+    let fmt = |t: Option<f64>| {
+        t.map(|v| format!("{v:.2} tps"))
+            .unwrap_or_else(|| "—".to_string())
+    };
+    println!("  off (classic decode) = {}", fmt(report.off_tps));
+    println!("  on  (MTP self-spec)  = {}", fmt(report.on_tps));
+    if let Some(err) = report.error.as_ref() {
+        println!("  note: {err}");
+    }
+    // A non-capable / off-wins model records `false` (Some(false) or a None
+    // winner both collapse to disable).
+    let winner = report.winner.unwrap_or(false);
+    println!();
+    println!("  → pick: speculative_mtp = {winner}");
+    if let Err(e) = persist_speculative_mtp_winner(winner) {
+        tracing::warn!(error = %e, "failed to persist speculative_mtp winner");
+    }
+    Ok(())
+}
+
+/// A/B the chunked-parallel SSM (DeltaNet) prefill path by measured
+/// prefill tok/s. Loads the model once and toggles the
+/// `RUSTLLAMA_SSM_PREFILL_CHUNKED` env var (read per-forward) between
+/// arms (no reload). Hybrid models only: a non-hybrid model records
+/// `Some(false)` (nothing to tune). Persists winner under
+/// `ssm_prefill_chunked`; engine auto-applies on next load when
+/// `[tuning].auto_apply_ssm_prefill_chunked = true`.
+fn cmd_tune_ssm_prefill_chunked(
+    config_path: &std::path::Path,
+    model_override: Option<String>,
+    repeats: u32,
+) -> anyhow::Result<()> {
+    use rustllama_engine::measurement::{measure_ssm_prefill_chunked, MeasurementConfig};
+
+    let cfg = rustllama_config::load(config_path).unwrap_or_default();
+    let model_path = match model_override {
+        Some(p) => std::path::PathBuf::from(p),
+        None => cfg.model.path.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no model: pass --model or set [model].path in {}",
+                config_path.display()
+            )
+        })?,
+    };
+    if repeats == 0 {
+        anyhow::bail!("--ssm-prefill-chunked-repeats must be >= 1");
+    }
+
+    println!("rustllama tune --ssm-prefill-chunked");
+    println!("  model   = {}", model_path.display());
+    println!("  repeats = {repeats} (median per arm)");
+    println!();
+
+    // The chunked-parallel SSM prefill path only exists on hybrid
+    // (transformer+SSM / DeltaNet) models; on anything else the env toggle
+    // changes nothing and both arms measure the same path. Skip the sweep and
+    // record "off" so the axis reads as tuned.
+    if !gguf_is_hybrid(&model_path) {
+        println!("  skipped: not a hybrid model");
+        if let Err(e) = persist_ssm_prefill_chunked_winner(false) {
+            tracing::warn!(error = %e, "failed to persist ssm_prefill_chunked winner (false)");
+        }
+        return Ok(());
+    }
+
+    let (k, _) = cfg.inference.resolved_kv_dtypes();
+    let m_cfg = MeasurementConfig {
+        kv_dtype: parse_kv_dtype(k)?,
+        kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
+        flash_attention: cfg.inference.flash_attention,
+        n_gpu_layers: cfg.inference.n_gpu_layers,
+    };
+
+    let report = measure_ssm_prefill_chunked(&model_path, &m_cfg, repeats as usize)
+        .map_err(|e| anyhow::anyhow!("SSM prefill measurement failed: {e}"))?;
+
+    let fmt = |t: Option<f64>| {
+        t.map(|v| format!("{v:.2} tps"))
+            .unwrap_or_else(|| "—".to_string())
+    };
+    println!(
+        "  off (sequential prefill) = {}",
+        fmt(report.off_prefill_tps)
+    );
+    println!(
+        "  on  (chunked-parallel)   = {}",
+        fmt(report.on_prefill_tps)
+    );
+    if let Some(err) = report.error.as_ref() {
+        println!("  note: {err}");
+    }
+    let winner = report.winner.unwrap_or(false);
+    println!();
+    println!("  → pick: ssm_prefill_chunked = {winner}");
+    if let Err(e) = persist_ssm_prefill_chunked_winner(winner) {
+        tracing::warn!(error = %e, "failed to persist ssm_prefill_chunked winner");
     }
     Ok(())
 }
@@ -6305,10 +6535,21 @@ fn cmd_tune_all(
         .as_ref()
         .map(|t| !t.per_device_perf.is_empty())
         .unwrap_or(false);
+    // MTP self-speculation + chunked SSM prefill: both persist a
+    // `Some(bool)` winner (including `Some(false)` for a non-capable /
+    // non-hybrid model), so `.is_some()` is the "already tuned" probe.
+    let has_speculative_mtp = cached
+        .as_ref()
+        .map(|t| t.speculative_mtp.is_some())
+        .unwrap_or(false);
+    let has_ssm_prefill_chunked = cached
+        .as_ref()
+        .map(|t| t.ssm_prefill_chunked.is_some())
+        .unwrap_or(false);
 
     let skip = |populated: bool| skip_cached && !force && populated;
 
-    println!("Stage 1/8: kernel LWS (per-shape packed-quant matvec)");
+    println!("Stage 1/10: kernel LWS (per-shape packed-quant matvec)");
     println!("--------");
     let model_clone_for_stages = model_override.clone();
     if skip(has_kernels) {
@@ -6327,7 +6568,7 @@ fn cmd_tune_all(
     }
 
     println!();
-    println!("Stage 1b/8: per-device perf (each GPU + CPU tier decode tok/s — heat placement)");
+    println!("Stage 1b/10: per-device perf (each GPU + CPU tier decode tok/s — heat placement)");
     println!("--------");
     if skip(has_per_device_perf) {
         println!("(skipped: per-device perf already cached)");
@@ -6344,7 +6585,7 @@ fn cmd_tune_all(
     }
 
     println!();
-    println!("Stage 2/8: kv_dtype  (coherence-first: smallest KV dtype whose decode matches F32)");
+    println!("Stage 2/10: kv_dtype  (coherence-first: smallest KV dtype whose decode matches F32)");
     println!("--------");
     if skip(has_kv_dtype) {
         println!("(skipped: kv_dtype winner already cached)");
@@ -6360,7 +6601,7 @@ fn cmd_tune_all(
     }
 
     println!();
-    println!("Stage 3/8: flash_attention");
+    println!("Stage 3/10: flash_attention");
     println!("--------");
     if skip(has_flash) {
         println!("(skipped: flash_attention winner already cached)");
@@ -6375,7 +6616,7 @@ fn cmd_tune_all(
     }
 
     println!();
-    println!("Stage 4/8: kv_cache_layout");
+    println!("Stage 4/10: kv_cache_layout");
     println!("--------");
     if skip(has_kv_layout) {
         println!("(skipped: kv_cache_layout winner already cached)");
@@ -6391,7 +6632,7 @@ fn cmd_tune_all(
     }
 
     println!();
-    println!("Stage 5/8: placement (measured)");
+    println!("Stage 5/10: placement (measured)");
     println!("--------");
     if skip(has_placement) {
         println!("(skipped: placement winner already cached)");
@@ -6410,7 +6651,7 @@ fn cmd_tune_all(
     }
 
     println!();
-    println!("Stage 6/8: batch_size");
+    println!("Stage 6/10: batch_size");
     println!("--------");
     if skip(has_batch_size) {
         println!("(skipped: batch_size winner already cached)");
@@ -6425,7 +6666,7 @@ fn cmd_tune_all(
     }
 
     println!();
-    println!("Stage 7/8: threads");
+    println!("Stage 7/10: threads");
     println!("--------");
     if skip(has_threads) {
         println!("(skipped: threads winner already cached)");
@@ -6440,12 +6681,34 @@ fn cmd_tune_all(
     }
 
     println!();
-    println!("Stage 8/8: decision calibration (temperature scaling)");
+    println!("Stage 8/10: decision calibration (temperature scaling)");
     println!("--------");
     if skip(has_decision_calibration) {
         println!("(skipped: decision calibration already cached)");
-    } else if let Err(e) = cmd_decision_calibrate(config_path, model_clone_for_stages) {
+    } else if let Err(e) = cmd_decision_calibrate(config_path, model_clone_for_stages.clone()) {
         tracing::warn!(error = %e, "stage 8 (decision calibration) failed");
+    }
+
+    println!();
+    println!("Stage 9/10: MTP self-speculation (decode tok/s)");
+    println!("--------");
+    if skip(has_speculative_mtp) {
+        println!("(skipped: speculative_mtp winner already cached)");
+    } else if let Err(e) =
+        cmd_tune_speculative_mtp(config_path, model_clone_for_stages.clone(), measure_repeats)
+    {
+        tracing::warn!(error = %e, "stage 9 (MTP self-speculation) failed; continuing");
+    }
+
+    println!();
+    println!("Stage 10/10: chunked SSM prefill (prefill tok/s)");
+    println!("--------");
+    if skip(has_ssm_prefill_chunked) {
+        println!("(skipped: ssm_prefill_chunked winner already cached)");
+    } else if let Err(e) =
+        cmd_tune_ssm_prefill_chunked(config_path, model_clone_for_stages, measure_repeats)
+    {
+        tracing::warn!(error = %e, "stage 10 (chunked SSM prefill) failed; continuing");
     }
 
     println!();
@@ -6521,6 +6784,66 @@ pub fn persist_flash_attention_winner_to(
     let mut tuning =
         load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
     tuning.flash_attention = Some(flash);
+    tuning.last_tuned = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| format!("{}", d.as_secs()));
+    save_cache(cache_dir, &tuning)?;
+    Ok(cache_path_for(cache_dir, key))
+}
+
+pub fn persist_speculative_mtp_winner(v: bool) -> anyhow::Result<()> {
+    let Some(cache_dir) = rustllama_tuner::default_cache_dir() else {
+        tracing::warn!("no tuner cache dir resolvable; skipping speculative_mtp persistence");
+        return Ok(());
+    };
+    let (key, device) = rustllama_tuner::cache_context();
+    let path = persist_speculative_mtp_winner_to(&cache_dir, &key, &device, v)?;
+    println!("saved speculative_mtp winner to {}", path.display());
+    Ok(())
+}
+
+pub fn persist_speculative_mtp_winner_to(
+    cache_dir: &std::path::Path,
+    key: &str,
+    device: &rustllama_tuner::DeviceFingerprint,
+    v: bool,
+) -> anyhow::Result<std::path::PathBuf> {
+    use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
+    std::fs::create_dir_all(cache_dir)?;
+    let mut tuning =
+        load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
+    tuning.speculative_mtp = Some(v);
+    tuning.last_tuned = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| format!("{}", d.as_secs()));
+    save_cache(cache_dir, &tuning)?;
+    Ok(cache_path_for(cache_dir, key))
+}
+
+pub fn persist_ssm_prefill_chunked_winner(v: bool) -> anyhow::Result<()> {
+    let Some(cache_dir) = rustllama_tuner::default_cache_dir() else {
+        tracing::warn!("no tuner cache dir resolvable; skipping ssm_prefill_chunked persistence");
+        return Ok(());
+    };
+    let (key, device) = rustllama_tuner::cache_context();
+    let path = persist_ssm_prefill_chunked_winner_to(&cache_dir, &key, &device, v)?;
+    println!("saved ssm_prefill_chunked winner to {}", path.display());
+    Ok(())
+}
+
+pub fn persist_ssm_prefill_chunked_winner_to(
+    cache_dir: &std::path::Path,
+    key: &str,
+    device: &rustllama_tuner::DeviceFingerprint,
+    v: bool,
+) -> anyhow::Result<std::path::PathBuf> {
+    use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
+    std::fs::create_dir_all(cache_dir)?;
+    let mut tuning =
+        load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
+    tuning.ssm_prefill_chunked = Some(v);
     tuning.last_tuned = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -6880,6 +7203,44 @@ pub fn flash_attention_from_cache_or_default_to(
         .ok()
         .flatten()
         .and_then(|t| t.flash_attention)
+}
+
+pub fn speculative_mtp_from_cache_or_default(auto_apply: bool) -> Option<bool> {
+    if !auto_apply {
+        return None;
+    }
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    speculative_mtp_from_cache_or_default_to(&cache_dir, &key)
+}
+
+pub fn speculative_mtp_from_cache_or_default_to(
+    cache_dir: &std::path::Path,
+    key: &str,
+) -> Option<bool> {
+    rustllama_tuner::load_cache(cache_dir, key)
+        .ok()
+        .flatten()
+        .and_then(|t| t.speculative_mtp)
+}
+
+pub fn ssm_prefill_chunked_from_cache_or_default(auto_apply: bool) -> Option<bool> {
+    if !auto_apply {
+        return None;
+    }
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    ssm_prefill_chunked_from_cache_or_default_to(&cache_dir, &key)
+}
+
+pub fn ssm_prefill_chunked_from_cache_or_default_to(
+    cache_dir: &std::path::Path,
+    key: &str,
+) -> Option<bool> {
+    rustllama_tuner::load_cache(cache_dir, key)
+        .ok()
+        .flatten()
+        .and_then(|t| t.ssm_prefill_chunked)
 }
 
 pub fn kv_cache_layout_from_cache_or_default(auto_apply: bool) -> Option<String> {

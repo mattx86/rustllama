@@ -1998,6 +1998,325 @@ pub fn measure_moe_placement_candidates(
     })
 }
 
+// ============================================================
+// MTP self-speculation + chunked-SSM-prefill autotune sweeps
+// ============================================================
+//
+// Both are simple A/B toggles (not multi-candidate grids), so they
+// return a two-arm report rather than the `{ <axis>, ..., median_tps }`
+// candidate-vec convention. Each loads the model ONCE and flips the
+// relevant knob between arms with NO reload:
+//   - MTP is a hot engine flag (`set_mtp_speculative`);
+//   - chunked SSM prefill is gated by an env var the model reads
+//     per-forward (`RUSTLLAMA_SSM_PREFILL_CHUNKED`).
+
+/// Outcome of [`measure_speculative_mtp`].
+///
+/// When `capable` is `false` the loaded model carries no NextN head
+/// (not hybrid, or the head is absent), so MTP self-speculation is a
+/// silent no-op — `off_tps` / `on_tps` / `winner` stay `None` and the
+/// CLI skips the axis (nothing to tune). When `capable` is `true`,
+/// `off_tps` / `on_tps` are the median DECODE tok/s with MTP disabled /
+/// enabled on the SAME loaded engine, and `winner = Some(on_tps >
+/// off_tps)` (`true` ⇒ enable MTP). `error` carries the first arm's
+/// failure message when a median is `None`.
+#[derive(Debug, Clone, Default)]
+pub struct SpecMtpReport {
+    pub capable: bool,
+    pub off_tps: Option<f64>,
+    pub on_tps: Option<f64>,
+    pub winner: Option<bool>,
+    pub error: Option<String>,
+}
+
+/// Outcome of [`measure_ssm_prefill_chunked`].
+///
+/// `off_prefill_tps` / `on_prefill_tps` are the median PREFILL tok/s
+/// with the chunked-parallel SSM (DeltaNet) prefill path disabled /
+/// enabled, measured on the SAME loaded engine (the model reads
+/// `RUSTLLAMA_SSM_PREFILL_CHUNKED` per-forward, so the toggle needs no
+/// reload). `winner = Some(on > off)` (`true` ⇒ enable the chunked
+/// path). `error` carries the first arm's failure message when a
+/// median is `None`.
+#[derive(Debug, Clone, Default)]
+pub struct SsmPrefillChunkedReport {
+    pub off_prefill_tps: Option<f64>,
+    pub on_prefill_tps: Option<f64>,
+    pub winner: Option<bool>,
+    pub error: Option<String>,
+}
+
+/// A/B MTP (NextN) self-speculative decode by measured DECODE tok/s.
+///
+/// Loads the model ONCE (same load call the decode sweeps use). MTP
+/// self-speculation is a HOT toggle ([`CpuEngine::set_mtp_speculative`]),
+/// so both arms run on that single loaded engine with NO reload between
+/// them.
+///
+/// Capability gate: [`CpuEngine::mtp_speculative`] returns
+/// `mtp_spec && model_supports_mtp()` (hybrid + NextN head present), so
+/// enabling the flag and reading the effective getter back tells us
+/// whether the loaded model can actually use MTP — no reload required,
+/// since the capability is a property of the already-loaded weights.
+/// When not capable we return `SpecMtpReport { capable: false, .. }`
+/// with no measurements and the CLI skips the axis.
+///
+/// Deterministic (temp=0) synthetic decode, mirroring the decode
+/// sweeps' prompt/token sizing (`tune`'s `--prompt-tokens=64` /
+/// `--decode-tokens=32` defaults), so the off/on medians are directly
+/// comparable.
+pub fn measure_speculative_mtp(
+    model_path: &std::path::Path,
+    cfg: &MeasurementConfig,
+    repeats: usize,
+) -> Result<SpecMtpReport, String> {
+    // Mirror the decode sweeps' sizing. ctx holds prompt + decode +
+    // slack (see `measure_end_to_end_tok_s` in the CLI).
+    const PROMPT_TOKENS: u32 = 64;
+    const DECODE_TOKENS: u32 = 32;
+    let ctx_size = (PROMPT_TOKENS as usize + DECODE_TOKENS as usize + 8).max(128);
+
+    let mut cpu = CpuEngine::load_with_options_and_layout(
+        model_path,
+        ctx_size,
+        true,
+        cfg.kv_dtype,
+        &cfg.kv_cache_layout,
+    )
+    .map_err(|e| format!("load failed: {e}"))?;
+    cpu.set_prefix_cache(false);
+    cpu.set_flash_attention(cfg.flash_attention);
+    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+
+    // Capability probe: enable the flag, then read the EFFECTIVE getter
+    // (`mtp_spec && model_supports_mtp()`). No reload needed — the flag
+    // is a plain field and the capability is a property of the loaded
+    // model. Not capable ⇒ report it and let the CLI skip the axis.
+    cpu.set_mtp_speculative(true);
+    let capable = cpu.mtp_speculative();
+    if !capable {
+        cpu.set_mtp_speculative(false);
+        return Ok(SpecMtpReport {
+            capable: false,
+            ..Default::default()
+        });
+    }
+
+    let vocab = cpu.vocab_size() as i32;
+    let prompt_ids: Vec<i32> = (0..PROMPT_TOKENS as i32)
+        .map(|i| 1 + (i % vocab.max(2).saturating_sub(1)))
+        .collect();
+    let sampling = SamplingParams {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        typical_p: 1.0,
+        repeat_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        seed: 0,
+        max_tokens: DECODE_TOKENS,
+        stop: Vec::new(),
+        ..SamplingParams::default()
+    };
+
+    // Median decode tok/s for the engine's current toggle state: one
+    // untimed warmup + `repeats` timed runs. Returns `(None, Some(err))`
+    // when every run failed. Mirrors the decode-metric pattern used by
+    // `measure_placement_candidates` / `measure_per_device_perf`.
+    let bench = |cpu: &mut CpuEngine| -> (Option<f64>, Option<String>) {
+        cpu.clear_prefix_cache();
+        if let Err(e) = cpu.generate_token_ids(&prompt_ids, DECODE_TOKENS, &sampling) {
+            return (None, Some(format!("warmup failed: {e}")));
+        }
+        let mut runs: Vec<f64> = Vec::with_capacity(repeats);
+        let mut last_err: Option<String> = None;
+        for _ in 0..repeats {
+            cpu.clear_prefix_cache();
+            match cpu.generate_token_ids(&prompt_ids, DECODE_TOKENS, &sampling) {
+                Ok(_) => {
+                    let stats = cpu.last_request_stats();
+                    if stats.decode_ms > 0.0 && stats.tokens_generated > 0 {
+                        runs.push((stats.tokens_generated as f64) / (stats.decode_ms / 1000.0));
+                    }
+                }
+                Err(e) => last_err = Some(e.to_string()),
+            }
+        }
+        if runs.is_empty() {
+            return (
+                None,
+                Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
+            );
+        }
+        runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = if runs.len() % 2 == 1 {
+            runs[runs.len() / 2]
+        } else {
+            (runs[runs.len() / 2 - 1] + runs[runs.len() / 2]) / 2.0
+        };
+        (Some(median), None)
+    };
+
+    // OFF arm (classic single-token decode).
+    cpu.set_mtp_speculative(false);
+    let (off_tps, off_err) = bench(&mut cpu);
+
+    // ON arm (MTP self-speculation) — hot toggle, no reload.
+    cpu.set_mtp_speculative(true);
+    let (on_tps, on_err) = bench(&mut cpu);
+
+    // Restore the engine's default state (classic decode).
+    cpu.set_mtp_speculative(false);
+
+    let winner = match (off_tps, on_tps) {
+        (Some(off), Some(on)) => Some(on > off),
+        _ => None,
+    };
+    let error = off_err.or(on_err);
+
+    Ok(SpecMtpReport {
+        capable: true,
+        off_tps,
+        on_tps,
+        winner,
+        error,
+    })
+}
+
+/// A/B the chunked-parallel SSM (DeltaNet) prefill path by measured
+/// PREFILL tok/s.
+///
+/// Loads the model ONCE. The chunked path is gated by the
+/// `RUSTLLAMA_SSM_PREFILL_CHUNKED` env var, which `llama_arch.rs` reads
+/// PER-FORWARD (once at the top of the prefill pass, via `is_some()`),
+/// so both arms run on the same loaded engine by toggling the env var
+/// between runs — NO reload. Because the gate uses `is_some()`, the OFF
+/// arm must REMOVE the var entirely (setting it to `"0"` would still
+/// read as on); the pre-sweep value is restored before returning.
+///
+/// Prefill is isolated exactly like [`measure_batch_size_candidates`]:
+/// `max_tokens = 1`, and prefill tok/s = `tokens_prefilled /
+/// (prefill_ms / 1000)`. A long synthetic prompt (2048 tokens,
+/// mirroring the batch-size sweep's fixed prompt) keeps prefill the
+/// dominant, measurable cost. On a non-SSM / non-DeltaNet model the env
+/// var changes nothing and both arms measure the same path (a
+/// degenerate, harmless near-tie).
+pub fn measure_ssm_prefill_chunked(
+    model_path: &std::path::Path,
+    cfg: &MeasurementConfig,
+    repeats: usize,
+) -> Result<SsmPrefillChunkedReport, String> {
+    // Long synthetic prompt so prefill dominates (mirror the batch-size
+    // sweep's `BATCH_SWEEP_PROMPT_TOKENS`). ctx holds the prompt + the
+    // single decode token + slack.
+    const PROMPT_TOKENS: u32 = 2048;
+    let ctx_size = (PROMPT_TOKENS as usize + 8).max(64);
+
+    let mut cpu = CpuEngine::load_with_options_and_layout(
+        model_path,
+        ctx_size,
+        true,
+        cfg.kv_dtype,
+        &cfg.kv_cache_layout,
+    )
+    .map_err(|e| format!("load failed: {e}"))?;
+    cpu.set_prefix_cache(false);
+    cpu.set_flash_attention(cfg.flash_attention);
+    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+
+    let vocab = cpu.vocab_size() as i32;
+    let prompt_ids: Vec<i32> = (0..PROMPT_TOKENS as i32)
+        .map(|i| 1 + (i % vocab.max(2).saturating_sub(1)))
+        .collect();
+    // Pin decode to 1 token so the measurement isolates prefill.
+    let sampling = SamplingParams {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        typical_p: 1.0,
+        repeat_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        seed: 0,
+        max_tokens: 1,
+        stop: Vec::new(),
+        ..SamplingParams::default()
+    };
+
+    // Median prefill tok/s for the current env-var state: one untimed
+    // warmup + `repeats` timed runs. Mirrors the prefill-metric pattern
+    // in `measure_batch_size_candidates` (incl. the
+    // `tokens_prefilled.max(prompt)` guard).
+    let bench = |cpu: &mut CpuEngine| -> (Option<f64>, Option<String>) {
+        cpu.clear_prefix_cache();
+        if let Err(e) = cpu.generate_token_ids(&prompt_ids, 1, &sampling) {
+            return (None, Some(format!("warmup failed: {e}")));
+        }
+        let mut runs: Vec<f64> = Vec::with_capacity(repeats);
+        let mut last_err: Option<String> = None;
+        for _ in 0..repeats {
+            cpu.clear_prefix_cache();
+            match cpu.generate_token_ids(&prompt_ids, 1, &sampling) {
+                Ok(_) => {
+                    let stats = cpu.last_request_stats();
+                    let pf_ms = stats.prefill_ms;
+                    let prefilled = stats.tokens_prefilled.max(PROMPT_TOKENS);
+                    if pf_ms > 0.0 && prefilled > 0 {
+                        runs.push((prefilled as f64) / (pf_ms / 1000.0));
+                    }
+                }
+                Err(e) => last_err = Some(e.to_string()),
+            }
+        }
+        if runs.is_empty() {
+            return (
+                None,
+                Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
+            );
+        }
+        runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = if runs.len() % 2 == 1 {
+            runs[runs.len() / 2]
+        } else {
+            (runs[runs.len() / 2 - 1] + runs[runs.len() / 2]) / 2.0
+        };
+        (Some(median), None)
+    };
+
+    // Save the pre-sweep env state so the toggle doesn't leak to the
+    // rest of the process.
+    let saved_env = std::env::var_os("RUSTLLAMA_SSM_PREFILL_CHUNKED");
+
+    // OFF arm: REMOVE the var (the gate is `is_some()`, so `"0"` ≠ off).
+    std::env::remove_var("RUSTLLAMA_SSM_PREFILL_CHUNKED");
+    let (off_prefill_tps, off_err) = bench(&mut cpu);
+
+    // ON arm: set the var — read per-forward, so it takes effect on the
+    // next generate with no reload.
+    std::env::set_var("RUSTLLAMA_SSM_PREFILL_CHUNKED", "1");
+    let (on_prefill_tps, on_err) = bench(&mut cpu);
+
+    // Restore the pre-sweep env state.
+    match saved_env {
+        Some(v) => std::env::set_var("RUSTLLAMA_SSM_PREFILL_CHUNKED", v),
+        None => std::env::remove_var("RUSTLLAMA_SSM_PREFILL_CHUNKED"),
+    }
+
+    let winner = match (off_prefill_tps, on_prefill_tps) {
+        (Some(off), Some(on)) => Some(on > off),
+        _ => None,
+    };
+    let error = off_err.or(on_err);
+
+    Ok(SsmPrefillChunkedReport {
+        off_prefill_tps,
+        on_prefill_tps,
+        winner,
+        error,
+    })
+}
+
 #[cfg(test)]
 mod kv_coherence_tests {
     use super::*;
