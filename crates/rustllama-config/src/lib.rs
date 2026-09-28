@@ -497,6 +497,18 @@ pub struct InferenceConfig {
     /// fidelity; a shared speculation-temperature knob is a follow-up.
     #[serde(default)]
     pub speculative_ngram: bool,
+    /// MTP / NextN self-speculative decoding for hybrid models that
+    /// carry a NextN head (`qwen35moe`-family `blk.{N}.nextn.*`).
+    /// Default `false`. When `true`, grammar-free requests on a hybrid
+    /// model with a NextN head route through the MTP driver: each main
+    /// forward also runs the cheap NextN head to draft the +2 token,
+    /// which the next forward verifies (accept commits 2 tokens per
+    /// round, reject falls back to 1). Silently ignored on models
+    /// without a NextN head (falls back to classic decode). Takes
+    /// precedence over `speculative_ngram` when both are set. Same
+    /// raw-softmax sampling caveat as the other speculative paths.
+    #[serde(default)]
+    pub speculative_mtp: bool,
     /// Trailing-token match window for the n-gram drafter. Default 3 —
     /// good for code without ballooning lookup cost. Ignored when
     /// `speculative_ngram = false`.
@@ -824,6 +836,7 @@ impl Default for InferenceConfig {
             kv_cache_layout: default_kv_cache_layout(),
             kv_page_size: default_kv_page_size(),
             speculative_ngram: false,
+            speculative_mtp: false,
             speculative_draft_path: None,
             speculative_draft_k: default_speculative_draft_k(),
             ngram_n_match: 3,

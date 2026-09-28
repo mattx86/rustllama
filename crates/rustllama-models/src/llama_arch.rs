@@ -4851,17 +4851,119 @@ impl LlamaModel {
                                 }
                             }
                         }
-                        _ => {
-                            // Hybrid models on other quantized KV
-                            // dtypes are unsupported. The engine
-                            // coerces unsupported dtypes at load; if
-                            // a user hand-edits config we panic with
-                            // a clear message rather than producing
-                            // garbage.
-                            panic!(
-                                "hybrid full-attention layer requires F32 or Q4_0 KV cache; \
-                                 set [inference].kv_dtype = \"f32\" or \"q4_0\" for qwen35moe-family models"
+                        KvLayer::Q8_0 { k_q, k_scales, v_q, v_scales } => {
+                            // All-KV-quant support for hybrids. Mirrors
+                            // the dense Q8_0 arm (per-row i8 + absmax
+                            // scale), then applies the hybrid per-head
+                            // sigmoid Q-gate. No whitening/kv-bias — the
+                            // 8-bit path is high-quality without them.
+                            for h in 0..n_kv_heads {
+                                let row_idx = h * max_ctx + cur_pos;
+                                let dst = row_idx * head_dim;
+                                k_scales[row_idx] = quantize_row_q8_0(
+                                    &k_buf[h * head_dim..(h + 1) * head_dim],
+                                    &mut k_q[dst..dst + head_dim],
+                                );
+                                v_scales[row_idx] = quantize_row_q8_0(
+                                    &v_buf[h * head_dim..(h + 1) * head_dim],
+                                    &mut v_q[dst..dst + head_dim],
+                                );
+                            }
+                            k::gqa_attention_flash_decode_q8_0(
+                                &q_buf, k_q, k_scales, v_q, v_scales, &mut attn_out,
+                                n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
                             );
+                            if !no_qgate_enabled() {
+                                for (a, g) in attn_out.iter_mut().zip(attn_gate_buf.iter()) {
+                                    let s = if *g >= 0.0 {
+                                        1.0 / (1.0 + (-*g).exp())
+                                    } else {
+                                        let e = g.exp();
+                                        e / (1.0 + e)
+                                    };
+                                    *a *= s;
+                                }
+                            }
+                        }
+                        KvLayer::TurboQuant { bits, k_packed, k_scales, v_packed, v_scales } => {
+                            // TurboQuant (low-bit) KV for hybrids,
+                            // mirroring the dense TQ arm. quantize_row
+                            // mutates its input in place, so copy each
+                            // head row into scratch first.
+                            let bytes_per_row =
+                                rustllama_kernels_cpu::turboquant::bytes_per_block(head_dim, *bits);
+                            let mut tq_row = vec![0f32; head_dim];
+                            for h in 0..n_kv_heads {
+                                let row_idx = h * max_ctx + cur_pos;
+                                let p_dst = row_idx * bytes_per_row;
+                                tq_row.copy_from_slice(&k_buf[h * head_dim..(h + 1) * head_dim]);
+                                k_scales[row_idx] = rustllama_kernels_cpu::turboquant::quantize_row(
+                                    &mut tq_row, *bits, &mut k_packed[p_dst..p_dst + bytes_per_row],
+                                );
+                                tq_row.copy_from_slice(&v_buf[h * head_dim..(h + 1) * head_dim]);
+                                v_scales[row_idx] = rustllama_kernels_cpu::turboquant::quantize_row(
+                                    &mut tq_row, *bits, &mut v_packed[p_dst..p_dst + bytes_per_row],
+                                );
+                            }
+                            rustllama_kernels_cpu::turboquant::gqa_attention_flash_decode_tq(
+                                &q_buf, k_packed, k_scales, v_packed, v_scales, *bits, &mut attn_out,
+                                n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                            );
+                            if !no_qgate_enabled() {
+                                for (a, g) in attn_out.iter_mut().zip(attn_gate_buf.iter()) {
+                                    let s = if *g >= 0.0 {
+                                        1.0 / (1.0 + (-*g).exp())
+                                    } else {
+                                        let e = g.exp();
+                                        e / (1.0 + e)
+                                    };
+                                    *a *= s;
+                                }
+                            }
+                        }
+                        KvLayer::Nvfp4 { k_packed, v_packed } => {
+                            // NVFP4 (4-bit float, 16 elems/block) KV for
+                            // hybrids, mirroring the dense NVFP4 arm.
+                            let blocks_per_row =
+                                head_dim / rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_ELEMS;
+                            let bytes_per_row =
+                                blocks_per_row * rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_BYTES;
+                            for h in 0..n_kv_heads {
+                                let p_dst = (h * max_ctx + cur_pos) * bytes_per_row;
+                                for b in 0..blocks_per_row {
+                                    let elem_off = h * head_dim
+                                        + b * rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_ELEMS;
+                                    let blk_dst =
+                                        p_dst + b * rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_BYTES;
+                                    rustllama_kernels_cpu::nvfp4::quantize_block(
+                                        &k_buf[elem_off
+                                            ..elem_off + rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_ELEMS],
+                                        &mut k_packed[blk_dst
+                                            ..blk_dst + rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_BYTES],
+                                    );
+                                    rustllama_kernels_cpu::nvfp4::quantize_block(
+                                        &v_buf[elem_off
+                                            ..elem_off + rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_ELEMS],
+                                        &mut v_packed[blk_dst
+                                            ..blk_dst + rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_BYTES],
+                                    );
+                                }
+                            }
+                            rustllama_kernels_cpu::nvfp4::gqa_attention_flash_decode_nvfp4(
+                                &q_buf, k_packed, v_packed, &mut attn_out,
+                                n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                            );
+                            if !no_qgate_enabled() {
+                                for (a, g) in attn_out.iter_mut().zip(attn_gate_buf.iter()) {
+                                    let s = if *g >= 0.0 {
+                                        1.0 / (1.0 + (-*g).exp())
+                                    } else {
+                                        let e = g.exp();
+                                        e / (1.0 + e)
+                                    };
+                                    *a *= s;
+                                }
+                            }
                         }
                     }
                     {
@@ -5199,6 +5301,13 @@ impl LlamaModel {
         );
         let no_rope = no_rope_enabled();
         let no_qgate = no_qgate_enabled();
+        // ADDITIVE, default-off SSM prefill accel: when
+        // RUSTLLAMA_SSM_PREFILL_CHUNKED is set, the SSM prefill arm
+        // computes the per-head delta recurrence with the chunked-parallel
+        // kernel (`delta_rule_prefill_chunked`) instead of nb sequential
+        // per-token `delta_rule_step` calls. Read ONCE here, outside the
+        // token loops. Unset ⇒ the byte-identical per-token path runs.
+        let ssm_prefill_chunked = std::env::var_os("RUSTLLAMA_SSM_PREFILL_CHUNKED").is_some();
         // Prism Hadamard rotation state + scratch (see decode twin).
         let had = self.weights.hadamard.as_ref();
         let mut had_buf: Vec<f32> = Vec::new();
@@ -5279,6 +5388,143 @@ impl LlamaModel {
                         *b = s;
                     }
                     if pp_on { pp[0] += pp_mark.elapsed().as_secs_f64() * 1e3; pp_mark = std::time::Instant::now(); }
+                    if ssm_prefill_chunked {
+                        // ADDITIVE chunked-prefill path (default-off). Same
+                        // per-(token,head) math as the per-token `else`
+                        // branch below — same conv+silu, same q/k/v build,
+                        // same decay, same gate, same output projection — but
+                        // the delta recurrence over this sub-chunk's `nb`
+                        // tokens is computed by ONE `delta_rule_prefill_chunked`
+                        // call per V-head instead of `nb` sequential
+                        // `delta_rule_step` calls. `dn.recurrent_state` after
+                        // this branch equals what the sequential branch would
+                        // leave, so later sub-chunks / decode continue
+                        // correctly; `dn.conv_state` is advanced by the
+                        // still-sequential conv exactly as before.
+                        use rayon::prelude::*;
+                        let state_stride = head_qk_dim * head_v_dim;
+                        let q_scale = (head_qk_dim as f32).sqrt().recip();
+                        // 1. Sequential conv1d + silu for all nb tokens (the
+                        //    conv recurrence over dn.conv_state cannot chunk).
+                        //    Persist each token's conv'd qkv row for the scan.
+                        let mut qkv_conv_sub = vec![0.0f32; nb * qkv_dim];
+                        for bi in 0..nb {
+                            k::delta_net::conv1d_depthwise_step_f32(
+                                &hoist_qkv[bi * qkv_dim..(bi + 1) * qkv_dim],
+                                &block.ssm_conv1d_f32,
+                                &mut dn.conv_state,
+                                &mut qkv_conv_sub[bi * qkv_dim..(bi + 1) * qkv_dim],
+                                qkv_dim,
+                                conv_kernel,
+                            );
+                            k::delta_net::silu_f32_inplace(
+                                &mut qkv_conv_sub[bi * qkv_dim..(bi + 1) * qkv_dim],
+                            );
+                        }
+                        // 2. Per V-head chunked delta scan — rayon over heads
+                        //    on disjoint recurrent-state slabs (the SAME
+                        //    parallelism axis as the per-token path). For each
+                        //    head, gather the nb-length token-major q/k/v/g/beta
+                        //    sequences (q: l2norm then *q_scale; k: l2norm; v:
+                        //    verbatim; g: this head's per-token decay; beta:
+                        //    the already-sigmoid'd hoist_beta), then thread the
+                        //    head's recurrent_state slab IN/OUT through one
+                        //    chunked call. Outputs are collected head-major
+                        //    ([n_v_heads][nb][head_v_dim]) and gated-RMSNorm'd
+                        //    per token per head, exactly as the per-token path.
+                        let mut chunk_out = vec![0.0f32; n_v_heads * nb * head_v_dim];
+                        dn.recurrent_state[..n_v_heads * state_stride]
+                            .par_chunks_mut(state_stride)
+                            .zip(chunk_out.par_chunks_mut(nb * head_v_dim))
+                            .enumerate()
+                            .for_each(|(h, (state_head, out_head_all))| {
+                                let kh = h % n_qk_heads;
+                                let q_off = kh * head_qk_dim;
+                                let k_off = q_block_size + kh * head_qk_dim;
+                                let v_off = q_block_size + k_block_size + h * head_v_dim;
+                                let mut q_seq = vec![0.0f32; nb * head_qk_dim];
+                                let mut k_seq = vec![0.0f32; nb * head_qk_dim];
+                                let mut v_seq = vec![0.0f32; nb * head_v_dim];
+                                let mut g_seq = vec![0.0f32; nb];
+                                let mut beta_seq = vec![0.0f32; nb];
+                                for bi in 0..nb {
+                                    let conv =
+                                        &qkv_conv_sub[bi * qkv_dim..(bi + 1) * qkv_dim];
+                                    let qd = &mut q_seq
+                                        [bi * head_qk_dim..(bi + 1) * head_qk_dim];
+                                    qd.copy_from_slice(&conv[q_off..q_off + head_qk_dim]);
+                                    k::delta_net::l2norm_f32_inplace(qd, 1e-6);
+                                    for x in qd.iter_mut() {
+                                        *x *= q_scale;
+                                    }
+                                    let kd = &mut k_seq
+                                        [bi * head_qk_dim..(bi + 1) * head_qk_dim];
+                                    kd.copy_from_slice(&conv[k_off..k_off + head_qk_dim]);
+                                    k::delta_net::l2norm_f32_inplace(kd, 1e-6);
+                                    v_seq[bi * head_v_dim..(bi + 1) * head_v_dim]
+                                        .copy_from_slice(&conv[v_off..v_off + head_v_dim]);
+                                    g_seq[bi] = block.ssm_a[h]
+                                        * delta_net_softplus(
+                                            hoist_alpha[bi * n_v_heads + h]
+                                                + block.ssm_dt_bias[h],
+                                        );
+                                    beta_seq[bi] = hoist_beta[bi * n_v_heads + h];
+                                }
+                                k::delta_net::delta_rule_prefill_chunked(
+                                    &q_seq,
+                                    &k_seq,
+                                    &v_seq,
+                                    &g_seq,
+                                    &beta_seq,
+                                    state_head,
+                                    out_head_all,
+                                    nb,
+                                    head_qk_dim,
+                                    head_v_dim,
+                                );
+                                let mut norm_scratch = vec![0.0f32; head_v_dim];
+                                for bi in 0..nb {
+                                    let gate_head = &hoist_gate[bi * ssm_inner
+                                        + h * head_v_dim
+                                        ..bi * ssm_inner + (h + 1) * head_v_dim];
+                                    let out_bi = &mut out_head_all
+                                        [bi * head_v_dim..(bi + 1) * head_v_dim];
+                                    k::delta_net::gated_rmsnorm_f32_scratch(
+                                        out_bi,
+                                        gate_head,
+                                        &block.ssm_norm,
+                                        cfg.rms_eps,
+                                        &mut norm_scratch,
+                                    );
+                                }
+                            });
+                        // 3. Per-token assembly: gather this token's heads into
+                        //    v_out_concat (head-major), then the SAME output-
+                        //    projection hoist (tiled→grouped perm + Hadamard)
+                        //    the per-token path applies before the batched
+                        //    ssm_out matvec below.
+                        for bi in 0..nb {
+                            for h in 0..n_v_heads {
+                                v_out_concat[h * head_v_dim..(h + 1) * head_v_dim]
+                                    .copy_from_slice(
+                                        &chunk_out[h * nb * head_v_dim + bi * head_v_dim
+                                            ..h * nb * head_v_dim + (bi + 1) * head_v_dim],
+                                    );
+                            }
+                            let x_in = hadamard_pre_ssm_out(
+                                had,
+                                &block.ssm_out,
+                                &v_out_concat,
+                                head_v_dim,
+                                n_qk_heads,
+                                n_v_heads / n_qk_heads,
+                                &mut had_perm_buf,
+                                &mut had_buf,
+                            );
+                            hoist_vrot[bi * ssm_inner..(bi + 1) * ssm_inner]
+                                .copy_from_slice(x_in);
+                        }
+                    } else {
                     for bi in 0..nb {
                         let alpha = &hoist_alpha[bi * n_v_heads..(bi + 1) * n_v_heads];
                         let beta = &hoist_beta[bi * n_v_heads..(bi + 1) * n_v_heads];
@@ -5377,6 +5623,7 @@ impl LlamaModel {
                             hoist_vrot[bi * ssm_inner..(bi + 1) * ssm_inner]
                                 .copy_from_slice(x_in);
                         }
+                    }
                     }
                     if pp_on { pp[1] += pp_mark.elapsed().as_secs_f64() * 1e3; pp_mark = std::time::Instant::now(); }
                     matvec_tensor_batched_dispatch(
@@ -5583,11 +5830,67 @@ impl LlamaModel {
                                     );
                                 }
                             }
-                            _ => {
-                                panic!(
-                                    "hybrid full-attention layer requires F32 or Q4_0 KV cache; \
-                                     set [inference].kv_dtype = \"f32\" or \"q4_0\" for qwen35moe-family models"
-                                );
+                            KvLayer::Q8_0 { k_q, k_scales, v_q, v_scales } => {
+                                // All-KV-quant prefill store (attention
+                                // deferred to the batched flash-prefill
+                                // call below). Mirrors the dense Q8_0
+                                // store.
+                                for h in 0..n_kv_heads {
+                                    let row_idx = h * max_ctx + cur_pos;
+                                    let dst = row_idx * head_dim;
+                                    k_scales[row_idx] = quantize_row_q8_0(
+                                        &k_buf[h * head_dim..(h + 1) * head_dim],
+                                        &mut k_q[dst..dst + head_dim],
+                                    );
+                                    v_scales[row_idx] = quantize_row_q8_0(
+                                        &v_buf[h * head_dim..(h + 1) * head_dim],
+                                        &mut v_q[dst..dst + head_dim],
+                                    );
+                                }
+                            }
+                            KvLayer::TurboQuant { bits, k_packed, k_scales, v_packed, v_scales } => {
+                                let bytes_per_row =
+                                    rustllama_kernels_cpu::turboquant::bytes_per_block(head_dim, *bits);
+                                let mut tq_row = vec![0f32; head_dim];
+                                for h in 0..n_kv_heads {
+                                    let row_idx = h * max_ctx + cur_pos;
+                                    let p_dst = row_idx * bytes_per_row;
+                                    tq_row.copy_from_slice(&k_buf[h * head_dim..(h + 1) * head_dim]);
+                                    k_scales[row_idx] = rustllama_kernels_cpu::turboquant::quantize_row(
+                                        &mut tq_row, *bits, &mut k_packed[p_dst..p_dst + bytes_per_row],
+                                    );
+                                    tq_row.copy_from_slice(&v_buf[h * head_dim..(h + 1) * head_dim]);
+                                    v_scales[row_idx] = rustllama_kernels_cpu::turboquant::quantize_row(
+                                        &mut tq_row, *bits, &mut v_packed[p_dst..p_dst + bytes_per_row],
+                                    );
+                                }
+                            }
+                            KvLayer::Nvfp4 { k_packed, v_packed } => {
+                                let blocks_per_row =
+                                    head_dim / rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_ELEMS;
+                                let bytes_per_row =
+                                    blocks_per_row * rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_BYTES;
+                                for h in 0..n_kv_heads {
+                                    let p_dst = (h * max_ctx + cur_pos) * bytes_per_row;
+                                    for b in 0..blocks_per_row {
+                                        let elem_off = h * head_dim
+                                            + b * rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_ELEMS;
+                                        let blk_dst =
+                                            p_dst + b * rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_BYTES;
+                                        rustllama_kernels_cpu::nvfp4::quantize_block(
+                                            &k_buf[elem_off
+                                                ..elem_off + rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_ELEMS],
+                                            &mut k_packed[blk_dst
+                                                ..blk_dst + rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_BYTES],
+                                        );
+                                        rustllama_kernels_cpu::nvfp4::quantize_block(
+                                            &v_buf[elem_off
+                                                ..elem_off + rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_ELEMS],
+                                            &mut v_packed[blk_dst
+                                                ..blk_dst + rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_BYTES],
+                                        );
+                                    }
+                                }
                             }
                         }
                         // Attention is DEFERRED: stash this token's
@@ -5633,7 +5936,33 @@ impl LlamaModel {
                                     kv_len_base, nb,
                                 );
                             }
-                            _ => unreachable!("gated by the per-token match above"),
+                            KvLayer::Q8_0 { k_q, k_scales, v_q, v_scales } => {
+                                sub_whiten = false;
+                                k::gqa_attention_flash_prefill_q8_0(
+                                    &hoist_qrows[..nb * d_q], k_q, k_scales, v_q, v_scales,
+                                    &mut hoist_attn_out[..nb * d_q],
+                                    n_heads, n_kv_heads, head_dim, max_ctx,
+                                    kv_len_base, nb,
+                                );
+                            }
+                            KvLayer::TurboQuant { bits, k_packed, k_scales, v_packed, v_scales } => {
+                                sub_whiten = false;
+                                rustllama_kernels_cpu::turboquant::gqa_attention_flash_prefill_tq(
+                                    &hoist_qrows[..nb * d_q], k_packed, k_scales, v_packed, v_scales,
+                                    *bits, &mut hoist_attn_out[..nb * d_q],
+                                    n_heads, n_kv_heads, head_dim, max_ctx,
+                                    kv_len_base, nb,
+                                );
+                            }
+                            KvLayer::Nvfp4 { k_packed, v_packed } => {
+                                sub_whiten = false;
+                                rustllama_kernels_cpu::nvfp4::gqa_attention_flash_prefill_nvfp4(
+                                    &hoist_qrows[..nb * d_q], k_packed, v_packed,
+                                    &mut hoist_attn_out[..nb * d_q],
+                                    n_heads, n_kv_heads, head_dim, max_ctx,
+                                    kv_len_base, nb,
+                                );
+                            }
                         }
                     }
                     for bi in 0..nb {
@@ -7309,8 +7638,12 @@ impl LlamaModel {
         let d_q = n_heads * head_dim;
         let d_kv = n_kv_heads * head_dim;
         let d_ff = cfg.d_ff;
-        let cur_pos = pos as usize;
-        let kv_len = cur_pos + 1;
+        // Env-gated KV eviction (sliding-window / heavy-hitter): when a
+        // budget is set and engaged, the cache retains fewer than
+        // `pos + 1` positions and `retained_len_for_pos` reports the
+        // compacted count the gather slab + attention run over. With no
+        // budget set this is exactly `pos + 1` (byte-identical).
+        let kv_len = cache.retained_len_for_pos(pos);
 
         // Pool the per-token scratch into the thread-local
         // ForwardScratch — same pattern the contiguous forward_one
@@ -7349,7 +7682,7 @@ impl LlamaModel {
         let head_dim = cfg.head_dim;
         let d_q = cfg.n_heads * head_dim;
         let d_kv = cfg.n_kv_heads * head_dim;
-        let kv_len = pos as usize + 1;
+        let kv_len = cache.retained_len_for_pos(pos); // env-gated KV eviction; == pos+1 when off
         let cfg_clone = self.cfg.clone();
         let (moe_n_experts, moe_top_k) = match cfg_clone.moe.as_ref() {
             Some(m) => (m.n_experts as usize, m.n_experts_used as usize),
@@ -7381,7 +7714,7 @@ impl LlamaModel {
         let head_dim = cfg.head_dim;
         let d_q = cfg.n_heads * head_dim;
         let d_kv = cfg.n_kv_heads * head_dim;
-        let kv_len = pos as usize + 1;
+        let kv_len = cache.retained_len_for_pos(pos); // env-gated KV eviction; == pos+1 when off
         let cfg_clone = self.cfg.clone();
         let (moe_n_experts, moe_top_k) = match cfg_clone.moe.as_ref() {
             Some(m) => (m.n_experts as usize, m.n_experts_used as usize),
@@ -7426,8 +7759,7 @@ impl LlamaModel {
         let d_q = n_heads * head_dim;
         let d_kv = n_kv_heads * head_dim;
         let d_ff = cfg.d_ff;
-        let cur_pos = pos as usize;
-        let kv_len = cur_pos + 1;
+        let kv_len = cache.retained_len_for_pos(pos); // env-gated KV eviction; == pos+1 when off
         let cfg_clone = self.cfg.clone();
         let (moe_n_experts, moe_top_k) = match cfg_clone.moe.as_ref() {
             Some(m) => (m.n_experts as usize, m.n_experts_used as usize),

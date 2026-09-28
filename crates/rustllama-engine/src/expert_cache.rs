@@ -20,6 +20,12 @@
 //! corrupt file is detected by fingerprint (size + mtime + head hash)
 //! and ignored; pre-pinned experts are refcount-0 and evict normally
 //! under LRU pressure if the learned ranking turns out wrong.
+//!
+//! 3. **Disk-spill store location** — when the opt-in disk-spill /
+//!    lower-bit expert store is enabled (`RUSTLLAMA_MOE_DISK_SPILL`,
+//!    mechanism in `accel`), [`init_moe_spill_store`] points its spill
+//!    file at the runtime cache dir. Called automatically from
+//!    [`UsageLearner::open`]. Unset ⇒ never touched.
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -28,6 +34,13 @@ use std::time::{Duration, Instant};
 
 pub use rustllama_models::accel::ExpertKey;
 use rustllama_models::accel::{expert_access_take, expert_prepin};
+// Disk-spill + lower-bit secondary store (the mechanism lives in `accel`).
+// Re-exported so the engine/integrator reaches the fault-in path through
+// this policy module. Inert unless `RUSTLLAMA_MOE_DISK_SPILL` is set.
+pub use rustllama_models::accel::{
+    moe_spill_enabled, moe_spill_reconstruct, moe_spill_stats, MoeSpillStats, SpilledExpert,
+    SpilledPart,
+};
 
 /// Sidecar magic + format version (bump on layout change).
 const MAGIC: &[u8; 8] = b"RLUSAGE\x01";
@@ -89,6 +102,20 @@ pub fn sidecar_path(model_path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
+/// Point the process-global MoE disk-spill store at the runtime cache dir
+/// (`<runtime>/moe-spill/`). No-op — and no runtime-path resolution — unless
+/// `RUSTLLAMA_MOE_DISK_SPILL` is set. Idempotent; called automatically from
+/// [`UsageLearner::open`] at model load, and exposed so a headless caller
+/// without a usage learner can wire the location explicitly. When it is never
+/// called, the store falls back to a folder under the OS temp dir.
+pub fn init_moe_spill_store() {
+    if !moe_spill_enabled() {
+        return;
+    }
+    let dir = rustllama_runtime::paths().runtime_dir.join("moe-spill");
+    rustllama_models::accel::set_moe_spill_dir(dir);
+}
+
 /// Per-model learning-cache driver. Owned by the engine that loaded
 /// the model (forks get `None` — one flusher per model, and the accel
 /// counts are process-global anyway).
@@ -107,6 +134,9 @@ impl UsageLearner {
     /// model file itself can't be fingerprinted (deleted mid-load). A
     /// missing / stale / corrupt sidecar yields an empty baseline.
     pub fn open(model_path: &Path) -> Option<Self> {
+        // Opt-in: locate the MoE disk-spill store under the runtime dir. No-op
+        // (and no runtime-path resolution) unless the feature is enabled.
+        init_moe_spill_store();
         let fp = fingerprint(model_path)?;
         let path = sidecar_path(model_path);
         let baseline = match read_sidecar(&path, fp) {

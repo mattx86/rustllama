@@ -212,6 +212,10 @@ pub async fn completions(
     } else {
         None
     };
+    // MTP / NextN self-speculation takes precedence over n-gram (same
+    // grammar-free gate). `mtp_speculative()` already verifies the loaded
+    // model carries a NextN head, so this is `false` on non-MTP models.
+    let spec_mtp = sampling.grammar.is_none() && cpu.mtp_speculative();
 
     let (text, logprobs_out, completion_tokens) = if let Some(k) = want_logprobs {
         // Logprobs path: drives `generate_token_ids_with_logprobs`, then
@@ -278,6 +282,31 @@ pub async fn completions(
             text_offset,
         };
         (text_acc, Some(logprobs_payload), tok_count)
+    } else if spec_mtp {
+        // MTP / NextN self-speculative path — same draining shape as the
+        // n-gram arm, but drafts come from the model's NextN head. Takes
+        // precedence over n-gram when both are enabled.
+        let prompt_ids_i32: Vec<i32> = prompt_ids.iter().map(|&v| v as i32).collect();
+        let mut st = match cpu.speculate_mtp_stream_from_ids(prompt_ids_i32, sampling.clone()) {
+            Ok(st) => st,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        use futures::StreamExt;
+        let mut text = String::new();
+        while let Some(item) = st.next().await {
+            match item {
+                Ok(tok) => text.push_str(&tok.text),
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
+            }
+        }
+        let completion_tokens = cpu
+            .tokenizer()
+            .and_then(|t| t.encode(&text, false).ok())
+            .map(|ids| ids.len() as u32)
+            .unwrap_or(0);
+        (text, None, completion_tokens)
     } else if let Some(ng) = spec_ngram {
         // Speculative path: drain the ID-level TokenStream here in
         // the async handler — its verify rounds run on
@@ -498,7 +527,30 @@ async fn completions_stream(
     } else {
         None
     };
-    if let Some(ng) = spec_ngram {
+    // MTP / NextN self-speculation, precedence over n-gram; same gate.
+    // `mtp_speculative()` is `false` on models without a NextN head.
+    let spec_mtp = sampling.grammar.is_none() && logprobs_k.is_none() && cpu.mtp_speculative();
+    if spec_mtp {
+        // MTP self-speculative stream — same forwarding shape as the
+        // n-gram arm below; drafts come from the model's NextN head.
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&v| v as i32).collect();
+            match cpu_inner.speculate_mtp_stream_from_ids(prompt_i32, sampling_inner) {
+                Ok(mut st) => {
+                    while let Some(item) = st.next().await {
+                        let mapped = item.map_err(|e| e.to_string());
+                        if tx.send(mapped).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e.to_string())).await;
+                }
+            }
+        });
+    } else if let Some(ng) = spec_ngram {
         // The speculative TokenStream is async (verify rounds run on
         // spawn_blocking internally) — forward it into the same mpsc
         // the SSE loop drains, from a plain tokio task.

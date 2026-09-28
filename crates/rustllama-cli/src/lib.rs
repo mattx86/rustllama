@@ -3455,6 +3455,17 @@ async fn serve(
                          grammar requests fall back to the classic sampler)"
                 );
             }
+            // MTP / NextN self-speculation (hybrid + NextN-head models
+            // only; a silent no-op otherwise). Takes precedence over
+            // n-gram at dispatch time when both are enabled.
+            cpu.set_mtp_speculative(cfg.inference.speculative_mtp);
+            if cfg.inference.speculative_mtp {
+                tracing::info!(
+                    "MTP / NextN self-speculative decoding enabled (raw-softmax \
+                         sampling; used only on hybrid models with a NextN head; \
+                         grammar requests fall back to the classic sampler)"
+                );
+            }
             let applied_flash =
                 flash_attention_from_cache_or_default(cfg.tuning.auto_apply_flash_attention)
                     .unwrap_or(cfg.inference.flash_attention);
@@ -7450,6 +7461,8 @@ fn bench(
             ..Default::default()
         }));
     }
+    // MTP / NextN self-speculation (hybrid + NextN-head models only).
+    cpu.set_mtp_speculative(cfg.inference.speculative_mtp);
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
     println!("  load          = {load_ms:.1} ms");
     // Surface MoE info post-load so users comparing MoE vs dense

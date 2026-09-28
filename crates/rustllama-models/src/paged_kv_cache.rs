@@ -38,6 +38,158 @@
 use crate::page_table::{PageId, PageTable};
 use crate::paged_kv_store::PagedKvStore;
 
+// ============================================================
+// Optional KV-cache eviction for long contexts (env-gated).
+// ============================================================
+//
+// Two policies, both OFF by default. When neither env var is set,
+// `Evictor::from_env()` returns `None`, `PagedKvCache::evict` stays
+// `None`, and every method below takes its original code path — the
+// cache is byte-for-byte the unbounded cache it has always been.
+//
+//   RUSTLLAMA_KV_SLIDING_WINDOW=<tokens>
+//       Classic sliding-window attention cache. Keep only the most
+//       recent N token positions; free the pages that fall out of the
+//       window. Retained set stays contiguous.
+//
+//   RUSTLLAMA_KV_HEAVY_HITTER=<keep>
+//       H2O-style "heavy hitter" retention. True H2O keeps the tokens
+//       that have accumulated the most attention mass. Per-token
+//       attention scores are NOT available at the KV-cache layer
+//       (this layer only sees already-RoPE'd K/V rows — the softmax
+//       weights live inside the attention kernel and are never handed
+//       back here). Rather than fabricate scores, we use the
+//       well-established StreamingLLM proxy: keep the `keep` most
+//       recent positions PLUS a small block of initial "attention
+//       sink" positions (empirically the earliest tokens carry
+//       disproportionate attention mass and act as a stabilizing
+//       sink). This is a documented recency + position-sink
+//       approximation of H2O, not a measured-attention heavy-hitter
+//       selection. The sink size defaults to 4 tokens and can be
+//       overridden with RUSTLLAMA_KV_HEAVY_SINK=<tokens>.
+//
+// Precedence when BOTH are set: heavy-hitter is chosen, but its
+// recent-window `keep` is clamped to the sliding `window` so the
+// sliding value bounds the overall recent span (sinks are retained on
+// top of that, as StreamingLLM prescribes).
+//
+// Eviction is page-granular: only whole pages are freed (returned to
+// the `PageTable` free list, honoring its refcounts via `free`). The
+// retained pages keep their ORIGINAL absolute positions, so the RoPE
+// phase baked into each cached K row still matches the query's
+// absolute position — attention over the retained set is exactly
+// sliding-window / sink attention with no re-rotation needed. A
+// parallel `page_base` vector records each retained page's absolute
+// start position so writes/gathers address the right physical page
+// after older pages (and, for heavy-hitter, middle pages) are dropped.
+//
+// Scope (v1): engages only on the single-owner decode path
+// (`ensure_capacity` -> per-step `write_token*`/`gather_layer*`), which
+// the CPU engine drives with a per-token `ensure_capacity(table,
+// pos+1)`. Multi-token prefill and the shared/continuous-batching
+// path are left untouched (they grow by many positions at once, which
+// the trigger gate below deliberately skips), so those paths stay
+// byte-identical regardless of the env vars.
+
+/// Default number of leading "attention sink" tokens retained by the
+/// heavy-hitter policy (StreamingLLM's finding is ~4). Page-aligned up
+/// at engage time. Overridable via `RUSTLLAMA_KV_HEAVY_SINK`.
+const DEFAULT_HEAVY_SINK_TOKENS: u32 = 4;
+
+/// Which retention policy an [`Evictor`] enforces. Read once from the
+/// environment at cache construction.
+#[derive(Debug, Clone, Copy)]
+enum EvictPolicy {
+    /// Keep the most recent `window` token positions; drop older pages.
+    SlidingWindow { window: u32 },
+    /// Keep the `keep` most-recent positions plus the first `sink`
+    /// positions (page-aligned). Documented recency + sink proxy for
+    /// H2O; see the module comment above.
+    HeavyHitter { keep: u32, sink: u32 },
+}
+
+/// Per-cache eviction state. Present only when a budget env var is set.
+#[derive(Debug)]
+struct Evictor {
+    policy: EvictPolicy,
+    /// Absolute start position of each retained page, kept parallel to
+    /// [`PagedKvCache::pages`]. Empty until the first eviction actually
+    /// drops a page; `engaged` flips true at that point and the
+    /// offset-aware read/write path takes over. Before engagement the
+    /// pages are still contiguous from position 0 and the original
+    /// (byte-identical) path is used.
+    page_base: Vec<u32>,
+    engaged: bool,
+}
+
+impl Evictor {
+    /// Parse the eviction env vars once. Returns `None` (the default,
+    /// unbounded cache) unless a budget is set.
+    fn from_env() -> Option<Evictor> {
+        let sliding = std::env::var("RUSTLLAMA_KV_SLIDING_WINDOW")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&n| n > 0);
+        let heavy = std::env::var("RUSTLLAMA_KV_HEAVY_HITTER")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&n| n > 0);
+        let policy = match (sliding, heavy) {
+            // Heavy-hitter wins when both are set; sliding bounds `keep`.
+            (bound, Some(keep)) => {
+                let keep = match bound {
+                    Some(w) => keep.min(w),
+                    None => keep,
+                };
+                let sink = std::env::var("RUSTLLAMA_KV_HEAVY_SINK")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .unwrap_or(DEFAULT_HEAVY_SINK_TOKENS);
+                EvictPolicy::HeavyHitter { keep, sink }
+            }
+            (Some(window), None) => EvictPolicy::SlidingWindow { window },
+            (None, None) => return None,
+        };
+        Some(Evictor {
+            policy,
+            page_base: Vec::new(),
+            engaged: false,
+        })
+    }
+}
+
+/// Whether the page starting at absolute `base` is retained when the
+/// sequence has `l` total positions, under `policy`, with `ps`-token
+/// pages. Free function (no `self` borrow) so the eviction partition
+/// loop can call it while it holds `&mut self`.
+fn page_kept(policy: EvictPolicy, base: u32, l: u32, ps: u32) -> bool {
+    match policy {
+        EvictPolicy::SlidingWindow { window } => {
+            if l <= window {
+                return true;
+            }
+            // Drop whole pages entirely older than the window. Round the
+            // window floor DOWN to a page boundary so a page is kept
+            // until every position it holds has left the window (the
+            // retained span is thus in `[window, window + ps)`).
+            let floor = ((l - window) / ps) * ps;
+            base >= floor
+        }
+        EvictPolicy::HeavyHitter { keep, sink } => {
+            // Sink block: the first `sink` positions, page-aligned up.
+            let sink_ceil = sink.div_ceil(ps) * ps;
+            if base < sink_ceil {
+                return true;
+            }
+            if l <= keep {
+                return true;
+            }
+            let floor = ((l - keep) / ps) * ps;
+            base >= floor
+        }
+    }
+}
+
 /// One request's KV-cache state. Cheap to construct (just a Vec
 /// of PageIds + counters); the actual byte storage lives in the
 /// shared [`PagedKvStore`] passed into every write/gather call.
@@ -46,6 +198,12 @@ pub struct PagedKvCache {
     /// Pages currently assigned to this request, in
     /// position-ascending order. Page `i` holds positions
     /// `[i * page_size, (i + 1) * page_size)` for every layer.
+    ///
+    /// With eviction engaged this is the *retained* page list, which
+    /// may no longer start at position 0 (sliding window) and may have
+    /// a gap between the sink block and the recent window (heavy
+    /// hitter). The parallel `evict.page_base` records each page's
+    /// absolute start; gather walks these in order and compacts them.
     pages: Vec<PageId>,
     /// Total token positions written so far. Promoted by
     /// `write_token` (lazy `max(seq_len, pos + 1)` semantics) and
@@ -57,6 +215,9 @@ pub struct PagedKvCache {
     /// lifetime of a request — if `PagedKvStore::resize` ever lands,
     /// the cache will need an invalidate hook.
     page_size: u32,
+    /// Optional KV eviction policy (env-gated). `None` = unbounded
+    /// cache, the default; every method then takes its original path.
+    evict: Option<Evictor>,
 }
 
 impl PagedKvCache {
@@ -68,6 +229,7 @@ impl PagedKvCache {
             pages: Vec::new(),
             seq_len: 0,
             page_size: store.page_size(),
+            evict: Evictor::from_env(),
         }
     }
 
@@ -80,6 +242,7 @@ impl PagedKvCache {
             pages: Vec::new(),
             seq_len: 0,
             page_size: store.page_size(),
+            evict: Evictor::from_env(),
         }
     }
 
@@ -90,6 +253,7 @@ impl PagedKvCache {
             pages: Vec::new(),
             seq_len: 0,
             page_size,
+            evict: Evictor::from_env(),
         }
     }
 
@@ -110,8 +274,82 @@ impl PagedKvCache {
     /// Total positions the cache can currently hold across its
     /// allocated pages. Drives the "do I need to grow?" check at
     /// each forward pass entry.
+    ///
+    /// With eviction engaged the retained pages no longer start at
+    /// position 0, so this reports the ABSOLUTE writable ceiling
+    /// (`last_page_base + page_size`) rather than a raw page count —
+    /// the forward pass's `pos < capacity_tokens()` guard and the
+    /// engine's `ensure_capacity(pos + 1)` stay correct on the
+    /// absolute position axis. When eviction is disabled it is the
+    /// original `pages * page_size`, byte-identical.
     pub fn capacity_tokens(&self) -> u32 {
-        (self.pages.len() as u32).saturating_mul(self.page_size)
+        match self.evict.as_ref() {
+            Some(e) if e.engaged => e
+                .page_base
+                .last()
+                .map(|&b| b + self.page_size)
+                .unwrap_or(0),
+            _ => (self.pages.len() as u32).saturating_mul(self.page_size),
+        }
+    }
+
+    /// True once at least one page has been evicted (the offset-aware
+    /// read/write path is live). Always false when eviction is
+    /// disabled (`evict == None`) or a budget is set but not yet
+    /// exceeded.
+    #[inline]
+    fn evict_engaged(&self) -> bool {
+        self.evict.as_ref().map(|e| e.engaged).unwrap_or(false)
+    }
+
+    /// Number of token positions currently retained and gathered for
+    /// attention. Equals `seq_len` (the absolute count) when eviction
+    /// is disabled or not engaged; otherwise the compacted count of
+    /// the retained pages (full pages + partial tail). This is the
+    /// `kv_len` the attention kernel runs over after eviction.
+    pub fn retained_len(&self) -> u32 {
+        match self.evict.as_ref() {
+            Some(e) if e.engaged => match e.page_base.last() {
+                Some(&last_base) if !self.pages.is_empty() => {
+                    (self.pages.len() as u32 - 1) * self.page_size
+                        + self.seq_len.saturating_sub(last_base)
+                }
+                _ => 0,
+            },
+            _ => self.seq_len,
+        }
+    }
+
+    /// The `kv_len` the attention kernel should use for the token at
+    /// absolute `pos` (i.e. the value [`Self::retained_len`] will hold
+    /// once `write_token(pos)` has bumped `seq_len` to `pos + 1`).
+    /// Callers in the paged forward pass size the gather slab from
+    /// this. Returns `pos + 1` unchanged when eviction is disabled, so
+    /// the default path is byte-identical.
+    pub fn retained_len_for_pos(&self, pos: u32) -> usize {
+        match self.evict.as_ref() {
+            Some(e) if e.engaged => match e.page_base.last() {
+                Some(&last_base) if !self.pages.is_empty() => {
+                    (((self.pages.len() as u32 - 1) * self.page_size)
+                        + (pos + 1).saturating_sub(last_base)) as usize
+                }
+                _ => pos as usize + 1,
+            },
+            _ => pos as usize + 1,
+        }
+    }
+
+    /// Resolve an absolute position to the physical (page, in-page
+    /// offset) that holds it, for the eviction-engaged write path.
+    /// Searches from the tail because writes append to the newest
+    /// page. Returns `None` if no retained page covers `pos` (a bug —
+    /// `ensure_capacity` must have allocated the tail page first).
+    fn resolve_write_page(&self, pos: u32) -> Option<(PageId, u32)> {
+        let ps = self.page_size;
+        let want_base = (pos / ps) * ps;
+        let e = self.evict.as_ref()?;
+        let idx = e.page_base.iter().rposition(|&b| b == want_base)?;
+        Some((self.pages[idx], pos - want_base))
     }
 
     /// E3.2: install a read-only view onto another slot's already-
@@ -164,7 +402,32 @@ impl PagedKvCache {
         table: &mut PageTable,
         n_total: u32,
     ) -> Result<(), usize> {
-        if n_total <= self.capacity_tokens() {
+        // Env-gated KV eviction (default-off; see the module comment).
+        // Trigger only on incremental, decode-style growth — one new
+        // position past the current watermark. Multi-token prefill and
+        // the shared/continuous-batching admission path grow by many
+        // positions at once, so this gate skips them and they stay
+        // byte-identical regardless of the env vars.
+        if self.evict.is_some() && n_total == self.seq_len + 1 {
+            self.maybe_evict(table, n_total);
+        }
+        if self.evict_engaged() {
+            return self.ensure_capacity_engaged(table, n_total);
+        }
+        self.ensure_capacity_plain(table, n_total)
+    }
+
+    /// The original (pre-eviction) contiguous allocator. Grows `pages`
+    /// so the cache covers `n_total` positions from 0. Used by the
+    /// non-engaged branch of [`Self::ensure_capacity`] and by the
+    /// shared/continuous-batching path (which never evicts), so both
+    /// stay byte-identical to the historical behavior.
+    fn ensure_capacity_plain(
+        &mut self,
+        table: &mut PageTable,
+        n_total: u32,
+    ) -> Result<(), usize> {
+        if n_total <= (self.pages.len() as u32).saturating_mul(self.page_size) {
             return Ok(());
         }
         let pages_needed = n_total.div_ceil(self.page_size) as usize;
@@ -176,6 +439,90 @@ impl PagedKvCache {
                 Ok(())
             }
             None => Err(new_pages.saturating_sub(table.free_count())),
+        }
+    }
+
+    /// Evict retained pages that have fallen out of the configured
+    /// budget for a sequence of `n_total` absolute positions, freeing
+    /// them back to `table`. Idempotent within a step: re-running with
+    /// the same `n_total` drops nothing more. Lazily builds
+    /// `page_base` (and flips `engaged`) the first time a page is
+    /// actually dropped, so a cache that never exceeds its budget
+    /// stays on the original code path.
+    fn maybe_evict(&mut self, table: &mut PageTable, n_total: u32) {
+        let ps = self.page_size;
+        let (policy, already) = match self.evict.as_ref() {
+            Some(e) => (e.policy, e.engaged),
+            None => return,
+        };
+        // Bases to evaluate: the maintained `page_base` once engaged,
+        // else the still-contiguous `i * page_size` layout.
+        let bases: Vec<u32> = if already {
+            self.evict.as_ref().unwrap().page_base.clone()
+        } else {
+            (0..self.pages.len() as u32).map(|i| i * ps).collect()
+        };
+        let mut kept_pages: Vec<PageId> = Vec::with_capacity(self.pages.len());
+        let mut kept_base: Vec<u32> = Vec::with_capacity(bases.len());
+        let mut evicted: Vec<PageId> = Vec::new();
+        for (i, &base) in bases.iter().enumerate() {
+            if page_kept(policy, base, n_total, ps) {
+                kept_pages.push(self.pages[i]);
+                kept_base.push(base);
+            } else {
+                evicted.push(self.pages[i]);
+            }
+        }
+        if evicted.is_empty() {
+            // Under budget this step — leave state as-is (still
+            // disengaged if it was, keeping the default path live).
+            return;
+        }
+        table.free(&evicted);
+        self.pages = kept_pages;
+        if let Some(e) = self.evict.as_mut() {
+            e.page_base = kept_base;
+            e.engaged = true;
+        }
+    }
+
+    /// Eviction-engaged capacity growth: allocate whatever tail pages
+    /// are needed to cover absolute position `n_total - 1`, extending
+    /// `page_base` in lockstep. Older/middle pages were already freed
+    /// by [`Self::maybe_evict`], so this keeps live page usage bounded
+    /// to the retained set plus the growing tail.
+    fn ensure_capacity_engaged(
+        &mut self,
+        table: &mut PageTable,
+        n_total: u32,
+    ) -> Result<(), usize> {
+        if n_total == 0 {
+            return Ok(());
+        }
+        let ps = self.page_size;
+        let target_last_base = ((n_total - 1) / ps) * ps;
+        let cur_last_base = self.evict.as_ref().and_then(|e| e.page_base.last().copied());
+        let start = match cur_last_base {
+            Some(b) if b >= target_last_base => return Ok(()),
+            Some(b) => b + ps,
+            None => 0,
+        };
+        let n_new = (((target_last_base - start) / ps) + 1) as usize;
+        match table.alloc(n_new) {
+            Some(new) => {
+                let mut base = start;
+                let mut new_bases: Vec<u32> = Vec::with_capacity(new.len());
+                for _ in &new {
+                    new_bases.push(base);
+                    base += ps;
+                }
+                self.pages.extend(new);
+                if let Some(e) = self.evict.as_mut() {
+                    e.page_base.extend(new_bases);
+                }
+                Ok(())
+            }
+            None => Err(n_new.saturating_sub(table.free_count())),
         }
     }
 
@@ -200,7 +547,16 @@ impl PagedKvCache {
         if pos >= self.capacity_tokens() {
             return None;
         }
-        store.write_token(&self.pages, layer, pos, k_row, v_row)?;
+        if self.evict_engaged() {
+            // Retained pages are non-contiguous in absolute position;
+            // resolve `pos` to its physical page and write via a
+            // one-page slice (store decomposes `pos_in_page < page_size`
+            // to index 0). Byte-identical result to the contiguous path.
+            let (page, in_page) = self.resolve_write_page(pos)?;
+            store.write_token(std::slice::from_ref(&page), layer, in_page, k_row, v_row)?;
+        } else {
+            store.write_token(&self.pages, layer, pos, k_row, v_row)?;
+        }
         if pos + 1 > self.seq_len {
             self.seq_len = pos + 1;
         }
@@ -223,7 +579,11 @@ impl PagedKvCache {
         k_out: &mut [f32],
         v_out: &mut [f32],
     ) -> Option<()> {
-        store.gather_layer(&self.pages, layer, self.seq_len, k_out, v_out)
+        // `retained_len()` == `seq_len` when eviction is off/disengaged,
+        // so this is byte-identical by default. When engaged it is the
+        // compacted retained-position count; the store walks `pages` in
+        // order and packs them into the caller's slab.
+        store.gather_layer(&self.pages, layer, self.retained_len(), k_out, v_out)
     }
 
     /// H9a: Q8_0 paged gather. Same shape as [`Self::gather_layer`]
@@ -237,7 +597,7 @@ impl PagedKvCache {
         k_out: &mut [f32],
         v_out: &mut [f32],
     ) -> Option<()> {
-        store.gather_layer(&self.pages, layer, self.seq_len, k_out, v_out)
+        store.gather_layer(&self.pages, layer, self.retained_len(), k_out, v_out)
     }
 
     /// H9a: Q8_0 paged write. Same shape as [`Self::write_token`]
@@ -253,7 +613,12 @@ impl PagedKvCache {
         if pos >= self.capacity_tokens() {
             return None;
         }
-        store.write_token(&self.pages, layer, pos, k_row, v_row)?;
+        if self.evict_engaged() {
+            let (page, in_page) = self.resolve_write_page(pos)?;
+            store.write_token(std::slice::from_ref(&page), layer, in_page, k_row, v_row)?;
+        } else {
+            store.write_token(&self.pages, layer, pos, k_row, v_row)?;
+        }
         if pos + 1 > self.seq_len {
             self.seq_len = pos + 1;
         }
@@ -276,7 +641,12 @@ impl PagedKvCache {
         if pos >= self.capacity_tokens() {
             return None;
         }
-        store.write_token(&self.pages, layer, pos, k_row, v_row)?;
+        if self.evict_engaged() {
+            let (page, in_page) = self.resolve_write_page(pos)?;
+            store.write_token(std::slice::from_ref(&page), layer, in_page, k_row, v_row)?;
+        } else {
+            store.write_token(&self.pages, layer, pos, k_row, v_row)?;
+        }
         if pos + 1 > self.seq_len {
             self.seq_len = pos + 1;
         }
@@ -290,7 +660,7 @@ impl PagedKvCache {
         k_out: &mut [f32],
         v_out: &mut [f32],
     ) -> Option<()> {
-        store.gather_layer(&self.pages, layer, self.seq_len, k_out, v_out)
+        store.gather_layer(&self.pages, layer, self.retained_len(), k_out, v_out)
     }
 
     /// Override the seq_len watermark to a smaller value — used by
@@ -311,11 +681,23 @@ impl PagedKvCache {
     /// admission can reuse the pages.
     pub fn release(&mut self, table: &mut PageTable) {
         if self.pages.is_empty() {
+            // Still reset eviction bookkeeping in case a prior release
+            // already cleared `pages` but left `evict` engaged.
+            if let Some(e) = self.evict.as_mut() {
+                e.page_base.clear();
+                e.engaged = false;
+            }
             return;
         }
         table.free(&self.pages);
         self.pages.clear();
         self.seq_len = 0;
+        // Reset eviction state (keep the policy from env so a reused
+        // cache re-engages on the next long generation).
+        if let Some(e) = self.evict.as_mut() {
+            e.page_base.clear();
+            e.engaged = false;
+        }
     }
 
     // ============================================================
@@ -338,7 +720,11 @@ impl PagedKvCache {
         shared: &crate::shared_paged_kv::SharedPagedKv,
         n_total: u32,
     ) -> Result<(), usize> {
-        shared.with_table_mut(|table| self.ensure_capacity(table, n_total))
+        // The continuous-batching path pre-sizes each slot to its full
+        // capacity once and never re-grows, so KV eviction does not
+        // apply here (v1). Route through the plain allocator so a set
+        // eviction env var can never engage on a shared/batched cache.
+        shared.with_table_mut(|table| self.ensure_capacity_plain(table, n_total))
     }
 
     /// Shared-store variant of [`Self::write_token`]. Writes a
@@ -721,5 +1107,145 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ========================================================
+    // Env-gated KV eviction (sliding-window / heavy-hitter).
+    // These inject the policy directly (bypassing the env vars) so
+    // they're deterministic and don't race with other tests in the
+    // same process.
+    // ========================================================
+
+    /// Gather the retained set and assert every retained position
+    /// reconstructs its write pattern. Works for both contiguous
+    /// (sliding-window) and holey (heavy-hitter) retained page lists:
+    /// the store compacts `pages` in order, and each retained page
+    /// carries the data for its own absolute `page_base`.
+    fn verify_retained_reconstruction(
+        cache: &PagedKvCache,
+        store: &PagedKvStore,
+        layer: u32,
+        pattern: impl Fn(u32, usize) -> f32,
+    ) {
+        let hd = store.head_dim() as usize; // n_kv_heads == 1 in these tests
+        let ps = store.page_size();
+        let rl = cache.retained_len() as usize;
+        let mut k_out = vec![0f32; rl * hd];
+        let mut v_out = vec![0f32; rl * hd];
+        cache
+            .gather_layer(store, layer, &mut k_out, &mut v_out)
+            .expect("gather retained set");
+        let e = cache.evict.as_ref().expect("evictor present");
+        let seq = cache.seq_len();
+        let last_idx = cache.pages().len() - 1;
+        let mut gp = 0usize;
+        for (i, &base) in e.page_base.iter().enumerate() {
+            let fill = if i == last_idx {
+                (seq - base) as usize
+            } else {
+                ps as usize
+            };
+            for j in 0..fill {
+                let abs = base + j as u32;
+                for d in 0..hd {
+                    let off = gp * hd + d;
+                    assert!(
+                        (k_out[off] - pattern(abs, d)).abs() < 1e-6,
+                        "k mismatch at abs pos {abs} d {d}: got {} want {}",
+                        k_out[off],
+                        pattern(abs, d),
+                    );
+                    assert!(
+                        (v_out[off] - pattern(abs, d)).abs() < 1e-6,
+                        "v mismatch at abs pos {abs} d {d}",
+                    );
+                }
+                gp += 1;
+            }
+        }
+        assert_eq!(gp, rl, "gathered position count equals retained_len");
+    }
+
+    #[test]
+    fn eviction_disabled_is_a_byte_identical_noop() {
+        // Force-disabled regardless of any ambient env var: the cache
+        // must behave exactly like the historical unbounded cache.
+        let store = PagedKvStore::new(8, 1, 1, 4, 2).unwrap();
+        let mut cache = PagedKvCache::new_for(&store);
+        cache.evict = None;
+        let mut table = PageTable::new(8, 4);
+        cache.ensure_capacity(&mut table, 6).unwrap();
+        assert!(!cache.evict_engaged());
+        assert_eq!(cache.pages().len(), 2, "6 tokens -> 2 pages (unchanged)");
+        assert_eq!(cache.capacity_tokens(), 8, "raw page*page_size capacity");
+        assert_eq!(cache.retained_len_for_pos(5), 6, "retained == pos+1 when off");
+        assert_eq!(cache.retained_len(), cache.seq_len());
+    }
+
+    #[test]
+    fn sliding_window_evicts_oldest_pages_and_reconstructs_recent() {
+        let mut store = PagedKvStore::new(8, 1, 1, 4, 2).unwrap();
+        let mut table = PageTable::new(8, 4);
+        let mut cache = PagedKvCache::new_for(&store);
+        cache.evict = Some(Evictor {
+            policy: EvictPolicy::SlidingWindow { window: 8 },
+            page_base: Vec::new(),
+            engaged: false,
+        });
+        let layer = 0u32;
+        let pattern = |pos: u32, d: usize| pos as f32 * 100.0 + d as f32;
+        // Drive 20 tokens the way the single-owner engine does:
+        // ensure_capacity(pos+1) then write_token(pos) each step.
+        for pos in 0..20u32 {
+            cache.ensure_capacity(&mut table, pos + 1).expect("grow");
+            let k = [pattern(pos, 0), pattern(pos, 1)];
+            cache.write_token(&mut store, layer, pos, &k, &k).expect("write");
+        }
+        assert!(cache.evict_engaged(), "should engage once past the window");
+        // Retained span bounded to [window, window + page_size).
+        let rl = cache.retained_len();
+        assert!((8..12).contains(&rl), "retained_len {rl} in [8, 12)");
+        // Live page usage bounded (not the 5 pages a 20-token history
+        // would need unbounded).
+        assert!(cache.pages().len() <= 3, "pages bounded: {}", cache.pages().len());
+        // Evicted pages returned to the pool.
+        assert!(table.free_count() >= 5, "old pages freed back: {}", table.free_count());
+        // Retained window is contiguous (no hole for sliding window).
+        let bases = &cache.evict.as_ref().unwrap().page_base;
+        assert!(bases.windows(2).all(|w| w[1] - w[0] == 4), "contiguous: {bases:?}");
+        // The newest token is inside the retained set and reconstructs.
+        verify_retained_reconstruction(&cache, &store, layer, &pattern);
+    }
+
+    #[test]
+    fn heavy_hitter_keeps_sink_and_recent_leaving_a_hole() {
+        let mut store = PagedKvStore::new(8, 1, 1, 4, 2).unwrap();
+        let mut table = PageTable::new(8, 4);
+        let mut cache = PagedKvCache::new_for(&store);
+        cache.evict = Some(Evictor {
+            policy: EvictPolicy::HeavyHitter { keep: 8, sink: 4 },
+            page_base: Vec::new(),
+            engaged: false,
+        });
+        let layer = 0u32;
+        let pattern = |pos: u32, d: usize| pos as f32 * 100.0 + d as f32;
+        for pos in 0..20u32 {
+            cache.ensure_capacity(&mut table, pos + 1).expect("grow");
+            let k = [pattern(pos, 0), pattern(pos, 1)];
+            cache.write_token(&mut store, layer, pos, &k, &k).expect("write");
+        }
+        assert!(cache.evict_engaged());
+        let bases = cache.evict.as_ref().unwrap().page_base.clone();
+        // Sink block (the first page) is retained at the front.
+        assert_eq!(bases[0], 0, "sink page retained: {bases:?}");
+        // A gap larger than one page separates the sink from the recent
+        // window — the middle was evicted (this is what distinguishes
+        // heavy-hitter from the sliding window).
+        assert!(
+            bases.windows(2).any(|w| w[1] - w[0] > 4),
+            "expected a hole between sink and recent window: {bases:?}",
+        );
+        // Sink + recent positions all reconstruct correctly.
+        verify_retained_reconstruction(&cache, &store, layer, &pattern);
     }
 }

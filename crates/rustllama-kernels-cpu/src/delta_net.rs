@@ -32,6 +32,7 @@
 //! the existing `matvec_*` kernels — no new kernel needed here.
 
 use crate::rmsnorm_f32;
+use std::sync::OnceLock;
 
 /// Substep 3.1: depthwise 1D convolution forward for one token.
 ///
@@ -1081,6 +1082,408 @@ pub fn delta_net_layer_forward_f32(
     matvec_f32_row_major(w_ssm_out, &v_out, out, d_model, ssm_inner);
 }
 
+// ============================================================================
+// Chunked-parallel prefill scan for the Gated Delta Rule
+// ============================================================================
+//
+// The per-token [`delta_rule_step_f32`] recurrence is strictly sequential
+// across tokens (each token's `v_tilde` reads the running state). During
+// prefill we already have the whole prompt in hand, so we can trade the
+// long serial dependency chain (T steps) for a *chunked* scan: split the T
+// tokens into fixed-length chunks, compute every chunk's intra-chunk
+// operators independently (embarrassingly parallel — rayon), then thread the
+// recurrent state through only the (few) chunk boundaries. This is the
+// standard chunked / "UT-transform" delta-rule formulation and is
+// numerically equivalent (to within f32 rounding) to running the per-token
+// step T times.
+//
+// ## Derivation (one V-head, matching the scalar reference exactly)
+//
+// Reference per-token math (see `delta_rule_step_f32_with_scratch_scalar`),
+// with `S_in` = state entering the chunk, local token index `t`:
+//   γ_t = exp(g_t)                                   (per-token decay)
+//   D_t = γ_t · S_{t-1}                              (decayed prior state)
+//   u_t = β_t·(v_t − Dᵀ_t k_t)                       (= v_tilde)
+//   S_t = D_t + k_t u_tᵀ                             (rank-1 update)
+//   o_t = S_tᵀ q_t                                   (output, uses updated S_t)
+//
+// Let `cg_t = Σ_{s=0..t} g_s` be the cumulative log-decay inside the chunk
+// (so γ ratios are `exp(cg_t − cg_r)` and never exceed 1 for the decays this
+// arch produces, which are always ≤ 0). Unrolling gives, for r ≤ t:
+//   S_t = Γ_t·S_in + Σ_{r≤t} exp(cg_t−cg_r)·k_r u_rᵀ,     Γ_t = exp(cg_t)
+// and the (t) delta corrections satisfy the unit-lower-triangular system
+//   u_t + Σ_{r<t} A[t,r]·u_r = β_t v_t − β_t Γ_t (S_inᵀ k_t)
+//   A[t,r] = β_t · exp(cg_t−cg_r) · (k_r·k_t)         (r < t)
+// Split the right-hand side into a chunk-local part (`β_t v_t`, independent
+// of `S_in`) and a cross part (`−β_t Γ_t S_inᵀ k_t = S_inᵀ p_t`,
+// `p_t = −β_t Γ_t k_t`). Because forward substitution is linear:
+//   U        = U_local + W·S_in
+//   U_local  solves (I+T)·U_local = diag(β)·V           (chunk-local)
+//   W        solves (I+T)·W        = P                   (chunk-local, [L×qk])
+// The outputs and the boundary state then decompose into a chunk-local piece
+// plus a cheap `·S_in` matmul:
+//   o_t       = O_intra_local[t] + (B·W·S_in)[t] + (Q̂·S_in)[t]
+//               B[t,r] = exp(cg_t−cg_r)(k_r·q_t) for r≤t, Q̂_t = Γ_t q_t
+//   S_out     = Γ_{L-1}·S_in + K̂ᵀ·U,  K̂_r = exp(cg_{L-1}−cg_r) k_r
+// Everything named `_local`, plus `W`, `B·W` (=`bw`), `Q̂` (=`qg`) and `K̂`
+// (=`kd`) depends only on this chunk's q/k/v/g/β, so it is built in parallel;
+// the serial boundary pass is just a handful of `[L×qk]·[qk×v]` matmuls per
+// chunk carrying `S_in`.
+//
+// ## Equivalence caveat
+// This is exact in real arithmetic. In f32 the reordered accumulation (a
+// cumulative `exp` of summed log-decays vs. repeated multiply, and a
+// triangular solve vs. the direct recurrence) drifts by a few ulp per step;
+// with the decays this arch produces (g ≤ 0 ⇒ every `exp(cg_t−cg_r) ≤ 1`,
+// so nothing amplifies) and L2-normed q/k it tracks the sequential path to
+// well under 1e-4 for realistic chunk sizes. There is no gating term that
+// forces a fallback: the decay `g` is the only gate and it is handled
+// exactly above. A chunk length of 1 is routed to the literal per-token
+// path for bit-for-bit identity.
+
+/// Default chunk length used by [`delta_rule_prefill_chunked`] when
+/// `RUSTLLAMA_SSM_CHUNK` is unset or `0`. 64 keeps each chunk's O(L²)
+/// intra-chunk work small while still giving rayon enough chunks to spread.
+pub const SSM_CHUNK_DEFAULT: usize = 64;
+
+/// Chunk length for the prefill scan, read once from `RUSTLLAMA_SSM_CHUNK`.
+/// `0`/unset → [`SSM_CHUNK_DEFAULT`]; `1` forces the exact per-token
+/// sequential path. Cached in a `OnceLock` so we don't touch the
+/// environment per SSM layer per prefill. (Plain env→value init — not a
+/// self-referential `OnceLock`.)
+fn ssm_chunk_len() -> usize {
+    static CHUNK: OnceLock<usize> = OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        std::env::var("RUSTLLAMA_SSM_CHUNK")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&c| c > 0)
+            .unwrap_or(SSM_CHUNK_DEFAULT)
+    })
+}
+
+/// Per-chunk operators, all independent of the incoming recurrent state so
+/// they can be built in parallel. Row-major throughout; `qk`/`vd` are
+/// `head_qk_dim`/`head_v_dim`. See the module-level derivation for the math.
+struct ChunkPlan {
+    start: usize,          // first (global) token index of this chunk
+    len: usize,            // L, tokens in this chunk
+    u_local: Vec<f32>,     // [L*vd]  (I+T)^{-1} diag(β) V
+    w: Vec<f32>,           // [L*qk]  (I+T)^{-1} P,  P_t = -β_t Γ_t k_t
+    o_intra_local: Vec<f32>, // [L*vd]  B · U_local
+    bw: Vec<f32>,          // [L*qk]  B · W
+    qg: Vec<f32>,          // [L*qk]  Q̂_t = Γ_t q_t   (for the inter-chunk output)
+    kd: Vec<f32>,          // [L*qk]  K̂_r = exp(cg_{L-1}-cg_r) k_r (state carry)
+    last_decay: f32,       // Γ_{L-1} = exp(cg_{L-1})
+}
+
+/// Build one chunk's [`ChunkPlan`] (the parallel, `S_in`-independent work).
+#[allow(clippy::too_many_arguments)]
+fn build_chunk_plan(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    start: usize,
+    len: usize,
+    qk: usize,
+    vd: usize,
+) -> ChunkPlan {
+    // Cumulative log-decay within the chunk: cg[t] = Σ_{s=0..t} g[start+s].
+    let mut cg = vec![0.0f32; len];
+    {
+        let mut acc = 0.0f32;
+        for t in 0..len {
+            acc += g[start + t];
+            cg[t] = acc;
+        }
+    }
+
+    // Forward-substitution solve of the unit-lower-triangular system for both
+    // right-hand sides at once (they share the same T[t,r] coefficients):
+    //   u_local: RHS_t = β_t v_t
+    //   w      : RHS_t = P_t = -β_t Γ_t k_t
+    let mut u_local = vec![0.0f32; len * vd];
+    let mut w = vec![0.0f32; len * qk];
+    for t in 0..len {
+        let gt = start + t;
+        let bt = beta[gt];
+        // Seed both RHS.
+        for j in 0..vd {
+            u_local[t * vd + j] = bt * v[gt * vd + j];
+        }
+        let neg_bg = -bt * cg[t].exp();
+        for i in 0..qk {
+            w[t * qk + i] = neg_bg * k[gt * qk + i];
+        }
+        // Subtract T[t,r]·X[r] for r<t, where T[t,r]=β_t·exp(cg_t-cg_r)·(k_r·k_t).
+        for r in 0..t {
+            let gr = start + r;
+            let mut kk = 0.0f32;
+            for i in 0..qk {
+                kk += k[gt * qk + i] * k[gr * qk + i];
+            }
+            let coeff = bt * (cg[t] - cg[r]).exp() * kk;
+            if coeff != 0.0 {
+                let (u_t, u_r) = (t * vd, r * vd);
+                for j in 0..vd {
+                    u_local[u_t + j] -= coeff * u_local[u_r + j];
+                }
+                let (w_t, w_r) = (t * qk, r * qk);
+                for i in 0..qk {
+                    w[w_t + i] -= coeff * w[w_r + i];
+                }
+            }
+        }
+    }
+
+    // Intra-chunk output operator B[t,r]=exp(cg_t-cg_r)(k_r·q_t), r≤t, applied
+    // to the chunk-local U and W: O_intra_local = B·U_local, bw = B·W.
+    let mut o_intra_local = vec![0.0f32; len * vd];
+    let mut bw = vec![0.0f32; len * qk];
+    for t in 0..len {
+        let gt = start + t;
+        for r in 0..=t {
+            let gr = start + r;
+            let mut kq = 0.0f32; // q_t · k_r
+            for i in 0..qk {
+                kq += q[gt * qk + i] * k[gr * qk + i];
+            }
+            let b = (cg[t] - cg[r]).exp() * kq;
+            if b != 0.0 {
+                let (o_t, u_r) = (t * vd, r * vd);
+                for j in 0..vd {
+                    o_intra_local[o_t + j] += b * u_local[u_r + j];
+                }
+                let (bw_t, w_r) = (t * qk, r * qk);
+                for i in 0..qk {
+                    bw[bw_t + i] += b * w[w_r + i];
+                }
+            }
+        }
+    }
+
+    // Inter-chunk output keys Q̂_t = Γ_t q_t and state-carry keys
+    // K̂_r = exp(cg_{L-1}-cg_r) k_r.
+    let mut qg = vec![0.0f32; len * qk];
+    let mut kd = vec![0.0f32; len * qk];
+    let cg_last = cg[len - 1];
+    for t in 0..len {
+        let gt = start + t;
+        let eg = cg[t].exp(); // Γ_t
+        let ekd = (cg_last - cg[t]).exp(); // Γ_{L-1}/Γ_t
+        for i in 0..qk {
+            qg[t * qk + i] = eg * q[gt * qk + i];
+            kd[t * qk + i] = ekd * k[gt * qk + i];
+        }
+    }
+
+    ChunkPlan {
+        start,
+        len,
+        u_local,
+        w,
+        o_intra_local,
+        bw,
+        qg,
+        kd,
+        last_decay: cg_last.exp(),
+    }
+}
+
+/// Chunked-parallel prefill scan of the Gated Delta Rule for **one V-head**.
+///
+/// Numerically equivalent (within f32 tolerance) to calling
+/// [`delta_rule_step_f32`] `seq_len` times with the same per-token inputs,
+/// carrying `state` across the calls — but the O(L²) intra-chunk work for
+/// every chunk is computed in parallel and only the recurrent state is
+/// threaded serially across the chunk boundaries.
+///
+/// ## Parameters (whole-sequence, token-major; `qk`=`head_qk_dim`,
+///    `vd`=`head_v_dim`)
+/// Each maps directly to the per-token [`delta_rule_step_f32`] argument the
+/// caller would otherwise pass token by token:
+/// - `q`, `k`: `[seq_len * qk]` — per-token query/key rows, already
+///   L2-normalized exactly as the single-token path expects (the caller
+///   applies `l2norm_f32_inplace` per token before packing).
+/// - `v`: `[seq_len * vd]` — per-token value rows.
+/// - `g`: `[seq_len]` — per-token log-decay scalars (the `g`/`decay`
+///   argument of the step fn; this arch's values are ≤ 0).
+/// - `beta`: `[seq_len]` — per-token learning-rate scalars, already
+///   sigmoid'd (the `beta` argument of the step fn).
+/// - `state`: `[qk * vd]` recurrent state, row-major with the K-dim outer —
+///   the *same* layout as the step fn. Read as the incoming state and
+///   **overwritten in place** with the final post-sequence state, so the
+///   caller can keep decoding from it.
+/// - `out`: `[seq_len * vd]` — per-token outputs, written (token-major).
+///
+/// Chunk length comes from `RUSTLLAMA_SSM_CHUNK` (see [`ssm_chunk_len`]).
+/// Decode (single-token) behavior is unaffected: `seq_len <= 1` and a chunk
+/// length of 1 both route to the exact per-token path.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_rule_prefill_chunked(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    state: &mut [f32],
+    out: &mut [f32],
+    seq_len: usize,
+    head_qk_dim: usize,
+    head_v_dim: usize,
+) {
+    delta_rule_prefill_chunked_with_chunk(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        out,
+        seq_len,
+        head_qk_dim,
+        head_v_dim,
+        ssm_chunk_len(),
+    );
+}
+
+/// [`delta_rule_prefill_chunked`] with an explicit chunk length (mostly for
+/// tests / autotuning). `chunk_len == 0` → [`SSM_CHUNK_DEFAULT`];
+/// `chunk_len == 1` → the exact per-token sequential path.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_rule_prefill_chunked_with_chunk(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    state: &mut [f32],
+    out: &mut [f32],
+    seq_len: usize,
+    head_qk_dim: usize,
+    head_v_dim: usize,
+    chunk_len: usize,
+) {
+    let qk = head_qk_dim;
+    let vd = head_v_dim;
+    assert_eq!(q.len(), seq_len * qk);
+    assert_eq!(k.len(), seq_len * qk);
+    assert_eq!(v.len(), seq_len * vd);
+    assert_eq!(g.len(), seq_len);
+    assert_eq!(beta.len(), seq_len);
+    assert_eq!(state.len(), qk * vd);
+    assert_eq!(out.len(), seq_len * vd);
+
+    if seq_len == 0 {
+        return;
+    }
+
+    let l0 = if chunk_len == 0 { SSM_CHUNK_DEFAULT } else { chunk_len };
+
+    // Exact per-token fallback: chunk length 1, or a trivially short
+    // sequence. Guarantees decode and `RUSTLLAMA_SSM_CHUNK=1` are bitwise
+    // the sequential path.
+    if l0 == 1 || seq_len == 1 {
+        let mut v_tilde = vec![0.0f32; vd];
+        for t in 0..seq_len {
+            delta_rule_step_f32_with_scratch(
+                &q[t * qk..(t + 1) * qk],
+                &k[t * qk..(t + 1) * qk],
+                &v[t * vd..(t + 1) * vd],
+                g[t],
+                beta[t],
+                state,
+                &mut out[t * vd..(t + 1) * vd],
+                qk,
+                vd,
+                &mut v_tilde,
+            );
+        }
+        return;
+    }
+
+    let n_chunks = seq_len.div_ceil(l0);
+
+    // --- Parallel phase: every chunk's S_in-independent operators. ---
+    let plans: Vec<ChunkPlan> = {
+        use rayon::prelude::*;
+        (0..n_chunks)
+            .into_par_iter()
+            .map(|c| {
+                let start = c * l0;
+                let len = (start + l0).min(seq_len) - start;
+                build_chunk_plan(q, k, v, g, beta, start, len, qk, vd)
+            })
+            .collect()
+    };
+
+    // --- Serial phase: thread the recurrent state through the boundaries. ---
+    // Per token we fuse the three `[L×qk]·[qk×vd]` products that fold S_in in:
+    //   ws = W·S_in            → U     = U_local + ws
+    //   oc = (B·W)·S_in        → O_intra = O_intra_local + oc
+    //   oi = Q̂·S_in            → o_t   = O_intra + oi  (inter-chunk output)
+    // then update the state:  S ← Γ_{L-1}·S + K̂ᵀ·U.
+    let mut u = vec![0.0f32; l0 * vd]; // reused; sized to the max chunk
+    let mut ws = vec![0.0f32; vd];
+    let mut oi = vec![0.0f32; vd];
+    let mut oc = vec![0.0f32; vd];
+    for plan in &plans {
+        let len = plan.len;
+        let start = plan.start;
+        for t in 0..len {
+            ws.iter_mut().for_each(|x| *x = 0.0);
+            oi.iter_mut().for_each(|x| *x = 0.0);
+            oc.iter_mut().for_each(|x| *x = 0.0);
+            let w_t = &plan.w[t * qk..(t + 1) * qk];
+            let qg_t = &plan.qg[t * qk..(t + 1) * qk];
+            let bw_t = &plan.bw[t * qk..(t + 1) * qk];
+            for i in 0..qk {
+                let wi = w_t[i];
+                let qi = qg_t[i];
+                let bi = bw_t[i];
+                let srow = &state[i * vd..(i + 1) * vd];
+                for j in 0..vd {
+                    let s = srow[j];
+                    ws[j] += wi * s;
+                    oi[j] += qi * s;
+                    oc[j] += bi * s;
+                }
+            }
+            let u_row = &mut u[t * vd..(t + 1) * vd];
+            let out_row = &mut out[(start + t) * vd..(start + t + 1) * vd];
+            let ul = &plan.u_local[t * vd..(t + 1) * vd];
+            let ol = &plan.o_intra_local[t * vd..(t + 1) * vd];
+            for j in 0..vd {
+                let uj = ul[j] + ws[j];
+                u_row[j] = uj;
+                out_row[j] = ol[j] + oc[j] + oi[j];
+            }
+        }
+
+        // State carry: S ← Γ_{L-1}·S first (does not depend on U), then add
+        // K̂ᵀ·U (uses the U just computed, not S).
+        let decay = plan.last_decay;
+        for s in state.iter_mut() {
+            *s *= decay;
+        }
+        for t in 0..len {
+            let kd_t = &plan.kd[t * qk..(t + 1) * qk];
+            let u_row = &u[t * vd..(t + 1) * vd];
+            for i in 0..qk {
+                let ki = kd_t[i];
+                if ki != 0.0 {
+                    let srow = &mut state[i * vd..(i + 1) * vd];
+                    for j in 0..vd {
+                        srow[j] += ki * u_row[j];
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1479,5 +1882,140 @@ mod tests {
                 assert!((av - bv).abs() < 1e-3, "gated_rmsnorm d={d} i={i}: simd={av} scalar={bv}");
             }
         }
+    }
+
+    // ---- Chunked prefill scan vs. sequential per-token reference ----
+
+    /// The chunked-parallel prefill scan must reproduce, for every token,
+    /// the exact sequence of outputs (and the final recurrent state) that a
+    /// token-by-token `delta_rule_step` recurrence produces. We sweep head
+    /// dims that hit and miss SIMD lane widths, a range of sequence lengths,
+    /// and several chunk lengths (including 0→default, 1→sequential, and a
+    /// chunk larger than the sequence). Inputs mimic the real call site:
+    /// per-token Q/K are L2-normed and the log-decays are ≤ 0.
+    #[test]
+    fn prefill_chunked_matches_sequential_step() {
+        let cases = [
+            (1usize, 1usize, 5usize),
+            (4, 4, 7),
+            (8, 8, 33),
+            (16, 16, 64),
+            (32, 48, 130),
+            (48, 32, 200),
+            (13, 29, 97),
+        ];
+        // Tolerance the reordered-accumulation math supports for these
+        // (mild, non-amplifying) decays and L2-normed keys.
+        let tol = 1e-4f32;
+        let mut worst = 0.0f32;
+
+        for &(qk, vd, t_len) in &cases {
+            // Build whole-sequence inputs (token-major).
+            let mut q = rvec(t_len * qk, (qk * 7 + vd * 13 + t_len * 3) as u32 + 1);
+            let mut k = rvec(t_len * qk, (qk * 11 + vd * 5 + t_len * 17) as u32 + 2);
+            let v = rvec(t_len * vd, (qk * 3 + vd * 19 + t_len * 23) as u32 + 3);
+            // Per-token L2-norm on Q/K, exactly as the layer forward does.
+            for t in 0..t_len {
+                l2norm_f32_inplace_scalar(&mut q[t * qk..(t + 1) * qk], 1e-6);
+                l2norm_f32_inplace_scalar(&mut k[t * qk..(t + 1) * qk], 1e-6);
+            }
+            // g ≤ 0 (this arch's decays are always negative), β ∈ (0.1, 0.9).
+            let gr = rvec(t_len, (t_len * 31 + qk) as u32 + 4);
+            let br = rvec(t_len, (t_len * 37 + vd) as u32 + 5);
+            let g: Vec<f32> = gr.iter().map(|x| -0.05 - 0.25 * x.abs()).collect();
+            let beta: Vec<f32> = br.iter().map(|x| 0.1 + 0.8 * x.abs()).collect();
+
+            // Reference: sequential per-token scalar recurrence.
+            let mut st_ref = vec![0.0f32; qk * vd];
+            let mut out_ref = vec![0.0f32; t_len * vd];
+            let mut vt = vec![0.0f32; vd];
+            for t in 0..t_len {
+                delta_rule_step_f32_with_scratch_scalar(
+                    &q[t * qk..(t + 1) * qk],
+                    &k[t * qk..(t + 1) * qk],
+                    &v[t * vd..(t + 1) * vd],
+                    g[t],
+                    beta[t],
+                    &mut st_ref,
+                    &mut out_ref[t * vd..(t + 1) * vd],
+                    qk,
+                    vd,
+                    &mut vt,
+                );
+            }
+
+            // Chunked scan for a spread of chunk lengths.
+            for &cl in &[0usize, 1, 2, 3, 8, 16, 64, 256] {
+                let mut st = vec![0.0f32; qk * vd];
+                let mut out_c = vec![0.0f32; t_len * vd];
+                delta_rule_prefill_chunked_with_chunk(
+                    &q, &k, &v, &g, &beta, &mut st, &mut out_c, t_len, qk, vd, cl,
+                );
+                for (idx, (a, b)) in out_ref.iter().zip(out_c.iter()).enumerate() {
+                    let d = (a - b).abs();
+                    worst = worst.max(d);
+                    assert!(
+                        d < tol,
+                        "output mismatch qk={qk} vd={vd} T={t_len} chunk={cl} idx={idx}: \
+                         ref={a} chunked={b} (diff={d})"
+                    );
+                }
+                for (a, b) in st_ref.iter().zip(st.iter()) {
+                    let d = (a - b).abs();
+                    worst = worst.max(d);
+                    assert!(
+                        d < tol,
+                        "final-state mismatch qk={qk} vd={vd} T={t_len} chunk={cl}: \
+                         ref={a} chunked={b} (diff={d})"
+                    );
+                }
+            }
+        }
+        // Informational: the achieved max abs diff across all cases.
+        assert!(worst < tol, "worst abs diff {worst} exceeded tol {tol}");
+    }
+
+    /// A chunk length of 1 must be *bit-for-bit* the per-token path (it is
+    /// routed straight to `delta_rule_step_f32_with_scratch`), so it matches
+    /// the dispatched (SIMD) step exactly, not merely within tolerance.
+    #[test]
+    fn prefill_chunked_len1_is_exact_sequential() {
+        let (qk, vd, t_len) = (17usize, 31usize, 40usize);
+        let mut q = rvec(t_len * qk, 12345);
+        let mut k = rvec(t_len * qk, 22345);
+        let v = rvec(t_len * vd, 32345);
+        for t in 0..t_len {
+            l2norm_f32_inplace(&mut q[t * qk..(t + 1) * qk], 1e-6);
+            l2norm_f32_inplace(&mut k[t * qk..(t + 1) * qk], 1e-6);
+        }
+        let g: Vec<f32> = rvec(t_len, 42345).iter().map(|x| -0.1 - 0.2 * x.abs()).collect();
+        let beta: Vec<f32> = rvec(t_len, 52345).iter().map(|x| 0.2 + 0.6 * x.abs()).collect();
+
+        // Dispatched per-token reference.
+        let mut st_ref = vec![0.0f32; qk * vd];
+        let mut out_ref = vec![0.0f32; t_len * vd];
+        let mut vt = vec![0.0f32; vd];
+        for t in 0..t_len {
+            delta_rule_step_f32_with_scratch(
+                &q[t * qk..(t + 1) * qk],
+                &k[t * qk..(t + 1) * qk],
+                &v[t * vd..(t + 1) * vd],
+                g[t],
+                beta[t],
+                &mut st_ref,
+                &mut out_ref[t * vd..(t + 1) * vd],
+                qk,
+                vd,
+                &mut vt,
+            );
+        }
+
+        let mut st = vec![0.0f32; qk * vd];
+        let mut out_c = vec![0.0f32; t_len * vd];
+        delta_rule_prefill_chunked_with_chunk(
+            &q, &k, &v, &g, &beta, &mut st, &mut out_c, t_len, qk, vd, 1,
+        );
+        assert_eq!(out_ref, out_c, "chunk=1 outputs must be bit-identical");
+        assert_eq!(st_ref, st, "chunk=1 final state must be bit-identical");
     }
 }

@@ -1063,6 +1063,13 @@ fn pin_expert_locked(
             return false; // everything resident is in-flight; just stream
         };
         let v = c.resident.remove(&vk).expect("victim present");
+        // Opt-in: preserve the evicted expert in the secondary spill store
+        // (optionally lower-bit) BEFORE unlocking, while its pages are still
+        // resident. Default-off: `moe_spill_enabled()` is false → no-op, so
+        // the eviction path stays byte-identical.
+        if moe_spill_enabled() {
+            spill_store_on_evict(vk, &v.ranges);
+        }
         for (a, l) in v.ranges {
             expert_mem_lock::unlock(a, l);
         }
@@ -1153,6 +1160,13 @@ pub fn expert_pin_touch(
         return Some(key);
     }
     c.misses += 1;
+    // Opt-in fault-in hook: note a resident miss the spill store may be able
+    // to serve without a full-precision GGUF re-read (the integrator calls
+    // `moe_spill_reconstruct(key)` to fetch the bytes). Default-off:
+    // `moe_spill_enabled()` is false → no lock taken, no behavior change.
+    if moe_spill_enabled() {
+        spill_store_note_fault(key);
+    }
     let ranges = [
         (g.0 as usize, g.1),
         (u.0 as usize, u.1),
@@ -1193,6 +1207,12 @@ pub fn expert_pin_clear() {
     c.hits = 0;
     c.misses = 0;
     c.access.clear();
+    // Opt-in: also drop the disk-spill secondary store on model reload so
+    // stale spilled bytes never outlive their source mmap. Default-off no-op.
+    if moe_spill_enabled() {
+        drop(c);
+        spill_store_reset();
+    }
 }
 
 /// Point-in-time expert-pin cache telemetry, cheap to snapshot.
@@ -1243,6 +1263,535 @@ pub fn expert_access_take() -> Vec<(ExpertKey, u64)> {
     c.access.drain().collect()
 }
 
+// ============================================================
+// MoE disk-spill + lower-bit secondary expert store (opt-in)
+// ============================================================
+//
+// Extends the pin cache's eviction path. Today an evicted expert's weight
+// pages simply revert to on-demand re-faults from the *original GGUF*
+// (native precision). With this feature armed the bytes are instead copied
+// — optionally requantized to a lower bit-width — into a process-local
+// spill file, and can be reconstructed (dequantized) on the next routing
+// hit, shrinking the resident + re-read cost of a large MoE model's cold
+// expert tail.
+//
+// Fully opt-in and default-OFF: with `RUSTLLAMA_MOE_DISK_SPILL` unset every
+// entry point below early-returns before touching any lock, file, or
+// allocation, so behavior is byte-identical to a build without it.
+//
+//   RUSTLLAMA_MOE_DISK_SPILL=1       enable the spill store
+//   RUSTLLAMA_MOE_STORE_BITS=<4|8>   store the cold tier requantized to this
+//                                    bit-width (default 0 = spill native
+//                                    bytes verbatim). Sources whose dtype
+//                                    can't be dequantized are spilled native
+//                                    regardless (see `dtype_dequant_to_f32`).
+//
+// Lock discipline: the store has its OWN mutex, always acquired *after*
+// (never before) the expert-pin mutex, so the eviction seam — which runs
+// while the caller holds the pin lock — is deadlock-free. Reconstruction and
+// telemetry take only the store lock; the per-part metadata map (read at the
+// eviction seam, written at load) is never held across the store lock.
+
+struct MoeSpillConfig {
+    disk_spill: bool,
+    /// 0 = spill native bytes; 4 or 8 = requantize the cold tier.
+    store_bits: u8,
+}
+
+fn moe_spill_config() -> &'static MoeSpillConfig {
+    static CFG: std::sync::OnceLock<MoeSpillConfig> = std::sync::OnceLock::new();
+    CFG.get_or_init(|| {
+        let disk_spill = std::env::var("RUSTLLAMA_MOE_DISK_SPILL")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let store_bits = match std::env::var("RUSTLLAMA_MOE_STORE_BITS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u8>().ok())
+        {
+            Some(4) => 4,
+            Some(8) => 8,
+            // Unset / unsupported width → keep native (verbatim) spill.
+            _ => 0,
+        };
+        MoeSpillConfig {
+            disk_spill,
+            store_bits,
+        }
+    })
+}
+
+/// Whether the MoE disk-spill store is enabled (`RUSTLLAMA_MOE_DISK_SPILL`).
+/// The single gate every spill entry point checks first; `false` (default)
+/// makes the whole feature inert (no files, no locks, no allocations).
+pub fn moe_spill_enabled() -> bool {
+    moe_spill_config().disk_spill
+}
+
+/// Lower-bit width for the cold tier (`RUSTLLAMA_MOE_STORE_BITS`): 0 means
+/// spill native bytes verbatim, 4 / 8 requantize on spill.
+pub fn moe_spill_store_bits() -> u8 {
+    moe_spill_config().store_bits
+}
+
+static SPILL_DIR: std::sync::OnceLock<std::sync::RwLock<Option<std::path::PathBuf>>> =
+    std::sync::OnceLock::new();
+
+/// Point the spill file at `dir` (the policy layer passes the runtime cache
+/// dir). Consulted lazily on the first spill, so call it before the first
+/// eviction. When unset, the store falls back to a `rustllama-moe-spill`
+/// folder under the OS temp dir. Idempotent.
+pub fn set_moe_spill_dir(dir: std::path::PathBuf) {
+    let cell = SPILL_DIR.get_or_init(|| std::sync::RwLock::new(None));
+    if let Ok(mut w) = cell.write() {
+        *w = Some(dir);
+    }
+}
+
+fn spill_dir() -> std::path::PathBuf {
+    if let Some(cell) = SPILL_DIR.get() {
+        if let Ok(r) = cell.read() {
+            if let Some(d) = r.as_ref() {
+                return d.clone();
+            }
+        }
+    }
+    std::env::temp_dir().join("rustllama-moe-spill")
+}
+
+/// Per-part source metadata for lower-bit requantization, keyed by the gate
+/// weight's start address (the exact key the pin cache uses). Filled at load
+/// by [`register_layer_experts`] ONLY when lower-bit spill is armed; empty
+/// otherwise (native spill needs no dtype).
+#[derive(Clone, Copy)]
+struct SpillPartMeta {
+    dtype: Dtype,
+    n_elems: usize,
+}
+
+fn spill_part_meta(
+) -> &'static std::sync::RwLock<std::collections::HashMap<usize, [SpillPartMeta; 3]>> {
+    static M: std::sync::OnceLock<
+        std::sync::RwLock<std::collections::HashMap<usize, [SpillPartMeta; 3]>>,
+    > = std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+#[derive(Clone, Copy)]
+enum SpillEncoding {
+    /// Verbatim native bytes (exact round-trip).
+    Native,
+    /// Requantized to `bits` (4 or 8) via the block codec.
+    LowBit { bits: u8 },
+}
+
+#[derive(Clone, Copy)]
+struct SpillPartRec {
+    offset: u64,
+    stored_len: usize,
+    /// Original element count — needed to bound lower-bit decode.
+    n_elems: usize,
+    /// Original source dtype (carried through for the integrator's context).
+    dtype: Dtype,
+    encoding: SpillEncoding,
+}
+
+struct SpillStore {
+    file: Option<std::fs::File>,
+    write_off: u64,
+    /// gate-addr key → the three (gate, up, down) part records.
+    records: std::collections::HashMap<usize, [SpillPartRec; 3]>,
+    spilled_bytes: u64,
+    evictions_spilled: u64,
+    faults_seen: u64,
+    reconstructions: u64,
+}
+
+impl SpillStore {
+    fn new() -> Self {
+        Self {
+            file: None,
+            write_off: 0,
+            records: std::collections::HashMap::new(),
+            spilled_bytes: 0,
+            evictions_spilled: 0,
+            faults_seen: 0,
+            reconstructions: 0,
+        }
+    }
+
+    /// Lazily create (truncating) the spill file. Returns `None` on any I/O
+    /// error — the caller then simply skips the record, so the expert
+    /// re-faults from the GGUF exactly as it does today (never a
+    /// correctness problem, only a lost optimization).
+    fn ensure_file(&mut self) -> Option<&mut std::fs::File> {
+        if self.file.is_none() {
+            let dir = spill_dir();
+            if std::fs::create_dir_all(&dir).is_err() {
+                return None;
+            }
+            // PID-tagged so concurrent processes never share one store file.
+            let path = dir.join(format!("moe-spill-{}.rlspill", std::process::id()));
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .ok()?;
+            tracing::debug!(path = %path.display(), "MoE spill store file created");
+            self.file = Some(f);
+            self.write_off = 0;
+        }
+        self.file.as_mut()
+    }
+
+    fn reset(&mut self) {
+        self.records.clear();
+        self.spilled_bytes = 0;
+        self.write_off = 0;
+        if let Some(f) = self.file.as_mut() {
+            use std::io::{Seek, SeekFrom};
+            let _ = f.set_len(0);
+            let _ = f.seek(SeekFrom::Start(0));
+        }
+    }
+}
+
+fn spill_store() -> &'static std::sync::Mutex<SpillStore> {
+    static S: std::sync::OnceLock<std::sync::Mutex<SpillStore>> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(SpillStore::new()))
+}
+
+/// Block size for the self-contained lower-bit spill codec. 32 matches the
+/// classic Q*_0 block so per-block scale overhead stays ~one f32.
+const SPILL_BLOCK: usize = 32;
+
+fn spill_quant_one(v: f32, d: f32, qmax: i32) -> i32 {
+    if d > 0.0 {
+        (v / d).round().clamp(-(qmax as f32), qmax as f32) as i32
+    } else {
+        0
+    }
+}
+
+/// Symmetric per-block quantize `values` to `bits` (4 or 8). Layout per
+/// block: little-endian f32 scale, then the packed quants (one i8/weight for
+/// 8-bit; two signed nibbles/byte, biased by +8, for 4-bit). Round-trips
+/// within one quant step — a lossy *secondary* copy, exactly like the
+/// on-disk cold tier it stands in for.
+fn spill_encode_lowbits(values: &[f32], bits: u8) -> Vec<u8> {
+    let qmax = ((1i32 << (bits - 1)) - 1).max(1);
+    let mut out = Vec::with_capacity(values.len() + values.len() / 8 + 8);
+    for blk in values.chunks(SPILL_BLOCK) {
+        let amax = blk.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let d = if amax > 0.0 { amax / qmax as f32 } else { 0.0 };
+        out.extend_from_slice(&d.to_le_bytes());
+        if bits == 8 {
+            for &v in blk {
+                out.push(spill_quant_one(v, d, qmax) as i8 as u8);
+            }
+        } else {
+            let mut i = 0;
+            while i < blk.len() {
+                let q0 = spill_quant_one(blk[i], d, qmax);
+                let q1 = if i + 1 < blk.len() {
+                    spill_quant_one(blk[i + 1], d, qmax)
+                } else {
+                    0
+                };
+                let n0 = ((q0 + 8) & 0xF) as u8;
+                let n1 = ((q1 + 8) & 0xF) as u8;
+                out.push(n0 | (n1 << 4));
+                i += 2;
+            }
+        }
+    }
+    out
+}
+
+/// Inverse of [`spill_encode_lowbits`]. Reconstructs exactly `n_elems`
+/// values (block boundaries are recomputed from the remaining count, so the
+/// short trailing block matches the encoder). Truncated / short input decodes
+/// to the values it can and zero-fills the rest.
+fn spill_decode_lowbits(bytes: &[u8], bits: u8, n_elems: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n_elems);
+    let mut off = 0usize;
+    while out.len() < n_elems && off + 4 <= bytes.len() {
+        let d = f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+        off += 4;
+        let this = (n_elems - out.len()).min(SPILL_BLOCK);
+        if bits == 8 {
+            if off + this > bytes.len() {
+                break;
+            }
+            for i in 0..this {
+                out.push((bytes[off + i] as i8 as f32) * d);
+            }
+            off += this;
+        } else {
+            let nbytes = this.div_ceil(2);
+            if off + nbytes > bytes.len() {
+                break;
+            }
+            for i in 0..this {
+                let byte = bytes[off + i / 2];
+                let nib = if i % 2 == 0 { byte & 0xF } else { byte >> 4 };
+                out.push(((nib as i32) - 8) as f32 * d);
+            }
+            off += nbytes;
+        }
+    }
+    out.resize(n_elems, 0.0);
+    out
+}
+
+/// Dequantize `bytes` of source `dtype` (as stored in the GGUF mmap) to f32.
+/// Returns `None` for dtypes we deliberately do NOT requantize (exotic IQ /
+/// ternary / fp4 codebook formats, whose extra quant step would compound the
+/// error without a size win worth the risk) — the caller then spills those
+/// native. Covers the dtypes MoE routed-expert weights realistically use.
+fn dtype_dequant_to_f32(dtype: Dtype, bytes: &[u8], n_elems: usize) -> Option<Vec<f32>> {
+    use rustllama_gguf::dequant as dq;
+    let mut out = vec![0f32; n_elems];
+    match dtype {
+        Dtype::F32 => {
+            for (i, c) in bytes.chunks_exact(4).take(n_elems).enumerate() {
+                out[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+        }
+        Dtype::F16 => dq::dequant_f16(bytes, &mut out),
+        Dtype::Bf16 | Dtype::Bf16Raw => dq::dequant_bf16(bytes, &mut out),
+        Dtype::Q8_0 | Dtype::Q8_0Raw => dq::dequant_q8_0(bytes, &mut out),
+        Dtype::Q4K | Dtype::Q4_KRaw => dq::dequant_q4_k(bytes, &mut out),
+        Dtype::Q5K | Dtype::Q5_KRaw => dq::dequant_q5_k(bytes, &mut out),
+        Dtype::Q6K | Dtype::Q6_KRaw => dq::dequant_q6_k(bytes, &mut out),
+        Dtype::Q4_0Raw => dq::dequant_q4_0(bytes, &mut out),
+        Dtype::Q5_0Raw => dq::dequant_q5_0(bytes, &mut out),
+        Dtype::Q4_1Raw => dq::dequant_q4_1(bytes, &mut out),
+        Dtype::Q5_1Raw => dq::dequant_q5_1(bytes, &mut out),
+        Dtype::Q2_KRaw => dq::dequant_q2_k(bytes, &mut out),
+        Dtype::Q3_KRaw => dq::dequant_q3_k(bytes, &mut out),
+        Dtype::IQ4_XSRaw => dq::dequant_iq4_xs(bytes, &mut out),
+        Dtype::IQ4_NLRaw => dq::dequant_iq4_nl(bytes, &mut out),
+        // Exotic codebook / ternary / fp4 formats → spill native instead.
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// Eviction → spill. Copies (optionally requantizes) the victim expert's
+/// three weight sub-ranges into the spill file and records where. Called from
+/// [`pin_expert_locked`]'s eviction loop while the pin lock is held AND the
+/// victim's pages are still resident, so the raw reads are valid. Best-effort:
+/// any I/O failure just skips the record (the expert falls back to a GGUF
+/// re-fault). Guarded by [`moe_spill_enabled`] at the call site.
+fn spill_store_on_evict(gate_key: usize, ranges: &[(usize, usize); 3]) {
+    let want_bits = moe_spill_store_bits();
+    // Per-part source metadata is present only when lower-bit is armed and
+    // the loader registered this expert; missing → native spill.
+    let meta = if want_bits != 0 {
+        spill_part_meta()
+            .read()
+            .ok()
+            .and_then(|m| m.get(&gate_key).copied())
+    } else {
+        None
+    };
+    let mut store = match spill_store().lock() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    // Already spilled (re-eviction of a re-pinned expert)? The bytes are
+    // identical across evictions, so keep the first record.
+    if store.records.contains_key(&gate_key) {
+        return;
+    }
+    let mut recs: [SpillPartRec; 3] = [SpillPartRec {
+        offset: 0,
+        stored_len: 0,
+        n_elems: 0,
+        dtype: Dtype::F32,
+        encoding: SpillEncoding::Native,
+    }; 3];
+    let mut ok = true;
+    for i in 0..3 {
+        let (addr, len) = ranges[i];
+        if addr == 0 || len == 0 {
+            ok = false;
+            break;
+        }
+        // SAFETY: the victim is resident (VirtualLock'd) at this seam and the
+        // GGUF mmap outlives it; addr/len describe a live weight sub-range,
+        // the same invariant `expert_mem_lock::unlock` relies on below.
+        let src: &[u8] = unsafe { std::slice::from_raw_parts(addr as *const u8, len) };
+        let pm = meta.map(|m| m[i]);
+        let (payload, enc, dtype, n_elems): (std::borrow::Cow<[u8]>, SpillEncoding, Dtype, usize) =
+            match pm {
+                Some(pm) if want_bits != 0 => match dtype_dequant_to_f32(pm.dtype, src, pm.n_elems) {
+                    Some(f32s) => (
+                        std::borrow::Cow::Owned(spill_encode_lowbits(&f32s, want_bits)),
+                        SpillEncoding::LowBit { bits: want_bits },
+                        pm.dtype,
+                        pm.n_elems,
+                    ),
+                    None => (
+                        std::borrow::Cow::Borrowed(src),
+                        SpillEncoding::Native,
+                        pm.dtype,
+                        pm.n_elems,
+                    ),
+                },
+                _ => (
+                    std::borrow::Cow::Borrowed(src),
+                    SpillEncoding::Native,
+                    Dtype::F32,
+                    0,
+                ),
+            };
+        let off = store.write_off;
+        let stored = payload.len();
+        let write_ok = {
+            let payload_ref: &[u8] = &payload;
+            match store.ensure_file() {
+                Some(f) => {
+                    use std::io::{Seek, SeekFrom, Write};
+                    f.seek(SeekFrom::Start(off)).is_ok() && f.write_all(payload_ref).is_ok()
+                }
+                None => false,
+            }
+        };
+        if !write_ok {
+            ok = false;
+            break;
+        }
+        store.write_off += stored as u64;
+        store.spilled_bytes += stored as u64;
+        recs[i] = SpillPartRec {
+            offset: off,
+            stored_len: stored,
+            n_elems,
+            dtype,
+            encoding: enc,
+        };
+    }
+    if ok {
+        store.records.insert(gate_key, recs);
+        store.evictions_spilled += 1;
+    }
+}
+
+/// Routing-miss → fault-in telemetry hook. Called from the miss branch of
+/// [`expert_pin_touch`] when the store is enabled: records that a resident
+/// miss occurred for an expert we may hold a spilled copy of. The actual byte
+/// reconstruction is [`moe_spill_reconstruct`], which the MoE forward /
+/// integrator calls to obtain the expert's weights without a full-precision
+/// GGUF re-read. Kept cheap (one lock + lookup) so the decode miss path isn't
+/// burdened.
+fn spill_store_note_fault(gate_key: usize) {
+    if let Ok(mut store) = spill_store().lock() {
+        if store.records.contains_key(&gate_key) {
+            store.faults_seen += 1;
+        }
+    }
+}
+
+/// Drop all spilled records + truncate the spill file (model reload). Called
+/// from [`expert_pin_clear`] under the same enable gate.
+fn spill_store_reset() {
+    if let Ok(mut store) = spill_store().lock() {
+        store.reset();
+    }
+    if let Ok(mut m) = spill_part_meta().write() {
+        m.clear();
+    }
+}
+
+/// One reconstructed expert weight part, as handed back on fault-in.
+pub enum SpilledPart {
+    /// Verbatim native bytes (source `dtype` preserved) — blit straight back.
+    Native { bytes: Vec<u8>, dtype: Dtype },
+    /// Dequantized f32 values (the source was requantized to a lower
+    /// bit-width on spill); `dtype` is the ORIGINAL source dtype.
+    Dequant { values: Vec<f32>, dtype: Dtype },
+}
+
+/// A spilled expert reconstructed from the secondary store: gate, up, down in
+/// that order.
+pub struct SpilledExpert {
+    pub parts: Vec<SpilledPart>,
+}
+
+/// Reconstruct a previously-spilled expert from the secondary store, keyed by
+/// its gate weight's start address (`gate.storage.mmap_borrowed_ptr_len().0
+/// as usize` — the same key the pin cache uses). Returns `None` when the
+/// store is disabled, the expert was never spilled, or a read fails (the
+/// caller then falls back to the GGUF as before). Reproduces the native bytes
+/// exactly, or the source weights within one lower-bit quant step.
+pub fn moe_spill_reconstruct(gate_key: usize) -> Option<SpilledExpert> {
+    if !moe_spill_enabled() {
+        return None;
+    }
+    let mut store = spill_store().lock().ok()?;
+    let recs = *store.records.get(&gate_key)?;
+    let mut parts = Vec::with_capacity(3);
+    for rec in recs.iter() {
+        let mut buf = vec![0u8; rec.stored_len];
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let f = store.file.as_mut()?;
+            if f.seek(SeekFrom::Start(rec.offset)).is_err() || f.read_exact(&mut buf).is_err() {
+                return None;
+            }
+        }
+        let part = match rec.encoding {
+            SpillEncoding::Native => SpilledPart::Native {
+                bytes: buf,
+                dtype: rec.dtype,
+            },
+            SpillEncoding::LowBit { bits } => SpilledPart::Dequant {
+                values: spill_decode_lowbits(&buf, bits, rec.n_elems),
+                dtype: rec.dtype,
+            },
+        };
+        parts.push(part);
+    }
+    store.reconstructions += 1;
+    Some(SpilledExpert { parts })
+}
+
+/// Point-in-time spill-store telemetry (separate from [`ExpertCacheStats`] so
+/// the existing struct's shape is untouched).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MoeSpillStats {
+    pub enabled: bool,
+    pub store_bits: u8,
+    pub records: usize,
+    pub spilled_bytes: u64,
+    pub evictions_spilled: u64,
+    pub faults_seen: u64,
+    pub reconstructions: u64,
+}
+
+/// Snapshot the spill-store counters. Cheap; takes no lock when disabled.
+pub fn moe_spill_stats() -> MoeSpillStats {
+    if !moe_spill_enabled() {
+        return MoeSpillStats {
+            store_bits: moe_spill_store_bits(),
+            ..Default::default()
+        };
+    }
+    let store = spill_store().lock().expect("moe spill store lock");
+    MoeSpillStats {
+        enabled: true,
+        store_bits: moe_spill_store_bits(),
+        records: store.records.len(),
+        spilled_bytes: store.spilled_bytes,
+        evictions_spilled: store.evictions_spilled,
+        faults_seen: store.faults_seen,
+        reconstructions: store.reconstructions,
+    }
+}
+
 // ---------------------------------------------------------------
 // Expert range registry + pre-pin + async readahead
 // ---------------------------------------------------------------
@@ -1283,6 +1832,12 @@ fn layer_pool_ranges() -> &'static std::sync::RwLock<std::collections::HashMap<u
 /// zero-copy file-backed (`MmapBorrowed`) — owned-heap experts are
 /// always resident and need neither service.
 pub fn register_layer_experts(layer: u32, gate: &[Tensor], up: &[Tensor], down: &[Tensor]) {
+    // Opt-in lower-bit spill: capture per-part source dtype/shape so the
+    // eviction seam can requantize. Only armed when both the spill store and
+    // a store-bits width are set — otherwise no map, no allocation, so this
+    // function stays byte-identical to today.
+    let arm_spill_meta = moe_spill_enabled() && moe_spill_store_bits() != 0;
+    let mut spill_metas: Vec<(usize, [SpillPartMeta; 3])> = Vec::new();
     let mut map = expert_ranges().write().expect("expert-range lock");
     let n = gate.len().min(up.len()).min(down.len());
     // Whole-pool span accumulators: (min addr, max end) per tensor.
@@ -1299,6 +1854,25 @@ pub fn register_layer_experts(layer: u32, gate: &[Tensor], up: &[Tensor], down: 
         };
         let triple = [(g.0 as usize, g.1), (u.0 as usize, u.1), (d.0 as usize, d.1)];
         map.insert(ExpertKey::new(layer, e as u32), triple);
+        if arm_spill_meta {
+            spill_metas.push((
+                g.0 as usize,
+                [
+                    SpillPartMeta {
+                        dtype: gate[e].dtype,
+                        n_elems: gate[e].element_count() as usize,
+                    },
+                    SpillPartMeta {
+                        dtype: up[e].dtype,
+                        n_elems: up[e].element_count() as usize,
+                    },
+                    SpillPartMeta {
+                        dtype: down[e].dtype,
+                        n_elems: down[e].element_count() as usize,
+                    },
+                ],
+            ));
+        }
         pool = Some(match pool {
             None => triple.map(|(a, l)| (a, a + l)),
             Some(mut p) => {
@@ -1311,6 +1885,12 @@ pub fn register_layer_experts(layer: u32, gate: &[Tensor], up: &[Tensor], down: 
         });
     }
     drop(map);
+    if arm_spill_meta && !spill_metas.is_empty() {
+        let mut mm = spill_part_meta().write().expect("spill-meta lock");
+        for (k, v) in spill_metas {
+            mm.insert(k, v);
+        }
+    }
     if all_backed {
         if let Some(p) = pool {
             layer_pool_ranges()
@@ -1873,6 +2453,62 @@ pub fn try_silu_mul_f32(x: &[f32], y: &[f32], out: &mut [f32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spill_lowbits_roundtrip_within_one_quant_step() {
+        // 70 elems → 2 full 32-blocks + a 6-elem tail (exercises the short
+        // trailing block on both the encode and decode side).
+        let vals: Vec<f32> = (0..70).map(|i| (i as f32 - 35.0) * 0.1).collect();
+        for &bits in &[8u8, 4u8] {
+            let enc = spill_encode_lowbits(&vals, bits);
+            let dec = spill_decode_lowbits(&enc, bits, vals.len());
+            assert_eq!(dec.len(), vals.len());
+            let qmax = ((1i32 << (bits - 1)) - 1) as f32;
+            // Per-block symmetric quant error is bounded by one step (amax/qmax).
+            let mut start = 0usize;
+            while start < vals.len() {
+                let end = (start + SPILL_BLOCK).min(vals.len());
+                let amax = vals[start..end].iter().fold(0f32, |m, &v| m.max(v.abs()));
+                let step = amax / qmax;
+                for i in start..end {
+                    assert!(
+                        (dec[i] - vals[i]).abs() <= step + 1e-6,
+                        "bits={bits} i={i}: got {} want {} (step {step})",
+                        dec[i],
+                        vals[i]
+                    );
+                }
+                start = end;
+            }
+        }
+    }
+
+    #[test]
+    fn spill_lowbits_all_zero_block_roundtrips_to_zero() {
+        let vals = vec![0.0f32; 40];
+        for &bits in &[8u8, 4u8] {
+            let dec = spill_decode_lowbits(&spill_encode_lowbits(&vals, bits), bits, vals.len());
+            assert_eq!(dec, vals);
+        }
+    }
+
+    #[test]
+    fn spill_dequant_f32_is_identity() {
+        let vals = [1.5f32, -2.25, 0.0, 100.0, -0.5];
+        let mut bytes = Vec::new();
+        for v in &vals {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let out = dtype_dequant_to_f32(Dtype::F32, &bytes, vals.len()).unwrap();
+        assert_eq!(out, vals.to_vec());
+    }
+
+    #[test]
+    fn spill_dequant_skips_exotic_dtype() {
+        // Exotic codebook formats must fall through to native spill (None).
+        assert!(dtype_dequant_to_f32(Dtype::IQ1_SRaw, &[0u8; 50], 256).is_none());
+        assert!(dtype_dequant_to_f32(Dtype::PTQ1_0Raw, &[0u8; 28], 128).is_none());
+    }
 
     #[test]
     fn try_rmsnorm_with_no_stream_returns_false() {

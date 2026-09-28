@@ -20,7 +20,7 @@ use crate::kv_backend::KvBackend;
 use crate::prefix_cache::PrefixCachePool;
 use crate::sampling::{compute_logprobs, Rng, Sampler};
 use crate::speculative::{
-    accept_reject, accept_reject_greedy, DraftToken, NgramDrafter, NgramDrafterConfig,
+    accept_reject, accept_reject_greedy, DraftToken, MtpDrafter, NgramDrafter, NgramDrafterConfig,
 };
 use crate::{
     ChatMessage, Engine, GrammarKind, Metrics, RequestStats, Result as EngineResult,
@@ -98,6 +98,18 @@ pub struct CpuEngine {
     /// Set from `[inference].speculative_draft_path` at serve time
     /// after a tokenizer-compatibility check.
     draft_spec: Option<(std::sync::Arc<dyn Engine>, u32)>,
+    /// When `true`, grammar-free text generation on a hybrid model that
+    /// carries a NextN head routes through the MTP / NextN self-
+    /// speculative driver ([`Self::speculate_mtp_stream_from_ids`])
+    /// instead of the classic single-token path. Set at load time from
+    /// `[inference].speculative_mtp` via [`Self::set_mtp_speculative`].
+    /// Forks inherit the parent's setting (a plain `Copy` bool). Takes
+    /// PRECEDENCE over `ngram_spec` when both are enabled — the NextN
+    /// head is a learned drafter and beats prompt-lookup on free prose.
+    /// A no-op (falls back to classic decode) when the loaded model has
+    /// no NextN head or isn't hybrid, so leaving it on for a non-MTP
+    /// model costs nothing.
+    mtp_spec: bool,
     /// Per-request performance + cache-hit stats from the most recent
     /// generation. Reset to defaults at the start of each request and
     /// committed at the end. Reads are race-free as long as the caller
@@ -1126,20 +1138,31 @@ impl CpuEngine {
             );
         }
         let ctx = max_ctx.min(model.cfg.ctx_train.max(max_ctx));
-        // Hybrid KV-dtype coercion. The hybrid full-attention forward
-        // implements a subset of the KV dtypes (F32 today; Q4_0 joins
-        // in the Bonsai KV phase) and PANICS at the first forward on
-        // anything else — while the workspace default kv_dtype is
-        // "tq4". Before this guard, loading a hybrid model with
-        // defaults built a TurboQuant cache and died mid-request.
-        // Coerce with a WARN instead: correctness first, the user
-        // keeps their setting for non-hybrid models.
-        const HYBRID_KV_SUPPORTED: &[KvDtype] = &[KvDtype::F32, KvDtype::Q4_0];
-        let kv_dtype = if model.weights.is_hybrid() && !HYBRID_KV_SUPPORTED.contains(&kv_dtype) {
+        // Hybrid KV dtype. The hybrid full-attention forward now
+        // implements EVERY KV dtype: F32 and Q4_0 have dedicated fast
+        // arms (Q4_0 with whitening + kv-bias calibration), and Q8_0 /
+        // TurboQuant / NVFP4 route through the same per-dtype flash
+        // decode/prefill kernels the dense path uses.
+        //
+        // We still DEFAULT hybrids to F32 for coherence: the low-bit
+        // Q8_0/TQ/NVFP4 arms lack the Q4_0 arm's whitening/calibration
+        // and are unvalidated on the SSM+attention hybrid, while the
+        // workspace default kv_dtype is "tq4". So an unqualified
+        // low-bit request on a hybrid is coerced to F32 (Q4_0 is
+        // honored as-is — it has the tuned arm). Opt into an arbitrary
+        // quantized hybrid KV cache with `RUSTLLAMA_HYBRID_KV_ANY=1`,
+        // which honors the configured dtype verbatim.
+        let hybrid_kv_any = std::env::var_os("RUSTLLAMA_HYBRID_KV_ANY").is_some();
+        let kv_dtype = if model.weights.is_hybrid()
+            && !hybrid_kv_any
+            && kv_dtype != KvDtype::F32
+            && kv_dtype != KvDtype::Q4_0
+        {
             tracing::warn!(
                 requested = ?kv_dtype,
-                "hybrid model: kv_dtype not supported by the hybrid \
-                 attention path yet — coercing to f32 for this load"
+                "hybrid model: defaulting KV cache to f32 for coherence \
+                 (set RUSTLLAMA_HYBRID_KV_ANY=1 to honor a quantized \
+                 hybrid KV cache verbatim)"
             );
             KvDtype::F32
         } else {
@@ -1438,6 +1461,7 @@ impl CpuEngine {
             placeholder_mode: None,
             ngram_spec: None,
             draft_spec: None,
+            mtp_spec: false,
             image_wrapper: None,
             vision_feature_memo: Arc::new(Mutex::new(None)),
             lock_registry,
@@ -2000,6 +2024,7 @@ impl CpuEngine {
             placeholder_mode: None,
             ngram_spec: None,
             draft_spec: None,
+            mtp_spec: false,
             image_wrapper: None,
             vision_feature_memo: Arc::new(Mutex::new(None)),
             lock_registry,
@@ -2300,6 +2325,33 @@ impl CpuEngine {
 
     pub fn ngram_speculative(&self) -> Option<NgramDrafterConfig> {
         self.ngram_spec
+    }
+
+    /// Enable / disable MTP / NextN self-speculative decoding for this
+    /// engine's text-generation path. `false` (default) keeps the
+    /// classic single-token decode. When `true` AND the loaded model is
+    /// hybrid with a NextN head, grammar-free `chat` / `generate`
+    /// requests route through [`Self::speculate_mtp_stream_from_ids`],
+    /// which uses the model's own NextN head to draft the +2 token each
+    /// round and verifies it with the next forward. On a model without a
+    /// NextN head this is a silent no-op (classic decode). Takes
+    /// precedence over n-gram speculation when both are enabled. Set at
+    /// load time from `[inference].speculative_mtp`.
+    pub fn set_mtp_speculative(&mut self, on: bool) {
+        self.mtp_spec = on;
+    }
+
+    /// Whether MTP self-speculation is enabled AND the loaded model can
+    /// actually use it (hybrid + NextN head present). The server routes
+    /// on this so it can fall back cleanly on non-MTP models.
+    pub fn mtp_speculative(&self) -> bool {
+        self.mtp_spec && self.model_supports_mtp()
+    }
+
+    /// True when the loaded model is hybrid and carries a NextN head —
+    /// the precondition for the MTP self-speculative driver.
+    fn model_supports_mtp(&self) -> bool {
+        self.model.weights.is_hybrid() && self.model.weights.nextn_head.is_some()
     }
 
     /// Pair this engine with a draft model for speculative decoding.
@@ -2634,6 +2686,8 @@ impl CpuEngine {
             // Forks inherit the parent's speculative setting (Copy).
             ngram_spec: self.ngram_spec,
             draft_spec: self.draft_spec.clone(),
+            // MTP self-speculation is a plain Copy bool; forks inherit it.
+            mtp_spec: self.mtp_spec,
             image_wrapper: self.image_wrapper.clone(),
             vision_feature_memo: Arc::clone(&self.vision_feature_memo),
             // Forks share the parent's locked ranges: they use the same
@@ -4323,6 +4377,272 @@ fn verify_and_commit_speculation(
     Ok(outcome)
 }
 
+/// One-time debug log for the "MTP requested but model can't do it"
+/// fall-through, so an operator who flips `speculative_mtp` on for a
+/// non-NextN model sees why nothing changed without spamming the log
+/// on every request.
+fn mtp_fallback_log_once() {
+    use std::sync::Once;
+    static WARN_ONCE: Once = Once::new();
+    WARN_ONCE.call_once(|| {
+        tracing::debug!(
+            "speculative_mtp is enabled but the loaded model has no NextN head \
+             (or isn't hybrid) — falling back to classic decode"
+        );
+    });
+}
+
+/// Result of one [`mtp_round`]: the tokens committed this round (1 on a
+/// no-draft round or a rejected verify, 2 on an accepted verify), the
+/// updated decode frontier, the draft to carry into the next round, and
+/// per-round speculation counters for the cumulative stats.
+struct MtpRoundOutcome {
+    /// Tokens to emit, in order (never empty on success).
+    committed: Vec<u32>,
+    /// Next token to forward (already emitted / prompt content).
+    next_input: i32,
+    /// Position of `next_input`; the KV/DeltaNet caches cover
+    /// `[0, next_pos)` on return.
+    next_pos: u32,
+    /// NextN draft for `next_pos + 1`, or `None` when this round did not
+    /// produce one (the has-draft rounds consume the draft and leave
+    /// `None`; the no-draft round produces a fresh one).
+    pending: Option<DraftToken>,
+    /// Drafts proposed this round (0 or 1) — for `add_speculation`.
+    drafted: usize,
+    /// Drafts accepted this round (0 or 1) — for `add_speculation`.
+    accepted: usize,
+}
+
+/// One round of MTP / NextN self-speculation, run under the engine
+/// state lock on the SYCL worker thread. Two modes, chosen by whether a
+/// draft is carried in:
+///
+///   - **no-draft** (`pending == None`, or no room to speculate): a
+///     single [`LlamaModel::forward_one_hybrid_with_nextn_logits`] call.
+///     The main head commits the next token (same argmax/multinomial
+///     policy the ngram path uses via an empty-draft `accept_reject`),
+///     and the NextN head drafts the token two positions ahead for the
+///     NEXT round. KV/DeltaNet advance by exactly one position.
+///
+///   - **has-draft** (`pending == Some`, room available): a batched
+///     [`LlamaModel::forward_speculation_batched_hybrid`] over
+///     `[next_input, draft]` verifies the carried draft. On ACCEPT the
+///     draft (position `base_pos+1`) plus the bonus (position
+///     `base_pos+2`) are committed — two tokens for one batched forward,
+///     the MTP win. On REJECT the draft position is rewound exactly like
+///     [`verify_and_commit_speculation`]'s hybrid path (truncate KV,
+///     restore the DeltaNet snapshot taken before the forward, replay
+///     `next_input`) and only the true main token commits.
+///
+/// Position bookkeeping matches the model-side contract:
+/// `forward_one_hybrid_with_nextn_logits` sets `kv.seq_len = base_pos+1`
+/// and advances the DeltaNet cache by one; the batched forward sets
+/// `kv.seq_len = base_pos + tokens.len()` and advances the DeltaNet
+/// cache by that many. This keeps the KV + recurrent state consistent
+/// with the classic path token-for-token.
+#[allow(clippy::too_many_arguments)]
+fn mtp_round(
+    model: &LlamaModel,
+    state: &Arc<Mutex<EngineState>>,
+    next_input: i32,
+    next_pos: u32,
+    pending: Option<DraftToken>,
+    allow_spec: bool,
+    greedy: bool,
+    rng: &mut Rng,
+    vocab: usize,
+) -> Result<MtpRoundOutcome> {
+    let mut state = state.lock().expect("state lock");
+    let base_pos = next_pos;
+
+    // MTP requires the contiguous KV backend + a DeltaNet cache. The
+    // dispatch layer already gated on hybrid + NextN head; this guards a
+    // paged-KV misconfiguration with a clean error instead of a panic
+    // deep in the forward.
+    let contiguous_ok = matches!(state.kv_backend, KvBackend::Contiguous(_))
+        && state.delta_net_cache.is_some();
+    if !contiguous_ok {
+        return Err(CpuEngineError::Other(
+            "MTP self-speculation requires the contiguous KV backend and a \
+             DeltaNet cache (hybrid model)"
+                .to_string(),
+        ));
+    }
+
+    if let (true, Some(draft)) = (allow_spec, pending) {
+        // ---- has-draft round: batched verify [next_input, draft] ----
+        // DeltaNet base snapshot BEFORE the forward (covers
+        // `[0, base_pos)`) so a rejection can restore + replay, exactly
+        // like `verify_and_commit_speculation`.
+        let dn_base = state.delta_net_cache.as_ref().map(|dn| dn.snapshot());
+        let mut two = vec![0f32; 2 * vocab];
+        {
+            let EngineState {
+                kv_backend,
+                delta_net_cache,
+                ..
+            } = &mut *state;
+            match (kv_backend, delta_net_cache.as_mut()) {
+                (KvBackend::Contiguous(kv), Some(dn)) => {
+                    model.forward_speculation_batched_hybrid(
+                        &[next_input, draft.id as i32],
+                        base_pos,
+                        kv,
+                        dn,
+                        &mut two,
+                    );
+                }
+                _ => unreachable!("contiguous_ok checked above"),
+            }
+        }
+        // Verify the single draft against row0 (the true next-token
+        // distribution); raw-softmax dists, matching the ngram path.
+        let row0 = softmax_to_vec(&two[0..vocab]);
+        let row1 = softmax_to_vec(&two[vocab..2 * vocab]);
+        let target: [&[f32]; 2] = [row0.as_slice(), row1.as_slice()];
+        let drafts = [draft];
+        let outcome = if greedy {
+            accept_reject_greedy(&drafts, &target)
+        } else {
+            accept_reject(&drafts, &target, rng)
+        };
+        if outcome.accepted.len() == 1 {
+            // ACCEPT: next_input (base_pos) + draft (base_pos+1) are both
+            // valid in KV/DeltaNet; the bonus (`replacement`) is the
+            // fresh token at base_pos+2 and is NOT forwarded — it seeds
+            // the next round. seq_len is already base_pos+2, no rewind.
+            debug_assert_eq!(state.kv_backend.seq_len(), base_pos as usize + 2);
+            // Extend `last_ids` by the two FORWARDED tokens (next_input +
+            // draft) so it stays == the KV/DeltaNet coverage. The bonus
+            // (`replacement`) is not forwarded, so it is not appended.
+            state.last_ids.push(next_input as u32);
+            state.last_ids.push(draft.id);
+            debug_assert_eq!(state.last_ids.len(), state.kv_backend.seq_len());
+            Ok(MtpRoundOutcome {
+                committed: vec![draft.id, outcome.replacement],
+                next_input: outcome.replacement as i32,
+                next_pos: base_pos + 2,
+                pending: None,
+                drafted: 1,
+                accepted: 1,
+            })
+        } else {
+            // REJECT: the draft row (base_pos+1) is wrong. Keep
+            // next_input's forward (base_pos) and drop the draft: rewind
+            // seq_len to base_pos, restore the DeltaNet base, and replay
+            // [next_input] so KV + DeltaNet both cover `[0, base_pos+1)`.
+            // Mirrors `verify_and_commit_speculation`'s hybrid reject.
+            state.kv_backend.set_seq_len(base_pos as usize);
+            if let (Some(dn), Some(snap)) =
+                (state.delta_net_cache.as_mut(), dn_base.as_ref())
+            {
+                dn.restore(snap);
+            }
+            let mut one = vec![0f32; vocab];
+            {
+                let EngineState {
+                    kv_backend,
+                    delta_net_cache,
+                    ..
+                } = &mut *state;
+                match (kv_backend, delta_net_cache.as_mut()) {
+                    (KvBackend::Contiguous(kv), Some(dn)) => {
+                        model.forward_speculation_batched_hybrid(
+                            &[next_input],
+                            base_pos,
+                            kv,
+                            dn,
+                            &mut one,
+                        );
+                    }
+                    _ => unreachable!("contiguous_ok checked above"),
+                }
+            }
+            debug_assert_eq!(state.kv_backend.seq_len(), base_pos as usize + 1);
+            // Only next_input was (re)forwarded; the true replacement token
+            // seeds the next round unforwarded.
+            state.last_ids.push(next_input as u32);
+            debug_assert_eq!(state.last_ids.len(), state.kv_backend.seq_len());
+            Ok(MtpRoundOutcome {
+                committed: vec![outcome.replacement],
+                next_input: outcome.replacement as i32,
+                next_pos: base_pos + 1,
+                pending: None,
+                drafted: 1,
+                accepted: 0,
+            })
+        }
+    } else {
+        // ---- no-draft round: one NextN forward. Commit the main token
+        //      and draft the +2 token for the next round. ----
+        let mut main_logits = vec![0f32; vocab];
+        let mut nextn_logits = vec![0f32; vocab];
+        {
+            let EngineState {
+                kv_backend,
+                delta_net_cache,
+                ..
+            } = &mut *state;
+            match (kv_backend, delta_net_cache.as_mut()) {
+                (KvBackend::Contiguous(kv), Some(dn)) => {
+                    // Conditioning caveat: the NextN head wants the TRUE
+                    // token at base_pos+1 as `next_token_id`, but that is
+                    // exactly what this same forward's main head predicts
+                    // — unknowable pre-call with the single-shot NextN
+                    // primitive. We pass `next_input` (a repeat prior).
+                    // The draft is VERIFIED next round, so a poor guess
+                    // only lowers acceptance, never correctness.
+                    model.forward_one_hybrid_with_nextn_logits(
+                        next_input,
+                        next_input,
+                        base_pos,
+                        kv,
+                        dn,
+                        &mut main_logits,
+                        &mut nextn_logits,
+                    );
+                }
+                _ => unreachable!("contiguous_ok checked above"),
+            }
+        }
+        debug_assert_eq!(state.kv_backend.seq_len(), base_pos as usize + 1);
+        // Commit the main token with the SAME policy the has-draft round
+        // uses: an empty-draft `accept_reject` == "sample one token from
+        // this position" (argmax when greedy, else multinomial over the
+        // raw softmax), so greedy MTP output is token-for-token identical
+        // to classic greedy.
+        let row0 = softmax_to_vec(&main_logits);
+        let target: [&[f32]; 1] = [row0.as_slice()];
+        let no_drafts: [DraftToken; 0] = [];
+        let m_out = if greedy {
+            accept_reject_greedy(&no_drafts, &target)
+        } else {
+            accept_reject(&no_drafts, &target, rng)
+        };
+        let m = m_out.replacement;
+        // Draft the +2 token from the NextN head (argmax + softmax q),
+        // reusing the tested `MtpDrafter` argmax path. `None` when the
+        // logit row is degenerate/empty.
+        let pending = MtpDrafter::default()
+            .propose(&[nextn_logits])
+            .into_iter()
+            .next();
+        // Only next_input was forwarded this round; the sampled main token
+        // `m` seeds the next round unforwarded.
+        state.last_ids.push(next_input as u32);
+        debug_assert_eq!(state.last_ids.len(), state.kv_backend.seq_len());
+        Ok(MtpRoundOutcome {
+            committed: vec![m],
+            next_input: m as i32,
+            next_pos: base_pos + 1,
+            pending,
+            drafted: 0,
+            accepted: 0,
+        })
+    }
+}
+
 // ----- streaming Engine impl -----
 
 impl Engine for CpuEngine {
@@ -4482,6 +4802,17 @@ impl Engine for CpuEngine {
                 return self.speculate(&prompt, draft.clone(), *k, s);
             }
         }
+        // MTP / NextN self-speculation: takes precedence over n-gram
+        // (the model's own NextN head beats prompt-lookup on free
+        // prose). Grammar-free only, same raw-softmax caveat as the
+        // other speculative paths. Silent fall-through to n-gram/classic
+        // on models without a NextN head.
+        if self.mtp_spec && s.grammar.is_none() {
+            if self.model_supports_mtp() {
+                return self.speculate_mtp_stream(prompt, s.clone());
+            }
+            mtp_fallback_log_once();
+        }
         if let Some(cfg) = self.ngram_spec {
             if s.grammar.is_none() {
                 return self.speculate_ngram_stream(prompt, cfg, s.clone());
@@ -4493,6 +4824,14 @@ impl Engine for CpuEngine {
     fn generate(&self, prompt: &str, s: &SamplingParams) -> EngineResult<TokenStream> {
         // Without a tokenizer, fall through and return a clear error from the
         // spawn path so the call still produces a Stream rather than panic.
+        // MTP / NextN self-speculation takes precedence over n-gram; a
+        // no-op fall-through on non-MTP models. Grammar-free only.
+        if self.mtp_spec && s.grammar.is_none() {
+            if self.model_supports_mtp() {
+                return self.speculate_mtp_stream(prompt.to_string(), s.clone());
+            }
+            mtp_fallback_log_once();
+        }
         if let Some(cfg) = self.ngram_spec {
             if s.grammar.is_none() {
                 return self.speculate_ngram_stream(prompt.to_string(), cfg, s.clone());
@@ -5047,6 +5386,289 @@ impl CpuEngine {
                 // Extend history with the committed tokens so the next
                 // round's drafter + verify see the full prefix.
                 current_prompt_ids.extend(committed.iter().map(|&id| id as i32));
+            }
+        };
+        Ok(Box::pin(stream))
+    }
+
+    /// Text entry for MTP / NextN self-speculation. Tokenizes `prompt`
+    /// (with the model's BOS policy) and forwards to
+    /// [`Self::speculate_mtp_stream_from_ids`]. Mirrors
+    /// [`Self::speculate_ngram_stream`].
+    ///
+    /// PRECONDITIONS (the caller — `chat` / `generate` — checks these
+    /// via [`Self::model_supports_mtp`] before routing here): the loaded
+    /// model is hybrid AND carries a NextN head, and the request is
+    /// grammar-free. On a model without a NextN head this still runs but
+    /// `mtp_round` would error on the missing head, so never route a
+    /// non-MTP model here.
+    pub fn speculate_mtp_stream(
+        &self,
+        prompt: String,
+        s: SamplingParams,
+    ) -> EngineResult<TokenStream> {
+        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
+            crate::EngineError::Unimplemented("speculate_mtp requires a tokenizer")
+        })?;
+        let add_bos = tokenizer.add_bos_token();
+        let initial_prompt_ids: Vec<i32> = tokenizer
+            .encode(&prompt, add_bos)?
+            .into_iter()
+            .map(|t| t as i32)
+            .collect();
+        self.speculate_mtp_stream_from_ids(initial_prompt_ids, s)
+    }
+
+    /// ID-level MTP / NextN self-speculative decode driver.
+    ///
+    /// Structurally mirrors [`Self::speculate_ngram_stream_from_ids`]
+    /// (async stream, per-round work on the persistent SYCL worker, same
+    /// streaming / stop / EOS / stats handling), but the drafter is the
+    /// model's own NextN head instead of an n-gram lookup: each no-draft
+    /// round produces a +2-token draft, and the next round batch-verifies
+    /// it (accept commits 2 tokens for one batched forward; reject commits
+    /// 1 and rewinds the draft position). See [`mtp_round`] for the KV /
+    /// DeltaNet position discipline.
+    ///
+    /// SAMPLING SEMANTICS — like the ngram path, verification samples the
+    /// target's RAW softmax (per-request temperature / top_k / top_p are
+    /// not applied). Callers route here only for grammar-free requests.
+    pub fn speculate_mtp_stream_from_ids(
+        &self,
+        initial_prompt_ids: Vec<i32>,
+        s: SamplingParams,
+    ) -> EngineResult<TokenStream> {
+        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
+            crate::EngineError::Unimplemented("speculate_mtp requires a tokenizer")
+        })?;
+        if initial_prompt_ids.is_empty() {
+            let stream = async_stream::stream! {
+                if false { yield Ok(Token { id: 0, text: String::new(), logprobs: None }); }
+            };
+            return Ok(Box::pin(stream));
+        }
+
+        let seed = s.seed;
+        let max_tokens = s.max_tokens as usize;
+        let model_eos = self.model.cfg.eos_token_id;
+        let stop_strings = s.stop.clone();
+        let greedy_spec = s.temperature <= 0.0;
+        let vocab = self.model.cfg.vocab_size;
+
+        // Snapshot Arc handles so the async stream owns them without
+        // borrowing `&self` for its lifetime (mirrors the ngram path).
+        let model = self.model.clone();
+        let state = self.state.clone();
+        let prefix_cache = self.prefix_cache;
+        let prefill_chunk_size = self.prefill_chunk_size;
+        let max_ctx = self.max_ctx;
+        let cumulative_stats = self.cumulative_stats.clone();
+        let last_stats = self.last_stats.clone();
+        let ema_tok_s_bits = Arc::clone(&self.ema_tok_s_bits);
+        // Route every forward onto the SYCL worker thread (warmed USM +
+        // persistent stream), exactly like the ngram path.
+        let worker = self.sycl_worker.submitter();
+        let flash_attention = self.flash_attention;
+        let n_gpu_layers = self.n_gpu_layers;
+        let cpu_force_patterns = self.cpu_force_patterns.clone();
+
+        let stream = async_stream::stream! {
+            let mut rng_slot = Some(Rng::from_seed(seed));
+            let mut total_emitted: usize = 0;
+            let mut emitted_text = String::new();
+            let mut utf8 = Utf8Stream::default();
+            let decode_start = std::time::Instant::now();
+
+            // Install this request's dispatch state on the worker thread +
+            // ensure the USM context exists (see `speculate` for the
+            // rationale). Idempotent; runs once before the round loop.
+            {
+                let model_install = model.clone();
+                let flash = flash_attention;
+                let ngl = n_gpu_layers;
+                let cpu_force = cpu_force_patterns.clone();
+                let _ = worker
+                    .run_blocking(move || {
+                        rustllama_models::accel::set_flash_attention(flash);
+                        rustllama_models::accel::set_n_gpu_layers(ngl);
+                        rustllama_models::accel::set_cpu_force_patterns(cpu_force);
+                        let cfg = &model_install.cfg;
+                        let head_dim = if cfg.head_dim > 0 {
+                            cfg.head_dim
+                        } else {
+                            cfg.d_model / cfg.n_heads.max(1)
+                        };
+                        let _ = rustllama_models::accel::prepare_usm_context(
+                            cfg.n_layers as u32,
+                            cfg.n_heads as u32,
+                            cfg.n_kv_heads as u32,
+                            head_dim as u32,
+                            max_ctx as u32,
+                        );
+                    })
+                    .await;
+            }
+
+            // ---- Prefill: forward all but the last prompt token, then
+            //      seed the decode frontier. Runs on the worker under the
+            //      state lock (mirrors `generate_token_ids_streaming`). ----
+            let prefill_ids = initial_prompt_ids.clone();
+            let model_p = model.clone();
+            let state_p = state.clone();
+            let prefill_join = worker
+                .run_blocking(move || -> Result<(i32, u32)> {
+                    let mut st = state_p.lock().expect("state lock");
+                    let prompt_u32: Vec<u32> =
+                        prefill_ids.iter().map(|&t| t as u32).collect();
+                    let mut logits = vec![0f32; model_p.cfg.vocab_size];
+                    let prompt_max = prefill_ids.len().saturating_sub(1);
+                    let effective = st.prepare_prefix_reuse(
+                        &prompt_u32,
+                        prefix_cache,
+                        PREFIX_REUSE_MIN_TOKENS,
+                        prompt_max,
+                    );
+                    let mut chrome = ChromeTracer::from_env();
+                    let (prefill, last) =
+                        prefill_ids.split_at(prefill_ids.len() - 1);
+                    let done = run_chunked_prefill(
+                        &model_p,
+                        &mut st,
+                        &prompt_u32,
+                        prefill,
+                        effective,
+                        prefill_chunk_size,
+                        &mut logits,
+                        &mut chrome,
+                        || false,
+                    );
+                    if done < prefill.len() {
+                        return Err(CpuEngineError::Other(
+                            "mtp prefill did not complete".to_string(),
+                        ));
+                    }
+                    // Bootstrap `last_ids` to exactly the forwarded prefix
+                    // (positions `[0, next_pos)`), overriding whatever
+                    // `prepare_prefix_reuse` left. `mtp_round` then extends
+                    // it by each forwarded token so `last_ids.len()` stays
+                    // == `kv.seq_len` — the invariant the next request's
+                    // hybrid "continue in place" reuse relies on (a stale
+                    // `last_ids` there would desync the DeltaNet state).
+                    st.last_ids = prompt_u32[..prefill.len()].to_vec();
+                    Ok((last[0], prefill.len() as u32))
+                })
+                .await;
+            let (mut next_input, mut next_pos) = match prefill_join {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    yield Err(crate::EngineError::Engine(format!(
+                        "mtp prefill: {e}"
+                    )));
+                    return;
+                }
+                Err(recv_err) => {
+                    yield Err(crate::EngineError::Engine(format!(
+                        "mtp prefill worker recv: {recv_err}"
+                    )));
+                    return;
+                }
+            };
+
+            // Carried NextN draft for `next_pos + 1` (produced by the
+            // previous no-draft round). `None` on the first round.
+            let mut pending: Option<DraftToken> = None;
+
+            loop {
+                if total_emitted >= max_tokens {
+                    return;
+                }
+                // Context exhausted — the single forward writes `next_pos`.
+                if next_pos as usize >= max_ctx {
+                    return;
+                }
+                let remaining = max_tokens - total_emitted;
+                // Only batch-verify when there is room for a bonus token
+                // (>= 2 left) AND room in the KV for the 2-position batch.
+                let allow_spec =
+                    remaining >= 2 && (next_pos as usize + 2) <= max_ctx;
+
+                let model_c = model.clone();
+                let state_c = state.clone();
+                let mut rng_c = rng_slot.take().expect("rng slot");
+                let ni = next_input;
+                let np = next_pos;
+                let pend = pending;
+                let vocab_c = vocab;
+                let joined = worker
+                    .run_blocking(move || {
+                        let out = mtp_round(
+                            &model_c, &state_c, ni, np, pend, allow_spec,
+                            greedy_spec, &mut rng_c, vocab_c,
+                        );
+                        (out, rng_c)
+                    })
+                    .await;
+                let round = match joined {
+                    Ok((Ok(r), rng)) => {
+                        rng_slot = Some(rng);
+                        r
+                    }
+                    Ok((Err(e), rng)) => {
+                        rng_slot = Some(rng);
+                        let _ = &rng_slot;
+                        yield Err(crate::EngineError::Engine(format!(
+                            "mtp round: {e}"
+                        )));
+                        return;
+                    }
+                    Err(recv_err) => {
+                        yield Err(crate::EngineError::Engine(format!(
+                            "mtp round worker recv: {recv_err}"
+                        )));
+                        return;
+                    }
+                };
+                cumulative_stats
+                    .add_speculation(round.drafted as u64, round.accepted as u64);
+
+                // Emit committed tokens; check stop / EOS / max after each.
+                for &id in &round.committed {
+                    let text = utf8.next_text(id, |ids| {
+                        tokenizer.decode(ids, true).unwrap_or_default()
+                    });
+                    emitted_text.push_str(&text);
+                    let hit_stop = stop_strings
+                        .iter()
+                        .any(|st| !st.is_empty() && emitted_text.contains(st.as_str()));
+                    yield Ok(Token { id, text, logprobs: None });
+                    total_emitted += 1;
+                    {
+                        let elapsed_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+                        let s = RequestStats {
+                            prefill_ms: 0.0,
+                            decode_ms: elapsed_ms,
+                            tokens_prefilled: 0,
+                            cache_hit_tokens: 0,
+                            tokens_generated: total_emitted as u32,
+                            tool_call_limit_hit: false,
+                        };
+                        update_ema_tok_s(&ema_tok_s_bits, &s);
+                        *last_stats.lock().expect("last_stats") = s;
+                    }
+                    if hit_stop {
+                        return;
+                    }
+                    if Some(id) == model_eos {
+                        return;
+                    }
+                    if total_emitted >= max_tokens {
+                        return;
+                    }
+                }
+
+                next_input = round.next_input;
+                next_pos = round.next_pos;
+                pending = round.pending;
             }
         };
         Ok(Box::pin(stream))
