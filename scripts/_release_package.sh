@@ -92,11 +92,48 @@ export LD_LIBRARY_PATH="${BINDIR}:${LD_LIBRARY_PATH:-}"
 # system libs (glibc/libstdc++/libgcc/the loader) + the NVIDIA driver are left
 # to the host. The launcher's LD_LIBRARY_PATH=$ORIGIN/lib resolves the bundle
 # at run time regardless of the libs' internal cross-references.
-is_system_lib() {
-  case "$1" in
-    /lib/*|/lib64/*|/usr/lib/*|/usr/lib64/*|/usr/local/lib/*) return 0 ;;
+# Libraries to NEVER bundle: the base OS / glibc / GCC runtime + the dynamic
+# loader. These are ABI-stable and present on every target Linux; bundling a
+# glibc/libstdc++ from the build image can break on a host with a different
+# one. Matched by BASENAME (not path) so we can still bundle the GUI's
+# webkit2gtk/GTK graph, which lives in the same /usr/lib64 as glibc.
+is_base_os_lib() {
+  case "$(basename "$1")" in
+    ld-linux*|ld64.so*|libc.so.*|libm.so.*|libmvec.so.*|libpthread.so.*) return 0 ;;
+    libdl.so.*|librt.so.*|libresolv.so.*|libutil.so.*|libnsl.so.*|libanl.so.*) return 0 ;;
+    libcrypt.so.*|libstdc++.so.*|libgcc_s.so.*|libgomp.so.*) return 0 ;;
     *) return 1 ;;
   esac
+}
+# Libraries we deliberately DON'T bundle for LICENSE reasons. libmpg123 (+ its
+# out123/syn123 siblings) is GPL-2.0-or-later — an OPTIONAL MP3 decoder pulled
+# transitively via GStreamer; the GUI works without it (no in-webview MP3), and
+# excluding it keeps the bundle free of strong copyleft. Left to the host if a
+# user wants MP3 in the embedded webview.
+is_excluded_lib() {
+  case "$(basename "$1")" in
+    libmpg123.so*|libout123.so*|libsyn123.so*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+# GPU / graphics driver-interface libs to leave on the HOST: the GL/EGL
+# dispatch (libglvnd), the kernel GPU interfaces (libdrm/libgbm), and the
+# NVIDIA/Intel userspace driver .so's must MATCH the host's kernel driver, so
+# bundling a build-image copy risks a mismatch. Any host running the GUI has a
+# display stack (mesa/vendor driver) already. Client X11/Wayland libs are NOT
+# here — those are ABI-stable and fine to bundle.
+is_host_graphics_lib() {
+  case "$(basename "$1")" in
+    libGL.so.*|libEGL.so.*|libGLX*.so.*|libGLdispatch.so.*|libOpenGL.so.*|libGLESv2.so.*) return 0 ;;
+    libdrm.so.*|libgbm.so.*|libgallium*.so.*|libGLX_*.so.*|libEGL_*.so.*) return 0 ;;
+    libcuda.so.*|libnvidia-*.so.*|libze_intel_gpu.so.*|libigdrcl.so.*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+# Back-compat shim: the oneAPI-bundling loop below still calls is_system_lib.
+# It now means "do NOT bundle" = base OS OR host-graphics OR license-excluded.
+is_system_lib() {
+  is_base_os_lib "$1" || is_host_graphics_lib "$1" || is_excluded_lib "$1"
 }
 # A shared object is named `<name>.so` or `<name>.so.<version>` — this filters
 # out gdb pretty-printers (`*.so-gdb.py`), .cmake files, etc. that live in the
@@ -158,6 +195,76 @@ else
     patchelf --set-rpath '$ORIGIN' "$so" 2>/dev/null || true
   done
   echo ">> set \$ORIGIN RPATH (binary -> lib/, libs -> siblings)"
+fi
+
+# ---- Third-party bundled-library license NOTICES (LGPL-2.1 §4/§6) ---------
+# Each bundled .so is a redistributable third-party library. For the LGPL
+# ones (webkit2gtk/GTK/glib/...) LGPL-2.1 requires shipping the license text +
+# a notice naming the lib + version + where its (unmodified upstream) source
+# is. We emit a NOTICES table (lib -> package -> version -> license) and copy
+# each owning package's own license files from the build image. Works on rpm
+# (Rocky x86_64) or dpkg (Ubuntu aarch64). rustllama's OWN code stays MIT OR
+# Apache-2.0; these libraries keep their own (mostly LGPL/permissive) licenses.
+if [ -d "$STAGE/lib" ] && [ "$(find "$STAGE/lib" -type f 2>/dev/null | wc -l)" -gt 0 ]; then
+  mkdir -p "$STAGE/licenses/third-party"
+  NOTICES="$STAGE/licenses/THIRD-PARTY-NOTICES.txt"
+  {
+    echo "rustllama bundles the third-party shared libraries in ./lib, dynamically"
+    echo "linked and replaceable. rustllama's own code is MIT OR Apache-2.0; each"
+    echo "bundled library keeps its own license, listed below with its exact version."
+    echo "LGPL-2.1 libraries' corresponding source is available as the named"
+    echo "distribution's source package (SRPM / dsc) for that version; each owning"
+    echo "package's license files are copied under ./licenses/third-party/<package>/."
+    echo
+    printf '%-38s %-26s %s\n' "LIBRARY (package)" "VERSION" "LICENSE"
+    printf '%-38s %-26s %s\n' "----------------" "-------" "-------"
+  } > "$NOTICES"
+  have_rpm=0; command -v rpm  >/dev/null 2>&1 && have_rpm=1
+  have_dpkg=0; command -v dpkg >/dev/null 2>&1 && have_dpkg=1
+  seen_pkgs=" "
+  for so in "$STAGE"/lib/*.so*; do
+    [ -f "$so" ] || continue
+    base="$(basename "$so")"
+    syspath=""
+    for d in /usr/lib64 /usr/lib /lib64 /lib \
+             /opt/intel/oneapi/compiler/latest/lib /opt/intel/oneapi/compiler/latest/lib/x64; do
+      [ -e "$d/$base" ] && { syspath="$d/$base"; break; }
+    done
+    pkg="(bundled runtime)"; ver="-"; lic="see upstream"
+    if [ -n "$syspath" ] && [ "$have_rpm" = 1 ]; then
+      p="$(rpm -qf --qf '%{NAME}|%{VERSION}-%{RELEASE}|%{LICENSE}\n' "$syspath" 2>/dev/null | head -1)"
+      if [ -n "$p" ] && ! echo "$p" | grep -qi 'not owned'; then
+        pkg="${p%%|*}"; rest="${p#*|}"; ver="${rest%%|*}"; lic="${rest#*|}"
+        case "$seen_pkgs" in *" $pkg "*) : ;; *)
+          seen_pkgs="$seen_pkgs$pkg "
+          [ -d "/usr/share/licenses/$pkg" ] && cp -r "/usr/share/licenses/$pkg" "$STAGE/licenses/third-party/" 2>/dev/null || true
+        ;; esac
+      fi
+    elif [ -n "$syspath" ] && [ "$have_dpkg" = 1 ]; then
+      pkg="$(dpkg -S "$syspath" 2>/dev/null | head -1 | cut -d: -f1)"
+      [ -z "$pkg" ] && pkg="(bundled runtime)"
+      if [ "$pkg" != "(bundled runtime)" ]; then
+        ver="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || echo '-')"
+        lic="$(awk -F': ' '/^License:/{print $2; exit}' "/usr/share/doc/$pkg/copyright" 2>/dev/null)"
+        [ -z "$lic" ] && lic="see copyright"
+        case "$seen_pkgs" in *" $pkg "*) : ;; *)
+          seen_pkgs="$seen_pkgs$pkg "
+          if [ -f "/usr/share/doc/$pkg/copyright" ]; then
+            mkdir -p "$STAGE/licenses/third-party/$pkg"
+            cp "/usr/share/doc/$pkg/copyright" "$STAGE/licenses/third-party/$pkg/" 2>/dev/null || true
+          fi
+        ;; esac
+      fi
+    fi
+    printf '%-38s %-26s %s\n' "$base ($pkg)" "$ver" "$lic" >> "$NOTICES"
+  done
+  echo ">> wrote licenses/THIRD-PARTY-NOTICES.txt + per-package license files"
+  # Flag (do not fail) any strong-copyleft that slipped into the bundle, so a
+  # release never silently ships GPL. mpg123 is already excluded above.
+  if grep -iE '(^|[^L])GPL-[0-9]' "$NOTICES" | grep -viE 'LGPL|GCC-exception|with exception|OR ' >/dev/null 2>&1; then
+    echo ">> WARNING: a bundled lib reports a GPL license — review $NOTICES" >&2
+    grep -iE '(^|[^L])GPL-[0-9]' "$NOTICES" | grep -viE 'LGPL|GCC-exception|with exception|OR ' >&2 || true
+  fi
 fi
 
 # License + docs.

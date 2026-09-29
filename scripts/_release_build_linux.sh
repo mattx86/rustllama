@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
-# In-container entrypoint for the Linux release archives: build the headless
-# binary (all backends compiled in) then package it self-contained. Invoked by
+# In-container entrypoint for the Linux release archives: build the GUI binary
+# (desktop GUI + CLI + server, all backends compiled in) then package it
+# self-contained — the single binary also runs headless (`rustllama serve`),
+# so the GUI artifact is a superset of the old headless one. Invoked by
 # scripts/release-linux-x86_64.bat and scripts/release-linux-arm64.bat.
+#
+# The GUI links webkit2gtk-4.1 + GTK (present in both build images); the
+# packaging step below bundles that .so graph via $ORIGIN RPATH (LGPL-2.1
+# libs, dynamically linked + replaceable + accompanied by NOTICES), so the
+# artifact needs no webkit2gtk install on the target. Set HEADLESS=1 to build
+# the server-only binary instead (no webkit graph bundled).
 #
 # Usage: scripts/_release_build_linux.sh <arch>     (arch: x86_64 | aarch64)
 set -euo pipefail
@@ -21,8 +29,14 @@ if [ "$ARCH" = "aarch64" ]; then
   echo ">> RUSTLLAMA_CUDA_ARCHS=$RUSTLLAMA_CUDA_ARCHS (native GH200 sm_90 + DGX Spark GB10 sm_121)"
 fi
 
-# 1. Build the headless server/CLI binary.
-scripts/build.sh --headless
+# 1. Build the binary. GUI (desktop + CLI + server) by default; HEADLESS=1
+#    builds server-only. The GUI needs the prebuilt frontend at app/ui/dist
+#    (committed) + webkit2gtk in the image (both present).
+if [ "${HEADLESS:-0}" = "1" ]; then
+  scripts/build.sh --headless
+else
+  scripts/build.sh
+fi
 
 # 2. Resolve version from the workspace manifest.
 VERSION="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
