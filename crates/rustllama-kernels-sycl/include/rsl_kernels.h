@@ -371,6 +371,60 @@ void rsl_flash_attn_prefill_nvfp4_usm(rsl_stream* s,
                                       int n_heads, int n_kv_heads,
                                       int head_dim, int max_ctx,
                                       int kv_len_base, int n_new);
+/* OCP Microscaling (MX) KV FlashAttention: MXFP4 / MXFP6 / MXFP8. Same
+ * shape/semantics as the NVFP4 entries above; the K/V slab is
+ * `[n_kv_heads, max_ctx, bytes_per_row]` with 32-element blocks (one
+ * trailing E8M0 scale byte each), so `head_dim % 32 == 0` and
+ *   MXFP4 : bytes_per_row = (head_dim/32)*17
+ *   MXFP6 : bytes_per_row = (head_dim/32)*25
+ *   MXFP8 : bytes_per_row = (head_dim/32)*33
+ * head_dim is capped at 256; the kernel early-returns on larger /
+ * mis-shaped inputs so the caller falls back to CPU. */
+void rsl_flash_attn_decode_mxfp4_usm(rsl_stream* s,
+                                     const float* q_usm,
+                                     const void* k_packed_usm,
+                                     const void* v_packed_usm,
+                                     float* out_usm,
+                                     int n_heads, int n_kv_heads,
+                                     int head_dim, int max_ctx, int kv_len);
+void rsl_flash_attn_prefill_mxfp4_usm(rsl_stream* s,
+                                      const float* q_usm,
+                                      const void* k_packed_usm,
+                                      const void* v_packed_usm,
+                                      float* out_usm,
+                                      int n_heads, int n_kv_heads,
+                                      int head_dim, int max_ctx,
+                                      int kv_len_base, int n_new);
+void rsl_flash_attn_decode_mxfp6_usm(rsl_stream* s,
+                                     const float* q_usm,
+                                     const void* k_packed_usm,
+                                     const void* v_packed_usm,
+                                     float* out_usm,
+                                     int n_heads, int n_kv_heads,
+                                     int head_dim, int max_ctx, int kv_len);
+void rsl_flash_attn_prefill_mxfp6_usm(rsl_stream* s,
+                                      const float* q_usm,
+                                      const void* k_packed_usm,
+                                      const void* v_packed_usm,
+                                      float* out_usm,
+                                      int n_heads, int n_kv_heads,
+                                      int head_dim, int max_ctx,
+                                      int kv_len_base, int n_new);
+void rsl_flash_attn_decode_mxfp8_usm(rsl_stream* s,
+                                     const float* q_usm,
+                                     const void* k_packed_usm,
+                                     const void* v_packed_usm,
+                                     float* out_usm,
+                                     int n_heads, int n_kv_heads,
+                                     int head_dim, int max_ctx, int kv_len);
+void rsl_flash_attn_prefill_mxfp8_usm(rsl_stream* s,
+                                      const float* q_usm,
+                                      const void* k_packed_usm,
+                                      const void* v_packed_usm,
+                                      float* out_usm,
+                                      int n_heads, int n_kv_heads,
+                                      int head_dim, int max_ctx,
+                                      int kv_len_base, int n_new);
 void rsl_flash_attn_decode_tq_usm(rsl_stream* s,
                                   const float* q_usm,
                                   const void* k_packed_usm,

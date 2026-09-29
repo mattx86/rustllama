@@ -10,6 +10,7 @@
 
 pub mod delta_net;
 pub mod mxfp;
+pub mod mxfp_kv;
 pub mod nvfp4;
 pub mod hadamard;
 pub mod q4_0_kv;

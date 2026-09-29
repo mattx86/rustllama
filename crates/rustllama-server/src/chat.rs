@@ -2201,6 +2201,9 @@ fn kv_dtype_label(cpu: &rustllama_engine::CpuEngine) -> &'static str {
         rustllama_engine::KvDtype::Tq(_) => "tq",
         rustllama_engine::KvDtype::Nvfp4 => "nvfp4",
         rustllama_engine::KvDtype::Q4_0 => "q4_0",
+        rustllama_engine::KvDtype::Mxfp4 => "mxfp4",
+        rustllama_engine::KvDtype::Mxfp6 => "mxfp6",
+        rustllama_engine::KvDtype::Mxfp8 => "mxfp8",
     }
 }
 

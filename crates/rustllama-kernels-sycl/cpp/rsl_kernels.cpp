@@ -67,6 +67,17 @@ struct rsl_stream {
     std::size_t embed_ids_capacity = 0;
 };
 
+// Forward declarations of the OCP Microscaling (MX) element decoders,
+// whose definitions live far below beside the MX weight matvecs
+// (~line 9134). Declared up here so the quantized-KV MX row-dequant
+// helpers in the anonymous namespace below can call them; these are the
+// same file-scope (external-linkage) `inline` entities, so no duplicate
+// definition is introduced — we just make the names visible early.
+inline float rsl_mx_e8m0_to_f32(uint8_t s);
+inline float rsl_mx_e2m1_to_f32(uint8_t code);
+inline float rsl_mx_e3m2_to_f32(uint8_t c);
+inline float rsl_mx_e4m3_to_f32(uint8_t b);
+
 namespace {
 
 // Convert a u16 IEEE-754 binary16 bit pattern to f32. SYCL's
@@ -219,6 +230,71 @@ inline void deq_nvfp4_row(const uint8_t* p, float* row, int head_dim) {
             row[o + j * 2]     = codebook[lo] * scale;
             row[o + j * 2 + 1] = codebook[hi] * scale;
         }
+    }
+}
+
+// OCP Microscaling (MX) KV rows: 32 elements per block, one trailing
+// E8M0 shared-scale byte, weight = scale * decode(code). Same block
+// layout as the MXFP weight matvecs (~line 9190) and byte-exact with the
+// CPU dequant in rustllama-gguf (dequant_mxfp4/6/8). Each writes one
+// dequantized KV row of `head_dim` f32 (sequential element order, so the
+// dot product against `q_usm` matches), then the flash kernels below run
+// the identical online-softmax as NVFP4. head_dim % 32 == 0.
+
+// MXFP4 KV row: 17 B / 32 elems — 16 bytes of two E2M1 nibbles each
+// (low nibble -> elem 2j, high -> elem 2j+1) + byte[16] = E8M0 scale.
+inline void deq_mxfp4_row(const uint8_t* p, float* row, int head_dim) {
+    int nb = head_dim / 32;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = p + b * 17;
+        const float scale = rsl_mx_e8m0_to_f32(blk[16]);
+        int o = b * 32;
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t byte = blk[j];
+            row[o + j * 2]     = rsl_mx_e2m1_to_f32(byte & 0x0F) * scale;
+            row[o + j * 2 + 1] = rsl_mx_e2m1_to_f32((byte >> 4) & 0x0F) * scale;
+        }
+    }
+}
+
+// MXFP6 KV row: 25 B / 32 elems — 24-byte little-endian bitstream of 32
+// six-bit E3M2 codes (elem j at bit 6j; for j not a multiple of 4 it
+// spans two adjacent bytes) + byte[24] = E8M0 scale. Read a 16-bit LE
+// window (zero high byte once past the 24-byte code region) and shift
+// out 6 bits — byte-for-byte with dequant_mxfp6 / the MXFP6 matvec.
+inline void deq_mxfp6_row(const uint8_t* p, float* row, int head_dim) {
+    int nb = head_dim / 32;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = p + b * 25;                  // 24 code bytes ...
+        const float scale = rsl_mx_e8m0_to_f32(blk[24]);  // + scale
+        int o = b * 32;
+        for (int j = 0; j < 32; ++j) {
+            const int bitpos = j * 6;
+            const int byte_idx = bitpos >> 3;   // / 8
+            const int bit_off = bitpos & 7;     // % 8
+            const uint32_t lo = blk[byte_idx];
+            // j=31 ends exactly on the 24-byte boundary, so only pull the
+            // high byte when it still lies inside the code region.
+            const uint32_t hi = (byte_idx + 1 < 24)
+                ? static_cast<uint32_t>(blk[byte_idx + 1]) : 0u;
+            const uint32_t word = lo | (hi << 8);
+            const uint8_t code =
+                static_cast<uint8_t>((word >> bit_off) & 0x3Fu);
+            row[o + j] = rsl_mx_e3m2_to_f32(code) * scale;
+        }
+    }
+}
+
+// MXFP8 KV row: 33 B / 32 elems — 32 E4M3 bytes (one per element) +
+// byte[32] = E8M0 scale. Byte-for-byte with dequant_mxfp8.
+inline void deq_mxfp8_row(const uint8_t* p, float* row, int head_dim) {
+    int nb = head_dim / 32;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = p + b * 33;
+        const float scale = rsl_mx_e8m0_to_f32(blk[32]);
+        int o = b * 32;
+        for (int j = 0; j < 32; ++j)
+            row[o + j] = rsl_mx_e4m3_to_f32(blk[j]) * scale;
     }
 }
 
@@ -1863,6 +1939,375 @@ void rsl_flash_attn_prefill_nvfp4_usm(rsl_stream* s,
                     l = l * rescale + p;
                     const uint8_t* vp = v_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
                     deq_nvfp4_row(vp, row, head_dim);
+                    for (int i = 0; i < head_dim; ++i)
+                        out_usm[out_off + i] = out_usm[out_off + i] * rescale + p * row[i];
+                    m = m_new;
+                }
+                const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+                for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] *= inv_l;
+            });
+    }).wait();
+})
+
+// =========================================================================
+// Quantized-KV FlashAttention for the OCP Microscaling (MX) KV formats:
+// MXFP4 / MXFP6 / MXFP8. Structurally identical to the NVFP4 kernels above
+// — one work-item per head (decode) or per (head, q_pos) (prefill), the
+// same dequant-then-online-softmax recurrence. Only three things change
+// per format: (a) the packed block byte count, hence `bytes_per_row =
+// (head_dim/32) * {17,25,33}`; (b) the `head_dim % 32 == 0` gate (MX
+// blocks span 32 elems, vs NVFP4's 16); (c) the per-row dequant helper
+// (deq_mxfp4_row / deq_mxfp6_row / deq_mxfp8_row). The K/V slab layout is
+// `[n_kv_heads, max_ctx, bytes_per_row]`, same as NVFP4.
+// =========================================================================
+
+// ---- MXFP4 KV (17 B / 32 elems: 16 nibble-pair bytes + E8M0 scale) ----
+void rsl_flash_attn_decode_mxfp4_usm(rsl_stream* s,
+                                     const float* q_usm,
+                                     const void* k_packed_usm,
+                                     const void* v_packed_usm,
+                                     float* out_usm,
+                                     int n_heads, int n_kv_heads,
+                                     int head_dim, int max_ctx,
+                                     int kv_len) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_mxfp4_usm", {
+    if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
+        || v_packed_usm == nullptr || out_usm == nullptr) return;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
+    if ((n_heads % n_kv_heads) != 0) return;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return;
+    auto& q = s->q;
+    if (kv_len <= 0) {
+        std::size_t total = static_cast<std::size_t>(n_heads) * head_dim;
+        q.memset(out_usm, 0, total * sizeof(float)).wait();
+        return;
+    }
+    const int n_gqa = n_heads / n_kv_heads;
+    const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    const int bytes_per_row = (head_dim / 32) * 17;
+    const uint8_t* k_bytes = static_cast<const uint8_t*>(k_packed_usm);
+    const uint8_t* v_bytes = static_cast<const uint8_t*>(v_packed_usm);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(n_heads)),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int hh = static_cast<int>(it.get_global_id(0));
+                if (hh >= n_heads) return;
+                const int kv_h = hh / n_gqa;
+                const int q_base = hh * head_dim;
+                const int out_base = hh * head_dim;
+                float row[RSL_FLASH_MAX_HEAD_DIM];
+                for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] = 0.0f;
+                float m = -INFINITY, l = 0.0f;
+                for (int t = 0; t < kv_len; ++t) {
+                    const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_mxfp4_row(kp, row, head_dim);
+                    float s_dot = 0.0f;
+                    for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_base + i] * row[i];
+                    s_dot *= scale;
+                    const float m_new = sycl::fmax(m, s_dot);
+                    const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
+                    const float p = sycl::exp(s_dot - m_new);
+                    l = l * rescale + p;
+                    const uint8_t* vp = v_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_mxfp4_row(vp, row, head_dim);
+                    for (int i = 0; i < head_dim; ++i)
+                        out_usm[out_base + i] = out_usm[out_base + i] * rescale + p * row[i];
+                    m = m_new;
+                }
+                const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+                for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] *= inv_l;
+            });
+    }).wait();
+})
+
+void rsl_flash_attn_prefill_mxfp4_usm(rsl_stream* s,
+                                      const float* q_usm,
+                                      const void* k_packed_usm,
+                                      const void* v_packed_usm,
+                                      float* out_usm,
+                                      int n_heads, int n_kv_heads,
+                                      int head_dim, int max_ctx,
+                                      int kv_len_base, int n_new) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_mxfp4_usm", {
+    if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
+        || v_packed_usm == nullptr || out_usm == nullptr) return;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return;
+    if ((n_heads % n_kv_heads) != 0) return;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return;
+    auto& q = s->q;
+    const int n_gqa = n_heads / n_kv_heads;
+    const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    const int bytes_per_row = (head_dim / 32) * 17;
+    const uint8_t* k_bytes = static_cast<const uint8_t*>(k_packed_usm);
+    const uint8_t* v_bytes = static_cast<const uint8_t*>(v_packed_usm);
+    const std::size_t global_h = round_up_to_lws(n_heads);
+    sycl::range<2> global(global_h, static_cast<std::size_t>(n_new));
+    sycl::range<2> local(RSL_LWS, 1);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) {
+                const int hh = static_cast<int>(it.get_global_id(0));
+                const int q_pos = static_cast<int>(it.get_global_id(1));
+                if (hh >= n_heads || q_pos >= n_new) return;
+                const int kv_h = hh / n_gqa;
+                const int q_off = (q_pos * n_heads + hh) * head_dim;
+                const int out_off = q_off;
+                const int kv_len_for_q = kv_len_base + q_pos + 1;
+                float row[RSL_FLASH_MAX_HEAD_DIM];
+                for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] = 0.0f;
+                float m = -INFINITY, l = 0.0f;
+                for (int t = 0; t < kv_len_for_q; ++t) {
+                    const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_mxfp4_row(kp, row, head_dim);
+                    float s_dot = 0.0f;
+                    for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_off + i] * row[i];
+                    s_dot *= scale;
+                    const float m_new = sycl::fmax(m, s_dot);
+                    const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
+                    const float p = sycl::exp(s_dot - m_new);
+                    l = l * rescale + p;
+                    const uint8_t* vp = v_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_mxfp4_row(vp, row, head_dim);
+                    for (int i = 0; i < head_dim; ++i)
+                        out_usm[out_off + i] = out_usm[out_off + i] * rescale + p * row[i];
+                    m = m_new;
+                }
+                const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+                for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] *= inv_l;
+            });
+    }).wait();
+})
+
+// ---- MXFP6 KV (25 B / 32 elems: 24-byte E3M2 bitstream + E8M0 scale) ----
+void rsl_flash_attn_decode_mxfp6_usm(rsl_stream* s,
+                                     const float* q_usm,
+                                     const void* k_packed_usm,
+                                     const void* v_packed_usm,
+                                     float* out_usm,
+                                     int n_heads, int n_kv_heads,
+                                     int head_dim, int max_ctx,
+                                     int kv_len) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_mxfp6_usm", {
+    if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
+        || v_packed_usm == nullptr || out_usm == nullptr) return;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
+    if ((n_heads % n_kv_heads) != 0) return;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return;
+    auto& q = s->q;
+    if (kv_len <= 0) {
+        std::size_t total = static_cast<std::size_t>(n_heads) * head_dim;
+        q.memset(out_usm, 0, total * sizeof(float)).wait();
+        return;
+    }
+    const int n_gqa = n_heads / n_kv_heads;
+    const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    const int bytes_per_row = (head_dim / 32) * 25;
+    const uint8_t* k_bytes = static_cast<const uint8_t*>(k_packed_usm);
+    const uint8_t* v_bytes = static_cast<const uint8_t*>(v_packed_usm);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(n_heads)),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int hh = static_cast<int>(it.get_global_id(0));
+                if (hh >= n_heads) return;
+                const int kv_h = hh / n_gqa;
+                const int q_base = hh * head_dim;
+                const int out_base = hh * head_dim;
+                float row[RSL_FLASH_MAX_HEAD_DIM];
+                for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] = 0.0f;
+                float m = -INFINITY, l = 0.0f;
+                for (int t = 0; t < kv_len; ++t) {
+                    const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_mxfp6_row(kp, row, head_dim);
+                    float s_dot = 0.0f;
+                    for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_base + i] * row[i];
+                    s_dot *= scale;
+                    const float m_new = sycl::fmax(m, s_dot);
+                    const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
+                    const float p = sycl::exp(s_dot - m_new);
+                    l = l * rescale + p;
+                    const uint8_t* vp = v_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_mxfp6_row(vp, row, head_dim);
+                    for (int i = 0; i < head_dim; ++i)
+                        out_usm[out_base + i] = out_usm[out_base + i] * rescale + p * row[i];
+                    m = m_new;
+                }
+                const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+                for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] *= inv_l;
+            });
+    }).wait();
+})
+
+void rsl_flash_attn_prefill_mxfp6_usm(rsl_stream* s,
+                                      const float* q_usm,
+                                      const void* k_packed_usm,
+                                      const void* v_packed_usm,
+                                      float* out_usm,
+                                      int n_heads, int n_kv_heads,
+                                      int head_dim, int max_ctx,
+                                      int kv_len_base, int n_new) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_mxfp6_usm", {
+    if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
+        || v_packed_usm == nullptr || out_usm == nullptr) return;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return;
+    if ((n_heads % n_kv_heads) != 0) return;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return;
+    auto& q = s->q;
+    const int n_gqa = n_heads / n_kv_heads;
+    const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    const int bytes_per_row = (head_dim / 32) * 25;
+    const uint8_t* k_bytes = static_cast<const uint8_t*>(k_packed_usm);
+    const uint8_t* v_bytes = static_cast<const uint8_t*>(v_packed_usm);
+    const std::size_t global_h = round_up_to_lws(n_heads);
+    sycl::range<2> global(global_h, static_cast<std::size_t>(n_new));
+    sycl::range<2> local(RSL_LWS, 1);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) {
+                const int hh = static_cast<int>(it.get_global_id(0));
+                const int q_pos = static_cast<int>(it.get_global_id(1));
+                if (hh >= n_heads || q_pos >= n_new) return;
+                const int kv_h = hh / n_gqa;
+                const int q_off = (q_pos * n_heads + hh) * head_dim;
+                const int out_off = q_off;
+                const int kv_len_for_q = kv_len_base + q_pos + 1;
+                float row[RSL_FLASH_MAX_HEAD_DIM];
+                for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] = 0.0f;
+                float m = -INFINITY, l = 0.0f;
+                for (int t = 0; t < kv_len_for_q; ++t) {
+                    const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_mxfp6_row(kp, row, head_dim);
+                    float s_dot = 0.0f;
+                    for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_off + i] * row[i];
+                    s_dot *= scale;
+                    const float m_new = sycl::fmax(m, s_dot);
+                    const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
+                    const float p = sycl::exp(s_dot - m_new);
+                    l = l * rescale + p;
+                    const uint8_t* vp = v_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_mxfp6_row(vp, row, head_dim);
+                    for (int i = 0; i < head_dim; ++i)
+                        out_usm[out_off + i] = out_usm[out_off + i] * rescale + p * row[i];
+                    m = m_new;
+                }
+                const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+                for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] *= inv_l;
+            });
+    }).wait();
+})
+
+// ---- MXFP8 KV (33 B / 32 elems: 32 E4M3 bytes + E8M0 scale) ----
+void rsl_flash_attn_decode_mxfp8_usm(rsl_stream* s,
+                                     const float* q_usm,
+                                     const void* k_packed_usm,
+                                     const void* v_packed_usm,
+                                     float* out_usm,
+                                     int n_heads, int n_kv_heads,
+                                     int head_dim, int max_ctx,
+                                     int kv_len) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_mxfp8_usm", {
+    if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
+        || v_packed_usm == nullptr || out_usm == nullptr) return;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
+    if ((n_heads % n_kv_heads) != 0) return;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return;
+    auto& q = s->q;
+    if (kv_len <= 0) {
+        std::size_t total = static_cast<std::size_t>(n_heads) * head_dim;
+        q.memset(out_usm, 0, total * sizeof(float)).wait();
+        return;
+    }
+    const int n_gqa = n_heads / n_kv_heads;
+    const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    const int bytes_per_row = (head_dim / 32) * 33;
+    const uint8_t* k_bytes = static_cast<const uint8_t*>(k_packed_usm);
+    const uint8_t* v_bytes = static_cast<const uint8_t*>(v_packed_usm);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(n_heads)),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int hh = static_cast<int>(it.get_global_id(0));
+                if (hh >= n_heads) return;
+                const int kv_h = hh / n_gqa;
+                const int q_base = hh * head_dim;
+                const int out_base = hh * head_dim;
+                float row[RSL_FLASH_MAX_HEAD_DIM];
+                for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] = 0.0f;
+                float m = -INFINITY, l = 0.0f;
+                for (int t = 0; t < kv_len; ++t) {
+                    const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_mxfp8_row(kp, row, head_dim);
+                    float s_dot = 0.0f;
+                    for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_base + i] * row[i];
+                    s_dot *= scale;
+                    const float m_new = sycl::fmax(m, s_dot);
+                    const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
+                    const float p = sycl::exp(s_dot - m_new);
+                    l = l * rescale + p;
+                    const uint8_t* vp = v_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_mxfp8_row(vp, row, head_dim);
+                    for (int i = 0; i < head_dim; ++i)
+                        out_usm[out_base + i] = out_usm[out_base + i] * rescale + p * row[i];
+                    m = m_new;
+                }
+                const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+                for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] *= inv_l;
+            });
+    }).wait();
+})
+
+void rsl_flash_attn_prefill_mxfp8_usm(rsl_stream* s,
+                                      const float* q_usm,
+                                      const void* k_packed_usm,
+                                      const void* v_packed_usm,
+                                      float* out_usm,
+                                      int n_heads, int n_kv_heads,
+                                      int head_dim, int max_ctx,
+                                      int kv_len_base, int n_new) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_mxfp8_usm", {
+    if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
+        || v_packed_usm == nullptr || out_usm == nullptr) return;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return;
+    if ((n_heads % n_kv_heads) != 0) return;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return;
+    auto& q = s->q;
+    const int n_gqa = n_heads / n_kv_heads;
+    const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    const int bytes_per_row = (head_dim / 32) * 33;
+    const uint8_t* k_bytes = static_cast<const uint8_t*>(k_packed_usm);
+    const uint8_t* v_bytes = static_cast<const uint8_t*>(v_packed_usm);
+    const std::size_t global_h = round_up_to_lws(n_heads);
+    sycl::range<2> global(global_h, static_cast<std::size_t>(n_new));
+    sycl::range<2> local(RSL_LWS, 1);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) {
+                const int hh = static_cast<int>(it.get_global_id(0));
+                const int q_pos = static_cast<int>(it.get_global_id(1));
+                if (hh >= n_heads || q_pos >= n_new) return;
+                const int kv_h = hh / n_gqa;
+                const int q_off = (q_pos * n_heads + hh) * head_dim;
+                const int out_off = q_off;
+                const int kv_len_for_q = kv_len_base + q_pos + 1;
+                float row[RSL_FLASH_MAX_HEAD_DIM];
+                for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] = 0.0f;
+                float m = -INFINITY, l = 0.0f;
+                for (int t = 0; t < kv_len_for_q; ++t) {
+                    const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_mxfp8_row(kp, row, head_dim);
+                    float s_dot = 0.0f;
+                    for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_off + i] * row[i];
+                    s_dot *= scale;
+                    const float m_new = sycl::fmax(m, s_dot);
+                    const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
+                    const float p = sycl::exp(s_dot - m_new);
+                    l = l * rescale + p;
+                    const uint8_t* vp = v_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
+                    deq_mxfp8_row(vp, row, head_dim);
                     for (int i = 0; i < head_dim; ++i)
                         out_usm[out_off + i] = out_usm[out_off + i] * rescale + p * row[i];
                     m = m_new;

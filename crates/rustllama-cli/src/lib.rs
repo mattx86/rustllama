@@ -380,7 +380,7 @@ pub enum Command {
         kv_dtype: bool,
         /// KV-dtype candidates (comma-separated). Default covers every
         /// v1-supported value. Honored only with `--kv-dtype`.
-        #[arg(long, default_value = "f32,q8_0,q4_0,tq1,tq2,tq4,tq8,nvfp4")]
+        #[arg(long, default_value = "f32,q8_0,q4_0,tq1,tq2,tq4,tq8,nvfp4,mxfp4,mxfp6,mxfp8")]
         kv_dtype_candidates: String,
         /// Flash-attention on/off sweep. Reuses one loaded engine
         /// (flash is a hot toggle). Writes the winner under
@@ -6977,6 +6977,9 @@ fn kv_dtype_to_str(dt: &rustllama_engine::KvDtype) -> String {
         rustllama_engine::KvDtype::Tq(bits) => format!("tq{bits}"),
         rustllama_engine::KvDtype::Nvfp4 => "nvfp4".to_string(),
         rustllama_engine::KvDtype::Q4_0 => "q4_0".to_string(),
+        rustllama_engine::KvDtype::Mxfp4 => "mxfp4".to_string(),
+        rustllama_engine::KvDtype::Mxfp6 => "mxfp6".to_string(),
+        rustllama_engine::KvDtype::Mxfp8 => "mxfp8".to_string(),
     }
 }
 

@@ -2322,6 +2322,21 @@ pub enum KvLayer {
         k_q: KvBuf<u8>,
         v_q: KvBuf<u8>,
     },
+    /// OCP Microscaling KV (E2M1/E3M2/E4M3 + embedded E8M0 scale per 32
+    /// elems; 17/25/33 B/block). `head_dim % 32 == 0`. Scale is embedded
+    /// per block, so no separate scales vector (like NVFP4).
+    Mxfp4 {
+        k_packed: KvBuf<u8>,
+        v_packed: KvBuf<u8>,
+    },
+    Mxfp6 {
+        k_packed: KvBuf<u8>,
+        v_packed: KvBuf<u8>,
+    },
+    Mxfp8 {
+        k_packed: KvBuf<u8>,
+        v_packed: KvBuf<u8>,
+    },
 }
 
 impl KvLayer {
@@ -2344,6 +2359,9 @@ impl KvLayer {
             }
             KvLayer::Nvfp4 { k_packed, v_packed } => b(k_packed) + b(v_packed),
             KvLayer::Q4_0 { k_q, v_q } => b(k_q) + b(v_q),
+            KvLayer::Mxfp4 { k_packed, v_packed }
+            | KvLayer::Mxfp6 { k_packed, v_packed }
+            | KvLayer::Mxfp8 { k_packed, v_packed } => b(k_packed) + b(v_packed),
         }
     }
 }
@@ -2362,6 +2380,12 @@ impl std::fmt::Debug for KvLayer {
                 .field("k_packed", k_packed).field("v_packed", v_packed).finish(),
             KvLayer::Q4_0 { k_q, v_q } => f.debug_struct("Q4_0")
                 .field("k_q", k_q).field("v_q", v_q).finish(),
+            KvLayer::Mxfp4 { k_packed, v_packed } => f.debug_struct("Mxfp4")
+                .field("k_packed", k_packed).field("v_packed", v_packed).finish(),
+            KvLayer::Mxfp6 { k_packed, v_packed } => f.debug_struct("Mxfp6")
+                .field("k_packed", k_packed).field("v_packed", v_packed).finish(),
+            KvLayer::Mxfp8 { k_packed, v_packed } => f.debug_struct("Mxfp8")
+                .field("k_packed", k_packed).field("v_packed", v_packed).finish(),
         }
     }
 }
@@ -2394,6 +2418,12 @@ pub enum KvDtype {
     /// elements. The Prism-compatible 4-bit KV option; ~7× smaller than
     /// F32. Requires head_dim % 32 == 0.
     Q4_0,
+    /// OCP Microscaling KV: E2M1 4-bit + E8M0 scale per 32 (17B/32).
+    Mxfp4,
+    /// OCP Microscaling KV: E3M2 6-bit + E8M0 scale per 32 (25B/32).
+    Mxfp6,
+    /// OCP Microscaling KV: E4M3 8-bit + E8M0 scale per 32 (33B/32).
+    Mxfp8,
 }
 
 impl Default for KvDtype {
@@ -2418,6 +2448,9 @@ impl KvDtype {
             "tq4" => Some(KvDtype::Tq(4)),
             "tq8" => Some(KvDtype::Tq(8)),
             "nvfp4" => Some(KvDtype::Nvfp4),
+            "mxfp4" => Some(KvDtype::Mxfp4),
+            "mxfp6" => Some(KvDtype::Mxfp6),
+            "mxfp8" => Some(KvDtype::Mxfp8),
             _ => None,
         }
     }
@@ -2450,6 +2483,11 @@ impl KvDtype {
             // 4 bits/element + 1 f16 scale per 32 elements.
             // Overhead: 16 / 32 = 0.5 bit/element.
             KvDtype::Q4_0 => 4.5,
+            // OCP MX: element bits + 1 E8M0 (8-bit) scale per 32 elems
+            // (0.25 bit/elem overhead).
+            KvDtype::Mxfp4 => 4.25,
+            KvDtype::Mxfp6 => 6.25,
+            KvDtype::Mxfp8 => 8.25,
         }
     }
 }
@@ -2664,6 +2702,18 @@ impl KvCache {
                                 k_q: KvBuf::from_vec(Vec::new()),
                                 v_q: KvBuf::from_vec(Vec::new()),
                             },
+                            KvDtype::Mxfp4 => KvLayer::Mxfp4 {
+                                k_packed: KvBuf::from_vec(Vec::new()),
+                                v_packed: KvBuf::from_vec(Vec::new()),
+                            },
+                            KvDtype::Mxfp6 => KvLayer::Mxfp6 {
+                                k_packed: KvBuf::from_vec(Vec::new()),
+                                v_packed: KvBuf::from_vec(Vec::new()),
+                            },
+                            KvDtype::Mxfp8 => KvLayer::Mxfp8 {
+                                k_packed: KvBuf::from_vec(Vec::new()),
+                                v_packed: KvBuf::from_vec(Vec::new()),
+                            },
                         };
                     }
                 }
@@ -2730,6 +2780,31 @@ impl KvCache {
                     KvLayer::Q4_0 {
                         k_q: alloc_kv_buf_u8(stream_ref, packed_len),
                         v_q: alloc_kv_buf_u8(stream_ref, packed_len),
+                    }
+                }
+                KvDtype::Mxfp4 | KvDtype::Mxfp6 | KvDtype::Mxfp8 => {
+                    // OCP MX packs 32 elements per 17/25/33-byte block.
+                    // Same rationale as the NVFP4 assert: fail clearly at
+                    // construction, not later in the attention loop.
+                    use rustllama_kernels_cpu::mxfp;
+                    assert!(
+                        cfg.head_dim % 32 == 0,
+                        "mxfp KV requires head_dim divisible by 32, got {}",
+                        cfg.head_dim,
+                    );
+                    let blocks_per_row = cfg.head_dim / 32;
+                    let blk_bytes = match dtype {
+                        KvDtype::Mxfp4 => mxfp::MXFP4_BLOCK_BYTES,
+                        KvDtype::Mxfp6 => mxfp::MXFP6_BLOCK_BYTES,
+                        _ => mxfp::MXFP8_BLOCK_BYTES,
+                    };
+                    let packed_len = total_rows * blocks_per_row * blk_bytes;
+                    let k = alloc_kv_buf_u8(stream_ref, packed_len);
+                    let v = alloc_kv_buf_u8(stream_ref, packed_len);
+                    match dtype {
+                        KvDtype::Mxfp4 => KvLayer::Mxfp4 { k_packed: k, v_packed: v },
+                        KvDtype::Mxfp6 => KvLayer::Mxfp6 { k_packed: k, v_packed: v },
+                        _ => KvLayer::Mxfp8 { k_packed: k, v_packed: v },
                     }
                 }
                 }
@@ -2814,6 +2889,16 @@ impl KvCache {
                         *x = 0;
                     }
                     for x in v_q.iter_mut() {
+                        *x = 0;
+                    }
+                }
+                KvLayer::Mxfp4 { k_packed, v_packed }
+                | KvLayer::Mxfp6 { k_packed, v_packed }
+                | KvLayer::Mxfp8 { k_packed, v_packed } => {
+                    for x in k_packed.iter_mut() {
+                        *x = 0;
+                    }
+                    for x in v_packed.iter_mut() {
                         *x = 0;
                     }
                 }
@@ -2967,6 +3052,34 @@ impl KvCache {
                     KvLayer::Q4_0 {
                         k_q: KvBuf::from_vec(snap_kq),
                         v_q: KvBuf::from_vec(snap_vq),
+                    }
+                }
+                KvLayer::Mxfp4 { k_packed, v_packed }
+                | KvLayer::Mxfp6 { k_packed, v_packed }
+                | KvLayer::Mxfp8 { k_packed, v_packed } => {
+                    use rustllama_kernels_cpu::mxfp;
+                    let blk_bytes = match layer {
+                        KvLayer::Mxfp4 { .. } => mxfp::MXFP4_BLOCK_BYTES,
+                        KvLayer::Mxfp6 { .. } => mxfp::MXFP6_BLOCK_BYTES,
+                        _ => mxfp::MXFP8_BLOCK_BYTES,
+                    };
+                    let bytes_per_row = (hd / 32) * blk_bytes;
+                    let mut snap_kp = vec![0u8; n_h * prefix_len * bytes_per_row];
+                    let mut snap_vp = vec![0u8; n_h * prefix_len * bytes_per_row];
+                    for h in 0..n_h {
+                        let p_src = h * self.max_ctx * bytes_per_row;
+                        let p_dst = h * prefix_len * bytes_per_row;
+                        snap_kp[p_dst..p_dst + prefix_len * bytes_per_row]
+                            .copy_from_slice(&k_packed[p_src..p_src + prefix_len * bytes_per_row]);
+                        snap_vp[p_dst..p_dst + prefix_len * bytes_per_row]
+                            .copy_from_slice(&v_packed[p_src..p_src + prefix_len * bytes_per_row]);
+                    }
+                    let k = KvBuf::from_vec(snap_kp);
+                    let v = KvBuf::from_vec(snap_vp);
+                    match layer {
+                        KvLayer::Mxfp4 { .. } => KvLayer::Mxfp4 { k_packed: k, v_packed: v },
+                        KvLayer::Mxfp6 { .. } => KvLayer::Mxfp6 { k_packed: k, v_packed: v },
+                        _ => KvLayer::Mxfp8 { k_packed: k, v_packed: v },
                     }
                 }
                 }
@@ -3208,6 +3321,18 @@ impl KvCache {
                             .copy_from_slice(&svq[p_src..p_src + pl * bytes_per_row]);
                     }
                 }
+                (KvLayer::Mxfp4 { k_packed, v_packed }, KvLayer::Mxfp4 { k_packed: skp, v_packed: svp }) => {
+                    restore_mxfp_prefix(k_packed, v_packed, skp, svp, hd, n_h, self.max_ctx, pl,
+                        rustllama_kernels_cpu::mxfp::MXFP4_BLOCK_BYTES);
+                }
+                (KvLayer::Mxfp6 { k_packed, v_packed }, KvLayer::Mxfp6 { k_packed: skp, v_packed: svp }) => {
+                    restore_mxfp_prefix(k_packed, v_packed, skp, svp, hd, n_h, self.max_ctx, pl,
+                        rustllama_kernels_cpu::mxfp::MXFP6_BLOCK_BYTES);
+                }
+                (KvLayer::Mxfp8 { k_packed, v_packed }, KvLayer::Mxfp8 { k_packed: skp, v_packed: svp }) => {
+                    restore_mxfp_prefix(k_packed, v_packed, skp, svp, hd, n_h, self.max_ctx, pl,
+                        rustllama_kernels_cpu::mxfp::MXFP8_BLOCK_BYTES);
+                }
                 _ => panic!("KvLayer dtype mismatch between live cache and snapshot"),
             }
         }
@@ -3227,6 +3352,197 @@ pub struct KvSnapshot {
     pub n_kv_heads: usize,
     pub head_dim: usize,
     pub dtype: KvDtype,
+}
+
+/// Copy a snapshot's `prefix_len` positions back into the live MXFP KV
+/// cache (shared by the 3 MXFP restore arms; only the block byte size
+/// differs). Head-major `[n_h, max_ctx, bytes_per_row]` live vs
+/// `[n_h, pl, bytes_per_row]` snapshot layout.
+#[allow(clippy::too_many_arguments)]
+fn restore_mxfp_prefix(
+    k_packed: &mut KvBuf<u8>,
+    v_packed: &mut KvBuf<u8>,
+    skp: &KvBuf<u8>,
+    svp: &KvBuf<u8>,
+    hd: usize,
+    n_h: usize,
+    max_ctx: usize,
+    pl: usize,
+    blk_bytes: usize,
+) {
+    let bytes_per_row = (hd / 32) * blk_bytes;
+    for h in 0..n_h {
+        let p_dst = h * max_ctx * bytes_per_row;
+        let p_src = h * pl * bytes_per_row;
+        k_packed[p_dst..p_dst + pl * bytes_per_row]
+            .copy_from_slice(&skp[p_src..p_src + pl * bytes_per_row]);
+        v_packed[p_dst..p_dst + pl * bytes_per_row]
+            .copy_from_slice(&svp[p_src..p_src + pl * bytes_per_row]);
+    }
+}
+
+/// Quantize one new K/V row (all `n_kv_heads`) into the MXFP host cache
+/// at position `cur_pos`. `fmt` picks the block bytes + quantizer.
+#[allow(clippy::too_many_arguments)]
+fn mxfp_kv_quantize_row(
+    fmt: KvDtype,
+    k_buf: &[f32],
+    v_buf: &[f32],
+    k_packed: &mut KvBuf<u8>,
+    v_packed: &mut KvBuf<u8>,
+    cur_pos: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+) {
+    use rustllama_kernels_cpu::{mxfp, mxfp_kv};
+    let (blk_bytes, qfn): (usize, fn(&[f32], &mut [u8])) = match fmt {
+        KvDtype::Mxfp4 => (mxfp::MXFP4_BLOCK_BYTES, mxfp_kv::quantize_block_mxfp4),
+        KvDtype::Mxfp6 => (mxfp::MXFP6_BLOCK_BYTES, mxfp_kv::quantize_block_mxfp6),
+        _ => (mxfp::MXFP8_BLOCK_BYTES, mxfp_kv::quantize_block_mxfp8),
+    };
+    let blocks_per_row = head_dim / 32;
+    let bytes_per_row = blocks_per_row * blk_bytes;
+    for h in 0..n_kv_heads {
+        let p_dst = (h * max_ctx + cur_pos) * bytes_per_row;
+        for b in 0..blocks_per_row {
+            let eo = h * head_dim + b * 32;
+            let bd = p_dst + b * blk_bytes;
+            qfn(&k_buf[eo..eo + 32], &mut k_packed[bd..bd + blk_bytes]);
+            qfn(&v_buf[eo..eo + 32], &mut v_packed[bd..bd + blk_bytes]);
+        }
+    }
+}
+
+/// MXFP KV flash-attention DECODE: quantize the new K/V row into the
+/// host mirror at `cur_pos`, try the GPU (CUDA→SYCL), else the CPU
+/// kernel. `fmt` selects the per-format block bytes + kernels. Shared by
+/// every MXFP decode arm in the forward path.
+#[allow(clippy::too_many_arguments)]
+fn mxfp_kv_decode(
+    fmt: KvDtype,
+    q_buf: &[f32],
+    k_buf: &[f32],
+    v_buf: &[f32],
+    k_packed: &mut KvBuf<u8>,
+    v_packed: &mut KvBuf<u8>,
+    attn_out: &mut [f32],
+    li: usize,
+    cur_pos: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len: usize,
+    n_layers: usize,
+) {
+    use rustllama_kernels_cpu::{mxfp, mxfp_kv};
+    let (blk_bytes, qfn): (usize, fn(&[f32], &mut [u8])) = match fmt {
+        KvDtype::Mxfp4 => (mxfp::MXFP4_BLOCK_BYTES, mxfp_kv::quantize_block_mxfp4),
+        KvDtype::Mxfp6 => (mxfp::MXFP6_BLOCK_BYTES, mxfp_kv::quantize_block_mxfp6),
+        _ => (mxfp::MXFP8_BLOCK_BYTES, mxfp_kv::quantize_block_mxfp8),
+    };
+    let blocks_per_row = head_dim / 32;
+    let bytes_per_row = blocks_per_row * blk_bytes;
+    for h in 0..n_kv_heads {
+        let p_dst = (h * max_ctx + cur_pos) * bytes_per_row;
+        for b in 0..blocks_per_row {
+            let eo = h * head_dim + b * 32;
+            let bd = p_dst + b * blk_bytes;
+            qfn(&k_buf[eo..eo + 32], &mut k_packed[bd..bd + blk_bytes]);
+            qfn(&v_buf[eo..eo + 32], &mut v_packed[bd..bd + blk_bytes]);
+        }
+    }
+    let k_rows = &k_buf[..n_kv_heads * head_dim];
+    let v_rows = &v_buf[..n_kv_heads * head_dim];
+    #[allow(clippy::type_complexity)]
+    let gpu_fn: fn(&[f32], &[f32], &[f32], &mut [f32], usize, u32, u32, u32, u32, u32, u32) -> bool =
+        match fmt {
+            KvDtype::Mxfp4 => crate::accel::try_flash_attn_decode_gpu_mxfp4,
+            KvDtype::Mxfp6 => crate::accel::try_flash_attn_decode_gpu_mxfp6,
+            _ => crate::accel::try_flash_attn_decode_gpu_mxfp8,
+        };
+    let gpu_ok = gpu_fn(
+        q_buf, k_rows, v_rows, attn_out, li, cur_pos as u32,
+        n_heads as u32, n_kv_heads as u32, head_dim as u32, max_ctx as u32, n_layers as u32,
+    );
+    if !gpu_ok {
+        #[allow(clippy::type_complexity)]
+        let cpu_fn: fn(&[f32], &[u8], &[u8], &mut [f32], usize, usize, usize, usize, usize) =
+            match fmt {
+                KvDtype::Mxfp4 => mxfp_kv::gqa_attention_flash_decode_mxfp4,
+                KvDtype::Mxfp6 => mxfp_kv::gqa_attention_flash_decode_mxfp6,
+                _ => mxfp_kv::gqa_attention_flash_decode_mxfp8,
+            };
+        cpu_fn(q_buf, k_packed, v_packed, attn_out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
+    }
+}
+
+/// MXFP KV flash-attention PREFILL: quantize `n_new` new K/V rows into
+/// the host mirror at `[kv_len_base, kv_len_base+n_new)`, try GPU, else
+/// CPU. `k_buf`/`v_buf` are laid out `[n_new, n_kv_heads, head_dim]`
+/// (stride `d_kv = n_kv_heads*head_dim` per new position).
+#[allow(clippy::too_many_arguments)]
+fn mxfp_kv_prefill(
+    fmt: KvDtype,
+    q_buf: &[f32],
+    k_buf: &[f32],
+    v_buf: &[f32],
+    k_packed: &mut KvBuf<u8>,
+    v_packed: &mut KvBuf<u8>,
+    attn_out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+) {
+    use rustllama_kernels_cpu::{mxfp, mxfp_kv};
+    let (blk_bytes, qfn): (usize, fn(&[f32], &mut [u8])) = match fmt {
+        KvDtype::Mxfp4 => (mxfp::MXFP4_BLOCK_BYTES, mxfp_kv::quantize_block_mxfp4),
+        KvDtype::Mxfp6 => (mxfp::MXFP6_BLOCK_BYTES, mxfp_kv::quantize_block_mxfp6),
+        _ => (mxfp::MXFP8_BLOCK_BYTES, mxfp_kv::quantize_block_mxfp8),
+    };
+    let blocks_per_row = head_dim / 32;
+    let bytes_per_row = blocks_per_row * blk_bytes;
+    let d_kv = n_kv_heads * head_dim;
+    for i in 0..n_new {
+        let pos_i = kv_len_base + i;
+        for h in 0..n_kv_heads {
+            let p_dst = (h * max_ctx + pos_i) * bytes_per_row;
+            for b in 0..blocks_per_row {
+                let eo = i * d_kv + h * head_dim + b * 32;
+                let bd = p_dst + b * blk_bytes;
+                qfn(&k_buf[eo..eo + 32], &mut k_packed[bd..bd + blk_bytes]);
+                qfn(&v_buf[eo..eo + 32], &mut v_packed[bd..bd + blk_bytes]);
+            }
+        }
+    }
+    #[allow(clippy::type_complexity)]
+    let gpu_fn: fn(&[f32], &[u8], &[u8], &mut [f32], usize, usize, usize, usize, usize, usize) -> bool =
+        match fmt {
+            KvDtype::Mxfp4 => crate::accel::try_flash_attn_prefill_gpu_mxfp4,
+            KvDtype::Mxfp6 => crate::accel::try_flash_attn_prefill_gpu_mxfp6,
+            _ => crate::accel::try_flash_attn_prefill_gpu_mxfp8,
+        };
+    let gpu_ok = gpu_fn(
+        q_buf, k_packed, v_packed, attn_out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base,
+        n_new,
+    );
+    if !gpu_ok {
+        #[allow(clippy::type_complexity)]
+        let cpu_fn: fn(&[f32], &[u8], &[u8], &mut [f32], usize, usize, usize, usize, usize, usize) =
+            match fmt {
+                KvDtype::Mxfp4 => mxfp_kv::gqa_attention_flash_prefill_mxfp4,
+                KvDtype::Mxfp6 => mxfp_kv::gqa_attention_flash_prefill_mxfp6,
+                _ => mxfp_kv::gqa_attention_flash_prefill_mxfp8,
+            };
+        cpu_fn(
+            q_buf, k_packed, v_packed, attn_out, n_heads, n_kv_heads, head_dim, max_ctx,
+            kv_len_base, n_new,
+        );
+    }
 }
 
 impl KvLayer {
@@ -3267,6 +3583,18 @@ impl KvLayer {
             KvLayer::Q4_0 { k_q, v_q } => KvLayer::Q4_0 {
                 k_q: k_q.clone(),
                 v_q: v_q.clone(),
+            },
+            KvLayer::Mxfp4 { k_packed, v_packed } => KvLayer::Mxfp4 {
+                k_packed: k_packed.clone(),
+                v_packed: v_packed.clone(),
+            },
+            KvLayer::Mxfp6 { k_packed, v_packed } => KvLayer::Mxfp6 {
+                k_packed: k_packed.clone(),
+                v_packed: v_packed.clone(),
+            },
+            KvLayer::Mxfp8 { k_packed, v_packed } => KvLayer::Mxfp8 {
+                k_packed: k_packed.clone(),
+                v_packed: v_packed.clone(),
             },
         }
     }
@@ -5061,6 +5389,42 @@ impl LlamaModel {
                                 }
                             }
                         }
+                        KvLayer::Mxfp4 { k_packed, v_packed } => {
+                            mxfp_kv_decode(
+                                KvDtype::Mxfp4, &q_buf, &k_buf, &v_buf, k_packed, v_packed,
+                                &mut attn_out, li, cur_pos, n_heads, n_kv_heads, head_dim, max_ctx,
+                                kv_len, cfg.n_layers,
+                            );
+                            if !no_qgate_enabled() {
+                                for (a, g) in attn_out.iter_mut().zip(attn_gate_buf.iter()) {
+                                    *a *= sigmoid_stable(*g);
+                                }
+                            }
+                        }
+                        KvLayer::Mxfp6 { k_packed, v_packed } => {
+                            mxfp_kv_decode(
+                                KvDtype::Mxfp6, &q_buf, &k_buf, &v_buf, k_packed, v_packed,
+                                &mut attn_out, li, cur_pos, n_heads, n_kv_heads, head_dim, max_ctx,
+                                kv_len, cfg.n_layers,
+                            );
+                            if !no_qgate_enabled() {
+                                for (a, g) in attn_out.iter_mut().zip(attn_gate_buf.iter()) {
+                                    *a *= sigmoid_stable(*g);
+                                }
+                            }
+                        }
+                        KvLayer::Mxfp8 { k_packed, v_packed } => {
+                            mxfp_kv_decode(
+                                KvDtype::Mxfp8, &q_buf, &k_buf, &v_buf, k_packed, v_packed,
+                                &mut attn_out, li, cur_pos, n_heads, n_kv_heads, head_dim, max_ctx,
+                                kv_len, cfg.n_layers,
+                            );
+                            if !no_qgate_enabled() {
+                                for (a, g) in attn_out.iter_mut().zip(attn_gate_buf.iter()) {
+                                    *a *= sigmoid_stable(*g);
+                                }
+                            }
+                        }
                     }
                     {
                         let x_in = hadamard_pre(had, &block.w_o, &attn_out, &mut had_buf);
@@ -5987,6 +6351,20 @@ impl LlamaModel {
                                     }
                                 }
                             }
+                            // MXFP KV: quantize-only (attention deferred to the
+                            // sub-chunk flash-prefill pass below).
+                            KvLayer::Mxfp4 { k_packed, v_packed } => mxfp_kv_quantize_row(
+                                KvDtype::Mxfp4, &k_buf, &v_buf, k_packed, v_packed, cur_pos,
+                                n_kv_heads, head_dim, max_ctx,
+                            ),
+                            KvLayer::Mxfp6 { k_packed, v_packed } => mxfp_kv_quantize_row(
+                                KvDtype::Mxfp6, &k_buf, &v_buf, k_packed, v_packed, cur_pos,
+                                n_kv_heads, head_dim, max_ctx,
+                            ),
+                            KvLayer::Mxfp8 { k_packed, v_packed } => mxfp_kv_quantize_row(
+                                KvDtype::Mxfp8, &k_buf, &v_buf, k_packed, v_packed, cur_pos,
+                                n_kv_heads, head_dim, max_ctx,
+                            ),
                         }
                         // Attention is DEFERRED: stash this token's
                         // (whitened, for Q4_0) query row and its
@@ -6090,6 +6468,50 @@ impl LlamaModel {
                                         &mut hoist_attn_out[..nb * d_q],
                                         n_heads, n_kv_heads, head_dim, max_ctx,
                                         kv_len_base, nb,
+                                    );
+                                }
+                            }
+                            // MXFP KV: flash-only (cache already populated in the
+                            // per-position quantize pass); no whitening.
+                            KvLayer::Mxfp4 { k_packed, v_packed } => {
+                                sub_whiten = false;
+                                if !crate::accel::try_flash_attn_prefill_gpu_mxfp4(
+                                    &hoist_qrows[..nb * d_q], k_packed, v_packed,
+                                    &mut hoist_attn_out[..nb * d_q],
+                                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, nb,
+                                ) {
+                                    rustllama_kernels_cpu::mxfp_kv::gqa_attention_flash_prefill_mxfp4(
+                                        &hoist_qrows[..nb * d_q], k_packed, v_packed,
+                                        &mut hoist_attn_out[..nb * d_q],
+                                        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, nb,
+                                    );
+                                }
+                            }
+                            KvLayer::Mxfp6 { k_packed, v_packed } => {
+                                sub_whiten = false;
+                                if !crate::accel::try_flash_attn_prefill_gpu_mxfp6(
+                                    &hoist_qrows[..nb * d_q], k_packed, v_packed,
+                                    &mut hoist_attn_out[..nb * d_q],
+                                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, nb,
+                                ) {
+                                    rustllama_kernels_cpu::mxfp_kv::gqa_attention_flash_prefill_mxfp6(
+                                        &hoist_qrows[..nb * d_q], k_packed, v_packed,
+                                        &mut hoist_attn_out[..nb * d_q],
+                                        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, nb,
+                                    );
+                                }
+                            }
+                            KvLayer::Mxfp8 { k_packed, v_packed } => {
+                                sub_whiten = false;
+                                if !crate::accel::try_flash_attn_prefill_gpu_mxfp8(
+                                    &hoist_qrows[..nb * d_q], k_packed, v_packed,
+                                    &mut hoist_attn_out[..nb * d_q],
+                                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, nb,
+                                ) {
+                                    rustllama_kernels_cpu::mxfp_kv::gqa_attention_flash_prefill_mxfp8(
+                                        &hoist_qrows[..nb * d_q], k_packed, v_packed,
+                                        &mut hoist_attn_out[..nb * d_q],
+                                        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, nb,
                                     );
                                 }
                             }
@@ -7139,6 +7561,21 @@ impl LlamaModel {
                     }
                     } // end else: CPU NVFP4 attention (GPU declined)
                 }
+                KvLayer::Mxfp4 { k_packed, v_packed } => mxfp_kv_decode(
+                    KvDtype::Mxfp4, &q_buf, &k_buf, &v_buf, k_packed, v_packed, &mut attn_out,
+                    layer_idx, cur_pos, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                    cfg.n_layers,
+                ),
+                KvLayer::Mxfp6 { k_packed, v_packed } => mxfp_kv_decode(
+                    KvDtype::Mxfp6, &q_buf, &k_buf, &v_buf, k_packed, v_packed, &mut attn_out,
+                    layer_idx, cur_pos, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                    cfg.n_layers,
+                ),
+                KvLayer::Mxfp8 { k_packed, v_packed } => mxfp_kv_decode(
+                    KvDtype::Mxfp8, &q_buf, &k_buf, &v_buf, k_packed, v_packed, &mut attn_out,
+                    layer_idx, cur_pos, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                    cfg.n_layers,
+                ),
                 KvLayer::Q4_0 { k_q, v_q } => {
                     use rustllama_kernels_cpu::q4_0_kv;
                     use rustllama_kernels_cpu::hadamard::whiten_chunks_inplace;

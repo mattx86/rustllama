@@ -4044,6 +4044,11 @@ fn spec_prefill_and_forward(
             rustllama_models::llama_arch::KvDtype::Tq(_) => Some(BatchedSpec::Tq),
             rustllama_models::llama_arch::KvDtype::Nvfp4 => Some(BatchedSpec::Nvfp4),
             rustllama_models::llama_arch::KvDtype::Q4_0 => Some(BatchedSpec::Q4_0),
+            // MXFP KV has no batched-speculation fast path yet; fall to
+            // the serial-loop path (None) — correct, just unaccelerated.
+            rustllama_models::llama_arch::KvDtype::Mxfp4
+            | rustllama_models::llama_arch::KvDtype::Mxfp6
+            | rustllama_models::llama_arch::KvDtype::Mxfp8 => None,
         },
         // Paged backend: serial fallback. Paged is F32-only in v1
         // (per the kv_backend gate); the F32 batched path can't be

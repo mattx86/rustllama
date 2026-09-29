@@ -4410,6 +4410,9 @@ async fn metrics(State(state): State<AppState>) -> Json<MetricsSnapshot> {
             rustllama_engine::KvDtype::Tq(bits) => format!("tq{bits}"),
             rustllama_engine::KvDtype::Nvfp4 => "nvfp4".to_string(),
             rustllama_engine::KvDtype::Q4_0 => "q4_0".to_string(),
+            rustllama_engine::KvDtype::Mxfp4 => "mxfp4".to_string(),
+            rustllama_engine::KvDtype::Mxfp6 => "mxfp6".to_string(),
+            rustllama_engine::KvDtype::Mxfp8 => "mxfp8".to_string(),
         }
     });
     let mem = rustllama_runtime::memory_info();

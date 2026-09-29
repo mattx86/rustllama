@@ -4912,13 +4912,16 @@ enum QuantKv {
     Q8_0,
     Nvfp4,
     Tq { bits: u8 },
+    Mxfp4,
+    Mxfp6,
+    Mxfp8,
 }
 
 impl QuantKv {
     /// Packed bytes per KV row for this format — must match the
     /// engine host slab's `bytes_per_row` exactly.
     fn bytes_per_row(self, head_dim: usize) -> usize {
-        use rustllama_kernels_cpu::{nvfp4, q4_0_kv, turboquant};
+        use rustllama_kernels_cpu::{mxfp, nvfp4, q4_0_kv, turboquant};
         match self {
             QuantKv::Q4_0 => (head_dim / q4_0_kv::Q4_0_BLOCK_ELEMS) * q4_0_kv::Q4_0_BLOCK_BYTES,
             // Q8_0 KV is stored as a raw i8 slab (1 byte / element),
@@ -4926,6 +4929,15 @@ impl QuantKv {
             QuantKv::Q8_0 => head_dim,
             QuantKv::Nvfp4 => (head_dim / nvfp4::NVFP4_BLOCK_ELEMS) * nvfp4::NVFP4_BLOCK_BYTES,
             QuantKv::Tq { bits } => turboquant::bytes_per_block(head_dim, bits),
+            QuantKv::Mxfp4 => {
+                (head_dim / mxfp::MXFP4_BLOCK_ELEMS) * mxfp::MXFP4_BLOCK_BYTES
+            }
+            QuantKv::Mxfp6 => {
+                (head_dim / mxfp::MXFP6_BLOCK_ELEMS) * mxfp::MXFP6_BLOCK_BYTES
+            }
+            QuantKv::Mxfp8 => {
+                (head_dim / mxfp::MXFP8_BLOCK_ELEMS) * mxfp::MXFP8_BLOCK_BYTES
+            }
         }
     }
 
@@ -5034,6 +5046,7 @@ fn try_flash_attn_decode_usm_quant(
         QuantKv::Q8_0 => true,
         QuantKv::Nvfp4 => hd % 16 == 0,
         QuantKv::Tq { bits } => matches!(bits, 1 | 2 | 4 | 8) && hd.is_power_of_two(),
+        QuantKv::Mxfp4 | QuantKv::Mxfp6 | QuantKv::Mxfp8 => hd % 32 == 0,
     };
     if !ok_shape {
         return false;
@@ -5215,6 +5228,40 @@ fn try_flash_attn_decode_usm_quant(
                     }
                 }
             }
+            QuantKv::Mxfp4 | QuantKv::Mxfp6 | QuantKv::Mxfp8 => {
+                use rustllama_kernels_cpu::{mxfp, mxfp_kv};
+                // Per-format block bytes + block quantizer; the (head,
+                // block) row loop is shared. Scale is embedded per block,
+                // so there is no side scales buffer (like NVFP4).
+                let (blk_bytes, qfn): (usize, fn(&[f32], &mut [u8])) = match fmt {
+                    QuantKv::Mxfp4 => (mxfp::MXFP4_BLOCK_BYTES, mxfp_kv::quantize_block_mxfp4),
+                    QuantKv::Mxfp6 => (mxfp::MXFP6_BLOCK_BYTES, mxfp_kv::quantize_block_mxfp6),
+                    _ => (mxfp::MXFP8_BLOCK_BYTES, mxfp_kv::quantize_block_mxfp8),
+                };
+                let blocks_per_row = hd / 32;
+                {
+                    let kb = ctx.q_k_packed[layer_idx].as_mut().expect("k mirror").as_mut_slice();
+                    for h in 0..n_kv {
+                        let p = (h * mc + posu) * bytes_per_row;
+                        for b in 0..blocks_per_row {
+                            let eo = h * hd + b * 32;
+                            let bd = p + b * blk_bytes;
+                            qfn(&k_row[eo..eo + 32], &mut kb[bd..bd + blk_bytes]);
+                        }
+                    }
+                }
+                {
+                    let vb = ctx.q_v_packed[layer_idx].as_mut().expect("v mirror").as_mut_slice();
+                    for h in 0..n_kv {
+                        let p = (h * mc + posu) * bytes_per_row;
+                        for b in 0..blocks_per_row {
+                            let eo = h * hd + b * 32;
+                            let bd = p + b * blk_bytes;
+                            qfn(&v_row[eo..eo + 32], &mut vb[bd..bd + blk_bytes]);
+                        }
+                    }
+                }
+            }
         }
 
         // A contiguous append extends the valid range; an in-place
@@ -5263,6 +5310,18 @@ fn try_flash_attn_decode_usm_quant(
                 ),
                 QuantKv::Tq { bits } => sk::flash_attn_decode_tq_usm_raw(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                ),
+                QuantKv::Mxfp4 => sk::flash_attn_decode_mxfp4_usm_raw(
+                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                ),
+                QuantKv::Mxfp6 => sk::flash_attn_decode_mxfp6_usm_raw(
+                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                ),
+                QuantKv::Mxfp8 => sk::flash_attn_decode_mxfp8_usm_raw(
+                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
                 ),
             }
@@ -5682,6 +5741,23 @@ fn cuda_quantize_row_into_stage(
                 );
             }
         }
+        QuantKv::Mxfp4 | QuantKv::Mxfp6 | QuantKv::Mxfp8 => {
+            use rustllama_kernels_cpu::{mxfp, mxfp_kv};
+            let (blk_bytes, qfn): (usize, fn(&[f32], &mut [u8])) = match fmt {
+                QuantKv::Mxfp4 => (mxfp::MXFP4_BLOCK_BYTES, mxfp_kv::quantize_block_mxfp4),
+                QuantKv::Mxfp6 => (mxfp::MXFP6_BLOCK_BYTES, mxfp_kv::quantize_block_mxfp6),
+                _ => (mxfp::MXFP8_BLOCK_BYTES, mxfp_kv::quantize_block_mxfp8),
+            };
+            let blocks_per_row = hd / 32;
+            for h in 0..n_kv {
+                let p = h * bytes_per_row;
+                for b in 0..blocks_per_row {
+                    let eo = h * hd + b * 32;
+                    let bd = p + b * blk_bytes;
+                    qfn(&src_row[eo..eo + 32], &mut stage_row[bd..bd + blk_bytes]);
+                }
+            }
+        }
     }
 }
 
@@ -5952,6 +6028,7 @@ fn try_flash_attn_decode_cuda_quant(
         QuantKv::Q8_0 => true,
         QuantKv::Nvfp4 => hd % 16 == 0,
         QuantKv::Tq { bits } => matches!(bits, 1 | 2 | 4 | 8) && hd.is_power_of_two(),
+        QuantKv::Mxfp4 | QuantKv::Mxfp6 | QuantKv::Mxfp8 => hd % 32 == 0,
     };
     if !ok_shape {
         return false;
@@ -6116,6 +6193,18 @@ fn try_flash_attn_decode_cuda_quant(
                 ),
                 QuantKv::Tq { bits } => ck::flash_attn_decode_tq(
                     stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
+                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                ),
+                QuantKv::Mxfp4 => ck::flash_attn_decode_mxfp4(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                ),
+                QuantKv::Mxfp6 => ck::flash_attn_decode_mxfp6(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                ),
+                QuantKv::Mxfp8 => ck::flash_attn_decode_mxfp8(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as usize, n_kv, hd, mc, kv_len as usize,
                 ),
             }
@@ -6354,6 +6443,44 @@ pub fn try_flash_attn_decode_gpu_nvfp4(
         n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
     )
 }
+
+/// MXFP4/6/8 KV flash-attention decode: CUDA → SYCL → (caller's CPU).
+/// These call the generic quant dispatch directly (no per-format
+/// intermediate wrappers), same as the prefill combinators below.
+macro_rules! mxfp_decode_gpu_combinator {
+    ($name:ident, $kv:expr) => {
+        #[allow(clippy::too_many_arguments)]
+        pub fn $name(
+            q: &[f32],
+            k_row: &[f32],
+            v_row: &[f32],
+            out: &mut [f32],
+            layer_idx: usize,
+            pos: u32,
+            n_heads: u32,
+            n_kv_heads: u32,
+            head_dim: u32,
+            max_ctx: u32,
+            n_layers: u32,
+        ) -> bool {
+            if cuda_active()
+                && try_flash_attn_decode_cuda_quant(
+                    $kv, q, k_row, v_row, out, layer_idx, pos,
+                    n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+                )
+            {
+                return true;
+            }
+            try_flash_attn_decode_usm_quant(
+                $kv, q, k_row, v_row, out, layer_idx, pos,
+                n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            )
+        }
+    };
+}
+mxfp_decode_gpu_combinator!(try_flash_attn_decode_gpu_mxfp4, QuantKv::Mxfp4);
+mxfp_decode_gpu_combinator!(try_flash_attn_decode_gpu_mxfp6, QuantKv::Mxfp6);
+mxfp_decode_gpu_combinator!(try_flash_attn_decode_gpu_mxfp8, QuantKv::Mxfp8);
 
 /// TurboQuant KV flash-attention decode: CUDA → SYCL → (caller's CPU).
 #[allow(clippy::too_many_arguments)]
@@ -9448,6 +9575,7 @@ fn try_flash_attn_prefill_usm_quant(
         QuantKv::Q8_0 => true,
         QuantKv::Nvfp4 => head_dim % 16 == 0,
         QuantKv::Tq { bits } => matches!(bits, 1 | 2 | 4 | 8) && head_dim.is_power_of_two(),
+        QuantKv::Mxfp4 | QuantKv::Mxfp6 | QuantKv::Mxfp8 => head_dim % 32 == 0,
     };
     if !ok_shape {
         log_prefill_attn_skip_once("quant prefill block-shape constraint");
@@ -9541,6 +9669,21 @@ fn try_flash_attn_prefill_usm_quant(
                 ),
                 QuantKv::Tq { bits } => sk::flash_attn_prefill_tq_usm_raw(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
+                    n_heads as u32, n_kv_heads as u32, head_dim as u32,
+                    max_ctx as u32, kv_len_base as u32, n_new as u32,
+                ),
+                QuantKv::Mxfp4 => sk::flash_attn_prefill_mxfp4_usm_raw(
+                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads as u32, n_kv_heads as u32, head_dim as u32,
+                    max_ctx as u32, kv_len_base as u32, n_new as u32,
+                ),
+                QuantKv::Mxfp6 => sk::flash_attn_prefill_mxfp6_usm_raw(
+                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads as u32, n_kv_heads as u32, head_dim as u32,
+                    max_ctx as u32, kv_len_base as u32, n_new as u32,
+                ),
+                QuantKv::Mxfp8 => sk::flash_attn_prefill_mxfp8_usm_raw(
+                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as u32, n_kv_heads as u32, head_dim as u32,
                     max_ctx as u32, kv_len_base as u32, n_new as u32,
                 ),
@@ -9698,6 +9841,7 @@ fn try_flash_attn_prefill_cuda_quant(
         QuantKv::Q8_0 => true,
         QuantKv::Nvfp4 => head_dim % 16 == 0,
         QuantKv::Tq { bits } => matches!(bits, 1 | 2 | 4 | 8) && head_dim.is_power_of_two(),
+        QuantKv::Mxfp4 | QuantKv::Mxfp6 | QuantKv::Mxfp8 => head_dim % 32 == 0,
     };
     if !ok_shape {
         return false;
@@ -9812,6 +9956,18 @@ fn try_flash_attn_prefill_cuda_quant(
                 ),
                 QuantKv::Tq { bits } => ck::flash_attn_prefill_tq(
                     stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                ),
+                QuantKv::Mxfp4 => ck::flash_attn_prefill_mxfp4(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                ),
+                QuantKv::Mxfp6 => ck::flash_attn_prefill_mxfp6(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                ),
+                QuantKv::Mxfp8 => ck::flash_attn_prefill_mxfp8(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
                 ),
             }
@@ -9953,6 +10109,41 @@ pub fn try_flash_attn_prefill_gpu_nvfp4(
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
     )
 }
+
+/// MXFP4/6/8 KV flash-attention prefill: CUDA → SYCL → (caller's CPU).
+macro_rules! mxfp_prefill_gpu_combinator {
+    ($name:ident, $kv:expr) => {
+        #[allow(clippy::too_many_arguments)]
+        pub fn $name(
+            q: &[f32],
+            k_packed: &[u8],
+            v_packed: &[u8],
+            out: &mut [f32],
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            max_ctx: usize,
+            kv_len_base: usize,
+            n_new: usize,
+        ) -> bool {
+            if cuda_active()
+                && try_flash_attn_prefill_cuda_quant(
+                    $kv, q, k_packed, v_packed, &[], &[], out,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                )
+            {
+                return true;
+            }
+            try_flash_attn_prefill_usm_quant(
+                $kv, q, k_packed, v_packed, &[], &[], out,
+                n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            )
+        }
+    };
+}
+mxfp_prefill_gpu_combinator!(try_flash_attn_prefill_gpu_mxfp4, QuantKv::Mxfp4);
+mxfp_prefill_gpu_combinator!(try_flash_attn_prefill_gpu_mxfp6, QuantKv::Mxfp6);
+mxfp_prefill_gpu_combinator!(try_flash_attn_prefill_gpu_mxfp8, QuantKv::Mxfp8);
 
 /// TurboQuant KV flash-attention prefill: CUDA → SYCL → (caller's CPU).
 #[allow(clippy::too_many_arguments)]

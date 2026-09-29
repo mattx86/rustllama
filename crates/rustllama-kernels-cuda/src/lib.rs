@@ -285,6 +285,83 @@ extern "C" {
         kv_len_base: c_int,
         n_new: c_int,
     ) -> c_int;
+    // MXFP4/6/8-KV flash: 32-elem blocks + trailing E8M0 scale byte
+    // (bytes_per_row = (head_dim/32)*{17,25,33}); mirror the NVFP4 entries.
+    fn rsl_cuda_flash_attn_decode_mxfp4(
+        s: *mut RslCudaStreamRaw,
+        q: *const f32,
+        k_packed: *const c_void,
+        v_packed: *const c_void,
+        out: *mut f32,
+        n_heads: c_int,
+        n_kv_heads: c_int,
+        head_dim: c_int,
+        max_ctx: c_int,
+        kv_len: c_int,
+    ) -> c_int;
+    fn rsl_cuda_flash_attn_prefill_mxfp4(
+        s: *mut RslCudaStreamRaw,
+        q: *const f32,
+        k_packed: *const c_void,
+        v_packed: *const c_void,
+        out: *mut f32,
+        n_heads: c_int,
+        n_kv_heads: c_int,
+        head_dim: c_int,
+        max_ctx: c_int,
+        kv_len_base: c_int,
+        n_new: c_int,
+    ) -> c_int;
+    fn rsl_cuda_flash_attn_decode_mxfp6(
+        s: *mut RslCudaStreamRaw,
+        q: *const f32,
+        k_packed: *const c_void,
+        v_packed: *const c_void,
+        out: *mut f32,
+        n_heads: c_int,
+        n_kv_heads: c_int,
+        head_dim: c_int,
+        max_ctx: c_int,
+        kv_len: c_int,
+    ) -> c_int;
+    fn rsl_cuda_flash_attn_prefill_mxfp6(
+        s: *mut RslCudaStreamRaw,
+        q: *const f32,
+        k_packed: *const c_void,
+        v_packed: *const c_void,
+        out: *mut f32,
+        n_heads: c_int,
+        n_kv_heads: c_int,
+        head_dim: c_int,
+        max_ctx: c_int,
+        kv_len_base: c_int,
+        n_new: c_int,
+    ) -> c_int;
+    fn rsl_cuda_flash_attn_decode_mxfp8(
+        s: *mut RslCudaStreamRaw,
+        q: *const f32,
+        k_packed: *const c_void,
+        v_packed: *const c_void,
+        out: *mut f32,
+        n_heads: c_int,
+        n_kv_heads: c_int,
+        head_dim: c_int,
+        max_ctx: c_int,
+        kv_len: c_int,
+    ) -> c_int;
+    fn rsl_cuda_flash_attn_prefill_mxfp8(
+        s: *mut RslCudaStreamRaw,
+        q: *const f32,
+        k_packed: *const c_void,
+        v_packed: *const c_void,
+        out: *mut f32,
+        n_heads: c_int,
+        n_kv_heads: c_int,
+        head_dim: c_int,
+        max_ctx: c_int,
+        kv_len_base: c_int,
+        n_new: c_int,
+    ) -> c_int;
     fn rsl_cuda_flash_attn_decode_tq(
         s: *mut RslCudaStreamRaw,
         q: *const f32,
@@ -1189,6 +1266,165 @@ pub unsafe fn flash_attn_prefill_nvfp4(
     n_new: usize,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_prefill_nvfp4(
+        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
+        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
+        kv_len_base as c_int, n_new as c_int,
+    );
+    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+}
+
+/// Quantized-KV FlashAttention decode for an MXFP4 KV cache. Layout as
+/// [`flash_attn_decode_nvfp4`] but `bytes_per_row = (head_dim/32)*17`
+/// (32 elems/block: 16 E2M1-nibble bytes + trailing E8M0 scale).
+///
+/// SAFETY: device pointers as above; `head_dim % 32 == 0`, `head_dim <= 256`.
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_decode_mxfp4(
+    stream: &CudaStream,
+    q: *const f32,
+    k_packed: *const c_void,
+    v_packed: *const c_void,
+    out: *mut f32,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len: usize,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_flash_attn_decode_mxfp4(
+        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
+        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int, kv_len as c_int,
+    );
+    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+}
+
+/// Quantized-KV FlashAttention prefill for an MXFP4 KV cache.
+///
+/// SAFETY: device pointers as above; `head_dim % 32 == 0`, `head_dim <= 256`,
+/// `kv_len_base + n_new <= max_ctx`.
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_prefill_mxfp4(
+    stream: &CudaStream,
+    q: *const f32,
+    k_packed: *const c_void,
+    v_packed: *const c_void,
+    out: *mut f32,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_flash_attn_prefill_mxfp4(
+        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
+        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
+        kv_len_base as c_int, n_new as c_int,
+    );
+    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+}
+
+/// Quantized-KV FlashAttention decode for an MXFP6 KV cache. Layout as
+/// [`flash_attn_decode_nvfp4`] but `bytes_per_row = (head_dim/32)*25`
+/// (32 elems/block: 24-byte LE bitstream of 6-bit E3M2 codes + E8M0 scale).
+///
+/// SAFETY: device pointers as above; `head_dim % 32 == 0`, `head_dim <= 256`.
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_decode_mxfp6(
+    stream: &CudaStream,
+    q: *const f32,
+    k_packed: *const c_void,
+    v_packed: *const c_void,
+    out: *mut f32,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len: usize,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_flash_attn_decode_mxfp6(
+        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
+        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int, kv_len as c_int,
+    );
+    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+}
+
+/// Quantized-KV FlashAttention prefill for an MXFP6 KV cache.
+///
+/// SAFETY: device pointers as above; `head_dim % 32 == 0`, `head_dim <= 256`,
+/// `kv_len_base + n_new <= max_ctx`.
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_prefill_mxfp6(
+    stream: &CudaStream,
+    q: *const f32,
+    k_packed: *const c_void,
+    v_packed: *const c_void,
+    out: *mut f32,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_flash_attn_prefill_mxfp6(
+        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
+        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
+        kv_len_base as c_int, n_new as c_int,
+    );
+    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+}
+
+/// Quantized-KV FlashAttention decode for an MXFP8 KV cache. Layout as
+/// [`flash_attn_decode_nvfp4`] but `bytes_per_row = (head_dim/32)*33`
+/// (32 elems/block: 32 E4M3 bytes + trailing E8M0 scale).
+///
+/// SAFETY: device pointers as above; `head_dim % 32 == 0`, `head_dim <= 256`.
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_decode_mxfp8(
+    stream: &CudaStream,
+    q: *const f32,
+    k_packed: *const c_void,
+    v_packed: *const c_void,
+    out: *mut f32,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len: usize,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_flash_attn_decode_mxfp8(
+        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
+        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int, kv_len as c_int,
+    );
+    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+}
+
+/// Quantized-KV FlashAttention prefill for an MXFP8 KV cache.
+///
+/// SAFETY: device pointers as above; `head_dim % 32 == 0`, `head_dim <= 256`,
+/// `kv_len_base + n_new <= max_ctx`.
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_prefill_mxfp8(
+    stream: &CudaStream,
+    q: *const f32,
+    k_packed: *const c_void,
+    v_packed: *const c_void,
+    out: *mut f32,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_flash_attn_prefill_mxfp8(
         stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
         n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
         kv_len_base as c_int, n_new as c_int,

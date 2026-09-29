@@ -211,6 +211,38 @@ int rsl_cuda_flash_attn_prefill_nvfp4(rsl_cuda_stream *s, const float *q,
                                       float *out, int n_heads, int n_kv_heads,
                                       int head_dim, int max_ctx,
                                       int kv_len_base, int n_new);
+/* MXFP4/6/8-KV FlashAttention: F32 Q / F32 out, packed K/V dequantized on
+ * the fly. Each format is 32 elems/block with a trailing E8M0 scale byte
+ * (bytes_per_row = (head_dim/32)*{17,25,33} for MXFP4/6/8); head_dim % 32
+ * == 0 and head_dim <= 256 (shared shape guard). Mirror the NVFP4 entries;
+ * only the per-block byte layout + row-dequant differ. Return 0 on success. */
+int rsl_cuda_flash_attn_decode_mxfp4(rsl_cuda_stream *s, const float *q,
+                                     const void *k_packed, const void *v_packed,
+                                     float *out, int n_heads, int n_kv_heads,
+                                     int head_dim, int max_ctx, int kv_len);
+int rsl_cuda_flash_attn_prefill_mxfp4(rsl_cuda_stream *s, const float *q,
+                                      const void *k_packed, const void *v_packed,
+                                      float *out, int n_heads, int n_kv_heads,
+                                      int head_dim, int max_ctx,
+                                      int kv_len_base, int n_new);
+int rsl_cuda_flash_attn_decode_mxfp6(rsl_cuda_stream *s, const float *q,
+                                     const void *k_packed, const void *v_packed,
+                                     float *out, int n_heads, int n_kv_heads,
+                                     int head_dim, int max_ctx, int kv_len);
+int rsl_cuda_flash_attn_prefill_mxfp6(rsl_cuda_stream *s, const float *q,
+                                      const void *k_packed, const void *v_packed,
+                                      float *out, int n_heads, int n_kv_heads,
+                                      int head_dim, int max_ctx,
+                                      int kv_len_base, int n_new);
+int rsl_cuda_flash_attn_decode_mxfp8(rsl_cuda_stream *s, const float *q,
+                                     const void *k_packed, const void *v_packed,
+                                     float *out, int n_heads, int n_kv_heads,
+                                     int head_dim, int max_ctx, int kv_len);
+int rsl_cuda_flash_attn_prefill_mxfp8(rsl_cuda_stream *s, const float *q,
+                                      const void *k_packed, const void *v_packed,
+                                      float *out, int n_heads, int n_kv_heads,
+                                      int head_dim, int max_ctx,
+                                      int kv_len_base, int n_new);
 int rsl_cuda_flash_attn_decode_tq(rsl_cuda_stream *s, const float *q,
                                   const void *k_packed, const void *v_packed,
                                   const float *k_scales, const float *v_scales,

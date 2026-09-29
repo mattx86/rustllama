@@ -10,22 +10,22 @@
 //! parity harness checks all three backends against this reference.
 
 /// E2M1 4-bit codebook (index = nibble). Shared with NVFP4.
-const E2M1_CODEBOOK: [f32; 16] = [
+pub(crate) const E2M1_CODEBOOK: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
 
-const MXFP4_BLOCK_ELEMS: usize = 32;
-const MXFP4_BLOCK_BYTES: usize = 17;
-const MXFP6_BLOCK_ELEMS: usize = 32;
-const MXFP6_BLOCK_BYTES: usize = 25;
-const MXFP6_CODE_BYTES: usize = 24;
-const MXFP8_BLOCK_ELEMS: usize = 32;
-const MXFP8_BLOCK_BYTES: usize = 33;
+pub const MXFP4_BLOCK_ELEMS: usize = 32;
+pub const MXFP4_BLOCK_BYTES: usize = 17;
+pub const MXFP6_BLOCK_ELEMS: usize = 32;
+pub const MXFP6_BLOCK_BYTES: usize = 25;
+pub(crate) const MXFP6_CODE_BYTES: usize = 24;
+pub const MXFP8_BLOCK_ELEMS: usize = 32;
+pub const MXFP8_BLOCK_BYTES: usize = 33;
 
 /// OCP E8M0 shared-scale byte → f32: `2^(byte-127)`, `0xFF` = NaN,
 /// `0x00` = `2^-127`. A pure power of two.
 #[inline]
-fn e8m0_to_f32(b: u8) -> f32 {
+pub(crate) fn e8m0_to_f32(b: u8) -> f32 {
     if b == 0xFF {
         return f32::NAN;
     }
@@ -35,7 +35,7 @@ fn e8m0_to_f32(b: u8) -> f32 {
 /// OCP E3M2 (MXFP6 element) 6-bit code → f32. 1 sign / 3 exp (bias 3) /
 /// 2 mantissa; no Inf/NaN.
 #[inline]
-fn e3m2_to_f32(c: u8) -> f32 {
+pub(crate) fn e3m2_to_f32(c: u8) -> f32 {
     let sign = (c & 0x20) != 0;
     let exp = (c >> 2) & 0x07;
     let mant = c & 0x03;
@@ -54,7 +54,7 @@ fn e3m2_to_f32(c: u8) -> f32 {
 /// FP8 E4M3 byte → f32. 1 sign / 4 exp (bias 7) / 3 mantissa; NaN at
 /// `0x7F`/`0xFF`.
 #[inline]
-fn e4m3_to_f32(b: u8) -> f32 {
+pub(crate) fn e4m3_to_f32(b: u8) -> f32 {
     let sign = (b & 0x80) != 0;
     let exp = (b >> 3) & 0x0F;
     let mant = b & 0x07;

@@ -332,6 +332,85 @@ mod imp {
             kv_len_base: c_int,
             n_new: c_int,
         );
+        // OCP Microscaling (MX) KV FlashAttention: MXFP4/6/8. Same
+        // signatures as the NVFP4 pair above (block layout differs on the
+        // C++ side only: 32-elem blocks, bytes_per_row = (head_dim/32)*
+        // {17,25,33}).
+        pub(super) fn rsl_flash_attn_decode_mxfp4_usm(
+            s: *mut rsl_stream,
+            q_usm: *const f32,
+            k_packed_usm: *const u8,
+            v_packed_usm: *const u8,
+            out_usm: *mut f32,
+            n_heads: c_int,
+            n_kv_heads: c_int,
+            head_dim: c_int,
+            max_ctx: c_int,
+            kv_len: c_int,
+        );
+        pub(super) fn rsl_flash_attn_prefill_mxfp4_usm(
+            s: *mut rsl_stream,
+            q_usm: *const f32,
+            k_packed_usm: *const u8,
+            v_packed_usm: *const u8,
+            out_usm: *mut f32,
+            n_heads: c_int,
+            n_kv_heads: c_int,
+            head_dim: c_int,
+            max_ctx: c_int,
+            kv_len_base: c_int,
+            n_new: c_int,
+        );
+        pub(super) fn rsl_flash_attn_decode_mxfp6_usm(
+            s: *mut rsl_stream,
+            q_usm: *const f32,
+            k_packed_usm: *const u8,
+            v_packed_usm: *const u8,
+            out_usm: *mut f32,
+            n_heads: c_int,
+            n_kv_heads: c_int,
+            head_dim: c_int,
+            max_ctx: c_int,
+            kv_len: c_int,
+        );
+        pub(super) fn rsl_flash_attn_prefill_mxfp6_usm(
+            s: *mut rsl_stream,
+            q_usm: *const f32,
+            k_packed_usm: *const u8,
+            v_packed_usm: *const u8,
+            out_usm: *mut f32,
+            n_heads: c_int,
+            n_kv_heads: c_int,
+            head_dim: c_int,
+            max_ctx: c_int,
+            kv_len_base: c_int,
+            n_new: c_int,
+        );
+        pub(super) fn rsl_flash_attn_decode_mxfp8_usm(
+            s: *mut rsl_stream,
+            q_usm: *const f32,
+            k_packed_usm: *const u8,
+            v_packed_usm: *const u8,
+            out_usm: *mut f32,
+            n_heads: c_int,
+            n_kv_heads: c_int,
+            head_dim: c_int,
+            max_ctx: c_int,
+            kv_len: c_int,
+        );
+        pub(super) fn rsl_flash_attn_prefill_mxfp8_usm(
+            s: *mut rsl_stream,
+            q_usm: *const f32,
+            k_packed_usm: *const u8,
+            v_packed_usm: *const u8,
+            out_usm: *mut f32,
+            n_heads: c_int,
+            n_kv_heads: c_int,
+            head_dim: c_int,
+            max_ctx: c_int,
+            kv_len_base: c_int,
+            n_new: c_int,
+        );
         pub(super) fn rsl_flash_attn_decode_tq_usm(
             s: *mut rsl_stream,
             q_usm: *const f32,
@@ -2132,6 +2211,202 @@ mod imp {
         // SAFETY: as above.
         unsafe {
             rsl_flash_attn_prefill_nvfp4_usm(
+                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
+                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
+                max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
+            );
+        }
+        consume_error()
+    }
+
+    // ---- OCP Microscaling (MX) KV FlashAttention: MXFP4 / MXFP6 / MXFP8 ----
+    // Identical shape validation + call shape to the NVFP4 wrappers above;
+    // the C++ kernel picks up the format's block byte count internally.
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_decode_mxfp4_usm(
+        stream: &SyclStream,
+        q_usm: *const f32,
+        k_packed_usm: *const u8,
+        v_packed_usm: *const u8,
+        out_usm: *mut f32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_ctx: u32,
+        kv_len: u32,
+    ) -> Result<()> {
+        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_decode_mxfp4_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
+            )));
+        }
+        // SAFETY: as above.
+        unsafe {
+            rsl_flash_attn_decode_mxfp4_usm(
+                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
+                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
+                max_ctx as c_int, kv_len as c_int,
+            );
+        }
+        consume_error()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_prefill_mxfp4_usm(
+        stream: &SyclStream,
+        q_usm: *const f32,
+        k_packed_usm: *const u8,
+        v_packed_usm: *const u8,
+        out_usm: *mut f32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_ctx: u32,
+        kv_len_base: u32,
+        n_new: u32,
+    ) -> Result<()> {
+        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_mxfp4_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
+            )));
+        }
+        if kv_len_base.saturating_add(n_new) > max_ctx {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_mxfp4_usm: kv_len_base={kv_len_base} + n_new={n_new} > max_ctx={max_ctx}"
+            )));
+        }
+        // SAFETY: as above.
+        unsafe {
+            rsl_flash_attn_prefill_mxfp4_usm(
+                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
+                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
+                max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
+            );
+        }
+        consume_error()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_decode_mxfp6_usm(
+        stream: &SyclStream,
+        q_usm: *const f32,
+        k_packed_usm: *const u8,
+        v_packed_usm: *const u8,
+        out_usm: *mut f32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_ctx: u32,
+        kv_len: u32,
+    ) -> Result<()> {
+        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_decode_mxfp6_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
+            )));
+        }
+        // SAFETY: as above.
+        unsafe {
+            rsl_flash_attn_decode_mxfp6_usm(
+                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
+                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
+                max_ctx as c_int, kv_len as c_int,
+            );
+        }
+        consume_error()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_prefill_mxfp6_usm(
+        stream: &SyclStream,
+        q_usm: *const f32,
+        k_packed_usm: *const u8,
+        v_packed_usm: *const u8,
+        out_usm: *mut f32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_ctx: u32,
+        kv_len_base: u32,
+        n_new: u32,
+    ) -> Result<()> {
+        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_mxfp6_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
+            )));
+        }
+        if kv_len_base.saturating_add(n_new) > max_ctx {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_mxfp6_usm: kv_len_base={kv_len_base} + n_new={n_new} > max_ctx={max_ctx}"
+            )));
+        }
+        // SAFETY: as above.
+        unsafe {
+            rsl_flash_attn_prefill_mxfp6_usm(
+                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
+                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
+                max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
+            );
+        }
+        consume_error()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_decode_mxfp8_usm(
+        stream: &SyclStream,
+        q_usm: *const f32,
+        k_packed_usm: *const u8,
+        v_packed_usm: *const u8,
+        out_usm: *mut f32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_ctx: u32,
+        kv_len: u32,
+    ) -> Result<()> {
+        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_decode_mxfp8_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
+            )));
+        }
+        // SAFETY: as above.
+        unsafe {
+            rsl_flash_attn_decode_mxfp8_usm(
+                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
+                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
+                max_ctx as c_int, kv_len as c_int,
+            );
+        }
+        consume_error()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_prefill_mxfp8_usm(
+        stream: &SyclStream,
+        q_usm: *const f32,
+        k_packed_usm: *const u8,
+        v_packed_usm: *const u8,
+        out_usm: *mut f32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_ctx: u32,
+        kv_len_base: u32,
+        n_new: u32,
+    ) -> Result<()> {
+        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_mxfp8_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
+            )));
+        }
+        if kv_len_base.saturating_add(n_new) > max_ctx {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_mxfp8_usm: kv_len_base={kv_len_base} + n_new={n_new} > max_ctx={max_ctx}"
+            )));
+        }
+        // SAFETY: as above.
+        unsafe {
+            rsl_flash_attn_prefill_mxfp8_usm(
                 stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
                 n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
                 max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
@@ -7512,6 +7787,153 @@ pub unsafe fn flash_attn_prefill_nvfp4_usm_raw(
     n_new: u32,
 ) -> Result<()> {
     imp::flash_attn_prefill_nvfp4_usm(
+        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+    )
+}
+
+/// Raw-pointer quantized-KV FlashAttention decode (MXFP4 KV cache).
+/// `bytes_per_row = (head_dim/32)*17`.
+///
+/// # Safety
+/// USM pointers as above; `head_dim % 32 == 0`, `head_dim <= 256`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_decode_mxfp4_usm_raw(
+    stream: &SyclStream,
+    q_usm: *const f32,
+    k_packed_usm: *const u8,
+    v_packed_usm: *const u8,
+    out_usm: *mut f32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    kv_len: u32,
+) -> Result<()> {
+    imp::flash_attn_decode_mxfp4_usm(
+        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+    )
+}
+
+/// Raw-pointer quantized-KV FlashAttention prefill (MXFP4 KV cache).
+///
+/// # Safety
+/// USM pointers as above; `head_dim % 32 == 0`, `head_dim <= 256`,
+/// `kv_len_base + n_new <= max_ctx`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_prefill_mxfp4_usm_raw(
+    stream: &SyclStream,
+    q_usm: *const f32,
+    k_packed_usm: *const u8,
+    v_packed_usm: *const u8,
+    out_usm: *mut f32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    kv_len_base: u32,
+    n_new: u32,
+) -> Result<()> {
+    imp::flash_attn_prefill_mxfp4_usm(
+        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+    )
+}
+
+/// Raw-pointer quantized-KV FlashAttention decode (MXFP6 KV cache).
+/// `bytes_per_row = (head_dim/32)*25`.
+///
+/// # Safety
+/// USM pointers as above; `head_dim % 32 == 0`, `head_dim <= 256`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_decode_mxfp6_usm_raw(
+    stream: &SyclStream,
+    q_usm: *const f32,
+    k_packed_usm: *const u8,
+    v_packed_usm: *const u8,
+    out_usm: *mut f32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    kv_len: u32,
+) -> Result<()> {
+    imp::flash_attn_decode_mxfp6_usm(
+        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+    )
+}
+
+/// Raw-pointer quantized-KV FlashAttention prefill (MXFP6 KV cache).
+///
+/// # Safety
+/// USM pointers as above; `head_dim % 32 == 0`, `head_dim <= 256`,
+/// `kv_len_base + n_new <= max_ctx`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_prefill_mxfp6_usm_raw(
+    stream: &SyclStream,
+    q_usm: *const f32,
+    k_packed_usm: *const u8,
+    v_packed_usm: *const u8,
+    out_usm: *mut f32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    kv_len_base: u32,
+    n_new: u32,
+) -> Result<()> {
+    imp::flash_attn_prefill_mxfp6_usm(
+        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+    )
+}
+
+/// Raw-pointer quantized-KV FlashAttention decode (MXFP8 KV cache).
+/// `bytes_per_row = (head_dim/32)*33`.
+///
+/// # Safety
+/// USM pointers as above; `head_dim % 32 == 0`, `head_dim <= 256`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_decode_mxfp8_usm_raw(
+    stream: &SyclStream,
+    q_usm: *const f32,
+    k_packed_usm: *const u8,
+    v_packed_usm: *const u8,
+    out_usm: *mut f32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    kv_len: u32,
+) -> Result<()> {
+    imp::flash_attn_decode_mxfp8_usm(
+        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+    )
+}
+
+/// Raw-pointer quantized-KV FlashAttention prefill (MXFP8 KV cache).
+///
+/// # Safety
+/// USM pointers as above; `head_dim % 32 == 0`, `head_dim <= 256`,
+/// `kv_len_base + n_new <= max_ctx`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_prefill_mxfp8_usm_raw(
+    stream: &SyclStream,
+    q_usm: *const f32,
+    k_packed_usm: *const u8,
+    v_packed_usm: *const u8,
+    out_usm: *mut f32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    kv_len_base: u32,
+    n_new: u32,
+) -> Result<()> {
+    imp::flash_attn_prefill_mxfp8_usm(
         stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
     )

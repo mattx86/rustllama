@@ -1736,6 +1736,70 @@ __device__ __forceinline__ void rsl_deq_nvfp4_row(const unsigned char *p,
     }
 }
 
+// Dequant one MXFP4 KV row (head_dim % 32 == 0). Block = 17 B / 32:
+// 16 nibble bytes packing two E2M1 codes each (low nibble -> elem 2j,
+// high -> elem 2j+1) + trailing E8M0 shared-scale byte (byte 16). Reuses
+// the module-level RSL_NVFP4_CODEBOOK (E2M1) + rsl_e8m0_to_f32; mirrors
+// the mxfp4_row_dot layout but dequants into `row` (no fused dot).
+__device__ __forceinline__ void rsl_deq_mxfp4_row(const unsigned char *p,
+                                                  float *row, int head_dim) {
+    int nb = head_dim / 32;
+    for (int b = 0; b < nb; ++b) {
+        const unsigned char *blk = p + b * 17;   // 17 B / 32-elem block
+        float scale = rsl_e8m0_to_f32(blk[16]);
+        int o = b * 32;
+        for (int j = 0; j < 16; ++j) {
+            unsigned char byte = blk[j];
+            int lo = byte & 0x0F;
+            int hi = (byte >> 4) & 0x0F;
+            row[o + j * 2]     = RSL_NVFP4_CODEBOOK[lo] * scale;
+            row[o + j * 2 + 1] = RSL_NVFP4_CODEBOOK[hi] * scale;
+        }
+    }
+}
+
+// Dequant one MXFP6 KV row (head_dim % 32 == 0). Block = 25 B / 32:
+// 24-byte LE bitstream of 32 six-bit E3M2 codes (element j at bit 6j, may
+// straddle a byte boundary) + trailing E8M0 scale byte (byte 24). Read a
+// 16-bit window { codes[byte_idx], codes[byte_idx+1] } and shift right by
+// (6j % 8); the high byte reads 0 once past the 24-byte code region (only
+// the final code touches it, and its top bits are unused).
+__device__ __forceinline__ void rsl_deq_mxfp6_row(const unsigned char *p,
+                                                  float *row, int head_dim) {
+    int nb = head_dim / 32;
+    for (int b = 0; b < nb; ++b) {
+        const unsigned char *blk = p + b * 25;   // 25 B / 32-elem block
+        const unsigned char *codes = blk;        // qs[0..24]
+        float scale = rsl_e8m0_to_f32(blk[24]);
+        int o = b * 32;
+        for (int j = 0; j < 32; ++j) {
+            int bitpos = j * 6;
+            int byte_idx = bitpos >> 3;           // bitpos / 8
+            int bit_off = bitpos & 7;             // bitpos % 8
+            unsigned int lo = codes[byte_idx];
+            unsigned int hi = (byte_idx + 1 < 24) ? (unsigned int)codes[byte_idx + 1] : 0u;
+            unsigned int word = lo | (hi << 8);
+            unsigned char code = (unsigned char)((word >> bit_off) & 0x3Fu);
+            row[o + j] = rsl_e3m2_to_f32(code) * scale;
+        }
+    }
+}
+
+// Dequant one MXFP8 KV row (head_dim % 32 == 0). Block = 33 B / 32:
+// 32 E4M3 bytes (one per element) + trailing E8M0 scale byte (byte 32).
+__device__ __forceinline__ void rsl_deq_mxfp8_row(const unsigned char *p,
+                                                  float *row, int head_dim) {
+    int nb = head_dim / 32;
+    for (int b = 0; b < nb; ++b) {
+        const unsigned char *blk = p + b * 33;   // 33 B / 32-elem block
+        float scale = rsl_e8m0_to_f32(blk[32]);
+        int o = b * 32;
+        for (int j = 0; j < 32; ++j) {
+            row[o + j] = rsl_e4m3_to_f32(blk[j]) * scale;
+        }
+    }
+}
+
 // Dequant one TurboQuant KV row: unpack signed codes (bits in
 // {1,2,4,8}), multiply by the row's separate scale, then inverse WHT
 // (forward butterfly + 1/N). Matches turboquant::dequantize_row's op
@@ -1923,6 +1987,228 @@ __global__ void flash_attn_prefill_nvfp4_kernel(const float *q,
     for (int i = 0; i < head_dim; ++i) out[out_off + i] *= inv_l;
 }
 
+// ---- MXFP4-KV decode / prefill (17 B / 32-elem block, E8M0 scale) ----
+__global__ void flash_attn_decode_mxfp4_kernel(const float *q,
+                                               const unsigned char *k_packed,
+                                               const unsigned char *v_packed,
+                                               float *out, int n_heads, int n_gqa,
+                                               int head_dim, int max_ctx,
+                                               int kv_len, float scale) {
+    int hh = blockIdx.x * blockDim.x + threadIdx.x;
+    if (hh >= n_heads) return;
+    int kv_h = hh / n_gqa;
+    int q_base = hh * head_dim;
+    int out_base = hh * head_dim;
+    int bytes_per_row = (head_dim / 32) * 17;
+    float row[RSL_FLASH_MAX_HEAD_DIM];
+    for (int i = 0; i < head_dim; ++i) out[out_base + i] = 0.f;
+    float m = -INFINITY, l = 0.f;
+    for (int t = 0; t < kv_len; ++t) {
+        const unsigned char *kp = k_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
+        rsl_deq_mxfp4_row(kp, row, head_dim);
+        float s_dot = 0.f;
+        for (int i = 0; i < head_dim; ++i) s_dot += q[q_base + i] * row[i];
+        s_dot *= scale;
+        float m_new = fmaxf(m, s_dot);
+        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
+        float p = expf(s_dot - m_new);
+        l = l * rescale + p;
+        const unsigned char *vp = v_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
+        rsl_deq_mxfp4_row(vp, row, head_dim);
+        for (int i = 0; i < head_dim; ++i)
+            out[out_base + i] = out[out_base + i] * rescale + p * row[i];
+        m = m_new;
+    }
+    float inv_l = (l > 0.f) ? 1.f / l : 0.f;
+    for (int i = 0; i < head_dim; ++i) out[out_base + i] *= inv_l;
+}
+
+__global__ void flash_attn_prefill_mxfp4_kernel(const float *q,
+                                                const unsigned char *k_packed,
+                                                const unsigned char *v_packed,
+                                                float *out, int n_heads, int n_gqa,
+                                                int head_dim, int max_ctx,
+                                                int kv_len_base, int n_new,
+                                                float scale) {
+    int hh = blockIdx.x * blockDim.x + threadIdx.x;
+    int q_pos = blockIdx.y;
+    if (hh >= n_heads || q_pos >= n_new) return;
+    int kv_h = hh / n_gqa;
+    int q_off = (q_pos * n_heads + hh) * head_dim;
+    int out_off = q_off;
+    int kv_len_for_q = kv_len_base + q_pos + 1;
+    int bytes_per_row = (head_dim / 32) * 17;
+    float row[RSL_FLASH_MAX_HEAD_DIM];
+    for (int i = 0; i < head_dim; ++i) out[out_off + i] = 0.f;
+    float m = -INFINITY, l = 0.f;
+    for (int t = 0; t < kv_len_for_q; ++t) {
+        const unsigned char *kp = k_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
+        rsl_deq_mxfp4_row(kp, row, head_dim);
+        float s_dot = 0.f;
+        for (int i = 0; i < head_dim; ++i) s_dot += q[q_off + i] * row[i];
+        s_dot *= scale;
+        float m_new = fmaxf(m, s_dot);
+        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
+        float p = expf(s_dot - m_new);
+        l = l * rescale + p;
+        const unsigned char *vp = v_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
+        rsl_deq_mxfp4_row(vp, row, head_dim);
+        for (int i = 0; i < head_dim; ++i)
+            out[out_off + i] = out[out_off + i] * rescale + p * row[i];
+        m = m_new;
+    }
+    float inv_l = (l > 0.f) ? 1.f / l : 0.f;
+    for (int i = 0; i < head_dim; ++i) out[out_off + i] *= inv_l;
+}
+
+// ---- MXFP6-KV decode / prefill (25 B / 32-elem block, E8M0 scale) ----
+__global__ void flash_attn_decode_mxfp6_kernel(const float *q,
+                                               const unsigned char *k_packed,
+                                               const unsigned char *v_packed,
+                                               float *out, int n_heads, int n_gqa,
+                                               int head_dim, int max_ctx,
+                                               int kv_len, float scale) {
+    int hh = blockIdx.x * blockDim.x + threadIdx.x;
+    if (hh >= n_heads) return;
+    int kv_h = hh / n_gqa;
+    int q_base = hh * head_dim;
+    int out_base = hh * head_dim;
+    int bytes_per_row = (head_dim / 32) * 25;
+    float row[RSL_FLASH_MAX_HEAD_DIM];
+    for (int i = 0; i < head_dim; ++i) out[out_base + i] = 0.f;
+    float m = -INFINITY, l = 0.f;
+    for (int t = 0; t < kv_len; ++t) {
+        const unsigned char *kp = k_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
+        rsl_deq_mxfp6_row(kp, row, head_dim);
+        float s_dot = 0.f;
+        for (int i = 0; i < head_dim; ++i) s_dot += q[q_base + i] * row[i];
+        s_dot *= scale;
+        float m_new = fmaxf(m, s_dot);
+        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
+        float p = expf(s_dot - m_new);
+        l = l * rescale + p;
+        const unsigned char *vp = v_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
+        rsl_deq_mxfp6_row(vp, row, head_dim);
+        for (int i = 0; i < head_dim; ++i)
+            out[out_base + i] = out[out_base + i] * rescale + p * row[i];
+        m = m_new;
+    }
+    float inv_l = (l > 0.f) ? 1.f / l : 0.f;
+    for (int i = 0; i < head_dim; ++i) out[out_base + i] *= inv_l;
+}
+
+__global__ void flash_attn_prefill_mxfp6_kernel(const float *q,
+                                                const unsigned char *k_packed,
+                                                const unsigned char *v_packed,
+                                                float *out, int n_heads, int n_gqa,
+                                                int head_dim, int max_ctx,
+                                                int kv_len_base, int n_new,
+                                                float scale) {
+    int hh = blockIdx.x * blockDim.x + threadIdx.x;
+    int q_pos = blockIdx.y;
+    if (hh >= n_heads || q_pos >= n_new) return;
+    int kv_h = hh / n_gqa;
+    int q_off = (q_pos * n_heads + hh) * head_dim;
+    int out_off = q_off;
+    int kv_len_for_q = kv_len_base + q_pos + 1;
+    int bytes_per_row = (head_dim / 32) * 25;
+    float row[RSL_FLASH_MAX_HEAD_DIM];
+    for (int i = 0; i < head_dim; ++i) out[out_off + i] = 0.f;
+    float m = -INFINITY, l = 0.f;
+    for (int t = 0; t < kv_len_for_q; ++t) {
+        const unsigned char *kp = k_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
+        rsl_deq_mxfp6_row(kp, row, head_dim);
+        float s_dot = 0.f;
+        for (int i = 0; i < head_dim; ++i) s_dot += q[q_off + i] * row[i];
+        s_dot *= scale;
+        float m_new = fmaxf(m, s_dot);
+        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
+        float p = expf(s_dot - m_new);
+        l = l * rescale + p;
+        const unsigned char *vp = v_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
+        rsl_deq_mxfp6_row(vp, row, head_dim);
+        for (int i = 0; i < head_dim; ++i)
+            out[out_off + i] = out[out_off + i] * rescale + p * row[i];
+        m = m_new;
+    }
+    float inv_l = (l > 0.f) ? 1.f / l : 0.f;
+    for (int i = 0; i < head_dim; ++i) out[out_off + i] *= inv_l;
+}
+
+// ---- MXFP8-KV decode / prefill (33 B / 32-elem block, E8M0 scale) ----
+__global__ void flash_attn_decode_mxfp8_kernel(const float *q,
+                                               const unsigned char *k_packed,
+                                               const unsigned char *v_packed,
+                                               float *out, int n_heads, int n_gqa,
+                                               int head_dim, int max_ctx,
+                                               int kv_len, float scale) {
+    int hh = blockIdx.x * blockDim.x + threadIdx.x;
+    if (hh >= n_heads) return;
+    int kv_h = hh / n_gqa;
+    int q_base = hh * head_dim;
+    int out_base = hh * head_dim;
+    int bytes_per_row = (head_dim / 32) * 33;
+    float row[RSL_FLASH_MAX_HEAD_DIM];
+    for (int i = 0; i < head_dim; ++i) out[out_base + i] = 0.f;
+    float m = -INFINITY, l = 0.f;
+    for (int t = 0; t < kv_len; ++t) {
+        const unsigned char *kp = k_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
+        rsl_deq_mxfp8_row(kp, row, head_dim);
+        float s_dot = 0.f;
+        for (int i = 0; i < head_dim; ++i) s_dot += q[q_base + i] * row[i];
+        s_dot *= scale;
+        float m_new = fmaxf(m, s_dot);
+        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
+        float p = expf(s_dot - m_new);
+        l = l * rescale + p;
+        const unsigned char *vp = v_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
+        rsl_deq_mxfp8_row(vp, row, head_dim);
+        for (int i = 0; i < head_dim; ++i)
+            out[out_base + i] = out[out_base + i] * rescale + p * row[i];
+        m = m_new;
+    }
+    float inv_l = (l > 0.f) ? 1.f / l : 0.f;
+    for (int i = 0; i < head_dim; ++i) out[out_base + i] *= inv_l;
+}
+
+__global__ void flash_attn_prefill_mxfp8_kernel(const float *q,
+                                                const unsigned char *k_packed,
+                                                const unsigned char *v_packed,
+                                                float *out, int n_heads, int n_gqa,
+                                                int head_dim, int max_ctx,
+                                                int kv_len_base, int n_new,
+                                                float scale) {
+    int hh = blockIdx.x * blockDim.x + threadIdx.x;
+    int q_pos = blockIdx.y;
+    if (hh >= n_heads || q_pos >= n_new) return;
+    int kv_h = hh / n_gqa;
+    int q_off = (q_pos * n_heads + hh) * head_dim;
+    int out_off = q_off;
+    int kv_len_for_q = kv_len_base + q_pos + 1;
+    int bytes_per_row = (head_dim / 32) * 33;
+    float row[RSL_FLASH_MAX_HEAD_DIM];
+    for (int i = 0; i < head_dim; ++i) out[out_off + i] = 0.f;
+    float m = -INFINITY, l = 0.f;
+    for (int t = 0; t < kv_len_for_q; ++t) {
+        const unsigned char *kp = k_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
+        rsl_deq_mxfp8_row(kp, row, head_dim);
+        float s_dot = 0.f;
+        for (int i = 0; i < head_dim; ++i) s_dot += q[q_off + i] * row[i];
+        s_dot *= scale;
+        float m_new = fmaxf(m, s_dot);
+        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
+        float p = expf(s_dot - m_new);
+        l = l * rescale + p;
+        const unsigned char *vp = v_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
+        rsl_deq_mxfp8_row(vp, row, head_dim);
+        for (int i = 0; i < head_dim; ++i)
+            out[out_off + i] = out[out_off + i] * rescale + p * row[i];
+        m = m_new;
+    }
+    float inv_l = (l > 0.f) ? 1.f / l : 0.f;
+    for (int i = 0; i < head_dim; ++i) out[out_off + i] *= inv_l;
+}
+
 // ---- TurboQuant-KV decode / prefill (separate per-row f32 scales) ----
 __global__ void flash_attn_decode_tq_kernel(const float *q,
                                             const unsigned char *k_packed,
@@ -2093,6 +2379,124 @@ extern "C" int rsl_cuda_flash_attn_prefill_nvfp4(rsl_cuda_stream *s, const float
         q, (const unsigned char *)k_packed, (const unsigned char *)v_packed, out,
         n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale);
     return rsl_cuda_check("rsl_cuda_flash_attn_prefill_nvfp4");
+}
+
+// ---- MXFP4/6/8-KV launchers (32-elem blocks, head_dim % 32 == 0) ----
+extern "C" int rsl_cuda_flash_attn_decode_mxfp4(rsl_cuda_stream *s, const float *q,
+                                                const void *k_packed, const void *v_packed,
+                                                float *out, int n_heads, int n_kv_heads,
+                                                int head_dim, int max_ctx, int kv_len) {
+    if (!s || !q || !k_packed || !v_packed || !out) return -1;
+    if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 32) != 0) return -1;
+    cudaSetDevice(s->device);
+    if (kv_len <= 0) {
+        cudaMemsetAsync(out, 0, (size_t)n_heads * head_dim * sizeof(float), s->stream);
+        return rsl_cuda_check("rsl_cuda_flash_attn_decode_mxfp4");
+    }
+    int n_gqa = n_heads / n_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int t = 64, b = (n_heads + t - 1) / t;
+    flash_attn_decode_mxfp4_kernel<<<b, t, 0, s->stream>>>(
+        q, (const unsigned char *)k_packed, (const unsigned char *)v_packed, out,
+        n_heads, n_gqa, head_dim, max_ctx, kv_len, scale);
+    return rsl_cuda_check("rsl_cuda_flash_attn_decode_mxfp4");
+}
+
+extern "C" int rsl_cuda_flash_attn_prefill_mxfp4(rsl_cuda_stream *s, const float *q,
+                                                 const void *k_packed, const void *v_packed,
+                                                 float *out, int n_heads, int n_kv_heads,
+                                                 int head_dim, int max_ctx,
+                                                 int kv_len_base, int n_new) {
+    if (!s || !q || !k_packed || !v_packed || !out || n_new <= 0) return -1;
+    if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 32) != 0) return -1;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
+    cudaSetDevice(s->device);
+    int n_gqa = n_heads / n_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int t = 64;
+    dim3 b((n_heads + t - 1) / t, (unsigned)n_new);
+    flash_attn_prefill_mxfp4_kernel<<<b, t, 0, s->stream>>>(
+        q, (const unsigned char *)k_packed, (const unsigned char *)v_packed, out,
+        n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale);
+    return rsl_cuda_check("rsl_cuda_flash_attn_prefill_mxfp4");
+}
+
+extern "C" int rsl_cuda_flash_attn_decode_mxfp6(rsl_cuda_stream *s, const float *q,
+                                                const void *k_packed, const void *v_packed,
+                                                float *out, int n_heads, int n_kv_heads,
+                                                int head_dim, int max_ctx, int kv_len) {
+    if (!s || !q || !k_packed || !v_packed || !out) return -1;
+    if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 32) != 0) return -1;
+    cudaSetDevice(s->device);
+    if (kv_len <= 0) {
+        cudaMemsetAsync(out, 0, (size_t)n_heads * head_dim * sizeof(float), s->stream);
+        return rsl_cuda_check("rsl_cuda_flash_attn_decode_mxfp6");
+    }
+    int n_gqa = n_heads / n_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int t = 64, b = (n_heads + t - 1) / t;
+    flash_attn_decode_mxfp6_kernel<<<b, t, 0, s->stream>>>(
+        q, (const unsigned char *)k_packed, (const unsigned char *)v_packed, out,
+        n_heads, n_gqa, head_dim, max_ctx, kv_len, scale);
+    return rsl_cuda_check("rsl_cuda_flash_attn_decode_mxfp6");
+}
+
+extern "C" int rsl_cuda_flash_attn_prefill_mxfp6(rsl_cuda_stream *s, const float *q,
+                                                 const void *k_packed, const void *v_packed,
+                                                 float *out, int n_heads, int n_kv_heads,
+                                                 int head_dim, int max_ctx,
+                                                 int kv_len_base, int n_new) {
+    if (!s || !q || !k_packed || !v_packed || !out || n_new <= 0) return -1;
+    if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 32) != 0) return -1;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
+    cudaSetDevice(s->device);
+    int n_gqa = n_heads / n_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int t = 64;
+    dim3 b((n_heads + t - 1) / t, (unsigned)n_new);
+    flash_attn_prefill_mxfp6_kernel<<<b, t, 0, s->stream>>>(
+        q, (const unsigned char *)k_packed, (const unsigned char *)v_packed, out,
+        n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale);
+    return rsl_cuda_check("rsl_cuda_flash_attn_prefill_mxfp6");
+}
+
+extern "C" int rsl_cuda_flash_attn_decode_mxfp8(rsl_cuda_stream *s, const float *q,
+                                                const void *k_packed, const void *v_packed,
+                                                float *out, int n_heads, int n_kv_heads,
+                                                int head_dim, int max_ctx, int kv_len) {
+    if (!s || !q || !k_packed || !v_packed || !out) return -1;
+    if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 32) != 0) return -1;
+    cudaSetDevice(s->device);
+    if (kv_len <= 0) {
+        cudaMemsetAsync(out, 0, (size_t)n_heads * head_dim * sizeof(float), s->stream);
+        return rsl_cuda_check("rsl_cuda_flash_attn_decode_mxfp8");
+    }
+    int n_gqa = n_heads / n_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int t = 64, b = (n_heads + t - 1) / t;
+    flash_attn_decode_mxfp8_kernel<<<b, t, 0, s->stream>>>(
+        q, (const unsigned char *)k_packed, (const unsigned char *)v_packed, out,
+        n_heads, n_gqa, head_dim, max_ctx, kv_len, scale);
+    return rsl_cuda_check("rsl_cuda_flash_attn_decode_mxfp8");
+}
+
+extern "C" int rsl_cuda_flash_attn_prefill_mxfp8(rsl_cuda_stream *s, const float *q,
+                                                 const void *k_packed, const void *v_packed,
+                                                 float *out, int n_heads, int n_kv_heads,
+                                                 int head_dim, int max_ctx,
+                                                 int kv_len_base, int n_new) {
+    if (!s || !q || !k_packed || !v_packed || !out || n_new <= 0) return -1;
+    if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 32) != 0) return -1;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
+    cudaSetDevice(s->device);
+    int n_gqa = n_heads / n_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int t = 64;
+    dim3 b((n_heads + t - 1) / t, (unsigned)n_new);
+    flash_attn_prefill_mxfp8_kernel<<<b, t, 0, s->stream>>>(
+        q, (const unsigned char *)k_packed, (const unsigned char *)v_packed, out,
+        n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale);
+    return rsl_cuda_check("rsl_cuda_flash_attn_prefill_mxfp8");
 }
 
 extern "C" int rsl_cuda_flash_attn_decode_tq(rsl_cuda_stream *s, const float *q,

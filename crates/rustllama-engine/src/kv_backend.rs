@@ -246,6 +246,17 @@ impl KvBackend {
                     KvDtype::Q4_0 => Err(KvBackendError::PagedRequiresF32 {
                         kv_dtype: "q4_0".to_string(),
                     }),
+                    // MXFP KV is contiguous-only (no paged store yet),
+                    // mirroring Q4_0 — the paged layout needs F32.
+                    KvDtype::Mxfp4 => Err(KvBackendError::PagedRequiresF32 {
+                        kv_dtype: "mxfp4".to_string(),
+                    }),
+                    KvDtype::Mxfp6 => Err(KvBackendError::PagedRequiresF32 {
+                        kv_dtype: "mxfp6".to_string(),
+                    }),
+                    KvDtype::Mxfp8 => Err(KvBackendError::PagedRequiresF32 {
+                        kv_dtype: "mxfp8".to_string(),
+                    }),
                 }
             }
             other => Err(KvBackendError::UnknownLayout(other.to_string())),

@@ -62,6 +62,12 @@ EXPORTS
     rsl_flash_attn_prefill_q4_0_usm
     rsl_flash_attn_decode_nvfp4_usm
     rsl_flash_attn_prefill_nvfp4_usm
+    rsl_flash_attn_decode_mxfp4_usm
+    rsl_flash_attn_prefill_mxfp4_usm
+    rsl_flash_attn_decode_mxfp6_usm
+    rsl_flash_attn_prefill_mxfp6_usm
+    rsl_flash_attn_decode_mxfp8_usm
+    rsl_flash_attn_prefill_mxfp8_usm
     rsl_flash_attn_decode_tq_usm
     rsl_flash_attn_prefill_tq_usm
     rsl_flash_attn_decode_q8_0_usm
