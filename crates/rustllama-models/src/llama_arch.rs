@@ -1818,6 +1818,14 @@ fn load_weight(gguf: &Gguf, name: &str) -> Result<Tensor, LlamaLoadError> {
         // dequant copy.
         GgmlType::IQ1_S if !fits_in_l3 => Dtype::IQ1_SRaw,
         GgmlType::IQ1_M if !fits_in_l3 => Dtype::IQ1_MRaw,
+        // OCP Microscaling weights kept raw (packed matvec on
+        // CPU/SYCL/CUDA). Without these arms a big MXFP* tensor falls to
+        // the F16 fallback below and silently dequants to an owned F16
+        // slab — no packed path ever runs. (FP8 with its per-tensor
+        // metadata scale is handled by its own load path, not here.)
+        GgmlType::Mxfp4 if !fits_in_l3 => Dtype::Mxfp4Raw,
+        GgmlType::Mxfp6 if !fits_in_l3 => Dtype::Mxfp6Raw,
+        GgmlType::Mxfp8 if !fits_in_l3 => Dtype::Mxfp8Raw,
         other => {
             // Every raw-passthrough quant above accepts big tensors, so a
             // BIG tensor can only land here when its GGUF type has no raw

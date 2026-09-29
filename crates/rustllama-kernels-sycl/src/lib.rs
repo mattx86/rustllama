@@ -493,6 +493,16 @@ mod imp {
         pub(super) fn rsl_matvec_q4_0_packed_f32_usm(
             s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
             out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+        // OCP Microscaling packed matvecs (block 32; 17/25/33 bytes/block).
+        pub(super) fn rsl_matvec_mxfp4_packed_f32_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+        pub(super) fn rsl_matvec_mxfp6_packed_f32_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+        pub(super) fn rsl_matvec_mxfp8_packed_f32_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
         pub(super) fn rsl_matvec_q5_0_packed_f32_usm(
             s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
             out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
@@ -2669,6 +2679,10 @@ mod imp {
         };
     }
     packed_matvec_real_wrapper!(matvec_q4_0_packed_f32_usm, rsl_matvec_q4_0_packed_f32_usm, 32);
+    // OCP Microscaling (MX) — block 32, one E8M0 power-of-two scale/block.
+    packed_matvec_real_wrapper!(matvec_mxfp4_packed_f32_usm, rsl_matvec_mxfp4_packed_f32_usm, 32);
+    packed_matvec_real_wrapper!(matvec_mxfp6_packed_f32_usm, rsl_matvec_mxfp6_packed_f32_usm, 32);
+    packed_matvec_real_wrapper!(matvec_mxfp8_packed_f32_usm, rsl_matvec_mxfp8_packed_f32_usm, 32);
     packed_matvec_real_wrapper!(matvec_q5_0_packed_f32_usm, rsl_matvec_q5_0_packed_f32_usm, 32);
     packed_matvec_real_wrapper!(matvec_q4_1_packed_f32_usm, rsl_matvec_q4_1_packed_f32_usm, 32);
     packed_matvec_real_wrapper!(matvec_q5_1_packed_f32_usm, rsl_matvec_q5_1_packed_f32_usm, 32);
@@ -5369,6 +5383,10 @@ macro_rules! packed_matvec_raw_wrapper {
     };
 }
 packed_matvec_raw_wrapper!(matvec_q4_0_packed_f32_usm_raw, matvec_q4_0_packed_f32_usm);
+// OCP Microscaling raw entries (M*(K/32)*{17,25,33} bytes; block 32).
+packed_matvec_raw_wrapper!(matvec_mxfp4_packed_f32_usm_raw, matvec_mxfp4_packed_f32_usm);
+packed_matvec_raw_wrapper!(matvec_mxfp6_packed_f32_usm_raw, matvec_mxfp6_packed_f32_usm);
+packed_matvec_raw_wrapper!(matvec_mxfp8_packed_f32_usm_raw, matvec_mxfp8_packed_f32_usm);
 packed_matvec_raw_wrapper!(matvec_q5_0_packed_f32_usm_raw, matvec_q5_0_packed_f32_usm);
 packed_matvec_raw_wrapper!(matvec_q4_1_packed_f32_usm_raw, matvec_q4_1_packed_f32_usm);
 packed_matvec_raw_wrapper!(matvec_q5_1_packed_f32_usm_raw, matvec_q5_1_packed_f32_usm);

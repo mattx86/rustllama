@@ -46,7 +46,8 @@ impl ModelArch {
         match arch {
             Some(
                 "llama" | "mistral" | "mistral3" | "qwen2" | "qwen2.5" | "qwen2_5" | "qwen3"
-                | "qwen35" | "qwen3_5" | "deepseek" | "deepseek2" | "phi3" | "yi",
+                | "qwen35" | "qwen3_5" | "qwen3next" | "qwen3_next" | "deepseek" | "deepseek2"
+                | "phi3" | "yi",
             ) => Self::Llama,
             // Transformer-MoE archs that share the rustllama attention +
             // per-layer MoE forward path. NOTE: this enum is vestigial —
@@ -57,8 +58,8 @@ impl ModelArch {
             // Ornith 1.5) run through the regular engine boundary today;
             // the earlier "needs SSM/MTP wiring first" caveat is resolved.
             Some(
-                "qwen2_moe" | "qwen3moe" | "qwen35moe" | "qwen3_5_moe" | "mixtral"
-                | "deepseek_v3",
+                "qwen2_moe" | "qwen3moe" | "qwen35moe" | "qwen3_5_moe" | "qwen3nextmoe"
+                | "qwen3next_moe" | "mixtral" | "deepseek_v3",
             ) => Self::LlamaMoe,
             Some(other) => Self::Unknown(other.to_string()),
             None => Self::Unknown(String::new()),
@@ -107,7 +108,7 @@ mod tests {
         // arm gets caught without having to grep the source.
         for arch in [
             "llama", "mistral", "mistral3", "qwen2", "qwen2.5", "qwen2_5", "qwen3", "qwen35",
-            "qwen3_5", "deepseek", "deepseek2", "phi3", "yi",
+            "qwen3_5", "qwen3next", "qwen3_next", "deepseek", "deepseek2", "phi3", "yi",
         ] {
             assert_eq!(
                 ModelArch::from_gguf(Some(arch)),
@@ -119,7 +120,16 @@ mod tests {
 
     #[test]
     fn from_gguf_recognizes_moe_archs() {
-        for arch in ["qwen2_moe", "qwen3moe", "qwen35moe", "qwen3_5_moe", "mixtral", "deepseek_v3"] {
+        for arch in [
+            "qwen2_moe",
+            "qwen3moe",
+            "qwen35moe",
+            "qwen3_5_moe",
+            "qwen3nextmoe",
+            "qwen3next_moe",
+            "mixtral",
+            "deepseek_v3",
+        ] {
             assert_eq!(
                 ModelArch::from_gguf(Some(arch)),
                 ModelArch::LlamaMoe,

@@ -143,6 +143,27 @@ const LAYOUTS: &[QuantLayout] = &[
         block_bytes: 28,
         f16_scales: &[26],
     },
+    // OCP Microscaling: 32-elem blocks, trailing E8M0 (1-byte) scale.
+    // No f16 scales — `gen_quant_bytes` stamps a sane E8M0 byte (and
+    // masks E4M3 NaN element bytes for mxfp8) by name below.
+    QuantLayout {
+        name: "mxfp4",
+        block_elems: 32,
+        block_bytes: 17,
+        f16_scales: &[],
+    },
+    QuantLayout {
+        name: "mxfp6",
+        block_elems: 32,
+        block_bytes: 25,
+        f16_scales: &[],
+    },
+    QuantLayout {
+        name: "mxfp8",
+        block_elems: 32,
+        block_bytes: 33,
+        f16_scales: &[],
+    },
 ];
 
 type CpuMatvec = fn(&[u8], &[f32], &mut [f32], usize, usize);
@@ -176,6 +197,9 @@ fn cpu_matvec_for(name: &str) -> CpuMatvec {
         "iq3_xxs" => k::matvec_iq3_xxs_w_f32_a,
         "iq3_s" => k::matvec_iq3_s_w_f32_a,
         "ptq1_0" => k::matvec_ptq1_0_w_f32_a,
+        "mxfp4" => k::mxfp::matvec_mxfp4_w_f32_a,
+        "mxfp6" => k::mxfp::matvec_mxfp6_w_f32_a,
+        "mxfp8" => k::mxfp::matvec_mxfp8_w_f32_a,
         _ => unreachable!("unknown dtype {name}"),
     }
 }
@@ -196,6 +220,9 @@ fn gpu_matvec_for(name: &str) -> GpuMatvecRaw {
         "iq3_xxs" => sk::matvec_iq3_xxs_packed_f32_usm_raw,
         "iq3_s" => sk::matvec_iq3_s_packed_f32_usm_raw,
         "ptq1_0" => sk::matvec_ptq1_0_packed_f32_usm_raw,
+        "mxfp4" => sk::matvec_mxfp4_packed_f32_usm_raw,
+        "mxfp6" => sk::matvec_mxfp6_packed_f32_usm_raw,
+        "mxfp8" => sk::matvec_mxfp8_packed_f32_usm_raw,
         _ => unreachable!("unknown dtype {name}"),
     }
 }
@@ -236,9 +263,10 @@ fn probe_names() -> Vec<String> {
         v.push(format!("matvec:{}", l.name));
     }
     for l in LAYOUTS {
-        // PTQ1_0 has no fused gate/up kernel (Bonsai's FFN dispatch
-        // uses the plain matvec); probe the matvec only.
-        if l.name == "ptq1_0" {
+        // PTQ1_0 and the MXFP* formats have no fused gate/up kernel
+        // (their FFN dispatch uses the plain matvec, falling back to two
+        // separate single-row matvecs); probe the matvec only.
+        if l.name == "ptq1_0" || l.name.starts_with("mxfp") {
             continue;
         }
         v.push(format!("fused:{}", l.name));
@@ -280,7 +308,23 @@ fn gen_quant_bytes(layout: &QuantLayout, rows: usize, k_dim: usize, seed: u32) -
             let val = 0.004 + 0.002 * ((b + i) % 5) as f32;
             bytes[off + s..off + s + 2].copy_from_slice(&half::f16::from_f32(val).to_le_bytes());
         }
-        if layout.f16_scales.is_empty() {
+        if layout.name.starts_with("mxfp") {
+            // OCP MX: one E8M0 scale byte at the block tail. Random fill
+            // could leave it 0xFF (the E8M0 NaN); stamp a sane exponent
+            // near 2^0 so block magnitudes stay O(1) and finite. For
+            // mxfp8, also mask the two E4M3 NaN element encodings
+            // (0x7F / 0xFF) that random bytes can produce — a NaN weight
+            // would poison the cosine comparison for both backends.
+            let scale_off = off + layout.block_bytes - 1;
+            bytes[scale_off] = (125 + (b % 5)) as u8; // 2^-2 .. 2^2
+            if layout.name == "mxfp8" {
+                for byte in bytes[off..off + 32].iter_mut() {
+                    if *byte == 0x7F || *byte == 0xFF {
+                        *byte = 0x38;
+                    }
+                }
+            }
+        } else if layout.f16_scales.is_empty() {
             // IQ1_M: scales live packed inside the 8-byte scale words
             // (including the split f16 delta). A fixed moderate bit
             // pattern keeps the implied delta finite; the retry guard
@@ -1043,7 +1087,7 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
 
     // ---- Packed matvecs the CUDA backend implements ----
     // (K constraints: ptq1_0 %128, q8_0 %32, q4_k/q6_k %256 — MV_K=2048 ok.)
-    for dtype in ["ptq1_0", "q8_0", "q4_k", "q6_k"] {
+    for dtype in ["ptq1_0", "q8_0", "q4_k", "q6_k", "mxfp4", "mxfp6", "mxfp8"] {
         let name = format!("matvec:{dtype}");
         let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
         let x = gen_x(MV_K, 42);
@@ -1072,6 +1116,9 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 "q8_0" => ck::matvec_q8_0_packed_f32(&stream, w, x, o, MV_M, MV_K),
                 "q4_k" => ck::matvec_q4_k_packed_f32(&stream, w, x, o, MV_M, MV_K),
                 "q6_k" => ck::matvec_q6_k_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "mxfp4" => ck::matvec_mxfp4_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "mxfp6" => ck::matvec_mxfp6_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "mxfp8" => ck::matvec_mxfp8_packed_f32(&stream, w, x, o, MV_M, MV_K),
                 _ => unreachable!(),
             }
         };

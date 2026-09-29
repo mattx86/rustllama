@@ -9,6 +9,7 @@
 //! GPU equivalents come in later phases; correctness first.
 
 pub mod delta_net;
+pub mod mxfp;
 pub mod nvfp4;
 pub mod hadamard;
 pub mod q4_0_kv;
@@ -86,6 +87,9 @@ pub fn matvec_tensor(w: &Tensor, x: &[f32], out: &mut [f32], m: usize, k: usize)
             Dtype::IQ1_SRaw => Some(matvec_iq1_s_w_f32_a),
             Dtype::IQ1_MRaw => Some(matvec_iq1_m_w_f32_a),
             Dtype::Nvfp4Raw => Some(nvfp4::matvec_nvfp4_w_f32_a),
+            Dtype::Mxfp4Raw => Some(mxfp::matvec_mxfp4_w_f32_a),
+            Dtype::Mxfp6Raw => Some(mxfp::matvec_mxfp6_w_f32_a),
+            Dtype::Mxfp8Raw => Some(mxfp::matvec_mxfp8_w_f32_a),
             Dtype::PQ2_0Raw => Some(matvec_pq2_0_w_f32_a),
             // Decode/single-activation path stays on the exact
             // reference kernel: measured, the fastdot 4-accumulator
@@ -177,6 +181,9 @@ pub fn matvec_tensor_serial(w: &Tensor, x: &[f32], out: &mut [f32], m: usize, k:
         Dtype::IQ1_SRaw => matvec_iq1_s_w_f32_a(as_bytes(w), x, out, m, k),
         Dtype::IQ1_MRaw => matvec_iq1_m_w_f32_a(as_bytes(w), x, out, m, k),
         Dtype::Nvfp4Raw => nvfp4::matvec_nvfp4_w_f32_a(as_bytes(w), x, out, m, k),
+        Dtype::Mxfp4Raw => mxfp::matvec_mxfp4_w_f32_a(as_bytes(w), x, out, m, k),
+        Dtype::Mxfp6Raw => mxfp::matvec_mxfp6_w_f32_a(as_bytes(w), x, out, m, k),
+        Dtype::Mxfp8Raw => mxfp::matvec_mxfp8_w_f32_a(as_bytes(w), x, out, m, k),
         Dtype::PQ2_0Raw => matvec_pq2_0_w_f32_a(as_bytes(w), x, out, m, k),
         Dtype::PTQ1_0Raw => matvec_ptq1_0_w_f32_a(as_bytes(w), x, out, m, k),
         other => panic!("matvec_tensor: unsupported dtype {other:?}"),

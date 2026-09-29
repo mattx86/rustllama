@@ -9114,6 +9114,215 @@ inline void matvec_ptq1_0_gate_up_fused_usm_impl(
     }).wait();
 }
 
+// =========================================================================
+// OCP Microscaling (MX) packed matvecs: MXFP4 / MXFP6 / MXFP8 (block 32).
+// Each 32-weight block is a run of narrow-float element codes followed by
+// one trailing E8M0 (power-of-two) shared-scale byte, so the effective
+// weight is `scale * decode(code)`. These mirror the CPU reference in
+// rustllama-gguf/src/dequant.rs (dequant_mxfp4/6/8 + the e8m0/e2m1/e3m2/
+// e4m3 element helpers) byte-for-byte, so the GPU output matches the CPU
+// reference under `doctor --gpu-parity`. Structure is identical to the
+// Q4_0/Q5_0/... packed matvecs above — one work-item per output row,
+// templated on LWS; only the block byte count (17/25/33) and the per-block
+// decode differ.
+// =========================================================================
+
+// OCP E8M0 shared-scale byte -> f32. 8-bit biased exponent (bias 127), no
+// sign / no mantissa: value = 2^(s - 127), a pure power of two. 0xFF is the
+// reserved NaN; 0x00 decodes to the subnormal 2^-127. `ldexp(1,e)` gives an
+// exact power of two, matching the CPU `e8m0_to_f32`. Shared by all three.
+__attribute__((always_inline))
+inline float rsl_mx_e8m0_to_f32(uint8_t s) {
+    if (s == 0xFF) return sycl::nan(0u);
+    return sycl::ldexp(1.0f, static_cast<int>(s) - 127);
+}
+
+// OCP E2M1 4-bit code (MXFP4 element) -> f32. Signed codebook
+// {0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6} (bits `s ee m`). Mirrors the CPU
+// E2M1_CODEBOOK exactly; index 8 is -0.0 like the reference.
+__attribute__((always_inline))
+inline float rsl_mx_e2m1_to_f32(uint8_t code) {
+    const float lut[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+    return lut[code & 0x0F];
+}
+
+// OCP E3M2 6-bit code (MXFP6 element) -> f32. 1 sign / 3 exp (bias 3) / 2
+// mantissa; every bit pattern is finite (no Inf/NaN). Bits `s eee mm`.
+// Mirrors the CPU e3m2_to_f32: subnormal (exp==0) = (mant/4) * 2^-2, else
+// (1 + mant/4) * 2^(exp-3).
+__attribute__((always_inline))
+inline float rsl_mx_e3m2_to_f32(uint8_t c) {
+    const bool sign = (c & 0x20) != 0;
+    const int exp = (c >> 2) & 0x07;
+    const int mant = c & 0x03;
+    float val;
+    if (exp == 0) {
+        val = (static_cast<float>(mant) / 4.0f) * sycl::ldexp(1.0f, -2);
+    } else {
+        val = (1.0f + static_cast<float>(mant) / 4.0f)
+              * sycl::ldexp(1.0f, exp - 3);
+    }
+    return sign ? -val : val;
+}
+
+// OCP E4M3 byte (MXFP8 element) -> f32. 1 sign / 4 exp (bias 7) / 3
+// mantissa; exp==0xF & mant==7 is the sole NaN. Mirrors the CPU
+// e4m3_to_f32 (== the KV `rsl_flash_e4m3_to_f32` above): subnormal
+// (exp==0) = mant * 2^-9, else (1 + mant/8) * 2^(exp-7).
+__attribute__((always_inline))
+inline float rsl_mx_e4m3_to_f32(uint8_t b) {
+    const bool sign = (b & 0x80) != 0;
+    const int exp = (b >> 3) & 0x0F;
+    const int mant = b & 0x07;
+    if (exp == 0x0F && mant == 0x07) return sycl::nan(0u);
+    float val;
+    if (exp == 0) {
+        val = static_cast<float>(mant) * (1.0f / 512.0f);  // mant * 2^-9
+    } else {
+        val = (1.0f + static_cast<float>(mant) / 8.0f)
+              * sycl::ldexp(1.0f, exp - 7);
+    }
+    return sign ? -val : val;
+}
+
+// ---- MXFP4 (17 bytes / 32: 16 packed-nibble bytes + 1 E8M0 scale) ----
+// qs[j] packs two E2M1 codes: low nibble -> element 2j, high nibble ->
+// element 2j+1. weight = scale * E2M1[nibble]. Matches dequant_mxfp4.
+template <std::size_t LWS_T>
+inline void matvec_mxfp4_packed_f32_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 32;
+    const int bytes_per_row = blocks_per_row * 17;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                if (m >= M) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 17;
+                    const float scale = rsl_mx_e8m0_to_f32(blk[16]);
+                    const int x_off = b * 32;
+                    for (int j = 0; j < 16; ++j) {
+                        const uint8_t byte = blk[j];
+                        const float w0 =
+                            rsl_mx_e2m1_to_f32(byte & 0x0F) * scale;
+                        const float w1 =
+                            rsl_mx_e2m1_to_f32((byte >> 4) & 0x0F) * scale;
+                        acc += w0 * x_usm[x_off + j * 2];
+                        acc += w1 * x_usm[x_off + j * 2 + 1];
+                    }
+                }
+                out_usm[m] = acc;
+            });
+    }).wait();
+}
+
+// ---- MXFP6 (25 bytes / 32: 24-byte E3M2 bitstream + 1 E8M0 scale) ----
+// qs is a little-endian bitstream of 32 six-bit E3M2 codes; element j
+// occupies bits [6*j, 6*j+6), which for j at a non-multiple of 4 spans
+// two adjacent bytes — so we read a 16-bit little-endian window (with a
+// zero high byte past the 24-byte code region) and shift out the 6 bits,
+// exactly as the CPU dequant_mxfp6. weight = scale * E3M2[code].
+template <std::size_t LWS_T>
+inline void matvec_mxfp6_packed_f32_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 32;
+    const int bytes_per_row = blocks_per_row * 25;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                if (m >= M) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 25;   // 24 code bytes ...
+                    const float scale = rsl_mx_e8m0_to_f32(blk[24]);  // + scale
+                    const int x_off = b * 32;
+                    for (int j = 0; j < 32; ++j) {
+                        const int bitpos = j * 6;
+                        const int byte_idx = bitpos >> 3;   // / 8
+                        const int bit_off = bitpos & 7;     // % 8
+                        const uint32_t lo = blk[byte_idx];
+                        // The last code (j=31) ends exactly on the 24-byte
+                        // boundary, so the high byte is only needed when it
+                        // lies inside the code region.
+                        const uint32_t hi =
+                            (byte_idx + 1 < 24)
+                                ? static_cast<uint32_t>(blk[byte_idx + 1])
+                                : 0u;
+                        const uint32_t word = lo | (hi << 8);
+                        const uint8_t code =
+                            static_cast<uint8_t>((word >> bit_off) & 0x3Fu);
+                        acc += rsl_mx_e3m2_to_f32(code) * scale
+                               * x_usm[x_off + j];
+                    }
+                }
+                out_usm[m] = acc;
+            });
+    }).wait();
+}
+
+// ---- MXFP8 (33 bytes / 32: 32 E4M3 bytes + 1 E8M0 scale) ----
+// One E4M3 byte per element. weight = scale * E4M3[byte]. Matches
+// dequant_mxfp8.
+template <std::size_t LWS_T>
+inline void matvec_mxfp8_packed_f32_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 32;
+    const int bytes_per_row = blocks_per_row * 33;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                if (m >= M) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 33;
+                    const float scale = rsl_mx_e8m0_to_f32(blk[32]);
+                    const int x_off = b * 32;
+                    for (int j = 0; j < 32; ++j) {
+                        acc += rsl_mx_e4m3_to_f32(blk[j]) * scale
+                               * x_usm[x_off + j];
+                    }
+                }
+                out_usm[m] = acc;
+            });
+    }).wait();
+}
+
 extern "C" {
 
 void rsl_matvec_q4_0_packed_f32_usm(rsl_stream* s,
@@ -9139,6 +9348,87 @@ void rsl_matvec_q4_0_packed_f32_usm(rsl_stream* s,
         case 128: matvec_q4_0_packed_f32_usm_impl<128>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
         case 256: matvec_q4_0_packed_f32_usm_impl<256>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
         default:  matvec_q4_0_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+    }
+})
+
+// OCP Microscaling packed matvecs (block 32; 17/25/33 bytes per block).
+// Same wrapper shape + LWS-switch as the Q4_0 entry above; only the impl
+// template and byte layout differ. See the MX helpers/impls above.
+void rsl_matvec_mxfp4_packed_f32_usm(rsl_stream* s,
+                                     const void* w_bytes_usm,
+                                     const float* x_usm,
+                                     float* out_usm,
+                                     int M, int K,
+                                     int lws) RSL_FFI_BODY_VOID(
+    "rsl_matvec_mxfp4_packed_f32_usm", {
+    if (s == nullptr || w_bytes_usm == nullptr
+        || x_usm == nullptr || out_usm == nullptr) {
+        return;
+    }
+    if (M <= 0 || K <= 0 || (K % 32) != 0) {
+        return;
+    }
+    auto& q = s->q;
+    const int eff_lws = (lws <= 0) ? static_cast<int>(RSL_LWS) : lws;
+    switch (eff_lws) {
+        case 16:  matvec_mxfp4_packed_f32_usm_impl<16>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 32:  matvec_mxfp4_packed_f32_usm_impl<32>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 64:  matvec_mxfp4_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 128: matvec_mxfp4_packed_f32_usm_impl<128>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 256: matvec_mxfp4_packed_f32_usm_impl<256>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        default:  matvec_mxfp4_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+    }
+})
+
+void rsl_matvec_mxfp6_packed_f32_usm(rsl_stream* s,
+                                     const void* w_bytes_usm,
+                                     const float* x_usm,
+                                     float* out_usm,
+                                     int M, int K,
+                                     int lws) RSL_FFI_BODY_VOID(
+    "rsl_matvec_mxfp6_packed_f32_usm", {
+    if (s == nullptr || w_bytes_usm == nullptr
+        || x_usm == nullptr || out_usm == nullptr) {
+        return;
+    }
+    if (M <= 0 || K <= 0 || (K % 32) != 0) {
+        return;
+    }
+    auto& q = s->q;
+    const int eff_lws = (lws <= 0) ? static_cast<int>(RSL_LWS) : lws;
+    switch (eff_lws) {
+        case 16:  matvec_mxfp6_packed_f32_usm_impl<16>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 32:  matvec_mxfp6_packed_f32_usm_impl<32>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 64:  matvec_mxfp6_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 128: matvec_mxfp6_packed_f32_usm_impl<128>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 256: matvec_mxfp6_packed_f32_usm_impl<256>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        default:  matvec_mxfp6_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+    }
+})
+
+void rsl_matvec_mxfp8_packed_f32_usm(rsl_stream* s,
+                                     const void* w_bytes_usm,
+                                     const float* x_usm,
+                                     float* out_usm,
+                                     int M, int K,
+                                     int lws) RSL_FFI_BODY_VOID(
+    "rsl_matvec_mxfp8_packed_f32_usm", {
+    if (s == nullptr || w_bytes_usm == nullptr
+        || x_usm == nullptr || out_usm == nullptr) {
+        return;
+    }
+    if (M <= 0 || K <= 0 || (K % 32) != 0) {
+        return;
+    }
+    auto& q = s->q;
+    const int eff_lws = (lws <= 0) ? static_cast<int>(RSL_LWS) : lws;
+    switch (eff_lws) {
+        case 16:  matvec_mxfp8_packed_f32_usm_impl<16>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 32:  matvec_mxfp8_packed_f32_usm_impl<32>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 64:  matvec_mxfp8_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 128: matvec_mxfp8_packed_f32_usm_impl<128>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        case 256: matvec_mxfp8_packed_f32_usm_impl<256>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
+        default:  matvec_mxfp8_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
     }
 })
 

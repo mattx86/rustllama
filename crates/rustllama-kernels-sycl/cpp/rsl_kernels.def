@@ -76,6 +76,9 @@ EXPORTS
     rsl_matvec_q5_k_packed_f32_usm
     rsl_matvec_q6_k_packed_f32_usm
     rsl_matvec_q4_0_packed_f32_usm
+    rsl_matvec_mxfp4_packed_f32_usm
+    rsl_matvec_mxfp6_packed_f32_usm
+    rsl_matvec_mxfp8_packed_f32_usm
     rsl_matvec_q5_0_packed_f32_usm
     rsl_matvec_q4_1_packed_f32_usm
     rsl_matvec_q5_1_packed_f32_usm

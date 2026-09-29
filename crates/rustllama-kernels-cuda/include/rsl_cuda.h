@@ -100,11 +100,12 @@ int rsl_cuda_matvec_q6_k_packed_f32_batched(rsl_cuda_stream *s, const void *w_by
  * --cuda-parity). Single: `x`=[K], `out`=[M]; batched: `x`=[N,K], `out`=[N,M].
  * Return 0 on success. K must be a multiple of the format's block width:
  *   Q5_K,Q2_K,Q8_K,IQ4_XS,IQ2_xxs/xs/s,IQ3_xxs/s,IQ1_s/m: 256 (super-block quants)
- *   Q4_0/Q5_0/Q4_1/Q5_1/IQ4_NL:              32
+ *   Q4_0/Q5_0/Q4_1/Q5_1/IQ4_NL/MXFP4/MXFP6/MXFP8:  32
  *   NVFP4:                                    16
  * Block bytes/super-block: Q5_K 176, Q2_K 84, Q8_K 292, Q4_0 18, Q5_0 22,
  *   Q4_1 20, Q5_1 24, IQ4_NL 18, IQ4_XS 136, IQ2_XXS 66, IQ2_XS 74,
  *   IQ2_S 82, IQ3_XXS 98, IQ3_S 110, IQ1_S 50, IQ1_M 56, NVFP4 9,
+ *   MXFP4 17, MXFP6 25, MXFP8 33 (all K%32==0, trailing E8M0 scale byte),
  *   Q3_K 110 (K%256==0), PQ2_0 34 (K%128==0). */
 #define RSL_CUDA_DECL_PACKED(NAME)                                            \
     int rsl_cuda_##NAME(rsl_cuda_stream *s, const void *w_bytes,              \
@@ -129,6 +130,9 @@ RSL_CUDA_DECL_PACKED(matvec_iq3_s_packed_f32)
 RSL_CUDA_DECL_PACKED(matvec_iq1_s_packed_f32)
 RSL_CUDA_DECL_PACKED(matvec_iq1_m_packed_f32)
 RSL_CUDA_DECL_PACKED(matvec_nvfp4_packed_f32)
+RSL_CUDA_DECL_PACKED(matvec_mxfp4_packed_f32)
+RSL_CUDA_DECL_PACKED(matvec_mxfp6_packed_f32)
+RSL_CUDA_DECL_PACKED(matvec_mxfp8_packed_f32)
 RSL_CUDA_DECL_PACKED(matvec_q3_k_packed_f32)
 RSL_CUDA_DECL_PACKED(matvec_pq2_0_packed_f32)
 #undef RSL_CUDA_DECL_PACKED

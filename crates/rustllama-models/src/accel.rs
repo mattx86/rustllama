@@ -132,6 +132,9 @@ fn dtype_to_cuda_kind(dtype: Dtype) -> Option<ck::CudaPackedKind> {
         Dtype::Nvfp4Raw => Some(ck::CudaPackedKind::Nvfp4),
         Dtype::Q3_KRaw => Some(ck::CudaPackedKind::Q3_K),
         Dtype::PQ2_0Raw => Some(ck::CudaPackedKind::Pq2_0),
+        Dtype::Mxfp4Raw => Some(ck::CudaPackedKind::Mxfp4),
+        Dtype::Mxfp6Raw => Some(ck::CudaPackedKind::Mxfp6),
+        Dtype::Mxfp8Raw => Some(ck::CudaPackedKind::Mxfp8),
         _ => None,
     }
 }
@@ -4427,6 +4430,9 @@ pub fn preload_packed_tensor_to_usm(w: &Tensor) -> bool {
         Dtype::Q3_KRaw => PackedMatvecKind::Q3_K,
         Dtype::Q8_KRaw => PackedMatvecKind::Q8_K,
         Dtype::PQ2_0Raw => PackedMatvecKind::PQ2_0,
+        Dtype::Mxfp4Raw => PackedMatvecKind::Mxfp4,
+        Dtype::Mxfp6Raw => PackedMatvecKind::Mxfp6,
+        Dtype::Mxfp8Raw => PackedMatvecKind::Mxfp8,
         _ => return false,
     };
     // Weight tensors are shaped `[M, K]` (out × in). The engine's
@@ -6906,11 +6912,22 @@ enum PackedMatvecKind {
     /// PQ2_0Raw (PrismML Bonsai 2-bit): 34 bytes per 128-weight
     /// block, K%128==0. Group-128 sibling of Prism's Q2_0.
     PQ2_0,
+    /// MXFP4Raw (OCP Microscaling): 17 bytes per 32-weight block,
+    /// K%32==0. Two E2M1 nibbles per byte + one trailing E8M0 scale.
+    Mxfp4,
+    /// MXFP6Raw (OCP Microscaling, E3M2): 25 bytes per 32-weight
+    /// block, K%32==0. LE 6-bit code bitstream + one E8M0 scale.
+    Mxfp6,
+    /// MXFP8Raw (OCP Microscaling, E4M3): 33 bytes per 32-weight
+    /// block, K%32==0. One E4M3 byte per element + one E8M0 scale.
+    Mxfp8,
 }
 
 /// Number of [`PackedMatvecKind`] variants (sizes the failure-latch
-/// array below; `kind as usize` indexes it).
-const PACKED_KIND_COUNT: usize = 22;
+/// array below; `kind as usize` indexes it). New variants MUST be
+/// appended at the end of the enum so existing discriminants (= array
+/// indices) stay stable.
+const PACKED_KIND_COUNT: usize = 25;
 
 /// Consecutive failures before a packed kind stops dispatching.
 const PACKED_KIND_DISABLE_AFTER: u32 = 3;
@@ -7018,6 +7035,9 @@ impl PackedMatvecKind {
             PackedMatvecKind::Q3_K => "q3_k",
             PackedMatvecKind::Q8_K => "q8_k",
             PackedMatvecKind::PQ2_0 => "pq2_0",
+            PackedMatvecKind::Mxfp4 => "mxfp4",
+            PackedMatvecKind::Mxfp6 => "mxfp6",
+            PackedMatvecKind::Mxfp8 => "mxfp8",
         }
     }
 
@@ -7048,6 +7068,9 @@ impl PackedMatvecKind {
             PackedMatvecKind::Q3_K => (k / 256) * 110,
             PackedMatvecKind::Q8_K => (k / 256) * 292,
             PackedMatvecKind::PQ2_0 => (k / 128) * 34,
+            PackedMatvecKind::Mxfp4 => (k / 32) * 17,
+            PackedMatvecKind::Mxfp6 => (k / 32) * 25,
+            PackedMatvecKind::Mxfp8 => (k / 32) * 33,
         }
     }
 
@@ -7059,7 +7082,10 @@ impl PackedMatvecKind {
             | PackedMatvecKind::Q4_0
             | PackedMatvecKind::Q5_0
             | PackedMatvecKind::Q4_1
-            | PackedMatvecKind::Q5_1 => 32,
+            | PackedMatvecKind::Q5_1
+            | PackedMatvecKind::Mxfp4
+            | PackedMatvecKind::Mxfp6
+            | PackedMatvecKind::Mxfp8 => 32,
             PackedMatvecKind::Q4_K
             | PackedMatvecKind::Q5_K
             | PackedMatvecKind::Q6_K
@@ -7295,6 +7321,9 @@ pub fn try_matvec_tensor_usm_f32(
         Dtype::Q3_KRaw => PackedMatvecKind::Q3_K,
         Dtype::Q8_KRaw => PackedMatvecKind::Q8_K,
         Dtype::PQ2_0Raw => PackedMatvecKind::PQ2_0,
+        Dtype::Mxfp4Raw => PackedMatvecKind::Mxfp4,
+        Dtype::Mxfp6Raw => PackedMatvecKind::Mxfp6,
+        Dtype::Mxfp8Raw => PackedMatvecKind::Mxfp8,
         _ => {
             // Log every unique dtype we see fall through to CPU
             // so we get a complete dtype-distribution map of the
@@ -7622,6 +7651,24 @@ pub fn try_matvec_tensor_usm_f32(
             .is_ok(),
             PackedMatvecKind::PQ2_0 => unsafe {
                 sk::matvec_pq2_0_packed_f32_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::Mxfp4 => unsafe {
+                sk::matvec_mxfp4_packed_f32_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::Mxfp6 => unsafe {
+                sk::matvec_mxfp6_packed_f32_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::Mxfp8 => unsafe {
+                sk::matvec_mxfp8_packed_f32_usm_raw(
                     &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
                 )
             }

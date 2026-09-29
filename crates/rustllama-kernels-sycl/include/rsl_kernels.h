@@ -1046,10 +1046,24 @@ void rsl_sample_argmax(rsl_stream* s,
  *   Q2_K:  84 B / 256  (16 scale bytes + 64 qs + f16 d + f16 dmin)
  *   Q3_K: 110 B / 256  (32 hmask + 64 qs + 12 scales + f16 d)
  *   Q8_K: 292 B / 256  (f32 d + 256 i8 + 16 i16 bsums; d is F32)
- *   PQ2_0: 34 B / 128  (f16 d + 32 packed 2-bit; weight = d*(code-1)) */
+ *   PQ2_0: 34 B / 128  (f16 d + 32 packed 2-bit; weight = d*(code-1))
+ *   MXFP4: 17 B / 32   (16 nibble-pair bytes E2M1 + E8M0 scale)
+ *   MXFP6: 25 B / 32   (24-byte LE E3M2 6-bit bitstream + E8M0 scale)
+ *   MXFP8: 33 B / 32   (32 E4M3 bytes + E8M0 scale)
+ * The three MX* formats are OCP Microscaling: weight = scale * decode(code)
+ * where scale is a power-of-two E8M0 byte. Mirror dequant_mxfp4/6/8. */
 void rsl_matvec_q4_0_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm,
                                     const float* x_usm, float* out_usm,
                                     int M, int K, int lws);
+void rsl_matvec_mxfp4_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm,
+                                     const float* x_usm, float* out_usm,
+                                     int M, int K, int lws);
+void rsl_matvec_mxfp6_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm,
+                                     const float* x_usm, float* out_usm,
+                                     int M, int K, int lws);
+void rsl_matvec_mxfp8_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm,
+                                     const float* x_usm, float* out_usm,
+                                     int M, int K, int lws);
 void rsl_matvec_q5_0_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm,
                                     const float* x_usm, float* out_usm,
                                     int M, int K, int lws);

@@ -158,6 +158,14 @@ extern "C" {
     fn rsl_cuda_matvec_iq1_m_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
     fn rsl_cuda_matvec_nvfp4_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
     fn rsl_cuda_matvec_nvfp4_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
+    // OCP Microscaling FP4/FP6/FP8. 32-elem blocks + trailing E8M0 scale
+    // byte; K%32==0. MXFP4: 17 B, MXFP6: 25 B, MXFP8: 33 B per block.
+    fn rsl_cuda_matvec_mxfp4_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
+    fn rsl_cuda_matvec_mxfp4_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
+    fn rsl_cuda_matvec_mxfp6_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
+    fn rsl_cuda_matvec_mxfp6_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
+    fn rsl_cuda_matvec_mxfp8_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
+    fn rsl_cuda_matvec_mxfp8_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
     // Q3_K + PQ2_0 (parity-gap close). Q3_K: 110 B/256, K%256==0.
     // PQ2_0: 34 B/128, K%128==0.
     fn rsl_cuda_matvec_q3_k_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
@@ -867,6 +875,24 @@ cuda_packed_matvec!(
     rsl_cuda_matvec_nvfp4_packed_f32_batched
 );
 cuda_packed_matvec!(
+    matvec_mxfp4_packed_f32,
+    matvec_mxfp4_packed_f32_batched,
+    rsl_cuda_matvec_mxfp4_packed_f32,
+    rsl_cuda_matvec_mxfp4_packed_f32_batched
+);
+cuda_packed_matvec!(
+    matvec_mxfp6_packed_f32,
+    matvec_mxfp6_packed_f32_batched,
+    rsl_cuda_matvec_mxfp6_packed_f32,
+    rsl_cuda_matvec_mxfp6_packed_f32_batched
+);
+cuda_packed_matvec!(
+    matvec_mxfp8_packed_f32,
+    matvec_mxfp8_packed_f32_batched,
+    rsl_cuda_matvec_mxfp8_packed_f32,
+    rsl_cuda_matvec_mxfp8_packed_f32_batched
+);
+cuda_packed_matvec!(
     matvec_q3_k_packed_f32,
     matvec_q3_k_packed_f32_batched,
     rsl_cuda_matvec_q3_k_packed_f32,
@@ -1365,6 +1391,10 @@ pub enum CudaPackedKind {
     Iq1_M,
     // NVIDIA FP4 (E2M1 + FP8 E4M3 per-16 scale)
     Nvfp4,
+    // OCP Microscaling FP4/FP6/FP8 (E8M0 shared scale, 32-elem blocks)
+    Mxfp4,
+    Mxfp6,
+    Mxfp8,
     // 3-bit K-quant (parity-gap close)
     Q3_K,
     // PrismML Bonsai 2-bit (parity-gap close)
@@ -1381,7 +1411,10 @@ impl CudaPackedKind {
             | CudaPackedKind::Q5_0
             | CudaPackedKind::Q4_1
             | CudaPackedKind::Q5_1
-            | CudaPackedKind::Iq4_Nl => 32,
+            | CudaPackedKind::Iq4_Nl
+            | CudaPackedKind::Mxfp4
+            | CudaPackedKind::Mxfp6
+            | CudaPackedKind::Mxfp8 => 32,
             CudaPackedKind::Ptq1_0 | CudaPackedKind::Pq2_0 => 128,
             CudaPackedKind::Q4_K
             | CudaPackedKind::Q6_K
@@ -1423,6 +1456,9 @@ impl CudaPackedKind {
             CudaPackedKind::Iq1_S => (k / 256) * 50,
             CudaPackedKind::Iq1_M => (k / 256) * 56,
             CudaPackedKind::Nvfp4 => (k / 16) * 9,
+            CudaPackedKind::Mxfp4 => (k / 32) * 17,
+            CudaPackedKind::Mxfp6 => (k / 32) * 25,
+            CudaPackedKind::Mxfp8 => (k / 32) * 33,
             CudaPackedKind::Q3_K => (k / 256) * 110,
             CudaPackedKind::Pq2_0 => (k / 128) * 34,
         }
@@ -1626,6 +1662,9 @@ impl CudaMatvecCache {
                 CudaPackedKind::Iq1_S => matvec_iq1_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
                 CudaPackedKind::Iq1_M => matvec_iq1_m_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
                 CudaPackedKind::Nvfp4 => matvec_nvfp4_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Mxfp4 => matvec_mxfp4_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Mxfp6 => matvec_mxfp6_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Mxfp8 => matvec_mxfp8_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
                 CudaPackedKind::Q3_K => matvec_q3_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
                 CudaPackedKind::Pq2_0 => matvec_pq2_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
             }
@@ -1698,6 +1737,9 @@ impl CudaMatvecCache {
                 CudaPackedKind::Iq1_S => matvec_iq1_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
                 CudaPackedKind::Iq1_M => matvec_iq1_m_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
                 CudaPackedKind::Nvfp4 => matvec_nvfp4_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Mxfp4 => matvec_mxfp4_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Mxfp6 => matvec_mxfp6_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Mxfp8 => matvec_mxfp8_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
                 CudaPackedKind::Q3_K => matvec_q3_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
                 CudaPackedKind::Pq2_0 => matvec_pq2_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
             }

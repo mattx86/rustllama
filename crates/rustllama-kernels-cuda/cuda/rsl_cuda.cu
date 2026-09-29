@@ -592,6 +592,32 @@ __device__ __forceinline__ float rsl_e4m3_to_f32(unsigned char b) {
     return sign ? -val : val;
 }
 
+// OCP E8M0 shared-scale byte -> f32 (bit-exact port of gguf
+// dequant::e8m0_to_f32). 8-bit unsigned biased exponent (bias 127), no
+// sign / mantissa: value = 2^(byte - 127). 0xFF is the reserved NaN; 0x00
+// decodes to 2^-127 (the smallest MX block scale). Shared by MXFP4/6/8.
+__device__ __forceinline__ float rsl_e8m0_to_f32(unsigned char b) {
+    if (b == 0xFF) return __int_as_float(0x7fc00000);  // NaN
+    return ldexpf(1.0f, (int)b - 127);
+}
+
+// OCP E3M2 (MXFP6 element) -> f32 (bit-exact port of gguf
+// dequant::e3m2_to_f32). 6-bit code `s eee mm`: 1 sign / 3 exp (bias 3) /
+// 2 mantissa. No Inf/NaN encodings (every bit pattern is finite).
+__device__ __forceinline__ float rsl_e3m2_to_f32(unsigned char c) {
+    bool sign = (c & 0x20) != 0;
+    int exp = (c >> 2) & 0x07;
+    int mant = c & 0x03;
+    float val;
+    if (exp == 0) {
+        // Subnormal: (mant/4) * 2^(1 - bias), bias = 3 -> factor 2^-2.
+        val = ((float)mant * 0.25f) * ldexpf(1.0f, -2);
+    } else {
+        val = (1.0f + (float)mant * 0.25f) * ldexpf(1.0f, exp - 3);
+    }
+    return sign ? -val : val;
+}
+
 // ---------- Priority 1: K-quants + legacy quants ----------
 
 // Q5_K: 176 B / 256 wts. { d:f16, dmin:f16, scales[12], qh[32], qs[128] }.
@@ -1165,6 +1191,77 @@ __device__ __forceinline__ float nvfp4_row_dot(const unsigned char *row,
     return acc;
 }
 
+// ---------- OCP Microscaling (MXFP4 / MXFP6 / MXFP8) ----------
+// 32 elements per block, each with a trailing E8M0 shared-scale byte that
+// multiplies every decoded element. Byte-exact ports of the gguf CPU
+// reference dequant_mxfp4/6/8; the element order + `scale * decode * x`
+// accumulation match the NVFP4 kernel above so --cuda-parity agrees.
+
+// MXFP4: 17 B / 32 wts. { qs:[u8;16], scale:e8m0 (byte 16) }. Each qs byte
+// packs two E2M1 nibbles: low nibble -> element 2j, high -> element 2j+1
+// (reuses the NVFP4 E2M1 codebook). K % 32 == 0.
+__device__ __forceinline__ float mxfp4_row_dot(const unsigned char *row,
+                                               const float *x, int bpr) {
+    float acc = 0.0f;
+    for (int b = 0; b < bpr; ++b) {
+        const unsigned char *blk = row + b * 17;
+        float scale = rsl_e8m0_to_f32(blk[16]);
+        int xo = b * 32;
+        for (int j = 0; j < 16; ++j) {
+            unsigned char byte = blk[j];
+            int lo = byte & 0x0F;
+            int hi = (byte >> 4) & 0x0F;
+            acc += scale * RSL_NVFP4_CODEBOOK[lo] * x[xo + j * 2];
+            acc += scale * RSL_NVFP4_CODEBOOK[hi] * x[xo + j * 2 + 1];
+        }
+    }
+    return acc;
+}
+
+// MXFP6: 25 B / 32 wts. { qs:[u8;24] LE bitstream of 32 six-bit E3M2 codes,
+// scale:e8m0 (byte 24) }. Element j occupies bits [6j, 6j+6); a 6-bit code
+// can straddle a byte boundary, so read a 16-bit window
+// { codes[byte_idx], codes[byte_idx+1] } and shift right by (6j % 8). The
+// high byte reads as 0 once past the 24-byte code region (only the final
+// code touches that, and its top bits are unused). K % 32 == 0.
+__device__ __forceinline__ float mxfp6_row_dot(const unsigned char *row,
+                                               const float *x, int bpr) {
+    float acc = 0.0f;
+    for (int b = 0; b < bpr; ++b) {
+        const unsigned char *blk = row + b * 25;
+        const unsigned char *codes = blk;              // qs[0..24]
+        float scale = rsl_e8m0_to_f32(blk[24]);
+        int xo = b * 32;
+        for (int j = 0; j < 32; ++j) {
+            int bitpos = j * 6;
+            int byte_idx = bitpos >> 3;                // bitpos / 8
+            int bit_off = bitpos & 7;                  // bitpos % 8
+            unsigned int lo = codes[byte_idx];
+            unsigned int hi = (byte_idx + 1 < 24) ? (unsigned int)codes[byte_idx + 1] : 0u;
+            unsigned int word = lo | (hi << 8);
+            unsigned char code = (unsigned char)((word >> bit_off) & 0x3Fu);
+            acc += scale * rsl_e3m2_to_f32(code) * x[xo + j];
+        }
+    }
+    return acc;
+}
+
+// MXFP8: 33 B / 32 wts. { qs:[u8;32] one E4M3 byte per element,
+// scale:e8m0 (byte 32) }. K % 32 == 0.
+__device__ __forceinline__ float mxfp8_row_dot(const unsigned char *row,
+                                               const float *x, int bpr) {
+    float acc = 0.0f;
+    for (int b = 0; b < bpr; ++b) {
+        const unsigned char *blk = row + b * 33;
+        float scale = rsl_e8m0_to_f32(blk[32]);
+        int xo = b * 32;
+        for (int j = 0; j < 32; ++j) {
+            acc += scale * rsl_e4m3_to_f32(blk[j]) * x[xo + j];
+        }
+    }
+    return acc;
+}
+
 // Wire single + batched kernels + extern-"C" launchers for each format.
 //                  NAME                       ROWDOT          KMOD BPB  EPB
 RSL_PACKED_MATVEC(matvec_q5_k_packed_f32,   q5_k_row_dot,   256, 176, 256)
@@ -1184,6 +1281,9 @@ RSL_PACKED_MATVEC(matvec_iq3_s_packed_f32,  iq3_s_row_dot,  256, 110, 256)
 RSL_PACKED_MATVEC(matvec_iq1_s_packed_f32,  iq1_s_row_dot,  256,  50, 256)
 RSL_PACKED_MATVEC(matvec_iq1_m_packed_f32,  iq1_m_row_dot,  256,  56, 256)
 RSL_PACKED_MATVEC(matvec_nvfp4_packed_f32,  nvfp4_row_dot,   16,   9,  16)
+RSL_PACKED_MATVEC(matvec_mxfp4_packed_f32,  mxfp4_row_dot,   32,  17,  32)
+RSL_PACKED_MATVEC(matvec_mxfp6_packed_f32,  mxfp6_row_dot,   32,  25,  32)
+RSL_PACKED_MATVEC(matvec_mxfp8_packed_f32,  mxfp8_row_dot,   32,  33,  32)
 
 // ---------- Priority 3: Q3_K + PQ2_0 (parity-gap close) ----------
 
