@@ -2062,8 +2062,8 @@ pub struct SsmPrefillChunkedReport {
 /// with no measurements and the CLI skips the axis.
 ///
 /// Deterministic (temp=0) synthetic decode, mirroring the decode
-/// sweeps' prompt/token sizing (`tune`'s `--prompt-tokens=64` /
-/// `--decode-tokens=32` defaults).
+/// sweeps' quick-by-default prompt/token sizing (`tune`'s
+/// `--prompt-tokens=64` / `--decode-tokens=16` defaults).
 ///
 /// The two arms exercise the paths they name so the tok/s delta is real:
 /// the OFF arm drives `generate_token_ids` (the classic single-token
@@ -2085,10 +2085,13 @@ pub fn measure_speculative_mtp(
     cfg: &MeasurementConfig,
     repeats: usize,
 ) -> Result<SpecMtpReport, String> {
-    // Mirror the decode sweeps' sizing. ctx holds prompt + decode +
-    // slack (see `measure_end_to_end_tok_s` in the CLI).
+    // Mirror the decode sweeps' quick-by-default sizing. ctx holds
+    // prompt + decode + slack (see `measure_end_to_end_tok_s` in the
+    // CLI). Decode tok/s stabilizes within a few tokens, so 16 decode
+    // tokens ranks the MTP on/off arms reliably at a fraction of the
+    // wall-time of the old 32.
     const PROMPT_TOKENS: u32 = 64;
-    const DECODE_TOKENS: u32 = 32;
+    const DECODE_TOKENS: u32 = 16;
     let ctx_size = (PROMPT_TOKENS as usize + DECODE_TOKENS as usize + 8).max(128);
 
     let mut cpu = CpuEngine::load_with_options_and_layout(
@@ -2305,20 +2308,24 @@ pub fn measure_speculative_mtp(
 ///
 /// Prefill is isolated exactly like [`measure_batch_size_candidates`]:
 /// `max_tokens = 1`, and prefill tok/s = `tokens_prefilled /
-/// (prefill_ms / 1000)`. A long synthetic prompt (2048 tokens,
-/// mirroring the batch-size sweep's fixed prompt) keeps prefill the
-/// dominant, measurable cost. On a non-SSM / non-DeltaNet model the env
-/// var changes nothing and both arms measure the same path (a
-/// degenerate, harmless near-tie).
+/// (prefill_ms / 1000)`. A synthetic prompt (256 tokens — the
+/// quick-by-default size, mirroring the batch-size sweep's quick
+/// prompt) keeps prefill the dominant, measurable cost while keeping
+/// the sweep fast; prefill tok/s ranking is size-independent, so the
+/// two arms rank the same as at the old 2048. On a non-SSM /
+/// non-DeltaNet model the env var changes nothing and both arms measure
+/// the same path (a degenerate, harmless near-tie).
 pub fn measure_ssm_prefill_chunked(
     model_path: &std::path::Path,
     cfg: &MeasurementConfig,
     repeats: usize,
 ) -> Result<SsmPrefillChunkedReport, String> {
-    // Long synthetic prompt so prefill dominates (mirror the batch-size
-    // sweep's `BATCH_SWEEP_PROMPT_TOKENS`). ctx holds the prompt + the
-    // single decode token + slack.
-    const PROMPT_TOKENS: u32 = 2048;
+    // Quick-by-default synthetic prompt so prefill still dominates
+    // (mirror the batch-size sweep's quick prompt). Prefill tok/s
+    // ranking is size-independent, so 256 tokens ranks the chunked
+    // on/off arms the same as the old 2048 at ~8× less work. ctx holds
+    // the prompt + the single decode token + slack.
+    const PROMPT_TOKENS: u32 = 256;
     let ctx_size = (PROMPT_TOKENS as usize + 8).max(64);
 
     let mut cpu = CpuEngine::load_with_options_and_layout(

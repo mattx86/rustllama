@@ -62,13 +62,17 @@ impl SweepResult {
 /// Configuration knobs for a single sweep. Defaults via [`Default`].
 #[derive(Debug, Clone, Copy)]
 pub struct SweepConfig {
-    /// Calls discarded before timing starts. 2 is enough for an
-    /// in-order SYCL queue: the first launch warms the SYCL runtime's
-    /// JIT cache, the second warms the device's instruction cache.
+    /// Calls discarded before timing starts. 1 is enough for the
+    /// quick-by-default sweep: the first launch warms the SYCL
+    /// runtime's JIT cache + the device's instruction cache, which is
+    /// what the timed runs need discarded. `--thorough` bumps this back
+    /// up (see `cmd_tune`) for tighter cold-effect rejection.
     pub warmup_runs: usize,
-    /// Timed launches per candidate. 7 yields a 5-sample window after
-    /// dropping fastest + slowest; median is then stable to ±10%
-    /// on a quiet system.
+    /// Timed launches per candidate. 3 gives a plain median (below the
+    /// 5-sample trim threshold) that already ranks LWS candidates
+    /// reliably — the winner is chosen by relative order, which is
+    /// stable at 3 samples on a quiet host. `--thorough` widens this
+    /// for tighter confidence intervals when absolute µs matter.
     pub timed_runs: usize,
     /// Skip remaining timed runs for this candidate when partial
     /// median already exceeds `early_stop_ratio × current_best`.
@@ -80,8 +84,11 @@ pub struct SweepConfig {
 impl Default for SweepConfig {
     fn default() -> Self {
         Self {
-            warmup_runs: 2,
-            timed_runs: 7,
+            // Quick by default: 1 warmup + 3 timed runs is enough to
+            // rank LWS candidates. `--thorough` restores the wider
+            // (exhaustive) sweep in `cmd_tune`.
+            warmup_runs: 1,
+            timed_runs: 3,
             early_stop_ratio: 2.0,
         }
     }

@@ -223,7 +223,12 @@ pub fn run_autotune_blocking(
             }
         }
         TuneScope::Full => {
-            cmd.arg("--all").arg("--thorough");
+            // Quick by default: the mandatory first-load autotune runs the
+            // full stage coverage with the cheap (quick) measurement sizes
+            // so a fresh model is tuned in ~15-30 min, not hours. A user who
+            // wants the exhaustive sweep runs `rustllama tune --all --thorough`
+            // by hand.
+            cmd.arg("--all");
             if force {
                 cmd.arg("--force");
             } else {

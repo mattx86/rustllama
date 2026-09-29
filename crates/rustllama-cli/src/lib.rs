@@ -281,11 +281,15 @@ pub enum Command {
         #[arg(long, default_value_t = 64)]
         prompt_tokens: u32,
         /// Decode tokens per measurement run, shared by every measured
-        /// sweep. Bigger = more stable tok/s readings. Default 32.
-        #[arg(long, default_value_t = 32)]
+        /// sweep. Quick by default (16) — decode tok/s stabilizes within
+        /// a few tokens, so 16 ranks candidates reliably; `--thorough`
+        /// bumps this to 32. Pass a bigger value to override upward.
+        #[arg(long, default_value_t = 16)]
         decode_tokens: u32,
         /// Repeats per candidate, shared by every measured sweep; the
-        /// median score of these runs picks the winner. Default 3.
+        /// median score of these runs picks the winner. Quick by default
+        /// (3); `--thorough` bumps this to 7. Pass a bigger value to
+        /// override upward.
         #[arg(long, default_value_t = 3)]
         repeats: u32,
         /// After the kernel-LWS sweep completes and the cache is
@@ -1152,9 +1156,33 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 return cmd_tuning_show(&config_path);
             }
             // The batch-size sweep measures prefill throughput, so it
-            // always uses a long synthetic prompt rather than the shared
+            // uses a long synthetic prompt rather than the shared
             // `--prompt-tokens` (which is sized for decode measurements).
+            // Quick by default (256 tokens keeps prefill dominant while
+            // finishing fast; prefill tok/s ranking is size-independent);
+            // `--thorough` restores the old exhaustive 2048-token prompt.
             const BATCH_SWEEP_PROMPT_TOKENS: u32 = 2048;
+            const QUICK_BATCH_SWEEP_PROMPT_TOKENS: u32 = 256;
+            let batch_prompt_tokens = if thorough {
+                BATCH_SWEEP_PROMPT_TOKENS
+            } else {
+                QUICK_BATCH_SWEEP_PROMPT_TOKENS
+            };
+            // Quick-by-default measurement sizing for the decode sweeps.
+            // `--thorough` restores the old exhaustive decode-tokens (32)
+            // and repeats (7). `.max()` keeps any user override that goes
+            // UPWARD (e.g. `--decode-tokens 64` / `--repeats 7`), so the
+            // flags still let a user tune more precisely on demand. The
+            // mandatory first-load autotune no longer passes `--thorough`,
+            // so it runs quick. (The shared `--prompt-tokens` is already
+            // small — it only sizes the excluded prefill + KV footprint of
+            // the decode sweeps — so it needs no quick/thorough split.)
+            let eff_decode_tokens = if thorough {
+                decode_tokens.max(32)
+            } else {
+                decode_tokens
+            };
+            let eff_repeats = if thorough { repeats.max(7) } else { repeats };
             let exclusive = [
                 placement,
                 batch_size,
@@ -1194,25 +1222,25 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     vram_headroom_mb,
                     placement_ctx,
                     prompt_tokens,
-                    decode_tokens,
-                    repeats,
+                    eff_decode_tokens,
+                    eff_repeats,
                     &batch_candidates,
-                    BATCH_SWEEP_PROMPT_TOKENS,
-                    repeats,
+                    batch_prompt_tokens,
+                    eff_repeats,
                     &threads_candidates,
-                    decode_tokens,
-                    repeats,
+                    eff_decode_tokens,
+                    eff_repeats,
                     &kv_dtype_candidates,
                     prompt_tokens,
-                    decode_tokens,
-                    repeats,
+                    eff_decode_tokens,
+                    eff_repeats,
                     prompt_tokens,
-                    decode_tokens,
-                    repeats,
+                    eff_decode_tokens,
+                    eff_repeats,
                     &kv_layout_candidates,
                     prompt_tokens,
-                    decode_tokens,
-                    repeats,
+                    eff_decode_tokens,
+                    eff_repeats,
                     skip_cached,
                     force,
                 );
@@ -1319,8 +1347,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     &config_path,
                     model,
                     &batch_candidates,
-                    BATCH_SWEEP_PROMPT_TOKENS,
-                    repeats,
+                    batch_prompt_tokens,
+                    eff_repeats,
                 )
             } else if placement {
                 cmd_tune_placement(
@@ -4242,9 +4270,11 @@ async fn pull(hub_ref_str: &str) -> anyhow::Result<()> {
 /// Defaults:
 ///   - `--device` = `sycl:0`
 ///   - `--model` = `[model].path` from the active config
-///   - `--thorough` extends each sweep from 7 timed runs → 21 and
-///     disables the early-stop heuristic, ~3× slower but tighter
-///     confidence intervals.
+///   - `--thorough` extends each sweep from the quick-default 3 timed
+///     runs → 21 and disables the early-stop heuristic, slower but with
+///     tighter confidence intervals. Without it (the default, incl. the
+///     mandatory first-load autotune) the kernel LWS sweep runs the
+///     quick 1-warmup/3-timed cadence.
 ///   - `--clear` deletes any existing cache for this device before
 ///     sweeping; without it, existing entries for shapes NOT in this
 ///     model are preserved (you can tune two models for the same
