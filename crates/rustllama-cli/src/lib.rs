@@ -3181,6 +3181,31 @@ async fn serve(
     // env var wins), so this doesn't double-apply.
     promote_cpu_tier_env_from_config(&cfg.inference);
 
+    // Single-instance guard: take the advisory `runtime/server.lock`
+    // and hold it for the whole process lifetime. A second server
+    // (CLI or the GUI's embedded serve) against the same runtime dir
+    // then fails fast here instead of racing on the bind port + the
+    // `runtime/server.json` discovery record. The guard drops when
+    // `serve` returns (or the process exits), releasing the lock. A
+    // stale lock from a crashed server is auto-released by the OS
+    // (advisory lock tied to the file handle), so this never blocks on
+    // a dead predecessor. A filesystem error is non-fatal — we log and
+    // serve without the guard rather than refuse to start.
+    let _server_lock: Option<rustllama_runtime::ServerLock> =
+        match rustllama_runtime::acquire_server_lock() {
+            Ok(Some(guard)) => Some(guard),
+            Ok(None) => anyhow::bail!(
+                "another rustllama server is already running against this runtime \
+                 directory (runtime/server.lock is held). Stop it first, or point \
+                 this instance at a separate install/data directory."
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not acquire runtime/server.lock; \
+                    starting without the single-instance guard");
+                None
+            }
+        };
+
     // Install the Job Object sandbox before any heavy allocation
     // (model load, engine spawn). The memory cap acts on every
     // subsequent malloc, so attaching here catches a malformed-GGUF
@@ -6620,9 +6645,12 @@ fn cmd_tune_all(
     batch_candidates: &str,
     batch_prompt_tokens: u32,
     batch_repeats: u32,
-    threads_candidates: &str,
-    threads_decode_tokens: u32,
-    threads_repeats: u32,
+    // Threads stage (7) now runs as a subprocess with its own quick-by-default
+    // sizing, so these caller-supplied sizings are no longer consumed here.
+    // Kept in the signature for call-site stability; prefixed to mark unused.
+    _threads_candidates: &str,
+    _threads_decode_tokens: u32,
+    _threads_repeats: u32,
     kv_dtype_candidates: &str,
     kv_dtype_prompt_tokens: u32,
     kv_dtype_decode_tokens: u32,

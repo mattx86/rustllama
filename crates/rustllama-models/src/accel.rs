@@ -1212,6 +1212,30 @@ pub fn expert_pin_release(key: Option<usize>) {
     }
 }
 
+/// True when the expert whose gate weight is `w_gate_e` is currently
+/// resident (pinned / hot) in the MoE pin cache.
+///
+/// This makes the disk-spill read-redirect residency-aware: a hot
+/// expert's weight pages are VirtualLock'd in RAM, so reconstructing it
+/// from the (possibly requantized) spill store is pure overhead —
+/// reconstruct only on a residency MISS (a cold/evicted expert). Query
+/// this BEFORE [`expert_pin_touch`], which pins (→ makes resident) the
+/// expert it touches; querying after would always report a hit. A
+/// non-file-backed gate weight was never spill-eligible, so it reports
+/// `false` (the redirect no-ops on it anyway — no spill record). The
+/// key is the gate weight's mmap start address, exactly as the pin
+/// cache + spill store key their entries.
+pub fn expert_resident_by_gate(w_gate_e: &Tensor) -> bool {
+    let Some((addr, _)) = w_gate_e.storage.mmap_borrowed_ptr_len() else {
+        return false;
+    };
+    let key = addr as usize;
+    expert_pins()
+        .lock()
+        .map(|c| c.resident.contains_key(&key))
+        .unwrap_or(false)
+}
+
 /// Unlock + drop all pinned experts and reset telemetry (model reload
 /// / teardown). Safe to call when inactive. The engine calls this (with
 /// [`expert_registry_clear`]) before loading a new model so stale pins

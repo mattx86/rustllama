@@ -257,12 +257,12 @@ pub fn route_topk_into(
 /// The caller MUST gate this behind `accel::moe_spill_enabled()` so the
 /// default (feature-off) path never allocates or touches the store.
 ///
-/// PERF: reconstruction reads the spill file + rebuilds tensors on every
-/// routed token that hits a spilled expert — it fires whenever a spill
-/// record exists, not only on a true residency miss. A residency-aware
-/// gate (reconstruct only when the pin cache reports the expert
-/// non-resident) is a follow-up that needs the pin cache to expose the
-/// hit/miss it already computes internally.
+/// PERF: reconstruction reads the spill file + rebuilds tensors, so the
+/// caller gates it on a true residency MISS — it samples
+/// `accel::expert_resident_by_gate` BEFORE `expert_pin_touch` pins the
+/// expert and only redirects when the expert was non-resident (cold /
+/// evicted). A resident (hot) expert keeps its RAM-locked mmap pages, so
+/// it skips reconstruction entirely.
 fn moe_spill_redirect_expert(
     w_gate_e: &Tensor,
     w_up_e: &Tensor,
@@ -424,6 +424,14 @@ pub fn moe_ffn_one_into(
             let w_up_e = &block.up_per_expert[*expert_idx];
             let w_down_e = &block.down_per_expert[*expert_idx];
 
+            // Residency-aware spill gate: sample the pin cache BEFORE the
+            // touch below pins this expert (→ makes it resident). A hot
+            // (resident) expert keeps its pages RAM-locked, so serving it
+            // from the spill store would be pure overhead — reconstruct
+            // only on a true residency MISS. Default-OFF no-op.
+            let spill_miss = crate::accel::moe_spill_enabled()
+                && !crate::accel::expert_resident_by_gate(w_gate_e);
+
             // MoE LRU expert-pin cache: VirtualLock this hot expert's
             // weight pages in RAM (when the cache is active + weights are
             // zero-copy file-backed) so they stop re-faulting from disk.
@@ -434,9 +442,10 @@ pub fn moe_ffn_one_into(
             // MoE disk-spill read-redirect (feature #5, opt-in). Default-
             // OFF: `moe_spill_enabled()` is false → this whole block is
             // skipped and the mmap path below runs byte-identically. When
-            // armed, an evicted+spilled expert is served from the
-            // secondary store instead of re-faulting its GGUF pages.
-            let spilled = if crate::accel::moe_spill_enabled() {
+            // armed, an evicted+spilled expert (residency miss) is served
+            // from the secondary store instead of re-faulting its GGUF
+            // pages; a resident expert uses its hot mmap pages.
+            let spilled = if spill_miss {
                 moe_spill_redirect_expert(w_gate_e, w_up_e, w_down_e)
             } else {
                 None
@@ -563,6 +572,11 @@ pub fn moe_ffn_one_into_parts(
             let w_up_e = &up_per_expert[*expert_idx];
             let w_down_e = &down_per_expert[*expert_idx];
 
+            // Residency-aware spill gate: sample BEFORE the touch pins the
+            // expert (see moe_ffn_one_into). Reconstruct only on a miss.
+            let spill_miss = crate::accel::moe_spill_enabled()
+                && !crate::accel::expert_resident_by_gate(w_gate_e);
+
             // MoE LRU expert-pin cache (see moe_ffn_one_into). No-op when
             // RUSTLLAMA_MOE_EXPERT_CACHE_MB=0 or weights aren't file-backed.
             let pin = crate::accel::expert_pin_touch(*expert_idx, w_gate_e, w_up_e, w_down_e);
@@ -571,7 +585,7 @@ pub fn moe_ffn_one_into_parts(
             // OFF (`moe_spill_enabled()` == false) → the mmap path below
             // runs byte-identically. See `moe_ffn_one_into` for the full
             // rationale (CPU-only kernels avoid the USM stale-upload race).
-            let spilled = if crate::accel::moe_spill_enabled() {
+            let spilled = if spill_miss {
                 moe_spill_redirect_expert(w_gate_e, w_up_e, w_down_e)
             } else {
                 None
