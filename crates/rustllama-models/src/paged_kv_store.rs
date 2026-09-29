@@ -1007,6 +1007,231 @@ impl PagedKvStoreOps for PagedKvStoreNvfp4 {
     fn total_pages(&self) -> u32 { PagedKvStoreNvfp4::total_pages(self) }
 }
 
+// ============================================================
+// Wave 2: MXFP4 / MXFP6 / MXFP8 paged KV storage.
+// ============================================================
+
+/// Generate an OCP Microscaling (MX) paged KV store — one struct per
+/// element format (MXFP4/6/8). Each `(page, layer, kv_axis, head,
+/// pos_in_page)` cell holds `head_dim / 32` blocks; a block is 32
+/// elements sharing one trailing E8M0 (power-of-two) scale byte,
+/// byte-identical to the contiguous MXFP KV blocks in
+/// [`rustllama_kernels_cpu::mxfp_kv`] and the weight-side MXFP blocks.
+/// Block bytes: MXFP4 17, MXFP6 25, MXFP8 33. There is NO separate
+/// per-row scale — the E8M0 scale is embedded per block, like NVFP4
+/// (contrast Q8_0 / TQ, which append an f32 row scale).
+///
+/// Per-row byte size = `head_dim / 32 × <block bytes>`. `head_dim` must
+/// be a multiple of 32 (the MX block size), so `new` rejects any other
+/// geometry up front rather than mis-striding later.
+///
+/// `quantize_row_into` runs the per-block encoder (`$qfn`) over each
+/// 32-elem block; `dequantize_row_into` uses the row-level MXFP decoder
+/// (`$deqrow`), which walks the same block stride the encoder wrote,
+/// to reconstruct the whole `head_dim` row into the caller's f32 slab.
+/// This mirrors [`PagedKvStoreNvfp4`] exactly modulo the 32-elem (vs
+/// NVFP4's 16) block geometry and the MX element codec. The three
+/// formats differ only in block bytes + codec, so a macro keeps the
+/// offset math single-sourced — the same DRY pattern the flash kernels
+/// use in `rustllama_kernels_cpu::mxfp_kv`.
+macro_rules! paged_kv_store_mxfp {
+    ($name:ident, $blk_bytes:expr, $blk_elems:expr, $qfn:path, $deqrow:path) => {
+        #[derive(Debug)]
+        #[allow(non_camel_case_types)]
+        pub struct $name {
+            data: Vec<u8>,
+            total_pages: u32,
+            n_layers: u32,
+            n_kv_heads: u32,
+            page_size: u32,
+            head_dim: u32,
+            bytes_per_row: usize,
+            head_stride: usize,
+            kv_stride: usize,
+            layer_stride: usize,
+            page_stride: usize,
+        }
+
+        impl $name {
+            /// Bytes of pool storage (memory-budget planner input).
+            pub fn approx_bytes(&self) -> usize {
+                self.data.len()
+            }
+
+            pub fn new(
+                total_pages: u32, n_layers: u32, n_kv_heads: u32, page_size: u32, head_dim: u32,
+            ) -> Option<Self> {
+                let blk_bytes: usize = $blk_bytes;
+                let blk_elems: usize = $blk_elems;
+                if total_pages == 0 || n_layers == 0 || n_kv_heads == 0
+                    || page_size == 0 || head_dim == 0
+                    || (head_dim as usize) % blk_elems != 0
+                {
+                    return None;
+                }
+                let blocks_per_row = (head_dim as usize) / blk_elems;
+                let bytes_per_row = blocks_per_row.checked_mul(blk_bytes)?;
+                let head_stride = (page_size as usize).checked_mul(bytes_per_row)?;
+                let kv_stride = (n_kv_heads as usize).checked_mul(head_stride)?;
+                let layer_stride = kv_stride.checked_mul(2)?;
+                let page_stride = (n_layers as usize).checked_mul(layer_stride)?;
+                let total_bytes = (total_pages as usize).checked_mul(page_stride)?;
+                Some(Self {
+                    data: vec![0u8; total_bytes],
+                    total_pages, n_layers, n_kv_heads, page_size, head_dim,
+                    bytes_per_row,
+                    head_stride, kv_stride, layer_stride, page_stride,
+                })
+            }
+
+            pub fn total_pages(&self) -> u32 { self.total_pages }
+            pub fn n_layers(&self) -> u32 { self.n_layers }
+            pub fn n_kv_heads(&self) -> u32 { self.n_kv_heads }
+            pub fn page_size(&self) -> u32 { self.page_size }
+            pub fn head_dim(&self) -> u32 { self.head_dim }
+
+            #[inline]
+            fn cell_offset(&self, page: PageId, layer: u32, kv_axis: u32, h: u32, pos_in_page: u32) -> Option<usize> {
+                if page.0 >= self.total_pages || layer >= self.n_layers || kv_axis >= 2
+                    || h >= self.n_kv_heads || pos_in_page >= self.page_size {
+                    return None;
+                }
+                let off = (page.0 as usize) * self.page_stride
+                    + (layer as usize) * self.layer_stride
+                    + (kv_axis as usize) * self.kv_stride
+                    + (h as usize) * self.head_stride
+                    + (pos_in_page as usize) * self.bytes_per_row;
+                Some(off)
+            }
+
+            /// Quantize one f32 head row (`head_dim` elems) into the packed
+            /// cell at byte offset `off`. One `$qfn` call per 32-elem block;
+            /// each block writes `blk_bytes` bytes (per-element codes +
+            /// the trailing E8M0 scale byte).
+            fn quantize_row_into(&mut self, off: usize, src_row: &[f32]) {
+                let hd = self.head_dim as usize;
+                debug_assert_eq!(src_row.len(), hd);
+                let blk_bytes: usize = $blk_bytes;
+                let blk_elems: usize = $blk_elems;
+                let blocks = hd / blk_elems;
+                for b in 0..blocks {
+                    $qfn(
+                        &src_row[b * blk_elems..(b + 1) * blk_elems],
+                        &mut self.data[off + b * blk_bytes..off + (b + 1) * blk_bytes],
+                    );
+                }
+            }
+
+            /// Dequantize one packed cell (`bytes_per_row` bytes) back into
+            /// a `head_dim`-long f32 slice. The row-level MX decoder walks
+            /// the same per-block stride the encoder wrote, so this is a
+            /// single call over the whole row (unlike NVFP4's per-block
+            /// `dequantize_block`).
+            fn dequantize_row_into(&self, off: usize, dst: &mut [f32]) {
+                debug_assert_eq!(dst.len(), self.head_dim as usize);
+                $deqrow(&self.data[off..off + self.bytes_per_row], dst);
+            }
+
+            pub fn write_token(
+                &mut self, pages: &[PageId], layer: u32, pos: u32, k: &[f32], v: &[f32],
+            ) -> Option<()> {
+                let hd = self.head_dim as usize;
+                let need = (self.n_kv_heads as usize) * hd;
+                if k.len() != need || v.len() != need { return None; }
+                let page_idx = (pos / self.page_size) as usize;
+                let pos_in_page = pos % self.page_size;
+                let page = *pages.get(page_idx)?;
+                for h in 0..self.n_kv_heads {
+                    let h_off_src = (h as usize) * hd;
+                    let k_off = self.cell_offset(page, layer, 0, h, pos_in_page)?;
+                    self.quantize_row_into(k_off, &k[h_off_src..h_off_src + hd]);
+                    let v_off = self.cell_offset(page, layer, 1, h, pos_in_page)?;
+                    self.quantize_row_into(v_off, &v[h_off_src..h_off_src + hd]);
+                }
+                Some(())
+            }
+
+            pub fn gather_layer(
+                &self, pages: &[PageId], layer: u32, kv_len: u32, k_out: &mut [f32], v_out: &mut [f32],
+            ) -> Option<()> {
+                if layer >= self.n_layers { return None; }
+                let hd = self.head_dim as usize;
+                let need = (self.n_kv_heads as usize) * (kv_len as usize) * hd;
+                if k_out.len() != need || v_out.len() != need { return None; }
+                let pages_needed = (kv_len as usize).div_ceil(self.page_size as usize);
+                if pages.len() < pages_needed { return None; }
+                let page_size = self.page_size as usize;
+                let kv_len_us = kv_len as usize;
+                for h in 0..self.n_kv_heads {
+                    let out_head_base = (h as usize) * kv_len_us * hd;
+                    let mut pos_written = 0usize;
+                    for (page_i, &page) in pages.iter().enumerate() {
+                        if pos_written >= kv_len_us { break; }
+                        let remaining = kv_len_us - pos_written;
+                        let pos_in_this_page = remaining.min(page_size);
+                        for p in 0..pos_in_this_page {
+                            let k_off = self.cell_offset(page, layer, 0, h, p as u32)
+                                .expect("page/layer/head/pos in range");
+                            let v_off = self.cell_offset(page, layer, 1, h, p as u32)
+                                .expect("page/layer/head/pos in range");
+                            let dst_pos = out_head_base + (page_i * page_size + p) * hd;
+                            self.dequantize_row_into(k_off, &mut k_out[dst_pos..dst_pos + hd]);
+                            self.dequantize_row_into(v_off, &mut v_out[dst_pos..dst_pos + hd]);
+                        }
+                        pos_written += pos_in_this_page;
+                    }
+                }
+                Some(())
+            }
+
+            pub fn zero_page(&mut self, page: PageId) -> Option<()> {
+                if page.0 >= self.total_pages { return None; }
+                let start = (page.0 as usize) * self.page_stride;
+                let end = start + self.page_stride;
+                for v in &mut self.data[start..end] { *v = 0; }
+                Some(())
+            }
+        }
+
+        impl PagedKvStoreOps for $name {
+            fn write_token(&mut self, pages: &[PageId], layer: u32, pos: u32, k: &[f32], v: &[f32]) -> Option<()> {
+                $name::write_token(self, pages, layer, pos, k, v)
+            }
+            fn gather_layer(&self, pages: &[PageId], layer: u32, kv_len: u32, k_out: &mut [f32], v_out: &mut [f32]) -> Option<()> {
+                $name::gather_layer(self, pages, layer, kv_len, k_out, v_out)
+            }
+            fn zero_page(&mut self, page: PageId) -> Option<()> { $name::zero_page(self, page) }
+            fn page_size(&self) -> u32 { $name::page_size(self) }
+            fn n_layers(&self) -> u32 { $name::n_layers(self) }
+            fn n_kv_heads(&self) -> u32 { $name::n_kv_heads(self) }
+            fn head_dim(&self) -> u32 { $name::head_dim(self) }
+            fn total_pages(&self) -> u32 { $name::total_pages(self) }
+        }
+    };
+}
+
+paged_kv_store_mxfp!(
+    PagedKvStoreMxfp4,
+    rustllama_kernels_cpu::mxfp::MXFP4_BLOCK_BYTES,
+    rustllama_kernels_cpu::mxfp::MXFP4_BLOCK_ELEMS,
+    rustllama_kernels_cpu::mxfp_kv::quantize_block_mxfp4,
+    rustllama_kernels_cpu::mxfp_kv::dequantize_row_mxfp4
+);
+paged_kv_store_mxfp!(
+    PagedKvStoreMxfp6,
+    rustllama_kernels_cpu::mxfp::MXFP6_BLOCK_BYTES,
+    rustllama_kernels_cpu::mxfp::MXFP6_BLOCK_ELEMS,
+    rustllama_kernels_cpu::mxfp_kv::quantize_block_mxfp6,
+    rustllama_kernels_cpu::mxfp_kv::dequantize_row_mxfp6
+);
+paged_kv_store_mxfp!(
+    PagedKvStoreMxfp8,
+    rustllama_kernels_cpu::mxfp::MXFP8_BLOCK_BYTES,
+    rustllama_kernels_cpu::mxfp::MXFP8_BLOCK_ELEMS,
+    rustllama_kernels_cpu::mxfp_kv::quantize_block_mxfp8,
+    rustllama_kernels_cpu::mxfp_kv::dequantize_row_mxfp8
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

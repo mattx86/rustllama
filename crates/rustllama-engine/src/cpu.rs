@@ -788,7 +788,10 @@ impl EngineState {
             KvBackend::Paged { cache, table, .. }
             | KvBackend::PagedQ8_0 { cache, table, .. }
             | KvBackend::PagedTQ { cache, table, .. }
-            | KvBackend::PagedNvfp4 { cache, table, .. } => {
+            | KvBackend::PagedNvfp4 { cache, table, .. }
+            | KvBackend::PagedMxfp4 { cache, table, .. }
+            | KvBackend::PagedMxfp6 { cache, table, .. }
+            | KvBackend::PagedMxfp8 { cache, table, .. } => {
                 cache.release(table);
                 self.last_ids.clear();
                 return 0;
@@ -3916,9 +3919,9 @@ fn softmax_to_vec(logits: &[f32]) -> Vec<f32> {
 /// `spawn_blocking` task without holding `&self`.
 /// Which batched-speculation path to take in `verify_speculation_inner`.
 /// One arm per KV dtype that has a `forward_speculation_batched_*`
-/// variant. All five KV dtypes now wire through batched specs —
-/// covers the full FP-quant and integer-quant range:
-/// - `F32` and `Nvfp4` are the FP-quant variants.
+/// variant. All KV dtypes now wire through batched specs — covers the
+/// full FP-quant and integer-quant range:
+/// - `F32`, `Nvfp4`, and `Mxfp4/6/8` are the FP-quant variants.
 /// - `Q8_0`, `Q4_0`, and `Tq` are integer-quant.
 #[derive(Copy, Clone, Debug)]
 enum BatchedSpec {
@@ -3927,6 +3930,9 @@ enum BatchedSpec {
     Tq,
     Nvfp4,
     Q4_0,
+    Mxfp4,
+    Mxfp6,
+    Mxfp8,
 }
 
 /// Shared speculation forward core: LCP-credited prefill of
@@ -4044,11 +4050,12 @@ fn spec_prefill_and_forward(
             rustllama_models::llama_arch::KvDtype::Tq(_) => Some(BatchedSpec::Tq),
             rustllama_models::llama_arch::KvDtype::Nvfp4 => Some(BatchedSpec::Nvfp4),
             rustllama_models::llama_arch::KvDtype::Q4_0 => Some(BatchedSpec::Q4_0),
-            // MXFP KV has no batched-speculation fast path yet; fall to
-            // the serial-loop path (None) — correct, just unaccelerated.
-            rustllama_models::llama_arch::KvDtype::Mxfp4
-            | rustllama_models::llama_arch::KvDtype::Mxfp6
-            | rustllama_models::llama_arch::KvDtype::Mxfp8 => None,
+            // MXFP KV batched-spec fast path (Wave 2): one arm per
+            // element format — `mxfp_kv_prefill` inside the batched
+            // forward selects the block bytes + kernels.
+            rustllama_models::llama_arch::KvDtype::Mxfp4 => Some(BatchedSpec::Mxfp4),
+            rustllama_models::llama_arch::KvDtype::Mxfp6 => Some(BatchedSpec::Mxfp6),
+            rustllama_models::llama_arch::KvDtype::Mxfp8 => Some(BatchedSpec::Mxfp8),
         },
         // Paged backend: serial fallback. Paged is F32-only in v1
         // (per the kv_backend gate); the F32 batched path can't be
@@ -4073,6 +4080,15 @@ fn spec_prefill_and_forward(
                     &inputs, prefill.len() as u32, kv, &mut all_logits,
                 ),
                 BatchedSpec::Q4_0 => model.forward_speculation_batched_q4_0(
+                    &inputs, prefill.len() as u32, kv, &mut all_logits,
+                ),
+                BatchedSpec::Mxfp4 => model.forward_speculation_batched_mxfp4(
+                    &inputs, prefill.len() as u32, kv, &mut all_logits,
+                ),
+                BatchedSpec::Mxfp6 => model.forward_speculation_batched_mxfp6(
+                    &inputs, prefill.len() as u32, kv, &mut all_logits,
+                ),
+                BatchedSpec::Mxfp8 => model.forward_speculation_batched_mxfp8(
                     &inputs, prefill.len() as u32, kv, &mut all_logits,
                 ),
             }
@@ -6622,7 +6638,10 @@ fn drive_vlm_generation(
         KvBackend::Paged { .. }
         | KvBackend::PagedQ8_0 { .. }
         | KvBackend::PagedTQ { .. }
-        | KvBackend::PagedNvfp4 { .. } => {
+        | KvBackend::PagedNvfp4 { .. }
+        | KvBackend::PagedMxfp4 { .. }
+        | KvBackend::PagedMxfp6 { .. }
+        | KvBackend::PagedMxfp8 { .. } => {
             return Err(crate::EngineError::Engine(
                 "VLM chat requires the contiguous KV backend in v1 — \
                  set [inference].kv_cache_layout = \"contiguous\""
@@ -7007,7 +7026,10 @@ fn forward_one_via_backend_hybrid(
             KvBackend::Paged { .. }
             | KvBackend::PagedQ8_0 { .. }
             | KvBackend::PagedTQ { .. }
-            | KvBackend::PagedNvfp4 { .. } => {
+            | KvBackend::PagedNvfp4 { .. }
+            | KvBackend::PagedMxfp4 { .. }
+            | KvBackend::PagedMxfp6 { .. }
+            | KvBackend::PagedMxfp8 { .. } => {
                 // Hybrid models don't yet route through the paged
                 // backend — Phase 3.7b only supports contiguous KV.
                 panic!(
@@ -7049,6 +7071,27 @@ fn forward_one_via_backend_hybrid(
                 .ensure_capacity(table, pos + 1)
                 .expect("paged cache grow failed — pool was sized to max_ctx at engine load");
             model.forward_one_paged_nvfp4(token_id, pos, cache, store, logits_out);
+        }
+        KvBackend::PagedMxfp4 { cache, store, table } => {
+            // Wave 2: MXFP4 paged forward dispatch.
+            cache
+                .ensure_capacity(table, pos + 1)
+                .expect("paged cache grow failed — pool was sized to max_ctx at engine load");
+            model.forward_one_paged_mxfp4(token_id, pos, cache, store, logits_out);
+        }
+        KvBackend::PagedMxfp6 { cache, store, table } => {
+            // Wave 2: MXFP6 paged forward dispatch.
+            cache
+                .ensure_capacity(table, pos + 1)
+                .expect("paged cache grow failed — pool was sized to max_ctx at engine load");
+            model.forward_one_paged_mxfp6(token_id, pos, cache, store, logits_out);
+        }
+        KvBackend::PagedMxfp8 { cache, store, table } => {
+            // Wave 2: MXFP8 paged forward dispatch.
+            cache
+                .ensure_capacity(table, pos + 1)
+                .expect("paged cache grow failed — pool was sized to max_ctx at engine load");
+            model.forward_one_paged_mxfp8(token_id, pos, cache, store, logits_out);
         }
     }
 }
@@ -7092,7 +7135,10 @@ fn forward_one_with_mtp_drafts_via_backend(
         KvBackend::Paged { .. }
         | KvBackend::PagedQ8_0 { .. }
         | KvBackend::PagedTQ { .. }
-        | KvBackend::PagedNvfp4 { .. } => {
+        | KvBackend::PagedNvfp4 { .. }
+        | KvBackend::PagedMxfp4 { .. }
+        | KvBackend::PagedMxfp6 { .. }
+        | KvBackend::PagedMxfp8 { .. } => {
             return Err(crate::EngineError::Unimplemented(
                 "MTP drafting on paged KV backend (forward_one_with_mtp_logits_paged is a \
                  follow-up; use the contiguous backend for MTP-driven speculation)",

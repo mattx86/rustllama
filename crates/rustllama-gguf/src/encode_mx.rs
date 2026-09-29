@@ -9,10 +9,14 @@
 //! (`dequant_mxfp4/6/8`); these encoders are their inverse and the two
 //! round-trip within the element format's quantization step.
 //!
-//! FP8 (E4M3, per-tensor scale) is intentionally NOT here: its scale is
-//! whole-tensor and lives in GGUF metadata, so it can't be produced by
-//! a per-block/per-chunk encoder — that path is handled at the pipeline
-//! level where the tensor scale is computed and written to metadata.
+//! FP8 (E4M3, per-tensor scale) differs: its scale is whole-tensor and
+//! lives in GGUF metadata, not in the byte stream, so it can't derive a
+//! scale from a lone 32-element block the way the MX encoders do. Scale
+//! *selection* and the metadata write therefore stay at the pipeline
+//! level (see [`crate::quantize`]); the pure per-element quantize step —
+//! [`encode_fp8`], which takes the pre-computed tensor scale — lives here
+//! next to [`quant_e4m3_byte`] it reuses, so encode is the exact inverse
+//! of the load-side [`crate::dequant::e4m3_to_f32`] decode.
 
 use crate::dequant::{e3m2_to_f32, e4m3_to_f32, e8m0_to_f32};
 
@@ -176,6 +180,35 @@ pub fn encode_mxfp8(src: &[f32], dst: &mut [u8]) {
     }
 }
 
+/// Encode f32 → FP8 (E4M3) using a **pre-computed per-tensor scale**.
+/// Each element becomes one E4M3 byte: `round_e4m3(x / scale)`.
+/// `dst.len()` must equal `src.len()` (FP8 is 1 byte/element, no block).
+///
+/// Why the scale is a parameter (unlike the per-block MX encoders
+/// above): FP8's scale is whole-tensor and is stored in GGUF metadata
+/// (`<tensor>.fp8_scale`), NOT in the byte stream. Scale selection and
+/// the metadata write happen in the quantize pipeline (see
+/// `quantize::fp8_tensor_scale`), which sees the whole tensor and owns
+/// header/metadata ordering; this is the pure per-element quantize step,
+/// so it stays trivially chunkable once the scale is fixed. Reuses
+/// [`quant_e4m3_byte`] so the result is the exact inverse of the
+/// load-side [`e4m3_to_f32`] decode within E4M3's rounding step.
+pub fn encode_fp8(src: &[f32], scale: f32, dst: &mut [u8]) {
+    debug_assert_eq!(src.len(), dst.len());
+    // Guard a zero / non-finite scale (empty or all-zero tensor):
+    // `1.0 / scale` would be Inf/NaN and push every element to the E4M3
+    // max. `inv = 0` instead sends all elements to E4M3 zero, matching
+    // the decode (`0 * scale == 0`).
+    let inv = if scale != 0.0 && scale.is_finite() {
+        1.0 / scale
+    } else {
+        0.0
+    };
+    for (d, &x) in dst.iter_mut().zip(src.iter()) {
+        *d = quant_e4m3_byte(x * inv);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +275,61 @@ mod tests {
         let absmax = src.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
         // E4M3 elements: ~2^-3 relative step; error well under 5% of range.
         assert!(max_abs_err(&src, &d8) < absmax * 0.05, "mxfp8 error too large");
+    }
+
+    #[test]
+    fn fp8_round_trip_within_e4m3_tolerance() {
+        use crate::dequant::dequant_fp8;
+        // 128 varied values spanning both signs and a wide magnitude
+        // range (the exact-zero at i == 64 exercises the zero element).
+        let src: Vec<f32> = (0..128)
+            .map(|i| {
+                let x = (i as f32 - 64.0) * 0.13;
+                x * (1.0 + 0.05 * (i as f32).cos())
+            })
+            .collect();
+        let absmax = src.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        // Mirror the pipeline's scale choice: map absmax → E4M3 max (448)
+        // so the largest element lands exactly on a representable level.
+        let scale = absmax / 448.0;
+        let mut enc = vec![0u8; src.len()];
+        encode_fp8(&src, scale, &mut enc);
+        let mut dec = vec![0f32; src.len()];
+        dequant_fp8(&enc, scale, &mut dec);
+        // E4M3 has 3 mantissa bits → ~1/16 (6.25%) worst-case relative
+        // rounding step. Bound the relative error for elements above a
+        // small floor; near-zero elements use an absolute bound (they
+        // round toward E4M3's fine-grained low range / zero).
+        for (s, d) in src.iter().zip(&dec) {
+            let abs_err = (s - d).abs();
+            let ok = if s.abs() > absmax * 0.02 {
+                abs_err <= s.abs() * 0.13
+            } else {
+                abs_err <= absmax * 0.02
+            };
+            assert!(ok, "fp8 round-trip: src={s} dec={d} abs_err={abs_err}");
+        }
+        // Sign preserved for the large-magnitude elements.
+        for (s, d) in src.iter().zip(&dec) {
+            if s.abs() > absmax * 0.25 {
+                assert_eq!(s.is_sign_negative(), d.is_sign_negative());
+            }
+        }
+    }
+
+    #[test]
+    fn fp8_zero_tensor_round_trips_to_zero() {
+        use crate::dequant::dequant_fp8;
+        // The pipeline hands a zero/non-finite tensor a scale of 1.0.
+        let src = vec![0.0f32; 64];
+        let mut enc = vec![0u8; 64];
+        encode_fp8(&src, 1.0, &mut enc);
+        let mut dec = vec![9.0f32; 64];
+        dequant_fp8(&enc, 1.0, &mut dec);
+        assert!(
+            dec.iter().all(|&x| x == 0.0),
+            "zero tensor must decode to zero"
+        );
     }
 
     #[test]

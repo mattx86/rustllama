@@ -248,6 +248,20 @@ pub struct LoadModelParams {
     pub kv_dtype: Option<String>,
 }
 
+/// One tool call the model emitted, reassembled from the streaming
+/// `tool_calls` deltas (header + argument fragments). Surfaced whole via
+/// [`ChatEvent::ToolCalls`] so a frontend can apply a confirm / auto-run
+/// policy without reimplementing delta reassembly.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ToolCall {
+    /// Server-assigned call id (`call_…`).
+    pub id: String,
+    /// Function name.
+    pub name: String,
+    /// Raw argument JSON string (accumulated across arg-delta chunks).
+    pub arguments: String,
+}
+
 /// One streamed event delivered to the REPL / GUI from `chat_stream`.
 #[derive(Debug, Clone)]
 pub enum ChatEvent {
@@ -255,6 +269,19 @@ pub enum ChatEvent {
     Start,
     /// Delta of generated content.
     Content(String),
+    /// The model proposed one or more tool calls. Emitted once, just
+    /// before [`ChatEvent::Finish`] (`"tool_calls"`), with the calls fully
+    /// reassembled. Frontends that don't execute tools use this to apply a
+    /// confirm / auto-run policy (approve, deny, or accept silently).
+    ToolCalls(Vec<ToolCall>),
+    /// CLARIFY: the model called the reserved `ask_user` tool. Carries the
+    /// question `prompt` + selectable `options` for the frontend to present.
+    /// Emitted just before [`ChatEvent::Finish`] (`"ask_user"`).
+    AskUser {
+        id: String,
+        prompt: String,
+        options: Vec<String>,
+    },
     /// Stream finished cleanly with the given reason ("stop", "length", ...).
     Finish(String),
     /// Server-reported error.
@@ -476,6 +503,10 @@ where
         let mut buf = Vec::<u8>::new();
         let mut sent_start = false;
         let mut byte_stream = byte_stream;
+        // Reassembles the streaming `tool_calls` deltas (header + arg
+        // fragments) into whole calls across chunk boundaries. Drained into
+        // a `ChatEvent::ToolCalls` at the finish chunk.
+        let mut tool_acc: Vec<ToolCall> = Vec::new();
 
         while let Some(chunk) = byte_stream.next().await {
             let chunk = match chunk {
@@ -493,7 +524,7 @@ where
                 let event_bytes = buf.drain(..pos).collect::<Vec<u8>>();
                 // Drop the boundary marker (\n\n or \r\n\r\n).
                 drain_boundary(&mut buf);
-                for event in decode_event(&event_bytes) {
+                for event in decode_event(&event_bytes, &mut tool_acc) {
                     if !sent_start {
                         sent_start = true;
                         yield Ok(ChatEvent::Start);
@@ -521,7 +552,11 @@ fn drain_boundary(buf: &mut Vec<u8>) {
     }
 }
 
-fn decode_event(bytes: &[u8]) -> Vec<Result<ChatEvent>> {
+/// Decode one SSE event into zero or more [`ChatEvent`]s. `tool_acc` is
+/// caller-owned state (see [`parse_sse`]): the streaming `tool_calls` deltas
+/// arrive across several events, so this accumulates them there and drains a
+/// whole [`ChatEvent::ToolCalls`] at the finish chunk.
+fn decode_event(bytes: &[u8], tool_acc: &mut Vec<ToolCall>) -> Vec<Result<ChatEvent>> {
     let mut out = Vec::new();
     let text = match std::str::from_utf8(bytes) {
         Ok(s) => s,
@@ -554,8 +589,38 @@ fn decode_event(bytes: &[u8]) -> Vec<Result<ChatEvent>> {
                             out.push(Ok(ChatEvent::Content(content.to_string())));
                         }
                     }
+                    // Reassemble streaming tool-call deltas into `tool_acc`.
+                    if let Some(calls) = delta.get("tool_calls").and_then(|c| c.as_array()) {
+                        merge_tool_call_deltas(tool_acc, calls);
+                    }
+                    // CLARIFY: the reserved `ask_user` tool rides the terminal
+                    // chunk as `delta.ask_user` (finish_reason "ask_user").
+                    if let Some(ask) = delta.get("ask_user") {
+                        out.push(Ok(ChatEvent::AskUser {
+                            id: ask.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                            prompt: ask
+                                .get("prompt")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            options: ask
+                                .get("options")
+                                .and_then(|o| o.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                        }));
+                    }
                 }
                 if let Some(reason) = choice.and_then(|c| c.get("finish_reason")).and_then(|r| r.as_str()) {
+                    // Surface any reassembled tool calls once, right before
+                    // Finish, so a frontend can gate them (confirm / auto-run).
+                    if !tool_acc.is_empty() {
+                        out.push(Ok(ChatEvent::ToolCalls(std::mem::take(tool_acc))));
+                    }
                     out.push(Ok(ChatEvent::Finish(reason.to_string())));
                 }
                 // OpenAI `stream_options.include_usage` emits a final
@@ -573,6 +638,36 @@ fn decode_event(bytes: &[u8]) -> Vec<Result<ChatEvent>> {
         }
     }
     out
+}
+
+/// Merge a chunk's `tool_calls` delta array into the accumulator, keyed by
+/// the delta's `index`. The server emits a header delta (index + id + name)
+/// then argument delta(s) (index + `function.arguments`) per call; this
+/// tolerates them arriving in any number of chunks by appending argument
+/// fragments and only overwriting id / name when non-empty.
+fn merge_tool_call_deltas(acc: &mut Vec<ToolCall>, calls: &[serde_json::Value]) {
+    for c in calls {
+        let index = c.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+        if acc.len() <= index {
+            acc.resize(index + 1, ToolCall::default());
+        }
+        let slot = &mut acc[index];
+        if let Some(id) = c.get("id").and_then(|x| x.as_str()) {
+            if !id.is_empty() {
+                slot.id = id.to_string();
+            }
+        }
+        if let Some(f) = c.get("function") {
+            if let Some(name) = f.get("name").and_then(|x| x.as_str()) {
+                if !name.is_empty() {
+                    slot.name = name.to_string();
+                }
+            }
+            if let Some(args) = f.get("arguments").and_then(|x| x.as_str()) {
+                slot.arguments.push_str(args);
+            }
+        }
+    }
 }
 
 /// One streamed event from `completions_stream`. Mirror of [`ChatEvent`]
@@ -671,7 +766,7 @@ mod tests {
     #[test]
     fn decode_role_chunk_does_not_emit_content() {
         let s = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}";
-        let evts = decode_event(s.as_bytes());
+        let evts = decode_event(s.as_bytes(), &mut Vec::new());
         let count = evts.into_iter().filter_map(|e| e.ok()).count();
         assert_eq!(count, 0);
     }
@@ -679,7 +774,7 @@ mod tests {
     #[test]
     fn decode_content_chunk() {
         let s = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}";
-        let evts: Vec<_> = decode_event(s.as_bytes())
+        let evts: Vec<_> = decode_event(s.as_bytes(), &mut Vec::new())
             .into_iter()
             .filter_map(|e| e.ok())
             .collect();
@@ -690,7 +785,7 @@ mod tests {
     #[test]
     fn decode_finish_chunk() {
         let s = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}";
-        let evts: Vec<_> = decode_event(s.as_bytes())
+        let evts: Vec<_> = decode_event(s.as_bytes(), &mut Vec::new())
             .into_iter()
             .filter_map(|e| e.ok())
             .collect();
@@ -700,8 +795,75 @@ mod tests {
 
     #[test]
     fn decode_done_marker_is_silent() {
-        let evts = decode_event(b"data: [DONE]");
+        let evts = decode_event(b"data: [DONE]", &mut Vec::new());
         assert!(evts.is_empty());
+    }
+
+    /// Streaming tool-call deltas (header chunk, then an args chunk, then
+    /// the finish chunk) reassemble into one `ChatEvent::ToolCalls`, emitted
+    /// just before `Finish("tool_calls")`. The accumulator persists across
+    /// `decode_event` calls exactly as `parse_sse` drives it.
+    #[test]
+    fn decode_reassembles_streaming_tool_calls_before_finish() {
+        let mut acc: Vec<ToolCall> = Vec::new();
+        let header = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\
+                      \"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\
+                      \"arguments\":\"\"}}]}}]}";
+        let args = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\
+                    \"function\":{\"arguments\":\"{\\\"city\\\":\\\"NYC\\\"}\"}}]}}]}";
+        let fin = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}";
+
+        // Header + args chunks accumulate but emit no ChatEvent.
+        assert!(decode_event(header.as_bytes(), &mut acc)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .next()
+            .is_none());
+        assert!(decode_event(args.as_bytes(), &mut acc)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .next()
+            .is_none());
+        // Finish chunk drains the calls, then Finish.
+        let evts: Vec<_> = decode_event(fin.as_bytes(), &mut acc)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(evts.len(), 2);
+        match &evts[0] {
+            ChatEvent::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "call_1");
+                assert_eq!(calls[0].name, "get_weather");
+                assert_eq!(calls[0].arguments, "{\"city\":\"NYC\"}");
+            }
+            other => panic!("expected ToolCalls first, got {other:?}"),
+        }
+        assert!(matches!(evts[1], ChatEvent::Finish(ref r) if r == "tool_calls"));
+        assert!(acc.is_empty(), "accumulator must be drained");
+    }
+
+    /// CLARIFY: the terminal `ask_user` chunk decodes to `ChatEvent::AskUser`
+    /// (prompt + options), then `Finish("ask_user")`.
+    #[test]
+    fn decode_ask_user_terminal_chunk() {
+        let s = "data: {\"choices\":[{\"index\":0,\"delta\":{\"ask_user\":{\"id\":\"call_9\",\
+                 \"kind\":\"clarify\",\"prompt\":\"Which file?\",\"options\":[\"a.rs\",\"b.rs\"]}},\
+                 \"finish_reason\":\"ask_user\"}]}";
+        let evts: Vec<_> = decode_event(s.as_bytes(), &mut Vec::new())
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(evts.len(), 2);
+        match &evts[0] {
+            ChatEvent::AskUser { id, prompt, options } => {
+                assert_eq!(id, "call_9");
+                assert_eq!(prompt, "Which file?");
+                assert_eq!(options, &["a.rs".to_string(), "b.rs".to_string()]);
+            }
+            other => panic!("expected AskUser first, got {other:?}"),
+        }
+        assert!(matches!(evts[1], ChatEvent::Finish(ref r) if r == "ask_user"));
     }
 
     /// Pinning the non-streaming `ChatResponse` deserializes the new
@@ -769,7 +931,7 @@ mod tests {
                  \"completion_tokens\":3,\"total_tokens\":20,\
                  \"prefill_ms\":12.5,\"decode_ms\":30.0,\
                  \"tokens_prefilled\":17,\"cache_hit_tokens\":0}}";
-        let evts: Vec<_> = decode_event(s.as_bytes())
+        let evts: Vec<_> = decode_event(s.as_bytes(), &mut Vec::new())
             .into_iter()
             .filter_map(|e| e.ok())
             .collect();
@@ -793,7 +955,7 @@ mod tests {
     #[test]
     fn decode_usage_chunk_silently_skips_malformed_usage() {
         let s = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":17}}";
-        let evts: Vec<_> = decode_event(s.as_bytes())
+        let evts: Vec<_> = decode_event(s.as_bytes(), &mut Vec::new())
             .into_iter()
             .filter_map(|e| e.ok())
             .collect();

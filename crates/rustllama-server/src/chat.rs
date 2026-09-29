@@ -577,6 +577,83 @@ fn filter_tools_to_name(tools: &Value, name: &str) -> Value {
     }
 }
 
+/// Name of the reserved "ask the user" tool (CLARIFY). Injected alongside
+/// the caller's tools on every tools request so the model can pause and ask
+/// the human a question with selectable options instead of guessing. It's a
+/// perfectly ordinary function schema — so [`parse_tool_choice`], the
+/// tool-call grammar, and [`parse_tool_calls`] treat it like any other tool.
+/// The streaming terminus in [`build_sse_stream_with_tools`] is the only
+/// place that special-cases it: a completed `ask_user` call is re-emitted as
+/// an `ask_user` SSE delta (finish_reason `"ask_user"`) rather than a
+/// `tool_calls` one, so clients render a chooser instead of trying to run it.
+const ASK_USER_TOOL_NAME: &str = "ask_user";
+
+/// The OpenAI-shape tool schema for [`ASK_USER_TOOL_NAME`].
+fn ask_user_tool_schema() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": ASK_USER_TOOL_NAME,
+            "description": "Ask the user a clarifying question and let them choose from a list of \
+                            options. Call this instead of guessing when you're missing a decision \
+                            or detail you need to continue.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The question to put to the user."
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "The selectable answers to offer the user."
+                    }
+                },
+                "required": ["prompt", "options"]
+            }
+        }
+    })
+}
+
+/// Append the reserved [`ask_user`](ask_user_tool_schema) tool to a
+/// normalized `tools` array. A non-array value (e.g. `Value::Null` from a
+/// caller that sent `functions: []`) becomes a one-element array so the
+/// reserved tool is always advertised on the tools path.
+fn with_reserved_ask_user_tool(tools: Value) -> Value {
+    match tools {
+        Value::Array(mut arr) => {
+            arr.push(ask_user_tool_schema());
+            Value::Array(arr)
+        }
+        _ => Value::Array(vec![ask_user_tool_schema()]),
+    }
+}
+
+/// Pull `(prompt, options)` out of a completed `ask_user` call's argument
+/// JSON string for the `ask_user` SSE delta. Tolerant of missing / mistyped
+/// fields — a missing `prompt` yields `""` and missing / non-array `options`
+/// yields `[]` — so the terminal chunk is always well-formed even if the
+/// model drifted from the schema.
+fn parse_ask_user_args(args: &str) -> (String, Vec<String>) {
+    let v: Value = serde_json::from_str(args).unwrap_or(Value::Null);
+    let prompt = v
+        .get("prompt")
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .to_string();
+    let options = v
+        .get("options")
+        .and_then(|o| o.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    (prompt, options)
+}
+
 /// Build the raw-JSON message array the tools render path feeds to the
 /// chat template. Each element carries `role` + flattened `content`,
 /// plus the multi-turn round-trip fields (`tool_calls`, `tool_call_id`,
@@ -658,6 +735,11 @@ async fn chat_with_tools(state: AppState, req: ChatRequest) -> Response {
         }
         _ => Value::Null,
     };
+    // Advertise the reserved `ask_user` tool (CLARIFY) alongside the
+    // caller's tools. Injected before the `tool_choice: {function}` filter
+    // so forcing a specific function still drops it (the model must call the
+    // one the caller pinned, not ask instead).
+    let tools_value = with_reserved_ask_user_tool(tools_value);
     // `tool_choice: {function}` forces one tool: filter the rendered
     // tools (and, below, the grammar) down to it so the prompt only
     // advertises that function.
@@ -873,6 +955,9 @@ async fn chat_stream_with_tools(state: AppState, req: ChatRequest) -> Response {
         _ => Value::Null,
     };
     let tool_choice = parse_tool_choice(&req.tool_choice);
+    // Advertise the reserved `ask_user` tool (CLARIFY) — see the
+    // non-streaming path for the rationale on ordering vs. the filter.
+    let tools_value = with_reserved_ask_user_tool(tools_value);
     // `tool_choice: {function}` forces one tool — filter the rendered
     // tools (and the grammar below) down to it.
     let tools_value = match &tool_choice {
@@ -1025,6 +1110,16 @@ fn build_sse_stream_with_tools(
         let mut any_tool_call = false;
         let mut finish_reason: &'static str = "stop";
         let mut completion_tokens = 0u32;
+        // CLARIFY: a completed `ask_user` call is swallowed here (its
+        // header/args are NOT streamed as a normal tool_calls delta) and
+        // re-emitted at the terminus as a single `ask_user` delta. The
+        // header and its args arrive as consecutive parser events, so we
+        // latch the call index off the header and buffer the args that
+        // follow it.
+        let mut ask_user_seen = false;
+        let mut ask_user_id: Option<String> = None;
+        let mut ask_user_index: Option<usize> = None;
+        let mut ask_user_args = String::new();
 
         while let Some(item) = tok_stream.next().await {
             if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
@@ -1059,29 +1154,43 @@ fn build_sse_stream_with_tools(
                             }
                             StreamEvent::Content(_) => {}
                             StreamEvent::ToolCallHeader { index, id: cid, name } => {
-                                any_tool_call = true;
-                                let delta = json!({
-                                    "tool_calls": [{
-                                        "index": index,
-                                        "id": cid,
-                                        "type": "function",
-                                        "function": { "name": name, "arguments": "" },
-                                    }]
-                                });
-                                yield Ok(Event::default().data(
-                                    chunk_json_with_fp(&id, created, &model, delta, None, None, fp).to_string()
-                                ));
+                                if name == ASK_USER_TOOL_NAME {
+                                    // CLARIFY: swallow the header; the call is
+                                    // re-emitted as an `ask_user` delta at the
+                                    // terminus (see below).
+                                    ask_user_seen = true;
+                                    ask_user_index = Some(index);
+                                    ask_user_id = Some(cid);
+                                } else {
+                                    any_tool_call = true;
+                                    let delta = json!({
+                                        "tool_calls": [{
+                                            "index": index,
+                                            "id": cid,
+                                            "type": "function",
+                                            "function": { "name": name, "arguments": "" },
+                                        }]
+                                    });
+                                    yield Ok(Event::default().data(
+                                        chunk_json_with_fp(&id, created, &model, delta, None, None, fp).to_string()
+                                    ));
+                                }
                             }
                             StreamEvent::ToolCallArgs { index, args } => {
-                                let delta = json!({
-                                    "tool_calls": [{
-                                        "index": index,
-                                        "function": { "arguments": args },
-                                    }]
-                                });
-                                yield Ok(Event::default().data(
-                                    chunk_json_with_fp(&id, created, &model, delta, None, None, fp).to_string()
-                                ));
+                                if ask_user_index == Some(index) {
+                                    // Buffer the `ask_user` args for the terminus.
+                                    ask_user_args.push_str(&args);
+                                } else {
+                                    let delta = json!({
+                                        "tool_calls": [{
+                                            "index": index,
+                                            "function": { "arguments": args },
+                                        }]
+                                    });
+                                    yield Ok(Event::default().data(
+                                        chunk_json_with_fp(&id, created, &model, delta, None, None, fp).to_string()
+                                    ));
+                                }
                             }
                         }
                     }
@@ -1107,50 +1216,68 @@ fn build_sse_stream_with_tools(
                     }
                     StreamEvent::Content(_) => {}
                     StreamEvent::ToolCallHeader { index, id: cid, name } => {
-                        any_tool_call = true;
-                        let delta = json!({
-                            "tool_calls": [{
-                                "index": index,
-                                "id": cid,
-                                "type": "function",
-                                "function": { "name": name, "arguments": "" },
-                            }]
-                        });
-                        yield Ok(Event::default().data(
-                            chunk_json_with_fp(&id, created, &model, delta, None, None, fp).to_string()
-                        ));
+                        if name == ASK_USER_TOOL_NAME {
+                            // CLARIFY: swallow the header (see the streaming
+                            // loop above); re-emitted at the terminus.
+                            ask_user_seen = true;
+                            ask_user_index = Some(index);
+                            ask_user_id = Some(cid);
+                        } else {
+                            any_tool_call = true;
+                            let delta = json!({
+                                "tool_calls": [{
+                                    "index": index,
+                                    "id": cid,
+                                    "type": "function",
+                                    "function": { "name": name, "arguments": "" },
+                                }]
+                            });
+                            yield Ok(Event::default().data(
+                                chunk_json_with_fp(&id, created, &model, delta, None, None, fp).to_string()
+                            ));
+                        }
                     }
                     StreamEvent::ToolCallArgs { index, args } => {
-                        let delta = json!({
-                            "tool_calls": [{
-                                "index": index,
-                                "function": { "arguments": args },
-                            }]
-                        });
-                        yield Ok(Event::default().data(
-                            chunk_json_with_fp(&id, created, &model, delta, None, None, fp).to_string()
-                        ));
+                        if ask_user_index == Some(index) {
+                            ask_user_args.push_str(&args);
+                        } else {
+                            let delta = json!({
+                                "tool_calls": [{
+                                    "index": index,
+                                    "function": { "arguments": args },
+                                }]
+                            });
+                            yield Ok(Event::default().data(
+                                chunk_json_with_fp(&id, created, &model, delta, None, None, fp).to_string()
+                            ));
+                        }
                     }
                 }
             }
 
-            if any_tool_call {
+            if ask_user_seen {
+                // CLARIFY takes precedence over tool_calls: the model paused
+                // to ask the user, so this isn't a normal tool-call terminus.
+                finish_reason = "ask_user";
+            } else if any_tool_call {
                 finish_reason = "tool_calls";
             }
         }
         // Termination-reason precedence (highest first):
         //   1. cancelled    — operator aborted (set in the loop above)
         //   2. error        — engine returned an error
-        //   3. tool_calls   — the response contains tool_use blocks
-        //   4. tool_call_iteration_limit — the grammar capped recursion
-        //   5. length       — output_tokens reached max_tokens cap
-        //   6. stop         — natural end of stream
+        //   3. ask_user     — the model called the reserved CLARIFY tool
+        //   4. tool_calls   — the response contains tool_use blocks
+        //   5. tool_call_iteration_limit — the grammar capped recursion
+        //   6. length       — output_tokens reached max_tokens cap
+        //   7. stop         — natural end of stream
         //
         // 1 and 2 are already latched in `finish_reason` before this
-        // point. 3 was set during the parser-flush pass. Apply 4 and 5
-        // here on top of the default "stop".
+        // point; 3 and 4 were set during the parser-flush pass. Apply 5 and
+        // 6 here on top of the default "stop" — but never over `ask_user`,
+        // which is a clean, user-actionable terminus.
         let stats = cpu.as_deref().map(|c| c.last_request_stats());
-        if stats.as_ref().map(|s| s.tool_call_limit_hit).unwrap_or(false) {
+        if !ask_user_seen && stats.as_ref().map(|s| s.tool_call_limit_hit).unwrap_or(false) {
             finish_reason = "tool_call_iteration_limit";
         } else if finish_reason == "stop" && completion_tokens >= max_tokens {
             // Only apply the length-cap label when we'd otherwise be
@@ -1159,8 +1286,25 @@ fn build_sse_stream_with_tools(
             finish_reason = "length";
         }
 
+        // Terminal chunk. For a CLARIFY it carries the parsed question +
+        // options on `delta.ask_user` (a ride-along on the existing chunk
+        // shape, mirroring how tool_calls attach); otherwise the usual
+        // empty delta.
+        let final_delta = if ask_user_seen {
+            let (prompt, options) = parse_ask_user_args(&ask_user_args);
+            json!({
+                "ask_user": {
+                    "id": ask_user_id.clone().unwrap_or_default(),
+                    "kind": "clarify",
+                    "prompt": prompt,
+                    "options": options,
+                }
+            })
+        } else {
+            json!({})
+        };
         yield Ok(Event::default().data(
-            chunk_json_with_fp(&id, created, &model, json!({}), Some(finish_reason), None, fp).to_string()
+            chunk_json_with_fp(&id, created, &model, final_delta, Some(finish_reason), None, fp).to_string()
         ));
         if include_usage {
             yield Ok(Event::default().data(
@@ -3357,6 +3501,63 @@ mod tests {
         assert!(map.is_empty());
         let map = extract_tool_schemas(&json!({}));
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn with_reserved_ask_user_tool_appends_to_caller_tools() {
+        // The caller's tools are preserved and `ask_user` is appended, so a
+        // model can still call the real tools OR ask the user.
+        let tools = json!([
+            { "type": "function", "function": { "name": "get_weather" } }
+        ]);
+        let out = with_reserved_ask_user_tool(tools);
+        let names: Vec<&str> = out
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(|n| n.as_str()))
+            .collect();
+        assert_eq!(names, ["get_weather", ASK_USER_TOOL_NAME]);
+        // The reserved tool is a real function schema, so `extract_tool_schemas`
+        // picks it up for the grammar with no special-casing.
+        let map = extract_tool_schemas(&out);
+        assert!(map.contains_key(ASK_USER_TOOL_NAME));
+    }
+
+    #[test]
+    fn with_reserved_ask_user_tool_handles_non_array() {
+        // A caller that sent `functions: []` normalizes to `Value::Null`;
+        // the reserved tool still gets advertised as a one-element array.
+        let out = with_reserved_ask_user_tool(Value::Null);
+        assert_eq!(out.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(
+            out.pointer("/0/function/name").and_then(|n| n.as_str()),
+            Some(ASK_USER_TOOL_NAME)
+        );
+    }
+
+    #[test]
+    fn parse_ask_user_args_extracts_prompt_and_options() {
+        let (prompt, options) = parse_ask_user_args(
+            r#"{"prompt":"Which file?","options":["main.rs","lib.rs"]}"#,
+        );
+        assert_eq!(prompt, "Which file?");
+        assert_eq!(options, ["main.rs", "lib.rs"]);
+    }
+
+    #[test]
+    fn parse_ask_user_args_tolerates_missing_and_mistyped_fields() {
+        // Missing prompt → ""; missing/non-array options → []; non-string
+        // option entries are skipped. Never panics — the terminal chunk must
+        // always be well-formed even if the model drifted from the schema.
+        let (prompt, options) = parse_ask_user_args(r#"{"options":42}"#);
+        assert_eq!(prompt, "");
+        assert!(options.is_empty());
+        let (_, options) = parse_ask_user_args(r#"{"options":["a",7,"b"]}"#);
+        assert_eq!(options, ["a", "b"]);
+        let (prompt, options) = parse_ask_user_args("not json at all");
+        assert_eq!(prompt, "");
+        assert!(options.is_empty());
     }
 
     #[test]

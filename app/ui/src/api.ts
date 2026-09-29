@@ -1276,6 +1276,30 @@ export interface ChatStreamHandlers {
   /// rather than just dropping SSE chunks on the client side.
   /// Optional — pre-existing callers ignore it.
   onStart?: (requestId: string) => void;
+  /// CLARIFY: fired when the model calls the reserved `ask_user` tool.
+  /// Carries the question `prompt` + selectable `options` for the UI to
+  /// present a chooser (rides the terminal chunk, finish_reason "ask_user").
+  onAskUser?: (q: AskUser) => void;
+  /// Fired once, just before `onDone`, when the model proposed tool calls
+  /// (finish_reason "tool_calls"), with the streamed deltas reassembled.
+  /// The chat doesn't execute tools — this is for a confirm / auto-run
+  /// policy over the proposal. Optional; pre-existing callers ignore it.
+  onToolCalls?: (calls: ToolCall[]) => void;
+}
+
+/// CLARIFY question surfaced on `delta.ask_user`.
+export interface AskUser {
+  id: string;
+  kind: string;
+  prompt: string;
+  options: string[];
+}
+
+/// A tool call reassembled from the streaming `tool_calls` deltas.
+export interface ToolCall {
+  id: string;
+  name: string;
+  arguments: string;
 }
 
 /// Cancel an in-flight streaming request by id. Server flips the
@@ -1398,6 +1422,16 @@ export async function streamChat(
   // Server emits `chatcmpl-<…>` on every chunk, so any frame with
   // a string id works; capture-on-first prevents re-firing.
   let requestIdNotified = false;
+  // Reassemble streaming `tool_calls` deltas (header + arg fragments),
+  // keyed by index, then hand them to `onToolCalls` once at the end.
+  const toolAcc: ToolCall[] = [];
+  let toolCallsFlushed = false;
+  const flushToolCalls = () => {
+    if (!toolCallsFlushed && toolAcc.length > 0) {
+      toolCallsFlushed = true;
+      h.onToolCalls?.(toolAcc.filter((c) => c.name.length > 0));
+    }
+  };
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -1411,6 +1445,7 @@ export async function streamChat(
         const data = line.startsWith("data: ") ? line.slice(6) : "";
         if (!data) continue;
         if (data.trim() === "[DONE]") {
+          flushToolCalls();
           h.onDone({ finishReason, usage, systemFingerprint });
           return;
         }
@@ -1432,8 +1467,38 @@ export async function streamChat(
           if (typeof delta === "string" && delta.length > 0) {
             h.onContent(delta);
           }
+          // Reassemble streaming tool-call deltas into `toolAcc`.
+          const tcDeltas = choice?.delta?.tool_calls;
+          if (Array.isArray(tcDeltas)) {
+            for (const c of tcDeltas) {
+              const idx = typeof c?.index === "number" ? c.index : 0;
+              while (toolAcc.length <= idx)
+                toolAcc.push({ id: "", name: "", arguments: "" });
+              const slot = toolAcc[idx];
+              if (typeof c?.id === "string" && c.id) slot.id = c.id;
+              if (typeof c?.function?.name === "string" && c.function.name)
+                slot.name = c.function.name;
+              if (typeof c?.function?.arguments === "string")
+                slot.arguments += c.function.arguments;
+            }
+          }
+          // CLARIFY: the reserved `ask_user` tool rides the terminal chunk
+          // as `delta.ask_user` (finish_reason "ask_user").
+          const ask = choice?.delta?.ask_user;
+          if (ask && typeof ask === "object") {
+            h.onAskUser?.({
+              id: typeof ask.id === "string" ? ask.id : "",
+              kind: typeof ask.kind === "string" ? ask.kind : "clarify",
+              prompt: typeof ask.prompt === "string" ? ask.prompt : "",
+              options: Array.isArray(ask.options)
+                ? ask.options.filter((o: unknown): o is string => typeof o === "string")
+                : [],
+            });
+          }
           if (choice?.finish_reason) {
             finishReason = choice.finish_reason;
+            // Surface any reassembled tool calls once the turn resolves.
+            if (finishReason === "tool_calls") flushToolCalls();
           }
           if (obj.usage) {
             usage = obj.usage as UsageInfo;
@@ -1443,6 +1508,7 @@ export async function streamChat(
         }
       }
     }
+    flushToolCalls();
     h.onDone({ finishReason, usage, systemFingerprint });
   } catch (e) {
     h.onError(e instanceof Error ? e : new Error(String(e)));

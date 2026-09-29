@@ -8364,6 +8364,107 @@ impl LlamaModel {
         );
     }
 
+    /// Wave 2: Paged-KV MXFP4 forward dispatch. Same code path as
+    /// `forward_one_paged_nvfp4` — the MXFP4 store quantizes K/V rows
+    /// on write and dequantizes on gather, so the forward function only
+    /// ever sees F32 slabs. `head_dim` must be a multiple of 32.
+    pub fn forward_one_paged_mxfp4(
+        &self,
+        token_id: i32,
+        pos: u32,
+        cache: &mut crate::paged_kv_cache::PagedKvCache,
+        store: &mut crate::paged_kv_store::PagedKvStoreMxfp4,
+        logits_out: &mut [f32],
+    ) {
+        let cfg = &self.cfg;
+        assert_eq!(logits_out.len(), cfg.vocab_size);
+        debug_assert!(pos < cache.capacity_tokens());
+        let d = cfg.d_model;
+        let head_dim = cfg.head_dim;
+        let d_q = cfg.n_heads * head_dim;
+        let d_kv = cfg.n_kv_heads * head_dim;
+        let kv_len = cache.retained_len_for_pos(pos); // env-gated KV eviction; == pos+1 when off
+        let cfg_clone = self.cfg.clone();
+        let (moe_n_experts, moe_top_k) = match cfg_clone.moe.as_ref() {
+            Some(m) => (m.n_experts as usize, m.n_experts_used as usize),
+            None => (0, 0),
+        };
+        crate::accel::with_forward_scratch(
+            d, d_q, d_kv, cfg.d_ff, head_dim, cfg.rope_theta, moe_n_experts, moe_top_k,
+            |scratch| self.forward_one_paged_f32_inner(
+                token_id, pos, cache,
+                store as &mut dyn crate::paged_kv_store::PagedKvStoreOps,
+                logits_out, scratch, kv_len,
+            ),
+        );
+    }
+
+    /// Wave 2: Paged-KV MXFP6 forward dispatch. See
+    /// [`Self::forward_one_paged_mxfp4`].
+    pub fn forward_one_paged_mxfp6(
+        &self,
+        token_id: i32,
+        pos: u32,
+        cache: &mut crate::paged_kv_cache::PagedKvCache,
+        store: &mut crate::paged_kv_store::PagedKvStoreMxfp6,
+        logits_out: &mut [f32],
+    ) {
+        let cfg = &self.cfg;
+        assert_eq!(logits_out.len(), cfg.vocab_size);
+        debug_assert!(pos < cache.capacity_tokens());
+        let d = cfg.d_model;
+        let head_dim = cfg.head_dim;
+        let d_q = cfg.n_heads * head_dim;
+        let d_kv = cfg.n_kv_heads * head_dim;
+        let kv_len = cache.retained_len_for_pos(pos); // env-gated KV eviction; == pos+1 when off
+        let cfg_clone = self.cfg.clone();
+        let (moe_n_experts, moe_top_k) = match cfg_clone.moe.as_ref() {
+            Some(m) => (m.n_experts as usize, m.n_experts_used as usize),
+            None => (0, 0),
+        };
+        crate::accel::with_forward_scratch(
+            d, d_q, d_kv, cfg.d_ff, head_dim, cfg.rope_theta, moe_n_experts, moe_top_k,
+            |scratch| self.forward_one_paged_f32_inner(
+                token_id, pos, cache,
+                store as &mut dyn crate::paged_kv_store::PagedKvStoreOps,
+                logits_out, scratch, kv_len,
+            ),
+        );
+    }
+
+    /// Wave 2: Paged-KV MXFP8 forward dispatch. See
+    /// [`Self::forward_one_paged_mxfp4`].
+    pub fn forward_one_paged_mxfp8(
+        &self,
+        token_id: i32,
+        pos: u32,
+        cache: &mut crate::paged_kv_cache::PagedKvCache,
+        store: &mut crate::paged_kv_store::PagedKvStoreMxfp8,
+        logits_out: &mut [f32],
+    ) {
+        let cfg = &self.cfg;
+        assert_eq!(logits_out.len(), cfg.vocab_size);
+        debug_assert!(pos < cache.capacity_tokens());
+        let d = cfg.d_model;
+        let head_dim = cfg.head_dim;
+        let d_q = cfg.n_heads * head_dim;
+        let d_kv = cfg.n_kv_heads * head_dim;
+        let kv_len = cache.retained_len_for_pos(pos); // env-gated KV eviction; == pos+1 when off
+        let cfg_clone = self.cfg.clone();
+        let (moe_n_experts, moe_top_k) = match cfg_clone.moe.as_ref() {
+            Some(m) => (m.n_experts as usize, m.n_experts_used as usize),
+            None => (0, 0),
+        };
+        crate::accel::with_forward_scratch(
+            d, d_q, d_kv, cfg.d_ff, head_dim, cfg.rope_theta, moe_n_experts, moe_top_k,
+            |scratch| self.forward_one_paged_f32_inner(
+                token_id, pos, cache,
+                store as &mut dyn crate::paged_kv_store::PagedKvStoreOps,
+                logits_out, scratch, kv_len,
+            ),
+        );
+    }
+
     /// H9a: Paged-KV variant of `forward_one` with Q8_0 storage.
     /// Same code path as `forward_one_paged_f32` — both delegate to
     /// `forward_one_paged_f32_inner` via the `PagedKvStoreOps` trait
@@ -10250,6 +10351,343 @@ impl LlamaModel {
                     }
                 }
                 _ => unreachable!("forward_prefill_batched_nvfp4 entered with non-NVFP4 KV"),
+            }
+
+            // Stage 4 (batched): output projection.
+            matvec_tensor_batched_dispatch(block.w_o(), &attn_out, &mut attn_proj, d, d_q, n_new);
+            // Stage 5 (per-token): residual + post-attn rmsnorm.
+            for i in 0..n_new {
+                let proj_row = &attn_proj[i * d..(i + 1) * d];
+                let h_row = &mut hidden[i * d..(i + 1) * d];
+                if !skip_attn_enabled() {
+                    k::add_inplace_f32(h_row, proj_row);
+                }
+                let n_row = &mut h_norm[i * d..(i + 1) * d];
+                k::rmsnorm_f32_row(h_row, block.ffn_norm(), n_row, cfg.rms_eps);
+            }
+            // Stage 6-8: FFN dense matvec ladder OR per-token MoE.
+            if let Some(moe) = moe_cfg.as_ref() {
+                let mb = &self.weights.moe_blocks.as_ref().unwrap()[layer_idx];
+                for i in 0..n_new {
+                    let n_row = &h_norm[i * d..(i + 1) * d];
+                    let out_row = &mut ffn_out[i * d..(i + 1) * d];
+                    crate::moe::moe_ffn_one_into(
+                        n_row,
+                        mb,
+                        d,
+                        d_ff,
+                        moe.n_experts as usize,
+                        moe.n_experts_used as usize,
+                        out_row,
+                        &mut moe_gate_one,
+                        &mut moe_up_one,
+                        &mut moe_ff_one,
+                        &mut moe_down_one,
+                        &mut moe_expert_logits,
+                        &mut moe_routed_picks,
+                    );
+                }
+            } else {
+                let dense_block = &self.weights.blocks[layer_idx];
+                matvec_tensor_batched_dispatch(
+                    &dense_block.w_gate,
+                    &h_norm,
+                    &mut gate_buf,
+                    d_ff,
+                    d,
+                    n_new,
+                );
+                matvec_tensor_batched_dispatch(
+                    &dense_block.w_up,
+                    &h_norm,
+                    &mut up_buf,
+                    d_ff,
+                    d,
+                    n_new,
+                );
+                for i in 0..n_new {
+                    let g_row = &gate_buf[i * d_ff..(i + 1) * d_ff];
+                    let u_row = &up_buf[i * d_ff..(i + 1) * d_ff];
+                    let f_row = &mut ffn_buf[i * d_ff..(i + 1) * d_ff];
+                    k::silu_mul_f32(g_row, u_row, f_row);
+                }
+                matvec_tensor_batched_dispatch(
+                    &dense_block.w_down,
+                    &ffn_buf,
+                    &mut ffn_out,
+                    d,
+                    d_ff,
+                    n_new,
+                );
+            }
+            // Stage 9 (per-token): residual.
+            if !skip_ffn_enabled() {
+                for i in 0..n_new {
+                    let h_row = &mut hidden[i * d..(i + 1) * d];
+                    let o_row = &ffn_out[i * d..(i + 1) * d];
+                    k::add_inplace_f32(h_row, o_row);
+                }
+            }
+        }
+        kv.seq_len = kv.seq_len.max(kv_len_base + n_new);
+
+        // LM-head dispatch — see `LmHeadMode` doc.
+        let lm_head = self
+            .weights
+            .output
+            .as_ref()
+            .unwrap_or(&self.weights.token_embd);
+        match mode {
+            LmHeadMode::Last(out) => {
+                let last_off = (n_new - 1) * d;
+                let last_hidden = &hidden[last_off..last_off + d];
+                let mut final_norm = vec![0f32; d];
+                k::rmsnorm_f32_row(
+                    last_hidden, &self.weights.output_norm, &mut final_norm, cfg.rms_eps,
+                );
+                matvec_tensor_dispatch(lm_head, &final_norm, out, cfg.vocab_size, d);
+            }
+            LmHeadMode::All(out) => {
+                let mut final_norm_all = vec![0f32; n_new * d];
+                for i in 0..n_new {
+                    let in_row = &hidden[i * d..(i + 1) * d];
+                    let out_row = &mut final_norm_all[i * d..(i + 1) * d];
+                    k::rmsnorm_f32_row(
+                        in_row, &self.weights.output_norm, out_row, cfg.rms_eps,
+                    );
+                }
+                matvec_tensor_batched_dispatch(
+                    lm_head, &final_norm_all, out, cfg.vocab_size, d, n_new,
+                );
+            }
+        }
+    }
+
+    /// Batched MXFP4-KV multi-position forward returning per-position
+    /// logits — the E1 speculation primitive for MXFP4 KV. Mirrors
+    /// [`Self::forward_speculation_batched_nvfp4`] modulo the 32-elem MX
+    /// block geometry; shares the per-layer body with the MXFP6/MXFP8
+    /// spec entries via the generic `forward_prefill_batched_mxfp_inner`
+    /// (the `fmt` arg selects the block bytes + kernels).
+    pub fn forward_speculation_batched_mxfp4(
+        &self,
+        tokens: &[i32],
+        start_pos: u32,
+        kv: &mut KvCache,
+        logits_out: &mut [f32],
+    ) {
+        let cfg = &self.cfg;
+        let n_new = tokens.len();
+        assert_eq!(
+            logits_out.len(),
+            n_new * cfg.vocab_size,
+            "forward_speculation_batched_mxfp4: logits_out must be sized to tokens.len() * vocab_size"
+        );
+        if n_new == 0 {
+            return;
+        }
+        self.forward_prefill_batched_mxfp_inner(
+            KvDtype::Mxfp4, tokens, start_pos, kv,
+            LmHeadMode::All(logits_out),
+        );
+    }
+
+    /// Batched MXFP6-KV spec primitive. See
+    /// [`Self::forward_speculation_batched_mxfp4`].
+    pub fn forward_speculation_batched_mxfp6(
+        &self,
+        tokens: &[i32],
+        start_pos: u32,
+        kv: &mut KvCache,
+        logits_out: &mut [f32],
+    ) {
+        let cfg = &self.cfg;
+        let n_new = tokens.len();
+        assert_eq!(
+            logits_out.len(),
+            n_new * cfg.vocab_size,
+            "forward_speculation_batched_mxfp6: logits_out must be sized to tokens.len() * vocab_size"
+        );
+        if n_new == 0 {
+            return;
+        }
+        self.forward_prefill_batched_mxfp_inner(
+            KvDtype::Mxfp6, tokens, start_pos, kv,
+            LmHeadMode::All(logits_out),
+        );
+    }
+
+    /// Batched MXFP8-KV spec primitive. See
+    /// [`Self::forward_speculation_batched_mxfp4`].
+    pub fn forward_speculation_batched_mxfp8(
+        &self,
+        tokens: &[i32],
+        start_pos: u32,
+        kv: &mut KvCache,
+        logits_out: &mut [f32],
+    ) {
+        let cfg = &self.cfg;
+        let n_new = tokens.len();
+        assert_eq!(
+            logits_out.len(),
+            n_new * cfg.vocab_size,
+            "forward_speculation_batched_mxfp8: logits_out must be sized to tokens.len() * vocab_size"
+        );
+        if n_new == 0 {
+            return;
+        }
+        self.forward_prefill_batched_mxfp_inner(
+            KvDtype::Mxfp8, tokens, start_pos, kv,
+            LmHeadMode::All(logits_out),
+        );
+    }
+
+    /// Shared per-layer body for the three MXFP batched-spec entries.
+    /// Byte-identical to `forward_prefill_batched_nvfp4_inner` except
+    /// the attention stage routes through the MXFP KV path: `fmt` picks
+    /// the per-format block bytes (17/25/33) + quant/attention kernels,
+    /// and the KV write + batched flash prefill (GPU→CPU) go through the
+    /// shared `mxfp_kv_prefill` helper — the same helper the contiguous
+    /// MXFP prefill uses, so paged/contiguous stay consistent.
+    fn forward_prefill_batched_mxfp_inner(
+        &self,
+        fmt: KvDtype,
+        tokens: &[i32],
+        start_pos: u32,
+        kv: &mut KvCache,
+        mode: LmHeadMode<'_>,
+    ) {
+        let cfg = &self.cfg;
+        let n_new = tokens.len();
+        if n_new == 0 {
+            return;
+        }
+        let d = cfg.d_model;
+        let n_heads = cfg.n_heads;
+        let n_kv_heads = cfg.n_kv_heads;
+        let head_dim = cfg.head_dim;
+        let d_q = n_heads * head_dim;
+        let d_kv = n_kv_heads * head_dim;
+        let d_ff = cfg.d_ff;
+        let max_ctx = kv.max_ctx;
+        let kv_len_base = start_pos as usize;
+        assert!(
+            kv_len_base + n_new <= max_ctx,
+            "prefill batch overflows max_ctx: {kv_len_base} + {n_new} > {max_ctx}"
+        );
+
+        let mut hidden = vec![0f32; n_new * d];
+        for (i, &tok) in tokens.iter().enumerate() {
+            k::embed_lookup_tensor(
+                &self.weights.token_embd,
+                &[tok],
+                &mut hidden[i * d..(i + 1) * d],
+                d,
+            );
+        }
+
+        let mut h_norm = vec![0f32; n_new * d];
+        let mut q_buf = vec![0f32; n_new * d_q];
+        let mut k_buf = vec![0f32; n_new * d_kv];
+        let mut v_buf = vec![0f32; n_new * d_kv];
+        let mut attn_out = vec![0f32; n_new * d_q];
+        let mut attn_proj = vec![0f32; n_new * d];
+        let mut gate_buf = vec![0f32; n_new * d_ff];
+        let mut up_buf = vec![0f32; n_new * d_ff];
+        let mut ffn_buf = vec![0f32; n_new * d_ff];
+        let mut ffn_out = vec![0f32; n_new * d];
+
+        // MoE single-token scratch — see forward_prefill_batched_f32.
+        let moe_cfg = cfg.moe.clone();
+        let (mut moe_gate_one, mut moe_up_one, mut moe_ff_one, mut moe_down_one) =
+            if moe_cfg.is_some() {
+                (vec![0f32; d_ff], vec![0f32; d_ff], vec![0f32; d_ff], vec![0f32; d])
+            } else {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            };
+        let (mut moe_expert_logits, mut moe_routed_picks) = if let Some(m) = moe_cfg.as_ref() {
+            (vec![0f32; m.n_experts as usize], Vec::with_capacity(m.n_experts_used as usize))
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        let attn_views: Vec<&dyn AttnBlock> =
+            if let Some(mbs) = self.weights.moe_blocks.as_ref() {
+                mbs.iter().map(|b| b as &dyn AttnBlock).collect()
+            } else {
+                self.weights
+                    .blocks
+                    .iter()
+                    .map(|b| b as &dyn AttnBlock)
+                    .collect()
+            };
+
+        let n_layers_used = std::env::var("RUSTLLAMA_MAX_LAYERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(attn_views.len())
+            .min(attn_views.len());
+
+        for (layer_idx, block) in attn_views.iter().take(n_layers_used).enumerate() {
+            // Hybrid placement: tell the `try_*_usm_f32` dispatch
+            // ladder which layer we're on. Helpers consult
+            // `accel::gpu_active_for_current_layer()` (= layer_idx
+            // < accel::n_gpu_layers()) to short-circuit the GPU
+            // path for layers past the `[inference].n_gpu_layers`
+            // cutoff.
+            crate::accel::set_current_layer_idx(layer_idx as u32);
+            // Stage 1 (per-token): pre-attention rmsnorm.
+            for i in 0..n_new {
+                let h_row = &hidden[i * d..(i + 1) * d];
+                let n_row = &mut h_norm[i * d..(i + 1) * d];
+                k::rmsnorm_f32_row(h_row, block.attn_norm(), n_row, cfg.rms_eps);
+            }
+            // Stage 2 (batched): Q / K / V projections.
+            matvec_tensor_batched_dispatch(block.w_q(), &h_norm, &mut q_buf, d_q, d, n_new);
+            matvec_tensor_batched_dispatch(block.w_k(), &h_norm, &mut k_buf, d_kv, d, n_new);
+            matvec_tensor_batched_dispatch(block.w_v(), &h_norm, &mut v_buf, d_kv, d, n_new);
+            // Stage 3 (per-token): bias + RoPE.
+            for i in 0..n_new {
+                let q_row = &mut q_buf[i * d_q..(i + 1) * d_q];
+                let k_row = &mut k_buf[i * d_kv..(i + 1) * d_kv];
+                let v_row = &mut v_buf[i * d_kv..(i + 1) * d_kv];
+                if let Some(bq) = block.b_q() {
+                    k::add_inplace_f32(q_row, bq);
+                }
+                if let Some(bk) = block.b_k() {
+                    k::add_inplace_f32(k_row, bk);
+                }
+                if let Some(bv) = block.b_v() {
+                    k::add_inplace_f32(v_row, bv);
+                }
+                let pos_i = (kv_len_base + i) as u32;
+                if rope_interleaved_enabled() {
+                    k::rope_inplace_interleaved(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
+                    k::rope_inplace_interleaved(k_row, n_kv_heads, head_dim, pos_i, cfg.rope_theta);
+                } else {
+                    k::rope_inplace_neox(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
+                    k::rope_inplace_neox(k_row, n_kv_heads, head_dim, pos_i, cfg.rope_theta);
+                }
+            }
+
+            // MXFP KV write + batched flash prefill. `mxfp_kv_prefill`
+            // quantizes all n_new K/V rows per-block into the packed
+            // slabs at `[kv_len_base, kv_len_base+n_new)` (layout
+            // `[h, pos]` with stride `head_dim/32 × blk_bytes`), then
+            // runs the GPU flash prefill or the CPU kernel — identical
+            // to the NVFP4 inline block, factored into the helper the
+            // contiguous MXFP prefill already shares.
+            let kv_layer = &mut kv.layers[layer_idx];
+            match kv_layer {
+                KvLayer::Mxfp4 { k_packed, v_packed }
+                | KvLayer::Mxfp6 { k_packed, v_packed }
+                | KvLayer::Mxfp8 { k_packed, v_packed } => {
+                    mxfp_kv_prefill(
+                        fmt, &q_buf, &k_buf, &v_buf, k_packed, v_packed, &mut attn_out,
+                        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                    );
+                }
+                _ => unreachable!("forward_prefill_batched_mxfp entered with non-MXFP KV"),
             }
 
             // Stage 4 (batched): output projection.

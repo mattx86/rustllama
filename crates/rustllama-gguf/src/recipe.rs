@@ -45,7 +45,8 @@ pub enum RecipeError {
         "recipe {path} line {line}: unknown target dtype {dtype:?}. \
          Supported targets: f32, f16, bf16, q4_0, q4_1, q5_0, q5_1, q8_0, q8_1, \
          q2_k, q3_k, q4_k, q5_k, q6_k, q8_k, tq1_0, tq2_0, iq4_nl, iq4_xs, \
-         iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq1_s, iq1_m."
+         iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq1_s, iq1_m, mxfp4, mxfp6, \
+         mxfp8, fp8."
     )]
     UnknownDtype {
         path: String,
@@ -203,6 +204,15 @@ pub fn parse_dtype_name(name: &str) -> Option<GgmlType> {
         "iq3_s" => Some(GgmlType::IQ3_S),
         "iq1_s" => Some(GgmlType::IQ1_S),
         "iq1_m" => Some(GgmlType::IQ1_M),
+        // OCP Microscaling (per-32-block E8M0 scale) + FP8 (per-tensor
+        // E4M3 scale in metadata). The MX encoders shipped with Wave 2
+        // but were never selectable by recipe string until now; FP8
+        // gained its encoder here. All four are `encoder_supported` in
+        // the quantize pipeline.
+        "mxfp4" => Some(GgmlType::Mxfp4),
+        "mxfp6" => Some(GgmlType::Mxfp6),
+        "mxfp8" => Some(GgmlType::Mxfp8),
+        "fp8" => Some(GgmlType::Fp8),
         _ => None,
     }
 }
@@ -292,6 +302,22 @@ blk.*.attn_q.weight  Q4_K  # inline comment
             RecipeError::UnknownDtype { dtype, .. } => assert_eq!(dtype, "q42_k"),
             other => panic!("expected UnknownDtype, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_dtype_name_accepts_fp8_and_mxfp_families() {
+        // FP8 (per-tensor E4M3 scale) + the three OCP MX formats are all
+        // selectable by recipe string; case-insensitive like the rest.
+        assert_eq!(parse_dtype_name("fp8"), Some(GgmlType::Fp8));
+        assert_eq!(parse_dtype_name("FP8"), Some(GgmlType::Fp8));
+        assert_eq!(parse_dtype_name("mxfp4"), Some(GgmlType::Mxfp4));
+        assert_eq!(parse_dtype_name("mxfp6"), Some(GgmlType::Mxfp6));
+        assert_eq!(parse_dtype_name("mxfp8"), Some(GgmlType::Mxfp8));
+        assert_eq!(parse_dtype_name("MXFP8"), Some(GgmlType::Mxfp8));
+        // A recipe file targeting FP8 parses end-to-end.
+        let rules = parse_recipe_text("blk.*.ffn_*.weight fp8\n", "<test>").unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].target, GgmlType::Fp8);
     }
 
     #[test]

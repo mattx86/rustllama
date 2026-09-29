@@ -22,7 +22,7 @@ use rayon::prelude::*;
 
 use crate::{dequant, encode, encode_iq, encode_iq_vec, encode_k, encode_mx, encode_t};
 use crate::recipe::{resolve_first_match, RecipeRule};
-use crate::{Gguf, GgmlType};
+use crate::{Gguf, GgmlType, MetadataValue};
 use crate::write::{GgufMmapWriter, GgufWriter, WriteError};
 
 thread_local! {
@@ -310,6 +310,22 @@ pub fn quantize_gguf<W: Write + Seek>(
         // Recipes stay authoritative — warn (don't override) when an
         // MTP head lands below 8 bits per weight.
         warn_if_mtp_below_8bpw(&t.name, target);
+        // FP8 (E4M3) target: compute the whole-tensor scale now (pass 1)
+        // and write `<name>.fp8_scale` — it MUST land in the header
+        // before `finish_header` so the loader reads it back. Only for a
+        // genuine re-encode to FP8, never a passthrough of an already-FP8
+        // source (which keeps the scale copied verbatim in stage 1). See
+        // the "FP8 non-chunked branch" comment block above.
+        let fp8_scale = if target == GgmlType::Fp8 && target != t.dtype {
+            let scale = resolve_fp8_scale(src, &t.name, t.dtype, n as usize)?;
+            dst.add_metadata(
+                format!("{}.fp8_scale", t.name),
+                MetadataValue::F32(scale),
+            )?;
+            Some(scale)
+        } else {
+            None
+        };
         dst.declare_tensor(t.name.clone(), t.dims.clone(), target)?;
         resolved.push(ResolvedTensor {
             name: t.name.clone(),
@@ -318,6 +334,7 @@ pub fn quantize_gguf<W: Write + Seek>(
             n_elements: n,
             dims: t.dims.clone(),
             passthrough: target == t.dtype,
+            fp8_scale,
         });
     }
 
@@ -337,6 +354,22 @@ pub fn quantize_gguf<W: Write + Seek>(
             dst.write_tensor_data(&r.name, src_bytes)?;
             stats.bytes_out += src_bytes.len() as u64;
             stats.tensors_passthrough += 1;
+        } else if let Some(scale) = r.fp8_scale {
+            // FP8 (E4M3, per-tensor scale): non-chunked pass-2 encode
+            // with the scale fixed + metadata-written in stage 2.
+            let target_bytes = r.target_dtype.byte_size(r.n_elements) as usize;
+            let mut enc_buf = vec![0u8; target_bytes];
+            encode_fp8_tensor(
+                r.src_dtype,
+                src_bytes,
+                r.n_elements as usize,
+                scale,
+                &mut enc_buf,
+                &r.name,
+            )?;
+            dst.write_tensor_data(&r.name, &enc_buf)?;
+            stats.bytes_out += target_bytes as u64;
+            stats.tensors_requantized += 1;
         } else {
             // **Chunked + parallel** dequant → encode.
             //
@@ -426,6 +459,13 @@ struct ResolvedTensor {
     /// imatrix vector across output rows during encode.
     dims: Vec<u64>,
     passthrough: bool,
+    /// Pre-computed FP8 (E4M3) per-tensor scale, `Some` only when this
+    /// tensor is being re-encoded to `GgmlType::Fp8`. Set in stage 2
+    /// (where it is also written to `<name>.fp8_scale` metadata, which
+    /// must precede `finish_header`); consumed in stage 3 by
+    /// [`encode_fp8_tensor`]. `None` for every other target — those go
+    /// through the per-chunk [`encode_from_f32`] path.
+    fp8_scale: Option<f32>,
 }
 
 /// **mmap-backed** variant of [`quantize_gguf`]. Writes the output
@@ -498,6 +538,22 @@ pub fn quantize_gguf_to_path_with_imatrix<P: AsRef<std::path::Path>>(
         // Recipes stay authoritative — warn (don't override) when an
         // MTP head lands below 8 bits per weight.
         warn_if_mtp_below_8bpw(&t.name, target);
+        // FP8 (E4M3) target: compute the whole-tensor scale now (pass 1)
+        // and write `<name>.fp8_scale` — it MUST land in the header
+        // before `finish_header` so the loader reads it back. Only for a
+        // genuine re-encode to FP8, never a passthrough of an already-FP8
+        // source (which keeps the scale copied verbatim in stage 1). See
+        // the "FP8 non-chunked branch" comment block above.
+        let fp8_scale = if target == GgmlType::Fp8 && target != t.dtype {
+            let scale = resolve_fp8_scale(src, &t.name, t.dtype, n as usize)?;
+            dst.add_metadata(
+                format!("{}.fp8_scale", t.name),
+                MetadataValue::F32(scale),
+            )?;
+            Some(scale)
+        } else {
+            None
+        };
         dst.declare_tensor(t.name.clone(), t.dims.clone(), target)?;
         resolved.push(ResolvedTensor {
             name: t.name.clone(),
@@ -506,6 +562,7 @@ pub fn quantize_gguf_to_path_with_imatrix<P: AsRef<std::path::Path>>(
             n_elements: n,
             dims: t.dims.clone(),
             passthrough: target == t.dtype,
+            fp8_scale,
         });
     }
 
@@ -531,6 +588,20 @@ pub fn quantize_gguf_to_path_with_imatrix<P: AsRef<std::path::Path>>(
             region.copy_from_slice(src_bytes);
             stats.bytes_out += region_bytes as u64;
             stats.tensors_passthrough += 1;
+        } else if let Some(scale) = r.fp8_scale {
+            // FP8 (E4M3, per-tensor scale): non-chunked pass-2 encode
+            // straight into the mapped region, with the scale fixed +
+            // metadata-written in stage 2.
+            encode_fp8_tensor(
+                r.src_dtype,
+                src_bytes,
+                r.n_elements as usize,
+                scale,
+                region,
+                &r.name,
+            )?;
+            stats.bytes_out += region_bytes as u64;
+            stats.tensors_requantized += 1;
         } else {
             // Chunked + parallel dequant→encode, writing directly
             // into the mapped region. Same algorithm as
@@ -707,6 +778,22 @@ pub fn quantize_gguf_to_path_with_encoder_imatrix<P: AsRef<std::path::Path>>(
         // Recipes stay authoritative — warn (don't override) when an
         // MTP head lands below 8 bits per weight.
         warn_if_mtp_below_8bpw(&t.name, target);
+        // FP8 (E4M3) target: compute the whole-tensor scale now (pass 1)
+        // and write `<name>.fp8_scale` — it MUST land in the header
+        // before `finish_header` so the loader reads it back. Only for a
+        // genuine re-encode to FP8, never a passthrough of an already-FP8
+        // source (which keeps the scale copied verbatim in stage 1). See
+        // the "FP8 non-chunked branch" comment block above.
+        let fp8_scale = if target == GgmlType::Fp8 && target != t.dtype {
+            let scale = resolve_fp8_scale(src, &t.name, t.dtype, n as usize)?;
+            dst.add_metadata(
+                format!("{}.fp8_scale", t.name),
+                MetadataValue::F32(scale),
+            )?;
+            Some(scale)
+        } else {
+            None
+        };
         dst.declare_tensor(t.name.clone(), t.dims.clone(), target)?;
         resolved.push(ResolvedTensor {
             name: t.name.clone(),
@@ -715,6 +802,7 @@ pub fn quantize_gguf_to_path_with_encoder_imatrix<P: AsRef<std::path::Path>>(
             n_elements: n,
             dims: t.dims.clone(),
             passthrough: target == t.dtype,
+            fp8_scale,
         });
     }
 
@@ -1135,6 +1223,20 @@ fn encode_cpu_tensor_serial(
     src_bytes: &[u8],
     region: &mut [u8],
 ) -> Result<(), QuantizeError> {
+    // FP8 (E4M3, per-tensor scale): non-chunked branch using the scale
+    // fixed in stage 2. Must run BEFORE the per-chunk `encode_from_f32`
+    // path below — that path has no scale channel and would hit the FP8
+    // `unreachable!` arm.
+    if let Some(scale) = r.fp8_scale {
+        return encode_fp8_tensor(
+            r.src_dtype,
+            src_bytes,
+            r.n_elements as usize,
+            scale,
+            region,
+            &r.name,
+        );
+    }
     const CHUNK_WEIGHTS: usize = 256 * 1024;
     let total_n = r.n_elements as usize;
     let chunk_cap = CHUNK_WEIGHTS.min(total_n);
@@ -1234,6 +1336,10 @@ fn encoder_supported(dtype: GgmlType) -> bool {
             | GgmlType::Mxfp4
             | GgmlType::Mxfp6
             | GgmlType::Mxfp8
+            // FP8 (E4M3, per-tensor scale) — encoded via the dedicated
+            // non-chunked branch (`encode_fp8_tensor`), NOT the per-chunk
+            // `encode_from_f32`; the scale is written to metadata first.
+            | GgmlType::Fp8
     )
 }
 
@@ -1377,26 +1483,162 @@ fn encode_from_f32(target_dtype: GgmlType, src: &[f32], dst: &mut [u8]) {
         GgmlType::IQ1_S => encode_iq_vec::encode_iq1_s(src, dst),
         GgmlType::IQ1_M => encode_iq_vec::encode_iq1_m(src, dst),
         // OCP Microscaling encoders (self-contained per-32 block +
-        // E8M0 scale). FP8 (per-tensor scale) is produced by a
-        // dedicated pipeline path, not this per-chunk encoder, so it is
-        // NOT `encoder_supported` here.
+        // E8M0 scale in the byte stream — so the per-chunk path works).
         GgmlType::Mxfp4 => encode_mx::encode_mxfp4(src, dst),
         GgmlType::Mxfp6 => encode_mx::encode_mxfp6(src, dst),
         GgmlType::Mxfp8 => encode_mx::encode_mxfp8(src, dst),
+        // FP8 (E4M3, per-TENSOR scale) is `encoder_supported`, but its
+        // scale is whole-tensor and written to GGUF metadata, so it can
+        // NOT be encoded from a lone chunk here. The pipeline routes FP8
+        // targets to `encode_fp8_tensor` (which supplies the pre-computed
+        // scale) BEFORE reaching this per-chunk dispatch — landing here
+        // means that routing was skipped.
+        GgmlType::Fp8 => unreachable!(
+            "encode_from_f32: FP8 must go through the per-tensor-scale branch \
+             (encode_fp8_tensor), not the per-chunk encoder"
+        ),
         // The pipeline checks `encoder_supported` before dispatch;
         // these remaining variants should never reach this match.
         // PQ2_0/PTQ1_0 are deliberately decode-only (we consume
         // PrismML's files; producing them means replicating their
-        // Hadamard-rotated quantization pipeline, out of scope). FP8
-        // needs the per-tensor-scale metadata path.
+        // Hadamard-rotated quantization pipeline, out of scope).
         GgmlType::Nvfp4
         | GgmlType::PQ2_0
-        | GgmlType::PTQ1_0
-        | GgmlType::Fp8 => unreachable!(
+        | GgmlType::PTQ1_0 => unreachable!(
             "encode_from_f32: encoder for {target_dtype:?} not implemented via the \
              per-chunk path — encoder_supported() should have rejected this earlier"
         ),
     }
+}
+
+// ----------------------------------------------------------------------
+// FP8 (E4M3, per-TENSOR scale) encode — the non-chunked branch.
+// ----------------------------------------------------------------------
+//
+// Unlike every other target, FP8's scale is whole-tensor and lives in
+// GGUF metadata (`<tensor>.fp8_scale`), not in the encoded bytes. So it
+// can NOT ride the `par_chunks_mut` per-chunk path, whose invariant is
+// that each output chunk is self-contained: a per-chunk absmax would
+// give each chunk a *different* scale. Instead FP8 is a two-pass,
+// stage-split encode:
+//   - **pass 1** (stage 2, while metadata can still be added): scan the
+//     whole tensor for its absmax, derive the per-tensor scale, and
+//     write `<tensor>.fp8_scale` into the header BEFORE `finish_header`.
+//   - **pass 2** (stage 3): dequant the source and quantize each element
+//     to one E4M3 byte with that fixed scale (see `encode_fp8_tensor`).
+
+/// FP8 (E4M3) per-tensor scale from a whole-tensor absmax. E4M3's max
+/// finite magnitude is 448 (= 1.75·2^8); mapping `absmax → 448` uses the
+/// element format's full dynamic range and lands the largest element on
+/// a representable level. Encode is `round_e4m3(x / scale)`, decode
+/// `e4m3(byte) * scale`, so the pair is inverse within E4M3's ~1/16
+/// worst-case relative rounding step. A zero / non-finite tensor scales
+/// by 1.0 (every element → E4M3 zero), matching the loader's default.
+fn fp8_tensor_scale(absmax: f32) -> f32 {
+    // E4M3 (4-bit exp bias 7, 3-bit mantissa): largest finite is
+    // 1.75 * 2^8 = 448.0. Kept in lockstep with `dequant::e4m3_to_f32`.
+    const E4M3_MAX: f32 = 448.0;
+    if absmax == 0.0 || !absmax.is_finite() {
+        1.0
+    } else {
+        absmax / E4M3_MAX
+    }
+}
+
+/// FP8 pass 1: dequant the source in bounded chunks and return the
+/// whole-tensor absolute maximum (ignoring non-finite values). Chunked
+/// so a multi-GB tensor doesn't expand whole to f32 just to find one
+/// scalar; `CHUNK_WEIGHTS` is a multiple of every source block size, so
+/// `byte_size(start)` is always exact at a chunk boundary. Returns
+/// `Err(())` when the source dtype has no dequant routine (the caller
+/// maps that to `UnsupportedSourceDtype`).
+fn fp8_source_absmax(
+    src_dtype: GgmlType,
+    src_bytes: &[u8],
+    n_elements: usize,
+) -> Result<f32, ()> {
+    const CHUNK_WEIGHTS: usize = 256 * 1024;
+    let mut absmax = 0.0f32;
+    let mut start = 0usize;
+    while start < n_elements {
+        let end = (start + CHUNK_WEIGHTS).min(n_elements);
+        let n_this = end - start;
+        let lo = src_dtype.byte_size(start as u64) as usize;
+        let hi = src_dtype.byte_size(end as u64) as usize;
+        with_f32_scratch(n_this, |buf| {
+            dequant_to_f32(src_dtype, &src_bytes[lo..hi], buf)?;
+            for &x in buf.iter() {
+                let a = x.abs();
+                if a.is_finite() && a > absmax {
+                    absmax = a;
+                }
+            }
+            Ok::<(), ()>(())
+        })?;
+        start = end;
+    }
+    Ok(absmax)
+}
+
+/// Resolve the FP8 per-tensor scale for a tensor being re-encoded to
+/// FP8: pass-1 absmax over the source, then [`fp8_tensor_scale`]. Called
+/// in stage 2 so the caller can add the `<name>.fp8_scale` metadata key
+/// before `finish_header`.
+fn resolve_fp8_scale(
+    src: &Gguf,
+    name: &str,
+    src_dtype: GgmlType,
+    n_elements: usize,
+) -> Result<f32, QuantizeError> {
+    let src_bytes = src
+        .tensor_bytes(name)
+        .ok_or_else(|| QuantizeError::MissingTensor(name.to_string()))?;
+    let absmax = fp8_source_absmax(src_dtype, src_bytes, n_elements).map_err(|()| {
+        QuantizeError::UnsupportedSourceDtype {
+            name: name.to_string(),
+            src: src_dtype,
+        }
+    })?;
+    Ok(fp8_tensor_scale(absmax))
+}
+
+/// FP8 pass 2: dequant the source and quantize each element to one E4M3
+/// byte with the pre-computed `scale` (already written to metadata in
+/// pass 1). Chunked — once the tensor scale is fixed each element's
+/// encode is self-contained, so this keeps the same bounded-scratch
+/// discipline as the K-quant/IQ paths. FP8 is 1 byte/element, so the
+/// output chunk length is exactly the weight count for that chunk.
+fn encode_fp8_tensor(
+    src_dtype: GgmlType,
+    src_bytes: &[u8],
+    n_elements: usize,
+    scale: f32,
+    dst: &mut [u8],
+    name: &str,
+) -> Result<(), QuantizeError> {
+    debug_assert_eq!(dst.len(), n_elements);
+    const CHUNK_WEIGHTS: usize = 256 * 1024;
+    // `n_elements >= 1` (declare_tensor rejects zero dims), so `max(1)`
+    // only guards the degenerate empty-slice case defensively.
+    let chunk_cap = CHUNK_WEIGHTS.min(n_elements.max(1));
+    for (i, out_chunk) in dst.chunks_mut(chunk_cap).enumerate() {
+        let start = i * chunk_cap;
+        let n_this = out_chunk.len(); // FP8: 1 byte per weight
+        let end = start + n_this;
+        let lo = src_dtype.byte_size(start as u64) as usize;
+        let hi = src_dtype.byte_size(end as u64) as usize;
+        with_f32_scratch(n_this, |buf| {
+            dequant_to_f32(src_dtype, &src_bytes[lo..hi], buf).map_err(|()| {
+                QuantizeError::UnsupportedSourceDtype {
+                    name: name.to_string(),
+                    src: src_dtype,
+                }
+            })?;
+            encode_mx::encode_fp8(buf, scale, out_chunk);
+            Ok::<(), QuantizeError>(())
+        })?;
+    }
+    Ok(())
 }
 
 /// Probe the writer for an existing metadata key. The `GgufWriter`
@@ -1494,6 +1736,87 @@ mod tests {
             }
         }
         assert!(max_err < 0.6, "Q4_K re-quantize: max_err={max_err}");
+
+        let _ = std::fs::remove_file(&tmp_src);
+        let _ = std::fs::remove_file(&tmp_dst);
+    }
+
+    /// End-to-end FP8 (E4M3, per-tensor scale) pipeline: F32 → FP8.
+    /// Unlike the block-scaled formats, FP8's scale is whole-tensor and
+    /// must be written to `<name>.fp8_scale` metadata BEFORE the tensor
+    /// bytes. This checks the scale is emitted where the loader looks
+    /// for it, the tensor reopens as FP8 (1 byte/element), and
+    /// dequant-with-that-scale round-trips within E4M3 tolerance.
+    #[test]
+    fn pipeline_requantizes_f32_to_fp8_with_scale_metadata() {
+        let n = 256usize;
+        // Spread across both signs; absmax at i=0 (= -3.2) maps to E4M3's
+        // representable max after scaling, so it round-trips exactly.
+        let row: Vec<f32> = (0..n).map(|i| (i as f32 - 128.0) / 40.0).collect();
+        let absmax = row.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+
+        let mut src_buf = GgufWriter::new(Cursor::new(Vec::<u8>::new()));
+        src_buf
+            .add_metadata(
+                "general.architecture",
+                MetadataValue::String("llama".into()),
+            )
+            .unwrap();
+        src_buf
+            .declare_tensor("a.weight", vec![n as u64], GgmlType::F32)
+            .unwrap();
+        src_buf.finish_header().unwrap();
+        let bytes_a: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+        src_buf.write_tensor_data("a.weight", &bytes_a).unwrap();
+        let src_bytes = src_buf.finish().unwrap().into_inner();
+        let tmp_src = std::env::temp_dir().join("rustllama_quantize_fp8_src.gguf");
+        std::fs::write(&tmp_src, &src_bytes).unwrap();
+        let src = Gguf::open(&tmp_src).unwrap();
+
+        let mut dst = GgufWriter::new(Cursor::new(Vec::<u8>::new()));
+        let plan = QuantizePlan::uniform(GgmlType::Fp8);
+        let stats = quantize_gguf(&src, &mut dst, &plan).unwrap();
+        assert_eq!(stats.tensors_requantized, 1);
+        assert_eq!(stats.tensors_passthrough, 0);
+        // FP8 is 1 byte/element — output is exactly `n` bytes.
+        assert_eq!(stats.bytes_out, n as u64);
+        let out_bytes = dst.finish().unwrap().into_inner();
+
+        let tmp_dst = std::env::temp_dir().join("rustllama_quantize_fp8_dst.gguf");
+        std::fs::write(&tmp_dst, &out_bytes).unwrap();
+        let re = Gguf::open(&tmp_dst).unwrap();
+        assert_eq!(re.tensor("a.weight").unwrap().dtype, GgmlType::Fp8);
+
+        // The per-tensor scale must be present under the exact key the
+        // loader reads (`<name>.fp8_scale`) and equal absmax / 448.
+        let scale = re
+            .metadata_get("a.weight.fp8_scale")
+            .and_then(|v| v.as_f32())
+            .expect("fp8_scale metadata missing");
+        assert!(
+            (scale - absmax / 448.0).abs() < 1e-6,
+            "fp8 scale mismatch: got {scale}, want {}",
+            absmax / 448.0
+        );
+
+        // Dequant with the stored scale and check the round-trip. E4M3's
+        // ~1/16 relative step bounds larger elements; near-zero elements
+        // use an absolute bound.
+        let mut deq = vec![0f32; n];
+        crate::dequant::dequant_fp8(re.tensor_bytes("a.weight").unwrap(), scale, &mut deq);
+        for i in 0..n {
+            let abs_err = (deq[i] - row[i]).abs();
+            let ok = if row[i].abs() > absmax * 0.02 {
+                abs_err <= row[i].abs() * 0.13
+            } else {
+                abs_err <= absmax * 0.02
+            };
+            assert!(
+                ok,
+                "fp8 pipeline round-trip idx {i}: src={} deq={} err={abs_err}",
+                row[i], deq[i]
+            );
+        }
 
         let _ = std::fs::remove_file(&tmp_src);
         let _ = std::fs::remove_file(&tmp_dst);

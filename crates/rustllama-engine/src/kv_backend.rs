@@ -52,8 +52,9 @@ pub enum KvBackendError {
     UnknownLayout(String),
     #[error(
         "kv_cache_layout = \"paged\" + kv_dtype = \"{kv_dtype}\" not yet supported. \
-         Paged backend now supports all four KvDtypes (F32, Q8_0, TQ, NVFP4) per \
-         H9b — this error remains only as a safety net for future unknown dtypes."
+         Paged backend now supports F32, Q8_0, TQ, NVFP4 (H9b) and MXFP4/6/8 \
+         (Wave 2); this error remains only for the documented Q4_0 non-goal and \
+         as a safety net for future unknown dtypes."
     )]
     PagedRequiresF32 { kv_dtype: String },
     #[error("paged KV store alloc failed (geometry would zero out)")]
@@ -96,6 +97,26 @@ pub enum KvBackend {
         store: rustllama_models::paged_kv_store::PagedKvStoreNvfp4,
         table: PageTable,
     },
+    /// Wave 2: MXFP4 paged variant (OCP Microscaling E2M1 + embedded
+    /// E8M0 scale, 17 B / 32-elem block). `head_dim` must be a multiple
+    /// of 32.
+    PagedMxfp4 {
+        cache: PagedKvCache,
+        store: rustllama_models::paged_kv_store::PagedKvStoreMxfp4,
+        table: PageTable,
+    },
+    /// Wave 2: MXFP6 paged variant (E3M2 + E8M0, 25 B / 32-elem block).
+    PagedMxfp6 {
+        cache: PagedKvCache,
+        store: rustllama_models::paged_kv_store::PagedKvStoreMxfp6,
+        table: PageTable,
+    },
+    /// Wave 2: MXFP8 paged variant (E4M3 + E8M0, 33 B / 32-elem block).
+    PagedMxfp8 {
+        cache: PagedKvCache,
+        store: rustllama_models::paged_kv_store::PagedKvStoreMxfp8,
+        table: PageTable,
+    },
 }
 
 impl KvBackend {
@@ -110,6 +131,9 @@ impl KvBackend {
             KvBackend::PagedQ8_0 { store, .. } => store.approx_bytes() as u64,
             KvBackend::PagedTQ { store, .. } => store.approx_bytes() as u64,
             KvBackend::PagedNvfp4 { store, .. } => store.approx_bytes() as u64,
+            KvBackend::PagedMxfp4 { store, .. } => store.approx_bytes() as u64,
+            KvBackend::PagedMxfp6 { store, .. } => store.approx_bytes() as u64,
+            KvBackend::PagedMxfp8 { store, .. } => store.approx_bytes() as u64,
         }
     }
 
@@ -246,17 +270,46 @@ impl KvBackend {
                     KvDtype::Q4_0 => Err(KvBackendError::PagedRequiresF32 {
                         kv_dtype: "q4_0".to_string(),
                     }),
-                    // MXFP KV is contiguous-only (no paged store yet),
-                    // mirroring Q4_0 — the paged layout needs F32.
-                    KvDtype::Mxfp4 => Err(KvBackendError::PagedRequiresF32 {
-                        kv_dtype: "mxfp4".to_string(),
-                    }),
-                    KvDtype::Mxfp6 => Err(KvBackendError::PagedRequiresF32 {
-                        kv_dtype: "mxfp6".to_string(),
-                    }),
-                    KvDtype::Mxfp8 => Err(KvBackendError::PagedRequiresF32 {
-                        kv_dtype: "mxfp8".to_string(),
-                    }),
+                    // MXFP KV paged stores (Wave 2): quantize-on-write /
+                    // dequantize-on-gather, same page geometry as NVFP4
+                    // but 32-elem blocks (17/25/33 B). `head_dim % 32`
+                    // must be 0 or `new` returns None → PagedStoreShape.
+                    KvDtype::Mxfp4 => {
+                        let store = rustllama_models::paged_kv_store::PagedKvStoreMxfp4::new(
+                            pages_for_one_request,
+                            model_cfg.n_layers as u32,
+                            model_cfg.n_kv_heads as u32,
+                            page_size,
+                            model_cfg.head_dim as u32,
+                        )
+                        .ok_or(KvBackendError::PagedStoreShape)?;
+                        let cache = PagedKvCache::new_with_page_size(store.page_size());
+                        Ok(KvBackend::PagedMxfp4 { cache, store, table })
+                    }
+                    KvDtype::Mxfp6 => {
+                        let store = rustllama_models::paged_kv_store::PagedKvStoreMxfp6::new(
+                            pages_for_one_request,
+                            model_cfg.n_layers as u32,
+                            model_cfg.n_kv_heads as u32,
+                            page_size,
+                            model_cfg.head_dim as u32,
+                        )
+                        .ok_or(KvBackendError::PagedStoreShape)?;
+                        let cache = PagedKvCache::new_with_page_size(store.page_size());
+                        Ok(KvBackend::PagedMxfp6 { cache, store, table })
+                    }
+                    KvDtype::Mxfp8 => {
+                        let store = rustllama_models::paged_kv_store::PagedKvStoreMxfp8::new(
+                            pages_for_one_request,
+                            model_cfg.n_layers as u32,
+                            model_cfg.n_kv_heads as u32,
+                            page_size,
+                            model_cfg.head_dim as u32,
+                        )
+                        .ok_or(KvBackendError::PagedStoreShape)?;
+                        let cache = PagedKvCache::new_with_page_size(store.page_size());
+                        Ok(KvBackend::PagedMxfp8 { cache, store, table })
+                    }
                 }
             }
             other => Err(KvBackendError::UnknownLayout(other.to_string())),
@@ -272,6 +325,9 @@ impl KvBackend {
             KvBackend::PagedQ8_0 { cache, table, .. } => cache.release(table),
             KvBackend::PagedTQ { cache, table, .. } => cache.release(table),
             KvBackend::PagedNvfp4 { cache, table, .. } => cache.release(table),
+            KvBackend::PagedMxfp4 { cache, table, .. } => cache.release(table),
+            KvBackend::PagedMxfp6 { cache, table, .. } => cache.release(table),
+            KvBackend::PagedMxfp8 { cache, table, .. } => cache.release(table),
         }
     }
 
@@ -282,7 +338,10 @@ impl KvBackend {
             KvBackend::Paged { cache, .. }
             | KvBackend::PagedQ8_0 { cache, .. }
             | KvBackend::PagedTQ { cache, .. }
-            | KvBackend::PagedNvfp4 { cache, .. } => cache.seq_len() as usize,
+            | KvBackend::PagedNvfp4 { cache, .. }
+            | KvBackend::PagedMxfp4 { cache, .. }
+            | KvBackend::PagedMxfp6 { cache, .. }
+            | KvBackend::PagedMxfp8 { cache, .. } => cache.seq_len() as usize,
         }
     }
 
@@ -300,7 +359,10 @@ impl KvBackend {
             KvBackend::Paged { cache, .. }
             | KvBackend::PagedQ8_0 { cache, .. }
             | KvBackend::PagedTQ { cache, .. }
-            | KvBackend::PagedNvfp4 { cache, .. } => cache.set_seq_len_for_rollback(n as u32),
+            | KvBackend::PagedNvfp4 { cache, .. }
+            | KvBackend::PagedMxfp4 { cache, .. }
+            | KvBackend::PagedMxfp6 { cache, .. }
+            | KvBackend::PagedMxfp8 { cache, .. } => cache.set_seq_len_for_rollback(n as u32),
         }
     }
 
@@ -312,6 +374,9 @@ impl KvBackend {
             KvBackend::PagedQ8_0 { .. } => KvDtype::Q8_0,
             KvBackend::PagedTQ { store, .. } => KvDtype::Tq(store.bits()),
             KvBackend::PagedNvfp4 { .. } => KvDtype::Nvfp4,
+            KvBackend::PagedMxfp4 { .. } => KvDtype::Mxfp4,
+            KvBackend::PagedMxfp6 { .. } => KvDtype::Mxfp6,
+            KvBackend::PagedMxfp8 { .. } => KvDtype::Mxfp8,
         }
     }
 
@@ -322,6 +387,9 @@ impl KvBackend {
                 | KvBackend::PagedQ8_0 { .. }
                 | KvBackend::PagedTQ { .. }
                 | KvBackend::PagedNvfp4 { .. }
+                | KvBackend::PagedMxfp4 { .. }
+                | KvBackend::PagedMxfp6 { .. }
+                | KvBackend::PagedMxfp8 { .. }
         )
     }
 
@@ -339,7 +407,10 @@ impl KvBackend {
             KvBackend::Paged { table, .. }
             | KvBackend::PagedQ8_0 { table, .. }
             | KvBackend::PagedTQ { table, .. }
-            | KvBackend::PagedNvfp4 { table, .. } => {
+            | KvBackend::PagedNvfp4 { table, .. }
+            | KvBackend::PagedMxfp4 { table, .. }
+            | KvBackend::PagedMxfp6 { table, .. }
+            | KvBackend::PagedMxfp8 { table, .. } => {
                 Some((table.total(), table.free_count() as u32))
             }
         }

@@ -33,11 +33,13 @@ import {
   streamChat,
   tokenizeCount,
   unloadModel,
+  type AskUser,
   type ChatMessage,
   type ConversationSummary,
   type ModelInfo,
   type SystemPrompt,
   type TagsModel,
+  type ToolCall,
   type UsageInfo,
 } from "../api";
 import TuneProgressModal from "../TuneProgressModal";
@@ -377,6 +379,33 @@ export default function ChatPage() {
   const [fingerprintChanged, setFingerprintChanged] =
     useState<{ prev: string; current: string } | null>(null);
   const [pending, setPending] = useState<string>("");
+  /// CLARIFY: a pending `ask_user` question. While set, the transcript
+  /// shows option buttons; clicking one appends it as a user turn and
+  /// continues the conversation.
+  const [pendingQuestion, setPendingQuestion] = useState<AskUser | null>(null);
+  /// A pending tool-call proposal awaiting approve/deny (auto-tools OFF).
+  const [pendingTools, setPendingTools] = useState<ToolCall[] | null>(null);
+  /// Auto-run tools: accept proposed tool calls without prompting. The chat
+  /// never executes tools — this only gates the confirm UI. Persisted per
+  /// browser (localStorage, best-effort).
+  const [autoTools, setAutoTools] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("rustllama.autoTools") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const toggleAutoTools = () => {
+    setAutoTools((v) => {
+      const next = !v;
+      try {
+        localStorage.setItem("rustllama.autoTools", next ? "1" : "0");
+      } catch {
+        /* private mode / blocked storage — in-memory only */
+      }
+      return next;
+    });
+  };
   const abortRef = useRef<AbortController | null>(null);
   /// Server-side request id (`chatcmpl-…`) captured from the first
   /// SSE chunk. Used by `stop()` to POST `/v1/cancel` so the
@@ -682,6 +711,8 @@ export default function ChatPage() {
     setStreaming("idle");
     setLastUsage(null);
     setActiveConvId(null);
+    setPendingQuestion(null);
+    setPendingTools(null);
   };
 
   const removeConv = async (id: number) => {
@@ -695,82 +726,19 @@ export default function ChatPage() {
     await refreshList();
   };
 
-  const send = async () => {
-    if (!draft.trim() || streaming === "streaming") return;
-    const userText = draft.trim();
-    const userMsg: ChatMessage =
-      attachedImages.length > 0
-        ? { role: "user", content: userText, images: attachedImages }
-        : { role: "user", content: userText };
-    setAttachedImages([]);
-    // On the first turn of a conversation, if a system-prompt entry
-    // is selected, materialize it as the conversation's leading
-    // message. Subsequent turns inherit it because it's now in
-    // `history`. Switching prompts mid-conversation is intentionally
-    // a no-op — the system message belongs to the conversation, not
-    // the live dropdown.
-    const startingFresh = history.length === 0;
-    const picked =
-      startingFresh && selectedPromptName
-        ? systemPrompts.find((p) => p.name === selectedPromptName)
-        : null;
-    const messagesToPrepend: ChatMessage[] = picked
-      ? [{ role: "system", content: picked.body }]
-      : [];
-    const newHistory = [...messagesToPrepend, ...history, userMsg];
-    setHistory(newHistory);
-    setDraft("");
-    setError(null);
-    setPending("");
-    setStreaming("streaming");
+  /// One-line description of proposed tool calls (auto-run note / footer).
+  const describeToolCalls = (calls: ToolCall[]) =>
+    "Proposed tool call: " +
+    calls.map((c) => `${c.name}(${c.arguments})`).join(", ");
 
-    // Persist the user message immediately so a network blip doesn't
-    // lose it. Create the conversation on the first turn — the
-    // conversation's title is the first user message, truncated.
-    let convId = activeConvId;
-    if (historyOn) {
-      try {
-        if (convId === null) {
-          const title =
-            userText.length > 60 ? userText.slice(0, 57) + "…" : userText;
-          convId = await createConversation(title);
-          setActiveConvId(convId);
-        }
-        // Persist the system prompt first so the conversation
-        // sidebar's full transcript reconstructs the same context
-        // shape as the in-memory `history`. Skipped silently when
-        // the appendMessage flow is unavailable.
-        if (picked) {
-          await appendMessage(convId, "system", picked.body);
-        }
-        await appendMessage(convId, "user", userText);
-      } catch (e) {
-        // History errors shouldn't break the chat. Surface to console
-        // and continue with the in-memory transcript.
-        console.warn("history persist failed:", e);
-      }
-    }
-
-    // Smart compaction: if this turn would overflow ~75% of the model's
-    // context window, ask the model to summarize the older turns first,
-    // then send the compacted transcript. Best-effort — on failure we
-    // send the full history and let the server truncate as before.
-    let toSend = newHistory;
-    if (ctxBudget && estTokens(newHistory) > ctxBudget * 0.75) {
-      setCompacting(true);
-      try {
-        const compacted = await compactContext(newHistory, ctxBudget);
-        if (compacted !== newHistory) {
-          toSend = compacted;
-          setHistory(compacted);
-        }
-      } catch (e) {
-        console.warn("auto-compaction failed:", e);
-      } finally {
-        setCompacting(false);
-      }
-    }
-
+  /// Stream one assistant turn against `toSend` and fold the result into the
+  /// transcript. Shared by `send()`, the CLARIFY option pick, and tool-deny
+  /// so a continuation reuses the exact same handlers (persistence, usage,
+  /// fingerprint, plus the ask_user / tool_calls policy).
+  const streamAssistantTurn = async (
+    toSend: ChatMessage[],
+    convId: number | null,
+  ) => {
     const ctrl = new AbortController();
     abortRef.current = ctrl;
     requestIdRef.current = null;
@@ -790,6 +758,25 @@ export default function ChatPage() {
         onContent: (delta) => {
           acc += delta;
           setPending(acc);
+        },
+        // CLARIFY: stash the question so the transcript renders a chooser.
+        onAskUser: (q) => {
+          setPendingTools(null);
+          setPendingQuestion(q);
+        },
+        // Tool-call proposal: auto-run accepts silently (a transcript note);
+        // otherwise raise an approve/deny prompt.
+        onToolCalls: (calls) => {
+          if (calls.length === 0) return;
+          if (autoTools) {
+            setHistory((h) => [
+              ...h,
+              { role: "assistant", content: describeToolCalls(calls) },
+            ]);
+          } else {
+            setPendingQuestion(null);
+            setPendingTools(calls);
+          }
         },
         onDone: async (info) => {
           if (acc.length > 0) {
@@ -844,6 +831,145 @@ export default function ChatPage() {
         },
       },
     );
+  };
+
+  /// CLARIFY: the user picked an option. Record the question + answer and
+  /// continue the conversation.
+  const chooseOption = async (opt: string) => {
+    if (streaming === "streaming") return;
+    const q = pendingQuestion;
+    if (!q) return;
+    setPendingQuestion(null);
+    const newHistory: ChatMessage[] = [
+      ...history,
+      { role: "assistant", content: q.prompt },
+      { role: "user", content: opt },
+    ];
+    setHistory(newHistory);
+    setError(null);
+    setPending("");
+    setStreaming("streaming");
+    const convId = activeConvId;
+    if (historyOn && convId !== null) {
+      try {
+        await appendMessage(convId, "assistant", q.prompt);
+        await appendMessage(convId, "user", opt);
+      } catch (e) {
+        console.warn("history persist failed:", e);
+      }
+    }
+    await streamAssistantTurn(newHistory, convId);
+  };
+
+  /// Approve a proposed tool call — the chat has no executor, so this just
+  /// dismisses the prompt (the note stays in the transcript).
+  const approveTools = () => setPendingTools(null);
+
+  /// Deny a proposed tool call: append a brief "don't run that" user turn
+  /// and continue so the model answers directly.
+  const denyTools = async () => {
+    if (streaming === "streaming") return;
+    setPendingTools(null);
+    const denyMsg: ChatMessage = {
+      role: "user",
+      content: "Please don't run that tool — answer directly instead.",
+    };
+    const newHistory = [...history, denyMsg];
+    setHistory(newHistory);
+    setError(null);
+    setPending("");
+    setStreaming("streaming");
+    const convId = activeConvId;
+    if (historyOn && convId !== null) {
+      try {
+        await appendMessage(convId, "user", denyMsg.content);
+      } catch (e) {
+        console.warn("history persist failed:", e);
+      }
+    }
+    await streamAssistantTurn(newHistory, convId);
+  };
+
+  const send = async () => {
+    if (!draft.trim() || streaming === "streaming") return;
+    const userText = draft.trim();
+    const userMsg: ChatMessage =
+      attachedImages.length > 0
+        ? { role: "user", content: userText, images: attachedImages }
+        : { role: "user", content: userText };
+    setAttachedImages([]);
+    // On the first turn of a conversation, if a system-prompt entry
+    // is selected, materialize it as the conversation's leading
+    // message. Subsequent turns inherit it because it's now in
+    // `history`. Switching prompts mid-conversation is intentionally
+    // a no-op — the system message belongs to the conversation, not
+    // the live dropdown.
+    const startingFresh = history.length === 0;
+    const picked =
+      startingFresh && selectedPromptName
+        ? systemPrompts.find((p) => p.name === selectedPromptName)
+        : null;
+    const messagesToPrepend: ChatMessage[] = picked
+      ? [{ role: "system", content: picked.body }]
+      : [];
+    const newHistory = [...messagesToPrepend, ...history, userMsg];
+    setHistory(newHistory);
+    setDraft("");
+    setError(null);
+    setPending("");
+    // A fresh manual send supersedes any pending clarify / tool prompt.
+    setPendingQuestion(null);
+    setPendingTools(null);
+    setStreaming("streaming");
+
+    // Persist the user message immediately so a network blip doesn't
+    // lose it. Create the conversation on the first turn — the
+    // conversation's title is the first user message, truncated.
+    let convId = activeConvId;
+    if (historyOn) {
+      try {
+        if (convId === null) {
+          const title =
+            userText.length > 60 ? userText.slice(0, 57) + "…" : userText;
+          convId = await createConversation(title);
+          setActiveConvId(convId);
+        }
+        // Persist the system prompt first so the conversation
+        // sidebar's full transcript reconstructs the same context
+        // shape as the in-memory `history`. Skipped silently when
+        // the appendMessage flow is unavailable.
+        if (picked) {
+          await appendMessage(convId, "system", picked.body);
+        }
+        await appendMessage(convId, "user", userText);
+      } catch (e) {
+        // History errors shouldn't break the chat. Surface to console
+        // and continue with the in-memory transcript.
+        console.warn("history persist failed:", e);
+      }
+    }
+
+    // Smart compaction: if this turn would overflow ~75% of the model's
+    // context window, ask the model to summarize the older turns first,
+    // then send the compacted transcript. Best-effort — on failure we
+    // send the full history and let the server truncate as before.
+    let toSend = newHistory;
+    if (ctxBudget && estTokens(newHistory) > ctxBudget * 0.75) {
+      setCompacting(true);
+      try {
+        const compacted = await compactContext(newHistory, ctxBudget);
+        if (compacted !== newHistory) {
+          toSend = compacted;
+          setHistory(compacted);
+        }
+      } catch (e) {
+        console.warn("auto-compaction failed:", e);
+      } finally {
+        setCompacting(false);
+      }
+    }
+
+    await streamAssistantTurn(toSend, convId);
   };
 
   const stop = () => {
@@ -1149,6 +1275,26 @@ export default function ChatPage() {
           >
             ⚙ Settings
           </button>
+          <label
+            title="When on, tool calls the model proposes are accepted without asking. This chat never executes tools; it only gates the confirm prompt."
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              fontSize: 12,
+              color: "var(--ll-text-muted)",
+              cursor: "pointer",
+              userSelect: "none",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={autoTools}
+              onChange={toggleAutoTools}
+              style={{ accentColor: "var(--ll-accent)", cursor: "pointer" }}
+            />
+            Auto-run tools
+          </label>
           {history.filter((m) => m.role !== "system").length >= 3 && (
             <button
               onClick={handleCompact}
@@ -1251,6 +1397,67 @@ export default function ChatPage() {
             );
           })()}
           {pending.length > 0 && renderMsg({ role: "assistant", content: pending }, "pending")}
+          {pendingQuestion && (
+            <div
+              style={{
+                margin: "12px 0",
+                padding: "12px 14px",
+                background: "var(--ll-bg-elev)",
+                border: "1px solid var(--ll-border-strong)",
+                borderRadius: 6,
+              }}
+            >
+              <div style={{ fontSize: 13, marginBottom: 10, color: "var(--ll-text)" }}>
+                {pendingQuestion.prompt || "Choose an option:"}
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {pendingQuestion.options.map((opt, i) => (
+                  <button
+                    key={i}
+                    onClick={() => chooseOption(opt)}
+                    disabled={streaming === "streaming"}
+                    style={btnSecondary}
+                  >
+                    {opt}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {pendingTools && (
+            <div
+              style={{
+                margin: "12px 0",
+                padding: "12px 14px",
+                background: "var(--ll-yellow-soft)",
+                border: "1px solid var(--ll-yellow)",
+                borderRadius: 6,
+              }}
+            >
+              <div style={{ fontSize: 13, marginBottom: 10, color: "var(--ll-text)" }}>
+                The model proposes a tool call:{" "}
+                <code>{describeToolCalls(pendingTools)}</code>. This chat can't
+                run tools — approve to acknowledge, or deny to have it answer
+                directly.
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={approveTools}
+                  disabled={streaming === "streaming"}
+                  style={btnPrimary}
+                >
+                  Approve
+                </button>
+                <button
+                  onClick={denyTools}
+                  disabled={streaming === "streaming"}
+                  style={btnSecondary}
+                >
+                  Deny
+                </button>
+              </div>
+            </div>
+          )}
           {error && (
             <div style={{ margin: "12px 0", padding: "10px 14px", background: "var(--ll-red-soft)", border: "1px solid var(--ll-red)", borderRadius: 4, color: "var(--ll-red)", fontSize: 13 }}>
               error: {error}

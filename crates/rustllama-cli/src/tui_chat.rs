@@ -26,7 +26,7 @@ use ratatui::crossterm::{
 };
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
-use rustllama_client::{ChatEvent, ChatMessage, ChatRequest, Client};
+use rustllama_client::{ChatEvent, ChatMessage, ChatRequest, Client, ToolCall};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 /// One transcript turn.
@@ -50,6 +50,18 @@ enum StreamMsg {
         id: String,
         note: String,
     },
+    /// CLARIFY: the model called `ask_user`. Carries the question + the
+    /// selectable options; the render loop stashes them as a pending
+    /// selection and the next digit/Enter answers.
+    AskUser {
+        prompt: String,
+        options: Vec<String>,
+    },
+    /// The model proposed tool calls. With auto-tools ON they're accepted
+    /// silently (a note); OFF they become a pending approve/deny prompt.
+    ToolCalls {
+        calls: Vec<ToolCall>,
+    },
 }
 
 /// TUI state.
@@ -71,6 +83,17 @@ struct App {
     top_k: u32,
     repeat_penalty: f32,
     should_quit: bool,
+    /// Auto-run tools: when true, proposed tool calls are accepted silently;
+    /// when false (default), they raise an approve/deny prompt. Toggled with
+    /// Ctrl-T. (The chat itself never executes tools — this only gates the
+    /// confirm prompt.)
+    auto_tools: bool,
+    /// CLARIFY: a pending `ask_user` question `(prompt, options)`. While set,
+    /// a digit / Enter answers it instead of sending a normal message.
+    pending_question: Option<(String, Vec<String>)>,
+    /// A pending tool-call approve/deny (auto-tools OFF). Holds the proposed
+    /// calls; `y`/Enter approves, `n` denies.
+    pending_tools: Option<Vec<ToolCall>>,
 }
 
 impl App {
@@ -210,6 +233,9 @@ async fn event_loop<B: Backend>(
         top_k: 40,
         repeat_penalty: 1.1,
         should_quit: false,
+        auto_tools: false,
+        pending_question: None,
+        pending_tools: None,
     };
 
     // Dedicated blocking input reader → channel, so the async loop never
@@ -281,6 +307,66 @@ fn handle_event(
         Event::Resize(_, _) => return true,
         _ => return false,
     };
+
+    // Ctrl-T toggles auto-run-tools at any time (even mid-prompt).
+    if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.auto_tools = !app.auto_tools;
+        app.status = if app.auto_tools {
+            "auto-tools: ON".into()
+        } else {
+            "auto-tools: OFF".into()
+        };
+        return true;
+    }
+    // Ctrl-C always quits, even with a selection pending.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.should_quit = true;
+        return true;
+    }
+
+    // A pending CLARIFY question captures input: a digit (1-9) or Enter
+    // picks an option, which becomes a user turn + continues the stream.
+    if let Some((_, options)) = app.pending_question.clone() {
+        match key.code {
+            KeyCode::Esc => app.should_quit = true,
+            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                let idx = (c as u8 - b'1') as usize;
+                if idx < options.len() {
+                    answer_pending_question(app, client, stream_tx, options[idx].clone());
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(first) = options.first().cloned() {
+                    answer_pending_question(app, client, stream_tx, first);
+                }
+            }
+            _ => return false,
+        }
+        return true;
+    }
+
+    // A pending tool-call confirm (auto-tools OFF): y/a/Enter accepts (the
+    // chat has no executor, so this just dismisses), n/d denies + continues.
+    if app.pending_tools.is_some() {
+        match key.code {
+            KeyCode::Esc => app.should_quit = true,
+            KeyCode::Char('y') | KeyCode::Char('a') | KeyCode::Enter => {
+                app.pending_tools = None;
+                app.turns.push(Turn {
+                    role: "info".into(),
+                    content: "tool call approved (chat has no executor; nothing ran)".into(),
+                });
+                app.status = "ready".into();
+            }
+            KeyCode::Char('n') | KeyCode::Char('d') => {
+                app.pending_tools = None;
+                deny_pending_tools(app, client, stream_tx);
+            }
+            _ => return false,
+        }
+        return true;
+    }
+
     match (key.code, key.modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             app.should_quit = true;
@@ -373,7 +459,61 @@ fn apply_stream_msg(app: &mut App, msg: StreamMsg) {
                 content: note,
             });
         }
+        StreamMsg::AskUser { prompt, options } => {
+            // Reuse the streaming placeholder (it never got content) as the
+            // question turn — so it's part of the transcript once answered —
+            // and stash it as a pending selection.
+            app.streaming = false;
+            drop_empty_assistant(app);
+            app.turns.push(Turn {
+                role: "assistant".into(),
+                content: prompt.clone(),
+            });
+            app.status = "choose an option (1-9 / Enter)".into();
+            app.pending_question = Some((prompt, options));
+        }
+        StreamMsg::ToolCalls { calls } => {
+            app.streaming = false;
+            drop_empty_assistant(app);
+            let summary = summarize_tool_calls(&calls);
+            if app.auto_tools {
+                // Accept silently — the chat can't execute tools, so this
+                // is just an acknowledgement note.
+                app.turns.push(Turn {
+                    role: "info".into(),
+                    content: format!("auto-accepted tool call: {summary}"),
+                });
+                app.status = "ready".into();
+            } else {
+                app.turns.push(Turn {
+                    role: "info".into(),
+                    content: format!("model proposes tool call: {summary}"),
+                });
+                app.status = "approve? y = accept / n = deny".into();
+                app.pending_tools = Some(calls);
+            }
+        }
     }
+}
+
+/// Drop a trailing empty assistant placeholder (the one a turn pushes before
+/// streaming) when the turn produced no text — e.g. an `ask_user` / tool-call
+/// terminus — so the transcript doesn't show a blank "AI:" bubble.
+fn drop_empty_assistant(app: &mut App) {
+    if let Some(last) = app.turns.last() {
+        if last.role == "assistant" && last.content.is_empty() {
+            app.turns.pop();
+        }
+    }
+}
+
+/// One-line summary of proposed tool calls for the transcript.
+fn summarize_tool_calls(calls: &[ToolCall]) -> String {
+    calls
+        .iter()
+        .map(|c| format!("{}({})", c.name, c.arguments))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn spawn_stream(client: Arc<Client>, req: ChatRequest, tx: UnboundedSender<StreamMsg>) {
@@ -399,6 +539,12 @@ fn spawn_stream(client: Arc<Client>, req: ChatRequest, tx: UnboundedSender<Strea
                                 tps
                             )));
                         }
+                        Ok(ChatEvent::AskUser { prompt, options, .. }) => {
+                            let _ = tx.send(StreamMsg::AskUser { prompt, options });
+                        }
+                        Ok(ChatEvent::ToolCalls(calls)) => {
+                            let _ = tx.send(StreamMsg::ToolCalls { calls });
+                        }
                         Ok(ChatEvent::Finish(_)) => break,
                         Ok(ChatEvent::Start) => {}
                         Ok(ChatEvent::Error(e)) => {
@@ -418,6 +564,50 @@ fn spawn_stream(client: Arc<Client>, req: ChatRequest, tx: UnboundedSender<Strea
             }
         }
     });
+}
+
+/// Answer a pending CLARIFY question: record the chosen option as a user
+/// turn (the question is already an assistant turn) and continue the stream.
+fn answer_pending_question(
+    app: &mut App,
+    client: &Arc<Client>,
+    stream_tx: &UnboundedSender<StreamMsg>,
+    answer: String,
+) {
+    app.pending_question = None;
+    app.turns.push(Turn {
+        role: "user".into(),
+        content: answer,
+    });
+    app.turns.push(Turn {
+        role: "assistant".into(),
+        content: String::new(),
+    });
+    app.streaming = true;
+    app.follow = true;
+    app.status = "generating…".into();
+    spawn_stream(client.clone(), app.request(), stream_tx.clone());
+}
+
+/// Deny a proposed tool call: push a brief "don't run that" user turn and
+/// continue the stream so the model answers directly instead.
+fn deny_pending_tools(
+    app: &mut App,
+    client: &Arc<Client>,
+    stream_tx: &UnboundedSender<StreamMsg>,
+) {
+    app.turns.push(Turn {
+        role: "user".into(),
+        content: "Please don't run that tool — answer directly instead.".into(),
+    });
+    app.turns.push(Turn {
+        role: "assistant".into(),
+        content: String::new(),
+    });
+    app.streaming = true;
+    app.follow = true;
+    app.status = "generating…".into();
+    spawn_stream(client.clone(), app.request(), stream_tx.clone());
 }
 
 /// In-TUI slash commands. These mirror the `rustllama` CLI verbs — the
@@ -467,14 +657,23 @@ fn handle_command(
                 app.status = format!("max_tokens = {v}");
             }
         }
+        // Toggle auto-run-tools (same as Ctrl-T). `on`/`off` force a state.
+        "auto" => {
+            app.auto_tools = match arg.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => !app.auto_tools,
+            };
+            app.status = format!("auto-tools: {}", if app.auto_tools { "ON" } else { "OFF" });
+        }
         "help" => {
             app.turns.push(Turn {
                 role: "info".into(),
                 content: "commands (mirror the CLI): /model <id|list|load <ref>|default <ref>|\
                           unload <id>>  ·  /chat <list|save [name]|resume <name>|delete <name>>  ·  \
                           /system <text>  /reset  /temp <f>  /top_p <f>  /top_k <n>  \
-                          /repeat_penalty <f>  /max_tokens <n>  /help  /quit   ·   \
-                          keys: Enter send · PgUp/PgDn scroll · Esc/Ctrl-C quit"
+                          /repeat_penalty <f>  /max_tokens <n>  /auto [on|off]  /help  /quit   ·   \
+                          keys: Enter send · PgUp/PgDn scroll · Ctrl-T auto-tools · Esc/Ctrl-C quit"
                     .into(),
             });
         }
@@ -771,6 +970,15 @@ fn ui(f: &mut Frame, app: &mut App) {
             format!("[{}]", app.status),
             Style::default().fg(Color::Gray),
         ),
+        // Auto-run-tools indicator (Ctrl-T toggles).
+        Span::styled(
+            format!("  tools:{}", if app.auto_tools { "auto" } else { "ask" }),
+            Style::default().fg(if app.auto_tools {
+                Color::Magenta
+            } else {
+                Color::DarkGray
+            }),
+        ),
     ]);
     f.render_widget(Paragraph::new(status), chunks[0]);
 
@@ -829,6 +1037,37 @@ fn ui(f: &mut Frame, app: &mut App) {
             }
         }
         lines.push(Line::from("")); // blank separator between turns
+    }
+
+    // CLARIFY: render the pending question's numbered options so the user
+    // knows what a digit / Enter will pick.
+    if let Some((_, options)) = &app.pending_question {
+        lines.push(Line::from(vec![Span::styled(
+            "Choose an option (press its number, or Enter for 1):",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        for (i, opt) in options.iter().enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {}. ", i + 1),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(opt.clone()),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+    // Tool-confirm (auto-tools OFF): prompt approve/deny.
+    if app.pending_tools.is_some() {
+        lines.push(Line::from(vec![Span::styled(
+            "Run this tool call?  y = accept   n = deny (Ctrl-T = auto-run)",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        lines.push(Line::from(""));
     }
 
     // Auto-follow: pin scroll to the bottom unless the user scrolled up.

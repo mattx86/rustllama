@@ -9135,6 +9135,10 @@ async fn chat_repl(
     let mut top_p: f32 = 0.95;
     let mut top_k: u32 = 40;
     let mut repeat_penalty: f32 = 1.1;
+    // Auto-run tools: OFF prompts approve/deny on each proposed tool call;
+    // ON accepts silently. Toggled with `/auto`. (The REPL never executes
+    // tools — this only gates the confirmation prompt.)
+    let mut auto_tools = false;
 
     // rustyline editor with history under %APPDATA%\rustllama\chat_history
     let history_path = rustllama_config::default_config_path()
@@ -9196,6 +9200,10 @@ async fn chat_repl(
                     );
                     println!("    /repeat_penalty <0.5..2.0>  discourage repeats; 1.0 = off (current: {repeat_penalty})");
                     println!("    /max_tokens <n>    per-turn token cap (current: {max_tokens})");
+                    println!(
+                        "    /auto [on|off]     toggle auto-run of proposed tool calls (current: {})",
+                        if auto_tools { "on" } else { "off" }
+                    );
                     println!("    /save <path>       append the last assistant message to a file");
                     println!(
                         "    /transcript <path> dump the full conversation as markdown to a file"
@@ -9403,6 +9411,21 @@ async fn chat_repl(
                     }
                     continue;
                 }
+                // Toggle auto-run-tools (accept proposed tool calls without
+                // prompting). `on`/`off` force a state; bare toggles.
+                "auto" => {
+                    auto_tools = match arg.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        "" => !auto_tools,
+                        other => {
+                            println!("usage: /auto [on|off]  (got `{other}`)");
+                            continue;
+                        }
+                    };
+                    println!("[auto-tools {}]", if auto_tools { "on" } else { "off" });
+                    continue;
+                }
                 "top_p" => {
                     match arg.parse::<f32>() {
                         Ok(p) if (0.0..=1.0).contains(&p) => {
@@ -9568,21 +9591,76 @@ async fn chat_repl(
             content: trimmed.to_string(),
         });
 
-        let req = ChatRequest {
-            model: model_label.clone(),
-            messages: messages.clone(),
-            temperature: Some(temperature),
-            top_p: Some(top_p),
-            top_k: Some(top_k),
-            max_tokens: Some(max_tokens),
-            repeat_penalty: Some(repeat_penalty),
-            stream: true,
-            stream_options: Some(rustllama_client::StreamOptions {
-                include_usage: true,
-            }),
-        };
-
-        drive_chat_stream(&client, req, &mut messages).await?;
+        // Drive the turn, then service any interactive follow-up (CLARIFY
+        // option pick / tool-confirm) by appending a user turn and
+        // re-issuing, until the model finishes normally.
+        loop {
+            let req = ChatRequest {
+                model: model_label.clone(),
+                messages: messages.clone(),
+                temperature: Some(temperature),
+                top_p: Some(top_p),
+                top_k: Some(top_k),
+                max_tokens: Some(max_tokens),
+                repeat_penalty: Some(repeat_penalty),
+                stream: true,
+                stream_options: Some(rustllama_client::StreamOptions {
+                    include_usage: true,
+                }),
+            };
+            match drive_chat_stream(&client, req, &mut messages).await? {
+                StreamOutcome::Normal => break,
+                StreamOutcome::AskUser { prompt, options } => {
+                    // Record the question as an assistant turn so the
+                    // follow-up request is coherent, then read the pick.
+                    messages.push(ChatMessage {
+                        role: "assistant".into(),
+                        content: prompt,
+                    });
+                    match read_clarify_selection(&mut rl, &options)? {
+                        Some(answer) => {
+                            println!("\x1b[2m[you chose: {answer}]\x1b[0m");
+                            messages.push(ChatMessage {
+                                role: "user".into(),
+                                content: answer,
+                            });
+                            // Loop: re-issue with the answer appended.
+                        }
+                        None => break, // aborted — leave the question in view
+                    }
+                }
+                StreamOutcome::ToolCalls(calls) => {
+                    let summary = summarize_tool_calls(&calls);
+                    if auto_tools {
+                        println!("\x1b[2m[auto-accepted tool call: {summary}]\x1b[0m");
+                        break;
+                    }
+                    println!("[model proposes tool call: {summary}]");
+                    let ans = match rl.readline("run it? [y/N] ") {
+                        Ok(l) => l,
+                        Err(rustyline::error::ReadlineError::Interrupted)
+                        | Err(rustyline::error::ReadlineError::Eof) => break,
+                        Err(e) => return Err(e.into()),
+                    };
+                    let approved = matches!(
+                        ans.trim().to_ascii_lowercase().as_str(),
+                        "y" | "yes" | "a"
+                    );
+                    if approved {
+                        // The REPL has no tool executor, so "approve" just
+                        // acknowledges — nothing runs.
+                        println!("[approved — the chat has no tool executor, so nothing ran]");
+                        break;
+                    }
+                    // Deny: ask the model to answer directly, then re-issue.
+                    messages.push(ChatMessage {
+                        role: "user".into(),
+                        content: "Please don't run that tool — answer directly instead."
+                            .into(),
+                    });
+                }
+            }
+        }
         continue;
     }
 
@@ -9929,11 +10007,26 @@ async fn embed_oneshot(
     Ok(())
 }
 
+/// What a streaming turn ended in — drives the REPL's interactive follow-up
+/// (CLARIFY option pick / tool-confirm) after [`drive_chat_stream`] returns.
+enum StreamOutcome {
+    /// A normal completion (or an error already reported); nothing to prompt.
+    Normal,
+    /// CLARIFY: the model asked the user a question with selectable options.
+    AskUser {
+        prompt: String,
+        options: Vec<String>,
+    },
+    /// The model proposed one or more tool calls; the REPL applies its
+    /// confirm / auto-run policy over them.
+    ToolCalls(Vec<rustllama_client::ToolCall>),
+}
+
 async fn drive_chat_stream(
     client: &rustllama_client::Client,
     req: rustllama_client::ChatRequest,
     messages: &mut Vec<rustllama_client::ChatMessage>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<StreamOutcome> {
     use futures::StreamExt as _;
     use rustllama_client::{ChatEvent, ChatMessage};
     use std::io::Write as _;
@@ -9948,13 +10041,17 @@ async fn drive_chat_stream(
             if messages.last().map(|m| m.role.as_str()) == Some("user") {
                 messages.pop();
             }
-            return Ok(());
+            return Ok(StreamOutcome::Normal);
         }
     };
 
     let mut content = String::new();
     let mut got_error = false;
     let mut last_usage: Option<rustllama_client::Usage> = None;
+    // CLARIFY / tool-confirm signals — surfaced by the client just before
+    // Finish. Handled by the caller after this turn's output is flushed.
+    let mut ask_user: Option<(String, Vec<String>)> = None;
+    let mut tool_calls: Option<Vec<rustllama_client::ToolCall>> = None;
     while let Some(ev) = stream.next().await {
         match ev {
             Ok(ChatEvent::Start) => {}
@@ -9962,6 +10059,16 @@ async fn drive_chat_stream(
                 print!("{t}");
                 let _ = std::io::stdout().flush();
                 content.push_str(&t);
+            }
+            Ok(ChatEvent::AskUser { prompt, options, .. }) => {
+                // Echo the question inline (it isn't content); the caller
+                // prints the numbered options and reads a selection.
+                print!("{prompt}");
+                let _ = std::io::stdout().flush();
+                ask_user = Some((prompt, options));
+            }
+            Ok(ChatEvent::ToolCalls(calls)) => {
+                tool_calls = Some(calls);
             }
             Ok(ChatEvent::Usage(u)) => {
                 // Save for printing after Finish — usage typically
@@ -10017,13 +10124,62 @@ async fn drive_chat_stream(
         if messages.last().map(|m| m.role.as_str()) == Some("user") {
             messages.pop();
         }
-    } else if !content.is_empty() {
+        return Ok(StreamOutcome::Normal);
+    }
+    if !content.is_empty() {
         messages.push(ChatMessage {
             role: "assistant".into(),
             content,
         });
     }
-    Ok(())
+    // CLARIFY takes precedence over a tool-call terminus (mirrors the
+    // server): the model paused to ask, so prompt the user for that.
+    if let Some((prompt, options)) = ask_user {
+        return Ok(StreamOutcome::AskUser { prompt, options });
+    }
+    if let Some(calls) = tool_calls {
+        return Ok(StreamOutcome::ToolCalls(calls));
+    }
+    Ok(StreamOutcome::Normal)
+}
+
+/// Print numbered CLARIFY options and read the user's pick. A bare number
+/// selects that option; any other non-empty line is used verbatim as a
+/// freeform answer; an empty line defaults to the first option. Returns
+/// `None` if the user aborted (Ctrl-C / EOF).
+fn read_clarify_selection(
+    rl: &mut rustyline::DefaultEditor,
+    options: &[String],
+) -> anyhow::Result<Option<String>> {
+    println!();
+    for (i, o) in options.iter().enumerate() {
+        println!("  {}. {o}", i + 1);
+    }
+    let line = match rl.readline("choose> ") {
+        Ok(l) => l,
+        Err(rustyline::error::ReadlineError::Interrupted)
+        | Err(rustyline::error::ReadlineError::Eof) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(options.first().cloned());
+    }
+    if let Ok(n) = trimmed.parse::<usize>() {
+        if n >= 1 && n <= options.len() {
+            return Ok(Some(options[n - 1].clone()));
+        }
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// One-line summary of proposed tool calls for the REPL.
+fn summarize_tool_calls(calls: &[rustllama_client::ToolCall]) -> String {
+    calls
+        .iter()
+        .map(|c| format!("{}({})", c.name, c.arguments))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
