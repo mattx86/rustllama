@@ -596,6 +596,91 @@ impl KvDtypeMeasurementReport {
         Some(eligible[0].0)
     }
 
+    /// Speed-first-if-it-fits KV dtype selection.
+    ///
+    /// Among candidates that stay coherent (top-1 agreement ≥
+    /// `agreement_threshold` with the highest-precision reference —
+    /// same reference + coherence gate as [`Self::pick_coherence_first`]),
+    /// pick the **fastest** (highest median tok/s) whose KV cache fits
+    /// the memory budget. `kv_bytes(dt)` returns the estimated total
+    /// K+V cache size at the deployment context for dtype `dt`; a
+    /// candidate is eligible only when `kv_bytes(dt) <= budget_bytes`.
+    ///
+    /// Under memory pressure — when no coherent candidate fits — fall
+    /// back to the smallest coherent dtype (identical to
+    /// [`Self::pick_coherence_first`]), so a tight box still gets a
+    /// coherent, memory-frugal pick rather than one that would OOM.
+    ///
+    /// `budget_bytes == 0` disables the fit gate (everything is treated
+    /// as fitting): callers pass `0` when they cannot determine a budget
+    /// and would rather honor the speed-first intent than guess.
+    ///
+    /// Returns `None` only if no candidate produced tokens at all.
+    pub fn pick_speed_first_if_fits(
+        &self,
+        agreement_threshold: f32,
+        budget_bytes: u64,
+        kv_bytes: impl Fn(KvDtype) -> u64,
+    ) -> Option<KvDtype> {
+        // Reference: highest-bits candidate that produced tokens
+        // (shared definition with `pick_coherence_first`).
+        let mut reference: Option<(KvDtype, &[u32])> = None;
+        for c in &self.candidates {
+            if let Some(toks) = c.decode_tokens.as_deref() {
+                let take = match reference {
+                    None => true,
+                    Some((dt, _)) => {
+                        c.kv_dtype.approx_bits_per_element() > dt.approx_bits_per_element()
+                    }
+                };
+                if take {
+                    reference = Some((c.kv_dtype, toks));
+                }
+            }
+        }
+        let (ref_dt, ref_toks) = reference?;
+
+        // Coherent candidates that produced a median tps:
+        // (kv_dtype, bits_per_element, median_tps).
+        let mut coherent: Vec<(KvDtype, f32, f64)> = Vec::new();
+        for c in &self.candidates {
+            let Some(toks) = c.decode_tokens.as_deref() else {
+                continue;
+            };
+            let Some(med) = c.median_tps else { continue };
+            let agree = top1_agreement(toks, ref_toks);
+            // The reference passes trivially (agrees with itself);
+            // others must clear the coherence bar.
+            if c.kv_dtype != ref_dt && agree < agreement_threshold {
+                continue;
+            }
+            coherent.push((c.kv_dtype, c.kv_dtype.approx_bits_per_element(), med));
+        }
+        if coherent.is_empty() {
+            return Some(ref_dt);
+        }
+
+        // Fastest coherent that fits the budget (0 = no gate).
+        let fits = |dt: KvDtype| budget_bytes == 0 || kv_bytes(dt) <= budget_bytes;
+        if let Some((dt, _, _)) = coherent
+            .iter()
+            .filter(|(dt, _, _)| fits(*dt))
+            .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            return Some(*dt);
+        }
+
+        // Memory pressure: nothing coherent fits. Fall back to the
+        // smallest coherent dtype (bits ASC, tps DESC) — the same
+        // memory-frugal pick `pick_coherence_first` would make.
+        coherent.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        Some(coherent[0].0)
+    }
+
     /// Compute top-1 agreement (in `[0, 1]`) between each candidate's
     /// decode and a reference KV dtype's decode. Returns the pairs
     /// in `(kv_dtype, agreement)` order. Useful for diagnostic
@@ -2536,5 +2621,122 @@ mod kv_coherence_tests {
             ],
         };
         assert_eq!(report.pick_coherence_first(0.90), Some(KvDtype::F32));
+    }
+
+    // Estimated K+V bytes for a dtype: an f16 base scaled by
+    // bits/16, matching how the CLI derives the fit estimate from
+    // `kv_cache_vram_bytes` (which is f16-based).
+    fn kv_bytes_est(dt: KvDtype, f16_base: u64) -> u64 {
+        ((f16_base as f64) * (dt.approx_bits_per_element() as f64) / 16.0) as u64
+    }
+
+    #[test]
+    fn speed_first_picks_fastest_coherent_when_all_fit() {
+        // F32 reference; Q8_0 + Q4_0 both coherent. F32 is fastest.
+        // With a roomy budget every candidate fits, so speed wins:
+        // pick F32 even though it is the largest KV footprint.
+        let report = KvDtypeMeasurementReport {
+            total_load_ms: 0.0,
+            winner: Some(KvDtype::F32),
+            winner_tps: 100.0,
+            candidates: vec![
+                mk(KvDtype::F32, 130.0, Some(vec![1, 2, 3, 4])),
+                mk(KvDtype::Q8_0, 110.0, Some(vec![1, 2, 3, 4])),
+                mk(KvDtype::Q4_0, 90.0, Some(vec![1, 2, 3, 4])),
+            ],
+        };
+        let base = 1_000_000; // 1 MB f16 base → F32 ≈ 2 MB
+        let budget = 1_000_000_000; // 1 GB: everything fits
+        assert_eq!(
+            report.pick_speed_first_if_fits(0.90, budget, |dt| kv_bytes_est(dt, base)),
+            Some(KvDtype::F32)
+        );
+    }
+
+    #[test]
+    fn speed_first_downgrades_under_memory_pressure() {
+        // Same candidates, but the budget only admits a ~4.5-bit KV
+        // cache. F32 (fastest) and Q8_0 don't fit; Q4_0 does — so the
+        // fastest *fitting* coherent candidate (Q4_0) is chosen.
+        let report = KvDtypeMeasurementReport {
+            total_load_ms: 0.0,
+            winner: Some(KvDtype::F32),
+            winner_tps: 100.0,
+            candidates: vec![
+                mk(KvDtype::F32, 130.0, Some(vec![1, 2, 3, 4])),
+                mk(KvDtype::Q8_0, 110.0, Some(vec![1, 2, 3, 4])),
+                mk(KvDtype::Q4_0, 90.0, Some(vec![1, 2, 3, 4])),
+            ],
+        };
+        let base = 1_000_000;
+        // Q4_0 ≈ 281 KB, Q8_0 ≈ 531 KB, F32 ≈ 2 MB. Budget 400 KB
+        // admits only Q4_0.
+        let budget = 400_000;
+        assert_eq!(
+            report.pick_speed_first_if_fits(0.90, budget, |dt| kv_bytes_est(dt, base)),
+            Some(KvDtype::Q4_0)
+        );
+    }
+
+    #[test]
+    fn speed_first_falls_back_to_smallest_when_nothing_fits() {
+        // Budget is below even the smallest coherent candidate: fall
+        // back to the smallest coherent dtype (never OOM), matching
+        // `pick_coherence_first`.
+        let report = KvDtypeMeasurementReport {
+            total_load_ms: 0.0,
+            winner: Some(KvDtype::F32),
+            winner_tps: 100.0,
+            candidates: vec![
+                mk(KvDtype::F32, 130.0, Some(vec![1, 2, 3, 4])),
+                mk(KvDtype::Q4_0, 90.0, Some(vec![1, 2, 3, 4])),
+            ],
+        };
+        let base = 1_000_000;
+        let budget = 1; // nothing fits
+        assert_eq!(
+            report.pick_speed_first_if_fits(0.90, budget, |dt| kv_bytes_est(dt, base)),
+            Some(KvDtype::Q4_0)
+        );
+    }
+
+    #[test]
+    fn speed_first_zero_budget_disables_fit_gate() {
+        // budget == 0 means "cannot determine budget": honor the
+        // speed-first intent and pick the fastest coherent candidate.
+        let report = KvDtypeMeasurementReport {
+            total_load_ms: 0.0,
+            winner: Some(KvDtype::F32),
+            winner_tps: 100.0,
+            candidates: vec![
+                mk(KvDtype::F32, 130.0, Some(vec![1, 2, 3, 4])),
+                mk(KvDtype::Q4_0, 90.0, Some(vec![1, 2, 3, 4])),
+            ],
+        };
+        assert_eq!(
+            report.pick_speed_first_if_fits(0.90, 0, |_dt| u64::MAX),
+            Some(KvDtype::F32)
+        );
+    }
+
+    #[test]
+    fn speed_first_respects_coherence_gate() {
+        // F32 fastest but Q4_0 is incoherent (wrong tokens). Even
+        // with a roomy budget, the incoherent fast-but-smaller
+        // candidate is excluded; F32 (coherent) wins.
+        let report = KvDtypeMeasurementReport {
+            total_load_ms: 0.0,
+            winner: Some(KvDtype::F32),
+            winner_tps: 100.0,
+            candidates: vec![
+                mk(KvDtype::F32, 100.0, Some(vec![1, 2, 3, 4])),
+                mk(KvDtype::Q4_0, 200.0, Some(vec![9, 9, 9, 9])),
+            ],
+        };
+        let base = 1_000_000;
+        assert_eq!(
+            report.pick_speed_first_if_fits(0.90, 1_000_000_000, |dt| kv_bytes_est(dt, base)),
+            Some(KvDtype::F32)
+        );
     }
 }

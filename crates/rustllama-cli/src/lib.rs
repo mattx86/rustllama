@@ -458,6 +458,14 @@ pub enum Command {
         /// Repeats per arm for the chunked-SSM-prefill sweep.
         #[arg(long, default_value_t = 3)]
         ssm_prefill_chunked_repeats: u32,
+        /// Decision-calibration (temperature scaling for typed
+        /// decisions). Loads the model, fits a calibration temperature
+        /// over the labeled decision set, and persists it to the tuner
+        /// cache. Primarily exists so `tune --all` can run this stage
+        /// as an isolated subprocess (fresh SYCL/USM state); rarely
+        /// invoked directly.
+        #[arg(long)]
+        decision_calibrate: bool,
         /// **Comprehensive autotune**: run every sweep in coordinate-
         /// descent order — kernel LWS → kv_dtype → flash_attention →
         /// kv_cache_layout → placement → batch_size → threads — and
@@ -1146,6 +1154,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             speculative_mtp_repeats,
             ssm_prefill_chunked,
             ssm_prefill_chunked_repeats,
+            decision_calibrate,
             all,
             skip_cached,
             force,
@@ -1183,6 +1192,19 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 decode_tokens
             };
             let eff_repeats = if thorough { repeats.max(7) } else { repeats };
+            // Quick-by-default batch-size candidate grid. The quick batch sweep
+            // uses a 256-token prompt (QUICK_BATCH_SWEEP_PROMPT_TOKENS), so any
+            // chunk-size candidate >= that prompt length degenerates to a single
+            // chunk and just re-measures the same thing — trim the grid to the
+            // two candidates that actually differ at 256 tokens. `--thorough`
+            // restores the full user-supplied grid (default 128..=2048) paired
+            // with the 2048-token prefill. batch_size is the slowest single
+            // stage, so cutting redundant candidates is the biggest quick win.
+            let eff_batch_candidates: &str = if thorough {
+                batch_candidates.as_str()
+            } else {
+                "128,256"
+            };
             let exclusive = [
                 placement,
                 batch_size,
@@ -1197,6 +1219,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 moe_placement,
                 speculative_mtp,
                 ssm_prefill_chunked,
+                decision_calibrate,
                 all,
             ]
             .iter()
@@ -1208,7 +1231,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                      --flash-attention / --kv-layout / --flash-kv-min / \
                      --prefix-snapshots / --kv-page-size / --flash-v3-kv-tile / \
                      --moe-placement / --speculative-mtp / --ssm-prefill-chunked / \
-                     --all are exclusive; pick at most one"
+                     --decision-calibrate / --all are exclusive; pick at most one"
                 );
             }
             if all {
@@ -1224,7 +1247,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     prompt_tokens,
                     eff_decode_tokens,
                     eff_repeats,
-                    &batch_candidates,
+                    eff_batch_candidates,
                     batch_prompt_tokens,
                     eff_repeats,
                     &threads_candidates,
@@ -1333,6 +1356,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     ssm_prefill_chunked_repeats,
                 );
             }
+            if decision_calibrate {
+                return cmd_decision_calibrate(&config_path, model);
+            }
             if threads {
                 return cmd_tune_threads(
                     &config_path,
@@ -1346,7 +1372,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 cmd_tune_batch_size(
                     &config_path,
                     model,
-                    &batch_candidates,
+                    eff_batch_candidates,
                     batch_prompt_tokens,
                     eff_repeats,
                 )
@@ -4823,19 +4849,31 @@ fn cmd_tune_threads(
     println!("baseline tok/s with rayon's default — useful as a perf reference.");
     println!();
 
-    // Use measure_placement_candidates with one placement (all GPU)
-    // as the timing harness — single candidate, but the existing
-    // load + warmup + median-of-runs machinery is identical to what
-    // we want.
+    // Use measure_placement_candidates with a single placement as the
+    // timing harness — one candidate, but the existing load + warmup +
+    // median-of-runs machinery is identical to what we want.
+    //
+    // Measure the ALL-CPU placement (n_gpu_layers = 0), NOT all-GPU:
+    // this stage installs the rayon CPU thread pool, so the thing whose
+    // effect we are trying to observe (thread count) only moves the
+    // needle on the CPU decode path. Measuring with everything on the
+    // GPU would drown the CPU-thread signal AND route through the
+    // per-thread `UsmAttnContext` — and on hybrid (attn+DeltaNet) models
+    // the all-GPU + `contiguous`-layout combination crashes USM K/V
+    // allocation with an access violation (0xC0000005), which aborts the
+    // whole `tune --all` process (a hard fault, not a catchable Err) and
+    // silently skips the later stages (decision calibration, MTP,
+    // chunked SSM). All-CPU + `paged` mirrors the safe, representative
+    // path the engine actually runs for a CPU-placed model.
     let cand_plans = [PlacementPlan {
-        n_gpu_layers: u32::MAX,
+        n_gpu_layers: 0,
         overrides: Vec::new(),
     }];
     let m_cfg = MeasurementConfig {
         kv_dtype: KvDtype::F32,
-        kv_cache_layout: "contiguous".to_string(),
+        kv_cache_layout: "paged".to_string(),
         flash_attention: true,
-        n_gpu_layers: u32::MAX,
+        n_gpu_layers: 0,
     };
     let prompt_tokens = 32u32;
     let ctx_size = (prompt_tokens as usize + decode_tokens as usize + 8).max(128);
@@ -5529,7 +5567,64 @@ fn cmd_tune_kv_dtype(
     // eligible. Empirically the threshold below which KV-quant
     // artifacts start to be visible in generation quality.
     const COHERENCE_THRESHOLD: f32 = 0.90;
-    let coherence_winner = report.pick_coherence_first(COHERENCE_THRESHOLD);
+
+    // Speed-first-if-it-fits selection budget. Among coherent
+    // candidates we want the FASTEST that still fits memory, only
+    // downgrading to a smaller (slower) KV dtype under genuine
+    // memory pressure. Estimate each candidate's K+V cache at the
+    // DEPLOYMENT context (`[inference].ctx_size`, not the tiny probe
+    // ctx used for the sweep) by scaling the f16-based
+    // `kv_cache_vram_bytes` by the dtype's bits/16, and budget it
+    // against available system RAM.
+    //
+    // RAM (not VRAM) is the pool here because (a) this stage runs
+    // BEFORE the placement stage, so we don't yet know if the model
+    // will be GPU- or CPU-placed, and (b) the primary target is a
+    // unified-memory iGPU where the KV cache lives in shared RAM
+    // anyway. On a discrete GPU the placement stage's own VRAM gate
+    // remains the authoritative fit check; this budget is a coarse
+    // guard that keeps us from choosing a KV dtype whose cache would
+    // blow out host memory at the configured context. A budget of 0
+    // (dims unreadable / RAM query failed) disables the gate and
+    // honors the pure speed-first pick.
+    let deploy_ctx = cfg.inference.ctx_size.max(1);
+    // f16-based KV cache size at the deployment context (0 if dims
+    // couldn't be read → fit gate disabled below). The per-dtype
+    // estimate scales this by bits/16.
+    let f16_base_for_fit: u64 = match read_dims_and_quant_from_gguf(&model_path) {
+        Ok((dims, _quant)) => rustllama_tuner::placement::kv_cache_vram_bytes(dims, deploy_ctx),
+        Err(e) => {
+            tracing::warn!(error = %e, "kv_dtype: could not read dims for fit budget; speed-first without the fit gate");
+            0
+        }
+    };
+    // Budget: half of available RAM (leaves headroom for weights +
+    // activations + OS). 0 base ⇒ 0 budget ⇒ gate disabled (pure
+    // speed-first).
+    let kv_budget_bytes: u64 = if f16_base_for_fit == 0 {
+        0
+    } else {
+        let avail = rustllama_runtime::memory_info().available_bytes;
+        let budget = avail / 2;
+        let mib = |b: u64| (b as f64) / (1024.0 * 1024.0);
+        println!(
+            "  fit budget    = {:.0} MiB (½ of {:.0} MiB available RAM); KV@ctx{} f16 base {:.0} MiB",
+            mib(budget),
+            mib(avail),
+            deploy_ctx,
+            mib(f16_base_for_fit),
+        );
+        budget
+    };
+    let kv_bytes_for = |dt: rustllama_engine::KvDtype| -> u64 {
+        ((f16_base_for_fit as f64) * (dt.approx_bits_per_element() as f64) / 16.0) as u64
+    };
+
+    // Speed-first-if-it-fits: fastest coherent dtype that fits the
+    // budget, falling back to the smallest coherent under memory
+    // pressure (see `pick_speed_first_if_fits`).
+    let chosen_pick =
+        report.pick_speed_first_if_fits(COHERENCE_THRESHOLD, kv_budget_bytes, kv_bytes_for);
     for c in &report.candidates {
         let name = kv_dtype_to_str(&c.kv_dtype);
         let bpe = c.kv_dtype.approx_bits_per_element();
@@ -5539,7 +5634,7 @@ fn cmd_tune_kv_dtype(
             .and_then(|(_, a)| *a)
             .map(|a| format!("{:.0}%", a * 100.0))
             .unwrap_or_else(|| "—".to_string());
-        let pick_marker = if coherence_winner == Some(c.kv_dtype) {
+        let pick_marker = if chosen_pick == Some(c.kv_dtype) {
             "  ★ pick"
         } else {
             ""
@@ -5562,21 +5657,31 @@ fn cmd_tune_kv_dtype(
     }
     println!();
     // Selection ladder:
-    //   1. Coherence-first pick (smallest memory that stays
-    //      within COHERENCE_THRESHOLD of the reference dtype).
+    //   1. Speed-first-if-it-fits pick: the FASTEST coherent dtype
+    //      (≥COHERENCE_THRESHOLD agreement vs the reference) whose KV
+    //      cache fits the memory budget; smallest coherent under
+    //      memory pressure.
     //   2. Fall back to the pure tok/s winner if no candidate
     //      cleared the coherence bar.
     //   3. Else nothing ran — leave the config value as-is.
-    let chosen = coherence_winner.or(report.winner);
+    let chosen = chosen_pick.or(report.winner);
     match chosen {
         Some(dt) => {
             let s = kv_dtype_to_str(&dt);
             let ref_s = kv_dtype_to_str(&reference_dt);
-            let how = if coherence_winner == Some(dt) {
-                format!(
-                    "coherence-first: smallest dtype with ≥{:.0}% top-1 agreement vs {ref_s}",
-                    COHERENCE_THRESHOLD * 100.0
-                )
+            let how = if chosen_pick == Some(dt) {
+                let fits = kv_budget_bytes == 0 || kv_bytes_for(dt) <= kv_budget_bytes;
+                if fits {
+                    format!(
+                        "speed-first: fastest dtype with ≥{:.0}% top-1 agreement vs {ref_s} that fits the memory budget",
+                        COHERENCE_THRESHOLD * 100.0
+                    )
+                } else {
+                    format!(
+                        "memory-pressure fallback: smallest dtype with ≥{:.0}% top-1 agreement vs {ref_s} (nothing faster fit the budget)",
+                        COHERENCE_THRESHOLD * 100.0
+                    )
+                }
             } else {
                 "tok/s-only (no candidate cleared the coherence bar)".to_string()
             };
@@ -6446,6 +6551,59 @@ fn cmd_tune_kv_layout(
 /// placement uses the chosen kv_dtype + flash setting) consult the
 /// cache between phases rather than re-passing values through call
 /// arguments.
+/// Run one `tune --<stage>` as an isolated subprocess of this binary.
+///
+/// The autotuner reloads the model many times per `tune --all` run,
+/// and on this SYCL stack the cumulative USM / stream state across
+/// ~16 in-process reloads faults the driver (0xC0000005) mid-sweep —
+/// a hard access violation that `catch_unwind` cannot contain and that
+/// would otherwise abort the whole `tune --all` process, losing every
+/// later stage AND making the mandatory first-load autotune report a
+/// failure (even though the earlier stages' winners persisted). Running
+/// the crash-prone late stages as fresh child processes — mirroring
+/// `doctor --sycl-parity`, which subprocesses each probe so a
+/// DEVICE_LOST only kills its child — resets that per-process state to
+/// zero, so each stage loads into a clean driver.
+///
+/// Each stage subcommand persists its own winner to the shared
+/// tuner-cache TOML, so a child that succeeds contributes exactly what
+/// the in-process call would; a child that crashes is logged and the
+/// parent moves on. The child inherits the parent's env (keep_quant_raw
+/// etc.) and never passes `--force` — the parent already cleared the
+/// cache once at the top of the sweep, and each child only adds its key.
+fn run_tune_stage_subprocess(
+    config_path: &std::path::Path,
+    model: &Option<String>,
+    stage_flag: &str,
+    thorough: bool,
+    stage_label: &str,
+) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("cannot resolve current exe for tune subprocess: {e}"))?;
+    let mut cmd = std::process::Command::new(exe);
+    // `--config` is a global arg; forward the parent's resolved path so
+    // the child keys the same cache + honors the same config overrides.
+    cmd.arg("--config").arg(config_path);
+    cmd.arg("tune").arg(stage_flag);
+    if let Some(m) = model {
+        cmd.arg("--model").arg(m);
+    }
+    if thorough {
+        cmd.arg("--thorough");
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to spawn `tune {stage_flag}` subprocess: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        // A crashed child (access violation, DEVICE_LOST) surfaces here
+        // as a non-success status; the caller logs and continues so the
+        // remaining stages still run.
+        anyhow::bail!("`tune {stage_label}` subprocess exited with {status}")
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_tune_all(
     config_path: &std::path::Path,
@@ -6706,19 +6864,27 @@ fn cmd_tune_all(
         tracing::warn!(error = %e, "stage 6 (batch_size) failed; continuing");
     }
 
+    // Stages 7-10 run as ISOLATED SUBPROCESSES. By this point the
+    // parent has reloaded the model ~15× in-process; the next in-process
+    // load faults the SYCL driver (see `run_tune_stage_subprocess`).
+    // Each of these stages loads the model again, so we spawn a fresh
+    // child per stage — the parent does no further model loads and stays
+    // alive to run every stage, and a child crash is contained + logged.
+    // (Their granular sizing flags aren't forwarded; the subcommands use
+    // the same quick-by-default sizing, escalated together by --thorough.)
     println!();
     println!("Stage 7/10: threads");
     println!("--------");
     if skip(has_threads) {
         println!("(skipped: threads winner already cached)");
-    } else if let Err(e) = cmd_tune_threads(
+    } else if let Err(e) = run_tune_stage_subprocess(
         config_path,
-        model_clone_for_stages.clone(),
-        threads_candidates,
-        threads_decode_tokens,
-        threads_repeats,
+        &model_clone_for_stages,
+        "--threads",
+        thorough,
+        "7 (threads)",
     ) {
-        tracing::warn!(error = %e, "stage 7 (threads) failed");
+        tracing::warn!(error = %e, "stage 7 (threads) failed; continuing");
     }
 
     println!();
@@ -6726,8 +6892,14 @@ fn cmd_tune_all(
     println!("--------");
     if skip(has_decision_calibration) {
         println!("(skipped: decision calibration already cached)");
-    } else if let Err(e) = cmd_decision_calibrate(config_path, model_clone_for_stages.clone()) {
-        tracing::warn!(error = %e, "stage 8 (decision calibration) failed");
+    } else if let Err(e) = run_tune_stage_subprocess(
+        config_path,
+        &model_clone_for_stages,
+        "--decision-calibrate",
+        thorough,
+        "8 (decision calibration)",
+    ) {
+        tracing::warn!(error = %e, "stage 8 (decision calibration) failed; continuing");
     }
 
     println!();
@@ -6735,9 +6907,13 @@ fn cmd_tune_all(
     println!("--------");
     if skip(has_speculative_mtp) {
         println!("(skipped: speculative_mtp winner already cached)");
-    } else if let Err(e) =
-        cmd_tune_speculative_mtp(config_path, model_clone_for_stages.clone(), measure_repeats)
-    {
+    } else if let Err(e) = run_tune_stage_subprocess(
+        config_path,
+        &model_clone_for_stages,
+        "--speculative-mtp",
+        thorough,
+        "9 (MTP self-speculation)",
+    ) {
         tracing::warn!(error = %e, "stage 9 (MTP self-speculation) failed; continuing");
     }
 
@@ -6746,8 +6922,13 @@ fn cmd_tune_all(
     println!("--------");
     if skip(has_ssm_prefill_chunked) {
         println!("(skipped: ssm_prefill_chunked winner already cached)");
-    } else if let Err(e) =
-        cmd_tune_ssm_prefill_chunked(config_path, model_clone_for_stages, measure_repeats)
+    } else if let Err(e) = run_tune_stage_subprocess(
+        config_path,
+        &model_clone_for_stages,
+        "--ssm-prefill-chunked",
+        thorough,
+        "10 (chunked SSM prefill)",
+    )
     {
         tracing::warn!(error = %e, "stage 10 (chunked SSM prefill) failed; continuing");
     }
