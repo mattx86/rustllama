@@ -88,6 +88,11 @@ struct App {
     /// Ctrl-T. (The chat itself never executes tools — this only gates the
     /// confirm prompt.)
     auto_tools: bool,
+    /// CLARIFY: when true (default), the server may inject the reserved
+    /// `ask_user` tool so the model can pause and ask a clarifying question
+    /// with selectable options instead of guessing. Toggled with Ctrl-K or
+    /// `/clarify`. OFF sends the plain (no-tool) request path.
+    clarify_enabled: bool,
     /// CLARIFY: a pending `ask_user` question `(prompt, options)`. While set,
     /// a digit / Enter answers it instead of sending a normal message.
     pending_question: Option<(String, Vec<String>)>,
@@ -137,6 +142,9 @@ impl App {
             stream_options: Some(rustllama_client::StreamOptions {
                 include_usage: true,
             }),
+            // `None` (not `Some(false)`) when off, so the OFF request is
+            // wire-identical to the plain path (no `ask_user` tool).
+            allow_clarify: self.clarify_enabled.then_some(true),
         }
     }
 }
@@ -234,6 +242,7 @@ async fn event_loop<B: Backend>(
         repeat_penalty: 1.1,
         should_quit: false,
         auto_tools: false,
+        clarify_enabled: true,
         pending_question: None,
         pending_tools: None,
     };
@@ -315,6 +324,16 @@ fn handle_event(
             "auto-tools: ON".into()
         } else {
             "auto-tools: OFF".into()
+        };
+        return true;
+    }
+    // Ctrl-K toggles CLARIFY (the model may ask a clarifying question).
+    if key.code == KeyCode::Char('k') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.clarify_enabled = !app.clarify_enabled;
+        app.status = if app.clarify_enabled {
+            "clarify: ON".into()
+        } else {
+            "clarify: OFF".into()
         };
         return true;
     }
@@ -666,14 +685,27 @@ fn handle_command(
             };
             app.status = format!("auto-tools: {}", if app.auto_tools { "ON" } else { "OFF" });
         }
+        // Toggle CLARIFY (same as Ctrl-K). `on`/`off` force a state.
+        "clarify" => {
+            app.clarify_enabled = match arg.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => !app.clarify_enabled,
+            };
+            app.status = format!(
+                "clarify: {}",
+                if app.clarify_enabled { "ON" } else { "OFF" }
+            );
+        }
         "help" => {
             app.turns.push(Turn {
                 role: "info".into(),
                 content: "commands (mirror the CLI): /model <id|list|load <ref>|default <ref>|\
                           unload <id>>  ·  /chat <list|save [name]|resume <name>|delete <name>>  ·  \
                           /system <text>  /reset  /temp <f>  /top_p <f>  /top_k <n>  \
-                          /repeat_penalty <f>  /max_tokens <n>  /auto [on|off]  /help  /quit   ·   \
-                          keys: Enter send · PgUp/PgDn scroll · Ctrl-T auto-tools · Esc/Ctrl-C quit"
+                          /repeat_penalty <f>  /max_tokens <n>  /auto [on|off]  /clarify [on|off]  \
+                          /help  /quit   ·   keys: Enter send · PgUp/PgDn scroll · Ctrl-T auto-tools \
+                          · Ctrl-K clarify · Esc/Ctrl-C quit"
                     .into(),
             });
         }
@@ -975,6 +1007,15 @@ fn ui(f: &mut Frame, app: &mut App) {
             format!("  tools:{}", if app.auto_tools { "auto" } else { "ask" }),
             Style::default().fg(if app.auto_tools {
                 Color::Magenta
+            } else {
+                Color::DarkGray
+            }),
+        ),
+        // CLARIFY indicator (Ctrl-K toggles).
+        Span::styled(
+            format!("  clarify:{}", if app.clarify_enabled { "on" } else { "off" }),
+            Style::default().fg(if app.clarify_enabled {
+                Color::Cyan
             } else {
                 Color::DarkGray
             }),

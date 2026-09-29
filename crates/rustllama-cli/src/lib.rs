@@ -9139,6 +9139,12 @@ async fn chat_repl(
     // ON accepts silently. Toggled with `/auto`. (The REPL never executes
     // tools — this only gates the confirmation prompt.)
     let mut auto_tools = false;
+    // CLARIFY: ON lets the model pause and ask a clarifying question (with
+    // selectable options) instead of guessing — the server injects the
+    // reserved `ask_user` tool. Default ON so this UI can surface clarifying
+    // questions; toggled with `/clarify`. OFF sends the plain (no-tool)
+    // request path, wire-identical to a client that never knew CLARIFY.
+    let mut clarify_enabled = true;
 
     // rustyline editor with history under %APPDATA%\rustllama\chat_history
     let history_path = rustllama_config::default_config_path()
@@ -9149,6 +9155,10 @@ async fn chat_repl(
     }
 
     println!("type a message; /help for commands");
+    println!(
+        "\x1b[2mclarifying questions: {} (/clarify to toggle)\x1b[0m",
+        if clarify_enabled { "on" } else { "off" }
+    );
     loop {
         let line = match rl.readline("> ") {
             Ok(l) => l,
@@ -9204,6 +9214,10 @@ async fn chat_repl(
                         "    /auto [on|off]     toggle auto-run of proposed tool calls (current: {})",
                         if auto_tools { "on" } else { "off" }
                     );
+                    println!(
+                        "    /clarify [on|off]  let the model ask clarifying questions (current: {})",
+                        if clarify_enabled { "on" } else { "off" }
+                    );
                     println!("    /save <path>       append the last assistant message to a file");
                     println!(
                         "    /transcript <path> dump the full conversation as markdown to a file"
@@ -9253,6 +9267,9 @@ async fn chat_repl(
                         stream_options: Some(rustllama_client::StreamOptions {
                             include_usage: true,
                         }),
+                        // `None` (not `Some(false)`) when off, so the OFF
+                        // request is wire-identical to the plain path.
+                        allow_clarify: clarify_enabled.then_some(true),
                     };
                     drive_chat_stream(&client, req, &mut messages).await?;
                     continue;
@@ -9424,6 +9441,22 @@ async fn chat_repl(
                         }
                     };
                     println!("[auto-tools {}]", if auto_tools { "on" } else { "off" });
+                    continue;
+                }
+                "clarify" => {
+                    clarify_enabled = match arg.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        "" => !clarify_enabled,
+                        other => {
+                            println!("usage: /clarify [on|off]  (got `{other}`)");
+                            continue;
+                        }
+                    };
+                    println!(
+                        "[clarifying questions {}]",
+                        if clarify_enabled { "on" } else { "off" }
+                    );
                     continue;
                 }
                 "top_p" => {
@@ -9607,6 +9640,9 @@ async fn chat_repl(
                 stream_options: Some(rustllama_client::StreamOptions {
                     include_usage: true,
                 }),
+                // `None` (not `Some(false)`) when off, so the OFF request is
+                // wire-identical to the plain path (no `ask_user` tool).
+                allow_clarify: clarify_enabled.then_some(true),
             };
             match drive_chat_stream(&client, req, &mut messages).await? {
                 StreamOutcome::Normal => break,

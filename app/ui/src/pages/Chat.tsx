@@ -406,6 +406,30 @@ export default function ChatPage() {
       return next;
     });
   };
+  /// CLARIFY: when ON (default), the server may inject the reserved
+  /// `ask_user` tool so the model can pause and ask a clarifying question
+  /// with selectable options instead of guessing (`onAskUser` renders the
+  /// chooser). Persisted per browser (localStorage, best-effort). Defaults
+  /// ON unless the user previously turned it off. When OFF the request goes
+  /// through the plain (no-tool) path.
+  const [clarify, setClarify] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("rustllama.clarify") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const toggleClarify = () => {
+    setClarify((v) => {
+      const next = !v;
+      try {
+        localStorage.setItem("rustllama.clarify", next ? "1" : "0");
+      } catch {
+        /* private mode / blocked storage — in-memory only */
+      }
+      return next;
+    });
+  };
   const abortRef = useRef<AbortController | null>(null);
   /// Server-side request id (`chatcmpl-…`) captured from the first
   /// SSE chunk. Used by `stop()` to POST `/v1/cancel` so the
@@ -749,6 +773,8 @@ export default function ChatPage() {
         temperature,
         maxTokens,
         seed: seed.trim() === "" ? undefined : Number(seed),
+        // CLARIFY opt-in: routes through the tools path (ask_user only).
+        allowClarify: clarify,
         abort: ctrl.signal,
       },
       {
@@ -1017,6 +1043,8 @@ export default function ChatPage() {
         temperature,
         maxTokens,
         seed: seed.trim() === "" ? undefined : Number(seed),
+        // CLARIFY opt-in: routes through the tools path (ask_user only).
+        allowClarify: clarify,
         abort: ctrl.signal,
       },
       {
@@ -1294,6 +1322,26 @@ export default function ChatPage() {
               style={{ accentColor: "var(--ll-accent)", cursor: "pointer" }}
             />
             Auto-run tools
+          </label>
+          <label
+            title="When on, the model can pause and ask you a clarifying question with selectable options instead of guessing. Turning it off sends the plain request with no tools."
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              fontSize: 12,
+              color: "var(--ll-text-muted)",
+              cursor: "pointer",
+              userSelect: "none",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={clarify}
+              onChange={toggleClarify}
+              style={{ accentColor: "var(--ll-accent)", cursor: "pointer" }}
+            />
+            Clarifying questions
           </label>
           {history.filter((m) => m.role !== "system").length >= 3 && (
             <button

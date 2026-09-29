@@ -50,6 +50,16 @@ pub struct ChatRequest {
     /// just before [`ChatEvent::Finish`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
+    /// CLARIFY opt-in (rustllama extension). When `Some(true)`, the server
+    /// routes the request through the tools path advertising only the
+    /// reserved `ask_user` tool, so the model may pause and ask the user a
+    /// clarifying question (delivered as [`ChatEvent::AskUser`]) instead of
+    /// guessing. `None` omits the field entirely, so a request that leaves
+    /// it unset is wire-identical to the pre-CLARIFY client. The chat
+    /// frontends (REPL/TUI/GUI) set this to `Some(true)` by default and let
+    /// the user toggle it off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_clarify: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]

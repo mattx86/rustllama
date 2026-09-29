@@ -1365,6 +1365,12 @@ export async function streamChat(
     temperature?: number;
     maxTokens?: number;
     seed?: number;
+    /// CLARIFY opt-in. When true, the server injects the reserved
+    /// `ask_user` tool so the model may pause and ask a clarifying
+    /// question (delivered to `onAskUser`) instead of guessing. Omitted
+    /// from the request body when falsy, so the OFF request is
+    /// wire-identical to the pre-CLARIFY plain path.
+    allowClarify?: boolean;
     abort?: AbortSignal;
   },
   h: ChatStreamHandlers,
@@ -1397,6 +1403,9 @@ export async function streamChat(
         seed: opts.seed,
         stream: true,
         stream_options: { include_usage: true },
+        // Only send the flag when enabled — an omitted field keeps the
+        // request byte-identical to the plain (no-tool) path.
+        ...(opts.allowClarify ? { allow_clarify: true } : {}),
       }),
       signal: opts.abort,
     });

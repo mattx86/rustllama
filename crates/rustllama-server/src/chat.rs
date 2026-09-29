@@ -86,6 +86,18 @@ pub struct ChatRequest {
     /// OpenAI streaming knob. With `include_usage: true` we emit a final
     /// chunk containing the `usage` block before `[DONE]`.
     pub stream_options: Option<StreamOptions>,
+    /// rustllama extension (CLARIFY opt-in). When `Some(true)`, route the
+    /// request through the tools path even if the caller sent no
+    /// `tools`/`functions`, advertising ONLY the reserved `ask_user` tool
+    /// so the model can pause and ask the human a clarifying question with
+    /// selectable options instead of guessing. `tool_choice` stays at its
+    /// default (`auto`), so the model asks only when it wants to. `None` /
+    /// `Some(false)` leaves the plain path byte-identical to before. The
+    /// chat frontends (REPL/TUI/GUI) default this on so their UIs can
+    /// surface clarifying questions; it's a toggle because it engages the
+    /// tool grammar.
+    #[serde(default)]
+    pub allow_clarify: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -490,13 +502,24 @@ pub async fn chat_completions(
     // Tools / functions request: needs explicit prompt building (via the
     // tokenizer chat template with `tools` exposed) and incremental parsing
     // of `<tool_call>...</tool_call>` blocks.
+    //
+    // `allow_clarify` (CLARIFY opt-in) ALSO takes the tools path even with
+    // no caller-supplied tools: the tools normalizer below turns the empty
+    // set into just `[ask_user]` (see `with_reserved_ask_user_tool`), so the
+    // model can ask a clarifying question. A clarify-only request skips the
+    // shell env hint (it advertises no shell/command tool the hint would
+    // help). `tool_choice` stays at its default (`auto`) — the model asks
+    // only when it wants to.
     let has_tools = req.tools.is_some() || req.functions.is_some();
-    if has_tools {
-        // Inject the server host-environment context so the model picks
-        // the right shell dialect on a shell/command tool call. Gated by
-        // `[server].tool_environment_hint` (default on); appends to an
-        // existing system message, else prepends a new one.
-        req.messages = maybe_inject_env_hint(req.messages);
+    let clarify_only = !has_tools && req.allow_clarify == Some(true);
+    if has_tools || clarify_only {
+        if has_tools {
+            // Inject the server host-environment context so the model picks
+            // the right shell dialect on a shell/command tool call. Gated by
+            // `[server].tool_environment_hint` (default on); appends to an
+            // existing system message, else prepends a new one.
+            req.messages = maybe_inject_env_hint(req.messages);
+        }
         if req.stream {
             return chat_stream_with_tools(state, req).await;
         }
