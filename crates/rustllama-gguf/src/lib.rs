@@ -32,6 +32,8 @@ pub mod encode_k;
 pub mod iq_gpu;
 #[cfg(feature = "encoder")]
 pub mod encode_t;
+#[cfg(feature = "encoder")]
+pub mod encode_mx;
 pub mod imatrix;
 pub mod iq1_grid;
 mod parse;

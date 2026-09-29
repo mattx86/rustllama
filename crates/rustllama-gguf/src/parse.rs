@@ -187,6 +187,23 @@ pub enum GgmlType {
     /// with our extension. Pinned to this value forever — bumping it
     /// would break every existing rustllama-quantized GGUF on disk.
     Nvfp4 = 1024,
+    /// MXFP4 (OCP Microscaling): E2M1 4-bit float, 32-element block
+    /// sharing one E8M0 (8-bit power-of-two) scale. 17 bytes/block
+    /// (16 nibble bytes + 1 scale) = 4.25 bpw. IDs 1025-1028 continue
+    /// rustllama's extension range above llama.cpp's enum; pinned
+    /// forever (bumping breaks on-disk GGUFs).
+    Mxfp4 = 1025,
+    /// MXFP6 (OCP Microscaling, E3M2 variant): 6-bit float, 32-element
+    /// block + one E8M0 scale. 25 bytes/block (24 + 1) = 6.25 bpw.
+    Mxfp6 = 1026,
+    /// MXFP8 (OCP Microscaling, E4M3 variant): 8-bit float, 32-element
+    /// block + one E8M0 scale. 33 bytes/block (32 + 1) = 8.25 bpw.
+    Mxfp8 = 1027,
+    /// FP8 (E4M3, per-TENSOR scale): 8-bit float elements, 1 byte each;
+    /// the single f32 scale for the whole tensor lives in GGUF metadata
+    /// (`<tensor>.fp8_scale` / a general scale key), NOT in the weight
+    /// bytes. 8 bpw of element data.
+    Fp8 = 1028,
 }
 
 impl GgmlType {
@@ -221,6 +238,10 @@ impl GgmlType {
             142 => Self::PQ2_0,
             143 => Self::PTQ1_0,
             1024 => Self::Nvfp4,
+            1025 => Self::Mxfp4,
+            1026 => Self::Mxfp6,
+            1027 => Self::Mxfp8,
+            1028 => Self::Fp8,
             other => return Err(GgufError::UnknownGgmlType(other)),
         })
     }
@@ -260,6 +281,10 @@ impl GgmlType {
             Self::PQ2_0 => "PQ2_0",
             Self::PTQ1_0 => "PTQ1_0",
             Self::Nvfp4 => "NVFP4",
+            Self::Mxfp4 => "MXFP4",
+            Self::Mxfp6 => "MXFP6",
+            Self::Mxfp8 => "MXFP8",
+            Self::Fp8 => "FP8",
         }
     }
 
@@ -298,6 +323,10 @@ impl GgmlType {
                 | Self::PQ2_0
                 | Self::PTQ1_0
                 | Self::Nvfp4
+                | Self::Mxfp4
+                | Self::Mxfp6
+                | Self::Mxfp8
+                | Self::Fp8
         )
     }
 
@@ -333,6 +362,12 @@ impl GgmlType {
             Self::PQ2_0 => blocks(n_elements, 128) * 34,
             Self::PTQ1_0 => blocks(n_elements, 128) * 28,
             Self::Nvfp4 => blocks(n_elements, 16) * 9,
+            // OCP Microscaling: 32 elems/block + 1 E8M0 scale byte.
+            Self::Mxfp4 => blocks(n_elements, 32) * 17,
+            Self::Mxfp6 => blocks(n_elements, 32) * 25,
+            Self::Mxfp8 => blocks(n_elements, 32) * 33,
+            // FP8 (E4M3, per-tensor scale in metadata): 1 byte/element.
+            Self::Fp8 => n_elements,
         }
     }
 }

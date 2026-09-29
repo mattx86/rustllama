@@ -617,7 +617,7 @@ pub fn dequant_nvfp4(bytes: &[u8], out: &mut [f32]) {
 
 /// FP8 E4M3 → f32. Mirrors `rustllama-kernels-cpu::nvfp4::e4m3_to_f32`.
 /// 4-bit exponent (bias 7) + 3-bit mantissa, NaN at `0x7F`/`0xFF`.
-fn e4m3_to_f32(b: u8) -> f32 {
+pub(crate) fn e4m3_to_f32(b: u8) -> f32 {
     let sign = (b & 0x80) != 0;
     let exp = (b >> 3) & 0x0F;
     let mant = b & 0x07;
@@ -635,6 +635,133 @@ fn e4m3_to_f32(b: u8) -> f32 {
         -val
     } else {
         val
+    }
+}
+
+/// OCP E8M0 shared-scale byte → f32. 8-bit unsigned biased exponent
+/// (bias 127), no sign / mantissa: `value = 2^(byte - 127)`. `0xFF` is
+/// the reserved NaN. `0x00` decodes to `2^-127` (a subnormal f32, the
+/// smallest representable MX block scale). Shared by all three MXFP*
+/// formats. Mirror this exactly in the CPU/SYCL/CUDA kernels.
+pub(crate) fn e8m0_to_f32(b: u8) -> f32 {
+    if b == 0xFF {
+        return f32::NAN;
+    }
+    (2.0f32).powi(b as i32 - 127)
+}
+
+/// OCP E3M2 (MXFP6 element) → f32. 6-bit: 1 sign / 3 exp (bias 3) / 2
+/// mantissa. No Inf/NaN encodings (all bit patterns are finite). Bits:
+/// `s eee mm` in the low 6 bits of `c`.
+pub(crate) fn e3m2_to_f32(c: u8) -> f32 {
+    let sign = (c & 0x20) != 0;
+    let exp = (c >> 2) & 0x07;
+    let mant = c & 0x03;
+    let val = if exp == 0 {
+        // Subnormal: (mant/4) * 2^(1 - bias), bias = 3.
+        (mant as f32) / 4.0 * (2.0f32).powi(-2)
+    } else {
+        (1.0 + (mant as f32) / 4.0) * (2.0f32).powi(exp as i32 - 3)
+    };
+    if sign {
+        -val
+    } else {
+        val
+    }
+}
+
+/// The E2M1 4-bit codebook (index = 4-bit nibble). Bits `s ee m`:
+/// `{0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}`. Shared by NVFP4 and MXFP4.
+pub const E2M1_CODEBOOK: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+/// MXFP4 (OCP Microscaling): 17 bytes per 32-weight block —
+/// `{ qs: [u8; 16], scale: u8 }`. Each `qs` byte packs two E2M1 4-bit
+/// codes (low nibble = even element, high nibble = odd element); the
+/// trailing byte is the E8M0 block scale. `out.len()` must equal
+/// `bytes.len() / 17 * 32`.
+pub fn dequant_mxfp4(bytes: &[u8], out: &mut [f32]) {
+    const BLOCK_BYTES: usize = 17;
+    const ELEMS: usize = 32;
+    let n_blocks = bytes.len() / BLOCK_BYTES;
+    debug_assert_eq!(bytes.len(), n_blocks * BLOCK_BYTES);
+    debug_assert_eq!(out.len(), n_blocks * ELEMS);
+    for b in 0..n_blocks {
+        let off = b * BLOCK_BYTES;
+        let scale = e8m0_to_f32(bytes[off + 16]);
+        let dst = b * ELEMS;
+        for j in 0..16 {
+            let byte = bytes[off + j];
+            let lo = (byte & 0x0F) as usize;
+            let hi = ((byte >> 4) & 0x0F) as usize;
+            out[dst + j * 2] = E2M1_CODEBOOK[lo] * scale;
+            out[dst + j * 2 + 1] = E2M1_CODEBOOK[hi] * scale;
+        }
+    }
+}
+
+/// MXFP6 (OCP Microscaling, E3M2): 25 bytes per 32-weight block —
+/// `{ qs: [u8; 24], scale: u8 }`. `qs` is a little-endian bitstream of
+/// 32 × 6-bit E3M2 codes (element `j` at bit offset `6*j`); the trailing
+/// byte is the E8M0 block scale. `out.len()` must equal
+/// `bytes.len() / 25 * 32`.
+pub fn dequant_mxfp6(bytes: &[u8], out: &mut [f32]) {
+    const BLOCK_BYTES: usize = 25;
+    const CODE_BYTES: usize = 24;
+    const ELEMS: usize = 32;
+    let n_blocks = bytes.len() / BLOCK_BYTES;
+    debug_assert_eq!(bytes.len(), n_blocks * BLOCK_BYTES);
+    debug_assert_eq!(out.len(), n_blocks * ELEMS);
+    for b in 0..n_blocks {
+        let off = b * BLOCK_BYTES;
+        let scale = e8m0_to_f32(bytes[off + CODE_BYTES]);
+        let codes = &bytes[off..off + CODE_BYTES];
+        let dst = b * ELEMS;
+        for j in 0..ELEMS {
+            let bitpos = j * 6;
+            let byte_idx = bitpos / 8;
+            let bit_off = bitpos % 8;
+            let lo = codes[byte_idx] as u16;
+            let hi = if byte_idx + 1 < CODE_BYTES {
+                codes[byte_idx + 1] as u16
+            } else {
+                0
+            };
+            let word = lo | (hi << 8);
+            let code = ((word >> bit_off) & 0x3F) as u8;
+            out[dst + j] = e3m2_to_f32(code) * scale;
+        }
+    }
+}
+
+/// MXFP8 (OCP Microscaling, E4M3): 33 bytes per 32-weight block —
+/// `{ qs: [u8; 32], scale: u8 }`. Each `qs` byte is one E4M3 element;
+/// the trailing byte is the E8M0 block scale. `out.len()` must equal
+/// `bytes.len() / 33 * 32`.
+pub fn dequant_mxfp8(bytes: &[u8], out: &mut [f32]) {
+    const BLOCK_BYTES: usize = 33;
+    const ELEMS: usize = 32;
+    let n_blocks = bytes.len() / BLOCK_BYTES;
+    debug_assert_eq!(bytes.len(), n_blocks * BLOCK_BYTES);
+    debug_assert_eq!(out.len(), n_blocks * ELEMS);
+    for b in 0..n_blocks {
+        let off = b * BLOCK_BYTES;
+        let scale = e8m0_to_f32(bytes[off + 32]);
+        let dst = b * ELEMS;
+        for j in 0..ELEMS {
+            out[dst + j] = e4m3_to_f32(bytes[off + j]) * scale;
+        }
+    }
+}
+
+/// FP8 (E4M3, per-TENSOR scale): one E4M3 byte per element, no block
+/// structure. `scale` is the single tensor-wide multiplier read from
+/// GGUF metadata. `out.len()` must equal `bytes.len()`.
+pub fn dequant_fp8(bytes: &[u8], scale: f32, out: &mut [f32]) {
+    debug_assert_eq!(bytes.len(), out.len());
+    for (o, &b) in out.iter_mut().zip(bytes.iter()) {
+        *o = e4m3_to_f32(b) * scale;
     }
 }
 

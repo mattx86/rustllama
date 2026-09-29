@@ -20,7 +20,7 @@ use std::io::{Seek, Write};
 
 use rayon::prelude::*;
 
-use crate::{dequant, encode, encode_iq, encode_iq_vec, encode_k, encode_t};
+use crate::{dequant, encode, encode_iq, encode_iq_vec, encode_k, encode_mx, encode_t};
 use crate::recipe::{resolve_first_match, RecipeRule};
 use crate::{Gguf, GgmlType};
 use crate::write::{GgufMmapWriter, GgufWriter, WriteError};
@@ -1192,6 +1192,10 @@ fn target_block_size(dtype: GgmlType) -> u64 {
         GgmlType::Nvfp4 => 16,
         // PrismML ternary group-128 formats (decode-only; no encoder).
         GgmlType::PQ2_0 | GgmlType::PTQ1_0 => 128,
+        // OCP Microscaling: 32-element blocks (one E8M0 scale each).
+        GgmlType::Mxfp4 | GgmlType::Mxfp6 | GgmlType::Mxfp8 => 32,
+        // FP8 (E4M3, per-tensor scale): element-wise, no block.
+        GgmlType::Fp8 => 1,
     }
 }
 
@@ -1227,6 +1231,9 @@ fn encoder_supported(dtype: GgmlType) -> bool {
             | GgmlType::IQ3_S
             | GgmlType::IQ1_S
             | GgmlType::IQ1_M
+            | GgmlType::Mxfp4
+            | GgmlType::Mxfp6
+            | GgmlType::Mxfp8
     )
 }
 
@@ -1280,6 +1287,15 @@ fn dequant_to_f32(src_dtype: GgmlType, src_bytes: &[u8], out: &mut [f32]) -> Res
         // never a target.
         GgmlType::PQ2_0 => dequant::dequant_pq2_0(src_bytes, out),
         GgmlType::PTQ1_0 => dequant::dequant_ptq1_0(src_bytes, out),
+        // OCP Microscaling (self-contained block scale in the bytes).
+        GgmlType::Mxfp4 => dequant::dequant_mxfp4(src_bytes, out),
+        GgmlType::Mxfp6 => dequant::dequant_mxfp6(src_bytes, out),
+        GgmlType::Mxfp8 => dequant::dequant_mxfp8(src_bytes, out),
+        // FP8 as a re-quant SOURCE: the per-tensor scale lives in
+        // metadata, not the bytes, and isn't threaded to this helper —
+        // decode raw E4M3 (scale 1.0). Requantizing FROM scaled FP8 is
+        // not a supported path; FP8 is normally only a target.
+        GgmlType::Fp8 => dequant::dequant_fp8(src_bytes, 1.0, out),
     }
     Ok(())
 }
@@ -1360,14 +1376,25 @@ fn encode_from_f32(target_dtype: GgmlType, src: &[f32], dst: &mut [u8]) {
         GgmlType::IQ3_S => encode_iq_vec::encode_iq3_s(src, dst),
         GgmlType::IQ1_S => encode_iq_vec::encode_iq1_s(src, dst),
         GgmlType::IQ1_M => encode_iq_vec::encode_iq1_m(src, dst),
+        // OCP Microscaling encoders (self-contained per-32 block +
+        // E8M0 scale). FP8 (per-tensor scale) is produced by a
+        // dedicated pipeline path, not this per-chunk encoder, so it is
+        // NOT `encoder_supported` here.
+        GgmlType::Mxfp4 => encode_mx::encode_mxfp4(src, dst),
+        GgmlType::Mxfp6 => encode_mx::encode_mxfp6(src, dst),
+        GgmlType::Mxfp8 => encode_mx::encode_mxfp8(src, dst),
         // The pipeline checks `encoder_supported` before dispatch;
         // these remaining variants should never reach this match.
         // PQ2_0/PTQ1_0 are deliberately decode-only (we consume
         // PrismML's files; producing them means replicating their
-        // Hadamard-rotated quantization pipeline, out of scope).
-        GgmlType::Nvfp4 | GgmlType::PQ2_0 | GgmlType::PTQ1_0 => unreachable!(
-            "encode_from_f32: encoder for {target_dtype:?} not implemented yet — \
-             encoder_supported() should have rejected this earlier"
+        // Hadamard-rotated quantization pipeline, out of scope). FP8
+        // needs the per-tensor-scale metadata path.
+        GgmlType::Nvfp4
+        | GgmlType::PQ2_0
+        | GgmlType::PTQ1_0
+        | GgmlType::Fp8 => unreachable!(
+            "encode_from_f32: encoder for {target_dtype:?} not implemented via the \
+             per-chunk path — encoder_supported() should have rejected this earlier"
         ),
     }
 }

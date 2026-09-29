@@ -257,6 +257,34 @@ pub enum Dtype {
     /// wrapping-multiply digit extraction. The densest weight format
     /// rustllama executes; a 27B model fits in ~5.9 GB.
     PTQ1_0Raw,
+    /// MXFP4 (OCP Microscaling) with raw GGUF block bytes preserved.
+    /// 17 bytes per 32 weights (4.25 bpw): 16 bytes of E2M1 4-bit
+    /// float codes (two per byte, low nibble first) + 1 trailing E8M0
+    /// 8-bit power-of-two block scale. Reconstruction is
+    /// `e8m0_scale * e2m1_decode(code)` where E2M1 = {0, ±0.5, ±1,
+    /// ±1.5, ±2, ±3, ±4, ±6}. Shares NVFP4's E2M1 element codebook but
+    /// with a power-of-two (E8M0) block scale instead of NVFP4's E4M3.
+    Mxfp4Raw,
+    /// MXFP6 (OCP Microscaling, E3M2 variant) with raw GGUF block
+    /// bytes preserved. 25 bytes per 32 weights (6.25 bpw): 24 bytes
+    /// of 6-bit E3M2 float codes (1 sign / 3 exp / 2 mantissa, bit-
+    /// packed little-endian) + 1 trailing E8M0 block scale.
+    /// Reconstruction `e8m0_scale * e3m2_decode(code)`.
+    Mxfp6Raw,
+    /// MXFP8 (OCP Microscaling, E4M3 variant) with raw GGUF block
+    /// bytes preserved. 33 bytes per 32 weights (8.25 bpw): 32 bytes
+    /// of 8-bit E4M3 float elements + 1 trailing E8M0 block scale.
+    /// Reconstruction `e8m0_scale * e4m3_decode(byte)` (shares NVFP4's
+    /// E4M3 element decoder).
+    Mxfp8Raw,
+    /// FP8 (E4M3, per-TENSOR scale) with raw GGUF element bytes
+    /// preserved. 1 byte per weight (8 bpw): each byte is an E4M3
+    /// float element; the single f32 scale for the whole tensor lives
+    /// in GGUF metadata (NOT in the weight bytes), so this format has
+    /// no in-block scale and the matvec kernels take the scale as a
+    /// separate argument. Reconstruction `tensor_scale *
+    /// e4m3_decode(byte)`.
+    Fp8Raw,
 }
 
 impl Dtype {
@@ -315,6 +343,10 @@ impl Dtype {
                 | Self::Nvfp4Raw
                 | Self::PQ2_0Raw
                 | Self::PTQ1_0Raw
+                | Self::Mxfp4Raw
+                | Self::Mxfp6Raw
+                | Self::Mxfp8Raw
+                | Self::Fp8Raw
         )
     }
 
@@ -375,6 +407,15 @@ impl Dtype {
             // PrismML ternary group-128 formats.
             Self::PQ2_0Raw => blocks(n_elements, 128) * 34,
             Self::PTQ1_0Raw => blocks(n_elements, 128) * 28,
+            // OCP Microscaling: 32 elems/block + 1 E8M0 scale byte.
+            // MXFP4 = 16 nibble bytes + 1 = 17; MXFP6(E3M2) = 24 + 1 =
+            // 25; MXFP8(E4M3) = 32 + 1 = 33.
+            Self::Mxfp4Raw => blocks(n_elements, 32) * 17,
+            Self::Mxfp6Raw => blocks(n_elements, 32) * 25,
+            Self::Mxfp8Raw => blocks(n_elements, 32) * 33,
+            // FP8 (E4M3, per-tensor scale): 1 byte per element, the
+            // scale lives in GGUF metadata (not the weight bytes).
+            Self::Fp8Raw => n_elements,
         }
     }
 }
@@ -884,6 +925,10 @@ pub fn raw_passthrough_source(target: Dtype) -> Option<GgmlType> {
         Dtype::Nvfp4Raw => GgmlType::Nvfp4,
         Dtype::PQ2_0Raw => GgmlType::PQ2_0,
         Dtype::PTQ1_0Raw => GgmlType::PTQ1_0,
+        Dtype::Mxfp4Raw => GgmlType::Mxfp4,
+        Dtype::Mxfp6Raw => GgmlType::Mxfp6,
+        Dtype::Mxfp8Raw => GgmlType::Mxfp8,
+        Dtype::Fp8Raw => GgmlType::Fp8,
         _ => return None,
     })
 }
@@ -1033,6 +1078,33 @@ fn load_tensor_bytes(info: &TensorInfo, src: &[u8], target: Dtype, name: &str) -
         GgmlType::PTQ1_0 => {
             let mut out = vec![0f32; n_elements];
             dequant::dequant_ptq1_0(src, &mut out);
+            out
+        }
+        GgmlType::Mxfp4 => {
+            let mut out = vec![0f32; n_elements];
+            dequant::dequant_mxfp4(src, &mut out);
+            out
+        }
+        GgmlType::Mxfp6 => {
+            let mut out = vec![0f32; n_elements];
+            dequant::dequant_mxfp6(src, &mut out);
+            out
+        }
+        GgmlType::Mxfp8 => {
+            let mut out = vec![0f32; n_elements];
+            dequant::dequant_mxfp8(src, &mut out);
+            out
+        }
+        GgmlType::Fp8 => {
+            // FP8 (E4M3) carries its scale per-TENSOR in GGUF metadata,
+            // not in the element bytes. The raw-weight path applies that
+            // scale in the matvec kernel; this dequant-to-f32 fallback
+            // (hit only when FP8 is force-converted to F32/F16 at load,
+            // e.g. a sub-L3 tensor) decodes the raw E4M3 elements with an
+            // implicit scale of 1.0. `dequant_fp8` takes the scale so the
+            // metadata-driven path can pass it once TensorInfo carries it.
+            let mut out = vec![0f32; n_elements];
+            dequant::dequant_fp8(src, 1.0, &mut out);
             out
         }
         other => {
@@ -1270,6 +1342,42 @@ fn load_tensor_bytes(info: &TensorInfo, src: &[u8], target: Dtype, name: &str) -
                 info.dtype,
                 GgmlType::PTQ1_0,
                 "Dtype::PTQ1_0Raw requires source dtype PTQ1_0, got {:?}",
+                info.dtype
+            );
+            src.to_vec()
+        }
+        Dtype::Mxfp4Raw => {
+            assert_eq!(
+                info.dtype,
+                GgmlType::Mxfp4,
+                "Dtype::Mxfp4Raw requires source dtype Mxfp4, got {:?}",
+                info.dtype
+            );
+            src.to_vec()
+        }
+        Dtype::Mxfp6Raw => {
+            assert_eq!(
+                info.dtype,
+                GgmlType::Mxfp6,
+                "Dtype::Mxfp6Raw requires source dtype Mxfp6, got {:?}",
+                info.dtype
+            );
+            src.to_vec()
+        }
+        Dtype::Mxfp8Raw => {
+            assert_eq!(
+                info.dtype,
+                GgmlType::Mxfp8,
+                "Dtype::Mxfp8Raw requires source dtype Mxfp8, got {:?}",
+                info.dtype
+            );
+            src.to_vec()
+        }
+        Dtype::Fp8Raw => {
+            assert_eq!(
+                info.dtype,
+                GgmlType::Fp8,
+                "Dtype::Fp8Raw requires source dtype Fp8, got {:?}",
                 info.dtype
             );
             src.to_vec()
