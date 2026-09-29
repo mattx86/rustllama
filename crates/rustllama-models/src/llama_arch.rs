@@ -1834,7 +1834,21 @@ fn load_weight(gguf: &Gguf, name: &str) -> Result<Tensor, LlamaLoadError> {
             // heap: a 2-bit 100 MiB expert tensor becomes an 800 MiB F16
             // slab, and a freshly downloaded quant "mysteriously"
             // explodes RAM. Make it loud once per load path.
-            if !fits_in_l3 && !matches!(other, GgmlType::F16) {
+            if matches!(other, GgmlType::Fp8) {
+                // FP8 (E4M3, per-tensor scale) is intentionally
+                // transcoded to F16 at load: its scale is out-of-band
+                // (GGUF metadata), which doesn't fit the packed matvec's
+                // in-band block model, so we dequant (applying the
+                // metadata scale) to F16 and run the standard F16 path.
+                // This costs 2x the FP8 file's bytes in RAM; MXFP8 gives
+                // the same 8-bit precision at ~8 bpw if memory matters.
+                tracing::info!(
+                    tensor = name,
+                    f16_mib = f16_bytes / (1024 * 1024),
+                    "FP8 tensor transcoded to F16 at load (per-tensor scale \
+                     applied); use MXFP8 for memory-efficient 8-bit weights"
+                );
+            } else if !fits_in_l3 && !matches!(other, GgmlType::F16) {
                 tracing::warn!(
                     tensor = name,
                     ggml_type = ?other,

@@ -851,7 +851,19 @@ impl Tensor {
         let bytes = gguf
             .tensor_bytes(name)
             .ok_or_else(|| TensorError::MissingTensor(name.to_string()))?;
-        load_tensor_bytes(info, bytes, target, name)
+        // FP8 (E4M3) carries its scale per-tensor in GGUF metadata, not
+        // in the weight bytes. Read `<tensor>.fp8_scale`, falling back to
+        // the model-wide `general.fp8_scale`, else 1.0 (raw E4M3). Only
+        // read for an FP8 source — every other dtype ignores the scale.
+        let fp8_scale = if info.dtype == GgmlType::Fp8 {
+            gguf.metadata_get(&format!("{name}.fp8_scale"))
+                .or_else(|| gguf.metadata_get("general.fp8_scale"))
+                .and_then(|v| v.as_f32())
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        load_tensor_bytes(info, bytes, target, name, fp8_scale)
     }
 
     /// Zero-copy load: when `target` is a raw passthrough of the source
@@ -933,7 +945,13 @@ pub fn raw_passthrough_source(target: Dtype) -> Option<GgmlType> {
     })
 }
 
-fn load_tensor_bytes(info: &TensorInfo, src: &[u8], target: Dtype, name: &str) -> Result<Tensor> {
+fn load_tensor_bytes(
+    info: &TensorInfo,
+    src: &[u8],
+    target: Dtype,
+    name: &str,
+    fp8_scale: f32,
+) -> Result<Tensor> {
     let n_elements = info.element_count() as usize;
     let shape = info.dims.clone();
 
@@ -1102,9 +1120,10 @@ fn load_tensor_bytes(info: &TensorInfo, src: &[u8], target: Dtype, name: &str) -
             // (hit only when FP8 is force-converted to F32/F16 at load,
             // e.g. a sub-L3 tensor) decodes the raw E4M3 elements with an
             // implicit scale of 1.0. `dequant_fp8` takes the scale so the
-            // metadata-driven path can pass it once TensorInfo carries it.
+            // metadata-driven path passes it (from_gguf reads the GGUF
+            // `<tensor>.fp8_scale` / `general.fp8_scale` metadata key).
             let mut out = vec![0f32; n_elements];
-            dequant::dequant_fp8(src, 1.0, &mut out);
+            dequant::dequant_fp8(src, fp8_scale, &mut out);
             out
         }
         other => {

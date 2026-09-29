@@ -408,6 +408,21 @@ impl MetadataValue {
             _ => None,
         }
     }
+    /// Best-effort f32 read: accepts the float types and widens the
+    /// small integer types. Used e.g. for the FP8 per-tensor scale.
+    pub fn as_f32(&self) -> Option<f32> {
+        match self {
+            Self::F32(v) => Some(*v),
+            Self::F64(v) => Some(*v as f32),
+            Self::U8(v) => Some(*v as f32),
+            Self::I8(v) => Some(*v as f32),
+            Self::U16(v) => Some(*v as f32),
+            Self::I16(v) => Some(*v as f32),
+            Self::U32(v) => Some(*v as f32),
+            Self::I32(v) => Some(*v as f32),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) struct Parsed {
