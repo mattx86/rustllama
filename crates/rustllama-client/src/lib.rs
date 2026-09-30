@@ -41,6 +41,12 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repeat_penalty: Option<f32>,
+    /// Fixed RNG seed for reproducible sampling. `None` → the server picks a
+    /// fresh seed each request. Mirrors the web client's `seed` field (see
+    /// `app/ui/src/api.ts` `streamChat`), which the native GUI's sampling
+    /// panel now sets too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
     #[serde(default)]
     pub stream: bool,
     /// OpenAI `stream_options` — currently honors only
@@ -402,6 +408,67 @@ pub struct PullProgress {
     pub error: Option<String>,
 }
 
+// --- /v1/config (read-only subset) -----------------------------------------
+// The GUI reads two things off the on-disk config: the system-prompt library
+// (the chat's system-prompt dropdown) and `[inference].ctx_size` (a fallback
+// context budget for the token counter when `/v1/metrics.ctx_size` is 0). The
+// full `Config` is much larger; we pin only these fields and leave the rest
+// unread. Every field is `#[serde(default)]` so a slimmer/older server body
+// still deserializes. Mirrors `app/ui/src/api.ts` `ConfigEnvelope`/`AppConfig`.
+
+/// The `{ config, config_path, hot_apply }` envelope `GET /v1/config` returns.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ConfigEnvelope {
+    #[serde(default)]
+    pub config: AppConfig,
+}
+
+/// Read-only slice of the server's `Config` the GUI consumes.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AppConfig {
+    #[serde(default)]
+    pub inference: InferenceConfig,
+    /// `[[system_prompts]]` library. Empty → the chat hides its dropdown.
+    #[serde(default)]
+    pub system_prompts: Vec<SystemPrompt>,
+}
+
+/// The `[inference]` fields the GUI reads (just the context budget today).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct InferenceConfig {
+    /// Configured context length. `0` when unset / on a mock engine.
+    #[serde(default)]
+    pub ctx_size: u64,
+}
+
+/// One `[[system_prompts]]` entry. The chat prepends the chosen prompt's
+/// `body` as a leading `role:"system"` message; `default_for_model` auto-picks
+/// it when the named model is the active one. The server serializes the text
+/// under `body` (matches `app/ui`'s `SystemPrompt.body`); `content` is accepted
+/// as an alias in case a future server renames it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SystemPrompt {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, alias = "content")]
+    pub body: String,
+    /// Model id this prompt auto-selects for. Empty = never auto-selected.
+    #[serde(default)]
+    pub default_for_model: String,
+}
+
+/// `POST /v1/tokenize` response. The GUI only reads `count` (the live composer
+/// token counter); `tokens`/`model_id` round-trip for completeness.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TokenizeResult {
+    #[serde(default)]
+    pub count: u32,
+    #[serde(default)]
+    pub tokens: Vec<i64>,
+    #[serde(default)]
+    pub model_id: String,
+}
+
 /// One tool call the model emitted, reassembled from the streaming
 /// `tool_calls` deltas (header + argument fragments). Surfaced whole via
 /// [`ChatEvent::ToolCalls`] so a frontend can apply a confirm / auto-run
@@ -419,8 +486,14 @@ pub struct ToolCall {
 /// One streamed event delivered to the REPL / GUI from `chat_stream`.
 #[derive(Debug, Clone)]
 pub enum ChatEvent {
-    /// Initial chunk announcing role=assistant.
-    Start,
+    /// Initial chunk announcing role=assistant. Carries the server-assigned
+    /// request id (`chatcmpl-…`) read off the first streamed chunk — every
+    /// chunk echoes it at the JSON envelope's top level. Frontends stash this
+    /// so a Stop button can POST it to `/v1/cancel` and actually halt the
+    /// engine (not merely drop SSE chunks client-side). Empty string only if a
+    /// (non-conformant) server omitted the id. Mirrors the web client's
+    /// `onStart(obj.id)`.
+    Start(String),
     /// Delta of generated content.
     Content(String),
     /// The model proposed one or more tool calls. Emitted once, just
@@ -642,6 +715,80 @@ impl Client {
         Ok(resp.json().await?)
     }
 
+    /// `GET /v1/config` — the on-disk config (system-prompt library + inference
+    /// knobs). The chat view reads `config.system_prompts` for its dropdown and
+    /// `config.inference.ctx_size` as a fallback context budget. Returns the
+    /// `{ config, … }` envelope; see [`ConfigEnvelope`] for the consumed subset.
+    pub async fn get_config(&self) -> Result<ConfigEnvelope> {
+        let url = join(&self.base, "/v1/config")?;
+        let resp = self.http.get(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Server {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// `POST /v1/tokenize` — server-side token count for `content`, used by the
+    /// chat's live "N / ctx" composer counter. `add_bos` is sent `false` to
+    /// match the web client (the chat template prepends its own BOS, so the
+    /// meter must not double-count). `model` targets a specific loaded model, or
+    /// `None` to use the server default.
+    pub async fn tokenize(&self, content: &str, model: Option<&str>) -> Result<TokenizeResult> {
+        let url = join(&self.base, "/v1/tokenize")?;
+        let resp = self
+            .http
+            .post(url)
+            .json(&serde_json::json!({
+                "content": content,
+                "model": model,
+                "add_bos": false,
+            }))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Server {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// `POST /v1/cancel` — stop an in-flight streaming generation by request id
+    /// (the `chatcmpl-…` from [`ChatEvent::Start`]). The server flips the
+    /// engine's cancel flag so generation stops mid-token and resources free
+    /// immediately — complementary to dropping the SSE stream client-side. A
+    /// `404` (the request already finished / was never registered — a common
+    /// race) is treated as success, mirroring the web client.
+    pub async fn cancel(&self, request_id: &str) -> Result<()> {
+        let url = join(&self.base, "/v1/cancel")?;
+        let resp = self
+            .http
+            .post(url)
+            .json(&serde_json::json!({ "id": request_id }))
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.as_u16() == 404 {
+            return Ok(());
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Server {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(())
+    }
+
     /// `DELETE /api/delete` — remove a cached GGUF from disk. `name` is the
     /// `/api/tags` display name (`owner/repo:filename` or a bare file stem).
     pub async fn delete_model(&self, name: &str) -> Result<()> {
@@ -798,11 +945,19 @@ where
                 let event_bytes = buf.drain(..pos).collect::<Vec<u8>>();
                 // Drop the boundary marker (\n\n or \r\n\r\n).
                 drain_boundary(&mut buf);
+                // Emit `Start` exactly once, carrying the request id, as soon
+                // as we can read it. Unlike before we do NOT wait for the first
+                // decoded event: the very first chunk is usually the role-only
+                // delta (`{delta:{role:"assistant"}}`) which yields no event —
+                // but it DOES carry the id, and the sooner the client has the
+                // id the sooner a Stop can cancel. `extract_request_id` reads
+                // it off the raw event; decode_event is untouched.
+                if !sent_start {
+                    sent_start = true;
+                    let id = extract_request_id(&event_bytes).unwrap_or_default();
+                    yield Ok(ChatEvent::Start(id));
+                }
                 for event in decode_event(&event_bytes, &mut tool_acc) {
-                    if !sent_start {
-                        sent_start = true;
-                        yield Ok(ChatEvent::Start);
-                    }
                     yield event;
                     // If the parsed event was Finish or Error, the server is
                     // about to send `data: [DONE]` and close. We can keep
@@ -874,6 +1029,36 @@ fn drain_boundary(buf: &mut Vec<u8>) {
     } else if buf.starts_with(b"\r\n\r\n") {
         buf.drain(..4);
     }
+}
+
+/// Pull the server-assigned request id (`chatcmpl-…`) out of a raw SSE event.
+/// The id rides every streaming chunk at the JSON envelope's top level; we read
+/// it from the first parseable `data:` line so [`ChatEvent::Start`] can carry
+/// it. Kept separate from `decode_event` so that function (and its unit tests)
+/// stay unchanged. Non-`data:` lines (SSE comments / `event:` lines) and the
+/// `[DONE]` sentinel are skipped.
+fn extract_request_id(event_bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(event_bytes).ok()?;
+    for line in text.lines() {
+        let Some(payload) = line
+            .strip_prefix("data: ")
+            .or_else(|| line.strip_prefix("data:"))
+        else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+            if let Some(id) = v.get("id").and_then(|i| i.as_str()) {
+                if !id.is_empty() {
+                    return Some(id.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Decode one SSE event into zero or more [`ChatEvent`]s. `tool_acc` is
@@ -1504,5 +1689,99 @@ mod tests {
         assert!(decode_ndjson_line(b"").is_none());
         assert!(decode_ndjson_line(b"   ").is_none());
         assert!(decode_ndjson_line(b"not json").is_none());
+    }
+
+    /// `/v1/config` envelope → the system-prompt library + inference ctx_size
+    /// the chat view reads. Lenient: extra sections / fields pass through
+    /// unread, and a `content` key aliases `body`.
+    #[test]
+    fn config_envelope_deserializes_prompts_and_ctx() {
+        let body = serde_json::json!({
+            "config": {
+                "inference": { "ctx_size": 8192, "n_gpu_layers": 999 },
+                "system_prompts": [
+                    { "name": "coder", "body": "You write code.", "default_for_model": "qwen2.5-coder" },
+                    { "name": "aliased", "content": "Via content alias." }
+                ],
+                "server": { "port": 11434 }
+            },
+            "config_path": "/x/config.toml",
+            "hot_apply": { "model": "reload" }
+        });
+        let env: ConfigEnvelope = serde_json::from_value(body).unwrap();
+        assert_eq!(env.config.inference.ctx_size, 8192);
+        assert_eq!(env.config.system_prompts.len(), 2);
+        assert_eq!(env.config.system_prompts[0].name, "coder");
+        assert_eq!(env.config.system_prompts[0].body, "You write code.");
+        assert_eq!(
+            env.config.system_prompts[0].default_for_model,
+            "qwen2.5-coder"
+        );
+        // `content` aliases `body`; a missing default_for_model defaults empty.
+        assert_eq!(env.config.system_prompts[1].body, "Via content alias.");
+        assert!(env.config.system_prompts[1].default_for_model.is_empty());
+    }
+
+    /// A minimal `/v1/config` (no system_prompts, no inference) still
+    /// deserializes to empty defaults.
+    #[test]
+    fn config_envelope_minimal_defaults() {
+        let env: ConfigEnvelope = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(env.config.inference.ctx_size, 0);
+        assert!(env.config.system_prompts.is_empty());
+    }
+
+    /// `/v1/tokenize` response → the composer counter reads `count`.
+    #[test]
+    fn tokenize_result_deserializes_count() {
+        let body =
+            serde_json::json!({ "count": 5, "tokens": [1, 2, 3, 4, 5], "model_id": "qwen" });
+        let r: TokenizeResult = serde_json::from_value(body).unwrap();
+        assert_eq!(r.count, 5);
+        assert_eq!(r.tokens.len(), 5);
+        assert_eq!(r.model_id, "qwen");
+    }
+
+    /// `seed` serializes only when set (skip_serializing_if), so an unset seed
+    /// keeps the request wire-identical to a client that never had the field.
+    #[test]
+    fn chat_request_seed_serializes_only_when_set() {
+        let base = ChatRequest {
+            model: "m".into(),
+            messages: vec![],
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            repeat_penalty: None,
+            seed: None,
+            stream: true,
+            stream_options: None,
+            allow_clarify: None,
+        };
+        let v = serde_json::to_value(&base).unwrap();
+        assert!(v.get("seed").is_none(), "unset seed must be omitted");
+
+        let with_seed = ChatRequest {
+            seed: Some(42),
+            ..base
+        };
+        let v = serde_json::to_value(&with_seed).unwrap();
+        assert_eq!(v.get("seed").and_then(|s| s.as_u64()), Some(42));
+    }
+
+    /// The request id rides every chunk at envelope level; `extract_request_id`
+    /// reads it off the raw SSE event (skipping non-`data:` lines + `[DONE]`).
+    #[test]
+    fn extract_request_id_reads_envelope_id() {
+        let ev = "data: {\"id\":\"chatcmpl-abc123\",\"choices\":[{\"index\":0,\
+                  \"delta\":{\"role\":\"assistant\"}}]}";
+        assert_eq!(
+            extract_request_id(ev.as_bytes()).as_deref(),
+            Some("chatcmpl-abc123")
+        );
+        // A comment / done line yields nothing.
+        assert!(extract_request_id(b": keep-alive").is_none());
+        assert!(extract_request_id(b"data: [DONE]").is_none());
     }
 }

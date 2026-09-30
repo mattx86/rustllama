@@ -9263,6 +9263,7 @@ async fn chat_repl(
                         top_k: Some(top_k),
                         max_tokens: Some(max_tokens),
                         repeat_penalty: Some(repeat_penalty),
+                        seed: None,
                         stream: true,
                         stream_options: Some(rustllama_client::StreamOptions {
                             include_usage: true,
@@ -9636,6 +9637,7 @@ async fn chat_repl(
                 top_k: Some(top_k),
                 max_tokens: Some(max_tokens),
                 repeat_penalty: Some(repeat_penalty),
+                seed: None,
                 stream: true,
                 stream_options: Some(rustllama_client::StreamOptions {
                     include_usage: true,
@@ -10090,7 +10092,7 @@ async fn drive_chat_stream(
     let mut tool_calls: Option<Vec<rustllama_client::ToolCall>> = None;
     while let Some(ev) = stream.next().await {
         match ev {
-            Ok(ChatEvent::Start) => {}
+            Ok(ChatEvent::Start(_)) => {}
             Ok(ChatEvent::Content(t)) => {
                 print!("{t}");
                 let _ = std::io::stdout().flush();

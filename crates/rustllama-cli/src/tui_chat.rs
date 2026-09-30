@@ -138,6 +138,7 @@ impl App {
             top_k: Some(self.top_k),
             max_tokens: Some(self.max_tokens),
             repeat_penalty: Some(self.repeat_penalty),
+            seed: None,
             stream: true,
             stream_options: Some(rustllama_client::StreamOptions {
                 include_usage: true,
@@ -565,7 +566,7 @@ fn spawn_stream(client: Arc<Client>, req: ChatRequest, tx: UnboundedSender<Strea
                             let _ = tx.send(StreamMsg::ToolCalls { calls });
                         }
                         Ok(ChatEvent::Finish(_)) => break,
-                        Ok(ChatEvent::Start) => {}
+                        Ok(ChatEvent::Start(_)) => {}
                         Ok(ChatEvent::Error(e)) => {
                             let _ = tx.send(StreamMsg::Err(e));
                             return;

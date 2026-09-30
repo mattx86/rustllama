@@ -15,7 +15,7 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use futures::StreamExt;
 use rustllama_client::{
     ChatEvent, ChatMessage, ChatRequest, Client, HfFile, HfModel, LoadModelParams, MetricsSnapshot,
-    StreamOptions, TagsModel, Usage,
+    StreamOptions, SystemPrompt, TagsModel, ToolCall, Usage,
 };
 
 // --- Theme tokens ---------------------------------------------------------
@@ -37,6 +37,19 @@ const HEALTH_OK: Color32 = Color32::from_rgb(0x3f, 0xb9, 0x50);
 const HEALTH_BAD: Color32 = Color32::from_rgb(0xe5, 0x48, 0x4d);
 const WARN: Color32 = Color32::from_rgb(0xd2, 0x99, 0x22); // meter "yellow" band
 const DANGER: Color32 = Color32::from_rgb(0xf8, 0x51, 0x49); // delete affordances
+
+/// Keyboard-shortcut rows shown in the chat's help overlay (see
+/// [`GuiApp::render_chat`]).
+const SHORTCUTS: &[(&str, &str)] = &[
+    ("Enter", "Send message"),
+    ("Ctrl+Enter", "Send message"),
+    ("Shift+Enter", "Insert a newline"),
+    ("Esc", "Stop generating / close this overlay"),
+    ("Ctrl+L", "Clear the transcript"),
+    ("Ctrl+R", "Regenerate the last response"),
+    ("Ctrl+E", "Export the conversation as Markdown"),
+    ("?", "Toggle this shortcuts overlay"),
+];
 
 /// Which page the central area renders. Chat + Models are built in Phase 2;
 /// Status / Settings / Decide / Quantize are stubbed in the nav for later.
@@ -82,6 +95,92 @@ impl Turn {
             content,
         }
     }
+    fn system(content: String) -> Self {
+        Self {
+            role: "system".into(),
+            content,
+        }
+    }
+}
+
+/// Sampling controls surfaced in the chat's Sampling popover. Each field is
+/// wired into [`ChatRequest`]; [`Sampling::apply`] sends a value only when it
+/// differs from the neutral default, so an untouched panel keeps the request
+/// wire-minimal (the server/model default wins). Mirrors Chat.tsx's Settings
+/// panel (temperature / max_tokens / seed) plus the top_p / top_k /
+/// repeat_penalty knobs the request already supports.
+#[derive(Clone)]
+struct Sampling {
+    temperature: f32,
+    max_tokens: u32,
+    /// Free text; parsed to `u64`. Blank / unparseable = random each turn.
+    seed: String,
+    top_p: f32,
+    top_k: u32,
+    repeat_penalty: f32,
+}
+
+impl Default for Sampling {
+    fn default() -> Self {
+        // Neutral-ish defaults: temperature/max_tokens match the web UI's
+        // starting values; top_p 1.0 / top_k 0 / repeat_penalty 1.0 are the
+        // "no-op" sampler settings, so leaving them untouched means "don't
+        // override the model/server default".
+        Self {
+            temperature: 0.7,
+            max_tokens: 512,
+            seed: String::new(),
+            top_p: 1.0,
+            top_k: 0,
+            repeat_penalty: 1.0,
+        }
+    }
+}
+
+impl Sampling {
+    /// Fold the panel values into a [`ChatRequest`], leaving each field `None`
+    /// when it still sits at the default — an untouched panel adds nothing to
+    /// the wire body, so the server/model defaults apply as before.
+    fn apply(&self, req: &mut ChatRequest) {
+        let d = Sampling::default();
+        if (self.temperature - d.temperature).abs() > f32::EPSILON {
+            req.temperature = Some(self.temperature);
+        }
+        if self.max_tokens != d.max_tokens {
+            req.max_tokens = Some(self.max_tokens);
+        }
+        if (self.top_p - d.top_p).abs() > f32::EPSILON {
+            req.top_p = Some(self.top_p);
+        }
+        if self.top_k != d.top_k {
+            req.top_k = Some(self.top_k);
+        }
+        if (self.repeat_penalty - d.repeat_penalty).abs() > f32::EPSILON {
+            req.repeat_penalty = Some(self.repeat_penalty);
+        }
+        if let Ok(s) = self.seed.trim().parse::<u64>() {
+            req.seed = Some(s);
+        }
+    }
+
+    /// True when every knob is still at its neutral default (drives a subtle
+    /// "· custom" hint on the Sampling button).
+    fn is_default(&self) -> bool {
+        let d = Sampling::default();
+        (self.temperature - d.temperature).abs() <= f32::EPSILON
+            && self.max_tokens == d.max_tokens
+            && self.seed.trim().is_empty()
+            && (self.top_p - d.top_p).abs() <= f32::EPSILON
+            && self.top_k == d.top_k
+            && (self.repeat_penalty - d.repeat_penalty).abs() <= f32::EPSILON
+    }
+}
+
+/// A pending CLARIFY (`ask_user`) question rendered as clickable option
+/// buttons; picking one continues the conversation (see `choose_option`).
+struct PendingAsk {
+    prompt: String,
+    options: Vec<String>,
 }
 
 /// Messages sent from spawned tokio tasks (and the file-dialog thread) back to
@@ -95,12 +194,24 @@ enum UiMsg {
     LoadedModels(Vec<LoadedModel>),
     /// `/healthz` (or a metrics poll) says the server is reachable.
     Health(bool),
+    /// The chat stream announced its server request id (`chatcmpl-…`), read
+    /// off the first SSE chunk. Stored so Stop can POST it to `/v1/cancel`.
+    ChatStart(String),
     /// A streamed chat content delta.
     ChatDelta(String),
     /// The chat stream drained cleanly; carries the final usage block.
     ChatDone(Option<Usage>),
     /// A chat stream failed.
     ChatError(String),
+    /// CLARIFY: the model called the reserved `ask_user` tool — render the
+    /// prompt + options as a chooser instead of guessing.
+    AskUser {
+        prompt: String,
+        options: Vec<String>,
+    },
+    /// The model proposed tool call(s). With "Auto-run tools" off we render an
+    /// Approve/Deny prompt; on, we note the proposal in the transcript.
+    ToolCalls(Vec<ToolCall>),
     /// A model was promoted to the server default (model-bar Load).
     ModelLoaded(String),
     /// Generic status/error line for the model bar.
@@ -140,6 +251,22 @@ enum UiMsg {
     Metrics(Box<MetricsSnapshot>),
     /// The metrics poll failed (server unreachable) → offline dot.
     MetricsError,
+
+    // --- chat config / token counter / export ---
+    /// `/v1/config` returned: the system-prompt library + a fallback ctx budget.
+    Config {
+        system_prompts: Vec<SystemPrompt>,
+        ctx_size: u64,
+    },
+    /// A debounced `/v1/tokenize` count for the composer text (tagged with the
+    /// text it answered so a stale response is dropped).
+    DraftTokens { text: String, count: u32 },
+    /// The tokenize call failed (e.g. mock engine) → hide the counter.
+    DraftTokenError,
+    /// The export save-dialog thread wrote the transcript to a file.
+    ExportDone(String),
+    /// The export failed (write error; a cancelled dialog sends nothing).
+    ExportError(String),
 }
 
 /// Deferred UI action. Immediate-mode widgets push these while a panel is
@@ -224,6 +351,47 @@ pub struct GuiApp {
     last_usage: Option<Usage>,
     status: Option<String>,
 
+    // --- chat: system prompt (from /v1/config) ---
+    system_prompts: Vec<SystemPrompt>,
+    /// Name of the picked prompt, or "" for none. Auto-selected from
+    /// `default_for_model` until the user touches the dropdown.
+    selected_prompt: String,
+    user_picked_prompt: bool,
+    /// Fallback context budget from `[inference].ctx_size` (used when
+    /// `/v1/metrics.ctx_size` is 0).
+    config_ctx_size: u64,
+
+    // --- chat: sampling ---
+    sampling: Sampling,
+
+    // --- chat: live token counter ---
+    /// Last debounced token count for the composer, or `None` (counting /
+    /// unsupported). Tagged internally by `tok_last_text`.
+    draft_tokens: Option<u32>,
+    /// When the composer text last changed — drives the ~300 ms tokenize
+    /// debounce.
+    tok_dirty_since: Option<Instant>,
+    /// The composer text last sent to `/v1/tokenize` (dedupes repeats).
+    tok_last_text: String,
+    tok_inflight: bool,
+
+    // --- chat: cancel / clarify / tools ---
+    /// Server request id of the in-flight stream (for Stop → `/v1/cancel`).
+    request_id: Option<String>,
+    /// Handle to the streaming task so Stop can abort local SSE consumption.
+    chat_task: Option<tokio::task::JoinHandle<()>>,
+    /// Accept proposed tool calls without prompting (chat never executes
+    /// tools — this only gates the confirm UI). Persisted via eframe storage.
+    auto_tools: bool,
+    /// CLARIFY opt-in: let the model pause and ask (drives `allow_clarify`).
+    /// Persisted via eframe storage.
+    clarify: bool,
+    pending_question: Option<PendingAsk>,
+    pending_tools: Option<Vec<ToolCall>>,
+
+    // --- chat: keyboard-shortcuts overlay ---
+    show_shortcuts: bool,
+
     md_cache: CommonMarkCache,
 }
 
@@ -238,6 +406,19 @@ impl GuiApp {
         let client = Client::new(base_url.as_str())
             .map_err(|e| anyhow::anyhow!("invalid base url {base_url:?}: {e}"))?;
         let (tx, rx) = std::sync::mpsc::channel();
+
+        // Restore the header toggles from eframe storage. Without the eframe
+        // `persistence` feature `cc.storage` is `None`, so this degrades to the
+        // in-session defaults (auto-tools OFF, clarify ON). Mirrors the web
+        // UI's localStorage keys.
+        let (auto_tools, clarify) = cc
+            .storage
+            .map(|s| {
+                let auto = s.get_string("auto_tools").as_deref() == Some("1");
+                let clar = s.get_string("clarify").as_deref() != Some("0");
+                (auto, clar)
+            })
+            .unwrap_or((false, true));
 
         let app = Self {
             base_url,
@@ -278,13 +459,31 @@ impl GuiApp {
             metrics_inflight: false,
             last_usage: None,
             status: None,
+            system_prompts: Vec::new(),
+            selected_prompt: String::new(),
+            user_picked_prompt: false,
+            config_ctx_size: 0,
+            sampling: Sampling::default(),
+            draft_tokens: Some(0),
+            tok_dirty_since: None,
+            tok_last_text: String::new(),
+            tok_inflight: false,
+            request_id: None,
+            chat_task: None,
+            auto_tools,
+            clarify,
+            pending_question: None,
+            pending_tools: None,
+            show_shortcuts: false,
             md_cache: CommonMarkCache::default(),
         };
 
-        // Kick off the initial loads (health probe + model list + cached list).
+        // Kick off the initial loads (health probe + model list + cached list +
+        // the config's system-prompt library / ctx budget).
         app.spawn_health();
         app.spawn_refresh_models();
         app.spawn_refresh_cached();
+        app.spawn_config();
         Ok(app)
     }
 
@@ -345,6 +544,48 @@ impl GuiApp {
                 }
                 Err(_) => {
                     let _ = tx.send(UiMsg::MetricsError);
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Fetch `/v1/config` once at startup: the system-prompt library (chat
+    /// dropdown) + a fallback context budget. A failure is silent — the chat
+    /// just hides the dropdown / falls back to metrics for the ctx budget.
+    fn spawn_config(&self) {
+        let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            if let Ok(env) = client.get_config().await {
+                let _ = tx.send(UiMsg::Config {
+                    system_prompts: env.config.system_prompts,
+                    ctx_size: env.config.inference.ctx_size,
+                });
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Debounced `/v1/tokenize` for the composer counter. The result is tagged
+    /// with `text` so a stale reply (the user kept typing) is dropped.
+    fn spawn_tokenize(&self, text: String) {
+        let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), self.ctx.clone());
+        let model = self.current_model();
+        self.rt.spawn(async move {
+            let model_opt = if model.is_empty() {
+                None
+            } else {
+                Some(model.as_str())
+            };
+            match client.tokenize(&text, model_opt).await {
+                Ok(r) => {
+                    let _ = tx.send(UiMsg::DraftTokens {
+                        text,
+                        count: r.count,
+                    });
+                }
+                Err(_) => {
+                    let _ = tx.send(UiMsg::DraftTokenError);
                 }
             }
             ctx.request_repaint();
@@ -566,10 +807,16 @@ impl GuiApp {
         });
     }
 
-    fn spawn_chat(&self, model: String, messages: Vec<ChatMessage>) {
+    fn spawn_chat(
+        &mut self,
+        model: String,
+        messages: Vec<ChatMessage>,
+        sampling: Sampling,
+        allow_clarify: bool,
+    ) {
         let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), self.ctx.clone());
-        self.rt.spawn(async move {
-            let req = ChatRequest {
+        let handle = self.rt.spawn(async move {
+            let mut req = ChatRequest {
                 model,
                 messages,
                 temperature: None,
@@ -577,14 +824,19 @@ impl GuiApp {
                 top_k: None,
                 max_tokens: None,
                 repeat_penalty: None,
+                seed: None,
                 stream: true,
                 stream_options: Some(StreamOptions {
                     include_usage: true,
                 }),
-                // CLARIFY opt-in: let the model pause and ask instead of
-                // guessing. We render the question inline (see AskUser).
-                allow_clarify: Some(true),
+                // CLARIFY opt-in: `Some(true)` routes through the ask_user tool
+                // path so the model can pause and ask; `None` keeps the request
+                // wire-identical to the plain path (mirrors the web client
+                // sending the flag only when the toggle is on).
+                allow_clarify: if allow_clarify { Some(true) } else { None },
             };
+            // Fold in the sampling panel (each field stays None at its default).
+            sampling.apply(&mut req);
 
             // Event-ordering NOTE: with `stream_options.include_usage` the
             // server emits the Usage event in a *separate* final SSE chunk that
@@ -598,22 +850,29 @@ impl GuiApp {
                 Ok(mut stream) => {
                     while let Some(ev) = stream.next().await {
                         match ev {
+                            // The first chunk carries the request id — forward
+                            // it so a Stop can POST it to `/v1/cancel`.
+                            Ok(ChatEvent::Start(id)) => {
+                                let _ = tx.send(UiMsg::ChatStart(id));
+                                ctx.request_repaint();
+                            }
                             Ok(ChatEvent::Content(t)) => {
                                 let _ = tx.send(UiMsg::ChatDelta(t));
                                 ctx.request_repaint(); // wake the UI per token
                             }
                             Ok(ChatEvent::Usage(u)) => usage = Some(u),
+                            // CLARIFY: surface the question so the transcript
+                            // renders clickable option buttons (not inline text).
                             Ok(ChatEvent::AskUser {
                                 prompt, options, ..
                             }) => {
-                                // Fold the clarify question into the visible
-                                // stream. TODO(phase3): inline choice buttons
-                                // that round-trip the answer.
-                                let mut m = format!("\n\n**Clarification needed:** {prompt}");
-                                if !options.is_empty() {
-                                    m.push_str(&format!("\n\n_Options: {}_", options.join(", ")));
-                                }
-                                let _ = tx.send(UiMsg::ChatDelta(m));
+                                let _ = tx.send(UiMsg::AskUser { prompt, options });
+                                ctx.request_repaint();
+                            }
+                            // Tool-call proposal — the UI applies its confirm /
+                            // auto-run policy (the chat has no tool executor).
+                            Ok(ChatEvent::ToolCalls(calls)) => {
+                                let _ = tx.send(UiMsg::ToolCalls(calls));
                                 ctx.request_repaint();
                             }
                             Ok(ChatEvent::Error(e)) => {
@@ -621,8 +880,7 @@ impl GuiApp {
                                 let _ = tx.send(UiMsg::ChatError(e));
                                 ctx.request_repaint();
                             }
-                            // Start / Finish / ToolCalls: nothing to render in
-                            // the chat view (tool execution is a later phase).
+                            // Finish: nothing to render (Usage rides a later chunk).
                             Ok(_) => {}
                             Err(e) => {
                                 errored = true;
@@ -641,6 +899,7 @@ impl GuiApp {
             }
             ctx.request_repaint();
         });
+        self.chat_task = Some(handle);
     }
 
     // --- state helpers -----------------------------------------------------
@@ -657,27 +916,81 @@ impl GuiApp {
         self.models.first().cloned().unwrap_or_default()
     }
 
-    fn send_message(&mut self) {
-        if self.streaming {
+    /// The active model id used for system-prompt auto-selection: prefer the
+    /// server's reported `model_id` (via `/v1/metrics`), else the last-loaded,
+    /// else the model-bar selection.
+    fn active_model_id(&self) -> String {
+        if let Some(id) = self
+            .metrics
+            .as_ref()
+            .map(|m| m.model_id.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return id.to_string();
+        }
+        self.current_model()
+    }
+
+    /// The context budget for the token counter: `/v1/metrics.ctx_size` when
+    /// known, else the config's `[inference].ctx_size`, else `None`.
+    fn ctx_budget(&self) -> Option<u64> {
+        self.metrics
+            .as_ref()
+            .map(|m| m.ctx_size)
+            .filter(|&c| c > 0)
+            .or(if self.config_ctx_size > 0 {
+                Some(self.config_ctx_size)
+            } else {
+                None
+            })
+    }
+
+    /// The body of the currently-selected system prompt (if any / non-empty).
+    fn active_system_prompt_body(&self) -> Option<String> {
+        if self.selected_prompt.is_empty() {
+            return None;
+        }
+        self.system_prompts
+            .iter()
+            .find(|p| p.name == self.selected_prompt)
+            .map(|p| p.body.clone())
+            .filter(|b| !b.is_empty())
+    }
+
+    /// Auto-select the prompt whose `default_for_model` matches the active
+    /// model — but only until the user picks one from the dropdown. Mirrors
+    /// Chat.tsx's auto-pick effect.
+    fn maybe_autoselect_prompt(&mut self) {
+        if self.user_picked_prompt || self.system_prompts.is_empty() {
             return;
         }
-        let text = self.input.trim().to_string();
-        if text.is_empty() {
+        let model = self.active_model_id();
+        if model.is_empty() {
             return;
         }
+        let matched = self
+            .system_prompts
+            .iter()
+            .find(|p| !p.default_for_model.is_empty() && p.default_for_model == model)
+            .map(|p| p.name.clone());
+        self.selected_prompt = matched.unwrap_or_default();
+    }
+
+    /// Stream one assistant turn against the current transcript. Shared by
+    /// send / regenerate / clarify-pick / tool-deny so each reuses the exact
+    /// same request build (sampling + clarify) and streaming path.
+    fn stream_current(&mut self) {
         let model = self.current_model();
         if model.is_empty() {
             self.status = Some("Select and load a model first.".into());
+            self.streaming = false;
             return;
         }
-
-        self.input.clear();
-        self.transcript.push(Turn::user(text));
         self.pending.clear();
         self.last_usage = None;
         self.status = None;
+        self.request_id = None;
         self.streaming = true;
-
         // Send the full transcript so the server has the conversation context.
         let messages: Vec<ChatMessage> = self
             .transcript
@@ -687,7 +1000,191 @@ impl GuiApp {
                 content: t.content.clone(),
             })
             .collect();
-        self.spawn_chat(model, messages);
+        let sampling = self.sampling.clone();
+        let clarify = self.clarify;
+        self.spawn_chat(model, messages, sampling, clarify);
+    }
+
+    fn send_message(&mut self) {
+        if self.streaming {
+            return;
+        }
+        let text = self.input.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        // A fresh manual send supersedes any pending clarify / tool prompt.
+        self.pending_question = None;
+        self.pending_tools = None;
+        self.input.clear();
+        self.draft_tokens = Some(0);
+        self.tok_dirty_since = None;
+
+        // On the first turn, materialize the selected system prompt as the
+        // conversation's leading message. It then rides in `history` for every
+        // later turn; the dropdown locks while the transcript is non-empty
+        // (mirrors Chat.tsx — the system message belongs to the conversation).
+        if self.transcript.is_empty() {
+            if let Some(body) = self.active_system_prompt_body() {
+                self.transcript.push(Turn::system(body));
+            }
+        }
+        self.transcript.push(Turn::user(text));
+        self.stream_current();
+    }
+
+    /// Re-run generation as if the last assistant turn never happened: drop the
+    /// trailing assistant message (and anything after it) and resend. Mirrors
+    /// Chat.tsx `regenerateLast`.
+    fn regenerate_last(&mut self) {
+        if self.streaming {
+            return;
+        }
+        let Some(idx) = self.transcript.iter().rposition(|t| t.role == "assistant") else {
+            return;
+        };
+        // Need a user turn before it — else there's nothing to regenerate from.
+        if !self.transcript[..idx].iter().any(|t| t.role == "user") {
+            return;
+        }
+        self.transcript.truncate(idx);
+        self.pending_question = None;
+        self.pending_tools = None;
+        self.stream_current();
+    }
+
+    /// CLARIFY: the user picked an option. Record the question as an assistant
+    /// turn + the answer as a user turn, then continue. Mirrors `chooseOption`.
+    fn choose_option(&mut self, opt: String) {
+        if self.streaming {
+            return;
+        }
+        let Some(q) = self.pending_question.take() else {
+            return;
+        };
+        self.transcript.push(Turn::assistant(q.prompt));
+        self.transcript.push(Turn::user(opt));
+        self.stream_current();
+    }
+
+    /// Approve a proposed tool call — the chat has no executor, so this just
+    /// dismisses the prompt.
+    fn approve_tools(&mut self) {
+        self.pending_tools = None;
+    }
+
+    /// Deny a proposed tool call: append a brief "don't run that" user turn and
+    /// continue so the model answers directly. Mirrors `denyTools`.
+    fn deny_tools(&mut self) {
+        if self.streaming {
+            return;
+        }
+        self.pending_tools = None;
+        self.transcript.push(Turn::user(
+            "Please don't run that tool — answer directly instead.".into(),
+        ));
+        self.stream_current();
+    }
+
+    /// Clear the transcript (Ctrl+L / New). Aborts any in-flight stream first.
+    fn clear_chat(&mut self) {
+        self.stop_stream();
+        self.transcript.clear();
+        self.pending.clear();
+        self.streaming = false;
+        self.last_usage = None;
+        self.status = None;
+        self.pending_question = None;
+        self.pending_tools = None;
+        self.request_id = None;
+    }
+
+    /// Stop the in-flight stream: POST `/v1/cancel` so the ENGINE stops
+    /// generating (not merely drop SSE chunks), abort the local streaming task,
+    /// and commit any partial text so it isn't lost — the same three-part
+    /// teardown the web client does on Stop.
+    fn stop_stream(&mut self) {
+        if !self.streaming {
+            return;
+        }
+        if let Some(id) = self.request_id.take() {
+            let (client, ctx) = (self.client.clone(), self.ctx.clone());
+            self.rt.spawn(async move {
+                let _ = client.cancel(&id).await;
+                ctx.request_repaint();
+            });
+        }
+        if let Some(h) = self.chat_task.take() {
+            h.abort();
+        }
+        if !self.pending.is_empty() {
+            let text = std::mem::take(&mut self.pending);
+            self.transcript.push(Turn::assistant(text));
+        }
+        self.streaming = false;
+    }
+
+    /// Kick off an off-thread save-dialog + write for the transcript. `as_json`
+    /// picks the format; the rfd dialog blocks, so it runs on a dedicated OS
+    /// thread and reports back over the channel (the UI never stalls).
+    fn spawn_export(&self, as_json: bool) {
+        let (ext, content) = if as_json {
+            ("json", self.build_export_json())
+        } else {
+            ("md", self.build_export_markdown())
+        };
+        let default_name = export_filename(ext);
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        let filter_name = if as_json { "JSON" } else { "Markdown" };
+        std::thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_file_name(&default_name)
+                .add_filter(filter_name, &[ext])
+                .set_title("Export conversation")
+                .save_file()
+            {
+                let msg = match std::fs::write(&path, content.as_bytes()) {
+                    Ok(()) => UiMsg::ExportDone(path.display().to_string()),
+                    Err(e) => UiMsg::ExportError(e.to_string()),
+                };
+                let _ = tx.send(msg);
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Markdown rendering of the transcript (roles bold-labeled, `---` between
+    /// turns). Mirrors Chat.tsx `buildExportMarkdown`.
+    fn build_export_markdown(&self) -> String {
+        let model = self.active_model_id();
+        let head = if model.is_empty() {
+            "# Conversation\n\nExported from rustllama.\n\n---\n\n".to_string()
+        } else {
+            format!("# Conversation\n\nExported from rustllama (model: `{model}`).\n\n---\n\n")
+        };
+        let body = self
+            .transcript
+            .iter()
+            .map(|t| format!("**{}:**\n\n{}", t.role, t.content))
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n");
+        format!("{head}{body}\n")
+    }
+
+    /// JSON dump of the transcript — an OpenAI-compatible `messages` array that
+    /// round-trips back into `/v1/chat/completions`. Mirrors `buildExportJson`.
+    fn build_export_json(&self) -> String {
+        let model = self.active_model_id();
+        let messages: Vec<serde_json::Value> = self
+            .transcript
+            .iter()
+            .map(|t| serde_json::json!({ "role": t.role, "content": t.content }))
+            .collect();
+        let doc = serde_json::json!({
+            "model_id": if model.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(model) },
+            "messages": messages,
+        });
+        serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into())
     }
 
     fn handle_msg(&mut self, msg: UiMsg) {
@@ -706,14 +1203,25 @@ impl GuiApp {
                 self.models_error = None;
             }
             UiMsg::Health(ok) => self.health = Some(ok),
-            UiMsg::ChatDelta(t) => self.pending.push_str(&t),
-            UiMsg::ChatDone(usage) => {
-                if !self.pending.is_empty() {
-                    let text = std::mem::take(&mut self.pending);
-                    self.transcript.push(Turn::assistant(text));
+            UiMsg::ChatStart(id) => self.request_id = Some(id),
+            UiMsg::ChatDelta(t) => {
+                // Ignore stragglers that may land after a Stop aborted the task
+                // but before the channel drained.
+                if self.streaming {
+                    self.pending.push_str(&t);
                 }
-                self.streaming = false;
-                self.last_usage = usage;
+            }
+            UiMsg::ChatDone(usage) => {
+                if self.streaming {
+                    if !self.pending.is_empty() {
+                        let text = std::mem::take(&mut self.pending);
+                        self.transcript.push(Turn::assistant(text));
+                    }
+                    self.streaming = false;
+                    self.last_usage = usage;
+                }
+                self.request_id = None;
+                self.chat_task = None;
             }
             UiMsg::ChatError(e) => {
                 // Commit any partial text so it isn't lost, then surface the error.
@@ -722,8 +1230,27 @@ impl GuiApp {
                     self.transcript.push(Turn::assistant(text));
                 }
                 self.streaming = false;
+                self.request_id = None;
+                self.chat_task = None;
                 tracing::warn!(target: "rustllama_gui", "chat error: {e}");
                 self.status = Some(format!("Error: {e}"));
+            }
+            UiMsg::AskUser { prompt, options } => {
+                self.pending_tools = None;
+                self.pending_question = Some(PendingAsk { prompt, options });
+            }
+            UiMsg::ToolCalls(calls) => {
+                if !calls.is_empty() {
+                    if self.auto_tools {
+                        // Auto-run accepts silently — note the proposal in the
+                        // transcript (the chat has no tool executor).
+                        self.transcript
+                            .push(Turn::assistant(describe_tool_calls(&calls)));
+                    } else {
+                        self.pending_question = None;
+                        self.pending_tools = Some(calls);
+                    }
+                }
             }
             UiMsg::ModelLoaded(id) => {
                 self.loaded_model = Some(id.clone());
@@ -817,6 +1344,33 @@ impl GuiApp {
                 self.health = Some(false);
                 self.metrics = None;
             }
+            UiMsg::Config {
+                system_prompts,
+                ctx_size,
+            } => {
+                self.system_prompts = system_prompts;
+                self.config_ctx_size = ctx_size;
+                // Auto-pick a default-for-model prompt now that we have the list.
+                self.maybe_autoselect_prompt();
+            }
+            UiMsg::DraftTokens { text, count } => {
+                self.tok_inflight = false;
+                // Only accept the count if the composer still holds that text.
+                if text == self.input {
+                    self.draft_tokens = Some(count);
+                }
+            }
+            UiMsg::DraftTokenError => {
+                self.tok_inflight = false;
+                // Server can't tokenize (mock engine) — hide the counter.
+                self.draft_tokens = None;
+            }
+            UiMsg::ExportDone(path) => {
+                self.status = Some(format!("Exported to {path}"));
+            }
+            UiMsg::ExportError(e) => {
+                self.status = Some(format!("Export failed: {e}"));
+            }
             UiMsg::Err(e) => {
                 tracing::debug!(target: "rustllama_gui", "{e}");
                 self.status = Some(e);
@@ -837,6 +1391,10 @@ impl eframe::App for GuiApp {
         for msg in incoming {
             self.handle_msg(msg);
         }
+
+        // Track the active model for system-prompt auto-selection (no-op once
+        // the user has picked a prompt or when nothing matches).
+        self.maybe_autoselect_prompt();
 
         let now = Instant::now();
 
@@ -867,6 +1425,25 @@ impl eframe::App for GuiApp {
                 } else if q.len() < 2 {
                     self.hf_results.clear();
                     self.hf_searching = false;
+                }
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(300));
+            }
+        }
+
+        // Composer token-counter debounce: ~300 ms after the last keystroke,
+        // POST the draft to `/v1/tokenize`. Non-blocking (channel bridge); the
+        // response is tagged with its text so a stale count is dropped.
+        if let Some(t) = self.tok_dirty_since {
+            if now.duration_since(t) >= Duration::from_millis(300) {
+                self.tok_dirty_since = None;
+                let text = self.input.clone();
+                if text.trim().is_empty() {
+                    self.draft_tokens = Some(0);
+                } else if text != self.tok_last_text && !self.tok_inflight {
+                    self.tok_last_text = text.clone();
+                    self.tok_inflight = true;
+                    self.spawn_tokenize(text);
                 }
             } else {
                 ctx.request_repaint_after(Duration::from_millis(300));
@@ -1041,17 +1618,45 @@ impl eframe::App for GuiApp {
             }
         }
     }
+
+    /// Persist the header toggles across runs. Only effective when eframe is
+    /// built with the `persistence` feature (this crate isn't, today), in which
+    /// case it degrades to in-session state — the toggles still work, they just
+    /// don't survive a restart. Mirrors the web UI's localStorage keys.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string("auto_tools", if self.auto_tools { "1" } else { "0" }.into());
+        storage.set_string("clarify", if self.clarify { "1" } else { "0" }.into());
+    }
 }
 
 impl GuiApp {
-    /// The Chat view: model bar (top), composer (bottom), transcript (center).
+    /// The Chat view: model bar + toolbar (top), composer (bottom), transcript
+    /// (center). Widgets set local intent flags that are applied after the
+    /// panels close, so the spawn helpers get clean access to `self`.
+    //
+    // DEFERRED (later phases, intentionally not built here):
+    //   - Image attach / multimodal (OpenAI image_url content blocks) — the
+    //     composer is text-only for now.
+    //   - Conversation-history sidebar (the server's `/api/conversations`
+    //     sqlite routes, `--features history`).
+    //   - Auto context compaction (summarize older turns to fit ctx_size).
     fn render_chat(&mut self, ctx: &egui::Context) {
-        // Actions local to the chat view (kept as flags since they only touch
-        // chat state / the model bar).
+        // Intent flags collected during immediate-mode rendering.
         let mut do_load = false;
         let mut do_unload = false;
         let mut do_refresh = false;
         let mut do_send = false;
+        let mut do_stop = false;
+        let mut do_new = false;
+        let mut do_regen = false;
+        let mut do_export_md = false;
+        let mut do_export_json = false;
+        let mut open_shortcuts = false;
+        let mut prompt_picked = false;
+        let mut input_changed = false;
+        let mut chosen_option: Option<String> = None;
+        let mut do_approve = false;
+        let mut do_deny = false;
 
         // Model bar.
         let models = self.models.clone(); // cheap; avoids nested-closure borrows
@@ -1109,7 +1714,150 @@ impl GuiApp {
                 });
             });
 
-        // Composer.
+        // Chat toolbar: New, Sampling popover, tool/clarify toggles, regen /
+        // export, shortcuts help, and the last-turn usage line.
+        let usage_line = self.last_usage.as_ref().map(format_usage);
+        let transcript_empty = self.transcript.is_empty();
+        let has_assistant = self.transcript.iter().any(|t| t.role == "assistant");
+        let sampling_is_default = self.sampling.is_default();
+        let streaming = self.streaming;
+        egui::TopBottomPanel::top("chat_toolbar")
+            .frame(
+                egui::Frame::default()
+                    .fill(BG)
+                    .inner_margin(Margin::symmetric(12.0, 6.0))
+                    .stroke(Stroke::new(1.0, BORDER)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(!transcript_empty, egui::Button::new("New"))
+                        .on_hover_text("Clear the transcript (Ctrl+L)")
+                        .clicked()
+                    {
+                        do_new = true;
+                    }
+
+                    // Sampling popover — sliders bind straight to self.sampling.
+                    let sampling_label = if sampling_is_default {
+                        "Sampling"
+                    } else {
+                        "Sampling · custom"
+                    };
+                    ui.menu_button(sampling_label, |ui| {
+                        ui.set_min_width(260.0);
+                        ui.label(RichText::new("Sampling").strong().color(TEXT));
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Slider::new(&mut self.sampling.temperature, 0.0..=2.0)
+                                .text("temperature"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.sampling.top_p, 0.0..=1.0).text("top_p"),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.sampling.top_k)
+                                    .range(0..=1000)
+                                    .speed(1.0),
+                            );
+                            ui.label(RichText::new("top_k (0 = off)").color(MUTED).small());
+                        });
+                        ui.add(
+                            egui::Slider::new(&mut self.sampling.repeat_penalty, 0.8..=2.0)
+                                .text("repeat_penalty"),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.sampling.max_tokens)
+                                    .range(1..=32768)
+                                    .speed(4.0),
+                            );
+                            ui.label(RichText::new("max_tokens").color(MUTED).small());
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("seed").color(MUTED).small());
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.sampling.seed)
+                                    .hint_text("random")
+                                    .desired_width(120.0),
+                            );
+                        });
+                        ui.add_space(6.0);
+                        if ui.button("Reset to defaults").clicked() {
+                            self.sampling = Sampling::default();
+                        }
+                        ui.label(
+                            RichText::new("Values at their default are left unset.")
+                                .color(MUTED)
+                                .small(),
+                        );
+                    })
+                    .response
+                    .on_hover_text("Temperature / top_p / top_k / repeat_penalty / max_tokens / seed");
+
+                    ui.checkbox(&mut self.auto_tools, "Auto-run tools").on_hover_text(
+                        "When on, proposed tool calls are accepted without asking. This chat \
+                         never executes tools — it only gates the confirm prompt.",
+                    );
+                    ui.checkbox(&mut self.clarify, "Clarifying questions").on_hover_text(
+                        "When on, the model can pause and ask a clarifying question with \
+                         selectable options instead of guessing.",
+                    );
+
+                    if ui
+                        .add_enabled(has_assistant && !streaming, egui::Button::new("Regenerate"))
+                        .on_hover_text("Re-run the last user turn (Ctrl+R)")
+                        .clicked()
+                    {
+                        do_regen = true;
+                    }
+                    if ui
+                        .add_enabled(!transcript_empty && !streaming, egui::Button::new("Export MD"))
+                        .on_hover_text("Save the transcript as Markdown (Ctrl+E)")
+                        .clicked()
+                    {
+                        do_export_md = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            !transcript_empty && !streaming,
+                            egui::Button::new("Export JSON"),
+                        )
+                        .on_hover_text("Save the transcript as JSON")
+                        .clicked()
+                    {
+                        do_export_json = true;
+                    }
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("?").on_hover_text("Keyboard shortcuts").clicked() {
+                            open_shortcuts = true;
+                        }
+                        if let Some(line) = &usage_line {
+                            ui.label(RichText::new(line).color(MUTED).small());
+                        }
+                    });
+                });
+            });
+
+        // Composer (bottom): system-prompt selector, message field, token
+        // counter, and Send / Stop.
+        let active_model = self.active_model_id();
+        let prompts: Vec<(String, String)> = self
+            .system_prompts
+            .iter()
+            .map(|p| {
+                let mut label = p.name.clone();
+                if !p.default_for_model.is_empty() && p.default_for_model == active_model {
+                    label.push_str("  (default for this model)");
+                }
+                (p.name.clone(), label)
+            })
+            .collect();
+        let show_prompts = !prompts.is_empty();
+        let budget = self.ctx_budget();
+        let draft_tokens = self.draft_tokens;
         egui::TopBottomPanel::bottom("composer")
             .frame(
                 egui::Frame::default()
@@ -1117,38 +1865,140 @@ impl GuiApp {
                     .inner_margin(Margin::symmetric(12.0, 10.0)),
             )
             .show(ctx, |ui| {
-                ui.add_sized(
-                    [ui.available_width(), 72.0],
+                // System-prompt selector (locked once the conversation starts —
+                // the system message belongs to the conversation, not the live
+                // dropdown; mirrors Chat.tsx).
+                if show_prompts {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("System prompt").color(MUTED).small());
+                        ui.add_enabled_ui(transcript_empty, |ui| {
+                            egui::ComboBox::from_id_salt("sysprompt_combo")
+                                .width(240.0)
+                                .selected_text(if self.selected_prompt.is_empty() {
+                                    "— none —".to_string()
+                                } else {
+                                    self.selected_prompt.clone()
+                                })
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.selected_prompt,
+                                            String::new(),
+                                            "— none —",
+                                        )
+                                        .clicked()
+                                    {
+                                        prompt_picked = true;
+                                    }
+                                    for (name, label) in &prompts {
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.selected_prompt,
+                                                name.clone(),
+                                                label.as_str(),
+                                            )
+                                            .clicked()
+                                        {
+                                            prompt_picked = true;
+                                        }
+                                    }
+                                });
+                        });
+                        if !transcript_empty {
+                            ui.label(
+                                RichText::new("(locked for this conversation)")
+                                    .color(DISABLED)
+                                    .small(),
+                            );
+                        }
+                    });
+                    ui.add_space(6.0);
+                }
+
+                let te = ui.add_sized(
+                    [ui.available_width(), 64.0],
                     egui::TextEdit::multiline(&mut self.input)
-                        .hint_text("Message the model…  (Ctrl+Enter to send)")
+                        .hint_text("Message the model…  (Enter to send · Shift+Enter for newline)")
                         .desired_rows(3),
                 );
-                // Computed AFTER the TextEdit so this frame's typing is applied.
-                let can_send = !self.streaming && !self.input.trim().is_empty();
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(can_send, egui::Button::new("Send")).clicked() {
-                        do_send = true;
-                    }
-                    if self.streaming {
-                        ui.spinner();
-                        ui.label(RichText::new("generating…").color(MUTED));
-                    } else if let Some(u) = &self.last_usage {
-                        ui.label(RichText::new(format_usage(u)).color(MUTED).small());
-                    }
-                });
-                // Ctrl+Enter sends; Enter alone stays a newline in the field.
-                let ctrl_enter = ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl);
-                if ctrl_enter && can_send {
+                if te.changed() {
+                    input_changed = true;
+                }
+                // Enter (no Shift) or Ctrl+Enter sends; Shift+Enter inserts a
+                // newline. `send_message` trims, so the '\n' the field inserts
+                // this same frame is dropped.
+                let enter_send = te.has_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                if enter_send && !self.streaming && !self.input.trim().is_empty() {
                     do_send = true;
                 }
+
+                // Token counter (built after the TextEdit so it reflects this
+                // frame's typing).
+                let counter = if self.input.trim().is_empty() {
+                    RichText::new("Enter to send · Shift+Enter for a newline")
+                        .color(MUTED)
+                        .small()
+                } else {
+                    let chars = self.input.chars().count();
+                    match draft_tokens {
+                        Some(n) => match budget {
+                            Some(b) if b > 0 => {
+                                let pct = (n as f64 / b as f64) * 100.0;
+                                let col = if pct >= 90.0 {
+                                    HEALTH_BAD
+                                } else if pct >= 50.0 {
+                                    WARN
+                                } else {
+                                    MUTED
+                                };
+                                RichText::new(format!(
+                                    "{n} / {b} tokens · {pct:.0}% of ctx · {chars} chars"
+                                ))
+                                .color(col)
+                                .small()
+                            }
+                            _ => RichText::new(format!("{n} tokens · {chars} chars"))
+                                .color(MUTED)
+                                .small(),
+                        },
+                        None => RichText::new(format!("{chars} chars · counting…"))
+                            .color(MUTED)
+                            .small(),
+                    }
+                };
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(counter);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if self.streaming {
+                            if ui
+                                .add(egui::Button::new(RichText::new("Stop").color(TEXT)).fill(DANGER))
+                                .on_hover_text("Stop generating (Esc)")
+                                .clicked()
+                            {
+                                do_stop = true;
+                            }
+                            ui.spinner();
+                            ui.label(RichText::new("generating…").color(MUTED).small());
+                        } else {
+                            let can_send = !self.input.trim().is_empty();
+                            if ui.add_enabled(can_send, egui::Button::new("Send")).clicked() {
+                                do_send = true;
+                            }
+                        }
+                    });
+                });
             });
 
         // Transcript. Bind the fields the closure needs up front as disjoint
-        // borrows (shared `transcript`/`pending`, mut `md_cache`).
+        // borrows (shared reads + mut `md_cache`).
         let transcript = &self.transcript;
         let pending = &self.pending;
         let streaming = self.streaming;
+        let pending_question = &self.pending_question;
+        let pending_tools = &self.pending_tools;
         let cache = &mut self.md_cache;
         egui::CentralPanel::default()
             .frame(
@@ -1161,7 +2011,11 @@ impl GuiApp {
                     .auto_shrink([false, false])
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
-                        if transcript.is_empty() && !streaming {
+                        if transcript.is_empty()
+                            && !streaming
+                            && pending_question.is_none()
+                            && pending_tools.is_none()
+                        {
                             ui.add_space(64.0);
                             ui.vertical_centered(|ui| {
                                 ui.label(
@@ -1170,21 +2024,162 @@ impl GuiApp {
                             });
                             return;
                         }
-                        for turn in transcript {
-                            render_turn(ui, cache, turn);
+                        for (idx, turn) in transcript.iter().enumerate() {
+                            render_turn(ui, cache, turn, idx);
                         }
+                        // Live streaming assistant text (think-aware card).
                         if streaming {
                             ui.add_space(6.0);
-                            ui.label(RichText::new("Assistant").strong().color(ACCENT));
-                            if pending.is_empty() {
-                                ui.label(RichText::new("…").color(MUTED));
-                            } else {
-                                CommonMarkViewer::new().show(ui, cache, pending);
-                            }
+                            render_assistant_card(ui, cache, pending, usize::MAX);
+                        }
+                        // CLARIFY chooser: clickable option buttons.
+                        if let Some(q) = pending_question {
+                            ui.add_space(10.0);
+                            egui::Frame::none()
+                                .fill(ELEVATED)
+                                .rounding(Rounding::same(8.0))
+                                .stroke(Stroke::new(1.0, BORDER))
+                                .inner_margin(Margin::same(12.0))
+                                .show(ui, |ui| {
+                                    let prompt = if q.prompt.is_empty() {
+                                        "Choose an option:"
+                                    } else {
+                                        q.prompt.as_str()
+                                    };
+                                    ui.label(RichText::new(prompt).color(TEXT));
+                                    ui.add_space(8.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        for opt in &q.options {
+                                            if ui
+                                                .add_enabled(
+                                                    !streaming,
+                                                    egui::Button::new(opt.as_str()),
+                                                )
+                                                .clicked()
+                                            {
+                                                chosen_option = Some(opt.clone());
+                                            }
+                                        }
+                                    });
+                                });
+                        }
+                        // Tool-confirm: Approve / Deny (auto-run OFF).
+                        if let Some(calls) = pending_tools {
+                            ui.add_space(10.0);
+                            egui::Frame::none()
+                                .fill(WARN.gamma_multiply(0.12))
+                                .rounding(Rounding::same(8.0))
+                                .stroke(Stroke::new(1.0, WARN))
+                                .inner_margin(Margin::same(12.0))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "The model proposes a tool call: {}. This chat can't \
+                                             run tools — approve to acknowledge, or deny to have \
+                                             it answer directly.",
+                                            describe_tool_calls(calls)
+                                        ))
+                                        .color(TEXT),
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add_enabled(!streaming, egui::Button::new("Approve"))
+                                            .clicked()
+                                        {
+                                            do_approve = true;
+                                        }
+                                        if ui
+                                            .add_enabled(!streaming, egui::Button::new("Deny"))
+                                            .clicked()
+                                        {
+                                            do_deny = true;
+                                        }
+                                    });
+                                });
                         }
                     });
             });
 
+        // Keyboard shortcuts overlay (a floating window, like the delete modal).
+        if self.show_shortcuts {
+            let mut close = false;
+            egui::Window::new("Keyboard shortcuts")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_max_width(420.0);
+                    for (keys, what) in SHORTCUTS {
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [140.0, 18.0],
+                                egui::Label::new(RichText::new(*keys).monospace().color(TEXT)),
+                            );
+                            ui.label(RichText::new(*what).color(MUTED));
+                        });
+                    }
+                    ui.add_space(10.0);
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+            if close {
+                self.show_shortcuts = false;
+            }
+        }
+
+        // Global chat shortcuts (Esc / Ctrl+L / Ctrl+R / Ctrl+E / ?). Enter is
+        // handled in the composer above so it can gate on field focus. `?` only
+        // fires when no widget is focused (so typing `?` into the composer
+        // isn't swallowed) — mirrors Chat.tsx's isTypingTarget guard.
+        let typing = ctx.memory(|m| m.focused().is_some());
+        let (mut sc_clear, mut sc_regen, mut sc_export, mut sc_esc, mut sc_help) =
+            (false, false, false, false, false);
+        ctx.input(|i| {
+            let cmd = i.modifiers.command; // ctrl on win/linux, ⌘ on mac
+            sc_esc = i.key_pressed(egui::Key::Escape);
+            sc_clear = cmd && i.key_pressed(egui::Key::L);
+            sc_regen = cmd && i.key_pressed(egui::Key::R);
+            sc_export = cmd && i.key_pressed(egui::Key::E);
+            if !typing {
+                sc_help = i
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Text(t) if t == "?"));
+            }
+        });
+        if sc_help {
+            self.show_shortcuts = !self.show_shortcuts;
+        }
+        if sc_esc {
+            // Esc closes the overlay first, else stops an in-flight stream.
+            if self.show_shortcuts {
+                self.show_shortcuts = false;
+            } else if self.streaming {
+                do_stop = true;
+            }
+        }
+        if sc_clear {
+            do_new = true;
+        }
+        if sc_regen {
+            do_regen = true;
+        }
+        if sc_export {
+            do_export_md = true;
+        }
+
+        // Apply intents now that the panels have closed and `self` is free.
+        if open_shortcuts {
+            self.show_shortcuts = true;
+        }
+        if prompt_picked {
+            self.user_picked_prompt = true;
+        }
+        if input_changed {
+            self.tok_dirty_since = Some(Instant::now());
+        }
         if do_refresh {
             self.spawn_refresh_models();
         }
@@ -1197,6 +2192,30 @@ impl GuiApp {
             if let Some(m) = self.selected_model.clone().filter(|s| !s.is_empty()) {
                 self.spawn_unload(m);
             }
+        }
+        if do_stop {
+            self.stop_stream();
+        }
+        if do_new {
+            self.clear_chat();
+        }
+        if do_regen {
+            self.regenerate_last();
+        }
+        if let Some(opt) = chosen_option {
+            self.choose_option(opt);
+        }
+        if do_approve {
+            self.approve_tools();
+        }
+        if do_deny {
+            self.deny_tools();
+        }
+        if do_export_md {
+            self.spawn_export(false);
+        }
+        if do_export_json {
+            self.spawn_export(true);
         }
         if do_send {
             self.send_message();
@@ -1509,8 +2528,10 @@ fn parse_loaded_models(v: &serde_json::Value) -> Vec<LoadedModel> {
 }
 
 /// One transcript turn. User/system turns render as plain (wrapped) text in a
-/// subtle card; assistant turns render as markdown via `CommonMarkViewer`.
-fn render_turn(ui: &mut egui::Ui, cache: &mut CommonMarkCache, turn: &Turn) {
+/// subtle card; assistant turns render as a markdown card with `<think>`
+/// reasoning collapsed (see [`render_assistant_card`]). `idx` seeds a stable id
+/// for each assistant card's collapse state.
+fn render_turn(ui: &mut egui::Ui, cache: &mut CommonMarkCache, turn: &Turn, idx: usize) {
     ui.add_space(8.0);
     match turn.role.as_str() {
         "user" => {
@@ -1528,17 +2549,147 @@ fn render_turn(ui: &mut egui::Ui, cache: &mut CommonMarkCache, turn: &Turn) {
             ui.label(RichText::new(turn.content.as_str()).color(MUTED));
         }
         _ => {
-            ui.label(RichText::new("Assistant").strong().color(ACCENT));
-            egui::Frame::none()
-                .fill(ELEVATED)
-                .rounding(Rounding::same(8.0))
-                .inner_margin(Margin::same(10.0))
-                .show(ui, |ui| {
-                    CommonMarkViewer::new().show(ui, cache, turn.content.as_str());
-                });
+            render_assistant_card(ui, cache, turn.content.as_str(), idx);
         }
     }
     ui.add_space(6.0);
+}
+
+/// Result of pulling a `<think>…</think>` reasoning span out of assistant text.
+struct ThinkSplit {
+    thinking: String,
+    answer: String,
+    has_thinking: bool,
+    thinking_done: bool,
+}
+
+/// Render an assistant message as the Phase-2 markdown card, collapsing any
+/// `<think>…</think>` (or `<thinking>`) reasoning span into a "Reasoning"
+/// section (collapsed by default) and rendering the remainder as markdown.
+/// `id_salt` distinguishes each card's collapse state.
+fn render_assistant_card<H: std::hash::Hash>(
+    ui: &mut egui::Ui,
+    cache: &mut CommonMarkCache,
+    content: &str,
+    id_salt: H,
+) {
+    ui.label(RichText::new("Assistant").strong().color(ACCENT));
+    egui::Frame::none()
+        .fill(ELEVATED)
+        .rounding(Rounding::same(8.0))
+        .inner_margin(Margin::same(10.0))
+        .show(ui, |ui| {
+            let split = split_thinking(content);
+            if split.has_thinking {
+                // Collapsed by default — reasoning traces are long + noisy, so
+                // the user opts in (mirrors Chat.tsx's ThinkingBlock). Before
+                // the closing tag arrives mid-stream the header reads
+                // "Thinking…"; once closed it becomes "Reasoning".
+                let title = if split.thinking_done {
+                    "Reasoning"
+                } else {
+                    "Thinking…"
+                };
+                egui::CollapsingHeader::new(RichText::new(title).small().color(MUTED))
+                    .id_salt(("chat_think", id_salt))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        let t = split.thinking.trim();
+                        if t.is_empty() {
+                            ui.label(RichText::new("(thinking…)").color(MUTED).small());
+                        } else {
+                            // Partial reasoning is rarely valid markdown — show
+                            // it as plain wrapped text.
+                            ui.label(RichText::new(t).color(MUTED));
+                        }
+                    });
+            }
+            // The answer (think stripped), or the whole content when there was
+            // no think span. Empty while the model is still inside <think>.
+            let body = if split.has_thinking {
+                split.answer.as_str()
+            } else {
+                content
+            };
+            if body.is_empty() {
+                if !split.has_thinking {
+                    ui.label(RichText::new("…").color(MUTED));
+                }
+            } else {
+                CommonMarkViewer::new().show(ui, cache, body);
+            }
+        });
+}
+
+/// Split a `<think>…</think>` / `<thinking>…</thinking>` reasoning span out of
+/// assistant text. Port of Chat.tsx `splitThinking`, including the
+/// still-streaming case (opening tag seen, closing tag not yet): everything
+/// after `<think>` is the partial reasoning and the answer is empty.
+fn split_thinking(content: &str) -> ThinkSplit {
+    let Some((oi, olen)) = find_tag_ci(content, &["<think>", "<thinking>"]) else {
+        return ThinkSplit {
+            thinking: String::new(),
+            answer: content.to_string(),
+            has_thinking: false,
+            thinking_done: true,
+        };
+    };
+    let rest = &content[oi + olen..];
+    let Some((ci, clen)) = find_tag_ci(rest, &["</think>", "</thinking>"]) else {
+        return ThinkSplit {
+            thinking: rest.to_string(),
+            answer: String::new(),
+            has_thinking: true,
+            thinking_done: false,
+        };
+    };
+    let before = &content[..oi];
+    let after = &rest[ci + clen..];
+    ThinkSplit {
+        thinking: rest[..ci].to_string(),
+        answer: format!("{before}{after}").trim().to_string(),
+        has_thinking: true,
+        thinking_done: true,
+    }
+}
+
+/// Earliest case-insensitive match of any tag in `tags` (all pre-lowercased
+/// ASCII). Returns `(byte offset into hay, matched length)`. ASCII-lowercasing
+/// the haystack preserves byte offsets (only A–Z change, never a multi-byte
+/// UTF-8 lead byte), so the index maps straight back onto `hay`.
+fn find_tag_ci(hay: &str, tags: &[&str]) -> Option<(usize, usize)> {
+    let lower = hay.to_ascii_lowercase();
+    let mut best: Option<(usize, usize)> = None;
+    for t in tags {
+        if let Some(idx) = lower.find(t) {
+            if best.map_or(true, |(b, _)| idx < b) {
+                best = Some((idx, t.len()));
+            }
+        }
+    }
+    best
+}
+
+/// One-line description of proposed tool calls (the tool-confirm prompt +
+/// the auto-run transcript note). Mirrors Chat.tsx `describeToolCalls`.
+fn describe_tool_calls(calls: &[ToolCall]) -> String {
+    let list = calls
+        .iter()
+        .map(|c| format!("{}({})", c.name, c.arguments))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Proposed tool call: {list}")
+}
+
+/// A timestamped export filename (`rustllama-chat-<unix>.md`). Uses unix
+/// seconds rather than a formatted date to avoid a chrono dependency — enough
+/// to keep successive exports distinct.
+fn export_filename(ext: &str) -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("rustllama-chat-{secs}.{ext}")
 }
 
 /// Format the usage block into a one-liner: prompt/completion counts + a
