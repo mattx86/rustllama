@@ -466,6 +466,15 @@ pub enum Command {
         /// invoked directly.
         #[arg(long)]
         decision_calibrate: bool,
+        /// Per-device perf measurement (each GPU + the CPU tier's short-
+        /// synthetic decode tok/s), persisted under `per_device_perf` to
+        /// feed the heat placement planner. Primarily exists so `tune --all`
+        /// can run this model-reloading stage as an isolated subprocess
+        /// (fresh SYCL/USM state — see Stage 1b); rarely invoked directly.
+        /// Honors the shared `--prompt-tokens` / `--decode-tokens` /
+        /// `--repeats` sizing.
+        #[arg(long)]
+        per_device_perf: bool,
         /// **Comprehensive autotune**: run every sweep in coordinate-
         /// descent order — kernel LWS → kv_dtype → flash_attention →
         /// kv_cache_layout → placement → batch_size → threads — and
@@ -1179,6 +1188,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             ssm_prefill_chunked,
             ssm_prefill_chunked_repeats,
             decision_calibrate,
+            per_device_perf,
             all,
             skip_cached,
             force,
@@ -1244,6 +1254,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 speculative_mtp,
                 ssm_prefill_chunked,
                 decision_calibrate,
+                per_device_perf,
                 all,
             ]
             .iter()
@@ -1255,7 +1266,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                      --flash-attention / --kv-layout / --flash-kv-min / \
                      --prefix-snapshots / --kv-page-size / --flash-v3-kv-tile / \
                      --moe-placement / --speculative-mtp / --ssm-prefill-chunked / \
-                     --decision-calibrate / --all are exclusive; pick at most one"
+                     --decision-calibrate / --per-device-perf / --all are exclusive; \
+                     pick at most one"
                 );
             }
             if all {
@@ -1382,6 +1394,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if decision_calibrate {
                 return cmd_decision_calibrate(&config_path, model);
+            }
+            if per_device_perf {
+                return cmd_tune_per_device_perf(
+                    &config_path,
+                    model,
+                    prompt_tokens,
+                    decode_tokens,
+                    repeats,
+                );
             }
             if threads {
                 return cmd_tune_threads(
@@ -6870,23 +6891,39 @@ fn cmd_tune_kv_layout(
 /// would otherwise abort the whole `tune --all` process, losing every
 /// later stage AND making the mandatory first-load autotune report a
 /// failure (even though the earlier stages' winners persisted). Running
-/// the crash-prone late stages as fresh child processes — mirroring
-/// `doctor --sycl-parity`, which subprocesses each probe so a
+/// the crash-prone model-reloading stages as fresh child processes —
+/// mirroring `doctor --sycl-parity`, which subprocesses each probe so a
 /// DEVICE_LOST only kills its child — resets that per-process state to
-/// zero, so each stage loads into a clean driver.
+/// zero, so each stage loads into a clean driver. Every model-reloading
+/// stage of `tune --all` (1b/per-device-perf, 2/kv_dtype, 3/flash,
+/// 4/kv_layout, 5/placement, 6/batch_size, and 7–10) goes through here;
+/// only Stage 1 (the pure SYCL kernel-LWS shape sweep, which loads no
+/// full model) stays in-process, so the parent performs ZERO model
+/// loads and can never reach the fault threshold.
+///
+/// `extra_args` are the stage's candidate + prompt/decode-token + repeats
+/// flags, forwarded verbatim so a user's `tune --all` sizing overrides
+/// (`--kv-dtype-candidates`, `--batch-candidates`, `--prompt-tokens`, …)
+/// reach the child rather than being silently dropped. The child's own
+/// `--<stage>` dispatch parses them exactly as a standalone single-stage
+/// invocation would, so behavior matches the former in-process call.
+/// Stages 7–10 pass no extra args (their subcommands use the same
+/// quick-by-default sizing, escalated together by `--thorough`).
 ///
 /// Each stage subcommand persists its own winner to the shared
 /// tuner-cache TOML, so a child that succeeds contributes exactly what
 /// the in-process call would; a child that crashes is logged and the
 /// parent moves on. The child inherits the parent's env (keep_quant_raw
-/// etc.) and never passes `--force` — the parent already cleared the
-/// cache once at the top of the sweep, and each child only adds its key.
+/// etc.) and never passes `--force`/`--clear` — the parent already
+/// cleared the cache once at the top of the sweep, and each child only
+/// adds its key (so an earlier stage's winner is never wiped mid-run).
 fn run_tune_stage_subprocess(
     config_path: &std::path::Path,
     model: &Option<String>,
     stage_flag: &str,
     thorough: bool,
     stage_label: &str,
+    extra_args: &[String],
 ) -> anyhow::Result<()> {
     let exe = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("cannot resolve current exe for tune subprocess: {e}"))?;
@@ -6900,6 +6937,10 @@ fn run_tune_stage_subprocess(
     }
     if thorough {
         cmd.arg("--thorough");
+    }
+    // Stage-specific candidate/sizing flags (empty for stages 7–10).
+    for a in extra_args {
+        cmd.arg(a);
     }
     let status = cmd
         .status()
@@ -6928,7 +6969,12 @@ fn cmd_tune_all(
     measure_decode_tokens: u32,
     measure_repeats: u32,
     batch_candidates: &str,
-    batch_prompt_tokens: u32,
+    // The batch-size stage (6) now runs as a subprocess; its prefill prompt
+    // length is derived by the child from `--thorough` (there is no
+    // `--batch-prompt-tokens` flag to forward), so this caller-supplied
+    // sizing is no longer consumed here. Kept for call-site stability;
+    // prefixed to mark unused.
+    _batch_prompt_tokens: u32,
     batch_repeats: u32,
     // Threads stage (7) now runs as a subprocess with its own quick-by-default
     // sizing, so these caller-supplied sizings are no longer consumed here.
@@ -7061,6 +7107,24 @@ fn cmd_tune_all(
 
     let skip = |populated: bool| skip_cached && !force && populated;
 
+    // Stage 1 (kernel LWS) is the ONLY stage that runs in-process: with
+    // `measure_tok_s = false` (passed below) it loads NO full model — it
+    // opens the GGUF tensor table and sweeps packed-quant matvec LWS on a
+    // single SYCL stream. Every stage AFTER it reloads the model (each via
+    // a `measure_*` helper), and on this SYCL stack ~16 cumulative
+    // in-process reloads fault the driver with a 0xC0000005 access
+    // violation mid-sweep. So stages 1b-6 (like 7-10) now run as ISOLATED
+    // SUBPROCESSES via `run_tune_stage_subprocess`: each child loads the
+    // model into fresh SYCL/USM state, the parent performs ZERO model
+    // loads for the whole `--all` run, and a child crash is contained +
+    // logged so the remaining stages still run. Coordinate descent is
+    // preserved — stages run sequentially and each child reads the
+    // current on-disk tuner cache and writes its winner back before the
+    // next stage spawns. The stages' candidate/sizing overrides are
+    // forwarded to each child (see the per-stage `args_*` below), so a
+    // user's `tune --all --kv-dtype-candidates …` / `--thorough` is not
+    // silently dropped; the mandatory first-load autotune uses defaults
+    // either way.
     println!("Stage 1/10: kernel LWS (per-shape packed-quant matvec)");
     println!("--------");
     let model_clone_for_stages = model_override.clone();
@@ -7084,16 +7148,27 @@ fn cmd_tune_all(
     println!("--------");
     if skip(has_per_device_perf) {
         println!("(skipped: per-device perf already cached)");
-    } else if let Err(e) = cmd_tune_per_device_perf(
-        config_path,
-        model_clone_for_stages.clone(),
+    } else {
         // Reuse the placement measurement's prompt/decode sizing so the
         // synthetic decode is representative of the placement sweep.
-        measure_prompt_tokens,
-        measure_decode_tokens,
-        measure_repeats,
-    ) {
-        tracing::warn!(error = %e, "stage 1b (per-device perf) failed; continuing");
+        let args_1b = vec![
+            "--prompt-tokens".to_string(),
+            measure_prompt_tokens.to_string(),
+            "--decode-tokens".to_string(),
+            measure_decode_tokens.to_string(),
+            "--repeats".to_string(),
+            measure_repeats.to_string(),
+        ];
+        if let Err(e) = run_tune_stage_subprocess(
+            config_path,
+            &model_clone_for_stages,
+            "--per-device-perf",
+            thorough,
+            "1b (per-device perf)",
+            &args_1b,
+        ) {
+            tracing::warn!(error = %e, "stage 1b (per-device perf) failed; continuing");
+        }
     }
 
     println!();
@@ -7101,15 +7176,27 @@ fn cmd_tune_all(
     println!("--------");
     if skip(has_kv_dtype) {
         println!("(skipped: kv_dtype winner already cached)");
-    } else if let Err(e) = cmd_tune_kv_dtype(
-        config_path,
-        model_clone_for_stages.clone(),
-        kv_dtype_candidates,
-        kv_dtype_prompt_tokens,
-        kv_dtype_decode_tokens,
-        kv_dtype_repeats,
-    ) {
-        tracing::warn!(error = %e, "stage 2 (kv_dtype) failed; continuing");
+    } else {
+        let args_2 = vec![
+            "--prompt-tokens".to_string(),
+            kv_dtype_prompt_tokens.to_string(),
+            "--decode-tokens".to_string(),
+            kv_dtype_decode_tokens.to_string(),
+            "--repeats".to_string(),
+            kv_dtype_repeats.to_string(),
+            "--kv-dtype-candidates".to_string(),
+            kv_dtype_candidates.to_string(),
+        ];
+        if let Err(e) = run_tune_stage_subprocess(
+            config_path,
+            &model_clone_for_stages,
+            "--kv-dtype",
+            thorough,
+            "2 (kv_dtype)",
+            &args_2,
+        ) {
+            tracing::warn!(error = %e, "stage 2 (kv_dtype) failed; continuing");
+        }
     }
 
     println!();
@@ -7117,14 +7204,25 @@ fn cmd_tune_all(
     println!("--------");
     if skip(has_flash) {
         println!("(skipped: flash_attention winner already cached)");
-    } else if let Err(e) = cmd_tune_flash_attention(
-        config_path,
-        model_clone_for_stages.clone(),
-        flash_prompt_tokens,
-        flash_decode_tokens,
-        flash_repeats,
-    ) {
-        tracing::warn!(error = %e, "stage 3 (flash_attention) failed; continuing");
+    } else {
+        let args_3 = vec![
+            "--prompt-tokens".to_string(),
+            flash_prompt_tokens.to_string(),
+            "--decode-tokens".to_string(),
+            flash_decode_tokens.to_string(),
+            "--repeats".to_string(),
+            flash_repeats.to_string(),
+        ];
+        if let Err(e) = run_tune_stage_subprocess(
+            config_path,
+            &model_clone_for_stages,
+            "--flash-attention",
+            thorough,
+            "3 (flash_attention)",
+            &args_3,
+        ) {
+            tracing::warn!(error = %e, "stage 3 (flash_attention) failed; continuing");
+        }
     }
 
     println!();
@@ -7132,15 +7230,27 @@ fn cmd_tune_all(
     println!("--------");
     if skip(has_kv_layout) {
         println!("(skipped: kv_cache_layout winner already cached)");
-    } else if let Err(e) = cmd_tune_kv_layout(
-        config_path,
-        model_clone_for_stages.clone(),
-        kv_layout_candidates,
-        kv_layout_prompt_tokens,
-        kv_layout_decode_tokens,
-        kv_layout_repeats,
-    ) {
-        tracing::warn!(error = %e, "stage 4 (kv_cache_layout) failed; continuing");
+    } else {
+        let args_4 = vec![
+            "--prompt-tokens".to_string(),
+            kv_layout_prompt_tokens.to_string(),
+            "--decode-tokens".to_string(),
+            kv_layout_decode_tokens.to_string(),
+            "--repeats".to_string(),
+            kv_layout_repeats.to_string(),
+            "--kv-layout-candidates".to_string(),
+            kv_layout_candidates.to_string(),
+        ];
+        if let Err(e) = run_tune_stage_subprocess(
+            config_path,
+            &model_clone_for_stages,
+            "--kv-layout",
+            thorough,
+            "4 (kv_cache_layout)",
+            &args_4,
+        ) {
+            tracing::warn!(error = %e, "stage 4 (kv_cache_layout) failed; continuing");
+        }
     }
 
     println!();
@@ -7148,18 +7258,37 @@ fn cmd_tune_all(
     println!("--------");
     if skip(has_placement) {
         println!("(skipped: placement winner already cached)");
-    } else if let Err(e) = cmd_tune_placement(
-        config_path,
-        model_clone_for_stages.clone(),
-        vram_mb,
-        vram_headroom_mb,
-        placement_ctx,
-        true,
-        measure_prompt_tokens,
-        measure_decode_tokens,
-        measure_repeats,
-    ) {
-        tracing::warn!(error = %e, "stage 5 (placement) failed; continuing");
+    } else {
+        // `--measure` selects the dynamic measurement half (the in-process
+        // call forced `measure = true`); VRAM budget + optional ctx are
+        // forwarded so the child fits the same candidate table.
+        let mut args_5 = vec![
+            "--measure".to_string(),
+            "--vram-mb".to_string(),
+            vram_mb.to_string(),
+            "--vram-headroom-mb".to_string(),
+            vram_headroom_mb.to_string(),
+            "--prompt-tokens".to_string(),
+            measure_prompt_tokens.to_string(),
+            "--decode-tokens".to_string(),
+            measure_decode_tokens.to_string(),
+            "--repeats".to_string(),
+            measure_repeats.to_string(),
+        ];
+        if let Some(ctx) = placement_ctx {
+            args_5.push("--placement-ctx".to_string());
+            args_5.push(ctx.to_string());
+        }
+        if let Err(e) = run_tune_stage_subprocess(
+            config_path,
+            &model_clone_for_stages,
+            "--placement",
+            thorough,
+            "5 (placement)",
+            &args_5,
+        ) {
+            tracing::warn!(error = %e, "stage 5 (placement) failed; continuing");
+        }
     }
 
     println!();
@@ -7167,24 +7296,32 @@ fn cmd_tune_all(
     println!("--------");
     if skip(has_batch_size) {
         println!("(skipped: batch_size winner already cached)");
-    } else if let Err(e) = cmd_tune_batch_size(
-        config_path,
-        model_clone_for_stages.clone(),
-        batch_candidates,
-        batch_prompt_tokens,
-        batch_repeats,
-    ) {
-        tracing::warn!(error = %e, "stage 6 (batch_size) failed; continuing");
+    } else {
+        // `batch_candidates` / `batch_repeats` are already the effective
+        // (quick/thorough-resolved) values; the child re-applies the same
+        // `--thorough` transform idempotently (quick forces "128,256" +
+        // a 256-token prefill regardless, which is what these resolve to).
+        let args_6 = vec![
+            "--batch-candidates".to_string(),
+            batch_candidates.to_string(),
+            "--repeats".to_string(),
+            batch_repeats.to_string(),
+        ];
+        if let Err(e) = run_tune_stage_subprocess(
+            config_path,
+            &model_clone_for_stages,
+            "--batch-size",
+            thorough,
+            "6 (batch_size)",
+            &args_6,
+        ) {
+            tracing::warn!(error = %e, "stage 6 (batch_size) failed; continuing");
+        }
     }
 
-    // Stages 7-10 run as ISOLATED SUBPROCESSES. By this point the
-    // parent has reloaded the model ~15× in-process; the next in-process
-    // load faults the SYCL driver (see `run_tune_stage_subprocess`).
-    // Each of these stages loads the model again, so we spawn a fresh
-    // child per stage — the parent does no further model loads and stays
-    // alive to run every stage, and a child crash is contained + logged.
-    // (Their granular sizing flags aren't forwarded; the subcommands use
-    // the same quick-by-default sizing, escalated together by --thorough.)
+    // Stages 7-10 also run as ISOLATED SUBPROCESSES (they reload the model
+    // too). They forward no candidate/sizing flags — their subcommands use
+    // the same quick-by-default sizing, escalated together by --thorough.
     println!();
     println!("Stage 7/10: threads");
     println!("--------");
@@ -7196,6 +7333,7 @@ fn cmd_tune_all(
         "--threads",
         thorough,
         "7 (threads)",
+        &[],
     ) {
         tracing::warn!(error = %e, "stage 7 (threads) failed; continuing");
     }
@@ -7211,6 +7349,7 @@ fn cmd_tune_all(
         "--decision-calibrate",
         thorough,
         "8 (decision calibration)",
+        &[],
     ) {
         tracing::warn!(error = %e, "stage 8 (decision calibration) failed; continuing");
     }
@@ -7226,6 +7365,7 @@ fn cmd_tune_all(
         "--speculative-mtp",
         thorough,
         "9 (MTP self-speculation)",
+        &[],
     ) {
         tracing::warn!(error = %e, "stage 9 (MTP self-speculation) failed; continuing");
     }
@@ -7241,6 +7381,7 @@ fn cmd_tune_all(
         "--ssm-prefill-chunked",
         thorough,
         "10 (chunked SSM prefill)",
+        &[],
     )
     {
         tracing::warn!(error = %e, "stage 10 (chunked SSM prefill) failed; continuing");
