@@ -1084,6 +1084,21 @@ impl CpuEngine {
         kv_layout: &str,
         kv_page_size: u32,
     ) -> Result<Self> {
+        // Model DIRECTORY (an MLX affine checkpoint, or an AWQ/GPTQ folder
+        // export): there is no GGUF tensor table to open, so route it through
+        // the content-classifying auto-dispatcher (`load_mlx` /
+        // `load_safetensors`) exactly as the server's own `use_load_auto` load
+        // branch does. This is what lets every `load_with_options*` caller —
+        // notably the autotuner's measurement loads (`tune --all` on an MLX
+        // dir) — work on a directory instead of failing the `Gguf::open` below.
+        // The `.gguf`-file path is unchanged: a file is never `is_dir()`, so
+        // this guard is strictly additive. (The dir path uses `load_auto`'s
+        // F32/contiguous KV defaults; the GGUF-specific kv_dtype / kv_layout /
+        // kv_page_size options don't apply to the affine dir loader yet — the
+        // same limitation the server documents on its dir load branch.)
+        if path.is_dir() {
+            return Self::load_auto(path, max_ctx);
+        }
         // MoE expert cache: reset any previous model's pins + range
         // registry before the new model registers its experts (stale
         // pins must never outlive their mmap), and couple zero-copy

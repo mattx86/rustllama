@@ -4661,6 +4661,23 @@ fn cmd_tune(
         }
     };
 
+    // An MLX model is a DIRECTORY of affine-quantized safetensors with no
+    // GGUF tensor table, and here it runs on CPU (load_auto → load_mlx; no GPU
+    // kernel dispatch), so this per-shape SYCL kernel-LWS sweep has nothing to
+    // tune. Detect the directory and skip cleanly — returning Ok so the
+    // `tune --all` orchestrator treats Stage 1 as a no-op rather than a failure
+    // (opening a directory as a GGUF file would otherwise error at `Gguf::open`
+    // below). Bails before even opening a SYCL device, so it is correct on a
+    // CPU-only host too.
+    if model_path.is_dir() {
+        println!("  model       = {}", model_path.display());
+        println!(
+            "MLX / non-GGUF model directory — skipping GPU kernel-LWS sweep \
+             (no packed-quant GGUF tensors; MLX runs on CPU)."
+        );
+        return Ok(());
+    }
+
     // 2. Open SYCL device + fingerprint.
     let stream = sk::create_stream(device_idx)
         .map_err(|e| anyhow::anyhow!("create_stream(sycl:{device_idx}): {e}"))?;
@@ -5266,6 +5283,42 @@ fn cmd_tune_placement(
         })?,
     };
     let max_ctx = placement_ctx_override.unwrap_or(cfg.inference.ctx_size);
+
+    // MLX / non-GGUF model directory: there is no GGUF tensor table to price a
+    // VRAM-fit table from, and an MLX affine checkpoint loads + runs on CPU
+    // here (load_auto → load_mlx, which ignores n_gpu_layers), so the only
+    // placement is all-CPU (n_gpu_layers = 0). Persist that CPU placement
+    // winner keyed by the model stem — the exact key the first-load autotune
+    // gate (`server::autotune::is_untuned`) checks — so `tune --all` on an MLX
+    // dir records a real, applicable placement instead of erroring on
+    // `read_dims_and_quant_from_gguf` (`Gguf::open`) below. No per-candidate
+    // measurement is needed (there is only one placement), which also keeps
+    // this robust even when the MLX load is slow/heavy.
+    if model_path.is_dir() {
+        println!("rustllama tune --placement");
+        println!(
+            "  model       = {} (MLX / non-GGUF directory → CPU placement)",
+            model_path.display()
+        );
+        println!("  ctx_size    = {max_ctx}");
+        println!();
+        let model_key = model_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown-model")
+            .to_string();
+        // n_gpu_layers = 0 → all-CPU; MLX affine runs on CPU regardless, so
+        // this is both correct and the value the engine honors on reload.
+        match persist_placement_winner(&model_key, 0) {
+            Ok(()) => {
+                println!("  → placement: n_gpu_layers = 0 (CPU; MLX affine runs on CPU here)")
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to persist MLX placement winner to tuner cache")
+            }
+        }
+        return Ok(());
+    }
 
     let (dims, quant) = read_dims_and_quant_from_gguf(&model_path)?;
 
