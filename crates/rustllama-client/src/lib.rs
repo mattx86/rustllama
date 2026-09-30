@@ -324,6 +324,19 @@ pub struct MetricsSnapshot {
     pub ctx_size: u64,
     #[serde(default)]
     pub ctx_used: u64,
+    /// Requests queued / in-flight for the active model, and the backpressure
+    /// cap (`[server].max_pending_per_model`). Drive the Status page's
+    /// pending/queue sparkline; `0` on the mock engine.
+    #[serde(default)]
+    pub pending: u64,
+    #[serde(default)]
+    pub max_pending: u64,
+    /// Seconds since the server started (the Status header's uptime readout).
+    #[serde(default)]
+    pub uptime_s: u64,
+    /// Configured in-flight concurrency per model.
+    #[serde(default)]
+    pub concurrency: u32,
     /// Per-request decode tok/s (swings wildly cold→warm; prefer `ema_tok_s`).
     #[serde(default)]
     pub last_tok_s: Option<f64>,
@@ -467,6 +480,191 @@ pub struct TokenizeResult {
     pub tokens: Vec<i64>,
     #[serde(default)]
     pub model_id: String,
+}
+
+// --- Phase-4 Settings/Status wire types (config write, capabilities, tuner) --
+// Consumed by the native GUI's Settings + Status views. As with the types
+// above, every field is `#[serde(default)]` so a slimmer / older server body
+// still deserializes. Mirrors `app/ui/src/api.ts`
+// (Capabilities / BackendsSnapshot / TuningSummary / TuneProgress).
+
+/// `GET /v1/capabilities` (the subset the Status "Backends" panel reads): the
+/// server version + the live compute-backend snapshot.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Capabilities {
+    #[serde(default)]
+    pub server_version: String,
+    #[serde(default)]
+    pub backends: Backends,
+}
+
+/// The three compute tiers `/v1/capabilities.backends` reports. `cuda` is
+/// `None` on servers predating the CUDA probe.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Backends {
+    #[serde(default)]
+    pub cpu: CpuBackend,
+    #[serde(default)]
+    pub sycl: SyclBackend,
+    #[serde(default)]
+    pub cuda: Option<CudaBackend>,
+}
+
+/// CPU tier: always available; the always-present fallback compute tier.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CpuBackend {
+    #[serde(default)]
+    pub available: bool,
+    /// Detected host SIMD features (avx / avx2 / fma / f16c / avx512f). Empty
+    /// on non-x86.
+    #[serde(default)]
+    pub simd_features: Vec<String>,
+    #[serde(default)]
+    pub parallel_matvec: bool,
+    #[serde(default)]
+    pub logical_cores: Option<u32>,
+    #[serde(default)]
+    pub enabled_cores: Option<u32>,
+    #[serde(default)]
+    pub cpu_enabled: Option<bool>,
+    #[serde(default)]
+    pub gpu_enabled: Option<bool>,
+    #[serde(default)]
+    pub vram_only: Option<bool>,
+}
+
+/// SYCL (Intel/AMD) tier.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SyclBackend {
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub device_count: u32,
+    /// "level_zero" | "opencl" | other backend label; `None` when unavailable.
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub preference: String,
+    #[serde(default)]
+    pub l0_import_eligible: bool,
+}
+
+/// CUDA (NVIDIA) tier — first-class peer of SYCL. `compute_ready == 0` with
+/// `device_count > 0` = GPU visible but kernels can't run (driver mismatch).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CudaBackend {
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub device_count: u32,
+    #[serde(default)]
+    pub compute_ready: u32,
+    #[serde(default)]
+    pub driver: Option<String>,
+}
+
+/// `GET /v1/tuning_summary` — the tuner-cache state for the active device plus
+/// the live `[tuning].auto_apply_*` flags. The Status "Tuner cache" panel
+/// renders these as rows.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TuningSummary {
+    /// `None` when no SYCL device is visible (the cache is keyed by device).
+    #[serde(default)]
+    pub device: Option<TuningDevice>,
+    #[serde(default)]
+    pub cache_path: Option<String>,
+    #[serde(default)]
+    pub cache_present: bool,
+    #[serde(default)]
+    pub last_tuned: Option<String>,
+    #[serde(default)]
+    pub kernel_entry_count: u32,
+    #[serde(default)]
+    pub placement: Vec<TuningPlacementEntry>,
+    #[serde(default)]
+    pub batch_size: Option<u32>,
+    #[serde(default)]
+    pub kv_dtype: Option<String>,
+    #[serde(default)]
+    pub flash_attention: Option<bool>,
+    #[serde(default)]
+    pub kv_cache_layout: Option<String>,
+    #[serde(default)]
+    pub auto_apply_placement: bool,
+    #[serde(default)]
+    pub auto_apply_batch_size: bool,
+    #[serde(default)]
+    pub auto_apply_kv_dtype: bool,
+    #[serde(default)]
+    pub auto_apply_flash_attention: bool,
+    #[serde(default)]
+    pub auto_apply_kv_cache_layout: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TuningDevice {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub driver_ver: String,
+    #[serde(default)]
+    pub vram_mb: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TuningPlacementEntry {
+    #[serde(default)]
+    pub model_key: String,
+    #[serde(default)]
+    pub n_gpu_layers: i32,
+}
+
+/// `GET /v1/tuning/recommendations` — matvec shapes dispatched without a
+/// cached LWS entry. `untuned_count == 0` ⇒ everything tuned (or no GPU).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TuningRecommendations {
+    #[serde(default)]
+    pub untuned_count: u32,
+    #[serde(default)]
+    pub shapes: Vec<TuningShape>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TuningShape {
+    #[serde(default)]
+    pub kernel: String,
+    #[serde(default)]
+    pub m: u32,
+    #[serde(default)]
+    pub k: u32,
+}
+
+/// `GET /v1/tune/progress` — live first-load-autotune / manual re-tune
+/// progress the Status panel polls ~1 Hz while a sweep runs.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TuneProgress {
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub model_id: String,
+    #[serde(default)]
+    pub stage_idx: u32,
+    #[serde(default)]
+    pub stage_total: u32,
+    #[serde(default)]
+    pub stage_name: String,
+    #[serde(default)]
+    pub pct: f64,
+    #[serde(default)]
+    pub line: String,
+    #[serde(default)]
+    pub log: Vec<String>,
+    #[serde(default)]
+    pub done: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub started_unix: u64,
 }
 
 /// One tool call the model emitted, reassembled from the streaming
@@ -733,6 +931,137 @@ impl Client {
         Ok(resp.json().await?)
     }
 
+    /// `GET /v1/config` as raw JSON — the WHOLE `{ config, config_path,
+    /// hot_apply }` envelope, unparsed. The Settings view edits a handful of
+    /// fields but must round-trip the rest untouched (placement overrides,
+    /// tuning flags, profiles, system prompts …), so it holds the config as a
+    /// `serde_json::Value` and writes back only the keys it exposes.
+    /// Deserializing into a partial typed struct here would silently DROP every
+    /// unmodeled field on the next [`Self::set_config`], so we keep it raw.
+    pub async fn get_config_raw(&self) -> Result<serde_json::Value> {
+        let url = join(&self.base, "/v1/config")?;
+        json_or_err(self.http.get(url).send().await?).await
+    }
+
+    /// `PUT /v1/config` — persist an edited config OBJECT (the `config` field
+    /// of the envelope, not the whole envelope). Returns the server's change
+    /// report (`requires_model_reload` / `requires_server_restart`).
+    pub async fn set_config(&self, config: &serde_json::Value) -> Result<serde_json::Value> {
+        let url = join(&self.base, "/v1/config")?;
+        json_or_err(self.http.put(url).json(config).send().await?).await
+    }
+
+    /// `POST /v1/config/profile/apply` — switch to a named `[[profiles]]`
+    /// block; the server merges the profile's SPARSE overrides into the
+    /// on-disk config. Returns the same change report as [`Self::set_config`].
+    pub async fn apply_profile(&self, name: &str) -> Result<serde_json::Value> {
+        let url = join(&self.base, "/v1/config/profile/apply")?;
+        json_or_err(
+            self.http
+                .post(url)
+                .json(&serde_json::json!({ "name": name }))
+                .send()
+                .await?,
+        )
+        .await
+    }
+
+    /// `GET /v1/capabilities` — server version + live compute-backend snapshot
+    /// (CPU SIMD, SYCL devices, CUDA devices) for the Status "Backends" panel.
+    pub async fn capabilities(&self) -> Result<Capabilities> {
+        let url = join(&self.base, "/v1/capabilities")?;
+        json_or_err(self.http.get(url).send().await?).await
+    }
+
+    /// `GET /v1/tuning_summary` — the per-device tuner-cache summary.
+    pub async fn tuning_summary(&self) -> Result<TuningSummary> {
+        let url = join(&self.base, "/v1/tuning_summary")?;
+        json_or_err(self.http.get(url).send().await?).await
+    }
+
+    /// `GET /v1/tuning/recommendations` — untuned matvec shapes.
+    pub async fn tuning_recommendations(&self) -> Result<TuningRecommendations> {
+        let url = join(&self.base, "/v1/tuning/recommendations")?;
+        json_or_err(self.http.get(url).send().await?).await
+    }
+
+    /// `POST /v1/tune/model` — force a re-tune of a cached model. `scope` is
+    /// `"all"` (full per-model sweep) or `"placement"` (just CPU-vs-GPU
+    /// dispatch). BLOCKS for the whole sweep (30 s–several min); poll
+    /// [`Self::tune_progress`] meanwhile for the stage bar. Reload the model
+    /// afterwards to apply the fresh winners.
+    pub async fn tune_model(&self, model: &str, force: bool, scope: &str) -> Result<()> {
+        let url = join(&self.base, "/v1/tune/model")?;
+        let resp = self
+            .http
+            .post(url)
+            .json(&serde_json::json!({ "model": model, "force": force, "scope": scope }))
+            .send()
+            .await?;
+        ok_or_err(resp).await
+    }
+
+    /// `GET /v1/tune/progress` — live re-tune / first-load-autotune progress.
+    pub async fn tune_progress(&self) -> Result<TuneProgress> {
+        let url = join(&self.base, "/v1/tune/progress")?;
+        json_or_err(self.http.get(url).send().await?).await
+    }
+
+    /// `GET /v1/lan_info` — bind addr / port / LAN IP / QR SVG for the Settings
+    /// LAN-access panel. Returned raw (the native GUI renders no QR yet).
+    pub async fn lan_info(&self) -> Result<serde_json::Value> {
+        let url = join(&self.base, "/v1/lan_info")?;
+        json_or_err(self.http.get(url).send().await?).await
+    }
+
+    /// `GET /v1/crash_logs` — the runtime panic-hook crash-log index.
+    pub async fn crash_logs(&self) -> Result<serde_json::Value> {
+        let url = join(&self.base, "/v1/crash_logs")?;
+        json_or_err(self.http.get(url).send().await?).await
+    }
+
+    /// `DELETE /v1/crash_logs/<name>` — remove one crash log from disk.
+    pub async fn delete_crash_log(&self, name: &str) -> Result<()> {
+        let mut url = join(&self.base, "/v1/crash_logs/")?;
+        url.path_segments_mut()
+            .map_err(|_| ClientError::Server {
+                status: 0,
+                body: "base url cannot have path segments".into(),
+            })?
+            .push(name);
+        ok_or_err(self.http.delete(url).send().await?).await
+    }
+
+    /// `GET /v1/audit_log/tail?n=<n>` — the last `n` audit-log lines.
+    pub async fn audit_log_tail(&self, n: u32) -> Result<serde_json::Value> {
+        let mut url = join(&self.base, "/v1/audit_log/tail")?;
+        url.query_pairs_mut().append_pair("n", &n.to_string());
+        json_or_err(self.http.get(url).send().await?).await
+    }
+
+    /// `POST /v1/chat/template/preview` — render a Jinja chat template against
+    /// a sample conversation (no model load).
+    pub async fn template_preview(
+        &self,
+        template: &str,
+        messages: &serde_json::Value,
+        add_generation_prompt: bool,
+    ) -> Result<serde_json::Value> {
+        let url = join(&self.base, "/v1/chat/template/preview")?;
+        json_or_err(
+            self.http
+                .post(url)
+                .json(&serde_json::json!({
+                    "template": template,
+                    "messages": messages,
+                    "add_generation_prompt": add_generation_prompt,
+                }))
+                .send()
+                .await?,
+        )
+        .await
+    }
+
     /// `POST /v1/tokenize` — server-side token count for `content`, used by the
     /// chat's live "N / ctx" composer counter. `add_bos` is sent `false` to
     /// match the web client (the chat template prepends its own BOS, so the
@@ -912,6 +1241,35 @@ fn join(base: &reqwest::Url, path: &str) -> Result<reqwest::Url> {
         status: 0,
         body: format!("url join failed: {e}"),
     })
+}
+
+/// Deserialize a JSON response, mapping a non-2xx status to
+/// [`ClientError::Server`] with the response body (the same error shape the
+/// hand-rolled methods above produce). Shared by the Phase-4 Settings / Status
+/// calls to keep them terse.
+async fn json_or_err<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Result<T> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ClientError::Server {
+            status: status.as_u16(),
+            body,
+        });
+    }
+    Ok(resp.json().await?)
+}
+
+/// Like [`json_or_err`] but for endpoints whose success body we ignore.
+async fn ok_or_err(resp: reqwest::Response) -> Result<()> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ClientError::Server {
+            status: status.as_u16(),
+            body,
+        });
+    }
+    Ok(())
 }
 
 /// Drive the raw byte stream into [`ChatEvent`]s. Buffers across chunk

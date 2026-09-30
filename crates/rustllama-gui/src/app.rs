@@ -6,6 +6,7 @@
 //! tok-s / active model, polled from `/v1/metrics`). The Phase-1 model bar +
 //! transcript + composer are now the **Chat** view.
 
+use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,9 +15,15 @@ use egui::{Align, Align2, Color32, FontId, Layout, Margin, Rect, RichText, Round
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use futures::StreamExt;
 use rustllama_client::{
-    ChatEvent, ChatMessage, ChatRequest, Client, HfFile, HfModel, LoadModelParams, MetricsSnapshot,
-    StreamOptions, SystemPrompt, TagsModel, ToolCall, Usage,
+    Capabilities, ChatEvent, ChatMessage, ChatRequest, Client, HfFile, HfModel, LoadModelParams,
+    MetricsSnapshot, StreamOptions, SystemPrompt, TagsModel, ToolCall, TuneProgress,
+    TuningRecommendations, TuningSummary, Usage,
 };
+
+/// How many `/v1/metrics` samples the Status sparklines retain. At the ~1 Hz
+/// Status-view poll cadence that's two minutes of rolling history — enough to
+/// see a generation's shape without the ring buffer growing unbounded.
+const METRICS_WINDOW: usize = 120;
 
 // --- Theme tokens ---------------------------------------------------------
 // Approximate the app's design tokens (LM-Studio-ish dark). `Color32::from_rgb`
@@ -51,12 +58,14 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("?", "Toggle this shortcuts overlay"),
 ];
 
-/// Which page the central area renders. Chat + Models are built in Phase 2;
-/// Status / Settings / Decide / Quantize are stubbed in the nav for later.
+/// Which page the central area renders. Chat + Models (Phase 2) and Status +
+/// Settings (Phase 4) are live; Decide / Quantize remain stubbed in the nav.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
     Chat,
     Models,
+    Status,
+    Settings,
 }
 
 /// A currently-loaded model from `/v1/models` (`data[]`). `is_default` gates
@@ -72,6 +81,8 @@ struct LoadedModel {
 enum NavIcon {
     Chat,
     Models,
+    Status,
+    Settings,
     Placeholder,
 }
 
@@ -176,6 +187,45 @@ impl Sampling {
     }
 }
 
+/// The editable subset of the on-disk config the Settings form exposes. Loaded
+/// from `/v1/config` (see [`draft_from_config`]) and written back over the
+/// original config JSON on Save (see [`apply_draft_to_config`]) so unmodeled
+/// sections — placement overrides, `[tuning]`, `[[profiles]]`,
+/// `[[system_prompts]]`, the speculative-draft knobs — round-trip untouched.
+/// `PartialEq` drives the "dirty" gate (a form equal to the freshly-loaded
+/// snapshot disables Save / permits Apply-profile), mirroring Settings.tsx.
+#[derive(Clone, PartialEq)]
+struct SettingsDraft {
+    // --- server (restart) ---
+    bind_addr: String,
+    /// Free text; parsed to u16 on save so a mid-edit "" doesn't clamp to 0.
+    port: String,
+    api_key: String,
+    max_loaded_models: u32,
+    /// Comma-separated origins; split on save (mirrors the React text field).
+    cors_origins: String,
+    // --- model (reload) ---
+    model_path: String,
+    model_hub: String,
+    chat_template: String,
+    // --- inference (reload) ---
+    ctx_size: u64,
+    batch_size: u32,
+    threads: u32,
+    kv_dtype: String,
+    /// "" = inherit `kv_dtype` (written back as JSON null).
+    k_dtype: String,
+    v_dtype: String,
+    flash_attention: bool,
+    speculative_ngram: bool,
+    prefix_cache: bool,
+    keep_quant_raw: bool,
+    // --- ui (live) ---
+    theme: String,
+    font_size: u32,
+    code_theme: String,
+}
+
 /// A pending CLARIFY (`ask_user`) question rendered as clickable option
 /// buttons; picking one continues the conversation (see `choose_option`).
 struct PendingAsk {
@@ -267,6 +317,35 @@ enum UiMsg {
     ExportDone(String),
     /// The export failed (write error; a cancelled dialog sends nothing).
     ExportError(String),
+
+    // --- Status / Settings views (Phase 4) ---
+    /// `/v1/capabilities` — server version + compute-backend snapshot (boxed;
+    /// it's a large struct). Feeds the Status Backends panel + Settings
+    /// Hardware panel.
+    Caps(Box<Capabilities>),
+    /// `/v1/tuning_summary` + `/v1/tuning/recommendations` for the Status
+    /// Tuner-cache panel. `Ok((summary, recs))` on success (summary boxed — the
+    /// larger of the two); `Err(msg)` when the summary fetch failed.
+    Tuning(std::result::Result<(Box<TuningSummary>, TuningRecommendations), String>),
+    /// A re-tune finished (`Ok` clears the busy state + refreshes the summary;
+    /// `Err` surfaces the message).
+    TuneDone(std::result::Result<(), String>),
+    /// One `/v1/tune/progress` poll frame (stage bar + last log line).
+    TuneProg(Box<TuneProgress>),
+    /// `/v1/config` loaded for the Settings form: the whole config object (for
+    /// round-trip preservation), its on-disk path, and the profile names.
+    SettingsLoaded {
+        config: Box<serde_json::Value>,
+        config_path: String,
+        profiles: Vec<String>,
+    },
+    /// The Settings config fetch failed.
+    SettingsError(String),
+    /// A Save (PUT) / Apply-profile succeeded — carries the server's
+    /// reload/restart flags for the result banner. Triggers a config re-fetch.
+    SettingsSaved { reload: bool, restart: bool },
+    /// A Save / Apply-profile failed.
+    SettingsSaveError(String),
 }
 
 /// Deferred UI action. Immediate-mode widgets push these while a panel is
@@ -286,6 +365,19 @@ enum Action {
     HfBack,
     HfPickFile { repo: String, file: String },
     Pull(String),
+    // --- Status / Settings (Phase 4) ---
+    /// Refresh the Status dashboard's tuning summary + recommendations.
+    RefreshTuning,
+    /// Start a re-tune of the named cached model (full "all" sweep).
+    TuneModel(String),
+    /// Reload the Settings config from disk (Refresh / post-save).
+    ReloadSettings,
+    /// PUT the edited config.
+    SaveSettings,
+    /// Reset the Settings form to the last-loaded config (Discard).
+    ResetSettings,
+    /// Apply a named config profile (sparse override merge).
+    ApplyProfile(String),
 }
 
 pub struct GuiApp {
@@ -392,6 +484,54 @@ pub struct GuiApp {
     // --- chat: keyboard-shortcuts overlay ---
     show_shortcuts: bool,
 
+    // --- Status / Settings shared: compute-backend snapshot ---
+    /// `/v1/capabilities`, fetched once at startup (backends don't change
+    /// mid-process — adding a GPU needs a server restart). Feeds the Status
+    /// Backends panel + the Settings Hardware panel.
+    capabilities: Option<Capabilities>,
+
+    // --- Status view ---
+    /// Rolling ring buffers for the sparklines, appended on each metrics poll
+    /// (see [`GuiApp::push_metric_samples`]) and capped at `METRICS_WINDOW`.
+    tok_series: VecDeque<f64>,
+    ctx_series: VecDeque<f64>,
+    pending_series: VecDeque<f64>,
+    tuning_summary: Option<TuningSummary>,
+    tuning_recs: Option<TuningRecommendations>,
+    tuning_error: Option<String>,
+    /// When the tuner summary was last polled (slow ~10 s cadence).
+    tuning_last_poll: Option<Instant>,
+    /// The cached model selected in the Re-tune picker.
+    tune_sel_model: String,
+    /// True while a re-tune subprocess runs (disables the buttons).
+    tune_running: bool,
+    /// Latest `/v1/tune/progress` frame (stage bar + last log line).
+    tune_progress: Option<TuneProgress>,
+    /// When tune progress was last polled (~1 s cadence while a re-tune runs).
+    tune_prog_last_poll: Option<Instant>,
+    /// Result line of the most recent re-tune ("done" / "error: …").
+    tune_status: Option<String>,
+
+    // --- Settings view ---
+    /// The full config OBJECT last loaded from `/v1/config`, kept whole so a
+    /// Save writes only the edited keys and preserves everything else.
+    settings_config: Option<serde_json::Value>,
+    settings_config_path: String,
+    /// The editable form state, and a snapshot of it at load time for the
+    /// dirty check.
+    settings_draft: Option<SettingsDraft>,
+    settings_orig: Option<SettingsDraft>,
+    /// `[[profiles]]` names for the Apply dropdown.
+    settings_profiles: Vec<String>,
+    settings_profile_sel: String,
+    settings_error: Option<String>,
+    /// True while a config fetch is in flight (drives the "loading…" state).
+    settings_loading: bool,
+    /// True while a Save / Apply-profile PUT is in flight.
+    settings_saving: bool,
+    /// The Save/Apply result banner: (is_error, message).
+    settings_status: Option<(bool, String)>,
+
     md_cache: CommonMarkCache,
 }
 
@@ -475,15 +615,40 @@ impl GuiApp {
             pending_question: None,
             pending_tools: None,
             show_shortcuts: false,
+            capabilities: None,
+            tok_series: VecDeque::new(),
+            ctx_series: VecDeque::new(),
+            pending_series: VecDeque::new(),
+            tuning_summary: None,
+            tuning_recs: None,
+            tuning_error: None,
+            tuning_last_poll: None,
+            tune_sel_model: String::new(),
+            tune_running: false,
+            tune_progress: None,
+            tune_prog_last_poll: None,
+            tune_status: None,
+            settings_config: None,
+            settings_config_path: String::new(),
+            settings_draft: None,
+            settings_orig: None,
+            settings_profiles: Vec::new(),
+            settings_profile_sel: String::new(),
+            settings_error: None,
+            settings_loading: false,
+            settings_saving: false,
+            settings_status: None,
             md_cache: CommonMarkCache::default(),
         };
 
         // Kick off the initial loads (health probe + model list + cached list +
-        // the config's system-prompt library / ctx budget).
+        // the config's system-prompt library / ctx budget + the compute-backend
+        // capabilities snapshot for Status/Settings).
         app.spawn_health();
         app.spawn_refresh_models();
         app.spawn_refresh_cached();
         app.spawn_config();
+        app.spawn_capabilities();
         Ok(app)
     }
 
@@ -563,6 +728,143 @@ impl GuiApp {
                 });
                 ctx.request_repaint();
             }
+        });
+    }
+
+    /// Fetch `/v1/capabilities` once (backends are process-stable). Feeds the
+    /// Status Backends panel + Settings Hardware panel; a failure is silent
+    /// (those panels just show "unavailable").
+    fn spawn_capabilities(&self) {
+        let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            if let Ok(c) = client.capabilities().await {
+                let _ = tx.send(UiMsg::Caps(Box::new(c)));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Poll the tuner-cache summary + untuned-shape recommendations for the
+    /// Status Tuner panel. Recommendations are best-effort (older servers lack
+    /// the endpoint), so a failure there degrades to an empty list.
+    fn spawn_tuning(&self) {
+        let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            let msg = match client.tuning_summary().await {
+                Ok(summary) => {
+                    let recs = client.tuning_recommendations().await.unwrap_or_default();
+                    UiMsg::Tuning(Ok((Box::new(summary), recs)))
+                }
+                Err(e) => UiMsg::Tuning(Err(e.to_string())),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// One `/v1/tune/progress` poll — the stage bar + last log line shown while
+    /// a re-tune runs.
+    fn spawn_tune_progress(&self) {
+        let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            if let Ok(p) = client.tune_progress().await {
+                let _ = tx.send(UiMsg::TuneProg(Box::new(p)));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Force a full ("all") re-tune of `model`. The POST blocks for the whole
+    /// sweep; the Status view polls [`Self::spawn_tune_progress`] meanwhile.
+    fn spawn_tune_model(&self, model: String) {
+        let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            let res = client
+                .tune_model(&model, true, "all")
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(UiMsg::TuneDone(res));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Load the full config for the Settings form (raw JSON so unmodeled
+    /// sections round-trip on Save). Extracts the profile names for the Apply
+    /// dropdown.
+    fn spawn_settings_config(&self) {
+        let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            match client.get_config_raw().await {
+                Ok(env) => {
+                    let config = env.get("config").cloned().unwrap_or(serde_json::Value::Null);
+                    let config_path = env
+                        .get("config_path")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("config.toml")
+                        .to_string();
+                    let profiles = config
+                        .get("profiles")
+                        .and_then(|p| p.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|p| {
+                                    p.get("name").and_then(|n| n.as_str()).map(str::to_string)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let _ = tx.send(UiMsg::SettingsLoaded {
+                        config: Box::new(config),
+                        config_path,
+                        profiles,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(UiMsg::SettingsError(e.to_string()));
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// PUT the edited config. `config` is the merged object (draft written over
+    /// the loaded config so unmodeled keys survive). The reload/restart flags
+    /// in the response drive the result banner.
+    fn spawn_save_settings(&self, config: serde_json::Value) {
+        let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            match client.set_config(&config).await {
+                Ok(v) => {
+                    let _ = tx.send(UiMsg::SettingsSaved {
+                        reload: flag(&v, "requires_model_reload"),
+                        restart: flag(&v, "requires_server_restart"),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(UiMsg::SettingsSaveError(e.to_string()));
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Apply a named config profile (server merges its sparse overrides). Same
+    /// reload/restart result shape as a Save.
+    fn spawn_apply_profile(&self, name: String) {
+        let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            match client.apply_profile(&name).await {
+                Ok(v) => {
+                    let _ = tx.send(UiMsg::SettingsSaved {
+                        reload: flag(&v, "requires_model_reload"),
+                        restart: flag(&v, "requires_server_restart"),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(UiMsg::SettingsSaveError(e.to_string()));
+                }
+            }
+            ctx.request_repaint();
         });
     }
 
@@ -1337,6 +1639,9 @@ impl GuiApp {
             UiMsg::Metrics(m) => {
                 self.metrics_inflight = false;
                 self.health = Some(true);
+                // Append the Status sparkline samples before storing (the ring
+                // buffers roll at METRICS_WINDOW).
+                self.push_metric_samples(&m);
                 self.metrics = Some(*m);
             }
             UiMsg::MetricsError => {
@@ -1371,11 +1676,82 @@ impl GuiApp {
             UiMsg::ExportError(e) => {
                 self.status = Some(format!("Export failed: {e}"));
             }
+            UiMsg::Caps(c) => self.capabilities = Some(*c),
+            UiMsg::Tuning(res) => match res {
+                Ok((summary, recs)) => {
+                    self.tuning_summary = Some(*summary);
+                    self.tuning_recs = Some(recs);
+                    self.tuning_error = None;
+                    // Seed the re-tune picker with the first cached model once,
+                    // so the button is immediately actionable.
+                    if self.tune_sel_model.is_empty() {
+                        if let Some(first) = self.cached.first() {
+                            self.tune_sel_model = first.name.clone();
+                        }
+                    }
+                }
+                Err(e) => self.tuning_error = Some(e),
+            },
+            UiMsg::TuneProg(p) => self.tune_progress = Some(*p),
+            UiMsg::TuneDone(res) => {
+                self.tune_running = false;
+                self.tune_status = Some(match res {
+                    Ok(()) => "tune complete — reload the model to apply the new winners".into(),
+                    Err(e) => format!("error: {e}"),
+                });
+                // Refresh the summary so the new winners show.
+                self.spawn_tuning();
+            }
+            UiMsg::SettingsLoaded {
+                config,
+                config_path,
+                profiles,
+            } => {
+                let draft = draft_from_config(&config);
+                self.settings_config = Some(*config);
+                self.settings_config_path = config_path;
+                self.settings_profiles = profiles;
+                self.settings_orig = Some(draft.clone());
+                self.settings_draft = Some(draft);
+                self.settings_loading = false;
+                self.settings_error = None;
+            }
+            UiMsg::SettingsError(e) => {
+                self.settings_loading = false;
+                self.settings_error = Some(e);
+            }
+            UiMsg::SettingsSaved { reload, restart } => {
+                self.settings_saving = false;
+                let msg = if restart {
+                    "Saved. Server fields changed — restart rustllama for them to take effect."
+                } else if reload {
+                    "Saved. Model / inference fields changed — reload the model from the Models page."
+                } else {
+                    "Saved. Changes hot-applied via the watcher."
+                };
+                self.settings_status = Some((false, msg.into()));
+                // Re-fetch so the form (and its dirty snapshot) tracks disk.
+                self.spawn_settings_config();
+            }
+            UiMsg::SettingsSaveError(e) => {
+                self.settings_saving = false;
+                self.settings_status = Some((true, format!("save failed: {e}")));
+            }
             UiMsg::Err(e) => {
                 tracing::debug!(target: "rustllama_gui", "{e}");
                 self.status = Some(e);
             }
         }
+    }
+
+    /// Append one metrics tick to the Status sparkline ring buffers, evicting
+    /// the oldest sample once each exceeds `METRICS_WINDOW`. Charts the smoothed
+    /// EMA tok/s (falls back to the per-request value pre-warm-up) so the line
+    /// doesn't jitter between cold and warm requests.
+    fn push_metric_samples(&mut self, m: &MetricsSnapshot) {
+        push_capped(&mut self.tok_series, m.ema_tok_s.or(m.last_tok_s).unwrap_or(0.0));
+        push_capped(&mut self.ctx_series, m.ctx_used as f64);
+        push_capped(&mut self.pending_series, m.pending as f64);
     }
 }
 
@@ -1398,18 +1774,48 @@ impl eframe::App for GuiApp {
 
         let now = Instant::now();
 
-        // 2) Status-bar metrics poll (~2 s cadence). Gate on an in-flight flag
-        //    so a slow server doesn't queue overlapping requests. The
-        //    `request_repaint_after` keeps the poll alive when the UI is idle.
+        // 2) Metrics poll. The status bar wants ~2 s, but the Status view's
+        //    sparklines want ~1 Hz, so tighten the cadence to 1 s while that
+        //    view is up. Gate on an in-flight flag so a slow server doesn't
+        //    queue overlapping requests; `request_repaint_after` keeps the poll
+        //    alive when the UI is idle.
+        let metrics_interval = if self.view == View::Status {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(2)
+        };
         let due = self
             .metrics_last_poll
-            .map_or(true, |t| now.duration_since(t) >= Duration::from_secs(2));
+            .map_or(true, |t| now.duration_since(t) >= metrics_interval);
         if due && !self.metrics_inflight {
             self.metrics_inflight = true;
             self.metrics_last_poll = Some(now);
             self.spawn_metrics();
         }
-        ctx.request_repaint_after(Duration::from_secs(2));
+        ctx.request_repaint_after(metrics_interval);
+
+        // 2b) Status view: refresh the tuner-cache summary on a slow ~10 s
+        //     cadence (it only changes when the user runs a tune), and — while
+        //     a re-tune runs — poll its progress ~1 Hz for the stage bar.
+        if self.view == View::Status {
+            let tuning_due = self
+                .tuning_last_poll
+                .map_or(true, |t| now.duration_since(t) >= Duration::from_secs(10));
+            if tuning_due {
+                self.tuning_last_poll = Some(now);
+                self.spawn_tuning();
+            }
+        }
+        if self.tune_running {
+            let prog_due = self
+                .tune_prog_last_poll
+                .map_or(true, |t| now.duration_since(t) >= Duration::from_secs(1));
+            if prog_due {
+                self.tune_prog_last_poll = Some(now);
+                self.spawn_tune_progress();
+            }
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
 
         // 3) HuggingFace search debounce: fire ~300 ms after the last keystroke
         //    (avoids a request per character). A pending debounce schedules a
@@ -1488,14 +1894,25 @@ impl eframe::App for GuiApp {
                     actions.push(Action::SwitchView(View::Models));
                 }
                 ui.add_space(3.0);
-                // Room for later phases — rendered but disabled.
+                // Decide / Quantize remain later-phase placeholders; Status +
+                // Settings are live (Phase 4).
                 nav_item(ui, NavIcon::Placeholder, "Decide", false, false);
                 ui.add_space(3.0);
-                nav_item(ui, NavIcon::Placeholder, "Status", false, false);
+                if nav_item(ui, NavIcon::Status, "Status", self.view == View::Status, true) {
+                    actions.push(Action::SwitchView(View::Status));
+                }
                 ui.add_space(3.0);
                 nav_item(ui, NavIcon::Placeholder, "Quantize", false, false);
                 ui.add_space(3.0);
-                nav_item(ui, NavIcon::Placeholder, "Settings", false, false);
+                if nav_item(
+                    ui,
+                    NavIcon::Settings,
+                    "Settings",
+                    self.view == View::Settings,
+                    true,
+                ) {
+                    actions.push(Action::SwitchView(View::Settings));
+                }
             });
 
         // 5) Status bar (all views) — added before any per-view bottom panel so
@@ -1520,6 +1937,8 @@ impl eframe::App for GuiApp {
         match self.view {
             View::Chat => self.render_chat(ctx),
             View::Models => self.render_models(ctx, &mut actions),
+            View::Status => self.render_status(ctx, &mut actions),
+            View::Settings => self.render_settings(ctx, &mut actions),
         }
 
         // 7) Delete-confirmation modal (Models view). A floating egui window so
@@ -1558,10 +1977,29 @@ impl eframe::App for GuiApp {
             match action {
                 Action::SwitchView(v) => {
                     self.view = v;
-                    // Freshen the lists when entering Models.
-                    if v == View::Models {
-                        self.spawn_refresh_models();
-                        self.spawn_refresh_cached();
+                    match v {
+                        // Freshen the lists when entering Models.
+                        View::Models => {
+                            self.spawn_refresh_models();
+                            self.spawn_refresh_cached();
+                        }
+                        // Status needs the tuner summary + the cached-model
+                        // list (for the re-tune picker) on entry. Stamp the
+                        // poll clock so step 2b doesn't immediately re-fetch.
+                        View::Status => {
+                            self.tuning_last_poll = Some(Instant::now());
+                            self.spawn_tuning();
+                            self.spawn_refresh_cached();
+                        }
+                        // Settings loads (or reloads) the on-disk config on
+                        // entry unless it's already loaded.
+                        View::Settings => {
+                            if self.settings_draft.is_none() && !self.settings_loading {
+                                self.settings_loading = true;
+                                self.spawn_settings_config();
+                            }
+                        }
+                        View::Chat => {}
                     }
                 }
                 Action::RefreshModels => {
@@ -1613,6 +2051,52 @@ impl eframe::App for GuiApp {
                         self.pull_pct = None;
                         self.pull_status = Some("starting…".into());
                         self.spawn_pull(r);
+                    }
+                }
+                Action::RefreshTuning => {
+                    self.tuning_last_poll = Some(Instant::now());
+                    self.spawn_tuning();
+                    self.spawn_capabilities();
+                }
+                Action::TuneModel(model) => {
+                    if !self.tune_running && !model.trim().is_empty() {
+                        self.tune_running = true;
+                        self.tune_status = None;
+                        self.tune_progress = None;
+                        self.tune_prog_last_poll = None;
+                        self.spawn_tune_model(model);
+                    }
+                }
+                Action::ReloadSettings => {
+                    self.settings_loading = true;
+                    self.settings_status = None;
+                    self.spawn_settings_config();
+                }
+                Action::SaveSettings => {
+                    // Merge the draft over the loaded config so unmodeled
+                    // sections survive, then PUT.
+                    if let (Some(base), Some(draft)) =
+                        (self.settings_config.clone(), self.settings_draft.clone())
+                    {
+                        let mut merged = base;
+                        apply_draft_to_config(&mut merged, &draft);
+                        self.settings_saving = true;
+                        self.settings_status = None;
+                        self.spawn_save_settings(merged);
+                    }
+                }
+                Action::ResetSettings => {
+                    // Discard edits: restore the form to the loaded snapshot.
+                    if let Some(orig) = self.settings_orig.clone() {
+                        self.settings_draft = Some(orig);
+                    }
+                    self.settings_status = None;
+                }
+                Action::ApplyProfile(name) => {
+                    if !name.is_empty() && !self.settings_saving {
+                        self.settings_saving = true;
+                        self.settings_status = None;
+                        self.spawn_apply_profile(name);
                     }
                 }
             }
@@ -2491,6 +2975,690 @@ impl GuiApp {
                     });
             });
     }
+
+    /// The Status view (Phase 4): a live dashboard — server health / version /
+    /// uptime, the compute-backend snapshot, a per-device compute inventory,
+    /// live sparklines (tok/s · ctx · pending), and the tuner-cache panel with
+    /// a per-model re-tune (progress polled ~1 Hz while it runs).
+    //
+    // DEFERRED (TODOs, intentionally not built here):
+    //   - GPU power / energy derivation (needs the L0 Sysman energy counter +
+    //     a two-sample dE/dt like Status.tsx's GPU-sensors panel).
+    //   - The paged-KV pool occupancy panel.
+    //   - The synthetic throughput probe ("Run probe").
+    //   - The static API-surface endpoint list.
+    fn render_status(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        // Clone the read-only display state up front so the panel closure can
+        // still take `&mut self.tune_sel_model` for the re-tune picker without
+        // aliasing (mirrors render_models). The ring buffers are ≤120 f64 each,
+        // so cloning them per frame is cheap.
+        let caps = self.capabilities.clone();
+        let metrics = self.metrics.clone();
+        let health = self.health;
+        let tuning = self.tuning_summary.clone();
+        let recs = self.tuning_recs.clone();
+        let tuning_error = self.tuning_error.clone();
+        let cached = self.cached.clone();
+        let tune_running = self.tune_running;
+        let tune_progress = self.tune_progress.clone();
+        let tune_status = self.tune_status.clone();
+        let tok = self.tok_series.clone();
+        let ctxs = self.ctx_series.clone();
+        let pend = self.pending_series.clone();
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(BG).inner_margin(Margin::same(16.0)))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Status").heading().color(TEXT));
+                            ui.add_space(6.0);
+                            if ui.button("Refresh").clicked() {
+                                actions.push(Action::RefreshTuning);
+                            }
+                        });
+                        ui.add_space(14.0);
+
+                        // --- Server ---
+                        card(ui, |ui| {
+                            ui.label(RichText::new("Server").strong().color(TEXT));
+                            ui.add_space(6.0);
+                            kv_row(
+                                ui,
+                                "Status",
+                                match health {
+                                    Some(true) => "live",
+                                    Some(false) => "offline",
+                                    None => "—",
+                                },
+                            );
+                            kv_row(
+                                ui,
+                                "Version",
+                                caps.as_ref()
+                                    .map(|c| c.server_version.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or("—"),
+                            );
+                            kv_row(
+                                ui,
+                                "Uptime",
+                                &metrics
+                                    .as_ref()
+                                    .map(|m| fmt_uptime(m.uptime_s))
+                                    .unwrap_or_else(|| "—".into()),
+                            );
+                            kv_row(
+                                ui,
+                                "Loaded model",
+                                metrics
+                                    .as_ref()
+                                    .map(|m| m.model_id.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or("—"),
+                            );
+                        });
+                        ui.add_space(14.0);
+
+                        // --- Backends ---
+                        card(ui, |ui| {
+                            ui.label(RichText::new("Backends").strong().color(TEXT));
+                            ui.label(
+                                RichText::new("compute dispatch paths").color(MUTED).small(),
+                            );
+                            ui.add_space(8.0);
+                            match &caps {
+                                Some(c) => render_backends(ui, &c.backends),
+                                None => {
+                                    ui.label(
+                                        RichText::new("capabilities unavailable").color(MUTED),
+                                    );
+                                }
+                            }
+                        });
+                        ui.add_space(14.0);
+
+                        // --- Compute inventory (every GPU + the CPU tier) ---
+                        card(ui, |ui| {
+                            ui.label(RichText::new("Compute inventory").strong().color(TEXT));
+                            ui.label(
+                                RichText::new("every GPU + the CPU tier").color(MUTED).small(),
+                            );
+                            ui.add_space(8.0);
+                            if let Some(m) = &metrics {
+                                let gpus = m.gpus.clone().unwrap_or_default();
+                                for g in &gpus {
+                                    let used = match (g.vram_total_bytes, g.vram_free_bytes) {
+                                        (Some(t), Some(f)) => Some(t.saturating_sub(f)),
+                                        _ => None,
+                                    };
+                                    inventory_row(
+                                        ui,
+                                        gpu_badge(&g.vendor),
+                                        &format!("GPU {}", g.index),
+                                        &g.name,
+                                        used,
+                                        g.vram_total_bytes,
+                                        g.utilization_pct,
+                                    );
+                                }
+                                let ram_used = (m.ram_total_bytes > 0)
+                                    .then(|| m.ram_total_bytes.saturating_sub(m.ram_available_bytes));
+                                inventory_row(
+                                    ui,
+                                    "CPU",
+                                    "CPU",
+                                    m.cpu_brand.as_deref().unwrap_or("Host CPU"),
+                                    ram_used,
+                                    (m.ram_total_bytes > 0).then_some(m.ram_total_bytes),
+                                    m.cpu_utilization_pct,
+                                );
+                                if gpus.is_empty() {
+                                    ui.label(
+                                        RichText::new(
+                                            "No GPU visible — inference runs on the CPU tier.",
+                                        )
+                                        .color(MUTED)
+                                        .small(),
+                                    );
+                                }
+                            } else {
+                                ui.label(RichText::new("waiting for /v1/metrics…").color(MUTED));
+                            }
+                        });
+                        ui.add_space(14.0);
+
+                        // --- Live metrics (sparklines) ---
+                        card(ui, |ui| {
+                            ui.label(RichText::new("Live metrics").strong().color(TEXT));
+                            ui.add_space(8.0);
+                            if let Some(m) = &metrics {
+                                ui.horizontal_wrapped(|ui| {
+                                    let tok_v = m
+                                        .ema_tok_s
+                                        .or(m.last_tok_s)
+                                        .map(|t| format!("{t:.1}"))
+                                        .unwrap_or_else(|| "—".into());
+                                    sparkline(
+                                        ui, "spark_tok", "Tokens / second", &tok_v, &tok,
+                                        HEALTH_OK, None,
+                                    );
+                                    ui.add_space(12.0);
+                                    sparkline(
+                                        ui,
+                                        "spark_ctx",
+                                        "KV context used",
+                                        &format!("{} / {}", m.ctx_used, m.ctx_size),
+                                        &ctxs,
+                                        ACCENT,
+                                        (m.ctx_size > 0).then_some(m.ctx_size as f64),
+                                    );
+                                    ui.add_space(12.0);
+                                    sparkline(
+                                        ui,
+                                        "spark_pend",
+                                        "Pending requests",
+                                        &format!("{} / {}", m.pending, m.max_pending),
+                                        &pend,
+                                        WARN,
+                                        (m.max_pending > 0).then_some(m.max_pending as f64),
+                                    );
+                                });
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(format!(
+                                        "KV dtype: {} · concurrency: {} · uptime {}",
+                                        m.kv_dtype.as_deref().unwrap_or("—"),
+                                        m.concurrency,
+                                        fmt_uptime(m.uptime_s),
+                                    ))
+                                    .color(MUTED)
+                                    .small(),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new("Waiting for the first /v1/metrics tick…")
+                                        .color(MUTED),
+                                );
+                            }
+                        });
+                        ui.add_space(14.0);
+
+                        // --- Tuner cache ---
+                        card(ui, |ui| {
+                            ui.label(RichText::new("Tuner cache").strong().color(TEXT));
+                            ui.add_space(8.0);
+                            if let Some(e) = &tuning_error {
+                                ui.label(
+                                    RichText::new(format!("failed to read: {e}"))
+                                        .color(DANGER)
+                                        .small(),
+                                );
+                            }
+                            match &tuning {
+                                None if tuning_error.is_none() => {
+                                    ui.label(RichText::new("loading…").color(MUTED));
+                                }
+                                None => {}
+                                Some(t) => {
+                                    match &t.device {
+                                        None => {
+                                            ui.label(
+                                                RichText::new(
+                                                    "No SYCL device visible — the tuner cache is \
+                                                     keyed by device, so there is nothing to \
+                                                     surface.",
+                                                )
+                                                .color(MUTED)
+                                                .small(),
+                                            );
+                                        }
+                                        Some(dev) => {
+                                            kv_row(ui, "Device", &dev.name);
+                                            kv_row(ui, "Driver", &dev.driver_ver);
+                                            kv_row(ui, "VRAM", &format!("{} MiB", dev.vram_mb));
+                                        }
+                                    }
+                                    kv_row(
+                                        ui,
+                                        "Cache present",
+                                        if t.cache_present {
+                                            "yes"
+                                        } else {
+                                            "none — run rustllama tune"
+                                        },
+                                    );
+                                    kv_row(ui, "Last tuned", t.last_tuned.as_deref().unwrap_or("—"));
+                                    kv_row(
+                                        ui,
+                                        "Tuned kernel shapes",
+                                        &t.kernel_entry_count.to_string(),
+                                    );
+                                    winner_row(
+                                        ui,
+                                        "Batch-size winner",
+                                        t.batch_size.map(|b| b.to_string()),
+                                        t.auto_apply_batch_size,
+                                    );
+                                    winner_row(
+                                        ui,
+                                        "KV-dtype winner",
+                                        t.kv_dtype.clone(),
+                                        t.auto_apply_kv_dtype,
+                                    );
+                                    winner_row(
+                                        ui,
+                                        "Flash-attn winner",
+                                        t.flash_attention
+                                            .map(|b| if b { "on".into() } else { "off".into() }),
+                                        t.auto_apply_flash_attention,
+                                    );
+                                    winner_row(
+                                        ui,
+                                        "KV-layout winner",
+                                        t.kv_cache_layout.clone(),
+                                        t.auto_apply_kv_cache_layout,
+                                    );
+                                    if !t.placement.is_empty() {
+                                        ui.add_space(6.0);
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "Placement winners ({}){}",
+                                                t.placement.len(),
+                                                if t.auto_apply_placement {
+                                                    " · auto-applied"
+                                                } else {
+                                                    " · stored"
+                                                }
+                                            ))
+                                            .color(MUTED)
+                                            .small(),
+                                        );
+                                        for p in &t.placement {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "  {} → n_gpu_layers={}",
+                                                    p.model_key, p.n_gpu_layers
+                                                ))
+                                                .color(TEXT)
+                                                .small(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Untuned-shape banner.
+                            if let Some(r) = &recs {
+                                if r.untuned_count > 0 {
+                                    ui.add_space(8.0);
+                                    egui::Frame::none()
+                                        .fill(WARN.gamma_multiply(0.12))
+                                        .rounding(Rounding::same(8.0))
+                                        .stroke(Stroke::new(1.0, WARN))
+                                        .inner_margin(Margin::same(10.0))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{} kernel shape(s) dispatched without a \
+                                                     cached LWS entry — the kernel default works \
+                                                     but typically leaves 1.5–3× on the table.",
+                                                    r.untuned_count
+                                                ))
+                                                .color(TEXT)
+                                                .small(),
+                                            );
+                                        });
+                                }
+                            }
+
+                            // --- Re-tune (per cached model) ---
+                            ui.add_space(10.0);
+                            ui.separator();
+                            ui.label(RichText::new("Re-tune").color(MUTED).small());
+                            ui.add_space(4.0);
+                            if cached.is_empty() {
+                                ui.label(
+                                    RichText::new(
+                                        "No cached models — pull one from the Models page first.",
+                                    )
+                                    .color(MUTED)
+                                    .small(),
+                                );
+                            } else {
+                                ui.horizontal(|ui| {
+                                    egui::ComboBox::from_id_salt("tune_model_combo")
+                                        .width(280.0)
+                                        .selected_text(if self.tune_sel_model.is_empty() {
+                                            "select a model".to_string()
+                                        } else {
+                                            display_name(&self.tune_sel_model).to_string()
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            for m in &cached {
+                                                ui.selectable_value(
+                                                    &mut self.tune_sel_model,
+                                                    m.name.clone(),
+                                                    display_name(&m.name),
+                                                );
+                                            }
+                                        });
+                                    let can = !tune_running && !self.tune_sel_model.is_empty();
+                                    if ui
+                                        .add_enabled(
+                                            can,
+                                            egui::Button::new(if tune_running {
+                                                "tuning…"
+                                            } else {
+                                                "Re-tune"
+                                            }),
+                                        )
+                                        .on_hover_text(
+                                            "Full per-model sweep (KV-dtype, CPU/GPU dispatch, \
+                                             kernels, batch size), persisted to the tuner cache. \
+                                             Runs in a background process; reload the model \
+                                             afterwards to apply.",
+                                        )
+                                        .clicked()
+                                    {
+                                        actions.push(Action::TuneModel(self.tune_sel_model.clone()));
+                                    }
+                                    if tune_running {
+                                        ui.spinner();
+                                    }
+                                });
+                                if tune_running {
+                                    ui.add_space(6.0);
+                                    if let Some(p) = &tune_progress {
+                                        let frac = (p.pct / 100.0).clamp(0.0, 1.0) as f32;
+                                        ui.add(
+                                            egui::ProgressBar::new(frac)
+                                                .desired_width(f32::INFINITY)
+                                                .fill(ACCENT)
+                                                .text(format!(
+                                                    "{}/{} {}",
+                                                    p.stage_idx, p.stage_total, p.stage_name
+                                                )),
+                                        );
+                                        if !p.line.is_empty() {
+                                            ui.label(
+                                                RichText::new(&p.line)
+                                                    .color(MUTED)
+                                                    .monospace()
+                                                    .small(),
+                                            );
+                                        }
+                                    } else {
+                                        ui.label(RichText::new("starting…").color(MUTED).small());
+                                    }
+                                }
+                                if let Some(s) = &tune_status {
+                                    ui.add_space(6.0);
+                                    let col = if s.starts_with("error") { DANGER } else { HEALTH_OK };
+                                    ui.label(RichText::new(s).color(col).small());
+                                }
+                            }
+                        });
+                    });
+            });
+    }
+
+    /// The Settings view (Phase 4): an editable form over the on-disk config,
+    /// grouped into collapsible sections + a Save (PUT /v1/config). Sections are
+    /// tagged live / reload / restart per the hot-apply semantics (mirrors
+    /// Settings.tsx); the form round-trips the whole config so unmodeled
+    /// sections survive a save. Profiles apply sparse overrides; Hardware is
+    /// read-only.
+    //
+    // DEFERRED (TODOs): the LAN-access QR panel (needs a QR renderer), the
+    // audit-log tail panel, the crash-logs panel, and the chat-template live
+    // preview. The client methods exist (`lan_info` / `audit_log_tail` /
+    // `crash_logs` / `template_preview`) but those panels are omitted here.
+    fn render_settings(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        // Read-only display data cloned up front; the form below takes
+        // `&mut self.settings_draft`, and the profile picker edits a local
+        // (written back after the panel) — both keep the closure aliasing-free.
+        let caps = self.capabilities.clone();
+        let metrics = self.metrics.clone();
+        let config_path = self.settings_config_path.clone();
+        let profiles = self.settings_profiles.clone();
+        let error = self.settings_error.clone();
+        let status = self.settings_status.clone();
+        let saving = self.settings_saving;
+        let loading = self.settings_loading;
+        let orig = self.settings_orig.clone();
+        let has_draft = self.settings_draft.is_some();
+        let mut profile_sel = self.settings_profile_sel.clone();
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(BG).inner_margin(Margin::same(16.0)))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Settings").heading().color(TEXT));
+                            ui.add_space(6.0);
+                            // Re-read the on-disk config (e.g. after editing
+                            // config.toml by hand). Discards unsaved form edits.
+                            if ui
+                                .add_enabled(!saving, egui::Button::new("Reload"))
+                                .on_hover_text("Re-read config.toml from disk (discards unsaved edits)")
+                                .clicked()
+                            {
+                                actions.push(Action::ReloadSettings);
+                            }
+                        });
+                        ui.label(
+                            RichText::new(format!(
+                                "Edits write to {}.  live = hot-applied · reload = reload the \
+                                 model (Models → Load) · restart = restart rustllama.",
+                                if config_path.is_empty() {
+                                    "config.toml"
+                                } else {
+                                    config_path.as_str()
+                                }
+                            ))
+                            .color(MUTED)
+                            .small(),
+                        );
+                        ui.add_space(10.0);
+
+                        if let Some(e) = &error {
+                            error_banner(ui, &format!("error loading config: {e}"));
+                            ui.add_space(8.0);
+                        }
+                        if let Some((is_err, msg)) = &status {
+                            let col = if *is_err { DANGER } else { HEALTH_OK };
+                            egui::Frame::none()
+                                .fill(col.gamma_multiply(0.12))
+                                .rounding(Rounding::same(8.0))
+                                .stroke(Stroke::new(1.0, col))
+                                .inner_margin(Margin::same(10.0))
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new(msg).color(col).small());
+                                });
+                            ui.add_space(8.0);
+                        }
+
+                        if loading && !has_draft {
+                            ui.label(RichText::new("loading config…").color(MUTED));
+                            return;
+                        }
+
+                        // Profiles (sparse overrides) — a local &mut so it stays
+                        // disjoint from the draft borrow below.
+                        settings_profiles_section(
+                            ui,
+                            &profiles,
+                            &mut profile_sel,
+                            // dirty gate computed against the draft below; pass a
+                            // conservative value here then refine via the button.
+                            self.settings_draft.as_ref() != orig.as_ref(),
+                            saving,
+                            actions,
+                        );
+
+                        if let Some(draft) = self.settings_draft.as_mut() {
+                            let dirty = orig.as_ref().map_or(false, |o| *draft != *o);
+
+                            collapsing_section(ui, "Server", "restart", |ui| {
+                                form_text(ui, "Bind address",
+                                    "127.0.0.1 = localhost only · 0.0.0.0 = LAN",
+                                    &mut draft.bind_addr);
+                                form_text(ui, "Port", "default 11434", &mut draft.port);
+                                form_text(ui, "API key",
+                                    "Empty = no auth. Sent as `Authorization: Bearer <key>`.",
+                                    &mut draft.api_key);
+                                form_num(ui, "Max loaded models",
+                                    "Warm pool cap (LRU evicts non-default models).",
+                                    &mut draft.max_loaded_models, 1.0..=64.0);
+                                form_text(ui, "CORS origins",
+                                    "Comma-separated. Empty = none. `*` allows any origin.",
+                                    &mut draft.cors_origins);
+                            });
+
+                            collapsing_section(ui, "Model", "reload", |ui| {
+                                form_text(ui, "GGUF path",
+                                    "Absolute path. Mutually exclusive with the hub ref.",
+                                    &mut draft.model_path);
+                                form_text(ui, "Hub ref",
+                                    "owner/repo:filename.gguf — resolved from the local cache.",
+                                    &mut draft.model_hub);
+                                form_text(ui, "Chat template",
+                                    "auto = read from the GGUF · chatml / llama3 / inline Jinja.",
+                                    &mut draft.chat_template);
+                            });
+
+                            collapsing_section(ui, "Inference", "reload", |ui| {
+                                form_num(ui, "Context size",
+                                    "Max tokens (prompt + completion) per request.",
+                                    &mut draft.ctx_size, 512.0..=1_048_576.0);
+                                form_num(ui, "Batch size",
+                                    "Prefill chunk. Larger = faster but more RAM per chunk.",
+                                    &mut draft.batch_size, 1.0..=65_536.0);
+                                form_num(ui, "Threads", "0 = auto (physical cores).",
+                                    &mut draft.threads, 0.0..=256.0);
+                                form_combo(ui, "kv_dtype_combo", "KV dtype (both K and V)",
+                                    "Default for both K and V; override per-channel below to split.",
+                                    &mut draft.kv_dtype, &KV_DTYPES);
+                                form_combo(ui, "k_dtype_combo", "K dtype (override)",
+                                    "Empty = use KV dtype.",
+                                    &mut draft.k_dtype, &KV_DTYPES_OPT);
+                                form_combo(ui, "v_dtype_combo", "V dtype (override)",
+                                    "Empty = use KV dtype. V is more precision-sensitive than K.",
+                                    &mut draft.v_dtype, &KV_DTYPES_OPT);
+                                form_bool(ui, "Flash attention",
+                                    "Fused softmax-attention (no-op until SYCL dispatch wires up).",
+                                    &mut draft.flash_attention);
+                                form_bool(ui, "Speculative decoding (n-gram)",
+                                    "Prompt-lookup drafting + one batched verify per round. No \
+                                     second model, zero RAM.",
+                                    &mut draft.speculative_ngram);
+                                form_bool(ui, "Prefix cache",
+                                    "Reuse KV for shared prompt prefixes (big speedup for chat / \
+                                     coding flows).",
+                                    &mut draft.prefix_cache);
+                                form_bool(ui, "Keep quant raw",
+                                    "Skip dequant-to-F16 on small tensors. Saves 1-3 GB on a \
+                                     7B-24B model; recommended on ≤16 GB hosts.",
+                                    &mut draft.keep_quant_raw);
+                            });
+
+                            collapsing_section(ui, "UI", "live", |ui| {
+                                form_combo(ui, "theme_combo", "Theme",
+                                    "`system` follows the OS dark/light setting.",
+                                    &mut draft.theme, &THEMES);
+                                form_num(ui, "Font size", "", &mut draft.font_size, 8.0..=32.0);
+                                form_text(ui, "Code theme",
+                                    "Syntax-highlight palette name for assistant code blocks.",
+                                    &mut draft.code_theme);
+                            });
+
+                            // Save bar.
+                            ui.add_space(12.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        dirty && !saving,
+                                        egui::Button::new(RichText::new("Save changes").color(TEXT))
+                                            .fill(ACCENT),
+                                    )
+                                    .clicked()
+                                {
+                                    actions.push(Action::SaveSettings);
+                                }
+                                if ui
+                                    .add_enabled(dirty && !saving, egui::Button::new("Discard"))
+                                    .clicked()
+                                {
+                                    actions.push(Action::ResetSettings);
+                                }
+                                if saving {
+                                    ui.spinner();
+                                    ui.label(RichText::new("saving…").color(MUTED).small());
+                                } else if !dirty {
+                                    ui.label(
+                                        RichText::new("no unsaved changes").color(MUTED).small(),
+                                    );
+                                }
+                            });
+                        }
+
+                        // Hardware (read-only) — a summary of the compute
+                        // backends the server sees.
+                        ui.add_space(12.0);
+                        collapsing_section_ro(ui, "Hardware", |ui| {
+                            let sycl = caps
+                                .as_ref()
+                                .map(|c| c.backends.sycl.device_count)
+                                .unwrap_or(0);
+                            kv_row(
+                                ui,
+                                "SYCL devices",
+                                &if sycl > 0 {
+                                    format!("{sycl} (oneAPI detected)")
+                                } else {
+                                    "0 (no Intel GPU / oneAPI runtime)".into()
+                                },
+                            );
+                            if let Some(c) = &caps {
+                                if let Some(cuda) = &c.backends.cuda {
+                                    kv_row(
+                                        ui,
+                                        "CUDA devices",
+                                        &format!(
+                                            "{} ({} kernel-ready)",
+                                            cuda.device_count, cuda.compute_ready
+                                        ),
+                                    );
+                                }
+                                let simd = if c.backends.cpu.simd_features.is_empty() {
+                                    "scalar (non-x86)".to_string()
+                                } else {
+                                    c.backends.cpu.simd_features.join(", ")
+                                };
+                                kv_row(ui, "CPU SIMD", &simd);
+                            }
+                            if let Some(m) = &metrics {
+                                if let Some(gpus) = &m.gpus {
+                                    for g in gpus {
+                                        kv_row(ui, &format!("GPU {}", g.index), &g.name);
+                                    }
+                                }
+                            }
+                        });
+                        ui.add_space(60.0);
+                    });
+            });
+
+        // Write the profile picker's edit back to state.
+        self.settings_profile_sel = profile_sel;
+    }
 }
 
 // --- free helpers ---------------------------------------------------------
@@ -3043,6 +4211,34 @@ fn draw_nav_icon(painter: &egui::Painter, rect: Rect, icon: NavIcon, color: Colo
             painter.line_segment([egui::pos2(c.x + w, c.y - h * 0.5), c], s);
             painter.line_segment([c, egui::pos2(c.x, c.y + h)], s);
         }
+        NavIcon::Status => {
+            // A three-bar mini bar-chart (dashboard vibe).
+            let base = rect.max.y - 1.0;
+            let heights = [0.45f32, 0.85, 0.62];
+            let n = heights.len();
+            let slot = rect.width() / (n as f32);
+            for (i, h) in heights.iter().enumerate() {
+                let x = rect.left() + slot * (i as f32) + slot * 0.5;
+                let top = base - rect.height() * h;
+                painter.line_segment([egui::pos2(x, base), egui::pos2(x, top)], s);
+            }
+            painter.line_segment(
+                [egui::pos2(rect.left(), base), egui::pos2(rect.right(), base)],
+                s,
+            );
+        }
+        NavIcon::Settings => {
+            // A gear approximation: a ring + four radial ticks.
+            let c = rect.center();
+            let r = rect.width() * 0.28;
+            painter.circle_stroke(c, r, s);
+            let tick = rect.width() * 0.16;
+            for (dx, dy) in [(0.0, -1.0), (0.0, 1.0), (-1.0, 0.0), (1.0, 0.0)] {
+                let a = egui::pos2(c.x + dx * r, c.y + dy * r);
+                let b = egui::pos2(c.x + dx * (r + tick), c.y + dy * (r + tick));
+                painter.line_segment([a, b], s);
+            }
+        }
         NavIcon::Placeholder => {
             painter.rect_stroke(rect.shrink(2.0), Rounding::same(3.0), s);
         }
@@ -3078,6 +4274,608 @@ fn display_name(name: &str) -> &str {
     name.strip_suffix(".gguf")
         .or_else(|| name.strip_suffix(".GGUF"))
         .unwrap_or(name)
+}
+
+// --- Phase-4 Status / Settings helpers ------------------------------------
+
+/// The KV-dtype option lists (mirror Settings.tsx). `_OPT` prepends `""`
+/// (rendered "— inherit —") for the optional per-channel K/V overrides.
+const KV_DTYPES: [&str; 8] = ["f32", "q8_0", "q4_0", "tq1", "tq2", "tq4", "tq8", "nvfp4"];
+const KV_DTYPES_OPT: [&str; 9] = [
+    "", "f32", "q8_0", "q4_0", "tq1", "tq2", "tq4", "tq8", "nvfp4",
+];
+/// UI theme options.
+const THEMES: [&str; 3] = ["system", "dark", "light"];
+
+/// Push `v` onto a sparkline ring buffer, evicting the oldest sample once it
+/// exceeds `METRICS_WINDOW`. `VecDeque` keeps both ends O(1), so the buffer
+/// never grows past the window regardless of how long a session runs.
+fn push_capped(buf: &mut VecDeque<f64>, v: f64) {
+    buf.push_back(v);
+    while buf.len() > METRICS_WINDOW {
+        buf.pop_front();
+    }
+}
+
+/// Read a boolean field off a JSON object (the `set_config` / `apply_profile`
+/// change report), defaulting to false.
+fn flag(v: &serde_json::Value, key: &str) -> bool {
+    v.get(key).and_then(|b| b.as_bool()).unwrap_or(false)
+}
+
+/// Human-readable server uptime (mirrors Status.tsx `formatUptime`).
+fn fmt_uptime(s: u64) -> String {
+    if s < 60 {
+        return format!("{s}s");
+    }
+    let m = s / 60;
+    if m < 60 {
+        return format!("{}m {}s", m, s % 60);
+    }
+    let h = m / 60;
+    format!("{}h {}m", h, m % 60)
+}
+
+/// GPU vendor → dispatch-backend badge (Intel/AMD ⇒ SYCL, NVIDIA ⇒ CUDA).
+fn gpu_badge(vendor: &str) -> &'static str {
+    match vendor {
+        "nvidia" => "CUDA",
+        "intel" | "amd" | "gpu" => "SYCL",
+        _ => "GPU",
+    }
+}
+
+// --- config <-> draft round-trip ------------------------------------------
+
+/// Read a string field `config[section][key]`, treating a missing value or
+/// JSON null as `default` (so a null `model.path` reads as "").
+fn cfg_str(cfg: &serde_json::Value, section: &str, key: &str, default: &str) -> String {
+    cfg.get(section)
+        .and_then(|s| s.get(key))
+        .and_then(|v| v.as_str())
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn cfg_u64(cfg: &serde_json::Value, section: &str, key: &str, default: u64) -> u64 {
+    cfg.get(section)
+        .and_then(|s| s.get(key))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(default)
+}
+
+fn cfg_bool(cfg: &serde_json::Value, section: &str, key: &str, default: bool) -> bool {
+    cfg.get(section)
+        .and_then(|s| s.get(key))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(default)
+}
+
+/// Extract the editable form fields from a loaded config object. Defaults
+/// mirror the server-side config defaults so a slim config still populates a
+/// sensible form.
+fn draft_from_config(cfg: &serde_json::Value) -> SettingsDraft {
+    let cors = cfg
+        .get("server")
+        .and_then(|s| s.get("cors_origins"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    SettingsDraft {
+        bind_addr: cfg_str(cfg, "server", "bind_addr", "127.0.0.1"),
+        port: cfg_u64(cfg, "server", "port", 11434).to_string(),
+        api_key: cfg_str(cfg, "server", "api_key", ""),
+        max_loaded_models: cfg_u64(cfg, "server", "max_loaded_models", 1) as u32,
+        cors_origins: cors,
+        model_path: cfg_str(cfg, "model", "path", ""),
+        model_hub: cfg_str(cfg, "model", "hub", ""),
+        chat_template: cfg_str(cfg, "model", "chat_template", "auto"),
+        ctx_size: cfg_u64(cfg, "inference", "ctx_size", 8192),
+        batch_size: cfg_u64(cfg, "inference", "batch_size", 512) as u32,
+        threads: cfg_u64(cfg, "inference", "threads", 0) as u32,
+        kv_dtype: cfg_str(cfg, "inference", "kv_dtype", "f32"),
+        k_dtype: cfg_str(cfg, "inference", "k_dtype", ""),
+        v_dtype: cfg_str(cfg, "inference", "v_dtype", ""),
+        flash_attention: cfg_bool(cfg, "inference", "flash_attention", false),
+        speculative_ngram: cfg_bool(cfg, "inference", "speculative_ngram", false),
+        prefix_cache: cfg_bool(cfg, "inference", "prefix_cache", false),
+        keep_quant_raw: cfg_bool(cfg, "inference", "keep_quant_raw", false),
+        theme: cfg_str(cfg, "ui", "theme", "system"),
+        font_size: cfg_u64(cfg, "ui", "font_size", 14) as u32,
+        code_theme: cfg_str(cfg, "ui", "code_theme", ""),
+    }
+}
+
+/// Write the edited form fields back over a config object, in place, leaving
+/// every unmodeled key untouched. An empty path/hub/K/V override is written as
+/// JSON null (matching how Settings.tsx clears those optional fields). The
+/// `port` field parses to a u16; a mid-edit unparseable value is left as-is on
+/// disk rather than clobbered to 0.
+fn apply_draft_to_config(cfg: &mut serde_json::Value, d: &SettingsDraft) {
+    use serde_json::Value;
+    let str_or_null = |s: &str| {
+        if s.trim().is_empty() {
+            Value::Null
+        } else {
+            Value::String(s.trim().to_string())
+        }
+    };
+    let cors: Vec<Value> = d
+        .cors_origins
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| Value::String(s.to_string()))
+        .collect();
+
+    set_path(cfg, "server", "bind_addr", Value::String(d.bind_addr.clone()));
+    if let Ok(p) = d.port.trim().parse::<u16>() {
+        set_path(cfg, "server", "port", Value::from(p));
+    }
+    set_path(cfg, "server", "api_key", Value::String(d.api_key.clone()));
+    set_path(
+        cfg,
+        "server",
+        "max_loaded_models",
+        Value::from(d.max_loaded_models),
+    );
+    set_path(cfg, "server", "cors_origins", Value::Array(cors));
+
+    set_path(cfg, "model", "path", str_or_null(&d.model_path));
+    set_path(cfg, "model", "hub", str_or_null(&d.model_hub));
+    set_path(
+        cfg,
+        "model",
+        "chat_template",
+        Value::String(d.chat_template.clone()),
+    );
+
+    set_path(cfg, "inference", "ctx_size", Value::from(d.ctx_size));
+    set_path(cfg, "inference", "batch_size", Value::from(d.batch_size));
+    set_path(cfg, "inference", "threads", Value::from(d.threads));
+    set_path(
+        cfg,
+        "inference",
+        "kv_dtype",
+        Value::String(d.kv_dtype.clone()),
+    );
+    set_path(cfg, "inference", "k_dtype", str_or_null(&d.k_dtype));
+    set_path(cfg, "inference", "v_dtype", str_or_null(&d.v_dtype));
+    set_path(
+        cfg,
+        "inference",
+        "flash_attention",
+        Value::Bool(d.flash_attention),
+    );
+    set_path(
+        cfg,
+        "inference",
+        "speculative_ngram",
+        Value::Bool(d.speculative_ngram),
+    );
+    set_path(
+        cfg,
+        "inference",
+        "prefix_cache",
+        Value::Bool(d.prefix_cache),
+    );
+    set_path(
+        cfg,
+        "inference",
+        "keep_quant_raw",
+        Value::Bool(d.keep_quant_raw),
+    );
+
+    set_path(cfg, "ui", "theme", Value::String(d.theme.clone()));
+    set_path(cfg, "ui", "font_size", Value::from(d.font_size));
+    set_path(cfg, "ui", "code_theme", Value::String(d.code_theme.clone()));
+}
+
+/// Set `cfg[section][key] = val`, creating the section object if the config (or
+/// that section) isn't an object yet.
+fn set_path(cfg: &mut serde_json::Value, section: &str, key: &str, val: serde_json::Value) {
+    if !cfg.is_object() {
+        *cfg = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let obj = cfg.as_object_mut().expect("config is an object");
+    let sec = obj
+        .entry(section.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !sec.is_object() {
+        *sec = serde_json::Value::Object(serde_json::Map::new());
+    }
+    sec.as_object_mut()
+        .expect("section is an object")
+        .insert(key.to_string(), val);
+}
+
+// --- Status-view widgets --------------------------------------------------
+
+/// A left-labelled key/value row for the Status cards.
+fn kv_row(ui: &mut egui::Ui, k: &str, v: &str) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(170.0, 16.0), Sense::hover());
+        ui.painter().text(
+            rect.left_center(),
+            Align2::LEFT_CENTER,
+            k,
+            FontId::proportional(12.0),
+            MUTED,
+        );
+        ui.label(RichText::new(v).color(TEXT).small());
+    });
+}
+
+/// A tuner-winner row: label + value + an auto-applied / stored pill, or "—"
+/// when the sweep hasn't produced a winner.
+fn winner_row(ui: &mut egui::Ui, label: &str, value: Option<String>, auto_applied: bool) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(170.0, 16.0), Sense::hover());
+        ui.painter().text(
+            rect.left_center(),
+            Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(12.0),
+            MUTED,
+        );
+        match value {
+            Some(v) => {
+                ui.label(RichText::new(v).color(TEXT).small());
+                if auto_applied {
+                    pill(ui, "auto-applied", HEALTH_OK);
+                } else {
+                    pill(ui, "stored", MUTED);
+                }
+            }
+            None => {
+                ui.label(RichText::new("—").color(MUTED).small());
+            }
+        }
+    });
+}
+
+/// The compute-backend panel body (CPU / SYCL / CUDA tiers), from
+/// `/v1/capabilities`.
+fn render_backends(ui: &mut egui::Ui, b: &rustllama_client::Backends) {
+    // CPU — always the active fallback tier.
+    ui.label(RichText::new("CPU").color(MUTED).small());
+    ui.label(RichText::new("active").color(HEALTH_OK).strong());
+    let simd = if b.cpu.simd_features.is_empty() {
+        "scalar (non-x86)".to_string()
+    } else {
+        format!("SIMD: {}", b.cpu.simd_features.join(", "))
+    };
+    ui.label(RichText::new(simd).color(MUTED).small());
+    ui.label(
+        RichText::new(format!(
+            "rayon matvec: {}",
+            if b.cpu.parallel_matvec { "on (M≥256)" } else { "off" }
+        ))
+        .color(MUTED)
+        .small(),
+    );
+
+    // SYCL.
+    ui.add_space(8.0);
+    ui.label(RichText::new("SYCL (GPU)").color(MUTED).small());
+    if b.sycl.available {
+        ui.label(
+            RichText::new(b.sycl.backend.clone().unwrap_or_else(|| "active".into()))
+                .color(HEALTH_OK)
+                .strong(),
+        );
+        ui.label(
+            RichText::new(format!(
+                "devices: {} · preference: {}",
+                b.sycl.device_count, b.sycl.preference
+            ))
+            .color(MUTED)
+            .small(),
+        );
+        if b.sycl.l0_import_eligible {
+            ui.label(
+                RichText::new("L0 USM import fast-path eligible")
+                    .color(HEALTH_OK)
+                    .small(),
+            );
+        }
+    } else {
+        ui.label(RichText::new("unavailable").color(MUTED).strong());
+        ui.label(RichText::new("no SYCL GPU visible").color(MUTED).small());
+    }
+
+    // CUDA.
+    ui.add_space(8.0);
+    ui.label(RichText::new("CUDA (GPU)").color(MUTED).small());
+    match &b.cuda {
+        Some(c) if c.available => {
+            ui.label(RichText::new("active").color(HEALTH_OK).strong());
+            ui.label(
+                RichText::new(format!(
+                    "{}/{} kernel-ready · driver {}",
+                    c.compute_ready,
+                    c.device_count,
+                    c.driver.clone().unwrap_or_else(|| "n/a".into())
+                ))
+                .color(MUTED)
+                .small(),
+            );
+        }
+        _ => {
+            ui.label(RichText::new("unavailable").color(MUTED).strong());
+            ui.label(RichText::new("no NVIDIA GPU visible").color(MUTED).small());
+        }
+    }
+}
+
+/// One compute-inventory row: backend badge + label/name on the left, a memory
+/// meter + utilization on the right. Every numeric is optional (renders "n/a").
+fn inventory_row(
+    ui: &mut egui::Ui,
+    badge: &str,
+    label: &str,
+    name: &str,
+    used: Option<u64>,
+    total: Option<u64>,
+    util: Option<f64>,
+) {
+    egui::Frame::none()
+        .fill(ELEVATED2)
+        .rounding(Rounding::same(8.0))
+        .stroke(Stroke::new(1.0, BORDER))
+        .inner_margin(Margin::symmetric(12.0, 8.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        pill(ui, badge, ACCENT);
+                        ui.label(RichText::new(label).strong().color(TEXT).small());
+                    });
+                    ui.label(RichText::new(name).color(MUTED).small());
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let util_txt = util
+                        .map(|u| format!("{u:.0}%"))
+                        .unwrap_or_else(|| "n/a".into());
+                    ui.label(RichText::new(util_txt).color(TEXT).small());
+                    ui.label(RichText::new("util").color(MUTED).small());
+                    if let Some(t) = total {
+                        ui.add_space(10.0);
+                        let mem_txt = match used {
+                            Some(u) => format!("{} / {}", fmt_gib(u), fmt_gib(t)),
+                            None => format!("{} total", fmt_gib(t)),
+                        };
+                        ui.label(RichText::new(mem_txt).color(TEXT).small());
+                        let frac = used.map(|u| u as f32 / t as f32).unwrap_or(0.0);
+                        thin_meter(ui, frac, 80.0);
+                    }
+                });
+            });
+        });
+    ui.add_space(6.0);
+}
+
+/// A small egui_plot line sparkline for a Status live-metrics tile: `label` +
+/// the current `value` over a compact filled line chart of the ring-buffer
+/// series. `y_max` pins the ceiling for a capped series (ctx_size, max_pending);
+/// `None` auto-scales to the series' own peak. Panning / zooming are disabled —
+/// it's a read-only glance widget.
+fn sparkline(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    value: &str,
+    series: &VecDeque<f64>,
+    color: Color32,
+    y_max: Option<f64>,
+) {
+    ui.allocate_ui(egui::vec2(184.0, 88.0), |ui| {
+        ui.vertical(|ui| {
+            ui.label(RichText::new(label).color(MUTED).small());
+            ui.label(RichText::new(value).color(TEXT).heading());
+            let points: Vec<[f64; 2]> = series
+                .iter()
+                .enumerate()
+                .map(|(i, &y)| [i as f64, y])
+                .collect();
+            let line = egui_plot::Line::new(points).color(color).width(1.5).fill(0.0);
+            let mut plot = egui_plot::Plot::new(id.to_string())
+                .height(40.0)
+                .width(180.0)
+                .show_axes([false, false])
+                .show_grid([false, false])
+                .show_x(false)
+                .show_y(false)
+                .allow_zoom(false)
+                .allow_drag(false)
+                .allow_scroll(false)
+                .allow_boxed_zoom(false)
+                .include_y(0.0);
+            if let Some(m) = y_max {
+                plot = plot.include_y(m.max(1.0));
+            }
+            plot.show(ui, |pui| pui.line(line));
+        });
+    });
+}
+
+// --- Settings-view widgets ------------------------------------------------
+
+/// A live / reload / restart section badge (color-coded like Settings.tsx).
+fn section_badge(ui: &mut egui::Ui, kind: &str) {
+    let color = match kind {
+        "live" => HEALTH_OK,
+        "reload" => ACCENT,
+        "restart" => WARN,
+        _ => MUTED,
+    };
+    pill(ui, kind, color);
+}
+
+/// A collapsible Settings section (default-open), its hot-apply `tag` shown as
+/// a badge at the top of the body.
+fn collapsing_section(
+    ui: &mut egui::Ui,
+    title: &str,
+    tag: &str,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    egui::CollapsingHeader::new(RichText::new(title).strong().color(TEXT))
+        .id_salt(("settings_sec", title))
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                section_badge(ui, tag);
+            });
+            add(ui);
+        });
+    ui.add_space(6.0);
+}
+
+/// A collapsible read-only Settings section (no hot-apply badge).
+fn collapsing_section_ro(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    egui::CollapsingHeader::new(RichText::new(title).strong().color(TEXT))
+        .id_salt(("settings_sec_ro", title))
+        .default_open(true)
+        .show(ui, |ui| add(ui));
+    ui.add_space(6.0);
+}
+
+/// A labelled single-line text field (with an optional hint line).
+fn form_text(ui: &mut egui::Ui, label: &str, hint: &str, value: &mut String) {
+    ui.add_space(6.0);
+    ui.label(RichText::new(label).color(TEXT).small().strong());
+    ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
+    if !hint.is_empty() {
+        ui.label(RichText::new(hint).color(DISABLED).small());
+    }
+}
+
+/// A labelled numeric drag field, clamped to `range` (the range is f64 so a
+/// single helper serves both the u32 and u64 fields).
+fn form_num<N: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    label: &str,
+    hint: &str,
+    value: &mut N,
+    range: std::ops::RangeInclusive<f64>,
+) {
+    ui.add_space(6.0);
+    ui.label(RichText::new(label).color(TEXT).small().strong());
+    ui.add(egui::DragValue::new(value).range(range));
+    if !hint.is_empty() {
+        ui.label(RichText::new(hint).color(DISABLED).small());
+    }
+}
+
+/// A labelled checkbox field.
+fn form_bool(ui: &mut egui::Ui, label: &str, hint: &str, value: &mut bool) {
+    ui.add_space(6.0);
+    ui.checkbox(value, RichText::new(label).color(TEXT).small());
+    if !hint.is_empty() {
+        ui.label(RichText::new(hint).color(DISABLED).small());
+    }
+}
+
+/// A labelled dropdown over `options`; the empty option renders "— inherit —"
+/// (used by the optional per-channel K/V dtype overrides).
+fn form_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    hint: &str,
+    value: &mut String,
+    options: &[&str],
+) {
+    ui.add_space(6.0);
+    ui.label(RichText::new(label).color(TEXT).small().strong());
+    egui::ComboBox::from_id_salt(id)
+        .width(220.0)
+        .selected_text(if value.is_empty() {
+            "— inherit —".to_string()
+        } else {
+            value.clone()
+        })
+        .show_ui(ui, |ui| {
+            for opt in options {
+                let disp = if opt.is_empty() { "— inherit —" } else { opt };
+                ui.selectable_value(value, opt.to_string(), disp);
+            }
+        });
+    if !hint.is_empty() {
+        ui.label(RichText::new(hint).color(DISABLED).small());
+    }
+}
+
+/// The Profiles section: a picker + Apply. Applying merges the chosen profile's
+/// SPARSE overrides on the server; blocked while the form has unsaved edits
+/// (the merge would otherwise discard them).
+fn settings_profiles_section(
+    ui: &mut egui::Ui,
+    profiles: &[String],
+    selected: &mut String,
+    dirty: bool,
+    saving: bool,
+    actions: &mut Vec<Action>,
+) {
+    egui::CollapsingHeader::new(RichText::new("Profiles").strong().color(TEXT))
+        .id_salt(("settings_sec", "Profiles"))
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(
+                    "Quick-switch between named [[profiles]] in config.toml. Applying merges the \
+                     profile's SPARSE overrides into the on-disk config — only the sections it \
+                     defines change.",
+                )
+                .color(MUTED)
+                .small(),
+            );
+            ui.add_space(6.0);
+            if profiles.is_empty() {
+                ui.label(
+                    RichText::new("No profiles defined. Add [[profiles]] blocks to config.toml.")
+                        .color(MUTED)
+                        .small(),
+                );
+            } else {
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("profile_combo")
+                        .width(220.0)
+                        .selected_text(if selected.is_empty() {
+                            "— select —".to_string()
+                        } else {
+                            selected.clone()
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(selected, String::new(), "— select —");
+                            for p in profiles {
+                                ui.selectable_value(selected, p.clone(), p.as_str());
+                            }
+                        });
+                    let can = !selected.is_empty() && !dirty && !saving;
+                    if ui
+                        .add_enabled(can, egui::Button::new("Apply profile"))
+                        .clicked()
+                    {
+                        actions.push(Action::ApplyProfile(selected.clone()));
+                    }
+                });
+                if dirty {
+                    ui.label(
+                        RichText::new("Discard or save your current edits before applying a profile.")
+                            .color(WARN)
+                            .small(),
+                    );
+                }
+            }
+        });
+    ui.add_space(6.0);
 }
 
 /// Install the dark visuals once at startup. Called from [`GuiApp::new`].

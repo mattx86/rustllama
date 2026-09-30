@@ -20,6 +20,10 @@ eframe = { version = "0.29", default-features = false, features = ["default_font
 egui = "0.29"
 egui_extras = { version = "0.29", features = ["syntect"] }
 egui_commonmark = "0.18"
+# Live sparkline charts on the Status view (tok/s, ctx-used, pending). Pinned to
+# the same 0.29 minor as the rest of the egui family — a mismatch is a hard type
+# error at the Plot/Ui boundary.
+egui_plot = "0.29"
 
 # Native OS file dialog (the Models view's "Load from file…" GGUF picker).
 # Pure-Rust/platform-native, no toolchain deps — keeps the crate toolchain-free.
