@@ -42,24 +42,35 @@ fn main() {
     // Real-only crate: on x86_64 the SYCL backend is ALWAYS compiled from
     // the real C++ TU (requires Intel oneAPI `icx`/`icpx` on PATH).
     //
-    // Intel oneAPI / SYCL is **x86_64-only** — it does not exist for
-    // aarch64 (or any non-x86 arch). On those targets (e.g. an NVIDIA
-    // Grace / DGX Spark ARM box) we instead build a tiny no-op C stub
-    // that satisfies the `rsl_*` FFI symbols so the crate LINKS, with
-    // `rsl_sycl_device_count()` returning 0 at runtime → the engine sees
-    // no SYCL device and runs on CPU + the native CUDA backend. The Rust
-    // `imp` module is pure FFI (extern decls + safe wrappers) and
-    // compiles unchanged on any architecture. Runtime selection of SYCL
-    // vs CUDA vs CPU happens in the engine's startup device detection.
+    // Intel oneAPI / SYCL is **x86_64-only** and **never existed on macOS**
+    // (no icx/icpx for Apple, any arch). So on any non-x86 target (e.g. an
+    // NVIDIA Grace / DGX Spark ARM box) AND on every Mac we instead build a
+    // tiny no-op C stub that satisfies the `rsl_*` FFI symbols so the crate
+    // LINKS, with `rsl_sycl_device_count()` returning 0 at runtime → the
+    // engine sees no SYCL device and runs on CPU + whatever native GPU
+    // backend the host has (CUDA on Linux/aarch64, MLX/Metal on Apple
+    // Silicon). The Rust `imp` module is pure FFI (extern decls + safe
+    // wrappers) and compiles unchanged on any architecture. Runtime
+    // selection of SYCL vs CUDA vs MLX vs CPU happens in the engine's
+    // startup device detection.
     let out_path = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
 
     println!("cargo:rerun-if-changed=cpp/rsl_kernels.def");
     println!("cargo:rerun-if-changed=build.rs");
 
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    if target_arch != "x86_64" {
-        // Non-x86 (aarch64, …): SYCL/oneAPI is unavailable. Stub it.
-        build_sycl_stub(&out_path);
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    // Stub the SYCL backend wherever Intel oneAPI cannot exist:
+    //   * non-x86_64 (aarch64, …): oneAPI/SYCL is an x86_64-only toolchain.
+    //   * macOS on ANY arch: Intel never shipped icx/icpx for macOS, and an
+    //     Intel Mac (x86_64) therefore has no SYCL compiler either. Real
+    //     compute on a Mac is CPU + the MLX/Metal backend (Apple Silicon);
+    //     SYCL is always inert there. Gating macOS here keeps the real
+    //     icx/icpx path exclusively on x86_64 Windows/Linux — the platforms
+    //     the parent build-verifies — so those builds are byte-for-byte
+    //     unchanged (the macOS branch is unreachable unless TARGET_OS==macos).
+    if target_arch != "x86_64" || target_os == "macos" {
+        build_sycl_stub(&out_path, &target_os, &target_arch);
         return;
     }
 
@@ -81,8 +92,8 @@ fn main() {
     // compiler as its own linker (see module docs — the DLL/.so route is
     // required so SYCL's device-image registration survives). Windows
     // uses `icx` (MSVC-style driver → `.dll` + import lib); Linux uses
-    // `icpx` (GCC-style driver → `.so`).
-    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    // `icpx` (GCC-style driver → `.so`). (`target_os` computed above; this
+    // point is only reached on x86_64 non-macOS, i.e. Windows or Linux.)
     if target_os == "windows" {
         build_windows(&out_path);
     } else {
@@ -95,11 +106,15 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CMPLR_ROOT");
 }
 
-/// Non-x86 targets: build a no-op C stub that provides every `rsl_*`
-/// FFI symbol the Rust crate references, so it links without Intel
-/// oneAPI (which is x86_64-only). At runtime `rsl_sycl_device_count()`
-/// returns 0 → no SYCL device → CPU + CUDA path. The symbol list is
-/// read from `cpp/rsl_kernels.def` (the authoritative export set).
+/// Stub targets (non-x86_64, OR macOS on any arch): build a no-op C stub
+/// that provides every `rsl_*` FFI symbol the Rust crate references, so it
+/// links without Intel oneAPI. oneAPI/SYCL is x86_64-only AND has never
+/// existed on macOS (no icx/icpx for Apple), so both the aarch64 hosts
+/// (NVIDIA Grace / DGX Spark) and every Mac (Apple Silicon or Intel) take
+/// this path. At runtime `rsl_sycl_device_count()` returns 0 → no SYCL
+/// device → the engine runs on CPU + (per host) the native CUDA or MLX/Metal
+/// backend. The symbol list is read from `cpp/rsl_kernels.def` (the
+/// authoritative export set).
 ///
 /// Each symbol is defined as `long long name() { return 0; }`: empty
 /// parens accept any caller ABI, and a 0 integer/pointer return is
@@ -107,7 +122,13 @@ fn main() {
 /// reports zero devices (the device/stream probes — integer + pointer
 /// returns). The kernel entry points are never called when there is no
 /// device; they only need to resolve at link time.
-fn build_sycl_stub(out_path: &std::path::Path) {
+///
+/// The stub is emitted as a shared library named exactly like the real one
+/// (`librsl_kernels.{so,dylib}`) so the crate's `dylib=rsl_kernels` link
+/// directive + the copy-beside-binary + release-bundling machinery all apply
+/// unchanged. The Mach-O vs ELF differences (see below) are the only reason
+/// this branches on `target_os`.
+fn build_sycl_stub(out_path: &std::path::Path, target_os: &str, target_arch: &str) {
     let def = std::fs::read_to_string("cpp/rsl_kernels.def")
         .expect("rustllama-kernels-sycl build.rs: read cpp/rsl_kernels.def");
     let mut names: Vec<String> = Vec::new();
@@ -133,11 +154,13 @@ fn build_sycl_stub(out_path: &std::path::Path) {
     );
 
     let mut c = String::with_capacity(16 * 1024);
-    c.push_str("/* AUTO-GENERATED by build.rs — no-SYCL stub for non-x86_64 targets.\n");
-    c.push_str(" * Intel oneAPI / SYCL is x86_64-only; on aarch64 (NVIDIA Grace /\n");
-    c.push_str(" * DGX Spark, etc.) these no-op symbols satisfy the FFI so the crate\n");
-    c.push_str(" * links. rsl_sycl_device_count() returns 0 → no SYCL device → the\n");
-    c.push_str(" * engine runs on CPU + the native CUDA backend. */\n");
+    c.push_str("/* AUTO-GENERATED by build.rs — no-SYCL stub for targets with no\n");
+    c.push_str(" * Intel oneAPI: every non-x86_64 arch (oneAPI is x86_64-only, e.g.\n");
+    c.push_str(" * an NVIDIA Grace / DGX Spark aarch64 box) AND macOS on any arch\n");
+    c.push_str(" * (Intel never shipped icx/icpx for Apple). These no-op symbols\n");
+    c.push_str(" * satisfy the FFI so the crate links; rsl_sycl_device_count()\n");
+    c.push_str(" * returns 0 → no SYCL device → the engine runs on CPU + the native\n");
+    c.push_str(" * CUDA (Linux/aarch64) or MLX/Metal (Apple Silicon) backend. */\n");
     for n in &names {
         c.push_str("long long ");
         c.push_str(n);
@@ -146,10 +169,52 @@ fn build_sycl_stub(out_path: &std::path::Path) {
     let stub_c = out_path.join("rsl_kernels_stub.c");
     std::fs::write(&stub_c, c).expect("write rsl_kernels_stub.c");
 
-    // Build a shared object named exactly like the real one so the same
-    // `dylib=rsl_kernels` link directive + `$ORIGIN` rpath + copy-beside-
-    // binary machinery apply unchanged.
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+
+    if target_os == "macos" {
+        // ---- Mach-O (macOS): emit a `.dylib`, not a `.so`. ----
+        // Apple's linker (ld64) resolves a `dylib=rsl_kernels` directive to
+        // `librsl_kernels.dylib` (or `.tbd`) and does NOT search for `.so`,
+        // so the ELF path below would fail to link. Mach-O differences vs
+        // ELF that this branch handles:
+        //   * `-dynamiclib` (not `-shared`) to produce a Mach-O dylib.
+        //   * `-install_name @rpath/librsl_kernels.dylib` so the dependent
+        //     binary records an @rpath-relative reference; the binary's
+        //     `@loader_path` rpath (added below) then resolves it beside
+        //     itself — the Mach-O analogue of ELF `$ORIGIN`. release-macos.sh
+        //     later rewrites this to `@loader_path/../lib` when it relocates
+        //     the dylib into `lib/`.
+        //   * `-arch arm64|x86_64` so a cross-arch build (`cargo build
+        //     --target {aarch64,x86_64}-apple-darwin`) compiles the stub for
+        //     the requested Mac arch, matching what rustc emits.
+        let clang_arch = macos_clang_arch(target_arch);
+        let dylib_path = out_path.join("librsl_kernels.dylib");
+        let status = Command::new(&cc)
+            .args(["-O2", "-arch", clang_arch, "-dynamiclib"])
+            .args(["-install_name", "@rpath/librsl_kernels.dylib"])
+            .arg(&stub_c)
+            .arg("-o")
+            .arg(&dylib_path)
+            .status()
+            .unwrap_or_else(|e| {
+                panic!("rustllama-kernels-sycl build.rs: failed to invoke C compiler {cc:?} for the macOS SYCL stub: {e}")
+            });
+        if !status.success() {
+            panic!("rustllama-kernels-sycl build.rs: {cc} failed to build the no-op SYCL stub .dylib");
+        }
+        println!("cargo:rustc-link-search=native={}", out_path.display());
+        println!("cargo:rustc-link-lib=dylib=rsl_kernels");
+        // Resolve `librsl_kernels.dylib` beside the executable at runtime
+        // (Apple's analogue of Linux `$ORIGIN`).
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path");
+        copy_shared_lib_next_to_binaries(out_path, "librsl_kernels.dylib");
+        return;
+    }
+
+    // ---- ELF (non-x86_64 Linux, e.g. aarch64): emit a `.so`. ----
+    // Named exactly like the real one so the same `dylib=rsl_kernels` link
+    // directive + `$ORIGIN` rpath + copy-beside-binary machinery apply
+    // unchanged.
     let so_path = out_path.join("librsl_kernels.so");
     let status = Command::new(&cc)
         .args(["-O2", "-fPIC", "-shared"])
@@ -168,6 +233,16 @@ fn build_sycl_stub(out_path: &std::path::Path) {
     println!("cargo:rustc-link-lib=dylib=rsl_kernels");
     println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
     copy_shared_lib_next_to_binaries(out_path, "librsl_kernels.so");
+}
+
+/// Map a Rust `CARGO_CFG_TARGET_ARCH` to the clang `-arch` name used on
+/// macOS: Rust says `aarch64`, Apple's clang says `arm64`; `x86_64` is
+/// spelled the same. Only meaningful on a macOS (Mach-O) target.
+fn macos_clang_arch(target_arch: &str) -> &'static str {
+    match target_arch {
+        "aarch64" => "arm64",
+        _ => "x86_64",
+    }
 }
 
 /// True if `<cmd> --version` runs and succeeds (i.e. the tool is on PATH).

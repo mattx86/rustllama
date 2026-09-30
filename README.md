@@ -82,6 +82,8 @@ bundled runtime libraries it needs, `README.md`, both `LICENSE-*` files, and
 | `rustllama-<ver>-windows-x86_64.zip` | Windows 10 / 11 | x86_64 | **GUI** + CLI + server | Intel GPU (SYCL), NVIDIA GPU (CUDA), CPU (AVX2) |
 | `rustllama-<ver>-linux-x86_64.tar.gz` | RHEL 10 / Rocky Linux 10, Ubuntu 24.04 (glibc ≥ 2.39) | x86_64 | **headless** (CLI + server) | Intel GPU (SYCL), NVIDIA GPU (CUDA), CPU (AVX2) |
 | `rustllama-<ver>-linux-aarch64.tar.gz` | Ubuntu 24.04 (NVIDIA Grace / **DGX Spark**) | aarch64 (ARMv9) | **headless** (CLI + server) | NVIDIA GPU (CUDA), CPU (NEON) |
+| `rustllama-<ver>-macos-arm64.tar.gz` | macOS (Apple Silicon: M1 and later) | arm64 (aarch64) | **GUI** + CLI + server | Apple GPU (Metal/MLX), CPU (NEON) |
+| `rustllama-<ver>-macos-x86_64.tar.gz` | macOS (Intel) | x86_64 | **GUI** + CLI + server | CPU (AVX2) |
 
 Notes:
 
@@ -93,12 +95,18 @@ Notes:
   falls back to the CPU path automatically.
 - **SYCL is x86-64 only** — the aarch64 build ships a no-op SYCL stub and runs
   on CUDA + CPU (NEON). See [docs/sycl-offload.md](docs/sycl-offload.md).
-- **GUI is Windows-only** in the release archives; the Linux archives are
-  headless (server + CLI). Run the server anywhere and point a browser-based
-  or editor client at it (see [docs/editor-integrations.md](docs/editor-integrations.md)).
+- **macOS has neither SYCL nor CUDA** — Intel oneAPI never targeted macOS and
+  NVIDIA dropped macOS CUDA ~2019, so both compile to inert stubs. Real compute
+  on a Mac is **CPU** (both arches) plus **Metal via MLX on Apple Silicon**
+  (Intel Macs are CPU-only). The macOS binary is ad-hoc code-signed (`-s -`);
+  an unsigned/ad-hoc binary may need a Gatekeeper override on first run.
+- **GUI ships on Windows and macOS**; the Linux archives are headless (server +
+  CLI). Run the server anywhere and point a browser-based or editor client at it
+  (see [docs/editor-integrations.md](docs/editor-integrations.md)).
 - Build these locally with `scripts/release-windows.bat`,
   `scripts/release-linux-x86_64.bat`, and `scripts/release-linux-arm64.bat`
-  (Linux archives build in Docker); output lands in `release/`.
+  (Linux archives build in Docker), and `scripts/release-macos.sh {arm64,x86_64}`
+  (run **on a Mac**, no Docker); output lands in `release/`.
 
 ## Layout
 

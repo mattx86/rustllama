@@ -198,17 +198,29 @@ they work on SYCL/CUDA/CPU hosts alike) and auto-apply on next load per the
 
 ## Release builds
 
-Three self-contained artifacts, `rustllama-{version}-{os}-{arch}.{ext}`:
+Five self-contained artifacts, `rustllama-{version}-{os}-{arch}.{ext}`:
 
 - Windows x64 `.zip` (GUI) — `scripts\release-windows.bat`
 - Linux x64 `.tar.gz` (headless) — `scripts\release-linux-x86_64.bat`
 - Linux aarch64 `.tar.gz` (headless, DGX Spark / GB10) —
   `scripts\release-linux-arm64.bat` (Docker/QEMU, SBSA CUDA repo)
+- macOS arm64 (Apple Silicon) `.tar.gz` (GUI) — `scripts/release-macos.sh arm64`
+- macOS x86_64 (Intel) `.tar.gz` (GUI) — `scripts/release-macos.sh x86_64`
 
-Each bundles the binary + its non-system shared libs (Linux uses patchelf
-`$ORIGIN` RPATH so a single `rustllama` binary finds its `.so`s) + README +
-LICENSE + docs in a nested dir. Packaging helpers: `_release_package.ps1`
-(bsdtar), `_release_package.sh`, `_release_build_linux.sh`.
+The **two macOS artifacts are built ON A MAC** (no Docker): `release-macos.sh`
+drives `build-macos.sh` (native egui GUI; CPU real on both arches, MLX/Metal
+real on Apple Silicon; **SYCL + CUDA compile to inert stubs** — neither oneAPI
+nor nvcc exists on macOS). Cross-build the non-native arch with `--target`
+(`rustup target add …`; the C stubs cross-compile via clang `-arch`).
+
+Each bundles the binary + its non-system shared libs + README + LICENSE + docs
+in a nested dir. Linux uses patchelf `$ORIGIN` RPATH so a single `rustllama`
+binary finds its `.so`s; macOS uses the Mach-O analogue — `otool -L` to walk
+dylib deps, `install_name_tool` to rewrite them to `@rpath` + add an
+`@loader_path/../lib` rpath, then an ad-hoc `codesign -s -` (a real Developer
+ID can replace `-` later). Packaging helpers: `_release_package.ps1` (bsdtar),
+`_release_package.sh`, `_release_build_linux.sh`; macOS packaging is inline in
+`release-macos.sh`.
 
 ## Useful environment variables
 
