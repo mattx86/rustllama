@@ -3180,20 +3180,44 @@ impl GuiApp {
                 });
                 ui.add_space(6.0);
 
+                // Detect (and consume) a plain-Enter press BEFORE the multiline
+                // TextEdit runs. An egui multiline field eats Enter to insert a
+                // newline and marks the event consumed, so the earlier
+                // post-widget `key_pressed(Enter)` check only ever saw
+                // Ctrl+Enter — which is why plain Enter did not send. We gate on
+                // the field actually being focused (via its explicit id, using
+                // last frame's focus state) so Enter isn't stolen from other
+                // widgets, consume the event so the field does NOT also insert a
+                // newline, and leave Shift+Enter as the newline.
+                let input_id = egui::Id::new("chat_input_box");
+                let enter_send = ui.memory(|m| m.has_focus(input_id))
+                    && ui.input_mut(|i| {
+                        let hit = i.key_pressed(egui::Key::Enter) && !i.modifiers.shift;
+                        if hit {
+                            i.events.retain(|e| {
+                                !matches!(
+                                    e,
+                                    egui::Event::Key {
+                                        key: egui::Key::Enter,
+                                        pressed: true,
+                                        ..
+                                    }
+                                )
+                            });
+                        }
+                        hit
+                    });
+
                 let te = ui.add_sized(
                     [ui.available_width(), 64.0],
                     egui::TextEdit::multiline(&mut self.input)
+                        .id(input_id)
                         .hint_text("Message the model…  (Enter to send · Shift+Enter for newline)")
                         .desired_rows(3),
                 );
                 if te.changed() {
                     input_changed = true;
                 }
-                // Enter (no Shift) or Ctrl+Enter sends; Shift+Enter inserts a
-                // newline. `send_message` trims, so the '\n' the field inserts
-                // this same frame is dropped.
-                let enter_send = te.has_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
                 if enter_send
                     && !self.streaming
                     && (!self.input.trim().is_empty() || has_pending_imgs)
