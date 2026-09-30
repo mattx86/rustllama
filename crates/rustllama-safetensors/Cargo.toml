@@ -29,3 +29,7 @@ rustllama-models = { path = "../rustllama-models" }
 
 [dev-dependencies]
 bytemuck.workspace = true
+# Round-trip test for the MLX loader: decode a loaded `MlxAffineQuant`
+# through the CPU dequant reference and check it against the known
+# affine inputs. Toolchain-free crate, so it adds no build-env burden.
+rustllama-kernels-cpu = { path = "../rustllama-kernels-cpu" }

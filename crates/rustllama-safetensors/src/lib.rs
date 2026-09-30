@@ -39,6 +39,7 @@ pub mod build;
 pub mod convert;
 pub mod dequant;
 pub mod hf_config;
+pub mod mlx;
 pub mod name_map;
 pub use build::{build_llama_model_from_safetensors, BuildError};
 pub use convert::{
@@ -49,6 +50,10 @@ pub use dequant::{
     dequant_awq_int4_to_f16, dequant_gptq_int4_to_f16, DequantError,
 };
 pub use hf_config::{parse_hf_config, HfConfigError};
+pub use mlx::{
+    is_mlx_model, load_mlx_dir, load_mlx_from_bytes, MlxError, MlxFullDtype,
+    MlxFullTensor, MlxLayerQuant, MlxModel, MlxQuantConfig, MlxQuantMode,
+};
 pub use name_map::{map_hf_to_gguf, HfTensor, HfTensorKind};
 
 /// Classification of a safetensors file's quant scheme. Detected by

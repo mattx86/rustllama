@@ -4442,6 +4442,7 @@ dependencies = [
  "bytemuck",
  "half",
  "memmap2",
+ "rustllama-kernels-cpu",
  "rustllama-models",
  "rustllama-tensor",
  "safetensors",

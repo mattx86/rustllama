@@ -12,6 +12,12 @@ use half::f16;
 use rustllama_gguf::dequant;
 use rustllama_gguf::{GgmlType, Gguf, GgufError, TensorInfo};
 
+/// Apple MLX affine quantized-weight representation. Kept in its own
+/// module because an MLX weight is three sibling tensors (packed codes +
+/// scales + biases), which doesn't fit the single-`Storage` [`Tensor`].
+pub mod mlx_affine;
+pub use mlx_affine::{MlxAffineError, MlxAffineQuant};
+
 /// Logical compute device.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Device {

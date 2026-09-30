@@ -9,6 +9,7 @@
 //! GPU equivalents come in later phases; correctness first.
 
 pub mod delta_net;
+pub mod mlx_affine;
 pub mod mxfp;
 pub mod mxfp_kv;
 pub mod nvfp4;
