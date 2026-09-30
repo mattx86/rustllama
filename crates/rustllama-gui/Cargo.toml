@@ -1,0 +1,36 @@
+[package]
+name = "rustllama-gui"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Native egui/eframe desktop GUI for rustllama (drives the server over HTTP)."
+
+[dependencies]
+# egui stack. Pin the whole family to the SAME 0.29 minor — a mismatch
+# (e.g. egui 0.29 + egui_commonmark built against 0.28) is a hard type
+# error at the CommonMarkViewer::show boundary. eframe with
+# default-features off + an explicit renderer keeps the dep graph lean;
+# `wayland`/`x11` are no-ops on Windows (winit gates those deps to unix)
+# so this exact feature set still checks on the Windows dev box.
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.29"
+egui_extras = { version = "0.29", features = ["syntect"] }
+egui_commonmark = "0.18"
+
+# The ONLY rustllama dep — a reqwest-only HTTP client. Depending on
+# -client (not -engine/-models/-server/-kernels-*) is what keeps this
+# crate TOOLCHAIN-FREE: it builds with plain `cargo`, no oneAPI/CUDA env.
+rustllama-client = { path = "../rustllama-client" }
+
+# Async bridge: a multi-thread tokio runtime owns the network calls; the
+# UI thread never blocks. `tokio.workspace` carries the `full` feature set
+# (superset of rt-multi-thread/macros/sync/time).
+tokio.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

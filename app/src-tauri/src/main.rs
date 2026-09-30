@@ -228,51 +228,13 @@ fn run_gui() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("spawn server thread: {e}"))?;
     }
 
-    let tauri_result = tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![
-            server_url,
-            list_models,
-            pull_model,
-            get_config,
-            set_config,
-            get_server_status,
-            ensure_server,
-            send_chat,
-            stream_chat,
-            get_tuning_state,
-            start_tune,
-            cancel_tune,
-            open_new_window,
-            list_open_windows,
-            close_window,
-            quantize_model,
-        ])
-        // System tray with Show / Hide / Quit. The window's
-        // CloseRequested handler intercepts the OS close button and
-        // hides instead of exiting — matching the "close-to-tray
-        // default on" behavior the plan calls out.
-        .setup(|app| {
-            install_tray(app.handle())?;
-            Ok(())
-        })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                // Main window: hide-not-exit (close-to-tray). The
-                // user can still actually quit via the tray menu's
-                // "Quit" item. Secondary windows (label != "main")
-                // close normally — they're per-conversation, the
-                // user expects close-button to dispose of them.
-                if window.label() == "main" {
-                    let _ = window.hide();
-                    api.prevent_close();
-                }
-            }
-        })
-        .run(tauri::generate_context!());
-    if let Err(e) = &tauri_result {
-        tracing::error!(error = %e, "tauri runtime exited with error");
-    }
-    tauri_result.map_err(|e| anyhow::anyhow!("tauri runtime: {e}"))?;
+    // Native egui GUI (replaces the former Tauri/webview window). The
+    // embedded server spawned above serves the API on the config port; the
+    // egui app drives it over HTTP via rustllama-client. The Tauri IPC
+    // commands + tray helpers further down are now dead code, kept only
+    // until the de-Tauri cleanup pass (dir rename + removal).
+    let base_url = "http://127.0.0.1:11434".to_string(); // TODO: read [server].port
+    rustllama_gui::run_ui(base_url)?;
 
     tracing::info!("rustllama GUI exiting cleanly");
     // Server thread keeps running until process exit; we don't await

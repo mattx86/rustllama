@@ -37,7 +37,7 @@ tui = ["rustllama-cli/tui"]
 # Enables the Tauri GUI subcommand. Requires Node 20+ and pnpm (see app/ui).
 # Implies `encoder`: the GUI's quantize_model command drives the
 # gguf encode pipeline directly.
-gui = ["encoder", "dep:tauri", "dep:tauri-build", "dep:reqwest", "dep:serde", "dep:serde_json", "dep:futures"]
+gui = ["encoder", "dep:rustllama-gui", "dep:tauri", "dep:tauri-build", "dep:reqwest", "dep:serde", "dep:serde_json", "dep:futures"]
 
 [dependencies]
 tokio.workspace = true
@@ -59,8 +59,13 @@ rustllama-kernels-sycl = { path = "../../crates/rustllama-kernels-sycl", default
 # driver at runtime, since the kernels + static cudart are linked in).
 rustllama-kernels-cuda = { path = "../../crates/rustllama-kernels-cuda" }
 
+# Native egui/eframe GUI (replaces the Tauri/webview window). Toolchain-free
+# (eframe + rustllama-client only) — needs no Node/frontend build.
+rustllama-gui = { path = "../../crates/rustllama-gui", optional = true }
 # GUI integration — gated behind feature `gui` so phase-0 builds work without
-# Node or the Tauri frontend dist dir.
+# Node or the Tauri frontend dist dir. (The Tauri deps below are now legacy —
+# run_gui() launches the native egui app; the Tauri IPC/tray code is dead
+# pending the de-Tauri cleanup pass.)
 tauri = { workspace = true, optional = true, features = ["tray-icon", "image-ico"] }
 # Tiny HTTP client used by the IPC command adapters — `tauri::command`
 # fns can't run the React frontend's `fetch`, so commands that need to
