@@ -1865,29 +1865,99 @@ impl CpuEngine {
         self.image_token_id
     }
 
-    /// Auto-detect dispatcher (A-3): inspect the path's extension and
-    /// route to either [`load_with_tokenizer`] (`.gguf`) or
-    /// [`load_safetensors`] (`.safetensors`).
+    /// Auto-detect dispatcher: route a model path to the right loader.
     ///
-    /// Returns an error for unrecognized extensions rather than
-    /// guessing — silently mis-classifying a TFlow checkpoint as
-    /// GGUF would surface as a cryptic parse failure deep in the
-    /// loader.
+    /// - A **directory** is an mlx-lm / mlx-community MLX model layout
+    ///   (`config.json` + `*.safetensors` + `tokenizer.json`) → [`load_mlx`]
+    ///   when it detects as MLX; an AWQ/GPTQ export handed as a directory
+    ///   falls back to its `model.safetensors`.
+    /// - `.gguf` → [`load_with_tokenizer`]; `.safetensors` →
+    ///   [`load_safetensors`] (or [`load_mlx`] on the parent dir when the
+    ///   sibling `config.json` + `.scales`/`.biases` mark it an MLX affine
+    ///   checkpoint, not AWQ/GPTQ).
+    ///
+    /// Returns an error for unrecognized extensions rather than guessing —
+    /// silently mis-classifying a checkpoint would surface as a cryptic
+    /// parse failure deep in the loader.
     pub fn load_auto(path: &Path, max_ctx: usize) -> Result<Self> {
+        // A model DIRECTORY has no meaningful extension; classify it by
+        // contents. MLX first (its `.scales`/`.biases` triple is the
+        // discriminator vs AWQ's `.scales`/`.qzeros`), then fall back to a
+        // single `model.safetensors` for AWQ/GPTQ exported as a folder.
+        if path.is_dir() {
+            if Self::is_mlx_dir(path) {
+                return Self::load_mlx(path, max_ctx);
+            }
+            let st = path.join("model.safetensors");
+            if st.is_file() {
+                return Self::load_safetensors(&st, max_ctx);
+            }
+            return Err(CpuEngineError::Other(format!(
+                "model directory `{}` is neither an MLX affine checkpoint \
+                 (a `quantization` block in config.json + `.scales`/`.biases` \
+                 tensors) nor an AWQ/GPTQ export (no `model.safetensors`)",
+                path.display()
+            )));
+        }
         let ext = path
             .extension()
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_lowercase());
         match ext.as_deref() {
             Some("gguf") => Self::load_with_tokenizer(path, max_ctx),
-            Some("safetensors") => Self::load_safetensors(path, max_ctx),
+            Some("safetensors") => {
+                // An MLX affine checkpoint pointed at by its `.safetensors`
+                // file (not the directory): route to the MLX loader on the
+                // parent dir. Plain AWQ/GPTQ keep the existing path.
+                if let Some(parent) = path.parent() {
+                    if Self::is_mlx_dir(parent) {
+                        return Self::load_mlx(parent, max_ctx);
+                    }
+                }
+                Self::load_safetensors(path, max_ctx)
+            }
             _ => Err(CpuEngineError::Other(format!(
                 "unrecognized model file extension for `{}`: rustllama v1 \
-                 supports `.gguf` (GGUF) and `.safetensors` (HuggingFace \
-                 AWQ / GPTQ / fp16 checkpoints)",
+                 supports `.gguf` (GGUF), `.safetensors` (HuggingFace \
+                 AWQ / GPTQ / fp16 checkpoints), and an MLX model directory \
+                 (mlx-lm / mlx-community)",
                 path.display()
             ))),
         }
+    }
+
+    /// Cheap MLX-directory probe: does `dir` hold a `config.json` with a
+    /// `quantization` block AND a `.safetensors` shard carrying `.scales` +
+    /// `.biases` sibling tensors? That pair is what distinguishes an MLX
+    /// affine checkpoint from AWQ/GPTQ (which ship `.scales` + `.qzeros`,
+    /// no `.biases`) and from a plain fp16 HF dump. Any IO / parse error is
+    /// swallowed as `false` — an unreadable or non-MLX dir simply isn't
+    /// routed to the MLX loader. Only the safetensors HEADER is parsed
+    /// (via mmap), so this stays cheap even for multi-GB shards.
+    fn is_mlx_dir(dir: &Path) -> bool {
+        let Ok(config_json) = std::fs::read_to_string(dir.join("config.json")) else {
+            return false;
+        };
+        // Prefer the canonical single shard; else the first `*.safetensors`.
+        let st_path = {
+            let single = dir.join("model.safetensors");
+            if single.is_file() {
+                Some(single)
+            } else {
+                std::fs::read_dir(dir).ok().and_then(|rd| {
+                    rd.filter_map(|e| e.ok().map(|e| e.path())).find(|p| {
+                        p.extension().and_then(|x| x.to_str()) == Some("safetensors")
+                    })
+                })
+            }
+        };
+        let Some(st_path) = st_path else {
+            return false;
+        };
+        let Ok(mmap) = rustllama_safetensors::open_safetensors(&st_path) else {
+            return false;
+        };
+        rustllama_safetensors::is_mlx_model(&config_json, &mmap[..])
     }
 
     /// Load a HuggingFace `.safetensors` checkpoint (AWQ, GPTQ, or
@@ -2036,6 +2106,294 @@ impl CpuEngine {
             expert_usage: None,
             kv_persist_owner: false,
         })
+    }
+
+    /// Load an Apple **MLX** affine-quantized model directory (mlx-lm /
+    /// mlx-community layout): a `config.json` carrying the HF architecture
+    /// hyperparameters **and** an MLX `quantization` block, one or more
+    /// `*.safetensors` shards whose quantized linears/embeddings are stored
+    /// as the `<module>.weight` (uint32-packed) + `.scales` + `.biases`
+    /// affine triple, and a `tokenizer.json`:
+    ///
+    /// ```text
+    ///   path/to/Qwen2.5-0.5B-Instruct-4bit/
+    ///     config.json         ← HF arch metadata + `quantization` block
+    ///     model.safetensors   ← packed MLX affine weights (+ scales/biases)
+    ///     tokenizer.json      ← HF tokenizer
+    /// ```
+    ///
+    /// **B1 strategy — dequant-to-f16, then reuse the existing safetensors
+    /// builder.** Every affine weight is dequantized to a dense f16 tensor
+    /// keyed by the SAME GGUF slot the AWQ/GPTQ path targets
+    /// (`model.layers.0.self_attn.q_proj.weight` → `blk.0.attn_q.weight`),
+    /// producing the identical [`ConvertedTensor`] list
+    /// `convert_safetensors_to_gguf_tensors` yields, so
+    /// [`build_llama_model_from_safetensors`] and the whole arch/forward
+    /// stack are reused unchanged. Keeping the weights packed as
+    /// `MlxAffineQuant` and routing matvec through
+    /// `matvec_mlx_affine_w_f32_a` / mlx-c (native-residency) is the LATER
+    /// B2 slice — deliberately NOT attempted here.
+    ///
+    /// KV cache is F32 contiguous (same default as the GGUF + AWQ paths).
+    ///
+    /// [`ConvertedTensor`]: rustllama_safetensors::ConvertedTensor
+    /// [`build_llama_model_from_safetensors`]: rustllama_safetensors::build_llama_model_from_safetensors
+    pub fn load_mlx(dir: &Path, max_ctx: usize) -> Result<Self> {
+        let config_path = dir.join("config.json");
+        let tokenizer_path = dir.join("tokenizer.json");
+        if !config_path.exists() {
+            return Err(CpuEngineError::Other(format!(
+                "missing `config.json` in MLX model directory `{}` — mlx-lm \
+                 layouts require it for architecture + quantization metadata",
+                dir.display()
+            )));
+        }
+
+        // config.json feeds two parsers: the HF-arch hyperparams (via
+        // `parse_hf_config`, shared with the AWQ path) and the MLX
+        // `quantization` block (parsed inside `load_mlx_dir`).
+        let config_json = std::fs::read_to_string(&config_path)
+            .map_err(|e| CpuEngineError::Other(format!("read config.json: {e}")))?;
+        let cfg = rustllama_safetensors::parse_hf_config(&config_json)
+            .map_err(|e| CpuEngineError::Other(format!("config.json: {e}")))?;
+
+        // Read every shard, split into quantized affine weights + full
+        // tensors, then dequant + remap to the GGUF-named ConvertedTensor
+        // list the llama builder consumes.
+        let mlx = rustllama_safetensors::load_mlx_dir(dir)
+            .map_err(|e| CpuEngineError::Other(format!("mlx safetensors load: {e}")))?;
+        let n_quant = mlx.quant.len();
+        let n_full = mlx.full.len();
+        let converted = Self::mlx_model_to_converted(&mlx)?;
+        let model =
+            rustllama_safetensors::build_llama_model_from_safetensors(&cfg, converted)
+                .map_err(|e| CpuEngineError::Other(format!("mlx model build: {e}")))?;
+
+        // Tokenizer: optional, same posture as `load_safetensors` — most
+        // mlx-community releases ship `tokenizer.json`; warn (don't fail)
+        // when it's absent so the model still loads for the token-ID API.
+        let tokenizer = if tokenizer_path.exists() {
+            Some(Arc::new(Tokenizer::from_file(&tokenizer_path).map_err(
+                |e| CpuEngineError::Other(format!("tokenizer.json: {e}")),
+            )?))
+        } else {
+            tracing::warn!(
+                path = %tokenizer_path.display(),
+                "tokenizer.json not present in MLX model directory — `chat` / \
+                 `generate` will require a tokenizer; loading model only"
+            );
+            None
+        };
+
+        let ctx = max_ctx.min(cfg.ctx_train.max(max_ctx));
+        let kv_backend = KvBackend::from_inference_config(
+            "contiguous",
+            &cfg,
+            ctx as u32,
+            KvDtype::F32,
+        )
+        .map_err(|e| CpuEngineError::Other(format!("kv_backend init: {e}")))?;
+
+        let model_id = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "rustllama-mlx".into());
+
+        tracing::info!(
+            model_id = %model_id,
+            arch = %cfg.arch,
+            n_layers = cfg.n_layers,
+            d_model = cfg.d_model,
+            n_heads = cfg.n_heads,
+            n_kv_heads = cfg.n_kv_heads,
+            vocab_size = cfg.vocab_size,
+            ctx_train = cfg.ctx_train,
+            ctx = ctx,
+            quant_weights = n_quant,
+            full_tensors = n_full,
+            "MLX model loaded (dequant-to-f16) — engine ready"
+        );
+
+        let delta_net_cache = build_delta_net_cache(&model);
+        let model = Arc::new(model);
+        let lock_registry =
+            crate::pagelock::lock_model_into_ram(Arc::clone(&model)).map(Arc::new);
+        let kv_dtype_cached = kv_backend.kv_dtype();
+        Ok(Self {
+            model,
+            tokenizer,
+            kv_dtype_cached,
+            metrics_cache: Arc::new(MetricsCacheAtomics::default()),
+            state: Arc::new(Mutex::new(EngineState {
+                kv_backend,
+                last_ids: Vec::new(),
+                pool: PrefixCachePool::new(DEFAULT_PREFIX_CACHE_MAX_SNAPSHOTS),
+                delta_net_cache,
+            })),
+            sycl_worker: Arc::new(SyclWorker::spawn()),
+            max_ctx: ctx,
+            model_id,
+            source_path: dir.to_path_buf(),
+            prefix_cache: true,
+            prefill_chunk_size: DEFAULT_PREFILL_CHUNK,
+            prefix_cache_max_snapshots: DEFAULT_PREFIX_CACHE_MAX_SNAPSHOTS,
+            last_stats: Arc::new(Mutex::new(RequestStats::default())),
+            ema_tok_s_bits: Arc::new(std::sync::atomic::AtomicU64::new(f64::NAN.to_bits())),
+            cumulative_stats: Arc::new(crate::CumulativeStats::default()),
+            max_tool_iterations: DEFAULT_MAX_TOOL_ITERATIONS,
+            flash_attention: true,
+            kv_layout: "contiguous".to_string(),
+            kv_page_size: 0, // unused on contiguous; KvBackend defaults
+            n_gpu_layers: u32::MAX,
+            cpu_force_patterns: Vec::new(),
+            vision: None,
+            image_token_id: None,
+            placeholder_mode: None,
+            ngram_spec: None,
+            draft_spec: None,
+            mtp_spec: false,
+            image_wrapper: None,
+            vision_feature_memo: Arc::new(Mutex::new(None)),
+            lock_registry,
+            // Dequant-to-f16 weights are owned-heap (nothing mmap-backed to
+            // pin), so the expert learning cache never applies.
+            expert_usage: None,
+            kv_persist_owner: false,
+        })
+    }
+
+    /// Dequant + remap a loaded [`MlxModel`](rustllama_safetensors::MlxModel)
+    /// into the GGUF-named [`ConvertedTensor`](rustllama_safetensors::ConvertedTensor)
+    /// list `build_llama_model_from_safetensors` consumes — the pragmatic
+    /// B1 "dequant-to-f16 then reuse the existing builder" path.
+    ///
+    /// Two naming families are accepted so both real mlx-community
+    /// checkpoints AND rustllama's own `quantize --to-mlx` exports load:
+    ///
+    /// 1. **HF module paths** (`model.layers.0.self_attn.q_proj`,
+    ///    `model.embed_tokens`, `lm_head`, `model.norm`) — real mlx-lm /
+    ///    mlx-community models. Routed via
+    ///    [`map_hf_to_gguf`](rustllama_safetensors::map_hf_to_gguf), exactly
+    ///    as the AWQ/GPTQ path maps its HF names.
+    /// 2. **GGUF names already** (`blk.0.attn_q`, `token_embd`, `output`,
+    ///    `output_norm.weight`) — what `quantize --to-mlx` emits (it keeps
+    ///    the source GGUF tensor names verbatim). Passed through unchanged,
+    ///    so the encoder round-trip loads without a separate GGUF-name path.
+    ///
+    /// **Orientation (the one thing to get right):** MLX affine dequant
+    /// yields row-major `[out_features, in_features]` — element `(r, c)` is
+    /// at packed bit `(r*in_features + c)*bits` — which is byte-identical to
+    /// the row-major `[out_features, in_features]` layout the llama builder
+    /// expects (the same layout the AWQ converter *transposes into*). So
+    /// **no transpose** is applied; the dequant buffer maps straight to a
+    /// `ConvertedTensor`.
+    fn mlx_model_to_converted(
+        mlx: &rustllama_safetensors::MlxModel,
+    ) -> Result<Vec<rustllama_safetensors::ConvertedTensor>> {
+        use rustllama_safetensors::{ConvertedDtype, ConvertedTensor, MlxFullDtype};
+
+        // Quantized-weight module path → GGUF slot. HF name via the shared
+        // table first; else GGUF-name passthrough (encoder round-trip).
+        fn quant_name_to_gguf(module: &str) -> Option<String> {
+            let hf_weight = format!("{module}.weight");
+            if let Some(m) = rustllama_safetensors::map_hf_to_gguf(&hf_weight) {
+                return Some(m.gguf_name);
+            }
+            if module.starts_with("blk.") || matches!(module, "token_embd" | "output") {
+                return Some(hf_weight);
+            }
+            None
+        }
+        // Full-tensor name → GGUF slot (norms, biases, un-quantized
+        // embeddings / lm_head). HF name via the table; else already-GGUF.
+        fn full_name_to_gguf(name: &str) -> Option<String> {
+            if let Some(m) = rustllama_safetensors::map_hf_to_gguf(name) {
+                return Some(m.gguf_name);
+            }
+            if name.starts_with("blk.")
+                || matches!(
+                    name,
+                    "token_embd.weight" | "output.weight" | "output_norm.weight"
+                )
+            {
+                return Some(name.to_string());
+            }
+            None
+        }
+
+        let mut out = Vec::with_capacity(mlx.quant.len() + mlx.full.len());
+
+        // --- Quantized affine weights → dense f16 -----------------------
+        for (module, q) in &mlx.quant {
+            let Some(gguf_name) = quant_name_to_gguf(module) else {
+                tracing::debug!(
+                    module = %module,
+                    "mlx load: quantized module has no GGUF mapping — skipping"
+                );
+                continue;
+            };
+            q.validate()
+                .map_err(|e| CpuEngineError::Other(format!("mlx weight `{module}`: {e}")))?;
+            let n = q.n_elements() as usize;
+            let mut deq = vec![0f32; n];
+            rustllama_kernels_cpu::mlx_affine::dequantize_mlx_affine(
+                &q.packed,
+                &q.scales,
+                &q.biases,
+                q.group_size,
+                q.bits,
+                &mut deq,
+            );
+            // Round to f16 to match the AWQ/GPTQ converter's
+            // ConvertedDtype::F16 output — the proven downstream dtype for
+            // the llama builder + CPU forward. No transpose (see fn docs).
+            let bytes: Vec<u8> = deq
+                .iter()
+                .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+                .collect();
+            out.push(ConvertedTensor {
+                gguf_name,
+                shape: q.shape.clone(),
+                dtype: ConvertedDtype::F16,
+                bytes,
+            });
+        }
+
+        // --- Full-precision tensors → pass through ----------------------
+        for (name, full) in &mlx.full {
+            let Some(gguf_name) = full_name_to_gguf(name) else {
+                tracing::debug!(
+                    name = %name,
+                    "mlx load: full tensor has no GGUF mapping — skipping"
+                );
+                continue;
+            };
+            let (dtype, bytes) = match full.dtype {
+                MlxFullDtype::F32 => (ConvertedDtype::F32, full.bytes.clone()),
+                MlxFullDtype::F16 => (ConvertedDtype::F16, full.bytes.clone()),
+                MlxFullDtype::Bf16 => {
+                    // BF16 = high 16 bits of an f32; widen then round to f16
+                    // — the same conversion `convert::convert_plain` applies,
+                    // so a bf16 norm reaches the builder as the f16 it wants.
+                    let mut b = Vec::with_capacity(full.bytes.len());
+                    for c in full.bytes.chunks_exact(2) {
+                        let bf = u16::from_le_bytes([c[0], c[1]]);
+                        let f = f32::from_bits((bf as u32) << 16);
+                        b.extend_from_slice(&half::f16::from_f32(f).to_le_bytes());
+                    }
+                    (ConvertedDtype::F16, b)
+                }
+            };
+            out.push(ConvertedTensor {
+                gguf_name,
+                shape: full.shape.clone(),
+                dtype,
+                bytes,
+            });
+        }
+
+        Ok(out)
     }
 
     /// Test-only hook: install a pre-loaded vision tower and a chosen

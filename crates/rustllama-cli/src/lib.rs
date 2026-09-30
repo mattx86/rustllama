@@ -3501,9 +3501,10 @@ async fn serve(
         cfg.model.path.clone().into_iter().collect()
     };
     for m in &startup_models {
-        if !m.is_file() {
+        if !m.exists() {
             anyhow::bail!(
-                "--model {}: file not found (pass a path to a .gguf file)",
+                "--model {}: not found (pass a `.gguf` file, a `.safetensors` \
+                 AWQ/GPTQ checkpoint, or an MLX model directory)",
                 m.display()
             );
         }
@@ -3526,7 +3527,10 @@ async fn serve(
     let mut loaded_startup: Vec<(ServingModel, String)> = Vec::new();
     for path in &startup_models {
         // Mandatory first-load auto-tune for THIS model, before it loads.
-        {
+        // The tune subprocess loads via the GGUF path, so a model DIRECTORY
+        // (MLX / safetensors export) has no GGUF to tune — skip the sweep;
+        // it loads with engine defaults (F32 contiguous KV).
+        if !path.is_dir() {
             let path = path.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 rustllama_server::maybe_first_load_autotune(&path, true)
@@ -3701,15 +3705,31 @@ async fn serve(
                     "tuner cache: applied kv_page_size winner"
                 );
             }
-            let mut cpu = CpuEngine::load_with_options_layout_and_page_size(
-                path,
-                max_ctx,
-                true,
-                kv_dtype,
-                &applied_layout,
-                applied_page_size,
-            )
-            .map_err(|e| anyhow::anyhow!("failed to load model {}: {e}", path.display()))?;
+            let mut cpu = if path.is_dir() {
+                // MLX / safetensors model DIRECTORY: route through the
+                // format-detecting loader (dequant-to-f16 for MLX). It fixes
+                // F32 contiguous KV, so the GGUF-oriented kv_dtype / layout /
+                // page-size winners resolved above don't apply here.
+                tracing::info!(
+                    model = %path.display(),
+                    "loading model directory via load_auto (MLX / safetensors)"
+                );
+                CpuEngine::load_auto(path, max_ctx).map_err(|e| {
+                    anyhow::anyhow!("failed to load model {}: {e}", path.display())
+                })?
+            } else {
+                CpuEngine::load_with_options_layout_and_page_size(
+                    path,
+                    max_ctx,
+                    true,
+                    kv_dtype,
+                    &applied_layout,
+                    applied_page_size,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to load model {}: {e}", path.display())
+                })?
+            };
             // K-cache mean-centering bias sidecar (explicit path
             // from config, else auto-discovery beside the model).
             // A malformed / basis-mismatched sidecar fails the
