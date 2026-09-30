@@ -1406,6 +1406,20 @@ fn dequant_to_f32(src_dtype: GgmlType, src_bytes: &[u8], out: &mut [f32]) -> Res
     Ok(())
 }
 
+/// Public entry point: dequantize one tensor's raw GGUF bytes to f32 by
+/// source dtype. This is the same dispatch [`quantize_gguf`] uses
+/// internally, exposed so out-of-crate re-quant callers (e.g. the MLX
+/// affine encoder in `rustllama-cli`) can get an f32 view of any
+/// supported source dtype without reaching into the pipeline.
+///
+/// `out.len()` must equal the tensor's element count; `src_bytes` must
+/// be the whole tensor's data region. Infallible — the dispatch is
+/// exhaustive over every [`GgmlType`] (the `Result` on the private
+/// helper is vestigial), so this returns `()`.
+pub fn dequant_tensor_to_f32(src_dtype: GgmlType, src_bytes: &[u8], out: &mut [f32]) {
+    let _ = dequant_to_f32(src_dtype, src_bytes, out);
+}
+
 /// Dispatch encode by target dtype. Caller guarantees
 /// `encoder_supported(target_dtype) == true` (the pipeline checks
 /// before declaring the tensor).

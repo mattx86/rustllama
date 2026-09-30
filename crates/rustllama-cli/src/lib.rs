@@ -503,20 +503,44 @@ pub enum Command {
     /// worth, not the whole model. 1D "norm"-style tensors are
     /// passed through at source dtype automatically (override via
     /// `--no-passthrough` if you really want to re-encode them).
+    ///
+    /// With `--to-mlx`, the output is instead an **Apple MLX** model
+    /// *directory* (mlx-lm affine format): each 2-D weight is
+    /// group-affine quantized (`--mlx-bits` / `--mlx-group-size`) into
+    /// the `<name>.weight`/`.scales`/`.biases` triple, 1-D tensors pass
+    /// through, and a `config.json` (with the `quantization` block) +
+    /// copied `tokenizer.json` are written beside `model.safetensors`.
+    /// `--target`/`--recipe`/`--apex`/`--imatrix` are ignored in this
+    /// mode.
     Quantize {
         /// Source GGUF file.
         #[arg(long)]
         input: String,
-        /// Destination GGUF file. Created or truncated.
+        /// Destination. A GGUF file by default (created/truncated); with
+        /// `--to-mlx` this is an MLX model **directory** (created).
         #[arg(long)]
         output: String,
+        /// Write an Apple MLX affine model directory instead of a GGUF
+        /// file. Changes `--output` semantics to a directory.
+        #[arg(long, default_value_t = false)]
+        to_mlx: bool,
+        /// MLX affine bits per weight (`--to-mlx` only). One of
+        /// 2,3,4,5,6,8. Default 4 (the mlx-lm default).
+        #[arg(long, default_value_t = 4)]
+        mlx_bits: u32,
+        /// MLX affine group size (`--to-mlx` only) — elements per
+        /// (scale, bias) group along the input dim. One of 32,64,128.
+        /// Default 64 (the mlx-lm default).
+        #[arg(long, default_value_t = 64)]
+        mlx_group_size: usize,
         /// Default target dtype for all quantizable weight tensors
         /// that no recipe or APEX rule matches. Accepts canonical
         /// ggml names (case-insensitive): q4_0, q4_1, q5_0, q5_1,
         /// q8_0, q8_1, q2_k, q3_k, q4_k, q5_k, q6_k, q8_k, tq1_0,
-        /// tq2_0, iq4_nl, iq4_xs, f32, f16, bf16.
+        /// tq2_0, iq4_nl, iq4_xs, f32, f16, bf16. Required for the
+        /// GGUF→GGUF path; ignored (and optional) with `--to-mlx`.
         #[arg(long)]
-        target: String,
+        target: Option<String>,
         /// Disable the 1D-tensor passthrough heuristic. Without
         /// this, norms / biases stay at source dtype.
         #[arg(long, default_value_t = false)]
@@ -1405,6 +1429,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Quantize {
             input,
             output,
+            to_mlx,
+            mlx_bits,
+            mlx_group_size,
             target,
             no_passthrough,
             keep_output,
@@ -1414,7 +1441,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         } => cmd_quantize(
             &input,
             &output,
-            &target,
+            to_mlx,
+            mlx_bits,
+            mlx_group_size,
+            target.as_deref(),
             no_passthrough,
             keep_output,
             recipe.as_deref(),
@@ -1468,7 +1498,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 fn cmd_quantize(
     input: &str,
     output: &str,
-    target_name: &str,
+    to_mlx: bool,
+    mlx_bits: u32,
+    mlx_group_size: usize,
+    target_name: Option<&str>,
     no_passthrough: bool,
     keep_output: bool,
     recipe_path: Option<&str>,
@@ -1483,6 +1516,31 @@ fn cmd_quantize(
         GgmlType, Gguf, MetadataValue,
     };
 
+    // `--to-mlx` writes an Apple MLX affine model directory instead of a
+    // GGUF file — an entirely separate produce path (GGUF dequant → MLX
+    // group-affine quant → safetensors/config writer). The GGUF→GGUF
+    // levers (`--target`/recipe/apex/imatrix) don't apply.
+    if to_mlx {
+        if target_name.is_some()
+            || recipe_path.is_some()
+            || apex_tier.is_some()
+            || imatrix_path.is_some()
+        {
+            eprintln!(
+                "quantize: --to-mlx ignores --target/--recipe/--apex/--imatrix \
+                 (MLX uses --mlx-bits / --mlx-group-size)"
+            );
+        }
+        return cmd_quantize_to_mlx(input, output, mlx_bits, mlx_group_size);
+    }
+
+    // GGUF → GGUF path. `--target` is required here.
+    let target_name = target_name.ok_or_else(|| {
+        anyhow::anyhow!(
+            "quantize: --target is required for the GGUF→GGUF path \
+             (or pass --to-mlx to write an MLX directory)"
+        )
+    })?;
     let target = parse_target_dtype(target_name)?;
     let src = Gguf::open(input)
         .map_err(|e| anyhow::anyhow!("failed to open source GGUF {input:?}: {e}"))?;
@@ -1661,6 +1719,160 @@ fn cmd_quantize(
     let _ = GgmlType::F32;
     let _ = MetadataValue::U32(0);
 
+    Ok(())
+}
+
+/// `rustllama quantize --to-mlx`: convert a GGUF model into an Apple
+/// **MLX affine** model directory (mlx-lm / mlx-community layout). Each
+/// 2-D weight whose input dim is a multiple of `group_size` is
+/// group-affine quantized into the MLX `<name>.weight`/`.scales`/
+/// `.biases` triple; 1-D tensors (and any 2-D weight whose input dim
+/// doesn't divide `group_size`) pass through full precision. GGUF tensor
+/// names are preserved, so the Phase-A MLX loader
+/// (`rustllama_safetensors::load_mlx_dir`) reads them straight back.
+///
+/// # Caveats
+///
+/// - **Name fidelity.** Names are kept verbatim (`blk.0.attn_q.*`), NOT
+///   rewritten to mlx-lm's HF module paths (`model.layers.0...`). The
+///   file round-trips through rustllama's own loader (which keys on the
+///   `.scales`/`.biases` siblings, not fixed names), but is not a
+///   drop-in for upstream mlx-lm tooling until a name remap lands.
+/// - **Dims > 2** (e.g. stacked MoE expert tensors) pass through as f32
+///   rather than being quantized — correct but large; MoE→MLX is a
+///   later slice.
+/// - **Single shard.** Always one `model.safetensors`; no sharding.
+/// - **Affine only.** Emits `mode="affine"`; the MXFP/NVFP4 MLX modes
+///   are out of scope (the loader rejects them on read too).
+#[cfg(feature = "encoder")]
+fn cmd_quantize_to_mlx(
+    input: &str,
+    output: &str,
+    bits: u32,
+    group_size: usize,
+) -> anyhow::Result<()> {
+    use rustllama_gguf::{quantize::dequant_tensor_to_f32, Gguf};
+    use rustllama_kernels_cpu::mlx_affine::quantize_mlx_affine;
+    use rustllama_safetensors::{write_mlx_dir, MlxFullDtype, MlxWriteTensor};
+
+    // Geometry guards mirror the MLX affine format + the loader's
+    // validate(): bits ∈ {2,3,4,5,6,8}, group_size ∈ {32,64,128}.
+    if !matches!(bits, 2 | 3 | 4 | 5 | 6 | 8) {
+        anyhow::bail!("--mlx-bits {bits} invalid (want one of 2,3,4,5,6,8)");
+    }
+    if !matches!(group_size, 32 | 64 | 128) {
+        anyhow::bail!("--mlx-group-size {group_size} invalid (want one of 32,64,128)");
+    }
+
+    let src = Gguf::open(input)
+        .map_err(|e| anyhow::anyhow!("failed to open source GGUF {input:?}: {e}"))?;
+    let out_dir = std::path::Path::new(output);
+
+    let start = std::time::Instant::now();
+    let mut tensors: Vec<MlxWriteTensor> = Vec::with_capacity(src.tensors().len());
+    let mut n_quant = 0usize;
+    let mut n_full = 0usize;
+    let mut bytes_in = 0u64;
+
+    for t in src.tensors() {
+        let n = t.element_count() as usize;
+        let src_bytes = src
+            .tensor_bytes(&t.name)
+            .ok_or_else(|| anyhow::anyhow!("source tensor {:?} has no data region", t.name))?;
+        bytes_in += src_bytes.len() as u64;
+
+        // Dequant the whole tensor to f32. GGUF data is row-major with
+        // the inner (input) dim contiguous — exactly the axis MLX groups
+        // along, so no transpose is needed.
+        let mut f32_buf = vec![0f32; n];
+        dequant_tensor_to_f32(t.dtype, src_bytes, &mut f32_buf);
+
+        // GGUF dims are [n_in (contiguous), n_out, ...]; a 2-D weight is
+        // [n_in, n_out]. MLX's logical shape is [out_features,
+        // in_features] = [n_out, n_in], with groups along n_in.
+        let is_2d = t.dims.len() == 2;
+        let in_features = t.dims.first().copied().unwrap_or(0);
+        if is_2d && in_features > 0 && in_features % group_size as u64 == 0 {
+            let out_features = t.dims[1];
+            let (packed, scales, biases) = quantize_mlx_affine(&f32_buf, group_size, bits);
+            // Module path = tensor name minus the `.weight` suffix; the
+            // writer re-appends `.weight`/`.scales`/`.biases`.
+            let module = t
+                .name
+                .strip_suffix(".weight")
+                .unwrap_or(&t.name)
+                .to_string();
+            tensors.push(MlxWriteTensor::Quant {
+                name: module,
+                packed,
+                scales,
+                biases,
+                group_size,
+                bits,
+                shape: vec![out_features, in_features],
+            });
+            n_quant += 1;
+        } else {
+            // 1-D norms/biases, a group-misaligned 2-D weight, or a
+            // >2-D tensor: carry through full precision (f32, lossless)
+            // under the tensor's own name.
+            if is_2d {
+                eprintln!(
+                    "quantize: {} [{}x{}] input dim not a multiple of group_size {} \
+                     — passing through full precision",
+                    t.name, in_features, t.dims[1], group_size
+                );
+            }
+            let bytes: Vec<u8> = f32_buf.iter().flat_map(|v| v.to_le_bytes()).collect();
+            tensors.push(MlxWriteTensor::Full {
+                name: t.name.clone(),
+                dtype: MlxFullDtype::F32,
+                shape: t.dims.clone(),
+                bytes,
+            });
+            n_full += 1;
+        }
+    }
+
+    // Minimal, honest config.json provenance beyond the `quantization`
+    // block the writer adds (the MLX loader needs only `quantization`).
+    let mut extra = serde_json::Map::new();
+    if let Some(arch) = src.architecture() {
+        extra.insert("architectures".into(), serde_json::json!([arch]));
+        extra.insert("model_type".into(), serde_json::json!(arch));
+    }
+    extra.insert("quantized_by".into(), serde_json::json!("rustllama"));
+
+    // Copy a sibling `tokenizer.json` if the source GGUF has one beside
+    // it (GGUF embeds its tokenizer in metadata, but a directory export
+    // may also ship the HF tokenizer.json). The writer copies only when
+    // the path exists.
+    let tok_src = std::path::Path::new(input)
+        .parent()
+        .map(|p| p.join("tokenizer.json"));
+    let tok_src_ref = tok_src.as_deref().filter(|p| p.exists());
+
+    write_mlx_dir(out_dir, &tensors, group_size, bits, extra, tok_src_ref)
+        .map_err(|e| anyhow::anyhow!("MLX write failed: {e}"))?;
+
+    let elapsed = start.elapsed();
+    println!(
+        "quantize --to-mlx: {} tensor(s) — {} quantized (affine {}-bit, g={}), {} passthrough",
+        tensors.len(),
+        n_quant,
+        bits,
+        group_size,
+        n_full,
+    );
+    println!(
+        "          source {:.1} MiB -> MLX directory {} in {:.2}s",
+        bytes_in as f64 / (1024.0 * 1024.0),
+        out_dir.display(),
+        elapsed.as_secs_f64(),
+    );
+    if tok_src_ref.is_some() {
+        println!("          copied tokenizer.json");
+    }
     Ok(())
 }
 

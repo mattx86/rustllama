@@ -567,6 +567,329 @@ pub fn load_mlx_dir(dir: &Path) -> Result<MlxModel, MlxError> {
     })
 }
 
+// =====================================================================
+// Writer (produce path) — the inverse of the loader above.
+//
+// Serializes a set of MLX affine-quantized + full-precision tensors to
+// an `mlx-lm`-shaped model directory: `model.safetensors` (packed
+// weight as uint32, scales/biases as f16), a `config.json` carrying the
+// `quantization` block, and (optionally) a copied `tokenizer.json`.
+// Round-trips back through [`load_mlx_dir`] / [`is_mlx_model`].
+// =====================================================================
+
+/// One tensor to write into an MLX model directory. A [`Quant`] weight
+/// emits the three sibling tensors (`<name>.weight` uint32,
+/// `<name>.scales`/`<name>.biases` f16); a [`Full`] tensor is written
+/// verbatim at its dtype (norms, biases, un-quantized embeddings).
+///
+/// [`Quant`]: MlxWriteTensor::Quant
+/// [`Full`]: MlxWriteTensor::Full
+#[derive(Debug, Clone)]
+pub enum MlxWriteTensor {
+    /// Affine-quantized 2-D linear/embedding weight. `packed` is the
+    /// LSB-first bitstream from
+    /// `rustllama_kernels_cpu::mlx_affine::quantize_mlx_affine`
+    /// (already padded to a whole number of uint32 words);
+    /// `scales`/`biases` are per-group f32 (rounded to f16 on disk, the
+    /// mlx-lm default — see the writer note). `name` is the module path
+    /// (the `.weight`-stripped prefix the loader keys on); `shape` is
+    /// the logical `[out_features, in_features]`.
+    Quant {
+        name: String,
+        packed: Vec<u8>,
+        scales: Vec<f32>,
+        biases: Vec<f32>,
+        group_size: usize,
+        bits: u32,
+        shape: Vec<u64>,
+    },
+    /// A full-precision tensor carried through verbatim at `dtype`.
+    /// `bytes` are the raw little-endian payload matching `dtype`.
+    Full {
+        name: String,
+        dtype: MlxFullDtype,
+        shape: Vec<u64>,
+        bytes: Vec<u8>,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MlxWriteError {
+    #[error("mlx write io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("mlx write serialize: {0}")]
+    Serialize(#[from] safetensors::SafeTensorError),
+    #[error("mlx write config.json: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error(
+        "mlx write `{name}`: quant shape {shape:?} is not 2-D \
+         [out_features, in_features]"
+    )]
+    QuantNotMatrix { name: String, shape: Vec<u64> },
+    #[error(
+        "mlx write `{name}`: in_features {in_features} not a multiple of \
+         group_size {group_size}"
+    )]
+    GroupMisaligned {
+        name: String,
+        in_features: u64,
+        group_size: usize,
+    },
+    #[error(
+        "mlx write `{name}`: in_features {in_features} × bits {bits} = \
+         {row_bits} is not a multiple of 32 — cannot pack into uint32 words"
+    )]
+    RowNotWordAligned {
+        name: String,
+        in_features: u64,
+        bits: u32,
+        row_bits: u64,
+    },
+    #[error(
+        "mlx write `{name}`: packed {got} bytes != expected {expected} \
+         for [{out_features}, {in_features}] at {bits} bits"
+    )]
+    PackedLen {
+        name: String,
+        got: usize,
+        expected: usize,
+        out_features: u64,
+        in_features: u64,
+        bits: u32,
+    },
+    #[error(
+        "mlx write `{name}`: expected {expected} scale/bias groups, got \
+         scales {scales} / biases {biases}"
+    )]
+    GroupCount {
+        name: String,
+        expected: usize,
+        scales: usize,
+        biases: usize,
+    },
+}
+
+/// MLX's `mode="affine"` value string for the `quantization.mode` key.
+const MODE_AFFINE: &str = "affine";
+
+/// f32 → f16 little-endian bytes. mlx-lm stores `scales`/`biases` in the
+/// model's compute dtype (overwhelmingly f16/bf16); we pick **f16** to
+/// match that default and to halve the sidecar size vs f32. The loader
+/// decodes f16 → f32 on read, so the only cost is the f16 rounding of
+/// the per-group scale/bias (well inside the affine quant error).
+fn scales_to_f16_le(v: &[f32]) -> Vec<u8> {
+    v.iter()
+        .flat_map(|x| half::f16::from_f32(*x).to_le_bytes())
+        .collect()
+}
+
+fn full_st_dtype(d: MlxFullDtype) -> StDtype {
+    match d {
+        MlxFullDtype::F32 => StDtype::F32,
+        MlxFullDtype::F16 => StDtype::F16,
+        MlxFullDtype::Bf16 => StDtype::BF16,
+    }
+}
+
+/// An owned tensor payload the serializer borrows from. We stage every
+/// tensor's bytes in a `Vec` first (held for the whole serialize call),
+/// then build the borrowing `TensorView`s in a second pass — the same
+/// lifetime dance `crate::convert` uses.
+struct OwnedTensor {
+    name: String,
+    dtype: StDtype,
+    shape: Vec<usize>,
+    bytes: Vec<u8>,
+}
+
+/// Serialize `tensors` into an MLX model directory at `dir`.
+///
+/// Writes `model.safetensors` (single shard — sharding is out of scope,
+/// see the module TODO), a `config.json` whose `quantization` block
+/// carries `default_group_size`/`default_bits` plus a per-layer override
+/// for any [`MlxWriteTensor::Quant`] whose geometry differs from those
+/// defaults, and — when `tokenizer_src` names an existing file — a copy
+/// of it as `tokenizer.json`. `extra_config` supplies the non-quant
+/// `config.json` fields (architecture, dims, …); its keys are written
+/// verbatim, and a caller-supplied `quantization` key is overwritten.
+///
+/// The result round-trips: [`is_mlx_model`] returns true for the written
+/// directory and [`load_mlx_dir`] reconstructs each weight.
+pub fn write_mlx_dir(
+    dir: &Path,
+    tensors: &[MlxWriteTensor],
+    default_group_size: usize,
+    default_bits: u32,
+    extra_config: serde_json::Map<String, serde_json::Value>,
+    tokenizer_src: Option<&Path>,
+) -> Result<(), MlxWriteError> {
+    std::fs::create_dir_all(dir)?;
+
+    let mut owned: Vec<OwnedTensor> = Vec::with_capacity(tensors.len());
+    // Per-layer quant overrides for config.json — only emitted for a
+    // Quant tensor whose (group_size, bits) differs from the defaults.
+    let mut overrides: serde_json::Map<String, serde_json::Value> =
+        serde_json::Map::new();
+
+    for t in tensors {
+        match t {
+            MlxWriteTensor::Full {
+                name,
+                dtype,
+                shape,
+                bytes,
+            } => {
+                owned.push(OwnedTensor {
+                    name: name.clone(),
+                    dtype: full_st_dtype(*dtype),
+                    shape: shape.iter().map(|&d| d as usize).collect(),
+                    bytes: bytes.clone(),
+                });
+            }
+            MlxWriteTensor::Quant {
+                name,
+                packed,
+                scales,
+                biases,
+                group_size,
+                bits,
+                shape,
+            } => {
+                if shape.len() != 2 {
+                    return Err(MlxWriteError::QuantNotMatrix {
+                        name: name.clone(),
+                        shape: shape.clone(),
+                    });
+                }
+                let out_features = shape[0];
+                let in_features = shape[1];
+                if in_features % *group_size as u64 != 0 {
+                    return Err(MlxWriteError::GroupMisaligned {
+                        name: name.clone(),
+                        in_features,
+                        group_size: *group_size,
+                    });
+                }
+                // MLX packs each row into whole uint32 words; that needs
+                // `in_features * bits` to be a multiple of 32 (always
+                // true when group_size — a multiple of 32 — divides
+                // in_features, but we check rather than assume).
+                let row_bits = in_features * *bits as u64;
+                if row_bits % 32 != 0 {
+                    return Err(MlxWriteError::RowNotWordAligned {
+                        name: name.clone(),
+                        in_features,
+                        bits: *bits,
+                        row_bits,
+                    });
+                }
+                let row_words = (row_bits / 32) as usize;
+                let expected_bytes =
+                    (out_features as usize) * row_words * 4;
+                if packed.len() != expected_bytes {
+                    return Err(MlxWriteError::PackedLen {
+                        name: name.clone(),
+                        got: packed.len(),
+                        expected: expected_bytes,
+                        out_features,
+                        in_features,
+                        bits: *bits,
+                    });
+                }
+                let n_groups =
+                    (out_features * (in_features / *group_size as u64)) as usize;
+                if scales.len() != n_groups || biases.len() != n_groups {
+                    return Err(MlxWriteError::GroupCount {
+                        name: name.clone(),
+                        expected: n_groups,
+                        scales: scales.len(),
+                        biases: biases.len(),
+                    });
+                }
+
+                let groups_per_row = (in_features / *group_size as u64) as usize;
+                // `<name>.weight` — packed uint32; the byte view already
+                // IS the uint32-LE array (see the format docs).
+                owned.push(OwnedTensor {
+                    name: format!("{name}{SUFFIX_WEIGHT}"),
+                    dtype: StDtype::U32,
+                    shape: vec![out_features as usize, row_words],
+                    bytes: packed.clone(),
+                });
+                // `<name>.scales` / `<name>.biases` — per-group f16,
+                // row-major `[out_features, in_features/group_size]`.
+                owned.push(OwnedTensor {
+                    name: format!("{name}{SUFFIX_SCALES}"),
+                    dtype: StDtype::F16,
+                    shape: vec![out_features as usize, groups_per_row],
+                    bytes: scales_to_f16_le(scales),
+                });
+                owned.push(OwnedTensor {
+                    name: format!("{name}{SUFFIX_BIASES}"),
+                    dtype: StDtype::F16,
+                    shape: vec![out_features as usize, groups_per_row],
+                    bytes: scales_to_f16_le(biases),
+                });
+
+                // Record a per-layer override when this weight's quant
+                // geometry diverges from the model-wide defaults.
+                if *group_size != default_group_size || *bits != default_bits {
+                    overrides.insert(
+                        name.clone(),
+                        serde_json::json!({
+                            "group_size": *group_size,
+                            "bits": *bits,
+                            "mode": MODE_AFFINE,
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    // Build the borrowing views in a second pass (owned outlives `map`).
+    let mut map: BTreeMap<String, safetensors::tensor::TensorView<'_>> =
+        BTreeMap::new();
+    for o in &owned {
+        let view = safetensors::tensor::TensorView::new(
+            o.dtype,
+            o.shape.clone(),
+            &o.bytes,
+        )?;
+        map.insert(o.name.clone(), view);
+    }
+    // Tag the file as MLX (mlx-lm writes a `format` metadata key). Not
+    // load-bearing for our loader, but keeps the artifact honest.
+    let metadata: std::collections::HashMap<String, String> =
+        std::collections::HashMap::from([("format".to_string(), "mlx".to_string())]);
+    let blob = safetensors::serialize(&map, &Some(metadata))?;
+    std::fs::write(dir.join("model.safetensors"), &blob)?;
+
+    // config.json: caller fields + the quantization block.
+    let mut config = extra_config;
+    let mut quant = serde_json::Map::new();
+    quant.insert("group_size".into(), serde_json::json!(default_group_size));
+    quant.insert("bits".into(), serde_json::json!(default_bits));
+    quant.insert("mode".into(), serde_json::json!(MODE_AFFINE));
+    for (k, v) in overrides {
+        quant.insert(k, v);
+    }
+    config.insert("quantization".into(), serde_json::Value::Object(quant));
+    let config_str = serde_json::to_string_pretty(&serde_json::Value::Object(config))?;
+    std::fs::write(dir.join("config.json"), config_str)?;
+
+    // Copy the tokenizer when the source has one (standard HF
+    // `tokenizer.json`; the loader leaves tokenizer handling to
+    // rustllama-tokenizer).
+    if let Some(src) = tokenizer_src {
+        if src.exists() {
+            std::fs::copy(src, dir.join("tokenizer.json"))?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,5 +1094,110 @@ mod tests {
         let blob = safetensors::serialize(&map, &None).unwrap();
         let cfg_json = r#"{"quantization": {"group_size": 64, "bits": 4}}"#;
         assert!(!is_mlx_model(cfg_json, &blob));
+    }
+
+    // --- writer (produce path) -------------------------------------------
+
+    /// Deterministic pseudo-random f32 in `[-2, 2)`, matching the
+    /// kernels-cpu encode tests' generator so the round-trip covers a
+    /// realistic weight spread without an `rand` dep.
+    fn pseudo_f32(i: usize) -> f32 {
+        let h = (i as u32).wrapping_mul(2654435761) ^ 0x9E37_79B9;
+        (h % 10_007) as f32 / 10_007.0 * 4.0 - 2.0
+    }
+
+    #[test]
+    fn write_mlx_dir_roundtrips_through_loader() {
+        use rustllama_kernels_cpu::mlx_affine::{
+            dequantize_mlx_affine, quantize_mlx_affine,
+        };
+
+        let out_f = 4usize;
+        let in_f = 128usize;
+        let group_size = 64usize;
+        let bits = 4u32;
+
+        // Synthetic [out_f, in_f] weight, row-major (in_f contiguous) —
+        // exactly the MLX/GGUF nn.Linear layout the loader reconstructs.
+        let weights: Vec<f32> = (0..out_f * in_f).map(pseudo_f32).collect();
+        let (packed, scales, biases) =
+            quantize_mlx_affine(&weights, group_size, bits);
+
+        // A 1-D norm written as a full (un-quantized) f16 passthrough.
+        let norm: Vec<f32> = (0..out_f).map(|i| 1.0 + i as f32 * 0.1).collect();
+        let norm_bytes = f16_bytes(&norm);
+
+        let tensors = vec![
+            MlxWriteTensor::Quant {
+                name: "model.layers.0.self_attn.q_proj".into(),
+                packed,
+                scales: scales.clone(),
+                biases: biases.clone(),
+                group_size,
+                bits,
+                shape: vec![out_f as u64, in_f as u64],
+            },
+            MlxWriteTensor::Full {
+                name: "model.norm.weight".into(),
+                dtype: MlxFullDtype::F16,
+                shape: vec![out_f as u64],
+                bytes: norm_bytes,
+            },
+        ];
+
+        // Unique temp dir per process so parallel test runs don't clash.
+        let dir = std::env::temp_dir()
+            .join(format!("rustllama-mlx-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut extra = serde_json::Map::new();
+        extra.insert("architectures".into(), serde_json::json!(["LlamaForCausalLM"]));
+        extra.insert("hidden_size".into(), serde_json::json!(out_f));
+        write_mlx_dir(&dir, &tensors, group_size, bits, extra, None).unwrap();
+
+        // The written dir must classify as MLX.
+        let cfg_json = std::fs::read_to_string(dir.join("config.json")).unwrap();
+        let st_bytes = std::fs::read(dir.join("model.safetensors")).unwrap();
+        assert!(is_mlx_model(&cfg_json, &st_bytes), "written dir not detected as MLX");
+
+        // Load it back and check geometry + reconstruction.
+        let model = load_mlx_dir(&dir).unwrap();
+        assert_eq!(model.config.group_size, group_size);
+        assert_eq!(model.config.bits, bits);
+        assert_eq!(model.quant.len(), 1);
+        assert_eq!(model.full.len(), 1);
+
+        let q = model
+            .quant
+            .get("model.layers.0.self_attn.q_proj")
+            .expect("quant weight present");
+        assert_eq!(q.shape, vec![out_f as u64, in_f as u64]);
+        assert_eq!(q.group_size, group_size);
+        assert_eq!(q.bits, bits);
+        q.validate().unwrap();
+
+        let mut recon = vec![0f32; q.n_elements() as usize];
+        dequantize_mlx_affine(
+            &q.packed, &q.scales, &q.biases, q.group_size, q.bits, &mut recon,
+        );
+        // Tolerance: affine quant error (scale/2) + slack for the f16
+        // rounding of the per-group scale/bias.
+        for i in 0..weights.len() {
+            let g = i / group_size;
+            let tol = scales[g] * 0.5 + 0.03;
+            assert!(
+                (recon[i] - weights[i]).abs() <= tol,
+                "cell {i}: recon {} vs orig {} (tol {tol})",
+                recon[i],
+                weights[i],
+            );
+        }
+
+        // The full norm survived as an f16 passthrough of the right shape.
+        let norm_t = model.full.get("model.norm.weight").expect("norm present");
+        assert_eq!(norm_t.dtype, MlxFullDtype::F16);
+        assert_eq!(norm_t.shape, vec![out_f as u64]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

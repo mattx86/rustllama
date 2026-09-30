@@ -81,6 +81,124 @@ pub fn read_bits_le(packed: &[u8], bit_pos: usize, bits: u32) -> u32 {
     val
 }
 
+/// Write `bits` bits for element `index` into `out`, LSB-first — the
+/// exact inverse of [`read_bits_le`] (which reads element `i` from the
+/// absolute bit offset `i*bits`). Here `index` is the *element* index,
+/// so the bits land at `[index*bits, (index+1)*bits)`.
+///
+/// `value` must already be masked to `bits` bits; the target byte span
+/// of `out` must be pre-zeroed, because we OR the code in (never clear)
+/// — mirroring how MLX's packer accumulates successive elements into a
+/// freshly-zeroed uint32 word. The straddle handling (3/5/6-bit codes
+/// that cross a byte/word boundary) is the write-side twin of the read
+/// loop: take the low `take` bits available in the current byte, OR
+/// them in at `bit_in_byte`, advance, repeat.
+#[inline]
+pub fn write_bits_le(out: &mut [u8], index: usize, bits: u32, value: u32) {
+    debug_assert!(bits <= 32);
+    debug_assert!(bits == 32 || value < (1u32 << bits), "value {value} exceeds {bits} bits");
+    let bit_pos = index * bits as usize;
+    let mut got: u32 = 0;
+    while got < bits {
+        let abs = bit_pos + got as usize;
+        let byte_idx = abs / 8;
+        let bit_in_byte = (abs % 8) as u32;
+        let avail = 8 - bit_in_byte; // bits free in this byte
+        let take = avail.min(bits - got); // how many we deposit here
+        let mask = if take == 32 { u32::MAX } else { (1u32 << take) - 1 };
+        // Low `take` bits of the remaining value, shifted to sit at
+        // `bit_in_byte`. `take <= 8` always (a byte holds <= 8 free
+        // bits), so the cast to u8 never truncates real data.
+        let chunk = ((value >> got) & mask) as u8;
+        out[byte_idx] |= chunk << bit_in_byte;
+        got += take;
+    }
+}
+
+/// MLX group-affine (min/max) **encode**: quantize `weights` to the MLX
+/// affine triple — packed `bits`-bit codes + per-group `scales` +
+/// per-group `biases` — the exact inverse of [`dequantize_mlx_affine`].
+///
+/// This mirrors mlx-lm's `mx.quantize(..., mode="affine")`: process
+/// `group_size` contiguous elements (along the flattened input dim) at
+/// a time; per group take `lo = min`, `hi = max`, set
+/// `scale = (hi - lo) / ((1<<bits) - 1)` and `bias = lo`, then
+/// `q[i] = round((w[i] - lo) / scale)` clamped to `[0, (1<<bits)-1]`.
+/// Dequant reconstructs `scale*q + bias`, so per-element error is
+/// bounded by `scale/2` (plus f32 rounding).
+///
+/// Returns `(packed, scales, biases)` where `packed` is the contiguous
+/// LSB-first bitstream **padded up to a whole number of uint32 words**
+/// (multiple of 4 bytes) so that reinterpreting it as a `uint32-LE`
+/// array yields exactly MLX's packed `weight` tensor. For a real
+/// linear (`in_features` a multiple of `group_size`, itself a multiple
+/// of 32) the natural byte length is already a multiple of 4, so the
+/// padding is a no-op; it only ever matters for odd synthetic shapes.
+///
+/// # Zero-range groups
+///
+/// When a group is constant (`hi == lo`, or non-finite) `scale` would
+/// be 0 and `round((w-lo)/scale)` is undefined. We fall back to
+/// `scale = 1.0`, which forces every code to `round(0) = 0` and makes
+/// dequant reproduce `bias = lo` exactly — the MLX behavior for a flat
+/// group.
+pub fn quantize_mlx_affine(
+    weights: &[f32],
+    group_size: usize,
+    bits: u32,
+) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+    assert!(
+        matches!(bits, 2 | 3 | 4 | 5 | 6 | 8),
+        "unsupported bits {bits} (want one of 2,3,4,5,6,8)"
+    );
+    let n = weights.len();
+    assert!(
+        group_size > 0 && n % group_size == 0,
+        "n {n} not a multiple of group_size {group_size}"
+    );
+    let n_groups = n / group_size;
+    let qmax = ((1u32 << bits) - 1) as f32; // top code = levels - 1
+
+    // Packed byte length, padded to a multiple of 4 so the byte view
+    // maps to a whole-word uint32-LE array (see the doc note above).
+    let packed_len = (n * bits as usize).div_ceil(8).next_multiple_of(4);
+    let mut packed = vec![0u8; packed_len];
+    let mut scales = Vec::with_capacity(n_groups);
+    let mut biases = Vec::with_capacity(n_groups);
+
+    for g in 0..n_groups {
+        let base = g * group_size;
+        let grp = &weights[base..base + group_size];
+        let mut lo = grp[0];
+        let mut hi = grp[0];
+        for &w in &grp[1..] {
+            if w < lo {
+                lo = w;
+            }
+            if w > hi {
+                hi = w;
+            }
+        }
+        // `scale > 0` catches hi==lo (zero range) AND a NaN range, both
+        // of which fall back to the flat-group encoding (all codes 0).
+        let mut scale = (hi - lo) / qmax;
+        if !(scale > 0.0) {
+            scale = 1.0;
+        }
+        let inv = 1.0 / scale;
+        for (j, &w) in grp.iter().enumerate() {
+            // round-half-to-even via f32::round (half away from zero);
+            // the offset (w-lo) is >= 0 so direction bias is moot.
+            let q = (((w - lo) * inv).round()).clamp(0.0, qmax) as u32;
+            write_bits_le(&mut packed, base + j, bits, q);
+        }
+        scales.push(scale);
+        biases.push(lo);
+    }
+
+    (packed, scales, biases)
+}
+
 /// Decode `out.len()` MLX affine-quantized elements to f32.
 ///
 /// `packed` is the contiguous little-endian bitstream (`out.len()*bits/8`
@@ -244,6 +362,128 @@ mod tests {
             let g = i / group_size;
             let want = scales[g] * qs[i] as f32 + biases[g];
             assert!((out[i] - want).abs() < 1e-6, "i={i} got {} want {want}", out[i]);
+        }
+    }
+
+    /// Deterministic pseudo-random f32 in `[-2, 2)` — a fixed spread so
+    /// the encode tests are reproducible without an `rand` dep.
+    fn pseudo_f32(i: usize) -> f32 {
+        let h = (i as u32).wrapping_mul(2654435761) ^ 0x9E37_79B9;
+        (h % 10_007) as f32 / 10_007.0 * 4.0 - 2.0
+    }
+
+    #[test]
+    fn write_then_read_bits_roundtrips_all_widths() {
+        // write_bits_le ∘ read_bits_le must be the identity for every
+        // supported width, including the straddling 3/5/6-bit codes.
+        for &bits in &[2u32, 3, 4, 5, 6, 8] {
+            let maxv = 1u32 << bits;
+            // 64 elements → byte-aligned for every width (64*bits % 8 == 0).
+            let vals: Vec<u32> = (0..64).map(|i| (i as u32).wrapping_mul(2246822519) % maxv).collect();
+            let mut packed = vec![0u8; 64 * bits as usize / 8];
+            for (i, &v) in vals.iter().enumerate() {
+                write_bits_le(&mut packed, i, bits, v);
+            }
+            for (i, &v) in vals.iter().enumerate() {
+                let got = read_bits_le(&packed, i * bits as usize, bits);
+                assert_eq!(got, v, "bits={bits} i={i}");
+            }
+        }
+    }
+
+    #[test]
+    fn quantize_then_dequantize_within_scale_half() {
+        // Encode → decode must reconstruct each element within scale/2
+        // (+ f32 rounding eps), across every group_size × bits combo.
+        for &group_size in &[32usize, 64, 128] {
+            for &bits in &[2u32, 3, 4, 5, 6, 8] {
+                let n = group_size * 5; // 5 groups
+                let weights: Vec<f32> = (0..n).map(pseudo_f32).collect();
+                let (packed, scales, biases) =
+                    quantize_mlx_affine(&weights, group_size, bits);
+
+                // Packed length is padded to a multiple of 4 (u32 words).
+                assert_eq!(packed.len() % 4, 0, "packed not word-padded");
+                // For these shapes the natural length is already a
+                // multiple of 4, so padding adds nothing.
+                assert_eq!(packed.len(), n * bits as usize / 8);
+                assert_eq!(scales.len(), n / group_size);
+                assert_eq!(biases.len(), n / group_size);
+
+                let mut recon = vec![0f32; n];
+                dequantize_mlx_affine(
+                    &packed, &scales, &biases, group_size, bits, &mut recon,
+                );
+                for i in 0..n {
+                    let g = i / group_size;
+                    let tol = scales[g] * 0.5 + 1e-4;
+                    assert!(
+                        (recon[i] - weights[i]).abs() <= tol,
+                        "gs={group_size} bits={bits} i={i}: recon {} vs {} (tol {tol})",
+                        recon[i],
+                        weights[i],
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quantize_constant_group_is_exact() {
+        // A flat group (hi==lo) must hit the scale=1 fallback and
+        // reproduce the constant exactly (all codes 0, bias=value).
+        let weights = vec![0.375f32; 64];
+        let (packed, scales, biases) = quantize_mlx_affine(&weights, 32, 4);
+        assert_eq!(scales, vec![1.0, 1.0]);
+        assert_eq!(biases, vec![0.375, 0.375]);
+        let mut recon = vec![0f32; 64];
+        dequantize_mlx_affine(&packed, &scales, &biases, 32, 4, &mut recon);
+        assert!(recon.iter().all(|&r| (r - 0.375).abs() < 1e-6));
+    }
+
+    #[test]
+    fn quantized_matvec_approximates_naive_f32_matvec() {
+        // Encode a full [m,k] weight, then confirm the fused quant
+        // matvec over the encoded weights tracks a naive f32 matvec on
+        // the ORIGINAL weights within a quantization-error bound.
+        for &(group_size, bits) in &[(32usize, 8u32), (64, 4), (128, 6), (32, 3)] {
+            let m = 4usize;
+            let k = group_size * 3; // 3 groups per row
+            let n = m * k;
+            let weights: Vec<f32> = (0..n).map(pseudo_f32).collect();
+            let x: Vec<f32> = (0..k).map(|c| (c as f32) * 0.003 - 0.4).collect();
+
+            let (packed, scales, biases) =
+                quantize_mlx_affine(&weights, group_size, bits);
+
+            // Naive f32 reference on the ORIGINAL weights.
+            let mut want = vec![0f32; m];
+            for i in 0..m {
+                let mut acc = 0.0f32;
+                for c in 0..k {
+                    acc += weights[i * k + c] * x[c];
+                }
+                want[i] = acc;
+            }
+
+            let mut out = vec![0f32; m];
+            matvec_mlx_affine_w_f32_a(
+                &packed, &scales, &biases, group_size, bits, &x, &mut out, m, k,
+            );
+
+            // Per-output error <= Σ_c (scale_c/2)*|x_c|. Bound it loosely
+            // with the max group scale and the L1 norm of x.
+            let max_scale = scales.iter().cloned().fold(0.0f32, f32::max);
+            let l1_x: f32 = x.iter().map(|v| v.abs()).sum();
+            let tol = max_scale * 0.5 * l1_x + 1e-3;
+            for i in 0..m {
+                assert!(
+                    (out[i] - want[i]).abs() <= tol,
+                    "gs={group_size} bits={bits} row {i}: {} vs {} (tol {tol})",
+                    out[i],
+                    want[i],
+                );
+            }
         }
     }
 

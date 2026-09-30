@@ -51,6 +51,11 @@ rustllama-client = { path = "../rustllama-client" }
 rustllama-lsp = { path = "../rustllama-lsp" }
 rustllama-tuner = { path = "../rustllama-tuner" }
 rustllama-gguf = { path = "../rustllama-gguf", default-features = false }
+# `quantize --to-mlx` writes an MLX affine model directory via this
+# crate's `write_mlx_dir` (produce path); the GGUF source is dequantized
+# through `rustllama-gguf` and re-quantized with the MLX affine encoder
+# in `rustllama-kernels-cpu`.
+rustllama-safetensors = { path = "../rustllama-safetensors" }
 # `doctor --sycl-smoke` round-trips f32 ↔ f16 to drive the SYCL kernel.
 half.workspace = true
 # kernels-sycl: real-only, always compiled — its C++ TU is built by
