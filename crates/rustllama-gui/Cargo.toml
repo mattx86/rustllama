@@ -21,6 +21,10 @@ egui = "0.29"
 egui_extras = { version = "0.29", features = ["syntect"] }
 egui_commonmark = "0.18"
 
+# Native OS file dialog (the Models view's "Load from file…" GGUF picker).
+# Pure-Rust/platform-native, no toolchain deps — keeps the crate toolchain-free.
+rfd = "0.15"
+
 # The ONLY rustllama dep — a reqwest-only HTTP client. Depending on
 # -client (not -engine/-models/-server/-kernels-*) is what keeps this
 # crate TOOLCHAIN-FREE: it builds with plain `cargo`, no oneAPI/CUDA env.

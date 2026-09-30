@@ -235,18 +235,27 @@ pub struct EmbeddingsUsage {
     pub total_tokens: u32,
 }
 
-/// Body shape for `POST /v1/models/load`. Either `path` or `hub` is
-/// required; the others are optional knobs that get applied to the
-/// freshly-loaded model.
+/// Body shape for `POST /v1/models/load`. Exactly one of `path`, `hub`, or
+/// `name` identifies the GGUF to load; the rest are optional knobs applied to
+/// the freshly-loaded model.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct LoadModelParams {
-    /// Absolute path to a `.gguf` file. Mutually exclusive with `hub`.
+    /// Absolute path to a `.gguf` file. Mutually exclusive with `hub`/`name`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<std::path::PathBuf>,
     /// HuggingFace ref `owner/repo:filename`. Server resolves against
     /// its local cache; does not trigger a download.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hub: Option<String>,
+    /// Short file-stem as surfaced by `/api/tags` (a *cached* model). The
+    /// server walks its model cache and matches `path.file_stem()` — this is
+    /// the shape the web Models page's Load button POSTs for cached rows, and
+    /// the ONLY payload that reliably loads a cached model by name. (The CLI
+    /// `model load <name>` fails because it treats the bare arg as a
+    /// filesystem path instead of a cache stem.) Mutually exclusive with
+    /// `path`/`hub`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Context length override (defaults to 8192 server-side).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ctx_size: Option<usize>,
@@ -256,6 +265,141 @@ pub struct LoadModelParams {
     /// KV-cache dtype: `"f32"` or `"q8_0"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_dtype: Option<String>,
+}
+
+// --- Model-management + status wire types (Ollama /api/* + /v1/metrics) ----
+// Consumed by the native GUI's Models view + status bar. Field sets mirror the
+// web UI's `api.ts` (see `app/ui/src/api.ts`); every field is lenient
+// (`#[serde(default)]`) so a slimmer/older server response still deserializes.
+
+/// One cached GGUF on disk, from `GET /api/tags` (`{ models: [...] }`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TagsModel {
+    /// File stem / display name — the value the load `name` field wants.
+    pub name: String,
+    /// Ollama-shaped mirror of `name` (often identical); unused by the GUI.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// On-disk size in bytes.
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub modified_at: Option<String>,
+    #[serde(default)]
+    pub details: Option<TagsModelDetails>,
+}
+
+/// Per-model metadata badges (`family`, `parameter_size`, `quantization_level`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TagsModelDetails {
+    #[serde(default)]
+    pub family: Option<String>,
+    #[serde(default)]
+    pub parameter_size: Option<String>,
+    #[serde(default)]
+    pub quantization_level: Option<String>,
+}
+
+/// The `{ models: [...] }` envelope `/api/tags` returns.
+#[derive(Debug, Deserialize)]
+struct TagsResponse {
+    #[serde(default)]
+    models: Vec<TagsModel>,
+}
+
+/// Subset of `GET /v1/metrics` the status bar renders. The full snapshot the
+/// web Status page consumes is much larger; we pin only the RAM / GPU / tok-s
+/// / active-model fields the bar needs and let the rest pass through unread.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MetricsSnapshot {
+    #[serde(default)]
+    pub model_id: String,
+    #[serde(default)]
+    pub ctx_size: u64,
+    #[serde(default)]
+    pub ctx_used: u64,
+    /// Per-request decode tok/s (swings wildly cold→warm; prefer `ema_tok_s`).
+    #[serde(default)]
+    pub last_tok_s: Option<f64>,
+    /// Exponential moving average of decode tok/s — the value to display.
+    #[serde(default)]
+    pub ema_tok_s: Option<f64>,
+    /// KV-cache dtype ("f32"/"q8_0"/…); `null` on the mock engine.
+    #[serde(default)]
+    pub kv_dtype: Option<String>,
+    /// Host physical RAM, total + currently-free (used = total − available).
+    #[serde(default)]
+    pub ram_total_bytes: u64,
+    #[serde(default)]
+    pub ram_available_bytes: u64,
+    /// System-wide CPU utilization %, 0..=100 (delta since the last poll).
+    #[serde(default)]
+    pub cpu_utilization_pct: Option<f64>,
+    #[serde(default)]
+    pub cpu_brand: Option<String>,
+    /// Per-physical-GPU VRAM/util (deduped across SYCL+CUDA). Absent/empty
+    /// when no GPU is visible.
+    #[serde(default)]
+    pub gpus: Option<Vec<GpuMetric>>,
+}
+
+/// One physical GPU's live VRAM + utilization for the status bar.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GpuMetric {
+    /// Stable enumeration index — the label ("GPU 0", "GPU 1") stays fixed
+    /// regardless of which GPUs are disabled.
+    #[serde(default)]
+    pub index: u32,
+    /// "intel" | "nvidia" | "amd" | "gpu".
+    #[serde(default)]
+    pub vendor: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub vram_total_bytes: Option<u64>,
+    #[serde(default)]
+    pub vram_free_bytes: Option<u64>,
+    /// Engine (compute/render) utilization %, 0..=100; `null` when the
+    /// backend doesn't expose it (bar shows "n/a").
+    #[serde(default)]
+    pub utilization_pct: Option<f64>,
+}
+
+/// A GGUF-carrying repo from `GET /api/hf/search`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HfModel {
+    pub id: String,
+    #[serde(default)]
+    pub downloads: u64,
+    #[serde(default)]
+    pub likes: u64,
+}
+
+/// A single `.gguf` file within a repo, from `GET /api/hf/files`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HfFile {
+    pub rfilename: String,
+    #[serde(default)]
+    pub size: u64,
+}
+
+/// One NDJSON line streamed by `POST /api/pull`. A download frame carries
+/// `status` + `completed`/`total` byte counts; a failure frame carries
+/// `error`. Every field is optional so keepalive / partial frames don't break
+/// deserialization.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PullProgress {
+    #[serde(default)]
+    pub status: String,
+    /// Bytes downloaded so far (present during the `downloading …` phase).
+    #[serde(default)]
+    pub completed: Option<u64>,
+    /// Total bytes (Content-Length); 0/absent when the server can't report it.
+    #[serde(default)]
+    pub total: Option<u64>,
+    /// Server-side error message (a `{"error": "..."}` frame).
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// One tool call the model emitted, reassembled from the streaming
@@ -463,6 +607,126 @@ impl Client {
         Ok(resp.json().await?)
     }
 
+    /// `GET /api/tags` — the Ollama-shaped list of *cached* GGUFs on disk
+    /// (`{ models: [...] }`). The GUI Models view's "My Models" section is
+    /// built from this; each entry's `name` is the load payload for a cached
+    /// model (see [`LoadModelParams::name`]).
+    pub async fn cached_models(&self) -> Result<Vec<TagsModel>> {
+        let url = join(&self.base, "/api/tags")?;
+        let resp = self.http.get(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Server {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(resp.json::<TagsResponse>().await?.models)
+    }
+
+    /// `GET /v1/metrics` — the status-bar snapshot (RAM, per-GPU VRAM/util,
+    /// tok/s EMA, active model, …). See [`MetricsSnapshot`] for the consumed
+    /// subset.
+    pub async fn metrics(&self) -> Result<MetricsSnapshot> {
+        let url = join(&self.base, "/v1/metrics")?;
+        let resp = self.http.get(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Server {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// `DELETE /api/delete` — remove a cached GGUF from disk. `name` is the
+    /// `/api/tags` display name (`owner/repo:filename` or a bare file stem).
+    pub async fn delete_model(&self, name: &str) -> Result<()> {
+        let url = join(&self.base, "/api/delete")?;
+        let resp = self
+            .http
+            .delete(url)
+            .json(&serde_json::json!({ "name": name }))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Server {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(())
+    }
+
+    /// `GET /api/hf/search?q=…&limit=…` — realtime HuggingFace search for
+    /// GGUF-carrying repos (proxied server-side so the GUI needs no HF token).
+    pub async fn hf_search(&self, query: &str, limit: u32) -> Result<Vec<HfModel>> {
+        let mut url = join(&self.base, "/api/hf/search")?;
+        url.query_pairs_mut()
+            .append_pair("q", query)
+            .append_pair("limit", &limit.to_string());
+        let resp = self.http.get(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Server {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// `GET /api/hf/files?repo=…` — the `.gguf` files in a repo (so the user
+    /// can pick which quant to pull).
+    pub async fn hf_files(&self, repo: &str) -> Result<Vec<HfFile>> {
+        let mut url = join(&self.base, "/api/hf/files")?;
+        url.query_pairs_mut().append_pair("repo", repo);
+        let resp = self.http.get(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Server {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// `POST /api/pull` — download a model by HuggingFace ref, streaming
+    /// NDJSON progress. Mirrors [`Self::chat_stream`]'s streaming shape but
+    /// over newline-delimited JSON: the returned stream yields one
+    /// [`PullProgress`] per line (a byte-count frame, or a terminal
+    /// `{"error": …}` frame), then completes when the download ends.
+    pub async fn pull_model(
+        &self,
+        model_ref: &str,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<PullProgress>> + Send>>> {
+        let url = join(&self.base, "/api/pull")?;
+        let resp = self
+            .http
+            .post(url)
+            .json(&serde_json::json!({ "model": model_ref, "stream": true }))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Server {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let byte_stream = resp.bytes_stream();
+        Ok(Box::pin(parse_ndjson(byte_stream)))
+    }
+
     /// Issue a streaming chat completion (`stream=true`) and parse the SSE
     /// response into [`ChatEvent`]s. The returned stream yields events until
     /// `Finish` or `Error`, then completes.
@@ -547,6 +811,56 @@ where
             }
         }
     }
+}
+
+/// Drive the raw byte stream of `POST /api/pull` into [`PullProgress`]
+/// items. Unlike the SSE parsers this is plain NDJSON: split on `\n`, parse
+/// each non-empty line as JSON, and tolerate keepalive / partial frames by
+/// silently skipping any line that doesn't parse (mirrors the web client's
+/// `pullModel` loop). Buffers across chunk boundaries.
+fn parse_ndjson<S>(byte_stream: S) -> impl Stream<Item = Result<PullProgress>> + Send
+where
+    S: Stream<Item = reqwest::Result<bytes::Bytes>> + Send + Unpin + 'static,
+{
+    async_stream::stream! {
+        let mut buf = Vec::<u8>::new();
+        let mut byte_stream = byte_stream;
+
+        while let Some(chunk) = byte_stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    yield Err(ClientError::Http(e));
+                    return;
+                }
+            };
+            buf.extend_from_slice(&chunk);
+
+            // Emit every complete (newline-terminated) line.
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let mut line: Vec<u8> = buf.drain(..=pos).collect();
+                line.pop(); // drop the trailing '\n'
+                if let Some(p) = decode_ndjson_line(&line) {
+                    yield Ok(p);
+                }
+            }
+        }
+
+        // Flush a trailing line that arrived without a closing newline.
+        if let Some(p) = decode_ndjson_line(&buf) {
+            yield Ok(p);
+        }
+    }
+}
+
+/// Parse one NDJSON line into a [`PullProgress`], or `None` for a blank /
+/// unparseable (keepalive, partial) frame.
+fn decode_ndjson_line(line: &[u8]) -> Option<PullProgress> {
+    let text = std::str::from_utf8(line).ok()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<PullProgress>(text).ok()
 }
 
 fn find_event_boundary(buf: &[u8]) -> Option<usize> {
@@ -1110,5 +1424,85 @@ mod tests {
         let resp: CompletionResponse = serde_json::from_value(body).unwrap();
         assert_eq!(resp.system_fingerprint.as_deref(), Some("fp_deadbeefcafe"));
         assert_eq!(resp.usage.unwrap().total_tokens, 9);
+    }
+
+    /// The cached-model load payload the GUI Models page replicates: a bare
+    /// file stem serializes to `{ "name": "<stem>" }` (NOT `path`) — the only
+    /// shape that loads a cached model by name. `skip_serializing_if` keeps
+    /// the unused `path`/`hub` fields out of the wire body.
+    #[test]
+    fn load_params_cached_name_serializes_to_name_field() {
+        let params = LoadModelParams {
+            name: Some("Qwen2.5-Coder-0.5B".into()),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&params).unwrap();
+        assert_eq!(v.get("name").and_then(|n| n.as_str()), Some("Qwen2.5-Coder-0.5B"));
+        assert!(v.get("path").is_none(), "path must be omitted for a cached load");
+        assert!(v.get("hub").is_none(), "hub must be omitted for a cached load");
+    }
+
+    /// `/api/tags` envelope → cached model list with detail badges.
+    #[test]
+    fn tags_response_deserializes_models_with_details() {
+        let body = serde_json::json!({
+            "models": [{
+                "name": "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf",
+                "model": "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf",
+                "size": 417_000_000u64,
+                "modified_at": "2026-09-01T00:00:00Z",
+                "details": { "family": "qwen2", "parameter_size": "0.5B", "quantization_level": "Q4_K_M" }
+            }]
+        });
+        let models: Vec<TagsModel> =
+            serde_json::from_value::<TagsResponse>(body).unwrap().models;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].size, 417_000_000);
+        assert_eq!(models[0].details.as_ref().unwrap().family.as_deref(), Some("qwen2"));
+    }
+
+    /// A slim `/v1/metrics` payload deserializes (every field lenient), and
+    /// the GPU list carries VRAM + util.
+    #[test]
+    fn metrics_snapshot_deserializes_minimal_and_gpus() {
+        let body = serde_json::json!({
+            "model_id": "qwen2.5-coder-0.5b",
+            "ram_total_bytes": 34_000_000_000u64,
+            "ram_available_bytes": 12_000_000_000u64,
+            "ema_tok_s": 42.5,
+            "gpus": [{
+                "index": 0, "vendor": "intel", "name": "Iris Xe",
+                "vram_total_bytes": 2_000_000_000u64, "vram_free_bytes": 1_500_000_000u64,
+                "utilization_pct": 61.0
+            }]
+        });
+        let m: MetricsSnapshot = serde_json::from_value(body).unwrap();
+        assert_eq!(m.ram_total_bytes, 34_000_000_000);
+        assert_eq!(m.ema_tok_s, Some(42.5));
+        let gpus = m.gpus.unwrap();
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].utilization_pct, Some(61.0));
+        assert_eq!(gpus[0].vram_free_bytes, Some(1_500_000_000));
+    }
+
+    /// NDJSON pull frames: a byte-count line parses to a progress frame; a
+    /// blank / garbage line yields nothing; an `{"error": …}` line surfaces
+    /// the message.
+    #[test]
+    fn ndjson_line_decodes_progress_error_and_skips_junk() {
+        let prog = decode_ndjson_line(
+            br#"{"status":"downloading","completed":512,"total":1024}"#,
+        )
+        .unwrap();
+        assert_eq!(prog.status, "downloading");
+        assert_eq!(prog.completed, Some(512));
+        assert_eq!(prog.total, Some(1024));
+
+        let err = decode_ndjson_line(br#"{"error":"repo not found"}"#).unwrap();
+        assert_eq!(err.error.as_deref(), Some("repo not found"));
+
+        assert!(decode_ndjson_line(b"").is_none());
+        assert!(decode_ndjson_line(b"   ").is_none());
+        assert!(decode_ndjson_line(b"not json").is_none());
     }
 }

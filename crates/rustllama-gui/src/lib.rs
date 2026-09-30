@@ -1,4 +1,5 @@
-//! Native egui/eframe desktop GUI for rustllama — Phase 1 (functional chat).
+//! Native egui/eframe desktop GUI for rustllama — Phase 2 (chat + model
+//! management + status bar).
 //!
 //! This crate is deliberately **toolchain-free**: it depends only on
 //! `rustllama-client` (a reqwest-only OpenAI/Ollama HTTP client) plus the egui
@@ -7,11 +8,17 @@
 //! server-embedding stays in `app/src-tauri` (a later step) which will call
 //! [`run_ui`]; the GUI itself only ever talks to the server over HTTP.
 //!
-//! ## Phase 1 scope
-//! Load/select a model, stream a chat conversation, render assistant turns as
-//! markdown. Model management, settings, status panels, typed decisions, and
-//! quantization tooling are later phases — this crate leaves `TODO(phase2)`
-//! notes where their seams are but does not build them.
+//! ## Scope
+//! - **Chat** view: load/select a model, stream a conversation, render
+//!   assistant turns as markdown.
+//! - **Models** view: loaded + cached lists (load / unload / set-default /
+//!   delete), a native "load from file" picker, and HuggingFace search →
+//!   streamed pull with a live progress bar.
+//! - A left icon-nav sidebar and an always-on status bar (RAM / per-GPU VRAM /
+//!   tok-s / active model, polled from `/v1/metrics`).
+//!
+//! Settings, typed decisions, and quantization tooling are later phases — the
+//! nav rail stubs them so their seams are visible but does not build them.
 //!
 //! ## The async/repaint bridge (the load-bearing gotcha)
 //! egui is immediate-mode and only repaints on input or an explicit
