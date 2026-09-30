@@ -440,6 +440,9 @@ enum Action {
     RefreshModels,
     LoadCached(String),
     PickFile,
+    /// Pick an MLX model FOLDER off disk (mlx-lm / mlx-community layout) and
+    /// load it by `path` — the on-demand equivalent of `serve --model <dir>`.
+    PickFolder,
     SetDefault(String),
     UnloadModel(String),
     AskDelete(String),
@@ -1280,6 +1283,27 @@ impl GuiApp {
                 .add_filter("GGUF model", &["gguf"])
                 .set_title("Load a GGUF model")
                 .pick_file()
+            {
+                let _ = tx.send(UiMsg::PickedFile(path));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Open the native "load a model folder" dialog. Same blocking-rfd-on-an-
+    /// OS-thread pattern as [`spawn_pick_file`], but picks a DIRECTORY — an
+    /// MLX model layout (`config.json` + `*.safetensors` + `tokenizer.json`),
+    /// which the server routes through `load_auto`. The pick rides back on the
+    /// same `PickedFile` message, so it flows through `spawn_load_path` and
+    /// loads by `path` (a dir is a valid load target once the server routes
+    /// it), letting a user load an MLX model sitting anywhere on disk — not
+    /// just under the model cache.
+    fn spawn_pick_folder(&self) {
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Load an MLX model folder")
+                .pick_folder()
             {
                 let _ = tx.send(UiMsg::PickedFile(path));
                 ctx.request_repaint();
@@ -2584,6 +2608,7 @@ impl eframe::App for GuiApp {
                     self.spawn_load_cached(name);
                 }
                 Action::PickFile => self.spawn_pick_file(),
+                Action::PickFolder => self.spawn_pick_folder(),
                 Action::SetDefault(id) => {
                     self.busy_model = Some(id.clone());
                     self.spawn_set_default(id);
@@ -3524,6 +3549,9 @@ impl GuiApp {
                             }
                             if ui.button("Load from file…").clicked() {
                                 actions.push(Action::PickFile);
+                            }
+                            if ui.button("Load from folder…").clicked() {
+                                actions.push(Action::PickFolder);
                             }
                         });
                         if let Some(e) = &self.models_error {

@@ -8676,21 +8676,54 @@ fn sessions_export(name: &str, format: &str, out: Option<&std::path::Path>) -> a
 fn models_list() -> anyhow::Result<()> {
     let cache_dir = rustllama_hub::default_cache_dir()
         .ok_or_else(|| anyhow::anyhow!("could not resolve cache dir"))?;
-    let entries = rustllama_hub::list_cached(&cache_dir)?;
+    // `list_cached_models` surfaces cached GGUF files AND MLX model
+    // directories (mlx-lm / mlx-community layout), so both show up here and
+    // can be loaded on the running server by name.
+    let entries = rustllama_hub::list_cached_models(&cache_dir)?;
     if entries.is_empty() {
         println!("(no cached models in {})", cache_dir.display());
         return Ok(());
     }
-    println!("{:<48} {:>10}  PATH", "OWNER__REPO/FILENAME", "SIZE_MB");
-    for path in entries {
-        let size_mb = std::fs::metadata(&path)
-            .map(|m| (m.len() as f64) / (1024.0 * 1024.0))
-            .unwrap_or(0.0);
-        let rel = path.strip_prefix(&cache_dir).unwrap_or(&path);
-        let rel_str = rel.display().to_string().replace('\\', "/");
-        println!("{:<48} {:>10.1}  {}", rel_str, size_mb, path.display());
+    println!("{:<48} {:>10}  PATH", "NAME", "SIZE_MB");
+    for entry in entries {
+        // GGUF = the file size; MLX dir = the sum of its `*.safetensors`
+        // shards (the weights), since the dir's own `metadata().len()` is
+        // meaningless.
+        let size_mb = if entry.is_dir {
+            mlx_dir_weight_bytes(&entry.path) as f64 / (1024.0 * 1024.0)
+        } else {
+            std::fs::metadata(&entry.path)
+                .map(|m| (m.len() as f64) / (1024.0 * 1024.0))
+                .unwrap_or(0.0)
+        };
+        let label = if entry.is_dir {
+            format!("{} (mlx)", entry.name)
+        } else {
+            entry.name.clone()
+        };
+        println!("{:<48} {:>10.1}  {}", label, size_mb, entry.path.display());
     }
     Ok(())
+}
+
+/// Total bytes of an MLX model directory's `*.safetensors` shards — the
+/// weights that dominate its on-disk size. Best-effort; 0 on an unreadable
+/// dir. (Mirrors the server's `/api/tags` size column.)
+fn mlx_dir_weight_bytes(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .and_then(|x| x.to_str())
+                        .map(|x| x.eq_ignore_ascii_case("safetensors"))
+                        .unwrap_or(false)
+                })
+                .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 fn models_rm(hub_ref_or_path: &str) -> anyhow::Result<()> {

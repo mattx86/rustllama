@@ -2132,16 +2132,18 @@ async fn load_model(
             p
         }
         (false, false, true) => {
-            // Short-name resolution: walk the cache, match file stems.
+            // Short-name resolution: walk the cache, match model names.
             // This is the path the GUI Models page hits when the user
             // clicks "Load" on a row from `/api/tags` (which surfaces
-            // file stems, not full paths).
+            // names, not full paths). `list_cached_models` matches a GGUF
+            // by file stem AND an MLX model directory by its folder name,
+            // so an MLX dir loads by name the same way a cached GGUF does.
             let name = req.name.unwrap();
             let Some(cache) = rustllama_hub::default_cache_dir() else {
                 return (StatusCode::INTERNAL_SERVER_ERROR, "no cache dir").into_response();
             };
-            let paths = match rustllama_hub::list_cached(&cache) {
-                Ok(p) => p,
+            let models = match rustllama_hub::list_cached_models(&cache) {
+                Ok(m) => m,
                 Err(e) => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -2150,19 +2152,14 @@ async fn load_model(
                         .into_response();
                 }
             };
-            let matched = paths.into_iter().find(|p| {
-                p.file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s == name)
-                    .unwrap_or(false)
-            });
+            let matched = models.into_iter().find(|m| m.name == name).map(|m| m.path);
             match matched {
                 Some(p) => p,
                 None => {
                     return (
                         StatusCode::NOT_FOUND,
                         format!(
-                            "no cached GGUF with file stem `{name}` under {}",
+                            "no cached GGUF or MLX model named `{name}` under {}",
                             cache.display()
                         ),
                     )
@@ -2411,17 +2408,37 @@ async fn load_model(
 
     let load_path = path.clone();
     let load_layout = applied_layout.clone();
-    let load_result = tokio::task::spawn_blocking(move || {
-        rustllama_engine::CpuEngine::load_with_options_layout_and_page_size(
-            &load_path,
-            max_ctx,
-            true,
-            kv_dtype,
-            &load_layout,
-            applied_page_size,
-        )
-    })
-    .await;
+    // Route by load target. An MLX model DIRECTORY (or a `.safetensors`
+    // checkpoint) goes through `load_auto`, which classifies by contents
+    // (MLX affine → dequant-to-f16, else AWQ/GPTQ safetensors). A `.gguf`
+    // keeps the GGUF-tuned load so the kv_dtype / kv_cache_layout /
+    // kv_page_size winners resolved above are honored. NOTE: MLX dirs use
+    // `load_auto`'s defaults (F32 contiguous KV) — the GGUF tuning knobs
+    // don't apply to the dir path yet.
+    let use_load_auto = load_path.is_dir()
+        || load_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("safetensors"))
+            .unwrap_or(false);
+    let load_result = if use_load_auto {
+        tokio::task::spawn_blocking(move || {
+            rustllama_engine::CpuEngine::load_auto(&load_path, max_ctx)
+        })
+        .await
+    } else {
+        tokio::task::spawn_blocking(move || {
+            rustllama_engine::CpuEngine::load_with_options_layout_and_page_size(
+                &load_path,
+                max_ctx,
+                true,
+                kv_dtype,
+                &load_layout,
+                applied_page_size,
+            )
+        })
+        .await
+    };
     let mut cpu = match load_result {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {

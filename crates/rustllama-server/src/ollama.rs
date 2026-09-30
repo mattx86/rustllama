@@ -238,16 +238,42 @@ pub async fn tags(State(state): State<AppState>) -> Json<TagsOut> {
     // to fill in family / quant / parameter_size. Without this peek
     // the GUI Models page just shows "Unknown" for every cached row.
     if let Some(cache) = rustllama_hub::default_cache_dir() {
-        if let Ok(paths) = rustllama_hub::list_cached(&cache) {
-            for path in paths {
-                let name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
+        if let Ok(cached) = rustllama_hub::list_cached_models(&cache) {
+            for entry in cached {
+                let name = entry.name;
                 if models.iter().any(|m| m.name == name) {
                     continue; // already listed as loaded
                 }
+                if entry.is_dir {
+                    // MLX model directory — no GGUF header to peek. Size is the
+                    // largest `*.safetensors` shard (the weights); family /
+                    // quant are surfaced as "mlx" so the GUI Models row renders
+                    // a badge instead of "Unknown". Loading is by dir name.
+                    let size = mlx_dir_weight_bytes(&entry.path);
+                    let modified = std::fs::metadata(&entry.path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| format!("epoch-{}", d.as_secs()))
+                        .unwrap_or_else(|| "unknown".into());
+                    models.push(TagModel {
+                        name: name.clone(),
+                        model: name,
+                        modified_at: modified,
+                        size,
+                        digest: String::new(),
+                        details: TagDetails {
+                            parent_model: "",
+                            format: "mlx",
+                            family: "mlx".into(),
+                            families: vec!["mlx".into()],
+                            parameter_size: "unknown".into(),
+                            quantization_level: "mlx".into(),
+                        },
+                    });
+                    continue;
+                }
+                let path = entry.path;
                 let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 let modified = std::fs::metadata(&path)
                     .and_then(|m| m.modified())
@@ -280,6 +306,28 @@ pub async fn tags(State(state): State<AppState>) -> Json<TagsOut> {
     }
 
     Json(TagsOut { models })
+}
+
+/// Total bytes of an MLX model directory's `*.safetensors` shards — the
+/// weights, which dominate the on-disk footprint. Used for the `/api/tags`
+/// size column (an MLX model is a directory, not a single file, so
+/// `metadata().len()` on the dir is meaningless). Best-effort: sums what it
+/// can stat, returns 0 on an unreadable dir.
+fn mlx_dir_weight_bytes(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .and_then(|x| x.to_str())
+                        .map(|x| x.eq_ignore_ascii_case("safetensors"))
+                        .unwrap_or(false)
+                })
+                .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 /// Cheap GGUF header peek: opens the mmap, reads the metadata KV

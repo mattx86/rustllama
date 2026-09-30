@@ -202,6 +202,140 @@ pub fn list_cached(cache_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// One resolvable model on disk: either a GGUF **file** or an MLX model
+/// **directory** (mlx-lm / mlx-community layout). Both carry a `name` the
+/// caller can match a short load request against — a GGUF's file stem, or an
+/// MLX dir's file name (a directory has no extension to strip). This is the
+/// shape the on-demand load path + `/api/tags` listing resolve against so a
+/// user can `Load` an MLX model by name the same way they load a cached GGUF.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedModel {
+    /// Absolute path — a `.gguf` file, or an MLX model directory (the thing
+    /// `CpuEngine::load_auto` is handed).
+    pub path: PathBuf,
+    /// Resolvable identity: the GGUF's file stem, or the MLX dir's file name.
+    pub name: String,
+    /// `true` when `path` is an MLX model directory (load via `load_auto`);
+    /// `false` for a plain `.gguf` file (load via the GGUF-tuned path).
+    pub is_dir: bool,
+}
+
+/// Enumerate cached models: GGUF **files** (as [`list_cached`]) *plus* MLX
+/// model **directories**. An MLX directory is an mlx-lm / mlx-community
+/// checkpoint — a folder holding a `config.json` with a `quantization` block
+/// and at least one `*.safetensors` shard. Such a dir can sit either directly
+/// under the cache (`<cache>/<repo>/…`, a hub-mirrored flat download) or one
+/// level deeper (`<cache>/<owner>__<repo>/<subdir>/…`), so both depth 1 and
+/// depth 2 are probed.
+///
+/// GGUF entries keep [`list_cached`]'s file-stem identity (byte-identical
+/// discovery); only `.gguf` files surface as standalone models, so an MLX
+/// shard / config sitting at a listable depth never masquerades as its own
+/// GGUF row. MLX entries take the directory's `file_name` as their name.
+pub fn list_cached_models(cache_dir: &Path) -> Result<Vec<CachedModel>> {
+    let mut out = Vec::new();
+    if !cache_dir.exists() {
+        return Ok(out);
+    }
+
+    // 1) MLX model directories (depth 1, else its immediate children at
+    //    depth 2). A depth-1 match is reported as-is and NOT descended into,
+    //    so a model can't be double-counted.
+    let mut mlx_dirs: Vec<PathBuf> = Vec::new();
+    for d1 in read_subdirs(cache_dir) {
+        if is_mlx_dir_shallow(&d1) {
+            mlx_dirs.push(d1);
+        } else {
+            for d2 in read_subdirs(&d1) {
+                if is_mlx_dir_shallow(&d2) {
+                    mlx_dirs.push(d2);
+                }
+            }
+        }
+    }
+    for dir in &mlx_dirs {
+        if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
+            out.push(CachedModel {
+                path: dir.clone(),
+                name: name.to_string(),
+                is_dir: true,
+            });
+        }
+    }
+
+    // 2) GGUF files (the hub `owner__repo/file.gguf` layout). Filter to
+    //    `.gguf` and skip any file that lives inside a detected MLX directory
+    //    so an MLX shard / config.json never shows up as a standalone model.
+    for p in list_cached(cache_dir)? {
+        let is_gguf = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("gguf"))
+            .unwrap_or(false);
+        if !is_gguf {
+            continue;
+        }
+        if mlx_dirs.iter().any(|d| p.starts_with(d)) {
+            continue;
+        }
+        if let Some(name) = p.file_stem().and_then(|s| s.to_str()) {
+            out.push(CachedModel {
+                path: p.clone(),
+                name: name.to_string(),
+                is_dir: false,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Immediate subdirectories of `dir` (best-effort; an unreadable `dir`
+/// yields an empty list). Non-recursive.
+fn read_subdirs(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_dir())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Cheap MLX-directory probe used by discovery (no dependency on
+/// rustllama-safetensors, so the hub crate stays toolchain-free): does `dir`
+/// hold a `config.json` carrying a `quantization` block AND at least one
+/// `*.safetensors` shard? That's the mlx-lm / mlx-community marker. The
+/// engine's `load_auto` re-checks with the stricter `.scales`/`.biases`
+/// discriminator before committing to the MLX load path, so this only needs
+/// to be a fast, permissive filter for the listing. Any IO / parse error is
+/// swallowed as `false`.
+fn is_mlx_dir_shallow(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(dir.join("config.json")) else {
+        return false;
+    };
+    let has_quant = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("quantization").map(|q| q.is_object()))
+        .unwrap_or(false);
+    if !has_quant {
+        return false;
+    }
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok()).any(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.eq_ignore_ascii_case("safetensors"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Asynchronously download `<owner>/<repo>:<filename>` into
 /// `cache_dir/<owner>__<repo>/<filename>` and return the local path.
 /// If the file is already present at the destination, returns immediately.
@@ -344,6 +478,87 @@ mod tests {
         let r = HubRef::parse("a/b:c.gguf").unwrap();
         let p = r.local_path(Path::new("/tmp/cache"));
         assert!(p.ends_with("a__b/c.gguf"));
+    }
+
+    #[test]
+    fn list_cached_models_surfaces_gguf_files_and_mlx_dirs() {
+        // Build a throwaway cache tree:
+        //   <root>/owner__repo/model-q4_k_m.gguf        → GGUF file
+        //   <root>/Qwen2.5-0.5B-Instruct-4bit/          → MLX dir (depth 1)
+        //       config.json (quantization block) + model.safetensors
+        //   <root>/nested/DeepSomething-3bit/           → MLX dir (depth 2)
+        //       config.json + weights.safetensors
+        let root = std::env::temp_dir().join(format!(
+            "rustllama_hub_list_cached_models_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("owner__repo")).unwrap();
+        std::fs::write(root.join("owner__repo/model-q4_k_m.gguf"), b"GGUF\0\0\0\0").unwrap();
+
+        let mlx1 = root.join("Qwen2.5-0.5B-Instruct-4bit");
+        std::fs::create_dir_all(&mlx1).unwrap();
+        std::fs::write(
+            mlx1.join("config.json"),
+            br#"{"quantization":{"group_size":64,"bits":4}}"#,
+        )
+        .unwrap();
+        std::fs::write(mlx1.join("model.safetensors"), b"\x00").unwrap();
+        std::fs::write(mlx1.join("tokenizer.json"), b"{}").unwrap();
+
+        let mlx2 = root.join("nested").join("DeepSomething-3bit");
+        std::fs::create_dir_all(&mlx2).unwrap();
+        std::fs::write(
+            mlx2.join("config.json"),
+            br#"{"quantization":{"group_size":32,"bits":3}}"#,
+        )
+        .unwrap();
+        std::fs::write(mlx2.join("weights.safetensors"), b"\x00").unwrap();
+
+        // A plain fp16 HF dir (no `quantization` block) must NOT surface.
+        let plain = root.join("plain-hf-dir");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("config.json"), br#"{"model_type":"llama"}"#).unwrap();
+        std::fs::write(plain.join("model.safetensors"), b"\x00").unwrap();
+
+        let models = list_cached_models(&root).unwrap();
+
+        // GGUF file surfaces by file stem, not a dir.
+        let gguf = models
+            .iter()
+            .find(|m| m.name == "model-q4_k_m")
+            .expect("gguf model-q4_k_m should surface");
+        assert!(!gguf.is_dir);
+        assert!(gguf.path.ends_with("owner__repo/model-q4_k_m.gguf"));
+
+        // MLX dir at depth 1 surfaces by dir name.
+        let d1 = models
+            .iter()
+            .find(|m| m.name == "Qwen2.5-0.5B-Instruct-4bit")
+            .expect("depth-1 MLX dir should surface");
+        assert!(d1.is_dir);
+        assert_eq!(d1.path, mlx1);
+
+        // MLX dir at depth 2 surfaces too.
+        let d2 = models
+            .iter()
+            .find(|m| m.name == "DeepSomething-3bit")
+            .expect("depth-2 MLX dir should surface");
+        assert!(d2.is_dir);
+        assert_eq!(d2.path, mlx2);
+
+        // The non-quantized HF dir must be absent, and its `model.safetensors`
+        // must not masquerade as a GGUF row.
+        assert!(
+            !models.iter().any(|m| m.name == "plain-hf-dir"),
+            "a dir without a quantization block must not surface as MLX"
+        );
+        assert!(
+            !models.iter().any(|m| m.name == "model" || m.name == "config"),
+            "safetensors / config.json must never surface as standalone models"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
