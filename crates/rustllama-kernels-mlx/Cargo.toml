@@ -1,0 +1,30 @@
+[package]
+name = "rustllama-kernels-mlx"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Apple Metal / MLX GPU compute kernels for rustllama (macOS)."
+build = "build.rs"
+
+# No mock/feature gates: this crate always compiles the real backend, like
+# the SYCL and CUDA kernel crates. The TARGET decides what build.rs emits —
+# on aarch64-apple-darwin (Apple Silicon) the real Metal/MLX shim
+# (mlx/rsl_mlx.mm + .metal, linked against Apple's libmlx via the mlx-c C
+# API); on every other host (Windows, Linux, Intel macOS — none of which
+# have an MLX Metal GPU) a no-op stub so the crate links and
+# rsl_mlx_device_count() reports 0. Runtime detection decides whether MLX is
+# actually used. NOTE (Phase 0): the compute path is scaffolded but the real
+# Metal kernels + mlx-c enumeration land in Phase 1; device_count() is 0
+# everywhere until then.
+
+[dependencies]
+tracing.workspace = true
+thiserror.workspace = true
+half.workspace = true
+
+[build-dependencies]
+cc.workspace = true

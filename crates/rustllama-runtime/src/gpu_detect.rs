@@ -150,6 +150,57 @@ pub fn nvidia_driver_present() -> bool {
     load_cuda_driver().is_some()
 }
 
+/// One Apple Metal GPU. Mirror of [`NvidiaGpu`], with `registry_id`
+/// (Metal's stable `MTLDevice.registryID`) in place of the CUDA compute-
+/// capability pair — Metal has no compute-capability version.
+#[derive(Debug, Clone)]
+pub struct AppleGpu {
+    pub index: u32,
+    pub name: String,
+    /// Total (unified) memory in bytes. On Apple Silicon the GPU shares one
+    /// physical pool with the CPU, so this is the shared-RAM size, not a
+    /// separate VRAM aperture.
+    pub total_mem_bytes: u64,
+    /// Metal's `MTLDevice.registryID` — the stable, driver-invariant device
+    /// identifier (Metal has no CUDA-style 16-byte UUID). Zeroed in the
+    /// Phase-0 placeholder.
+    pub registry_id: u64,
+}
+
+/// Outcome of probing for Apple Metal GPUs. Mirrors [`NvidiaInfo`]'s shape;
+/// Metal exposes no global "driver version" integer, so this is just the GPU
+/// list.
+#[derive(Debug, Clone)]
+pub struct AppleInfo {
+    pub gpus: Vec<AppleGpu>,
+}
+
+/// Detect Apple Metal GPUs — the macOS analogue of [`detect_nvidia`], kept
+/// TOOLCHAIN-FREE (no link against Metal or `rustllama-kernels-mlx`; cfg /
+/// dlopen only, exactly like the CUDA-driver probe). Fail-soft: `None` when
+/// no Metal GPU can be enumerated, never a build requirement.
+///
+/// PHASE 0: inert everywhere. On non-macOS hosts there is no Metal GPU, so
+/// this is a compile-time `None`. The real macOS enumeration (dlopen
+/// `Metal.framework` → `MTLCreateSystemDefaultDevice` for `name` /
+/// `recommendedMaxWorkingSetSize` / `registryID`, or `sysctl hw.memsize`
+/// for the unified-memory pool) lands in Phase 1 alongside the real MLX
+/// kernels; until then it returns `None` so the whole Apple tier stays inert
+/// (matching `rustllama_kernels_mlx::device_count() == 0`).
+#[cfg(target_os = "macos")]
+pub fn detect_apple_gpu() -> Option<AppleInfo> {
+    // TODO(Phase 1): dlopen Metal.framework and enumerate the real Metal
+    // device(s) here (registryID + unified-memory size). Kept TOOLCHAIN-FREE
+    // — no Objective-C link, no kernel-crate dep.
+    None
+}
+
+/// Non-macOS hosts have no Metal GPU — always `None` (see the macOS variant).
+#[cfg(not(target_os = "macos"))]
+pub fn detect_apple_gpu() -> Option<AppleInfo> {
+    None
+}
+
 /// Read the currently-**free** VRAM (bytes) of the NVIDIA GPU at the given
 /// CUDA-driver device index (`NvidiaGpu::index`), via the dlopen'd CUDA
 /// driver — no CUDA toolkit required. Returns `None` on any failure or on a

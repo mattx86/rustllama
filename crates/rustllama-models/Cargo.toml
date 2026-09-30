@@ -40,6 +40,13 @@ rustllama-kernels-sycl = { path = "../rustllama-kernels-sycl", default-features 
 # to an NVIDIA GPU when one is present; inert (never constructed) when
 # device_count()==0, so non-NVIDIA hosts are unaffected.
 rustllama-kernels-cuda = { path = "../rustllama-kernels-cuda" }
+# kernels-mlx: real-only, always compiled (Apple Metal/MLX). The 4th GPU
+# tier — the native packed-matvec dispatch (MlxMatvecCache) routes the
+# dominant matmuls to an Apple Metal GPU when one is present; inert (never
+# constructed) when device_count()==0, so non-Apple hosts (Windows/Linux/
+# Intel-mac) are unaffected. Phase 0: device_count() is 0 everywhere (stub)
+# until the real Metal kernels land in Phase 1.
+rustllama-kernels-mlx = { path = "../rustllama-kernels-mlx" }
 # Reads the on-disk autotuner cache at engine load to populate the
 # per-(M, K) tuned LWS map consulted by the matvec dispatch in
 # `accel::tuned_q4k_lws`. Falls back to the kernel's hand-picked

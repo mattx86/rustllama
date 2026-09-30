@@ -52,6 +52,10 @@ rustllama-kernels-sycl = { path = "../rustllama-kernels-sycl", default-features 
 # (e.g. the DGX Spark, where SYCL is a no-op stub) plans 0 GPU layers and runs
 # CPU-only. Inert on non-NVIDIA hosts (`device_count()` returns 0).
 rustllama-kernels-cuda = { path = "../rustllama-kernels-cuda" }
+# VRAM-fit placement must see Apple Metal GPUs too — the 4th GPU tier. On
+# an Apple Silicon host `mlx_vram_budget()` sizes the (unified-memory) pool
+# from here. Inert on non-Apple hosts (`device_count()` returns 0).
+rustllama-kernels-mlx = { path = "../rustllama-kernels-mlx" }
 # Level Zero Sysman probe — used by the measurement loop in
 # `measurement.rs` to read the GPU energy counter pre/post each
 # candidate, deriving watts + tokens-per-joule for the power-aware

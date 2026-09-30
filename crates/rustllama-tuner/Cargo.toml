@@ -26,3 +26,7 @@ rustllama-kernels-sycl = { path = "../rustllama-kernels-sycl", default-features 
 # UUIDs of every GPU, not just the single SYCL device). Inert on non-NVIDIA
 # hosts (`device_count()` returns 0).
 rustllama-kernels-cuda = { path = "../rustllama-kernels-cuda" }
+# Enumerate Apple Metal GPUs for the whole-SYSTEM placement fingerprint
+# (registry IDs of every Metal device). Inert on non-Apple hosts
+# (`device_count()` returns 0), so the fingerprint is unchanged there.
+rustllama-kernels-mlx = { path = "../rustllama-kernels-mlx" }

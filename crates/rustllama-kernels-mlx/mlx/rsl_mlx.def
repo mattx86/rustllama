@@ -1,0 +1,122 @@
+; Module-definition file for rsl_mlx.dll (Windows stub) + the export
+; name list the no-op stub generator reads on every non-Apple-Silicon
+; target.
+;
+; Lists every extern "C" function the native MLX/Metal shim exports for
+; consumption by the Rust crate's FFI shims. On Windows (and any host
+; where we build the DLL/`.dylib` stub via a `.def`) the linker uses this
+; file to populate the export table + import lib (.lib) for downstream
+; Rust consumers. On the aarch64-apple-darwin REAL path the symbols are
+; exported by default C ABI visibility from `mlx/rsl_mlx.mm`, so this file
+; is consumed there only as the authoritative name list (build.rs also
+; parses it to emit the no-op stub on non-Apple hosts).
+;
+; KEEP IN SYNC with the function list in `mlx/rsl_mlx.h`, the `extern "C"`
+; block in `src/lib.rs`, and the entry points in `mlx/rsl_mlx.mm`. If a new
+; entry is added in one place, add it in all four. A missing symbol fails
+; loudly at the Rust-side link step (`unresolved external symbol rsl_mlx_*`).
+
+LIBRARY rsl_mlx
+EXPORTS
+    ; Device query
+    rsl_mlx_device_count
+    rsl_mlx_device_info
+    rsl_mlx_consume_error_count
+
+    ; Host-pointer reference kernels (establish the FFI/parity pattern)
+    rsl_mlx_rmsnorm_f32
+    rsl_mlx_matvec_f32
+
+    ; Stream / device-buffer lifecycle (device-resident path)
+    rsl_mlx_stream_create
+    rsl_mlx_stream_destroy
+    rsl_mlx_malloc_from_host
+    rsl_mlx_malloc_device
+    rsl_mlx_free
+    rsl_mlx_memcpy_h2d
+    rsl_mlx_memcpy_d2h
+
+    ; PrismML PTQ1_0 (Bonsai ternary) + Prism Hadamard
+    rsl_mlx_matvec_ptq1_0_packed_f32
+    rsl_mlx_matvec_ptq1_0_packed_f32_batched
+    rsl_mlx_hadamard_forward
+
+    ; Packed-quant matvecs (single + batched), one entry pair per quant.
+    ; Mirrors the CudaPackedKind / MlxPackedKind variant set.
+    rsl_mlx_matvec_q8_0_packed_f32
+    rsl_mlx_matvec_q8_0_packed_f32_batched
+    rsl_mlx_matvec_q4_k_packed_f32
+    rsl_mlx_matvec_q4_k_packed_f32_batched
+    rsl_mlx_matvec_q6_k_packed_f32
+    rsl_mlx_matvec_q6_k_packed_f32_batched
+    rsl_mlx_matvec_q5_k_packed_f32
+    rsl_mlx_matvec_q5_k_packed_f32_batched
+    rsl_mlx_matvec_q2_k_packed_f32
+    rsl_mlx_matvec_q2_k_packed_f32_batched
+    rsl_mlx_matvec_q8_k_packed_f32
+    rsl_mlx_matvec_q8_k_packed_f32_batched
+    rsl_mlx_matvec_q4_0_packed_f32
+    rsl_mlx_matvec_q4_0_packed_f32_batched
+    rsl_mlx_matvec_q5_0_packed_f32
+    rsl_mlx_matvec_q5_0_packed_f32_batched
+    rsl_mlx_matvec_q4_1_packed_f32
+    rsl_mlx_matvec_q4_1_packed_f32_batched
+    rsl_mlx_matvec_q5_1_packed_f32
+    rsl_mlx_matvec_q5_1_packed_f32_batched
+    rsl_mlx_matvec_iq4_nl_packed_f32
+    rsl_mlx_matvec_iq4_nl_packed_f32_batched
+    rsl_mlx_matvec_iq4_xs_packed_f32
+    rsl_mlx_matvec_iq4_xs_packed_f32_batched
+    rsl_mlx_matvec_iq2_xxs_packed_f32
+    rsl_mlx_matvec_iq2_xxs_packed_f32_batched
+    rsl_mlx_matvec_iq2_xs_packed_f32
+    rsl_mlx_matvec_iq2_xs_packed_f32_batched
+    rsl_mlx_matvec_iq2_s_packed_f32
+    rsl_mlx_matvec_iq2_s_packed_f32_batched
+    rsl_mlx_matvec_iq3_xxs_packed_f32
+    rsl_mlx_matvec_iq3_xxs_packed_f32_batched
+    rsl_mlx_matvec_iq3_s_packed_f32
+    rsl_mlx_matvec_iq3_s_packed_f32_batched
+    rsl_mlx_matvec_iq1_s_packed_f32
+    rsl_mlx_matvec_iq1_s_packed_f32_batched
+    rsl_mlx_matvec_iq1_m_packed_f32
+    rsl_mlx_matvec_iq1_m_packed_f32_batched
+    rsl_mlx_matvec_nvfp4_packed_f32
+    rsl_mlx_matvec_nvfp4_packed_f32_batched
+    rsl_mlx_matvec_mxfp4_packed_f32
+    rsl_mlx_matvec_mxfp4_packed_f32_batched
+    rsl_mlx_matvec_mxfp6_packed_f32
+    rsl_mlx_matvec_mxfp6_packed_f32_batched
+    rsl_mlx_matvec_mxfp8_packed_f32
+    rsl_mlx_matvec_mxfp8_packed_f32_batched
+    rsl_mlx_matvec_q3_k_packed_f32
+    rsl_mlx_matvec_q3_k_packed_f32_batched
+    rsl_mlx_matvec_pq2_0_packed_f32
+    rsl_mlx_matvec_pq2_0_packed_f32_batched
+
+    ; Forward-pass primitives (device-resident, f32)
+    rsl_mlx_add_rmsnorm_f32
+    rsl_mlx_rope_f32
+    rsl_mlx_silu_mul_f32
+    rsl_mlx_embedding_lookup_f32
+    rsl_mlx_flash_attn_decode_f32
+    rsl_mlx_flash_attn_prefill_f32
+
+    ; Quantized-KV flash attention (F32 Q/out, packed K/V dequant on the fly)
+    rsl_mlx_flash_attn_decode_q4_0
+    rsl_mlx_flash_attn_prefill_q4_0
+    rsl_mlx_flash_attn_decode_nvfp4
+    rsl_mlx_flash_attn_prefill_nvfp4
+    rsl_mlx_flash_attn_decode_mxfp4
+    rsl_mlx_flash_attn_prefill_mxfp4
+    rsl_mlx_flash_attn_decode_mxfp6
+    rsl_mlx_flash_attn_prefill_mxfp6
+    rsl_mlx_flash_attn_decode_mxfp8
+    rsl_mlx_flash_attn_prefill_mxfp8
+    rsl_mlx_flash_attn_decode_tq
+    rsl_mlx_flash_attn_prefill_tq
+    rsl_mlx_flash_attn_decode_q8_0
+    rsl_mlx_flash_attn_prefill_q8_0
+
+    ; Sampling
+    rsl_mlx_argmax_f32

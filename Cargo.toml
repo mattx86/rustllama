@@ -9,6 +9,7 @@ members = [
     "crates/rustllama-kernels-cpu",
     "crates/rustllama-kernels-sycl",
     "crates/rustllama-kernels-cuda",
+    "crates/rustllama-kernels-mlx",
     "crates/rustllama-l0-sys",
     "crates/rustllama-models",
     "crates/rustllama-tuner",

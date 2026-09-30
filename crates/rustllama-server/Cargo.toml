@@ -60,6 +60,11 @@ rustllama-kernels-sycl = { path = "../rustllama-kernels-sycl", default-features 
 # Already built transitively via rustllama-engine, so this direct dep adds no
 # build cost; inert (returns 0) on non-NVIDIA hosts.
 rustllama-kernels-cuda = { path = "../rustllama-kernels-cuda" }
+# Apple Metal/MLX compute-readiness probe for /v1/capabilities +
+# gpus_probe (`device_count()` = how many Metal GPUs the runtime can launch
+# kernels on). Already built transitively via rustllama-engine, so this
+# direct dep adds no build cost; inert (returns 0) on non-Apple hosts.
+rustllama-kernels-mlx = { path = "../rustllama-kernels-mlx" }
 # Level Zero Sysman probes (VRAM total/free, temperature, energy).
 # Surfaced via /v1/metrics; falls back to None on non-Intel hosts
 # or when the driver doesn't expose Sysman (Iris Xe shared-memory

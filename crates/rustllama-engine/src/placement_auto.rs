@@ -205,6 +205,16 @@ fn host_has_dedicated_vram(fallback_device_index: u32) -> bool {
     if rustllama_models::accel::cuda_active() {
         return true;
     }
+    // Apple Metal is UNIFIED MEMORY: the CPU and GPU share one physical
+    // pool, so there is NO separate dedicated VRAM to fit weights into —
+    // `vram_only` degenerates to a no-op (weights live in the shared pool
+    // either way), exactly as for the integrated Iris Xe. Return false.
+    // Checked before the SYCL probe below because an Apple host has no SYCL
+    // device for the fallback `device_info` query to consult. Inert off
+    // Apple Silicon (`mlx_active` == false → this is skipped).
+    if rustllama_models::accel::mlx_active() {
+        return false;
+    }
     let idx = rustllama_models::accel::first_enabled_sycl_device_index()
         .unwrap_or(fallback_device_index);
     match rustllama_kernels_sycl::device_info(idx) {
@@ -252,7 +262,17 @@ fn auto_n_gpu_layers_inner(
         } else {
             None
         };
-        cuda.or_else(|| {
+        // Apple Metal — the 4th GPU tier. Size against the unified-memory
+        // pool (MLX device 0's total). Mutually exclusive with CUDA/SYCL in
+        // practice (a host has Metal xor CUDA/SYCL GPUs); inert off Apple
+        // (`mlx_active` == false → stays None, chain byte-identical). Placed
+        // after CUDA, before SYCL, mirroring the matvec-dispatch precedence.
+        let mlx = if rustllama_models::accel::mlx_active() {
+            mlx_vram_budget().map(|(b, n)| (b, format!("Metal GPU ({n})")))
+        } else {
+            None
+        };
+        cuda.or(mlx).or_else(|| {
             rustllama_kernels_sycl::device_info(opts.device_index)
                 .ok()
                 .map(|i| (i.vram_bytes, format!("SYCL device {}", opts.device_index)))
@@ -350,6 +370,21 @@ fn cuda_vram_budget() -> Option<(u64, String)> {
         return None;
     }
     let info = rustllama_kernels_cuda::device_info(0).ok()?;
+    Some((info.total_mem_bytes, info.name))
+}
+
+/// The active Apple Metal GPU's total (unified) memory (device 0) + name, or
+/// `None` when no Metal GPU is present. Mirror of [`cuda_vram_budget`].
+/// UNIFIED MEMORY: this "VRAM" is the shared CPU/GPU pool, so the
+/// `safety_factor` + `reserve_bytes` (which already cover activations / KV /
+/// runtime) matter even more here than on a discrete card — the same pool
+/// also holds the OS and everything else. Inert off Apple Silicon
+/// (`device_count()` returns 0 → `None`).
+fn mlx_vram_budget() -> Option<(u64, String)> {
+    if rustllama_kernels_mlx::device_count() == 0 {
+        return None;
+    }
+    let info = rustllama_kernels_mlx::device_info(0).ok()?;
     Some((info.total_mem_bytes, info.name))
 }
 

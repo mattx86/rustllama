@@ -4603,6 +4603,7 @@ fn gpus_probe() -> Vec<GpuMetric> {
                         0x8086 => "intel",
                         0x10de => "nvidia",
                         0x1002 => "amd",
+                        0x106b => "apple",
                         _ => "gpu",
                     };
                     out.push(GpuMetric {
@@ -4647,6 +4648,30 @@ fn gpus_probe() -> Vec<GpuMetric> {
                 vram_total_bytes: Some(g.total_mem_bytes),
                 name: g.name,
                 // NVIDIA NVML util lands in A3b.
+                utilization_pct: None,
+            });
+        }
+    }
+    // Apple Metal GPUs via the always-compiled MLX kernel crate — the 4th
+    // GPU tier, appended after NVIDIA with the next unified index. Inert off
+    // Apple Silicon (`device_count()` == 0 → appends nothing on Windows/
+    // Linux). UNIFIED MEMORY: the reported total is the shared CPU/GPU pool;
+    // there is no separate per-GPU free-VRAM counter (it's system-wide free
+    // RAM), so `vram_free_bytes` is left None here in Phase 0. GPUs in the
+    // disable-list are omitted but survivors keep their original indices.
+    for i in 0..rustllama_kernels_mlx::device_count() {
+        if let Ok(info) = rustllama_kernels_mlx::device_info(i) {
+            let this = idx;
+            idx += 1;
+            if disabled.contains(&this) {
+                continue;
+            }
+            out.push(GpuMetric {
+                index: this,
+                vendor: "apple".to_string(),
+                name: info.name,
+                vram_total_bytes: Some(info.total_mem_bytes),
+                vram_free_bytes: None,
                 utilization_pct: None,
             });
         }
@@ -5181,6 +5206,11 @@ struct BackendsCapability {
     /// CUDA driver enumeration; `compute_ready` on the runtime's
     /// ability to launch kernels. All-zero / false on non-NVIDIA hosts.
     cuda: CudaBackend,
+    /// Apple Metal / MLX GPU dispatch — the always-compiled native Metal
+    /// kernel layer, the 4th compute tier and a first-class peer of `sycl`
+    /// / `cuda`. `available` / `compute_ready` gate on the runtime device
+    /// count. All-zero / false on non-Apple hosts (Windows/Linux/Intel-mac).
+    metal: MetalBackend,
 }
 
 #[derive(Serialize)]
@@ -5229,6 +5259,24 @@ struct CudaBackend {
     compute_ready: u32,
     /// CUDA driver version string, when a GPU is present; `null` otherwise.
     driver: Option<String>,
+}
+
+#[derive(Serialize)]
+struct MetalBackend {
+    /// True when at least one Apple Metal GPU is visible to the MLX runtime
+    /// (always-compiled kernel crate; no toolkit needed to detect).
+    available: bool,
+    /// Number of Metal GPUs the MLX runtime enumerates.
+    device_count: u32,
+    /// How many of those the native compute crate can actually launch
+    /// kernels on. On Apple Silicon this equals `device_count`; `0` on every
+    /// non-Apple host (the crate is inert there). Phase 0: 0 everywhere.
+    compute_ready: u32,
+    /// Whether the GPU is UNIFIED-MEMORY (always true on Apple Silicon: the
+    /// CPU and GPU share one physical pool — there is no separate dedicated
+    /// VRAM). The Metal analog of `CudaBackend::driver`; lets the GUI label
+    /// the memory pool correctly. `false` when no Metal GPU is present.
+    unified_memory: bool,
 }
 
 #[derive(Serialize)]
@@ -5547,6 +5595,19 @@ fn probe_backends() -> BackendsCapability {
             .filter(|i| !i.gpus.is_empty())
             .map(|i| i.driver_version_str()),
     };
+    // Apple Metal probe — the 4th GPU tier, peer of SYCL/CUDA. The always-
+    // compiled MLX kernel crate enumerates Metal GPUs (device_count) and, on
+    // Apple Silicon, can launch kernels on all of them. Inert (all-zero) on
+    // non-Apple hosts (`device_count()` == 0). Phase 0: 0 everywhere until
+    // the real Metal path lands.
+    let metal_device_count = rustllama_kernels_mlx::device_count();
+    let metal = MetalBackend {
+        available: metal_device_count > 0,
+        device_count: metal_device_count,
+        compute_ready: metal_device_count,
+        // Apple Silicon is always unified memory (shared CPU/GPU pool).
+        unified_memory: metal_device_count > 0,
+    };
     let logical_cores = std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(0);
@@ -5565,6 +5626,7 @@ fn probe_backends() -> BackendsCapability {
         },
         sycl,
         cuda,
+        metal,
     }
 }
 

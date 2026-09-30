@@ -4253,6 +4253,7 @@ dependencies = [
  "rustllama-gguf",
  "rustllama-kernels-cpu",
  "rustllama-kernels-cuda",
+ "rustllama-kernels-mlx",
  "rustllama-kernels-sycl",
  "rustllama-l0-sys",
  "rustllama-models",
@@ -4341,6 +4342,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustllama-kernels-mlx"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "half",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "rustllama-kernels-sycl"
 version = "0.1.0"
 dependencies = [
@@ -4384,6 +4395,7 @@ dependencies = [
  "rustllama-gguf",
  "rustllama-kernels-cpu",
  "rustllama-kernels-cuda",
+ "rustllama-kernels-mlx",
  "rustllama-kernels-sycl",
  "rustllama-tensor",
  "rustllama-tuner",
@@ -4454,6 +4466,7 @@ dependencies = [
  "rustllama-gguf",
  "rustllama-hub",
  "rustllama-kernels-cuda",
+ "rustllama-kernels-mlx",
  "rustllama-kernels-sycl",
  "rustllama-l0-sys",
  "rustllama-models",
@@ -4503,6 +4516,7 @@ name = "rustllama-tuner"
 version = "0.1.0"
 dependencies = [
  "rustllama-kernels-cuda",
+ "rustllama-kernels-mlx",
  "rustllama-kernels-sycl",
  "rustllama-runtime",
  "rustllama-tensor",

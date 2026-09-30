@@ -28,6 +28,7 @@
 
 use half::f16;
 use rustllama_kernels_cuda as ck;
+use rustllama_kernels_mlx as mk;
 use rustllama_kernels_sycl as sk;
 use rustllama_tensor::{as_bytes, Dtype, Tensor};
 use std::cell::RefCell;
@@ -183,6 +184,156 @@ fn try_matvec_packed_cuda_batched(
 }
 
 // ============================================================
+// Native MLX packed-matvec dispatch (Apple Metal backend)
+// ============================================================
+//
+// The Apple-Metal analogue of the CUDA packed-matvec dispatch above and
+// the SYCL USM ladder below — the 4th device tier (beside SYCL, CUDA and
+// CPU). When a Metal GPU is present the packed-matvec dispatch points route
+// the supported kinds here, mirroring the CUDA precedence (and mutually
+// exclusive with it in practice — a host has Metal xor CUDA/SYCL GPUs).
+// Everything is INERT off Apple Silicon: `mk::device_count()` returns 0 →
+// [`mlx_cache`] is `None` (never constructed) and every MLX attempt short-
+// circuits to `false`, so the proven SYCL/CUDA/CPU path is bit-for-bit
+// unchanged on Windows/Linux/Intel-mac hosts.
+//
+// APPLE UNIFIED MEMORY: unlike CUDA's separate device memory, Apple's GPU
+// shares one physical pool with the CPU, so the cache's "upload" is a cheap
+// StorageModeShared memcpy. The cache keeps CUDA's shape (upload once,
+// keyed by the GGUF host pointer) so this dispatch stays backend-agnostic;
+// Phase 1 may collapse it to a zero-copy MTLBuffer wrap of the weight bytes.
+
+/// Whether the native MLX (Apple Metal) packed-matvec backend is active:
+/// a usable Metal GPU exists (and the env off-switch isn't set). No per-
+/// thread opt-in — the cache is process-wide and thread-agnostic. Mirror of
+/// [`cuda_active`]; inert (false, cached) off Apple Silicon, so no engine
+/// wiring is needed and the SYCL/CUDA/CPU path is untouched there.
+#[inline]
+pub fn mlx_active() -> bool {
+    mlx_cache().is_some()
+}
+
+/// Whether a native MLX compute device is available for dispatch.
+/// Public mirror of [`mlx_active`] for operator-facing reporting.
+pub fn mlx_available() -> bool {
+    mlx_cache().is_some()
+}
+
+/// The process-wide device-resident MLX matvec cache. Lazily created once:
+/// `Some` only when a Metal GPU is visible, the env off-switch
+/// (`RUSTLLAMA_MLX_DISPATCH=0`) isn't set, and a stream + budget could be
+/// established; `None` (cached) otherwise. Budget = 85% of device 0's total
+/// (unified) memory, matching the CUDA/SYCL VRAM-fit reserve. Phase 0:
+/// `mk::device_count()` is 0 everywhere (the stub), so this always caches
+/// `None` off Apple Silicon.
+fn mlx_cache() -> Option<&'static Mutex<mk::MlxMatvecCache>> {
+    static CACHE: OnceLock<Option<Mutex<mk::MlxMatvecCache>>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            // Env off-switch for A/B (mirrors RUSTLLAMA_CUDA_DISPATCH).
+            if std::env::var("RUSTLLAMA_MLX_DISPATCH")
+                .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            if mk::device_count() == 0 {
+                return None;
+            }
+            let budget = mk::device_info(0)
+                .map(|i| ((i.total_mem_bytes as f64) * 0.85) as usize)
+                .unwrap_or(0);
+            if budget == 0 {
+                return None;
+            }
+            mk::MlxMatvecCache::new(0, budget).map(Mutex::new)
+        })
+        .as_ref()
+}
+
+/// Map a weight [`Dtype`] to the MLX cache's packed kind, or `None` for
+/// dtypes the MLX backend doesn't dispatch — those fall through to the
+/// SYCL/CPU ladder. Byte-for-byte mirror of [`dtype_to_cuda_kind`]: every
+/// packed-quant `*Raw` dtype the loader produces has an MLX arm (the kernel
+/// surface + `MlxMatvecCache` cover all of them; `k_alignment`/`row_bytes`
+/// on `MlxPackedKind` gate each shape).
+fn dtype_to_mlx_kind(dtype: Dtype) -> Option<mk::MlxPackedKind> {
+    match dtype {
+        Dtype::PTQ1_0Raw => Some(mk::MlxPackedKind::Ptq1_0),
+        Dtype::Q8_0Raw => Some(mk::MlxPackedKind::Q8_0),
+        Dtype::Q4_KRaw => Some(mk::MlxPackedKind::Q4_K),
+        Dtype::Q6_KRaw => Some(mk::MlxPackedKind::Q6_K),
+        Dtype::Q5_KRaw => Some(mk::MlxPackedKind::Q5_K),
+        Dtype::Q2_KRaw => Some(mk::MlxPackedKind::Q2_K),
+        Dtype::Q8_KRaw => Some(mk::MlxPackedKind::Q8_K),
+        Dtype::Q4_0Raw => Some(mk::MlxPackedKind::Q4_0),
+        Dtype::Q5_0Raw => Some(mk::MlxPackedKind::Q5_0),
+        Dtype::Q4_1Raw => Some(mk::MlxPackedKind::Q4_1),
+        Dtype::Q5_1Raw => Some(mk::MlxPackedKind::Q5_1),
+        Dtype::IQ4_NLRaw => Some(mk::MlxPackedKind::Iq4_Nl),
+        Dtype::IQ4_XSRaw => Some(mk::MlxPackedKind::Iq4_Xs),
+        Dtype::IQ2_XXSRaw => Some(mk::MlxPackedKind::Iq2_Xxs),
+        Dtype::IQ2_XSRaw => Some(mk::MlxPackedKind::Iq2_Xs),
+        Dtype::IQ2_SRaw => Some(mk::MlxPackedKind::Iq2_S),
+        Dtype::IQ3_XXSRaw => Some(mk::MlxPackedKind::Iq3_Xxs),
+        Dtype::IQ3_SRaw => Some(mk::MlxPackedKind::Iq3_S),
+        Dtype::IQ1_SRaw => Some(mk::MlxPackedKind::Iq1_S),
+        Dtype::IQ1_MRaw => Some(mk::MlxPackedKind::Iq1_M),
+        Dtype::Nvfp4Raw => Some(mk::MlxPackedKind::Nvfp4),
+        Dtype::Q3_KRaw => Some(mk::MlxPackedKind::Q3_K),
+        Dtype::PQ2_0Raw => Some(mk::MlxPackedKind::Pq2_0),
+        Dtype::Mxfp4Raw => Some(mk::MlxPackedKind::Mxfp4),
+        Dtype::Mxfp6Raw => Some(mk::MlxPackedKind::Mxfp6),
+        Dtype::Mxfp8Raw => Some(mk::MlxPackedKind::Mxfp8),
+        _ => None,
+    }
+}
+
+/// Single-row packed matvec via the native MLX backend. Returns `false` on
+/// any miss (no device, over budget, kernel failure) so the caller falls
+/// through to the SYCL/CPU ladder; leaves `out` untouched on failure.
+/// Mirror of [`try_matvec_packed_cuda`].
+fn try_matvec_packed_mlx(
+    kind: mk::MlxPackedKind,
+    weight_key: usize,
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) -> bool {
+    let Some(cache) = mlx_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    guard.matvec_packed(kind, weight_key, w_bytes, x, out, m, k)
+}
+
+/// Batched (`n`-row) packed matvec via the native MLX backend. Mirror of
+/// [`try_matvec_packed_cuda_batched`].
+#[allow(clippy::too_many_arguments)]
+fn try_matvec_packed_mlx_batched(
+    kind: mk::MlxPackedKind,
+    weight_key: usize,
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    let Some(cache) = mlx_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    guard.matvec_packed_batched(kind, weight_key, w_bytes, x, out, m, k, n)
+}
+
+// ============================================================
 // Phase 4: multi-GPU device-assignment plan + per-device caches
 // ============================================================
 //
@@ -200,6 +351,12 @@ pub enum GpuBackend {
     Sycl,
     /// NVIDIA CUDA device, addressed by 0-based `device_index`.
     Cuda,
+    /// Apple Metal / MLX device, addressed by 0-based `device_index`. The
+    /// 4th GPU tier; Apple Silicon is single-GPU + unified-memory in
+    /// practice, so the multi-device (`device_index != 0`) cross-GPU
+    /// routing the CUDA path has is never exercised for Metal — the
+    /// single-device `mlx_active()` dispatch below covers it.
+    Metal,
 }
 
 /// A single GPU target: backend + 0-based device index within that backend.
@@ -6315,6 +6472,685 @@ pub fn clear_cuda_attn_context() {
     });
 }
 
+// ==================================================================
+// MLX-resident flash-attention decode + prefill (Apple Metal)
+// ==================================================================
+//
+// The Apple-Metal analogue of the CUDA-resident flash-attention path above.
+// It mirrors that design EXACTLY — a per-thread context that keeps K/V
+// resident on the accelerator, an epoch/valid-len staleness gate, "write
+// the new row, run the kernel over `[0, pos+1)`, read the output back" — and
+// keeps CUDA's explicit H2D/D2H shape even though Apple Silicon is UNIFIED
+// MEMORY (the CPU and GPU share one physical pool). Keeping the identical
+// shape makes this a mechanical mirror; Phase 1 may collapse the offset H2D
+// copies into direct writes of the shared MTLBuffer page (like the SYCL USM
+// path). The staleness gate is fully INDEPENDENT of both the SYCL and CUDA
+// contexts: its own thread-local (`MLX_ATTN`), its own `kv_valid_len_*` /
+// `kv_epoch_*`. Everything is INERT off Apple Silicon (`mlx_active()` ==
+// false → these are never called), so the SYCL/CUDA/CPU paths are unchanged.
+//
+// The backend-agnostic HOST helpers are reused from the CUDA block above:
+// `cuda_quantize_row_into_stage` (pure CPU quantization into host staging)
+// and `ensure_cuda_shadow_u8` / `ensure_cuda_shadow_f32` (plain `Vec`
+// growth) touch no device state, so duplicating them under `mlx_` names
+// would only add drift. The device-typed helpers (`ensure_mlx_dev`,
+// `mlx_upload_staged_row`) mirror their CUDA peers 1:1 over the `mk::` API.
+
+/// Sized parameters for the MLX attention context. Mirror of
+/// [`CudaAttnConfig`]; a mismatch forces a rebuild.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MlxAttnConfig {
+    n_layers: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+}
+
+/// Per-thread MLX attention context. Byte-for-byte mirror of
+/// [`CudaAttnContext`] over the `mk::` device API: a Metal/MLX stream,
+/// per-layer persistent device-resident K/V mirrors (written one row at a
+/// time via an offset H2D copy — no host shadow, no full re-upload), a small
+/// reusable host staging buffer for the quant path's new row, shared Q / out
+/// device scratch, and disjoint F32 / quant staleness gates.
+///
+/// FIELD ORDER MATTERS: every `mk::MlxDeviceBuffer<'static>` here actually
+/// borrows `self.stream` (the `'static` is the same lifetime lie the SYCL /
+/// CUDA contexts tell); they are declared BEFORE `stream` so declaration-
+/// order field drop frees them while the stream is still alive.
+struct MlxAttnContext {
+    cfg: MlxAttnConfig,
+    // ---- per-layer persistent F32 K/V device mirrors ----
+    dev_k_mirror: Vec<Option<mk::MlxDeviceBuffer<'static>>>,
+    dev_v_mirror: Vec<Option<mk::MlxDeviceBuffer<'static>>>,
+    // ---- per-layer persistent quant K/V device mirrors (+ scales) ----
+    dev_qk_mirror: Vec<Option<mk::MlxDeviceBuffer<'static>>>,
+    dev_qv_mirror: Vec<Option<mk::MlxDeviceBuffer<'static>>>,
+    dev_qk_scales: Vec<Option<mk::MlxDeviceBuffer<'static>>>,
+    dev_qv_scales: Vec<Option<mk::MlxDeviceBuffer<'static>>>,
+    // ---- shared per-step device scratch (reused across layers) ----
+    dev_q: Option<mk::MlxDeviceBuffer<'static>>,
+    dev_out: Option<mk::MlxDeviceBuffer<'static>>,
+    // ---- reusable host staging for ONE new KV row (quant path only) ----
+    stage_row: Vec<u8>,
+    stage_scales: Vec<f32>,
+    // ---- disjoint staleness gates (F32 vs quant; independent of SYCL/CUDA) -
+    kv_valid_len_f32: Vec<u32>,
+    kv_epoch_f32: u64,
+    q_bytes_per_row: Vec<u32>,
+    kv_valid_len_q: Vec<u32>,
+    kv_epoch_q: u64,
+    // ---- prefill device scratch (batched flash-prefill) ----
+    dev_prefill_k: Option<mk::MlxDeviceBuffer<'static>>,
+    dev_prefill_v: Option<mk::MlxDeviceBuffer<'static>>,
+    dev_prefill_k_scales: Option<mk::MlxDeviceBuffer<'static>>,
+    dev_prefill_v_scales: Option<mk::MlxDeviceBuffer<'static>>,
+    dev_prefill_q: Option<mk::MlxDeviceBuffer<'static>>,
+    dev_prefill_out: Option<mk::MlxDeviceBuffer<'static>>,
+    // ---- owning stream (declared LAST so the buffers above free first) --
+    stream: mk::MlxStream,
+}
+
+impl MlxAttnContext {
+    /// Build a fresh MLX attention context for the given model shape.
+    /// `None` when no Metal device / stream creation fails (callers fall
+    /// back to SYCL or CPU). Uses device 0 — the same device the MLX matvec
+    /// cache binds to (`MlxMatvecCache::new(0, ...)`).
+    fn try_new(cfg: MlxAttnConfig) -> Option<Self> {
+        let stream = mk::MlxStream::create(0)?;
+        let n = cfg.n_layers as usize;
+        Some(Self {
+            cfg,
+            dev_k_mirror: (0..n).map(|_| None).collect(),
+            dev_v_mirror: (0..n).map(|_| None).collect(),
+            dev_qk_mirror: (0..n).map(|_| None).collect(),
+            dev_qv_mirror: (0..n).map(|_| None).collect(),
+            dev_qk_scales: (0..n).map(|_| None).collect(),
+            dev_qv_scales: (0..n).map(|_| None).collect(),
+            dev_q: None,
+            dev_out: None,
+            stage_row: Vec::new(),
+            stage_scales: Vec::new(),
+            kv_valid_len_f32: vec![0; n],
+            kv_epoch_f32: 0,
+            q_bytes_per_row: vec![0; n],
+            kv_valid_len_q: vec![0; n],
+            kv_epoch_q: 0,
+            dev_prefill_k: None,
+            dev_prefill_v: None,
+            dev_prefill_k_scales: None,
+            dev_prefill_v_scales: None,
+            dev_prefill_q: None,
+            dev_prefill_out: None,
+            stream,
+        })
+    }
+}
+
+thread_local! {
+    /// Per-thread MLX attention context. Built lazily on the first
+    /// `try_flash_attn_decode_mlx_*` call once `mlx_active()` is true and a
+    /// matching config is presented; rebuilt on a config change. Independent
+    /// of [`USM_ATTN`] and `CUDA_ATTN` — the three backends never share state.
+    static MLX_ATTN: std::cell::RefCell<Option<MlxAttnContext>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Ensure `slot` holds a device buffer of at least `need_bytes`. Mirror of
+/// [`ensure_cuda_dev`] over the `mk::` API (grows free-before-alloc, reused
+/// otherwise). `need_bytes` must be `> 0`.
+fn ensure_mlx_dev(
+    slot: &mut Option<mk::MlxDeviceBuffer<'static>>,
+    stream: &mk::MlxStream,
+    need_bytes: usize,
+) -> bool {
+    if slot.as_ref().map_or(false, |b| b.len_bytes() >= need_bytes) {
+        return true;
+    }
+    // Free the too-small buffer before allocating its replacement so peak
+    // device memory doesn't double.
+    *slot = None;
+    match mk::MlxDeviceBuffer::alloc(stream, need_bytes) {
+        Some(b) => {
+            // SAFETY: the `'_`→`'static` widening is the same lifetime lie
+            // the CUDA/SYCL contexts tell — the buffer borrows `stream` (a
+            // field of the owning context), which is declared last and so
+            // outlives every buffer via declaration-order field drop.
+            *slot = Some(unsafe {
+                std::mem::transmute::<
+                    mk::MlxDeviceBuffer<'_>,
+                    mk::MlxDeviceBuffer<'static>,
+                >(b)
+            });
+            true
+        }
+        None => false,
+    }
+}
+
+/// Offset-upload ONE staged position's packed K (or V) row (+ optional
+/// per-row scales) into its persistent device mirror at `pos`. Mirror of
+/// [`cuda_upload_staged_row`] over the `mk::` API — the head-major
+/// `[n_kv, max_ctx, bytes_per_row]` layout means each kv-head's new row
+/// lands at `(h*max_ctx + pos)*bytes_per_row` (a separate `copy_from_host_at`
+/// per head). Returns false on any H2D error BEFORE the caller extends
+/// `kv_valid_len`, so a half-written row is never marked valid.
+#[allow(clippy::too_many_arguments)]
+fn mlx_upload_staged_row(
+    mirror: &mut mk::MlxDeviceBuffer<'static>,
+    scales_mirror: Option<&mut mk::MlxDeviceBuffer<'static>>,
+    stage_row: &[u8],
+    stage_scales: &[f32],
+    n_kv: usize,
+    mc: usize,
+    pos: usize,
+    bytes_per_row: usize,
+    has_scales: bool,
+) -> bool {
+    for h in 0..n_kv {
+        let off = (h * mc + pos) * bytes_per_row;
+        if mirror
+            .copy_from_host_at(off, &stage_row[h * bytes_per_row..(h + 1) * bytes_per_row])
+            .is_err()
+        {
+            return false;
+        }
+    }
+    if has_scales {
+        let sm = match scales_mirror {
+            Some(s) => s,
+            None => return false,
+        };
+        let sb: &[u8] = unsafe {
+            std::slice::from_raw_parts(stage_scales.as_ptr() as *const u8, n_kv * 4)
+        };
+        for h in 0..n_kv {
+            let off = (h * mc + pos) * 4;
+            if sm.copy_from_host_at(off, &sb[h * 4..(h + 1) * 4]).is_err() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Try to run F32 KV flash-attention decode on the native MLX backend.
+/// Mirror of [`try_flash_attn_decode_cuda_f32`]; same public signature as
+/// [`try_flash_attn_decode_usm_f32`]. `true` iff the GPU produced `out`.
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_mlx_f32(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    if !mlx_active() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    let cfg = MlxAttnConfig { n_layers, n_heads, n_kv_heads, head_dim, max_ctx };
+    let hd = head_dim as usize;
+    let n_kv = n_kv_heads as usize;
+    let mc = max_ctx as usize;
+    let posu = pos as usize;
+    let q_len = (n_heads as usize) * hd;
+    let kv_row_len = n_kv * hd;
+    if q.len() != q_len
+        || k_row.len() != kv_row_len
+        || v_row.len() != kv_row_len
+        || out.len() != q_len
+        || layer_idx >= n_layers as usize
+        || pos >= max_ctx
+        || n_kv_heads == 0
+        || n_heads % n_kv_heads != 0
+    {
+        return false;
+    }
+    let mirror_bytes = n_kv * mc * hd * 4; // full f32 device-mirror bytes
+    let row_bytes = hd * 4; // one kv-head's f32 row
+    let q_bytes = q_len * 4;
+    let kv_len = pos + 1;
+
+    MLX_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let needs_rebuild = match slot.as_ref() {
+            Some(ctx) => ctx.cfg != cfg,
+            None => true,
+        };
+        if needs_rebuild {
+            *slot = MlxAttnContext::try_new(cfg);
+            if slot.is_none() {
+                return false;
+            }
+        }
+        let ctx = slot.as_mut().expect("mlx ctx just built");
+
+        // F32 staleness gate (independent of the quant gate + of SYCL/CUDA).
+        let epoch = USM_KV_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if ctx.kv_epoch_f32 != epoch {
+            for v in ctx.kv_valid_len_f32.iter_mut() {
+                *v = 0;
+            }
+            ctx.kv_epoch_f32 = epoch;
+        }
+        let valid = ctx.kv_valid_len_f32[layer_idx];
+        if pos > valid {
+            log_usm_kv_gap_once(layer_idx, pos, valid);
+            return false;
+        }
+
+        // Ensure this layer's persistent F32 device mirror + shared Q / out
+        // scratch (each `[layer_idx]` mut-borrows a distinct Vec field,
+        // disjoint from the `&ctx.stream` borrow).
+        if !ensure_mlx_dev(&mut ctx.dev_k_mirror[layer_idx], &ctx.stream, mirror_bytes)
+            || !ensure_mlx_dev(&mut ctx.dev_v_mirror[layer_idx], &ctx.stream, mirror_bytes)
+            || !ensure_mlx_dev(&mut ctx.dev_q, &ctx.stream, q_bytes)
+            || !ensure_mlx_dev(&mut ctx.dev_out, &ctx.stream, q_bytes)
+        {
+            return false;
+        }
+
+        // Write ONLY the new K/V row into the resident mirror at `pos`, one
+        // kv-head at a time (head-major ⇒ heads are `max_ctx*head_dim` apart).
+        {
+            let k_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(k_row.as_ptr() as *const u8, kv_row_len * 4)
+            };
+            let kmir = ctx.dev_k_mirror[layer_idx].as_mut().unwrap();
+            for h in 0..n_kv {
+                let off = (h * mc + posu) * row_bytes;
+                if kmir
+                    .copy_from_host_at(off, &k_bytes[h * row_bytes..(h + 1) * row_bytes])
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+        }
+        {
+            let v_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(v_row.as_ptr() as *const u8, kv_row_len * 4)
+            };
+            let vmir = ctx.dev_v_mirror[layer_idx].as_mut().unwrap();
+            for h in 0..n_kv {
+                let off = (h * mc + posu) * row_bytes;
+                if vmir
+                    .copy_from_host_at(off, &v_bytes[h * row_bytes..(h + 1) * row_bytes])
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+        }
+        // Extend the valid range ONLY after the row is fully resident.
+        if pos == valid {
+            ctx.kv_valid_len_f32[layer_idx] = pos + 1;
+        }
+
+        // Upload Q into the shared scratch.
+        {
+            let q_src: &[u8] =
+                unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u8, q_bytes) };
+            if ctx.dev_q.as_mut().unwrap().copy_from_host(q_src).is_err() {
+                return false;
+            }
+        }
+
+        // Gather raw device pointers (disjoint fields) and launch over
+        // `[0, pos+1)` against the persistent mirror. No full re-upload.
+        let stream = &ctx.stream;
+        let q_ptr = ctx.dev_q.as_ref().unwrap().as_ptr() as *const f32;
+        let k_ptr = ctx.dev_k_mirror[layer_idx].as_ref().unwrap().as_ptr() as *const f32;
+        let v_ptr = ctx.dev_v_mirror[layer_idx].as_ref().unwrap().as_ptr() as *const f32;
+        let out_ptr = ctx.dev_out.as_mut().unwrap().as_mut_ptr() as *mut f32;
+        // SAFETY: all four are live device pointers on `stream`, sized for
+        // the shapes below; the wrapper synchronizes before returning so
+        // the read-back doesn't race the kernel.
+        let launched = unsafe {
+            mk::flash_attn_decode_f32(
+                stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                n_heads as usize, n_kv, hd, mc, kv_len as usize,
+            )
+        }
+        .is_ok();
+        if !launched || mk::consume_error_count() != 0 {
+            return false;
+        }
+
+        // Read the result back into the caller's f32 buffer.
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, q_bytes) };
+        ctx.dev_out.as_ref().unwrap().copy_to_host(out_bytes).is_ok()
+    })
+}
+
+/// Shared body for every native-MLX quantized-KV decode helper. Mirror of
+/// [`try_flash_attn_decode_cuda_quant`] over the `mk::` API. `true` iff the
+/// GPU produced `out`.
+#[allow(clippy::too_many_arguments)]
+fn try_flash_attn_decode_mlx_quant(
+    fmt: QuantKv,
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    if !mlx_active() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    let cfg = MlxAttnConfig { n_layers, n_heads, n_kv_heads, head_dim, max_ctx };
+    let hd = head_dim as usize;
+    let n_kv = n_kv_heads as usize;
+    let mc = max_ctx as usize;
+    let posu = pos as usize;
+    let q_len = (n_heads as usize) * hd;
+    let kv_row_len = n_kv * hd;
+    if q.len() != q_len
+        || k_row.len() != kv_row_len
+        || v_row.len() != kv_row_len
+        || out.len() != q_len
+        || layer_idx >= n_layers as usize
+        || pos >= max_ctx
+        || n_kv_heads == 0
+        || n_heads % n_kv_heads != 0
+    {
+        return false;
+    }
+    // Per-format block constraint (same rules as the CUDA/SYCL quant helper).
+    let ok_shape = match fmt {
+        QuantKv::Q4_0 => hd % 32 == 0,
+        QuantKv::Q8_0 => true,
+        QuantKv::Nvfp4 => hd % 16 == 0,
+        QuantKv::Tq { bits } => matches!(bits, 1 | 2 | 4 | 8) && hd.is_power_of_two(),
+        QuantKv::Mxfp4 | QuantKv::Mxfp6 | QuantKv::Mxfp8 => hd % 32 == 0,
+    };
+    if !ok_shape {
+        return false;
+    }
+    let bytes_per_row = fmt.bytes_per_row(hd);
+    let mirror_len = n_kv * mc * bytes_per_row; // packed bytes
+    let scales_len = n_kv * mc; // f32 elements
+    let q_bytes = q_len * 4;
+    let kv_len = pos + 1;
+    let has_scales = fmt.has_scales();
+
+    MLX_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let needs_rebuild = match slot.as_ref() {
+            Some(ctx) => ctx.cfg != cfg,
+            None => true,
+        };
+        if needs_rebuild {
+            *slot = MlxAttnContext::try_new(cfg);
+            if slot.is_none() {
+                return false;
+            }
+        }
+        let ctx = slot.as_mut().expect("mlx ctx just built");
+
+        // Quant staleness gate (independent of the F32 gate + of SYCL/CUDA).
+        let epoch = USM_KV_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if ctx.kv_epoch_q != epoch {
+            for v in ctx.kv_valid_len_q.iter_mut() {
+                *v = 0;
+            }
+            ctx.kv_epoch_q = epoch;
+        }
+        let valid = ctx.kv_valid_len_q[layer_idx];
+        if pos > valid {
+            log_usm_kv_gap_once(layer_idx, pos, valid);
+            return false;
+        }
+
+        // A format change for this layer re-allocates the device mirror (+
+        // scales) and resets its valid range — mirrors the CUDA quant gate.
+        if ctx.q_bytes_per_row[layer_idx] as usize != bytes_per_row {
+            ctx.dev_qk_mirror[layer_idx] = None;
+            ctx.dev_qv_mirror[layer_idx] = None;
+            ctx.dev_qk_scales[layer_idx] = None;
+            ctx.dev_qv_scales[layer_idx] = None;
+            ctx.kv_valid_len_q[layer_idx] = 0;
+            ctx.q_bytes_per_row[layer_idx] = bytes_per_row as u32;
+        }
+
+        // Ensure this layer's persistent packed device mirror (+ scales),
+        // the shared Q / out scratch, and the reusable one-row host staging.
+        if !ensure_mlx_dev(&mut ctx.dev_qk_mirror[layer_idx], &ctx.stream, mirror_len)
+            || !ensure_mlx_dev(&mut ctx.dev_qv_mirror[layer_idx], &ctx.stream, mirror_len)
+            || !ensure_mlx_dev(&mut ctx.dev_q, &ctx.stream, q_bytes)
+            || !ensure_mlx_dev(&mut ctx.dev_out, &ctx.stream, q_bytes)
+        {
+            return false;
+        }
+        if has_scales
+            && (!ensure_mlx_dev(&mut ctx.dev_qk_scales[layer_idx], &ctx.stream, scales_len * 4)
+                || !ensure_mlx_dev(&mut ctx.dev_qv_scales[layer_idx], &ctx.stream, scales_len * 4))
+        {
+            return false;
+        }
+        // Host staging for ONE position's new row (all kv-heads), reused for
+        // K then V. Reuses the backend-agnostic `cuda_`-named host helpers.
+        let stage_bytes = n_kv * bytes_per_row;
+        if !ensure_cuda_shadow_u8(&mut ctx.stage_row, stage_bytes) {
+            return false;
+        }
+        if has_scales && !ensure_cuda_shadow_f32(&mut ctx.stage_scales, n_kv) {
+            return false;
+        }
+
+        // Quantize + offset-upload the new K row, then the new V row, reusing
+        // the one staging buffer. The SAME CPU quantizers the engine's host
+        // slab uses keep each mirror row byte-identical, so the GPU output
+        // equals the CPU flash-decode result. Only ONE row moves host→device
+        // per call. `mlx_upload_staged_row` returns false (→ CPU) on any H2D
+        // error BEFORE the valid range is extended.
+        cuda_quantize_row_into_stage(
+            fmt, k_row, &mut ctx.stage_row, &mut ctx.stage_scales, n_kv, hd, bytes_per_row,
+        );
+        if !mlx_upload_staged_row(
+            ctx.dev_qk_mirror[layer_idx].as_mut().unwrap(),
+            ctx.dev_qk_scales[layer_idx].as_mut(),
+            &ctx.stage_row,
+            &ctx.stage_scales,
+            n_kv, mc, posu, bytes_per_row, has_scales,
+        ) {
+            return false;
+        }
+        cuda_quantize_row_into_stage(
+            fmt, v_row, &mut ctx.stage_row, &mut ctx.stage_scales, n_kv, hd, bytes_per_row,
+        );
+        if !mlx_upload_staged_row(
+            ctx.dev_qv_mirror[layer_idx].as_mut().unwrap(),
+            ctx.dev_qv_scales[layer_idx].as_mut(),
+            &ctx.stage_row,
+            &ctx.stage_scales,
+            n_kv, mc, posu, bytes_per_row, has_scales,
+        ) {
+            return false;
+        }
+        // Extend the valid range ONLY after both rows are fully resident.
+        if pos == valid {
+            ctx.kv_valid_len_q[layer_idx] = pos + 1;
+        }
+
+        // Upload Q into the shared scratch.
+        {
+            let q_src: &[u8] =
+                unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u8, q_bytes) };
+            if ctx.dev_q.as_mut().unwrap().copy_from_host(q_src).is_err() {
+                return false;
+            }
+        }
+
+        // Gather raw device pointers (disjoint fields) and launch the
+        // format-matching kernel against the persistent packed mirror.
+        let stream = &ctx.stream;
+        let q_ptr = ctx.dev_q.as_ref().unwrap().as_ptr() as *const f32;
+        let k_ptr = ctx.dev_qk_mirror[layer_idx].as_ref().unwrap().as_ptr();
+        let v_ptr = ctx.dev_qv_mirror[layer_idx].as_ref().unwrap().as_ptr();
+        let out_ptr = ctx.dev_out.as_mut().unwrap().as_mut_ptr() as *mut f32;
+        let (ks_ptr, vs_ptr) = if has_scales {
+            (
+                ctx.dev_qk_scales[layer_idx].as_ref().unwrap().as_ptr() as *const f32,
+                ctx.dev_qv_scales[layer_idx].as_ref().unwrap().as_ptr() as *const f32,
+            )
+        } else {
+            (std::ptr::null::<f32>(), std::ptr::null::<f32>())
+        };
+        // SAFETY: every pointer is a live device allocation on `stream`,
+        // sized for the shapes below; the wrappers synchronize before
+        // returning so the read-back doesn't race the kernel.
+        let launched = unsafe {
+            match fmt {
+                QuantKv::Q4_0 => mk::flash_attn_decode_q4_0(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                ),
+                QuantKv::Q8_0 => mk::flash_attn_decode_q8_0(
+                    stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, out_ptr,
+                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                ),
+                QuantKv::Nvfp4 => mk::flash_attn_decode_nvfp4(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                ),
+                QuantKv::Tq { bits } => mk::flash_attn_decode_tq(
+                    stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
+                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                ),
+                QuantKv::Mxfp4 => mk::flash_attn_decode_mxfp4(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                ),
+                QuantKv::Mxfp6 => mk::flash_attn_decode_mxfp6(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                ),
+                QuantKv::Mxfp8 => mk::flash_attn_decode_mxfp8(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                ),
+            }
+        }
+        .is_ok();
+        if !launched || mk::consume_error_count() != 0 {
+            return false;
+        }
+
+        // Read the f32 result back into the caller's buffer.
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, q_bytes) };
+        ctx.dev_out.as_ref().unwrap().copy_to_host(out_bytes).is_ok()
+    })
+}
+
+/// Native-MLX quantized-KV (Q4_0) flash-attention decode. Same signature as
+/// [`try_flash_attn_decode_usm_q4_0`]. `false` ⇒ caller uses SYCL/CPU.
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_mlx_q4_0(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    try_flash_attn_decode_mlx_quant(
+        QuantKv::Q4_0, q, k_row, v_row, out, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// Native-MLX quantized-KV (Q8_0 i8 slab + per-row absmax) decode.
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_mlx_q8_0(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    try_flash_attn_decode_mlx_quant(
+        QuantKv::Q8_0, q, k_row, v_row, out, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// Native-MLX quantized-KV (NVFP4) flash-attention decode.
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_mlx_nvfp4(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    try_flash_attn_decode_mlx_quant(
+        QuantKv::Nvfp4, q, k_row, v_row, out, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// Native-MLX quantized-KV (TurboQuant, `bits` ∈ {1,2,4,8}) decode.
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_mlx_tq(
+    q: &[f32],
+    k_row: &[f32],
+    v_row: &[f32],
+    out: &mut [f32],
+    bits: u8,
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    try_flash_attn_decode_mlx_quant(
+        QuantKv::Tq { bits }, q, k_row, v_row, out, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// Diagnostic: clear the per-thread MLX attention context. Sibling of
+/// [`clear_cuda_attn_context`].
+pub fn clear_mlx_attn_context() {
+    MLX_ATTN.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
 // ------------------------------------------------------------------
 // GPU flash-attention decode dispatchers (CUDA → SYCL → CPU)
 // ------------------------------------------------------------------
@@ -6351,6 +7187,14 @@ pub fn try_flash_attn_decode_gpu_f32(
     {
         return true;
     }
+    if mlx_active()
+        && try_flash_attn_decode_mlx_f32(
+            q, k_row, v_row, out, layer_idx, pos,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        )
+    {
+        return true;
+    }
     try_flash_attn_decode_usm_f32(
         q, k_row, v_row, out, layer_idx, pos,
         n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
@@ -6374,6 +7218,14 @@ pub fn try_flash_attn_decode_gpu_q4_0(
 ) -> bool {
     if cuda_active()
         && try_flash_attn_decode_cuda_q4_0(
+            q, k_row, v_row, out, layer_idx, pos,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        )
+    {
+        return true;
+    }
+    if mlx_active()
+        && try_flash_attn_decode_mlx_q4_0(
             q, k_row, v_row, out, layer_idx, pos,
             n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
         )
@@ -6409,6 +7261,14 @@ pub fn try_flash_attn_decode_gpu_q8_0(
     {
         return true;
     }
+    if mlx_active()
+        && try_flash_attn_decode_mlx_q8_0(
+            q, k_row, v_row, out, layer_idx, pos,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        )
+    {
+        return true;
+    }
     try_flash_attn_decode_usm_q8_0(
         q, k_row, v_row, out, layer_idx, pos,
         n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
@@ -6432,6 +7292,14 @@ pub fn try_flash_attn_decode_gpu_nvfp4(
 ) -> bool {
     if cuda_active()
         && try_flash_attn_decode_cuda_nvfp4(
+            q, k_row, v_row, out, layer_idx, pos,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        )
+    {
+        return true;
+    }
+    if mlx_active()
+        && try_flash_attn_decode_mlx_nvfp4(
             q, k_row, v_row, out, layer_idx, pos,
             n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
         )
@@ -6471,6 +7339,14 @@ macro_rules! mxfp_decode_gpu_combinator {
             {
                 return true;
             }
+            if mlx_active()
+                && try_flash_attn_decode_mlx_quant(
+                    $kv, q, k_row, v_row, out, layer_idx, pos,
+                    n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+                )
+            {
+                return true;
+            }
             try_flash_attn_decode_usm_quant(
                 $kv, q, k_row, v_row, out, layer_idx, pos,
                 n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
@@ -6500,6 +7376,14 @@ pub fn try_flash_attn_decode_gpu_tq(
 ) -> bool {
     if cuda_active()
         && try_flash_attn_decode_cuda_tq(
+            q, k_row, v_row, out, bits, layer_idx, pos,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        )
+    {
+        return true;
+    }
+    if mlx_active()
+        && try_flash_attn_decode_mlx_tq(
             q, k_row, v_row, out, bits, layer_idx, pos,
             n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
         )
@@ -7395,6 +8279,27 @@ pub fn try_matvec_tensor_usm_f32(
         if let Some(ck_kind) = dtype_to_cuda_kind(w.dtype) {
             let wb = as_bytes(w);
             if try_matvec_packed_cuda(ck_kind, wb.as_ptr() as usize, wb, x, out, m, k) {
+                return true;
+            }
+        }
+    }
+    // Native MLX (Apple Metal) backend — the 4th GPU tier. Same universal
+    // gates as the CUDA arm above; inert off Apple Silicon (`mlx_active`
+    // == false → skipped entirely, path byte-identical). On a Mac this is
+    // chosen in place of CUDA/SYCL (mutually exclusive in practice). A miss
+    // falls through to the SYCL/CPU ladder.
+    if mlx_active()
+        && !tensor_forced_to_cpu(&w.name)
+        && current_layer_idx() < n_gpu_layers()
+        && m != 0
+        && k != 0
+        && x.len() == k
+        && out.len() == m
+        && matvec_above_min_flops(2u64 * m as u64 * k as u64)
+    {
+        if let Some(mk_kind) = dtype_to_mlx_kind(w.dtype) {
+            let wb = as_bytes(w);
+            if try_matvec_packed_mlx(mk_kind, wb.as_ptr() as usize, wb, x, out, m, k) {
                 return true;
             }
         }
@@ -9045,6 +9950,25 @@ pub fn try_matvec_tensor_batched_usm_f32(
             }
         }
     }
+    // Native MLX (Apple Metal) backend — batched twin of the single-row
+    // hook. Universal gates only; inert off Apple Silicon.
+    if mlx_active()
+        && !tensor_forced_to_cpu(&w.name)
+        && current_layer_idx() < n_gpu_layers()
+        && m != 0
+        && k != 0
+        && n != 0
+        && x.len() == n * k
+        && out.len() == n * m
+        && matvec_above_min_flops(2u64 * n as u64 * m as u64 * k as u64)
+    {
+        if let Some(mk_kind) = dtype_to_mlx_kind(w.dtype) {
+            let wb = as_bytes(w);
+            if try_matvec_packed_mlx_batched(mk_kind, wb.as_ptr() as usize, wb, x, out, m, k, n) {
+                return true;
+            }
+        }
+    }
     if !usm_attn_enabled() {
         log_matvec_batched_skip_once("usm_attn_enabled = false");
         return false;
@@ -9982,6 +10906,283 @@ fn try_flash_attn_prefill_cuda_quant(
     })
 }
 
+/// F32 KV flash-attention prefill on the native MLX backend. Mirror of
+/// [`try_flash_attn_prefill_cuda_f32`] over the `mk::` API. `true` iff the
+/// GPU produced `out`.
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_prefill_mlx_f32(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+) -> bool {
+    if !mlx_active() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || max_ctx == 0 || n_new == 0 {
+        return false;
+    }
+    if n_heads % n_kv_heads != 0 || kv_len_base + n_new > max_ctx {
+        return false;
+    }
+    let need_q = n_new * n_heads * head_dim;
+    let need_kv = n_kv_heads * max_ctx * head_dim;
+    if q.len() != need_q || k.len() != need_kv || v.len() != need_kv || out.len() != need_q {
+        return false;
+    }
+    let mirror_bytes = need_kv * 4;
+    let q_bytes = need_q * 4;
+    let out_bytes = need_q * 4;
+    MLX_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        // Prefill runs before any decode, so the context is normally None
+        // here. Build a minimal one (n_layers = 1: prefill never indexes the
+        // per-layer decode shadows) purely to own a stream + prefill scratch.
+        if slot.is_none() {
+            *slot = MlxAttnContext::try_new(MlxAttnConfig {
+                n_layers: 1,
+                n_heads: n_heads as u32,
+                n_kv_heads: n_kv_heads as u32,
+                head_dim: head_dim as u32,
+                max_ctx: max_ctx as u32,
+            });
+            if slot.is_none() {
+                return false;
+            }
+        }
+        let ctx = slot.as_mut().expect("mlx ctx just built");
+        if !ensure_mlx_dev(&mut ctx.dev_prefill_k, &ctx.stream, mirror_bytes)
+            || !ensure_mlx_dev(&mut ctx.dev_prefill_v, &ctx.stream, mirror_bytes)
+            || !ensure_mlx_dev(&mut ctx.dev_prefill_q, &ctx.stream, q_bytes)
+            || !ensure_mlx_dev(&mut ctx.dev_prefill_out, &ctx.stream, out_bytes)
+        {
+            return false;
+        }
+        {
+            let s: &[u8] =
+                unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, mirror_bytes) };
+            if ctx.dev_prefill_k.as_mut().unwrap().copy_from_host(s).is_err() {
+                return false;
+            }
+        }
+        {
+            let s: &[u8] =
+                unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, mirror_bytes) };
+            if ctx.dev_prefill_v.as_mut().unwrap().copy_from_host(s).is_err() {
+                return false;
+            }
+        }
+        {
+            let s: &[u8] = unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u8, q_bytes) };
+            if ctx.dev_prefill_q.as_mut().unwrap().copy_from_host(s).is_err() {
+                return false;
+            }
+        }
+        let stream = &ctx.stream;
+        let q_ptr = ctx.dev_prefill_q.as_ref().unwrap().as_ptr() as *const f32;
+        let k_ptr = ctx.dev_prefill_k.as_ref().unwrap().as_ptr() as *const f32;
+        let v_ptr = ctx.dev_prefill_v.as_ref().unwrap().as_ptr() as *const f32;
+        let out_ptr = ctx.dev_prefill_out.as_mut().unwrap().as_mut_ptr() as *mut f32;
+        // SAFETY: live device pointers on `stream`, sized above; the wrapper
+        // synchronizes before returning so the read-back doesn't race.
+        let launched = unsafe {
+            mk::flash_attn_prefill_f32(
+                stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            )
+        }
+        .is_ok();
+        if !launched || mk::consume_error_count() != 0 {
+            return false;
+        }
+        let out_b: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out_bytes) };
+        ctx.dev_prefill_out.as_ref().unwrap().copy_to_host(out_b).is_ok()
+    })
+}
+
+/// Shared body for every native-MLX quantized-KV prefill helper. Mirror of
+/// [`try_flash_attn_prefill_cuda_quant`] over the `mk::` API. `k_packed` /
+/// `v_packed` are the packed slab bytes; `k_scales` / `v_scales` the per-row
+/// f32 scales (empty for scale-embedded formats). `true` iff the GPU
+/// produced `out`.
+#[allow(clippy::too_many_arguments)]
+fn try_flash_attn_prefill_mlx_quant(
+    fmt: QuantKv,
+    q: &[f32],
+    k_packed: &[u8],
+    v_packed: &[u8],
+    k_scales: &[f32],
+    v_scales: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+) -> bool {
+    if !mlx_active() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || max_ctx == 0 || n_new == 0 {
+        return false;
+    }
+    if n_heads % n_kv_heads != 0 || kv_len_base + n_new > max_ctx {
+        return false;
+    }
+    let ok_shape = match fmt {
+        QuantKv::Q4_0 => head_dim % 32 == 0,
+        QuantKv::Q8_0 => true,
+        QuantKv::Nvfp4 => head_dim % 16 == 0,
+        QuantKv::Tq { bits } => matches!(bits, 1 | 2 | 4 | 8) && head_dim.is_power_of_two(),
+        QuantKv::Mxfp4 | QuantKv::Mxfp6 | QuantKv::Mxfp8 => head_dim % 32 == 0,
+    };
+    if !ok_shape {
+        return false;
+    }
+    let bytes_per_row = fmt.bytes_per_row(head_dim);
+    let need_q = n_new * n_heads * head_dim;
+    let need_kv = n_kv_heads * max_ctx * bytes_per_row;
+    let need_scales = n_kv_heads * max_ctx;
+    let has_scales = fmt.has_scales();
+    if q.len() != need_q
+        || k_packed.len() != need_kv
+        || v_packed.len() != need_kv
+        || out.len() != need_q
+    {
+        return false;
+    }
+    if has_scales && (k_scales.len() != need_scales || v_scales.len() != need_scales) {
+        return false;
+    }
+    let q_bytes = need_q * 4;
+    let out_bytes = need_q * 4;
+    let scales_bytes = need_scales * 4;
+    MLX_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = MlxAttnContext::try_new(MlxAttnConfig {
+                n_layers: 1,
+                n_heads: n_heads as u32,
+                n_kv_heads: n_kv_heads as u32,
+                head_dim: head_dim as u32,
+                max_ctx: max_ctx as u32,
+            });
+            if slot.is_none() {
+                return false;
+            }
+        }
+        let ctx = slot.as_mut().expect("mlx ctx just built");
+        if !ensure_mlx_dev(&mut ctx.dev_prefill_k, &ctx.stream, need_kv)
+            || !ensure_mlx_dev(&mut ctx.dev_prefill_v, &ctx.stream, need_kv)
+            || !ensure_mlx_dev(&mut ctx.dev_prefill_q, &ctx.stream, q_bytes)
+            || !ensure_mlx_dev(&mut ctx.dev_prefill_out, &ctx.stream, out_bytes)
+        {
+            return false;
+        }
+        if has_scales
+            && (!ensure_mlx_dev(&mut ctx.dev_prefill_k_scales, &ctx.stream, scales_bytes)
+                || !ensure_mlx_dev(&mut ctx.dev_prefill_v_scales, &ctx.stream, scales_bytes))
+        {
+            return false;
+        }
+        // Upload the packed slab (+ scales) + Q verbatim. `k_packed` etc. are
+        // caller-owned slices (not `ctx` fields), so there is no aliasing
+        // with the device buffers they copy into.
+        if ctx.dev_prefill_k.as_mut().unwrap().copy_from_host(k_packed).is_err() {
+            return false;
+        }
+        if ctx.dev_prefill_v.as_mut().unwrap().copy_from_host(v_packed).is_err() {
+            return false;
+        }
+        if has_scales {
+            {
+                let s: &[u8] = unsafe {
+                    std::slice::from_raw_parts(k_scales.as_ptr() as *const u8, scales_bytes)
+                };
+                if ctx.dev_prefill_k_scales.as_mut().unwrap().copy_from_host(s).is_err() {
+                    return false;
+                }
+            }
+            {
+                let s: &[u8] = unsafe {
+                    std::slice::from_raw_parts(v_scales.as_ptr() as *const u8, scales_bytes)
+                };
+                if ctx.dev_prefill_v_scales.as_mut().unwrap().copy_from_host(s).is_err() {
+                    return false;
+                }
+            }
+        }
+        {
+            let s: &[u8] = unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u8, q_bytes) };
+            if ctx.dev_prefill_q.as_mut().unwrap().copy_from_host(s).is_err() {
+                return false;
+            }
+        }
+        let stream = &ctx.stream;
+        let q_ptr = ctx.dev_prefill_q.as_ref().unwrap().as_ptr() as *const f32;
+        let k_ptr = ctx.dev_prefill_k.as_ref().unwrap().as_ptr();
+        let v_ptr = ctx.dev_prefill_v.as_ref().unwrap().as_ptr();
+        let out_ptr = ctx.dev_prefill_out.as_mut().unwrap().as_mut_ptr() as *mut f32;
+        let (ks_ptr, vs_ptr) = if has_scales {
+            (
+                ctx.dev_prefill_k_scales.as_ref().unwrap().as_ptr() as *const f32,
+                ctx.dev_prefill_v_scales.as_ref().unwrap().as_ptr() as *const f32,
+            )
+        } else {
+            (std::ptr::null::<f32>(), std::ptr::null::<f32>())
+        };
+        // SAFETY: live device pointers on `stream`, sized above; the wrappers
+        // synchronize before returning.
+        let launched = unsafe {
+            match fmt {
+                QuantKv::Q4_0 => mk::flash_attn_prefill_q4_0(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                ),
+                QuantKv::Q8_0 => mk::flash_attn_prefill_q8_0(
+                    stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                ),
+                QuantKv::Nvfp4 => mk::flash_attn_prefill_nvfp4(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                ),
+                QuantKv::Tq { bits } => mk::flash_attn_prefill_tq(
+                    stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                ),
+                QuantKv::Mxfp4 => mk::flash_attn_prefill_mxfp4(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                ),
+                QuantKv::Mxfp6 => mk::flash_attn_prefill_mxfp6(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                ),
+                QuantKv::Mxfp8 => mk::flash_attn_prefill_mxfp8(
+                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                ),
+            }
+        }
+        .is_ok();
+        if !launched || mk::consume_error_count() != 0 {
+            return false;
+        }
+        let out_b: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out_bytes) };
+        ctx.dev_prefill_out.as_ref().unwrap().copy_to_host(out_b).is_ok()
+    })
+}
+
 // ------------------------------------------------------------------
 // GPU flash-attention PREFILL dispatchers (CUDA → SYCL → CPU)
 // ------------------------------------------------------------------
@@ -10013,6 +11214,13 @@ pub fn try_flash_attn_prefill_gpu_f32(
     {
         return true;
     }
+    if mlx_active()
+        && try_flash_attn_prefill_mlx_f32(
+            q, k, v, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        )
+    {
+        return true;
+    }
     try_flash_attn_prefill_usm_f32(
         q, k, v, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
     )
@@ -10034,6 +11242,14 @@ pub fn try_flash_attn_prefill_gpu_q4_0(
 ) -> bool {
     if cuda_active()
         && try_flash_attn_prefill_cuda_quant(
+            QuantKv::Q4_0, q, k_packed, v_packed, &[], &[], out,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        )
+    {
+        return true;
+    }
+    if mlx_active()
+        && try_flash_attn_prefill_mlx_quant(
             QuantKv::Q4_0, q, k_packed, v_packed, &[], &[], out,
             n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
         )
@@ -10076,6 +11292,14 @@ pub fn try_flash_attn_prefill_gpu_q8_0(
     {
         return true;
     }
+    if mlx_active()
+        && try_flash_attn_prefill_mlx_quant(
+            QuantKv::Q8_0, q, k_bytes, v_bytes, k_scales, v_scales, out,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        )
+    {
+        return true;
+    }
     try_flash_attn_prefill_usm_quant(
         QuantKv::Q8_0, q, k_bytes, v_bytes, k_scales, v_scales, out,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
@@ -10098,6 +11322,14 @@ pub fn try_flash_attn_prefill_gpu_nvfp4(
 ) -> bool {
     if cuda_active()
         && try_flash_attn_prefill_cuda_quant(
+            QuantKv::Nvfp4, q, k_packed, v_packed, &[], &[], out,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        )
+    {
+        return true;
+    }
+    if mlx_active()
+        && try_flash_attn_prefill_mlx_quant(
             QuantKv::Nvfp4, q, k_packed, v_packed, &[], &[], out,
             n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
         )
@@ -10134,6 +11366,14 @@ macro_rules! mxfp_prefill_gpu_combinator {
             {
                 return true;
             }
+            if mlx_active()
+                && try_flash_attn_prefill_mlx_quant(
+                    $kv, q, k_packed, v_packed, &[], &[], out,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                )
+            {
+                return true;
+            }
             try_flash_attn_prefill_usm_quant(
                 $kv, q, k_packed, v_packed, &[], &[], out,
                 n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
@@ -10164,6 +11404,14 @@ pub fn try_flash_attn_prefill_gpu_tq(
 ) -> bool {
     if cuda_active()
         && try_flash_attn_prefill_cuda_quant(
+            QuantKv::Tq { bits }, q, k_packed, v_packed, k_scales, v_scales, out,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        )
+    {
+        return true;
+    }
+    if mlx_active()
+        && try_flash_attn_prefill_mlx_quant(
             QuantKv::Tq { bits }, q, k_packed, v_packed, k_scales, v_scales, out,
             n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
         )

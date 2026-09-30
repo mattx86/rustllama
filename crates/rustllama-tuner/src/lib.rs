@@ -572,6 +572,16 @@ pub fn system_fingerprint() -> String {
             gpus.insert(gpu_key("cuda", 0x10de, &d.name, vram_mb, &d.uuid));
         }
     }
+    // Apple Metal GPUs — the 4th tier. Inert off Apple Silicon
+    // (`device_count()` returns 0), so the fingerprint is unchanged on
+    // Windows/Linux/Intel-mac. Keyed by `mlx_gpu_key` (registry-id-aware),
+    // deduped into the same BTreeSet as the SYCL/CUDA GPUs.
+    let n_mlx = rustllama_kernels_mlx::device_count();
+    for i in 0..n_mlx {
+        if let Ok(d) = rustllama_kernels_mlx::device_info(i) {
+            gpus.insert(mlx_gpu_key(&d));
+        }
+    }
 
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -636,6 +646,23 @@ pub fn sycl_gpu_key(d: &rustllama_kernels_sycl::DeviceInfo) -> String {
 pub fn cuda_gpu_key(d: &rustllama_kernels_cuda::CudaDeviceInfo) -> String {
     let vram_mb = d.total_mem_bytes / (1024 * 1024);
     gpu_key("cuda", 0x10de, &d.name, vram_mb, &d.uuid)
+}
+
+/// Stable per-device slug for an Apple Metal GPU — the exact key
+/// [`system_fingerprint`] uses for this device. Mirror of [`cuda_gpu_key`]
+/// (Apple GPUs use vendor `0x106b`, Apple Inc.'s PCI vendor ID).
+///
+/// Metal has no CUDA-style 16-byte device UUID, so `MlxDeviceInfo.uuid` is
+/// all-zero until Phase 1 synthesizes one from `registry_id`. To keep the
+/// key stable + per-device-unique even in Phase 0, fold the driver-invariant
+/// `registry_id` into the name so the name/vram FALLBACK in [`gpu_key`]
+/// distinguishes devices (two identically-named Metal GPUs — never on
+/// today's single-GPU Apple Silicon — would otherwise collide). Once Phase 1
+/// sets a real UUID, `gpu_key` takes the UUID path and ignores the name.
+pub fn mlx_gpu_key(d: &rustllama_kernels_mlx::MlxDeviceInfo) -> String {
+    let vram_mb = d.total_mem_bytes / (1024 * 1024);
+    let name = format!("{}#{:x}", d.name, d.registry_id);
+    gpu_key("mlx", 0x106b, &name, vram_mb, &d.uuid)
 }
 
 /// Stable per-device slug for the CPU compute tier: the CPU package
