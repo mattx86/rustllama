@@ -1,16 +1,17 @@
 // Metal Shading Language kernels for rustllama's Apple GPU backend.
 //
-// ============================ STATUS: PHASE 0 ============================
-// SKELETON — NOT compiled in Phase 0. build.rs compiles only the host shim
-// (`rsl_mlx.mm`) with plain clang++ while the backend is inert. Phase 1
-// compiles this file into a `.metallib`:
+// ============================ STATUS: PHASE 1a =========================
+// COMPILED. On the real macOS/Apple-Silicon path build.rs compiles this file
+// to a `.metallib` and bin2c-EMBEDS it into librsl_mlx.dylib:
 //
-//   xcrun -sdk macosx metal    -c rsl_mlx.metal -o rsl_mlx.air
-//   xcrun -sdk macosx metallib    rsl_mlx.air   -o rsl_mlx.metallib
+//   xcrun -sdk macosx metal    -c rsl_mlx.metal -o $OUT/rsl_mlx.air
+//   xcrun -sdk macosx metallib    $OUT/rsl_mlx.air -o $OUT/rsl_mlx.metallib
+//   (bytes → $OUT/rsl_mlx_metallib.h, loaded via [dev newLibraryWithData:])
 //
-// then either embeds it in the dylib (`-sectcreate __TEXT __metallib ...`)
-// or loads it at runtime (`[dev newLibraryWithURL:]`). The host shim looks
-// up each `kernel` below by name to build a `MTLComputePipelineState`.
+// The host shim (rsl_mlx.mm) looks up `rsl_mlx_matvec_f32_kernel` below by
+// name to build a `MTLComputePipelineState`. Phase 1a ships ONLY that f32
+// matvec kernel live; the kernel families sketched at the bottom are the
+// Phase-1b/1c TODO (their host entry points still return -1).
 //
 // PARITY DISCIPLINE: every kernel here must be a BYTE-EXACT port of its CPU
 // reference in `rustllama-kernels-cpu` (and match the SYCL/CUDA kernels),
