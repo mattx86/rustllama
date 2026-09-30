@@ -15,9 +15,10 @@ use egui::{Align, Align2, Color32, FontId, Layout, Margin, Rect, RichText, Round
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use futures::StreamExt;
 use rustllama_client::{
-    Capabilities, ChatEvent, ChatMessage, ChatRequest, Client, HfFile, HfModel, LoadModelParams,
-    MetricsSnapshot, StreamOptions, SystemPrompt, TagsModel, ToolCall, TuneProgress,
-    TuningRecommendations, TuningSummary, Usage,
+    Capabilities, ChatEvent, ChatMessage, ChatRequest, Client, ConversationSummary, DecideResult,
+    HfFile, HfModel, LoadModelParams, MetricsSnapshot, MultimodalMessage, StoredMessage,
+    StreamOptions, SystemPrompt, TagsModel, ToolCall, TuneProgress, TuningRecommendations,
+    TuningSummary, Usage,
 };
 
 /// How many `/v1/metrics` samples the Status sparklines retain. At the ~1 Hz
@@ -58,13 +59,15 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("?", "Toggle this shortcuts overlay"),
 ];
 
-/// Which page the central area renders. Chat + Models (Phase 2) and Status +
-/// Settings (Phase 4) are live; Decide / Quantize remain stubbed in the nav.
+/// Which page the central area renders. All six nav items are live as of
+/// Phase 5 (Decide + Quantize completed the parity pass).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
     Chat,
     Models,
+    Decide,
     Status,
+    Quantize,
     Settings,
 }
 
@@ -81,16 +84,22 @@ struct LoadedModel {
 enum NavIcon {
     Chat,
     Models,
+    Decide,
     Status,
+    Quantize,
     Settings,
+    #[allow(dead_code)]
     Placeholder,
 }
 
 /// One committed message in the transcript. `role` is the OpenAI role string
-/// (`"user"` / `"assistant"` / `"system"`) so it maps 1:1 onto [`ChatMessage`].
+/// (`"user"` / `"assistant"` / `"system"`) so it maps 1:1 onto
+/// [`MultimodalMessage`]. `images` carries any attached images as base64
+/// `data:` URIs (user turns only); empty is the common text-only path.
 struct Turn {
     role: String,
     content: String,
+    images: Vec<String>,
 }
 
 impl Turn {
@@ -98,20 +107,62 @@ impl Turn {
         Self {
             role: "user".into(),
             content,
+            images: Vec::new(),
+        }
+    }
+    /// A user turn with attached images (base64 `data:` URIs).
+    fn user_with_images(content: String, images: Vec<String>) -> Self {
+        Self {
+            role: "user".into(),
+            content,
+            images,
         }
     }
     fn assistant(content: String) -> Self {
         Self {
             role: "assistant".into(),
             content,
+            images: Vec::new(),
         }
     }
     fn system(content: String) -> Self {
         Self {
             role: "system".into(),
             content,
+            images: Vec::new(),
         }
     }
+}
+
+/// Which Decide sub-tab is active (mirrors Decide.tsx's `Mode`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecideTab {
+    Choice,
+    Score,
+    Boolean,
+}
+
+/// One image staged in the chat composer before send: its display name (for
+/// the chip) + the base64 `data:` URI actually sent on the wire.
+struct PendingImage {
+    name: String,
+    uri: String,
+    bytes: u64,
+}
+
+/// The result summary of an in-process quantize run — the fields the Quantize
+/// view renders (mirrors Quantize.tsx's `QuantizeResult`). Populated from
+/// `rustllama_gguf::quantize::QuantizeStats` on the worker thread.
+#[derive(Clone)]
+struct QuantizeSummary {
+    tensors_total: usize,
+    tensors_requantized: usize,
+    tensors_passthrough: usize,
+    bytes_in: u64,
+    bytes_out: u64,
+    elapsed_ms: f64,
+    target: String,
+    n_layers: usize,
 }
 
 /// Sampling controls surfaced in the chat's Sampling popover. Each field is
@@ -346,6 +397,39 @@ enum UiMsg {
     SettingsSaved { reload: bool, restart: bool },
     /// A Save / Apply-profile failed.
     SettingsSaveError(String),
+
+    // --- Decide view (Phase 5) ---
+    /// A `/v1/decide/*` call finished (`Ok` result, or `Err(message)`).
+    DecideDone(std::result::Result<Box<DecideResult>, String>),
+
+    // --- Quantize view (Phase 5) ---
+    /// The in-process quantize worker finished (`Ok` stats, or `Err(message)`).
+    QuantizeDone(std::result::Result<Box<QuantizeSummary>, String>),
+    /// The native picker returned the source `.gguf` path to quantize.
+    PickedQuantInput(std::path::PathBuf),
+    /// The native picker returned the output `.gguf` path to write.
+    PickedQuantOutput(std::path::PathBuf),
+
+    // --- Chat: image attach + conversation history (Phase 5) ---
+    /// The native image picker returned a chosen image (already base64
+    /// `data:`-encoded on the picker thread — decoding a large image off the
+    /// UI thread keeps the event loop responsive).
+    PickedImage {
+        name: String,
+        uri: String,
+        bytes: u64,
+    },
+    /// The history-feature probe result (`--features history` present?).
+    HistoryAvailable(bool),
+    /// The saved-conversation list (list / post-mutation refresh).
+    Conversations(Vec<ConversationSummary>),
+    /// A conversation's messages loaded for the transcript (select-to-load).
+    ConversationLoaded { id: i64, messages: Vec<StoredMessage> },
+    /// A save (create-if-needed + append) persisted `appended` new messages
+    /// to conversation `id`.
+    HistorySaved { id: i64, appended: usize },
+    /// A history operation failed (kept non-fatal — chat never breaks on it).
+    HistoryError(String),
 }
 
 /// Deferred UI action. Immediate-mode widgets push these while a panel is
@@ -378,6 +462,15 @@ enum Action {
     ResetSettings,
     /// Apply a named config profile (sparse override merge).
     ApplyProfile(String),
+    // --- Decide / Quantize (Phase 5) ---
+    /// Run the current Decide tab (choice / score / boolean).
+    RunDecide,
+    /// Open the source-GGUF picker for the Quantize view.
+    PickQuantInput,
+    /// Open the output-GGUF save picker for the Quantize view.
+    PickQuantOutput,
+    /// Start the in-process quantize with the current form values.
+    RunQuantize,
 }
 
 pub struct GuiApp {
@@ -532,6 +625,56 @@ pub struct GuiApp {
     /// The Save/Apply result banner: (is_error, message).
     settings_status: Option<(bool, String)>,
 
+    // --- Decide view (Phase 5) ---
+    decide_tab: DecideTab,
+    /// The context / prompt scored against the model.
+    decide_context: String,
+    /// Choice: the candidate option strings (dynamic add/remove list).
+    decide_options: Vec<String>,
+    /// Score: the ordered scale level strings (dynamic add/remove list).
+    decide_levels: Vec<String>,
+    /// Boolean: the yes/no question.
+    decide_question: String,
+    decide_busy: bool,
+    /// The last result + the labels it answered (so the bars carry the right
+    /// captions even if the option fields are edited afterwards).
+    decide_result: Option<DecideResult>,
+    decide_result_labels: Vec<String>,
+    decide_result_tab: DecideTab,
+    decide_error: Option<String>,
+
+    // --- Quantize view (Phase 5) ---
+    q_input: String,
+    q_output: String,
+    q_target: String,
+    q_apex: String,
+    q_recipe: String,
+    q_keep_output: bool,
+    q_running: bool,
+    q_result: Option<QuantizeSummary>,
+    q_error: Option<String>,
+
+    // --- Chat: image attach (Phase 5) ---
+    /// Images staged in the composer, sent with the next user turn.
+    pending_images: Vec<PendingImage>,
+
+    // --- Chat: conversation history (Phase 5) ---
+    /// `None` while the feature probe is in flight; `Some(false)` hides the
+    /// sidebar entirely (server built without `--features history`).
+    history_enabled: Option<bool>,
+    /// Sidebar expand/collapse (unobtrusive — a toolbar toggle flips it).
+    history_open: bool,
+    /// The saved-conversation list rendered in the sidebar.
+    conversations: Vec<ConversationSummary>,
+    /// The conversation the live transcript is bound to (for incremental
+    /// save), or `None` for an unsaved fresh chat.
+    current_conv: Option<i64>,
+    /// How many transcript messages have already been persisted to
+    /// `current_conv` — the save appends only `transcript[saved_msgs..]`.
+    saved_msgs: usize,
+    /// True while a create/append save task runs (dedupes concurrent saves).
+    history_saving: bool,
+
     md_cache: CommonMarkCache,
 }
 
@@ -638,6 +781,38 @@ impl GuiApp {
             settings_loading: false,
             settings_saving: false,
             settings_status: None,
+            // Decide view: seed with Decide.tsx's sample sentiment task so the
+            // page is immediately runnable.
+            decide_tab: DecideTab::Choice,
+            decide_context:
+                "Classify the sentiment.\nReview: \"I absolutely love this, best purchase ever!\"\nSentiment:"
+                    .to_string(),
+            decide_options: vec!["positive".into(), "negative".into(), "neutral".into()],
+            decide_levels: vec!["1".into(), "2".into(), "3".into(), "4".into(), "5".into()],
+            decide_question: "Is this review positive?".to_string(),
+            decide_busy: false,
+            decide_result: None,
+            decide_result_labels: Vec::new(),
+            decide_result_tab: DecideTab::Choice,
+            decide_error: None,
+            // Quantize view.
+            q_input: String::new(),
+            q_output: String::new(),
+            q_target: "q4_k".to_string(),
+            q_apex: String::new(),
+            q_recipe: String::new(),
+            q_keep_output: true,
+            q_running: false,
+            q_result: None,
+            q_error: None,
+            // Chat image attach + history.
+            pending_images: Vec::new(),
+            history_enabled: None,
+            history_open: true,
+            conversations: Vec::new(),
+            current_conv: None,
+            saved_msgs: 0,
+            history_saving: false,
             md_cache: CommonMarkCache::default(),
         };
 
@@ -649,6 +824,9 @@ impl GuiApp {
         app.spawn_refresh_cached();
         app.spawn_config();
         app.spawn_capabilities();
+        // Probe for the optional conversation-history feature; if present, the
+        // sidebar appears and the initial list loads (see the probe helper).
+        app.spawn_history_probe();
         Ok(app)
     }
 
@@ -1109,18 +1287,242 @@ impl GuiApp {
         });
     }
 
+    // --- Decide view -------------------------------------------------------
+
+    /// Run the active Decide tab against the loaded model. `labels` is the
+    /// caption list carried back so the result bars stay in sync even if the
+    /// option fields are edited before the reply lands.
+    fn spawn_decide(&self, tab: DecideTab, context: String, labels: Vec<String>) {
+        let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), self.ctx.clone());
+        let question = self.decide_question.clone();
+        self.rt.spawn(async move {
+            let res = match tab {
+                DecideTab::Choice => client.decide_choice(&context, &labels).await,
+                DecideTab::Score => client.decide_score(&context, &labels).await,
+                DecideTab::Boolean => client.decide_boolean(&context, &question).await,
+            };
+            let msg = res.map(Box::new).map_err(|e| e.to_string());
+            let _ = tx.send(UiMsg::DecideDone(msg));
+            ctx.request_repaint();
+        });
+    }
+
+    // --- Quantize view -----------------------------------------------------
+
+    /// Run the (CPU-bound, minutes-long) quantize pipeline on a DEDICATED OS
+    /// thread — NOT the tokio pool (which the network calls share) or the UI
+    /// thread. The `rustllama_gguf::quantize` encode loop is synchronous +
+    /// heavy; a plain `std::thread` keeps both the async runtime and the event
+    /// loop fully responsive, and the result rides back over the channel. The
+    /// pipeline exposes no progress callback, so the view shows a spinner.
+    fn spawn_quantize(
+        &self,
+        input: String,
+        output: String,
+        target: String,
+        apex: Option<String>,
+        recipe: Option<String>,
+        keep_output: bool,
+    ) {
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let res = run_quantize_job(
+                &input,
+                &output,
+                &target,
+                apex.as_deref(),
+                recipe.as_deref(),
+                keep_output,
+            )
+            .map(Box::new);
+            let _ = tx.send(UiMsg::QuantizeDone(res));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Open the source-GGUF picker (blocking rfd → its own OS thread).
+    fn spawn_pick_quant_input(&self) {
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("GGUF model", &["gguf"])
+                .set_title("Source GGUF to quantize")
+                .pick_file()
+            {
+                let _ = tx.send(UiMsg::PickedQuantInput(path));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Open the output-GGUF save picker (blocking rfd → its own OS thread).
+    fn spawn_pick_quant_output(&self) {
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("GGUF model", &["gguf"])
+                .set_title("Output GGUF (created or overwritten)")
+                .set_file_name("quantized.gguf")
+                .save_file()
+            {
+                let _ = tx.send(UiMsg::PickedQuantOutput(path));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Open the native image picker (blocking rfd → its own OS thread). Reads
+    /// the file + base64-encodes it into a `data:` URI on that thread so a
+    /// large image never blocks the UI, then reports it back for the composer.
+    fn spawn_pick_image(&self) {
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Image", &["png", "jpg", "jpeg", "webp", "gif"])
+                .set_title("Attach an image")
+                .pick_file()
+            {
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        let uri = format!(
+                            "data:{};base64,{}",
+                            mime_from_path(&path),
+                            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
+                        );
+                        let name = path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "image".into());
+                        let _ = tx.send(UiMsg::PickedImage {
+                            name,
+                            uri,
+                            bytes: bytes.len() as u64,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(UiMsg::Err(format!("read image: {e}")));
+                    }
+                }
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    // --- Conversation history ----------------------------------------------
+
+    /// Probe the history feature once at startup; on success also load the
+    /// initial conversation list.
+    fn spawn_history_probe(&self) {
+        let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            let ok = client.history_available().await;
+            let _ = tx.send(UiMsg::HistoryAvailable(ok));
+            if ok {
+                if let Ok(list) = client.list_conversations().await {
+                    let _ = tx.send(UiMsg::Conversations(list));
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Refresh the saved-conversation list.
+    fn spawn_list_conversations(&self) {
+        let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            if let Ok(list) = client.list_conversations().await {
+                let _ = tx.send(UiMsg::Conversations(list));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Load a conversation's messages into the transcript.
+    fn spawn_get_conversation(&self, id: i64) {
+        let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            match client.get_conversation(id).await {
+                Ok(c) => {
+                    let _ = tx.send(UiMsg::ConversationLoaded {
+                        id,
+                        messages: c.messages,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(UiMsg::HistoryError(e.to_string()));
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Delete a conversation, then refresh the list.
+    fn spawn_delete_conversation(&self, id: i64) {
+        let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            let _ = client.delete_conversation(id).await;
+            if let Ok(list) = client.list_conversations().await {
+                let _ = tx.send(UiMsg::Conversations(list));
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Persist the not-yet-saved tail of the transcript: create the
+    /// conversation on the first save (title = the first user line, trimmed),
+    /// then append each pending message in order. Best-effort — a failure just
+    /// leaves the messages unsaved (chat itself never breaks).
+    fn spawn_save_history(&self, conv: Option<i64>, title: String, msgs: Vec<(String, String)>) {
+        let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            let id = match conv {
+                Some(id) => id,
+                None => match client.create_conversation(&title).await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let _ = tx.send(UiMsg::HistoryError(e.to_string()));
+                        ctx.request_repaint();
+                        return;
+                    }
+                },
+            };
+            let mut appended = 0usize;
+            for (role, content) in &msgs {
+                if client.append_message(id, role, content).await.is_ok() {
+                    appended += 1;
+                } else {
+                    break;
+                }
+            }
+            let _ = tx.send(UiMsg::HistorySaved { id, appended });
+            ctx.request_repaint();
+        });
+    }
+
     fn spawn_chat(
         &mut self,
         model: String,
-        messages: Vec<ChatMessage>,
+        messages: Vec<MultimodalMessage>,
         sampling: Sampling,
         allow_clarify: bool,
     ) {
         let (client, tx, ctx) = (self.client.clone(), self.tx.clone(), self.ctx.clone());
         let handle = self.rt.spawn(async move {
+            let has_images = messages.iter().any(|m| !m.images.is_empty());
+            // The typed request carries the plain-text messages; the sampling
+            // panel folds in below. For the image path we serialize it and
+            // splice a multimodal `messages[]` (see MultimodalMessage::to_json)
+            // — the typed ChatRequest can't express per-message image blocks.
+            let plain: Vec<ChatMessage> = messages
+                .iter()
+                .map(|m| ChatMessage {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                })
+                .collect();
             let mut req = ChatRequest {
                 model,
-                messages,
+                messages: plain,
                 temperature: None,
                 top_p: None,
                 top_k: None,
@@ -1140,6 +1542,29 @@ impl GuiApp {
             // Fold in the sampling panel (each field stays None at its default).
             sampling.apply(&mut req);
 
+            // Pick the transport: raw-JSON body (with multimodal content blocks)
+            // when any message has images, else the fully-typed path.
+            let stream_res = if has_images {
+                match serde_json::to_value(&req) {
+                    Ok(mut body) => {
+                        body["messages"] = serde_json::Value::Array(
+                            messages.iter().map(|m| m.to_json()).collect(),
+                        );
+                        Some(client.chat_stream_value(body).await)
+                    }
+                    Err(e) => {
+                        let _ = tx.send(UiMsg::ChatError(format!("serialize request: {e}")));
+                        ctx.request_repaint();
+                        None
+                    }
+                }
+            } else {
+                Some(client.chat_stream(req).await)
+            };
+            let Some(stream_res) = stream_res else {
+                return;
+            };
+
             // Event-ordering NOTE: with `stream_options.include_usage` the
             // server emits the Usage event in a *separate* final SSE chunk that
             // arrives AFTER Finish. So we do NOT commit on Finish — we
@@ -1148,7 +1573,7 @@ impl GuiApp {
             // completion.
             let mut usage: Option<Usage> = None;
             let mut errored = false;
-            match client.chat_stream(req).await {
+            match stream_res {
                 Ok(mut stream) => {
                     while let Some(ev) = stream.next().await {
                         match ev {
@@ -1294,12 +1719,14 @@ impl GuiApp {
         self.request_id = None;
         self.streaming = true;
         // Send the full transcript so the server has the conversation context.
-        let messages: Vec<ChatMessage> = self
+        // Images ride the user turn(s) they were attached to (see `Turn`).
+        let messages: Vec<MultimodalMessage> = self
             .transcript
             .iter()
-            .map(|t| ChatMessage {
+            .map(|t| MultimodalMessage {
                 role: t.role.clone(),
                 content: t.content.clone(),
+                images: t.images.clone(),
             })
             .collect();
         let sampling = self.sampling.clone();
@@ -1312,7 +1739,8 @@ impl GuiApp {
             return;
         }
         let text = self.input.trim().to_string();
-        if text.is_empty() {
+        // Allow an image-only turn (no text) as long as something is attached.
+        if text.is_empty() && self.pending_images.is_empty() {
             return;
         }
         // A fresh manual send supersedes any pending clarify / tool prompt.
@@ -1331,7 +1759,14 @@ impl GuiApp {
                 self.transcript.push(Turn::system(body));
             }
         }
-        self.transcript.push(Turn::user(text));
+        // Take the staged images (if any) and attach them to this user turn.
+        if self.pending_images.is_empty() {
+            self.transcript.push(Turn::user(text));
+        } else {
+            let imgs: Vec<String> =
+                std::mem::take(&mut self.pending_images).into_iter().map(|p| p.uri).collect();
+            self.transcript.push(Turn::user_with_images(text, imgs));
+        }
         self.stream_current();
     }
 
@@ -1393,12 +1828,56 @@ impl GuiApp {
         self.stop_stream();
         self.transcript.clear();
         self.pending.clear();
+        self.pending_images.clear();
         self.streaming = false;
         self.last_usage = None;
         self.status = None;
         self.pending_question = None;
         self.pending_tools = None;
         self.request_id = None;
+    }
+
+    /// Start a brand-new chat: clear the transcript AND detach the history
+    /// binding so the next send begins a fresh conversation (History sidebar +
+    /// Ctrl+L). A no-op-safe superset of [`Self::clear_chat`].
+    fn new_chat(&mut self) {
+        self.clear_chat();
+        self.current_conv = None;
+        self.saved_msgs = 0;
+    }
+
+    /// Select-to-load: fetch a saved conversation and replace the transcript
+    /// with it. Aborts any in-flight stream first.
+    fn load_conversation(&mut self, id: i64) {
+        self.stop_stream();
+        self.spawn_get_conversation(id);
+    }
+
+    /// After a turn completes, persist the transcript tail if history is on
+    /// and something new is pending. Guarded so only one save runs at a time
+    /// (a partial failure just retries the remainder on the next completion).
+    fn maybe_save_history(&mut self) {
+        if self.history_enabled != Some(true) || self.history_saving {
+            return;
+        }
+        if self.transcript.len() <= self.saved_msgs {
+            return;
+        }
+        let pending: Vec<(String, String)> = self.transcript[self.saved_msgs..]
+            .iter()
+            .map(|t| (t.role.clone(), t.content.clone()))
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let title = self
+            .transcript
+            .iter()
+            .find(|t| t.role == "user")
+            .map(|t| truncate_title(&t.content))
+            .unwrap_or_else(|| "New chat".into());
+        self.history_saving = true;
+        self.spawn_save_history(self.current_conv, title, pending);
     }
 
     /// Stop the in-flight stream: POST `/v1/cancel` so the ENGINE stops
@@ -1524,6 +2003,8 @@ impl GuiApp {
                 }
                 self.request_id = None;
                 self.chat_task = None;
+                // Persist the completed exchange when history is enabled.
+                self.maybe_save_history();
             }
             UiMsg::ChatError(e) => {
                 // Commit any partial text so it isn't lost, then surface the error.
@@ -1737,6 +2218,84 @@ impl GuiApp {
                 self.settings_saving = false;
                 self.settings_status = Some((true, format!("save failed: {e}")));
             }
+            UiMsg::DecideDone(res) => {
+                self.decide_busy = false;
+                match res {
+                    Ok(r) => {
+                        self.decide_result = Some(*r);
+                        self.decide_result_tab = self.decide_tab;
+                        self.decide_error = None;
+                    }
+                    Err(e) => {
+                        self.decide_result = None;
+                        self.decide_error = Some(e);
+                    }
+                }
+            }
+            UiMsg::QuantizeDone(res) => {
+                self.q_running = false;
+                match res {
+                    Ok(s) => {
+                        self.q_result = Some(*s);
+                        self.q_error = None;
+                    }
+                    Err(e) => {
+                        self.q_result = None;
+                        self.q_error = Some(e);
+                    }
+                }
+            }
+            UiMsg::PickedQuantInput(path) => {
+                self.q_input = path.display().to_string();
+                // Suggest an output path beside the source if none set yet.
+                if self.q_output.trim().is_empty() {
+                    self.q_output = suggest_quant_output(&path, &self.q_target);
+                }
+            }
+            UiMsg::PickedQuantOutput(path) => {
+                self.q_output = path.display().to_string();
+            }
+            UiMsg::PickedImage { name, uri, bytes } => {
+                self.pending_images.push(PendingImage { name, uri, bytes });
+            }
+            UiMsg::HistoryAvailable(ok) => {
+                self.history_enabled = Some(ok);
+            }
+            UiMsg::Conversations(list) => {
+                self.conversations = list;
+            }
+            UiMsg::ConversationLoaded { id, messages } => {
+                self.stop_stream();
+                self.transcript = messages
+                    .into_iter()
+                    .map(|m| Turn {
+                        role: m.role,
+                        content: m.content,
+                        images: Vec::new(),
+                    })
+                    .collect();
+                self.pending.clear();
+                self.pending_images.clear();
+                self.streaming = false;
+                self.last_usage = None;
+                self.status = None;
+                self.pending_question = None;
+                self.pending_tools = None;
+                self.request_id = None;
+                self.current_conv = Some(id);
+                self.saved_msgs = self.transcript.len();
+            }
+            UiMsg::HistorySaved { id, appended } => {
+                self.history_saving = false;
+                self.current_conv = Some(id);
+                self.saved_msgs += appended;
+                // Refresh the list so a newly-created conversation appears.
+                self.spawn_list_conversations();
+            }
+            UiMsg::HistoryError(e) => {
+                self.history_saving = false;
+                tracing::warn!(target: "rustllama_gui", "history: {e}");
+            }
             UiMsg::Err(e) => {
                 tracing::debug!(target: "rustllama_gui", "{e}");
                 self.status = Some(e);
@@ -1894,15 +2453,17 @@ impl eframe::App for GuiApp {
                     actions.push(Action::SwitchView(View::Models));
                 }
                 ui.add_space(3.0);
-                // Decide / Quantize remain later-phase placeholders; Status +
-                // Settings are live (Phase 4).
-                nav_item(ui, NavIcon::Placeholder, "Decide", false, false);
+                if nav_item(ui, NavIcon::Decide, "Decide", self.view == View::Decide, true) {
+                    actions.push(Action::SwitchView(View::Decide));
+                }
                 ui.add_space(3.0);
                 if nav_item(ui, NavIcon::Status, "Status", self.view == View::Status, true) {
                     actions.push(Action::SwitchView(View::Status));
                 }
                 ui.add_space(3.0);
-                nav_item(ui, NavIcon::Placeholder, "Quantize", false, false);
+                if nav_item(ui, NavIcon::Quantize, "Quantize", self.view == View::Quantize, true) {
+                    actions.push(Action::SwitchView(View::Quantize));
+                }
                 ui.add_space(3.0);
                 if nav_item(
                     ui,
@@ -1937,7 +2498,9 @@ impl eframe::App for GuiApp {
         match self.view {
             View::Chat => self.render_chat(ctx),
             View::Models => self.render_models(ctx, &mut actions),
+            View::Decide => self.render_decide(ctx, &mut actions),
             View::Status => self.render_status(ctx, &mut actions),
+            View::Quantize => self.render_quantize(ctx, &mut actions),
             View::Settings => self.render_settings(ctx, &mut actions),
         }
 
@@ -1999,7 +2562,15 @@ impl eframe::App for GuiApp {
                                 self.spawn_settings_config();
                             }
                         }
-                        View::Chat => {}
+                        // Chat re-syncs the history list (if enabled) so a
+                        // conversation saved from another surface shows.
+                        View::Chat => {
+                            if self.history_enabled == Some(true) {
+                                self.spawn_list_conversations();
+                            }
+                        }
+                        // Decide / Quantize keep local form state — no fetch.
+                        View::Decide | View::Quantize => {}
                     }
                 }
                 Action::RefreshModels => {
@@ -2099,6 +2670,81 @@ impl eframe::App for GuiApp {
                         self.spawn_apply_profile(name);
                     }
                 }
+                Action::RunDecide => {
+                    if !self.decide_busy {
+                        // The labels the result bars caption: options / levels /
+                        // (boolean uses yes/no, filled in at render time).
+                        let labels: Vec<String> = match self.decide_tab {
+                            DecideTab::Choice => self
+                                .decide_options
+                                .iter()
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect(),
+                            DecideTab::Score => self
+                                .decide_levels
+                                .iter()
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect(),
+                            DecideTab::Boolean => vec!["yes".into(), "no".into()],
+                        };
+                        let context = self.decide_context.clone();
+                        let valid = match self.decide_tab {
+                            DecideTab::Boolean => !self.decide_question.trim().is_empty(),
+                            _ => labels.len() >= 2,
+                        };
+                        if !valid {
+                            self.decide_error = Some(match self.decide_tab {
+                                DecideTab::Boolean => "Enter a yes/no question.".into(),
+                                _ => "Enter at least two non-empty options.".into(),
+                            });
+                        } else {
+                            self.decide_busy = true;
+                            self.decide_error = None;
+                            self.decide_result = None;
+                            self.decide_result_labels = labels.clone();
+                            self.spawn_decide(self.decide_tab, context, labels);
+                        }
+                    }
+                }
+                Action::PickQuantInput => self.spawn_pick_quant_input(),
+                Action::PickQuantOutput => self.spawn_pick_quant_output(),
+                Action::RunQuantize => {
+                    if !self.q_running {
+                        if self.q_input.trim().is_empty() || self.q_output.trim().is_empty() {
+                            self.q_error = Some("Both input and output paths are required.".into());
+                        } else {
+                            self.q_running = true;
+                            self.q_error = None;
+                            self.q_result = None;
+                            let apex = {
+                                let a = self.q_apex.trim();
+                                if a.is_empty() {
+                                    None
+                                } else {
+                                    Some(a.to_string())
+                                }
+                            };
+                            let recipe = {
+                                let r = self.q_recipe.trim();
+                                if r.is_empty() {
+                                    None
+                                } else {
+                                    Some(r.to_string())
+                                }
+                            };
+                            self.spawn_quantize(
+                                self.q_input.trim().to_string(),
+                                self.q_output.trim().to_string(),
+                                self.q_target.clone(),
+                                apex,
+                                recipe,
+                                self.q_keep_output,
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -2118,11 +2764,11 @@ impl GuiApp {
     /// (center). Widgets set local intent flags that are applied after the
     /// panels close, so the spawn helpers get clean access to `self`.
     //
-    // DEFERRED (later phases, intentionally not built here):
-    //   - Image attach / multimodal (OpenAI image_url content blocks) — the
-    //     composer is text-only for now.
-    //   - Conversation-history sidebar (the server's `/api/conversations`
-    //     sqlite routes, `--features history`).
+    // As of Phase 5 the composer supports image attach (OpenAI `image_url`
+    // content blocks) and a collapsible conversation-history sidebar (the
+    // server's `/api/conversations` sqlite routes, feature-probed at startup).
+    //
+    // DEFERRED (intentionally not built here):
     //   - Auto context compaction (summarize older turns to fit ctx_size).
     fn render_chat(&mut self, ctx: &egui::Context) {
         // Intent flags collected during immediate-mode rendering.
@@ -2141,6 +2787,77 @@ impl GuiApp {
         let mut chosen_option: Option<String> = None;
         let mut do_approve = false;
         let mut do_deny = false;
+        // Phase-5 chat intents (history sidebar + image attach).
+        let mut do_toggle_history = false;
+        let mut hist_new = false;
+        let mut hist_load: Option<i64> = None;
+        let mut hist_delete: Option<i64> = None;
+        let mut do_attach_image = false;
+        let mut remove_image: Option<usize> = None;
+
+        // Conversation-history sidebar (left; only when the feature is present).
+        // Added before the top/bottom panels so it claims the full-height left
+        // strip beside the nav rail. Unobtrusive — a toolbar toggle hides it.
+        if self.history_enabled == Some(true) && self.history_open {
+            let convs = self.conversations.clone();
+            let current = self.current_conv;
+            egui::SidePanel::left("history")
+                .resizable(true)
+                .default_width(212.0)
+                .width_range(170.0..=340.0)
+                .frame(
+                    egui::Frame::default()
+                        .fill(SIDEBAR)
+                        .inner_margin(Margin::symmetric(8.0, 10.0))
+                        .stroke(Stroke::new(1.0, BORDER)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("History").strong().color(TEXT));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .small_button("‹")
+                                .on_hover_text("Hide the history sidebar")
+                                .clicked()
+                            {
+                                do_toggle_history = true;
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 26.0],
+                            egui::Button::new(RichText::new("+  New chat").color(TEXT))
+                                .fill(ACCENT),
+                        )
+                        .clicked()
+                    {
+                        hist_new = true;
+                    }
+                    ui.add_space(8.0);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if convs.is_empty() {
+                                ui.label(
+                                    RichText::new("No conversations yet").color(MUTED).small(),
+                                );
+                            }
+                            for c in &convs {
+                                let (load, delete) =
+                                    conversation_row(ui, c, current == Some(c.id));
+                                if load {
+                                    hist_load = Some(c.id);
+                                }
+                                if delete {
+                                    hist_delete = Some(c.id);
+                                }
+                                ui.add_space(4.0);
+                            }
+                        });
+                });
+        }
 
         // Model bar.
         let models = self.models.clone(); // cheap; avoids nested-closure borrows
@@ -2205,6 +2922,10 @@ impl GuiApp {
         let has_assistant = self.transcript.iter().any(|t| t.role == "assistant");
         let sampling_is_default = self.sampling.is_default();
         let streaming = self.streaming;
+        // History-sidebar toggle affordance state (drawn only when the feature
+        // is present so the toolbar stays clean on a default server).
+        let history_present = self.history_enabled == Some(true);
+        let history_shown = self.history_open;
         egui::TopBottomPanel::top("chat_toolbar")
             .frame(
                 egui::Frame::default()
@@ -2214,9 +2935,19 @@ impl GuiApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
+                    if history_present {
+                        let label = if history_shown { "☰ History" } else { "☰ History ›" };
+                        if ui
+                            .selectable_label(history_shown, label)
+                            .on_hover_text("Show / hide the conversation-history sidebar")
+                            .clicked()
+                        {
+                            do_toggle_history = true;
+                        }
+                    }
                     if ui
                         .add_enabled(!transcript_empty, egui::Button::new("New"))
-                        .on_hover_text("Clear the transcript (Ctrl+L)")
+                        .on_hover_text("Start a fresh chat (Ctrl+L)")
                         .clicked()
                     {
                         do_new = true;
@@ -2342,6 +3073,13 @@ impl GuiApp {
         let show_prompts = !prompts.is_empty();
         let budget = self.ctx_budget();
         let draft_tokens = self.draft_tokens;
+        // Snapshot the staged images for the composer chips (name + size).
+        let pending_imgs: Vec<(String, u64)> = self
+            .pending_images
+            .iter()
+            .map(|p| (p.name.clone(), p.bytes))
+            .collect();
+        let has_pending_imgs = !pending_imgs.is_empty();
         egui::TopBottomPanel::bottom("composer")
             .frame(
                 egui::Frame::default()
@@ -2399,6 +3137,24 @@ impl GuiApp {
                     ui.add_space(6.0);
                 }
 
+                // Attach-image affordance + staged-image chips. Sent as OpenAI
+                // `image_url` content blocks with the next user turn (a
+                // vision-aware model splices them; a text model sees a
+                // `[image: …]` placeholder).
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(!streaming, egui::Button::new("＋ Image"))
+                        .on_hover_text("Attach an image to the next message")
+                        .clicked()
+                    {
+                        do_attach_image = true;
+                    }
+                    for (i, (name, bytes)) in pending_imgs.iter().enumerate() {
+                        image_chip(ui, name, *bytes, &mut remove_image, i);
+                    }
+                });
+                ui.add_space(6.0);
+
                 let te = ui.add_sized(
                     [ui.available_width(), 64.0],
                     egui::TextEdit::multiline(&mut self.input)
@@ -2413,7 +3169,10 @@ impl GuiApp {
                 // this same frame is dropped.
                 let enter_send = te.has_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-                if enter_send && !self.streaming && !self.input.trim().is_empty() {
+                if enter_send
+                    && !self.streaming
+                    && (!self.input.trim().is_empty() || has_pending_imgs)
+                {
                     do_send = true;
                 }
 
@@ -2467,7 +3226,8 @@ impl GuiApp {
                             ui.spinner();
                             ui.label(RichText::new("generating…").color(MUTED).small());
                         } else {
-                            let can_send = !self.input.trim().is_empty();
+                            let can_send =
+                                !self.input.trim().is_empty() || has_pending_imgs;
                             if ui.add_enabled(can_send, egui::Button::new("Send")).clicked() {
                                 do_send = true;
                             }
@@ -2681,7 +3441,8 @@ impl GuiApp {
             self.stop_stream();
         }
         if do_new {
-            self.clear_chat();
+            // Ctrl+L / New: a fresh chat (also detaches the history binding).
+            self.new_chat();
         }
         if do_regen {
             self.regenerate_last();
@@ -2703,6 +3464,31 @@ impl GuiApp {
         }
         if do_send {
             self.send_message();
+        }
+        // Phase-5 chat intents (history sidebar + image attach).
+        if do_toggle_history {
+            self.history_open = !self.history_open;
+        }
+        if hist_new {
+            self.new_chat();
+        }
+        if let Some(id) = hist_load {
+            self.load_conversation(id);
+        }
+        if let Some(id) = hist_delete {
+            if self.current_conv == Some(id) {
+                self.current_conv = None;
+                self.saved_msgs = 0;
+            }
+            self.spawn_delete_conversation(id);
+        }
+        if do_attach_image {
+            self.spawn_pick_image();
+        }
+        if let Some(i) = remove_image {
+            if i < self.pending_images.len() {
+                self.pending_images.remove(i);
+            }
         }
     }
 
@@ -3659,6 +4445,310 @@ impl GuiApp {
         // Write the profile picker's edit back to state.
         self.settings_profile_sel = profile_sel;
     }
+
+    /// The Decide view (Phase 5): tabs Choice / Score / Boolean over the
+    /// `/v1/decide/*` endpoints. Each scores candidate options against the
+    /// loaded model and returns a typed value + per-option probabilities (no
+    /// prose). Mirrors Decide.tsx — a context box, a per-tab input (dynamic
+    /// option/level list, or a yes/no question), a Decide button, and a result
+    /// with a probability bar per option + a "calibrated" badge.
+    fn render_decide(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let busy = self.decide_busy;
+        let result = self.decide_result.clone();
+        let result_tab = self.decide_result_tab;
+        let result_labels = self.decide_result_labels.clone();
+        let error = self.decide_error.clone();
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(BG).inner_margin(Margin::same(16.0)))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_max_width(760.0);
+                        ui.label(RichText::new("Decide").heading().color(TEXT));
+                        ui.label(
+                            RichText::new(
+                                "Score candidate options against the loaded model and return a \
+                                 typed value + probabilities — no prose generation. Choice picks \
+                                 one, Score rates an ordered scale, Boolean is a calibrated yes/no.",
+                            )
+                            .color(MUTED)
+                            .small(),
+                        );
+                        ui.add_space(12.0);
+
+                        // Tabs.
+                        ui.horizontal(|ui| {
+                            for (tab, label) in [
+                                (DecideTab::Choice, "Choice"),
+                                (DecideTab::Score, "Score"),
+                                (DecideTab::Boolean, "Boolean"),
+                            ] {
+                                if ui
+                                    .selectable_label(self.decide_tab == tab, label)
+                                    .clicked()
+                                {
+                                    self.decide_tab = tab;
+                                }
+                            }
+                        });
+                        ui.add_space(10.0);
+
+                        card(ui, |ui| {
+                            ui.label(RichText::new("Context").color(MUTED).small());
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.decide_context)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(5)
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                            ui.add_space(8.0);
+
+                            match self.decide_tab {
+                                DecideTab::Boolean => {
+                                    ui.label(
+                                        RichText::new("Question (yes/no)").color(MUTED).small(),
+                                    );
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.decide_question)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                }
+                                DecideTab::Choice => {
+                                    ui.label(RichText::new("Options").color(MUTED).small());
+                                    string_list_editor(ui, &mut self.decide_options, "option");
+                                }
+                                DecideTab::Score => {
+                                    ui.label(
+                                        RichText::new("Levels (ordered scale)")
+                                            .color(MUTED)
+                                            .small(),
+                                    );
+                                    string_list_editor(ui, &mut self.decide_levels, "level");
+                                }
+                            }
+
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        !busy,
+                                        egui::Button::new(
+                                            RichText::new(if busy {
+                                                "Deciding…"
+                                            } else {
+                                                "Decide"
+                                            })
+                                            .color(TEXT),
+                                        )
+                                        .fill(ACCENT),
+                                    )
+                                    .clicked()
+                                {
+                                    actions.push(Action::RunDecide);
+                                }
+                                if busy {
+                                    ui.spinner();
+                                }
+                            });
+                        });
+
+                        if let Some(e) = &error {
+                            ui.add_space(10.0);
+                            error_banner(ui, e);
+                        }
+
+                        if let Some(r) = &result {
+                            ui.add_space(14.0);
+                            card(ui, |ui| {
+                                render_decide_result(ui, r, result_tab, &result_labels);
+                            });
+                        }
+                    });
+            });
+    }
+
+    /// The Quantize view (Phase 5): re-encode a GGUF to a smaller target dtype
+    /// in-process, on a worker thread. Mirrors Quantize.tsx — source/output
+    /// pickers, a target-dtype dropdown, an optional APEX mixed-precision tier,
+    /// an optional recipe file, a keep-LM-head checkbox, and a result panel.
+    /// Runs the SAME `rustllama_gguf::quantize::quantize_gguf_to_path` pipeline
+    /// the Tauri `quantize_model` command drives (see [`run_quantize_job`]).
+    fn render_quantize(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let running = self.q_running;
+        let result = self.q_result.clone();
+        let error = self.q_error.clone();
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(BG).inner_margin(Margin::same(16.0)))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_max_width(820.0);
+                        ui.label(RichText::new("Quantize").heading().color(TEXT));
+                        ui.label(
+                            RichText::new(
+                                "Re-encode a GGUF model to a smaller target dtype. Source can be \
+                                 any supported quant (F32/F16/BF16, Q4/Q5/Q8, Q2–Q8_K, TQ1/2, \
+                                 IQ1–IQ4); norms and biases pass through automatically. Runs on a \
+                                 worker thread — a real model can take minutes.",
+                            )
+                            .color(MUTED)
+                            .small(),
+                        );
+                        ui.add_space(12.0);
+
+                        // --- Paths ---
+                        card(ui, |ui| {
+                            ui.label(RichText::new("Paths").strong().color(TEXT));
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("Source GGUF").color(MUTED).small());
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.q_input)
+                                        .desired_width(ui.available_width() - 96.0)
+                                        .hint_text("path to the source .gguf")
+                                        .font(egui::TextStyle::Monospace),
+                                );
+                                if ui.button("Browse…").clicked() {
+                                    actions.push(Action::PickQuantInput);
+                                }
+                            });
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new("Output GGUF (created or overwritten)")
+                                    .color(MUTED)
+                                    .small(),
+                            );
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.q_output)
+                                        .desired_width(ui.available_width() - 96.0)
+                                        .hint_text("path to write the quantized .gguf")
+                                        .font(egui::TextStyle::Monospace),
+                                );
+                                if ui.button("Save as…").clicked() {
+                                    actions.push(Action::PickQuantOutput);
+                                }
+                            });
+                        });
+                        ui.add_space(14.0);
+
+                        // --- Target ---
+                        card(ui, |ui| {
+                            ui.label(RichText::new("Target").strong().color(TEXT));
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(
+                                    "Default dtype (any tensor not matched by APEX or a recipe)",
+                                )
+                                .color(MUTED)
+                                .small(),
+                            );
+                            egui::ComboBox::from_id_salt("quant_target_combo")
+                                .width(300.0)
+                                .selected_text(quant_target_label(&self.q_target))
+                                .show_ui(ui, |ui| {
+                                    for (name, label) in QUANT_TARGETS {
+                                        ui.selectable_value(
+                                            &mut self.q_target,
+                                            (*name).to_string(),
+                                            *label,
+                                        );
+                                    }
+                                });
+
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new("APEX profile (mixed-precision for MoE models)")
+                                    .color(MUTED)
+                                    .small(),
+                            );
+                            egui::ComboBox::from_id_salt("quant_apex_combo")
+                                .width(300.0)
+                                .selected_text(apex_tier_label(&self.q_apex))
+                                .show_ui(ui, |ui| {
+                                    for (name, label) in APEX_TIERS {
+                                        ui.selectable_value(
+                                            &mut self.q_apex,
+                                            (*name).to_string(),
+                                            *label,
+                                        );
+                                    }
+                                });
+
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new("Recipe file (optional; `<glob> <dtype>` per line)")
+                                    .color(MUTED)
+                                    .small(),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.q_recipe)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("(leave blank to skip)")
+                                    .font(egui::TextStyle::Monospace),
+                            );
+
+                            ui.add_space(8.0);
+                            ui.checkbox(
+                                &mut self.q_keep_output,
+                                RichText::new(
+                                    "Keep LM head at source precision (recommended for <4 bpw)",
+                                )
+                                .color(TEXT)
+                                .small(),
+                            );
+                        });
+                        ui.add_space(14.0);
+
+                        ui.horizontal(|ui| {
+                            let can_run = !running
+                                && !self.q_input.trim().is_empty()
+                                && !self.q_output.trim().is_empty();
+                            if ui
+                                .add_enabled(
+                                    can_run,
+                                    egui::Button::new(
+                                        RichText::new(if running {
+                                            "Running…"
+                                        } else {
+                                            "Run quantize"
+                                        })
+                                        .color(TEXT),
+                                    )
+                                    .fill(if running { ELEVATED2 } else { HEALTH_OK }),
+                                )
+                                .clicked()
+                            {
+                                actions.push(Action::RunQuantize);
+                            }
+                            if running {
+                                ui.spinner();
+                                ui.label(
+                                    RichText::new("re-encoding — this can take minutes…")
+                                        .color(MUTED)
+                                        .small(),
+                                );
+                            }
+                        });
+
+                        if let Some(e) = &error {
+                            ui.add_space(14.0);
+                            error_banner(ui, e);
+                        }
+
+                        if let Some(s) = &result {
+                            ui.add_space(14.0);
+                            card(ui, |ui| {
+                                render_quantize_result(ui, s);
+                            });
+                        }
+                    });
+            });
+    }
 }
 
 // --- free helpers ---------------------------------------------------------
@@ -3709,7 +4799,20 @@ fn render_turn(ui: &mut egui::Ui, cache: &mut CommonMarkCache, turn: &Turn, idx:
                 .rounding(Rounding::same(8.0))
                 .inner_margin(Margin::same(10.0))
                 .show(ui, |ui| {
-                    ui.label(RichText::new(turn.content.as_str()).color(TEXT));
+                    if !turn.images.is_empty() {
+                        ui.label(
+                            RichText::new(format!(
+                                "🖼 {} image{} attached",
+                                turn.images.len(),
+                                if turn.images.len() == 1 { "" } else { "s" }
+                            ))
+                            .color(MUTED)
+                            .small(),
+                        );
+                    }
+                    if !turn.content.is_empty() {
+                        ui.label(RichText::new(turn.content.as_str()).color(TEXT));
+                    }
                 });
         }
         "system" => {
@@ -4238,6 +5341,63 @@ fn draw_nav_icon(painter: &egui::Painter, rect: Rect, icon: NavIcon, color: Colo
                 let b = egui::pos2(c.x + dx * (r + tick), c.y + dy * (r + tick));
                 painter.line_segment([a, b], s);
             }
+        }
+        NavIcon::Decide => {
+            // A decision diamond (rotated square) with a small check inside.
+            let c = rect.center();
+            let r = rect.width() * 0.42;
+            let pts = vec![
+                egui::pos2(c.x, c.y - r),
+                egui::pos2(c.x + r, c.y),
+                egui::pos2(c.x, c.y + r),
+                egui::pos2(c.x - r, c.y),
+            ];
+            painter.add(egui::Shape::closed_line(pts, s));
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - r * 0.4, c.y),
+                    egui::pos2(c.x - r * 0.05, c.y + r * 0.35),
+                ],
+                s,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - r * 0.05, c.y + r * 0.35),
+                    egui::pos2(c.x + r * 0.45, c.y - r * 0.35),
+                ],
+                s,
+            );
+        }
+        NavIcon::Quantize => {
+            // A "compress" glyph: two arrows pointing toward a middle bar.
+            let c = rect.center();
+            let w = rect.width() * 0.34;
+            painter.line_segment(
+                [egui::pos2(c.x - w, c.y), egui::pos2(c.x + w, c.y)],
+                s,
+            );
+            // Top arrow pointing down to the bar.
+            let ty = rect.top() + 1.0;
+            painter.line_segment([egui::pos2(c.x, ty), egui::pos2(c.x, c.y - 3.0)], s);
+            painter.line_segment(
+                [egui::pos2(c.x - 3.0, c.y - 6.0), egui::pos2(c.x, c.y - 3.0)],
+                s,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x + 3.0, c.y - 6.0), egui::pos2(c.x, c.y - 3.0)],
+                s,
+            );
+            // Bottom arrow pointing up to the bar.
+            let by = rect.bottom() - 1.0;
+            painter.line_segment([egui::pos2(c.x, by), egui::pos2(c.x, c.y + 3.0)], s);
+            painter.line_segment(
+                [egui::pos2(c.x - 3.0, c.y + 6.0), egui::pos2(c.x, c.y + 3.0)],
+                s,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x + 3.0, c.y + 6.0), egui::pos2(c.x, c.y + 3.0)],
+                s,
+            );
         }
         NavIcon::Placeholder => {
             painter.rect_stroke(rect.shrink(2.0), Rounding::same(3.0), s);
@@ -4876,6 +6036,433 @@ fn settings_profiles_section(
             }
         });
     ui.add_space(6.0);
+}
+
+// --- Phase-5 Decide / Quantize / history / image helpers ------------------
+
+/// The quantize target dtypes the pipeline supports, ordered lowest→highest
+/// bpw so the dropdown reads smallest-to-biggest output (mirrors Quantize.tsx's
+/// `TARGETS`). `(dtype name accepted by `parse_dtype_name`, display label)`.
+const QUANT_TARGETS: &[(&str, &str)] = &[
+    ("iq1_s", "IQ1_S — 1.56 bpw"),
+    ("iq1_m", "IQ1_M — 1.75 bpw"),
+    ("tq1_0", "TQ1_0 — 1.69 bpw"),
+    ("tq2_0", "TQ2_0 — 2.0 bpw"),
+    ("iq2_xxs", "IQ2_XXS — 2.06 bpw"),
+    ("iq2_xs", "IQ2_XS — 2.31 bpw"),
+    ("iq2_s", "IQ2_S — 2.56 bpw"),
+    ("q2_k", "Q2_K — 2.625 bpw"),
+    ("iq3_xxs", "IQ3_XXS — 3.06 bpw"),
+    ("iq3_s", "IQ3_S — 3.44 bpw"),
+    ("q3_k", "Q3_K — 3.44 bpw"),
+    ("iq4_nl", "IQ4_NL — 4.5 bpw"),
+    ("iq4_xs", "IQ4_XS — 4.25 bpw"),
+    ("q4_0", "Q4_0 — 4.5 bpw"),
+    ("q4_1", "Q4_1 — 5.0 bpw"),
+    ("q4_k", "Q4_K (recommended) — 4.5 bpw"),
+    ("q5_0", "Q5_0 — 5.5 bpw"),
+    ("q5_1", "Q5_1 — 6.0 bpw"),
+    ("q5_k", "Q5_K — 5.5 bpw"),
+    ("q6_k", "Q6_K — 6.5 bpw"),
+    ("q8_0", "Q8_0 — 8.5 bpw"),
+    ("q8_1", "Q8_1 — 9.0 bpw"),
+    ("q8_k", "Q8_K — 9.125 bpw"),
+    ("bf16", "BF16 — 16 bpw"),
+    ("f16", "F16 — 16 bpw"),
+    ("f32", "F32 (no quantization) — 32 bpw"),
+];
+
+/// APEX mixed-precision tiers (mirrors Quantize.tsx's `APEX_TIERS`). `""` = none.
+const APEX_TIERS: &[(&str, &str)] = &[
+    ("", "(none) — uniform target across all tensors"),
+    ("i-quality", "I-Quality — routed Q4_K/Q6_K, shared Q8_0, attn Q6_K"),
+    ("quality", "Quality — routed Q3_K/Q5_K, shared Q8_0, attn Q6_K"),
+    ("balanced", "Balanced — routed Q3_K/Q4_K, shared Q6_K, attn Q5_K"),
+    ("mini", "Mini — routed Q2_K/Q4_K, shared Q5_K, attn Q5_K"),
+    ("nano", "Nano — routed Q2_K, shared Q4_K, attn Q4_K"),
+];
+
+/// Look up the display label for the selected quantize target (falls back to
+/// the raw name if it isn't in the table).
+fn quant_target_label(name: &str) -> &str {
+    QUANT_TARGETS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, l)| *l)
+        .unwrap_or(name)
+}
+
+/// Look up the display label for the selected APEX tier.
+fn apex_tier_label(name: &str) -> &str {
+    APEX_TIERS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, l)| *l)
+        .unwrap_or("(none)")
+}
+
+/// A dynamic add/remove list of single-line string fields (Decide options /
+/// levels). Blank rows are tolerated (filtered out before the request). `noun`
+/// labels the add button + remove tooltips.
+fn string_list_editor(ui: &mut egui::Ui, items: &mut Vec<String>, noun: &str) {
+    let mut remove: Option<usize> = None;
+    for (i, item) in items.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(item)
+                    .desired_width(ui.available_width() - 34.0)
+                    .hint_text(format!("{noun} {}", i + 1)),
+            );
+            if ui
+                .add(egui::Button::new(RichText::new("✕").color(DANGER)).small())
+                .on_hover_text(format!("Remove this {noun}"))
+                .clicked()
+            {
+                remove = Some(i);
+            }
+        });
+        ui.add_space(2.0);
+    }
+    if let Some(i) = remove {
+        // Keep at least one row so the list is never empty to edit.
+        if items.len() > 1 {
+            items.remove(i);
+        } else if let Some(s) = items.get_mut(0) {
+            s.clear();
+        }
+    }
+    if ui
+        .button(RichText::new(format!("＋ Add {noun}")).small())
+        .clicked()
+    {
+        items.push(String::new());
+    }
+}
+
+/// Render a Decide result: winner header + a "calibrated"/"raw" badge, then a
+/// probability bar per option with the winner highlighted (mirrors Decide.tsx).
+fn render_decide_result(
+    ui: &mut egui::Ui,
+    r: &DecideResult,
+    tab: DecideTab,
+    labels: &[String],
+) {
+    // Header line + calibration badge.
+    ui.horizontal(|ui| {
+        let header = match tab {
+            DecideTab::Boolean => {
+                let p = r.probability.unwrap_or(0.0);
+                let yes = r.value.as_bool().unwrap_or(p >= 0.5);
+                format!("{} ({:.1}%)", if yes { "YES" } else { "NO" }, p * 100.0)
+            }
+            _ => r
+                .value
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| r.value.to_string()),
+        };
+        ui.label(RichText::new(header).strong().color(TEXT).size(15.0));
+        if tab == DecideTab::Score {
+            if let Some(sc) = r.score {
+                ui.label(RichText::new(format!("expected {sc:.2}")).color(MUTED).small());
+            }
+        }
+        if r.calibrated {
+            pill(ui, "calibrated", HEALTH_OK);
+        } else {
+            pill(ui, "raw confidence", MUTED);
+        }
+        if r.declined {
+            pill(ui, "declined", WARN);
+        }
+    });
+    ui.add_space(10.0);
+
+    // Bars: choice/score come back as an array; boolean is a single P(yes)
+    // expanded to yes/no.
+    let bars: Vec<(String, f32)> = match tab {
+        DecideTab::Boolean => {
+            let p = r.probability.unwrap_or(0.0);
+            vec![("yes".to_string(), p), ("no".to_string(), 1.0 - p)]
+        }
+        _ => {
+            let probs = r.probabilities.clone().unwrap_or_default();
+            probs
+                .iter()
+                .enumerate()
+                .map(|(i, &p)| (labels.get(i).cloned().unwrap_or_else(|| format!("#{i}")), p))
+                .collect()
+        }
+    };
+    let winner = bars
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i);
+    for (i, (label, p)) in bars.iter().enumerate() {
+        let p = *p;
+        ui.horizontal(|ui| {
+            let is_win = winner == Some(i);
+            let cap = RichText::new(label.as_str())
+                .color(if is_win { TEXT } else { MUTED })
+                .small();
+            ui.add_sized([130.0, 16.0], egui::Label::new(cap).truncate());
+            // Bar trough + fill.
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width() - 60.0, 12.0), Sense::hover());
+            let rounding = Rounding::same(6.0);
+            ui.painter().rect_filled(rect, rounding, FIELD_BG);
+            let f = p.clamp(0.0, 1.0);
+            if f > 0.0 {
+                let fill =
+                    Rect::from_min_size(rect.min, egui::vec2(rect.width() * f, rect.height()));
+                ui.painter()
+                    .rect_filled(fill, rounding, if is_win { ACCENT } else { ELEVATED2 });
+            }
+            ui.label(
+                RichText::new(format!("{:.1}%", p * 100.0))
+                    .color(if is_win { TEXT } else { MUTED })
+                    .small(),
+            );
+        });
+        ui.add_space(4.0);
+    }
+}
+
+/// Render the quantize result summary (mirrors Quantize.tsx's result grid).
+fn render_quantize_result(ui: &mut egui::Ui, s: &QuantizeSummary) {
+    ui.label(RichText::new("Quantize complete").strong().color(HEALTH_OK));
+    ui.add_space(8.0);
+    kv_row(ui, "Default target", &s.target);
+    kv_row(ui, "Block layers detected", &s.n_layers.to_string());
+    kv_row(
+        ui,
+        "Tensors re-encoded",
+        &format!("{} of {}", s.tensors_requantized, s.tensors_total),
+    );
+    kv_row(ui, "Passthrough", &s.tensors_passthrough.to_string());
+    kv_row(ui, "Source size", &human_bytes(s.bytes_in));
+    let pct = if s.bytes_in > 0 {
+        (s.bytes_out as f64 / s.bytes_in as f64) * 100.0
+    } else {
+        0.0
+    };
+    kv_row(
+        ui,
+        "Output size",
+        &format!("{} ({pct:.1}% of original)", human_bytes(s.bytes_out)),
+    );
+    kv_row(ui, "Elapsed", &format!("{:.2}s", s.elapsed_ms / 1000.0));
+}
+
+/// One conversation row in the history sidebar. Returns `(load_clicked,
+/// delete_clicked)`. The active conversation is highlighted.
+fn conversation_row(ui: &mut egui::Ui, c: &ConversationSummary, active: bool) -> (bool, bool) {
+    let mut load = false;
+    let mut delete = false;
+    let fill = if active { SELECT_BG } else { ELEVATED };
+    egui::Frame::none()
+        .fill(fill)
+        .rounding(Rounding::same(7.0))
+        .inner_margin(Margin::symmetric(8.0, 6.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let title = if c.title.trim().is_empty() {
+                    "Untitled".to_string()
+                } else {
+                    c.title.clone()
+                };
+                let resp = ui.add(
+                    egui::Label::new(
+                        RichText::new(title).color(if active { TEXT } else { MUTED }).small(),
+                    )
+                    .truncate()
+                    .sense(Sense::click()),
+                );
+                if resp.clicked() {
+                    load = true;
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(egui::Button::new(RichText::new("✕").color(DANGER)).small())
+                        .on_hover_text("Delete this conversation")
+                        .clicked()
+                    {
+                        delete = true;
+                    }
+                });
+            });
+        });
+    (load, delete)
+}
+
+/// A staged-image chip in the composer: name + size + a remove (✕) button.
+fn image_chip(
+    ui: &mut egui::Ui,
+    name: &str,
+    bytes: u64,
+    remove: &mut Option<usize>,
+    idx: usize,
+) {
+    egui::Frame::none()
+        .fill(ELEVATED2)
+        .rounding(Rounding::same(6.0))
+        .stroke(Stroke::new(1.0, BORDER))
+        .inner_margin(Margin::symmetric(7.0, 3.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("🖼").small());
+                let short = if name.chars().count() > 20 {
+                    let head: String = name.chars().take(18).collect();
+                    format!("{head}…")
+                } else {
+                    name.to_string()
+                };
+                ui.label(RichText::new(short).color(TEXT).small())
+                    .on_hover_text(format!("{name} · {}", human_bytes(bytes)));
+                if ui
+                    .add(egui::Button::new(RichText::new("✕").color(DANGER)).small())
+                    .clicked()
+                {
+                    *remove = Some(idx);
+                }
+            });
+        });
+}
+
+/// A short, single-line conversation title from the first user message.
+fn truncate_title(s: &str) -> String {
+    let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() > 48 {
+        let head: String = one_line.chars().take(46).collect();
+        format!("{head}…")
+    } else if one_line.is_empty() {
+        "New chat".into()
+    } else {
+        one_line
+    }
+}
+
+/// Guess an image MIME type from a file extension for the `data:` URI (the
+/// server sniffs the real bytes, but a correct type is polite / cheap).
+fn mime_from_path(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Suggest an output path beside the source, tagged with the target dtype
+/// (e.g. `model.gguf` + `q4_k` → `model.Q4_K.gguf`).
+fn suggest_quant_output(src: &std::path::Path, target: &str) -> String {
+    let stem = src
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model");
+    let out = src.with_file_name(format!("{stem}.{}.gguf", target.to_uppercase()));
+    out.display().to_string()
+}
+
+/// Run the in-process quantize pipeline — the SAME code path as the Tauri
+/// `quantize_model` command (`app/src-tauri/src/main.rs`): parse the target
+/// dtype, open the source GGUF, build a [`QuantizePlan`] (uniform default +
+/// optional APEX rules + optional recipe rules + optional LM-head passthrough),
+/// and run `quantize_gguf_to_path`. Returns a display summary or a message.
+/// Called ONLY from the [`GuiApp::spawn_quantize`] worker thread — this is
+/// CPU-bound and can run for minutes.
+fn run_quantize_job(
+    input: &str,
+    output: &str,
+    target: &str,
+    apex: Option<&str>,
+    recipe: Option<&str>,
+    keep_output: bool,
+) -> std::result::Result<QuantizeSummary, String> {
+    use rustllama_gguf::{
+        apex::{build_apex_rules, ApexTier},
+        quantize::{quantize_gguf_to_path, QuantizePlan},
+        recipe::{parse_dtype_name, parse_recipe_file},
+        Gguf,
+    };
+
+    let target_dtype =
+        parse_dtype_name(target).ok_or_else(|| format!("unknown target dtype {target:?}"))?;
+    let src = Gguf::open(input).map_err(|e| format!("open source: {e}"))?;
+
+    let mut plan = QuantizePlan::uniform(target_dtype);
+    let n_layers = infer_n_layers(&src);
+    if let Some(tier_name) = apex.filter(|t| !t.is_empty()) {
+        let tier = ApexTier::parse(tier_name)
+            .ok_or_else(|| format!("unknown APEX tier {tier_name:?}"))?;
+        plan.add_rules(build_apex_rules(tier, n_layers));
+    }
+    if let Some(path) = recipe.filter(|p| !p.is_empty()) {
+        let rules = parse_recipe_file(path).map_err(|e| format!("recipe parse: {e}"))?;
+        plan.add_rules(rules);
+    }
+    if keep_output {
+        // Keep the LM head / output projection at source precision — the
+        // usual recommendation for sub-4-bpw targets (llama.cpp's
+        // `--leave-output-tensor`). Mirrors the Tauri command.
+        plan.passthrough_prefixes.push("output.".into());
+        plan.passthrough_prefixes.push("lm_head.".into());
+        plan.passthrough_prefixes.push("head.".into());
+    }
+
+    let start = std::time::Instant::now();
+    let stats =
+        quantize_gguf_to_path(&src, output, &plan).map_err(|e| format!("pipeline: {e}"))?;
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    Ok(QuantizeSummary {
+        tensors_total: stats.tensors_total,
+        tensors_requantized: stats.tensors_requantized,
+        tensors_passthrough: stats.tensors_passthrough,
+        bytes_in: stats.bytes_in,
+        bytes_out: stats.bytes_out,
+        elapsed_ms,
+        target: target_dtype.as_str().to_string(),
+        n_layers,
+    })
+}
+
+/// Layer-count heuristic mirroring the Tauri command's `infer_n_layers`:
+/// `{arch}.block_count` metadata, else the max `blk.N.*` tensor index + 1.
+fn infer_n_layers(src: &rustllama_gguf::Gguf) -> usize {
+    use rustllama_gguf::MetadataValue;
+    if let Some(arch) = src.architecture() {
+        let key = format!("{arch}.block_count");
+        if let Some(value) = src.metadata_get(&key) {
+            if let Some(n) = match value {
+                MetadataValue::U32(v) => Some(*v as usize),
+                MetadataValue::U64(v) => Some(*v as usize),
+                MetadataValue::I32(v) if *v >= 0 => Some(*v as usize),
+                MetadataValue::I64(v) if *v >= 0 => Some(*v as usize),
+                _ => None,
+            } {
+                return n;
+            }
+        }
+    }
+    let mut max_idx: Option<usize> = None;
+    for t in src.tensors() {
+        if let Some(rest) = t.name.strip_prefix("blk.") {
+            if let Some(dot) = rest.find('.') {
+                if let Ok(idx) = rest[..dot].parse::<usize>() {
+                    max_idx = Some(max_idx.map_or(idx, |m| m.max(idx)));
+                }
+            }
+        }
+    }
+    max_idx.map_or(0, |i| i + 1)
 }
 
 /// Install the dark visuals once at startup. Called from [`GuiApp::new`].

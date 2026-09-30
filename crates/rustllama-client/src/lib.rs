@@ -27,6 +27,55 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// A chat message that may carry attached images as base64 `data:` URIs.
+///
+/// Kept as a SEPARATE type from [`ChatMessage`] (rather than adding an `images`
+/// field to it) so the many existing `ChatMessage { role, content }`
+/// construction sites — the CLI REPL/TUI, tests — stay untouched. The GUI's
+/// image-attach path builds these and renders the OpenAI multimodal
+/// content-block array via [`Self::to_json`].
+#[derive(Debug, Clone, Default)]
+pub struct MultimodalMessage {
+    pub role: String,
+    pub content: String,
+    /// Attached images, each a `data:image/...;base64,...` URI. Empty is the
+    /// common text-only path.
+    pub images: Vec<String>,
+}
+
+impl MultimodalMessage {
+    /// A plain text-only message (no images).
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            images: Vec::new(),
+        }
+    }
+
+    /// The OpenAI wire shape for this message. With no images it is a plain
+    /// `{role, content:"..."}` — byte-identical to a [`ChatMessage`]. With
+    /// images it is the GPT-4-Vision multimodal *content-block array*:
+    /// `{role, content:[{type:"image_url",image_url:{url}}..., {type:"text",text}]}`.
+    /// The server accepts both shapes (see `rustllama-server`'s
+    /// `OpenAiContent` untagged enum); the image blocks lead so a
+    /// vision-aware engine splices projected features before the prompt text,
+    /// matching the web client (`app/ui/src/api.ts` `streamChat`).
+    pub fn to_json(&self) -> serde_json::Value {
+        if self.images.is_empty() {
+            serde_json::json!({ "role": self.role, "content": self.content })
+        } else {
+            let mut blocks: Vec<serde_json::Value> = self
+                .images
+                .iter()
+                .map(|u| serde_json::json!({ "type": "image_url", "image_url": { "url": u } }))
+                .collect();
+            blocks.push(serde_json::json!({ "type": "text", "text": self.content }));
+            serde_json::json!({ "role": self.role, "content": blocks })
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatRequest {
     pub model: String,
@@ -719,6 +768,103 @@ pub enum ChatEvent {
     Usage(Usage),
 }
 
+// --- Typed decisions (/v1/decide/*) ----------------------------------------
+// Consumed by the native GUI's Decide view. Mirrors `app/ui/src/api.ts`
+// `DecideResult`. Lenient (`#[serde(default)]`) so the choice / score /
+// boolean response shapes — which differ in which fields are present — all
+// deserialize into this one struct.
+
+/// One typed-decision result from `/v1/decide/{choice,score,boolean}`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DecideResult {
+    /// choice/score: the winning option label (a JSON string). boolean: the
+    /// yes/no verdict (a JSON bool). Kept as a `Value` because the wire type
+    /// of this field differs per endpoint (String vs bool); the Decide view
+    /// reads `.as_str()` for choice/score and `.as_bool()` for boolean.
+    #[serde(default)]
+    pub value: serde_json::Value,
+    /// choice/score: index of the winner within the option/level list.
+    #[serde(default)]
+    pub index: Option<usize>,
+    /// choice/score: calibrated softmax probability per option/level, in order.
+    #[serde(default)]
+    pub probabilities: Option<Vec<f32>>,
+    #[serde(default)]
+    pub logprobs: Option<Vec<f32>>,
+    /// score: the prob-weighted expected value (present when levels are numeric).
+    #[serde(default)]
+    pub score: Option<f32>,
+    /// boolean: P(yes).
+    #[serde(default)]
+    pub probability: Option<f32>,
+    #[serde(default)]
+    pub confidence: f32,
+    /// True when a per-model decision temperature (fitted by the tune sweep's
+    /// calibration stage) was applied — drives the Decide view's
+    /// "calibrated" vs "raw confidence" badge.
+    #[serde(default)]
+    pub calibrated: bool,
+    #[serde(default)]
+    pub entropy: f32,
+    #[serde(default)]
+    pub margin: f32,
+    #[serde(default)]
+    pub effective_options: f32,
+    /// True when the winner's top probability fell below an `abstain_below`
+    /// threshold — the full distribution is still returned.
+    #[serde(default)]
+    pub declined: bool,
+}
+
+// --- Conversation history (/api/conversations*; --features history) ---------
+// Consumed by the native GUI's chat history sidebar. Mirrors the sqlite-backed
+// store in `rustllama-server`'s `history` module. Every field is lenient so a
+// slimmer response still deserializes. When the server lacks the feature the
+// routes return 501/404 (see [`Client::history_available`]).
+
+/// One conversation's metadata row from `GET /api/conversations`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ConversationSummary {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+/// One stored message within a conversation.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StoredMessage {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub created_at: i64,
+}
+
+/// A full conversation (summary fields flattened in) + its messages, from
+/// `GET /api/conversations/:id`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Conversation {
+    #[serde(flatten)]
+    pub summary: ConversationSummary,
+    #[serde(default)]
+    pub messages: Vec<StoredMessage>,
+}
+
+/// The `{ conversations: [...] }` envelope `GET /api/conversations` returns.
+#[derive(Debug, Default, Deserialize)]
+struct ConversationsEnvelope {
+    #[serde(default)]
+    conversations: Vec<ConversationSummary>,
+}
+
 pub struct Client {
     base: reqwest::Url,
     http: reqwest::Client,
@@ -1224,6 +1370,173 @@ impl Client {
 
         let byte_stream = resp.bytes_stream();
         Ok(Box::pin(parse_sse(byte_stream)))
+    }
+
+    /// Streaming `/v1/chat/completions` from a PRE-BUILT JSON body. The typed
+    /// [`Self::chat_stream`] can't express the OpenAI multimodal content-block
+    /// array (per-message image attachments), so the GUI's image-attach path
+    /// serializes a base [`ChatRequest`] to JSON and splices a multimodal
+    /// `messages[]` built from [`MultimodalMessage::to_json`]. `stream` is
+    /// forced `true` so a caller can't accidentally request a non-streamed
+    /// body here. Same SSE parsing as [`Self::chat_stream`].
+    pub async fn chat_stream_value(
+        &self,
+        mut body: serde_json::Value,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatEvent>> + Send>>> {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("stream".into(), serde_json::Value::Bool(true));
+        }
+        let url = join(&self.base, "/v1/chat/completions")?;
+        let resp = self.http.post(url).json(&body).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let b = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Server {
+                status: status.as_u16(),
+                body: b,
+            });
+        }
+        Ok(Box::pin(parse_sse(resp.bytes_stream())))
+    }
+
+    // --- Typed decisions ---------------------------------------------------
+
+    /// `POST /v1/decide/choice` — pick one option from `options` by scoring
+    /// each as a continuation of `context`; returns per-option probabilities +
+    /// the winning `value`/`index` (+ a `calibrated` flag).
+    pub async fn decide_choice(
+        &self,
+        context: &str,
+        options: &[String],
+    ) -> Result<DecideResult> {
+        let url = join(&self.base, "/v1/decide/choice")?;
+        json_or_err(
+            self.http
+                .post(url)
+                .json(&serde_json::json!({ "context": context, "options": options }))
+                .send()
+                .await?,
+        )
+        .await
+    }
+
+    /// `POST /v1/decide/score` — rate `context` on the ordered scale `levels`;
+    /// returns the distribution + an expected `score`.
+    pub async fn decide_score(&self, context: &str, levels: &[String]) -> Result<DecideResult> {
+        let url = join(&self.base, "/v1/decide/score")?;
+        json_or_err(
+            self.http
+                .post(url)
+                .json(&serde_json::json!({ "context": context, "levels": levels }))
+                .send()
+                .await?,
+        )
+        .await
+    }
+
+    /// `POST /v1/decide/boolean` — a yes/no `question` about `context` → the
+    /// `value` verdict + `probability` = P(yes).
+    pub async fn decide_boolean(&self, context: &str, question: &str) -> Result<DecideResult> {
+        let url = join(&self.base, "/v1/decide/boolean")?;
+        json_or_err(
+            self.http
+                .post(url)
+                .json(&serde_json::json!({ "context": context, "question": question }))
+                .send()
+                .await?,
+        )
+        .await
+    }
+
+    // --- Conversation history ---------------------------------------------
+
+    /// Probe whether the server has conversation history enabled
+    /// (`--features history` + a store). A `501`/`404` → `false`; any other
+    /// response (or a 2xx) → `true`; a transport error → `false` (server
+    /// unreachable). The GUI hides its history sidebar when this is `false`.
+    pub async fn history_available(&self) -> bool {
+        let Ok(url) = join(&self.base, "/api/conversations") else {
+            return false;
+        };
+        match self.http.get(url).send().await {
+            Ok(r) => {
+                let s = r.status().as_u16();
+                s != 501 && s != 404
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// `GET /api/conversations` — the saved-conversation list, newest first.
+    pub async fn list_conversations(&self) -> Result<Vec<ConversationSummary>> {
+        let url = join(&self.base, "/api/conversations")?;
+        let env: ConversationsEnvelope = json_or_err(self.http.get(url).send().await?).await?;
+        Ok(env.conversations)
+    }
+
+    /// `GET /api/conversations/:id` — one conversation with its messages.
+    pub async fn get_conversation(&self, id: i64) -> Result<Conversation> {
+        let url = join(&self.base, &format!("/api/conversations/{id}"))?;
+        json_or_err(self.http.get(url).send().await?).await
+    }
+
+    /// `POST /api/conversations` — create a new conversation; returns its id.
+    pub async fn create_conversation(&self, title: &str) -> Result<i64> {
+        let url = join(&self.base, "/api/conversations")?;
+        let v: serde_json::Value = json_or_err(
+            self.http
+                .post(url)
+                .json(&serde_json::json!({ "title": title }))
+                .send()
+                .await?,
+        )
+        .await?;
+        Ok(v.get("id").and_then(|i| i.as_i64()).unwrap_or_default())
+    }
+
+    /// `POST /api/conversations/:id/messages` — append one message.
+    pub async fn append_message(&self, id: i64, role: &str, content: &str) -> Result<()> {
+        let url = join(&self.base, &format!("/api/conversations/{id}/messages"))?;
+        ok_or_err(
+            self.http
+                .post(url)
+                .json(&serde_json::json!({ "role": role, "content": content }))
+                .send()
+                .await?,
+        )
+        .await
+    }
+
+    /// `DELETE /api/conversations/:id` — remove a conversation (a `404` — it
+    /// was already gone — is treated as success).
+    pub async fn delete_conversation(&self, id: i64) -> Result<()> {
+        let url = join(&self.base, &format!("/api/conversations/{id}"))?;
+        let resp = self.http.delete(url).send().await?;
+        let status = resp.status();
+        if status.as_u16() == 404 {
+            return Ok(());
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Server {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(())
+    }
+
+    /// `PATCH /api/conversations/:id` — rename a conversation.
+    pub async fn rename_conversation(&self, id: i64, title: &str) -> Result<()> {
+        let url = join(&self.base, &format!("/api/conversations/{id}"))?;
+        ok_or_err(
+            self.http
+                .patch(url)
+                .json(&serde_json::json!({ "title": title }))
+                .send()
+                .await?,
+        )
+        .await
     }
 }
 
@@ -2141,5 +2454,91 @@ mod tests {
         // A comment / done line yields nothing.
         assert!(extract_request_id(b": keep-alive").is_none());
         assert!(extract_request_id(b"data: [DONE]").is_none());
+    }
+
+    /// A text-only [`MultimodalMessage`] serializes byte-identically to a
+    /// plain `{role, content}` message; one with images serializes to the
+    /// OpenAI multimodal content-block array (image blocks first, then text).
+    #[test]
+    fn multimodal_message_to_json_plain_vs_blocks() {
+        let plain = MultimodalMessage::text("user", "hello");
+        assert_eq!(
+            plain.to_json(),
+            serde_json::json!({ "role": "user", "content": "hello" })
+        );
+
+        let with_img = MultimodalMessage {
+            role: "user".into(),
+            content: "what is this?".into(),
+            images: vec!["data:image/png;base64,AAAA".into()],
+        };
+        assert_eq!(
+            with_img.to_json(),
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                    { "type": "text", "text": "what is this?" }
+                ]
+            })
+        );
+    }
+
+    /// The three decide response shapes all deserialize into `DecideResult`:
+    /// choice carries a string `value` + `probabilities`; boolean carries a
+    /// bool `value` + `probability`.
+    #[test]
+    fn decide_result_deserializes_choice_and_boolean() {
+        let choice: DecideResult = serde_json::from_value(serde_json::json!({
+            "value": "positive", "index": 0,
+            "probabilities": [0.7, 0.2, 0.1],
+            "confidence": 0.7, "calibrated": true
+        }))
+        .unwrap();
+        assert_eq!(choice.value.as_str(), Some("positive"));
+        assert_eq!(choice.index, Some(0));
+        assert_eq!(choice.probabilities.as_ref().unwrap().len(), 3);
+        assert!(choice.calibrated);
+
+        let boolean: DecideResult = serde_json::from_value(serde_json::json!({
+            "value": true, "probability": 0.82,
+            "confidence": 0.82, "calibrated": false
+        }))
+        .unwrap();
+        assert_eq!(boolean.value.as_bool(), Some(true));
+        assert_eq!(boolean.probability, Some(0.82));
+        assert!(!boolean.calibrated);
+    }
+
+    /// A conversation deserializes with its summary fields flattened at the
+    /// top level alongside `messages`.
+    #[test]
+    fn conversation_deserializes_flattened_summary() {
+        let c: Conversation = serde_json::from_value(serde_json::json!({
+            "id": 7, "title": "My chat", "created_at": 1, "updated_at": 2,
+            "messages": [
+                { "id": 1, "role": "user", "content": "hi", "created_at": 1 },
+                { "id": 2, "role": "assistant", "content": "hello", "created_at": 2 }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(c.summary.id, 7);
+        assert_eq!(c.summary.title, "My chat");
+        assert_eq!(c.messages.len(), 2);
+        assert_eq!(c.messages[1].role, "assistant");
+    }
+
+    /// The `{ conversations: [...] }` list envelope deserializes; a missing
+    /// key yields an empty list (lenient).
+    #[test]
+    fn conversations_envelope_deserializes_and_defaults_empty() {
+        let env: ConversationsEnvelope = serde_json::from_value(serde_json::json!({
+            "conversations": [ { "id": 1, "title": "a", "created_at": 0, "updated_at": 0 } ]
+        }))
+        .unwrap();
+        assert_eq!(env.conversations.len(), 1);
+        let empty: ConversationsEnvelope =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(empty.conversations.is_empty());
     }
 }

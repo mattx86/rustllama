@@ -29,10 +29,22 @@ egui_plot = "0.29"
 # Pure-Rust/platform-native, no toolchain deps — keeps the crate toolchain-free.
 rfd = "0.15"
 
-# The ONLY rustllama dep — a reqwest-only HTTP client. Depending on
-# -client (not -engine/-models/-server/-kernels-*) is what keeps this
-# crate TOOLCHAIN-FREE: it builds with plain `cargo`, no oneAPI/CUDA env.
+# The reqwest-only HTTP client — the surface for chat / models / decide /
+# history. Depending on -client (not -engine/-models/-server/-kernels-*) is
+# what keeps this crate TOOLCHAIN-FREE: it builds with plain `cargo`, no
+# oneAPI/CUDA env.
 rustllama-client = { path = "../rustllama-client" }
+
+# In-process quantize (the Quantize view runs the encode pipeline directly on
+# a worker thread, mirroring the Tauri `quantize_model` command). `-gguf` is
+# ALSO toolchain-free — pure Rust GGUF read/write + quant encode, no
+# oneAPI/CUDA — so pulling it in keeps this crate buildable with plain `cargo`.
+# `encoder` (the default feature) gates the quantize/apex/recipe modules.
+rustllama-gguf = { path = "../rustllama-gguf", default-features = false, features = ["encoder"] }
+
+# base64-encode attached images into `data:` URIs for the chat composer's
+# multimodal `image_url` content blocks. Pure Rust, toolchain-free.
+base64.workspace = true
 
 # Async bridge: a multi-thread tokio runtime owns the network calls; the
 # UI thread never blocks. `tokio.workspace` carries the `full` feature set

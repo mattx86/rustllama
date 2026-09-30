@@ -5605,6 +5605,7 @@ name = "rustllama-gui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "eframe",
  "egui",
  "egui_commonmark",
@@ -5613,6 +5614,7 @@ dependencies = [
  "futures",
  "rfd",
  "rustllama-client",
+ "rustllama-gguf",
  "serde_json",
  "tokio",
  "tracing",
