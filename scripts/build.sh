@@ -6,17 +6,18 @@
 # Intel via SYCL/Level-Zero, NVIDIA via CUDA, CPU always.
 #
 #   scripts/build.sh                 GUI artifact (desktop GUI + CLI + server)
-#   scripts/build.sh --headless      server-only build (no Tauri GUI)
+#   scripts/build.sh --headless      server-only build (no GUI)
 #   scripts/build.sh test            run the CPU test suites
 #   scripts/build.sh --debug         debug profile
 #   scripts/build.sh -- <args>       pass extra args to cargo
 #
 # GUI is the default artifact so users can launch the desktop GUI OR use
-# the CLI/server from the same binary. The GUI links GTK/webkit2gtk-4.1
-# (present in the build image) and embeds the prebuilt frontend at
-# app/ui/dist. That dist is platform-independent — build it once with
-# `pnpm -C app/ui install && pnpm -C app/ui build` (Node 20+); this script
-# consumes it (the build image needs no Node). It errors if dist is absent.
+# the CLI/server from the same binary. The GUI is native egui/eframe
+# (crates/rustllama-gui) — NOT Tauri/webkit — so there is NO JS frontend to
+# prebuild (no pnpm, no app/ui/dist). It links a small OpenGL + windowing
+# graph instead: mesa GL/EGL, X11 + Wayland client libs, libxkbcommon,
+# fontconfig/freetype, and D-Bus (rfd file dialogs) — all present in the
+# build image.
 #
 # Because all backends are built in, this REQUIRES both GPU toolchains:
 # Intel oneAPI (icx/icpx) and the CUDA Toolkit (nvcc). Run it inside the
@@ -26,8 +27,8 @@
 # Linking: Rust links all crates + bundled C libs (sqlite, oniguruma,
 # rustls crypto, tree-sitter) + the nvcc kernels + static cudart into the
 # binary. Dynamic deps: glibc + core system libs, the SYCL runtime, the
-# NVIDIA driver, and (unless --headless) GTK/webkit2gtk-4.1. No musl, no
-# static glibc.
+# NVIDIA driver, and (unless --headless) the egui GL/X11/Wayland/fontconfig
+# graph. No musl, no static glibc.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -58,21 +59,15 @@ done
 
 pflag=(); [ "$profile" = "release" ] && pflag=(--release)
 outdir="${CARGO_TARGET_DIR:-target}/$([ "$profile" = release ] && echo release || echo debug)"
-APP=(--manifest-path app/src-tauri/Cargo.toml)
+APP=(--manifest-path app/desktop/Cargo.toml)
 
 # SYCL + CUDA + CPU are always compiled in (non-optional deps), so no
-# backend features are passed. GUI (the default) adds the Tauri desktop
-# shell and embeds the prebuilt app/ui/dist; --headless drops it for a
-# server-only binary.
+# backend features are passed. GUI (the default) adds the native egui/eframe
+# desktop shell (crates/rustllama-gui) — no JS frontend, nothing to prebuild;
+# --headless drops it for a server-only binary.
 featflag=()
 if [ "$gui" = "1" ]; then
   featflag=(--features gui)
-  if { [ "$cmd" = "build" ] || [ "$cmd" = "check" ]; } && [ ! -e app/ui/dist/index.html ]; then
-    echo "ERROR: GUI build needs the prebuilt frontend at app/ui/dist." >&2
-    echo "       Build it first (Node 20+): pnpm -C app/ui install && pnpm -C app/ui build" >&2
-    echo "       Or build server-only:      scripts/build.sh --headless" >&2
-    exit 1
-  fi
 fi
 
 case "$cmd" in

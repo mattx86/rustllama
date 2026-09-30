@@ -5,11 +5,14 @@
 # so the GUI artifact is a superset of the old headless one. Invoked by
 # scripts/release-linux-x86_64.bat and scripts/release-linux-arm64.bat.
 #
-# The GUI links webkit2gtk-4.1 + GTK (present in both build images); the
-# packaging step below bundles that .so graph via $ORIGIN RPATH (LGPL-2.1
-# libs, dynamically linked + replaceable + accompanied by NOTICES), so the
-# artifact needs no webkit2gtk install on the target. Set HEADLESS=1 to build
-# the server-only binary instead (no webkit graph bundled).
+# The GUI is native egui/eframe (crates/rustllama-gui) — it links a small
+# OpenGL + windowing graph (mesa GL/EGL, X11/Wayland, libxkbcommon,
+# fontconfig/freetype, D-Bus for rfd file dialogs), NOT Tauri/webkit. The
+# packaging step below bundles the ABI-stable, non-host .so's via $ORIGIN
+# RPATH (dynamically linked + replaceable + accompanied by NOTICES); the
+# host-provided GL/vendor-driver and xdg-desktop-portal libs are left on the
+# target. Set HEADLESS=1 to build the server-only binary instead (no GUI
+# graph bundled).
 #
 # Usage: scripts/_release_build_linux.sh <arch>     (arch: x86_64 | aarch64)
 set -euo pipefail
@@ -30,8 +33,8 @@ if [ "$ARCH" = "aarch64" ]; then
 fi
 
 # 1. Build the binary. GUI (desktop + CLI + server) by default; HEADLESS=1
-#    builds server-only. The GUI needs the prebuilt frontend at app/ui/dist
-#    (committed) + webkit2gtk in the image (both present).
+#    builds server-only. The native egui GUI needs no JS frontend — just the
+#    egui/GL build deps in the image (present).
 if [ "${HEADLESS:-0}" = "1" ]; then
   scripts/build.sh --headless
 else

@@ -7,14 +7,15 @@ REM per-backend features. Startup detection picks which to run (or all):
 REM Intel via SYCL/Level-Zero, NVIDIA via CUDA, CPU always.
 REM
 REM   scripts\build.bat            GUI artifact: desktop GUI + CLI + server
-REM   scripts\build.bat --headless server-only build (no Tauri GUI)
+REM   scripts\build.bat --headless server-only build (no GUI)
 REM   scripts\build.bat test       run the test suites
 REM   scripts\build.bat --debug    debug profile
 REM   scripts\build.bat -- <args>  pass extra args to cargo
 REM
 REM GUI is the default artifact so a single binary serves the desktop GUI
-REM OR the CLI/server. The GUI build rebuilds the frontend (pnpm -> Node
-REM 20+) and embeds app/ui/dist; --headless skips both.
+REM OR the CLI/server. The GUI is native egui/eframe (crates/rustllama-gui)
+REM — NOT Tauri/webkit — so there is NO JS frontend to prebuild (no pnpm, no
+REM app/ui). On Windows it links only winit + the OS OpenGL stack.
 REM
 REM Because all backends are built in, this REQUIRES both GPU toolchains:
 REM Intel oneAPI (icx) and the CUDA Toolkit (nvcc, `winget install
@@ -51,18 +52,8 @@ goto collect
 
 set "ENV=%~dp0build-env.bat"
 
-REM Build the GUI frontend (pnpm) when producing the GUI artifact, so the
-REM embedded app/ui/dist is fresh. Requires Node 20+ and pnpm on PATH.
-REM Skipped for --headless (empty FEATS) and for test/check/clean.
-if /I "%CMD%"=="build" if /I "%FEATS%"=="gui" (
-    echo ^>^> building GUI frontend ^(pnpm^)...
-    pushd "%~dp0..\app\ui"
-    call pnpm install --frozen-lockfile
-    if errorlevel 1 ( echo ERROR: pnpm install failed & popd & exit /b 1 )
-    call pnpm build
-    if errorlevel 1 ( echo ERROR: pnpm build failed & popd & exit /b 1 )
-    popd
-)
+REM The GUI is native egui — no JS frontend to prebuild, so there is no pnpm
+REM step here. The `gui` cargo feature pulls in crates/rustllama-gui directly.
 
 REM Only pass --features when non-empty (--headless leaves FEATS empty,
 REM giving a server-only binary from the app crate's default features).
@@ -71,10 +62,10 @@ if not "%FEATS%"=="" set "FEATFLAG=--features %FEATS%"
 
 if /I "%CMD%"=="build" (
     echo ^>^> rustllama build ^(Windows, features: %FEATS%^)
-    call "%ENV%" build %PROFILE% %FEATFLAG% --manifest-path app\src-tauri\Cargo.toml -j 2 %EXTRA%
+    call "%ENV%" build %PROFILE% %FEATFLAG% --manifest-path app\desktop\Cargo.toml -j 2 %EXTRA%
 ) else if /I "%CMD%"=="check" (
     echo ^>^> rustllama check ^(Windows, features: %FEATS%^)
-    call "%ENV%" check %PROFILE% %FEATFLAG% --manifest-path app\src-tauri\Cargo.toml %EXTRA%
+    call "%ENV%" check %PROFILE% %FEATFLAG% --manifest-path app\desktop\Cargo.toml %EXTRA%
 ) else if /I "%CMD%"=="test" (
     echo ^>^> rustllama test ^(Windows^)
     call "%ENV%" test %PROFILE% -p rustllama-kernels-cpu -p rustllama-config -p rustllama-tensor -p rustllama-tokenizer -p rustllama-safetensors -p rustllama-models -p rustllama-engine -p rustllama-server %EXTRA%

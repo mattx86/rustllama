@@ -5,7 +5,7 @@
 //! `rustllama-client` (a reqwest-only OpenAI/Ollama HTTP client) plus the egui
 //! stack, so it builds with plain `cargo` — no Intel oneAPI / NVIDIA CUDA env.
 //! It is *just* the UI + an async bridge to a running rustllama server. The
-//! server-embedding stays in `app/src-tauri` (a later step) which will call
+//! server-embedding lives in the `app/desktop` binary, which calls
 //! [`run_ui`]; the GUI itself only ever talks to the server over HTTP.
 //!
 //! ## Scope

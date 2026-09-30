@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Clap-based CLI subcommand library for rustllama (no main; dispatched from app/src-tauri)."
+description = "Clap-based CLI subcommand library for rustllama (no main; dispatched from app/desktop)."
 
 [features]
 # All ON by default so plain builds and the shipped GUI binary are

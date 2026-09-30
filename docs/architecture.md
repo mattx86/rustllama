@@ -7,7 +7,7 @@ project evolves.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ rustllama-cli  rustllama-server  rustllama-gui (Tauri)       │
+│ rustllama-cli  rustllama-server  rustllama-gui (egui)        │
 └────────────────────────┬─────────────────────────────────────┘
                          │ Engine API
 ┌────────────────────────┴─────────────────────────────────────┐
@@ -62,7 +62,7 @@ as a single device, and dispatch prefers Level Zero.
 2. **GGUF v3.** Quantizations supported in v1: F16, Q8_0, Q4_K_M, Q5_K_M.
 3. **Tokenizer**: HuggingFace `tokenizers` (Rust-native).
 4. **Chat templates**: `minijinja`.
-5. **GUI**: Tauri 2 + React + TypeScript + Vite.
+5. **GUI**: native egui/eframe (glow renderer + winit; rfd file dialogs).
 6. **HTTP server**: Axum, bind 127.0.0.1, no auth (overridable).
 7. **Single binary.** Subcommands: `serve` (`--model`/`--ip`/`--port`),
    `chat` (line REPL or `--tui`; `--resume`, plus `chat list/show/export/

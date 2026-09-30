@@ -36,7 +36,7 @@ rfd = "0.15"
 rustllama-client = { path = "../rustllama-client" }
 
 # In-process quantize (the Quantize view runs the encode pipeline directly on
-# a worker thread, mirroring the Tauri `quantize_model` command). `-gguf` is
+# a worker thread, mirroring the old Tauri `quantize_model` command). `-gguf` is
 # ALSO toolchain-free — pure Rust GGUF read/write + quant encode, no
 # oneAPI/CUDA — so pulling it in keeps this crate buildable with plain `cargo`.
 # `encoder` (the default feature) gates the quantize/apex/recipe modules.

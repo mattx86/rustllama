@@ -2,13 +2,15 @@
 # ============================================================================
 # Assemble a rustllama Linux release archive — runs INSIDE the build container
 # (Rocky 10 x86_64 GPU image, or the Ubuntu 24.04 aarch64 image), after
-# scripts/build.sh --headless. Produces the canonical layout:
+# scripts/build.sh (GUI, the default) or scripts/build.sh --headless. Produces
+# the canonical layout:
 #
 #   release/rustllama-<version>-linux-<arch>/
-#     rustllama          launcher (sets LD_LIBRARY_PATH → ./lib, execs .bin)
-#     rustllama.bin      the ELF binary (all backends compiled in)
-#     lib/               bundled Intel oneAPI SYCL runtime .so closure (x86_64;
-#                        aarch64 ships the SYCL no-op stub → no bundled libs)
+#     rustllama          the relocatable ELF binary (all backends compiled in)
+#     lib/               bundled non-host .so closure — the Intel oneAPI SYCL
+#                        runtime (x86_64) plus, for a GUI build, the egui/eframe
+#                        GL/X11/Wayland/fontconfig graph. Empty/absent on an
+#                        aarch64 headless build (SYCL no-op stub, no bundled libs)
 #     README.md  LICENSE-MIT  LICENSE-APACHE  docs/
 #
 # then `release/rustllama-<version>-linux-<arch>.tar.gz`.
@@ -43,11 +45,14 @@ ensure_patchelf() {
     apt-get update -qq >/dev/null 2>&1 || true
     apt-get install -y -qq patchelf >/dev/null 2>&1 || true
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y patchelf >/dev/null 2>&1 || {
-      dnf install -y dnf-plugins-core >/dev/null 2>&1 || true
+    # The GPU build image carries a CUDA repo whose metadata can fail to
+    # refresh; patchelf lives in CRB/EPEL, so disable the CUDA repo(s) for this
+    # install so dnf doesn't choke on an unrelated flaky repo.
+    dnf install -y --disablerepo='cuda*' patchelf >/dev/null 2>&1 || {
+      dnf install -y --disablerepo='cuda*' dnf-plugins-core >/dev/null 2>&1 || true
       dnf config-manager --set-enabled crb >/dev/null 2>&1 || true
-      dnf install -y epel-release >/dev/null 2>&1 || true
-      dnf install -y patchelf >/dev/null 2>&1 || true
+      dnf install -y epel-release --disablerepo='cuda*' >/dev/null 2>&1 || true
+      dnf install -y --disablerepo='cuda*' patchelf >/dev/null 2>&1 || true
     }
   elif command -v yum >/dev/null 2>&1; then
     yum install -y patchelf >/dev/null 2>&1 || true
@@ -87,32 +92,22 @@ fi
 export LD_LIBRARY_PATH="${BINDIR}:${LD_LIBRARY_PATH:-}"
 
 # Bundle every shared lib the binary pulls in that ISN'T part of the base OS —
-# i.e. our own `librsl_kernels.so` SYCL shim + the whole Intel oneAPI SYCL
-# runtime closure. Recurse so interdependent oneAPI libs all come along. Base
-# system libs (glibc/libstdc++/libgcc/the loader) + the NVIDIA driver are left
-# to the host. The launcher's LD_LIBRARY_PATH=$ORIGIN/lib resolves the bundle
-# at run time regardless of the libs' internal cross-references.
+# our own `librsl_kernels.so` SYCL shim + the whole Intel oneAPI SYCL runtime
+# closure, plus (for a GUI build) the egui/eframe GL/X11/Wayland/fontconfig
+# graph. Recurse so interdependent libs all come along. Base system libs
+# (glibc/libstdc++/libgcc/the loader), the NVIDIA driver, and the host GL /
+# vendor-driver .so's are left to the host. The $ORIGIN RPATH set below
+# resolves the bundle at run time regardless of the libs' cross-references.
 # Libraries to NEVER bundle: the base OS / glibc / GCC runtime + the dynamic
 # loader. These are ABI-stable and present on every target Linux; bundling a
 # glibc/libstdc++ from the build image can break on a host with a different
 # one. Matched by BASENAME (not path) so we can still bundle the GUI's
-# webkit2gtk/GTK graph, which lives in the same /usr/lib64 as glibc.
+# egui/GL/X11/Wayland graph, which lives in the same /usr/lib64 as glibc.
 is_base_os_lib() {
   case "$(basename "$1")" in
     ld-linux*|ld64.so*|libc.so.*|libm.so.*|libmvec.so.*|libpthread.so.*) return 0 ;;
     libdl.so.*|librt.so.*|libresolv.so.*|libutil.so.*|libnsl.so.*|libanl.so.*) return 0 ;;
     libcrypt.so.*|libstdc++.so.*|libgcc_s.so.*|libgomp.so.*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-# Libraries we deliberately DON'T bundle for LICENSE reasons. libmpg123 (+ its
-# out123/syn123 siblings) is GPL-2.0-or-later — an OPTIONAL MP3 decoder pulled
-# transitively via GStreamer; the GUI works without it (no in-webview MP3), and
-# excluding it keeps the bundle free of strong copyleft. Left to the host if a
-# user wants MP3 in the embedded webview.
-is_excluded_lib() {
-  case "$(basename "$1")" in
-    libmpg123.so*|libout123.so*|libsyn123.so*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -130,10 +125,12 @@ is_host_graphics_lib() {
     *) return 1 ;;
   esac
 }
-# Back-compat shim: the oneAPI-bundling loop below still calls is_system_lib.
-# It now means "do NOT bundle" = base OS OR host-graphics OR license-excluded.
+# Back-compat shim: the bundling loop below still calls is_system_lib.
+# It means "do NOT bundle" = base OS OR host-graphics driver-interface lib.
+# (There is no license-exclusion list anymore: the old GStreamer/mpg123 GPL
+# carve-out was webkit-only, and the egui GUI pulls in no such media libs.)
 is_system_lib() {
-  is_base_os_lib "$1" || is_host_graphics_lib "$1" || is_excluded_lib "$1"
+  is_base_os_lib "$1" || is_host_graphics_lib "$1"
 }
 # A shared object is named `<name>.so` or `<name>.so.<version>` — this filters
 # out gdb pretty-printers (`*.so-gdb.py`), .cmake files, etc. that live in the
@@ -199,12 +196,13 @@ fi
 
 # ---- Third-party bundled-library license NOTICES (LGPL-2.1 §4/§6) ---------
 # Each bundled .so is a redistributable third-party library. For the LGPL
-# ones (webkit2gtk/GTK/glib/...) LGPL-2.1 requires shipping the license text +
-# a notice naming the lib + version + where its (unmodified upstream) source
-# is. We emit a NOTICES table (lib -> package -> version -> license) and copy
-# each owning package's own license files from the build image. Works on rpm
-# (Rocky x86_64) or dpkg (Ubuntu aarch64). rustllama's OWN code stays MIT OR
-# Apache-2.0; these libraries keep their own (mostly LGPL/permissive) licenses.
+# ones (e.g. freetype/fontconfig/libxkbcommon among the egui graph) LGPL-2.1
+# requires shipping the license text + a notice naming the lib + version +
+# where its (unmodified upstream) source is. We emit a NOTICES table (lib ->
+# package -> version -> license) and copy each owning package's own license
+# files from the build image. Works on rpm (Rocky x86_64) or dpkg (Ubuntu
+# aarch64). rustllama's OWN code stays MIT OR Apache-2.0; these libraries keep
+# their own (mostly permissive / LGPL) licenses.
 if [ -d "$STAGE/lib" ] && [ "$(find "$STAGE/lib" -type f 2>/dev/null | wc -l)" -gt 0 ]; then
   mkdir -p "$STAGE/licenses/third-party"
   NOTICES="$STAGE/licenses/THIRD-PARTY-NOTICES.txt"
@@ -215,6 +213,10 @@ if [ -d "$STAGE/lib" ] && [ "$(find "$STAGE/lib" -type f 2>/dev/null | wc -l)" -
     echo "LGPL-2.1 libraries' corresponding source is available as the named"
     echo "distribution's source package (SRPM / dsc) for that version; each owning"
     echo "package's license files are copied under ./licenses/third-party/<package>/."
+    echo
+    echo "Runtime note: the GUI's native file dialogs use a desktop portal"
+    echo "(xdg-desktop-portal). It is provided by the host desktop and is NOT"
+    echo "bundled; without one, in-app 'open file' dialogs are unavailable."
     echo
     printf '%-38s %-26s %s\n' "LIBRARY (package)" "VERSION" "LICENSE"
     printf '%-38s %-26s %s\n' "----------------" "-------" "-------"
@@ -260,7 +262,8 @@ if [ -d "$STAGE/lib" ] && [ "$(find "$STAGE/lib" -type f 2>/dev/null | wc -l)" -
   done
   echo ">> wrote licenses/THIRD-PARTY-NOTICES.txt + per-package license files"
   # Flag (do not fail) any strong-copyleft that slipped into the bundle, so a
-  # release never silently ships GPL. mpg123 is already excluded above.
+  # release never silently ships GPL. The egui graph pulls in no known GPL
+  # libs; this stays as a cheap safety net against future dependency drift.
   if grep -iE '(^|[^L])GPL-[0-9]' "$NOTICES" | grep -viE 'LGPL|GCC-exception|with exception|OR ' >/dev/null 2>&1; then
     echo ">> WARNING: a bundled lib reports a GPL license — review $NOTICES" >&2
     grep -iE '(^|[^L])GPL-[0-9]' "$NOTICES" | grep -viE 'LGPL|GCC-exception|with exception|OR ' >&2 || true

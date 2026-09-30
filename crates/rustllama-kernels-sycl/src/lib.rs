@@ -1422,7 +1422,7 @@ mod imp {
 
     /// Whether the delay-loaded `rsl_kernels.dll` and its oneAPI runtime
     /// dependencies can actually be loaded. On Windows the kernel DLL is
-    /// **delay-loaded** (see `app/src-tauri/build.rs`), so the very first
+    /// **delay-loaded** (see `app/desktop/build.rs`), so the very first
     /// call into any `rsl_*` symbol would otherwise raise a fatal SEH
     /// exception (module-not-found) when oneAPI is absent or a driver DLL
     /// is broken — aborting the process instead of degrading to CPU. We
@@ -1616,7 +1616,7 @@ mod imp {
         // (`rsl_try_import_win32_handle_as_usm`) can ever fire —
         // that path requires `ext_oneapi_level_zero`. Routed
         // through `tracing` so it lands in `gui.log` (C++
-        // `fprintf(stderr)` is discarded by the Tauri GUI process).
+        // `fprintf(stderr)` is discarded by the windowed egui GUI process).
         static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         LOGGED.get_or_init(|| {
             let backend_id = unsafe { rsl_stream_backend(raw) };

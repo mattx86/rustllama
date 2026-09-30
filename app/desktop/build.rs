@@ -1,5 +1,6 @@
-//! Tauri's frontend codegen is run only when the `gui` feature is enabled,
-//! so phase-0 builds (no Node toolchain installed) succeed.
+//! Binary-crate build script: per-platform link setup for the SYCL
+//! kernel DLL/.so. Runs on every build (the kernels are real-only and
+//! always linked); there is no frontend codegen step.
 
 fn main() {
     // The SYCL kernels are ALWAYS linked (the kernels-sycl crate is
@@ -24,9 +25,5 @@ fn main() {
         // Add an `$ORIGIN` rpath so the dynamic loader finds it beside the
         // executable (ship the .so alongside the binary).
         println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
-    }
-    if std::env::var("CARGO_FEATURE_GUI").is_ok() {
-        #[cfg(feature = "gui")]
-        tauri_build::build();
     }
 }

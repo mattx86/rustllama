@@ -20,8 +20,8 @@
 # local Claude Code state (settings, plans, scheduled tasks) — never commit
 .claude/
 
-# tauri build artifacts
-app/src-tauri/target
+# desktop crate + legacy frontend build artifacts
+app/desktop/target
 app/ui/dist
 
 # tuner caches (when run locally outside %LOCALAPPDATA%)

@@ -6,7 +6,7 @@ REM other build script delegates its env setup here. Pass cargo args
 REM after the script name, e.g.:
 REM
 REM   scripts\build-env.bat build --release --features gui ^
-REM       --manifest-path app\src-tauri\Cargo.toml
+REM       --manifest-path app\desktop\Cargo.toml
 REM   (SYCL + CUDA + CPU are always compiled in — no backend features;
 REM    `--features gui` is the default artifact, added by the caller.)
 REM

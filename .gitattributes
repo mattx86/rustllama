@@ -1,0 +1,8 @@
+# Shell scripts + Dockerfiles run inside Linux containers — force LF so the
+# working-tree copy the container mounts never carries CRLF (bash/dnf choke
+# on the trailing \r, e.g. `set -o pipefail\r`). Windows batch/PS keep CRLF.
+*.sh    text eol=lf
+*.bash  text eol=lf
+Dockerfile* text eol=lf
+*.bat   text eol=crlf
+*.ps1   text eol=crlf

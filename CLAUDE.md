@@ -7,7 +7,7 @@ derivable from a quick look at the tree.
 ## What this is
 
 **rustllama** is a from-scratch Rust LLM runtime — an OpenAI/Ollama-compatible
-inference server + CLI + Tauri GUI. It is **clean-room: no `llama.cpp`
+inference server + CLI + native egui GUI. It is **clean-room: no `llama.cpp`
 dependency**. It owns its whole compute stack: a real-only kernel layer over
 **Intel SYCL + NVIDIA CUDA + CPU**, GGUF/safetensors loaders, tokenizers, chat
 templating, a KV cache, sampling, an autotuner, and quantization tooling.
@@ -42,8 +42,8 @@ crates/                         (19-crate Cargo workspace)
   rustllama-lsp                 LSP bridge (inline completion via FIM)
   rustllama-cli                 the `rustllama` binary — all subcommands
 app/
-  src-tauri/                    Tauri desktop shell (embeds the server)
-  ui/                           frontend (pnpm; LM Studio-style UI)
+  desktop/                      the `rustllama` binary — CLI/GUI dispatcher; embeds the server + native egui GUI
+  ui/                           legacy React frontend (pnpm) — unused by the native egui GUI; slated for removal
 scripts/                        build + release wrappers (see below)
 docs/                           architecture.md, quant-formats.md, sycl-offload.md, ...
 xtask/                          workspace automation
@@ -68,7 +68,7 @@ mangles long batch strings):
 
 | Goal | Command |
 |------|---------|
-| GUI release artifact (frontend + Tauri) | `scripts\_build.bat` |
+| GUI release artifact (native egui) | `scripts\_build.bat` |
 | Headless server/CLI build | `scripts\_build_headless.bat` |
 | Arbitrary cargo cmd with the full toolchain env | `scripts\build-env.bat build --release …` |
 | Check a **toolchain-free** crate (no env needed) | `cargo check -p rustllama-runtime` |
@@ -155,7 +155,7 @@ commands in the chat REPL/TUI mirror this verb set):
   `--cpu-parity` run the kernel parity/stability harnesses against the CPU
   reference (`--sycl-parity` subprocesses each probe so a DEVICE_LOST only
   kills its child; `--cuda-parity` and `--cpu-parity` run in-process).
-- `gui` — launch the Tauri GUI. `lsp` — LSP bridge over stdio. `version`.
+- `gui` — launch the native egui GUI. `lsp` — LSP bridge over stdio. `version`.
 
 ## Config & server
 

@@ -1,5 +1,5 @@
 //! Minimal OpenAI-compatible HTTP client used by `rustllama chat` and the
-//! Tauri GUI.
+//! native egui GUI.
 
 use std::pin::Pin;
 

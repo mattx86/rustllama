@@ -21,7 +21,7 @@ members = [
     "crates/rustllama-gui",
     "crates/rustllama-lsp",
     "crates/rustllama-cli",
-    "app/src-tauri",
+    "app/desktop",
     "xtask",
 ]
 
@@ -131,10 +131,6 @@ bindgen = "0.69"
 # load — `0` lets rayon's heuristic pick.
 rayon = "1.10"
 
-# tauri
-tauri = { version = "2", features = [] }
-tauri-build = "2"
-
 [profile.release]
 lto = "thin"
 codegen-units = 1
@@ -145,7 +141,7 @@ debug = 1
 # (release keeps `debug = 1` so cdb.exe can symbolize hangs during
 # development — that workflow found the 2026-09-06 OnceLock deadlock).
 # NEVER set `panic = "abort"` here: the embedded server thread relies
-# on `catch_unwind` (app/src-tauri/src/main.rs) and the engine asserts
+# on `catch_unwind` (app/desktop/src/main.rs) and the engine asserts
 # liberally — an abort would take down the whole GUI process where
 # today a request fails cleanly.
 [profile.dist]

@@ -4574,7 +4574,7 @@ impl GuiApp {
     /// pickers, a target-dtype dropdown, an optional APEX mixed-precision tier,
     /// an optional recipe file, a keep-LM-head checkbox, and a result panel.
     /// Runs the SAME `rustllama_gguf::quantize::quantize_gguf_to_path` pipeline
-    /// the Tauri `quantize_model` command drives (see [`run_quantize_job`]).
+    /// the old Tauri `quantize_model` command drove (see [`run_quantize_job`]).
     fn render_quantize(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let running = self.q_running;
         let result = self.q_result.clone();
@@ -6371,9 +6371,9 @@ fn suggest_quant_output(src: &std::path::Path, target: &str) -> String {
     out.display().to_string()
 }
 
-/// Run the in-process quantize pipeline — the SAME code path as the Tauri
-/// `quantize_model` command (`app/src-tauri/src/main.rs`): parse the target
-/// dtype, open the source GGUF, build a [`QuantizePlan`] (uniform default +
+/// Run the in-process quantize pipeline (the same path the old Tauri
+/// `quantize_model` command drove, now folded into this egui GUI): parse the
+/// target dtype, open the source GGUF, build a [`QuantizePlan`] (uniform default +
 /// optional APEX rules + optional recipe rules + optional LM-head passthrough),
 /// and run `quantize_gguf_to_path`. Returns a display summary or a message.
 /// Called ONLY from the [`GuiApp::spawn_quantize`] worker thread — this is
@@ -6411,7 +6411,7 @@ fn run_quantize_job(
     if keep_output {
         // Keep the LM head / output projection at source precision — the
         // usual recommendation for sub-4-bpw targets (llama.cpp's
-        // `--leave-output-tensor`). Mirrors the Tauri command.
+        // `--leave-output-tensor`). Mirrors the old Tauri command's behavior.
         plan.passthrough_prefixes.push("output.".into());
         plan.passthrough_prefixes.push("lm_head.".into());
         plan.passthrough_prefixes.push("head.".into());
@@ -6434,7 +6434,7 @@ fn run_quantize_job(
     })
 }
 
-/// Layer-count heuristic mirroring the Tauri command's `infer_n_layers`:
+/// Layer-count heuristic mirroring the old Tauri command's `infer_n_layers`:
 /// `{arch}.block_count` metadata, else the max `blk.N.*` tensor index + 1.
 fn infer_n_layers(src: &rustllama_gguf::Gguf) -> usize {
     use rustllama_gguf::MetadataValue;

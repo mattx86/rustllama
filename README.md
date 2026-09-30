@@ -1,8 +1,8 @@
 # rustllama
 
 A Rust LLM runtime with hybrid system-RAM + VRAM offload, an
-OpenAI-compatible HTTP server, a CLI, and a Tauri GUI — all shipped as one
-binary, all owned end-to-end (no llama.cpp dependency). Runs on **Windows
+OpenAI-compatible HTTP server, a CLI, and a native egui GUI — all shipped as
+one binary, all owned end-to-end (no llama.cpp dependency). Runs on **Windows
 and Linux on x86_64, and Linux on aarch64** (e.g. NVIDIA Grace / DGX
 Spark). Compute backends are compiled in and selected at startup per the
 hardware present: **Intel GPUs via SYCL** (x86_64 only), **NVIDIA GPUs via
@@ -18,8 +18,10 @@ CUDA**, and **CPU SIMD** (AVX2 on x86_64, NEON on aarch64).
 | Rust                       | 1.83+ (stable)      | everything                                   |
 | Intel oneAPI Base Toolkit  | 2025.0+             | SYCL kernels (`rustllama-kernels-sycl`, icx/icpx) — **x86_64 only** |
 | NVIDIA CUDA Toolkit        | 13.x                | CUDA kernels (`rustllama-kernels-cuda`, nvcc; also targets aarch64) |
-| Node.js                    | 20+                 | Tauri GUI frontend (`app/ui`)                |
-| pnpm                       | 9+                  | Tauri GUI frontend                           |
+
+The GUI is a native **egui/eframe** desktop app (`crates/rustllama-gui`) — it
+has **no JS frontend**, so no Node.js / pnpm is required. (The legacy Vite/React
+tree at `app/ui/` is unused by the current build and slated for removal.)
 
 The compute kernels are **real-only** — there are no `mock`/`sycl`/`cuda`
 cargo features; the backends are always compiled in and startup detection
@@ -27,8 +29,7 @@ picks which to run. On **x86_64** this means building requires both Intel
 oneAPI (`icx`/`icpx`) and the CUDA Toolkit (`nvcc`). On **aarch64** Intel
 oneAPI does not exist, so `rustllama-kernels-sycl` compiles a no-op stub
 and only the CUDA Toolkit (`nvcc`) is required — inference then runs on
-CPU (NEON) + CUDA. CPU SIMD is chosen automatically per arch. Node/pnpm
-are needed only for the Tauri GUI frontend.
+CPU (NEON) + CUDA. CPU SIMD is chosen automatically per arch.
 
 ## Quickstart
 
@@ -40,7 +41,7 @@ target\release\rustllama.exe doctor --cuda-parity  # verify CUDA kernels vs the 
 
 # Build the GUI artifact (GUI + CLI + server, all backends). Windows:
 scripts\build.bat
-scripts\build.bat --headless                       # server-only, no Tauri GUI
+scripts\build.bat --headless                       # server-only, no GUI
 
 # Linux builds run in Docker (or on a Linux host directly via scripts/build.sh):
 #   scripts\build-linux-gpu-docker.bat             # x86_64 GPU image (oneAPI + CUDA)
@@ -102,9 +103,9 @@ Notes:
 ## Layout
 
 ```
-crates/                Library crates (engine + supporting layers)
-app/src-tauri/         The shipped binary (CLI + GUI dispatcher)
-app/ui/                Vite + React + TypeScript frontend
+crates/                Library crates (engine + supporting layers, incl. rustllama-gui)
+app/desktop/           The shipped binary (CLI + GUI dispatcher)
+app/ui/                Legacy Vite + React frontend (unused; from the old Tauri GUI)
 xtask/                 Dev tasks (doctor, fetch-test-model, build)
 docs/                  Architecture, quant-format reference, redist manifest
 ```

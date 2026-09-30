@@ -5,7 +5,7 @@
 //! # Why this works (Windows)
 //!
 //! `rsl_kernels.dll` (the SYCL kernel DLL) is **delay-loaded** by the
-//! binary (see `app/src-tauri/build.rs`: `/DELAYLOAD:rsl_kernels.dll`).
+//! binary (see `app/desktop/build.rs`: `/DELAYLOAD:rsl_kernels.dll`).
 //! Delay-load defers binding the DLL — and thus its transitive oneAPI
 //! dependencies (`sycl*.dll`, `ur_loader.dll`, `ur_adapter_level_zero*
 //! .dll`, `libhwloc-15.dll`, …) — until the first `rsl_*` FFI call,

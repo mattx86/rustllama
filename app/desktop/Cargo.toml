@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "rustllama — local LLM runtime for Intel (SYCL) + NVIDIA (CUDA) + CPU (CLI + server + GUI)."
+description = "rustllama — local LLM runtime for Intel (SYCL) + NVIDIA (CUDA) + CPU (CLI + server + native egui GUI)."
 build = "build.rs"
 
 [[bin]]
@@ -26,7 +26,7 @@ path = "src/main.rs"
 # `--no-default-features` to drop them (server-only deployment: no
 # quantizer tables, no bundled sqlite, no tree-sitter grammars, no GUI).
 default = ["encoder", "history", "tree-sitter", "tui"]
-# `rustllama quantize` + the GUI's quantize_model command.
+# `rustllama quantize` + the GUI's quantize page.
 encoder = ["rustllama-gguf/encoder", "rustllama-cli/encoder"]
 # Conversation-history sqlite store (GUI Chat sidebar, `rustllama conv`).
 history = ["rustllama-cli/history"]
@@ -34,10 +34,10 @@ history = ["rustllama-cli/history"]
 tree-sitter = ["rustllama-cli/tree-sitter"]
 # Full-screen chat TUI (`rustllama chat --tui`; ratatui + crossterm).
 tui = ["rustllama-cli/tui"]
-# Enables the Tauri GUI subcommand. Requires Node 20+ and pnpm (see app/ui).
-# Implies `encoder`: the GUI's quantize_model command drives the
-# gguf encode pipeline directly.
-gui = ["encoder", "dep:rustllama-gui", "dep:tauri", "dep:tauri-build", "dep:reqwest", "dep:serde", "dep:serde_json", "dep:futures"]
+# Enables the native egui GUI subcommand (`rustllama gui`). Implies
+# `encoder`: the GUI's quantize page drives the gguf encode pipeline
+# directly. Toolchain-free at the GUI layer — no Node/frontend build.
+gui = ["encoder", "dep:rustllama-gui"]
 
 [dependencies]
 tokio.workspace = true
@@ -47,7 +47,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 rustllama-cli = { path = "../../crates/rustllama-cli", default-features = false }
 rustllama-runtime = { path = "../../crates/rustllama-runtime" }
-# The GUI's `quantize_model` Tauri command drives the pipeline directly.
+# The GUI's quantize page drives the gguf encode pipeline directly.
 rustllama-gguf = { path = "../../crates/rustllama-gguf", default-features = false }
 # Used directly by `run_gui` for the startup SYCL device-probe log
 # (so the user can see "GPU detected: ... driver_ver ... vram_mb"
@@ -59,26 +59,8 @@ rustllama-kernels-sycl = { path = "../../crates/rustllama-kernels-sycl", default
 # driver at runtime, since the kernels + static cudart are linked in).
 rustllama-kernels-cuda = { path = "../../crates/rustllama-kernels-cuda" }
 
-# Native egui/eframe GUI (replaces the Tauri/webview window). Toolchain-free
-# (eframe + rustllama-client only) — needs no Node/frontend build.
+# Native egui/eframe GUI. Gated behind feature `gui` and toolchain-free at
+# the GUI layer (eframe + rustllama-client only) — needs no Node/frontend
+# build. `run_gui()` spawns the embedded server, then hands off to
+# `rustllama_gui::run_ui()`.
 rustllama-gui = { path = "../../crates/rustllama-gui", optional = true }
-# GUI integration — gated behind feature `gui` so phase-0 builds work without
-# Node or the Tauri frontend dist dir. (The Tauri deps below are now legacy —
-# run_gui() launches the native egui app; the Tauri IPC/tray code is dead
-# pending the de-Tauri cleanup pass.)
-tauri = { workspace = true, optional = true, features = ["tray-icon", "image-ico"] }
-# Tiny HTTP client used by the IPC command adapters — `tauri::command`
-# fns can't run the React frontend's `fetch`, so commands that need to
-# proxy to the embedded HTTP server (e.g. `list_models`, `start_tune`)
-# go through this client. `default-features = false` keeps the dep
-# footprint small; `rustls-tls` so the binary doesn't drag in OpenSSL.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"], optional = true }
-serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
-# `futures::StreamExt::next` for reading SSE chunks from reqwest's
-# byte stream inside the `stream_chat` Tauri command. Gated behind
-# the gui feature so non-GUI builds skip the dep.
-futures = { workspace = true, optional = true }
-
-[build-dependencies]
-tauri-build = { workspace = true, optional = true }
