@@ -1,14 +1,18 @@
 //! Per-model auto-tuning orchestration for the server.
 //!
-//! The full 7-stage sweep already exists as the CLI `tune --all`
+//! The full 10-stage sweep already exists as the CLI `tune --all`
 //! orchestrator (`rustllama-cli::cmd_tune_all`), which loads the model,
-//! measures kernel-LWS / kv_dtype-coherence / flash-attn / kv-layout /
-//! placement (CPU-vs-GPU dispatch) / batch-size / threads, and persists
-//! each winner to the per-device tuner cache. Rather than re-implement
-//! that orchestration here, the server runs its own binary as a
-//! subprocess (`current_exe() tune --all --model <path> ...`) and parses
-//! the `Stage N/7:` lines from its stdout into a process-global
-//! [`TuneProgress`] that the GUI polls via `GET /v1/tune/progress`.
+//! measures kernel-LWS / per-device-perf / kv_dtype-coherence / flash-attn
+//! / kv-layout / placement (CPU-vs-GPU dispatch) / batch-size / threads /
+//! decision-calibration / MTP-self-spec / chunked-SSM-prefill, and persists
+//! each winner to the per-device tuner cache. Rather than re-implement that
+//! orchestration here, the server runs its own binary as a subprocess
+//! (`current_exe() tune --all --model <path> ...`) and parses the
+//! `Stage <n>/10:` lines from its stdout into a process-global
+//! [`TuneProgress`] that the GUI polls via `GET /v1/tune/progress`. The
+//! sweep prints one non-integer sub-stage header (`Stage 1b/10`, the
+//! per-device-perf refinement between stages 1 and 2); the parser treats
+//! it as a half-step so the progress bar advances rather than stalling.
 //!
 //! Why a subprocess and not an in-process call: the sweep reloads the
 //! model several times (once per kv_dtype candidate, etc.), and doing it
@@ -40,7 +44,7 @@ pub struct TuneProgress {
     pub model_id: String,
     /// 1-based index of the current stage (0 before the first stage).
     pub stage_idx: u32,
-    /// Total stages in the sweep (7 for `--all`).
+    /// Total stages in the sweep (10 for `--all`).
     pub stage_total: u32,
     /// Human-readable current stage name (e.g. "placement (measured)").
     pub stage_name: String,
@@ -133,20 +137,32 @@ fn push_line(raw: &str) {
         return;
     }
     if let Ok(mut g) = progress().lock() {
-        // Parse "Stage N/T: name" headers to advance the bar.
+        // Parse "Stage <label>/T: name" headers to advance the bar. The
+        // CLI `tune --all` sweep numbers its headers `1, 1b, 2 .. 10` over
+        // a denominator of `10`, so the numerator is NOT always an integer:
+        // `1b` is the per-device-perf sub-stage wedged between 1 and 2. We
+        // split the leading digits (the displayed stage number) off any
+        // trailing letter, and treat a sub-stage as a half-step for the
+        // percentage so the bar advances past stage 1 instead of stalling.
         if let Some(rest) = line.strip_prefix("Stage ") {
             if let Some((frac, name)) = rest.split_once(':') {
-                if let Some((n, t)) = frac.trim().split_once('/') {
+                if let Some((label, total)) = frac.trim().split_once('/') {
+                    let label = label.trim();
+                    let digits: String =
+                        label.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    let is_substage = !digits.is_empty() && digits.len() != label.len();
                     if let (Ok(n), Ok(t)) =
-                        (n.trim().parse::<u32>(), t.trim().parse::<u32>())
+                        (digits.parse::<u32>(), total.trim().parse::<u32>())
                     {
                         g.stage_idx = n;
                         g.stage_total = t.max(1);
                         g.stage_name = name.trim().to_string();
                         // Percentage tracks completed stages; the current
-                        // stage counts as in-progress (n-1 finished).
-                        g.pct = ((n.saturating_sub(1)) as f32 / g.stage_total as f32)
-                            * 100.0;
+                        // stage counts as in-progress (n-1 finished), and a
+                        // sub-stage (`1b`) sits a half-step past its parent.
+                        let completed =
+                            (n.saturating_sub(1)) as f32 + if is_substage { 0.5 } else { 0.0 };
+                        g.pct = (completed / g.stage_total as f32) * 100.0;
                     }
                 }
             }
@@ -171,7 +187,7 @@ fn finish(err: Option<String>) {
     }
 }
 
-/// What a tune run covers. `Full` = the 7-stage `tune --all` sweep for the
+/// What a tune run covers. `Full` = the 10-stage `tune --all` sweep for the
 /// selected model; `Placement` = just the CPU-vs-GPU dispatch measurement
 /// (`tune --placement`), the quick "tune CPU & GPUs" action.
 #[derive(Clone, Copy, PartialEq)]
@@ -214,7 +230,7 @@ pub fn run_autotune_blocking(
     cmd.arg("tune");
     match scope {
         TuneScope::Placement => {
-            // Single-stage run — `tune --placement` prints no "Stage N/7"
+            // Single-stage run — `tune --placement` prints no "Stage N/10"
             // header, so seed the stage label for the progress window.
             cmd.arg("--placement");
             if let Ok(mut g) = progress().lock() {
@@ -319,7 +335,7 @@ pub fn run_autotune_blocking(
 }
 
 /// Shared MANDATORY first-load auto-tune for BOTH the HTTP `/v1/models/load`
-/// handler (GUI) and the CLI `serve` startup load. Runs the full 7-stage
+/// handler (GUI) and the CLI `serve` startup load. Runs the full 10-stage
 /// sweep (blocking) whenever no tune is already in flight and this model has
 /// no tuner-cache entry for this device — so a fresh model is always tuned
 /// once, transparently, before it is served, and `serve` is as turnkey as
