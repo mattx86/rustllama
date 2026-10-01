@@ -328,6 +328,17 @@ fn converted_to_tensor(ct: ConvertedTensor) -> Tensor {
         // stay correct). Matvec / embedding dispatch on this dtype route
         // to the packed MLX kernels — no dequant here.
         ConvertedDtype::MlxAffineRaw => Dtype::MlxAffineRaw,
+        // MLX load-time transcoder output: the bytes are already standard
+        // GGUF Q4_1 / Q8_0 blocks — byte-identical to what the GGUF loader
+        // produces for these dtypes (see `bert_arch::tensor_from_info`), so
+        // they wrap verbatim and the SHARED packed-quant matvec / embedding
+        // kernels (CPU + SYCL + CUDA + MLX-Metal) pick them up with no new
+        // dispatch. The block layout runs along the innermost (`in`) dim,
+        // which is a multiple of 32, so blocks never cross a row boundary
+        // and the logical `[out, in]` shape in `ct.shape` keeps `check_shape`
+        // and the matvec `m`/`k` correct.
+        ConvertedDtype::Q4_1Raw => Dtype::Q4_1Raw,
+        ConvertedDtype::Q8_0Raw => Dtype::Q8_0Raw,
     };
     let strides = contiguous_strides(&ct.shape);
     Tensor {
@@ -358,6 +369,15 @@ fn converted_to_f32_vec(ct: &ConvertedTensor) -> Vec<f32> {
         // flat-f32 consumer.
         ConvertedDtype::MlxAffineRaw => unreachable!(
             "converted_to_f32_vec: MLX affine blob `{}` routed to the \
+             norm/bias f32-vec path — quantized weights must go through \
+             converted_to_tensor",
+            ct.gguf_name
+        ),
+        // Transcoded GGUF-quant linears never reach the norm/bias f32-vec
+        // path (same invariant as MlxAffineRaw above — only full-precision
+        // norms/biases do). Fail loudly if one ever does.
+        ConvertedDtype::Q4_1Raw | ConvertedDtype::Q8_0Raw => unreachable!(
+            "converted_to_f32_vec: GGUF-quant blob `{}` routed to the \
              norm/bias f32-vec path — quantized weights must go through \
              converted_to_tensor",
             ct.gguf_name

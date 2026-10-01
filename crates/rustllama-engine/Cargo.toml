@@ -14,6 +14,16 @@ default = []
 # KV mean-centering sidecar WRITING (calibration). Forwards to
 # `rustllama-models/kv-bias-write`; reading a sidecar needs no feature.
 kv-bias-write = ["rustllama-models/kv-bias-write"]
+# MLX load-time transcoder: on an MLX model load, dequantize each affine
+# quantized linear to f32 and RE-ENCODE it to a GGUF block-quant (Q4_1 /
+# Q8_0) so it runs on the shared, autotuned CPU/SYCL/CUDA/MLX-Metal quant
+# kernels (MLX on the GPU "for free"). Needs the gguf encode-side modules
+# (`rustllama_gguf::encode`). OFF (slim builds, `--no-default-features`) →
+# MLX linears stay packed as native `MlxAffineRaw` (CPU-only affine matvec),
+# the pre-transcode behavior. Enabled by the binary-level `encoder` feature
+# (cli/desktop), so the shipped GUI + normal builds get the transcode; the
+# slim server opts out with the rest of the encode-side tables.
+encoder = ["rustllama-gguf/encoder"]
 
 [dependencies]
 tokio.workspace = true

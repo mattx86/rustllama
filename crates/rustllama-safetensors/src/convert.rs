@@ -62,6 +62,23 @@ pub enum ConvertedDtype {
     /// dequant-to-f16. Emitted only by the MLX load path (`load_mlx`),
     /// never by the AWQ/GPTQ converter.
     MlxAffineRaw,
+    /// GGUF **Q4_1** block-quantized weight (block-32: f16 scale `d` +
+    /// f16 min `m` + 16 B of 4-bit codes). Emitted by the MLX load-time
+    /// **transcoder**: a 4-bit MLX-affine weight is dequantized to f32 and
+    /// re-encoded as Q4_1 — the *faithful* affine analog (both are
+    /// per-group `q·scale + bias`), so the 4→4-bit requant is near-lossless.
+    /// The point: the model then holds a STANDARD GGUF-quant tensor, so the
+    /// mature, autotuned CPU / SYCL / CUDA / MLX-Metal Q4_1 matvec +
+    /// embedding kernels run it with zero MLX-specific dispatch (MLX runs on
+    /// the GPU "for free"). `converted_to_tensor` wraps the bytes verbatim
+    /// as a [`rustllama_tensor::Dtype::Q4_1Raw`] tensor. Never emitted by
+    /// the AWQ/GPTQ converter.
+    Q4_1Raw,
+    /// GGUF **Q8_0** block-quantized weight (block-32: f16 scale + 32 × i8
+    /// codes). The 8-bit MLX transcode target — same rationale as
+    /// [`ConvertedDtype::Q4_1Raw`], Q8_0 being the GGUF symmetric-int8
+    /// analog. Wrapped as [`rustllama_tensor::Dtype::Q8_0Raw`].
+    Q8_0Raw,
 }
 
 #[derive(Debug, thiserror::Error)]

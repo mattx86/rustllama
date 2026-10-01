@@ -2137,17 +2137,21 @@ impl CpuEngine {
     ///     tokenizer.json      ← HF tokenizer
     /// ```
     ///
-    /// **B1 strategy — dequant-to-f16, then reuse the existing safetensors
-    /// builder.** Every affine weight is dequantized to a dense f16 tensor
-    /// keyed by the SAME GGUF slot the AWQ/GPTQ path targets
-    /// (`model.layers.0.self_attn.q_proj.weight` → `blk.0.attn_q.weight`),
-    /// producing the identical [`ConvertedTensor`] list
-    /// `convert_safetensors_to_gguf_tensors` yields, so
-    /// [`build_llama_model_from_safetensors`] and the whole arch/forward
-    /// stack are reused unchanged. Keeping the weights packed as
-    /// `MlxAffineQuant` and routing matvec through
-    /// `matvec_mlx_affine_w_f32_a` / mlx-c (native-residency) is the LATER
-    /// B2 slice — deliberately NOT attempted here.
+    /// **Strategy — load-time transcode to GGUF block-quant.** Each affine
+    /// weight is remapped to the SAME GGUF slot the AWQ/GPTQ path targets
+    /// (`model.layers.0.self_attn.q_proj.weight` → `blk.0.attn_q.weight`) and
+    /// re-encoded to a standard GGUF quant (4-bit → `Q4_1`, 8-bit → `Q8_0`;
+    /// see [`mlx_model_to_converted`]), producing the same
+    /// [`ConvertedTensor`] shape `convert_safetensors_to_gguf_tensors` yields
+    /// so [`build_llama_model_from_safetensors`] and the whole arch/forward
+    /// stack are reused unchanged — and, crucially, so the mature, autotuned
+    /// CPU/SYCL/CUDA/MLX-Metal quant kernels run the model with zero
+    /// MLX-specific dispatch (MLX on the GPU "for free"). The earlier
+    /// native-packed-residency step (`MlxAffineQuant` blobs + the CPU
+    /// `matvec_mlx_affine_*` path) survives only as the fallback for odd
+    /// bit-widths, `RUSTLLAMA_MLX_NATIVE=1`, and slim (`encoder`-off) builds.
+    ///
+    /// [`mlx_model_to_converted`]: Self::mlx_model_to_converted
     ///
     /// KV cache is F32 contiguous (same default as the GGUF + AWQ paths).
     ///
@@ -2227,7 +2231,7 @@ impl CpuEngine {
             ctx = ctx,
             quant_weights = n_quant,
             full_tensors = n_full,
-            "MLX model loaded (native-affine packed residency) — engine ready"
+            "MLX model loaded (affine → GGUF-quant transcode; GPU-capable) — engine ready"
         );
 
         let delta_net_cache = build_delta_net_cache(&model);
@@ -2280,11 +2284,16 @@ impl CpuEngine {
 
     /// Remap a loaded [`MlxModel`](rustllama_safetensors::MlxModel) into the
     /// GGUF-named [`ConvertedTensor`](rustllama_safetensors::ConvertedTensor)
-    /// list `build_llama_model_from_safetensors` consumes. B2: quantized
-    /// linears are kept **packed** as `ConvertedDtype::MlxAffineRaw` blobs
-    /// (native-affine residency — no dequant-to-f16); full-precision
-    /// tensors (norms, biases, unquantized embeddings) pass through as
-    /// f16/f32 as before.
+    /// list `build_llama_model_from_safetensors` consumes. Quantized linears
+    /// are **transcoded at load** to a GGUF block-quant (4-bit → `Q4_1`,
+    /// 8-bit → `Q8_0`) via [`mlx_quant_to_converted_bytes`], so the model
+    /// runs on the shared, autotuned CPU/SYCL/CUDA/MLX-Metal quant kernels
+    /// (MLX on the GPU "for free"); odd bit-widths, `RUSTLLAMA_MLX_NATIVE=1`,
+    /// and slim builds keep the native packed `MlxAffineRaw` blob instead.
+    /// Full-precision tensors (norms, biases, unquantized embeddings) pass
+    /// through as f16/f32.
+    ///
+    /// [`mlx_quant_to_converted_bytes`]: Self::mlx_quant_to_converted_bytes
     ///
     /// Two naming families are accepted so both real mlx-community
     /// checkpoints AND rustllama's own `quantize --to-mlx` exports load:
@@ -2343,17 +2352,31 @@ impl CpuEngine {
 
         let mut out = Vec::with_capacity(mlx.quant.len() + mlx.full.len());
 
-        // --- Quantized affine weights → packed self-describing blob -----
-        // B2: keep MLX-affine weights PACKED (no dequant-to-f16). Each
-        // weight serializes to the single `MlxAffineQuant::to_blob` byte
-        // buffer (header + packed codes + f16 scale/bias sidecars) and
-        // flows downstream as a `Dtype::MlxAffineRaw` tensor; the CPU
-        // matvec / embedding kernels decode it in place. This is ~4× less
-        // resident RAM than B1's f16 materialization (a 4-bit 0.5B drops
-        // from ~1 GB to ~278 MB) and the CPU foundation for the Apple
-        // Metal `quantized_matmul` fast path later. No transpose — MLX
-        // affine is already row-major `[out_features, in_features]` (see
-        // fn docs).
+        // --- Quantized affine weights → load-time GGUF-quant transcode ---
+        // "Transcode everywhere but Metal": each quantized MLX-affine linear
+        // is dequantized to f32 and RE-ENCODED to a standard GGUF block-quant
+        // (`mlx_quant_to_converted_bytes`) whose CPU / SYCL / CUDA / MLX-Metal
+        // matvec + embedding kernels are already mature and autotuned. The
+        // payoff: an MLX model then loads + runs as an ordinary quantized
+        // model on EVERY backend with ZERO MLX-specific dispatch — so MLX
+        // runs on the GPU "for free" via the existing Q4_1/Q8_0 kernels (the
+        // weight is `Dtype::Q4_1Raw`/`Q8_0Raw` from here on, indistinguishable
+        // from a GGUF model's).
+        //
+        // The native packed-affine blob (`MlxAffineRaw` + the CPU
+        // `matvec_mlx_affine_*` path, the B2 residency format) is kept only
+        // as the FALLBACK for: odd bit-widths (2/3/5/6, no faithful GGUF
+        // analog), `RUSTLLAMA_MLX_NATIVE=1` (force native for ALL weights —
+        // A/B the requant delta, exact-value parity, and the future Apple
+        // Metal `quantized_matmul` fast path), and slim builds without the
+        // `encoder` feature (no gguf encode tables). The target-format policy
+        // + requant rationale live on `mlx_quant_to_converted_bytes`. No
+        // transpose — MLX affine is already row-major
+        // `[out_features, in_features]` (see fn docs).
+        let force_native = std::env::var("RUSTLLAMA_MLX_NATIVE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let (mut n_q4_1, mut n_q8_0, mut n_native) = (0usize, 0usize, 0usize);
         for (module, q) in &mlx.quant {
             let Some(gguf_name) = quant_name_to_gguf(module) else {
                 tracing::debug!(
@@ -2364,13 +2387,28 @@ impl CpuEngine {
             };
             q.validate()
                 .map_err(|e| CpuEngineError::Other(format!("mlx weight `{module}`: {e}")))?;
+            let (dtype, bytes) = Self::mlx_quant_to_converted_bytes(q, force_native);
+            match dtype {
+                ConvertedDtype::Q4_1Raw => n_q4_1 += 1,
+                ConvertedDtype::Q8_0Raw => n_q8_0 += 1,
+                _ => n_native += 1,
+            }
             out.push(ConvertedTensor {
                 gguf_name,
                 shape: q.shape.clone(),
-                dtype: ConvertedDtype::MlxAffineRaw,
-                bytes: q.to_blob(),
+                dtype,
+                bytes,
             });
         }
+        tracing::info!(
+            transcoded_q4_1 = n_q4_1,
+            transcoded_q8_0 = n_q8_0,
+            kept_native_affine = n_native,
+            force_native,
+            "mlx load: quantized-linear transcode complete (affine → GGUF \
+             block-quant; native kept for odd-bit / RUSTLLAMA_MLX_NATIVE / \
+             slim build)"
+        );
 
         // --- Full-precision tensors → pass through ----------------------
         for (name, full) in &mlx.full {
@@ -2406,6 +2444,94 @@ impl CpuEngine {
         }
 
         Ok(out)
+    }
+
+    /// Choose the on-model representation for one quantized MLX-affine
+    /// linear and produce its bytes — the core of the load-time transcoder.
+    ///
+    /// Dequantizes the packed affine weight to f32 and re-encodes it to the
+    /// GGUF block-quant whose shared CPU/SYCL/CUDA/MLX-Metal matvec +
+    /// embedding kernels are already mature and autotuned:
+    ///
+    /// **Target-format policy** (the one requant choice that matters):
+    ///   - **4-bit → `Q4_1`.** Q4_1 is block-32 with an f16 scale `d` + f16
+    ///     min `m` — the *faithful affine analog* of MLX's group `scale·q +
+    ///     bias`, so the 4→4-bit requant is near-lossless. Block-32 also fits
+    ///     almost any column count: `in_features` is always a multiple of the
+    ///     32/64/128 MLX group size, hence a multiple of 32, so blocks never
+    ///     cross a weight-row boundary. (Q4_K is higher quality-per-bit but
+    ///     needs `cols % 256 == 0`, which many model dims fail — so Q4_1 is
+    ///     the robust default. See the module TODO for the opt-in Q4_K path.)
+    ///   - **8-bit → `Q8_0`** (block-32, symmetric int8 — the GGUF analog).
+    ///
+    /// Falls back to the native packed `MlxAffineRaw` blob (decoded by the
+    /// CPU `matvec_mlx_affine_*` path) when: `force_native` is set
+    /// (`RUSTLLAMA_MLX_NATIVE=1`), the bit-width is one of 2/3/5/6 (no
+    /// faithful GGUF analog), or — defensively — the element count isn't a
+    /// multiple of 32 (which a real MLX weight never hits). The
+    /// `#[cfg(not(feature = "encoder"))]` twin below handles slim builds that
+    /// ship no gguf encode tables: there every weight stays native.
+    #[cfg(feature = "encoder")]
+    fn mlx_quant_to_converted_bytes(
+        q: &rustllama_tensor::MlxAffineQuant,
+        force_native: bool,
+    ) -> (rustllama_safetensors::ConvertedDtype, Vec<u8>) {
+        use rustllama_safetensors::ConvertedDtype;
+
+        let n = q.n_elements() as usize;
+        // `0` = keep native affine. `force_native` or a non-block-32 count
+        // short-circuits before any dequant work.
+        let target_bits = if force_native || n % 32 != 0 { 0 } else { q.bits };
+
+        match target_bits {
+            4 => {
+                let f32buf = Self::mlx_dequant_affine_f32(q, n);
+                // Q4_1: 20 B / 32-weight block (f16 d + f16 min + 16 B codes).
+                let mut enc = vec![0u8; (n / 32) * 20];
+                rustllama_gguf::encode::encode_q4_1(&f32buf, &mut enc);
+                (ConvertedDtype::Q4_1Raw, enc)
+            }
+            8 => {
+                let f32buf = Self::mlx_dequant_affine_f32(q, n);
+                // Q8_0: 34 B / 32-weight block (f16 d + 32 × i8 codes).
+                let mut enc = vec![0u8; (n / 32) * 34];
+                rustllama_gguf::encode::encode_q8_0(&f32buf, &mut enc);
+                (ConvertedDtype::Q8_0Raw, enc)
+            }
+            // Native fallback: odd bit-width (2/3/5/6), RUSTLLAMA_MLX_NATIVE=1,
+            // or a non-block-32 geometry.
+            _ => (ConvertedDtype::MlxAffineRaw, q.to_blob()),
+        }
+    }
+
+    /// Slim-build twin of [`mlx_quant_to_converted_bytes`]: without the
+    /// `encoder` feature there are no gguf encode-side tables, so every MLX
+    /// affine weight stays packed as native `MlxAffineRaw` (CPU-only affine
+    /// matvec) — the pre-transcode behavior.
+    #[cfg(not(feature = "encoder"))]
+    fn mlx_quant_to_converted_bytes(
+        q: &rustllama_tensor::MlxAffineQuant,
+        _force_native: bool,
+    ) -> (rustllama_safetensors::ConvertedDtype, Vec<u8>) {
+        (rustllama_safetensors::ConvertedDtype::MlxAffineRaw, q.to_blob())
+    }
+
+    /// Dequantize one packed MLX-affine weight to a flat f32 buffer in
+    /// `[out_features, in_features]` row-major order (the layout the GGUF
+    /// encoders + llama builder consume — no transpose). Shared by the Q4_1
+    /// and Q8_0 transcode arms of [`mlx_quant_to_converted_bytes`].
+    #[cfg(feature = "encoder")]
+    fn mlx_dequant_affine_f32(q: &rustllama_tensor::MlxAffineQuant, n: usize) -> Vec<f32> {
+        let mut f32buf = vec![0f32; n];
+        rustllama_kernels_cpu::mlx_affine::dequantize_mlx_affine(
+            &q.packed,
+            &q.scales,
+            &q.biases,
+            q.group_size,
+            q.bits,
+            &mut f32buf,
+        );
+        f32buf
     }
 
     /// Test-only hook: install a pre-loaded vision tower and a chosen

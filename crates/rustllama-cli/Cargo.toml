@@ -15,8 +15,17 @@ description = "Clap-based CLI subcommand library for rustllama (no main; dispatc
 # passes `--no-default-features` to drop them.
 default = ["encoder", "history", "tree-sitter", "tui"]
 # `rustllama quantize` / GPU IQ encode. Gates the clap subcommand and
-# the gguf encode-side tables (~3-6 MB .text).
-encoder = ["rustllama-gguf/encoder", "rustllama-kernels-sycl/encoder", "rustllama-engine/kv-bias-write"]
+# the gguf encode-side tables (~3-6 MB .text). Also turns on the engine's
+# MLX load-time transcoder (`rustllama-engine/encoder`): with the encode
+# tables present, an MLX model requants to GGUF Q4_1/Q8_0 at load so it
+# runs on the shared GPU quant kernels (slim server, encoder off, keeps the
+# native-affine CPU path).
+encoder = [
+    "rustllama-gguf/encoder",
+    "rustllama-kernels-sycl/encoder",
+    "rustllama-engine/kv-bias-write",
+    "rustllama-engine/encoder",
+]
 # Conversation-history sqlite store (GUI Chat sidebar + `rustllama
 # conv`). ~10.9 MB of bundled sqlite in the static binary.
 history = ["rustllama-server/history"]
