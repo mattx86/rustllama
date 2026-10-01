@@ -2893,6 +2893,7 @@ fn token_logprob_chunk_json(
 mod tests {
     use super::{
         apply_response_format, build_sampling, chunk_json, chunk_json_with_fp,
+        parse_ask_user_args, with_reserved_ask_user_tool, ASK_USER_TOOL_NAME,
         chunk_text_delta_into, extract_tool_schemas, longest_suffix_that_is_prefix_of,
         make_token_logprob_out, openai_content_block_to_text, parse_tool_call_body,
         parse_tool_calls, parse_tool_choice, token_logprob_chunk_json, wire_messages_to_engine,
