@@ -338,6 +338,13 @@ fn converted_to_tensor(ct: ConvertedTensor) -> Tensor {
         // and the logical `[out, in]` shape in `ct.shape` keeps `check_shape`
         // and the matvec `m`/`k` correct.
         ConvertedDtype::Q4_1Raw => Dtype::Q4_1Raw,
+        // Q4_K super-blocks (256 weights) wrap identically to Q4_1: the bytes
+        // are byte-identical to the GGUF loader's Q4_K output, and the
+        // transcoder only picks Q4_K when `in_features % 256 == 0`, so a
+        // super-block never crosses the innermost (`in`) row boundary — the
+        // same no-cross invariant that keeps `[out, in]` `check_shape` + the
+        // matvec `m`/`k` correct.
+        ConvertedDtype::Q4_KRaw => Dtype::Q4_KRaw,
         ConvertedDtype::Q8_0Raw => Dtype::Q8_0Raw,
     };
     let strides = contiguous_strides(&ct.shape);
@@ -376,12 +383,14 @@ fn converted_to_f32_vec(ct: &ConvertedTensor) -> Vec<f32> {
         // Transcoded GGUF-quant linears never reach the norm/bias f32-vec
         // path (same invariant as MlxAffineRaw above — only full-precision
         // norms/biases do). Fail loudly if one ever does.
-        ConvertedDtype::Q4_1Raw | ConvertedDtype::Q8_0Raw => unreachable!(
-            "converted_to_f32_vec: GGUF-quant blob `{}` routed to the \
-             norm/bias f32-vec path — quantized weights must go through \
-             converted_to_tensor",
-            ct.gguf_name
-        ),
+        ConvertedDtype::Q4_1Raw | ConvertedDtype::Q4_KRaw | ConvertedDtype::Q8_0Raw => {
+            unreachable!(
+                "converted_to_f32_vec: GGUF-quant blob `{}` routed to the \
+                 norm/bias f32-vec path — quantized weights must go through \
+                 converted_to_tensor",
+                ct.gguf_name
+            )
+        }
     }
 }
 

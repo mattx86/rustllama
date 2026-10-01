@@ -2376,7 +2376,8 @@ impl CpuEngine {
         let force_native = std::env::var("RUSTLLAMA_MLX_NATIVE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let (mut n_q4_1, mut n_q8_0, mut n_native) = (0usize, 0usize, 0usize);
+        let (mut n_q4_1, mut n_q4_k, mut n_q8_0, mut n_native) =
+            (0usize, 0usize, 0usize, 0usize);
         for (module, q) in &mlx.quant {
             let Some(gguf_name) = quant_name_to_gguf(module) else {
                 tracing::debug!(
@@ -2390,6 +2391,7 @@ impl CpuEngine {
             let (dtype, bytes) = Self::mlx_quant_to_converted_bytes(q, force_native);
             match dtype {
                 ConvertedDtype::Q4_1Raw => n_q4_1 += 1,
+                ConvertedDtype::Q4_KRaw => n_q4_k += 1,
                 ConvertedDtype::Q8_0Raw => n_q8_0 += 1,
                 _ => n_native += 1,
             }
@@ -2402,6 +2404,7 @@ impl CpuEngine {
         }
         tracing::info!(
             transcoded_q4_1 = n_q4_1,
+            transcoded_q4_k = n_q4_k,
             transcoded_q8_0 = n_q8_0,
             kept_native_affine = n_native,
             force_native,
@@ -2454,14 +2457,20 @@ impl CpuEngine {
     /// embedding kernels are already mature and autotuned:
     ///
     /// **Target-format policy** (the one requant choice that matters):
-    ///   - **4-bit → `Q4_1`.** Q4_1 is block-32 with an f16 scale `d` + f16
-    ///     min `m` — the *faithful affine analog* of MLX's group `scale·q +
-    ///     bias`, so the 4→4-bit requant is near-lossless. Block-32 also fits
-    ///     almost any column count: `in_features` is always a multiple of the
-    ///     32/64/128 MLX group size, hence a multiple of 32, so blocks never
-    ///     cross a weight-row boundary. (Q4_K is higher quality-per-bit but
-    ///     needs `cols % 256 == 0`, which many model dims fail — so Q4_1 is
-    ///     the robust default. See the module TODO for the opt-in Q4_K path.)
+    ///   - **4-bit → `Q4_K` when `in_features % 256 == 0`, else `Q4_1`.**
+    ///     Q4_K (256-weight super-blocks: 6-bit sub-scales under an f16 super
+    ///     `d`/`dmin`) is higher quality-per-bit than Q4_1 — its two-level
+    ///     scale structure spends fewer bits on per-group metadata — so it's
+    ///     the preferred 4-bit target. But Q4_K quantizes each row in
+    ///     super-blocks of 256, so the row length (`in_features`, the
+    ///     quantized/contraction dim) must be a multiple of 256 or a
+    ///     super-block would straddle a weight-row boundary. Rows that aren't
+    ///     256-aligned fall back to **Q4_1**: block-32 with an f16 scale `d` +
+    ///     f16 min `m` — the *faithful affine analog* of MLX's group `scale·q
+    ///     + bias`, and block-32 fits any column count (`in_features` is
+    ///     always a multiple of the 32/64/128 MLX group size, hence of 32, so
+    ///     its blocks never cross a row boundary either). Both 4→4-bit
+    ///     requants are near-lossless.
     ///   - **8-bit → `Q8_0`** (block-32, symmetric int8 — the GGUF analog).
     ///
     /// Falls back to the native packed `MlxAffineRaw` blob (decoded by the
@@ -2486,10 +2495,26 @@ impl CpuEngine {
         match target_bits {
             4 => {
                 let f32buf = Self::mlx_dequant_affine_f32(q, n);
-                // Q4_1: 20 B / 32-weight block (f16 d + f16 min + 16 B codes).
-                let mut enc = vec![0u8; (n / 32) * 20];
-                rustllama_gguf::encode::encode_q4_1(&f32buf, &mut enc);
-                (ConvertedDtype::Q4_1Raw, enc)
+                // Prefer **Q4_K** when the row length (`in_features`, the
+                // quantized/contraction dim) is a multiple of QK_K = 256. Q4_K
+                // is higher quality-per-bit than Q4_1, but it quantizes each
+                // row in 256-weight super-blocks, so a 256-aligned
+                // `in_features` is required to keep every super-block inside
+                // one weight row — the no-cross-row invariant Q4_1's block-32
+                // gets for free. (`n` is then a multiple of 256 too, since
+                // `n = out_features * in_features`.) Otherwise fall back to
+                // Q4_1 (block-32 fits any multiple of 32).
+                if q.in_features() % 256 == 0 {
+                    // Q4_K: 144 B / 256-weight super-block.
+                    let mut enc = vec![0u8; (n / 256) * 144];
+                    rustllama_gguf::encode_k::encode_q4_k(&f32buf, &mut enc);
+                    (ConvertedDtype::Q4_KRaw, enc)
+                } else {
+                    // Q4_1: 20 B / 32-weight block (f16 d + f16 min + 16 B codes).
+                    let mut enc = vec![0u8; (n / 32) * 20];
+                    rustllama_gguf::encode::encode_q4_1(&f32buf, &mut enc);
+                    (ConvertedDtype::Q4_1Raw, enc)
+                }
             }
             8 => {
                 let f32buf = Self::mlx_dequant_affine_f32(q, n);

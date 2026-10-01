@@ -50,6 +50,10 @@ pub struct ConvertedTensor {
 /// dtypes the model loader expects; A-2c plugs these into
 /// `Tensor::from_storage`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Variant naming follows the GGUF format-name convention (`Q4_1`, `Q4_K`,
+// `Q8_0`) rather than strict Rust CamelCase, matching `rustllama_tensor::Dtype`
+// so each variant maps 1:1 to its tensor dtype at a glance.
+#[allow(non_camel_case_types)]
 pub enum ConvertedDtype {
     F32,
     F16,
@@ -74,6 +78,21 @@ pub enum ConvertedDtype {
     /// as a [`rustllama_tensor::Dtype::Q4_1Raw`] tensor. Never emitted by
     /// the AWQ/GPTQ converter.
     Q4_1Raw,
+    /// GGUF **Q4_K** super-block-quantized weight (QK_K=256: 6-bit sub-scales
+    /// + f16 super d/dmin + 128 B of 4-bit codes, 144 B / 256-weight block).
+    /// The *preferred* 4-bit MLX transcode target — Q4_K is higher
+    /// quality-per-bit than Q4_1 (its two-level scale structure spends fewer
+    /// bits on per-group metadata), so the transcoder picks it over
+    /// [`ConvertedDtype::Q4_1Raw`] whenever the weight's contraction dim
+    /// (`in_features`, the quantized row length) is a multiple of **256** —
+    /// the alignment Q4_K requires so a 256-weight super-block never straddles
+    /// a weight-row boundary. Rows that aren't 256-aligned fall back to Q4_1
+    /// (block-32, fits any multiple of 32). Same "transcode to a standard
+    /// GGUF-quant so every backend's mature kernels run it" rationale as
+    /// [`ConvertedDtype::Q4_1Raw`]. Wrapped verbatim as
+    /// [`rustllama_tensor::Dtype::Q4_KRaw`]. Never emitted by the AWQ/GPTQ
+    /// converter.
+    Q4_KRaw,
     /// GGUF **Q8_0** block-quantized weight (block-32: f16 scale + 32 × i8
     /// codes). The 8-bit MLX transcode target — same rationale as
     /// [`ConvertedDtype::Q4_1Raw`], Q8_0 being the GGUF symmetric-int8
