@@ -52,6 +52,9 @@
 //!   reference stays as the cross-backend parity oracle (as the MXFP/CUDA
 //!   parity harness uses the scalar kernels today).
 
+use half::f16;
+use rustllama_tensor::MlxAffineBlobView;
+
 /// Read `bits` bits starting at absolute bit offset `bit_pos` from a
 /// little-endian bit buffer, LSB-first. `bits` must be ≤ 32.
 ///
@@ -283,6 +286,130 @@ pub fn matvec_mlx_affine_w_f32_a(
             }
         }
         out[i] = acc;
+    }
+}
+
+// ============================================================
+// MLX affine BLOB kernels — the self-describing-blob production path
+// ============================================================
+//
+// `matvec_mlx_affine_w_f32_a` / `dequantize_mlx_affine` above are the
+// correctness-first references that take the three arrays as separate
+// f32 scale/bias slices. In the engine, an MLX weight is kept **packed**
+// as a single [`MlxAffineBlobView`] blob (a `Dtype::MlxAffineRaw`
+// tensor's bytes) with the scale/bias sidecar still f16. These wrappers
+// parse that blob, widen the f16 sidecar, and route straight through the
+// reference matvec — so the packed weight is never dequantized to f16 at
+// load time (~4× less resident RAM), exactly like the GGUF `*Raw` path.
+//
+// TODO(mlx-perf): decode the f16 sidecar into a reusable per-thread
+// scratch (or read f16 inline in the loop) to drop the per-call `Vec`
+// alloc; plus the AVX2/AVX-512 decode+FMA noted on the reference kernel.
+// TODO(mlx-metal): on Apple Silicon this decode is a no-op — route the
+// blob's packed codes to mlx-c `mlx_quantized_matmul` (native Metal
+// `qmv`/`qmm`) instead of the CPU decode.
+
+/// Widen a little-endian f16 sidecar (`scales`/`biases`) to f32.
+pub fn decode_f16_sidecar(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect()
+}
+
+/// Serial MLX-affine matvec over a packed blob (`[m, k]` weight × f32
+/// activations). Parses the blob, widens the f16 sidecar, and calls the
+/// reference [`matvec_mlx_affine_w_f32_a`]. Used by the nested-rayon-safe
+/// `matvec_tensor_serial` dispatch.
+pub fn matvec_mlx_affine_blob_w_f32_a(
+    bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    let view = MlxAffineBlobView::parse(bytes)
+        .expect("matvec_mlx_affine_blob: malformed MLX affine blob");
+    assert_eq!(view.rows, m, "mlx blob rows vs m");
+    assert_eq!(view.cols, k, "mlx blob cols vs k");
+    let scales = decode_f16_sidecar(view.scales_f16);
+    let biases = decode_f16_sidecar(view.biases_f16);
+    matvec_mlx_affine_w_f32_a(
+        view.packed, &scales, &biases, view.group_size, view.bits, x, out, m, k,
+    );
+}
+
+/// Row-parallel MLX-affine blob matvec: splits the output (`m`) axis into
+/// contiguous `chunk_rows`-row bands and runs the reference matvec on
+/// each band's packed + sidecar sub-slice. Bitwise-identical to the
+/// serial call — only the row range differs, per-row accumulation is the
+/// same code. Each row is byte-aligned in the packed stream (row =
+/// `k*bits` bits, `k` a multiple of `group_size` ≥ 32) and its groups are
+/// contiguous in the sidecar, so a row band slices out cleanly.
+pub fn matvec_mlx_affine_blob_w_f32_a_parallel(
+    bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    chunk_rows: usize,
+) {
+    use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+    use rayon::slice::ParallelSliceMut;
+
+    let view = MlxAffineBlobView::parse(bytes)
+        .expect("matvec_mlx_affine_blob_parallel: malformed MLX affine blob");
+    assert_eq!(view.rows, m, "mlx blob rows vs m");
+    assert_eq!(view.cols, k, "mlx blob cols vs k");
+    // Widen the whole sidecar once; each band indexes its own slice.
+    let scales = decode_f16_sidecar(view.scales_f16);
+    let biases = decode_f16_sidecar(view.biases_f16);
+    let gpr = view.groups_per_row(); // groups per output row
+    let row_pbytes = k * view.bits as usize / 8; // packed bytes per row (byte-aligned)
+    let chunk_rows = chunk_rows.max(1);
+    out.par_chunks_mut(chunk_rows).enumerate().for_each(|(ci, oc)| {
+        let r0 = ci * chunk_rows;
+        let nr = oc.len();
+        matvec_mlx_affine_w_f32_a(
+            &view.packed[r0 * row_pbytes..(r0 + nr) * row_pbytes],
+            &scales[r0 * gpr..(r0 + nr) * gpr],
+            &biases[r0 * gpr..(r0 + nr) * gpr],
+            view.group_size,
+            view.bits,
+            x,
+            oc,
+            nr,
+            k,
+        );
+    });
+}
+
+/// Embedding row-gather from a packed MLX-affine blob: dequantize only
+/// the rows named by `ids` (each row = `d` elements) into `out`, in F32.
+/// The MLX-quantized token-embedding table stays packed; this decodes
+/// per requested row (typically one per token) rather than materializing
+/// the whole `[vocab, d]` table. Row `id`'s packed codes + its groups'
+/// f16 scales/biases slice out directly (see [`MlxAffineBlobView`]).
+pub fn embed_lookup_mlx_affine_blob(bytes: &[u8], ids: &[i32], out: &mut [f32], d: usize) {
+    let view = MlxAffineBlobView::parse(bytes)
+        .expect("embed_lookup_mlx_affine_blob: malformed MLX affine blob");
+    assert_eq!(view.cols, d, "mlx embed blob cols vs d");
+    let gpr = view.groups_per_row();
+    let row_pbytes = d * view.bits as usize / 8;
+    for (i, &id) in ids.iter().enumerate() {
+        let id = id as usize;
+        let p0 = id * row_pbytes;
+        let packed_row = &view.packed[p0..p0 + row_pbytes];
+        let scales = decode_f16_sidecar(&view.scales_f16[id * gpr * 2..(id + 1) * gpr * 2]);
+        let biases = decode_f16_sidecar(&view.biases_f16[id * gpr * 2..(id + 1) * gpr * 2]);
+        dequantize_mlx_affine(
+            packed_row,
+            &scales,
+            &biases,
+            view.group_size,
+            view.bits,
+            &mut out[i * d..(i + 1) * d],
+        );
     }
 }
 
@@ -531,6 +658,99 @@ mod tests {
                     want[i],
                 );
             }
+        }
+    }
+
+    /// Build an `MlxAffineQuant` for a random `[m, k]` weight, serialize
+    /// to a blob, and confirm the blob matvec (serial AND parallel)
+    /// reproduces a reference matvec run on the **same f16-rounded**
+    /// sidecar — bit-for-bit. This isolates the blob parse/slice/dispatch
+    /// plumbing from the (expected, mlx-lm-matching) f16 sidecar precision
+    /// loss: feeding both paths identical inputs, the blob path must equal
+    /// the reference exactly. This is the production path the engine runs.
+    #[test]
+    fn blob_matvec_matches_f16_sidecar_reference_bit_exact() {
+        use rustllama_tensor::MlxAffineQuant;
+        for &(group_size, bits) in &[(32usize, 8u32), (64, 4), (128, 6), (64, 3)] {
+            let m = 130usize; // > a couple of parallel bands
+            let k = group_size * 3;
+            let n = m * k;
+            let weights: Vec<f32> = (0..n).map(pseudo_f32).collect();
+            let x: Vec<f32> = (0..k).map(|c| (c as f32) * 0.004 - 0.3).collect();
+            let (packed, scales, biases) = quantize_mlx_affine(&weights, group_size, bits);
+
+            let q = MlxAffineQuant {
+                packed: packed.into(),
+                scales,
+                biases,
+                group_size,
+                bits,
+                shape: vec![m as u64, k as u64],
+                name: "w".into(),
+            };
+            let blob = q.to_blob();
+
+            // Reference: the blob stores the sidecar as f16, so decode it
+            // back to f32 and run the reference kernel on THOSE values —
+            // identical inputs to the blob path.
+            let scales_f16: Vec<f32> =
+                q.scales.iter().map(|&s| f16::from_f32(s).to_f32()).collect();
+            let biases_f16: Vec<f32> =
+                q.biases.iter().map(|&b| f16::from_f32(b).to_f32()).collect();
+            let mut want = vec![0f32; m];
+            matvec_mlx_affine_w_f32_a(
+                &q.packed, &scales_f16, &biases_f16, group_size, bits, &x, &mut want, m, k,
+            );
+
+            let mut got = vec![0f32; m];
+            matvec_mlx_affine_blob_w_f32_a(&blob, &x, &mut got, m, k);
+            assert_eq!(got, want, "serial gs={group_size} bits={bits}");
+
+            let mut got_par = vec![0f32; m];
+            matvec_mlx_affine_blob_w_f32_a_parallel(&blob, &x, &mut got_par, m, k, 64);
+            // Parallel vs serial blob matvec must be bit-identical (same
+            // decode, only the row range differs).
+            assert_eq!(got_par, want, "parallel gs={group_size} bits={bits}");
+        }
+    }
+
+    /// Embedding gather from the blob must equal dequantizing the whole
+    /// table then indexing the requested rows.
+    #[test]
+    fn blob_embed_lookup_matches_full_dequant() {
+        use rustllama_tensor::MlxAffineQuant;
+        let (group_size, bits) = (64usize, 4u32);
+        let vocab = 20usize;
+        let d = group_size * 2; // 128
+        let n = vocab * d;
+        let weights: Vec<f32> = (0..n).map(pseudo_f32).collect();
+        let (packed, scales, biases) = quantize_mlx_affine(&weights, group_size, bits);
+
+        let q = MlxAffineQuant {
+            packed: packed.into(),
+            scales,
+            biases,
+            group_size,
+            bits,
+            shape: vec![vocab as u64, d as u64],
+            name: "token_embd".into(),
+        };
+        let blob = q.to_blob();
+
+        // Reference: full-table dequant on the SAME f16-rounded sidecar
+        // the blob stores, so the gather must match bit-for-bit.
+        let scales_f16: Vec<f32> = q.scales.iter().map(|&s| f16::from_f32(s).to_f32()).collect();
+        let biases_f16: Vec<f32> = q.biases.iter().map(|&b| f16::from_f32(b).to_f32()).collect();
+        let mut full = vec![0f32; n];
+        dequantize_mlx_affine(&q.packed, &scales_f16, &biases_f16, group_size, bits, &mut full);
+
+        let ids = [0i32, 5, 19, 5, 12];
+        let mut looked = vec![0f32; ids.len() * d];
+        embed_lookup_mlx_affine_blob(&blob, &ids, &mut looked, d);
+        for (i, &id) in ids.iter().enumerate() {
+            let want = &full[(id as usize) * d..(id as usize + 1) * d];
+            let got = &looked[i * d..(i + 1) * d];
+            assert_eq!(got, want, "embed row {id}");
         }
     }
 }

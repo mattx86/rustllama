@@ -53,6 +53,15 @@ pub struct ConvertedTensor {
 pub enum ConvertedDtype {
     F32,
     F16,
+    /// Apple MLX **affine** quantized weight kept packed: the `bytes`
+    /// payload is the single self-describing blob built by
+    /// [`rustllama_tensor::MlxAffineQuant::to_blob`] (header + packed
+    /// codes + f16 scale/bias sidecars), which
+    /// `converted_to_tensor` wraps verbatim as a
+    /// [`rustllama_tensor::Dtype::MlxAffineRaw`] tensor — no
+    /// dequant-to-f16. Emitted only by the MLX load path (`load_mlx`),
+    /// never by the AWQ/GPTQ converter.
+    MlxAffineRaw,
 }
 
 #[derive(Debug, thiserror::Error)]

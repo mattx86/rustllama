@@ -149,9 +149,16 @@ fn collect_tensors(weights: &LlamaWeights) -> Vec<TensorInfo> {
     // Plain fn (not a closure) so multiple call sites don't fight over a `&mut
     // out` borrow.
     fn info_of(t: &Tensor) -> TensorInfo {
+        // MLX-affine blobs have no `byte_size(element_count)`; use the
+        // actual blob length (mirrors `per_layer_weight_bytes`).
+        let bytes = if t.dtype == rustllama_tensor::Dtype::MlxAffineRaw {
+            t.storage.len_bytes() as u64
+        } else {
+            t.dtype.byte_size(t.element_count())
+        };
         TensorInfo {
             name: t.name.clone(),
-            bytes: t.dtype.byte_size(t.element_count()),
+            bytes,
             heat: classify_heat(&t.name),
             is_attn: is_attn_tensor(&t.name),
         }

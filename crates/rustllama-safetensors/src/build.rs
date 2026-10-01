@@ -322,6 +322,12 @@ fn converted_to_tensor(ct: ConvertedTensor) -> Tensor {
     let dtype = match ct.dtype {
         ConvertedDtype::F32 => Dtype::F32,
         ConvertedDtype::F16 => Dtype::F16,
+        // MLX affine: the bytes are already the packed self-describing
+        // blob; wrap them verbatim (the logical `[out, in]` shape is
+        // carried in `ct.shape`, so `check_shape` and the matvec `m`/`k`
+        // stay correct). Matvec / embedding dispatch on this dtype route
+        // to the packed MLX kernels — no dequant here.
+        ConvertedDtype::MlxAffineRaw => Dtype::MlxAffineRaw,
     };
     let strides = contiguous_strides(&ct.shape);
     Tensor {
@@ -344,6 +350,18 @@ fn converted_to_f32_vec(ct: &ConvertedTensor) -> Vec<f32> {
             let f16s: &[f16] = cast_slice(&ct.bytes);
             f16s.iter().map(|h| h.to_f32()).collect()
         }
+        // Only norm / bias slots (always full-precision in an MLX
+        // checkpoint — RMSNorm weights, linear biases) reach this f32-vec
+        // path; quantized linears route through `converted_to_tensor`.
+        // An MLX-affine blob here would mean a norm got mis-classified as
+        // quantized, so fail loudly rather than feed a packed blob to a
+        // flat-f32 consumer.
+        ConvertedDtype::MlxAffineRaw => unreachable!(
+            "converted_to_f32_vec: MLX affine blob `{}` routed to the \
+             norm/bias f32-vec path — quantized weights must go through \
+             converted_to_tensor",
+            ct.gguf_name
+        ),
     }
 }
 

@@ -16,7 +16,9 @@ use rustllama_gguf::{GgmlType, Gguf, GgufError, TensorInfo};
 /// module because an MLX weight is three sibling tensors (packed codes +
 /// scales + biases), which doesn't fit the single-`Storage` [`Tensor`].
 pub mod mlx_affine;
-pub use mlx_affine::{MlxAffineError, MlxAffineQuant};
+pub use mlx_affine::{
+    MlxAffineBlobView, MlxAffineError, MlxAffineQuant, MLX_AFFINE_BLOB_HEADER_BYTES,
+};
 
 /// Logical compute device.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -291,6 +293,35 @@ pub enum Dtype {
     /// separate argument. Reconstruction `tensor_scale *
     /// e4m3_decode(byte)`.
     Fp8Raw,
+    /// Apple **MLX affine** quantized weight, kept packed in a single
+    /// self-describing blob (no dequant-to-f16 at load — the CPU
+    /// foundation for the Metal `quantized_matmul` fast path).
+    ///
+    /// Unlike the GGUF `*Raw` formats above — one contiguous buffer with
+    /// fixed block geometry and the scale baked per block — an MLX affine
+    /// weight is three sibling arrays (packed codes + per-group scales +
+    /// per-group biases) with **per-tensor** `group_size` ∈ {32,64,128}
+    /// and `bits` ∈ {2,3,4,5,6,8} that aren't derivable from the element
+    /// count. So the blob carries a 16-byte header describing the
+    /// geometry, then the three regions:
+    ///
+    /// ```text
+    ///   [0..4)   group_size : u32 LE
+    ///   [4..8)   bits       : u32 LE
+    ///   [8..12)  rows (out_features) : u32 LE
+    ///   [12..16) cols (in_features)  : u32 LE
+    ///   [16 ..)  packed  : rows*cols*bits/8 bytes (LSB-first bitstream)
+    ///   then     scales  : rows*cols/group_size × f16 LE
+    ///   then     biases  : rows*cols/group_size × f16 LE
+    /// ```
+    ///
+    /// The layout (writer [`mlx_affine::MlxAffineQuant::to_blob`], reader
+    /// [`mlx_affine::MlxAffineBlobView`]) lives in the `mlx_affine` module.
+    /// Matvec / embedding dispatch on this dtype route to the packed CPU
+    /// kernel (`rustllama_kernels_cpu::mlx_affine`), which decodes the
+    /// f16 sidecar and runs `matvec_mlx_affine_w_f32_a` on the packed
+    /// codes directly — ~4× less resident RAM than dequant-to-f16.
+    MlxAffineRaw,
 }
 
 impl Dtype {
@@ -422,6 +453,22 @@ impl Dtype {
             // FP8 (E4M3, per-tensor scale): 1 byte per element, the
             // scale lives in GGUF metadata (not the weight bytes).
             Self::Fp8Raw => n_elements,
+            // MLX affine: the blob byte count depends on the per-tensor
+            // `bits` + `group_size` (and the f16 scale/bias sidecar),
+            // NONE of which is recoverable from the element count alone —
+            // so an exact `byte_size(n_elements)` doesn't exist for this
+            // format. Callers that need an MLX weight's resident size must
+            // read `tensor.storage.len_bytes()` (the true blob length)
+            // instead; the placement byte-accounting paths do exactly
+            // that. This arm is a tripwire: if some future generic path
+            // reaches it, the panic points at the fix rather than
+            // silently mis-budgeting VRAM.
+            Self::MlxAffineRaw => panic!(
+                "Dtype::byte_size is not defined for MlxAffineRaw — its \
+                 blob size depends on per-tensor bits/group_size + the f16 \
+                 sidecar (not the element count); use \
+                 `tensor.storage.len_bytes()` for the resident byte count"
+            ),
         }
     }
 }

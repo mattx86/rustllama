@@ -408,6 +408,12 @@ pub fn per_layer_weight_bytes(
         {
             return 0;
         }
+        // MLX-affine blobs have no `byte_size(element_count)` (per-tensor
+        // bits/group_size aren't recoverable from the element count); their
+        // true resident size is the blob length.
+        if t.dtype == rustllama_tensor::Dtype::MlxAffineRaw {
+            return t.storage.len_bytes() as u64;
+        }
         t.dtype.byte_size(t.element_count())
     };
     let count_opt = |t: &Option<Tensor>| -> u64 {

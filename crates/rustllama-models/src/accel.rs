@@ -285,6 +285,15 @@ fn dtype_to_mlx_kind(dtype: Dtype) -> Option<mk::MlxPackedKind> {
         Dtype::Mxfp4Raw => Some(mk::MlxPackedKind::Mxfp4),
         Dtype::Mxfp6Raw => Some(mk::MlxPackedKind::Mxfp6),
         Dtype::Mxfp8Raw => Some(mk::MlxPackedKind::Mxfp8),
+        // TODO(mlx-metal): `Dtype::MlxAffineRaw` (Apple MLX affine, kept
+        // packed) would route here to a native `mlx_quantized_matmul`
+        // (Metal `qmv`/`qmm`) on Apple Silicon — the whole point of the
+        // packed-residency format. Until that kernel lands it falls to
+        // `None` → the CPU `matvec_mlx_affine_blob_*` path (the must-have,
+        // and the only path on this Windows/Intel box where MLX runs on
+        // CPU). The SYCL/CUDA ladders likewise have no native MLX-affine
+        // kernel; they leave it to CPU (a dequant-to-f16-on-upload GPU
+        // shim is a separate follow-up).
         _ => None,
     }
 }

@@ -65,6 +65,22 @@ pub fn matvec_tensor(w: &Tensor, x: &[f32], out: &mut [f32], m: usize, k: usize)
     // this, every quant matvec (including the 248K-row Q6_K LM head)
     // ran on one core.
     let crossover = parallel_matvec_crossover();
+    // MLX affine is a self-describing blob (packed codes + f16 sidecar),
+    // NOT a fixed-bpw row-major byte stream, so it can't use the generic
+    // `byte_size(k)`-per-row split below. It has its own row-band parallel
+    // kernel (each output row reads its own packed row + sidecar groups).
+    if w.dtype == Dtype::MlxAffineRaw {
+        if crossover > 0 && m >= crossover {
+            let n_threads = rayon::current_num_threads().max(1);
+            let chunk_rows = ((m + 4 * n_threads - 1) / (4 * n_threads)).max(64).min(m);
+            mlx_affine::matvec_mlx_affine_blob_w_f32_a_parallel(
+                as_bytes(w), x, out, m, k, chunk_rows,
+            );
+        } else {
+            mlx_affine::matvec_mlx_affine_blob_w_f32_a(as_bytes(w), x, out, m, k);
+        }
+        return;
+    }
     if crossover > 0 && m >= crossover {
         let serial: Option<fn(&[u8], &[f32], &mut [f32], usize, usize)> = match w.dtype {
             Dtype::Bf16Raw => Some(matvec_bf16_w_f32_a),
@@ -188,6 +204,10 @@ pub fn matvec_tensor_serial(w: &Tensor, x: &[f32], out: &mut [f32], m: usize, k:
         Dtype::Mxfp8Raw => mxfp::matvec_mxfp8_w_f32_a(as_bytes(w), x, out, m, k),
         Dtype::PQ2_0Raw => matvec_pq2_0_w_f32_a(as_bytes(w), x, out, m, k),
         Dtype::PTQ1_0Raw => matvec_ptq1_0_w_f32_a(as_bytes(w), x, out, m, k),
+        // MLX affine packed blob — serial (nested-rayon-safe) variant.
+        Dtype::MlxAffineRaw => {
+            mlx_affine::matvec_mlx_affine_blob_w_f32_a(as_bytes(w), x, out, m, k)
+        }
         other => panic!("matvec_tensor: unsupported dtype {other:?}"),
     }
 }
@@ -6777,6 +6797,11 @@ pub fn embed_lookup_tensor(table: &Tensor, ids: &[i32], out: &mut [f32], d: usiz
         Dtype::IQ1_MRaw => embed_lookup_iq1_m(as_bytes(table), ids, out, d),
         Dtype::PQ2_0Raw => embed_lookup_pq2_0(as_bytes(table), ids, out, d),
         Dtype::PTQ1_0Raw => embed_lookup_ptq1_0(as_bytes(table), ids, out, d),
+        // MLX-quantized token-embedding table: dequant only the requested
+        // rows straight out of the packed blob (table stays packed).
+        Dtype::MlxAffineRaw => {
+            mlx_affine::embed_lookup_mlx_affine_blob(as_bytes(table), ids, out, d)
+        }
         other => panic!("embed_lookup_tensor: unsupported dtype {other:?}"),
     }
 }

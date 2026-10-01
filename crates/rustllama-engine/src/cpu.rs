@@ -2227,7 +2227,7 @@ impl CpuEngine {
             ctx = ctx,
             quant_weights = n_quant,
             full_tensors = n_full,
-            "MLX model loaded (dequant-to-f16) — engine ready"
+            "MLX model loaded (native-affine packed residency) — engine ready"
         );
 
         let delta_net_cache = build_delta_net_cache(&model);
@@ -2271,17 +2271,20 @@ impl CpuEngine {
             image_wrapper: None,
             vision_feature_memo: Arc::new(Mutex::new(None)),
             lock_registry,
-            // Dequant-to-f16 weights are owned-heap (nothing mmap-backed to
-            // pin), so the expert learning cache never applies.
+            // Packed MLX-affine weights are owned-heap blobs (nothing
+            // mmap-backed to pin), so the expert learning cache never applies.
             expert_usage: None,
             kv_persist_owner: false,
         })
     }
 
-    /// Dequant + remap a loaded [`MlxModel`](rustllama_safetensors::MlxModel)
-    /// into the GGUF-named [`ConvertedTensor`](rustllama_safetensors::ConvertedTensor)
-    /// list `build_llama_model_from_safetensors` consumes — the pragmatic
-    /// B1 "dequant-to-f16 then reuse the existing builder" path.
+    /// Remap a loaded [`MlxModel`](rustllama_safetensors::MlxModel) into the
+    /// GGUF-named [`ConvertedTensor`](rustllama_safetensors::ConvertedTensor)
+    /// list `build_llama_model_from_safetensors` consumes. B2: quantized
+    /// linears are kept **packed** as `ConvertedDtype::MlxAffineRaw` blobs
+    /// (native-affine residency — no dequant-to-f16); full-precision
+    /// tensors (norms, biases, unquantized embeddings) pass through as
+    /// f16/f32 as before.
     ///
     /// Two naming families are accepted so both real mlx-community
     /// checkpoints AND rustllama's own `quantize --to-mlx` exports load:
@@ -2296,13 +2299,14 @@ impl CpuEngine {
     ///    the source GGUF tensor names verbatim). Passed through unchanged,
     ///    so the encoder round-trip loads without a separate GGUF-name path.
     ///
-    /// **Orientation (the one thing to get right):** MLX affine dequant
-    /// yields row-major `[out_features, in_features]` — element `(r, c)` is
-    /// at packed bit `(r*in_features + c)*bits` — which is byte-identical to
+    /// **Orientation (the one thing to get right):** MLX affine is
+    /// row-major `[out_features, in_features]` — element `(r, c)` is at
+    /// packed bit `(r*in_features + c)*bits` — which is byte-identical to
     /// the row-major `[out_features, in_features]` layout the llama builder
     /// expects (the same layout the AWQ converter *transposes into*). So
-    /// **no transpose** is applied; the dequant buffer maps straight to a
-    /// `ConvertedTensor`.
+    /// **no transpose** is applied; the packed blob maps straight to a
+    /// `ConvertedTensor` and the matvec `m`/`k` fall out of the logical
+    /// shape.
     fn mlx_model_to_converted(
         mlx: &rustllama_safetensors::MlxModel,
     ) -> Result<Vec<rustllama_safetensors::ConvertedTensor>> {
@@ -2339,7 +2343,17 @@ impl CpuEngine {
 
         let mut out = Vec::with_capacity(mlx.quant.len() + mlx.full.len());
 
-        // --- Quantized affine weights → dense f16 -----------------------
+        // --- Quantized affine weights → packed self-describing blob -----
+        // B2: keep MLX-affine weights PACKED (no dequant-to-f16). Each
+        // weight serializes to the single `MlxAffineQuant::to_blob` byte
+        // buffer (header + packed codes + f16 scale/bias sidecars) and
+        // flows downstream as a `Dtype::MlxAffineRaw` tensor; the CPU
+        // matvec / embedding kernels decode it in place. This is ~4× less
+        // resident RAM than B1's f16 materialization (a 4-bit 0.5B drops
+        // from ~1 GB to ~278 MB) and the CPU foundation for the Apple
+        // Metal `quantized_matmul` fast path later. No transpose — MLX
+        // affine is already row-major `[out_features, in_features]` (see
+        // fn docs).
         for (module, q) in &mlx.quant {
             let Some(gguf_name) = quant_name_to_gguf(module) else {
                 tracing::debug!(
@@ -2350,28 +2364,11 @@ impl CpuEngine {
             };
             q.validate()
                 .map_err(|e| CpuEngineError::Other(format!("mlx weight `{module}`: {e}")))?;
-            let n = q.n_elements() as usize;
-            let mut deq = vec![0f32; n];
-            rustllama_kernels_cpu::mlx_affine::dequantize_mlx_affine(
-                &q.packed,
-                &q.scales,
-                &q.biases,
-                q.group_size,
-                q.bits,
-                &mut deq,
-            );
-            // Round to f16 to match the AWQ/GPTQ converter's
-            // ConvertedDtype::F16 output — the proven downstream dtype for
-            // the llama builder + CPU forward. No transpose (see fn docs).
-            let bytes: Vec<u8> = deq
-                .iter()
-                .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
-                .collect();
             out.push(ConvertedTensor {
                 gguf_name,
                 shape: q.shape.clone(),
-                dtype: ConvertedDtype::F16,
-                bytes,
+                dtype: ConvertedDtype::MlxAffineRaw,
+                bytes: q.to_blob(),
             });
         }
 
