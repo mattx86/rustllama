@@ -1774,7 +1774,7 @@ fn cmd_quantize_to_mlx(
 ) -> anyhow::Result<()> {
     use rustllama_gguf::{quantize::dequant_tensor_to_f32, Gguf};
     use rustllama_kernels_cpu::mlx_affine::quantize_mlx_affine;
-    use rustllama_safetensors::{write_mlx_dir, MlxFullDtype, MlxWriteTensor};
+    use rustllama_safetensors::{map_gguf_to_hf, write_mlx_dir, MlxFullDtype, MlxWriteTensor};
 
     // Geometry guards mirror the MLX affine format + the loader's
     // validate(): bits ∈ {2,3,4,5,6,8}, group_size ∈ {32,64,128}.
@@ -1808,6 +1808,11 @@ fn cmd_quantize_to_mlx(
         let mut f32_buf = vec![0f32; n];
         dequant_tensor_to_f32(t.dtype, src_bytes, &mut f32_buf);
 
+        // Translate the GGUF tensor name to its mlx-lm / HF counterpart so
+        // the written checkpoint is a drop-in for upstream mlx-lm tooling
+        // (`model.layers.0.self_attn.q_proj.weight`, not `blk.0.attn_q.weight`).
+        let hf_name = map_gguf_to_hf(&t.name);
+
         // GGUF dims are [n_in (contiguous), n_out, ...]; a 2-D weight is
         // [n_in, n_out]. MLX's logical shape is [out_features,
         // in_features] = [n_out, n_in], with groups along n_in.
@@ -1815,13 +1820,23 @@ fn cmd_quantize_to_mlx(
         let in_features = t.dims.first().copied().unwrap_or(0);
         if is_2d && in_features > 0 && in_features % group_size as u64 == 0 {
             let out_features = t.dims[1];
+            // A quantized linear with no clean HF inverse would produce a
+            // checkpoint upstream can't load — bail rather than emit a
+            // wrong name. (The standard Llama/Qwen2 set always maps.)
+            let hf_full = hf_name.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot map GGUF tensor {:?} to an mlx-lm / HF module name — \
+                     quantize --to-mlx supports the standard dense Llama/Qwen2 tensor \
+                     set; a fused or architecture-specific weight has no clean HF inverse",
+                    t.name
+                )
+            })?;
             let (packed, scales, biases) = quantize_mlx_affine(&f32_buf, group_size, bits);
-            // Module path = tensor name minus the `.weight` suffix; the
-            // writer re-appends `.weight`/`.scales`/`.biases`.
-            let module = t
-                .name
+            // Module path = HF name minus the `.weight` suffix; the writer
+            // re-appends `.weight`/`.scales`/`.biases`.
+            let module = hf_full
                 .strip_suffix(".weight")
-                .unwrap_or(&t.name)
+                .unwrap_or(&hf_full)
                 .to_string();
             tensors.push(MlxWriteTensor::Quant {
                 name: module,
@@ -1835,8 +1850,10 @@ fn cmd_quantize_to_mlx(
             n_quant += 1;
         } else {
             // 1-D norms/biases, a group-misaligned 2-D weight, or a
-            // >2-D tensor: carry through full precision (f32, lossless)
-            // under the tensor's own name.
+            // >2-D tensor: carry through full precision (f32, lossless).
+            // Map the name when we can; an unmapped passthrough (aux tensor
+            // outside the standard set) keeps its GGUF name with a warning
+            // rather than aborting the whole conversion.
             if is_2d {
                 eprintln!(
                     "quantize: {} [{}x{}] input dim not a multiple of group_size {} \
@@ -1844,9 +1861,20 @@ fn cmd_quantize_to_mlx(
                     t.name, in_features, t.dims[1], group_size
                 );
             }
+            let name = match hf_name {
+                Some(h) => h,
+                None => {
+                    eprintln!(
+                        "quantize: GGUF tensor {:?} has no mlx-lm / HF name mapping — \
+                         writing it under its original name (mlx-lm may ignore it)",
+                        t.name
+                    );
+                    t.name.clone()
+                }
+            };
             let bytes: Vec<u8> = f32_buf.iter().flat_map(|v| v.to_le_bytes()).collect();
             tensors.push(MlxWriteTensor::Full {
-                name: t.name.clone(),
+                name,
                 dtype: MlxFullDtype::F32,
                 shape: t.dims.clone(),
                 bytes,

@@ -55,7 +55,7 @@ pub use mlx::{
     MlxFullDtype, MlxFullTensor, MlxLayerQuant, MlxModel, MlxQuantConfig,
     MlxQuantMode, MlxWriteError, MlxWriteTensor,
 };
-pub use name_map::{map_hf_to_gguf, HfTensor, HfTensorKind};
+pub use name_map::{map_gguf_to_hf, map_hf_to_gguf, HfTensor, HfTensorKind};
 
 /// Classification of a safetensors file's quant scheme. Detected by
 /// scanning tensor names for the suffixes each format emits.

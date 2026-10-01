@@ -1200,4 +1200,91 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn write_mlx_dir_emits_hf_module_names_via_gguf_map() {
+        // The `quantize --to-mlx` path (rustllama-cli) translates GGUF
+        // tensor names to HF names via `map_gguf_to_hf` before handing them
+        // to `write_mlx_dir`. Mirror that here: start from GGUF names, map
+        // them, write, and confirm the written dir (a) classifies as MLX
+        // and (b) load_mlx_dir keys the quant weights by the HF module
+        // path real mlx-lm models use — proving the output is upstream-
+        // loadable, not GGUF-named.
+        use rustllama_kernels_cpu::mlx_affine::{dequantize_mlx_affine, quantize_mlx_affine};
+
+        let out_f = 4usize;
+        let in_f = 128usize;
+        let group_size = 64usize;
+        let bits = 4u32;
+
+        // GGUF names as `quantize --to-mlx` sees them in the source model.
+        let gguf_q = "blk.0.attn_q.weight";
+        let gguf_norm = "output_norm.weight";
+        let hf_q = crate::map_gguf_to_hf(gguf_q).expect("attn_q maps");
+        let hf_norm = crate::map_gguf_to_hf(gguf_norm).expect("output_norm maps");
+        assert_eq!(hf_q, "model.layers.0.self_attn.q_proj.weight");
+        assert_eq!(hf_norm, "model.norm.weight");
+
+        let weights: Vec<f32> = (0..out_f * in_f).map(pseudo_f32).collect();
+        let (packed, scales, biases) = quantize_mlx_affine(&weights, group_size, bits);
+        let norm: Vec<f32> = (0..out_f).map(|i| 1.0 + i as f32 * 0.1).collect();
+
+        let tensors = vec![
+            MlxWriteTensor::Quant {
+                // Writer wants the module path (name minus `.weight`),
+                // exactly as the CLI derives it from the mapped HF name.
+                name: hf_q.strip_suffix(".weight").unwrap().to_string(),
+                packed,
+                scales: scales.clone(),
+                biases: biases.clone(),
+                group_size,
+                bits,
+                shape: vec![out_f as u64, in_f as u64],
+            },
+            MlxWriteTensor::Full {
+                name: hf_norm.clone(),
+                dtype: MlxFullDtype::F16,
+                shape: vec![out_f as u64],
+                bytes: f16_bytes(&norm),
+            },
+        ];
+
+        let dir = std::env::temp_dir()
+            .join(format!("rustllama-mlx-hf-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut extra = serde_json::Map::new();
+        extra.insert("architectures".into(), serde_json::json!(["Qwen2ForCausalLM"]));
+        write_mlx_dir(&dir, &tensors, group_size, bits, extra, None).unwrap();
+
+        let cfg_json = std::fs::read_to_string(dir.join("config.json")).unwrap();
+        let st_bytes = std::fs::read(dir.join("model.safetensors")).unwrap();
+        assert!(is_mlx_model(&cfg_json, &st_bytes), "written dir not detected as MLX");
+
+        let model = load_mlx_dir(&dir).unwrap();
+        // The quant weight is keyed by the HF module path (not the GGUF
+        // `blk.0.attn_q`), so upstream mlx-lm — and our own load path which
+        // HF->GGUF-maps on wiring — finds it.
+        let q = model
+            .quant
+            .get("model.layers.0.self_attn.q_proj")
+            .expect("quant keyed by HF module path");
+        assert!(model.quant.get("blk.0.attn_q").is_none(), "must not emit GGUF name");
+        assert_eq!(q.shape, vec![out_f as u64, in_f as u64]);
+        q.validate().unwrap();
+
+        // And it still dequants to the original weights within quant error.
+        let mut recon = vec![0f32; q.n_elements() as usize];
+        dequantize_mlx_affine(&q.packed, &q.scales, &q.biases, q.group_size, q.bits, &mut recon);
+        for i in 0..weights.len() {
+            let g = i / group_size;
+            let tol = scales[g] * 0.5 + 0.03;
+            assert!((recon[i] - weights[i]).abs() <= tol, "cell {i}");
+        }
+
+        // The norm carried through under its HF name.
+        assert!(model.full.contains_key("model.norm.weight"), "norm keyed by HF name");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

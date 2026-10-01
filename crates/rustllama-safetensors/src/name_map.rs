@@ -158,6 +158,64 @@ pub fn map_hf_to_gguf(hf_name: &str) -> Option<HfTensor> {
     })
 }
 
+/// Translate a rustllama / GGUF tensor name **back** to its HuggingFace
+/// `transformers` (mlx-lm) counterpart — the inverse of
+/// [`map_hf_to_gguf`] over the dense Llama/Qwen2 tensor set.
+///
+/// Used by `quantize --to-mlx` so the written checkpoint carries the
+/// module names real `mlx-community` models use
+/// (`model.layers.0.self_attn.q_proj.weight` rather than
+/// `blk.0.attn_q.weight`) and is a drop-in for upstream mlx-lm tooling.
+/// The trailing `.weight` / `.bias` suffix is preserved (Qwen2/2.5 ships
+/// Q/K/V biases).
+///
+/// Returns `None` for a GGUF name outside the standard set (fused / MoE /
+/// vision tensors have no clean 1:1 HF inverse) or without a `.weight` /
+/// `.bias` suffix, so the caller can bail or pass it through under its
+/// original name rather than emit a wrong one.
+pub fn map_gguf_to_hf(gguf_name: &str) -> Option<String> {
+    // Split the trailing `.weight` / `.bias` (preserved across the map).
+    let (stem, suffix) = if let Some(s) = gguf_name.strip_suffix(".weight") {
+        (s, "weight")
+    } else if let Some(s) = gguf_name.strip_suffix(".bias") {
+        (s, "bias")
+    } else {
+        return None;
+    };
+
+    // Top-level (non-layer) tensors — the inverse of the stem matches in
+    // `map_hf_to_gguf`.
+    let top = match stem {
+        "token_embd" => Some("model.embed_tokens"),
+        "output_norm" => Some("model.norm"),
+        "output" => Some("lm_head"),
+        _ => None,
+    };
+    if let Some(hf_stem) = top {
+        return Some(format!("{hf_stem}.{suffix}"));
+    }
+
+    // Per-layer tensors: `blk.<idx>.<rest>`.
+    let after_blk = stem.strip_prefix("blk.")?;
+    let dot = after_blk.find('.')?;
+    let layer_idx: u32 = after_blk[..dot].parse().ok()?;
+    let rest = &after_blk[dot + 1..];
+
+    let hf_rest = match rest {
+        "attn_norm" => "input_layernorm",
+        "ffn_norm" => "post_attention_layernorm",
+        "attn_q" => "self_attn.q_proj",
+        "attn_k" => "self_attn.k_proj",
+        "attn_v" => "self_attn.v_proj",
+        "attn_output" => "self_attn.o_proj",
+        "ffn_gate" => "mlp.gate_proj",
+        "ffn_up" => "mlp.up_proj",
+        "ffn_down" => "mlp.down_proj",
+        _ => return None,
+    };
+    Some(format!("model.layers.{layer_idx}.{hf_rest}.{suffix}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +367,63 @@ mod tests {
         // accidentally got merged — must not be silently accepted.
         assert!(map_hf_to_gguf("vision_tower.layers.0.weight").is_none());
         assert!(map_hf_to_gguf("decoder.layers.0.self_attn.q_proj.weight").is_none());
+    }
+
+    // --- gguf -> hf inverse (quantize --to-mlx names) --------------------
+
+    #[test]
+    fn gguf_to_hf_maps_the_standard_set() {
+        for (gguf, hf) in [
+            ("token_embd.weight", "model.embed_tokens.weight"),
+            ("output_norm.weight", "model.norm.weight"),
+            ("output.weight", "lm_head.weight"),
+            ("blk.0.attn_q.weight", "model.layers.0.self_attn.q_proj.weight"),
+            ("blk.0.attn_k.weight", "model.layers.0.self_attn.k_proj.weight"),
+            ("blk.0.attn_v.weight", "model.layers.0.self_attn.v_proj.weight"),
+            ("blk.0.attn_output.weight", "model.layers.0.self_attn.o_proj.weight"),
+            ("blk.3.ffn_gate.weight", "model.layers.3.mlp.gate_proj.weight"),
+            ("blk.3.ffn_up.weight", "model.layers.3.mlp.up_proj.weight"),
+            ("blk.3.ffn_down.weight", "model.layers.3.mlp.down_proj.weight"),
+            ("blk.7.attn_norm.weight", "model.layers.7.input_layernorm.weight"),
+            ("blk.7.ffn_norm.weight", "model.layers.7.post_attention_layernorm.weight"),
+            // Qwen2 Q/K/V biases keep the `.bias` suffix.
+            ("blk.2.attn_q.bias", "model.layers.2.self_attn.q_proj.bias"),
+            ("blk.2.attn_k.bias", "model.layers.2.self_attn.k_proj.bias"),
+            ("blk.2.attn_v.bias", "model.layers.2.self_attn.v_proj.bias"),
+        ] {
+            assert_eq!(map_gguf_to_hf(gguf).as_deref(), Some(hf), "gguf={gguf}");
+        }
+    }
+
+    #[test]
+    fn gguf_to_hf_round_trips_map_hf_to_gguf() {
+        // For the standard dense set, gguf->hf should be the exact inverse
+        // of hf->gguf: start from an HF name, map to GGUF, map back, and
+        // land on the original HF name.
+        for hf in [
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.11.self_attn.o_proj.weight",
+            "model.layers.5.mlp.gate_proj.weight",
+            "model.layers.5.mlp.down_proj.weight",
+            "model.layers.3.input_layernorm.weight",
+            "model.layers.3.post_attention_layernorm.weight",
+            "model.layers.7.self_attn.q_proj.bias",
+        ] {
+            let gguf = map_hf_to_gguf(hf).unwrap().gguf_name;
+            assert_eq!(map_gguf_to_hf(&gguf).as_deref(), Some(hf), "round-trip hf={hf}");
+        }
+    }
+
+    #[test]
+    fn gguf_to_hf_rejects_unmapped_and_suffixless() {
+        // No clean HF inverse (fused / unknown) or no weight/bias suffix.
+        assert!(map_gguf_to_hf("blk.0.future_subkey.weight").is_none());
+        assert!(map_gguf_to_hf("blk.abc.attn_q.weight").is_none());
+        assert!(map_gguf_to_hf("token_embd").is_none());
+        assert!(map_gguf_to_hf("blk.0.attn_q").is_none());
+        assert!(map_gguf_to_hf("rope_freqs.weight").is_none());
     }
 }
