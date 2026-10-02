@@ -33,3 +33,7 @@ bytemuck.workspace = true
 # through the CPU dequant reference and check it against the known
 # affine inputs. Toolchain-free crate, so it adds no build-env burden.
 rustllama-kernels-cpu = { path = "../rustllama-kernels-cpu" }
+# Non-affine (mxfp4/mxfp8/nvfp4) tests repack an `MlxMicroQuant` to our
+# GGUF-style block layout and decode it through the Wave-2 dequant
+# references to check the element↔scale mapping. Toolchain-free.
+rustllama-gguf = { path = "../rustllama-gguf" }

@@ -51,9 +51,9 @@ pub use dequant::{
 };
 pub use hf_config::{parse_hf_config, HfConfigError};
 pub use mlx::{
-    is_mlx_model, load_mlx_dir, load_mlx_from_bytes, write_mlx_dir, MlxError,
-    MlxFullDtype, MlxFullTensor, MlxLayerQuant, MlxModel, MlxQuantConfig,
-    MlxQuantMode, MlxWriteError, MlxWriteTensor,
+    is_mlx_dir, is_mlx_model, load_mlx_dir, load_mlx_from_bytes, write_mlx_dir,
+    MlxError, MlxFullDtype, MlxFullTensor, MlxLayerQuant, MlxMicroQuant,
+    MlxModel, MlxQuantConfig, MlxQuantMode, MlxWriteError, MlxWriteTensor,
 };
 pub use name_map::{map_gguf_to_hf, map_hf_to_gguf, HfTensor, HfTensorKind};
 

@@ -30,13 +30,36 @@
 //! `.biases` are per-`group_size` f16/bf16; dequant is the plain affine
 //! `w = scale*q + bias`.
 //!
+//! # Non-affine microscaling modes (`mxfp4` / `mxfp8` / `nvfp4`)
+//!
+//! Real `mlx-lm` also ships **non-affine** microscaling checkpoints. These
+//! drop the `.biases` sidecar entirely: `mx.quantize` returns only
+//! `(weight, scales)` for them (three tensors for affine, two for these).
+//! Confirmed on-disk layout (MLX `mlx.core.quantize` docs + a real
+//! `mlx-community` `mxfp4` `config.json` + the `ml-explore/mlx-lm` FP8
+//! issues):
+//!
+//! | mode    | group | bits | element | block scale (uint8) | biases |
+//! |---------|-------|------|---------|---------------------|--------|
+//! | `mxfp4` | 32    | 4    | E2M1    | E8M0                | none   |
+//! | `mxfp8` | 32    | 8    | E4M3    | E8M0                | none   |
+//! | `nvfp4` | 16    | 4    | E2M1    | E4M3                | none   |
+//!
+//! The packed `.weight` is still a uint32 bitstream (elements packed
+//! low→high bits within each 32-bit word — byte-identical ordering to our
+//! own MXFP/NVFP block codes); the `.scales` tensor is `uint8`, one raw
+//! E8M0/E4M3 byte per group. These are loaded into [`MlxMicroQuant`] and —
+//! because our GGUF-style block layout for these formats is just
+//! `[group codes][1 scale byte]` per block — repacked to that layout and
+//! handed to rustllama's **existing, parity-checked Wave-2
+//! `dequant_mxfp4/mxfp8/nvfp4`** (see [`MlxMicroQuant::to_gguf_blocks`]).
+//! The engine then dequant→transcodes them to a standard GGUF block-quant
+//! exactly like the affine path, so they run on every backend. A
+//! genuinely unknown `mode` string is still rejected with
+//! [`MlxError::UnsupportedMode`].
+//!
 //! # Out of scope (this phase)
 //!
-//! - **Non-affine modes** (`mxfp4` / `nvfp4` / `mxfp8`): the mode is
-//!   parsed + surfaced, but loading a non-affine weight triple is
-//!   rejected with [`MlxError::UnsupportedMode`] — those layouts have no
-//!   `biases` and use e8m0/e4m3 scales (a later slice; rustllama already
-//!   has MXFP/NVFP4 decoders in `rustllama-kernels-cpu` to build on).
 //! - **Model wiring**: turning an [`MlxModel`] into a runnable
 //!   `LlamaModel` (weight-name mapping, arch dispatch, matvec routing) is
 //!   the next, build-env-gated phase in `rustllama-models`. This module
@@ -242,6 +265,154 @@ pub struct MlxFullTensor {
     pub bytes: Vec<u8>,
 }
 
+/// A single **non-affine microscaling** MLX weight (`mxfp4` / `mxfp8` /
+/// `nvfp4`). Unlike [`MlxAffineQuant`] there is no per-group bias — the
+/// value is `codebook[code] * block_scale`, with the block scale a raw
+/// E8M0 (mxfp*) or E4M3 (nvfp4) byte.
+///
+/// `shape` is the logical, dequantized `[out_features, in_features]`
+/// (row-major, groups along the input dim), matching the affine struct.
+#[derive(Debug, Clone)]
+pub struct MlxMicroQuant {
+    /// Packed `bits`-bit element codes — the raw little-endian bytes of the
+    /// uint32 `.weight` tensor. MLX packs elements low→high within each
+    /// 32-bit word, which (for 4-bit) puts element `2j` in byte `j`'s low
+    /// nibble and `2j+1` in its high nibble, and (for 8-bit) element `j` in
+    /// byte `j` — **byte-identical** to the code ordering our
+    /// `dequant_mxfp4/mxfp8/nvfp4` references expect, so no bit-shuffle is
+    /// needed on repack. `Arc` to share a tied embedding/`lm_head` cheaply.
+    pub packed: Arc<[u8]>,
+    /// Per-group block scales as the **raw uint8 bytes** from the `.scales`
+    /// tensor (E8M0 for mxfp4/mxfp8, E4M3 for nvfp4 — decoded by the Wave-2
+    /// dequant, not here). Length `out_features * (in_features/group_size)`,
+    /// row-major to match `shape`.
+    pub scales: Vec<u8>,
+    /// The microscaling mode — [`MlxQuantMode::Mxfp4`] / `Mxfp8` / `Nvfp4`.
+    pub mode: MlxQuantMode,
+    /// Elements per block (32 for mxfp4/mxfp8, 16 for nvfp4).
+    pub group_size: usize,
+    /// Bits per element (4 for mxfp4/nvfp4, 8 for mxfp8).
+    pub bits: u32,
+    /// Logical dequantized shape `[out_features, in_features]`.
+    pub shape: Vec<u64>,
+    /// The `.weight` tensor name, for diagnostics.
+    pub name: String,
+}
+
+impl MlxMicroQuant {
+    /// `out_features` (rows) — first logical dim.
+    pub fn out_features(&self) -> u64 {
+        self.shape[0]
+    }
+    /// `in_features` (cols, the quantized/contraction dim) — second dim.
+    pub fn in_features(&self) -> u64 {
+        self.shape[1]
+    }
+    /// Total logical elements (`out_features * in_features`).
+    pub fn n_elements(&self) -> u64 {
+        self.shape[0] * self.shape[1]
+    }
+
+    /// The `(bits, group_size)` a microscaling mode mandates on disk (fixed
+    /// by the OCP/NVIDIA specs and MLX's implementation). `None` for any
+    /// non-micro mode.
+    pub(crate) fn mode_geometry(mode: &MlxQuantMode) -> Option<(u32, usize)> {
+        match mode {
+            MlxQuantMode::Mxfp4 => Some((4, 32)),
+            MlxQuantMode::Mxfp8 => Some((8, 32)),
+            MlxQuantMode::Nvfp4 => Some((4, 16)),
+            _ => None,
+        }
+    }
+
+    /// Cross-check the packed/scale buffer lengths against the geometry so a
+    /// malformed file fails loudly instead of decoding garbage. Also
+    /// enforces that `group_size`/`bits` match what the mode requires (so a
+    /// `config.json` claiming e.g. `mxfp4` at group 64 — which our fixed-32
+    /// decoder can't honor — is rejected, not silently mis-decoded).
+    pub fn validate(&self) -> Result<(), MlxError> {
+        if self.shape.len() != 2 {
+            return Err(MlxError::MicroNotMatrix {
+                name: self.name.clone(),
+                shape: self.shape.clone(),
+            });
+        }
+        let (exp_bits, exp_group) = Self::mode_geometry(&self.mode).ok_or_else(|| {
+            MlxError::UnsupportedMode {
+                module: self.name.clone(),
+                mode: self.mode.clone(),
+            }
+        })?;
+        if self.bits != exp_bits || self.group_size != exp_group {
+            return Err(MlxError::MicroGeometry {
+                name: self.name.clone(),
+                mode: self.mode.clone(),
+                group_size: self.group_size,
+                bits: self.bits,
+                expected_group: exp_group,
+                expected_bits: exp_bits,
+            });
+        }
+        let in_f = self.in_features();
+        if in_f % self.group_size as u64 != 0 {
+            return Err(MlxError::MicroGroupMisaligned {
+                name: self.name.clone(),
+                in_features: in_f,
+                group_size: self.group_size,
+            });
+        }
+        let n = self.n_elements();
+        let expected_packed = (n * self.bits as u64 / 8) as usize;
+        if self.packed.len() != expected_packed {
+            return Err(MlxError::MicroPackedLen {
+                name: self.name.clone(),
+                got: self.packed.len(),
+                expected: expected_packed,
+                n_elements: n,
+                bits: self.bits,
+            });
+        }
+        let n_groups = (n / self.group_size as u64) as usize;
+        if self.scales.len() != n_groups {
+            return Err(MlxError::MicroScaleCount {
+                name: self.name.clone(),
+                got: self.scales.len(),
+                expected: n_groups,
+            });
+        }
+        Ok(())
+    }
+
+    /// Repack MLX's `(packed uint32 codes, uint8 block scales)` into
+    /// rustllama's **GGUF-style block layout** so the existing Wave-2
+    /// `dequant_mxfp4/mxfp8/nvfp4` (and the whole quant-kernel stack) decode
+    /// it unchanged.
+    ///
+    /// Our block layout is `[group_code_bytes][1 scale byte]` per group, and
+    /// MLX's packed stream already stores each group's codes contiguously in
+    /// exactly our byte/nibble order (see [`MlxMicroQuant::packed`]). So the
+    /// repack is a pure per-group splice — copy the group's code bytes, then
+    /// append its one scale byte. No bit shuffling, no transpose.
+    ///
+    /// - mxfp4: 16 code bytes + 1 E8M0 byte → 17-byte block (32 elems)
+    /// - mxfp8: 32 code bytes + 1 E8M0 byte → 33-byte block (32 elems)
+    /// - nvfp4:  8 code bytes + 1 E4M3 byte →  9-byte block (16 elems)
+    ///
+    /// `validate()` must have passed (lengths consistent); callers in this
+    /// crate run it at load time.
+    pub fn to_gguf_blocks(&self) -> Vec<u8> {
+        let group_code_bytes = self.group_size * self.bits as usize / 8;
+        let n_blocks = self.scales.len();
+        let mut out = Vec::with_capacity(n_blocks * (group_code_bytes + 1));
+        for bi in 0..n_blocks {
+            let start = bi * group_code_bytes;
+            out.extend_from_slice(&self.packed[start..start + group_code_bytes]);
+            out.push(self.scales[bi]);
+        }
+        out
+    }
+}
+
 /// The tensors of an MLX checkpoint, split into quantized weights +
 /// full-precision tensors, plus the parsed quant config.
 ///
@@ -259,7 +430,12 @@ pub struct MlxFullTensor {
 #[derive(Debug, Clone)]
 pub struct MlxModel {
     pub config: MlxQuantConfig,
+    /// Affine-quantized weights (packed codes + per-group scale AND bias),
+    /// keyed by module path.
     pub quant: BTreeMap<String, MlxAffineQuant>,
+    /// Non-affine microscaling weights (`mxfp4`/`mxfp8`/`nvfp4`: packed
+    /// codes + per-group uint8 scale, no bias), keyed by module path.
+    pub micro: BTreeMap<String, MlxMicroQuant>,
     pub full: BTreeMap<String, MlxFullTensor>,
 }
 
@@ -281,10 +457,67 @@ pub enum MlxError {
     #[error("not an MLX-quantized checkpoint: no `quantization` block in config.json")]
     NotMlx,
     #[error(
-        "mlx layer `{module}` uses mode {mode:?}; this phase loads only \
-         affine-quantized weights (mxfp4/nvfp4/mxfp8 are a later slice)"
+        "mlx layer `{module}` uses unrecognized quantization mode {mode:?}; \
+         supported: affine, mxfp4, mxfp8, nvfp4"
     )]
     UnsupportedMode { module: String, mode: MlxQuantMode },
+    #[error(
+        "mlx layer `{module}` is config-moded `affine` but ships no `.biases` \
+         tensor (affine quant needs a per-group scale AND bias)"
+    )]
+    AffineMissingBiases { module: String },
+    #[error(
+        "mlx micro `{name}`: mode {mode:?} mandates group_size {expected_group} \
+         / bits {expected_bits}, but config/file give group_size {group_size} \
+         / bits {bits} (the microscaling decoders are fixed to the spec geometry)"
+    )]
+    MicroGeometry {
+        name: String,
+        mode: MlxQuantMode,
+        group_size: usize,
+        bits: u32,
+        expected_group: usize,
+        expected_bits: u32,
+    },
+    #[error(
+        "mlx micro `{name}`: shape {shape:?} is not 2-D [out_features, in_features]"
+    )]
+    MicroNotMatrix { name: String, shape: Vec<u64> },
+    #[error(
+        "mlx micro `{name}`: in_features {in_features} not a multiple of \
+         group_size {group_size}"
+    )]
+    MicroGroupMisaligned {
+        name: String,
+        in_features: u64,
+        group_size: usize,
+    },
+    #[error(
+        "mlx micro `{name}`: packed bytes {got} != expected {expected} \
+         ({n_elements} elems × {bits} bits / 8)"
+    )]
+    MicroPackedLen {
+        name: String,
+        got: usize,
+        expected: usize,
+        n_elements: u64,
+        bits: u32,
+    },
+    #[error(
+        "mlx micro `{name}`: scales count {got} != expected {expected} groups"
+    )]
+    MicroScaleCount {
+        name: String,
+        got: usize,
+        expected: usize,
+    },
+    #[error(
+        "mlx micro weight `{name}` has scales dtype {dtype:?}; non-affine MLX \
+         stores E8M0/E4M3 block scales as uint8"
+    )]
+    MicroScalesNotU8 { name: String, dtype: StDtype },
+    #[error("mlx: model directory has no `*.safetensors` shards to load")]
+    NoShards,
     #[error(
         "mlx layer `{module}` is explicitly skipped by a per-layer override \
          in config.json, yet ships packed `.scales`/`.biases` tensors"
@@ -319,9 +552,18 @@ pub enum MlxError {
 }
 
 /// Is this a MLX-quantized checkpoint? True when `config.json` has a
-/// `quantization` block **and** the safetensors carries `.scales` +
-/// `.biases` sibling tensors. Cheap detection primitive the engine's
-/// format sniffer can call before committing to the MLX load path.
+/// `quantization` block **and** the safetensors carries a packed uint32
+/// `.weight` next to a per-group `.scales` sidecar. Cheap detection
+/// primitive the engine's format sniffer can call before committing to the
+/// MLX load path.
+///
+/// Detection keys on the **uint32 `.weight` + `.scales` pair**, NOT on
+/// `.biases`: affine checkpoints add a `.biases`, but the non-affine
+/// microscaling modes (`mxfp4`/`mxfp8`/`nvfp4`) have none — requiring
+/// biases would reject every non-affine model. The uint32 `.weight` is
+/// also what separates MLX from AWQ/GPTQ (whose packed tensor is
+/// `.qweight`, with a plain fp16 `.weight` at most), so this stays a clean
+/// MLX-vs-AWQ discriminator. Only the safetensors HEADER is parsed.
 pub fn is_mlx_model(config_json: &str, safetensors_bytes: &[u8]) -> bool {
     let has_q = matches!(
         MlxQuantConfig::parse_from_config_json(config_json),
@@ -333,17 +575,76 @@ pub fn is_mlx_model(config_json: &str, safetensors_bytes: &[u8]) -> bool {
     let Ok(st) = SafeTensors::deserialize(safetensors_bytes) else {
         return false;
     };
-    let mut has_scales = false;
-    let mut has_biases = false;
-    for name in st.names() {
-        if name.ends_with(SUFFIX_SCALES) {
-            has_scales = true;
+    let names: BTreeSet<String> = st.names().into_iter().cloned().collect();
+    for name in &names {
+        let Some(prefix) = name.strip_suffix(SUFFIX_SCALES) else {
+            continue;
+        };
+        let weight = format!("{prefix}{SUFFIX_WEIGHT}");
+        if !names.contains(&weight) {
+            continue;
         }
-        if name.ends_with(SUFFIX_BIASES) {
-            has_biases = true;
+        // The packed weight must be uint32 (MLX's code bitstream); a plain
+        // fp16 `.weight` next to `.scales` is not an MLX quant module.
+        if let Ok(w) = st.tensor(&weight) {
+            if w.dtype() == StDtype::U32 {
+                return true;
+            }
         }
-        if has_scales && has_biases {
-            return true;
+    }
+    false
+}
+
+/// Directory-level, **shard-aware** MLX detection. True when `dir` holds a
+/// `config.json` with a `quantization` block AND — across ALL of its
+/// `*.safetensors` shards merged — a packed uint32 `.weight` sits next to a
+/// `.scales` sibling.
+///
+/// This exists because [`is_mlx_model`] inspects a single blob, which is
+/// wrong for a **sharded** checkpoint: HuggingFace shards split by byte
+/// size, so a module's uint32 `.weight` and its `.scales` can land in
+/// DIFFERENT shards. Probing one shard would miss the pair and mis-route
+/// the model away from the MLX loader. Here we merge every shard's tensor
+/// headers (header-only, via mmap — no weight data is read) before looking
+/// for the pair, mirroring [`load_mlx_dir`]'s merge-then-match. Any IO /
+/// parse error is swallowed as `false`.
+pub fn is_mlx_dir(dir: &Path) -> bool {
+    let Ok(config_json) = std::fs::read_to_string(dir.join("config.json")) else {
+        return false;
+    };
+    if !matches!(
+        MlxQuantConfig::parse_from_config_json(&config_json),
+        Ok(Some(_))
+    ) {
+        return false;
+    }
+    let Ok(shard_paths) = resolve_shard_paths(dir) else {
+        return false;
+    };
+    // mmap every shard + parse its header; hold them alive for the views.
+    let mut mmaps = Vec::with_capacity(shard_paths.len());
+    for p in &shard_paths {
+        let Ok(m) = crate::open_safetensors(p) else {
+            return false;
+        };
+        mmaps.push(m);
+    }
+    // Merge name → dtype across all shards (header metadata only).
+    let mut name_dtype: BTreeMap<String, StDtype> = BTreeMap::new();
+    for m in &mmaps {
+        let Ok(st) = SafeTensors::deserialize(&m[..]) else {
+            return false;
+        };
+        for (name, view) in st.tensors() {
+            name_dtype.insert(name, view.dtype());
+        }
+    }
+    for name in name_dtype.keys() {
+        if let Some(prefix) = name.strip_suffix(SUFFIX_SCALES) {
+            let weight = format!("{prefix}{SUFFIX_WEIGHT}");
+            if name_dtype.get(&weight) == Some(&StDtype::U32) {
+                return true;
+            }
         }
     }
     false
@@ -392,58 +693,63 @@ fn full_dtype(name: &str, dtype: StDtype) -> Result<MlxFullDtype, MlxError> {
     })
 }
 
-/// Load one safetensors shard's tensors into the `quant` + `full` maps,
-/// using `config` for per-layer `group_size`/`bits`. Shared by the
-/// in-memory and directory entry points; call it once per shard and the
-/// maps accumulate across shards.
-fn load_shard_into(
+/// Split a merged `name → TensorView` map (one shard's worth, or every
+/// shard merged together) into affine-quantized weights, non-affine
+/// microscaling weights, and full-precision tensors.
+///
+/// **Affine vs micro routing is by the ground-truth presence of a
+/// `.biases` sibling**, not by the config `mode` string: MLX emits three
+/// tensors (`weight`+`scales`+`biases`) for affine and two
+/// (`weight`+`scales`) for the microscaling modes, so biases-present ⇔
+/// affine. A model may MIX both (e.g. attention/embeddings affine, MLP
+/// mxfp4) — per-layer routing handles that. For a micro layer the specific
+/// format (mxfp4/mxfp8/nvfp4) comes from the resolved config mode; a layer
+/// the config marks `affine` but that ships no `.biases` is a malformed
+/// file and errors.
+fn collect_mlx_tensors(
     config: &MlxQuantConfig,
-    bytes: &[u8],
+    tensors: &BTreeMap<String, TensorView<'_>>,
     quant: &mut BTreeMap<String, MlxAffineQuant>,
+    micro: &mut BTreeMap<String, MlxMicroQuant>,
     full: &mut BTreeMap<String, MlxFullTensor>,
 ) -> Result<(), MlxError> {
-    let st = SafeTensors::deserialize(bytes)?;
-
-    // Pass 1: find every quantized module prefix `P` such that
-    // `P.weight` + `P.scales` + `P.biases` all exist in this shard, and
-    // record the three tensor names they consume.
-    let names: BTreeSet<String> = st.names().into_iter().cloned().collect();
+    // Pass 1: find every quant module prefix `P` with both `P.weight` and
+    // `P.scales` present (a `.biases` is optional — affine has it, micro
+    // doesn't). Collect prefixes first so the mutable build loop isn't
+    // tangled with the immutable key scan.
     let mut prefixes: Vec<String> = Vec::new();
     let mut consumed: BTreeSet<String> = BTreeSet::new();
-    for name in &names {
+    for name in tensors.keys() {
         let Some(prefix) = name.strip_suffix(SUFFIX_SCALES) else {
             continue;
         };
         let weight = format!("{prefix}{SUFFIX_WEIGHT}");
-        let biases = format!("{prefix}{SUFFIX_BIASES}");
-        if names.contains(&weight) && names.contains(&biases) {
+        if tensors.contains_key(&weight) {
             prefixes.push(prefix.to_string());
-            consumed.insert(weight);
-            consumed.insert(name.clone());
-            consumed.insert(biases);
         }
     }
 
-    // Pass 2: build a quant weight per prefix.
+    // Pass 2: build an affine or micro weight per prefix.
     for prefix in prefixes {
         let weight_name = format!("{prefix}{SUFFIX_WEIGHT}");
         let scales_name = format!("{prefix}{SUFFIX_SCALES}");
         let biases_name = format!("{prefix}{SUFFIX_BIASES}");
-        let weight = st.tensor(&weight_name)?;
-        let scales = st.tensor(&scales_name)?;
-        let biases = st.tensor(&biases_name)?;
+        let weight = tensors.get(&weight_name).expect("checked in pass 1");
+        let scales = tensors.get(&scales_name).expect("checked in pass 1");
+        let has_biases = tensors.contains_key(&biases_name);
+
+        consumed.insert(weight_name.clone());
+        consumed.insert(scales_name.clone());
+        if has_biases {
+            consumed.insert(biases_name.clone());
+        }
 
         let layer = config.for_layer(&prefix).ok_or(MlxError::SkippedButPacked {
             module: prefix.clone(),
         })?;
-        if layer.mode != MlxQuantMode::Affine {
-            return Err(MlxError::UnsupportedMode {
-                module: prefix.clone(),
-                mode: layer.mode,
-            });
-        }
 
-        // Packed weight must be uint32, 2-D [out_features, in_words].
+        // Packed weight must be uint32, 2-D [out_features, in_words] — same
+        // for affine and micro (both pack codes into a uint32 bitstream).
         if weight.dtype() != StDtype::U32 {
             return Err(MlxError::WeightNotU32 {
                 name: weight_name.clone(),
@@ -459,47 +765,102 @@ fn load_shard_into(
         }
         let out_features = pshape[0];
         let row_words = pshape[1];
-        // in_features = (row_words * 32) / bits. MLX packs `bits*in`
-        // bits per row into uint32 words; recover in from the word count.
-        let row_bits = row_words * 32;
-        if row_bits % layer.bits as u64 != 0 {
-            return Err(MlxError::RowWidthIndivisible {
-                name: weight_name.clone(),
-                row_words,
+
+        if has_biases {
+            // ---- Affine: packed codes + per-group f16 scale AND bias. ----
+            let biases = tensors.get(&biases_name).expect("has_biases checked");
+            // in_features = (row_words * 32) / bits. MLX packs `bits*in`
+            // bits per row into uint32 words; recover in from the word count.
+            let row_bits = row_words * 32;
+            if row_bits % layer.bits as u64 != 0 {
+                return Err(MlxError::RowWidthIndivisible {
+                    name: weight_name.clone(),
+                    row_words,
+                    bits: layer.bits,
+                });
+            }
+            let in_features = row_bits / layer.bits as u64;
+
+            let scales_f32 = floats_to_f32(&scales_name, scales)?;
+            let biases_f32 = floats_to_f32(&biases_name, biases)?;
+
+            let q = MlxAffineQuant {
+                // The uint32 tensor's raw LE bytes *are* the bitstream.
+                packed: Arc::from(weight.data().to_vec()),
+                scales: scales_f32,
+                biases: biases_f32,
+                group_size: layer.group_size,
                 bits: layer.bits,
-            });
+                shape: vec![out_features, in_features],
+                name: weight_name.clone(),
+            };
+            q.validate()?;
+            quant.insert(prefix, q);
+        } else {
+            // ---- Non-affine: route by the resolved config mode. ----
+            match layer.mode {
+                MlxQuantMode::Affine => {
+                    return Err(MlxError::AffineMissingBiases {
+                        module: prefix.clone(),
+                    });
+                }
+                MlxQuantMode::Mxfp4 | MlxQuantMode::Mxfp8 | MlxQuantMode::Nvfp4 => {
+                    // Bits are fixed by the mode (not by `layer.bits`, which
+                    // for microscaling is the nominal 4/8 but we re-derive to
+                    // be safe); validate() cross-checks group_size.
+                    let (exp_bits, _exp_group) = MlxMicroQuant::mode_geometry(&layer.mode)
+                        .expect("micro mode has geometry");
+                    let row_bits = row_words * 32;
+                    if row_bits % exp_bits as u64 != 0 {
+                        return Err(MlxError::RowWidthIndivisible {
+                            name: weight_name.clone(),
+                            row_words,
+                            bits: exp_bits,
+                        });
+                    }
+                    let in_features = row_bits / exp_bits as u64;
+
+                    // Block scales are raw uint8 (E8M0 / E4M3) — not floats.
+                    if scales.dtype() != StDtype::U8 {
+                        return Err(MlxError::MicroScalesNotU8 {
+                            name: scales_name.clone(),
+                            dtype: scales.dtype(),
+                        });
+                    }
+
+                    let m = MlxMicroQuant {
+                        packed: Arc::from(weight.data().to_vec()),
+                        scales: scales.data().to_vec(),
+                        mode: layer.mode.clone(),
+                        group_size: layer.group_size,
+                        bits: exp_bits,
+                        shape: vec![out_features, in_features],
+                        name: weight_name.clone(),
+                    };
+                    m.validate()?;
+                    micro.insert(prefix, m);
+                }
+                MlxQuantMode::Other(_) => {
+                    return Err(MlxError::UnsupportedMode {
+                        module: prefix.clone(),
+                        mode: layer.mode.clone(),
+                    });
+                }
+            }
         }
-        let in_features = row_bits / layer.bits as u64;
-
-        let scales_f32 = floats_to_f32(&scales_name, &scales)?;
-        let biases_f32 = floats_to_f32(&biases_name, &biases)?;
-
-        let q = MlxAffineQuant {
-            // The uint32 tensor's raw LE bytes *are* the bitstream.
-            packed: Arc::from(weight.data().to_vec()),
-            scales: scales_f32,
-            biases: biases_f32,
-            group_size: layer.group_size,
-            bits: layer.bits,
-            shape: vec![out_features, in_features],
-            name: weight_name.clone(),
-        };
-        // Cross-check packed length + scale/bias counts vs geometry.
-        q.validate()?;
-        quant.insert(prefix, q);
     }
 
-    // Pass 3: everything not part of a quant triple is a full tensor.
-    for (name, view) in st.tensors() {
-        if consumed.contains(&name) {
+    // Pass 3: everything not part of a quant/micro group is a full tensor.
+    for (name, view) in tensors {
+        if consumed.contains(name) {
             continue;
         }
-        let dtype = full_dtype(&name, view.dtype())?;
+        let dtype = full_dtype(name, view.dtype())?;
         let shape: Vec<u64> = view.shape().iter().map(|&d| d as u64).collect();
         full.insert(
             name.clone(),
             MlxFullTensor {
-                name,
+                name: name.clone(),
                 dtype,
                 shape,
                 bytes: view.data().to_vec(),
@@ -520,30 +881,52 @@ pub fn load_mlx_from_bytes(
 ) -> Result<MlxModel, MlxError> {
     let config = MlxQuantConfig::parse_from_config_json(config_json)?
         .ok_or(MlxError::NotMlx)?;
+    let st = SafeTensors::deserialize(safetensors_bytes)?;
+    let tensors: BTreeMap<String, TensorView<'_>> = st.tensors().into_iter().collect();
     let mut quant = BTreeMap::new();
+    let mut micro = BTreeMap::new();
     let mut full = BTreeMap::new();
-    load_shard_into(&config, safetensors_bytes, &mut quant, &mut full)?;
+    collect_mlx_tensors(&config, &tensors, &mut quant, &mut micro, &mut full)?;
     Ok(MlxModel {
         config,
         quant,
+        micro,
         full,
     })
 }
 
-/// Load an MLX checkpoint from a model directory: read `config.json`,
-/// enumerate every `*.safetensors` shard, and merge their tensors. The
-/// tokenizer (`tokenizer.json`) is intentionally left to the caller /
-/// `rustllama-tokenizer`.
+/// Resolve the ordered list of `*.safetensors` shard files to load from a
+/// model directory.
 ///
-/// Shards are discovered by extension rather than by parsing
-/// `model.safetensors.index.json` — loading every shard is simpler and
-/// robust to a missing / out-of-date index.
-pub fn load_mlx_dir(dir: &Path) -> Result<MlxModel, MlxError> {
-    let config_json = std::fs::read_to_string(dir.join("config.json"))?;
-    let config = MlxQuantConfig::parse_from_config_json(&config_json)?
-        .ok_or(MlxError::NotMlx)?;
+/// Prefers `model.safetensors.index.json` (the canonical shard manifest):
+/// its `weight_map` names the shard file each tensor lives in, so we load
+/// exactly the referenced shards (robust to stray `.safetensors` in the
+/// dir). Falls back to globbing `*.safetensors` when there's no index or
+/// its `weight_map` is unusable — a single-file `model.safetensors` model
+/// has no index and is found by the glob.
+fn resolve_shard_paths(dir: &Path) -> Result<Vec<std::path::PathBuf>, MlxError> {
+    let index_path = dir.join("model.safetensors.index.json");
+    if index_path.is_file() {
+        let s = std::fs::read_to_string(&index_path)?;
+        let v: serde_json::Value = serde_json::from_str(&s)?;
+        if let Some(wm) = v.get("weight_map").and_then(|m| m.as_object()) {
+            // weight_map: tensor_name → shard_filename. Dedup to the set of
+            // referenced shards; BTreeSet gives a sorted, deterministic order.
+            let mut files: BTreeSet<String> = BTreeSet::new();
+            for val in wm.values() {
+                if let Some(f) = val.as_str() {
+                    files.insert(f.to_string());
+                }
+            }
+            if !files.is_empty() {
+                return Ok(files.into_iter().map(|f| dir.join(f)).collect());
+            }
+        }
+        // Index present but no usable weight_map → fall through to globbing.
+    }
 
-    // Collect shard paths, sorted so the merge order is deterministic.
+    // No (usable) index: load every `*.safetensors` shard, sorted so the
+    // merge order is deterministic.
     let mut shards: Vec<std::path::PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
@@ -552,17 +935,58 @@ pub fn load_mlx_dir(dir: &Path) -> Result<MlxModel, MlxError> {
         }
     }
     shards.sort();
+    if shards.is_empty() {
+        return Err(MlxError::NoShards);
+    }
+    Ok(shards)
+}
+
+/// Load an MLX checkpoint from a model directory: read `config.json`,
+/// resolve its `*.safetensors` shards (via `model.safetensors.index.json`
+/// when present, else by globbing), and **merge every shard's tensors into
+/// one map before matching quant groups**. The tokenizer (`tokenizer.json`)
+/// is intentionally left to the caller / `rustllama-tokenizer`.
+///
+/// Merging *before* matching is what makes sharding correct: HuggingFace
+/// shards split purely by byte size, so a module's `.weight`, `.scales` and
+/// `.biases` can land in **different** shards. Matching per-shard would miss
+/// any group straddling a shard boundary; merging first sees the whole
+/// tensor set at once.
+pub fn load_mlx_dir(dir: &Path) -> Result<MlxModel, MlxError> {
+    let config_json = std::fs::read_to_string(dir.join("config.json"))?;
+    let config = MlxQuantConfig::parse_from_config_json(&config_json)?
+        .ok_or(MlxError::NotMlx)?;
+
+    let shard_paths = resolve_shard_paths(dir)?;
+
+    // mmap + deserialize every shard, and hold the mmaps AND the parsed
+    // `SafeTensors` alive for the whole merge — the `TensorView`s borrow
+    // from them.
+    let mut mmaps = Vec::with_capacity(shard_paths.len());
+    for p in &shard_paths {
+        mmaps.push(crate::open_safetensors(p)?);
+    }
+    let mut sts = Vec::with_capacity(mmaps.len());
+    for m in &mmaps {
+        sts.push(SafeTensors::deserialize(&m[..])?);
+    }
+
+    // Merge all shards' tensors into one `name → view` map, then match.
+    let mut tensors: BTreeMap<String, TensorView<'_>> = BTreeMap::new();
+    for st in &sts {
+        for (name, view) in st.tensors() {
+            tensors.insert(name, view);
+        }
+    }
 
     let mut quant = BTreeMap::new();
+    let mut micro = BTreeMap::new();
     let mut full = BTreeMap::new();
-    for shard in shards {
-        // mmap each shard (validated + parsed by safetensors on deserialize).
-        let mmap = crate::open_safetensors(&shard)?;
-        load_shard_into(&config, &mmap[..], &mut quant, &mut full)?;
-    }
+    collect_mlx_tensors(&config, &tensors, &mut quant, &mut micro, &mut full)?;
     Ok(MlxModel {
         config,
         quant,
+        micro,
         full,
     })
 }
@@ -1054,13 +1478,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_affine_mode() {
+    fn rejects_unknown_mode() {
+        // A non-affine pair (weight u32 + scales u8, no biases) whose
+        // config mode is an unrecognized string → UnsupportedMode.
         let p = "model.layers.0.mlp.gate_proj";
-        let (blob, _, _, _) = make_mlx_blob(p, 4, 64, 32, 4);
-        let cfg_json = r#"{"quantization": {"group_size": 32, "bits": 4, "mode": "mxfp4"}}"#;
+        let blob = make_micro_blob(p, 4, 64, 32, 4, &vec![127u8; 4 * 2]).0;
+        let cfg_json =
+            r#"{"quantization": {"group_size": 32, "bits": 4, "mode": "frobnicate"}}"#;
         match load_mlx_from_bytes(cfg_json, &blob) {
-            Err(MlxError::UnsupportedMode { mode: MlxQuantMode::Mxfp4, .. }) => {}
+            Err(MlxError::UnsupportedMode {
+                mode: MlxQuantMode::Other(m),
+                ..
+            }) => assert_eq!(m, "frobnicate"),
             other => panic!("expected UnsupportedMode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn affine_mode_without_biases_is_rejected() {
+        // config says affine but the file ships no `.biases` → malformed.
+        let p = "model.layers.0.mlp.up_proj";
+        let blob = make_micro_blob(p, 4, 64, 32, 4, &vec![127u8; 4 * 2]).0;
+        let cfg_json = r#"{"quantization": {"group_size": 32, "bits": 4, "mode": "affine"}}"#;
+        match load_mlx_from_bytes(cfg_json, &blob) {
+            Err(MlxError::AffineMissingBiases { .. }) => {}
+            other => panic!("expected AffineMissingBiases, got {other:?}"),
         }
     }
 
@@ -1094,6 +1536,378 @@ mod tests {
         let blob = safetensors::serialize(&map, &None).unwrap();
         let cfg_json = r#"{"quantization": {"group_size": 64, "bits": 4}}"#;
         assert!(!is_mlx_model(cfg_json, &blob));
+    }
+
+    // --- non-affine microscaling (mxfp4 / mxfp8 / nvfp4) -----------------
+
+    /// Build a one-linear **non-affine** MLX safetensors blob:
+    ///   `<p>.weight` (u32 packed codes), `<p>.scales` (u8 block scales)
+    /// plus a bare `model.norm.weight` full tensor. NO `.biases` — that's
+    /// what marks it non-affine. `scale_bytes` is the raw E8M0/E4M3 byte
+    /// per group (len = out_f * in_f/group). Returns (blob, codes).
+    fn make_micro_blob(
+        p: &str,
+        out_f: usize,
+        in_f: usize,
+        group: usize,
+        bits: u32,
+        scale_bytes: &[u8],
+    ) -> (Vec<u8>, Vec<u32>) {
+        let n = out_f * in_f;
+        let maxv = 1u32 << bits;
+        let codes: Vec<u32> =
+            (0..n).map(|i| (i as u32).wrapping_mul(2246822519) % maxv).collect();
+        let row_words = in_f * bits as usize / 32;
+        let packed = pack_u32_le(&codes, bits);
+        assert_eq!(scale_bytes.len(), out_f * (in_f / group));
+
+        let norm = f16_bytes(&vec![1.0; out_f]);
+
+        let mut map: Map<String, TensorView<'_>> = Map::new();
+        let wv = TensorView::new(StDtype::U32, vec![out_f, row_words], &packed).unwrap();
+        let sv = TensorView::new(StDtype::U8, vec![out_f, in_f / group], scale_bytes).unwrap();
+        let nv = TensorView::new(StDtype::F16, vec![out_f], &norm).unwrap();
+        map.insert(format!("{p}.weight"), wv);
+        map.insert(format!("{p}.scales"), sv);
+        map.insert("model.norm.weight".to_string(), nv);
+        let blob = safetensors::serialize(&map, &None).unwrap();
+        (blob, codes)
+    }
+
+    // Local decoders mirroring the Wave-2 references, so the value checks
+    // below don't depend on `rustllama-gguf`'s crate-private helpers.
+    const E2M1: [f32; 16] = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ];
+    fn e8m0(b: u8) -> f32 {
+        if b == 0xFF {
+            f32::NAN
+        } else {
+            (2.0f32).powi(b as i32 - 127)
+        }
+    }
+    fn e4m3(b: u8) -> f32 {
+        let sign = (b & 0x80) != 0;
+        let exp = (b >> 3) & 0x0F;
+        let mant = b & 0x07;
+        if exp == 0x0F && mant == 0x07 {
+            return f32::NAN;
+        }
+        let v = if exp == 0 {
+            (mant as f32) * (1.0 / 512.0)
+        } else {
+            (1.0 + (mant as f32) / 8.0) * (2.0f32).powi(exp as i32 - 7)
+        };
+        if sign {
+            -v
+        } else {
+            v
+        }
+    }
+
+    #[test]
+    fn parses_non_affine_modes() {
+        for (s, want) in [
+            ("mxfp4", MlxQuantMode::Mxfp4),
+            ("mxfp8", MlxQuantMode::Mxfp8),
+            ("nvfp4", MlxQuantMode::Nvfp4),
+        ] {
+            let json = format!(
+                r#"{{"quantization": {{"group_size": 32, "bits": 4, "mode": "{s}"}}}}"#
+            );
+            let cfg = MlxQuantConfig::parse_from_config_json(&json).unwrap().unwrap();
+            assert_eq!(cfg.mode, want);
+        }
+    }
+
+    #[test]
+    fn loads_mxfp4_and_dequants_through_wave2() {
+        // in_f=128, group 32, 4-bit E2M1, E8M0 scales. Use a spread of
+        // scale exponents so a wrong element↔scale pairing would show.
+        let p = "model.layers.0.self_attn.q_proj";
+        let (out_f, in_f, group) = (4usize, 128usize, 32usize);
+        let n_groups = out_f * (in_f / group);
+        let scales: Vec<u8> = (0..n_groups).map(|g| (126 + g % 4) as u8).collect();
+        let (blob, codes) = make_micro_blob(p, out_f, in_f, group, 4, &scales);
+        let cfg_json = r#"{"quantization": {"group_size": 32, "bits": 4, "mode": "mxfp4"}}"#;
+
+        assert!(is_mlx_model(cfg_json, &blob), "mxfp4 (no biases) must detect as MLX");
+
+        let model = load_mlx_from_bytes(cfg_json, &blob).unwrap();
+        assert_eq!(model.quant.len(), 0, "no affine weights");
+        assert_eq!(model.micro.len(), 1, "one micro weight");
+        assert_eq!(model.full.len(), 1, "the norm");
+        let m = model.micro.get(p).expect("micro present");
+        assert_eq!(m.shape, vec![out_f as u64, in_f as u64]);
+        assert_eq!(m.mode, MlxQuantMode::Mxfp4);
+        assert_eq!((m.group_size, m.bits), (32, 4));
+        m.validate().unwrap();
+
+        // Repack → Wave-2 dequant, then check each cell is codebook*scale
+        // with the CORRECT per-group scale (the repack's whole job).
+        let blocks = m.to_gguf_blocks();
+        let n = (out_f * in_f) as usize;
+        let mut out = vec![0f32; n];
+        rustllama_gguf::dequant::dequant_mxfp4(&blocks, &mut out);
+        for i in 0..n {
+            let g = i / group;
+            let want = E2M1[codes[i] as usize] * e8m0(scales[g]);
+            assert!((out[i] - want).abs() < 1e-6, "cell {i}: {} vs {want}", out[i]);
+        }
+    }
+
+    #[test]
+    fn loads_mxfp8_and_dequants_through_wave2() {
+        // 8-bit E4M3 elements, E8M0 scales, group 32.
+        let p = "model.layers.0.mlp.down_proj";
+        let (out_f, in_f, group) = (2usize, 64usize, 32usize);
+        let n_groups = out_f * (in_f / group);
+        let scales: Vec<u8> = (0..n_groups).map(|g| (127 + g) as u8).collect();
+        let (blob, codes) = make_micro_blob(p, out_f, in_f, group, 8, &scales);
+        let cfg_json = r#"{"quantization": {"group_size": 32, "bits": 8, "mode": "mxfp8"}}"#;
+
+        let model = load_mlx_from_bytes(cfg_json, &blob).unwrap();
+        let m = model.micro.get(p).expect("micro present");
+        assert_eq!((m.group_size, m.bits), (32, 8));
+        assert_eq!(m.mode, MlxQuantMode::Mxfp8);
+
+        let blocks = m.to_gguf_blocks();
+        let n = (out_f * in_f) as usize;
+        let mut out = vec![0f32; n];
+        rustllama_gguf::dequant::dequant_mxfp8(&blocks, &mut out);
+        for i in 0..n {
+            let g = i / group;
+            // 8-bit code byte = the element's E4M3 byte directly.
+            let want = e4m3(codes[i] as u8) * e8m0(scales[g]);
+            if want.is_nan() {
+                assert!(out[i].is_nan(), "cell {i} expected NaN");
+            } else {
+                assert!((out[i] - want).abs() < 1e-5, "cell {i}: {} vs {want}", out[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn loads_nvfp4_and_dequants_through_wave2() {
+        // 4-bit E2M1 elements, group 16, E4M3 block scales.
+        let p = "model.layers.0.self_attn.v_proj";
+        let (out_f, in_f, group) = (3usize, 32usize, 16usize);
+        let n_groups = out_f * (in_f / group);
+        // 0x38 = E4M3 1.0; 0x40 = 2.0 — a two-value scale spread.
+        let scales: Vec<u8> = (0..n_groups)
+            .map(|g| if g % 2 == 0 { 0x38 } else { 0x40 })
+            .collect();
+        let (blob, codes) = make_micro_blob(p, out_f, in_f, group, 4, &scales);
+        let cfg_json = r#"{"quantization": {"group_size": 16, "bits": 4, "mode": "nvfp4"}}"#;
+
+        let model = load_mlx_from_bytes(cfg_json, &blob).unwrap();
+        let m = model.micro.get(p).expect("micro present");
+        assert_eq!((m.group_size, m.bits), (16, 4));
+        assert_eq!(m.mode, MlxQuantMode::Nvfp4);
+
+        let blocks = m.to_gguf_blocks();
+        let n = (out_f * in_f) as usize;
+        let mut out = vec![0f32; n];
+        rustllama_gguf::dequant::dequant_nvfp4(&blocks, &mut out);
+        for i in 0..n {
+            let g = i / group;
+            let want = E2M1[codes[i] as usize] * e4m3(scales[g]);
+            assert!((out[i] - want).abs() < 1e-6, "cell {i}: {} vs {want}", out[i]);
+        }
+    }
+
+    #[test]
+    fn micro_wrong_group_size_rejected() {
+        // config claims mxfp4 at group 64, but mxfp4 is fixed to group 32.
+        let p = "model.layers.0.mlp.gate_proj";
+        let scales = vec![127u8; 2 * (128 / 64)];
+        let (blob, _) = make_micro_blob(p, 2, 128, 64, 4, &scales);
+        let cfg_json = r#"{"quantization": {"group_size": 64, "bits": 4, "mode": "mxfp4"}}"#;
+        match load_mlx_from_bytes(cfg_json, &blob) {
+            Err(MlxError::MicroGeometry { expected_group: 32, group_size: 64, .. }) => {}
+            other => panic!("expected MicroGeometry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_affine_and_micro_in_one_model() {
+        // One affine layer (global affine) + one mxfp4 layer (per-layer
+        // override). Proves per-layer routing by biases-presence + mode.
+        let affine_p = "model.layers.0.self_attn.q_proj";
+        let micro_p = "model.layers.0.mlp.gate_proj";
+
+        // Affine triple via the affine helper (weight+scales+biases).
+        let (aff_blob, _, _, _) = make_mlx_blob(affine_p, 4, 128, 32, 4);
+        // Micro pair.
+        let micro_scales = vec![127u8; 4 * (128 / 32)];
+        let (mic_blob, _) = make_micro_blob(micro_p, 4, 128, 32, 4, &micro_scales);
+
+        // Merge the two blobs' tensors into one safetensors file.
+        let aff = SafeTensors::deserialize(&aff_blob).unwrap();
+        let mic = SafeTensors::deserialize(&mic_blob).unwrap();
+        let mut map: Map<String, TensorView<'_>> = Map::new();
+        for (n, v) in aff.tensors() {
+            map.insert(n, v);
+        }
+        for (n, v) in mic.tensors() {
+            // skip the duplicate norm from the second blob
+            if !map.contains_key(&n) {
+                map.insert(n, v);
+            }
+        }
+        let blob = safetensors::serialize(&map, &None).unwrap();
+
+        let cfg_json = format!(
+            r#"{{"quantization": {{"group_size": 32, "bits": 4, "mode": "affine",
+                 "{micro_p}": {{"group_size": 32, "bits": 4, "mode": "mxfp4"}}}}}}"#
+        );
+        let model = load_mlx_from_bytes(&cfg_json, &blob).unwrap();
+        assert_eq!(model.quant.len(), 1, "one affine");
+        assert_eq!(model.micro.len(), 1, "one micro");
+        assert!(model.quant.contains_key(affine_p));
+        assert!(model.micro.contains_key(micro_p));
+    }
+
+    // --- multi-shard loading (index.json weight_map) ---------------------
+
+    /// Write a 2-shard MLX model dir whose quant triple is deliberately
+    /// SPLIT across shards (weight in shard 1; scales + biases in shard 2),
+    /// plus a `model.safetensors.index.json` weight_map. Returns the dir.
+    fn write_split_shard_dir(tag: &str, with_index: bool) -> std::path::PathBuf {
+        let p = "model.layers.0.self_attn.q_proj";
+        let (out_f, in_f, group, bits) = (4usize, 128usize, 32usize, 4u32);
+        let n = out_f * in_f;
+        let codes: Vec<u32> = (0..n).map(|i| (i as u32).wrapping_mul(2246822519) % 16).collect();
+        let packed = pack_u32_le(&codes, bits);
+        let row_words = in_f * bits as usize / 32;
+        let n_groups = out_f * (in_f / group);
+        let scales: Vec<f32> = (0..n_groups).map(|g| 0.5 + g as f32 * 0.0625).collect();
+        let biases: Vec<f32> = (0..n_groups).map(|g| -0.25 + g as f32 * 0.03125).collect();
+        let norm = f16_bytes(&vec![1.0; out_f]);
+        let scales_b = f16_bytes(&scales);
+        let biases_b = f16_bytes(&biases);
+
+        let dir =
+            std::env::temp_dir().join(format!("rustllama-mlx-shard-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Shard 1: the packed weight + the full norm.
+        let mut m1: Map<String, TensorView<'_>> = Map::new();
+        m1.insert(
+            format!("{p}.weight"),
+            TensorView::new(StDtype::U32, vec![out_f, row_words], &packed).unwrap(),
+        );
+        m1.insert(
+            "model.norm.weight".into(),
+            TensorView::new(StDtype::F16, vec![out_f], &norm).unwrap(),
+        );
+        let b1 = safetensors::serialize(&m1, &None).unwrap();
+        std::fs::write(dir.join("model-00001-of-00002.safetensors"), &b1).unwrap();
+
+        // Shard 2: the scales + biases (same module → cross-shard triple).
+        let mut m2: Map<String, TensorView<'_>> = Map::new();
+        m2.insert(
+            format!("{p}.scales"),
+            TensorView::new(StDtype::F16, vec![out_f, in_f / group], &scales_b).unwrap(),
+        );
+        m2.insert(
+            format!("{p}.biases"),
+            TensorView::new(StDtype::F16, vec![out_f, in_f / group], &biases_b).unwrap(),
+        );
+        let b2 = safetensors::serialize(&m2, &None).unwrap();
+        std::fs::write(dir.join("model-00002-of-00002.safetensors"), &b2).unwrap();
+
+        if with_index {
+            let index = serde_json::json!({
+                "metadata": {"total_size": (b1.len() + b2.len())},
+                "weight_map": {
+                    format!("{p}.weight"): "model-00001-of-00002.safetensors",
+                    "model.norm.weight": "model-00001-of-00002.safetensors",
+                    format!("{p}.scales"): "model-00002-of-00002.safetensors",
+                    format!("{p}.biases"): "model-00002-of-00002.safetensors",
+                }
+            });
+            std::fs::write(
+                dir.join("model.safetensors.index.json"),
+                serde_json::to_string_pretty(&index).unwrap(),
+            )
+            .unwrap();
+        }
+
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"architectures":["Qwen2ForCausalLM"],"quantization":{"group_size":32,"bits":4}}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn multi_shard_merges_cross_shard_triple_via_index() {
+        let dir = write_split_shard_dir("idx", true);
+        let model = load_mlx_dir(&dir).unwrap();
+        // The affine triple, split across two shards, must still match.
+        assert_eq!(model.quant.len(), 1, "cross-shard triple merged");
+        assert_eq!(model.full.len(), 1, "the norm");
+        let q = model
+            .quant
+            .get("model.layers.0.self_attn.q_proj")
+            .expect("quant weight merged across shards");
+        assert_eq!(q.shape, vec![4, 128]);
+        q.validate().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_shard_merges_without_index_via_glob() {
+        // Same split, but NO index.json → glob-every-shard fallback also
+        // merges-before-matching, so the cross-shard triple still loads.
+        let dir = write_split_shard_dir("glob", false);
+        let model = load_mlx_dir(&dir).unwrap();
+        assert_eq!(model.quant.len(), 1, "cross-shard triple merged (glob path)");
+        assert!(model.quant.contains_key("model.layers.0.self_attn.q_proj"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_mlx_dir_detects_sharded_across_shards() {
+        // The regression this guards: detection must look ACROSS shards.
+        // Here the uint32 `.weight` is in shard 1 and `.scales` in shard 2,
+        // so a single-shard probe (old behavior) would miss the pair and
+        // mis-route the model away from the MLX loader.
+        let dir = write_split_shard_dir("detect-idx", true);
+        assert!(is_mlx_dir(&dir), "sharded MLX dir (index) must detect as MLX");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir2 = write_split_shard_dir("detect-glob", false);
+        assert!(is_mlx_dir(&dir2), "sharded MLX dir (glob) must detect as MLX");
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn is_mlx_dir_false_without_quant_block() {
+        // A dir with a safetensors shard but no `quantization` block in
+        // config.json is not MLX.
+        let dir = std::env::temp_dir()
+            .join(format!("rustllama-mlx-notmlx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let norm = f16_bytes(&vec![1.0; 4]);
+        let mut map: Map<String, TensorView<'_>> = Map::new();
+        map.insert(
+            "model.norm.weight".into(),
+            TensorView::new(StDtype::F16, vec![4], &norm).unwrap(),
+        );
+        let blob = safetensors::serialize(&map, &None).unwrap();
+        std::fs::write(dir.join("model.safetensors"), &blob).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"],"hidden_size":4}"#,
+        )
+        .unwrap();
+        assert!(!is_mlx_dir(&dir), "no quant block → not MLX");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- writer (produce path) -------------------------------------------

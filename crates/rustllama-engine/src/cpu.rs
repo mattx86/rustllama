@@ -1941,38 +1941,18 @@ impl CpuEngine {
         }
     }
 
-    /// Cheap MLX-directory probe: does `dir` hold a `config.json` with a
-    /// `quantization` block AND a `.safetensors` shard carrying `.scales` +
-    /// `.biases` sibling tensors? That pair is what distinguishes an MLX
-    /// affine checkpoint from AWQ/GPTQ (which ship `.scales` + `.qzeros`,
-    /// no `.biases`) and from a plain fp16 HF dump. Any IO / parse error is
-    /// swallowed as `false` — an unreadable or non-MLX dir simply isn't
-    /// routed to the MLX loader. Only the safetensors HEADER is parsed
-    /// (via mmap), so this stays cheap even for multi-GB shards.
+    /// MLX-directory probe: does `dir` hold a `config.json` with a
+    /// `quantization` block AND — across ALL its `*.safetensors` shards
+    /// merged — a packed uint32 `.weight` next to a `.scales` sibling? That
+    /// uint32-weight + scales pair distinguishes an MLX checkpoint (affine OR
+    /// non-affine mxfp4/mxfp8/nvfp4) from AWQ/GPTQ (whose packed tensor is
+    /// `.qweight`) and from a plain fp16 HF dump. Delegates to the
+    /// shard-aware [`rustllama_safetensors::is_mlx_dir`], which merges every
+    /// shard's HEADER (via mmap — no weight data read) before matching, so a
+    /// sharded model whose `.weight` and `.scales` land in different shards
+    /// is still detected. Any IO / parse error is swallowed as `false`.
     fn is_mlx_dir(dir: &Path) -> bool {
-        let Ok(config_json) = std::fs::read_to_string(dir.join("config.json")) else {
-            return false;
-        };
-        // Prefer the canonical single shard; else the first `*.safetensors`.
-        let st_path = {
-            let single = dir.join("model.safetensors");
-            if single.is_file() {
-                Some(single)
-            } else {
-                std::fs::read_dir(dir).ok().and_then(|rd| {
-                    rd.filter_map(|e| e.ok().map(|e| e.path())).find(|p| {
-                        p.extension().and_then(|x| x.to_str()) == Some("safetensors")
-                    })
-                })
-            }
-        };
-        let Some(st_path) = st_path else {
-            return false;
-        };
-        let Ok(mmap) = rustllama_safetensors::open_safetensors(&st_path) else {
-            return false;
-        };
-        rustllama_safetensors::is_mlx_model(&config_json, &mmap[..])
+        rustllama_safetensors::is_mlx_dir(dir)
     }
 
     /// Load a HuggingFace `.safetensors` checkpoint (AWQ, GPTQ, or
@@ -2182,6 +2162,7 @@ impl CpuEngine {
         let mlx = rustllama_safetensors::load_mlx_dir(dir)
             .map_err(|e| CpuEngineError::Other(format!("mlx safetensors load: {e}")))?;
         let n_quant = mlx.quant.len();
+        let n_micro = mlx.micro.len();
         let n_full = mlx.full.len();
         let converted = Self::mlx_model_to_converted(&mlx)?;
         let model =
@@ -2230,8 +2211,10 @@ impl CpuEngine {
             ctx_train = cfg.ctx_train,
             ctx = ctx,
             quant_weights = n_quant,
+            micro_weights = n_micro,
             full_tensors = n_full,
-            "MLX model loaded (affine → GGUF-quant transcode; GPU-capable) — engine ready"
+            "MLX model loaded (affine + mxfp4/mxfp8/nvfp4 → GGUF-quant transcode; \
+             GPU-capable) — engine ready"
         );
 
         let delta_net_cache = build_delta_net_cache(&model);
@@ -2413,6 +2396,69 @@ impl CpuEngine {
              slim build)"
         );
 
+        // --- Non-affine microscaling weights (MXFP4 / MXFP8 / NVFP4) ----
+        // Real mlx-lm also ships microscaling checkpoints (no `.biases`;
+        // E8M0/E4M3 uint8 block scales). Each is repacked from MLX's packed
+        // layout into our GGUF-style block bytes, dequantized via the
+        // already-parity-checked Wave-2 reference, and RE-ENCODED to the SAME
+        // GGUF block-quant the affine path targets (4-bit → Q4_K/Q4_1, 8-bit
+        // → Q8_0). So MXFP/NVFP MLX models run on the identical mature,
+        // autotuned CPU/SYCL/CUDA/MLX-Metal quant kernels with zero
+        // format-specific dispatch — the FP4→Q4_K requant is near-lossless
+        // (Q4_K carries more per-weight precision than FP4). We emit the
+        // existing ConvertedDtype variants rather than a native
+        // `Mxfp4Raw`/… tensor to reuse the proven affine downstream (the
+        // ConvertedDtype → Tensor bridge has no micro-raw variant); a native
+        // no-requant path would need new ConvertedDtype + builder wiring.
+        if !mlx.micro.is_empty() {
+            #[cfg(not(feature = "encoder"))]
+            {
+                return Err(CpuEngineError::Other(format!(
+                    "MLX non-affine (mxfp4/mxfp8/nvfp4) weights need the \
+                     `encoder` feature to transcode to a GGUF block-quant; \
+                     this slim build cannot load {} such weight(s)",
+                    mlx.micro.len()
+                )));
+            }
+            #[cfg(feature = "encoder")]
+            {
+                let (mut nm_q4_1, mut nm_q4_k, mut nm_q8_0) = (0usize, 0usize, 0usize);
+                for (module, m) in &mlx.micro {
+                    let Some(gguf_name) = quant_name_to_gguf(module) else {
+                        tracing::debug!(
+                            module = %module,
+                            "mlx load: micro module has no GGUF mapping — skipping"
+                        );
+                        continue;
+                    };
+                    m.validate().map_err(|e| {
+                        CpuEngineError::Other(format!("mlx micro weight `{module}`: {e}"))
+                    })?;
+                    let (dtype, bytes) = Self::mlx_micro_to_converted_bytes(m)?;
+                    match dtype {
+                        ConvertedDtype::Q4_1Raw => nm_q4_1 += 1,
+                        ConvertedDtype::Q4_KRaw => nm_q4_k += 1,
+                        ConvertedDtype::Q8_0Raw => nm_q8_0 += 1,
+                        _ => {}
+                    }
+                    out.push(ConvertedTensor {
+                        gguf_name,
+                        shape: m.shape.clone(),
+                        dtype,
+                        bytes,
+                    });
+                }
+                tracing::info!(
+                    micro_weights = mlx.micro.len(),
+                    transcoded_q4_1 = nm_q4_1,
+                    transcoded_q4_k = nm_q4_k,
+                    transcoded_q8_0 = nm_q8_0,
+                    "mlx load: non-affine (mxfp4/mxfp8/nvfp4) transcode complete \
+                     (repack → Wave-2 dequant → GGUF block-quant)"
+                );
+            }
+        }
+
         // --- Full-precision tensors → pass through ----------------------
         for (name, full) in &mlx.full {
             let Some(gguf_name) = full_name_to_gguf(name) else {
@@ -2493,35 +2539,17 @@ impl CpuEngine {
         let target_bits = if force_native || n % 32 != 0 { 0 } else { q.bits };
 
         match target_bits {
-            4 => {
+            4 | 8 => {
                 let f32buf = Self::mlx_dequant_affine_f32(q, n);
-                // Prefer **Q4_K** when the row length (`in_features`, the
-                // quantized/contraction dim) is a multiple of QK_K = 256. Q4_K
-                // is higher quality-per-bit than Q4_1, but it quantizes each
-                // row in 256-weight super-blocks, so a 256-aligned
-                // `in_features` is required to keep every super-block inside
-                // one weight row — the no-cross-row invariant Q4_1's block-32
-                // gets for free. (`n` is then a multiple of 256 too, since
-                // `n = out_features * in_features`.) Otherwise fall back to
-                // Q4_1 (block-32 fits any multiple of 32).
-                if q.in_features() % 256 == 0 {
-                    // Q4_K: 144 B / 256-weight super-block.
-                    let mut enc = vec![0u8; (n / 256) * 144];
-                    rustllama_gguf::encode_k::encode_q4_k(&f32buf, &mut enc);
-                    (ConvertedDtype::Q4_KRaw, enc)
-                } else {
-                    // Q4_1: 20 B / 32-weight block (f16 d + f16 min + 16 B codes).
-                    let mut enc = vec![0u8; (n / 32) * 20];
-                    rustllama_gguf::encode::encode_q4_1(&f32buf, &mut enc);
-                    (ConvertedDtype::Q4_1Raw, enc)
-                }
-            }
-            8 => {
-                let f32buf = Self::mlx_dequant_affine_f32(q, n);
-                // Q8_0: 34 B / 32-weight block (f16 d + 32 × i8 codes).
-                let mut enc = vec![0u8; (n / 32) * 34];
-                rustllama_gguf::encode::encode_q8_0(&f32buf, &mut enc);
-                (ConvertedDtype::Q8_0Raw, enc)
+                // Dequantized f32 → the matching GGUF block-quant (4-bit →
+                // Q4_K/Q4_1, 8-bit → Q8_0). Shared with the micro path.
+                Self::transcode_f32_to_gguf(&f32buf, target_bits, q.in_features())
+                    .unwrap_or_else(|| {
+                        // Unreachable for a real affine weight (in_features is
+                        // a multiple of group_size ⇒ of 32); keep native as a
+                        // defensive fallback rather than panicking.
+                        (ConvertedDtype::MlxAffineRaw, q.to_blob())
+                    })
             }
             // Native fallback: odd bit-width (2/3/5/6), RUSTLLAMA_MLX_NATIVE=1,
             // or a non-block-32 geometry.
@@ -2557,6 +2585,102 @@ impl CpuEngine {
             &mut f32buf,
         );
         f32buf
+    }
+
+    /// Re-encode a dequantized f32 weight (row-major `[out_features,
+    /// in_features]`) to the matching GGUF block-quant. Shared by the MLX
+    /// affine and non-affine (micro) transcode paths.
+    ///
+    /// **Target-format policy** (same as the affine path's docs):
+    ///   - **4-bit → `Q4_K`** when `in_features % 256 == 0` (256-weight
+    ///     super-blocks must stay inside one weight row), **else `Q4_1`**
+    ///     (block-32, fits any multiple of 32).
+    ///   - **8-bit → `Q8_0`** (block-32 symmetric int8).
+    ///
+    /// Returns `None` when the geometry can't host the block-quant without a
+    /// block straddling a weight-row boundary (`in_features` not a multiple
+    /// of 32 — impossible for affine/mxfp4/mxfp8, only reachable by an
+    /// exotic nvfp4 shape), or for an unsupported `bits`. Callers decide the
+    /// fallback (affine keeps native; micro errors).
+    #[cfg(feature = "encoder")]
+    fn transcode_f32_to_gguf(
+        f32buf: &[f32],
+        bits: u32,
+        in_features: u64,
+    ) -> Option<(rustllama_safetensors::ConvertedDtype, Vec<u8>)> {
+        use rustllama_safetensors::ConvertedDtype;
+        let n = f32buf.len();
+        match bits {
+            4 => {
+                if in_features % 256 == 0 {
+                    // Q4_K: 144 B / 256-weight super-block.
+                    let mut enc = vec![0u8; (n / 256) * 144];
+                    rustllama_gguf::encode_k::encode_q4_k(f32buf, &mut enc);
+                    Some((ConvertedDtype::Q4_KRaw, enc))
+                } else if in_features % 32 == 0 {
+                    // Q4_1: 20 B / 32-weight block (f16 d + f16 min + 16 B codes).
+                    let mut enc = vec![0u8; (n / 32) * 20];
+                    rustllama_gguf::encode::encode_q4_1(f32buf, &mut enc);
+                    Some((ConvertedDtype::Q4_1Raw, enc))
+                } else {
+                    None
+                }
+            }
+            8 => {
+                if in_features % 32 == 0 {
+                    // Q8_0: 34 B / 32-weight block (f16 d + 32 × i8 codes).
+                    let mut enc = vec![0u8; (n / 32) * 34];
+                    rustllama_gguf::encode::encode_q8_0(f32buf, &mut enc);
+                    Some((ConvertedDtype::Q8_0Raw, enc))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Transcode one non-affine microscaling MLX weight (`mxfp4` / `mxfp8` /
+    /// `nvfp4`) to a GGUF block-quant [`ConvertedTensor`] payload.
+    ///
+    /// Path: repack MLX's `(packed uint32 codes, uint8 block scales)` into
+    /// our GGUF-style block bytes ([`MlxMicroQuant::to_gguf_blocks`]) →
+    /// dequantize via the already-parity-checked Wave-2 reference
+    /// (`dequant_mxfp4/mxfp8/nvfp4`, byte-exact with the SYCL/CUDA kernels)
+    /// → re-encode to Q4_K/Q4_1 (4-bit) or Q8_0 (8-bit). The FP4→Q4_K
+    /// requant is near-lossless (Q4_K carries more per-weight precision than
+    /// FP4). Reusing the affine downstream (shared `transcode_f32_to_gguf`)
+    /// means MXFP/NVFP MLX models run on every backend's mature quant
+    /// kernels with zero format-specific dispatch.
+    #[cfg(feature = "encoder")]
+    fn mlx_micro_to_converted_bytes(
+        m: &rustllama_safetensors::MlxMicroQuant,
+    ) -> Result<(rustllama_safetensors::ConvertedDtype, Vec<u8>)> {
+        use rustllama_safetensors::MlxQuantMode;
+        let n = m.n_elements() as usize;
+        let blocks = m.to_gguf_blocks();
+        let mut f32buf = vec![0f32; n];
+        match m.mode {
+            MlxQuantMode::Mxfp4 => rustllama_gguf::dequant::dequant_mxfp4(&blocks, &mut f32buf),
+            MlxQuantMode::Mxfp8 => rustllama_gguf::dequant::dequant_mxfp8(&blocks, &mut f32buf),
+            MlxQuantMode::Nvfp4 => rustllama_gguf::dequant::dequant_nvfp4(&blocks, &mut f32buf),
+            ref other => {
+                return Err(CpuEngineError::Other(format!(
+                    "mlx micro weight `{}`: non-micro mode {other:?} reached the \
+                     micro transcoder",
+                    m.name
+                )));
+            }
+        }
+        Self::transcode_f32_to_gguf(&f32buf, m.bits, m.in_features()).ok_or_else(|| {
+            CpuEngineError::Other(format!(
+                "mlx micro weight `{}`: geometry (in_features {}, {} bits) has no \
+                 faithful GGUF block-quant target",
+                m.name,
+                m.in_features(),
+                m.bits
+            ))
+        })
     }
 
     /// Test-only hook: install a pre-loaded vision tower and a chosen
