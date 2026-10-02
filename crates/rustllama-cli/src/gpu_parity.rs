@@ -1267,6 +1267,63 @@ fn cu_grade(
     cu_emit(name, key, &format!("cos={cos:.6} max_rel={max_rel:.4}"));
 }
 
+/// Blackwell FP4 tensor-core GEMM parity probe. Builds N f32 activation rows,
+/// computes the batched CPU reference `out[n*M + m]` via the scalar FP4 matvec
+/// (`cpu_row` is the per-row W×x kernel), runs the TC GEMM, and grades with a
+/// loose W4A4-vs-W4A16 gate. `w` is the packed FP4 weight (M×K).
+#[allow(clippy::too_many_arguments)]
+fn cu_fp4_tc_probe(
+    stream: &ck::CudaStream,
+    name: &str,
+    kind: ck::CudaFp4TcKind,
+    w: &[u8],
+    cpu_row: fn(&[u8], &[f32], &mut [f32], usize, usize),
+    m: usize,
+    k: usize,
+    n: usize,
+    counts: &mut std::collections::BTreeMap<&'static str, usize>,
+) {
+    let x = gen_x(n * k, 123);
+    // Batched reference: out[n*M + m] = row_n · W[m] (col-major in M, as the
+    // GEMM writes it).
+    let mut cpu = vec![0f32; n * m];
+    for ni in 0..n {
+        let mut row = vec![0f32; m];
+        cpu_row(w, &x[ni * k..(ni + 1) * k], &mut row, m, k);
+        cpu[ni * m..(ni + 1) * m].copy_from_slice(&row);
+    }
+    let (Some(wb), Some(xb), Some(mut ob)) = (
+        ck::CudaDeviceBuffer::from_host(stream, w),
+        cu_upload_f32(stream, &x),
+        ck::CudaDeviceBuffer::alloc(stream, n * m * 4),
+    ) else {
+        cu_emit(name, "KERNEL_ERR", "device-alloc-failed");
+        *counts.entry("KERNEL_ERR").or_default() += 1;
+        return;
+    };
+    // SAFETY: wb (M×K FP4 blocks), xb (N·K f32), ob (N·M f32) are live device
+    // buffers on `stream`; the wrapper synchronizes before returning.
+    let res = unsafe {
+        ck::gemm_fp4_tc_f32(
+            kind,
+            stream,
+            wb.as_ptr(),
+            xb.as_ptr() as *const f32,
+            ob.as_mut_ptr() as *mut f32,
+            m,
+            n,
+            k,
+        )
+    };
+    match res {
+        Err(e) => {
+            cu_emit(name, "KERNEL_ERR", &format!("{e}"));
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+        }
+        Ok(()) => cu_grade(name, &cu_download_f32(&ob, n * m), &cpu, 0.85, 0.60, counts),
+    }
+}
+
 // ---- CPU references for the forward-pass kernels ----
 
 fn ref_rope(qk: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, inv_freq: &[f32]) {
@@ -1463,6 +1520,40 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 &mut counts,
             ),
         }
+    }
+
+    // ---- Blackwell SM12x FP4 tensor-core GEMM (W4A4) ----
+    // The new hand-rolled block-scaled `mma.sync` path (cuda/rsl_blackwell.cuh).
+    // SKIP unless this is a real SM12x Blackwell device built with the TC path
+    // (RUSTLLAMA_CUDA_ARCHS including sm_120a/121a). The TC GEMM quantizes the
+    // activation to FP4 on the fly (W4A4), while the CPU reference keeps f32
+    // activations (W4A16), so the gate is deliberately LOOSE — it catches gross
+    // fragment/scale layout bugs (which drive cosine toward 0), not the
+    // activation-quant error. On-device numbers on the Spark settle the real
+    // tolerance; until then every assumption tagged SPARK-VALIDATE in the
+    // header is what this probe exists to check.
+    if !ck::blackwell_tc_available(0) {
+        for nm in ["gemm:nvfp4_tc(W4A4)", "gemm:mxfp4_tc(W4A4)"] {
+            cu_emit(nm, "SKIP", "not-sm12x-blackwell-or-no-tc-build");
+            *counts.entry("SKIP").or_default() += 1;
+        }
+    } else {
+        let (m, kd, n) = (64usize, 128usize, 16usize); // K % 64 == 0
+        // NVFP4 weight: quantize random f32 → valid per-16 E4M3 blocks.
+        let wsrc = gen_x(m * kd, 77);
+        let mut wnv = vec![0u8; m * (kd / 16) * 9];
+        k::nvfp4::quantize_matrix(m, kd, &wsrc, &mut wnv);
+        cu_fp4_tc_probe(
+            &stream, "gemm:nvfp4_tc(W4A4)", ck::CudaFp4TcKind::Nvfp4, &wnv,
+            k::nvfp4::matvec_nvfp4_w_f32_a, m, kd, n, &mut counts,
+        );
+        // MXFP4 weight: reuse the harness's valid-byte synth (per-32 E8M0).
+        let mx_layout = LAYOUTS.iter().find(|l| l.name == "mxfp4").expect("layout");
+        let wmx = gen_quant_bytes(mx_layout, m, kd, 0xC0FFEE);
+        cu_fp4_tc_probe(
+            &stream, "gemm:mxfp4_tc(W4A4)", ck::CudaFp4TcKind::Mxfp4, &wmx,
+            k::mxfp::matvec_mxfp4_w_f32_a, m, kd, n, &mut counts,
+        );
     }
 
     // ---- Dense f32 matvec (host-copy reference wrapper) ----

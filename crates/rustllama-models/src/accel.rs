@@ -183,6 +183,58 @@ fn try_matvec_packed_cuda_batched(
     guard.matvec_packed_batched(kind, weight_key, w_bytes, x, out, m, k, n)
 }
 
+// ------------------------------------------------------------
+// Blackwell SM12x FP4 tensor-core GEMM dispatch (opt-in)
+// ------------------------------------------------------------
+
+/// Map a weight [`Dtype`] to the Blackwell FP4 tensor-core kind, or `None`
+/// (the dtype has no FP4 TC path — fall through to the scalar dispatch).
+fn dtype_to_fp4_tc_kind(dtype: Dtype) -> Option<ck::CudaFp4TcKind> {
+    match dtype {
+        Dtype::Nvfp4Raw => Some(ck::CudaFp4TcKind::Nvfp4),
+        Dtype::Mxfp4Raw => Some(ck::CudaFp4TcKind::Mxfp4),
+        _ => None,
+    }
+}
+
+/// Whether the Blackwell FP4 tensor-core GEMM path is enabled. **DEFAULT OFF**:
+/// the TC path quantizes activations to FP4 (W4A4 — extra error vs the scalar
+/// W4A16 path) and its fragment/scale layout is pending on-device validation
+/// (`doctor --cuda-parity`) on the Spark, so it is gated behind the opt-in
+/// `RUSTLLAMA_FP4_TC=1` AND a real SM12x Blackwell device built with the TC
+/// path (`ck::blackwell_tc_available`). Cached once (process-wide).
+fn fp4_tc_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        let on = std::env::var("RUSTLLAMA_FP4_TC")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        on && cuda_active() && ck::blackwell_tc_available(0)
+    })
+}
+
+/// Batched FP4 tensor-core GEMM via the CUDA cache. `false` on any miss so the
+/// caller falls through to the scalar CUDA/SYCL/CPU ladder (untouched `out`).
+#[allow(clippy::too_many_arguments)]
+fn try_gemm_fp4_tc_batched(
+    kind: ck::CudaFp4TcKind,
+    weight_key: usize,
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    guard.gemm_fp4_tc(kind, weight_key, w_bytes, x, out, m, k, n)
+}
+
 // ============================================================
 // Native MLX packed-matvec dispatch (Apple Metal backend)
 // ============================================================
@@ -9937,6 +9989,30 @@ pub fn try_matvec_tensor_batched_usm_f32(
                         }
                     }
                 }
+            }
+        }
+    }
+    // Blackwell SM12x FP4 tensor-core GEMM (W4A4) — tried BEFORE the scalar
+    // CUDA packed path. OPT-IN and inert unless RUSTLLAMA_FP4_TC=1 on a real
+    // SM12x Blackwell TC build (`fp4_tc_enabled()` folds both). Only for the
+    // prefill-size batches that amortize the tensor core (n >= 16) with
+    // K % 64 == 0; decode-size N and other K stay on the scalar GEMV. A TC
+    // miss (returns false) falls straight through to the scalar block below —
+    // byte-identical behavior on every non-opted-in / non-Blackwell host.
+    if fp4_tc_enabled()
+        && !tensor_forced_to_cpu(&w.name)
+        && current_layer_idx() < n_gpu_layers()
+        && m != 0
+        && k != 0
+        && n >= 16
+        && (k % 64 == 0)
+        && x.len() == n * k
+        && out.len() == n * m
+    {
+        if let Some(tc_kind) = dtype_to_fp4_tc_kind(w.dtype) {
+            let wb = as_bytes(w);
+            if try_gemm_fp4_tc_batched(tc_kind, wb.as_ptr() as usize, wb, x, out, m, k, n) {
+                return true;
             }
         }
     }

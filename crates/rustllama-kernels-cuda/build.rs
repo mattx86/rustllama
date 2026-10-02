@@ -25,6 +25,11 @@ fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     println!("cargo:rerun-if-changed={}", src.display());
     println!("cargo:rerun-if-changed={}", inc.join("rsl_cuda.h").display());
+    // Blackwell SM12x tensor-core kernels (included by rsl_cuda.cu).
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest.join("cuda").join("rsl_blackwell.cuh").display()
+    );
     println!("cargo:rerun-if-env-changed=RUSTLLAMA_CUDA_ARCHS");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDACXX");
@@ -77,6 +82,26 @@ fn main() {
     for a in &arch_list {
         cmd.arg(format!("-gencode=arch=compute_{a},code=sm_{a}"));
     }
+    // Blackwell SM12x tensor-core path (rsl_blackwell.cuh). The block-scaled
+    // FP4 / FP8 / FP6 / sparse `mma.sync` instructions are ONLY legal on an
+    // *architecture-accelerated* target — `sm_120a` / `sm_121a` (the DGX Spark
+    // GB10 is sm_121) or the family `sm_12xf` — NOT plain `sm_120`. ptxas
+    // rejects them on `.target sm_120`. `arch_major_of` strips the trailing
+    // `a`/`f`; when the arch list names an SM12x accelerated target we define
+    // `RSL_BLACKWELL_TC` so the real `mma.sync` path compiles; otherwise it
+    // stays undefined and the kernels fall back to a scalar body (so the
+    // default Ampere→Hopper build, and any plain `sm_120`, compile cleanly).
+    // The device code additionally guards on `__CUDA_ARCH__ >= 1200`, so in a
+    // mixed list (e.g. "90;121a") the non-Blackwell passes take the fallback.
+    let blackwell_tc = arch_list.iter().any(|a| {
+        let suffixed = a.ends_with('a') || a.ends_with('f');
+        suffixed && arch_major_of(a).map(|m| (120..=129).contains(&m)).unwrap_or(false)
+    });
+    if blackwell_tc {
+        cmd.arg("-DRSL_BLACKWELL_TC=1");
+        // The accelerated mma needs the newer PTX ISA; CUDA 12.8+ supplies it.
+        println!("cargo:warning=rustllama-kernels-cuda: Blackwell SM12x tensor-core path ENABLED (RSL_BLACKWELL_TC) for arch list {archs}");
+    }
     // Also embed PTX for the HIGHEST requested arch. `code=sm_X` bakes in
     // SASS only, which the driver will NOT run on a newer GPU — so a build
     // for sm_80..90 fails on Blackwell (e.g. the GB10 in an NVIDIA DGX
@@ -86,7 +111,7 @@ fn main() {
     // RUSTLLAMA_CUDA_ARCHS to the target's native SM for best perf.
     if let Some(max) = arch_list
         .iter()
-        .max_by_key(|a| a.parse::<u32>().unwrap_or(0))
+        .max_by_key(|a| arch_major_of(a).unwrap_or(0))
     {
         cmd.arg(format!("-gencode=arch=compute_{max},code=compute_{max}"));
     }
@@ -274,6 +299,16 @@ fn parse_extern_rsl_cuda_fns(lib_rs: &std::path::Path) -> Vec<String> {
         }
     }
     names
+}
+
+/// Parse the numeric SM major from an arch token, tolerating the
+/// architecture-accelerated (`a`) and family (`f`) suffixes: `"90"`→90,
+/// `"120a"`→120, `"121f"`→121. `None` when the token has no leading digits.
+/// Used both to pick the highest arch for the forward-compat PTX line and to
+/// detect an SM12x accelerated target for the Blackwell tensor-core gate.
+fn arch_major_of(a: &str) -> Option<u32> {
+    let digits: String = a.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u32>().ok()
 }
 
 /// Resolve the `nvcc` compiler. `CUDACXX` wins; otherwise prefer the

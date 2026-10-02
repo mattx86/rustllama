@@ -2675,3 +2675,13 @@ extern "C" int rsl_cuda_flash_attn_prefill_q8_0(rsl_cuda_stream *s, const float 
     return rsl_cuda_check("rsl_cuda_flash_attn_prefill_q8_0");
 }
 
+// ============================================================
+// Blackwell SM12x tensor-core GEMMs (FP4 / FP8 / FP6 / TMA / 2:4 sparse).
+// Included LAST so it can reuse this TU's decoders (RSL_NVFP4_CODEBOOK,
+// rsl_e4m3_to_f32, rsl_e8m0_to_f32, rsl_e3m2_to_f32), the rsl_cuda_stream
+// struct, and rsl_cuda_check. Real `mma.sync` path compiles only for an
+// SM12x architecture-accelerated build (build.rs -DRSL_BLACKWELL_TC); else a
+// scalar fallback. See the header's banner for the WRITE-BLIND discipline.
+// ============================================================
+#include "rsl_blackwell.cuh"
+

@@ -430,7 +430,83 @@ extern "C" {
         out_idx: *mut c_int,
     ) -> c_int;
 
+    // ---- Blackwell SM12x tensor-core GEMMs (cuda/rsl_blackwell.cuh) ----
+    // `*_available` is 1 only when this binary compiled the real `mma.sync`
+    // path (an SM12x `a`/`f` arch was in RUSTLLAMA_CUDA_ARCHS) AND device
+    // `dev` is SM12x Blackwell. The GEMM entry points take W (M×K, packed
+    // FP4), X (N×K f32, quantized to FP4 in-kernel => W4A4), OUT (N×M f32),
+    // and return -2 when the TC path is unavailable so the caller falls back.
+    fn rsl_cuda_blackwell_tc_available(dev: c_int) -> c_int;
+    fn rsl_cuda_gemm_nvfp4_tc_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_gemm_mxfp4_tc_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+    ) -> c_int;
+
     fn rsl_cuda_consume_error_count() -> c_int;
+}
+
+/// Whether this binary compiled the Blackwell SM12x tensor-core GEMM path
+/// (an `a`/`f` SM12x arch was in `RUSTLLAMA_CUDA_ARCHS`) AND device `dev` is a
+/// real SM12x Blackwell GPU. `false` on every non-Blackwell host and on a
+/// default (Ampere→Hopper) build — callers keep the scalar packed path there.
+pub fn blackwell_tc_available(dev: u32) -> bool {
+    // SAFETY: no pointer args; the shim queries cudaDeviceProp internally.
+    unsafe { rsl_cuda_blackwell_tc_available(dev as c_int) == 1 }
+}
+
+/// The Blackwell FP4 tensor-core GEMMs. `kind` selects NVFP4 vs MXFP4. See the
+/// extern block's note for the operand contract. Returns `Err(Kernel(-2))`
+/// when the TC path is unavailable (the caller then uses the scalar path);
+/// any other non-zero rc is a launch error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CudaFp4TcKind {
+    Nvfp4,
+    Mxfp4,
+}
+
+/// Run a Blackwell FP4 tensor-core GEMM: `out[N×M] = X[N×K] · W[M×K]ᵀ`, W in
+/// FP4 (NVFP4/MXFP4) blocks, X f32 (quantized to FP4 on the fly). `K % 64 == 0`.
+///
+/// # Safety
+/// `w`/`x`/`out` must be live device buffers on `stream` sized for (M,N,K):
+/// `w` = M rows of FP4 blocks, `x` = N·K f32, `out` = N·M f32.
+pub unsafe fn gemm_fp4_tc_f32(
+    kind: CudaFp4TcKind,
+    stream: &CudaStream,
+    w: *const c_void,
+    x: *const f32,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), CudaError> {
+    let rc = match kind {
+        CudaFp4TcKind::Nvfp4 => {
+            rsl_cuda_gemm_nvfp4_tc_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int)
+        }
+        CudaFp4TcKind::Mxfp4 => {
+            rsl_cuda_gemm_mxfp4_tc_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int)
+        }
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
 }
 
 /// Number of visible NVIDIA CUDA devices (0 when none / driver absent).
@@ -1980,6 +2056,64 @@ impl CudaMatvecCache {
                 CudaPackedKind::Pq2_0 => matvec_pq2_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
             }
         };
+        if res.is_err() || consume_error_count() != 0 {
+            return false;
+        }
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * m * 4) };
+        self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
+
+    /// Blackwell FP4 tensor-core batched GEMM (W4A4) — the TC analogue of
+    /// [`matvec_packed_batched`](Self::matvec_packed_batched) for NVFP4/MXFP4
+    /// weights, routed to the block-scaled `mma.sync` path. Same device-buffer
+    /// management (weight uploaded once keyed by `weight_key`, `x` H2D, `out`
+    /// D2H) and the SAME `out[n*M + m]` layout, so it is a drop-in for the
+    /// scalar batched path when `blackwell_tc_available()`. Returns `false`
+    /// (caller falls back to the scalar path) on bad shape / `K % 64 != 0` /
+    /// budget / kernel failure, leaving `out` untouched on failure.
+    pub fn gemm_fp4_tc(
+        &mut self,
+        kind: CudaFp4TcKind,
+        weight_key: usize,
+        w_bytes: &[u8],
+        x: &[f32],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> bool {
+        // FP4 block geometry: NVFP4 = K/16 × 9B (per-16 E4M3); MXFP4 = K/32 ×
+        // 17B (per-32 E8M0). The TC atom also needs K % 64 == 0.
+        let (kalign, row_bytes) = match kind {
+            CudaFp4TcKind::Nvfp4 => (16usize, (k / 16) * 9),
+            CudaFp4TcKind::Mxfp4 => (32usize, (k / 32) * 17),
+        };
+        if m == 0 || k == 0 || n == 0 || x.len() != n * k || out.len() != n * m {
+            return false;
+        }
+        if k % 64 != 0 || k % kalign != 0 || w_bytes.len() < m * row_bytes {
+            return false;
+        }
+        if !self.ensure_weight(weight_key, w_bytes) {
+            return false;
+        }
+        if !Self::ensure_scratch(&mut self.x_scratch, &self.stream, n * k * 4)
+            || !Self::ensure_scratch(&mut self.out_scratch, &self.stream, n * m * 4)
+        {
+            return false;
+        }
+        let x_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, n * k * 4) };
+        if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
+            return false;
+        }
+        let w_ptr = self.weights[&weight_key].ptr;
+        let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
+        let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: w (M×K FP4 blocks), x (N·K f32), out (N·M f32) are live
+        // device buffers on `self.stream`; the wrapper synchronizes.
+        let res = unsafe { gemm_fp4_tc_f32(kind, &self.stream, w_ptr, x_ptr, out_ptr, m, n, k) };
         if res.is_err() || consume_error_count() != 0 {
             return false;
         }
