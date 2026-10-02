@@ -21,19 +21,19 @@ cd "$(dirname "$0")/.."
 ARCH="${1:?usage: _release_build_linux.sh <arch>}"
 
 # CUDA target arch for the aarch64 (Grace-class) release. Ship NATIVE SASS for
-# the two realistic ARM NVIDIA targets: Grace-Hopper (sm_90, GH200) and — the
+# the two realistic ARM NVIDIA targets: Grace-Hopper (sm_90a, GH200) and — the
 # headline target — the DGX Spark's GB10 (sm_121a, Blackwell, CUDA 13.0+).
-# The GB10 arch is the *accelerated* `sm_121a`, NOT plain `sm_121`: the Blackwell
-# tensor-core kernels (FP4/FP8/FP6 + TMA) in rustllama-kernels-cuda are gated on
-# the `a` suffix (build.rs `blackwell_tc`), so a plain `sm_121` release would
-# ship them DISABLED. kernels-cuda/build.rs also embeds forward-compatible PTX
-# for the highest arch for any newer GPU. Native GB10 SASS avoids the one-time
-# PTX JIT at first load (the extra nvcc pass lengthens the QEMU build, accepted).
-# Static cudart 13.0 matches the Spark's CUDA 13.0.2 / driver 580.159.03.
-# (Hopper sm_90 stays plain until its tensor-core kernels land, then → `90a;121a`.)
+# BOTH are the *accelerated* arches (the `a` suffix), NOT plain sm_90/sm_121: the
+# tensor-core kernels in rustllama-kernels-cuda are gated on the suffix — Hopper
+# wgmma FP8 + TMA (build.rs `hopper_tc`, sm_90a) and Blackwell FP4/FP8/FP6 + TMA
+# (build.rs `blackwell_tc`, sm_121a) — so a plain sm_90/sm_121 release would ship
+# them DISABLED. kernels-cuda/build.rs also embeds forward-compatible PTX for the
+# highest arch for any newer GPU. Native SASS avoids the one-time PTX JIT at first
+# load (the extra nvcc pass lengthens the QEMU build, accepted). Static cudart
+# 13.0 matches the Spark's CUDA 13.0.2 / driver 580.159.03.
 if [ "$ARCH" = "aarch64" ]; then
-  export RUSTLLAMA_CUDA_ARCHS="90;121a"
-  echo ">> RUSTLLAMA_CUDA_ARCHS=$RUSTLLAMA_CUDA_ARCHS (native GH200 sm_90 + DGX Spark GB10 sm_121a, Blackwell tensor-core)"
+  export RUSTLLAMA_CUDA_ARCHS="90a;121a"
+  echo ">> RUSTLLAMA_CUDA_ARCHS=$RUSTLLAMA_CUDA_ARCHS (GH200 sm_90a Hopper + DGX Spark GB10 sm_121a Blackwell, both tensor-core)"
 fi
 
 # 1. Build the binary. GUI (desktop + CLI + server) by default; HEADLESS=1

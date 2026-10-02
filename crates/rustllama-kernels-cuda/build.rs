@@ -30,6 +30,11 @@ fn main() {
         "cargo:rerun-if-changed={}",
         manifest.join("cuda").join("rsl_blackwell.cuh").display()
     );
+    // Hopper sm_90a tensor-core kernels (included by rsl_cuda.cu).
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest.join("cuda").join("rsl_hopper.cuh").display()
+    );
     println!("cargo:rerun-if-env-changed=RUSTLLAMA_CUDA_ARCHS");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDACXX");
@@ -101,6 +106,22 @@ fn main() {
         cmd.arg("-DRSL_BLACKWELL_TC=1");
         // The accelerated mma needs the newer PTX ISA; CUDA 12.8+ supplies it.
         println!("cargo:warning=rustllama-kernels-cuda: Blackwell SM12x tensor-core path ENABLED (RSL_BLACKWELL_TC) for arch list {archs}");
+    }
+    // Hopper (sm_90a) tensor-core path (rsl_hopper.cuh): `wgmma.mma_async` FP8 +
+    // TMA. Like the Blackwell gate, the warpgroup async MMA is only legal on the
+    // *architecture-accelerated* `sm_90a` target — ptxas rejects `wgmma` on a
+    // plain `.target sm_90`. Define RSL_HOPPER_TC when the arch list names an
+    // sm_90x accelerated target; the device code additionally guards on
+    // `__CUDA_ARCH__ == 900`, so a mixed list (e.g. "90a;121a") routes the Hopper
+    // pass to wgmma and everything else to the scalar fallback. WRITE-BLIND:
+    // compile-only here — the project has no Hopper (GH200) to run it on.
+    let hopper_tc = arch_list.iter().any(|a| {
+        let suffixed = a.ends_with('a') || a.ends_with('f');
+        suffixed && arch_major_of(a) == Some(90)
+    });
+    if hopper_tc {
+        cmd.arg("-DRSL_HOPPER_TC=1");
+        println!("cargo:warning=rustllama-kernels-cuda: Hopper sm_90a tensor-core path ENABLED (RSL_HOPPER_TC) for arch list {archs}");
     }
     // Also embed PTX for the HIGHEST requested arch. `code=sm_X` bakes in
     // SASS only, which the driver will NOT run on a newer GPU — so a build

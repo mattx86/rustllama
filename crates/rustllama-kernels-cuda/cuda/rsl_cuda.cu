@@ -2685,3 +2685,15 @@ extern "C" int rsl_cuda_flash_attn_prefill_q8_0(rsl_cuda_stream *s, const float 
 // ============================================================
 #include "rsl_blackwell.cuh"
 
+// ============================================================
+// Hopper (sm_90a) FP8 `wgmma.mma_async` + TMA tensor-core GEMM. Included AFTER
+// rsl_blackwell.cuh so it can reuse namespace rslbw's MXFP8 readers
+// (rsl_mxfp8_byte / rsl_mxfp8_scale / rsl_f32_to_e4m3) plus this TU's module-
+// level rsl_e4m3_to_f32 / rsl_e8m0_to_f32, the rsl_cuda_stream struct, and
+// rsl_cuda_check. Real `wgmma` path compiles only for a Hopper sm_90a build
+// (build.rs -DRSL_HOPPER_TC + the device pass __CUDA_ARCH__ == 900); otherwise a
+// scalar fallback body. See the header's banner for the WRITE-BLIND discipline
+// (no GH200 exists to validate it — compile-only, forever, for us).
+// ============================================================
+#include "rsl_hopper.cuh"
+

@@ -487,6 +487,31 @@ extern "C" {
         k: c_int,
     ) -> c_int;
 
+    // Hopper (sm_90a) FP8 `wgmma.mma_async` tensor-core GEMM (MXFP8 W8A8,
+    // m64n16k32, K % 32 == 0) + a TMA-staged variant. Same (M,N,K)/return
+    // contract as the Blackwell GEMMs; return -2 when the Hopper TC path is
+    // unavailable so the caller falls back to the scalar path. WRITE-BLIND:
+    // compile-only — the project has no GH200 to runtime-validate these.
+    fn rsl_cuda_hopper_tc_available(dev: c_int) -> c_int;
+    fn rsl_cuda_gemm_mxfp8_wgmma_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_gemm_mxfp8_wgmma_tma_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+    ) -> c_int;
+
     fn rsl_cuda_consume_error_count() -> c_int;
 }
 
@@ -579,6 +604,48 @@ pub unsafe fn gemm_mxfp6_tc_f32(
     k: usize,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_gemm_mxfp6_tc_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int);
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// Whether this binary compiled the Hopper sm_90a FP8 `wgmma` tensor-core GEMM
+/// path (an sm_90x `a`/`f` arch was in `RUSTLLAMA_CUDA_ARCHS`) AND device `dev`
+/// is a real Hopper (sm_90) GPU. `false` on every non-Hopper host and on a
+/// default (Ampere→Hopper, non-accelerated) build. WRITE-BLIND: never validated
+/// at runtime by this project (no GH200) — a GH200 owner confirms via
+/// `doctor --cuda-parity`.
+pub fn hopper_tc_available(dev: u32) -> bool {
+    // SAFETY: no pointer args; the shim queries cudaDeviceProp internally.
+    unsafe { rsl_cuda_hopper_tc_available(dev as c_int) == 1 }
+}
+
+/// Hopper MXFP8 (W8A8) FP8 `wgmma` tensor-core GEMM: `out[N×M] = X[N×K] · W[M×K]ᵀ`,
+/// W in MXFP8 (per-32 E8M0, E4M3 elements), X f32 (quantized to E4M3 on the fly).
+/// `K % 32 == 0`. `tma` selects the `cp.async.bulk`-staged variant.
+/// `Err(Kernel(-2))` when the Hopper TC path is unavailable (caller falls back
+/// to the scalar path). WRITE-BLIND: compile-only, no GH200 to validate.
+///
+/// # Safety
+/// `w` (M rows of MXFP8 blocks), `x` (N·K f32), `out` (N·M f32) must be live
+/// device buffers on `stream`.
+pub unsafe fn gemm_mxfp8_wgmma_f32(
+    stream: &CudaStream,
+    w: *const c_void,
+    x: *const f32,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    tma: bool,
+) -> Result<(), CudaError> {
+    let rc = if tma {
+        rsl_cuda_gemm_mxfp8_wgmma_tma_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int)
+    } else {
+        rsl_cuda_gemm_mxfp8_wgmma_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int)
+    };
     if rc == 0 {
         Ok(())
     } else {
