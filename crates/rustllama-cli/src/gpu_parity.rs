@@ -1275,6 +1275,7 @@ fn cu_grade(
 #[derive(Clone, Copy)]
 enum TcGemm {
     Nvfp4,
+    Nvfp4Tma,
     Mxfp4,
     Mxfp8,
     Mxfp6,
@@ -1318,6 +1319,7 @@ fn cu_tc_gemm_probe(
     let res = unsafe {
         match which {
             TcGemm::Nvfp4 => ck::gemm_fp4_tc_f32(ck::CudaFp4TcKind::Nvfp4, stream, wp, xp, op, m, n, k),
+            TcGemm::Nvfp4Tma => ck::gemm_nvfp4_tc_tma_f32(stream, wp, xp, op, m, n, k),
             TcGemm::Mxfp4 => ck::gemm_fp4_tc_f32(ck::CudaFp4TcKind::Mxfp4, stream, wp, xp, op, m, n, k),
             TcGemm::Mxfp8 => ck::gemm_mxfp8_tc_f32(stream, wp, xp, op, m, n, k),
             TcGemm::Mxfp6 => ck::gemm_mxfp6_tc_f32(stream, wp, xp, op, m, n, k),
@@ -1542,7 +1544,7 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
     // header is what this probe exists to check.
     if !ck::blackwell_tc_available(0) {
         for nm in [
-            "gemm:nvfp4_tc(W4A4)", "gemm:mxfp4_tc(W4A4)",
+            "gemm:nvfp4_tc(W4A4)", "gemm:nvfp4_tc_tma(W4A4)", "gemm:mxfp4_tc(W4A4)",
             "gemm:mxfp8_tc(W8A8)", "gemm:mxfp6_tc(W6A6)",
         ] {
             cu_emit(nm, "SKIP", "not-sm12x-blackwell-or-no-tc-build");
@@ -1556,6 +1558,11 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         k::nvfp4::quantize_matrix(m, kd, &wsrc, &mut wnv);
         cu_tc_gemm_probe(
             &stream, "gemm:nvfp4_tc(W4A4)", TcGemm::Nvfp4, &wnv,
+            k::nvfp4::matvec_nvfp4_w_f32_a, m, kd, n, &mut counts,
+        );
+        // TMA-staged NVFP4 (Phase 4): same weight/ref, cp.async.bulk staging.
+        cu_tc_gemm_probe(
+            &stream, "gemm:nvfp4_tc_tma(W4A4)", TcGemm::Nvfp4Tma, &wnv,
             k::nvfp4::matvec_nvfp4_w_f32_a, m, kd, n, &mut counts,
         );
         // MXFP4/6/8 weights: reuse the harness's valid-byte synth (E8M0 blocks).

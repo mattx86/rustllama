@@ -634,6 +634,97 @@ __global__ void rsl_bw_gemm_mxfp6_kernel(const unsigned char* __restrict__ w, co
 #endif
 }
 
+// ===========================================================================
+// Phase 4: TMA (Tensor Memory Accelerator) async-copy operand staging.
+// Replaces the NVFP4 kernel's per-thread activation-staging loop with a
+// cp.async.bulk (non-tensor: one copy per token row = 64 contiguous f32 =
+// 256 B) + mbarrier. No CUtensorMap / driver API needed (that would be the
+// 2D-strided tensor variant). All mbarrier / cp.async.bulk PTX confirmed to
+// assemble for sm_120a. Single-buffered (copy -> wait -> compute); the
+// double-buffered overlap that actually hides the copy latency is the perf
+// follow-up. SPARK-VALIDATE: the mbarrier phase/transaction-count semantics
+// and the bulk-copy alignment are assumed-from-docs. Dispatch-gated behind a
+// separate opt-in; parity validates it == the scalar reference.
+// ===========================================================================
+#ifdef RSL_BW_DEVICE_TC
+__device__ __forceinline__ void rsl_bw_mbar_init(unsigned mbar, int count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" :: "r"(mbar), "r"(count) : "memory");
+}
+__device__ __forceinline__ void rsl_bw_mbar_expect(unsigned mbar, int bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" :: "r"(mbar), "r"(bytes) : "memory");
+}
+__device__ __forceinline__ void rsl_bw_bulk_g2s(unsigned dst_smem, const void* src_g, int bytes, unsigned mbar) {
+    asm volatile(
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+        :: "r"(dst_smem), "l"(src_g), "r"(bytes), "r"(mbar) : "memory");
+}
+__device__ __forceinline__ void rsl_bw_mbar_wait(unsigned mbar, int phase) {
+    asm volatile(
+        "{ .reg .pred p; L_%=: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1; @!p bra L_%=; }\n"
+        :: "r"(mbar), "r"(phase) : "memory");
+}
+#endif
+
+// TMA-staged NVFP4 GEMM — identical math to rsl_bw_gemm_nvfp4_kernel; only the
+// 8x64 activation tile staging differs (cp.async.bulk + mbarrier per K-step).
+__global__ void rsl_bw_gemm_nvfp4_tma_kernel(
+    const unsigned char* __restrict__ w, const float* __restrict__ x,
+    float* __restrict__ out, int M, int N, int K) {
+    const int m0 = blockIdx.x * 16, n0 = blockIdx.y * 8, lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3;
+#ifdef RSL_BW_DEVICE_TC
+    __shared__ alignas(16) float xs[8][64];
+    __shared__ alignas(8) unsigned long long mbar;
+    unsigned mb = (unsigned)__cvta_generic_to_shared(&mbar);
+    if (lane == 0) rsl_bw_mbar_init(mb, 1);
+    __syncwarp();
+    float c[4] = {0, 0, 0, 0}; const int rA0 = m0 + g, rA1 = m0 + g + 8;
+    int phase = 0;
+    for (int k0 = 0; k0 < K; k0 += 64) {
+        int valid = N - n0; if (valid > 8) valid = 8; if (valid < 0) valid = 0;
+        if (lane == 0) {
+            rsl_bw_mbar_expect(mb, valid * 64 * (int)sizeof(float));
+            for (int r = 0; r < valid; ++r) {
+                unsigned dst = (unsigned)__cvta_generic_to_shared(&xs[r][0]);
+                rsl_bw_bulk_g2s(dst, &x[(long long)(n0 + r) * K + k0], 64 * (int)sizeof(float), mb);
+            }
+        }
+        // Zero the edge rows not covered by a bulk copy so B quant is defined.
+        for (int idx = lane; idx < (8 - valid) * 64; idx += 32) { int r = valid + (idx >> 6); xs[r][idx & 63] = 0.f; }
+        rsl_bw_mbar_wait(mb, phase); phase ^= 1;
+        __syncwarp();
+        unsigned a[4];
+        a[0] = rsl_pack_a_nvfp4(w, rA0, M, k0 + q * 8, K); a[1] = rsl_pack_a_nvfp4(w, rA0, M, k0 + 32 + q * 8, K);
+        a[2] = rsl_pack_a_nvfp4(w, rA1, M, k0 + q * 8, K); a[3] = rsl_pack_a_nvfp4(w, rA1, M, k0 + 32 + q * 8, K);
+        unsigned sfa = 0u;
+        if (rA0 < M) {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) sfa |= (unsigned)rsl_nvfp4_scale(w, rA0, (k0 >> 4) + j, K) << (8 * j);
+        }
+        float bscale[4]; unsigned sfb = 0u;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float mx = 0.f;
+            #pragma unroll
+            for (int t = 0; t < 16; ++t) mx = fmaxf(mx, fabsf(xs[g][j * 16 + t]));
+            float s = mx > 0.f ? mx / 6.0f : 1.0f; bscale[j] = s;
+            sfb |= (unsigned)rsl_f32_to_e4m3(s) << (8 * j);
+        }
+        unsigned b[2] = {0, 0};
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int kk0 = q * 8 + i, kk1 = 32 + q * 8 + i;
+            b[0] |= rsl_f32_to_e2m1(xs[g][kk0] / bscale[kk0 >> 4]) << (4 * i);
+            b[1] |= rsl_f32_to_e2m1(xs[g][kk1] / bscale[kk1 >> 4]) << (4 * i);
+        }
+        float d[4]; rsl_bw_mma_nvfp4(d, a, b, c, sfa, sfb); c[0] = d[0]; c[1] = d[1]; c[2] = d[2]; c[3] = d[3];
+        __syncwarp();
+    }
+    RSL_BW_STORE_TILE(c);
+#else
+    RSL_BW_FALLBACK(rsl_e4m3_to_f32(rsl_nvfp4_scale(w, m, kk >> 4, K)) * RSL_NVFP4_CODEBOOK[rsl_nvfp4_nibble(w, m, kk, K)]);
+#endif
+}
+
 }  // namespace rslbw
 
 // ---------------------------------------------------------------------------
@@ -674,3 +765,5 @@ RSL_BW_GEMM_LAUNCH(rsl_cuda_gemm_nvfp4_tc_f32, rsl_bw_gemm_nvfp4_kernel)
 RSL_BW_GEMM_LAUNCH(rsl_cuda_gemm_mxfp4_tc_f32, rsl_bw_gemm_mxfp4_kernel)
 RSL_BW_GEMM_LAUNCH_K(rsl_cuda_gemm_mxfp8_tc_f32, rsl_bw_gemm_mxfp8_kernel, 32)
 RSL_BW_GEMM_LAUNCH_K(rsl_cuda_gemm_mxfp6_tc_f32, rsl_bw_gemm_mxfp6_kernel, 32)
+// Phase 4: TMA-staged NVFP4 variant (same contract + K%64 as the plain NVFP4).
+RSL_BW_GEMM_LAUNCH(rsl_cuda_gemm_nvfp4_tc_tma_f32, rsl_bw_gemm_nvfp4_tma_kernel)

@@ -475,6 +475,17 @@ extern "C" {
         n: c_int,
         k: c_int,
     ) -> c_int;
+    // Phase 4: TMA-staged NVFP4 (cp.async.bulk activation staging). Same
+    // (M,N,K)/return contract as rsl_cuda_gemm_nvfp4_tc_f32.
+    fn rsl_cuda_gemm_nvfp4_tc_tma_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+    ) -> c_int;
 
     fn rsl_cuda_consume_error_count() -> c_int;
 }
@@ -568,6 +579,30 @@ pub unsafe fn gemm_mxfp6_tc_f32(
     k: usize,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_gemm_mxfp6_tc_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int);
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// Blackwell TMA-staged NVFP4 tensor-core GEMM — numerically identical to
+/// [`gemm_fp4_tc_f32`] with `Nvfp4`, but stages the activation tile via
+/// `cp.async.bulk` + an mbarrier (Phase 4). `K % 64 == 0`.
+///
+/// # Safety
+/// As [`gemm_fp4_tc_f32`].
+pub unsafe fn gemm_nvfp4_tc_tma_f32(
+    stream: &CudaStream,
+    w: *const c_void,
+    x: *const f32,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), CudaError> {
+    let rc =
+        rsl_cuda_gemm_nvfp4_tc_tma_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int);
     if rc == 0 {
         Ok(())
     } else {
