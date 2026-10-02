@@ -455,6 +455,26 @@ extern "C" {
         n: c_int,
         k: c_int,
     ) -> c_int;
+    // FP8 (MXFP8, W8A8) and FP6 (MXFP6, W6A6) block-scaled TC GEMMs
+    // (kind::mxf8f6f4, m16n8k32, K % 32 == 0). Same (M,N,K)/return contract.
+    fn rsl_cuda_gemm_mxfp8_tc_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_gemm_mxfp6_tc_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+    ) -> c_int;
 
     fn rsl_cuda_consume_error_count() -> c_int;
 }
@@ -502,6 +522,52 @@ pub unsafe fn gemm_fp4_tc_f32(
             rsl_cuda_gemm_mxfp4_tc_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int)
         }
     };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// Blackwell MXFP8 (W8A8) tensor-core GEMM: `out[N×M] = X[N×K] · W[M×K]ᵀ`, W in
+/// MXFP8 (per-32 E8M0, E4M3 elements), X f32 (quantized to E4M3 on the fly).
+/// `K % 32 == 0`. `Err(Kernel(-2))` when the TC path is unavailable.
+///
+/// # Safety
+/// `w` (M rows of MXFP8 blocks), `x` (N·K f32), `out` (N·M f32) must be live
+/// device buffers on `stream`.
+pub unsafe fn gemm_mxfp8_tc_f32(
+    stream: &CudaStream,
+    w: *const c_void,
+    x: *const f32,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_gemm_mxfp8_tc_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int);
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// Blackwell MXFP6 (W6A6) tensor-core GEMM, as [`gemm_mxfp8_tc_f32`] but W in
+/// MXFP6 (per-32 E8M0, E3M2 elements), activations quantized to E3M2.
+///
+/// # Safety
+/// As [`gemm_mxfp8_tc_f32`], with `w` holding MXFP6 (25B/32) blocks.
+pub unsafe fn gemm_mxfp6_tc_f32(
+    stream: &CudaStream,
+    w: *const c_void,
+    x: *const f32,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_gemm_mxfp6_tc_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int);
     if rc == 0 {
         Ok(())
     } else {

@@ -1271,11 +1271,20 @@ fn cu_grade(
 /// computes the batched CPU reference `out[n*M + m]` via the scalar FP4 matvec
 /// (`cpu_row` is the per-row W×x kernel), runs the TC GEMM, and grades with a
 /// loose W4A4-vs-W4A16 gate. `w` is the packed FP4 weight (M×K).
+/// Which Blackwell TC GEMM a probe exercises.
+#[derive(Clone, Copy)]
+enum TcGemm {
+    Nvfp4,
+    Mxfp4,
+    Mxfp8,
+    Mxfp6,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn cu_fp4_tc_probe(
+fn cu_tc_gemm_probe(
     stream: &ck::CudaStream,
     name: &str,
-    kind: ck::CudaFp4TcKind,
+    which: TcGemm,
     w: &[u8],
     cpu_row: fn(&[u8], &[f32], &mut [f32], usize, usize),
     m: usize,
@@ -1301,19 +1310,18 @@ fn cu_fp4_tc_probe(
         *counts.entry("KERNEL_ERR").or_default() += 1;
         return;
     };
-    // SAFETY: wb (M×K FP4 blocks), xb (N·K f32), ob (N·M f32) are live device
-    // buffers on `stream`; the wrapper synchronizes before returning.
+    let wp = wb.as_ptr();
+    let xp = xb.as_ptr() as *const f32;
+    let op = ob.as_mut_ptr() as *mut f32;
+    // SAFETY: wb (M×K packed blocks), xb (N·K f32), ob (N·M f32) are live device
+    // buffers on `stream`; the wrappers synchronize before returning.
     let res = unsafe {
-        ck::gemm_fp4_tc_f32(
-            kind,
-            stream,
-            wb.as_ptr(),
-            xb.as_ptr() as *const f32,
-            ob.as_mut_ptr() as *mut f32,
-            m,
-            n,
-            k,
-        )
+        match which {
+            TcGemm::Nvfp4 => ck::gemm_fp4_tc_f32(ck::CudaFp4TcKind::Nvfp4, stream, wp, xp, op, m, n, k),
+            TcGemm::Mxfp4 => ck::gemm_fp4_tc_f32(ck::CudaFp4TcKind::Mxfp4, stream, wp, xp, op, m, n, k),
+            TcGemm::Mxfp8 => ck::gemm_mxfp8_tc_f32(stream, wp, xp, op, m, n, k),
+            TcGemm::Mxfp6 => ck::gemm_mxfp6_tc_f32(stream, wp, xp, op, m, n, k),
+        }
     };
     match res {
         Err(e) => {
@@ -1533,27 +1541,30 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
     // tolerance; until then every assumption tagged SPARK-VALIDATE in the
     // header is what this probe exists to check.
     if !ck::blackwell_tc_available(0) {
-        for nm in ["gemm:nvfp4_tc(W4A4)", "gemm:mxfp4_tc(W4A4)"] {
+        for nm in [
+            "gemm:nvfp4_tc(W4A4)", "gemm:mxfp4_tc(W4A4)",
+            "gemm:mxfp8_tc(W8A8)", "gemm:mxfp6_tc(W6A6)",
+        ] {
             cu_emit(nm, "SKIP", "not-sm12x-blackwell-or-no-tc-build");
             *counts.entry("SKIP").or_default() += 1;
         }
     } else {
-        let (m, kd, n) = (64usize, 128usize, 16usize); // K % 64 == 0
+        let (m, kd, n) = (64usize, 128usize, 16usize); // K % 64 == 0 (and % 32)
         // NVFP4 weight: quantize random f32 → valid per-16 E4M3 blocks.
         let wsrc = gen_x(m * kd, 77);
         let mut wnv = vec![0u8; m * (kd / 16) * 9];
         k::nvfp4::quantize_matrix(m, kd, &wsrc, &mut wnv);
-        cu_fp4_tc_probe(
-            &stream, "gemm:nvfp4_tc(W4A4)", ck::CudaFp4TcKind::Nvfp4, &wnv,
+        cu_tc_gemm_probe(
+            &stream, "gemm:nvfp4_tc(W4A4)", TcGemm::Nvfp4, &wnv,
             k::nvfp4::matvec_nvfp4_w_f32_a, m, kd, n, &mut counts,
         );
-        // MXFP4 weight: reuse the harness's valid-byte synth (per-32 E8M0).
-        let mx_layout = LAYOUTS.iter().find(|l| l.name == "mxfp4").expect("layout");
-        let wmx = gen_quant_bytes(mx_layout, m, kd, 0xC0FFEE);
-        cu_fp4_tc_probe(
-            &stream, "gemm:mxfp4_tc(W4A4)", ck::CudaFp4TcKind::Mxfp4, &wmx,
-            k::mxfp::matvec_mxfp4_w_f32_a, m, kd, n, &mut counts,
-        );
+        // MXFP4/6/8 weights: reuse the harness's valid-byte synth (E8M0 blocks).
+        let wmx4 = gen_quant_bytes(LAYOUTS.iter().find(|l| l.name == "mxfp4").unwrap(), m, kd, 0xC0FFEE);
+        cu_tc_gemm_probe(&stream, "gemm:mxfp4_tc(W4A4)", TcGemm::Mxfp4, &wmx4, k::mxfp::matvec_mxfp4_w_f32_a, m, kd, n, &mut counts);
+        let wmx8 = gen_quant_bytes(LAYOUTS.iter().find(|l| l.name == "mxfp8").unwrap(), m, kd, 0xBEEF11);
+        cu_tc_gemm_probe(&stream, "gemm:mxfp8_tc(W8A8)", TcGemm::Mxfp8, &wmx8, k::mxfp::matvec_mxfp8_w_f32_a, m, kd, n, &mut counts);
+        let wmx6 = gen_quant_bytes(LAYOUTS.iter().find(|l| l.name == "mxfp6").unwrap(), m, kd, 0xBEEF22);
+        cu_tc_gemm_probe(&stream, "gemm:mxfp6_tc(W6A6)", TcGemm::Mxfp6, &wmx6, k::mxfp::matvec_mxfp6_w_f32_a, m, kd, n, &mut counts);
     }
 
     // ---- Dense f32 matvec (host-copy reference wrapper) ----
