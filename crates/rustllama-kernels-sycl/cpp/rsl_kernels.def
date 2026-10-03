@@ -184,3 +184,7 @@ EXPORTS
     rsl_dequant_q3_k_to_f32_usm
     rsl_dequant_q5_k_to_f32_usm
     rsl_dequant_q6_k_to_f32_usm
+
+    ; XMX/DPAS joint_matrix bf16 GEMM (Arc/PVC). Always exported; the entry is a
+    ; -2 "unavailable" stub unless the DLL was built -DRSL_SYCL_XMX.
+    rsl_sycl_gemm_bf16_xmx_f32

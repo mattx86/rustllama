@@ -67,6 +67,13 @@ struct rsl_stream {
     std::size_t embed_ids_capacity = 0;
 };
 
+// Intel XMX/DPAS joint_matrix bf16 GEMM, gated on RSL_SYCL_XMX (build.rs sets it
+// when RUSTLLAMA_SYCL_XMX=1). Included here so its extern "C" host entry can see
+// `struct rsl_stream` (uses s->q). Real DPAS path on Arc (Xe-HPG) / PVC
+// (Xe-HPC); a -2 "unavailable" stub otherwise, so the non-XMX (Iris Xe) build +
+// behavior is byte-for-byte unchanged. WRITE-BLIND: compile-only, no XMX HW here.
+#include "rsl_xmx.hpp"
+
 // Forward declarations of the OCP Microscaling (MX) element decoders,
 // whose definitions live far below beside the MX weight matvecs
 // (~line 9134). Declared up here so the quantized-KV MX row-dequant

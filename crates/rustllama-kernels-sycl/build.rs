@@ -101,6 +101,8 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=cpp/rsl_kernels.cpp");
+    println!("cargo:rerun-if-changed=cpp/rsl_xmx.hpp");
+    println!("cargo:rerun-if-env-changed=RUSTLLAMA_SYCL_XMX");
     println!("cargo:rerun-if-changed=include/rsl_kernels.h");
     println!("cargo:rerun-if-env-changed=ONEAPI_ROOT");
     println!("cargo:rerun-if-env-changed=CMPLR_ROOT");
@@ -329,6 +331,7 @@ fn build_windows(out_path: &std::path::Path) {
             "-Iinclude",
             "cpp/rsl_kernels.cpp",
         ])
+        .args(xmx_defs())
         .arg(format!("-I{}", out_path.display()))
         .arg(format!("-Fe{}", dll_path.display()))
         .arg(format!("-Fo{}", out_path.join("rsl_kernels.obj").display()))
@@ -367,6 +370,20 @@ fn build_windows(out_path: &std::path::Path) {
     }
 
     copy_shared_lib_next_to_binaries(out_path, "rsl_kernels.dll");
+}
+
+/// `-DRSL_SYCL_XMX` iff `RUSTLLAMA_SYCL_XMX=1` — enables the Intel XMX/DPAS
+/// `joint_matrix` bf16 GEMM path in `cpp/rsl_xmx.hpp`. Default OFF so the Iris Xe
+/// (Xe-LP, no XMX) dev build + the standard release compile only the software-
+/// decode path; set it when building for / compile-checking an Arc (Xe-HPG) or
+/// PVC (Xe-HPC) target. The extern "C" entry compiles either way (a -2
+/// "unavailable" stub when off), so the symbol set / .def is unchanged.
+fn xmx_defs() -> Vec<&'static str> {
+    if std::env::var("RUSTLLAMA_SYCL_XMX").as_deref() == Ok("1") {
+        vec!["-DRSL_SYCL_XMX"]
+    } else {
+        vec![]
+    }
 }
 
 /// Linux: build `librsl_kernels.so` with `icpx` (GCC-style DPC++ driver;
@@ -409,6 +426,7 @@ fn build_unix(out_path: &std::path::Path) {
             "-Iinclude",
             "cpp/rsl_kernels.cpp",
         ])
+        .args(xmx_defs())
         .arg(format!("-I{}", out_path.display()))
         .arg("-o")
         .arg(&so_path)
