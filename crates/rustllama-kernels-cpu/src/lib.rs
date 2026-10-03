@@ -4358,7 +4358,126 @@ pub fn matvec_q6_k_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_q6_k_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_q6_k_w_f32_a_scalar(w_bytes, x, out, m, k);
+}
+
+/// Build 16 Q6_K codes (one strand, one l-chunk) as unsigned `float32x4`
+/// lanes `[0..4, 4..8, 8..12, 12..16]`. Combines the 4 low bits from `ql`
+/// (low or high nibble per `is_high_nibble`) with the 2 high bits pulled
+/// from `qh` at a per-strand bit position (`neg_shift = -shift` fed to
+/// `vshlq_u8`, since NEON's logical shift takes a signed per-lane count)
+/// into the 6-bit `[0,63]` value. The caller recenters by -32. Mirrors
+/// `build_q_strand` in the AVX2 path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn build_q6k_strand_neon(
+    ql_ptr: *const u8,
+    qh_ptr: *const u8,
+    neg_shift: std::arch::aarch64::int8x16_t,
+    is_high_nibble: bool,
+    mask_lo: std::arch::aarch64::uint8x16_t,
+    mask_2bit: std::arch::aarch64::uint8x16_t,
+) -> [std::arch::aarch64::float32x4_t; 4] {
+    use std::arch::aarch64::*;
+    let ql = vld1q_u8(ql_ptr);
+    let ql_nibble = if is_high_nibble {
+        vshrq_n_u8::<4>(ql)
+    } else {
+        vandq_u8(ql, mask_lo)
+    };
+    let qh = vld1q_u8(qh_ptr);
+    // (qh >> shift) & 0x03, then promote to bits 4..5 and OR with the nibble.
+    let qh_bits = vandq_u8(vshlq_u8(qh, neg_shift), mask_2bit);
+    let qh_top = vshlq_n_u8::<4>(qh_bits);
+    u8x16_to_f32x4x4(vorrq_u8(ql_nibble, qh_top))
+}
+
+/// AArch64 NEON Q6_K matvec. Same 4-strand × 2-half super-block layout as
+/// the AVX2 path (see [`matvec_q6_k_w_f32_a_scalar`] / the AVX2 strand
+/// specs): each 256-weight super-block splits into two 128-weight halves
+/// (`n`), each half into 4 strands (`q1..q4`) picking the ql nibble, the
+/// qh 2-bit field, the x window, and the signed-i8 sub-scale. Each strand
+/// covers 32 outputs in two 16-lane chunks whose scale flips at the l=16
+/// boundary (is=0 vs is=1). NEON baseline; same tolerance contract as the
+/// AVX2 path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_q6_k_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 210;
+    const QK_K: usize = 256;
+    let blocks_per_row = k / QK_K;
+    let mask_lo = vdupq_n_u8(0x0F);
+    let mask_2bit = vdupq_n_u8(0x03);
+    let thirtytwo = vdupq_n_f32(32.0);
+    // (ql_off, is_high_nibble, qh_shift, x_off, scale_offset) per strand.
+    let strand_specs: [(usize, bool, i32, usize, usize); 4] = [
+        (0, false, 0, 0, 0),   // q1
+        (32, false, 2, 32, 1), // q2
+        (0, true, 4, 64, 2),   // q3
+        (32, true, 6, 96, 3),  // q4
+    ];
+    for i in 0..m {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc = [vdupq_n_f32(0.0); 8];
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let ql_ptr = w_bytes.as_ptr().add(off);
+            let qh_ptr = w_bytes.as_ptr().add(off + 128);
+            let scales_ptr = w_bytes.as_ptr().add(off + 192) as *const i8;
+            let d = f16::from_le_bytes([w_bytes[off + 208], w_bytes[off + 209]]).to_f32();
+            let xptr = x.as_ptr().add(b * QK_K);
+            let mut ai = 0usize;
+            for n in 0..2 {
+                let ql_base = ql_ptr.add(64 * n);
+                let qh_base = qh_ptr.add(32 * n);
+                let scales_base = scales_ptr.add(n * 8);
+                let x_base = xptr.add(n * 128);
+                for &(ql_off, hi, shift_v, x_off, scale_offset) in strand_specs.iter() {
+                    let neg_shift = vdupq_n_s8(-(shift_v as i8));
+                    // l<16 uses scale_a, l>=16 uses scale_b.
+                    let d_sa = d * (*scales_base.add(scale_offset * 2)) as f32;
+                    let d_sb = d * (*scales_base.add(scale_offset * 2 + 1)) as f32;
+                    for (chunk, d_s) in [(0usize, d_sa), (16usize, d_sb)] {
+                        let q = build_q6k_strand_neon(
+                            ql_base.add(ql_off + chunk),
+                            qh_base.add(chunk),
+                            neg_shift,
+                            hi,
+                            mask_lo,
+                            mask_2bit,
+                        );
+                        let dsv = vdupq_n_f32(d_s);
+                        for c in 0..4 {
+                            let xv = vld1q_f32(x_base.add(x_off + chunk + c * 4));
+                            let coef = vmulq_f32(dsv, vsubq_f32(q[c], thirtytwo));
+                            acc[ai & 7] = vfmaq_f32(acc[ai & 7], coef, xv);
+                            ai += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let mut s = vdupq_n_f32(0.0);
+        for v in acc.iter() {
+            s = vaddq_f32(s, *v);
+        }
+        out[i] = vaddvq_f32(s);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -5244,7 +5363,85 @@ pub fn matvec_q5_k_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_q5_k_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_q5_k_w_f32_a_scalar(w_bytes, x, out, m, k);
+}
+
+/// AArch64 NEON Q5_K matvec. Identical to the Q5_K scalar / Q4_K NEON
+/// structure (4 groups of 64 outputs, each 32 low + 32 high nibbles with
+/// per-sub-block `d*q - m`), plus the 5th bit: for group `g`, the low
+/// half's extra bit is `qh[l]` bit `g*2`, the high half's is bit `g*2+1`
+/// (the same 32 `qh` bytes read at different bit offsets per group). The
+/// extracted bit is promoted to 0x10 and OR'd into the nibble before the
+/// unsigned widen. NEON baseline; same tolerance contract as the AVX2 path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_q5_k_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 176;
+    const QK_K: usize = 256;
+    let blocks_per_row = k / QK_K;
+    let mask_lo = vdupq_n_u8(0x0F);
+    let one = vdupq_n_u8(1);
+    for i in 0..m {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let d = f16::from_le_bytes([w_bytes[off], w_bytes[off + 1]]).to_f32();
+            let dmin = f16::from_le_bytes([w_bytes[off + 2], w_bytes[off + 3]]).to_f32();
+            let (sc, mn) = unpack_q4k_scales(&w_bytes[off + 4..off + 16]);
+            let qh = w_bytes.as_ptr().add(off + 16);
+            let qs = w_bytes.as_ptr().add(off + 48);
+            let xb = x.as_ptr().add(b * QK_K);
+            for group in 0..4 {
+                let qptr = qs.add(group * 32);
+                let d_lo = d * sc[group * 2] as f32;
+                let m_lo = vdupq_n_f32(dmin * mn[group * 2] as f32);
+                let d_hi = d * sc[group * 2 + 1] as f32;
+                let m_hi = vdupq_n_f32(dmin * mn[group * 2 + 1] as f32);
+                let neg_bit_lo = vdupq_n_s8(-((group * 2) as i8));
+                let neg_bit_hi = vdupq_n_s8(-((group * 2 + 1) as i8));
+                let xlo = xb.add(group * 64);
+                let xhi = xb.add(group * 64 + 32);
+                let mut ai = 0usize;
+                for half in 0..2 {
+                    let base = half * 16;
+                    let qb16 = vld1q_u8(qptr.add(base));
+                    let qh16 = vld1q_u8(qh.add(base));
+                    // 5th bit → 0x10 at each lane: ((qh >> bit) & 1) << 4.
+                    let bit_lo = vshlq_n_u8::<4>(vandq_u8(vshlq_u8(qh16, neg_bit_lo), one));
+                    let bit_hi = vshlq_n_u8::<4>(vandq_u8(vshlq_u8(qh16, neg_bit_hi), one));
+                    let qlo_f = u8x16_to_f32x4x4(vorrq_u8(vandq_u8(qb16, mask_lo), bit_lo));
+                    let qhi_f = u8x16_to_f32x4x4(vorrq_u8(vshrq_n_u8::<4>(qb16), bit_hi));
+                    for c in 0..4 {
+                        let idx = base + c * 4;
+                        let xl = vld1q_f32(xlo.add(idx));
+                        let xh = vld1q_f32(xhi.add(idx));
+                        let coef_lo = vsubq_f32(vmulq_n_f32(qlo_f[c], d_lo), m_lo);
+                        let coef_hi = vsubq_f32(vmulq_n_f32(qhi_f[c], d_hi), m_hi);
+                        acc[ai & 3] = vfmaq_f32(acc[ai & 3], coef_lo, xl);
+                        acc[(ai + 1) & 3] = vfmaq_f32(acc[(ai + 1) & 3], coef_hi, xh);
+                        ai += 2;
+                    }
+                }
+            }
+        }
+        let s = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
+        out[i] = vaddvq_f32(s);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -5627,7 +5824,81 @@ pub fn matvec_q2_k_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_q2_k_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_q2_k_w_f32_a_scalar(w_bytes, x, out, m, k);
+}
+
+/// AArch64 NEON Q2_K matvec. Mirrors the scalar layout: each 256-weight
+/// super-block is 16 sub-blocks of 16 weights (2 q-chunks × 4 shifts × 2
+/// halves A/B). A sub-block's 2-bit codes are `(q >> shift) & 3`; its
+/// scale byte gives `dl = d*(sc & 0xF)` and `ml = dmin*(sc >> 4)`, and the
+/// contribution is `(dl*q - ml)*x`. The runtime `shift` (0/2/4/6) feeds
+/// `vshlq_u8` as a negative per-lane count. NEON baseline; same tolerance
+/// contract as the AVX2 path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_q2_k_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 84;
+    const QK_K: usize = 256;
+    let blocks_per_row = k / QK_K;
+    let three = vdupq_n_u8(0x03);
+    for i in 0..m {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let scales = &w_bytes[off..off + 16];
+            let qs = w_bytes.as_ptr().add(off + 16);
+            let d = f16::from_le_bytes([w_bytes[off + 80], w_bytes[off + 81]]).to_f32();
+            let dmin = f16::from_le_bytes([w_bytes[off + 82], w_bytes[off + 83]]).to_f32();
+            let xb = x.as_ptr().add(b * QK_K);
+            let mut x_off = 0usize;
+            let mut is = 0usize;
+            for chunk in 0..2 {
+                let qc = qs.add(chunk * 32);
+                for shift in [0i8, 2, 4, 6] {
+                    let neg = vdupq_n_s8(-shift);
+                    // Sub-block A: q[0..16] >> shift.
+                    let sc_a = scales[is];
+                    let dl_a = d * (sc_a & 0xF) as f32;
+                    let ml_a = vdupq_n_f32(dmin * (sc_a >> 4) as f32);
+                    let qa = u8x16_to_f32x4x4(vandq_u8(vshlq_u8(vld1q_u8(qc), neg), three));
+                    for c in 0..4 {
+                        let xv = vld1q_f32(xb.add(x_off + c * 4));
+                        acc[c] = vfmaq_f32(acc[c], vsubq_f32(vmulq_n_f32(qa[c], dl_a), ml_a), xv);
+                    }
+                    x_off += 16;
+                    is += 1;
+                    // Sub-block B: q[16..32] >> shift.
+                    let sc_b = scales[is];
+                    let dl_b = d * (sc_b & 0xF) as f32;
+                    let ml_b = vdupq_n_f32(dmin * (sc_b >> 4) as f32);
+                    let qb16 = u8x16_to_f32x4x4(vandq_u8(vshlq_u8(vld1q_u8(qc.add(16)), neg), three));
+                    for c in 0..4 {
+                        let xv = vld1q_f32(xb.add(x_off + c * 4));
+                        acc[c] = vfmaq_f32(acc[c], vsubq_f32(vmulq_n_f32(qb16[c], dl_b), ml_b), xv);
+                    }
+                    x_off += 16;
+                    is += 1;
+                }
+            }
+        }
+        let s = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
+        out[i] = vaddvq_f32(s);
+    }
 }
 
 fn matvec_q2_k_w_f32_a_scalar(
@@ -5985,7 +6256,105 @@ pub fn matvec_q3_k_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_q3_k_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_q3_k_w_f32_a_scalar(w_bytes, x, out, m, k);
+}
+
+/// AArch64 NEON Q3_K matvec. Mirrors the scalar layout: the 6-bit signed
+/// sub-scales are reconstructed by the same `aux` bit-shuffle, then each
+/// 256-weight super-block is 16 half-sub-blocks of 16 weights (2 q-chunks
+/// × 4 shifts × 2 halves A/B). The 2-bit low field is `(qs >> shift) & 3`;
+/// the per-weight high bit comes from `hmask` (bit `chunk*4 + j`): when the
+/// bit is NOT set the value drops by 4, so `value = low2 - (set ? 0 : 4)`
+/// (range -4..3). Scale is `d_all*(scale - 32)`. NEON baseline; same
+/// tolerance contract as the AVX2 path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_q3_k_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 110;
+    const QK_K: usize = 256;
+    const KMASK1: u32 = 0x03030303;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    let blocks_per_row = k / QK_K;
+    let three = vdupq_n_u8(0x03);
+    let four = vdupq_n_u8(4);
+    for i in 0..m {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let hmask = w_bytes.as_ptr().add(off);
+            let qs = w_bytes.as_ptr().add(off + 32);
+            let sc = &w_bytes[off + 96..off + 108];
+            let d_all = f16::from_le_bytes([w_bytes[off + 108], w_bytes[off + 109]]).to_f32();
+
+            // Reconstruct the 16 signed sub-scales (same bit-shuffle as scalar).
+            let mut aux = [0u32; 4];
+            aux[0] = u32::from_le_bytes([sc[0], sc[1], sc[2], sc[3]]);
+            aux[1] = u32::from_le_bytes([sc[4], sc[5], sc[6], sc[7]]);
+            aux[2] = u32::from_le_bytes([sc[8], sc[9], sc[10], sc[11]]);
+            let tmp = aux[2];
+            aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+            aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+            aux[0] = (aux[0] & KMASK2) | ((tmp & KMASK1) << 4);
+            aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+            let aux_bytes: [u8; 16] = bytemuck::cast(aux);
+            let scales: [i8; 16] = aux_bytes.map(|x| x as i8);
+
+            let xb = x.as_ptr().add(b * QK_K);
+            let mut x_off = 0usize;
+            let mut is = 0usize;
+            for chunk in 0..2 {
+                let qc = qs.add(chunk * 32);
+                for j in 0..4 {
+                    let neg = vdupq_n_s8(-((j * 2) as i8));
+                    let mbit = vdupq_n_u8(1u8 << (chunk * 4 + j));
+                    // Sub-block A: qs[0..16], hmask[0..16].
+                    let dl_a = d_all * (scales[is] as f32 - 32.0);
+                    let lo_a = vandq_u8(vshlq_u8(vld1q_u8(qc), neg), three);
+                    // 4 where hmask bit NOT set, else 0.
+                    let hs_a = vandq_u8(vmvnq_u8(vtstq_u8(vld1q_u8(hmask), mbit)), four);
+                    let lo_af = u8x16_to_f32x4x4(lo_a);
+                    let hs_af = u8x16_to_f32x4x4(hs_a);
+                    for c in 0..4 {
+                        let xv = vld1q_f32(xb.add(x_off + c * 4));
+                        let val = vsubq_f32(lo_af[c], hs_af[c]);
+                        acc[c] = vfmaq_f32(acc[c], vmulq_n_f32(val, dl_a), xv);
+                    }
+                    x_off += 16;
+                    is += 1;
+                    // Sub-block B: qs[16..32], hmask[16..32].
+                    let dl_b = d_all * (scales[is] as f32 - 32.0);
+                    let lo_b = vandq_u8(vshlq_u8(vld1q_u8(qc.add(16)), neg), three);
+                    let hs_b = vandq_u8(vmvnq_u8(vtstq_u8(vld1q_u8(hmask.add(16)), mbit)), four);
+                    let lo_bf = u8x16_to_f32x4x4(lo_b);
+                    let hs_bf = u8x16_to_f32x4x4(hs_b);
+                    for c in 0..4 {
+                        let xv = vld1q_f32(xb.add(x_off + c * 4));
+                        let val = vsubq_f32(lo_bf[c], hs_bf[c]);
+                        acc[c] = vfmaq_f32(acc[c], vmulq_n_f32(val, dl_b), xv);
+                    }
+                    x_off += 16;
+                    is += 1;
+                }
+            }
+        }
+        let s = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
+        out[i] = vaddvq_f32(s);
+    }
 }
 
 fn matvec_q3_k_w_f32_a_scalar(
@@ -8016,7 +8385,65 @@ pub fn matvec_q4_0_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_q4_0_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_q4_0_w_f32_a_scalar(w_bytes, x, out, m, k);
+}
+
+/// AArch64 NEON Q4_0 matvec (weight Q4_0, activation f32). Mirrors the
+/// AVX2/scalar math: per 32-weight block, 16 low nibbles (outputs 0..15,
+/// activations x[0..16]) and 16 high nibbles (outputs 16..31, x[16..32]),
+/// each recentered by -8 and scaled by the f16 block scale `d`. The 16
+/// packed bytes widen to two sets of four `float32x4` lanes via the shared
+/// `u8x16_to_f32x4x4` helper; 4 accumulators keep the FMA pipeline full;
+/// one horizontal sum per row. NEON is baseline on aarch64 (no runtime
+/// detect). Not bit-identical to the scalar reference (d folded per block,
+/// vector summation) — same tolerance contract as the AVX2 path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_q4_0_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 18;
+    const QK: usize = 32;
+    let blocks_per_row = k / QK;
+    let mask_lo = vdupq_n_u8(0x0F);
+    let eight = vdupq_n_f32(8.0);
+    for i in 0..m {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let dv = vdupq_n_f32(f16::from_le_bytes([w_bytes[off], w_bytes[off + 1]]).to_f32());
+            // 16 packed bytes → 16 low nibbles (qs[j]&0xF) + 16 high nibbles (qs[j]>>4).
+            let qb16 = vld1q_u8(w_bytes.as_ptr().add(off + 2));
+            let lo_f = u8x16_to_f32x4x4(vandq_u8(qb16, mask_lo));
+            let hi_f = u8x16_to_f32x4x4(vshrq_n_u8::<4>(qb16));
+            let xlo = x.as_ptr().add(b * QK);
+            let xhi = xlo.add(16);
+            for c in 0..4 {
+                let xl = vld1q_f32(xlo.add(c * 4));
+                let xh = vld1q_f32(xhi.add(c * 4));
+                // coef = d * (nibble - 8)
+                let coef_lo = vmulq_f32(dv, vsubq_f32(lo_f[c], eight));
+                let coef_hi = vmulq_f32(dv, vsubq_f32(hi_f[c], eight));
+                acc[c] = vfmaq_f32(acc[c], coef_lo, xl);
+                acc[c] = vfmaq_f32(acc[c], coef_hi, xh);
+            }
+        }
+        let s = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
+        out[i] = vaddvq_f32(s);
+    }
 }
 
 fn matvec_q4_0_w_f32_a_scalar(
@@ -8239,7 +8666,93 @@ pub fn matvec_q5_0_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_q5_0_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_q5_0_w_f32_a_scalar(w_bytes, x, out, m, k);
+}
+
+/// Expand the two low bytes of a packed bit field into 16 `u8` lanes,
+/// each `val` where the corresponding bit is set and 0 otherwise — the
+/// NEON building block for the Q5_0/Q5_1 "5th bit" (bit `j` of the 32-bit
+/// `qh` field selects lane `j`). `lo_byte` drives lanes 0..8, `hi_byte`
+/// lanes 8..16. `vtst` turns a bit-test into a 0xFF/0x00 lane mask, which
+/// we AND with `val` to get `val`-or-0 (the AVX2/AVX-512 paths do the same
+/// with a per-lane variable shift; NEON's bit-expand trick is cheaper than
+/// a 16-lane `vshl`).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn q5_bit_expand_neon(lo_byte: u8, hi_byte: u8, val: u8) -> std::arch::aarch64::uint8x16_t {
+    use std::arch::aarch64::*;
+    const BITS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+    let bitmask = vld1_u8(BITS.as_ptr());
+    let valv = vdup_n_u8(val);
+    let lo = vand_u8(vtst_u8(vdup_n_u8(lo_byte), bitmask), valv);
+    let hi = vand_u8(vtst_u8(vdup_n_u8(hi_byte), bitmask), valv);
+    vcombine_u8(lo, hi)
+}
+
+/// AArch64 NEON Q5_0 matvec. 5-bit signed codes: 4 low bits in `qs`, the
+/// 5th bit in the per-block 32-bit `qh` field. For output `j` (low
+/// nibble) the 5th bit is `qh` bit `j`; for output `j+16` (high nibble)
+/// it is `qh` bit `j+16`. We OR the expanded 5th bit (0 or 0x10) into the
+/// nibble, widen unsigned, recenter by -16, scale by `d`, FMA. NEON
+/// baseline; same tolerance contract as the AVX2 path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_q5_0_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 22;
+    const QK: usize = 32;
+    let blocks_per_row = k / QK;
+    let mask_lo = vdupq_n_u8(0x0F);
+    let sixteen = vdupq_n_f32(16.0);
+    for i in 0..m {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let dv = vdupq_n_f32(f16::from_le_bytes([w_bytes[off], w_bytes[off + 1]]).to_f32());
+            let qh = u32::from_le_bytes([
+                w_bytes[off + 2],
+                w_bytes[off + 3],
+                w_bytes[off + 4],
+                w_bytes[off + 5],
+            ]);
+            let qb16 = vld1q_u8(w_bytes.as_ptr().add(off + 6));
+            let low_nib = vandq_u8(qb16, mask_lo);
+            let high_nib = vshrq_n_u8::<4>(qb16);
+            // 5th bit: outputs 0..15 ← qh bits 0..15; outputs 16..31 ← qh bits 16..31.
+            let hb_lo = q5_bit_expand_neon((qh & 0xFF) as u8, ((qh >> 8) & 0xFF) as u8, 0x10);
+            let hb_hi =
+                q5_bit_expand_neon(((qh >> 16) & 0xFF) as u8, ((qh >> 24) & 0xFF) as u8, 0x10);
+            let lo_f = u8x16_to_f32x4x4(vorrq_u8(low_nib, hb_lo)); // 0..31
+            let hi_f = u8x16_to_f32x4x4(vorrq_u8(high_nib, hb_hi));
+            let xlo = x.as_ptr().add(b * QK);
+            let xhi = xlo.add(16);
+            for c in 0..4 {
+                let xl = vld1q_f32(xlo.add(c * 4));
+                let xh = vld1q_f32(xhi.add(c * 4));
+                let coef_lo = vmulq_f32(dv, vsubq_f32(lo_f[c], sixteen));
+                let coef_hi = vmulq_f32(dv, vsubq_f32(hi_f[c], sixteen));
+                acc[c] = vfmaq_f32(acc[c], coef_lo, xl);
+                acc[c] = vfmaq_f32(acc[c], coef_hi, xh);
+            }
+        }
+        let s = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
+        out[i] = vaddvq_f32(s);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -8534,7 +9047,61 @@ pub fn matvec_q4_1_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_q4_1_w_f32_a_neon(w_bytes, x, out, m_rows, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_q4_1_w_f32_a_scalar(w_bytes, x, out, m_rows, k);
+}
+
+/// AArch64 NEON Q4_1 matvec (weight Q4_1, activation f32). Like Q4_0 but
+/// the codes are unsigned (no `-8` recenter) and each block carries a
+/// second f16 field `m` (the min/offset): the per-weight value is
+/// `d*q + m`, folded with one `vfmaq` (`m + q*d`) before the activation
+/// FMA. Low nibbles map to outputs 0..15 (x[0..16]), high nibbles to
+/// 16..31 (x[16..32]). NEON baseline; same tolerance contract as AVX2.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_q4_1_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m_rows: usize,
+    k: usize,
+) {
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 20;
+    const QK: usize = 32;
+    let blocks_per_row = k / QK;
+    let mask_lo = vdupq_n_u8(0x0F);
+    for i in 0..m_rows {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let dv = vdupq_n_f32(f16::from_le_bytes([w_bytes[off], w_bytes[off + 1]]).to_f32());
+            let mv = vdupq_n_f32(f16::from_le_bytes([w_bytes[off + 2], w_bytes[off + 3]]).to_f32());
+            let qb16 = vld1q_u8(w_bytes.as_ptr().add(off + 4));
+            let lo_f = u8x16_to_f32x4x4(vandq_u8(qb16, mask_lo));
+            let hi_f = u8x16_to_f32x4x4(vshrq_n_u8::<4>(qb16));
+            let xlo = x.as_ptr().add(b * QK);
+            let xhi = xlo.add(16);
+            for c in 0..4 {
+                let xl = vld1q_f32(xlo.add(c * 4));
+                let xh = vld1q_f32(xhi.add(c * 4));
+                // coef = d*q + m (fused: m + q*d)
+                let coef_lo = vfmaq_f32(mv, lo_f[c], dv);
+                let coef_hi = vfmaq_f32(mv, hi_f[c], dv);
+                acc[c] = vfmaq_f32(acc[c], coef_lo, xl);
+                acc[c] = vfmaq_f32(acc[c], coef_hi, xh);
+            }
+        }
+        let s = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
+        out[i] = vaddvq_f32(s);
+    }
 }
 
 fn matvec_q4_1_w_f32_a_scalar(
@@ -8742,7 +9309,71 @@ pub fn matvec_q5_1_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_q5_1_w_f32_a_neon(w_bytes, x, out, m_rows, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_q5_1_w_f32_a_scalar(w_bytes, x, out, m_rows, k);
+}
+
+/// AArch64 NEON Q5_1 matvec. Like Q5_0 but unsigned 5-bit codes (no -16
+/// recenter) plus a per-block f16 min `m`: value = `d*q + m`. The 5th bit
+/// comes from the 32-bit `qh` field exactly as in Q5_0 (output `j` low ←
+/// `qh` bit `j`, output `j+16` high ← bit `j+16`). NEON baseline; same
+/// tolerance contract as the AVX2 path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_q5_1_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m_rows: usize,
+    k: usize,
+) {
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 24;
+    const QK: usize = 32;
+    let blocks_per_row = k / QK;
+    let mask_lo = vdupq_n_u8(0x0F);
+    for i in 0..m_rows {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let dv = vdupq_n_f32(f16::from_le_bytes([w_bytes[off], w_bytes[off + 1]]).to_f32());
+            let mv = vdupq_n_f32(f16::from_le_bytes([w_bytes[off + 2], w_bytes[off + 3]]).to_f32());
+            let qh = u32::from_le_bytes([
+                w_bytes[off + 4],
+                w_bytes[off + 5],
+                w_bytes[off + 6],
+                w_bytes[off + 7],
+            ]);
+            let qb16 = vld1q_u8(w_bytes.as_ptr().add(off + 8));
+            let low_nib = vandq_u8(qb16, mask_lo);
+            let high_nib = vshrq_n_u8::<4>(qb16);
+            let hb_lo = q5_bit_expand_neon((qh & 0xFF) as u8, ((qh >> 8) & 0xFF) as u8, 0x10);
+            let hb_hi =
+                q5_bit_expand_neon(((qh >> 16) & 0xFF) as u8, ((qh >> 24) & 0xFF) as u8, 0x10);
+            let lo_f = u8x16_to_f32x4x4(vorrq_u8(low_nib, hb_lo)); // 0..31
+            let hi_f = u8x16_to_f32x4x4(vorrq_u8(high_nib, hb_hi));
+            let xlo = x.as_ptr().add(b * QK);
+            let xhi = xlo.add(16);
+            for c in 0..4 {
+                let xl = vld1q_f32(xlo.add(c * 4));
+                let xh = vld1q_f32(xhi.add(c * 4));
+                // coef = d*q + m (fused: m + q*d)
+                let coef_lo = vfmaq_f32(mv, lo_f[c], dv);
+                let coef_hi = vfmaq_f32(mv, hi_f[c], dv);
+                acc[c] = vfmaq_f32(acc[c], coef_lo, xl);
+                acc[c] = vfmaq_f32(acc[c], coef_hi, xh);
+            }
+        }
+        let s = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
+        out[i] = vaddvq_f32(s);
+    }
 }
 
 fn matvec_q5_1_w_f32_a_scalar(
@@ -9368,7 +9999,65 @@ pub fn matvec_q8_k_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_q8_k_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_q8_k_w_f32_a_scalar(w_bytes, x, out, m, k);
+}
+
+/// AArch64 NEON Q8_K matvec. Like Q8_0 scaled to 256-weight super-blocks,
+/// but the block scale `d` is f32 (not f16) and `bsums` is unused in the
+/// Q8_K × F32 path. Widen the 256 i8 quants 8 at a time to f32, fold `d`,
+/// `fmla` against the activations; 4 accumulators, one horizontal sum per
+/// row. NEON baseline; same tolerance contract as the AVX2 path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_q8_k_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 292;
+    const QK_K: usize = 256;
+    let blocks_per_row = k / QK_K;
+    for i in 0..m {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let dv = vdupq_n_f32(f32::from_le_bytes([
+                w_bytes[off],
+                w_bytes[off + 1],
+                w_bytes[off + 2],
+                w_bytes[off + 3],
+            ]));
+            let qs = w_bytes.as_ptr().add(off + 4) as *const i8;
+            let xptr = x.as_ptr().add(b * QK_K);
+            let mut ai = 0usize;
+            let mut o = 0usize;
+            while o < QK_K {
+                // 8 i8 quants → i16x8 → two f32x4.
+                let q16 = vmovl_s8(vld1_s8(qs.add(o)));
+                let f_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16)));
+                let f_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16)));
+                acc[ai & 3] = vfmaq_f32(acc[ai & 3], vmulq_f32(dv, f_lo), vld1q_f32(xptr.add(o)));
+                ai += 1;
+                acc[ai & 3] =
+                    vfmaq_f32(acc[ai & 3], vmulq_f32(dv, f_hi), vld1q_f32(xptr.add(o + 4)));
+                ai += 1;
+                o += 8;
+            }
+        }
+        let s = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
+        out[i] = vaddvq_f32(s);
+    }
 }
 
 fn matvec_q8_k_w_f32_a_scalar(
@@ -18102,6 +18791,269 @@ mod tests {
                     "silu_mul SIMD parity at n={n} idx={i}: simd={av} scalar={bv}"
                 );
             }
+        }
+    }
+
+    // ============================================================
+    // AArch64 NEON parity tests
+    // ============================================================
+    //
+    // These run only when the crate is BUILT for aarch64 (natively or
+    // cross-compiled + executed under qemu-user). Each compares the NEON
+    // kernel against the pure-scalar reference on identical random inputs,
+    // the ARM twin of the x86 `*_simd_paths_match_scalar` tests. Tolerance
+    // matches the x86 parity tests (the vector path folds scales per block
+    // and sums in a different order, so it is close-not-bit-identical).
+    #[cfg(target_arch = "aarch64")]
+    mod neon_parity {
+        use super::*;
+
+        /// Small LCG → a reproducible byte/float stream (no `rand` dep).
+        struct Lcg(u32);
+        impl Lcg {
+            fn next_u32(&mut self) -> u32 {
+                self.0 = self.0.wrapping_mul(1664525).wrapping_add(1013904223);
+                self.0
+            }
+            fn byte(&mut self) -> u8 {
+                (self.next_u32() >> 24) as u8
+            }
+            /// A "sane" f16 scale/min (small magnitude, finite) as LE bytes.
+            fn f16_le(&mut self, spread: f32, offset: f32) -> [u8; 2] {
+                let u = (self.next_u32() >> 16) as f32 / 65536.0;
+                f16::from_f32(u * spread + offset).to_le_bytes()
+            }
+            /// A "sane" f32 scale (small magnitude, finite) as LE bytes.
+            fn f32_le(&mut self, spread: f32, offset: f32) -> [u8; 4] {
+                let u = (self.next_u32() >> 8) as f32 / (1u32 << 24) as f32;
+                (u * spread + offset).to_le_bytes()
+            }
+            fn activation(&mut self) -> f32 {
+                (self.next_u32() as i32 as f32) / (i32::MAX as f32)
+            }
+        }
+
+        fn assert_close(scalar: &[f32], neon: &[f32], tag: &str) {
+            for (i, (a, b)) in scalar.iter().zip(neon.iter()).enumerate() {
+                let abs = (a - b).abs();
+                let rel = abs / a.abs().max(1e-6);
+                assert!(
+                    abs < 1e-3 || rel < 1e-5,
+                    "{tag} row {i}: scalar={a} neon={b} abs={abs} rel={rel}"
+                );
+            }
+        }
+
+        fn run_block_quant<const BB: usize>(
+            tag: &str,
+            m: usize,
+            k: usize,
+            seed: u32,
+            // fills one block's bytes given (lcg, &mut block_slice)
+            fill: impl Fn(&mut Lcg, &mut [u8]),
+            scalar: unsafe fn(&[u8], &[f32], &mut [f32], usize, usize),
+            neon: unsafe fn(&[u8], &[f32], &mut [f32], usize, usize),
+            qk: usize,
+        ) {
+            let blocks_per_row = k / qk;
+            let total_blocks = m * blocks_per_row;
+            let mut lcg = Lcg(seed);
+            let mut w = vec![0u8; total_blocks * BB];
+            for blk in w.chunks_exact_mut(BB) {
+                fill(&mut lcg, blk);
+            }
+            let mut x = vec![0f32; k];
+            for v in x.iter_mut() {
+                *v = lcg.activation();
+            }
+            let mut out_scalar = vec![0f32; m];
+            let mut out_neon = vec![0f32; m];
+            // SAFETY: NEON baseline on aarch64; scalar is plain Rust.
+            unsafe {
+                scalar(&w, &x, &mut out_scalar, m, k);
+                neon(&w, &x, &mut out_neon, m, k);
+            }
+            assert_close(&out_scalar, &out_neon, tag);
+        }
+
+        #[test]
+        fn q4_0_neon_matches_scalar() {
+            run_block_quant::<18>(
+                "q4_0",
+                5,
+                128,
+                0x4040_1111,
+                |l, blk| {
+                    blk[0..2].copy_from_slice(&l.f16_le(0.05, 0.001));
+                    for q in &mut blk[2..18] {
+                        *q = l.byte();
+                    }
+                },
+                |w, x, o, m, k| matvec_q4_0_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_q4_0_w_f32_a_neon(w, x, o, m, k) },
+                32,
+            );
+        }
+
+        #[test]
+        fn q4_1_neon_matches_scalar() {
+            run_block_quant::<20>(
+                "q4_1",
+                5,
+                128,
+                0x4141_2222,
+                |l, blk| {
+                    blk[0..2].copy_from_slice(&l.f16_le(0.05, 0.001));
+                    blk[2..4].copy_from_slice(&l.f16_le(0.1, -0.05));
+                    for q in &mut blk[4..20] {
+                        *q = l.byte();
+                    }
+                },
+                |w, x, o, m, k| matvec_q4_1_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_q4_1_w_f32_a_neon(w, x, o, m, k) },
+                32,
+            );
+        }
+
+        #[test]
+        fn q5_0_neon_matches_scalar() {
+            run_block_quant::<22>(
+                "q5_0",
+                5,
+                128,
+                0x5050_3333,
+                |l, blk| {
+                    blk[0..2].copy_from_slice(&l.f16_le(0.05, 0.001));
+                    for q in &mut blk[2..22] {
+                        *q = l.byte();
+                    }
+                },
+                |w, x, o, m, k| matvec_q5_0_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_q5_0_w_f32_a_neon(w, x, o, m, k) },
+                32,
+            );
+        }
+
+        #[test]
+        fn q5_1_neon_matches_scalar() {
+            run_block_quant::<24>(
+                "q5_1",
+                5,
+                128,
+                0x5151_4444,
+                |l, blk| {
+                    blk[0..2].copy_from_slice(&l.f16_le(0.05, 0.001));
+                    blk[2..4].copy_from_slice(&l.f16_le(0.1, -0.05));
+                    for q in &mut blk[4..24] {
+                        *q = l.byte();
+                    }
+                },
+                |w, x, o, m, k| matvec_q5_1_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_q5_1_w_f32_a_neon(w, x, o, m, k) },
+                32,
+            );
+        }
+
+        #[test]
+        fn q6_k_neon_matches_scalar() {
+            // Q6_K super-block: 128 ql + 64 qh + 16 i8 scales + f16 d.
+            run_block_quant::<210>(
+                "q6_k",
+                4,
+                512,
+                0x6060_5555,
+                |l, blk| {
+                    for q in &mut blk[0..208] {
+                        *q = l.byte();
+                    }
+                    blk[208..210].copy_from_slice(&l.f16_le(0.02, 0.001));
+                },
+                |w, x, o, m, k| matvec_q6_k_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_q6_k_w_f32_a_neon(w, x, o, m, k) },
+                256,
+            );
+        }
+
+        #[test]
+        fn q2_k_neon_matches_scalar() {
+            // Q2_K super-block: scales[16] + qs[64] + d(f16) + dmin(f16).
+            run_block_quant::<84>(
+                "q2_k",
+                4,
+                512,
+                0x2020_6666,
+                |l, blk| {
+                    for s in &mut blk[0..80] {
+                        *s = l.byte();
+                    }
+                    blk[80..82].copy_from_slice(&l.f16_le(0.03, 0.001));
+                    blk[82..84].copy_from_slice(&l.f16_le(0.03, 0.001));
+                },
+                |w, x, o, m, k| matvec_q2_k_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_q2_k_w_f32_a_neon(w, x, o, m, k) },
+                256,
+            );
+        }
+
+        #[test]
+        fn q3_k_neon_matches_scalar() {
+            // Q3_K super-block: hmask[32] + qs[64] + sc[12] + d(f16).
+            run_block_quant::<110>(
+                "q3_k",
+                4,
+                512,
+                0x3030_7777,
+                |l, blk| {
+                    for s in &mut blk[0..108] {
+                        *s = l.byte();
+                    }
+                    blk[108..110].copy_from_slice(&l.f16_le(0.02, 0.001));
+                },
+                |w, x, o, m, k| matvec_q3_k_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_q3_k_w_f32_a_neon(w, x, o, m, k) },
+                256,
+            );
+        }
+
+        #[test]
+        fn q5_k_neon_matches_scalar() {
+            // Q5_K super-block: d(f16) + dmin(f16) + scales[12] + qh[32] + qs[128].
+            run_block_quant::<176>(
+                "q5_k",
+                4,
+                512,
+                0x5050_8888,
+                |l, blk| {
+                    blk[0..2].copy_from_slice(&l.f16_le(0.03, 0.001));
+                    blk[2..4].copy_from_slice(&l.f16_le(0.03, 0.001));
+                    for s in &mut blk[4..176] {
+                        *s = l.byte();
+                    }
+                },
+                |w, x, o, m, k| matvec_q5_k_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_q5_k_w_f32_a_neon(w, x, o, m, k) },
+                256,
+            );
+        }
+
+        #[test]
+        fn q8_k_neon_matches_scalar() {
+            // Q8_K super-block: d(f32) + qs[i8;256] + bsums[i16;16] (unused here).
+            run_block_quant::<292>(
+                "q8_k",
+                4,
+                512,
+                0x8080_9999,
+                |l, blk| {
+                    blk[0..4].copy_from_slice(&l.f32_le(0.02, 0.001));
+                    for s in &mut blk[4..292] {
+                        *s = l.byte();
+                    }
+                },
+                |w, x, o, m, k| matvec_q8_k_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_q8_k_w_f32_a_neon(w, x, o, m, k) },
+                256,
+            );
         }
     }
 }
