@@ -635,6 +635,15 @@ pub struct LlamaBlockWeights {
     pub w_gate: Tensor,      // [d_ff, d_model] F32
     pub w_up: Tensor,        // [d_ff, d_model] F32
     pub w_down: Tensor,      // [d_model, d_ff] F32
+    /// Per-head Q/K RMSNorm (Qwen3 / Qwen3-MoE family). Shape
+    /// `[head_dim]`, applied per-head to Q and K after their
+    /// projection and *before* RoPE — the same op the hybrid
+    /// `HybridAttnBlockWeights` carries. `None` on every other
+    /// Llama-family arch (Qwen2 / Llama / Mistral / …), which ships
+    /// no `attn_q_norm` / `attn_k_norm` tensors; the forward then
+    /// skips the op entirely (zero overhead for non-Qwen3 models).
+    pub q_norm: Option<Vec<f32>>,
+    pub k_norm: Option<Vec<f32>>,
 }
 
 /// Uniform read-only view over the attention tensors of any
@@ -656,6 +665,15 @@ pub trait AttnBlock {
     fn b_k(&self) -> Option<&Vec<f32>>;
     fn b_v(&self) -> Option<&Vec<f32>>;
     fn ffn_norm(&self) -> &[f32];
+    /// Qwen3 per-head Q/K RMSNorm weights (`[head_dim]`). Default
+    /// `None` keeps non-Qwen3 impls (and any future ones) untouched;
+    /// the two concrete blocks override to expose their field.
+    fn q_norm(&self) -> Option<&[f32]> {
+        None
+    }
+    fn k_norm(&self) -> Option<&[f32]> {
+        None
+    }
 }
 
 impl AttnBlock for LlamaBlockWeights {
@@ -668,6 +686,8 @@ impl AttnBlock for LlamaBlockWeights {
     fn b_k(&self) -> Option<&Vec<f32>> { self.b_k.as_ref() }
     fn b_v(&self) -> Option<&Vec<f32>> { self.b_v.as_ref() }
     fn ffn_norm(&self) -> &[f32] { &self.ffn_norm }
+    fn q_norm(&self) -> Option<&[f32]> { self.q_norm.as_deref() }
+    fn k_norm(&self) -> Option<&[f32]> { self.k_norm.as_deref() }
 }
 
 impl AttnBlock for LlamaMoeBlockWeights {
@@ -680,6 +700,8 @@ impl AttnBlock for LlamaMoeBlockWeights {
     fn b_k(&self) -> Option<&Vec<f32>> { self.b_k.as_ref() }
     fn b_v(&self) -> Option<&Vec<f32>> { self.b_v.as_ref() }
     fn ffn_norm(&self) -> &[f32] { &self.ffn_norm }
+    fn q_norm(&self) -> Option<&[f32]> { self.q_norm.as_deref() }
+    fn k_norm(&self) -> Option<&[f32]> { self.k_norm.as_deref() }
 }
 
 /// One MoE transformer block's weights — same attention path as
@@ -702,6 +724,13 @@ pub struct LlamaMoeBlockWeights {
     pub b_q: Option<Vec<f32>>,
     pub b_k: Option<Vec<f32>>,
     pub b_v: Option<Vec<f32>>,
+    /// Per-head Q/K RMSNorm (Qwen3-MoE family). Shape `[head_dim]`,
+    /// applied per-head to Q and K after projection and before RoPE.
+    /// `None` on non-Qwen3 MoE archs (Qwen2-MoE / Mixtral / OLMoE /
+    /// DeepSeek-V3), which carry no such tensors — the forward then
+    /// skips the op. Mirrors [`LlamaBlockWeights::q_norm`].
+    pub q_norm: Option<Vec<f32>>,
+    pub k_norm: Option<Vec<f32>>,
     pub ffn_norm: Vec<f32>,  // [d_model]
     /// Router projection. Shape `[n_experts, d_model]` — produces
     /// one logit per expert which the forward pass softmax+top-K's
@@ -1101,6 +1130,10 @@ impl LlamaWeights {
                     b_q: load_optional_norm(gguf, &format!("{prefix}.attn_q.bias")),
                     b_k: load_optional_norm(gguf, &format!("{prefix}.attn_k.bias")),
                     b_v: load_optional_norm(gguf, &format!("{prefix}.attn_v.bias")),
+                    // Qwen3-MoE per-head Q/K norm; absent on other MoE
+                    // archs (returns None → forward skips the op).
+                    q_norm: load_optional_norm(gguf, &format!("{prefix}.attn_q_norm.weight")),
+                    k_norm: load_optional_norm(gguf, &format!("{prefix}.attn_k_norm.weight")),
                     ffn_norm: load_norm(gguf, &format!("{prefix}.ffn_norm.weight"))?,
                     router: load_weight(gguf, &format!("{prefix}.ffn_gate_inp.weight"))?,
                     w_gate_exps,
@@ -1161,6 +1194,10 @@ impl LlamaWeights {
                     w_gate: load_weight(gguf, &format!("{prefix}.ffn_gate.weight"))?,
                     w_up: load_weight(gguf, &format!("{prefix}.ffn_up.weight"))?,
                     w_down: load_weight(gguf, &format!("{prefix}.ffn_down.weight"))?,
+                    // Qwen3 per-head Q/K norm; absent on other dense
+                    // archs (returns None → forward skips the op).
+                    q_norm: load_optional_norm(gguf, &format!("{prefix}.attn_q_norm.weight")),
+                    k_norm: load_optional_norm(gguf, &format!("{prefix}.attn_k_norm.weight")),
                 });
             }
             (blocks, None, None)
@@ -1192,6 +1229,10 @@ impl LlamaWeights {
                         w_gate: load_weight(gguf, &format!("{prefix}.ffn_gate.weight"))?,
                         w_up: load_weight(gguf, &format!("{prefix}.ffn_up.weight"))?,
                         w_down: load_weight(gguf, &format!("{prefix}.ffn_down.weight"))?,
+                        // MTP heads (DeepSeek-V3 style) carry no per-head
+                        // Q/K norm — Qwen3 uses the NextN head, not MTP.
+                        q_norm: None,
+                        k_norm: None,
                     },
                     // Per-head LM head is optional — most DeepSeek-V3
                     // variants tie all MTP heads to the main LM head.
@@ -1654,6 +1695,58 @@ fn apply_partial_rope_per_head(
             let y = head[i + pair_count];
             head[i] = x * c - y * s;
             head[i + pair_count] = x * s + y * c;
+        }
+    }
+}
+
+/// Qwen3 per-head Q/K RMSNorm, applied in place to a single token's
+/// Q and K projection rows *before* RoPE.
+///
+/// Qwen3 (and Qwen3-MoE) insert a per-head RMSNorm on the query and
+/// key vectors after their linear projection and before the rotary
+/// embedding — tensors `self_attn.q_norm.weight` / `k_norm.weight`,
+/// each `[head_dim]`, shared across all heads of that projection.
+/// This is the exact op the hybrid `HybridAttnBlockWeights` path
+/// already performs inline; this free helper lets the dense + MoE
+/// (`&dyn AttnBlock`) forward paths reuse the identical math.
+///
+/// **No-op for every non-Qwen3 arch**: when both `q_norm` and
+/// `k_norm` are `None` (Qwen2 / Llama / Mistral / Mixtral / …) the
+/// function returns immediately, so threading the call through the
+/// shared forward paths costs those models only two `Option` checks.
+///
+/// `q_row` is `[n_heads * head_dim]`, `k_row` is `[n_kv_heads *
+/// head_dim]` — the same per-head row layout RoPE consumes.
+#[inline]
+fn apply_qk_head_norm(
+    q_norm: Option<&[f32]>,
+    k_norm: Option<&[f32]>,
+    q_row: &mut [f32],
+    k_row: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) {
+    if q_norm.is_none() && k_norm.is_none() {
+        return;
+    }
+    // One scratch row of `head_dim` reused across every head (the
+    // rmsnorm kernel writes to a separate output buffer, so we copy
+    // it back over the source after each head).
+    let mut tmp = vec![0.0f32; head_dim];
+    if let Some(qn) = q_norm {
+        for h in 0..n_heads {
+            let s = &mut q_row[h * head_dim..(h + 1) * head_dim];
+            k::rmsnorm_f32_row(s, qn, &mut tmp, eps);
+            s.copy_from_slice(&tmp);
+        }
+    }
+    if let Some(kn) = k_norm {
+        for h in 0..n_kv_heads {
+            let s = &mut k_row[h * head_dim..(h + 1) * head_dim];
+            k::rmsnorm_f32_row(s, kn, &mut tmp, eps);
+            s.copy_from_slice(&tmp);
         }
     }
 }
@@ -7145,6 +7238,18 @@ impl LlamaModel {
             if let Some(bv) = block.b_v() {
                 k::add_inplace_f32(&mut v_buf, bv);
             }
+            // Qwen3 per-head Q/K RMSNorm, before RoPE. No-op on every
+            // non-Qwen3 arch (q_norm/k_norm are None).
+            apply_qk_head_norm(
+                block.q_norm(),
+                block.k_norm(),
+                &mut q_buf,
+                &mut k_buf,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                cfg.rms_eps,
+            );
             // Pick RoPE convention by environment variable so we can A/B
             // test against models without rebuilding (default = neox).
             // Interleaved layout has no SYCL kernel today (the GPU
@@ -8063,6 +8168,18 @@ impl LlamaModel {
                 if let Some(bv) = block.b_v() {
                     k::add_inplace_f32(v_row, bv);
                 }
+                // Qwen3 per-head Q/K RMSNorm, before RoPE. No-op on
+                // every non-Qwen3 arch (q_norm/k_norm are None).
+                apply_qk_head_norm(
+                    block.q_norm(),
+                    block.k_norm(),
+                    q_row,
+                    k_row,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    cfg.rms_eps,
+                );
                 if rope_interleaved_enabled() {
                     k::rope_inplace_interleaved(q_row, n_heads, head_dim, slot.pos, cfg.rope_theta);
                     k::rope_inplace_interleaved(k_row, n_kv_heads, head_dim, slot.pos, cfg.rope_theta);
@@ -8628,6 +8745,18 @@ impl LlamaModel {
             if let Some(bv) = block.b_v() {
                 k::add_inplace_f32(&mut v_buf, bv);
             }
+            // Qwen3 per-head Q/K RMSNorm, before RoPE. No-op on every
+            // non-Qwen3 arch (q_norm/k_norm are None).
+            apply_qk_head_norm(
+                block.q_norm(),
+                block.k_norm(),
+                &mut q_buf,
+                &mut k_buf,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                cfg.rms_eps,
+            );
             if rope_interleaved_enabled() {
                 k::rope_inplace_interleaved(&mut q_buf, n_heads, head_dim, pos, cfg.rope_theta);
                 k::rope_inplace_interleaved(&mut k_buf, n_kv_heads, head_dim, pos, cfg.rope_theta);
@@ -8994,6 +9123,18 @@ impl LlamaModel {
                 if let Some(bv) = block.b_v() {
                     k::add_inplace_f32(v_row, bv);
                 }
+                // Qwen3 per-head Q/K RMSNorm, before RoPE. No-op (two
+                // Option checks) on every non-Qwen3 arch.
+                apply_qk_head_norm(
+                    block.q_norm(),
+                    block.k_norm(),
+                    q_row,
+                    k_row,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    cfg.rms_eps,
+                );
                 let pos_i = (kv_len_base + i) as u32;
                 if rope_interleaved_enabled() {
                     k::rope_inplace_interleaved(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
@@ -9329,6 +9470,18 @@ impl LlamaModel {
                 if let Some(bv) = &block.b_v {
                     k::add_inplace_f32(v_row, bv);
                 }
+                // Qwen3 per-head Q/K RMSNorm, before RoPE. No-op on
+                // every non-Qwen3 arch (q_norm/k_norm are None).
+                apply_qk_head_norm(
+                    block.q_norm.as_deref(),
+                    block.k_norm.as_deref(),
+                    q_row,
+                    k_row,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    cfg.rms_eps,
+                );
                 let pos_i = (kv_len_base + i) as u32;
                 if rope_interleaved_enabled() {
                     k::rope_inplace_interleaved(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
@@ -9601,6 +9754,18 @@ impl LlamaModel {
                 if let Some(bv) = block.b_v() {
                     k::add_inplace_f32(v_row, bv);
                 }
+                // Qwen3 per-head Q/K RMSNorm, before RoPE. No-op (two
+                // Option checks) on every non-Qwen3 arch.
+                apply_qk_head_norm(
+                    block.q_norm(),
+                    block.k_norm(),
+                    q_row,
+                    k_row,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    cfg.rms_eps,
+                );
                 let pos_i = (kv_len_base + i) as u32;
                 if rope_interleaved_enabled() {
                     k::rope_inplace_interleaved(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
@@ -9960,6 +10125,18 @@ impl LlamaModel {
                 if let Some(bv) = block.b_v() {
                     k::add_inplace_f32(v_row, bv);
                 }
+                // Qwen3 per-head Q/K RMSNorm, before RoPE. No-op (two
+                // Option checks) on every non-Qwen3 arch.
+                apply_qk_head_norm(
+                    block.q_norm(),
+                    block.k_norm(),
+                    q_row,
+                    k_row,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    cfg.rms_eps,
+                );
                 let pos_i = (kv_len_base + i) as u32;
                 if rope_interleaved_enabled() {
                     k::rope_inplace_interleaved(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
@@ -10297,6 +10474,18 @@ impl LlamaModel {
                 if let Some(bv) = block.b_v() {
                     k::add_inplace_f32(v_row, bv);
                 }
+                // Qwen3 per-head Q/K RMSNorm, before RoPE. No-op (two
+                // Option checks) on every non-Qwen3 arch.
+                apply_qk_head_norm(
+                    block.q_norm(),
+                    block.k_norm(),
+                    q_row,
+                    k_row,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    cfg.rms_eps,
+                );
                 let pos_i = (kv_len_base + i) as u32;
                 if rope_interleaved_enabled() {
                     k::rope_inplace_interleaved(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
@@ -10673,6 +10862,18 @@ impl LlamaModel {
                 if let Some(bv) = block.b_v() {
                     k::add_inplace_f32(v_row, bv);
                 }
+                // Qwen3 per-head Q/K RMSNorm, before RoPE. No-op (two
+                // Option checks) on every non-Qwen3 arch.
+                apply_qk_head_norm(
+                    block.q_norm(),
+                    block.k_norm(),
+                    q_row,
+                    k_row,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    cfg.rms_eps,
+                );
                 let pos_i = (kv_len_base + i) as u32;
                 if rope_interleaved_enabled() {
                     k::rope_inplace_interleaved(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
@@ -10967,6 +11168,18 @@ impl LlamaModel {
                 if let Some(bv) = block.b_v() {
                     k::add_inplace_f32(v_row, bv);
                 }
+                // Qwen3 per-head Q/K RMSNorm, before RoPE. No-op (two
+                // Option checks) on every non-Qwen3 arch.
+                apply_qk_head_norm(
+                    block.q_norm(),
+                    block.k_norm(),
+                    q_row,
+                    k_row,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    cfg.rms_eps,
+                );
                 let pos_i = (kv_len_base + i) as u32;
                 if rope_interleaved_enabled() {
                     k::rope_inplace_interleaved(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
@@ -11397,6 +11610,8 @@ mod tests {
                 w_up: mat("w_up", d_ff, d, base + 5),
                 w_down: mat("w_down", d, d_ff, base + 6),
                 w_qkv_fused: None,
+                q_norm: None,
+                k_norm: None,
             });
         }
         LlamaModel {

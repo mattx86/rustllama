@@ -121,6 +121,11 @@ pub fn map_hf_to_gguf(hf_name: &str) -> Option<HfTensor> {
         "self_attn.k_proj" => "attn_k",
         "self_attn.v_proj" => "attn_v",
         "self_attn.o_proj" => "attn_output",
+        // Qwen3 / Qwen3-MoE per-head Q/K RMSNorm. 1-D `[head_dim]`
+        // norm weights the builder loads into the block's q_norm /
+        // k_norm slots (Plain tensors — not quantized).
+        "self_attn.q_norm" => "attn_q_norm",
+        "self_attn.k_norm" => "attn_k_norm",
         "mlp.gate_proj" => "ffn_gate",
         "mlp.up_proj" => "ffn_up",
         "mlp.down_proj" => "ffn_down",
@@ -208,6 +213,8 @@ pub fn map_gguf_to_hf(gguf_name: &str) -> Option<String> {
         "attn_k" => "self_attn.k_proj",
         "attn_v" => "self_attn.v_proj",
         "attn_output" => "self_attn.o_proj",
+        "attn_q_norm" => "self_attn.q_norm",
+        "attn_k_norm" => "self_attn.k_norm",
         "ffn_gate" => "mlp.gate_proj",
         "ffn_up" => "mlp.up_proj",
         "ffn_down" => "mlp.down_proj",

@@ -202,6 +202,24 @@ pub fn build_llama_model_from_safetensors(
             "attn_v.bias",
             &[d_kv as u64],
         )?;
+        // Qwen3 per-head Q/K RMSNorm (`self_attn.{q,k}_norm.weight`,
+        // mapped to `attn_{q,k}_norm` by `map_hf_to_gguf`). Each is a
+        // `[head_dim]` norm applied per-head before RoPE. Absent on
+        // Qwen2 / Llama / Mistral → `None`, and the forward skips it.
+        let q_norm = take_optional_f32_vec(
+            &mut by_name,
+            cfg,
+            &format!("{prefix}.attn_q_norm.weight"),
+            "attn_q_norm",
+            &[head_dim as u64],
+        )?;
+        let k_norm = take_optional_f32_vec(
+            &mut by_name,
+            cfg,
+            &format!("{prefix}.attn_k_norm.weight"),
+            "attn_k_norm",
+            &[head_dim as u64],
+        )?;
         let ffn_norm = take_f32_vec(
             &mut by_name,
             cfg,
@@ -247,6 +265,8 @@ pub fn build_llama_model_from_safetensors(
             w_gate,
             w_up,
             w_down,
+            q_norm,
+            k_norm,
         });
     }
 
@@ -381,6 +401,23 @@ fn build_moe_model_from_safetensors(
             "attn_v.bias",
             &[d_kv as u64],
         )?;
+        // Qwen3-MoE per-head Q/K RMSNorm (`self_attn.{q,k}_norm.weight`
+        // → `attn_{q,k}_norm`). `[head_dim]` per-head norm before RoPE;
+        // absent on Qwen2-MoE / Mixtral / OLMoE / DeepSeek-V3 → `None`.
+        let q_norm = take_optional_f32_vec(
+            by_name,
+            cfg,
+            &format!("{prefix}.attn_q_norm.weight"),
+            "attn_q_norm",
+            &[head_dim as u64],
+        )?;
+        let k_norm = take_optional_f32_vec(
+            by_name,
+            cfg,
+            &format!("{prefix}.attn_k_norm.weight"),
+            "attn_k_norm",
+            &[head_dim as u64],
+        )?;
         let ffn_norm = take_f32_vec(
             by_name,
             cfg,
@@ -451,6 +488,8 @@ fn build_moe_model_from_safetensors(
             b_q,
             b_k,
             b_v,
+            q_norm,
+            k_norm,
             ffn_norm,
             router,
             w_gate_exps,

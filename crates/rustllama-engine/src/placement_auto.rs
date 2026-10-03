@@ -538,6 +538,8 @@ mod tests {
                 w_up: mk_tensor(&format!("blk.{layer}.ffn_up.weight"), 200, Dtype::F32),
                 w_down: mk_tensor(&format!("blk.{layer}.ffn_down.weight"), 200, Dtype::F32),
                 w_qkv_fused: None,
+                q_norm: None,
+                k_norm: None,
             }
         };
         let weights = LlamaWeights {
@@ -571,6 +573,8 @@ mod tests {
             w_up: mk_tensor("blk.0.ffn_up.weight", 200, Dtype::F32),
             w_down: mk_tensor("blk.0.ffn_down.weight", 200, Dtype::F32),
             w_qkv_fused: None,
+            q_norm: None,
+            k_norm: None,
         };
         let weights = LlamaWeights {
             token_embd: mk_tensor("token_embd.weight", 1, Dtype::F32),
@@ -606,6 +610,8 @@ mod tests {
             w_up: mk_tensor("w_up", 1, Dtype::F32),
             w_down: mk_tensor("w_down", 1, Dtype::F32),
             w_qkv_fused: None,
+            q_norm: None,
+            k_norm: None,
         };
         let weights = LlamaWeights {
             token_embd: mk_tensor("token_embd", 1, Dtype::F32),

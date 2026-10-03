@@ -771,6 +771,8 @@ mod tests {
                 w_up: mk("blk.0.ffn_up.weight", 20),
                 w_down: mk("blk.0.ffn_down.weight", 20),
                 w_qkv_fused: None,
+                q_norm: None,
+                k_norm: None,
             }],
             moe_blocks: None,
             hybrid_layers: None,

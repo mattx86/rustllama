@@ -1470,6 +1470,8 @@ mod tests {
             b_q: None,
             b_k: None,
             b_v: None,
+            q_norm: None,
+            k_norm: None,
             ffn_norm: vec![1.0; d_model],
             router: tensor_f16_from_rowmajor(&router_vals, n_experts, d_model, "router"),
             w_gate_exps: make_exps(&gate_per_expert, d_ff, d_model, "gate_exps"),
