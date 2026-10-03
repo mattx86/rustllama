@@ -11177,6 +11177,77 @@ fn parallel_matvec_crossover() -> usize {
     })
 }
 
+/// Widen four f16 bit-patterns (each zero-extended into a `u32` lane) to
+/// `float32x4`, hand-rolled so it needs only baseline NEON — the
+/// `vcvt_f32_f16` intrinsics are still behind the unstable
+/// `stdarch_neon_f16` feature, so they can't be used on stable Rust. Uses
+/// Fabian Giesen's branchless float-scale trick: place the 15 exponent +
+/// mantissa bits, multiply by a magic `2^112` to re-bias the exponent
+/// (which also reconstructs f16 subnormals for free, since the product is a
+/// normal f32), lift Inf/NaN via a compare, then OR the sign back. Exact for
+/// every finite f16 (all are representable in f32), so bit-identical to
+/// `half::f16::to_f32` on real weight data.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn f16x4_to_f32x4(h: std::arch::aarch64::uint32x4_t) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    let magic = vreinterpretq_f32_u32(vdupq_n_u32((254 - 15) << 23));
+    let was_infnan = vdupq_n_f32(f32::from_bits((127 + 16) << 23));
+    let expmant = vshlq_n_u32::<13>(vandq_u32(h, vdupq_n_u32(0x7fff)));
+    let scaled = vmulq_f32(vreinterpretq_f32_u32(expmant), magic);
+    // Lanes that overflow the f16 finite range (Inf/NaN) get the exponent
+    // forced to all-ones; `vcgeq_f32` yields the per-lane select mask.
+    let is_infnan = vcgeq_f32(scaled, was_infnan);
+    let infnan_bits = vandq_u32(is_infnan, vdupq_n_u32(255 << 23));
+    let sign = vshlq_n_u32::<16>(vandq_u32(h, vdupq_n_u32(0x8000)));
+    let bits = vorrq_u32(vorrq_u32(vreinterpretq_u32_f32(scaled), infnan_bits), sign);
+    vreinterpretq_f32_u32(bits)
+}
+
+/// AArch64 NEON serial F16 matvec. Widens f16 weights to f32 with the stable
+/// hand-rolled [`f16x4_to_f32x4`] (no unstable fp16 intrinsics). 16-lane
+/// main tile (4 accumulators), 4-lane mid loop, scalar tail — the f16 twin
+/// of the BF16 NEON path. NEON baseline; same tolerance contract as the
+/// AVX2 path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_f16_w_f32_a_neon(w: &[f16], x: &[f32], out: &mut [f32], m: usize, k: usize) {
+    use std::arch::aarch64::*;
+    let k_main = k & !15;
+    let k_main4 = k & !3;
+    for i in 0..m {
+        let wptr = w.as_ptr().add(i * k) as *const u16;
+        let mut a = [vdupq_n_f32(0.0); 4];
+        let mut p = 0;
+        while p < k_main {
+            let h0 = vld1q_u16(wptr.add(p));
+            let h1 = vld1q_u16(wptr.add(p + 8));
+            let w0 = f16x4_to_f32x4(vmovl_u16(vget_low_u16(h0)));
+            let w1 = f16x4_to_f32x4(vmovl_u16(vget_high_u16(h0)));
+            let w2 = f16x4_to_f32x4(vmovl_u16(vget_low_u16(h1)));
+            let w3 = f16x4_to_f32x4(vmovl_u16(vget_high_u16(h1)));
+            let xp = x.as_ptr().add(p);
+            a[0] = vfmaq_f32(a[0], w0, vld1q_f32(xp));
+            a[1] = vfmaq_f32(a[1], w1, vld1q_f32(xp.add(4)));
+            a[2] = vfmaq_f32(a[2], w2, vld1q_f32(xp.add(8)));
+            a[3] = vfmaq_f32(a[3], w3, vld1q_f32(xp.add(12)));
+            p += 16;
+        }
+        while p < k_main4 {
+            let h = f16x4_to_f32x4(vmovl_u16(vld1_u16(wptr.add(p))));
+            a[0] = vfmaq_f32(a[0], h, vld1q_f32(x.as_ptr().add(p)));
+            p += 4;
+        }
+        let mut sum = vaddvq_f32(vaddq_f32(vaddq_f32(a[0], a[1]), vaddq_f32(a[2], a[3])));
+        while p < k {
+            sum += w[i * k + p].to_f32() * x[p];
+            p += 1;
+        }
+        out[i] = sum;
+    }
+}
+
 /// Serial F16 matvec — the original SIMD-only path. The public
 /// [`matvec_f16_w_f32_a`] auto-dispatcher picks this for small M;
 /// callers that always want the serial path call this directly.
@@ -11209,7 +11280,14 @@ pub fn matvec_f16_w_f32_a_serial(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_f16_w_f32_a_neon(w, x, out, m, k) };
+        return;
+    }
 
+    #[cfg(not(target_arch = "aarch64"))]
     gemm_f16_w_f32_a(w, x, out, m, 1, k);
 }
 
@@ -20166,6 +20244,28 @@ mod tests {
             matvec_bf16_w_f32_a_scalar(&w, &x, &mut os, m, k);
             unsafe { matvec_bf16_w_f32_a_neon(&w, &x, &mut on, m, k) };
             assert_close(&os, &on, "matvec_bf16");
+        }
+
+        #[test]
+        fn matvec_f16_neon_matches_scalar() {
+            // k = 70 exercises the 16-lane tile, the 4-lane mid loop, and the
+            // scalar tail. The hand-rolled widen is exact for finite f16, so
+            // this should be bit-identical (abs == 0) to the naive reference.
+            let mut l = Lcg(0x0F16_0001);
+            let (m, k) = (5usize, 70usize);
+            let w: Vec<f16> = (0..m * k).map(|_| f16::from_f32(l.activation())).collect();
+            let x: Vec<f32> = (0..k).map(|_| l.activation()).collect();
+            let mut os = vec![0f32; m];
+            for (i, o) in os.iter_mut().enumerate() {
+                let mut acc = 0f32;
+                for p in 0..k {
+                    acc += w[i * k + p].to_f32() * x[p];
+                }
+                *o = acc;
+            }
+            let mut on = vec![0f32; m];
+            unsafe { matvec_f16_w_f32_a_neon(&w, &x, &mut on, m, k) };
+            assert_close(&os, &on, "matvec_f16");
         }
 
         #[test]
