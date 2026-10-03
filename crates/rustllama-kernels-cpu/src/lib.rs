@@ -4858,12 +4858,15 @@ pub fn matvec_iq4_xs_w_f32_a(
 }
 
 /// Widen an `int8x16` (16 signed bytes) to four `float32x4` — the signed
-/// twin of [`u8x16_to_f32x4x4`], used by the IQ4 codebook kernels where
-/// the looked-up codebook values are signed i8.
+/// twin of [`u8x16_to_f32x4x4`], used by the IQ4 codebook kernels (here)
+/// and the MXFP4/NVFP4 E2M1 kernels (in the `mxfp`/`nvfp4` submodules)
+/// where the looked-up codebook values are signed i8.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
-unsafe fn s8x16_to_f32x4x4(v: std::arch::aarch64::int8x16_t) -> [std::arch::aarch64::float32x4_t; 4] {
+pub(crate) unsafe fn s8x16_to_f32x4x4(
+    v: std::arch::aarch64::int8x16_t,
+) -> [std::arch::aarch64::float32x4_t; 4] {
     use std::arch::aarch64::*;
     let lo16 = vmovl_s8(vget_low_s8(v));
     let hi16 = vmovl_s8(vget_high_s8(v));

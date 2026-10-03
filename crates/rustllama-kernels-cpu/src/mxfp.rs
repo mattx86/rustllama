@@ -16,6 +16,15 @@ pub(crate) const E2M1_CODEBOOK: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
 
+/// E2M1 codebook **scaled by 2** so every entry is an exact small integer
+/// (`[0,1,2,3,4,6,8,12]` and negatives), which fits `i8` and can be gathered
+/// with a single NEON `vqtbl1q_s8`. A caller reconstructs the true value by
+/// folding the extra `0.5` into the block scale (`scale * 0.5`), which is
+/// exact (`0.5` is a power of two). Shared by the MXFP4 / NVFP4 NEON kernels.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const E2M1_X2_I8: [i8; 16] =
+    [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
 pub const MXFP4_BLOCK_ELEMS: usize = 32;
 pub const MXFP4_BLOCK_BYTES: usize = 17;
 pub const MXFP6_BLOCK_ELEMS: usize = 32;
@@ -99,7 +108,51 @@ pub fn matvec_mxfp4_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_mxfp4_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_mxfp4_w_f32_a_scalar(w_bytes, x, out, m, k);
+}
+
+/// AArch64 NEON MXFP4 matvec (E2M1 + E8M0). The 4-bit codes gather from
+/// the integer-scaled [`E2M1_X2_I8`] codebook via `vqtbl1q_s8`; the extra
+/// factor of 2 is folded back as `scale * 0.5` (exact). Codes are stored
+/// interleaved (byte `j` → elements `2j`, `2j+1`), so `vzip` reinterleaves
+/// the low/high nibble lookups into element order before the signed widen.
+/// NEON baseline; same tolerance contract as the AVX2 path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_mxfp4_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
+    use crate::s8x16_to_f32x4x4;
+    use std::arch::aarch64::*;
+    let bpr = k / MXFP4_BLOCK_ELEMS;
+    let codebook = vld1q_s8(E2M1_X2_I8.as_ptr());
+    let mask_lo = vdupq_n_u8(0x0F);
+    for i in 0..m {
+        let row = i * bpr * MXFP4_BLOCK_BYTES;
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        for b in 0..bpr {
+            let off = row + b * MXFP4_BLOCK_BYTES;
+            let sv = vdupq_n_f32(e8m0_to_f32(w_bytes[off + 16]) * 0.5);
+            let qb16 = vld1q_u8(w_bytes.as_ptr().add(off));
+            // 16 lo + 16 hi codebook values (i8), then interleave to element order.
+            let lo = vqtbl1q_s8(codebook, vandq_u8(qb16, mask_lo));
+            let hi = vqtbl1q_s8(codebook, vshrq_n_u8::<4>(qb16));
+            let e_lo = s8x16_to_f32x4x4(vzip1q_s8(lo, hi)); // elements 0..15
+            let e_hi = s8x16_to_f32x4x4(vzip2q_s8(lo, hi)); // elements 16..31
+            let xb = x.as_ptr().add(b * MXFP4_BLOCK_ELEMS);
+            for c in 0..4 {
+                acc[c] = vfmaq_f32(acc[c], vmulq_f32(sv, e_lo[c]), vld1q_f32(xb.add(c * 4)));
+                acc[c] = vfmaq_f32(acc[c], vmulq_f32(sv, e_hi[c]), vld1q_f32(xb.add(16 + c * 4)));
+            }
+        }
+        let s = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
+        out[i] = vaddvq_f32(s);
+    }
 }
 
 /// Scalar reference for the MXFP4 matvec — also the non-x86 fallback.
@@ -743,6 +796,13 @@ mod tests {
             let mut disp = vec![0f32; m];
             matvec_mxfp4_w_f32_a(&w, &x, &mut disp, m, k);
             assert_close(&disp, &scalar, "mxfp4 dispatch");
+            #[cfg(target_arch = "aarch64")]
+            {
+                let mut o = vec![0f32; m];
+                // SAFETY: NEON baseline on aarch64.
+                unsafe { matvec_mxfp4_w_f32_a_neon(&w, &x, &mut o, m, k) };
+                assert_close(&o, &scalar, "mxfp4 neon");
+            }
             #[cfg(target_arch = "x86_64")]
             {
                 if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {

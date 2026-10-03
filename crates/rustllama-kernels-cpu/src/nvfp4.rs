@@ -320,7 +320,56 @@ pub fn matvec_nvfp4_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_nvfp4_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_nvfp4_w_f32_a_scalar(w_bytes, x, out, m, k);
+}
+
+/// AArch64 NEON NVFP4 matvec (E2M1 codes + per-16-block E4M3 scale). Same
+/// E2M1 codebook as MXFP4, so the 8 code bytes (16 interleaved 4-bit codes)
+/// gather from the integer [`crate::mxfp::E2M1_X2_I8`] codebook via an
+/// 8-lane `vqtbl1_s8`, reinterleave with `vzip`, widen signed, and fold the
+/// `×2` back as `scale * 0.5`. NEON baseline; same tolerance contract as the
+/// AVX2 path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_nvfp4_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use crate::{mxfp::E2M1_X2_I8, s8x16_to_f32x4x4};
+    use std::arch::aarch64::*;
+    let bpr = k / NVFP4_BLOCK_ELEMS;
+    let codebook = vld1q_s8(E2M1_X2_I8.as_ptr());
+    let mask_lo = vdup_n_u8(0x0F);
+    for i in 0..m {
+        let row_start = i * bpr * NVFP4_BLOCK_BYTES;
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        for b in 0..bpr {
+            let off = row_start + b * NVFP4_BLOCK_BYTES;
+            let sv = vdupq_n_f32(e4m3_to_f32(w_bytes[off + 8]) * 0.5);
+            let b8 = vld1_u8(w_bytes.as_ptr().add(off)); // 8 code bytes → 16 codes
+            let lo = vqtbl1_s8(codebook, vand_u8(b8, mask_lo)); // 8 lo-nibble values
+            let hi = vqtbl1_s8(codebook, vshr_n_u8::<4>(b8)); // 8 hi-nibble values
+            // Interleave to element order (e[2j]=lo[j], e[2j+1]=hi[j]).
+            let e = vcombine_s8(vzip1_s8(lo, hi), vzip2_s8(lo, hi));
+            let ef = s8x16_to_f32x4x4(e);
+            let xb = x.as_ptr().add(b * NVFP4_BLOCK_ELEMS);
+            for c in 0..4 {
+                acc[c] = vfmaq_f32(acc[c], vmulq_f32(sv, ef[c]), vld1q_f32(xb.add(c * 4)));
+            }
+        }
+        let s = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
+        out[i] = vaddvq_f32(s);
+    }
 }
 
 fn matvec_nvfp4_w_f32_a_scalar(
@@ -925,6 +974,23 @@ mod tests {
                 kernel_out[i],
                 ref_out[i],
             );
+        }
+
+        // On aarch64 the dispatch above already ran the NEON kernel; pin it
+        // directly against the scalar reference too (tighter than the
+        // dequant bound — same decode, only FMA reduction order differs).
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mut scalar_out = vec![0f32; m];
+            matvec_nvfp4_w_f32_a_scalar(&w_packed, &x, &mut scalar_out, m, k);
+            let mut neon_out = vec![0f32; m];
+            // SAFETY: NEON baseline on aarch64.
+            unsafe { matvec_nvfp4_w_f32_a_neon(&w_packed, &x, &mut neon_out, m, k) };
+            for i in 0..m {
+                let abs = (scalar_out[i] - neon_out[i]).abs();
+                let rel = abs / scalar_out[i].abs().max(1e-6);
+                assert!(abs < 1e-4 || rel < 1e-5, "row {i}: neon {} vs scalar {}", neon_out[i], scalar_out[i]);
+            }
         }
     }
 
