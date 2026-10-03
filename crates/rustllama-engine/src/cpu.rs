@@ -2333,6 +2333,38 @@ impl CpuEngine {
             None
         }
 
+        // MoE detection + per-weight skip. An MLX MoE checkpoint
+        // (Qwen2-MoE / Qwen3-MoE / OLMoE / Mixtral) names its FFN
+        // experts `...mlp.experts.{E}.{gate,up,down}_proj`, its router
+        // `...mlp.gate`, and (Qwen2-MoE) a shared expert
+        // `...mlp.shared_expert.*` + `...mlp.shared_expert_gate`. Those
+        // are stacked into the GGUF MoE tensor set by
+        // `mlx_moe_to_converted`, so the per-weight generic loops below
+        // must SKIP them (they'd otherwise have no GGUF mapping and be
+        // dropped). Dense MLX models have no `.mlp.experts.` modules and
+        // take the unchanged path.
+        fn mlx_mlp_moe_module(module: &str) -> bool {
+            let Some(rest) = module.strip_prefix("model.layers.") else {
+                return false;
+            };
+            let Some(dot) = rest.find('.') else { return false };
+            if rest[..dot].parse::<usize>().is_err() {
+                return false;
+            }
+            let Some(mlp) = rest[dot + 1..].strip_prefix("mlp.") else {
+                return false;
+            };
+            mlp.starts_with("experts.")
+                || mlp == "gate"
+                || mlp.starts_with("shared_expert.")
+                || mlp == "shared_expert_gate"
+        }
+        let is_moe = mlx
+            .quant
+            .keys()
+            .chain(mlx.micro.keys())
+            .any(|m| m.contains(".mlp.experts."));
+
         let mut out = Vec::with_capacity(mlx.quant.len() + mlx.full.len());
 
         // --- Quantized affine weights → load-time GGUF-quant transcode ---
@@ -2362,6 +2394,9 @@ impl CpuEngine {
         let (mut n_q4_1, mut n_q4_k, mut n_q8_0, mut n_native) =
             (0usize, 0usize, 0usize, 0usize);
         for (module, q) in &mlx.quant {
+            if is_moe && mlx_mlp_moe_module(module) {
+                continue; // handled by mlx_moe_to_converted (stacked)
+            }
             let Some(gguf_name) = quant_name_to_gguf(module) else {
                 tracing::debug!(
                     module = %module,
@@ -2424,6 +2459,9 @@ impl CpuEngine {
             {
                 let (mut nm_q4_1, mut nm_q4_k, mut nm_q8_0) = (0usize, 0usize, 0usize);
                 for (module, m) in &mlx.micro {
+                    if is_moe && mlx_mlp_moe_module(module) {
+                        continue; // handled by mlx_moe_to_converted (stacked)
+                    }
                     let Some(gguf_name) = quant_name_to_gguf(module) else {
                         tracing::debug!(
                             module = %module,
@@ -2490,6 +2528,20 @@ impl CpuEngine {
                 dtype,
                 bytes,
             });
+        }
+
+        // --- MoE: stack experts + router + shared expert ---------------
+        // Appended after the per-weight (attention / norm / embedding /
+        // lm_head) tensors so a MoE model carries BOTH its dense-shaped
+        // slots (handled above) and its stacked expert set (here).
+        if is_moe {
+            let moe_tensors = Self::mlx_moe_to_converted(mlx)?;
+            tracing::info!(
+                moe_tensors = moe_tensors.len(),
+                "mlx load: MoE experts/router/shared stacked into GGUF MoE \
+                 tensor set (per-expert transcode → stacked block-quant)"
+            );
+            out.extend(moe_tensors);
         }
 
         Ok(out)
@@ -2681,6 +2733,224 @@ impl CpuEngine {
                 m.bits
             ))
         })
+    }
+
+    /// Group an MLX MoE checkpoint's per-expert / router / shared-expert
+    /// linears into the GGUF MoE tensor set the engine's MoE forward
+    /// already consumes:
+    ///
+    /// - `blk.{N}.ffn_{gate,up,down}_exps.weight` — ONE stacked tensor
+    ///   per layer+projection holding every expert's transcoded
+    ///   block-quant bytes back-to-back, in expert-index order. That is
+    ///   exactly the byte layout [`rustllama_models::moe::expert_view`]
+    ///   slices (offset = `expert * byte_size(d_out*d_in)`), so the
+    ///   builder's per-expert views land on the right bytes.
+    /// - `blk.{N}.ffn_gate_inp.weight` — the router (`mlp.gate`).
+    /// - `blk.{N}.ffn_{gate,up,down}_shexp.weight` +
+    ///   `blk.{N}.ffn_gate_inp_shexp.weight` — Qwen2-MoE's always-on
+    ///   shared expert and its sigmoid gate (absent on Qwen3-MoE /
+    ///   OLMoE / Mixtral).
+    ///
+    /// Every weight runs through the SAME per-weight transcoder the
+    /// dense path uses (affine or mxfp*/nvfp* → Q4_K/Q4_1/Q8_0), so a
+    /// MoE MLX model becomes an ordinary stacked-quant MoE model that
+    /// runs on every backend with no MLX-specific dispatch. Experts must
+    /// transcode to a block-quant (never native `MlxAffineRaw`) so the
+    /// stacked bytes stay uniform + sliceable; an odd-bit / force-native
+    /// expert is rejected rather than silently mis-stacked.
+    #[cfg(feature = "encoder")]
+    fn mlx_moe_to_converted(
+        mlx: &rustllama_safetensors::MlxModel,
+    ) -> Result<Vec<rustllama_safetensors::ConvertedTensor>> {
+        use rustllama_safetensors::{ConvertedDtype, ConvertedTensor};
+        use std::collections::BTreeMap;
+
+        #[derive(Clone, Copy)]
+        enum Proj {
+            Gate,
+            Up,
+            Down,
+        }
+        enum Role {
+            Expert { layer: usize, proj: Proj, expert: usize },
+            Router { layer: usize },
+            Shared { layer: usize, proj: Proj },
+            SharedGate { layer: usize },
+        }
+        fn proj_from(s: &str) -> Option<Proj> {
+            match s {
+                "gate_proj" => Some(Proj::Gate),
+                "up_proj" => Some(Proj::Up),
+                "down_proj" => Some(Proj::Down),
+                _ => None,
+            }
+        }
+        fn classify(module: &str) -> Option<Role> {
+            let rest = module.strip_prefix("model.layers.")?;
+            let dot = rest.find('.')?;
+            let layer: usize = rest[..dot].parse().ok()?;
+            let mlp = rest[dot + 1..].strip_prefix("mlp.")?;
+            if let Some(e) = mlp.strip_prefix("experts.") {
+                let edot = e.find('.')?;
+                let expert: usize = e[..edot].parse().ok()?;
+                let proj = proj_from(&e[edot + 1..])?;
+                return Some(Role::Expert { layer, proj, expert });
+            }
+            if mlp == "gate" {
+                return Some(Role::Router { layer });
+            }
+            if mlp == "shared_expert_gate" {
+                return Some(Role::SharedGate { layer });
+            }
+            if let Some(sp) = mlp.strip_prefix("shared_expert.") {
+                return Some(Role::Shared {
+                    layer,
+                    proj: proj_from(sp)?,
+                });
+            }
+            None
+        }
+        let proj_code = |p: Proj| -> u8 {
+            match p {
+                Proj::Gate => 0,
+                Proj::Up => 1,
+                Proj::Down => 2,
+            }
+        };
+
+        // Stage every MoE weight (transcoded) with its classified role,
+        // from BOTH the affine and the microscaling maps.
+        let mut staged: Vec<(Role, ConvertedDtype, Vec<u8>, Vec<u64>, String)> = Vec::new();
+        for (module, q) in &mlx.quant {
+            let Some(role) = classify(module) else { continue };
+            let (dtype, bytes) = Self::mlx_quant_to_converted_bytes(q, false);
+            staged.push((role, dtype, bytes, q.shape.clone(), module.clone()));
+        }
+        for (module, m) in &mlx.micro {
+            let Some(role) = classify(module) else { continue };
+            let (dtype, bytes) = Self::mlx_micro_to_converted_bytes(m)?;
+            staged.push((role, dtype, bytes, m.shape.clone(), module.clone()));
+        }
+
+        // Route: experts accumulate into per-(layer, proj) maps keyed by
+        // expert index (BTreeMap → ascending order); router / shared
+        // emit single GGUF-named tensors immediately.
+        // (layer, proj_code) -> expert_idx -> (dtype, bytes, [out, in]).
+        let mut experts: BTreeMap<(usize, u8), BTreeMap<usize, (ConvertedDtype, Vec<u8>, Vec<u64>)>> =
+            BTreeMap::new();
+        let mut out: Vec<ConvertedTensor> = Vec::new();
+        for (role, dtype, bytes, shape, module) in staged {
+            if matches!(dtype, ConvertedDtype::MlxAffineRaw) {
+                return Err(CpuEngineError::Other(format!(
+                    "mlx MoE weight `{module}` did not transcode to a GGUF \
+                     block-quant (kept native affine — odd bit-width or \
+                     RUSTLLAMA_MLX_NATIVE set); MoE needs stackable uniform \
+                     expert blocks"
+                )));
+            }
+            match role {
+                Role::Expert { layer, proj, expert } => {
+                    experts
+                        .entry((layer, proj_code(proj)))
+                        .or_default()
+                        .insert(expert, (dtype, bytes, shape));
+                }
+                Role::Router { layer } => {
+                    out.push(ConvertedTensor {
+                        gguf_name: format!("blk.{layer}.ffn_gate_inp.weight"),
+                        shape,
+                        dtype,
+                        bytes,
+                    });
+                }
+                Role::Shared { layer, proj } => {
+                    let nm = match proj {
+                        Proj::Gate => "ffn_gate_shexp",
+                        Proj::Up => "ffn_up_shexp",
+                        Proj::Down => "ffn_down_shexp",
+                    };
+                    out.push(ConvertedTensor {
+                        gguf_name: format!("blk.{layer}.{nm}.weight"),
+                        shape,
+                        dtype,
+                        bytes,
+                    });
+                }
+                Role::SharedGate { layer } => {
+                    out.push(ConvertedTensor {
+                        gguf_name: format!("blk.{layer}.ffn_gate_inp_shexp.weight"),
+                        shape,
+                        dtype,
+                        bytes,
+                    });
+                }
+            }
+        }
+
+        // Stack each (layer, proj) expert group: concat expert 0's bytes,
+        // then 1, … (BTreeMap iterates in ascending index order). Enforce
+        // a dense 0..n index set + a single uniform dtype so the stacked
+        // blob slices cleanly.
+        for ((layer, pc), per_expert) in experts {
+            let n = per_expert.len();
+            let mut dtype: Option<ConvertedDtype> = None;
+            let mut dims: Option<(u64, u64)> = None;
+            let mut expect = 0usize;
+            let mut all_bytes: Vec<u8> = Vec::new();
+            for (idx, (dt, b, sh)) in per_expert {
+                if idx != expect {
+                    return Err(CpuEngineError::Other(format!(
+                        "mlx MoE layer {layer} proj {pc}: experts not a dense \
+                         0..n index set (saw {idx}, expected {expect})"
+                    )));
+                }
+                expect += 1;
+                match dtype {
+                    None => dtype = Some(dt),
+                    Some(d) if d == dt => {}
+                    Some(_) => {
+                        return Err(CpuEngineError::Other(format!(
+                            "mlx MoE layer {layer} proj {pc}: experts transcoded \
+                             to mixed dtypes — cannot stack"
+                        )))
+                    }
+                }
+                if dims.is_none() && sh.len() == 2 {
+                    dims = Some((sh[0], sh[1]));
+                }
+                all_bytes.extend_from_slice(&b);
+            }
+            let dtype = dtype.expect("non-empty expert group");
+            let (d_out, d_in) = dims.expect("2-D expert shape");
+            let nm = match pc {
+                0 => "ffn_gate_exps",
+                1 => "ffn_up_exps",
+                _ => "ffn_down_exps",
+            };
+            out.push(ConvertedTensor {
+                gguf_name: format!("blk.{layer}.{nm}.weight"),
+                shape: vec![n as u64, d_out, d_in],
+                dtype,
+                bytes: all_bytes,
+            });
+        }
+
+        Ok(out)
+    }
+
+    /// Slim-build twin of [`mlx_moe_to_converted`]: without the `encoder`
+    /// feature there are no gguf encode tables to transcode the experts,
+    /// so a MoE MLX model cannot be stacked. Fail loudly.
+    #[cfg(not(feature = "encoder"))]
+    fn mlx_moe_to_converted(
+        _mlx: &rustllama_safetensors::MlxModel,
+    ) -> Result<Vec<rustllama_safetensors::ConvertedTensor>> {
+        Err(CpuEngineError::Other(
+            "MLX MoE load requires the `encoder` feature to transcode + stack \
+             experts into a GGUF block-quant; this slim build cannot load a \
+             MoE MLX model"
+                .to_string(),
+        ))
     }
 
     /// Test-only hook: install a pre-loaded vision tower and a chosen

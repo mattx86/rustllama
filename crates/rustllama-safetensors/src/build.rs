@@ -22,9 +22,9 @@ use std::sync::Arc;
 use bytemuck::cast_slice;
 use half::f16;
 use rustllama_models::llama_arch::{
-    LlamaBlockWeights, LlamaModel, LlamaWeights,
+    LlamaBlockWeights, LlamaModel, LlamaMoeBlockWeights, LlamaWeights,
 };
-use rustllama_models::llama_config::LlamaConfig;
+use rustllama_models::llama_config::{LlamaConfig, MoeConfig};
 use rustllama_tensor::{contiguous_strides, Device, Dtype, Storage, Tensor};
 
 use crate::convert::{ConvertedDtype, ConvertedTensor};
@@ -57,6 +57,16 @@ pub enum BuildError {
          conversion path"
     )]
     MoeUnsupported,
+    #[error(
+        "MoE build: stacked expert tensor `{name}` has {got} bytes, not a \
+         whole multiple of {n_experts} experts ({per_expert} B each)"
+    )]
+    MoeExpertStackMismatch {
+        name: String,
+        got: usize,
+        n_experts: usize,
+        per_expert: usize,
+    },
 }
 
 /// Assemble a [`LlamaModel`] from the A-2b converted-tensor list
@@ -78,9 +88,21 @@ pub fn build_llama_model_from_safetensors(
     cfg: &LlamaConfig,
     tensors: Vec<ConvertedTensor>,
 ) -> Result<LlamaModel, BuildError> {
-    if cfg.moe.is_some() {
-        return Err(BuildError::MoeUnsupported);
+    // Build a name → ConvertedTensor map so we can extract each
+    // tensor by name and surface a clear MissingTensor error when
+    // a required slot isn't present.
+    let mut by_name: HashMap<String, ConvertedTensor> =
+        tensors.into_iter().map(|t| (t.gguf_name.clone(), t)).collect();
+
+    // MoE checkpoints (Qwen2-MoE / Qwen3-MoE / OLMoE / Mixtral) take a
+    // separate assembly path: the engine's MLX transcoder stacks each
+    // layer's experts into `blk.N.ffn_{gate,up,down}_exps.weight` + a
+    // `ffn_gate_inp` router (+ optional shared expert), exactly the
+    // GGUF MoE tensor set — this builds `LlamaMoeBlockWeights` from it.
+    if let Some(moe) = cfg.moe.as_ref() {
+        return build_moe_model_from_safetensors(cfg, moe, &mut by_name);
     }
+
     let d_model = cfg.d_model;
     let d_ff = cfg.d_ff;
     let n_heads = cfg.n_heads;
@@ -88,12 +110,6 @@ pub fn build_llama_model_from_safetensors(
     let head_dim = cfg.head_dim;
     let d_q = n_heads * head_dim;
     let d_kv = n_kv_heads * head_dim;
-
-    // Build a name → ConvertedTensor map so we can extract each
-    // tensor by name and surface a clear MissingTensor error when
-    // a required slot isn't present.
-    let mut by_name: HashMap<String, ConvertedTensor> =
-        tensors.into_iter().map(|t| (t.gguf_name.clone(), t)).collect();
 
     // ---- Top-level tensors ------------------------------------
     let token_embd = take_tensor(
@@ -248,6 +264,272 @@ pub fn build_llama_model_from_safetensors(
             hadamard: None,
         },
     })
+}
+
+/// Assemble a MoE [`LlamaModel`] from the converted-tensor list.
+///
+/// The engine's MLX transcoder (`cpu.rs::mlx_model_to_converted`)
+/// stacks each layer's per-expert MLX linears into the GGUF MoE tensor
+/// set — `blk.N.ffn_{gate,up,down}_exps.weight` (one tensor holding all
+/// experts' bytes back-to-back, the exact byte layout
+/// [`rustllama_models::moe::expert_view`] slices), a `blk.N.ffn_gate_inp`
+/// router, and (Qwen2-MoE) a `blk.N.ffn_{gate,up,down}_shexp` shared
+/// expert plus a `blk.N.ffn_gate_inp_shexp` sigmoid gate. This mirrors
+/// the GGUF MoE loader (`LlamaWeights::from_gguf`): same tensor names,
+/// same per-expert views, so the engine's existing MoE forward runs it
+/// unchanged. Attention / norm / embedding slots reuse the dense path's
+/// `take_*` helpers (identical to a dense Llama block).
+fn build_moe_model_from_safetensors(
+    cfg: &LlamaConfig,
+    moe: &MoeConfig,
+    by_name: &mut HashMap<String, ConvertedTensor>,
+) -> Result<LlamaModel, BuildError> {
+    let d_model = cfg.d_model;
+    let d_ff = cfg.d_ff; // per-expert FFN width (moe_intermediate_size)
+    let n_heads = cfg.n_heads;
+    let n_kv_heads = cfg.n_kv_heads;
+    let head_dim = cfg.head_dim;
+    let d_q = n_heads * head_dim;
+    let d_kv = n_kv_heads * head_dim;
+    let n_experts = moe.n_experts as usize;
+
+    // ---- Top-level tensors (identical to the dense path) ----------
+    let token_embd = take_tensor(
+        by_name,
+        cfg,
+        "token_embd.weight",
+        "token_embd",
+        &[cfg.vocab_size as u64, d_model as u64],
+    )?;
+    let output_norm = take_f32_vec(
+        by_name,
+        cfg,
+        "output_norm.weight",
+        "output_norm",
+        &[d_model as u64],
+    )?;
+    let output = if cfg.tie_word_embeddings {
+        None
+    } else {
+        Some(take_tensor(
+            by_name,
+            cfg,
+            "output.weight",
+            "output",
+            &[cfg.vocab_size as u64, d_model as u64],
+        )?)
+    };
+
+    // ---- Per-layer MoE blocks -------------------------------------
+    let mut mbs = Vec::with_capacity(cfg.n_layers);
+    for i in 0..cfg.n_layers {
+        let prefix = format!("blk.{i}");
+        // Attention + norms: same shapes/roles as a dense block.
+        let attn_norm = take_f32_vec(
+            by_name,
+            cfg,
+            &format!("{prefix}.attn_norm.weight"),
+            "attn_norm",
+            &[d_model as u64],
+        )?;
+        let w_q = take_tensor(
+            by_name,
+            cfg,
+            &format!("{prefix}.attn_q.weight"),
+            "attn_q",
+            &[d_q as u64, d_model as u64],
+        )?;
+        let w_k = take_tensor(
+            by_name,
+            cfg,
+            &format!("{prefix}.attn_k.weight"),
+            "attn_k",
+            &[d_kv as u64, d_model as u64],
+        )?;
+        let w_v = take_tensor(
+            by_name,
+            cfg,
+            &format!("{prefix}.attn_v.weight"),
+            "attn_v",
+            &[d_kv as u64, d_model as u64],
+        )?;
+        let w_o = take_tensor(
+            by_name,
+            cfg,
+            &format!("{prefix}.attn_output.weight"),
+            "attn_output",
+            &[d_model as u64, d_q as u64],
+        )?;
+        let b_q = take_optional_f32_vec(
+            by_name,
+            cfg,
+            &format!("{prefix}.attn_q.bias"),
+            "attn_q.bias",
+            &[d_q as u64],
+        )?;
+        let b_k = take_optional_f32_vec(
+            by_name,
+            cfg,
+            &format!("{prefix}.attn_k.bias"),
+            "attn_k.bias",
+            &[d_kv as u64],
+        )?;
+        let b_v = take_optional_f32_vec(
+            by_name,
+            cfg,
+            &format!("{prefix}.attn_v.bias"),
+            "attn_v.bias",
+            &[d_kv as u64],
+        )?;
+        let ffn_norm = take_f32_vec(
+            by_name,
+            cfg,
+            &format!("{prefix}.ffn_norm.weight"),
+            "ffn_norm",
+            &[d_model as u64],
+        )?;
+
+        // Router `[n_experts, d_model]`. Block-quant shape is logical,
+        // so no strict pre-check — route_topk's matvec uses explicit
+        // m/k. Required (every MoE layer has a router).
+        let router = take_moe_tensor(by_name, &format!("{prefix}.ffn_gate_inp.weight"))?;
+
+        // Stacked experts. Each is one tensor of n_experts back-to-back
+        // `[d_out, d_in]` matrices; `expert_view` slices by byte offset.
+        let w_gate_exps = take_moe_stacked(
+            by_name,
+            &format!("{prefix}.ffn_gate_exps.weight"),
+            n_experts,
+            d_ff,
+            d_model,
+        )?;
+        let w_up_exps = take_moe_stacked(
+            by_name,
+            &format!("{prefix}.ffn_up_exps.weight"),
+            n_experts,
+            d_ff,
+            d_model,
+        )?;
+        let w_down_exps = take_moe_stacked(
+            by_name,
+            &format!("{prefix}.ffn_down_exps.weight"),
+            n_experts,
+            d_model,
+            d_ff,
+        )?;
+
+        // Pre-compute per-expert views (share storage via Arc slice —
+        // no byte copy). Same call shape as the GGUF MoE loader.
+        let gate_per_expert: Vec<Tensor> = (0..n_experts)
+            .map(|e| rustllama_models::moe::expert_view(&w_gate_exps, e, d_ff, d_model))
+            .collect();
+        let up_per_expert: Vec<Tensor> = (0..n_experts)
+            .map(|e| rustllama_models::moe::expert_view(&w_up_exps, e, d_ff, d_model))
+            .collect();
+        let down_per_expert: Vec<Tensor> = (0..n_experts)
+            .map(|e| rustllama_models::moe::expert_view(&w_down_exps, e, d_model, d_ff))
+            .collect();
+
+        // Shared expert (Qwen2-MoE) — optional. Its width differs from
+        // the routed experts; the forward reads it from the tensor. The
+        // sigmoid gate (`ffn_gate_inp_shexp`) is also optional.
+        let w_gate_shared =
+            take_optional_moe_tensor(by_name, &format!("{prefix}.ffn_gate_shexp.weight"));
+        let w_up_shared =
+            take_optional_moe_tensor(by_name, &format!("{prefix}.ffn_up_shexp.weight"));
+        let w_down_shared =
+            take_optional_moe_tensor(by_name, &format!("{prefix}.ffn_down_shexp.weight"));
+        let shared_router =
+            take_optional_moe_tensor(by_name, &format!("{prefix}.ffn_gate_inp_shexp.weight"));
+
+        mbs.push(LlamaMoeBlockWeights {
+            attn_norm,
+            w_q,
+            w_k,
+            w_v,
+            w_o,
+            b_q,
+            b_k,
+            b_v,
+            ffn_norm,
+            router,
+            w_gate_exps,
+            w_up_exps,
+            w_down_exps,
+            w_gate_shared,
+            w_up_shared,
+            w_down_shared,
+            shared_router,
+            gate_per_expert,
+            up_per_expert,
+            down_per_expert,
+        });
+    }
+
+    Ok(LlamaModel {
+        cfg: cfg.clone(),
+        weights: LlamaWeights {
+            token_embd,
+            blocks: Vec::new(),
+            moe_blocks: Some(mbs),
+            hybrid_layers: None,
+            output_norm,
+            output,
+            mtp_heads: None,
+            nextn_head: None,
+            hadamard: None,
+        },
+    })
+}
+
+/// Take a required MoE tensor by GGUF name with no shape check — used
+/// for the router and stacked-expert tensors whose logical shape isn't
+/// a plain `[out, in]` linear (the matvec/`expert_view` consumers pass
+/// explicit dims).
+fn take_moe_tensor(
+    by_name: &mut HashMap<String, ConvertedTensor>,
+    name: &str,
+) -> Result<Tensor, BuildError> {
+    let ct = by_name
+        .remove(name)
+        .ok_or_else(|| BuildError::MissingTensor(name.into()))?;
+    Ok(converted_to_tensor(ct))
+}
+
+/// Take an optional MoE tensor (shared-expert / shared-gate slots that
+/// only Qwen2-MoE carries). Absent → `None`.
+fn take_optional_moe_tensor(
+    by_name: &mut HashMap<String, ConvertedTensor>,
+    name: &str,
+) -> Option<Tensor> {
+    by_name.remove(name).map(converted_to_tensor)
+}
+
+/// Take a stacked per-expert tensor and verify its byte length is
+/// exactly `n_experts × per-expert-byte-size` so every
+/// [`rustllama_models::moe::expert_view`] offset lands in bounds.
+fn take_moe_stacked(
+    by_name: &mut HashMap<String, ConvertedTensor>,
+    name: &str,
+    n_experts: usize,
+    d_out: usize,
+    d_in: usize,
+) -> Result<Tensor, BuildError> {
+    let ct = by_name
+        .remove(name)
+        .ok_or_else(|| BuildError::MissingTensor(name.into()))?;
+    let t = converted_to_tensor(ct);
+    let per_expert = t.dtype.byte_size((d_out * d_in) as u64) as usize;
+    let got = t.storage.len_bytes();
+    if per_expert == 0 || got != per_expert * n_experts {
+        return Err(BuildError::MoeExpertStackMismatch {
+            name: name.into(),
+            got,
+            n_experts,
+            per_expert,
+        });
+    }
+    Ok(t)
 }
 
 fn take_tensor(
@@ -680,9 +962,14 @@ mod tests {
     }
 
     #[test]
-    fn moe_config_is_rejected_at_build_time() {
-        // Spoof a MoE-enabled cfg; the builder bails before reading
-        // any tensors.
+    fn moe_config_routes_to_moe_builder() {
+        // A MoE-enabled cfg no longer bails with MoeUnsupported — it now
+        // enters the MoE assembly path. With an empty tensor set that
+        // path fails at the first missing slot (`token_embd.weight`),
+        // which proves it took the MoE branch (the dense branch would
+        // report the same, but the point is the build no longer hard-
+        // rejects MoE). See `moe_builder_assembles_stacked_experts` for
+        // the positive path.
         use rustllama_models::llama_config::MoeConfig;
         let (cfg_json, _blob) = build_minimal_awq_safetensors();
         let mut cfg = parse_hf_config(&cfg_json).unwrap();
@@ -693,11 +980,81 @@ mod tests {
         });
         let err = build_llama_model_from_safetensors(&cfg, Vec::new())
             .err()
-            .expect("MoE cfg should be rejected");
+            .expect("empty MoE tensor set should fail on a missing slot");
         match err {
-            BuildError::MoeUnsupported => {}
-            other => panic!("expected MoeUnsupported, got {other:?}"),
+            BuildError::MissingTensor(ref n) if n == "token_embd.weight" => {}
+            other => panic!("expected MissingTensor(token_embd.weight), got {other:?}"),
         }
+    }
+
+    /// Positive MoE path: hand the builder a synthetic stacked-expert
+    /// tensor set (F16, 2 experts, no shared expert) and confirm it
+    /// assembles `moe_blocks` with correctly-sliced per-expert views.
+    #[test]
+    fn moe_builder_assembles_stacked_experts() {
+        use rustllama_models::llama_config::MoeConfig;
+        let d_model = 16usize;
+        let d_ff = 8usize; // per-expert FFN width
+        let n_experts = 2usize;
+        let vocab = 4usize;
+        let n_heads = 2usize;
+        let head_dim = 8usize; // d_q = d_kv = 16 = d_model
+
+        let f16_bytes = |v: &[f32]| -> Vec<u8> {
+            v.iter().flat_map(|x| f16::from_f32(*x).to_le_bytes()).collect()
+        };
+        let mut ts: Vec<ConvertedTensor> = Vec::new();
+        let push_f16 = |ts: &mut Vec<ConvertedTensor>, name: &str, shape: Vec<u64>, n: usize| {
+            let vals: Vec<f32> = (0..n).map(|i| (i % 7) as f32 * 0.01).collect();
+            ts.push(ConvertedTensor {
+                gguf_name: name.into(),
+                shape,
+                dtype: ConvertedDtype::F16,
+                bytes: f16_bytes(&vals),
+            });
+        };
+        push_f16(&mut ts, "token_embd.weight", vec![vocab as u64, d_model as u64], vocab * d_model);
+        push_f16(&mut ts, "output_norm.weight", vec![d_model as u64], d_model);
+        push_f16(&mut ts, "output.weight", vec![vocab as u64, d_model as u64], vocab * d_model);
+        for i in 0..1usize {
+            let p = format!("blk.{i}");
+            push_f16(&mut ts, &format!("{p}.attn_norm.weight"), vec![d_model as u64], d_model);
+            push_f16(&mut ts, &format!("{p}.ffn_norm.weight"), vec![d_model as u64], d_model);
+            for proj in ["attn_q", "attn_k", "attn_v", "attn_output"] {
+                push_f16(&mut ts, &format!("{p}.{proj}.weight"), vec![d_model as u64, d_model as u64], d_model * d_model);
+            }
+            // Router [n_experts, d_model].
+            push_f16(&mut ts, &format!("{p}.ffn_gate_inp.weight"), vec![n_experts as u64, d_model as u64], n_experts * d_model);
+            // Stacked experts: gate/up [n, d_ff, d_model], down [n, d_model, d_ff].
+            push_f16(&mut ts, &format!("{p}.ffn_gate_exps.weight"), vec![n_experts as u64, d_ff as u64, d_model as u64], n_experts * d_ff * d_model);
+            push_f16(&mut ts, &format!("{p}.ffn_up_exps.weight"), vec![n_experts as u64, d_ff as u64, d_model as u64], n_experts * d_ff * d_model);
+            push_f16(&mut ts, &format!("{p}.ffn_down_exps.weight"), vec![n_experts as u64, d_model as u64, d_ff as u64], n_experts * d_model * d_ff);
+        }
+
+        let cfg_json = format!(
+            r#"{{"architectures":["Qwen2MoeForCausalLM"],"hidden_size":{d_model},
+                "intermediate_size":64,"moe_intermediate_size":{d_ff},
+                "num_hidden_layers":1,"num_attention_heads":{n_heads},
+                "num_key_value_heads":{n_heads},"head_dim":{head_dim},
+                "vocab_size":{vocab},"num_experts":{n_experts},
+                "num_experts_per_tok":2,"tie_word_embeddings":false}}"#
+        );
+        let cfg = parse_hf_config(&cfg_json).unwrap();
+        assert_eq!(cfg.d_ff, d_ff, "MoE d_ff must be the per-expert width");
+        assert!(matches!(cfg.moe, Some(MoeConfig { n_experts: 2, n_experts_used: 2, .. })));
+
+        let model = build_llama_model_from_safetensors(&cfg, ts).expect("MoE build");
+        assert!(model.weights.blocks.is_empty());
+        let mbs = model.weights.moe_blocks.as_ref().expect("moe_blocks populated");
+        assert_eq!(mbs.len(), 1);
+        let mb = &mbs[0];
+        assert_eq!(mb.gate_per_expert.len(), n_experts);
+        assert_eq!(mb.down_per_expert.len(), n_experts);
+        // Per-expert views carry the sliced [d_out, d_in] shape.
+        assert_eq!(mb.gate_per_expert[0].shape, vec![d_ff as u64, d_model as u64]);
+        assert_eq!(mb.down_per_expert[1].shape, vec![d_model as u64, d_ff as u64]);
+        assert!(mb.w_gate_shared.is_none(), "no shared expert in this fixture");
+        assert!(mb.shared_router.is_none());
     }
 
     #[test]

@@ -723,6 +723,14 @@ pub struct LlamaMoeBlockWeights {
     pub w_gate_shared: Option<Tensor>,
     pub w_up_shared: Option<Tensor>,
     pub w_down_shared: Option<Tensor>,
+    /// Shared-expert sigmoid gate. `Some` only on Qwen2-MoE
+    /// (Qwen1.5-MoE), whose always-on shared expert is scaled per
+    /// token by `sigmoid(shared_router @ hidden)` (a `[1, d_model]`
+    /// projection). DeepSeek-V3 runs its shared expert ungated, so
+    /// this is `None` there and the shared contribution is added at
+    /// weight 1.0. Matches the `HybridFfn::Moe::shared_router` field
+    /// the qwen35moe hybrid path already carries.
+    pub shared_router: Option<Tensor>,
     /// Pre-computed per-expert tensor views into `w_gate_exps` /
     /// `w_up_exps` / `w_down_exps`. Each view is a 2D `[d_ff,
     /// d_model]` (or `[d_model, d_ff]` for down) tensor whose
@@ -1113,6 +1121,11 @@ impl LlamaWeights {
                         gguf,
                         &format!("{prefix}.ffn_down_shexp.weight"),
                     ),
+                    // GGUF MoE loads (DeepSeek-V3 / Qwen3-MoE) keep the
+                    // shared expert ungated; the Qwen2-MoE sigmoid gate
+                    // is wired on the MLX/safetensors load path, which
+                    // populates this. Preserve existing GGUF behavior.
+                    shared_router: None,
                     gate_per_expert,
                     up_per_expert,
                     down_per_expert,

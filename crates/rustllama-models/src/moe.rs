@@ -478,20 +478,71 @@ pub fn moe_ffn_one_into(
         }
     }
 
-    // Shared expert (always-active, no router weight). DeepSeek-V3
-    // family; absent on Mixtral / Qwen3-MoE.
+    // Shared expert. DeepSeek-V3 runs it always-on at the routed-
+    // expert width (`d_ff`); Qwen2-MoE (Qwen1.5-MoE) runs a WIDER
+    // shared FFN (`shared_expert_intermediate_size` != d_ff) scaled
+    // per token by `sigmoid(shared_router @ hidden)`. The shared
+    // width is read from the tensor itself, and the sigmoid gate is
+    // applied only when `block.shared_router` is present (None →
+    // weight 1.0, the DeepSeek-V3 path, byte-identical to before).
     if let (Some(w_g), Some(w_u), Some(w_d)) = (
         &block.w_gate_shared,
         &block.w_up_shared,
         &block.w_down_shared,
     ) {
-        crate::llama_arch::matvec_tensor_gate_up_fused_dispatch(
-            w_g, w_u, hidden, gate_buf, up_buf, d_ff, d_model,
-        );
-        k::silu_mul_f32(gate_buf, up_buf, ff_buf);
-        crate::llama_arch::matvec_tensor_dispatch(w_d, ff_buf, down_buf, d_model, d_ff);
+        let shared_weight = match block.shared_router.as_ref() {
+            Some(sr) => {
+                let mut s = [0.0f32; 1];
+                k::matvec_tensor(sr, hidden, &mut s, 1, d_model);
+                // Numerically stable sigmoid (matches moe_ffn_one_into_parts).
+                if s[0] >= 0.0 {
+                    1.0 / (1.0 + (-s[0]).exp())
+                } else {
+                    let e = s[0].exp();
+                    e / (1.0 + e)
+                }
+            }
+            None => 1.0,
+        };
+        // Shared FFN width = w_gate_shared rows. Equals d_ff for
+        // DeepSeek-V3 (reuse the routed-expert scratch); wider for
+        // Qwen2-MoE, where the d_ff-sized scratch would overflow, so
+        // allocate per-call shared buffers.
+        let shared_d_ff = w_g.shape.first().copied().unwrap_or(d_ff as u64) as usize;
+        if shared_d_ff <= d_ff {
+            crate::llama_arch::matvec_tensor_gate_up_fused_dispatch(
+                w_g,
+                w_u,
+                hidden,
+                &mut gate_buf[..shared_d_ff],
+                &mut up_buf[..shared_d_ff],
+                shared_d_ff,
+                d_model,
+            );
+            k::silu_mul_f32(
+                &gate_buf[..shared_d_ff],
+                &up_buf[..shared_d_ff],
+                &mut ff_buf[..shared_d_ff],
+            );
+            crate::llama_arch::matvec_tensor_dispatch(
+                w_d,
+                &ff_buf[..shared_d_ff],
+                down_buf,
+                d_model,
+                shared_d_ff,
+            );
+        } else {
+            let mut sg = vec![0.0f32; shared_d_ff];
+            let mut su = vec![0.0f32; shared_d_ff];
+            let mut sf = vec![0.0f32; shared_d_ff];
+            crate::llama_arch::matvec_tensor_gate_up_fused_dispatch(
+                w_g, w_u, hidden, &mut sg, &mut su, shared_d_ff, d_model,
+            );
+            k::silu_mul_f32(&sg, &su, &mut sf);
+            crate::llama_arch::matvec_tensor_dispatch(w_d, &sf, down_buf, d_model, shared_d_ff);
+        }
         for j in 0..d_model {
-            out[j] += down_buf[j];
+            out[j] += shared_weight * down_buf[j];
         }
     }
 }
@@ -1427,6 +1478,7 @@ mod tests {
             w_gate_shared: None,
             w_up_shared: None,
             w_down_shared: None,
+            shared_router: None,
             gate_per_expert: Vec::new(),
             up_per_expert: Vec::new(),
             down_per_expert: Vec::new(),

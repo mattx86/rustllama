@@ -12,7 +12,7 @@
 //! names mirror that schema verbatim; some keys are optional and
 //! default to derived / well-known values when absent.
 
-use rustllama_models::llama_config::LlamaConfig;
+use rustllama_models::llama_config::{LlamaConfig, MoeConfig};
 use serde::Deserialize;
 
 /// HuggingFace `config.json` shape — just the fields rustllama needs.
@@ -60,6 +60,33 @@ struct HfConfigJson {
     /// formula).
     #[serde(default)]
     head_dim: Option<u32>,
+
+    // ---- MoE (mixture-of-experts) fields --------------------------
+    // Present on MoE checkpoints (Qwen2-MoE / Qwen3-MoE / OLMoE /
+    // Mixtral). All optional so dense configs parse unchanged. MoE
+    // detection keys on a non-zero expert count.
+    /// Qwen2/Qwen3-MoE / OLMoE expert count (`num_experts`).
+    #[serde(default)]
+    num_experts: Option<u32>,
+    /// Mixtral's name for the same field (`num_local_experts`).
+    #[serde(default)]
+    num_local_experts: Option<u32>,
+    /// Top-K routed experts per token (`num_experts_per_tok`).
+    #[serde(default)]
+    num_experts_per_tok: Option<u32>,
+    /// Per-expert FFN width. On MoE models this — NOT
+    /// `intermediate_size` — is the expert feed-forward length the
+    /// per-expert tensors slice to (mirrors the GGUF loader's
+    /// preference for `expert_feed_forward_length`). Absent on
+    /// Mixtral (whose experts use `intermediate_size`).
+    #[serde(default)]
+    moe_intermediate_size: Option<u32>,
+    /// Qwen2-MoE always-on shared-expert FFN width. Its presence
+    /// marks a (sigmoid-gated) shared expert; the width differs from
+    /// `moe_intermediate_size` so the loader derives it from the
+    /// tensor itself at build time (this field only flags presence).
+    #[serde(default)]
+    shared_expert_intermediate_size: Option<u32>,
 }
 
 /// HF allows `eos_token_id: 151645` or `eos_token_id: [151645, 151643]`.
@@ -131,13 +158,46 @@ pub fn parse_hf_config(json: &str) -> Result<LlamaConfig, HfConfigError> {
         .unwrap_or_else(|| d_model / n_heads.max(1));
     let eos_id = raw.eos_token_id.as_ref().and_then(EosTokenId::first);
 
+    // MoE detection from the HF config. A non-zero `num_experts`
+    // (`num_local_experts` on Mixtral) marks a mixture-of-experts
+    // checkpoint. `n_experts_shared` flags Qwen2-MoE's always-on
+    // shared expert (presence of `shared_expert_intermediate_size`).
+    let n_experts = raw.num_experts.or(raw.num_local_experts).unwrap_or(0);
+    let moe = if n_experts > 0 {
+        Some(MoeConfig {
+            n_experts,
+            n_experts_used: raw.num_experts_per_tok.unwrap_or(1),
+            n_experts_shared: if raw.shared_expert_intermediate_size.is_some() {
+                1
+            } else {
+                0
+            },
+        })
+    } else {
+        None
+    };
+
+    // `d_ff` is the FFN width the per-layer tensors slice to. On MoE
+    // models that's the PER-EXPERT width (`moe_intermediate_size`),
+    // not the dense `intermediate_size` (which, where present, sizes
+    // only the Qwen2-MoE shared expert). Mirrors the GGUF loader
+    // preferring `expert_feed_forward_length` under expert metadata.
+    // Mixtral carries no `moe_intermediate_size`; its experts use
+    // `intermediate_size`, so fall back to it.
+    let d_ff = if moe.is_some() {
+        raw.moe_intermediate_size
+            .unwrap_or(raw.intermediate_size) as usize
+    } else {
+        raw.intermediate_size as usize
+    };
+
     Ok(LlamaConfig {
         arch,
         n_layers: raw.num_hidden_layers as usize,
         n_heads,
         n_kv_heads,
         d_model,
-        d_ff: raw.intermediate_size as usize,
+        d_ff,
         head_dim,
         // HF doesn't separate rope dim from head dim — they're equal
         // for every Llama-family model.
@@ -150,7 +210,7 @@ pub fn parse_hf_config(json: &str) -> Result<LlamaConfig, HfConfigError> {
         eos_token_id: eos_id,
         tie_word_embeddings: raw.tie_word_embeddings,
         n_mtp_heads: 0,
-        moe: None, // MoE detection from HF configs is A-2d (out of scope for v1)
+        moe, // MoE now parsed from HF config (MLX MoE load path)
         hybrid: None, // HF configs don't yet carry SSM keys for our hybrid path
         hadamard: None, // Prism rotation metadata is GGUF-only
     })
@@ -355,6 +415,76 @@ mod tests {
             Err(HfConfigError::Json(_)) => {}
             other => panic!("expected Json error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_qwen2_moe_config_with_shared_expert() {
+        // Mirrors mlx-community/Qwen1.5-MoE-A2.7B-Chat-4bit (Qwen2-MoE):
+        // 60 experts top-4, per-expert FFN 1408, shared expert 5632.
+        let json = r#"{
+            "architectures": ["Qwen2MoeForCausalLM"],
+            "hidden_size": 2048,
+            "intermediate_size": 5632,
+            "moe_intermediate_size": 1408,
+            "shared_expert_intermediate_size": 5632,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "num_experts": 60,
+            "num_experts_per_tok": 4,
+            "vocab_size": 151936,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0
+        }"#;
+        let cfg = parse_hf_config(json).unwrap();
+        assert_eq!(cfg.arch, "qwen2moe");
+        // d_ff is the PER-EXPERT width, not intermediate_size.
+        assert_eq!(cfg.d_ff, 1408);
+        let moe = cfg.moe.expect("MoE detected");
+        assert_eq!(moe.n_experts, 60);
+        assert_eq!(moe.n_experts_used, 4);
+        // shared_expert_intermediate_size present → 1 shared expert.
+        assert_eq!(moe.n_experts_shared, 1);
+    }
+
+    #[test]
+    fn parses_mixtral_num_local_experts_without_moe_intermediate() {
+        // Mixtral names the count `num_local_experts` and has no
+        // `moe_intermediate_size` — experts use `intermediate_size`.
+        let json = r#"{
+            "architectures": ["MixtralForCausalLM"],
+            "hidden_size": 4096,
+            "intermediate_size": 14336,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "num_local_experts": 8,
+            "num_experts_per_tok": 2,
+            "vocab_size": 32000
+        }"#;
+        let cfg = parse_hf_config(json).unwrap();
+        let moe = cfg.moe.expect("MoE detected via num_local_experts");
+        assert_eq!(moe.n_experts, 8);
+        assert_eq!(moe.n_experts_used, 2);
+        assert_eq!(moe.n_experts_shared, 0);
+        // No moe_intermediate_size → fall back to intermediate_size.
+        assert_eq!(cfg.d_ff, 14336);
+    }
+
+    #[test]
+    fn dense_config_still_has_no_moe() {
+        let json = r#"{
+            "architectures": ["Qwen2ForCausalLM"],
+            "hidden_size": 3584,
+            "intermediate_size": 18944,
+            "num_hidden_layers": 28,
+            "num_attention_heads": 28,
+            "num_key_value_heads": 4,
+            "vocab_size": 152064
+        }"#;
+        let cfg = parse_hf_config(json).unwrap();
+        assert!(cfg.moe.is_none());
+        assert_eq!(cfg.d_ff, 18944);
     }
 
     #[test]
