@@ -2134,6 +2134,513 @@ fn matvec_ptq1_0_w_f32_a_scalar(
     }
 }
 
+// ======================================================================
+// AArch64 NEON grid-codebook IQ matvecs (IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS
+// / IQ2_S / IQ3_XXS / IQ3_S).
+//
+// These formats dequant through 256..2048-entry packed grids, far too big
+// for an in-register `vqtbl` lookup (unlike IQ4_NL / IQ4_XS, whose 16-entry
+// codebook *does* fit). NEON has no gather instruction either, so — exactly
+// as the task brief prescribes — each grid entry is fetched scalar (the same
+// index math as the `_scalar` reference) and only the per-run arithmetic
+// (sign application + the `db·grid·x` FMA over 8 lanes) is vectorized. The
+// x86 paths lean on `_mm_i32gather_*`; on ARM that part stays scalar, so the
+// win here is modest, but it closes NEON parity for every quant format.
+// All are bit-close (abs<1e-3 || rel<1e-5) to the scalar reference, checked
+// under qemu by the `neon_parity` tests.
+// ======================================================================
+
+/// Widen a `uint8x8` (8 bytes) to two `float32x4` (unsigned). The 8-wide
+/// twin of [`u8x16_to_f32x4x4`], for the 8-weight IQ grid runs.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn u8x8_to_f32x4x2(v: std::arch::aarch64::uint8x8_t) -> [std::arch::aarch64::float32x4_t; 2] {
+    use std::arch::aarch64::*;
+    let w16 = vmovl_u8(v);
+    [
+        vcvtq_f32_u32(vmovl_u16(vget_low_u16(w16))),
+        vcvtq_f32_u32(vmovl_u16(vget_high_u16(w16))),
+    ]
+}
+
+/// Widen a signed `int8x8` (8 bytes) to two `float32x4`. The IQ1 grids
+/// store signed `i8` points (value + sign folded into the codebook), so
+/// their NEON widen is signed.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn s8x8_to_f32x4x2(v: std::arch::aarch64::int8x8_t) -> [std::arch::aarch64::float32x4_t; 2] {
+    use std::arch::aarch64::*;
+    let w16 = vmovl_s8(v);
+    [
+        vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16))),
+        vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16))),
+    ]
+}
+
+/// Expand an 8-bit IQ sign byte to two `float32x4` of ±1.0 (lane `j` is
+/// `-1.0` iff bit `j` is set — the `KMASK_IQ2XS = [1,2,4,8,16,32,64,128]`
+/// convention the scalar reference uses). Shared by every sign-table IQ
+/// grid kernel (IQ2_* / IQ3_*).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn iq_signs8_to_f32x4x2(sign_byte: u8) -> [std::arch::aarch64::float32x4_t; 2] {
+    use std::arch::aarch64::*;
+    let lo_bits = [1u32, 2, 4, 8];
+    let hi_bits = [16u32, 32, 64, 128];
+    let lo_mask = vld1q_u32(lo_bits.as_ptr());
+    let hi_mask = vld1q_u32(hi_bits.as_ptr());
+    let sbv = vdupq_n_u32(sign_byte as u32);
+    let one = vdupq_n_f32(1.0);
+    let neg = vdupq_n_f32(-1.0);
+    // `(sbv & bit) == bit` → bit set → pick -1.0, else +1.0.
+    let lo = vceqq_u32(vandq_u32(sbv, lo_mask), lo_mask);
+    let hi = vceqq_u32(vandq_u32(sbv, hi_mask), hi_mask);
+    [vbslq_f32(lo, neg, one), vbslq_f32(hi, neg, one)]
+}
+
+/// AArch64 NEON IQ2_XXS matvec. Scalar grid gather (8-byte `u8` points per
+/// index) + `KSIGNS_IQ2XS` sign expansion, then an 8-lane FMA per run.
+/// Mirrors [`matvec_iq2_xxs_w_f32_a_scalar`].
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_iq2_xxs_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use rustllama_gguf::dequant::{IQ2XXS_GRID, KSIGNS_IQ2XS};
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 66;
+    const QK_K: usize = 256;
+    let blocks_per_row = k / QK_K;
+    let grid_bytes: &[u8] = bytemuck::cast_slice(&IQ2XXS_GRID);
+    for i in 0..m {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let d = f16::from_le_bytes([w_bytes[off], w_bytes[off + 1]]).to_f32();
+            let qs = &w_bytes[off + 2..off + 2 + 64];
+            let xptr = x.as_ptr().add(b * QK_K);
+            for ib32 in 0..8 {
+                let aux0 = u32::from_le_bytes([
+                    qs[8 * ib32],
+                    qs[8 * ib32 + 1],
+                    qs[8 * ib32 + 2],
+                    qs[8 * ib32 + 3],
+                ]);
+                let aux1 = u32::from_le_bytes([
+                    qs[8 * ib32 + 4],
+                    qs[8 * ib32 + 5],
+                    qs[8 * ib32 + 6],
+                    qs[8 * ib32 + 7],
+                ]);
+                let db = d * (0.5 + (aux1 >> 28) as f32) * 0.25;
+                let aux8 = aux0.to_le_bytes();
+                for l in 0..4 {
+                    let grid_idx = aux8[l] as usize;
+                    let gf = u8x8_to_f32x4x2(vld1_u8(grid_bytes.as_ptr().add(grid_idx * 8)));
+                    let sf = iq_signs8_to_f32x4x2(
+                        KSIGNS_IQ2XS[((aux1 >> (7 * l)) & 127) as usize] as u8,
+                    );
+                    let x_off = ib32 * 32 + l * 8;
+                    let coef_lo = vmulq_n_f32(vmulq_f32(gf[0], sf[0]), db);
+                    let coef_hi = vmulq_n_f32(vmulq_f32(gf[1], sf[1]), db);
+                    acc0 = vfmaq_f32(acc0, coef_lo, vld1q_f32(xptr.add(x_off)));
+                    acc1 = vfmaq_f32(acc1, coef_hi, vld1q_f32(xptr.add(x_off + 4)));
+                }
+            }
+        }
+        out[i] = vaddvq_f32(vaddq_f32(acc0, acc1));
+    }
+}
+
+/// AArch64 NEON IQ2_XS matvec. Grid index = low 9 bits of each `qs` u16,
+/// sign index = high 7 bits → `KSIGNS_IQ2XS`; per-sub-block low/high nibble
+/// scales. Mirrors [`matvec_iq2_xs_w_f32_a_scalar`].
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_iq2_xs_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use rustllama_gguf::dequant::{IQ2XS_GRID, KSIGNS_IQ2XS};
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 74;
+    const QK_K: usize = 256;
+    let blocks_per_row = k / QK_K;
+    let grid_bytes: &[u8] = bytemuck::cast_slice(&IQ2XS_GRID);
+    for i in 0..m {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let d = f16::from_le_bytes([w_bytes[off], w_bytes[off + 1]]).to_f32();
+            let qs = &w_bytes[off + 2..off + 2 + 64];
+            let scales = &w_bytes[off + 2 + 64..off + 2 + 64 + 8];
+            let xptr = x.as_ptr().add(b * QK_K);
+            for ib32 in 0..8 {
+                let scale_byte = scales[ib32];
+                let db_lo = d * (0.5 + (scale_byte & 0x0F) as f32) * 0.25;
+                let db_hi = d * (0.5 + (scale_byte >> 4) as f32) * 0.25;
+                for l in 0..4 {
+                    let q = u16::from_le_bytes([qs[8 * ib32 + 2 * l], qs[8 * ib32 + 2 * l + 1]]);
+                    let grid_idx = (q & 511) as usize;
+                    let sign_idx = (q >> 9) as usize;
+                    let gf = u8x8_to_f32x4x2(vld1_u8(grid_bytes.as_ptr().add(grid_idx * 8)));
+                    let sf = iq_signs8_to_f32x4x2(KSIGNS_IQ2XS[sign_idx] as u8);
+                    let db = if l < 2 { db_lo } else { db_hi };
+                    let x_off = ib32 * 32 + l * 8;
+                    let coef_lo = vmulq_n_f32(vmulq_f32(gf[0], sf[0]), db);
+                    let coef_hi = vmulq_n_f32(vmulq_f32(gf[1], sf[1]), db);
+                    acc0 = vfmaq_f32(acc0, coef_lo, vld1q_f32(xptr.add(x_off)));
+                    acc1 = vfmaq_f32(acc1, coef_hi, vld1q_f32(xptr.add(x_off + 4)));
+                }
+            }
+        }
+        out[i] = vaddvq_f32(vaddq_f32(acc0, acc1));
+    }
+}
+
+/// AArch64 NEON IQ2_S matvec. 10-bit grid index (`qs_lo` byte + 2 high bits
+/// from `qh`), explicit per-run sign byte (no `KSIGNS` indirection). Mirrors
+/// [`matvec_iq2_s_w_f32_a_scalar`].
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_iq2_s_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use rustllama_gguf::dequant::IQ2S_GRID;
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 82;
+    const QK_K: usize = 256;
+    let blocks_per_row = k / QK_K;
+    let grid_bytes: &[u8] = bytemuck::cast_slice(&IQ2S_GRID);
+    for i in 0..m {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let d = f16::from_le_bytes([w_bytes[off], w_bytes[off + 1]]).to_f32();
+            let qs_lo = &w_bytes[off + 2..off + 2 + 32];
+            let signs = &w_bytes[off + 2 + 32..off + 2 + 64];
+            let qh = &w_bytes[off + 2 + 64..off + 2 + 64 + 8];
+            let scales = &w_bytes[off + 2 + 64 + 8..off + 2 + 64 + 8 + 8];
+            let xptr = x.as_ptr().add(b * QK_K);
+            for ib32 in 0..8 {
+                let scale_byte = scales[ib32];
+                let db_lo = d * (0.5 + (scale_byte & 0x0F) as f32) * 0.25;
+                let db_hi = d * (0.5 + (scale_byte >> 4) as f32) * 0.25;
+                let qs_off = ib32 * 4;
+                let qh_byte = qh[ib32];
+                for l in 0..4 {
+                    let high_bits = ((qh_byte as usize) << (8 - 2 * l)) & 0x300;
+                    let grid_idx = (qs_lo[qs_off + l] as usize) | high_bits;
+                    let gf = u8x8_to_f32x4x2(vld1_u8(grid_bytes.as_ptr().add(grid_idx * 8)));
+                    let sf = iq_signs8_to_f32x4x2(signs[qs_off + l]);
+                    let db = if l < 2 { db_lo } else { db_hi };
+                    let x_off = ib32 * 32 + l * 8;
+                    let coef_lo = vmulq_n_f32(vmulq_f32(gf[0], sf[0]), db);
+                    let coef_hi = vmulq_n_f32(vmulq_f32(gf[1], sf[1]), db);
+                    acc0 = vfmaq_f32(acc0, coef_lo, vld1q_f32(xptr.add(x_off)));
+                    acc1 = vfmaq_f32(acc1, coef_hi, vld1q_f32(xptr.add(x_off + 4)));
+                }
+            }
+        }
+        out[i] = vaddvq_f32(vaddq_f32(acc0, acc1));
+    }
+}
+
+/// AArch64 NEON IQ3_XXS matvec. 4-byte `u8` grid points, two indices per
+/// run combined into one 8-lane vector (grid1 → lanes 0..4, grid2 →
+/// 4..8); `KSIGNS_IQ2XS` sign expansion. Mirrors
+/// [`matvec_iq3_xxs_w_f32_a_scalar`].
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_iq3_xxs_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use rustllama_gguf::dequant::{IQ3XXS_GRID, KSIGNS_IQ2XS};
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 98;
+    const QK_K: usize = 256;
+    let blocks_per_row = k / QK_K;
+    let grid_bytes: &[u8] = bytemuck::cast_slice(&IQ3XXS_GRID);
+    for i in 0..m {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let d = f16::from_le_bytes([w_bytes[off], w_bytes[off + 1]]).to_f32();
+            let qs_grid = &w_bytes[off + 2..off + 2 + 64];
+            let qs_sas = &w_bytes[off + 2 + 64..off + 2 + 96];
+            let xptr = x.as_ptr().add(b * QK_K);
+            for ib32 in 0..8 {
+                let aux32 = u32::from_le_bytes([
+                    qs_sas[4 * ib32],
+                    qs_sas[4 * ib32 + 1],
+                    qs_sas[4 * ib32 + 2],
+                    qs_sas[4 * ib32 + 3],
+                ]);
+                let db = d * (0.5 + (aux32 >> 28) as f32) * 0.5;
+                let qs_off = 8 * ib32;
+                for l in 0..4 {
+                    let grid1_idx = qs_grid[qs_off + 2 * l] as usize;
+                    let grid2_idx = qs_grid[qs_off + 2 * l + 1] as usize;
+                    let mut buf = [0u8; 8];
+                    buf[0..4].copy_from_slice(&grid_bytes[grid1_idx * 4..grid1_idx * 4 + 4]);
+                    buf[4..8].copy_from_slice(&grid_bytes[grid2_idx * 4..grid2_idx * 4 + 4]);
+                    let gf = u8x8_to_f32x4x2(vld1_u8(buf.as_ptr()));
+                    let sf = iq_signs8_to_f32x4x2(
+                        KSIGNS_IQ2XS[((aux32 >> (7 * l)) & 127) as usize] as u8,
+                    );
+                    let x_off = ib32 * 32 + l * 8;
+                    let coef_lo = vmulq_n_f32(vmulq_f32(gf[0], sf[0]), db);
+                    let coef_hi = vmulq_n_f32(vmulq_f32(gf[1], sf[1]), db);
+                    acc0 = vfmaq_f32(acc0, coef_lo, vld1q_f32(xptr.add(x_off)));
+                    acc1 = vfmaq_f32(acc1, coef_hi, vld1q_f32(xptr.add(x_off + 4)));
+                }
+            }
+        }
+        out[i] = vaddvq_f32(vaddq_f32(acc0, acc1));
+    }
+}
+
+/// AArch64 NEON IQ3_S matvec. 9-bit grid index (`qs` byte + 1 high bit from
+/// `qh`), explicit per-run sign byte; `pair`/`sub` scale structure as the
+/// scalar path. grid1 → lanes 0..4, grid2 → 4..8. Mirrors
+/// [`matvec_iq3_s_w_f32_a_scalar`].
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_iq3_s_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use rustllama_gguf::dequant::IQ3S_GRID;
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 110;
+    const QK_K: usize = 256;
+    let blocks_per_row = k / QK_K;
+    let grid_bytes: &[u8] = bytemuck::cast_slice(&IQ3S_GRID);
+    for i in 0..m {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let d = f16::from_le_bytes([w_bytes[off], w_bytes[off + 1]]).to_f32();
+            let qs = &w_bytes[off + 2..off + 2 + 64];
+            let qh = &w_bytes[off + 2 + 64..off + 2 + 64 + 8];
+            let signs = &w_bytes[off + 2 + 64 + 8..off + 2 + 64 + 8 + 32];
+            let scales = &w_bytes[off + 2 + 64 + 8 + 32..off + 2 + 64 + 8 + 32 + 4];
+            let xptr = x.as_ptr().add(b * QK_K);
+            let mut qs_cur = 0usize;
+            let mut signs_cur = 0usize;
+            for pair in 0..4 {
+                let ib32 = pair * 2;
+                let scale_byte = scales[pair];
+                let db1 = d * (1.0 + 2.0 * ((scale_byte & 0x0F) as f32));
+                let db2 = d * (1.0 + 2.0 * ((scale_byte >> 4) as f32));
+                let x_off1 = ib32 * 32;
+                let x_off2 = (ib32 + 1) * 32;
+                let qh_byte1 = qh[ib32];
+                let qh_byte2 = qh[ib32 + 1];
+                for l in 0..4 {
+                    let g1_idx = qs[qs_cur + 2 * l] as usize
+                        | (((qh_byte1 as usize) << (8 - 2 * l)) & 0x100);
+                    let g2_idx = qs[qs_cur + 2 * l + 1] as usize
+                        | (((qh_byte1 as usize) << (7 - 2 * l)) & 0x100);
+                    let mut buf = [0u8; 8];
+                    buf[0..4].copy_from_slice(&grid_bytes[g1_idx * 4..g1_idx * 4 + 4]);
+                    buf[4..8].copy_from_slice(&grid_bytes[g2_idx * 4..g2_idx * 4 + 4]);
+                    let gf = u8x8_to_f32x4x2(vld1_u8(buf.as_ptr()));
+                    let sf = iq_signs8_to_f32x4x2(signs[signs_cur + l]);
+                    let xo = x_off1 + l * 8;
+                    let coef_lo = vmulq_n_f32(vmulq_f32(gf[0], sf[0]), db1);
+                    let coef_hi = vmulq_n_f32(vmulq_f32(gf[1], sf[1]), db1);
+                    acc0 = vfmaq_f32(acc0, coef_lo, vld1q_f32(xptr.add(xo)));
+                    acc1 = vfmaq_f32(acc1, coef_hi, vld1q_f32(xptr.add(xo + 4)));
+                }
+                qs_cur += 8;
+                signs_cur += 4;
+                for l in 0..4 {
+                    let g1_idx = qs[qs_cur + 2 * l] as usize
+                        | (((qh_byte2 as usize) << (8 - 2 * l)) & 0x100);
+                    let g2_idx = qs[qs_cur + 2 * l + 1] as usize
+                        | (((qh_byte2 as usize) << (7 - 2 * l)) & 0x100);
+                    let mut buf = [0u8; 8];
+                    buf[0..4].copy_from_slice(&grid_bytes[g1_idx * 4..g1_idx * 4 + 4]);
+                    buf[4..8].copy_from_slice(&grid_bytes[g2_idx * 4..g2_idx * 4 + 4]);
+                    let gf = u8x8_to_f32x4x2(vld1_u8(buf.as_ptr()));
+                    let sf = iq_signs8_to_f32x4x2(signs[signs_cur + l]);
+                    let xo = x_off2 + l * 8;
+                    let coef_lo = vmulq_n_f32(vmulq_f32(gf[0], sf[0]), db2);
+                    let coef_hi = vmulq_n_f32(vmulq_f32(gf[1], sf[1]), db2);
+                    acc0 = vfmaq_f32(acc0, coef_lo, vld1q_f32(xptr.add(xo)));
+                    acc1 = vfmaq_f32(acc1, coef_hi, vld1q_f32(xptr.add(xo + 4)));
+                }
+                qs_cur += 8;
+                signs_cur += 4;
+            }
+        }
+        out[i] = vaddvq_f32(vaddq_f32(acc0, acc1));
+    }
+}
+
+/// AArch64 NEON IQ1_S matvec. The IQ1 grid stores signed `i8` points; each
+/// 8-point run is `dl·(grid + delta)·x`, with the per-sub-block `delta`
+/// broadcast and added before the FMA. Mirrors
+/// [`matvec_iq1_s_w_f32_a_scalar`].
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_iq1_s_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use rustllama_gguf::dequant::IQ1S_DELTA;
+    use rustllama_gguf::iq1_grid::IQ1S_GRID;
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 50;
+    const QK_K: usize = 256;
+    let blocks_per_row = k / QK_K;
+    for i in 0..m {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let d = f16::from_le_bytes([w_bytes[off], w_bytes[off + 1]]).to_f32();
+            let qs = &w_bytes[off + 2..off + 2 + 32];
+            let qh_bytes = &w_bytes[off + 34..off + 34 + 16];
+            let xptr = x.as_ptr().add(b * QK_K);
+            let mut x_off = 0usize;
+            for ib32 in 0..8 {
+                let qh = u16::from_le_bytes([qh_bytes[ib32 * 2], qh_bytes[ib32 * 2 + 1]]);
+                let dl = d * (2.0 * ((qh >> 12) & 7) as f32 + 1.0);
+                let delta = if qh & 0x8000 != 0 {
+                    -1.0 - IQ1S_DELTA
+                } else {
+                    -1.0 + IQ1S_DELTA
+                };
+                let delta_v = vdupq_n_f32(delta);
+                for l in 0..4 {
+                    let idx = qs[4 * ib32 + l] as usize | ((((qh >> (3 * l)) & 7) as usize) << 8);
+                    let grid = IQ1S_GRID[idx].to_le_bytes();
+                    let gf = s8x8_to_f32x4x2(vld1_s8(grid.as_ptr() as *const i8));
+                    let coef_lo = vmulq_n_f32(vaddq_f32(gf[0], delta_v), dl);
+                    let coef_hi = vmulq_n_f32(vaddq_f32(gf[1], delta_v), dl);
+                    acc0 = vfmaq_f32(acc0, coef_lo, vld1q_f32(xptr.add(x_off + 8 * l)));
+                    acc1 = vfmaq_f32(acc1, coef_hi, vld1q_f32(xptr.add(x_off + 8 * l + 4)));
+                }
+                x_off += 32;
+            }
+        }
+        out[i] = vaddvq_f32(vaddq_f32(acc0, acc1));
+    }
+}
+
+/// AArch64 NEON IQ1_M matvec. Like IQ1_S but the super-block scale `d` is
+/// reassembled from the four packed scale words and each 8-point lane
+/// carries its own `(dl, delta)`. Mirrors [`matvec_iq1_m_w_f32_a_scalar`].
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_iq1_m_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use rustllama_gguf::dequant::IQ1S_DELTA;
+    use rustllama_gguf::iq1_grid::IQ1S_GRID;
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 56;
+    const QK_K: usize = 256;
+    let blocks_per_row = k / QK_K;
+    for i in 0..m {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let qs = &w_bytes[off..off + 32];
+            let qh = &w_bytes[off + 32..off + 32 + 16];
+            let scales_bytes = &w_bytes[off + 48..off + 48 + 8];
+            let mut sc = [0u16; 4];
+            for ii in 0..4 {
+                sc[ii] = u16::from_le_bytes([scales_bytes[ii * 2], scales_bytes[ii * 2 + 1]]);
+            }
+            let d_bits: u16 = (sc[0] >> 12)
+                | ((sc[1] >> 8) & 0x00F0)
+                | ((sc[2] >> 4) & 0x0F00)
+                | (sc[3] & 0xF000);
+            let d = f16::from_bits(d_bits).to_f32();
+            let xptr = x.as_ptr().add(b * QK_K);
+            let mut x_off = 0usize;
+            for ib in 0..8 {
+                let s_word = sc[ib / 2];
+                let shift0 = 6 * (ib % 2);
+                let shift1 = 6 * (ib % 2) + 3;
+                let dl1 = d * (2.0 * ((s_word >> shift0) & 0x7) as f32 + 1.0);
+                let dl2 = d * (2.0 * ((s_word >> shift1) & 0x7) as f32 + 1.0);
+                let qh0 = qh[ib * 2];
+                let qh1 = qh[ib * 2 + 1];
+                let delta = |bit_set: bool| {
+                    if bit_set {
+                        -1.0 - IQ1S_DELTA
+                    } else {
+                        -1.0 + IQ1S_DELTA
+                    }
+                };
+                let qs_chunk = &qs[ib * 4..ib * 4 + 4];
+                let lanes = [
+                    (dl1, delta(qh0 & 0x08 != 0), qs_chunk[0] as usize | (((qh0 & 0x07) as usize) << 8)),
+                    (dl1, delta(qh0 & 0x80 != 0), qs_chunk[1] as usize | ((((qh0 >> 4) & 0x07) as usize) << 8)),
+                    (dl2, delta(qh1 & 0x08 != 0), qs_chunk[2] as usize | (((qh1 & 0x07) as usize) << 8)),
+                    (dl2, delta(qh1 & 0x80 != 0), qs_chunk[3] as usize | ((((qh1 >> 4) & 0x07) as usize) << 8)),
+                ];
+                for (l, (dl, delta_val, idx)) in lanes.iter().copied().enumerate() {
+                    let grid = IQ1S_GRID[idx].to_le_bytes();
+                    let gf = s8x8_to_f32x4x2(vld1_s8(grid.as_ptr() as *const i8));
+                    let delta_v = vdupq_n_f32(delta_val);
+                    let coef_lo = vmulq_n_f32(vaddq_f32(gf[0], delta_v), dl);
+                    let coef_hi = vmulq_n_f32(vaddq_f32(gf[1], delta_v), dl);
+                    acc0 = vfmaq_f32(acc0, coef_lo, vld1q_f32(xptr.add(x_off + 8 * l)));
+                    acc1 = vfmaq_f32(acc1, coef_hi, vld1q_f32(xptr.add(x_off + 8 * l + 4)));
+                }
+                x_off += 32;
+            }
+        }
+        out[i] = vaddvq_f32(vaddq_f32(acc0, acc1));
+    }
+}
+
 /// IQ3_S weight matvec with on-the-fly dequant. Dispatches to AVX-512
 /// (gather-based, 16 weights/iter) → scalar.
 ///
@@ -2169,6 +2676,13 @@ pub fn matvec_iq3_s_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_iq3_s_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_iq3_s_w_f32_a_scalar(w_bytes, x, out, m, k);
 }
 
@@ -2532,6 +3046,13 @@ pub fn matvec_iq2_xxs_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_iq2_xxs_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_iq2_xxs_w_f32_a_scalar(w_bytes, x, out, m, k);
 }
 
@@ -2628,6 +3149,13 @@ pub fn matvec_iq3_xxs_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_iq3_xxs_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_iq3_xxs_w_f32_a_scalar(w_bytes, x, out, m, k);
 }
 
@@ -3119,6 +3647,13 @@ pub fn matvec_iq2_xs_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_iq2_xs_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_iq2_xs_w_f32_a_scalar(w_bytes, x, out, m, k);
 }
 
@@ -3415,6 +3950,13 @@ pub fn matvec_iq1_s_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_iq1_s_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_iq1_s_w_f32_a_scalar(w_bytes, x, out, m, k);
 }
 
@@ -3678,6 +4220,13 @@ pub fn matvec_iq1_m_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_iq1_m_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_iq1_m_w_f32_a_scalar(w_bytes, x, out, m, k);
 }
 
@@ -4049,6 +4598,13 @@ pub fn matvec_iq2_s_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_iq2_s_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_iq2_s_w_f32_a_scalar(w_bytes, x, out, m, k);
 }
 
@@ -19676,6 +20232,163 @@ mod tests {
                 },
                 |w, x, o, m, k| matvec_iq4_xs_w_f32_a_scalar(w, x, o, m, k),
                 |w, x, o, m, k| unsafe { matvec_iq4_xs_w_f32_a_neon(w, x, o, m, k) },
+                256,
+            );
+        }
+
+        // ---- Grid-codebook IQ quants (scalar-gather + NEON arithmetic) ----
+        //
+        // The block layouts carry the super-block scale `d` as a leading f16
+        // (sane-small via `f16_le`) with the rest of the block fully random;
+        // every grid index / sign index the random bytes can produce is in
+        // range (the grids span the full index space), so the NEON and scalar
+        // paths decode identical runs.
+
+        #[test]
+        fn iq2_xxs_neon_matches_scalar() {
+            run_block_quant::<66>(
+                "iq2_xxs",
+                4,
+                512,
+                0x2222_1a1a,
+                |l, blk| {
+                    blk[0..2].copy_from_slice(&l.f16_le(0.05, 0.001));
+                    for q in &mut blk[2..66] {
+                        *q = l.byte();
+                    }
+                },
+                |w, x, o, m, k| matvec_iq2_xxs_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_iq2_xxs_w_f32_a_neon(w, x, o, m, k) },
+                256,
+            );
+        }
+
+        #[test]
+        fn iq2_xs_neon_matches_scalar() {
+            run_block_quant::<74>(
+                "iq2_xs",
+                4,
+                512,
+                0x2358_1b1b,
+                |l, blk| {
+                    blk[0..2].copy_from_slice(&l.f16_le(0.05, 0.001));
+                    for q in &mut blk[2..74] {
+                        *q = l.byte();
+                    }
+                },
+                |w, x, o, m, k| matvec_iq2_xs_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_iq2_xs_w_f32_a_neon(w, x, o, m, k) },
+                256,
+            );
+        }
+
+        #[test]
+        fn iq2_s_neon_matches_scalar() {
+            run_block_quant::<82>(
+                "iq2_s",
+                4,
+                512,
+                0x2525_1c1c,
+                |l, blk| {
+                    blk[0..2].copy_from_slice(&l.f16_le(0.05, 0.001));
+                    for q in &mut blk[2..82] {
+                        *q = l.byte();
+                    }
+                },
+                |w, x, o, m, k| matvec_iq2_s_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_iq2_s_w_f32_a_neon(w, x, o, m, k) },
+                256,
+            );
+        }
+
+        #[test]
+        fn iq3_xxs_neon_matches_scalar() {
+            run_block_quant::<98>(
+                "iq3_xxs",
+                4,
+                512,
+                0x3358_1d1d,
+                |l, blk| {
+                    blk[0..2].copy_from_slice(&l.f16_le(0.05, 0.001));
+                    for q in &mut blk[2..98] {
+                        *q = l.byte();
+                    }
+                },
+                |w, x, o, m, k| matvec_iq3_xxs_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_iq3_xxs_w_f32_a_neon(w, x, o, m, k) },
+                256,
+            );
+        }
+
+        #[test]
+        fn iq3_s_neon_matches_scalar() {
+            run_block_quant::<110>(
+                "iq3_s",
+                4,
+                512,
+                0x3535_1e1e,
+                |l, blk| {
+                    blk[0..2].copy_from_slice(&l.f16_le(0.05, 0.001));
+                    for q in &mut blk[2..110] {
+                        *q = l.byte();
+                    }
+                },
+                |w, x, o, m, k| matvec_iq3_s_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_iq3_s_w_f32_a_neon(w, x, o, m, k) },
+                256,
+            );
+        }
+
+        #[test]
+        fn iq1_s_neon_matches_scalar() {
+            run_block_quant::<50>(
+                "iq1_s",
+                4,
+                512,
+                0x1515_1f1f,
+                |l, blk| {
+                    blk[0..2].copy_from_slice(&l.f16_le(0.05, 0.001));
+                    for q in &mut blk[2..50] {
+                        *q = l.byte();
+                    }
+                },
+                |w, x, o, m, k| matvec_iq1_s_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_iq1_s_w_f32_a_neon(w, x, o, m, k) },
+                256,
+            );
+        }
+
+        #[test]
+        fn iq1_m_neon_matches_scalar() {
+            // IQ1_M (56 bytes): qs[32] + qh[16] + 4 packed scale words. The
+            // super-block scale `d` is reassembled from the high nibbles of
+            // the four scale words, so plant a known small f16 across those
+            // nibbles and leave the rest (dl fields + qs + qh) random.
+            run_block_quant::<56>(
+                "iq1_m",
+                4,
+                512,
+                0x1949_3030,
+                |l, blk| {
+                    for q in &mut blk[0..48] {
+                        *q = l.byte();
+                    }
+                    let target = f16::from_f32(0.05).to_bits();
+                    let r0 = (l.next_u32() as u16) & 0x0FFF;
+                    let r1 = (l.next_u32() as u16) & 0xF0FF;
+                    let r2 = (l.next_u32() as u16) & 0x0FFF;
+                    let r3 = (l.next_u32() as u16) & 0x0FFF;
+                    let sc0 = r0 | ((target & 0x000F) << 12);
+                    let sc1 = r1 | (((target >> 4) & 0x000F) << 8);
+                    let sc2 = r2 | (((target >> 8) & 0x000F) << 12);
+                    let sc3 = r3 | (target & 0xF000);
+                    blk[48..50].copy_from_slice(&sc0.to_le_bytes());
+                    blk[50..52].copy_from_slice(&sc1.to_le_bytes());
+                    blk[52..54].copy_from_slice(&sc2.to_le_bytes());
+                    blk[54..56].copy_from_slice(&sc3.to_le_bytes());
+                },
+                |w, x, o, m, k| matvec_iq1_m_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_iq1_m_w_f32_a_neon(w, x, o, m, k) },
                 256,
             );
         }
