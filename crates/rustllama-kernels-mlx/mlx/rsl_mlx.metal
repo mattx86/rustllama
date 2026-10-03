@@ -1,6 +1,6 @@
 // Metal Shading Language kernels for rustllama's Apple GPU backend.
 //
-// ============================ STATUS: PHASE 1a =========================
+// ==================== STATUS: PHASE 4 (compute surface) ================
 // COMPILED. On the real macOS/Apple-Silicon path build.rs compiles this file
 // to a `.metallib` and bin2c-EMBEDS it into librsl_mlx.dylib:
 //
@@ -8,10 +8,31 @@
 //   xcrun -sdk macosx metallib    $OUT/rsl_mlx.air -o $OUT/rsl_mlx.metallib
 //   (bytes → $OUT/rsl_mlx_metallib.h, loaded via [dev newLibraryWithData:])
 //
-// The host shim (rsl_mlx.mm) looks up `rsl_mlx_matvec_f32_kernel` below by
-// name to build a `MTLComputePipelineState`. Phase 1a ships ONLY that f32
-// matvec kernel live; the kernel families sketched at the bottom are the
-// Phase-1b/1c TODO (their host entry points still return -1).
+// The host shim (rsl_mlx.mm) looks each kernel below up BY NAME to build a
+// `MTLComputePipelineState` (cached per device). Phase 4 adds the core
+// forward-pass compute surface on top of the Phase-1a f32 matvec:
+//   * forward-pass primitives — rmsnorm, add_rmsnorm (fused residual add),
+//     rope (NEOX split-half), silu_mul (SwiGLU), embedding_lookup
+//   * FlashAttention F32 — GQA online-softmax decode + causal prefill
+//   * argmax sampling
+//   * packed-quant matvec — Q8_0 (34B/32) + Q4_0 (18B/32), the simple
+//     32-element-block GGUF quants that establish the on-the-fly-dequant
+//     pattern the remaining quants specialize.
+// Each is a direct port of the SYCL/CPU reference (op order + byte layout).
+//
+// !!! WRITE-BLIND — AUTHORED ON A NON-APPLE HOST, NOT YET COMPILED OR RUN !!!
+// Metal has no compiler on Windows/Linux (no `xcrun metal`), so these shaders
+// have NEVER been through `xcrun metal`/`metallib` or a GPU. They are authored
+// from the byte-exact SYCL/CPU references; FIRST Mac build is expected to need
+// MSL-syntax fixes, and every kernel must still pass the Metal parity harness
+// before it is trusted. This mirrors the write-blind CUDA/SYCL-XMX discipline.
+//
+// REMAINING (Mac-pending, still inert -1 in rsl_mlx.mm): the other packed
+// quants (Q4_K/Q6_K/K-quants/IQ grids/MXFP/NVFP/PTQ1_0/PQ2_0 + their batched
+// forms), the Prism Hadamard, and the quantized-KV flash variants. They are
+// mechanical specializations of the patterns below (block dequant in the
+// matvec inner loop; on-the-fly K/V dequant in the flash inner loop) and are
+// best filled in with Mac compile + parity feedback.
 //
 // PARITY DISCIPLINE: every kernel here must be a BYTE-EXACT port of its CPU
 // reference in `rustllama-kernels-cpu` (and match the SYCL/CUDA kernels),
@@ -57,34 +78,338 @@ kernel void rsl_mlx_matvec_f32_kernel(
 }
 
 // ======================================================================
-// PHASE 1 TODO — kernel families to add (mirroring rsl_mlx.mm's entries):
+// Forward-pass primitives (device-resident, f32). The cooperative kernels
+// run ONE 32-lane threadgroup (== one Apple SIMD-group) per row/head and
+// reduce with `simd_sum`; the elementwise ones run a flat grid with a
+// bounds check. Host dispatch (rsl_mlx.mm) pins threadgroup size to 32 for
+// the simd_sum kernels so the whole group is one SIMD-group.
 // ======================================================================
-//
-// Packed-quant matvecs (single + batched), one specialization per quant.
-// Each reads W's raw GGUF super-block layout and dequantizes on the fly:
-//   PTQ1_0 (28B/128), Q8_0 (34B/32), Q4_K/Q6_K/Q5_K/Q2_K/Q8_K/Q3_K (…/256),
-//   Q4_0/Q5_0/Q4_1/Q5_1 (…/32), IQ4_NL (18B/32), IQ4_XS/IQ2_XXS/IQ2_XS/
-//   IQ2_S/IQ3_XXS/IQ3_S/IQ1_S/IQ1_M (…/256, grid-table lookups), NVFP4
-//   (9B/16), MXFP4/6/8 (17/25/33 B/32, trailing E8M0 scale), PQ2_0 (34B/128).
-//   e.g.  kernel void rsl_mlx_matvec_q4_k_packed_f32_kernel(
-//             device const uchar *w [[buffer(0)]],  // packed super-blocks
-//             device const float *x [[buffer(1)]],
-//             device       float *out [[buffer(2)]],
-//             constant int &K [[buffer(3)]], ...);
-//
-// Blockwise Prism Hadamard (rsl_mlx_hadamard_forward): WHT over power-of-two
-// spans, sign-flip from `signs`, /sqrt(block).
-//
-// Forward-pass primitives: add_rmsnorm (fused residual add + RMSNorm),
-// rope (paired rotation by pos*inv_freq), silu_mul (SwiGLU),
-// embedding_lookup (gather rows, negative id -> zero).
-//
-// FlashAttention (GQA, online softmax):
-//   * decode: one query per head over kv_len keys.
-//   * prefill: causal, n_new queries, query q_pos attends [0, base+q_pos].
-//   * quantized-KV variants (q4_0 / nvfp4 / mxfp4/6/8 / turboquant / q8_0):
-//     dequantize each K/V row inside the flash inner loop (no full
-//     materialization), matching the CPU reference's factored-scale math.
-//
-// Sampling: argmax over vocab logits (simd/threadgroup arg-reduction,
-// lowest index on ties).
+
+// y[row,i] = x[row,i] * rsqrt(mean_i(x[row,i]^2) + eps) * w[i].
+// One 32-lane group per row; lanes stride the d dimension + simd_sum.
+kernel void rsl_mlx_rmsnorm_f32_kernel(
+    device const float *x    [[buffer(0)]],
+    device const float *w    [[buffer(1)]],
+    device       float *y    [[buffer(2)]],
+    constant int   &d        [[buffer(3)]],
+    constant float &eps      [[buffer(4)]],
+    uint row                 [[threadgroup_position_in_grid]],
+    uint lane                [[thread_position_in_threadgroup]],
+    uint lane_count          [[threads_per_threadgroup]])
+{
+    const int base = (int)row * d;
+    float ss = 0.0f;
+    for (int i = (int)lane; i < d; i += (int)lane_count) {
+        const float xv = x[base + i];
+        ss += xv * xv;
+    }
+    ss = simd_sum(ss);
+    const float scale = rsqrt(ss / (float)d + eps);
+    for (int i = (int)lane; i < d; i += (int)lane_count) {
+        y[base + i] = x[base + i] * scale * w[i];
+    }
+}
+
+// hidden[row,i] += branch[row,i] (in place); then
+// y_norm[row,i] = hidden[row,i] * rsqrt(mean(hidden^2)+eps) * w[i].
+// Each lane reads back only the hidden entries it just wrote (strided), so
+// no cross-lane hazard. Ports rsl_add_rmsnorm_f32_usm.
+kernel void rsl_mlx_add_rmsnorm_f32_kernel(
+    device       float *hidden [[buffer(0)]],
+    device const float *branch [[buffer(1)]],
+    device const float *w      [[buffer(2)]],
+    device       float *y_norm [[buffer(3)]],
+    constant int   &d          [[buffer(4)]],
+    constant float &eps        [[buffer(5)]],
+    uint row                   [[threadgroup_position_in_grid]],
+    uint lane                  [[thread_position_in_threadgroup]],
+    uint lane_count            [[threads_per_threadgroup]])
+{
+    const int base = (int)row * d;
+    float ss = 0.0f;
+    for (int i = (int)lane; i < d; i += (int)lane_count) {
+        const float s_val = hidden[base + i] + branch[base + i];
+        hidden[base + i] = s_val;
+        ss += s_val * s_val;
+    }
+    ss = simd_sum(ss);
+    const float scale = rsqrt(ss / (float)d + eps);
+    for (int i = (int)lane; i < d; i += (int)lane_count) {
+        y_norm[base + i] = hidden[base + i] * scale * w[i];
+    }
+}
+
+// NEOX split-half RoPE: rotate the (j, j+head_dim/2) pair of each head by
+// angle = pos * inv_freq[j]. Flat grid over n_heads*(head_dim/2). Ports
+// rsl_rope_usm.
+kernel void rsl_mlx_rope_f32_kernel(
+    device       float *qk       [[buffer(0)]],
+    device const float *inv_freq [[buffer(1)]],
+    constant int &n_heads        [[buffer(2)]],
+    constant int &head_dim       [[buffer(3)]],
+    constant int &pos            [[buffer(4)]],
+    uint gid                     [[thread_position_in_grid]])
+{
+    const int half = head_dim / 2;
+    const int total = n_heads * half;
+    const int flat = (int)gid;
+    if (flat >= total) return;
+    const int head = flat / half;
+    const int j = flat % half;
+    const float angle = (float)pos * inv_freq[j];
+    const float c = cos(angle);
+    const float si = sin(angle);
+    const int b = head * head_dim;
+    const float x0 = qk[b + j];
+    const float x1 = qk[b + j + half];
+    qk[b + j]        = x0 * c - x1 * si;
+    qk[b + j + half] = x0 * si + x1 * c;
+}
+
+// out[i] = silu(x[i]) * y[i], silu(v) = v / (1 + exp(-v)). Ports rsl_silu_mul_usm.
+kernel void rsl_mlx_silu_mul_f32_kernel(
+    device const float *x   [[buffer(0)]],
+    device const float *y   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &n         [[buffer(3)]],
+    uint gid                [[thread_position_in_grid]])
+{
+    const int i = (int)gid;
+    if (i >= n) return;
+    const float xv = x[i];
+    const float silu = xv / (1.0f + exp(-xv));
+    out[i] = silu * y[i];
+}
+
+// out[i,:] = table[ids[i],:] (d elems); ids[i] < 0 -> zero row. Flat grid
+// over n_ids*d. `ids` is a device pointer. Ports rsl_embedding_lookup_usm.
+kernel void rsl_mlx_embedding_lookup_f32_kernel(
+    device const float *table [[buffer(0)]],
+    device const int   *ids   [[buffer(1)]],
+    device       float *out   [[buffer(2)]],
+    constant int &n_ids       [[buffer(3)]],
+    constant int &d           [[buffer(4)]],
+    uint gid                  [[thread_position_in_grid]])
+{
+    const uint total = (uint)n_ids * (uint)d;
+    if (gid >= total) return;
+    const uint i = gid / (uint)d;
+    const uint j = gid % (uint)d;
+    const int row = ids[i];
+    out[gid] = (row < 0) ? 0.0f : table[(uint)row * (uint)d + j];
+}
+
+// ======================================================================
+// FlashAttention F32 (GQA, online softmax). One 32-lane group per query:
+// lanes stride head_dim for the Q·K dot (simd_sum) and co-own the V
+// accumulator in threadgroup memory (disjoint strided slices → no hazard).
+// scale = 1/sqrt(head_dim), applied internally. head_dim capped at 256.
+// Ports rsl_flash_attn_decode_usm / rsl_flash_attn_prefill_usm.
+// ======================================================================
+
+kernel void rsl_mlx_flash_attn_decode_f32_kernel(
+    device const float *q    [[buffer(0)]],
+    device const float *k    [[buffer(1)]],
+    device const float *v    [[buffer(2)]],
+    device       float *out  [[buffer(3)]],
+    constant int &n_heads    [[buffer(4)]],
+    constant int &n_kv_heads [[buffer(5)]],
+    constant int &head_dim   [[buffer(6)]],
+    constant int &max_ctx    [[buffer(7)]],
+    constant int &kv_len     [[buffer(8)]],
+    uint head                [[threadgroup_position_in_grid]],
+    uint lane                [[thread_position_in_threadgroup]],
+    uint lane_count          [[threads_per_threadgroup]])
+{
+    threadgroup float tg_acc[256];
+    if ((int)head >= n_heads) return;
+    const int n_gqa = n_heads / n_kv_heads;
+    const int kv_h = (int)head / n_gqa;
+    const int q_base = (int)head * head_dim;
+    const float scale = 1.0f / sqrt((float)head_dim);
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count) tg_acc[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m = -INFINITY;
+    float l = 0.0f;
+    for (int t = 0; t < kv_len; ++t) {
+        const int kv_off = (kv_h * max_ctx + t) * head_dim;
+        float partial = 0.0f;
+        for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+            partial += q[q_base + i] * k[kv_off + i];
+        const float s_dot = simd_sum(partial) * scale;
+        const float m_new = fmax(m, s_dot);
+        const float rescale = isfinite(m) ? exp(m - m_new) : 0.0f;
+        const float p = exp(s_dot - m_new);
+        l = l * rescale + p;
+        for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+            tg_acc[i] = tg_acc[i] * rescale + p * v[kv_off + i];
+        m = m_new;
+    }
+    const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+        out[q_base + i] = tg_acc[i] * inv_l;
+}
+
+kernel void rsl_mlx_flash_attn_prefill_f32_kernel(
+    device const float *q    [[buffer(0)]],
+    device const float *k    [[buffer(1)]],
+    device const float *v    [[buffer(2)]],
+    device       float *out  [[buffer(3)]],
+    constant int &n_heads    [[buffer(4)]],
+    constant int &n_kv_heads [[buffer(5)]],
+    constant int &head_dim   [[buffer(6)]],
+    constant int &max_ctx    [[buffer(7)]],
+    constant int &kv_len_base [[buffer(8)]],
+    constant int &n_new      [[buffer(9)]],
+    uint2 tgpos              [[threadgroup_position_in_grid]],
+    uint lane                [[thread_position_in_threadgroup]],
+    uint lane_count          [[threads_per_threadgroup]])
+{
+    threadgroup float tg_acc[256];
+    const int hh = (int)tgpos.x;
+    const int q_pos = (int)tgpos.y;
+    if (hh >= n_heads || q_pos >= n_new) return;
+    const int n_gqa = n_heads / n_kv_heads;
+    const int kv_h = hh / n_gqa;
+    const int q_off = (q_pos * n_heads + hh) * head_dim;
+    // Causal: query at new position q_pos attends absolute [0, kv_len_base+q_pos].
+    const int kv_len_for_q = kv_len_base + q_pos + 1;
+    const float scale = 1.0f / sqrt((float)head_dim);
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count) tg_acc[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m = -INFINITY;
+    float l = 0.0f;
+    for (int t = 0; t < kv_len_for_q; ++t) {
+        const int kv_off = (kv_h * max_ctx + t) * head_dim;
+        float partial = 0.0f;
+        for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+            partial += q[q_off + i] * k[kv_off + i];
+        const float s_dot = simd_sum(partial) * scale;
+        const float m_new = fmax(m, s_dot);
+        const float rescale = isfinite(m) ? exp(m - m_new) : 0.0f;
+        const float p = exp(s_dot - m_new);
+        l = l * rescale + p;
+        for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+            tg_acc[i] = tg_acc[i] * rescale + p * v[kv_off + i];
+        m = m_new;
+    }
+    const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+        out[q_off + i] = tg_acc[i] * inv_l;
+}
+
+// Greedy argmax over `vocab` f32 logits, lowest index on ties. One
+// threadgroup: strided scan into private best, then a threadgroup tree
+// reduction. Host pins threadgroup size to 256 (a power of two).
+kernel void rsl_mlx_argmax_f32_kernel(
+    device const float *logits [[buffer(0)]],
+    device       int   *out_idx [[buffer(1)]],
+    constant int &vocab        [[buffer(2)]],
+    uint lane                  [[thread_position_in_threadgroup]],
+    uint lane_count            [[threads_per_threadgroup]])
+{
+    threadgroup float tv[256];
+    threadgroup int   ti[256];
+    float best_v = -INFINITY;
+    int   best_i = 0;
+    for (int i = (int)lane; i < vocab; i += (int)lane_count) {
+        const float val = logits[i];
+        if (val > best_v || (val == best_v && i < best_i)) { best_v = val; best_i = i; }
+    }
+    tv[lane] = best_v;
+    ti[lane] = best_i;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            const float ov = tv[lane + stride];
+            const int   oi = ti[lane + stride];
+            if (ov > tv[lane] || (ov == tv[lane] && oi < ti[lane])) {
+                tv[lane] = ov; ti[lane] = oi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) out_idx[0] = ti[0];
+}
+
+// ======================================================================
+// Packed-quant matvec (on-the-fly dequant). out[col,m] = sum_k dequant(
+// W[m,k]) * x[col,k]. Grid = (M rows, N cols) threadgroups of 32 lanes;
+// each lane strides the K/blockwidth blocks and simd_sum reduces. N=1 is
+// the single (non-batched) case. W row-major [M, bytes_per_row]; x [N, K];
+// out [N, M]. Ports rsl_matvec_{q8_0,q4_0}_packed_f32_usm byte-for-byte.
+// ======================================================================
+
+// Q8_0: 34 bytes / 32 weights = { f16 d (LE); int8 qs[32] }. w = d * qs.
+kernel void rsl_mlx_matvec_q8_0_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K         [[buffer(3)]],
+    constant int &M         [[buffer(4)]],
+    constant int &N         [[buffer(5)]],
+    uint2 tgpos             [[threadgroup_position_in_grid]],
+    uint lane               [[thread_position_in_threadgroup]],
+    uint lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x;
+    const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 32;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 34ul;
+    device const uchar *row = w + (ulong)m * bytes_per_row;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 34ul;
+        const half d = as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+        const float dscale = (float)d;
+        const int xoff = b * 32;
+        float bd = 0.0f;
+        for (int e = 0; e < 32; ++e)
+            bd += (float)((int)((char)blk[2 + e])) * xc[xoff + e];
+        acc += dscale * bd;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// Q4_0: 18 bytes / 32 weights = { f16 d (LE); u8 qs[16] }. Low nibble =
+// weight j, high nibble = weight j+16; value = d * (nibble - 8).
+kernel void rsl_mlx_matvec_q4_0_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K         [[buffer(3)]],
+    constant int &M         [[buffer(4)]],
+    constant int &N         [[buffer(5)]],
+    uint2 tgpos             [[threadgroup_position_in_grid]],
+    uint lane               [[thread_position_in_threadgroup]],
+    uint lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x;
+    const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 32;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 18ul;
+    device const uchar *row = w + (ulong)m * bytes_per_row;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 18ul;
+        const half d = as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+        const float dscale = (float)d;
+        device const uchar *qs = blk + 2;
+        const int xoff = b * 32;
+        float bd = 0.0f;
+        for (int j = 0; j < 16; ++j) {
+            const int x0 = (int)(qs[j] & 0x0F) - 8;
+            const int x1 = (int)(qs[j] >> 4) - 8;
+            bd += (float)x0 * xc[xoff + j];
+            bd += (float)x1 * xc[xoff + j + 16];
+        }
+        acc += dscale * bd;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}

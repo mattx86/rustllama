@@ -5,9 +5,9 @@
 // of the CUDA crate's `cuda/rsl_cuda.cu` and the SYCL crate's
 // `cpp/rsl_kernels.cpp`.
 //
-// ============================ STATUS: PHASE 1a ==========================
-// The MINIMAL real f32 Metal path is LIVE (macOS/Apple-Silicon, guarded by
-// RSL_MLX_HAVE_METAL=1, which build.rs now defines on the real path). Real:
+// ===================== STATUS: PHASE 4 (compute surface) ================
+// The real Metal path (macOS/Apple-Silicon, guarded by RSL_MLX_HAVE_METAL=1)
+// now covers the core forward-pass compute surface. Live:
 //   * rsl_mlx_device_count / _device_info — MTLCopyAllDevices enumeration,
 //     name / recommendedMaxWorkingSetSize / registryID (uuid left zeroed;
 //     the tuner keys on registryID on Apple).
@@ -17,21 +17,31 @@
 //     pointer" handed to Rust; a global registry maps [base,base+len) spans
 //     back to their MTLBuffer (see mlx_registry_*/mlx_resolve above).
 //     memcpy_h2d/d2h are plain memcpys (unified memory; offsets auto-honored).
-//   * rsl_mlx_matvec_f32 — a real Metal compute dispatch of the
-//     rsl_mlx_matvec_f32_kernel in rsl_mlx.metal (the metallib is compiled +
-//     EMBEDDED by build.rs, loaded via newLibraryWithData:).
-// On a non-Apple host none of this compiles — the crate links the generated
-// no-op stub (build.rs build_mlx_stub) and device_count()==0 → CPU/SYCL/CUDA.
+//   * A shared MTLLibrary + pipeline-by-name cache (mlx_library / mlx_pipeline)
+//     and the mlx_run device-resident dispatch helper.
+//   * rsl_mlx_matvec_f32 + rsl_mlx_rmsnorm_f32 — host-pointer reference paths.
+//   * Forward-pass primitives: add_rmsnorm, rope, silu_mul, embedding_lookup.
+//   * FlashAttention F32: GQA online-softmax decode + causal prefill.
+//   * argmax sampling; packed-quant matvec Q8_0 + Q4_0 (single + batched).
+// Each kernel body lives in rsl_mlx.metal (compiled + EMBEDDED by build.rs,
+// loaded via newLibraryWithData:).
 //
-// ====================== PHASE 1b/1c TODO (DEFERRED) =====================
-// Still inert (return -1 / no-op): rmsnorm_f32, the packed/quant matvecs,
-// PTQ1_0/Hadamard, the forward-pass primitives (add_rmsnorm/rope/silu_mul/
-// embedding_lookup), GQA flash decode/prefill (F32 + quantized-KV), and
-// argmax — each a Metal compute kernel (or an mlx-c op) that is a BYTE-EXACT
-// port of the CPU reference, validated by the Metal parity harness, the same
-// discipline the SYCL/CUDA ports follow. They are never reached in Phase 1a
-// except via an explicit device-resident dispatch, so returning -1 makes the
-// caller fall back to the CPU kernel.
+// !!! WRITE-BLIND — AUTHORED ON A NON-APPLE HOST (Phase 4). The Metal shaders
+// and this real path have NEVER been compiled (no `xcrun metal` off-Mac) or
+// run on a GPU. They are byte-exact ports of the SYCL/CPU references; the first
+// Mac build is expected to need MSL/ObjC++ fixes, and every kernel must pass
+// the Metal parity harness before it is trusted. On a non-Apple host NONE of
+// this compiles — the crate links the generated no-op stub (build.rs
+// build_mlx_stub) and device_count()==0 → CPU/SYCL/CUDA.
+//
+// ===================== STILL INERT (-1, Mac-pending) ====================
+// The remaining packed quants (Q4_K/Q6_K/K-quants/IQ grids/MXFP/NVFP/Q5_0/
+// Q4_1/Q5_1/PTQ1_0/PQ2_0 + batched), Prism Hadamard, and the quantized-KV
+// flash variants (q4_0/nvfp4/mxfp*/tq/q8_0). Each is a mechanical
+// specialization of a live pattern above (block dequant in the matvec inner
+// loop; on-the-fly K/V dequant in the flash inner loop) and is best filled in
+// with Mac compile + parity feedback. Returning -1 makes the caller fall back
+// to the CPU kernel until then.
 //
 // Keep this file, `rsl_mlx.h`, `rsl_mlx.def`, and the `extern "C"` block in
 // `src/lib.rs` in lock-step.
@@ -218,17 +228,20 @@ static id<MTLCommandQueue> mlx_default_queue(id<MTLDevice> dev) {
     return g_mlx_default_queue;
 }
 
-[[maybe_unused]] static id<MTLLibrary> g_mlx_library = nil;  // strong — keep the lib alive
-static id<MTLComputePipelineState> g_mlx_matvec_pso = nil;   // strong
-static id<MTLDevice> g_mlx_pso_device = nil;                 // strong (which dev the pso is for)
-static std::mutex g_mlx_pso_mutex;
+// ---- Shared MTLLibrary (embedded metallib) + pipeline-by-name cache ----
+//
+// The Phase-1a f32 matvec used a single hardcoded pipeline; Phase 4 adds a
+// whole kernel surface, so we cache the loaded MTLLibrary once and build a
+// MTLComputePipelineState per kernel name on first use (keyed by device to
+// future-proof multi-GPU, though Apple Silicon has one GPU so each builds
+// once). nil on failure latches an error so the caller falls back to CPU.
+static id<MTLLibrary> g_mlx_library = nil;      // strong — keep the lib alive
+static id<MTLDevice>  g_mlx_library_dev = nil;  // strong (which dev it's for)
+static std::mutex g_mlx_library_mutex;
 
-// Build (once, cached) the f32-matvec compute pipeline for `dev` from the
-// embedded metallib. nil on failure (latches an error so the caller falls
-// back to CPU).
-static id<MTLComputePipelineState> mlx_matvec_pso(id<MTLDevice> dev) {
-    std::lock_guard<std::mutex> lk(g_mlx_pso_mutex);
-    if (g_mlx_matvec_pso != nil && g_mlx_pso_device == dev) return g_mlx_matvec_pso;
+static id<MTLLibrary> mlx_library(id<MTLDevice> dev) {
+    std::lock_guard<std::mutex> lk(g_mlx_library_mutex);
+    if (g_mlx_library != nil && g_mlx_library_dev == dev) return g_mlx_library;
     NSError *err = nil;
     // DISPATCH_DATA_DESTRUCTOR_DEFAULT makes dispatch_data copy the bytes, so
     // the static array's lifetime does not matter after this call.
@@ -242,24 +255,103 @@ static id<MTLComputePipelineState> mlx_matvec_pso(id<MTLDevice> dev) {
         g_rsl_mlx_errors++;
         return nil;
     }
-    id<MTLFunction> fn = [lib newFunctionWithName:@"rsl_mlx_matvec_f32_kernel"];
+    g_mlx_library = lib;
+    g_mlx_library_dev = dev;
+    return g_mlx_library;
+}
+
+static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_mlx_psos = nil;  // strong
+static id<MTLDevice> g_mlx_psos_dev = nil;  // strong (which dev the cache is for)
+static std::mutex g_mlx_psos_mutex;
+
+// Build (once, cached) the compute pipeline named `name` for `dev` from the
+// embedded metallib. nil on failure (error latched).
+static id<MTLComputePipelineState> mlx_pipeline(id<MTLDevice> dev, NSString *name) {
+    std::lock_guard<std::mutex> lk(g_mlx_psos_mutex);
+    if (g_mlx_psos == nil || g_mlx_psos_dev != dev) {
+        g_mlx_psos = [NSMutableDictionary dictionary];  // ARC retains into the strong global
+        g_mlx_psos_dev = dev;
+    }
+    id<MTLComputePipelineState> cached = [g_mlx_psos objectForKey:name];
+    if (cached != nil) return cached;
+    id<MTLLibrary> lib = mlx_library(dev);
+    if (lib == nil) return nil;
+    id<MTLFunction> fn = [lib newFunctionWithName:name];
     if (fn == nil) {
-        std::fprintf(stderr, "rsl_mlx: kernel rsl_mlx_matvec_f32_kernel not found\n");
+        std::fprintf(stderr, "rsl_mlx: kernel %s not found\n", name.UTF8String);
         g_rsl_mlx_errors++;
         return nil;
     }
+    NSError *err = nil;
     id<MTLComputePipelineState> pso =
         [dev newComputePipelineStateWithFunction:fn error:&err];
     if (pso == nil) {
-        std::fprintf(stderr, "rsl_mlx: pipeline build failed: %s\n",
+        std::fprintf(stderr, "rsl_mlx: pipeline %s build failed: %s\n", name.UTF8String,
                      err ? err.localizedDescription.UTF8String : "(nil)");
         g_rsl_mlx_errors++;
         return nil;
     }
-    g_mlx_library = lib;
-    g_mlx_matvec_pso = pso;
-    g_mlx_pso_device = dev;
-    return g_mlx_matvec_pso;
+    [g_mlx_psos setObject:pso forKey:name];
+    return pso;
+}
+
+// Back-compat alias for the Phase-1a host-pointer matvec path.
+static id<MTLComputePipelineState> mlx_matvec_pso(id<MTLDevice> dev) {
+    return mlx_pipeline(dev, @"rsl_mlx_matvec_f32_kernel");
+}
+
+// ---- Device-resident dispatch helper -----------------------------------
+//
+// Build a command buffer + compute encoder on the stream, let `bind` set the
+// buffers/bytes (buffers resolved by the caller from the global registry),
+// dispatch `grid` threadgroups of `tpg`, commit + wait (Phase-4 runs
+// synchronously, like the matvec_f32 path). Returns 0 on success, -1 on a
+// pipeline/encode/GPU error (latched → CPU fallback). Must be called inside
+// an @autoreleasepool-able scope.
+typedef void (^MlxBindBlock)(id<MTLComputeCommandEncoder>);
+static int mlx_run(rsl_mlx_stream *s, NSString *name, MTLSize grid, MTLSize tpg,
+                   MlxBindBlock bind) {
+    if (s == nullptr) return -1;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pso = mlx_pipeline(s->device, name);
+        if (pso == nil) return -1;  // error already latched
+        id<MTLCommandBuffer> cb = [s->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        bind(enc);
+        [enc dispatchThreadgroups:grid threadsPerThreadgroup:tpg];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) { g_rsl_mlx_errors++; return -1; }
+        return 0;
+    }
+}
+
+// Shared body for the packed-quant matvecs: resolve W/x/out from the registry,
+// dispatch `kernel_name` over (M rows, N cols) threadgroups of 32 lanes. K must
+// be a multiple of the format's 32-wide block. N == 1 is the single case.
+static int mlx_packed_matvec(rsl_mlx_stream *s, NSString *kernel_name,
+                             const void *w, const float *x, float *out,
+                             int M, int K, int N) {
+    if (s == nullptr || w == nullptr || x == nullptr || out == nullptr) return -1;
+    if (M <= 0 || K <= 0 || N <= 0 || (K % 32) != 0) return -1;
+    size_t ow = 0, ox = 0, oo = 0;
+    id<MTLBuffer> bw = mlx_resolve(w, &ow);
+    id<MTLBuffer> bx = mlx_resolve(x, &ox);
+    id<MTLBuffer> bo = mlx_resolve(out, &oo);
+    if (bw == nil || bx == nil || bo == nil) { g_rsl_mlx_errors++; return -1; }
+    int kk = K, mm = M, nn = N;
+    MTLSize grid = MTLSizeMake((NSUInteger)M, (NSUInteger)N, 1);
+    MTLSize tpg = MTLSizeMake(32, 1, 1);
+    return mlx_run(s, kernel_name, grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bw offset:ow atIndex:0];
+        [enc setBuffer:bx offset:ox atIndex:1];
+        [enc setBuffer:bo offset:oo atIndex:2];
+        [enc setBytes:&kk length:sizeof(int) atIndex:3];
+        [enc setBytes:&mm length:sizeof(int) atIndex:4];
+        [enc setBytes:&nn length:sizeof(int) atIndex:5];
+    });
 }
 #endif  // RSL_MLX_HAVE_METAL
 
@@ -320,9 +412,52 @@ extern "C" int rsl_mlx_device_info(int idx, char *name, int name_cap,
 
 extern "C" int rsl_mlx_rmsnorm_f32(const float *x, const float *w, float *y,
                                    int n_rows, int d, float eps) {
+#if RSL_MLX_HAVE_METAL
+    if (!x || !w || !y || n_rows <= 0 || d <= 0) return -1;
+    @autoreleasepool {
+        // Stream-less host-pointer reference path → GPU 0 + cached queue/pso,
+        // staging x/w into fresh shared buffers and reading y straight back
+        // (same shape as rsl_mlx_matvec_f32).
+        id<MTLDevice> dev = mlx_device_at(0);
+        if (dev == nil) { g_rsl_mlx_errors++; return -1; }
+        id<MTLComputePipelineState> pso = mlx_pipeline(dev, @"rsl_mlx_rmsnorm_f32_kernel");
+        if (pso == nil) return -1;  // error already latched
+        id<MTLCommandQueue> q = mlx_default_queue(dev);
+        if (q == nil) { g_rsl_mlx_errors++; return -1; }
+
+        const NSUInteger xbytes = (NSUInteger)n_rows * (NSUInteger)d * sizeof(float);
+        const NSUInteger wbytes = (NSUInteger)d * sizeof(float);
+        id<MTLBuffer> bX = [dev newBufferWithBytes:x length:xbytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bW = [dev newBufferWithBytes:w length:wbytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bY = [dev newBufferWithLength:xbytes options:MTLResourceStorageModeShared];
+        if (bX == nil || bW == nil || bY == nil) { g_rsl_mlx_errors++; return -1; }
+
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bX offset:0 atIndex:0];
+        [enc setBuffer:bW offset:0 atIndex:1];
+        [enc setBuffer:bY offset:0 atIndex:2];
+        int dd = d;
+        float ee = eps;
+        [enc setBytes:&dd length:sizeof(int) atIndex:3];
+        [enc setBytes:&ee length:sizeof(float) atIndex:4];
+        // One 32-lane threadgroup (== one SIMD-group) per row; lanes stride d
+        // and simd_sum-reduce the sum of squares.
+        MTLSize grid = MTLSizeMake((NSUInteger)n_rows, 1, 1);
+        MTLSize tpg = MTLSizeMake(32, 1, 1);
+        [enc dispatchThreadgroups:grid threadsPerThreadgroup:tpg];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) { g_rsl_mlx_errors++; return -1; }
+        std::memcpy(y, [bY contents], (size_t)xbytes);
+        return 0;
+    }
+#else
     (void)x; (void)w; (void)y; (void)n_rows; (void)d; (void)eps;
-    // TODO(phase1): y = x * rsqrt(mean(x^2)+eps) * w, one threadgroup/row.
     return -1;
+#endif
 }
 
 extern "C" int rsl_mlx_matvec_f32(const float *W, const float *x, float *out,
@@ -524,13 +659,14 @@ extern "C" int rsl_mlx_hadamard_forward(rsl_mlx_stream *s, const float *x,
     extern "C" int rsl_mlx_##NAME##_batched(rsl_mlx_stream *s, const void *w, \
         const float *x, float *out, int M, int K, int N)                      \
         { (void)s;(void)w;(void)x;(void)out;(void)M;(void)K;(void)N; RSL_MLX_STUB_KERNEL }
-RSL_MLX_DEFINE_PACKED(matvec_q8_0_packed_f32)
+// NOTE: matvec_q8_0_packed_f32 + matvec_q4_0_packed_f32 (and their batched
+// forms) are IMPLEMENTED below (real Metal dispatch), so they are omitted
+// from this inert-stub list.
 RSL_MLX_DEFINE_PACKED(matvec_q4_k_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_q6_k_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_q5_k_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_q2_k_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_q8_k_packed_f32)
-RSL_MLX_DEFINE_PACKED(matvec_q4_0_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_q5_0_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_q4_1_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_q5_1_packed_f32)
@@ -551,30 +687,211 @@ RSL_MLX_DEFINE_PACKED(matvec_q3_k_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_pq2_0_packed_f32)
 #undef RSL_MLX_DEFINE_PACKED
 
-// Forward-pass primitives.
-extern "C" int rsl_mlx_add_rmsnorm_f32(rsl_mlx_stream *s, float *hidden,
-    const float *branch, const float *w, float *y_norm, int n_rows, int d, float eps)
-    { (void)s;(void)hidden;(void)branch;(void)w;(void)y_norm;(void)n_rows;(void)d;(void)eps; RSL_MLX_STUB_KERNEL }
-extern "C" int rsl_mlx_rope_f32(rsl_mlx_stream *s, float *qk, int n_heads,
-    int head_dim, int pos, const float *inv_freq)
-    { (void)s;(void)qk;(void)n_heads;(void)head_dim;(void)pos;(void)inv_freq; RSL_MLX_STUB_KERNEL }
-extern "C" int rsl_mlx_silu_mul_f32(rsl_mlx_stream *s, const float *x,
-    const float *y, float *out, int n)
-    { (void)s;(void)x;(void)y;(void)out;(void)n; RSL_MLX_STUB_KERNEL }
-extern "C" int rsl_mlx_embedding_lookup_f32(rsl_mlx_stream *s, const float *table,
-    const int *ids, float *out, int n_ids, int d)
-    { (void)s;(void)table;(void)ids;(void)out;(void)n_ids;(void)d; RSL_MLX_STUB_KERNEL }
+// --- Q8_0 / Q4_0 packed matvec: LIVE (Metal dispatch via mlx_packed_matvec) ---
+// The two simplest GGUF quants (32-wide blocks, no 6-bit scale unpack / grid
+// tables), ported byte-exact from rsl_matvec_{q8_0,q4_0}_packed_f32_usm. They
+// establish the "dequant W's block layout in the matvec inner loop" pattern the
+// remaining packed quants above specialize.
+extern "C" int rsl_mlx_matvec_q8_0_packed_f32(rsl_mlx_stream *s, const void *w,
+    const float *x, float *out, int M, int K) {
+#if RSL_MLX_HAVE_METAL
+    return mlx_packed_matvec(s, @"rsl_mlx_matvec_q8_0_packed_f32_kernel", w, x, out, M, K, 1);
+#else
+    (void)s;(void)w;(void)x;(void)out;(void)M;(void)K; return -1;
+#endif
+}
+extern "C" int rsl_mlx_matvec_q8_0_packed_f32_batched(rsl_mlx_stream *s, const void *w,
+    const float *x, float *out, int M, int K, int N) {
+#if RSL_MLX_HAVE_METAL
+    return mlx_packed_matvec(s, @"rsl_mlx_matvec_q8_0_packed_f32_kernel", w, x, out, M, K, N);
+#else
+    (void)s;(void)w;(void)x;(void)out;(void)M;(void)K;(void)N; return -1;
+#endif
+}
+extern "C" int rsl_mlx_matvec_q4_0_packed_f32(rsl_mlx_stream *s, const void *w,
+    const float *x, float *out, int M, int K) {
+#if RSL_MLX_HAVE_METAL
+    return mlx_packed_matvec(s, @"rsl_mlx_matvec_q4_0_packed_f32_kernel", w, x, out, M, K, 1);
+#else
+    (void)s;(void)w;(void)x;(void)out;(void)M;(void)K; return -1;
+#endif
+}
+extern "C" int rsl_mlx_matvec_q4_0_packed_f32_batched(rsl_mlx_stream *s, const void *w,
+    const float *x, float *out, int M, int K, int N) {
+#if RSL_MLX_HAVE_METAL
+    return mlx_packed_matvec(s, @"rsl_mlx_matvec_q4_0_packed_f32_kernel", w, x, out, M, K, N);
+#else
+    (void)s;(void)w;(void)x;(void)out;(void)M;(void)K;(void)N; return -1;
+#endif
+}
 
-// FlashAttention (F32 K/V). TODO(phase1): GQA online-softmax flash decode
-// (one query/head) + causal prefill; port from the CUDA/SYCL flash kernels.
+// Forward-pass primitives — LIVE (device-resident Metal dispatch).
+extern "C" int rsl_mlx_add_rmsnorm_f32(rsl_mlx_stream *s, float *hidden,
+    const float *branch, const float *w, float *y_norm, int n_rows, int d, float eps) {
+#if RSL_MLX_HAVE_METAL
+    if (!s || !hidden || !branch || !w || !y_norm || n_rows <= 0 || d <= 0) return -1;
+    size_t oh = 0, ob = 0, ow = 0, oy = 0;
+    id<MTLBuffer> bh = mlx_resolve(hidden, &oh);
+    id<MTLBuffer> bb = mlx_resolve(branch, &ob);
+    id<MTLBuffer> bw = mlx_resolve(w, &ow);
+    id<MTLBuffer> by = mlx_resolve(y_norm, &oy);
+    if (bh == nil || bb == nil || bw == nil || by == nil) { g_rsl_mlx_errors++; return -1; }
+    int dd = d;
+    float ee = eps;
+    MTLSize grid = MTLSizeMake((NSUInteger)n_rows, 1, 1);
+    MTLSize tpg = MTLSizeMake(32, 1, 1);
+    return mlx_run(s, @"rsl_mlx_add_rmsnorm_f32_kernel", grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bh offset:oh atIndex:0];
+        [enc setBuffer:bb offset:ob atIndex:1];
+        [enc setBuffer:bw offset:ow atIndex:2];
+        [enc setBuffer:by offset:oy atIndex:3];
+        [enc setBytes:&dd length:sizeof(int) atIndex:4];
+        [enc setBytes:&ee length:sizeof(float) atIndex:5];
+    });
+#else
+    (void)s;(void)hidden;(void)branch;(void)w;(void)y_norm;(void)n_rows;(void)d;(void)eps; RSL_MLX_STUB_KERNEL
+#endif
+}
+extern "C" int rsl_mlx_rope_f32(rsl_mlx_stream *s, float *qk, int n_heads,
+    int head_dim, int pos, const float *inv_freq) {
+#if RSL_MLX_HAVE_METAL
+    if (!s || !qk || !inv_freq || n_heads <= 0 || head_dim <= 0 || (head_dim % 2) != 0) return -1;
+    size_t oq = 0, of = 0;
+    id<MTLBuffer> bq = mlx_resolve(qk, &oq);
+    id<MTLBuffer> bf = mlx_resolve(inv_freq, &of);
+    if (bq == nil || bf == nil) { g_rsl_mlx_errors++; return -1; }
+    int nh = n_heads, hd = head_dim, pp = pos;
+    const NSUInteger total = (NSUInteger)n_heads * (NSUInteger)(head_dim / 2);
+    const NSUInteger tg = 256;
+    MTLSize grid = MTLSizeMake((total + tg - 1) / tg, 1, 1);
+    MTLSize tpg = MTLSizeMake(tg, 1, 1);
+    return mlx_run(s, @"rsl_mlx_rope_f32_kernel", grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bq offset:oq atIndex:0];
+        [enc setBuffer:bf offset:of atIndex:1];
+        [enc setBytes:&nh length:sizeof(int) atIndex:2];
+        [enc setBytes:&hd length:sizeof(int) atIndex:3];
+        [enc setBytes:&pp length:sizeof(int) atIndex:4];
+    });
+#else
+    (void)s;(void)qk;(void)n_heads;(void)head_dim;(void)pos;(void)inv_freq; RSL_MLX_STUB_KERNEL
+#endif
+}
+extern "C" int rsl_mlx_silu_mul_f32(rsl_mlx_stream *s, const float *x,
+    const float *y, float *out, int n) {
+#if RSL_MLX_HAVE_METAL
+    if (!s || !x || !y || !out || n <= 0) return -1;
+    size_t ox = 0, oy = 0, oo = 0;
+    id<MTLBuffer> bx = mlx_resolve(x, &ox);
+    id<MTLBuffer> by = mlx_resolve(y, &oy);
+    id<MTLBuffer> bo = mlx_resolve(out, &oo);
+    if (bx == nil || by == nil || bo == nil) { g_rsl_mlx_errors++; return -1; }
+    int nn = n;
+    const NSUInteger tg = 256;
+    MTLSize grid = MTLSizeMake(((NSUInteger)n + tg - 1) / tg, 1, 1);
+    MTLSize tpg = MTLSizeMake(tg, 1, 1);
+    return mlx_run(s, @"rsl_mlx_silu_mul_f32_kernel", grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bx offset:ox atIndex:0];
+        [enc setBuffer:by offset:oy atIndex:1];
+        [enc setBuffer:bo offset:oo atIndex:2];
+        [enc setBytes:&nn length:sizeof(int) atIndex:3];
+    });
+#else
+    (void)s;(void)x;(void)y;(void)out;(void)n; RSL_MLX_STUB_KERNEL
+#endif
+}
+extern "C" int rsl_mlx_embedding_lookup_f32(rsl_mlx_stream *s, const float *table,
+    const int *ids, float *out, int n_ids, int d) {
+#if RSL_MLX_HAVE_METAL
+    if (!s || !table || !ids || !out || n_ids <= 0 || d <= 0) return -1;
+    size_t ot = 0, oi = 0, oo = 0;
+    id<MTLBuffer> bt = mlx_resolve(table, &ot);
+    id<MTLBuffer> bi = mlx_resolve(ids, &oi);   // ids is a DEVICE pointer here
+    id<MTLBuffer> bo = mlx_resolve(out, &oo);
+    if (bt == nil || bi == nil || bo == nil) { g_rsl_mlx_errors++; return -1; }
+    int ni = n_ids, dd = d;
+    const unsigned long long total = (unsigned long long)n_ids * (unsigned long long)d;
+    const NSUInteger tg = 256;
+    MTLSize grid = MTLSizeMake((NSUInteger)((total + tg - 1) / tg), 1, 1);
+    MTLSize tpg = MTLSizeMake(tg, 1, 1);
+    return mlx_run(s, @"rsl_mlx_embedding_lookup_f32_kernel", grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bt offset:ot atIndex:0];
+        [enc setBuffer:bi offset:oi atIndex:1];
+        [enc setBuffer:bo offset:oo atIndex:2];
+        [enc setBytes:&ni length:sizeof(int) atIndex:3];
+        [enc setBytes:&dd length:sizeof(int) atIndex:4];
+    });
+#else
+    (void)s;(void)table;(void)ids;(void)out;(void)n_ids;(void)d; RSL_MLX_STUB_KERNEL
+#endif
+}
+
+// FlashAttention (F32 K/V) — LIVE. GQA online-softmax: one 32-lane group per
+// query (decode) / per (head, q_pos) (prefill); head_dim capped at 256 (the
+// shader's threadgroup accumulator). Ports rsl_flash_attn_{decode,prefill}_usm.
 extern "C" int rsl_mlx_flash_attn_decode_f32(rsl_mlx_stream *s, const float *q,
     const float *k, const float *v, float *out, int n_heads, int n_kv_heads,
-    int head_dim, int max_ctx, int kv_len)
-    { (void)s;(void)q;(void)k;(void)v;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len; RSL_MLX_STUB_KERNEL }
+    int head_dim, int max_ctx, int kv_len) {
+#if RSL_MLX_HAVE_METAL
+    if (!s || !q || !k || !v || !out) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || kv_len <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0 || head_dim > 256) return -1;
+    size_t oq = 0, ok = 0, ov = 0, oo = 0;
+    id<MTLBuffer> bq = mlx_resolve(q, &oq);
+    id<MTLBuffer> bk = mlx_resolve(k, &ok);
+    id<MTLBuffer> bv = mlx_resolve(v, &ov);
+    id<MTLBuffer> bo = mlx_resolve(out, &oo);
+    if (bq == nil || bk == nil || bv == nil || bo == nil) { g_rsl_mlx_errors++; return -1; }
+    int nh = n_heads, nkv = n_kv_heads, hd = head_dim, mc = max_ctx, kl = kv_len;
+    MTLSize grid = MTLSizeMake((NSUInteger)n_heads, 1, 1);
+    MTLSize tpg = MTLSizeMake(32, 1, 1);
+    return mlx_run(s, @"rsl_mlx_flash_attn_decode_f32_kernel", grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bq offset:oq atIndex:0];
+        [enc setBuffer:bk offset:ok atIndex:1];
+        [enc setBuffer:bv offset:ov atIndex:2];
+        [enc setBuffer:bo offset:oo atIndex:3];
+        [enc setBytes:&nh length:sizeof(int) atIndex:4];
+        [enc setBytes:&nkv length:sizeof(int) atIndex:5];
+        [enc setBytes:&hd length:sizeof(int) atIndex:6];
+        [enc setBytes:&mc length:sizeof(int) atIndex:7];
+        [enc setBytes:&kl length:sizeof(int) atIndex:8];
+    });
+#else
+    (void)s;(void)q;(void)k;(void)v;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len; RSL_MLX_STUB_KERNEL
+#endif
+}
 extern "C" int rsl_mlx_flash_attn_prefill_f32(rsl_mlx_stream *s, const float *q,
     const float *k, const float *v, float *out, int n_heads, int n_kv_heads,
-    int head_dim, int max_ctx, int kv_len_base, int n_new)
-    { (void)s;(void)q;(void)k;(void)v;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len_base;(void)n_new; RSL_MLX_STUB_KERNEL }
+    int head_dim, int max_ctx, int kv_len_base, int n_new) {
+#if RSL_MLX_HAVE_METAL
+    if (!s || !q || !k || !v || !out) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0 || head_dim > 256) return -1;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
+    size_t oq = 0, ok = 0, ov = 0, oo = 0;
+    id<MTLBuffer> bq = mlx_resolve(q, &oq);
+    id<MTLBuffer> bk = mlx_resolve(k, &ok);
+    id<MTLBuffer> bv = mlx_resolve(v, &ov);
+    id<MTLBuffer> bo = mlx_resolve(out, &oo);
+    if (bq == nil || bk == nil || bv == nil || bo == nil) { g_rsl_mlx_errors++; return -1; }
+    int nh = n_heads, nkv = n_kv_heads, hd = head_dim, mc = max_ctx, kb = kv_len_base, nn = n_new;
+    MTLSize grid = MTLSizeMake((NSUInteger)n_heads, (NSUInteger)n_new, 1);
+    MTLSize tpg = MTLSizeMake(32, 1, 1);
+    return mlx_run(s, @"rsl_mlx_flash_attn_prefill_f32_kernel", grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bq offset:oq atIndex:0];
+        [enc setBuffer:bk offset:ok atIndex:1];
+        [enc setBuffer:bv offset:ov atIndex:2];
+        [enc setBuffer:bo offset:oo atIndex:3];
+        [enc setBytes:&nh length:sizeof(int) atIndex:4];
+        [enc setBytes:&nkv length:sizeof(int) atIndex:5];
+        [enc setBytes:&hd length:sizeof(int) atIndex:6];
+        [enc setBytes:&mc length:sizeof(int) atIndex:7];
+        [enc setBytes:&kb length:sizeof(int) atIndex:8];
+        [enc setBytes:&nn length:sizeof(int) atIndex:9];
+    });
+#else
+    (void)s;(void)q;(void)k;(void)v;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len_base;(void)n_new; RSL_MLX_STUB_KERNEL
+#endif
+}
 
 // Quantized-KV FlashAttention. TODO(phase1): dequant K/V on the fly inside
 // the flash kernel; byte-exact ports of the CPU reference q4_0/nvfp4/mxfp*/
@@ -622,9 +939,28 @@ extern "C" int rsl_mlx_flash_attn_prefill_q8_0(rsl_mlx_stream *s, const float *q
     int head_dim, int max_ctx, int kv_len_base, int n_new)
     { (void)s;(void)q;(void)k_packed;(void)v_packed;(void)k_scales;(void)v_scales;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len_base;(void)n_new; RSL_MLX_STUB_KERNEL }
 
-// Sampling.
+// Sampling — LIVE. Single threadgroup argmax (lowest index on ties).
 extern "C" int rsl_mlx_argmax_f32(rsl_mlx_stream *s, const float *logits,
-    int vocab, int *out_idx)
-    { (void)s;(void)logits;(void)vocab;(void)out_idx; RSL_MLX_STUB_KERNEL }
+    int vocab, int *out_idx) {
+#if RSL_MLX_HAVE_METAL
+    if (!s || !logits || !out_idx || vocab <= 0) return -1;
+    size_t ol = 0, oo = 0;
+    id<MTLBuffer> bl = mlx_resolve(logits, &ol);
+    id<MTLBuffer> bo = mlx_resolve(out_idx, &oo);
+    if (bl == nil || bo == nil) { g_rsl_mlx_errors++; return -1; }
+    int vv = vocab;
+    // One threadgroup of 256 (power of two for the tree reduction); the kernel
+    // threadgroup arrays are sized 256 to match.
+    MTLSize grid = MTLSizeMake(1, 1, 1);
+    MTLSize tpg = MTLSizeMake(256, 1, 1);
+    return mlx_run(s, @"rsl_mlx_argmax_f32_kernel", grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bl offset:ol atIndex:0];
+        [enc setBuffer:bo offset:oo atIndex:1];
+        [enc setBytes:&vv length:sizeof(int) atIndex:2];
+    });
+#else
+    (void)s;(void)logits;(void)vocab;(void)out_idx; RSL_MLX_STUB_KERNEL
+#endif
+}
 
 #undef RSL_MLX_STUB_KERNEL
