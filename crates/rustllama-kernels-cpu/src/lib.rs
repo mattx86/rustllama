@@ -11489,8 +11489,45 @@ pub fn silu_mul_f32(x: &[f32], y: &[f32], out: &mut [f32]) {
             return;
         }
     }
-
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { silu_mul_f32_neon(x, y, out) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     silu_mul_f32_scalar(x, y, out);
+}
+
+/// AArch64 NEON SiLU-gate: `out = (x / (1 + exp(-x))) * y`, 4 lanes at a
+/// time with [`expf_approx_neon`], scalar (`libm` exp) tail. Mirrors the
+/// AVX2 path; same tolerance contract vs the scalar reference.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn silu_mul_f32_neon(x: &[f32], y: &[f32], out: &mut [f32]) {
+    use std::arch::aarch64::*;
+    let n = x.len();
+    let n4 = n & !3;
+    let xp = x.as_ptr();
+    let yp = y.as_ptr();
+    let op = out.as_mut_ptr();
+    let one = vdupq_n_f32(1.0);
+    let zero = vdupq_n_f32(0.0);
+    let mut p = 0;
+    while p < n4 {
+        let xv = vld1q_f32(xp.add(p));
+        let yv = vld1q_f32(yp.add(p));
+        // silu(x) = x / (1 + exp(-x))
+        let e = expf_approx_neon(vsubq_f32(zero, xv));
+        let silu = vdivq_f32(xv, vaddq_f32(one, e));
+        vst1q_f32(op.add(p), vmulq_f32(silu, yv));
+        p += 4;
+    }
+    while p < n {
+        let xv = *xp.add(p);
+        *op.add(p) = (xv / (1.0 + (-xv).exp())) * *yp.add(p);
+        p += 1;
+    }
 }
 
 pub(crate) fn silu_mul_f32_scalar(x: &[f32], y: &[f32], out: &mut [f32]) {
@@ -11797,8 +11834,74 @@ pub fn softmax_f32_inplace(x: &mut [f32]) {
             return;
         }
     }
-
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { softmax_f32_inplace_neon(x) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     softmax_f32_inplace_scalar(x);
+}
+
+/// AArch64 NEON in-place softmax: 3 passes (max / exp-and-sum / normalize),
+/// 4 lanes per step with a scalar tail. The bulk uses [`expf_approx_neon`]
+/// and the tail uses `libm` exp, exactly like the AVX2 path; the
+/// post-normalization absorbs the ~2e-6 approximation error. NEON baseline.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn softmax_f32_inplace_neon(x: &mut [f32]) {
+    use std::arch::aarch64::*;
+    let n = x.len();
+    let ptr = x.as_mut_ptr();
+    let n4 = n & !3;
+
+    // Pass 1: max.
+    let mut max_v = vdupq_n_f32(f32::NEG_INFINITY);
+    let mut p = 0;
+    while p < n4 {
+        max_v = vmaxq_f32(max_v, vld1q_f32(ptr.add(p)));
+        p += 4;
+    }
+    let mut max_s = vmaxvq_f32(max_v);
+    while p < n {
+        let v = *ptr.add(p);
+        if v > max_s {
+            max_s = v;
+        }
+        p += 1;
+    }
+
+    // Pass 2: exp(v - max), accumulate sum.
+    let max_b = vdupq_n_f32(max_s);
+    let mut sum_v = vdupq_n_f32(0.0);
+    let mut p = 0;
+    while p < n4 {
+        let e = expf_approx_neon(vsubq_f32(vld1q_f32(ptr.add(p)), max_b));
+        vst1q_f32(ptr.add(p), e);
+        sum_v = vaddq_f32(sum_v, e);
+        p += 4;
+    }
+    let mut sum_s = vaddvq_f32(sum_v);
+    while p < n {
+        let e = (*ptr.add(p) - max_s).exp();
+        *ptr.add(p) = e;
+        sum_s += e;
+        p += 1;
+    }
+
+    // Pass 3: normalize.
+    let inv_b = vdupq_n_f32(1.0 / sum_s);
+    let mut p = 0;
+    while p < n4 {
+        vst1q_f32(ptr.add(p), vmulq_f32(vld1q_f32(ptr.add(p)), inv_b));
+        p += 4;
+    }
+    let inv = 1.0 / sum_s;
+    while p < n {
+        *ptr.add(p) *= inv;
+        p += 1;
+    }
 }
 
 /// Scalar-only softmax — fallback path + parity reference for the
@@ -11903,6 +12006,35 @@ unsafe fn expf_approx_avx512f(x: std::arch::x86_64::__m512) -> std::arch::x86_64
     let n_biased = _mm512_add_epi32(n_i, _mm512_set1_epi32(127));
     let pow2n = _mm512_castsi512_ps(_mm512_slli_epi32::<23>(n_biased));
     _mm512_mul_ps(p, pow2n)
+}
+
+/// AArch64 NEON `expf` approximation over `float32x4_t` — the exact same
+/// Cephes range-reduction + 5-term Horner polynomial as [`expf_approx_avx2`]
+/// (same constants, so the same ~2e-6 relative error), using `vrndnq_f32`
+/// for the round-to-nearest, `vfmsq_f32` (`a - b*c`) for the range
+/// reduction, `vfmaq_f32` for the polynomial, and a `<< 23` exponent bit
+/// trick for `2^n`. Shared by the NEON SiLU / softmax kernels.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn expf_approx_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    let x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-88.0)), vdupq_n_f32(88.0));
+    // n = round(x * log2(e)); r = x - n*ln2 (2-piece for precision).
+    let n = vrndnq_f32(vmulq_f32(x, vdupq_n_f32(std::f32::consts::LOG2_E)));
+    let r = vfmsq_f32(x, n, vdupq_n_f32(0.693_359_375));
+    let r = vfmsq_f32(r, n, vdupq_n_f32(-2.121_944_4e-4));
+    // exp(r) Horner polynomial (5 terms).
+    let p = vdupq_n_f32(1.0 / 120.0);
+    let p = vfmaq_f32(vdupq_n_f32(1.0 / 24.0), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(1.0 / 6.0), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(0.5), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(1.0), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(1.0), p, r);
+    // 2^n via (n + 127) << 23 in the f32 exponent field.
+    let n_biased = vaddq_s32(vcvtq_s32_f32(n), vdupq_n_s32(127));
+    let pow2n = vreinterpretq_f32_s32(vshlq_n_s32::<23>(n_biased));
+    vmulq_f32(p, pow2n)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -12111,7 +12243,78 @@ pub fn fused_temp_softmax_inplace(x: &mut [f32], inv_temp: f32) {
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { fused_temp_softmax_inplace_neon(x, inv_temp) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     fused_temp_softmax_inplace_scalar(x, inv_temp);
+}
+
+/// AArch64 NEON fused temperature-scaled softmax: pass 1 writes
+/// `x * inv_temp` back while tracking the max, then the standard
+/// exp-and-sum / normalize passes (bulk via [`expf_approx_neon`], scalar
+/// `libm` exp tail). Mirrors the AVX2 path; NEON baseline.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn fused_temp_softmax_inplace_neon(x: &mut [f32], inv_temp: f32) {
+    use std::arch::aarch64::*;
+    let n = x.len();
+    let ptr = x.as_mut_ptr();
+    let n4 = n & !3;
+    let inv_t_b = vdupq_n_f32(inv_temp);
+
+    // Pass 1: scale by inv_temp in place + track max.
+    let mut max_v = vdupq_n_f32(f32::NEG_INFINITY);
+    let mut p = 0;
+    while p < n4 {
+        let v = vmulq_f32(vld1q_f32(ptr.add(p)), inv_t_b);
+        vst1q_f32(ptr.add(p), v);
+        max_v = vmaxq_f32(max_v, v);
+        p += 4;
+    }
+    let mut max_s = vmaxvq_f32(max_v);
+    while p < n {
+        let v = *ptr.add(p) * inv_temp;
+        *ptr.add(p) = v;
+        if v > max_s {
+            max_s = v;
+        }
+        p += 1;
+    }
+
+    // Pass 2: exp(v - max), accumulate sum.
+    let max_b = vdupq_n_f32(max_s);
+    let mut sum_v = vdupq_n_f32(0.0);
+    let mut p = 0;
+    while p < n4 {
+        let e = expf_approx_neon(vsubq_f32(vld1q_f32(ptr.add(p)), max_b));
+        vst1q_f32(ptr.add(p), e);
+        sum_v = vaddq_f32(sum_v, e);
+        p += 4;
+    }
+    let mut sum_s = vaddvq_f32(sum_v);
+    while p < n {
+        let e = (*ptr.add(p) - max_s).exp();
+        *ptr.add(p) = e;
+        sum_s += e;
+        p += 1;
+    }
+
+    // Pass 3: normalize.
+    let inv = 1.0 / sum_s;
+    let inv_b = vdupq_n_f32(inv);
+    let mut p = 0;
+    while p < n4 {
+        vst1q_f32(ptr.add(p), vmulq_f32(vld1q_f32(ptr.add(p)), inv_b));
+        p += 4;
+    }
+    while p < n {
+        *ptr.add(p) *= inv;
+        p += 1;
+    }
 }
 
 pub(crate) fn fused_temp_softmax_inplace_scalar(x: &mut [f32], inv_temp: f32) {
