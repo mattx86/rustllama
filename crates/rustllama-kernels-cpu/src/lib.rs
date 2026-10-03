@@ -10662,7 +10662,65 @@ pub fn matvec_bf16_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_bf16_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_bf16_w_f32_a_scalar(w_bytes, x, out, m, k);
+}
+
+/// AArch64 NEON BF16 matvec. BF16 widens to f32 by a zero-fill left-shift
+/// of 16 bits — `vshll_n_u16::<16>` lands the 16 BF16 bits in the top of a
+/// u32, which reinterprets directly as f32 (no `fp16`/vcvt needed, so this
+/// is stable-NEON). 16-lane main tile (4 accumulators), 4-lane mid loop,
+/// scalar tail. NEON baseline; same tolerance contract as the AVX2 path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_bf16_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use std::arch::aarch64::*;
+    let k_main = k & !15;
+    let k_main4 = k & !3;
+    for i in 0..m {
+        let row = i * k * 2;
+        let wptr = w_bytes.as_ptr().add(row) as *const u16;
+        let mut a = [vdupq_n_f32(0.0); 4];
+        let mut p = 0;
+        while p < k_main {
+            let u0 = vld1q_u16(wptr.add(p));
+            let u1 = vld1q_u16(wptr.add(p + 8));
+            let w0 = vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(u0)));
+            let w1 = vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_high_u16(u0)));
+            let w2 = vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(u1)));
+            let w3 = vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_high_u16(u1)));
+            let xp = x.as_ptr().add(p);
+            a[0] = vfmaq_f32(a[0], w0, vld1q_f32(xp));
+            a[1] = vfmaq_f32(a[1], w1, vld1q_f32(xp.add(4)));
+            a[2] = vfmaq_f32(a[2], w2, vld1q_f32(xp.add(8)));
+            a[3] = vfmaq_f32(a[3], w3, vld1q_f32(xp.add(12)));
+            p += 16;
+        }
+        while p < k_main4 {
+            let w = vreinterpretq_f32_u32(vshll_n_u16::<16>(vld1_u16(wptr.add(p))));
+            a[0] = vfmaq_f32(a[0], w, vld1q_f32(x.as_ptr().add(p)));
+            p += 4;
+        }
+        let mut sum = vaddvq_f32(vaddq_f32(vaddq_f32(a[0], a[1]), vaddq_f32(a[2], a[3])));
+        while p < k {
+            let u = u16::from_le_bytes([w_bytes[row + p * 2], w_bytes[row + p * 2 + 1]]);
+            sum += f32::from_bits((u as u32) << 16) * x[p];
+            p += 1;
+        }
+        out[i] = sum;
+    }
 }
 
 fn matvec_bf16_w_f32_a_scalar(
@@ -10884,8 +10942,51 @@ pub fn matvec_f32_serial(w: &[f32], x: &[f32], out: &mut [f32], m: usize, k: usi
             return;
         }
     }
-
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_f32_neon(w, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_f32_scalar(w, x, out, m, k);
+}
+
+/// AArch64 NEON F32 matvec. 16-lane main tile (4 × `float32x4` FMA
+/// accumulators), 4-lane mid loop, scalar tail — the ARM analogue of the
+/// AVX2 4-accumulator structure. `k` need not be a multiple of the tile.
+/// NEON baseline; vector summation differs from scalar only in reduction
+/// order (same tolerance contract as the AVX2 path).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_f32_neon(w: &[f32], x: &[f32], out: &mut [f32], m: usize, k: usize) {
+    use std::arch::aarch64::*;
+    let k_main = k & !15;
+    let k_main4 = k & !3;
+    for i in 0..m {
+        let w_row = w.as_ptr().add(i * k);
+        let mut a = [vdupq_n_f32(0.0); 4];
+        let mut p = 0;
+        while p < k_main {
+            let wp = w_row.add(p);
+            let xp = x.as_ptr().add(p);
+            a[0] = vfmaq_f32(a[0], vld1q_f32(wp), vld1q_f32(xp));
+            a[1] = vfmaq_f32(a[1], vld1q_f32(wp.add(4)), vld1q_f32(xp.add(4)));
+            a[2] = vfmaq_f32(a[2], vld1q_f32(wp.add(8)), vld1q_f32(xp.add(8)));
+            a[3] = vfmaq_f32(a[3], vld1q_f32(wp.add(12)), vld1q_f32(xp.add(12)));
+            p += 16;
+        }
+        while p < k_main4 {
+            a[0] = vfmaq_f32(a[0], vld1q_f32(w_row.add(p)), vld1q_f32(x.as_ptr().add(p)));
+            p += 4;
+        }
+        let mut sum = vaddvq_f32(vaddq_f32(vaddq_f32(a[0], a[1]), vaddq_f32(a[2], a[3])));
+        while p < k {
+            sum += *w_row.add(p) * x[p];
+            p += 1;
+        }
+        out[i] = sum;
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -11059,8 +11160,61 @@ pub fn rmsnorm_f32_row(x: &[f32], weight: &[f32], y: &mut [f32], eps: f32) {
             return;
         }
     }
-
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { rmsnorm_f32_row_neon(x, weight, y, eps) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     rmsnorm_f32_row_scalar(x, weight, y, eps);
+}
+
+/// AArch64 NEON `rmsnorm_f32_row`. Pass 1 accumulates the sum of squares
+/// with `vfmaq` (4 lanes) + scalar tail; the `inv = 1/sqrt(mean+eps)`
+/// reciprocal is computed in scalar f32 identically to the reference (so
+/// the normalization factor matches bit-for-bit). Pass 2 writes
+/// `y = x * inv * w`. NEON baseline.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn rmsnorm_f32_row_neon(x: &[f32], weight: &[f32], y: &mut [f32], eps: f32) {
+    use std::arch::aarch64::*;
+    let d = x.len();
+    let n4 = d & !3;
+    let xp = x.as_ptr();
+    let wp = weight.as_ptr();
+    let yp = y.as_mut_ptr();
+
+    // Pass 1: sum of squares.
+    let mut acc = vdupq_n_f32(0.0);
+    let mut p = 0;
+    while p < n4 {
+        let v = vld1q_f32(xp.add(p));
+        acc = vfmaq_f32(acc, v, v);
+        p += 4;
+    }
+    let mut sum_sq = vaddvq_f32(acc);
+    while p < d {
+        let v = *xp.add(p);
+        sum_sq += v * v;
+        p += 1;
+    }
+
+    let inv = 1.0 / (sum_sq / d as f32 + eps).sqrt();
+    let inv_b = vdupq_n_f32(inv);
+
+    // Pass 2: y = x * inv * w.
+    let mut p = 0;
+    while p < n4 {
+        let xv = vld1q_f32(xp.add(p));
+        let wv = vld1q_f32(wp.add(p));
+        vst1q_f32(yp.add(p), vmulq_f32(vmulq_f32(xv, inv_b), wv));
+        p += 4;
+    }
+    while p < d {
+        *yp.add(p) = *xp.add(p) * inv * *wp.add(p);
+        p += 1;
+    }
 }
 
 /// Scalar fallback / parity reference for `rmsnorm_f32_row`.
@@ -11253,9 +11407,36 @@ pub fn add_inplace_f32(a: &mut [f32], b: &[f32]) {
         unsafe { add_inplace_f32_avx2(a, b) };
         return;
     }
-
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { add_inplace_f32_neon(a, b) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     for (lhs, rhs) in a.iter_mut().zip(b.iter()) {
         *lhs += *rhs;
+    }
+}
+
+/// AArch64 NEON `a += b` over f32 slices. 4-lane body + scalar tail. Add
+/// is exact in f32, so this is bit-identical to the scalar reference.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn add_inplace_f32_neon(a: &mut [f32], b: &[f32]) {
+    use std::arch::aarch64::*;
+    let n = a.len();
+    let n4 = n & !3;
+    let mut p = 0;
+    while p < n4 {
+        let av = vld1q_f32(a.as_ptr().add(p));
+        let bv = vld1q_f32(b.as_ptr().add(p));
+        vst1q_f32(a.as_mut_ptr().add(p), vaddq_f32(av, bv));
+        p += 4;
+    }
+    while p < n {
+        a[p] += b[p];
+        p += 1;
     }
 }
 
@@ -19057,6 +19238,67 @@ mod tests {
                 |w, x, o, m, k| unsafe { matvec_q8_k_w_f32_a_neon(w, x, o, m, k) },
                 256,
             );
+        }
+
+        // Dense matvecs + forward helpers use `k`/`n = 70` (not a multiple
+        // of the 16-lane tile) so the scalar tail is exercised too.
+        #[test]
+        fn matvec_f32_neon_matches_scalar() {
+            let mut l = Lcg(0x0F32_0001);
+            let (m, k) = (5usize, 70usize);
+            let w: Vec<f32> = (0..m * k).map(|_| l.activation()).collect();
+            let x: Vec<f32> = (0..k).map(|_| l.activation()).collect();
+            let mut os = vec![0f32; m];
+            let mut on = vec![0f32; m];
+            matvec_f32_scalar(&w, &x, &mut os, m, k);
+            unsafe { matvec_f32_neon(&w, &x, &mut on, m, k) };
+            assert_close(&os, &on, "matvec_f32");
+        }
+
+        #[test]
+        fn matvec_bf16_neon_matches_scalar() {
+            let mut l = Lcg(0x0BF1_0001);
+            let (m, k) = (5usize, 70usize);
+            let mut w = vec![0u8; m * k * 2];
+            for pair in w.chunks_exact_mut(2) {
+                // A sane bf16 = top 16 bits of a small f32.
+                let bf = (l.activation().to_bits() >> 16) as u16;
+                pair.copy_from_slice(&bf.to_le_bytes());
+            }
+            let x: Vec<f32> = (0..k).map(|_| l.activation()).collect();
+            let mut os = vec![0f32; m];
+            let mut on = vec![0f32; m];
+            matvec_bf16_w_f32_a_scalar(&w, &x, &mut os, m, k);
+            unsafe { matvec_bf16_w_f32_a_neon(&w, &x, &mut on, m, k) };
+            assert_close(&os, &on, "matvec_bf16");
+        }
+
+        #[test]
+        fn rmsnorm_neon_matches_scalar() {
+            let mut l = Lcg(0x8311_0001);
+            let d = 70usize;
+            let x: Vec<f32> = (0..d).map(|_| l.activation()).collect();
+            let w: Vec<f32> = (0..d).map(|_| l.activation()).collect();
+            let mut ys = vec![0f32; d];
+            let mut yn = vec![0f32; d];
+            rmsnorm_f32_row_scalar(&x, &w, &mut ys, 1e-5);
+            unsafe { rmsnorm_f32_row_neon(&x, &w, &mut yn, 1e-5) };
+            assert_close(&ys, &yn, "rmsnorm");
+        }
+
+        #[test]
+        fn add_inplace_neon_matches_scalar() {
+            let mut l = Lcg(0x0ADD_0001);
+            let n = 70usize;
+            let base: Vec<f32> = (0..n).map(|_| l.activation()).collect();
+            let b: Vec<f32> = (0..n).map(|_| l.activation()).collect();
+            let mut a_s = base.clone();
+            let mut a_n = base.clone();
+            for (lhs, rhs) in a_s.iter_mut().zip(b.iter()) {
+                *lhs += *rhs;
+            }
+            unsafe { add_inplace_f32_neon(&mut a_n, &b) };
+            assert_close(&a_s, &a_n, "add_inplace"); // add is bit-exact
         }
     }
 }
