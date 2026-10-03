@@ -4847,7 +4847,90 @@ pub fn matvec_iq4_xs_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_iq4_xs_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_iq4_xs_w_f32_a_scalar(w_bytes, x, out, m, k);
+}
+
+/// Widen an `int8x16` (16 signed bytes) to four `float32x4` — the signed
+/// twin of [`u8x16_to_f32x4x4`], used by the IQ4 codebook kernels where
+/// the looked-up codebook values are signed i8.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn s8x16_to_f32x4x4(v: std::arch::aarch64::int8x16_t) -> [std::arch::aarch64::float32x4_t; 4] {
+    use std::arch::aarch64::*;
+    let lo16 = vmovl_s8(vget_low_s8(v));
+    let hi16 = vmovl_s8(vget_high_s8(v));
+    [
+        vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16))),
+        vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16))),
+        vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16))),
+        vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16))),
+    ]
+}
+
+/// AArch64 NEON IQ4_XS matvec. The 4-bit codes index the signed `i8`
+/// codebook [`KVALUES_IQ4XS`] — a `vqtbl1q_s8` 16-way table lookup (the
+/// ARM analogue of the AVX2 PSHUFB path). 8 sub-blocks of 32 weights, each
+/// with a 6-bit signed sub-scale (`lo4` from `scales_l`, `hi2` from
+/// `scales_h`, bias 32). Low nibbles → outputs 0..15, high → 16..31. NEON
+/// baseline; same tolerance contract as the AVX2 path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_iq4_xs_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 136;
+    const QK_K: usize = 256;
+    let blocks_per_row = k / QK_K;
+    let codebook = vld1q_s8(KVALUES_IQ4XS.as_ptr());
+    let mask_lo = vdupq_n_u8(0x0F);
+    for i in 0..m {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let d = f16::from_le_bytes([w_bytes[off], w_bytes[off + 1]]).to_f32();
+            let scales_h = u16::from_le_bytes([w_bytes[off + 2], w_bytes[off + 3]]);
+            let scales_l = &w_bytes[off + 4..off + 8];
+            let qs = w_bytes.as_ptr().add(off + 8);
+            let xb = x.as_ptr().add(b * QK_K);
+            for ib in 0..8 {
+                let lo_nibble = if ib % 2 == 0 {
+                    scales_l[ib / 2] & 0x0F
+                } else {
+                    scales_l[ib / 2] >> 4
+                };
+                let hi_bits = ((scales_h >> (2 * ib)) & 0x03) as u8;
+                let ls = ((lo_nibble | (hi_bits << 4)) as i8 - 32) as f32;
+                let sdv = vdupq_n_f32(d * ls);
+                let qb16 = vld1q_u8(qs.add(ib * 16));
+                // vqtbl1q_s8 takes a uint8x16 index (0..15 selects a lane).
+                let lo_f = s8x16_to_f32x4x4(vqtbl1q_s8(codebook, vandq_u8(qb16, mask_lo)));
+                let hi_f = s8x16_to_f32x4x4(vqtbl1q_s8(codebook, vshrq_n_u8::<4>(qb16)));
+                let x_off = ib * 32;
+                for c in 0..4 {
+                    let xl = vld1q_f32(xb.add(x_off + c * 4));
+                    let xh = vld1q_f32(xb.add(x_off + 16 + c * 4));
+                    acc[c] = vfmaq_f32(acc[c], vmulq_f32(sdv, lo_f[c]), xl);
+                    acc[c] = vfmaq_f32(acc[c], vmulq_f32(sdv, hi_f[c]), xh);
+                }
+            }
+        }
+        let s = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
+        out[i] = vaddvq_f32(s);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -5162,7 +5245,57 @@ pub fn matvec_iq4_nl_w_f32_a(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_iq4_nl_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_iq4_nl_w_f32_a_scalar(w_bytes, x, out, m, k);
+}
+
+/// AArch64 NEON IQ4_NL matvec. Single per-block f16 scale `d`; each `qs`
+/// byte's low/high nibbles index the signed `i8` codebook
+/// [`KVALUES_IQ4XS`] via `vqtbl1q_s8`. Low nibbles → outputs 0..15, high
+/// → 16..31. NEON baseline; same tolerance contract as the AVX2 path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_iq4_nl_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 18;
+    const QK: usize = 32;
+    let blocks_per_row = k / QK;
+    let codebook = vld1q_s8(KVALUES_IQ4XS.as_ptr());
+    let mask_lo = vdupq_n_u8(0x0F);
+    for i in 0..m {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let dv = vdupq_n_f32(f16::from_le_bytes([w_bytes[off], w_bytes[off + 1]]).to_f32());
+            let qb16 = vld1q_u8(w_bytes.as_ptr().add(off + 2));
+            // vqtbl1q_s8 takes a uint8x16 index (0..15 selects a lane).
+            let lo_f = s8x16_to_f32x4x4(vqtbl1q_s8(codebook, vandq_u8(qb16, mask_lo)));
+            let hi_f = s8x16_to_f32x4x4(vqtbl1q_s8(codebook, vshrq_n_u8::<4>(qb16)));
+            let xlo = x.as_ptr().add(b * QK);
+            let xhi = xlo.add(16);
+            for c in 0..4 {
+                let xl = vld1q_f32(xlo.add(c * 4));
+                let xh = vld1q_f32(xhi.add(c * 4));
+                acc[c] = vfmaq_f32(acc[c], vmulq_f32(dv, lo_f[c]), xl);
+                acc[c] = vfmaq_f32(acc[c], vmulq_f32(dv, hi_f[c]), xh);
+            }
+        }
+        let s = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
+        out[i] = vaddvq_f32(s);
+    }
 }
 
 fn matvec_iq4_nl_w_f32_a_scalar(
@@ -19299,6 +19432,46 @@ mod tests {
             }
             unsafe { add_inplace_f32_neon(&mut a_n, &b) };
             assert_close(&a_s, &a_n, "add_inplace"); // add is bit-exact
+        }
+
+        #[test]
+        fn iq4_nl_neon_matches_scalar() {
+            // IQ4_NL block: d(f16) + qs[16].
+            run_block_quant::<18>(
+                "iq4_nl",
+                5,
+                128,
+                0x4949_1010,
+                |l, blk| {
+                    blk[0..2].copy_from_slice(&l.f16_le(0.05, 0.001));
+                    for q in &mut blk[2..18] {
+                        *q = l.byte();
+                    }
+                },
+                |w, x, o, m, k| matvec_iq4_nl_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_iq4_nl_w_f32_a_neon(w, x, o, m, k) },
+                32,
+            );
+        }
+
+        #[test]
+        fn iq4_xs_neon_matches_scalar() {
+            // IQ4_XS super-block: d(f16) + scales_h(u16) + scales_l[4] + qs[128].
+            run_block_quant::<136>(
+                "iq4_xs",
+                4,
+                512,
+                0x4958_2020,
+                |l, blk| {
+                    blk[0..2].copy_from_slice(&l.f16_le(0.02, 0.001));
+                    for s in &mut blk[2..136] {
+                        *s = l.byte();
+                    }
+                },
+                |w, x, o, m, k| matvec_iq4_xs_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_iq4_xs_w_f32_a_neon(w, x, o, m, k) },
+                256,
+            );
         }
     }
 }
