@@ -1334,6 +1334,50 @@ fn cu_tc_gemm_probe(
     }
 }
 
+/// E4M3 byte -> f32 (reuse the CPU kernel's decoder).
+fn ck_e4m3(b: u8) -> f32 {
+    k::nvfp4::e4m3_to_f32(b)
+}
+
+/// 2:4 magnitude-pruned DENSE reference: out[n*M+m] = sum over each 4-group of
+/// K of the 2 largest-|.| E4M3 weights dotted with x. Mirrors the sparse
+/// kernel's prune + compute (minus the kernel's activation E4M3 round-trip), so
+/// the probe isolates the mma.sp fragment/metadata layout. `w` row-major E4M3.
+fn sp24_ref(w: &[u8], x: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let mut out = vec![0f32; n * m];
+    for ni in 0..n {
+        for mi in 0..m {
+            let mut acc = 0f32;
+            let mut kk = 0;
+            while kk < k {
+                let mags = [
+                    ck_e4m3(w[mi * k + kk]).abs(),
+                    ck_e4m3(w[mi * k + kk + 1]).abs(),
+                    ck_e4m3(w[mi * k + kk + 2]).abs(),
+                    ck_e4m3(w[mi * k + kk + 3]).abs(),
+                ];
+                let mut i0 = 0;
+                for t in 1..4 {
+                    if mags[t] > mags[i0] {
+                        i0 = t;
+                    }
+                }
+                let mut i1 = usize::MAX;
+                for t in 0..4 {
+                    if t != i0 && (i1 == usize::MAX || mags[t] > mags[i1]) {
+                        i1 = t;
+                    }
+                }
+                acc += ck_e4m3(w[mi * k + kk + i0]) * x[ni * k + kk + i0];
+                acc += ck_e4m3(w[mi * k + kk + i1]) * x[ni * k + kk + i1];
+                kk += 4;
+            }
+            out[ni * m + mi] = acc;
+        }
+    }
+    out
+}
+
 // ---- CPU references for the forward-pass kernels ----
 
 fn ref_rope(qk: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, inv_freq: &[f32]) {
@@ -1545,7 +1589,7 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
     if !ck::blackwell_tc_available(0) {
         for nm in [
             "gemm:nvfp4_tc(W4A4)", "gemm:nvfp4_tc_tma(W4A4)", "gemm:mxfp4_tc(W4A4)",
-            "gemm:mxfp8_tc(W8A8)", "gemm:mxfp6_tc(W6A6)",
+            "gemm:mxfp8_tc(W8A8)", "gemm:mxfp6_tc(W6A6)", "gemm:fp8_sp24(2:4)",
         ] {
             cu_emit(nm, "SKIP", "not-sm12x-blackwell-or-no-tc-build");
             *counts.entry("SKIP").or_default() += 1;
@@ -1572,6 +1616,34 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         cu_tc_gemm_probe(&stream, "gemm:mxfp8_tc(W8A8)", TcGemm::Mxfp8, &wmx8, k::mxfp::matvec_mxfp8_w_f32_a, m, kd, n, &mut counts);
         let wmx6 = gen_quant_bytes(LAYOUTS.iter().find(|l| l.name == "mxfp6").unwrap(), m, kd, 0xBEEF22);
         cu_tc_gemm_probe(&stream, "gemm:mxfp6_tc(W6A6)", TcGemm::Mxfp6, &wmx6, k::mxfp::matvec_mxfp6_w_f32_a, m, kd, n, &mut counts);
+
+        // 2:4 structured-sparse FP8 (Phase 5). Dense E4M3 weight; pruned
+        // on-device. Graded vs the 2:4-pruned dense reference (loose: the GPU
+        // path also E4M3-quantizes the activation). This probe is what reveals
+        // whether the compressed-A / metadata layout is right on the Spark.
+        let wsp: Vec<u8> = gen_x(m * kd, 97).iter().map(|&v| k::nvfp4::f32_to_e4m3(v)).collect();
+        let xsp = gen_x(n * kd, 131);
+        let cpu_sp = sp24_ref(&wsp, &xsp, m, kd, n);
+        if let (Some(wb), Some(xb), Some(mut ob)) = (
+            ck::CudaDeviceBuffer::from_host(&stream, &wsp),
+            cu_upload_f32(&stream, &xsp),
+            ck::CudaDeviceBuffer::alloc(&stream, n * m * 4),
+        ) {
+            // SAFETY: wb (M·K E4M3 bytes), xb (N·K f32), ob (N·M f32) live on stream.
+            let res = unsafe {
+                ck::gemm_fp8_sp24_f32(
+                    &stream, wb.as_ptr(), xb.as_ptr() as *const f32,
+                    ob.as_mut_ptr() as *mut f32, m, n, kd,
+                )
+            };
+            match res {
+                Err(e) => {
+                    cu_emit("gemm:fp8_sp24(2:4)", "KERNEL_ERR", &format!("{e}"));
+                    *counts.entry("KERNEL_ERR").or_default() += 1;
+                }
+                Ok(()) => cu_grade("gemm:fp8_sp24(2:4)", &cu_download_f32(&ob, n * m), &cpu_sp, 0.85, 0.60, &mut counts),
+            }
+        }
     }
 
     // ---- Dense f32 matvec (host-copy reference wrapper) ----

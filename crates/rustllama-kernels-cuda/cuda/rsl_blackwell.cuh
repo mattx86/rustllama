@@ -725,6 +725,143 @@ __global__ void rsl_bw_gemm_nvfp4_tma_kernel(
 #endif
 }
 
+// ===========================================================================
+// Phase 5: 2:4 structured-sparse FP8 tensor-core GEMM (OPT-IN, quality caveat).
+// mma.sp::ordered_metadata.m16n8k64.kind::f8f6f4 (E4M3). Logical K=64 with 2:4
+// sparsity: A compressed to 16x32 (4 regs/thread) + 2-bit metadata; B full
+// 64x8 (4 regs/thread). Confirmed to assemble for sm_120a (toolchain proof
+// variant 8).
+//
+// QUALITY CAVEAT: forcing a dense model into a 2:4 pattern = magnitude-pruning
+// 50% of each 4-group's weights. That is lossless ONLY for a model TRAINED for
+// 2:4; on an arbitrary dense model it SILENTLY degrades output. This path is
+// therefore OPT-IN (default OFF) and intended for sparsity-aware models or
+// accepted-loss scenarios. The on-the-fly magnitude prune here is a convenience
+// for experimentation; production use should prune / fine-tune offline.
+//
+// SPARK-VALIDATE (MORE than the other phases): the compressed-A fragment layout
+// AND the ordered_metadata bit encoding are assumed from the CUTLASS sparse
+// spec and are NOT verifiable without hardware. --cuda-parity on the Spark (vs
+// the 2:4-pruned dense reference) is the arbiter; expect an index fix here.
+// ===========================================================================
+#ifdef RSL_BW_DEVICE_TC
+// 2:4 sparse E4M3 x E4M3 -> f32 (non-block). A compressed (4 regs), B full
+// (4 regs), metadata e (1 reg), sparsity selector 0x0.
+__device__ __forceinline__ void rsl_bw_mma_sp_f8(
+    float d[4], const unsigned a[4], const unsigned b[4], const float c[4], unsigned e) {
+    asm volatile(
+        "mma.sp::ordered_metadata.sync.aligned.m16n8k64.row.col.kind::f8f6f4"
+        ".f32.e4m3.e4m3.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9,%10,%11}, {%12,%13,%14,%15}, %16, 0x0;\n"
+        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]), "r"(b[2]), "r"(b[3]),
+          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]), "r"(e));
+}
+#endif
+
+// Prune one 4-group of E4M3 bytes to 2:4 (keep the 2 largest |decoded|): writes
+// the 2 kept bytes to out[0..2] (in ascending original position) and returns
+// the metadata nibble (bits[1:0]=first kept pos, bits[3:2]=second kept pos).
+__device__ __forceinline__ unsigned rsl_bw_prune24_group(
+    const unsigned char gb[4], unsigned char out[2]) {
+    float mag[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) mag[i] = fabsf(rsl_e4m3_to_f32(gb[i]));
+    int i0 = 0;
+    #pragma unroll
+    for (int i = 1; i < 4; ++i) if (mag[i] > mag[i0]) i0 = i;
+    int i1 = -1;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) if (i != i0 && (i1 < 0 || mag[i] > mag[i1])) i1 = i;
+    if (i1 < i0) { int t = i0; i0 = i1; i1 = t; }
+    out[0] = gb[i0]; out[1] = gb[i1];
+    return (unsigned)(i0 & 3) | ((unsigned)(i1 & 3) << 2);
+}
+
+// 2:4-sparse FP8 GEMM. W dense E4M3 (1 B/elem, row-major, scale 1.0); X f32
+// (quantized to E4M3 per token-row per K-step, scale applied to the partial,
+// so the mma runs with C=0 and we accumulate scale*D). K % 64 == 0.
+__global__ void rsl_bw_gemm_fp8_sp24_kernel(
+    const unsigned char* __restrict__ w, const float* __restrict__ x,
+    float* __restrict__ out, int M, int N, int K) {
+    const int m0 = blockIdx.x * 16, n0 = blockIdx.y * 8, lane = threadIdx.x & 31, g = lane >> 2, q = lane & 3;
+#ifdef RSL_BW_DEVICE_TC
+    __shared__ float xs[8][64];
+    float c[4] = {0, 0, 0, 0};
+    const int rA0 = m0 + g, rA1 = m0 + g + 8;
+    for (int k0 = 0; k0 < K; k0 += 64) {
+        for (int idx = lane; idx < 8 * 64; idx += 32) { int r = idx >> 6, cl = idx & 63, n = n0 + r; xs[r][cl] = (n < N) ? x[(long long)n * K + k0 + cl] : 0.f; }
+        __syncwarp();
+        // Compressed A (16x32 = 16 kept E4M3/thread = 4 regs) + 32-bit metadata.
+        // Thread (g,q) owns rows {g,g+8} and logical cols [q*16,q*16+16) per row
+        // = 4 2:4-groups/row; 4 groups/row x 2 rows = 8 groups -> 16 kept bytes.
+        // SPARK-VALIDATE: (thread -> logical col) map + ordered_metadata order.
+        unsigned a[4] = {0, 0, 0, 0}, e = 0u;
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            int m = (half == 0) ? rA0 : rA1;
+            #pragma unroll
+            for (int grp = 0; grp < 4; ++grp) {
+                int base = q * 16 + grp * 4;
+                unsigned char kept[2] = {0, 0}, gb[4];
+                unsigned md = 0u;
+                if (m < M) {
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) gb[t] = w[(long long)m * K + k0 + base + t];
+                    md = rsl_bw_prune24_group(gb, kept);
+                }
+                int reg = half * 2 + (grp >> 1);
+                int shift = (grp & 1) * 16;
+                a[reg] |= ((unsigned)kept[0] | ((unsigned)kept[1] << 8)) << shift;
+                e |= md << ((half * 4 + grp) * 4);
+            }
+        }
+        // Full B (64x8 = 16 E4M3/thread = 4 regs), cols n=g, logical K
+        // [q*16,q*16+16) matching A. Quantized to E4M3, one scale per row/K-step.
+        float mx = 0.f;
+        #pragma unroll
+        for (int t = 0; t < 64; ++t) mx = fmaxf(mx, fabsf(xs[g][t]));
+        float bs = mx > 0.f ? mx / 448.0f : 1.0f;
+        unsigned b[4] = {0, 0, 0, 0};
+        #pragma unroll
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            unsigned r = 0u;
+            #pragma unroll
+            for (int t = 0; t < 4; ++t) r |= (unsigned)rsl_f32_to_e4m3(xs[g][q * 16 + chunk * 4 + t] / bs) << (8 * t);
+            b[chunk] = r;
+        }
+        float z[4] = {0, 0, 0, 0}, d[4];
+        rsl_bw_mma_sp_f8(d, a, b, z, e);
+        c[0] += bs * d[0]; c[1] += bs * d[1]; c[2] += bs * d[2]; c[3] += bs * d[3];
+        __syncwarp();
+    }
+    RSL_BW_STORE_TILE(c);
+#else
+    // Fallback: 2:4-pruned dense reference (prune each 4-group, dot with x).
+    for (int _rr = 0; _rr < 2; ++_rr) {
+        int m = (_rr == 0) ? (m0 + g) : (m0 + g + 8);
+        if (m >= M) continue;
+        for (int _cc = 0; _cc < 2; ++_cc) {
+            int n = n0 + 2 * q + _cc;
+            if (n >= N) continue;
+            float acc = 0.f;
+            for (int k0 = 0; k0 < K; k0 += 4) {
+                unsigned char gb[4];
+                #pragma unroll
+                for (int t = 0; t < 4; ++t) gb[t] = w[(long long)m * K + k0 + t];
+                unsigned char kp[2];
+                unsigned md = rsl_bw_prune24_group(gb, kp);
+                int i0 = md & 3, i1 = (md >> 2) & 3;
+                acc += rsl_e4m3_to_f32(kp[0]) * x[(long long)n * K + k0 + i0];
+                acc += rsl_e4m3_to_f32(kp[1]) * x[(long long)n * K + k0 + i1];
+            }
+            out[(long long)n * M + m] = acc;
+        }
+    }
+#endif
+}
+
 }  // namespace rslbw
 
 // ---------------------------------------------------------------------------
@@ -767,3 +904,5 @@ RSL_BW_GEMM_LAUNCH_K(rsl_cuda_gemm_mxfp8_tc_f32, rsl_bw_gemm_mxfp8_kernel, 32)
 RSL_BW_GEMM_LAUNCH_K(rsl_cuda_gemm_mxfp6_tc_f32, rsl_bw_gemm_mxfp6_kernel, 32)
 // Phase 4: TMA-staged NVFP4 variant (same contract + K%64 as the plain NVFP4).
 RSL_BW_GEMM_LAUNCH(rsl_cuda_gemm_nvfp4_tc_tma_f32, rsl_bw_gemm_nvfp4_tma_kernel)
+// Phase 5: 2:4 structured-sparse FP8 (dense E4M3 weight, pruned on-device).
+RSL_BW_GEMM_LAUNCH(rsl_cuda_gemm_fp8_sp24_f32, rsl_bw_gemm_fp8_sp24_kernel)

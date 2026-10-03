@@ -486,6 +486,17 @@ extern "C" {
         n: c_int,
         k: c_int,
     ) -> c_int;
+    // Phase 5: 2:4 structured-sparse FP8 GEMM. W = dense E4M3 (1 B/elem),
+    // magnitude-pruned to 2:4 on-device + mma.sp. OPT-IN (quality caveat).
+    fn rsl_cuda_gemm_fp8_sp24_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+    ) -> c_int;
 
     // Hopper (sm_90a) FP8 `wgmma.mma_async` tensor-core GEMM (MXFP8 W8A8,
     // m64n16k32, K % 32 == 0) + a TMA-staged variant. Same (M,N,K)/return
@@ -670,6 +681,34 @@ pub unsafe fn gemm_nvfp4_tc_tma_f32(
 ) -> Result<(), CudaError> {
     let rc =
         rsl_cuda_gemm_nvfp4_tc_tma_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int);
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// Blackwell 2:4 structured-sparse FP8 tensor-core GEMM. `w` is a DENSE E4M3
+/// weight (1 byte/elem, M×K, row-major); the kernel magnitude-prunes each
+/// 4-group to 2:4 and runs `mma.sp`. `K % 64 == 0`.
+///
+/// QUALITY CAVEAT: 2:4 magnitude pruning drops 50% of weights per 4-group — a
+/// no-op only for 2:4-trained models, otherwise a silent accuracy loss. Use
+/// only for sparsity-aware models or accepted-loss scenarios.
+///
+/// # Safety
+/// `w` (M·K E4M3 bytes), `x` (N·K f32), `out` (N·M f32) must be live device
+/// buffers on `stream`.
+pub unsafe fn gemm_fp8_sp24_f32(
+    stream: &CudaStream,
+    w: *const c_void,
+    x: *const f32,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_gemm_fp8_sp24_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int);
     if rc == 0 {
         Ok(())
     } else {
