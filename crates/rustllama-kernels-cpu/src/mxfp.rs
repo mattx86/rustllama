@@ -199,6 +199,13 @@ pub fn matvec_mxfp6_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_mxfp6_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_mxfp6_w_f32_a_scalar(w_bytes, x, out, m, k);
 }
 
@@ -232,6 +239,39 @@ fn matvec_mxfp6_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: us
     }
 }
 
+/// AArch64 NEON MXFP6 matvec (E3M2 + E8M0). The 6-bit code bitstream is
+/// inherently serial to unpack, so — like the x86 paths — decode one block
+/// into a 32-wide scratch (scale pre-folded via the 64-entry E3M2 codebook)
+/// and vectorize only the multiply-accumulate (four 4-lane FMAs × 2 halves).
+/// NEON baseline; same tolerance contract as the AVX2 path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_mxfp6_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
+    use std::arch::aarch64::*;
+    let bpr = k / MXFP6_BLOCK_ELEMS;
+    let cb = e3m2_codebook();
+    let mut vals = [0.0f32; MXFP6_BLOCK_ELEMS];
+    for i in 0..m {
+        let row = i * bpr * MXFP6_BLOCK_BYTES;
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        for b in 0..bpr {
+            let off = row + b * MXFP6_BLOCK_BYTES;
+            let scale = e8m0_to_f32(w_bytes[off + MXFP6_CODE_BYTES]);
+            let codes = &w_bytes[off..off + MXFP6_CODE_BYTES];
+            decode_mxfp6_block(codes, &cb, scale, &mut vals);
+            let xb = x.as_ptr().add(b * MXFP6_BLOCK_ELEMS);
+            let vp = vals.as_ptr();
+            for c in 0..4 {
+                acc[c] = vfmaq_f32(acc[c], vld1q_f32(vp.add(c * 4)), vld1q_f32(xb.add(c * 4)));
+                acc[c] =
+                    vfmaq_f32(acc[c], vld1q_f32(vp.add(16 + c * 4)), vld1q_f32(xb.add(16 + c * 4)));
+            }
+        }
+        let s = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
+        out[i] = vaddvq_f32(s);
+    }
+}
+
 /// MXFP8 weight matvec (E4M3 + E8M0). 33-byte blocks: 32 E4M3 bytes + 1
 /// scale byte. Dispatches to AVX-512 / AVX2 / scalar at runtime
 /// (equivalent up to FMA order; the E4M3 codebook decode is exact).
@@ -254,6 +294,13 @@ pub fn matvec_mxfp8_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { matvec_mxfp8_w_f32_a_neon(w_bytes, x, out, m, k) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     matvec_mxfp8_w_f32_a_scalar(w_bytes, x, out, m, k);
 }
 
@@ -272,6 +319,46 @@ fn matvec_mxfp8_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: us
             }
         }
         out[i] = acc;
+    }
+}
+
+/// AArch64 NEON MXFP8 matvec (E4M3 + E8M0). Each E4M3 byte indexes the
+/// 256-entry codebook; NEON has no gather, so decode the 32 bytes scalar
+/// into a 32-wide scratch, then four 4-lane FMAs × 2 halves with the E8M0
+/// scale folded per lane. NEON baseline; same tolerance contract as AVX2.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn matvec_mxfp8_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
+    use std::arch::aarch64::*;
+    let bpr = k / MXFP8_BLOCK_ELEMS;
+    let cb = e4m3_codebook();
+    for i in 0..m {
+        let row = i * bpr * MXFP8_BLOCK_BYTES;
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        for b in 0..bpr {
+            let off = row + b * MXFP8_BLOCK_BYTES;
+            let sv = vdupq_n_f32(e8m0_to_f32(w_bytes[off + 32]));
+            let xb = x.as_ptr().add(b * MXFP8_BLOCK_ELEMS);
+            let mut vals = [0.0f32; MXFP8_BLOCK_ELEMS];
+            for (j, v) in vals.iter_mut().enumerate() {
+                *v = cb[w_bytes[off + j] as usize];
+            }
+            let vp = vals.as_ptr();
+            for c in 0..4 {
+                acc[c] = vfmaq_f32(
+                    acc[c],
+                    vmulq_f32(sv, vld1q_f32(vp.add(c * 4))),
+                    vld1q_f32(xb.add(c * 4)),
+                );
+                acc[c] = vfmaq_f32(
+                    acc[c],
+                    vmulq_f32(sv, vld1q_f32(vp.add(16 + c * 4))),
+                    vld1q_f32(xb.add(16 + c * 4)),
+                );
+            }
+        }
+        let s = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
+        out[i] = vaddvq_f32(s);
     }
 }
 
@@ -308,7 +395,7 @@ unsafe fn hsum256_ps(v: std::arch::x86_64::__m256) -> f32 {
 /// 64-entry E3M2 (MXFP6) codebook, `code -> f32`. Byte-identical to
 /// `e3m2_to_f32`; materialized once per matvec so the inner loop is a table
 /// lookup instead of a per-element decode (branch + `powi`).
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn e3m2_codebook() -> [f32; 64] {
     let mut cb = [0.0f32; 64];
     for (c, v) in cb.iter_mut().enumerate() {
@@ -320,7 +407,7 @@ fn e3m2_codebook() -> [f32; 64] {
 /// 256-entry E4M3 (MXFP8) codebook, `byte -> f32`. Byte-identical to
 /// `e4m3_to_f32` (NaN in the `0x7F` / `0xFF` slots, which never occur in
 /// valid weight data). Used as the AVX gather LUT.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn e4m3_codebook() -> [f32; 256] {
     let mut cb = [0.0f32; 256];
     for (c, v) in cb.iter_mut().enumerate() {
@@ -422,7 +509,7 @@ unsafe fn matvec_mxfp4_w_f32_a_avx512(w_bytes: &[u8], x: &[f32], out: &mut [f32]
 /// bitstream is inherently serial to unpack, so both SIMD MXFP6 paths share
 /// this scalar decode into a register-width scratch and only vectorize the
 /// subsequent multiply-accumulate.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline]
 fn decode_mxfp6_block(codes: &[u8], cb: &[f32; 64], scale: f32, vals: &mut [f32; MXFP6_BLOCK_ELEMS]) {
     for (j, v) in vals.iter_mut().enumerate() {
@@ -830,6 +917,13 @@ mod tests {
             let mut disp = vec![0f32; m];
             matvec_mxfp6_w_f32_a(&w, &x, &mut disp, m, k);
             assert_close(&disp, &scalar, "mxfp6 dispatch");
+            #[cfg(target_arch = "aarch64")]
+            {
+                let mut o = vec![0f32; m];
+                // SAFETY: NEON baseline on aarch64.
+                unsafe { matvec_mxfp6_w_f32_a_neon(&w, &x, &mut o, m, k) };
+                assert_close(&o, &scalar, "mxfp6 neon");
+            }
             #[cfg(target_arch = "x86_64")]
             {
                 if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -857,6 +951,13 @@ mod tests {
             let mut disp = vec![0f32; m];
             matvec_mxfp8_w_f32_a(&w, &x, &mut disp, m, k);
             assert_close(&disp, &scalar, "mxfp8 dispatch");
+            #[cfg(target_arch = "aarch64")]
+            {
+                let mut o = vec![0f32; m];
+                // SAFETY: NEON baseline on aarch64.
+                unsafe { matvec_mxfp8_w_f32_a_neon(&w, &x, &mut o, m, k) };
+                assert_close(&o, &scalar, "mxfp8 neon");
+            }
             #[cfg(target_arch = "x86_64")]
             {
                 if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
