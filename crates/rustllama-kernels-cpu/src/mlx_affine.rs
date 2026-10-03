@@ -266,10 +266,47 @@ pub fn matvec_mlx_affine_w_f32_a(
     assert_eq!(packed.len(), m * k * bits as usize / 8, "packed len");
 
     // TODO(mlx): Apple-Metal fast path. On Apple Silicon, skip this
-    // scalar decode entirely and route to `mlx-c`'s
-    // `mlx_quantized_matmul` (native Metal `qmv`/`qmm`) — this reference
-    // then serves only as the cross-backend parity oracle.
-    // TODO(mlx): SIMD (AVX2/AVX-512) decode+FMA, mirroring `mxfp`/`nvfp4`.
+    // decode entirely and route to `mlx-c`'s `mlx_quantized_matmul`
+    // (native Metal `qmv`/`qmm`) — the CPU kernels then serve only as the
+    // cross-backend parity oracle.
+    // TODO(mlx): x86 SIMD (AVX2/AVX-512) decode+FMA (the AVX version was
+    // intentionally dropped earlier; NEON is the ARM equivalent below).
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON fast path for the common power-of-two widths (4/8-bit).
+        // The straddling 3/5/6-bit widths — and the rare 2-bit — stay on
+        // the scalar `read_bits_le` unpacker (their codes cross byte/word
+        // boundaries, so the de-interleave is not worth vectorizing).
+        if bits == 4 || bits == 8 {
+            // SAFETY: NEON is baseline on aarch64.
+            unsafe {
+                matvec_mlx_affine_w_f32_a_neon(
+                    packed, scales, biases, group_size, bits, x, out, m, k,
+                );
+            }
+            return;
+        }
+    }
+    matvec_mlx_affine_w_f32_a_scalar(packed, scales, biases, group_size, bits, x, out, m, k);
+}
+
+/// Scalar MLX-affine matvec reference — walks the packed bitstream with
+/// [`read_bits_le`] (byte-exact with MLX for every width 2/3/4/5/6/8) and
+/// folds the per-group affine `scale*q + bias`. The public dispatcher runs
+/// this for every width on x86 and for the straddling widths on aarch64.
+#[allow(clippy::too_many_arguments)]
+fn matvec_mlx_affine_w_f32_a_scalar(
+    packed: &[u8],
+    scales: &[f32],
+    biases: &[f32],
+    group_size: usize,
+    bits: u32,
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    let groups_per_row = k / group_size;
     let row_bits = k * bits as usize; // each row is word-aligned (see docs)
     for i in 0..m {
         let mut acc = 0.0f32;
@@ -286,6 +323,80 @@ pub fn matvec_mlx_affine_w_f32_a(
             }
         }
         out[i] = acc;
+    }
+}
+
+/// AArch64 NEON MLX-affine matvec for the power-of-two widths **4 and 8**
+/// (the common production widths; the dispatcher only reaches this for
+/// `bits ∈ {4, 8}`). Decodes the packed little-endian bitstream a 16-code
+/// chunk at a time to f32, folds the per-group affine `scale*q + bias` with
+/// one `vfmaq`, then `fmla`s against the activations. 4 accumulators, one
+/// horizontal sum per row.
+///
+/// Byte layout per 16-code chunk:
+/// - **8-bit**: 16 contiguous bytes, one code each → widen u8→f32.
+/// - **4-bit**: 8 bytes, two codes each; code `2j` is the low nibble of
+///   byte `j`, code `2j+1` the high nibble (LSB-first stream), so we `vzip`
+///   the low/high nibble lanes back into code order before widening.
+///
+/// `group_size` is a multiple of 32, so a 16-code chunk never crosses a
+/// group boundary — `scale`/`bias` are hoisted per group. Not bit-identical
+/// to the scalar reference (vector summation, affine coef fused) — same
+/// tolerance contract as the x86 SIMD quant kernels.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn matvec_mlx_affine_w_f32_a_neon(
+    packed: &[u8],
+    scales: &[f32],
+    biases: &[f32],
+    group_size: usize,
+    bits: u32,
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    use crate::u8x16_to_f32x4x4;
+    use std::arch::aarch64::*;
+    debug_assert!(bits == 4 || bits == 8);
+    debug_assert_eq!(group_size % 16, 0);
+    let groups_per_row = k / group_size;
+    let row_bytes = k * bits as usize / 8; // byte-aligned row stride
+    let group_bytes = group_size * bits as usize / 8;
+    let mask_lo8 = vdup_n_u8(0x0F);
+    for i in 0..m {
+        let row_pbase = i * row_bytes;
+        let sb_row = i * groups_per_row;
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        for g in 0..groups_per_row {
+            let sv = vdupq_n_f32(scales[sb_row + g]);
+            let bv = vdupq_n_f32(biases[sb_row + g]);
+            let gp = row_pbase + g * group_bytes; // packed byte offset of this group
+            let xg = x.as_ptr().add(g * group_size);
+            let mut c16 = 0usize; // code offset within group
+            while c16 < group_size {
+                let codes: uint8x16_t = if bits == 8 {
+                    vld1q_u8(packed.as_ptr().add(gp + c16))
+                } else {
+                    // 4-bit: 8 bytes → 16 nibbles; code 2j = byte j low
+                    // nibble, 2j+1 = high nibble. `vzip` restores code order.
+                    let b8 = vld1_u8(packed.as_ptr().add(gp + c16 / 2));
+                    let lo8 = vand_u8(b8, mask_lo8);
+                    let hi8 = vshr_n_u8::<4>(b8);
+                    vcombine_u8(vzip1_u8(lo8, hi8), vzip2_u8(lo8, hi8))
+                };
+                let qf = u8x16_to_f32x4x4(codes);
+                for c in 0..4 {
+                    let xv = vld1q_f32(xg.add(c16 + c * 4));
+                    let coef = vfmaq_f32(bv, qf[c], sv); // scale*q + bias
+                    acc[c] = vfmaq_f32(acc[c], coef, xv);
+                }
+                c16 += 16;
+            }
+        }
+        let sum = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
+        out[i] = vaddvq_f32(sum);
     }
 }
 
@@ -751,6 +862,44 @@ mod tests {
             let want = &full[(id as usize) * d..(id as usize + 1) * d];
             let got = &looked[i * d..(i + 1) * d];
             assert_eq!(got, want, "embed row {id}");
+        }
+    }
+
+    /// The aarch64 NEON fast path (bits 4/8) must match the scalar
+    /// reference within the SIMD tolerance on a real `[m, k]` weight.
+    /// Runs only when built for aarch64 (natively or under qemu-user).
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn neon_matches_scalar_pow2_widths() {
+        for &(group_size, bits) in &[(32usize, 4u32), (64, 4), (128, 4), (32, 8), (64, 8)] {
+            let m = 7usize;
+            let k = group_size * 4;
+            let n = m * k;
+            let weights: Vec<f32> = (0..n).map(pseudo_f32).collect();
+            let x: Vec<f32> = (0..k).map(|c| (c as f32) * 0.002 - 0.25).collect();
+            let (packed, scales, biases) = quantize_mlx_affine(&weights, group_size, bits);
+
+            let mut out_scalar = vec![0f32; m];
+            matvec_mlx_affine_w_f32_a_scalar(
+                &packed, &scales, &biases, group_size, bits, &x, &mut out_scalar, m, k,
+            );
+            let mut out_neon = vec![0f32; m];
+            // SAFETY: NEON is baseline on aarch64.
+            unsafe {
+                matvec_mlx_affine_w_f32_a_neon(
+                    &packed, &scales, &biases, group_size, bits, &x, &mut out_neon, m, k,
+                );
+            }
+            for i in 0..m {
+                let abs = (out_scalar[i] - out_neon[i]).abs();
+                let rel = abs / out_scalar[i].abs().max(1e-6);
+                assert!(
+                    abs < 1e-3 || rel < 1e-5,
+                    "gs={group_size} bits={bits} row {i}: scalar={} neon={}",
+                    out_scalar[i],
+                    out_neon[i],
+                );
+            }
         }
     }
 }

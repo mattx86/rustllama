@@ -6908,11 +6908,14 @@ fn matvec_q4_k_w_f32_a_scalar(
     }
 }
 
-/// Widen a `uint8x16` (16 bytes) to four `float32x4` (unsigned).
+/// Widen a `uint8x16` (16 bytes) to four `float32x4` (unsigned). Shared
+/// across this module's NEON quant kernels and the `mlx_affine` submodule.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
-unsafe fn u8x16_to_f32x4x4(v: std::arch::aarch64::uint8x16_t) -> [std::arch::aarch64::float32x4_t; 4] {
+pub(crate) unsafe fn u8x16_to_f32x4x4(
+    v: std::arch::aarch64::uint8x16_t,
+) -> [std::arch::aarch64::float32x4_t; 4] {
     use std::arch::aarch64::*;
     let lo16 = vmovl_u8(vget_low_u8(v));
     let hi16 = vmovl_u8(vget_high_u8(v));
