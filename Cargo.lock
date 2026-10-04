@@ -4195,6 +4195,7 @@ dependencies = [
  "rustllama-hub",
  "rustllama-kernels-cpu",
  "rustllama-kernels-cuda",
+ "rustllama-kernels-mlx",
  "rustllama-kernels-sycl",
  "rustllama-lsp",
  "rustllama-runtime",
