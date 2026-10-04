@@ -772,3 +772,216 @@ kernel void rsl_mlx_matvec_q8_k_packed_f32_kernel(
     acc = simd_sum(acc);
     if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
 }
+
+// Q5_0: 22 bytes / 32 = { f16 d; u32 qh; u8 qs[16] }. 5-bit signed:
+// value = (nibble | 5th_bit<<4) - 16; the 5th bit for weight j is qh bit j
+// (low) / j+16 (high), via the ((qh>>j)<<4)&0x10 trick. K % 32 == 0.
+kernel void rsl_mlx_matvec_q5_0_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K         [[buffer(3)]],
+    constant int &M         [[buffer(4)]],
+    constant int &N         [[buffer(5)]],
+    uint2 tgpos             [[threadgroup_position_in_grid]],
+    uint lane               [[thread_position_in_threadgroup]],
+    uint lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x;
+    const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 32;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 22ul;
+    device const uchar *row = w + (ulong)m * bytes_per_row;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 22ul;
+        const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+        const uint qh = (uint)blk[2] | ((uint)blk[3] << 8) | ((uint)blk[4] << 16) | ((uint)blk[5] << 24);
+        device const uchar *qs = blk + 6;
+        const int x_off = b * 32;
+        for (int j = 0; j < 16; ++j) {
+            const uint xh0 = ((qh >> j) << 4) & 0x10u;
+            const uint xh1 = (qh >> (j + 12)) & 0x10u;
+            const int x0 = (int)((uint)(qs[j] & 0x0F) | xh0) - 16;
+            const int x1 = (int)((uint)(qs[j] >> 4) | xh1) - 16;
+            acc += d * (float)x0 * xc[x_off + j];
+            acc += d * (float)x1 * xc[x_off + j + 16];
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// Q4_1: 20 bytes / 32 = { f16 d; f16 min; u8 qs[16] }. value = d*nibble + min
+// (min carries the offset — no -8 zero-point). K % 32 == 0.
+kernel void rsl_mlx_matvec_q4_1_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K         [[buffer(3)]],
+    constant int &M         [[buffer(4)]],
+    constant int &N         [[buffer(5)]],
+    uint2 tgpos             [[threadgroup_position_in_grid]],
+    uint lane               [[thread_position_in_threadgroup]],
+    uint lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x;
+    const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 32;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 20ul;
+    device const uchar *row = w + (ulong)m * bytes_per_row;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 20ul;
+        const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+        const float mn = (float)as_type<half>((ushort)(blk[2] | ((ushort)blk[3] << 8)));
+        device const uchar *qs = blk + 4;
+        const int x_off = b * 32;
+        for (int j = 0; j < 16; ++j) {
+            const int q0 = (int)(qs[j] & 0x0F);
+            const int q1 = (int)(qs[j] >> 4);
+            acc += (d * (float)q0 + mn) * xc[x_off + j];
+            acc += (d * (float)q1 + mn) * xc[x_off + j + 16];
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// Q5_1: 24 bytes / 32 = { f16 d; f16 min; u32 qh; u8 qs[16] }. value =
+// d*(nibble | 5th_bit<<4) + min; same qh bit-selection as Q5_0. K % 32 == 0.
+kernel void rsl_mlx_matvec_q5_1_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K         [[buffer(3)]],
+    constant int &M         [[buffer(4)]],
+    constant int &N         [[buffer(5)]],
+    uint2 tgpos             [[threadgroup_position_in_grid]],
+    uint lane               [[thread_position_in_threadgroup]],
+    uint lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x;
+    const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 32;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 24ul;
+    device const uchar *row = w + (ulong)m * bytes_per_row;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 24ul;
+        const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+        const float mn = (float)as_type<half>((ushort)(blk[2] | ((ushort)blk[3] << 8)));
+        const uint qh = (uint)blk[4] | ((uint)blk[5] << 8) | ((uint)blk[6] << 16) | ((uint)blk[7] << 24);
+        device const uchar *qs = blk + 8;
+        const int x_off = b * 32;
+        for (int j = 0; j < 16; ++j) {
+            const uint xh0 = ((qh >> j) << 4) & 0x10u;
+            const uint xh1 = (qh >> (j + 12)) & 0x10u;
+            const int q0 = (int)((uint)(qs[j] & 0x0F) | xh0);
+            const int q1 = (int)((uint)(qs[j] >> 4) | xh1);
+            acc += (d * (float)q0 + mn) * xc[x_off + j];
+            acc += (d * (float)q1 + mn) * xc[x_off + j + 16];
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// IQ4 nonlinear 16-entry codebook (ggml kvalues_iq4nl), shared by IQ4_NL + IQ4_XS.
+constant int KVALUES_IQ4[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+       1,   13,  25,  38,  53,  69,  89, 113,
+};
+
+// IQ4_NL: 18 bytes / 32 = { f16 d; u8 qs[16] }. 4-bit index into KVALUES_IQ4;
+// value = d * KVALUES_IQ4[nibble]. K % 32 == 0.
+kernel void rsl_mlx_matvec_iq4_nl_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K         [[buffer(3)]],
+    constant int &M         [[buffer(4)]],
+    constant int &N         [[buffer(5)]],
+    uint2 tgpos             [[threadgroup_position_in_grid]],
+    uint lane               [[thread_position_in_threadgroup]],
+    uint lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x;
+    const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 32;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 18ul;
+    device const uchar *row = w + (ulong)m * bytes_per_row;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 18ul;
+        const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+        device const uchar *qs = blk + 2;
+        const int x_off = b * 32;
+        for (int j = 0; j < 16; ++j) {
+            const int lo = (int)(qs[j] & 0x0F);
+            const int hi = (int)(qs[j] >> 4);
+            acc += d * (float)KVALUES_IQ4[lo] * xc[x_off + j];
+            acc += d * (float)KVALUES_IQ4[hi] * xc[x_off + j + 16];
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// IQ4_XS: 136 bytes / 256 = { f16 d; u16 scales_h; u8 scales_l[4]; u8 qs[128] }.
+// 8 sub-blocks of 32; each 6-bit sub-scale = (scales_l nibble | scales_h 2 bits)
+// - 32; value = d * sub_scale * KVALUES_IQ4[nibble]. K % 256 == 0.
+kernel void rsl_mlx_matvec_iq4_xs_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K         [[buffer(3)]],
+    constant int &M         [[buffer(4)]],
+    constant int &N         [[buffer(5)]],
+    uint2 tgpos             [[threadgroup_position_in_grid]],
+    uint lane               [[thread_position_in_threadgroup]],
+    uint lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x;
+    const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 256;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 136ul;
+    device const uchar *row = w + (ulong)m * bytes_per_row;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 136ul;
+        const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+        const uint scales_h = (uint)(blk[2] | ((ushort)blk[3] << 8));
+        device const uchar *scales_l = blk + 4;
+        device const uchar *qs = blk + 8;
+        const int x_base = b * 256;
+        for (int ib = 0; ib < 8; ++ib) {
+            const uchar lo_nibble = (ib % 2 == 0) ? (scales_l[ib / 2] & 0x0F)
+                                                  : (scales_l[ib / 2] >> 4);
+            const uchar hi_bits = (uchar)((scales_h >> (2 * ib)) & 0x03u);
+            const int ls_i = (int)((uchar)(lo_nibble | (hi_bits << 4))) - 32;
+            const float sub_d = d * (float)ls_i;
+            const int q_off = ib * 16;
+            const int x_off = ib * 32;
+            for (int j = 0; j < 16; ++j) {
+                const uchar q = qs[q_off + j];
+                const int lo = (int)(q & 0x0F);
+                const int hi = (int)(q >> 4);
+                acc += sub_d * (float)KVALUES_IQ4[lo] * xc[x_base + x_off + j];
+                acc += sub_d * (float)KVALUES_IQ4[hi] * xc[x_base + x_off + 16 + j];
+            }
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}

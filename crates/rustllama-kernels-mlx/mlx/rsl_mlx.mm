@@ -666,11 +666,6 @@ extern "C" int rsl_mlx_hadamard_forward(rsl_mlx_stream *s, const float *x,
 // NOTE: the full K-quant family (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K) + Q8_0/Q4_0
 // (and their batched forms) are IMPLEMENTED below (real Metal dispatch), so
 // they are omitted from this inert-stub list.
-RSL_MLX_DEFINE_PACKED(matvec_q5_0_packed_f32)
-RSL_MLX_DEFINE_PACKED(matvec_q4_1_packed_f32)
-RSL_MLX_DEFINE_PACKED(matvec_q5_1_packed_f32)
-RSL_MLX_DEFINE_PACKED(matvec_iq4_nl_packed_f32)
-RSL_MLX_DEFINE_PACKED(matvec_iq4_xs_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_iq2_xxs_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_iq2_xs_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_iq2_s_packed_f32)
@@ -794,6 +789,53 @@ RSL_MLX_KQUANT(matvec_q2_k_packed_f32, "rsl_mlx_matvec_q2_k_packed_f32_kernel")
 RSL_MLX_KQUANT(matvec_q3_k_packed_f32, "rsl_mlx_matvec_q3_k_packed_f32_kernel")
 RSL_MLX_KQUANT(matvec_q8_k_packed_f32, "rsl_mlx_matvec_q8_k_packed_f32_kernel")
 #undef RSL_MLX_KQUANT
+
+// --- Q5_0 / Q4_1 / Q5_1 packed matvec: LIVE. Simple 32-wide blocks (K%32 via
+// mlx_packed_matvec), ported byte-exact from the SYCL refs. The RSL_MLX_SIMPLE32
+// macro is reused by other 32-wide quants (IQ4_NL, MXFP4/6/8) as they land. ---
+#if RSL_MLX_HAVE_METAL
+#define RSL_MLX_SIMPLE32(NAME, KERNEL)                                             \
+    extern "C" int rsl_mlx_##NAME(rsl_mlx_stream *s, const void *w,                \
+        const float *x, float *out, int M, int K)                                 \
+        { return mlx_packed_matvec(s, @KERNEL, w, x, out, M, K, 1); }              \
+    extern "C" int rsl_mlx_##NAME##_batched(rsl_mlx_stream *s, const void *w,      \
+        const float *x, float *out, int M, int K, int N)                          \
+        { return mlx_packed_matvec(s, @KERNEL, w, x, out, M, K, N); }
+#else
+#define RSL_MLX_SIMPLE32(NAME, KERNEL)                                             \
+    extern "C" int rsl_mlx_##NAME(rsl_mlx_stream *s, const void *w,                \
+        const float *x, float *out, int M, int K)                                 \
+        { (void)s;(void)w;(void)x;(void)out;(void)M;(void)K; return -1; }          \
+    extern "C" int rsl_mlx_##NAME##_batched(rsl_mlx_stream *s, const void *w,      \
+        const float *x, float *out, int M, int K, int N)                          \
+        { (void)s;(void)w;(void)x;(void)out;(void)M;(void)K;(void)N; return -1; }
+#endif
+RSL_MLX_SIMPLE32(matvec_q5_0_packed_f32, "rsl_mlx_matvec_q5_0_packed_f32_kernel")
+RSL_MLX_SIMPLE32(matvec_q4_1_packed_f32, "rsl_mlx_matvec_q4_1_packed_f32_kernel")
+RSL_MLX_SIMPLE32(matvec_q5_1_packed_f32, "rsl_mlx_matvec_q5_1_packed_f32_kernel")
+// IQ4_NL is a 32-wide codebook quant → the same simple path; IQ4_XS is 256-wide
+// (below).
+RSL_MLX_SIMPLE32(matvec_iq4_nl_packed_f32, "rsl_mlx_matvec_iq4_nl_packed_f32_kernel")
+
+// IQ4_XS: 256-wide codebook quant — K % 256 guard + shared dispatch.
+extern "C" int rsl_mlx_matvec_iq4_xs_packed_f32(rsl_mlx_stream *s, const void *w,
+    const float *x, float *out, int M, int K) {
+#if RSL_MLX_HAVE_METAL
+    if ((K % 256) != 0) return -1;
+    return mlx_packed_matvec(s, @"rsl_mlx_matvec_iq4_xs_packed_f32_kernel", w, x, out, M, K, 1);
+#else
+    (void)s;(void)w;(void)x;(void)out;(void)M;(void)K; return -1;
+#endif
+}
+extern "C" int rsl_mlx_matvec_iq4_xs_packed_f32_batched(rsl_mlx_stream *s, const void *w,
+    const float *x, float *out, int M, int K, int N) {
+#if RSL_MLX_HAVE_METAL
+    if ((K % 256) != 0) return -1;
+    return mlx_packed_matvec(s, @"rsl_mlx_matvec_iq4_xs_packed_f32_kernel", w, x, out, M, K, N);
+#else
+    (void)s;(void)w;(void)x;(void)out;(void)M;(void)K;(void)N; return -1;
+#endif
+}
 
 // Forward-pass primitives — LIVE (device-resident Metal dispatch).
 extern "C" int rsl_mlx_add_rmsnorm_f32(rsl_mlx_stream *s, float *hidden,
