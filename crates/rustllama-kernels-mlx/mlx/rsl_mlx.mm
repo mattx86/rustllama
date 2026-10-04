@@ -650,13 +650,49 @@ extern "C" int rsl_mlx_memcpy_d2h(rsl_mlx_stream *s, void *dst_host,
 
 #define RSL_MLX_STUB_KERNEL { return -1; }
 
-// PTQ1_0 (Bonsai ternary) + Prism Hadamard.
+// PTQ1_0 (Bonsai ternary, 128-wide) + Prism Hadamard — LIVE.
 extern "C" int rsl_mlx_matvec_ptq1_0_packed_f32(rsl_mlx_stream *s, const void *w,
-    const float *x, float *out, int M, int K) { (void)s;(void)w;(void)x;(void)out;(void)M;(void)K; RSL_MLX_STUB_KERNEL }
+    const float *x, float *out, int M, int K) {
+#if RSL_MLX_HAVE_METAL
+    return mlx_packed_matvec_align(s, @"rsl_mlx_matvec_ptq1_0_packed_f32_kernel", w, x, out, M, K, 1, 128);
+#else
+    (void)s;(void)w;(void)x;(void)out;(void)M;(void)K; return -1;
+#endif
+}
 extern "C" int rsl_mlx_matvec_ptq1_0_packed_f32_batched(rsl_mlx_stream *s, const void *w,
-    const float *x, float *out, int M, int K, int N) { (void)s;(void)w;(void)x;(void)out;(void)M;(void)K;(void)N; RSL_MLX_STUB_KERNEL }
+    const float *x, float *out, int M, int K, int N) {
+#if RSL_MLX_HAVE_METAL
+    return mlx_packed_matvec_align(s, @"rsl_mlx_matvec_ptq1_0_packed_f32_kernel", w, x, out, M, K, N, 128);
+#else
+    (void)s;(void)w;(void)x;(void)out;(void)M;(void)K;(void)N; return -1;
+#endif
+}
 extern "C" int rsl_mlx_hadamard_forward(rsl_mlx_stream *s, const float *x,
-    const float *signs, float *out, int n_elems, int block) { (void)s;(void)x;(void)signs;(void)out;(void)n_elems;(void)block; RSL_MLX_STUB_KERNEL }
+    const float *signs, float *out, int n_elems, int block) {
+#if RSL_MLX_HAVE_METAL
+    if (!s || !x || !signs || !out || n_elems <= 0 || block <= 0) return -1;
+    // block: power of two <= 4096 (the kernel's threadgroup slm) dividing n_elems.
+    if (block > 4096 || (block & (block - 1)) != 0 || (n_elems % block) != 0) return -1;
+    size_t ox = 0, osg = 0, oo = 0;
+    id<MTLBuffer> bx = mlx_resolve(x, &ox);
+    id<MTLBuffer> bsg = mlx_resolve(signs, &osg);
+    id<MTLBuffer> bo = mlx_resolve(out, &oo);
+    if (bx == nil || bsg == nil || bo == nil) { g_rsl_mlx_errors++; return -1; }
+    int ne = n_elems, blk = block;
+    const NSUInteger lws = block < 256 ? (NSUInteger)block : 256;
+    MTLSize grid = MTLSizeMake((NSUInteger)(n_elems / block), 1, 1);
+    MTLSize tpg = MTLSizeMake(lws, 1, 1);
+    return mlx_run(s, @"rsl_mlx_hadamard_forward_kernel", grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bx offset:ox atIndex:0];
+        [enc setBuffer:bsg offset:osg atIndex:1];
+        [enc setBuffer:bo offset:oo atIndex:2];
+        [enc setBytes:&ne length:sizeof(int) atIndex:3];
+        [enc setBytes:&blk length:sizeof(int) atIndex:4];
+    });
+#else
+    (void)s;(void)x;(void)signs;(void)out;(void)n_elems;(void)block; return -1;
+#endif
+}
 
 // Packed-quant matvecs (single + batched). TODO(phase1): one Metal kernel
 // per quant; the on-device dequant math ports byte-exact from the CPU
@@ -681,7 +717,6 @@ RSL_MLX_DEFINE_PACKED(matvec_iq3_xxs_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_iq3_s_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_iq1_s_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_iq1_m_packed_f32)
-RSL_MLX_DEFINE_PACKED(matvec_pq2_0_packed_f32)
 #undef RSL_MLX_DEFINE_PACKED
 
 // --- Q8_0 / Q4_0 packed matvec: LIVE (Metal dispatch via mlx_packed_matvec) ---
@@ -860,6 +895,24 @@ extern "C" int rsl_mlx_matvec_nvfp4_packed_f32_batched(rsl_mlx_stream *s, const 
     const float *x, float *out, int M, int K, int N) {
 #if RSL_MLX_HAVE_METAL
     return mlx_packed_matvec_align(s, @"rsl_mlx_matvec_nvfp4_packed_f32_kernel", w, x, out, M, K, N, 16);
+#else
+    (void)s;(void)w;(void)x;(void)out;(void)M;(void)K;(void)N; return -1;
+#endif
+}
+
+// PQ2_0 (PrismML Bonsai 2-bit): 128-wide super-block, K % 128.
+extern "C" int rsl_mlx_matvec_pq2_0_packed_f32(rsl_mlx_stream *s, const void *w,
+    const float *x, float *out, int M, int K) {
+#if RSL_MLX_HAVE_METAL
+    return mlx_packed_matvec_align(s, @"rsl_mlx_matvec_pq2_0_packed_f32_kernel", w, x, out, M, K, 1, 128);
+#else
+    (void)s;(void)w;(void)x;(void)out;(void)M;(void)K; return -1;
+#endif
+}
+extern "C" int rsl_mlx_matvec_pq2_0_packed_f32_batched(rsl_mlx_stream *s, const void *w,
+    const float *x, float *out, int M, int K, int N) {
+#if RSL_MLX_HAVE_METAL
+    return mlx_packed_matvec_align(s, @"rsl_mlx_matvec_pq2_0_packed_f32_kernel", w, x, out, M, K, N, 128);
 #else
     (void)s;(void)w;(void)x;(void)out;(void)M;(void)K;(void)N; return -1;
 #endif

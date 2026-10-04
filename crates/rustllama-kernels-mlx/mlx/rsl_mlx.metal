@@ -1173,3 +1173,147 @@ kernel void rsl_mlx_matvec_nvfp4_packed_f32_kernel(
     acc = simd_sum(acc);
     if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
 }
+
+// PQ2_0 (PrismML Bonsai): 34 bytes / 128 = { f16 d; u8 qs[32] }. 2-bit code
+// read low-to-high per byte; value = d * (code - 1). K % 128 == 0.
+kernel void rsl_mlx_matvec_pq2_0_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K         [[buffer(3)]],
+    constant int &M         [[buffer(4)]],
+    constant int &N         [[buffer(5)]],
+    uint2 tgpos             [[threadgroup_position_in_grid]],
+    uint lane               [[thread_position_in_threadgroup]],
+    uint lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x;
+    const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 128;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 34ul;
+    device const uchar *row = w + (ulong)m * bytes_per_row;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 34ul;
+        const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+        device const uchar *qs = blk + 2;
+        const int x_off = b * 128;
+        float sum = 0.0f;
+        for (int j = 0; j < 128; ++j) {
+            const int qv = (int)((qs[j / 4] >> ((j % 4) * 2)) & 0x3) - 1;
+            sum += (float)qv * xc[x_off + j];
+        }
+        acc += d * sum;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// PTQ1_0 (PrismML Bonsai ternary): 28 bytes / 128 = { u8 qs[24]; u8 qh[2];
+// f16 d }. Trits recovered base-3: trit = ((u8)(code * 3^n) * 3 >> 8) - 1.
+// qs[0..16]x5 digits -> e0..80, qs[16..24]x5 -> e80..120, qh[2]x4 -> e120..128.
+// K % 128 == 0.
+kernel void rsl_mlx_matvec_ptq1_0_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K         [[buffer(3)]],
+    constant int &M         [[buffer(4)]],
+    constant int &N         [[buffer(5)]],
+    uint2 tgpos             [[threadgroup_position_in_grid]],
+    uint lane               [[thread_position_in_threadgroup]],
+    uint lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x;
+    const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const uchar pow3[5] = {1, 3, 9, 27, 81};
+    const int blocks_per_row = K / 128;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 28ul;
+    device const uchar *row = w + (ulong)m * bytes_per_row;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 28ul;
+        device const uchar *qs = blk;
+        device const uchar *qh = blk + 24;
+        const float d = (float)as_type<half>((ushort)(blk[26] | ((ushort)blk[27] << 8)));
+        const int x_base = b * 128;
+        float sum = 0.0f;
+        for (int n = 0; n < 5; ++n) {
+            const uchar p3 = pow3[n];
+            const int e0 = x_base + n * 16;
+            for (int mm = 0; mm < 16; ++mm) {
+                const uchar qv = (uchar)(qs[mm] * p3);
+                const int trit = (((int)qv * 3) >> 8) - 1;
+                sum += (float)trit * xc[e0 + mm];
+            }
+        }
+        for (int n = 0; n < 5; ++n) {
+            const uchar p3 = pow3[n];
+            const int e0 = x_base + 80 + n * 8;
+            for (int mm = 0; mm < 8; ++mm) {
+                const uchar qv = (uchar)(qs[16 + mm] * p3);
+                const int trit = (((int)qv * 3) >> 8) - 1;
+                sum += (float)trit * xc[e0 + mm];
+            }
+        }
+        for (int n = 0; n < 4; ++n) {
+            const uchar p3 = pow3[n];
+            const int e0 = x_base + 120 + n * 2;
+            for (int hh = 0; hh < 2; ++hh) {
+                const uchar qv = (uchar)(qh[hh] * p3);
+                const int trit = (((int)qv * 3) >> 8) - 1;
+                sum += (float)trit * xc[e0 + hh];
+            }
+        }
+        acc += d * sum;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// Prism blockwise Hadamard: out = WHT(signs .* x) / sqrt(block), per block-sized
+// span. One threadgroup per block cooperatively does the in-place butterfly in
+// threadgroup memory. `block` is a power of two <= 4096. Ports
+// rsl_hadamard_forward_usm. (Device pointers; forward-pass op, not a matvec.)
+kernel void rsl_mlx_hadamard_forward_kernel(
+    device const float *x     [[buffer(0)]],
+    device const float *signs [[buffer(1)]],
+    device       float *out   [[buffer(2)]],
+    constant int &n_elems     [[buffer(3)]],
+    constant int &block       [[buffer(4)]],
+    uint blk                  [[threadgroup_position_in_grid]],
+    uint tid                  [[thread_position_in_threadgroup]],
+    uint lws                  [[threads_per_threadgroup]])
+{
+    threadgroup float slm[4096];
+    const int per_thread = block / (int)lws;
+    const float inv_sqrt = rsqrt((float)block);
+    const int base = (int)blk * block;
+    for (int i = 0; i < per_thread; ++i) {
+        const int e = (int)tid * per_thread + i;
+        slm[e] = x[base + e] * signs[base + e];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int half = 1; half < block; half <<= 1) {
+        for (int i = 0; i < per_thread; ++i) {
+            const int e = (int)tid * per_thread + i;
+            if (e < block / 2) {
+                const int lo = (e / half) * (half << 1) + (e % half);
+                const int hi = lo + half;
+                const float a = slm[lo];
+                const float bqv = slm[hi];
+                slm[lo] = a + bqv;
+                slm[hi] = a - bqv;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int i = 0; i < per_thread; ++i) {
+        const int e = (int)tid * per_thread + i;
+        out[base + e] = slm[e] * inv_sqrt;
+    }
+}
