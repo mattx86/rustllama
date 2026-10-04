@@ -63,7 +63,7 @@ ENV PATH=/root/.cargo/bin:${PATH}
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1-mesa-dev libegl1-mesa-dev libxkbcommon-dev \
         libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
-        libwayland-dev libxcb1-dev libdbus-1-dev libfontconfig-1-dev libfreetype-dev \
+        libwayland-dev libxcb1-dev libdbus-1-dev libfontconfig-dev libfreetype-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN nvcc --version | tail -2 && rustc --version && cc --version | head -1
