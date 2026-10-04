@@ -55,6 +55,14 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// IQ1/IQ2/IQ3 codebook grids + KSIGNS/KMASK sign tables, generated from the
+// gguf crate's Rust grid sources by build.rs into $OUT/iq_grids_metal.h (on the
+// shader include path via `-I$OUT`). Provides the `constant` arrays
+// IQ1S_GRID_MLX / IQ2XXS_GRID_MLX / IQ2XS_GRID_MLX / IQ2S_GRID_MLX /
+// IQ3XXS_GRID_MLX / IQ3S_GRID_MLX / KSIGNS_IQ2XS_MLX / KMASK_IQ2XS_MLX used by
+// the IQ matvec kernels below. (Only reached on the macOS metal compile.)
+#include "iq_grids_metal.h"
+
 // ---- Dense f32 mat-vec (reference / pattern establisher) --------------
 // out[m] = sum_k W[m*K + k] * x[k]. One threadgroup (32-lane SIMD) per row;
 // each lane strides the K dimension and a simd_sum reduces. This trivial
@@ -1316,4 +1324,349 @@ kernel void rsl_mlx_hadamard_forward_kernel(
         const int e = (int)tid * per_thread + i;
         out[base + e] = slm[e] * inv_sqrt;
     }
+}
+
+// ======================================================================
+// IQ-grid quants (IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S). All 256-wide
+// codebook quants: a grid index selects a `constant` codebook entry (8 packed
+// i8/u8 grid values for IQ2/IQ1, 4 for IQ3) and a sign table flips them. Ported
+// byte-exact from the rsl_matvec_iq*_packed_f32_usm SYCL refs. One 32-lane
+// group per (row,col), simd_sum over blocks. K % 256 == 0.
+// ======================================================================
+
+// IQ2_XXS: 66B/256 = { f16 d; u8 qs[64] }.
+kernel void rsl_mlx_matvec_iq2_xxs_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K [[buffer(3)]], constant int &M [[buffer(4)]], constant int &N [[buffer(5)]],
+    uint2 tgpos [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]], uint lane_count [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x; const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 256;
+    device const uchar *row = w + (ulong)m * (ulong)blocks_per_row * 66ul;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 66ul;
+        const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+        device const uchar *qs = blk + 2;
+        const int x_base = b * 256;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const uint aux0 = (uint)qs[8 * ib32] | ((uint)qs[8 * ib32 + 1] << 8) | ((uint)qs[8 * ib32 + 2] << 16) | ((uint)qs[8 * ib32 + 3] << 24);
+            const uint aux1 = (uint)qs[8 * ib32 + 4] | ((uint)qs[8 * ib32 + 5] << 8) | ((uint)qs[8 * ib32 + 6] << 16) | ((uint)qs[8 * ib32 + 7] << 24);
+            const float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
+            for (int l = 0; l < 4; ++l) {
+                const ulong grid_bits = IQ2XXS_GRID_MLX[(aux0 >> (8 * l)) & 0xFFu];
+                const uchar signs = KSIGNS_IQ2XS_MLX[(aux1 >> (7 * l)) & 127u];
+                const int x_off = x_base + ib32 * 32 + l * 8;
+                for (int j = 0; j < 8; ++j) {
+                    const uchar gi = (uchar)((grid_bits >> (j * 8)) & 0xFFul);
+                    const float s = (signs & KMASK_IQ2XS_MLX[j]) ? -1.0f : 1.0f;
+                    acc += db * (float)gi * s * xc[x_off + j];
+                }
+            }
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// IQ2_XS: 74B/256 = { f16 d; u8 qs[64]; u8 scales[8] }.
+kernel void rsl_mlx_matvec_iq2_xs_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K [[buffer(3)]], constant int &M [[buffer(4)]], constant int &N [[buffer(5)]],
+    uint2 tgpos [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]], uint lane_count [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x; const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 256;
+    device const uchar *row = w + (ulong)m * (ulong)blocks_per_row * 74ul;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 74ul;
+        const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+        device const uchar *qs = blk + 2;
+        device const uchar *scales = blk + 66;
+        const int x_base = b * 256;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const uchar scale_byte = scales[ib32];
+            const float db_lo = d * (0.5f + (float)(scale_byte & 0x0Fu)) * 0.25f;
+            const float db_hi = d * (0.5f + (float)(scale_byte >> 4)) * 0.25f;
+            const int base = 8 * ib32;
+            for (int l = 0; l < 4; ++l) {
+                const uint qv = (uint)qs[base + 2 * l] | ((uint)qs[base + 2 * l + 1] << 8);
+                const ulong grid_bits = IQ2XS_GRID_MLX[qv & 0x1FFu];
+                const uchar signs = KSIGNS_IQ2XS_MLX[qv >> 9];
+                const float db = (l < 2) ? db_lo : db_hi;
+                const int x_off = x_base + ib32 * 32 + l * 8;
+                for (int j = 0; j < 8; ++j) {
+                    const uchar gi = (uchar)((grid_bits >> (j * 8)) & 0xFFul);
+                    const float s = (signs & KMASK_IQ2XS_MLX[j]) ? -1.0f : 1.0f;
+                    acc += db * (float)gi * s * xc[x_off + j];
+                }
+            }
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// IQ2_S: 82B/256 = { f16 d; u8 qs[32]; u8 signs[32]; u8 qh[8]; u8 scales[8] }.
+kernel void rsl_mlx_matvec_iq2_s_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K [[buffer(3)]], constant int &M [[buffer(4)]], constant int &N [[buffer(5)]],
+    uint2 tgpos [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]], uint lane_count [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x; const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 256;
+    device const uchar *row = w + (ulong)m * (ulong)blocks_per_row * 82ul;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 82ul;
+        const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+        device const uchar *qs_lo = blk + 2;
+        device const uchar *signs = blk + 34;
+        device const uchar *qh = blk + 66;
+        device const uchar *scales = blk + 74;
+        const int x_base = b * 256;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const uchar scale_byte = scales[ib32];
+            const float db_lo = d * (0.5f + (float)(scale_byte & 0x0Fu)) * 0.25f;
+            const float db_hi = d * (0.5f + (float)(scale_byte >> 4)) * 0.25f;
+            const int qs_off = ib32 * 4;
+            const uchar qh_byte = qh[ib32];
+            for (int l = 0; l < 4; ++l) {
+                const uint high_bits = ((uint)qh_byte << (8 - 2 * l)) & 0x300u;
+                const ulong grid_bits = IQ2S_GRID_MLX[(uint)qs_lo[qs_off + l] | high_bits];
+                const uchar sign_byte = signs[qs_off + l];
+                const float db = (l < 2) ? db_lo : db_hi;
+                const int x_off = x_base + ib32 * 32 + l * 8;
+                for (int j = 0; j < 8; ++j) {
+                    const uchar gi = (uchar)((grid_bits >> (j * 8)) & 0xFFul);
+                    const float s = (sign_byte & KMASK_IQ2XS_MLX[j]) ? -1.0f : 1.0f;
+                    acc += db * (float)gi * s * xc[x_off + j];
+                }
+            }
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// IQ3_XXS: 98B/256 = { f16 d; u8 qs_grid[64]; u8 qs_sas[32] }. u32 grid = 4 u8.
+kernel void rsl_mlx_matvec_iq3_xxs_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K [[buffer(3)]], constant int &M [[buffer(4)]], constant int &N [[buffer(5)]],
+    uint2 tgpos [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]], uint lane_count [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x; const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 256;
+    device const uchar *row = w + (ulong)m * (ulong)blocks_per_row * 98ul;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 98ul;
+        const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+        device const uchar *qs_grid = blk + 2;
+        device const uchar *qs_sas = blk + 66;
+        const int x_base = b * 256;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const uint aux32 = (uint)qs_sas[4 * ib32] | ((uint)qs_sas[4 * ib32 + 1] << 8) | ((uint)qs_sas[4 * ib32 + 2] << 16) | ((uint)qs_sas[4 * ib32 + 3] << 24);
+            const float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+            const int qs_off = 8 * ib32;
+            for (int l = 0; l < 4; ++l) {
+                const uint grid1 = IQ3XXS_GRID_MLX[qs_grid[qs_off + 2 * l]];
+                const uint grid2 = IQ3XXS_GRID_MLX[qs_grid[qs_off + 2 * l + 1]];
+                const uchar signs = KSIGNS_IQ2XS_MLX[(aux32 >> (7 * l)) & 127u];
+                const int x_off = x_base + ib32 * 32 + l * 8;
+                for (int j = 0; j < 4; ++j) {
+                    const uchar g1 = (uchar)((grid1 >> (j * 8)) & 0xFFu);
+                    const uchar g2 = (uchar)((grid2 >> (j * 8)) & 0xFFu);
+                    const float s_lo = (signs & KMASK_IQ2XS_MLX[j]) ? -1.0f : 1.0f;
+                    const float s_hi = (signs & KMASK_IQ2XS_MLX[j + 4]) ? -1.0f : 1.0f;
+                    acc += db * (float)g1 * s_lo * xc[x_off + j];
+                    acc += db * (float)g2 * s_hi * xc[x_off + j + 4];
+                }
+            }
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// IQ3_S: 110B/256 = { f16 d; u8 qs[64]; u8 qh[8]; u8 signs[32]; u8 scales[4] }.
+kernel void rsl_mlx_matvec_iq3_s_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K [[buffer(3)]], constant int &M [[buffer(4)]], constant int &N [[buffer(5)]],
+    uint2 tgpos [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]], uint lane_count [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x; const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 256;
+    device const uchar *row = w + (ulong)m * (ulong)blocks_per_row * 110ul;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 110ul;
+        const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+        device const uchar *qs = blk + 2;
+        device const uchar *qh = blk + 66;
+        device const uchar *signs = blk + 74;
+        device const uchar *scales = blk + 106;
+        const int x_base = b * 256;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const int pair = ib32 >> 1;
+            const uchar scale_byte = scales[pair];
+            const float db = (ib32 & 1) ? d * (1.0f + 2.0f * (float)(scale_byte >> 4))
+                                        : d * (1.0f + 2.0f * (float)(scale_byte & 0x0Fu));
+            const int qs_off = ib32 * 8;
+            const int signs_off = ib32 * 4;
+            const uchar qh_byte = qh[ib32];
+            for (int l = 0; l < 4; ++l) {
+                const uint g1_idx = (uint)qs[qs_off + 2 * l] | (((uint)qh_byte << (8 - 2 * l)) & 0x100u);
+                const uint g2_idx = (uint)qs[qs_off + 2 * l + 1] | (((uint)qh_byte << (7 - 2 * l)) & 0x100u);
+                const uint grid1 = IQ3S_GRID_MLX[g1_idx];
+                const uint grid2 = IQ3S_GRID_MLX[g2_idx];
+                const uchar sign_byte = signs[signs_off + l];
+                const int x_off = x_base + ib32 * 32 + l * 8;
+                for (int j = 0; j < 4; ++j) {
+                    const uchar g1 = (uchar)((grid1 >> (j * 8)) & 0xFFu);
+                    const uchar g2 = (uchar)((grid2 >> (j * 8)) & 0xFFu);
+                    const float s_lo = (sign_byte & KMASK_IQ2XS_MLX[j]) ? -1.0f : 1.0f;
+                    const float s_hi = (sign_byte & KMASK_IQ2XS_MLX[j + 4]) ? -1.0f : 1.0f;
+                    acc += db * (float)g1 * s_lo * xc[x_off + j];
+                    acc += db * (float)g2 * s_hi * xc[x_off + j + 4];
+                }
+            }
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// IQ1_S: 50B/256 = { f16 d; u8 qs[32]; u8 qh[16] }. SIGNED grid bytes + a
+// per-block +/- delta. IQ1S_DELTA = 0.125.
+kernel void rsl_mlx_matvec_iq1_s_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K [[buffer(3)]], constant int &M [[buffer(4)]], constant int &N [[buffer(5)]],
+    uint2 tgpos [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]], uint lane_count [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x; const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const float IQ1S_DELTA = 0.125f;
+    const int blocks_per_row = K / 256;
+    device const uchar *row = w + (ulong)m * (ulong)blocks_per_row * 50ul;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 50ul;
+        const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+        device const uchar *qs = blk + 2;
+        device const uchar *qh_bytes = blk + 34;
+        const int x_base = b * 256;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const uint qh = (uint)qh_bytes[ib32 * 2] | ((uint)qh_bytes[ib32 * 2 + 1] << 8);
+            const float dl = d * (2.0f * (float)((qh >> 12) & 7u) + 1.0f);
+            const float delta = (qh & 0x8000u) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA);
+            const int x_off = x_base + ib32 * 32;
+            for (int l = 0; l < 4; ++l) {
+                const uint idx = (uint)qs[ib32 * 4 + l] | (((qh >> (3 * l)) & 7u) << 8);
+                const ulong grid_bits = IQ1S_GRID_MLX[idx];
+                for (int j = 0; j < 8; ++j) {
+                    const int gi = (int)((char)((grid_bits >> (j * 8)) & 0xFFul));
+                    acc += dl * ((float)gi + delta) * xc[x_off + l * 8 + j];
+                }
+            }
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// IQ1_M: 56B/256 = { u8 qs[32]; u8 qh[16]; u8 sc[8] }. d packed across sc[].
+kernel void rsl_mlx_matvec_iq1_m_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K [[buffer(3)]], constant int &M [[buffer(4)]], constant int &N [[buffer(5)]],
+    uint2 tgpos [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]], uint lane_count [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x; const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const float IQ1S_DELTA = 0.125f;
+    const int blocks_per_row = K / 256;
+    device const uchar *row = w + (ulong)m * (ulong)blocks_per_row * 56ul;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 56ul;
+        device const uchar *qs = blk;
+        device const uchar *qh = blk + 32;
+        device const uchar *sc_bytes = blk + 48;
+        uint sc[4];
+        for (int ii = 0; ii < 4; ++ii) {
+            sc[ii] = (uint)sc_bytes[ii * 2] | ((uint)sc_bytes[ii * 2 + 1] << 8);
+        }
+        const ushort d_bits = (ushort)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0u) | ((sc[2] >> 4) & 0x0F00u) | (sc[3] & 0xF000u));
+        const float d = (float)as_type<half>(d_bits);
+        const int x_base = b * 256;
+        int x_off = 0;
+        for (int ib = 0; ib < 8; ++ib) {
+            const uint s_word = sc[ib / 2];
+            const int shift0 = 6 * (ib % 2);
+            const int shift1 = shift0 + 3;
+            const float dl1 = d * (2.0f * (float)((s_word >> shift0) & 0x7u) + 1.0f);
+            const float dl2 = d * (2.0f * (float)((s_word >> shift1) & 0x7u) + 1.0f);
+            const uchar qh0 = qh[ib * 2];
+            const uchar qh1 = qh[ib * 2 + 1];
+            const float delta_l[4] = {
+                (qh0 & 0x08u) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA),
+                (qh0 & 0x80u) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA),
+                (qh1 & 0x08u) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA),
+                (qh1 & 0x80u) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA),
+            };
+            const uint idx_l[4] = {
+                (uint)qs[ib * 4 + 0] | (((uint)qh0 & 0x07u) << 8),
+                (uint)qs[ib * 4 + 1] | ((((uint)qh0 >> 4) & 0x07u) << 8),
+                (uint)qs[ib * 4 + 2] | (((uint)qh1 & 0x07u) << 8),
+                (uint)qs[ib * 4 + 3] | ((((uint)qh1 >> 4) & 0x07u) << 8),
+            };
+            const float dl_l[4] = { dl1, dl1, dl2, dl2 };
+            for (int l = 0; l < 4; ++l) {
+                const ulong grid_bits = IQ1S_GRID_MLX[idx_l[l]];
+                const float dl_delta = dl_l[l] * delta_l[l];
+                for (int j = 0; j < 8; ++j) {
+                    const int gi = (int)((char)((grid_bits >> (j * 8)) & 0xFFul));
+                    const float val = dl_l[l] * (float)gi + dl_delta;
+                    acc += val * xc[x_base + x_off + 8 * l + j];
+                }
+            }
+            x_off += 32;
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
 }
