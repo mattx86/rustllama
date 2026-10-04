@@ -37,14 +37,16 @@
 // build_mlx_stub) and device_count()==0 → CPU/SYCL/CUDA.
 //
 // ===================== STILL INERT (-1, Mac-pending) ====================
-// The packed-quant matvec surface is now COMPLETE — every GGUF/MLX quant the
-// loader produces (base + K-quants + IQ4 + IQ1/2/3 grids + MXFP/NVFP + PTQ1_0/
-// PQ2_0) has a live Metal kernel, plus the Prism Hadamard. The only remaining
-// inert entries are the quantized-KV flash-attention variants
-// (q4_0/nvfp4/mxfp*/tq/q8_0): the F32 flash is live; these add on-the-fly K/V
-// dequant in the flash inner loop (reusing the microscaling decode helpers in
-// rsl_mlx.metal) and are the last Mac-pending follow-on. Returning -1 makes the
-// caller fall back to the CPU kernel until then.
+// The Metal compute surface is now COMPLETE — every entry point declared in
+// rsl_mlx.h is implemented: device enumeration + the pointer<->MTLBuffer bridge,
+// the forward-pass primitives (rmsnorm/add_rmsnorm/rope/silu_mul/embedding),
+// FlashAttention F32 (decode+prefill) + ALL quantized-KV variants
+// (q4_0/nvfp4/mxfp4/6/8/q8_0/tq), argmax, the Prism Hadamard, and the full
+// packed-quant matvec set (every GGUF/MLX quant the loader produces: base +
+// K-quants + IQ4 + IQ1/2/3 grids + MXFP/NVFP + PTQ1_0/PQ2_0). Nothing returns
+// the inert -1 anymore. WRITE-BLIND: none of it has been through `xcrun metal`
+// or an Apple GPU — the first Mac build needs a compile pass + the Metal parity
+// harness before any of it is trusted.
 //
 // Keep this file, `rsl_mlx.h`, `rsl_mlx.def`, and the `extern "C"` block in
 // `src/lib.rs` in lock-step.
@@ -363,6 +365,60 @@ static int mlx_packed_matvec(rsl_mlx_stream *s, NSString *kernel_name,
                              const void *w, const float *x, float *out,
                              int M, int K, int N) {
     return mlx_packed_matvec_align(s, kernel_name, w, x, out, M, K, N, 32);
+}
+
+// Shared gates + dispatch for the scale-free quantized-KV flash kernels
+// (q4_0/nvfp4/mxfp4/6/8): F32 q/out, packed byte K/V. `k_align` = the KV block
+// width head_dim must divide (16 for nvfp4, else 32). head_dim <= 256.
+static int mlx_flash_kv_decode(rsl_mlx_stream *s, NSString *name, const float *q,
+                               const void *k, const void *v, float *out,
+                               int n_heads, int n_kv_heads, int head_dim,
+                               int max_ctx, int kv_len, int k_align) {
+    if (!s || !q || !k || !v || !out) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || kv_len <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0 || head_dim > 256 || (head_dim % k_align) != 0) return -1;
+    size_t oq = 0, ok = 0, ov = 0, oo = 0;
+    id<MTLBuffer> bq = mlx_resolve(q, &oq), bk = mlx_resolve(k, &ok), bv = mlx_resolve(v, &ov), bo = mlx_resolve(out, &oo);
+    if (bq == nil || bk == nil || bv == nil || bo == nil) { g_rsl_mlx_errors++; return -1; }
+    int nh = n_heads, nkv = n_kv_heads, hd = head_dim, mc = max_ctx, kl = kv_len;
+    MTLSize grid = MTLSizeMake((NSUInteger)n_heads, 1, 1), tpg = MTLSizeMake(32, 1, 1);
+    return mlx_run(s, name, grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bq offset:oq atIndex:0];
+        [enc setBuffer:bk offset:ok atIndex:1];
+        [enc setBuffer:bv offset:ov atIndex:2];
+        [enc setBuffer:bo offset:oo atIndex:3];
+        [enc setBytes:&nh length:sizeof(int) atIndex:4];
+        [enc setBytes:&nkv length:sizeof(int) atIndex:5];
+        [enc setBytes:&hd length:sizeof(int) atIndex:6];
+        [enc setBytes:&mc length:sizeof(int) atIndex:7];
+        [enc setBytes:&kl length:sizeof(int) atIndex:8];
+    });
+}
+static int mlx_flash_kv_prefill(rsl_mlx_stream *s, NSString *name, const float *q,
+                                const void *k, const void *v, float *out,
+                                int n_heads, int n_kv_heads, int head_dim,
+                                int max_ctx, int kv_len_base, int n_new, int k_align) {
+    if (!s || !q || !k || !v || !out) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0 || head_dim > 256 || (head_dim % k_align) != 0) return -1;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
+    size_t oq = 0, ok = 0, ov = 0, oo = 0;
+    id<MTLBuffer> bq = mlx_resolve(q, &oq), bk = mlx_resolve(k, &ok), bv = mlx_resolve(v, &ov), bo = mlx_resolve(out, &oo);
+    if (bq == nil || bk == nil || bv == nil || bo == nil) { g_rsl_mlx_errors++; return -1; }
+    int nh = n_heads, nkv = n_kv_heads, hd = head_dim, mc = max_ctx, kb = kv_len_base, nn = n_new;
+    MTLSize grid = MTLSizeMake((NSUInteger)n_heads, (NSUInteger)n_new, 1), tpg = MTLSizeMake(32, 1, 1);
+    return mlx_run(s, name, grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bq offset:oq atIndex:0];
+        [enc setBuffer:bk offset:ok atIndex:1];
+        [enc setBuffer:bv offset:ov atIndex:2];
+        [enc setBuffer:bo offset:oo atIndex:3];
+        [enc setBytes:&nh length:sizeof(int) atIndex:4];
+        [enc setBytes:&nkv length:sizeof(int) atIndex:5];
+        [enc setBytes:&hd length:sizeof(int) atIndex:6];
+        [enc setBytes:&mc length:sizeof(int) atIndex:7];
+        [enc setBytes:&kb length:sizeof(int) atIndex:8];
+        [enc setBytes:&nn length:sizeof(int) atIndex:9];
+    });
 }
 #endif  // RSL_MLX_HAVE_METAL
 
@@ -1123,37 +1179,177 @@ extern "C" int rsl_mlx_flash_attn_prefill_f32(rsl_mlx_stream *s, const float *q,
         float *out, int n_heads, int n_kv_heads, int head_dim, int max_ctx,  \
         int kv_len_base, int n_new)                                          \
         { (void)s;(void)q;(void)k_packed;(void)v_packed;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len_base;(void)n_new; RSL_MLX_STUB_KERNEL }
-RSL_MLX_DEFINE_FLASH_KV(q4_0)
-RSL_MLX_DEFINE_FLASH_KV(nvfp4)
-RSL_MLX_DEFINE_FLASH_KV(mxfp4)
-RSL_MLX_DEFINE_FLASH_KV(mxfp6)
-RSL_MLX_DEFINE_FLASH_KV(mxfp8)
-#undef RSL_MLX_DEFINE_FLASH_KV
+// Quantized-KV flash (scale-free formats) — LIVE. Real Metal dispatch via the
+// mlx_flash_kv_{decode,prefill} helpers; KALIGN = the KV block width.
+#if RSL_MLX_HAVE_METAL
+#define RSL_MLX_FLASH_KV(SUFFIX, KALIGN)                                           \
+    extern "C" int rsl_mlx_flash_attn_decode_##SUFFIX(rsl_mlx_stream *s,           \
+        const float *q, const void *k_packed, const void *v_packed, float *out,   \
+        int n_heads, int n_kv_heads, int head_dim, int max_ctx, int kv_len)        \
+        { return mlx_flash_kv_decode(s, @"rsl_mlx_flash_attn_decode_" #SUFFIX "_kernel", \
+            q, k_packed, v_packed, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, KALIGN); } \
+    extern "C" int rsl_mlx_flash_attn_prefill_##SUFFIX(rsl_mlx_stream *s,          \
+        const float *q, const void *k_packed, const void *v_packed, float *out,   \
+        int n_heads, int n_kv_heads, int head_dim, int max_ctx, int kv_len_base, int n_new) \
+        { return mlx_flash_kv_prefill(s, @"rsl_mlx_flash_attn_prefill_" #SUFFIX "_kernel", \
+            q, k_packed, v_packed, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, KALIGN); }
+#else
+#define RSL_MLX_FLASH_KV(SUFFIX, KALIGN)                                           \
+    extern "C" int rsl_mlx_flash_attn_decode_##SUFFIX(rsl_mlx_stream *s,           \
+        const float *q, const void *k_packed, const void *v_packed, float *out,   \
+        int n_heads, int n_kv_heads, int head_dim, int max_ctx, int kv_len)        \
+        { (void)s;(void)q;(void)k_packed;(void)v_packed;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len; return -1; } \
+    extern "C" int rsl_mlx_flash_attn_prefill_##SUFFIX(rsl_mlx_stream *s,          \
+        const float *q, const void *k_packed, const void *v_packed, float *out,   \
+        int n_heads, int n_kv_heads, int head_dim, int max_ctx, int kv_len_base, int n_new) \
+        { (void)s;(void)q;(void)k_packed;(void)v_packed;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len_base;(void)n_new; return -1; }
+#endif
+RSL_MLX_FLASH_KV(q4_0, 32)
+RSL_MLX_FLASH_KV(nvfp4, 16)
+RSL_MLX_FLASH_KV(mxfp4, 32)
+RSL_MLX_FLASH_KV(mxfp6, 32)
+RSL_MLX_FLASH_KV(mxfp8, 32)
+#undef RSL_MLX_FLASH_KV
 
 // TurboQuant KV flash carries per-row f32 scales + a `bits` selector, so it
 // has its own signature (not the macro above).
+// TurboQuant-KV flash — LIVE. 6 device buffers (q/k/v/k_scales/v_scales/out) +
+// `bits` + dims; head_dim a power of two <= 256 (the in-kernel inverse-WHT).
 extern "C" int rsl_mlx_flash_attn_decode_tq(rsl_mlx_stream *s, const float *q,
     const void *k_packed, const void *v_packed, const float *k_scales,
     const float *v_scales, int bits, float *out, int n_heads, int n_kv_heads,
-    int head_dim, int max_ctx, int kv_len)
-    { (void)s;(void)q;(void)k_packed;(void)v_packed;(void)k_scales;(void)v_scales;(void)bits;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len; RSL_MLX_STUB_KERNEL }
+    int head_dim, int max_ctx, int kv_len) {
+#if RSL_MLX_HAVE_METAL
+    if (!s || !q || !k_packed || !v_packed || !k_scales || !v_scales || !out) return -1;
+    if (bits != 1 && bits != 2 && bits != 4 && bits != 8) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || kv_len <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0 || head_dim > 256 || (head_dim & (head_dim - 1)) != 0) return -1;
+    size_t oq=0,ok=0,ov=0,oks=0,ovs=0,oo=0;
+    id<MTLBuffer> bq=mlx_resolve(q,&oq), bk=mlx_resolve(k_packed,&ok), bv=mlx_resolve(v_packed,&ov),
+        bks=mlx_resolve(k_scales,&oks), bvs=mlx_resolve(v_scales,&ovs), bo=mlx_resolve(out,&oo);
+    if(bq==nil||bk==nil||bv==nil||bks==nil||bvs==nil||bo==nil){g_rsl_mlx_errors++;return -1;}
+    int bb=bits,nh=n_heads,nkv=n_kv_heads,hd=head_dim,mc=max_ctx,kl=kv_len;
+    MTLSize grid=MTLSizeMake((NSUInteger)n_heads,1,1), tpg=MTLSizeMake(32,1,1);
+    return mlx_run(s,@"rsl_mlx_flash_attn_decode_tq_kernel",grid,tpg,^(id<MTLComputeCommandEncoder> enc){
+        [enc setBuffer:bq offset:oq atIndex:0];
+        [enc setBuffer:bk offset:ok atIndex:1];
+        [enc setBuffer:bv offset:ov atIndex:2];
+        [enc setBuffer:bks offset:oks atIndex:3];
+        [enc setBuffer:bvs offset:ovs atIndex:4];
+        [enc setBytes:&bb length:sizeof(int) atIndex:5];
+        [enc setBuffer:bo offset:oo atIndex:6];
+        [enc setBytes:&nh length:sizeof(int) atIndex:7];
+        [enc setBytes:&nkv length:sizeof(int) atIndex:8];
+        [enc setBytes:&hd length:sizeof(int) atIndex:9];
+        [enc setBytes:&mc length:sizeof(int) atIndex:10];
+        [enc setBytes:&kl length:sizeof(int) atIndex:11];
+    });
+#else
+    (void)s;(void)q;(void)k_packed;(void)v_packed;(void)k_scales;(void)v_scales;(void)bits;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len; return -1;
+#endif
+}
 extern "C" int rsl_mlx_flash_attn_prefill_tq(rsl_mlx_stream *s, const float *q,
     const void *k_packed, const void *v_packed, const float *k_scales,
     const float *v_scales, int bits, float *out, int n_heads, int n_kv_heads,
-    int head_dim, int max_ctx, int kv_len_base, int n_new)
-    { (void)s;(void)q;(void)k_packed;(void)v_packed;(void)k_scales;(void)v_scales;(void)bits;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len_base;(void)n_new; RSL_MLX_STUB_KERNEL }
+    int head_dim, int max_ctx, int kv_len_base, int n_new) {
+#if RSL_MLX_HAVE_METAL
+    if (!s || !q || !k_packed || !v_packed || !k_scales || !v_scales || !out) return -1;
+    if (bits != 1 && bits != 2 && bits != 4 && bits != 8) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0 || head_dim > 256 || (head_dim & (head_dim - 1)) != 0) return -1;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
+    size_t oq=0,ok=0,ov=0,oks=0,ovs=0,oo=0;
+    id<MTLBuffer> bq=mlx_resolve(q,&oq), bk=mlx_resolve(k_packed,&ok), bv=mlx_resolve(v_packed,&ov),
+        bks=mlx_resolve(k_scales,&oks), bvs=mlx_resolve(v_scales,&ovs), bo=mlx_resolve(out,&oo);
+    if(bq==nil||bk==nil||bv==nil||bks==nil||bvs==nil||bo==nil){g_rsl_mlx_errors++;return -1;}
+    int bb=bits,nh=n_heads,nkv=n_kv_heads,hd=head_dim,mc=max_ctx,kb=kv_len_base,nn=n_new;
+    MTLSize grid=MTLSizeMake((NSUInteger)n_heads,(NSUInteger)n_new,1), tpg=MTLSizeMake(32,1,1);
+    return mlx_run(s,@"rsl_mlx_flash_attn_prefill_tq_kernel",grid,tpg,^(id<MTLComputeCommandEncoder> enc){
+        [enc setBuffer:bq offset:oq atIndex:0];
+        [enc setBuffer:bk offset:ok atIndex:1];
+        [enc setBuffer:bv offset:ov atIndex:2];
+        [enc setBuffer:bks offset:oks atIndex:3];
+        [enc setBuffer:bvs offset:ovs atIndex:4];
+        [enc setBytes:&bb length:sizeof(int) atIndex:5];
+        [enc setBuffer:bo offset:oo atIndex:6];
+        [enc setBytes:&nh length:sizeof(int) atIndex:7];
+        [enc setBytes:&nkv length:sizeof(int) atIndex:8];
+        [enc setBytes:&hd length:sizeof(int) atIndex:9];
+        [enc setBytes:&mc length:sizeof(int) atIndex:10];
+        [enc setBytes:&kb length:sizeof(int) atIndex:11];
+        [enc setBytes:&nn length:sizeof(int) atIndex:12];
+    });
+#else
+    (void)s;(void)q;(void)k_packed;(void)v_packed;(void)k_scales;(void)v_scales;(void)bits;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len_base;(void)n_new; return -1;
+#endif
+}
 
 // Q8_0 KV flash: i8 slab + per-row f32 scale (its own signature too).
+// Q8_0-KV flash — LIVE. i8 slab K/V + per-row f32 scales; 6 device buffers.
 extern "C" int rsl_mlx_flash_attn_decode_q8_0(rsl_mlx_stream *s, const float *q,
     const void *k_packed, const void *v_packed, const float *k_scales,
     const float *v_scales, float *out, int n_heads, int n_kv_heads,
-    int head_dim, int max_ctx, int kv_len)
-    { (void)s;(void)q;(void)k_packed;(void)v_packed;(void)k_scales;(void)v_scales;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len; RSL_MLX_STUB_KERNEL }
+    int head_dim, int max_ctx, int kv_len) {
+#if RSL_MLX_HAVE_METAL
+    if (!s || !q || !k_packed || !v_packed || !k_scales || !v_scales || !out) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || kv_len <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0 || head_dim > 256) return -1;
+    size_t oq=0,ok=0,ov=0,oks=0,ovs=0,oo=0;
+    id<MTLBuffer> bq=mlx_resolve(q,&oq), bk=mlx_resolve(k_packed,&ok), bv=mlx_resolve(v_packed,&ov),
+        bks=mlx_resolve(k_scales,&oks), bvs=mlx_resolve(v_scales,&ovs), bo=mlx_resolve(out,&oo);
+    if(bq==nil||bk==nil||bv==nil||bks==nil||bvs==nil||bo==nil){g_rsl_mlx_errors++;return -1;}
+    int nh=n_heads,nkv=n_kv_heads,hd=head_dim,mc=max_ctx,kl=kv_len;
+    MTLSize grid=MTLSizeMake((NSUInteger)n_heads,1,1), tpg=MTLSizeMake(32,1,1);
+    return mlx_run(s,@"rsl_mlx_flash_attn_decode_q8_0_kernel",grid,tpg,^(id<MTLComputeCommandEncoder> enc){
+        [enc setBuffer:bq offset:oq atIndex:0];
+        [enc setBuffer:bk offset:ok atIndex:1];
+        [enc setBuffer:bv offset:ov atIndex:2];
+        [enc setBuffer:bks offset:oks atIndex:3];
+        [enc setBuffer:bvs offset:ovs atIndex:4];
+        [enc setBuffer:bo offset:oo atIndex:5];
+        [enc setBytes:&nh length:sizeof(int) atIndex:6];
+        [enc setBytes:&nkv length:sizeof(int) atIndex:7];
+        [enc setBytes:&hd length:sizeof(int) atIndex:8];
+        [enc setBytes:&mc length:sizeof(int) atIndex:9];
+        [enc setBytes:&kl length:sizeof(int) atIndex:10];
+    });
+#else
+    (void)s;(void)q;(void)k_packed;(void)v_packed;(void)k_scales;(void)v_scales;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len; return -1;
+#endif
+}
 extern "C" int rsl_mlx_flash_attn_prefill_q8_0(rsl_mlx_stream *s, const float *q,
     const void *k_packed, const void *v_packed, const float *k_scales,
     const float *v_scales, float *out, int n_heads, int n_kv_heads,
-    int head_dim, int max_ctx, int kv_len_base, int n_new)
-    { (void)s;(void)q;(void)k_packed;(void)v_packed;(void)k_scales;(void)v_scales;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len_base;(void)n_new; RSL_MLX_STUB_KERNEL }
+    int head_dim, int max_ctx, int kv_len_base, int n_new) {
+#if RSL_MLX_HAVE_METAL
+    if (!s || !q || !k_packed || !v_packed || !k_scales || !v_scales || !out) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0 || head_dim > 256) return -1;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
+    size_t oq=0,ok=0,ov=0,oks=0,ovs=0,oo=0;
+    id<MTLBuffer> bq=mlx_resolve(q,&oq), bk=mlx_resolve(k_packed,&ok), bv=mlx_resolve(v_packed,&ov),
+        bks=mlx_resolve(k_scales,&oks), bvs=mlx_resolve(v_scales,&ovs), bo=mlx_resolve(out,&oo);
+    if(bq==nil||bk==nil||bv==nil||bks==nil||bvs==nil||bo==nil){g_rsl_mlx_errors++;return -1;}
+    int nh=n_heads,nkv=n_kv_heads,hd=head_dim,mc=max_ctx,kb=kv_len_base,nn=n_new;
+    MTLSize grid=MTLSizeMake((NSUInteger)n_heads,(NSUInteger)n_new,1), tpg=MTLSizeMake(32,1,1);
+    return mlx_run(s,@"rsl_mlx_flash_attn_prefill_q8_0_kernel",grid,tpg,^(id<MTLComputeCommandEncoder> enc){
+        [enc setBuffer:bq offset:oq atIndex:0];
+        [enc setBuffer:bk offset:ok atIndex:1];
+        [enc setBuffer:bv offset:ov atIndex:2];
+        [enc setBuffer:bks offset:oks atIndex:3];
+        [enc setBuffer:bvs offset:ovs atIndex:4];
+        [enc setBuffer:bo offset:oo atIndex:5];
+        [enc setBytes:&nh length:sizeof(int) atIndex:6];
+        [enc setBytes:&nkv length:sizeof(int) atIndex:7];
+        [enc setBytes:&hd length:sizeof(int) atIndex:8];
+        [enc setBytes:&mc length:sizeof(int) atIndex:9];
+        [enc setBytes:&kb length:sizeof(int) atIndex:10];
+        [enc setBytes:&nn length:sizeof(int) atIndex:11];
+    });
+#else
+    (void)s;(void)q;(void)k_packed;(void)v_packed;(void)k_scales;(void)v_scales;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len_base;(void)n_new; return -1;
+#endif
+}
 
 // Sampling — LIVE. Single threadgroup argmax (lowest index on ties).
 extern "C" int rsl_mlx_argmax_f32(rsl_mlx_stream *s, const float *logits,

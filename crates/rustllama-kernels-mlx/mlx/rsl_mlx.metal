@@ -28,14 +28,12 @@
 // MSL-syntax fixes, and every kernel must still pass the Metal parity harness
 // before it is trusted. This mirrors the write-blind CUDA/SYCL-XMX discipline.
 //
-// REMAINING (Mac-pending, still inert -1 in rsl_mlx.mm): the other packed
-// quants (Q5_0/Q4_1/Q5_1/IQ4_NL/IQ4_XS + the grid-table IQ1/IQ2/IQ3 + MXFP/
-// NVFP microscaling + PTQ1_0/PQ2_0 + their batched forms; the IQ-grid/MXFP/NVFP
-// families need codebook/microscaling tables staged by build.rs first), the
-// Prism Hadamard, and the quantized-KV flash variants. They are
-// mechanical specializations of the patterns below (block dequant in the
-// matvec inner loop; on-the-fly K/V dequant in the flash inner loop) and are
-// best filled in with Mac compile + parity feedback.
+// COMPLETE: every kernel rsl_mlx.mm dispatches is now defined here — the full
+// forward pass, F32 + all quantized-KV flash, argmax, the Prism Hadamard, and
+// every packed-quant matvec (base + K-quants + IQ4 + IQ1/2/3 grids + MXFP/NVFP +
+// PTQ1_0/PQ2_0). Each is the on-the-fly block/row dequant woven into the matvec
+// or flash inner loop. All WRITE-BLIND — validate on the Mac via the parity
+// harness before trusting any of it.
 //
 // PARITY DISCIPLINE: every kernel here must be a BYTE-EXACT port of its CPU
 // reference in `rustllama-kernels-cpu` (and match the SYCL/CUDA kernels),
@@ -1669,4 +1667,386 @@ kernel void rsl_mlx_matvec_iq1_m_packed_f32_kernel(
     }
     acc = simd_sum(acc);
     if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// ======================================================================
+// Quantized-KV FlashAttention. The F32 flash (decode/prefill) with each K/V
+// element dequantized on the fly from its packed row — the GQA online-softmax
+// recurrence is identical to the F32 kernels; only the K/V source differs.
+// One 32-lane group per query; lanes stride head_dim; simd_sum for the dot,
+// threadgroup accumulator for V. Ports the rsl_flash_attn_{decode,prefill}_*_usm
+// family. head_dim <= 256; per-format block alignment enforced by the host.
+// ======================================================================
+
+// --- per-element dequant of element `i` from a packed K/V row (scale-free
+// formats: the scale is embedded per block). Mirror the matvec dequant. ---
+inline float rsl_q4_0_kv_elem(device const uchar *p, int i) {
+    device const uchar *blk = p + (ulong)(i / 32) * 18ul;
+    const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+    const int w = i % 32;
+    const int nib = (w < 16) ? (int)(blk[2 + w] & 0x0F) : (int)(blk[2 + w - 16] >> 4);
+    return d * (float)(nib - 8);
+}
+inline float rsl_nvfp4_kv_elem(device const uchar *p, int i) {
+    device const uchar *blk = p + (ulong)(i / 16) * 9ul;
+    const float scale = rsl_e4m3_to_f32(blk[8]);
+    const int w = i % 16;
+    const uchar byte = blk[w / 2];
+    const int nib = (w & 1) ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
+    return E2M1_LUT[nib] * scale;
+}
+inline float rsl_mxfp4_kv_elem(device const uchar *p, int i) {
+    device const uchar *blk = p + (ulong)(i / 32) * 17ul;
+    const float scale = rsl_e8m0_to_f32(blk[16]);
+    const int w = i % 32;
+    const uchar byte = blk[w / 2];
+    const int nib = (w & 1) ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
+    return E2M1_LUT[nib] * scale;
+}
+inline float rsl_mxfp6_kv_elem(device const uchar *p, int i) {
+    device const uchar *blk = p + (ulong)(i / 32) * 25ul;
+    const float scale = rsl_e8m0_to_f32(blk[24]);
+    const int w = i % 32;
+    const int bitpos = w * 6;
+    const int byte_idx = bitpos >> 3;
+    const int bit_off = bitpos & 7;
+    const uint lo = blk[byte_idx];
+    const uint hi = (byte_idx + 1 < 24) ? (uint)blk[byte_idx + 1] : 0u;
+    const uchar code = (uchar)(((lo | (hi << 8)) >> bit_off) & 0x3Fu);
+    return rsl_e3m2_to_f32(code) * scale;
+}
+inline float rsl_mxfp8_kv_elem(device const uchar *p, int i) {
+    device const uchar *blk = p + (ulong)(i / 32) * 33ul;
+    const float scale = rsl_e8m0_to_f32(blk[32]);
+    return rsl_e4m3_to_f32(blk[i % 32]) * scale;
+}
+
+// Generate the decode + prefill kernel pair for a scale-free per-element KV
+// format. BPR(head_dim) = bytes per K/V row; DEQ(ptr,i) dequants element i.
+#define RSL_MLX_FLASH_KV_PAIR(SUFFIX, BPR, DEQ)                                    \
+kernel void rsl_mlx_flash_attn_decode_##SUFFIX##_kernel(                           \
+    device const float *q [[buffer(0)]],                                          \
+    device const uchar *k_packed [[buffer(1)]],                                   \
+    device const uchar *v_packed [[buffer(2)]],                                   \
+    device       float *out [[buffer(3)]],                                        \
+    constant int &n_heads [[buffer(4)]], constant int &n_kv_heads [[buffer(5)]],  \
+    constant int &head_dim [[buffer(6)]], constant int &max_ctx [[buffer(7)]],    \
+    constant int &kv_len [[buffer(8)]],                                           \
+    uint head [[threadgroup_position_in_grid]],                                   \
+    uint lane [[thread_position_in_threadgroup]],                                 \
+    uint lane_count [[threads_per_threadgroup]])                                  \
+{                                                                                 \
+    threadgroup float tg_acc[256];                                                \
+    if ((int)head >= n_heads) return;                                             \
+    const int n_gqa = n_heads / n_kv_heads;                                       \
+    const int kv_h = (int)head / n_gqa;                                           \
+    const int q_base = (int)head * head_dim;                                      \
+    const float scale = 1.0f / sqrt((float)head_dim);                             \
+    const int bpr = (BPR);                                                        \
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count) tg_acc[i] = 0.0f; \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                              \
+    float m = -INFINITY, l = 0.0f;                                                \
+    for (int t = 0; t < kv_len; ++t) {                                            \
+        device const uchar *kp = k_packed + (ulong)(kv_h * max_ctx + t) * bpr;    \
+        float partial = 0.0f;                                                     \
+        for (int i = (int)lane; i < head_dim; i += (int)lane_count)               \
+            partial += q[q_base + i] * DEQ(kp, i);                                \
+        const float s_dot = simd_sum(partial) * scale;                           \
+        const float m_new = fmax(m, s_dot);                                       \
+        const float rescale = isfinite(m) ? exp(m - m_new) : 0.0f;                \
+        const float p = exp(s_dot - m_new);                                       \
+        l = l * rescale + p;                                                      \
+        device const uchar *vp = v_packed + (ulong)(kv_h * max_ctx + t) * bpr;    \
+        for (int i = (int)lane; i < head_dim; i += (int)lane_count)               \
+            tg_acc[i] = tg_acc[i] * rescale + p * DEQ(vp, i);                     \
+        m = m_new;                                                                \
+    }                                                                             \
+    const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;                            \
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count)                   \
+        out[q_base + i] = tg_acc[i] * inv_l;                                      \
+}                                                                                 \
+kernel void rsl_mlx_flash_attn_prefill_##SUFFIX##_kernel(                         \
+    device const float *q [[buffer(0)]],                                          \
+    device const uchar *k_packed [[buffer(1)]],                                   \
+    device const uchar *v_packed [[buffer(2)]],                                   \
+    device       float *out [[buffer(3)]],                                        \
+    constant int &n_heads [[buffer(4)]], constant int &n_kv_heads [[buffer(5)]],  \
+    constant int &head_dim [[buffer(6)]], constant int &max_ctx [[buffer(7)]],    \
+    constant int &kv_len_base [[buffer(8)]], constant int &n_new [[buffer(9)]],   \
+    uint2 tgpos [[threadgroup_position_in_grid]],                                 \
+    uint lane [[thread_position_in_threadgroup]],                                 \
+    uint lane_count [[threads_per_threadgroup]])                                  \
+{                                                                                 \
+    threadgroup float tg_acc[256];                                                \
+    const int hh = (int)tgpos.x;                                                  \
+    const int q_pos = (int)tgpos.y;                                               \
+    if (hh >= n_heads || q_pos >= n_new) return;                                  \
+    const int n_gqa = n_heads / n_kv_heads;                                       \
+    const int kv_h = hh / n_gqa;                                                  \
+    const int q_off = (q_pos * n_heads + hh) * head_dim;                          \
+    const int kv_len_for_q = kv_len_base + q_pos + 1;                             \
+    const float scale = 1.0f / sqrt((float)head_dim);                             \
+    const int bpr = (BPR);                                                        \
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count) tg_acc[i] = 0.0f; \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                              \
+    float m = -INFINITY, l = 0.0f;                                                \
+    for (int t = 0; t < kv_len_for_q; ++t) {                                      \
+        device const uchar *kp = k_packed + (ulong)(kv_h * max_ctx + t) * bpr;    \
+        float partial = 0.0f;                                                     \
+        for (int i = (int)lane; i < head_dim; i += (int)lane_count)               \
+            partial += q[q_off + i] * DEQ(kp, i);                                 \
+        const float s_dot = simd_sum(partial) * scale;                           \
+        const float m_new = fmax(m, s_dot);                                       \
+        const float rescale = isfinite(m) ? exp(m - m_new) : 0.0f;                \
+        const float p = exp(s_dot - m_new);                                       \
+        l = l * rescale + p;                                                      \
+        device const uchar *vp = v_packed + (ulong)(kv_h * max_ctx + t) * bpr;    \
+        for (int i = (int)lane; i < head_dim; i += (int)lane_count)               \
+            tg_acc[i] = tg_acc[i] * rescale + p * DEQ(vp, i);                     \
+        m = m_new;                                                                \
+    }                                                                             \
+    const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;                            \
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count)                   \
+        out[q_off + i] = tg_acc[i] * inv_l;                                       \
+}
+
+RSL_MLX_FLASH_KV_PAIR(q4_0, (head_dim / 32) * 18, rsl_q4_0_kv_elem)
+RSL_MLX_FLASH_KV_PAIR(nvfp4, (head_dim / 16) * 9, rsl_nvfp4_kv_elem)
+RSL_MLX_FLASH_KV_PAIR(mxfp4, (head_dim / 32) * 17, rsl_mxfp4_kv_elem)
+RSL_MLX_FLASH_KV_PAIR(mxfp6, (head_dim / 32) * 25, rsl_mxfp6_kv_elem)
+RSL_MLX_FLASH_KV_PAIR(mxfp8, (head_dim / 32) * 33, rsl_mxfp8_kv_elem)
+#undef RSL_MLX_FLASH_KV_PAIR
+
+// Q8_0-KV: PLAIN i8 slab [n_kv_heads, max_ctx, head_dim] + per-row f32 scales
+// (k_scales/v_scales, indexed kv_h*max_ctx + t). Scale factors out of the dot.
+kernel void rsl_mlx_flash_attn_decode_q8_0_kernel(
+    device const float *q [[buffer(0)]],
+    device const char  *k_slab [[buffer(1)]],
+    device const char  *v_slab [[buffer(2)]],
+    device const float *k_scales [[buffer(3)]],
+    device const float *v_scales [[buffer(4)]],
+    device       float *out [[buffer(5)]],
+    constant int &n_heads [[buffer(6)]], constant int &n_kv_heads [[buffer(7)]],
+    constant int &head_dim [[buffer(8)]], constant int &max_ctx [[buffer(9)]],
+    constant int &kv_len [[buffer(10)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint lane_count [[threads_per_threadgroup]])
+{
+    threadgroup float tg_acc[256];
+    if ((int)head >= n_heads) return;
+    const int n_gqa = n_heads / n_kv_heads;
+    const int kv_h = (int)head / n_gqa;
+    const int q_base = (int)head * head_dim;
+    const float scale = 1.0f / sqrt((float)head_dim);
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count) tg_acc[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m = -INFINITY, l = 0.0f;
+    for (int t = 0; t < kv_len; ++t) {
+        const int ridx = kv_h * max_ctx + t;
+        device const char *kp = k_slab + (ulong)ridx * head_dim;
+        float partial = 0.0f;
+        for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+            partial += q[q_base + i] * (float)((int)kp[i]);
+        const float s_dot = simd_sum(partial) * (k_scales[ridx] * scale);
+        const float m_new = fmax(m, s_dot);
+        const float rescale = isfinite(m) ? exp(m - m_new) : 0.0f;
+        const float p = exp(s_dot - m_new);
+        l = l * rescale + p;
+        device const char *vp = v_slab + (ulong)ridx * head_dim;
+        const float p_eff = p * v_scales[ridx];
+        for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+            tg_acc[i] = tg_acc[i] * rescale + p_eff * (float)((int)vp[i]);
+        m = m_new;
+    }
+    const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+        out[q_base + i] = tg_acc[i] * inv_l;
+}
+kernel void rsl_mlx_flash_attn_prefill_q8_0_kernel(
+    device const float *q [[buffer(0)]],
+    device const char  *k_slab [[buffer(1)]],
+    device const char  *v_slab [[buffer(2)]],
+    device const float *k_scales [[buffer(3)]],
+    device const float *v_scales [[buffer(4)]],
+    device       float *out [[buffer(5)]],
+    constant int &n_heads [[buffer(6)]], constant int &n_kv_heads [[buffer(7)]],
+    constant int &head_dim [[buffer(8)]], constant int &max_ctx [[buffer(9)]],
+    constant int &kv_len_base [[buffer(10)]], constant int &n_new [[buffer(11)]],
+    uint2 tgpos [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint lane_count [[threads_per_threadgroup]])
+{
+    threadgroup float tg_acc[256];
+    const int hh = (int)tgpos.x;
+    const int q_pos = (int)tgpos.y;
+    if (hh >= n_heads || q_pos >= n_new) return;
+    const int n_gqa = n_heads / n_kv_heads;
+    const int kv_h = hh / n_gqa;
+    const int q_off = (q_pos * n_heads + hh) * head_dim;
+    const int kv_len_for_q = kv_len_base + q_pos + 1;
+    const float scale = 1.0f / sqrt((float)head_dim);
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count) tg_acc[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m = -INFINITY, l = 0.0f;
+    for (int t = 0; t < kv_len_for_q; ++t) {
+        const int ridx = kv_h * max_ctx + t;
+        device const char *kp = k_slab + (ulong)ridx * head_dim;
+        float partial = 0.0f;
+        for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+            partial += q[q_off + i] * (float)((int)kp[i]);
+        const float s_dot = simd_sum(partial) * (k_scales[ridx] * scale);
+        const float m_new = fmax(m, s_dot);
+        const float rescale = isfinite(m) ? exp(m - m_new) : 0.0f;
+        const float p = exp(s_dot - m_new);
+        l = l * rescale + p;
+        device const char *vp = v_slab + (ulong)ridx * head_dim;
+        const float p_eff = p * v_scales[ridx];
+        for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+            tg_acc[i] = tg_acc[i] * rescale + p_eff * (float)((int)vp[i]);
+        m = m_new;
+    }
+    const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+        out[q_off + i] = tg_acc[i] * inv_l;
+}
+
+// TurboQuant-KV: bits in {1,2,4,8}, per-row f32 scale, head_dim a power of two.
+// Unlike the other KV formats the row dequant includes an inverse Walsh-Hadamard
+// transform (couples all elements), so the row is materialized + WHT'd in
+// threadgroup memory before the dot. One thread cooperatively fills, the group
+// barries, then lane 0... — here lane-strided fill + a serial WHT by lane 0 to
+// avoid a second cooperative butterfly (head_dim <= 256, kv loop dominates).
+inline void rsl_tq_fill_row(threadgroup float *row, device const uchar *p,
+                            float row_scale, int bits, int head_dim,
+                            uint lane, uint lane_count) {
+    const int max_level = (bits == 1) ? 1 : ((bits == 2) ? 1 : ((bits == 4) ? 7 : 127));
+    const uint mask = (bits == 1) ? 0x1u : ((bits == 2) ? 0x3u : ((bits == 4) ? 0xFu : 0xFFu));
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count) {
+        const int bit_off = i * bits;
+        const int byte_idx = bit_off >> 3;
+        const int bit_in = bit_off & 7;
+        uint cell = (uint)p[byte_idx] >> bit_in;
+        if (bit_in + bits > 8) {
+            cell |= (uint)p[byte_idx + 1] << (bits - (bit_in + bits - 8));
+        }
+        const uint u = cell & mask;
+        const int code = (bits == 1) ? ((u == 0) ? -1 : 1) : ((int)u - max_level);
+        row[i] = (float)code * row_scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Inverse WHT = forward butterfly then *1/N. Serial over lane 0 (the pairs
+    // at each stage are disjoint but span lanes; a serial pass is simplest and
+    // correct — the kv loop, not this, dominates runtime).
+    if (lane == 0) {
+        for (int h = 1; h < head_dim; h <<= 1) {
+            for (int i = 0; i < head_dim; i += (h << 1)) {
+                for (int j = i; j < i + h; ++j) {
+                    const float a = row[j];
+                    const float bqv = row[j + h];
+                    row[j] = a + bqv;
+                    row[j + h] = a - bqv;
+                }
+            }
+        }
+        const float inv_n = 1.0f / (float)head_dim;
+        for (int i = 0; i < head_dim; ++i) row[i] *= inv_n;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+kernel void rsl_mlx_flash_attn_decode_tq_kernel(
+    device const float *q [[buffer(0)]],
+    device const uchar *k_packed [[buffer(1)]],
+    device const uchar *v_packed [[buffer(2)]],
+    device const float *k_scales [[buffer(3)]],
+    device const float *v_scales [[buffer(4)]],
+    constant int &bits [[buffer(5)]],
+    device       float *out [[buffer(6)]],
+    constant int &n_heads [[buffer(7)]], constant int &n_kv_heads [[buffer(8)]],
+    constant int &head_dim [[buffer(9)]], constant int &max_ctx [[buffer(10)]],
+    constant int &kv_len [[buffer(11)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint lane_count [[threads_per_threadgroup]])
+{
+    threadgroup float tg_acc[256];
+    threadgroup float tg_row[256];
+    if ((int)head >= n_heads) return;
+    const int n_gqa = n_heads / n_kv_heads;
+    const int kv_h = (int)head / n_gqa;
+    const int q_base = (int)head * head_dim;
+    const float scale = 1.0f / sqrt((float)head_dim);
+    const int bpr = (head_dim * bits + 7) / 8;
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count) tg_acc[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m = -INFINITY, l = 0.0f;
+    for (int t = 0; t < kv_len; ++t) {
+        const int ridx = kv_h * max_ctx + t;
+        rsl_tq_fill_row(tg_row, k_packed + (ulong)ridx * bpr, k_scales[ridx], bits, head_dim, lane, lane_count);
+        float partial = 0.0f;
+        for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+            partial += q[q_base + i] * tg_row[i];
+        const float s_dot = simd_sum(partial) * scale;
+        const float m_new = fmax(m, s_dot);
+        const float rescale = isfinite(m) ? exp(m - m_new) : 0.0f;
+        const float p = exp(s_dot - m_new);
+        l = l * rescale + p;
+        rsl_tq_fill_row(tg_row, v_packed + (ulong)ridx * bpr, v_scales[ridx], bits, head_dim, lane, lane_count);
+        for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+            tg_acc[i] = tg_acc[i] * rescale + p * tg_row[i];
+        m = m_new;
+    }
+    const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+        out[q_base + i] = tg_acc[i] * inv_l;
+}
+kernel void rsl_mlx_flash_attn_prefill_tq_kernel(
+    device const float *q [[buffer(0)]],
+    device const uchar *k_packed [[buffer(1)]],
+    device const uchar *v_packed [[buffer(2)]],
+    device const float *k_scales [[buffer(3)]],
+    device const float *v_scales [[buffer(4)]],
+    constant int &bits [[buffer(5)]],
+    device       float *out [[buffer(6)]],
+    constant int &n_heads [[buffer(7)]], constant int &n_kv_heads [[buffer(8)]],
+    constant int &head_dim [[buffer(9)]], constant int &max_ctx [[buffer(10)]],
+    constant int &kv_len_base [[buffer(11)]], constant int &n_new [[buffer(12)]],
+    uint2 tgpos [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint lane_count [[threads_per_threadgroup]])
+{
+    threadgroup float tg_acc[256];
+    threadgroup float tg_row[256];
+    const int hh = (int)tgpos.x;
+    const int q_pos = (int)tgpos.y;
+    if (hh >= n_heads || q_pos >= n_new) return;
+    const int n_gqa = n_heads / n_kv_heads;
+    const int kv_h = hh / n_gqa;
+    const int q_off = (q_pos * n_heads + hh) * head_dim;
+    const int kv_len_for_q = kv_len_base + q_pos + 1;
+    const float scale = 1.0f / sqrt((float)head_dim);
+    const int bpr = (head_dim * bits + 7) / 8;
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count) tg_acc[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m = -INFINITY, l = 0.0f;
+    for (int t = 0; t < kv_len_for_q; ++t) {
+        const int ridx = kv_h * max_ctx + t;
+        rsl_tq_fill_row(tg_row, k_packed + (ulong)ridx * bpr, k_scales[ridx], bits, head_dim, lane, lane_count);
+        float partial = 0.0f;
+        for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+            partial += q[q_off + i] * tg_row[i];
+        const float s_dot = simd_sum(partial) * scale;
+        const float m_new = fmax(m, s_dot);
+        const float rescale = isfinite(m) ? exp(m - m_new) : 0.0f;
+        const float p = exp(s_dot - m_new);
+        l = l * rescale + p;
+        rsl_tq_fill_row(tg_row, v_packed + (ulong)ridx * bpr, v_scales[ridx], bits, head_dim, lane, lane_count);
+        for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+            tg_acc[i] = tg_acc[i] * rescale + p * tg_row[i];
+        m = m_new;
+    }
+    const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+        out[q_off + i] = tg_acc[i] * inv_l;
 }
