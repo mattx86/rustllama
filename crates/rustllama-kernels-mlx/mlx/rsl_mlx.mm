@@ -22,7 +22,8 @@
 //   * rsl_mlx_matvec_f32 + rsl_mlx_rmsnorm_f32 — host-pointer reference paths.
 //   * Forward-pass primitives: add_rmsnorm, rope, silu_mul, embedding_lookup.
 //   * FlashAttention F32: GQA online-softmax decode + causal prefill.
-//   * argmax sampling; packed-quant matvec Q8_0 + Q4_0 (single + batched).
+//   * argmax sampling; packed-quant matvec Q8_0 + Q4_0 + Q4_K + Q6_K
+//     (single + batched) — the common dense + K-quant GGUF formats.
 // Each kernel body lives in rsl_mlx.metal (compiled + EMBEDDED by build.rs,
 // loaded via newLibraryWithData:).
 //
@@ -35,7 +36,7 @@
 // build_mlx_stub) and device_count()==0 → CPU/SYCL/CUDA.
 //
 // ===================== STILL INERT (-1, Mac-pending) ====================
-// The remaining packed quants (Q4_K/Q6_K/K-quants/IQ grids/MXFP/NVFP/Q5_0/
+// The remaining packed quants (Q5_K/Q2_K/Q8_K/Q3_K/IQ grids/MXFP/NVFP/Q5_0/
 // Q4_1/Q5_1/PTQ1_0/PQ2_0 + batched), Prism Hadamard, and the quantized-KV
 // flash variants (q4_0/nvfp4/mxfp*/tq/q8_0). Each is a mechanical
 // specialization of a live pattern above (block dequant in the matvec inner
@@ -659,11 +660,9 @@ extern "C" int rsl_mlx_hadamard_forward(rsl_mlx_stream *s, const float *x,
     extern "C" int rsl_mlx_##NAME##_batched(rsl_mlx_stream *s, const void *w, \
         const float *x, float *out, int M, int K, int N)                      \
         { (void)s;(void)w;(void)x;(void)out;(void)M;(void)K;(void)N; RSL_MLX_STUB_KERNEL }
-// NOTE: matvec_q8_0_packed_f32 + matvec_q4_0_packed_f32 (and their batched
-// forms) are IMPLEMENTED below (real Metal dispatch), so they are omitted
-// from this inert-stub list.
-RSL_MLX_DEFINE_PACKED(matvec_q4_k_packed_f32)
-RSL_MLX_DEFINE_PACKED(matvec_q6_k_packed_f32)
+// NOTE: matvec_{q8_0,q4_0,q4_k,q6_k}_packed_f32 (and their batched forms) are
+// IMPLEMENTED below (real Metal dispatch), so they are omitted from this
+// inert-stub list.
 RSL_MLX_DEFINE_PACKED(matvec_q5_k_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_q2_k_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_q8_k_packed_f32)
@@ -720,6 +719,47 @@ extern "C" int rsl_mlx_matvec_q4_0_packed_f32_batched(rsl_mlx_stream *s, const v
     const float *x, float *out, int M, int K, int N) {
 #if RSL_MLX_HAVE_METAL
     return mlx_packed_matvec(s, @"rsl_mlx_matvec_q4_0_packed_f32_kernel", w, x, out, M, K, N);
+#else
+    (void)s;(void)w;(void)x;(void)out;(void)M;(void)K;(void)N; return -1;
+#endif
+}
+
+// --- Q4_K / Q6_K packed matvec: LIVE. K-quant super-blocks (256-wide), so they
+// add a K % 256 guard on top of the shared mlx_packed_matvec dispatch. Ported
+// byte-exact from rsl_matvec_{q4_k,q6_k}_packed_f32_usm (6-bit scale unpack /
+// ql+qh 6-bit layout). ---
+extern "C" int rsl_mlx_matvec_q4_k_packed_f32(rsl_mlx_stream *s, const void *w,
+    const float *x, float *out, int M, int K) {
+#if RSL_MLX_HAVE_METAL
+    if ((K % 256) != 0) return -1;
+    return mlx_packed_matvec(s, @"rsl_mlx_matvec_q4_k_packed_f32_kernel", w, x, out, M, K, 1);
+#else
+    (void)s;(void)w;(void)x;(void)out;(void)M;(void)K; return -1;
+#endif
+}
+extern "C" int rsl_mlx_matvec_q4_k_packed_f32_batched(rsl_mlx_stream *s, const void *w,
+    const float *x, float *out, int M, int K, int N) {
+#if RSL_MLX_HAVE_METAL
+    if ((K % 256) != 0) return -1;
+    return mlx_packed_matvec(s, @"rsl_mlx_matvec_q4_k_packed_f32_kernel", w, x, out, M, K, N);
+#else
+    (void)s;(void)w;(void)x;(void)out;(void)M;(void)K;(void)N; return -1;
+#endif
+}
+extern "C" int rsl_mlx_matvec_q6_k_packed_f32(rsl_mlx_stream *s, const void *w,
+    const float *x, float *out, int M, int K) {
+#if RSL_MLX_HAVE_METAL
+    if ((K % 256) != 0) return -1;
+    return mlx_packed_matvec(s, @"rsl_mlx_matvec_q6_k_packed_f32_kernel", w, x, out, M, K, 1);
+#else
+    (void)s;(void)w;(void)x;(void)out;(void)M;(void)K; return -1;
+#endif
+}
+extern "C" int rsl_mlx_matvec_q6_k_packed_f32_batched(rsl_mlx_stream *s, const void *w,
+    const float *x, float *out, int M, int K, int N) {
+#if RSL_MLX_HAVE_METAL
+    if ((K % 256) != 0) return -1;
+    return mlx_packed_matvec(s, @"rsl_mlx_matvec_q6_k_packed_f32_kernel", w, x, out, M, K, N);
 #else
     (void)s;(void)w;(void)x;(void)out;(void)M;(void)K;(void)N; return -1;
 #endif
