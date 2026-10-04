@@ -12334,7 +12334,13 @@ pub fn rope_inplace_neox(x: &mut [f32], n_heads: usize, head_dim: usize, pos: u3
             return;
         }
     }
-
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { rope_inplace_neox_neon(x, n_heads, head_dim, half, cs) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     rope_inplace_neox_scalar(x, n_heads, head_dim, half, cs);
 }
 
@@ -12399,6 +12405,65 @@ unsafe fn rope_inplace_neox_avx2(
             _mm256_storeu_ps(xp.add(base + i), y0);
             _mm256_storeu_ps(xp.add(base + i + half), y1);
             i += 8;
+        }
+        while i < half {
+            let cos = *cosp.add(i);
+            let sin = *sinp.add(i);
+            let x0 = *xp.add(base + i);
+            let x1 = *xp.add(base + i + half);
+            *xp.add(base + i) = x0 * cos - x1 * sin;
+            *xp.add(base + i + half) = x0 * sin + x1 * cos;
+            i += 1;
+        }
+    }
+}
+
+/// AArch64 NEON NeoX RoPE: 4-lane twin of [`rope_inplace_neox_avx2`]. Same
+/// pre-split cos/sin slabs for contiguous loads, then per head:
+///   y0 = x0*cos - x1*sin  (vfmsq: a - b*c)
+///   y1 = x0*sin + x1*cos  (vfmaq: a + b*c)
+/// over the lower `half` lanes, scalar tail. Bit-exact to scalar up to FMA
+/// rounding (the AVX2 path uses the same fused form).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn rope_inplace_neox_neon(
+    x: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    half: usize,
+    cs: &[f32],
+) {
+    use std::arch::aarch64::*;
+    // Materialize separate cos / sin slabs so the inner loop does contiguous
+    // 4-wide loads (one-time cost amortized across n_heads heads).
+    let mut cos_buf = vec![0f32; half];
+    let mut sin_buf = vec![0f32; half];
+    for i in 0..half {
+        cos_buf[i] = cs[2 * i];
+        sin_buf[i] = cs[2 * i + 1];
+    }
+    let cosp = cos_buf.as_ptr();
+    let sinp = sin_buf.as_ptr();
+
+    let n4 = half & !3;
+    let xp = x.as_mut_ptr();
+    for h in 0..n_heads {
+        let base = h * head_dim;
+        let mut i = 0;
+        while i < n4 {
+            let cos_v = vld1q_f32(cosp.add(i));
+            let sin_v = vld1q_f32(sinp.add(i));
+            let x0 = vld1q_f32(xp.add(base + i));
+            let x1 = vld1q_f32(xp.add(base + i + half));
+            // y0 = x0*cos - x1*sin = (x0*cos) - x1*sin
+            let x0cos = vmulq_f32(x0, cos_v);
+            let y0 = vfmsq_f32(x0cos, x1, sin_v);
+            // y1 = x0*sin + x1*cos = (x0*sin) + x1*cos
+            let x0sin = vmulq_f32(x0, sin_v);
+            let y1 = vfmaq_f32(x0sin, x1, cos_v);
+            vst1q_f32(xp.add(base + i), y0);
+            vst1q_f32(xp.add(base + i + half), y1);
+            i += 4;
         }
         while i < half {
             let cos = *cosp.add(i);
@@ -13129,7 +13194,15 @@ pub fn log_sum_exp_f32(x: &[f32]) -> f32 {
             return unsafe { log_sum_exp_f32_avx2(x) };
         }
     }
-    log_sum_exp_f32_scalar(x)
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { log_sum_exp_f32_neon(x) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        log_sum_exp_f32_scalar(x)
+    }
 }
 
 pub(crate) fn log_sum_exp_f32_scalar(x: &[f32]) -> f32 {
@@ -13239,6 +13312,53 @@ unsafe fn log_sum_exp_f32_avx512f(x: &[f32]) -> f32 {
     max_s + sum_s.ln()
 }
 
+/// AArch64 NEON `log_sum_exp`: 4-lane twin of the AVX2 path. Pass 1 folds a
+/// horizontal max (`vmaxvq_f32`), pass 2 sums `exp(x - max)` via
+/// [`expf_approx_neon`] + `vaddvq_f32`, with a scalar `libm` tail. Byte-layout
+/// irrelevant (pure f32); close-not-bit-identical to scalar (reordered sum +
+/// the ~2e-6 expf approximation), gated by the parity test like the x86 paths.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn log_sum_exp_f32_neon(x: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let n = x.len();
+    let n4 = n & !3;
+    let ptr = x.as_ptr();
+
+    // Pass 1: horizontal max.
+    let mut max_v = vdupq_n_f32(f32::NEG_INFINITY);
+    let mut p = 0;
+    while p < n4 {
+        max_v = vmaxq_f32(max_v, vld1q_f32(ptr.add(p)));
+        p += 4;
+    }
+    let mut max_s = vmaxvq_f32(max_v);
+    while p < n {
+        let v = *ptr.add(p);
+        if v > max_s {
+            max_s = v;
+        }
+        p += 1;
+    }
+
+    // Pass 2: sum of exp(x - max).
+    let max_b = vdupq_n_f32(max_s);
+    let mut sum_v = vdupq_n_f32(0.0);
+    let mut p = 0;
+    while p < n4 {
+        let e = expf_approx_neon(vsubq_f32(vld1q_f32(ptr.add(p)), max_b));
+        sum_v = vaddq_f32(sum_v, e);
+        p += 4;
+    }
+    let mut sum_s = vaddvq_f32(sum_v);
+    while p < n {
+        sum_s += (*ptr.add(p) - max_s).exp();
+        p += 1;
+    }
+
+    max_s + sum_s.ln()
+}
+
 /// Grouped-query attention over a single query token.
 ///
 /// - `q`: `[n_heads, head_dim]` (rotated query for the current position)
@@ -13288,6 +13408,17 @@ pub fn gqa_attention_one_step(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe {
+            gqa_attention_one_step_neon(
+                q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            );
+        }
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     gqa_attention_one_step_scalar(
         q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
     );
@@ -13370,7 +13501,7 @@ unsafe fn gqa_attention_one_step_avx512(
 }
 
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-fn gqa_attention_one_step_scalar(
+pub(crate) fn gqa_attention_one_step_scalar(
     q: &[f32],
     k_cache: &[f32],
     v_cache: &[f32],
@@ -13407,6 +13538,74 @@ fn gqa_attention_one_step_scalar(
             let s = scores[t];
             for d in 0..head_dim {
                 out_h[d] += s * v_row[d];
+            }
+        }
+    }
+}
+
+/// AArch64 NEON twin of [`gqa_attention_one_step_scalar`] (3-pass GQA). The
+/// Q·K dot (`vfmaq_f32` + `vaddvq_f32` horizontal) and the `out += s*v`
+/// weighted-V accumulation are 4-lane; the softmax over `scores` reuses the
+/// dispatched [`softmax_f32_inplace`] (NEON on aarch64). Close-not-bit-identical
+/// to scalar (reordered reductions + expf approx in softmax).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn gqa_attention_one_step_neon(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len: usize,
+) {
+    use std::arch::aarch64::*;
+    let n_gqa = n_heads / n_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let hd4 = head_dim & !3;
+    let mut scores = vec![0.0f32; kv_len];
+    for h in 0..n_heads {
+        let kv_h = h / n_gqa;
+        let qp = q[h * head_dim..(h + 1) * head_dim].as_ptr();
+        for t in 0..kv_len {
+            let k_off = (kv_h * max_ctx + t) * head_dim;
+            let kp = k_cache.as_ptr().add(k_off);
+            let mut acc_v = vdupq_n_f32(0.0);
+            let mut d = 0;
+            while d < hd4 {
+                acc_v = vfmaq_f32(acc_v, vld1q_f32(qp.add(d)), vld1q_f32(kp.add(d)));
+                d += 4;
+            }
+            let mut acc = vaddvq_f32(acc_v);
+            while d < head_dim {
+                acc += *qp.add(d) * *kp.add(d);
+                d += 1;
+            }
+            scores[t] = acc * scale;
+        }
+        softmax_f32_inplace(&mut scores);
+        let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
+        for v in out_h.iter_mut() {
+            *v = 0.0;
+        }
+        let op = out_h.as_mut_ptr();
+        for t in 0..kv_len {
+            let v_off = (kv_h * max_ctx + t) * head_dim;
+            let vp = v_cache.as_ptr().add(v_off);
+            let s_b = vdupq_n_f32(scores[t]);
+            let s = scores[t];
+            let mut d = 0;
+            while d < hd4 {
+                let o = vld1q_f32(op.add(d));
+                vst1q_f32(op.add(d), vfmaq_f32(o, s_b, vld1q_f32(vp.add(d))));
+                d += 4;
+            }
+            while d < head_dim {
+                *op.add(d) += s * *vp.add(d);
+                d += 1;
             }
         }
     }
@@ -13473,6 +13672,17 @@ pub fn gqa_attention_flash_decode(
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe {
+            gqa_attention_flash_decode_neon(
+                q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            );
+        }
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     gqa_attention_flash_decode_scalar(
         q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
     );
@@ -13909,7 +14119,7 @@ unsafe fn gqa_attention_flash_prefill_avx512(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn gqa_attention_flash_decode_scalar(
+pub(crate) fn gqa_attention_flash_decode_scalar(
     q: &[f32],
     k_cache: &[f32],
     v_cache: &[f32],
@@ -13961,6 +14171,92 @@ fn gqa_attention_flash_decode_scalar(
         let inv_l = if l > 0.0 { 1.0 / l } else { 0.0 };
         for v in out_h.iter_mut() {
             *v *= inv_l;
+        }
+    }
+}
+
+/// AArch64 NEON twin of [`gqa_attention_flash_decode_scalar`] (online-softmax
+/// flash decode). Per kv position, the Q·K dot (`vfmaq_f32` + `vaddvq_f32`) and
+/// the `out = out*rescale + p*v` accumulation are 4-lane; the running
+/// max/rescale/`exp`/`l` recurrence stays scalar (`libm` exp) exactly as the
+/// AVX2 path. Close-not-bit-identical to scalar (reordered dot reduction).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn gqa_attention_flash_decode_neon(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len: usize,
+) {
+    use std::arch::aarch64::*;
+    let n_gqa = n_heads / n_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let hd4 = head_dim & !3;
+    for h in 0..n_heads {
+        let kv_h = h / n_gqa;
+        let qp = q[h * head_dim..(h + 1) * head_dim].as_ptr();
+        let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
+        for v in out_h.iter_mut() {
+            *v = 0.0;
+        }
+        let op = out_h.as_mut_ptr();
+        let mut m = f32::NEG_INFINITY;
+        let mut l = 0.0f32;
+        for t in 0..kv_len {
+            let k_off = (kv_h * max_ctx + t) * head_dim;
+            let kp = k_cache.as_ptr().add(k_off);
+            // score = scale * (q · k_row)
+            let mut acc_v = vdupq_n_f32(0.0);
+            let mut d = 0;
+            while d < hd4 {
+                acc_v = vfmaq_f32(acc_v, vld1q_f32(qp.add(d)), vld1q_f32(kp.add(d)));
+                d += 4;
+            }
+            let mut s = vaddvq_f32(acc_v);
+            while d < head_dim {
+                s += *qp.add(d) * *kp.add(d);
+                d += 1;
+            }
+            s *= scale;
+            // Online-softmax update + rescale of the running accumulator.
+            let m_new = m.max(s);
+            let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+            let p = (s - m_new).exp();
+            l = l * rescale + p;
+            let v_off = (kv_h * max_ctx + t) * head_dim;
+            let vp = v_cache.as_ptr().add(v_off);
+            let rescale_b = vdupq_n_f32(rescale);
+            let p_b = vdupq_n_f32(p);
+            let mut d = 0;
+            while d < hd4 {
+                // out = out*rescale + p*v
+                let o = vmulq_f32(vld1q_f32(op.add(d)), rescale_b);
+                vst1q_f32(op.add(d), vfmaq_f32(o, p_b, vld1q_f32(vp.add(d))));
+                d += 4;
+            }
+            while d < head_dim {
+                *op.add(d) = *op.add(d) * rescale + p * *vp.add(d);
+                d += 1;
+            }
+            m = m_new;
+        }
+        // Final normalize.
+        let inv_l = if l > 0.0 { 1.0 / l } else { 0.0 };
+        let inv_b = vdupq_n_f32(inv_l);
+        let mut d = 0;
+        while d < hd4 {
+            vst1q_f32(op.add(d), vmulq_f32(vld1q_f32(op.add(d)), inv_b));
+            d += 4;
+        }
+        while d < head_dim {
+            *op.add(d) *= inv_l;
+            d += 1;
         }
     }
 }
@@ -19999,6 +20295,96 @@ mod tests {
                     "{tag} row {i}: scalar={a} neon={b} abs={abs} rel={rel}"
                 );
             }
+        }
+
+        // ---- Forward-pass NEON ports (log_sum_exp / rope / GQA attention) ----
+
+        #[test]
+        fn log_sum_exp_neon_matches_scalar() {
+            let mut l = Lcg(0x1053_0001);
+            for n in [1usize, 3, 4, 7, 16, 33, 128, 1000] {
+                let x: Vec<f32> = (0..n).map(|_| l.activation() * 8.0).collect();
+                let s = log_sum_exp_f32_scalar(&x);
+                let v = unsafe { log_sum_exp_f32_neon(&x) };
+                let abs = (s - v).abs();
+                let rel = abs / s.abs().max(1e-6);
+                assert!(
+                    abs < 1e-3 || rel < 1e-5,
+                    "log_sum_exp n={n}: scalar={s} neon={v} abs={abs} rel={rel}"
+                );
+            }
+        }
+
+        #[test]
+        fn rope_neox_neon_matches_scalar() {
+            let mut l = Lcg(0x8042_0001);
+            let n_heads = 6usize;
+            // head_dim 70 → half 35 (exercises the 4-wide body + scalar tail).
+            let head_dim = 70usize;
+            let half = head_dim / 2;
+            let theta = 10000.0f32;
+            let pos = 37u32;
+            let cs: Vec<f32> = (0..half)
+                .flat_map(|i| {
+                    let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
+                    let p = pos as f32 * freq;
+                    [p.cos(), p.sin()]
+                })
+                .collect();
+            let base: Vec<f32> = (0..n_heads * head_dim).map(|_| l.activation()).collect();
+            let mut xs = base.clone();
+            let mut xn = base.clone();
+            rope_inplace_neox_scalar(&mut xs, n_heads, head_dim, half, &cs);
+            unsafe { rope_inplace_neox_neon(&mut xn, n_heads, head_dim, half, &cs) };
+            assert_close(&xs, &xn, "rope_neox");
+        }
+
+        #[test]
+        fn gqa_one_step_neon_matches_scalar() {
+            let mut l = Lcg(0x6911_0001);
+            let (n_heads, n_kv_heads, head_dim, max_ctx, kv_len) = (8usize, 2, 48, 32, 19);
+            let q: Vec<f32> = (0..n_heads * head_dim).map(|_| l.activation()).collect();
+            let k: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+                .map(|_| l.activation())
+                .collect();
+            let v: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+                .map(|_| l.activation())
+                .collect();
+            let mut os = vec![0f32; n_heads * head_dim];
+            let mut on = vec![0f32; n_heads * head_dim];
+            gqa_attention_one_step_scalar(
+                &q, &k, &v, &mut os, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            );
+            unsafe {
+                gqa_attention_one_step_neon(
+                    &q, &k, &v, &mut on, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                )
+            };
+            assert_close(&os, &on, "gqa_one_step");
+        }
+
+        #[test]
+        fn gqa_flash_decode_neon_matches_scalar() {
+            let mut l = Lcg(0xF1A5_0001);
+            let (n_heads, n_kv_heads, head_dim, max_ctx, kv_len) = (8usize, 4, 64, 40, 23);
+            let q: Vec<f32> = (0..n_heads * head_dim).map(|_| l.activation()).collect();
+            let k: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+                .map(|_| l.activation())
+                .collect();
+            let v: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+                .map(|_| l.activation())
+                .collect();
+            let mut os = vec![0f32; n_heads * head_dim];
+            let mut on = vec![0f32; n_heads * head_dim];
+            gqa_attention_flash_decode_scalar(
+                &q, &k, &v, &mut os, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            );
+            unsafe {
+                gqa_attention_flash_decode_neon(
+                    &q, &k, &v, &mut on, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                )
+            };
+            assert_close(&os, &on, "gqa_flash_decode");
         }
 
         fn run_block_quant<const BB: usize>(
