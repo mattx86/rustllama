@@ -235,6 +235,59 @@ fn try_gemm_fp4_tc_batched(
     guard.gemm_fp4_tc(kind, weight_key, w_bytes, x, out, m, k, n)
 }
 
+// ------------------------------------------------------------
+// Hopper SM90a FP8 wgmma tensor-core GEMM dispatch (opt-in)
+// ------------------------------------------------------------
+
+/// Whether the Hopper FP8 `wgmma` tensor-core GEMM path is enabled. **DEFAULT
+/// OFF** + WRITE-BLIND (no GH200 has validated it): the path is W8A8
+/// (activations quantized to E4M3 — extra error vs the scalar W8A16 path) and
+/// is gated behind the opt-in `RUSTLLAMA_FP8_WGMMA=1` AND a real sm_90 Hopper
+/// device built with the TC path (`ck::hopper_tc_available`). Mirror of
+/// [`fp4_tc_enabled`]; cached once (process-wide).
+fn hopper_tc_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        let on = std::env::var("RUSTLLAMA_FP8_WGMMA")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        on && cuda_active() && ck::hopper_tc_available(0)
+    })
+}
+
+/// Whether to use the TMA (`cp.async.bulk`)-staged `wgmma` variant
+/// (`RUSTLLAMA_FP8_WGMMA_TMA=1`; default the non-TMA path). Cached once.
+fn hopper_tc_tma() -> bool {
+    static TMA: OnceLock<bool> = OnceLock::new();
+    *TMA.get_or_init(|| {
+        std::env::var("RUSTLLAMA_FP8_WGMMA_TMA")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Batched Hopper FP8 `wgmma` GEMM via the CUDA cache. `false` on any miss so
+/// the caller falls through to the scalar CUDA/SYCL/CPU ladder (untouched
+/// `out`). Mirror of [`try_gemm_fp4_tc_batched`].
+#[allow(clippy::too_many_arguments)]
+fn try_gemm_fp8_wgmma_batched(
+    weight_key: usize,
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    guard.gemm_fp8_wgmma(weight_key, w_bytes, x, out, m, k, n, hopper_tc_tma())
+}
+
 // ============================================================
 // Native MLX packed-matvec dispatch (Apple Metal backend)
 // ============================================================
@@ -10014,6 +10067,28 @@ pub fn try_matvec_tensor_batched_usm_f32(
             if try_gemm_fp4_tc_batched(tc_kind, wb.as_ptr() as usize, wb, x, out, m, k, n) {
                 return true;
             }
+        }
+    }
+    // Hopper SM90a FP8 wgmma tensor-core GEMM (W8A8) for MXFP8 weights — the
+    // Hopper twin of the Blackwell FP4 TC block above, same prefill-batch gate
+    // (n >= 16, K % 32 == 0 for the wgmma k-dim), tried BEFORE the scalar CUDA
+    // packed path. OPT-IN + inert unless RUSTLLAMA_FP8_WGMMA=1 on a real sm_90
+    // Hopper TC build (`hopper_tc_enabled()` folds both). A miss falls straight
+    // through to the scalar block below — byte-identical on every other host.
+    if hopper_tc_enabled()
+        && !tensor_forced_to_cpu(&w.name)
+        && current_layer_idx() < n_gpu_layers()
+        && m != 0
+        && k != 0
+        && n >= 16
+        && (k % 32 == 0)
+        && x.len() == n * k
+        && out.len() == n * m
+        && matches!(w.dtype, Dtype::Mxfp8Raw)
+    {
+        let wb = as_bytes(w);
+        if try_gemm_fp8_wgmma_batched(wb.as_ptr() as usize, wb, x, out, m, k, n) {
+            return true;
         }
     }
     // Native CUDA backend FIRST (batched twin — see the single-row

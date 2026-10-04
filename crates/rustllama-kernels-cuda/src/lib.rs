@@ -2328,6 +2328,63 @@ impl CudaMatvecCache {
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * m * 4) };
         self.out_scratch.as_ref().unwrap().download(out_bytes)
     }
+
+    /// Hopper sm_90a FP8 `wgmma` tensor-core batched GEMM (MXFP8 W8A8) — the
+    /// Hopper analogue of [`gemm_fp4_tc`](Self::gemm_fp4_tc). W is MXFP8
+    /// (K/32 × 33B: 32 E4M3 + 1 E8M0 scale), X f32 (quantized to E4M3 on the
+    /// fly); K % 32 == 0 (the `wgmma` k-dim). Same device-buffer management +
+    /// `out[n*M + m]` layout, so it is a drop-in for the scalar batched path
+    /// when `hopper_tc_available()`. `tma` selects the cp.async.bulk-staged
+    /// variant. Returns `false` (caller falls back to the scalar path) on bad
+    /// shape / budget / kernel failure, leaving `out` untouched on failure.
+    /// WRITE-BLIND: compile-only, no GH200 to validate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_wgmma(
+        &mut self,
+        weight_key: usize,
+        w_bytes: &[u8],
+        x: &[f32],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        tma: bool,
+    ) -> bool {
+        // MXFP8 geometry: K/32 × 33B (32 E4M3 elems + 1 E8M0 scale).
+        let row_bytes = (k / 32) * 33;
+        if m == 0 || k == 0 || n == 0 || x.len() != n * k || out.len() != n * m {
+            return false;
+        }
+        if k % 32 != 0 || w_bytes.len() < m * row_bytes {
+            return false;
+        }
+        if !self.ensure_weight(weight_key, w_bytes) {
+            return false;
+        }
+        if !Self::ensure_scratch(&mut self.x_scratch, &self.stream, n * k * 4)
+            || !Self::ensure_scratch(&mut self.out_scratch, &self.stream, n * m * 4)
+        {
+            return false;
+        }
+        let x_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, n * k * 4) };
+        if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
+            return false;
+        }
+        let w_ptr = self.weights[&weight_key].ptr;
+        let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
+        let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: w (M×K MXFP8 blocks), x (N·K f32), out (N·M f32) are live
+        // device buffers on `self.stream`; the wrapper synchronizes.
+        let res =
+            unsafe { gemm_mxfp8_wgmma_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, n, k, tma) };
+        if res.is_err() || consume_error_count() != 0 {
+            return false;
+        }
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * m * 4) };
+        self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
 }
 
 // SAFETY: the cache owns its stream + device buffers and is only ever
