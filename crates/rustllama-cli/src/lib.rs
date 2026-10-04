@@ -99,6 +99,16 @@ pub enum Command {
         /// Listen port — overrides `[server].port`.
         #[arg(long)]
         port: Option<u16>,
+        /// Bearer-token API key clients must present as
+        /// `Authorization: Bearer <token>`. Overrides `[server].api_key`
+        /// and the `RUSTLLAMA_API_KEY` env var (flag > env > config).
+        /// Remote (non-loopback) requests without a valid token get 401;
+        /// loopback + `/healthz` always bypass. Empty/unset = open access.
+        /// Set this to use token-auth clients (e.g. OpenCode) against the
+        /// server — pair it with `--ip 0.0.0.0` to expose + require it on
+        /// the LAN.
+        #[arg(long, value_name = "TOKEN")]
+        api_key: Option<String>,
         /// Disable the CPU compute tier (GPU-only placement). Overrides
         /// `[inference].cpu_enabled`. The load FAILS with a clear error if
         /// the model + KV cache don't fit GPU memory (no silent CPU spill).
@@ -939,6 +949,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             model,
             ip,
             port,
+            api_key,
             no_cpu,
             no_gpu,
             disabled_cpus,
@@ -949,6 +960,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 model,
                 ip,
                 port,
+                api_key,
                 no_cpu,
                 no_gpu,
                 disabled_cpus,
@@ -3384,11 +3396,13 @@ fn log_backend_selection() {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     config_path: &std::path::Path,
     models: Vec<std::path::PathBuf>,
     ip: Option<String>,
     port: Option<u16>,
+    api_key: Option<String>,
     no_cpu: bool,
     no_gpu: bool,
     disabled_cpus: Option<String>,
@@ -3405,6 +3419,14 @@ async fn serve(
         if !name.is_empty() {
             println!("rustllama: profile `{name}` active");
         }
+    }
+
+    // `--api-key` overrides `[server].api_key` (and the RUSTLLAMA_API_KEY env
+    // override already folded in by config load) — flag > env > config. This
+    // is the bearer token remote clients must present as
+    // `Authorization: Bearer <token>`; empty keeps open access.
+    if let Some(key) = api_key {
+        cfg.server.api_key = key;
     }
 
     // Device / memory-tier CLI flags override the corresponding

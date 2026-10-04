@@ -191,6 +191,11 @@ fn run_gui() -> anyhow::Result<()> {
                                 model: Vec::new(),
                                 ip: None,
                                 port: None,
+                                // No CLI api-key override: the embedded server
+                                // honors `[server].api_key` (and the
+                                // RUSTLLAMA_API_KEY env) from config load, so
+                                // bearer auth applies in GUI mode too when set.
+                                api_key: None,
                                 // Device-tier flags default off: the embedded
                                 // server honors the `[inference]` config keys
                                 // (cpu_enabled / gpu_enabled / disabled_cpus /

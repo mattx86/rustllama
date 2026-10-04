@@ -1175,13 +1175,32 @@ pub fn default_config_path() -> Option<PathBuf> {
 }
 
 pub fn load(path: &Path) -> Result<Config> {
-    if !path.exists() {
-        return Ok(Config::default());
-    }
-    let s = std::fs::read_to_string(path)?;
-    let cfg: Config = toml::from_str(&s)?;
-    validate(&cfg)?;
+    let mut cfg = if !path.exists() {
+        Config::default()
+    } else {
+        let s = std::fs::read_to_string(path)?;
+        let cfg: Config = toml::from_str(&s)?;
+        validate(&cfg)?;
+        cfg
+    };
+    apply_env_overrides(&mut cfg);
     Ok(cfg)
+}
+
+/// Apply environment-variable overrides that should win over the on-disk
+/// config for EVERY consumer (the `serve` CLI, the GUI-embedded server, the
+/// chat client, …) — not just one entry point.
+///
+/// `RUSTLLAMA_API_KEY`: the bearer-token `[server].api_key`. A non-empty value
+/// overrides the config so the token can be set without editing `config.toml`
+/// (e.g. `RUSTLLAMA_API_KEY=sk-… rustllama serve`). Empty/unset leaves the
+/// config value untouched. `serve --api-key` overrides this in turn.
+fn apply_env_overrides(cfg: &mut Config) {
+    if let Ok(key) = std::env::var("RUSTLLAMA_API_KEY") {
+        if !key.is_empty() {
+            cfg.server.api_key = key;
+        }
+    }
 }
 
 /// Load the config and apply the named profile in one step. If
