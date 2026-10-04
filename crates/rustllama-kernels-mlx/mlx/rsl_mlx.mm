@@ -22,8 +22,9 @@
 //   * rsl_mlx_matvec_f32 + rsl_mlx_rmsnorm_f32 — host-pointer reference paths.
 //   * Forward-pass primitives: add_rmsnorm, rope, silu_mul, embedding_lookup.
 //   * FlashAttention F32: GQA online-softmax decode + causal prefill.
-//   * argmax sampling; packed-quant matvec Q8_0 + Q4_0 + Q4_K + Q6_K
-//     (single + batched) — the common dense + K-quant GGUF formats.
+//   * argmax sampling; packed-quant matvec Q8_0 + Q4_0 + the full K-quant
+//     family (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K), single + batched — the common
+//     dense + K-quant GGUF formats.
 // Each kernel body lives in rsl_mlx.metal (compiled + EMBEDDED by build.rs,
 // loaded via newLibraryWithData:).
 //
@@ -36,8 +37,10 @@
 // build_mlx_stub) and device_count()==0 → CPU/SYCL/CUDA.
 //
 // ===================== STILL INERT (-1, Mac-pending) ====================
-// The remaining packed quants (Q5_K/Q2_K/Q8_K/Q3_K/IQ grids/MXFP/NVFP/Q5_0/
-// Q4_1/Q5_1/PTQ1_0/PQ2_0 + batched), Prism Hadamard, and the quantized-KV
+// The remaining packed quants (Q5_0/Q4_1/Q5_1/IQ4_NL/IQ4_XS + the grid-table
+// IQ1/IQ2/IQ3 quants + MXFP4/6/8/NVFP4 microscaling + PTQ1_0/PQ2_0 + batched;
+// the IQ-grid/MXFP/NVFP families need the codebook/microscaling tables staged
+// as Metal constants by build.rs first), Prism Hadamard, and the quantized-KV
 // flash variants (q4_0/nvfp4/mxfp*/tq/q8_0). Each is a mechanical
 // specialization of a live pattern above (block dequant in the matvec inner
 // loop; on-the-fly K/V dequant in the flash inner loop) and is best filled in
@@ -660,12 +663,9 @@ extern "C" int rsl_mlx_hadamard_forward(rsl_mlx_stream *s, const float *x,
     extern "C" int rsl_mlx_##NAME##_batched(rsl_mlx_stream *s, const void *w, \
         const float *x, float *out, int M, int K, int N)                      \
         { (void)s;(void)w;(void)x;(void)out;(void)M;(void)K;(void)N; RSL_MLX_STUB_KERNEL }
-// NOTE: matvec_{q8_0,q4_0,q4_k,q6_k}_packed_f32 (and their batched forms) are
-// IMPLEMENTED below (real Metal dispatch), so they are omitted from this
-// inert-stub list.
-RSL_MLX_DEFINE_PACKED(matvec_q5_k_packed_f32)
-RSL_MLX_DEFINE_PACKED(matvec_q2_k_packed_f32)
-RSL_MLX_DEFINE_PACKED(matvec_q8_k_packed_f32)
+// NOTE: the full K-quant family (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K) + Q8_0/Q4_0
+// (and their batched forms) are IMPLEMENTED below (real Metal dispatch), so
+// they are omitted from this inert-stub list.
 RSL_MLX_DEFINE_PACKED(matvec_q5_0_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_q4_1_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_q5_1_packed_f32)
@@ -682,7 +682,6 @@ RSL_MLX_DEFINE_PACKED(matvec_nvfp4_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_mxfp4_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_mxfp6_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_mxfp8_packed_f32)
-RSL_MLX_DEFINE_PACKED(matvec_q3_k_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_pq2_0_packed_f32)
 #undef RSL_MLX_DEFINE_PACKED
 
@@ -764,6 +763,37 @@ extern "C" int rsl_mlx_matvec_q6_k_packed_f32_batched(rsl_mlx_stream *s, const v
     (void)s;(void)w;(void)x;(void)out;(void)M;(void)K;(void)N; return -1;
 #endif
 }
+
+// --- Q5_K / Q2_K / Q3_K / Q8_K packed matvec: LIVE. Completes the K-quant
+// family on Metal; same 256-wide super-block K%256 guard + shared
+// mlx_packed_matvec dispatch as Q4_K/Q6_K, ported byte-exact from the
+// rsl_matvec_{q5_k,q2_k,q3_k,q8_k}_packed_f32_usm SYCL refs. ---
+#if RSL_MLX_HAVE_METAL
+#define RSL_MLX_KQUANT(NAME, KERNEL)                                               \
+    extern "C" int rsl_mlx_##NAME(rsl_mlx_stream *s, const void *w,                \
+        const float *x, float *out, int M, int K) {                               \
+        if ((K % 256) != 0) return -1;                                            \
+        return mlx_packed_matvec(s, @KERNEL, w, x, out, M, K, 1);                  \
+    }                                                                              \
+    extern "C" int rsl_mlx_##NAME##_batched(rsl_mlx_stream *s, const void *w,      \
+        const float *x, float *out, int M, int K, int N) {                        \
+        if ((K % 256) != 0) return -1;                                            \
+        return mlx_packed_matvec(s, @KERNEL, w, x, out, M, K, N);                  \
+    }
+#else
+#define RSL_MLX_KQUANT(NAME, KERNEL)                                               \
+    extern "C" int rsl_mlx_##NAME(rsl_mlx_stream *s, const void *w,                \
+        const float *x, float *out, int M, int K)                                 \
+        { (void)s;(void)w;(void)x;(void)out;(void)M;(void)K; return -1; }          \
+    extern "C" int rsl_mlx_##NAME##_batched(rsl_mlx_stream *s, const void *w,      \
+        const float *x, float *out, int M, int K, int N)                          \
+        { (void)s;(void)w;(void)x;(void)out;(void)M;(void)K;(void)N; return -1; }
+#endif
+RSL_MLX_KQUANT(matvec_q5_k_packed_f32, "rsl_mlx_matvec_q5_k_packed_f32_kernel")
+RSL_MLX_KQUANT(matvec_q2_k_packed_f32, "rsl_mlx_matvec_q2_k_packed_f32_kernel")
+RSL_MLX_KQUANT(matvec_q3_k_packed_f32, "rsl_mlx_matvec_q3_k_packed_f32_kernel")
+RSL_MLX_KQUANT(matvec_q8_k_packed_f32, "rsl_mlx_matvec_q8_k_packed_f32_kernel")
+#undef RSL_MLX_KQUANT
 
 // Forward-pass primitives — LIVE (device-resident Metal dispatch).
 extern "C" int rsl_mlx_add_rmsnorm_f32(rsl_mlx_stream *s, float *hidden,

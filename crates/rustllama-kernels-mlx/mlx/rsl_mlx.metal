@@ -15,9 +15,10 @@
 //     rope (NEOX split-half), silu_mul (SwiGLU), embedding_lookup
 //   * FlashAttention F32 — GQA online-softmax decode + causal prefill
 //   * argmax sampling
-//   * packed-quant matvec — Q8_0 (34B/32), Q4_0 (18B/32), Q4_K (144B/256),
-//     Q6_K (210B/256): the common dense + K-quant GGUF formats. They establish
-//     the on-the-fly block-dequant pattern the remaining quants specialize.
+//   * packed-quant matvec — Q8_0 (34B/32), Q4_0 (18B/32), and the full K-quant
+//     family Q2_K (84B), Q3_K (110B), Q4_K (144B), Q5_K (176B), Q6_K (210B),
+//     Q8_K (292B) — all /256. The common dense + K-quant GGUF formats; they
+//     establish the on-the-fly block-dequant pattern the rest specialize.
 // Each is a direct port of the SYCL/CPU reference (op order + byte layout).
 //
 // !!! WRITE-BLIND — AUTHORED ON A NON-APPLE HOST, NOT YET COMPILED OR RUN !!!
@@ -28,8 +29,10 @@
 // before it is trusted. This mirrors the write-blind CUDA/SYCL-XMX discipline.
 //
 // REMAINING (Mac-pending, still inert -1 in rsl_mlx.mm): the other packed
-// quants (Q5_K/Q2_K/Q8_K/Q3_K/IQ grids/MXFP/NVFP/PTQ1_0/PQ2_0 + their batched
-// forms), the Prism Hadamard, and the quantized-KV flash variants. They are
+// quants (Q5_0/Q4_1/Q5_1/IQ4_NL/IQ4_XS + the grid-table IQ1/IQ2/IQ3 + MXFP/
+// NVFP microscaling + PTQ1_0/PQ2_0 + their batched forms; the IQ-grid/MXFP/NVFP
+// families need codebook/microscaling tables staged by build.rs first), the
+// Prism Hadamard, and the quantized-KV flash variants. They are
 // mechanical specializations of the patterns below (block dequant in the
 // matvec inner loop; on-the-fly K/V dequant in the flash inner loop) and are
 // best filled in with Mac compile + parity feedback.
@@ -526,6 +529,244 @@ kernel void rsl_mlx_matvec_q6_k_packed_f32_kernel(
                 acc += d * s2 * (float)q3 * xc[x_base + base + 64];
                 acc += d * s3 * (float)q4 * xc[x_base + base + 96];
             }
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// Q5_K: 176 bytes / 256 = { f16 d; f16 dmin; u8 scales[12]; u8 qh[32]; u8 qs[128] }.
+// Like Q4_K (same 6-bit scale/min unpack) but each weight gets a 5th high bit
+// from qh. K % 256 == 0. Ports rsl_matvec_q5_k_packed_f32_usm.
+kernel void rsl_mlx_matvec_q5_k_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K         [[buffer(3)]],
+    constant int &M         [[buffer(4)]],
+    constant int &N         [[buffer(5)]],
+    uint2 tgpos             [[threadgroup_position_in_grid]],
+    uint lane               [[thread_position_in_threadgroup]],
+    uint lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x;
+    const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 256;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 176ul;
+    device const uchar *row = w + (ulong)m * bytes_per_row;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 176ul;
+        const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+        const float dmin = (float)as_type<half>((ushort)(blk[2] | ((ushort)blk[3] << 8)));
+        device const uchar *sb = blk + 4;
+        uchar sc[8];
+        uchar mn[8];
+        for (int j = 0; j < 8; ++j) {
+            if (j < 4) {
+                sc[j] = sb[j] & 0x3F;
+                mn[j] = sb[j + 4] & 0x3F;
+            } else {
+                sc[j] = (sb[j + 4] & 0x0F) | ((sb[j - 4] >> 6) << 4);
+                mn[j] = (sb[j + 4] >> 4) | ((sb[j] >> 6) << 4);
+            }
+        }
+        device const uchar *qh = blk + 16;
+        device const uchar *qs = blk + 48;
+        const int x_base = b * 256;
+        for (int group = 0; group < 4; ++group) {
+            device const uchar *qc = qs + group * 32;
+            const float d_lo = d * (float)sc[group * 2];
+            const float m_lo = dmin * (float)mn[group * 2];
+            const float d_hi = d * (float)sc[group * 2 + 1];
+            const float m_hi = dmin * (float)mn[group * 2 + 1];
+            const int bit_lo = group * 2;
+            const int bit_hi = group * 2 + 1;
+            const int x_lo = x_base + group * 64;
+            const int x_hi = x_lo + 32;
+            for (int l = 0; l < 32; ++l) {
+                const uchar qb = qc[l];
+                const uchar qhb = qh[l];
+                const uint lo = (uint)(qb & 0x0F) | ((uint)((qhb >> bit_lo) & 1) << 4);
+                const uint hi = (uint)(qb >> 4) | ((uint)((qhb >> bit_hi) & 1) << 4);
+                acc += (d_lo * (float)lo - m_lo) * xc[x_lo + l];
+                acc += (d_hi * (float)hi - m_hi) * xc[x_hi + l];
+            }
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// Q2_K: 84 bytes / 256 = { u8 scales[16]; u8 qs[64]; f16 d; f16 dmin }.
+// 2 chunks x 4 shifts x 2 sub-blocks of 16; each 6-bit scale byte packs
+// dl=(sc&0xF) and ml=(sc>>4). weight = d*dl*q - dmin*ml. K % 256 == 0.
+kernel void rsl_mlx_matvec_q2_k_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K         [[buffer(3)]],
+    constant int &M         [[buffer(4)]],
+    constant int &N         [[buffer(5)]],
+    uint2 tgpos             [[threadgroup_position_in_grid]],
+    uint lane               [[thread_position_in_threadgroup]],
+    uint lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x;
+    const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 256;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 84ul;
+    device const uchar *row = w + (ulong)m * bytes_per_row;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 84ul;
+        device const uchar *scales = blk;
+        device const uchar *qs = blk + 16;
+        const float d = (float)as_type<half>((ushort)(blk[80] | ((ushort)blk[81] << 8)));
+        const float dmin = (float)as_type<half>((ushort)(blk[82] | ((ushort)blk[83] << 8)));
+        const int x_base = b * 256;
+        int x_off = 0;
+        int is = 0;
+        for (int chunk = 0; chunk < 2; ++chunk) {
+            device const uchar *qc = qs + chunk * 32;
+            for (int sh = 0; sh < 4; ++sh) {
+                const uint shift = (uint)(sh * 2);
+                const uchar sc_a = scales[is];
+                const float dl_a = d * (float)(sc_a & 0x0F);
+                const float ml_a = dmin * (float)(sc_a >> 4);
+                for (int l = 0; l < 16; ++l) {
+                    const float qv = (float)((qc[l] >> shift) & 3);
+                    acc += (dl_a * qv - ml_a) * xc[x_base + x_off + l];
+                }
+                x_off += 16;
+                ++is;
+                const uchar sc_b = scales[is];
+                const float dl_b = d * (float)(sc_b & 0x0F);
+                const float ml_b = dmin * (float)(sc_b >> 4);
+                for (int l = 0; l < 16; ++l) {
+                    const float qv = (float)((qc[l + 16] >> shift) & 3);
+                    acc += (dl_b * qv - ml_b) * xc[x_base + x_off + l];
+                }
+                x_off += 16;
+                ++is;
+            }
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// Q3_K: 110 bytes / 256 = { u8 hmask[32]; u8 qs[64]; u8 scales[12]; f16 d }.
+// 6-bit scales unpacked via the KMASK1/KMASK2 shuffle into 16 signed scales
+// (biased -32); weight = dl*(low2 - (hmask_bit ? 0 : 4)). K % 256 == 0.
+kernel void rsl_mlx_matvec_q3_k_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K         [[buffer(3)]],
+    constant int &M         [[buffer(4)]],
+    constant int &N         [[buffer(5)]],
+    uint2 tgpos             [[threadgroup_position_in_grid]],
+    uint lane               [[thread_position_in_threadgroup]],
+    uint lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x;
+    const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const uint KMASK1 = 0x03030303u;
+    const uint KMASK2 = 0x0f0f0f0fu;
+    const int blocks_per_row = K / 256;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 110ul;
+    device const uchar *row = w + (ulong)m * bytes_per_row;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 110ul;
+        device const uchar *hmask = blk;
+        device const uchar *qs = blk + 32;
+        device const uchar *sc_raw = blk + 96;
+        const float d_all = (float)as_type<half>((ushort)(blk[108] | ((ushort)blk[109] << 8)));
+        uint aux[4];
+        aux[0] = (uint)sc_raw[0] | ((uint)sc_raw[1] << 8) | ((uint)sc_raw[2] << 16) | ((uint)sc_raw[3] << 24);
+        aux[1] = (uint)sc_raw[4] | ((uint)sc_raw[5] << 8) | ((uint)sc_raw[6] << 16) | ((uint)sc_raw[7] << 24);
+        aux[2] = (uint)sc_raw[8] | ((uint)sc_raw[9] << 8) | ((uint)sc_raw[10] << 16) | ((uint)sc_raw[11] << 24);
+        const uint tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+        aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+        aux[0] = (aux[0] & KMASK2) | ((tmp & KMASK1) << 4);
+        aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+        char scales[16];
+        for (int j = 0; j < 16; ++j) {
+            scales[j] = (char)(uchar)((aux[j >> 2] >> ((j & 3) * 8)) & 0xFF);
+        }
+        const int x_base = b * 256;
+        int q_cursor = 0;
+        int x_off = 0;
+        uchar m_bit = 1;
+        int is = 0;
+        for (int chunk = 0; chunk < 2; ++chunk) {
+            uint shift = 0;
+            for (int j4 = 0; j4 < 4; ++j4) {
+                float dl = d_all * ((float)scales[is] - 32.0f);
+                ++is;
+                for (int l = 0; l < 16; ++l) {
+                    const int lo = (int)((qs[q_cursor + l] >> shift) & 3);
+                    const int hi_sub = (hmask[l] & m_bit) != 0 ? 0 : 4;
+                    acc += dl * (float)(lo - hi_sub) * xc[x_base + x_off + l];
+                }
+                x_off += 16;
+                dl = d_all * ((float)scales[is] - 32.0f);
+                ++is;
+                for (int l = 0; l < 16; ++l) {
+                    const int lo = (int)((qs[q_cursor + l + 16] >> shift) & 3);
+                    const int hi_sub = (hmask[l + 16] & m_bit) != 0 ? 0 : 4;
+                    acc += dl * (float)(lo - hi_sub) * xc[x_base + x_off + l];
+                }
+                x_off += 16;
+                shift += 2;
+                m_bit = (uchar)(m_bit << 1);
+            }
+            q_cursor += 32;
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// Q8_K: 292 bytes / 256 = { f32 d (LE); i8 qs[256]; i16 bsums[16] (unused) }.
+// weight = d * i8. NOTE: d is F32 here (not the f16 of the other formats).
+// K % 256 == 0. Ports rsl_matvec_q8_k_packed_f32_usm.
+kernel void rsl_mlx_matvec_q8_k_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K         [[buffer(3)]],
+    constant int &M         [[buffer(4)]],
+    constant int &N         [[buffer(5)]],
+    uint2 tgpos             [[threadgroup_position_in_grid]],
+    uint lane               [[thread_position_in_threadgroup]],
+    uint lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x;
+    const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 256;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 292ul;
+    device const uchar *row = w + (ulong)m * bytes_per_row;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 292ul;
+        const uint dbits = (uint)blk[0] | ((uint)blk[1] << 8) | ((uint)blk[2] << 16) | ((uint)blk[3] << 24);
+        const float d = as_type<float>(dbits);
+        device const uchar *qs = blk + 4;
+        const int x_off = b * 256;
+        for (int j = 0; j < 256; ++j) {
+            acc += d * (float)((int)((char)qs[j])) * xc[x_off + j];
         }
     }
     acc = simd_sum(acc);
