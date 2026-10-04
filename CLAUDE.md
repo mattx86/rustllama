@@ -9,10 +9,12 @@ derivable from a quick look at the tree.
 **rustllama** is a from-scratch Rust LLM runtime — an OpenAI/Ollama-compatible
 inference server + CLI + native egui GUI. It is **clean-room: no `llama.cpp`
 dependency**. It owns its whole compute stack: a real-only kernel layer over
-**Intel SYCL + NVIDIA CUDA + CPU**, GGUF/safetensors loaders, tokenizers, chat
-templating, a KV cache, sampling, an autotuner, and quantization tooling.
+**Intel SYCL + NVIDIA CUDA + Apple Metal/MLX + CPU**, GGUF/safetensors loaders,
+tokenizers, chat templating, a KV cache, sampling, an autotuner, and
+quantization tooling.
 
-- Targets: **Windows x64, Linux x64, Linux aarch64** (DGX Spark / GB10).
+- Targets: **Windows x64, Linux x64, Linux aarch64** (DGX Spark / GB10),
+  **macOS arm64 (Apple Silicon) + x86_64 (Intel)**.
 - License: **MIT OR Apache-2.0**, © 2026 Matt Smith (`LICENSE-MIT`,
   `LICENSE-APACHE`). Application workspace — every crate is `publish = false`.
 - Status: experimental / pre-1.0 (`version = 0.1.0`). Edition 2021,
@@ -21,14 +23,15 @@ templating, a KV cache, sampling, an autotuner, and quantization tooling.
 ## Repo layout
 
 ```
-crates/                         (19-crate Cargo workspace)
+crates/                         (21-crate Cargo workspace)
   rustllama-tensor              tensor types / dtype defs
   rustllama-gguf                GGUF read/write, quant encode/decode (26 formats)
   rustllama-safetensors         AWQ/GPTQ safetensors load path
   rustllama-tokenizer           tokenizers wrapper + chat detok (Utf8Stream)
-  rustllama-kernels-cpu         SIMD CPU kernels (AVX2/AVX-512, rayon matmul)
+  rustllama-kernels-cpu         SIMD CPU kernels (AVX2/AVX-512 x86, NEON aarch64, rayon matmul)
   rustllama-kernels-sycl        SYCL kernels (icx/icpx; x86 only — no-op stub on aarch64)
-  rustllama-kernels-cuda        native CUDA kernels (nvcc; inert off-NVIDIA)
+  rustllama-kernels-cuda        native CUDA kernels (nvcc; inert off-NVIDIA; Blackwell/Hopper TC)
+  rustllama-kernels-mlx         Metal/MLX kernels (xcrun metal + ObjC++; inert off Apple)
   rustllama-l0-sys              Level-Zero Sysman FFI (power/energy telemetry)
   rustllama-models              model archs, forward pass, device dispatch (accel.rs)
   rustllama-tuner               device fingerprint + autotune cache
@@ -36,8 +39,9 @@ crates/                         (19-crate Cargo workspace)
   rustllama-config              config.toml schema + load/validate
   rustllama-hub                 HuggingFace hub download/cache
   rustllama-runtime             paths, server-record lockfile, crash handling
-  rustllama-server              axum HTTP server (OpenAI + Ollama APIs)
+  rustllama-server              axum HTTP server (OpenAI + Ollama APIs, bearer auth)
   rustllama-client              HTTP client used by chat/lsp
+  rustllama-gui                 native egui/eframe GUI (glow + winit; rfd dialogs)
   rustllama-rag                 code-aware RAG indexer (tree-sitter, opt-in)
   rustllama-lsp                 LSP bridge (inline completion via FIM)
   rustllama-cli                 the `rustllama` binary — all subcommands
@@ -99,15 +103,19 @@ RAM and OOMs the new run. (This does **not** apply before a *build*; killing
 
 ## Kernel layer & device model
 
-- **SYCL and CUDA GPUs are first-class equals at the surface.** CPU is the
-  2nd-place fallback used only when no usable GPU is present. The
+- **SYCL, CUDA, and Metal GPUs are first-class equals at the surface.** CPU is
+  the 2nd-place fallback used only when no usable GPU is present. The
   **tuner/placement layer decides** actual device use from there, weighted by
   measured **performance and VRAM** — including on mixed SYCL+CUDA or
   multi-CUDA-of-varying-perf systems, with true cross-GPU layer distribution as
   the target (see `memory`/plan for the multi-GPU roadmap).
 - matvec dispatch (`rustllama-models/src/accel.rs`) currently routes to ONE
   active backend: CUDA (`cuda_active()`) first if a usable NVIDIA GPU exists,
-  else the SYCL device, else CPU — gated by `n_gpu_layers`.
+  else the SYCL device, else the Metal/MLX device (Apple Silicon), else CPU —
+  gated by `n_gpu_layers`. Opt-in tensor-core GEMM paths layer on top: CUDA
+  Blackwell FP4/FP6/FP8 (`RUSTLLAMA_FP4_TC=1`) + Hopper FP8 `wgmma`
+  (`RUSTLLAMA_FP8_WGMMA=1`), and SYCL Intel XMX/DPAS bf16 (`RUSTLLAMA_SYCL_XMX=1`,
+  also a build-time define) — all off by default.
 - VRAM-fit placement (`rustllama-engine/src/placement_auto.rs`,
   `auto_n_gpu_layers`) budgets **CUDA-first** (mirrors dispatch), else SYCL,
   else all-CPU.
@@ -137,7 +145,8 @@ Top-level commands (each parent auto-provides a `help` subcommand; `/`-prefixed
 commands in the chat REPL/TUI mirror this verb set):
 
 - `serve` — start the HTTP server. `--model <gguf>` (repeatable; first = default),
-  `--ip`, `--port`. Auto-tunes each model on first load.
+  `--ip`, `--port`, `--api-key <token>` (requires `Authorization: Bearer`; flag >
+  `RUSTLLAMA_API_KEY` > `[server].api_key`). Auto-tunes each model on first load.
 - `chat` — interactive REPL, or full-screen `--tui`. `--resume <id|name>`,
   `--model`, `--system`, `--base-url`/`--ip`/`--port`. History subcommands:
   `chat list|show|export|delete|search`.
@@ -152,9 +161,11 @@ commands in the chat REPL/TUI mirror this verb set):
   `--threads`, `--moe-placement`, `--flash-kv-min`, etc.
 - `quantize` / `imatrix` / `kv-calibrate` — quantization + calibration tooling.
 - `doctor` — diagnostics. `--sycl-smoke`, `--sycl-parity`, `--cuda-parity`,
-  `--cpu-parity` run the kernel parity/stability harnesses against the CPU
-  reference (`--sycl-parity` subprocesses each probe so a DEVICE_LOST only
-  kills its child; `--cuda-parity` and `--cpu-parity` run in-process).
+  `--metal-parity`, `--cpu-parity` run the kernel parity/stability harnesses
+  against the CPU reference (`--sycl-parity` subprocesses each probe — including
+  an `xmx:gemm` probe — so a DEVICE_LOST only kills its child; `--cuda-parity`,
+  `--metal-parity`, and `--cpu-parity` run in-process). Also reports per-device
+  `xmx_capable` (Intel XMX/DPAS capability).
 - `gui` — launch the native egui GUI. `lsp` — LSP bridge over stdio. `version`.
 
 ## Config & server
@@ -162,11 +173,13 @@ commands in the chat REPL/TUI mirror this verb set):
 - `config.toml` sections: `[model]`, `[inference]` (n_gpu_layers, ctx_size,
   batch_size, kv_dtype/k_dtype/v_dtype, flash_attention, speculative_ngram,
   moe_placement, lock_ram_mb, `[inference.placement]`), `[server]`
-  (bind_addr, **port 11434** default, api_key, max_loaded_models), `[ui]`,
+  (bind_addr, **port 11434** default, api_key, require_auth_loopback,
+  max_loaded_models), `[ui]`,
   `[hub]`, `[tuning]` (auto_tune_on_first_load, auto_apply_* flags),
   `[embeddings]`, `[reranker]`.
 - The server speaks the **OpenAI** API (`/v1/chat/completions`, `/v1/completions`,
-  `/v1/embeddings`, `/v1/models`) and **Ollama** API (`/api/*`), plus
+  `/v1/embeddings`, `/v1/models`), the **Anthropic Messages** API
+  (`/v1/messages`, for Claude Code), and the **Ollama** API (`/api/*`), plus
   `/healthz`, `/v1/capabilities`, `/v1/tuning_summary`, and model
   load/default/unload endpoints. Server tracing goes to **stdout**, not stderr.
 - The GUI embeds the server in-process; it sets `RUSTLLAMA_GUI_EMBEDDED=1` so
@@ -186,10 +199,12 @@ they work on SYCL/CUDA/CPU hosts alike) and auto-apply on next load per the
 
 - `cargo test --lib -p <crate>` for the 8 toolchain-free crates (what CI runs).
 - Kernel correctness: `rustllama doctor --sycl-parity` (SYCL, per-probe
-  subprocessed) / `--cuda-parity` (CUDA, in-process) — every GPU kernel family
-  vs its CPU reference on identical inputs. `--cpu-parity` self-checks the CPU
-  matvec SIMD / rayon-parallel paths against a naive scalar reference on this
-  host (f32, f16, PTQ1_0 ternary fastdot/batched).
+  subprocessed) / `--cuda-parity` (CUDA, in-process) / `--metal-parity` (Metal,
+  in-process) — every GPU kernel family vs its CPU reference on identical
+  inputs. `--cpu-parity` self-checks the CPU matvec SIMD / rayon-parallel paths
+  against a naive scalar reference on this host (f32, f16, PTQ1_0 ternary
+  fastdot/batched). The aarch64 NEON forward-pass ports (RMSNorm/RoPE/GQA/flash)
+  carry their own scalar-parity `#[test]`s, validated under QEMU.
 - GPU/multi-GPU code that can't be exercised on available hardware is validated
   by parity harness + review; on-device confirmation happens on the user's HW.
 - Windows hang debugging: attach `cdb.exe` non-invasively for symbolized stacks;
@@ -225,9 +240,16 @@ ID can replace `-` later). Packaging helpers: `_release_package.ps1` (bsdtar),
 ## Useful environment variables
 
 - `RUSTLLAMA_SYSTEM_DIRS` — use OS dirs instead of binary-relative paths.
+- `RUSTLLAMA_API_KEY` — bearer token for `[server].api_key` (env tier: flag >
+  env > config). Non-empty ⇒ `Authorization: Bearer` required (loopback exempt
+  unless `[server].require_auth_loopback`).
 - `RUSTLLAMA_GUI_EMBEDDED` — set by the GUI; skips the blocking startup autotune.
 - `RUSTLLAMA_DISABLED_GPUS` — exclude specific GPUs from selection.
 - `RUSTLLAMA_IQ_GPU=1` — run IQ1_S imatrix weighting on the GPU during quantize.
+- Opt-in tensor-core / matrix-engine GEMM (all default-off): `RUSTLLAMA_FP4_TC=1`
+  (CUDA Blackwell sm_120a FP4/FP6/FP8), `RUSTLLAMA_FP8_WGMMA=1`
+  (+`RUSTLLAMA_FP8_WGMMA_TMA=1`; Hopper sm_90a FP8), `RUSTLLAMA_SYCL_XMX=1`
+  (Intel XMX/DPAS bf16 — also a build-time define).
 - Perf levers (production CPU-path recipe): `SYCL_DISPATCH=0`, `LOCK_RAM_MB`
   (also an `[inference]` key), `TERNARY_FASTDOT=1`, `PROFILE_HYBRID_PREFILL`.
 

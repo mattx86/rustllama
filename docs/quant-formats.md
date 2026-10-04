@@ -1,11 +1,24 @@
 # GGUF Quantization Formats
 
-This doc details rustllama's four core GGUF tensor formats (F16, Q8_0,
-Q4_K_M, Q5_K_M). The loader decodes many more besides these — Q2_K, Q3_K,
-Q6_K, Q4_0, Q5_0, the IQ-family (IQ1_S/M, IQ2_XXS/XS, IQ3_XXS/S, IQ4_NL/XS)
-and the ternary TQ1_0/TQ2_0 — via reference decoders in
-`crates/rustllama-gguf/src/dequant.rs`; a genuinely unsupported type is
-rejected at load with a clear error.
+This doc details rustllama's four *core* GGUF tensor formats (F16, Q8_0,
+Q4_K_M, Q5_K_M) in depth. The loader decodes ~26 formats in total via
+reference decoders in `crates/rustllama-gguf/src/dequant.rs`; a genuinely
+unsupported type is rejected at load with a clear error. The full set:
+
+- **Float:** F16, BF16.
+- **Legacy `_0`/`_1` blocks (32/block):** Q4_0, Q4_1, Q5_0, Q5_1, Q8_0.
+- **K-quants (256/super-block):** Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K.
+- **IQ-family:** IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS (grid-codebook +
+  sign-table decoders).
+- **Ternary / packed:** TQ1_0, TQ2_0 (ggml-compatible) plus our own packed
+  PTQ1_0 (base-3 trits, 128/block) and PQ2_0 (2-bit, 128/block).
+- **Microscaling (OCP) + FP8:** MXFP4, MXFP6, MXFP8, NVFP4 (E2M1/E3M2/E4M3
+  elements with E8M0/E4M3 block scales), and FP8 (OCP E4M3 / E5M2 and the
+  NVIDIA variant).
+
+Each format has a byte-exact decoder; the SYCL, CUDA, and Metal GPU kernels
+decode the **same** on-disk layouts (no host-side pre-dequant), verified against
+the CPU reference by the `doctor --{sycl,cuda,metal,cpu}-parity` harnesses.
 
 ## F16 — `GGML_TYPE_F16` (1)
 

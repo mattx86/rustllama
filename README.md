@@ -3,10 +3,14 @@
 A Rust LLM runtime with hybrid system-RAM + VRAM offload, an
 OpenAI-compatible HTTP server, a CLI, and a native egui GUI — all shipped as
 one binary, all owned end-to-end (no llama.cpp dependency). Runs on **Windows
-and Linux on x86_64, and Linux on aarch64** (e.g. NVIDIA Grace / DGX
-Spark). Compute backends are compiled in and selected at startup per the
-hardware present: **Intel GPUs via SYCL** (x86_64 only), **NVIDIA GPUs via
-CUDA**, and **CPU SIMD** (AVX2 on x86_64, NEON on aarch64).
+and Linux (x86_64), Linux on aarch64** (e.g. NVIDIA Grace / DGX Spark), **and
+macOS** (Apple Silicon + Intel). Compute backends are compiled in and selected
+at startup per the hardware present: **Intel GPUs via SYCL** (x86_64 only),
+**NVIDIA GPUs via CUDA**, **Apple GPUs via Metal/MLX** (Apple Silicon), and
+**CPU SIMD** (AVX2 on x86_64, NEON on aarch64). NVIDIA builds include opt-in
+tensor-core GEMM paths (Blackwell FP4/FP6/FP8, Hopper FP8); Intel builds an
+opt-in XMX/DPAS bf16 path — all off by default, validated against the CPU
+reference.
 
 > **Status:** experimental / pre-1.0. APIs, config keys, and on-disk
 > formats may change between releases.
@@ -18,6 +22,7 @@ CUDA**, and **CPU SIMD** (AVX2 on x86_64, NEON on aarch64).
 | Rust                       | 1.83+ (stable)      | everything                                   |
 | Intel oneAPI Base Toolkit  | 2025.0+             | SYCL kernels (`rustllama-kernels-sycl`, icx/icpx) — **x86_64 only** |
 | NVIDIA CUDA Toolkit        | 13.x                | CUDA kernels (`rustllama-kernels-cuda`, nvcc; also targets aarch64) |
+| Xcode command-line tools   | 15+                 | Metal kernels (`rustllama-kernels-mlx`, `xcrun metal`) — **macOS only** |
 
 The GUI is a native **egui/eframe** desktop app (`crates/rustllama-gui`) — it
 has **no JS frontend**, so no Node.js / pnpm is required. (The legacy Vite/React
@@ -29,7 +34,11 @@ picks which to run. On **x86_64** this means building requires both Intel
 oneAPI (`icx`/`icpx`) and the CUDA Toolkit (`nvcc`). On **aarch64** Intel
 oneAPI does not exist, so `rustllama-kernels-sycl` compiles a no-op stub
 and only the CUDA Toolkit (`nvcc`) is required — inference then runs on
-CPU (NEON) + CUDA. CPU SIMD is chosen automatically per arch.
+CPU (NEON) + CUDA. On **macOS** neither oneAPI nor CUDA exists, so SYCL and
+CUDA both compile to inert stubs and the Metal kernels (`rustllama-kernels-mlx`,
+built by `xcrun metal`) carry the GPU path on Apple Silicon; the same crate
+compiles to a no-op stub off Apple hardware. CPU SIMD is chosen automatically
+per arch.
 
 ## Quickstart
 
@@ -37,7 +46,9 @@ CPU (NEON) + CUDA. CPU SIMD is chosen automatically per arch.
 # Probe the environment
 cargo xtask doctor                                 # build-time: are the toolchains present?
 target\release\rustllama.exe doctor                # runtime: which backend/devices are live
-target\release\rustllama.exe doctor --cuda-parity  # verify CUDA kernels vs the CPU reference (on an NVIDIA host)
+target\release\rustllama.exe doctor --cuda-parity  # verify GPU kernels vs the CPU reference; per backend:
+                                                   #   --cuda-parity (NVIDIA), --sycl-parity (Intel, incl. xmx:gemm),
+                                                   #   --metal-parity (Apple), --cpu-parity (CPU SIMD self-check)
 
 # Build the GUI artifact (GUI + CLI + server, all backends). Windows:
 scripts\build.bat
@@ -51,6 +62,7 @@ scripts\build.bat --headless                       # server-only, no GUI
 target\release\rustllama.exe serve --model model.gguf   # load + auto-tune + serve (OpenAI-compatible API)
 target\release\rustllama.exe serve --model a.gguf --model b.gguf   # load several; the first is the default
 target\release\rustllama.exe serve --ip 0.0.0.0 --port 11434   # bind host/port (expose on the LAN)
+target\release\rustllama.exe serve --api-key sk-secret   # require `Authorization: Bearer sk-secret` on requests
 target\release\rustllama.exe gui                        # desktop GUI
 target\release\rustllama.exe chat                       # CLI chat against a running `serve`
 target\release\rustllama.exe chat --ip 192.168.1.10 --port 11434   # chat to a serve on another host
@@ -68,6 +80,30 @@ startup (each is auto-tuned; the **first** is the server default, the rest are
 reachable by id and via `rustllama model default`). `serve` with no `--model` uses
 `[model].path` from the config (or starts empty, ready for the GUI / `POST
 /v1/models/load`).
+
+## Binding & authentication
+
+The server binds `127.0.0.1:11434` by default (the port matches Ollama's, so
+Ollama clients swap in without reconfig). Change it with `serve --ip <addr>
+--port <n>` or `[server].bind_addr` / `[server].port` in `config.toml`.
+
+Authentication is **off by default**. Set an API key and the server requires a
+matching `Authorization: Bearer <token>` on every request (constant-time
+compared) — this is what lets coding agents like **OpenCode**, Continue, Aider,
+etc. talk to rustllama over a shared network. Three ways to set it, highest
+precedence first:
+
+```powershell
+rustllama serve --api-key sk-secret            # 1. CLI flag (wins)
+$env:RUSTLLAMA_API_KEY = "sk-secret"; rustllama serve   # 2. env var
+#   [server]                                   # 3. config.toml
+#   api_key = "sk-secret"
+```
+
+`/healthz` is always reachable without a token. Loopback (`127.0.0.1`) requests
+are exempt by default so local tools keep working; set
+`[server].require_auth_loopback = true` to require the token from local clients
+too. See [docs/editor-integrations.md](docs/editor-integrations.md).
 
 ## Releases
 

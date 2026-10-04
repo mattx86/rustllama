@@ -52,6 +52,25 @@ oneAPI has no aarch64 build, so on aarch64 `rustllama-kernels-sycl`
 compiles a no-op stub, there is no SYCL device, and inference runs on
 CPU + CUDA.
 
+## XMX / DPAS tensor-core GEMM (opt-in)
+
+Intel Arc / Data Center GPU Max (Xe-HPG/HPC) expose **XMX** systolic arrays
+(DPAS instructions) for matrix-engine GEMM. rustllama has a bf16-compute GEMM
+path (`rsl_sycl_gemm_bf16_xmx_f32`, f32 in/out via `joint_matrix`) that runs on
+them. It is **off by default** and double-gated:
+
+1. **Build:** the kernel compiles only when the crate is built with
+   `RUSTLLAMA_SYCL_XMX=1` (adds `-DRSL_SYCL_XMX`). A normal build omits it.
+2. **Runtime:** the model dispatcher uses it only when `RUSTLLAMA_SYCL_XMX=1`
+   is *also* set at runtime **and** the device reports XMX capability.
+
+Device capability surfaces as `xmx_capable` in `rustllama doctor` (it is the
+SYCL `ext::intel::info::device::uuid` sibling probe — Xe-LP iGPUs like Iris Xe
+report `false`, having no XMX). Validate the kernel against the CPU reference
+with the `xmx:gemm` probe under `rustllama doctor --sycl-parity`; it SKIPs
+cleanly on a non-XMX device or a build without the define. Leave XMX off unless
+you have the hardware and have confirmed parity on it.
+
 ## How to actually use it (faster without new hardware *if you have an Intel GPU*)
 
 If this machine has an idle Intel iGPU (Xe/UHD) or Arc, offloading to it is a

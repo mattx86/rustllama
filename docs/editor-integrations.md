@@ -18,10 +18,24 @@ about before you commit.
 `rustllama serve --ip 0.0.0.0 --port 11434`, or set
 `[server].bind_addr = "0.0.0.0"` in `config.toml`).
 
-**Auth:** the server runs without an API key by default. Editor configs
-typically still require a non-empty key string — pass anything (e.g.
-`"sk-rustllama"`); the server ignores it unless `[server].api_key` is
-configured.
+**Auth:** the server runs **without** an API key by default, so editor configs
+can pass any non-empty placeholder (e.g. `"sk-rustllama"`) and it is ignored.
+To actually require a token — the usual case when exposing rustllama on a LAN —
+set one and the server enforces `Authorization: Bearer <token>` on every
+request (constant-time compared; `/healthz` stays open). Three ways to set it,
+highest precedence first:
+
+```bash
+rustllama serve --api-key sk-secret       # 1. CLI flag (wins)
+RUSTLLAMA_API_KEY=sk-secret rustllama serve   # 2. env var
+#   [server]                              # 3. config.toml
+#   api_key = "sk-secret"
+```
+
+When a key is set, loopback (`127.0.0.1`) clients are still exempt by default so
+local tools keep working without a token; set `[server].require_auth_loopback =
+true` to require it from local clients too. In every editor config below,
+replace the placeholder `sk-rustllama` with your real key if you set one.
 
 **Model id:** the server's `/v1/models` reports model ids derived from
 the GGUF file stem (e.g. `qwen2.5-coder-7b-instruct-q4_k_m`). Editor
@@ -145,6 +159,47 @@ settings UI. Configure with:
 - Cline's "Use Browser Tool" and other agentic features depend on
   tool-call quality more than the API surface; pick a tool-tuned
   coding model (Qwen2.5-Coder, DeepSeek-Coder) for best results.
+
+---
+
+## OpenCode (terminal coding agent)
+
+[OpenCode](https://opencode.ai) talks to any OpenAI-compatible endpoint through
+a custom provider. Point it at rustllama's `/v1` base URL and give it the bearer
+token you set with `--api-key` / `RUSTLLAMA_API_KEY` / `[server].api_key`; it is
+sent as `Authorization: Bearer <token>`, which rustllama enforces.
+
+In OpenCode's config (`~/.config/opencode/opencode.json`), define an
+OpenAI-compatible provider:
+
+```json
+{
+  "provider": {
+    "rustllama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:11434/v1",
+        "apiKey": "sk-secret"
+      },
+      "models": {
+        "qwen2.5-coder-7b-instruct-q4_k_m": {}
+      }
+    }
+  }
+}
+```
+
+The model id must match what `GET /v1/models` reports. `apiKey` must equal the
+server's configured key (not a placeholder) whenever auth is on; over loopback
+with the default `require_auth_loopback = false` any value works. Check
+OpenCode's current provider docs for the exact config keys — the
+OpenAI-compatible provider surface is what rustllama targets.
+
+**Caveats:**
+- For non-loopback use (another host on the LAN), start the server with
+  `serve --ip 0.0.0.0 --api-key <token>` and use `http://<host>:11434/v1`.
+- OpenCode's agentic flows lean on tool-call quality; pick a tool-tuned coding
+  model (Qwen2.5-Coder, DeepSeek-Coder) for best results.
 
 ---
 
