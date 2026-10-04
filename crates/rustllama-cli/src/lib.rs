@@ -77,6 +77,14 @@ pub enum Command {
         /// reference themselves and are covered by the SYCL/CUDA modes.
         #[arg(long, default_value_t = false)]
         cpu_parity: bool,
+        /// Run the native Metal (MLX) kernel parity harness: the Apple-Metal
+        /// packed-quant matvecs (all K-quants, IQ grids, IQ4, MXFP, PTQ1_0) +
+        /// dense matvec + rmsnorm against their CPU reference on identical
+        /// inputs. In-process (Apple-Silicon target); SKIPs cleanly off Apple
+        /// Silicon (no Metal device). These kernels were authored write-blind
+        /// on a non-Apple host, so this is their first real validation.
+        #[arg(long, default_value_t = false)]
+        metal_parity: bool,
     },
     /// Print the rustllama version.
     Version,
@@ -932,6 +940,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             sycl_parity_probe,
             cuda_parity,
             cpu_parity,
+            metal_parity,
         } => {
             if let Some(probe) = sycl_parity_probe {
                 crate::gpu_parity::run_probe(&probe)
@@ -941,6 +950,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 crate::gpu_parity::run_cuda_parity()
             } else if cpu_parity {
                 crate::gpu_parity::run_cpu_parity()
+            } else if metal_parity {
+                crate::gpu_parity::run_metal_parity()
             } else {
                 doctor(&config_path, sycl_smoke).await
             }

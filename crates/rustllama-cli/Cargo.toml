@@ -79,6 +79,10 @@ rustllama-kernels-cuda = { path = "../rustllama-kernels-cuda" }
 # Threads sweep installs the rayon thread pool at engine load; the
 # CPU kernels crate owns the actual `install_thread_pool` entrypoint.
 rustllama-kernels-cpu = { path = "../rustllama-kernels-cpu" }
+# kernels-mlx: real-only, always compiled — the Apple-Metal shim builds to an
+# inert stub off Apple Silicon (device_count()==0). `doctor --metal-parity`
+# exercises it against the CPU reference (all SKIP off-Mac).
+rustllama-kernels-mlx = { path = "../rustllama-kernels-mlx" }
 
 [dev-dependencies]
 rustllama-gguf = { path = "../rustllama-gguf", features = ["synth"] }

@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 
 use rustllama_kernels_cpu as k;
 use rustllama_kernels_cuda as ck;
+use rustllama_kernels_mlx as mk;
 use rustllama_kernels_sycl as sk;
 
 // ---------------------------------------------------------------
@@ -285,6 +286,10 @@ fn probe_names() -> Vec<String> {
         }
         v.push(format!("fused:{}", l.name));
     }
+    // XMX/DPAS bf16 tensor-core GEMM (Arc Xe-HPG / PVC Xe-HPC). SKIPs unless
+    // the device is XMX-capable AND the DLL was built -DRSL_SYCL_XMX; on Iris
+    // Xe (Xe-LP) it reports SKIP. Last so it banks after the matvec families.
+    v.push("xmx:gemm".to_string());
     v
 }
 
@@ -409,6 +414,7 @@ pub fn run_probe(name: &str) -> anyhow::Result<()> {
         "matvec" => probe_matvec(&stream, name, rest, started),
         "fused" => probe_fused(&stream, name, rest, started),
         "attn" => probe_attn(&stream, name, rest, started),
+        "xmx" => probe_xmx(&stream, name, started),
         _ => anyhow::bail!("unknown probe kind {kind}"),
     }
     Ok(())
@@ -432,6 +438,49 @@ fn finite_ref(layout: &QuantLayout, cpu: CpuMatvec, x: &[f32]) -> Option<(Vec<u8
         }
     }
     None
+}
+
+/// XMX/DPAS bf16 tensor-core GEMM probe. SKIP unless the device is XMX-capable
+/// AND the DLL was built with the XMX path (`-DRSL_SYCL_XMX`; otherwise the host
+/// wrapper's kernel returns -2 → Ok(false)). bf16 compute vs an f32 CPU
+/// reference, so the gate is deliberately loose — it catches a wrong
+/// joint_matrix fragment/scale layout (cos→0), not bf16 rounding.
+/// `out[n*M + m] = Σ_k W[m,k]·x[n,k]`. WRITE-BLIND (no XMX GPU here); on-Arc
+/// numbers settle the real tolerance.
+fn probe_xmx(stream: &sk::SyclStream, name: &str, started: Instant) {
+    if !sk::xmx_available(stream) {
+        emit(name, "SKIP", "device-not-xmx-capable-or-no-xmx-build");
+        return;
+    }
+    let (m, kd, n) = (64usize, 128usize, 16usize); // K % 16 (TK) == 0
+    let w = gen_x(m * kd, 71);
+    let x = gen_x(n * kd, 73);
+    let mut cpu = vec![0f32; n * m];
+    for ni in 0..n {
+        for mi in 0..m {
+            let mut acc = 0f32;
+            for ki in 0..kd {
+                acc += w[mi * kd + ki] * x[ni * kd + ki];
+            }
+            cpu[ni * m + mi] = acc;
+        }
+    }
+    let mut gpu = vec![0f32; n * m];
+    let res = sk::gemm_bf16_xmx_f32_host(stream, &w, &x, &mut gpu, m, kd, n);
+    let ms = started.elapsed().as_millis();
+    match res {
+        Ok(true) => {
+            let (cos, max_rel) = compare(&gpu, &cpu);
+            let ok = cos > 0.98 && max_rel < 0.10;
+            emit(
+                name,
+                if ok { "OK" } else { "MISCOMPUTE" },
+                &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"),
+            );
+        }
+        Ok(false) => emit(name, "SKIP", &format!("xmx-gemm-unavailable ms={ms}")),
+        Err(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
+    }
 }
 
 fn probe_matvec(stream: &sk::SyclStream, name: &str, dtype: &str, started: Instant) {
@@ -2265,6 +2314,166 @@ pub fn run_cpu_parity() -> anyhow::Result<()> {
             "\nall exercised CPU SIMD / parallel matvec paths match the scalar reference on \
              this host."
         );
+    }
+    Ok(())
+}
+
+// ===============================================================
+// Metal (MLX) parity (`rustllama doctor --metal-parity`)
+// ===============================================================
+//
+// The Apple-Metal analogue of the CUDA harness: run each native Metal kernel
+// against its CPU reference on identical inputs, in-process. Everything SKIPs
+// off Apple Silicon (`mk::device_count()==0` on the inert stub), so this runs
+// clean (all SKIP) on Windows/Linux and does the real comparison only on a Mac.
+//
+// Covers the packed-quant matvecs (the bulk of the write-blind Metal kernels:
+// all K-quants the shared LAYOUTS describe, the IQ grids, IQ4, MXFP, PTQ1_0)
+// plus the host-pointer dense f32 matvec + rmsnorm. The forward-pass primitives
+// (rope/silu/embedding), F32 + quantized-KV flash, and argmax are a follow-on
+// (they need device-buffer plumbing + their own references); the matvec probes
+// here exercise the highest-risk dequant math first.
+
+/// Map a LAYOUTS dtype name to the MLX packed-matvec kind. `None` for names the
+/// shared harness describes but the MLX cache doesn't enumerate (there are none
+/// today — kept for symmetry with the CUDA/SYCL mappers).
+fn mlx_kind_for(name: &str) -> Option<mk::MlxPackedKind> {
+    use mk::MlxPackedKind as P;
+    Some(match name {
+        "q8_0" => P::Q8_0,
+        "q4_k" => P::Q4_K,
+        "q5_k" => P::Q5_K,
+        "q6_k" => P::Q6_K,
+        "iq4_nl" => P::Iq4_Nl,
+        "iq4_xs" => P::Iq4_Xs,
+        "iq1_s" => P::Iq1_S,
+        "iq1_m" => P::Iq1_M,
+        "iq2_xxs" => P::Iq2_Xxs,
+        "iq2_xs" => P::Iq2_Xs,
+        "iq2_s" => P::Iq2_S,
+        "iq3_xxs" => P::Iq3_Xxs,
+        "iq3_s" => P::Iq3_S,
+        "ptq1_0" => P::Ptq1_0,
+        "mxfp4" => P::Mxfp4,
+        "mxfp6" => P::Mxfp6,
+        "mxfp8" => P::Mxfp8,
+        _ => return None,
+    })
+}
+
+pub fn run_metal_parity() -> anyhow::Result<()> {
+    println!("Metal (MLX) kernel parity harness (Apple GPU backend, in-process)");
+    let n_dev = mk::device_count();
+    if n_dev == 0 {
+        println!(
+            "no Metal device visible (non-Apple-Silicon host, or no Metal GPU) — all SKIP"
+        );
+        println!("\nsummary: SKIP (no Metal device)");
+        return Ok(());
+    }
+    let budget = match mk::device_info(0) {
+        Ok(info) => {
+            println!(
+                "Metal device 0: {} ({} MB), {} device(s) total",
+                info.name,
+                info.total_mem_bytes / (1024 * 1024),
+                n_dev,
+            );
+            ((info.total_mem_bytes as f64) * 0.85) as usize
+        }
+        Err(_) => {
+            println!("{n_dev} Metal device(s) (info query failed)");
+            0
+        }
+    };
+    let Some(mut cache) = mk::MlxMatvecCache::new(0, budget) else {
+        println!("failed to create MlxMatvecCache on device 0 — all SKIP");
+        println!("\nsummary: SKIP (no cache)");
+        return Ok(());
+    };
+    println!();
+    let mut counts: std::collections::BTreeMap<&'static str, usize> = Default::default();
+
+    // ---- Packed matvecs the MLX backend implements ----
+    for layout in LAYOUTS {
+        let Some(kind) = mlx_kind_for(layout.name) else {
+            continue;
+        };
+        let name = format!("matvec:{}", layout.name);
+        let x = gen_x(MV_K, 42);
+        let Some((w, cpu_out)) = finite_ref(layout, cpu_matvec_for(layout.name), &x) else {
+            cu_emit(&name, "SKIP", "no-finite-reference");
+            *counts.entry("SKIP").or_default() += 1;
+            continue;
+        };
+        let mut out = vec![0f32; MV_M];
+        let ok = cache.matvec_packed(kind, w.as_ptr() as usize, &w, &x, &mut out, MV_M, MV_K);
+        if ok {
+            cu_grade(&name, &out, &cpu_out, 0.999, 0.02, &mut counts);
+        } else {
+            cu_emit(&name, "KERNEL_ERR", "matvec_packed returned false");
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+        }
+    }
+
+    // ---- Dense f32 matvec (host-pointer reference path) ----
+    {
+        let (m, kd) = (MV_M, MV_K);
+        let w = gen_x(m * kd, 201);
+        let x = gen_x(kd, 203);
+        let mut cpu = vec![0f32; m];
+        ref_matvec_f32_scalar(&w, &x, &mut cpu, m, kd);
+        let mut gpu = vec![0f32; m];
+        match mk::matvec_f32(&w, &x, &mut gpu, m, kd) {
+            Ok(()) => cu_grade("matvec:f32", &gpu, &cpu, 0.9999, 0.01, &mut counts),
+            Err(e) => {
+                cu_emit("matvec:f32", "KERNEL_ERR", &format!("{e:?}"));
+                *counts.entry("KERNEL_ERR").or_default() += 1;
+            }
+        }
+    }
+
+    // ---- RMSNorm (host-pointer reference path) ----
+    {
+        let rows = 4usize;
+        let d = 256usize;
+        let x = gen_x(rows * d, 21);
+        let wv = gen_x(d, 22);
+        let eps = 1e-5f32;
+        let mut cpu = vec![0f32; rows * d];
+        for r in 0..rows {
+            let mut ss = 0.0f32;
+            for i in 0..d {
+                ss += x[r * d + i] * x[r * d + i];
+            }
+            let inv = 1.0 / (ss / d as f32 + eps).sqrt();
+            for i in 0..d {
+                cpu[r * d + i] = x[r * d + i] * inv * wv[i];
+            }
+        }
+        let mut gpu = vec![0f32; rows * d];
+        match mk::rmsnorm_f32(&x, &wv, &mut gpu, rows, d, eps) {
+            Ok(()) => cu_grade("rmsnorm:f32", &gpu, &cpu, 0.9999, 0.01, &mut counts),
+            Err(e) => {
+                cu_emit("rmsnorm:f32", "KERNEL_ERR", &format!("{e:?}"));
+                *counts.entry("KERNEL_ERR").or_default() += 1;
+            }
+        }
+    }
+
+    println!();
+    let summary: Vec<String> = counts.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    println!("summary: {}", summary.join("  "));
+    let bad = counts.get("MISCOMPUTE").copied().unwrap_or(0)
+        + counts.get("KERNEL_ERR").copied().unwrap_or(0);
+    if bad > 0 {
+        println!(
+            "\n{bad} Metal kernel(s) diverged from the CPU reference or failed to launch — \
+             investigate before trusting the Metal backend (these kernels were authored \
+             write-blind on a non-Apple host; this harness is their first real check)."
+        );
+    } else if counts.get("OK").copied().unwrap_or(0) > 0 {
+        println!("\nall exercised Metal kernels match the CPU reference on this device.");
     }
     Ok(())
 }
