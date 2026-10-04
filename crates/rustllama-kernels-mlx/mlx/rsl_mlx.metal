@@ -985,3 +985,191 @@ kernel void rsl_mlx_matvec_iq4_xs_packed_f32_kernel(
     acc = simd_sum(acc);
     if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
 }
+
+// ======================================================================
+// Microscaling (MX / NVFP4) decode helpers — byte-exact ports of the
+// rsl_mx_{e8m0,e2m1,e3m2,e4m3}_to_f32 SYCL helpers (== CPU dequant_mxfp*).
+// ======================================================================
+
+// OCP E2M1 4-bit code (MXFP4 / NVFP4 element) codebook.
+constant float E2M1_LUT[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+};
+
+// E8M0 shared-scale byte -> f32 (2^(s-127); 0xFF = NaN).
+inline float rsl_e8m0_to_f32(uchar s) {
+    if (s == 0xFF) return NAN;
+    return ldexp(1.0f, (int)s - 127);
+}
+// E3M2 6-bit code (MXFP6 element) -> f32. 1 sign / 3 exp (bias 3) / 2 mantissa.
+inline float rsl_e3m2_to_f32(uchar c) {
+    const bool sign = (c & 0x20) != 0;
+    const int exp = (c >> 2) & 0x07;
+    const int mant = c & 0x03;
+    float val;
+    if (exp == 0) {
+        val = ((float)mant / 4.0f) * ldexp(1.0f, -2);
+    } else {
+        val = (1.0f + (float)mant / 4.0f) * ldexp(1.0f, exp - 3);
+    }
+    return sign ? -val : val;
+}
+// E4M3 byte (MXFP8 / NVFP4 scale) -> f32. 1 sign / 4 exp (bias 7) / 3 mantissa;
+// exp==0xF & mant==7 is the sole NaN.
+inline float rsl_e4m3_to_f32(uchar b) {
+    const bool sign = (b & 0x80) != 0;
+    const int exp = (b >> 3) & 0x0F;
+    const int mant = b & 0x07;
+    if (exp == 0x0F && mant == 0x07) return NAN;
+    float val;
+    if (exp == 0) {
+        val = (float)mant * (1.0f / 512.0f);
+    } else {
+        val = (1.0f + (float)mant / 8.0f) * ldexp(1.0f, exp - 7);
+    }
+    return sign ? -val : val;
+}
+
+// MXFP4: 17 bytes / 32 = { u8 qs[16] (two E2M1 nibbles each); u8 E8M0 scale }.
+// Interleaved: low nibble -> elem 2j, high -> 2j+1. K % 32 == 0.
+kernel void rsl_mlx_matvec_mxfp4_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K         [[buffer(3)]],
+    constant int &M         [[buffer(4)]],
+    constant int &N         [[buffer(5)]],
+    uint2 tgpos             [[threadgroup_position_in_grid]],
+    uint lane               [[thread_position_in_threadgroup]],
+    uint lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x;
+    const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 32;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 17ul;
+    device const uchar *row = w + (ulong)m * bytes_per_row;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 17ul;
+        const float scale = rsl_e8m0_to_f32(blk[16]);
+        const int x_off = b * 32;
+        for (int j = 0; j < 16; ++j) {
+            const uchar byte = blk[j];
+            acc += E2M1_LUT[byte & 0x0F] * scale * xc[x_off + j * 2];
+            acc += E2M1_LUT[(byte >> 4) & 0x0F] * scale * xc[x_off + j * 2 + 1];
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// MXFP6: 25 bytes / 32 = { 24 bytes of 6-bit E3M2 codes; u8 E8M0 scale }.
+// Codes are packed 6-bits-across-bytes. K % 32 == 0.
+kernel void rsl_mlx_matvec_mxfp6_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K         [[buffer(3)]],
+    constant int &M         [[buffer(4)]],
+    constant int &N         [[buffer(5)]],
+    uint2 tgpos             [[threadgroup_position_in_grid]],
+    uint lane               [[thread_position_in_threadgroup]],
+    uint lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x;
+    const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 32;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 25ul;
+    device const uchar *row = w + (ulong)m * bytes_per_row;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 25ul;
+        const float scale = rsl_e8m0_to_f32(blk[24]);
+        const int x_off = b * 32;
+        for (int j = 0; j < 32; ++j) {
+            const int bitpos = j * 6;
+            const int byte_idx = bitpos >> 3;
+            const int bit_off = bitpos & 7;
+            const uint lo = blk[byte_idx];
+            const uint hi = (byte_idx + 1 < 24) ? (uint)blk[byte_idx + 1] : 0u;
+            const uint word = lo | (hi << 8);
+            const uchar code = (uchar)((word >> bit_off) & 0x3Fu);
+            acc += rsl_e3m2_to_f32(code) * scale * xc[x_off + j];
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// MXFP8: 33 bytes / 32 = { u8 E4M3[32]; u8 E8M0 scale }. Sequential elements.
+// K % 32 == 0.
+kernel void rsl_mlx_matvec_mxfp8_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K         [[buffer(3)]],
+    constant int &M         [[buffer(4)]],
+    constant int &N         [[buffer(5)]],
+    uint2 tgpos             [[threadgroup_position_in_grid]],
+    uint lane               [[thread_position_in_threadgroup]],
+    uint lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x;
+    const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 32;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 33ul;
+    device const uchar *row = w + (ulong)m * bytes_per_row;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 33ul;
+        const float scale = rsl_e8m0_to_f32(blk[32]);  // E8M0 shared scale
+        const int x_off = b * 32;
+        for (int j = 0; j < 32; ++j) {
+            acc += rsl_e4m3_to_f32(blk[j]) * scale * xc[x_off + j];
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}
+
+// NVFP4: 9 bytes / 16 = { u8 qs[8] (two E2M1 nibbles each); u8 E4M3 scale }.
+// Interleaved like MXFP4 but per-16 block with an FP8 (E4M3) scale. K % 16 == 0.
+kernel void rsl_mlx_matvec_nvfp4_packed_f32_kernel(
+    device const uchar *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant int &K         [[buffer(3)]],
+    constant int &M         [[buffer(4)]],
+    constant int &N         [[buffer(5)]],
+    uint2 tgpos             [[threadgroup_position_in_grid]],
+    uint lane               [[thread_position_in_threadgroup]],
+    uint lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)tgpos.x;
+    const int col = (int)tgpos.y;
+    if (m >= M || col >= N) return;
+    const int blocks_per_row = K / 16;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 9ul;
+    device const uchar *row = w + (ulong)m * bytes_per_row;
+    device const float *xc = x + (ulong)col * (ulong)K;
+    float acc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *blk = row + (ulong)b * 9ul;
+        const float scale = rsl_e4m3_to_f32(blk[8]);
+        const int x_off = b * 16;
+        for (int j = 0; j < 8; ++j) {
+            const uchar byte = blk[j];
+            acc += E2M1_LUT[byte & 0x0F] * scale * xc[x_off + j * 2];
+            acc += E2M1_LUT[(byte >> 4) & 0x0F] * scale * xc[x_off + j * 2 + 1];
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)col * (ulong)M + (ulong)m] = acc;
+}

@@ -335,11 +335,11 @@ static int mlx_run(rsl_mlx_stream *s, NSString *name, MTLSize grid, MTLSize tpg,
 // Shared body for the packed-quant matvecs: resolve W/x/out from the registry,
 // dispatch `kernel_name` over (M rows, N cols) threadgroups of 32 lanes. K must
 // be a multiple of the format's 32-wide block. N == 1 is the single case.
-static int mlx_packed_matvec(rsl_mlx_stream *s, NSString *kernel_name,
+static int mlx_packed_matvec_align(rsl_mlx_stream *s, NSString *kernel_name,
                              const void *w, const float *x, float *out,
-                             int M, int K, int N) {
+                             int M, int K, int N, int k_align) {
     if (s == nullptr || w == nullptr || x == nullptr || out == nullptr) return -1;
-    if (M <= 0 || K <= 0 || N <= 0 || (K % 32) != 0) return -1;
+    if (M <= 0 || K <= 0 || N <= 0 || k_align <= 0 || (K % k_align) != 0) return -1;
     size_t ow = 0, ox = 0, oo = 0;
     id<MTLBuffer> bw = mlx_resolve(w, &ow);
     id<MTLBuffer> bx = mlx_resolve(x, &ox);
@@ -356,6 +356,14 @@ static int mlx_packed_matvec(rsl_mlx_stream *s, NSString *kernel_name,
         [enc setBytes:&mm length:sizeof(int) atIndex:4];
         [enc setBytes:&nn length:sizeof(int) atIndex:5];
     });
+}
+
+// Default 32-wide-block packed matvec (Q8_0/Q4_0/Q5_0/Q4_1/Q5_1/IQ4_NL/MXFP*).
+// K-quants pass 256 and NVFP4 passes 16 via mlx_packed_matvec_align directly.
+static int mlx_packed_matvec(rsl_mlx_stream *s, NSString *kernel_name,
+                             const void *w, const float *x, float *out,
+                             int M, int K, int N) {
+    return mlx_packed_matvec_align(s, kernel_name, w, x, out, M, K, N, 32);
 }
 #endif  // RSL_MLX_HAVE_METAL
 
@@ -673,10 +681,6 @@ RSL_MLX_DEFINE_PACKED(matvec_iq3_xxs_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_iq3_s_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_iq1_s_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_iq1_m_packed_f32)
-RSL_MLX_DEFINE_PACKED(matvec_nvfp4_packed_f32)
-RSL_MLX_DEFINE_PACKED(matvec_mxfp4_packed_f32)
-RSL_MLX_DEFINE_PACKED(matvec_mxfp6_packed_f32)
-RSL_MLX_DEFINE_PACKED(matvec_mxfp8_packed_f32)
 RSL_MLX_DEFINE_PACKED(matvec_pq2_0_packed_f32)
 #undef RSL_MLX_DEFINE_PACKED
 
@@ -832,6 +836,30 @@ extern "C" int rsl_mlx_matvec_iq4_xs_packed_f32_batched(rsl_mlx_stream *s, const
 #if RSL_MLX_HAVE_METAL
     if ((K % 256) != 0) return -1;
     return mlx_packed_matvec(s, @"rsl_mlx_matvec_iq4_xs_packed_f32_kernel", w, x, out, M, K, N);
+#else
+    (void)s;(void)w;(void)x;(void)out;(void)M;(void)K;(void)N; return -1;
+#endif
+}
+
+// --- MXFP4/6/8 (32-wide, E8M0 scale) via SIMPLE32; NVFP4 (16-wide, E4M3 scale)
+// needs K%16 so it uses mlx_packed_matvec_align(…, 16). Ported byte-exact from
+// the rsl_matvec_{mxfp4,mxfp6,mxfp8,nvfp4}_packed_f32_usm SYCL refs. ---
+RSL_MLX_SIMPLE32(matvec_mxfp4_packed_f32, "rsl_mlx_matvec_mxfp4_packed_f32_kernel")
+RSL_MLX_SIMPLE32(matvec_mxfp6_packed_f32, "rsl_mlx_matvec_mxfp6_packed_f32_kernel")
+RSL_MLX_SIMPLE32(matvec_mxfp8_packed_f32, "rsl_mlx_matvec_mxfp8_packed_f32_kernel")
+
+extern "C" int rsl_mlx_matvec_nvfp4_packed_f32(rsl_mlx_stream *s, const void *w,
+    const float *x, float *out, int M, int K) {
+#if RSL_MLX_HAVE_METAL
+    return mlx_packed_matvec_align(s, @"rsl_mlx_matvec_nvfp4_packed_f32_kernel", w, x, out, M, K, 1, 16);
+#else
+    (void)s;(void)w;(void)x;(void)out;(void)M;(void)K; return -1;
+#endif
+}
+extern "C" int rsl_mlx_matvec_nvfp4_packed_f32_batched(rsl_mlx_stream *s, const void *w,
+    const float *x, float *out, int M, int K, int N) {
+#if RSL_MLX_HAVE_METAL
+    return mlx_packed_matvec_align(s, @"rsl_mlx_matvec_nvfp4_packed_f32_kernel", w, x, out, M, K, N, 16);
 #else
     (void)s;(void)w;(void)x;(void)out;(void)M;(void)K;(void)N; return -1;
 #endif
