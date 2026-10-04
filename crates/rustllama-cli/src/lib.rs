@@ -3317,8 +3317,8 @@ fn log_backend_selection() {
     let intel_count = match rustllama_kernels_sycl::device_count() {
         Ok(n) if n > 0 => {
             use std::collections::BTreeMap;
-            // physical key -> list of (device_idx, driver, backend)
-            let mut groups: BTreeMap<(String, u32, u64), Vec<(u32, String, &'static str)>> =
+            // physical key -> list of (device_idx, driver, backend, xmx_capable)
+            let mut groups: BTreeMap<(String, u32, u64), Vec<(u32, String, &'static str, bool)>> =
                 BTreeMap::new();
             for idx in 0..n {
                 match rustllama_kernels_sycl::device_info(idx) {
@@ -3328,7 +3328,7 @@ fn log_backend_selection() {
                         groups
                             .entry((info.name.clone(), info.vendor_id, info.vram_mb()))
                             .or_default()
-                            .push((idx, info.driver_version.clone(), backend));
+                            .push((idx, info.driver_version.clone(), backend, info.xmx_capable));
                     }
                     Err(e) => tracing::info!(
                         vendor = "intel",
@@ -3344,13 +3344,16 @@ fn log_backend_selection() {
                 // appears in this group (identical GPUs on one backend
                 // → N; one GPU via L0+OpenCL → both appear once → 1).
                 let mut per_backend: BTreeMap<&str, usize> = BTreeMap::new();
-                for (_, _, b) in entries {
+                for (_, _, b, _) in entries {
                     *per_backend.entry(*b).or_default() += 1;
                 }
                 let physical = per_backend.values().copied().max().unwrap_or(1);
                 physical_total += physical;
                 let backends: Vec<&str> = per_backend.keys().copied().collect();
-                let indices: Vec<u32> = entries.iter().map(|(i, _, _)| *i).collect();
+                let indices: Vec<u32> = entries.iter().map(|(i, _, _, _)| *i).collect();
+                // bf16 XMX/DPAS capable (Arc Xe-HPG / PVC); same across identical
+                // devices in a group. Informational — the XMX GEMM is opt-in.
+                let xmx_capable = entries.iter().any(|(_, _, _, x)| *x);
                 // Active backend = the one dispatch actually uses: Level
                 // Zero if available, else OpenCL, else whatever's present
                 // (matches `first_enabled_sycl_device_index`).
@@ -3369,6 +3372,7 @@ fn log_backend_selection() {
                     device_indices = ?indices,
                     backends = %backends.join(", "),
                     active_backend = active_backend,
+                    xmx_capable = xmx_capable,
                     "GPU detected (Intel/SYCL{})",
                     if entries.len() > physical {
                         " — one physical GPU exposed via Level Zero + OpenCL; \

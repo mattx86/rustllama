@@ -1611,6 +1611,9 @@ mod imp {
             vram_bytes,
             uuid,
             is_integrated: is_integrated != 0,
+            // Populated by the public `device_info` wrapper (it has a stream to
+            // probe with); the inner FFI query doesn't create one.
+            xmx_capable: false,
         })
     }
 
@@ -5286,6 +5289,13 @@ pub struct DeviceInfo {
     /// or is a no-op (unified). Defaults to `false` when the query fails
     /// (no device / stub build).
     pub is_integrated: bool,
+    /// `true` = the device exposes the bf16 XMX/DPAS `joint_matrix`
+    /// combination (Intel Arc Xe-HPG / PVC Xe-HPC), so the opt-in XMX GEMM
+    /// path can run on it. `false` on Iris Xe (Xe-LP), the OpenCL fallback,
+    /// a non-XMX build, or the stub. Populated by [`device_info`] via a
+    /// capability probe on an ephemeral stream; purely informational (the
+    /// dispatch probes per-stream at call time).
+    pub xmx_capable: bool,
 }
 
 impl DeviceInfo {
@@ -5305,7 +5315,14 @@ impl DeviceInfo {
 ///
 /// Returns [`SyclError::Unavailable`] when no SYCL device is present.
 pub fn device_info(device_index: u32) -> Result<DeviceInfo> {
-    imp::device_info(device_index)
+    let mut info = imp::device_info(device_index)?;
+    // Probe bf16 XMX/DPAS capability on an ephemeral stream (same pattern as
+    // `current_backend_name`). Best-effort + informational: leave `false` if a
+    // stream can't be created. The dispatch still probes per-stream at call time.
+    if let Ok(stream) = imp::create_stream(device_index) {
+        info.xmx_capable = xmx_available(&stream);
+    }
+    Ok(info)
 }
 
 pub fn create_stream(device_index: u32) -> Result<SyclStream> {
