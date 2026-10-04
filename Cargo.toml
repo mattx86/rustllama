@@ -31,8 +31,8 @@ edition = "2021"
 rust-version = "1.83"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
-authors = ["rustllama contributors"]
-repository = "https://github.com/mcsx86/rustllama"
+authors = ["Matt Smith"]
+repository = "https://github.com/mattx86/rustllama"
 # This is an application workspace, not a set of crates.io libraries.
 # Every member sets `publish.workspace = true` to inherit this and stay
 # unpublishable (path-only deps would fail `cargo publish` anyway).
