@@ -288,6 +288,54 @@ fn try_gemm_fp8_wgmma_batched(
     guard.gemm_fp8_wgmma(weight_key, w_bytes, x, out, m, k, n, hopper_tc_tma())
 }
 
+// ------------------------------------------------------------
+// Intel XMX/DPAS bf16 tensor-core GEMM dispatch (SYCL, opt-in)
+// ------------------------------------------------------------
+
+/// Whether the Intel XMX/DPAS bf16 tensor-core GEMM path is enabled. **DEFAULT
+/// OFF** + WRITE-BLIND (no XMX GPU has validated it): the path dequantizes the
+/// weight to f32 and runs a bf16 `joint_matrix` GEMM (bf16 compute, f32
+/// accumulate) — an A/B option on Arc (Xe-HPG) / PVC (Xe-HPC), gated behind the
+/// opt-in `RUSTLLAMA_SYCL_XMX=1`. The per-device XMX capability is checked at
+/// dispatch (via the SYCL stream) since it needs a live device — this flag is
+/// just the env opt-in. Mirror of [`fp4_tc_enabled`]; cached once.
+fn xmx_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        std::env::var("RUSTLLAMA_SYCL_XMX")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Batched XMX/DPAS bf16 GEMM via the USM_ATTN SYCL stream: dequantize W→f32
+/// and run the `joint_matrix` GEMM (the kernel zero-pads the M/N/K tails, so no
+/// dim alignment is required). `false` on any miss — no USM_ATTN context, the
+/// device isn't XMX-capable, the dtype isn't dequantizable to f32, or the
+/// kernel reports unavailable/exception — so the caller falls straight through
+/// to the proven packed/scalar SYCL/CPU ladder with `out` untouched.
+fn try_gemm_xmx_batched(w: &Tensor, x: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) -> bool {
+    USM_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(ctx) = slot.as_mut() else {
+            return false;
+        };
+        // Skip the f32 weight dequant entirely on a non-XMX device (Iris Xe /
+        // OpenCL fallback / non-XMX build) — the probe is cheap, the dequant
+        // is not.
+        if !sk::xmx_available(&ctx.stream) {
+            return false;
+        }
+        let Some(w_f32) = dtype_dequant_to_f32(w.dtype, as_bytes(w), m * k) else {
+            return false; // exotic codebook/ternary/fp4 dtype — no f32 dequant
+        };
+        matches!(
+            sk::gemm_bf16_xmx_f32_host(&ctx.stream, &w_f32, x, out, m, k, n),
+            Ok(true)
+        )
+    })
+}
+
 // ============================================================
 // Native MLX packed-matvec dispatch (Apple Metal backend)
 // ============================================================
@@ -10088,6 +10136,28 @@ pub fn try_matvec_tensor_batched_usm_f32(
     {
         let wb = as_bytes(w);
         if try_gemm_fp8_wgmma_batched(wb.as_ptr() as usize, wb, x, out, m, k, n) {
+            return true;
+        }
+    }
+    // Intel XMX/DPAS bf16 tensor-core GEMM — the SYCL twin of the CUDA TC gates
+    // above. Dequantizes W→f32 and runs a joint_matrix GEMM for prefill-size
+    // batches (n >= 16 amortizes the dequant + tensor core); the kernel
+    // zero-pads M/N/K tails so no dim alignment is needed. OPT-IN + inert
+    // unless RUSTLLAMA_SYCL_XMX=1 on an XMX-capable Arc/PVC device (probed
+    // per-stream inside try_gemm_xmx_batched). A miss falls straight through to
+    // the scalar SYCL/CPU ladder — byte-identical on Iris Xe / non-opted-in
+    // hosts. CUDA-first doctrine preserved: the CUDA gates above win when a
+    // CUDA GPU is also present (XMX only engages on a SYCL-active host).
+    if xmx_enabled()
+        && !tensor_forced_to_cpu(&w.name)
+        && current_layer_idx() < n_gpu_layers()
+        && m != 0
+        && k != 0
+        && n >= 16
+        && x.len() == n * k
+        && out.len() == n * m
+    {
+        if try_gemm_xmx_batched(w, x, out, m, k, n) {
             return true;
         }
     }

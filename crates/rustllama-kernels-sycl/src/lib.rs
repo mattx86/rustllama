@@ -155,6 +155,20 @@ mod imp {
             n_bytes: usize,
         ) -> *mut std::ffi::c_void;
 
+        // XMX/DPAS bf16 tensor-core GEMM (Arc/PVC). out[n*M+m] = sum_k
+        // W[m,k]*X[n,k], W/X/out f32 (USM pointers). rc: 0 ok, -1 bad args,
+        // -2 non-XMX build, -3 SYCL exception. Plus the device capability probe.
+        pub(super) fn rsl_sycl_gemm_bf16_xmx_f32(
+            s: *mut rsl_stream,
+            w: *const f32,
+            x: *const f32,
+            out: *mut f32,
+            m: c_int,
+            k: c_int,
+            n: c_int,
+        ) -> c_int;
+        pub(super) fn rsl_sycl_xmx_available(s: *mut rsl_stream) -> c_int;
+
         pub(super) fn rsl_rmsnorm_usm(
             s: *mut rsl_stream,
             x_usm: *const u16,
@@ -6110,6 +6124,95 @@ pub unsafe fn iq_search_8elt_signed_raw(
 /// Use for testing + the future engine integration's per-call path;
 /// the integration will keep `logits_usm` resident across LM-head →
 /// sampler so the copy disappears.
+/// Whether `stream`'s device exposes the bf16 XMX/DPAS `joint_matrix`
+/// combination (Intel Arc Xe-HPG / PVC Xe-HPC). `false` on Iris Xe (Xe-LP),
+/// the OpenCL fallback, or a non-XMX build. The accel dispatch gates the XMX
+/// GEMM on this so it never launches (or dequants a weight to f32) on a device
+/// that would only fault / fall back.
+pub fn xmx_available(stream: &SyclStream) -> bool {
+    // SAFETY: `stream.raw` is a live rsl_stream for this stream's lifetime;
+    // the probe only reads the queue's device.
+    unsafe { imp::rsl_sycl_xmx_available(stream.raw) == 1 }
+}
+
+/// Host-slice XMX/DPAS bf16 tensor-core GEMM: `out[n*M + m] = sum_k W[m,k] *
+/// X[n,k]` (row-major W `[M,K]`, X `[N,K]`, out `[N,M]`), all f32. Stages the
+/// three buffers into USM-shared, runs the `joint_matrix` kernel, copies the
+/// result back, and frees. Returns `Ok(true)` on success, `Ok(false)` when the
+/// kernel reports unavailable / bad args / a SYCL exception (rc < 0 — the
+/// caller falls back to the software path), and `Err` only on USM-alloc
+/// failure. WRITE-BLIND: compile-only — no XMX GPU to validate against.
+pub fn gemm_bf16_xmx_f32_host(
+    stream: &SyclStream,
+    w: &[f32],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<bool> {
+    if m == 0 || k == 0 || n == 0 {
+        return Err(SyclError::InvalidShape(
+            "gemm_bf16_xmx_f32_host: zero dim".to_string(),
+        ));
+    }
+    if w.len() < m * k || x.len() < n * k || out.len() < n * m {
+        return Err(SyclError::InvalidShape(
+            "gemm_bf16_xmx_f32_host: slice too small for M/K/N".to_string(),
+        ));
+    }
+    let f32sz = std::mem::size_of::<f32>();
+    let w_usm = usm_alloc_shared(stream, m * k * f32sz) as *mut f32;
+    if w_usm.is_null() {
+        return Err(SyclError::Unavailable);
+    }
+    let x_usm = usm_alloc_shared(stream, n * k * f32sz) as *mut f32;
+    if x_usm.is_null() {
+        // SAFETY: w_usm came from usm_alloc_shared above on this stream.
+        unsafe { usm_free(stream, w_usm as *mut std::ffi::c_void) };
+        return Err(SyclError::Unavailable);
+    }
+    let out_usm = usm_alloc_shared(stream, n * m * f32sz) as *mut f32;
+    if out_usm.is_null() {
+        // SAFETY: both came from usm_alloc_shared above on this stream.
+        unsafe {
+            usm_free(stream, x_usm as *mut std::ffi::c_void);
+            usm_free(stream, w_usm as *mut std::ffi::c_void);
+        }
+        return Err(SyclError::Unavailable);
+    }
+    // SAFETY: USM-shared is host-writable; we hold the only handles and the
+    // sizes match the allocations above.
+    unsafe {
+        std::ptr::copy_nonoverlapping(w.as_ptr(), w_usm, m * k);
+        std::ptr::copy_nonoverlapping(x.as_ptr(), x_usm, n * k);
+    }
+    let rc = unsafe {
+        imp::rsl_sycl_gemm_bf16_xmx_f32(
+            stream.raw,
+            w_usm as *const f32,
+            x_usm as *const f32,
+            out_usm,
+            m as std::os::raw::c_int,
+            k as std::os::raw::c_int,
+            n as std::os::raw::c_int,
+        )
+    };
+    let ok = rc == 0;
+    if ok {
+        // SAFETY: the kernel wrote N*M f32 into out_usm (USM-shared).
+        unsafe { std::ptr::copy_nonoverlapping(out_usm as *const f32, out.as_mut_ptr(), n * m) };
+    }
+    // SAFETY: all three came from usm_alloc_shared on `stream` and are unused
+    // past this point.
+    unsafe {
+        usm_free(stream, out_usm as *mut std::ffi::c_void);
+        usm_free(stream, x_usm as *mut std::ffi::c_void);
+        usm_free(stream, w_usm as *mut std::ffi::c_void);
+    }
+    Ok(ok)
+}
+
 pub fn sampler_argmax_host(stream: &SyclStream, logits: &[f32]) -> Result<u32> {
     let vocab = logits.len();
     if vocab == 0 {

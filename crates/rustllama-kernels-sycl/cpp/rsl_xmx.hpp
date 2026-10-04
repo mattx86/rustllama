@@ -220,3 +220,18 @@ extern "C" int rsl_sycl_gemm_bf16_xmx_f32(rsl_stream* s, const float* w,
 #endif
 }
 
+// Runtime capability probe exposed to the Rust host: does the stream's device
+// expose the bf16 XMX/DPAS joint_matrix combination? Returns 1 = capable,
+// 0 = not (Iris Xe Xe-LP / OpenCL fallback / non-XMX build / null stream).
+// Lets the accel dispatch skip the XMX launch (and its f32 weight dequant)
+// entirely on a device that would only fault/fall back. Compiled
+// unconditionally — in a non-XMX build rsl_xmx_device_capable() returns false.
+extern "C" int rsl_sycl_xmx_available(rsl_stream* s) {
+    if (!s) return 0;
+    try {
+        return rslxmx::rsl_xmx_device_capable(s->q.get_device()) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+

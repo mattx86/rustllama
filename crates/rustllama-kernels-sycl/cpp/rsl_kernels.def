@@ -188,3 +188,5 @@ EXPORTS
     ; XMX/DPAS joint_matrix bf16 GEMM (Arc/PVC). Always exported; the entry is a
     ; -2 "unavailable" stub unless the DLL was built -DRSL_SYCL_XMX.
     rsl_sycl_gemm_bf16_xmx_f32
+    ; XMX capability probe (1/0). Always exported; 0 in a non-XMX build.
+    rsl_sycl_xmx_available
