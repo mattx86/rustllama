@@ -4234,9 +4234,15 @@ async fn serve(
         Some(auth) => {
             tracing::info!(
                 rate_limit_per_minute = cfg.server.rate_limit_per_minute,
-                "bearer-token auth enabled — loopback connections + /healthz still bypass"
+                require_auth_loopback = cfg.server.require_auth_loopback,
+                "bearer-token auth enabled — {} still bypass",
+                if cfg.server.require_auth_loopback {
+                    "/healthz only"
+                } else {
+                    "loopback connections + /healthz"
+                }
             );
-            state.with_auth(auth)
+            state.with_auth(auth.require_loopback_auth(cfg.server.require_auth_loopback))
         }
         None => state,
     };

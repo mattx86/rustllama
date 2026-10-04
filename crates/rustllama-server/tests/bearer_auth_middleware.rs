@@ -84,6 +84,75 @@ async fn get_with_header(
     (status, www_auth)
 }
 
+/// Auth state whose loopback bypass is toggled by `require_loopback`
+/// (mirrors `[server].require_auth_loopback`).
+fn build_state_with_auth_loopback(tag: &str, key: &str, require_loopback: bool) -> AppState {
+    let auth = AuthState::new(key)
+        .expect("non-empty key must produce AuthState")
+        .require_loopback_auth(require_loopback);
+    build_state_no_auth(tag).with_auth(auth)
+}
+
+/// GET with an explicit `ConnectInfo` peer + optional Authorization header.
+/// The oneshot path doesn't set ConnectInfo, so we insert it to exercise the
+/// loopback-bypass branch of the middleware.
+async fn get_with_peer(
+    app: axum::Router,
+    path: &str,
+    peer: std::net::SocketAddr,
+    auth_value: Option<&str>,
+) -> StatusCode {
+    let mut builder = Request::builder().method("GET").uri(path);
+    if let Some(v) = auth_value {
+        builder = builder.header(header::AUTHORIZATION, v);
+    }
+    let mut req = builder.body(Body::empty()).unwrap();
+    req.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+    app.oneshot(req).await.unwrap().status()
+}
+
+/// `require_auth_loopback` toggles the loopback bypass: a 127.0.0.1 peer with
+/// no token is admitted by default (bypass on) but rejected when loopback auth
+/// is required; the right token still passes; a remote peer always 401s.
+#[tokio::test]
+async fn loopback_bypass_toggles_with_require_auth_loopback() {
+    use std::net::SocketAddr;
+    let loopback: SocketAddr = "127.0.0.1:52001".parse().unwrap();
+    let remote: SocketAddr = "192.168.1.50:52002".parse().unwrap();
+
+    // Default (bypass ON): loopback peer, no token → 200.
+    let app = router(build_state_with_auth_loopback("lb-default", "sk-test", false));
+    assert_eq!(
+        get_with_peer(app, "/v1/models", loopback, None).await,
+        StatusCode::OK,
+        "default loopback bypass should admit a local peer without a token"
+    );
+
+    // require_auth_loopback = true: loopback peer, no token → 401.
+    let app = router(build_state_with_auth_loopback("lb-require", "sk-test", true));
+    assert_eq!(
+        get_with_peer(app, "/v1/models", loopback, None).await,
+        StatusCode::UNAUTHORIZED,
+        "require_auth_loopback should reject a local peer without a token"
+    );
+
+    // require_auth_loopback = true: loopback peer WITH the right token → 200.
+    let app = router(build_state_with_auth_loopback("lb-ok", "sk-test", true));
+    assert_eq!(
+        get_with_peer(app, "/v1/models", loopback, Some("Bearer sk-test")).await,
+        StatusCode::OK,
+        "require_auth_loopback should admit a local peer WITH the right token"
+    );
+
+    // Remote peer, no token → 401 regardless of the toggle.
+    let app = router(build_state_with_auth_loopback("lb-remote", "sk-test", false));
+    assert_eq!(
+        get_with_peer(app, "/v1/models", remote, None).await,
+        StatusCode::UNAUTHORIZED,
+        "remote peer must always authenticate"
+    );
+}
+
 /// No AuthState attached → middleware doesn't fire, every request
 /// passes through unchanged. Pins the backward-compat path.
 #[tokio::test]

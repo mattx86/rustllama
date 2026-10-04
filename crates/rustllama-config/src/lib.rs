@@ -979,6 +979,15 @@ pub struct ServerConfig {
     /// the model about the execution environment.
     #[serde(default = "default_true")]
     pub tool_environment_hint: bool,
+    /// Require a valid `Authorization: Bearer <token>` even from loopback
+    /// (127.0.0.1 / ::1) clients. `false` (default) keeps the historical
+    /// loopback bypass — local CLI/GUI fetches are trusted and only remote
+    /// (LAN) peers must authenticate. Set `true` for defense-in-depth on a
+    /// shared host so even a local client (e.g. a co-resident OpenCode) must
+    /// present the token. No effect when `api_key` is empty (auth disabled);
+    /// `/healthz` always bypasses regardless.
+    #[serde(default)]
+    pub require_auth_loopback: bool,
 }
 
 impl Default for ServerConfig {
@@ -1005,6 +1014,7 @@ impl Default for ServerConfig {
             rate_limit_per_minute: 0,
             sandbox_memory_limit_mb: 0,
             tool_environment_hint: true,
+            require_auth_loopback: false,
         }
     }
 }

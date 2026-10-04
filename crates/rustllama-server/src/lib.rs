@@ -743,6 +743,12 @@ pub struct AuthState {
     /// `HashMap<key_hash, RateLimitBucket>` keyed by SHA-256(key).
     /// `None` when `[server].rate_limit_per_minute` is unset or 0.
     rate_limit: Option<Arc<RateLimitBucket>>,
+    /// When `true`, even loopback (127.0.0.1 / ::1) requests must present a
+    /// valid token — the default loopback bypass is disabled. Set from
+    /// `[server].require_auth_loopback` (default `false`, which keeps the
+    /// historical "local clients + the GUI's own fetches are trusted"
+    /// behavior). `/healthz` still bypasses regardless.
+    require_loopback: bool,
 }
 
 /// Token-bucket rate limiter. `tokens_per_minute` refills at a
@@ -819,7 +825,16 @@ impl AuthState {
         Some(Self {
             key: Arc::from(api_key.as_bytes().to_vec().into_boxed_slice()),
             rate_limit,
+            require_loopback: false,
         })
+    }
+
+    /// Require a valid token even from loopback peers (disable the loopback
+    /// bypass). `/healthz` still bypasses. Default is `false` (loopback
+    /// trusted). Set from `[server].require_auth_loopback`.
+    pub fn require_loopback_auth(mut self, require: bool) -> Self {
+        self.require_loopback = require;
+        self
     }
 
     /// Try to consume one request from the per-key rate-limit bucket.
@@ -1880,12 +1895,18 @@ async fn auth_middleware(
     // `app.oneshot()` which doesn't set it), the bypass doesn't
     // fire and the request must present the token like any other
     // remote — tests opt in explicitly.
-    if let Some(connect_info) = req
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-    {
-        if connect_info.0.ip().is_loopback() {
-            return next.run(req).await;
+    //
+    // `require_loopback` ([server].require_auth_loopback) disables this
+    // bypass so even local clients must present the token — defense-in-depth
+    // for a shared box. `/healthz` (above) still bypasses regardless.
+    if !auth.require_loopback {
+        if let Some(connect_info) = req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        {
+            if connect_info.0.ip().is_loopback() {
+                return next.run(req).await;
+            }
         }
     }
 
