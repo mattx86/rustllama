@@ -213,14 +213,21 @@ they work on SYCL/CUDA/CPU hosts alike) and auto-apply on next load per the
 
 ## Release builds
 
-Five self-contained artifacts, `rustllama-{version}-{os}-{arch}.{ext}`:
+Five self-contained artifacts, `rustllama-{version}-{os}-{arch}.{ext}`. **All
+five are GUI builds** — the single binary is a superset that also runs headless
+via `rustllama serve` (so the aarch64 / DGX Spark archive still serves on a
+headless box; the GUI build just adds the egui desktop shell):
 
 - Windows x64 `.zip` (GUI) — `scripts\release-windows.bat`
-- Linux x64 `.tar.gz` (headless) — `scripts\release-linux-x86_64.bat`
-- Linux aarch64 `.tar.gz` (headless, DGX Spark / GB10) —
+- Linux x64 `.tar.gz` (GUI) — `scripts\release-linux-x86_64.bat`
+- Linux aarch64 `.tar.gz` (GUI, DGX Spark / GB10) —
   `scripts\release-linux-arm64.bat` (Docker/QEMU, SBSA CUDA repo)
 - macOS arm64 (Apple Silicon) `.tar.gz` (GUI) — `scripts/release-macos.sh arm64`
 - macOS x86_64 (Intel) `.tar.gz` (GUI) — `scripts/release-macos.sh x86_64`
+
+The in-container entrypoint `scripts/_release_build_linux.sh` builds GUI by
+default for both Linux arches (`HEADLESS=1` would build server-only; neither
+release wrapper sets it). Both Docker images carry the egui/GL build deps.
 
 The **two macOS artifacts are built ON A MAC** (no Docker): `release-macos.sh`
 drives `build-macos.sh` (native egui GUI; CPU real on both arches, MLX/Metal
