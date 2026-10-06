@@ -17,7 +17,7 @@ quantization tooling.
   **macOS arm64 (Apple Silicon) + x86_64 (Intel)**.
 - License: **MIT OR Apache-2.0**, © 2026 Matt Smith (`LICENSE-MIT`,
   `LICENSE-APACHE`). Application workspace — every crate is `publish = false`.
-- Status: experimental / pre-1.0 (`version = 0.1.0`). Edition 2021,
+- Status: experimental / pre-1.0 (`version = 0.1.1`). Edition 2021,
   `rust-version = 1.83`.
 
 ## Repo layout

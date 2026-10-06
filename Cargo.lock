@@ -4163,7 +4163,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -4180,7 +4180,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -4214,7 +4214,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-stream",
  "bytes",
@@ -4229,7 +4229,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "notify",
  "notify-debouncer-full",
@@ -4243,7 +4243,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-stream",
  "bytemuck",
@@ -4275,7 +4275,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-gguf"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -4288,7 +4288,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4308,7 +4308,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-hub"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hf-hub",
  "indicatif",
@@ -4324,7 +4324,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-kernels-cpu"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "half",
@@ -4336,7 +4336,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-kernels-cuda"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "half",
  "thiserror 1.0.69",
@@ -4345,7 +4345,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-kernels-mlx"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cc",
  "half",
@@ -4355,7 +4355,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-kernels-sycl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cc",
  "half",
@@ -4367,7 +4367,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-l0-sys"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libloading",
  "thiserror 1.0.69",
@@ -4376,7 +4376,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-lsp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustllama-client",
  "serde",
@@ -4388,7 +4388,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-models"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "half",
@@ -4408,7 +4408,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-rag"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ignore",
  "notify",
@@ -4424,7 +4424,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "directories",
  "fs2",
@@ -4439,7 +4439,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-safetensors"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "half",
@@ -4457,7 +4457,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-stream",
  "axum",
@@ -4493,7 +4493,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-tensor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "half",
@@ -4504,7 +4504,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-tokenizer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "minijinja",
  "minijinja-contrib",
@@ -4517,7 +4517,7 @@ dependencies = [
 
 [[package]]
 name = "rustllama-tuner"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustllama-kernels-cuda",
  "rustllama-kernels-mlx",
@@ -6707,7 +6707,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
