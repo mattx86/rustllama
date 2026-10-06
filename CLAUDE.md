@@ -112,10 +112,14 @@ RAM and OOMs the new run. (This does **not** apply before a *build*; killing
 - matvec dispatch (`rustllama-models/src/accel.rs`) currently routes to ONE
   active backend: CUDA (`cuda_active()`) first if a usable NVIDIA GPU exists,
   else the SYCL device, else the Metal/MLX device (Apple Silicon), else CPU —
-  gated by `n_gpu_layers`. Opt-in tensor-core GEMM paths layer on top: CUDA
-  Blackwell FP4/FP6/FP8 (`RUSTLLAMA_FP4_TC=1`) + Hopper FP8 `wgmma`
-  (`RUSTLLAMA_FP8_WGMMA=1`), and SYCL Intel XMX/DPAS bf16 (`RUSTLLAMA_SYCL_XMX=1`,
-  also a build-time define) — all off by default.
+  gated by `n_gpu_layers`. Specialized tensor-core / matrix-engine GEMM paths
+  layer on top — CUDA Blackwell FP4/FP6/FP8, Hopper FP8 `wgmma`, SYCL Intel
+  XMX/DPAS bf16 — and **auto-enable per device, no env vars**: the `tune
+  --validate-kernels` stage runs the parity probes on-device and caches a
+  pass/fail verdict (`TuningResult.kernel_verdicts`); `accel.rs`'s gates
+  (`fp4_tc_enabled`/`hopper_tc_enabled`/`xmx_enabled` → `kernel_verdict`) turn a
+  path on only where it matched the CPU reference, off otherwise (fail-closed).
+  The first-load path re-validates on a build/version change (self-heal).
 - VRAM-fit placement (`rustllama-engine/src/placement_auto.rs`,
   `auto_n_gpu_layers`) budgets **CUDA-first** (mirrors dispatch), else SYCL,
   else all-CPU.
@@ -253,10 +257,12 @@ ID can replace `-` later). Packaging helpers: `_release_package.ps1` (bsdtar),
 - `RUSTLLAMA_GUI_EMBEDDED` — set by the GUI; skips the blocking startup autotune.
 - `RUSTLLAMA_DISABLED_GPUS` — exclude specific GPUs from selection.
 - `RUSTLLAMA_IQ_GPU=1` — run IQ1_S imatrix weighting on the GPU during quantize.
-- Opt-in tensor-core / matrix-engine GEMM (all default-off): `RUSTLLAMA_FP4_TC=1`
-  (CUDA Blackwell sm_120a FP4/FP6/FP8), `RUSTLLAMA_FP8_WGMMA=1`
-  (+`RUSTLLAMA_FP8_WGMMA_TMA=1`; Hopper sm_90a FP8), `RUSTLLAMA_SYCL_XMX=1`
-  (Intel XMX/DPAS bf16 — also a build-time define).
+- (Removed) `RUSTLLAMA_FP4_TC` / `_FP8_WGMMA` / `_FP8_WGMMA_TMA` / `_SYCL_XMX`:
+  the Blackwell/Hopper tensor-core + Intel XMX/DPAS GEMM paths now **auto-enable
+  per device** via an on-device self-check (`tune --validate-kernels` →
+  `kernel_verdicts`), not env flags. The XMX kernel is always compiled now
+  (`build.rs` always emits `-DRSL_SYCL_XMX`; safe on non-XMX GPUs — JIT `spir64`,
+  only launched when capable + verdict-enabled).
 - Perf levers (production CPU-path recipe): `SYCL_DISPATCH=0`, `LOCK_RAM_MB`
   (also an `[inference]` key), `TERNARY_FASTDOT=1`, `PROFILE_HYBRID_PREFILL`.
 

@@ -57,11 +57,13 @@ aarch64 NEON path covers the matvec quants *and* the forward-pass ops —
 RMSNorm, RoPE, GQA/flash attention — validated under QEMU; scalar fallback
 elsewhere). The CUDA and Metal backends are wired into the forward pass —
 packed matvecs dispatch to a device-resident weight cache (inert when no such
-GPU is present). NVIDIA builds carry opt-in **tensor-core GEMM** paths
-(Blackwell sm_120a FP4/FP6/FP8 via `RUSTLLAMA_FP4_TC=1`; Hopper sm_90a FP8
-`wgmma` via `RUSTLLAMA_FP8_WGMMA=1`), and Intel builds an opt-in **XMX/DPAS**
-bf16 GEMM (`RUSTLLAMA_SYCL_XMX=1`; device capability shows as `xmx_capable` in
-`doctor`) — all off by default. Validate each backend's kernels against the CPU
+GPU is present). NVIDIA builds carry **tensor-core GEMM** paths (Blackwell
+sm_120a FP4/FP6/FP8, Hopper sm_90a FP8 `wgmma`) and Intel builds an **XMX/DPAS**
+bf16 GEMM — all **auto-enabled per device, no env vars**: the `tune
+--validate-kernels` stage runs the parity probes on-device and caches a pass/fail
+verdict the dispatch gates read, so a path turns on only where it matched the CPU
+reference (fail-closed). Device capability shows as `xmx_capable` in `doctor`.
+Validate each backend's kernels against the CPU
 reference with `rustllama doctor --cuda-parity` (CUDA), `--sycl-parity` (SYCL,
 including an `xmx:gemm` probe), or `--metal-parity` (Metal); `--cpu-parity`
 self-checks the CPU SIMD / parallel matvec paths against a naive scalar

@@ -197,19 +197,60 @@ fn dtype_to_fp4_tc_kind(dtype: Dtype) -> Option<ck::CudaFp4TcKind> {
     }
 }
 
-/// Whether the Blackwell FP4 tensor-core GEMM path is enabled. **DEFAULT OFF**:
-/// the TC path quantizes activations to FP4 (W4A4 — extra error vs the scalar
-/// W4A16 path) and its fragment/scale layout is pending on-device validation
-/// (`doctor --cuda-parity`) on the Spark, so it is gated behind the opt-in
-/// `RUSTLLAMA_FP4_TC=1` AND a real SM12x Blackwell device built with the TC
-/// path (`ck::blackwell_tc_available`). Cached once (process-wide).
+// ------------------------------------------------------------
+// On-device GPU-kernel validation verdicts (auto-enable, no env gate)
+// ------------------------------------------------------------
+
+/// Per-process GPU-kernel validation verdicts, loaded once from the
+/// autotuner cache (populated by `tune --validate-kernels`). Maps a
+/// parity-probe name (`"gemm:mxfp4_tc"`, `"xmx:gemm"`,
+/// `"attn:decode_mxfp8"`, …) to whether that kernel matched its CPU
+/// reference ON THIS machine. Mirrors [`load_lws_cache_for_device_once`].
+/// Empty when the cache is missing or the validation stage hasn't run, so
+/// every [`kernel_verdict`] lookup then fails CLOSED.
+fn load_kernel_verdicts_once() -> &'static std::collections::HashMap<String, bool> {
+    static CACHE: std::sync::OnceLock<std::collections::HashMap<String, bool>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let key = rustllama_tuner::system_fingerprint();
+        let Some(dir) = rustllama_tuner::default_cache_dir() else {
+            return std::collections::HashMap::new();
+        };
+        match rustllama_tuner::load_cache(&dir, &key) {
+            Ok(Some(t)) => t.kernel_verdicts,
+            _ => std::collections::HashMap::new(),
+        }
+    })
+}
+
+/// On-device verdict for a specialized GPU kernel: `true` only when the
+/// `tune --validate-kernels` stage confirmed it matches the CPU reference
+/// on THIS machine. FAIL-CLOSED — a kernel never validated (or whose probe
+/// SKIPped because the device lacks the capability) returns `false`, so the
+/// specialized path stays off and the base path runs. This replaces the
+/// removed `RUSTLLAMA_FP4_TC` / `_FP8_WGMMA` / `_SYCL_XMX` env gates: the
+/// verdict IS the automatic on/off decision.
+pub(crate) fn kernel_verdict(name: &str) -> bool {
+    load_kernel_verdicts_once()
+        .get(name)
+        .copied()
+        .unwrap_or(false)
+}
+
+/// Whether the Blackwell FP4 tensor-core GEMM path is enabled. **AUTOMATIC** —
+/// no env var: it turns on only when BOTH FP4 TC GEMM kernels (NVFP4 + MXFP4)
+/// passed the on-device self-check (`tune --validate-kernels` → `kernel_verdict`)
+/// on this machine, a usable NVIDIA GPU is present (`cuda_active()`), and the
+/// device is a TC-capable Blackwell (`ck::blackwell_tc_available`). Fail-closed:
+/// if either FP4 kernel hasn't been validated or miscomputed, the whole FP4 TC
+/// path stays off and the scalar path runs. Cached once (process-wide).
 fn fp4_tc_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
     *EN.get_or_init(|| {
-        let on = std::env::var("RUSTLLAMA_FP4_TC")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        on && cuda_active() && ck::blackwell_tc_available(0)
+        kernel_verdict(rustllama_tuner::VERDICT_GEMM_NVFP4_TC)
+            && kernel_verdict(rustllama_tuner::VERDICT_GEMM_MXFP4_TC)
+            && cuda_active()
+            && ck::blackwell_tc_available(0)
     })
 }
 
@@ -239,31 +280,27 @@ fn try_gemm_fp4_tc_batched(
 // Hopper SM90a FP8 wgmma tensor-core GEMM dispatch (opt-in)
 // ------------------------------------------------------------
 
-/// Whether the Hopper FP8 `wgmma` tensor-core GEMM path is enabled. **DEFAULT
-/// OFF** + WRITE-BLIND (no GH200 has validated it): the path is W8A8
-/// (activations quantized to E4M3 — extra error vs the scalar W8A16 path) and
-/// is gated behind the opt-in `RUSTLLAMA_FP8_WGMMA=1` AND a real sm_90 Hopper
-/// device built with the TC path (`ck::hopper_tc_available`). Mirror of
-/// [`fp4_tc_enabled`]; cached once (process-wide).
+/// Whether the Hopper FP8 `wgmma` tensor-core GEMM path is enabled.
+/// **AUTOMATIC** — no env var: on only when the Hopper FP8 kernel passed the
+/// on-device self-check (`kernel_verdict`), a usable NVIDIA GPU is present, and
+/// the device is a TC-capable Hopper (`ck::hopper_tc_available`). No parity
+/// probe emits this verdict yet (no GH200 is available to validate), so it
+/// stays off automatically until one is. Cached once (process-wide).
 fn hopper_tc_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
     *EN.get_or_init(|| {
-        let on = std::env::var("RUSTLLAMA_FP8_WGMMA")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        on && cuda_active() && ck::hopper_tc_available(0)
+        kernel_verdict(rustllama_tuner::VERDICT_GEMM_FP8_WGMMA)
+            && cuda_active()
+            && ck::hopper_tc_available(0)
     })
 }
 
-/// Whether to use the TMA (`cp.async.bulk`)-staged `wgmma` variant
-/// (`RUSTLLAMA_FP8_WGMMA_TMA=1`; default the non-TMA path). Cached once.
+/// Whether to use the TMA (`cp.async.bulk`)-staged `wgmma` variant. Defaults to
+/// the non-TMA path; the TMA variant would be selected once it has its own
+/// validated verdict (there is no on-device TMA-wgmma self-check yet, and no
+/// Hopper HW to run it). Cached once.
 fn hopper_tc_tma() -> bool {
-    static TMA: OnceLock<bool> = OnceLock::new();
-    *TMA.get_or_init(|| {
-        std::env::var("RUSTLLAMA_FP8_WGMMA_TMA")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    false
 }
 
 /// Batched Hopper FP8 `wgmma` GEMM via the CUDA cache. `false` on any miss so
@@ -292,20 +329,16 @@ fn try_gemm_fp8_wgmma_batched(
 // Intel XMX/DPAS bf16 tensor-core GEMM dispatch (SYCL, opt-in)
 // ------------------------------------------------------------
 
-/// Whether the Intel XMX/DPAS bf16 tensor-core GEMM path is enabled. **DEFAULT
-/// OFF** + WRITE-BLIND (no XMX GPU has validated it): the path dequantizes the
-/// weight to f32 and runs a bf16 `joint_matrix` GEMM (bf16 compute, f32
-/// accumulate) — an A/B option on Arc (Xe-HPG) / PVC (Xe-HPC), gated behind the
-/// opt-in `RUSTLLAMA_SYCL_XMX=1`. The per-device XMX capability is checked at
-/// dispatch (via the SYCL stream) since it needs a live device — this flag is
-/// just the env opt-in. Mirror of [`fp4_tc_enabled`]; cached once.
+/// Whether the Intel XMX/DPAS bf16 tensor-core GEMM path is enabled.
+/// **AUTOMATIC** — no env var: on only when the XMX GEMM kernel passed the
+/// on-device self-check (`kernel_verdict("xmx:gemm")`), which the probe records
+/// only on an XMX-capable device (Arc Xe-HPG / PVC Xe-HPC), so a passing verdict
+/// already implies capability. The per-stream `sk::xmx_available` check still
+/// guards the dispatch site. The path dequantizes the weight to f32 and runs a
+/// bf16 `joint_matrix` GEMM. Fail-closed; cached once (process-wide).
 fn xmx_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
-    *EN.get_or_init(|| {
-        std::env::var("RUSTLLAMA_SYCL_XMX")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    *EN.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_XMX_GEMM))
 }
 
 /// Batched XMX/DPAS bf16 GEMM via the USM_ATTN SYCL stream: dequantize W→f32

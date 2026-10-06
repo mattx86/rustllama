@@ -170,6 +170,47 @@ pub fn iter_tuned_lws(result: &TuningResult) -> Vec<(String, String, u32)> {
     out
 }
 
+// --- GPU-kernel validation verdicts -----------------------------------
+//
+// Parity-probe names for the specialized GPU kernels whose use is
+// auto-enabled per device by the `tune --validate-kernels` stage (which
+// runs these probes) and read at dispatch time. The names MUST match the
+// probe names emitted by `rustllama doctor --cuda-parity` / the SYCL XMX
+// probe so the verdict map keys line up. These replace the removed
+// `RUSTLLAMA_FP4_TC` / `_FP8_WGMMA` / `_SYCL_XMX` env gates.
+
+/// Blackwell FP4 tensor-core GEMM (NVFP4 weights, W4A4). Backs `fp4_tc`.
+pub const VERDICT_GEMM_NVFP4_TC: &str = "gemm:nvfp4_tc";
+/// Blackwell FP4 tensor-core GEMM (MXFP4 weights, W4A4). Backs `fp4_tc`.
+pub const VERDICT_GEMM_MXFP4_TC: &str = "gemm:mxfp4_tc";
+/// Blackwell MXFP8 (W8A8) block-scaled tensor-core GEMM. Probe-only
+/// until wired into dispatch (Phase 3).
+pub const VERDICT_GEMM_MXFP8_TC: &str = "gemm:mxfp8_tc";
+/// Blackwell MXFP6 (W6A6) block-scaled tensor-core GEMM. Probe-only.
+pub const VERDICT_GEMM_MXFP6_TC: &str = "gemm:mxfp6_tc";
+/// Blackwell NVFP4 TMA-staged tensor-core GEMM variant. Probe-only.
+pub const VERDICT_GEMM_NVFP4_TC_TMA: &str = "gemm:nvfp4_tc_tma";
+/// Blackwell FP8 2:4 structured-sparse GEMM. Probe-only.
+pub const VERDICT_GEMM_FP8_SP24: &str = "gemm:fp8_sp24";
+/// Hopper sm_90a FP8 `wgmma` GEMM. Backs `hopper_tc` (no probe emits this
+/// yet — stays off until a GH200 is available to validate).
+pub const VERDICT_GEMM_FP8_WGMMA: &str = "gemm:fp8_wgmma";
+/// Intel XMX/DPAS bf16 GEMM (SYCL). Backs `xmx`.
+pub const VERDICT_XMX_GEMM: &str = "xmx:gemm";
+
+/// Read the on-device verdict for a kernel probe name, if one has been
+/// recorded. `None` = never validated (or the probe SKIPped because the
+/// device lacks the capability) — callers treat that as "off".
+pub fn verdict_for(result: &TuningResult, name: &str) -> Option<bool> {
+    result.kernel_verdicts.get(name).copied()
+}
+
+/// Record (insert or overwrite) a kernel's on-device verdict. Used by the
+/// `tune --validate-kernels` stage.
+pub fn set_verdict(result: &mut TuningResult, name: &str, pass: bool) {
+    result.kernel_verdicts.insert(name.to_string(), pass);
+}
+
 // Compatibility shim: keep the original Q4_K-specific names that
 // existing tests + engine code reference. Both delegate to the new
 // kernel-agnostic helpers above.
@@ -351,6 +392,19 @@ pub struct TuningResult {
     /// load, so no schema-version bump is needed.
     #[serde(default)]
     pub per_device_perf: HashMap<String, f32>,
+    /// On-device GPU-kernel validation verdicts, keyed by parity-probe
+    /// name (e.g. `"gemm:mxfp4_tc"`, `"xmx:gemm"`, `"attn:decode_mxfp8"`)
+    /// and valued `true` = the kernel matched its CPU reference on THIS
+    /// machine, `false` = miscomputed. Populated by the `tune
+    /// --validate-kernels` stage (runs the parity probes). The dispatch
+    /// layer reads this to AUTO-ENABLE the specialized tensor-core / XMX
+    /// / microscaling-KV paths only where they pass — replacing the old
+    /// `RUSTLLAMA_FP4_TC` / `_FP8_WGMMA` / `_SYCL_XMX` env gating.
+    /// Fail-closed: a probe absent from this map (never validated, or the
+    /// device lacks the capability so the probe SKIPped) reads as "off".
+    /// `#[serde(default)]` → old caches still load, no schema bump.
+    #[serde(default)]
+    pub kernel_verdicts: HashMap<String, bool>,
     /// ISO-8601 timestamp of the last successful tune.
     pub last_tuned: Option<String>,
     pub rustllama_version: String,
@@ -401,6 +455,7 @@ impl TuningResult {
             ssm_prefill_chunked: None,
             decision_calibration: HashMap::new(),
             per_device_perf: HashMap::new(),
+            kernel_verdicts: HashMap::new(),
             last_tuned: None,
             rustllama_version: env!("CARGO_PKG_VERSION").to_string(),
         }

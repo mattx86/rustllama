@@ -102,7 +102,6 @@ fn main() {
 
     println!("cargo:rerun-if-changed=cpp/rsl_kernels.cpp");
     println!("cargo:rerun-if-changed=cpp/rsl_xmx.hpp");
-    println!("cargo:rerun-if-env-changed=RUSTLLAMA_SYCL_XMX");
     println!("cargo:rerun-if-changed=include/rsl_kernels.h");
     println!("cargo:rerun-if-env-changed=ONEAPI_ROOT");
     println!("cargo:rerun-if-env-changed=CMPLR_ROOT");
@@ -372,18 +371,17 @@ fn build_windows(out_path: &std::path::Path) {
     copy_shared_lib_next_to_binaries(out_path, "rsl_kernels.dll");
 }
 
-/// `-DRSL_SYCL_XMX` iff `RUSTLLAMA_SYCL_XMX=1` — enables the Intel XMX/DPAS
-/// `joint_matrix` bf16 GEMM path in `cpp/rsl_xmx.hpp`. Default OFF so the Iris Xe
-/// (Xe-LP, no XMX) dev build + the standard release compile only the software-
-/// decode path; set it when building for / compile-checking an Arc (Xe-HPG) or
-/// PVC (Xe-HPC) target. The extern "C" entry compiles either way (a -2
-/// "unavailable" stub when off), so the symbol set / .def is unchanged.
+/// Always emit `-DRSL_SYCL_XMX` so the Intel XMX/DPAS `joint_matrix` bf16 GEMM
+/// path in `cpp/rsl_xmx.hpp` is compiled into EVERY SYCL build and is available
+/// for the runtime on-device self-check (`tune --validate-kernels`) to validate
+/// — there is no build-time or runtime env gate. Safe on non-XMX dev GPUs (Iris
+/// Xe, Xe-LP): the kernels target `spir64` (JIT SPIR-V, see `build_unix`/
+/// `build_windows`), so the `joint_matrix` code lowers to generic SPIR-V and is
+/// only JIT-compiled + launched when the device is XMX-capable AND the verdict
+/// enables it; on Xe-LP it is never launched. The extern "C" entry's symbol set
+/// / `.def` is unchanged (the `sk::xmx_available` probe still guards dispatch).
 fn xmx_defs() -> Vec<&'static str> {
-    if std::env::var("RUSTLLAMA_SYCL_XMX").as_deref() == Ok("1") {
-        vec!["-DRSL_SYCL_XMX"]
-    } else {
-        vec![]
-    }
+    vec!["-DRSL_SYCL_XMX"]
 }
 
 /// Linux: build `librsl_kernels.so` with `icpx` (GCC-style DPC++ driver;

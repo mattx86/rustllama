@@ -493,6 +493,15 @@ pub enum Command {
         /// `--repeats` sizing.
         #[arg(long)]
         per_device_perf: bool,
+        /// On-device GPU-kernel validation: run the parity probes (CUDA
+        /// tensor-core GEMM, SYCL XMX) and persist a pass/fail verdict per
+        /// kernel under `kernel_verdicts`, which the dispatch layer reads to
+        /// AUTO-ENABLE each specialized path only where it matches the CPU
+        /// reference on this machine. Primarily a `tune --all` sub-stage
+        /// (Stage 1c); replaces the removed `RUSTLLAMA_FP4_TC` /
+        /// `_FP8_WGMMA` / `_SYCL_XMX` env gates.
+        #[arg(long)]
+        validate_kernels: bool,
         /// **Comprehensive autotune**: run every sweep in coordinate-
         /// descent order — kernel LWS → kv_dtype → flash_attention →
         /// kv_cache_layout → placement → batch_size → threads — and
@@ -1212,6 +1221,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             ssm_prefill_chunked_repeats,
             decision_calibrate,
             per_device_perf,
+            validate_kernels,
             all,
             skip_cached,
             force,
@@ -1278,6 +1288,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 ssm_prefill_chunked,
                 decision_calibrate,
                 per_device_perf,
+                validate_kernels,
                 all,
             ]
             .iter()
@@ -1426,6 +1437,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     decode_tokens,
                     repeats,
                 );
+            }
+            if validate_kernels {
+                return cmd_tune_validate_kernels();
             }
             if threads {
                 return cmd_tune_threads(
@@ -5851,6 +5865,80 @@ pub fn persist_per_device_perf(
     Ok(())
 }
 
+/// Run the on-device GPU-kernel parity probes (CUDA tensor-core GEMM +
+/// SYCL XMX) and persist a pass/fail verdict per kernel under
+/// `TuningResult.kernel_verdicts`. The dispatch layer reads these to
+/// AUTO-ENABLE each specialized path only where it matches the CPU
+/// reference on this machine — replacing the removed `RUSTLLAMA_FP4_TC` /
+/// `_FP8_WGMMA` / `_SYCL_XMX` env gates. A `tune --all` sub-stage (Stage
+/// 1c); also runnable standalone. Model-independent (hardware only). Safe
+/// on non-GPU hosts: every probe SKIPs → no verdict → nothing persisted.
+fn cmd_tune_validate_kernels() -> anyhow::Result<()> {
+    println!("rustllama tune --validate-kernels");
+    println!("  running GPU kernel parity probes (CUDA tensor-core GEMM, SYCL XMX)…");
+    println!();
+
+    let mut verdicts: Vec<(String, Option<bool>)> = Vec::new();
+    match crate::gpu_parity::collect_cuda_verdicts() {
+        Ok(mut v) => verdicts.append(&mut v),
+        Err(e) => tracing::warn!(error = %e, "CUDA kernel validation probe failed"),
+    }
+    verdicts.extend(crate::gpu_parity::collect_xmx_verdict());
+
+    // Keep only decided verdicts (OK / MISCOMPUTE); SKIP (capability
+    // absent) carries no information and is left unset.
+    let decided: Vec<(String, bool)> = verdicts
+        .into_iter()
+        .filter_map(|(name, v)| v.map(|pass| (name, pass)))
+        .collect();
+
+    println!();
+    if decided.is_empty() {
+        println!("  → no GPU kernel produced a verdict (no capable device)");
+    } else {
+        let pass = decided.iter().filter(|(_, p)| *p).count();
+        let fail = decided.len() - pass;
+        println!("  → {} verdict(s): {pass} pass, {fail} fail", decided.len());
+    }
+    // Always persist — even with no verdicts it stamps `rustllama_version`,
+    // so the first-load self-heal re-runs this once per build (on a version
+    // change) instead of on every load on a GPU-less host.
+    match persist_kernel_verdicts(&decided) {
+        Ok(()) if !decided.is_empty() => {
+            println!("  → persisted to tuner cache (auto-enables the passing paths)")
+        }
+        Ok(()) => {}
+        Err(e) => tracing::warn!(error = %e, "failed to persist kernel verdicts to tuner cache"),
+    }
+    Ok(())
+}
+
+/// Merge GPU-kernel validation verdicts into the tuner cache's
+/// `kernel_verdicts` map and stamp `rustllama_version`, so a later build
+/// (whose kernels may differ) re-validates instead of trusting a stale
+/// verdict. Graceful no-op when no cache dir resolves.
+pub fn persist_kernel_verdicts(verdicts: &[(String, bool)]) -> anyhow::Result<()> {
+    use rustllama_tuner::{load_cache, save_cache, set_verdict, TuningResult};
+    let Some(cache_dir) = rustllama_tuner::default_cache_dir() else {
+        tracing::warn!("no tuner cache dir resolvable; skipping kernel-verdict persistence");
+        return Ok(());
+    };
+    let (key, device) = rustllama_tuner::cache_context();
+    std::fs::create_dir_all(&cache_dir)?;
+    let mut tuning = load_cache(&cache_dir, &key)?
+        .unwrap_or_else(|| TuningResult::empty(key.clone(), device.clone()));
+    for (name, pass) in verdicts {
+        set_verdict(&mut tuning, name, *pass);
+    }
+    tuning.rustllama_version = env!("CARGO_PKG_VERSION").to_string();
+    tuning.last_tuned = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| format!("{}", d.as_secs()));
+    save_cache(&cache_dir, &tuning)?;
+    Ok(())
+}
+
 fn cmd_tune_kv_dtype(
     config_path: &std::path::Path,
     model_override: Option<String>,
@@ -7164,6 +7252,17 @@ fn cmd_tune_all(
         .as_ref()
         .map(|t| !t.per_device_perf.is_empty())
         .unwrap_or(false);
+    // Kernel verdicts are cached ONLY if present AND stamped by the
+    // CURRENT build — a different build may have changed the kernels (e.g.
+    // a Blackwell GEMM fix), so re-validate on a version change. This is
+    // the self-heal that auto-refreshes verdicts after an upgrade without
+    // the user clearing any cache.
+    let has_kernel_verdicts = cached
+        .as_ref()
+        .map(|t| {
+            !t.kernel_verdicts.is_empty() && t.rustllama_version == env!("CARGO_PKG_VERSION")
+        })
+        .unwrap_or(false);
     // MTP self-speculation + chunked SSM prefill: both persist a
     // `Some(bool)` winner (including `Some(false)` for a non-capable /
     // non-hybrid model), so `.is_some()` is the "already tuned" probe.
@@ -7239,6 +7338,26 @@ fn cmd_tune_all(
             &args_1b,
         ) {
             tracing::warn!(error = %e, "stage 1b (per-device perf) failed; continuing");
+        }
+    }
+
+    println!();
+    println!("Stage 1c/10: validate GPU kernels (tensor-core GEMM / XMX parity → auto-enable)");
+    println!("--------");
+    if skip(has_kernel_verdicts) {
+        println!("(skipped: kernel verdicts already cached for this build)");
+    } else {
+        // Hardware-only (model-independent) + fast; still a subprocess for a
+        // clean GPU context, consistent with the other stages.
+        if let Err(e) = run_tune_stage_subprocess(
+            config_path,
+            &model_clone_for_stages,
+            "--validate-kernels",
+            thorough,
+            "1c (validate kernels)",
+            &[],
+        ) {
+            tracing::warn!(error = %e, "stage 1c (validate kernels) failed; continuing");
         }
     }
 

@@ -34,6 +34,18 @@ ARCH="${1:?usage: _release_build_linux.sh <arch>}"
 if [ "$ARCH" = "aarch64" ]; then
   export RUSTLLAMA_CUDA_ARCHS="90a;121a"
   echo ">> RUSTLLAMA_CUDA_ARCHS=$RUSTLLAMA_CUDA_ARCHS (GH200 sm_90a Hopper + DGX Spark GB10 sm_121a Blackwell, both tensor-core)"
+else
+  # x86_64: Ampere/Ada base + the *architecture-accelerated* Hopper (sm_90a) and
+  # consumer Blackwell (sm_120a) targets, so the Hopper FP8 `wgmma` and Blackwell
+  # FP4/FP6/FP8 tensor-core kernels are COMPILED INTO the x86 release. That is the
+  # prerequisite for the on-device self-check (`tune --validate-kernels`) to even
+  # SEE them and auto-enable them on an x86 Hopper (H100) / Blackwell (RTX 50xx)
+  # host — without the accelerated arch the kernels aren't built and
+  # `blackwell/hopper_tc_available()` is false, so the probe SKIPs. `sm_90a` is a
+  # superset of `sm_90`, so the base Hopper path still runs on plain sm_90, and
+  # the embedded forward-compat PTX (highest arch) JITs onto any newer GPU.
+  export RUSTLLAMA_CUDA_ARCHS="80;86;89;90a;120a"
+  echo ">> RUSTLLAMA_CUDA_ARCHS=$RUSTLLAMA_CUDA_ARCHS (x86 Ampere/Ada + Hopper sm_90a + Blackwell sm_120a tensor-core)"
 fi
 
 # 1. Build the binary. GUI (desktop + CLI + server) by default; HEADLESS=1

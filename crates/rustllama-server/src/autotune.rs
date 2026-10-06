@@ -353,27 +353,90 @@ pub fn maybe_first_load_autotune(model_path: &Path, console: bool) {
         .and_then(|s| s.to_str())
         .unwrap_or("unknown-model")
         .to_string();
-    if is_active() || !is_untuned(&key) {
+    if is_active() {
         return;
     }
-    tracing::info!(
-        model = %key,
-        "first-load auto-tune: no tuner-cache entry for this device — running the \
-         full sweep before load"
-    );
-    if console {
-        println!(
-            "rustllama: first load of `{key}` on this device — auto-tuning before \
-             serving (one-time, usually a few minutes)."
+    if is_untuned(&key) {
+        tracing::info!(
+            model = %key,
+            "first-load auto-tune: no tuner-cache entry for this device — running the \
+             full sweep before load"
         );
-    }
-    if let Err(e) = run_autotune_blocking(model_path, false, TuneScope::Full, console) {
-        tracing::warn!(error = %e, "first-load auto-tune failed; loading with defaults");
         if console {
-            eprintln!(
-                "rustllama: auto-tune did not complete ({e}); loading with default settings."
+            println!(
+                "rustllama: first load of `{key}` on this device — auto-tuning before \
+                 serving (one-time, usually a few minutes)."
             );
         }
+        if let Err(e) = run_autotune_blocking(model_path, false, TuneScope::Full, console) {
+            tracing::warn!(error = %e, "first-load auto-tune failed; loading with defaults");
+            if console {
+                eprintln!(
+                    "rustllama: auto-tune did not complete ({e}); loading with default settings."
+                );
+            }
+        }
+    } else if kernel_validation_stale() {
+        // The model is already tuned, so the full sweep is skipped — but the
+        // GPU-kernel verdicts are missing or were stamped by a DIFFERENT
+        // build (whose kernels may differ). Re-validate just the kernels so
+        // the specialized accel paths auto-(re)enable WITHOUT a full re-tune
+        // or the user clearing any cache. Fast + hardware-only.
+        tracing::info!(
+            "GPU-kernel verdicts are absent or from a different build — re-validating \
+             kernels so the accelerated paths auto-enable"
+        );
+        if console {
+            println!("rustllama: validating GPU kernels on this device (one-time per build).");
+        }
+        run_validate_kernels_blocking(console);
+    }
+}
+
+/// Whether the on-device GPU-kernel verdicts need (re)validating for the
+/// CURRENT build: `true` when the tuner cache's `rustllama_version` differs
+/// from this build (a kernel change may have flipped a verdict) or there is
+/// no cache yet. Independent of whether any model is tuned. Conservative: an
+/// unreadable cache returns `false` so we never spawn a probe on a bad cache.
+fn kernel_validation_stale() -> bool {
+    let Some(dir) = rustllama_tuner::default_cache_dir() else {
+        return false;
+    };
+    let key = rustllama_tuner::system_fingerprint();
+    match rustllama_tuner::load_cache(&dir, &key) {
+        Ok(Some(t)) => t.rustllama_version != env!("CARGO_PKG_VERSION"),
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+
+/// Run just the `tune --validate-kernels` stage as a subprocess (fast,
+/// hardware-only, model-independent): it runs the GPU kernel parity probes,
+/// persists a pass/fail verdict per kernel, and stamps the build version so
+/// this doesn't re-run until the next build. Non-fatal — failures are logged.
+fn run_validate_kernels_blocking(console: bool) {
+    begin("validate-kernels", 1);
+    if let Ok(mut g) = progress().lock() {
+        g.stage_idx = 1;
+        g.stage_name = "validate GPU kernels".to_string();
+    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            finish(Some(format!("cannot locate current executable: {e}")));
+            return;
+        }
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("tune").arg("--validate-kernels").env("NO_COLOR", "1");
+    if !console {
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+    }
+    match cmd.status() {
+        Ok(s) if s.success() => finish(None),
+        Ok(s) => finish(Some(format!("validate-kernels exited with {s}"))),
+        Err(e) => finish(Some(format!("failed to launch validate-kernels: {e}"))),
     }
 }
 

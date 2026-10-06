@@ -388,7 +388,86 @@ fn compare(gpu: &[f32], cpu: &[f32]) -> (f64, f64) {
     (cos, max_rel)
 }
 
+// --- Probe-result recording (for `tune --validate-kernels`) -----------
+//
+// Both emit() (SYCL) and cu_emit() (CUDA) funnel every probe's verdict
+// line through here. Normally recording is OFF and they just print. The
+// `tune --validate-kernels` stage turns it ON around a probe run, then
+// drains the recorded `(probe_name, status)` pairs into on-device
+// auto-enable verdicts. No behavior change for `doctor --*-parity`.
+thread_local! {
+    static PROBE_REC: std::cell::RefCell<Option<Vec<(String, String)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn probe_rec_push(name: &str, verdict: &str) {
+    PROBE_REC.with(|r| {
+        if let Some(v) = r.borrow_mut().as_mut() {
+            // Canonical verdict key: drop any "(W4A4)"-style presentational
+            // suffix on the probe name (e.g. "gemm:mxfp8_tc(W8A8)") so the
+            // recorded key matches the bare `rustllama_tuner::VERDICT_*`
+            // constants the dispatch gates look up. The printed doctor line
+            // keeps the full label.
+            let key = name.split('(').next().unwrap_or(name).trim_end();
+            v.push((key.to_string(), verdict.to_string()));
+        }
+    });
+}
+
+fn probe_rec_begin() {
+    PROBE_REC.with(|r| *r.borrow_mut() = Some(Vec::new()));
+}
+
+fn probe_rec_take() -> Vec<(String, String)> {
+    PROBE_REC.with(|r| r.borrow_mut().take().unwrap_or_default())
+}
+
+/// Map a probe status string to an auto-enable verdict: `Some(true)` =
+/// matched the CPU reference, `Some(false)` = miscomputed or failed to
+/// run (fail-closed), `None` = SKIP (capability absent — leave unset so
+/// the gate's own capability check decides).
+fn probe_status_to_verdict(status: &str) -> Option<bool> {
+    match status {
+        "OK" => Some(true),
+        "MISCOMPUTE" | "KERNEL_ERR" => Some(false),
+        _ => None, // "SKIP" and anything unexpected
+    }
+}
+
+/// Run the CUDA kernel parity probes and return per-probe auto-enable
+/// verdicts (prints the same report as `doctor --cuda-parity`). Used by
+/// `tune --validate-kernels` to populate the on-device verdict cache.
+pub fn collect_cuda_verdicts() -> anyhow::Result<Vec<(String, Option<bool>)>> {
+    probe_rec_begin();
+    let r = run_cuda_parity();
+    let recorded = probe_rec_take();
+    r?;
+    Ok(recorded
+        .into_iter()
+        .map(|(name, status)| (name, probe_status_to_verdict(&status)))
+        .collect())
+}
+
+/// Run the SYCL XMX/DPAS GEMM parity probe and return its verdict. Empty
+/// when there is no usable SYCL device (no verdict recorded → XMX stays
+/// off). WRITE-BLIND note: in-process here (no XMX HW in play); if a real
+/// XMX device ever risks DEVICE_LOST this should move to the subprocess
+/// model the other SYCL probes use.
+pub fn collect_xmx_verdict() -> Vec<(String, Option<bool>)> {
+    let stream = match sk::create_stream(0) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    probe_rec_begin();
+    probe_xmx(&stream, "xmx:gemm", Instant::now());
+    probe_rec_take()
+        .into_iter()
+        .map(|(name, status)| (name, probe_status_to_verdict(&status)))
+        .collect()
+}
+
 fn emit(name: &str, verdict: &str, detail: &str) {
+    probe_rec_push(name, verdict);
     // Single-line machine-readable protocol; the parent greps for it.
     println!("PARITY {name} {verdict} {detail}");
     let _ = std::io::stdout().flush();
@@ -1297,6 +1376,7 @@ fn cu_download_f32(buf: &ck::CudaDeviceBuffer<'_>, n: usize) -> Vec<f32> {
 }
 
 fn cu_emit(name: &str, verdict: &str, detail: &str) {
+    probe_rec_push(name, verdict);
     println!("  {name:<24} {verdict:<11} {detail}");
 }
 
@@ -1328,6 +1408,9 @@ enum TcGemm {
     Mxfp4,
     Mxfp8,
     Mxfp6,
+    /// Hopper sm_90a FP8 `wgmma` GEMM (MXFP8 W8A8) — same weight/ref as
+    /// `Mxfp8`, but dispatches the Hopper `wgmma` kernel (non-TMA).
+    Fp8Wgmma,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1372,6 +1455,7 @@ fn cu_tc_gemm_probe(
             TcGemm::Mxfp4 => ck::gemm_fp4_tc_f32(ck::CudaFp4TcKind::Mxfp4, stream, wp, xp, op, m, n, k),
             TcGemm::Mxfp8 => ck::gemm_mxfp8_tc_f32(stream, wp, xp, op, m, n, k),
             TcGemm::Mxfp6 => ck::gemm_mxfp6_tc_f32(stream, wp, xp, op, m, n, k),
+            TcGemm::Fp8Wgmma => ck::gemm_mxfp8_wgmma_f32(stream, wp, xp, op, m, n, k, false),
         }
     };
     match res {
@@ -1693,6 +1777,36 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 Ok(()) => cu_grade("gemm:fp8_sp24(2:4)", &cu_download_f32(&ob, n * m), &cpu_sp, 0.85, 0.60, &mut counts),
             }
         }
+    }
+
+    // ---- Hopper sm_90a FP8 wgmma GEMM (MXFP8 W8A8) ----
+    // SKIP on non-Hopper (including Blackwell sm_12x, which is compute-major
+    // 12, not 9). On a real GH200 this validates the wgmma kernel so
+    // `hopper_tc_enabled()` auto-enables it — symmetric with the Blackwell FP4
+    // path above. Same MXFP8 weight + W8A16 CPU reference as `gemm:mxfp8_tc`;
+    // the only difference is the kernel dispatched.
+    if ck::hopper_tc_available(0) {
+        let (m, kd, n) = (64usize, 128usize, 16usize); // K % 32 == 0 (wgmma k-dim)
+        let whop = gen_quant_bytes(
+            LAYOUTS.iter().find(|l| l.name == "mxfp8").unwrap(),
+            m,
+            kd,
+            0xBEEF33,
+        );
+        cu_tc_gemm_probe(
+            &stream,
+            "gemm:fp8_wgmma",
+            TcGemm::Fp8Wgmma,
+            &whop,
+            k::mxfp::matvec_mxfp8_w_f32_a,
+            m,
+            kd,
+            n,
+            &mut counts,
+        );
+    } else {
+        cu_emit("gemm:fp8_wgmma", "SKIP", "not-a-hopper-device");
+        *counts.entry("SKIP").or_default() += 1;
     }
 
     // ---- Dense f32 matvec (host-copy reference wrapper) ----
