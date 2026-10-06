@@ -1,0 +1,48 @@
+# Runtime DEPLOY image for RunPod (or any NVIDIA GPU host): drops the
+# self-contained rustllama Linux x86_64 release onto a CUDA 13 / Ubuntu 24.04
+# base and runs the OpenAI/Ollama server. This is NOT a build image — the three
+# `Dockerfile.linux*` images COMPILE rustllama; this one just RUNS a published
+# release, so it's small and needs no toolchains.
+#
+# Why this base:
+#   - glibc >= 2.39  → Ubuntu 24.04 (the release is built on that floor; a 22.04
+#     base = glibc 2.35 and the binary won't start).
+#   - CUDA 13 runtime + an R580+ NVIDIA driver on the HOST. The binary links
+#     cudart statically, so only the driver is a runtime dep; an older host
+#     driver just means CUDA init fails and rustllama falls back to CPU.
+#     (A plain ubuntu:24.04 base also works since cudart is static — the
+#     nvidia/cuda base is just the conventional, safe GPU choice.)
+#
+# Build:  docker build --build-arg RUSTLLAMA_VERSION=0.1.0 -t rustllama-runpod -f scripts/Dockerfile.runpod .
+# Run:    docker run --gpus all -p 8000:8000 -e RUSTLLAMA_API_KEY=sk-secret \
+#             -v /my/models:/workspace/models rustllama-runpod \
+#             --model /workspace/models/model.gguf
+# See docs/deploy-runpod.md.
+FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04
+
+ARG RUSTLLAMA_VERSION=0.1.0
+ARG RUSTLLAMA_ARCH=x86_64
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Fetch + unpack the published self-contained release (binary + bundled .so's +
+# README + LICENSE + docs). The archive extracts to rustllama-<ver>-linux-<arch>/.
+RUN curl -fsSL -o /tmp/rl.tar.gz \
+      "https://github.com/mattx86/rustllama/releases/download/v${RUSTLLAMA_VERSION}/rustllama-${RUSTLLAMA_VERSION}-linux-${RUSTLLAMA_ARCH}.tar.gz" \
+    && tar xzf /tmp/rl.tar.gz -C /opt \
+    && ln -s "/opt/rustllama-${RUSTLLAMA_VERSION}-linux-${RUSTLLAMA_ARCH}/rustllama" /usr/local/bin/rustllama \
+    && rm -f /tmp/rl.tar.gz
+
+# RunPod exposes the service on 0.0.0.0; map this port in the pod/template config.
+ENV RUSTLLAMA_PORT=8000
+# Keep models + state on a mounted volume so they survive restarts and the
+# first-load autotune isn't repeated (see docs/deploy-runpod.md).
+WORKDIR /workspace
+EXPOSE 8000
+
+# Bearer token via RUSTLLAMA_API_KEY (serve reads it); anything after the image
+# name on `docker run` / in the RunPod "container args" is appended to `serve`
+# (e.g. `--model /workspace/models/model.gguf`).
+ENTRYPOINT ["/bin/sh","-c","exec rustllama serve --ip 0.0.0.0 --port ${RUSTLLAMA_PORT} \"$@\"","--"]

@@ -150,6 +150,9 @@ Notes:
   `scripts/release-linux-x86_64.bat`, and `scripts/release-linux-arm64.bat`
   (Linux archives build in Docker), and `scripts/release-macos.sh {arm64,x86_64}`
   (run **on a Mac**, no Docker); output lands in `release/`.
+- **Deploying to a GPU cloud** (RunPod, etc.)? See
+  [docs/deploy-runpod.md](docs/deploy-runpod.md) — `scripts/Dockerfile.runpod`
+  is a ready runtime image.
 
 ## Layout
 
