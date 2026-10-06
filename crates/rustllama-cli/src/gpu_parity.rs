@@ -786,6 +786,48 @@ fn quantize_kv_cache(
     packed
 }
 
+/// Inverse of [`quantize_kv_cache`]: dequantize a packed KV cache back to the
+/// f32 `[n_kv_heads, max_ctx, head_dim]` layout, using the SAME per-block CPU
+/// decoders the production KV reader uses. Feeds the SAME-QUANT flash reference
+/// (quantize → dequantize round-trip of the original cache) so the parity probe
+/// measures the kernel's correctness, not the KV quantization loss.
+fn dequant_kv_cache(
+    fmt: &QuantKvFormat,
+    packed: &[u8],
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    upto: usize,
+) -> Vec<f32> {
+    let blocks_per_row = head_dim / fmt.block_elems;
+    let bytes_per_row = blocks_per_row * fmt.block_bytes;
+    let mut out = vec![0f32; n_kv_heads * max_ctx * head_dim];
+    for h in 0..n_kv_heads {
+        for t in 0..upto {
+            let src = (h * max_ctx + t) * bytes_per_row;
+            let dst = (h * max_ctx + t) * head_dim;
+            let prow = &packed[src..src + bytes_per_row];
+            let orow = &mut out[dst..dst + head_dim];
+            match fmt.name {
+                "mxfp4" => k::mxfp_kv::dequantize_row_mxfp4(prow, orow),
+                "mxfp6" => k::mxfp_kv::dequantize_row_mxfp6(prow, orow),
+                "mxfp8" => k::mxfp_kv::dequantize_row_mxfp8(prow, orow),
+                "nvfp4" => {
+                    // nvfp4 exposes a per-BLOCK decoder; loop the row's blocks.
+                    for b in 0..blocks_per_row {
+                        k::nvfp4::dequantize_block(
+                            &prow[b * fmt.block_bytes..(b + 1) * fmt.block_bytes],
+                            &mut orow[b * fmt.block_elems..(b + 1) * fmt.block_elems],
+                        );
+                    }
+                }
+                _ => unreachable!("unknown quant-KV format {}", fmt.name),
+            }
+        }
+    }
+    out
+}
+
 fn probe_attn(stream: &sk::SyclStream, name: &str, variant: &str, started: Instant) {
     // Quant-KV variants (decode_mxfp4 … prefill_nvfp4) run the F32-Q /
     // packed-K/V flash kernels and grade against the full-precision CPU
@@ -2082,11 +2124,15 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
     }
 
     // ---- Quantized-KV FlashAttention decode + prefill (MXFP4/6/8, NVFP4) ----
-    // Same geometry as the f32 flash section above; K/V are quantized to
-    // each format's block layout on the CPU (byte-identical to the engine's
-    // KV writer), then the native quant-KV kernels dequantize them on the
-    // fly. Graded against the FULL-PRECISION f32 reference, so the per-format
-    // tolerance (from QUANT_KV_FORMATS) must absorb the KV round-trip error.
+    // Same geometry as the f32 flash section above; K/V are quantized to each
+    // format's block layout on the CPU (byte-identical to the engine's KV
+    // writer), then the native quant-KV kernels dequantize them on the fly.
+    // Graded against a SAME-QUANT reference (the identical packed K/V
+    // dequantized on the CPU, run through the f32 flash reference), so the probe
+    // measures the KERNEL's correctness, not the KV quantization loss — a
+    // correct kernel then passes the per-format tolerance with margin. (Was
+    // graded vs the full-precision f32 K/V, which conflated the two and flagged
+    // the correct kernels as MISCOMPUTE on their relative-error metric.)
     {
         let (n_heads, n_kv_heads, head_dim, max_ctx, kv_len) =
             (8usize, 2usize, 64usize, 128usize, 40usize);
@@ -2095,13 +2141,6 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         let kc = gen_x(n_kv_heads * max_ctx * head_dim, 63);
         let vc = gen_x(n_kv_heads * max_ctx * head_dim, 67);
         let qp = gen_x(n_new * n_heads * head_dim, 71);
-        // Full-precision references on the un-quantized K/V (reused by every
-        // format — the quantization lives only on the GPU side).
-        let cpu_dec =
-            ref_flash_decode(&q, &kc, &vc, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
-        let cpu_pre = ref_flash_prefill(
-            &qp, &kc, &vc, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-        );
         // Cover both readers from one packed cache: decode reads kv_len rows,
         // prefill reads kv_base+n_new rows.
         let upto = kv_len.max(kv_base + n_new);
@@ -2116,6 +2155,18 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             }
             let kp = quantize_kv_cache(fmt, &kc, n_kv_heads, head_dim, max_ctx, upto);
             let vp = quantize_kv_cache(fmt, &vc, n_kv_heads, head_dim, max_ctx, upto);
+
+            // Same-quant reference: dequantize the identical packed K/V and run
+            // the f32 flash reference on THAT (per-format — each format
+            // round-trips differently).
+            let kc_dq = dequant_kv_cache(fmt, &kp, n_kv_heads, head_dim, max_ctx, upto);
+            let vc_dq = dequant_kv_cache(fmt, &vp, n_kv_heads, head_dim, max_ctx, upto);
+            let cpu_dec = ref_flash_decode(
+                &q, &kc_dq, &vc_dq, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            );
+            let cpu_pre = ref_flash_prefill(
+                &qp, &kc_dq, &vc_dq, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
+            );
 
             // decode
             if let (Some(qb), Some(kb), Some(vb), Some(mut ob)) = (
