@@ -103,7 +103,10 @@ $env:RUSTLLAMA_API_KEY = "sk-secret"; rustllama serve   # 2. env var
 `/healthz` is always reachable without a token. Loopback (`127.0.0.1`) requests
 are exempt by default so local tools keep working; set
 `[server].require_auth_loopback = true` to require the token from local clients
-too. See [docs/editor-integrations.md](docs/editor-integrations.md).
+too. See [docs/editor-integrations.md](docs/editor-integrations.md). Coming from
+llama.cpp? [docs/llama-cpp-migration.md](docs/llama-cpp-migration.md) maps the
+common `llama-cli` / `llama-server` flags (`-fa`, `--temp`, `--top-k`,
+`--top-p`, `-c`, …) to their rustllama equivalents.
 
 ## Releases
 
