@@ -600,6 +600,16 @@ pub enum LlamaLoadError {
          the SSM forward kernel. See docs/qwen35moe-roadmap.md."
     )]
     UnsupportedHybridForward { arch: String, interval: u32 },
+    /// A hybrid (attention + SSM/DeltaNet) model whose DeltaNet head
+    /// geometry can't be derived consistently from its tensor shapes
+    /// (e.g. `ssm_inner_size` not divisible by the v-head count, a zero
+    /// head count, or a layer-count mismatch). Community merges /
+    /// fine-tunes that deviate from the base `qwen35moe` head layout the
+    /// DeltaNet cache assumes land here. Returned instead of panicking so
+    /// a load fails with a clear diagnostic rather than terminating the
+    /// whole process mid-decode.
+    #[error("unsupported hybrid DeltaNet geometry: {0}")]
+    UnsupportedHybridGeometry(String),
 }
 
 /// One transformer block's weights, stored as F16.
@@ -2152,38 +2162,77 @@ impl DeltaNetCache {
     /// layers are SSM (allocate) vs full-attention (sentinel). Returns
     /// `None` for non-hybrid models — the caller should not construct
     /// a DeltaNetCache in that case.
-    pub fn new_for_hybrid(cfg: &LlamaConfig, hybrid: &[HybridLayer]) -> Option<Self> {
-        let hyb = cfg.hybrid.as_ref()?;
-        assert_eq!(
-            hybrid.len(),
-            cfg.n_layers,
-            "DeltaNetCache: hybrid_layers must have one entry per layer"
-        );
+    pub fn new_for_hybrid(
+        cfg: &LlamaConfig,
+        hybrid: &[HybridLayer],
+    ) -> Result<Self, LlamaLoadError> {
+        // The weights say "hybrid" but the config block is missing: a
+        // genuine inconsistency. Error instead of silently returning
+        // `None` (which the caller would then `.expect()` on → panic).
+        let hyb = cfg.hybrid.as_ref().ok_or_else(|| {
+            LlamaLoadError::UnsupportedHybridGeometry(
+                "hybrid weights present but the [hybrid] config block is missing".to_string(),
+            )
+        })?;
+        if hybrid.len() != cfg.n_layers {
+            return Err(LlamaLoadError::UnsupportedHybridGeometry(format!(
+                "hybrid_layers has {} entries but the model declares {} layers",
+                hybrid.len(),
+                cfg.n_layers
+            )));
+        }
         let ssm_inner = hyb.ssm_inner_size as usize;
         let conv_kernel = hyb.ssm_conv_kernel as usize;
+        if conv_kernel == 0 {
+            return Err(LlamaLoadError::UnsupportedHybridGeometry(
+                "ssm_conv_kernel is 0".to_string(),
+            ));
+        }
         // n_v_heads / head_qk_dim / head_v_dim aren't first-class
         // config fields (they're encoded into the tensor shapes).
         // For `qwen35moe`: n_v_heads=32, n_qk_heads=16, head_qk_dim=
         // d_model/n_qk_heads=128, head_v_dim=ssm_inner/n_v_heads=128.
         // We derive them here from the tensor shapes of the first
         // SSM layer (which all SSM layers share).
-        let first_ssm = hybrid.iter().find_map(|l| match l {
-            HybridLayer::Ssm(s) => Some(s),
-            _ => None,
-        })?;
+        let first_ssm = hybrid
+            .iter()
+            .find_map(|l| match l {
+                HybridLayer::Ssm(s) => Some(s),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                LlamaLoadError::UnsupportedHybridGeometry(
+                    "model is marked hybrid but has no SSM/DeltaNet layers".to_string(),
+                )
+            })?;
         let n_v_heads = first_ssm.ssm_a.len();
-        assert!(
-            n_v_heads > 0,
-            "DeltaNetCache: first SSM layer's ssm_a was empty — model is malformed"
-        );
+        if n_v_heads == 0 {
+            return Err(LlamaLoadError::UnsupportedHybridGeometry(
+                "first SSM layer's `ssm_a` is empty (zero v-heads)".to_string(),
+            ));
+        }
+        // The DeltaNet state buffers are sized `n_v_heads * head_v_dim`
+        // with `head_v_dim = ssm_inner / n_v_heads`, so `ssm_inner` must
+        // divide evenly by the v-head count. A community merge / fine-
+        // tune that changes the head layout from the base `qwen35moe`
+        // (ssm_inner=4096, n_v_heads=32) would otherwise truncate here
+        // and index out of bounds in the DeltaNet forward → process
+        // crash. Fail cleanly at load instead (Part 2 — deriving the QK
+        // dims from the tensor shapes — is the real fix for such models).
+        if ssm_inner % n_v_heads != 0 {
+            return Err(LlamaLoadError::UnsupportedHybridGeometry(format!(
+                "ssm_inner_size ({ssm_inner}) is not divisible by the v-head count \
+                 ({n_v_heads}); this model's DeltaNet head layout isn't supported"
+            )));
+        }
         let head_v_dim = ssm_inner / n_v_heads;
         // QK heads share a head_dim with V heads on `qwen35moe`. We
         // recover n_qk_heads from `attn_qkv` shape: that tensor is
         // [qkv_dim, d_model] with qkv_dim = 2*ssm_inner. Split as
         // q (n_qk_heads * head_qk_dim) + k (n_qk_heads * head_qk_dim)
         // + v (n_v_heads * head_v_dim). We assume head_qk_dim ==
-        // head_v_dim (true for `qwen35moe`); if a future model
-        // diverges this needs a config field. Pin via assertion.
+        // head_v_dim (true for `qwen35moe`); a future model that
+        // diverges needs the dims derived from tensor shapes (Part 2).
         let head_qk_dim = head_v_dim; // qwen35moe convention
         let _ = head_qk_dim; // suppress unused if future divergence
         let layers: Vec<DeltaNetLayerState> = hybrid
@@ -2212,7 +2261,7 @@ impl DeltaNetCache {
                 HybridLayer::FullAttention(_) => DeltaNetLayerState::empty(),
             })
             .collect();
-        Some(Self { layers })
+        Ok(Self { layers })
     }
 
     pub fn reset(&mut self) {
@@ -12371,14 +12420,18 @@ mod tests {
         assert!(state.recurrent_state.iter().all(|&v| v == 0.0));
     }
 
-    /// DeltaNetCache::new_for_hybrid returns None for non-hybrid models
-    /// — the caller should not construct one in that case.
+    /// DeltaNetCache::new_for_hybrid errors on a non-hybrid cfg. The
+    /// "non-hybrid → no cache" guard now lives in the engine's
+    /// `build_delta_net_cache` (it checks the weights first and never
+    /// calls this on a dense model), so reaching here without a [hybrid]
+    /// config block is an inconsistency — surfaced as a clean error
+    /// instead of a panic.
     #[test]
-    fn deltanet_cache_returns_none_for_non_hybrid() {
+    fn deltanet_cache_errors_for_non_hybrid() {
         let cfg = synth_cfg(2, 2, 8);
         assert!(cfg.hybrid.is_none());
         let cache = DeltaNetCache::new_for_hybrid(&cfg, &[]);
-        assert!(cache.is_none());
+        assert!(cache.is_err());
     }
 
     /// Misshapen embed buffer panics (debug build) or errors clearly.

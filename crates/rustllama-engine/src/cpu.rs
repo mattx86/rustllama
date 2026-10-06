@@ -690,9 +690,17 @@ fn run_warmup(model: &LlamaModel, max_ctx: usize, n_gpu_layers: u32) -> usize {
 /// (load, load_with_options, fork_for_concurrent_use) stay consistent.
 fn build_delta_net_cache(
     model: &LlamaModel,
-) -> Option<rustllama_models::llama_arch::DeltaNetCache> {
-    let hybrid = model.weights.hybrid_layers.as_ref()?;
-    rustllama_models::llama_arch::DeltaNetCache::new_for_hybrid(&model.cfg, hybrid)
+) -> Result<Option<rustllama_models::llama_arch::DeltaNetCache>> {
+    // Non-hybrid models carry no DeltaNet layers → no cache (not an error).
+    let Some(hybrid) = model.weights.hybrid_layers.as_ref() else {
+        return Ok(None);
+    };
+    // A hybrid model with inconsistent DeltaNet geometry now returns a
+    // clean `UnsupportedHybridGeometry` error (surfaced here as the load
+    // error) instead of panicking inside the cache constructor.
+    Ok(Some(
+        rustllama_models::llama_arch::DeltaNetCache::new_for_hybrid(&model.cfg, hybrid)?,
+    ))
 }
 
 /// Per-layer KV keep-mask for sparse contiguous allocation (memory
@@ -1326,7 +1334,7 @@ impl CpuEngine {
             );
         }
 
-        let delta_net_cache = build_delta_net_cache(&model);
+        let delta_net_cache = build_delta_net_cache(&model)?;
         // Memory-budget planner (Phase 3): with `[inference].memory_budget
         // = "auto"`, derive the expert-cache budget from measured
         // available RAM minus an honest projection of what the engine
@@ -2055,7 +2063,7 @@ impl CpuEngine {
             "safetensors model loaded — engine ready"
         );
 
-        let delta_net_cache = build_delta_net_cache(&model);
+        let delta_net_cache = build_delta_net_cache(&model)?;
         let model = Arc::new(model);
         let lock_registry =
             crate::pagelock::lock_model_into_ram(Arc::clone(&model)).map(Arc::new);
@@ -2217,7 +2225,7 @@ impl CpuEngine {
              GPU-capable) — engine ready"
         );
 
-        let delta_net_cache = build_delta_net_cache(&model);
+        let delta_net_cache = build_delta_net_cache(&model)?;
         let model = Arc::new(model);
         let lock_registry =
             crate::pagelock::lock_model_into_ram(Arc::clone(&model)).map(Arc::new);
@@ -3553,7 +3561,18 @@ impl CpuEngine {
             hybrid_kv_keep_mask(&self.model).as_deref(),
         )
         .expect("parent's layout already validated at engine load");
-        let delta_net_cache = build_delta_net_cache(&self.model);
+        // Infallible fork of an ALREADY-loaded model: its DeltaNet
+        // geometry was validated when the parent loaded, so a rebuild
+        // error here is impossible in practice. Degrade to no cache +
+        // log rather than reintroduce a panic in this infallible path.
+        let delta_net_cache = build_delta_net_cache(&self.model).unwrap_or_else(|e| {
+            tracing::error!(
+                error = %e,
+                "fork_for_concurrent_use: DeltaNet cache rebuild failed for an \
+                 already-validated model"
+            );
+            None
+        });
         let kv_dtype_cached = kv_backend.kv_dtype();
         Self {
             model: self.model.clone(),
