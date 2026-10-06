@@ -7,10 +7,11 @@ and Linux (x86_64), Linux on aarch64** (e.g. NVIDIA Grace / DGX Spark), **and
 macOS** (Apple Silicon + Intel). Compute backends are compiled in and selected
 at startup per the hardware present: **Intel GPUs via SYCL** (x86_64 only),
 **NVIDIA GPUs via CUDA**, **Apple GPUs via Metal/MLX** (Apple Silicon), and
-**CPU SIMD** (AVX2 on x86_64, NEON on aarch64). NVIDIA builds include opt-in
-tensor-core GEMM paths (Blackwell FP4/FP6/FP8, Hopper FP8); Intel builds an
-opt-in XMX/DPAS bf16 path — all off by default, validated against the CPU
-reference.
+**CPU SIMD** (AVX2 on x86_64, NEON on aarch64). NVIDIA builds also carry
+tensor-core GEMM paths (Blackwell FP4/FP6/FP8, Hopper FP8) and Intel builds an
+XMX/DPAS bf16 path; these **auto-enable per device** — the first-load autotune
+runs an on-device parity self-check and turns each specialized path on only
+where it matches the CPU reference (no env vars, fail-closed).
 
 > **Status:** experimental / pre-1.0. APIs, config keys, and on-disk
 > formats may change between releases.

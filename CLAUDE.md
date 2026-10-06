@@ -159,10 +159,14 @@ commands in the chat REPL/TUI mirror this verb set):
   config default; `load`/`unload`/`default` manage the *running server's* loaded
   set (can't `unload` the current default). `bench` = synthetic prefill+decode.
 - `config` — manage the on-disk config.
-- `tune` — autotuner. `tune --all` runs every sweep (coordinate-descent);
-  `tune --show` prints tuner-cache state. Individual sweeps: `--kv-dtype`,
-  `--flash-attention`, `--kv-layout`, `--placement`, `--batch-size`,
-  `--threads`, `--moe-placement`, `--flash-kv-min`, etc.
+- `tune` — autotuner. `tune --all` runs every sweep (coordinate-descent),
+  including the `--validate-kernels` stage (Stage 1c): it runs the GPU kernel
+  parity probes on-device and caches a pass/fail verdict per kernel, which the
+  dispatch gates read to auto-enable the Blackwell/Hopper/XMX tensor-core paths
+  where they match the CPU reference. `tune --show` prints tuner-cache state.
+  Individual sweeps: `--kv-dtype`, `--flash-attention`, `--kv-layout`,
+  `--placement`, `--batch-size`, `--threads`, `--moe-placement`,
+  `--flash-kv-min`, `--validate-kernels`, etc.
 - `quantize` / `imatrix` / `kv-calibrate` — quantization + calibration tooling.
 - `doctor` — diagnostics. `--sycl-smoke`, `--sycl-parity`, `--cuda-parity`,
   `--metal-parity`, `--cpu-parity` run the kernel parity/stability harnesses
@@ -199,6 +203,16 @@ KV→f32. Winners persist to the tuner cache keyed by `system_fingerprint()` (so
 they work on SYCL/CUDA/CPU hosts alike) and auto-apply on next load per the
 `[tuning].auto_apply_*` flags.
 
+The sweep's `--validate-kernels` stage runs the GPU kernel parity probes and
+caches a pass/fail **verdict** per kernel (`TuningResult.kernel_verdicts`); the
+`accel.rs` gates read it to AUTO-ENABLE the Blackwell/Hopper tensor-core + Intel
+XMX GEMM paths only where they match the CPU reference (fail-closed, **no env
+vars** — the removed `RUSTLLAMA_FP4_TC`/`_FP8_WGMMA`/`_SYCL_XMX`). **Self-heal:**
+even when a model is already tuned, the first-load path re-runs
+`--validate-kernels` if the cache's verdicts are missing or were stamped by a
+DIFFERENT build version — so a new build (incl. a kernel fix) auto-(re)validates
+without the user clearing any cache.
+
 ## Testing & validation
 
 - `cargo test --lib -p <crate>` for the 8 toolchain-free crates (what CI runs).
@@ -228,6 +242,15 @@ headless box; the GUI build just adds the egui desktop shell):
   `scripts\release-linux-arm64.bat` (Docker/QEMU, SBSA CUDA repo)
 - macOS arm64 (Apple Silicon) `.tar.gz` (GUI) — `scripts/release-macos.sh arm64`
 - macOS x86_64 (Intel) `.tar.gz` (GUI) — `scripts/release-macos.sh x86_64`
+
+**CUDA arch coverage** (`RUSTLLAMA_CUDA_ARCHS`, set per release in
+`_release_build_linux.sh` / `release-windows.bat`): x86 ships
+`75;80;86;89;90a;100a;120a` (Turing → consumer Blackwell), aarch64 that +
+`121a` (GB10 / DGX Spark). The accelerated `a` arches (`90a`, `12xa`) are what
+compile the Hopper FP8 / Blackwell FP4 tensor-core kernels so the self-check can
+auto-enable them; the rest get the base path. GPU arch is host-independent, so
+both artifacts carry the full set — only GB10's `121a` is ARM-only. (Jetson/Tegra
+`sm_87` uses a separate Tegra CUDA repo and isn't in the SBSA release.)
 
 The in-container entrypoint `scripts/_release_build_linux.sh` builds GUI by
 default for both Linux arches (`HEADLESS=1` would build server-only; neither

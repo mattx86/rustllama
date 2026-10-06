@@ -15,9 +15,12 @@ changes are needed — just match two host requirements and expose the port.
    to CPU automatically** (still works, just no GPU accel). Check the instance's
    driver before expecting GPU speed.
 
-GPU-arch coverage is fine: the build ships SASS for sm_80/86/89/90 (A100, A40/
-A5000/A6000/3090, L4/L40/4090-Ada, H100) plus forward-compatible PTX that JITs
-onto newer cards (Blackwell). Validate once with `rustllama doctor --cuda-parity`
+GPU-arch coverage is broad: the x86_64 release ships SASS for
+`sm_75;80;86;89;90a;100a;120a` — Turing (T4), Ampere (A100, A40/A6000/3090), Ada
+(L4/L40/4090), Hopper (H100, `90a` with FP8 tensor cores), DC Blackwell (B200),
+consumer Blackwell (RTX 50xx, `120a` with FP4 tensor cores) — plus forward-compat
+PTX. The Hopper/Blackwell tensor-core paths **auto-enable** on first load after
+the on-device self-check passes. Validate once with `rustllama doctor --cuda-parity`
 on the pod before trusting output on a GPU you haven't run before.
 
 ## Path A — bare GPU Pod (no image to build)
