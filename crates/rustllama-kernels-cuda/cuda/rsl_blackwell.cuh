@@ -226,11 +226,15 @@ __device__ __forceinline__ void rsl_bw_mma_mxf6(
 //       b0 = X[n=g, K = q*8 + 0..7]
 //       b1 = X[n=g, K = 32 + q*8 + 0..7]
 //   D (16x8 f32): d0=(g,2q) d1=(g,2q+1) d2=(g+8,2q) d3=(g+8,2q+1)   [col = token n]
-// SPARK-VALIDATE: the A/B element->lane map above and the SFA/SFB scale-register
-// packing + {byte-id,thread-id} selectors (left 0 here) are taken from the
-// public TV-layout docs, not measured. --cuda-parity on the Spark is the
-// arbiter; a mismatch shows as MISCOMPUTE and is a layout-index fix, not a
-// toolchain problem.
+// SPARK-VALIDATE: the A/B element->lane map above is from the public TV-layout
+// docs. The SFA scale-register packing now follows the sm_120 block-scale rule
+// (PTX ISA + NVIDIA dev-forum: SF_A is supplied by the 2 "bottom" lanes of each
+// quad, selected by thread-id-a=0 via `(laneid>>1)&1`, one output row each):
+// q=0 -> rowA0 (m0+g), q=1 -> rowA1 (m0+g+8). SFB is robust — every lane in a
+// quad packs that quad's column g, so whichever single lane the {0,0} B-selector
+// picks is correct. The residual unknown is the row-pair order (q=0 <-> g vs
+// g+8); --cuda-parity on the Spark is the arbiter — a mismatch shows as
+// MISCOMPUTE and is a one-line row-order flip, not a toolchain problem.
 // ---------------------------------------------------------------------------
 
 // Read one NVFP4 nibble: weight row m (global), global K index gk. Row stride
@@ -296,12 +300,19 @@ __global__ void rsl_bw_gemm_nvfp4_kernel(
         a[1] = rsl_pack_a_nvfp4(w, rowA0, M, k0 + 32 + q * 8, K);
         a[2] = rsl_pack_a_nvfp4(w, rowA1, M, k0 + q * 8, K);
         a[3] = rsl_pack_a_nvfp4(w, rowA1, M, k0 + 32 + q * 8, K);
-        // SFA: pack row rowA0's 4 K-block E4M3 scales (bytes 0..3). SPARK-VALIDATE.
+        // SFA (sm_120 block-scale layout, scale_vec::4X): with thread-id-a=0
+        // (the {0,0} selector in rsl_bw_mma_nvfp4), the 2 bottom lanes of each
+        // quad (q=0,1) each supply ONE output row's 4 K-block E4M3 scales —
+        // q=0 -> rowA0 (m0+g), q=1 -> rowA1 (m0+g+8); lanes q=2,3 are ignored.
+        // (Was: every lane packed rowA0, so rows 8..15's scales never reached
+        // the MMA and ALL formats miscomputed.) Row-pair order is the residual
+        // coin-flip the Spark --cuda-parity resolves.
         unsigned sfa = 0u;
-        if (rowA0 < M) {
+        int sfa_row = (q == 0) ? rowA0 : (q == 1) ? rowA1 : -1;
+        if (sfa_row >= 0 && sfa_row < M) {
             #pragma unroll
             for (int j = 0; j < 4; ++j)
-                sfa |= (unsigned)rsl_nvfp4_scale(w, rowA0, (k0 >> 4) + j, K) << (8 * j);
+                sfa |= (unsigned)rsl_nvfp4_scale(w, sfa_row, (k0 >> 4) + j, K) << (8 * j);
         }
 
         // ---- B fragment (activations, quantized to NVFP4) ----
@@ -429,10 +440,12 @@ __global__ void rsl_bw_gemm_mxfp4_kernel(
         a[2] = rsl_pack_a_mxfp4(w, rowA1, M, k0 + q * 8, K);
         a[3] = rsl_pack_a_mxfp4(w, rowA1, M, k0 + 32 + q * 8, K);
         // SFA: 2 MXFP4 (per-32) block E8M0 scales over K=64 (scale_vec::2X).
+        // sm_120 layout: q=0 -> rowA0, q=1 -> rowA1 (see the NVFP4 kernel note).
         unsigned sfa = 0u;
-        if (rowA0 < M) {
-            sfa |= (unsigned)rsl_mxfp4_scale(w, rowA0, (k0 >> 5) + 0, K) << 0;
-            sfa |= (unsigned)rsl_mxfp4_scale(w, rowA0, (k0 >> 5) + 1, K) << 8;
+        int sfa_row = (q == 0) ? rowA0 : (q == 1) ? rowA1 : -1;
+        if (sfa_row >= 0 && sfa_row < M) {
+            sfa |= (unsigned)rsl_mxfp4_scale(w, sfa_row, (k0 >> 5) + 0, K) << 0;
+            sfa |= (unsigned)rsl_mxfp4_scale(w, sfa_row, (k0 >> 5) + 1, K) << 8;
         }
 
         // B: quantize activation token g to MXFP4 (2 per-32 blocks over K=64).
@@ -587,7 +600,8 @@ __global__ void rsl_bw_gemm_mxfp8_kernel(const unsigned char* __restrict__ w, co
         unsigned a[4];
         a[0] = rsl_pack_a_8bit(w, rA0, M, k0 + q * 4, K, 0); a[1] = rsl_pack_a_8bit(w, rA1, M, k0 + q * 4, K, 0);
         a[2] = rsl_pack_a_8bit(w, rA0, M, k0 + 16 + q * 4, K, 0); a[3] = rsl_pack_a_8bit(w, rA1, M, k0 + 16 + q * 4, K, 0);
-        unsigned sfa = (rA0 < M) ? (unsigned)rsl_mxfp8_scale(w, rA0, k0 >> 5, K) : 0u;
+        int sfa_row = (q == 0) ? rA0 : (q == 1) ? rA1 : -1; // sm_120: q=0->rA0, q=1->rA1
+        unsigned sfa = (sfa_row >= 0 && sfa_row < M) ? (unsigned)rsl_mxfp8_scale(w, sfa_row, k0 >> 5, K) : 0u;
         float mx = 0.f;
         #pragma unroll
         for (int t = 0; t < 32; ++t) mx = fmaxf(mx, fabsf(xs[g][t]));
@@ -617,7 +631,8 @@ __global__ void rsl_bw_gemm_mxfp6_kernel(const unsigned char* __restrict__ w, co
         unsigned a[4];
         a[0] = rsl_pack_a_8bit(w, rA0, M, k0 + q * 4, K, 1); a[1] = rsl_pack_a_8bit(w, rA1, M, k0 + q * 4, K, 1);
         a[2] = rsl_pack_a_8bit(w, rA0, M, k0 + 16 + q * 4, K, 1); a[3] = rsl_pack_a_8bit(w, rA1, M, k0 + 16 + q * 4, K, 1);
-        unsigned sfa = (rA0 < M) ? (unsigned)rsl_mxfp6_scale(w, rA0, k0 >> 5, K) : 0u;
+        int sfa_row = (q == 0) ? rA0 : (q == 1) ? rA1 : -1; // sm_120: q=0->rA0, q=1->rA1
+        unsigned sfa = (sfa_row >= 0 && sfa_row < M) ? (unsigned)rsl_mxfp6_scale(w, sfa_row, k0 >> 5, K) : 0u;
         float mx = 0.f;
         #pragma unroll
         for (int t = 0; t < 32; ++t) mx = fmaxf(mx, fabsf(xs[g][t]));
