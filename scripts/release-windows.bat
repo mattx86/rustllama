@@ -16,7 +16,7 @@ REM arches (sm_90a / sm_120a) are REQUIRED for the FP8-wgmma / FP4 TC paths to
 REM compile (build.rs gates RSL_HOPPER_TC / RSL_BLACKWELL_TC on them); sm_90a is
 REM a superset of sm_90 so the base Hopper path still runs. Release build only —
 REM dev `_build.bat` keeps the default arches for faster iteration.
-set "RUSTLLAMA_CUDA_ARCHS=80;86;89;90a;120a"
+set "RUSTLLAMA_CUDA_ARCHS=75;80;86;89;90a;100a;120a"
 
 echo ^>^> [1/3] building the GUI artifact (frontend + all-backends binary)...
 call "%~dp0_build.bat"

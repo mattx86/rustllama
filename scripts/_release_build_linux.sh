@@ -20,32 +20,30 @@ cd "$(dirname "$0")/.."
 
 ARCH="${1:?usage: _release_build_linux.sh <arch>}"
 
-# CUDA target arch for the aarch64 (Grace-class) release. Ship NATIVE SASS for
-# the two realistic ARM NVIDIA targets: Grace-Hopper (sm_90a, GH200) and — the
-# headline target — the DGX Spark's GB10 (sm_121a, Blackwell, CUDA 13.0+).
-# BOTH are the *accelerated* arches (the `a` suffix), NOT plain sm_90/sm_121: the
-# tensor-core kernels in rustllama-kernels-cuda are gated on the suffix — Hopper
-# wgmma FP8 + TMA (build.rs `hopper_tc`, sm_90a) and Blackwell FP4/FP8/FP6 + TMA
-# (build.rs `blackwell_tc`, sm_121a) — so a plain sm_90/sm_121 release would ship
-# them DISABLED. kernels-cuda/build.rs also embeds forward-compatible PTX for the
-# highest arch for any newer GPU. Native SASS avoids the one-time PTX JIT at first
-# load (the extra nvcc pass lengthens the QEMU build, accepted). Static cudart
-# 13.0 matches the Spark's CUDA 13.0.2 / driver 580.159.03.
+# CUDA target arches. GPU arch is independent of the host CPU, so BOTH releases
+# ship the full realistic GPU set; only sm_121a (GB10 / DGX Spark) is ARM-only.
+# The TC kernels in rustllama-kernels-cuda are gated on the *accelerated* (`a`)
+# arches — Hopper wgmma FP8 on sm_90a, Blackwell FP4/FP6/FP8 on sm_12xa — so those
+# must carry the `a` suffix to COMPILE the TC path (the prerequisite for
+# `tune --validate-kernels` to see + auto-enable it). The other arches
+# (75;80;86;89;100a) get the base path (the TC .cu is __CUDA_ARCH__-guarded, so
+# those passes take the fallback). build.rs also embeds forward-compat PTX for the
+# highest arch. Native SASS per arch avoids first-load PTX JIT but each adds an
+# nvcc pass (notably slower under QEMU on aarch64). Static cudart 13.0 matches the
+# Spark's CUDA 13.0.2 / driver 580.159.03.
 if [ "$ARCH" = "aarch64" ]; then
-  export RUSTLLAMA_CUDA_ARCHS="90a;121a"
-  echo ">> RUSTLLAMA_CUDA_ARCHS=$RUSTLLAMA_CUDA_ARCHS (GH200 sm_90a Hopper + DGX Spark GB10 sm_121a Blackwell, both tensor-core)"
+  # Grace superchips (GH200 sm_90a, GB200 sm_100a, GB10 sm_121a) AND ARM-host
+  # discrete GPUs (Ampere/Grace server + PCIe A100 80, A6000 86, L40 89, T4 75,
+  # RTX 120a, ...). Jetson/Tegra (Orin sm_87) is a separate Tegra repo — not here.
+  export RUSTLLAMA_CUDA_ARCHS="75;80;86;89;90a;100a;120a;121a"
+  echo ">> RUSTLLAMA_CUDA_ARCHS=$RUSTLLAMA_CUDA_ARCHS (aarch64: full GPU set incl. GB10 sm_121a)"
 else
-  # x86_64: Ampere/Ada base + the *architecture-accelerated* Hopper (sm_90a) and
-  # consumer Blackwell (sm_120a) targets, so the Hopper FP8 `wgmma` and Blackwell
-  # FP4/FP6/FP8 tensor-core kernels are COMPILED INTO the x86 release. That is the
-  # prerequisite for the on-device self-check (`tune --validate-kernels`) to even
-  # SEE them and auto-enable them on an x86 Hopper (H100) / Blackwell (RTX 50xx)
-  # host — without the accelerated arch the kernels aren't built and
-  # `blackwell/hopper_tc_available()` is false, so the probe SKIPs. `sm_90a` is a
-  # superset of `sm_90`, so the base Hopper path still runs on plain sm_90, and
-  # the embedded forward-compat PTX (highest arch) JITs onto any newer GPU.
-  export RUSTLLAMA_CUDA_ARCHS="80;86;89;90a;120a"
-  echo ">> RUSTLLAMA_CUDA_ARCHS=$RUSTLLAMA_CUDA_ARCHS (x86 Ampere/Ada + Hopper sm_90a + Blackwell sm_120a tensor-core)"
+  # x86_64: Turing (75), Ampere (80/86), Ada (89), Hopper (90a FP8 TC), DC
+  # Blackwell (100a, HGX B200 base), consumer Blackwell (120a RTX 50xx FP4 TC).
+  # The accelerated arches let the on-device self-check see + auto-enable the TC
+  # paths; sm_90a is a superset of sm_90 so the base Hopper path still runs.
+  export RUSTLLAMA_CUDA_ARCHS="75;80;86;89;90a;100a;120a"
+  echo ">> RUSTLLAMA_CUDA_ARCHS=$RUSTLLAMA_CUDA_ARCHS (x86_64: Turing..consumer Blackwell + Hopper/Blackwell TC)"
 fi
 
 # 1. Build the binary. GUI (desktop + CLI + server) by default; HEADLESS=1
