@@ -126,6 +126,9 @@ extern "C" {
     // (bit-exact). out[N,M] = x[N,K] . W[M,K]^T. Selected by accel.rs on the
     // prefill path via the `gemm:q4_k_f32` verdict.
     fn rsl_cuda_gemm_q4_k_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
+    // Q4_K prefill GEMM (Phase 2): int8 tensor-core W8A8 (lossy). Same shape;
+    // selected via the `gemm:q4_k_w8a8_tc` verdict.
+    fn rsl_cuda_gemm_q4_k_w8a8_tc(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
     fn rsl_cuda_matvec_q6_k_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
     fn rsl_cuda_matvec_q6_k_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
 
@@ -1186,6 +1189,38 @@ pub unsafe fn gemm_q4_k_f32(
     n: usize,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_gemm_q4_k_f32(
+        stream.raw(),
+        w,
+        x,
+        out,
+        m as c_int,
+        k as c_int,
+        n as c_int,
+    );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// Safe wrapper for the Q4_K int8 tensor-core prefill GEMM (W8A8, lossy). Same
+/// device-pointer contract as `gemm_q4_k_f32`; the kernel quantizes activations
+/// to int8 internally. Selected only when the `gemm:q4_k_w8a8_tc` verdict passed.
+///
+/// SAFETY: `w`/`x`/`out` are device pointers on `stream`'s device sized for the
+/// Q4_K block layout and the given M/K/N (K % 256 == 0).
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn gemm_q4_k_w8a8_tc(
+    stream: &CudaStream,
+    w: *const c_void,
+    x: *const f32,
+    out: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_gemm_q4_k_w8a8_tc(
         stream.raw(),
         w,
         x,
@@ -2438,6 +2473,55 @@ impl CudaMatvecCache {
         let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
         // SAFETY: device buffers sized for N rows, as `matvec_packed_batched`.
         let res = unsafe { gemm_q4_k_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n) };
+        if res.is_err() || consume_error_count() != 0 {
+            return false;
+        }
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * m * 4) };
+        self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
+
+    /// Q4_K int8 tensor-core prefill GEMM (W8A8, lossy). Identical device-buffer
+    /// lifecycle to [`gemm_packed_batched_q4k_f32`](Self::gemm_packed_batched_q4k_f32)
+    /// — the weight is the SAME packed Q4_K bytes — but the kernel int8-quantizes
+    /// the activations and runs the s8 tensor-core MMA. Selected by accel.rs on
+    /// the prefill path when the `gemm:q4_k_w8a8_tc` verdict passed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_packed_batched_q4k_w8a8_tc(
+        &mut self,
+        weight_key: usize,
+        w_bytes: &[u8],
+        x: &[f32],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> bool {
+        let kind = CudaPackedKind::Q4_K;
+        if m == 0 || k == 0 || n == 0 || x.len() != n * k || out.len() != n * m {
+            return false;
+        }
+        if k % kind.k_alignment() != 0 || w_bytes.len() < m * kind.row_bytes(k) {
+            return false;
+        }
+        if !self.ensure_weight(weight_key, w_bytes) {
+            return false;
+        }
+        if !Self::ensure_scratch(&mut self.x_scratch, &self.stream, n * k * 4)
+            || !Self::ensure_scratch(&mut self.out_scratch, &self.stream, n * m * 4)
+        {
+            return false;
+        }
+        let x_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, n * k * 4) };
+        if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
+            return false;
+        }
+        let w_ptr = self.weights[&weight_key].ptr;
+        let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
+        let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: device buffers sized for N rows, as `gemm_packed_batched_q4k_f32`.
+        let res = unsafe { gemm_q4_k_w8a8_tc(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n) };
         if res.is_err() || consume_error_count() != 0 {
             return false;
         }

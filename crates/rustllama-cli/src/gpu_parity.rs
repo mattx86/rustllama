@@ -2024,6 +2024,123 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- Q4_K int8 tensor-core GEMM (verdict: gemm:q4_k_w8a8_tc, W8A8 LOSSY) ----
+    // Two-part gate: (1) correctness vs the FAIR W8A8 reference (the SAME per-32
+    // int8 activation round-trip, then the f32 Q4_K matvec — int8 TC math is
+    // exact, so only quant rounding differs); (2) it must beat the LOSSLESS f32
+    // GEMM on a prefill shape, else "SLOW" (the f32 GEMM stays the path). It is
+    // dispatched FIRST when enabled, so this gate decides lossy-vs-lossless.
+    #[allow(clippy::never_loop)]
+    for _tc in 0..1usize {
+        const TC_N: usize = 8;
+        let name = "gemm:q4_k_w8a8_tc";
+        let layout = LAYOUTS.iter().find(|l| l.name == "q4_k").expect("layout");
+        let cpu = cpu_matvec_for("q4_k");
+        let xb_host: Vec<f32> = gen_x(TC_N * MV_K, 4242);
+        let Some((w, _)) = finite_ref(layout, cpu, &xb_host[..MV_K]) else {
+            cu_emit(name, "SKIP", "no-finite-reference");
+            *counts.entry("SKIP").or_default() += 1;
+            continue;
+        };
+        let mut cpu_out = vec![0f32; TC_N * MV_M];
+        for r in 0..TC_N {
+            let xr = w4a8_roundtrip(&xb_host[r * MV_K..(r + 1) * MV_K]);
+            let mut row = vec![0f32; MV_M];
+            cpu(&w, &xr, &mut row, MV_M, MV_K);
+            cpu_out[r * MV_M..(r + 1) * MV_M].copy_from_slice(&row);
+        }
+        let (Some(wb), Some(xbd), Some(mut ob)) = (
+            ck::CudaDeviceBuffer::from_host(&stream, &w),
+            cu_upload_f32(&stream, &xb_host),
+            ck::CudaDeviceBuffer::alloc(&stream, TC_N * MV_M * 4),
+        ) else {
+            cu_emit(name, "KERNEL_ERR", "device-alloc-failed");
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+            continue;
+        };
+        // SAFETY: live device buffers on `stream` sized for (N,M)/(N,K).
+        let res = unsafe {
+            ck::gemm_q4_k_w8a8_tc(
+                &stream,
+                wb.as_ptr(),
+                xbd.as_ptr() as *const f32,
+                ob.as_mut_ptr() as *mut f32,
+                MV_M,
+                MV_K,
+                TC_N,
+            )
+        };
+        if let Err(e) = res {
+            cu_emit(name, "KERNEL_ERR", &format!("{e}"));
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+            continue;
+        }
+        let (cos, max_rel) = compare(&cu_download_f32(&ob, TC_N * MV_M), &cpu_out);
+        if !(cos > 0.999 && max_rel < 0.05) {
+            cu_emit(name, "MISCOMPUTE", &format!("cos={cos:.6} max_rel={max_rel:.4}"));
+            *counts.entry("MISCOMPUTE").or_default() += 1;
+            continue;
+        }
+        const PM: usize = 2048;
+        const PK: usize = 4096;
+        const PN: usize = 512;
+        const WARMUP: usize = 3;
+        const ITERS: usize = 20;
+        let wp = gen_quant_bytes(layout, PM, PK, 0x8AC8);
+        let xp: Vec<f32> = gen_x(PN * PK, 55);
+        let (Some(wpb), Some(xpb), Some(mut opb)) = (
+            ck::CudaDeviceBuffer::from_host(&stream, &wp),
+            cu_upload_f32(&stream, &xp),
+            ck::CudaDeviceBuffer::alloc(&stream, PN * PM * 4),
+        ) else {
+            cu_emit(name, "SLOW", "perf-shape device alloc failed");
+            *counts.entry("SLOW").or_default() += 1;
+            continue;
+        };
+        let (wptr, xptr, optr) = (
+            wpb.as_ptr(),
+            xpb.as_ptr() as *const f32,
+            opb.as_mut_ptr() as *mut f32,
+        );
+        // SAFETY: live device buffers sized for (PM,PK,PN); each wrapper syncs.
+        let (t_tc, t_gemm, t_dp4a) = unsafe {
+            for _ in 0..WARMUP {
+                let _ = ck::gemm_q4_k_w8a8_tc(&stream, wptr, xptr, optr, PM, PK, PN);
+                let _ = ck::gemm_q4_k_f32(&stream, wptr, xptr, optr, PM, PK, PN);
+                let _ = ck::matvec_q4_k_dp4a_batched(&stream, wptr, xptr, optr, PM, PK, PN);
+            }
+            let t0 = std::time::Instant::now();
+            for _ in 0..ITERS {
+                let _ = ck::gemm_q4_k_w8a8_tc(&stream, wptr, xptr, optr, PM, PK, PN);
+            }
+            let tt = t0.elapsed().as_secs_f64();
+            let t1 = std::time::Instant::now();
+            for _ in 0..ITERS {
+                let _ = ck::gemm_q4_k_f32(&stream, wptr, xptr, optr, PM, PK, PN);
+            }
+            let tg = t1.elapsed().as_secs_f64();
+            let t2 = std::time::Instant::now();
+            for _ in 0..ITERS {
+                let _ = ck::matvec_q4_k_dp4a_batched(&stream, wptr, xptr, optr, PM, PK, PN);
+            }
+            let td = t2.elapsed().as_secs_f64();
+            (tt, tg, td)
+        };
+        let detail = format!(
+            "tc {:.3} vs f32gemm {:.3} vs dp4a {:.3} ms/call ({PM}x{PK}x{PN})",
+            t_tc * 1e3 / ITERS as f64,
+            t_gemm * 1e3 / ITERS as f64,
+            t_dp4a * 1e3 / ITERS as f64,
+        );
+        if t_tc < t_gemm * 0.95 {
+            cu_emit(name, "OK", &detail);
+            *counts.entry("OK").or_default() += 1;
+        } else {
+            cu_emit(name, "SLOW", &detail);
+            *counts.entry("SLOW").or_default() += 1;
+        }
+    }
+
     // ---- Blackwell SM12x FP4 tensor-core GEMM (W4A4) ----
     // The new hand-rolled block-scaled `mma.sync` path (cuda/rsl_blackwell.cuh).
     // SKIP unless this is a real SM12x Blackwell device built with the TC path

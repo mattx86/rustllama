@@ -228,6 +228,27 @@ fn try_gemm_q4k_f32_batched(
     guard.gemm_packed_batched_q4k_f32(weight_key, w_bytes, x, out, m, k, n)
 }
 
+/// Batched Q4_K matvec via the native CUDA int8 tensor-core GEMM (verdict
+/// `gemm:q4_k_w8a8_tc`, W8A8/lossy). Weights are the SAME packed Q4_K bytes.
+#[allow(clippy::too_many_arguments)]
+fn try_gemm_q4k_w8a8_tc_batched(
+    weight_key: usize,
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    guard.gemm_packed_batched_q4k_w8a8_tc(weight_key, w_bytes, x, out, m, k, n)
+}
+
 // ------------------------------------------------------------
 // Blackwell SM12x FP4 tensor-core GEMM dispatch (opt-in)
 // ------------------------------------------------------------
@@ -409,6 +430,18 @@ fn q4k_gemm_f32_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
     *EN.get_or_init(|| {
         kernel_verdict(rustllama_tuner::VERDICT_GEMM_Q4K_F32) && cuda_active()
+    })
+}
+
+/// **AUTOMATIC** — no env var: the Q4_K int8 tensor-core GEMM (W8A8, LOSSY) is on
+/// where its probe recorded a pass (`kernel_verdict("gemm:q4_k_w8a8_tc")`), which
+/// requires both correctness (vs a fair W8A8 reference) AND beating the lossless
+/// f32 GEMM on-device. So when enabled it is the fastest Q4_K prefill path and is
+/// dispatched FIRST; otherwise the bit-exact f32 GEMM runs. Fail-closed; cached.
+fn q4k_w8a8_tc_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        kernel_verdict(rustllama_tuner::VERDICT_GEMM_Q4K_W8A8_TC) && cuda_active()
     })
 }
 
@@ -10280,9 +10313,19 @@ pub fn try_matvec_tensor_batched_usm_f32(
         if let Some(ck_kind) = dtype_to_cuda_kind(w.dtype) {
             let wb = as_bytes(w);
             let q4k = matches!(ck_kind, ck::CudaPackedKind::Q4_K);
-            // Q4_K prefill GEMM (bit-exact, shared-mem weight reuse) — HIGHEST
-            // priority on a substantial batch: it fixes the O(M·K·N) weight re-
-            // streaming that DP4A does not. A miss falls through.
+            // Q4_K int8 tensor-core GEMM (W8A8, lossy) — tried FIRST: its verdict
+            // requires beating the lossless f32 GEMM on-device, so when it's on it
+            // is the fastest Q4_K prefill path. A miss falls through.
+            if q4k
+                && q4k_w8a8_tc_enabled()
+                && n >= 16
+                && k % 256 == 0
+                && try_gemm_q4k_w8a8_tc_batched(wb.as_ptr() as usize, wb, x, out, m, k, n)
+            {
+                return true;
+            }
+            // Q4_K prefill GEMM (bit-exact, shared-mem weight reuse) — the lossless
+            // path: fixes the O(M·K·N) weight re-streaming that DP4A does not.
             if q4k
                 && q4k_gemm_f32_enabled()
                 && n >= 16

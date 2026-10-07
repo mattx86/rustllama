@@ -15,6 +15,7 @@
 #include "rsl_cuda.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <mma.h> // nvcuda::wmma — int8 tensor-core GEMM (W8A8), sm_72+
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
@@ -163,6 +164,10 @@ struct rsl_cuda_stream {
     float *q4k_dp4a_xs = nullptr;
     size_t q4k_dp4a_xq_cap = 0; // bytes
     size_t q4k_dp4a_xs_cap = 0; // floats
+    // Per-sub-block Σ of int8 activation codes (the W8A8/TC −dmin·mn·Σq_x term);
+    // only allocated for the int8-TC path.
+    int *q4k_xsum = nullptr;
+    size_t q4k_xsum_cap = 0; // ints
 };
 
 extern "C" rsl_cuda_stream *rsl_cuda_stream_create(int device_index) {
@@ -186,6 +191,7 @@ extern "C" void rsl_cuda_stream_destroy(rsl_cuda_stream *s) {
     cudaSetDevice(s->device);
     if (s->q4k_dp4a_xq) cudaFree(s->q4k_dp4a_xq);
     if (s->q4k_dp4a_xs) cudaFree(s->q4k_dp4a_xs);
+    if (s->q4k_xsum) cudaFree(s->q4k_xsum);
     cudaStreamDestroy(s->stream);
     delete s;
 }
@@ -664,7 +670,7 @@ RSL_PACKED_MATVEC_WARP(matvec_q6_k_packed_f32, q6_k_row_dot_warp, 256, 210, 256)
 // sub-block: lane L owns element L, warp-reduces max-abs, writes the int8 code
 // + the per-sub-block scale. `n` (total elements) is a multiple of 32.
 __global__ void q4k_quant_act_kernel(const float *x, signed char *xq, float *xs,
-                                     int n) {
+                                     int *xsum, int n) {
     int sub = blockIdx.x * blockDim.y + threadIdx.y;
     int base = sub * 32;
     if (base >= n) return;
@@ -678,6 +684,14 @@ __global__ void q4k_quant_act_kernel(const float *x, signed char *xq, float *xs,
     int q = __float2int_rn(v * inv);
     q = max(-127, min(127, q));
     xq[base + lane] = (signed char)q;
+    // Optional Σ of the int8 codes per sub-block (the W8A8/TC `−dmin·mn·Σq_x`
+    // term); nullptr for the DP4A path, which computes it inline via __dp4a.
+    if (xsum) {
+        int ssum = q;
+        for (int off = 16; off > 0; off >>= 1)
+            ssum += __shfl_down_sync(0xffffffffu, ssum, off);
+        if (lane == 0) xsum[sub] = ssum;
+    }
     if (lane == 0) xs[sub] = a * (1.0f / 127.0f);
 }
 
@@ -766,7 +780,8 @@ __global__ void matvec_q4_k_dp4a_batched_kernel(const unsigned char *w,
 // after the previous call's matvec finished reading xq, and the CudaMatvecCache
 // mutex serializes callers. Growth uses plain cudaMalloc (not the async pool) to
 // keep the retained buffer out of any pool-trim path.
-static int rsl_q4k_ensure_scratch(rsl_cuda_stream *s, size_t need_xq, size_t need_xs) {
+static int rsl_q4k_ensure_scratch(rsl_cuda_stream *s, size_t need_xq, size_t need_xs,
+                                  size_t need_xsum) {
     if (need_xq > s->q4k_dp4a_xq_cap) {
         if (s->q4k_dp4a_xq) cudaFree(s->q4k_dp4a_xq);
         s->q4k_dp4a_xq = nullptr;
@@ -780,6 +795,13 @@ static int rsl_q4k_ensure_scratch(rsl_cuda_stream *s, size_t need_xq, size_t nee
         s->q4k_dp4a_xs_cap = 0;
         if (cudaMalloc((void **)&s->q4k_dp4a_xs, need_xs * sizeof(float)) != cudaSuccess) return -2;
         s->q4k_dp4a_xs_cap = need_xs;
+    }
+    if (need_xsum > s->q4k_xsum_cap) {
+        if (s->q4k_xsum) cudaFree(s->q4k_xsum);
+        s->q4k_xsum = nullptr;
+        s->q4k_xsum_cap = 0;
+        if (cudaMalloc((void **)&s->q4k_xsum, need_xsum * sizeof(int)) != cudaSuccess) return -2;
+        s->q4k_xsum_cap = need_xsum;
     }
     return 0;
 }
@@ -795,13 +817,13 @@ extern "C" int rsl_cuda_matvec_q4_k_dp4a_batched(rsl_cuda_stream *s, const void 
         return -1;
     cudaSetDevice(s->device);
     size_t ne = (size_t)N * K;
-    if (rsl_q4k_ensure_scratch(s, ne, (size_t)N * (K / 32)) != 0)
+    if (rsl_q4k_ensure_scratch(s, ne, (size_t)N * (K / 32), 0) != 0)
         return -2;
     signed char *xq = s->q4k_dp4a_xq;
     float *xs = s->q4k_dp4a_xs;
     dim3 qb(32, 8);
     dim3 qg((unsigned)((ne / 32 + 7) / 8)); // grid.x max is 2^31-1, no y-cap needed
-    q4k_quant_act_kernel<<<qg, qb, 0, s->stream>>>(x, xq, xs, (int)ne);
+    q4k_quant_act_kernel<<<qg, qb, 0, s->stream>>>(x, xq, xs, nullptr, (int)ne);
     unsigned gy = (unsigned)(N < 65535 ? N : 65535);
     dim3 block(32, 8);
     dim3 grid((unsigned)((M + 7) / 8), gy);
@@ -984,6 +1006,187 @@ extern "C" int rsl_cuda_gemm_q4_k_f32(rsl_cuda_stream *s, const void *w,
     gemm_q4_k_f32_rb_kernel<<<grid, block, 0, s->stream>>>(
         (const unsigned char *)w, x, out, M, K, N);
     return rsl_cuda_check("rsl_cuda_gemm_q4_k_f32");
+}
+
+// ============================================================
+// Q4_K prefill GEMM — Phase 2: int8 TENSOR CORES (W8A8). Same 64x64/BK=32 tiling
+// as the f32 GEMM, but the inner product is the s8 tensor-core MMA
+// (nvcuda::wmma 16x16x16, legal on sm_72+ — the whole release arch list). LOSSY:
+// activations are quantized to int8 (q4k_quant_act_kernel emits xq + per-32 scale
+// xs + per-32 Σ xsum). Per Q4_K sub-block (32 wide = 2 WMMA k=16 steps) the MMA
+// gives the exact int32 dot S1 = Σ(nibble·q_x); we then fold the per-row weight
+// scale (d·sc / dmin·mn) and per-token activation scale/sum in f32 via the ggml
+// identity y = xs·(d·sc·S1 − dmin·mn·Σq_x), accumulating across sub-blocks — the
+// "fresh-accumulator-per-block → store → scale-in-f32" pattern (store_matrix_sync
+// to shared avoids relying on the opaque accumulator fragment layout). One warp
+// per 16x16 output sub-tile; 16 warps / 64x64 block. Graded vs the FAIR W8A8
+// reference (int8 is exact; only activation rounding differs). out[N,M] =
+// x[N,K]·W[M,K]^T, K % 256 == 0.
+// ============================================================
+#define RSL_Q4K_TC_BM 64
+#define RSL_Q4K_TC_BN 64
+#define RSL_Q4K_TC_WARPS 16 // 4x4 grid of 16x16 sub-tiles -> 512 threads
+
+__global__ void gemm_q4_k_w8a8_tc_kernel(const unsigned char *w,
+                                         const signed char *xq, const float *xs,
+                                         const int *xsum, float *out, int M, int K,
+                                         int N) {
+    __shared__ signed char As[RSL_Q4K_TC_BM][32]; // weight nibbles  [m][k]
+    __shared__ signed char Bs[RSL_Q4K_TC_BN][32]; // int8 activations [n][k]
+    __shared__ float dsc[RSL_Q4K_TC_BM];          // per-row d*sc for this sub-block
+    __shared__ float dmn[RSL_Q4K_TC_BM];          // per-row dmin*mn
+    __shared__ float xscl[RSL_Q4K_TC_BN];         // per-token activation scale
+    __shared__ int xsm[RSL_Q4K_TC_BN];            // per-token Σ int8 codes
+    __shared__ int Cs[RSL_Q4K_TC_WARPS][16][16];  // per-warp int32 MMA result
+
+    const int rowBase = blockIdx.x * RSL_Q4K_TC_BM;
+    const int tokBase = blockIdx.y * RSL_Q4K_TC_BN;
+    const int warpId = threadIdx.y; // 0..15
+    const int lane = threadIdx.x;   // 0..31
+    const int tid = warpId * 32 + lane;
+    const int nthreads = RSL_Q4K_TC_WARPS * 32; // 512
+    const int wr = warpId >> 2;     // 0..3 — which 16-row band
+    const int wc = warpId & 3;      // 0..3 — which 16-token band
+    const int m0 = rowBase + wr * 16;
+    const int n0 = tokBase + wc * 16;
+    const int bpr = K / 256; // super-blocks per row
+    const int spr = K / 32;  // sub-blocks per row
+
+    float cacc[8];
+#pragma unroll
+    for (int c = 0; c < 8; ++c) cacc[c] = 0.0f;
+
+    for (int g = 0; g < spr; ++g) {
+        const int sbi = g >> 3; // super-block (g / 8)
+        const int s = g & 7;    // sub-block within super-block
+        const int hi = s & 1;
+        // Per-row weight scale (d*sc, dmin*mn) — one thread per row, unpack once.
+        if (tid < RSL_Q4K_TC_BM) {
+            int mg = rowBase + tid;
+            float a = 0.0f, b = 0.0f;
+            if (mg < M) {
+                const unsigned char *blk = w + ((size_t)mg * bpr + sbi) * 144;
+                float d = rsl_f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+                float dmin = rsl_f16_bits_to_f32((unsigned short)blk[2] | ((unsigned short)blk[3] << 8));
+                const unsigned char *sb = blk + 4;
+                unsigned char sc, mn;
+                if (s < 4) {
+                    sc = sb[s] & 0x3F;
+                    mn = sb[s + 4] & 0x3F;
+                } else {
+                    sc = (sb[s + 4] & 0x0F) | ((sb[s - 4] >> 6) << 4);
+                    mn = (sb[s + 4] >> 4) | ((sb[s] >> 6) << 4);
+                }
+                a = d * (float)sc;
+                b = dmin * (float)mn;
+            }
+            dsc[tid] = a;
+            dmn[tid] = b;
+        }
+        // Stage weight nibbles -> As[m][k] (int8).
+        for (int e = tid; e < RSL_Q4K_TC_BM * 32; e += nthreads) {
+            int rl = e >> 5;  // row (e / 32)
+            int kk = e & 31;  // k within sub-block
+            int mg = rowBase + rl;
+            signed char nib = 0;
+            if (mg < M) {
+                const unsigned char *blk = w + ((size_t)mg * bpr + sbi) * 144;
+                unsigned char bqt = blk[16 + (s >> 1) * 32 + kk];
+                nib = (signed char)(hi ? (bqt >> 4) : (bqt & 0x0F));
+            }
+            As[rl][kk] = nib;
+        }
+        // Stage int8 activations -> Bs[n][k].
+        for (int e = tid; e < RSL_Q4K_TC_BN * 32; e += nthreads) {
+            int tl = e >> 5;
+            int kk = e & 31;
+            int ng = tokBase + tl;
+            Bs[tl][kk] = (ng < N) ? xq[(size_t)ng * K + (size_t)g * 32 + kk] : (signed char)0;
+        }
+        // Per-token activation scale + Σ.
+        if (tid < RSL_Q4K_TC_BN) {
+            int ng = tokBase + tid;
+            xscl[tid] = (ng < N) ? xs[(size_t)ng * spr + g] : 0.0f;
+            xsm[tid] = (ng < N) ? xsum[(size_t)ng * spr + g] : 0;
+        }
+        __syncthreads();
+
+        // S1 = Σ_k(nibble · q_x) over the 32-wide sub-block, into Cs[warpId].
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 720)
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, signed char,
+                               nvcuda::wmma::row_major> a_frag;
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, signed char,
+                               nvcuda::wmma::col_major> b_frag;
+        nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, int> acc_frag;
+        nvcuda::wmma::fill_fragment(acc_frag, 0);
+#pragma unroll
+        for (int kk = 0; kk < 32; kk += 16) {
+            nvcuda::wmma::load_matrix_sync(a_frag, &As[wr * 16][kk], 32);
+            nvcuda::wmma::load_matrix_sync(b_frag, &Bs[wc * 16][kk], 32);
+            nvcuda::wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+        }
+        nvcuda::wmma::store_matrix_sync(&Cs[warpId][0][0], acc_frag, 16,
+                                        nvcuda::wmma::mem_row_major);
+#else
+        // Scalar fallback (arch < sm_72, never in the release list): same int32 dot.
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            int e = lane + c * 32;
+            int mi = e >> 4, nj = e & 15;
+            int acc_i = 0;
+            for (int kk = 0; kk < 32; ++kk)
+                acc_i += (int)As[wr * 16 + mi][kk] * (int)Bs[wc * 16 + nj][kk];
+            Cs[warpId][mi][nj] = acc_i;
+        }
+#endif
+        __syncwarp();
+        // Scale pass: fold the f32 scales into the running f32 accumulator.
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            int e = lane + c * 32;
+            int mi = e >> 4, nj = e & 15;
+            int row = wr * 16 + mi; // block-tile row (0..63)
+            int tok = wc * 16 + nj; // block-tile token (0..63)
+            cacc[c] += xscl[tok] * (dsc[row] * (float)Cs[warpId][mi][nj] -
+                                    dmn[row] * (float)xsm[tok]);
+        }
+        __syncthreads(); // before the next sub-block overwrites shared
+    }
+
+    // Write out[token][row].
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+        int e = lane + c * 32;
+        int mi = e >> 4, nj = e & 15;
+        int mg = m0 + mi;
+        int ng = n0 + nj;
+        if (mg < M && ng < N) out[(size_t)ng * M + mg] = cacc[c];
+    }
+}
+
+// Quant pre-pass (emit xq + xs + xsum) + int8-TC GEMM, persistent scratch.
+extern "C" int rsl_cuda_gemm_q4_k_w8a8_tc(rsl_cuda_stream *s, const void *w,
+                                          const float *x, float *out, int M, int K,
+                                          int N) {
+    if (!s || !w || !x || !out || M <= 0 || K <= 0 || N <= 0 || (K % 256) != 0)
+        return -1;
+    cudaSetDevice(s->device);
+    size_t ne = (size_t)N * K;
+    size_t nsub = (size_t)N * (K / 32);
+    if (rsl_q4k_ensure_scratch(s, ne, nsub, nsub) != 0)
+        return -2;
+    signed char *xq = s->q4k_dp4a_xq;
+    float *xs = s->q4k_dp4a_xs;
+    int *xsum = s->q4k_xsum;
+    dim3 qb(32, 8);
+    dim3 qg((unsigned)((ne / 32 + 7) / 8));
+    q4k_quant_act_kernel<<<qg, qb, 0, s->stream>>>(x, xq, xs, xsum, (int)ne);
+    dim3 block(32, RSL_Q4K_TC_WARPS);
+    dim3 grid((unsigned)((M + RSL_Q4K_TC_BM - 1) / RSL_Q4K_TC_BM),
+              (unsigned)((N + RSL_Q4K_TC_BN - 1) / RSL_Q4K_TC_BN));
+    gemm_q4_k_w8a8_tc_kernel<<<grid, block, 0, s->stream>>>(
+        (const unsigned char *)w, xq, xs, xsum, out, M, K, N);
+    return rsl_cuda_check("rsl_cuda_gemm_q4_k_w8a8_tc");
 }
 
 // IQ4_NL / IQ4_XS 16-entry non-linear codebook (ggml kvalues_iq4nl).
