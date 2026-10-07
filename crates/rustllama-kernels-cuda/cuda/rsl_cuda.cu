@@ -155,6 +155,14 @@ extern "C" int rsl_cuda_matvec_f32(const float *W, const float *x, float *out,
 struct rsl_cuda_stream {
     int device;
     cudaStream_t stream;
+    // Persistent Q4_K DP4A/W4A8 activation scratch (int8 codes + per-sub-block
+    // f32 scales), grown on demand and REUSED across matvec calls. Allocating
+    // this per call in the decode hot loop was what made the DP4A path ~4x
+    // slower than the bit-exact one; reuse keeps the quant pre-pass cheap.
+    signed char *q4k_dp4a_xq = nullptr;
+    float *q4k_dp4a_xs = nullptr;
+    size_t q4k_dp4a_xq_cap = 0; // bytes
+    size_t q4k_dp4a_xs_cap = 0; // floats
 };
 
 extern "C" rsl_cuda_stream *rsl_cuda_stream_create(int device_index) {
@@ -176,6 +184,8 @@ extern "C" rsl_cuda_stream *rsl_cuda_stream_create(int device_index) {
 extern "C" void rsl_cuda_stream_destroy(rsl_cuda_stream *s) {
     if (!s) return;
     cudaSetDevice(s->device);
+    if (s->q4k_dp4a_xq) cudaFree(s->q4k_dp4a_xq);
+    if (s->q4k_dp4a_xs) cudaFree(s->q4k_dp4a_xs);
     cudaStreamDestroy(s->stream);
     delete s;
 }
@@ -768,22 +778,43 @@ __global__ void matvec_q4_k_dp4a_batched_kernel(const unsigned char *w,
     }
 }
 
-// Quant pre-pass + DP4A matvec. Scratch is stream-ordered (cudaMallocAsync) so
-// the per-call alloc/free in the decode hot loop never syncs the host and reuses
-// the pool. `n` fits int for all realistic shapes (activations < 2 GiB).
+// Ensure the stream's persistent DP4A scratch holds >= need_xq bytes of int8
+// activations + need_xs f32 sub-block scales. Grown on demand (rare — it
+// stabilizes at the model's largest K after the first calls) and REUSED across
+// every matvec; never freed per call. The reuse is safe without double-buffering
+// because all work is on s->stream: the next call's quant kernel is ordered
+// after the previous call's matvec finished reading xq, and the CudaMatvecCache
+// mutex serializes callers. Growth uses plain cudaMalloc (not the async pool) to
+// keep the retained buffer out of any pool-trim path.
+static int rsl_q4k_ensure_scratch(rsl_cuda_stream *s, size_t need_xq, size_t need_xs) {
+    if (need_xq > s->q4k_dp4a_xq_cap) {
+        if (s->q4k_dp4a_xq) cudaFree(s->q4k_dp4a_xq);
+        s->q4k_dp4a_xq = nullptr;
+        s->q4k_dp4a_xq_cap = 0;
+        if (cudaMalloc((void **)&s->q4k_dp4a_xq, need_xq) != cudaSuccess) return -2;
+        s->q4k_dp4a_xq_cap = need_xq;
+    }
+    if (need_xs > s->q4k_dp4a_xs_cap) {
+        if (s->q4k_dp4a_xs) cudaFree(s->q4k_dp4a_xs);
+        s->q4k_dp4a_xs = nullptr;
+        s->q4k_dp4a_xs_cap = 0;
+        if (cudaMalloc((void **)&s->q4k_dp4a_xs, need_xs * sizeof(float)) != cudaSuccess) return -2;
+        s->q4k_dp4a_xs_cap = need_xs;
+    }
+    return 0;
+}
+
+// Quant pre-pass + DP4A matvec, reusing the stream's persistent scratch. `n`
+// fits int for all realistic shapes (activations < 2 GiB).
 extern "C" int rsl_cuda_matvec_q4_k_dp4a(rsl_cuda_stream *s, const void *w,
                                          const float *x, float *out, int M, int K) {
     if (!s || !w || !x || !out || M <= 0 || K <= 0 || (K % 256) != 0)
         return -1;
     cudaSetDevice(s->device);
-    signed char *xq = nullptr;
-    float *xs = nullptr;
-    if (cudaMallocAsync((void **)&xq, (size_t)K, s->stream) != cudaSuccess)
+    if (rsl_q4k_ensure_scratch(s, (size_t)K, (size_t)(K / 32)) != 0)
         return -2;
-    if (cudaMallocAsync((void **)&xs, (size_t)(K / 32) * sizeof(float), s->stream) != cudaSuccess) {
-        cudaFreeAsync(xq, s->stream);
-        return -2;
-    }
+    signed char *xq = s->q4k_dp4a_xq;
+    float *xs = s->q4k_dp4a_xs;
     dim3 qb(32, 8);
     dim3 qg((unsigned)(((K / 32) + 7) / 8));
     q4k_quant_act_kernel<<<qg, qb, 0, s->stream>>>(x, xq, xs, K);
@@ -791,8 +822,6 @@ extern "C" int rsl_cuda_matvec_q4_k_dp4a(rsl_cuda_stream *s, const void *w,
     dim3 grid((unsigned)((M + 7) / 8));
     matvec_q4_k_dp4a_kernel<<<grid, block, 0, s->stream>>>(
         (const unsigned char *)w, xq, xs, out, M, K);
-    cudaFreeAsync(xq, s->stream);
-    cudaFreeAsync(xs, s->stream);
     return rsl_cuda_check("rsl_cuda_matvec_q4_k_dp4a");
 }
 
@@ -803,14 +832,10 @@ extern "C" int rsl_cuda_matvec_q4_k_dp4a_batched(rsl_cuda_stream *s, const void 
         return -1;
     cudaSetDevice(s->device);
     size_t ne = (size_t)N * K;
-    signed char *xq = nullptr;
-    float *xs = nullptr;
-    if (cudaMallocAsync((void **)&xq, ne, s->stream) != cudaSuccess)
+    if (rsl_q4k_ensure_scratch(s, ne, (size_t)N * (K / 32)) != 0)
         return -2;
-    if (cudaMallocAsync((void **)&xs, (size_t)N * (K / 32) * sizeof(float), s->stream) != cudaSuccess) {
-        cudaFreeAsync(xq, s->stream);
-        return -2;
-    }
+    signed char *xq = s->q4k_dp4a_xq;
+    float *xs = s->q4k_dp4a_xs;
     dim3 qb(32, 8);
     dim3 qg((unsigned)((ne / 32 + 7) / 8)); // grid.x max is 2^31-1, no y-cap needed
     q4k_quant_act_kernel<<<qg, qb, 0, s->stream>>>(x, xq, xs, (int)ne);
@@ -819,8 +844,6 @@ extern "C" int rsl_cuda_matvec_q4_k_dp4a_batched(rsl_cuda_stream *s, const void 
     dim3 grid((unsigned)((M + 7) / 8), gy);
     matvec_q4_k_dp4a_batched_kernel<<<grid, block, 0, s->stream>>>(
         (const unsigned char *)w, xq, xs, out, M, K, N);
-    cudaFreeAsync(xq, s->stream);
-    cudaFreeAsync(xs, s->stream);
     return rsl_cuda_check("rsl_cuda_matvec_q4_k_dp4a_batched");
 }
 
