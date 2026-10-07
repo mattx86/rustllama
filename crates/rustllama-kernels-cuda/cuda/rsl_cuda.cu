@@ -853,51 +853,62 @@ __device__ __forceinline__ void rsl_unpack_q4k_scales(const unsigned char *sb,
 }
 
 // ============================================================
-// Q4_K prefill GEMM (Phase 1): tiled, shared-memory WEIGHT REUSE, f32 accumulate
-// — a BIT-EXACT replacement for the batched matvec, whose kernel re-read the
-// weight row once PER TOKEN (O(M*K*N) weight traffic, the ~30s prefill floor).
-// Here each (BM x BN) output tile stages one 256-weight super-block of its BM
-// weight rows (DEQUANTIZED to f32) + the BN tokens' activations in shared memory
-// and reuses them across the tile, so each weight is read from global memory
-// ONCE (O(M*K)). One thread per output element; +1 column padding avoids the
-// stride-256 shared-bank conflict. Bit-identical to the scalar Q4_K reference up
-// to f32 reduction order. out[N,M] = x[N,K] . W[M,K]^T, W = Q4_K packed
-// (144 B / 256 wt), K % 256 == 0.
+// Q4_K prefill GEMM (Phase 1): REGISTER-BLOCKED tiled GEMM, f32 accumulate — a
+// BIT-EXACT replacement for the batched matvec. Prefill is matvec-COMPUTE-bound
+// (~linear in tokens, ~4% of f32 peak on a naive kernel), so the lever is ILP +
+// arithmetic intensity, not just weight reuse: each thread computes a TM×TN
+// micro-tile of outputs with register accumulators (TM·TN independent FMAs per
+// k-step to hide latency), over a BM×BN block tile staged in shared memory. The
+// weight super-block is DEQUANTIZED to f32 into shared on the way in (BK=32
+// aligns to one Q4_K sub-block = one sc/mn), reused across the BN-token tile.
+// Shared is transposed ([BK][BM]/[BK][BN]) for the inner loop. Bit-identical to
+// the scalar Q4_K reference up to f32 reduction order. out[N,M] = x[N,K] .
+// W[M,K]^T, W = Q4_K packed (144 B / 256 wt), K % 256 == 0.
 // ============================================================
-#define RSL_Q4K_GEMM_BM 16
-#define RSL_Q4K_GEMM_BN 16
-#define RSL_Q4K_GEMM_BK 256 // one Q4_K super-block
-#define RSL_Q4K_GEMM_BKP (RSL_Q4K_GEMM_BK + 1)
+#define RSL_Q4K_GEMM_BM 64
+#define RSL_Q4K_GEMM_BN 64
+#define RSL_Q4K_GEMM_BK 32 // one Q4_K sub-block (one sc/mn)
+#define RSL_Q4K_GEMM_TM 4  // rows per thread
+#define RSL_Q4K_GEMM_TN 4  // tokens per thread
+// threads = (BM/TM)*(BN/TN) = 16*16 = 256
 
-__global__ void gemm_q4_k_f32_tiled_kernel(const unsigned char *w, const float *x,
-                                           float *out, int M, int K, int N) {
-    __shared__ float Ws[RSL_Q4K_GEMM_BM][RSL_Q4K_GEMM_BKP];
-    __shared__ float Xs[RSL_Q4K_GEMM_BN][RSL_Q4K_GEMM_BKP];
-    const int tx = threadIdx.x; // 0..BN-1 — token within the tile
-    const int ty = threadIdx.y; // 0..BM-1 — weight row within the tile
-    const int m = blockIdx.x * RSL_Q4K_GEMM_BM + ty; // output weight row
-    const int n = blockIdx.y * RSL_Q4K_GEMM_BN + tx; // output token
-    const int bpr = K / 256;                          // super-blocks per row
-    const int tid = ty * RSL_Q4K_GEMM_BN + tx;        // 0..255
-    const int nthreads = RSL_Q4K_GEMM_BM * RSL_Q4K_GEMM_BN;
-    float acc = 0.0f;
-    for (int kt = 0; kt < bpr; ++kt) {
-        // Stage W tile: dequant the BM rows' super-block kt into Ws[BM][256].
+__global__ void gemm_q4_k_f32_rb_kernel(const unsigned char *w, const float *x,
+                                        float *out, int M, int K, int N) {
+    __shared__ float As[RSL_Q4K_GEMM_BK][RSL_Q4K_GEMM_BM]; // dequant weights [k][row]
+    __shared__ float Bs[RSL_Q4K_GEMM_BK][RSL_Q4K_GEMM_BN]; // activations   [k][token]
+    const int rowBase = blockIdx.x * RSL_Q4K_GEMM_BM;
+    const int tokBase = blockIdx.y * RSL_Q4K_GEMM_BN;
+    const int tr = threadIdx.y; // 0..15 — micro-tile row index
+    const int tc = threadIdx.x; // 0..15 — micro-tile token index
+    const int nthreads = (RSL_Q4K_GEMM_BM / RSL_Q4K_GEMM_TM) *
+                         (RSL_Q4K_GEMM_BN / RSL_Q4K_GEMM_TN); // 256
+    const int tid = tr * (RSL_Q4K_GEMM_BN / RSL_Q4K_GEMM_TN) + tc;
+    const int bpr = K / 256; // super-blocks per row
+    float acc[RSL_Q4K_GEMM_TM][RSL_Q4K_GEMM_TN];
+#pragma unroll
+    for (int i = 0; i < RSL_Q4K_GEMM_TM; ++i)
+#pragma unroll
+        for (int j = 0; j < RSL_Q4K_GEMM_TN; ++j) acc[i][j] = 0.0f;
+
+    const int ktiles = K / RSL_Q4K_GEMM_BK; // K/32
+    for (int kt = 0; kt < ktiles; ++kt) {
+        // Stage As[BK][BM] — dequant the BM weight rows' sub-block kt.
         for (int e = tid; e < RSL_Q4K_GEMM_BM * RSL_Q4K_GEMM_BK; e += nthreads) {
-            int rl = e >> 8;  // row within tile (e / 256)
-            int j = e & 255;  // weight index within the super-block (0..255)
-            int mg = blockIdx.x * RSL_Q4K_GEMM_BM + rl;
+            int rl = e % RSL_Q4K_GEMM_BM;         // row within tile (0..BM-1)
+            int kk = e / RSL_Q4K_GEMM_BM;         // k within tile (0..BK-1)
+            int mg = rowBase + rl;
+            int kg = kt * RSL_Q4K_GEMM_BK + kk;   // global k
             float val = 0.0f;
             if (mg < M) {
-                const unsigned char *blk = w + ((size_t)mg * bpr + kt) * 144;
+                int sbi = kg >> 8; // super-block (kg / 256)
+                int j = kg & 255;  // index within super-block (0..255)
+                const unsigned char *blk = w + ((size_t)mg * bpr + sbi) * 144;
                 float d = rsl_f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
                 float dmin = rsl_f16_bits_to_f32((unsigned short)blk[2] | ((unsigned short)blk[3] << 8));
                 const unsigned char *sb = blk + 4;
                 const unsigned char *qs = blk + 16;
-                // ggml dequant layout: 4 groups of 64 (each = 32 lo + 32 hi
-                // nibbles over the same 32 qs bytes), sub-block scale sc[2g]/sc[2g+1].
-                int g = j >> 6;   // group 0..3
-                int pos = j & 63; // 0..63 within the group
+                int g = j >> 6;
+                int pos = j & 63;
                 int sub = 2 * g + (pos >= 32 ? 1 : 0);
                 int l = pos & 31;
                 unsigned char qb = qs[g * 32 + l];
@@ -912,24 +923,43 @@ __global__ void gemm_q4_k_f32_tiled_kernel(const unsigned char *w, const float *
                 }
                 val = d * (float)sc * (float)nib - dmin * (float)mn;
             }
-            Ws[rl][j] = val;
+            As[kk][rl] = val;
         }
-        // Stage X tile: the BN tokens' super-block kt into Xs[BN][256].
+        // Stage Bs[BK][BN] — the BN tokens' sub-block kt.
         for (int e = tid; e < RSL_Q4K_GEMM_BN * RSL_Q4K_GEMM_BK; e += nthreads) {
-            int tl = e >> 8; // token within the tile
-            int kk = e & 255;
-            int ng = blockIdx.y * RSL_Q4K_GEMM_BN + tl;
-            Xs[tl][kk] = (ng < N) ? x[(size_t)ng * K + (size_t)kt * 256 + kk] : 0.0f;
+            int tl = e % RSL_Q4K_GEMM_BN;
+            int kk = e / RSL_Q4K_GEMM_BN;
+            int ng = tokBase + tl;
+            int kg = kt * RSL_Q4K_GEMM_BK + kk;
+            Bs[kk][tl] = (ng < N) ? x[(size_t)ng * K + kg] : 0.0f;
         }
         __syncthreads();
-#pragma unroll 8
+#pragma unroll
         for (int k = 0; k < RSL_Q4K_GEMM_BK; ++k) {
-            acc += Ws[ty][k] * Xs[tx][k];
+            float ar[RSL_Q4K_GEMM_TM], br[RSL_Q4K_GEMM_TN];
+#pragma unroll
+            for (int i = 0; i < RSL_Q4K_GEMM_TM; ++i)
+                ar[i] = As[k][tr * RSL_Q4K_GEMM_TM + i];
+#pragma unroll
+            for (int j = 0; j < RSL_Q4K_GEMM_TN; ++j)
+                br[j] = Bs[k][tc * RSL_Q4K_GEMM_TN + j];
+#pragma unroll
+            for (int i = 0; i < RSL_Q4K_GEMM_TM; ++i)
+#pragma unroll
+                for (int j = 0; j < RSL_Q4K_GEMM_TN; ++j) acc[i][j] += ar[i] * br[j];
         }
         __syncthreads();
     }
-    if (m < M && n < N) {
-        out[(size_t)n * M + m] = acc;
+    // Write out[token][row] = acc.
+#pragma unroll
+    for (int i = 0; i < RSL_Q4K_GEMM_TM; ++i) {
+        int mg = rowBase + tr * RSL_Q4K_GEMM_TM + i;
+        if (mg >= M) continue;
+#pragma unroll
+        for (int j = 0; j < RSL_Q4K_GEMM_TN; ++j) {
+            int ng = tokBase + tc * RSL_Q4K_GEMM_TN + j;
+            if (ng < N) out[(size_t)ng * M + mg] = acc[i][j];
+        }
     }
 }
 
@@ -940,10 +970,10 @@ extern "C" int rsl_cuda_gemm_q4_k_f32(rsl_cuda_stream *s, const void *w,
     if (!s || !w || !x || !out || M <= 0 || K <= 0 || N <= 0 || (K % 256) != 0)
         return -1;
     cudaSetDevice(s->device);
-    dim3 block(RSL_Q4K_GEMM_BN, RSL_Q4K_GEMM_BM); // x = token (BN), y = row (BM)
+    dim3 block(RSL_Q4K_GEMM_BN / RSL_Q4K_GEMM_TN, RSL_Q4K_GEMM_BM / RSL_Q4K_GEMM_TM); // 16x16
     dim3 grid((unsigned)((M + RSL_Q4K_GEMM_BM - 1) / RSL_Q4K_GEMM_BM),
               (unsigned)((N + RSL_Q4K_GEMM_BN - 1) / RSL_Q4K_GEMM_BN));
-    gemm_q4_k_f32_tiled_kernel<<<grid, block, 0, s->stream>>>(
+    gemm_q4_k_f32_rb_kernel<<<grid, block, 0, s->stream>>>(
         (const unsigned char *)w, x, out, M, K, N);
     return rsl_cuda_check("rsl_cuda_gemm_q4_k_f32");
 }
