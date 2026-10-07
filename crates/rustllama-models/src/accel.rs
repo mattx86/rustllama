@@ -11687,24 +11687,59 @@ pub fn try_flash_attn_prefill_gpu_tq(
     )
 }
 
+/// The benign SYCL/USM short-circuit reason: the Intel USM subsystem simply is
+/// not the active path on this host — no usable Intel GPU, or a CUDA/MLX/CPU
+/// host. The call sites pass this exact string; the skip-once loggers match on
+/// it to stay quiet (debug-only) rather than emit an alarming "CPU fallback"
+/// WARN that reads as a global verdict when it is only the Intel path bowing
+/// out of a single call (the CUDA/MLX arm above it does the GPU work).
+const USM_REASON_INACTIVE: &str = "usm_attn_enabled = false";
+
+/// Name the active non-SYCL GPU backend, if any. When CUDA or MLX is live the
+/// SYCL/USM hooks declining is fully expected — that backend does the GPU work
+/// — so the USM skip notices drop to debug level and never read as a global
+/// CPU fallback. `None` ⇒ no GPU backend at all (a legitimate CPU-tier host).
+fn active_non_sycl_gpu_backend() -> Option<&'static str> {
+    if cuda_active() {
+        Some("CUDA")
+    } else if mlx_active() {
+        Some("MLX")
+    } else {
+        None
+    }
+}
+
 /// Log the FIRST time the USM attention KV-mirror validity gate
 /// declines a GPU dispatch on this process. One line is enough to
 /// see the mechanism in `gui.log` (which thread pattern produced a
 /// gap); afterwards the declines stay silent — they are the correct,
-/// intended CPU fallback, not an error.
+/// intended CPU fallback, not an error. On a CUDA/MLX host this SYCL
+/// attention path is simply unused, so the notice drops to debug.
 fn log_usm_kv_gap_once(layer_idx: usize, pos: u32, valid: u32) {
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     ONCE.get_or_init(|| {
-        tracing::info!(
-            layer = layer_idx,
-            pos,
-            valid,
-            thread_id = ?std::thread::current().id(),
-            "USM attention KV mirror has a row gap on this thread — \
-             declining GPU attention, CPU path takes over (logged once; \
-             this protects against attending over rows another thread or \
-             request wrote)"
-        );
+        if let Some(be) = active_non_sycl_gpu_backend() {
+            tracing::debug!(
+                layer = layer_idx,
+                pos,
+                valid,
+                backend = be,
+                "SYCL/USM attention KV-mirror gap — {} is this host's GPU \
+                 backend, this SYCL attention path is unused (logged once)",
+                be
+            );
+        } else {
+            tracing::info!(
+                layer = layer_idx,
+                pos,
+                valid,
+                thread_id = ?std::thread::current().id(),
+                "USM attention KV mirror has a row gap on this thread — \
+                 declining GPU attention, CPU path takes over (logged once; \
+                 this protects against attending over rows another thread or \
+                 request wrote)"
+            );
+        }
     });
 }
 
@@ -11715,11 +11750,26 @@ fn log_usm_kv_gap_once(layer_idx: usize, pos: u32, valid: u32) {
 fn log_prefill_attn_skip_once(reason: &str) {
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     ONCE.get_or_init(|| {
-        tracing::warn!(
-            reason,
-            "try_flash_attn_prefill_usm_f32 short-circuited — \
-             falling back to CPU prefill (logged once)"
-        );
+        if reason == USM_REASON_INACTIVE {
+            match active_non_sycl_gpu_backend() {
+                Some(be) => tracing::debug!(
+                    "SYCL/USM flash-prefill hook inactive — {} is this host's \
+                     GPU backend and handles prefill; this SYCL path is unused \
+                     (logged once)",
+                    be
+                ),
+                None => tracing::debug!(
+                    "SYCL/USM flash-prefill hook inactive — no GPU backend on \
+                     this host, using the CPU prefill path (logged once)"
+                ),
+            }
+        } else {
+            tracing::warn!(
+                reason,
+                "SYCL/USM flash-prefill hook short-circuited — CPU prefill for \
+                 the affected calls (logged once)"
+            );
+        }
     });
 }
 
@@ -11729,11 +11779,26 @@ fn log_prefill_attn_skip_once(reason: &str) {
 fn log_matvec_batched_skip_once(reason: &str) {
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     ONCE.get_or_init(|| {
-        tracing::warn!(
-            reason,
-            "try_matvec_tensor_batched_usm_f32 short-circuited — \
-             falling back to per-row dispatch (logged once)"
-        );
+        if reason == USM_REASON_INACTIVE {
+            match active_non_sycl_gpu_backend() {
+                Some(be) => tracing::debug!(
+                    "SYCL/USM batched-matvec hook inactive — {} is this host's \
+                     GPU backend and handles matvec; this SYCL path is unused \
+                     (logged once)",
+                    be
+                ),
+                None => tracing::debug!(
+                    "SYCL/USM batched-matvec hook inactive — no GPU backend on \
+                     this host (logged once)"
+                ),
+            }
+        } else {
+            tracing::warn!(
+                reason,
+                "SYCL/USM batched-matvec hook short-circuited — falling back to \
+                 per-row dispatch (logged once)"
+            );
+        }
     });
 }
 
@@ -11745,11 +11810,26 @@ fn log_matvec_batched_skip_once(reason: &str) {
 fn log_matvec_skip_once(reason: &str) {
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     ONCE.get_or_init(|| {
-        tracing::warn!(
-            reason,
-            "try_matvec_tensor_usm_f32 short-circuited — falling back to \
-             CPU matvec for this and subsequent calls (logged once)"
-        );
+        if reason == USM_REASON_INACTIVE {
+            match active_non_sycl_gpu_backend() {
+                Some(be) => tracing::debug!(
+                    "SYCL/USM matvec hook inactive — {} is this host's GPU \
+                     matvec backend; only non-offloaded calls (f32 tensors, \
+                     CPU-placed layers) use CPU (logged once)",
+                    be
+                ),
+                None => tracing::debug!(
+                    "SYCL/USM matvec hook inactive — no GPU matvec backend on \
+                     this host, using the CPU path (logged once)"
+                ),
+            }
+        } else {
+            tracing::warn!(
+                reason,
+                "SYCL/USM matvec hook short-circuited — CPU matvec for the \
+                 affected calls (logged once)"
+            );
+        }
     });
 }
 
