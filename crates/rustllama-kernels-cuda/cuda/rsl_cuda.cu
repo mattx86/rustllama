@@ -652,20 +652,13 @@ RSL_PACKED_MATVEC_WARP(matvec_q6_k_packed_f32, q6_k_row_dot_warp, 256, 210, 256)
 // Integer DP4A is EXACT, so the only error vs the bit-exact f32 path is the
 // int8 activation rounding: cos stays ~1.0 but max_rel grows past the tight
 // `doctor --cuda-parity` tolerance — that is why this is gated OFF by default
-// and is NOT auto-enabled (it trades a little precision for fewer ALU ops on
-// the still-ALU-bound Q4_K decode). Toggle with RUSTLLAMA_Q4K_DP4A=1. Every
-// release arch (sm_75+) has __dp4a. A malloc/launch failure returns nonzero →
-// the caller falls through to the SYCL/CPU ladder, so it degrades gracefully.
+// and is NOT auto-enabled on the bit-exact probe (it trades a little precision
+// for fewer ALU ops where prefill is compute-bound). It is gated by the per-
+// device `matvec:q4_k_dp4a` kernel verdict (a FAIR W4A8-vs-W4A8 parity probe)
+// and wired ONLY onto the batched/prefill path from accel.rs — single-row
+// decode stays bit-exact. Every release arch (sm_75+) has __dp4a. A malloc/
+// launch failure returns nonzero → the caller falls through to the CPU ladder.
 // ============================================================
-
-static int rsl_q4k_dp4a_enabled() {
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("RUSTLLAMA_Q4K_DP4A");
-        v = (e && e[0] && e[0] != '0') ? 1 : 0; // benign first-call race
-    }
-    return v;
-}
 
 // Symmetric int8 quant of f32 activations, one warp (32 lanes) per 32-element
 // sub-block: lane L owns element L, warp-reduces max-abs, writes the int8 code
@@ -746,19 +739,6 @@ __device__ __forceinline__ float q4_k_row_dot_warp_dp4a(const unsigned char *row
     return acc;
 }
 
-__global__ void matvec_q4_k_dp4a_kernel(const unsigned char *w,
-                                        const signed char *xq, const float *xs,
-                                        float *out, int M, int K) {
-    int row = blockIdx.x * blockDim.y + threadIdx.y;
-    if (row >= M) return;
-    int lane = threadIdx.x;
-    int bpr = K / 256;
-    float acc = q4_k_row_dot_warp_dp4a(w + (size_t)row * bpr * 144, xq, xs, bpr, lane);
-    for (int off = warpSize >> 1; off > 0; off >>= 1)
-        acc += __shfl_down_sync(0xffffffffu, acc, off);
-    if (lane == 0) out[row] = acc;
-}
-
 __global__ void matvec_q4_k_dp4a_batched_kernel(const unsigned char *w,
                                                 const signed char *xq,
                                                 const float *xs, float *out,
@@ -804,27 +784,10 @@ static int rsl_q4k_ensure_scratch(rsl_cuda_stream *s, size_t need_xq, size_t nee
     return 0;
 }
 
-// Quant pre-pass + DP4A matvec, reusing the stream's persistent scratch. `n`
-// fits int for all realistic shapes (activations < 2 GiB).
-extern "C" int rsl_cuda_matvec_q4_k_dp4a(rsl_cuda_stream *s, const void *w,
-                                         const float *x, float *out, int M, int K) {
-    if (!s || !w || !x || !out || M <= 0 || K <= 0 || (K % 256) != 0)
-        return -1;
-    cudaSetDevice(s->device);
-    if (rsl_q4k_ensure_scratch(s, (size_t)K, (size_t)(K / 32)) != 0)
-        return -2;
-    signed char *xq = s->q4k_dp4a_xq;
-    float *xs = s->q4k_dp4a_xs;
-    dim3 qb(32, 8);
-    dim3 qg((unsigned)(((K / 32) + 7) / 8));
-    q4k_quant_act_kernel<<<qg, qb, 0, s->stream>>>(x, xq, xs, K);
-    dim3 block(32, 8);
-    dim3 grid((unsigned)((M + 7) / 8));
-    matvec_q4_k_dp4a_kernel<<<grid, block, 0, s->stream>>>(
-        (const unsigned char *)w, xq, xs, out, M, K);
-    return rsl_cuda_check("rsl_cuda_matvec_q4_k_dp4a");
-}
-
+// Quant pre-pass + DP4A batched matvec, reusing the stream's persistent scratch.
+// DP4A is wired ONLY onto the batched/prefill path (verdict matvec:q4_k_dp4a,
+// selected from accel.rs); single-row decode stays bit-exact. `ne` fits int for
+// all realistic shapes (activations < 2 GiB).
 extern "C" int rsl_cuda_matvec_q4_k_dp4a_batched(rsl_cuda_stream *s, const void *w,
                                                  const float *x, float *out,
                                                  int M, int K, int N) {
@@ -847,21 +810,19 @@ extern "C" int rsl_cuda_matvec_q4_k_dp4a_batched(rsl_cuda_stream *s, const void 
     return rsl_cuda_check("rsl_cuda_matvec_q4_k_dp4a_batched");
 }
 
-// Public Q4_K entry (the names the Rust FFI binds to): dispatch to the opt-in
-// DP4A/W4A8 path or the default bit-exact warp path.
+// Public Q4_K entries (the names the Rust FFI binds to) are the DEFAULT bit-
+// exact warp path. The DP4A/W4A8 path is reached via the dedicated
+// rsl_cuda_matvec_q4_k_dp4a_batched entry, which accel.rs selects on the
+// prefill path only when the per-device `matvec:q4_k_dp4a` verdict passed.
 extern "C" int rsl_cuda_matvec_q4_k_packed_f32(rsl_cuda_stream *s, const void *w,
                                                const float *x, float *out,
                                                int M, int K) {
-    if (rsl_q4k_dp4a_enabled())
-        return rsl_cuda_matvec_q4_k_dp4a(s, w, x, out, M, K);
     return rsl_cuda_matvec_q4_k_bitexact(s, w, x, out, M, K);
 }
 extern "C" int rsl_cuda_matvec_q4_k_packed_f32_batched(rsl_cuda_stream *s,
                                                        const void *w,
                                                        const float *x, float *out,
                                                        int M, int K, int N) {
-    if (rsl_q4k_dp4a_enabled())
-        return rsl_cuda_matvec_q4_k_dp4a_batched(s, w, x, out, M, K, N);
     return rsl_cuda_matvec_q4_k_bitexact_batched(s, w, x, out, M, K, N);
 }
 

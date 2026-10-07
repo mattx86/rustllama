@@ -197,6 +197,10 @@ pub const VERDICT_GEMM_FP8_SP24: &str = "gemm:fp8_sp24";
 pub const VERDICT_GEMM_FP8_WGMMA: &str = "gemm:fp8_wgmma";
 /// Intel XMX/DPAS bf16 GEMM (SYCL). Backs `xmx`.
 pub const VERDICT_XMX_GEMM: &str = "xmx:gemm";
+/// Q4_K W4A8/DP4A matvec (int8 activations, HW `__dp4a`). Backs `q4k_dp4a`,
+/// wired ONLY onto the batched/prefill CUDA path (decode stays bit-exact).
+/// Graded by a FAIR W4A8-vs-W4A8 parity probe (not the bit-exact probe).
+pub const VERDICT_MATVEC_Q4K_DP4A: &str = "matvec:q4_k_dp4a";
 
 /// Read the on-device verdict for a kernel probe name, if one has been
 /// recorded. `None` = never validated (or the probe SKIPped because the

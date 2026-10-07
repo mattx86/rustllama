@@ -183,6 +183,28 @@ fn try_matvec_packed_cuda_batched(
     guard.matvec_packed_batched(kind, weight_key, w_bytes, x, out, m, k, n)
 }
 
+/// Batched Q4_K matvec via the native CUDA W4A8/DP4A prefill path (verdict
+/// `matvec:q4_k_dp4a`). Weights are the SAME packed Q4_K bytes as the bit-exact
+/// path; the kernel quantizes activations to int8 internally.
+#[allow(clippy::too_many_arguments)]
+fn try_matvec_packed_cuda_q4k_dp4a_batched(
+    weight_key: usize,
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    guard.matvec_packed_batched_q4k_dp4a(weight_key, w_bytes, x, out, m, k, n)
+}
+
 // ------------------------------------------------------------
 // Blackwell SM12x FP4 tensor-core GEMM dispatch (opt-in)
 // ------------------------------------------------------------
@@ -339,6 +361,19 @@ fn try_gemm_fp8_wgmma_batched(
 fn xmx_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
     *EN.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_XMX_GEMM))
+}
+
+/// **AUTOMATIC** — no env var: the Q4_K W4A8/DP4A matvec is on only where the
+/// fair W4A8 parity probe passed on-device (`kernel_verdict("matvec:q4_k_dp4a")`).
+/// It is lossy vs the bit-exact path (int8 activations) but numerically faithful
+/// to the W4A8 reference, and only wins where prefill is compute-bound — so it is
+/// wired ONLY onto the batched/prefill dispatch (single-row decode stays bit-
+/// exact). Fail-closed; cached once (process-wide).
+fn q4k_dp4a_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        kernel_verdict(rustllama_tuner::VERDICT_MATVEC_Q4K_DP4A) && cuda_active()
+    })
 }
 
 /// Batched XMX/DPAS bf16 GEMM via the USM_ATTN SYCL stream: dequantize W→f32
@@ -10208,6 +10243,24 @@ pub fn try_matvec_tensor_batched_usm_f32(
     {
         if let Some(ck_kind) = dtype_to_cuda_kind(w.dtype) {
             let wb = as_bytes(w);
+            // W4A8/DP4A prefill path (verdict-gated, batched only) — tried first
+            // for Q4_K on a substantial batch; a miss falls through to bit-exact.
+            if matches!(ck_kind, ck::CudaPackedKind::Q4_K)
+                && q4k_dp4a_enabled()
+                && n >= 16
+                && k % 256 == 0
+                && try_matvec_packed_cuda_q4k_dp4a_batched(
+                    wb.as_ptr() as usize,
+                    wb,
+                    x,
+                    out,
+                    m,
+                    k,
+                    n,
+                )
+            {
+                return true;
+            }
             if try_matvec_packed_cuda_batched(ck_kind, wb.as_ptr() as usize, wb, x, out, m, k, n) {
                 return true;
             }

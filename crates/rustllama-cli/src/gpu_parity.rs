@@ -519,6 +519,26 @@ fn finite_ref(layout: &QuantLayout, cpu: CpuMatvec, x: &[f32]) -> Option<(Vec<u8
     None
 }
 
+/// Per-32 symmetric int8 round-trip of activations (scale = absmax/127, round-
+/// to-nearest, clamp ±127), matching the CUDA DP4A kernel's activation quant.
+/// Used to build a FAIR W4A8 reference: because integer `__dp4a` is exact,
+/// dequantizing x back to f32 and running the normal f32-activation Q4_K matvec
+/// reproduces the kernel's `d·sc·Σ(q·xq) − dmin·mn·Σxq` identity up to f32
+/// accumulation order, so the probe grades kernel correctness — not quant loss.
+fn w4a8_roundtrip(x: &[f32]) -> Vec<f32> {
+    let mut xr = vec![0f32; x.len()];
+    for (bi, blk) in x.chunks(32).enumerate() {
+        let amax = blk.iter().fold(0f32, |a, &v| a.max(v.abs()));
+        let scale = amax / 127.0;
+        let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+        for (j, &v) in blk.iter().enumerate() {
+            let q = (v * inv).round().clamp(-127.0, 127.0);
+            xr[bi * 32 + j] = q * scale;
+        }
+    }
+    xr
+}
+
 /// XMX/DPAS bf16 tensor-core GEMM probe. SKIP unless the device is XMX-capable
 /// AND the DLL was built with the XMX path (`-DRSL_SYCL_XMX`; otherwise the host
 /// wrapper's kernel returns -2 → Ok(false)). bf16 compute vs an f32 CPU
@@ -1746,6 +1766,73 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 &cpu_out,
                 0.999,
                 0.02,
+                &mut counts,
+            ),
+        }
+    }
+
+    // ---- Q4_K W4A8/DP4A batched matvec (verdict: matvec:q4_k_dp4a) ----
+    // The prefill-path int8 matvec is lossy vs the f32-activation reference, so
+    // grade it against a FAIR W4A8 reference: the SAME per-32 int8 activation
+    // round-trip, then the normal f32-activation Q4_K matvec per row. Integer
+    // `__dp4a` is exact, so only f32 accumulation order differs → it passes
+    // tightly, isolating kernel correctness from quantization loss. A single-
+    // iteration loop so SKIP/KERNEL_ERR can `continue` past the GPU work.
+    #[allow(clippy::never_loop)]
+    for _dp4a in 0..1usize {
+        const DP4A_N: usize = 4;
+        let name = "matvec:q4_k_dp4a";
+        let layout = LAYOUTS.iter().find(|l| l.name == "q4_k").expect("layout");
+        let cpu = cpu_matvec_for("q4_k");
+        let xb_host: Vec<f32> = gen_x(DP4A_N * MV_K, 1234);
+        let Some((w, _)) = finite_ref(layout, cpu, &xb_host[..MV_K]) else {
+            cu_emit(name, "SKIP", "no-finite-reference");
+            *counts.entry("SKIP").or_default() += 1;
+            continue;
+        };
+        // CPU W4A8 reference, row by row, into [N, M] row-major.
+        let mut cpu_out = vec![0f32; DP4A_N * MV_M];
+        for r in 0..DP4A_N {
+            let xr = w4a8_roundtrip(&xb_host[r * MV_K..(r + 1) * MV_K]);
+            let mut row = vec![0f32; MV_M];
+            cpu(&w, &xr, &mut row, MV_M, MV_K);
+            cpu_out[r * MV_M..(r + 1) * MV_M].copy_from_slice(&row);
+        }
+        let (Some(wb), Some(xbd), Some(mut ob)) = (
+            ck::CudaDeviceBuffer::from_host(&stream, &w),
+            cu_upload_f32(&stream, &xb_host),
+            ck::CudaDeviceBuffer::alloc(&stream, DP4A_N * MV_M * 4),
+        ) else {
+            cu_emit(name, "KERNEL_ERR", "device-alloc-failed");
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+            continue;
+        };
+        // SAFETY: three live device buffers on `stream` sized for (N,M)/(N,K);
+        // the wrapper synchronizes before returning.
+        let res = unsafe {
+            ck::matvec_q4_k_dp4a_batched(
+                &stream,
+                wb.as_ptr(),
+                xbd.as_ptr() as *const f32,
+                ob.as_mut_ptr() as *mut f32,
+                MV_M,
+                MV_K,
+                DP4A_N,
+            )
+        };
+        match res {
+            Err(e) => {
+                cu_emit(name, "KERNEL_ERR", &format!("{e}"));
+                *counts.entry("KERNEL_ERR").or_default() += 1;
+            }
+            // Looser rel_max (0.05) than the bit-exact 0.02 to absorb the int8
+            // activation rounding; cos still ~1.0 confirms kernel correctness.
+            Ok(()) => cu_grade(
+                name,
+                &cu_download_f32(&ob, DP4A_N * MV_M),
+                &cpu_out,
+                0.999,
+                0.05,
                 &mut counts,
             ),
         }

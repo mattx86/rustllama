@@ -120,6 +120,13 @@ RAM and OOMs the new run. (This does **not** apply before a *build*; killing
   (`fp4_tc_enabled`/`hopper_tc_enabled`/`xmx_enabled` → `kernel_verdict`) turn a
   path on only where it matched the CPU reference, off otherwise (fail-closed).
   The first-load path re-validates on a build/version change (self-heal).
+- The **Q4_K W4A8/DP4A matvec** joins the same verdict mechanism
+  (`q4k_dp4a_enabled` → `kernel_verdict("matvec:q4_k_dp4a")`), with two
+  differences: it is intentionally lossy (int8 activations), so its probe grades
+  against a **fair W4A8 reference** (the same per-32 int8 round-trip) rather than
+  the bit-exact f32 reference; and it is wired **only onto the batched/prefill
+  CUDA path** — single-row decode stays bit-exact (DP4A is ~parity there, a win
+  only where prefill is compute-bound). No env var.
 - VRAM-fit placement (`rustllama-engine/src/placement_auto.rs`,
   `auto_n_gpu_layers`) budgets **CUDA-first** (mirrors dispatch), else SYCL,
   else all-CPU.
@@ -206,8 +213,12 @@ they work on SYCL/CUDA/CPU hosts alike) and auto-apply on next load per the
 The sweep's `--validate-kernels` stage runs the GPU kernel parity probes and
 caches a pass/fail **verdict** per kernel (`TuningResult.kernel_verdicts`); the
 `accel.rs` gates read it to AUTO-ENABLE the Blackwell/Hopper tensor-core + Intel
-XMX GEMM paths only where they match the CPU reference (fail-closed, **no env
-vars** — the removed `RUSTLLAMA_FP4_TC`/`_FP8_WGMMA`/`_SYCL_XMX`). **Self-heal:**
+XMX GEMM paths + the Q4_K W4A8/DP4A prefill matvec only where they match their
+CPU reference (fail-closed, **no env vars** — the removed
+`RUSTLLAMA_FP4_TC`/`_FP8_WGMMA`/`_SYCL_XMX`, and the Q4_K DP4A path's former
+`RUSTLLAMA_Q4K_DP4A`). The DP4A probe grades against a *fair W4A8* reference
+(int8-activation round-trip) since that path is intentionally lossy vs f32.
+**Self-heal:**
 even when a model is already tuned, the first-load path re-runs
 `--validate-kernels` if the cache's verdicts are missing or were stamped by a
 DIFFERENT build version — so a new build (incl. a kernel fix) auto-(re)validates
