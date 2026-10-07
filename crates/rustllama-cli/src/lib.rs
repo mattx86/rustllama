@@ -332,11 +332,14 @@ pub enum Command {
         #[arg(long)]
         placement: bool,
         /// VRAM budget in MiB for the placement sweep. Defaults to
-        /// 4096 (4 GiB), a reasonable starting point for integrated
-        /// Intel GPUs sharing LPDDR with the OS. On dedicated Arc
-        /// cards bump to your card's VRAM minus 1 GiB for the OS.
-        /// Honored only with `--placement`.
-        #[arg(long, default_value_t = 4096)]
+        /// `0` = AUTO-DETECT the dispatch GPU's VRAM (CUDA → SYCL),
+        /// so the sweep budgets against the REAL card. The old fixed
+        /// 4 GiB default silently capped placement on any larger GPU —
+        /// e.g. only ~20 of 28 layers on a 16 GiB card, leaving the
+        /// rest on CPU in the decode critical path. Pass an explicit
+        /// value to override (e.g. to reserve headroom on a shared
+        /// box). Honored only with `--placement`.
+        #[arg(long, default_value_t = 0)]
         vram_mb: u64,
         /// VRAM headroom in MiB kept free after the placement sweep
         /// fits weights + KV cache. Defaults to 256 MiB. Honored only
@@ -1977,15 +1980,7 @@ fn cmd_tune_moe_placement(
     use rustllama_engine::measurement::{measure_moe_placement_candidates, MeasurementConfig};
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
-    let model_path = match model_override {
-        Some(p) => std::path::PathBuf::from(p),
-        None => cfg.model.path.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no model: pass --model or set [model].path in {}",
-                config_path.display()
-            )
-        })?,
-    };
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
     if repeats == 0 {
         anyhow::bail!("--moe-placement-repeats must be >= 1");
     }
@@ -2481,13 +2476,7 @@ fn cmd_decision_calibrate(config_path: &std::path::Path, model: Option<String>) 
     use rustllama_engine::CpuEngine;
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
-    let model_path: std::path::PathBuf =
-        match model {
-            Some(s) => std::path::PathBuf::from(s),
-            None => cfg.model.path.clone().ok_or_else(|| {
-                anyhow::anyhow!("no --model given and no [model].path configured")
-            })?,
-        };
+    let model_path: std::path::PathBuf = effective_model_path(model, &cfg, config_path)?;
     let model_key = model_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -2629,13 +2618,11 @@ fn cmd_kv_calibrate(
     use rustllama_engine::{kv_bias, CpuEngine, SamplingParams};
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
-    let model_path =
-        match model {
-            Some(p) => p,
-            None => cfg.model.path.clone().ok_or_else(|| {
-                anyhow::anyhow!("no --model given and no [model].path configured")
-            })?,
-        };
+    let model_path = effective_model_path(
+        model.map(|p| p.to_string_lossy().into_owned()),
+        &cfg,
+        config_path,
+    )?;
     let output_path = output.unwrap_or_else(|| model_path.with_extension("kvbias.gguf"));
 
     let prompt_texts: Vec<String> = match &prompts {
@@ -3600,11 +3587,24 @@ async fn serve(
     } else {
         cfg.model.path.clone().into_iter().collect()
     };
+    // Resolve each `--model` entry the same way `model use`/`rm` do: an
+    // existing path (absolute or CWD-relative) is kept verbatim, otherwise
+    // the string is treated as a hub ref / cached id and mapped to its
+    // location under `models/<org>__<repo>/<file>`. Without this,
+    // `serve --model <the exact ref you pulled>` failed with "not found"
+    // even though the file sat in the cache — the user had to spell out the
+    // full nested path. An entry that resolves to nothing is left as typed
+    // so the existence check below reports it against the user's spelling.
+    let startup_models: Vec<std::path::PathBuf> = startup_models
+        .iter()
+        .map(|m| resolve_model_path(&m.to_string_lossy()).unwrap_or_else(|_| m.clone()))
+        .collect();
     for m in &startup_models {
         if !m.exists() {
             anyhow::bail!(
                 "--model {}: not found (pass a `.gguf` file, a `.safetensors` \
-                 AWQ/GPTQ checkpoint, or an MLX model directory)",
+                 AWQ/GPTQ checkpoint, an MLX model directory, or a hub ref / \
+                 cached id like `org/repo:file.gguf` you've `pull`ed)",
                 m.display()
             );
         }
@@ -4754,18 +4754,8 @@ fn cmd_tune(
                 .map_err(|e| anyhow::anyhow!("invalid --device {s:?}: {e}"))?
         }
     };
-    let model_path = match model_override {
-        Some(p) => std::path::PathBuf::from(p),
-        None => {
-            let cfg = rustllama_config::load(config_path).unwrap_or_default();
-            cfg.model.path.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no model: pass --model or set [model].path in {}",
-                    config_path.display()
-                )
-            })?
-        }
-    };
+    let cfg = rustllama_config::load(config_path).unwrap_or_default();
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
 
     // An MLX model is a DIRECTORY of affine-quantized safetensors with no
     // GGUF tensor table, and here it runs on CPU (load_auto → load_mlx; no GPU
@@ -4780,6 +4770,20 @@ fn cmd_tune(
         println!(
             "MLX / non-GGUF model directory — skipping GPU kernel-LWS sweep \
              (no packed-quant GGUF tensors; MLX runs on CPU)."
+        );
+        return Ok(());
+    }
+
+    // The kernel-LWS sweep tunes SYCL local-work-group sizes for the packed
+    // matvec — it is SYCL-ONLY. On a host with no usable SYCL device (an
+    // NVIDIA-only box / the DGX Spark, where SYCL is a no-op stub), opening
+    // sycl:0 fails with "device index out of range" — not an error, the sweep
+    // simply doesn't apply (CUDA/CPU use fixed launch geometry). Skip cleanly so
+    // `tune --all` doesn't log a scary "stage 1 (kernel LWS) failed".
+    if rustllama_kernels_sycl::device_count().unwrap_or(0) == 0 {
+        println!(
+            "  kernel LWS sweep: no SYCL device present — skipping \
+             (SYCL-only; CUDA/CPU use fixed launch geometry)."
         );
         return Ok(());
     }
@@ -5172,15 +5176,7 @@ fn cmd_tune_threads(
     use rustllama_tuner::PlacementPlan;
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
-    let model_path = match model_override {
-        Some(p) => std::path::PathBuf::from(p),
-        None => cfg.model.path.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no model: pass --model or set [model].path in {}",
-                config_path.display()
-            )
-        })?,
-    };
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
 
     // Derive candidate thread counts. Empty CSV → plan grid:
     //   {1, 2, 4, ncores/2, ncores, 2*ncores}
@@ -5346,6 +5342,43 @@ fn measure_end_to_end_tok_s(
         .ok_or_else(|| anyhow::anyhow!("no median_tps (warmup/runs failed)"))
 }
 
+/// Auto-detect the VRAM (in MiB) of the GPU the engine would dispatch on,
+/// mirroring the matvec-dispatch precedence (CUDA → SYCL). Returns `None` on a
+/// CPU-only host. Used by the placement sweep when `--vram-mb 0` (the default)
+/// so it budgets against the REAL card, not a fixed 4 GiB guess that silently
+/// capped placement on any larger GPU.
+fn detect_dispatch_gpu_vram_mb() -> Option<u64> {
+    if rustllama_kernels_cuda::device_count() > 0 {
+        if let Some(info) = rustllama_runtime::gpu_detect::detect_nvidia() {
+            if let Some(g) = info.gpus.iter().max_by_key(|g| g.total_mem_bytes) {
+                return Some(g.total_mem_bytes / (1024 * 1024));
+            }
+        }
+    }
+    if let Ok(info) = rustllama_kernels_sycl::device_info(0) {
+        let mb = info.vram_mb();
+        if mb > 0 {
+            return Some(mb);
+        }
+    }
+    None
+}
+
+/// True when the dispatch GPU has DEDICATED VRAM (discrete NVIDIA/SYCL card) or
+/// is a high-bandwidth unified GPU (Apple Metal) — i.e. NOT a weak integrated
+/// GPU sharing system LPDDR. On such a GPU the most-GPU-that-fits placement is
+/// always fastest for single-stream decode, so the per-candidate decode
+/// micro-benchmark (which only disambiguates the shared-LPDDR CPU-vs-iGPU case)
+/// is skipped — it mis-picked 20 of 28 layers on an RTX 2000 Ada where all-GPU
+/// is 1.5x faster. Mirrors `multi_gpu::host_has_dedicated_vram`.
+fn dispatch_gpu_has_dedicated_vram() -> bool {
+    rustllama_kernels_cuda::device_count() > 0
+        || rustllama_kernels_mlx::device_count() > 0
+        || rustllama_kernels_sycl::device_info(0)
+            .map(|i| !i.is_integrated)
+            .unwrap_or(false)
+}
+
 /// Static placement-sweep analyzer. Given the configured model, the
 /// supplied VRAM budget, and the context window, enumerates the
 /// `n_gpu_layers` candidates that fit and prints a per-candidate
@@ -5379,15 +5412,7 @@ fn cmd_tune_placement(
     };
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
-    let model_path = match model_override {
-        Some(p) => std::path::PathBuf::from(p),
-        None => cfg.model.path.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no model: pass --model or set [model].path in {}",
-                config_path.display()
-            )
-        })?,
-    };
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
     let max_ctx = placement_ctx_override.unwrap_or(cfg.inference.ctx_size);
 
     // MLX / non-GGUF model directory: there is no GGUF tensor table to price a
@@ -5427,6 +5452,24 @@ fn cmd_tune_placement(
     }
 
     let (dims, quant) = read_dims_and_quant_from_gguf(&model_path)?;
+
+    // AUTO VRAM (`--vram-mb 0`, the default): budget against the real dispatch
+    // GPU instead of the old fixed 4 GiB, which capped placement on any larger
+    // card (only ~20/28 layers on a 16 GiB GPU → the rest stranded on CPU).
+    let vram_mb = if vram_mb == 0 {
+        match detect_dispatch_gpu_vram_mb() {
+            Some(mb) => {
+                println!("  (auto-detected dispatch GPU VRAM: {mb} MiB)");
+                mb
+            }
+            None => {
+                println!("  (no GPU detected → all-CPU placement; 4096 MiB nominal budget)");
+                4096
+            }
+        }
+    } else {
+        vram_mb
+    };
 
     let vram_bytes = vram_mb * 1024 * 1024;
     let headroom_bytes = vram_headroom_mb * 1024 * 1024;
@@ -5526,6 +5569,20 @@ fn cmd_tune_placement(
         );
     }
     println!();
+    // On a dedicated-VRAM GPU the most-GPU-that-fits candidate (row 0) is always
+    // fastest for single-stream decode; the per-candidate decode sweep only
+    // disambiguates the weak shared-LPDDR integrated-GPU case, and its short
+    // micro-benchmark otherwise just adds noise (it mis-picked 20/28 on a
+    // discrete RTX 2000 Ada). Skip it there and take the recommendation.
+    let dedicated = dispatch_gpu_has_dedicated_vram();
+    let measure = measure && !dedicated;
+    if dedicated {
+        println!(
+            "  (dedicated-VRAM GPU: taking the most-GPU-that-fits candidate; \
+             skipping the per-candidate decode sweep — it only helps weak \
+             integrated GPUs)"
+        );
+    }
     // Dynamic measurement half: optionally run each candidate
     // through the real engine and pick the winner by measured tok/s.
     let (winner_n_gpu, measured_winner) = if measure {
@@ -5692,15 +5749,7 @@ fn cmd_tune_batch_size(
     repeats: u32,
 ) -> anyhow::Result<()> {
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
-    let model_path = match model_override {
-        Some(p) => std::path::PathBuf::from(p),
-        None => cfg.model.path.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no model: pass --model or set [model].path in {}",
-                config_path.display()
-            )
-        })?,
-    };
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
     let candidates: Vec<usize> = candidates_csv
         .split(',')
         .map(|s| s.trim())
@@ -5775,15 +5824,7 @@ fn cmd_tune_per_device_perf(
     use rustllama_engine::measurement::{measure_per_device_perf, MeasurementConfig};
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
-    let model_path = match model_override {
-        Some(p) => std::path::PathBuf::from(p),
-        None => cfg.model.path.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no model: pass --model or set [model].path in {}",
-                config_path.display()
-            )
-        })?,
-    };
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
     if repeats == 0 {
         anyhow::bail!("--repeats must be >= 1");
     }
@@ -5950,15 +5991,7 @@ fn cmd_tune_kv_dtype(
     use rustllama_engine::measurement::{measure_kv_dtype_candidates, MeasurementConfig};
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
-    let model_path = match model_override {
-        Some(p) => std::path::PathBuf::from(p),
-        None => cfg.model.path.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no model: pass --model or set [model].path in {}",
-                config_path.display()
-            )
-        })?,
-    };
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
 
     // Hybrid (transformer+SSM) models honor only f32 + q4_0 KV verbatim on the
     // hybrid attention path (q4_0 has the calibrated arm); any other non-f32
@@ -6198,15 +6231,7 @@ fn cmd_tune_flash_attention(
     use rustllama_engine::measurement::{measure_flash_attention_candidates, MeasurementConfig};
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
-    let model_path = match model_override {
-        Some(p) => std::path::PathBuf::from(p),
-        None => cfg.model.path.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no model: pass --model or set [model].path in {}",
-                config_path.display()
-            )
-        })?,
-    };
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
     if repeats == 0 {
         anyhow::bail!("--flash-repeats must be >= 1");
     }
@@ -6298,15 +6323,7 @@ fn cmd_tune_speculative_mtp(
     use rustllama_engine::measurement::{measure_speculative_mtp, MeasurementConfig};
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
-    let model_path = match model_override {
-        Some(p) => std::path::PathBuf::from(p),
-        None => cfg.model.path.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no model: pass --model or set [model].path in {}",
-                config_path.display()
-            )
-        })?,
-    };
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
     if repeats == 0 {
         anyhow::bail!("--speculative-mtp-repeats must be >= 1");
     }
@@ -6373,15 +6390,7 @@ fn cmd_tune_ssm_prefill_chunked(
     use rustllama_engine::measurement::{measure_ssm_prefill_chunked, MeasurementConfig};
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
-    let model_path = match model_override {
-        Some(p) => std::path::PathBuf::from(p),
-        None => cfg.model.path.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no model: pass --model or set [model].path in {}",
-                config_path.display()
-            )
-        })?,
-    };
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
     if repeats == 0 {
         anyhow::bail!("--ssm-prefill-chunked-repeats must be >= 1");
     }
@@ -6455,15 +6464,7 @@ fn cmd_tune_flash_kv_min(
     use rustllama_engine::measurement::{measure_flash_kv_min_candidates, MeasurementConfig};
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
-    let model_path = match model_override {
-        Some(p) => std::path::PathBuf::from(p),
-        None => cfg.model.path.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no model: pass --model or set [model].path in {}",
-                config_path.display()
-            )
-        })?,
-    };
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
     if repeats == 0 {
         anyhow::bail!("--flash-kv-min-repeats must be >= 1");
     }
@@ -6573,15 +6574,7 @@ fn cmd_tune_prefix_snapshots(
     use rustllama_engine::measurement::{measure_prefix_snapshots_candidates, MeasurementConfig};
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
-    let model_path = match model_override {
-        Some(p) => std::path::PathBuf::from(p),
-        None => cfg.model.path.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no model: pass --model or set [model].path in {}",
-                config_path.display()
-            )
-        })?,
-    };
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
     if repeats == 0 {
         anyhow::bail!("--prefix-snapshots-repeats must be >= 1");
     }
@@ -6690,15 +6683,7 @@ fn cmd_tune_flash_v3_kv_tile(
     use rustllama_engine::measurement::{measure_flash_v3_kv_tile_candidates, MeasurementConfig};
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
-    let model_path = match model_override {
-        Some(p) => std::path::PathBuf::from(p),
-        None => cfg.model.path.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no model: pass --model or set [model].path in {}",
-                config_path.display()
-            )
-        })?,
-    };
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
     if repeats == 0 {
         anyhow::bail!("--flash-v3-kv-tile-repeats must be >= 1");
     }
@@ -6813,15 +6798,7 @@ fn cmd_tune_kv_page_size(
     use rustllama_engine::measurement::{measure_kv_page_size_candidates, MeasurementConfig};
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
-    let model_path = match model_override {
-        Some(p) => std::path::PathBuf::from(p),
-        None => cfg.model.path.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no model: pass --model or set [model].path in {}",
-                config_path.display()
-            )
-        })?,
-    };
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
     if repeats == 0 {
         anyhow::bail!("--kv-page-size-repeats must be >= 1");
     }
@@ -6935,15 +6912,7 @@ fn cmd_tune_kv_layout(
     use rustllama_engine::measurement::{measure_kv_layout_candidates, MeasurementConfig};
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
-    let model_path = match model_override {
-        Some(p) => std::path::PathBuf::from(p),
-        None => cfg.model.path.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "no model: pass --model or set [model].path in {}",
-                config_path.display()
-            )
-        })?,
-    };
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
     let candidates: Vec<String> = candidates_csv
         .split(',')
         .map(|s| s.trim().to_string())
@@ -7223,19 +7192,15 @@ fn cmd_tune_all(
     // config's `[model].path`. (NB: placement is a per-DEVICE property today;
     // a whole-system fingerprint is the planned evolution — see the mixed
     // multi-GPU/CPU case — but the per-model keying is correct either way.)
-    let tune_model_key: Option<String> = model_override
-        .as_ref()
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            rustllama_config::load(config_path)
-                .ok()
-                .and_then(|c| c.model.path)
-        })
-        .and_then(|p| {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .map(str::to_string)
-        });
+    // Derive the per-model cache key from the RESOLVED model path, so a hub
+    // ref / cached id and the on-disk path it resolves to yield the same stem
+    // (the subprocess stages resolve `--model` the same way).
+    let tune_model_key: Option<String> = {
+        let cfg = rustllama_config::load(config_path).unwrap_or_default();
+        effective_model_path(model_override.clone(), &cfg, config_path)
+            .ok()
+            .and_then(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_string))
+    };
     let has_placement = match (cached.as_ref(), tune_model_key.as_ref()) {
         (Some(t), Some(k)) => t.placement.contains_key(k),
         _ => false,
@@ -8628,14 +8593,8 @@ fn bench(
     use rustllama_engine::{CpuEngine, SamplingParams};
 
     let cfg = rustllama_config::load_with_profile(config_path, profile)?;
-    let model_path = match (model_override, cfg.model.path.as_ref()) {
-        (Some(p), _) => std::path::PathBuf::from(p),
-        (None, Some(p)) => p.clone(),
-        (None, None) => anyhow::bail!(
-            "bench requires --model <path> or `[model].path` in {}",
-            config_path.display(),
-        ),
-    };
+    let model_path =
+        effective_model_path(model_override.map(str::to_string), &cfg, config_path)?;
     let ctx_size = ctx_size_override.unwrap_or(cfg.inference.ctx_size as usize);
     // Override-or-config K/V dtype. When K and V differ in config,
     // bench uses K's dtype (matches engine storage which couples
@@ -9413,16 +9372,58 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Resolve the effective model for a subcommand: the `--model` override when
+/// given, else `[model].path` from the config. EITHER source is run through
+/// [`resolve_model_path`], so a hub ref (`org/repo:file.gguf`), a bare cached
+/// id, or a path on disk works in either slot (CLAUDE.md notes `[model].path`
+/// may itself be a hub ref). `config_path` names the config in the "no model"
+/// error. This is the single front door every model-taking subcommand uses so
+/// resolution is identical whether you typed `--model` or set the config.
+fn effective_model_path(
+    model_override: Option<String>,
+    cfg: &rustllama_config::Config,
+    config_path: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    let spec = match model_override {
+        Some(s) => s,
+        None => cfg
+            .model
+            .path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no model: pass --model or set [model].path in {}",
+                    config_path.display()
+                )
+            })?,
+    };
+    resolve_model_path(&spec)
+}
+
 fn resolve_model_path(s: &str) -> anyhow::Result<PathBuf> {
-    // Either an existing absolute path, or a hub ref to be looked up in cache.
     let raw = PathBuf::from(s);
-    if raw.is_absolute() && (raw.exists() || raw.extension().is_some()) {
+    // An existing path (absolute OR relative to the CWD) is used verbatim;
+    // an absolute path that merely carries an extension also passes (lets a
+    // not-yet-downloaded target resolve to where it WILL land — `model use`
+    // / `pull` rely on naming a stable target before the file exists). Only
+    // when neither holds do we consult the cache.
+    if raw.exists() || (raw.is_absolute() && raw.extension().is_some()) {
         return Ok(raw);
     }
-    let hub_ref = rustllama_hub::HubRef::parse(s)
-        .map_err(|e| anyhow::anyhow!("{s:?} is not an existing path or a valid hub ref: {e}"))?;
     let cache_dir = rustllama_hub::default_cache_dir()
         .ok_or_else(|| anyhow::anyhow!("could not resolve cache dir"))?;
+    // Superset cache lookup — hub ref (`org/repo:file.gguf`), bare cached id /
+    // file stem, or MLX model dir — the same resolver the server + GUI use.
+    if let Some(found) = rustllama_hub::resolve_model_spec(s, &cache_dir) {
+        return Ok(found);
+    }
+    // Not in the cache: a well-formed hub ref still resolves to its would-be
+    // location so `model use org/repo:file` (before `pull`) names a stable
+    // target; anything else is unresolvable.
+    let hub_ref = rustllama_hub::HubRef::parse(s).map_err(|e| {
+        anyhow::anyhow!("{s:?} is not an existing path, a cached id, or a valid hub ref: {e}")
+    })?;
     Ok(hub_ref.local_path(&cache_dir))
 }
 
