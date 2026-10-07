@@ -1964,9 +1964,9 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         // shape; otherwise "SLOW" (decided off) and the existing path runs.
         const PM: usize = 2048;
         const PK: usize = 4096;
-        const PN: usize = 64;
+        const PN: usize = 512; // the real prefill chunk — a GEMM needs the batch
         const WARMUP: usize = 3;
-        const ITERS: usize = 25;
+        const ITERS: usize = 20;
         let wp = gen_quant_bytes(layout, PM, PK, 0xF00D);
         let xp: Vec<f32> = gen_x(PN * PK, 91);
         let (Some(wpb), Some(xpb), Some(mut opb)) = (
