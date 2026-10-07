@@ -414,12 +414,15 @@ __device__ __forceinline__ float q8_0_row_dot_warp(const unsigned char *row,
 
 // Q4_K_M: 144 B / 256-weight super-block. K % 256 == 0.
 // Warp-cooperative: the 256 weights of a super-block live in a 128-byte `qs`
-// field, which the warp splits as 4 coalesced passes — pass `iter` has lane
-// `t` read byte `t + 32*iter` (lanes 0..31 → consecutive bytes → one 128-byte
-// transaction). Each byte holds a lo/hi nibble; the group (scale/min selector)
-// and x indices are byte_idx>>5 / &31 — byte-exact the same weight→scale→x
-// mapping as the scalar reference, just partitioned across lanes (so the final
-// warp-reduce sum reproduces the row dot, modulo float reassociation).
+// field split into 4 groups of 32 bytes. Lane `t` reads byte `t` of each group
+// in turn (lanes 0..31 → the 32 consecutive bytes of that group → one coalesced
+// transaction). The `group` loop index is a COMPILE-TIME constant (equals the
+// old `byte_idx>>5`, since byte_idx = lane + 32*group and lane < 32), so the
+// group's two 6-bit scales/mins unpack INLINE with a compile-time branch — no
+// `sc[8]/mn[8]` array, which (indexed by a runtime group) used to spill to local
+// memory and was the level-2 dequant bottleneck (sm ~86% / mem ~47%). Byte-exact
+// weight→scale→x mapping vs the scalar reference; the warp-reduce sum reproduces
+// the row dot (modulo float reassociation).
 __device__ __forceinline__ float q4_k_row_dot_warp(const unsigned char *row,
                                                    const float *x, int bpr,
                                                    int lane) {
@@ -430,35 +433,38 @@ __device__ __forceinline__ float q4_k_row_dot_warp(const unsigned char *row,
         unsigned short m_bits = (unsigned short)blk[2] | ((unsigned short)blk[3] << 8);
         float d = rsl_f16_bits_to_f32(d_bits);
         float dmin = rsl_f16_bits_to_f32(m_bits);
-        // Inline 6-bit scale/min unpack (ggml get_scale_min_k4) — kept inline
-        // rather than calling rsl_unpack_q4k_scales (defined further down) so
-        // this stays a forward-reference-free self-contained device function.
         const unsigned char *sb = blk + 4;
-        unsigned char sc[8], mn[8];
-        for (int j = 0; j < 8; ++j) {
-            if (j < 4) {
-                sc[j] = sb[j] & 0x3F;
-                mn[j] = sb[j + 4] & 0x3F;
-            } else {
-                sc[j] = (sb[j + 4] & 0x0F) | ((sb[j - 4] >> 6) << 4);
-                mn[j] = (sb[j + 4] >> 4) | ((sb[j] >> 6) << 4);
-            }
-        }
         const unsigned char *qs = blk + 16;
         const int x_base = b * 256;
 #pragma unroll
-        for (int iter = 0; iter < 4; ++iter) {
-            int byte_idx = lane + 32 * iter; // 0..127
-            int group = byte_idx >> 5;       // 0..3
-            int l = byte_idx & 31;           // 0..31
-            unsigned char qb = qs[byte_idx];
+        for (int group = 0; group < 4; ++group) {
+            unsigned char qb = qs[group * 32 + lane];
+            // This group's two 6-bit scales (indices 2*group, 2*group+1) + mins,
+            // unpacked inline (ggml get_scale_min_k4). `group` is compile-time so
+            // the branch folds away — no array, nothing to spill.
+            unsigned char sc0, sc1, mn0, mn1;
+            if (group < 2) {
+                // indices 2*group, 2*group+1 are < 4: low 6 bits direct.
+                sc0 = sb[group * 2] & 0x3F;
+                mn0 = sb[group * 2 + 4] & 0x3F;
+                sc1 = sb[group * 2 + 1] & 0x3F;
+                mn1 = sb[group * 2 + 5] & 0x3F;
+            } else {
+                // indices >= 4: splice sb[j+4]'s nibble with sb[j-4]/sb[j] top bits.
+                int j0 = group * 2;
+                int j1 = group * 2 + 1;
+                sc0 = (sb[j0 + 4] & 0x0F) | ((sb[j0 - 4] >> 6) << 4);
+                mn0 = (sb[j0 + 4] >> 4) | ((sb[j0] >> 6) << 4);
+                sc1 = (sb[j1 + 4] & 0x0F) | ((sb[j1 - 4] >> 6) << 4);
+                mn1 = (sb[j1 + 4] >> 4) | ((sb[j1] >> 6) << 4);
+            }
+            float d_lo = d * (float)sc0;
+            float m_lo = dmin * (float)mn0;
+            float d_hi = d * (float)sc1;
+            float m_hi = dmin * (float)mn1;
             float q_lo = (float)(qb & 0x0F);
             float q_hi = (float)(qb >> 4);
-            float d_lo = d * (float)sc[group * 2];
-            float m_lo = dmin * (float)mn[group * 2];
-            float d_hi = d * (float)sc[group * 2 + 1];
-            float m_hi = dmin * (float)mn[group * 2 + 1];
-            int x_lo = x_base + group * 64 + l;
+            int x_lo = x_base + group * 64 + lane;
             int x_hi = x_lo + 32;
             acc += (d_lo * q_lo - m_lo) * x[x_lo];
             acc += (d_hi * q_hi - m_hi) * x[x_hi];
