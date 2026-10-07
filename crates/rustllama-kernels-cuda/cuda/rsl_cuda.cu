@@ -413,62 +413,59 @@ __device__ __forceinline__ float q8_0_row_dot_warp(const unsigned char *row,
 }
 
 // Q4_K_M: 144 B / 256-weight super-block. K % 256 == 0.
-// Warp-cooperative: the 256 weights of a super-block live in a 128-byte `qs`
-// field split into 4 groups of 32 bytes. Lane `t` reads byte `t` of each group
-// in turn (lanes 0..31 → the 32 consecutive bytes of that group → one coalesced
-// transaction). The `group` loop index is a COMPILE-TIME constant (equals the
-// old `byte_idx>>5`, since byte_idx = lane + 32*group and lane < 32), so the
-// group's two 6-bit scales/mins unpack INLINE with a compile-time branch — no
-// `sc[8]/mn[8]` array, which (indexed by a runtime group) used to spill to local
-// memory and was the level-2 dequant bottleneck (sm ~86% / mem ~47%). Byte-exact
-// weight→scale→x mapping vs the scalar reference; the warp-reduce sum reproduces
-// the row dot (modulo float reassociation).
+// Warp-cooperative, ONE GROUP per lane: the 256 weights are 4 groups of 64
+// (a group = 32 qs-bytes + two 6-bit scales + two 6-bit mins). Lane `t` owns
+// group `t>>3` and the 4-byte chunk `(t&7)*4` within it, so it unpacks ONLY
+// that group's 2 scales (not all 8) and handles 8 weights (4 lo + 4 hi).
+// Instead of dequantizing each weight, accumulate the quantized dot Σ(q·x) and
+// the activation sum Σx, then apply the scales ONCE per block via the ggml
+// identity  y_group = d·sc·Σ(q·x) − dmin·mn·Σx  — far fewer per-weight FMAs.
+// Byte loads (no alignment assumption). Numerically equivalent to the scalar
+// reference (float reassociation only); the warp-reduce over the 32 lanes'
+// partials yields the row dot. (A 2-way branch on group<2 is the only
+// divergence; each side is a couple of mask/shift ops.)
 __device__ __forceinline__ float q4_k_row_dot_warp(const unsigned char *row,
                                                    const float *x, int bpr,
                                                    int lane) {
+    const int group = lane >> 3;      // 0..3  — which 64-weight group this lane serves
+    const int lbase = (lane & 7) * 4; // 0..28 — weight/byte offset within the group
+    const int j0 = group * 2;         // scale index for the lo nibbles
+    const int j1 = group * 2 + 1;     // scale index for the hi nibbles
     float acc = 0.0f;
     for (int b = 0; b < bpr; ++b) {
         const unsigned char *blk = row + b * 144;
-        unsigned short d_bits = (unsigned short)blk[0] | ((unsigned short)blk[1] << 8);
-        unsigned short m_bits = (unsigned short)blk[2] | ((unsigned short)blk[3] << 8);
-        float d = rsl_f16_bits_to_f32(d_bits);
-        float dmin = rsl_f16_bits_to_f32(m_bits);
+        float d = rsl_f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+        float dmin = rsl_f16_bits_to_f32((unsigned short)blk[2] | ((unsigned short)blk[3] << 8));
         const unsigned char *sb = blk + 4;
-        const unsigned char *qs = blk + 16;
-        const int x_base = b * 256;
-#pragma unroll
-        for (int group = 0; group < 4; ++group) {
-            unsigned char qb = qs[group * 32 + lane];
-            // This group's two 6-bit scales (indices 2*group, 2*group+1) + mins,
-            // unpacked inline (ggml get_scale_min_k4). `group` is compile-time so
-            // the branch folds away — no array, nothing to spill.
-            unsigned char sc0, sc1, mn0, mn1;
-            if (group < 2) {
-                // indices 2*group, 2*group+1 are < 4: low 6 bits direct.
-                sc0 = sb[group * 2] & 0x3F;
-                mn0 = sb[group * 2 + 4] & 0x3F;
-                sc1 = sb[group * 2 + 1] & 0x3F;
-                mn1 = sb[group * 2 + 5] & 0x3F;
-            } else {
-                // indices >= 4: splice sb[j+4]'s nibble with sb[j-4]/sb[j] top bits.
-                int j0 = group * 2;
-                int j1 = group * 2 + 1;
-                sc0 = (sb[j0 + 4] & 0x0F) | ((sb[j0 - 4] >> 6) << 4);
-                mn0 = (sb[j0 + 4] >> 4) | ((sb[j0] >> 6) << 4);
-                sc1 = (sb[j1 + 4] & 0x0F) | ((sb[j1 - 4] >> 6) << 4);
-                mn1 = (sb[j1 + 4] >> 4) | ((sb[j1] >> 6) << 4);
-            }
-            float d_lo = d * (float)sc0;
-            float m_lo = dmin * (float)mn0;
-            float d_hi = d * (float)sc1;
-            float m_hi = dmin * (float)mn1;
-            float q_lo = (float)(qb & 0x0F);
-            float q_hi = (float)(qb >> 4);
-            int x_lo = x_base + group * 64 + lane;
-            int x_hi = x_lo + 32;
-            acc += (d_lo * q_lo - m_lo) * x[x_lo];
-            acc += (d_hi * q_hi - m_hi) * x[x_hi];
+        // This lane's group only (ggml get_scale_min_k4): two scales + two mins.
+        unsigned char sc0, sc1, mn0, mn1;
+        if (group < 2) { // indices j0,j1 are < 4: low 6 bits direct.
+            sc0 = sb[j0] & 0x3F;
+            mn0 = sb[j0 + 4] & 0x3F;
+            sc1 = sb[j1] & 0x3F;
+            mn1 = sb[j1 + 4] & 0x3F;
+        } else {         // indices >= 4: splice sb[j+4] nibble with sb[j-4]/sb[j] top bits.
+            sc0 = (sb[j0 + 4] & 0x0F) | ((sb[j0 - 4] >> 6) << 4);
+            mn0 = (sb[j0 + 4] >> 4) | ((sb[j0] >> 6) << 4);
+            sc1 = (sb[j1 + 4] & 0x0F) | ((sb[j1 - 4] >> 6) << 4);
+            mn1 = (sb[j1 + 4] >> 4) | ((sb[j1] >> 6) << 4);
         }
+        const unsigned char *qc = blk + 16 + group * 32 + lbase; // this lane's 4 bytes
+        const int x_lo = b * 256 + group * 64 + lbase;
+        const int x_hi = x_lo + 32;
+        float dot_lo = 0.0f, dot_hi = 0.0f, xsum_lo = 0.0f, xsum_hi = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            unsigned char qb = qc[k];
+            float xl = x[x_lo + k];
+            float xh = x[x_hi + k];
+            dot_lo += (float)(qb & 0x0F) * xl;
+            dot_hi += (float)(qb >> 4) * xh;
+            xsum_lo += xl;
+            xsum_hi += xh;
+        }
+        acc += d * ((float)sc0 * dot_lo + (float)sc1 * dot_hi) -
+               dmin * ((float)mn0 * xsum_lo + (float)mn1 * xsum_hi);
     }
     return acc;
 }
