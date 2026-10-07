@@ -197,18 +197,14 @@ pub const VERDICT_GEMM_FP8_SP24: &str = "gemm:fp8_sp24";
 pub const VERDICT_GEMM_FP8_WGMMA: &str = "gemm:fp8_wgmma";
 /// Intel XMX/DPAS bf16 GEMM (SYCL). Backs `xmx`.
 pub const VERDICT_XMX_GEMM: &str = "xmx:gemm";
-/// Q4_K W4A8/DP4A matvec (int8 activations, HW `__dp4a`). Backs `q4k_dp4a`,
-/// wired ONLY onto the batched/prefill CUDA path (decode stays bit-exact).
-/// Graded by a FAIR W4A8-vs-W4A8 parity probe (not the bit-exact probe).
-pub const VERDICT_MATVEC_Q4K_DP4A: &str = "matvec:q4_k_dp4a";
 /// Q4_K prefill GEMM (tiled, shared-mem weight reuse, f32 — BIT-EXACT). Backs
 /// `q4k_gemm_f32`, wired onto the batched/prefill CUDA path. Graded by the
 /// bit-exact batched parity probe; gated fail-closed (catches a write-blind
 /// kernel bug on an unvalidated arch).
 pub const VERDICT_GEMM_Q4K_F32: &str = "gemm:q4_k_f32";
 /// Q4_K prefill GEMM via int8 tensor cores (W8A8, LOSSY). Backs `q4k_w8a8_tc`,
-/// wired onto the batched/prefill CUDA path ABOVE DP4A, BELOW the bit-exact f32
-/// GEMM. Graded by a FAIR W8A8 probe (int8 activations) + the perf gate.
+/// wired onto the batched/prefill CUDA path ABOVE the bit-exact f32 GEMM (it is
+/// dispatched first). Graded by a FAIR W8A8 probe (int8 activations) + the perf gate.
 pub const VERDICT_GEMM_Q4K_W8A8_TC: &str = "gemm:q4_k_w8a8_tc";
 
 /// Read the on-device verdict for a kernel probe name, if one has been

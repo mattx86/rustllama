@@ -521,12 +521,12 @@ fn finite_ref(layout: &QuantLayout, cpu: CpuMatvec, x: &[f32]) -> Option<(Vec<u8
 }
 
 /// Per-32 symmetric int8 round-trip of activations (scale = absmax/127, round-
-/// to-nearest, clamp ±127), matching the CUDA DP4A kernel's activation quant.
-/// Used to build a FAIR W4A8 reference: because integer `__dp4a` is exact,
-/// dequantizing x back to f32 and running the normal f32-activation Q4_K matvec
-/// reproduces the kernel's `d·sc·Σ(q·xq) − dmin·mn·Σxq` identity up to f32
+/// to-nearest, clamp ±127), matching the CUDA int8 activation quant. The fair
+/// reference for int8-activation kernels: because the integer tensor-core dot is
+/// exact, dequantizing x back to f32 and running the normal f32-activation Q4_K
+/// matvec reproduces the kernel's `d·sc·Σ(q·xq) − dmin·mn·Σxq` identity up to f32
 /// accumulation order, so the probe grades kernel correctness — not quant loss.
-fn w4a8_roundtrip(x: &[f32]) -> Vec<f32> {
+fn int8_act_roundtrip(x: &[f32]) -> Vec<f32> {
     let mut xr = vec![0f32; x.len()];
     for (bi, blk) in x.chunks(32).enumerate() {
         let amax = blk.iter().fold(0f32, |a, &v| a.max(v.abs()));
@@ -1772,141 +1772,12 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
-    // ---- Q4_K W4A8/DP4A batched matvec (verdict: matvec:q4_k_dp4a) ----
-    // Two-part gate — the verdict is true only if the kernel is both CORRECT and
-    // a measured WIN, because DP4A is lossy (we never auto-enable a lossy path
-    // that isn't actually faster on this device):
-    //   1. Correctness — grade against a FAIR W4A8 reference (the SAME per-32
-    //      int8 activation round-trip, then the normal f32 Q4_K matvec per row).
-    //      Integer `__dp4a` is exact, so only f32 accumulation order differs → it
-    //      passes tightly, isolating kernel correctness from quantization loss.
-    //   2. Performance — time DP4A vs the bit-exact batched path on a prefill-
-    //      sized shape; "OK" only if DP4A is meaningfully faster, else "SLOW".
-    // A single-iteration loop so SKIP/MISCOMPUTE/SLOW can `continue` past the
-    // remaining GPU work.
-    #[allow(clippy::never_loop)]
-    for _dp4a in 0..1usize {
-        const DP4A_N: usize = 4;
-        let name = "matvec:q4_k_dp4a";
-        let layout = LAYOUTS.iter().find(|l| l.name == "q4_k").expect("layout");
-        let cpu = cpu_matvec_for("q4_k");
-        let xb_host: Vec<f32> = gen_x(DP4A_N * MV_K, 1234);
-        let Some((w, _)) = finite_ref(layout, cpu, &xb_host[..MV_K]) else {
-            cu_emit(name, "SKIP", "no-finite-reference");
-            *counts.entry("SKIP").or_default() += 1;
-            continue;
-        };
-        // CPU W4A8 reference, row by row, into [N, M] row-major.
-        let mut cpu_out = vec![0f32; DP4A_N * MV_M];
-        for r in 0..DP4A_N {
-            let xr = w4a8_roundtrip(&xb_host[r * MV_K..(r + 1) * MV_K]);
-            let mut row = vec![0f32; MV_M];
-            cpu(&w, &xr, &mut row, MV_M, MV_K);
-            cpu_out[r * MV_M..(r + 1) * MV_M].copy_from_slice(&row);
-        }
-        let (Some(wb), Some(xbd), Some(mut ob)) = (
-            ck::CudaDeviceBuffer::from_host(&stream, &w),
-            cu_upload_f32(&stream, &xb_host),
-            ck::CudaDeviceBuffer::alloc(&stream, DP4A_N * MV_M * 4),
-        ) else {
-            cu_emit(name, "KERNEL_ERR", "device-alloc-failed");
-            *counts.entry("KERNEL_ERR").or_default() += 1;
-            continue;
-        };
-        // SAFETY: three live device buffers on `stream` sized for (N,M)/(N,K);
-        // the wrapper synchronizes before returning.
-        let res = unsafe {
-            ck::matvec_q4_k_dp4a_batched(
-                &stream,
-                wb.as_ptr(),
-                xbd.as_ptr() as *const f32,
-                ob.as_mut_ptr() as *mut f32,
-                MV_M,
-                MV_K,
-                DP4A_N,
-            )
-        };
-        if let Err(e) = res {
-            cu_emit(name, "KERNEL_ERR", &format!("{e}"));
-            *counts.entry("KERNEL_ERR").or_default() += 1;
-            continue;
-        }
-        // (1) Correctness. Looser rel_max (0.05) than the bit-exact 0.02 absorbs
-        // the int8 activation rounding; cos ~1.0 confirms the kernel is faithful
-        // to the W4A8 reference. A miscompute here is a real kernel bug.
-        let (cos, max_rel) = compare(&cu_download_f32(&ob, DP4A_N * MV_M), &cpu_out);
-        if !(cos > 0.999 && max_rel < 0.05) {
-            cu_emit(name, "MISCOMPUTE", &format!("cos={cos:.6} max_rel={max_rel:.4}"));
-            *counts.entry("MISCOMPUTE").or_default() += 1;
-            continue;
-        }
-        // (2) Performance gate. Time DP4A against the bit-exact batched path on a
-        // prefill-sized shape over the SAME buffers; each wrapper syncs per call
-        // so the ratio is fair. Enable ("OK") only if DP4A is >=5% faster, else
-        // "SLOW" — a DECIDED off-verdict that overwrites any stale enable
-        // (self-heals a build where it stops winning). The __dp4a int8 edge over
-        // f32 varies by arch + bandwidth, so this is measured per device.
-        const PM: usize = 2048; // output rows
-        const PK: usize = 4096; // k-dim (% 256 == 0)
-        const PN: usize = 64; // prefill batch rows
-        const WARMUP: usize = 3;
-        const ITERS: usize = 25;
-        let wp = gen_quant_bytes(layout, PM, PK, 0xBEEF);
-        let xp: Vec<f32> = gen_x(PN * PK, 77);
-        let (Some(wpb), Some(xpb), Some(mut opb)) = (
-            ck::CudaDeviceBuffer::from_host(&stream, &wp),
-            cu_upload_f32(&stream, &xp),
-            ck::CudaDeviceBuffer::alloc(&stream, PN * PM * 4),
-        ) else {
-            // Correct, but we couldn't size the perf shape — stay conservative
-            // (don't enable a lossy path we couldn't prove faster).
-            cu_emit(name, "SLOW", "perf-shape device alloc failed");
-            *counts.entry("SLOW").or_default() += 1;
-            continue;
-        };
-        let (wptr, xptr, optr) = (
-            wpb.as_ptr(),
-            xpb.as_ptr() as *const f32,
-            opb.as_mut_ptr() as *mut f32,
-        );
-        // SAFETY: wp/xp/op are live device buffers on `stream` sized for
-        // (PM,PK,PN); both wrappers synchronize before returning.
-        unsafe {
-            for _ in 0..WARMUP {
-                let _ = ck::matvec_q4_k_dp4a_batched(&stream, wptr, xptr, optr, PM, PK, PN);
-                let _ = ck::matvec_q4_k_packed_f32_batched(&stream, wptr, xptr, optr, PM, PK, PN);
-            }
-            let t0 = std::time::Instant::now();
-            for _ in 0..ITERS {
-                let _ = ck::matvec_q4_k_dp4a_batched(&stream, wptr, xptr, optr, PM, PK, PN);
-            }
-            let t_dp4a = t0.elapsed().as_secs_f64();
-            let t1 = std::time::Instant::now();
-            for _ in 0..ITERS {
-                let _ = ck::matvec_q4_k_packed_f32_batched(&stream, wptr, xptr, optr, PM, PK, PN);
-            }
-            let t_bit = t1.elapsed().as_secs_f64();
-            let detail = format!(
-                "dp4a {:.3}ms vs bitexact {:.3}ms /call ({PM}x{PK}x{PN})",
-                t_dp4a * 1e3 / ITERS as f64,
-                t_bit * 1e3 / ITERS as f64,
-            );
-            if t_dp4a < t_bit * 0.95 {
-                cu_emit(name, "OK", &detail);
-                *counts.entry("OK").or_default() += 1;
-            } else {
-                cu_emit(name, "SLOW", &detail);
-                *counts.entry("SLOW").or_default() += 1;
-            }
-        }
-    }
-
     // ---- Q4_K prefill GEMM (verdict: gemm:q4_k_f32, BIT-EXACT + perf-gated) ----
     // Two-part gate (the GEMM is bit-exact, but it's dispatched FIRST, so it must
     // also be the fastest or it would regress): (1) correctness vs the f32 Q4_K
     // matvec reference at the bit-exact tolerance (0.999/0.02); (2) it must beat
-    // BOTH the bit-exact batched matvec AND the DP4A path on a prefill shape, else
-    // "SLOW" and the dispatch keeps the existing path. Fail-closed.
+    // the bit-exact batched matvec on a prefill shape, else "SLOW" and the
+    // dispatch keeps the existing path. Fail-closed.
     #[allow(clippy::never_loop)]
     for _gemm in 0..1usize {
         const GEMM_N: usize = 8;
@@ -1960,8 +1831,8 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             continue;
         }
         // (2) Performance — the GEMM is dispatched FIRST, so enable it only if it
-        // beats BOTH the bit-exact batched matvec AND the DP4A path on a prefill
-        // shape; otherwise "SLOW" (decided off) and the existing path runs.
+        // beats the bit-exact batched matvec on a prefill shape; otherwise "SLOW"
+        // (decided off) and the existing path runs.
         const PM: usize = 2048;
         const PK: usize = 4096;
         const PN: usize = 512; // the real prefill chunk — a GEMM needs the batch
@@ -1985,11 +1856,10 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         );
         // SAFETY: live device buffers sized for (PM,PK,PN); each wrapper syncs
         // per call, so the ratios are fair.
-        let (t_gemm, t_bit, t_dp4a) = unsafe {
+        let (t_gemm, t_bit) = unsafe {
             for _ in 0..WARMUP {
                 let _ = ck::gemm_q4_k_f32(&stream, wptr, xptr, optr, PM, PK, PN);
                 let _ = ck::matvec_q4_k_packed_f32_batched(&stream, wptr, xptr, optr, PM, PK, PN);
-                let _ = ck::matvec_q4_k_dp4a_batched(&stream, wptr, xptr, optr, PM, PK, PN);
             }
             let t0 = std::time::Instant::now();
             for _ in 0..ITERS {
@@ -2001,21 +1871,14 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 let _ = ck::matvec_q4_k_packed_f32_batched(&stream, wptr, xptr, optr, PM, PK, PN);
             }
             let tb = t1.elapsed().as_secs_f64();
-            let t2 = std::time::Instant::now();
-            for _ in 0..ITERS {
-                let _ = ck::matvec_q4_k_dp4a_batched(&stream, wptr, xptr, optr, PM, PK, PN);
-            }
-            let td = t2.elapsed().as_secs_f64();
-            (tg, tb, td)
+            (tg, tb)
         };
-        let best_alt = t_bit.min(t_dp4a);
         let detail = format!(
-            "gemm {:.3} vs matvec {:.3} vs dp4a {:.3} ms/call ({PM}x{PK}x{PN})",
+            "gemm {:.3} vs matvec {:.3} ms/call ({PM}x{PK}x{PN})",
             t_gemm * 1e3 / ITERS as f64,
             t_bit * 1e3 / ITERS as f64,
-            t_dp4a * 1e3 / ITERS as f64,
         );
-        if t_gemm < best_alt * 0.95 {
+        if t_gemm < t_bit * 0.95 {
             cu_emit(name, "OK", &detail);
             *counts.entry("OK").or_default() += 1;
         } else {
@@ -2044,7 +1907,7 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         };
         let mut cpu_out = vec![0f32; TC_N * MV_M];
         for r in 0..TC_N {
-            let xr = w4a8_roundtrip(&xb_host[r * MV_K..(r + 1) * MV_K]);
+            let xr = int8_act_roundtrip(&xb_host[r * MV_K..(r + 1) * MV_K]);
             let mut row = vec![0f32; MV_M];
             cpu(&w, &xr, &mut row, MV_M, MV_K);
             cpu_out[r * MV_M..(r + 1) * MV_M].copy_from_slice(&row);
@@ -2103,11 +1966,10 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             opb.as_mut_ptr() as *mut f32,
         );
         // SAFETY: live device buffers sized for (PM,PK,PN); each wrapper syncs.
-        let (t_tc, t_gemm, t_dp4a) = unsafe {
+        let (t_tc, t_gemm) = unsafe {
             for _ in 0..WARMUP {
                 let _ = ck::gemm_q4_k_w8a8_tc(&stream, wptr, xptr, optr, PM, PK, PN);
                 let _ = ck::gemm_q4_k_f32(&stream, wptr, xptr, optr, PM, PK, PN);
-                let _ = ck::matvec_q4_k_dp4a_batched(&stream, wptr, xptr, optr, PM, PK, PN);
             }
             let t0 = std::time::Instant::now();
             for _ in 0..ITERS {
@@ -2119,18 +1981,12 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 let _ = ck::gemm_q4_k_f32(&stream, wptr, xptr, optr, PM, PK, PN);
             }
             let tg = t1.elapsed().as_secs_f64();
-            let t2 = std::time::Instant::now();
-            for _ in 0..ITERS {
-                let _ = ck::matvec_q4_k_dp4a_batched(&stream, wptr, xptr, optr, PM, PK, PN);
-            }
-            let td = t2.elapsed().as_secs_f64();
-            (tt, tg, td)
+            (tt, tg)
         };
         let detail = format!(
-            "tc {:.3} vs f32gemm {:.3} vs dp4a {:.3} ms/call ({PM}x{PK}x{PN})",
+            "tc {:.3} vs f32gemm {:.3} ms/call ({PM}x{PK}x{PN})",
             t_tc * 1e3 / ITERS as f64,
             t_gemm * 1e3 / ITERS as f64,
-            t_dp4a * 1e3 / ITERS as f64,
         );
         if t_tc < t_gemm * 0.95 {
             cu_emit(name, "OK", &detail);

@@ -156,14 +156,14 @@ extern "C" int rsl_cuda_matvec_f32(const float *W, const float *x, float *out,
 struct rsl_cuda_stream {
     int device;
     cudaStream_t stream;
-    // Persistent Q4_K DP4A/W4A8 activation scratch (int8 codes + per-sub-block
-    // f32 scales), grown on demand and REUSED across matvec calls. Allocating
-    // this per call in the decode hot loop was what made the DP4A path ~4x
-    // slower than the bit-exact one; reuse keeps the quant pre-pass cheap.
-    signed char *q4k_dp4a_xq = nullptr;
-    float *q4k_dp4a_xs = nullptr;
-    size_t q4k_dp4a_xq_cap = 0; // bytes
-    size_t q4k_dp4a_xs_cap = 0; // floats
+    // Persistent Q4_K int8-activation scratch (int8 codes + per-sub-block scales)
+    // for the int8-TC GEMM, grown on demand and REUSED across calls. Allocating
+    // this per call in the decode hot loop was what made the int8-activation path
+    // ~4x slower; reuse keeps the quant pre-pass cheap.
+    signed char *q4k_act_xq = nullptr;
+    float *q4k_act_xs = nullptr;
+    size_t q4k_act_xq_cap = 0; // bytes
+    size_t q4k_act_xs_cap = 0; // floats
     // Per-sub-block Σ of int8 activation codes (the W8A8/TC −dmin·mn·Σq_x term);
     // only allocated for the int8-TC path.
     int *q4k_xsum = nullptr;
@@ -189,8 +189,8 @@ extern "C" rsl_cuda_stream *rsl_cuda_stream_create(int device_index) {
 extern "C" void rsl_cuda_stream_destroy(rsl_cuda_stream *s) {
     if (!s) return;
     cudaSetDevice(s->device);
-    if (s->q4k_dp4a_xq) cudaFree(s->q4k_dp4a_xq);
-    if (s->q4k_dp4a_xs) cudaFree(s->q4k_dp4a_xs);
+    if (s->q4k_act_xq) cudaFree(s->q4k_act_xq);
+    if (s->q4k_act_xs) cudaFree(s->q4k_act_xs);
     if (s->q4k_xsum) cudaFree(s->q4k_xsum);
     cudaStreamDestroy(s->stream);
     delete s;
@@ -644,26 +644,16 @@ __device__ __forceinline__ float q6_k_row_dot_warp(const unsigned char *row,
 
 RSL_PACKED_MATVEC_WARP(matvec_q8_0_packed_f32, q8_0_row_dot_warp, 32, 34, 32)
 // Q4_K's bit-exact warp path is generated under an internal name; the public
-// rsl_cuda_matvec_q4_k_packed_f32 entry (below) dispatches to it or to the
-// opt-in DP4A/W4A8 path.
+// rsl_cuda_matvec_q4_k_packed_f32 entry (below) dispatches to it.
 RSL_PACKED_MATVEC_WARP(matvec_q4_k_bitexact, q4_k_row_dot_warp, 256, 144, 256)
 RSL_PACKED_MATVEC_WARP(matvec_q6_k_packed_f32, q6_k_row_dot_warp, 256, 210, 256)
 
 // ============================================================
-// Q4_K W4A8 / DP4A path (OPT-IN, numerics-changing). Activations are quantized
-// to signed int8 per 32-element sub-block (symmetric, scale = maxabs/127) in a
-// cheap pre-pass, then the row dot runs on the HW 4-way int8 dot-product
-// (`__dp4a`, sm_61+) via the ggml identity
-//   y_group = x_scale · ( d·sc·Σ(q·xq) − dmin·mn·Σxq ).
-// Integer DP4A is EXACT, so the only error vs the bit-exact f32 path is the
-// int8 activation rounding: cos stays ~1.0 but max_rel grows past the tight
-// `doctor --cuda-parity` tolerance — that is why this is gated OFF by default
-// and is NOT auto-enabled on the bit-exact probe (it trades a little precision
-// for fewer ALU ops where prefill is compute-bound). It is gated by the per-
-// device `matvec:q4_k_dp4a` kernel verdict (a FAIR W4A8-vs-W4A8 parity probe)
-// and wired ONLY onto the batched/prefill path from accel.rs — single-row
-// decode stays bit-exact. Every release arch (sm_75+) has __dp4a. A malloc/
-// launch failure returns nonzero → the caller falls through to the CPU ladder.
+// Q4_K activation int8 quantization. Shared helper for the int8 tensor-core
+// W8A8 prefill GEMM: activations are quantized to signed int8 per 32-element
+// sub-block (symmetric, scale = maxabs/127) in a cheap pre-pass, reusing the
+// stream's persistent scratch. A malloc/launch failure returns nonzero → the
+// caller falls through to the CPU ladder.
 // ============================================================
 
 // Symmetric int8 quant of f32 activations, one warp (32 lanes) per 32-element
@@ -685,7 +675,7 @@ __global__ void q4k_quant_act_kernel(const float *x, signed char *xq, float *xs,
     q = max(-127, min(127, q));
     xq[base + lane] = (signed char)q;
     // Optional Σ of the int8 codes per sub-block (the W8A8/TC `−dmin·mn·Σq_x`
-    // term); nullptr for the DP4A path, which computes it inline via __dp4a.
+    // term); nullptr when the Σ term isn't needed.
     if (xsum) {
         int ssum = q;
         for (int off = 16; off > 0; off >>= 1)
@@ -695,84 +685,7 @@ __global__ void q4k_quant_act_kernel(const float *x, signed char *xq, float *xs,
     if (lane == 0) xs[sub] = a * (1.0f / 127.0f);
 }
 
-// DP4A row dot: same per-group lane layout as q4_k_row_dot_warp, but the inner
-// MACs are 4-wide HW int8 dots. `xq`/`xs` are the pre-quantized activations +
-// per-32 scales for THIS row's K elements. A lane's 4 packed weight bytes split
-// straight into two int8×4 vectors (lo = W&0x0F0F0F0F, hi = (W>>4)&…); the
-// weight codes are 0..15, hence positive in signed int8, so a signed __dp4a
-// against the signed int8 activations is correct. All offsets are 4-aligned
-// (block = 144 B = 4·36; group*32 + (lane&7)*4 is a multiple of 4; the weight
-// and activation buffers are cudaMalloc'd ≥256-aligned) so the uint32 loads are
-// aligned. Σxq is the 4-way dot against the all-ones vector.
-__device__ __forceinline__ float q4_k_row_dot_warp_dp4a(const unsigned char *row,
-                                                        const signed char *xq,
-                                                        const float *xs, int bpr,
-                                                        int lane) {
-    const int group = lane >> 3;
-    const int lbase = (lane & 7) * 4;
-    const int j0 = group * 2;
-    const int j1 = group * 2 + 1;
-    float acc = 0.0f;
-    for (int b = 0; b < bpr; ++b) {
-        const unsigned char *blk = row + b * 144;
-        float d = rsl_f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
-        float dmin = rsl_f16_bits_to_f32((unsigned short)blk[2] | ((unsigned short)blk[3] << 8));
-        const unsigned char *sb = blk + 4;
-        unsigned char sc0, sc1, mn0, mn1;
-        if (group < 2) {
-            sc0 = sb[j0] & 0x3F;
-            mn0 = sb[j0 + 4] & 0x3F;
-            sc1 = sb[j1] & 0x3F;
-            mn1 = sb[j1 + 4] & 0x3F;
-        } else {
-            sc0 = (sb[j0 + 4] & 0x0F) | ((sb[j0 - 4] >> 6) << 4);
-            mn0 = (sb[j0 + 4] >> 4) | ((sb[j0] >> 6) << 4);
-            sc1 = (sb[j1 + 4] & 0x0F) | ((sb[j1 - 4] >> 6) << 4);
-            mn1 = (sb[j1 + 4] >> 4) | ((sb[j1] >> 6) << 4);
-        }
-        // This lane's 4 packed weight bytes -> lo/hi nibble vectors (int8×4).
-        const unsigned char *qc = blk + 16 + group * 32 + lbase;
-        unsigned int W = *(const unsigned int *)qc;
-        int w_lo = (int)(W & 0x0F0F0F0Fu);
-        int w_hi = (int)((W >> 4) & 0x0F0F0F0Fu);
-        // This lane's 4 lo + 4 hi quantized activations (int8×4 vectors).
-        const int x_lo = b * 256 + group * 64 + lbase;
-        const int x_hi = x_lo + 32;
-        int xq_lo = *(const int *)(xq + x_lo);
-        int xq_hi = *(const int *)(xq + x_hi);
-        int dot_lo = __dp4a(w_lo, xq_lo, 0);
-        int dot_hi = __dp4a(w_hi, xq_hi, 0);
-        int xsum_lo = __dp4a(0x01010101, xq_lo, 0); // Σ of the 4 int8 activations
-        int xsum_hi = __dp4a(0x01010101, xq_hi, 0);
-        // Per-sub-block activation scales (lo = sub 2g, hi = sub 2g+1 of block b).
-        float xsl = xs[b * 8 + j0];
-        float xsh = xs[b * 8 + j1];
-        acc += xsl * (d * (float)sc0 * (float)dot_lo - dmin * (float)mn0 * (float)xsum_lo) +
-               xsh * (d * (float)sc1 * (float)dot_hi - dmin * (float)mn1 * (float)xsum_hi);
-    }
-    return acc;
-}
-
-__global__ void matvec_q4_k_dp4a_batched_kernel(const unsigned char *w,
-                                                const signed char *xq,
-                                                const float *xs, float *out,
-                                                int M, int K, int N) {
-    int row = blockIdx.x * blockDim.y + threadIdx.y;
-    if (row >= M) return;
-    int lane = threadIdx.x;
-    int bpr = K / 256;
-    int spr = K / 32; // sub-blocks (scales) per row
-    const unsigned char *rowp = w + (size_t)row * bpr * 144;
-    for (int n = blockIdx.y; n < N; n += gridDim.y) {
-        float acc = q4_k_row_dot_warp_dp4a(rowp, xq + (size_t)n * K,
-                                           xs + (size_t)n * spr, bpr, lane);
-        for (int off = warpSize >> 1; off > 0; off >>= 1)
-            acc += __shfl_down_sync(0xffffffffu, acc, off);
-        if (lane == 0) out[(size_t)n * M + row] = acc;
-    }
-}
-
-// Ensure the stream's persistent DP4A scratch holds >= need_xq bytes of int8
+// Ensure the stream's persistent int8-activation scratch holds >= need_xq bytes of int8
 // activations + need_xs f32 sub-block scales. Grown on demand (rare — it
 // stabilizes at the model's largest K after the first calls) and REUSED across
 // every matvec; never freed per call. The reuse is safe without double-buffering
@@ -782,19 +695,19 @@ __global__ void matvec_q4_k_dp4a_batched_kernel(const unsigned char *w,
 // keep the retained buffer out of any pool-trim path.
 static int rsl_q4k_ensure_scratch(rsl_cuda_stream *s, size_t need_xq, size_t need_xs,
                                   size_t need_xsum) {
-    if (need_xq > s->q4k_dp4a_xq_cap) {
-        if (s->q4k_dp4a_xq) cudaFree(s->q4k_dp4a_xq);
-        s->q4k_dp4a_xq = nullptr;
-        s->q4k_dp4a_xq_cap = 0;
-        if (cudaMalloc((void **)&s->q4k_dp4a_xq, need_xq) != cudaSuccess) return -2;
-        s->q4k_dp4a_xq_cap = need_xq;
+    if (need_xq > s->q4k_act_xq_cap) {
+        if (s->q4k_act_xq) cudaFree(s->q4k_act_xq);
+        s->q4k_act_xq = nullptr;
+        s->q4k_act_xq_cap = 0;
+        if (cudaMalloc((void **)&s->q4k_act_xq, need_xq) != cudaSuccess) return -2;
+        s->q4k_act_xq_cap = need_xq;
     }
-    if (need_xs > s->q4k_dp4a_xs_cap) {
-        if (s->q4k_dp4a_xs) cudaFree(s->q4k_dp4a_xs);
-        s->q4k_dp4a_xs = nullptr;
-        s->q4k_dp4a_xs_cap = 0;
-        if (cudaMalloc((void **)&s->q4k_dp4a_xs, need_xs * sizeof(float)) != cudaSuccess) return -2;
-        s->q4k_dp4a_xs_cap = need_xs;
+    if (need_xs > s->q4k_act_xs_cap) {
+        if (s->q4k_act_xs) cudaFree(s->q4k_act_xs);
+        s->q4k_act_xs = nullptr;
+        s->q4k_act_xs_cap = 0;
+        if (cudaMalloc((void **)&s->q4k_act_xs, need_xs * sizeof(float)) != cudaSuccess) return -2;
+        s->q4k_act_xs_cap = need_xs;
     }
     if (need_xsum > s->q4k_xsum_cap) {
         if (s->q4k_xsum) cudaFree(s->q4k_xsum);
@@ -806,36 +719,10 @@ static int rsl_q4k_ensure_scratch(rsl_cuda_stream *s, size_t need_xq, size_t nee
     return 0;
 }
 
-// Quant pre-pass + DP4A batched matvec, reusing the stream's persistent scratch.
-// DP4A is wired ONLY onto the batched/prefill path (verdict matvec:q4_k_dp4a,
-// selected from accel.rs); single-row decode stays bit-exact. `ne` fits int for
-// all realistic shapes (activations < 2 GiB).
-extern "C" int rsl_cuda_matvec_q4_k_dp4a_batched(rsl_cuda_stream *s, const void *w,
-                                                 const float *x, float *out,
-                                                 int M, int K, int N) {
-    if (!s || !w || !x || !out || M <= 0 || K <= 0 || N <= 0 || (K % 256) != 0)
-        return -1;
-    cudaSetDevice(s->device);
-    size_t ne = (size_t)N * K;
-    if (rsl_q4k_ensure_scratch(s, ne, (size_t)N * (K / 32), 0) != 0)
-        return -2;
-    signed char *xq = s->q4k_dp4a_xq;
-    float *xs = s->q4k_dp4a_xs;
-    dim3 qb(32, 8);
-    dim3 qg((unsigned)((ne / 32 + 7) / 8)); // grid.x max is 2^31-1, no y-cap needed
-    q4k_quant_act_kernel<<<qg, qb, 0, s->stream>>>(x, xq, xs, nullptr, (int)ne);
-    unsigned gy = (unsigned)(N < 65535 ? N : 65535);
-    dim3 block(32, 8);
-    dim3 grid((unsigned)((M + 7) / 8), gy);
-    matvec_q4_k_dp4a_batched_kernel<<<grid, block, 0, s->stream>>>(
-        (const unsigned char *)w, xq, xs, out, M, K, N);
-    return rsl_cuda_check("rsl_cuda_matvec_q4_k_dp4a_batched");
-}
-
-// Public Q4_K entries (the names the Rust FFI binds to) are the DEFAULT bit-
-// exact warp path. The DP4A/W4A8 path is reached via the dedicated
-// rsl_cuda_matvec_q4_k_dp4a_batched entry, which accel.rs selects on the
-// prefill path only when the per-device `matvec:q4_k_dp4a` verdict passed.
+// Public Q4_K entries (the names the Rust FFI binds to) are the bit-exact warp
+// path. The faster prefill GEMM variants (f32 / int8-TC) are reached via their
+// dedicated rsl_cuda_gemm_q4_k_* entries, which accel.rs selects on the prefill
+// path per the per-device `gemm:q4_k_f32` / `gemm:q4_k_w8a8_tc` verdicts.
 extern "C" int rsl_cuda_matvec_q4_k_packed_f32(rsl_cuda_stream *s, const void *w,
                                                const float *x, float *out,
                                                int M, int K) {
@@ -1175,8 +1062,8 @@ extern "C" int rsl_cuda_gemm_q4_k_w8a8_tc(rsl_cuda_stream *s, const void *w,
     size_t nsub = (size_t)N * (K / 32);
     if (rsl_q4k_ensure_scratch(s, ne, nsub, nsub) != 0)
         return -2;
-    signed char *xq = s->q4k_dp4a_xq;
-    float *xs = s->q4k_dp4a_xs;
+    signed char *xq = s->q4k_act_xq;
+    float *xs = s->q4k_act_xs;
     int *xsum = s->q4k_xsum;
     dim3 qb(32, 8);
     dim3 qg((unsigned)((ne / 32 + 7) / 8));

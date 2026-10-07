@@ -120,13 +120,16 @@ RAM and OOMs the new run. (This does **not** apply before a *build*; killing
   (`fp4_tc_enabled`/`hopper_tc_enabled`/`xmx_enabled` → `kernel_verdict`) turn a
   path on only where it matched the CPU reference, off otherwise (fail-closed).
   The first-load path re-validates on a build/version change (self-heal).
-- The **Q4_K W4A8/DP4A matvec** joins the same verdict mechanism
-  (`q4k_dp4a_enabled` → `kernel_verdict("matvec:q4_k_dp4a")`), with two
-  differences: it is intentionally lossy (int8 activations), so its probe grades
-  against a **fair W4A8 reference** (the same per-32 int8 round-trip) rather than
-  the bit-exact f32 reference; and it is wired **only onto the batched/prefill
-  CUDA path** — single-row decode stays bit-exact (DP4A is ~parity there, a win
-  only where prefill is compute-bound). No env var.
+- **Q4_K prefill GEMM path** (CUDA, the matvec on `prefill` is batched → GEMM,
+  the ~2.3× prefill win): prefill was matvec-compute-bound, so the batched Q4_K
+  matvec routes through a **weight-reusing tiled GEMM** instead of a per-token
+  re-streaming matvec. Two kernels, both verdict + perf-gated like the TC paths,
+  tried in order on the batched path (`n >= 16`, decode/single-row stays on the
+  bit-exact warp matvec): **int8 tensor cores** (`gemm_q4_k_w8a8_tc`, nvcuda::wmma
+  s8, W8A8 — LOSSY, graded vs a fair W8A8 ref, `kernel_verdict("gemm:q4_k_w8a8_tc")`,
+  enabled only where it beats the f32 GEMM) then the **register-blocked f32 GEMM**
+  (`gemm_q4_k_f32`, BIT-EXACT, `kernel_verdict("gemm:q4_k_f32")`, the lossless
+  fallback that still beats the re-streaming matvec). No env var.
 - VRAM-fit placement (`rustllama-engine/src/placement_auto.rs`,
   `auto_n_gpu_layers`) budgets **CUDA-first** (mirrors dispatch), else SYCL,
   else all-CPU.
@@ -213,11 +216,13 @@ they work on SYCL/CUDA/CPU hosts alike) and auto-apply on next load per the
 The sweep's `--validate-kernels` stage runs the GPU kernel parity probes and
 caches a pass/fail **verdict** per kernel (`TuningResult.kernel_verdicts`); the
 `accel.rs` gates read it to AUTO-ENABLE the Blackwell/Hopper tensor-core + Intel
-XMX GEMM paths + the Q4_K W4A8/DP4A prefill matvec only where they match their
-CPU reference (fail-closed, **no env vars** — the removed
-`RUSTLLAMA_FP4_TC`/`_FP8_WGMMA`/`_SYCL_XMX`, and the Q4_K DP4A path's former
-`RUSTLLAMA_Q4K_DP4A`). The DP4A probe grades against a *fair W4A8* reference
-(int8-activation round-trip) since that path is intentionally lossy vs f32.
+XMX GEMM paths + the Q4_K prefill GEMMs (`gemm:q4_k_f32` bit-exact,
+`gemm:q4_k_w8a8_tc` int8-TC) only where they pass (fail-closed, **no env vars** —
+the removed `RUSTLLAMA_FP4_TC`/`_FP8_WGMMA`/`_SYCL_XMX`). The probes are also
+**perf-gated** where a kernel is lossy or just an alternative: the int8-TC GEMM
+grades against a *fair W8A8* reference (int8-activation round-trip, since it's
+lossy vs f32) and auto-enables only where it's both correct AND measured faster
+than the f32 GEMM.
 **Self-heal:**
 even when a model is already tuned, the first-load path re-runs
 `--validate-kernels` if the cache's verdicts are missing or were stamped by a
