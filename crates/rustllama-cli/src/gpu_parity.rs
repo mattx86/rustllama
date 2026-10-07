@@ -1901,6 +1901,66 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- Q4_K prefill GEMM (verdict: gemm:q4_k_f32, BIT-EXACT) ----
+    // The tiled weight-reuse GEMM vs the standard f32 Q4_K matvec per row — same
+    // math, so graded at the bit-exact tolerance (0.999/0.02). Fail-closed: the
+    // dispatch uses the GEMM only when this verdict passes.
+    #[allow(clippy::never_loop)]
+    for _gemm in 0..1usize {
+        const GEMM_N: usize = 8;
+        let name = "gemm:q4_k_f32";
+        let layout = LAYOUTS.iter().find(|l| l.name == "q4_k").expect("layout");
+        let cpu = cpu_matvec_for("q4_k");
+        let xb_host: Vec<f32> = gen_x(GEMM_N * MV_K, 2024);
+        let Some((w, _)) = finite_ref(layout, cpu, &xb_host[..MV_K]) else {
+            cu_emit(name, "SKIP", "no-finite-reference");
+            *counts.entry("SKIP").or_default() += 1;
+            continue;
+        };
+        let mut cpu_out = vec![0f32; GEMM_N * MV_M];
+        for r in 0..GEMM_N {
+            let mut row = vec![0f32; MV_M];
+            cpu(&w, &xb_host[r * MV_K..(r + 1) * MV_K], &mut row, MV_M, MV_K);
+            cpu_out[r * MV_M..(r + 1) * MV_M].copy_from_slice(&row);
+        }
+        let (Some(wb), Some(xbd), Some(mut ob)) = (
+            ck::CudaDeviceBuffer::from_host(&stream, &w),
+            cu_upload_f32(&stream, &xb_host),
+            ck::CudaDeviceBuffer::alloc(&stream, GEMM_N * MV_M * 4),
+        ) else {
+            cu_emit(name, "KERNEL_ERR", "device-alloc-failed");
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+            continue;
+        };
+        // SAFETY: three live device buffers on `stream` sized for (N,M)/(N,K);
+        // the wrapper synchronizes before returning.
+        let res = unsafe {
+            ck::gemm_q4_k_f32(
+                &stream,
+                wb.as_ptr(),
+                xbd.as_ptr() as *const f32,
+                ob.as_mut_ptr() as *mut f32,
+                MV_M,
+                MV_K,
+                GEMM_N,
+            )
+        };
+        match res {
+            Err(e) => {
+                cu_emit(name, "KERNEL_ERR", &format!("{e}"));
+                *counts.entry("KERNEL_ERR").or_default() += 1;
+            }
+            Ok(()) => cu_grade(
+                name,
+                &cu_download_f32(&ob, GEMM_N * MV_M),
+                &cpu_out,
+                0.999,
+                0.02,
+                &mut counts,
+            ),
+        }
+    }
+
     // ---- Blackwell SM12x FP4 tensor-core GEMM (W4A4) ----
     // The new hand-rolled block-scaled `mma.sync` path (cuda/rsl_blackwell.cuh).
     // SKIP unless this is a real SM12x Blackwell device built with the TC path

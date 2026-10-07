@@ -205,6 +205,29 @@ fn try_matvec_packed_cuda_q4k_dp4a_batched(
     guard.matvec_packed_batched_q4k_dp4a(weight_key, w_bytes, x, out, m, k, n)
 }
 
+/// Batched Q4_K matvec via the native CUDA prefill GEMM (verdict `gemm:q4_k_f32`,
+/// bit-exact). Weights are the SAME packed Q4_K bytes; the kernel stages a
+/// dequantized weight super-block in shared memory and reuses it across the
+/// token tile (the weight-reuse fix for the re-streaming batched matvec).
+#[allow(clippy::too_many_arguments)]
+fn try_gemm_q4k_f32_batched(
+    weight_key: usize,
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    guard.gemm_packed_batched_q4k_f32(weight_key, w_bytes, x, out, m, k, n)
+}
+
 // ------------------------------------------------------------
 // Blackwell SM12x FP4 tensor-core GEMM dispatch (opt-in)
 // ------------------------------------------------------------
@@ -373,6 +396,19 @@ fn q4k_dp4a_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
     *EN.get_or_init(|| {
         kernel_verdict(rustllama_tuner::VERDICT_MATVEC_Q4K_DP4A) && cuda_active()
+    })
+}
+
+/// **AUTOMATIC** — no env var: the Q4_K prefill GEMM (tiled, shared-mem weight
+/// reuse, f32 — BIT-EXACT) is on where its bit-exact parity probe passed on-
+/// device (`kernel_verdict("gemm:q4_k_f32")`). Fail-closed: a write-blind kernel
+/// bug on an unvalidated arch leaves the verdict unset → the batched matvec runs.
+/// This is the weight-reuse fix for the O(M·K·N) re-streaming, so it takes
+/// priority over DP4A on the prefill path. Cached once (process-wide).
+fn q4k_gemm_f32_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        kernel_verdict(rustllama_tuner::VERDICT_GEMM_Q4K_F32) && cuda_active()
     })
 }
 
@@ -10243,9 +10279,20 @@ pub fn try_matvec_tensor_batched_usm_f32(
     {
         if let Some(ck_kind) = dtype_to_cuda_kind(w.dtype) {
             let wb = as_bytes(w);
-            // W4A8/DP4A prefill path (verdict-gated, batched only) — tried first
-            // for Q4_K on a substantial batch; a miss falls through to bit-exact.
-            if matches!(ck_kind, ck::CudaPackedKind::Q4_K)
+            let q4k = matches!(ck_kind, ck::CudaPackedKind::Q4_K);
+            // Q4_K prefill GEMM (bit-exact, shared-mem weight reuse) — HIGHEST
+            // priority on a substantial batch: it fixes the O(M·K·N) weight re-
+            // streaming that DP4A does not. A miss falls through.
+            if q4k
+                && q4k_gemm_f32_enabled()
+                && n >= 16
+                && k % 256 == 0
+                && try_gemm_q4k_f32_batched(wb.as_ptr() as usize, wb, x, out, m, k, n)
+            {
+                return true;
+            }
+            // W4A8/DP4A prefill path (verdict-gated, batched only).
+            if q4k
                 && q4k_dp4a_enabled()
                 && n >= 16
                 && k % 256 == 0

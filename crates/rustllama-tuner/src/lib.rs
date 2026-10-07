@@ -201,6 +201,11 @@ pub const VERDICT_XMX_GEMM: &str = "xmx:gemm";
 /// wired ONLY onto the batched/prefill CUDA path (decode stays bit-exact).
 /// Graded by a FAIR W4A8-vs-W4A8 parity probe (not the bit-exact probe).
 pub const VERDICT_MATVEC_Q4K_DP4A: &str = "matvec:q4_k_dp4a";
+/// Q4_K prefill GEMM (tiled, shared-mem weight reuse, f32 — BIT-EXACT). Backs
+/// `q4k_gemm_f32`, wired onto the batched/prefill CUDA path. Graded by the
+/// bit-exact batched parity probe; gated fail-closed (catches a write-blind
+/// kernel bug on an unvalidated arch).
+pub const VERDICT_GEMM_Q4K_F32: &str = "gemm:q4_k_f32";
 
 /// Read the on-device verdict for a kernel probe name, if one has been
 /// recorded. `None` = never validated (or the probe SKIPped because the

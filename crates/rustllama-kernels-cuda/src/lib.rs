@@ -122,6 +122,10 @@ extern "C" {
     // Q4_K W4A8/DP4A batched matvec (int8 activations + HW __dp4a). Prefill-only
     // path, selected by accel.rs via the `matvec:q4_k_dp4a` verdict.
     fn rsl_cuda_matvec_q4_k_dp4a_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
+    // Q4_K prefill GEMM (Phase 1): tiled, shared-mem weight REUSE, f32 accumulate
+    // (bit-exact). out[N,M] = x[N,K] . W[M,K]^T. Selected by accel.rs on the
+    // prefill path via the `gemm:q4_k_f32` verdict.
+    fn rsl_cuda_gemm_q4_k_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
     fn rsl_cuda_matvec_q6_k_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
     fn rsl_cuda_matvec_q6_k_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
 
@@ -1149,6 +1153,39 @@ pub unsafe fn matvec_q4_k_dp4a_batched(
     n: usize,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_matvec_q4_k_dp4a_batched(
+        stream.raw(),
+        w,
+        x,
+        out,
+        m as c_int,
+        k as c_int,
+        n as c_int,
+    );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// Safe wrapper for the Q4_K prefill GEMM (tiled, shared-mem weight reuse, f32
+/// accumulate — bit-exact). `out` = [N,M] row-major, `x` = [N,K] row-major, `w`
+/// = Q4_K packed [M,K]. This is the weight-reuse replacement for the batched
+/// matvec on the prefill path.
+///
+/// SAFETY: `w`/`x`/`out` are device pointers on `stream`'s device sized for the
+/// Q4_K block layout and the given M/K/N (K % 256 == 0).
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn gemm_q4_k_f32(
+    stream: &CudaStream,
+    w: *const c_void,
+    x: *const f32,
+    out: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_gemm_q4_k_f32(
         stream.raw(),
         w,
         x,
@@ -2350,6 +2387,57 @@ impl CudaMatvecCache {
         // SAFETY: device buffers sized for N rows, as `matvec_packed_batched`.
         let res =
             unsafe { matvec_q4_k_dp4a_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n) };
+        if res.is_err() || consume_error_count() != 0 {
+            return false;
+        }
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * m * 4) };
+        self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
+
+    /// Q4_K prefill GEMM (Phase 1): tiled, shared-mem weight reuse, f32 (bit-
+    /// exact). Same device-buffer lifecycle as `matvec_packed_batched` — the
+    /// weight is the SAME packed Q4_K bytes — but the kernel stages a dequantized
+    /// weight super-block in shared memory and reuses it across the token tile,
+    /// so each weight is read from global once (vs once per token). Selected by
+    /// accel.rs on the prefill (batched) path when the `gemm:q4_k_f32` verdict
+    /// passed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_packed_batched_q4k_f32(
+        &mut self,
+        weight_key: usize,
+        w_bytes: &[u8],
+        x: &[f32],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> bool {
+        let kind = CudaPackedKind::Q4_K;
+        if m == 0 || k == 0 || n == 0 || x.len() != n * k || out.len() != n * m {
+            return false;
+        }
+        if k % kind.k_alignment() != 0 || w_bytes.len() < m * kind.row_bytes(k) {
+            return false;
+        }
+        if !self.ensure_weight(weight_key, w_bytes) {
+            return false;
+        }
+        if !Self::ensure_scratch(&mut self.x_scratch, &self.stream, n * k * 4)
+            || !Self::ensure_scratch(&mut self.out_scratch, &self.stream, n * m * 4)
+        {
+            return false;
+        }
+        let x_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, n * k * 4) };
+        if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
+            return false;
+        }
+        let w_ptr = self.weights[&weight_key].ptr;
+        let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
+        let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: device buffers sized for N rows, as `matvec_packed_batched`.
+        let res = unsafe { gemm_q4_k_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n) };
         if res.is_err() || consume_error_count() != 0 {
             return false;
         }
