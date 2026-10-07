@@ -2090,37 +2090,118 @@ extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
 //   out: [n_new, n_heads, head_dim]  row-major
 // Causal: query at new position q_pos attends absolute [0, kv_len_base+q_pos].
 // 2D grid: x = head, y = q_pos. One thread per (head, q_pos).
+// head_dim ceiling, shared with the quantized-KV flash kernels below (the
+// #ifndef at the quant-KV block then sees it already defined and skips). The
+// per-lane register slices (qreg/acc) are sized for this ceiling.
+#ifndef RSL_FLASH_MAX_HEAD_DIM
+#define RSL_FLASH_MAX_HEAD_DIM 256
+#endif
+
+// Warp-cooperative tiled FlashAttention-2 prefill (f32). The naive version
+// this replaces ran one thread per (head, q_pos) and re-streamed all of K/V
+// from global for every query — O(n_new) redundant reads of the same K/V.
+// Here a block is BQ warps (BQ*32 threads) and ONE warp owns one query row,
+// so the BQ warps in a block share each staged K/V tile (the reuse win). K/V
+// are streamed in tiles of BK positions through dynamic shared memory; the
+// q·k dot is split across the 32 lanes of a warp and finished with a shuffle
+// reduction; the softmax is the SAME online (running-max) recurrence as the
+// CPU/scalar reference, so the result matches it to within FMA/expf
+// reassociation. Causal masking is a per-query inner-loop bound (`jmax`); the
+// OUTER tile-loop bound is block-uniform (`p_block_max`) so every warp — even
+// a tail warp whose q_pos is out of range — reaches the same __syncthreads.
+//
+// Shared use = 2*BK*head_dim*4 B = 16 KB at head_dim 128, 32 KB at 256 — under
+// the 48 KB per-block floor guaranteed on every CUDA arch, so no opt-in / no
+// device capability query is needed. Block = 128 threads (<< the 1024 cap).
+#define RSL_FLASH_PREFILL_BQ 4   // query rows (warps) per block
+#define RSL_FLASH_PREFILL_BK 16  // KV positions staged per shared tile
 __global__ void flash_attn_prefill_f32_kernel(const float *q, const float *k,
                                               const float *v, float *out,
                                               int n_heads, int n_gqa,
                                               int head_dim, int max_ctx,
                                               int kv_len_base, int n_new,
                                               float scale) {
-    int hh = blockIdx.x * blockDim.x + threadIdx.x;
-    int q_pos = blockIdx.y;
-    if (hh >= n_heads || q_pos >= n_new) return;
-    int kv_h = hh / n_gqa;
-    int q_off = (q_pos * n_heads + hh) * head_dim;
-    int out_off = q_off;
-    int kv_len_for_q = kv_len_base + q_pos + 1;
-    for (int i = 0; i < head_dim; ++i) out[out_off + i] = 0.f;
-    float m = -INFINITY, l = 0.f;
-    for (int t = 0; t < kv_len_for_q; ++t) {
-        int kv_off = (kv_h * max_ctx + t) * head_dim;
-        float s_dot = 0.f;
-        for (int i = 0; i < head_dim; ++i)
-            s_dot += q[q_off + i] * k[kv_off + i];
-        s_dot *= scale;
-        float m_new = fmaxf(m, s_dot);
-        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
-        float p = expf(s_dot - m_new);
-        l = l * rescale + p;
-        for (int i = 0; i < head_dim; ++i)
-            out[out_off + i] = out[out_off + i] * rescale + p * v[kv_off + i];
-        m = m_new;
+    extern __shared__ float smem[];  // [BK*head_dim] K then [BK*head_dim] V
+    float *k_tile = smem;
+    float *v_tile = smem + RSL_FLASH_PREFILL_BK * head_dim;
+
+    const int lane = threadIdx.x;              // 0..31
+    const int warp = threadIdx.y;              // 0..BQ-1
+    const int tid = warp * 32 + lane;
+    const int nthreads = blockDim.x * blockDim.y;
+
+    const int hh = blockIdx.y;                 // attention head
+    const int q_base = blockIdx.x * RSL_FLASH_PREFILL_BQ;
+    const int q_pos = q_base + warp;           // this warp's query row
+    const int kv_h = hh / n_gqa;
+
+    const bool active = (q_pos < n_new);
+    // Absolute KV position this query attends up to, inclusive (causal). The
+    // tile loop bound uses the block's MAX q_pos so it is warp-uniform.
+    const int q_last = min(q_base + RSL_FLASH_PREFILL_BQ - 1, n_new - 1);
+    const int p_self = kv_len_base + q_pos;    // meaningful only if active
+    const int p_block_max = kv_len_base + q_last;
+
+    // Each lane owns head dims {lane, lane+32, ...}; qreg/acc hold that slice.
+    float qreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    float acc[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    if (active) {
+        const int q_off = (q_pos * n_heads + hh) * head_dim;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
+            qreg[seg] = q[q_off + d];
+            acc[seg] = 0.f;
+        }
     }
-    float inv_l = (l > 0.f) ? 1.f / l : 0.f;
-    for (int i = 0; i < head_dim; ++i) out[out_off + i] *= inv_l;
+    float m = -INFINITY, l = 0.f;
+
+    for (int t0 = 0; t0 <= p_block_max; t0 += RSL_FLASH_PREFILL_BK) {
+        __syncthreads();
+        // Cooperatively stage K/V tile [t0, t0+BK) for this kv head. All
+        // threads (active or not) participate so the staging is complete.
+        for (int e = tid; e < RSL_FLASH_PREFILL_BK * head_dim; e += nthreads) {
+            int j = e / head_dim;
+            int d = e - j * head_dim;
+            int t = t0 + j;
+            float kk = 0.f, vv = 0.f;
+            if (t < max_ctx) {
+                int kv_off = (kv_h * max_ctx + t) * head_dim;
+                kk = k[kv_off + d];
+                vv = v[kv_off + d];
+            }
+            k_tile[e] = kk;
+            v_tile[e] = vv;
+        }
+        __syncthreads();
+        if (active) {
+            // Causal: this query sees positions t0..min(t0+BK-1, p_self).
+            int jmax = min(RSL_FLASH_PREFILL_BK, p_self - t0 + 1);
+            for (int j = 0; j < jmax; ++j) {
+                const float *krow = k_tile + j * head_dim;
+                float partial = 0.f;
+                for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+                    partial += qreg[seg] * krow[d];
+                // Warp reduce the per-lane partials into lane 0, broadcast back.
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    partial += __shfl_down_sync(0xffffffffu, partial, off);
+                float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
+                float m_new = fmaxf(m, s_dot);
+                float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
+                float p = expf(s_dot - m_new);
+                l = l * rescale + p;
+                const float *vrow = v_tile + j * head_dim;
+                for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+                    acc[seg] = acc[seg] * rescale + p * vrow[d];
+                m = m_new;
+            }
+        }
+    }
+    if (active) {
+        float inv_l = (l > 0.f) ? 1.f / l : 0.f;
+        const int out_off = (q_pos * n_heads + hh) * head_dim;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            out[out_off + d] = acc[seg] * inv_l;
+    }
 }
 
 extern "C" int rsl_cuda_flash_attn_prefill_f32(rsl_cuda_stream *s,
@@ -2134,13 +2215,17 @@ extern "C" int rsl_cuda_flash_attn_prefill_f32(rsl_cuda_stream *s,
         n_new <= 0)
         return -1;
     if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM) return -1;
     if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
     cudaSetDevice(s->device);
     int n_gqa = n_heads / n_kv_heads;
     float scale = 1.0f / sqrtf((float)head_dim);
-    int t = 64;
-    dim3 b((n_heads + t - 1) / t, (unsigned)n_new);
-    flash_attn_prefill_f32_kernel<<<b, t, 0, s->stream>>>(
+    dim3 block(32, RSL_FLASH_PREFILL_BQ);  // 128 threads, 1 warp per query row
+    dim3 grid((n_new + RSL_FLASH_PREFILL_BQ - 1) / RSL_FLASH_PREFILL_BQ,
+              (unsigned)n_heads);
+    size_t shmem =
+        (size_t)2 * RSL_FLASH_PREFILL_BK * head_dim * sizeof(float);
+    flash_attn_prefill_f32_kernel<<<grid, block, shmem, s->stream>>>(
         q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new,
         scale);
     return rsl_cuda_check("rsl_cuda_flash_attn_prefill_f32");
