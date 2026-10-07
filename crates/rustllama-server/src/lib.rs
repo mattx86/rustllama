@@ -2153,28 +2153,18 @@ async fn load_model(
             p
         }
         (false, false, true) => {
-            // Short-name resolution: walk the cache, match model names.
-            // This is the path the GUI Models page hits when the user
-            // clicks "Load" on a row from `/api/tags` (which surfaces
-            // names, not full paths). `list_cached_models` matches a GGUF
-            // by file stem AND an MLX model directory by its folder name,
-            // so an MLX dir loads by name the same way a cached GGUF does.
+            // Short-name resolution: the GUI Models page hits this when the
+            // user clicks "Load" on an `/api/tags` row (which surfaces names,
+            // not full paths). `resolve_model_spec` — the shared resolver the
+            // CLI also uses — matches a GGUF by file stem, an MLX model
+            // directory by its folder name, a root-level `<id>.gguf`, a hub
+            // ref, or a literal path, so a "name" that is really any of those
+            // still loads.
             let name = req.name.unwrap();
             let Some(cache) = rustllama_hub::default_cache_dir() else {
                 return (StatusCode::INTERNAL_SERVER_ERROR, "no cache dir").into_response();
             };
-            let models = match rustllama_hub::list_cached_models(&cache) {
-                Ok(m) => m,
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("failed to enumerate cache: {e}"),
-                    )
-                        .into_response();
-                }
-            };
-            let matched = models.into_iter().find(|m| m.name == name).map(|m| m.path);
-            match matched {
+            match rustllama_hub::resolve_model_spec(&name, &cache) {
                 Some(p) => p,
                 None => {
                     return (
@@ -2813,23 +2803,7 @@ async fn inspect_gguf(Json(req): Json<InspectGgufRequest>) -> Response {
             let Some(cache) = rustllama_hub::default_cache_dir() else {
                 return (StatusCode::INTERNAL_SERVER_ERROR, "no cache dir").into_response();
             };
-            let paths = match rustllama_hub::list_cached(&cache) {
-                Ok(p) => p,
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("failed to enumerate cache: {e}"),
-                    )
-                        .into_response();
-                }
-            };
-            let matched = paths.into_iter().find(|p| {
-                p.file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s == name)
-                    .unwrap_or(false)
-            });
-            match matched {
+            match rustllama_hub::resolve_model_spec(&name, &cache) {
                 Some(p) => p,
                 None => {
                     return (

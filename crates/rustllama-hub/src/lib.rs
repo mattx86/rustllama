@@ -202,6 +202,66 @@ pub fn list_cached(cache_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// Resolve a user-supplied model spec to a concrete on-disk path — a `.gguf`
+/// file or an MLX model directory — trying every form the CLI, the HTTP
+/// server, and the GUI accept so all three behave identically. Pure lookup;
+/// never downloads.
+///
+///   1. an existing path (absolute OR relative to the CWD) → used verbatim;
+///   2. a hub ref `owner/repo:file.gguf` → `<cache>/owner__repo/file.gguf`,
+///      when that file is actually present;
+///   3. a bare cached id / file stem (e.g.
+///      `qwen2.5-coder-7b-instruct-q4_k_m`) → a root-level `<id>.gguf`, else
+///      any hub-layout GGUF whose file stem equals `spec`, else an MLX model
+///      directory whose name equals `spec`.
+///
+/// Returns `None` when nothing matches. This is the single resolver the
+/// `serve` / `chat` / `model` CLI paths, the `/v1/models/load` handler, and
+/// the GUI all funnel through, so "the exact ref you pulled", "the id the
+/// model list shows", and "a path on disk" are interchangeable everywhere.
+pub fn resolve_model_spec(spec: &str, cache_dir: &Path) -> Option<PathBuf> {
+    // 1. An existing path wins outright (absolute or relative to the CWD).
+    let as_path = PathBuf::from(spec);
+    if as_path.exists() {
+        return Some(as_path);
+    }
+    // 2. A hub ref maps to its deterministic cache location — but only count
+    //    it when the file is actually there (a not-yet-pulled ref falls
+    //    through so the caller can apply its own "would-be path" logic).
+    if let Ok(hub_ref) = HubRef::parse(spec) {
+        let path = hub_ref.local_path(cache_dir);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    // 3a. A locally-dropped GGUF at the cache root (`<cache>/<id>.gguf`) —
+    //     `list_cached` only walks the depth-2 hub layout, so check this first.
+    let direct = cache_dir.join(format!("{spec}.gguf"));
+    if direct.is_file() {
+        return Some(direct);
+    }
+    // 3b. Any hub-layout GGUF whose file stem matches the spec (the id the
+    //     model list / `/api/tags` shows).
+    if let Ok(paths) = list_cached(cache_dir) {
+        if let Some(hit) = paths.into_iter().find(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s == spec)
+                .unwrap_or(false)
+        }) {
+            return Some(hit);
+        }
+    }
+    // 3c. An MLX model *directory* whose name matches (mlx-lm / mlx-community
+    //     checkpoints load by directory, not by a single file).
+    if let Ok(models) = list_cached_models(cache_dir) {
+        if let Some(m) = models.into_iter().find(|m| m.name == spec) {
+            return Some(m.path);
+        }
+    }
+    None
+}
+
 /// One resolvable model on disk: either a GGUF **file** or an MLX model
 /// **directory** (mlx-lm / mlx-community layout). Both carry a `name` the
 /// caller can match a short load request against — a GGUF's file stem, or an

@@ -529,28 +529,19 @@ pub async fn retune_handler(
     }
 }
 
-/// Resolve a model path or cache file-stem name to an absolute `.gguf`
-/// path, mirroring the `/v1/models/load` `name` resolution.
+/// Resolve a model path or cache file-stem name to an absolute `.gguf` /
+/// MLX path, mirroring the `/v1/models/load` `name` resolution. Delegates to
+/// the shared [`rustllama_hub::resolve_model_spec`] so the HTTP load path,
+/// the GUI (which drives it), and the CLI all accept the same forms: a path
+/// (absolute or CWD-relative), a hub ref `org/repo:file.gguf`, or a bare
+/// cached id / file stem (incl. a locally-dropped root-level `<id>.gguf` and
+/// MLX model directories).
 fn resolve_model_path(model: &str) -> Option<std::path::PathBuf> {
+    // An existing path resolves even if the cache dir can't be located.
     let p = std::path::PathBuf::from(model);
     if p.is_file() {
         return Some(p);
     }
     let cache = rustllama_hub::default_cache_dir()?;
-    // Models dropped directly in the models dir sit at depth 1;
-    // `list_cached` only walks the hub layout (`owner__repo/file.gguf` at
-    // depth 2), so check the root-level `<stem>.gguf` explicitly first —
-    // otherwise a locally-placed GGUF (not hub-pulled) can't be re-tuned
-    // by its id.
-    let direct = cache.join(format!("{model}.gguf"));
-    if direct.is_file() {
-        return Some(direct);
-    }
-    let paths = rustllama_hub::list_cached(&cache).ok()?;
-    paths.into_iter().find(|p| {
-        p.file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| s == model)
-            .unwrap_or(false)
-    })
+    rustllama_hub::resolve_model_spec(model, &cache)
 }
