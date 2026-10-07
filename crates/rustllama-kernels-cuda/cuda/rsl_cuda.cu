@@ -892,38 +892,46 @@ __global__ void gemm_q4_k_f32_rb_kernel(const unsigned char *w, const float *x,
 
     const int ktiles = K / RSL_Q4K_GEMM_BK; // K/32
     for (int kt = 0; kt < ktiles; ++kt) {
-        // Stage As[BK][BM] — dequant the BM weight rows' sub-block kt.
-        for (int e = tid; e < RSL_Q4K_GEMM_BM * RSL_Q4K_GEMM_BK; e += nthreads) {
-            int rl = e % RSL_Q4K_GEMM_BM;         // row within tile (0..BM-1)
-            int kk = e / RSL_Q4K_GEMM_BM;         // k within tile (0..BK-1)
-            int mg = rowBase + rl;
-            int kg = kt * RSL_Q4K_GEMM_BK + kk;   // global k
-            float val = 0.0f;
-            if (mg < M) {
-                int sbi = kg >> 8; // super-block (kg / 256)
-                int j = kg & 255;  // index within super-block (0..255)
-                const unsigned char *blk = w + ((size_t)mg * bpr + sbi) * 144;
-                float d = rsl_f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
-                float dmin = rsl_f16_bits_to_f32((unsigned short)blk[2] | ((unsigned short)blk[3] << 8));
-                const unsigned char *sb = blk + 4;
-                const unsigned char *qs = blk + 16;
-                int g = j >> 6;
-                int pos = j & 63;
-                int sub = 2 * g + (pos >= 32 ? 1 : 0);
-                int l = pos & 31;
-                unsigned char qb = qs[g * 32 + l];
-                int nib = (pos < 32) ? (qb & 0x0F) : (qb >> 4);
-                unsigned char sc, mn;
-                if (sub < 4) {
-                    sc = sb[sub] & 0x3F;
-                    mn = sb[sub + 4] & 0x3F;
-                } else {
-                    sc = (sb[sub + 4] & 0x0F) | ((sb[sub - 4] >> 6) << 4);
-                    mn = (sb[sub + 4] >> 4) | ((sb[sub] >> 6) << 4);
+        // Stage As[BK][BM] — dequant the BM weight rows' sub-block kt. All BK=32
+        // weights of a (row, k-tile) live in the SAME super-block + sub-block
+        // (BK aligns to one), so unpack d/dmin/sc/mn ONCE per row and read the 32
+        // contiguous qs bytes — one thread per row (sbi = kt/8, sub-block = kt%8).
+        {
+            const int sbi = kt >> 3; // super-block (kt / 8)
+            const int s = kt & 7;    // sub-block within super-block (kt % 8)
+            const int hi = s & 1;    // odd sub-block -> high nibbles
+            for (int rl = tid; rl < RSL_Q4K_GEMM_BM; rl += nthreads) {
+                int mg = rowBase + rl;
+                float dsc = 0.0f, dm = 0.0f;
+                const unsigned char *qb = nullptr;
+                if (mg < M) {
+                    const unsigned char *blk = w + ((size_t)mg * bpr + sbi) * 144;
+                    float d = rsl_f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+                    float dmin = rsl_f16_bits_to_f32((unsigned short)blk[2] | ((unsigned short)blk[3] << 8));
+                    const unsigned char *sb = blk + 4;
+                    unsigned char sc, mn;
+                    if (s < 4) {
+                        sc = sb[s] & 0x3F;
+                        mn = sb[s + 4] & 0x3F;
+                    } else {
+                        sc = (sb[s + 4] & 0x0F) | ((sb[s - 4] >> 6) << 4);
+                        mn = (sb[s + 4] >> 4) | ((sb[s] >> 6) << 4);
+                    }
+                    dsc = d * (float)sc;
+                    dm = dmin * (float)mn;
+                    qb = blk + 16 + (s >> 1) * 32; // this sub-block's 32 qs bytes
                 }
-                val = d * (float)sc * (float)nib - dmin * (float)mn;
+#pragma unroll
+                for (int kk = 0; kk < RSL_Q4K_GEMM_BK; ++kk) {
+                    float val = 0.0f;
+                    if (mg < M) {
+                        unsigned char b = qb[kk];
+                        int nib = hi ? (b >> 4) : (b & 0x0F);
+                        val = dsc * (float)nib - dm;
+                    }
+                    As[kk][rl] = val;
+                }
             }
-            As[kk][rl] = val;
         }
         // Stage Bs[BK][BN] — the BN tokens' sub-block kt.
         for (int e = tid; e < RSL_Q4K_GEMM_BN * RSL_Q4K_GEMM_BK; e += nthreads) {
