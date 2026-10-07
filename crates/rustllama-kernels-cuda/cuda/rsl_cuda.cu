@@ -382,32 +382,47 @@ extern "C" int rsl_cuda_hadamard_forward(rsl_cuda_stream *s, const float *x_dev,
 }
 
 // ============================================================
-// K-quant packed matvecs (Q8_0 / Q4_K / Q6_K) — one thread per row,
-// device-pointer args. Byte-exact ports of the SYCL impls. A macro
-// generates the single + batched kernels + launchers from each `row_dot`.
+// K-quant packed matvecs (Q8_0 / Q4_K / Q6_K) — ONE WARP per row (32 lanes
+// cooperate over the k-dimension; coalesced loads + a shfl reduce), device-
+// pointer args. The dequant math is byte-exact with the SYCL/CPU reference,
+// just distributed across the warp's lanes. RSL_PACKED_MATVEC_WARP (below)
+// generates the single + batched kernels + launchers from each
+// `<fmt>_row_dot_warp(row, x, bpr, lane)`.
 // ============================================================
 
 // Q8_0: 34 B / 32-weight block { f16 scale, 32 i8 }. K % 32 == 0.
-__device__ __forceinline__ float q8_0_row_dot(const unsigned char *row,
-                                              const float *x, int bpr) {
+// Warp-cooperative: lane `t` owns weight `t` of every block, so the warp's 32
+// lanes read the 32 consecutive i8s (coalesced) + the 32 consecutive x floats
+// and each accumulates its per-block products into a lane partial. The caller
+// warp-reduces the 32 partials:
+//   sum_t sum_b scale_b * w[b,t] * x[b,t] = sum_b scale_b * dot_b = row dot.
+// (Summation order differs from the scalar reference → float reassociation,
+// within `doctor --cuda-parity` tolerance.)
+__device__ __forceinline__ float q8_0_row_dot_warp(const unsigned char *row,
+                                                   const float *x, int bpr,
+                                                   int lane) {
     float acc = 0.0f;
     for (int b = 0; b < bpr; ++b) {
         const unsigned char *blk = row + b * 34;
         unsigned short sb = (unsigned short)blk[0] | ((unsigned short)blk[1] << 8);
         float scale = rsl_f16_bits_to_f32(sb);
-        int xo = b * 32;
-        float dot = 0.0f;
-        for (int d = 0; d < 32; ++d) {
-            dot += (float)((signed char)blk[2 + d]) * x[xo + d];
-        }
-        acc += scale * dot;
+        float w = (float)((signed char)blk[2 + lane]);
+        acc += scale * w * x[b * 32 + lane];
     }
     return acc;
 }
 
 // Q4_K_M: 144 B / 256-weight super-block. K % 256 == 0.
-__device__ __forceinline__ float q4_k_row_dot(const unsigned char *row,
-                                              const float *x, int bpr) {
+// Warp-cooperative: the 256 weights of a super-block live in a 128-byte `qs`
+// field, which the warp splits as 4 coalesced passes — pass `iter` has lane
+// `t` read byte `t + 32*iter` (lanes 0..31 → consecutive bytes → one 128-byte
+// transaction). Each byte holds a lo/hi nibble; the group (scale/min selector)
+// and x indices are byte_idx>>5 / &31 — byte-exact the same weight→scale→x
+// mapping as the scalar reference, just partitioned across lanes (so the final
+// warp-reduce sum reproduces the row dot, modulo float reassociation).
+__device__ __forceinline__ float q4_k_row_dot_warp(const unsigned char *row,
+                                                   const float *x, int bpr,
+                                                   int lane) {
     float acc = 0.0f;
     for (int b = 0; b < bpr; ++b) {
         const unsigned char *blk = row + b * 144;
@@ -415,6 +430,9 @@ __device__ __forceinline__ float q4_k_row_dot(const unsigned char *row,
         unsigned short m_bits = (unsigned short)blk[2] | ((unsigned short)blk[3] << 8);
         float d = rsl_f16_bits_to_f32(d_bits);
         float dmin = rsl_f16_bits_to_f32(m_bits);
+        // Inline 6-bit scale/min unpack (ggml get_scale_min_k4) — kept inline
+        // rather than calling rsl_unpack_q4k_scales (defined further down) so
+        // this stays a forward-reference-free self-contained device function.
         const unsigned char *sb = blk + 4;
         unsigned char sc[8], mn[8];
         for (int j = 0; j < 8; ++j) {
@@ -428,29 +446,36 @@ __device__ __forceinline__ float q4_k_row_dot(const unsigned char *row,
         }
         const unsigned char *qs = blk + 16;
         const int x_base = b * 256;
-        for (int group = 0; group < 4; ++group) {
-            const unsigned char *qc = qs + group * 32;
+#pragma unroll
+        for (int iter = 0; iter < 4; ++iter) {
+            int byte_idx = lane + 32 * iter; // 0..127
+            int group = byte_idx >> 5;       // 0..3
+            int l = byte_idx & 31;           // 0..31
+            unsigned char qb = qs[byte_idx];
+            float q_lo = (float)(qb & 0x0F);
+            float q_hi = (float)(qb >> 4);
             float d_lo = d * (float)sc[group * 2];
             float m_lo = dmin * (float)mn[group * 2];
             float d_hi = d * (float)sc[group * 2 + 1];
             float m_hi = dmin * (float)mn[group * 2 + 1];
-            int x_lo = x_base + group * 64;
+            int x_lo = x_base + group * 64 + l;
             int x_hi = x_lo + 32;
-            for (int l = 0; l < 32; ++l) {
-                unsigned char qb = qc[l];
-                float q_lo = (float)(qb & 0x0F);
-                float q_hi = (float)(qb >> 4);
-                acc += (d_lo * q_lo - m_lo) * x[x_lo + l];
-                acc += (d_hi * q_hi - m_hi) * x[x_hi + l];
-            }
+            acc += (d_lo * q_lo - m_lo) * x[x_lo];
+            acc += (d_hi * q_hi - m_hi) * x[x_hi];
         }
     }
     return acc;
 }
 
 // Q6_K: 210 B / 256-weight super-block. K % 256 == 0.
-__device__ __forceinline__ float q6_k_row_dot(const unsigned char *row,
-                                              const float *x, int bpr) {
+// Warp-cooperative: the scalar reference walks (n in 0..2) × (l in 0..32) = 64
+// inner iterations, each emitting 4 weights (q1..q4) → 256. The warp maps lane
+// `t` → l=t and runs the two n passes, so the 32 lanes read ql/qh/x at
+// consecutive offsets (coalesced) and each lane accumulates its 2×4 = 8
+// weights' products; the caller warp-reduces the 32 partials to the row dot.
+__device__ __forceinline__ float q6_k_row_dot_warp(const unsigned char *row,
+                                                   const float *x, int bpr,
+                                                   int lane) {
     float acc = 0.0f;
     for (int b = 0; b < bpr; ++b) {
         const unsigned char *blk = row + b * 210;
@@ -460,24 +485,24 @@ __device__ __forceinline__ float q6_k_row_dot(const unsigned char *row,
         unsigned short d_bits = (unsigned short)blk[208] | ((unsigned short)blk[209] << 8);
         float d = rsl_f16_bits_to_f32(d_bits);
         int x_base = b * 256;
+        int l = lane; // 0..31
+#pragma unroll
         for (int n = 0; n < 2; ++n) {
-            for (int l = 0; l < 32; ++l) {
-                int is = l / 16 + n * 8;
-                int qh_byte = qh[32 * n + l];
-                int q1 = ((int)(ql[64 * n + l] & 0x0F) | (((qh_byte >> 0) & 0x03) << 4)) - 32;
-                int q2 = ((int)(ql[64 * n + l + 32] & 0x0F) | (((qh_byte >> 2) & 0x03) << 4)) - 32;
-                int q3 = ((int)(ql[64 * n + l] >> 4) | (((qh_byte >> 4) & 0x03) << 4)) - 32;
-                int q4 = ((int)(ql[64 * n + l + 32] >> 4) | (((qh_byte >> 6) & 0x03) << 4)) - 32;
-                float s0 = (float)scales[is];
-                float s1 = (float)scales[is + 2];
-                float s2 = (float)scales[is + 4];
-                float s3 = (float)scales[is + 6];
-                int base = n * 128 + l;
-                acc += d * s0 * (float)q1 * x[x_base + base];
-                acc += d * s1 * (float)q2 * x[x_base + base + 32];
-                acc += d * s2 * (float)q3 * x[x_base + base + 64];
-                acc += d * s3 * (float)q4 * x[x_base + base + 96];
-            }
+            int is = l / 16 + n * 8;
+            int qh_byte = qh[32 * n + l];
+            int q1 = ((int)(ql[64 * n + l] & 0x0F) | (((qh_byte >> 0) & 0x03) << 4)) - 32;
+            int q2 = ((int)(ql[64 * n + l + 32] & 0x0F) | (((qh_byte >> 2) & 0x03) << 4)) - 32;
+            int q3 = ((int)(ql[64 * n + l] >> 4) | (((qh_byte >> 4) & 0x03) << 4)) - 32;
+            int q4 = ((int)(ql[64 * n + l + 32] >> 4) | (((qh_byte >> 6) & 0x03) << 4)) - 32;
+            float s0 = (float)scales[is];
+            float s1 = (float)scales[is + 2];
+            float s2 = (float)scales[is + 4];
+            float s3 = (float)scales[is + 6];
+            int base = n * 128 + l;
+            acc += d * s0 * (float)q1 * x[x_base + base];
+            acc += d * s1 * (float)q2 * x[x_base + base + 32];
+            acc += d * s2 * (float)q3 * x[x_base + base + 64];
+            acc += d * s3 * (float)q4 * x[x_base + base + 96];
         }
     }
     return acc;
@@ -533,9 +558,74 @@ __device__ __forceinline__ float q6_k_row_dot(const unsigned char *row,
         return rsl_cuda_check("rsl_cuda_" #NAME "_batched");                 \
     }
 
-RSL_PACKED_MATVEC(matvec_q8_0_packed_f32, q8_0_row_dot, 32, 34, 32)
-RSL_PACKED_MATVEC(matvec_q4_k_packed_f32, q4_k_row_dot, 256, 144, 256)
-RSL_PACKED_MATVEC(matvec_q6_k_packed_f32, q6_k_row_dot, 256, 210, 256)
+// Warp-cooperative variant of RSL_PACKED_MATVEC: ONE WARP (32 lanes) per output
+// row instead of one thread. Each lane accumulates a partial over its share of
+// the k-dimension via `<name>_row_dot_warp(row, x, bpr, lane)` (coalesced loads
+// — adjacent lanes touch adjacent bytes), then the warp shfl-reduces to the row
+// dot. This is the decode-perf fix: the scalar one-thread-per-row kernels were
+// compute-bound at ~26% memory-bandwidth utilization (uncoalesced per-row reads
+// + serial dequant on one thread); the warp form coalesces the weight stream
+// and parallelizes the dequant 32×. Launch = 8 warps/block (block = 32×8); a
+// warp is a fixed threadIdx.y with threadIdx.x the lane, so all 32 lanes share
+// one row and the 0xffffffff shfl mask is always full.
+#define RSL_PACKED_MATVEC_WARP(NAME, ROWDOTWARP, KMOD, BPB, EPB)               \
+    __global__ void NAME##_kernel(const unsigned char *w, const float *x,     \
+                                  float *out, int M, int K) {                 \
+        int row = blockIdx.x * blockDim.y + threadIdx.y;                      \
+        if (row >= M) return;                                                 \
+        int lane = threadIdx.x;                                               \
+        int bpr = K / (EPB);                                                  \
+        float acc = ROWDOTWARP(w + (size_t)row * bpr * (BPB), x, bpr, lane);  \
+        for (int off = warpSize >> 1; off > 0; off >>= 1)                     \
+            acc += __shfl_down_sync(0xffffffffu, acc, off);                   \
+        if (lane == 0) out[row] = acc;                                        \
+    }                                                                         \
+    __global__ void NAME##_batched_kernel(const unsigned char *w,            \
+                                          const float *x, float *out, int M,  \
+                                          int K, int N) {                     \
+        int row = blockIdx.x * blockDim.y + threadIdx.y;                      \
+        if (row >= M) return;                                                 \
+        int lane = threadIdx.x;                                               \
+        int bpr = K / (EPB);                                                  \
+        const unsigned char *rowp = w + (size_t)row * bpr * (BPB);            \
+        /* grid.y strides the batch (capped at 65535). */                     \
+        for (int n = blockIdx.y; n < N; n += gridDim.y) {                    \
+            float acc = ROWDOTWARP(rowp, x + (size_t)n * K, bpr, lane);       \
+            for (int off = warpSize >> 1; off > 0; off >>= 1)                 \
+                acc += __shfl_down_sync(0xffffffffu, acc, off);              \
+            if (lane == 0) out[(size_t)n * M + row] = acc;                    \
+        }                                                                     \
+    }                                                                         \
+    extern "C" int rsl_cuda_##NAME(rsl_cuda_stream *s, const void *w,         \
+                                   const float *x, float *out, int M, int K) {\
+        if (!s || !w || !x || !out || M <= 0 || K <= 0 || (K % (KMOD)) != 0)  \
+            return -1;                                                        \
+        cudaSetDevice(s->device);                                            \
+        dim3 block(32, 8);                                                    \
+        dim3 grid((unsigned)((M + 7) / 8));                                   \
+        NAME##_kernel<<<grid, block, 0, s->stream>>>(                        \
+            (const unsigned char *)w, x, out, M, K);                          \
+        return rsl_cuda_check("rsl_cuda_" #NAME);                            \
+    }                                                                         \
+    extern "C" int rsl_cuda_##NAME##_batched(rsl_cuda_stream *s,             \
+                                             const void *w, const float *x,   \
+                                             float *out, int M, int K,        \
+                                             int N) {                         \
+        if (!s || !w || !x || !out || M <= 0 || K <= 0 || N <= 0 ||          \
+            (K % (KMOD)) != 0)                                                \
+            return -1;                                                        \
+        cudaSetDevice(s->device);                                            \
+        unsigned gy = (unsigned)(N < 65535 ? N : 65535);                     \
+        dim3 block(32, 8);                                                    \
+        dim3 grid((unsigned)((M + 7) / 8), gy);                              \
+        NAME##_batched_kernel<<<grid, block, 0, s->stream>>>(                \
+            (const unsigned char *)w, x, out, M, K, N);                       \
+        return rsl_cuda_check("rsl_cuda_" #NAME "_batched");                 \
+    }
+
+RSL_PACKED_MATVEC_WARP(matvec_q8_0_packed_f32, q8_0_row_dot_warp, 32, 34, 32)
+RSL_PACKED_MATVEC_WARP(matvec_q4_k_packed_f32, q4_k_row_dot_warp, 256, 144, 256)
+RSL_PACKED_MATVEC_WARP(matvec_q6_k_packed_f32, q6_k_row_dot_warp, 256, 210, 256)
 
 // ============================================================
 // Additional packed matvecs (byte-exact ports of the CPU reference
@@ -548,7 +638,7 @@ RSL_PACKED_MATVEC(matvec_q6_k_packed_f32, q6_k_row_dot, 256, 210, 256)
 
 // ---- K-quant scale unpack (ggml get_scale_min_k4): 12 packed bytes ->
 // eight 6-bit `sc` (scales) + eight 6-bit `mn` (mins). Same code as the
-// inline unpack in q4_k_row_dot; shared by Q5_K (Q4_K keeps its inline copy).
+// inline unpack in q4_k_row_dot_warp; shared by Q5_K (Q4_K keeps its inline copy).
 __device__ __forceinline__ void rsl_unpack_q4k_scales(const unsigned char *sb,
                                                       unsigned char sc[8],
                                                       unsigned char mn[8]) {
