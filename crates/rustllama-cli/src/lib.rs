@@ -5651,13 +5651,25 @@ fn cmd_tune_placement(
         (candidates[0].n_gpu_layers, None)
     };
 
-    // Persist the measured winner to the tuner cache so a future
-    // consumer-side hook can read it back without re-running the
-    // sweep. Only fires when measurement actually ran AND produced
-    // a winner — the static recommendation isn't trustworthy enough
-    // to cache. Best-effort: cache failures are warned and don't
-    // fail the command.
-    if let Some(n) = measured_winner {
+    // Persist the chosen placement to the tuner cache so a future consumer-side
+    // hook — and the first-load autotune gate (`server::autotune::is_untuned`,
+    // keyed on this same per-model stem) — can read it back without re-running
+    // the sweep. Fires when EITHER measurement produced a winner, OR the GPU has
+    // dedicated VRAM, where the static most-GPU-that-fits pick (row 0) is always
+    // the right answer (the per-candidate micro-bench is skipped there precisely
+    // because it adds no information). On a shared-LPDDR INTEGRATED GPU without
+    // `--measure` we still decline to cache — the static recommendation isn't
+    // trustworthy there (it needs the decode sweep). Best-effort: a cache
+    // failure is warned and doesn't fail the command.
+    //
+    // This is the fix for the dedicated-VRAM friction: previously `measure` was
+    // forced off on a dedicated GPU, so `measured_winner` was always `None` and
+    // nothing was persisted — `is_untuned` stayed true forever and `serve`
+    // re-ran the full first-load sweep on EVERY load. Now a single fast
+    // `tune --placement` (and the Stage-5 sub-stage of `tune --all`, which calls
+    // this) persists the pick and `serve` skips the sweep thereafter.
+    let persist_n = measured_winner.or(if dedicated { Some(winner_n_gpu) } else { None });
+    if let Some(n) = persist_n {
         let model_key = model_path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -5675,7 +5687,7 @@ fn cmd_tune_placement(
         winner_n_gpu,
         config_path.display()
     );
-    if !measure {
+    if !measure && !dedicated {
         println!();
         println!(
             "tip: pass `--measure` to actually time each candidate — the static \
