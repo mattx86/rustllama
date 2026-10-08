@@ -1171,13 +1171,22 @@ impl CpuEngine {
         // decode/prefill kernels the dense path uses.
         //
         // We still DEFAULT hybrids to F32 for coherence: the low-bit
-        // Q8_0/TQ/NVFP4 arms lack the Q4_0 arm's whitening/calibration
-        // and are unvalidated on the SSM+attention hybrid, while the
-        // workspace default kv_dtype is "tq4". So an unqualified
-        // low-bit request on a hybrid is coerced to F32 (Q4_0 is
-        // honored as-is — it has the tuned arm). Opt into an arbitrary
-        // quantized hybrid KV cache with `RUSTLLAMA_HYBRID_KV_ANY=1`,
-        // which honors the configured dtype verbatim.
+        // Q8_0/TQ/NVFP4/MXFP arms lack the Q4_0 arm's whitening/
+        // calibration and are not individually validated on the
+        // SSM+attention hybrid. So an UNVALIDATED low-bit request on a
+        // hybrid is coerced to F32 (Q4_0 is honored as-is — it has the
+        // tuned arm).
+        //
+        // `RUSTLLAMA_HYBRID_KV_ANY` lifts that coercion — but it is now
+        // driven by the AUTOTUNE, not the user. The `tune --kv-dtype`
+        // sweep measures the FULL candidate grid on hybrids and its
+        // coherence gate rejects dtypes that diverge from the f32
+        // reference (e.g. 1-bit tq1) while adopting coherent ones. The
+        // sweep sets this flag during its own measurement, and the serve
+        // load sets it when it applies a coherence-VALIDATED cache winner
+        // — so a validated quant hybrid KV is honored verbatim here while
+        // an unqualified one still falls to F32. (A user may still set it
+        // manually to force an un-swept dtype.)
         let hybrid_kv_any = std::env::var_os("RUSTLLAMA_HYBRID_KV_ANY").is_some();
         let kv_dtype = if model.weights.is_hybrid()
             && !hybrid_kv_any

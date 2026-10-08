@@ -449,7 +449,7 @@ impl Scheduler for SingleFlightScheduler {
 /// one kernel call — needs the paged-attention SYCL/CPU kernels that
 /// land alongside `rustllama-kernels-sycl::rsl_paged_attention`. Until
 /// those ship, each slot runs on an independent
-/// [`crate::cpu::CpuEngine::fork_for_concurrent_use`] handle and the
+/// [`crate::inference::CpuEngine::fork_for_concurrent_use`] handle and the
 /// per-slot generation loops run in parallel on CPU cores — real
 /// throughput gains without the fused kernel.
 pub struct MultiFlightScheduler {
@@ -613,7 +613,7 @@ impl PagedKv {
 /// independent generation loops.
 ///
 /// Scaffold-stage today: the actual fused forward kernel doesn't
-/// exist yet. Wiring this scheduler into [`crate::cpu::CpuEngine`]
+/// exist yet. Wiring this scheduler into [`crate::inference::CpuEngine`]
 /// requires the paged-attention SIMD work that ships in a follow-up.
 /// The structures are here so server admission can target it without
 /// churn at switchover time.

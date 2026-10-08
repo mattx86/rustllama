@@ -14,7 +14,7 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 pub mod batch_scheduler;
-pub mod cpu;
+pub mod inference;
 pub mod expert_cache;
 pub mod grammar;
 pub mod kv_backend;
@@ -33,7 +33,7 @@ pub mod sycl_accel;
 pub mod sycl_resources;
 pub mod tool_grammar;
 
-pub use cpu::{CpuEngine, CpuEngineError};
+pub use inference::{CpuEngine, CpuEngineError};
 pub use rustllama_models::imatrix_collect;
 pub use rustllama_models::kv_bias;
 pub use rustllama_models::llama_arch::kv_whitening_active_for;
@@ -250,7 +250,7 @@ pub struct Metrics {
 }
 
 /// Per-request performance + cache-hit stats, captured at the end of
-/// each generation. Read via [`crate::cpu::CpuEngine::last_request_stats`]
+/// each generation. Read via [`crate::inference::CpuEngine::last_request_stats`]
 /// while the request's server-gate permit is still held — the
 /// serial-by-default Semaphore(1) per model means no other request
 /// can clobber the snapshot between handler reading it and writing it

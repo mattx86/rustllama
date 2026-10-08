@@ -1,8 +1,8 @@
 //! Continuous-batching engine over a shared paged KV pool.
 //!
-//! [`crate::cpu::CpuEngine`] is the single-request workhorse:
+//! [`crate::inference::CpuEngine`] is the single-request workhorse:
 //! one model + one KV backend serving one generation at a time.
-//! The server's [`crate::cpu::CpuEngine::fork_for_concurrent_use`]
+//! The server's [`crate::inference::CpuEngine::fork_for_concurrent_use`]
 //! gives M concurrent requests via M independent forks — real
 //! parallelism on the orchestration side but each fork issues its
 //! own kernel launches (M × launches per decode step).
@@ -30,7 +30,7 @@
 //! What lands in 3.7e:
 //!   - Async streaming entry (`generate_chat_streaming` / SSE) so
 //!     the server can route admitted requests into this engine
-//!     instead of into per-fork [`crate::cpu::CpuEngine`]s when
+//!     instead of into per-fork [`crate::inference::CpuEngine`]s when
 //!     `[server].fused_decode = true`.
 //!   - Scheduler integration: per-slot lifecycle events
 //!     (`Scheduler::admit` on request start, `complete` on EOS /
@@ -51,7 +51,7 @@ use rustllama_models::paged_kv_store::PagedKvStore;
 use rustllama_models::shared_paged_kv::SharedPagedKv;
 use rustllama_tokenizer::{ChatMessage as TokChat, Tokenizer};
 
-use crate::cpu::CpuEngineError;
+use crate::inference::CpuEngineError;
 use crate::sampling::Sampler;
 use crate::{
     ChatMessage, Engine, EngineError, Metrics, RequestStats, Result as EngineResult,
@@ -354,7 +354,7 @@ impl PagedBatchEngine {
     ///   - Stop conditions: per-request `max_tokens` or EOS token
     ///     from the model config. String stop sequences and grammar
     ///     constraints are not yet plumbed through — defer to
-    ///     [`crate::cpu::CpuEngine`] for those today.
+    ///     [`crate::inference::CpuEngine`] for those today.
     ///   - Request count must be `<= max_slots`. Exceeding it
     ///     returns an error rather than queuing (queueing is the
     ///     scheduler's job in 3.7e).

@@ -17,7 +17,7 @@ use std::path::Path;
 
 use rustllama_tuner::PlacementPlan;
 
-use crate::cpu::CpuEngine;
+use crate::inference::CpuEngine;
 use crate::SamplingParams;
 use rustllama_models::llama_arch::KvDtype;
 
