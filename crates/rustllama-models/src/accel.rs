@@ -6701,6 +6701,58 @@ pub fn cuda_decode_seed_kv_q4_0(
     )
 }
 
+/// Seed the CUDA NVFP4 decode mirror (embedded block scales). See
+/// [`cuda_decode_seed_kv_quant`].
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_decode_seed_kv_nvfp4(
+    k_packed: &[u8], v_packed: &[u8], layer_idx: usize, pos: u32,
+    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+) -> bool {
+    cuda_decode_seed_kv_quant(
+        QuantKv::Nvfp4, k_packed, v_packed, None, None, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// Seed the CUDA MXFP4 decode mirror (embedded E8M0 block scales). See
+/// [`cuda_decode_seed_kv_quant`].
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_decode_seed_kv_mxfp4(
+    k_packed: &[u8], v_packed: &[u8], layer_idx: usize, pos: u32,
+    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+) -> bool {
+    cuda_decode_seed_kv_quant(
+        QuantKv::Mxfp4, k_packed, v_packed, None, None, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// Seed the CUDA MXFP6 decode mirror (embedded E8M0 block scales). See
+/// [`cuda_decode_seed_kv_quant`].
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_decode_seed_kv_mxfp6(
+    k_packed: &[u8], v_packed: &[u8], layer_idx: usize, pos: u32,
+    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+) -> bool {
+    cuda_decode_seed_kv_quant(
+        QuantKv::Mxfp6, k_packed, v_packed, None, None, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// Seed the CUDA MXFP8 decode mirror (embedded E8M0 block scales). See
+/// [`cuda_decode_seed_kv_quant`].
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_decode_seed_kv_mxfp8(
+    k_packed: &[u8], v_packed: &[u8], layer_idx: usize, pos: u32,
+    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+) -> bool {
+    cuda_decode_seed_kv_quant(
+        QuantKv::Mxfp8, k_packed, v_packed, None, None, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
 /// Shared body for every native-CUDA quantized-KV decode helper. Mirrors
 /// [`try_flash_attn_decode_usm_quant`] (same shape gate, same CPU
 /// quantizers, same epoch/valid-len gate): quantizes ONLY the new row into

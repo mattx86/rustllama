@@ -3610,6 +3610,20 @@ fn mxfp_kv_decode(
     }
     let k_rows = &k_buf[..n_kv_heads * head_dim];
     let v_rows = &v_buf[..n_kv_heads * head_dim];
+    // Seed the CUDA decode mirror with the prefill history on the first decode
+    // step (no-op once resident); host k_packed/v_packed are byte-identical to
+    // the mirror, so a direct copy is correct. Without it the mirror gap
+    // declines and decode runs on CPU for the whole generation.
+    #[allow(clippy::type_complexity)]
+    let seed_fn: fn(&[u8], &[u8], usize, u32, u32, u32, u32, u32, u32) -> bool = match fmt {
+        KvDtype::Mxfp4 => crate::accel::cuda_decode_seed_kv_mxfp4,
+        KvDtype::Mxfp6 => crate::accel::cuda_decode_seed_kv_mxfp6,
+        _ => crate::accel::cuda_decode_seed_kv_mxfp8,
+    };
+    seed_fn(
+        &k_packed[..], &v_packed[..], li, cur_pos as u32,
+        n_heads as u32, n_kv_heads as u32, head_dim as u32, max_ctx as u32, n_layers as u32,
+    );
     #[allow(clippy::type_complexity)]
     let gpu_fn: fn(&[f32], &[f32], &[f32], &mut [f32], usize, u32, u32, u32, u32, u32, u32) -> bool =
         match fmt {
@@ -7707,6 +7721,20 @@ impl LlamaModel {
                     // applies as F32 / Q8_0 / TQ.
                     // GPU quant-KV flash decode first (USM). Decline →
                     // CPU flash/slab split below over the host slab.
+                    // Seed the CUDA decode mirror with the prefill history on
+                    // the first decode step (no-op once resident); host
+                    // k_packed/v_packed are byte-identical to the mirror.
+                    crate::accel::cuda_decode_seed_kv_nvfp4(
+                        &k_packed[..],
+                        &v_packed[..],
+                        layer_idx,
+                        cur_pos as u32,
+                        n_heads as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        max_ctx as u32,
+                        cfg.n_layers as u32,
+                    );
                     if !crate::accel::try_flash_attn_decode_gpu_nvfp4(
                         &q_buf,
                         &k_buf,
