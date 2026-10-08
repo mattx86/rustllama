@@ -763,6 +763,12 @@ const QUANT_KV_FORMATS: &[QuantKvFormat] = &[
     QuantKvFormat { name: "mxfp6", block_elems: 32, block_bytes: 25, cos_min: 0.980, rel_max: 0.25 },
     QuantKvFormat { name: "mxfp8", block_elems: 32, block_bytes: 33, cos_min: 0.995, rel_max: 0.10 },
     QuantKvFormat { name: "nvfp4", block_elems: 16, block_bytes: 9, cos_min: 0.970, rel_max: 0.30 },
+    // Q4_0 KV (ggml 18B/32 block, embedded f16 scale) — live on all three GPU
+    // flash-decode/prefill backends but previously ungraded. 4-bit, so the same
+    // tolerance band as mxfp4. Formats with SEPARATE per-row scales (Q8_0 / TQ)
+    // don't fit this block struct and are a follow-up (they need a scales
+    // buffer threaded through the probe + the kernel call).
+    QuantKvFormat { name: "q4_0", block_elems: 32, block_bytes: 18, cos_min: 0.930, rel_max: 0.60 },
 ];
 
 /// Look up a quant-KV format by the suffix of an `attn:{decode,prefill}_*`
@@ -799,6 +805,9 @@ fn quantize_kv_cache(
                     "mxfp6" => k::mxfp_kv::quantize_block_mxfp6(e, o),
                     "mxfp8" => k::mxfp_kv::quantize_block_mxfp8(e, o),
                     "nvfp4" => k::nvfp4::quantize_block(e, o),
+                    // One 32-elem Q4_0 block (quantize_row handles exactly a
+                    // multiple of 32 → here, a single 18B block).
+                    "q4_0" => k::q4_0_kv::quantize_row(e, o),
                     _ => unreachable!("unknown quant-KV format {}", fmt.name),
                 }
             }
@@ -842,6 +851,9 @@ fn dequant_kv_cache(
                         );
                     }
                 }
+                // q4_0 decodes a whole row (dequantize_row handles head_dim/32
+                // blocks), inverse of the quantize_row used above.
+                "q4_0" => k::q4_0_kv::dequantize_row(prow, orow),
                 _ => unreachable!("unknown quant-KV format {}", fmt.name),
             }
         }
@@ -1129,12 +1141,22 @@ fn probe_attn_quant_kv(
         let q: Vec<f32> = (0..AT_HEADS * AT_HEAD_DIM)
             .map(|_| rng.f32_pm(0.6))
             .collect();
-        // Full-precision reference on the UN-quantized K/V.
+        // Quantize K/V into the packed block layout the kernel decodes.
+        let kp = quantize_kv_cache(fmt, &kcache, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
+        let vp = quantize_kv_cache(fmt, &vcache, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
+        // SAME-QUANT reference (Phase 2): dequantize the IDENTICAL packed K/V and
+        // run the f32 attention on THAT, so max_rel isolates the kernel's
+        // FMA/expf reassociation from the KV QUANTIZATION LOSS. The old
+        // full-precision f32-KV reference measured the quant loss instead, which
+        // flagged every SYCL quant-KV format as a false MISCOMPUTE (cos > 0.99,
+        // large max_rel). Matches the CUDA probe's reference.
+        let kc_dq = dequant_kv_cache(fmt, &kp, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
+        let vc_dq = dequant_kv_cache(fmt, &vp, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
         let mut cpu_out = vec![0f32; AT_HEADS * AT_HEAD_DIM];
         k::gqa_attention_one_step(
             &q,
-            &kcache,
-            &vcache,
+            &kc_dq,
+            &vc_dq,
             &mut cpu_out,
             AT_HEADS,
             AT_KV_HEADS,
@@ -1142,9 +1164,6 @@ fn probe_attn_quant_kv(
             AT_MAX_CTX,
             AT_KV_LEN,
         );
-        // Quantize K/V into the packed block layout the kernel decodes.
-        let kp = quantize_kv_cache(fmt, &kcache, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
-        let vp = quantize_kv_cache(fmt, &vcache, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
         let alloc = (|| -> sk::Result<_> {
             let mut qb = sk::SyclSharedBuffer::<f32>::alloc(stream, q.len())?;
             qb.as_mut_slice().copy_from_slice(&q);
@@ -1189,6 +1208,11 @@ fn probe_attn_quant_kv(
                     AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
                     AT_MAX_CTX as u32, AT_KV_LEN as u32,
                 ),
+                "q4_0" => sk::flash_attn_decode_q4_0_usm_raw(
+                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
+                    AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
+                    AT_MAX_CTX as u32, AT_KV_LEN as u32,
+                ),
                 _ => {
                     emit(name, "SKIP", "unknown-format");
                     return;
@@ -1222,12 +1246,18 @@ fn probe_attn_quant_kv(
         let q: Vec<f32> = (0..AT_PREFILL_NEW * AT_HEADS * AT_HEAD_DIM)
             .map(|_| rng.f32_pm(0.6))
             .collect();
-        // Full-precision reference on the UN-quantized K/V.
+        let kp = quantize_kv_cache(fmt, &kcache, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
+        let vp = quantize_kv_cache(fmt, &vcache, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
+        // SAME-QUANT reference (Phase 2) — see the decode arm above: grade the
+        // kernel against a dequantized round-trip of the identical packed K/V so
+        // max_rel reflects kernel reassociation, not quantization loss.
+        let kc_dq = dequant_kv_cache(fmt, &kp, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
+        let vc_dq = dequant_kv_cache(fmt, &vp, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
         let mut cpu_out = vec![0f32; q.len()];
         k::gqa_attention_flash_prefill(
             &q,
-            &kcache,
-            &vcache,
+            &kc_dq,
+            &vc_dq,
             &mut cpu_out,
             AT_HEADS,
             AT_KV_HEADS,
@@ -1236,8 +1266,6 @@ fn probe_attn_quant_kv(
             AT_PREFILL_BASE,
             AT_PREFILL_NEW,
         );
-        let kp = quantize_kv_cache(fmt, &kcache, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
-        let vp = quantize_kv_cache(fmt, &vcache, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
         let alloc = (|| -> sk::Result<_> {
             let mut qb = sk::SyclSharedBuffer::<f32>::alloc(stream, q.len())?;
             qb.as_mut_slice().copy_from_slice(&q);
@@ -1276,6 +1304,11 @@ fn probe_attn_quant_kv(
                     AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
                 ),
                 "nvfp4" => sk::flash_attn_prefill_nvfp4_usm_raw(
+                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
+                    AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
+                    AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
+                ),
+                "q4_0" => sk::flash_attn_prefill_q4_0_usm_raw(
                     stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
                     AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
                     AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
@@ -1720,8 +1753,16 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
     let mut counts: std::collections::BTreeMap<&'static str, usize> = Default::default();
 
     // ---- Packed matvecs the CUDA backend implements ----
-    // (K constraints: ptq1_0 %128, q8_0 %32, q4_k/q6_k %256 — MV_K=2048 ok.)
-    for dtype in ["ptq1_0", "q8_0", "q4_k", "q6_k", "mxfp4", "mxfp6", "mxfp8"] {
+    // All 17 packed formats SYCL + Metal grade — CUDA ships + dispatches the
+    // same set, so grade them all here too. Previously only the first 7 ran,
+    // leaving q5_k + the IQ grid/codebook dequants (historically the trickiest,
+    // and write-blind) UNCHECKED on CUDA. K constraints (ptq1_0 %128, q8_0 %32,
+    // the rest %256 or %32) are all satisfied by MV_K=2048.
+    for dtype in [
+        "ptq1_0", "q8_0", "q4_k", "q6_k", "mxfp4", "mxfp6", "mxfp8", "q5_k",
+        "iq4_nl", "iq4_xs", "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs", "iq2_s",
+        "iq3_xxs", "iq3_s",
+    ] {
         let name = format!("matvec:{dtype}");
         let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
         let x = gen_x(MV_K, 42);
@@ -1753,6 +1794,16 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 "mxfp4" => ck::matvec_mxfp4_packed_f32(&stream, w, x, o, MV_M, MV_K),
                 "mxfp6" => ck::matvec_mxfp6_packed_f32(&stream, w, x, o, MV_M, MV_K),
                 "mxfp8" => ck::matvec_mxfp8_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "q5_k" => ck::matvec_q5_k_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "iq4_nl" => ck::matvec_iq4_nl_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "iq4_xs" => ck::matvec_iq4_xs_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "iq1_s" => ck::matvec_iq1_s_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "iq1_m" => ck::matvec_iq1_m_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "iq2_xxs" => ck::matvec_iq2_xxs_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "iq2_xs" => ck::matvec_iq2_xs_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "iq2_s" => ck::matvec_iq2_s_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "iq3_xxs" => ck::matvec_iq3_xxs_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "iq3_s" => ck::matvec_iq3_s_packed_f32(&stream, w, x, o, MV_M, MV_K),
                 _ => unreachable!(),
             }
         };
@@ -2442,6 +2493,9 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                         "nvfp4" => ck::flash_attn_decode_nvfp4(
                             &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
                         ),
+                        "q4_0" => ck::flash_attn_decode_q4_0(
+                            &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                        ),
                         _ => unreachable!(),
                     }
                 };
@@ -2488,6 +2542,10 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                             n_new,
                         ),
                         "nvfp4" => ck::flash_attn_prefill_nvfp4(
+                            &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base,
+                            n_new,
+                        ),
+                        "q4_0" => ck::flash_attn_prefill_q4_0(
                             &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base,
                             n_new,
                         ),
