@@ -6512,6 +6512,195 @@ pub fn cuda_decode_seed_kv_f32(
     })
 }
 
+/// Seed the native-CUDA QUANTIZED-KV decode mirror with the prefill history
+/// for a layer — upload the already-quantized rows `[valid..pos)` straight from
+/// the host KV cache. The quant decode path re-quantizes each new row into its
+/// device mirror with the SAME CPU quantizer the host slab uses, so the host
+/// packed bytes (+ per-row scales, for formats that have them) are
+/// BYTE-IDENTICAL to the mirror — a direct copy, no re-quantize. Without this,
+/// the quant decode path's gap check (`pos > valid`) declines for the whole
+/// generation after a prefill (the same trap the F32 path had), so quant-KV
+/// decode attention runs on the CPU. Call once per layer at the prefill→decode
+/// boundary; a no-op once resident. `k_packed`/`v_packed` are the host packed
+/// slabs (`[n_kv_heads, max_ctx, fmt.bytes_per_row(head_dim)]`);
+/// `k_scales`/`v_scales` are the host per-row scale slabs
+/// (`[n_kv_heads, max_ctx]` f32) and MUST be `Some` iff `fmt.has_scales()`.
+#[allow(clippy::too_many_arguments)]
+fn cuda_decode_seed_kv_quant(
+    fmt: QuantKv,
+    k_packed: &[u8],
+    v_packed: &[u8],
+    k_scales: Option<&[f32]>,
+    v_scales: Option<&[f32]>,
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    if !cuda_active() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    let cfg = CudaAttnConfig { n_layers, n_heads, n_kv_heads, head_dim, max_ctx };
+    let hd = head_dim as usize;
+    let n_kv = n_kv_heads as usize;
+    let mc = max_ctx as usize;
+    let posu = pos as usize;
+    if n_kv == 0 || layer_idx >= n_layers as usize || posu > mc {
+        return false;
+    }
+    let bytes_per_row = fmt.bytes_per_row(hd);
+    let mirror_len = n_kv * mc * bytes_per_row;
+    let scales_len = n_kv * mc;
+    let has_scales = fmt.has_scales();
+    if k_packed.len() < mirror_len || v_packed.len() < mirror_len {
+        return false;
+    }
+    if has_scales {
+        match (k_scales, v_scales) {
+            (Some(ks), Some(vs)) if ks.len() >= scales_len && vs.len() >= scales_len => {}
+            _ => return false,
+        }
+    }
+    CUDA_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let needs_rebuild = match slot.as_ref() {
+            Some(ctx) => ctx.cfg != cfg,
+            None => true,
+        };
+        if needs_rebuild {
+            *slot = CudaAttnContext::try_new(cfg);
+            if slot.is_none() {
+                return false;
+            }
+        }
+        let ctx = slot.as_mut().expect("cuda ctx just built");
+        let epoch = USM_KV_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if ctx.kv_epoch_q != epoch {
+            for vl in ctx.kv_valid_len_q.iter_mut() {
+                *vl = 0;
+            }
+            ctx.kv_epoch_q = epoch;
+        }
+        // A format change for this layer re-allocates the packed mirror (+
+        // scales) and resets its valid range, mirroring the decode path's gate
+        // — so the decode call that follows won't realloc and wipe the seeded
+        // rows.
+        if ctx.q_bytes_per_row[layer_idx] as usize != bytes_per_row {
+            ctx.dev_qk_mirror[layer_idx] = None;
+            ctx.dev_qv_mirror[layer_idx] = None;
+            ctx.dev_qk_scales[layer_idx] = None;
+            ctx.dev_qv_scales[layer_idx] = None;
+            ctx.kv_valid_len_q[layer_idx] = 0;
+            ctx.q_bytes_per_row[layer_idx] = bytes_per_row as u32;
+        }
+        let valid = ctx.kv_valid_len_q[layer_idx] as usize;
+        if valid >= posu {
+            return true; // already resident up to here
+        }
+        if !ensure_cuda_dev(&mut ctx.dev_qk_mirror[layer_idx], &ctx.stream, mirror_len)
+            || !ensure_cuda_dev(&mut ctx.dev_qv_mirror[layer_idx], &ctx.stream, mirror_len)
+        {
+            return false;
+        }
+        if has_scales
+            && (!ensure_cuda_dev(&mut ctx.dev_qk_scales[layer_idx], &ctx.stream, scales_len * 4)
+                || !ensure_cuda_dev(&mut ctx.dev_qv_scales[layer_idx], &ctx.stream, scales_len * 4))
+        {
+            return false;
+        }
+        // Upload the missing history rows [valid..pos) per kv-head: a contiguous
+        // run of packed rows, plus the matching per-row scales when present.
+        let nrows = posu - valid;
+        for h in 0..n_kv {
+            let off_b = (h * mc + valid) * bytes_per_row;
+            let len_b = nrows * bytes_per_row;
+            if ctx.dev_qk_mirror[layer_idx]
+                .as_mut()
+                .unwrap()
+                .copy_from_host_at(off_b, &k_packed[off_b..off_b + len_b])
+                .is_err()
+                || ctx.dev_qv_mirror[layer_idx]
+                    .as_mut()
+                    .unwrap()
+                    .copy_from_host_at(off_b, &v_packed[off_b..off_b + len_b])
+                    .is_err()
+            {
+                return false;
+            }
+            if has_scales {
+                let off_s = h * mc + valid; // f32 element index
+                let ks = &k_scales.unwrap()[off_s..off_s + nrows];
+                let vs = &v_scales.unwrap()[off_s..off_s + nrows];
+                let ks_b: &[u8] =
+                    unsafe { std::slice::from_raw_parts(ks.as_ptr() as *const u8, nrows * 4) };
+                let vs_b: &[u8] =
+                    unsafe { std::slice::from_raw_parts(vs.as_ptr() as *const u8, nrows * 4) };
+                if ctx.dev_qk_scales[layer_idx]
+                    .as_mut()
+                    .unwrap()
+                    .copy_from_host_at(off_s * 4, ks_b)
+                    .is_err()
+                    || ctx.dev_qv_scales[layer_idx]
+                        .as_mut()
+                        .unwrap()
+                        .copy_from_host_at(off_s * 4, vs_b)
+                        .is_err()
+                {
+                    return false;
+                }
+            }
+        }
+        ctx.kv_valid_len_q[layer_idx] = pos;
+        true
+    })
+}
+
+/// Seed the CUDA Q8_0 (per-row int8 + per-row f32 scale) decode mirror. See
+/// [`cuda_decode_seed_kv_quant`]. `k_q`/`v_q` are the host int8 slabs,
+/// `k_scales`/`v_scales` the host per-row f32 scales.
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_decode_seed_kv_q8_0(
+    k_q: &[u8],
+    v_q: &[u8],
+    k_scales: &[f32],
+    v_scales: &[f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    cuda_decode_seed_kv_quant(
+        QuantKv::Q8_0, k_q, v_q, Some(k_scales), Some(v_scales), layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// Seed the CUDA Q4_0 (ggml 18-byte blocks, embedded scale) decode mirror. See
+/// [`cuda_decode_seed_kv_quant`]. No separate scales.
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_decode_seed_kv_q4_0(
+    k_q: &[u8],
+    v_q: &[u8],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    cuda_decode_seed_kv_quant(
+        QuantKv::Q4_0, k_q, v_q, None, None, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
 /// Shared body for every native-CUDA quantized-KV decode helper. Mirrors
 /// [`try_flash_attn_decode_usm_quant`] (same shape gate, same CPU
 /// quantizers, same epoch/valid-len gate): quantizes ONLY the new row into

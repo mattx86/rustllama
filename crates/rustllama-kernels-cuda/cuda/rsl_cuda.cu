@@ -2511,39 +2511,101 @@ __device__ __forceinline__ void rsl_deq_tq_row(const unsigned char *p,
 }
 
 // ---- Q4_0-KV decode / prefill ----
+// Dequant ONE element `e` of a Q4_0 KV row (byte-identical to the per-row
+// rsl_deq_q4_0_row above: f16 block scale, low nibble for the first 16 of a
+// 32-block, high nibble for the rest, minus 8). Used by the flash-decoding
+// kernel so each warp lane dequantizes only the head dims it owns, in registers.
+__device__ __forceinline__ float rsl_deq_q4_0_elem(const unsigned char *p, int e) {
+    int b = e >> 5;        // block (32 elems) index
+    int idx = e & 31;      // within-block index
+    const unsigned char *blk = p + (size_t)b * 18;
+    unsigned short d_bits = (unsigned short)blk[0] | ((unsigned short)blk[1] << 8);
+    float d = rsl_f16_bits_to_f32(d_bits);
+    const unsigned char *qs = blk + 2;
+    int nib = (idx < 16) ? (qs[idx] & 0x0F) : (qs[idx - 16] >> 4);
+    return (float)(nib - 8) * d;
+}
+
+// Q4_0 KV (ggml 18-byte blocks, embedded f16 per-32 scale) flash-decoding.
+// Same warp-cooperative structure as flash_attn_decode_f32_kernel; each lane
+// dequantizes its head dims on the fly via rsl_deq_q4_0_elem (the per-block
+// scale is already folded in, so no separate per-row scale). Replaces the old
+// one-thread-per-head serial kernel.
 __global__ void flash_attn_decode_q4_0_kernel(const float *q,
                                               const unsigned char *k_packed,
                                               const unsigned char *v_packed,
                                               float *out, int n_heads, int n_gqa,
                                               int head_dim, int max_ctx,
                                               int kv_len, float scale) {
-    int hh = blockIdx.x * blockDim.x + threadIdx.x;
+    extern __shared__ float smem[];
+    float *sh_acc = smem;
+    float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;
+    float *sh_l = sh_m + RSL_FLASH_DECODE_W;
+
+    const int hh = blockIdx.x;
     if (hh >= n_heads) return;
-    int kv_h = hh / n_gqa;
-    int q_base = hh * head_dim;
-    int out_base = hh * head_dim;
-    int bytes_per_row = (head_dim / 32) * 18;
-    float row[RSL_FLASH_MAX_HEAD_DIM];
-    for (int i = 0; i < head_dim; ++i) out[out_base + i] = 0.f;
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int kv_h = hh / n_gqa;
+    const int q_off = hh * head_dim;
+    const int bytes_per_row = (head_dim / 32) * 18;
+
+    float qreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    float acc[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
+        qreg[seg] = q[q_off + d];
+        acc[seg] = 0.f;
+    }
     float m = -INFINITY, l = 0.f;
-    for (int t = 0; t < kv_len; ++t) {
-        const unsigned char *kp = k_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        rsl_deq_q4_0_row(kp, row, head_dim);
-        float s_dot = 0.f;
-        for (int i = 0; i < head_dim; ++i) s_dot += q[q_base + i] * row[i];
-        s_dot *= scale;
+
+    for (int t = warp; t < kv_len; t += RSL_FLASH_DECODE_W) {
+        const unsigned char *kp =
+            k_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
+        float partial = 0.f;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            partial += qreg[seg] * rsl_deq_q4_0_elem(kp, d);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            partial += __shfl_down_sync(0xffffffffu, partial, off);
+        float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
         float m_new = fmaxf(m, s_dot);
         float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
         float p = expf(s_dot - m_new);
         l = l * rescale + p;
-        const unsigned char *vp = v_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        rsl_deq_q4_0_row(vp, row, head_dim);
-        for (int i = 0; i < head_dim; ++i)
-            out[out_base + i] = out[out_base + i] * rescale + p * row[i];
+        const unsigned char *vp =
+            v_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            acc[seg] = acc[seg] * rescale + p * rsl_deq_q4_0_elem(vp, d);
         m = m_new;
     }
-    float inv_l = (l > 0.f) ? 1.f / l : 0.f;
-    for (int i = 0; i < head_dim; ++i) out[out_base + i] *= inv_l;
+
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+        sh_acc[warp * head_dim + d] = acc[seg];
+    if (lane == 0) {
+        sh_m[warp] = m;
+        sh_l[warp] = l;
+    }
+    __syncthreads();
+
+    float m_g = -INFINITY;
+    #pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w) m_g = fmaxf(m_g, sh_m[w]);
+    float l_g = 0.f;
+    #pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+        l_g += sh_l[w] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+    float inv_l = (l_g > 0.f) ? 1.f / l_g : 0.f;
+    const int tid = warp * 32 + lane;
+    const int nthreads = RSL_FLASH_DECODE_W * 32;
+    const int out_off = hh * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float o = 0.f;
+        #pragma unroll
+        for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+            o += sh_acc[w * head_dim + d] *
+                 (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+        out[out_off + d] = o * inv_l;
+    }
 }
 
 __global__ void flash_attn_prefill_q4_0_kernel(const float *q,
@@ -2987,8 +3049,12 @@ extern "C" int rsl_cuda_flash_attn_decode_q4_0(rsl_cuda_stream *s, const float *
     }
     int n_gqa = n_heads / n_kv_heads;
     float scale = 1.0f / sqrtf((float)head_dim);
-    int t = 64, b = (n_heads + t - 1) / t;
-    flash_attn_decode_q4_0_kernel<<<b, t, 0, s->stream>>>(
+    dim3 block(32, RSL_FLASH_DECODE_W);  // W warps per head
+    dim3 grid((unsigned)n_heads);        // one block per head → fills all SMs
+    size_t shmem = (size_t)(RSL_FLASH_DECODE_W * head_dim +
+                            2 * RSL_FLASH_DECODE_W) *
+                   sizeof(float);
+    flash_attn_decode_q4_0_kernel<<<grid, block, shmem, s->stream>>>(
         q, (const unsigned char *)k_packed, (const unsigned char *)v_packed, out,
         n_heads, n_gqa, head_dim, max_ctx, kv_len, scale);
     return rsl_cuda_check("rsl_cuda_flash_attn_decode_q4_0");
@@ -3230,6 +3296,13 @@ extern "C" int rsl_cuda_flash_attn_prefill_tq(rsl_cuda_stream *s, const float *q
 // out += (p*v_scale)*i8). We reproduce that factoring exactly for float
 // parity, so there is no private per-thread row buffer and head_dim is only
 // bounded by the shared shape guard (kept uniform with the other launchers).
+// Q8_0 KV (per-row int8 slab + per-row f32 scale) flash-decoding. Same
+// warp-cooperative structure as flash_attn_decode_f32_kernel (one block per
+// head, W warps split the kv_len sequence, 32 lanes split head_dim, shared-mem
+// flash merge of the W partials) — the only change is the in-warp dequant: K
+// codes are int8 scaled by the per-row `k_scales` after the warp reduce, and
+// each V contribution is scaled by `p * v_scales[row]`. Replaces the old
+// one-thread-per-head serial kernel that left ~23/24 SMs idle.
 __global__ void flash_attn_decode_q8_0_kernel(const float *q,
                                               const signed char *k_q,
                                               const float *k_scales,
@@ -3238,31 +3311,74 @@ __global__ void flash_attn_decode_q8_0_kernel(const float *q,
                                               float *out, int n_heads, int n_gqa,
                                               int head_dim, int max_ctx,
                                               int kv_len, float scale) {
-    int hh = blockIdx.x * blockDim.x + threadIdx.x;
+    extern __shared__ float smem[];
+    float *sh_acc = smem;
+    float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;
+    float *sh_l = sh_m + RSL_FLASH_DECODE_W;
+
+    const int hh = blockIdx.x;
     if (hh >= n_heads) return;
-    int kv_h = hh / n_gqa;
-    int q_base = hh * head_dim;
-    int out_base = hh * head_dim;
-    for (int i = 0; i < head_dim; ++i) out[out_base + i] = 0.f;
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int kv_h = hh / n_gqa;
+    const int q_off = hh * head_dim;
+
+    float qreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    float acc[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
+        qreg[seg] = q[q_off + d];
+        acc[seg] = 0.f;
+    }
     float m = -INFINITY, l = 0.f;
-    for (int t = 0; t < kv_len; ++t) {
-        size_t ridx = (size_t)(kv_h * max_ctx + t);
+
+    for (int t = warp; t < kv_len; t += RSL_FLASH_DECODE_W) {
+        const size_t ridx = (size_t)(kv_h * max_ctx + t);
         const signed char *kp = k_q + ridx * head_dim;
-        float s_dot = 0.f;
-        for (int i = 0; i < head_dim; ++i) s_dot += q[q_base + i] * (float)kp[i];
-        s_dot *= k_scales[ridx] * scale;
+        float partial = 0.f;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            partial += qreg[seg] * (float)kp[d];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            partial += __shfl_down_sync(0xffffffffu, partial, off);
+        float s_dot = __shfl_sync(0xffffffffu, partial, 0) * (k_scales[ridx] * scale);
         float m_new = fmaxf(m, s_dot);
         float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
         float p = expf(s_dot - m_new);
         l = l * rescale + p;
         const signed char *vp = v_q + ridx * head_dim;
         float p_eff = p * v_scales[ridx];
-        for (int i = 0; i < head_dim; ++i)
-            out[out_base + i] = out[out_base + i] * rescale + p_eff * (float)vp[i];
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            acc[seg] = acc[seg] * rescale + p_eff * (float)vp[d];
         m = m_new;
     }
-    float inv_l = (l > 0.f) ? 1.f / l : 0.f;
-    for (int i = 0; i < head_dim; ++i) out[out_base + i] *= inv_l;
+
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+        sh_acc[warp * head_dim + d] = acc[seg];
+    if (lane == 0) {
+        sh_m[warp] = m;
+        sh_l[warp] = l;
+    }
+    __syncthreads();
+
+    float m_g = -INFINITY;
+    #pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w) m_g = fmaxf(m_g, sh_m[w]);
+    float l_g = 0.f;
+    #pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+        l_g += sh_l[w] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+    float inv_l = (l_g > 0.f) ? 1.f / l_g : 0.f;
+    const int tid = warp * 32 + lane;
+    const int nthreads = RSL_FLASH_DECODE_W * 32;
+    const int out_off = hh * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float o = 0.f;
+        #pragma unroll
+        for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+            o += sh_acc[w * head_dim + d] *
+                 (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+        out[out_off + d] = o * inv_l;
+    }
 }
 
 __global__ void flash_attn_prefill_q8_0_kernel(const float *q,
@@ -3318,8 +3434,12 @@ extern "C" int rsl_cuda_flash_attn_decode_q8_0(rsl_cuda_stream *s, const float *
     }
     int n_gqa = n_heads / n_kv_heads;
     float scale = 1.0f / sqrtf((float)head_dim);
-    int t = 64, b = (n_heads + t - 1) / t;
-    flash_attn_decode_q8_0_kernel<<<b, t, 0, s->stream>>>(
+    dim3 block(32, RSL_FLASH_DECODE_W);  // W warps per head
+    dim3 grid((unsigned)n_heads);        // one block per head → fills all SMs
+    size_t shmem = (size_t)(RSL_FLASH_DECODE_W * head_dim +
+                            2 * RSL_FLASH_DECODE_W) *
+                   sizeof(float);
+    flash_attn_decode_q8_0_kernel<<<grid, block, shmem, s->stream>>>(
         q, (const signed char *)k_packed, k_scales, (const signed char *)v_packed, v_scales,
         out, n_heads, n_gqa, head_dim, max_ctx, kv_len, scale);
     return rsl_cuda_check("rsl_cuda_flash_attn_decode_q8_0");

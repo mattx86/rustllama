@@ -7490,6 +7490,27 @@ impl LlamaModel {
                     // to the CPU flash/standard split below. The helper
                     // re-quantizes k_buf/v_buf into its own USM mirror
                     // with the same quantizer, so its bytes match k_q/v_q.
+                    // Seed the CUDA decode mirror with the prefill history on
+                    // the first decode step (no-op once resident); without it
+                    // the mirror gap declines and quant-KV decode runs on CPU.
+                    // Host k_q/k_scales are byte-identical to the mirror.
+                    crate::accel::cuda_decode_seed_kv_q8_0(
+                        unsafe {
+                            std::slice::from_raw_parts(k_q.as_ptr() as *const u8, k_q.len())
+                        },
+                        unsafe {
+                            std::slice::from_raw_parts(v_q.as_ptr() as *const u8, v_q.len())
+                        },
+                        &k_scales[..],
+                        &v_scales[..],
+                        layer_idx,
+                        cur_pos as u32,
+                        n_heads as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        max_ctx as u32,
+                        cfg.n_layers as u32,
+                    );
                     if !crate::accel::try_flash_attn_decode_gpu_q8_0(
                         &q_buf,
                         &k_buf,
@@ -7825,6 +7846,21 @@ impl LlamaModel {
                     // exactly what the host slab was quantized from, so the
                     // helper's mirror matches k_q/v_q. Decline → CPU below.
                     // The un-whiten in step 3 applies to either output.
+                    // Seed the CUDA decode mirror with the prefill history on
+                    // the first decode step (no-op once resident); host k_q/v_q
+                    // (quantized from the whitened k_buf) are byte-identical to
+                    // the mirror, so a direct copy is correct.
+                    crate::accel::cuda_decode_seed_kv_q4_0(
+                        &k_q[..],
+                        &v_q[..],
+                        layer_idx,
+                        cur_pos as u32,
+                        n_heads as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        max_ctx as u32,
+                        cfg.n_layers as u32,
+                    );
                     if !crate::accel::try_flash_attn_decode_gpu_q4_0(
                         &q_buf,
                         &k_buf,
