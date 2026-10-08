@@ -6399,6 +6399,119 @@ pub fn try_flash_attn_decode_cuda_f32(
     })
 }
 
+/// Seed the native-CUDA F32 decode KV mirror with the prefill history for a
+/// layer — upload the rows `[valid..pos)` that aren't resident yet from the
+/// host KV cache. Without this, [`try_flash_attn_decode_cuda_f32`]'s
+/// resident-mirror gap check (`pos > valid`) declines for the WHOLE
+/// generation after a prefill: decode starts at `pos = prompt_len` against an
+/// empty mirror (`valid == 0`), so attention silently falls back to the CPU
+/// every step (the matvec stays on the GPU, so it reads like a slow,
+/// context-scaling decode). Call once per layer at the prefill→decode boundary;
+/// a no-op once the mirror is current (`valid >= pos`). `k`/`v` are the host
+/// KV cache buffers, head-major `[n_kv_heads, max_ctx, head_dim]` (same layout
+/// as the mirror), so each head's missing rows upload as one contiguous copy.
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_decode_seed_kv_f32(
+    k: &[f32],
+    v: &[f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    if !cuda_active() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    let cfg = CudaAttnConfig { n_layers, n_heads, n_kv_heads, head_dim, max_ctx };
+    let hd = head_dim as usize;
+    let n_kv = n_kv_heads as usize;
+    let mc = max_ctx as usize;
+    let posu = pos as usize;
+    if n_kv == 0
+        || layer_idx >= n_layers as usize
+        || posu > mc
+        || k.len() < n_kv * mc * hd
+        || v.len() < n_kv * mc * hd
+    {
+        return false;
+    }
+    let mirror_bytes = n_kv * mc * hd * 4;
+    let row_bytes = hd * 4;
+    CUDA_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let needs_rebuild = match slot.as_ref() {
+            Some(ctx) => ctx.cfg != cfg,
+            None => true,
+        };
+        if needs_rebuild {
+            *slot = CudaAttnContext::try_new(cfg);
+            if slot.is_none() {
+                return false;
+            }
+        }
+        let ctx = slot.as_mut().expect("cuda ctx just built");
+        // Same F32 staleness gate as the decode path: a new sequence (epoch
+        // bump) invalidates every layer's resident length.
+        let epoch = USM_KV_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if ctx.kv_epoch_f32 != epoch {
+            for vl in ctx.kv_valid_len_f32.iter_mut() {
+                *vl = 0;
+            }
+            ctx.kv_epoch_f32 = epoch;
+        }
+        let valid = ctx.kv_valid_len_f32[layer_idx] as usize;
+        if valid >= posu {
+            return true; // already resident up to here — nothing to seed
+        }
+        if !ensure_cuda_dev(&mut ctx.dev_k_mirror[layer_idx], &ctx.stream, mirror_bytes)
+            || !ensure_cuda_dev(&mut ctx.dev_v_mirror[layer_idx], &ctx.stream, mirror_bytes)
+        {
+            return false;
+        }
+        // Upload the missing history rows [valid..pos) per kv-head. Head-major
+        // layout ⇒ a head's rows are contiguous, so one copy per head.
+        let nrows = posu - valid;
+        let len_bytes = nrows * row_bytes;
+        for h in 0..n_kv {
+            let off_floats = (h * mc + valid) * hd;
+            let off_bytes = off_floats * 4;
+            let k_src: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    k[off_floats..off_floats + nrows * hd].as_ptr() as *const u8,
+                    len_bytes,
+                )
+            };
+            if ctx.dev_k_mirror[layer_idx]
+                .as_mut()
+                .unwrap()
+                .copy_from_host_at(off_bytes, k_src)
+                .is_err()
+            {
+                return false;
+            }
+            let v_src: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    v[off_floats..off_floats + nrows * hd].as_ptr() as *const u8,
+                    len_bytes,
+                )
+            };
+            if ctx.dev_v_mirror[layer_idx]
+                .as_mut()
+                .unwrap()
+                .copy_from_host_at(off_bytes, v_src)
+                .is_err()
+            {
+                return false;
+            }
+        }
+        ctx.kv_valid_len_f32[layer_idx] = pos;
+        true
+    })
+}
+
 /// Shared body for every native-CUDA quantized-KV decode helper. Mirrors
 /// [`try_flash_attn_decode_usm_quant`] (same shape gate, same CPU
 /// quantizers, same epoch/valid-len gate): quantizes ONLY the new row into

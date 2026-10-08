@@ -5287,6 +5287,17 @@ impl LlamaModel {
                             //    existing CPU GQA flash-decode kernel, so
                             //    F32 behavior is unchanged when no GPU
                             //    path engages.
+                            // Seed the CUDA decode KV mirror with the prefill
+                            // history on the first decode step after a prefill
+                            // (a no-op once resident). Without it the resident-
+                            // mirror gap check declines and decode attention
+                            // runs on the CPU for the whole generation.
+                            crate::accel::cuda_decode_seed_kv_f32(
+                                k, v, li, cur_pos as u32,
+                                n_heads as u32, n_kv_heads as u32,
+                                head_dim as u32, max_ctx as u32,
+                                cfg.n_layers as u32,
+                            );
                             if !crate::accel::try_flash_attn_decode_gpu_f32(
                                 &q_buf,
                                 &k_buf[..n_kv_heads * head_dim],
@@ -7359,6 +7370,25 @@ impl LlamaModel {
                         v[dst..dst + head_dim]
                             .copy_from_slice(&v_buf[h * head_dim..(h + 1) * head_dim]);
                     }
+                    // Seed the CUDA decode KV mirror with the prefill
+                    // history on the first decode step after a prefill (a
+                    // no-op once resident). Without it the native-CUDA
+                    // decode path's resident-mirror gap check declines for
+                    // the whole generation (decode starts at
+                    // pos = prompt_len against an empty mirror), so decode
+                    // attention silently runs on the CPU while the matvec
+                    // stays on the GPU.
+                    crate::accel::cuda_decode_seed_kv_f32(
+                        k,
+                        v,
+                        layer_idx,
+                        cur_pos as u32,
+                        n_heads as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        max_ctx as u32,
+                        cfg.n_layers as u32,
+                    );
                     // USM-resident SYCL path first (opt-in via
                     // `RUSTLLAMA_USM_ATTN=1`). On integrated GPUs
                     // (Iris Xe + shared LPDDR) the K/V cache stays

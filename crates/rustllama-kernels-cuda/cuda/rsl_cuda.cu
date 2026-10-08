@@ -2025,39 +2025,107 @@ extern "C" int rsl_cuda_embedding_lookup_f32(rsl_cuda_stream *s,
     return rsl_cuda_check("rsl_cuda_embedding_lookup_f32");
 }
 
-// FlashAttention decode, F32 (mirrors rsl_flash_attn_decode_usm v1):
+// head_dim ceiling (shared with the quant-KV flash kernels; the #ifndef at
+// their block then skips). Sizes the per-lane register slices below.
+#ifndef RSL_FLASH_MAX_HEAD_DIM
+#define RSL_FLASH_MAX_HEAD_DIM 256
+#endif
+
+// FlashAttention decode, F32 ("flash-decoding"):
 //   q:   [n_heads, head_dim]
 //   k/v: [n_kv_heads, max_ctx, head_dim]
 //   out: [n_heads, head_dim]
-// One thread per head; serial online softmax over kv_len positions.
+// The naive version this replaces ran ONE THREAD per head — so n_heads threads
+// in a SINGLE block kept one SM busy while the other ~23 sat idle, each thread
+// looping kv_len positions with a serial head_dim dot + uncoalesced K/V reads.
+// That dominated long-context decode (attention is ~O(kv_len); ~60-80% of the
+// decode token at 2K-4K ctx). Here each head gets a BLOCK of W warps that SPLIT
+// the kv_len sequence between them (strided): every warp runs an online-softmax
+// partial over its slice with the 32 lanes splitting head_dim (coalesced K/V
+// reads + a shuffle-reduced dot), then the W partials are merged in shared
+// memory by the standard flash reduction (m=max, l=Σ l_w·e^{m_w−m}, acc likewise).
+// This fills the GPU (one block per head, over all SMs) AND hides memory latency
+// (W warps in flight per head). The online-softmax recurrence is unchanged, so
+// the result matches the CPU/scalar reference to FMA/expf reassociation.
+//
+// Shared use = (W*head_dim + 2*W)*4 B = ~4.2 KB @ W=8/head_dim=128, ≤8.3 KB
+// through head_dim 256 — far under the 48 KB floor, no opt-in / device query.
+#define RSL_FLASH_DECODE_W 8  // warps per head = KV-sequence split factor
 __global__ void flash_attn_decode_f32_kernel(const float *q, const float *k,
                                              const float *v, float *out,
                                              int n_heads, int n_gqa,
                                              int head_dim, int max_ctx,
                                              int kv_len, float scale) {
-    int hh = blockIdx.x * blockDim.x + threadIdx.x;
+    extern __shared__ float smem[];
+    float *sh_acc = smem;                                   // [W * head_dim]
+    float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;   // [W]
+    float *sh_l = sh_m + RSL_FLASH_DECODE_W;                // [W]
+
+    const int hh = blockIdx.x;            // one block per head
     if (hh >= n_heads) return;
-    int kv_h = hh / n_gqa;
-    int q_base = hh * head_dim;
-    int out_base = hh * head_dim;
-    for (int i = 0; i < head_dim; ++i) out[out_base + i] = 0.f;
+    const int lane = threadIdx.x;         // 0..31
+    const int warp = threadIdx.y;         // 0..W-1
+    const int kv_h = hh / n_gqa;
+    const int q_off = hh * head_dim;
+
+    // This head's query row into per-lane registers (dims lane, lane+32, …).
+    float qreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    float acc[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
+        qreg[seg] = q[q_off + d];
+        acc[seg] = 0.f;
+    }
     float m = -INFINITY, l = 0.f;
-    for (int t = 0; t < kv_len; ++t) {
-        int k_off = (kv_h * max_ctx + t) * head_dim;
-        float s_dot = 0.f;
-        for (int i = 0; i < head_dim; ++i) s_dot += q[q_base + i] * k[k_off + i];
-        s_dot *= scale;
+
+    // Warp `warp` handles KV positions warp, warp+W, warp+2W, … (strided, so
+    // consecutive positions are read by consecutive warps each step → good L2).
+    for (int t = warp; t < kv_len; t += RSL_FLASH_DECODE_W) {
+        const int kv_off = (kv_h * max_ctx + t) * head_dim;
+        float partial = 0.f;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            partial += qreg[seg] * k[kv_off + d];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            partial += __shfl_down_sync(0xffffffffu, partial, off);
+        float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
         float m_new = fmaxf(m, s_dot);
         float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
         float p = expf(s_dot - m_new);
         l = l * rescale + p;
-        int v_off = (kv_h * max_ctx + t) * head_dim;
-        for (int i = 0; i < head_dim; ++i)
-            out[out_base + i] = out[out_base + i] * rescale + p * v[v_off + i];
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            acc[seg] = acc[seg] * rescale + p * v[kv_off + d];
         m = m_new;
     }
-    float inv_l = (l > 0.f) ? 1.f / l : 0.f;
-    for (int i = 0; i < head_dim; ++i) out[out_base + i] *= inv_l;
+
+    // Publish this warp's partial (m, l, acc) to shared.
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+        sh_acc[warp * head_dim + d] = acc[seg];
+    if (lane == 0) {
+        sh_m[warp] = m;
+        sh_l[warp] = l;
+    }
+    __syncthreads();
+
+    // Merge the W partials: global max, then the flash denominator + output.
+    float m_g = -INFINITY;
+    #pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w) m_g = fmaxf(m_g, sh_m[w]);
+    float l_g = 0.f;
+    #pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+        l_g += sh_l[w] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+    float inv_l = (l_g > 0.f) ? 1.f / l_g : 0.f;
+    const int tid = warp * 32 + lane;
+    const int nthreads = RSL_FLASH_DECODE_W * 32;
+    const int out_off = hh * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float o = 0.f;
+        #pragma unroll
+        for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+            o += sh_acc[w * head_dim + d] *
+                 (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+        out[out_off + d] = o * inv_l;
+    }
 }
 
 extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
@@ -2070,6 +2138,7 @@ extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0)
         return -1;
     if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM) return -1;
     cudaSetDevice(s->device);
     if (kv_len <= 0) {
         cudaMemsetAsync(out, 0, (size_t)n_heads * head_dim * sizeof(float),
@@ -2078,8 +2147,12 @@ extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
     }
     int n_gqa = n_heads / n_kv_heads;
     float scale = 1.0f / sqrtf((float)head_dim);
-    int t = 64, b = (n_heads + t - 1) / t;
-    flash_attn_decode_f32_kernel<<<b, t, 0, s->stream>>>(
+    dim3 block(32, RSL_FLASH_DECODE_W);  // W warps per head
+    dim3 grid((unsigned)n_heads);        // one block per head → fills all SMs
+    size_t shmem = (size_t)(RSL_FLASH_DECODE_W * head_dim +
+                            2 * RSL_FLASH_DECODE_W) *
+                   sizeof(float);
+    flash_attn_decode_f32_kernel<<<grid, block, shmem, s->stream>>>(
         q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len, scale);
     return rsl_cuda_check("rsl_cuda_flash_attn_decode_f32");
 }
