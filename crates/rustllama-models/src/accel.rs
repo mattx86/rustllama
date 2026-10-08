@@ -6769,6 +6769,616 @@ pub fn cuda_decode_seed_kv_tq(
     )
 }
 
+// ===========================================================================
+// SYCL (USM) + MLX decode-KV seeds — parity twins of the CUDA seeds above.
+//
+// The USM and MLX quant/F32 decode paths carry the SAME `pos > valid` gap the
+// CUDA path had before its seed: after a batched-host prefill, the per-step
+// decode call writes only the row at `pos`, so the thread-local device mirror
+// holds no history and the dispatcher declines to CPU for the whole
+// generation. These seeds fill the missing rows `[valid..pos)` from the host
+// KV cache once, at the prefill->decode boundary, so the GPU flash-decode
+// engages. The `decode_seed_kv_*` combinators pick the active backend
+// (CUDA -> MLX -> SYCL), exactly like `try_flash_attn_decode_gpu_*`. CPU needs
+// no seed — its attention reads the host KV slab directly.
+// ===========================================================================
+
+/// SYCL (USM) twin of [`cuda_decode_seed_kv_f32`]: fill the f16 USM mirror
+/// rows `[valid..pos)` from the host f32 KV slab. The USM F32 mirror stores
+/// f16 (`UsmAttnContext::k_caches`), so this CONVERTS per element rather than
+/// byte-copying (the one structural difference from the CUDA f32 seed).
+#[allow(clippy::too_many_arguments)]
+pub fn usm_decode_seed_kv_f32(
+    k: &[f32],
+    v: &[f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    if !usm_attn_enabled() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    let cfg = UsmAttnConfig {
+        n_layers,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        d: 0,
+        d_ff: 0,
+    };
+    let hd = head_dim as usize;
+    let n_kv = n_kv_heads as usize;
+    let mc = max_ctx as usize;
+    let posu = pos as usize;
+    if n_kv == 0
+        || layer_idx >= n_layers as usize
+        || posu > mc
+        || k.len() < n_kv * mc * hd
+        || v.len() < n_kv * mc * hd
+    {
+        return false;
+    }
+    USM_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let needs_rebuild = match slot.as_ref() {
+            Some(ctx) => ctx.cfg != cfg,
+            None => true,
+        };
+        if needs_rebuild {
+            *slot = UsmAttnContext::try_new(cfg);
+            if slot.is_none() {
+                return false;
+            }
+        }
+        let ctx = slot.as_mut().expect("usm ctx just built");
+        // Same f16-path staleness gate as the decode entry.
+        let epoch = USM_KV_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if ctx.kv_epoch != epoch {
+            for vl in ctx.kv_valid_len.iter_mut() {
+                *vl = 0;
+            }
+            ctx.kv_epoch = epoch;
+        }
+        let valid = ctx.kv_valid_len[layer_idx] as usize;
+        if valid >= posu {
+            return true; // already resident up to here — nothing to seed
+        }
+        // Mirror layout == host layout ((h*mc+row)*hd + d), so src and dst
+        // indices coincide; convert f32 -> f16-bits the same way the per-pos
+        // decode fill does.
+        {
+            let kc = ctx.k_caches[layer_idx].as_mut_slice();
+            for h in 0..n_kv {
+                for row in valid..posu {
+                    let base = (h * mc + row) * hd;
+                    for d in 0..hd {
+                        kc[base + d] = half::f16::from_f32(k[base + d]).to_bits();
+                    }
+                }
+            }
+        }
+        {
+            let vc = ctx.v_caches[layer_idx].as_mut_slice();
+            for h in 0..n_kv {
+                for row in valid..posu {
+                    let base = (h * mc + row) * hd;
+                    for d in 0..hd {
+                        vc[base + d] = half::f16::from_f32(v[base + d]).to_bits();
+                    }
+                }
+            }
+        }
+        ctx.kv_valid_len[layer_idx] = pos;
+        true
+    })
+}
+
+/// SYCL (USM) twin of [`cuda_decode_seed_kv_quant`]: byte-copy the host packed
+/// KV rows `[valid..pos)` (+ per-row scales) into the USM mirror. The USM
+/// mirror's packed layout is byte-identical to the host slab (same quantizer,
+/// same `(h*mc+pos)*bytes_per_row` layout), so this is a direct slice copy.
+#[allow(clippy::too_many_arguments)]
+fn usm_decode_seed_kv_quant(
+    fmt: QuantKv,
+    k_packed: &[u8],
+    v_packed: &[u8],
+    k_scales: Option<&[f32]>,
+    v_scales: Option<&[f32]>,
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    if !usm_attn_enabled() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    let cfg = UsmAttnConfig {
+        n_layers,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        d: 0,
+        d_ff: 0,
+    };
+    let hd = head_dim as usize;
+    let n_kv = n_kv_heads as usize;
+    let mc = max_ctx as usize;
+    let posu = pos as usize;
+    if n_kv == 0 || layer_idx >= n_layers as usize || posu > mc {
+        return false;
+    }
+    let bytes_per_row = fmt.bytes_per_row(hd);
+    let mirror_len = n_kv * mc * bytes_per_row;
+    let scales_len = n_kv * mc;
+    let has_scales = fmt.has_scales();
+    if k_packed.len() < mirror_len || v_packed.len() < mirror_len {
+        return false;
+    }
+    if has_scales {
+        match (k_scales, v_scales) {
+            (Some(ks), Some(vs)) if ks.len() >= scales_len && vs.len() >= scales_len => {}
+            _ => return false,
+        }
+    }
+    USM_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let needs_rebuild = match slot.as_ref() {
+            Some(ctx) => ctx.cfg != cfg,
+            None => true,
+        };
+        if needs_rebuild {
+            *slot = UsmAttnContext::try_new(cfg);
+            if slot.is_none() {
+                return false;
+            }
+        }
+        let ctx = slot.as_mut().expect("usm ctx just built");
+        let epoch = USM_KV_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if ctx.kv_epoch_q != epoch {
+            for vl in ctx.kv_valid_len_q.iter_mut() {
+                *vl = 0;
+            }
+            ctx.kv_epoch_q = epoch;
+        }
+        // A format change for this layer re-allocates the packed mirror (+
+        // scales) and resets its valid range — mirrors the decode gate so the
+        // decode call that follows won't realloc and wipe the seeded rows.
+        if ctx.q_bytes_per_row[layer_idx] as usize != bytes_per_row {
+            ctx.q_k_packed[layer_idx] = None;
+            ctx.q_v_packed[layer_idx] = None;
+            ctx.q_k_scales[layer_idx] = None;
+            ctx.q_v_scales[layer_idx] = None;
+            ctx.kv_valid_len_q[layer_idx] = 0;
+            ctx.q_bytes_per_row[layer_idx] = bytes_per_row as u32;
+        }
+        let valid = ctx.kv_valid_len_q[layer_idx] as usize;
+        if valid >= posu {
+            return true; // already resident up to here
+        }
+        if !ensure_u8_exact(&ctx.stream, &mut ctx.q_k_packed[layer_idx], mirror_len)
+            || !ensure_u8_exact(&ctx.stream, &mut ctx.q_v_packed[layer_idx], mirror_len)
+        {
+            return false;
+        }
+        if has_scales
+            && (!ensure_scratch_f32(&ctx.stream, &mut ctx.q_k_scales[layer_idx], scales_len)
+                || !ensure_scratch_f32(&ctx.stream, &mut ctx.q_v_scales[layer_idx], scales_len))
+        {
+            return false;
+        }
+        let nrows = posu - valid;
+        // Head-major layout ⇒ a head's missing rows are contiguous: one slice
+        // copy per kv-head, packed bytes then per-row scales.
+        {
+            let kb = ctx.q_k_packed[layer_idx].as_mut().expect("k mirror").as_mut_slice();
+            for h in 0..n_kv {
+                let off = (h * mc + valid) * bytes_per_row;
+                let len = nrows * bytes_per_row;
+                kb[off..off + len].copy_from_slice(&k_packed[off..off + len]);
+            }
+        }
+        {
+            let vb = ctx.q_v_packed[layer_idx].as_mut().expect("v mirror").as_mut_slice();
+            for h in 0..n_kv {
+                let off = (h * mc + valid) * bytes_per_row;
+                let len = nrows * bytes_per_row;
+                vb[off..off + len].copy_from_slice(&v_packed[off..off + len]);
+            }
+        }
+        if has_scales {
+            let ks = k_scales.unwrap();
+            let vs = v_scales.unwrap();
+            {
+                let kscale = ctx.q_k_scales[layer_idx].as_mut().expect("k scales").as_mut_slice();
+                for h in 0..n_kv {
+                    let off = h * mc + valid;
+                    kscale[off..off + nrows].copy_from_slice(&ks[off..off + nrows]);
+                }
+            }
+            {
+                let vscale = ctx.q_v_scales[layer_idx].as_mut().expect("v scales").as_mut_slice();
+                for h in 0..n_kv {
+                    let off = h * mc + valid;
+                    vscale[off..off + nrows].copy_from_slice(&vs[off..off + nrows]);
+                }
+            }
+        }
+        ctx.kv_valid_len_q[layer_idx] = pos;
+        true
+    })
+}
+
+/// MLX twin of [`cuda_decode_seed_kv_f32`] (f32 device mirror, raw byte copy).
+/// Write-blind like the rest of the MLX surface — validated on Apple HW.
+#[allow(clippy::too_many_arguments)]
+pub fn mlx_decode_seed_kv_f32(
+    k: &[f32],
+    v: &[f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    if !mlx_active() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    let cfg = MlxAttnConfig { n_layers, n_heads, n_kv_heads, head_dim, max_ctx };
+    let hd = head_dim as usize;
+    let n_kv = n_kv_heads as usize;
+    let mc = max_ctx as usize;
+    let posu = pos as usize;
+    if n_kv == 0
+        || layer_idx >= n_layers as usize
+        || posu > mc
+        || k.len() < n_kv * mc * hd
+        || v.len() < n_kv * mc * hd
+    {
+        return false;
+    }
+    let mirror_bytes = n_kv * mc * hd * 4;
+    let row_bytes = hd * 4;
+    MLX_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let needs_rebuild = match slot.as_ref() {
+            Some(ctx) => ctx.cfg != cfg,
+            None => true,
+        };
+        if needs_rebuild {
+            *slot = MlxAttnContext::try_new(cfg);
+            if slot.is_none() {
+                return false;
+            }
+        }
+        let ctx = slot.as_mut().expect("mlx ctx just built");
+        let epoch = USM_KV_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if ctx.kv_epoch_f32 != epoch {
+            for vl in ctx.kv_valid_len_f32.iter_mut() {
+                *vl = 0;
+            }
+            ctx.kv_epoch_f32 = epoch;
+        }
+        let valid = ctx.kv_valid_len_f32[layer_idx] as usize;
+        if valid >= posu {
+            return true;
+        }
+        if !ensure_mlx_dev(&mut ctx.dev_k_mirror[layer_idx], &ctx.stream, mirror_bytes)
+            || !ensure_mlx_dev(&mut ctx.dev_v_mirror[layer_idx], &ctx.stream, mirror_bytes)
+        {
+            return false;
+        }
+        let nrows = posu - valid;
+        let len_bytes = nrows * row_bytes;
+        for h in 0..n_kv {
+            let off_floats = (h * mc + valid) * hd;
+            let off_bytes = off_floats * 4;
+            let k_src: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    k[off_floats..off_floats + nrows * hd].as_ptr() as *const u8,
+                    len_bytes,
+                )
+            };
+            if ctx.dev_k_mirror[layer_idx]
+                .as_mut()
+                .unwrap()
+                .copy_from_host_at(off_bytes, k_src)
+                .is_err()
+            {
+                return false;
+            }
+            let v_src: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    v[off_floats..off_floats + nrows * hd].as_ptr() as *const u8,
+                    len_bytes,
+                )
+            };
+            if ctx.dev_v_mirror[layer_idx]
+                .as_mut()
+                .unwrap()
+                .copy_from_host_at(off_bytes, v_src)
+                .is_err()
+            {
+                return false;
+            }
+        }
+        ctx.kv_valid_len_f32[layer_idx] = pos;
+        true
+    })
+}
+
+/// MLX twin of [`cuda_decode_seed_kv_quant`] (byte-copy host packed rows +
+/// scales into the device mirror). Write-blind; validated on Apple HW.
+#[allow(clippy::too_many_arguments)]
+fn mlx_decode_seed_kv_quant(
+    fmt: QuantKv,
+    k_packed: &[u8],
+    v_packed: &[u8],
+    k_scales: Option<&[f32]>,
+    v_scales: Option<&[f32]>,
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    if !mlx_active() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    let cfg = MlxAttnConfig { n_layers, n_heads, n_kv_heads, head_dim, max_ctx };
+    let hd = head_dim as usize;
+    let n_kv = n_kv_heads as usize;
+    let mc = max_ctx as usize;
+    let posu = pos as usize;
+    if n_kv == 0 || layer_idx >= n_layers as usize || posu > mc {
+        return false;
+    }
+    let bytes_per_row = fmt.bytes_per_row(hd);
+    let mirror_len = n_kv * mc * bytes_per_row;
+    let scales_len = n_kv * mc;
+    let has_scales = fmt.has_scales();
+    if k_packed.len() < mirror_len || v_packed.len() < mirror_len {
+        return false;
+    }
+    if has_scales {
+        match (k_scales, v_scales) {
+            (Some(ks), Some(vs)) if ks.len() >= scales_len && vs.len() >= scales_len => {}
+            _ => return false,
+        }
+    }
+    MLX_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let needs_rebuild = match slot.as_ref() {
+            Some(ctx) => ctx.cfg != cfg,
+            None => true,
+        };
+        if needs_rebuild {
+            *slot = MlxAttnContext::try_new(cfg);
+            if slot.is_none() {
+                return false;
+            }
+        }
+        let ctx = slot.as_mut().expect("mlx ctx just built");
+        let epoch = USM_KV_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if ctx.kv_epoch_q != epoch {
+            for vl in ctx.kv_valid_len_q.iter_mut() {
+                *vl = 0;
+            }
+            ctx.kv_epoch_q = epoch;
+        }
+        if ctx.q_bytes_per_row[layer_idx] as usize != bytes_per_row {
+            ctx.dev_qk_mirror[layer_idx] = None;
+            ctx.dev_qv_mirror[layer_idx] = None;
+            ctx.dev_qk_scales[layer_idx] = None;
+            ctx.dev_qv_scales[layer_idx] = None;
+            ctx.kv_valid_len_q[layer_idx] = 0;
+            ctx.q_bytes_per_row[layer_idx] = bytes_per_row as u32;
+        }
+        let valid = ctx.kv_valid_len_q[layer_idx] as usize;
+        if valid >= posu {
+            return true;
+        }
+        if !ensure_mlx_dev(&mut ctx.dev_qk_mirror[layer_idx], &ctx.stream, mirror_len)
+            || !ensure_mlx_dev(&mut ctx.dev_qv_mirror[layer_idx], &ctx.stream, mirror_len)
+        {
+            return false;
+        }
+        if has_scales
+            && (!ensure_mlx_dev(&mut ctx.dev_qk_scales[layer_idx], &ctx.stream, scales_len * 4)
+                || !ensure_mlx_dev(&mut ctx.dev_qv_scales[layer_idx], &ctx.stream, scales_len * 4))
+        {
+            return false;
+        }
+        let nrows = posu - valid;
+        for h in 0..n_kv {
+            let off_b = (h * mc + valid) * bytes_per_row;
+            let len_b = nrows * bytes_per_row;
+            if ctx.dev_qk_mirror[layer_idx]
+                .as_mut()
+                .unwrap()
+                .copy_from_host_at(off_b, &k_packed[off_b..off_b + len_b])
+                .is_err()
+                || ctx.dev_qv_mirror[layer_idx]
+                    .as_mut()
+                    .unwrap()
+                    .copy_from_host_at(off_b, &v_packed[off_b..off_b + len_b])
+                    .is_err()
+            {
+                return false;
+            }
+            if has_scales {
+                let off_s = h * mc + valid;
+                let ks = &k_scales.unwrap()[off_s..off_s + nrows];
+                let vs = &v_scales.unwrap()[off_s..off_s + nrows];
+                let ks_b: &[u8] =
+                    unsafe { std::slice::from_raw_parts(ks.as_ptr() as *const u8, nrows * 4) };
+                let vs_b: &[u8] =
+                    unsafe { std::slice::from_raw_parts(vs.as_ptr() as *const u8, nrows * 4) };
+                if ctx.dev_qk_scales[layer_idx]
+                    .as_mut()
+                    .unwrap()
+                    .copy_from_host_at(off_s * 4, ks_b)
+                    .is_err()
+                    || ctx.dev_qv_scales[layer_idx]
+                        .as_mut()
+                        .unwrap()
+                        .copy_from_host_at(off_s * 4, vs_b)
+                        .is_err()
+                {
+                    return false;
+                }
+            }
+        }
+        ctx.kv_valid_len_q[layer_idx] = pos;
+        true
+    })
+}
+
+// ---- Backend-selecting decode-KV seed combinators -------------------------
+//
+// CUDA -> MLX -> SYCL. Each backend seed self-gates (returns false off its
+// backend / on the gpu-inactive layer), so the `||` chain runs exactly one
+// real seed and short-circuits. A seed that fails (OOM / H2D error) returns
+// false too — the decode then simply falls to CPU, as it did before any seed.
+
+/// F32 decode-KV seed across backends. Call once per layer at the
+/// prefill->decode boundary; a no-op once the mirror is resident.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_seed_kv_f32(
+    k: &[f32],
+    v: &[f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    cuda_decode_seed_kv_f32(k, v, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers)
+        || mlx_decode_seed_kv_f32(k, v, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers)
+        || usm_decode_seed_kv_f32(k, v, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers)
+}
+
+/// Quantized-KV decode seed across backends (fmt-taking shared body).
+#[allow(clippy::too_many_arguments)]
+fn decode_seed_kv_quant(
+    fmt: QuantKv,
+    k_packed: &[u8],
+    v_packed: &[u8],
+    k_scales: Option<&[f32]>,
+    v_scales: Option<&[f32]>,
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
+) -> bool {
+    cuda_decode_seed_kv_quant(fmt, k_packed, v_packed, k_scales, v_scales, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers)
+        || mlx_decode_seed_kv_quant(fmt, k_packed, v_packed, k_scales, v_scales, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers)
+        || usm_decode_seed_kv_quant(fmt, k_packed, v_packed, k_scales, v_scales, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers)
+}
+
+/// Q8_0 decode seed across backends. See [`decode_seed_kv_quant`].
+#[allow(clippy::too_many_arguments)]
+pub fn decode_seed_kv_q8_0(
+    k_q: &[u8], v_q: &[u8], k_scales: &[f32], v_scales: &[f32], layer_idx: usize, pos: u32,
+    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+) -> bool {
+    decode_seed_kv_quant(
+        QuantKv::Q8_0, k_q, v_q, Some(k_scales), Some(v_scales), layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// Q4_0 decode seed across backends. See [`decode_seed_kv_quant`].
+#[allow(clippy::too_many_arguments)]
+pub fn decode_seed_kv_q4_0(
+    k_q: &[u8], v_q: &[u8], layer_idx: usize, pos: u32,
+    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+) -> bool {
+    decode_seed_kv_quant(
+        QuantKv::Q4_0, k_q, v_q, None, None, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// NVFP4 decode seed across backends. See [`decode_seed_kv_quant`].
+#[allow(clippy::too_many_arguments)]
+pub fn decode_seed_kv_nvfp4(
+    k_packed: &[u8], v_packed: &[u8], layer_idx: usize, pos: u32,
+    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+) -> bool {
+    decode_seed_kv_quant(
+        QuantKv::Nvfp4, k_packed, v_packed, None, None, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// MXFP4 decode seed across backends. See [`decode_seed_kv_quant`].
+#[allow(clippy::too_many_arguments)]
+pub fn decode_seed_kv_mxfp4(
+    k_packed: &[u8], v_packed: &[u8], layer_idx: usize, pos: u32,
+    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+) -> bool {
+    decode_seed_kv_quant(
+        QuantKv::Mxfp4, k_packed, v_packed, None, None, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// MXFP6 decode seed across backends. See [`decode_seed_kv_quant`].
+#[allow(clippy::too_many_arguments)]
+pub fn decode_seed_kv_mxfp6(
+    k_packed: &[u8], v_packed: &[u8], layer_idx: usize, pos: u32,
+    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+) -> bool {
+    decode_seed_kv_quant(
+        QuantKv::Mxfp6, k_packed, v_packed, None, None, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// MXFP8 decode seed across backends. See [`decode_seed_kv_quant`].
+#[allow(clippy::too_many_arguments)]
+pub fn decode_seed_kv_mxfp8(
+    k_packed: &[u8], v_packed: &[u8], layer_idx: usize, pos: u32,
+    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+) -> bool {
+    decode_seed_kv_quant(
+        QuantKv::Mxfp8, k_packed, v_packed, None, None, layer_idx, pos,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
+/// TurboQuant decode seed across backends. See [`decode_seed_kv_quant`].
+#[allow(clippy::too_many_arguments)]
+pub fn decode_seed_kv_tq(
+    bits: u8,
+    k_packed: &[u8], v_packed: &[u8], k_scales: &[f32], v_scales: &[f32],
+    layer_idx: usize, pos: u32,
+    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+) -> bool {
+    decode_seed_kv_quant(
+        QuantKv::Tq { bits }, k_packed, v_packed, Some(k_scales), Some(v_scales),
+        layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
 /// Shared body for every native-CUDA quantized-KV decode helper. Mirrors
 /// [`try_flash_attn_decode_usm_quant`] (same shape gate, same CPU
 /// quantizers, same epoch/valid-len gate): quantizes ONLY the new row into

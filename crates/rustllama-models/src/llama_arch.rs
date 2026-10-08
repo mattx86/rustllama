@@ -3616,9 +3616,9 @@ fn mxfp_kv_decode(
     // declines and decode runs on CPU for the whole generation.
     #[allow(clippy::type_complexity)]
     let seed_fn: fn(&[u8], &[u8], usize, u32, u32, u32, u32, u32, u32) -> bool = match fmt {
-        KvDtype::Mxfp4 => crate::accel::cuda_decode_seed_kv_mxfp4,
-        KvDtype::Mxfp6 => crate::accel::cuda_decode_seed_kv_mxfp6,
-        _ => crate::accel::cuda_decode_seed_kv_mxfp8,
+        KvDtype::Mxfp4 => crate::accel::decode_seed_kv_mxfp4,
+        KvDtype::Mxfp6 => crate::accel::decode_seed_kv_mxfp6,
+        _ => crate::accel::decode_seed_kv_mxfp8,
     };
     seed_fn(
         &k_packed[..], &v_packed[..], li, cur_pos as u32,
@@ -5306,7 +5306,7 @@ impl LlamaModel {
                             // (a no-op once resident). Without it the resident-
                             // mirror gap check declines and decode attention
                             // runs on the CPU for the whole generation.
-                            crate::accel::cuda_decode_seed_kv_f32(
+                            crate::accel::decode_seed_kv_f32(
                                 k, v, li, cur_pos as u32,
                                 n_heads as u32, n_kv_heads as u32,
                                 head_dim as u32, max_ctx as u32,
@@ -5396,7 +5396,7 @@ impl LlamaModel {
                             // Seed the CUDA decode mirror with the prefill
                             // history (no-op once resident); host k_q/v_q are
                             // byte-identical to the mirror.
-                            crate::accel::cuda_decode_seed_kv_q4_0(
+                            crate::accel::decode_seed_kv_q4_0(
                                 &k_q[..], &v_q[..], li, cur_pos as u32,
                                 n_heads as u32, n_kv_heads as u32,
                                 head_dim as u32, max_ctx as u32, cfg.n_layers as u32,
@@ -5452,7 +5452,7 @@ impl LlamaModel {
                             // Seed the CUDA decode mirror with the prefill
                             // history (no-op once resident); host k_q/k_scales
                             // are byte-identical to the mirror.
-                            crate::accel::cuda_decode_seed_kv_q8_0(
+                            crate::accel::decode_seed_kv_q8_0(
                                 unsafe {
                                     std::slice::from_raw_parts(k_q.as_ptr() as *const u8, k_q.len())
                                 },
@@ -5513,7 +5513,7 @@ impl LlamaModel {
                             // Seed the CUDA decode mirror with the prefill
                             // history (no-op once resident); host
                             // k_packed/k_scales are byte-identical to the mirror.
-                            crate::accel::cuda_decode_seed_kv_tq(
+                            crate::accel::decode_seed_kv_tq(
                                 *bits, &k_packed[..], &v_packed[..],
                                 &k_scales[..], &v_scales[..], li, cur_pos as u32,
                                 n_heads as u32, n_kv_heads as u32,
@@ -5578,7 +5578,7 @@ impl LlamaModel {
                             // Seed the CUDA decode mirror with the prefill
                             // history (no-op once resident); host k_packed/
                             // v_packed are byte-identical to the mirror.
-                            crate::accel::cuda_decode_seed_kv_nvfp4(
+                            crate::accel::decode_seed_kv_nvfp4(
                                 &k_packed[..], &v_packed[..], li, cur_pos as u32,
                                 n_heads as u32, n_kv_heads as u32,
                                 head_dim as u32, max_ctx as u32, cfg.n_layers as u32,
@@ -7431,7 +7431,7 @@ impl LlamaModel {
                     // pos = prompt_len against an empty mirror), so decode
                     // attention silently runs on the CPU while the matvec
                     // stays on the GPU.
-                    crate::accel::cuda_decode_seed_kv_f32(
+                    crate::accel::decode_seed_kv_f32(
                         k,
                         v,
                         layer_idx,
@@ -7547,7 +7547,7 @@ impl LlamaModel {
                     // the first decode step (no-op once resident); without it
                     // the mirror gap declines and quant-KV decode runs on CPU.
                     // Host k_q/k_scales are byte-identical to the mirror.
-                    crate::accel::cuda_decode_seed_kv_q8_0(
+                    crate::accel::decode_seed_kv_q8_0(
                         unsafe {
                             std::slice::from_raw_parts(k_q.as_ptr() as *const u8, k_q.len())
                         },
@@ -7670,7 +7670,7 @@ impl LlamaModel {
                     // Seed the CUDA decode mirror with the prefill history on
                     // the first decode step (no-op once resident); host
                     // k_packed/k_scales are byte-identical to the mirror.
-                    crate::accel::cuda_decode_seed_kv_tq(
+                    crate::accel::decode_seed_kv_tq(
                         *bits,
                         &k_packed[..],
                         &v_packed[..],
@@ -7780,7 +7780,7 @@ impl LlamaModel {
                     // Seed the CUDA decode mirror with the prefill history on
                     // the first decode step (no-op once resident); host
                     // k_packed/v_packed are byte-identical to the mirror.
-                    crate::accel::cuda_decode_seed_kv_nvfp4(
+                    crate::accel::decode_seed_kv_nvfp4(
                         &k_packed[..],
                         &v_packed[..],
                         layer_idx,
@@ -7934,7 +7934,7 @@ impl LlamaModel {
                     // the first decode step (no-op once resident); host k_q/v_q
                     // (quantized from the whitened k_buf) are byte-identical to
                     // the mirror, so a direct copy is correct.
-                    crate::accel::cuda_decode_seed_kv_q4_0(
+                    crate::accel::decode_seed_kv_q4_0(
                         &k_q[..],
                         &v_q[..],
                         layer_idx,
