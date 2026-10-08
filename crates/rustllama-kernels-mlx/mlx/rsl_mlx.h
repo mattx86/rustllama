@@ -141,6 +141,29 @@ RSL_MLX_DECL_PACKED(matvec_q3_k_packed_f32)
 RSL_MLX_DECL_PACKED(matvec_pq2_0_packed_f32)
 #undef RSL_MLX_DECL_PACKED
 
+/* Fused gate+up matvec (decode): one dispatch computes gate_out + up_out for
+ * the FFN. gw/uw = packed gate/up weights [M,K]; gout/uout = [M] device ptrs.
+ * Reuses the format's single-matvec dequant (bit-exact). Return 0 on success. */
+#define RSL_MLX_DECL_GATE_UP_FUSED(NAME)                                       \
+    int rsl_mlx_##NAME##_gate_up_fused(rsl_mlx_stream *s, const void *gw,      \
+                                       const void *uw, const float *x,         \
+                                       float *gout, float *uout, int M, int K);
+RSL_MLX_DECL_GATE_UP_FUSED(matvec_q8_0_packed_f32)
+RSL_MLX_DECL_GATE_UP_FUSED(matvec_q4_k_packed_f32)
+RSL_MLX_DECL_GATE_UP_FUSED(matvec_q6_k_packed_f32)
+RSL_MLX_DECL_GATE_UP_FUSED(matvec_q5_k_packed_f32)
+RSL_MLX_DECL_GATE_UP_FUSED(matvec_iq4_nl_packed_f32)
+RSL_MLX_DECL_GATE_UP_FUSED(matvec_iq4_xs_packed_f32)
+RSL_MLX_DECL_GATE_UP_FUSED(matvec_iq1_s_packed_f32)
+RSL_MLX_DECL_GATE_UP_FUSED(matvec_iq1_m_packed_f32)
+RSL_MLX_DECL_GATE_UP_FUSED(matvec_iq2_xxs_packed_f32)
+RSL_MLX_DECL_GATE_UP_FUSED(matvec_iq2_xs_packed_f32)
+RSL_MLX_DECL_GATE_UP_FUSED(matvec_iq2_s_packed_f32)
+RSL_MLX_DECL_GATE_UP_FUSED(matvec_iq3_xxs_packed_f32)
+RSL_MLX_DECL_GATE_UP_FUSED(matvec_iq3_s_packed_f32)
+RSL_MLX_DECL_GATE_UP_FUSED(matvec_ptq1_0_packed_f32)
+#undef RSL_MLX_DECL_GATE_UP_FUSED
+
 /* ============================================================
  * Forward-pass primitives (device-resident, F32). Ports of the CUDA/SYCL
  * kernels; all pointers are DEVICE pointers on the stream's device.

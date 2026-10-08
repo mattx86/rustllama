@@ -1798,6 +1798,89 @@ RSL_PACKED_MATVEC(matvec_mxfp4_packed_f32,  mxfp4_row_dot,   32,  17,  32)
 RSL_PACKED_MATVEC(matvec_mxfp6_packed_f32,  mxfp6_row_dot,   32,  25,  32)
 RSL_PACKED_MATVEC(matvec_mxfp8_packed_f32,  mxfp8_row_dot,   32,  33,  32)
 
+// ============================================================
+// Fused gate+up matvec (DECODE — one x column): a single launch computes BOTH
+// FFN projections, gate_out[m] = gate_w[m,:]·x and up_out[m] = up_w[m,:]·x,
+// reusing the EXACT per-format `row_dot` the single matvec is parity-validated
+// against. So the fused result is bit-exact to running the two matvecs
+// separately; the win is one launch instead of two (and the second x read hits
+// L2). Mirrors the SYCL `matvec_<fmt>_gate_up_fused_usm` kernels + is the CUDA
+// target of accel.rs `try_matvec_tensor_gate_up_fused_usm_f32` (default-off).
+// Two macros so each format keeps its single-matvec work distribution: WARP
+// (q8_0/q4_k/q6_k, one warp per row + shfl-reduce) and thread-per-row (rest).
+// ============================================================
+#define RSL_GATE_UP_FUSED(NAME, ROWDOT, KMOD, BPB, EPB)                       \
+    __global__ void NAME##_gate_up_fused_kernel(                              \
+        const unsigned char *gw, const unsigned char *uw, const float *x,     \
+        float *gout, float *uout, int M, int K) {                             \
+        int m = blockIdx.x * blockDim.x + threadIdx.x;                        \
+        if (m >= M) return;                                                   \
+        int bpr = K / (EPB);                                                  \
+        size_t off = (size_t)m * bpr * (BPB);                                 \
+        gout[m] = ROWDOT(gw + off, x, bpr);                                   \
+        uout[m] = ROWDOT(uw + off, x, bpr);                                   \
+    }                                                                         \
+    extern "C" int rsl_cuda_##NAME##_gate_up_fused(                           \
+        rsl_cuda_stream *s, const void *gw, const void *uw, const float *x,   \
+        float *gout, float *uout, int M, int K) {                             \
+        if (!s || !gw || !uw || !x || !gout || !uout || M <= 0 || K <= 0 ||   \
+            (K % (KMOD)) != 0)                                                 \
+            return -1;                                                         \
+        cudaSetDevice(s->device);                                             \
+        int t = 128, b = (M + t - 1) / t;                                     \
+        NAME##_gate_up_fused_kernel<<<b, t, 0, s->stream>>>(                  \
+            (const unsigned char *)gw, (const unsigned char *)uw, x, gout,     \
+            uout, M, K);                                                       \
+        return rsl_cuda_check("rsl_cuda_" #NAME "_gate_up_fused");            \
+    }
+
+#define RSL_GATE_UP_FUSED_WARP(NAME, ROWDOTWARP, KMOD, BPB, EPB)              \
+    __global__ void NAME##_gate_up_fused_kernel(                              \
+        const unsigned char *gw, const unsigned char *uw, const float *x,     \
+        float *gout, float *uout, int M, int K) {                             \
+        int row = blockIdx.x * blockDim.y + threadIdx.y;                      \
+        if (row >= M) return;                                                 \
+        int lane = threadIdx.x;                                               \
+        int bpr = K / (EPB);                                                  \
+        size_t off = (size_t)row * bpr * (BPB);                               \
+        float g = ROWDOTWARP(gw + off, x, bpr, lane);                         \
+        float u = ROWDOTWARP(uw + off, x, bpr, lane);                         \
+        for (int o = warpSize >> 1; o > 0; o >>= 1) {                         \
+            g += __shfl_down_sync(0xffffffffu, g, o);                         \
+            u += __shfl_down_sync(0xffffffffu, u, o);                         \
+        }                                                                     \
+        if (lane == 0) { gout[row] = g; uout[row] = u; }                      \
+    }                                                                         \
+    extern "C" int rsl_cuda_##NAME##_gate_up_fused(                           \
+        rsl_cuda_stream *s, const void *gw, const void *uw, const float *x,   \
+        float *gout, float *uout, int M, int K) {                             \
+        if (!s || !gw || !uw || !x || !gout || !uout || M <= 0 || K <= 0 ||   \
+            (K % (KMOD)) != 0)                                                 \
+            return -1;                                                         \
+        cudaSetDevice(s->device);                                             \
+        dim3 block(32, 8);                                                    \
+        dim3 grid((unsigned)((M + 7) / 8));                                   \
+        NAME##_gate_up_fused_kernel<<<grid, block, 0, s->stream>>>(           \
+            (const unsigned char *)gw, (const unsigned char *)uw, x, gout,     \
+            uout, M, K);                                                       \
+        return rsl_cuda_check("rsl_cuda_" #NAME "_gate_up_fused");            \
+    }
+
+RSL_GATE_UP_FUSED_WARP(matvec_q8_0_packed_f32, q8_0_row_dot_warp, 32, 34, 32)
+RSL_GATE_UP_FUSED_WARP(matvec_q4_k_packed_f32, q4_k_row_dot_warp, 256, 144, 256)
+RSL_GATE_UP_FUSED_WARP(matvec_q6_k_packed_f32, q6_k_row_dot_warp, 256, 210, 256)
+RSL_GATE_UP_FUSED(matvec_q5_k_packed_f32,   q5_k_row_dot,   256, 176, 256)
+RSL_GATE_UP_FUSED(matvec_iq4_nl_packed_f32, iq4_nl_row_dot,  32,  18,  32)
+RSL_GATE_UP_FUSED(matvec_iq4_xs_packed_f32, iq4_xs_row_dot, 256, 136, 256)
+RSL_GATE_UP_FUSED(matvec_iq1_s_packed_f32,  iq1_s_row_dot,  256,  50, 256)
+RSL_GATE_UP_FUSED(matvec_iq1_m_packed_f32,  iq1_m_row_dot,  256,  56, 256)
+RSL_GATE_UP_FUSED(matvec_iq2_xxs_packed_f32, iq2_xxs_row_dot, 256, 66, 256)
+RSL_GATE_UP_FUSED(matvec_iq2_xs_packed_f32, iq2_xs_row_dot, 256,  74, 256)
+RSL_GATE_UP_FUSED(matvec_iq2_s_packed_f32,  iq2_s_row_dot,  256,  82, 256)
+RSL_GATE_UP_FUSED(matvec_iq3_xxs_packed_f32, iq3_xxs_row_dot, 256, 98, 256)
+RSL_GATE_UP_FUSED(matvec_iq3_s_packed_f32,  iq3_s_row_dot,  256, 110, 256)
+RSL_GATE_UP_FUSED(matvec_ptq1_0_packed_f32, ptq1_0_row_dot, 128,  28, 128)
+
 // ---------- Priority 3: Q3_K + PQ2_0 (parity-gap close) ----------
 
 // Q3_K: 110 B / 256 wts. { hmask[32], qs[64], scales[12], d:f16 }.

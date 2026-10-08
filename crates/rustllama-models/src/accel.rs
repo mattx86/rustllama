@@ -162,6 +162,31 @@ fn try_matvec_packed_cuda(
     guard.matvec_packed(kind, weight_key, w_bytes, x, out, m, k)
 }
 
+/// Fused gate+up matvec via the native CUDA backend. Returns false (caller runs
+/// the two-matvec fallback) on any miss — including a `kind` without a fused
+/// kernel, which the cache method rejects internally.
+#[allow(clippy::too_many_arguments)]
+fn try_matvec_gate_up_fused_cuda(
+    kind: ck::CudaPackedKind,
+    g_key: usize,
+    g_bytes: &[u8],
+    u_key: usize,
+    u_bytes: &[u8],
+    x: &[f32],
+    gate_out: &mut [f32],
+    up_out: &mut [f32],
+    m: usize,
+    k: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    guard.matvec_gate_up_fused(kind, g_key, g_bytes, u_key, u_bytes, x, gate_out, up_out, m, k)
+}
+
 /// Batched (`n`-row) packed matvec via the native CUDA backend.
 #[allow(clippy::too_many_arguments)]
 fn try_matvec_packed_cuda_batched(
@@ -641,6 +666,31 @@ fn try_matvec_packed_mlx(
         return false;
     };
     guard.matvec_packed(kind, weight_key, w_bytes, x, out, m, k)
+}
+
+/// Fused gate+up matvec via the native MLX backend. Mirror of
+/// [`try_matvec_gate_up_fused_cuda`]; returns false on any miss (incl. a `kind`
+/// without a fused kernel, which the cache rejects internally).
+#[allow(clippy::too_many_arguments)]
+fn try_matvec_gate_up_fused_mlx(
+    kind: mk::MlxPackedKind,
+    g_key: usize,
+    g_bytes: &[u8],
+    u_key: usize,
+    u_bytes: &[u8],
+    x: &[f32],
+    gate_out: &mut [f32],
+    up_out: &mut [f32],
+    m: usize,
+    k: usize,
+) -> bool {
+    let Some(cache) = mlx_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    guard.matvec_gate_up_fused(kind, g_key, g_bytes, u_key, u_bytes, x, gate_out, up_out, m, k)
 }
 
 /// Batched (`n`-row) packed matvec via the native MLX backend. Mirror of
@@ -10027,6 +10077,108 @@ pub fn try_matvec_tensor_usm_f32(
         out.copy_from_slice(&out_buf.as_slice()[..m]);
         true
     })
+}
+
+/// Fused gate+up matvec on the native CUDA backend — the CUDA twin of
+/// [`try_matvec_tensor_gate_up_fused_usm_f32`]. One launch computes both FFN
+/// projections (reusing the parity-validated per-format row_dot, so bit-exact
+/// to two separate matvecs). Universal gates only (placement / layer cutoff /
+/// shape / tiny-matvec floor), mirroring the single-matvec CUDA arm; inert off
+/// NVIDIA (`cuda_active` == false). A miss (incl. a dtype without a fused
+/// kernel) returns false and the caller runs the two-matvec fallback.
+pub fn try_matvec_tensor_gate_up_fused_cuda_f32(
+    w_gate: &Tensor,
+    w_up: &Tensor,
+    x: &[f32],
+    gate_out: &mut [f32],
+    up_out: &mut [f32],
+    m: usize,
+    k: usize,
+) -> bool {
+    if !moe_gate_up_fused_enabled() || !cuda_active() {
+        return false;
+    }
+    if tensor_forced_to_cpu(&w_gate.name) || tensor_forced_to_cpu(&w_up.name) {
+        return false;
+    }
+    if current_layer_idx() >= n_gpu_layers() {
+        return false;
+    }
+    if m == 0 || k == 0 || x.len() != k || gate_out.len() != m || up_out.len() != m {
+        return false;
+    }
+    if w_gate.dtype != w_up.dtype {
+        return false;
+    }
+    if !matvec_above_min_flops(4u64 * m as u64 * k as u64) {
+        return false;
+    }
+    let Some(kind) = dtype_to_cuda_kind(w_gate.dtype) else {
+        return false;
+    };
+    let g_bytes = as_bytes(w_gate);
+    let u_bytes = as_bytes(w_up);
+    try_matvec_gate_up_fused_cuda(
+        kind,
+        g_bytes.as_ptr() as usize,
+        g_bytes,
+        u_bytes.as_ptr() as usize,
+        u_bytes,
+        x,
+        gate_out,
+        up_out,
+        m,
+        k,
+    )
+}
+
+/// Fused gate+up matvec on the native MLX (Apple Metal) backend — the MLX twin
+/// of [`try_matvec_tensor_gate_up_fused_cuda_f32`]. Inert off Apple Silicon
+/// (`mlx_active` == false). A miss returns false → two-matvec fallback.
+pub fn try_matvec_tensor_gate_up_fused_mlx_f32(
+    w_gate: &Tensor,
+    w_up: &Tensor,
+    x: &[f32],
+    gate_out: &mut [f32],
+    up_out: &mut [f32],
+    m: usize,
+    k: usize,
+) -> bool {
+    if !moe_gate_up_fused_enabled() || !mlx_active() {
+        return false;
+    }
+    if tensor_forced_to_cpu(&w_gate.name) || tensor_forced_to_cpu(&w_up.name) {
+        return false;
+    }
+    if current_layer_idx() >= n_gpu_layers() {
+        return false;
+    }
+    if m == 0 || k == 0 || x.len() != k || gate_out.len() != m || up_out.len() != m {
+        return false;
+    }
+    if w_gate.dtype != w_up.dtype {
+        return false;
+    }
+    if !matvec_above_min_flops(4u64 * m as u64 * k as u64) {
+        return false;
+    }
+    let Some(kind) = dtype_to_mlx_kind(w_gate.dtype) else {
+        return false;
+    };
+    let g_bytes = as_bytes(w_gate);
+    let u_bytes = as_bytes(w_up);
+    try_matvec_gate_up_fused_mlx(
+        kind,
+        g_bytes.as_ptr() as usize,
+        g_bytes,
+        u_bytes.as_ptr() as usize,
+        u_bytes,
+        x,
+        gate_out,
+        up_out,
+        m,
+        k,
+    )
 }
 
 /// H4: Fused gate + up matvec — one USM dispatch computes both

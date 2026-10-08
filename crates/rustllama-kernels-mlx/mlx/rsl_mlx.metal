@@ -1670,6 +1670,1201 @@ kernel void rsl_mlx_matvec_iq1_m_packed_f32_kernel(
 }
 
 // ======================================================================
+// Fused gate+up matvec (decode). Each kernel computes BOTH FFN projections
+// for one x column at once: gout[m] = gate_w[m,:]·x and uout[m] = up_w[m,:]·x.
+// The grid is 1-D (M threadgroups of 32 lanes); x is a single column so the
+// x index is used directly (no col/N dimension). Each is the FUSED TWIN of the
+// single `rsl_mlx_matvec_<fmt>_packed_f32_kernel` above: the per-block dequant
+// is copied VERBATIM, once reading gate weights `gw` into `gacc` and once
+// reading up weights `uw` into `uacc`, over the SAME x values — so each half
+// is bit-exact with the single matvec kernel. simd_sum reduces each lane's
+// partial, lane 0 writes both outputs.
+// ======================================================================
+
+// Q8_0 fused twin (reuses rsl_mlx_matvec_q8_0_packed_f32_kernel's dequant).
+kernel void rsl_mlx_matvec_q8_0_gate_up_fused_kernel(
+    device const uchar *gw   [[buffer(0)]],
+    device const uchar *uw   [[buffer(1)]],
+    device const float *x    [[buffer(2)]],
+    device       float *gout [[buffer(3)]],
+    device       float *uout [[buffer(4)]],
+    constant int &K          [[buffer(5)]],
+    constant int &M          [[buffer(6)]],
+    uint  m_in               [[threadgroup_position_in_grid]],
+    uint  lane               [[thread_position_in_threadgroup]],
+    uint  lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)m_in;
+    if (m >= M) return;
+    const int blocks_per_row = K / 32;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 34ul;
+    device const uchar *grow = gw + (ulong)m * bytes_per_row;
+    device const uchar *urow = uw + (ulong)m * bytes_per_row;
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *gblk = grow + (ulong)b * 34ul;
+        device const uchar *ublk = urow + (ulong)b * 34ul;
+        {
+            device const uchar *blk = gblk;
+            const half d = as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            const float dscale = (float)d;
+            const int xoff = b * 32;
+            float bd = 0.0f;
+            for (int e = 0; e < 32; ++e)
+                bd += (float)((int)((char)blk[2 + e])) * x[xoff + e];
+            gacc += dscale * bd;
+        }
+        {
+            device const uchar *blk = ublk;
+            const half d = as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            const float dscale = (float)d;
+            const int xoff = b * 32;
+            float bd = 0.0f;
+            for (int e = 0; e < 32; ++e)
+                bd += (float)((int)((char)blk[2 + e])) * x[xoff + e];
+            uacc += dscale * bd;
+        }
+    }
+    gacc = simd_sum(gacc);
+    uacc = simd_sum(uacc);
+    if (lane == 0) { gout[m] = gacc; uout[m] = uacc; }
+}
+
+// Q4_K fused twin (reuses rsl_mlx_matvec_q4_k_packed_f32_kernel's dequant).
+kernel void rsl_mlx_matvec_q4_k_gate_up_fused_kernel(
+    device const uchar *gw   [[buffer(0)]],
+    device const uchar *uw   [[buffer(1)]],
+    device const float *x    [[buffer(2)]],
+    device       float *gout [[buffer(3)]],
+    device       float *uout [[buffer(4)]],
+    constant int &K          [[buffer(5)]],
+    constant int &M          [[buffer(6)]],
+    uint  m_in               [[threadgroup_position_in_grid]],
+    uint  lane               [[thread_position_in_threadgroup]],
+    uint  lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)m_in;
+    if (m >= M) return;
+    const int blocks_per_row = K / 256;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 144ul;
+    device const uchar *grow = gw + (ulong)m * bytes_per_row;
+    device const uchar *urow = uw + (ulong)m * bytes_per_row;
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *gblk = grow + (ulong)b * 144ul;
+        device const uchar *ublk = urow + (ulong)b * 144ul;
+        {
+            device const uchar *blk = gblk;
+            const half dh = as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            const half dminh = as_type<half>((ushort)(blk[2] | ((ushort)blk[3] << 8)));
+            const float d = (float)dh;
+            const float dmin = (float)dminh;
+            device const uchar *sb = blk + 4;
+            uchar sc[8];
+            uchar mn[8];
+            for (int j = 0; j < 8; ++j) {
+                if (j < 4) {
+                    sc[j] = sb[j] & 0x3F;
+                    mn[j] = sb[j + 4] & 0x3F;
+                } else {
+                    sc[j] = (sb[j + 4] & 0x0F) | ((sb[j - 4] >> 6) << 4);
+                    mn[j] = (sb[j + 4] >> 4) | ((sb[j] >> 6) << 4);
+                }
+            }
+            device const uchar *qs = blk + 16;
+            const int x_base = b * 256;
+            for (int group = 0; group < 4; ++group) {
+                device const uchar *qc = qs + group * 32;
+                const float d_lo = d * (float)sc[group * 2];
+                const float m_lo = dmin * (float)mn[group * 2];
+                const float d_hi = d * (float)sc[group * 2 + 1];
+                const float m_hi = dmin * (float)mn[group * 2 + 1];
+                const int x_lo = x_base + group * 64;
+                const int x_hi = x_lo + 32;
+                for (int l = 0; l < 32; ++l) {
+                    const uchar qb = qc[l];
+                    const float q_lo = (float)(qb & 0x0F);
+                    const float q_hi = (float)(qb >> 4);
+                    gacc += (d_lo * q_lo - m_lo) * x[x_lo + l];
+                    gacc += (d_hi * q_hi - m_hi) * x[x_hi + l];
+                }
+            }
+        }
+        {
+            device const uchar *blk = ublk;
+            const half dh = as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            const half dminh = as_type<half>((ushort)(blk[2] | ((ushort)blk[3] << 8)));
+            const float d = (float)dh;
+            const float dmin = (float)dminh;
+            device const uchar *sb = blk + 4;
+            uchar sc[8];
+            uchar mn[8];
+            for (int j = 0; j < 8; ++j) {
+                if (j < 4) {
+                    sc[j] = sb[j] & 0x3F;
+                    mn[j] = sb[j + 4] & 0x3F;
+                } else {
+                    sc[j] = (sb[j + 4] & 0x0F) | ((sb[j - 4] >> 6) << 4);
+                    mn[j] = (sb[j + 4] >> 4) | ((sb[j] >> 6) << 4);
+                }
+            }
+            device const uchar *qs = blk + 16;
+            const int x_base = b * 256;
+            for (int group = 0; group < 4; ++group) {
+                device const uchar *qc = qs + group * 32;
+                const float d_lo = d * (float)sc[group * 2];
+                const float m_lo = dmin * (float)mn[group * 2];
+                const float d_hi = d * (float)sc[group * 2 + 1];
+                const float m_hi = dmin * (float)mn[group * 2 + 1];
+                const int x_lo = x_base + group * 64;
+                const int x_hi = x_lo + 32;
+                for (int l = 0; l < 32; ++l) {
+                    const uchar qb = qc[l];
+                    const float q_lo = (float)(qb & 0x0F);
+                    const float q_hi = (float)(qb >> 4);
+                    uacc += (d_lo * q_lo - m_lo) * x[x_lo + l];
+                    uacc += (d_hi * q_hi - m_hi) * x[x_hi + l];
+                }
+            }
+        }
+    }
+    gacc = simd_sum(gacc);
+    uacc = simd_sum(uacc);
+    if (lane == 0) { gout[m] = gacc; uout[m] = uacc; }
+}
+
+// Q6_K fused twin (reuses rsl_mlx_matvec_q6_k_packed_f32_kernel's dequant).
+kernel void rsl_mlx_matvec_q6_k_gate_up_fused_kernel(
+    device const uchar *gw   [[buffer(0)]],
+    device const uchar *uw   [[buffer(1)]],
+    device const float *x    [[buffer(2)]],
+    device       float *gout [[buffer(3)]],
+    device       float *uout [[buffer(4)]],
+    constant int &K          [[buffer(5)]],
+    constant int &M          [[buffer(6)]],
+    uint  m_in               [[threadgroup_position_in_grid]],
+    uint  lane               [[thread_position_in_threadgroup]],
+    uint  lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)m_in;
+    if (m >= M) return;
+    const int blocks_per_row = K / 256;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 210ul;
+    device const uchar *grow = gw + (ulong)m * bytes_per_row;
+    device const uchar *urow = uw + (ulong)m * bytes_per_row;
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *gblk = grow + (ulong)b * 210ul;
+        device const uchar *ublk = urow + (ulong)b * 210ul;
+        {
+            device const uchar *blk = gblk;
+            device const uchar *ql = blk;
+            device const uchar *qh = blk + 128;
+            device const uchar *sc6 = blk + 192;
+            const half dh = as_type<half>((ushort)(blk[208] | ((ushort)blk[209] << 8)));
+            const float d = (float)dh;
+            const int x_base = b * 256;
+            for (int n = 0; n < 2; ++n) {
+                for (int l = 0; l < 32; ++l) {
+                    const int is = l / 16 + n * 8;
+                    const int qh_byte = qh[32 * n + l];
+                    const int q1 = ((int)(ql[64 * n + l] & 0x0F) | (((qh_byte >> 0) & 0x03) << 4)) - 32;
+                    const int q2 = ((int)(ql[64 * n + l + 32] & 0x0F) | (((qh_byte >> 2) & 0x03) << 4)) - 32;
+                    const int q3 = ((int)(ql[64 * n + l] >> 4) | (((qh_byte >> 4) & 0x03) << 4)) - 32;
+                    const int q4 = ((int)(ql[64 * n + l + 32] >> 4) | (((qh_byte >> 6) & 0x03) << 4)) - 32;
+                    const float s0 = (float)((char)sc6[is]);
+                    const float s1 = (float)((char)sc6[is + 2]);
+                    const float s2 = (float)((char)sc6[is + 4]);
+                    const float s3 = (float)((char)sc6[is + 6]);
+                    const int base = n * 128 + l;
+                    gacc += d * s0 * (float)q1 * x[x_base + base];
+                    gacc += d * s1 * (float)q2 * x[x_base + base + 32];
+                    gacc += d * s2 * (float)q3 * x[x_base + base + 64];
+                    gacc += d * s3 * (float)q4 * x[x_base + base + 96];
+                }
+            }
+        }
+        {
+            device const uchar *blk = ublk;
+            device const uchar *ql = blk;
+            device const uchar *qh = blk + 128;
+            device const uchar *sc6 = blk + 192;
+            const half dh = as_type<half>((ushort)(blk[208] | ((ushort)blk[209] << 8)));
+            const float d = (float)dh;
+            const int x_base = b * 256;
+            for (int n = 0; n < 2; ++n) {
+                for (int l = 0; l < 32; ++l) {
+                    const int is = l / 16 + n * 8;
+                    const int qh_byte = qh[32 * n + l];
+                    const int q1 = ((int)(ql[64 * n + l] & 0x0F) | (((qh_byte >> 0) & 0x03) << 4)) - 32;
+                    const int q2 = ((int)(ql[64 * n + l + 32] & 0x0F) | (((qh_byte >> 2) & 0x03) << 4)) - 32;
+                    const int q3 = ((int)(ql[64 * n + l] >> 4) | (((qh_byte >> 4) & 0x03) << 4)) - 32;
+                    const int q4 = ((int)(ql[64 * n + l + 32] >> 4) | (((qh_byte >> 6) & 0x03) << 4)) - 32;
+                    const float s0 = (float)((char)sc6[is]);
+                    const float s1 = (float)((char)sc6[is + 2]);
+                    const float s2 = (float)((char)sc6[is + 4]);
+                    const float s3 = (float)((char)sc6[is + 6]);
+                    const int base = n * 128 + l;
+                    uacc += d * s0 * (float)q1 * x[x_base + base];
+                    uacc += d * s1 * (float)q2 * x[x_base + base + 32];
+                    uacc += d * s2 * (float)q3 * x[x_base + base + 64];
+                    uacc += d * s3 * (float)q4 * x[x_base + base + 96];
+                }
+            }
+        }
+    }
+    gacc = simd_sum(gacc);
+    uacc = simd_sum(uacc);
+    if (lane == 0) { gout[m] = gacc; uout[m] = uacc; }
+}
+
+// Q5_K fused twin (reuses rsl_mlx_matvec_q5_k_packed_f32_kernel's dequant).
+kernel void rsl_mlx_matvec_q5_k_gate_up_fused_kernel(
+    device const uchar *gw   [[buffer(0)]],
+    device const uchar *uw   [[buffer(1)]],
+    device const float *x    [[buffer(2)]],
+    device       float *gout [[buffer(3)]],
+    device       float *uout [[buffer(4)]],
+    constant int &K          [[buffer(5)]],
+    constant int &M          [[buffer(6)]],
+    uint  m_in               [[threadgroup_position_in_grid]],
+    uint  lane               [[thread_position_in_threadgroup]],
+    uint  lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)m_in;
+    if (m >= M) return;
+    const int blocks_per_row = K / 256;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 176ul;
+    device const uchar *grow = gw + (ulong)m * bytes_per_row;
+    device const uchar *urow = uw + (ulong)m * bytes_per_row;
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *gblk = grow + (ulong)b * 176ul;
+        device const uchar *ublk = urow + (ulong)b * 176ul;
+        {
+            device const uchar *blk = gblk;
+            const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            const float dmin = (float)as_type<half>((ushort)(blk[2] | ((ushort)blk[3] << 8)));
+            device const uchar *sb = blk + 4;
+            uchar sc[8];
+            uchar mn[8];
+            for (int j = 0; j < 8; ++j) {
+                if (j < 4) {
+                    sc[j] = sb[j] & 0x3F;
+                    mn[j] = sb[j + 4] & 0x3F;
+                } else {
+                    sc[j] = (sb[j + 4] & 0x0F) | ((sb[j - 4] >> 6) << 4);
+                    mn[j] = (sb[j + 4] >> 4) | ((sb[j] >> 6) << 4);
+                }
+            }
+            device const uchar *qh = blk + 16;
+            device const uchar *qs = blk + 48;
+            const int x_base = b * 256;
+            for (int group = 0; group < 4; ++group) {
+                device const uchar *qc = qs + group * 32;
+                const float d_lo = d * (float)sc[group * 2];
+                const float m_lo = dmin * (float)mn[group * 2];
+                const float d_hi = d * (float)sc[group * 2 + 1];
+                const float m_hi = dmin * (float)mn[group * 2 + 1];
+                const int bit_lo = group * 2;
+                const int bit_hi = group * 2 + 1;
+                const int x_lo = x_base + group * 64;
+                const int x_hi = x_lo + 32;
+                for (int l = 0; l < 32; ++l) {
+                    const uchar qb = qc[l];
+                    const uchar qhb = qh[l];
+                    const uint lo = (uint)(qb & 0x0F) | ((uint)((qhb >> bit_lo) & 1) << 4);
+                    const uint hi = (uint)(qb >> 4) | ((uint)((qhb >> bit_hi) & 1) << 4);
+                    gacc += (d_lo * (float)lo - m_lo) * x[x_lo + l];
+                    gacc += (d_hi * (float)hi - m_hi) * x[x_hi + l];
+                }
+            }
+        }
+        {
+            device const uchar *blk = ublk;
+            const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            const float dmin = (float)as_type<half>((ushort)(blk[2] | ((ushort)blk[3] << 8)));
+            device const uchar *sb = blk + 4;
+            uchar sc[8];
+            uchar mn[8];
+            for (int j = 0; j < 8; ++j) {
+                if (j < 4) {
+                    sc[j] = sb[j] & 0x3F;
+                    mn[j] = sb[j + 4] & 0x3F;
+                } else {
+                    sc[j] = (sb[j + 4] & 0x0F) | ((sb[j - 4] >> 6) << 4);
+                    mn[j] = (sb[j + 4] >> 4) | ((sb[j] >> 6) << 4);
+                }
+            }
+            device const uchar *qh = blk + 16;
+            device const uchar *qs = blk + 48;
+            const int x_base = b * 256;
+            for (int group = 0; group < 4; ++group) {
+                device const uchar *qc = qs + group * 32;
+                const float d_lo = d * (float)sc[group * 2];
+                const float m_lo = dmin * (float)mn[group * 2];
+                const float d_hi = d * (float)sc[group * 2 + 1];
+                const float m_hi = dmin * (float)mn[group * 2 + 1];
+                const int bit_lo = group * 2;
+                const int bit_hi = group * 2 + 1;
+                const int x_lo = x_base + group * 64;
+                const int x_hi = x_lo + 32;
+                for (int l = 0; l < 32; ++l) {
+                    const uchar qb = qc[l];
+                    const uchar qhb = qh[l];
+                    const uint lo = (uint)(qb & 0x0F) | ((uint)((qhb >> bit_lo) & 1) << 4);
+                    const uint hi = (uint)(qb >> 4) | ((uint)((qhb >> bit_hi) & 1) << 4);
+                    uacc += (d_lo * (float)lo - m_lo) * x[x_lo + l];
+                    uacc += (d_hi * (float)hi - m_hi) * x[x_hi + l];
+                }
+            }
+        }
+    }
+    gacc = simd_sum(gacc);
+    uacc = simd_sum(uacc);
+    if (lane == 0) { gout[m] = gacc; uout[m] = uacc; }
+}
+
+// IQ4_NL fused twin (reuses rsl_mlx_matvec_iq4_nl_packed_f32_kernel's dequant).
+kernel void rsl_mlx_matvec_iq4_nl_gate_up_fused_kernel(
+    device const uchar *gw   [[buffer(0)]],
+    device const uchar *uw   [[buffer(1)]],
+    device const float *x    [[buffer(2)]],
+    device       float *gout [[buffer(3)]],
+    device       float *uout [[buffer(4)]],
+    constant int &K          [[buffer(5)]],
+    constant int &M          [[buffer(6)]],
+    uint  m_in               [[threadgroup_position_in_grid]],
+    uint  lane               [[thread_position_in_threadgroup]],
+    uint  lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)m_in;
+    if (m >= M) return;
+    const int blocks_per_row = K / 32;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 18ul;
+    device const uchar *grow = gw + (ulong)m * bytes_per_row;
+    device const uchar *urow = uw + (ulong)m * bytes_per_row;
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *gblk = grow + (ulong)b * 18ul;
+        device const uchar *ublk = urow + (ulong)b * 18ul;
+        {
+            device const uchar *blk = gblk;
+            const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            device const uchar *qs = blk + 2;
+            const int x_off = b * 32;
+            for (int j = 0; j < 16; ++j) {
+                const int lo = (int)(qs[j] & 0x0F);
+                const int hi = (int)(qs[j] >> 4);
+                gacc += d * (float)KVALUES_IQ4[lo] * x[x_off + j];
+                gacc += d * (float)KVALUES_IQ4[hi] * x[x_off + j + 16];
+            }
+        }
+        {
+            device const uchar *blk = ublk;
+            const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            device const uchar *qs = blk + 2;
+            const int x_off = b * 32;
+            for (int j = 0; j < 16; ++j) {
+                const int lo = (int)(qs[j] & 0x0F);
+                const int hi = (int)(qs[j] >> 4);
+                uacc += d * (float)KVALUES_IQ4[lo] * x[x_off + j];
+                uacc += d * (float)KVALUES_IQ4[hi] * x[x_off + j + 16];
+            }
+        }
+    }
+    gacc = simd_sum(gacc);
+    uacc = simd_sum(uacc);
+    if (lane == 0) { gout[m] = gacc; uout[m] = uacc; }
+}
+
+// IQ4_XS fused twin (reuses rsl_mlx_matvec_iq4_xs_packed_f32_kernel's dequant).
+kernel void rsl_mlx_matvec_iq4_xs_gate_up_fused_kernel(
+    device const uchar *gw   [[buffer(0)]],
+    device const uchar *uw   [[buffer(1)]],
+    device const float *x    [[buffer(2)]],
+    device       float *gout [[buffer(3)]],
+    device       float *uout [[buffer(4)]],
+    constant int &K          [[buffer(5)]],
+    constant int &M          [[buffer(6)]],
+    uint  m_in               [[threadgroup_position_in_grid]],
+    uint  lane               [[thread_position_in_threadgroup]],
+    uint  lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)m_in;
+    if (m >= M) return;
+    const int blocks_per_row = K / 256;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 136ul;
+    device const uchar *grow = gw + (ulong)m * bytes_per_row;
+    device const uchar *urow = uw + (ulong)m * bytes_per_row;
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *gblk = grow + (ulong)b * 136ul;
+        device const uchar *ublk = urow + (ulong)b * 136ul;
+        {
+            device const uchar *blk = gblk;
+            const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            const uint scales_h = (uint)(blk[2] | ((ushort)blk[3] << 8));
+            device const uchar *scales_l = blk + 4;
+            device const uchar *qs = blk + 8;
+            const int x_base = b * 256;
+            for (int ib = 0; ib < 8; ++ib) {
+                const uchar lo_nibble = (ib % 2 == 0) ? (scales_l[ib / 2] & 0x0F)
+                                                      : (scales_l[ib / 2] >> 4);
+                const uchar hi_bits = (uchar)((scales_h >> (2 * ib)) & 0x03u);
+                const int ls_i = (int)((uchar)(lo_nibble | (hi_bits << 4))) - 32;
+                const float sub_d = d * (float)ls_i;
+                const int q_off = ib * 16;
+                const int x_off = ib * 32;
+                for (int j = 0; j < 16; ++j) {
+                    const uchar q = qs[q_off + j];
+                    const int lo = (int)(q & 0x0F);
+                    const int hi = (int)(q >> 4);
+                    gacc += sub_d * (float)KVALUES_IQ4[lo] * x[x_base + x_off + j];
+                    gacc += sub_d * (float)KVALUES_IQ4[hi] * x[x_base + x_off + 16 + j];
+                }
+            }
+        }
+        {
+            device const uchar *blk = ublk;
+            const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            const uint scales_h = (uint)(blk[2] | ((ushort)blk[3] << 8));
+            device const uchar *scales_l = blk + 4;
+            device const uchar *qs = blk + 8;
+            const int x_base = b * 256;
+            for (int ib = 0; ib < 8; ++ib) {
+                const uchar lo_nibble = (ib % 2 == 0) ? (scales_l[ib / 2] & 0x0F)
+                                                      : (scales_l[ib / 2] >> 4);
+                const uchar hi_bits = (uchar)((scales_h >> (2 * ib)) & 0x03u);
+                const int ls_i = (int)((uchar)(lo_nibble | (hi_bits << 4))) - 32;
+                const float sub_d = d * (float)ls_i;
+                const int q_off = ib * 16;
+                const int x_off = ib * 32;
+                for (int j = 0; j < 16; ++j) {
+                    const uchar q = qs[q_off + j];
+                    const int lo = (int)(q & 0x0F);
+                    const int hi = (int)(q >> 4);
+                    uacc += sub_d * (float)KVALUES_IQ4[lo] * x[x_base + x_off + j];
+                    uacc += sub_d * (float)KVALUES_IQ4[hi] * x[x_base + x_off + 16 + j];
+                }
+            }
+        }
+    }
+    gacc = simd_sum(gacc);
+    uacc = simd_sum(uacc);
+    if (lane == 0) { gout[m] = gacc; uout[m] = uacc; }
+}
+
+// IQ1_S fused twin (reuses rsl_mlx_matvec_iq1_s_packed_f32_kernel's dequant).
+kernel void rsl_mlx_matvec_iq1_s_gate_up_fused_kernel(
+    device const uchar *gw   [[buffer(0)]],
+    device const uchar *uw   [[buffer(1)]],
+    device const float *x    [[buffer(2)]],
+    device       float *gout [[buffer(3)]],
+    device       float *uout [[buffer(4)]],
+    constant int &K          [[buffer(5)]],
+    constant int &M          [[buffer(6)]],
+    uint  m_in               [[threadgroup_position_in_grid]],
+    uint  lane               [[thread_position_in_threadgroup]],
+    uint  lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)m_in;
+    if (m >= M) return;
+    const float IQ1S_DELTA = 0.125f;
+    const int blocks_per_row = K / 256;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 50ul;
+    device const uchar *grow = gw + (ulong)m * bytes_per_row;
+    device const uchar *urow = uw + (ulong)m * bytes_per_row;
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *gblk = grow + (ulong)b * 50ul;
+        device const uchar *ublk = urow + (ulong)b * 50ul;
+        {
+            device const uchar *blk = gblk;
+            const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            device const uchar *qs = blk + 2;
+            device const uchar *qh_bytes = blk + 34;
+            const int x_base = b * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const uint qh = (uint)qh_bytes[ib32 * 2] | ((uint)qh_bytes[ib32 * 2 + 1] << 8);
+                const float dl = d * (2.0f * (float)((qh >> 12) & 7u) + 1.0f);
+                const float delta = (qh & 0x8000u) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA);
+                const int x_off = x_base + ib32 * 32;
+                for (int l = 0; l < 4; ++l) {
+                    const uint idx = (uint)qs[ib32 * 4 + l] | (((qh >> (3 * l)) & 7u) << 8);
+                    const ulong grid_bits = IQ1S_GRID_MLX[idx];
+                    for (int j = 0; j < 8; ++j) {
+                        const int gi = (int)((char)((grid_bits >> (j * 8)) & 0xFFul));
+                        gacc += dl * ((float)gi + delta) * x[x_off + l * 8 + j];
+                    }
+                }
+            }
+        }
+        {
+            device const uchar *blk = ublk;
+            const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            device const uchar *qs = blk + 2;
+            device const uchar *qh_bytes = blk + 34;
+            const int x_base = b * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const uint qh = (uint)qh_bytes[ib32 * 2] | ((uint)qh_bytes[ib32 * 2 + 1] << 8);
+                const float dl = d * (2.0f * (float)((qh >> 12) & 7u) + 1.0f);
+                const float delta = (qh & 0x8000u) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA);
+                const int x_off = x_base + ib32 * 32;
+                for (int l = 0; l < 4; ++l) {
+                    const uint idx = (uint)qs[ib32 * 4 + l] | (((qh >> (3 * l)) & 7u) << 8);
+                    const ulong grid_bits = IQ1S_GRID_MLX[idx];
+                    for (int j = 0; j < 8; ++j) {
+                        const int gi = (int)((char)((grid_bits >> (j * 8)) & 0xFFul));
+                        uacc += dl * ((float)gi + delta) * x[x_off + l * 8 + j];
+                    }
+                }
+            }
+        }
+    }
+    gacc = simd_sum(gacc);
+    uacc = simd_sum(uacc);
+    if (lane == 0) { gout[m] = gacc; uout[m] = uacc; }
+}
+
+// IQ1_M fused twin (reuses rsl_mlx_matvec_iq1_m_packed_f32_kernel's dequant).
+kernel void rsl_mlx_matvec_iq1_m_gate_up_fused_kernel(
+    device const uchar *gw   [[buffer(0)]],
+    device const uchar *uw   [[buffer(1)]],
+    device const float *x    [[buffer(2)]],
+    device       float *gout [[buffer(3)]],
+    device       float *uout [[buffer(4)]],
+    constant int &K          [[buffer(5)]],
+    constant int &M          [[buffer(6)]],
+    uint  m_in               [[threadgroup_position_in_grid]],
+    uint  lane               [[thread_position_in_threadgroup]],
+    uint  lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)m_in;
+    if (m >= M) return;
+    const float IQ1S_DELTA = 0.125f;
+    const int blocks_per_row = K / 256;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 56ul;
+    device const uchar *grow = gw + (ulong)m * bytes_per_row;
+    device const uchar *urow = uw + (ulong)m * bytes_per_row;
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *gblk = grow + (ulong)b * 56ul;
+        device const uchar *ublk = urow + (ulong)b * 56ul;
+        {
+            device const uchar *blk = gblk;
+            device const uchar *qs = blk;
+            device const uchar *qh = blk + 32;
+            device const uchar *sc_bytes = blk + 48;
+            uint sc[4];
+            for (int ii = 0; ii < 4; ++ii) {
+                sc[ii] = (uint)sc_bytes[ii * 2] | ((uint)sc_bytes[ii * 2 + 1] << 8);
+            }
+            const ushort d_bits = (ushort)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0u) | ((sc[2] >> 4) & 0x0F00u) | (sc[3] & 0xF000u));
+            const float d = (float)as_type<half>(d_bits);
+            const int x_base = b * 256;
+            int x_off = 0;
+            for (int ib = 0; ib < 8; ++ib) {
+                const uint s_word = sc[ib / 2];
+                const int shift0 = 6 * (ib % 2);
+                const int shift1 = shift0 + 3;
+                const float dl1 = d * (2.0f * (float)((s_word >> shift0) & 0x7u) + 1.0f);
+                const float dl2 = d * (2.0f * (float)((s_word >> shift1) & 0x7u) + 1.0f);
+                const uchar qh0 = qh[ib * 2];
+                const uchar qh1 = qh[ib * 2 + 1];
+                const float delta_l[4] = {
+                    (qh0 & 0x08u) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA),
+                    (qh0 & 0x80u) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA),
+                    (qh1 & 0x08u) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA),
+                    (qh1 & 0x80u) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA),
+                };
+                const uint idx_l[4] = {
+                    (uint)qs[ib * 4 + 0] | (((uint)qh0 & 0x07u) << 8),
+                    (uint)qs[ib * 4 + 1] | ((((uint)qh0 >> 4) & 0x07u) << 8),
+                    (uint)qs[ib * 4 + 2] | (((uint)qh1 & 0x07u) << 8),
+                    (uint)qs[ib * 4 + 3] | ((((uint)qh1 >> 4) & 0x07u) << 8),
+                };
+                const float dl_l[4] = { dl1, dl1, dl2, dl2 };
+                for (int l = 0; l < 4; ++l) {
+                    const ulong grid_bits = IQ1S_GRID_MLX[idx_l[l]];
+                    const float dl_delta = dl_l[l] * delta_l[l];
+                    for (int j = 0; j < 8; ++j) {
+                        const int gi = (int)((char)((grid_bits >> (j * 8)) & 0xFFul));
+                        const float val = dl_l[l] * (float)gi + dl_delta;
+                        gacc += val * x[x_base + x_off + 8 * l + j];
+                    }
+                }
+                x_off += 32;
+            }
+        }
+        {
+            device const uchar *blk = ublk;
+            device const uchar *qs = blk;
+            device const uchar *qh = blk + 32;
+            device const uchar *sc_bytes = blk + 48;
+            uint sc[4];
+            for (int ii = 0; ii < 4; ++ii) {
+                sc[ii] = (uint)sc_bytes[ii * 2] | ((uint)sc_bytes[ii * 2 + 1] << 8);
+            }
+            const ushort d_bits = (ushort)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0u) | ((sc[2] >> 4) & 0x0F00u) | (sc[3] & 0xF000u));
+            const float d = (float)as_type<half>(d_bits);
+            const int x_base = b * 256;
+            int x_off = 0;
+            for (int ib = 0; ib < 8; ++ib) {
+                const uint s_word = sc[ib / 2];
+                const int shift0 = 6 * (ib % 2);
+                const int shift1 = shift0 + 3;
+                const float dl1 = d * (2.0f * (float)((s_word >> shift0) & 0x7u) + 1.0f);
+                const float dl2 = d * (2.0f * (float)((s_word >> shift1) & 0x7u) + 1.0f);
+                const uchar qh0 = qh[ib * 2];
+                const uchar qh1 = qh[ib * 2 + 1];
+                const float delta_l[4] = {
+                    (qh0 & 0x08u) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA),
+                    (qh0 & 0x80u) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA),
+                    (qh1 & 0x08u) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA),
+                    (qh1 & 0x80u) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA),
+                };
+                const uint idx_l[4] = {
+                    (uint)qs[ib * 4 + 0] | (((uint)qh0 & 0x07u) << 8),
+                    (uint)qs[ib * 4 + 1] | ((((uint)qh0 >> 4) & 0x07u) << 8),
+                    (uint)qs[ib * 4 + 2] | (((uint)qh1 & 0x07u) << 8),
+                    (uint)qs[ib * 4 + 3] | ((((uint)qh1 >> 4) & 0x07u) << 8),
+                };
+                const float dl_l[4] = { dl1, dl1, dl2, dl2 };
+                for (int l = 0; l < 4; ++l) {
+                    const ulong grid_bits = IQ1S_GRID_MLX[idx_l[l]];
+                    const float dl_delta = dl_l[l] * delta_l[l];
+                    for (int j = 0; j < 8; ++j) {
+                        const int gi = (int)((char)((grid_bits >> (j * 8)) & 0xFFul));
+                        const float val = dl_l[l] * (float)gi + dl_delta;
+                        uacc += val * x[x_base + x_off + 8 * l + j];
+                    }
+                }
+                x_off += 32;
+            }
+        }
+    }
+    gacc = simd_sum(gacc);
+    uacc = simd_sum(uacc);
+    if (lane == 0) { gout[m] = gacc; uout[m] = uacc; }
+}
+
+// IQ2_XXS fused twin (reuses rsl_mlx_matvec_iq2_xxs_packed_f32_kernel's dequant).
+kernel void rsl_mlx_matvec_iq2_xxs_gate_up_fused_kernel(
+    device const uchar *gw   [[buffer(0)]],
+    device const uchar *uw   [[buffer(1)]],
+    device const float *x    [[buffer(2)]],
+    device       float *gout [[buffer(3)]],
+    device       float *uout [[buffer(4)]],
+    constant int &K          [[buffer(5)]],
+    constant int &M          [[buffer(6)]],
+    uint  m_in               [[threadgroup_position_in_grid]],
+    uint  lane               [[thread_position_in_threadgroup]],
+    uint  lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)m_in;
+    if (m >= M) return;
+    const int blocks_per_row = K / 256;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 66ul;
+    device const uchar *grow = gw + (ulong)m * bytes_per_row;
+    device const uchar *urow = uw + (ulong)m * bytes_per_row;
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *gblk = grow + (ulong)b * 66ul;
+        device const uchar *ublk = urow + (ulong)b * 66ul;
+        {
+            device const uchar *blk = gblk;
+            const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            device const uchar *qs = blk + 2;
+            const int x_base = b * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const uint aux0 = (uint)qs[8 * ib32] | ((uint)qs[8 * ib32 + 1] << 8) | ((uint)qs[8 * ib32 + 2] << 16) | ((uint)qs[8 * ib32 + 3] << 24);
+                const uint aux1 = (uint)qs[8 * ib32 + 4] | ((uint)qs[8 * ib32 + 5] << 8) | ((uint)qs[8 * ib32 + 6] << 16) | ((uint)qs[8 * ib32 + 7] << 24);
+                const float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
+                for (int l = 0; l < 4; ++l) {
+                    const ulong grid_bits = IQ2XXS_GRID_MLX[(aux0 >> (8 * l)) & 0xFFu];
+                    const uchar signs = KSIGNS_IQ2XS_MLX[(aux1 >> (7 * l)) & 127u];
+                    const int x_off = x_base + ib32 * 32 + l * 8;
+                    for (int j = 0; j < 8; ++j) {
+                        const uchar gi = (uchar)((grid_bits >> (j * 8)) & 0xFFul);
+                        const float s = (signs & KMASK_IQ2XS_MLX[j]) ? -1.0f : 1.0f;
+                        gacc += db * (float)gi * s * x[x_off + j];
+                    }
+                }
+            }
+        }
+        {
+            device const uchar *blk = ublk;
+            const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            device const uchar *qs = blk + 2;
+            const int x_base = b * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const uint aux0 = (uint)qs[8 * ib32] | ((uint)qs[8 * ib32 + 1] << 8) | ((uint)qs[8 * ib32 + 2] << 16) | ((uint)qs[8 * ib32 + 3] << 24);
+                const uint aux1 = (uint)qs[8 * ib32 + 4] | ((uint)qs[8 * ib32 + 5] << 8) | ((uint)qs[8 * ib32 + 6] << 16) | ((uint)qs[8 * ib32 + 7] << 24);
+                const float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
+                for (int l = 0; l < 4; ++l) {
+                    const ulong grid_bits = IQ2XXS_GRID_MLX[(aux0 >> (8 * l)) & 0xFFu];
+                    const uchar signs = KSIGNS_IQ2XS_MLX[(aux1 >> (7 * l)) & 127u];
+                    const int x_off = x_base + ib32 * 32 + l * 8;
+                    for (int j = 0; j < 8; ++j) {
+                        const uchar gi = (uchar)((grid_bits >> (j * 8)) & 0xFFul);
+                        const float s = (signs & KMASK_IQ2XS_MLX[j]) ? -1.0f : 1.0f;
+                        uacc += db * (float)gi * s * x[x_off + j];
+                    }
+                }
+            }
+        }
+    }
+    gacc = simd_sum(gacc);
+    uacc = simd_sum(uacc);
+    if (lane == 0) { gout[m] = gacc; uout[m] = uacc; }
+}
+
+// IQ2_XS fused twin (reuses rsl_mlx_matvec_iq2_xs_packed_f32_kernel's dequant).
+kernel void rsl_mlx_matvec_iq2_xs_gate_up_fused_kernel(
+    device const uchar *gw   [[buffer(0)]],
+    device const uchar *uw   [[buffer(1)]],
+    device const float *x    [[buffer(2)]],
+    device       float *gout [[buffer(3)]],
+    device       float *uout [[buffer(4)]],
+    constant int &K          [[buffer(5)]],
+    constant int &M          [[buffer(6)]],
+    uint  m_in               [[threadgroup_position_in_grid]],
+    uint  lane               [[thread_position_in_threadgroup]],
+    uint  lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)m_in;
+    if (m >= M) return;
+    const int blocks_per_row = K / 256;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 74ul;
+    device const uchar *grow = gw + (ulong)m * bytes_per_row;
+    device const uchar *urow = uw + (ulong)m * bytes_per_row;
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *gblk = grow + (ulong)b * 74ul;
+        device const uchar *ublk = urow + (ulong)b * 74ul;
+        {
+            device const uchar *blk = gblk;
+            const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            device const uchar *qs = blk + 2;
+            device const uchar *scales = blk + 66;
+            const int x_base = b * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const uchar scale_byte = scales[ib32];
+                const float db_lo = d * (0.5f + (float)(scale_byte & 0x0Fu)) * 0.25f;
+                const float db_hi = d * (0.5f + (float)(scale_byte >> 4)) * 0.25f;
+                const int base = 8 * ib32;
+                for (int l = 0; l < 4; ++l) {
+                    const uint qv = (uint)qs[base + 2 * l] | ((uint)qs[base + 2 * l + 1] << 8);
+                    const ulong grid_bits = IQ2XS_GRID_MLX[qv & 0x1FFu];
+                    const uchar signs = KSIGNS_IQ2XS_MLX[qv >> 9];
+                    const float db = (l < 2) ? db_lo : db_hi;
+                    const int x_off = x_base + ib32 * 32 + l * 8;
+                    for (int j = 0; j < 8; ++j) {
+                        const uchar gi = (uchar)((grid_bits >> (j * 8)) & 0xFFul);
+                        const float s = (signs & KMASK_IQ2XS_MLX[j]) ? -1.0f : 1.0f;
+                        gacc += db * (float)gi * s * x[x_off + j];
+                    }
+                }
+            }
+        }
+        {
+            device const uchar *blk = ublk;
+            const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            device const uchar *qs = blk + 2;
+            device const uchar *scales = blk + 66;
+            const int x_base = b * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const uchar scale_byte = scales[ib32];
+                const float db_lo = d * (0.5f + (float)(scale_byte & 0x0Fu)) * 0.25f;
+                const float db_hi = d * (0.5f + (float)(scale_byte >> 4)) * 0.25f;
+                const int base = 8 * ib32;
+                for (int l = 0; l < 4; ++l) {
+                    const uint qv = (uint)qs[base + 2 * l] | ((uint)qs[base + 2 * l + 1] << 8);
+                    const ulong grid_bits = IQ2XS_GRID_MLX[qv & 0x1FFu];
+                    const uchar signs = KSIGNS_IQ2XS_MLX[qv >> 9];
+                    const float db = (l < 2) ? db_lo : db_hi;
+                    const int x_off = x_base + ib32 * 32 + l * 8;
+                    for (int j = 0; j < 8; ++j) {
+                        const uchar gi = (uchar)((grid_bits >> (j * 8)) & 0xFFul);
+                        const float s = (signs & KMASK_IQ2XS_MLX[j]) ? -1.0f : 1.0f;
+                        uacc += db * (float)gi * s * x[x_off + j];
+                    }
+                }
+            }
+        }
+    }
+    gacc = simd_sum(gacc);
+    uacc = simd_sum(uacc);
+    if (lane == 0) { gout[m] = gacc; uout[m] = uacc; }
+}
+
+// IQ2_S fused twin (reuses rsl_mlx_matvec_iq2_s_packed_f32_kernel's dequant).
+kernel void rsl_mlx_matvec_iq2_s_gate_up_fused_kernel(
+    device const uchar *gw   [[buffer(0)]],
+    device const uchar *uw   [[buffer(1)]],
+    device const float *x    [[buffer(2)]],
+    device       float *gout [[buffer(3)]],
+    device       float *uout [[buffer(4)]],
+    constant int &K          [[buffer(5)]],
+    constant int &M          [[buffer(6)]],
+    uint  m_in               [[threadgroup_position_in_grid]],
+    uint  lane               [[thread_position_in_threadgroup]],
+    uint  lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)m_in;
+    if (m >= M) return;
+    const int blocks_per_row = K / 256;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 82ul;
+    device const uchar *grow = gw + (ulong)m * bytes_per_row;
+    device const uchar *urow = uw + (ulong)m * bytes_per_row;
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *gblk = grow + (ulong)b * 82ul;
+        device const uchar *ublk = urow + (ulong)b * 82ul;
+        {
+            device const uchar *blk = gblk;
+            const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            device const uchar *qs_lo = blk + 2;
+            device const uchar *signs = blk + 34;
+            device const uchar *qh = blk + 66;
+            device const uchar *scales = blk + 74;
+            const int x_base = b * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const uchar scale_byte = scales[ib32];
+                const float db_lo = d * (0.5f + (float)(scale_byte & 0x0Fu)) * 0.25f;
+                const float db_hi = d * (0.5f + (float)(scale_byte >> 4)) * 0.25f;
+                const int qs_off = ib32 * 4;
+                const uchar qh_byte = qh[ib32];
+                for (int l = 0; l < 4; ++l) {
+                    const uint high_bits = ((uint)qh_byte << (8 - 2 * l)) & 0x300u;
+                    const ulong grid_bits = IQ2S_GRID_MLX[(uint)qs_lo[qs_off + l] | high_bits];
+                    const uchar sign_byte = signs[qs_off + l];
+                    const float db = (l < 2) ? db_lo : db_hi;
+                    const int x_off = x_base + ib32 * 32 + l * 8;
+                    for (int j = 0; j < 8; ++j) {
+                        const uchar gi = (uchar)((grid_bits >> (j * 8)) & 0xFFul);
+                        const float s = (sign_byte & KMASK_IQ2XS_MLX[j]) ? -1.0f : 1.0f;
+                        gacc += db * (float)gi * s * x[x_off + j];
+                    }
+                }
+            }
+        }
+        {
+            device const uchar *blk = ublk;
+            const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            device const uchar *qs_lo = blk + 2;
+            device const uchar *signs = blk + 34;
+            device const uchar *qh = blk + 66;
+            device const uchar *scales = blk + 74;
+            const int x_base = b * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const uchar scale_byte = scales[ib32];
+                const float db_lo = d * (0.5f + (float)(scale_byte & 0x0Fu)) * 0.25f;
+                const float db_hi = d * (0.5f + (float)(scale_byte >> 4)) * 0.25f;
+                const int qs_off = ib32 * 4;
+                const uchar qh_byte = qh[ib32];
+                for (int l = 0; l < 4; ++l) {
+                    const uint high_bits = ((uint)qh_byte << (8 - 2 * l)) & 0x300u;
+                    const ulong grid_bits = IQ2S_GRID_MLX[(uint)qs_lo[qs_off + l] | high_bits];
+                    const uchar sign_byte = signs[qs_off + l];
+                    const float db = (l < 2) ? db_lo : db_hi;
+                    const int x_off = x_base + ib32 * 32 + l * 8;
+                    for (int j = 0; j < 8; ++j) {
+                        const uchar gi = (uchar)((grid_bits >> (j * 8)) & 0xFFul);
+                        const float s = (sign_byte & KMASK_IQ2XS_MLX[j]) ? -1.0f : 1.0f;
+                        uacc += db * (float)gi * s * x[x_off + j];
+                    }
+                }
+            }
+        }
+    }
+    gacc = simd_sum(gacc);
+    uacc = simd_sum(uacc);
+    if (lane == 0) { gout[m] = gacc; uout[m] = uacc; }
+}
+
+// IQ3_XXS fused twin (reuses rsl_mlx_matvec_iq3_xxs_packed_f32_kernel's dequant).
+kernel void rsl_mlx_matvec_iq3_xxs_gate_up_fused_kernel(
+    device const uchar *gw   [[buffer(0)]],
+    device const uchar *uw   [[buffer(1)]],
+    device const float *x    [[buffer(2)]],
+    device       float *gout [[buffer(3)]],
+    device       float *uout [[buffer(4)]],
+    constant int &K          [[buffer(5)]],
+    constant int &M          [[buffer(6)]],
+    uint  m_in               [[threadgroup_position_in_grid]],
+    uint  lane               [[thread_position_in_threadgroup]],
+    uint  lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)m_in;
+    if (m >= M) return;
+    const int blocks_per_row = K / 256;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 98ul;
+    device const uchar *grow = gw + (ulong)m * bytes_per_row;
+    device const uchar *urow = uw + (ulong)m * bytes_per_row;
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *gblk = grow + (ulong)b * 98ul;
+        device const uchar *ublk = urow + (ulong)b * 98ul;
+        {
+            device const uchar *blk = gblk;
+            const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            device const uchar *qs_grid = blk + 2;
+            device const uchar *qs_sas = blk + 66;
+            const int x_base = b * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const uint aux32 = (uint)qs_sas[4 * ib32] | ((uint)qs_sas[4 * ib32 + 1] << 8) | ((uint)qs_sas[4 * ib32 + 2] << 16) | ((uint)qs_sas[4 * ib32 + 3] << 24);
+                const float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+                const int qs_off = 8 * ib32;
+                for (int l = 0; l < 4; ++l) {
+                    const uint grid1 = IQ3XXS_GRID_MLX[qs_grid[qs_off + 2 * l]];
+                    const uint grid2 = IQ3XXS_GRID_MLX[qs_grid[qs_off + 2 * l + 1]];
+                    const uchar signs = KSIGNS_IQ2XS_MLX[(aux32 >> (7 * l)) & 127u];
+                    const int x_off = x_base + ib32 * 32 + l * 8;
+                    for (int j = 0; j < 4; ++j) {
+                        const uchar g1 = (uchar)((grid1 >> (j * 8)) & 0xFFu);
+                        const uchar g2 = (uchar)((grid2 >> (j * 8)) & 0xFFu);
+                        const float s_lo = (signs & KMASK_IQ2XS_MLX[j]) ? -1.0f : 1.0f;
+                        const float s_hi = (signs & KMASK_IQ2XS_MLX[j + 4]) ? -1.0f : 1.0f;
+                        gacc += db * (float)g1 * s_lo * x[x_off + j];
+                        gacc += db * (float)g2 * s_hi * x[x_off + j + 4];
+                    }
+                }
+            }
+        }
+        {
+            device const uchar *blk = ublk;
+            const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            device const uchar *qs_grid = blk + 2;
+            device const uchar *qs_sas = blk + 66;
+            const int x_base = b * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const uint aux32 = (uint)qs_sas[4 * ib32] | ((uint)qs_sas[4 * ib32 + 1] << 8) | ((uint)qs_sas[4 * ib32 + 2] << 16) | ((uint)qs_sas[4 * ib32 + 3] << 24);
+                const float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+                const int qs_off = 8 * ib32;
+                for (int l = 0; l < 4; ++l) {
+                    const uint grid1 = IQ3XXS_GRID_MLX[qs_grid[qs_off + 2 * l]];
+                    const uint grid2 = IQ3XXS_GRID_MLX[qs_grid[qs_off + 2 * l + 1]];
+                    const uchar signs = KSIGNS_IQ2XS_MLX[(aux32 >> (7 * l)) & 127u];
+                    const int x_off = x_base + ib32 * 32 + l * 8;
+                    for (int j = 0; j < 4; ++j) {
+                        const uchar g1 = (uchar)((grid1 >> (j * 8)) & 0xFFu);
+                        const uchar g2 = (uchar)((grid2 >> (j * 8)) & 0xFFu);
+                        const float s_lo = (signs & KMASK_IQ2XS_MLX[j]) ? -1.0f : 1.0f;
+                        const float s_hi = (signs & KMASK_IQ2XS_MLX[j + 4]) ? -1.0f : 1.0f;
+                        uacc += db * (float)g1 * s_lo * x[x_off + j];
+                        uacc += db * (float)g2 * s_hi * x[x_off + j + 4];
+                    }
+                }
+            }
+        }
+    }
+    gacc = simd_sum(gacc);
+    uacc = simd_sum(uacc);
+    if (lane == 0) { gout[m] = gacc; uout[m] = uacc; }
+}
+
+// IQ3_S fused twin (reuses rsl_mlx_matvec_iq3_s_packed_f32_kernel's dequant).
+kernel void rsl_mlx_matvec_iq3_s_gate_up_fused_kernel(
+    device const uchar *gw   [[buffer(0)]],
+    device const uchar *uw   [[buffer(1)]],
+    device const float *x    [[buffer(2)]],
+    device       float *gout [[buffer(3)]],
+    device       float *uout [[buffer(4)]],
+    constant int &K          [[buffer(5)]],
+    constant int &M          [[buffer(6)]],
+    uint  m_in               [[threadgroup_position_in_grid]],
+    uint  lane               [[thread_position_in_threadgroup]],
+    uint  lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)m_in;
+    if (m >= M) return;
+    const int blocks_per_row = K / 256;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 110ul;
+    device const uchar *grow = gw + (ulong)m * bytes_per_row;
+    device const uchar *urow = uw + (ulong)m * bytes_per_row;
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *gblk = grow + (ulong)b * 110ul;
+        device const uchar *ublk = urow + (ulong)b * 110ul;
+        {
+            device const uchar *blk = gblk;
+            const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            device const uchar *qs = blk + 2;
+            device const uchar *qh = blk + 66;
+            device const uchar *signs = blk + 74;
+            device const uchar *scales = blk + 106;
+            const int x_base = b * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const int pair = ib32 >> 1;
+                const uchar scale_byte = scales[pair];
+                const float db = (ib32 & 1) ? d * (1.0f + 2.0f * (float)(scale_byte >> 4))
+                                            : d * (1.0f + 2.0f * (float)(scale_byte & 0x0Fu));
+                const int qs_off = ib32 * 8;
+                const int signs_off = ib32 * 4;
+                const uchar qh_byte = qh[ib32];
+                for (int l = 0; l < 4; ++l) {
+                    const uint g1_idx = (uint)qs[qs_off + 2 * l] | (((uint)qh_byte << (8 - 2 * l)) & 0x100u);
+                    const uint g2_idx = (uint)qs[qs_off + 2 * l + 1] | (((uint)qh_byte << (7 - 2 * l)) & 0x100u);
+                    const uint grid1 = IQ3S_GRID_MLX[g1_idx];
+                    const uint grid2 = IQ3S_GRID_MLX[g2_idx];
+                    const uchar sign_byte = signs[signs_off + l];
+                    const int x_off = x_base + ib32 * 32 + l * 8;
+                    for (int j = 0; j < 4; ++j) {
+                        const uchar g1 = (uchar)((grid1 >> (j * 8)) & 0xFFu);
+                        const uchar g2 = (uchar)((grid2 >> (j * 8)) & 0xFFu);
+                        const float s_lo = (sign_byte & KMASK_IQ2XS_MLX[j]) ? -1.0f : 1.0f;
+                        const float s_hi = (sign_byte & KMASK_IQ2XS_MLX[j + 4]) ? -1.0f : 1.0f;
+                        gacc += db * (float)g1 * s_lo * x[x_off + j];
+                        gacc += db * (float)g2 * s_hi * x[x_off + j + 4];
+                    }
+                }
+            }
+        }
+        {
+            device const uchar *blk = ublk;
+            const float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            device const uchar *qs = blk + 2;
+            device const uchar *qh = blk + 66;
+            device const uchar *signs = blk + 74;
+            device const uchar *scales = blk + 106;
+            const int x_base = b * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const int pair = ib32 >> 1;
+                const uchar scale_byte = scales[pair];
+                const float db = (ib32 & 1) ? d * (1.0f + 2.0f * (float)(scale_byte >> 4))
+                                            : d * (1.0f + 2.0f * (float)(scale_byte & 0x0Fu));
+                const int qs_off = ib32 * 8;
+                const int signs_off = ib32 * 4;
+                const uchar qh_byte = qh[ib32];
+                for (int l = 0; l < 4; ++l) {
+                    const uint g1_idx = (uint)qs[qs_off + 2 * l] | (((uint)qh_byte << (8 - 2 * l)) & 0x100u);
+                    const uint g2_idx = (uint)qs[qs_off + 2 * l + 1] | (((uint)qh_byte << (7 - 2 * l)) & 0x100u);
+                    const uint grid1 = IQ3S_GRID_MLX[g1_idx];
+                    const uint grid2 = IQ3S_GRID_MLX[g2_idx];
+                    const uchar sign_byte = signs[signs_off + l];
+                    const int x_off = x_base + ib32 * 32 + l * 8;
+                    for (int j = 0; j < 4; ++j) {
+                        const uchar g1 = (uchar)((grid1 >> (j * 8)) & 0xFFu);
+                        const uchar g2 = (uchar)((grid2 >> (j * 8)) & 0xFFu);
+                        const float s_lo = (sign_byte & KMASK_IQ2XS_MLX[j]) ? -1.0f : 1.0f;
+                        const float s_hi = (sign_byte & KMASK_IQ2XS_MLX[j + 4]) ? -1.0f : 1.0f;
+                        uacc += db * (float)g1 * s_lo * x[x_off + j];
+                        uacc += db * (float)g2 * s_hi * x[x_off + j + 4];
+                    }
+                }
+            }
+        }
+    }
+    gacc = simd_sum(gacc);
+    uacc = simd_sum(uacc);
+    if (lane == 0) { gout[m] = gacc; uout[m] = uacc; }
+}
+
+// PTQ1_0 fused twin (reuses rsl_mlx_matvec_ptq1_0_packed_f32_kernel's dequant).
+kernel void rsl_mlx_matvec_ptq1_0_gate_up_fused_kernel(
+    device const uchar *gw   [[buffer(0)]],
+    device const uchar *uw   [[buffer(1)]],
+    device const float *x    [[buffer(2)]],
+    device       float *gout [[buffer(3)]],
+    device       float *uout [[buffer(4)]],
+    constant int &K          [[buffer(5)]],
+    constant int &M          [[buffer(6)]],
+    uint  m_in               [[threadgroup_position_in_grid]],
+    uint  lane               [[thread_position_in_threadgroup]],
+    uint  lane_count         [[threads_per_threadgroup]])
+{
+    const int m = (int)m_in;
+    if (m >= M) return;
+    const uchar pow3[5] = {1, 3, 9, 27, 81};
+    const int blocks_per_row = K / 128;
+    const ulong bytes_per_row = (ulong)blocks_per_row * 28ul;
+    device const uchar *grow = gw + (ulong)m * bytes_per_row;
+    device const uchar *urow = uw + (ulong)m * bytes_per_row;
+    float gacc = 0.0f, uacc = 0.0f;
+    for (int b = (int)lane; b < blocks_per_row; b += (int)lane_count) {
+        device const uchar *gblk = grow + (ulong)b * 28ul;
+        device const uchar *ublk = urow + (ulong)b * 28ul;
+        {
+            device const uchar *blk = gblk;
+            device const uchar *qs = blk;
+            device const uchar *qh = blk + 24;
+            const float d = (float)as_type<half>((ushort)(blk[26] | ((ushort)blk[27] << 8)));
+            const int x_base = b * 128;
+            float sum = 0.0f;
+            for (int n = 0; n < 5; ++n) {
+                const uchar p3 = pow3[n];
+                const int e0 = x_base + n * 16;
+                for (int mm = 0; mm < 16; ++mm) {
+                    const uchar qv = (uchar)(qs[mm] * p3);
+                    const int trit = (((int)qv * 3) >> 8) - 1;
+                    sum += (float)trit * x[e0 + mm];
+                }
+            }
+            for (int n = 0; n < 5; ++n) {
+                const uchar p3 = pow3[n];
+                const int e0 = x_base + 80 + n * 8;
+                for (int mm = 0; mm < 8; ++mm) {
+                    const uchar qv = (uchar)(qs[16 + mm] * p3);
+                    const int trit = (((int)qv * 3) >> 8) - 1;
+                    sum += (float)trit * x[e0 + mm];
+                }
+            }
+            for (int n = 0; n < 4; ++n) {
+                const uchar p3 = pow3[n];
+                const int e0 = x_base + 120 + n * 2;
+                for (int hh = 0; hh < 2; ++hh) {
+                    const uchar qv = (uchar)(qh[hh] * p3);
+                    const int trit = (((int)qv * 3) >> 8) - 1;
+                    sum += (float)trit * x[e0 + hh];
+                }
+            }
+            gacc += d * sum;
+        }
+        {
+            device const uchar *blk = ublk;
+            device const uchar *qs = blk;
+            device const uchar *qh = blk + 24;
+            const float d = (float)as_type<half>((ushort)(blk[26] | ((ushort)blk[27] << 8)));
+            const int x_base = b * 128;
+            float sum = 0.0f;
+            for (int n = 0; n < 5; ++n) {
+                const uchar p3 = pow3[n];
+                const int e0 = x_base + n * 16;
+                for (int mm = 0; mm < 16; ++mm) {
+                    const uchar qv = (uchar)(qs[mm] * p3);
+                    const int trit = (((int)qv * 3) >> 8) - 1;
+                    sum += (float)trit * x[e0 + mm];
+                }
+            }
+            for (int n = 0; n < 5; ++n) {
+                const uchar p3 = pow3[n];
+                const int e0 = x_base + 80 + n * 8;
+                for (int mm = 0; mm < 8; ++mm) {
+                    const uchar qv = (uchar)(qs[16 + mm] * p3);
+                    const int trit = (((int)qv * 3) >> 8) - 1;
+                    sum += (float)trit * x[e0 + mm];
+                }
+            }
+            for (int n = 0; n < 4; ++n) {
+                const uchar p3 = pow3[n];
+                const int e0 = x_base + 120 + n * 2;
+                for (int hh = 0; hh < 2; ++hh) {
+                    const uchar qv = (uchar)(qh[hh] * p3);
+                    const int trit = (((int)qv * 3) >> 8) - 1;
+                    sum += (float)trit * x[e0 + hh];
+                }
+            }
+            uacc += d * sum;
+        }
+    }
+    gacc = simd_sum(gacc);
+    uacc = simd_sum(uacc);
+    if (lane == 0) { gout[m] = gacc; uout[m] = uacc; }
+}
+
+// ======================================================================
 // Quantized-KV FlashAttention. The F32 flash (decode/prefill) with each K/V
 // element dequantized on the fly from its packed row — the GQA online-softmax
 // recurrence is identical to the F32 kernels; only the K/V source differs.

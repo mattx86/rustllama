@@ -94,6 +94,22 @@ EXPORTS
     rsl_mlx_matvec_pq2_0_packed_f32
     rsl_mlx_matvec_pq2_0_packed_f32_batched
 
+    ; Fused gate+up matvec (decode)
+    rsl_mlx_matvec_q8_0_packed_f32_gate_up_fused
+    rsl_mlx_matvec_q4_k_packed_f32_gate_up_fused
+    rsl_mlx_matvec_q6_k_packed_f32_gate_up_fused
+    rsl_mlx_matvec_q5_k_packed_f32_gate_up_fused
+    rsl_mlx_matvec_iq4_nl_packed_f32_gate_up_fused
+    rsl_mlx_matvec_iq4_xs_packed_f32_gate_up_fused
+    rsl_mlx_matvec_iq1_s_packed_f32_gate_up_fused
+    rsl_mlx_matvec_iq1_m_packed_f32_gate_up_fused
+    rsl_mlx_matvec_iq2_xxs_packed_f32_gate_up_fused
+    rsl_mlx_matvec_iq2_xs_packed_f32_gate_up_fused
+    rsl_mlx_matvec_iq2_s_packed_f32_gate_up_fused
+    rsl_mlx_matvec_iq3_xxs_packed_f32_gate_up_fused
+    rsl_mlx_matvec_iq3_s_packed_f32_gate_up_fused
+    rsl_mlx_matvec_ptq1_0_packed_f32_gate_up_fused
+
     ; Forward-pass primitives (device-resident, f32)
     rsl_mlx_add_rmsnorm_f32
     rsl_mlx_rope_f32

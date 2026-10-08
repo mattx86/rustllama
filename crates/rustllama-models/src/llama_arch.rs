@@ -139,10 +139,18 @@ pub(crate) fn matvec_tensor_gate_up_fused_dispatch(
     // each tensor is recorded exactly once via `matvec_tensor_dispatch`
     // (the fused USM kernel bypasses that hook). No double-count: only
     // the base dispatch records.
+    // Backend order mirrors the single-matvec dispatch: native CUDA, then MLX
+    // (Apple), then the SYCL USM path. Each is inert off its backend
+    // (`cuda_active`/`mlx_active`/USM-ctx checks) and returns false on a miss,
+    // falling through to the two-matvec base path below.
     if !crate::imatrix_collect::is_collecting()
-        && crate::accel::try_matvec_tensor_gate_up_fused_usm_f32(
+        && (crate::accel::try_matvec_tensor_gate_up_fused_cuda_f32(
             w_gate, w_up, x, gate_out, up_out, m, k_dim,
-        )
+        ) || crate::accel::try_matvec_tensor_gate_up_fused_mlx_f32(
+            w_gate, w_up, x, gate_out, up_out, m, k_dim,
+        ) || crate::accel::try_matvec_tensor_gate_up_fused_usm_f32(
+            w_gate, w_up, x, gate_out, up_out, m, k_dim,
+        ))
     {
         return;
     }

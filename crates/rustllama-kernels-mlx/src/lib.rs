@@ -198,6 +198,23 @@ extern "C" {
     fn rsl_mlx_matvec_pq2_0_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
     fn rsl_mlx_matvec_pq2_0_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
 
+    // Fused gate+up matvec (decode): one dispatch computes gate_out + up_out.
+    // gw/uw = packed gate/up weights [M,K]; gout/uout = [M] device ptrs.
+    fn rsl_mlx_matvec_q8_0_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
+    fn rsl_mlx_matvec_q4_k_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
+    fn rsl_mlx_matvec_q6_k_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
+    fn rsl_mlx_matvec_q5_k_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
+    fn rsl_mlx_matvec_iq4_nl_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
+    fn rsl_mlx_matvec_iq4_xs_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
+    fn rsl_mlx_matvec_iq1_s_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
+    fn rsl_mlx_matvec_iq1_m_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
+    fn rsl_mlx_matvec_iq2_xxs_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
+    fn rsl_mlx_matvec_iq2_xs_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
+    fn rsl_mlx_matvec_iq2_s_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
+    fn rsl_mlx_matvec_iq3_xxs_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
+    fn rsl_mlx_matvec_iq3_s_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
+    fn rsl_mlx_matvec_ptq1_0_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
+
     // Forward-pass primitives (device-resident, f32).
     fn rsl_mlx_add_rmsnorm_f32(
         s: *mut RslMlxStreamRaw,
@@ -860,6 +877,47 @@ macro_rules! mlx_packed_matvec {
         }
     };
 }
+
+/// Generate the safe wrapper for a fused gate+up matvec (decode). One dispatch
+/// computes gate_out + up_out, reusing the format's single-matvec dequant.
+/// SAFETY (all): `gw`/`uw`/`x`/`gout`/`uout` are device pointers on `stream`'s
+/// device sized for the quant's block layout and the given M/K.
+macro_rules! mlx_gate_up_fused {
+    ($name:ident, $raw:ident) => {
+        #[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+        pub unsafe fn $name(
+            stream: &MlxStream,
+            gw: *const c_void,
+            uw: *const c_void,
+            x: *const f32,
+            gout: *mut f32,
+            uout: *mut f32,
+            m: usize,
+            k: usize,
+        ) -> Result<(), MlxError> {
+            let rc = $raw(stream.raw(), gw, uw, x, gout, uout, m as c_int, k as c_int);
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(MlxError::Kernel(rc))
+            }
+        }
+    };
+}
+mlx_gate_up_fused!(matvec_q8_0_gate_up_fused, rsl_mlx_matvec_q8_0_packed_f32_gate_up_fused);
+mlx_gate_up_fused!(matvec_q4_k_gate_up_fused, rsl_mlx_matvec_q4_k_packed_f32_gate_up_fused);
+mlx_gate_up_fused!(matvec_q6_k_gate_up_fused, rsl_mlx_matvec_q6_k_packed_f32_gate_up_fused);
+mlx_gate_up_fused!(matvec_q5_k_gate_up_fused, rsl_mlx_matvec_q5_k_packed_f32_gate_up_fused);
+mlx_gate_up_fused!(matvec_iq4_nl_gate_up_fused, rsl_mlx_matvec_iq4_nl_packed_f32_gate_up_fused);
+mlx_gate_up_fused!(matvec_iq4_xs_gate_up_fused, rsl_mlx_matvec_iq4_xs_packed_f32_gate_up_fused);
+mlx_gate_up_fused!(matvec_iq1_s_gate_up_fused, rsl_mlx_matvec_iq1_s_packed_f32_gate_up_fused);
+mlx_gate_up_fused!(matvec_iq1_m_gate_up_fused, rsl_mlx_matvec_iq1_m_packed_f32_gate_up_fused);
+mlx_gate_up_fused!(matvec_iq2_xxs_gate_up_fused, rsl_mlx_matvec_iq2_xxs_packed_f32_gate_up_fused);
+mlx_gate_up_fused!(matvec_iq2_xs_gate_up_fused, rsl_mlx_matvec_iq2_xs_packed_f32_gate_up_fused);
+mlx_gate_up_fused!(matvec_iq2_s_gate_up_fused, rsl_mlx_matvec_iq2_s_packed_f32_gate_up_fused);
+mlx_gate_up_fused!(matvec_iq3_xxs_gate_up_fused, rsl_mlx_matvec_iq3_xxs_packed_f32_gate_up_fused);
+mlx_gate_up_fused!(matvec_iq3_s_gate_up_fused, rsl_mlx_matvec_iq3_s_packed_f32_gate_up_fused);
+mlx_gate_up_fused!(matvec_ptq1_0_gate_up_fused, rsl_mlx_matvec_ptq1_0_packed_f32_gate_up_fused);
 
 mlx_packed_matvec!(
     matvec_q8_0_packed_f32,
@@ -1942,6 +2000,95 @@ impl MlxMatvecCache {
         let out_bytes: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, m * 4) };
         self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
+
+    /// Fused gate+up matvec (decode): one dispatch computes `gate_out = gate_w
+    /// @ x` and `up_out = up_w @ x`, reusing the format's single-matvec dequant
+    /// (so bit-exact to two separate [`Self::matvec_packed`] calls). Mirror of
+    /// the CUDA `matvec_gate_up_fused`. Uploads both weights (keyed separately),
+    /// stages `x` + a 2*M output slab, downloads both halves. Returns false
+    /// (caller runs the two-matvec fallback) on any bad shape / budget /
+    /// unsupported kind / kernel failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_gate_up_fused(
+        &mut self,
+        kind: MlxPackedKind,
+        gate_key: usize,
+        gate_bytes: &[u8],
+        up_key: usize,
+        up_bytes: &[u8],
+        x: &[f32],
+        gate_out: &mut [f32],
+        up_out: &mut [f32],
+        m: usize,
+        k: usize,
+    ) -> bool {
+        if m == 0 || k == 0 || x.len() != k || gate_out.len() != m || up_out.len() != m {
+            return false;
+        }
+        let row_bytes = m * kind.row_bytes(k);
+        if k % kind.k_alignment() != 0
+            || gate_bytes.len() < row_bytes
+            || up_bytes.len() < row_bytes
+        {
+            return false;
+        }
+        if !self.ensure_weight(gate_key, gate_bytes) || !self.ensure_weight(up_key, up_bytes) {
+            return false;
+        }
+        if !Self::ensure_scratch(&mut self.x_scratch, &self.stream, k * 4)
+            || !Self::ensure_scratch(&mut self.out_scratch, &self.stream, 2 * m * 4)
+        {
+            return false;
+        }
+        let x_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
+        if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
+            return false;
+        }
+        let gw_ptr = self.weights[&gate_key].ptr;
+        let uw_ptr = self.weights[&up_key].ptr;
+        let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
+        // out_scratch holds [gate_out(M) | up_out(M)]; up starts at element M.
+        let gout_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        let uout_ptr = unsafe { gout_ptr.add(m) };
+        // SAFETY: gw/uw/x/gout/uout are live device buffers on `self.stream`
+        // sized for (M,K) / 2*M; the wrapper synchronizes before returning.
+        let res = unsafe {
+            match kind {
+                MlxPackedKind::Q8_0 => matvec_q8_0_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
+                MlxPackedKind::Q4_K => matvec_q4_k_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
+                MlxPackedKind::Q6_K => matvec_q6_k_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
+                MlxPackedKind::Q5_K => matvec_q5_k_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
+                MlxPackedKind::Iq4_Nl => matvec_iq4_nl_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
+                MlxPackedKind::Iq4_Xs => matvec_iq4_xs_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
+                MlxPackedKind::Iq1_S => matvec_iq1_s_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
+                MlxPackedKind::Iq1_M => matvec_iq1_m_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
+                MlxPackedKind::Iq2_Xxs => matvec_iq2_xxs_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
+                MlxPackedKind::Iq2_Xs => matvec_iq2_xs_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
+                MlxPackedKind::Iq2_S => matvec_iq2_s_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
+                MlxPackedKind::Iq3_Xxs => matvec_iq3_xxs_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
+                MlxPackedKind::Iq3_S => matvec_iq3_s_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
+                MlxPackedKind::Ptq1_0 => matvec_ptq1_0_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
+                // No fused kernel for the remaining kinds — caller falls back.
+                _ => return false,
+            }
+        };
+        if res.is_err() || consume_error_count() != 0 {
+            return false;
+        }
+        // Download the combined [gate(M) | up(M)] slab and split.
+        let mut both = vec![0f32; 2 * m];
+        {
+            let both_bytes: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(both.as_mut_ptr() as *mut u8, 2 * m * 4) };
+            if !self.out_scratch.as_ref().unwrap().download(both_bytes) {
+                return false;
+            }
+        }
+        gate_out.copy_from_slice(&both[..m]);
+        up_out.copy_from_slice(&both[m..2 * m]);
+        true
     }
 
     /// Batched packed matvec over `n` input rows. `x` = [N,K] row-major,

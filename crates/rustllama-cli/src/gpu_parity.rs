@@ -2011,6 +2011,85 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- Fused gate+up matvec (decode) ----
+    // One launch computes gate_out + up_out, reusing each format's row_dot — so
+    // bit-exact to the single matvec. Grades the concatenated [gate; up] output
+    // against two independent CPU matvecs (distinct gate/up weights), confirming
+    // the dual-output write + the fusion wiring. Same 14 formats as SYCL.
+    for dtype in [
+        "q8_0", "q4_k", "q6_k", "q5_k", "iq4_nl", "iq4_xs", "iq1_s", "iq1_m",
+        "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "ptq1_0",
+    ] {
+        let name = format!("fused:{dtype}");
+        let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
+        let x = gen_x(MV_K, 44);
+        let cpu = cpu_matvec_for(dtype);
+        let Some((wg, cpu_g)) = finite_ref(layout, cpu, &x) else {
+            cu_emit(&name, "SKIP", "no-finite-reference");
+            *counts.entry("SKIP").or_default() += 1;
+            continue;
+        };
+        // Second, distinct weight for `up`.
+        let wu = gen_quant_bytes(layout, MV_M, MV_K, 0xBEEF0007);
+        let mut cpu_u = vec![0f32; MV_M];
+        cpu(&wu, &x, &mut cpu_u, MV_M, MV_K);
+        if !cpu_u.iter().all(|v| v.is_finite()) {
+            cu_emit(&name, "SKIP", "no-finite-reference");
+            *counts.entry("SKIP").or_default() += 1;
+            continue;
+        }
+        let (Some(gwb), Some(uwb), Some(xb), Some(mut gob), Some(mut uob)) = (
+            ck::CudaDeviceBuffer::from_host(&stream, &wg),
+            ck::CudaDeviceBuffer::from_host(&stream, &wu),
+            cu_upload_f32(&stream, &x),
+            ck::CudaDeviceBuffer::alloc(&stream, MV_M * 4),
+            ck::CudaDeviceBuffer::alloc(&stream, MV_M * 4),
+        ) else {
+            cu_emit(&name, "KERNEL_ERR", "device-alloc-failed");
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+            continue;
+        };
+        // SAFETY: five live device buffers on `stream` sized for (M,K)/M; the
+        // wrapper synchronizes before returning.
+        let res = unsafe {
+            let gw = gwb.as_ptr();
+            let uw = uwb.as_ptr();
+            let xp = xb.as_ptr() as *const f32;
+            let go = gob.as_mut_ptr() as *mut f32;
+            let uo = uob.as_mut_ptr() as *mut f32;
+            match dtype {
+                "q8_0" => ck::matvec_q8_0_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
+                "q4_k" => ck::matvec_q4_k_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
+                "q6_k" => ck::matvec_q6_k_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
+                "q5_k" => ck::matvec_q5_k_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
+                "iq4_nl" => ck::matvec_iq4_nl_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
+                "iq4_xs" => ck::matvec_iq4_xs_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
+                "iq1_s" => ck::matvec_iq1_s_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
+                "iq1_m" => ck::matvec_iq1_m_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
+                "iq2_xxs" => ck::matvec_iq2_xxs_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
+                "iq2_xs" => ck::matvec_iq2_xs_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
+                "iq2_s" => ck::matvec_iq2_s_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
+                "iq3_xxs" => ck::matvec_iq3_xxs_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
+                "iq3_s" => ck::matvec_iq3_s_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
+                "ptq1_0" => ck::matvec_ptq1_0_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
+                _ => unreachable!(),
+            }
+        };
+        match res {
+            Err(e) => {
+                cu_emit(&name, "KERNEL_ERR", &format!("{e}"));
+                *counts.entry("KERNEL_ERR").or_default() += 1;
+            }
+            Ok(()) => {
+                let mut got = cu_download_f32(&gob, MV_M);
+                got.extend_from_slice(&cu_download_f32(&uob, MV_M));
+                let mut refv = cpu_g.clone();
+                refv.extend_from_slice(&cpu_u);
+                cu_grade(&name, &got, &refv, 0.999, 0.02, &mut counts);
+            }
+        }
+    }
+
     // ---- Q4_K prefill GEMM (verdict: gemm:q4_k_f32, BIT-EXACT + perf-gated) ----
     // Two-part gate (the GEMM is bit-exact, but it's dispatched FIRST, so it must
     // also be the fastest or it would regress): (1) correctness vs the f32 Q4_K
@@ -3069,6 +3148,55 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
             cu_grade(&name, &out, &cpu_out, 0.999, 0.02, &mut counts);
         } else {
             cu_emit(&name, "KERNEL_ERR", "matvec_packed returned false");
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+        }
+    }
+
+    // ---- Fused gate+up matvec (decode) ----
+    // MLX twin of the CUDA/SYCL fused probe: one dispatch computes gate+up,
+    // graded against two independent CPU matvecs. Distinct synthetic cache keys
+    // (not host pointers) so no stale-weight aliasing across iterations.
+    for (idx, dtype) in [
+        "q8_0", "q4_k", "q6_k", "q5_k", "iq4_nl", "iq4_xs", "iq1_s", "iq1_m",
+        "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "ptq1_0",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let Some(kind) = mlx_kind_for(dtype) else {
+            continue;
+        };
+        let name = format!("fused:{dtype}");
+        let layout = LAYOUTS.iter().find(|l| l.name == *dtype).expect("layout");
+        let x = gen_x(MV_K, 44);
+        let cpu = cpu_matvec_for(dtype);
+        let Some((wg, cpu_g)) = finite_ref(layout, cpu, &x) else {
+            cu_emit(&name, "SKIP", "no-finite-reference");
+            *counts.entry("SKIP").or_default() += 1;
+            continue;
+        };
+        let wu = gen_quant_bytes(layout, MV_M, MV_K, 0xBEEF0007);
+        let mut cpu_u = vec![0f32; MV_M];
+        cpu(&wu, &x, &mut cpu_u, MV_M, MV_K);
+        if !cpu_u.iter().all(|v| v.is_finite()) {
+            cu_emit(&name, "SKIP", "no-finite-reference");
+            *counts.entry("SKIP").or_default() += 1;
+            continue;
+        }
+        let (g_key, u_key) = (0x6a7e_0000 + idx * 2, 0x6a7e_0000 + idx * 2 + 1);
+        let mut gout = vec![0f32; MV_M];
+        let mut uout = vec![0f32; MV_M];
+        let ok = cache.matvec_gate_up_fused(
+            kind, g_key, &wg, u_key, &wu, &x, &mut gout, &mut uout, MV_M, MV_K,
+        );
+        if ok {
+            let mut got = gout.clone();
+            got.extend_from_slice(&uout);
+            let mut refv = cpu_g.clone();
+            refv.extend_from_slice(&cpu_u);
+            cu_grade(&name, &got, &refv, 0.999, 0.02, &mut counts);
+        } else {
+            cu_emit(&name, "KERNEL_ERR", "matvec_gate_up_fused returned false");
             *counts.entry("KERNEL_ERR").or_default() += 1;
         }
     }

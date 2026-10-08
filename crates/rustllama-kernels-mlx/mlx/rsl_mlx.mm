@@ -367,6 +367,34 @@ static int mlx_packed_matvec(rsl_mlx_stream *s, NSString *kernel_name,
     return mlx_packed_matvec_align(s, kernel_name, w, x, out, M, K, N, 32);
 }
 
+// Shared body for the fused gate+up matvecs (decode): resolve both weight rows
+// (gw/up), x, and both outputs (gout/uout) from the registry, dispatch
+// `kernel_name` over M threadgroups of 32 lanes (1-D grid; x is a single
+// column). K must be a multiple of the format's block width (k_align).
+static int mlx_gate_up_fused_align(rsl_mlx_stream *s, NSString *kernel_name,
+                                   const void *gw, const void *uw, const float *x,
+                                   float *gout, float *uout,
+                                   int M, int K, int k_align) {
+    if (!s || !gw || !uw || !x || !gout || !uout) return -1;
+    if (M <= 0 || K <= 0 || k_align <= 0 || (K % k_align) != 0) return -1;
+    size_t ogw=0, ouw=0, ox=0, og=0, ou=0;
+    id<MTLBuffer> bgw = mlx_resolve(gw,&ogw), buw = mlx_resolve(uw,&ouw),
+                  bx = mlx_resolve(x,&ox), bg = mlx_resolve(gout,&og), bu = mlx_resolve(uout,&ou);
+    if (bgw==nil||buw==nil||bx==nil||bg==nil||bu==nil) { g_rsl_mlx_errors++; return -1; }
+    int kk=K, mm=M;
+    MTLSize grid = MTLSizeMake((NSUInteger)M, 1, 1);
+    MTLSize tpg  = MTLSizeMake(32, 1, 1);
+    return mlx_run(s, kernel_name, grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bgw offset:ogw atIndex:0];
+        [enc setBuffer:buw offset:ouw atIndex:1];
+        [enc setBuffer:bx  offset:ox  atIndex:2];
+        [enc setBuffer:bg  offset:og  atIndex:3];
+        [enc setBuffer:bu  offset:ou  atIndex:4];
+        [enc setBytes:&kk length:sizeof(int) atIndex:5];
+        [enc setBytes:&mm length:sizeof(int) atIndex:6];
+    });
+}
+
 // Shared gates + dispatch for the scale-free quantized-KV flash kernels
 // (q4_0/nvfp4/mxfp4/6/8): F32 q/out, packed byte K/V. `k_align` = the KV block
 // width head_dim must divide (16 for nvfp4, else 32). head_dim <= 256.
@@ -996,6 +1024,44 @@ RSL_MLX_K256(matvec_iq3_s_packed_f32, "rsl_mlx_matvec_iq3_s_packed_f32_kernel")
 RSL_MLX_K256(matvec_iq1_s_packed_f32, "rsl_mlx_matvec_iq1_s_packed_f32_kernel")
 RSL_MLX_K256(matvec_iq1_m_packed_f32, "rsl_mlx_matvec_iq1_m_packed_f32_kernel")
 #undef RSL_MLX_K256
+
+// --- Fused gate+up matvec (decode): LIVE. One dispatch computes BOTH FFN
+// projections for a single x column (gate_w·x -> gout, up_w·x -> uout),
+// reusing each format's single-matvec dequant (bit-exact). K_ALIGN is the
+// format's block width (32 for q8_0/iq4_nl, 128 for ptq1_0, else 256).
+// Same per-function #if RSL_MLX_HAVE_METAL real / #else inert-stub structure
+// as the RSL_MLX_KQUANT/K256/SIMPLE32 matvec macros above. ---
+#if RSL_MLX_HAVE_METAL
+#define RSL_MLX_GATE_UP_FUSED(FMT, KERNEL, KALIGN)                                 \
+    extern "C" int rsl_mlx_matvec_##FMT##_gate_up_fused(rsl_mlx_stream *s,         \
+        const void *gw, const void *uw, const float *x, float *gout, float *uout, \
+        int M, int K) {                                                           \
+        return mlx_gate_up_fused_align(s, @KERNEL, gw, uw, x, gout, uout,          \
+                                       M, K, KALIGN);                              \
+    }
+#else
+#define RSL_MLX_GATE_UP_FUSED(FMT, KERNEL, KALIGN)                                 \
+    extern "C" int rsl_mlx_matvec_##FMT##_gate_up_fused(rsl_mlx_stream *s,         \
+        const void *gw, const void *uw, const float *x, float *gout, float *uout, \
+        int M, int K)                                                             \
+        { (void)s;(void)gw;(void)uw;(void)x;(void)gout;(void)uout;(void)M;(void)K; \
+          return -1; }
+#endif
+RSL_MLX_GATE_UP_FUSED(q8_0, "rsl_mlx_matvec_q8_0_gate_up_fused_kernel", 32)
+RSL_MLX_GATE_UP_FUSED(q4_k, "rsl_mlx_matvec_q4_k_gate_up_fused_kernel", 256)
+RSL_MLX_GATE_UP_FUSED(q6_k, "rsl_mlx_matvec_q6_k_gate_up_fused_kernel", 256)
+RSL_MLX_GATE_UP_FUSED(q5_k, "rsl_mlx_matvec_q5_k_gate_up_fused_kernel", 256)
+RSL_MLX_GATE_UP_FUSED(iq4_nl, "rsl_mlx_matvec_iq4_nl_gate_up_fused_kernel", 32)
+RSL_MLX_GATE_UP_FUSED(iq4_xs, "rsl_mlx_matvec_iq4_xs_gate_up_fused_kernel", 256)
+RSL_MLX_GATE_UP_FUSED(iq1_s, "rsl_mlx_matvec_iq1_s_gate_up_fused_kernel", 256)
+RSL_MLX_GATE_UP_FUSED(iq1_m, "rsl_mlx_matvec_iq1_m_gate_up_fused_kernel", 256)
+RSL_MLX_GATE_UP_FUSED(iq2_xxs, "rsl_mlx_matvec_iq2_xxs_gate_up_fused_kernel", 256)
+RSL_MLX_GATE_UP_FUSED(iq2_xs, "rsl_mlx_matvec_iq2_xs_gate_up_fused_kernel", 256)
+RSL_MLX_GATE_UP_FUSED(iq2_s, "rsl_mlx_matvec_iq2_s_gate_up_fused_kernel", 256)
+RSL_MLX_GATE_UP_FUSED(iq3_xxs, "rsl_mlx_matvec_iq3_xxs_gate_up_fused_kernel", 256)
+RSL_MLX_GATE_UP_FUSED(iq3_s, "rsl_mlx_matvec_iq3_s_gate_up_fused_kernel", 256)
+RSL_MLX_GATE_UP_FUSED(ptq1_0, "rsl_mlx_matvec_ptq1_0_gate_up_fused_kernel", 128)
+#undef RSL_MLX_GATE_UP_FUSED
 
 // Forward-pass primitives — LIVE (device-resident Metal dispatch).
 extern "C" int rsl_mlx_add_rmsnorm_f32(rsl_mlx_stream *s, float *hidden,
