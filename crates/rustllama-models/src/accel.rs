@@ -6753,6 +6753,22 @@ pub fn cuda_decode_seed_kv_mxfp8(
     )
 }
 
+/// Seed the CUDA TurboQuant decode mirror (low-bit packed codes + per-row
+/// scales). See [`cuda_decode_seed_kv_quant`].
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_decode_seed_kv_tq(
+    bits: u8,
+    k_packed: &[u8], v_packed: &[u8],
+    k_scales: &[f32], v_scales: &[f32],
+    layer_idx: usize, pos: u32,
+    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+) -> bool {
+    cuda_decode_seed_kv_quant(
+        QuantKv::Tq { bits }, k_packed, v_packed, Some(k_scales), Some(v_scales),
+        layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
+}
+
 /// Shared body for every native-CUDA quantized-KV decode helper. Mirrors
 /// [`try_flash_attn_decode_usm_quant`] (same shape gate, same CPU
 /// quantizers, same epoch/valid-len gate): quantizes ONLY the new row into

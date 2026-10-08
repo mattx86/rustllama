@@ -3130,6 +3130,55 @@ __global__ void flash_attn_prefill_mxfp8_kernel(const float *q,
 }
 
 // ---- TurboQuant-KV decode / prefill (separate per-row f32 scales) ----
+// Cooperatively dequant + inverse-WHT one TurboQuant KV row into the
+// warp-private `scratch` (head_dim floats). Byte-identical to rsl_deq_tq_row:
+// lane-strided code unpack × row scale, then the forward WHT butterfly (its
+// pairs are disjoint within a stage, so the 32 lanes run them in parallel with
+// a __syncwarp between stages), then × (1/head_dim). ALL 32 lanes of the warp
+// must call this together (the loop bound `t < kv_len` is warp-uniform).
+__device__ __forceinline__ void rsl_tq_dequant_wht_warp(const unsigned char *p,
+                                                        float row_scale, int bits,
+                                                        float *scratch, int head_dim,
+                                                        int lane) {
+    int max_level = (bits == 1) ? 1 : ((bits == 2) ? 1 : ((bits == 4) ? 7 : 127));
+    unsigned mask = (bits == 1) ? 0x1u : ((bits == 2) ? 0x3u : ((bits == 4) ? 0xFu : 0xFFu));
+    for (int i = lane; i < head_dim; i += 32) {
+        int bit_off = i * bits;
+        int byte_idx = bit_off >> 3;
+        int bit_in = bit_off & 7;
+        unsigned cell = (unsigned)p[byte_idx] >> bit_in;
+        if (bit_in + bits > 8) {
+            int spill = bit_in + bits - 8;
+            int shift = bits - spill;
+            cell |= (unsigned)p[byte_idx + 1] << shift;
+        }
+        unsigned u = cell & mask;
+        int code = (bits == 1) ? ((u == 0) ? -1 : 1) : ((int)u - max_level);
+        scratch[i] = (float)code * row_scale;
+    }
+    __syncwarp();
+    for (int h = 1; h < head_dim; h <<= 1) {
+        for (int pidx = lane; pidx < (head_dim >> 1); pidx += 32) {
+            int bk = pidx / h;
+            int o = pidx - bk * h;
+            int j = bk * (h << 1) + o;
+            float a = scratch[j];
+            float bb = scratch[j + h];
+            scratch[j] = a + bb;
+            scratch[j + h] = a - bb;
+        }
+        __syncwarp();
+    }
+    float inv_n = 1.0f / (float)head_dim;
+    for (int i = lane; i < head_dim; i += 32) scratch[i] *= inv_n;
+    __syncwarp();
+}
+
+// TurboQuant KV (low-bit codes + per-row scale + inverse-WHT) flash-decoding.
+// Unlike the other quant formats the WHT couples the whole row, so each warp
+// dequant+WHTs a full row into a warp-private shared scratch (reusing this
+// warp's slice of sh_acc, free until the final merge) and then dots it — same
+// one-block-per-head / W-warps-split-kv_len structure as the others.
 __global__ void flash_attn_decode_tq_kernel(const float *q,
                                             const unsigned char *k_packed,
                                             const unsigned char *v_packed,
@@ -3138,32 +3187,75 @@ __global__ void flash_attn_decode_tq_kernel(const float *q,
                                             float *out, int n_heads, int n_gqa,
                                             int head_dim, int max_ctx,
                                             int kv_len, float scale) {
-    int hh = blockIdx.x * blockDim.x + threadIdx.x;
+    extern __shared__ float smem[];
+    float *sh_acc = smem;
+    float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;
+    float *sh_l = sh_m + RSL_FLASH_DECODE_W;
+    const int hh = blockIdx.x;
     if (hh >= n_heads) return;
-    int kv_h = hh / n_gqa;
-    int q_base = hh * head_dim;
-    int out_base = hh * head_dim;
-    int bytes_per_row = (head_dim * bits + 7) / 8;
-    float row[RSL_FLASH_MAX_HEAD_DIM];
-    for (int i = 0; i < head_dim; ++i) out[out_base + i] = 0.f;
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int kv_h = hh / n_gqa;
+    const int q_off = hh * head_dim;
+    const int bytes_per_row = (head_dim * bits + 7) / 8;
+    float *scratch = sh_acc + warp * head_dim;  // warp-private; reused for acc publish
+    float qreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    float acc[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
+        qreg[seg] = q[q_off + d];
+        acc[seg] = 0.f;
+    }
     float m = -INFINITY, l = 0.f;
-    for (int t = 0; t < kv_len; ++t) {
-        size_t ridx = (size_t)(kv_h * max_ctx + t);
-        rsl_deq_tq_row(k_packed + ridx * bytes_per_row, k_scales[ridx], bits, row, head_dim);
-        float s_dot = 0.f;
-        for (int i = 0; i < head_dim; ++i) s_dot += q[q_base + i] * row[i];
-        s_dot *= scale;
+    for (int t = warp; t < kv_len; t += RSL_FLASH_DECODE_W) {
+        const size_t ridx = (size_t)(kv_h * max_ctx + t);
+        rsl_tq_dequant_wht_warp(k_packed + ridx * bytes_per_row, k_scales[ridx], bits,
+                                scratch, head_dim, lane);
+        float partial = 0.f;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            partial += qreg[seg] * scratch[d];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            partial += __shfl_down_sync(0xffffffffu, partial, off);
+        float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
         float m_new = fmaxf(m, s_dot);
         float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
         float p = expf(s_dot - m_new);
         l = l * rescale + p;
-        rsl_deq_tq_row(v_packed + ridx * bytes_per_row, v_scales[ridx], bits, row, head_dim);
-        for (int i = 0; i < head_dim; ++i)
-            out[out_base + i] = out[out_base + i] * rescale + p * row[i];
+        __syncwarp();  // K dot done → safe to overwrite scratch for V
+        rsl_tq_dequant_wht_warp(v_packed + ridx * bytes_per_row, v_scales[ridx], bits,
+                                scratch, head_dim, lane);
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            acc[seg] = acc[seg] * rescale + p * scratch[d];
         m = m_new;
+        __syncwarp();  // acc reads of scratch done before next iter overwrites it
     }
-    float inv_l = (l > 0.f) ? 1.f / l : 0.f;
-    for (int i = 0; i < head_dim; ++i) out[out_base + i] *= inv_l;
+    __syncthreads();  // all warps done with their scratch (sh_acc) before the acc publish
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+        sh_acc[warp * head_dim + d] = acc[seg];
+    if (lane == 0) {
+        sh_m[warp] = m;
+        sh_l[warp] = l;
+    }
+    __syncthreads();
+    float m_g = -INFINITY;
+    #pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w) m_g = fmaxf(m_g, sh_m[w]);
+    float l_g = 0.f;
+    #pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+        l_g += sh_l[w] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+    float inv_l = (l_g > 0.f) ? 1.f / l_g : 0.f;
+    const int tid = warp * 32 + lane;
+    const int nthreads = RSL_FLASH_DECODE_W * 32;
+    const int out_off = hh * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float o = 0.f;
+        #pragma unroll
+        for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+            o += sh_acc[w * head_dim + d] *
+                 (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+        out[out_off + d] = o * inv_l;
+    }
 }
 
 __global__ void flash_attn_prefill_tq_kernel(const float *q,
@@ -3451,8 +3543,12 @@ extern "C" int rsl_cuda_flash_attn_decode_tq(rsl_cuda_stream *s, const float *q,
     }
     int n_gqa = n_heads / n_kv_heads;
     float scale = 1.0f / sqrtf((float)head_dim);
-    int t = 64, b = (n_heads + t - 1) / t;
-    flash_attn_decode_tq_kernel<<<b, t, 0, s->stream>>>(
+    dim3 block(32, RSL_FLASH_DECODE_W);  // W warps per head
+    dim3 grid((unsigned)n_heads);        // one block per head → fills all SMs
+    size_t shmem = (size_t)(RSL_FLASH_DECODE_W * head_dim +
+                            2 * RSL_FLASH_DECODE_W) *
+                   sizeof(float);
+    flash_attn_decode_tq_kernel<<<grid, block, shmem, s->stream>>>(
         q, (const unsigned char *)k_packed, (const unsigned char *)v_packed,
         k_scales, v_scales, bits, out, n_heads, n_gqa, head_dim, max_ctx, kv_len, scale);
     return rsl_cuda_check("rsl_cuda_flash_attn_decode_tq");

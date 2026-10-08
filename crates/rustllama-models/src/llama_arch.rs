@@ -7628,6 +7628,23 @@ impl LlamaModel {
                     //    to 256 to match.
                     // GPU quant-KV flash decode first (USM). Decline →
                     // CPU flash/standard split below over the host slab.
+                    // Seed the CUDA decode mirror with the prefill history on
+                    // the first decode step (no-op once resident); host
+                    // k_packed/k_scales are byte-identical to the mirror.
+                    crate::accel::cuda_decode_seed_kv_tq(
+                        *bits,
+                        &k_packed[..],
+                        &v_packed[..],
+                        &k_scales[..],
+                        &v_scales[..],
+                        layer_idx,
+                        cur_pos as u32,
+                        n_heads as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        max_ctx as u32,
+                        cfg.n_layers as u32,
+                    );
                     if !crate::accel::try_flash_attn_decode_gpu_tq(
                         &q_buf,
                         &k_buf,
