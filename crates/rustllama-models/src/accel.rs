@@ -9943,14 +9943,13 @@ pub fn try_matvec_tensor_usm_f32(
                 )
             }
             .is_ok(),
-            // The 8 CPU-parity packed formats (legacy Q4_0/Q5_0/Q4_1/
-            // Q5_1, K-quant Q2_K/Q3_K/Q8_K, PrismML PQ2_0) route through
-            // the DIRECT single-row call with `lws = 0` — the
+            // The CPU-parity + MX packed formats (legacy Q4_0/Q5_0/Q4_1/
+            // Q5_1, K-quant Q2_K/Q3_K/Q8_K, PrismML PQ2_0, MXFP4/6/8) route
+            // through the DIRECT single-row call with `lws = 0` — the
             // kernel-TU-picked default work-group size. These have no
-            // autotuner `KERNEL_*` const, so we skip `tuned_lws_for`
-            // (no new tuner consts needed); the batched twin below has no
-            // arm for them, so PREFILL correctly falls to the CPU batched
-            // path while DECODE (this site) uses the GPU.
+            // autotuner `KERNEL_*` const, so we skip `tuned_lws_for` (no new
+            // tuner consts needed). Each now has a batched twin below (same
+            // lws=0), so PREFILL reaches the GPU too — no CPU-prefill fallback.
             PackedMatvecKind::Q4_0 => unsafe {
                 sk::matvec_q4_0_packed_f32_usm_raw(
                     &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
@@ -11441,8 +11440,9 @@ pub fn try_matvec_tensor_batched_usm_f32(
         // batched PREFILL of these 8 formats fell through to the CPU
         // batched matvec while the single-row DECODE gate
         // (`try_matvec_tensor_usm_f32`) already routed them to the GPU.
-        // Map them here too so all 14 packed dtypes reach the GPU on
-        // prefill, matching the single-row gate exactly.
+        // Map them here too (the CPU-parity + MX formats follow below) so
+        // every packed dtype reaches the GPU on prefill, matching the
+        // single-row gate exactly.
         Dtype::IQ1_SRaw => PackedMatvecKind::IQ1_S,
         Dtype::IQ2_XXSRaw => PackedMatvecKind::IQ2_XXS,
         Dtype::IQ1_MRaw => PackedMatvecKind::IQ1_M,
@@ -11451,6 +11451,21 @@ pub fn try_matvec_tensor_batched_usm_f32(
         Dtype::IQ3_XXSRaw => PackedMatvecKind::IQ3_XXS,
         Dtype::IQ3_SRaw => PackedMatvecKind::IQ3_S,
         Dtype::PTQ1_0Raw => PackedMatvecKind::PTQ1_0,
+        // Q4_0 + the remaining CPU-parity / MX formats now have batched SYCL
+        // kernels too (matvec_<fmt>_packed_f32_batched_usm) — map them so their
+        // prefill reaches the GPU like decode. This closes the GPU-decode /
+        // CPU-prefill asymmetry for ALL packed formats.
+        Dtype::Q4_0Raw => PackedMatvecKind::Q4_0,
+        Dtype::Q5_0Raw => PackedMatvecKind::Q5_0,
+        Dtype::Q4_1Raw => PackedMatvecKind::Q4_1,
+        Dtype::Q5_1Raw => PackedMatvecKind::Q5_1,
+        Dtype::Q2_KRaw => PackedMatvecKind::Q2_K,
+        Dtype::Q3_KRaw => PackedMatvecKind::Q3_K,
+        Dtype::Q8_KRaw => PackedMatvecKind::Q8_K,
+        Dtype::PQ2_0Raw => PackedMatvecKind::PQ2_0,
+        Dtype::Mxfp4Raw => PackedMatvecKind::Mxfp4,
+        Dtype::Mxfp6Raw => PackedMatvecKind::Mxfp6,
+        Dtype::Mxfp8Raw => PackedMatvecKind::Mxfp8,
         _ => {
             log_unmatched_dtype(w.dtype);
             return false;
@@ -11598,6 +11613,22 @@ pub fn try_matvec_tensor_batched_usm_f32(
                 )
             }
             .is_ok(),
+            // Q4_0 batched prefill (no dedicated tuner LWS key yet → 0 = the
+            // kernel's RSL_LWS default); same per-row work distribution as the
+            // single-row q4_0 decode kernel.
+            PackedMatvecKind::Q4_0 => unsafe {
+                sk::matvec_q4_0_packed_f32_batched_usm_raw(
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    0,
+                )
+            }
+            .is_ok(),
             PackedMatvecKind::Q6_K => unsafe {
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_Q6K_PACKED_USM, m, k);
                 sk::matvec_q6_k_packed_f32_batched_usm_raw(
@@ -11683,13 +11714,82 @@ pub fn try_matvec_tensor_batched_usm_f32(
                 )
             }
             .is_ok(),
-            // The 8 CPU-parity packed formats (Q4_0/Q5_0/Q4_1/Q5_1,
-            // Q2_K/Q3_K/Q8_K, PQ2_0) have no batched SYCL kernel and are
-            // intentionally NOT mapped in the dtype gate above — this arm
-            // is unreachable in practice but keeps the match exhaustive.
-            // Their batched PREFILL correctly falls to the CPU batched
-            // matvec while single-row DECODE uses the GPU.
-            _ => return false,
+            // The remaining CPU-parity + MX packed formats: batched prefill
+            // twins of the single-row decode kernels above. None has a
+            // dedicated tuner LWS key (same as their single-row arms), so they
+            // pass lws=0 = the kernel's RSL_LWS default. With the dtype gate
+            // above now mapping these, batched PREFILL reaches the GPU for every
+            // packed format — the GPU-decode / CPU-prefill asymmetry is closed.
+            PackedMatvecKind::Q5_0 => unsafe {
+                sk::matvec_q5_0_packed_f32_batched_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr,
+                    m as u32, k as u32, n as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::Q4_1 => unsafe {
+                sk::matvec_q4_1_packed_f32_batched_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr,
+                    m as u32, k as u32, n as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::Q5_1 => unsafe {
+                sk::matvec_q5_1_packed_f32_batched_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr,
+                    m as u32, k as u32, n as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::Q2_K => unsafe {
+                sk::matvec_q2_k_packed_f32_batched_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr,
+                    m as u32, k as u32, n as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::Q3_K => unsafe {
+                sk::matvec_q3_k_packed_f32_batched_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr,
+                    m as u32, k as u32, n as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::Q8_K => unsafe {
+                sk::matvec_q8_k_packed_f32_batched_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr,
+                    m as u32, k as u32, n as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::PQ2_0 => unsafe {
+                sk::matvec_pq2_0_packed_f32_batched_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr,
+                    m as u32, k as u32, n as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::Mxfp4 => unsafe {
+                sk::matvec_mxfp4_packed_f32_batched_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr,
+                    m as u32, k as u32, n as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::Mxfp6 => unsafe {
+                sk::matvec_mxfp6_packed_f32_batched_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr,
+                    m as u32, k as u32, n as u32, 0,
+                )
+            }
+            .is_ok(),
+            PackedMatvecKind::Mxfp8 => unsafe {
+                sk::matvec_mxfp8_packed_f32_batched_usm_raw(
+                    &*stream_raw, w_ptr, x_ptr, out_ptr,
+                    m as u32, k as u32, n as u32, 0,
+                )
+            }
+            .is_ok(),
         };
         note_packed_kind_result(kind, ok);
         if !ok {

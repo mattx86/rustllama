@@ -96,6 +96,17 @@ EXPORTS
     rsl_matvec_iq4_xs_packed_f32_usm
     rsl_matvec_iq4_nl_packed_f32_batched_usm
     rsl_matvec_iq4_xs_packed_f32_batched_usm
+    rsl_matvec_q4_0_packed_f32_batched_usm
+    rsl_matvec_q5_0_packed_f32_batched_usm
+    rsl_matvec_q4_1_packed_f32_batched_usm
+    rsl_matvec_q5_1_packed_f32_batched_usm
+    rsl_matvec_q2_k_packed_f32_batched_usm
+    rsl_matvec_q3_k_packed_f32_batched_usm
+    rsl_matvec_q8_k_packed_f32_batched_usm
+    rsl_matvec_pq2_0_packed_f32_batched_usm
+    rsl_matvec_mxfp4_packed_f32_batched_usm
+    rsl_matvec_mxfp6_packed_f32_batched_usm
+    rsl_matvec_mxfp8_packed_f32_batched_usm
     rsl_matvec_iq1_s_packed_f32_usm
     rsl_matvec_iq1_s_packed_f32_batched_usm
     rsl_matvec_iq2_xxs_packed_f32_usm

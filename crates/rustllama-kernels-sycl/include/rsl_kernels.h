@@ -951,6 +951,49 @@ void rsl_matvec_iq4_nl_packed_f32_batched_usm(rsl_stream* s,
                                               float* out_usm,
                                               int M, int K, int N, int lws);
 
+/* Batched Q4_0 packed matvec — N input rows in one launch; the prefill twin of
+ * rsl_matvec_q4_0_packed_f32_usm. Lifts Q4_0 prefill off the CPU fallback. */
+void rsl_matvec_q4_0_packed_f32_batched_usm(rsl_stream* s,
+                                            const void* w_bytes_usm,
+                                            const float* x_usm,
+                                            float* out_usm,
+                                            int M, int K, int N, int lws);
+
+/* Batched twins of the remaining CPU-parity + MX packed matvecs — N input rows
+ * in one launch; the prefill twins of rsl_matvec_<fmt>_packed_f32_usm. Lift
+ * Q5_0/Q4_1/Q5_1/Q2_K/Q3_K/Q8_K/PQ2_0/MXFP4/MXFP6/MXFP8 prefill off the CPU
+ * fallback. Same per-cell math as the single-row variants. */
+void rsl_matvec_q5_0_packed_f32_batched_usm(rsl_stream* s, const void* w_bytes_usm,
+                                            const float* x_usm, float* out_usm,
+                                            int M, int K, int N, int lws);
+void rsl_matvec_q4_1_packed_f32_batched_usm(rsl_stream* s, const void* w_bytes_usm,
+                                            const float* x_usm, float* out_usm,
+                                            int M, int K, int N, int lws);
+void rsl_matvec_q5_1_packed_f32_batched_usm(rsl_stream* s, const void* w_bytes_usm,
+                                            const float* x_usm, float* out_usm,
+                                            int M, int K, int N, int lws);
+void rsl_matvec_q2_k_packed_f32_batched_usm(rsl_stream* s, const void* w_bytes_usm,
+                                            const float* x_usm, float* out_usm,
+                                            int M, int K, int N, int lws);
+void rsl_matvec_q3_k_packed_f32_batched_usm(rsl_stream* s, const void* w_bytes_usm,
+                                            const float* x_usm, float* out_usm,
+                                            int M, int K, int N, int lws);
+void rsl_matvec_q8_k_packed_f32_batched_usm(rsl_stream* s, const void* w_bytes_usm,
+                                            const float* x_usm, float* out_usm,
+                                            int M, int K, int N, int lws);
+void rsl_matvec_pq2_0_packed_f32_batched_usm(rsl_stream* s, const void* w_bytes_usm,
+                                             const float* x_usm, float* out_usm,
+                                             int M, int K, int N, int lws);
+void rsl_matvec_mxfp4_packed_f32_batched_usm(rsl_stream* s, const void* w_bytes_usm,
+                                             const float* x_usm, float* out_usm,
+                                             int M, int K, int N, int lws);
+void rsl_matvec_mxfp6_packed_f32_batched_usm(rsl_stream* s, const void* w_bytes_usm,
+                                             const float* x_usm, float* out_usm,
+                                             int M, int K, int N, int lws);
+void rsl_matvec_mxfp8_packed_f32_batched_usm(rsl_stream* s, const void* w_bytes_usm,
+                                             const float* x_usm, float* out_usm,
+                                             int M, int K, int N, int lws);
+
 /* F4 follow-up: batched IQ4_XS packed matvec — N input rows in one
  * kernel launch. Same per-cell math as the single-row variant; lifts
  * IQ4_XS prefill off the CPU fallback path. */

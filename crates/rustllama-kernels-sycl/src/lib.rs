@@ -920,6 +920,58 @@ mod imp {
             lws: c_int,
         );
 
+        pub(super) fn rsl_matvec_q4_0_packed_f32_batched_usm(
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            n: c_int,
+            lws: c_int,
+        );
+
+        pub(super) fn rsl_matvec_q5_0_packed_f32_batched_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+        );
+        pub(super) fn rsl_matvec_q4_1_packed_f32_batched_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+        );
+        pub(super) fn rsl_matvec_q5_1_packed_f32_batched_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+        );
+        pub(super) fn rsl_matvec_q2_k_packed_f32_batched_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+        );
+        pub(super) fn rsl_matvec_q3_k_packed_f32_batched_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+        );
+        pub(super) fn rsl_matvec_q8_k_packed_f32_batched_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+        );
+        pub(super) fn rsl_matvec_pq2_0_packed_f32_batched_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+        );
+        pub(super) fn rsl_matvec_mxfp4_packed_f32_batched_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+        );
+        pub(super) fn rsl_matvec_mxfp6_packed_f32_batched_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+        );
+        pub(super) fn rsl_matvec_mxfp8_packed_f32_batched_usm(
+            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+        );
+
         pub(super) fn rsl_matvec_iq4_nl_packed_f32_batched_usm(
             s: *mut rsl_stream,
             w_bytes_usm: *const u8,
@@ -3979,6 +4031,107 @@ mod imp {
         consume_error()
     }
 
+    pub fn matvec_q4_0_packed_f32_batched_usm(
+        stream: &SyclStream,
+        w_bytes_usm: *const u8,
+        x_usm: *const f32,
+        out_usm: *mut f32,
+        m: u32,
+        k: u32,
+        n: u32,
+        lws: u32,
+    ) -> Result<()> {
+        if m == 0 || k == 0 || n == 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "matvec_q4_0_packed_f32_batched_usm: zero dim (M={m}, K={k}, N={n})"
+            )));
+        }
+        if k % 32 != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "matvec_q4_0_packed_f32_batched_usm: K must be a multiple of 32, got {k}"
+            )));
+        }
+        // SAFETY: caller owns all USM pointers + holds them alive across the
+        // call; kernel waits before returning.
+        unsafe {
+            rsl_matvec_q4_0_packed_f32_batched_usm(
+                stream.raw,
+                w_bytes_usm,
+                x_usm,
+                out_usm,
+                m as c_int,
+                k as c_int,
+                n as c_int,
+                lws as c_int,
+            );
+        }
+        consume_error()
+    }
+
+    // Batched (prefill) twins of the remaining CPU-parity + MX packed matvecs.
+    // Each forwards to its `rsl_matvec_<fmt>_packed_f32_batched_usm` FFI entry
+    // with the same shape validation as the explicit methods above; only the
+    // K-divisibility constant differs (32 for the block-32 formats, 256 for the
+    // K-quants, 128 for PQ2_0).
+    macro_rules! batched_matvec_imp {
+        ($name:ident, $ffi:ident, $kmod:literal) => {
+            pub fn $name(
+                stream: &SyclStream,
+                w_bytes_usm: *const u8,
+                x_usm: *const f32,
+                out_usm: *mut f32,
+                m: u32,
+                k: u32,
+                n: u32,
+                lws: u32,
+            ) -> Result<()> {
+                if m == 0 || k == 0 || n == 0 {
+                    return Err(SyclError::InvalidShape(format!(
+                        concat!(stringify!($name), ": zero dim (M={}, K={}, N={})"),
+                        m, k, n
+                    )));
+                }
+                if k % $kmod != 0 {
+                    return Err(SyclError::InvalidShape(format!(
+                        concat!(stringify!($name), ": K must be a multiple of ",
+                                stringify!($kmod), ", got {}"),
+                        k
+                    )));
+                }
+                // SAFETY: caller owns all USM pointers + holds them alive
+                // across the call; kernel waits before returning.
+                unsafe {
+                    $ffi(
+                        stream.raw, w_bytes_usm, x_usm, out_usm,
+                        m as c_int, k as c_int, n as c_int, lws as c_int,
+                    );
+                }
+                consume_error()
+            }
+        };
+    }
+
+    batched_matvec_imp!(matvec_q5_0_packed_f32_batched_usm,
+                        rsl_matvec_q5_0_packed_f32_batched_usm, 32);
+    batched_matvec_imp!(matvec_q4_1_packed_f32_batched_usm,
+                        rsl_matvec_q4_1_packed_f32_batched_usm, 32);
+    batched_matvec_imp!(matvec_q5_1_packed_f32_batched_usm,
+                        rsl_matvec_q5_1_packed_f32_batched_usm, 32);
+    batched_matvec_imp!(matvec_q2_k_packed_f32_batched_usm,
+                        rsl_matvec_q2_k_packed_f32_batched_usm, 256);
+    batched_matvec_imp!(matvec_q3_k_packed_f32_batched_usm,
+                        rsl_matvec_q3_k_packed_f32_batched_usm, 256);
+    batched_matvec_imp!(matvec_q8_k_packed_f32_batched_usm,
+                        rsl_matvec_q8_k_packed_f32_batched_usm, 256);
+    batched_matvec_imp!(matvec_pq2_0_packed_f32_batched_usm,
+                        rsl_matvec_pq2_0_packed_f32_batched_usm, 128);
+    batched_matvec_imp!(matvec_mxfp4_packed_f32_batched_usm,
+                        rsl_matvec_mxfp4_packed_f32_batched_usm, 32);
+    batched_matvec_imp!(matvec_mxfp6_packed_f32_batched_usm,
+                        rsl_matvec_mxfp6_packed_f32_batched_usm, 32);
+    batched_matvec_imp!(matvec_mxfp8_packed_f32_batched_usm,
+                        rsl_matvec_mxfp8_packed_f32_batched_usm, 32);
+
     pub fn matvec_iq4_nl_packed_f32_batched_usm(
         stream: &SyclStream,
         w_bytes_usm: *const u8,
@@ -6869,6 +7022,71 @@ pub unsafe fn matvec_iq4_nl_packed_f32_batched_usm_raw(
 ) -> Result<()> {
     imp::matvec_iq4_nl_packed_f32_batched_usm(stream, w_bytes_usm, x_usm, out_usm, m, k, n, lws)
 }
+
+/// Raw-pointer batched USM Q4_0 packed matvec — the prefill twin of
+/// `matvec_q4_0_packed_f32_usm_raw`, covering N input rows in one launch.
+/// Closes the Q4_0 prefill CPU-fallback gap.
+///
+/// # Safety
+/// `w_bytes_usm` sized ≥ `M * (K/32) * 18` bytes, `x_usm` ≥ `N*K`, `out_usm`
+/// ≥ `N*M`, all on `stream`'s SYCL context; `K % 32 == 0`. Kernel `.wait()`s
+/// before returning.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn matvec_q4_0_packed_f32_batched_usm_raw(
+    stream: &SyclStream,
+    w_bytes_usm: *const u8,
+    x_usm: *const f32,
+    out_usm: *mut f32,
+    m: u32,
+    k: u32,
+    n: u32,
+    lws: u32,
+) -> Result<()> {
+    imp::matvec_q4_0_packed_f32_batched_usm(stream, w_bytes_usm, x_usm, out_usm, m, k, n, lws)
+}
+
+/// Raw-pointer batched (prefill) packed matvecs — the N-row twins of the
+/// single-row CPU-parity + MX `..._usm_raw` entries. Each forwards to its
+/// `imp` method; `out[n*M+m] = W[m,:]·x[n,:]`.
+macro_rules! batched_matvec_raw_wrapper {
+    ($raw:ident, $imp:ident) => {
+        /// Raw-pointer batched packed matvec. See
+        /// [`matvec_q4_0_packed_f32_batched_usm_raw`] for the contract:
+        /// `w_bytes_usm` sized per the dtype's packed layout, `x_usm` ≥ `N*K`
+        /// f32, `out_usm` ≥ `N*M` f32, all on `stream`; the kernel `.wait()`s
+        /// before returning.
+        ///
+        /// # Safety
+        /// All three USM pointers are live on `stream` for the full extents
+        /// above and outlive the call.
+        pub unsafe fn $raw(
+            stream: &SyclStream, w_bytes_usm: *const u8, x_usm: *const f32,
+            out_usm: *mut f32, m: u32, k: u32, n: u32, lws: u32,
+        ) -> Result<()> {
+            imp::$imp(stream, w_bytes_usm, x_usm, out_usm, m, k, n, lws)
+        }
+    };
+}
+batched_matvec_raw_wrapper!(matvec_q5_0_packed_f32_batched_usm_raw,
+                            matvec_q5_0_packed_f32_batched_usm);
+batched_matvec_raw_wrapper!(matvec_q4_1_packed_f32_batched_usm_raw,
+                            matvec_q4_1_packed_f32_batched_usm);
+batched_matvec_raw_wrapper!(matvec_q5_1_packed_f32_batched_usm_raw,
+                            matvec_q5_1_packed_f32_batched_usm);
+batched_matvec_raw_wrapper!(matvec_q2_k_packed_f32_batched_usm_raw,
+                            matvec_q2_k_packed_f32_batched_usm);
+batched_matvec_raw_wrapper!(matvec_q3_k_packed_f32_batched_usm_raw,
+                            matvec_q3_k_packed_f32_batched_usm);
+batched_matvec_raw_wrapper!(matvec_q8_k_packed_f32_batched_usm_raw,
+                            matvec_q8_k_packed_f32_batched_usm);
+batched_matvec_raw_wrapper!(matvec_pq2_0_packed_f32_batched_usm_raw,
+                            matvec_pq2_0_packed_f32_batched_usm);
+batched_matvec_raw_wrapper!(matvec_mxfp4_packed_f32_batched_usm_raw,
+                            matvec_mxfp4_packed_f32_batched_usm);
+batched_matvec_raw_wrapper!(matvec_mxfp6_packed_f32_batched_usm_raw,
+                            matvec_mxfp6_packed_f32_batched_usm);
+batched_matvec_raw_wrapper!(matvec_mxfp8_packed_f32_batched_usm_raw,
+                            matvec_mxfp8_packed_f32_batched_usm);
 
 /// Raw-pointer variant of the batched USM IQ4_XS packed matvec.
 /// Same per-cell math as `matvec_iq4_xs_packed_f32_usm_raw`,

@@ -9085,6 +9085,54 @@ inline void matvec_q4_0_packed_f32_usm_impl(
     }).wait();
 }
 
+// Q4_0 BATCHED (prefill) twin of matvec_q4_0_packed_f32_usm_impl — identical
+// 18B/32-block dequant (d*(nibble-8)) but a 2D (M, N) range computing
+// out[n*M + m] = sum_k dequant(W[m,k]) * X[n,k]. Closes the gap where Q4_0
+// weights fell to the CPU batched matvec on prefill (single-row decode already
+// used the GPU). Mirrors the iq4_nl batched kernel's shape.
+template <std::size_t LWS_T>
+inline void matvec_q4_0_packed_f32_batched_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K, int N) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 32;
+    const int bytes_per_row = blocks_per_row * 18;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global_m =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    sycl::range<2> global(global_m, static_cast<std::size_t>(N));
+    sycl::range<2> local(LWS, 1);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                const int n = static_cast<int>(it.get_global_id(1));
+                if (m >= M || n >= N) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                const float* x_row = x_usm + static_cast<std::size_t>(n) * K;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 18;
+                    const float d = bits_to_f32(static_cast<uint16_t>(blk[0])
+                                                | (static_cast<uint16_t>(blk[1]) << 8));
+                    const uint8_t* qs = blk + 2;
+                    const int x_off = b * 32;
+                    for (int j = 0; j < 16; ++j) {
+                        const int x0 = static_cast<int>(qs[j] & 0x0F) - 8;
+                        const int x1 = static_cast<int>(qs[j] >> 4) - 8;
+                        acc += d * static_cast<float>(x0) * x_row[x_off + j];
+                        acc += d * static_cast<float>(x1) * x_row[x_off + j + 16];
+                    }
+                }
+                out_usm[static_cast<std::size_t>(n) * M + m] = acc;
+            });
+    }).wait();
+}
+
 // ---- Q5_0 (22 bytes / 32: f16 d + u32 qh + 16 nibble bytes) ----
 // 5-bit signed: value = (nibble | 5th_bit<<4) - 16. The 5th bit for the
 // low-nibble weight j is qh bit j; for the high-nibble weight it is bit
@@ -9775,6 +9823,560 @@ inline void matvec_mxfp8_packed_f32_usm_impl(
     }).wait();
 }
 
+// =========================================================================
+// Batched (prefill) twins of the CPU-parity + MX packed matvecs above. Each
+// is a mechanical N-row lift of its single-row impl: `nd_range<2>` with the
+// output row m in dim 0 and the input row n in dim 1, `x_row = x_usm + n*K`,
+// `out[n*M + m]`. The per-block dequant math is byte-identical to the
+// single-row twin (copied verbatim) — only the launch shape + the x/out
+// indexing change. These close the prefill CPU-fallback gap for Q5_0/Q4_1/
+// Q5_1/Q2_K/Q3_K/Q8_K/PQ2_0/MXFP4/MXFP6/MXFP8 (Q4_0 + Q8_0/Q4_K/Q5_K/Q6_K/
+// IQ* already had batched kernels). Validated by the `matvecb:` parity probes.
+// =========================================================================
+
+// ---- Q5_0 batched (22 bytes / 32) ----
+template <std::size_t LWS_T>
+inline void matvec_q5_0_packed_f32_batched_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K, int N) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 32;
+    const int bytes_per_row = blocks_per_row * 22;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global_m =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    sycl::range<2> global(global_m, static_cast<std::size_t>(N));
+    sycl::range<2> local(LWS, 1);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                const int n = static_cast<int>(it.get_global_id(1));
+                if (m >= M || n >= N) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                const float* x_row = x_usm + static_cast<std::size_t>(n) * K;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 22;
+                    const float d = bits_to_f32(static_cast<uint16_t>(blk[0])
+                                                | (static_cast<uint16_t>(blk[1]) << 8));
+                    const uint32_t qh =
+                        static_cast<uint32_t>(blk[2])
+                        | (static_cast<uint32_t>(blk[3]) << 8)
+                        | (static_cast<uint32_t>(blk[4]) << 16)
+                        | (static_cast<uint32_t>(blk[5]) << 24);
+                    const uint8_t* qs = blk + 6;
+                    const int x_off = b * 32;
+                    for (int j = 0; j < 16; ++j) {
+                        const uint32_t xh_0 = ((qh >> j) << 4) & 0x10u;
+                        const uint32_t xh_1 = (qh >> (j + 12)) & 0x10u;
+                        const int x0 = (static_cast<int>(qs[j] & 0x0F)
+                                        | static_cast<int>(xh_0)) - 16;
+                        const int x1 = (static_cast<int>(qs[j] >> 4)
+                                        | static_cast<int>(xh_1)) - 16;
+                        acc += d * static_cast<float>(x0) * x_row[x_off + j];
+                        acc += d * static_cast<float>(x1) * x_row[x_off + j + 16];
+                    }
+                }
+                out_usm[static_cast<std::size_t>(n) * M + m] = acc;
+            });
+    }).wait();
+}
+
+// ---- Q4_1 batched (20 bytes / 32) ----
+template <std::size_t LWS_T>
+inline void matvec_q4_1_packed_f32_batched_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K, int N) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 32;
+    const int bytes_per_row = blocks_per_row * 20;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global_m =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    sycl::range<2> global(global_m, static_cast<std::size_t>(N));
+    sycl::range<2> local(LWS, 1);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                const int n = static_cast<int>(it.get_global_id(1));
+                if (m >= M || n >= N) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                const float* x_row = x_usm + static_cast<std::size_t>(n) * K;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 20;
+                    const float d = bits_to_f32(static_cast<uint16_t>(blk[0])
+                                                | (static_cast<uint16_t>(blk[1]) << 8));
+                    const float mn = bits_to_f32(static_cast<uint16_t>(blk[2])
+                                                 | (static_cast<uint16_t>(blk[3]) << 8));
+                    const uint8_t* qs = blk + 4;
+                    const int x_off = b * 32;
+                    for (int j = 0; j < 16; ++j) {
+                        const int q0 = static_cast<int>(qs[j] & 0x0F);
+                        const int q1 = static_cast<int>(qs[j] >> 4);
+                        acc += (d * static_cast<float>(q0) + mn) * x_row[x_off + j];
+                        acc += (d * static_cast<float>(q1) + mn) * x_row[x_off + j + 16];
+                    }
+                }
+                out_usm[static_cast<std::size_t>(n) * M + m] = acc;
+            });
+    }).wait();
+}
+
+// ---- Q5_1 batched (24 bytes / 32) ----
+template <std::size_t LWS_T>
+inline void matvec_q5_1_packed_f32_batched_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K, int N) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 32;
+    const int bytes_per_row = blocks_per_row * 24;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global_m =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    sycl::range<2> global(global_m, static_cast<std::size_t>(N));
+    sycl::range<2> local(LWS, 1);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                const int n = static_cast<int>(it.get_global_id(1));
+                if (m >= M || n >= N) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                const float* x_row = x_usm + static_cast<std::size_t>(n) * K;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 24;
+                    const float d = bits_to_f32(static_cast<uint16_t>(blk[0])
+                                                | (static_cast<uint16_t>(blk[1]) << 8));
+                    const float mn = bits_to_f32(static_cast<uint16_t>(blk[2])
+                                                 | (static_cast<uint16_t>(blk[3]) << 8));
+                    const uint32_t qh =
+                        static_cast<uint32_t>(blk[4])
+                        | (static_cast<uint32_t>(blk[5]) << 8)
+                        | (static_cast<uint32_t>(blk[6]) << 16)
+                        | (static_cast<uint32_t>(blk[7]) << 24);
+                    const uint8_t* qs = blk + 8;
+                    const int x_off = b * 32;
+                    for (int j = 0; j < 16; ++j) {
+                        const uint32_t xh_0 = ((qh >> j) << 4) & 0x10u;
+                        const uint32_t xh_1 = (qh >> (j + 12)) & 0x10u;
+                        const int q0 = static_cast<int>(qs[j] & 0x0F)
+                                       | static_cast<int>(xh_0);
+                        const int q1 = static_cast<int>(qs[j] >> 4)
+                                       | static_cast<int>(xh_1);
+                        acc += (d * static_cast<float>(q0) + mn) * x_row[x_off + j];
+                        acc += (d * static_cast<float>(q1) + mn) * x_row[x_off + j + 16];
+                    }
+                }
+                out_usm[static_cast<std::size_t>(n) * M + m] = acc;
+            });
+    }).wait();
+}
+
+// ---- Q2_K batched (84 bytes / 256) ----
+template <std::size_t LWS_T>
+inline void matvec_q2_k_packed_f32_batched_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K, int N) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 256;
+    const int bytes_per_row = blocks_per_row * 84;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global_m =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    sycl::range<2> global(global_m, static_cast<std::size_t>(N));
+    sycl::range<2> local(LWS, 1);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                const int n = static_cast<int>(it.get_global_id(1));
+                if (m >= M || n >= N) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                const float* x_row = x_usm + static_cast<std::size_t>(n) * K;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 84;
+                    const uint8_t* scales = blk;          // [0..16)
+                    const uint8_t* qs = blk + 16;         // [16..80)
+                    const float d = bits_to_f32(static_cast<uint16_t>(blk[80])
+                                                | (static_cast<uint16_t>(blk[81]) << 8));
+                    const float dmin = bits_to_f32(static_cast<uint16_t>(blk[82])
+                                                 | (static_cast<uint16_t>(blk[83]) << 8));
+                    const int x_base = b * 256;
+                    int x_off = 0;
+                    int is = 0;
+                    for (int chunk = 0; chunk < 2; ++chunk) {
+                        const uint8_t* qc = qs + chunk * 32;
+                        for (int sh = 0; sh < 4; ++sh) {
+                            const uint32_t shift = static_cast<uint32_t>(sh * 2);
+                            const uint8_t sc_a = scales[is];
+                            const float dl_a = d * static_cast<float>(sc_a & 0x0F);
+                            const float ml_a = dmin * static_cast<float>(sc_a >> 4);
+                            for (int l = 0; l < 16; ++l) {
+                                const float qv = static_cast<float>((qc[l] >> shift) & 3);
+                                acc += (dl_a * qv - ml_a) * x_row[x_base + x_off + l];
+                            }
+                            x_off += 16;
+                            ++is;
+                            const uint8_t sc_b = scales[is];
+                            const float dl_b = d * static_cast<float>(sc_b & 0x0F);
+                            const float ml_b = dmin * static_cast<float>(sc_b >> 4);
+                            for (int l = 0; l < 16; ++l) {
+                                const float qv = static_cast<float>((qc[l + 16] >> shift) & 3);
+                                acc += (dl_b * qv - ml_b) * x_row[x_base + x_off + l];
+                            }
+                            x_off += 16;
+                            ++is;
+                        }
+                    }
+                }
+                out_usm[static_cast<std::size_t>(n) * M + m] = acc;
+            });
+    }).wait();
+}
+
+// ---- Q3_K batched (110 bytes / 256) ----
+template <std::size_t LWS_T>
+inline void matvec_q3_k_packed_f32_batched_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K, int N) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 256;
+    const int bytes_per_row = blocks_per_row * 110;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global_m =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    sycl::range<2> global(global_m, static_cast<std::size_t>(N));
+    sycl::range<2> local(LWS, 1);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                const int n = static_cast<int>(it.get_global_id(1));
+                if (m >= M || n >= N) return;
+                const uint32_t KMASK1 = 0x03030303u;
+                const uint32_t KMASK2 = 0x0f0f0f0fu;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                const float* x_row = x_usm + static_cast<std::size_t>(n) * K;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 110;
+                    const uint8_t* hmask = blk;            // [0..32)
+                    const uint8_t* qs = blk + 32;          // [32..96)
+                    const uint8_t* sc_raw = blk + 96;      // [96..108)
+                    const float d_all = bits_to_f32(static_cast<uint16_t>(blk[108])
+                                                 | (static_cast<uint16_t>(blk[109]) << 8));
+                    uint32_t aux[4];
+                    aux[0] = static_cast<uint32_t>(sc_raw[0])
+                             | (static_cast<uint32_t>(sc_raw[1]) << 8)
+                             | (static_cast<uint32_t>(sc_raw[2]) << 16)
+                             | (static_cast<uint32_t>(sc_raw[3]) << 24);
+                    aux[1] = static_cast<uint32_t>(sc_raw[4])
+                             | (static_cast<uint32_t>(sc_raw[5]) << 8)
+                             | (static_cast<uint32_t>(sc_raw[6]) << 16)
+                             | (static_cast<uint32_t>(sc_raw[7]) << 24);
+                    aux[2] = static_cast<uint32_t>(sc_raw[8])
+                             | (static_cast<uint32_t>(sc_raw[9]) << 8)
+                             | (static_cast<uint32_t>(sc_raw[10]) << 16)
+                             | (static_cast<uint32_t>(sc_raw[11]) << 24);
+                    const uint32_t tmp = aux[2];
+                    aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+                    aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+                    aux[0] = (aux[0] & KMASK2) | ((tmp & KMASK1) << 4);
+                    aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+                    int8_t scales[16];
+                    for (int j = 0; j < 16; ++j) {
+                        scales[j] = static_cast<int8_t>(
+                            static_cast<uint8_t>((aux[j >> 2] >> ((j & 3) * 8)) & 0xFF));
+                    }
+                    const int x_base = b * 256;
+                    int q_cursor = 0;
+                    int x_off = 0;
+                    uint8_t m_bit = 1;
+                    int is = 0;
+                    for (int chunk = 0; chunk < 2; ++chunk) {
+                        uint32_t shift = 0;
+                        for (int j4 = 0; j4 < 4; ++j4) {
+                            float dl = d_all * (static_cast<float>(scales[is]) - 32.0f);
+                            ++is;
+                            for (int l = 0; l < 16; ++l) {
+                                const int lo = static_cast<int>((qs[q_cursor + l] >> shift) & 3);
+                                const int hi_sub = (hmask[l] & m_bit) != 0 ? 0 : 4;
+                                acc += dl * static_cast<float>(lo - hi_sub)
+                                          * x_row[x_base + x_off + l];
+                            }
+                            x_off += 16;
+                            dl = d_all * (static_cast<float>(scales[is]) - 32.0f);
+                            ++is;
+                            for (int l = 0; l < 16; ++l) {
+                                const int lo = static_cast<int>((qs[q_cursor + l + 16] >> shift) & 3);
+                                const int hi_sub = (hmask[l + 16] & m_bit) != 0 ? 0 : 4;
+                                acc += dl * static_cast<float>(lo - hi_sub)
+                                          * x_row[x_base + x_off + l];
+                            }
+                            x_off += 16;
+                            shift += 2;
+                            m_bit = static_cast<uint8_t>(m_bit << 1);
+                        }
+                        q_cursor += 32;
+                    }
+                }
+                out_usm[static_cast<std::size_t>(n) * M + m] = acc;
+            });
+    }).wait();
+}
+
+// ---- Q8_K batched (292 bytes / 256; f32 d) ----
+template <std::size_t LWS_T>
+inline void matvec_q8_k_packed_f32_batched_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K, int N) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 256;
+    const int bytes_per_row = blocks_per_row * 292;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global_m =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    sycl::range<2> global(global_m, static_cast<std::size_t>(N));
+    sycl::range<2> local(LWS, 1);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                const int n = static_cast<int>(it.get_global_id(1));
+                if (m >= M || n >= N) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                const float* x_row = x_usm + static_cast<std::size_t>(n) * K;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 292;
+                    const uint32_t d_bits =
+                        static_cast<uint32_t>(blk[0])
+                        | (static_cast<uint32_t>(blk[1]) << 8)
+                        | (static_cast<uint32_t>(blk[2]) << 16)
+                        | (static_cast<uint32_t>(blk[3]) << 24);
+                    float d;
+                    std::memcpy(&d, &d_bits, sizeof(float));
+                    const uint8_t* qs = blk + 4;
+                    const int x_off = b * 256;
+                    for (int j = 0; j < 256; ++j) {
+                        const int8_t w_i8 = static_cast<int8_t>(qs[j]);
+                        acc += d * static_cast<float>(w_i8) * x_row[x_off + j];
+                    }
+                }
+                out_usm[static_cast<std::size_t>(n) * M + m] = acc;
+            });
+    }).wait();
+}
+
+// ---- PQ2_0 batched (34 bytes / 128) ----
+template <std::size_t LWS_T>
+inline void matvec_pq2_0_packed_f32_batched_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K, int N) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 128;
+    const int bytes_per_row = blocks_per_row * 34;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global_m =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    sycl::range<2> global(global_m, static_cast<std::size_t>(N));
+    sycl::range<2> local(LWS, 1);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                const int n = static_cast<int>(it.get_global_id(1));
+                if (m >= M || n >= N) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                const float* x_row = x_usm + static_cast<std::size_t>(n) * K;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 34;
+                    const float d = bits_to_f32(static_cast<uint16_t>(blk[0])
+                                                | (static_cast<uint16_t>(blk[1]) << 8));
+                    const uint8_t* qs = blk + 2;
+                    const int x_off = b * 128;
+                    float sum = 0.0f;
+                    for (int j = 0; j < 128; ++j) {
+                        const int qv = static_cast<int>((qs[j / 4] >> ((j % 4) * 2)) & 0x3) - 1;
+                        sum += static_cast<float>(qv) * x_row[x_off + j];
+                    }
+                    acc += d * sum;
+                }
+                out_usm[static_cast<std::size_t>(n) * M + m] = acc;
+            });
+    }).wait();
+}
+
+// ---- MXFP4 batched (17 bytes / 32) ----
+template <std::size_t LWS_T>
+inline void matvec_mxfp4_packed_f32_batched_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K, int N) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 32;
+    const int bytes_per_row = blocks_per_row * 17;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global_m =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    sycl::range<2> global(global_m, static_cast<std::size_t>(N));
+    sycl::range<2> local(LWS, 1);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                const int n = static_cast<int>(it.get_global_id(1));
+                if (m >= M || n >= N) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                const float* x_row = x_usm + static_cast<std::size_t>(n) * K;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 17;
+                    const float scale = rsl_mx_e8m0_to_f32(blk[16]);
+                    const int x_off = b * 32;
+                    for (int j = 0; j < 16; ++j) {
+                        const uint8_t byte = blk[j];
+                        const float w0 =
+                            rsl_mx_e2m1_to_f32(byte & 0x0F) * scale;
+                        const float w1 =
+                            rsl_mx_e2m1_to_f32((byte >> 4) & 0x0F) * scale;
+                        acc += w0 * x_row[x_off + j * 2];
+                        acc += w1 * x_row[x_off + j * 2 + 1];
+                    }
+                }
+                out_usm[static_cast<std::size_t>(n) * M + m] = acc;
+            });
+    }).wait();
+}
+
+// ---- MXFP6 batched (25 bytes / 32) ----
+template <std::size_t LWS_T>
+inline void matvec_mxfp6_packed_f32_batched_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K, int N) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 32;
+    const int bytes_per_row = blocks_per_row * 25;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global_m =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    sycl::range<2> global(global_m, static_cast<std::size_t>(N));
+    sycl::range<2> local(LWS, 1);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                const int n = static_cast<int>(it.get_global_id(1));
+                if (m >= M || n >= N) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                const float* x_row = x_usm + static_cast<std::size_t>(n) * K;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 25;   // 24 code bytes ...
+                    const float scale = rsl_mx_e8m0_to_f32(blk[24]);  // + scale
+                    const int x_off = b * 32;
+                    for (int j = 0; j < 32; ++j) {
+                        const int bitpos = j * 6;
+                        const int byte_idx = bitpos >> 3;
+                        const int bit_off = bitpos & 7;
+                        const uint32_t lo = blk[byte_idx];
+                        const uint32_t hi =
+                            (byte_idx + 1 < 24)
+                                ? static_cast<uint32_t>(blk[byte_idx + 1])
+                                : 0u;
+                        const uint32_t word = lo | (hi << 8);
+                        const uint8_t code =
+                            static_cast<uint8_t>((word >> bit_off) & 0x3Fu);
+                        acc += rsl_mx_e3m2_to_f32(code) * scale
+                               * x_row[x_off + j];
+                    }
+                }
+                out_usm[static_cast<std::size_t>(n) * M + m] = acc;
+            });
+    }).wait();
+}
+
+// ---- MXFP8 batched (33 bytes / 32) ----
+template <std::size_t LWS_T>
+inline void matvec_mxfp8_packed_f32_batched_usm_impl(
+    sycl::queue& q,
+    const void* w_bytes_usm,
+    const float* x_usm,
+    float* out_usm,
+    int M, int K, int N) {
+    constexpr std::size_t LWS = LWS_T;
+    const int blocks_per_row = K / 32;
+    const int bytes_per_row = blocks_per_row * 33;
+    const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
+    const std::size_t global_m =
+        ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
+    sycl::range<2> global(global_m, static_cast<std::size_t>(N));
+    sycl::range<2> local(LWS, 1);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<2>(global, local),
+            [=](sycl::nd_item<2> it) {
+                const int m = static_cast<int>(it.get_global_id(0));
+                const int n = static_cast<int>(it.get_global_id(1));
+                if (m >= M || n >= N) return;
+                const uint8_t* row = w_bytes + m * bytes_per_row;
+                const float* x_row = x_usm + static_cast<std::size_t>(n) * K;
+                float acc = 0.0f;
+                for (int b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* blk = row + b * 33;
+                    const float scale = rsl_mx_e8m0_to_f32(blk[32]);
+                    const int x_off = b * 32;
+                    for (int j = 0; j < 32; ++j) {
+                        acc += rsl_mx_e4m3_to_f32(blk[j]) * scale
+                               * x_row[x_off + j];
+                    }
+                }
+                out_usm[static_cast<std::size_t>(n) * M + m] = acc;
+            });
+    }).wait();
+}
+
 extern "C" {
 
 void rsl_matvec_q4_0_packed_f32_usm(rsl_stream* s,
@@ -9802,6 +10404,81 @@ void rsl_matvec_q4_0_packed_f32_usm(rsl_stream* s,
         default:  matvec_q4_0_packed_f32_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K); break;
     }
 })
+
+void rsl_matvec_q4_0_packed_f32_batched_usm(rsl_stream* s,
+                                            const void* w_bytes_usm,
+                                            const float* x_usm,
+                                            float* out_usm,
+                                            int M, int K, int N,
+                                            int lws) RSL_FFI_BODY_VOID(
+    "rsl_matvec_q4_0_packed_f32_batched_usm", {
+    if (s == nullptr || w_bytes_usm == nullptr
+        || x_usm == nullptr || out_usm == nullptr) {
+        return;
+    }
+    if (M <= 0 || K <= 0 || N <= 0 || (K % 32) != 0) {
+        return;
+    }
+    auto& q = s->q;
+    const int eff_lws = (lws <= 0) ? static_cast<int>(RSL_LWS) : lws;
+    switch (eff_lws) {
+        case 16:  matvec_q4_0_packed_f32_batched_usm_impl<16>(q, w_bytes_usm, x_usm, out_usm, M, K, N); break;
+        case 32:  matvec_q4_0_packed_f32_batched_usm_impl<32>(q, w_bytes_usm, x_usm, out_usm, M, K, N); break;
+        case 64:  matvec_q4_0_packed_f32_batched_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K, N); break;
+        case 128: matvec_q4_0_packed_f32_batched_usm_impl<128>(q, w_bytes_usm, x_usm, out_usm, M, K, N); break;
+        case 256: matvec_q4_0_packed_f32_batched_usm_impl<256>(q, w_bytes_usm, x_usm, out_usm, M, K, N); break;
+        default:  matvec_q4_0_packed_f32_batched_usm_impl<64>(q, w_bytes_usm, x_usm, out_usm, M, K, N); break;
+    }
+})
+
+// Batched (prefill) twins of the CPU-parity + MX packed matvecs. Same wrapper
+// shape + LWS-switch as `rsl_matvec_q4_0_packed_f32_batched_usm` above; only
+// the impl template, byte layout, and K-divisibility constraint differ.
+#define RSL_BATCHED_MATVEC_WRAPPER(FNNAME, IMPL, KMOD)                          \
+    void FNNAME(rsl_stream* s, const void* w_bytes_usm, const float* x_usm,     \
+                float* out_usm, int M, int K, int N, int lws)                   \
+        RSL_FFI_BODY_VOID(#FNNAME, {                                            \
+        if (s == nullptr || w_bytes_usm == nullptr || x_usm == nullptr          \
+            || out_usm == nullptr) {                                            \
+            return;                                                             \
+        }                                                                       \
+        if (M <= 0 || K <= 0 || N <= 0 || (K % (KMOD)) != 0) {                  \
+            return;                                                             \
+        }                                                                       \
+        auto& q = s->q;                                                         \
+        const int eff_lws = (lws <= 0) ? static_cast<int>(RSL_LWS) : lws;       \
+        switch (eff_lws) {                                                      \
+            case 16:  IMPL<16>(q, w_bytes_usm, x_usm, out_usm, M, K, N); break; \
+            case 32:  IMPL<32>(q, w_bytes_usm, x_usm, out_usm, M, K, N); break; \
+            case 64:  IMPL<64>(q, w_bytes_usm, x_usm, out_usm, M, K, N); break; \
+            case 128: IMPL<128>(q, w_bytes_usm, x_usm, out_usm, M, K, N); break;\
+            case 256: IMPL<256>(q, w_bytes_usm, x_usm, out_usm, M, K, N); break;\
+            default:  IMPL<64>(q, w_bytes_usm, x_usm, out_usm, M, K, N); break; \
+        }                                                                       \
+    })
+
+RSL_BATCHED_MATVEC_WRAPPER(rsl_matvec_q5_0_packed_f32_batched_usm,
+                           matvec_q5_0_packed_f32_batched_usm_impl, 32)
+RSL_BATCHED_MATVEC_WRAPPER(rsl_matvec_q4_1_packed_f32_batched_usm,
+                           matvec_q4_1_packed_f32_batched_usm_impl, 32)
+RSL_BATCHED_MATVEC_WRAPPER(rsl_matvec_q5_1_packed_f32_batched_usm,
+                           matvec_q5_1_packed_f32_batched_usm_impl, 32)
+RSL_BATCHED_MATVEC_WRAPPER(rsl_matvec_q2_k_packed_f32_batched_usm,
+                           matvec_q2_k_packed_f32_batched_usm_impl, 256)
+RSL_BATCHED_MATVEC_WRAPPER(rsl_matvec_q3_k_packed_f32_batched_usm,
+                           matvec_q3_k_packed_f32_batched_usm_impl, 256)
+RSL_BATCHED_MATVEC_WRAPPER(rsl_matvec_q8_k_packed_f32_batched_usm,
+                           matvec_q8_k_packed_f32_batched_usm_impl, 256)
+RSL_BATCHED_MATVEC_WRAPPER(rsl_matvec_pq2_0_packed_f32_batched_usm,
+                           matvec_pq2_0_packed_f32_batched_usm_impl, 128)
+RSL_BATCHED_MATVEC_WRAPPER(rsl_matvec_mxfp4_packed_f32_batched_usm,
+                           matvec_mxfp4_packed_f32_batched_usm_impl, 32)
+RSL_BATCHED_MATVEC_WRAPPER(rsl_matvec_mxfp6_packed_f32_batched_usm,
+                           matvec_mxfp6_packed_f32_batched_usm_impl, 32)
+RSL_BATCHED_MATVEC_WRAPPER(rsl_matvec_mxfp8_packed_f32_batched_usm,
+                           matvec_mxfp8_packed_f32_batched_usm_impl, 32)
+
+#undef RSL_BATCHED_MATVEC_WRAPPER
 
 // OCP Microscaling packed matvecs (block 32; 17/25/33 bytes per block).
 // Same wrapper shape + LWS-switch as the Q4_0 entry above; only the impl

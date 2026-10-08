@@ -64,6 +64,16 @@ const LAYOUTS: &[QuantLayout] = &[
         block_bytes: 34,
         f16_scales: &[0],
     },
+    // Legacy GGML Q4_0: 18 bytes / 32 elems = f16 d + 16 nibble bytes;
+    // value = d·(nibble − 8). Single-row + batched SYCL kernels both ship
+    // (`matvec_q4_0_packed_f32{,_batched}_usm`); listed here so the matvec +
+    // batched-matvec probes exercise them against the CPU reference.
+    QuantLayout {
+        name: "q4_0",
+        block_elems: 32,
+        block_bytes: 18,
+        f16_scales: &[0],
+    },
     QuantLayout {
         name: "q4_k",
         block_elems: 256,
@@ -165,6 +175,24 @@ const LAYOUTS: &[QuantLayout] = &[
         block_bytes: 33,
         f16_scales: &[],
     },
+    // CPU-parity legacy + K-quant + PrismML formats: single-row AND batched
+    // SYCL matvec kernels ship for each (`matvec_<fmt>_packed_f32{,_batched}_
+    // usm`); listed here so both the matvec + matvecb probes exercise them.
+    // Q5_0: 22B/32 = f16 d + u32 qh + 16 nibbles.
+    QuantLayout { name: "q5_0", block_elems: 32, block_bytes: 22, f16_scales: &[0] },
+    // Q4_1: 20B/32 = f16 d + f16 min + 16 nibbles.
+    QuantLayout { name: "q4_1", block_elems: 32, block_bytes: 20, f16_scales: &[0, 2] },
+    // Q5_1: 24B/32 = f16 d + f16 min + u32 qh + 16 nibbles.
+    QuantLayout { name: "q5_1", block_elems: 32, block_bytes: 24, f16_scales: &[0, 2] },
+    // Q2_K: 84B/256 = 16 scale bytes + 64 qs + f16 d + f16 dmin (at 80/82).
+    QuantLayout { name: "q2_k", block_elems: 256, block_bytes: 84, f16_scales: &[80, 82] },
+    // Q3_K: 110B/256 = 32 hmask + 64 qs + 12 scales + f16 d (at 108).
+    QuantLayout { name: "q3_k", block_elems: 256, block_bytes: 110, f16_scales: &[108] },
+    // Q8_K: 292B/256 = F32 d (at 0) + 256 i8 qs + 16 i16 bsums. The scale is
+    // F32, not f16 — `gen_quant_bytes` stamps it by name (see below).
+    QuantLayout { name: "q8_k", block_elems: 256, block_bytes: 292, f16_scales: &[] },
+    // PQ2_0 (PrismML Bonsai): 34B/128 = f16 d + 32 packed 2-bit codes.
+    QuantLayout { name: "pq2_0", block_elems: 128, block_bytes: 34, f16_scales: &[0] },
 ];
 
 type CpuMatvec = fn(&[u8], &[f32], &mut [f32], usize, usize);
@@ -181,10 +209,23 @@ type GpuFusedRaw = unsafe fn(
     u32,
     u32,
 ) -> sk::Result<()>;
+// Batched packed matvec: the prefill twin of `GpuMatvecRaw` with an extra `N`
+// (input-row count) before the `lws`. `out[n*M + m] = W[m,:]·x[n,:]`.
+type GpuMatvecBatchedRaw = unsafe fn(
+    &sk::SyclStream,
+    *const u8,
+    *const f32,
+    *mut f32,
+    u32,
+    u32,
+    u32,
+    u32,
+) -> sk::Result<()>;
 
 fn cpu_matvec_for(name: &str) -> CpuMatvec {
     match name {
         "q8_0" => k::matvec_q8_0_w_f32_a,
+        "q4_0" => k::matvec_q4_0_w_f32_a,
         "q4_k" => k::matvec_q4_k_w_f32_a,
         "q5_k" => k::matvec_q5_k_w_f32_a,
         "q6_k" => k::matvec_q6_k_w_f32_a,
@@ -201,6 +242,13 @@ fn cpu_matvec_for(name: &str) -> CpuMatvec {
         "mxfp4" => k::mxfp::matvec_mxfp4_w_f32_a,
         "mxfp6" => k::mxfp::matvec_mxfp6_w_f32_a,
         "mxfp8" => k::mxfp::matvec_mxfp8_w_f32_a,
+        "q5_0" => k::matvec_q5_0_w_f32_a,
+        "q4_1" => k::matvec_q4_1_w_f32_a,
+        "q5_1" => k::matvec_q5_1_w_f32_a,
+        "q2_k" => k::matvec_q2_k_w_f32_a,
+        "q3_k" => k::matvec_q3_k_w_f32_a,
+        "q8_k" => k::matvec_q8_k_w_f32_a,
+        "pq2_0" => k::matvec_pq2_0_w_f32_a,
         _ => unreachable!("unknown dtype {name}"),
     }
 }
@@ -208,6 +256,7 @@ fn cpu_matvec_for(name: &str) -> CpuMatvec {
 fn gpu_matvec_for(name: &str) -> GpuMatvecRaw {
     match name {
         "q8_0" => sk::matvec_q8_0_packed_f32_usm_raw,
+        "q4_0" => sk::matvec_q4_0_packed_f32_usm_raw,
         "q4_k" => sk::matvec_q4_k_packed_f32_usm_raw,
         "q5_k" => sk::matvec_q5_k_packed_f32_usm_raw,
         "q6_k" => sk::matvec_q6_k_packed_f32_usm_raw,
@@ -224,12 +273,54 @@ fn gpu_matvec_for(name: &str) -> GpuMatvecRaw {
         "mxfp4" => sk::matvec_mxfp4_packed_f32_usm_raw,
         "mxfp6" => sk::matvec_mxfp6_packed_f32_usm_raw,
         "mxfp8" => sk::matvec_mxfp8_packed_f32_usm_raw,
+        "q5_0" => sk::matvec_q5_0_packed_f32_usm_raw,
+        "q4_1" => sk::matvec_q4_1_packed_f32_usm_raw,
+        "q5_1" => sk::matvec_q5_1_packed_f32_usm_raw,
+        "q2_k" => sk::matvec_q2_k_packed_f32_usm_raw,
+        "q3_k" => sk::matvec_q3_k_packed_f32_usm_raw,
+        "q8_k" => sk::matvec_q8_k_packed_f32_usm_raw,
+        "pq2_0" => sk::matvec_pq2_0_packed_f32_usm_raw,
         _ => unreachable!("unknown dtype {name}"),
     }
 }
 
-fn gpu_fused_for(name: &str) -> GpuFusedRaw {
-    match name {
+/// The batched (prefill) packed-matvec kernel for `name`, or `None` for a
+/// format that has only the single-row kernel (so the batched prefill path
+/// falls to CPU). Drives the `matvecb:` probes — the ONLY parity coverage of
+/// the batched kernels (the matvec probes above exercise the single-row path).
+fn gpu_matvec_batched_for(name: &str) -> Option<GpuMatvecBatchedRaw> {
+    Some(match name {
+        "q8_0" => sk::matvec_q8_0_packed_f32_batched_usm_raw,
+        "q4_0" => sk::matvec_q4_0_packed_f32_batched_usm_raw,
+        "q4_k" => sk::matvec_q4_k_packed_f32_batched_usm_raw,
+        "q5_k" => sk::matvec_q5_k_packed_f32_batched_usm_raw,
+        "q6_k" => sk::matvec_q6_k_packed_f32_batched_usm_raw,
+        "iq4_nl" => sk::matvec_iq4_nl_packed_f32_batched_usm_raw,
+        "iq4_xs" => sk::matvec_iq4_xs_packed_f32_batched_usm_raw,
+        "iq1_s" => sk::matvec_iq1_s_packed_f32_batched_usm_raw,
+        "iq1_m" => sk::matvec_iq1_m_packed_f32_batched_usm_raw,
+        "iq2_xxs" => sk::matvec_iq2_xxs_packed_f32_batched_usm_raw,
+        "iq2_xs" => sk::matvec_iq2_xs_packed_f32_batched_usm_raw,
+        "iq2_s" => sk::matvec_iq2_s_packed_f32_batched_usm_raw,
+        "iq3_xxs" => sk::matvec_iq3_xxs_packed_f32_batched_usm_raw,
+        "iq3_s" => sk::matvec_iq3_s_packed_f32_batched_usm_raw,
+        "ptq1_0" => sk::matvec_ptq1_0_packed_f32_batched_usm_raw,
+        "q5_0" => sk::matvec_q5_0_packed_f32_batched_usm_raw,
+        "q4_1" => sk::matvec_q4_1_packed_f32_batched_usm_raw,
+        "q5_1" => sk::matvec_q5_1_packed_f32_batched_usm_raw,
+        "q2_k" => sk::matvec_q2_k_packed_f32_batched_usm_raw,
+        "q3_k" => sk::matvec_q3_k_packed_f32_batched_usm_raw,
+        "q8_k" => sk::matvec_q8_k_packed_f32_batched_usm_raw,
+        "pq2_0" => sk::matvec_pq2_0_packed_f32_batched_usm_raw,
+        "mxfp4" => sk::matvec_mxfp4_packed_f32_batched_usm_raw,
+        "mxfp6" => sk::matvec_mxfp6_packed_f32_batched_usm_raw,
+        "mxfp8" => sk::matvec_mxfp8_packed_f32_batched_usm_raw,
+        _ => return None,
+    })
+}
+
+fn gpu_fused_for(name: &str) -> Option<GpuFusedRaw> {
+    Some(match name {
         "q8_0" => sk::matvec_q8_0_gate_up_fused_usm_raw,
         "q4_k" => sk::matvec_q4_k_gate_up_fused_usm_raw,
         "q5_k" => sk::matvec_q5_k_gate_up_fused_usm_raw,
@@ -243,8 +334,8 @@ fn gpu_fused_for(name: &str) -> GpuFusedRaw {
         "iq2_s" => sk::matvec_iq2_s_gate_up_fused_usm_raw,
         "iq3_xxs" => sk::matvec_iq3_xxs_gate_up_fused_usm_raw,
         "iq3_s" => sk::matvec_iq3_s_gate_up_fused_usm_raw,
-        _ => unreachable!("unknown dtype {name}"),
-    }
+        _ => return None,
+    })
 }
 
 /// All probe names, in execution order. Attention probes go FIRST:
@@ -277,14 +368,22 @@ fn probe_names() -> Vec<String> {
     for l in LAYOUTS {
         v.push(format!("matvec:{}", l.name));
     }
+    // Batched (prefill) packed matvecs: the N>1 twin of the matvec probes
+    // above. The single-row probes never touch these kernels, so this is
+    // their only parity coverage. Only formats with a batched kernel
+    // (`gpu_matvec_batched_for`) are listed; the rest fall to CPU on prefill.
     for l in LAYOUTS {
-        // PTQ1_0 and the MXFP* formats have no fused gate/up kernel
-        // (their FFN dispatch uses the plain matvec, falling back to two
-        // separate single-row matvecs); probe the matvec only.
-        if l.name == "ptq1_0" || l.name.starts_with("mxfp") {
-            continue;
+        if gpu_matvec_batched_for(l.name).is_some() {
+            v.push(format!("matvecb:{}", l.name));
         }
-        v.push(format!("fused:{}", l.name));
+    }
+    for l in LAYOUTS {
+        // Only the formats with a fused gate/up kernel (`gpu_fused_for`); the
+        // rest (PTQ1_0, Q4_0, the legacy/K-quant/PQ/MXFP formats) have no fused
+        // kernel — their FFN dispatch uses two separate single-row matvecs.
+        if gpu_fused_for(l.name).is_some() {
+            v.push(format!("fused:{}", l.name));
+        }
     }
     // XMX/DPAS bf16 tensor-core GEMM (Arc Xe-HPG / PVC Xe-HPC). SKIPs unless
     // the device is XMX-capable AND the DLL was built -DRSL_SYCL_XMX; on Iris
@@ -343,6 +442,12 @@ fn gen_quant_bytes(layout: &QuantLayout, rows: usize, k_dim: usize, seed: u32) -
                     }
                 }
             }
+        } else if layout.name == "q8_k" {
+            // Q8_K's shared scale is a leading F32 (not f16); random bytes
+            // there could be a huge/NaN float and poison the comparison.
+            // Stamp a small sane magnitude so d·i8 stays O(1) and finite.
+            let val = 0.004 + 0.002 * (b % 5) as f32;
+            bytes[off..off + 4].copy_from_slice(&val.to_le_bytes());
         } else if layout.f16_scales.is_empty() {
             // IQ1_M: scales live packed inside the 8-byte scale words
             // (including the split f16 delta). A fixed moderate bit
@@ -492,6 +597,7 @@ pub fn run_probe(name: &str) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("bad probe name {name}"))?;
     match kind {
         "matvec" => probe_matvec(&stream, name, rest, started),
+        "matvecb" => probe_matvec_batched(&stream, name, rest, started),
         "fused" => probe_fused(&stream, name, rest, started),
         "attn" => probe_attn(&stream, name, rest, started),
         "xmx" => probe_xmx(&stream, name, started),
@@ -638,6 +744,85 @@ fn probe_matvec(stream: &sk::SyclStream, name: &str, dtype: &str, started: Insta
     }
 }
 
+/// Prefill micro-batch width for the batched-matvec probe. The accel.rs
+/// batched-GEMM dispatch engages at `n >= 16`, so 16 is the realistic smallest
+/// batch and keeps buffers modest (16×2048 f32 x, 16×512 f32 out).
+const MV_N: usize = 16;
+
+/// Batched (prefill) packed-matvec probe: `out[n*M + m] = W[m,:]·x[n,:]` over N
+/// activation rows in one launch, graded against the CPU matvec run per-row.
+/// The single-row `probe_matvec` never touches the batched kernels, so this is
+/// their only parity check.
+fn probe_matvec_batched(stream: &sk::SyclStream, name: &str, dtype: &str, started: Instant) {
+    let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
+    let Some(gpu) = gpu_matvec_batched_for(dtype) else {
+        emit(name, "SKIP", "no-batched-kernel");
+        return;
+    };
+    let cpu = cpu_matvec_for(dtype);
+    // N distinct activation rows; reuse finite_ref (on row 0) to pick a weight
+    // whose CPU output is finite, then run the CPU reference for every row.
+    let x = gen_x(MV_N * MV_K, 42);
+    let Some((w, _)) = finite_ref(layout, cpu, &x[0..MV_K]) else {
+        emit(name, "SKIP", "no-finite-reference");
+        return;
+    };
+    let mut cpu_out = vec![0f32; MV_N * MV_M];
+    for n in 0..MV_N {
+        let xr = &x[n * MV_K..(n + 1) * MV_K];
+        cpu(&w, xr, &mut cpu_out[n * MV_M..(n + 1) * MV_M], MV_M, MV_K);
+    }
+    if !cpu_out.iter().all(|v| v.is_finite()) {
+        emit(name, "SKIP", "no-finite-reference");
+        return;
+    }
+    let (mut wb, mut xb, mut ob) = match (
+        sk::SyclSharedBuffer::<u8>::alloc(stream, w.len()),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, MV_N * MV_K),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, MV_N * MV_M),
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        _ => {
+            emit(name, "KERNEL_ERR", "usm-alloc-failed");
+            return;
+        }
+    };
+    wb.as_mut_slice().copy_from_slice(&w);
+    xb.as_mut_slice().copy_from_slice(&x);
+    ob.as_mut_slice().fill(f32::NAN);
+    // SAFETY: three live USM allocations on `stream` sized (M,K)/(N,K)/(N,M);
+    // the kernel derives all extents from (m, k, n) and waits before returning.
+    let res = unsafe {
+        gpu(
+            stream,
+            wb.as_ptr(),
+            xb.as_ptr(),
+            ob.as_mut_ptr(),
+            MV_M as u32,
+            MV_K as u32,
+            MV_N as u32,
+            0,
+        )
+    };
+    let ms = started.elapsed().as_millis();
+    match res {
+        Err(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
+        Ok(()) => {
+            let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
+            let verdict = if cos > 0.999 && max_rel < 0.02 {
+                "OK"
+            } else {
+                "MISCOMPUTE"
+            };
+            emit(
+                name,
+                verdict,
+                &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms} n={MV_N}"),
+            );
+        }
+    }
+}
+
 fn probe_fused(stream: &sk::SyclStream, name: &str, dtype: &str, started: Instant) {
     let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
     let x = gen_x(MV_K, 43);
@@ -673,7 +858,10 @@ fn probe_fused(stream: &sk::SyclStream, name: &str, dtype: &str, started: Instan
     xb.as_mut_slice().copy_from_slice(&x);
     gob.as_mut_slice().fill(f32::NAN);
     uob.as_mut_slice().fill(f32::NAN);
-    let gpu = gpu_fused_for(dtype);
+    let Some(gpu) = gpu_fused_for(dtype) else {
+        emit(name, "SKIP", "no-fused-kernel");
+        return;
+    };
     // SAFETY: as in `probe_matvec`; two weight tensors, two outputs.
     let res = unsafe {
         gpu(
