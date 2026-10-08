@@ -28,6 +28,13 @@ thiserror.workspace = true
 half.workspace = true
 rustllama-gguf = { path = "../rustllama-gguf", default-features = false }
 
+# Unix-only: a tiny stderr-fd silencer wraps the one-time oneAPI UR adapter
+# init (first SYCL enumeration) so its benign "UR adapter initialization
+# failed" banner doesn't pollute the console on non-Intel (e.g. NVIDIA-only)
+# hosts. MIT/Apache — no copyleft.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Dev-only: hardware-validation tests for the IQ4 batched matvec
 # kernels need a CPU reference. The kernels-cpu crate's

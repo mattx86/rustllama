@@ -1483,14 +1483,82 @@ mod imp {
         true
     }
 
+    /// RAII guard that redirects fd 2 (stderr) to `/dev/null` for its
+    /// lifetime and restores it on drop. Used to swallow the one-time oneAPI
+    /// UR adapter init banner on non-Intel hosts (see `device_count`). No-op
+    /// off Unix (the windowed GUI already discards the C++ side's stderr).
+    #[cfg(unix)]
+    struct StderrSilencer {
+        saved_fd: libc::c_int,
+    }
+    #[cfg(unix)]
+    impl StderrSilencer {
+        fn new() -> Self {
+            use std::io::Write as _;
+            let _ = std::io::stderr().flush();
+            // SAFETY: a standard POSIX dup/dup2 dance; a negative `saved_fd`
+            // (dup failed) is handled in `drop`.
+            let saved_fd = unsafe {
+                let saved = libc::dup(libc::STDERR_FILENO);
+                let devnull = libc::open(
+                    b"/dev/null\0".as_ptr() as *const libc::c_char,
+                    libc::O_WRONLY,
+                );
+                if devnull >= 0 {
+                    libc::dup2(devnull, libc::STDERR_FILENO);
+                    libc::close(devnull);
+                }
+                saved
+            };
+            StderrSilencer { saved_fd }
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for StderrSilencer {
+        fn drop(&mut self) {
+            if self.saved_fd >= 0 {
+                // SAFETY: restore the stderr fd we saved in `new`.
+                unsafe {
+                    libc::dup2(self.saved_fd, libc::STDERR_FILENO);
+                    libc::close(self.saved_fd);
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    struct StderrSilencer;
+    #[cfg(not(unix))]
+    impl StderrSilencer {
+        fn new() -> Self {
+            StderrSilencer
+        }
+    }
+
     pub fn device_count() -> Result<u32> {
         // Guard the delay-loaded FFI: if the GPU runtime can't be loaded,
         // report zero devices instead of aborting on the first symbol.
         if !sycl_runtime_loadable() {
             return Ok(0);
         }
-        // SAFETY: bound to the C ABI shim we own.
-        let n = unsafe { rsl_sycl_device_count() };
+        // The FIRST SYCL enumeration triggers the oneAPI UR loader's one-time
+        // adapter init. On a host with no usable Level-Zero (an NVIDIA-only
+        // box, where our `ONEAPI_DEVICE_SELECTOR=level_zero:gpu` makes the L0
+        // adapter load against an absent/incompatible runtime) the loader
+        // prints a benign but confusing
+        // `UR adapter initialization failed: 43 (UNSUPPORTED_VERSION)` to
+        // stderr. Swallow stderr around ONLY that one-time init — not later
+        // calls, so a real DEVICE_LOST diagnostic still surfaces; the count it
+        // returns (0 here) is all we need to know SYCL found nothing.
+        static UR_INIT: std::sync::Once = std::sync::Once::new();
+        let mut first: Option<std::os::raw::c_int> = None;
+        UR_INIT.call_once(|| {
+            let _silence = StderrSilencer::new();
+            // SAFETY: bound to the C ABI shim we own.
+            first = Some(unsafe { rsl_sycl_device_count() });
+        });
+        // SAFETY: bound to the C ABI shim we own; after the first call the UR
+        // loader is initialized, so this runs without the banner.
+        let n = first.unwrap_or_else(|| unsafe { rsl_sycl_device_count() });
         Ok(n.max(0) as u32)
     }
 
