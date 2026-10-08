@@ -2768,11 +2768,11 @@ fn infer_n_layers_from_gguf(src: &rustllama_gguf::Gguf) -> usize {
 
 /// True when the GGUF declares a hybrid transformer+SSM architecture — the
 /// same trigger `LlamaConfig::from_gguf` uses (`{arch}.full_attention_interval`
-/// AND `{arch}.ssm.state_size` both present). Hybrid models (qwen35 / qwen35moe
-/// / Ornith) honor only f32 + q4_0 KV verbatim on the hybrid attention path
-/// (q4_0 has the calibrated arm); any other non-f32 dtype requires
-/// `RUSTLLAMA_HYBRID_KV_ANY`. The kv_dtype sweep therefore restricts hybrids to
-/// the `{f32,q4_0}` candidate list rather than skipping it.
+/// AND `{arch}.ssm.state_size` both present). Used by the kv_dtype sweep, which
+/// MEASURES the full candidate grid on hybrids (qwen35 / qwen35moe / Ornith) and
+/// lets its coherence gate decide which quant KV (if any) is honored — so the
+/// autotune, not a manual `RUSTLLAMA_HYBRID_KV_ANY`, is the authority on quant
+/// hybrid KV. See [`cmd_tune_kv_dtype`].
 fn gguf_is_hybrid(model_path: &std::path::Path) -> bool {
     let Ok(g) = rustllama_gguf::Gguf::open(model_path) else {
         return false;
@@ -3779,6 +3779,16 @@ async fn serve(
             );
             if let Some(w) = kv_guard_warn {
                 tracing::warn!("{w}");
+            }
+            // A tuner-cache kv_dtype winner is coherence-gated by the sweep —
+            // now including hybrids (the sweep measures the full grid on them).
+            // Signal the engine's load-time hybrid-KV coercion to honor the
+            // validated dtype verbatim, so the autotune — not a manual env var
+            // — is the authority on quant hybrid KV. Scoped to a non-f32 winner
+            // (nothing to lift otherwise); harmless on non-hybrids, where the
+            // coercion never fires.
+            if from_cache && !safe_kv_dtype_str.eq_ignore_ascii_case("f32") {
+                std::env::set_var("RUSTLLAMA_HYBRID_KV_ANY", "1");
             }
             let kv_dtype = parse_kv_dtype(&safe_kv_dtype_str)?;
 
@@ -5993,16 +6003,24 @@ fn cmd_tune_kv_dtype(
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
     let model_path = effective_model_path(model_override, &cfg, config_path)?;
 
-    // Hybrid (transformer+SSM) models honor only f32 + q4_0 KV verbatim on the
-    // hybrid attention path (q4_0 has the calibrated arm); any other non-f32
-    // dtype requires RUSTLLAMA_HYBRID_KV_ANY. Rather than skip the sweep and
-    // always force f32 (~8 min/reload of wasted work on Qwen3.5 / Ornith when
-    // sweeping the full grid), restrict the candidate list to {f32,q4_0} and
-    // fall through to the normal measure + coherence-first pick + persist flow,
-    // so a coherent q4_0 winner can still win and save KV memory. Non-hybrids
-    // sweep the full candidate list unchanged.
+    // Hybrid (transformer+SSM) models: the hybrid attention forward implements
+    // EVERY KV dtype (f32/q4_0 have dedicated calibrated arms; q8_0 / TurboQuant
+    // / NVFP4 / MXFP route through the same per-dtype flash decode/prefill
+    // kernels the dense path uses). Rather than restrict hybrids to {f32,q4_0}
+    // and require a manual `RUSTLLAMA_HYBRID_KV_ANY` to try the rest, the sweep
+    // now MEASURES the full candidate grid on hybrids too and lets its
+    // coherence-first gate decide: an aggressive quant that diverges from the
+    // f32 reference (e.g. 1-bit tq1) is rejected automatically, a coherent one
+    // is adopted + persisted. We set the hybrid-KV-any flag for THIS tune
+    // subprocess so each candidate is honored verbatim during measurement —
+    // otherwise the engine's load-time hybrid coercion would force every
+    // non-f32/q4_0 candidate to f32 and the sweep would grade f32 against
+    // itself. The persisted winner is a coherence-VALIDATED choice the serve
+    // path then honors with no user env var. Non-hybrids are unaffected.
     let is_hybrid = gguf_is_hybrid(&model_path);
-    let candidates_csv: &str = if is_hybrid { "f32,q4_0" } else { candidates_csv };
+    if is_hybrid {
+        std::env::set_var("RUSTLLAMA_HYBRID_KV_ANY", "1");
+    }
 
     let candidates: Vec<rustllama_engine::KvDtype> = candidates_csv
         .split(',')
@@ -6039,7 +6057,10 @@ fn cmd_tune_kv_dtype(
             .join(", ")
     );
     if is_hybrid {
-        println!("  hybrid model: restricting KV sweep to {{f32,q4_0}}");
+        println!(
+            "  hybrid model: sweeping full grid — coherence gate decides which \
+             quant KV (if any) is honored"
+        );
     }
     println!("  ctx_size      = {ctx_size}");
     println!("  prompt_tokens = {prompt_tokens}");

@@ -2378,6 +2378,14 @@ async fn load_model(
                 if let Some(w) = warn {
                     tracing::warn!("{w}");
                 }
+                // A trusted (cache-winner) kv_dtype is coherence-gated by the
+                // sweep — now including hybrids. Signal the engine's hybrid-KV
+                // coercion to honor the validated dtype verbatim (the autotune,
+                // not a manual env var, decides quant hybrid KV). Harmless on
+                // non-hybrids, where the coercion never fires.
+                if trust_winner && !safe.eq_ignore_ascii_case("f32") {
+                    std::env::set_var("RUSTLLAMA_HYBRID_KV_ANY", "1");
+                }
                 match rustllama_engine::KvDtype::parse(&safe) {
                     Some(d) => d,
                     None => {
