@@ -320,6 +320,74 @@ fn try_gemm_fp4_tc_batched(
     guard.gemm_fp4_tc(kind, weight_key, w_bytes, x, out, m, k, n)
 }
 
+/// Whether the Blackwell MXFP8 (W8A8) block-scaled tensor-core GEMM path is
+/// enabled. **AUTOMATIC** — on only when the MXFP8-TC kernel passed the
+/// on-device self-check (`kernel_verdict`), a usable NVIDIA GPU is present, and
+/// the device is a TC-capable Blackwell. Fail-closed; cached once. The sibling
+/// of [`fp4_tc_enabled`] for the 8-bit block-scaled kernel, which was validated
+/// + probed but previously never wired into dispatch.
+fn mxfp8_tc_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        kernel_verdict(rustllama_tuner::VERDICT_GEMM_MXFP8_TC)
+            && cuda_active()
+            && ck::blackwell_tc_available(0)
+    })
+}
+
+/// Whether the Blackwell MXFP6 (W6A6) block-scaled tensor-core GEMM path is
+/// enabled. As [`mxfp8_tc_enabled`] for the MXFP6 kernel verdict.
+fn mxfp6_tc_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        kernel_verdict(rustllama_tuner::VERDICT_GEMM_MXFP6_TC)
+            && cuda_active()
+            && ck::blackwell_tc_available(0)
+    })
+}
+
+/// Batched Blackwell MXFP8 tensor-core GEMM via the CUDA cache. `false` on any
+/// miss so the caller falls through to the scalar ladder (untouched `out`).
+#[allow(clippy::too_many_arguments)]
+fn try_gemm_mxfp8_tc_batched(
+    weight_key: usize,
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    guard.gemm_mxfp8_tc(weight_key, w_bytes, x, out, m, k, n)
+}
+
+/// Batched Blackwell MXFP6 tensor-core GEMM via the CUDA cache. See
+/// [`try_gemm_mxfp8_tc_batched`].
+#[allow(clippy::too_many_arguments)]
+fn try_gemm_mxfp6_tc_batched(
+    weight_key: usize,
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    guard.gemm_mxfp6_tc(weight_key, w_bytes, x, out, m, k, n)
+}
+
 // ------------------------------------------------------------
 // Hopper SM90a FP8 wgmma tensor-core GEMM dispatch (opt-in)
 // ------------------------------------------------------------
@@ -11219,6 +11287,42 @@ pub fn try_matvec_tensor_batched_usm_f32(
         let wb = as_bytes(w);
         if try_gemm_fp8_wgmma_batched(wb.as_ptr() as usize, wb, x, out, m, k, n) {
             return true;
+        }
+    }
+    // Blackwell SM12x MXFP8 / MXFP6 block-scaled tensor-core GEMM (W8A8 / W6A6)
+    // — the 8-/6-bit siblings of the FP4 TC block above, over the same sm_120
+    // block-scaled MMA. Their kernels (gemm_mxfp8_tc / gemm_mxfp6_tc) passed the
+    // SAME on-device `--validate-kernels` probe as the FP4/Q4_K TC paths, so they
+    // auto-enable per their verdicts (fail-closed) — closing the gap where an
+    // MXFP8/MXFP6 WEIGHT on Blackwell silently stayed on the scalar packed matvec
+    // even though its TC kernel was validated. DISTINCT from the Hopper block
+    // above (sm_90 `wgmma`, gated off on Blackwell): an MXFP8 weight lands here on
+    // Blackwell and there on Hopper. Same prefill-batch gate (n >= 16, K % 32 ==
+    // 0 for the 32-elem microscale blocks). A miss falls through to the scalar
+    // packed path below — byte-identical on every non-Blackwell host.
+    if (mxfp8_tc_enabled() || mxfp6_tc_enabled())
+        && !tensor_forced_to_cpu(&w.name)
+        && current_layer_idx() < n_gpu_layers()
+        && m != 0
+        && k != 0
+        && n >= 16
+        && (k % 32 == 0)
+        && x.len() == n * k
+        && out.len() == n * m
+    {
+        let wb = as_bytes(w);
+        match w.dtype {
+            Dtype::Mxfp8Raw if mxfp8_tc_enabled() => {
+                if try_gemm_mxfp8_tc_batched(wb.as_ptr() as usize, wb, x, out, m, k, n) {
+                    return true;
+                }
+            }
+            Dtype::Mxfp6Raw if mxfp6_tc_enabled() => {
+                if try_gemm_mxfp6_tc_batched(wb.as_ptr() as usize, wb, x, out, m, k, n) {
+                    return true;
+                }
+            }
+            _ => {}
         }
     }
     // Intel XMX/DPAS bf16 tensor-core GEMM — the SYCL twin of the CUDA TC gates
