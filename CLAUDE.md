@@ -193,7 +193,7 @@ commands in the chat REPL/TUI mirror this verb set):
   moe_placement, lock_ram_mb, `[inference.placement]`), `[server]`
   (bind_addr, **port 11434** default, api_key, require_auth_loopback,
   max_loaded_models), `[ui]`,
-  `[hub]`, `[tuning]` (auto_tune_on_first_load, auto_apply_* flags),
+  `[tuning]` (auto_apply_* flags, opportunistic_refine),
   `[embeddings]`, `[reranker]`.
 - The server speaks the **OpenAI** API (`/v1/chat/completions`, `/v1/completions`,
   `/v1/embeddings`, `/v1/models`), the **Anthropic Messages** API

@@ -75,8 +75,8 @@ first time it sees a given model on a given device it runs a one-time
 auto-tune sweep (kv-dtype coherence, flash-attention, KV layout, CPU/GPU
 placement, batch size, threads) and caches the winners — exactly what the
 desktop GUI does on first load. Progress streams to the console; later
-runs read the cache and skip the sweep. Set `[tuning].auto_tune_on_first_load
-= false` to opt out. Pass `--model` more than once to load several models at
+runs read the cache and skip the sweep (it is keyed by a device fingerprint, so
+it re-runs automatically if the hardware changes). Pass `--model` more than once to load several models at
 startup (each is auto-tuned; the **first** is the server default, the rest are
 reachable by id and via `rustllama model default`). `serve` with no `--model` uses
 `[model].path` from the config (or starts empty, ready for the GUI / `POST

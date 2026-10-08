@@ -4868,7 +4868,7 @@ async fn get_config(State(state): State<AppState>) -> Response {
 /// Returns a [`ConfigPutResponse`] describing what changed and
 /// whether a model reload or server restart is needed. The on-disk
 /// watcher will pick up the write and broadcast the same delta to
-/// the running engine — `[ui]` / `[hub]` / `[tuning]` apply live,
+/// the running engine — `[ui]` / `[tuning]` apply live,
 /// `[model]` / `[inference]` / `[server]` need the user to follow up.
 #[derive(serde::Serialize)]
 struct ConfigPutResponse {
