@@ -1659,6 +1659,24 @@ fn cu_download_f32(buf: &ck::CudaDeviceBuffer<'_>, n: usize) -> Vec<f32> {
     out
 }
 
+/// Upload an f32 slice to an MLX device buffer (the Metal analogue of
+/// [`cu_upload_f32`]). `None` on alloc/copy failure.
+fn mk_upload_f32<'s>(stream: &'s mk::MlxStream, data: &[f32]) -> Option<mk::MlxDeviceBuffer<'s>> {
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+    };
+    mk::MlxDeviceBuffer::from_host(stream, bytes)
+}
+
+/// Download `n` f32 from an MLX device buffer.
+fn mk_download_f32(buf: &mk::MlxDeviceBuffer<'_>, n: usize) -> Vec<f32> {
+    let mut out = vec![0f32; n];
+    let bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * 4) };
+    let _ = buf.copy_to_host(bytes);
+    out
+}
+
 fn cu_emit(name: &str, verdict: &str, detail: &str) {
     probe_rec_push(name, verdict);
     println!("  {name:<24} {verdict:<11} {detail}");
@@ -3242,6 +3260,236 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
             Err(e) => {
                 cu_emit("rmsnorm:f32", "KERNEL_ERR", &format!("{e:?}"));
                 *counts.entry("KERNEL_ERR").or_default() += 1;
+            }
+        }
+    }
+
+    // ---- Device-resident forward kernels: RoPE / SwiGLU / embedding / flash ----
+    // The Metal twins of the CUDA device-resident probes (previously ungraded by
+    // ANY harness). Same geometry, CPU references, and tolerances as the CUDA
+    // section, so verdicts line up across backends. These need a raw MlxStream
+    // (the matvec cache owns its own private one); skip the lot if one can't be
+    // created. Emits rope:f32 / silu_mul:f32 / embedding:f32 / attn:decode /
+    // attn:prefill. WRITE-BLIND (authored off-Apple) — first real check is here.
+    if let Some(fs) = mk::MlxStream::create(0) {
+        // RoPE
+        {
+            let n_heads = 8usize;
+            let head_dim = 64usize;
+            let pos = 37usize;
+            let qk = gen_x(n_heads * head_dim, 31);
+            let inv_freq: Vec<f32> = (0..head_dim / 2)
+                .map(|j| (10000f32).powf(-2.0 * j as f32 / head_dim as f32))
+                .collect();
+            let mut cpu = qk.clone();
+            ref_rope(&mut cpu, n_heads, head_dim, pos, &inv_freq);
+            if let (Some(mut qb), Some(fb)) =
+                (mk_upload_f32(&fs, &qk), mk_upload_f32(&fs, &inv_freq))
+            {
+                // SAFETY: qb/fb are live device f32 buffers on `fs`.
+                let res = unsafe {
+                    mk::rope_f32(
+                        &fs,
+                        qb.as_mut_ptr() as *mut f32,
+                        n_heads,
+                        head_dim,
+                        pos,
+                        fb.as_ptr() as *const f32,
+                    )
+                };
+                match res {
+                    Ok(()) => cu_grade(
+                        "rope:f32",
+                        &mk_download_f32(&qb, n_heads * head_dim),
+                        &cpu,
+                        0.9999,
+                        0.01,
+                        &mut counts,
+                    ),
+                    Err(e) => {
+                        cu_emit("rope:f32", "KERNEL_ERR", &format!("{e:?}"));
+                        *counts.entry("KERNEL_ERR").or_default() += 1;
+                    }
+                }
+            }
+        }
+
+        // SwiGLU (silu(x) * y)
+        {
+            let n = 4096usize;
+            let x = gen_x(n, 41);
+            let y = gen_x(n, 43);
+            let cpu = ref_silu_mul(&x, &y);
+            if let (Some(xb), Some(yb), Some(mut ob)) = (
+                mk_upload_f32(&fs, &x),
+                mk_upload_f32(&fs, &y),
+                mk::MlxDeviceBuffer::alloc(&fs, n * 4),
+            ) {
+                // SAFETY: three live device f32 buffers of length n on `fs`.
+                let res = unsafe {
+                    mk::silu_mul_f32(
+                        &fs,
+                        xb.as_ptr() as *const f32,
+                        yb.as_ptr() as *const f32,
+                        ob.as_mut_ptr() as *mut f32,
+                        n,
+                    )
+                };
+                match res {
+                    Ok(()) => cu_grade(
+                        "silu_mul:f32",
+                        &mk_download_f32(&ob, n),
+                        &cpu,
+                        0.9999,
+                        0.01,
+                        &mut counts,
+                    ),
+                    Err(e) => {
+                        cu_emit("silu_mul:f32", "KERNEL_ERR", &format!("{e:?}"));
+                        *counts.entry("KERNEL_ERR").or_default() += 1;
+                    }
+                }
+            }
+        }
+
+        // Embedding lookup (device ids; row < 0 ⇒ zeros)
+        {
+            let vocab = 100usize;
+            let d = 128usize;
+            let table = gen_x(vocab * d, 51);
+            let ids: Vec<i32> = [5i32, 0, 99, -1, 42].to_vec();
+            let n_ids = ids.len();
+            let mut cpu = vec![0f32; n_ids * d];
+            for (i, &row) in ids.iter().enumerate() {
+                if row >= 0 {
+                    cpu[i * d..(i + 1) * d]
+                        .copy_from_slice(&table[row as usize * d..(row as usize + 1) * d]);
+                }
+            }
+            let id_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(ids.as_ptr() as *const u8, n_ids * 4) };
+            if let (Some(tb), Some(ib), Some(mut ob)) = (
+                mk_upload_f32(&fs, &table),
+                mk::MlxDeviceBuffer::from_host(&fs, id_bytes),
+                mk::MlxDeviceBuffer::alloc(&fs, n_ids * d * 4),
+            ) {
+                // SAFETY: table [vocab*d] f32, ids [n_ids] i32, out [n_ids*d]
+                // f32, all live device buffers on `fs`.
+                let res = unsafe {
+                    mk::embedding_lookup_f32(
+                        &fs,
+                        tb.as_ptr() as *const f32,
+                        ib.as_ptr() as *const std::os::raw::c_int,
+                        ob.as_mut_ptr() as *mut f32,
+                        n_ids,
+                        d,
+                    )
+                };
+                match res {
+                    Ok(()) => cu_grade(
+                        "embedding:f32",
+                        &mk_download_f32(&ob, n_ids * d),
+                        &cpu,
+                        0.99999,
+                        0.0001,
+                        &mut counts,
+                    ),
+                    Err(e) => {
+                        cu_emit("embedding:f32", "KERNEL_ERR", &format!("{e:?}"));
+                        *counts.entry("KERNEL_ERR").or_default() += 1;
+                    }
+                }
+            }
+        }
+
+        // FlashAttention decode + prefill (f32)
+        {
+            let (n_heads, n_kv_heads, head_dim, max_ctx, kv_len) =
+                (8usize, 2usize, 64usize, 128usize, 40usize);
+            let q = gen_x(n_heads * head_dim, 61);
+            let kc = gen_x(n_kv_heads * max_ctx * head_dim, 63);
+            let vc = gen_x(n_kv_heads * max_ctx * head_dim, 67);
+            let cpu =
+                ref_flash_decode(&q, &kc, &vc, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
+            if let (Some(qb), Some(kb), Some(vb), Some(mut ob)) = (
+                mk_upload_f32(&fs, &q),
+                mk_upload_f32(&fs, &kc),
+                mk_upload_f32(&fs, &vc),
+                mk::MlxDeviceBuffer::alloc(&fs, n_heads * head_dim * 4),
+            ) {
+                // SAFETY: q/out [n_heads*head_dim], k/v [n_kv_heads*max_ctx*
+                // head_dim] device f32 on `fs`.
+                let res = unsafe {
+                    mk::flash_attn_decode_f32(
+                        &fs,
+                        qb.as_ptr() as *const f32,
+                        kb.as_ptr() as *const f32,
+                        vb.as_ptr() as *const f32,
+                        ob.as_mut_ptr() as *mut f32,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_len,
+                    )
+                };
+                match res {
+                    Ok(()) => cu_grade(
+                        "attn:decode",
+                        &mk_download_f32(&ob, n_heads * head_dim),
+                        &cpu,
+                        0.999,
+                        0.02,
+                        &mut counts,
+                    ),
+                    Err(e) => {
+                        cu_emit("attn:decode", "KERNEL_ERR", &format!("{e:?}"));
+                        *counts.entry("KERNEL_ERR").or_default() += 1;
+                    }
+                }
+            }
+
+            let (kv_base, n_new) = (10usize, 6usize);
+            let qp = gen_x(n_new * n_heads * head_dim, 71);
+            let cpu_p = ref_flash_prefill(
+                &qp, &kc, &vc, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
+            );
+            if let (Some(qb), Some(kb), Some(vb), Some(mut ob)) = (
+                mk_upload_f32(&fs, &qp),
+                mk_upload_f32(&fs, &kc),
+                mk_upload_f32(&fs, &vc),
+                mk::MlxDeviceBuffer::alloc(&fs, n_new * n_heads * head_dim * 4),
+            ) {
+                // SAFETY: q/out [n_new*n_heads*head_dim], k/v caches device f32.
+                let res = unsafe {
+                    mk::flash_attn_prefill_f32(
+                        &fs,
+                        qb.as_ptr() as *const f32,
+                        kb.as_ptr() as *const f32,
+                        vb.as_ptr() as *const f32,
+                        ob.as_mut_ptr() as *mut f32,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_base,
+                        n_new,
+                    )
+                };
+                match res {
+                    Ok(()) => cu_grade(
+                        "attn:prefill",
+                        &mk_download_f32(&ob, n_new * n_heads * head_dim),
+                        &cpu_p,
+                        0.999,
+                        0.02,
+                        &mut counts,
+                    ),
+                    Err(e) => {
+                        cu_emit("attn:prefill", "KERNEL_ERR", &format!("{e:?}"));
+                        *counts.entry("KERNEL_ERR").or_default() += 1;
+                    }
+                }
             }
         }
     }
