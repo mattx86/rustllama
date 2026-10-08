@@ -4635,6 +4635,46 @@ async fn pull(hub_ref_str: &str) -> anyhow::Result<()> {
     pb.finish_and_clear();
     println!("✓ {}", dst.display());
 
+    // Companion sidecars that live in the same repo: the `<stem>.kvbias.gguf`
+    // KV-calibration file (its presence next to the GGUF is exactly what unlocks
+    // a quantized KV cache for this model — see `coherence_safe_kv_dtype`) and an
+    // mmproj vision projector for multimodal models. Fetch them too so a pulled
+    // model lands complete; the single GGUF silently loses quant-KV coherence +
+    // vision. Best-effort: listing the repo or any one companion failing never
+    // fails the pull (the GGUF is already down).
+    match rustllama_hub::hf_repo_files(&hub_ref.repo_id()).await {
+        Ok(files) => {
+            for comp in rustllama_hub::companion_sidecars(&hub_ref.filename, &files) {
+                let cpb = ProgressBar::new_spinner();
+                cpb.enable_steady_tick(Duration::from_millis(120));
+                cpb.set_style(
+                    ProgressStyle::default_spinner()
+                        .template("{spinner} {msg}")
+                        .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+                );
+                cpb.set_message(format!("downloading companion {comp}"));
+                let comp_ref = rustllama_hub::HubRef {
+                    owner: hub_ref.owner.clone(),
+                    repo: hub_ref.repo.clone(),
+                    filename: comp.clone(),
+                };
+                match rustllama_hub::download(&comp_ref, &cache_dir, Some(&cpb)).await {
+                    Ok(p) => {
+                        cpb.finish_and_clear();
+                        println!("✓ companion → {}", p.display());
+                    }
+                    Err(e) => {
+                        cpb.finish_and_clear();
+                        tracing::warn!(error = %e, companion = %comp, "companion sidecar download failed (continuing)");
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not list repo files for companion sidecars (continuing)");
+        }
+    }
+
     // Fetch the HF model card README.md so `models inspect` / `/api/show`
     // can surface license, tags, base_model, etc. Best-effort: a missing
     // README, network hiccup, or 404 doesn't fail the pull — the GGUF is

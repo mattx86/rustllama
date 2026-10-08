@@ -57,9 +57,12 @@ pub async fn hf_search(query: &str, limit: u32) -> Result<Vec<HfModel>> {
     Ok(models)
 }
 
-/// List the `.gguf` files (with sizes) in a repo's `main` revision via the
-/// tree API. Used to turn a searched repo into concrete pullable files.
-pub async fn hf_gguf_files(repo_id: &str) -> Result<Vec<HfFile>> {
+/// List ALL files in a repo's `main` revision (path + size) via the tree API.
+/// The superset [`hf_gguf_files`] filters down to GGUFs; `pull` uses this to
+/// discover the `.kvbias.gguf` / mmproj COMPANION files that live next to a
+/// chosen GGUF so a pulled model lands complete on disk (see
+/// [`companion_sidecars`]).
+pub async fn hf_repo_files(repo_id: &str) -> Result<Vec<HfFile>> {
     let repo = repo_id.trim();
     if repo.is_empty() {
         return Ok(Vec::new());
@@ -78,7 +81,7 @@ pub async fn hf_gguf_files(repo_id: &str) -> Result<Vec<HfFile>> {
         serde_json::from_str(&body).map_err(|e| HubError::Http(format!("parse tree: {e}")))?;
     let mut out: Vec<HfFile> = entries
         .into_iter()
-        .filter(|e| e.kind == "file" && e.path.to_ascii_lowercase().ends_with(".gguf"))
+        .filter(|e| e.kind == "file")
         .map(|e| HfFile {
             rfilename: e.path,
             size: e.size,
@@ -86,6 +89,53 @@ pub async fn hf_gguf_files(repo_id: &str) -> Result<Vec<HfFile>> {
         .collect();
     out.sort_by(|a, b| a.rfilename.cmp(&b.rfilename));
     Ok(out)
+}
+
+/// List the `.gguf` files (with sizes) in a repo's `main` revision via the
+/// tree API. Used to turn a searched repo into concrete pullable files.
+pub async fn hf_gguf_files(repo_id: &str) -> Result<Vec<HfFile>> {
+    let mut out: Vec<HfFile> = hf_repo_files(repo_id)
+        .await?
+        .into_iter()
+        .filter(|f| f.rfilename.to_ascii_lowercase().ends_with(".gguf"))
+        .collect();
+    out.sort_by(|a, b| a.rfilename.cmp(&b.rfilename));
+    Ok(out)
+}
+
+/// Given the main GGUF filename just pulled and the repo's full file list,
+/// return the repo-relative paths of COMPANION files worth fetching alongside
+/// it so the model is actually complete on disk — the single GGUF alone
+/// silently loses these:
+///   - `<stem>.kvbias.gguf` — KV-bias calibration; its presence NEXT TO the
+///     GGUF is exactly what lets `coherence_safe_kv_dtype` trust a quantized
+///     KV cache for this model (without it, quant KV is coerced to f32).
+///   - `*mmproj*.gguf`      — the vision projector for a multimodal model
+///     (without it a pulled vision model can't see).
+/// Case-insensitive; the main file itself is never returned. A plain
+/// single-GGUF repo yields an empty list. (imatrix / tokenizer / config are
+/// deliberately excluded — imatrix is a quantize-time input, and a GGUF already
+/// embeds its tokenizer + config.)
+pub fn companion_sidecars(main_filename: &str, repo_files: &[HfFile]) -> Vec<String> {
+    let main_lc = main_filename.to_ascii_lowercase();
+    // `<stem>.kvbias.gguf` sibling — keep the full repo path so a nested layout
+    // (`sub/model.gguf` → `sub/model.kvbias.gguf`) still matches, mirroring the
+    // engine's `model_path.with_extension("kvbias.gguf")` lookup.
+    let stem = main_lc.strip_suffix(".gguf").unwrap_or(main_lc.as_str());
+    let kvbias = format!("{stem}.kvbias.gguf");
+    let mut out = Vec::new();
+    for f in repo_files {
+        let p = f.rfilename.to_ascii_lowercase();
+        if p == main_lc {
+            continue;
+        }
+        let is_kvbias = p == kvbias;
+        let is_mmproj = p.ends_with(".gguf") && p.contains("mmproj");
+        if is_kvbias || is_mmproj {
+            out.push(f.rfilename.clone());
+        }
+    }
+    out
 }
 
 async fn http_get_text(url: &str) -> Result<String> {
@@ -513,6 +563,39 @@ pub async fn download_with_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn companion_sidecars_picks_kvbias_and_mmproj_only() {
+        let f = |p: &str| HfFile {
+            rfilename: p.to_string(),
+            size: 1,
+        };
+        let files = vec![
+            f("Model-Q4_K_M.gguf"),
+            f("Model-Q4_K_M.kvbias.gguf"), // KV calibration for THIS variant
+            f("mmproj-Model-Q8_0.gguf"),   // vision projector
+            f("Model-Q8_0.gguf"),          // a DIFFERENT quant variant
+            f("README.md"),
+            f("model.imatrix"), // quantize-time input, not an inference companion
+        ];
+        let comps = companion_sidecars("Model-Q4_K_M.gguf", &files);
+        assert!(comps.contains(&"Model-Q4_K_M.kvbias.gguf".to_string()));
+        assert!(comps.contains(&"mmproj-Model-Q8_0.gguf".to_string()));
+        // Must NOT pull a sibling quant variant, the main file, the card, or the
+        // imatrix.
+        assert!(!comps.contains(&"Model-Q8_0.gguf".to_string()));
+        assert!(!comps.contains(&"Model-Q4_K_M.gguf".to_string()));
+        assert!(!comps.contains(&"README.md".to_string()));
+        assert!(!comps.contains(&"model.imatrix".to_string()));
+        // A plain single-GGUF repo yields no companions.
+        assert!(companion_sidecars("solo.gguf", &[f("solo.gguf")]).is_empty());
+        // Nested layout: the kvbias sibling shares the GGUF's directory.
+        let nested = vec![f("sub/m.gguf"), f("sub/m.kvbias.gguf")];
+        assert_eq!(
+            companion_sidecars("sub/m.gguf", &nested),
+            vec!["sub/m.kvbias.gguf".to_string()]
+        );
+    }
 
     #[test]
     fn parse_valid_ref() {
