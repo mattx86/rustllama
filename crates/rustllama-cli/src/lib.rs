@@ -8641,7 +8641,54 @@ fn bench(
     )
     .map_err(|e| anyhow::anyhow!("load failed: {e}"))?;
     cpu.set_flash_attention(flash_enabled);
-    cpu.set_n_gpu_layers(cfg.inference.n_gpu_layers);
+    // Resolve `n_gpu_layers` the SAME way `serve` does, rather than passing the
+    // raw config value. A fresh config's AUTO sentinel (N_GPU_LAYERS_AUTO = 999)
+    // is NOT a layer count: the engine's per-tensor device plan (VRAM-fit /
+    // measured-perf heat) is installed only when AUTO is resolved through
+    // `auto_place_heat`. Handing the sentinel straight to `set_n_gpu_layers`
+    // left the model all-CPU, so bench silently measured the WRONG device (looked
+    // like a 2x "regression" that was really a CPU run). Precedence mirrors the
+    // serve load path: hard GPU-fit guardrail → explicit override → cached tuner
+    // winner → AUTO heat/VRAM-fit.
+    let placement_opts = rustllama_engine::placement_auto::AutoPlacementOpts {
+        cpu_enabled: cfg.inference.cpu_enabled,
+        gpu_enabled: cfg.inference.gpu_enabled,
+        vram_only: cfg.inference.vram_only,
+        ..Default::default()
+    };
+    let override_n = if cfg.inference.gpu_enabled {
+        cfg.inference.n_gpu_layers_override()
+    } else {
+        None
+    };
+    let model_key = model_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown-model")
+        .to_string();
+    let cached_placement = cfg
+        .tuning
+        .auto_apply_placement
+        .then(|| placement_cache_lookup(&model_key))
+        .flatten();
+    let force_gpu_fit = !cfg.inference.cpu_enabled || cfg.inference.vram_only;
+    let applied_n_gpu_layers = if force_gpu_fit {
+        cpu.auto_place_heat(&placement_opts).n_gpu_layers
+    } else if let Some(n) = override_n {
+        n
+    } else if let Some(n) = cached_placement {
+        n
+    } else {
+        cpu.auto_place_heat(&placement_opts).n_gpu_layers
+    };
+    if applied_n_gpu_layers != cfg.inference.n_gpu_layers {
+        tracing::info!(
+            configured = cfg.inference.n_gpu_layers,
+            applied = applied_n_gpu_layers,
+            "bench placement: resolved n_gpu_layers (AUTO → VRAM-fit/heat plan)"
+        );
+    }
+    cpu.set_n_gpu_layers(applied_n_gpu_layers);
     cpu.set_prefix_cache(false); // bench is comparable across repeats only without prefix reuse
     if cfg.inference.speculative_ngram {
         cpu.set_ngram_speculative(Some(rustllama_engine::speculative::NgramDrafterConfig {
@@ -8654,6 +8701,12 @@ fn bench(
     cpu.set_mtp_speculative(cfg.inference.speculative_mtp);
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
     println!("  load          = {load_ms:.1} ms");
+    // Make the device placement explicit so a CPU-vs-GPU run is never
+    // mistaken for a kernel regression (the AUTO-sentinel trap).
+    println!(
+        "  n_gpu_layers  = {applied_n_gpu_layers} / {} total",
+        cpu.n_layers()
+    );
     // Surface MoE info post-load so users comparing MoE vs dense
     // tok/s rows can see at a glance which row is which.
     if let Some(moe) = cpu.llama_config().moe.as_ref() {
