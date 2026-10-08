@@ -5393,6 +5393,14 @@ impl LlamaModel {
                             // matching the host slab the helper's mirror is
                             // re-quantized from. Decline → CPU. The un-whiten
                             // below applies to either output.
+                            // Seed the CUDA decode mirror with the prefill
+                            // history (no-op once resident); host k_q/v_q are
+                            // byte-identical to the mirror.
+                            crate::accel::cuda_decode_seed_kv_q4_0(
+                                &k_q[..], &v_q[..], li, cur_pos as u32,
+                                n_heads as u32, n_kv_heads as u32,
+                                head_dim as u32, max_ctx as u32, cfg.n_layers as u32,
+                            );
                             if !crate::accel::try_flash_attn_decode_gpu_q4_0(
                                 &q_buf,
                                 &k_buf[..n_kv_heads * head_dim],
@@ -5441,6 +5449,20 @@ impl LlamaModel {
                             }
                             // GPU quant-KV flash decode first (USM); host
                             // slab written above, so decline → CPU.
+                            // Seed the CUDA decode mirror with the prefill
+                            // history (no-op once resident); host k_q/k_scales
+                            // are byte-identical to the mirror.
+                            crate::accel::cuda_decode_seed_kv_q8_0(
+                                unsafe {
+                                    std::slice::from_raw_parts(k_q.as_ptr() as *const u8, k_q.len())
+                                },
+                                unsafe {
+                                    std::slice::from_raw_parts(v_q.as_ptr() as *const u8, v_q.len())
+                                },
+                                &k_scales[..], &v_scales[..], li, cur_pos as u32,
+                                n_heads as u32, n_kv_heads as u32,
+                                head_dim as u32, max_ctx as u32, cfg.n_layers as u32,
+                            );
                             if !crate::accel::try_flash_attn_decode_gpu_q8_0(
                                 &q_buf,
                                 &k_buf[..n_kv_heads * head_dim],
@@ -5488,6 +5510,15 @@ impl LlamaModel {
                             }
                             // GPU quant-KV flash decode first (USM); host
                             // slab written above, so decline → CPU.
+                            // Seed the CUDA decode mirror with the prefill
+                            // history (no-op once resident); host
+                            // k_packed/k_scales are byte-identical to the mirror.
+                            crate::accel::cuda_decode_seed_kv_tq(
+                                *bits, &k_packed[..], &v_packed[..],
+                                &k_scales[..], &v_scales[..], li, cur_pos as u32,
+                                n_heads as u32, n_kv_heads as u32,
+                                head_dim as u32, max_ctx as u32, cfg.n_layers as u32,
+                            );
                             if !crate::accel::try_flash_attn_decode_gpu_tq(
                                 &q_buf,
                                 &k_buf[..n_kv_heads * head_dim],
@@ -5544,6 +5575,14 @@ impl LlamaModel {
                             }
                             // GPU quant-KV flash decode first (USM); host
                             // slab written above, so decline → CPU.
+                            // Seed the CUDA decode mirror with the prefill
+                            // history (no-op once resident); host k_packed/
+                            // v_packed are byte-identical to the mirror.
+                            crate::accel::cuda_decode_seed_kv_nvfp4(
+                                &k_packed[..], &v_packed[..], li, cur_pos as u32,
+                                n_heads as u32, n_kv_heads as u32,
+                                head_dim as u32, max_ctx as u32, cfg.n_layers as u32,
+                            );
                             if !crate::accel::try_flash_attn_decode_gpu_nvfp4(
                                 &q_buf,
                                 &k_buf[..n_kv_heads * head_dim],
