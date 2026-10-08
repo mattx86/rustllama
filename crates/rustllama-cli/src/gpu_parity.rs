@@ -3492,6 +3492,124 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                 }
             }
         }
+
+        // ---- Quantized-KV FlashAttention decode + prefill ----
+        // Metal twins of the CUDA quant-KV flash probes, with the IDENTICAL
+        // SAME-QUANT reference: quantize K/V to each format's block layout,
+        // dequantize the exact packed bytes on the CPU, run the f32 flash
+        // reference on THAT — so the probe measures kernel correctness, not KV
+        // quantization loss (a full-precision ref would false-flag correct
+        // kernels on relative error). Same QUANT_KV_FORMATS set + per-format
+        // tolerances as CUDA. Previously ungraded on Metal.
+        {
+            let (n_heads, n_kv_heads, head_dim, max_ctx, kv_len) =
+                (8usize, 2usize, 64usize, 128usize, 40usize);
+            let (kv_base, n_new) = (10usize, 6usize);
+            let q = gen_x(n_heads * head_dim, 61);
+            let kc = gen_x(n_kv_heads * max_ctx * head_dim, 63);
+            let vc = gen_x(n_kv_heads * max_ctx * head_dim, 67);
+            let qp = gen_x(n_new * n_heads * head_dim, 71);
+            // Decode reads kv_len rows; prefill reads kv_base+n_new. Quantize up
+            // to the larger so one packed cache serves both readers.
+            let upto = kv_len.max(kv_base + n_new);
+            for fmt in QUANT_KV_FORMATS {
+                let dname = format!("attn:decode_{}", fmt.name);
+                let pname = format!("attn:prefill_{}", fmt.name);
+                if head_dim % fmt.block_elems != 0 {
+                    cu_emit(&dname, "SKIP", "head-dim-not-block-aligned");
+                    cu_emit(&pname, "SKIP", "head-dim-not-block-aligned");
+                    *counts.entry("SKIP").or_default() += 2;
+                    continue;
+                }
+                let kp = quantize_kv_cache(fmt, &kc, n_kv_heads, head_dim, max_ctx, upto);
+                let vp = quantize_kv_cache(fmt, &vc, n_kv_heads, head_dim, max_ctx, upto);
+                let kc_dq = dequant_kv_cache(fmt, &kp, n_kv_heads, head_dim, max_ctx, upto);
+                let vc_dq = dequant_kv_cache(fmt, &vp, n_kv_heads, head_dim, max_ctx, upto);
+                let cpu_dec = ref_flash_decode(
+                    &q, &kc_dq, &vc_dq, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                );
+                let cpu_pre = ref_flash_prefill(
+                    &qp, &kc_dq, &vc_dq, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
+                );
+
+                // decode
+                if let (Some(qb), Some(kb), Some(vb), Some(mut ob)) = (
+                    mk_upload_f32(&fs, &q),
+                    mk::MlxDeviceBuffer::from_host(&fs, &kp),
+                    mk::MlxDeviceBuffer::from_host(&fs, &vp),
+                    mk::MlxDeviceBuffer::alloc(&fs, n_heads * head_dim * 4),
+                ) {
+                    // SAFETY: q/out F32 [n_heads*head_dim]; k/v packed device
+                    // buffers [n_kv_heads*max_ctx*bytes_per_row] on `fs`.
+                    let res = unsafe {
+                        let q = qb.as_ptr() as *const f32;
+                        let k = kb.as_ptr();
+                        let v = vb.as_ptr();
+                        let o = ob.as_mut_ptr() as *mut f32;
+                        match fmt.name {
+                            "mxfp4" => mk::flash_attn_decode_mxfp4(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len),
+                            "mxfp6" => mk::flash_attn_decode_mxfp6(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len),
+                            "mxfp8" => mk::flash_attn_decode_mxfp8(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len),
+                            "nvfp4" => mk::flash_attn_decode_nvfp4(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len),
+                            "q4_0" => mk::flash_attn_decode_q4_0(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len),
+                            _ => unreachable!(),
+                        }
+                    };
+                    match res {
+                        Ok(()) => cu_grade(
+                            &dname,
+                            &mk_download_f32(&ob, n_heads * head_dim),
+                            &cpu_dec,
+                            fmt.cos_min,
+                            fmt.rel_max,
+                            &mut counts,
+                        ),
+                        Err(e) => {
+                            cu_emit(&dname, "KERNEL_ERR", &format!("{e:?}"));
+                            *counts.entry("KERNEL_ERR").or_default() += 1;
+                        }
+                    }
+                }
+
+                // prefill
+                if let (Some(qb), Some(kb), Some(vb), Some(mut ob)) = (
+                    mk_upload_f32(&fs, &qp),
+                    mk::MlxDeviceBuffer::from_host(&fs, &kp),
+                    mk::MlxDeviceBuffer::from_host(&fs, &vp),
+                    mk::MlxDeviceBuffer::alloc(&fs, n_new * n_heads * head_dim * 4),
+                ) {
+                    // SAFETY: q/out F32 [n_new*n_heads*head_dim]; k/v packed as above.
+                    let res = unsafe {
+                        let q = qb.as_ptr() as *const f32;
+                        let k = kb.as_ptr();
+                        let v = vb.as_ptr();
+                        let o = ob.as_mut_ptr() as *mut f32;
+                        match fmt.name {
+                            "mxfp4" => mk::flash_attn_prefill_mxfp4(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new),
+                            "mxfp6" => mk::flash_attn_prefill_mxfp6(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new),
+                            "mxfp8" => mk::flash_attn_prefill_mxfp8(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new),
+                            "nvfp4" => mk::flash_attn_prefill_nvfp4(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new),
+                            "q4_0" => mk::flash_attn_prefill_q4_0(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new),
+                            _ => unreachable!(),
+                        }
+                    };
+                    match res {
+                        Ok(()) => cu_grade(
+                            &pname,
+                            &mk_download_f32(&ob, n_new * n_heads * head_dim),
+                            &cpu_pre,
+                            fmt.cos_min,
+                            fmt.rel_max,
+                            &mut counts,
+                        ),
+                        Err(e) => {
+                            cu_emit(&pname, "KERNEL_ERR", &format!("{e:?}"));
+                            *counts.entry("KERNEL_ERR").or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     println!();
