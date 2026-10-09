@@ -1086,64 +1086,97 @@ impl LlamaWeights {
     ///
     /// Returns `(experts_promoted, bytes_promoted)`.
     ///
+    /// `ranked` is a usage-ordered expert list (hottest first, from
+    /// `UsageLearner::ranked_keys` reading the persisted per-model sidecar):
+    /// those experts are promoted FIRST so a tight budget buys the experts the
+    /// model actually routes to most, then the remainder fills in `(layer,
+    /// expert)` index order. An empty `ranked` (cold start — no sidecar yet) is
+    /// pure index order.
+    ///
     /// **Correctness is safe by construction:** the device allocation is
     /// CPU-mappable (`cpu_readable` — managed/USM/unified), so `as_bytes` stays
     /// valid everywhere and every non-GPU code path still sees the same bytes.
     /// The worst case of a blind or absent device tier is "no speedup", never a
-    /// wrong answer. Experts are taken in `(layer, expert)` index order for now;
-    /// usage-driven ranking (hottest first, from `UsageLearner`) is a Phase-3
-    /// follow-up. Already-device-resident experts and non-MoE models are
+    /// wrong answer. Already-device-resident experts and non-MoE models are
     /// skipped; a `budget_bytes` of 0, or no active GPU producer
     /// (`upload_bytes_to_device` → `None`, e.g. this unified-memory dev box with
     /// no dedicated VRAM), promotes nothing. Benefit is on dedicated-VRAM GPUs
     /// (the pod) + Apple; it is write-blind here and validated on that HW.
-    ///
-    /// The auto-trigger (a dedicated-VRAM expert budget + a guarded load-path
-    /// call site) lands with the Phase-4 VRAM-budget planner — this method is
-    /// the reusable mechanism it drives.
-    pub fn promote_experts_to_device(&mut self, budget_bytes: u64) -> (usize, u64) {
+    pub fn promote_experts_to_device(
+        &mut self,
+        budget_bytes: u64,
+        ranked: &[crate::accel::ExpertKey],
+    ) -> (usize, u64) {
         if budget_bytes == 0 {
             return (0, 0);
         }
         let Some(blocks) = self.moe_blocks.as_mut() else {
             return (0, 0);
         };
+        let n_layers = blocks.len();
+        // Per-layer expert count (min of the three per-expert Vecs — always
+        // equal; the `min` just guards a malformed load). Computed up front so
+        // the immutable borrow of `blocks` is released before the promotion
+        // loop's `&mut blocks[l]`.
+        let n_exp: Vec<usize> = blocks
+            .iter()
+            .map(|b| {
+                b.gate_per_expert
+                    .len()
+                    .min(b.up_per_expert.len())
+                    .min(b.down_per_expert.len())
+            })
+            .collect();
+        // Promotion order: usage-ranked (hottest-first) experts, then the rest
+        // in `(layer, expert)` index order — deduped. Cold start (empty
+        // `ranked`) collapses to pure index order.
+        let mut order: Vec<(usize, usize)> = Vec::new();
+        let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for key in ranked {
+            let (l, e) = (key.layer as usize, key.expert as usize);
+            if l < n_layers && e < n_exp[l] && seen.insert((l, e)) {
+                order.push((l, e));
+            }
+        }
+        for l in 0..n_layers {
+            for e in 0..n_exp[l] {
+                if seen.insert((l, e)) {
+                    order.push((l, e));
+                }
+            }
+        }
         let mut used: u64 = 0;
         let mut promoted = 0usize;
-        'outer: for block in blocks.iter_mut() {
-            let n_exp = block
-                .gate_per_expert
-                .len()
-                .min(block.up_per_expert.len())
-                .min(block.down_per_expert.len());
-            for e in 0..n_exp {
-                // Skip experts already (partially) device-resident.
-                if block.gate_per_expert[e].storage.residency()
-                    != rustllama_tensor::DeviceBackend::Cpu
-                {
-                    continue;
-                }
-                let cost = block.gate_per_expert[e].storage.len_bytes() as u64
-                    + block.up_per_expert[e].storage.len_bytes() as u64
-                    + block.down_per_expert[e].storage.len_bytes() as u64;
-                // Same-size experts ⇒ once one overflows the remaining budget
-                // the rest will too, but `continue` keeps this robust to mixed
-                // sizes (shared/shexp FFNs promote via their own tensors).
-                if cost == 0 || used + cost > budget_bytes {
-                    continue;
-                }
-                // Promote the expert's three matrices as a unit. If the GPU
-                // producer is unavailable (no active backend → `None`), stop
-                // entirely: nothing further will promote either.
-                if !Self::promote_tensor(&mut block.gate_per_expert[e])
-                    || !Self::promote_tensor(&mut block.up_per_expert[e])
-                    || !Self::promote_tensor(&mut block.down_per_expert[e])
-                {
-                    break 'outer;
-                }
-                used += cost;
-                promoted += 1;
+        for (l, e) in order {
+            let block = &mut blocks[l];
+            // Skip experts already (partially) device-resident.
+            if block.gate_per_expert[e].storage.residency()
+                != rustllama_tensor::DeviceBackend::Cpu
+            {
+                continue;
             }
+            let cost = block.gate_per_expert[e].storage.len_bytes() as u64
+                + block.up_per_expert[e].storage.len_bytes() as u64
+                + block.down_per_expert[e].storage.len_bytes() as u64;
+            // Same-size experts ⇒ once one overflows the remaining budget the
+            // rest will too, but `continue` keeps this robust to mixed sizes
+            // (shared/shexp FFNs promote via their own tensors) and to the
+            // ranked-then-index ordering (a skipped hot expert mustn't abort
+            // the colder fill).
+            if cost == 0 || used + cost > budget_bytes {
+                continue;
+            }
+            // Promote the expert's three matrices as a unit. If the GPU producer
+            // is unavailable (no active backend → `None`), stop entirely:
+            // nothing further will promote either.
+            if !Self::promote_tensor(&mut block.gate_per_expert[e])
+                || !Self::promote_tensor(&mut block.up_per_expert[e])
+                || !Self::promote_tensor(&mut block.down_per_expert[e])
+            {
+                break;
+            }
+            used += cost;
+            promoted += 1;
         }
         (promoted, used)
     }

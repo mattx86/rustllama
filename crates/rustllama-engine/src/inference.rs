@@ -1431,13 +1431,22 @@ impl CpuEngine {
                 .map(|mb| mb.saturating_mul(1024 * 1024))
                 .unwrap_or(0);
             if vram_expert_bytes > 0 {
+                // Usage ranking (hottest-first) from the persisted per-model
+                // sidecar, so a tight budget buys the most-routed experts. Cold
+                // start (no sidecar) ⇒ empty ⇒ promotion falls back to index
+                // order. Opening a throwaway learner just reads the sidecar; the
+                // session's own learner is initialized separately below.
+                let ranked = crate::expert_cache::UsageLearner::open(path)
+                    .map(|l| l.ranked_keys())
+                    .unwrap_or_default();
                 let (experts, bytes) =
-                    model.weights.promote_experts_to_device(vram_expert_bytes);
+                    model.weights.promote_experts_to_device(vram_expert_bytes, &ranked);
                 if experts > 0 {
                     tracing::info!(
                         experts,
                         promoted_mb = bytes / (1024 * 1024),
                         budget_mb = vram_expert_bytes / (1024 * 1024),
+                        ranked = ranked.len(),
                         "moe tiered-expert: promoted hottest experts to CUDA device memory"
                     );
                 }
