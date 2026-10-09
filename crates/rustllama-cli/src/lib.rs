@@ -8867,6 +8867,16 @@ fn bench(
     stats("prefill", prefill_ms, "ms");
     stats("decode", decode_tps, "tok/s");
     stats("wall", wall_ms, "ms");
+    // MoE tiered-expert engine: how many matvecs ran against a promoted
+    // (device-resident) expert during the bench. Non-zero confirms
+    // `RUSTLLAMA_MOE_VRAM_EXPERT_MB` actually engaged the device tier (vs
+    // silently falling back); omitted when 0 so non-MoE / non-promoted benches
+    // stay quiet.
+    let dev_resident = rustllama_engine::moe_dev_resident_hits();
+    if dev_resident > 0 {
+        println!();
+        println!("  moe device-resident expert matvecs = {dev_resident}");
+    }
     Ok(())
 }
 

@@ -34,6 +34,7 @@ pub mod sycl_resources;
 pub mod tool_grammar;
 
 pub use inference::{CpuEngine, CpuEngineError};
+pub use rustllama_models::accel::moe_dev_resident_hits;
 pub use rustllama_models::imatrix_collect;
 pub use rustllama_models::kv_bias;
 pub use rustllama_models::llama_arch::kv_whitening_active_for;
