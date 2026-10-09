@@ -2636,6 +2636,93 @@ impl CudaMatvecCache {
         self.out_scratch.as_ref().unwrap().download(out_bytes)
     }
 
+    /// Device-resident batched packed matvec — the prefill-path analogue of
+    /// [`Self::matvec_packed_dev_resident`] (which see for the rationale). The
+    /// weight already lives on the device (`w_ptr_dev`, a promoted expert in
+    /// managed memory): no `weight_key` lookup, no host→device weight upload.
+    /// `w_nbytes` is the allocation length, checked exactly as the uploading
+    /// path does. `x` = [N,K] row-major, `out` = [N,M] row-major. Returns false
+    /// (caller falls through) on bad shape / scratch / kernel failure, leaving
+    /// `out` untouched. Weight ownership stays with the caller's `Tensor`.
+    ///
+    /// # Safety
+    /// `w_ptr_dev` must be a live device-accessible pointer of at least
+    /// `w_nbytes` bytes on this cache's device, valid for the call.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn matvec_packed_batched_dev_resident(
+        &mut self,
+        kind: CudaPackedKind,
+        w_ptr_dev: *const c_void,
+        w_nbytes: usize,
+        x: &[f32],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> bool {
+        if m == 0 || k == 0 || n == 0 || x.len() != n * k || out.len() != n * m {
+            return false;
+        }
+        if w_ptr_dev.is_null() {
+            return false;
+        }
+        if k % kind.k_alignment() != 0 || w_nbytes < m * kind.row_bytes(k) {
+            return false;
+        }
+        if !Self::ensure_scratch(&mut self.x_scratch, &self.stream, n * k * 4)
+            || !Self::ensure_scratch(&mut self.out_scratch, &self.stream, n * m * 4)
+        {
+            return false;
+        }
+        let x_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, n * k * 4) };
+        if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
+            return false;
+        }
+        let w_ptr = w_ptr_dev;
+        let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
+        let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: w is a caller-guaranteed live device buffer; x/out are live
+        // device scratch on `self.stream` sized for N rows; dispatch mirrors
+        // `matvec_packed_batched` exactly (same per-format kernels → bit-exact).
+        let res = unsafe {
+            match kind {
+                CudaPackedKind::Ptq1_0 => matvec_ptq1_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Q8_0 => matvec_q8_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Q4_K => matvec_q4_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Q6_K => matvec_q6_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Q5_K => matvec_q5_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Q2_K => matvec_q2_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Q8_K => matvec_q8_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Q4_0 => matvec_q4_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Q5_0 => matvec_q5_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Q4_1 => matvec_q4_1_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Q5_1 => matvec_q5_1_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Iq4_Nl => matvec_iq4_nl_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Iq4_Xs => matvec_iq4_xs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Iq2_Xxs => matvec_iq2_xxs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Iq2_Xs => matvec_iq2_xs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Iq2_S => matvec_iq2_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Iq3_Xxs => matvec_iq3_xxs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Iq3_S => matvec_iq3_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Iq1_S => matvec_iq1_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Iq1_M => matvec_iq1_m_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Nvfp4 => matvec_nvfp4_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Mxfp4 => matvec_mxfp4_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Mxfp6 => matvec_mxfp6_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Mxfp8 => matvec_mxfp8_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Q3_K => matvec_q3_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Pq2_0 => matvec_pq2_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+            }
+        };
+        if res.is_err() || consume_error_count() != 0 {
+            return false;
+        }
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * m * 4) };
+        self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
+
     /// Q4_K prefill GEMM (Phase 1): tiled, shared-mem weight reuse, f32 (bit-
     /// exact). Same device-buffer lifecycle as `matvec_packed_batched` — the
     /// weight is the SAME packed Q4_K bytes — but the kernel stages a dequantized
@@ -2678,6 +2765,62 @@ impl CudaMatvecCache {
         let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
         let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
         // SAFETY: device buffers sized for N rows, as `matvec_packed_batched`.
+        let res = unsafe { gemm_q4_k_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n) };
+        if res.is_err() || consume_error_count() != 0 {
+            return false;
+        }
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * m * 4) };
+        self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
+
+    /// Device-resident Q4_K prefill GEMM — the promoted-expert analogue of
+    /// [`Self::gemm_packed_batched_q4k_f32`]. The weight already lives on the
+    /// device (`w_ptr_dev`, managed memory): no `weight_key` / no upload. The
+    /// SAME bit-exact tiled GEMM (shared-mem weight reuse), so a promoted Q4_K
+    /// expert keeps the prefill-GEMM win AND skips the re-upload — no prefill
+    /// regression vs the uploading GEMM. Returns false (caller falls through) on
+    /// bad shape / scratch / kernel failure; leaves `out` untouched.
+    ///
+    /// # Safety
+    /// `w_ptr_dev` must be a live device-accessible pointer of at least
+    /// `w_nbytes` bytes on this cache's device, valid for the call.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_packed_batched_q4k_f32_dev_resident(
+        &mut self,
+        w_ptr_dev: *const c_void,
+        w_nbytes: usize,
+        x: &[f32],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> bool {
+        let kind = CudaPackedKind::Q4_K;
+        if m == 0 || k == 0 || n == 0 || x.len() != n * k || out.len() != n * m {
+            return false;
+        }
+        if w_ptr_dev.is_null() {
+            return false;
+        }
+        if k % kind.k_alignment() != 0 || w_nbytes < m * kind.row_bytes(k) {
+            return false;
+        }
+        if !Self::ensure_scratch(&mut self.x_scratch, &self.stream, n * k * 4)
+            || !Self::ensure_scratch(&mut self.out_scratch, &self.stream, n * m * 4)
+        {
+            return false;
+        }
+        let x_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, n * k * 4) };
+        if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
+            return false;
+        }
+        let w_ptr = w_ptr_dev;
+        let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
+        let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: w is a caller-guaranteed live device buffer; x/out are device
+        // scratch sized for N rows; same kernel as the uploading GEMM → bit-exact.
         let res = unsafe { gemm_q4_k_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n) };
         if res.is_err() || consume_error_count() != 0 {
             return false;
