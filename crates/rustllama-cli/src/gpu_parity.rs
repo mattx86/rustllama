@@ -365,9 +365,11 @@ fn probe_names() -> Vec<String> {
     for f in QUANT_KV_FORMATS {
         v.push(format!("attn:prefill_{}", f.name));
     }
-    // Q8_0 KV flash (per-row-scale layout; not a QUANT_KV_FORMATS block entry).
+    // Q8_0 + TQ KV flash (per-row-scale layouts; not QUANT_KV_FORMATS blocks).
     v.push("attn:decode_q8_0".to_string());
     v.push("attn:prefill_q8_0".to_string());
+    v.push("attn:decode_tq".to_string());
+    v.push("attn:prefill_tq".to_string());
     for l in LAYOUTS {
         v.push(format!("matvec:{}", l.name));
     }
@@ -1124,6 +1126,77 @@ fn i8_as_bytes(slab: &[i8]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(slab.as_ptr() as *const u8, slab.len()) }
 }
 
+// ---- Per-row-scale KV quantizers (TQ / TurboQuant) ----
+// TQ KV is the engine's KvLayer::Tq: each head_dim row is WHT-rotated + packed
+// to `bits`-per-element level codes (`turboquant::bytes_per_block(head_dim,
+// bits)` bytes/row) with a SEPARATE per-row f32 scale [n_kv_heads*max_ctx]. The
+// flash kernels take the packed slab + scales + a runtime `bits` arg. Same probe
+// shape as Q8_0, plus `bits`. Parity is bits-independent (same-quant reference
+// uses the identical `dequantize_row`, which reverses the WHT + scale).
+
+/// Quantize a KV cache to the TQ per-row layout at `bits`. Returns
+/// `(packed slab [n_kv_heads*max_ctx*bytes_per_block], f32 scales
+/// [n_kv_heads*max_ctx])`.
+fn quantize_kv_tq(
+    cache: &[f32],
+    bits: u8,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    upto: usize,
+) -> (Vec<u8>, Vec<f32>) {
+    let bpr = k::turboquant::bytes_per_block(head_dim, bits);
+    let mut slab = vec![0u8; n_kv_heads * max_ctx * bpr];
+    let mut scales = vec![0f32; n_kv_heads * max_ctx];
+    let mut row = vec![0f32; head_dim];
+    for h in 0..n_kv_heads {
+        for t in 0..upto {
+            let ridx = h * max_ctx + t;
+            let src = ridx * head_dim;
+            row.copy_from_slice(&cache[src..src + head_dim]);
+            let p = ridx * bpr;
+            // quantize_row WHT-rotates `row` in place + returns the per-row scale.
+            scales[ridx] = k::turboquant::quantize_row(&mut row, bits, &mut slab[p..p + bpr]);
+        }
+    }
+    (slab, scales)
+}
+
+/// Same-quant dequant of a TQ KV slab (inverse WHT + per-row scale): the exact
+/// inverse of [`quantize_kv_tq`], for the same-quant flash reference.
+fn dequant_kv_tq(
+    slab: &[u8],
+    scales: &[f32],
+    bits: u8,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    upto: usize,
+) -> Vec<f32> {
+    let bpr = k::turboquant::bytes_per_block(head_dim, bits);
+    let mut out = vec![0f32; n_kv_heads * max_ctx * head_dim];
+    for h in 0..n_kv_heads {
+        for t in 0..upto {
+            let ridx = h * max_ctx + t;
+            let p = ridx * bpr;
+            let dst = ridx * head_dim;
+            k::turboquant::dequantize_row(
+                &slab[p..p + bpr],
+                scales[ridx],
+                bits,
+                &mut out[dst..dst + head_dim],
+            );
+        }
+    }
+    out
+}
+
+/// Representative TQ bit-width for the parity probes. Parity is bits-independent
+/// (same-quant reference), so one value exercises the pack/unpack + kernel path;
+/// 2-bit is the mid-range sub-byte case (avoids tq1's sign-only + tq8's
+/// byte-aligned edges).
+const TQ_PROBE_BITS: u8 = 2;
+
 fn probe_attn(stream: &sk::SyclStream, name: &str, variant: &str, started: Instant) {
     // Quant-KV variants (decode_mxfp4 … prefill_nvfp4) run the F32-Q /
     // packed-K/V flash kernels and grade against the full-precision CPU
@@ -1137,6 +1210,14 @@ fn probe_attn(stream: &sk::SyclStream, name: &str, variant: &str, started: Insta
     }
     if variant == "prefill_q8_0" {
         probe_attn_q8_0(stream, name, "prefill", started);
+        return;
+    }
+    if variant == "decode_tq" {
+        probe_attn_tq(stream, name, "decode", started);
+        return;
+    }
+    if variant == "prefill_tq" {
+        probe_attn_tq(stream, name, "prefill", started);
         return;
     }
     if let Some(fmt) = variant.strip_prefix("decode_").and_then(quant_kv_format) {
@@ -1742,6 +1823,138 @@ fn probe_attn_q8_0(stream: &sk::SyclStream, name: &str, dir: &str, started: Inst
                 let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
                 let verdict = if cos > 0.999 && max_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
                 emit(name, verdict, &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"));
+            }
+        }
+    } else {
+        emit(name, "SKIP", "unknown-direction");
+    }
+}
+
+/// TQ (TurboQuant) KV FlashAttention probe. Like `probe_attn_q8_0` but the slab
+/// is WHT-packed `bits`-per-element level codes (`turboquant`) and the kernel
+/// takes a runtime `bits` arg. Graded same-quant (identical slab+scales
+/// dequantized via the inverse WHT) at a representative `TQ_PROBE_BITS`.
+fn probe_attn_tq(stream: &sk::SyclStream, name: &str, dir: &str, started: Instant) {
+    let bits = TQ_PROBE_BITS;
+    let mut rng = XorShift(0xA77E17);
+    let fill_kv = |rng: &mut XorShift, upto: usize| -> Vec<f32> {
+        let mut v = vec![0f32; AT_KV_HEADS * AT_MAX_CTX * AT_HEAD_DIM];
+        for h in 0..AT_KV_HEADS {
+            for t in 0..upto {
+                for d in 0..AT_HEAD_DIM {
+                    v[(h * AT_MAX_CTX + t) * AT_HEAD_DIM + d] = rng.f32_pm(0.6);
+                }
+            }
+        }
+        v
+    };
+    let run = |q: &[f32],
+               kslab: &[u8],
+               ksc: &[f32],
+               vslab: &[u8],
+               vsc: &[f32],
+               out_len: usize|
+     -> sk::Result<(
+        sk::SyclSharedBuffer<f32>,
+        sk::SyclSharedBuffer<u8>,
+        sk::SyclSharedBuffer<u8>,
+        sk::SyclSharedBuffer<f32>,
+        sk::SyclSharedBuffer<f32>,
+        sk::SyclSharedBuffer<f32>,
+    )> {
+        let mut qb = sk::SyclSharedBuffer::<f32>::alloc(stream, q.len())?;
+        qb.as_mut_slice().copy_from_slice(q);
+        let mut kb = sk::SyclSharedBuffer::<u8>::alloc(stream, kslab.len())?;
+        kb.as_mut_slice().copy_from_slice(kslab);
+        let mut vb = sk::SyclSharedBuffer::<u8>::alloc(stream, vslab.len())?;
+        vb.as_mut_slice().copy_from_slice(vslab);
+        let mut ksb = sk::SyclSharedBuffer::<f32>::alloc(stream, ksc.len())?;
+        ksb.as_mut_slice().copy_from_slice(ksc);
+        let mut vsb = sk::SyclSharedBuffer::<f32>::alloc(stream, vsc.len())?;
+        vsb.as_mut_slice().copy_from_slice(vsc);
+        let mut ob = sk::SyclSharedBuffer::<f32>::alloc(stream, out_len)?;
+        ob.as_mut_slice().fill(f32::NAN);
+        Ok((qb, kb, vb, ksb, vsb, ob))
+    };
+
+    if dir == "decode" {
+        let kcache = fill_kv(&mut rng, AT_KV_LEN);
+        let vcache = fill_kv(&mut rng, AT_KV_LEN);
+        let q: Vec<f32> = (0..AT_HEADS * AT_HEAD_DIM).map(|_| rng.f32_pm(0.6)).collect();
+        let (kslab, ksc) = quantize_kv_tq(&kcache, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
+        let (vslab, vsc) = quantize_kv_tq(&vcache, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
+        let kdq = dequant_kv_tq(&kslab, &ksc, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
+        let vdq = dequant_kv_tq(&vslab, &vsc, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
+        let mut cpu_out = vec![0f32; AT_HEADS * AT_HEAD_DIM];
+        k::gqa_attention_one_step(
+            &q, &kdq, &vdq, &mut cpu_out,
+            AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN,
+        );
+        let (qb, kb, vb, ksb, vsb, mut ob) =
+            match run(&q, &kslab, &ksc, &vslab, &vsc, cpu_out.len()) {
+                Ok(t) => t,
+                Err(_) => {
+                    emit(name, "KERNEL_ERR", "usm-alloc-failed");
+                    return;
+                }
+            };
+        // SAFETY: all USM buffers live on `stream`, sized to the geometry; the
+        // kernel waits before returning.
+        let res = unsafe {
+            sk::flash_attn_decode_tq_usm_raw(
+                stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ksb.as_ptr(), vsb.as_ptr(),
+                bits as u32, ob.as_mut_ptr(), AT_HEADS as u32, AT_KV_HEADS as u32,
+                AT_HEAD_DIM as u32, AT_MAX_CTX as u32, AT_KV_LEN as u32,
+            )
+        };
+        let ms = started.elapsed().as_millis();
+        match res {
+            Err(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
+            Ok(()) => {
+                let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
+                let verdict = if cos > 0.999 && max_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
+                emit(name, verdict, &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms} bits={bits}"));
+            }
+        }
+    } else if dir == "prefill" {
+        let upto = AT_PREFILL_BASE + AT_PREFILL_NEW;
+        let kcache = fill_kv(&mut rng, upto);
+        let vcache = fill_kv(&mut rng, upto);
+        let q: Vec<f32> = (0..AT_PREFILL_NEW * AT_HEADS * AT_HEAD_DIM)
+            .map(|_| rng.f32_pm(0.6))
+            .collect();
+        let (kslab, ksc) = quantize_kv_tq(&kcache, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
+        let (vslab, vsc) = quantize_kv_tq(&vcache, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
+        let kdq = dequant_kv_tq(&kslab, &ksc, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
+        let vdq = dequant_kv_tq(&vslab, &vsc, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
+        let mut cpu_out = vec![0f32; q.len()];
+        k::gqa_attention_flash_prefill(
+            &q, &kdq, &vdq, &mut cpu_out,
+            AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_PREFILL_BASE, AT_PREFILL_NEW,
+        );
+        let (qb, kb, vb, ksb, vsb, mut ob) =
+            match run(&q, &kslab, &ksc, &vslab, &vsc, cpu_out.len()) {
+                Ok(t) => t,
+                Err(_) => {
+                    emit(name, "KERNEL_ERR", "usm-alloc-failed");
+                    return;
+                }
+            };
+        // SAFETY: as the decode arm, q/out sized for AT_PREFILL_NEW queries.
+        let res = unsafe {
+            sk::flash_attn_prefill_tq_usm_raw(
+                stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ksb.as_ptr(), vsb.as_ptr(),
+                bits as u32, ob.as_mut_ptr(), AT_HEADS as u32, AT_KV_HEADS as u32,
+                AT_HEAD_DIM as u32, AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
+            )
+        };
+        let ms = started.elapsed().as_millis();
+        match res {
+            Err(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
+            Ok(()) => {
+                let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
+                let verdict = if cos > 0.999 && max_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
+                emit(name, verdict, &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms} bits={bits}"));
             }
         }
     } else {
@@ -3170,6 +3383,103 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- TQ (TurboQuant) KV FlashAttention decode + prefill ----
+    // WHT-packed bits-per-element slab + per-row f32 scales + a runtime `bits`
+    // arg. Same-quant reference at TQ_PROBE_BITS (parity is bits-independent).
+    {
+        let (n_heads, n_kv_heads, head_dim, max_ctx, kv_len) = (8usize, 2usize, 64usize, 128usize, 40usize);
+        let (kv_base, n_new) = (10usize, 6usize);
+        let bits = TQ_PROBE_BITS;
+        let q = gen_x(n_heads * head_dim, 61);
+        let kc = gen_x(n_kv_heads * max_ctx * head_dim, 63);
+        let vc = gen_x(n_kv_heads * max_ctx * head_dim, 67);
+        let qp = gen_x(n_new * n_heads * head_dim, 71);
+        let upto = kv_len.max(kv_base + n_new);
+        let (kslab, ksc) = quantize_kv_tq(&kc, bits, n_kv_heads, head_dim, max_ctx, upto);
+        let (vslab, vsc) = quantize_kv_tq(&vc, bits, n_kv_heads, head_dim, max_ctx, upto);
+        let kdq = dequant_kv_tq(&kslab, &ksc, bits, n_kv_heads, head_dim, max_ctx, upto);
+        let vdq = dequant_kv_tq(&vslab, &vsc, bits, n_kv_heads, head_dim, max_ctx, upto);
+        let cpu_dec = ref_flash_decode(&q, &kdq, &vdq, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
+        let cpu_pre = ref_flash_prefill(&qp, &kdq, &vdq, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new);
+        // decode
+        if let (Some(qb), Some(kb), Some(vb), Some(ksb), Some(vsb), Some(mut ob)) = (
+            cu_upload_f32(&stream, &q),
+            ck::CudaDeviceBuffer::from_host(&stream, &kslab),
+            ck::CudaDeviceBuffer::from_host(&stream, &vslab),
+            cu_upload_f32(&stream, &ksc),
+            cu_upload_f32(&stream, &vsc),
+            ck::CudaDeviceBuffer::alloc(&stream, n_heads * head_dim * 4),
+        ) {
+            // SAFETY: q/out F32; k/v packed TQ slabs; k/v scales F32 — live
+            // device buffers on `stream`.
+            let res = unsafe {
+                ck::flash_attn_decode_tq(
+                    &stream,
+                    qb.as_ptr() as *const f32,
+                    kb.as_ptr(),
+                    vb.as_ptr(),
+                    ksb.as_ptr() as *const f32,
+                    vsb.as_ptr() as *const f32,
+                    bits as u32,
+                    ob.as_mut_ptr() as *mut f32,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                )
+            };
+            match res {
+                Ok(()) => cu_grade(
+                    "attn:decode_tq",
+                    &cu_download_f32(&ob, n_heads * head_dim),
+                    &cpu_dec,
+                    0.999,
+                    0.05,
+                    &mut counts,
+                ),
+                Err(e) => {
+                    cu_emit("attn:decode_tq", "KERNEL_ERR", &format!("{e}"));
+                    *counts.entry("KERNEL_ERR").or_default() += 1;
+                }
+            }
+        }
+        // prefill
+        if let (Some(qb), Some(kb), Some(vb), Some(ksb), Some(vsb), Some(mut ob)) = (
+            cu_upload_f32(&stream, &qp),
+            ck::CudaDeviceBuffer::from_host(&stream, &kslab),
+            ck::CudaDeviceBuffer::from_host(&stream, &vslab),
+            cu_upload_f32(&stream, &ksc),
+            cu_upload_f32(&stream, &vsc),
+            ck::CudaDeviceBuffer::alloc(&stream, n_new * n_heads * head_dim * 4),
+        ) {
+            // SAFETY: as the decode arm, q/out sized for n_new queries.
+            let res = unsafe {
+                ck::flash_attn_prefill_tq(
+                    &stream,
+                    qb.as_ptr() as *const f32,
+                    kb.as_ptr(),
+                    vb.as_ptr(),
+                    ksb.as_ptr() as *const f32,
+                    vsb.as_ptr() as *const f32,
+                    bits as u32,
+                    ob.as_mut_ptr() as *mut f32,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
+                )
+            };
+            match res {
+                Ok(()) => cu_grade(
+                    "attn:prefill_tq",
+                    &cu_download_f32(&ob, n_new * n_heads * head_dim),
+                    &cpu_pre,
+                    0.999,
+                    0.05,
+                    &mut counts,
+                ),
+                Err(e) => {
+                    cu_emit("attn:prefill_tq", "KERNEL_ERR", &format!("{e}"));
+                    *counts.entry("KERNEL_ERR").or_default() += 1;
+                }
+            }
+        }
+    }
+
     // ---- Greedy argmax ----
     {
         let vocab = 4096usize;
@@ -4015,6 +4325,104 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                     ),
                     Err(e) => {
                         cu_emit("attn:prefill_q8_0", "KERNEL_ERR", &format!("{e:?}"));
+                        *counts.entry("KERNEL_ERR").or_default() += 1;
+                    }
+                }
+            }
+        }
+
+        // ---- TQ (TurboQuant) KV FlashAttention decode + prefill ----
+        // Metal twin of the CUDA TQ probe: WHT-packed slab + per-row scales +
+        // `bits`, same-quant reference at TQ_PROBE_BITS. Reuses the MlxStream.
+        {
+            let (n_heads, n_kv_heads, head_dim, max_ctx, kv_len) =
+                (8usize, 2usize, 64usize, 128usize, 40usize);
+            let (kv_base, n_new) = (10usize, 6usize);
+            let bits = TQ_PROBE_BITS;
+            let q = gen_x(n_heads * head_dim, 61);
+            let kc = gen_x(n_kv_heads * max_ctx * head_dim, 63);
+            let vc = gen_x(n_kv_heads * max_ctx * head_dim, 67);
+            let qp = gen_x(n_new * n_heads * head_dim, 71);
+            let upto = kv_len.max(kv_base + n_new);
+            let (kslab, ksc) = quantize_kv_tq(&kc, bits, n_kv_heads, head_dim, max_ctx, upto);
+            let (vslab, vsc) = quantize_kv_tq(&vc, bits, n_kv_heads, head_dim, max_ctx, upto);
+            let kdq = dequant_kv_tq(&kslab, &ksc, bits, n_kv_heads, head_dim, max_ctx, upto);
+            let vdq = dequant_kv_tq(&vslab, &vsc, bits, n_kv_heads, head_dim, max_ctx, upto);
+            let cpu_dec = ref_flash_decode(&q, &kdq, &vdq, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
+            let cpu_pre = ref_flash_prefill(&qp, &kdq, &vdq, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new);
+            // decode
+            if let (Some(qb), Some(kb), Some(vb), Some(ksb), Some(vsb), Some(mut ob)) = (
+                mk_upload_f32(&fs, &q),
+                mk::MlxDeviceBuffer::from_host(&fs, &kslab),
+                mk::MlxDeviceBuffer::from_host(&fs, &vslab),
+                mk_upload_f32(&fs, &ksc),
+                mk_upload_f32(&fs, &vsc),
+                mk::MlxDeviceBuffer::alloc(&fs, n_heads * head_dim * 4),
+            ) {
+                // SAFETY: q/out F32; k/v packed TQ slabs; k/v scales F32 — live
+                // device buffers on `fs`.
+                let res = unsafe {
+                    mk::flash_attn_decode_tq(
+                        &fs,
+                        qb.as_ptr() as *const f32,
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ksb.as_ptr() as *const f32,
+                        vsb.as_ptr() as *const f32,
+                        bits as u32,
+                        ob.as_mut_ptr() as *mut f32,
+                        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                    )
+                };
+                match res {
+                    Ok(()) => cu_grade(
+                        "attn:decode_tq",
+                        &mk_download_f32(&ob, n_heads * head_dim),
+                        &cpu_dec,
+                        0.999,
+                        0.05,
+                        &mut counts,
+                    ),
+                    Err(e) => {
+                        cu_emit("attn:decode_tq", "KERNEL_ERR", &format!("{e:?}"));
+                        *counts.entry("KERNEL_ERR").or_default() += 1;
+                    }
+                }
+            }
+            // prefill
+            if let (Some(qb), Some(kb), Some(vb), Some(ksb), Some(vsb), Some(mut ob)) = (
+                mk_upload_f32(&fs, &qp),
+                mk::MlxDeviceBuffer::from_host(&fs, &kslab),
+                mk::MlxDeviceBuffer::from_host(&fs, &vslab),
+                mk_upload_f32(&fs, &ksc),
+                mk_upload_f32(&fs, &vsc),
+                mk::MlxDeviceBuffer::alloc(&fs, n_new * n_heads * head_dim * 4),
+            ) {
+                // SAFETY: as the decode arm, q/out sized for n_new queries.
+                let res = unsafe {
+                    mk::flash_attn_prefill_tq(
+                        &fs,
+                        qb.as_ptr() as *const f32,
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ksb.as_ptr() as *const f32,
+                        vsb.as_ptr() as *const f32,
+                        bits as u32,
+                        ob.as_mut_ptr() as *mut f32,
+                        n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
+                    )
+                };
+                match res {
+                    Ok(()) => cu_grade(
+                        "attn:prefill_tq",
+                        &mk_download_f32(&ob, n_new * n_heads * head_dim),
+                        &cpu_pre,
+                        0.999,
+                        0.05,
+                        &mut counts,
+                    ),
+                    Err(e) => {
+                        cu_emit("attn:prefill_tq", "KERNEL_ERR", &format!("{e:?}"));
                         *counts.entry("KERNEL_ERR").or_default() += 1;
                     }
                 }
