@@ -3249,6 +3249,188 @@ impl CudaMatvecCache {
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * m * 4) };
         self.out_scratch.as_ref().unwrap().download(out_bytes)
     }
+
+    // ── MoE tiered-expert device-resident TC GEMMs ──────────────────────────
+    // Promoted-expert twins of the four tensor-core batched GEMMs above: the
+    // weight already lives on the device (`w_ptr_dev`, managed memory), so these
+    // skip `weight_key`/`ensure_weight` and the host→device re-upload, feeding
+    // the resident pointer to the SAME kernel (identical geometry checks). They
+    // close the last batched tradeoff — a promoted NVFP4/MXFP4/MXFP8/MXFP6
+    // expert on an already-GPU-placed layer keeps its TC GEMM. Each is
+    // verdict-gated at the dispatch (fail-closed: if the kernel is write-blind /
+    // unvalidated, its verdict is off and this never runs). `w_ptr_dev` must be
+    // a live device buffer of `>= w_nbytes` bytes on this cache's device.
+
+    /// Device-resident [`Self::gemm_fp4_tc`] (NVFP4 / MXFP4, W4A4).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_fp4_tc_dev_resident(
+        &mut self,
+        kind: CudaFp4TcKind,
+        w_ptr_dev: *const c_void,
+        w_nbytes: usize,
+        x: &[f32],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> bool {
+        let (kalign, row_bytes) = match kind {
+            CudaFp4TcKind::Nvfp4 => (16usize, (k / 16) * 9),
+            CudaFp4TcKind::Mxfp4 => (32usize, (k / 32) * 17),
+        };
+        if m == 0 || k == 0 || n == 0 || x.len() != n * k || out.len() != n * m {
+            return false;
+        }
+        if w_ptr_dev.is_null() || k % 64 != 0 || k % kalign != 0 || w_nbytes < m * row_bytes {
+            return false;
+        }
+        if !Self::ensure_scratch(&mut self.x_scratch, &self.stream, n * k * 4)
+            || !Self::ensure_scratch(&mut self.out_scratch, &self.stream, n * m * 4)
+        {
+            return false;
+        }
+        let x_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, n * k * 4) };
+        if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
+            return false;
+        }
+        let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
+        let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: w caller-guaranteed live device buffer; x/out device scratch
+        // sized N·K / N·M; same kernel as `gemm_fp4_tc`.
+        let res = unsafe { gemm_fp4_tc_f32(kind, &self.stream, w_ptr_dev, x_ptr, out_ptr, m, n, k) };
+        if res.is_err() || consume_error_count() != 0 {
+            return false;
+        }
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * m * 4) };
+        self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
+
+    /// Device-resident [`Self::gemm_mxfp8_tc`] (Blackwell MXFP8, W8A8).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_mxfp8_tc_dev_resident(
+        &mut self,
+        w_ptr_dev: *const c_void,
+        w_nbytes: usize,
+        x: &[f32],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> bool {
+        let row_bytes = (k / 32) * 33;
+        if m == 0 || k == 0 || n == 0 || x.len() != n * k || out.len() != n * m {
+            return false;
+        }
+        if w_ptr_dev.is_null() || k % 32 != 0 || w_nbytes < m * row_bytes {
+            return false;
+        }
+        if !Self::ensure_scratch(&mut self.x_scratch, &self.stream, n * k * 4)
+            || !Self::ensure_scratch(&mut self.out_scratch, &self.stream, n * m * 4)
+        {
+            return false;
+        }
+        let x_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, n * k * 4) };
+        if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
+            return false;
+        }
+        let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
+        let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: as gemm_fp4_tc_dev_resident; same kernel as `gemm_mxfp8_tc`.
+        let res = unsafe { gemm_mxfp8_tc_f32(&self.stream, w_ptr_dev, x_ptr, out_ptr, m, n, k) };
+        if res.is_err() || consume_error_count() != 0 {
+            return false;
+        }
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * m * 4) };
+        self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
+
+    /// Device-resident [`Self::gemm_mxfp6_tc`] (Blackwell MXFP6, W6A6).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_mxfp6_tc_dev_resident(
+        &mut self,
+        w_ptr_dev: *const c_void,
+        w_nbytes: usize,
+        x: &[f32],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> bool {
+        let row_bytes = (k / 32) * 25;
+        if m == 0 || k == 0 || n == 0 || x.len() != n * k || out.len() != n * m {
+            return false;
+        }
+        if w_ptr_dev.is_null() || k % 32 != 0 || w_nbytes < m * row_bytes {
+            return false;
+        }
+        if !Self::ensure_scratch(&mut self.x_scratch, &self.stream, n * k * 4)
+            || !Self::ensure_scratch(&mut self.out_scratch, &self.stream, n * m * 4)
+        {
+            return false;
+        }
+        let x_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, n * k * 4) };
+        if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
+            return false;
+        }
+        let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
+        let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: as gemm_fp4_tc_dev_resident; same kernel as `gemm_mxfp6_tc`.
+        let res = unsafe { gemm_mxfp6_tc_f32(&self.stream, w_ptr_dev, x_ptr, out_ptr, m, n, k) };
+        if res.is_err() || consume_error_count() != 0 {
+            return false;
+        }
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * m * 4) };
+        self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
+
+    /// Device-resident [`Self::gemm_fp8_wgmma`] (Hopper MXFP8 wgmma, W8A8).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_fp8_wgmma_dev_resident(
+        &mut self,
+        w_ptr_dev: *const c_void,
+        w_nbytes: usize,
+        x: &[f32],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        tma: bool,
+    ) -> bool {
+        let row_bytes = (k / 32) * 33;
+        if m == 0 || k == 0 || n == 0 || x.len() != n * k || out.len() != n * m {
+            return false;
+        }
+        if w_ptr_dev.is_null() || k % 32 != 0 || w_nbytes < m * row_bytes {
+            return false;
+        }
+        if !Self::ensure_scratch(&mut self.x_scratch, &self.stream, n * k * 4)
+            || !Self::ensure_scratch(&mut self.out_scratch, &self.stream, n * m * 4)
+        {
+            return false;
+        }
+        let x_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, n * k * 4) };
+        if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
+            return false;
+        }
+        let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
+        let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: as gemm_fp4_tc_dev_resident; same kernel as `gemm_fp8_wgmma`.
+        let res =
+            unsafe { gemm_mxfp8_wgmma_f32(&self.stream, w_ptr_dev, x_ptr, out_ptr, m, n, k, tma) };
+        if res.is_err() || consume_error_count() != 0 {
+            return false;
+        }
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * m * 4) };
+        self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
 }
 
 // SAFETY: the cache owns its stream + device buffers and is only ever

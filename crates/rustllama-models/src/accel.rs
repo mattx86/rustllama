@@ -641,6 +641,97 @@ fn try_gemm_fp8_wgmma_batched(
     guard.gemm_fp8_wgmma(weight_key, w_bytes, x, out, m, k, n, hopper_tc_tma())
 }
 
+// ── MoE tiered-expert device-resident TC GEMM helpers ───────────────────────
+// Promoted-expert twins of the four `try_gemm_*_batched` helpers above: the
+// weight is already in CUDA device memory (`w_ptr_dev`), so they skip the cache
+// upload. Each records a dev-resident hit on success (observability). SAFETY:
+// `w_ptr_dev` is a live device buffer of `>= w_nbytes` bytes on the default
+// device, guaranteed by the owning `Tensor`'s `Storage::Device` outliving the
+// call.
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn try_gemm_fp4_tc_batched_dev_resident(
+    kind: ck::CudaFp4TcKind,
+    w_ptr_dev: *const core::ffi::c_void,
+    w_nbytes: usize,
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else { return false };
+    let Ok(mut guard) = cache.lock() else { return false };
+    // SAFETY: see module note above.
+    let ok = unsafe { guard.gemm_fp4_tc_dev_resident(kind, w_ptr_dev, w_nbytes, x, out, m, k, n) };
+    if ok {
+        note_moe_dev_resident_hit();
+    }
+    ok
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn try_gemm_mxfp8_tc_batched_dev_resident(
+    w_ptr_dev: *const core::ffi::c_void,
+    w_nbytes: usize,
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else { return false };
+    let Ok(mut guard) = cache.lock() else { return false };
+    // SAFETY: see module note above.
+    let ok = unsafe { guard.gemm_mxfp8_tc_dev_resident(w_ptr_dev, w_nbytes, x, out, m, k, n) };
+    if ok {
+        note_moe_dev_resident_hit();
+    }
+    ok
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn try_gemm_mxfp6_tc_batched_dev_resident(
+    w_ptr_dev: *const core::ffi::c_void,
+    w_nbytes: usize,
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else { return false };
+    let Ok(mut guard) = cache.lock() else { return false };
+    // SAFETY: see module note above.
+    let ok = unsafe { guard.gemm_mxfp6_tc_dev_resident(w_ptr_dev, w_nbytes, x, out, m, k, n) };
+    if ok {
+        note_moe_dev_resident_hit();
+    }
+    ok
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn try_gemm_fp8_wgmma_batched_dev_resident(
+    w_ptr_dev: *const core::ffi::c_void,
+    w_nbytes: usize,
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else { return false };
+    let Ok(mut guard) = cache.lock() else { return false };
+    // SAFETY: see module note above.
+    let ok = unsafe {
+        guard.gemm_fp8_wgmma_dev_resident(w_ptr_dev, w_nbytes, x, out, m, k, n, hopper_tc_tma())
+    };
+    if ok {
+        note_moe_dev_resident_hit();
+    }
+    ok
+}
+
 // ------------------------------------------------------------
 // Intel XMX/DPAS bf16 tensor-core GEMM dispatch (SYCL, opt-in)
 // ------------------------------------------------------------
@@ -11783,21 +11874,16 @@ pub fn try_matvec_tensor_batched_usm_f32(
     // GPU-resident regardless of its layer placement, consistent with its decode
     // path. Q4_K gets its FULL prefill ladder device-resident — lossy int8
     // W8A8-TC GEMM, then bit-exact f32 weight-reuse GEMM — the same order the
-    // uploading arm uses, so a promoted Q4_K expert is never slower than a
-    // non-promoted one; every other promoted format uses the device-resident
-    // batched matvec. All skip the re-upload AND the `as_bytes` host migration
-    // of managed pages. Honors an explicit CPU pin + shape/flops floor. Inert
-    // (byte-identical) until something promotes experts — on non-CUDA /
-    // non-promoted runs the device tag is never Cuda.
-    //
-    // TRADEOFF (always correct, narrow, write-blind): the Blackwell/Hopper
-    // NVFP4/MXFP8/MXFP6 tensor-core GEMMs have no device-resident variant yet,
-    // so a promoted expert in those formats takes the plain device-resident
-    // batched matvec here. For a CPU-placed layer that's still a win (GPU vs
-    // CPU); only a promoted MXFP-family expert on an already-GPU-placed layer
-    // forgoes its TC GEMM — a vanishingly narrow intersection (opt-in +
-    // Blackwell/Hopper + MXFP experts + hot expert on a GPU layer). Those
-    // dev-resident TC GEMMs are a follow-up if the pod shows it matters.
+    // uploading arm uses. The TC formats (NVFP4/MXFP4 FP4-TC, MXFP8 Hopper
+    // wgmma / Blackwell block-scaled, MXFP6) then get their device-resident TC
+    // GEMMs next, again mirroring the uploading dispatch's gates + order; any
+    // remaining format falls to the device-resident batched matvec. So a
+    // promoted expert of ANY format is never slower than a non-promoted one on
+    // a GPU-placed layer — the batched tradeoff is closed. All skip the
+    // re-upload AND the `as_bytes` host migration of managed pages. Honors an
+    // explicit CPU pin + shape/flops floor. Inert (byte-identical) until
+    // something promotes experts — on non-CUDA / non-promoted runs the device
+    // tag is never Cuda; the TC GEMMs stay verdict-gated (fail-closed).
     if !tensor_forced_to_cpu(&w.name)
         && m != 0
         && k != 0
@@ -11842,6 +11928,59 @@ pub fn try_matvec_tensor_batched_usm_f32(
                         }
                     {
                         return true;
+                    }
+                    // Tensor-core prefill GEMMs for the TC formats, same gates +
+                    // order as the uploading arm — so a promoted NVFP4/MXFP4/
+                    // MXFP8/MXFP6 expert on a GPU-placed layer keeps its TC GEMM
+                    // (closes the last batched tradeoff). All verdict-gated
+                    // (fail-closed) + batch-gated (n>=16); a miss falls through
+                    // to the plain batched matvec. SAFETY: as above.
+                    if n >= 16 {
+                        if let Some(tc_kind) = dtype_to_fp4_tc_kind(w.dtype) {
+                            if fp4_tc_enabled()
+                                && k % 64 == 0
+                                && unsafe {
+                                    try_gemm_fp4_tc_batched_dev_resident(
+                                        tc_kind, dptr, w_nbytes, x, out, m, k, n,
+                                    )
+                                }
+                            {
+                                return true;
+                            }
+                        }
+                        if matches!(w.dtype, Dtype::Mxfp8Raw) && k % 32 == 0 {
+                            // Hopper wgmma first, then Blackwell block-scaled —
+                            // mutually exclusive by device, mirroring dispatch.
+                            if hopper_tc_enabled()
+                                && unsafe {
+                                    try_gemm_fp8_wgmma_batched_dev_resident(
+                                        dptr, w_nbytes, x, out, m, k, n,
+                                    )
+                                }
+                            {
+                                return true;
+                            }
+                            if mxfp8_tc_enabled()
+                                && unsafe {
+                                    try_gemm_mxfp8_tc_batched_dev_resident(
+                                        dptr, w_nbytes, x, out, m, k, n,
+                                    )
+                                }
+                            {
+                                return true;
+                            }
+                        }
+                        if matches!(w.dtype, Dtype::Mxfp6Raw)
+                            && k % 32 == 0
+                            && mxfp6_tc_enabled()
+                            && unsafe {
+                                try_gemm_mxfp6_tc_batched_dev_resident(
+                                    dptr, w_nbytes, x, out, m, k, n,
+                                )
+                            }
+                        {
+                            return true;
+                        }
                     }
                     // SAFETY: as above.
                     if unsafe {
