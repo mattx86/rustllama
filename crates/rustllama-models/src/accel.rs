@@ -9690,29 +9690,28 @@ pub fn try_matvec_tensor_usm_f32(
             }
         }
     }
-    // Native CUDA backend FIRST (before the SYCL-specific gates below —
-    // `usm_attn_enabled` is false on a SYCL-less NVIDIA host, so CUDA
-    // must not sit behind it). Universal gates only: placement override,
-    // the n_gpu_layers layer cutoff, shape, and the tiny-matvec floor.
-    // Inert on non-NVIDIA hosts (`cuda_active` == false). A miss falls
-    // through to the SYCL/CPU ladder.
-    if cuda_active()
-        && !tensor_forced_to_cpu(&w.name)
-        && current_layer_idx() < n_gpu_layers()
+    // MoE tiered-expert device-resident fast path (Phase 2) — lifted ABOVE the
+    // `n_gpu_layers` layer cutoff on purpose. A tensor explicitly promoted to
+    // CUDA device memory (`Storage::Device` tagged Cuda, via
+    // `LlamaWeights::promote_experts_to_device`) carries a PER-TENSOR placement
+    // decision that composes with — and overrides — the layer-granular plan: an
+    // expert of an otherwise-CPU-placed layer still runs on the GPU. That's the
+    // whole point of the device tier for MoE (gap #3). Feed the resident device
+    // pointer straight to the kernel — no `as_bytes` (which would migrate the
+    // managed pages back to host every call) and no per-call re-upload. Still
+    // honors an explicit CPU pin (`tensor_forced_to_cpu` wins) and the
+    // shape/flops floor. Inert unless something has promoted experts (the
+    // producer is CUDA-only today), so byte-identical on every non-promoted run.
+    if !tensor_forced_to_cpu(&w.name)
         && m != 0
         && k != 0
         && x.len() == k
         && out.len() == m
         && matvec_above_min_flops(2u64 * m as u64 * k as u64)
     {
-        if let Some(ck_kind) = dtype_to_cuda_kind(w.dtype) {
-            // MoE tiered-expert fast path, tried FIRST: a promoted expert whose
-            // weight already lives in CUDA device (managed) memory. Feed the
-            // device pointer straight to the kernel — no `as_bytes` (which would
-            // migrate the managed pages back to host on every call) and no
-            // per-call re-upload. A miss falls through to the uploading path.
-            if let Some((rustllama_tensor::DeviceBackend::Cuda, _dev)) = w.storage.device_backend() {
-                if let Some(dptr) = w.storage.device_ptr() {
+        if let Some((rustllama_tensor::DeviceBackend::Cuda, _dev)) = w.storage.device_backend() {
+            if let Some(dptr) = w.storage.device_ptr() {
+                if let Some(ck_kind) = dtype_to_cuda_kind(w.dtype) {
                     // SAFETY: the `Storage::Device` allocation backing `w`
                     // outlives this call; `len_bytes()` is its true length.
                     if unsafe {
@@ -9730,6 +9729,24 @@ pub fn try_matvec_tensor_usm_f32(
                     }
                 }
             }
+        }
+    }
+    // Native CUDA backend FIRST (before the SYCL-specific gates below —
+    // `usm_attn_enabled` is false on a SYCL-less NVIDIA host, so CUDA
+    // must not sit behind it). Universal gates only: placement override,
+    // the n_gpu_layers layer cutoff, shape, and the tiny-matvec floor.
+    // Inert on non-NVIDIA hosts (`cuda_active` == false). A miss falls
+    // through to the SYCL/CPU ladder.
+    if cuda_active()
+        && !tensor_forced_to_cpu(&w.name)
+        && current_layer_idx() < n_gpu_layers()
+        && m != 0
+        && k != 0
+        && x.len() == k
+        && out.len() == m
+        && matvec_above_min_flops(2u64 * m as u64 * k as u64)
+    {
+        if let Some(ck_kind) = dtype_to_cuda_kind(w.dtype) {
             let wb = as_bytes(w);
             // Q4_K decode: try the lossy W4A8 int8-activation matvec FIRST where
             // its verdict+perf gate passed (faster than the bit-exact f32 warp
