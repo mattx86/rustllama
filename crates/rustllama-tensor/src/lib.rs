@@ -74,6 +74,37 @@ impl std::fmt::Display for Device {
     }
 }
 
+/// The compute backend / residency tier a tensor's storage lives on. Unlike
+/// [`Device`] (model-placement identity, CPU/SYCL only), this tags WHERE bytes
+/// physically reside, across every backend: it labels a device-resident
+/// [`DeviceAllocation`] and classifies ANY [`Storage`] via
+/// [`Storage::residency`]. `Cpu` covers all host-RAM storage (owned / sliced /
+/// mmap-borrowed). It is the tier key the MoE tiered-expert engine promotes and
+/// demotes experts across (host RAM ↔ device VRAM/USM ↔ disk). `Copy + Eq +
+/// Hash` so it can be half of a `(expert_id, backend)` residency-cache key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeviceBackend {
+    /// Host RAM — `CpuOwned`, `CpuOwnedSlice`, or `MmapBorrowed`.
+    Cpu,
+    /// Intel SYCL device memory (USM — unified, CPU-mappable).
+    Sycl,
+    /// NVIDIA CUDA device memory (managed — CPU-mappable, migrates on access).
+    Cuda,
+    /// Apple Metal / MLX device memory (unified on Apple Silicon).
+    Mlx,
+}
+
+impl std::fmt::Display for DeviceBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cpu => write!(f, "cpu"),
+            Self::Sycl => write!(f, "sycl"),
+            Self::Cuda => write!(f, "cuda"),
+            Self::Mlx => write!(f, "mlx"),
+        }
+    }
+}
+
 /// Element type of a tensor. The quantized variants mirror `GgmlType` so a
 /// GGUF tensor maps 1:1 to a [`Tensor`].
 ///
@@ -543,6 +574,14 @@ pub enum Storage {
     /// extraction) so the migration only happens when the CPU
     /// genuinely needs to inspect the bytes (debug paths, tests).
     SyclUsm(Arc<SyclUsmAllocation>),
+    /// Backend-tagged device-resident allocation (CUDA managed, MLX unified,
+    /// or SYCL) — the generalization of `SyclUsm` that the MoE tiered-expert
+    /// engine promotes hot experts into. Carries its [`DeviceBackend`] +
+    /// device id so the tiered cache knows which tier a tensor lives on; the
+    /// GPU hot path reads [`Storage::device_ptr`], and `as_bytes` stays valid
+    /// while the memory is CPU-mappable (the Phase-1 contract). `Arc` so a
+    /// promoted expert shared across layers/call sites keeps one allocation.
+    Device(Arc<DeviceAllocation>),
 }
 
 /// Refcount-owned SYCL USM allocation. The drop closure returns the
@@ -636,6 +675,113 @@ impl std::fmt::Debug for SyclUsmAllocation {
     }
 }
 
+/// A backend-tagged device-resident allocation — the generalization of
+/// [`SyclUsmAllocation`] to CUDA (managed memory) and MLX (unified) as well as
+/// SYCL (USM). Type-erased like `SyclUsmAllocation` so the toolchain-free
+/// `rustllama-tensor` crate stays free of every kernel-crate dependency: the
+/// owning kernel crate supplies the raw pointer + a free callback at upload
+/// time (via [`Storage::device_from_raw`]).
+///
+/// The Phase-1 MoE-tiered-engine contract is **CPU-mappable device memory**
+/// (`cpu_readable == true`): USM, CUDA managed, and Apple unified are all
+/// readable from the host (migrating on access on a dedicated GPU), so
+/// [`Storage::as_bytes`] stays valid everywhere while the GPU hot path uses the
+/// raw [`Self::as_ptr`] with no migration. A future dedicated-VRAM producer may
+/// set `cpu_readable == false`; `as_bytes` then panics (dispatch-only — callers
+/// must branch on [`Storage::device_ptr`] first), an invariant the tiered cache
+/// upholds by only promoting GPU-dispatched experts.
+pub struct DeviceAllocation {
+    ptr: std::ptr::NonNull<u8>,
+    len: usize,
+    backend: DeviceBackend,
+    device_id: u32,
+    cpu_readable: bool,
+    free_fn: Option<Box<dyn FnOnce(*mut u8) + Send + Sync>>,
+}
+
+// SAFETY: as `SyclUsmAllocation` — the device runtime keeps the pointer valid
+// until the explicit free the drop callback performs, and the `Arc` wrapping
+// serializes that drop.
+unsafe impl Send for DeviceAllocation {}
+unsafe impl Sync for DeviceAllocation {}
+
+impl DeviceAllocation {
+    /// Wrap a raw device pointer + its free callback. SAFETY: `ptr` is a live
+    /// allocation of `len` bytes on `backend`/`device_id`; `free_fn` frees
+    /// exactly that pointer on exactly the right stream once, on last-Arc drop;
+    /// `cpu_readable` is true ONLY if the host can dereference `ptr` (USM /
+    /// managed / unified).
+    pub unsafe fn new_with_free(
+        ptr: *mut u8,
+        len: usize,
+        backend: DeviceBackend,
+        device_id: u32,
+        cpu_readable: bool,
+        free_fn: Box<dyn FnOnce(*mut u8) + Send + Sync>,
+    ) -> Self {
+        Self {
+            ptr: std::ptr::NonNull::new(ptr).expect("non-null device pointer"),
+            len,
+            backend,
+            device_id,
+            cpu_readable,
+            free_fn: Some(free_fn),
+        }
+    }
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn backend(&self) -> DeviceBackend {
+        self.backend
+    }
+    pub fn device_id(&self) -> u32 {
+        self.device_id
+    }
+    pub fn cpu_readable(&self) -> bool {
+        self.cpu_readable
+    }
+    /// Host view of the bytes — valid only when `cpu_readable`. SAFETY: the
+    /// allocation outlives the `Arc`; on a dedicated GPU this migrates the page
+    /// to the host on first read.
+    pub fn as_bytes(&self) -> &[u8] {
+        assert!(
+            self.cpu_readable,
+            "DeviceAllocation::as_bytes on non-CPU-mappable {} memory — use as_ptr + GPU dispatch",
+            self.backend
+        );
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for DeviceAllocation {
+    fn drop(&mut self) {
+        if let Some(free_fn) = self.free_fn.take() {
+            free_fn(self.ptr.as_ptr());
+        }
+    }
+}
+
+impl std::fmt::Debug for DeviceAllocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceAllocation")
+            .field("backend", &self.backend)
+            .field("device_id", &self.device_id)
+            .field("ptr", &self.ptr.as_ptr())
+            .field("len", &self.len)
+            .field("cpu_readable", &self.cpu_readable)
+            .finish()
+    }
+}
+
 impl Storage {
     pub fn as_bytes(&self) -> &[u8] {
         match self {
@@ -654,6 +800,7 @@ impl Storage {
                 &full[*offset..*offset + *len]
             }
             Self::SyclUsm(a) => a.as_bytes(),
+            Self::Device(a) => a.as_bytes(),
         }
     }
 
@@ -663,6 +810,7 @@ impl Storage {
             Self::CpuOwnedSlice { len, .. } => *len,
             Self::MmapBorrowed { len, .. } => *len,
             Self::SyclUsm(a) => a.len(),
+            Self::Device(a) => a.len(),
         }
     }
 
@@ -690,6 +838,9 @@ impl Storage {
                 Some((unsafe { full.as_ptr().add(*offset) }, *len))
             }
             Self::SyclUsm(_) => None,
+            // Device-resident: page-locking doesn't apply (freed via its own
+            // drop callback on the owning stream), like SyclUsm.
+            Self::Device(_) => None,
         }
     }
 
@@ -749,6 +900,71 @@ impl Storage {
         Self::SyclUsm(Arc::new(SyclUsmAllocation::new_with_free(ptr, len, free_fn)))
     }
 
+    /// Wrap an externally-allocated, backend-tagged device pointer + free
+    /// callback as a [`Storage::Device`]. The generic cross-backend form of
+    /// [`Self::sycl_usm_from_raw`], used by the MoE tiered-expert engine to
+    /// promote an expert into device memory (CUDA managed / MLX unified / SYCL).
+    ///
+    /// SAFETY: see [`DeviceAllocation::new_with_free`] — `ptr` is a live
+    /// `len`-byte allocation on `backend`/`device_id`, freed exactly once by
+    /// `free_fn` on the owning stream, and `cpu_readable` is accurate.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn device_from_raw(
+        ptr: *mut u8,
+        len: usize,
+        backend: DeviceBackend,
+        device_id: u32,
+        cpu_readable: bool,
+        free_fn: Box<dyn FnOnce(*mut u8) + Send + Sync>,
+    ) -> Self {
+        Self::Device(Arc::new(DeviceAllocation::new_with_free(
+            ptr,
+            len,
+            backend,
+            device_id,
+            cpu_readable,
+            free_fn,
+        )))
+    }
+
+    /// True if this storage is a backend-tagged device-resident allocation
+    /// ([`Storage::Device`]). (`SyclUsm` is the older SYCL-specific device
+    /// variant — see [`Self::is_sycl_usm`].)
+    pub fn is_device(&self) -> bool {
+        matches!(self, Self::Device(_))
+    }
+
+    /// Raw device pointer when this storage is a [`Storage::Device`]. The GPU
+    /// hot path reads this directly (no host copy). `None` for every other
+    /// variant (SYCL USM uses [`Self::sycl_usm_ptr`]).
+    pub fn device_ptr(&self) -> Option<*const u8> {
+        match self {
+            Self::Device(a) => Some(a.as_ptr()),
+            _ => None,
+        }
+    }
+
+    /// The backend of a [`Storage::Device`] allocation + its device id.
+    pub fn device_backend(&self) -> Option<(DeviceBackend, u32)> {
+        match self {
+            Self::Device(a) => Some((a.backend(), a.device_id())),
+            _ => None,
+        }
+    }
+
+    /// Classify ANY storage by the residency tier its bytes physically live on
+    /// — the MoE tiered-expert engine's promote/demote key. Host-RAM variants
+    /// (owned / sliced / mmap) → `Cpu`; `SyclUsm` → `Sycl`; `Device` → its tag.
+    pub fn residency(&self) -> DeviceBackend {
+        match self {
+            Self::CpuOwned(_) | Self::CpuOwnedSlice { .. } | Self::MmapBorrowed { .. } => {
+                DeviceBackend::Cpu
+            }
+            Self::SyclUsm(_) => DeviceBackend::Sycl,
+            Self::Device(a) => a.backend(),
+        }
+    }
+
     /// Construct a sub-slice view sharing the backing storage of
     /// `self`. Inherits the underlying Arc — cheap to clone, no
     /// byte copy. Panics if `offset + len` exceeds the source.
@@ -806,6 +1022,11 @@ impl Storage {
                  expert weights, KV cache pages, etc.). The SyclUsm \
                  variant is for whole-tensor uploads only."
             ),
+            Self::Device(_) => panic!(
+                "Storage::slice: device-resident storage isn't sliceable — a \
+                 device sub-allocation needs its own free path. Promote whole \
+                 per-expert tensors to the device tier, not sub-views."
+            ),
         };
         assert!(
             offset + len <= backing.len(),
@@ -841,6 +1062,7 @@ impl std::fmt::Debug for Storage {
                 .field("ptr", &a.as_ptr())
                 .field("len", &a.len())
                 .finish(),
+            Self::Device(a) => a.fmt(f),
         }
     }
 }
