@@ -126,6 +126,9 @@ extern "C" {
     // Q4_K prefill GEMM (Phase 2): int8 tensor-core W8A8 (lossy). Same shape;
     // selected via the `gemm:q4_k_w8a8_tc` verdict.
     fn rsl_cuda_gemm_q4_k_w8a8_tc(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
+    // Q4_K W4A8 DECODE matvec (single-row, lossy int8-activation). Selected via
+    // the `matvec:q4_k_w4a8` verdict (correct + perf-gated vs the f32 matvec).
+    fn rsl_cuda_matvec_q4_k_w4a8(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
     fn rsl_cuda_matvec_q6_k_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
     fn rsl_cuda_matvec_q6_k_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
 
@@ -1250,6 +1253,30 @@ pub unsafe fn gemm_q4_k_w8a8_tc(
         k as c_int,
         n as c_int,
     );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// W4A8 Q4_K DECODE matvec (single row): int8-activation dot, the lossy +
+/// perf-gated decode twin of [`gemm_q4_k_w8a8_tc`]. `out` = [M], `x` = [K], `w`
+/// = Q4_K packed [M,K].
+///
+/// # Safety
+/// `w`/`x`/`out` are device pointers on `stream`'s device sized for (M,K)/K/M;
+/// `K % 256 == 0`. The wrapper quantizes `x` to int8 internally + synchronizes.
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn matvec_q4_k_w4a8(
+    stream: &CudaStream,
+    w: *const c_void,
+    x: *const f32,
+    out: *mut f32,
+    m: usize,
+    k: usize,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_matvec_q4_k_w4a8(stream.raw(), w, x, out, m as c_int, k as c_int);
     if rc == 0 {
         Ok(())
     } else {
@@ -2587,6 +2614,52 @@ impl CudaMatvecCache {
         }
         let out_bytes: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * m * 4) };
+        self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
+
+    /// W4A8 Q4_K DECODE matvec (single row): the lossy, perf-gated int8-
+    /// activation decode twin of [`Self::gemm_packed_batched_q4k_w8a8_tc`].
+    /// `x` = [K], `out` = [M]. Returns false (caller runs the bit-exact f32
+    /// warp matvec) on bad shape / budget / kernel failure.
+    pub fn matvec_q4k_w4a8(
+        &mut self,
+        weight_key: usize,
+        w_bytes: &[u8],
+        x: &[f32],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+    ) -> bool {
+        let kind = CudaPackedKind::Q4_K;
+        if m == 0 || k == 0 || x.len() != k || out.len() != m {
+            return false;
+        }
+        if k % kind.k_alignment() != 0 || w_bytes.len() < m * kind.row_bytes(k) {
+            return false;
+        }
+        if !self.ensure_weight(weight_key, w_bytes) {
+            return false;
+        }
+        if !Self::ensure_scratch(&mut self.x_scratch, &self.stream, k * 4)
+            || !Self::ensure_scratch(&mut self.out_scratch, &self.stream, m * 4)
+        {
+            return false;
+        }
+        let x_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
+        if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
+            return false;
+        }
+        let w_ptr = self.weights[&weight_key].ptr;
+        let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
+        let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: device buffers sized (M,K)/K/M on self.stream; wrapper syncs.
+        let res = unsafe { matvec_q4_k_w4a8(&self.stream, w_ptr, x_ptr, out_ptr, m, k) };
+        if res.is_err() || consume_error_count() != 0 {
+            return false;
+        }
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, m * 4) };
         self.out_scratch.as_ref().unwrap().download(out_bytes)
     }
 

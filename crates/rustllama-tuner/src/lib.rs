@@ -206,6 +206,12 @@ pub const VERDICT_GEMM_Q4K_F32: &str = "gemm:q4_k_f32";
 /// wired onto the batched/prefill CUDA path ABOVE the bit-exact f32 GEMM (it is
 /// dispatched first). Graded by a FAIR W8A8 probe (int8 activations) + the perf gate.
 pub const VERDICT_GEMM_Q4K_W8A8_TC: &str = "gemm:q4_k_w8a8_tc";
+/// Q4_K W4A8 DECODE matvec (int8 activations, LOSSY). Backs `q4k_w4a8`, wired
+/// onto the single-row CUDA decode path ABOVE the bit-exact f32 warp matvec (it
+/// is dispatched first). Graded by a FAIR W8A8 probe (int8 activations) + the
+/// perf gate, so it auto-enables only where correct AND faster than the f32
+/// matvec. The decode twin of [`VERDICT_GEMM_Q4K_W8A8_TC`].
+pub const VERDICT_MATVEC_Q4K_W4A8: &str = "matvec:q4_k_w4a8";
 
 /// Read the on-device verdict for a kernel probe name, if one has been
 /// recorded. `None` = never validated (or the probe SKIPped because the

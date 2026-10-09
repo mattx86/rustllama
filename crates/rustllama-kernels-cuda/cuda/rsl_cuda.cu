@@ -1076,6 +1076,83 @@ extern "C" int rsl_cuda_gemm_q4_k_w8a8_tc(rsl_cuda_stream *s, const void *w,
     return rsl_cuda_check("rsl_cuda_gemm_q4_k_w8a8_tc");
 }
 
+// ============================================================
+// W4A8 Q4_K DECODE matvec — the single-row (decode) twin of the W8A8 TC GEMM.
+// Decode (N=1) can't use the 64x64 WMMA GEMM efficiently, so this is a plain
+// warp-per-row int8 matvec: activations are int8-quantized (the SAME
+// q4k_quant_act pre-pass → xq + per-sub-block scale xs + Σ xsum), and each
+// Q4_K sub-block's int dot S1 = Σ(nibble·xq) is a per-lane int multiply +
+// warp shuffle-reduce (DP4A-class int ALU, not f32 dequant-then-FMA). Folds the
+// per-row weight scale + per-token activation scale in f32 via the SAME ggml
+// identity the W8A8 GEMM uses: out[m] = Σ_sub xs·(d·sc·S1 − dmin·mn·Σxq). So it
+// is bit-identical to the W8A8 path's result (int8 dot is exact; only the
+// activation int8 rounding is lossy vs f32) → graded vs the FAIR W8A8 reference
+// + perf-gated (verdict `matvec:q4_k_w4a8`), auto-enabled only where correct AND
+// faster than the bit-exact f32 warp matvec. K % 256 == 0.
+// ============================================================
+__global__ void matvec_q4_k_w4a8_decode_kernel(const unsigned char *w,
+                                                const signed char *xq, const float *xs,
+                                                const int *xsum, float *out, int M, int K) {
+    int row = blockIdx.x * blockDim.y + threadIdx.y; // one warp per output row
+    if (row >= M) return;
+    int lane = threadIdx.x; // 0..31 — owns element `lane` of each 32-wide sub-block
+    const int bpr = K / 256; // super-blocks per row
+    const int spr = K / 32;  // sub-blocks per row
+    float acc = 0.0f;
+    for (int g = 0; g < spr; ++g) {
+        const int sbi = g >> 3; // super-block (g / 8)
+        const int s = g & 7;    // sub-block within super-block
+        const int hi = s & 1;
+        const unsigned char *blk = w + ((size_t)row * bpr + sbi) * 144;
+        unsigned char bqt = blk[16 + (s >> 1) * 32 + lane];
+        int nib = hi ? (bqt >> 4) : (bqt & 0x0F);
+        int prod = nib * (int)xq[(size_t)g * 32 + lane];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            prod += __shfl_down_sync(0xffffffffu, prod, off);
+        // lane 0 holds S1 = Σ(nibble·xq); unpack this sub-block's d*sc / dmin*mn
+        // (ggml 6-bit scale/min shuffle, identical to the W8A8 kernel) + fold.
+        if (lane == 0) {
+            float d = rsl_f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+            float dmin = rsl_f16_bits_to_f32((unsigned short)blk[2] | ((unsigned short)blk[3] << 8));
+            const unsigned char *sb = blk + 4;
+            unsigned char sc, mn;
+            if (s < 4) {
+                sc = sb[s] & 0x3F;
+                mn = sb[s + 4] & 0x3F;
+            } else {
+                sc = (sb[s + 4] & 0x0F) | ((sb[s - 4] >> 6) << 4);
+                mn = (sb[s + 4] >> 4) | ((sb[s] >> 6) << 4);
+            }
+            acc += xs[g] * (d * (float)sc * (float)prod - dmin * (float)mn * (float)xsum[g]);
+        }
+    }
+    if (lane == 0) out[row] = acc;
+}
+
+// Quant pre-pass (N=1) + the W4A8 decode matvec, reusing the persistent scratch.
+extern "C" int rsl_cuda_matvec_q4_k_w4a8(rsl_cuda_stream *s, const void *w,
+                                         const float *x, float *out, int M, int K) {
+    if (!s || !w || !x || !out || M <= 0 || K <= 0 || (K % 256) != 0)
+        return -1;
+    cudaSetDevice(s->device);
+    size_t ne = (size_t)K;        // single activation row
+    size_t nsub = (size_t)(K / 32);
+    if (rsl_q4k_ensure_scratch(s, ne, nsub, nsub) != 0)
+        return -2;
+    signed char *xq = s->q4k_act_xq;
+    float *xs = s->q4k_act_xs;
+    int *xsum = s->q4k_xsum;
+    dim3 qb(32, 8);
+    dim3 qg((unsigned)((ne / 32 + 7) / 8));
+    q4k_quant_act_kernel<<<qg, qb, 0, s->stream>>>(x, xq, xs, xsum, (int)ne);
+    dim3 block(32, 8);
+    dim3 grid((unsigned)((M + 7) / 8));
+    matvec_q4_k_w4a8_decode_kernel<<<grid, block, 0, s->stream>>>(
+        (const unsigned char *)w, xq, xs, xsum, out, M, K);
+    return rsl_cuda_check("rsl_cuda_matvec_q4_k_w4a8");
+}
+
 // IQ4_NL / IQ4_XS 16-entry non-linear codebook (ggml kvalues_iq4nl).
 // Read-only device global (divergent index -> global/L2 beats __constant__).
 __device__ const signed char RSL_KVALUES_IQ4NL[16] = {
