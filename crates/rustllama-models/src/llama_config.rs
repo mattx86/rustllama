@@ -167,6 +167,33 @@ pub struct MoeConfig {
     pub n_experts_shared: u32,
 }
 
+/// Derive the routed-expert FFN width from the combined `blk.0.ffn_gate_exps`
+/// tensor, for MoE GGUFs that omit `{arch}.expert_feed_forward_length` (some
+/// Qwen1.5/Qwen2-MoE converters do, and some store it under a non-`u32` int the
+/// metadata lookup misses). The tensor holds `n_experts` matrices of
+/// `[expert_ff, d_model]`, so `expert_ff = element_count / (n_experts *
+/// d_model)` — authoritative, and robust to GGUF dim ordering since it uses the
+/// total element count. Without this the dense `feed_forward_length` fallback
+/// (which is several× larger on models with asymmetric routed/shared FFN) makes
+/// every per-expert slice offset overflow its backing (`Storage::slice` panic).
+/// Returns `None` when the tensor is absent or the count doesn't divide evenly
+/// — never forces a wrong width (the caller then falls back to the dense key).
+fn derive_expert_ff_from_gate_exps(
+    gguf: &Gguf,
+    n_experts: usize,
+    d_model: usize,
+) -> Option<usize> {
+    if n_experts == 0 || d_model == 0 {
+        return None;
+    }
+    let total = gguf.tensor("blk.0.ffn_gate_exps.weight")?.element_count() as usize;
+    let denom = n_experts * d_model;
+    if denom == 0 || total == 0 || total % denom != 0 {
+        return None;
+    }
+    Some(total / denom)
+}
+
 impl LlamaConfig {
     pub fn from_gguf(gguf: &Gguf) -> Result<Self, ConfigError> {
         let arch = gguf
@@ -185,11 +212,18 @@ impl LlamaConfig {
         // makes the per-expert tensor slicing offset garbage. So
         // prefer the MoE-specific key when ANY expert metadata is
         // present, and fall through to dense otherwise.
-        let has_moe_meta = u32_optional(gguf, &key("expert_count")).unwrap_or(0) > 0;
+        let n_experts_meta = u32_optional(gguf, &key("expert_count")).unwrap_or(0) as usize;
+        let has_moe_meta = n_experts_meta > 0;
         let d_ff = if has_moe_meta {
+            // Prefer the explicit MoE key; if it's absent (or a non-u32 int the
+            // lookup misses), DERIVE the routed-expert FFN width from the actual
+            // ffn_gate_exps tensor — the dense `feed_forward_length` is the WRONG
+            // (larger) width on asymmetric MoE models and overflows the slices.
             u32_optional(gguf, &key("expert_feed_forward_length"))
-                .or_else(|| u32_optional(gguf, &key("feed_forward_length")))
-                .ok_or(ConfigError::Missing("expert_feed_forward_length"))? as usize
+                .map(|v| v as usize)
+                .or_else(|| derive_expert_ff_from_gate_exps(gguf, n_experts_meta, d_model))
+                .or_else(|| u32_optional(gguf, &key("feed_forward_length")).map(|v| v as usize))
+                .ok_or(ConfigError::Missing("expert_feed_forward_length"))?
         } else {
             u32_optional(gguf, &key("feed_forward_length"))
                 .or_else(|| u32_optional(gguf, &key("expert_feed_forward_length")))
