@@ -2391,15 +2391,17 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
     let mut counts: std::collections::BTreeMap<&'static str, usize> = Default::default();
 
     // ---- Packed matvecs the CUDA backend implements ----
-    // All 17 packed formats SYCL + Metal grade — CUDA ships + dispatches the
-    // same set, so grade them all here too. Previously only the first 7 ran,
-    // leaving q5_k + the IQ grid/codebook dequants (historically the trickiest,
-    // and write-blind) UNCHECKED on CUDA. K constraints (ptq1_0 %128, q8_0 %32,
-    // the rest %256 or %32) are all satisfied by MV_K=2048.
+    // All 25 packed formats SYCL grades — CUDA ships + dispatches the same set,
+    // so grade them all here too (was 17, then the first 7 before that). The
+    // final 8 (q4_0/q5_0/q4_1/q5_1/q2_k/q3_k/q8_k/pq2_0) were graded on SYCL but
+    // not CUDA; now CUDA matches SYCL format-for-format, single-row AND batched.
+    // K constraints (ptq1_0 %128, q8_0/q4_0/q5_0/q4_1/q5_1 %32, the K-quants
+    // %256) are all satisfied by MV_K=2048.
     for dtype in [
         "ptq1_0", "q8_0", "q4_k", "q6_k", "mxfp4", "mxfp6", "mxfp8", "q5_k",
         "iq4_nl", "iq4_xs", "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs", "iq2_s",
-        "iq3_xxs", "iq3_s",
+        "iq3_xxs", "iq3_s", "q4_0", "q5_0", "q4_1", "q5_1", "q2_k", "q3_k",
+        "q8_k", "pq2_0",
     ] {
         let name = format!("matvec:{dtype}");
         let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
@@ -2442,6 +2444,14 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 "iq2_s" => ck::matvec_iq2_s_packed_f32(&stream, w, x, o, MV_M, MV_K),
                 "iq3_xxs" => ck::matvec_iq3_xxs_packed_f32(&stream, w, x, o, MV_M, MV_K),
                 "iq3_s" => ck::matvec_iq3_s_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "q4_0" => ck::matvec_q4_0_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "q5_0" => ck::matvec_q5_0_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "q4_1" => ck::matvec_q4_1_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "q5_1" => ck::matvec_q5_1_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "q2_k" => ck::matvec_q2_k_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "q3_k" => ck::matvec_q3_k_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "q8_k" => ck::matvec_q8_k_packed_f32(&stream, w, x, o, MV_M, MV_K),
+                "pq2_0" => ck::matvec_pq2_0_packed_f32(&stream, w, x, o, MV_M, MV_K),
                 _ => unreachable!(),
             }
         };
@@ -2472,7 +2482,8 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
     for dtype in [
         "ptq1_0", "q8_0", "q4_k", "q6_k", "mxfp4", "mxfp6", "mxfp8", "q5_k",
         "iq4_nl", "iq4_xs", "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs", "iq2_s",
-        "iq3_xxs", "iq3_s",
+        "iq3_xxs", "iq3_s", "q4_0", "q5_0", "q4_1", "q5_1", "q2_k", "q3_k",
+        "q8_k", "pq2_0",
     ] {
         let name = format!("matvecb:{dtype}");
         let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
@@ -2533,6 +2544,14 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 "iq2_s" => ck::matvec_iq2_s_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
                 "iq3_xxs" => ck::matvec_iq3_xxs_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
                 "iq3_s" => ck::matvec_iq3_s_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "q4_0" => ck::matvec_q4_0_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "q5_0" => ck::matvec_q5_0_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "q4_1" => ck::matvec_q4_1_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "q5_1" => ck::matvec_q5_1_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "q2_k" => ck::matvec_q2_k_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "q3_k" => ck::matvec_q3_k_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "q8_k" => ck::matvec_q8_k_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "pq2_0" => ck::matvec_pq2_0_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
                 _ => unreachable!(),
             }
         };
