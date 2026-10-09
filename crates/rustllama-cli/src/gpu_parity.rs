@@ -2461,6 +2461,97 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- Batched (prefill) packed matvecs ----
+    // The CUDA batched kernels (`matvec_<fmt>_packed_f32_batched`, the N-lifted
+    // prefill twins) run during prefill for every non-Q4_K format (and Q4_K
+    // when the GEMM gate doesn't hold) but were NEVER graded — the matvec loop
+    // above only exercises the single-row kernels, and the SYCL `matvecb:` probe
+    // is SYCL-only. Grade the same 17 formats batched here: [N,M] GPU output vs
+    // the CPU reference run per-row. (Q4_K's prefill GEMM is graded separately as
+    // `gemm:q4_k_f32`; this grades the generic batched matvec path.)
+    for dtype in [
+        "ptq1_0", "q8_0", "q4_k", "q6_k", "mxfp4", "mxfp6", "mxfp8", "q5_k",
+        "iq4_nl", "iq4_xs", "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs", "iq2_s",
+        "iq3_xxs", "iq3_s",
+    ] {
+        let name = format!("matvecb:{dtype}");
+        let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
+        let cpu = cpu_matvec_for(dtype);
+        let x = gen_x(MV_N * MV_K, 42);
+        // Pick a weight whose row-0 CPU output is finite, then run the CPU
+        // reference for all N rows (mirrors the SYCL batched probe).
+        let Some((w, _)) = finite_ref(layout, cpu, &x[0..MV_K]) else {
+            cu_emit(&name, "SKIP", "no-finite-reference");
+            *counts.entry("SKIP").or_default() += 1;
+            continue;
+        };
+        let mut cpu_out = vec![0f32; MV_N * MV_M];
+        for row in 0..MV_N {
+            cpu(
+                &w,
+                &x[row * MV_K..(row + 1) * MV_K],
+                &mut cpu_out[row * MV_M..(row + 1) * MV_M],
+                MV_M,
+                MV_K,
+            );
+        }
+        if !cpu_out.iter().all(|v| v.is_finite()) {
+            cu_emit(&name, "SKIP", "no-finite-reference");
+            *counts.entry("SKIP").or_default() += 1;
+            continue;
+        }
+        let (Some(wb), Some(xb), Some(mut ob)) = (
+            ck::CudaDeviceBuffer::from_host(&stream, &w),
+            cu_upload_f32(&stream, &x),
+            ck::CudaDeviceBuffer::alloc(&stream, MV_N * MV_M * 4),
+        ) else {
+            cu_emit(&name, "KERNEL_ERR", "device-alloc-failed");
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+            continue;
+        };
+        // SAFETY: w (M,K), x (N,K), o (N,M) are live device buffers on `stream`;
+        // each batched wrapper derives extents from (M,K,N) and synchronizes.
+        let res = unsafe {
+            let w = wb.as_ptr();
+            let x = xb.as_ptr() as *const f32;
+            let o = ob.as_mut_ptr() as *mut f32;
+            match dtype {
+                "ptq1_0" => ck::matvec_ptq1_0_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "q8_0" => ck::matvec_q8_0_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "q4_k" => ck::matvec_q4_k_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "q6_k" => ck::matvec_q6_k_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "mxfp4" => ck::matvec_mxfp4_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "mxfp6" => ck::matvec_mxfp6_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "mxfp8" => ck::matvec_mxfp8_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "q5_k" => ck::matvec_q5_k_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "iq4_nl" => ck::matvec_iq4_nl_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "iq4_xs" => ck::matvec_iq4_xs_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "iq1_s" => ck::matvec_iq1_s_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "iq1_m" => ck::matvec_iq1_m_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "iq2_xxs" => ck::matvec_iq2_xxs_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "iq2_xs" => ck::matvec_iq2_xs_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "iq2_s" => ck::matvec_iq2_s_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "iq3_xxs" => ck::matvec_iq3_xxs_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "iq3_s" => ck::matvec_iq3_s_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                _ => unreachable!(),
+            }
+        };
+        match res {
+            Err(e) => {
+                cu_emit(&name, "KERNEL_ERR", &format!("{e}"));
+                *counts.entry("KERNEL_ERR").or_default() += 1;
+            }
+            Ok(()) => cu_grade(
+                &name,
+                &cu_download_f32(&ob, MV_N * MV_M),
+                &cpu_out,
+                0.999,
+                0.02,
+                &mut counts,
+            ),
+        }
+    }
+
     // ---- Fused gate+up matvec (decode) ----
     // One launch computes gate_out + up_out, reusing each format's row_dot — so
     // bit-exact to the single matvec. Grades the concatenated [gate; up] output
@@ -3898,6 +3989,56 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
             cu_grade(&name, &out, &cpu_out, 0.999, 0.02, &mut counts);
         } else {
             cu_emit(&name, "KERNEL_ERR", "matvec_packed returned false");
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+        }
+    }
+
+    // ---- Batched (prefill) packed matvecs ----
+    // MLX twin of the CUDA/SYCL `matvecb:` probe: the N-lifted prefill kernels
+    // (`MlxMatvecCache::matvec_packed_batched`) run during prefill but were
+    // ungraded. Grade [N,M] GPU output vs the CPU reference run per-row.
+    for layout in LAYOUTS {
+        let Some(kind) = mlx_kind_for(layout.name) else {
+            continue;
+        };
+        let name = format!("matvecb:{}", layout.name);
+        let cpu = cpu_matvec_for(layout.name);
+        let x = gen_x(MV_N * MV_K, 42);
+        let Some((w, _)) = finite_ref(layout, cpu, &x[0..MV_K]) else {
+            cu_emit(&name, "SKIP", "no-finite-reference");
+            *counts.entry("SKIP").or_default() += 1;
+            continue;
+        };
+        let mut cpu_out = vec![0f32; MV_N * MV_M];
+        for row in 0..MV_N {
+            cpu(
+                &w,
+                &x[row * MV_K..(row + 1) * MV_K],
+                &mut cpu_out[row * MV_M..(row + 1) * MV_M],
+                MV_M,
+                MV_K,
+            );
+        }
+        if !cpu_out.iter().all(|v| v.is_finite()) {
+            cu_emit(&name, "SKIP", "no-finite-reference");
+            *counts.entry("SKIP").or_default() += 1;
+            continue;
+        }
+        let mut out = vec![0f32; MV_N * MV_M];
+        let ok = cache.matvec_packed_batched(
+            kind,
+            w.as_ptr() as usize,
+            &w,
+            &x,
+            &mut out,
+            MV_M,
+            MV_K,
+            MV_N,
+        );
+        if ok {
+            cu_grade(&name, &out, &cpu_out, 0.999, 0.02, &mut counts);
+        } else {
+            cu_emit(&name, "KERNEL_ERR", "matvec_packed_batched returned false");
             *counts.entry("KERNEL_ERR").or_default() += 1;
         }
     }
