@@ -126,14 +126,12 @@ fn dtype_to_cuda_kind(dtype: Dtype) -> Option<ck::CudaPackedKind> {
         Dtype::IQ2_XXSRaw => Some(ck::CudaPackedKind::Iq2_Xxs),
         Dtype::IQ2_XSRaw => Some(ck::CudaPackedKind::Iq2_Xs),
         Dtype::IQ2_SRaw => Some(ck::CudaPackedKind::Iq2_S),
-        // IQ3_XXS gated OFF the CUDA path (fail-safe → SYCL/CPU, both correct):
-        // the CUDA iq3_xxs matvec miscomputes on-device (`doctor --cuda-parity`
-        // cos~0.97) even though its arithmetic + grid/sign tables are
-        // byte-identical to the CPU/AVX2/AVX512/SYCL references (all pass
-        // parity). Root cause is a device-specific defect still under
-        // investigation (the probe dumps per-weight divergence to pinpoint it);
-        // until fixed, route iq3_xxs off CUDA so no wrong output ships.
-        Dtype::IQ3_XXSRaw => None,
+        // IQ3_XXS re-enabled: the miscompute was the grid-byte `(signed char)`
+        // cast flipping grid values ≥ 128 (e.g. IQ3XXS_GRID[170]=0x1c3e14ac,
+        // byte0=0xAC); the CPU/SYCL read them unsigned (ggml uint8). Fixed in
+        // rsl_cuda.cu (all IQ grid-byte casts → unsigned char). The
+        // `iq3_xxs:perweight` probe pinpointed it (grid index 170, gpu≈−cpu/2).
+        Dtype::IQ3_XXSRaw => Some(ck::CudaPackedKind::Iq3_Xxs),
         Dtype::IQ3_SRaw => Some(ck::CudaPackedKind::Iq3_S),
         Dtype::IQ1_SRaw => Some(ck::CudaPackedKind::Iq1_S),
         Dtype::IQ1_MRaw => Some(ck::CudaPackedKind::Iq1_M),

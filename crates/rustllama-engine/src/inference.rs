@@ -1460,6 +1460,19 @@ impl CpuEngine {
                     .unwrap_or(0)
             };
             let vram_expert_bytes = requested.min(host_cap);
+            if requested > 0 && vram_expert_bytes == 0 {
+                // Requested but clamped to nothing — almost always the host-RAM
+                // cap on a box where the model barely fits RAM (managed memory
+                // doubles the promoted bytes). Log it so a "tier didn't engage"
+                // run is self-explanatory rather than silent.
+                tracing::warn!(
+                    requested_mb = requested / (1024 * 1024),
+                    host_cap_mb = host_cap / (1024 * 1024),
+                    "moe tiered-expert: promotion skipped — budget clamped to 0 by \
+                     available host RAM (managed memory is host-backed; free more \
+                     RAM or use a larger-RAM host to promote experts)"
+                );
+            }
             if vram_expert_bytes > 0 {
                 // Usage ranking (hottest-first) from the persisted per-model
                 // sidecar, so a tight budget buys the most-routed experts. Cold

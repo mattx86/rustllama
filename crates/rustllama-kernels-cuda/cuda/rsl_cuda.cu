@@ -1500,7 +1500,7 @@ __device__ __forceinline__ float iq2_xxs_row_dot(const unsigned char *row,
                 unsigned char signs = rsl::KSIGNS_IQ2XS_CUDA[(aux1 >> (7 * l)) & 127u];
                 int x_off = x_base + ib32 * 32 + l * 8;
                 for (int j = 0; j < 8; ++j) {
-                    signed char gj = (signed char)((g >> (j * 8)) & 0xFFu);
+                    unsigned char gj = (unsigned char)((g >> (j * 8)) & 0xFFu);
                     float s = (signs & rsl::KMASK_IQ2XS_CUDA[j]) ? -1.0f : 1.0f;
                     acc += db * (float)gj * s * x[x_off + j];
                 }
@@ -1536,7 +1536,7 @@ __device__ __forceinline__ float iq2_xs_row_dot(const unsigned char *row,
                 float db = (l < 2) ? db_lo : db_hi;
                 int x_off = x_base + ib32 * 32 + l * 8;
                 for (int j = 0; j < 8; ++j) {
-                    signed char gj = (signed char)((g >> (j * 8)) & 0xFFu);
+                    unsigned char gj = (unsigned char)((g >> (j * 8)) & 0xFFu);
                     float s = (signs & rsl::KMASK_IQ2XS_CUDA[j]) ? -1.0f : 1.0f;
                     acc += db * (float)gj * s * x[x_off + j];
                 }
@@ -1574,7 +1574,7 @@ __device__ __forceinline__ float iq2_s_row_dot(const unsigned char *row,
                 float db = (l < 2) ? db_lo : db_hi;
                 int x_off = x_base + ib32 * 32 + l * 8;
                 for (int j = 0; j < 8; ++j) {
-                    signed char gj = (signed char)((g >> (j * 8)) & 0xFFu);
+                    unsigned char gj = (unsigned char)((g >> (j * 8)) & 0xFFu);
                     float s = (sign_byte & rsl::KMASK_IQ2XS_CUDA[j]) ? -1.0f : 1.0f;
                     acc += db * (float)gj * s * x[x_off + j];
                 }
@@ -1610,8 +1610,8 @@ __device__ __forceinline__ float iq3_xxs_row_dot(const unsigned char *row,
                 unsigned char signs = rsl::KSIGNS_IQ2XS_CUDA[(aux32 >> (7 * l)) & 127u];
                 int x_off = x_base + ib32 * 32 + l * 8;
                 for (int j = 0; j < 4; ++j) {
-                    signed char g1j = (signed char)((g1 >> (j * 8)) & 0xFFu);
-                    signed char g2j = (signed char)((g2 >> (j * 8)) & 0xFFu);
+                    unsigned char g1j = (unsigned char)((g1 >> (j * 8)) & 0xFFu);
+                    unsigned char g2j = (unsigned char)((g2 >> (j * 8)) & 0xFFu);
                     float s_lo = (signs & rsl::KMASK_IQ2XS_CUDA[j]) ? -1.0f : 1.0f;
                     float s_hi = (signs & rsl::KMASK_IQ2XS_CUDA[j + 4]) ? -1.0f : 1.0f;
                     acc += db * (float)g1j * s_lo * x[x_off + j];
@@ -1657,8 +1657,8 @@ __device__ __forceinline__ float iq3_s_row_dot(const unsigned char *row,
                 unsigned char sign_byte = signs[signs_cur + l];
                 int xl = x_off1 + l * 8;
                 for (int j = 0; j < 4; ++j) {
-                    signed char g1j = (signed char)((g1 >> (j * 8)) & 0xFFu);
-                    signed char g2j = (signed char)((g2 >> (j * 8)) & 0xFFu);
+                    unsigned char g1j = (unsigned char)((g1 >> (j * 8)) & 0xFFu);
+                    unsigned char g2j = (unsigned char)((g2 >> (j * 8)) & 0xFFu);
                     float s_lo = (sign_byte & rsl::KMASK_IQ2XS_CUDA[j]) ? -1.0f : 1.0f;
                     float s_hi = (sign_byte & rsl::KMASK_IQ2XS_CUDA[j + 4]) ? -1.0f : 1.0f;
                     acc += db1 * (float)g1j * s_lo * x[xl + j];
@@ -1676,8 +1676,8 @@ __device__ __forceinline__ float iq3_s_row_dot(const unsigned char *row,
                 unsigned char sign_byte = signs[signs_cur + l];
                 int xl = x_off2 + l * 8;
                 for (int j = 0; j < 4; ++j) {
-                    signed char g1j = (signed char)((g1 >> (j * 8)) & 0xFFu);
-                    signed char g2j = (signed char)((g2 >> (j * 8)) & 0xFFu);
+                    unsigned char g1j = (unsigned char)((g1 >> (j * 8)) & 0xFFu);
+                    unsigned char g2j = (unsigned char)((g2 >> (j * 8)) & 0xFFu);
                     float s_lo = (sign_byte & rsl::KMASK_IQ2XS_CUDA[j]) ? -1.0f : 1.0f;
                     float s_hi = (sign_byte & rsl::KMASK_IQ2XS_CUDA[j + 4]) ? -1.0f : 1.0f;
                     acc += db2 * (float)g1j * s_lo * x[xl + j];
@@ -1713,7 +1713,7 @@ __device__ __forceinline__ float iq1_s_row_dot(const unsigned char *row,
                 unsigned int idx = (unsigned)qs[4 * ib32 + l] | (((qh >> (3 * l)) & 7u) << 8);
                 unsigned long long g = rsl::IQ1S_GRID_CUDA[idx];
                 for (int j = 0; j < 8; ++j) {
-                    signed char gj = (signed char)((g >> (j * 8)) & 0xFFu);
+                    unsigned char gj = (unsigned char)((g >> (j * 8)) & 0xFFu);
                     acc += dl * ((float)gj + delta) * x[x_off + 8 * l + j];
                 }
             }
@@ -1771,7 +1771,7 @@ __device__ __forceinline__ float iq1_m_row_dot(const unsigned char *row,
                 float dl = dls[l];
                 float delta_val = deltas[l];
                 for (int j = 0; j < 8; ++j) {
-                    signed char gj = (signed char)((g >> (j * 8)) & 0xFFu);
+                    unsigned char gj = (unsigned char)((g >> (j * 8)) & 0xFFu);
                     acc += dl * ((float)gj + delta_val) * x[x_off + 8 * l + j];
                 }
             }
