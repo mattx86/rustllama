@@ -1201,6 +1201,50 @@ impl LlamaWeights {
         true
     }
 
+    /// Byte split for the MoE VRAM-budget projection (Phase 4): `(expert_bytes,
+    /// non_expert_bytes)`.
+    ///
+    /// `expert_bytes` is the total of the per-expert gate/up/down weight views —
+    /// exactly the bytes [`Self::promote_experts_to_device`] can move to the
+    /// device, so it caps the budget. (The parent `w_*_exps` tensors they view
+    /// stay in host RAM and are NOT counted — they never go to VRAM.)
+    ///
+    /// `non_expert_bytes` is everything else that normal layer placement can put
+    /// in VRAM — token embeddings, LM head, and per-block attention
+    /// (`w_q/k/v/o`), router, and shared-expert projections. The tiny `Vec<f32>`
+    /// norms are omitted (negligible). The auto budget reserves this (assuming it
+    /// is all GPU-resident — conservative) plus a margin, and gives the rest to
+    /// experts. Non-MoE models report `(0, …)`.
+    pub fn vram_byte_breakdown(&self) -> (u64, u64) {
+        let b = |t: &Tensor| t.storage.len_bytes() as u64;
+        let mut expert = 0u64;
+        let mut non_expert = b(&self.token_embd);
+        if let Some(out) = self.output.as_ref() {
+            non_expert += b(out);
+        }
+        if let Some(blocks) = self.moe_blocks.as_ref() {
+            for blk in blocks {
+                non_expert += b(&blk.w_q) + b(&blk.w_k) + b(&blk.w_v) + b(&blk.w_o) + b(&blk.router);
+                for sh in [&blk.w_gate_shared, &blk.w_up_shared, &blk.w_down_shared]
+                    .into_iter()
+                    .flatten()
+                {
+                    non_expert += b(sh);
+                }
+                for e in &blk.gate_per_expert {
+                    expert += b(e);
+                }
+                for e in &blk.up_per_expert {
+                    expert += b(e);
+                }
+                for e in &blk.down_per_expert {
+                    expert += b(e);
+                }
+            }
+        }
+        (expert, non_expert)
+    }
+
     pub fn from_gguf(gguf: &Gguf, cfg: &LlamaConfig) -> Result<Self, LlamaLoadError> {
         let token_embd = load_weight(gguf, "token_embd.weight")?;
 

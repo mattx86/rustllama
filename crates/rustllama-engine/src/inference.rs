@@ -1410,26 +1410,44 @@ impl CpuEngine {
                 );
             }
         }
-        // MoE tiered-expert engine (Phase 2 trigger): opt-in, default-off.
-        // With `RUSTLLAMA_MOE_VRAM_EXPERT_MB` set (>0) and a CUDA GPU active,
-        // promote that many MB of experts into CUDA device (managed) memory so
-        // they run GPU-resident regardless of the `n_gpu_layers` layer cutoff
-        // (the lifted dispatch in `accel.rs`). Must happen HERE — `model` is
-        // still uniquely owned (before the `Arc`), and before `lock_model_into_ram`
-        // (which skips `Storage::Device` via `cpu_backing_ptr_len` → `None`, so
-        // promoted experts are never VirtualLock'd). Safe-by-construction:
-        // managed memory oversubscribes to host-paged UVM instead of hard-OOMing,
-        // and a failed promotion keeps the CPU bytes, so an over-large budget
-        // degrades to "slower", never a crash or a wrong answer — the budget is
-        // the pod-tunable lever. Inert unless the env is set (default-off,
-        // matching the other additive perf/memory features). Device-tier benefit
-        // is on dedicated-VRAM GPUs; it is write-blind here (unified-memory box).
+        // MoE tiered-expert engine (Phase 2/4 trigger): opt-in, default-off.
+        // `RUSTLLAMA_MOE_VRAM_EXPERT_MB` on a CUDA box with a MoE model promotes
+        // experts into CUDA device (managed) memory so they run GPU-resident
+        // regardless of the `n_gpu_layers` layer cutoff (the lifted dispatch in
+        // `accel.rs`). The value is either a manual MB budget, or `auto` for the
+        // Phase-4 projection (free VRAM at load − non-expert weights − margin).
+        // Must happen HERE — `model` is still uniquely owned (before the `Arc`),
+        // and before `lock_model_into_ram` (which skips `Storage::Device` via
+        // `cpu_backing_ptr_len` → `None`, so promoted experts are never
+        // VirtualLock'd). Safe-by-construction: managed memory oversubscribes to
+        // host-paged UVM instead of hard-OOMing, and a failed promotion keeps the
+        // CPU bytes, so an over-large budget degrades to "slower", never a crash
+        // or a wrong answer — the budget/margin is the pod-tunable lever. Inert
+        // unless the env is set (default-off). Device-tier benefit is on
+        // dedicated-VRAM GPUs; write-blind here (unified-memory box).
         if rustllama_models::accel::cuda_active() && model.weights.is_moe() {
-            let vram_expert_bytes = std::env::var("RUSTLLAMA_MOE_VRAM_EXPERT_MB")
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .map(|mb| mb.saturating_mul(1024 * 1024))
-                .unwrap_or(0);
+            let raw = std::env::var("RUSTLLAMA_MOE_VRAM_EXPERT_MB").unwrap_or_default();
+            let raw = raw.trim();
+            let vram_expert_bytes: u64 = if raw.eq_ignore_ascii_case("auto") {
+                // Projected budget: free VRAM at load (weights upload lazily, so
+                // ~nothing is resident yet) − the non-expert weights (assumed all
+                // GPU-resident, conservative) − a margin for the CUDA context, KV
+                // cache, and fragmentation; capped at the total expert bytes.
+                let (expert_b, non_expert_b) = model.weights.vram_byte_breakdown();
+                let avail =
+                    rustllama_runtime::gpu_detect::nvidia_free_vram_bytes(0).unwrap_or(0);
+                let margin = (avail / 5).max(1024 * 1024 * 1024); // 20% or 1 GiB
+                avail
+                    .saturating_sub(non_expert_b)
+                    .saturating_sub(margin)
+                    .min(expert_b)
+            } else {
+                // Manual MB budget (0 / unset / unparseable ⇒ off).
+                raw.parse::<u64>()
+                    .ok()
+                    .map(|mb| mb.saturating_mul(1024 * 1024))
+                    .unwrap_or(0)
+            };
             if vram_expert_bytes > 0 {
                 // Usage ranking (hottest-first) from the persisted per-model
                 // sidecar, so a tight budget buys the most-routed experts. Cold
