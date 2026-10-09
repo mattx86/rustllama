@@ -2471,27 +2471,32 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
-    // ---- iq3_xxs per-weight divergence diagnostic ----
+    // ---- iq3_xxs per-weight divergence diagnostic (multi-block) ----
     // iq3_xxs miscomputes on-device though its arithmetic matches the CPU/SYCL
-    // reference exactly. A whole-row matvec only says "row m is wrong", not
-    // which weight. So probe ONE block (M=1, K=256) with unit-vector inputs:
-    // x = e_j ⇒ out[0] = weight j. Dump the first divergent weights with their
-    // decoded position (ib32 / l / grid1-or-2 / byte) so the failing pattern is
-    // obvious (e.g. "all byte==3" or "all g2"). CPU ref via the same path the
-    // matvec probe uses. Pinpoints the kernel defect for a real fix.
+    // reference. A single-block (K=256) sweep MATCHES, but the full matvec
+    // (K=2048, 8 blocks/row) diverges — so the defect is multi-block (per-block
+    // byte / x offset, or weight-value-dependent). Probe M=1, K=2048 with
+    // unit-vector inputs x=e_j ⇒ out[0] = weight j; the weight spans 8 blocks,
+    // each with d=f16(1.0) and per-block-varied grid/sign bytes. Dump the first
+    // divergent weights with their decoded (block / ib32 / l / grid1-or-2 /
+    // byte) so the pattern is obvious (e.g. "only block≥1" = an offset bug, or
+    // "specific grid index" = a value bug). CPU ref via the matvec probe's path.
     {
         let name = "iq3_xxs:perweight";
         let cpu = cpu_matvec_for("iq3_xxs");
-        // One deterministic, finite iq3_xxs block (98 B): d=f16(1.0), varied
-        // grid indices + scale/sign words so the sweep exercises many entries.
-        let mut w = vec![0u8; 98];
-        w[0] = 0x00;
-        w[1] = 0x3c; // 0x3c00 = f16 1.0
-        for i in 0..64 {
-            w[2 + i] = ((i * 7 + 3) & 0xff) as u8;
-        }
-        for i in 0..32 {
-            w[66 + i] = ((i * 13 + 5) & 0xff) as u8;
+        const NB: usize = 8; // blocks per row
+        const K: usize = NB * 256; // 2048
+        let mut w = vec![0u8; NB * 98];
+        for b in 0..NB {
+            let o = b * 98;
+            w[o] = 0x00;
+            w[o + 1] = 0x3c; // f16 1.0
+            for i in 0..64 {
+                w[o + 2 + i] = ((b * 31 + i * 7 + 3) & 0xff) as u8;
+            }
+            for i in 0..32 {
+                w[o + 66 + i] = ((b * 17 + i * 13 + 5) & 0xff) as u8;
+            }
         }
         match (
             ck::CudaDeviceBuffer::from_host(&stream, &w),
@@ -2499,11 +2504,11 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         ) {
             (Some(wb), Some(mut ob)) => {
                 let mut diverged: Vec<(usize, f32, f32)> = Vec::new();
-                for j in 0..256usize {
-                    let mut xj = vec![0f32; 256];
+                for j in 0..K {
+                    let mut xj = vec![0f32; K];
                     xj[j] = 1.0;
                     let mut cpu_out = [0f32; 1];
-                    cpu(&w, &xj, &mut cpu_out, 1, 256);
+                    cpu(&w, &xj, &mut cpu_out, 1, K);
                     let Some(xb) = cu_upload_f32(&stream, &xj) else {
                         continue;
                     };
@@ -2514,7 +2519,7 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                             xb.as_ptr() as *const f32,
                             ob.as_mut_ptr() as *mut f32,
                             1,
-                            256,
+                            K,
                         )
                     };
                     if ok.is_err() {
@@ -2528,24 +2533,35 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                     }
                 }
                 if diverged.is_empty() {
-                    cu_emit(name, "OK", "all 256 weights match (single block)");
+                    cu_emit(name, "OK", &format!("all {K} weights match ({NB} blocks)"));
                     *counts.entry("OK").or_default() += 1;
                 } else {
+                    // Per-block divergence histogram so "only block≥1" is obvious.
+                    let mut per_block = [0usize; NB];
+                    for &(j, _, _) in &diverged {
+                        per_block[j / 256] += 1;
+                    }
                     cu_emit(
                         name,
                         "MISCOMPUTE",
-                        &format!("{} / 256 weights diverge (single block)", diverged.len()),
+                        &format!(
+                            "{} / {K} weights diverge; per-block {:?}",
+                            diverged.len(),
+                            per_block
+                        ),
                     );
                     *counts.entry("MISCOMPUTE").or_default() += 1;
                     for &(j, c, g) in diverged.iter().take(24) {
-                        let ib32 = j / 32;
-                        let p = j % 32;
-                        let l = p / 8;
-                        let pl = p % 8;
+                        let blk = j / 256;
+                        let p = j % 256;
+                        let ib32 = p / 32;
+                        let pp = p % 32;
+                        let l = pp / 8;
+                        let pl = pp % 8;
                         let which = if pl < 4 { "g1" } else { "g2" };
                         let byte = pl % 4;
                         println!(
-                            "      w[{j:>3}] cpu={c:+.4} gpu={g:+.4}  (ib32={ib32} l={l} {which} byte={byte})"
+                            "      w[{j:>4}] cpu={c:+.4} gpu={g:+.4}  (blk={blk} ib32={ib32} l={l} {which} byte={byte})"
                         );
                     }
                 }

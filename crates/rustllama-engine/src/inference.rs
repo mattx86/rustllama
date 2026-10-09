@@ -1428,7 +1428,18 @@ impl CpuEngine {
         if rustllama_models::accel::cuda_active() && model.weights.is_moe() {
             let raw = std::env::var("RUSTLLAMA_MOE_VRAM_EXPERT_MB").unwrap_or_default();
             let raw = raw.trim();
-            let vram_expert_bytes: u64 = if raw.eq_ignore_ascii_case("auto") {
+            // CUDA managed memory is HOST-BACKED: promoting X bytes commits X
+            // bytes of host RAM ON TOP of the already-loaded model (the parent
+            // `*_exps` tensors stay resident). On a large model that doubles the
+            // expert RAM and OOM-kills the process mid-promotion (seen on the 30B:
+            // 18.6 GB model + 12 GB managed > pod RAM). So cap EVERY budget (auto
+            // and manual) by free host RAM, minus a reserve so the promotion peak
+            // (before the managed pages migrate to the device during inference)
+            // never exhausts RAM.
+            let host_cap = crate::pagelock::memory_status()
+                .map(|(_, avail_host)| avail_host.saturating_sub(2 * 1024 * 1024 * 1024))
+                .unwrap_or(0);
+            let requested: u64 = if raw.eq_ignore_ascii_case("auto") {
                 // Projected budget: free VRAM at load (weights upload lazily, so
                 // ~nothing is resident yet) − the non-expert weights (assumed all
                 // GPU-resident, conservative) − a margin for the CUDA context, KV
@@ -1448,6 +1459,7 @@ impl CpuEngine {
                     .map(|mb| mb.saturating_mul(1024 * 1024))
                     .unwrap_or(0)
             };
+            let vram_expert_bytes = requested.min(host_cap);
             if vram_expert_bytes > 0 {
                 // Usage ranking (hottest-first) from the persisted per-model
                 // sidecar, so a tight budget buys the most-routed experts. Cold
