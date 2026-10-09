@@ -192,7 +192,11 @@ unsafe fn try_matvec_packed_cuda_dev_resident(
     };
     // SAFETY: caller guarantees `w_ptr_dev` is a live device buffer of
     // `>= w_nbytes` bytes on this cache's (default) device for the call.
-    unsafe { guard.matvec_packed_dev_resident(kind, w_ptr_dev, w_nbytes, x, out, m, k) }
+    let ok = unsafe { guard.matvec_packed_dev_resident(kind, w_ptr_dev, w_nbytes, x, out, m, k) };
+    if ok {
+        note_moe_dev_resident_hit();
+    }
+    ok
 }
 
 /// Device-resident lossy W4A8 Q4_K decode matvec (MoE tiered-expert): a promoted
@@ -221,7 +225,11 @@ unsafe fn try_matvec_q4k_w4a8_dev_resident(
     };
     // SAFETY: caller guarantees `w_ptr_dev` is a live device buffer of
     // `>= w_nbytes` bytes on this cache's (default) device for the call.
-    unsafe { guard.matvec_q4k_w4a8_dev_resident(w_ptr_dev, w_nbytes, x, out, m, k) }
+    let ok = unsafe { guard.matvec_q4k_w4a8_dev_resident(w_ptr_dev, w_nbytes, x, out, m, k) };
+    if ok {
+        note_moe_dev_resident_hit();
+    }
+    ok
 }
 
 /// Fused gate+up matvec via the native CUDA backend. Returns false (caller runs
@@ -300,9 +308,13 @@ unsafe fn try_matvec_packed_cuda_batched_dev_resident(
     };
     // SAFETY: caller guarantees `w_ptr_dev` is a live device buffer of
     // `>= w_nbytes` bytes on this cache's (default) device for the call.
-    unsafe {
+    let ok = unsafe {
         guard.matvec_packed_batched_dev_resident(kind, w_ptr_dev, w_nbytes, x, out, m, k, n)
+    };
+    if ok {
+        note_moe_dev_resident_hit();
     }
+    ok
 }
 
 /// Device-resident Q4_K prefill GEMM (MoE tiered-expert): a promoted Q4_K expert
@@ -331,7 +343,12 @@ unsafe fn try_gemm_q4k_f32_batched_dev_resident(
     };
     // SAFETY: caller guarantees `w_ptr_dev` is a live device buffer of
     // `>= w_nbytes` bytes on this cache's (default) device for the call.
-    unsafe { guard.gemm_packed_batched_q4k_f32_dev_resident(w_ptr_dev, w_nbytes, x, out, m, k, n) }
+    let ok =
+        unsafe { guard.gemm_packed_batched_q4k_f32_dev_resident(w_ptr_dev, w_nbytes, x, out, m, k, n) };
+    if ok {
+        note_moe_dev_resident_hit();
+    }
+    ok
 }
 
 /// Device-resident lossy Q4_K W8A8 int8 tensor-core prefill GEMM (MoE
@@ -361,9 +378,13 @@ unsafe fn try_gemm_q4k_w8a8_tc_batched_dev_resident(
     };
     // SAFETY: caller guarantees `w_ptr_dev` is a live device buffer of
     // `>= w_nbytes` bytes on this cache's (default) device for the call.
-    unsafe {
+    let ok = unsafe {
         guard.gemm_packed_batched_q4k_w8a8_tc_dev_resident(w_ptr_dev, w_nbytes, x, out, m, k, n)
+    };
+    if ok {
+        note_moe_dev_resident_hit();
     }
+    ok
 }
 
 /// Batched Q4_K matvec via the native CUDA prefill GEMM (verdict `gemm:q4_k_f32`,
@@ -13674,6 +13695,36 @@ fn log_matvec_batched_skip_once(reason: &str) {
 /// reasons stay silent — we just want one diagnostic line in
 /// `gui.log` per process to confirm what's happening when the user
 /// reports "GPU% spiked but Shared GPU memory stayed flat".
+/// MoE tiered-expert device-resident dispatch counter: how many matvecs ran
+/// against a promoted (device-resident) expert weight this process.
+static MOE_DEV_RESIDENT_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record one device-resident expert matvec (the promoted-expert fast path).
+/// Cheap (one relaxed add); the FIRST hit also logs once, so a
+/// `RUSTLLAMA_MOE_VRAM_EXPERT_MB` run can confirm — from the log alone — that
+/// promoted experts actually dispatch to the device tier instead of silently
+/// falling back to the upload path / CPU. Pairs with the promotion log
+/// ("promoted N experts") emitted at load.
+fn note_moe_dev_resident_hit() {
+    MOE_DEV_RESIDENT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        tracing::info!(
+            "MoE tiered-expert: device-resident expert matvec engaged — promoted \
+             experts are dispatching to GPU device memory (logged once)"
+        );
+    });
+}
+
+/// Total device-resident expert matvecs dispatched this process (MoE
+/// tiered-expert tier). `0` ⇒ the tier never engaged — either nothing was
+/// promoted, or every promoted matvec fell back. A diagnostic hook for bench /
+/// pod validation.
+pub fn moe_dev_resident_hits() -> u64 {
+    MOE_DEV_RESIDENT_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn log_matvec_skip_once(reason: &str) {
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     ONCE.get_or_init(|| {
