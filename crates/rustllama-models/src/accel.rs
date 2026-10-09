@@ -9923,7 +9923,15 @@ pub fn try_matvec_tensor_usm_f32(
         // caller's CPU matvec fire.
         return false;
     }
-    if !gpu_active_for_current_layer() {
+    // A promoted SYCL expert (`Storage::Device` tagged Sycl) carries an explicit
+    // per-tensor placement that OVERRIDES the layer cutoff — the SYCL twin of
+    // the CUDA tiered-expert path. DISTINCT from a preloaded dense `SyclUsm`
+    // weight (which still respects the cutoff), so dense placement is unchanged.
+    let sycl_dev_resident = matches!(
+        w.storage.device_backend(),
+        Some((rustllama_tensor::DeviceBackend::Sycl, _))
+    );
+    if !gpu_active_for_current_layer() && !sycl_dev_resident {
         // CPU-resident layer per `[inference].n_gpu_layers` cutoff —
         // skip USM matvec, let the caller fall through to CPU. No
         // log: this is the configured-behavior path, not a failure.
@@ -9989,12 +9997,16 @@ pub fn try_matvec_tensor_usm_f32(
         return false;
     }
     // Fast path: weight storage is already `Storage::SyclUsm` (the
-    // model was loaded with `preload_weights_to_usm`). Skip the
-    // host→device upload entirely; the kernel reads the USM pointer
-    // directly. `weight_key` falls back to the host-pointer key
-    // when storage is `CpuOwned`, preserving the cached-upload
-    // behavior for tensors that didn't preload.
-    let preloaded_usm: Option<*const u8> = w.storage.sycl_usm_ptr();
+    // model was loaded with `preload_weights_to_usm`), OR a promoted
+    // `Device(Sycl)` expert whose `device_ptr` is a USM pointer. Skip
+    // the host→device upload entirely; the kernel reads the USM pointer
+    // directly. `weight_key` falls back to the host-pointer key when
+    // storage is `CpuOwned`, preserving the cached-upload behavior for
+    // tensors that didn't preload.
+    let preloaded_usm: Option<*const u8> = w
+        .storage
+        .sycl_usm_ptr()
+        .or_else(|| if sycl_dev_resident { w.storage.device_ptr() } else { None });
     let weight_key = w_bytes.as_ptr() as usize;
     USM_ATTN.with(|cell| {
         let mut slot = cell.borrow_mut();
@@ -11228,6 +11240,59 @@ pub fn upload_bytes_to_usm(
     })
 }
 
+/// Promote `bytes` into SYCL USM, returning a `Storage::Device` tagged `Sycl`
+/// (the MoE tiered-expert SYCL producer). Allocation + free are identical to
+/// [`upload_bytes_to_usm`]; the ONLY difference is the storage VARIANT —
+/// `Device(Sycl)` instead of `SyclUsm`. That distinction matters: on a
+/// unified-memory host the dense weights are *also* preloaded to `SyclUsm`, so
+/// "is USM" can't tell a promoted expert from a preloaded dense weight. The
+/// `Device(Sycl)` tag marks an EXPLICIT per-tensor promotion, which the SYCL
+/// dispatch honors above the `n_gpu_layers` layer cutoff (like the CUDA tier).
+/// USM-shared memory is CPU-coherent, so `cpu_readable = true` and `as_bytes`
+/// stays valid. `None` unless the USM context is live (`usm_attn_enabled`).
+pub fn upload_bytes_to_sycl_device(bytes: &[u8]) -> Option<rustllama_tensor::Storage> {
+    if !usm_attn_enabled() || bytes.is_empty() {
+        return None;
+    }
+    USM_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let ctx = slot.as_mut()?;
+        let n = bytes.len();
+        let raw = sk::usm_alloc_shared_raw(&ctx.stream, n);
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: `raw` is a valid USM allocation of `n` bytes; USM shared is
+        // CPU-coherent so a plain memcpy fills it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), raw as *mut u8, n);
+        }
+        // Same stream-lifetime contract as `upload_bytes_to_usm`'s free closure.
+        let stream_addr = &ctx.stream as *const sk::SyclStream as usize;
+        let free_fn: Box<dyn FnOnce(*mut u8) + Send + Sync> = Box::new(move |p| {
+            // SAFETY: `stream_addr` points to the engine's `UsmAttnContext`
+            // stream, which outlives any promotion it produced.
+            unsafe {
+                let stream_ref = &*(stream_addr as *const sk::SyclStream);
+                sk::usm_free_raw(stream_ref, p as *mut std::ffi::c_void);
+            }
+        });
+        // SAFETY: `raw` is non-null (checked) + a `n`-byte USM allocation; the
+        // closure frees exactly it; USM shared is CPU-mappable (`cpu_readable`).
+        let storage = unsafe {
+            rustllama_tensor::Storage::device_from_raw(
+                raw as *mut u8,
+                n,
+                rustllama_tensor::DeviceBackend::Sycl,
+                0,
+                true,
+                free_fn,
+            )
+        };
+        Some(storage)
+    })
+}
+
 /// Promote `bytes` into CUDA **managed** memory, returning a `Storage::Device`
 /// (backend Cuda). The CUDA analogue of [`upload_bytes_to_usm`] — managed memory
 /// is CPU-mappable, so `as_bytes` stays valid while the GPU reads the raw
@@ -11267,14 +11332,15 @@ pub fn upload_bytes_to_cuda_managed(bytes: &[u8]) -> Option<rustllama_tensor::St
 
 /// Promote `bytes` to the ACTIVE GPU backend's device memory — the generic
 /// cross-backend producer the MoE tiered-expert tier routes promotions through.
-/// CUDA → managed (`Storage::Device`); SYCL → USM (`Storage::SyclUsm`, the
-/// existing path, classified `Sycl` by `Storage::residency`); else `None`. (MLX
-/// unified joins when its managed producer lands — write-blind.)
+/// Both backends return a backend-tagged `Storage::Device`: CUDA → managed
+/// memory; SYCL → USM (`Device(Sycl)`, DISTINCT from the preloaded-dense
+/// `SyclUsm` so the dispatch can honor it above the layer cutoff). `None` off
+/// GPU. (MLX unified joins when its managed producer lands — write-blind.)
 pub fn upload_bytes_to_device(bytes: &[u8]) -> Option<rustllama_tensor::Storage> {
     if cuda_active() {
         return upload_bytes_to_cuda_managed(bytes);
     }
-    upload_bytes_to_usm(bytes)
+    upload_bytes_to_sycl_device(bytes)
 }
 
 pub fn try_embedding_lookup_usm_f32(
