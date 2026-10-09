@@ -20559,6 +20559,47 @@ mod tests {
         }
 
         #[test]
+        fn q4_k_neon_matches_scalar() {
+            // Q4_K super-block: d(f16) + dmin(f16) + sc[12] + qs[128].
+            run_block_quant::<144>(
+                "q4_k",
+                4,
+                512,
+                0x4040_8888,
+                |l, blk| {
+                    blk[0..2].copy_from_slice(&l.f16_le(0.03, 0.001));
+                    blk[2..4].copy_from_slice(&l.f16_le(0.03, 0.001));
+                    for s in &mut blk[4..144] {
+                        *s = l.byte();
+                    }
+                },
+                |w, x, o, m, k| matvec_q4_k_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_q4_k_w_f32_a_neon(w, x, o, m, k) },
+                256,
+            );
+        }
+
+        #[test]
+        fn q8_0_neon_matches_scalar() {
+            // Q8_0 block: f16 d + 32 int8 qs (34 bytes / 32 weights).
+            run_block_quant::<34>(
+                "q8_0",
+                4,
+                512,
+                0x8080_9999,
+                |l, blk| {
+                    blk[0..2].copy_from_slice(&l.f16_le(0.02, 0.001));
+                    for q in &mut blk[2..34] {
+                        *q = l.byte();
+                    }
+                },
+                |w, x, o, m, k| matvec_q8_0_w_f32_a_scalar(w, x, o, m, k),
+                |w, x, o, m, k| unsafe { matvec_q8_0_w_f32_a_neon(w, x, o, m, k) },
+                32,
+            );
+        }
+
+        #[test]
         fn q5_k_neon_matches_scalar() {
             // Q5_K super-block: d(f16) + dmin(f16) + scales[12] + qh[32] + qs[128].
             run_block_quant::<176>(
