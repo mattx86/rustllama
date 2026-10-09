@@ -2381,6 +2381,97 @@ impl CudaMatvecCache {
         self.out_scratch.as_ref().unwrap().download(out_bytes)
     }
 
+    /// Device-resident single-row packed matvec — the MoE tiered-expert fast
+    /// path. Identical math to [`Self::matvec_packed`], but the weight is
+    /// ALREADY on the device (`w_ptr_dev`, e.g. a `cudaMallocManaged` buffer
+    /// backing a promoted expert): no `weight_key` lookup and **no host→device
+    /// weight upload** — that per-call re-streaming is exactly what the device
+    /// tier exists to skip. `w_nbytes` is the allocation length, checked against
+    /// the format's row stride exactly as the uploading path does. Only `x`
+    /// (H2D) and `out` (D2H) still cross the bus. Returns false (caller falls
+    /// through to the upload path / CPU) on bad shape / scratch / kernel
+    /// failure, leaving `out` untouched. Weight-buffer ownership stays with the
+    /// caller's `Tensor` — this cache never frees `w_ptr_dev`.
+    ///
+    /// # Safety
+    /// `w_ptr_dev` must be a live device-accessible pointer (CUDA device or
+    /// managed/unified memory) of at least `w_nbytes` bytes on this cache's
+    /// device, valid for the duration of the call.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn matvec_packed_dev_resident(
+        &mut self,
+        kind: CudaPackedKind,
+        w_ptr_dev: *const c_void,
+        w_nbytes: usize,
+        x: &[f32],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+    ) -> bool {
+        if m == 0 || k == 0 || x.len() != k || out.len() != m {
+            return false;
+        }
+        if w_ptr_dev.is_null() {
+            return false;
+        }
+        if k % kind.k_alignment() != 0 || w_nbytes < m * kind.row_bytes(k) {
+            return false;
+        }
+        if !Self::ensure_scratch(&mut self.x_scratch, &self.stream, k * 4)
+            || !Self::ensure_scratch(&mut self.out_scratch, &self.stream, m * 4)
+        {
+            return false;
+        }
+        let x_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
+        if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
+            return false;
+        }
+        let w_ptr = w_ptr_dev;
+        let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
+        let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: w is a caller-guaranteed live device buffer; x/out are live
+        // device scratch on `self.stream` sized for (M,K); the wrapper
+        // synchronizes before returning. Kernel dispatch mirrors
+        // `matvec_packed` exactly (same per-format row_dot → bit-exact).
+        let res = unsafe {
+            match kind {
+                CudaPackedKind::Ptq1_0 => matvec_ptq1_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Q8_0 => matvec_q8_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Q4_K => matvec_q4_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Q6_K => matvec_q6_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Q5_K => matvec_q5_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Q2_K => matvec_q2_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Q8_K => matvec_q8_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Q4_0 => matvec_q4_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Q5_0 => matvec_q5_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Q4_1 => matvec_q4_1_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Q5_1 => matvec_q5_1_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Iq4_Nl => matvec_iq4_nl_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Iq4_Xs => matvec_iq4_xs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Iq2_Xxs => matvec_iq2_xxs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Iq2_Xs => matvec_iq2_xs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Iq2_S => matvec_iq2_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Iq3_Xxs => matvec_iq3_xxs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Iq3_S => matvec_iq3_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Iq1_S => matvec_iq1_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Iq1_M => matvec_iq1_m_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Nvfp4 => matvec_nvfp4_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Mxfp4 => matvec_mxfp4_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Mxfp6 => matvec_mxfp6_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Mxfp8 => matvec_mxfp8_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Q3_K => matvec_q3_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Pq2_0 => matvec_pq2_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+            }
+        };
+        if res.is_err() || consume_error_count() != 0 {
+            return false;
+        }
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, m * 4) };
+        self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
+
     /// Fused gate+up matvec (decode): one launch computes `gate_out = gate_w @ x`
     /// and `up_out = up_w @ x`, reusing the parity-validated per-format row_dot
     /// (so bit-exact to two separate [`Self::matvec_packed`] calls). Uploads

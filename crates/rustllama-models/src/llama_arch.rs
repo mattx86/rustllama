@@ -1075,6 +1075,99 @@ impl LlamaWeights {
         self.moe_blocks.is_some()
     }
 
+    /// MoE tiered-expert engine (Phase 1c): promote the hottest experts'
+    /// gate/up/down weights into the ACTIVE GPU backend's device memory (CUDA
+    /// managed / SYCL USM, via [`crate::accel::upload_bytes_to_device`]) up to
+    /// `budget_bytes`, so the per-expert matvec reads them device-resident — no
+    /// per-call host→device re-upload (the whole point of the device tier). The
+    /// matching dispatch fast path lives in
+    /// [`crate::accel::try_matvec_tensor_usm_f32`] (it feeds `device_ptr()`
+    /// straight to the kernel when a tensor is `Storage::Device`).
+    ///
+    /// Returns `(experts_promoted, bytes_promoted)`.
+    ///
+    /// **Correctness is safe by construction:** the device allocation is
+    /// CPU-mappable (`cpu_readable` — managed/USM/unified), so `as_bytes` stays
+    /// valid everywhere and every non-GPU code path still sees the same bytes.
+    /// The worst case of a blind or absent device tier is "no speedup", never a
+    /// wrong answer. Experts are taken in `(layer, expert)` index order for now;
+    /// usage-driven ranking (hottest first, from `UsageLearner`) is a Phase-3
+    /// follow-up. Already-device-resident experts and non-MoE models are
+    /// skipped; a `budget_bytes` of 0, or no active GPU producer
+    /// (`upload_bytes_to_device` → `None`, e.g. this unified-memory dev box with
+    /// no dedicated VRAM), promotes nothing. Benefit is on dedicated-VRAM GPUs
+    /// (the pod) + Apple; it is write-blind here and validated on that HW.
+    ///
+    /// The auto-trigger (a dedicated-VRAM expert budget + a guarded load-path
+    /// call site) lands with the Phase-4 VRAM-budget planner — this method is
+    /// the reusable mechanism it drives.
+    pub fn promote_experts_to_device(&mut self, budget_bytes: u64) -> (usize, u64) {
+        if budget_bytes == 0 {
+            return (0, 0);
+        }
+        let Some(blocks) = self.moe_blocks.as_mut() else {
+            return (0, 0);
+        };
+        let mut used: u64 = 0;
+        let mut promoted = 0usize;
+        'outer: for block in blocks.iter_mut() {
+            let n_exp = block
+                .gate_per_expert
+                .len()
+                .min(block.up_per_expert.len())
+                .min(block.down_per_expert.len());
+            for e in 0..n_exp {
+                // Skip experts already (partially) device-resident.
+                if block.gate_per_expert[e].storage.residency()
+                    != rustllama_tensor::DeviceBackend::Cpu
+                {
+                    continue;
+                }
+                let cost = block.gate_per_expert[e].storage.len_bytes() as u64
+                    + block.up_per_expert[e].storage.len_bytes() as u64
+                    + block.down_per_expert[e].storage.len_bytes() as u64;
+                // Same-size experts ⇒ once one overflows the remaining budget
+                // the rest will too, but `continue` keeps this robust to mixed
+                // sizes (shared/shexp FFNs promote via their own tensors).
+                if cost == 0 || used + cost > budget_bytes {
+                    continue;
+                }
+                // Promote the expert's three matrices as a unit. If the GPU
+                // producer is unavailable (no active backend → `None`), stop
+                // entirely: nothing further will promote either.
+                if !Self::promote_tensor(&mut block.gate_per_expert[e])
+                    || !Self::promote_tensor(&mut block.up_per_expert[e])
+                    || !Self::promote_tensor(&mut block.down_per_expert[e])
+                {
+                    break 'outer;
+                }
+                used += cost;
+                promoted += 1;
+            }
+        }
+        (promoted, used)
+    }
+
+    /// Swap one tensor's storage to the active GPU backend's device memory.
+    /// Returns `false` (leaving the tensor untouched on CPU) when no producer is
+    /// available or the upload fails; a no-op `true` for already-device tensors.
+    /// Correctness-preserving: the new storage is CPU-mappable, so `as_bytes`
+    /// still yields identical bytes.
+    fn promote_tensor(t: &mut Tensor) -> bool {
+        if t.storage.residency() != rustllama_tensor::DeviceBackend::Cpu {
+            return true;
+        }
+        // `bytes` borrows `t.storage`; the producer copies them into device
+        // memory synchronously and returns an owned Storage, so the borrow ends
+        // before the reassignment (NLL).
+        let bytes = t.storage.as_bytes();
+        let Some(dev) = crate::accel::upload_bytes_to_device(bytes) else {
+            return false;
+        };
+        t.storage = dev;
+        true
+    }
+
     pub fn from_gguf(gguf: &Gguf, cfg: &LlamaConfig) -> Result<Self, LlamaLoadError> {
         let token_embd = load_weight(gguf, "token_embd.weight")?;
 

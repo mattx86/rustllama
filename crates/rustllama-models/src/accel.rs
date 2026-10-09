@@ -162,6 +162,39 @@ fn try_matvec_packed_cuda(
     guard.matvec_packed(kind, weight_key, w_bytes, x, out, m, k)
 }
 
+/// Device-resident single-row packed matvec (MoE tiered-expert fast path): the
+/// weight is ALREADY in CUDA device memory — a promoted expert in managed
+/// memory (see [`promote_experts_to_device`]). Feeds the device pointer
+/// straight to the kernel, skipping the cache's host→device weight upload (and
+/// the `as_bytes` host migration the uploading arm would trigger on managed
+/// memory). Returns false on any miss so the caller falls through to the
+/// uploading path; leaves `out` untouched on failure.
+///
+/// # Safety
+/// `w_ptr_dev` must be a live device-accessible pointer of at least `w_nbytes`
+/// bytes on the default CUDA device, valid for the duration of the call —
+/// guaranteed here by the owning `Tensor`'s `Storage::Device` allocation
+/// outliving the call.
+unsafe fn try_matvec_packed_cuda_dev_resident(
+    kind: ck::CudaPackedKind,
+    w_ptr_dev: *const core::ffi::c_void,
+    w_nbytes: usize,
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    // SAFETY: caller guarantees `w_ptr_dev` is a live device buffer of
+    // `>= w_nbytes` bytes on this cache's (default) device for the call.
+    unsafe { guard.matvec_packed_dev_resident(kind, w_ptr_dev, w_nbytes, x, out, m, k) }
+}
+
 /// Fused gate+up matvec via the native CUDA backend. Returns false (caller runs
 /// the two-matvec fallback) on any miss — including a `kind` without a fused
 /// kernel, which the cache method rejects internally.
@@ -9673,6 +9706,30 @@ pub fn try_matvec_tensor_usm_f32(
         && matvec_above_min_flops(2u64 * m as u64 * k as u64)
     {
         if let Some(ck_kind) = dtype_to_cuda_kind(w.dtype) {
+            // MoE tiered-expert fast path, tried FIRST: a promoted expert whose
+            // weight already lives in CUDA device (managed) memory. Feed the
+            // device pointer straight to the kernel — no `as_bytes` (which would
+            // migrate the managed pages back to host on every call) and no
+            // per-call re-upload. A miss falls through to the uploading path.
+            if let Some((rustllama_tensor::DeviceBackend::Cuda, _dev)) = w.storage.device_backend() {
+                if let Some(dptr) = w.storage.device_ptr() {
+                    // SAFETY: the `Storage::Device` allocation backing `w`
+                    // outlives this call; `len_bytes()` is its true length.
+                    if unsafe {
+                        try_matvec_packed_cuda_dev_resident(
+                            ck_kind,
+                            dptr as *const core::ffi::c_void,
+                            w.storage.len_bytes(),
+                            x,
+                            out,
+                            m,
+                            k,
+                        )
+                    } {
+                        return true;
+                    }
+                }
+            }
             let wb = as_bytes(w);
             // Q4_K decode: try the lossy W4A8 int8-activation matvec FIRST where
             // its verdict+perf gate passed (faster than the bit-exact f32 warp
