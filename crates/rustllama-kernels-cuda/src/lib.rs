@@ -2879,6 +2879,62 @@ impl CudaMatvecCache {
         self.out_scratch.as_ref().unwrap().download(out_bytes)
     }
 
+    /// Device-resident Q4_K int8 tensor-core prefill GEMM (W8A8, lossy) — the
+    /// promoted-expert analogue of [`Self::gemm_packed_batched_q4k_w8a8_tc`].
+    /// Weight already on the device (`w_ptr_dev`, managed memory): no
+    /// `weight_key` / no upload. Same lossy W8A8 TC kernel, so a promoted Q4_K
+    /// expert gets the faster prefill path (where its verdict/perf gate passed)
+    /// without re-upload. Returns false (caller falls through to the f32 GEMM /
+    /// matvec) on any miss.
+    ///
+    /// # Safety
+    /// `w_ptr_dev` must be a live device-accessible pointer of at least
+    /// `w_nbytes` bytes on this cache's device, valid for the call.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_packed_batched_q4k_w8a8_tc_dev_resident(
+        &mut self,
+        w_ptr_dev: *const c_void,
+        w_nbytes: usize,
+        x: &[f32],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> bool {
+        let kind = CudaPackedKind::Q4_K;
+        if m == 0 || k == 0 || n == 0 || x.len() != n * k || out.len() != n * m {
+            return false;
+        }
+        if w_ptr_dev.is_null() {
+            return false;
+        }
+        if k % kind.k_alignment() != 0 || w_nbytes < m * kind.row_bytes(k) {
+            return false;
+        }
+        if !Self::ensure_scratch(&mut self.x_scratch, &self.stream, n * k * 4)
+            || !Self::ensure_scratch(&mut self.out_scratch, &self.stream, n * m * 4)
+        {
+            return false;
+        }
+        let x_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, n * k * 4) };
+        if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
+            return false;
+        }
+        let w_ptr = w_ptr_dev;
+        let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
+        let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: w caller-guaranteed live device buffer; x/out device scratch
+        // sized for N rows; same kernel as the uploading W8A8 TC GEMM.
+        let res = unsafe { gemm_q4_k_w8a8_tc(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n) };
+        if res.is_err() || consume_error_count() != 0 {
+            return false;
+        }
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * m * 4) };
+        self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
+
     /// W4A8 Q4_K DECODE matvec (single row): the lossy, perf-gated int8-
     /// activation decode twin of [`Self::gemm_packed_batched_q4k_w8a8_tc`].
     /// `x` = [K], `out` = [M]. Returns false (caller runs the bit-exact f32
@@ -2916,6 +2972,59 @@ impl CudaMatvecCache {
         let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
         let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
         // SAFETY: device buffers sized (M,K)/K/M on self.stream; wrapper syncs.
+        let res = unsafe { matvec_q4_k_w4a8(&self.stream, w_ptr, x_ptr, out_ptr, m, k) };
+        if res.is_err() || consume_error_count() != 0 {
+            return false;
+        }
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, m * 4) };
+        self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
+
+    /// Device-resident W4A8 Q4_K decode matvec — the promoted-expert analogue of
+    /// [`Self::matvec_q4k_w4a8`]. Weight already on the device (`w_ptr_dev`): no
+    /// `weight_key` / no upload. Same lossy int8-activation kernel, so a promoted
+    /// Q4_K expert gets the faster decode path (where its verdict/perf gate
+    /// passed) without re-upload. Returns false (caller runs the bit-exact f32
+    /// dev-resident matvec) on any miss.
+    ///
+    /// # Safety
+    /// `w_ptr_dev` must be a live device-accessible pointer of at least
+    /// `w_nbytes` bytes on this cache's device, valid for the call.
+    pub unsafe fn matvec_q4k_w4a8_dev_resident(
+        &mut self,
+        w_ptr_dev: *const c_void,
+        w_nbytes: usize,
+        x: &[f32],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
+    ) -> bool {
+        let kind = CudaPackedKind::Q4_K;
+        if m == 0 || k == 0 || x.len() != k || out.len() != m {
+            return false;
+        }
+        if w_ptr_dev.is_null() {
+            return false;
+        }
+        if k % kind.k_alignment() != 0 || w_nbytes < m * kind.row_bytes(k) {
+            return false;
+        }
+        if !Self::ensure_scratch(&mut self.x_scratch, &self.stream, k * 4)
+            || !Self::ensure_scratch(&mut self.out_scratch, &self.stream, m * 4)
+        {
+            return false;
+        }
+        let x_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
+        if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
+            return false;
+        }
+        let w_ptr = w_ptr_dev;
+        let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
+        let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: w caller-guaranteed live device buffer; x/out device scratch
+        // sized K/M; same kernel as the uploading W4A8 matvec.
         let res = unsafe { matvec_q4_k_w4a8(&self.stream, w_ptr, x_ptr, out_ptr, m, k) };
         if res.is_err() || consume_error_count() != 0 {
             return false;

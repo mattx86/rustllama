@@ -195,6 +195,35 @@ unsafe fn try_matvec_packed_cuda_dev_resident(
     unsafe { guard.matvec_packed_dev_resident(kind, w_ptr_dev, w_nbytes, x, out, m, k) }
 }
 
+/// Device-resident lossy W4A8 Q4_K decode matvec (MoE tiered-expert): a promoted
+/// Q4_K expert already in CUDA device memory, run through the faster int8-
+/// activation decode matvec (verdict+perf-gated, `q4k_w4a8_enabled`) WITHOUT
+/// re-upload — so a promoted expert gets the same fast decode path as a
+/// non-promoted one. Returns false on any miss (caller falls to the bit-exact
+/// f32 dev-resident matvec).
+///
+/// # Safety
+/// `w_ptr_dev` must be a live device-accessible pointer of at least `w_nbytes`
+/// bytes on the default CUDA device, valid for the call.
+unsafe fn try_matvec_q4k_w4a8_dev_resident(
+    w_ptr_dev: *const core::ffi::c_void,
+    w_nbytes: usize,
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    // SAFETY: caller guarantees `w_ptr_dev` is a live device buffer of
+    // `>= w_nbytes` bytes on this cache's (default) device for the call.
+    unsafe { guard.matvec_q4k_w4a8_dev_resident(w_ptr_dev, w_nbytes, x, out, m, k) }
+}
+
 /// Fused gate+up matvec via the native CUDA backend. Returns false (caller runs
 /// the two-matvec fallback) on any miss — including a `kind` without a fused
 /// kernel, which the cache method rejects internally.
@@ -303,6 +332,38 @@ unsafe fn try_gemm_q4k_f32_batched_dev_resident(
     // SAFETY: caller guarantees `w_ptr_dev` is a live device buffer of
     // `>= w_nbytes` bytes on this cache's (default) device for the call.
     unsafe { guard.gemm_packed_batched_q4k_f32_dev_resident(w_ptr_dev, w_nbytes, x, out, m, k, n) }
+}
+
+/// Device-resident lossy Q4_K W8A8 int8 tensor-core prefill GEMM (MoE
+/// tiered-expert): a promoted Q4_K expert already in CUDA device memory, run
+/// through the faster int8-TC prefill GEMM (verdict+perf-gated,
+/// `q4k_w8a8_tc_enabled`) WITHOUT re-upload. Returns false on any miss (caller
+/// falls to the bit-exact f32 dev-resident GEMM).
+///
+/// # Safety
+/// `w_ptr_dev` must be a live device-accessible pointer of at least `w_nbytes`
+/// bytes on the default CUDA device, valid for the call.
+#[allow(clippy::too_many_arguments)]
+unsafe fn try_gemm_q4k_w8a8_tc_batched_dev_resident(
+    w_ptr_dev: *const core::ffi::c_void,
+    w_nbytes: usize,
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    // SAFETY: caller guarantees `w_ptr_dev` is a live device buffer of
+    // `>= w_nbytes` bytes on this cache's (default) device for the call.
+    unsafe {
+        guard.gemm_packed_batched_q4k_w8a8_tc_dev_resident(w_ptr_dev, w_nbytes, x, out, m, k, n)
+    }
 }
 
 /// Batched Q4_K matvec via the native CUDA prefill GEMM (verdict `gemm:q4_k_f32`,
@@ -9776,18 +9837,23 @@ pub fn try_matvec_tensor_usm_f32(
         if let Some((rustllama_tensor::DeviceBackend::Cuda, _dev)) = w.storage.device_backend() {
             if let Some(dptr) = w.storage.device_ptr() {
                 if let Some(ck_kind) = dtype_to_cuda_kind(w.dtype) {
+                    let w_nbytes = w.storage.len_bytes();
+                    let dptr = dptr as *const core::ffi::c_void;
+                    // Q4_K decode: lossy W4A8 int8-activation matvec FIRST where
+                    // its verdict/perf gate passed (same choice the uploading arm
+                    // makes), so a promoted expert isn't stuck on the slower
+                    // bit-exact f32 matvec. A miss falls through to f32 below.
                     // SAFETY: the `Storage::Device` allocation backing `w`
                     // outlives this call; `len_bytes()` is its true length.
+                    if matches!(ck_kind, ck::CudaPackedKind::Q4_K)
+                        && q4k_w4a8_enabled()
+                        && unsafe { try_matvec_q4k_w4a8_dev_resident(dptr, w_nbytes, x, out, m, k) }
+                    {
+                        return true;
+                    }
+                    // SAFETY: as above.
                     if unsafe {
-                        try_matvec_packed_cuda_dev_resident(
-                            ck_kind,
-                            dptr as *const core::ffi::c_void,
-                            w.storage.len_bytes(),
-                            x,
-                            out,
-                            m,
-                            k,
-                        )
+                        try_matvec_packed_cuda_dev_resident(ck_kind, dptr, w_nbytes, x, out, m, k)
                     } {
                         return true;
                     }
@@ -11628,23 +11694,23 @@ pub fn try_matvec_tensor_batched_usm_f32(
     // of the single-row hook) — lifted ABOVE the layer cutoff AND the TC/GEMM
     // gates. A promoted expert (`Storage::Device` tagged Cuda) runs prefill
     // GPU-resident regardless of its layer placement, consistent with its decode
-    // path. Q4_K keeps the bit-exact weight-reuse GEMM via the device-resident
-    // GEMM (no regression vs the uploading GEMM); every other promoted format
-    // uses the device-resident batched matvec. Both skip the re-upload AND the
-    // `as_bytes` host migration of managed pages. Honors an explicit CPU pin +
-    // shape/flops floor. Inert (byte-identical) until something promotes experts
-    // — on non-CUDA / non-promoted runs the device tag is never Cuda.
+    // path. Q4_K gets its FULL prefill ladder device-resident — lossy int8
+    // W8A8-TC GEMM, then bit-exact f32 weight-reuse GEMM — the same order the
+    // uploading arm uses, so a promoted Q4_K expert is never slower than a
+    // non-promoted one; every other promoted format uses the device-resident
+    // batched matvec. All skip the re-upload AND the `as_bytes` host migration
+    // of managed pages. Honors an explicit CPU pin + shape/flops floor. Inert
+    // (byte-identical) until something promotes experts — on non-CUDA /
+    // non-promoted runs the device tag is never Cuda.
     //
-    // TRADEOFF (always correct, narrow, write-blind): formats with a layer-gated
-    // tensor-core prefill GEMM — the lossy Q4_K W8A8-TC and the Blackwell/Hopper
-    // NVFP4/MXFP8/MXFP6 GEMMs — have no device-resident variant yet, so a
-    // promoted expert in those formats takes the plain device-resident batched
-    // matvec here instead. For a CPU-placed layer that's still a win (GPU vs CPU)
-    // and for the bit-exact Q4_K f32 GEMM there's no change; only a promoted
-    // MXFP-family expert on an already-GPU-placed layer forgoes its TC GEMM —
-    // a vanishingly narrow intersection (opt-in + Blackwell/Hopper + MXFP
-    // experts + hot expert on a GPU layer). Dev-resident TC GEMMs are a
-    // follow-up if the pod shows it matters.
+    // TRADEOFF (always correct, narrow, write-blind): the Blackwell/Hopper
+    // NVFP4/MXFP8/MXFP6 tensor-core GEMMs have no device-resident variant yet,
+    // so a promoted expert in those formats takes the plain device-resident
+    // batched matvec here. For a CPU-placed layer that's still a win (GPU vs
+    // CPU); only a promoted MXFP-family expert on an already-GPU-placed layer
+    // forgoes its TC GEMM — a vanishingly narrow intersection (opt-in +
+    // Blackwell/Hopper + MXFP experts + hot expert on a GPU layer). Those
+    // dev-resident TC GEMMs are a follow-up if the pod shows it matters.
     if !tensor_forced_to_cpu(&w.name)
         && m != 0
         && k != 0
@@ -11658,11 +11724,29 @@ pub fn try_matvec_tensor_batched_usm_f32(
                 if let Some(ck_kind) = dtype_to_cuda_kind(w.dtype) {
                     let w_nbytes = w.storage.len_bytes();
                     let dptr = dptr as *const core::ffi::c_void;
-                    // Q4_K: bit-exact prefill GEMM where its verdict passed + the
-                    // GEMM batch gate holds; otherwise the plain batched matvec.
+                    let q4k = matches!(ck_kind, ck::CudaPackedKind::Q4_K);
+                    // Q4_K prefill, same order as the uploading arm:
+                    //   1. lossy int8 W8A8 TC GEMM (where its verdict/perf gate
+                    //      passed — the fastest Q4_K prefill),
+                    //   2. bit-exact f32 weight-reuse GEMM,
+                    //   3. plain batched matvec (any format).
+                    // So a promoted Q4_K expert gets the SAME fast prefill path a
+                    // non-promoted one would, minus the re-upload. A miss at each
+                    // step falls through.
                     // SAFETY: the Device(Cuda) allocation backing `w` outlives
                     // this call; `len_bytes()` is its true length.
-                    if matches!(ck_kind, ck::CudaPackedKind::Q4_K)
+                    if q4k
+                        && q4k_w8a8_tc_enabled()
+                        && n >= 16
+                        && k % 256 == 0
+                        && unsafe {
+                            try_gemm_q4k_w8a8_tc_batched_dev_resident(dptr, w_nbytes, x, out, m, k, n)
+                        }
+                    {
+                        return true;
+                    }
+                    // SAFETY: as above.
+                    if q4k
                         && q4k_gemm_f32_enabled()
                         && n >= 16
                         && k % 256 == 0
