@@ -10586,7 +10586,19 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
     if tensor_forced_to_cpu(&w_gate.name) || tensor_forced_to_cpu(&w_up.name) {
         return false;
     }
-    if !gpu_active_for_current_layer() {
+    // A promoted expert's gate+up are both `Storage::Device(Sycl)` — an explicit
+    // per-tensor placement that overrides the layer cutoff (the SYCL tiered twin
+    // of the single-row path). Both must be device-resident to fuse; otherwise
+    // the cutoff still applies (preloaded dense SyclUsm is unchanged).
+    let gate_sycl_dev = matches!(
+        w_gate.storage.device_backend(),
+        Some((rustllama_tensor::DeviceBackend::Sycl, _))
+    );
+    let up_sycl_dev = matches!(
+        w_up.storage.device_backend(),
+        Some((rustllama_tensor::DeviceBackend::Sycl, _))
+    );
+    if !gpu_active_for_current_layer() && !(gate_sycl_dev && up_sycl_dev) {
         return false;
     }
     if m == 0 || k == 0
@@ -10646,8 +10658,17 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
     if g_bytes.len() < expected || u_bytes.len() < expected {
         return false;
     }
-    let g_preloaded: Option<*const u8> = w_gate.storage.sycl_usm_ptr();
-    let u_preloaded: Option<*const u8> = w_up.storage.sycl_usm_ptr();
+    // Resident USM pointer per weight: preloaded `SyclUsm`, or a promoted
+    // `Device(Sycl)` expert (its `device_ptr` is a USM pointer). Either skips
+    // the host→device cache upload.
+    let g_preloaded: Option<*const u8> = w_gate
+        .storage
+        .sycl_usm_ptr()
+        .or_else(|| if gate_sycl_dev { w_gate.storage.device_ptr() } else { None });
+    let u_preloaded: Option<*const u8> = w_up
+        .storage
+        .sycl_usm_ptr()
+        .or_else(|| if up_sycl_dev { w_up.storage.device_ptr() } else { None });
     let g_key = g_bytes.as_ptr() as usize;
     let u_key = u_bytes.as_ptr() as usize;
     // File-backed (GGUF mmap) weights are safe to discard after the USM
@@ -12166,7 +12187,14 @@ pub fn try_matvec_tensor_batched_usm_f32(
         // Per-tensor override (same as the single-row variant).
         return false;
     }
-    if !gpu_active_for_current_layer() {
+    // A promoted `Device(Sycl)` expert overrides the layer cutoff (SYCL tiered
+    // twin of the single-row/prefill path); preloaded dense SyclUsm still
+    // respects it.
+    let sycl_dev_resident = matches!(
+        w.storage.device_backend(),
+        Some((rustllama_tensor::DeviceBackend::Sycl, _))
+    );
+    if !gpu_active_for_current_layer() && !sycl_dev_resident {
         // Same placement-cutoff path as the single-row variant —
         // CPU-resident layer falls through to the CPU batched
         // matvec.
@@ -12238,8 +12266,12 @@ pub fn try_matvec_tensor_batched_usm_f32(
     }
     // Same SyclUsm fast-path as the single-row hook. Preloaded
     // weights skip the per-call cache lookup + upload — the kernel
-    // reads the USM pointer directly.
-    let preloaded_usm: Option<*const u8> = w.storage.sycl_usm_ptr();
+    // reads the USM pointer directly. A promoted `Device(Sycl)` expert's
+    // `device_ptr` is a USM pointer too, so it takes the same fast path.
+    let preloaded_usm: Option<*const u8> = w
+        .storage
+        .sycl_usm_ptr()
+        .or_else(|| if sycl_dev_resident { w.storage.device_ptr() } else { None });
     let weight_key = w_bytes.as_ptr() as usize;
     USM_ATTN.with(|cell| {
         let mut slot = cell.borrow_mut();
