@@ -1146,7 +1146,7 @@ impl CpuEngine {
                  follow-up turn that adds `MambaEngine`."
             )));
         }
-        let model = LlamaModel::load(&gguf)?;
+        let mut model = LlamaModel::load(&gguf)?;
         // Hybrid transformer+DeltaNet (qwen35moe-family) models now
         // load AND run a forward pass — Phase 3.7b plumbing routes
         // these to `forward_one_hybrid` instead of the dense forward.
@@ -1408,6 +1408,39 @@ impl CpuEngine {
                 tracing::warn!(
                     "memory_budget=auto: physical-memory query unavailable; keeping manual budgets"
                 );
+            }
+        }
+        // MoE tiered-expert engine (Phase 2 trigger): opt-in, default-off.
+        // With `RUSTLLAMA_MOE_VRAM_EXPERT_MB` set (>0) and a CUDA GPU active,
+        // promote that many MB of experts into CUDA device (managed) memory so
+        // they run GPU-resident regardless of the `n_gpu_layers` layer cutoff
+        // (the lifted dispatch in `accel.rs`). Must happen HERE — `model` is
+        // still uniquely owned (before the `Arc`), and before `lock_model_into_ram`
+        // (which skips `Storage::Device` via `cpu_backing_ptr_len` → `None`, so
+        // promoted experts are never VirtualLock'd). Safe-by-construction:
+        // managed memory oversubscribes to host-paged UVM instead of hard-OOMing,
+        // and a failed promotion keeps the CPU bytes, so an over-large budget
+        // degrades to "slower", never a crash or a wrong answer — the budget is
+        // the pod-tunable lever. Inert unless the env is set (default-off,
+        // matching the other additive perf/memory features). Device-tier benefit
+        // is on dedicated-VRAM GPUs; it is write-blind here (unified-memory box).
+        if rustllama_models::accel::cuda_active() && model.weights.is_moe() {
+            let vram_expert_bytes = std::env::var("RUSTLLAMA_MOE_VRAM_EXPERT_MB")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(|mb| mb.saturating_mul(1024 * 1024))
+                .unwrap_or(0);
+            if vram_expert_bytes > 0 {
+                let (experts, bytes) =
+                    model.weights.promote_experts_to_device(vram_expert_bytes);
+                if experts > 0 {
+                    tracing::info!(
+                        experts,
+                        promoted_mb = bytes / (1024 * 1024),
+                        budget_mb = vram_expert_bytes / (1024 * 1024),
+                        "moe tiered-expert: promoted hottest experts to CUDA device memory"
+                    );
+                }
             }
         }
         // Wrap the model in its Arc, then (Windows) VirtualLock the hot

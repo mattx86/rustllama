@@ -296,6 +296,15 @@ ID can replace `-` later). Packaging helpers: `_release_package.ps1` (bsdtar),
 - `RUSTLLAMA_GUI_EMBEDDED` — set by the GUI; skips the blocking startup autotune.
 - `RUSTLLAMA_DISABLED_GPUS` — exclude specific GPUs from selection.
 - `RUSTLLAMA_IQ_GPU=1` — run IQ1_S imatrix weighting on the GPU during quantize.
+- `RUSTLLAMA_MOE_VRAM_EXPERT_MB=<MB>` — MoE tiered-expert engine (Phase 2),
+  **opt-in, default-off**. Promote up to `<MB>` of the hottest MoE experts into
+  CUDA device (managed) memory at load so they run GPU-resident regardless of
+  the `n_gpu_layers` layer cutoff (the device-resident dispatch is lifted above
+  it). CUDA-only (inert off NVIDIA / on unified-memory iGPUs where it's a
+  no-op). Safe-by-construction: managed memory oversubscribes to host-paged UVM
+  rather than OOMing, and a failed promotion keeps the CPU bytes — an over-large
+  budget degrades to "slower", never a crash or wrong answer, so the budget is
+  the tunable lever. Benefit is on dedicated-VRAM GPUs; write-blind on this box.
 - (Removed) `RUSTLLAMA_FP4_TC` / `_FP8_WGMMA` / `_FP8_WGMMA_TMA` / `_SYCL_XMX`:
   the Blackwell/Hopper tensor-core + Intel XMX/DPAS GEMM paths now **auto-enable
   per device** via an on-device self-check (`tune --validate-kernels` →
