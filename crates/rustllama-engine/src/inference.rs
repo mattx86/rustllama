@@ -1460,6 +1460,10 @@ impl CpuEngine {
                 let (experts, bytes) =
                     model.weights.promote_experts_to_device(vram_expert_bytes, &ranked);
                 if experts > 0 {
+                    // Arm MoE-aware placement + the non-promoted-expert CPU
+                    // routing (per_layer_weight_bytes excludes experts; the
+                    // dispatch forces un-promoted expert views to CPU).
+                    rustllama_models::accel::set_moe_tier_active(true);
                     tracing::info!(
                         experts,
                         promoted_mb = bytes / (1024 * 1024),

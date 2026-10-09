@@ -126,7 +126,14 @@ fn dtype_to_cuda_kind(dtype: Dtype) -> Option<ck::CudaPackedKind> {
         Dtype::IQ2_XXSRaw => Some(ck::CudaPackedKind::Iq2_Xxs),
         Dtype::IQ2_XSRaw => Some(ck::CudaPackedKind::Iq2_Xs),
         Dtype::IQ2_SRaw => Some(ck::CudaPackedKind::Iq2_S),
-        Dtype::IQ3_XXSRaw => Some(ck::CudaPackedKind::Iq3_Xxs),
+        // IQ3_XXS gated OFF the CUDA path (fail-safe → SYCL/CPU, both correct):
+        // the CUDA iq3_xxs matvec miscomputes on-device (`doctor --cuda-parity`
+        // cos~0.97) even though its arithmetic + grid/sign tables are
+        // byte-identical to the CPU/AVX2/AVX512/SYCL references (all pass
+        // parity). Root cause is a device-specific defect still under
+        // investigation (the probe dumps per-weight divergence to pinpoint it);
+        // until fixed, route iq3_xxs off CUDA so no wrong output ships.
+        Dtype::IQ3_XXSRaw => None,
         Dtype::IQ3_SRaw => Some(ck::CudaPackedKind::Iq3_S),
         Dtype::IQ1_SRaw => Some(ck::CudaPackedKind::Iq1_S),
         Dtype::IQ1_MRaw => Some(ck::CudaPackedKind::Iq1_M),
@@ -1769,6 +1776,40 @@ pub fn moe_expert_cache_max_bytes() -> u64 {
 /// pins remain until [`expert_pin_clear`] or eviction pressure).
 pub fn set_moe_expert_cache_max_bytes(bytes: u64) {
     moe_expert_cache_cap_cell().store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// MoE tiered-expert engine: `true` once experts were promoted to device memory
+/// this load (set by the trigger in the engine when `promote_experts_to_device`
+/// moved ≥1 expert). Read by MoE-aware placement (`per_layer_weight_bytes`
+/// excludes the per-expert weights from the VRAM-fit layer budget, since the
+/// tier sizes them separately) and by the dispatch (`expert_forced_cpu` routes
+/// NON-promoted expert views to CPU so a now-GPU-placed layer's un-promoted
+/// experts don't cache-upload and blow the VRAM budget). Process-global;
+/// default off, so non-tier runs behave exactly as before.
+static MOE_TIER_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn moe_tier_active() -> bool {
+    MOE_TIER_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_moe_tier_active(active: bool) {
+    MOE_TIER_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Route a NON-promoted MoE expert view to CPU when the tiered engine is active.
+/// MoE-aware placement excludes expert weights from the layer VRAM budget, so a
+/// MoE layer can be "GPU-placed" for its attention while most experts are NOT
+/// in VRAM; those un-promoted experts must run on CPU rather than cache-upload
+/// on demand (which would overrun the budget). A PROMOTED expert is
+/// `Storage::Device` (residency != Cpu) → NOT forced (the device-resident fast
+/// path runs it on GPU). Matches the per-expert view naming from
+/// `moe::expert_view` (`…ffn_{gate,up,down}_exps.weight.e{idx}`). Inert unless
+/// the tier is active, so default dispatch is unchanged.
+#[inline]
+fn expert_forced_cpu(w: &Tensor) -> bool {
+    moe_tier_active()
+        && w.storage.residency() == rustllama_tensor::DeviceBackend::Cpu
+        && w.name.contains("_exps.weight.e")
 }
 
 // ============================================================
@@ -9927,6 +9968,13 @@ pub fn try_matvec_tensor_usm_f32(
             }
         }
     }
+    // MoE-aware placement: a NON-promoted expert view runs on CPU when the tier
+    // is active (promoted experts, `Storage::Device`, pass through to the
+    // device-resident path below). Prevents un-promoted experts of a
+    // GPU-placed MoE layer from cache-uploading and overrunning the VRAM budget.
+    if expert_forced_cpu(w) {
+        return false;
+    }
     // MoE tiered-expert device-resident fast path (Phase 2) — lifted ABOVE the
     // `n_gpu_layers` layer cutoff on purpose. A tensor explicitly promoted to
     // CUDA device memory (`Storage::Device` tagged Cuda, via
@@ -11888,6 +11936,12 @@ pub fn try_matvec_tensor_batched_usm_f32(
                 }
             }
         }
+    }
+    // MoE-aware placement (batched twin): a NON-promoted expert view runs on
+    // CPU when the tier is active; promoted experts fall through to the
+    // device-resident prefill path below.
+    if expert_forced_cpu(w) {
+        return false;
     }
     // MoE tiered-expert device-resident fast path (Phase 2, batched/prefill twin
     // of the single-row hook) — lifted ABOVE the layer cutoff AND the TC/GEMM

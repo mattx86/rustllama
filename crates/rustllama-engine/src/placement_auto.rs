@@ -472,19 +472,31 @@ pub fn per_layer_weight_bytes(
             })
             .collect()
     } else if let Some(moe) = weights.moe_blocks.as_ref() {
+        // MoE-aware placement: when the tiered-expert engine is active the
+        // per-expert weights are sized SEPARATELY (promoted to VRAM up to the
+        // expert budget; the rest pinned to CPU by `expert_forced_cpu`), so they
+        // must NOT count against the per-layer VRAM-fit budget — otherwise the
+        // huge `*_exps` tensors starve the layer cutoff and strand attention on
+        // CPU. Count only attention + router + shared-expert FFN per layer; the
+        // experts are the tier's responsibility. Off-tier (default), count
+        // everything exactly as before.
+        let tier = rustllama_models::accel::moe_tier_active();
         moe.iter()
             .map(|b| {
-                count_tensor(&b.w_q)
+                let mut bytes = count_tensor(&b.w_q)
                     + count_tensor(&b.w_k)
                     + count_tensor(&b.w_v)
                     + count_tensor(&b.w_o)
                     + count_tensor(&b.router)
-                    + count_tensor(&b.w_gate_exps)
-                    + count_tensor(&b.w_up_exps)
-                    + count_tensor(&b.w_down_exps)
                     + count_opt(&b.w_gate_shared)
                     + count_opt(&b.w_up_shared)
-                    + count_opt(&b.w_down_shared)
+                    + count_opt(&b.w_down_shared);
+                if !tier {
+                    bytes += count_tensor(&b.w_gate_exps)
+                        + count_tensor(&b.w_up_exps)
+                        + count_tensor(&b.w_down_exps);
+                }
+                bytes
             })
             .collect()
     } else {

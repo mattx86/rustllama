@@ -2471,6 +2471,92 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- iq3_xxs per-weight divergence diagnostic ----
+    // iq3_xxs miscomputes on-device though its arithmetic matches the CPU/SYCL
+    // reference exactly. A whole-row matvec only says "row m is wrong", not
+    // which weight. So probe ONE block (M=1, K=256) with unit-vector inputs:
+    // x = e_j ⇒ out[0] = weight j. Dump the first divergent weights with their
+    // decoded position (ib32 / l / grid1-or-2 / byte) so the failing pattern is
+    // obvious (e.g. "all byte==3" or "all g2"). CPU ref via the same path the
+    // matvec probe uses. Pinpoints the kernel defect for a real fix.
+    {
+        let name = "iq3_xxs:perweight";
+        let cpu = cpu_matvec_for("iq3_xxs");
+        // One deterministic, finite iq3_xxs block (98 B): d=f16(1.0), varied
+        // grid indices + scale/sign words so the sweep exercises many entries.
+        let mut w = vec![0u8; 98];
+        w[0] = 0x00;
+        w[1] = 0x3c; // 0x3c00 = f16 1.0
+        for i in 0..64 {
+            w[2 + i] = ((i * 7 + 3) & 0xff) as u8;
+        }
+        for i in 0..32 {
+            w[66 + i] = ((i * 13 + 5) & 0xff) as u8;
+        }
+        match (
+            ck::CudaDeviceBuffer::from_host(&stream, &w),
+            ck::CudaDeviceBuffer::alloc(&stream, 4),
+        ) {
+            (Some(wb), Some(mut ob)) => {
+                let mut diverged: Vec<(usize, f32, f32)> = Vec::new();
+                for j in 0..256usize {
+                    let mut xj = vec![0f32; 256];
+                    xj[j] = 1.0;
+                    let mut cpu_out = [0f32; 1];
+                    cpu(&w, &xj, &mut cpu_out, 1, 256);
+                    let Some(xb) = cu_upload_f32(&stream, &xj) else {
+                        continue;
+                    };
+                    let ok = unsafe {
+                        ck::matvec_iq3_xxs_packed_f32(
+                            &stream,
+                            wb.as_ptr(),
+                            xb.as_ptr() as *const f32,
+                            ob.as_mut_ptr() as *mut f32,
+                            1,
+                            256,
+                        )
+                    };
+                    if ok.is_err() {
+                        continue;
+                    }
+                    let gpu = cu_download_f32(&ob, 1)[0];
+                    let c = cpu_out[0];
+                    let denom = c.abs().max(1e-6);
+                    if (gpu - c).abs() / denom > 1e-3 {
+                        diverged.push((j, c, gpu));
+                    }
+                }
+                if diverged.is_empty() {
+                    cu_emit(name, "OK", "all 256 weights match (single block)");
+                    *counts.entry("OK").or_default() += 1;
+                } else {
+                    cu_emit(
+                        name,
+                        "MISCOMPUTE",
+                        &format!("{} / 256 weights diverge (single block)", diverged.len()),
+                    );
+                    *counts.entry("MISCOMPUTE").or_default() += 1;
+                    for &(j, c, g) in diverged.iter().take(24) {
+                        let ib32 = j / 32;
+                        let p = j % 32;
+                        let l = p / 8;
+                        let pl = p % 8;
+                        let which = if pl < 4 { "g1" } else { "g2" };
+                        let byte = pl % 4;
+                        println!(
+                            "      w[{j:>3}] cpu={c:+.4} gpu={g:+.4}  (ib32={ib32} l={l} {which} byte={byte})"
+                        );
+                    }
+                }
+            }
+            _ => {
+                cu_emit(name, "KERNEL_ERR", "device-alloc-failed");
+                *counts.entry("KERNEL_ERR").or_default() += 1;
+            }
+        }
+    }
+
     // ---- Batched (prefill) packed matvecs ----
     // The CUDA batched kernels (`matvec_<fmt>_packed_f32_batched`, the N-lifted
     // prefill twins) run during prefill for every non-Q4_K format (and Q4_K
