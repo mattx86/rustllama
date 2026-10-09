@@ -78,6 +78,9 @@ extern "C" {
     ) -> *mut c_void;
     fn rsl_cuda_malloc_device(s: *mut RslCudaStreamRaw, n_bytes: u64) -> *mut c_void;
     fn rsl_cuda_free(s: *mut RslCudaStreamRaw, dev_ptr: *mut c_void);
+    // Device-indexed managed-memory alloc/free (MoE tiered tier; stream-free).
+    fn rsl_cuda_malloc_managed(device: c_int, n_bytes: u64) -> *mut c_void;
+    fn rsl_cuda_free_managed(device: c_int, ptr: *mut c_void);
     fn rsl_cuda_memcpy_h2d(
         s: *mut RslCudaStreamRaw,
         dst_dev: *mut c_void,
@@ -1098,6 +1101,31 @@ pub unsafe fn hadamard_forward(
     } else {
         Err(CudaError::Kernel(rc))
     }
+}
+
+/// Allocate `n_bytes` of CUDA **managed** memory on `device` (CPU-mappable,
+/// migrates on access) for the MoE tiered-expert tier. `None` on failure.
+/// Device-global (no stream) — free with [`free_managed`] (the two together
+/// back `Storage::device_from_raw(DeviceBackend::Cuda, …)` in the engine).
+pub fn malloc_managed(device: u32, n_bytes: usize) -> Option<*mut u8> {
+    if n_bytes == 0 {
+        return None;
+    }
+    // SAFETY: FFI; returns null on failure, checked below.
+    let p = unsafe { rsl_cuda_malloc_managed(device as c_int, n_bytes as u64) };
+    if p.is_null() {
+        None
+    } else {
+        Some(p as *mut u8)
+    }
+}
+
+/// Free a [`malloc_managed`] allocation on `device`.
+///
+/// # Safety
+/// `ptr` came from [`malloc_managed`] on this `device` and is freed exactly once.
+pub unsafe fn free_managed(device: u32, ptr: *mut u8) {
+    rsl_cuda_free_managed(device as c_int, ptr as *mut c_void);
 }
 
 /// Generate the single + batched safe wrappers for a packed-quant matvec.

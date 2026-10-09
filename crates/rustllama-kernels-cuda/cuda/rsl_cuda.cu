@@ -221,6 +221,25 @@ extern "C" void rsl_cuda_free(rsl_cuda_stream *s, void *dev_ptr) {
     cudaFree(dev_ptr);
 }
 
+// Device-indexed MANAGED-memory alloc/free for the MoE tiered-expert tier.
+// cudaMallocManaged is CPU-mappable (pages migrate CPU↔GPU on access), which
+// satisfies the Phase-1 cpu_readable device-storage contract: `as_bytes` stays
+// valid while the GPU hot path dereferences the pointer with no copy. These are
+// device-global (no stream), so the Rust-side free closure captures only the
+// `device` index — no stream-lifetime juggling (unlike the USM free path).
+extern "C" void *rsl_cuda_malloc_managed(int device, unsigned long long n_bytes) {
+    if (cudaSetDevice(device) != cudaSuccess) return nullptr;
+    void *p = nullptr;
+    if (cudaMallocManaged(&p, (size_t)n_bytes) != cudaSuccess) return nullptr;
+    return p;
+}
+
+extern "C" void rsl_cuda_free_managed(int device, void *ptr) {
+    if (!ptr) return;
+    cudaSetDevice(device);
+    cudaFree(ptr);
+}
+
 extern "C" int rsl_cuda_memcpy_h2d(rsl_cuda_stream *s, void *dst_dev,
                                    const void *src_host, unsigned long long n_bytes) {
     if (!s) return -1;

@@ -11024,6 +11024,55 @@ pub fn upload_bytes_to_usm(
     })
 }
 
+/// Promote `bytes` into CUDA **managed** memory, returning a `Storage::Device`
+/// (backend Cuda). The CUDA analogue of [`upload_bytes_to_usm`] — managed memory
+/// is CPU-mappable, so `as_bytes` stays valid while the GPU reads the raw
+/// `device_ptr` (migrating on first access). Used by the MoE tiered-expert tier
+/// to promote a hot expert into VRAM. `None` off-NVIDIA or on alloc failure.
+/// The free closure captures just the device index (managed memory is
+/// device-global, no stream to keep alive — simpler than the USM path).
+pub fn upload_bytes_to_cuda_managed(bytes: &[u8]) -> Option<rustllama_tensor::Storage> {
+    if !cuda_active() || bytes.is_empty() {
+        return None;
+    }
+    let device = 0u32; // single active CUDA device (mirrors the dispatch)
+    let n = bytes.len();
+    let raw = ck::malloc_managed(device, n)?;
+    // Managed memory is host-accessible — a plain memcpy (the pages migrate to
+    // the GPU on the first kernel read).
+    // SAFETY: `raw` is a live managed allocation of exactly `n` bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), raw, n);
+    }
+    let free_fn: Box<dyn FnOnce(*mut u8) + Send + Sync> =
+        Box::new(move |p| unsafe { ck::free_managed(device, p) });
+    // SAFETY: `raw` is non-null (checked) + a `n`-byte managed alloc on
+    // `device`; the closure frees exactly it; managed memory is CPU-mappable.
+    let storage = unsafe {
+        rustllama_tensor::Storage::device_from_raw(
+            raw,
+            n,
+            rustllama_tensor::DeviceBackend::Cuda,
+            device,
+            true,
+            free_fn,
+        )
+    };
+    Some(storage)
+}
+
+/// Promote `bytes` to the ACTIVE GPU backend's device memory — the generic
+/// cross-backend producer the MoE tiered-expert tier routes promotions through.
+/// CUDA → managed (`Storage::Device`); SYCL → USM (`Storage::SyclUsm`, the
+/// existing path, classified `Sycl` by `Storage::residency`); else `None`. (MLX
+/// unified joins when its managed producer lands — write-blind.)
+pub fn upload_bytes_to_device(bytes: &[u8]) -> Option<rustllama_tensor::Storage> {
+    if cuda_active() {
+        return upload_bytes_to_cuda_managed(bytes);
+    }
+    upload_bytes_to_usm(bytes)
+}
+
 pub fn try_embedding_lookup_usm_f32(
     table: &Tensor,
     ids: &[i32],
