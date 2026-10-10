@@ -390,12 +390,13 @@ pub fn moe_ffn_one_into(
     crate::accel::note_routed_experts(picks);
 
     // MoE tiered-expert grouped FFN (decode fast path): when every routed
-    // expert is a promoted, device-resident Q4_K buffer, run the whole top-k
-    // FFN in one on-device pass (no per-expert host↔device round-trip / CPU
-    // silu migration). Verdict + fallback gated; on success `out` holds the
-    // routed-expert sum and the shared expert (below) still adds in. A miss
-    // (not all promoted, dtype ≠ Q4_K, verdict off) falls through unchanged.
-    if crate::accel::try_moe_ffn_grouped_q4k_dev_resident(
+    // expert is a promoted, device-resident buffer of one warp-cooperative quant
+    // (Q4_K/Q8_0/Q6_K), run the whole top-k FFN in one on-device pass (no
+    // per-expert host↔device round-trip / CPU silu migration). Verdict + fallback
+    // gated; on success `out` holds the routed-expert sum and the shared expert
+    // (below) still adds in. A miss (not all promoted, unsupported dtype, verdict
+    // off) falls through unchanged.
+    if crate::accel::try_moe_ffn_grouped_dev_resident(
         hidden,
         &block.gate_per_expert,
         &block.up_per_expert,

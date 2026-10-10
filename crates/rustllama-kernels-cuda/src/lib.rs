@@ -85,10 +85,39 @@ extern "C" {
     // during decode) + a device-wide sync to drain the async prefetches.
     fn rsl_cuda_prefetch_managed(device: c_int, ptr: *const c_void, n_bytes: u64) -> c_int;
     fn rsl_cuda_device_sync(device: c_int) -> c_int;
-    // Grouped Q4_K routed-expert FFN (MoE tiered-expert decode fast path): the
-    // whole top-k expert FFN for one token in one on-device pass.
+    // Grouped routed-expert FFN (MoE tiered-expert decode fast path): the whole
+    // top-k expert FFN for one token in one on-device pass. One entry per
+    // warp-cooperative quant (Q4_K / Q8_0 / Q6_K); identical signature.
     #[allow(clippy::too_many_arguments)]
     fn rsl_cuda_moe_ffn_grouped_q4k(
+        s: *mut RslCudaStreamRaw,
+        gate_ptrs: *const *const c_void,
+        up_ptrs: *const *const c_void,
+        down_ptrs: *const *const c_void,
+        weights: *const f32,
+        x: *const f32,
+        ff: *mut f32,
+        out: *mut f32,
+        n_pick: c_int,
+        d_model: c_int,
+        d_ff: c_int,
+    ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    fn rsl_cuda_moe_ffn_grouped_q8_0(
+        s: *mut RslCudaStreamRaw,
+        gate_ptrs: *const *const c_void,
+        up_ptrs: *const *const c_void,
+        down_ptrs: *const *const c_void,
+        weights: *const f32,
+        x: *const f32,
+        ff: *mut f32,
+        out: *mut f32,
+        n_pick: c_int,
+        d_model: c_int,
+        d_ff: c_int,
+    ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    fn rsl_cuda_moe_ffn_grouped_q6_k(
         s: *mut RslCudaStreamRaw,
         gate_ptrs: *const *const c_void,
         up_ptrs: *const *const c_void,
@@ -2565,8 +2594,9 @@ impl CudaMatvecCache {
     /// device-accessible (managed/unified) Q4_K weight buffer on this cache's
     /// device, valid for the call, sized for the stated (M,K).
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn moe_ffn_grouped_q4k_dev_resident(
+    pub unsafe fn moe_ffn_grouped_dev_resident(
         &mut self,
+        kind: CudaPackedKind,
         x: &[f32],
         gate_ptrs: &[*const c_void],
         up_ptrs: &[*const c_void],
@@ -2576,6 +2606,14 @@ impl CudaMatvecCache {
         d_model: usize,
         d_ff: usize,
     ) -> bool {
+        // Only the warp-cooperative quants have a grouped FFN kernel.
+        if !matches!(
+            kind,
+            CudaPackedKind::Q4_K | CudaPackedKind::Q8_0 | CudaPackedKind::Q6_K
+        ) {
+            return false;
+        }
+        let align = kind.k_alignment();
         let n = gate_ptrs.len();
         if n == 0
             || n != up_ptrs.len()
@@ -2585,8 +2623,8 @@ impl CudaMatvecCache {
             || out.len() != d_model
             || d_model == 0
             || d_ff == 0
-            || d_model % 256 != 0
-            || d_ff % 256 != 0
+            || d_model % align != 0
+            || d_ff % align != 0
         {
             return false;
         }
@@ -2642,20 +2680,23 @@ impl CudaMatvecCache {
         // SAFETY: all buffers are live device scratch on this stream sized above;
         // the entry memsets `out`, runs both batched kernels in stream order
         // (kernel 2 reads what kernel 1 wrote), and synchronizes before return.
+        // One C entry per warp-cooperative quant; call directly per arm (each
+        // returns c_int → the match unifies without a fn-pointer coercion).
+        let s = self.stream.raw();
+        let (n_c, dm_c, df_c) = (n as c_int, d_model as c_int, d_ff as c_int);
         let rc = unsafe {
-            rsl_cuda_moe_ffn_grouped_q4k(
-                self.stream.raw(),
-                gate_dev,
-                up_dev,
-                down_dev,
-                wt_dev,
-                x_ptr,
-                ff_ptr,
-                out_ptr,
-                n as c_int,
-                d_model as c_int,
-                d_ff as c_int,
-            )
+            match kind {
+                CudaPackedKind::Q4_K => rsl_cuda_moe_ffn_grouped_q4k(
+                    s, gate_dev, up_dev, down_dev, wt_dev, x_ptr, ff_ptr, out_ptr, n_c, dm_c, df_c,
+                ),
+                CudaPackedKind::Q8_0 => rsl_cuda_moe_ffn_grouped_q8_0(
+                    s, gate_dev, up_dev, down_dev, wt_dev, x_ptr, ff_ptr, out_ptr, n_c, dm_c, df_c,
+                ),
+                CudaPackedKind::Q6_K => rsl_cuda_moe_ffn_grouped_q6_k(
+                    s, gate_dev, up_dev, down_dev, wt_dev, x_ptr, ff_ptr, out_ptr, n_c, dm_c, df_c,
+                ),
+                _ => return false, // guarded at entry; unreachable
+            }
         };
         if rc != 0 || consume_error_count() != 0 {
             return false;

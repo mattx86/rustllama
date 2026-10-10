@@ -1852,25 +1852,42 @@ pub fn reset_device_caches_for_new_model() {
     set_moe_tier_active(false);
 }
 
-/// Grouped Q4_K routed-expert FFN decode path: ON only where its on-device
-/// self-check (`tune --validate-kernels` → the `moe:ffn_grouped_q4k` verdict)
-/// matched the CPU reference. Fail-closed (off until validated); the per-expert
-/// dispatch is the always-correct fallback.
-fn moe_ffn_grouped_q4k_enabled() -> bool {
-    cuda_active() && kernel_verdict("moe:ffn_grouped_q4k")
+/// `--cuda-parity` verdict-cache name for the grouped FFN kernel of `kind`, or
+/// `None` for a kind without a grouped kernel (only the warp-cooperative quants
+/// Q4_K/Q8_0/Q6_K have one).
+fn moe_ffn_grouped_verdict_name(kind: ck::CudaPackedKind) -> Option<&'static str> {
+    match kind {
+        ck::CudaPackedKind::Q4_K => Some("moe:ffn_grouped_q4k"),
+        ck::CudaPackedKind::Q8_0 => Some("moe:ffn_grouped_q8_0"),
+        ck::CudaPackedKind::Q6_K => Some("moe:ffn_grouped_q6_k"),
+        _ => None,
+    }
 }
 
-/// Grouped Q4_K routed-expert FFN — the MoE tiered-expert DECODE fast path.
-/// When every routed (picked) expert's gate/up/down weights are promoted Q4_K
-/// buffers resident in CUDA device (managed) memory, run the whole top-k FFN in
-/// ONE on-device pass (`out = Σ_e w_e·(Wdown_e·silu(Wgate_e·x)⊙(Wup_e·x))`)
-/// instead of the per-expert loop's ~17 host↔device round-trips per layer (the
-/// CPU silu between each expert's matvecs forced a device→host→device managed
-/// migration — the ~30%-SM decode profile). `out` is OVERWRITTEN with the
-/// routed-expert sum; the caller adds any shared-expert contribution after.
-/// Returns false — caller runs the per-expert path, `out` untouched — unless
-/// the verdict is on AND all picks are device-resident Q4_K of the FFN dims.
-pub fn try_moe_ffn_grouped_q4k_dev_resident(
+/// Grouped routed-expert FFN decode path for `kind`: ON only where its on-device
+/// self-check (`tune --validate-kernels` → the `moe:ffn_grouped_<fmt>` verdict)
+/// matched the CPU reference. Fail-closed (off until validated, or for a kind
+/// with no grouped kernel); the per-expert dispatch is the always-correct
+/// fallback.
+fn moe_ffn_grouped_enabled(kind: ck::CudaPackedKind) -> bool {
+    cuda_active()
+        && moe_ffn_grouped_verdict_name(kind)
+            .map(kernel_verdict)
+            .unwrap_or(false)
+}
+
+/// Grouped routed-expert FFN — the MoE tiered-expert DECODE fast path. When
+/// every routed (picked) expert's gate/up/down weights are promoted buffers of
+/// ONE warp-cooperative quant (Q4_K/Q8_0/Q6_K) resident in CUDA device (managed)
+/// memory, run the whole top-k FFN in ONE on-device pass
+/// (`out = Σ_e w_e·(Wdown_e·silu(Wgate_e·x)⊙(Wup_e·x))`) instead of the
+/// per-expert loop's ~17 host↔device round-trips per layer (the CPU silu between
+/// each expert's matvecs forced a device→host→device managed migration — the
+/// ~30%-SM decode profile). `out` is OVERWRITTEN with the routed-expert sum; the
+/// caller adds any shared-expert contribution after. Returns false — caller runs
+/// the per-expert path, `out` untouched — unless the kind's verdict is on AND all
+/// picks are device-resident of that same kind + the FFN dims.
+pub fn try_moe_ffn_grouped_dev_resident(
     hidden: &[f32],
     gate: &[Tensor],
     up: &[Tensor],
@@ -1880,32 +1897,42 @@ pub fn try_moe_ffn_grouped_q4k_dev_resident(
     d_ff: usize,
     out: &mut [f32],
 ) -> bool {
-    if !moe_ffn_grouped_q4k_enabled()
-        || picks.is_empty()
-        || hidden.len() != d_model
-        || out.len() != d_model
-        || d_model % 256 != 0
-        || d_ff % 256 != 0
-    {
+    if !cuda_active() || picks.is_empty() || hidden.len() != d_model || out.len() != d_model {
         return false;
     }
-    // Q4_K row bytes = (K/256) super-blocks × 144 B. A promoted per-expert view
-    // holds its own managed copy of exactly its bytes, so the length identifies
-    // the exact weight shape without depending on the view's `shape` encoding.
-    let q4k_row_bytes = |k: usize| (k / 256) * 144;
-    let gate_up_bytes = d_ff * q4k_row_bytes(d_model);
-    let down_bytes = d_model * q4k_row_bytes(d_ff);
+    // The shared expert kind comes from the first pick's gate tensor; only the
+    // warp-cooperative quants have a grouped kernel, and the per-kind verdict
+    // must have passed.
+    let first = picks[0].0;
+    if first >= gate.len() {
+        return false;
+    }
+    let Some(kind) = dtype_to_cuda_kind(gate[first].dtype) else {
+        return false;
+    };
+    if !moe_ffn_grouped_enabled(kind) {
+        return false;
+    }
+    let align = kind.k_alignment();
+    if d_model % align != 0 || d_ff % align != 0 {
+        return false;
+    }
+    // Per-kind packed row bytes. A promoted per-expert view holds its own managed
+    // copy of exactly its bytes, so the length identifies the exact weight shape
+    // without depending on the view's `shape` encoding.
+    let gate_up_bytes = d_ff * kind.row_bytes(d_model);
+    let down_bytes = d_model * kind.row_bytes(d_ff);
     let want = |t: &Tensor, expected: usize| -> Option<*const core::ffi::c_void> {
         match (
             t.storage.device_backend(),
             t.storage.device_ptr(),
             dtype_to_cuda_kind(t.dtype),
         ) {
-            (
-                Some((rustllama_tensor::DeviceBackend::Cuda, _)),
-                Some(p),
-                Some(ck::CudaPackedKind::Q4_K),
-            ) if t.storage.len_bytes() == expected => Some(p as *const core::ffi::c_void),
+            (Some((rustllama_tensor::DeviceBackend::Cuda, _)), Some(p), Some(k))
+                if k == kind && t.storage.len_bytes() == expected =>
+            {
+                Some(p as *const core::ffi::c_void)
+            }
             _ => None,
         }
     };
@@ -1936,11 +1963,11 @@ pub fn try_moe_ffn_grouped_q4k_dev_resident(
     let Ok(mut guard) = cache.lock() else {
         return false;
     };
-    // SAFETY: every ptr is a live managed Q4_K buffer (checked above) owned by a
-    // promoted expert `Tensor` that outlives this call; dims validated.
+    // SAFETY: every ptr is a live managed buffer of `kind` (checked above) owned
+    // by a promoted expert `Tensor` that outlives this call; dims validated.
     let ok = unsafe {
-        guard.moe_ffn_grouped_q4k_dev_resident(
-            hidden, &gate_ptrs, &up_ptrs, &down_ptrs, &weights, out, d_model, d_ff,
+        guard.moe_ffn_grouped_dev_resident(
+            kind, hidden, &gate_ptrs, &up_ptrs, &down_ptrs, &weights, out, d_model, d_ff,
         )
     };
     if ok {

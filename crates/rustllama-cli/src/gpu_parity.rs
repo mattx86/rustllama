@@ -3841,18 +3841,23 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
-    // ---- Grouped Q4_K routed-expert FFN (MoE tiered-expert decode fast path) ----
-    // Builds NP experts of Q4_K gate/up/down, runs the whole top-k FFN on-device
-    // in one pass, and grades vs a CPU reference over the IDENTICAL packed
-    // weights (per-expert q4_k matvec → silu_mul → down matvec → weighted sum).
-    // Not bit-exact — the GPU accumulates the weighted sum via atomicAdd (FMA
-    // reassociation only) — so cos/max_rel gated like the other grouped/TC paths.
-    {
-        let name = "moe:ffn_grouped_q4k";
-        const D: usize = 512; // d_model == d_ff, Q4_K-aligned (% 256 == 0)
+    // ---- Grouped routed-expert FFN (MoE tiered-expert decode fast path) ----
+    // Builds NP experts of gate/up/down for each warp-cooperative quant, runs the
+    // whole top-k FFN on-device in one pass, and grades vs a CPU reference over
+    // the IDENTICAL packed weights (per-expert matvec → silu_mul → down matvec →
+    // weighted sum). Not bit-exact — the GPU accumulates the weighted sum via
+    // atomicAdd (FMA reassociation only) — so cos/max_rel gated. The probe name
+    // MUST match `accel::moe_ffn_grouped_verdict_name` so the dispatch gate reads
+    // the right verdict.
+    for (name, dtype, kind) in [
+        ("moe:ffn_grouped_q4k", "q4_k", ck::CudaPackedKind::Q4_K),
+        ("moe:ffn_grouped_q8_0", "q8_0", ck::CudaPackedKind::Q8_0),
+        ("moe:ffn_grouped_q6_k", "q6_k", ck::CudaPackedKind::Q6_K),
+    ] {
+        const D: usize = 512; // d_model == d_ff; divisible by both 256 and 32
         const NP: usize = 4; // routed experts
-        let layout = LAYOUTS.iter().find(|l| l.name == "q4_k").expect("q4_k layout");
-        let cpu_mv = cpu_matvec_for("q4_k");
+        let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
+        let cpu_mv = cpu_matvec_for(dtype);
         let x = gen_x(D, 0x00A1_1CE5);
         let weights: [f32; NP] = [0.9, 0.05, 0.03, 0.02];
         let mut wg: Vec<Vec<u8>> = Vec::with_capacity(NP);
@@ -3911,10 +3916,12 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         } else if let Some(mut cache) = ck::CudaMatvecCache::new(0, 1 << 20) {
             let mut out_gpu = vec![0f32; D];
             let wv = weights.to_vec();
-            // SAFETY: every ptr is a live device Q4_K buffer held in `keep` on
-            // device 0, valid for the call; dims are Q4_K-aligned.
+            // SAFETY: every ptr is a live device buffer of `kind` held in `keep`
+            // on device 0, valid for the call; dims are kind-aligned.
             let ok = unsafe {
-                cache.moe_ffn_grouped_q4k_dev_resident(&x, &gp, &upp, &dp, &wv, &mut out_gpu, D, D)
+                cache.moe_ffn_grouped_dev_resident(
+                    kind, &x, &gp, &upp, &dp, &wv, &mut out_gpu, D, D,
+                )
             };
             if ok {
                 cu_grade(name, &out_gpu, &cpu, 0.999, 0.02, &mut counts);

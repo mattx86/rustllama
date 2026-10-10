@@ -2006,7 +2006,7 @@ RSL_GATE_UP_FUSED(matvec_iq1_s_packed_f32,  iq1_s_row_dot,  256,  50, 256)
 RSL_GATE_UP_FUSED(matvec_iq1_m_packed_f32,  iq1_m_row_dot,  256,  56, 256)
 
 // ============================================================
-// GROUPED Q4_K ROUTED-EXPERT FFN — MoE tiered-expert DECODE fast path.
+// GROUPED ROUTED-EXPERT FFN — MoE tiered-expert DECODE fast path.
 // Does the whole top-k expert FFN for one token in ONE on-device pass over all
 // routed (device-promoted) experts, instead of the per-expert dispatch's ~17
 // host<->device round-trips per layer (each expert = fused gate+up matvec, a
@@ -2014,83 +2014,83 @@ RSL_GATE_UP_FUSED(matvec_iq1_m_packed_f32,  iq1_m_row_dot,  256,  56, 256)
 // down matvec — all separately synchronized). Here x is uploaded once and out
 // downloaded once; the gate+up+silu+down chain never leaves the GPU, so the
 // SM stops idling on launch latency + page faults (the ~30%-SM decode profile).
-// Q4_K-only: the promoted-expert common case (all experts share dtype + dims).
-// NOT bit-exact vs the sequential per-expert accumulate — the weighted 8-term
-// sum is an atomicAdd reduction (FMA reassociation only) — so it is graded
-// cos/max_rel and verdict + fallback gated, never shipped where it miscomputes.
-// gate/up weights: M=d_ff rows, K=d_model. down: M=d_model rows, K=d_ff.
-// Both K multiples of 256 (Q4_K super-block); 144 B/block, so row r starts at
-// r*(K/256)*144. Pointer args are DEVICE arrays of the experts' device ptrs.
+// All routed experts share ONE dtype + dims. NOT bit-exact vs the sequential
+// per-expert accumulate — the weighted sum is an atomicAdd reduction (FMA
+// reassociation only) — so it is graded cos/max_rel and verdict + fallback
+// gated, never shipped where it miscomputes. gate/up weights: M=d_ff rows,
+// K=d_model. down: M=d_model rows, K=d_ff. Instantiated per warp-cooperative
+// quant (Q4_K/Q8_0/Q6_K) via the per-format row_dot + its block layout (BPB
+// bytes / EPB elems per super-block); row r starts at r*(K/EPB)*BPB. Pointer
+// args are DEVICE arrays of the experts' device ptrs.
 // ============================================================
-
-// Kernel 1 — for every (expert e, row r<d_ff): ff[e*d_ff+r] = silu(gate)*up,
-// gate = Wg_e[r].x, up = Wu_e[r].x. One warp per (e,r); grid.y strides experts.
-__global__ void moe_grouped_q4k_gate_up_silu_kernel(
-    const unsigned char *const *gate_ptrs, const unsigned char *const *up_ptrs,
-    const float *x, float *ff, int d_ff, int d_model) {
-    int e = blockIdx.y;
-    int r = blockIdx.x * blockDim.y + threadIdx.y;
-    if (r >= d_ff) return;
-    int lane = threadIdx.x;
-    int bpr = d_model / 256;
-    size_t off = (size_t)r * bpr * 144;
-    float g = q4_k_row_dot_warp(gate_ptrs[e] + off, x, bpr, lane);
-    float u = q4_k_row_dot_warp(up_ptrs[e] + off, x, bpr, lane);
-    for (int o = warpSize >> 1; o > 0; o >>= 1) {
-        g += __shfl_down_sync(0xffffffffu, g, o);
-        u += __shfl_down_sync(0xffffffffu, u, o);
+#define RSL_MOE_GROUPED_FFN(NAME, ROWDOTWARP, BPB, EPB)                        \
+    /* Kernel 1 — per (expert e, row r<d_ff): ff[e*d_ff+r]=silu(gate)*up. */   \
+    __global__ void NAME##_gate_up_silu_kernel(                               \
+        const unsigned char *const *gate_ptrs,                               \
+        const unsigned char *const *up_ptrs, const float *x, float *ff,       \
+        int d_ff, int d_model) {                                              \
+        int e = blockIdx.y;                                                   \
+        int r = blockIdx.x * blockDim.y + threadIdx.y;                        \
+        if (r >= d_ff) return;                                                \
+        int lane = threadIdx.x;                                               \
+        int bpr = d_model / (EPB);                                            \
+        size_t off = (size_t)r * bpr * (BPB);                                 \
+        float g = ROWDOTWARP(gate_ptrs[e] + off, x, bpr, lane);               \
+        float u = ROWDOTWARP(up_ptrs[e] + off, x, bpr, lane);                 \
+        for (int o = warpSize >> 1; o > 0; o >>= 1) {                         \
+            g += __shfl_down_sync(0xffffffffu, g, o);                         \
+            u += __shfl_down_sync(0xffffffffu, u, o);                         \
+        }                                                                     \
+        if (lane == 0) {                                                      \
+            float s = g / (1.0f + expf(-g));                                  \
+            ff[(size_t)e * d_ff + r] = s * u;                                 \
+        }                                                                     \
+    }                                                                         \
+    /* Kernel 2 — per (expert e, col c<d_model): atomicAdd(out[c], w_e*down). */ \
+    __global__ void NAME##_down_accum_kernel(                                 \
+        const unsigned char *const *down_ptrs, const float *weights,          \
+        const float *ff, float *out, int d_model, int d_ff) {                 \
+        int e = blockIdx.y;                                                   \
+        int c = blockIdx.x * blockDim.y + threadIdx.y;                        \
+        if (c >= d_model) return;                                             \
+        int lane = threadIdx.x;                                               \
+        int bpr = d_ff / (EPB);                                               \
+        size_t off = (size_t)c * bpr * (BPB);                                 \
+        float acc =                                                           \
+            ROWDOTWARP(down_ptrs[e] + off, ff + (size_t)e * d_ff, bpr, lane); \
+        for (int o = warpSize >> 1; o > 0; o >>= 1)                           \
+            acc += __shfl_down_sync(0xffffffffu, acc, o);                     \
+        if (lane == 0) atomicAdd(&out[c], weights[e] * acc);                  \
+    }                                                                         \
+    /* x/ff/out + the ptr/weight arrays are DEVICE buffers; kernel 2 reads ff \
+       on the same stream kernel 1 wrote it (stream order, no explicit sync); \
+       `out` is memset 0 before the accumulate. */                           \
+    extern "C" int rsl_cuda_##NAME(                                           \
+        rsl_cuda_stream *s, const void *const *gate_ptrs,                     \
+        const void *const *up_ptrs, const void *const *down_ptrs,             \
+        const float *weights, const float *x, float *ff, float *out,          \
+        int n_pick, int d_model, int d_ff) {                                  \
+        if (!s || !gate_ptrs || !up_ptrs || !down_ptrs || !weights || !x ||   \
+            !ff || !out || n_pick <= 0 || d_model <= 0 || d_ff <= 0 ||        \
+            (d_model % (EPB)) != 0 || (d_ff % (EPB)) != 0)                     \
+            return -1;                                                        \
+        cudaSetDevice(s->device);                                            \
+        dim3 block(32, 8);                                                    \
+        dim3 g1((unsigned)((d_ff + 7) / 8), (unsigned)n_pick);               \
+        NAME##_gate_up_silu_kernel<<<g1, block, 0, s->stream>>>(              \
+            (const unsigned char *const *)gate_ptrs,                          \
+            (const unsigned char *const *)up_ptrs, x, ff, d_ff, d_model);     \
+        cudaMemsetAsync(out, 0, (size_t)d_model * sizeof(float), s->stream);  \
+        dim3 g2((unsigned)((d_model + 7) / 8), (unsigned)n_pick);            \
+        NAME##_down_accum_kernel<<<g2, block, 0, s->stream>>>(               \
+            (const unsigned char *const *)down_ptrs, weights, ff, out,        \
+            d_model, d_ff);                                                   \
+        return rsl_cuda_check("rsl_cuda_" #NAME);                             \
     }
-    if (lane == 0) {
-        float s = g / (1.0f + expf(-g)); // silu(gate); matches silu_mul_f32_kernel
-        ff[(size_t)e * d_ff + r] = s * u;
-    }
-}
 
-// Kernel 2 — for every (expert e, col c<d_model): atomicAdd(out[c], w_e*down),
-// down = Wd_e[c].ff_e. One warp per (e,c). `out` is zeroed by the entry below.
-__global__ void moe_grouped_q4k_down_accum_kernel(
-    const unsigned char *const *down_ptrs, const float *weights, const float *ff,
-    float *out, int d_model, int d_ff) {
-    int e = blockIdx.y;
-    int c = blockIdx.x * blockDim.y + threadIdx.y;
-    if (c >= d_model) return;
-    int lane = threadIdx.x;
-    int bpr = d_ff / 256;
-    size_t off = (size_t)c * bpr * 144;
-    float acc =
-        q4_k_row_dot_warp(down_ptrs[e] + off, ff + (size_t)e * d_ff, bpr, lane);
-    for (int o = warpSize >> 1; o > 0; o >>= 1)
-        acc += __shfl_down_sync(0xffffffffu, acc, o);
-    if (lane == 0) atomicAdd(&out[c], weights[e] * acc);
-}
-
-// x/ff/out + the four pointer/weight arrays are all DEVICE buffers (the caller
-// uploads x, the expert device-ptr arrays, and the routing weights to scratch,
-// and allocates ff [n_pick*d_ff] + out [d_model]). Kernel 2 reads ff on the
-// same stream as kernel 1 writes it → stream ordering serializes them, no
-// explicit sync. `out` is memset to 0 before the accumulate.
-extern "C" int rsl_cuda_moe_ffn_grouped_q4k(
-    rsl_cuda_stream *s, const void *const *gate_ptrs,
-    const void *const *up_ptrs, const void *const *down_ptrs,
-    const float *weights, const float *x, float *ff, float *out, int n_pick,
-    int d_model, int d_ff) {
-    if (!s || !gate_ptrs || !up_ptrs || !down_ptrs || !weights || !x || !ff ||
-        !out || n_pick <= 0 || d_model <= 0 || d_ff <= 0 ||
-        (d_model % 256) != 0 || (d_ff % 256) != 0)
-        return -1;
-    cudaSetDevice(s->device);
-    dim3 block(32, 8);
-    dim3 g1((unsigned)((d_ff + 7) / 8), (unsigned)n_pick);
-    moe_grouped_q4k_gate_up_silu_kernel<<<g1, block, 0, s->stream>>>(
-        (const unsigned char *const *)gate_ptrs,
-        (const unsigned char *const *)up_ptrs, x, ff, d_ff, d_model);
-    cudaMemsetAsync(out, 0, (size_t)d_model * sizeof(float), s->stream);
-    dim3 g2((unsigned)((d_model + 7) / 8), (unsigned)n_pick);
-    moe_grouped_q4k_down_accum_kernel<<<g2, block, 0, s->stream>>>(
-        (const unsigned char *const *)down_ptrs, weights, ff, out, d_model,
-        d_ff);
-    return rsl_cuda_check("rsl_cuda_moe_ffn_grouped_q4k");
-}
+RSL_MOE_GROUPED_FFN(moe_ffn_grouped_q4k, q4_k_row_dot_warp, 144, 256)
+RSL_MOE_GROUPED_FFN(moe_ffn_grouped_q8_0, q8_0_row_dot_warp, 34, 32)
+RSL_MOE_GROUPED_FFN(moe_ffn_grouped_q6_k, q6_k_row_dot_warp, 210, 256)
 RSL_GATE_UP_FUSED(matvec_iq2_xxs_packed_f32, iq2_xxs_row_dot, 256, 66, 256)
 RSL_GATE_UP_FUSED(matvec_iq2_xs_packed_f32, iq2_xs_row_dot, 256,  74, 256)
 RSL_GATE_UP_FUSED(matvec_iq2_s_packed_f32,  iq2_s_row_dot,  256,  82, 256)
