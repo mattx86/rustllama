@@ -1821,6 +1821,24 @@ pub fn cuda_sync_device() {
     }
 }
 
+/// VRAM (bytes) of the first enabled DEDICATED (non-integrated) SYCL device, for
+/// the MoE tier auto-enable on a SYCL box with no NVIDIA GPU (Intel Arc/PVC).
+/// `None` on an integrated iGPU (Iris Xe — its "VRAM" is a shared-LPDDR aperture,
+/// so promoting experts to USM there is a host-backed no-op), when no SYCL device
+/// is enabled, or when the VRAM query fails. Total VRAM is used as the free-VRAM
+/// proxy (no SYCL free query exists); promotion happens before the weight upload
+/// so ~all of it is free, and USM device-alloc failure stops promotion
+/// gracefully. WRITE-BLIND: no dedicated-SYCL hardware available to validate.
+pub fn sycl_dedicated_vram_bytes() -> Option<u64> {
+    let idx = first_enabled_sycl_device_index()?;
+    let info = sk::device_info(idx).ok()?;
+    if info.is_integrated {
+        return None;
+    }
+    let bytes = info.vram_mb().saturating_mul(1024 * 1024);
+    (bytes > 0).then_some(bytes)
+}
+
 /// Reset all process-global / per-thread GPU device state tied to the PREVIOUS
 /// model, at the start of loading a new one. The matvec weight caches
 /// (CUDA/MLX) key by the weight's HOST byte address, which the allocator reuses

@@ -302,11 +302,15 @@ ID can replace `-` later). Packaging helpers: `_release_package.ps1` (bsdtar),
   GPU-resident regardless of the `n_gpu_layers` layer cutoff (the lifted dispatch
   in `accel.rs`). Budget = the `auto` projection: free VRAM at load − non-expert
   weights − a **KV-mirror-aware margin** (the flash-decode KV mirror's bytes for
-  the active kv_dtype, min 1 GiB, covering the CUDA context + scratch + frag),
+  the active kv_dtype, min 1 GiB, covering the device context + scratch + frag),
   capped at total expert bytes. No env var: the tier self-limits — a failed VRAM
-  query or a tiny/unified GPU yields budget 0 → no promotion. CUDA (managed
-  memory) today; SYCL (USM, Intel Arc/PVC) device-tier auto-enable is a follow-up
-  (the `auto` projection is CUDA-only); inert off GPU / on unified-memory iGPUs.
+  query or a tiny/unified GPU yields budget 0 → no promotion. Auto-enables on
+  **CUDA** (managed memory) OR a **dedicated SYCL GPU** (Intel Arc/PVC, USM —
+  `sycl_dedicated_vram_bytes`, total-VRAM proxy since SYCL has no free query;
+  WRITE-BLIND, no dedicated-SYCL HW to validate). Inert off GPU, on unified /
+  integrated iGPUs (Iris Xe — `is_integrated` → no promotion, USM is host-backed
+  there), and on Apple MLX (unified memory → the device tier is a no-op by
+  construction: no dedicated VRAM to promote into).
   Safe-by-construction: managed memory oversubscribes to host-paged UVM + no-double
   promotion, so an over-estimate degrades to "slower", never OOM/wrong-answer.
   Device-cache + KV-mirror state is reset on every model load so reloads (the

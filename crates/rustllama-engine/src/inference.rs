@@ -1434,24 +1434,28 @@ impl CpuEngine {
         // inert on unified-memory GPUs (promotion to managed is a no-op there).
         // SYCL/MLX device-tier auto-enable is a follow-up (needs their
         // free-VRAM query; the `auto` projection is CUDA-only today).
-        if rustllama_models::accel::cuda_active() && model.weights.is_moe() {
-            // AUTO — NO ENV VAR. Always use the `auto` VRAM-expert projection on
-            // a CUDA MoE model: free VRAM at load − non-expert weights − the
-            // KV-mirror-aware margin, capped at total expert bytes. The tier
-            // self-limits with no knob: a failed VRAM query (avail=0) or a tiny /
-            // unified-memory GPU yields budget 0, and the `> 0` guard below then
-            // skips promotion. `promote_experts_to_device` is NO-DOUBLE (promote
-            // a block, free its host-side parent → transient host ≈ one block)
-            // and managed memory oversubscribes to host-paged UVM, so an
-            // over-estimate degrades to "slower", never an OOM or wrong answer.
+        // AUTO — NO ENV VAR. Tier target VRAM: CUDA free VRAM, else a DEDICATED
+        // SYCL GPU (Intel Arc/PVC — `None` on integrated Iris Xe where USM
+        // promotion is a host-backed no-op, and on a box with no usable GPU).
+        // The promotion routes to the active backend (CUDA managed / SYCL USM)
+        // via `upload_bytes_to_device`. The tier self-limits with no knob: a
+        // failed VRAM query / tiny / unified GPU yields budget 0 and the `> 0`
+        // guard below skips promotion. `promote_experts_to_device` is NO-DOUBLE
+        // (promote a block, free its host parent → transient host ≈ one block),
+        // so an over-estimate degrades to "slower", never OOM/wrong-answer.
+        let tier_avail: Option<u64> = if rustllama_models::accel::cuda_active() {
+            Some(rustllama_runtime::gpu_detect::nvidia_free_vram_bytes(0).unwrap_or(0))
+        } else {
+            rustllama_models::accel::sycl_dedicated_vram_bytes()
+        };
+        if let Some(avail) = tier_avail {
+          if model.weights.is_moe() {
             let vram_expert_bytes: u64 = {
                 // Projected budget: free VRAM at load (weights upload lazily, so
                 // ~nothing is resident yet) − the non-expert weights (assumed all
-                // GPU-resident, conservative) − a margin for the CUDA context, KV
-                // mirror, and fragmentation; capped at the total expert bytes.
+                // GPU-resident, conservative) − a margin for the device context,
+                // KV mirror, and fragmentation; capped at the total expert bytes.
                 let (expert_b, non_expert_b) = model.weights.vram_byte_breakdown();
-                let avail =
-                    rustllama_runtime::gpu_detect::nvidia_free_vram_bytes(0).unwrap_or(0);
                 // Margin = the decode KV mirror + a floor for the CUDA context,
                 // Q/out scratch, and fragmentation. The canonical KV cache is
                 // host RAM (`KvBuf::Host`), BUT the CUDA/Metal flash-DECODE path
@@ -1501,10 +1505,11 @@ impl CpuEngine {
                         promoted_mb = bytes / (1024 * 1024),
                         budget_mb = vram_expert_bytes / (1024 * 1024),
                         ranked = ranked.len(),
-                        "moe tiered-expert: promoted hottest experts to CUDA device memory"
+                        "moe tiered-expert: promoted hottest experts to GPU device memory"
                     );
                 }
             }
+          }
         }
         // Wrap the model in its Arc, then (Windows) VirtualLock the hot
         // weight tiers into RAM per RUSTLLAMA_LOCK_RAM_MB. Done after the
