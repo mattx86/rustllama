@@ -6086,6 +6086,12 @@ fn cmd_tune_kv_dtype(
     if repeats == 0 {
         anyhow::bail!("--kv-dtype-repeats must be >= 1");
     }
+    // Coherence needs a longer decode sample than the shared tune default (16):
+    // the gate is an EXACT top-1 match, and a marginally-lossy KV dtype can agree
+    // for the first few tokens then diverge — so grade over >=64 decode tokens
+    // for a robust verdict. Cheap next to the per-candidate model load; only this
+    // sweep is affected (placement/other sweeps keep the caller's value).
+    let decode_tokens = decode_tokens.max(64);
 
     let m_cfg = MeasurementConfig {
         // Initial value is irrelevant — measure_kv_dtype_candidates overrides
@@ -6158,11 +6164,13 @@ fn cmd_tune_kv_dtype(
         "  {:>6}  {:>9}  {:>11}  {:>11}  {:>7}  {:>9}  notes",
         "dtype", "warmup", "median tps", "p100 tps", "bpe", "vs-ref"
     );
-    // Coherence threshold: a candidate must agree with the
-    // reference dtype on ≥90% of decode tokens to remain
-    // eligible. Empirically the threshold below which KV-quant
-    // artifacts start to be visible in generation quality.
-    const COHERENCE_THRESHOLD: f32 = 0.90;
+    // Coherence threshold: a candidate must agree with the reference dtype on
+    // 100% of the measured decode tokens (EXACT top-1 match) to remain eligible.
+    // A quant KV is adopted only when it is LOSSLESS on the probe — anything that
+    // diverges even once falls back to the next-smaller coherent dtype (and
+    // ultimately f32). This is deliberately strict: KV error compounds over
+    // context, so "near-coherent" is not good enough to ship as the auto default.
+    const COHERENCE_THRESHOLD: f32 = 1.0;
 
     // Speed-first-if-it-fits selection budget. Among coherent
     // candidates we want the FASTEST that still fits memory, only
@@ -8868,10 +8876,9 @@ fn bench(
     stats("decode", decode_tps, "tok/s");
     stats("wall", wall_ms, "ms");
     // MoE tiered-expert engine: how many matvecs ran against a promoted
-    // (device-resident) expert during the bench. Non-zero confirms
-    // `RUSTLLAMA_MOE_VRAM_EXPERT_MB` actually engaged the device tier (vs
-    // silently falling back); omitted when 0 so non-MoE / non-promoted benches
-    // stay quiet.
+    // (device-resident) expert during the bench. Non-zero confirms the
+    // (auto-enabled) device tier actually engaged (vs silently falling back);
+    // omitted when 0 so non-MoE / non-promoted benches stay quiet.
     let dev_resident = rustllama_engine::moe_dev_resident_hits();
     if dev_resident > 0 {
         println!();

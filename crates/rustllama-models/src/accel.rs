@@ -14078,10 +14078,10 @@ static MOE_DEV_RESIDENT_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Record one device-resident expert matvec (the promoted-expert fast path).
-/// Cheap (one relaxed add); the FIRST hit also logs once, so a
-/// `RUSTLLAMA_MOE_VRAM_EXPERT_MB` run can confirm — from the log alone — that
-/// promoted experts actually dispatch to the device tier instead of silently
-/// falling back to the upload path / CPU. Pairs with the promotion log
+/// Cheap (one relaxed add); the FIRST hit also logs once, so a MoE model run
+/// can confirm — from the log alone — that promoted experts actually dispatch
+/// to the (auto-enabled) device tier instead of silently falling back to the
+/// upload path / CPU. Pairs with the promotion log
 /// ("promoted N experts") emitted at load.
 fn note_moe_dev_resident_hit() {
     MOE_DEV_RESIDENT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

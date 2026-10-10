@@ -296,19 +296,24 @@ ID can replace `-` later). Packaging helpers: `_release_package.ps1` (bsdtar),
 - `RUSTLLAMA_GUI_EMBEDDED` — set by the GUI; skips the blocking startup autotune.
 - `RUSTLLAMA_DISABLED_GPUS` — exclude specific GPUs from selection.
 - `RUSTLLAMA_IQ_GPU=1` — run IQ1_S imatrix weighting on the GPU during quantize.
-- `RUSTLLAMA_MOE_VRAM_EXPERT_MB=<MB>|auto` — MoE tiered-expert engine,
-  **opt-in, default-off**. Promote the hottest MoE experts (usage-ranked from
-  the per-model sidecar) into the GPU's device memory at load so they run
-  GPU-resident regardless of the `n_gpu_layers` layer cutoff (the device-resident
-  dispatch is lifted above it). `<MB>` is a manual budget; `auto` uses the
-  Phase-4 projection — free VRAM at load − non-expert weights − a margin (20% or
-  1 GiB) for the CUDA context, KV cache, and fragmentation, capped at total
-  expert bytes. CUDA (managed memory) + SYCL (USM, Intel Arc/PVC) today; inert
-  off GPU / on unified-memory iGPUs where it's a no-op. Safe-by-construction:
-  the device allocation oversubscribes to host-paged memory rather than OOMing,
-  and a failed promotion keeps the CPU bytes — an over-large budget degrades to
-  "slower", never a crash or wrong answer, so the budget/margin is the tunable
-  lever. Benefit is on dedicated-VRAM GPUs; write-blind on this box.
+- (No env var) **MoE tiered-expert engine — AUTO on CUDA, no knob.** A MoE model
+  on a CUDA box automatically promotes its hottest experts (usage-ranked from the
+  per-model sidecar) into the GPU's device (managed) memory at load so they run
+  GPU-resident regardless of the `n_gpu_layers` layer cutoff (the lifted dispatch
+  in `accel.rs`). Budget = the `auto` projection: free VRAM at load − non-expert
+  weights − a **KV-mirror-aware margin** (the flash-decode KV mirror's bytes for
+  the active kv_dtype, min 1 GiB, covering the CUDA context + scratch + frag),
+  capped at total expert bytes. No env var: the tier self-limits — a failed VRAM
+  query or a tiny/unified GPU yields budget 0 → no promotion. CUDA (managed
+  memory) today; SYCL (USM, Intel Arc/PVC) device-tier auto-enable is a follow-up
+  (the `auto` projection is CUDA-only); inert off GPU / on unified-memory iGPUs.
+  Safe-by-construction: managed memory oversubscribes to host-paged UVM + no-double
+  promotion, so an over-estimate degrades to "slower", never OOM/wrong-answer.
+  Device-cache + KV-mirror state is reset on every model load so reloads (the
+  KV-dtype sweep, multi-model serve) don't reuse a stale host-addr-keyed buffer.
+  Validated on-device (RTX 2000 Ada, Qwen3-30B-A3B: 5.25→~12.86 tok/s coherent,
+  with the autotuner's 100%-coherence-gated q4_0 KV). (Removed env var:
+  `RUSTLLAMA_MOE_VRAM_EXPERT_MB` — the tier is unconditional now.)
 - (Removed) `RUSTLLAMA_FP4_TC` / `_FP8_WGMMA` / `_FP8_WGMMA_TMA` / `_SYCL_XMX`:
   the Blackwell/Hopper tensor-core + Intel XMX/DPAS GEMM paths now **auto-enable
   per device** via an on-device self-check (`tune --validate-kernels` →
