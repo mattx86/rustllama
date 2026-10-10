@@ -1442,7 +1442,18 @@ impl CpuEngine {
                 let (expert_b, non_expert_b) = model.weights.vram_byte_breakdown();
                 let avail =
                     rustllama_runtime::gpu_detect::nvidia_free_vram_bytes(0).unwrap_or(0);
-                let margin = (avail / 5).max(1024 * 1024 * 1024); // 20% or 1 GiB
+                // Margin for the CUDA context, per-forward attention scratch, and
+                // fragmentation. NOT the KV cache: on the CUDA tiered path the KV
+                // lives in HOST RAM (`KvBuf::Host`), so it never competes for
+                // VRAM. The old flat 20% over-reserved ~1.8 GB on a 16 GB GPU —
+                // an on-pod budget sweep (Qwen3-30B-A3B) showed budgets up to
+                // ~13.5 GB promote cleanly (fb steady ~15.9/16.4 GB, no managed
+                // paging/thrash, decode 8.96→10.19 tok/s as more expert layers
+                // land on-device). 10% (min 1.5 GiB) keeps ~400-500 MB headroom
+                // while fitting several more expert layers; promoted experts are
+                // managed memory that pages to host under pressure, so an
+                // over-estimate degrades to "slower", never a hard OOM.
+                let margin = (avail / 10).max(1536 * 1024 * 1024); // 10% or 1.5 GiB
                 avail
                     .saturating_sub(non_expert_b)
                     .saturating_sub(margin)
