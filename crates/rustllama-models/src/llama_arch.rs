@@ -7519,6 +7519,12 @@ impl LlamaModel {
         // that allocation gains ~32 micro-allocs per generated
         // token on a Llama-7B-class model.
         let moe_blocks = self.weights.moe_blocks.as_ref();
+        // #2 Phase 2 (cross-layer hidden residency): true while the device
+        // activation slab holds the current `hidden` and the HOST `hidden` is
+        // stale. Only the pure-dense combined device path keeps it resident
+        // across layers; a drain to host happens on a fallback to the host path
+        // and once after the loop (before the final norm / LM head).
+        let mut hidden_dev_resident = false;
         for layer_idx in 0..n_layers_used {
             let block: &dyn AttnBlock = if let Some(mbs) = moe_blocks {
                 &mbs[layer_idx]
@@ -7568,6 +7574,15 @@ impl LlamaModel {
                     None
                 };
             let mut device_dense_ffn = false;
+            // Cross-layer residency (#2 Phase 2) applies only to the pure-dense
+            // combined path (every layer device-resident). Upload hidden only
+            // when it isn't already resident from the previous layer; keep it
+            // resident (no download) across dense layers. The MoE / attention-
+            // only path stays per-layer (`true, true`) since its host FFN needs
+            // host hidden each layer.
+            let cross_layer = dense_ffn_arg.is_some();
+            let upload_hidden = if cross_layer { !hidden_dev_resident } else { true };
+            let download_hidden = !cross_layer;
             let device_attn = if let KvLayer::F32 { k, v } = &mut kv.layers[layer_idx] {
                 let (attn_ran, ffn_ran) = crate::accel::try_decode_attn_block_cuda_f32(
                     block.w_q(),
@@ -7596,12 +7611,25 @@ impl LlamaModel {
                     cfg.n_layers,
                     layer_idx,
                     cfg.rms_eps,
+                    upload_hidden,
+                    download_hidden,
                 );
                 device_dense_ffn = ffn_ran;
                 attn_ran
             } else {
                 false
             };
+            if device_attn {
+                // Cross-layer: hidden stays on device (host stale); per-layer:
+                // it was downloaded, so host is authoritative.
+                hidden_dev_resident = cross_layer;
+            } else if hidden_dev_resident {
+                // The device path declined this layer but the slab holds the
+                // current hidden (a prior dense layer left it resident); refresh
+                // the host copy before the host attention/FFN path runs.
+                crate::accel::fetch_resident_hidden_cuda_f32(&mut hidden, d);
+                hidden_dev_resident = false;
+            }
             if !device_attn {
             if !crate::accel::try_rmsnorm_usm_f32(
                 &hidden,
@@ -8418,6 +8446,13 @@ impl LlamaModel {
             }
 
             debug::trace_layer(layer_idx, &hidden);
+        }
+
+        // #2 Phase 2: drain the cross-layer-resident hidden back to the host once
+        // the layer loop is done (the dense device path kept it on device across
+        // layers), so the final norm + LM head below read the current state.
+        if hidden_dev_resident {
+            crate::accel::fetch_resident_hidden_cuda_f32(&mut hidden, d);
         }
 
         // ---- output norm + LM head ----

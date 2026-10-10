@@ -7167,6 +7167,11 @@ pub fn try_decode_attn_block_cuda_f32(
     n_layers: usize,
     layer_idx: usize,
     rms_eps: f32,
+    // Cross-layer hidden residency (#2 Phase 2): `upload_hidden=false` ⇒ hidden
+    // is already device-resident from the previous layer; `download_hidden=false`
+    // ⇒ leave it resident for the next layer. Per-layer default is `(true, true)`.
+    upload_hidden: bool,
+    download_hidden: bool,
 ) -> (bool, bool) {
     if !dev_attn_enabled() || !cuda_active() || has_qkv_bias {
         return (false, false);
@@ -7244,6 +7249,8 @@ pub fn try_decode_attn_block_cuda_f32(
             layer_idx,
             rms_eps,
             ffn_dev,
+            upload_hidden,
+            download_hidden,
         )
     };
     if ok {
@@ -7275,6 +7282,25 @@ pub fn try_decode_attn_block_cuda_f32(
     }
     // (attention ran on device, dense FFN ran on device)
     (ok, ok && ffn_requested)
+}
+
+/// Drain the cross-layer-resident `hidden` (#2 Phase 2) from the CUDA activation
+/// slab to the host. The caller uses this when a dense model finishes its
+/// device-resident layer run (before the final norm / LM head) or must fall back
+/// to the host path mid-stream (so the stale host `hidden` is refreshed first).
+/// Returns false (caller keeps the host `hidden` it has) when CUDA is inactive,
+/// the cache is unavailable, or the copy failed.
+pub fn fetch_resident_hidden_cuda_f32(hidden: &mut [f32], d_model: usize) -> bool {
+    if !cuda_active() {
+        return false;
+    }
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(g) = cache.lock() else {
+        return false;
+    };
+    g.download_resident_hidden_f32(hidden, d_model)
 }
 
 /// Seed the native-CUDA F32 decode KV mirror with the prefill history for a

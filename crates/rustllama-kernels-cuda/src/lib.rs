@@ -2834,6 +2834,15 @@ impl CudaMatvecCache {
             (CudaPackedKind, usize, &[u8]),
             usize,
         )>,
+        // Cross-layer hidden residency (#2 Phase 2). `upload_hidden=false` ⇒
+        // `hidden` is ALREADY resident in the activation slab from the previous
+        // layer (skip the H2D upload); `download_hidden=false` ⇒ leave the
+        // updated hidden in the slab for the next layer (skip the D2H). The
+        // per-layer default is `(true, true)` (Phase-1 behavior). The slab's
+        // offset-0 `hidden` survives across calls because same-dim layers don't
+        // realloc it and nothing else overwrites offset 0.
+        upload_hidden: bool,
+        download_hidden: bool,
     ) -> bool {
         let d_q = n_heads * head_dim;
         let d_kv = n_kv_heads * head_dim;
@@ -2898,8 +2907,9 @@ impl CudaMatvecCache {
         let fb = |s: &[f32]| -> &[u8] {
             unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
         };
-        // Upload hidden + the norm weights.
-        if !self.attn_act.as_mut().unwrap().upload_at(o_hidden * 4, fb(hidden)) {
+        // Upload hidden (unless it's already resident from the previous layer —
+        // cross-layer residency) + the norm weights.
+        if upload_hidden && !self.attn_act.as_mut().unwrap().upload_at(o_hidden * 4, fb(hidden)) {
             return false;
         }
         {
@@ -3080,10 +3090,16 @@ impl CudaMatvecCache {
         // unused.
         {
             let a = self.attn_act.as_ref().unwrap();
-            let hb: &mut [u8] =
-                unsafe { std::slice::from_raw_parts_mut(hidden.as_mut_ptr() as *mut u8, d_model * 4) };
-            if !a.download_at(o_hidden * 4, hb) {
-                return false;
+            // Download hidden unless it stays resident for the next layer
+            // (cross-layer residency); the caller drains it once at loop end (or
+            // on a fallback to the host path) via `download_resident_hidden_f32`.
+            if download_hidden {
+                let hb: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(hidden.as_mut_ptr() as *mut u8, d_model * 4)
+                };
+                if !a.download_at(o_hidden * 4, hb) {
+                    return false;
+                }
             }
             if dense_ffn.is_none() {
                 let h2b: &mut [u8] = unsafe {
@@ -3095,6 +3111,24 @@ impl CudaMatvecCache {
             }
         }
         consume_error_count() == 0
+    }
+
+    /// Drain the cross-layer-resident `hidden` (activation-slab offset 0) to the
+    /// host — used when a dense model finishes its device-resident layer run
+    /// (loop end) or must fall back to the host path mid-stream (so the stale
+    /// host `hidden` is refreshed first). Returns false if the slab isn't present
+    /// or the copy failed. `d_model` must match the dims the block ran with.
+    pub fn download_resident_hidden_f32(&self, hidden: &mut [f32], d_model: usize) -> bool {
+        if hidden.len() != d_model {
+            return false;
+        }
+        let Some(a) = self.attn_act.as_ref() else {
+            return false;
+        };
+        let hb: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(hidden.as_mut_ptr() as *mut u8, d_model * 4) };
+        // offset 0 = hidden (see the activation-slab offset tuple).
+        a.download_at(0, hb) && consume_error_count() == 0
     }
 
     /// Seed the on-device F32 KV mirror for `layer_idx` with the host cache's
