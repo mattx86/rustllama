@@ -2574,6 +2574,77 @@ impl CudaMatvecCache {
         self.out_scratch.as_ref().unwrap().download(out_bytes)
     }
 
+    /// Device-I/O packed matvec — the on-device activation-residency primitive
+    /// (#2). Identical math to [`Self::matvec_packed`], but BOTH `x` and `out`
+    /// are ALREADY device pointers on this cache's stream, so there is **no
+    /// H2D upload of x and no D2H download of out** — the activation stays
+    /// resident across ops. The weight is still host-keyed (`weight_key` =
+    /// `w_bytes.as_ptr()`), uploaded once + cached via [`Self::ensure_weight`]
+    /// (attention/dense layer weights aren't promoted, unlike MoE experts).
+    /// Bit-exact to `matvec_packed` (same per-format row_dot). Returns false
+    /// (caller falls back to the host-I/O path) on bad shape / budget / kernel
+    /// failure; `out_dev` is then undefined and the caller must not consume it.
+    ///
+    /// # Safety
+    /// `x_dev` (≥ `k` f32) and `out_dev` (≥ `m` f32) are live device pointers on
+    /// this cache's stream for the call; the wrapper synchronizes before return.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn matvec_packed_dev_io(
+        &mut self,
+        kind: CudaPackedKind,
+        weight_key: usize,
+        w_bytes: &[u8],
+        x_dev: *const f32,
+        out_dev: *mut f32,
+        m: usize,
+        k: usize,
+    ) -> bool {
+        if m == 0 || k == 0 || x_dev.is_null() || out_dev.is_null() {
+            return false;
+        }
+        if k % kind.k_alignment() != 0 || w_bytes.len() < m * kind.row_bytes(k) {
+            return false;
+        }
+        if !self.ensure_weight(weight_key, w_bytes) {
+            return false;
+        }
+        let w_ptr = self.weights[&weight_key].ptr;
+        // SAFETY: w is cached device memory of the right size; x_dev/out_dev are
+        // caller-guaranteed live device pointers on this stream; the wrapper
+        // synchronizes. Same per-format row_dot as `matvec_packed` → bit-exact.
+        let res = unsafe {
+            match kind {
+                CudaPackedKind::Ptq1_0 => matvec_ptq1_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Q8_0 => matvec_q8_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Q4_K => matvec_q4_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Q6_K => matvec_q6_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Q5_K => matvec_q5_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Q2_K => matvec_q2_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Q8_K => matvec_q8_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Q4_0 => matvec_q4_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Q5_0 => matvec_q5_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Q4_1 => matvec_q4_1_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Q5_1 => matvec_q5_1_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Iq4_Nl => matvec_iq4_nl_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Iq4_Xs => matvec_iq4_xs_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Iq2_Xxs => matvec_iq2_xxs_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Iq2_Xs => matvec_iq2_xs_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Iq2_S => matvec_iq2_s_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Iq3_Xxs => matvec_iq3_xxs_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Iq3_S => matvec_iq3_s_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Iq1_S => matvec_iq1_s_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Iq1_M => matvec_iq1_m_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Nvfp4 => matvec_nvfp4_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Mxfp4 => matvec_mxfp4_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Mxfp6 => matvec_mxfp6_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Mxfp8 => matvec_mxfp8_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Q3_K => matvec_q3_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Pq2_0 => matvec_pq2_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+            }
+        };
+        res.is_ok() && consume_error_count() == 0
+    }
+
     /// Grouped Q4_K routed-expert FFN — the MoE tiered-expert DECODE fast path.
     /// Computes `out = Σ_e weight[e] · (Wdown_e · silu(Wgate_e·x) ⊙ (Wup_e·x))`
     /// for all `n_pick` promoted (device-resident) experts in ONE on-device pass
