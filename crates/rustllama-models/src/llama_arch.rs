@@ -7551,8 +7551,25 @@ impl LlamaModel {
             // coherent — so the whole host attention path below is skipped. F32
             // KV + no qkv bias only; otherwise falls through unchanged.
             let kv_max_ctx = kv.max_ctx;
+            // #2 Phase 1 — dense FFN residency: for a PURE-dense layer (no MoE,
+            // not hybrid-SSM) also hand the device block the SwiGLU FFN weights so
+            // gate/up/silu/down + the FFN residual run GPU-resident too. MoE /
+            // hybrid layers pass `None` (attention-only; their FFN stays on the
+            // host / grouped path). `.get` avoids indexing a MoE model's empty
+            // `blocks`. When the FFN ran on device, `device_dense_ffn` skips the
+            // host FFN below.
+            let dense_ffn_arg: Option<(&Tensor, &Tensor, &Tensor, usize)> =
+                if moe_cfg.is_none() && !self.weights.is_hybrid() {
+                    self.weights
+                        .blocks
+                        .get(layer_idx)
+                        .map(|db| (&db.w_gate, &db.w_up, &db.w_down, d_ff))
+                } else {
+                    None
+                };
+            let mut device_dense_ffn = false;
             let device_attn = if let KvLayer::F32 { k, v } = &mut kv.layers[layer_idx] {
-                crate::accel::try_decode_attn_block_cuda_f32(
+                let (attn_ran, ffn_ran) = crate::accel::try_decode_attn_block_cuda_f32(
                     block.w_q(),
                     block.w_k(),
                     block.w_v(),
@@ -7569,6 +7586,7 @@ impl LlamaModel {
                     &mut v_buf,
                     k,
                     v,
+                    dense_ffn_arg,
                     n_heads,
                     n_kv_heads,
                     head_dim,
@@ -7578,7 +7596,9 @@ impl LlamaModel {
                     cfg.n_layers,
                     layer_idx,
                     cfg.rms_eps,
-                )
+                );
+                device_dense_ffn = ffn_ran;
+                attn_ran
             } else {
                 false
             };
@@ -8349,48 +8369,52 @@ impl LlamaModel {
             // buffers are shared with the dense ladder (same
             // shape), down_buf / expert_logits / routed_picks are
             // dedicated MoE scratch slots.
-            if let Some(moe) = moe_cfg.as_ref() {
-                let mb = &self.weights.moe_blocks.as_ref().unwrap()[layer_idx];
-                crate::moe::moe_ffn_one_into(
-                    &h_norm,
-                    mb,
-                    d,
-                    d_ff,
-                    moe.n_experts as usize,
-                    moe.n_experts_used as usize,
-                    &mut ffn_out,
-                    &mut gate_buf,
-                    &mut up_buf,
-                    &mut ffn_buf,
-                    &mut moe_down,
-                    &mut moe_expert_logits,
-                    &mut moe_routed_picks,
-                );
-            } else {
-                let dense_block = &self.weights.blocks[layer_idx];
-                matvec_tensor_dispatch(&dense_block.w_gate, &h_norm, &mut gate_buf, d_ff, d);
-                matvec_tensor_dispatch(&dense_block.w_up, &h_norm, &mut up_buf, d_ff, d);
-                // USM → host-pointer SYCL → CPU dispatch ladder.
-                if !crate::accel::try_silu_mul_usm_f32(&gate_buf, &up_buf, &mut ffn_buf)
-                    && !crate::accel::try_silu_mul_f32(&gate_buf, &up_buf, &mut ffn_buf)
-                {
-                    k::silu_mul_f32(&gate_buf, &up_buf, &mut ffn_buf);
+            // Skipped entirely when the device block already ran the dense FFN
+            // (#2 Phase 1): `hidden` then already carries the FFN residual.
+            if !device_dense_ffn {
+                if let Some(moe) = moe_cfg.as_ref() {
+                    let mb = &self.weights.moe_blocks.as_ref().unwrap()[layer_idx];
+                    crate::moe::moe_ffn_one_into(
+                        &h_norm,
+                        mb,
+                        d,
+                        d_ff,
+                        moe.n_experts as usize,
+                        moe.n_experts_used as usize,
+                        &mut ffn_out,
+                        &mut gate_buf,
+                        &mut up_buf,
+                        &mut ffn_buf,
+                        &mut moe_down,
+                        &mut moe_expert_logits,
+                        &mut moe_routed_picks,
+                    );
+                } else {
+                    let dense_block = &self.weights.blocks[layer_idx];
+                    matvec_tensor_dispatch(&dense_block.w_gate, &h_norm, &mut gate_buf, d_ff, d);
+                    matvec_tensor_dispatch(&dense_block.w_up, &h_norm, &mut up_buf, d_ff, d);
+                    // USM → host-pointer SYCL → CPU dispatch ladder.
+                    if !crate::accel::try_silu_mul_usm_f32(&gate_buf, &up_buf, &mut ffn_buf)
+                        && !crate::accel::try_silu_mul_f32(&gate_buf, &up_buf, &mut ffn_buf)
+                    {
+                        k::silu_mul_f32(&gate_buf, &up_buf, &mut ffn_buf);
+                    }
+                    matvec_tensor_dispatch(&dense_block.w_down, &ffn_buf, &mut ffn_out, d, d_ff);
                 }
-                matvec_tensor_dispatch(&dense_block.w_down, &ffn_buf, &mut ffn_out, d, d_ff);
-            }
 
-            debug::ffn_stats(
-                layer_idx,
-                &hidden,
-                &h_norm,
-                &gate_buf,
-                &up_buf,
-                &ffn_buf,
-                &ffn_out,
-            );
+                debug::ffn_stats(
+                    layer_idx,
+                    &hidden,
+                    &h_norm,
+                    &gate_buf,
+                    &up_buf,
+                    &ffn_buf,
+                    &ffn_out,
+                );
 
-            if !skip_ffn_enabled() {
-                k::add_inplace_f32(&mut hidden, &ffn_out);
+                if !skip_ffn_enabled() {
+                    k::add_inplace_f32(&mut hidden, &ffn_out);
+                }
             }
 
             debug::trace_layer(layer_idx, &hidden);

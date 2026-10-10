@@ -297,6 +297,12 @@ extern "C" {
         out: *mut f32,
         n: c_int,
     ) -> c_int;
+    fn rsl_cuda_add_f32(
+        s: *mut RslCudaStreamRaw,
+        hidden: *mut f32,
+        branch: *const f32,
+        n: c_int,
+    ) -> c_int;
     fn rsl_cuda_embedding_lookup_f32(
         s: *mut RslCudaStreamRaw,
         table: *const f32,
@@ -1669,6 +1675,27 @@ pub unsafe fn silu_mul_f32(
     }
 }
 
+/// Plain element-wise residual add: `hidden[i] += branch[i]` (device f32, in
+/// place). Used for the device-resident dense FFN residual (`hidden += ffn_out`)
+/// where there's no following RMSNorm to fuse (the next op is the next layer's
+/// attn-norm) — so [`add_rmsnorm_f32`] would be wrong.
+///
+/// SAFETY: `hidden` (mut) and `branch` are device pointers of `n` f32.
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn add_f32(
+    stream: &CudaStream,
+    hidden: *mut f32,
+    branch: *const f32,
+    n: usize,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_add_f32(stream.raw(), hidden, branch, n as c_int);
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
 /// Embedding lookup: `out[i,:] = table[ids[i],:]` (row < 0 ⇒ zeros).
 ///
 /// SAFETY: `table` = [V,d], `out` = [n_ids,d], `ids` = [n_ids] i32 are all
@@ -2796,9 +2823,21 @@ impl CudaMatvecCache {
         n_layers: usize,
         layer_idx: usize,
         rms_eps: f32,
+        // Optional dense SwiGLU FFN run device-resident right after the attention
+        // block (gate/up → silu → down → residual), so a whole dense layer's
+        // decode stays on device. `Some((w_gate, w_up, w_down, d_ff))`, each
+        // weight (packed kind, host key, bytes). `None` ⇒ attention-only (the
+        // caller runs the FFN on the host path, e.g. for a MoE layer).
+        dense_ffn: Option<(
+            (CudaPackedKind, usize, &[u8]),
+            (CudaPackedKind, usize, &[u8]),
+            (CudaPackedKind, usize, &[u8]),
+            usize,
+        )>,
     ) -> bool {
         let d_q = n_heads * head_dim;
         let d_kv = n_kv_heads * head_dim;
+        let d_ff = dense_ffn.as_ref().map(|f| f.3).unwrap_or(0);
         if hidden.len() != d_model
             || h_norm2.len() != d_model
             || k_row_out.len() != d_kv
@@ -2826,7 +2865,9 @@ impl CudaMatvecCache {
         if pos as u32 > valid {
             return false; // mirror gap: caller seeds the prefill history / falls back
         }
-        let act_bytes = (4 * d_model + 2 * d_q + 2 * d_kv) * 4;
+        // +3·d_ff when a dense FFN follows (gate|up|act appended after h_norm2;
+        // ffn_out reuses the now-free `o` region). d_ff = 0 ⇒ attention-only size.
+        let act_bytes = (4 * d_model + 2 * d_q + 2 * d_kv + 3 * d_ff) * 4;
         let norm_bytes = (2 * d_model + 2 * head_dim + head_dim / 2) * 4;
         let mir_bytes = d_kv * max_ctx * 4;
         if !Self::ensure_scratch(&mut self.attn_act, &self.stream, act_bytes)
@@ -2847,6 +2888,10 @@ impl CudaMatvecCache {
             2 * d_model + 2 * d_q + 2 * d_kv,
             3 * d_model + 2 * d_q + 2 * d_kv,
         );
+        // Dense-FFN slab offsets (gate|up|act), appended after h_norm2; ffn_out
+        // reuses `o_o` (free once step-8's add_rmsnorm consumes the o-projection).
+        let ffn_base = 4 * d_model + 2 * d_q + 2 * d_kv;
+        let (o_gate, o_up, o_act) = (ffn_base, ffn_base + d_ff, ffn_base + 2 * d_ff);
         // Norm-slab f32 offsets: attn_norm|post_norm|q_norm|k_norm|inv_freq.
         let (no_attn, no_post, no_qn, no_kn, no_if) =
             (0, d_model, 2 * d_model, 2 * d_model + head_dim, 2 * d_model + 2 * head_dim);
@@ -2877,7 +2922,7 @@ impl CudaMatvecCache {
             }
         }
         // Raw device pointers into the two slabs (copied out → no borrow held).
-        let (ph, phn, pq, pk, pv, pat, po, phn2) = {
+        let (ph, phn, pq, pk, pv, pat, po, phn2, p_gate, p_up, p_act) = {
             let a = self.attn_act.as_ref().unwrap();
             (
                 a.f32_ptr_at(o_hidden),
@@ -2888,6 +2933,10 @@ impl CudaMatvecCache {
                 a.f32_ptr_at(o_attn),
                 a.f32_ptr_at(o_o),
                 a.f32_ptr_at(o_hn2),
+                // Valid only when d_ff > 0 (dense FFN); unused otherwise.
+                a.f32_ptr_at(o_gate),
+                a.f32_ptr_at(o_up),
+                a.f32_ptr_at(o_act),
             )
         };
         let (pan, ppn, pqn, pkn, pif) = {
@@ -3002,7 +3051,33 @@ impl CudaMatvecCache {
                 return false;
             }
         }
-        // 9. Download the updated hidden (hidden += o) + the post-attn norm.
+        // 8b. Optional dense SwiGLU FFN, device-resident: gate/up = W·h_norm2,
+        // act = silu(gate)⊙up, ffn_out = W_down·act, hidden += ffn_out. Reads
+        // h_norm2 (phn2), writes hidden (ph) in place; ffn_out reuses `po` (the
+        // o-projection region, free after step 8). On success the whole dense
+        // layer is done on device and the caller skips the host FFN.
+        if let Some((wg, wu, wd, _)) = dense_ffn {
+            unsafe {
+                if !self.matvec_packed_dev_io(wg.0, wg.1, wg.2, phn2, p_gate, d_ff, d_model)
+                    || !self.matvec_packed_dev_io(wu.0, wu.1, wu.2, phn2, p_up, d_ff, d_model)
+                {
+                    return false;
+                }
+                if silu_mul_f32(&self.stream, p_gate, p_up, p_act, d_ff).is_err() {
+                    return false;
+                }
+                if !self.matvec_packed_dev_io(wd.0, wd.1, wd.2, p_act, po, d_model, d_ff) {
+                    return false;
+                }
+                if add_f32(&self.stream, ph, po, d_model).is_err() {
+                    return false;
+                }
+            }
+        }
+        // 9. Download the updated hidden (hidden += o [+ ffn_out]). The post-attn
+        // norm (h_norm2) is downloaded only when the FFN ran on the HOST — when
+        // the device FFN above consumed it, the caller skips the host FFN so it's
+        // unused.
         {
             let a = self.attn_act.as_ref().unwrap();
             let hb: &mut [u8] =
@@ -3010,11 +3085,13 @@ impl CudaMatvecCache {
             if !a.download_at(o_hidden * 4, hb) {
                 return false;
             }
-            let h2b: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(h_norm2.as_mut_ptr() as *mut u8, d_model * 4)
-            };
-            if !a.download_at(o_hn2 * 4, h2b) {
-                return false;
+            if dense_ffn.is_none() {
+                let h2b: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(h_norm2.as_mut_ptr() as *mut u8, d_model * 4)
+                };
+                if !a.download_at(o_hn2 * 4, h2b) {
+                    return false;
+                }
             }
         }
         consume_error_count() == 0

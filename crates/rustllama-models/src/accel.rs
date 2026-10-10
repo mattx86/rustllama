@@ -7136,6 +7136,7 @@ fn dev_attn_enabled() -> bool {
 /// packed-quant dispatchable. F32 KV only. `k_cache`/`v_cache` are the layer's
 /// host KV slabs (head-major) for seeding the mirror's prefill history.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub fn try_decode_attn_block_cuda_f32(
     w_q: &Tensor,
     w_k: &Tensor,
@@ -7153,6 +7154,10 @@ pub fn try_decode_attn_block_cuda_f32(
     v_buf: &mut [f32],
     k_cache: &mut [f32],
     v_cache: &mut [f32],
+    // Optional dense SwiGLU FFN `(w_gate, w_up, w_down, d_ff)` to run
+    // device-resident right after the attention block (#2 Phase 1 — dense FFN
+    // residency). `None` ⇒ attention-only (MoE layers keep the host/grouped FFN).
+    dense_ffn: Option<(&Tensor, &Tensor, &Tensor, usize)>,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -7162,9 +7167,9 @@ pub fn try_decode_attn_block_cuda_f32(
     n_layers: usize,
     layer_idx: usize,
     rms_eps: f32,
-) -> bool {
+) -> (bool, bool) {
     if !dev_attn_enabled() || !cuda_active() || has_qkv_bias {
-        return false;
+        return (false, false);
     }
     let (Some(kq), Some(kk), Some(kv), Some(ko)) = (
         dtype_to_cuda_kind(w_q.dtype),
@@ -7172,7 +7177,7 @@ pub fn try_decode_attn_block_cuda_f32(
         dtype_to_cuda_kind(w_v.dtype),
         dtype_to_cuda_kind(w_o.dtype),
     ) else {
-        return false;
+        return (false, false);
     };
     let (qb, kb, vb, ob) = (
         w_q.storage.as_bytes(),
@@ -7180,11 +7185,35 @@ pub fn try_decode_attn_block_cuda_f32(
         w_v.storage.as_bytes(),
         w_o.storage.as_bytes(),
     );
+    // Build the device dense-FFN arg only when the caller asked AND all three
+    // weights are packed-dispatchable; any non-packed weight ⇒ attention-only
+    // (the caller then runs the host FFN). The byte-slices borrow the Tensors,
+    // which outlive this call.
+    let ffn_dev: Option<(
+        (ck::CudaPackedKind, usize, &[u8]),
+        (ck::CudaPackedKind, usize, &[u8]),
+        (ck::CudaPackedKind, usize, &[u8]),
+        usize,
+    )> = dense_ffn.and_then(|(wg, wu, wd, d_ff)| {
+        let kg = dtype_to_cuda_kind(wg.dtype)?;
+        let ku = dtype_to_cuda_kind(wu.dtype)?;
+        let kd = dtype_to_cuda_kind(wd.dtype)?;
+        let gb = wg.storage.as_bytes();
+        let ub = wu.storage.as_bytes();
+        let db = wd.storage.as_bytes();
+        Some((
+            (kg, gb.as_ptr() as usize, gb),
+            (ku, ub.as_ptr() as usize, ub),
+            (kd, db.as_ptr() as usize, db),
+            d_ff,
+        ))
+    });
+    let ffn_requested = ffn_dev.is_some();
     let Some(cache) = cuda_cache() else {
-        return false;
+        return (false, false);
     };
     let Ok(mut g) = cache.lock() else {
-        return false;
+        return (false, false);
     };
     // SAFETY: weight byte-slices outlive the call; host buffers are sized to the
     // dims (caller contract); the cache owns the stream + mirror.
@@ -7214,6 +7243,7 @@ pub fn try_decode_attn_block_cuda_f32(
             n_layers,
             layer_idx,
             rms_eps,
+            ffn_dev,
         )
     };
     if ok {
@@ -7228,14 +7258,23 @@ pub fn try_decode_attn_block_cuda_f32(
         }
         // Count the hit (the A/B's engagement check reads this) + log the first.
         if DEV_ATTN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
-            tracing::info!(
-                "#2 on-device activation-residency attention ENGAGED — the whole \
-                 attention block runs GPU-resident (perf-gated verdict \
-                 attn:dev_resident_block) (logged once)"
-            );
+            if ffn_requested {
+                tracing::info!(
+                    "#2 on-device activation-residency ENGAGED — the whole dense \
+                     layer (attention + FFN) runs GPU-resident (perf-gated verdict \
+                     attn:dev_resident_block) (logged once)"
+                );
+            } else {
+                tracing::info!(
+                    "#2 on-device activation-residency attention ENGAGED — the whole \
+                     attention block runs GPU-resident (perf-gated verdict \
+                     attn:dev_resident_block) (logged once)"
+                );
+            }
         }
     }
-    ok
+    // (attention ran on device, dense FFN ran on device)
+    (ok, ok && ffn_requested)
 }
 
 /// Seed the native-CUDA F32 decode KV mirror with the prefill history for a

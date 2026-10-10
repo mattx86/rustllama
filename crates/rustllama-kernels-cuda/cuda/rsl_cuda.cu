@@ -2345,6 +2345,23 @@ extern "C" int rsl_cuda_silu_mul_f32(rsl_cuda_stream *s, const float *x,
     return rsl_cuda_check("rsl_cuda_silu_mul_f32");
 }
 
+// Plain element-wise residual add: hidden[i] += branch[i]. Device f32, in place.
+// (The fused add_rmsnorm does add+norm; the FFN residual needs just the add,
+// since the following op is the NEXT layer's attn-norm, not this layer's.)
+__global__ void add_f32_kernel(float *hidden, const float *branch, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) hidden[i] += branch[i];
+}
+
+extern "C" int rsl_cuda_add_f32(rsl_cuda_stream *s, float *hidden,
+                                const float *branch, int n) {
+    if (!s || !hidden || !branch || n <= 0) return -1;
+    cudaSetDevice(s->device);
+    int t = 256, b = (n + t - 1) / t;
+    add_f32_kernel<<<b, t, 0, s->stream>>>(hidden, branch, n);
+    return rsl_cuda_check("rsl_cuda_add_f32");
+}
+
 // Embedding lookup (mirrors rsl_embedding_lookup_usm): out[i] = table[ids[i]]
 // (d elements). ids < 0 → zero row. `ids` is a DEVICE pointer here (the CUDA
 // worker uploads it) — no host scratch like the SYCL variant. One block per id.
