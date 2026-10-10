@@ -7540,10 +7540,12 @@ impl LlamaModel {
             // success and we short-circuit; on `false` we fall
             // through to the next tier.
             //
-            // #2 on-device activation-residency attention (opt-in
-            // `RUSTLLAMA_DEV_ATTN`): run the WHOLE attention block on the GPU
-            // with the activation resident on device (rmsnorm→qkv→qk-head-norm→
-            // rope→flash→o→residual+norm, no per-op host round-trip). On success
+            // #2 on-device activation-residency attention (perf-gated auto, no
+            // env var — on only where `tune --dev-attn` measured it faster, via
+            // `accel::dev_attn_enabled` → verdict `attn:dev_resident_block`): run
+            // the WHOLE attention block on the GPU with the activation resident
+            // on device (rmsnorm→qkv→qk-head-norm→rope→flash→o→residual+norm, no
+            // per-op host round-trip). On success
             // `hidden` is updated (residual done), `h_norm` holds the post-attn
             // RMSNorm (the FFN input), and the host KV cache is appended +
             // coherent — so the whole host attention path below is skipped. F32

@@ -7048,16 +7048,53 @@ pub fn try_flash_attn_decode_cuda_f32(
     })
 }
 
-/// On-device activation-residency attention path (#2): OPT-IN first-integration
-/// gate `RUSTLLAMA_DEV_ATTN=1` (default-off, so it can't touch default inference
-/// until coherence is proven on-device; becomes verdict-gated auto afterward).
+/// Tuner-only runtime override for the `tune --dev-attn` A/B: -1 = unset (use
+/// the verdict), 0 = force OFF, 1 = force ON. Lets the autotuner measure the
+/// host arm then the device arm on ONE loaded engine (set per-arm via
+/// [`set_dev_attn_force`]). NOT a user knob — serve/bench never touch it, so the
+/// verdict path below is the real on/off decision. (There is no `RUSTLLAMA_DEV_ATTN`
+/// env var: #2 is perf-gated auto, not env-gated.)
+static DEV_ATTN_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+/// Count of decode tokens where the #2 device-resident attention block actually
+/// ran (incremented per successful [`try_decode_attn_block_cuda_f32`]). The A/B
+/// reads it to confirm the ON arm truly engaged (else the measurement is
+/// meaningless and no verdict is persisted); 0 ⇒ the path never fired.
+static DEV_ATTN_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Force the #2 device-resident attention path on/off for the current process
+/// (the `tune --dev-attn` A/B harness only). `None` clears the override → the
+/// verdict decides.
+pub fn set_dev_attn_force(v: Option<bool>) {
+    let code: i8 = match v {
+        None => -1,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    DEV_ATTN_FORCE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many decode tokens have run through the #2 device-resident attention
+/// block so far (process-global). The A/B harness compares this before/after the
+/// ON arm to confirm the path engaged.
+pub fn dev_attn_hits() -> u64 {
+    DEV_ATTN_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the #2 on-device activation-residency attention block is enabled.
+/// **AUTOMATIC, no env var** — perf-gated exactly like the TC-GEMM paths: on
+/// only where the `tune --dev-attn` A/B measured it FASTER than the host path on
+/// this device+model (verdict [`VERDICT_ATTN_DEV_RESIDENT_BLOCK`]). Fail-closed:
+/// unmeasured / not-a-win ⇒ off (the host attention path runs). The tuner's
+/// per-arm force override short-circuits the verdict so the A/B itself can drive
+/// both arms. (The block is already bit-exact/coherent; the gate is purely perf.)
 fn dev_attn_enabled() -> bool {
+    match DEV_ATTN_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("RUSTLLAMA_DEV_ATTN")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    *ON.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK))
 }
 
 /// Run the WHOLE attention block for one decode token on the GPU, keeping the
@@ -7160,11 +7197,12 @@ pub fn try_decode_attn_block_cuda_f32(
             k_cache[dst..dst + head_dim].copy_from_slice(&k_buf[src..src + head_dim]);
             v_cache[dst..dst + head_dim].copy_from_slice(&v_buf[src..src + head_dim]);
         }
-        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        // Count the hit (the A/B's engagement check reads this) + log the first.
+        if DEV_ATTN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
             tracing::info!(
                 "#2 on-device activation-residency attention ENGAGED — the whole \
-                 attention block runs GPU-resident (RUSTLLAMA_DEV_ATTN) (logged once)"
+                 attention block runs GPU-resident (perf-gated verdict \
+                 attn:dev_resident_block) (logged once)"
             );
         }
     }

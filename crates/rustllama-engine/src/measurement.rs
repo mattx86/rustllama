@@ -2517,6 +2517,170 @@ pub fn measure_ssm_prefill_chunked(
     })
 }
 
+/// Outcome of [`measure_dev_attn`] — the #2 device-resident attention A/B.
+///
+/// `capable` is `true` only when CUDA is active AND the ON arm actually ran the
+/// device block (the hit counter advanced); otherwise the measurement is
+/// meaningless (no NVIDIA GPU, non-packed q/k/v/o, qkv bias, unsupported shape)
+/// and the CLI persists NO verdict so the path stays off. `off_tps` / `on_tps`
+/// are median DECODE tok/s with the block forced off / on on the SAME f32-KV
+/// engine; `winner = Some(on > off * margin)` — a real margin past run-to-run
+/// noise, since the block is a no-win on MoE / CPU-expert-tail configs (attention
+/// isn't the bottleneck there) and should auto-enable only on a clear win.
+#[derive(Debug, Clone, Default)]
+pub struct DevAttnReport {
+    pub capable: bool,
+    pub off_tps: Option<f64>,
+    pub on_tps: Option<f64>,
+    pub winner: Option<bool>,
+    pub error: Option<String>,
+}
+
+/// A/B the #2 on-device activation-residency attention block by measured DECODE
+/// tok/s, forcing f32 KV (the block is F32-KV-only). Loads the model ONCE; the
+/// block is a process-global force toggle
+/// ([`rustllama_models::accel::set_dev_attn_force`]), so both arms run on the
+/// single loaded engine with NO reload. CUDA-only — off CUDA the block never
+/// runs, so we skip (`capable=false`, no verdict). Mirrors
+/// [`measure_speculative_mtp`]'s shape; both arms drive `generate_token_ids`
+/// (the classic decode loop the block hooks per-layer), so the tok/s delta is
+/// exactly the host↔device round-trip saving. Timing is content-independent
+/// (the flash kernel runs over the same range regardless of mirror contents), so
+/// the A/B is a valid SPEED measurement even though the block's CORRECTNESS is
+/// validated separately (coherence run).
+pub fn measure_dev_attn(
+    model_path: &std::path::Path,
+    cfg: &MeasurementConfig,
+    repeats: usize,
+) -> Result<DevAttnReport, String> {
+    // #2 runs only on CUDA; nothing to measure otherwise (return BEFORE loading
+    // so a non-CUDA host wastes no model load).
+    if !rustllama_models::accel::cuda_active() {
+        return Ok(DevAttnReport {
+            capable: false,
+            error: Some("CUDA-only: no active NVIDIA GPU — device-resident attention cannot run".into()),
+            ..Default::default()
+        });
+    }
+    // Clear-win margin: the block is ~flat/slightly-negative on MoE / CPU-tail
+    // configs and wins only on a dense model or a fully-fitting GPU, so require
+    // ON to beat OFF by >3% to clear same-process back-to-back noise before
+    // auto-enabling. Fail-closed otherwise.
+    const WIN_MARGIN: f64 = 1.03;
+    const PROMPT_TOKENS: u32 = 64;
+    // A few more decode tokens than the MTP probe (16): the per-token transfer
+    // saving must dominate the one-time prefill→decode mirror seed.
+    const DECODE_TOKENS: u32 = 48;
+    let ctx_size = (PROMPT_TOKENS as usize + DECODE_TOKENS as usize + 8).max(128);
+
+    // Force f32 KV regardless of cfg.kv_dtype — the block is F32-KV-only, so the
+    // A/B measures exactly the scenario where it can engage. (At serve time the
+    // dispatch gate is f32-KV-only too, so a quant-KV winner leaves it dormant.)
+    let mut cpu = CpuEngine::load_with_options_and_layout(
+        model_path,
+        ctx_size,
+        true,
+        KvDtype::F32,
+        &cfg.kv_cache_layout,
+    )
+    .map_err(|e| format!("load failed: {e}"))?;
+    cpu.set_prefix_cache(false);
+    cpu.set_flash_attention(cfg.flash_attention);
+    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+
+    let vocab = cpu.vocab_size() as i32;
+    let prompt_ids: Vec<i32> = (0..PROMPT_TOKENS as i32)
+        .map(|i| 1 + (i % vocab.max(2).saturating_sub(1)))
+        .collect();
+    let sampling = SamplingParams {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        typical_p: 1.0,
+        repeat_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        seed: 0,
+        max_tokens: DECODE_TOKENS,
+        stop: Vec::new(),
+        ..SamplingParams::default()
+    };
+
+    // One untimed warmup + `repeats` timed decode runs → median tok/s (the exact
+    // decode-metric pattern the kv_dtype / MTP sweeps use).
+    let bench = |cpu: &mut CpuEngine| -> (Option<f64>, Option<String>) {
+        cpu.clear_prefix_cache();
+        if let Err(e) = cpu.generate_token_ids(&prompt_ids, DECODE_TOKENS, &sampling) {
+            return (None, Some(format!("warmup failed: {e}")));
+        }
+        let mut runs: Vec<f64> = Vec::with_capacity(repeats);
+        let mut last_err: Option<String> = None;
+        for _ in 0..repeats {
+            cpu.clear_prefix_cache();
+            match cpu.generate_token_ids(&prompt_ids, DECODE_TOKENS, &sampling) {
+                Ok(_) => {
+                    let stats = cpu.last_request_stats();
+                    if stats.decode_ms > 0.0 && stats.tokens_generated > 0 {
+                        runs.push((stats.tokens_generated as f64) / (stats.decode_ms / 1000.0));
+                    }
+                }
+                Err(e) => last_err = Some(e.to_string()),
+            }
+        }
+        if runs.is_empty() {
+            return (
+                None,
+                Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
+            );
+        }
+        runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = if runs.len() % 2 == 1 {
+            runs[runs.len() / 2]
+        } else {
+            (runs[runs.len() / 2 - 1] + runs[runs.len() / 2]) / 2.0
+        };
+        (Some(median), None)
+    };
+
+    // OFF arm: the host attention path (current production decode).
+    rustllama_models::accel::set_dev_attn_force(Some(false));
+    let (off_tps, off_err) = bench(&mut cpu);
+
+    // ON arm: the #2 device-resident block. Snapshot the hit counter around it to
+    // confirm the block actually fired — if it never did, the A/B is meaningless.
+    let hits_before = rustllama_models::accel::dev_attn_hits();
+    rustllama_models::accel::set_dev_attn_force(Some(true));
+    let (on_tps, on_err) = bench(&mut cpu);
+    let engaged = rustllama_models::accel::dev_attn_hits() > hits_before;
+    rustllama_models::accel::set_dev_attn_force(None); // clear the override
+
+    if !engaged {
+        return Ok(DevAttnReport {
+            capable: false,
+            off_tps,
+            on_tps,
+            winner: None,
+            error: Some(
+                "device-resident attention never engaged (non-packed q/k/v/o, qkv \
+                 bias, or unsupported shape) — verdict left unset"
+                    .into(),
+            ),
+        });
+    }
+
+    let winner = match (off_tps, on_tps) {
+        (Some(off), Some(on)) if off > 0.0 => Some(on > off * WIN_MARGIN),
+        _ => None,
+    };
+    Ok(DevAttnReport {
+        capable: true,
+        off_tps,
+        on_tps,
+        winner,
+        error: off_err.or(on_err),
+    })
+}
+
 #[cfg(test)]
 mod kv_coherence_tests {
     use super::*;

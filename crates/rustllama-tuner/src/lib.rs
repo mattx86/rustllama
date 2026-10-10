@@ -212,6 +212,16 @@ pub const VERDICT_GEMM_Q4K_W8A8_TC: &str = "gemm:q4_k_w8a8_tc";
 /// perf gate, so it auto-enables only where correct AND faster than the f32
 /// matvec. The decode twin of [`VERDICT_GEMM_Q4K_W8A8_TC`].
 pub const VERDICT_MATVEC_Q4K_W4A8: &str = "matvec:q4_k_w4a8";
+/// #2 on-device activation-residency DECODE attention block (whole attention
+/// block GPU-resident on one stream: rmsnorm→qkv→qk-head-norm→rope→flash→o→
+/// residual+norm, no per-op host round-trip). Unlike the other verdicts this is
+/// a PERF verdict, not a parity one: the block is already bit-exact (coherence
+/// validated), so the `tune --dev-attn` A/B stage enables it ONLY where a real
+/// f32-KV decode measurement shows it beats the host path on THIS device+model
+/// (fail-closed off otherwise — it's a no-win or slight loss on MoE/CPU-tail
+/// configs where attention isn't the bottleneck, a win only on a dense model or
+/// a fully-fitting GPU). Read by `accel::dev_attn_enabled`; f32-KV-only at dispatch.
+pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK: &str = "attn:dev_resident_block";
 
 /// Read the on-device verdict for a kernel probe name, if one has been
 /// recorded. `None` = never validated (or the probe SKIPped because the

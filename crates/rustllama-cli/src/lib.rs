@@ -505,6 +505,14 @@ pub enum Command {
         /// `_FP8_WGMMA` / `_SYCL_XMX` env gates.
         #[arg(long)]
         validate_kernels: bool,
+        /// #2 on-device activation-residency attention A/B: force the device
+        /// block off then on on one f32-KV load, measure DECODE tok/s, and
+        /// persist a PERF verdict (`attn:dev_resident_block`) that auto-enables
+        /// the block only where it's measured faster than the host path on this
+        /// device+model. CUDA-only; a `tune --all` sub-stage (Stage 1d). The
+        /// block is bit-exact, so this gates on speed, not correctness.
+        #[arg(long)]
+        dev_attn: bool,
         /// **Comprehensive autotune**: run every sweep in coordinate-
         /// descent order — kernel LWS → kv_dtype → flash_attention →
         /// kv_cache_layout → placement → batch_size → threads — and
@@ -1225,6 +1233,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             decision_calibrate,
             per_device_perf,
             validate_kernels,
+            dev_attn,
             all,
             skip_cached,
             force,
@@ -1292,6 +1301,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 decision_calibrate,
                 per_device_perf,
                 validate_kernels,
+                dev_attn,
                 all,
             ]
             .iter()
@@ -1303,7 +1313,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                      --flash-attention / --kv-layout / --flash-kv-min / \
                      --prefix-snapshots / --kv-page-size / --flash-v3-kv-tile / \
                      --moe-placement / --speculative-mtp / --ssm-prefill-chunked / \
-                     --decision-calibrate / --per-device-perf / --all are exclusive; \
+                     --decision-calibrate / --per-device-perf / --validate-kernels / \
+                     --dev-attn / --all are exclusive; \
                      pick at most one"
                 );
             }
@@ -1443,6 +1454,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if validate_kernels {
                 return cmd_tune_validate_kernels();
+            }
+            if dev_attn {
+                return cmd_tune_dev_attn(
+                    &config_path,
+                    model,
+                    prompt_tokens,
+                    decode_tokens,
+                    repeats,
+                );
             }
             if threads {
                 return cmd_tune_threads(
@@ -6042,6 +6062,77 @@ pub fn persist_kernel_verdicts(verdicts: &[(String, bool)]) -> anyhow::Result<()
     Ok(())
 }
 
+/// `tune --dev-attn` (Stage 1d): A/B the #2 on-device activation-residency
+/// attention block and persist the PERF verdict `attn:dev_resident_block`, which
+/// `accel::dev_attn_enabled` reads to auto-enable the block only where it beats
+/// the host path on this device+model. The block is bit-exact (coherence
+/// validated separately), so this gates on SPEED, not correctness. CUDA-only +
+/// f32-KV (the block's constraints); on any other host it prints "skipped" and
+/// persists nothing, so the path stays off (fail-closed).
+fn cmd_tune_dev_attn(
+    config_path: &std::path::Path,
+    model_override: Option<String>,
+    _prompt_tokens: u32,
+    _decode_tokens: u32,
+    repeats: u32,
+) -> anyhow::Result<()> {
+    use rustllama_engine::measurement::{measure_dev_attn, MeasurementConfig};
+
+    let cfg = rustllama_config::load(config_path).unwrap_or_default();
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
+
+    println!("rustllama tune --dev-attn");
+    println!("  model = {}", model_path.display());
+
+    // CUDA-only + the engagement check happen inside `measure_dev_attn` (it
+    // returns BEFORE loading the model off CUDA), so there's no cli-side gate
+    // here — `rustllama-cli` doesn't link `rustllama-models` anyway.
+    // The block is F32-KV-only; `measure_dev_attn` forces f32 regardless of this
+    // field. We still pass the config's layout / flash / placement so the A/B
+    // runs on the same decode path serve would.
+    let m_cfg = MeasurementConfig {
+        kv_dtype: rustllama_engine::KvDtype::F32,
+        kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
+        flash_attention: cfg.inference.flash_attention,
+        n_gpu_layers: cfg.inference.n_gpu_layers,
+    };
+
+    let report =
+        measure_dev_attn(&model_path, &m_cfg, repeats.max(3) as usize).map_err(|e| anyhow::anyhow!(e))?;
+
+    match (report.capable, report.off_tps, report.on_tps, report.winner) {
+        (true, Some(off), Some(on), Some(win)) => {
+            println!("  host attn (OFF) = {off:.2} tok/s");
+            println!(
+                "  dev  attn (ON)  = {on:.2} tok/s  ({:+.1}%)",
+                (on / off - 1.0) * 100.0
+            );
+            println!(
+                "  → {}",
+                if win {
+                    "ENABLE — device-resident attention is faster here"
+                } else {
+                    "keep host path — device-resident attention is not a win here"
+                }
+            );
+            persist_kernel_verdicts(&[(
+                rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK.to_string(),
+                win,
+            )])?;
+            println!("  → persisted verdict attn:dev_resident_block = {win}");
+        }
+        _ => {
+            println!(
+                "  → not measured ({}); verdict left unset — path stays off",
+                report
+                    .error
+                    .unwrap_or_else(|| "device-resident block did not engage".into())
+            );
+        }
+    }
+    Ok(())
+}
+
 fn cmd_tune_kv_dtype(
     config_path: &std::path::Path,
     model_override: Option<String>,
@@ -7309,6 +7400,18 @@ fn cmd_tune_all(
             !t.kernel_verdicts.is_empty() && t.rustllama_version == env!("CARGO_PKG_VERSION")
         })
         .unwrap_or(false);
+    // #2 device-attn PERF verdict — build-stamped like the kernel verdicts
+    // (a new build may change the block's cost), keyed by its own name so it's
+    // independent of the parity verdicts. `Some(false)` (measured no-win) still
+    // counts as decided, so use `contains_key`.
+    let has_dev_attn = cached
+        .as_ref()
+        .map(|t| {
+            t.kernel_verdicts
+                .contains_key(rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK)
+                && t.rustllama_version == env!("CARGO_PKG_VERSION")
+        })
+        .unwrap_or(false);
     // MTP self-speculation + chunked SSM prefill: both persist a
     // `Some(bool)` winner (including `Some(false)` for a non-capable /
     // non-hybrid model), so `.is_some()` is the "already tuned" probe.
@@ -7404,6 +7507,26 @@ fn cmd_tune_all(
             &[],
         ) {
             tracing::warn!(error = %e, "stage 1c (validate kernels) failed; continuing");
+        }
+    }
+
+    println!();
+    println!("Stage 1d/10: dev-attn perf (A/B the #2 device-resident attention block, f32 KV)");
+    println!("--------");
+    if skip(has_dev_attn) {
+        println!("(skipped: dev-attn verdict already cached for this build)");
+    } else {
+        // Model-dependent f32-KV decode A/B; CUDA-only (the stage self-skips off
+        // CUDA). Subprocess like the others for a clean GPU context.
+        if let Err(e) = run_tune_stage_subprocess(
+            config_path,
+            &model_clone_for_stages,
+            "--dev-attn",
+            thorough,
+            "1d (dev-attn perf)",
+            &[],
+        ) {
+            tracing::warn!(error = %e, "stage 1d (dev-attn perf) failed; continuing");
         }
     }
 
