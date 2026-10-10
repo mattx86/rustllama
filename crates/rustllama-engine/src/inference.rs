@@ -1442,18 +1442,29 @@ impl CpuEngine {
                 let (expert_b, non_expert_b) = model.weights.vram_byte_breakdown();
                 let avail =
                     rustllama_runtime::gpu_detect::nvidia_free_vram_bytes(0).unwrap_or(0);
-                // Margin for the CUDA context, per-forward attention scratch, and
-                // fragmentation. NOT the KV cache: on the CUDA tiered path the KV
-                // lives in HOST RAM (`KvBuf::Host`), so it never competes for
-                // VRAM. The old flat 20% over-reserved ~1.8 GB on a 16 GB GPU —
-                // an on-pod budget sweep (Qwen3-30B-A3B) showed budgets up to
-                // ~13.5 GB promote cleanly (fb steady ~15.9/16.4 GB, no managed
-                // paging/thrash, decode 8.96→10.19 tok/s as more expert layers
-                // land on-device). 10% (min 1.5 GiB) keeps ~400-500 MB headroom
-                // while fitting several more expert layers; promoted experts are
-                // managed memory that pages to host under pressure, so an
-                // over-estimate degrades to "slower", never a hard OOM.
-                let margin = (avail / 10).max(1536 * 1024 * 1024); // 10% or 1.5 GiB
+                // Margin = the decode KV mirror + a floor for the CUDA context,
+                // Q/out scratch, and fragmentation. The canonical KV cache is
+                // host RAM (`KvBuf::Host`), BUT the CUDA/Metal flash-DECODE path
+                // keeps a persistent per-layer device KV mirror in VRAM (packed,
+                // so its footprint scales with kv_dtype: f32 = 4 B/elem, q8_0 ≈
+                // 1.06, nvfp4 ≈ 0.56). Reserving the actual mirror means a
+                // quantized KV auto-frees that VRAM for more promoted experts.
+                // On-pod (Qwen3-30B-A3B, RTX 2000 Ada 16 GB): f32 → ~1.6 GB
+                // mirror → budget ~13.2 GB (~38 layers, 9.96 tok/s); q8_0 →
+                // ~0.43 GB mirror (floor dominates) → budget ~13.8 GB (~40) AND
+                // a 4× lighter attention read (q8_0 alone measured 9.96→11.37
+                // tok/s). The old flat 20% over-reserved ~1.8 GB; budget sweeps
+                // up to ~13.5 GB promote cleanly (fb steady, no thrash) since
+                // promoted experts are managed memory that pages to host under
+                // pressure — an under-reserve degrades to "slower", never OOM.
+                let kv_bytes_per_elem = (kv_dtype.approx_bits_per_element() / 8.0) as f64;
+                let kv_mirror = (model.cfg.n_layers as f64
+                    * 2.0 // K + V
+                    * model.cfg.n_kv_heads as f64
+                    * ctx as f64
+                    * model.cfg.head_dim as f64
+                    * kv_bytes_per_elem) as u64;
+                let margin = kv_mirror.max(1024 * 1024 * 1024); // KV mirror, min 1 GiB
                 avail
                     .saturating_sub(non_expert_b)
                     .saturating_sub(margin)
