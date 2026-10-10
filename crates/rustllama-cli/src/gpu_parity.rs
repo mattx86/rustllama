@@ -3454,6 +3454,66 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 }
             }
         }
+
+        // Timing: the warp-cooperative FA-2 prefill kernel at a REALISTIC prefill
+        // shape (the parity tile above is 6 tokens — too small to time past launch
+        // overhead). Reports the kernel's on-device cost + its speedup over the
+        // scalar CPU reference — the honest available comparison, since the naive
+        // one-thread-per-query kernel this FA-2 replaced was removed (no in-tree
+        // A/B). Human diagnostic only; emits no verdict and doesn't touch `counts`.
+        {
+            let (th, tkv, thd, tmax, tnew) = (32usize, 4usize, 128usize, 512usize, 256usize);
+            let kv_base = 0usize;
+            let q = gen_x(tnew * th * thd, 71);
+            let kc = gen_x(tkv * tmax * thd, 73);
+            let vc = gen_x(tkv * tmax * thd, 79);
+            if let (Some(qb), Some(kb), Some(vb), Some(mut ob)) = (
+                cu_upload_f32(&stream, &q),
+                cu_upload_f32(&stream, &kc),
+                cu_upload_f32(&stream, &vc),
+                ck::CudaDeviceBuffer::alloc(&stream, tnew * th * thd * 4),
+            ) {
+                // SAFETY: q/out [tnew*th*thd], k/v [tkv*tmax*thd] device f32;
+                // kv_base + tnew = tnew <= tmax holds.
+                let launch = |ob: &mut ck::CudaDeviceBuffer| unsafe {
+                    ck::flash_attn_prefill_f32(
+                        &stream,
+                        qb.as_ptr() as *const f32,
+                        kb.as_ptr() as *const f32,
+                        vb.as_ptr() as *const f32,
+                        ob.as_mut_ptr() as *mut f32,
+                        th,
+                        tkv,
+                        thd,
+                        tmax,
+                        kv_base,
+                        tnew,
+                    )
+                };
+                if launch(&mut ob).is_ok() {
+                    // Warmup done (the launch above); a download forces completion.
+                    let _ = cu_download_f32(&ob, tnew * th * thd);
+                    const ITERS: u32 = 20;
+                    let t0 = Instant::now();
+                    for _ in 0..ITERS {
+                        let _ = launch(&mut ob);
+                    }
+                    // One D2H after the N serialized stream launches syncs them all.
+                    let _ = cu_download_f32(&ob, tnew * th * thd);
+                    let gpu_ms = t0.elapsed().as_secs_f64() * 1000.0 / ITERS as f64;
+                    let c0 = Instant::now();
+                    let _ = ref_flash_prefill(
+                        &q, &kc, &vc, th, tkv, thd, tmax, kv_base, tnew,
+                    );
+                    let cpu_ms = c0.elapsed().as_secs_f64() * 1000.0;
+                    let speedup = if gpu_ms > 0.0 { cpu_ms / gpu_ms } else { 0.0 };
+                    println!(
+                        "  attn:prefill TIMING [{th}h/{tkv}kv/{thd}d, {tnew} new tokens]: \
+                         GPU {gpu_ms:.3} ms/launch vs CPU ref {cpu_ms:.1} ms (~{speedup:.0}x)"
+                    );
+                }
+            }
+        }
     }
 
     // ---- Quantized-KV FlashAttention decode + prefill (MXFP4/6/8, NVFP4) ----
