@@ -2358,6 +2358,37 @@ impl RawDevBuf {
         };
         rc == 0
     }
+    /// H2D copy of `src` into this buffer at `byte_offset` (for partial writes:
+    /// the activation slab's sub-regions + a KV-mirror row). `byte_offset +
+    /// src.len()` must be <= cap.
+    fn upload_at(&mut self, byte_offset: usize, src: &[u8]) -> bool {
+        if byte_offset + src.len() > self.cap_bytes {
+            return false;
+        }
+        // SAFETY: dst is within the live cap_bytes allocation.
+        let dst = unsafe { (self.ptr as *mut u8).add(byte_offset) as *mut c_void };
+        let rc = unsafe {
+            rsl_cuda_memcpy_h2d(self.raw_stream, dst, src.as_ptr() as *const c_void, src.len() as u64)
+        };
+        rc == 0
+    }
+    /// D2H copy of `dst.len()` bytes from `byte_offset` into `dst`.
+    fn download_at(&self, byte_offset: usize, dst: &mut [u8]) -> bool {
+        if byte_offset + dst.len() > self.cap_bytes {
+            return false;
+        }
+        // SAFETY: src is within the live cap_bytes allocation.
+        let src = unsafe { (self.ptr as *const u8).add(byte_offset) as *const c_void };
+        let rc = unsafe {
+            rsl_cuda_memcpy_d2h(self.raw_stream, dst.as_mut_ptr() as *mut c_void, src, dst.len() as u64)
+        };
+        rc == 0
+    }
+    /// Raw device pointer at `f32_offset` f32-elements into the buffer.
+    fn f32_ptr_at(&self, f32_offset: usize) -> *mut f32 {
+        // SAFETY: caller keeps the offset within cap_bytes.
+        unsafe { (self.ptr as *mut f32).add(f32_offset) }
+    }
 }
 
 impl Drop for RawDevBuf {
@@ -2380,6 +2411,16 @@ pub struct CudaMatvecCache {
     ff_scratch: Option<RawDevBuf>,
     ptr_scratch: Option<RawDevBuf>,
     wt_scratch: Option<RawDevBuf>,
+    // #2 on-device activation-residency decode (decode_attn_block_f32): a
+    // persistent per-layer F32 KV mirror (same role as CudaAttnContext's, but on
+    // THIS cache's stream so the whole attention block runs ordered on one
+    // stream) + reusable activation/norm scratch. Allocated lazily on first use.
+    attn_k_mirror: Vec<Option<RawDevBuf>>,
+    attn_v_mirror: Vec<Option<RawDevBuf>>,
+    attn_valid_len: Vec<u32>,
+    attn_mirror_ctx: (u32, u32, u32), // (n_layers, n_kv_heads*head_dim, max_ctx) — rebuild on change
+    attn_act: Option<RawDevBuf>,   // activation slab: hidden|h_norm|q|k|v|attn_out|o|h_norm2
+    attn_norms: Option<RawDevBuf>, // norm-weight slab: attn_norm|post_norm|q_norm|k_norm|inv_freq
     used_bytes: usize,
     budget_bytes: usize,
     stream: CudaStream,
@@ -2397,6 +2438,12 @@ impl CudaMatvecCache {
             ff_scratch: None,
             ptr_scratch: None,
             wt_scratch: None,
+            attn_k_mirror: Vec::new(),
+            attn_v_mirror: Vec::new(),
+            attn_valid_len: Vec::new(),
+            attn_mirror_ctx: (0, 0, 0),
+            attn_act: None,
+            attn_norms: None,
             used_bytes: 0,
             budget_bytes,
             stream,
@@ -2707,6 +2754,270 @@ impl CudaMatvecCache {
             }
         };
         res.is_ok() && consume_error_count() == 0
+    }
+
+    /// On-device activation-residency DECODE attention block (#2). Runs the whole
+    /// attention block for one token on THIS cache's stream, keeping the
+    /// activation resident on device across every op — so instead of ~5 H2D + ~5
+    /// D2H per layer, there is one hidden upload + one small K/V download (for the
+    /// host KV cache) + hidden/h_norm2 download. Sequence:
+    /// `rmsnorm(hidden)→q/k/v=matvec_dev_io→qk_head_norm→rope→[dl k/v; mirror
+    /// write]→flash(q,mirror)→attn_out→o=matvec_dev_io→add_rmsnorm(hidden+=o)`.
+    /// Weights are `(kind, host_key, bytes)` tuples (uploaded once via the normal
+    /// weight cache). `k_row_out`/`v_row_out` receive the post-RoPE K/V so the
+    /// caller appends them to the host KV cache. Returns false (caller runs the
+    /// host path, `hidden` untouched since it's only written back on full success)
+    /// on bad shape / a mirror gap (`pos > valid` — caller must seed) / any
+    /// kernel failure. NOT bit-exact (device rmsnorm/attn parallel reduce) —
+    /// verdict + fallback gated by the caller. F32 KV only (quant-KV residency is
+    /// a follow-up). No qkv bias (caller falls back if biases are present).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn decode_attn_block_f32(
+        &mut self,
+        wq: (CudaPackedKind, usize, &[u8]),
+        wk: (CudaPackedKind, usize, &[u8]),
+        wv: (CudaPackedKind, usize, &[u8]),
+        wo: (CudaPackedKind, usize, &[u8]),
+        attn_norm: &[f32],
+        post_norm: &[f32],
+        q_norm: Option<&[f32]>,
+        k_norm: Option<&[f32]>,
+        inv_freq: &[f32],
+        hidden: &mut [f32],
+        h_norm2: &mut [f32],
+        k_row_out: &mut [f32],
+        v_row_out: &mut [f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        d_model: usize,
+        pos: usize,
+        max_ctx: usize,
+        n_layers: usize,
+        layer_idx: usize,
+        rms_eps: f32,
+    ) -> bool {
+        let d_q = n_heads * head_dim;
+        let d_kv = n_kv_heads * head_dim;
+        if hidden.len() != d_model
+            || h_norm2.len() != d_model
+            || k_row_out.len() != d_kv
+            || v_row_out.len() != d_kv
+            || attn_norm.len() != d_model
+            || post_norm.len() != d_model
+            || inv_freq.len() != head_dim / 2
+            || head_dim % 2 != 0
+            || layer_idx >= n_layers
+            || pos >= max_ctx
+            || n_kv_heads == 0
+            || n_heads % n_kv_heads != 0
+        {
+            return false;
+        }
+        // Per-layer F32 KV mirror on this stream; rebuilt on a shape change.
+        let mctx = (n_layers as u32, d_kv as u32, max_ctx as u32);
+        if self.attn_mirror_ctx != mctx {
+            self.attn_k_mirror = (0..n_layers).map(|_| None).collect();
+            self.attn_v_mirror = (0..n_layers).map(|_| None).collect();
+            self.attn_valid_len = vec![0; n_layers];
+            self.attn_mirror_ctx = mctx;
+        }
+        let valid = self.attn_valid_len[layer_idx];
+        if pos as u32 > valid {
+            return false; // mirror gap: caller seeds the prefill history / falls back
+        }
+        let act_bytes = (4 * d_model + 2 * d_q + 2 * d_kv) * 4;
+        let norm_bytes = (2 * d_model + 2 * head_dim + head_dim / 2) * 4;
+        let mir_bytes = d_kv * max_ctx * 4;
+        if !Self::ensure_scratch(&mut self.attn_act, &self.stream, act_bytes)
+            || !Self::ensure_scratch(&mut self.attn_norms, &self.stream, norm_bytes)
+            || !Self::ensure_scratch(&mut self.attn_k_mirror[layer_idx], &self.stream, mir_bytes)
+            || !Self::ensure_scratch(&mut self.attn_v_mirror[layer_idx], &self.stream, mir_bytes)
+        {
+            return false;
+        }
+        // Activation-slab f32 offsets: hidden|h_norm|q|k|v|attn_out|o|h_norm2.
+        let (o_hidden, o_hnorm, o_q, o_k, o_v, o_attn, o_o, o_hn2) = (
+            0,
+            d_model,
+            2 * d_model,
+            2 * d_model + d_q,
+            2 * d_model + d_q + d_kv,
+            2 * d_model + d_q + 2 * d_kv,
+            2 * d_model + 2 * d_q + 2 * d_kv,
+            3 * d_model + 2 * d_q + 2 * d_kv,
+        );
+        // Norm-slab f32 offsets: attn_norm|post_norm|q_norm|k_norm|inv_freq.
+        let (no_attn, no_post, no_qn, no_kn, no_if) =
+            (0, d_model, 2 * d_model, 2 * d_model + head_dim, 2 * d_model + 2 * head_dim);
+        let fb = |s: &[f32]| -> &[u8] {
+            unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
+        };
+        // Upload hidden + the norm weights.
+        if !self.attn_act.as_mut().unwrap().upload_at(o_hidden * 4, fb(hidden)) {
+            return false;
+        }
+        {
+            let nrm = self.attn_norms.as_mut().unwrap();
+            if !nrm.upload_at(no_attn * 4, fb(attn_norm))
+                || !nrm.upload_at(no_post * 4, fb(post_norm))
+                || !nrm.upload_at(no_if * 4, fb(inv_freq))
+            {
+                return false;
+            }
+            if let Some(w) = q_norm {
+                if !nrm.upload_at(no_qn * 4, fb(w)) {
+                    return false;
+                }
+            }
+            if let Some(w) = k_norm {
+                if !nrm.upload_at(no_kn * 4, fb(w)) {
+                    return false;
+                }
+            }
+        }
+        // Raw device pointers into the two slabs (copied out → no borrow held).
+        let (ph, phn, pq, pk, pv, pat, po, phn2) = {
+            let a = self.attn_act.as_ref().unwrap();
+            (
+                a.f32_ptr_at(o_hidden),
+                a.f32_ptr_at(o_hnorm),
+                a.f32_ptr_at(o_q),
+                a.f32_ptr_at(o_k),
+                a.f32_ptr_at(o_v),
+                a.f32_ptr_at(o_attn),
+                a.f32_ptr_at(o_o),
+                a.f32_ptr_at(o_hn2),
+            )
+        };
+        let (pan, ppn, pqn, pkn, pif) = {
+            let n = self.attn_norms.as_ref().unwrap();
+            (
+                n.f32_ptr_at(no_attn),
+                n.f32_ptr_at(no_post),
+                n.f32_ptr_at(no_qn),
+                n.f32_ptr_at(no_kn),
+                n.f32_ptr_at(no_if),
+            )
+        };
+        // 1. attn RMSNorm; 2. q/k/v projections (device-I/O, no copy).
+        unsafe {
+            if rmsnorm_dev_f32(&self.stream, ph, pan, phn, 1, d_model, rms_eps).is_err() {
+                return false;
+            }
+        }
+        if !unsafe { self.matvec_packed_dev_io(wq.0, wq.1, wq.2, phn, pq, d_q, d_model) }
+            || !unsafe { self.matvec_packed_dev_io(wk.0, wk.1, wk.2, phn, pk, d_kv, d_model) }
+            || !unsafe { self.matvec_packed_dev_io(wv.0, wv.1, wv.2, phn, pv, d_kv, d_model) }
+        {
+            return false;
+        }
+        // 3. Qwen3 qk-head-norm; 4. RoPE (both device, in place).
+        unsafe {
+            if q_norm.is_some()
+                && qk_head_norm_f32(&self.stream, pq, pqn, n_heads, head_dim, rms_eps).is_err()
+            {
+                return false;
+            }
+            if k_norm.is_some()
+                && qk_head_norm_f32(&self.stream, pk, pkn, n_kv_heads, head_dim, rms_eps).is_err()
+            {
+                return false;
+            }
+            if rope_f32(&self.stream, pq, n_heads, head_dim, pos, pif).is_err()
+                || rope_f32(&self.stream, pk, n_kv_heads, head_dim, pos, pif).is_err()
+            {
+                return false;
+            }
+        }
+        // 5. Download post-RoPE K/V (for the host KV cache) + write the new row
+        //    into the F32 mirror at `pos`, one kv-head at a time (head-major).
+        {
+            let a = self.attn_act.as_ref().unwrap();
+            let kb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(k_row_out.as_mut_ptr() as *mut u8, d_kv * 4)
+            };
+            let vb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(v_row_out.as_mut_ptr() as *mut u8, d_kv * 4)
+            };
+            if !a.download_at(o_k * 4, kb) || !a.download_at(o_v * 4, vb) {
+                return false;
+            }
+        }
+        let row_bytes = head_dim * 4;
+        let kb = fb(k_row_out);
+        let vb = fb(v_row_out);
+        {
+            let km = self.attn_k_mirror[layer_idx].as_mut().unwrap();
+            for h in 0..n_kv_heads {
+                if !km.upload_at(
+                    (h * max_ctx + pos) * row_bytes,
+                    &kb[h * row_bytes..(h + 1) * row_bytes],
+                ) {
+                    return false;
+                }
+            }
+        }
+        {
+            let vm = self.attn_v_mirror[layer_idx].as_mut().unwrap();
+            for h in 0..n_kv_heads {
+                if !vm.upload_at(
+                    (h * max_ctx + pos) * row_bytes,
+                    &vb[h * row_bytes..(h + 1) * row_bytes],
+                ) {
+                    return false;
+                }
+            }
+        }
+        if pos as u32 == valid {
+            self.attn_valid_len[layer_idx] = pos as u32 + 1;
+        }
+        // 6. Flash decode over [0, pos+1) against the mirror → attn_out (device).
+        let km_ptr = self.attn_k_mirror[layer_idx].as_ref().unwrap().ptr as *const f32;
+        let vm_ptr = self.attn_v_mirror[layer_idx].as_ref().unwrap().ptr as *const f32;
+        unsafe {
+            if flash_attn_decode_f32(
+                &self.stream,
+                pq,
+                km_ptr,
+                vm_ptr,
+                pat,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx,
+                pos + 1,
+            )
+            .is_err()
+            {
+                return false;
+            }
+        }
+        // 7. o projection (device-I/O); 8. fused residual + post-attn RMSNorm.
+        if !unsafe { self.matvec_packed_dev_io(wo.0, wo.1, wo.2, pat, po, d_model, d_q) } {
+            return false;
+        }
+        unsafe {
+            if add_rmsnorm_f32(&self.stream, ph, po, ppn, phn2, 1, d_model, rms_eps).is_err() {
+                return false;
+            }
+        }
+        // 9. Download the updated hidden (hidden += o) + the post-attn norm.
+        {
+            let a = self.attn_act.as_ref().unwrap();
+            let hb: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(hidden.as_mut_ptr() as *mut u8, d_model * 4) };
+            if !a.download_at(o_hidden * 4, hb) {
+                return false;
+            }
+            let h2b: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(h_norm2.as_mut_ptr() as *mut u8, d_model * 4)
+            };
+            if !a.download_at(o_hn2 * 4, h2b) {
+                return false;
+            }
+        }
+        consume_error_count() == 0
     }
 
     /// Grouped Q4_K routed-expert FFN — the MoE tiered-expert DECODE fast path.
