@@ -1810,6 +1810,118 @@ fn expert_forced_cpu(w: &Tensor) -> bool {
         && w.name.contains("_exps.weight.e")
 }
 
+/// Drain pending CUDA work on device 0 — including the async managed-memory
+/// prefetches [`upload_bytes_to_cuda_managed`] issues during expert promotion —
+/// so promoted expert pages are device-resident before inference rather than
+/// fault-migrating during the first decode steps. Called once at the end of
+/// `promote_experts_to_device`. No-op off CUDA.
+pub fn cuda_sync_device() {
+    if cuda_active() {
+        let _ = ck::device_sync(0);
+    }
+}
+
+/// Grouped Q4_K routed-expert FFN decode path: ON only where its on-device
+/// self-check (`tune --validate-kernels` → the `moe:ffn_grouped_q4k` verdict)
+/// matched the CPU reference. Fail-closed (off until validated); the per-expert
+/// dispatch is the always-correct fallback.
+fn moe_ffn_grouped_q4k_enabled() -> bool {
+    cuda_active() && kernel_verdict("moe:ffn_grouped_q4k")
+}
+
+/// Grouped Q4_K routed-expert FFN — the MoE tiered-expert DECODE fast path.
+/// When every routed (picked) expert's gate/up/down weights are promoted Q4_K
+/// buffers resident in CUDA device (managed) memory, run the whole top-k FFN in
+/// ONE on-device pass (`out = Σ_e w_e·(Wdown_e·silu(Wgate_e·x)⊙(Wup_e·x))`)
+/// instead of the per-expert loop's ~17 host↔device round-trips per layer (the
+/// CPU silu between each expert's matvecs forced a device→host→device managed
+/// migration — the ~30%-SM decode profile). `out` is OVERWRITTEN with the
+/// routed-expert sum; the caller adds any shared-expert contribution after.
+/// Returns false — caller runs the per-expert path, `out` untouched — unless
+/// the verdict is on AND all picks are device-resident Q4_K of the FFN dims.
+pub fn try_moe_ffn_grouped_q4k_dev_resident(
+    hidden: &[f32],
+    gate: &[Tensor],
+    up: &[Tensor],
+    down: &[Tensor],
+    picks: &[(usize, f32)],
+    d_model: usize,
+    d_ff: usize,
+    out: &mut [f32],
+) -> bool {
+    if !moe_ffn_grouped_q4k_enabled()
+        || picks.is_empty()
+        || hidden.len() != d_model
+        || out.len() != d_model
+        || d_model % 256 != 0
+        || d_ff % 256 != 0
+    {
+        return false;
+    }
+    // Q4_K row bytes = (K/256) super-blocks × 144 B. A promoted per-expert view
+    // holds its own managed copy of exactly its bytes, so the length identifies
+    // the exact weight shape without depending on the view's `shape` encoding.
+    let q4k_row_bytes = |k: usize| (k / 256) * 144;
+    let gate_up_bytes = d_ff * q4k_row_bytes(d_model);
+    let down_bytes = d_model * q4k_row_bytes(d_ff);
+    let want = |t: &Tensor, expected: usize| -> Option<*const core::ffi::c_void> {
+        match (
+            t.storage.device_backend(),
+            t.storage.device_ptr(),
+            dtype_to_cuda_kind(t.dtype),
+        ) {
+            (
+                Some((rustllama_tensor::DeviceBackend::Cuda, _)),
+                Some(p),
+                Some(ck::CudaPackedKind::Q4_K),
+            ) if t.storage.len_bytes() == expected => Some(p as *const core::ffi::c_void),
+            _ => None,
+        }
+    };
+    let mut gate_ptrs = Vec::with_capacity(picks.len());
+    let mut up_ptrs = Vec::with_capacity(picks.len());
+    let mut down_ptrs = Vec::with_capacity(picks.len());
+    let mut weights = Vec::with_capacity(picks.len());
+    for (idx, w) in picks {
+        let e = *idx;
+        if e >= gate.len() || e >= up.len() || e >= down.len() {
+            return false;
+        }
+        let (Some(g), Some(u), Some(d)) = (
+            want(&gate[e], gate_up_bytes),
+            want(&up[e], gate_up_bytes),
+            want(&down[e], down_bytes),
+        ) else {
+            return false;
+        };
+        gate_ptrs.push(g);
+        up_ptrs.push(u);
+        down_ptrs.push(d);
+        weights.push(*w);
+    }
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    // SAFETY: every ptr is a live managed Q4_K buffer (checked above) owned by a
+    // promoted expert `Tensor` that outlives this call; dims validated.
+    let ok = unsafe {
+        guard.moe_ffn_grouped_q4k_dev_resident(
+            hidden, &gate_ptrs, &up_ptrs, &down_ptrs, &weights, out, d_model, d_ff,
+        )
+    };
+    if ok {
+        // One dev-resident "hit" per expert, matching the per-expert path's
+        // accounting so the bench counter stays comparable.
+        for _ in 0..picks.len() {
+            note_moe_dev_resident_hit();
+        }
+    }
+    ok
+}
+
 // ============================================================
 // MoE LRU expert-pin cache
 // ============================================================
@@ -11486,11 +11598,22 @@ pub fn upload_bytes_to_cuda_managed(bytes: &[u8]) -> Option<rustllama_tensor::St
     let device = 0u32; // single active CUDA device (mirrors the dispatch)
     let n = bytes.len();
     let raw = ck::malloc_managed(device, n)?;
-    // Managed memory is host-accessible — a plain memcpy (the pages migrate to
-    // the GPU on the first kernel read).
+    // Managed memory is host-accessible — a plain memcpy (the pages start
+    // host-resident).
     // SAFETY: `raw` is a live managed allocation of exactly `n` bytes.
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), raw, n);
+    }
+    // Prefetch the just-filled pages onto the GPU so they are device-resident
+    // before the first decode kernel, instead of fault-migrating CPU→GPU lazily
+    // during generation (which otherwise stalls the SM — the promoted 30B
+    // showed the framebuffer filling 6→14 GB *through* decode at ~30% SM). The
+    // async migration runs on the NULL stream during the remaining load; the
+    // promotion driver (`promote_experts_to_device`) calls `cuda_sync_device`
+    // once at the end to drain them. Best-effort — ignored where unsupported.
+    // SAFETY: `raw` is a live managed allocation of `n` bytes on `device`.
+    unsafe {
+        let _ = ck::prefetch_managed(device, raw, n);
     }
     let free_fn: Box<dyn FnOnce(*mut u8) + Send + Sync> =
         Box::new(move |p| unsafe { ck::free_managed(device, p) });

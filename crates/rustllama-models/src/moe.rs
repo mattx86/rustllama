@@ -389,6 +389,25 @@ pub fn moe_ffn_one_into(
     // faulting in from disk while pick 1 computes.
     crate::accel::note_routed_experts(picks);
 
+    // MoE tiered-expert grouped FFN (decode fast path): when every routed
+    // expert is a promoted, device-resident Q4_K buffer, run the whole top-k
+    // FFN in one on-device pass (no per-expert host↔device round-trip / CPU
+    // silu migration). Verdict + fallback gated; on success `out` holds the
+    // routed-expert sum and the shared expert (below) still adds in. A miss
+    // (not all promoted, dtype ≠ Q4_K, verdict off) falls through unchanged.
+    if crate::accel::try_moe_ffn_grouped_q4k_dev_resident(
+        hidden,
+        &block.gate_per_expert,
+        &block.up_per_expert,
+        &block.down_per_expert,
+        picks,
+        d_model,
+        d_ff,
+        out,
+    ) {
+        // Routed experts done on-device. Fall through to the shared-expert
+        // block, which accumulates into `out` exactly as in the CPU path.
+    } else {
     // q★ co-execution (tuner-resolved): with a nonzero split on a
     // GPU-active layer, part of the picks dispatch to the GPU while
     // the rest run CPU-concurrently. Pointless when experts are
@@ -477,6 +496,7 @@ pub fn moe_ffn_one_into(
             crate::accel::expert_pin_release(pin);
         }
     }
+    } // end grouped-FFN fallback (per-expert / split path)
 
     // Shared expert. DeepSeek-V3 runs it always-on at the routed-
     // expert width (`d_ff`); Qwen2-MoE (Qwen1.5-MoE) runs a WIDER

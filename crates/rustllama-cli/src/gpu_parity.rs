@@ -3841,6 +3841,94 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- Grouped Q4_K routed-expert FFN (MoE tiered-expert decode fast path) ----
+    // Builds NP experts of Q4_K gate/up/down, runs the whole top-k FFN on-device
+    // in one pass, and grades vs a CPU reference over the IDENTICAL packed
+    // weights (per-expert q4_k matvec → silu_mul → down matvec → weighted sum).
+    // Not bit-exact — the GPU accumulates the weighted sum via atomicAdd (FMA
+    // reassociation only) — so cos/max_rel gated like the other grouped/TC paths.
+    {
+        let name = "moe:ffn_grouped_q4k";
+        const D: usize = 512; // d_model == d_ff, Q4_K-aligned (% 256 == 0)
+        const NP: usize = 4; // routed experts
+        let layout = LAYOUTS.iter().find(|l| l.name == "q4_k").expect("q4_k layout");
+        let cpu_mv = cpu_matvec_for("q4_k");
+        let x = gen_x(D, 0x00A1_1CE5);
+        let weights: [f32; NP] = [0.9, 0.05, 0.03, 0.02];
+        let mut wg: Vec<Vec<u8>> = Vec::with_capacity(NP);
+        let mut wu: Vec<Vec<u8>> = Vec::with_capacity(NP);
+        let mut wd: Vec<Vec<u8>> = Vec::with_capacity(NP);
+        for e in 0..NP as u32 {
+            wg.push(gen_quant_bytes(layout, D, D, 0x6A7E ^ (e * 101)));
+            wu.push(gen_quant_bytes(layout, D, D, 0x0D97 ^ (e * 131)));
+            wd.push(gen_quant_bytes(layout, D, D, 0xD074 ^ (e * 151)));
+        }
+        // CPU reference: Σ_e w_e · (Wdown_e · silu(Wgate_e·x) ⊙ (Wup_e·x)).
+        let mut cpu = vec![0f32; D];
+        let (mut g, mut u, mut ff, mut dn) =
+            (vec![0f32; D], vec![0f32; D], vec![0f32; D], vec![0f32; D]);
+        for e in 0..NP {
+            cpu_mv(&wg[e], &x, &mut g, D, D);
+            cpu_mv(&wu[e], &x, &mut u, D, D);
+            k::silu_mul_f32(&g, &u, &mut ff);
+            cpu_mv(&wd[e], &ff, &mut dn, D, D);
+            for j in 0..D {
+                cpu[j] += weights[e] * dn[j];
+            }
+        }
+        // GPU: per-expert device-resident weights + the grouped entry on a fresh
+        // cache. (All device-0 streams share the runtime primary context, so
+        // these plain-device pointers are valid in the cache's stream — the real
+        // path uses managed memory, which is cross-context either way.)
+        let mut keep = Vec::with_capacity(3 * NP);
+        let mut gp: Vec<*const core::ffi::c_void> = Vec::with_capacity(NP);
+        let mut upp: Vec<*const core::ffi::c_void> = Vec::with_capacity(NP);
+        let mut dp: Vec<*const core::ffi::c_void> = Vec::with_capacity(NP);
+        let mut alloc_ok = true;
+        for e in 0..NP {
+            match (
+                ck::CudaDeviceBuffer::from_host(&stream, &wg[e]),
+                ck::CudaDeviceBuffer::from_host(&stream, &wu[e]),
+                ck::CudaDeviceBuffer::from_host(&stream, &wd[e]),
+            ) {
+                (Some(a), Some(b), Some(c)) => {
+                    gp.push(a.as_ptr());
+                    upp.push(b.as_ptr());
+                    dp.push(c.as_ptr());
+                    keep.push(a);
+                    keep.push(b);
+                    keep.push(c);
+                }
+                _ => {
+                    alloc_ok = false;
+                    break;
+                }
+            }
+        }
+        if !alloc_ok {
+            cu_emit(name, "KERNEL_ERR", "device-alloc-failed");
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+        } else if let Some(mut cache) = ck::CudaMatvecCache::new(0, 1 << 20) {
+            let mut out_gpu = vec![0f32; D];
+            let wv = weights.to_vec();
+            // SAFETY: every ptr is a live device Q4_K buffer held in `keep` on
+            // device 0, valid for the call; dims are Q4_K-aligned.
+            let ok = unsafe {
+                cache.moe_ffn_grouped_q4k_dev_resident(&x, &gp, &upp, &dp, &wv, &mut out_gpu, D, D)
+            };
+            if ok {
+                cu_grade(name, &out_gpu, &cpu, 0.999, 0.02, &mut counts);
+            } else {
+                cu_emit(name, "KERNEL_ERR", "grouped-ffn-returned-false");
+                *counts.entry("KERNEL_ERR").or_default() += 1;
+            }
+        } else {
+            cu_emit(name, "KERNEL_ERR", "cache-create-failed");
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+        }
+        drop(keep);
+    }
+
     println!();
     let summary: Vec<String> = counts.iter().map(|(k, v)| format!("{k}={v}")).collect();
     println!("summary: {}", summary.join("  "));

@@ -81,6 +81,26 @@ extern "C" {
     // Device-indexed managed-memory alloc/free (MoE tiered tier; stream-free).
     fn rsl_cuda_malloc_managed(device: c_int, n_bytes: u64) -> *mut c_void;
     fn rsl_cuda_free_managed(device: c_int, ptr: *mut c_void);
+    // Prefetch a managed allocation onto the GPU (avoids lazy fault-migration
+    // during decode) + a device-wide sync to drain the async prefetches.
+    fn rsl_cuda_prefetch_managed(device: c_int, ptr: *const c_void, n_bytes: u64) -> c_int;
+    fn rsl_cuda_device_sync(device: c_int) -> c_int;
+    // Grouped Q4_K routed-expert FFN (MoE tiered-expert decode fast path): the
+    // whole top-k expert FFN for one token in one on-device pass.
+    #[allow(clippy::too_many_arguments)]
+    fn rsl_cuda_moe_ffn_grouped_q4k(
+        s: *mut RslCudaStreamRaw,
+        gate_ptrs: *const *const c_void,
+        up_ptrs: *const *const c_void,
+        down_ptrs: *const *const c_void,
+        weights: *const f32,
+        x: *const f32,
+        ff: *mut f32,
+        out: *mut f32,
+        n_pick: c_int,
+        d_model: c_int,
+        d_ff: c_int,
+    ) -> c_int;
     fn rsl_cuda_memcpy_h2d(
         s: *mut RslCudaStreamRaw,
         dst_dev: *mut c_void,
@@ -1126,6 +1146,27 @@ pub fn malloc_managed(device: u32, n_bytes: usize) -> Option<*mut u8> {
 /// `ptr` came from [`malloc_managed`] on this `device` and is freed exactly once.
 pub unsafe fn free_managed(device: u32, ptr: *mut u8) {
     rsl_cuda_free_managed(device as c_int, ptr as *mut c_void);
+}
+
+/// Prefetch a [`malloc_managed`] allocation onto `device` so its pages are
+/// device-resident before the first kernel touches them (skips lazy CPU→GPU
+/// fault-migration during decode). Best-effort: `true` on success, `false` if
+/// the device/OS doesn't support it (pages then migrate lazily, as before).
+///
+/// # Safety
+/// `ptr` is a live managed allocation of at least `n_bytes` on `device`.
+pub unsafe fn prefetch_managed(device: u32, ptr: *const u8, n_bytes: usize) -> bool {
+    if ptr.is_null() || n_bytes == 0 {
+        return false;
+    }
+    rsl_cuda_prefetch_managed(device as c_int, ptr as *const c_void, n_bytes as u64) == 0
+}
+
+/// Block until all prior work on `device` finishes — including the async
+/// [`prefetch_managed`] migrations. Call once after a batch of promotions.
+pub fn device_sync(device: u32) -> bool {
+    // SAFETY: FFI; sets the device + synchronizes. No pointers involved.
+    unsafe { rsl_cuda_device_sync(device as c_int) == 0 }
 }
 
 /// Generate the single + batched safe wrappers for a packed-quant matvec.
@@ -2240,6 +2281,12 @@ pub struct CudaMatvecCache {
     weights: HashMap<usize, RawDevBuf>,
     x_scratch: Option<RawDevBuf>,
     out_scratch: Option<RawDevBuf>,
+    // Grouped Q4_K expert-FFN scratch (decode fast path): intermediate
+    // ff [n_pick*d_ff], the three expert device-ptr arrays packed back-to-back
+    // [3*n_pick ptrs], and the routing weights [n_pick].
+    ff_scratch: Option<RawDevBuf>,
+    ptr_scratch: Option<RawDevBuf>,
+    wt_scratch: Option<RawDevBuf>,
     used_bytes: usize,
     budget_bytes: usize,
     stream: CudaStream,
@@ -2254,6 +2301,9 @@ impl CudaMatvecCache {
             weights: HashMap::new(),
             x_scratch: None,
             out_scratch: None,
+            ff_scratch: None,
+            ptr_scratch: None,
+            wt_scratch: None,
             used_bytes: 0,
             budget_bytes,
             stream,
@@ -2469,6 +2519,126 @@ impl CudaMatvecCache {
         }
         let out_bytes: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, m * 4) };
+        self.out_scratch.as_ref().unwrap().download(out_bytes)
+    }
+
+    /// Grouped Q4_K routed-expert FFN — the MoE tiered-expert DECODE fast path.
+    /// Computes `out = Σ_e weight[e] · (Wdown_e · silu(Wgate_e·x) ⊙ (Wup_e·x))`
+    /// for all `n_pick` promoted (device-resident) experts in ONE on-device pass
+    /// (two batched kernels), instead of the per-expert dispatch's ~17
+    /// host↔device round-trips per layer. `x` is uploaded once + `out`
+    /// downloaded once; the silu stays on-device, so no per-expert managed-page
+    /// migration. The `*_ptrs` are the experts' live device (managed) weight
+    /// pointers — Q4_K packed, `gate`/`up` = `[d_ff, d_model]`, `down` =
+    /// `[d_model, d_ff]`. `out` is OVERWRITTEN with the routed-expert sum (the
+    /// caller adds any shared-expert contribution afterward). Returns false
+    /// (caller runs the per-expert path) on bad shape / scratch / kernel
+    /// failure, leaving `out` untouched. NOT bit-exact vs the sequential
+    /// accumulate (atomicAdd reorders the weighted sum) — verdict + perf gated
+    /// by the caller.
+    ///
+    /// # Safety
+    /// Each pointer in `gate_ptrs`/`up_ptrs`/`down_ptrs` is a live
+    /// device-accessible (managed/unified) Q4_K weight buffer on this cache's
+    /// device, valid for the call, sized for the stated (M,K).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn moe_ffn_grouped_q4k_dev_resident(
+        &mut self,
+        x: &[f32],
+        gate_ptrs: &[*const c_void],
+        up_ptrs: &[*const c_void],
+        down_ptrs: &[*const c_void],
+        weights: &[f32],
+        out: &mut [f32],
+        d_model: usize,
+        d_ff: usize,
+    ) -> bool {
+        let n = gate_ptrs.len();
+        if n == 0
+            || n != up_ptrs.len()
+            || n != down_ptrs.len()
+            || n != weights.len()
+            || x.len() != d_model
+            || out.len() != d_model
+            || d_model == 0
+            || d_ff == 0
+            || d_model % 256 != 0
+            || d_ff % 256 != 0
+        {
+            return false;
+        }
+        if gate_ptrs
+            .iter()
+            .chain(up_ptrs)
+            .chain(down_ptrs)
+            .any(|p| p.is_null())
+        {
+            return false;
+        }
+        let ptr_bytes = std::mem::size_of::<*const c_void>();
+        if !Self::ensure_scratch(&mut self.x_scratch, &self.stream, d_model * 4)
+            || !Self::ensure_scratch(&mut self.out_scratch, &self.stream, d_model * 4)
+            || !Self::ensure_scratch(&mut self.ff_scratch, &self.stream, n * d_ff * 4)
+            || !Self::ensure_scratch(&mut self.ptr_scratch, &self.stream, 3 * n * ptr_bytes)
+            || !Self::ensure_scratch(&mut self.wt_scratch, &self.stream, n * 4)
+        {
+            return false;
+        }
+        // Upload x.
+        let x_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, d_model * 4) };
+        if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
+            return false;
+        }
+        // Upload the three expert device-ptr arrays packed [gate | up | down].
+        // Managed pointers are unified-VA, so their host-side value is the same
+        // address the kernel dereferences on-device.
+        let mut ptrs: Vec<*const c_void> = Vec::with_capacity(3 * n);
+        ptrs.extend_from_slice(gate_ptrs);
+        ptrs.extend_from_slice(up_ptrs);
+        ptrs.extend_from_slice(down_ptrs);
+        let ptr_src: &[u8] =
+            unsafe { std::slice::from_raw_parts(ptrs.as_ptr() as *const u8, 3 * n * ptr_bytes) };
+        if !self.ptr_scratch.as_mut().unwrap().upload(ptr_src) {
+            return false;
+        }
+        // Upload routing weights.
+        let wt_src: &[u8] =
+            unsafe { std::slice::from_raw_parts(weights.as_ptr() as *const u8, n * 4) };
+        if !self.wt_scratch.as_mut().unwrap().upload(wt_src) {
+            return false;
+        }
+        let base = self.ptr_scratch.as_ref().unwrap().ptr as *const *const c_void;
+        let gate_dev = base;
+        let up_dev = unsafe { base.add(n) };
+        let down_dev = unsafe { base.add(2 * n) };
+        let wt_dev = self.wt_scratch.as_ref().unwrap().ptr as *const f32;
+        let x_ptr = self.x_scratch.as_ref().unwrap().ptr as *const f32;
+        let ff_ptr = self.ff_scratch.as_ref().unwrap().ptr as *mut f32;
+        let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
+        // SAFETY: all buffers are live device scratch on this stream sized above;
+        // the entry memsets `out`, runs both batched kernels in stream order
+        // (kernel 2 reads what kernel 1 wrote), and synchronizes before return.
+        let rc = unsafe {
+            rsl_cuda_moe_ffn_grouped_q4k(
+                self.stream.raw(),
+                gate_dev,
+                up_dev,
+                down_dev,
+                wt_dev,
+                x_ptr,
+                ff_ptr,
+                out_ptr,
+                n as c_int,
+                d_model as c_int,
+                d_ff as c_int,
+            )
+        };
+        if rc != 0 || consume_error_count() != 0 {
+            return false;
+        }
+        let out_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, d_model * 4) };
         self.out_scratch.as_ref().unwrap().download(out_bytes)
     }
 

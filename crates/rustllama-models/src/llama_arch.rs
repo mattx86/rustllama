@@ -1193,6 +1193,13 @@ impl LlamaWeights {
             used += block_bytes;
             promoted += ne;
         }
+        // Drain the async managed-memory prefetches each promotion issued
+        // (`upload_bytes_to_cuda_managed` → `prefetch_managed`), so the promoted
+        // expert pages are device-resident before inference instead of
+        // fault-migrating during the first decode steps. One sync for the batch.
+        if promoted > 0 {
+            crate::accel::cuda_sync_device();
+        }
         (promoted, used)
     }
 

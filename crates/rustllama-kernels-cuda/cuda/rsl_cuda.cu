@@ -240,6 +240,40 @@ extern "C" void rsl_cuda_free_managed(int device, void *ptr) {
     cudaFree(ptr);
 }
 
+// Prefetch a managed allocation onto the GPU so its pages are device-resident
+// BEFORE the first decode kernel touches them. Without this, cudaMallocManaged
+// pages start host-resident and fault-migrate CPU->GPU lazily on first access,
+// spreading the migration cost across the first decode steps (observed on a
+// promoted 30B as the GPU framebuffer slowly filling 6->14 GB *during*
+// generation, with the SM only ~30% busy). Called right after the promotion
+// memcpy; pair with rsl_cuda_device_sync after ALL promotions so the async
+// prefetches finish before inference. Best-effort: a device without
+// concurrentManagedAccess (or WDDM/Windows) returns an error the caller
+// IGNORES — pages then migrate lazily exactly as before (slower, never wrong).
+// CUDA 13 removed the deprecated int-dstDevice overload, so use the
+// cudaMemLocation form on >=12.2 and the legacy form below it.
+extern "C" int rsl_cuda_prefetch_managed(int device, const void *ptr,
+                                         unsigned long long n_bytes) {
+    if (!ptr || n_bytes == 0) return -1;
+    if (cudaSetDevice(device) != cudaSuccess) return -1;
+#if CUDART_VERSION >= 12020
+    cudaMemLocation loc;
+    loc.type = cudaMemLocationTypeDevice;
+    loc.id = device;
+    cudaError_t e = cudaMemPrefetchAsync(ptr, (size_t)n_bytes, loc, 0, 0);
+#else
+    cudaError_t e = cudaMemPrefetchAsync(ptr, (size_t)n_bytes, device, 0);
+#endif
+    return e == cudaSuccess ? 0 : (int)e;
+}
+
+// Block until all prior work on `device` (incl. the async managed prefetches
+// above, issued on the NULL stream) completes. One call at the end of promotion.
+extern "C" int rsl_cuda_device_sync(int device) {
+    if (cudaSetDevice(device) != cudaSuccess) return -1;
+    return cudaDeviceSynchronize() == cudaSuccess ? 0 : -1;
+}
+
 extern "C" int rsl_cuda_memcpy_h2d(rsl_cuda_stream *s, void *dst_dev,
                                    const void *src_host, unsigned long long n_bytes) {
     if (!s) return -1;
@@ -1970,6 +2004,93 @@ RSL_GATE_UP_FUSED(matvec_iq4_nl_packed_f32, iq4_nl_row_dot,  32,  18,  32)
 RSL_GATE_UP_FUSED(matvec_iq4_xs_packed_f32, iq4_xs_row_dot, 256, 136, 256)
 RSL_GATE_UP_FUSED(matvec_iq1_s_packed_f32,  iq1_s_row_dot,  256,  50, 256)
 RSL_GATE_UP_FUSED(matvec_iq1_m_packed_f32,  iq1_m_row_dot,  256,  56, 256)
+
+// ============================================================
+// GROUPED Q4_K ROUTED-EXPERT FFN — MoE tiered-expert DECODE fast path.
+// Does the whole top-k expert FFN for one token in ONE on-device pass over all
+// routed (device-promoted) experts, instead of the per-expert dispatch's ~17
+// host<->device round-trips per layer (each expert = fused gate+up matvec, a
+// CPU silu that forces a device->host->device managed-page migration, then a
+// down matvec — all separately synchronized). Here x is uploaded once and out
+// downloaded once; the gate+up+silu+down chain never leaves the GPU, so the
+// SM stops idling on launch latency + page faults (the ~30%-SM decode profile).
+// Q4_K-only: the promoted-expert common case (all experts share dtype + dims).
+// NOT bit-exact vs the sequential per-expert accumulate — the weighted 8-term
+// sum is an atomicAdd reduction (FMA reassociation only) — so it is graded
+// cos/max_rel and verdict + fallback gated, never shipped where it miscomputes.
+// gate/up weights: M=d_ff rows, K=d_model. down: M=d_model rows, K=d_ff.
+// Both K multiples of 256 (Q4_K super-block); 144 B/block, so row r starts at
+// r*(K/256)*144. Pointer args are DEVICE arrays of the experts' device ptrs.
+// ============================================================
+
+// Kernel 1 — for every (expert e, row r<d_ff): ff[e*d_ff+r] = silu(gate)*up,
+// gate = Wg_e[r].x, up = Wu_e[r].x. One warp per (e,r); grid.y strides experts.
+__global__ void moe_grouped_q4k_gate_up_silu_kernel(
+    const unsigned char *const *gate_ptrs, const unsigned char *const *up_ptrs,
+    const float *x, float *ff, int d_ff, int d_model) {
+    int e = blockIdx.y;
+    int r = blockIdx.x * blockDim.y + threadIdx.y;
+    if (r >= d_ff) return;
+    int lane = threadIdx.x;
+    int bpr = d_model / 256;
+    size_t off = (size_t)r * bpr * 144;
+    float g = q4_k_row_dot_warp(gate_ptrs[e] + off, x, bpr, lane);
+    float u = q4_k_row_dot_warp(up_ptrs[e] + off, x, bpr, lane);
+    for (int o = warpSize >> 1; o > 0; o >>= 1) {
+        g += __shfl_down_sync(0xffffffffu, g, o);
+        u += __shfl_down_sync(0xffffffffu, u, o);
+    }
+    if (lane == 0) {
+        float s = g / (1.0f + expf(-g)); // silu(gate); matches silu_mul_f32_kernel
+        ff[(size_t)e * d_ff + r] = s * u;
+    }
+}
+
+// Kernel 2 — for every (expert e, col c<d_model): atomicAdd(out[c], w_e*down),
+// down = Wd_e[c].ff_e. One warp per (e,c). `out` is zeroed by the entry below.
+__global__ void moe_grouped_q4k_down_accum_kernel(
+    const unsigned char *const *down_ptrs, const float *weights, const float *ff,
+    float *out, int d_model, int d_ff) {
+    int e = blockIdx.y;
+    int c = blockIdx.x * blockDim.y + threadIdx.y;
+    if (c >= d_model) return;
+    int lane = threadIdx.x;
+    int bpr = d_ff / 256;
+    size_t off = (size_t)c * bpr * 144;
+    float acc =
+        q4_k_row_dot_warp(down_ptrs[e] + off, ff + (size_t)e * d_ff, bpr, lane);
+    for (int o = warpSize >> 1; o > 0; o >>= 1)
+        acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if (lane == 0) atomicAdd(&out[c], weights[e] * acc);
+}
+
+// x/ff/out + the four pointer/weight arrays are all DEVICE buffers (the caller
+// uploads x, the expert device-ptr arrays, and the routing weights to scratch,
+// and allocates ff [n_pick*d_ff] + out [d_model]). Kernel 2 reads ff on the
+// same stream as kernel 1 writes it → stream ordering serializes them, no
+// explicit sync. `out` is memset to 0 before the accumulate.
+extern "C" int rsl_cuda_moe_ffn_grouped_q4k(
+    rsl_cuda_stream *s, const void *const *gate_ptrs,
+    const void *const *up_ptrs, const void *const *down_ptrs,
+    const float *weights, const float *x, float *ff, float *out, int n_pick,
+    int d_model, int d_ff) {
+    if (!s || !gate_ptrs || !up_ptrs || !down_ptrs || !weights || !x || !ff ||
+        !out || n_pick <= 0 || d_model <= 0 || d_ff <= 0 ||
+        (d_model % 256) != 0 || (d_ff % 256) != 0)
+        return -1;
+    cudaSetDevice(s->device);
+    dim3 block(32, 8);
+    dim3 g1((unsigned)((d_ff + 7) / 8), (unsigned)n_pick);
+    moe_grouped_q4k_gate_up_silu_kernel<<<g1, block, 0, s->stream>>>(
+        (const unsigned char *const *)gate_ptrs,
+        (const unsigned char *const *)up_ptrs, x, ff, d_ff, d_model);
+    cudaMemsetAsync(out, 0, (size_t)d_model * sizeof(float), s->stream);
+    dim3 g2((unsigned)((d_model + 7) / 8), (unsigned)n_pick);
+    moe_grouped_q4k_down_accum_kernel<<<g2, block, 0, s->stream>>>(
+        (const unsigned char *const *)down_ptrs, weights, ff, out, d_model,
+        d_ff);
+    return rsl_cuda_check("rsl_cuda_moe_ffn_grouped_q4k");
+}
 RSL_GATE_UP_FUSED(matvec_iq2_xxs_packed_f32, iq2_xxs_row_dot, 256, 66, 256)
 RSL_GATE_UP_FUSED(matvec_iq2_xs_packed_f32, iq2_xs_row_dot, 256,  74, 256)
 RSL_GATE_UP_FUSED(matvec_iq2_s_packed_f32,  iq2_s_row_dot,  256,  82, 256)
