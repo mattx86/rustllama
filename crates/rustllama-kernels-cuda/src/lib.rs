@@ -3020,6 +3020,81 @@ impl CudaMatvecCache {
         consume_error_count() == 0
     }
 
+    /// Seed the on-device F32 KV mirror for `layer_idx` with the host cache's
+    /// prefill history `[valid, pos)`, so `decode_attn_block_f32`'s `pos > valid`
+    /// gate passes once decode starts at `pos = prompt_len` (the mirror begins
+    /// empty). `k_cache`/`v_cache` are the layer's host KV slabs, head-major
+    /// `[n_kv_heads, max_ctx, head_dim]` (same layout as the mirror), so each
+    /// head's missing rows upload as ONE contiguous copy. No-op once current.
+    /// Call once per layer at the prefill→decode boundary, before the block.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn seed_attn_mirror_f32(
+        &mut self,
+        layer_idx: usize,
+        k_cache: &[f32],
+        v_cache: &[f32],
+        pos: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx: usize,
+        n_layers: usize,
+    ) -> bool {
+        let d_kv = n_kv_heads * head_dim;
+        if layer_idx >= n_layers
+            || pos > max_ctx
+            || k_cache.len() < d_kv * max_ctx
+            || v_cache.len() < d_kv * max_ctx
+        {
+            return false;
+        }
+        let mctx = (n_layers as u32, d_kv as u32, max_ctx as u32);
+        if self.attn_mirror_ctx != mctx {
+            self.attn_k_mirror = (0..n_layers).map(|_| None).collect();
+            self.attn_v_mirror = (0..n_layers).map(|_| None).collect();
+            self.attn_valid_len = vec![0; n_layers];
+            self.attn_mirror_ctx = mctx;
+        }
+        let mir_bytes = d_kv * max_ctx * 4;
+        if !Self::ensure_scratch(&mut self.attn_k_mirror[layer_idx], &self.stream, mir_bytes)
+            || !Self::ensure_scratch(&mut self.attn_v_mirror[layer_idx], &self.stream, mir_bytes)
+        {
+            return false;
+        }
+        let valid = self.attn_valid_len[layer_idx] as usize;
+        if valid >= pos {
+            return true; // already current
+        }
+        let kcb: &[u8] = unsafe {
+            std::slice::from_raw_parts(k_cache.as_ptr() as *const u8, std::mem::size_of_val(k_cache))
+        };
+        let vcb: &[u8] = unsafe {
+            std::slice::from_raw_parts(v_cache.as_ptr() as *const u8, std::mem::size_of_val(v_cache))
+        };
+        let n = pos - valid; // rows to upload per head
+        {
+            let km = self.attn_k_mirror[layer_idx].as_mut().unwrap();
+            for h in 0..n_kv_heads {
+                let src = (h * max_ctx + valid) * head_dim * 4;
+                let dst = (h * max_ctx + valid) * head_dim * 4;
+                if !km.upload_at(dst, &kcb[src..src + n * head_dim * 4]) {
+                    return false;
+                }
+            }
+        }
+        {
+            let vm = self.attn_v_mirror[layer_idx].as_mut().unwrap();
+            for h in 0..n_kv_heads {
+                let src = (h * max_ctx + valid) * head_dim * 4;
+                let dst = (h * max_ctx + valid) * head_dim * 4;
+                if !vm.upload_at(dst, &vcb[src..src + n * head_dim * 4]) {
+                    return false;
+                }
+            }
+        }
+        self.attn_valid_len[layer_idx] = pos as u32;
+        consume_error_count() == 0
+    }
+
     /// Grouped Q4_K routed-expert FFN — the MoE tiered-expert DECODE fast path.
     /// Computes `out = Σ_e weight[e] · (Wdown_e · silu(Wgate_e·x) ⊙ (Wup_e·x))`
     /// for all `n_pick` promoted (device-resident) experts in ONE on-device pass

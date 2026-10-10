@@ -7539,6 +7539,48 @@ impl LlamaModel {
             // CPU kernel. The `try_*` functions return `true` on
             // success and we short-circuit; on `false` we fall
             // through to the next tier.
+            //
+            // #2 on-device activation-residency attention (opt-in
+            // `RUSTLLAMA_DEV_ATTN`): run the WHOLE attention block on the GPU
+            // with the activation resident on device (rmsnorm→qkv→qk-head-norm→
+            // rope→flash→o→residual+norm, no per-op host round-trip). On success
+            // `hidden` is updated (residual done), `h_norm` holds the post-attn
+            // RMSNorm (the FFN input), and the host KV cache is appended +
+            // coherent — so the whole host attention path below is skipped. F32
+            // KV + no qkv bias only; otherwise falls through unchanged.
+            let kv_max_ctx = kv.max_ctx;
+            let device_attn = if let KvLayer::F32 { k, v } = &mut kv.layers[layer_idx] {
+                crate::accel::try_decode_attn_block_cuda_f32(
+                    block.w_q(),
+                    block.w_k(),
+                    block.w_v(),
+                    block.w_o(),
+                    block.attn_norm(),
+                    block.ffn_norm(),
+                    block.q_norm(),
+                    block.k_norm(),
+                    block.b_q().is_some() || block.b_k().is_some() || block.b_v().is_some(),
+                    rope_inv_freq,
+                    &mut hidden,
+                    &mut h_norm,
+                    &mut k_buf,
+                    &mut v_buf,
+                    k,
+                    v,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    d,
+                    cur_pos,
+                    kv_max_ctx,
+                    cfg.n_layers,
+                    layer_idx,
+                    cfg.rms_eps,
+                )
+            } else {
+                false
+            };
+            if !device_attn {
             if !crate::accel::try_rmsnorm_usm_f32(
                 &hidden,
                 block.attn_norm(),
@@ -8296,6 +8338,7 @@ impl LlamaModel {
                 }
             }
             } // end else (H6 fused out-proj+norm not taken)
+            } // end `if !device_attn` (host attention path; device path done above)
 
             // FFN dispatch: dense (existing matvec ladder) or MoE
             // (router + top-K expert SwiGLU). The MoE path uses

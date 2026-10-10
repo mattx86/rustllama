@@ -7048,6 +7048,129 @@ pub fn try_flash_attn_decode_cuda_f32(
     })
 }
 
+/// On-device activation-residency attention path (#2): OPT-IN first-integration
+/// gate `RUSTLLAMA_DEV_ATTN=1` (default-off, so it can't touch default inference
+/// until coherence is proven on-device; becomes verdict-gated auto afterward).
+fn dev_attn_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("RUSTLLAMA_DEV_ATTN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Run the WHOLE attention block for one decode token on the GPU, keeping the
+/// activation resident on device (#2) — `CudaMatvecCache::decode_attn_block_f32`
+/// behind the gate + weight/norm extraction + mirror seeding. On success `hidden`
+/// is updated (residual done), `h_norm2` holds the post-attn RMSNorm (the FFN
+/// input), and `k_buf`/`v_buf` hold the post-RoPE K/V (caller appends them to the
+/// host KV cache). Returns false — caller runs the host attention path — unless:
+/// the flag is on, CUDA is active, there are no qkv biases, and q/k/v/o are all
+/// packed-quant dispatchable. F32 KV only. `k_cache`/`v_cache` are the layer's
+/// host KV slabs (head-major) for seeding the mirror's prefill history.
+#[allow(clippy::too_many_arguments)]
+pub fn try_decode_attn_block_cuda_f32(
+    w_q: &Tensor,
+    w_k: &Tensor,
+    w_v: &Tensor,
+    w_o: &Tensor,
+    attn_norm: &[f32],
+    post_norm: &[f32],
+    q_norm: Option<&[f32]>,
+    k_norm: Option<&[f32]>,
+    has_qkv_bias: bool,
+    inv_freq: &[f32],
+    hidden: &mut [f32],
+    h_norm2: &mut [f32],
+    k_buf: &mut [f32],
+    v_buf: &mut [f32],
+    k_cache: &mut [f32],
+    v_cache: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    d_model: usize,
+    pos: usize,
+    max_ctx: usize,
+    n_layers: usize,
+    layer_idx: usize,
+    rms_eps: f32,
+) -> bool {
+    if !dev_attn_enabled() || !cuda_active() || has_qkv_bias {
+        return false;
+    }
+    let (Some(kq), Some(kk), Some(kv), Some(ko)) = (
+        dtype_to_cuda_kind(w_q.dtype),
+        dtype_to_cuda_kind(w_k.dtype),
+        dtype_to_cuda_kind(w_v.dtype),
+        dtype_to_cuda_kind(w_o.dtype),
+    ) else {
+        return false;
+    };
+    let (qb, kb, vb, ob) = (
+        w_q.storage.as_bytes(),
+        w_k.storage.as_bytes(),
+        w_v.storage.as_bytes(),
+        w_o.storage.as_bytes(),
+    );
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut g) = cache.lock() else {
+        return false;
+    };
+    // SAFETY: weight byte-slices outlive the call; host buffers are sized to the
+    // dims (caller contract); the cache owns the stream + mirror.
+    let ok = unsafe {
+        g.seed_attn_mirror_f32(
+            layer_idx, k_cache, v_cache, pos, n_kv_heads, head_dim, max_ctx, n_layers,
+        ) && g.decode_attn_block_f32(
+            (kq, qb.as_ptr() as usize, qb),
+            (kk, kb.as_ptr() as usize, kb),
+            (kv, vb.as_ptr() as usize, vb),
+            (ko, ob.as_ptr() as usize, ob),
+            attn_norm,
+            post_norm,
+            q_norm,
+            k_norm,
+            inv_freq,
+            hidden,
+            h_norm2,
+            k_buf,
+            v_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            d_model,
+            pos,
+            max_ctx,
+            n_layers,
+            layer_idx,
+            rms_eps,
+        )
+    };
+    if ok {
+        // Append this token's post-RoPE K/V into the host KV cache at `pos`
+        // (head-major), so the host cache stays coherent for a later fallback /
+        // the next seed. The device block already wrote the mirror + flashed.
+        for h in 0..n_kv_heads {
+            let dst = (h * max_ctx + pos) * head_dim;
+            let src = h * head_dim;
+            k_cache[dst..dst + head_dim].copy_from_slice(&k_buf[src..src + head_dim]);
+            v_cache[dst..dst + head_dim].copy_from_slice(&v_buf[src..src + head_dim]);
+        }
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(
+                "#2 on-device activation-residency attention ENGAGED — the whole \
+                 attention block runs GPU-resident (RUSTLLAMA_DEV_ATTN) (logged once)"
+            );
+        }
+    }
+    ok
+}
+
 /// Seed the native-CUDA F32 decode KV mirror with the prefill history for a
 /// layer — upload the rows `[valid..pos)` that aren't resident yet from the
 /// host KV cache. Without this, [`try_flash_attn_decode_cuda_f32`]'s
