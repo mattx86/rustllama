@@ -1116,6 +1116,12 @@ impl CpuEngine {
         // read once); later loads inherit whatever the first saw.
         rustllama_models::accel::expert_pin_clear();
         rustllama_models::accel::expert_registry_clear();
+        // Free the PREVIOUS model's GPU device state before loading this one:
+        // the matvec weight caches key by host byte address (reused across
+        // reloads → stale entry = wrong-sized device buffer = illegal memory
+        // access, or accumulation → OOM), and the flash-attention KV mirrors
+        // hold the old shape's device buffers. No-op on a first/only load.
+        rustllama_models::accel::reset_device_caches_for_new_model();
         if (rustllama_models::accel::moe_expert_cache_max_bytes() > 0
             || crate::memory_budget::auto_memory_budget_enabled())
             && std::env::var_os("RUSTLLAMA_ZEROCOPY_WEIGHTS").is_none()

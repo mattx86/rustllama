@@ -1821,6 +1821,37 @@ pub fn cuda_sync_device() {
     }
 }
 
+/// Reset all process-global / per-thread GPU device state tied to the PREVIOUS
+/// model, at the start of loading a new one. The matvec weight caches
+/// (CUDA/MLX) key by the weight's HOST byte address, which the allocator reuses
+/// across model reloads — so without this a new model can hit a stale cache
+/// entry and run a kernel against the old model's (wrong-sized) device buffer →
+/// illegal memory access, or the never-freed entries pile up until VRAM OOMs
+/// (both observed on the `tune --kv-dtype` per-candidate reload). The
+/// flash-attention KV mirrors (`CUDA_ATTN`/`MLX_ATTN`/`USM_ATTN` thread-locals)
+/// hold per-layer device buffers for the old model's shape; free them too, bump
+/// the KV staleness epoch, and clear the MoE-tier flag (this model re-arms it if
+/// it promotes). Idempotent + cheap on a first/only load (empty caches). For a
+/// concurrently-serving other model this evicts its cached weights, which it
+/// simply re-uploads on its next matvec (correctness preserved; minor churn).
+pub fn reset_device_caches_for_new_model() {
+    if let Some(cache) = cuda_cache() {
+        if let Ok(mut g) = cache.lock() {
+            g.clear();
+        }
+    }
+    if let Some(cache) = mlx_cache() {
+        if let Ok(mut g) = cache.lock() {
+            g.clear();
+        }
+    }
+    clear_cuda_attn_context();
+    clear_mlx_attn_context();
+    clear_usm_attn_context();
+    usm_attn_kv_epoch_bump();
+    set_moe_tier_active(false);
+}
+
 /// Grouped Q4_K routed-expert FFN decode path: ON only where its on-device
 /// self-check (`tune --validate-kernels` → the `moe:ffn_grouped_q4k` verdict)
 /// matched the CPU reference. Fail-closed (off until validated); the per-expert

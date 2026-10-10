@@ -2320,6 +2320,19 @@ impl CudaMatvecCache {
         self.used_bytes
     }
 
+    /// Drop all cached weights (freeing their device buffers) and reset the
+    /// byte counter; the reusable scratch buffers are kept (model-agnostic,
+    /// resized on demand). Call on model reload: the weight-cache key is the
+    /// host byte address (`w_bytes.as_ptr()`), which the allocator reuses across
+    /// model loads, so a stale entry from the previous model would otherwise
+    /// serve a wrong-sized device buffer (out-of-bounds kernel read → illegal
+    /// memory access) or wrong data to the next model, and the never-freed
+    /// entries accumulate until VRAM OOMs.
+    pub fn clear(&mut self) {
+        self.weights.clear();
+        self.used_bytes = 0;
+    }
+
     fn ensure_scratch(slot: &mut Option<RawDevBuf>, stream: &CudaStream, need_bytes: usize) -> bool {
         let big_enough = matches!(slot, Some(b) if b.cap_bytes >= need_bytes);
         if big_enough {
@@ -2337,8 +2350,18 @@ impl CudaMatvecCache {
     /// Ensure `weight_key`'s bytes are resident; upload on first use.
     /// Returns false if over budget or an alloc/upload fails.
     fn ensure_weight(&mut self, weight_key: usize, w_bytes: &[u8]) -> bool {
-        if self.weights.contains_key(&weight_key) {
-            return true;
+        if let Some(existing) = self.weights.get(&weight_key) {
+            if existing.cap_bytes == w_bytes.len() {
+                return true;
+            }
+            // Stale entry: the key is the host byte address, which the allocator
+            // reuses across model reloads. A reused address now maps to a
+            // DIFFERENT-sized weight — serving the old (possibly smaller) device
+            // buffer would read out of bounds (illegal memory access). Evict +
+            // re-upload the correct bytes. (A clean reload also calls `clear`;
+            // this is the per-entry safety net.)
+            self.used_bytes = self.used_bytes.saturating_sub(existing.cap_bytes);
+            self.weights.remove(&weight_key);
         }
         if self.used_bytes + w_bytes.len() > self.budget_bytes {
             return false;

@@ -1891,6 +1891,16 @@ impl MlxMatvecCache {
         self.used_bytes
     }
 
+    /// Drop all cached weights (freeing their device buffers) and reset the
+    /// byte counter. Call on model reload: the weight-cache key is the host byte
+    /// address, which the allocator reuses across model loads, so a stale entry
+    /// would otherwise serve a wrong-sized/`wrong` buffer to the next model or
+    /// accumulate until OOM. (Mirrors `CudaMatvecCache::clear`.)
+    pub fn clear(&mut self) {
+        self.weights.clear();
+        self.used_bytes = 0;
+    }
+
     fn ensure_scratch(slot: &mut Option<RawDevBuf>, stream: &MlxStream, need_bytes: usize) -> bool {
         let big_enough = matches!(slot, Some(b) if b.cap_bytes >= need_bytes);
         if big_enough {
@@ -1908,8 +1918,16 @@ impl MlxMatvecCache {
     /// Ensure `weight_key`'s bytes are resident; upload on first use.
     /// Returns false if over budget or an alloc/upload fails.
     fn ensure_weight(&mut self, weight_key: usize, w_bytes: &[u8]) -> bool {
-        if self.weights.contains_key(&weight_key) {
-            return true;
+        if let Some(existing) = self.weights.get(&weight_key) {
+            if existing.cap_bytes == w_bytes.len() {
+                return true;
+            }
+            // Stale entry from a prior model (host-address key reused across
+            // reloads for a different-sized weight) — evict + re-upload so the
+            // kernel never reads a wrong-sized buffer. (Clean reload also calls
+            // `clear`; this is the per-entry safety net.)
+            self.used_bytes = self.used_bytes.saturating_sub(existing.cap_bytes);
+            self.weights.remove(&weight_key);
         }
         if self.used_bytes + w_bytes.len() > self.budget_bytes {
             return false;
