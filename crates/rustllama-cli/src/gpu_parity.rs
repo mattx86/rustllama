@@ -3841,6 +3841,53 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- Qwen3 per-head q/k RMSNorm (device, #2 activation residency) ----
+    // In-place RMSNorm of each head's head_dim slice with a shared weight;
+    // graded vs the CPU `rmsnorm_f32_row` per head (parallel reduce → not
+    // bit-exact, cos/max_rel gated).
+    {
+        let name = "attn:qk_head_norm";
+        const NH: usize = 4; // heads
+        const HD: usize = 128; // head_dim
+        let x = gen_x(NH * HD, 0x9E3F);
+        let w = gen_x(HD, 0x0000_517A);
+        let eps = 1e-6f32;
+        let mut cpu = x.clone();
+        let mut tmp = vec![0f32; HD];
+        for h in 0..NH {
+            k::rmsnorm_f32_row(&x[h * HD..(h + 1) * HD], &w, &mut tmp, eps);
+            cpu[h * HD..(h + 1) * HD].copy_from_slice(&tmp);
+        }
+        match (cu_upload_f32(&stream, &x), cu_upload_f32(&stream, &w)) {
+            (Some(mut buf), Some(wb)) => {
+                // SAFETY: buf (NH*HD f32) + wb (HD f32) are live device buffers
+                // on `stream`; qk_head_norm writes `buf` in place + synchronizes.
+                let ok = unsafe {
+                    ck::qk_head_norm_f32(
+                        &stream,
+                        buf.as_mut_ptr() as *mut f32,
+                        wb.as_ptr() as *const f32,
+                        NH,
+                        HD,
+                        eps,
+                    )
+                }
+                .is_ok()
+                    && ck::consume_error_count() == 0;
+                if ok {
+                    cu_grade(name, &cu_download_f32(&buf, NH * HD), &cpu, 0.999, 0.02, &mut counts);
+                } else {
+                    cu_emit(name, "KERNEL_ERR", "kernel-failed");
+                    *counts.entry("KERNEL_ERR").or_default() += 1;
+                }
+            }
+            _ => {
+                cu_emit(name, "KERNEL_ERR", "device-alloc-failed");
+                *counts.entry("KERNEL_ERR").or_default() += 1;
+            }
+        }
+    }
+
     // ---- Grouped routed-expert FFN (MoE tiered-expert decode fast path) ----
     // Builds NP experts of gate/up/down for each warp-cooperative quant, runs the
     // whole top-k FFN on-device in one pass, and grades vs a CPU reference over

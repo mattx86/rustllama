@@ -271,6 +271,25 @@ extern "C" {
         pos: c_int,
         inv_freq: *const f32,
     ) -> c_int;
+    // Stream-based device-resident RMSNorm + Qwen3 per-head q/k RMSNorm (#2
+    // activation residency): device pointers, no internal round-trip.
+    fn rsl_cuda_rmsnorm_dev_f32(
+        s: *mut RslCudaStreamRaw,
+        x: *const f32,
+        w: *const f32,
+        y: *mut f32,
+        n_rows: c_int,
+        d: c_int,
+        eps: f32,
+    ) -> c_int;
+    fn rsl_cuda_qk_head_norm_f32(
+        s: *mut RslCudaStreamRaw,
+        buf: *mut f32,
+        w: *const f32,
+        n_heads: c_int,
+        head_dim: c_int,
+        eps: f32,
+    ) -> c_int;
     fn rsl_cuda_silu_mul_f32(
         s: *mut RslCudaStreamRaw,
         x: *const f32,
@@ -1579,6 +1598,51 @@ pub unsafe fn rope_f32(
         pos as c_int,
         inv_freq,
     );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// Device-resident RMSNorm: `y[r] = rmsnorm(x[r]) * w`, `n_rows` rows of `d`.
+///
+/// SAFETY: `x`/`w`/`y` are device pointers on `stream` (`x`,`y` ≥ `n_rows*d`;
+/// `w` ≥ `d`); the wrapper synchronizes before returning.
+#[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+pub unsafe fn rmsnorm_dev_f32(
+    stream: &CudaStream,
+    x: *const f32,
+    w: *const f32,
+    y: *mut f32,
+    n_rows: usize,
+    d: usize,
+    eps: f32,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_rmsnorm_dev_f32(stream.raw(), x, w, y, n_rows as c_int, d as c_int, eps);
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// Qwen3 per-head q/k RMSNorm in place: RMSNorm each of `n_heads` rows of
+/// `head_dim` in `buf` with the shared weight `w`.
+///
+/// SAFETY: `buf` (≥ `n_heads*head_dim`) and `w` (≥ `head_dim`) are device
+/// pointers on `stream`; the wrapper synchronizes before returning.
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn qk_head_norm_f32(
+    stream: &CudaStream,
+    buf: *mut f32,
+    w: *const f32,
+    n_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Result<(), CudaError> {
+    let rc =
+        rsl_cuda_qk_head_norm_f32(stream.raw(), buf, w, n_heads as c_int, head_dim as c_int, eps);
     if rc == 0 {
         Ok(())
     } else {

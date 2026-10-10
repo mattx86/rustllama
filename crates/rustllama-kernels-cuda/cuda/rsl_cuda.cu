@@ -115,6 +115,30 @@ extern "C" int rsl_cuda_rmsnorm_f32(const float *x, const float *w, float *y,
     return err == cudaSuccess ? 0 : -3;
 }
 
+// Qwen3 per-head Q/K RMSNorm, in place (mirrors `apply_qk_head_norm`: RMSNorm
+// each head's `head_dim` slice with the shared `w`[head_dim], before RoPE).
+// `buf`[n_heads*head_dim] + `w`[head_dim] are DEVICE pointers; one block per
+// head (256 threads cover head_dim via the strided loop; threads past head_dim
+// contribute 0). Device-resident; NOT bit-exact (parallel reduce) → graded.
+// (The extern launchers using `rsl_cuda_stream` live after its struct def.)
+__global__ void qk_head_norm_f32_kernel(float *buf, const float *w,
+                                        int head_dim, float eps) {
+    int head = blockIdx.x;
+    float *row = buf + (size_t)head * head_dim;
+    __shared__ float sh[256];
+    float local = 0.f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) local += row[i] * row[i];
+    sh[threadIdx.x] = local;
+    __syncthreads();
+    for (int s2 = blockDim.x >> 1; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) sh[threadIdx.x] += sh[threadIdx.x + s2];
+        __syncthreads();
+    }
+    float inv = rsqrtf(sh[0] / (float)head_dim + eps);
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
+        row[i] = row[i] * inv * w[i];
+}
+
 // ---- f32 mat-vec: out[m] = sum_k W[m*k + k] * x[k] --------------------
 // One warp (32 lanes) reduces the k-dimension for a row; blockDim.y rows
 // per block.
@@ -2275,6 +2299,31 @@ extern "C" int rsl_cuda_rope_f32(rsl_cuda_stream *s, float *qk, int n_heads,
     int t = 128, b = (total + t - 1) / t;
     rope_f32_kernel<<<b, t, 0, s->stream>>>(qk, n_heads, head_dim, pos, inv_freq);
     return rsl_cuda_check("rsl_cuda_rope_f32");
+}
+
+// Stream-based DEVICE-RESIDENT RMSNorm (no internal malloc/copy, unlike
+// rsl_cuda_rmsnorm_f32 which round-trips host arrays) — for the on-device
+// activation-residency decode path (#2). x/w/y are DEVICE pointers on the
+// stream; one block per row; reuses rmsnorm_kernel. NOT bit-exact vs the CPU
+// (parallel reduce reorders the sum) — graded cos/max_rel, verdict + fallback
+// gated like the other device paths.
+extern "C" int rsl_cuda_rmsnorm_dev_f32(rsl_cuda_stream *s, const float *x,
+                                        const float *w, float *y, int n_rows,
+                                        int d, float eps) {
+    if (!s || !x || !w || !y || n_rows <= 0 || d <= 0) return -1;
+    cudaSetDevice(s->device);
+    rmsnorm_kernel<<<n_rows, 256, 0, s->stream>>>(x, w, y, d, eps);
+    return rsl_cuda_check("rsl_cuda_rmsnorm_dev_f32");
+}
+
+// Launcher for qk_head_norm_f32_kernel (defined above the mat-vec section).
+extern "C" int rsl_cuda_qk_head_norm_f32(rsl_cuda_stream *s, float *buf,
+                                         const float *w, int n_heads,
+                                         int head_dim, float eps) {
+    if (!s || !buf || !w || n_heads <= 0 || head_dim <= 0) return -1;
+    cudaSetDevice(s->device);
+    qk_head_norm_f32_kernel<<<n_heads, 256, 0, s->stream>>>(buf, w, head_dim, eps);
+    return rsl_cuda_check("rsl_cuda_qk_head_norm_f32");
 }
 
 // SwiGLU (mirrors rsl_silu_mul_usm): out[i] = silu(x[i]) * y[i].
