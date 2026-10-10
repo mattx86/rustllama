@@ -323,6 +323,15 @@ pub struct TuningResult {
     pub device: DeviceFingerprint,
     pub kernels: HashMap<String, KernelParams>,
     pub placement: HashMap<String, PlacementPlan>,
+    /// Per-model winning MoE tiered-expert VRAM **margin** in BYTES (the headroom
+    /// reserved below free VRAM when projecting the expert-promotion budget),
+    /// keyed by model file stem — from `tune --moe-vram-margin` / `--all`. A
+    /// smaller margin promotes more experts to GPU (faster decode) until paging
+    /// thrash; the sweep measures decode tok/s per margin and keeps the best.
+    /// `load_inner` reads this (else the static `kv_mirror.max(1 GiB)` heuristic).
+    /// `#[serde(default)]` → old cache files still load, no schema-version bump.
+    #[serde(default)]
+    pub moe_vram_margin: HashMap<String, u64>,
     pub threads: Option<ThreadPlan>,
     pub batch_size: Option<u32>,
     /// Winning `[inference].kv_dtype` from the comprehensive sweep
@@ -465,6 +474,7 @@ impl TuningResult {
             device,
             kernels: HashMap::new(),
             placement: HashMap::new(),
+            moe_vram_margin: HashMap::new(),
             threads: None,
             batch_size: None,
             kv_dtype: None,

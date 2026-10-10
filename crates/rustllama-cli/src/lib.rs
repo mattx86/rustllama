@@ -513,6 +513,14 @@ pub enum Command {
         /// block is bit-exact, so this gates on speed, not correctness.
         #[arg(long)]
         dev_attn: bool,
+        /// Sweep the MoE tiered-expert VRAM margin (the headroom reserved below
+        /// free VRAM when projecting the expert-promotion budget) and persist the
+        /// per-model margin with the best decode tok/s. A smaller margin promotes
+        /// more experts to GPU device memory (faster) until paging thrash; the
+        /// sweep reloads per margin and keeps the sweet spot. CUDA / dedicated-
+        /// SYCL MoE only; a `tune --all` sub-stage (Stage 5b).
+        #[arg(long)]
+        moe_vram_margin: bool,
         /// **Comprehensive autotune**: run every sweep in coordinate-
         /// descent order — kernel LWS → kv_dtype → flash_attention →
         /// kv_cache_layout → placement → batch_size → threads — and
@@ -1234,6 +1242,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             per_device_perf,
             validate_kernels,
             dev_attn,
+            moe_vram_margin,
             all,
             skip_cached,
             force,
@@ -1302,6 +1311,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 per_device_perf,
                 validate_kernels,
                 dev_attn,
+                moe_vram_margin,
                 all,
             ]
             .iter()
@@ -1314,7 +1324,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                      --prefix-snapshots / --kv-page-size / --flash-v3-kv-tile / \
                      --moe-placement / --speculative-mtp / --ssm-prefill-chunked / \
                      --decision-calibrate / --per-device-perf / --validate-kernels / \
-                     --dev-attn / --all are exclusive; \
+                     --dev-attn / --moe-vram-margin / --all are exclusive; \
                      pick at most one"
                 );
             }
@@ -1457,6 +1467,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if dev_attn {
                 return cmd_tune_dev_attn(
+                    &config_path,
+                    model,
+                    prompt_tokens,
+                    decode_tokens,
+                    repeats,
+                );
+            }
+            if moe_vram_margin {
+                return cmd_tune_moe_vram_margin(
                     &config_path,
                     model,
                     prompt_tokens,
@@ -6133,6 +6152,118 @@ fn cmd_tune_dev_attn(
     Ok(())
 }
 
+/// Persist the per-model MoE VRAM-margin winner (bytes) into the tuner cache,
+/// keyed by model stem under `moe_vram_margin` (mirrors `persist_placement_winner`).
+/// `load_inner` reads it at load so `serve` auto-applies the decode-optimal
+/// margin with no env var. Best-effort: a missing cache dir is a warned no-op.
+pub fn persist_moe_vram_margin_winner(model_key: &str, margin_bytes: u64) -> anyhow::Result<()> {
+    use rustllama_tuner::{load_cache, save_cache, TuningResult};
+    let Some(cache_dir) = rustllama_tuner::default_cache_dir() else {
+        tracing::warn!("no tuner cache dir resolvable; skipping moe-vram-margin persistence");
+        return Ok(());
+    };
+    let (key, device) = rustllama_tuner::cache_context();
+    std::fs::create_dir_all(&cache_dir)?;
+    let mut tuning = load_cache(&cache_dir, &key)?
+        .unwrap_or_else(|| TuningResult::empty(key.clone(), device.clone()));
+    tuning
+        .moe_vram_margin
+        .insert(model_key.to_string(), margin_bytes);
+    tuning.last_tuned = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| format!("{}", d.as_secs()));
+    save_cache(&cache_dir, &tuning)?;
+    Ok(())
+}
+
+/// `tune --moe-vram-margin` (a `tune --all` sub-stage): sweep the MoE
+/// tiered-expert VRAM margin (headroom reserved below free VRAM) and persist the
+/// per-model margin whose decode tok/s is best. A smaller margin promotes more
+/// experts to GPU (faster) until paging thrash; the sweep reloads per margin and
+/// keeps the sweet spot. CUDA / dedicated-SYCL MoE only; inert elsewhere.
+fn cmd_tune_moe_vram_margin(
+    config_path: &std::path::Path,
+    model_override: Option<String>,
+    prompt_tokens: u32,
+    decode_tokens: u32,
+    repeats: u32,
+) -> anyhow::Result<()> {
+    use rustllama_engine::measurement::{measure_moe_vram_margin_candidates, MeasurementConfig};
+
+    let cfg = rustllama_config::load(config_path).unwrap_or_default();
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
+    let model_key = model_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown-model")
+        .to_string();
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    // Largest-first: the measurement's tie-break keeps the earlier (larger,
+    // safer) margin when two are within noise.
+    let margins: Vec<u64> = vec![2 * GIB, 3 * GIB / 2, GIB, 3 * GIB / 4, GIB / 2];
+
+    let decode_tokens = decode_tokens.max(64);
+    let ctx_size =
+        (prompt_tokens as usize + decode_tokens as usize + 8).max(cfg.inference.ctx_size as usize);
+    let m_cfg = MeasurementConfig {
+        kv_dtype: parse_kv_dtype(&cfg.inference.kv_dtype).unwrap_or(rustllama_engine::KvDtype::F32),
+        kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
+        flash_attention: cfg.inference.flash_attention,
+        n_gpu_layers: cfg.inference.n_gpu_layers,
+    };
+
+    println!("rustllama tune --moe-vram-margin");
+    println!("  model         = {}", model_path.display());
+    println!(
+        "  margins (GiB) = {}",
+        margins
+            .iter()
+            .map(|m| format!("{:.2}", *m as f64 / GIB as f64))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!("  decode_tokens = {decode_tokens}, repeats = {}", repeats.max(2));
+    println!();
+
+    let report = measure_moe_vram_margin_candidates(
+        &model_path,
+        &margins,
+        ctx_size,
+        prompt_tokens,
+        decode_tokens,
+        repeats.max(2),
+        &m_cfg,
+    )
+    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    for (m, tps) in &report.candidates {
+        match tps {
+            Some(t) => println!("  margin {:.2} GiB → {t:.2} tok/s", *m as f64 / GIB as f64),
+            None => println!("  margin {:.2} GiB → (no measurement)", *m as f64 / GIB as f64),
+        }
+    }
+    if !report.capable {
+        println!(
+            "  → skipped: {}",
+            report
+                .error
+                .unwrap_or_else(|| "MoE VRAM tier inert on this host".into())
+        );
+        return Ok(());
+    }
+    match report.winner {
+        Some(m) => {
+            println!("  → winner: {:.2} GiB margin", m as f64 / GIB as f64);
+            persist_moe_vram_margin_winner(&model_key, m)?;
+            println!("  → persisted per-model margin (serve auto-applies it at load)");
+        }
+        None => println!("  → no candidate produced a measurement; nothing persisted"),
+    }
+    Ok(())
+}
+
 fn cmd_tune_kv_dtype(
     config_path: &std::path::Path,
     model_override: Option<String>,
@@ -7377,6 +7508,11 @@ fn cmd_tune_all(
         (Some(t), Some(k)) => t.placement.contains_key(k),
         _ => false,
     };
+    // Per-model MoE VRAM margin (Stage 5b). Like placement, keyed by model stem.
+    let has_moe_vram_margin = match (cached.as_ref(), tune_model_key.as_ref()) {
+        (Some(t), Some(k)) => t.moe_vram_margin.contains_key(k),
+        _ => false,
+    };
     let has_batch_size = cached.as_ref().and_then(|t| t.batch_size).is_some();
     let has_threads = cached.as_ref().and_then(|t| t.threads.clone()).is_some();
     let has_decision_calibration = cached
@@ -7647,6 +7783,34 @@ fn cmd_tune_all(
             &args_5,
         ) {
             tracing::warn!(error = %e, "stage 5 (placement) failed; continuing");
+        }
+    }
+
+    println!();
+    println!("Stage 5b/10: moe-vram-margin (promote the decode-optimal expert count to GPU)");
+    println!("--------");
+    if skip(has_moe_vram_margin) {
+        println!("(skipped: moe-vram-margin winner already cached)");
+    } else {
+        // Model-dependent reload-per-margin decode A/B; CUDA / dedicated-SYCL
+        // MoE only (the stage self-skips + persists nothing otherwise).
+        let args_5b = vec![
+            "--prompt-tokens".to_string(),
+            measure_prompt_tokens.to_string(),
+            "--decode-tokens".to_string(),
+            measure_decode_tokens.to_string(),
+            "--repeats".to_string(),
+            measure_repeats.to_string(),
+        ];
+        if let Err(e) = run_tune_stage_subprocess(
+            config_path,
+            &model_clone_for_stages,
+            "--moe-vram-margin",
+            thorough,
+            "5b (moe-vram-margin)",
+            &args_5b,
+        ) {
+            tracing::warn!(error = %e, "stage 5b (moe-vram-margin) failed; continuing");
         }
     }
 

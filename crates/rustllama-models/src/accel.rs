@@ -7080,6 +7080,35 @@ pub fn dev_attn_hits() -> u64 {
     DEV_ATTN_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Runtime override for the MoE tiered-expert VRAM MARGIN (bytes) — the headroom
+/// reserved below free VRAM when `load_inner` projects the expert-promotion
+/// budget (`budget = free_vram − non_expert_weights − margin`). `u64::MAX` =
+/// unset → the load path uses the persisted per-model winner (from
+/// `tune --moe-vram-margin`) or the static `kv_mirror.max(1 GiB)` heuristic.
+/// Set by the margin A/B sweep per candidate (before each reload); serve/bench
+/// leave it unset. A smaller margin promotes MORE experts to GPU (faster decode)
+/// until UVM paging thrash — safe by construction (managed memory oversubscribes
+/// to host-paged UVM rather than OOMing, so a too-small margin degrades to
+/// "slower", which the sweep rejects).
+static MOE_VRAM_MARGIN_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Set (or clear with `None`) the MoE VRAM-margin override, in bytes.
+pub fn set_moe_vram_margin_override(bytes: Option<u64>) {
+    MOE_VRAM_MARGIN_OVERRIDE.store(
+        bytes.unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The MoE VRAM-margin override in bytes, or `None` when unset.
+pub fn moe_vram_margin_override() -> Option<u64> {
+    match MOE_VRAM_MARGIN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        u64::MAX => None,
+        v => Some(v),
+    }
+}
+
 /// Whether the #2 on-device activation-residency attention block is enabled.
 /// **AUTOMATIC, no env var** — perf-gated exactly like the TC-GEMM paths: on
 /// only where the `tune --dev-attn` A/B measured it FASTER than the host path on

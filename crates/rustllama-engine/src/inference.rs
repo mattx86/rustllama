@@ -1084,6 +1084,22 @@ impl CpuEngine {
         Self::load_inner(path, max_ctx, with_tokenizer, kv_dtype, kv_layout, kv_page_size)
     }
 
+    /// Read the autotuned MoE VRAM margin (bytes) for `model_id` from the tuner
+    /// cache, if `tune --moe-vram-margin` / `--all` recorded one on this system
+    /// (keyed by the system fingerprint + model file stem). Best-effort: any
+    /// cache miss / load error yields `None`, so `load_inner` falls back to the
+    /// static `kv_mirror.max(1 GiB)` heuristic.
+    fn moe_vram_margin_tuned(model_id: &str) -> Option<u64> {
+        let dir = rustllama_tuner::default_cache_dir()?;
+        let (key, _device) = rustllama_tuner::cache_context();
+        rustllama_tuner::load_cache(&dir, &key)
+            .ok()
+            .flatten()?
+            .moe_vram_margin
+            .get(model_id)
+            .copied()
+    }
+
     fn load_inner(
         path: &Path,
         max_ctx: usize,
@@ -1478,7 +1494,15 @@ impl CpuEngine {
                     * ctx as f64
                     * model.cfg.head_dim as f64
                     * kv_bytes_per_elem) as u64;
-                let margin = kv_mirror.max(1024 * 1024 * 1024); // KV mirror, min 1 GiB
+                // Margin precedence: the tuner A/B override (set per candidate by
+                // the in-process `tune --moe-vram-margin` sweep) → the persisted
+                // per-model winner → the static `kv_mirror.max(1 GiB)` heuristic.
+                // An autotuned margin lets each host promote the decode-optimal
+                // expert count instead of the conservative default.
+                let heuristic_margin = kv_mirror.max(1024 * 1024 * 1024);
+                let margin = rustllama_models::accel::moe_vram_margin_override()
+                    .or_else(|| Self::moe_vram_margin_tuned(&model_id))
+                    .unwrap_or(heuristic_margin);
                 avail
                     .saturating_sub(non_expert_b)
                     .saturating_sub(margin)

@@ -2681,6 +2681,172 @@ pub fn measure_dev_attn(
     })
 }
 
+/// Outcome of [`measure_moe_vram_margin_candidates`] — the MoE VRAM-margin A/B.
+///
+/// `capable` is `true` only when a reload actually engaged the tiered-expert
+/// promotion (CUDA / dedicated-SYCL MoE model); otherwise the margin has no
+/// effect and the CLI persists nothing. `candidates` are `(margin_bytes, median
+/// decode tok/s)` per swept margin; `winner` is the margin with the best median
+/// decode (ties → the LARGER / safer margin). A smaller margin promotes more
+/// experts (faster) until UVM paging thrash drags decode back down, so the
+/// best-decode margin is the sweet spot — and it's safe to probe aggressively
+/// because managed memory oversubscribes rather than OOMing.
+#[derive(Debug, Clone, Default)]
+pub struct MoeVramMarginReport {
+    pub capable: bool,
+    pub winner: Option<u64>,
+    pub candidates: Vec<(u64, Option<f64>)>,
+    pub error: Option<String>,
+}
+
+/// A/B the MoE tiered-expert VRAM margin by measured DECODE tok/s. Reloads the
+/// model once per margin (the budget is applied at LOAD, so unlike the placement
+/// A/B this can't toggle in place) with the accel margin override set, confirms
+/// the tier promoted (`moe_tier_active`), and keeps the best-decode margin.
+/// CUDA / dedicated-SYCL MoE only — inert elsewhere (`capable=false`, no winner).
+pub fn measure_moe_vram_margin_candidates(
+    model_path: &Path,
+    margins: &[u64],
+    ctx_size: usize,
+    prompt_tokens: u32,
+    decode_tokens: u32,
+    repeats: u32,
+    cfg: &MeasurementConfig,
+) -> crate::Result<MoeVramMarginReport> {
+    use rustllama_models::accel;
+
+    // The margin only matters where the tier can promote into device VRAM.
+    let tier_possible = accel::cuda_active() || accel::sycl_dedicated_vram_bytes().is_some();
+    if !tier_possible {
+        return Ok(MoeVramMarginReport {
+            capable: false,
+            error: Some("no CUDA / dedicated-SYCL GPU — the MoE VRAM tier is inert".into()),
+            ..Default::default()
+        });
+    }
+    if margins.is_empty() {
+        return Ok(MoeVramMarginReport {
+            capable: false,
+            error: Some("no margin candidates".into()),
+            ..Default::default()
+        });
+    }
+
+    let sampling = SamplingParams {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        typical_p: 1.0,
+        repeat_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        seed: 0,
+        max_tokens: decode_tokens,
+        stop: Vec::new(),
+        ..SamplingParams::default()
+    };
+
+    let mut candidates: Vec<(u64, Option<f64>)> = Vec::with_capacity(margins.len());
+    let mut best: Option<(u64, f64)> = None;
+    let mut any_tier = false;
+    let mut last_err: Option<String> = None;
+
+    for &margin in margins {
+        accel::set_moe_vram_margin_override(Some(margin));
+        let mut cpu = match CpuEngine::load_with_options_and_layout(
+            model_path,
+            ctx_size,
+            true,
+            cfg.kv_dtype,
+            &cfg.kv_cache_layout,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = Some(format!("load failed (margin {margin}): {e}"));
+                candidates.push((margin, None));
+                continue;
+            }
+        };
+        // Did this margin actually engage the tier? `load_inner` sets the flag
+        // (reset per load) only when it promoted >=1 expert into device memory.
+        let promoted = accel::moe_tier_active();
+        any_tier |= promoted;
+        cpu.set_prefix_cache(false);
+        cpu.set_flash_attention(cfg.flash_attention);
+        cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+
+        let vocab = cpu.vocab_size() as i32;
+        let prompt_ids: Vec<i32> = (0..prompt_tokens as i32)
+            .map(|i| 1 + (i % vocab.max(2).saturating_sub(1)))
+            .collect();
+
+        // Untimed warmup + `repeats` timed decode runs → median tok/s.
+        cpu.clear_prefix_cache();
+        let tps = if cpu
+            .generate_token_ids(&prompt_ids, decode_tokens, &sampling)
+            .is_err()
+        {
+            None
+        } else {
+            let mut runs: Vec<f64> = Vec::with_capacity(repeats as usize);
+            for _ in 0..repeats {
+                cpu.clear_prefix_cache();
+                if cpu
+                    .generate_token_ids(&prompt_ids, decode_tokens, &sampling)
+                    .is_ok()
+                {
+                    let stats = cpu.last_request_stats();
+                    if stats.decode_ms > 0.0 && stats.tokens_generated > 0 {
+                        runs.push((stats.tokens_generated as f64) / (stats.decode_ms / 1000.0));
+                    }
+                }
+            }
+            if runs.is_empty() {
+                None
+            } else {
+                runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                Some(if runs.len() % 2 == 1 {
+                    runs[runs.len() / 2]
+                } else {
+                    (runs[runs.len() / 2 - 1] + runs[runs.len() / 2]) / 2.0
+                })
+            }
+        };
+        candidates.push((margin, tps));
+        if let Some(t) = tps {
+            // Best decode; on a (near-)tie prefer the LARGER margin already held
+            // (safer headroom) — only replace when strictly faster.
+            match best {
+                Some((_, bt)) if t <= bt => {}
+                _ => best = Some((margin, t)),
+            }
+        }
+        // Drop the engine (frees the promoted device memory) before the next
+        // reload; the load path's reset_device_caches_for_new_model clears any
+        // stale device-cache/KV-mirror state on the following load.
+        drop(cpu);
+        accel::set_moe_vram_margin_override(None);
+    }
+
+    accel::set_moe_vram_margin_override(None);
+    if !any_tier {
+        return Ok(MoeVramMarginReport {
+            capable: false,
+            candidates,
+            error: last_err.or_else(|| {
+                Some("tier never promoted (not a MoE model, or no device VRAM budget)".into())
+            }),
+            ..Default::default()
+        });
+    }
+    Ok(MoeVramMarginReport {
+        capable: true,
+        winner: best.map(|(m, _)| m),
+        candidates,
+        error: last_err,
+    })
+}
+
 #[cfg(test)]
 mod kv_coherence_tests {
     use super::*;
