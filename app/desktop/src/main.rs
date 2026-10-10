@@ -19,6 +19,22 @@ fn main() -> anyhow::Result<()> {
     // PATH prepend takes effect when it binds). Makes `serve`/`gui`
     // work from a bare shell without run-sycl.bat. No-op off-Windows.
     rustllama_runtime::ensure_gpu_dll_search_paths();
+    // Silence the oneAPI Unified Runtime loader's benign adapter-init banner on
+    // non-Intel hosts. On an NVIDIA-only / CPU box the bundled Level-Zero
+    // adapter fails a version check against an absent/old L0 driver and the UR
+    // loader logs `UR adapter initialization failed: 43 (UNSUPPORTED_VERSION)`
+    // — confusing but harmless (the CUDA/CPU path is unaffected). Lower the UR
+    // loader + L0-adapter log components to `quiet` (the documented
+    // `UR_LOG_<component>=level:<lvl>` knobs); this only changes logging, never
+    // device selection, so it's inert on Intel hosts. Set BEFORE any SYCL symbol
+    // binds (the kernel lib is delay-loaded) so the loader reads it at init, and
+    // leave a user-provided value alone for debugging.
+    if std::env::var_os("UR_LOG_LOADER").is_none() {
+        std::env::set_var("UR_LOG_LOADER", "level:quiet;flush:off");
+    }
+    if std::env::var_os("UR_LOG_LEVEL_ZERO").is_none() {
+        std::env::set_var("UR_LOG_LEVEL_ZERO", "level:quiet;flush:off");
+    }
     let cli = Cli::parse();
 
     match cli.command {

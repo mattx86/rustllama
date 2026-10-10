@@ -434,7 +434,37 @@ fn handle_event(
         (KeyCode::Backspace, _) if !app.streaming => {
             app.input.pop();
         }
-        (KeyCode::Char(c), _) if !app.streaming => {
+        // Many terminals (and SSH / tmux / some pod consoles) send Ctrl-H
+        // (0x08) for the Backspace key; crossterm decodes that as
+        // Char('h')+CONTROL. Without this arm it would fall through to the
+        // printable-char arm below and TYPE an 'h' instead of deleting.
+        (KeyCode::Char('h'), m)
+            if m.contains(KeyModifiers::CONTROL) && !app.streaming =>
+        {
+            app.input.pop();
+        }
+        // Ctrl-U clears the line, Ctrl-W deletes the last word — the usual
+        // readline edits users expect in an input box.
+        (KeyCode::Char('u'), m)
+            if m.contains(KeyModifiers::CONTROL) && !app.streaming =>
+        {
+            app.input.clear();
+        }
+        (KeyCode::Char('w'), m)
+            if m.contains(KeyModifiers::CONTROL) && !app.streaming =>
+        {
+            let keep = app.input.trim_end();
+            let cut = keep.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+            app.input.truncate(cut);
+        }
+        // Printable text — but NOT control/alt-modified combos, which would
+        // otherwise type the bare letter (e.g. an unhandled Ctrl-A → 'a').
+        // SHIFT is allowed so capitals still work.
+        (KeyCode::Char(c), m)
+            if !app.streaming
+                && !m.contains(KeyModifiers::CONTROL)
+                && !m.contains(KeyModifiers::ALT) =>
+        {
             app.input.push(c);
         }
         _ => return false,
@@ -961,6 +991,55 @@ fn set_f32(slot: &mut f32, arg: &str, status: &mut String, name: &str) {
 
 // ---- rendering ----
 
+/// Strip chain-of-thought reasoning from an assistant message for DISPLAY.
+/// Reasoning models (Qwen3, …) stream a `<think>…</think>` scratchpad the user
+/// shouldn't see in the transcript. A COMPLETE span is removed; an UNCLOSED
+/// `<think>` (reasoning still streaming) collapses to a dim `[thinking…]` marker
+/// so the turn isn't blank mid-generation. Also handles the template-injected
+/// form where the completion starts mid-thought and only emits the closing tag
+/// (a `</think>` with no `<think>` before it → drop everything up to it). Models
+/// that emit no think tags are returned unchanged. Display-only; the stored
+/// content (and thus history) is untouched.
+fn strip_think(content: &str) -> String {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    let mut rest = content;
+    // Implicit leading reasoning: a CLOSE before any OPEN means the opening tag
+    // was injected into the prompt, so the completion opened mid-thought — drop
+    // through the first CLOSE.
+    if let Some(c) = rest.find(CLOSE) {
+        let open_first = rest.find(OPEN).map(|o| o < c).unwrap_or(false);
+        if !open_first {
+            rest = &rest[c + CLOSE.len()..];
+        }
+    }
+    let mut out = String::with_capacity(rest.len());
+    loop {
+        match rest.find(OPEN) {
+            None => {
+                out.push_str(rest);
+                break;
+            }
+            Some(i) => {
+                out.push_str(&rest[..i]);
+                let after = &rest[i + OPEN.len()..];
+                match after.find(CLOSE) {
+                    Some(j) => rest = &after[j + CLOSE.len()..],
+                    None => {
+                        // Still reasoning (no close yet) → marker, stop.
+                        if !out.trim_end().is_empty() {
+                            out.push('\n');
+                        }
+                        out.push_str("[thinking…]");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    out.trim_start().to_string()
+}
+
 fn ui(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let chunks = Layout::default()
@@ -1059,9 +1138,17 @@ fn ui(f: &mut Frame, app: &mut App) {
             Style::default()
         };
         // "Prefix: " then wrapped body; continuation lines indented.
+        // Assistant turns have their chain-of-thought `<think>…</think>` span
+        // hidden (reasoning models stream a scratchpad the user shouldn't see);
+        // everything else renders verbatim.
         let head = format!("{prefix}: ");
         let indent = " ".repeat(head.len().min(content_w.saturating_sub(1)));
-        let wrapped = wrap_text(&t.content, content_w.saturating_sub(head.len()).max(1));
+        let body: std::borrow::Cow<str> = if t.role == "assistant" {
+            std::borrow::Cow::Owned(strip_think(&t.content))
+        } else {
+            std::borrow::Cow::Borrowed(t.content.as_str())
+        };
+        let wrapped = wrap_text(&body, content_w.saturating_sub(head.len()).max(1));
         if wrapped.is_empty() {
             lines.push(Line::from(vec![Span::styled(head.clone(), style)]));
         }
