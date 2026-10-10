@@ -1713,7 +1713,7 @@ __device__ __forceinline__ float iq1_s_row_dot(const unsigned char *row,
                 unsigned int idx = (unsigned)qs[4 * ib32 + l] | (((qh >> (3 * l)) & 7u) << 8);
                 unsigned long long g = rsl::IQ1S_GRID_CUDA[idx];
                 for (int j = 0; j < 8; ++j) {
-                    unsigned char gj = (unsigned char)((g >> (j * 8)) & 0xFFu);
+                    signed char gj = (signed char)((g >> (j * 8)) & 0xFFu);
                     acc += dl * ((float)gj + delta) * x[x_off + 8 * l + j];
                 }
             }
@@ -1771,7 +1771,7 @@ __device__ __forceinline__ float iq1_m_row_dot(const unsigned char *row,
                 float dl = dls[l];
                 float delta_val = deltas[l];
                 for (int j = 0; j < 8; ++j) {
-                    unsigned char gj = (unsigned char)((g >> (j * 8)) & 0xFFu);
+                    signed char gj = (signed char)((g >> (j * 8)) & 0xFFu);
                     acc += dl * ((float)gj + delta_val) * x[x_off + 8 * l + j];
                 }
             }

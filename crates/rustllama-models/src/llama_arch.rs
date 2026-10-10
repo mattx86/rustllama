@@ -1115,9 +1115,7 @@ impl LlamaWeights {
         };
         let n_layers = blocks.len();
         // Per-layer expert count (min of the three per-expert Vecs — always
-        // equal; the `min` just guards a malformed load). Computed up front so
-        // the immutable borrow of `blocks` is released before the promotion
-        // loop's `&mut blocks[l]`.
+        // equal; the `min` just guards a malformed load).
         let n_exp: Vec<usize> = blocks
             .iter()
             .map(|b| {
@@ -1127,58 +1125,90 @@ impl LlamaWeights {
                     .min(b.down_per_expert.len())
             })
             .collect();
-        // Promotion order: usage-ranked (hottest-first) experts, then the rest
-        // in `(layer, expert)` index order — deduped. Cold start (empty
-        // `ranked`) collapses to pure index order.
-        let mut order: Vec<(usize, usize)> = Vec::new();
-        let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
-        for key in ranked {
-            let (l, e) = (key.layer as usize, key.expert as usize);
-            if l < n_layers && e < n_exp[l] && seen.insert((l, e)) {
-                order.push((l, e));
+        // NO-DOUBLE, WHOLE-BLOCK promotion. Promote ALL of a block's experts,
+        // then FREE the host-side parent `w_*_exps` tensors — the per-expert
+        // views now hold their own device (managed) copies, so nothing else
+        // references the parent `Arc`, and dropping it releases its host bytes.
+        // This caps the transient host overhead at ~ONE block instead of
+        // doubling the entire expert set (CUDA managed memory is host-backed),
+        // which is the difference between "can't promote a 30B on a RAM-tight
+        // host" and "promotes block-by-block, freeing as it goes". Blocks are
+        // taken in order of their hottest expert's usage rank (from the
+        // persisted sidecar), then layer-index order for the cold tail.
+        let mut block_rank = vec![usize::MAX; n_layers];
+        for (i, key) in ranked.iter().enumerate() {
+            let l = key.layer as usize;
+            if l < n_layers && block_rank[l] == usize::MAX {
+                block_rank[l] = i;
             }
         }
-        for l in 0..n_layers {
-            for e in 0..n_exp[l] {
-                if seen.insert((l, e)) {
-                    order.push((l, e));
-                }
-            }
-        }
+        let mut block_order: Vec<usize> = (0..n_layers).collect();
+        block_order.sort_by_key(|&l| (block_rank[l], l));
+
         let mut used: u64 = 0;
         let mut promoted = 0usize;
-        for (l, e) in order {
+        'outer: for l in block_order {
+            let ne = n_exp[l];
+            if ne == 0 {
+                continue;
+            }
             let block = &mut blocks[l];
-            // Skip experts already (partially) device-resident.
-            if block.gate_per_expert[e].storage.residency()
+            // Already-promoted block (first view device-resident) → skip.
+            if block.gate_per_expert[0].storage.residency()
                 != rustllama_tensor::DeviceBackend::Cpu
             {
                 continue;
             }
-            let cost = block.gate_per_expert[e].storage.len_bytes() as u64
-                + block.up_per_expert[e].storage.len_bytes() as u64
-                + block.down_per_expert[e].storage.len_bytes() as u64;
-            // Same-size experts ⇒ once one overflows the remaining budget the
-            // rest will too, but `continue` keeps this robust to mixed sizes
-            // (shared/shexp FFNs promote via their own tensors) and to the
-            // ranked-then-index ordering (a skipped hot expert mustn't abort
-            // the colder fill).
-            if cost == 0 || used + cost > budget_bytes {
+            // This block's expert bytes = the three parents (all experts).
+            let block_bytes = block.w_gate_exps.storage.len_bytes() as u64
+                + block.w_up_exps.storage.len_bytes() as u64
+                + block.w_down_exps.storage.len_bytes() as u64;
+            if block_bytes == 0 || used + block_bytes > budget_bytes {
+                // Doesn't fit the remaining budget; a colder/smaller block still
+                // might, so keep scanning rather than abort.
                 continue;
             }
-            // Promote the expert's three matrices as a unit. If the GPU producer
-            // is unavailable (no active backend → `None`), stop entirely:
-            // nothing further will promote either.
-            if !Self::promote_tensor(&mut block.gate_per_expert[e])
-                || !Self::promote_tensor(&mut block.up_per_expert[e])
-                || !Self::promote_tensor(&mut block.down_per_expert[e])
-            {
-                break;
+            // Promote every expert of the block. On producer failure (no active
+            // backend, or the host can't back the managed alloc), stop entirely
+            // — leaving this block's parents intact so it still runs correctly.
+            let mut ok = true;
+            for e in 0..ne {
+                if !Self::promote_tensor(&mut block.gate_per_expert[e])
+                    || !Self::promote_tensor(&mut block.up_per_expert[e])
+                    || !Self::promote_tensor(&mut block.down_per_expert[e])
+                {
+                    ok = false;
+                    break;
+                }
             }
-            used += cost;
-            promoted += 1;
+            if !ok {
+                break 'outer;
+            }
+            // Free the now-unreferenced host-side parents (every view of them is
+            // device-resident) — this is the "no-double": host bytes released
+            // as managed bytes are added.
+            Self::drop_expert_parent(&mut block.w_gate_exps);
+            Self::drop_expert_parent(&mut block.w_up_exps);
+            Self::drop_expert_parent(&mut block.w_down_exps);
+            used += block_bytes;
+            promoted += ne;
         }
         (promoted, used)
+    }
+
+    /// Replace a fully-promoted expert parent (`w_*_exps`) with an empty tensor,
+    /// freeing its host bytes. Safe ONLY after every per-expert view of it is
+    /// device-resident (they hold independent managed copies, so no view
+    /// references the parent `Arc` any more). Shape → `[0]` + empty storage so
+    /// every reader — placement byte-count (`per_layer_weight_bytes`, which also
+    /// excludes experts when the tier is active), multi-GPU tensor info, the
+    /// pagelock walk — sees a consistent 0-byte tensor.
+    fn drop_expert_parent(t: &mut Tensor) {
+        t.shape = vec![0];
+        t.strides = vec![1];
+        t.storage = rustllama_tensor::Storage::CpuOwned(std::sync::Arc::from(
+            Vec::<u8>::new().into_boxed_slice(),
+        ));
     }
 
     /// Swap one tensor's storage to the active GPU backend's device memory.
