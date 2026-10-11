@@ -6182,6 +6182,20 @@ pub fn persist_moe_vram_margin_winner(model_key: &str, margin_bytes: u64) -> any
 /// per-model margin whose decode tok/s is best. A smaller margin promotes more
 /// experts to GPU (faster) until paging thrash; the sweep reloads per margin and
 /// keeps the sweet spot. CUDA / dedicated-SYCL MoE only; inert elsewhere.
+/// The model's tuned kv_dtype winner from the tuner cache (what serve's
+/// auto-apply uses at load), falling back to `default` (the config value) when
+/// none is cached / the cache can't be read. The MoE-margin sweep measures at
+/// this so the persisted margin matches the KV mirror size serve will run with.
+fn tuned_kv_dtype_or(default: &str) -> String {
+    rustllama_tuner::default_cache_dir()
+        .and_then(|dir| {
+            let (key, _device) = rustllama_tuner::cache_context();
+            rustllama_tuner::load_cache(&dir, &key).ok().flatten()
+        })
+        .and_then(|t| t.kv_dtype)
+        .unwrap_or_else(|| default.to_string())
+}
+
 fn cmd_tune_moe_vram_margin(
     config_path: &std::path::Path,
     model_override: Option<String>,
@@ -6207,8 +6221,13 @@ fn cmd_tune_moe_vram_margin(
     let decode_tokens = decode_tokens.max(64);
     let ctx_size =
         (prompt_tokens as usize + decode_tokens as usize + 8).max(cfg.inference.ctx_size as usize);
+    // Measure at the kv_dtype SERVE will use (the tuned winner if cached, else
+    // the config value) — the KV mirror's VRAM footprint scales with it, so
+    // sweeping at the wrong dtype can persist a mismatched margin.
+    let kv_dtype_str = tuned_kv_dtype_or(&cfg.inference.kv_dtype);
+    let kv_dtype = parse_kv_dtype(&kv_dtype_str).unwrap_or(rustllama_engine::KvDtype::F32);
     let m_cfg = MeasurementConfig {
-        kv_dtype: parse_kv_dtype(&cfg.inference.kv_dtype).unwrap_or(rustllama_engine::KvDtype::F32),
+        kv_dtype,
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
@@ -6216,6 +6235,7 @@ fn cmd_tune_moe_vram_margin(
 
     println!("rustllama tune --moe-vram-margin");
     println!("  model         = {}", model_path.display());
+    println!("  kv_dtype      = {kv_dtype_str} (as serve will run it)");
     println!(
         "  margins (GiB) = {}",
         margins
