@@ -344,11 +344,67 @@ pub struct MemoryInfo {
     pub commit_available_bytes: u64,
 }
 
+/// The container memory-cgroup limit + current usage in bytes, when the process
+/// runs under a memory-limited cgroup (Docker `--memory`, Kubernetes, RunPod,
+/// …). `None` when unconfined or off Linux, so callers fall back to the host
+/// totals. Tries cgroup **v2** (`memory.max` / `memory.current`) first, then
+/// **v1** (`memory.limit_in_bytes` / `memory.usage_in_bytes`); a `"max"` value
+/// (v2) or a near-`u64::MAX` sentinel (v1) means "unlimited" and yields `None`.
+#[cfg(target_os = "linux")]
+fn cgroup_mem_limit() -> Option<(u64, u64)> {
+    fn read_u64(path: &str) -> Option<u64> {
+        std::fs::read_to_string(path).ok()?.trim().parse::<u64>().ok()
+    }
+    // A limit at/above this is effectively "no limit" (v1 unlimited sentinel is
+    // ~u64::MAX rounded to the page size; a limit of exabytes is never real).
+    const UNLIMITED: u64 = 1u64 << 62;
+    // cgroup v2 (unified hierarchy): `memory.max` is a byte count or "max".
+    if let Ok(raw) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        let t = raw.trim();
+        if t == "max" {
+            return None;
+        }
+        if let Ok(limit) = t.parse::<u64>() {
+            if limit < UNLIMITED {
+                let current = read_u64("/sys/fs/cgroup/memory.current").unwrap_or(0);
+                return Some((limit, current));
+            }
+        }
+        return None;
+    }
+    // cgroup v1.
+    if let Some(limit) = read_u64("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
+        if limit < UNLIMITED {
+            let current = read_u64("/sys/fs/cgroup/memory/memory.usage_in_bytes").unwrap_or(0);
+            return Some((limit, current));
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_mem_limit() -> Option<(u64, u64)> {
+    None
+}
+
 pub fn memory_info() -> MemoryInfo {
     let mut s = sysinfo::System::new();
     s.refresh_memory();
-    let total = s.total_memory();
-    let avail = s.available_memory();
+    let host_total = s.total_memory();
+    let host_avail = s.available_memory();
+    // Respect a container memory cgroup: inside a limited container the host's
+    // `/proc/meminfo` over-reports (the node's RAM, not the container's), so
+    // every RAM budget (the KV-dtype fit gate, the model-load commit pre-flight,
+    // the GUI status row) would size against the node and could OOM the
+    // container. Clamp `total` to the cgroup limit and `available` to the
+    // container's real headroom (limit − current usage).
+    let (mut total, mut avail) = (host_total, host_avail);
+    if let Some((limit, current)) = cgroup_mem_limit() {
+        if limit < host_total {
+            total = limit;
+            avail = host_avail.min(limit.saturating_sub(current));
+        }
+    }
     let (commit_total, commit_available) = commit_budget(total, avail, &s);
     MemoryInfo {
         total_bytes: total,
