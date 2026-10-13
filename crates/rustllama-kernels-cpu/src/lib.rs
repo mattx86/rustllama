@@ -32,6 +32,12 @@ mod amx;
 #[cfg(target_arch = "x86_64")]
 pub mod vnni;
 
+/// AVX-512-BF16 prefill GEMM — the AMD / older-Intel companion to AMX. x86-64
+/// only; self-check-gated + fail-closed, inert off AVX-512-BF16 hardware.
+/// See `avx512bf16.rs`.
+#[cfg(target_arch = "x86_64")]
+mod avx512bf16;
+
 /// `C = W · X` where `W: [M, K]` (row-major, F16) and `X: [K, N]` (col-major
 /// for `N == 1` is a vector, otherwise row-major). Output `C: [M, N]`
 /// row-major, F32. Activations accumulate in F32.
@@ -53,6 +59,12 @@ pub fn gemm_f16_w_f32_a(w: &[f16], x: &[f32], c: &mut [f32], m: usize, n: usize,
             // SAFETY: amx_gemm_usable() confirmed AMX present + OS-permitted +
             // self-checked on this host; the shapes are asserted above.
             unsafe { amx::gemm_bf16_amx(w, x, c, m, n, k) };
+            return;
+        }
+        // AVX-512-BF16 prefill GEMM — the AMD / older-Intel path (no AMX). Same
+        // bf16 trade + self-check gate; fail-closed to the scalar GEMM below.
+        if n >= 8 && m >= 8 && k >= 32 && avx512bf16::avx512bf16_gemm_usable() {
+            avx512bf16::gemm_bf16_avx512(w, x, c, m, n, k);
             return;
         }
     }

@@ -116,12 +116,14 @@ Phases 1–2 are real, testable work that lands the device-management +
 scheduler requirements **without** any NPU hardware or vendor runtime; 3–5 are
 the write-blind vendor integrations behind their features.
 
-## 5. Open decisions for the owner
+## 5. Decisions (owner, 2026-10-13)
 
-- **First NPU target**: Intel/OpenVINO (more mature, better docs) or AMD/Ryzen
-  AI first? (Both land eventually; this is sequencing.)
-- **Default priority order**: `GPU/Metal → NPU → CPU` as above, or NPU ahead of
-  GPU on low-power/battery scenarios (NPUs are efficiency-first)? Could be a
-  `[inference.placement].tier_order` + a power-aware mode.
-- **Scope of op-offload v1**: matmul-only (simplest, biggest ops) vs matmul +
-  attention from the start.
+- **Approved**, with the remaining CPU extension (AVX-512-BF16 GEMM) landed
+  **before** the NPU/scheduler phases.
+- **First NPU target**: **both** Intel/OpenVINO and AMD/Ryzen AI scaffolded in
+  parallel (Phases 3+4 together) behind their feature flags.
+- **Default priority order**: **`GPU/Metal → NPU → CPU`** (throughput-first).
+  Keep it a tunable `[inference.placement].tier_order`; a power-aware NPU-first
+  mode can come later.
+- **Op-offload v1 scope**: matmul-first (open; matmul + attention is the natural
+  extension once matmul offload is validated).
