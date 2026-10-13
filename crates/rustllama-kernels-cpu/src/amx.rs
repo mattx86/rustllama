@@ -1,0 +1,356 @@
+//! Intel AMX (Advanced Matrix Extensions) bf16 tile GEMM — an optional fast
+//! path for the F16·F32 prefill GEMM (`gemm_f16_w_f32_a`) on Sapphire Rapids+
+//! server CPUs.
+//!
+//! WRITE-BLIND + inline-asm. Rust's AMX tile intrinsics (`_tile_dpbf16ps`, …)
+//! are nightly-only (`x86_amx_intrinsics`, rust-lang/rust#126622), but this
+//! crate must build on the repo's stable 1.83 toolchain, so the TMUL
+//! instructions are emitted through `core::arch::asm!` with the standard x86
+//! mnemonics (which LLVM's integrated assembler accepts regardless of target
+//! features — inline asm is opaque to the feature system). There is no AMX
+//! hardware on the author's box, so this is authored blind and SELF-VALIDATES
+//! at runtime: [`amx_gemm_usable`] executes the kernel against a scalar bf16
+//! reference ONCE and enables the fast path only where the output matches —
+//! fail-closed, so a wrong (unvalidated) encoding degrades to the existing
+//! scalar/SIMD GEMM instead of corrupting a result.
+//!
+//! Safety / fault model: a tile instruction `#GP`s if the OS has not granted
+//! `XTILEDATA` permission to the thread, so on Linux we gate on an explicit
+//! `arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)` (Windows enables AMX
+//! through the normal XSAVE path; macOS/non-x86 have no AMX). On a CPU without
+//! AMX the feature is simply never detected and NO tile instruction is ever
+//! reached, so the dev box and CI compile the asm but never run it.
+//!
+//! Numerics: AMX bf16 truncates both operands to bf16 (8-bit mantissa), so the
+//! result is LOSSY vs the F16·F32 reference — the self-check grades against a
+//! *bf16* reference (same truncation) so it measures kernel correctness, not
+//! bf16 rounding; the fast path is still only taken for matmuls large enough
+//! that the prefill GEMM dominates.
+//!
+//! Tile layout for `tdpbf16ps C, A, B` (C[M,N] f32 += A[M,K] bf16 · B[K,N]
+//! bf16), all three tiles a uniform 16 rows × 64 bytes:
+//!   - C: 16 rows × 16 f32  (colsb = 64)
+//!   - A: 16 rows × 32 bf16 (colsb = 64), plain row-major M×K
+//!   - B: 16 rows × 32 bf16 (colsb = 64), VNNI-packed: row `kk` holds the
+//!        interleaved pair (X[2*kk][n], X[2*kk+1][n]) for n in 0..16, i.e.
+//!        32 bf16 = two K-values per output column.
+//! M/N remainders are handled by zero-padding the packed A/B buffers to the
+//! full tile and copying back only the valid M×N sub-block of C; K remainders
+//! by zero-padding the last K-tile (an odd K pads the trailing VNNI pair).
+
+#![cfg(target_arch = "x86_64")]
+
+use half::{bf16, f16};
+use std::sync::OnceLock;
+
+/// AMX bf16 tile dims: C is TM×TN f32, A is TM×TK bf16, B is (TK/2)×(2·TN) bf16.
+const TM: usize = 16;
+const TN: usize = 16;
+const TK: usize = 32;
+/// Every tile is 16 rows × 64 bytes with this layout.
+const TILE_ROWS: u8 = 16;
+const TILE_COLSB: u16 = 64;
+
+/// 64-byte `ldtilecfg` payload. Palette 1; tiles 0/1/2 configured to 16×64,
+/// the rest left zero (unused).
+#[repr(C, align(64))]
+struct TileConfig {
+    palette_id: u8,
+    start_row: u8,
+    _reserved0: [u8; 14],
+    colsb: [u16; 8],
+    rows: [u8; 8],
+}
+
+impl TileConfig {
+    fn new() -> Self {
+        let mut colsb = [0u16; 8];
+        let mut rows = [0u8; 8];
+        // tmm0 = C, tmm1 = A, tmm2 = B.
+        for t in 0..3 {
+            colsb[t] = TILE_COLSB;
+            rows[t] = TILE_ROWS;
+        }
+        TileConfig {
+            palette_id: 1,
+            start_row: 0,
+            _reserved0: [0u8; 14],
+            colsb,
+            rows,
+        }
+    }
+}
+
+/// Request `XTILEDATA` permission for this thread (Linux ≥ 5.16). Without it the
+/// first tile instruction `#GP`s. Returns `true` on success; non-Linux targets
+/// enable AMX through the normal XSAVE path and return `true`.
+#[cfg(target_os = "linux")]
+fn request_amx_tiledata() -> bool {
+    use std::arch::asm;
+    // arch_prctl(ARCH_REQ_XCOMP_PERM = 0x1023, XFEATURE_XTILEDATA = 18).
+    const ARCH_REQ_XCOMP_PERM: u64 = 0x1023;
+    const XFEATURE_XTILEDATA: u64 = 18;
+    const SYS_ARCH_PRCTL: u64 = 158;
+    let ret: i64;
+    // SAFETY: a plain syscall with register inputs; clobbers rcx/r11 per the
+    // Linux syscall ABI. No memory is touched.
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") SYS_ARCH_PRCTL => ret,
+            in("rdi") ARCH_REQ_XCOMP_PERM,
+            in("rsi") XFEATURE_XTILEDATA,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack)
+        );
+    }
+    ret == 0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn request_amx_tiledata() -> bool {
+    true
+}
+
+/// Detect AMX (tile + bf16) via raw CPUID + XCR0. The `is_x86_feature_detected!`
+/// macro can't be used here: its `"amx-tile"` / `"amx-bf16"` arms are themselves
+/// gated behind the nightly `x86_amx_intrinsics` feature, so they don't compile
+/// on stable. CPUID leaf 7 (EDX bit 24 = AMX-TILE, bit 22 = AMX-BF16) plus XCR0
+/// bits 17/18 (the OS has enabled XTILECFG + XTILEDATA state) are the same bits
+/// that macro would read, and `__cpuid_count` / `xgetbv` are stable.
+fn amx_cpu_supported() -> bool {
+    use std::arch::x86_64::__cpuid_count;
+    // SAFETY: CPUID is always available on x86-64.
+    let leaf7 = unsafe { __cpuid_count(7, 0) };
+    let amx_tile = (leaf7.edx >> 24) & 1 != 0;
+    let amx_bf16 = (leaf7.edx >> 22) & 1 != 0;
+    if !(amx_tile && amx_bf16) {
+        return false;
+    }
+    // OSXSAVE (CPUID.1:ECX bit 27) must be set before XGETBV is valid.
+    let leaf1 = unsafe { __cpuid_count(1, 0) };
+    if (leaf1.ecx >> 27) & 1 == 0 {
+        return false;
+    }
+    // XCR0 bits 17 (XTILECFG) + 18 (XTILEDATA): the OS saves/restores AMX tile
+    // state → tile instructions are usable. Read via the `xgetbv` instruction
+    // directly (avoids any intrinsic-stability question).
+    let xcr0 = unsafe { read_xcr0() };
+    (xcr0 >> 17) & 0b11 == 0b11
+}
+
+/// Read XCR0 (`xgetbv` with ECX=0). SAFETY: valid only when OSXSAVE is set
+/// (checked by the sole caller).
+unsafe fn read_xcr0() -> u64 {
+    use std::arch::asm;
+    let eax: u32;
+    let edx: u32;
+    asm!(
+        "xgetbv",
+        in("ecx") 0u32,
+        out("eax") eax,
+        out("edx") edx,
+        options(nostack, nomem, preserves_flags)
+    );
+    ((edx as u64) << 32) | (eax as u64)
+}
+
+#[inline]
+fn f16_to_bf16_bits(v: f16) -> u16 {
+    bf16::from_f32(v.to_f32()).to_bits()
+}
+
+#[inline]
+fn f32_to_bf16_bits(v: f32) -> u16 {
+    bf16::from_f32(v).to_bits()
+}
+
+/// Pack a TM×TK bf16 A-tile (row-major) from `w[M,K]` at block (mb, kb),
+/// zero-padding the M and K remainders.
+fn pack_a(w: &[f16], a_buf: &mut [u16; TM * TK], m: usize, k: usize, mb: usize, kb: usize) {
+    a_buf.fill(0);
+    let mrows = (m - mb).min(TM);
+    let kcols = (k - kb).min(TK);
+    for i in 0..mrows {
+        let w_row = &w[(mb + i) * k..];
+        let dst = &mut a_buf[i * TK..];
+        for p in 0..kcols {
+            dst[p] = f16_to_bf16_bits(w_row[kb + p]);
+        }
+    }
+}
+
+/// Pack a VNNI B-tile from `x[K,N]` (row-major) at block (kb, nb): row `kk`
+/// holds the interleaved pair (x[kb+2kk][n], x[kb+2kk+1][n]) for n in the
+/// N-block. Zero-pads the N and K remainders (an odd K zeros the trailing
+/// element of the last pair).
+fn pack_b_vnni(x: &[f32], b_buf: &mut [u16; (TK / 2) * (2 * TN)], n: usize, k: usize, kb: usize, nb: usize) {
+    b_buf.fill(0);
+    let ncols = (n - nb).min(TN);
+    let kcols = (k - kb).min(TK);
+    for kk in 0..(TK / 2) {
+        let k0 = kb + 2 * kk;
+        let k1 = k0 + 1;
+        let row = &mut b_buf[kk * (2 * TN)..];
+        for j in 0..ncols {
+            if 2 * kk < kcols {
+                row[2 * j] = f32_to_bf16_bits(x[k0 * n + (nb + j)]);
+            }
+            if 2 * kk + 1 < kcols {
+                row[2 * j + 1] = f32_to_bf16_bits(x[k1 * n + (nb + j)]);
+            }
+        }
+    }
+}
+
+/// One AMX bf16 GEMM block: `C_tile[16,16] += A_tile · B_tile` using tmm0 (C),
+/// tmm1 (A), tmm2 (B). The caller has already run `ldtilecfg` and `tilezero
+/// tmm0`. `stride` is 64 (bytes/row) for all three tiles.
+///
+/// SAFETY: requires AMX to be present and `XTILEDATA` permitted (see
+/// [`amx_gemm_usable`]); `a_ptr`/`b_ptr` point at 16×64-byte packed tiles.
+#[inline]
+unsafe fn amx_block_mul(a_ptr: *const u16, b_ptr: *const u16) {
+    use std::arch::asm;
+    let stride: usize = 64;
+    asm!(
+        "tileloadd tmm1, [{a} + {s}]",
+        "tileloadd tmm2, [{b} + {s}]",
+        "tdpbf16ps tmm0, tmm1, tmm2",
+        a = in(reg) a_ptr,
+        b = in(reg) b_ptr,
+        s = in(reg) stride,
+        options(nostack, preserves_flags)
+    );
+}
+
+/// AMX bf16 GEMM: `c[M,N] = w[M,K] · x[K,N]` (same shape contract as
+/// `gemm_f16_w_f32_a`), computed in bf16 tiles with f32 accumulation.
+///
+/// SAFETY: caller must ensure AMX is usable ([`amx_gemm_usable`] returned
+/// true) on THIS thread; shapes must satisfy `w.len()==m*k`, `x.len()==k*n`,
+/// `c.len()==m*n`.
+pub unsafe fn gemm_bf16_amx(w: &[f16], x: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    use std::arch::asm;
+    let cfg = TileConfig::new();
+    // SAFETY: cfg is a 64-byte aligned payload; ldtilecfg reads 64 bytes.
+    asm!("ldtilecfg [{c}]", c = in(reg) &cfg as *const TileConfig, options(nostack, readonly, preserves_flags));
+
+    let mut a_buf = [0u16; TM * TK];
+    let mut b_buf = [0u16; (TK / 2) * (2 * TN)];
+    let mut c_buf = [0f32; TM * TN];
+    let stride: usize = 64;
+
+    let mut mb = 0;
+    while mb < m {
+        let mrows = (m - mb).min(TM);
+        let mut nb = 0;
+        while nb < n {
+            let ncols = (n - nb).min(TN);
+            asm!("tilezero tmm0", options(nostack, preserves_flags));
+            let mut kb = 0;
+            while kb < k {
+                pack_a(w, &mut a_buf, m, k, mb, kb);
+                pack_b_vnni(x, &mut b_buf, n, k, kb, nb);
+                amx_block_mul(a_buf.as_ptr(), b_buf.as_ptr());
+                kb += TK;
+            }
+            // Store the accumulator tile, then scatter the valid sub-block.
+            asm!(
+                "tilestored [{c} + {s}], tmm0",
+                c = in(reg) c_buf.as_mut_ptr(),
+                s = in(reg) stride,
+                options(nostack)
+            );
+            for i in 0..mrows {
+                for j in 0..ncols {
+                    c[(mb + i) * n + (nb + j)] = c_buf[i * TN + j];
+                }
+            }
+            nb += TN;
+        }
+        mb += TM;
+    }
+    asm!("tilerelease", options(nostack, preserves_flags));
+}
+
+/// Scalar bf16 reference for the self-check: truncates both operands to bf16
+/// exactly as the tile path does, so a match isolates kernel/encoding
+/// correctness from bf16 rounding.
+fn gemm_bf16_ref(w: &[f16], x: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0f32;
+            for p in 0..k {
+                let a = bf16::from_f32(w[i * k + p].to_f32()).to_f32();
+                let b = bf16::from_f32(x[p * n + j]).to_f32();
+                acc += a * b;
+            }
+            c[i * n + j] = acc;
+        }
+    }
+}
+
+/// Whether the AMX bf16 GEMM fast path is usable on this host — cached. True
+/// only when: the CPU reports `amx-tile` + `amx-bf16`, the OS granted tile
+/// permission, AND the kernel reproduces the scalar bf16 reference on a probe
+/// matrix (so a wrong write-blind encoding fails closed). Any failure (or a
+/// non-AMX CPU) returns false and NO tile instruction is executed afterward.
+pub fn amx_gemm_usable() -> bool {
+    static USABLE: OnceLock<bool> = OnceLock::new();
+    *USABLE.get_or_init(|| {
+        if !amx_cpu_supported() {
+            return false;
+        }
+        if !request_amx_tiledata() {
+            return false;
+        }
+        // Self-check on a probe that crosses several tiles in every dim
+        // (M=20, N=20, K=40 → 2×2 M/N tiles + 2 K-tiles with remainders).
+        let (m, n, k) = (20usize, 20usize, 40usize);
+        let w: Vec<f16> = (0..m * k)
+            .map(|i| f16::from_f32((((i as i64 * 2_654_435_761) % 97) as f32 - 48.0) * 0.03))
+            .collect();
+        let x: Vec<f32> = (0..k * n)
+            .map(|i| (((i as i64 * 40_503) % 89) as f32 - 44.0) * 0.02)
+            .collect();
+        let mut got = vec![0f32; m * n];
+        let mut want = vec![0f32; m * n];
+        gemm_bf16_ref(&w, &x, &mut want, m, n, k);
+        // SAFETY: feature-detected + permission granted above; shapes match.
+        unsafe { gemm_bf16_amx(&w, &x, &mut got, m, n, k) };
+        got.iter().zip(&want).all(|(a, b)| {
+            let denom = b.abs().max(1e-4);
+            (a - b).abs() / denom <= 0.02
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn amx_probe_matches_reference_or_skips() {
+        // On a non-AMX host this just returns false (no tile instruction runs).
+        // On an AMX host the self-check must pass (the kernel == bf16 ref).
+        let usable = amx_gemm_usable();
+        if !usable {
+            eprintln!("amx: not usable on this host (expected off AMX hardware) — SKIP");
+            return;
+        }
+        // Re-run a fresh parity check at a different shape to confirm.
+        let (m, n, k) = (33usize, 17usize, 64usize);
+        let w: Vec<f16> = (0..m * k).map(|i| f16::from_f32(((i % 7) as f32 - 3.0) * 0.1)).collect();
+        let x: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32 - 2.0) * 0.05).collect();
+        let mut got = vec![0f32; m * n];
+        let mut want = vec![0f32; m * n];
+        gemm_bf16_ref(&w, &x, &mut want, m, n, k);
+        unsafe { gemm_bf16_amx(&w, &x, &mut got, m, n, k) };
+        for (a, b) in got.iter().zip(&want) {
+            let denom = b.abs().max(1e-4);
+            assert!((a - b).abs() / denom <= 0.02, "amx {a} vs ref {b}");
+        }
+    }
+}

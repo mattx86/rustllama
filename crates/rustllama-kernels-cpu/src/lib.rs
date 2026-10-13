@@ -20,6 +20,12 @@ pub mod turboquant;
 use half::f16;
 use rustllama_tensor::{as_bytes, as_slice_f16, as_slice_f32, Dtype, Tensor};
 
+/// Intel AMX bf16 tile GEMM (Sapphire Rapids+ Xeon) — an optional, runtime
+/// self-validated fast path for the prefill GEMM. x86-64 only; inert (and no
+/// tile instruction ever executed) off AMX hardware. See `amx.rs`.
+#[cfg(target_arch = "x86_64")]
+mod amx;
+
 /// `C = W · X` where `W: [M, K]` (row-major, F16) and `X: [K, N]` (col-major
 /// for `N == 1` is a vector, otherwise row-major). Output `C: [M, N]`
 /// row-major, F32. Activations accumulate in F32.
@@ -27,6 +33,23 @@ pub fn gemm_f16_w_f32_a(w: &[f16], x: &[f32], c: &mut [f32], m: usize, n: usize,
     debug_assert_eq!(w.len(), m * k);
     debug_assert_eq!(x.len(), k * n);
     debug_assert_eq!(c.len(), m * n);
+    // Optional Intel AMX bf16 tile GEMM (Sapphire Rapids+ Xeon). Gated behind a
+    // runtime self-check that FAILS CLOSED to the scalar path below: inert off
+    // AMX hardware (this dev box / CI) and off any host where the write-blind
+    // kernel doesn't reproduce its scalar reference. Only taken for a wide
+    // enough GEMM (prefill) that the tile setup + bf16 repack pays off — a
+    // matvec (N==1, decode) keeps full f16·f32 precision on the scalar path.
+    // Like the GPU bf16 tensor-core paths (XMX/Hopper) this trades to bf16
+    // operands, so it is deliberately confined to prefill-shaped GEMMs.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if n >= 16 && m >= 16 && k >= 32 && amx::amx_gemm_usable() {
+            // SAFETY: amx_gemm_usable() confirmed AMX present + OS-permitted +
+            // self-checked on this host; the shapes are asserted above.
+            unsafe { amx::gemm_bf16_amx(w, x, c, m, n, k) };
+            return;
+        }
+    }
     for i in 0..m {
         let w_row = &w[i * k..(i + 1) * k];
         for j in 0..n {
