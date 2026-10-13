@@ -38,6 +38,11 @@ pub mod vnni;
 #[cfg(target_arch = "x86_64")]
 mod avx512bf16;
 
+/// AVX-512-FP16 native-f16 GEMM (completeness; f16 accumulation caveat — see
+/// `avx512fp16.rs`). x86-64 only; self-check-gated, not auto-selected.
+#[cfg(target_arch = "x86_64")]
+mod avx512fp16;
+
 /// `C = W · X` where `W: [M, K]` (row-major, F16) and `X: [K, N]` (col-major
 /// for `N == 1` is a vector, otherwise row-major). Output `C: [M, N]`
 /// row-major, F32. Activations accumulate in F32.
