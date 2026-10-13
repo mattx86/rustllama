@@ -249,10 +249,10 @@ pub fn route_topk_into(
 /// isn't file-backed (`mmap_borrowed_ptr_len` is `None`, so it was never
 /// spill-eligible).
 ///
-/// With the default `RUSTLLAMA_MOE_STORE_BITS=0` (native spill) the
-/// reconstructed bytes are bit-identical to the mmap, so matvec output is
-/// unchanged; a nonzero store-bits requantizes the cold tier (lossy — the
-/// caller's explicit opt-in).
+/// For an already-quantized expert (the common case) the spill is native, so
+/// the reconstructed bytes are bit-identical to the mmap and matvec output is
+/// unchanged; a high-precision (F16/F32) expert is re-encoded to GGUF Q8_0 on
+/// spill (near-lossless) — see `accel::spill_store_dtype_for`.
 ///
 /// The caller MUST gate this behind `accel::moe_spill_enabled()` so the
 /// default (feature-off) path never allocates or touches the store.

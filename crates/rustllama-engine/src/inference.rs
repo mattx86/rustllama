@@ -1432,6 +1432,32 @@ impl CpuEngine {
                 );
             }
         }
+        // Automatic MoE disk-spill cold-tier store (GGUF-native, no env var).
+        // Arm it exactly when the routed-expert pool exceeds the now-finalized
+        // LRU expert-cache budget — i.e. experts WILL evict, so a compact,
+        // sequential, GGUF-native spill copy of the cold tail beats re-faulting
+        // the scattered GGUF mmap. Pool <= budget (all experts fit resident) or
+        // budget == 0 (tier/exhausted path) ⇒ no eviction ⇒ spill stays OFF, so
+        // the default box and the validated device-tier path are untouched.
+        // This runs on every load — including the autotuner's — so the enable
+        // is part of the per-(system, model) autotune determination.
+        {
+            let cache_budget = rustllama_models::accel::moe_expert_cache_max_bytes();
+            let pool = rustllama_models::accel::expert_registry_total_bytes();
+            let spill = cache_budget > 0 && pool > cache_budget;
+            rustllama_models::accel::set_moe_spill_plan(spill);
+            if spill {
+                // Point the spill file at the runtime cache dir (idempotent;
+                // no-op when disarmed). Independent of the usage learner.
+                crate::expert_cache::init_moe_spill_store();
+                tracing::info!(
+                    pool_mb = pool / (1024 * 1024),
+                    cache_budget_mb = cache_budget / (1024 * 1024),
+                    "moe disk-spill: GGUF-native cold-tier store armed \
+                     (expert pool exceeds the LRU cache budget; experts will evict)"
+                );
+            }
+        }
         // MoE tiered-expert engine (Phase 2/4 trigger): AUTO-ENABLED on CUDA.
         // On a CUDA box with a MoE model this promotes the hottest experts into
         // CUDA device (managed) memory so they run GPU-resident regardless of the

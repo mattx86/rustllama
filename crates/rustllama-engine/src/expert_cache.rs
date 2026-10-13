@@ -21,11 +21,12 @@
 //! and ignored; pre-pinned experts are refcount-0 and evict normally
 //! under LRU pressure if the learned ranking turns out wrong.
 //!
-//! 3. **Disk-spill store location** — when the opt-in disk-spill /
-//!    lower-bit expert store is enabled (`RUSTLLAMA_MOE_DISK_SPILL`,
-//!    mechanism in `accel`), [`init_moe_spill_store`] points its spill
-//!    file at the runtime cache dir. Called automatically from
-//!    [`UsageLearner::open`]. Unset ⇒ never touched.
+//! 3. **Disk-spill store location** — when the automatic GGUF-native
+//!    disk-spill cold-tier store is armed (the engine's load-time memory
+//!    planner calls `accel::set_moe_spill_plan`; mechanism in `accel`),
+//!    [`init_moe_spill_store`] points its spill file at the runtime cache
+//!    dir. Called from the planner and from [`UsageLearner::open`].
+//!    Disarmed ⇒ never touched.
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -34,9 +35,9 @@ use std::time::{Duration, Instant};
 
 pub use rustllama_models::accel::ExpertKey;
 use rustllama_models::accel::{expert_access_take, expert_prepin};
-// Disk-spill + lower-bit secondary store (the mechanism lives in `accel`).
+// Disk-spill + GGUF-native secondary store (the mechanism lives in `accel`).
 // Re-exported so the engine/integrator reaches the fault-in path through
-// this policy module. Inert unless `RUSTLLAMA_MOE_DISK_SPILL` is set.
+// this policy module. Inert unless the memory planner arms it.
 pub use rustllama_models::accel::{
     moe_spill_enabled, moe_spill_reconstruct, moe_spill_stats, MoeSpillStats, SpilledExpert,
     SpilledPart,
@@ -104,10 +105,11 @@ pub fn sidecar_path(model_path: &Path) -> PathBuf {
 
 /// Point the process-global MoE disk-spill store at the runtime cache dir
 /// (`<runtime>/moe-spill/`). No-op — and no runtime-path resolution — unless
-/// `RUSTLLAMA_MOE_DISK_SPILL` is set. Idempotent; called automatically from
-/// [`UsageLearner::open`] at model load, and exposed so a headless caller
-/// without a usage learner can wire the location explicitly. When it is never
-/// called, the store falls back to a folder under the OS temp dir.
+/// the store has been armed (`accel::set_moe_spill_plan`). Idempotent; called
+/// from the engine's load-time memory planner when it arms the store, and
+/// from [`UsageLearner::open`], and exposed so a headless caller without a
+/// usage learner can wire the location explicitly. When it is never called,
+/// the store falls back to a folder under the OS temp dir.
 pub fn init_moe_spill_store() {
     if !moe_spill_enabled() {
         return;
