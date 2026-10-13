@@ -55,6 +55,42 @@ fn has_avxvnni() -> bool {
     (leaf.eax >> 4) & 1 != 0
 }
 
+/// AVX-512-VNNI (+ the F/BW/VL it needs for the 256-bit EVEX `vpdpbusd`) via
+/// CPUID.(EAX=7,ECX=0): EBX[16]=AVX512F, EBX[30]=AVX512BW, EBX[31]=AVX512VL,
+/// ECX[11]=AVX512VNNI. AMD Zen 4/5 + Intel server have this even where the VEX
+/// AVX-VNNI bit is absent.
+fn has_avx512vnni() -> bool {
+    // SAFETY: CPUID leaf 7 exists on all x86-64.
+    let leaf = unsafe { __cpuid_count(7, 0) };
+    let f = (leaf.ebx >> 16) & 1 != 0;
+    let bw = (leaf.ebx >> 30) & 1 != 0;
+    let vl = (leaf.ebx >> 31) & 1 != 0;
+    let vnni = (leaf.ecx >> 11) & 1 != 0;
+    f && bw && vl && vnni
+}
+
+/// Which VNNI instruction set to use, cached. Prefer AVX-512-VNNI (EVEX) where
+/// present, else the VEX AVX-VNNI, else none.
+#[derive(Clone, Copy, PartialEq)]
+enum VnniKind {
+    None,
+    Avx256,
+    Avx512,
+}
+
+fn vnni_kind() -> VnniKind {
+    static K: OnceLock<VnniKind> = OnceLock::new();
+    *K.get_or_init(|| {
+        if has_avx512vnni() {
+            VnniKind::Avx512
+        } else if has_avxvnni() {
+            VnniKind::Avx256
+        } else {
+            VnniKind::None
+        }
+    })
+}
+
 /// Horizontal sum of the 8 i32 lanes of a `__m256i`.
 #[target_feature(enable = "avx,avx2")]
 unsafe fn hsum_i32x8(v: __m256i) -> i32 {
@@ -163,6 +199,49 @@ unsafe fn matvec_q8_0_w8a8_avxvnni(
     }
 }
 
+/// AVX-512-VNNI W8A8 Q8_0 matvec — identical algorithm to the AVX-VNNI path,
+/// using the EVEX-encoded 256-bit `_mm256_dpbusd_epi32` so it runs on
+/// AVX-512-VNNI CPUs that lack the VEX AVX-VNNI bit (AMD Zen 4/5, Intel
+/// server). WRITE-BLIND (no AVX-512 on the author's box); a 512-bit-wide
+/// two-block form is a later perf follow-up.
+#[target_feature(enable = "avx,avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn matvec_q8_0_w8a8_avx512vnni(
+    w_bytes: &[u8],
+    xqu8: &[u8],
+    xscales: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    let blocks_per_row = k / QK;
+    let ones = _mm256_set1_epi8(1);
+    for i in 0..m {
+        let row_start = i * blocks_per_row * BLOCK_BYTES;
+        let mut acc = 0f32;
+        for b in 0..blocks_per_row {
+            let off = row_start + b * BLOCK_BYTES;
+            let d = f16::from_le_bytes([w_bytes[off], w_bytes[off + 1]]).to_f32();
+            let wq = _mm256_loadu_si256(w_bytes.as_ptr().add(off + 2) as *const __m256i);
+            let a = _mm256_loadu_si256(xqu8.as_ptr().add(b * QK) as *const __m256i);
+            let dot = _mm256_dpbusd_epi32(_mm256_setzero_si256(), a, wq);
+            let wsum = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ones, wq);
+            let corrected = hsum_i32x8(dot) - 128 * hsum_i32x8(wsum);
+            acc += d * xscales[b] * corrected as f32;
+        }
+        out[i] = acc;
+    }
+}
+
+/// Run the active VNNI kernel on pre-quantized activations. Caller ensures a
+/// VNNI kind is present ([`vnni_q8_0_usable`]).
+unsafe fn run_vnni_kernel(w_bytes: &[u8], xqu8: &[u8], xscales: &[f32], out: &mut [f32], m: usize, k: usize) {
+    match vnni_kind() {
+        VnniKind::Avx512 => matvec_q8_0_w8a8_avx512vnni(w_bytes, xqu8, xscales, out, m, k),
+        VnniKind::Avx256 => matvec_q8_0_w8a8_avxvnni(w_bytes, xqu8, xscales, out, m, k),
+        VnniKind::None => matvec_q8_0_w8a8_scalar(w_bytes, xqu8, xscales, out, m, k),
+    }
+}
+
 /// W8A8 Q8_0 matvec (public entry): quantize the activation once, then run the
 /// widest available VNNI kernel. Caller must have confirmed [`vnni_q8_0_usable`].
 pub fn matvec_q8_0_w8a8(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
@@ -171,8 +250,8 @@ pub fn matvec_q8_0_w8a8(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k:
     let mut xqu8 = vec![0u8; k];
     let mut xscales = vec![0f32; blocks];
     quantize_activation(x, k, &mut xqu8, &mut xscales);
-    // SAFETY: gated on has_avxvnni() via vnni_q8_0_usable().
-    unsafe { matvec_q8_0_w8a8_avxvnni(w_bytes, &xqu8, &xscales, out, m, k) };
+    // SAFETY: a VNNI kind was confirmed present via vnni_q8_0_usable().
+    unsafe { run_vnni_kernel(w_bytes, &xqu8, &xscales, out, m, k) };
 }
 
 /// Whether the W8A8 VNNI Q8_0 matvec is usable — cached. True only when the
@@ -182,7 +261,7 @@ pub fn matvec_q8_0_w8a8(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k:
 pub fn vnni_q8_0_usable() -> bool {
     static USABLE: OnceLock<bool> = OnceLock::new();
     *USABLE.get_or_init(|| {
-        if !has_avxvnni() {
+        if vnni_kind() == VnniKind::None {
             return false;
         }
         // Probe across several blocks/rows with a valid Q8_0 weight.
@@ -195,8 +274,8 @@ pub fn vnni_q8_0_usable() -> bool {
         let mut got = vec![0f32; m];
         let mut want = vec![0f32; m];
         matvec_q8_0_w8a8_scalar(&w, &xqu8, &xscales, &mut want, m, k);
-        // SAFETY: has_avxvnni() checked above.
-        unsafe { matvec_q8_0_w8a8_avxvnni(&w, &xqu8, &xscales, &mut got, m, k) };
+        // SAFETY: a VNNI kind is present (checked above).
+        unsafe { run_vnni_kernel(&w, &xqu8, &xscales, &mut got, m, k) };
         // Integer math is identical → exact f32 match (both fold the same
         // per-block d·x_scale in the same order).
         got == want
@@ -209,11 +288,11 @@ mod tests {
 
     #[test]
     fn vnni_w8a8_matches_scalar_or_skips() {
-        if !has_avxvnni() {
-            eprintln!("vnni: no AVX-VNNI on this host — SKIP");
+        if vnni_kind() == VnniKind::None {
+            eprintln!("vnni: no AVX-VNNI / AVX-512-VNNI on this host — SKIP");
             return;
         }
-        assert!(vnni_q8_0_usable(), "AVX-VNNI present but self-check failed");
+        assert!(vnni_q8_0_usable(), "VNNI present but self-check failed");
         // Larger shape, different data.
         let (m, k) = (37usize, 256usize);
         let w = synth_q8_0(m, k, 40_503);
@@ -224,7 +303,7 @@ mod tests {
         let mut got = vec![0f32; m];
         let mut want = vec![0f32; m];
         matvec_q8_0_w8a8_scalar(&w, &xqu8, &xscales, &mut want, m, k);
-        unsafe { matvec_q8_0_w8a8_avxvnni(&w, &xqu8, &xscales, &mut got, m, k) };
-        assert_eq!(got, want, "AVX-VNNI W8A8 != scalar W8A8 reference");
+        unsafe { run_vnni_kernel(&w, &xqu8, &xscales, &mut got, m, k) };
+        assert_eq!(got, want, "VNNI W8A8 != scalar W8A8 reference");
     }
 }
