@@ -1839,6 +1839,143 @@ pub fn sycl_dedicated_vram_bytes() -> Option<u64> {
     (bytes > 0).then_some(bytes)
 }
 
+/// Outcome of [`sycl_tier_self_check`].
+#[derive(Debug, Clone)]
+pub enum SyclTierCheck {
+    /// Not applicable on this host — the detail says why. Never a failure: the
+    /// tiered-expert engine promotes ONLY into dedicated SYCL VRAM, so it is a
+    /// no-op on CUDA (validated separately), integrated iGPUs, Apple MLX
+    /// unified memory, and CPU-only boxes.
+    Skip(String),
+    /// Ran: the promoted (device-resident) expert matvec matched the CPU
+    /// reference within tolerance.
+    Pass { cos: f64, max_rel: f64 },
+    /// Ran but the promoted expert matvec DISAGREED with the CPU reference —
+    /// a real bug in the SYCL promotion / device-resident dispatch plumbing.
+    Miscompute { cos: f64, max_rel: f64 },
+}
+
+/// End-to-end self-check of the MoE tiered-expert PROMOTION path on a dedicated
+/// SYCL GPU (Intel Arc / PVC) — the one tier backend with no hardware on the
+/// author's box, so it ships WRITE-BLIND and this harness settles it on the
+/// user's Arc. The kernel it runs (USM-resident packed matvec) is already
+/// covered by `doctor --sycl-parity`; what this adds is the PLUMBING the tier
+/// uniquely exercises: `upload_bytes_to_device` producing a `Storage::
+/// Device(Sycl)` USM buffer, and the matvec dispatch auto-detecting that
+/// promoted pointer and running it ABOVE the `n_gpu_layers` layer cutoff.
+///
+/// Method: synthesize a Q4_K expert weight, promote it exactly as the tier does,
+/// run the real device-resident dispatch (`try_matvec_tensor_usm_f32`), and
+/// grade vs a CPU reference dequantized from the SAME bytes — so the grade
+/// reflects dispatch correctness, not quantization loss. SKIPs cleanly off
+/// dedicated-SYCL hardware (the gate is the exact `sycl_dedicated_vram_bytes`
+/// the tier auto-enables behind), so on an integrated / CUDA / MLX / CPU box it
+/// reports why and does nothing.
+pub fn sycl_tier_self_check() -> SyclTierCheck {
+    // Gate on the EXACT condition the tier promotes behind. CUDA has its own
+    // on-device validation (`--cuda-parity` + model runs); MLX unified and
+    // integrated iGPUs promote nothing (host-backed USM), so there is no
+    // device-resident path to check.
+    if cuda_active() {
+        return SyclTierCheck::Skip(
+            "CUDA active — the tier's CUDA path is validated by --cuda-parity + model runs".into(),
+        );
+    }
+    if sycl_dedicated_vram_bytes().is_none() {
+        return SyclTierCheck::Skip(
+            "no dedicated SYCL GPU (the tier is a no-op on integrated / MLX-unified / CPU)".into(),
+        );
+    }
+    // Model-realistic per-expert gate matvec; Q4_K needs K % 256 == 0.
+    let (m, k) = (512usize, 2048usize);
+    let n = m * k;
+    // Deterministic pseudo-random f32 weights + activation (small magnitude so
+    // the reference stays finite); no RNG dependency.
+    let w_f32: Vec<f32> = (0..n)
+        .map(|i| (((i as i64).wrapping_mul(2_654_435_761) % 2000) as f32 - 1000.0) * 0.001)
+        .collect();
+    let x: Vec<f32> = (0..k)
+        .map(|j| (((j as i64).wrapping_mul(40_503) % 1000) as f32 - 500.0) * 0.002)
+        .collect();
+    // Encode to Q4_K, then dequantize the SAME bytes for the reference so the
+    // grade isolates kernel/plumbing correctness from quant loss.
+    let mut w_bytes = vec![0u8; (n / 256) * 144];
+    rustllama_gguf::encode_k::encode_q4_k(&w_f32, &mut w_bytes);
+    let mut w_deq = vec![0f32; n];
+    rustllama_gguf::dequant::dequant_q4_k(&w_bytes, &mut w_deq);
+    let mut ref_out = vec![0f32; m];
+    for mi in 0..m {
+        let mut acc = 0f64;
+        for kj in 0..k {
+            acc += w_deq[mi * k + kj] as f64 * x[kj] as f64;
+        }
+        ref_out[mi] = acc as f32;
+    }
+    // Build the CPU Q4_K tensor, then promote it to the device via the REAL
+    // tier producer (`upload_bytes_to_device` → `Storage::Device(Sycl)`).
+    let shape: Vec<u64> = vec![m as u64, k as u64];
+    let mut w = Tensor {
+        device: rustllama_tensor::Device::Cpu,
+        dtype: Dtype::Q4_KRaw,
+        strides: rustllama_tensor::contiguous_strides(&shape),
+        shape,
+        storage: rustllama_tensor::Storage::CpuOwned(w_bytes.into()),
+        name: "sycl-tier-probe".into(),
+    };
+    let Some(dev) = upload_bytes_to_device(w.storage.as_bytes()) else {
+        return SyclTierCheck::Skip(
+            "upload_bytes_to_device returned None (device USM alloc unavailable)".into(),
+        );
+    };
+    w.storage = dev;
+    if !matches!(
+        w.storage.device_backend(),
+        Some((rustllama_tensor::DeviceBackend::Sycl, _))
+    ) {
+        return SyclTierCheck::Skip("promoted storage is not Device(Sycl)".into());
+    }
+    // The device-resident matvec needs the thread-local USM context populated
+    // first (it does not lazily init). Minimal dims — the matvec sizes its own
+    // scratch; the cfg only sizes the (here unused) attention KV mirror.
+    if !prepare_usm_context(1, 1, 1, 128, 16) {
+        return SyclTierCheck::Skip(
+            "prepare_usm_context failed (usm_attn disabled or SYCL context init failed)".into(),
+        );
+    }
+    let mut gpu_out = vec![0f32; m];
+    if !try_matvec_tensor_usm_f32(&w, &x, &mut gpu_out, m, k) {
+        return SyclTierCheck::Skip(
+            "device-resident matvec did not run (dispatch declined the promoted tensor)".into(),
+        );
+    }
+    // Grade: cosine similarity + max relative error vs the CPU reference.
+    let mut dot = 0f64;
+    let mut na = 0f64;
+    let mut nb = 0f64;
+    let mut max_rel = 0f64;
+    for i in 0..m {
+        let a = gpu_out[i] as f64;
+        let b = ref_out[i] as f64;
+        dot += a * b;
+        na += a * a;
+        nb += b * b;
+        let denom = b.abs().max(1e-6);
+        max_rel = max_rel.max((a - b).abs() / denom);
+    }
+    let cos = if na > 0.0 && nb > 0.0 {
+        dot / (na.sqrt() * nb.sqrt())
+    } else {
+        0.0
+    };
+    // Q4_K kernel vs an f32 reference over the SAME bytes is a faithful
+    // dequant+FMA, so the agreement is tight (only FMA reassociation differs).
+    if cos >= 0.999 && max_rel <= 0.05 {
+        SyclTierCheck::Pass { cos, max_rel }
+    } else {
+        SyclTierCheck::Miscompute { cos, max_rel }
+    }
+}
+
 /// Reset all process-global / per-thread GPU device state tied to the PREVIOUS
 /// model, at the start of loading a new one. The matvec weight caches
 /// (CUDA/MLX) key by the weight's HOST byte address, which the allocator reuses

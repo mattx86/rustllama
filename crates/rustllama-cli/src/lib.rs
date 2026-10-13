@@ -85,6 +85,15 @@ pub enum Command {
         /// on a non-Apple host, so this is their first real validation.
         #[arg(long, default_value_t = false)]
         metal_parity: bool,
+        /// Validate the MoE tiered-expert PROMOTION path on a dedicated SYCL
+        /// GPU (Intel Arc / PVC): synthesize a Q4_K expert, promote it to
+        /// device USM exactly as the tier does, run the real device-resident
+        /// matvec dispatch, and grade vs a CPU reference. SKIPs cleanly off
+        /// dedicated-SYCL hardware (CUDA / integrated / MLX-unified / CPU),
+        /// where the tier is a no-op. WRITE-BLIND: no dedicated-SYCL hardware
+        /// on the author's box, so this is its first real validation.
+        #[arg(long, default_value_t = false)]
+        sycl_tier_parity: bool,
     },
     /// Print the rustllama version.
     Version,
@@ -969,6 +978,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             cuda_parity,
             cpu_parity,
             metal_parity,
+            sycl_tier_parity,
         } => {
             if let Some(probe) = sycl_parity_probe {
                 crate::gpu_parity::run_probe(&probe)
@@ -980,6 +990,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 crate::gpu_parity::run_cpu_parity()
             } else if metal_parity {
                 crate::gpu_parity::run_metal_parity()
+            } else if sycl_tier_parity {
+                crate::gpu_parity::run_sycl_tier_parity()
             } else {
                 doctor(&config_path, sycl_smoke).await
             }

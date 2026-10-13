@@ -182,8 +182,12 @@ commands in the chat REPL/TUI mirror this verb set):
   `--metal-parity`, `--cpu-parity` run the kernel parity/stability harnesses
   against the CPU reference (`--sycl-parity` subprocesses each probe — including
   an `xmx:gemm` probe — so a DEVICE_LOST only kills its child; `--cuda-parity`,
-  `--metal-parity`, and `--cpu-parity` run in-process). Also reports per-device
-  `xmx_capable` (Intel XMX/DPAS capability).
+  `--metal-parity`, and `--cpu-parity` run in-process). `--sycl-tier-parity`
+  validates the MoE tiered-expert PROMOTION path on a dedicated SYCL GPU
+  (synthesize a Q4_K expert → promote to USM exactly as the tier does → run the
+  real device-resident matvec dispatch → grade vs CPU); SKIPs off dedicated-SYCL
+  HW (CUDA/integrated/MLX-unified/CPU, where the tier is a no-op). Also reports
+  per-device `xmx_capable` (Intel XMX/DPAS capability).
 - `gui` — launch the native egui GUI. `lsp` — LSP bridge over stdio. `version`.
 
 ## Config & server

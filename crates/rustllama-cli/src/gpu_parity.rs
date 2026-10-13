@@ -4122,6 +4122,32 @@ fn cpu_simd_level() -> &'static str {
     }
 }
 
+/// MoE tiered-expert SYCL PROMOTION self-check (`doctor --sycl-tier-parity`).
+/// Drives the real promotion + device-resident matvec via the engine (which
+/// owns the accel layer) and prints a single OK / MISCOMPUTE / SKIP line. The
+/// kernel is already covered by `--sycl-parity`; this validates the promotion
+/// plumbing the tier uniquely uses, and SKIPs cleanly off dedicated-SYCL HW.
+pub fn run_sycl_tier_parity() -> anyhow::Result<()> {
+    println!("MoE tiered-expert SYCL promotion self-check (dedicated Arc/PVC; in-process)");
+    match rustllama_engine::sycl_tier_self_check() {
+        rustllama_engine::SyclTierCheck::Skip(why) => {
+            println!("tier:sycl_promote  SKIP  {why}");
+            println!("\nsummary: SKIP");
+        }
+        rustllama_engine::SyclTierCheck::Pass { cos, max_rel } => {
+            println!("tier:sycl_promote  OK    cos={cos:.6} max_rel={max_rel:.4}");
+            println!("\nsummary: OK=1 MISCOMPUTE=0");
+        }
+        rustllama_engine::SyclTierCheck::Miscompute { cos, max_rel } => {
+            println!("tier:sycl_promote  MISCOMPUTE  cos={cos:.6} max_rel={max_rel:.4}");
+            println!(
+                "\nsummary: OK=0 MISCOMPUTE=1 — promoted-expert matvec disagrees with the CPU reference"
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn run_cpu_parity() -> anyhow::Result<()> {
     println!(
         "CPU kernel parity harness (matvec SIMD / rayon-parallel paths vs a naive scalar \

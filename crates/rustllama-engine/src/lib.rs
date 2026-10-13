@@ -36,6 +36,7 @@ pub mod tool_grammar;
 pub use inference::{CpuEngine, CpuEngineError};
 pub use rustllama_models::accel::moe_dev_resident_hits;
 pub use rustllama_models::accel::set_synthetic_run;
+pub use rustllama_models::accel::{sycl_tier_self_check, SyclTierCheck};
 pub use rustllama_models::imatrix_collect;
 pub use rustllama_models::kv_bias;
 pub use rustllama_models::llama_arch::kv_whitening_active_for;
