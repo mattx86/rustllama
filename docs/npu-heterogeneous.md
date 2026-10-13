@@ -83,16 +83,17 @@ choice here.
 Generalize placement from "GPU-or-CPU per layer" to an ordered tier list with
 spillover:
 
-- **Priority order — MEASURED by the autotuner, fastest→slowest.** The
-  autotuner benches each tier's throughput (CPU + NPU + GPU/Metal, tok/s) and
-  orders the tiers by measured speed (`tier::order_tiers_by_perf`), extending
-  the existing `per_device_perf` stage to the NPU tier. So a weak iGPU that
-  benches below the CPU drops under it, and an NPU slots wherever its measured
-  speed lands — no static assumption. The order persists per `system_fingerprint`
-  (now NPU-aware) and is applied as `[inference.placement].tier_order`. The
-  static `GPU/Metal → NPU → CPU` (`tier::default_tier_order`) is only the
-  cold-start fallback before the bench runs, and an explicit config `tier_order`
-  overrides the measurement.
+- **Priority order — MEASURED, fastest→slowest, REUSING the existing ranking.**
+  This already exists for GPU + CPU: `multi_gpu::build_tiers` reads
+  `TuningResult.per_device_perf` (the median decode tok/s per GPU **and** the
+  CPU tier, from the Stage-1b `per_device_perf` bench) and `plan_heat_placement`
+  ranks the tiers by that `perf_score`, fastest first. So a weak iGPU that
+  benches below the CPU drops under it — no static assumption, and no new bench.
+  The NPU slots in by (a) adding the NPU to the Stage-1b per-tier measurement so
+  its tok/s lands in `per_device_perf`, and (b) adding an NPU tier to
+  `build_tiers` — both gated on a present, benchable NPU (Phase 3), so inert
+  today. The static `GPU/Metal → NPU → CPU` (`tier::default_tier_order`) is the
+  cold-start fallback; an explicit config `tier_order` is a user override.
 - **Spillover**: assign layers/ops down the priority list until each tier's
   **capacity** is exhausted, then spill the remainder to the next tier. Capacity
   = free VRAM (GPU), NPU memory (NPU), and "the rest" (CPU). This is the direct

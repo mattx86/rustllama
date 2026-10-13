@@ -58,18 +58,12 @@ pub fn spillover_assign(unit_bytes: &[u64], tier_caps: &[u64]) -> Vec<usize> {
     out
 }
 
-/// Order tiers fastest→slowest from MEASURED throughput, the spillover priority
-/// the autotuner sets after benching each tier (CPU + NPU + GPU/Metal) in tok/s.
-/// Descending by tok/s; a stable sort keeps the input order for ties. This
-/// replaces the static `default_tier_order` assumption with the measured
-/// ranking — e.g. a weak iGPU that benches slower than the CPU drops below it,
-/// and an NPU slots wherever its measured speed lands.
-pub fn order_tiers_by_perf(measured: &[(TierKind, f64)]) -> Vec<TierKind> {
-    let mut v: Vec<(TierKind, f64)> = measured.to_vec();
-    // Descending tok/s; NaN sinks to the bottom. Stable for ties.
-    v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    v.into_iter().map(|(k, _)| k).collect()
-}
+// NOTE: the MEASURED fastest→slowest tier ranking is NOT duplicated here — it
+// already lives in the engine's heat planner (`multi_gpu::build_tiers` reads
+// `TuningResult.per_device_perf`, the median decode tok/s per GPU + CPU tier,
+// and `plan_heat_placement` ranks the tiers by that `perf_score`). This module
+// only provides the capacity spillover + the static priority fallback;
+// `default_tier_order` is the cold-start order before the bench runs.
 
 /// Count how many units landed on each tier (len `n_tiers`).
 pub fn tier_counts(assignment: &[usize], n_tiers: usize) -> Vec<usize> {
@@ -116,21 +110,6 @@ mod tests {
     #[test]
     fn default_order_is_gpu_npu_cpu() {
         assert_eq!(default_tier_order(), vec![TierKind::GpuMetal, TierKind::Npu, TierKind::Cpu]);
-    }
-
-    #[test]
-    fn perf_ranking_orders_fastest_first() {
-        // A weak GPU (30 tok/s) benches below the CPU (45) and NPU (60) → the
-        // measured order is NPU > CPU > GPU, not the static GPU-first default.
-        let measured = vec![
-            (TierKind::GpuMetal, 30.0),
-            (TierKind::Cpu, 45.0),
-            (TierKind::Npu, 60.0),
-        ];
-        assert_eq!(
-            order_tiers_by_perf(&measured),
-            vec![TierKind::Npu, TierKind::Cpu, TierKind::GpuMetal]
-        );
     }
 
     /// Two-tier case must match the GPU-fill-then-CPU cutoff the engine's
