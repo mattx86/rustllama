@@ -43,6 +43,11 @@ mod avx512bf16;
 #[cfg(target_arch = "x86_64")]
 mod avx512fp16;
 
+/// Speculative bit-op CPU extensions (VPOPCNTDQ / GFNI / VBMI2) for future
+/// low-bit formats — no current consumer; self-check-gated. See `bitops_ext.rs`.
+#[cfg(target_arch = "x86_64")]
+mod bitops_ext;
+
 /// `C = W · X` where `W: [M, K]` (row-major, F16) and `X: [K, N]` (col-major
 /// for `N == 1` is a vector, otherwise row-major). Output `C: [M, N]`
 /// row-major, F32. Activations accumulate in F32.
