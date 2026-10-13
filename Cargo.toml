@@ -27,8 +27,10 @@ members = [
 ]
 
 [workspace.package]
+# The kernels-cpu SIMD paths use the x86 AVX-512 intrinsics stabilized in
+# Rust 1.89, so that is the true minimum (the old "1.83" would not compile).
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.89"
 version = "0.1.1"
 license = "MIT OR Apache-2.0"
 authors = ["Matt Smith"]
