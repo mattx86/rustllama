@@ -26,6 +26,12 @@ use rustllama_tensor::{as_bytes, as_slice_f16, as_slice_f32, Dtype, Tensor};
 #[cfg(target_arch = "x86_64")]
 mod amx;
 
+/// AVX-VNNI int8 (W8A8) matvec for Q8_0 weights — an Intel+AMD CPU extension.
+/// x86-64 only; opt-in (lossy) + self-check-gated, inert off AVX-VNNI hardware.
+/// See `vnni.rs`.
+#[cfg(target_arch = "x86_64")]
+pub mod vnni;
+
 /// `C = W · X` where `W: [M, K]` (row-major, F16) and `X: [K, N]` (col-major
 /// for `N == 1` is a vector, otherwise row-major). Output `C: [M, N]`
 /// row-major, F32. Activations accumulate in F32.
@@ -10467,6 +10473,13 @@ pub fn matvec_q8_0_w_f32_a(
 
     #[cfg(target_arch = "x86_64")]
     {
+        // Opt-in AVX-VNNI int8 (W8A8) fast path — default OFF (lossy vs the
+        // f32-activation paths below), self-check-gated, so this is inert
+        // unless both opted into and the kernel validated on this host.
+        if vnni::vnni_w8a8_enabled() && vnni::vnni_q8_0_usable() {
+            vnni::matvec_q8_0_w8a8(w_bytes, x, out, m, k);
+            return;
+        }
         if is_x86_feature_detected!("avx512f") {
             // SAFETY: runtime feature detection.
             unsafe { matvec_q8_0_w_f32_a_avx512(w_bytes, x, out, m, k) };
