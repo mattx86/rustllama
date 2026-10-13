@@ -78,6 +78,12 @@ pub struct Tier {
 pub enum TierKind {
     Cpu,
     Gpu(DeviceTarget),
+    /// An NPU device (0-based NPU index). Inert until an npu-* backend + NPU
+    /// hardware are present AND the NPU has a measured perf entry (Phase 3);
+    /// `build_tiers` only ever constructs this when `usable_npus()` is
+    /// non-empty, so it never appears in a plan today. The dispatch side that
+    /// honors an NPU assignment lands with the vendor backend.
+    Npu(u32),
 }
 
 /// Heat class of a weight tensor. `Ord`: later variants are HOTTER, so a
@@ -346,6 +352,7 @@ pub fn plan_from_tiers(
     let mut attn_device: Option<DeviceTarget> = None;
     let mut gpu_resident: u64 = 0;
     let mut cpu_resident: u64 = 0;
+    let mut npu_resident: u64 = 0;
     let mut overflow: Vec<String> = Vec::new();
 
     for t in &tensors {
@@ -368,6 +375,9 @@ pub fn plan_from_tiers(
                         }
                     }
                     TierKind::Cpu => cpu_resident += t.bytes,
+                    // Inert today (no NPU tier is ever built). Phase 3 wires the
+                    // NPU dispatch that honors this assignment.
+                    TierKind::Npu(_) => npu_resident += t.bytes,
                 }
             }
             None => {
@@ -418,12 +428,18 @@ pub fn plan_from_tiers(
         None
     };
 
+    let npu_note = if npu_resident > 0 {
+        format!(", {npu_resident} NPU-resident bytes")
+    } else {
+        String::new()
+    };
     let reason = format!(
-        "heat placement: {} GPU-resident bytes across {} device(s), {} CPU-resident bytes \
+        "heat placement: {} GPU-resident bytes across {} device(s), {} CPU-resident bytes{} \
          over {} tier(s) ranked by measured tok/s",
         gpu_resident,
         distinct_gpu_count,
         cpu_resident,
+        npu_note,
         tiers.len()
     );
 
@@ -568,6 +584,28 @@ fn build_tiers(
             budget_bytes: cpu_budget,
             total_bytes: ram,
             label: "CPU (enabled cores)".to_string(),
+        });
+    }
+
+    // --- NPU devices (Intel/AMD) --- the NPU tier slots into the SAME
+    // measured-perf ranking as the GPU/CPU tiers. INERT today: `usable_npus()`
+    // is empty without an npu-* backend + hardware, and even a present NPU is
+    // skipped until it has a measured perf entry (the Stage-1b bench extended
+    // to the NPU — Phase 3). So this adds nothing to `tiers` on current hosts.
+    for npu in rustllama_npu::usable_npus(&[]) {
+        let slug = rustllama_tuner::npu_perf_key(&npu);
+        // Measured perf is mandatory, exactly like GPU/CPU tiers.
+        let Some(&perf) = per_device_perf.get(&slug) else {
+            continue;
+        };
+        let budget = ((npu.memory_bytes as f64) * safety).floor() as u64;
+        let budget = budget.saturating_sub(reserve);
+        tiers.push(Tier {
+            kind: TierKind::Npu(npu.index),
+            perf_score: perf,
+            budget_bytes: budget,
+            total_bytes: npu.memory_bytes,
+            label: format!("NPU {} ({:?} {})", npu.index, npu.vendor, npu.name),
         });
     }
 

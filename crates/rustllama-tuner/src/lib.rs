@@ -797,6 +797,19 @@ pub fn cpu_perf_key() -> String {
     )
 }
 
+/// Stable per-device slug for an NPU tier's measured perf — the NPU analog of
+/// [`cpu_perf_key`] / the GPU `*_gpu_key`s. Keyed by vendor + name + index so
+/// the Stage-1b NPU bench and the heat planner agree on the `per_device_perf`
+/// entry (Phase 3). Non-alphanumeric chars in the name collapse to `_`.
+pub fn npu_perf_key(npu: &rustllama_npu::NpuInfo) -> String {
+    let safe_name: String = npu
+        .name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("npu:{:?}:{}:{}", npu.vendor, safe_name, npu.index)
+}
+
 /// FNV-1a 64-bit — deterministic across processes (unlike `DefaultHasher`,
 /// whose seed is randomized), so the system-fingerprint slug is stable.
 fn fnv1a(s: &str) -> u64 {
