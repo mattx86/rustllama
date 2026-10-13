@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, RwLock};
 
 /// Heterogeneous compute-tier scheduling (GPU/Metal → NPU → CPU spillover).
-pub mod tier;
+/// The pure core lives in `rustllama-runtime` (shared with the engine's
+/// placement layer); re-exported here for `[inference.placement].tier_order`.
+pub use rustllama_runtime::tier;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

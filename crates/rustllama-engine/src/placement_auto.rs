@@ -314,20 +314,18 @@ fn auto_n_gpu_layers_inner(
         };
     }
 
-    // Walk layers in order, accumulating bytes until we'd exceed
-    // the budget. The cutoff is the largest k such that
-    // sum(per_layer_bytes[0..k]) <= effective_budget.
+    // Place layers via the heterogeneous N-tier spillover scheduler
+    // (docs/npu-heterogeneous.md). Today the tiers are [GPU, CPU]: the NPU tier
+    // has no capacity yet (no vendor backend / hardware), so this reduces
+    // EXACTLY to the former GPU-fill-then-CPU walk — tier 0 (GPU) takes the
+    // largest layer prefix whose cumulative bytes fit `effective_budget`, the
+    // rest spill to CPU. When an NPU is present its capacity slots between GPU
+    // and CPU per `tier_order`, extending this to a true per-layer placement.
     let per_layer = per_layer_weight_bytes(weights, &opts.cpu_force_patterns);
-    let mut cumulative: u64 = 0;
-    let mut cutoff: u32 = 0;
-    for (i, bytes) in per_layer.iter().enumerate() {
-        let next = cumulative.saturating_add(*bytes);
-        if next > effective_budget {
-            break;
-        }
-        cumulative = next;
-        cutoff = (i + 1) as u32;
-    }
+    let assignment =
+        rustllama_runtime::tier::spillover_assign(&per_layer, &[effective_budget, 0]);
+    let cutoff = assignment.iter().take_while(|&&t| t == 0).count() as u32;
+    let cumulative: u64 = per_layer.iter().take(cutoff as usize).sum();
 
     let reason = if cutoff == total_layers {
         format!(

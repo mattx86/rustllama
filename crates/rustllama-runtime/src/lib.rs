@@ -25,6 +25,7 @@ pub mod crash;
 pub mod gpu_detect;
 pub mod gpu_paths;
 pub mod sandbox;
+pub mod tier;
 
 pub use gpu_paths::ensure_gpu_dll_search_paths;
 

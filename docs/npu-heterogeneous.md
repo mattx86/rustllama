@@ -83,11 +83,16 @@ choice here.
 Generalize placement from "GPU-or-CPU per layer" to an ordered tier list with
 spillover:
 
-- **Priority order** (default, tunable in `[inference.placement]`):
-  `GPU/Metal → NPU → CPU`. (GPU/Metal first = highest throughput; NPU second =
-  efficient offload that frees the GPU + CPU; CPU last = fallback.) A per-device
-  measured-perf weight (the existing `per_device_perf` tuner map) refines order
-  within a tier, as multi-GPU placement already does.
+- **Priority order — MEASURED by the autotuner, fastest→slowest.** The
+  autotuner benches each tier's throughput (CPU + NPU + GPU/Metal, tok/s) and
+  orders the tiers by measured speed (`tier::order_tiers_by_perf`), extending
+  the existing `per_device_perf` stage to the NPU tier. So a weak iGPU that
+  benches below the CPU drops under it, and an NPU slots wherever its measured
+  speed lands — no static assumption. The order persists per `system_fingerprint`
+  (now NPU-aware) and is applied as `[inference.placement].tier_order`. The
+  static `GPU/Metal → NPU → CPU` (`tier::default_tier_order`) is only the
+  cold-start fallback before the bench runs, and an explicit config `tier_order`
+  overrides the measurement.
 - **Spillover**: assign layers/ops down the priority list until each tier's
   **capacity** is exhausted, then spill the remainder to the next tier. Capacity
   = free VRAM (GPU), NPU memory (NPU), and "the rest" (CPU). This is the direct
