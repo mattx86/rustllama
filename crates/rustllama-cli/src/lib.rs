@@ -2156,6 +2156,12 @@ fn promote_cpu_tier_env_from_config(inference: &rustllama_config::InferenceConfi
         std::env::set_var("RUSTLLAMA_GPU_ENABLED", "0");
         tracing::info!("gpu_enabled=false: CPU-only placement (no GPU weight tier)");
     }
+    // NPU tier on/off (mirror of gpu_enabled). Promote so the scheduler +
+    // device inventory sideline NPUs. Inert when no NPU/backend is present.
+    if !inference.npu_enabled && std::env::var_os("RUSTLLAMA_NPU_ENABLED").is_none() {
+        std::env::set_var("RUSTLLAMA_NPU_ENABLED", "0");
+        tracing::info!("npu_enabled=false: NPU tier disabled");
+    }
     if inference.vram_only && std::env::var_os("RUSTLLAMA_VRAM_ONLY").is_none() {
         std::env::set_var("RUSTLLAMA_VRAM_ONLY", "1");
         tracing::info!("vram_only=true: weights required in dedicated VRAM only");
@@ -2200,6 +2206,18 @@ fn promote_memory_env_from_config(
             .join(",");
         std::env::set_var("RUSTLLAMA_DISABLED_GPUS", &list);
         tracing::info!(disabled_gpus = %list, "GPU disable-list applied from config");
+    }
+    // NPU disable-list: promote `[inference].disabled_npus` into the env that
+    // `rustllama_npu::usable_npus` + the system fingerprint read.
+    if !inference.disabled_npus.is_empty() && std::env::var_os("RUSTLLAMA_DISABLED_NPUS").is_none() {
+        let list = inference
+            .disabled_npus
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        std::env::set_var("RUSTLLAMA_DISABLED_NPUS", &list);
+        tracing::info!(disabled_npus = %list, "NPU disable-list applied from config");
     }
     // CPU compute tier (disable-list + on/off + VRAM-only mode).
     promote_cpu_tier_env_from_config(inference);

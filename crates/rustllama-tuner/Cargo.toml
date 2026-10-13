@@ -30,3 +30,6 @@ rustllama-kernels-cuda = { path = "../rustllama-kernels-cuda" }
 # (registry IDs of every Metal device). Inert on non-Apple hosts
 # (`device_count()` returns 0), so the fingerprint is unchanged there.
 rustllama-kernels-mlx = { path = "../rustllama-kernels-mlx" }
+# Enumerate NPUs for the system fingerprint (only added to the key when an NPU
+# is actually present, so existing GPU/CPU-only caches are unchanged).
+rustllama-npu = { path = "../rustllama-npu" }

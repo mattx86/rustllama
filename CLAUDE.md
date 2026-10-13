@@ -77,10 +77,10 @@ mangles long batch strings):
 | Arbitrary cargo cmd with the full toolchain env | `scripts\build-env.bat build --release …` |
 | Check a **toolchain-free** crate (no env needed) | `cargo check -p rustllama-runtime` |
 
-The **8 toolchain-free crates** (no transitive `kernels-sycl`/`kernels-cuda`
+The **9 toolchain-free crates** (no transitive `kernels-sycl`/`kernels-cuda`
 dep) can be built/checked/tested with plain cargo, and are the only ones CI
 compiles: `rustllama-config`, `-tensor`, `-tokenizer`, `-gguf`,
-`-kernels-cpu`, `-l0-sys`, `-runtime`, `-hub`. Everything else (models,
+`-kernels-cpu`, `-l0-sys`, `-runtime`, `-hub`, `-npu`. Everything else (models,
 engine, server, cli, tuner, app, and the crates that pull them) needs the GPU
 toolchains and is validated on a dev box with both installed + the
 `scripts/Dockerfile.linux-gpu` image. Source of truth: `.github/workflows/ci.yml`.
@@ -235,7 +235,7 @@ without the user clearing any cache.
 
 ## Testing & validation
 
-- `cargo test --lib -p <crate>` for the 8 toolchain-free crates (what CI runs).
+- `cargo test --lib -p <crate>` for the 9 toolchain-free crates (what CI runs).
 - Kernel correctness: `rustllama doctor --sycl-parity` (SYCL, per-probe
   subprocessed) / `--cuda-parity` (CUDA, in-process) / `--metal-parity` (Metal,
   in-process) — every GPU kernel family vs its CPU reference on identical

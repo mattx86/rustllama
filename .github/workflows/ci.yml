@@ -18,11 +18,11 @@ jobs:
   cargo-check:
     runs-on: windows-latest
     env:
-      # The 8 crates with no transitive kernels-sycl / kernels-cuda dep.
+      # The crates with no transitive kernels-sycl / kernels-cuda dep.
       FREE_CRATES: >-
         -p rustllama-config -p rustllama-tensor -p rustllama-tokenizer
         -p rustllama-gguf -p rustllama-kernels-cpu -p rustllama-l0-sys
-        -p rustllama-runtime -p rustllama-hub
+        -p rustllama-runtime -p rustllama-hub -p rustllama-npu
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

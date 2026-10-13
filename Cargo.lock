@@ -4408,6 +4408,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustllama-npu"
+version = "0.1.1"
+dependencies = [
+ "serde",
+ "tracing",
+]
+
+[[package]]
 name = "rustllama-rag"
 version = "0.1.1"
 dependencies = [
@@ -4523,6 +4531,7 @@ dependencies = [
  "rustllama-kernels-cuda",
  "rustllama-kernels-mlx",
  "rustllama-kernels-sycl",
+ "rustllama-npu",
  "rustllama-runtime",
  "rustllama-tensor",
  "serde",

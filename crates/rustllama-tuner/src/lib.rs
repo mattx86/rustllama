@@ -702,6 +702,14 @@ pub fn system_fingerprint() -> String {
     ));
     parts.push(format!("cpu_enabled:{}", enabled.join(",")));
     parts.push(format!("ram:{ram_gib}GiB"));
+    // NPUs (Intel/AMD) join the fingerprint exactly as GPUs do — but ONLY when
+    // one is actually present. Adding "npu:none" unconditionally would change
+    // every existing GPU/CPU-only key and force a needless re-tune, so the slug
+    // is appended only for a non-empty usable NPU set (env-disabled applied).
+    let npu_fp = rustllama_npu::npu_fingerprint(&[]);
+    if npu_fp != "npu:none" {
+        parts.push(npu_fp);
+    }
     format!("{:016x}", fnv1a(&parts.join("|")))
 }
 

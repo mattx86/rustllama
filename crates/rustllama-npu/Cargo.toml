@@ -1,0 +1,22 @@
+[package]
+name = "rustllama-npu"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Backend-agnostic NPU device model: enumeration, disable-by-index, fingerprint. Vendor runtimes (Intel OpenVINO / AMD Ryzen AI) plug in behind features."
+
+[dependencies]
+serde = { workspace = true }
+tracing.workspace = true
+
+[features]
+default = []
+# Intel NPU via OpenVINO (Apache-2.0). Enumeration/offload FFI lands in a later
+# phase; the feature gate + stub exist now so the device model is complete.
+npu-openvino = []
+# AMD NPU via the Ryzen AI / XRT stack. Same shape as npu-openvino.
+npu-ryzenai = []

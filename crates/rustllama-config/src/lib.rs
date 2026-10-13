@@ -349,6 +349,19 @@ pub struct InferenceConfig {
     /// (comma-separated) and the `serve --disabled-cpus <CSV>` flag.
     #[serde(default)]
     pub disabled_cpus: Vec<u32>,
+    /// NPU indices (0-based, in the NPU enumeration order) to ignore entirely —
+    /// excluded from placement + the device inventory, the NPU analog of
+    /// `disabled_gpus`. Empty (the default) = use every enumerated NPU. Also
+    /// settable via `RUSTLLAMA_DISABLED_NPUS` (comma-separated).
+    #[serde(default)]
+    pub disabled_npus: Vec<u32>,
+    /// Whether enumerated NPUs are offered to the heterogeneous scheduler as a
+    /// compute tier (between GPU/Metal and CPU in the default priority order).
+    /// `true` (the default) uses any available NPU; `false` sidelines all NPUs
+    /// without editing the disable-list. Inert when no NPU is present or no
+    /// `npu-*` backend is built. Also settable via `RUSTLLAMA_NPU_ENABLED=0`.
+    #[serde(default = "default_true")]
+    pub npu_enabled: bool,
     /// VRAM-only weight residency. `false` (the default) keeps the normal
     /// RAM/mmap + USM residency path. `true` forbids host-RAM weight
     /// residency and mmap: weights must live in **dedicated** GPU VRAM
@@ -819,6 +832,10 @@ impl Default for InferenceConfig {
             // CPU-only placement. Both false is a validation error.
             gpu_enabled: true,
             disabled_cpus: Vec::new(),
+            // NPUs: enabled as a tier by default, none disabled (inert until an
+            // npu-* backend + NPU hardware are present).
+            disabled_npus: Vec::new(),
+            npu_enabled: true,
             vram_only: false,
             placement: PlacementConfig::default(),
             prefix_cache: true,

@@ -11,6 +11,7 @@ members = [
     "crates/rustllama-kernels-cuda",
     "crates/rustllama-kernels-mlx",
     "crates/rustllama-l0-sys",
+    "crates/rustllama-npu",
     "crates/rustllama-models",
     "crates/rustllama-tuner",
     "crates/rustllama-engine",
