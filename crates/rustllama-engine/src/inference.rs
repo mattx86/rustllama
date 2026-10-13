@@ -1791,11 +1791,18 @@ impl CpuEngine {
     ) -> Option<Arc<Mutex<crate::expert_cache::UsageLearner>>> {
         use rustllama_models::accel;
         let budget = accel::moe_expert_cache_max_bytes();
-        if budget == 0 {
+        let tier = accel::moe_tier_active();
+        // Learn routing usage when EITHER the LRU pin-cache is on (budget > 0) OR
+        // the tiered-expert engine is active — the tier's hottest-first promotion
+        // needs the usage sidecar too, and without this it never fills (ranked=0).
+        if budget == 0 && !tier {
             return None;
         }
         let registered = accel::expert_registry_len();
-        if registered == 0 {
+        // The LRU pin-cache needs file-backed registered experts; the tier does
+        // NOT (its experts are device-resident via promotion, not the mmap pin
+        // registry), so only bail on an empty registry for the LRU-only path.
+        if budget > 0 && registered == 0 {
             tracing::warn!(
                 model_id = %model_id,
                 "moe expert cache enabled but no file-backed experts registered — \
@@ -1816,17 +1823,28 @@ impl CpuEngine {
             return None;
         }
         let learner = crate::expert_cache::UsageLearner::open(path)?;
-        let t0 = std::time::Instant::now();
-        let (pinned, bytes) = learner.prepin(budget);
-        tracing::info!(
-            model_id = %model_id,
-            registered_experts = registered,
-            budget_mb = budget / (1024 * 1024),
-            prepinned_experts = pinned,
-            prepinned_mb = bytes / (1024 * 1024),
-            elapsed_ms = t0.elapsed().as_millis() as u64,
-            "expert cache: learning sidecar loaded, hot experts pre-pinned"
-        );
+        if budget > 0 {
+            // LRU pin-cache: pre-pin the hottest experts from the sidecar.
+            let t0 = std::time::Instant::now();
+            let (pinned, bytes) = learner.prepin(budget);
+            tracing::info!(
+                model_id = %model_id,
+                registered_experts = registered,
+                budget_mb = budget / (1024 * 1024),
+                prepinned_experts = pinned,
+                prepinned_mb = bytes / (1024 * 1024),
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                "expert cache: learning sidecar loaded, hot experts pre-pinned"
+            );
+        } else {
+            // Tiered-expert engine (no LRU cache): no pre-pin — the sidecar just
+            // records routed-expert usage so the NEXT load promotes hottest-first.
+            tracing::info!(
+                model_id = %model_id,
+                "moe tiered-expert: usage-learning sidecar active — routed-expert \
+                 counts persist so promotion is hottest-first on the next load"
+            );
+        }
         let learner = Arc::new(Mutex::new(learner));
         let weak = Arc::downgrade(&learner);
         // Periodic flusher: folds routing stats into the sidecar

@@ -388,6 +388,11 @@ pub fn moe_ffn_one_into(
     // remaining picks (and the same indices on the next layers) start
     // faulting in from disk while pick 1 computes.
     crate::accel::note_routed_experts(picks);
+    // Learn routed-expert usage for the tiered-expert engine's hottest-first
+    // promotion. No-op unless the tier is active + the LRU pin-cache is off (the
+    // one path that otherwise records nothing → `ranked=0`); this is the decode
+    // path (one token), so the counter's lock is uncontended.
+    crate::accel::record_routed_usage(picks);
 
     // MoE tiered-expert grouped FFN (decode fast path): when every routed
     // expert is a promoted, device-resident buffer of one warp-cooperative quant

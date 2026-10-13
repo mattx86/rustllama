@@ -1179,17 +1179,22 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             prompt_tokens,
             decode_tokens,
             repeats,
-        }) => bench(
-            &config_path,
-            cli.profile.as_deref(),
-            model.as_deref(),
-            flash,
-            kv_dtype.as_deref(),
-            ctx_size,
-            prompt_tokens,
-            decode_tokens,
-            repeats,
-        ),
+        }) => {
+            // `bench` drives synthetic decode — don't let it train the MoE
+            // routed-expert usage sidecar (see the `tune` arm).
+            rustllama_engine::set_synthetic_run(true);
+            bench(
+                &config_path,
+                cli.profile.as_deref(),
+                model.as_deref(),
+                flash,
+                kv_dtype.as_deref(),
+                ctx_size,
+                prompt_tokens,
+                decode_tokens,
+                repeats,
+            )
+        }
         Command::Config(ConfigCmd::Show) => config_show(&config_path),
         Command::Config(ConfigCmd::Path) => {
             println!("{}", config_path.display());
@@ -1247,6 +1252,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             skip_cached,
             force,
         } => {
+            // Tune sweeps drive SYNTHETIC decode (fixed pseudo-token prompts).
+            // Mark the process so the MoE routed-expert usage learner skips
+            // this process's routing — otherwise the benchmark's non-
+            // representative routing would poison the real-usage sidecar that
+            // ranks which experts get promoted to the device tier.
+            rustllama_engine::set_synthetic_run(true);
             // `tune --show` just prints the tuner-cache state (the former
             // `tuning show`) and runs no sweep.
             if show {

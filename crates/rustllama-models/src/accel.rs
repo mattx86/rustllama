@@ -2273,6 +2273,44 @@ pub fn expert_pin_touch(
     }
 }
 
+/// Record routed-expert usage for the tiered-expert engine's hottest-first
+/// promotion learning. [`expert_pin_touch`] only counts when the LRU pin-cache
+/// budget > 0, and it's never called on the grouped device-resident path — so
+/// with the tier active + the (default-off) LRU cache the usage sidecar never
+/// fills and promotion falls back to index order (`ranked=0`). This writes the
+/// routed `(layer, expert)` hits into the SAME `access` map the `UsageLearner`
+/// flush drains, gated to exactly that gap (tier active AND LRU off) so it never
+/// double-counts `expert_pin_touch`. One lock per token (all top-k picks under
+/// it); call only from the single-threaded decode path, so the Mutex is
+/// uncontended (prefill's batched MoE variants don't call it).
+pub fn record_routed_usage(picks: &[(usize, f32)]) {
+    if !moe_tier_active() || moe_expert_cache_max_bytes() != 0 || synthetic_run() {
+        return;
+    }
+    let layer = current_layer_idx();
+    let mut c = expert_pins().lock().expect("expert-pin lock");
+    for (expert_idx, _w) in picks {
+        let ekey = ExpertKey::new(layer, *expert_idx as u32);
+        *c.access.entry(ekey).or_insert(0) += 1;
+    }
+}
+
+/// Set by `tune` / `model bench` so their SYNTHETIC decode (fixed pseudo-token
+/// prompts) doesn't poison the real-usage learning sidecar. Real `serve` /
+/// `generate` leave it false → routed usage is learned from real prompts.
+static SYNTHETIC_RUN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark this process's decode as synthetic (benchmark/tune), so
+/// [`record_routed_usage`] skips it.
+pub fn set_synthetic_run(on: bool) {
+    SYNTHETIC_RUN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this process is doing synthetic (benchmark/tune) decode.
+pub fn synthetic_run() -> bool {
+    SYNTHETIC_RUN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Drop the in-flight refcount on a pinned expert after its matvecs.
 /// No-op for `None` (expert wasn't pinned).
 pub fn expert_pin_release(key: Option<usize>) {
