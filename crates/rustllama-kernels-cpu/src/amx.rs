@@ -327,6 +327,175 @@ pub fn amx_gemm_usable() -> bool {
     })
 }
 
+// ============================================================
+// AMX-INT8 tile GEMM (tdpbssd) — the int8 sibling of the bf16 path above, for
+// W8A8 quant (e.g. Q8_0) prefill on Xeon. Reuses the same 16×64 TileConfig: an
+// int8 A tile is 16 rows × 64 i8 (K=64), a VNNI B tile is (K/4)=16 rows × 4·N
+// i8, and the C tile is 16×16 i32 — all 16 rows × 64 bytes. The int8 dot folds
+// 4 K-values per i32 lane, so K per tile is 64 (vs 32 for bf16) and B is
+// 4-packed (vs 2-packed). WRITE-BLIND (no AMX hardware here); self-check-gated.
+// ============================================================
+
+/// int8 A/B/C tile dims (A 16×64 i8, B VNNI (K/4)×(4·N) i8, C 16×16 i32).
+const TK_I8: usize = 64;
+
+/// AMX-INT8 presence: AMX-TILE (CPUID.7.0:EDX[24]) + AMX-INT8 (EDX[25]) + OS
+/// XTILEDATA (XCR0 17/18), same gating as [`amx_cpu_supported`].
+fn amx_int8_supported() -> bool {
+    use std::arch::x86_64::__cpuid_count;
+    let leaf7 = unsafe { __cpuid_count(7, 0) };
+    let amx_tile = (leaf7.edx >> 24) & 1 != 0;
+    let amx_int8 = (leaf7.edx >> 25) & 1 != 0;
+    if !(amx_tile && amx_int8) {
+        return false;
+    }
+    let leaf1 = unsafe { __cpuid_count(1, 0) };
+    if (leaf1.ecx >> 27) & 1 == 0 {
+        return false;
+    }
+    let xcr0 = unsafe { read_xcr0() };
+    (xcr0 >> 17) & 0b11 == 0b11
+}
+
+/// Pack a TM×TK_I8 i8 A-tile (row-major) from `a[M,K]` at block (mb, kb),
+/// zero-padding the M/K remainders.
+fn pack_a_i8(a: &[i8], a_buf: &mut [i8; TM * TK_I8], m: usize, k: usize, mb: usize, kb: usize) {
+    a_buf.fill(0);
+    let mrows = (m - mb).min(TM);
+    let kcols = (k - kb).min(TK_I8);
+    for i in 0..mrows {
+        let src = &a[(mb + i) * k..];
+        let dst = &mut a_buf[i * TK_I8..];
+        for p in 0..kcols {
+            dst[p] = src[kb + p];
+        }
+    }
+}
+
+/// Pack a VNNI int8 B-tile from `b[K,N]` (row-major) at block (kb, nb): row `kk`
+/// holds, per output column n, the 4 consecutive K-values b[kb+4kk+{0..4}][n].
+fn pack_b_i8_vnni(b: &[i8], b_buf: &mut [i8; (TK_I8 / 4) * (4 * TN)], n: usize, k: usize, kb: usize, nb: usize) {
+    b_buf.fill(0);
+    let ncols = (n - nb).min(TN);
+    let kcols = (k - kb).min(TK_I8);
+    for kk in 0..(TK_I8 / 4) {
+        let row = &mut b_buf[kk * (4 * TN)..];
+        for j in 0..ncols {
+            for r in 0..4 {
+                let ki = 4 * kk + r;
+                if ki < kcols {
+                    row[j * 4 + r] = b[(kb + ki) * n + (nb + j)];
+                }
+            }
+        }
+    }
+}
+
+/// One AMX-INT8 block: `C_tile[16,16] i32 += A_tile · B_tile` (tmm0/1/2). The
+/// caller has run `ldtilecfg` + `tilezero tmm0`.
+///
+/// SAFETY: AMX present + XTILEDATA permitted; ptrs point at 16×64-byte tiles.
+#[inline]
+unsafe fn amx_block_mul_i8(a_ptr: *const i8, b_ptr: *const i8) {
+    use std::arch::asm;
+    let stride: usize = 64;
+    asm!(
+        "tileloadd tmm1, [{a} + {s}]",
+        "tileloadd tmm2, [{b} + {s}]",
+        "tdpbssd tmm0, tmm1, tmm2",
+        a = in(reg) a_ptr,
+        b = in(reg) b_ptr,
+        s = in(reg) stride,
+        options(nostack, preserves_flags)
+    );
+}
+
+/// AMX-INT8 GEMM: `c[M,N] i32 = a[M,K] i8 · b[K,N] i8`. The reusable int8 tile
+/// primitive; a Q8_0 W8A8 prefill wrapper (dequant block scales + quantize the
+/// activation) layers on top — a follow-up, since the quant prefill path is
+/// matvec-shaped today.
+///
+/// SAFETY: caller ensures AMX-INT8 is usable ([`amx_i8_gemm_usable`]); shapes
+/// satisfy `a.len()==m*k`, `b.len()==k*n`, `c.len()==m*n`.
+// Not yet wired into a quant prefill path (follow-up); kept available.
+#[allow(dead_code)]
+pub unsafe fn gemm_i8_amx(a: &[i8], b: &[i8], c: &mut [i32], m: usize, n: usize, k: usize) {
+    use std::arch::asm;
+    let cfg = TileConfig::new();
+    asm!("ldtilecfg [{c}]", c = in(reg) &cfg as *const TileConfig, options(nostack, readonly, preserves_flags));
+    let mut a_buf = [0i8; TM * TK_I8];
+    let mut b_buf = [0i8; (TK_I8 / 4) * (4 * TN)];
+    let mut c_buf = [0i32; TM * TN];
+    let stride: usize = 64;
+    let mut mb = 0;
+    while mb < m {
+        let mrows = (m - mb).min(TM);
+        let mut nb = 0;
+        while nb < n {
+            let ncols = (n - nb).min(TN);
+            asm!("tilezero tmm0", options(nostack, preserves_flags));
+            let mut kb = 0;
+            while kb < k {
+                pack_a_i8(a, &mut a_buf, m, k, mb, kb);
+                pack_b_i8_vnni(b, &mut b_buf, n, k, kb, nb);
+                amx_block_mul_i8(a_buf.as_ptr(), b_buf.as_ptr());
+                kb += TK_I8;
+            }
+            asm!(
+                "tilestored [{c} + {s}], tmm0",
+                c = in(reg) c_buf.as_mut_ptr(),
+                s = in(reg) stride,
+                options(nostack)
+            );
+            for i in 0..mrows {
+                for j in 0..ncols {
+                    c[(mb + i) * n + (nb + j)] = c_buf[i * TN + j];
+                }
+            }
+            nb += TN;
+        }
+        mb += TM;
+    }
+    asm!("tilerelease", options(nostack, preserves_flags));
+}
+
+/// Scalar int8 GEMM reference for the self-check (exact integer math).
+fn gemm_i8_ref(a: &[i8], b: &[i8], c: &mut [i32], m: usize, n: usize, k: usize) {
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0i32;
+            for p in 0..k {
+                acc += a[i * k + p] as i32 * b[p * n + j] as i32;
+            }
+            c[i * n + j] = acc;
+        }
+    }
+}
+
+/// Whether the AMX-INT8 GEMM is usable — cached. True only when the CPU has
+/// AMX-INT8, the OS granted tile permission, AND the kernel reproduces the
+/// scalar int8 reference EXACTLY on a probe (integer math is exact → a mismatch
+/// is a wrong encoding, fail closed).
+#[allow(dead_code)]
+pub fn amx_i8_gemm_usable() -> bool {
+    static USABLE: OnceLock<bool> = OnceLock::new();
+    *USABLE.get_or_init(|| {
+        if !amx_int8_supported() || !request_amx_tiledata() {
+            return false;
+        }
+        // Probe crossing M/N/K tiles (M=20, N=20, K=130 → tiles + remainders).
+        let (m, n, k) = (20usize, 20usize, 130usize);
+        let a: Vec<i8> = (0..m * k).map(|i| (((i as i64 * 2_654_435_761) % 255) - 127) as i8).collect();
+        let b: Vec<i8> = (0..k * n).map(|i| (((i as i64 * 40_503) % 255) - 127) as i8).collect();
+        let mut got = vec![0i32; m * n];
+        let mut want = vec![0i32; m * n];
+        gemm_i8_ref(&a, &b, &mut want, m, n, k);
+        // SAFETY: AMX-INT8 present + permitted above; shapes match.
+        unsafe { gemm_i8_amx(&a, &b, &mut got, m, n, k) };
+        got == want
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +521,22 @@ mod tests {
             let denom = b.abs().max(1e-4);
             assert!((a - b).abs() / denom <= 0.02, "amx {a} vs ref {b}");
         }
+    }
+
+    #[test]
+    fn amx_int8_probe_matches_reference_or_skips() {
+        if !amx_i8_gemm_usable() {
+            eprintln!("amx-int8: not usable on this host (expected off AMX-INT8 hw) — SKIP");
+            return;
+        }
+        // Fresh exact-int parity at a different shape.
+        let (m, n, k) = (33usize, 17usize, 128usize);
+        let a: Vec<i8> = (0..m * k).map(|i| ((i % 251) as i32 - 125) as i8).collect();
+        let b: Vec<i8> = (0..k * n).map(|i| ((i % 247) as i32 - 123) as i8).collect();
+        let mut got = vec![0i32; m * n];
+        let mut want = vec![0i32; m * n];
+        gemm_i8_ref(&a, &b, &mut want, m, n, k);
+        unsafe { gemm_i8_amx(&a, &b, &mut got, m, n, k) };
+        assert_eq!(got, want, "AMX-INT8 GEMM != scalar int8 reference");
     }
 }
