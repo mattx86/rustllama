@@ -7,6 +7,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, RwLock};
 
+/// Heterogeneous compute-tier scheduling (GPU/Metal → NPU → CPU spillover).
+pub mod tier;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -887,6 +890,24 @@ impl Default for InferenceConfig {
 #[serde(default)]
 pub struct PlacementConfig {
     pub overrides: Vec<TensorOverride>,
+    /// Heterogeneous scheduler tier priority, highest first. Empty (the
+    /// default) = `["gpu", "npu", "cpu"]` (throughput-first). The scheduler
+    /// fills each tier by capacity and spills the remainder to the next; the
+    /// CPU tier is the unbounded fallback. An NPU entry is inert until an NPU
+    /// is present. Accepts `gpu`/`metal`, `npu`, `cpu`.
+    pub tier_order: Vec<tier::TierKind>,
+}
+
+impl PlacementConfig {
+    /// The active tier order — the configured [`Self::tier_order`], or the
+    /// default GPU/Metal → NPU → CPU when it is empty.
+    pub fn effective_tier_order(&self) -> Vec<tier::TierKind> {
+        if self.tier_order.is_empty() {
+            tier::default_tier_order()
+        } else {
+            self.tier_order.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
