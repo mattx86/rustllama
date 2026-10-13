@@ -1263,6 +1263,130 @@ fn cuda_device_disabled(cuda_index: u32) -> bool {
     disabled.contains(&unified)
 }
 
+// ---------------------------------------------------------------
+// Multi-GPU tensor parallelism (column-parallel packed matvec)
+// ---------------------------------------------------------------
+//
+// Split the M output rows of a large matvec (the LM head, big prefill
+// projections) into contiguous bands — one per usable CUDA device — and run
+// each band CONCURRENTLY on its own device (separate CUDA context + per-device
+// matvec cache), then gather the output slices. This is COLUMN-parallel: the
+// output is PARTITIONED across devices, so there is no cross-device reduction
+// (the row-parallel variant that sums partial products — for a K-split — needs
+// an all-reduce and is a follow-up).
+//
+// WRITE-BLIND + UNVALIDATABLE on the author's hardware: every box in the
+// validation set is single-GPU, so this is inert there (fewer than 2 usable
+// devices → fail-closed to the single-device path). It is additionally
+// self-check-gated ([`tp_cuda_usable`]): on a real multi-GPU box it runs the
+// column-parallel matvec against the single-device result once and enables the
+// split only on a match, so a wrong cross-device encoding degrades to the
+// single-device path instead of corrupting output.
+
+/// Distinguishes a TP per-band cache key from the full-weight key on the same
+/// device (device 0's per-device cache IS the default cache, so a band and the
+/// full weight would otherwise collide under one key).
+const TP_KEY_SALT: usize = 0x5450_5F42_414e_4421; // "TP_BAND!"
+
+/// Minimum output rows (M) before the cross-device split pays its broadcast +
+/// launch overhead — large projections (LM head ≈ vocab rows) only.
+const TP_MIN_ROWS: usize = 4096;
+
+/// Usable CUDA devices (0-based, enabled) for multi-GPU execution.
+fn usable_cuda_devices() -> Vec<u32> {
+    (0..ck::device_count())
+        .filter(|&d| !cuda_device_disabled(d))
+        .collect()
+}
+
+/// Column-parallel multi-GPU tensor-parallel packed matvec. Returns `false`
+/// (leaving `out` possibly partial — the caller then overwrites it on the
+/// single-device path) when fewer than 2 devices are usable or any band fails.
+#[allow(clippy::too_many_arguments)]
+fn try_matvec_tp_cuda(
+    kind: ck::CudaPackedKind,
+    weight_key: usize,
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) -> bool {
+    let devices = usable_cuda_devices();
+    let ndev = devices.len();
+    if ndev < 2 || m < ndev {
+        return false;
+    }
+    let row_bytes = kind.row_bytes(k);
+    if row_bytes == 0 || w_bytes.len() < m * row_bytes || out.len() != m {
+        return false;
+    }
+    let per = m.div_ceil(ndev);
+    let ok = std::sync::atomic::AtomicBool::new(true);
+    std::thread::scope(|s| {
+        let mut out_rest: &mut [f32] = out;
+        let mut row0 = 0usize;
+        for (bi, &dev) in devices.iter().enumerate() {
+            if row0 >= m {
+                break;
+            }
+            let rows = if bi + 1 == ndev {
+                m - row0
+            } else {
+                per.min(m - row0)
+            };
+            let (band, rest) = out_rest.split_at_mut(rows);
+            out_rest = rest;
+            let w_slice = &w_bytes[row0 * row_bytes..(row0 + rows) * row_bytes];
+            // Per-band key: distinct from the full-weight key AND stable across
+            // calls (so each device re-hits its own band in the cache).
+            let band_key = weight_key ^ TP_KEY_SALT ^ row0;
+            let ok_ref = &ok;
+            s.spawn(move || {
+                if !try_matvec_packed_cuda_dev(dev, kind, band_key, w_slice, x, band, rows, k) {
+                    ok_ref.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+            row0 += rows;
+        }
+    });
+    ok.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the column-parallel multi-GPU matvec is usable — cached. True only
+/// with ≥2 usable CUDA devices AND a passing parity probe (TP == single-device
+/// on a Q8_0 weight), so a single-GPU box or a wrong split fails closed.
+fn tp_cuda_usable() -> bool {
+    static USABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *USABLE.get_or_init(|| {
+        if !cuda_active() || usable_cuda_devices().len() < 2 {
+            return false;
+        }
+        let kind = ck::CudaPackedKind::Q8_0;
+        let (m, k) = (512usize, 256usize);
+        // Valid Q8_0 weight from synthetic f32 (row-major 32-blocks).
+        let wf: Vec<f32> = (0..m * k)
+            .map(|i| (((i as i64 * 2_654_435_761) % 101) as f32 - 50.0) * 0.02)
+            .collect();
+        let mut w = vec![0u8; (m * k / 32) * 34];
+        rustllama_gguf::encode::encode_q8_0(&wf, &mut w);
+        let x: Vec<f32> = (0..k).map(|j| ((j % 13) as f32 - 6.0) * 0.1).collect();
+        let key = w.as_ptr() as usize;
+        let mut ref_out = vec![0f32; m];
+        let mut tp_out = vec![0f32; m];
+        if !try_matvec_packed_cuda(kind, key, &w, &x, &mut ref_out, m, k) {
+            return false;
+        }
+        if !try_matvec_tp_cuda(kind, key, &w, &x, &mut tp_out, m, k) {
+            return false;
+        }
+        ref_out
+            .iter()
+            .zip(&tp_out)
+            .all(|(a, b)| (a - b).abs() <= 1e-3 + 1e-3 * b.abs())
+    })
+}
+
 /// Single-row packed matvec on a SPECIFIC CUDA device (Phase 4 cross-GPU
 /// routing). Mirrors [`try_matvec_packed_cuda`] but targets `device_index`'s
 /// own resident cache. `false` on any miss so the caller falls through.
@@ -10621,6 +10745,17 @@ pub fn try_matvec_tensor_usm_f32(
             if matches!(ck_kind, ck::CudaPackedKind::Q4_K)
                 && q4k_w4a8_enabled()
                 && try_matvec_q4k_w4a8_cuda(wb.as_ptr() as usize, wb, x, out, m, k)
+            {
+                return true;
+            }
+            // Multi-GPU tensor parallelism (column-parallel): split the M output
+            // rows across ≥2 usable CUDA devices for a large matvec (LM head /
+            // big projection). Self-check-gated + fail-closed → inert on a
+            // single-GPU box; a miss falls through to the single-device matvec,
+            // which overwrites `out` fully.
+            if m >= TP_MIN_ROWS
+                && tp_cuda_usable()
+                && try_matvec_tp_cuda(ck_kind, wb.as_ptr() as usize, wb, x, out, m, k)
             {
                 return true;
             }
