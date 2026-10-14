@@ -106,6 +106,10 @@ struct SlotState {
     /// commit-on-completion path doesn't need to re-walk
     /// `history`.
     tokens_prefilled: u32,
+    /// Prompt tokens served from the APC / shared-prefix cache (the
+    /// page-aligned shared prefix length) — those positions skipped
+    /// prefill. Reported as `cache_hit_tokens` on completion.
+    cache_hit_tokens: u32,
 }
 
 /// Incoming-request message sent from `submit_streaming` callers
@@ -412,11 +416,26 @@ impl PagedBatchEngine {
             // serially; later slots can share whole pages with
             // earlier ones when their prompts overlap.
             let page_size_usz = self.page_size as usize;
-            let (shared_pages, shared_lcp) =
+            // Live-slot LCP (this batch's earlier slots) + vLLM APC
+            // (content-addressed, across all prior requests). Keep the longer.
+            let (live_pages, live_lcp) =
                 pick_shared_prefix_from_slots(&prompt, &slots, page_size_usz);
+            let prompt_u32: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
+            let chain = rustllama_models::apc::block_hash_chain(&prompt_u32, page_size_usz);
+            let apc_pages = self.shared.apc_acquire_prefix(&chain);
+            let apc_lcp = apc_pages.len() * page_size_usz;
+            let (shared_pages, shared_lcp) = if apc_lcp > 0 && apc_lcp >= live_lcp {
+                (apc_pages, apc_lcp)
+            } else {
+                if !apc_pages.is_empty() {
+                    self.shared.with_table_mut(|t| t.free(&apc_pages));
+                }
+                if !live_pages.is_empty() {
+                    self.shared.with_table_mut(|t| t.add_ref(&live_pages));
+                }
+                (live_pages, live_lcp)
+            };
             if !shared_pages.is_empty() {
-                self.shared
-                    .with_table_mut(|t| t.add_ref(&shared_pages));
                 cache.pin_shared_prefix(shared_pages, shared_lcp as u32);
             }
 
@@ -438,11 +457,19 @@ impl PagedBatchEngine {
                 });
             }
             let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+            // Register the prompt's full blocks (APC) — reusable by later slots/
+            // requests by content hash. Block `i` lives in page `i`.
+            if !chain.is_empty() {
+                let pages = cache.pages();
+                let n = chain.len().min(pages.len());
+                let entries: Vec<_> = (0..n).map(|i| (chain[i], pages[i])).collect();
+                self.shared.apc_register(&entries);
+            }
             let last = *prompt.last().expect("non-empty prompt");
             let tokens_prefilled = prompt.len() as u32;
             let next_pos = tokens_prefilled;
             let sampler = Sampler::new(sampling.clone());
-            let history: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
+            let history: Vec<u32> = prompt_u32;
             slots.push(SlotState {
                 sampling,
                 eos,
@@ -456,6 +483,7 @@ impl PagedBatchEngine {
                 prefill_ms,
                 decode_ms: 0.0,
                 tokens_prefilled,
+                cache_hit_tokens: shared_lcp as u32,
             });
         }
 
@@ -844,7 +872,7 @@ fn driver_loop(
                     prefill_ms: slot.state.prefill_ms,
                     decode_ms: slot.state.decode_ms,
                     tokens_prefilled: slot.state.tokens_prefilled,
-                    cache_hit_tokens: 0, // paged path has no prefix cache yet
+                    cache_hit_tokens: slot.state.cache_hit_tokens,
                     tokens_generated: slot.state.n_emitted,
                     tool_call_limit_hit: false,
                 };
@@ -918,9 +946,34 @@ fn admit_request(
     // pages.len() * page_size`. Round LCP down so partial-page
     // sharing isn't needed (it would force a copy of one page).
     let page_size = ctx.page_size as usize;
-    let (shared_pages, shared_lcp) = pick_shared_prefix(&prompt, active, page_size);
+    // Two sources of shared prefix, both page-aligned:
+    //  (1) live-slot LCP — share with a currently-active donor's pages.
+    //  (2) vLLM APC — content-addressed reuse across ALL prior requests,
+    //      INCLUDING completed ones whose pages were freed but not yet
+    //      physically reused (`PageTable::reacquire` revives their retained KV).
+    // The APC lookup acquires ref-held pages up front; we keep whichever source
+    // reuses more, releasing the other's refs.
+    let (live_pages, live_lcp) = pick_shared_prefix(&prompt, active, page_size);
+    let prompt_u32: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
+    let chain = rustllama_models::apc::block_hash_chain(&prompt_u32, page_size);
+    let apc_pages = ctx.shared.apc_acquire_prefix(&chain);
+    let apc_lcp = apc_pages.len() * page_size;
+
+    let (shared_pages, shared_lcp) = if apc_lcp > 0 && apc_lcp >= live_lcp {
+        // APC wins — its pages are already ref-held by apc_acquire_prefix.
+        (apc_pages, apc_lcp)
+    } else {
+        // Live-slot wins (or no APC hit): drop the speculative APC refs and
+        // add_ref the live donor's pages (the historical path's semantics).
+        if !apc_pages.is_empty() {
+            ctx.shared.with_table_mut(|t| t.free(&apc_pages));
+        }
+        if !live_pages.is_empty() {
+            ctx.shared.with_table_mut(|t| t.add_ref(&live_pages));
+        }
+        (live_pages, live_lcp)
+    };
     if !shared_pages.is_empty() {
-        ctx.shared.with_table_mut(|t| t.add_ref(&shared_pages));
         cache.pin_shared_prefix(shared_pages, shared_lcp as u32);
     }
 
@@ -949,11 +1002,21 @@ fn admit_request(
         });
     }
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+    // Register the prompt's full blocks in the APC index — the positions are now
+    // resident (shared prefix + just-prefilled suffix), block `i` in page `i` —
+    // so a later request with the same prefix content reacquires this KV instead
+    // of recomputing it, even after this request completes and frees its pages.
+    if !chain.is_empty() {
+        let pages = cache.pages();
+        let n = chain.len().min(pages.len());
+        let entries: Vec<_> = (0..n).map(|i| (chain[i], pages[i])).collect();
+        ctx.shared.apc_register(&entries);
+    }
     let last = *prompt.last().expect("non-empty prompt");
     let tokens_prefilled = prompt.len() as u32;
     let next_pos = tokens_prefilled;
     let sampler = Sampler::new(sampling.clone());
-    let history: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
+    let history: Vec<u32> = prompt_u32;
     Ok(SlotState {
         sampling,
         eos,
@@ -967,6 +1030,7 @@ fn admit_request(
         prefill_ms,
         decode_ms: 0.0,
         tokens_prefilled,
+        cache_hit_tokens: shared_lcp as u32,
     })
 }
 

@@ -233,13 +233,6 @@ impl PagedKvCache {
         }
     }
 
-    /// The pages assigned to this request, position-ascending (page `i` holds
-    /// positions `[i*page_size, (i+1)*page_size)`). Used by the APC layer to map
-    /// a block-hash chain to the pages holding each block for registration.
-    pub fn pages(&self) -> &[crate::page_table::PageId] {
-        &self.pages
-    }
-
     /// G2.4: Q8_0 paged variant. The cache itself only holds page IDs
     /// + seq_len + page_size — independent of how the store quantizes
     /// the cells, so the only difference vs `new_for` is the source
