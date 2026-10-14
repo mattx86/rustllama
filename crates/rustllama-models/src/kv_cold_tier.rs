@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 
 use crate::apc::BlockHash;
+use crate::kv_disk_tier::KvDiskTier;
 
 struct ColdEntry {
     bytes: Vec<f32>,
@@ -32,6 +33,9 @@ pub struct KvColdTier {
     cap_bytes: usize, // 0 = disabled
     hits: u64,
     misses: u64,
+    /// Optional disk tier UNDER the CPU tier: a block evicted from RAM is
+    /// demoted here instead of lost, and a RAM miss falls through to it.
+    disk: Option<KvDiskTier>,
 }
 
 impl KvColdTier {
@@ -41,6 +45,16 @@ impl KvColdTier {
 
     pub fn is_enabled(&self) -> bool {
         self.cap_bytes > 0
+    }
+
+    /// Attach a disk tier UNDER this CPU tier (blocks evicted from RAM demote to
+    /// it; RAM misses fall through to it). Requires the CPU tier enabled.
+    pub fn attach_disk(&mut self, disk: KvDiskTier) {
+        self.disk = Some(disk);
+    }
+
+    pub fn has_disk(&self) -> bool {
+        self.disk.is_some()
     }
 
     /// Set the byte budget (e.g. from config at engine init), evicting LRU
@@ -83,6 +97,10 @@ impl KvColdTier {
                 Some(k) => {
                     if let Some(e) = self.map.remove(&k) {
                         self.bytes -= e.bytes.len() * std::mem::size_of::<f32>();
+                        // Don't lose it — demote one tier down to disk.
+                        if let Some(disk) = self.disk.as_mut() {
+                            disk.demote(BlockHash(k), &e.bytes);
+                        }
                     }
                 }
                 None => break,
@@ -102,11 +120,17 @@ impl KvColdTier {
         if let Some(e) = self.map.get_mut(&hash.0) {
             e.last_used = clock;
             self.hits += 1;
-            Some(e.bytes.clone())
-        } else {
-            self.misses += 1;
-            None
+            return Some(e.bytes.clone());
         }
+        // RAM miss → fall through to the disk tier.
+        if let Some(disk) = self.disk.as_mut() {
+            if let Some(bytes) = disk.promote(hash) {
+                self.hits += 1;
+                return Some(bytes);
+            }
+        }
+        self.misses += 1;
+        None
     }
 
     pub fn contains(&self, hash: BlockHash) -> bool {
@@ -182,5 +206,22 @@ mod tests {
         let mut t = KvColdTier::new(8); // 2 f32
         t.demote(BlockHash(1), &[1.0, 2.0, 3.0, 4.0]); // 16 bytes > cap
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn cpu_tier_evicts_to_disk_and_promotes_back() {
+        use crate::kv_disk_tier::KvDiskTier;
+        let p = std::env::temp_dir()
+            .join(format!("rustllama-coldtier-disk-{}.bin", std::process::id()));
+        // CPU tier holds exactly one 2-elem (8-byte) block; disk holds more.
+        let mut t = KvColdTier::new(8);
+        t.attach_disk(KvDiskTier::new(&p, 2, 1 << 20).expect("disk"));
+        t.demote(BlockHash(1), &[1.0, 1.0]);
+        // Inserting block 2 evicts block 1 from RAM → it demotes to disk.
+        t.demote(BlockHash(2), &[2.0, 2.0]);
+        assert!(!t.contains(BlockHash(1)), "block 1 left the RAM tier");
+        // Promoting block 1 → RAM miss → served from the disk tier.
+        assert_eq!(t.promote(BlockHash(1)).as_deref(), Some([1.0f32, 1.0].as_slice()));
+        let _ = std::fs::remove_file(&p);
     }
 }

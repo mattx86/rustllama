@@ -13,6 +13,7 @@ pub mod llama_arch;
 pub mod llama_config;
 pub mod apc;
 pub mod kv_cold_tier;
+pub mod kv_disk_tier;
 pub mod mamba_arch;
 pub mod moe;
 pub mod page_table;

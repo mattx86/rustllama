@@ -630,6 +630,13 @@ pub struct InferenceConfig {
     /// Promoted to `RUSTLLAMA_KV_COLD_TIER_MB` at startup (a user-set env wins).
     #[serde(default)]
     pub kv_cold_tier_mb: u64,
+    /// LMCache DISK tier (under the CPU cold tier): cap in MB for a file-backed
+    /// store of blocks evicted from the RAM tier. Requires `kv_cold_tier_mb > 0`
+    /// (the disk tier absorbs RAM-tier overflow). `0` (default) = RAM tier only.
+    /// v1 is ephemeral (truncated per run). Promoted to
+    /// `RUSTLLAMA_KV_COLD_TIER_DISK_MB`.
+    #[serde(default)]
+    pub kv_cold_tier_disk_mb: u64,
     /// Memory-budget mode: `"manual"` (default) keeps the explicit
     /// knobs (`moe_expert_cache_mb`, `lock_ram_mb`) authoritative;
     /// `"auto"` derives the expert-cache budget at engine load from
@@ -893,6 +900,7 @@ impl Default for InferenceConfig {
             prefill_batched_hybrid: true,
             kv_persist_mb: 0,
             kv_cold_tier_mb: 0,
+            kv_cold_tier_disk_mb: 0,
             memory_budget: default_memory_budget(),
         }
     }

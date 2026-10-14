@@ -84,6 +84,21 @@ impl SharedPagedKv {
         self.cold.lock().expect("cold lock").set_cap_bytes(bytes);
     }
 
+    /// Attach the LMCache DISK tier under the CPU cold tier, backed by `path`,
+    /// capped at `cap_bytes`. Slots are one page each (`page_stride`), read from
+    /// the store geometry. Returns true if the disk tier opened. Call after
+    /// `set_cold_cap_bytes` (the disk tier only absorbs RAM-tier overflow).
+    pub fn enable_disk_tier(&self, path: &std::path::Path, cap_bytes: usize) -> bool {
+        let slot_elems = self.store.lock().expect("store lock").page_stride();
+        match crate::kv_disk_tier::KvDiskTier::new(path, slot_elems, cap_bytes) {
+            Some(disk) => {
+                self.cold.lock().expect("cold lock").attach_disk(disk);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Snapshot of the free-page count. Cheap (single mutex tap).
     /// Used by the engine's scheduler to decide whether to admit
     /// another slot — if free_pages drops below the admit threshold

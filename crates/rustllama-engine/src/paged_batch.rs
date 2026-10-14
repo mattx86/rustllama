@@ -241,6 +241,21 @@ impl PagedBatchEngine {
         {
             shared.set_cold_cap_bytes(mb * 1024 * 1024);
             tracing::info!(cap_mb = mb, "LMCache CPU cold tier enabled (paged serving engine)");
+            // Disk tier UNDER the CPU tier (absorbs RAM overflow). Ephemeral
+            // per-process file in the system temp dir.
+            if let Some(dmb) = std::env::var("RUSTLLAMA_KV_COLD_TIER_DISK_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&dmb| dmb > 0)
+            {
+                let path = std::env::temp_dir()
+                    .join(format!("rustllama-lmcache-{}.bin", std::process::id()));
+                if shared.enable_disk_tier(&path, dmb * 1024 * 1024) {
+                    tracing::info!(cap_mb = dmb, ?path, "LMCache disk tier enabled");
+                } else {
+                    tracing::warn!(?path, "LMCache disk tier could not be opened — RAM tier only");
+                }
+            }
         }
         let model = Arc::new(model);
         let model_id = path

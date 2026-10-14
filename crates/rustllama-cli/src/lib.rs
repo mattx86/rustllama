@@ -2312,6 +2312,18 @@ fn promote_memory_env_from_config(
             "kv_cold_tier_mb: LMCache CPU cold tier enabled (paged backend)"
         );
     }
+    if inference.kv_cold_tier_disk_mb > 0
+        && std::env::var_os("RUSTLLAMA_KV_COLD_TIER_DISK_MB").is_none()
+    {
+        std::env::set_var(
+            "RUSTLLAMA_KV_COLD_TIER_DISK_MB",
+            inference.kv_cold_tier_disk_mb.to_string(),
+        );
+        tracing::info!(
+            cap_mb = inference.kv_cold_tier_disk_mb,
+            "kv_cold_tier_disk_mb: LMCache disk tier enabled (paged backend)"
+        );
+    }
 }
 
 /// Generate an importance matrix by running calibration text through
