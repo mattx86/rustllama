@@ -174,6 +174,65 @@ for base in compiler/latest/lib compiler/latest/lib/x64; do
   done
 done
 
+# ---- Bundle the NPU vendor runtimes (dlopen'd at run time, so ldd never lists
+# them — they must be staged explicitly). x86_64 only: the Intel/AMD NPUs are
+# x86 (Core Ultra / Ryzen AI); aarch64 (DGX Spark) has none. Best-effort — a
+# release still succeeds without the SDKs (the rustllama-npu backend dlopen's
+# the runtime and fails soft). The NPU KERNEL driver (intel_vpu / amdxdna) must
+# be on the host for an NPU to appear; we ship only the userspace runtime.
+# NOTE: validated at release time on a Linux build host (no NPU HW on the
+# authoring box); symlink chains (libX.so -> .so.<soname> -> .so.<ver>) are
+# preserved with `cp -P` so SONAME-based NEEDED resolution works in ./lib.
+if [ "$ARCH" = "x86_64" ]; then
+  # Intel — OpenVINO (Apache-2.0). Root via OPENVINO_DIR / INTEL_OPENVINO_DIR or
+  # a conventional install path; accept either the toolkit root or `runtime`.
+  ov_rt=""
+  for cand in "${OPENVINO_DIR:-}" "${INTEL_OPENVINO_DIR:-}" /opt/openvino /opt/intel/openvino; do
+    [ -n "$cand" ] || continue
+    if   [ -d "$cand/runtime/lib/intel64" ]; then ov_rt="$cand/runtime"; break
+    elif [ -d "$cand/lib/intel64" ];         then ov_rt="$cand";         break; fi
+  done
+  if [ -n "$ov_rt" ]; then
+    mkdir -p "$STAGE/lib"
+    ovlib="$ov_rt/lib/intel64"
+    echo ">> bundling Intel NPU (OpenVINO) runtime from $ovlib"
+    # Full offload-ready set: core + C API + the NPU plugin/compiler/loaders +
+    # the GGUF/IR model frontends (so OpenVINO can ingest models for offload).
+    for stem in \
+      libopenvino libopenvino_c \
+      libopenvino_intel_npu_plugin libopenvino_intel_npu_vm_runtime \
+      libopenvino_intel_npu_compiler_loader libopenvino_intel_npu_compiler \
+      libopenvino_gguf_frontend libopenvino_ir_frontend; do
+      for f in "$ovlib/$stem".so "$ovlib/$stem".so.*; do
+        [ -e "$f" ] && cp -Pf "$f" "$STAGE/lib/" 2>/dev/null || true
+      done
+    done
+    # TBB (OpenVINO's threading runtime) + its own deps.
+    ovtbb="$ov_rt/3rdparty/tbb/lib"
+    if [ -d "$ovtbb" ]; then
+      for stem in libtbb libtbbbind_2_5 libtbbmalloc libhwloc; do
+        for f in "$ovtbb/$stem".so "$ovtbb/$stem".so.*; do
+          [ -e "$f" ] && cp -Pf "$f" "$STAGE/lib/" 2>/dev/null || true
+        done
+      done
+    fi
+  else
+    echo ">> NOTE: no OpenVINO SDK found (set OPENVINO_DIR) — Intel NPU runtime NOT bundled"
+  fi
+  # AMD — XRT (Apache-2.0). Optional; quiet when absent.
+  xrt_rt=""
+  for cand in "${XILINX_XRT:-}" /opt/xilinx/xrt; do
+    [ -n "$cand" ] && [ -d "$cand/lib" ] && { xrt_rt="$cand"; break; }
+  done
+  if [ -n "$xrt_rt" ]; then
+    mkdir -p "$STAGE/lib"
+    for f in "$xrt_rt/lib/libxrt_coreutil.so" "$xrt_rt/lib/libxrt_coreutil.so".*; do
+      [ -e "$f" ] && cp -Pf "$f" "$STAGE/lib/" 2>/dev/null || true
+    done
+    echo ">> bundling AMD NPU (XRT) runtime from $xrt_rt/lib"
+  fi
+fi
+
 nlibs=$(find "$STAGE/lib" -type f 2>/dev/null | wc -l | tr -d ' ')
 if [ "$nlibs" = "0" ]; then
   rmdir "$STAGE/lib" 2>/dev/null || true
@@ -188,6 +247,10 @@ else
   ensure_patchelf || { echo "ERROR: patchelf required to set the relocatable RPATH" >&2; exit 1; }
   patchelf --set-rpath '$ORIGIN/lib' "$STAGE/rustllama"
   for so in "$STAGE"/lib/*; do
+    # Skip symlinks: patchelf rewrites the target in place and would REPLACE the
+    # link with a full copy, duplicating the (large, e.g. 96 MB NPU compiler)
+    # real file. The real file in the chain is patched on its own iteration.
+    [ -L "$so" ] && continue
     [ -f "$so" ] || continue
     patchelf --set-rpath '$ORIGIN' "$so" 2>/dev/null || true
   done

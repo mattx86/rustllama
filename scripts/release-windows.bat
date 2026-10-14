@@ -6,6 +6,11 @@ REM   release\rustllama-<ver>-windows-x86_64.zip
 REM Self-contained: the desktop GUI + CLI + server (all backends compiled in)
 REM plus the bundled Intel oneAPI SYCL runtime DLLs, so it runs without an
 REM oneAPI install. CUDA is statically linked. Output lands in release\.
+REM
+REM NPU bundling (Intel OpenVINO): set OPENVINO_DIR (or INTEL_OPENVINO_DIR) to an
+REM OpenVINO SDK root before running this, and stage-redist bundles the NPU
+REM runtime too (user installs nothing). Unset => a loud warning + no NPU libs.
+REM AMD NPU: set XILINX_XRT likewise to bundle xrt_coreutil (optional).
 REM ===========================================================================
 pushd "%~dp0.."
 
@@ -22,7 +27,10 @@ echo ^>^> [1/3] building the GUI artifact (frontend + all-backends binary)...
 call "%~dp0_build.bat"
 if errorlevel 1 ( echo ERROR: GUI build failed & popd & exit /b 1 )
 
-echo ^>^> [2/3] staging Intel oneAPI redistributable SYCL DLLs...
+echo ^>^> [2/3] staging Intel oneAPI SYCL DLLs + bundled NPU runtimes...
+if not defined OPENVINO_DIR if not defined INTEL_OPENVINO_DIR (
+  echo    NOTE: OPENVINO_DIR not set - the Intel NPU runtime will NOT be bundled.
+)
 call "%~dp0build-env.bat" xtask stage-redist --out target\redist-staging
 if errorlevel 1 ( echo ERROR: stage-redist failed & popd & exit /b 1 )
 

@@ -29,5 +29,20 @@ RUN rpm --import https://yum.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW
 ENV ONEAPI_ROOT=/opt/intel/oneapi \
     PATH=/opt/intel/oneapi/compiler/latest/bin:$PATH
 
+# ---- Intel OpenVINO runtime (bundled into the x86_64 release for NPU support) --
+# The rustllama-npu backend dlopen's OpenVINO at run time; the release's
+# _release_package.sh stages this SDK's runtime libs next to the binary (option
+# A: Intel NPU support in the base x86_64 artifact, no user install), located via
+# OPENVINO_DIR. The ubuntu24 build (glibc 2.39) runs on Rocky 10 (glibc 2.39+) —
+# ABI-compatible for the C runtime. NOT needed to COMPILE (the crate dlopen's, no
+# SDK at build time); only the release staging reads it. Pinned to the version
+# validated on the Windows dev box. (aarch64 has no x86 NPU, so its image omits this.)
+ARG OPENVINO_BUILD=2026.4.1.22982.07f9c262b05
+RUN curl -fsSL "https://storage.openvinotoolkit.org/repositories/openvino/packages/2026.4.1/linux/openvino_toolkit_ubuntu24_${OPENVINO_BUILD}_x86_64.tgz" -o /tmp/openvino.tgz \
+    && mkdir -p /opt/openvino \
+    && tar -xzf /tmp/openvino.tgz -C /opt/openvino --strip-components=1 \
+    && rm -f /tmp/openvino.tgz
+ENV OPENVINO_DIR=/opt/openvino
+
 RUN nvcc --version | tail -2 && (icx --version 2>/dev/null | head -1 || echo "icx: source setvars in the build")
 WORKDIR /work
