@@ -230,31 +230,29 @@ impl PagedBatchEngine {
         ))?;
         let table = PageTable::new(total_pages, page_size);
         let shared = SharedPagedKv::new(store, table);
-        // LMCache: enable the CPU cold tier when configured (the CLI promotes
-        // `[inference].kv_cold_tier_mb` to this env var). Evicted KV blocks are
-        // then offloaded to RAM instead of lost, and promoted back on a later
-        // content-hash hit. `0`/unset = pure APC.
-        if let Some(mb) = std::env::var("RUSTLLAMA_KV_COLD_TIER_MB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&mb| mb > 0)
-        {
-            shared.set_cold_cap_bytes(mb * 1024 * 1024);
-            tracing::info!(cap_mb = mb, "LMCache CPU cold tier enabled (paged serving engine)");
-            // Disk tier UNDER the CPU tier (absorbs RAM overflow). Ephemeral
-            // per-process file in the system temp dir.
-            if let Some(dmb) = std::env::var("RUSTLLAMA_KV_COLD_TIER_DISK_MB")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&dmb| dmb > 0)
-            {
-                let path = std::env::temp_dir()
-                    .join(format!("rustllama-lmcache-{}.bin", std::process::id()));
-                if shared.enable_disk_tier(&path, dmb * 1024 * 1024) {
-                    tracing::info!(cap_mb = dmb, ?path, "LMCache disk tier enabled");
-                } else {
-                    tracing::warn!(?path, "LMCache disk tier could not be opened — RAM tier only");
-                }
+        // LMCache: auto-size the CPU cold tier from free RAM (no env var). The
+        // tier is DEMAND-FILLED — the budget is a CAP, not a preallocation, so a
+        // generous fraction is safe: it only holds KV blocks that were actually
+        // evicted and might be reused. Evicted blocks go to RAM instead of being
+        // lost, and promote back on a later content-hash hit. A disk tier under
+        // it (ephemeral per-process file) absorbs RAM-tier overflow at the same
+        // auto cap. Both off only when free RAM can't be read / is ~0.
+        let avail = rustllama_runtime::memory_info().available_bytes as usize;
+        // ≤ 1/8 of free RAM, capped at 8 GiB — plenty for KV-block reuse without
+        // crowding the model's working set.
+        let cold_cap = (avail / 8).min(8 * 1024 * 1024 * 1024);
+        if cold_cap >= 64 * 1024 * 1024 {
+            shared.set_cold_cap_bytes(cold_cap);
+            tracing::info!(
+                cap_mb = cold_cap / (1024 * 1024),
+                "LMCache CPU cold tier auto-enabled (paged serving engine)"
+            );
+            let path = std::env::temp_dir()
+                .join(format!("rustllama-lmcache-{}.bin", std::process::id()));
+            if shared.enable_disk_tier(&path, cold_cap) {
+                tracing::info!(cap_mb = cold_cap / (1024 * 1024), ?path, "LMCache disk tier auto-enabled");
+            } else {
+                tracing::warn!(?path, "LMCache disk tier could not be opened — RAM tier only");
             }
         }
         let model = Arc::new(model);

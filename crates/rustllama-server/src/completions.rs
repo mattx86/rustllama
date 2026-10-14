@@ -54,6 +54,14 @@ pub struct CompletionRequest {
     /// Legacy-completions `logprobs`: an integer 0..=5 giving the number of
     /// top alternative logprobs to return per token. `None` disables.
     pub logprobs: Option<u32>,
+    /// CacheBlend (rustllama extension): retrieved RAG context chunks, each a
+    /// document whose KV is precomputed in isolation and blended into the
+    /// prompt. They are prepended to `prompt` as context; when CacheBlend is
+    /// enabled (`[inference].cacheblend_recompute_ratio > 0`) the non-streaming
+    /// path reuses each chunk's cached KV instead of a full prefill. Ignored
+    /// (treated as plain prepended context) when empty or CacheBlend is off.
+    #[serde(default)]
+    pub documents: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,13 +140,45 @@ pub async fn completions(
         }
     };
 
-    let prompt_ids = match build_prompt_ids(tokenizer, &req.prompt, req.suffix.as_deref()) {
+    let query_ids = match build_prompt_ids(tokenizer, &req.prompt, req.suffix.as_deref()) {
         Ok(ids) => ids,
         Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
     };
 
-    // Prompt token count = length of the prompt_ids list we just assembled
-    // (already includes any FIM special tokens). Cheap and exact.
+    // CacheBlend RAG chunks: tokenize each document independently with NO
+    // special tokens (they appear mid-context, not at a sequence boundary) —
+    // this is what the isolated-at-position-0 KV precompute expects. Done here,
+    // pre-gate, so it overlaps any in-flight decode like the prompt tokenize.
+    let doc_chunks: Vec<Vec<i32>> = req
+        .documents
+        .iter()
+        .flatten()
+        .filter_map(|d| {
+            tokenizer
+                .encode(d, false)
+                .ok()
+                .filter(|ids| !ids.is_empty())
+                .map(|ids| ids.iter().map(|&v| v as i32).collect())
+        })
+        .collect();
+
+    // The full context = documents prepended to the query. Every existing
+    // generation arm uses this unchanged (documents become plain context); only
+    // the CacheBlend arm splits it back into (chunks, query) to reuse chunk KV.
+    let prompt_ids: Vec<u32> = if doc_chunks.is_empty() {
+        query_ids.clone()
+    } else {
+        let mut v: Vec<u32> = doc_chunks
+            .iter()
+            .flatten()
+            .map(|&t| t as u32)
+            .collect();
+        v.extend_from_slice(&query_ids);
+        v
+    };
+
+    // Prompt token count = length of the full assembled context (already
+    // includes any FIM special tokens + prepended documents). Cheap and exact.
     let prompt_tokens = prompt_ids.len() as u32;
     // Now wait on the gate; tokenization is already done.
     let permit = match pregate_permit.acquire_gate().await {
@@ -217,7 +257,33 @@ pub async fn completions(
     // model carries a NextN head, so this is `false` on non-MTP models.
     let spec_mtp = sampling.grammar.is_none() && cpu.mtp_speculative();
 
-    let (text, logprobs_out, completion_tokens) = if let Some(k) = want_logprobs {
+    let (text, logprobs_out, completion_tokens) = if !doc_chunks.is_empty() {
+        // CacheBlend arm (RAG `documents` present): reuse each chunk's isolated
+        // KV and blend it into the context, recomputing only the high-deviation
+        // tokens. `generate_text_cacheblend` self-falls-back to a normal prefill
+        // over the assembled prompt when CacheBlend is disabled or inapplicable,
+        // so this arm is always correct. Classic decode only (no logprobs/spec
+        // on the CacheBlend path in v1).
+        let chunks = doc_chunks.clone();
+        let suffix_i32: Vec<i32> = query_ids.iter().map(|&v| v as i32).collect();
+        let sampling_inner = sampling.clone();
+        let cpu_inner = cpu_for_blocking.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            cpu_inner.generate_text_cacheblend(&chunks, &suffix_i32, &sampling_inner)
+        })
+        .await;
+        let text = match res {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        let completion_tokens = cpu
+            .tokenizer()
+            .and_then(|t| t.encode(&text, false).ok())
+            .map(|ids| ids.len() as u32)
+            .unwrap_or(0);
+        (text, None, completion_tokens)
+    } else if let Some(k) = want_logprobs {
         // Logprobs path: drives `generate_token_ids_with_logprobs`, then
         // detokenizes each token id individually so we can build the
         // OpenAI shape's `tokens` / `token_logprobs` / `top_logprobs`

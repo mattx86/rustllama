@@ -2783,6 +2783,157 @@ pub fn measure_moe_vram_margin_candidates(
     })
 }
 
+/// Result of the CacheBlend recompute-ratio sweep.
+pub struct CacheblendMeasurement {
+    /// The smallest swept ratio whose blended next-token distribution stayed
+    /// coherent (mean cosine ≥ the bar) vs a full prefill. `0.0` = none cleared
+    /// the bar (or the model is hybrid / unsupported) → CacheBlend off.
+    pub chosen_ratio: f32,
+    /// `(ratio, mean cosine vs full prefill)` for every candidate — for the
+    /// CLI to print.
+    pub per_ratio_cos: Vec<(f32, f32)>,
+}
+
+/// Autotune the CacheBlend recompute ratio for a model: the SMALLEST `ratio`
+/// whose blended next-token distribution stays coherent (mean cosine ≥
+/// `coherence_min_cos`) against a full prefill, measured on synthetic
+/// multi-chunk contexts. This is a quality calibration, not a speed sweep —
+/// a smaller coherent ratio recomputes fewer tokens (faster RAG prefill) while
+/// preserving the output. `0.0` means the model was too sensitive at every
+/// candidate (CacheBlend stays off). Hybrid models are unsupported → `0.0`.
+///
+/// Mirrors the KV-dtype coherence gate: the forward is run on a forced
+/// contiguous F32-KV load (CacheBlend's requirement); `candidates` should be
+/// ascending.
+pub fn measure_cacheblend_ratio(
+    model_path: &Path,
+    ctx_size: usize,
+    candidates: &[f32],
+    coherence_min_cos: f32,
+) -> std::result::Result<CacheblendMeasurement, String> {
+    use rustllama_models::cacheblend::{CacheBlendConfig, ChunkPlacement};
+    use rustllama_models::llama_arch::KvCache;
+    use std::sync::Arc;
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let mut dot = 0f32;
+        let mut na = 0f32;
+        let mut nb = 0f32;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        dot / (na.sqrt() * nb.sqrt() + 1e-12)
+    }
+
+    if candidates.is_empty() {
+        return Err("measure_cacheblend_ratio: empty candidate list".into());
+    }
+
+    // CacheBlend requires contiguous F32 KV — force it for the measurement
+    // regardless of the model's tuned serve-time KV dtype.
+    let cpu = CpuEngine::load_with_options_and_layout(
+        model_path,
+        ctx_size,
+        false,
+        KvDtype::F32,
+        "contiguous",
+    )
+    .map_err(|e| format!("load failed: {e}"))?;
+    let model = cpu.model_arc();
+    if model.weights.is_hybrid() {
+        return Ok(CacheblendMeasurement { chosen_ratio: 0.0, per_ratio_cos: Vec::new() });
+    }
+    let vocab = model.cfg.vocab_size as u64;
+    if vocab < 2 {
+        return Err("measure_cacheblend_ratio: vocab too small".into());
+    }
+
+    // Deterministic synthetic token in [1, vocab).
+    let tok = |seed: u64| -> i32 {
+        let mut h = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= h >> 29;
+        h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h ^= h >> 32;
+        (1 + (h % (vocab - 1))) as i32
+    };
+
+    const N_CHUNKS: usize = 3;
+    const CHUNK_LEN: usize = 24;
+    const SUFFIX_LEN: usize = 12;
+    const N_CONTEXTS: usize = 2;
+
+    let mut sums = vec![0f32; candidates.len()];
+    let mut counted = 0usize;
+    for ctx_i in 0..N_CONTEXTS {
+        let base = (ctx_i as u64 + 1).wrapping_mul(1_000_003);
+        let mut chunks: Vec<Vec<i32>> = Vec::with_capacity(N_CHUNKS);
+        for c in 0..N_CHUNKS {
+            let mut v = Vec::with_capacity(CHUNK_LEN);
+            for j in 0..CHUNK_LEN {
+                v.push(tok(base + (c as u64) * 101 + j as u64));
+            }
+            chunks.push(v);
+        }
+        let mut assembled: Vec<i32> = Vec::new();
+        for c in &chunks {
+            assembled.extend_from_slice(c);
+        }
+        let suffix_start = assembled.len();
+        for j in 0..SUFFIX_LEN {
+            assembled.push(tok(base + 90_001 + j as u64));
+        }
+        if assembled.len() > ctx_size {
+            continue;
+        }
+
+        // Full-prefill reference.
+        let mut kv_ref = KvCache::new(&model.cfg, ctx_size);
+        let ref_logits = model.forward_prefill_batched_f32(&assembled, 0, &mut kv_ref);
+
+        // Isolated chunk snapshots → placements.
+        let mut placements: Vec<ChunkPlacement> = Vec::with_capacity(N_CHUNKS);
+        let mut off = 0usize;
+        for c in &chunks {
+            let mut scratch = KvCache::new(&model.cfg, c.len().max(1));
+            let _ = model.forward_prefill_batched_f32(c, 0, &mut scratch);
+            placements.push(ChunkPlacement {
+                offset: off,
+                snapshot: Arc::new(scratch.snapshot_prefix(c.len())),
+            });
+            off += c.len();
+        }
+
+        for (ri, &ratio) in candidates.iter().enumerate() {
+            let mut kv_cb = KvCache::new(&model.cfg, ctx_size);
+            let cb_logits = model.forward_prefill_cacheblend(
+                &assembled,
+                &placements,
+                suffix_start,
+                CacheBlendConfig { recompute_ratio: ratio, selection_layer: 1 },
+                &mut kv_cb,
+            );
+            sums[ri] += cosine(&cb_logits, &ref_logits);
+        }
+        counted += 1;
+    }
+
+    let per_ratio_cos: Vec<(f32, f32)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(ri, &r)| (r, if counted > 0 { sums[ri] / counted as f32 } else { 0.0 }))
+        .collect();
+    // Smallest ratio that cleared the coherence bar.
+    let chosen = per_ratio_cos
+        .iter()
+        .filter(|(_, c)| *c >= coherence_min_cos)
+        .map(|(r, _)| *r)
+        .fold(f32::INFINITY, f32::min);
+    let chosen_ratio = if chosen.is_finite() { chosen } else { 0.0 };
+    Ok(CacheblendMeasurement { chosen_ratio, per_ratio_cos })
+}
+
 #[cfg(test)]
 mod kv_coherence_tests {
     use super::*;

@@ -236,6 +236,21 @@ pub fn set_verdict(result: &mut TuningResult, name: &str, pass: bool) {
     result.kernel_verdicts.insert(name.to_string(), pass);
 }
 
+/// Read the autotuned CacheBlend recompute ratio for a model (keyed by file
+/// stem), if one has been fit. `Some(0.0)` means the stage ran and disabled
+/// CacheBlend (incoherent at every ratio); `None` means untuned.
+pub fn cacheblend_ratio_for(result: &TuningResult, model_stem: &str) -> Option<f32> {
+    result.cacheblend_recompute_ratio.get(model_stem).copied()
+}
+
+/// Record a model's autotuned CacheBlend recompute ratio. Used by the
+/// `tune --cacheblend` stage.
+pub fn set_cacheblend_ratio(result: &mut TuningResult, model_stem: &str, ratio: f32) {
+    result
+        .cacheblend_recompute_ratio
+        .insert(model_stem.to_string(), ratio);
+}
+
 // Compatibility shim: keep the original Q4_K-specific names that
 // existing tests + engine code reference. Both delegate to the new
 // kernel-agnostic helpers above.
@@ -439,6 +454,18 @@ pub struct TuningResult {
     /// `#[serde(default)]` → old caches still load, no schema bump.
     #[serde(default)]
     pub kernel_verdicts: HashMap<String, bool>,
+    /// Per-model autotuned CacheBlend recompute ratio (the fraction of chunk
+    /// tokens recomputed when blending cached RAG-chunk KV into a prompt),
+    /// keyed by model file stem like [`Self::moe_vram_margin`]. Fit by `tune
+    /// --cacheblend`: the SMALLEST swept ratio whose blended next-token
+    /// distribution stays coherent (cosine ≥ threshold) vs a full prefill on a
+    /// synthetic multi-chunk context. `0.0` = the model stayed incoherent at
+    /// every ratio → CacheBlend disabled for it. Absent = untuned. Applied when
+    /// `[tuning].auto_apply_cacheblend` is on, overriding
+    /// `[inference].cacheblend_recompute_ratio`.
+    /// `#[serde(default)]` → old caches still load, no schema bump.
+    #[serde(default)]
+    pub cacheblend_recompute_ratio: HashMap<String, f32>,
     /// ISO-8601 timestamp of the last successful tune.
     pub last_tuned: Option<String>,
     pub rustllama_version: String,
@@ -491,6 +518,7 @@ impl TuningResult {
             decision_calibration: HashMap::new(),
             per_device_perf: HashMap::new(),
             kernel_verdicts: HashMap::new(),
+            cacheblend_recompute_ratio: HashMap::new(),
             last_tuned: None,
             rustllama_version: env!("CARGO_PKG_VERSION").to_string(),
         }

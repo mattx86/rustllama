@@ -621,22 +621,18 @@ pub struct InferenceConfig {
     /// wins).
     #[serde(default)]
     pub kv_persist_mb: u64,
-    /// LMCache CPU cold tier (paged backend): cap in MB for an in-RAM store of
-    /// EVICTED KV blocks, keyed by content hash. When a block's page is about to
-    /// be physically reused, its bytes are offloaded here (demote) instead of
-    /// lost; a later request that shares that block promotes it back instead of
-    /// recomputing. `0` (default) disables the tier — pure APC (hot-only) then.
-    /// Only the paged backend uses it (the one that does block-level APC).
-    /// Promoted to `RUSTLLAMA_KV_COLD_TIER_MB` at startup (a user-set env wins).
+    /// CacheBlend — vLLM-style NON-prefix KV reuse for RAG. The fraction of
+    /// retrieved-chunk tokens to recompute when blending cached chunk KV into a
+    /// new context (`0.0`, default, disables CacheBlend → normal prefill). A
+    /// small ratio (`~0.15`) recovers most cross-chunk attention by recomputing
+    /// only the highest-deviation tokens; `1.0` recomputes everything (== a full
+    /// prefill). This is the **manual fallback**: `tune --cacheblend` measures
+    /// the smallest coherence-preserving ratio per model and, when
+    /// `[tuning].auto_apply_cacheblend` is on, that tuned winner overrides this
+    /// value. Quality-sensitive, so off by default until tuned. No env var — the
+    /// chunk-KV cache + the LMCache cold/disk tiers auto-size from free RAM.
     #[serde(default)]
-    pub kv_cold_tier_mb: u64,
-    /// LMCache DISK tier (under the CPU cold tier): cap in MB for a file-backed
-    /// store of blocks evicted from the RAM tier. Requires `kv_cold_tier_mb > 0`
-    /// (the disk tier absorbs RAM-tier overflow). `0` (default) = RAM tier only.
-    /// v1 is ephemeral (truncated per run). Promoted to
-    /// `RUSTLLAMA_KV_COLD_TIER_DISK_MB`.
-    #[serde(default)]
-    pub kv_cold_tier_disk_mb: u64,
+    pub cacheblend_recompute_ratio: f32,
     /// Memory-budget mode: `"manual"` (default) keeps the explicit
     /// knobs (`moe_expert_cache_mb`, `lock_ram_mb`) authoritative;
     /// `"auto"` derives the expert-cache budget at engine load from
@@ -899,8 +895,7 @@ impl Default for InferenceConfig {
             // which passed 2026-09-20).
             prefill_batched_hybrid: true,
             kv_persist_mb: 0,
-            kv_cold_tier_mb: 0,
-            kv_cold_tier_disk_mb: 0,
+            cacheblend_recompute_ratio: 0.0,
             memory_budget: default_memory_budget(),
         }
     }
@@ -1178,6 +1173,14 @@ pub struct TuningConfig {
     /// (un-calibrated) softmax confidence.
     #[serde(default = "default_true_serde")]
     pub auto_apply_decision_calibration: bool,
+    /// Apply the per-model autotuned CacheBlend recompute ratio (fitted by
+    /// `tune --cacheblend`: the smallest ratio whose blended next-token
+    /// distribution stays coherent vs a full prefill). When off (or no cache
+    /// entry), CacheBlend uses `[inference].cacheblend_recompute_ratio` (off by
+    /// default). A tuned `0.0` means the model was too sensitive → CacheBlend
+    /// stays off for it.
+    #[serde(default = "default_true_serde")]
+    pub auto_apply_cacheblend: bool,
 }
 
 fn default_true_serde() -> bool {
@@ -1201,6 +1204,7 @@ impl Default for TuningConfig {
             auto_apply_flash_v3_kv_tile: true,
             auto_apply_moe_placement: true,
             auto_apply_decision_calibration: true,
+            auto_apply_cacheblend: true,
         }
     }
 }

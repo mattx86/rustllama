@@ -246,6 +246,13 @@ pub struct CpuEngine {
     /// prefix pool to `<model>.rlkv`. Forks share the parent's pool
     /// concept but must not each write the sidecar.
     kv_persist_owner: bool,
+    /// CacheBlend recompute config for RAG `documents` requests. `None` =
+    /// CacheBlend off (the default; requests fall back to a normal prefill).
+    /// Set at serve load from the autotuned ratio (`tune --cacheblend` winner,
+    /// when `[tuning].auto_apply_cacheblend`) or the
+    /// `[inference].cacheblend_recompute_ratio` fallback, via
+    /// [`Self::set_cacheblend`]. Forks inherit it (plain `Copy`).
+    cacheblend: Option<rustllama_models::cacheblend::CacheBlendConfig>,
 }
 
 impl Drop for CpuEngine {
@@ -1685,6 +1692,7 @@ impl CpuEngine {
             lock_registry,
             expert_usage,
             kv_persist_owner: true,
+            cacheblend: None,
         };
         if let Ok(mut st) = engine.state.lock() {
             st.pool.set_max_bytes(pool_byte_cap);
@@ -2318,6 +2326,7 @@ impl CpuEngine {
             // to pin), so the expert learning cache never applies.
             expert_usage: None,
             kv_persist_owner: false,
+            cacheblend: None,
         })
     }
 
@@ -2480,6 +2489,7 @@ impl CpuEngine {
             // mmap-backed to pin), so the expert learning cache never applies.
             expert_usage: None,
             kv_persist_owner: false,
+            cacheblend: None,
         })
     }
 
@@ -3490,6 +3500,28 @@ impl CpuEngine {
         self.model.weights.is_hybrid() && self.model.weights.nextn_head.is_some()
     }
 
+    /// Set (or clear) the CacheBlend recompute ratio applied to RAG `documents`
+    /// requests. The serve load path calls this with the autotuned ratio (`tune
+    /// --cacheblend` winner when `[tuning].auto_apply_cacheblend`) or the
+    /// `[inference].cacheblend_recompute_ratio` fallback. `None`, or a ratio ≤ 0,
+    /// disables CacheBlend (requests fall back to a normal prefill). The
+    /// selection layer is fixed at 1 (layer-0 K carries no cross-attention
+    /// signal — see [`rustllama_models::cacheblend`]).
+    pub fn set_cacheblend(&mut self, recompute_ratio: Option<f32>) {
+        self.cacheblend = recompute_ratio.filter(|&r| r > 0.0).map(|r| {
+            rustllama_models::cacheblend::CacheBlendConfig {
+                recompute_ratio: r.min(1.0),
+                selection_layer: 1,
+            }
+        });
+    }
+
+    /// The loaded model handle, for in-crate measurement harnesses (e.g. the
+    /// CacheBlend coherence sweep). Not part of the public inference API.
+    pub(crate) fn model_arc(&self) -> Arc<LlamaModel> {
+        self.model.clone()
+    }
+
     /// Pair this engine with a draft model for speculative decoding.
     /// Grammar-free `generate`/`chat` requests then route through
     /// [`Engine::speculate`] with `k` candidates per round. Takes
@@ -3848,6 +3880,8 @@ impl CpuEngine {
             expert_usage: None,
             // One .rlkv writer per model, same reasoning.
             kv_persist_owner: false,
+            // Forks inherit the parent's tuned CacheBlend ratio (plain Copy).
+            cacheblend: self.cacheblend,
         }
     }
 
@@ -4401,6 +4435,191 @@ impl CpuEngine {
         Ok(out)
     }
 
+    /// CacheBlend generation (vLLM-style non-prefix KV reuse for RAG). The
+    /// prompt is `chunks` (retrieved documents, each with its KV precomputed in
+    /// isolation + cached content-addressed) followed by `suffix_ids` (the
+    /// query). Instead of a full prefill, the chunk KV is injected (re-roped to
+    /// its offset) and only the highest cross-attention-deviation tokens are
+    /// recomputed (see [`rustllama_models::cacheblend`]).
+    ///
+    /// Falls back to the normal [`Self::generate_token_ids`] (over the fully
+    /// assembled prompt) whenever CacheBlend can't apply: no ratio is set
+    /// ([`Self::set_cacheblend`] clear / 0 — the autotuned or config value),
+    /// there are no chunks or no query, the model is hybrid, or the KV backend
+    /// isn't contiguous F32. The fallback is byte-identical to a plain request,
+    /// so passing `documents` is always safe.
+    pub fn generate_token_ids_cacheblend(
+        &self,
+        chunks: &[Vec<i32>],
+        suffix_ids: &[i32],
+        n_new: u32,
+        sampling: &SamplingParams,
+    ) -> Result<Vec<u32>> {
+        // Assemble the full prompt once — the fallback path and the decode base.
+        let mut prompt_ids: Vec<i32> = Vec::new();
+        for c in chunks {
+            prompt_ids.extend_from_slice(c);
+        }
+        let suffix_start = prompt_ids.len();
+        prompt_ids.extend_from_slice(suffix_ids);
+
+        // Cheap disqualifiers → normal generation over the assembled prompt.
+        // The recompute ratio is the autotuned/config value applied at load via
+        // `set_cacheblend` (None ⇒ CacheBlend off for this model).
+        let blend = match self.cacheblend {
+            Some(b) => b,
+            None => return self.generate_token_ids(&prompt_ids, n_new, sampling),
+        };
+        if chunks.iter().all(|c| c.is_empty())
+            || suffix_ids.is_empty()
+            || suffix_start == 0
+            || prompt_ids.len() < 2
+            || self.model.weights.is_hybrid()
+            || self.kv_dtype_cached != KvDtype::F32
+        {
+            return self.generate_token_ids(&prompt_ids, n_new, sampling);
+        }
+
+        let _sycl_guard = install_sycl_dispatch_if_requested();
+        rustllama_models::accel::set_flash_attention(self.flash_attention);
+        rustllama_models::accel::set_n_gpu_layers(self.n_gpu_layers);
+        rustllama_models::accel::set_cpu_force_patterns(self.cpu_force_patterns.clone());
+        self.prepare_usm_for_sync_path();
+        let mut state = self.state.lock().expect("state lock");
+
+        // The backend layout (contiguous vs paged) is fixed at load; CacheBlend
+        // injects at absolute offsets into a contiguous F32 slab.
+        if !matches!(state.kv_backend, KvBackend::Contiguous(_)) {
+            drop(state);
+            return self.generate_token_ids(&prompt_ids, n_new, sampling);
+        }
+
+        let total_required = prompt_ids.len() + n_new as usize;
+        if total_required > self.max_ctx {
+            return Err(CpuEngineError::PromptTooLong {
+                prompt_len: prompt_ids.len(),
+                max_ctx: self.max_ctx,
+            });
+        }
+
+        // Precompute / fetch each chunk's isolated KV snapshot, content-addressed
+        // and shared across requests + forks (so a hot retrieved document is
+        // prefilled once). Offsets stack in chunk order.
+        let cache = cacheblend_cache_for_model(&self.model_id);
+        let mut placements: Vec<rustllama_models::cacheblend::ChunkPlacement> =
+            Vec::with_capacity(chunks.len());
+        let mut off = 0usize;
+        for c in chunks {
+            if c.is_empty() {
+                continue;
+            }
+            let snap = cacheblend_get_or_build_snapshot(&self.model, &cache, c);
+            placements.push(rustllama_models::cacheblend::ChunkPlacement {
+                offset: off,
+                snapshot: snap,
+            });
+            off += c.len();
+        }
+
+        let vocab = self.model.cfg.vocab_size;
+        let mut logits = vec![0f32; vocab];
+        let mut history: Vec<u32> = prompt_ids.iter().map(|&t| t as u32).collect();
+        let prompt_u32: Vec<u32> = history.clone();
+
+        // CacheBlend builds KV from chunk snapshots at absolute offsets, so it
+        // needs a FRESH cache — neutralize prefix reuse (resets KV, returns 0).
+        let _ = state.prepare_prefix_reuse(&prompt_u32, false, PREFIX_REUSE_MIN_TOKENS, 0);
+
+        let mut chrome = ChromeTracer::from_env();
+        let prefill_start = std::time::Instant::now();
+        // Selective-recompute prefill over the WHOLE prompt; its final-position
+        // logits seed decode (the query's last token is always in the suffix,
+        // hence always recomputed → its distribution is correct).
+        {
+            let KvBackend::Contiguous(kv) = &mut state.kv_backend else {
+                unreachable!("CacheBlend gate verified a contiguous backend");
+            };
+            let cb_logits = self.model.forward_prefill_cacheblend(
+                &prompt_ids,
+                &placements,
+                suffix_start,
+                blend,
+                kv,
+            );
+            logits.copy_from_slice(&cb_logits);
+        }
+        chrome.span("prefill_total", prefill_start);
+        let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+
+        let mut sampler = Sampler::new(sampling.clone());
+        let mut grammar = self.build_grammar(sampling);
+        // The full prompt occupies positions [0, len); the first sampled token
+        // lands at `len`.
+        let mut next_pos = prompt_ids.len() as u32;
+        let mut out = Vec::with_capacity(n_new as usize);
+        let mut decode_ms = 0.0f64;
+
+        for step in 0..n_new {
+            // `logits` holds the next-token distribution (CacheBlend prefill on
+            // step 0, the previous decode forward after).
+            let t_sample = std::time::Instant::now();
+            let next_tok = sampler.sample_with_grammar(&mut logits, &history, grammar.as_ref());
+            chrome.span(&format!("sample_{step}"), t_sample);
+            if let Some(g) = grammar.as_mut() {
+                g.advance(next_tok);
+            }
+            out.push(next_tok);
+            history.push(next_tok);
+            if let Some(eos) = self.model.cfg.eos_token_id {
+                if next_tok == eos {
+                    break;
+                }
+            }
+            if (next_pos as usize) >= self.max_ctx {
+                break;
+            }
+            // Forward the sampled token to produce the next distribution.
+            let t_fwd = std::time::Instant::now();
+            {
+                let EngineState {
+                    kv_backend, delta_net_cache, ..
+                } = &mut *state;
+                forward_one_via_backend_hybrid(
+                    &self.model,
+                    kv_backend,
+                    delta_net_cache.as_mut(),
+                    next_tok as i32,
+                    next_pos,
+                    &mut logits,
+                );
+            }
+            chrome.span(&format!("decode_fwd_{step}"), t_fwd);
+            decode_ms += t_fwd.elapsed().as_secs_f64() * 1000.0;
+            next_pos += 1;
+        }
+        chrome.flush();
+
+        let tool_call_limit_hit = grammar
+            .as_ref()
+            .map(|g| g.tool_call_limit_blocked())
+            .unwrap_or(false);
+        // `suffix_start` chunk tokens were reused (CacheBlend's "cache hit"); the
+        // rest of the prompt was recomputed.
+        let reused = suffix_start.min(prompt_ids.len());
+        self.commit_request_stats(RequestStats {
+            prefill_ms,
+            decode_ms,
+            tokens_prefilled: (prompt_ids.len().saturating_sub(reused)) as u32,
+            cache_hit_tokens: reused as u32,
+            tokens_generated: out.len() as u32,
+            tool_call_limit_hit,
+        });
+        // No `commit_snapshot`: the blended KV isn't a clean token prefix, so it
+        // must not poison the prefix pool for later exact-prefix requests.
+
+        Ok(out)
+    }
+
     /// Like [`generate_token_ids`] but also collects per-token logprob info
     /// (chosen-token logprob + top-K alternatives) for callers that want to
     /// expose `logprobs` in their response (the OpenAI `/v1/completions`
@@ -4889,6 +5108,77 @@ impl CpuEngine {
         let text = tokenizer.decode(&new_ids, true)?;
         Ok(text)
     }
+
+    /// Text-returning CacheBlend generation: `chunks` (retrieved documents) +
+    /// `suffix_ids` (the query). Delegates to [`Self::generate_token_ids_cacheblend`]
+    /// (which falls back to a normal prefill over the assembled prompt when
+    /// CacheBlend can't apply), then detokenizes. Safe to call unconditionally.
+    pub fn generate_text_cacheblend(
+        &self,
+        chunks: &[Vec<i32>],
+        suffix_ids: &[i32],
+        sampling: &SamplingParams,
+    ) -> Result<String> {
+        let tokenizer = self
+            .tokenizer
+            .as_deref()
+            .ok_or(CpuEngineError::NoTokenizer("generate_text_cacheblend"))?;
+        let new_ids =
+            self.generate_token_ids_cacheblend(chunks, suffix_ids, sampling.max_tokens, sampling)?;
+        let text = tokenizer.decode(&new_ids, true)?;
+        Ok(text)
+    }
+}
+
+/// Per-model content-addressed chunk-KV cache registry. Keyed by model id so a
+/// chunk's isolated KV (which depends only on (model, tokens)) is shared across
+/// every request and every `fork_for_concurrent_use` clone. The byte cap
+/// AUTO-SIZES from free RAM (no env var) — the cache is demand-filled and LRU,
+/// so the cap just bounds how many hot documents' KV it retains.
+fn cacheblend_cache_for_model(
+    model_id: &str,
+) -> Arc<Mutex<rustllama_models::cacheblend::ChunkKvCache>> {
+    static REG: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<String, Arc<Mutex<rustllama_models::cacheblend::ChunkKvCache>>>>,
+    > = std::sync::OnceLock::new();
+    let reg = REG.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    // ≤ 1/16 of free RAM, capped at 4 GiB. Demand-filled + LRU, so this only
+    // bounds retention; a tiny box simply caches fewer chunks.
+    let avail = rustllama_runtime::memory_info().available_bytes as usize;
+    let cap_bytes = (avail / 16).min(4 * 1024 * 1024 * 1024);
+    let mut map = reg.lock().expect("cacheblend registry");
+    map.entry(model_id.to_string())
+        .or_insert_with(|| {
+            Arc::new(Mutex::new(rustllama_models::cacheblend::ChunkKvCache::new(cap_bytes)))
+        })
+        .clone()
+}
+
+/// Fetch (or compute + cache) one chunk's isolated KV snapshot — a standalone
+/// F32-KV prefill of the chunk at position 0. The cache lock is held only for
+/// the get/insert, never across the (slow) prefill.
+fn cacheblend_get_or_build_snapshot(
+    model: &LlamaModel,
+    cache: &Mutex<rustllama_models::cacheblend::ChunkKvCache>,
+    chunk: &[i32],
+) -> Arc<rustllama_models::llama_arch::KvSnapshot> {
+    let hash = rustllama_models::cacheblend::chunk_content_hash(chunk);
+    {
+        let mut c = cache.lock().expect("chunk cache lock");
+        if let Some(snap) = c.get(hash) {
+            return snap;
+        }
+    }
+    // Miss: compute the isolated snapshot (no cache lock held). A standalone
+    // prefill at position 0 leaves the chunk's KV for re-roped placement.
+    let mut scratch = rustllama_models::llama_arch::KvCache::new(&model.cfg, chunk.len().max(1));
+    let _ = model.forward_prefill_batched_f32(chunk, 0, &mut scratch);
+    let snap = Arc::new(scratch.snapshot_prefix(chunk.len()));
+    cache
+        .lock()
+        .expect("chunk cache lock")
+        .insert(hash, snap.clone());
+    snap
 }
 
 /// Walk `prefill[effective..]` in chunks of `chunk_size` tokens, calling

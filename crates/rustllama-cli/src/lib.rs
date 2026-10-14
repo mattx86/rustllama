@@ -537,6 +537,14 @@ pub enum Command {
         /// SYCL MoE only; a `tune --all` sub-stage (Stage 5b).
         #[arg(long)]
         moe_vram_margin: bool,
+        /// Autotune the CacheBlend recompute ratio: measure the SMALLEST ratio
+        /// whose blended next-token distribution stays coherent (cosine vs a
+        /// full prefill) on synthetic multi-chunk contexts, and persist it per
+        /// model under `cacheblend_recompute_ratio`. The serve path applies it
+        /// to RAG `documents` requests when `[tuning].auto_apply_cacheblend` is
+        /// on. A `tune --all` sub-stage (Stage 2b). Dense F32-KV models only.
+        #[arg(long)]
+        cacheblend: bool,
         /// **Comprehensive autotune**: run every sweep in coordinate-
         /// descent order — kernel LWS → kv_dtype → flash_attention →
         /// kv_cache_layout → placement → batch_size → threads — and
@@ -1270,6 +1278,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             validate_kernels,
             dev_attn,
             moe_vram_margin,
+            cacheblend,
             all,
             skip_cached,
             force,
@@ -1345,6 +1354,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 validate_kernels,
                 dev_attn,
                 moe_vram_margin,
+                cacheblend,
                 all,
             ]
             .iter()
@@ -1357,7 +1367,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                      --prefix-snapshots / --kv-page-size / --flash-v3-kv-tile / \
                      --moe-placement / --speculative-mtp / --ssm-prefill-chunked / \
                      --decision-calibrate / --per-device-perf / --validate-kernels / \
-                     --dev-attn / --moe-vram-margin / --all are exclusive; \
+                     --dev-attn / --moe-vram-margin / --cacheblend / --all are exclusive; \
                      pick at most one"
                 );
             }
@@ -1515,6 +1525,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     decode_tokens,
                     repeats,
                 );
+            }
+            if cacheblend {
+                return cmd_tune_cacheblend(&config_path, model);
             }
             if threads {
                 return cmd_tune_threads(
@@ -2302,28 +2315,10 @@ fn promote_memory_env_from_config(
             "kv_persist_mb: warm-restart KV persistence enabled"
         );
     }
-    if inference.kv_cold_tier_mb > 0 && std::env::var_os("RUSTLLAMA_KV_COLD_TIER_MB").is_none() {
-        std::env::set_var(
-            "RUSTLLAMA_KV_COLD_TIER_MB",
-            inference.kv_cold_tier_mb.to_string(),
-        );
-        tracing::info!(
-            cap_mb = inference.kv_cold_tier_mb,
-            "kv_cold_tier_mb: LMCache CPU cold tier enabled (paged backend)"
-        );
-    }
-    if inference.kv_cold_tier_disk_mb > 0
-        && std::env::var_os("RUSTLLAMA_KV_COLD_TIER_DISK_MB").is_none()
-    {
-        std::env::set_var(
-            "RUSTLLAMA_KV_COLD_TIER_DISK_MB",
-            inference.kv_cold_tier_disk_mb.to_string(),
-        );
-        tracing::info!(
-            cap_mb = inference.kv_cold_tier_disk_mb,
-            "kv_cold_tier_disk_mb: LMCache disk tier enabled (paged backend)"
-        );
-    }
+    // LMCache cold/disk tiers + the CacheBlend chunk-KV cache auto-size from
+    // free RAM at load (no env var, no manual MB). The CacheBlend recompute
+    // ratio is applied separately via `cpu.set_cacheblend(...)` from the tuner
+    // winner / config fallback (see the serve load path).
 }
 
 /// Generate an importance matrix by running calibration text through
@@ -4099,6 +4094,19 @@ async fn serve(
                 );
             }
             cpu.set_flash_attention(applied_flash);
+            // CacheBlend recompute ratio for RAG `documents` requests. Tuner
+            // winner (gated by auto_apply_cacheblend) overrides the config
+            // fallback; a tuned 0.0 means the model was too sensitive → off.
+            let applied_cacheblend =
+                cacheblend_ratio_from_cache_or_default(cfg.tuning.auto_apply_cacheblend, &model_key)
+                    .unwrap_or(cfg.inference.cacheblend_recompute_ratio);
+            cpu.set_cacheblend(Some(applied_cacheblend));
+            if applied_cacheblend > 0.0 {
+                tracing::info!(
+                    ratio = applied_cacheblend,
+                    "CacheBlend enabled (non-prefix RAG KV reuse on `documents` requests)"
+                );
+            }
             // Pull CPU-force patterns from
             // `[inference].placement.overrides` FIRST — the placement
             // decision below (VRAM-fit planner + first-load probe)
@@ -6251,6 +6259,76 @@ pub fn persist_moe_vram_margin_winner(model_key: &str, margin_bytes: u64) -> any
     Ok(())
 }
 
+/// Persist the per-model autotuned CacheBlend recompute ratio into the tuner
+/// cache, keyed by model stem (mirrors `persist_moe_vram_margin_winner`). The
+/// serve path reads it via `cacheblend_ratio_from_cache_or_default` and applies
+/// it with `cpu.set_cacheblend`. Best-effort: a missing cache dir is a warned
+/// no-op.
+pub fn persist_cacheblend_winner(model_key: &str, ratio: f32) -> anyhow::Result<()> {
+    use rustllama_tuner::{load_cache, save_cache, TuningResult};
+    let Some(cache_dir) = rustllama_tuner::default_cache_dir() else {
+        tracing::warn!("no tuner cache dir resolvable; skipping cacheblend persistence");
+        return Ok(());
+    };
+    let (key, device) = rustllama_tuner::cache_context();
+    std::fs::create_dir_all(&cache_dir)?;
+    let mut tuning = load_cache(&cache_dir, &key)?
+        .unwrap_or_else(|| TuningResult::empty(key.clone(), device.clone()));
+    rustllama_tuner::set_cacheblend_ratio(&mut tuning, model_key, ratio);
+    tuning.last_tuned = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| format!("{}", d.as_secs()));
+    save_cache(&cache_dir, &tuning)?;
+    Ok(())
+}
+
+/// `tune --cacheblend` (a `tune --all` sub-stage): autotune the CacheBlend
+/// recompute ratio — the SMALLEST ratio whose blended next-token distribution
+/// stays coherent (cosine ≥ 0.98) vs a full prefill on synthetic multi-chunk
+/// contexts — and persist it per model. Dense F32-KV models only; hybrid /
+/// unsupported models persist `0.0` (CacheBlend off). The serve path applies the
+/// winner to RAG `documents` requests when `[tuning].auto_apply_cacheblend` is on.
+fn cmd_tune_cacheblend(
+    config_path: &std::path::Path,
+    model_override: Option<String>,
+) -> anyhow::Result<()> {
+    use rustllama_engine::measurement::measure_cacheblend_ratio;
+
+    let cfg = rustllama_config::load(config_path).unwrap_or_default();
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
+    let model_key = model_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown-model")
+        .to_string();
+
+    // Ascending candidates: pick the smallest coherent one.
+    let candidates = [0.1f32, 0.15, 0.25, 0.4, 0.6];
+    const COHERENCE_MIN_COS: f32 = 0.98;
+    let ctx_size = (cfg.inference.ctx_size as usize).max(256);
+
+    println!("rustllama tune --cacheblend");
+    println!("  model      = {}", model_path.display());
+    println!("  candidates = {candidates:?}");
+    println!("  coherence  = cosine >= {COHERENCE_MIN_COS} vs full prefill");
+
+    let m = measure_cacheblend_ratio(&model_path, ctx_size, &candidates, COHERENCE_MIN_COS)
+        .map_err(|e| anyhow::anyhow!("cacheblend measurement failed: {e}"))?;
+    for (r, cos) in &m.per_ratio_cos {
+        println!("  ratio {r:<4} -> mean cosine {cos:.5}");
+    }
+    if m.chosen_ratio > 0.0 {
+        println!("  WINNER: recompute_ratio = {} (coherent)", m.chosen_ratio);
+    } else {
+        println!(
+            "  WINNER: CacheBlend DISABLED (no swept ratio stayed coherent / unsupported model)"
+        );
+    }
+    persist_cacheblend_winner(&model_key, m.chosen_ratio)?;
+    Ok(())
+}
+
 /// `tune --moe-vram-margin` (a `tune --all` sub-stage): sweep the MoE
 /// tiered-expert VRAM margin (headroom reserved below free VRAM) and persist the
 /// per-model margin whose decode tok/s is best. A smaller margin promotes more
@@ -7607,6 +7685,10 @@ fn cmd_tune_all(
         (Some(t), Some(k)) => t.moe_vram_margin.contains_key(k),
         _ => false,
     };
+    let has_cacheblend = match (cached.as_ref(), tune_model_key.as_ref()) {
+        (Some(t), Some(k)) => t.cacheblend_recompute_ratio.contains_key(k),
+        _ => false,
+    };
     let has_batch_size = cached.as_ref().and_then(|t| t.batch_size).is_some();
     let has_threads = cached.as_ref().and_then(|t| t.threads.clone()).is_some();
     let has_decision_calibration = cached
@@ -7785,6 +7867,26 @@ fn cmd_tune_all(
             &args_2,
         ) {
             tracing::warn!(error = %e, "stage 2 (kv_dtype) failed; continuing");
+        }
+    }
+
+    println!();
+    println!("Stage 2b/10: cacheblend  (smallest RAG-chunk recompute ratio that stays coherent)");
+    println!("--------");
+    if skip(has_cacheblend) {
+        println!("(skipped: cacheblend winner already cached)");
+    } else {
+        // Coherence-only (forces contiguous F32 KV internally); no decode
+        // sizing. Dense non-hybrid models only — hybrids persist 0.0 (off).
+        if let Err(e) = run_tune_stage_subprocess(
+            config_path,
+            &model_clone_for_stages,
+            "--cacheblend",
+            thorough,
+            "2b (cacheblend)",
+            &[],
+        ) {
+            tracing::warn!(error = %e, "stage 2b (cacheblend) failed; continuing");
         }
     }
 
@@ -8518,6 +8620,22 @@ pub fn speculative_mtp_from_cache_or_default_to(
         .ok()
         .flatten()
         .and_then(|t| t.speculative_mtp)
+}
+
+/// The autotuned CacheBlend recompute ratio for `model_stem` from the tuner
+/// cache, when `[tuning].auto_apply_cacheblend` is on. `Some(0.0)` means the
+/// stage ran and disabled CacheBlend; `None` means untuned (caller falls back
+/// to `[inference].cacheblend_recompute_ratio`).
+pub fn cacheblend_ratio_from_cache_or_default(auto_apply: bool, model_stem: &str) -> Option<f32> {
+    if !auto_apply {
+        return None;
+    }
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    rustllama_tuner::load_cache(&cache_dir, &key)
+        .ok()
+        .flatten()
+        .and_then(|t| rustllama_tuner::cacheblend_ratio_for(&t, model_stem))
 }
 
 pub fn ssm_prefill_chunked_from_cache_or_default(auto_apply: bool) -> Option<bool> {

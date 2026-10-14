@@ -9507,6 +9507,394 @@ impl LlamaModel {
         );
     }
 
+    /// CacheBlend selective-recompute prefill (F32 KV, dense + MoE, full-rope).
+    ///
+    /// `tokens` is the full assembled context — the concatenated chunk tokens
+    /// followed by the query suffix. `placements` give each chunk's isolated KV
+    /// snapshot and its absolute offset; they must be contiguous and cover
+    /// `[0, suffix_start)`, where `suffix_start` is the first suffix position
+    /// (`= Σ chunk lens`). The suffix `[suffix_start, tokens.len())` has no
+    /// cached KV and is always recomputed.
+    ///
+    /// Schedule (see [`crate::cacheblend`]): inject each chunk's cached KV at its
+    /// offset with K re-rotated to that position; recompute every token through
+    /// layers `0..=selection_layer`; measure per-token K deviation at
+    /// `selection_layer` (fresh vs isolated-cached); keep the top
+    /// `ceil(recompute_ratio · n_chunk)` chunk tokens (the HKVD set) plus the
+    /// whole suffix; for layers above `selection_layer`, recompute only that
+    /// subset and reuse the injected cached KV for the rest. At
+    /// `recompute_ratio >= 1.0` (or no chunks) the subset never shrinks, so the
+    /// pass is a full prefill — the correctness anchor the parity test pins.
+    ///
+    /// Returns the next-token logits for the final position (always in the
+    /// recomputed set, since the suffix is). Leaves `kv` holding the blended KV
+    /// (fresh for recomputed positions, isolated-cached for the rest) so decode
+    /// can continue from `seq_len = tokens.len()`.
+    pub fn forward_prefill_cacheblend(
+        &self,
+        tokens: &[i32],
+        placements: &[crate::cacheblend::ChunkPlacement],
+        suffix_start: usize,
+        blend: crate::cacheblend::CacheBlendConfig,
+        kv: &mut KvCache,
+    ) -> Vec<f32> {
+        assert!(
+            !self.weights.is_hybrid(),
+            "CacheBlend prefill not supported for hybrid arch `{}`",
+            self.cfg.arch
+        );
+        let cfg = &self.cfg;
+        let n = tokens.len();
+        let vocab = cfg.vocab_size;
+        if n == 0 {
+            return vec![0.0f32; vocab];
+        }
+        let d = cfg.d_model;
+        let n_heads = cfg.n_heads;
+        let n_kv_heads = cfg.n_kv_heads;
+        let head_dim = cfg.head_dim;
+        let d_q = n_heads * head_dim;
+        let d_kv = n_kv_heads * head_dim;
+        let d_ff = cfg.d_ff;
+        let max_ctx = kv.max_ctx;
+        assert!(n <= max_ctx, "CacheBlend context {n} exceeds max_ctx {max_ctx}");
+        let suffix_start = suffix_start.min(n);
+
+        // --- 1. Inject each chunk's isolated KV at its offset (K re-roped). ---
+        for pl in placements {
+            self.inject_chunk_reroped(kv, pl);
+        }
+        kv.seq_len = kv.seq_len.max(n);
+
+        // The attention/FFN block list (dense or MoE), uniform via AttnBlock.
+        let attn_views: Vec<&dyn AttnBlock> =
+            if let Some(mbs) = self.weights.moe_blocks.as_ref() {
+                mbs.iter().map(|b| b as &dyn AttnBlock).collect()
+            } else {
+                self.weights.blocks.iter().map(|b| b as &dyn AttnBlock).collect()
+            };
+        let n_layers = attn_views.len();
+        let sel_layer = blend.selection_layer.min(n_layers.saturating_sub(1));
+        // `exact` ⇒ never shrink the recompute set ⇒ the pass is a full prefill.
+        let exact = blend.recompute_ratio >= 1.0 || suffix_start == 0;
+
+        // Capture the isolated-cached K at the selection layer (post-inject,
+        // pre-forward) so the HKVD deviation can compare against it after the
+        // forward overwrites that layer's slab. Only chunk positions carry
+        // cached KV; suffix positions stay zero (always recomputed anyway).
+        let mut cached_sel_k = vec![0f32; n * d_kv];
+        if !exact {
+            if let KvLayer::F32 { k, .. } = &kv.layers[sel_layer] {
+                for p in 0..suffix_start {
+                    for h in 0..n_kv_heads {
+                        let s = (h * max_ctx + p) * head_dim;
+                        let dpos = p * d_kv + h * head_dim;
+                        cached_sel_k[dpos..dpos + head_dim].copy_from_slice(&k[s..s + head_dim]);
+                    }
+                }
+            }
+        }
+
+        // MoE scratch (single-token slots; untouched for dense models).
+        let moe_cfg = cfg.moe.clone();
+        let (mut moe_gate_one, mut moe_up_one, mut moe_ff_one, mut moe_down_one) =
+            if moe_cfg.is_some() {
+                (vec![0f32; d_ff], vec![0f32; d_ff], vec![0f32; d_ff], vec![0f32; d])
+            } else {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            };
+        let (mut moe_expert_logits, mut moe_routed_picks) = if let Some(m) = moe_cfg.as_ref() {
+            (vec![0f32; m.n_experts as usize], Vec::with_capacity(m.n_experts_used as usize))
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        // --- 2. Recompute set. Starts as every position; shrinks after the
+        //        selection layer to HKVD ∪ suffix (unless `exact`). ---
+        let mut r_idx: Vec<usize> = (0..n).collect();
+        // True while the recompute set is still every position (the warm-up
+        // layers 0..=selection_layer, and the whole `exact` path): the queries
+        // then form a contiguous 0..n ramp, so one batched GPU/CPU flash-prefill
+        // call handles attention. Flipped false once the set shrinks to the
+        // scattered HKVD subset.
+        let mut r_is_full = true;
+        // Hidden state for the recompute set, compacted row-major `[|R|, d]`.
+        let mut h_r = vec![0f32; n * d];
+        for (i, &tok) in tokens.iter().enumerate() {
+            k::embed_lookup_tensor(
+                &self.weights.token_embd, &[tok], &mut h_r[i * d..(i + 1) * d], d,
+            );
+        }
+
+        for layer_idx in 0..n_layers {
+            crate::accel::set_current_layer_idx(layer_idx as u32);
+            let block = attn_views[layer_idx];
+            let nr = r_idx.len();
+
+            // Stage 1: pre-attn rmsnorm (per compact row).
+            let mut h_norm = vec![0f32; nr * d];
+            for j in 0..nr {
+                k::rmsnorm_f32_row(
+                    &h_r[j * d..(j + 1) * d], block.attn_norm(),
+                    &mut h_norm[j * d..(j + 1) * d], cfg.rms_eps,
+                );
+            }
+            // Stage 2: batched Q/K/V projections over the compact set.
+            let mut q_r = vec![0f32; nr * d_q];
+            let mut k_rr = vec![0f32; nr * d_kv];
+            let mut v_r = vec![0f32; nr * d_kv];
+            matvec_tensor_batched_dispatch(block.w_q(), &h_norm, &mut q_r, d_q, d, nr);
+            matvec_tensor_batched_dispatch(block.w_k(), &h_norm, &mut k_rr, d_kv, d, nr);
+            matvec_tensor_batched_dispatch(block.w_v(), &h_norm, &mut v_r, d_kv, d, nr);
+
+            // Stage 3: bias + qk-head-norm + RoPE at each row's REAL position,
+            // then write the fresh K/V into the live slab at that position.
+            {
+                let (kslab, vslab) = match &mut kv.layers[layer_idx] {
+                    KvLayer::F32 { k, v } => (k, v),
+                    _ => unreachable!("CacheBlend requires F32 KV"),
+                };
+                for j in 0..nr {
+                    let pos = r_idx[j] as u32;
+                    let q_row = &mut q_r[j * d_q..(j + 1) * d_q];
+                    let k_row = &mut k_rr[j * d_kv..(j + 1) * d_kv];
+                    let v_row = &mut v_r[j * d_kv..(j + 1) * d_kv];
+                    if let Some(bq) = block.b_q() {
+                        k::add_inplace_f32(q_row, bq);
+                    }
+                    if let Some(bk) = block.b_k() {
+                        k::add_inplace_f32(k_row, bk);
+                    }
+                    if let Some(bv) = block.b_v() {
+                        k::add_inplace_f32(v_row, bv);
+                    }
+                    apply_qk_head_norm(
+                        block.q_norm(), block.k_norm(), q_row, k_row,
+                        n_heads, n_kv_heads, head_dim, cfg.rms_eps,
+                    );
+                    if rope_interleaved_enabled() {
+                        k::rope_inplace_interleaved(q_row, n_heads, head_dim, pos, cfg.rope_theta);
+                        k::rope_inplace_interleaved(k_row, n_kv_heads, head_dim, pos, cfg.rope_theta);
+                    } else {
+                        k::rope_inplace_neox(q_row, n_heads, head_dim, pos, cfg.rope_theta);
+                        k::rope_inplace_neox(k_row, n_kv_heads, head_dim, pos, cfg.rope_theta);
+                    }
+                    let posu = r_idx[j];
+                    for h in 0..n_kv_heads {
+                        let dst = (h * max_ctx + posu) * head_dim;
+                        kslab[dst..dst + head_dim]
+                            .copy_from_slice(&k_row[h * head_dim..(h + 1) * head_dim]);
+                        vslab[dst..dst + head_dim]
+                            .copy_from_slice(&v_row[h * head_dim..(h + 1) * head_dim]);
+                    }
+                }
+            }
+
+            // Stage 4: attention over the FULL assembled KV (cached for the
+            // non-recomputed positions, fresh for the rest). A recomputed query
+            // at real position `p` attends causally over `0..=p`.
+            //
+            // While `r_is_full` (warm-up layers 0..=selection_layer + the exact
+            // path), the queries are the contiguous ramp 0..nr, so ONE batched
+            // flash-prefill call serves them — routed through the shared
+            // CUDA/Metal/SYCL GPU hook (single slab copy), CPU fallback. These
+            // are the expensive O(n²) layers, so this is where GPU attention
+            // pays off. Once the set is the scattered HKVD subset, each query
+            // attends over `0..=its_pos` via a per-row CPU step: the blended KV
+            // is host-resident so a per-row GPU copy would re-upload the whole
+            // slab each row (a loss), and no scatter-position GPU kernel exists.
+            let mut attn_out = vec![0f32; nr * d_q];
+            {
+                let (kslab, vslab) = match &kv.layers[layer_idx] {
+                    KvLayer::F32 { k, v } => (&k[..], &v[..]),
+                    _ => unreachable!("CacheBlend requires F32 KV"),
+                };
+                if r_is_full {
+                    // Contiguous queries 0..nr (row j is at position j),
+                    // kv_len_base = 0. Shared GPU prefill hook, CPU fallback.
+                    let used_gpu = crate::accel::try_flash_attn_prefill_gpu_f32(
+                        &q_r, kslab, vslab, &mut attn_out,
+                        n_heads, n_kv_heads, head_dim, max_ctx, 0, nr,
+                    );
+                    if !used_gpu {
+                        k::gqa_attention_flash_prefill(
+                            &q_r, kslab, vslab, &mut attn_out,
+                            n_heads, n_kv_heads, head_dim, max_ctx, 0, nr,
+                        );
+                    }
+                } else {
+                    for j in 0..nr {
+                        k::gqa_attention_one_step(
+                            &q_r[j * d_q..(j + 1) * d_q], kslab, vslab,
+                            &mut attn_out[j * d_q..(j + 1) * d_q],
+                            n_heads, n_kv_heads, head_dim, max_ctx, r_idx[j] + 1,
+                        );
+                    }
+                }
+            }
+
+            // Stage 5: output projection + residual + post-attn rmsnorm.
+            let mut attn_proj = vec![0f32; nr * d];
+            matvec_tensor_batched_dispatch(block.w_o(), &attn_out, &mut attn_proj, d, d_q, nr);
+            for j in 0..nr {
+                let proj_row = &attn_proj[j * d..(j + 1) * d];
+                let h_row = &mut h_r[j * d..(j + 1) * d];
+                if !skip_attn_enabled() {
+                    k::add_inplace_f32(h_row, proj_row);
+                }
+                k::rmsnorm_f32_row(
+                    h_row, block.ffn_norm(), &mut h_norm[j * d..(j + 1) * d], cfg.rms_eps,
+                );
+            }
+
+            // Stage 6-8: FFN (dense batched / MoE per-row).
+            let mut ffn_out = vec![0f32; nr * d];
+            if let Some(moe) = moe_cfg.as_ref() {
+                let mb = &self.weights.moe_blocks.as_ref().unwrap()[layer_idx];
+                for j in 0..nr {
+                    crate::moe::moe_ffn_one_into(
+                        &h_norm[j * d..(j + 1) * d], mb, d, d_ff,
+                        moe.n_experts as usize, moe.n_experts_used as usize,
+                        &mut ffn_out[j * d..(j + 1) * d],
+                        &mut moe_gate_one, &mut moe_up_one, &mut moe_ff_one, &mut moe_down_one,
+                        &mut moe_expert_logits, &mut moe_routed_picks,
+                    );
+                }
+            } else {
+                let dense_block = &self.weights.blocks[layer_idx];
+                let mut gate_buf = vec![0f32; nr * d_ff];
+                let mut up_buf = vec![0f32; nr * d_ff];
+                let mut ffn_buf = vec![0f32; nr * d_ff];
+                matvec_tensor_batched_dispatch(&dense_block.w_gate, &h_norm, &mut gate_buf, d_ff, d, nr);
+                matvec_tensor_batched_dispatch(&dense_block.w_up, &h_norm, &mut up_buf, d_ff, d, nr);
+                for j in 0..nr {
+                    k::silu_mul_f32(
+                        &gate_buf[j * d_ff..(j + 1) * d_ff],
+                        &up_buf[j * d_ff..(j + 1) * d_ff],
+                        &mut ffn_buf[j * d_ff..(j + 1) * d_ff],
+                    );
+                }
+                matvec_tensor_batched_dispatch(&dense_block.w_down, &ffn_buf, &mut ffn_out, d, d_ff, nr);
+            }
+            // Stage 9: FFN residual.
+            if !skip_ffn_enabled() {
+                for j in 0..nr {
+                    let h_row = &mut h_r[j * d..(j + 1) * d];
+                    k::add_inplace_f32(h_row, &ffn_out[j * d..(j + 1) * d]);
+                }
+            }
+
+            // --- 3. After the selection layer, shrink to HKVD ∪ suffix. ---
+            if !exact && layer_idx == sel_layer {
+                // At the selection layer `r_idx == 0..n`, so compact row j == pos
+                // j and `k_rr` holds fresh (post-RoPE) K for every position.
+                let n_rec = (((suffix_start as f32) * blend.recompute_ratio).ceil() as usize)
+                    .min(suffix_start);
+                let mut dev: Vec<(f32, usize)> = (0..suffix_start)
+                    .map(|p| {
+                        let a = &k_rr[p * d_kv..(p + 1) * d_kv];
+                        let b = &cached_sel_k[p * d_kv..(p + 1) * d_kv];
+                        let s: f32 = a.iter().zip(b).map(|(x, y)| {
+                            let e = x - y;
+                            e * e
+                        }).sum();
+                        (s, p)
+                    })
+                    .collect();
+                // Highest deviation first.
+                dev.sort_unstable_by(|x, y| {
+                    y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let mut keep: Vec<usize> = dev[..n_rec].iter().map(|&(_, p)| p).collect();
+                keep.extend(suffix_start..n);
+                keep.sort_unstable();
+                keep.dedup();
+                // Gather the surviving rows' hidden state (old row == pos here).
+                let mut new_h = vec![0f32; keep.len() * d];
+                for (nj, &p) in keep.iter().enumerate() {
+                    new_h[nj * d..(nj + 1) * d].copy_from_slice(&h_r[p * d..(p + 1) * d]);
+                }
+                h_r = new_h;
+                r_idx = keep;
+                r_is_full = false;
+            }
+        }
+
+        // --- 4. LM head on the final position (always the last recomputed row,
+        //        because the suffix is always recomputed). ---
+        let last = r_idx.len() - 1;
+        debug_assert_eq!(r_idx[last], n - 1, "CacheBlend: final position must be recomputed");
+        let mut final_norm = vec![0f32; d];
+        k::rmsnorm_f32_row(
+            &h_r[last * d..(last + 1) * d], &self.weights.output_norm, &mut final_norm, cfg.rms_eps,
+        );
+        let lm_head = self.weights.output.as_ref().unwrap_or(&self.weights.token_embd);
+        let mut logits = vec![0.0f32; vocab];
+        matvec_tensor_batched_dispatch(lm_head, &final_norm, &mut logits, vocab, d, 1);
+        logits
+    }
+
+    /// Inject one chunk's isolated KV snapshot into the live cache at
+    /// `placement.offset`, re-rotating K from the chunk-local positions it was
+    /// computed at (`0..chunk_len`) to the assembled positions (`off..off+len`).
+    ///
+    /// The snapshot's K is already RoPE-rotated by its within-chunk index `j`
+    /// (a standalone prefill advances the position per token). RoPE is additive
+    /// in angle, so one extra rotation by the constant `off` turns `rope-at-j`
+    /// into `rope-at-(j+off)` — exactly what a fresh prefill at the assembled
+    /// offset would produce (per-head Q/K RMSNorm runs before RoPE and is
+    /// position-independent, so it is unaffected). V carries no RoPE and is
+    /// copied verbatim.
+    fn inject_chunk_reroped(&self, kv: &mut KvCache, placement: &crate::cacheblend::ChunkPlacement) {
+        let cfg = &self.cfg;
+        let n_kv_heads = cfg.n_kv_heads;
+        let head_dim = cfg.head_dim;
+        let d_kv = n_kv_heads * head_dim;
+        let max_ctx = kv.max_ctx;
+        let snap = &placement.snapshot;
+        let pl = snap.prefix_len;
+        let off = placement.offset;
+        assert_eq!(snap.n_kv_heads, n_kv_heads);
+        assert_eq!(snap.head_dim, head_dim);
+        assert_eq!(snap.layers.len(), kv.layers.len());
+        assert!(off + pl <= max_ctx, "CacheBlend chunk overflows max_ctx");
+        // Delta rotation to re-base the chunk from local → assembled positions.
+        let delta = off as u32;
+        let mut k_scratch = vec![0f32; d_kv];
+        for (live, src) in kv.layers.iter_mut().zip(snap.layers.iter()) {
+            let (kslab, vslab, sk, sv) = match (live, src) {
+                (KvLayer::F32 { k, v }, KvLayer::F32 { k: sk, v: sv }) => (k, v, sk, sv),
+                _ => panic!("CacheBlend requires F32 KV snapshots"),
+            };
+            for j in 0..pl {
+                // Gather this position's K across heads into contiguous [d_kv].
+                for h in 0..n_kv_heads {
+                    let s = (h * pl + j) * head_dim;
+                    k_scratch[h * head_dim..(h + 1) * head_dim]
+                        .copy_from_slice(&sk[s..s + head_dim]);
+                }
+                // Re-base by the constant offset (identity when off == 0).
+                if delta != 0 {
+                    if rope_interleaved_enabled() {
+                        k::rope_inplace_interleaved(&mut k_scratch, n_kv_heads, head_dim, delta, cfg.rope_theta);
+                    } else {
+                        k::rope_inplace_neox(&mut k_scratch, n_kv_heads, head_dim, delta, cfg.rope_theta);
+                    }
+                }
+                // Scatter K (re-roped) + V (verbatim) into the live slab.
+                let posu = off + j;
+                for h in 0..n_kv_heads {
+                    let dst = (h * max_ctx + posu) * head_dim;
+                    kslab[dst..dst + head_dim]
+                        .copy_from_slice(&k_scratch[h * head_dim..(h + 1) * head_dim]);
+                    let ss = (h * pl + j) * head_dim;
+                    vslab[dst..dst + head_dim].copy_from_slice(&sv[ss..ss + head_dim]);
+                }
+            }
+        }
+        crate::accel::usm_attn_kv_epoch_bump();
+    }
+
     fn forward_prefill_batched_f32_inner(
         &self,
         tokens: &[i32],
@@ -13036,6 +13424,170 @@ mod tests {
         let _ = max_diff;
         // KV state matches: same writes, same seq_len.
         assert_eq!(kv_ref.seq_len, kv_batched.seq_len);
+    }
+
+    // ---- CacheBlend ----
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let mut dot = 0f32;
+        let mut na = 0f32;
+        let mut nb = 0f32;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        dot / (na.sqrt() * nb.sqrt() + 1e-12)
+    }
+
+    /// Build a chunk's isolated KV snapshot the way the engine will: a
+    /// standalone F32-KV prefill of the chunk at position 0.
+    fn chunk_snapshot(model: &LlamaModel, cfg: &LlamaConfig, chunk: &[i32]) -> KvSnapshot {
+        let mut kv = KvCache::new(cfg, 32);
+        let _ = model.forward_prefill_batched_f32(chunk, 0, &mut kv);
+        kv.snapshot_prefix(chunk.len())
+    }
+
+    /// The correctness anchor: at `recompute_ratio = 1.0` every token is
+    /// recomputed, so CacheBlend is numerically a full prefill of the assembled
+    /// context — the cached chunk KV is injected but fully overwritten. The two
+    /// differ only in attention-kernel reduction order (per-query `one_step`
+    /// vs the batched flash-prefill), so we gate on cosine, not bit-equality.
+    #[test]
+    fn cacheblend_exact_matches_full_prefill() {
+        use crate::cacheblend::{CacheBlendConfig, ChunkPlacement};
+        use std::sync::Arc;
+        let cfg = synth_cfg(4, 2, 8);
+        let model = synth_llama_model(&cfg);
+        let chunk1: Vec<i32> = vec![5, 7, 2, 14];
+        let chunk2: Vec<i32> = vec![3, 9, 1, 6];
+        let suffix: Vec<i32> = vec![11, 4];
+        let assembled: Vec<i32> =
+            chunk1.iter().chain(&chunk2).chain(&suffix).copied().collect();
+        let suffix_start = chunk1.len() + chunk2.len();
+        let max_ctx = 32;
+
+        // Reference: a full batched prefill of the assembled context.
+        let mut kv_ref = KvCache::new(&cfg, max_ctx);
+        let ref_logits = model.forward_prefill_batched_f32(&assembled, 0, &mut kv_ref);
+
+        // CacheBlend at ratio 1.0 (exact).
+        let placements = vec![
+            ChunkPlacement {
+                offset: 0,
+                snapshot: Arc::new(chunk_snapshot(&model, &cfg, &chunk1)),
+            },
+            ChunkPlacement {
+                offset: chunk1.len(),
+                snapshot: Arc::new(chunk_snapshot(&model, &cfg, &chunk2)),
+            },
+        ];
+        let mut kv_cb = KvCache::new(&cfg, max_ctx);
+        let cb_logits = model.forward_prefill_cacheblend(
+            &assembled,
+            &placements,
+            suffix_start,
+            CacheBlendConfig { recompute_ratio: 1.0, selection_layer: 1 },
+            &mut kv_cb,
+        );
+
+        let cos = cosine(&cb_logits, &ref_logits);
+        assert!(
+            cos > 0.9995,
+            "CacheBlend(exact) vs full prefill cosine {cos} too low"
+        );
+        assert_eq!(kv_cb.seq_len, assembled.len());
+    }
+
+    /// Re-rotation correctness: injecting a chunk at a non-zero offset must
+    /// reproduce the LAYER-0 K a fresh prefill would write at those absolute
+    /// positions. Layer 0's K is `proj(norm(embed))` + RoPE — context-free — so
+    /// the only thing that can go wrong is the positional re-rotation. (Layers
+    /// ≥1 deliberately differ: that's the cross-attention the HKVD set recovers.)
+    #[test]
+    fn cacheblend_inject_reroped_matches_fresh_layer0_k() {
+        use crate::cacheblend::ChunkPlacement;
+        use std::sync::Arc;
+        let cfg = synth_cfg(2, 2, 8);
+        let model = synth_llama_model(&cfg);
+        let head_dim = cfg.head_dim;
+        let n_kv_heads = cfg.n_kv_heads;
+        let max_ctx = 32;
+        let off = 3;
+        let chunk: Vec<i32> = vec![5, 7, 2, 14];
+        let filler: Vec<i32> = vec![1, 8, 2]; // occupies [0, off)
+        let assembled: Vec<i32> = filler.iter().chain(&chunk).copied().collect();
+
+        // Fresh full prefill → the gold layer-0 K at positions off..off+len.
+        let mut kv_full = KvCache::new(&cfg, max_ctx);
+        let _ = model.forward_prefill_batched_f32(&assembled, 0, &mut kv_full);
+
+        // Inject the chunk's isolated snapshot at `off` into an empty cache.
+        let snap = chunk_snapshot(&model, &cfg, &chunk);
+        let mut kv_inj = KvCache::new(&cfg, max_ctx);
+        model.inject_chunk_reroped(
+            &mut kv_inj,
+            &ChunkPlacement { offset: off, snapshot: Arc::new(snap) },
+        );
+
+        let (kf, ki) = match (&kv_full.layers[0], &kv_inj.layers[0]) {
+            (KvLayer::F32 { k: kf, .. }, KvLayer::F32 { k: ki, .. }) => (kf, ki),
+            _ => unreachable!(),
+        };
+        let mut max_diff = 0f32;
+        for j in 0..chunk.len() {
+            let pos = off + j;
+            for h in 0..n_kv_heads {
+                let base = (h * max_ctx + pos) * head_dim;
+                for e in 0..head_dim {
+                    max_diff = max_diff.max((kf[base + e] - ki[base + e]).abs());
+                }
+            }
+        }
+        assert!(
+            max_diff < 1e-4,
+            "injected re-roped layer-0 K drifts {max_diff} from fresh prefill"
+        );
+    }
+
+    /// Smoke: the approximate path (ratio < 1) selects an HKVD subset, shrinks
+    /// the recompute set, and still returns finite logits for the final
+    /// position with the right seq_len. Approximation quality on a random
+    /// synthetic model isn't meaningful, so this only pins "it runs & stays
+    /// finite", not a similarity bound.
+    #[test]
+    fn cacheblend_approx_runs_and_is_finite() {
+        use crate::cacheblend::{CacheBlendConfig, ChunkPlacement};
+        use std::sync::Arc;
+        let cfg = synth_cfg(4, 2, 8);
+        let model = synth_llama_model(&cfg);
+        let chunk1: Vec<i32> = vec![5, 7, 2, 14];
+        let chunk2: Vec<i32> = vec![3, 9, 1, 6];
+        let suffix: Vec<i32> = vec![11, 4];
+        let assembled: Vec<i32> =
+            chunk1.iter().chain(&chunk2).chain(&suffix).copied().collect();
+        let suffix_start = chunk1.len() + chunk2.len();
+        let placements = vec![
+            ChunkPlacement {
+                offset: 0,
+                snapshot: Arc::new(chunk_snapshot(&model, &cfg, &chunk1)),
+            },
+            ChunkPlacement {
+                offset: chunk1.len(),
+                snapshot: Arc::new(chunk_snapshot(&model, &cfg, &chunk2)),
+            },
+        ];
+        let mut kv_cb = KvCache::new(&cfg, 32);
+        let logits = model.forward_prefill_cacheblend(
+            &assembled,
+            &placements,
+            suffix_start,
+            CacheBlendConfig { recompute_ratio: 0.25, selection_layer: 1 },
+            &mut kv_cb,
+        );
+        assert_eq!(logits.len(), cfg.vocab_size);
+        assert!(logits.iter().all(|x| x.is_finite()), "approx logits not finite");
+        assert_eq!(kv_cb.seq_len, assembled.len());
     }
 
     /// E1 Q8_0: per-position logits from the batched Q8_0-KV
