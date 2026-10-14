@@ -1007,6 +1007,10 @@ pub fn cpu_topology() -> CpuTopology {
 
 /// CPUID-based package identity on x86; OS brand + zeroed IDs elsewhere.
 #[cfg(target_arch = "x86_64")]
+// The CPUID intrinsics below are safe to call on current rustc, which makes the
+// `unsafe` block redundant there (unused_unsafe); keep it — and allow the lint —
+// so the crate still builds on the 1.89 MSRV, where they may require `unsafe`.
+#[allow(unused_unsafe)]
 fn cpu_package_identity() -> CpuPackage {
     // SAFETY: CPUID is always available on x86_64; leaves 1 and the
     // 0x80000002..=4 brand leaves are architectural.
