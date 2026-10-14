@@ -841,6 +841,68 @@ fn try_gemm_xmx_batched(w: &Tensor, x: &[f32], out: &mut [f32], m: usize, k: usi
 }
 
 // ============================================================
+// Intel NPU compute offload (Phase 5, OpenVINO) — batched f32 GEMM
+// ============================================================
+
+/// Min batch (prefill tokens) to route a GEMM to the NPU: the host round-trip +
+/// per-shape graph compile only amortize on prefill-size batches, so decode
+/// (single-row / tiny `n`) stays on CPU/GPU. Mirrors the `n >= 16` batched gate.
+const NPU_GEMM_MIN_BATCH: usize = 16;
+
+/// The process-wide NPU executor (OpenVINO), created once. `None` off NPU
+/// hardware / without the bundled OpenVINO runtime → every offload short-
+/// circuits. Mirrors [`cuda_cache`] / [`mlx_cache`].
+fn npu_executor() -> Option<&'static rustllama_npu::NpuExecutor> {
+    static EX: OnceLock<Option<rustllama_npu::NpuExecutor>> = OnceLock::new();
+    EX.get_or_init(rustllama_npu::NpuExecutor::new).as_ref()
+}
+
+/// Whether the Intel NPU compute-offload path is enabled. **AUTOMATIC** — no env
+/// var: it turns on only when the NPU MatMul passed the on-device self-check
+/// (`tune --validate-kernels` → `kernel_verdict("npu:matmul_f32")`) on this
+/// machine AND an NPU + its runtime are present. FAIL-CLOSED: never validated
+/// (or no NPU) → `false`, so the offload stays off and the CPU/GPU ladder runs.
+/// Cached once (process-wide); inert until a `--validate-kernels` pass on real
+/// NPU hardware stamps the verdict, so this is byte-identical on every host
+/// without one.
+fn npu_offload_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| kernel_verdict("npu:matmul_f32") && npu_executor().is_some())
+}
+
+/// Batched NPU GEMM `out[n,m] = x[n,k]·w[m,k]ᵀ`: dequantize `W`→f32 and run it on
+/// the NPU via OpenVINO. The exact analog of [`try_gemm_xmx_batched`] (dequant →
+/// matrix-engine GEMM, verdict-gated). `false` on any miss — offload disabled,
+/// too-small batch, un-dequantizable dtype, or an FFI error — so the caller
+/// falls straight through to the proven CPU/GPU ladder with `out` untouched.
+fn try_npu_gemm_f32(w: &Tensor, x: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) -> bool {
+    if !npu_offload_enabled()
+        || n < NPU_GEMM_MIN_BATCH
+        || m == 0
+        || k == 0
+        || x.len() != n * k
+        || out.len() != n * m
+    {
+        return false;
+    }
+    let Some(exec) = npu_executor() else {
+        return false;
+    };
+    // Dequant W→f32 (m×k). None for exotic codebook/ternary dtypes → skip.
+    let Some(w_f32) = dtype_dequant_to_f32(w.dtype, as_bytes(w), m * k) else {
+        return false;
+    };
+    let Some(res) = exec.matmul_xwt_f32(x, n, k, &w_f32, m) else {
+        return false;
+    };
+    if res.len() != out.len() {
+        return false;
+    }
+    out.copy_from_slice(&res);
+    true
+}
+
+// ============================================================
 // Native MLX packed-matvec dispatch (Apple Metal backend)
 // ============================================================
 //
@@ -12893,6 +12955,17 @@ pub fn try_matvec_tensor_batched_usm_f32(
         && out.len() == n * m
     {
         if try_gemm_xmx_batched(w, x, out, m, k, n) {
+            return true;
+        }
+    }
+    // Intel NPU compute offload (Phase 5): a batched f32 GEMM on the NPU via
+    // OpenVINO. Gated on `!cuda_active()` so the CUDA-first doctrine holds (a
+    // CUDA GPU, if present, wins via the block below); the NPU is the next
+    // matrix-engine tier when no CUDA GPU is present (an NPU laptop, or an Intel
+    // host after XMX misses). Verdict-gated + fail-closed → INERT (byte-
+    // identical) until `tune --validate-kernels` passes on real NPU hardware.
+    if npu_offload_enabled() && !cuda_active() && !tensor_forced_to_cpu(&w.name) {
+        if try_npu_gemm_f32(w, x, out, m, k, n) {
             return true;
         }
     }

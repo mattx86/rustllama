@@ -577,6 +577,16 @@ pub fn collect_xmx_verdict() -> Vec<(String, Option<bool>)> {
         .collect()
 }
 
+/// Intel NPU compute-offload verdict for `tune --validate-kernels`: run the NPU
+/// MatMul parity (Phase 5, OpenVINO) and map it to the `npu:matmul_f32` verdict
+/// the accel dispatch reads. `None` (SKIP) when no NPU / OpenVINO runtime is
+/// present → nothing is persisted → the dispatch stays off (fail-closed).
+pub fn collect_npu_verdict() -> Vec<(String, Option<bool>)> {
+    let r = rustllama_npu::npu_matmul_parity();
+    let verdict = if r.supported { Some(r.pass) } else { None };
+    vec![("npu:matmul_f32".to_string(), verdict)]
+}
+
 fn emit(name: &str, verdict: &str, detail: &str) {
     probe_rec_push(name, verdict);
     // Single-line machine-readable protocol; the parent greps for it.

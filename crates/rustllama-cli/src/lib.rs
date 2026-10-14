@@ -6068,7 +6068,7 @@ pub fn persist_per_device_perf(
 /// on non-GPU hosts: every probe SKIPs → no verdict → nothing persisted.
 fn cmd_tune_validate_kernels() -> anyhow::Result<()> {
     println!("rustllama tune --validate-kernels");
-    println!("  running GPU kernel parity probes (CUDA tensor-core GEMM, SYCL XMX)…");
+    println!("  running GPU/NPU kernel parity probes (CUDA tensor-core GEMM, SYCL XMX, NPU MatMul)…");
     println!();
 
     let mut verdicts: Vec<(String, Option<bool>)> = Vec::new();
@@ -6077,6 +6077,7 @@ fn cmd_tune_validate_kernels() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "CUDA kernel validation probe failed"),
     }
     verdicts.extend(crate::gpu_parity::collect_xmx_verdict());
+    verdicts.extend(crate::gpu_parity::collect_npu_verdict());
 
     // Keep only decided verdicts (OK / MISCOMPUTE); SKIP (capability
     // absent) carries no information and is left unset.

@@ -57,6 +57,11 @@ rustllama-kernels-mlx = { path = "../rustllama-kernels-mlx" }
 # default when no entry exists. The cache itself is produced by
 # `rustllama tune` (Stage C).
 rustllama-tuner = { path = "../rustllama-tuner" }
+# Intel NPU compute offload (Phase 5): the batched f32 GEMM dispatch in
+# `accel.rs` routes to the NPU (via OpenVINO) when the `npu:matmul_f32` verdict
+# passed on this host. Default features (both vendor backends, dlopen'd) —
+# inert off NPU hardware.
+rustllama-npu = { path = "../rustllama-npu" }
 # VLM image preprocessor: decode PNG/JPEG, resize, channel-normalize.
 # Vendored into the model crate since the patch-flattening step is
 # tightly coupled to `VisionConfig` (patch_size + n_channels + image_size).

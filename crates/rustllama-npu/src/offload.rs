@@ -63,6 +63,9 @@ struct OvShape {
     dims: *mut i64,
 }
 
+/// Compiled-graph cache keyed by `(a_rows, a_cols, b_rows, b_cols, transpose_b)`.
+type MatmulCache = Mutex<HashMap<(usize, usize, usize, usize, bool), *mut OvCompiledModel>>;
+
 /// `ov_available_devices_t { char** devices; size_t size; }`.
 #[repr(C)]
 struct OvAvailableDevices {
@@ -133,9 +136,9 @@ pub struct NpuExecutor {
     _lib: libloading::Library, // keep the runtime loaded (the fn ptrs borrow it)
     api: Api,
     core: *mut OvCore,
-    // Compiled MatMul graphs keyed by (m, k, n) — compilation is expensive, so
+    // Compiled MatMul graphs (see MatmulCache) — compilation is expensive, so
     // amortize across the fixed prefill shapes.
-    matmul_cache: Mutex<HashMap<(usize, usize, usize), *mut OvCompiledModel>>,
+    matmul_cache: MatmulCache,
 }
 
 // SAFETY: the OpenVINO Core + compiled models are thread-safe for compile/infer
@@ -212,18 +215,35 @@ impl NpuExecutor {
         if a.len() != m * k || b.len() != k * n || m == 0 || k == 0 || n == 0 {
             return None;
         }
-        unsafe { self.matmul_inner(a, m, k, b, n) }
+        unsafe { self.exec_matmul(a, m, k, b, k, n, false) }
     }
 
-    unsafe fn matmul_inner(
+    /// `out[n,m] = X[n,k] · W[m,k]ᵀ` (OpenVINO `transpose_b=true`), the layout
+    /// `rustllama-models`' batched matvec dispatch uses (weight stored `m×k`,
+    /// activations `n×k`, output `n×m`). `None` on any failure. Thread-safe.
+    pub fn matmul_xwt_f32(&self, x: &[f32], n: usize, k: usize, w: &[f32], m: usize) -> Option<Vec<f32>> {
+        if x.len() != n * k || w.len() != m * k || m == 0 || k == 0 || n == 0 {
+            return None;
+        }
+        unsafe { self.exec_matmul(x, n, k, w, m, k, true) }
+    }
+
+    /// Compile (cached) + run a MatMul of `A[a_rows,a_cols]` by `B[b_rows,b_cols]`
+    /// with optional `transpose_b`. Output is `a_rows × (transpose_b ? b_rows :
+    /// b_cols)`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn exec_matmul(
         &self,
         a: &[f32],
-        m: usize,
-        k: usize,
+        a_rows: usize,
+        a_cols: usize,
         b: &[f32],
-        n: usize,
+        b_rows: usize,
+        b_cols: usize,
+        transpose_b: bool,
     ) -> Option<Vec<f32>> {
-        let compiled = self.compiled_matmul(m, k, n)?;
+        let out_cols = if transpose_b { b_rows } else { b_cols };
+        let compiled = self.compiled_matmul(a_rows, a_cols, b_rows, b_cols, transpose_b)?;
 
         let mut req: *mut OvInferRequest = ptr::null_mut();
         if (self.api.create_request)(compiled, &mut req) != OV_OK || req.is_null() {
@@ -231,12 +251,12 @@ impl NpuExecutor {
         }
         // Guard so the request is always freed.
         let out = (|| {
-            let ta = self.make_input(&[m, k], a)?;
-            let tb = self.make_input(&[k, n], b)?;
+            let ta = self.make_input(&[a_rows, a_cols], a)?;
+            let tb = self.make_input(&[b_rows, b_cols], b)?;
             let ok = (self.api.set_input)(req, 0, ta) == OV_OK
                 && (self.api.set_input)(req, 1, tb) == OV_OK
                 && (self.api.infer)(req) == OV_OK;
-            let result = if ok { self.read_output(req, m * n) } else { None };
+            let result = if ok { self.read_output(req, a_rows * out_cols) } else { None };
             (self.api.tensor_free)(ta);
             (self.api.tensor_free)(tb);
             result
@@ -246,14 +266,21 @@ impl NpuExecutor {
     }
 
     /// Get (or compile + cache) the NPU MatMul graph for this shape.
-    unsafe fn compiled_matmul(&self, m: usize, k: usize, n: usize) -> Option<*mut OvCompiledModel> {
-        let key = (m, k, n);
+    unsafe fn compiled_matmul(
+        &self,
+        a_rows: usize,
+        a_cols: usize,
+        b_rows: usize,
+        b_cols: usize,
+        transpose_b: bool,
+    ) -> Option<*mut OvCompiledModel> {
+        let key = (a_rows, a_cols, b_rows, b_cols, transpose_b);
         if let Ok(cache) = self.matmul_cache.lock() {
             if let Some(&c) = cache.get(&key) {
                 return Some(c);
             }
         }
-        let compiled = self.compile_matmul(m, k, n)?;
+        let compiled = self.compile_matmul(a_rows, a_cols, b_rows, b_cols, transpose_b)?;
         if let Ok(mut cache) = self.matmul_cache.lock() {
             // Re-check: another thread may have compiled the same shape.
             if let Some(&existing) = cache.get(&key) {
@@ -266,8 +293,15 @@ impl NpuExecutor {
     }
 
     /// Read the IR, compile it to the NPU. Frees the source model.
-    unsafe fn compile_matmul(&self, m: usize, k: usize, n: usize) -> Option<*mut OvCompiledModel> {
-        let xml = matmul_ir(m, k, n);
+    unsafe fn compile_matmul(
+        &self,
+        a_rows: usize,
+        a_cols: usize,
+        b_rows: usize,
+        b_cols: usize,
+        transpose_b: bool,
+    ) -> Option<*mut OvCompiledModel> {
+        let xml = matmul_ir(a_rows, a_cols, b_rows, b_cols, transpose_b);
         let xml_c = CString::new(xml).ok()?;
         let bytes = xml_c.as_bytes(); // without the NUL
 
@@ -358,31 +392,34 @@ impl Drop for NpuExecutor {
     }
 }
 
-/// Minimal OpenVINO IR (v11) for `C = MatMul(A[m,k], B[k,n])`, both f32 graph
-/// inputs. Static shapes (the NPU compiler wants them); no weights blob needed.
-fn matmul_ir(m: usize, k: usize, n: usize) -> String {
+/// Minimal OpenVINO IR (v11) for `C = MatMul(A[ar,ac], B[br,bc])` with optional
+/// `transpose_b`, both f32 graph inputs. Output is `ar × (transpose_b ? br :
+/// bc)`. Static shapes (the NPU compiler wants them); no weights blob needed.
+fn matmul_ir(ar: usize, ac: usize, br: usize, bc: usize, transpose_b: bool) -> String {
+    let tb = if transpose_b { "true" } else { "false" };
+    let oc = if transpose_b { br } else { bc };
     format!(
         r#"<?xml version="1.0"?>
 <net name="rsl_matmul" version="11">
   <layers>
     <layer id="0" name="A" type="Parameter" version="opset1">
-      <data shape="{m},{k}" element_type="f32"/>
-      <output><port id="0" precision="FP32" names="A"><dim>{m}</dim><dim>{k}</dim></port></output>
+      <data shape="{ar},{ac}" element_type="f32"/>
+      <output><port id="0" precision="FP32" names="A"><dim>{ar}</dim><dim>{ac}</dim></port></output>
     </layer>
     <layer id="1" name="B" type="Parameter" version="opset1">
-      <data shape="{k},{n}" element_type="f32"/>
-      <output><port id="0" precision="FP32" names="B"><dim>{k}</dim><dim>{n}</dim></port></output>
+      <data shape="{br},{bc}" element_type="f32"/>
+      <output><port id="0" precision="FP32" names="B"><dim>{br}</dim><dim>{bc}</dim></port></output>
     </layer>
     <layer id="2" name="MM" type="MatMul" version="opset1">
-      <data transpose_a="false" transpose_b="false"/>
+      <data transpose_a="false" transpose_b="{tb}"/>
       <input>
-        <port id="0" precision="FP32"><dim>{m}</dim><dim>{k}</dim></port>
-        <port id="1" precision="FP32"><dim>{k}</dim><dim>{n}</dim></port>
+        <port id="0" precision="FP32"><dim>{ar}</dim><dim>{ac}</dim></port>
+        <port id="1" precision="FP32"><dim>{br}</dim><dim>{bc}</dim></port>
       </input>
-      <output><port id="2" precision="FP32" names="C"><dim>{m}</dim><dim>{n}</dim></port></output>
+      <output><port id="2" precision="FP32" names="C"><dim>{ar}</dim><dim>{oc}</dim></port></output>
     </layer>
     <layer id="3" name="C/sink" type="Result" version="opset1">
-      <input><port id="0" precision="FP32"><dim>{m}</dim><dim>{n}</dim></port></input>
+      <input><port id="0" precision="FP32"><dim>{ar}</dim><dim>{oc}</dim></port></input>
     </layer>
   </layers>
   <edges>
