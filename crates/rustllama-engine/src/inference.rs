@@ -740,11 +740,10 @@ fn hybrid_kv_keep_mask(model: &LlamaModel) -> Option<Vec<bool>> {
 struct EngineState {
     kv_backend: KvBackend,
     last_ids: Vec<u32>,
-    /// Prefix cache pool. Only consulted when `kv_backend` is
-    /// `Contiguous` — paged KV doesn't carry the per-tensor slab
-    /// `restore_prefix` needs (a paged equivalent is a later
-    /// milestone, not blocking on the 3.6e wire-up). For paged the
-    /// pool stays empty and `prepare_prefix_reuse` early-returns 0.
+    /// Prefix cache pool for the `Contiguous` backend — snapshot/LCP reuse
+    /// (the contiguous KV has no per-position block addressing). The `Paged`
+    /// backends reuse via `apc` (block-level vLLM automatic prefix caching)
+    /// instead; see `prepare_prefix_reuse`. The pool stays empty on paged.
     pool: PrefixCachePool,
     /// DeltaNet recurrent state for `qwen35moe`-family hybrid
     /// models. `Some` when the loaded model carries
