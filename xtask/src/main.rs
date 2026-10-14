@@ -579,14 +579,16 @@ mod tests {
         assert!(missing.is_none());
 
         // Walk-fallback: file in a versioned subdir without the
-        // `latest` junction.
-        let alt = tmp.join("dnnl").join("2025.0.0").join("bin");
+        // `latest` junction (e.g. `compiler/2025.0.0/bin/`). Use a name
+        // present ONLY in the versioned subdir so the `latest/bin` search
+        // misses and the walk kicks in.
+        let alt = tmp.join("compiler").join("2025.0.0").join("bin");
         std::fs::create_dir_all(&alt).unwrap();
-        std::fs::write(alt.join("dnnl.dll"), b"fake").unwrap();
-        let found = find_redist_dll(&tmp, "dnnl.dll", RedistGroup::Dnnl);
+        std::fs::write(alt.join("libiomp5md.dll"), b"fake").unwrap();
+        let found = find_redist_dll(&tmp, "libiomp5md.dll", RedistGroup::Compiler);
         assert_eq!(
             found.as_deref().unwrap().file_name().unwrap(),
-            "dnnl.dll",
+            "libiomp5md.dll",
             "walk fallback should find versioned-subdir bin/<name>"
         );
 
