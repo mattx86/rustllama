@@ -187,10 +187,16 @@ commands in the chat REPL/TUI mirror this verb set):
   (synthesize a Q4_K expert → promote to USM exactly as the tier does → run the
   real device-resident matvec dispatch → grade vs CPU); SKIPs off dedicated-SYCL
   HW (CUDA/integrated/MLX-unified/CPU, where the tier is a no-op). `--npu-parity`
-  validates the Intel NPU **compute offload** (Phase 5): compile a MatMul to the
-  NPU via OpenVINO and grade it vs the CPU reference; SKIPs off NPU HW / without
-  the bundled OpenVINO runtime. Also reports
-  per-device `xmx_capable` (Intel XMX/DPAS capability).
+  validates the NPU **compute offload** (Phase 5) for BOTH vendors — Intel
+  (compile a MatMul to the NPU via OpenVINO) and AMD (a single-op ONNX `Gemm`
+  run on the Ryzen AI / XDNA NPU via ONNX Runtime + the VitisAI EP) — grading
+  each vs the CPU reference; each SKIPs off its vendor's NPU / runtime. The
+  dispatch (`accel.rs`) auto-enables each NPU offload only where it both matched
+  the CPU reference AND measured FASTER than the GPU/CPU at a representative
+  prefill GEMM (verdicts `npu:{matmul_f32,faster_than_gpu}` for Intel,
+  `npu:amd_{matmul_f32,faster_than_gpu}` for AMD, set by `tune
+  --validate-kernels`) — no hardcoded CUDA-first gate, fail-closed off NPU HW.
+  Also reports per-device `xmx_capable` (Intel XMX/DPAS capability).
 - `gui` — launch the native egui GUI. `lsp` — LSP bridge over stdio. `version`.
 
 ## Config & server

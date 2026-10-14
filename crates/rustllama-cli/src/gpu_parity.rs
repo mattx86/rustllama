@@ -589,17 +589,28 @@ pub fn collect_xmx_verdict() -> Vec<(String, Option<bool>)> {
 /// `None` (SKIP) on either when no NPU is present → nothing persisted → the
 /// dispatch stays off (fail-closed).
 pub fn collect_npu_verdict() -> Vec<(String, Option<bool>)> {
+    // Intel (OpenVINO).
     let r = rustllama_npu::npu_matmul_parity();
     let correct = if r.supported { Some(r.pass) } else { None };
-    // Only perf-rank a present, correct NPU; otherwise SKIP (None) the perf slot.
     let perf = if matches!(correct, Some(true)) {
         rustllama_engine::npu_perf_probe()
+    } else {
+        None
+    };
+    // AMD (ONNX Runtime + VitisAI). Mutually exclusive with Intel in practice;
+    // both probed — the absent one SKIPs (None) and persists nothing.
+    let amd = rustllama_npu::amd_npu_matmul_parity();
+    let amd_correct = if amd.supported { Some(amd.pass) } else { None };
+    let amd_perf = if matches!(amd_correct, Some(true)) {
+        rustllama_engine::amd_npu_perf_probe()
     } else {
         None
     };
     vec![
         ("npu:matmul_f32".to_string(), correct),
         ("npu:faster_than_gpu".to_string(), perf),
+        ("npu:amd_matmul_f32".to_string(), amd_correct),
+        ("npu:amd_faster_than_gpu".to_string(), amd_perf),
     ]
 }
 
@@ -5074,31 +5085,52 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
 // NPU compute-offload parity (`rustllama doctor --npu-parity`)
 // =====================================================================
 
-/// Grade the Intel NPU MatMul offload (Phase 5) against the CPU reference.
-/// SKIPs cleanly off NPU hardware / without the bundled OpenVINO runtime. This
-/// is the first real numeric validation of the write-blind offload path.
+/// Grade the NPU MatMul offloads (Phase 5) against the CPU reference — Intel
+/// (OpenVINO) and AMD (ONNX Runtime + VitisAI). Each SKIPs cleanly off its
+/// vendor's NPU / runtime. The first real numeric validation of the write-blind
+/// offload paths (the dispatch verdicts auto-enable each only on OK).
 pub fn run_npu_parity() -> anyhow::Result<()> {
-    println!("Intel NPU compute-offload parity (OpenVINO MatMul, Phase 5)");
-    let r = rustllama_npu::npu_matmul_parity();
-    if !r.supported {
-        println!(
-            "  matmul:f32               SKIP        no NPU device / OpenVINO runtime not loaded"
-        );
-        println!("\nsummary: SKIP (no NPU offload available on this host)");
-        return Ok(());
+    fn report(label: &str, r: rustllama_npu::NpuParity, verdict_name: &str) -> &'static str {
+        if !r.supported {
+            println!("  {label:<22} SKIP        no NPU device / runtime not loaded");
+            return "SKIP";
+        }
+        let v = if r.pass { "OK" } else { "MISCOMPUTE" };
+        println!("  {label:<22} {v:<11} cos={:.6} max_rel={:.4}", r.cos, r.max_rel);
+        let _ = verdict_name;
+        if r.pass {
+            "OK"
+        } else {
+            "MISCOMPUTE"
+        }
     }
-    let verdict = if r.pass { "OK" } else { "MISCOMPUTE" };
-    println!("  matmul:f32               {verdict:<11} cos={:.6} max_rel={:.4}", r.cos, r.max_rel);
-    if r.pass {
+
+    println!("NPU compute-offload parity (Phase 5)");
+    let intel = report(
+        "intel matmul:f32",
+        rustllama_npu::npu_matmul_parity(),
+        "npu:matmul_f32",
+    );
+    let amd = report(
+        "amd   matmul:f32",
+        rustllama_npu::amd_npu_matmul_parity(),
+        "npu:amd_matmul_f32",
+    );
+
+    let any_ok = intel == "OK" || amd == "OK";
+    let any_bad = intel == "MISCOMPUTE" || amd == "MISCOMPUTE";
+    if any_bad {
+        println!(
+            "\nsummary: MISCOMPUTE — an NPU MatMul offload disagrees with the CPU \
+             reference; that dispatch stays fail-closed (offload off)."
+        );
+    } else if any_ok {
         println!(
             "\nsummary: OK — the NPU MatMul offload matches the CPU reference; the \
-             dispatch verdict `npu:matmul_f32` can auto-enable it."
+             dispatch verdict can auto-enable it."
         );
     } else {
-        println!(
-            "\nsummary: MISCOMPUTE — the NPU MatMul offload disagrees with the CPU \
-             reference; dispatch stays fail-closed (NPU offload off)."
-        );
+        println!("\nsummary: SKIP (no NPU offload available on this host)");
     }
     Ok(())
 }

@@ -30,6 +30,11 @@ mod openvino;
 #[cfg(feature = "npu-ryzenai")]
 mod ryzenai;
 
+// AMD NPU COMPUTE offload (Phase 5, whole-graph) — a single-op ONNX model built
+// here, run on the Ryzen AI / XDNA NPU via ONNX Runtime + the VitisAI EP.
+#[cfg(feature = "npu-ryzenai")]
+mod onnx_ir;
+
 // Intel NPU COMPUTE offload (Phase 5) — op-level MatMul via OpenVINO. Write-blind
 // (validated on NPU HW via `doctor --npu-parity` + the tuner verdict).
 #[cfg(feature = "npu-openvino")]
@@ -37,6 +42,15 @@ mod offload;
 
 #[cfg(feature = "npu-openvino")]
 pub use offload::NpuExecutor;
+
+// AMD NPU COMPUTE offload (Phase 5, whole-graph) — a single-op ONNX Gemm run on
+// the Ryzen AI / XDNA NPU via ONNX Runtime + the VitisAI EP. Write-blind
+// (validated on Ryzen AI HW via `doctor --npu-parity` + the tuner verdict).
+#[cfg(feature = "npu-ryzenai")]
+mod offload_amd;
+
+#[cfg(feature = "npu-ryzenai")]
+pub use offload_amd::AmdNpuExecutor;
 
 /// NPU vendor (which runtime drives it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +177,31 @@ pub fn npu_matmul_parity() -> NpuParity {
     #[cfg(feature = "npu-openvino")]
     {
         return offload::matmul_parity();
+    }
+    #[allow(unreachable_code)]
+    NpuParity::skipped()
+}
+
+/// Whether AMD Ryzen AI NPU COMPUTE offload (ONNX Runtime + VitisAI EP) is
+/// available — the backend is compiled in AND ORT + the VitisAI EP + an AMD NPU
+/// are present. `false` without `npu-ryzenai` or off Ryzen AI hardware.
+pub fn amd_npu_offload_available() -> bool {
+    #[cfg(feature = "npu-ryzenai")]
+    {
+        return offload_amd::AmdNpuExecutor::new().is_some();
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Run the AMD NPU matmul parity self-check (Phase 5). SKIP without the backend
+/// or an AMD NPU; otherwise the measured cos / max_rel / pass vs the CPU
+/// reference — read by `doctor --npu-parity` and the tuner verdict
+/// (`npu:amd_matmul_f32`) that fail-closed-gates the AMD dispatch.
+pub fn amd_npu_matmul_parity() -> NpuParity {
+    #[cfg(feature = "npu-ryzenai")]
+    {
+        return offload_amd::matmul_parity();
     }
     #[allow(unreachable_code)]
     NpuParity::skipped()

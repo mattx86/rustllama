@@ -882,15 +882,36 @@ fn npu_offload_enabled() -> bool {
     })
 }
 
-/// On-device perf probe: is the NPU faster than the GPU (or CPU, when no GPU) at
-/// a representative prefill GEMM? Times the REAL NPU dispatch against the REAL
-/// non-NPU dispatch (CUDA/SYCL/MLX if present, else the CPU matvec) on a Q4_K
-/// weight — the same paths production runs. `None` when there is no NPU (nothing
-/// to rank). `tune --validate-kernels` caches the result as
-/// `npu:faster_than_gpu`, which [`npu_offload_enabled`] ANDs with the correctness
-/// verdict. Write-blind: authored here, measured on NPU hardware.
-pub fn npu_perf_probe() -> Option<bool> {
-    let exec = npu_executor()?;
+/// The process-wide AMD NPU executor (ONNX Runtime + VitisAI EP), created once.
+/// `None` off Ryzen AI hardware / without ORT + the VitisAI EP. Intel and AMD
+/// NPUs are mutually exclusive in practice (a host has one), so one is inert.
+fn amd_npu_executor() -> Option<&'static rustllama_npu::AmdNpuExecutor> {
+    static EX: OnceLock<Option<rustllama_npu::AmdNpuExecutor>> = OnceLock::new();
+    EX.get_or_init(rustllama_npu::AmdNpuExecutor::new).as_ref()
+}
+
+/// Whether the AMD Ryzen AI NPU compute-offload path is enabled — the AMD analog
+/// of [`npu_offload_enabled`]: correctness (`npu:amd_matmul_f32`) AND measured
+/// faster-than-GPU (`npu:amd_faster_than_gpu`) AND an executor present.
+/// FAIL-CLOSED; inert until a `--validate-kernels` pass on Ryzen AI hardware.
+fn amd_npu_offload_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        kernel_verdict("npu:amd_matmul_f32")
+            && kernel_verdict("npu:amd_faster_than_gpu")
+            && amd_npu_executor().is_some()
+    })
+}
+
+/// Shared body of the NPU perf probes: is `matmul` (an NPU `xwt` GEMM) faster
+/// than the REAL non-NPU dispatch (CUDA/SYCL/MLX if present, else the CPU matvec)
+/// at a representative Q4_K prefill GEMM — the same paths production runs? The
+/// `NPU_PROBE_SUPPRESS` flag forces the NPU dispatch blocks off while timing the
+/// non-NPU path (avoids self-timing). `None` if the probe can't be set up.
+fn npu_perf_probe_inner<F>(matmul: F) -> Option<bool>
+where
+    F: Fn(&[f32], usize, usize, &[f32], usize) -> Option<Vec<f32>>,
+{
     // Representative prefill GEMM: weight [m,k] Q4_K, activation [n,k], out [n,m].
     let (m, k, n) = (2048usize, 2048usize, 64usize);
     let total = m * k;
@@ -922,7 +943,7 @@ pub fn npu_perf_probe() -> Option<bool> {
     set_n_gpu_layers(u32::MAX);
     set_current_layer_idx(0);
     // Warm both: compile the NPU graph, upload GPU weights / prime caches.
-    let _ = exec.matmul_xwt_f32(&x, n, k, &w_deq, m);
+    let _ = matmul(&x, n, k, &w_deq, m);
     NPU_PROBE_SUPPRESS.store(true, Ordering::Relaxed);
     crate::llama_arch::matvec_tensor_batched_dispatch(&w, &x, &mut out, m, k, n);
     let t0 = Instant::now();
@@ -934,10 +955,25 @@ pub fn npu_perf_probe() -> Option<bool> {
 
     let t1 = Instant::now();
     for _ in 0..REPS {
-        let _ = exec.matmul_xwt_f32(&x, n, k, &w_deq, m);
+        let _ = matmul(&x, n, k, &w_deq, m);
     }
     let t_npu = t1.elapsed();
     Some(t_npu < t_other)
+}
+
+/// On-device perf probe: is the Intel NPU faster than the GPU/CPU at a
+/// representative prefill GEMM? `tune --validate-kernels` caches the result as
+/// `npu:faster_than_gpu`, which [`npu_offload_enabled`] ANDs with correctness.
+/// `None` when there is no Intel NPU. Write-blind: measured on NPU hardware.
+pub fn npu_perf_probe() -> Option<bool> {
+    let exec = npu_executor()?;
+    npu_perf_probe_inner(|x, n, k, w, m| exec.matmul_xwt_f32(x, n, k, w, m))
+}
+
+/// AMD analog of [`npu_perf_probe`] — cached as `npu:amd_faster_than_gpu`.
+pub fn amd_npu_perf_probe() -> Option<bool> {
+    let exec = amd_npu_executor()?;
+    npu_perf_probe_inner(|x, n, k, w, m| exec.matmul_xwt_f32(x, n, k, w, m))
 }
 
 /// Bounded host-side cache of dequantized f32 weights for the NPU offload, keyed
@@ -1017,22 +1053,53 @@ fn try_npu_gemm_f32(w: &Tensor, x: &[f32], out: &mut [f32], m: usize, k: usize, 
     let Some(exec) = npu_executor() else {
         return false;
     };
-    // Dequant W→f32 (m×k), reusing a cached dequant for a hot weight. The weight
-    // host pointer is a stable key (weights are mmap'd once). None for exotic
-    // codebook/ternary dtypes → skip.
+    let Some(w_f32) = npu_dequant_weight(w, m * k) else {
+        return false;
+    };
+    let Some(res) = exec.matmul_xwt_f32(x, n, k, &w_f32, m) else {
+        return false;
+    };
+    if res.len() != out.len() {
+        return false;
+    }
+    out.copy_from_slice(&res);
+    true
+}
+
+/// Dequantize `W`→f32 (`total` elems), reusing a cached dequant for a hot weight
+/// (the weight host pointer is a stable key — weights are mmap'd once). `None`
+/// for exotic codebook/ternary dtypes. Shared by the Intel + AMD NPU offloads.
+fn npu_dequant_weight(w: &Tensor, total: usize) -> Option<std::sync::Arc<Vec<f32>>> {
     let ptr = as_bytes(w).as_ptr() as usize;
-    let w_f32 = match npu_dequant_cache().lock().ok().and_then(|mut c| c.get(ptr)) {
-        Some(cached) => cached,
-        None => {
-            let Some(deq) = dtype_dequant_to_f32(w.dtype, as_bytes(w), m * k) else {
-                return false;
-            };
-            let arc = std::sync::Arc::new(deq);
-            if let Ok(mut c) = npu_dequant_cache().lock() {
-                c.insert(ptr, arc.clone());
-            }
-            arc
-        }
+    if let Some(cached) = npu_dequant_cache().lock().ok().and_then(|mut c| c.get(ptr)) {
+        return Some(cached);
+    }
+    let deq = dtype_dequant_to_f32(w.dtype, as_bytes(w), total)?;
+    let arc = std::sync::Arc::new(deq);
+    if let Ok(mut c) = npu_dequant_cache().lock() {
+        c.insert(ptr, arc.clone());
+    }
+    Some(arc)
+}
+
+/// AMD Ryzen AI NPU GEMM `out[n,m] = x[n,k]·w[m,k]ᵀ` via ONNX Runtime + VitisAI.
+/// The AMD analog of [`try_npu_gemm_f32`] (dequant → whole-graph GEMM, verdict-
+/// gated). `false` on any miss → caller falls through to the CPU/GPU ladder.
+fn try_amd_npu_gemm_f32(w: &Tensor, x: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) -> bool {
+    if !amd_npu_offload_enabled()
+        || n < NPU_GEMM_MIN_BATCH
+        || m == 0
+        || k == 0
+        || x.len() != n * k
+        || out.len() != n * m
+    {
+        return false;
+    }
+    let Some(exec) = amd_npu_executor() else {
+        return false;
+    };
+    let Some(w_f32) = npu_dequant_weight(w, m * k) else {
+        return false;
     };
     let Some(res) = exec.matmul_xwt_f32(x, n, k, &w_f32, m) else {
         return false;
@@ -13112,6 +13179,18 @@ pub fn try_matvec_tensor_batched_usm_f32(
         && !tensor_forced_to_cpu(&w.name)
     {
         if try_npu_gemm_f32(w, x, out, m, k, n) {
+            return true;
+        }
+    }
+    // AMD Ryzen AI NPU compute offload (Phase 5, whole-graph via ONNX Runtime +
+    // VitisAI). Same measured-verdict + probe-suppress gating as the Intel path;
+    // mutually exclusive in practice (a host has one NPU vendor). Fail-closed →
+    // INERT until `tune --validate-kernels` passes both AMD verdicts on HW.
+    if amd_npu_offload_enabled()
+        && !NPU_PROBE_SUPPRESS.load(std::sync::atomic::Ordering::Relaxed)
+        && !tensor_forced_to_cpu(&w.name)
+    {
+        if try_amd_npu_gemm_f32(w, x, out, m, k, n) {
             return true;
         }
     }
