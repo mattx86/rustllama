@@ -15,8 +15,11 @@ tracing.workspace = true
 
 [features]
 default = []
-# Intel NPU via OpenVINO (Apache-2.0). Enumeration/offload FFI lands in a later
-# phase; the feature gate + stub exist now so the device model is complete.
+# Intel NPU via the OpenVINO C API (Apache-2.0). REAL enumeration FFI
+# (src/openvino.rs); build.rs links `openvino_c` from the SDK located via
+# OPENVINO_DIR / INTEL_OPENVINO_DIR. Off by default so the normal build needs no
+# SDK and stays toolchain-free. The offload/inference FFI lands with op-offload.
 npu-openvino = []
-# AMD NPU via the Ryzen AI / XRT stack. Same shape as npu-openvino.
+# AMD NPU via the Ryzen AI / XRT stack. Same shape as npu-openvino; the FFI is a
+# stub until a Ryzen AI SDK is available to compile-verify against.
 npu-ryzenai = []

@@ -2,9 +2,11 @@
 //!
 //! NPUs are reached only through a vendor runtime — Intel via OpenVINO, AMD via
 //! the Ryzen AI / XRT stack — so the actual enumeration + offload FFI lives in
-//! feature-gated vendor backends (`npu-openvino`, `npu-ryzenai`) that land in a
-//! later phase. This crate is the vendor-neutral surface the rest of the
-//! runtime uses *now*, so NPUs get the same device management as GPUs:
+//! feature-gated vendor backends. Intel (`npu-openvino`) is REAL: `openvino.rs`
+//! enumerates NPUs through the OpenVINO C API (linked from the SDK by
+//! `build.rs`). AMD (`npu-ryzenai`) is a stub until a Ryzen AI SDK is available
+//! to compile against. This crate is the vendor-neutral surface the rest of the
+//! runtime uses, so NPUs get the same device management as GPUs:
 //! **enumeration**, **disable-by-index** (mirroring `RUSTLLAMA_DISABLED_GPUS`),
 //! and a **fingerprint** slug folded into the tuner's system fingerprint.
 //!
@@ -16,6 +18,11 @@
 //! is assembled by the placement layer, not here.
 
 use serde::{Deserialize, Serialize};
+
+// Intel NPU enumeration/offload FFI over the OpenVINO C API. Behind the feature
+// so the default build neither links nor loads OpenVINO.
+#[cfg(feature = "npu-openvino")]
+mod openvino;
 
 /// NPU vendor (which runtime drives it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,14 +59,15 @@ pub fn enumerate() -> Vec<NpuInfo> {
     out
 }
 
-// Vendor enumeration stubs — the real FFI (OpenVINO / Ryzen AI) lands in a
-// later phase. Present now so the device model + feature gates are complete.
+// Intel NPU enumeration via the real OpenVINO C API FFI (`src/openvino.rs`).
 #[cfg(feature = "npu-openvino")]
 fn openvino_enumerate() -> Vec<NpuInfo> {
-    tracing::debug!("npu-openvino: enumeration not yet implemented");
-    Vec::new()
+    openvino::enumerate()
 }
 
+// AMD NPU enumeration stub — the Ryzen AI / XRT FFI lands in a later phase
+// (write-blind: no Ryzen AI SDK on this box). Present now so the device model +
+// feature gate are complete.
 #[cfg(feature = "npu-ryzenai")]
 fn ryzenai_enumerate() -> Vec<NpuInfo> {
     tracing::debug!("npu-ryzenai: enumeration not yet implemented");
@@ -133,6 +141,10 @@ mod tests {
         assert_eq!(parse_indices(""), Vec::<u32>::new());
     }
 
+    // Only the default (no vendor backend) build is guaranteed deviceless; a
+    // build with a real backend (e.g. npu-openvino) may enumerate NPUs on NPU
+    // hardware, so the "empty" invariant is scoped to the stub-free build.
+    #[cfg(not(any(feature = "npu-openvino", feature = "npu-ryzenai")))]
     #[test]
     fn no_backend_enumerates_empty() {
         // No npu-* feature in a plain build → no devices, inert fingerprint.
