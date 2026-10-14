@@ -724,16 +724,17 @@ impl PagedKvCache {
         // capacity once and never re-grows, so KV eviction does not
         // apply here (v1). Route through the plain allocator so a set
         // eviction env var can never engage on a shared/batched cache.
-        let before = self.pages.len();
-        let r = shared.with_table_mut(|table| self.ensure_capacity_plain(table, n_total));
-        // APC correctness: any pages just PHYSICALLY allocated for this slot's
-        // new content must drop their stale block-hash entries — their old
-        // block's KV is about to be overwritten, so a content-hash hit must no
-        // longer resolve to them. (No-op when the APC index is empty.)
-        if r.is_ok() && self.pages.len() > before {
-            shared.apc_prune_realloc(&self.pages[before..]);
+        //
+        // LMCache: demote the blocks on the pages the grow is about to REUSE
+        // before `alloc` auto-prunes their hashes (no-op when the cold tier is
+        // off / no new pages needed). APC correctness — dropping the stale
+        // hashes of reused pages — is handled by `PageTable::alloc` itself.
+        let page_size = (self.page_size as usize).max(1);
+        let need = (n_total as usize).div_ceil(page_size);
+        if need > self.pages.len() {
+            shared.apc_demote_reuse(need - self.pages.len());
         }
-        r
+        shared.with_table_mut(|table| self.ensure_capacity_plain(table, n_total))
     }
 
     /// Shared-store variant of [`Self::write_token`]. Writes a
@@ -932,10 +933,9 @@ mod tests {
     /// across all layers, without needing a model forward pass.
     #[test]
     fn apc_reacquire_preserves_kv_content() {
-        use crate::apc::{acquire_prefix, block_hash_chain, ApcIndex};
+        use crate::apc::block_hash_chain;
         let mut store = small_store(); // page_size 4, 2 layers, 3 heads, head_dim 8
         let mut table = PageTable::new(4, 4);
-        let mut index = ApcIndex::new();
         let n_heads = store.n_kv_heads() as usize;
         let hd = store.head_dim() as usize;
         let page_size = store.page_size() as usize; // 4
@@ -958,7 +958,7 @@ mod tests {
         }
         let pages1: Vec<_> = cache1.pages().to_vec();
         for (i, h) in chain.iter().enumerate() {
-            index.register(*h, pages1[i]);
+            table.apc_register(*h, pages1[i]);
         }
 
         // --- Request 1 completes: free (content retained + still indexed). ---
@@ -967,7 +967,7 @@ mod tests {
 
         // --- Request 2: same prompt → reacquire both blocks by content hash. ---
         let chain2 = block_hash_chain(&prompt, page_size);
-        let shared = acquire_prefix(&mut index, &mut table, &chain2);
+        let shared = table.acquire_prefix(&chain2);
         assert_eq!(shared, pages1, "reacquired the same physical pages");
         assert_eq!(table.free_count(), 2, "reacquired pages left the free list");
 

@@ -1,5 +1,14 @@
 //! `PageId` + `PageTable` — opaque page-id type and the free-list
-//! allocator that hands ids out.
+//! allocator that hands ids out, plus the content-addressed APC block
+//! index (`ApcIndex`) it owns.
+//!
+//! The index lives INSIDE the allocator so that `alloc` — the single
+//! point where a page is physically re-purposed for new content —
+//! automatically prunes that page's stale block hash. This makes the
+//! "a reused page can never be reacquired under its old hash" invariant
+//! hold by construction for every caller (both the single-request
+//! `CpuEngine` and the continuous-batching pool), with no per-call-site
+//! pruning to forget.
 //!
 //! These were originally in `rustllama-engine::batch_scheduler` and
 //! moved here so the paged KV-cache types (`PagedKvStore`,
@@ -36,6 +45,10 @@ pub struct PageTable {
     refs: Vec<u32>,
     total: u32,
     page_size: u32,
+    /// Content-addressed vLLM APC block index (block-hash → the page holding
+    /// that block's KV). Owned here so [`alloc`](Self::alloc) auto-prunes a
+    /// reused page's stale hash.
+    apc: crate::apc::ApcIndex,
 }
 
 impl PageTable {
@@ -45,6 +58,7 @@ impl PageTable {
             refs: vec![0; total as usize],
             total,
             page_size,
+            apc: crate::apc::ApcIndex::new(),
         }
     }
 
@@ -85,7 +99,19 @@ impl PageTable {
             self.refs[p.0 as usize] = 1;
             out.push(p);
         }
+        // Auto-prune: these pages are now physically re-purposed for new
+        // content, so any stale APC block hash pointing at them is dropped —
+        // a content-hash hit can never resolve to an overwritten page.
+        self.apc.remove_pages(&out);
         Some(out)
+    }
+
+    /// The pages `alloc(n)` WOULD return next, without consuming them (the
+    /// free list's LIFO top `n`, in pop order). Used by the LMCache demote
+    /// path to offload each about-to-be-overwritten block BEFORE `alloc`
+    /// auto-prunes its hash. Fewer than `n` if the pool is short.
+    pub fn peek_reuse(&self, n: usize) -> Vec<PageId> {
+        self.free.iter().rev().take(n).copied().collect()
     }
 
     /// Bump the reference count on each page by 1. Used by E3.2's
@@ -151,6 +177,66 @@ impl PageTable {
                 self.free.push(*p);
             }
         }
+    }
+
+    // ---- APC block index (owned here so `alloc` auto-prunes) ----------------
+
+    /// Register a finalized block's page under its content hash.
+    pub fn apc_register(&mut self, hash: crate::apc::BlockHash, page: PageId) {
+        self.apc.register(hash, page);
+    }
+
+    /// vLLM APC acquire: the longest leading run of `chain` blocks present in
+    /// the index whose pages are still valid, taking one reference on each
+    /// (REACQUIRE a freed page — reviving its retained KV — or ADD_REF a live
+    /// one). A stale entry stops the run and is pruned. Returns ref-held pages.
+    pub fn acquire_prefix(&mut self, chain: &[crate::apc::BlockHash]) -> Vec<PageId> {
+        let mut out = Vec::new();
+        for &h in chain {
+            match self.apc_try_acquire(h) {
+                Some(page) => out.push(page),
+                None => break, // gap — reuse only a contiguous prefix
+            }
+        }
+        out
+    }
+
+    /// Try to acquire ONE block from the hot index: reacquire a freed page /
+    /// add_ref a live one. `None` on miss (or a stale entry, which is pruned).
+    /// The per-block primitive the LMCache tiered acquire interleaves with the
+    /// cold tier.
+    pub fn apc_try_acquire(&mut self, hash: crate::apc::BlockHash) -> Option<PageId> {
+        let page = self.apc.get(hash)?;
+        let acquired = if self.refs_of(page) > 0 {
+            self.add_ref(&[page]);
+            true
+        } else {
+            self.reacquire(page)
+        };
+        if acquired {
+            Some(page)
+        } else {
+            self.apc.remove(hash);
+            None
+        }
+    }
+
+    /// Drop a hash→page mapping (used by the tiered acquire when a hot miss is
+    /// about to be served from the cold tier under a fresh page).
+    pub fn apc_remove(&mut self, hash: crate::apc::BlockHash) {
+        self.apc.remove(hash);
+    }
+
+    /// The `(hash, page)` entries pointing at any of `pages` — the LMCache
+    /// demote path reads this (before a reuse `alloc` auto-prunes them) to
+    /// offload each block's bytes keyed by its hash.
+    pub fn apc_hashes_for_pages(&self, pages: &[PageId]) -> Vec<(crate::apc::BlockHash, PageId)> {
+        self.apc.hashes_for_pages(pages)
+    }
+
+    /// `(hits, misses, entries)` of the APC index.
+    pub fn apc_stats(&self) -> (u64, u64, usize) {
+        (self.apc.hits(), self.apc.misses(), self.apc.len())
     }
 }
 

@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 
-use crate::page_table::{PageId, PageTable};
+use crate::page_table::PageId;
 
 /// A content hash identifying a KV block together with every block before it —
 /// the vLLM prefix-hash chain `h(block_i) = H(h(block_{i-1}) ‖ tokens_i)`.
@@ -192,37 +192,9 @@ impl ApcIndex {
     }
 }
 
-/// Acquire the longest leading run of `chain` blocks present in `index` whose
-/// pages are still valid, taking ONE reference on each via `table` (REACQUIRE a
-/// freed page — reviving its retained KV — or ADD_REF a live one). A stale entry
-/// (its page since physically reused) stops the run and is pruned. Returns the
-/// ref-held pages in block order, exactly like a fresh `alloc` of that many
-/// pages, so the caller balances them with `free`.
-///
-/// Shared by [`crate::shared_paged_kv::SharedPagedKv`] (the continuous-batching
-/// pool, called under its table+apc locks) and the single-owner `CpuEngine`
-/// paged path — so vLLM APC reuse is one mechanism across both engines.
-pub fn acquire_prefix(index: &mut ApcIndex, table: &mut PageTable, chain: &[BlockHash]) -> Vec<PageId> {
-    let mut out = Vec::new();
-    for &h in chain {
-        let Some(page) = index.get(h) else {
-            break; // gap — reuse only a contiguous prefix
-        };
-        let acquired = if table.refs_of(page) > 0 {
-            table.add_ref(&[page]);
-            true
-        } else {
-            table.reacquire(page)
-        };
-        if acquired {
-            out.push(page);
-        } else {
-            index.remove(h);
-            break;
-        }
-    }
-    out
-}
+// NOTE: the acquire logic now lives on `PageTable::acquire_prefix` — the index
+// is owned by the table (so `alloc` auto-prunes reused pages), which is also the
+// natural home for the reacquire/add_ref it needs.
 
 #[cfg(test)]
 mod tests {

@@ -28,7 +28,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::apc::{ApcIndex, BlockHash};
+use crate::apc::BlockHash;
 use crate::kv_cold_tier::KvColdTier;
 use crate::page_table::{PageId, PageTable};
 use crate::paged_kv_store::PagedKvStore;
@@ -38,18 +38,18 @@ use crate::paged_kv_store::PagedKvStore;
 /// `PagedKvCache` instances so they can all reach the same byte
 /// storage and free list.
 ///
-/// Also owns the process-wide [`ApcIndex`] (vLLM automatic prefix caching):
-/// the content-addressed block index that lets a new request reacquire the KV
-/// blocks of an earlier (even completed) request by content hash. Lock order:
-/// **table → apc → store** — the acquire path holds table + apc together.
+/// The vLLM APC block index lives inside the `PageTable` (so `alloc` auto-prunes
+/// reused pages); this wrapper exposes it + the LMCache cold tier. Lock order:
+/// **table → store → cold**.
 #[derive(Clone)]
 pub struct SharedPagedKv {
     store: Arc<Mutex<PagedKvStore>>,
+    /// The page table OWNS the APC block index (so `alloc` auto-prunes reused
+    /// pages — see page_table.rs).
     table: Arc<Mutex<PageTable>>,
-    apc: Arc<Mutex<ApcIndex>>,
     /// LMCache CPU cold tier — evicted blocks' bytes keyed by block hash.
     /// Disabled (cap 0) until `set_cold_cap_bytes`. Lock order (whole file):
-    /// **table → apc → store → cold**.
+    /// **table → store → cold**.
     cold: Arc<Mutex<KvColdTier>>,
 }
 
@@ -74,7 +74,6 @@ impl SharedPagedKv {
         Self {
             store: Arc::new(Mutex::new(store)),
             table: Arc::new(Mutex::new(table)),
-            apc: Arc::new(Mutex::new(ApcIndex::new())),
             cold: Arc::new(Mutex::new(KvColdTier::new(0))),
         }
     }
@@ -131,46 +130,25 @@ impl SharedPagedKv {
         f(&mut *t)
     }
 
-    /// Lock-and-execute helper for the APC block index (register / prune /
-    /// stats). Acquired AFTER the table when both are needed.
-    pub fn with_apc_mut<R>(&self, f: impl FnOnce(&mut ApcIndex) -> R) -> R {
-        let mut a = self.apc.lock().expect("apc lock");
-        f(&mut *a)
-    }
-
-    /// vLLM APC acquire: for a prompt's block-hash `chain`, find the longest
-    /// leading run of blocks present in the index whose pages are still valid,
-    /// acquire one reference to each (REACQUIRE a freed page — reviving its
-    /// retained KV — or ADD_REF a live one), and return them in page order. The
-    /// returned pages are ref-held by the caller, exactly like a fresh `alloc`,
-    /// so [`crate::paged_kv_cache::PagedKvCache::pin_shared_prefix`] +
-    /// `release` balance them. A stale entry (its page since reused) stops the
-    /// run and is pruned. Holds table → apc.
-    /// LMCache-aware: on a hot-index miss for the next block, PROMOTE it from
-    /// the cold tier into a freshly-allocated page (copy bytes in + re-register)
-    /// so the reused prefix extends through offloaded blocks too. Stops at the
-    /// first block missing in BOTH tiers. With the cold tier disabled this is
-    /// byte-identical to the hot-only acquire. Lock order table→apc→store→cold.
+    /// vLLM APC acquire (LMCache-aware): the longest leading run of `chain`
+    /// blocks reusable as a prefix. Each block is tried in the HOT index first
+    /// (reacquire a freed page / add_ref a live one); on a hot miss it is tried
+    /// in the COLD tier — PROMOTED back into a freshly-allocated page (copy bytes
+    /// in + re-register). Stops at the first block missing in BOTH tiers. With
+    /// the cold tier disabled this is byte-identical to the hot-only acquire.
+    /// The returned pages are ref-held (like a fresh `alloc`). Lock order
+    /// table → store → cold.
     pub fn apc_acquire_prefix(&self, chain: &[BlockHash]) -> Vec<PageId> {
         let mut table = self.table.lock().expect("table lock");
-        let mut apc = self.apc.lock().expect("apc lock");
         let mut out = Vec::new();
         for &h in chain {
-            // 1. Hot index: reacquire a freed page / add_ref a live one.
-            if let Some(page) = apc.get(h) {
-                let acquired = if table.refs_of(page) > 0 {
-                    table.add_ref(&[page]);
-                    true
-                } else {
-                    table.reacquire(page)
-                };
-                if acquired {
-                    out.push(page);
-                    continue;
-                }
-                apc.remove(h); // stale — fall through to the cold tier
+            // 1. Hot index.
+            if let Some(page) = table.apc_try_acquire(h) {
+                out.push(page);
+                continue;
             }
-            // 2. Cold tier: promote the block back into a fresh page.
+            // 2. Cold tier: promote into a fresh page (`alloc` auto-prunes any
+            // stale hash on it).
             let mut store = self.store.lock().expect("store lock");
             let mut cold = self.cold.lock().expect("cold lock");
             let Some(bytes) = cold.promote(h) else {
@@ -180,7 +158,7 @@ impl SharedPagedKv {
                 break; // pool full — can't promote
             };
             if store.write_page(page, &bytes) {
-                apc.register(h, page);
+                table.apc_register(h, page);
                 out.push(page);
             } else {
                 table.free(&[page]);
@@ -196,42 +174,41 @@ impl SharedPagedKv {
         if entries.is_empty() {
             return;
         }
-        let mut apc = self.apc.lock().expect("apc lock");
+        let mut table = self.table.lock().expect("table lock");
         for (h, p) in entries {
-            apc.register(*h, *p);
+            table.apc_register(*h, *p);
         }
     }
 
-    /// Prune stale index entries for pages just PHYSICALLY allocated for new
-    /// content — and, first, DEMOTE each about-to-be-overwritten block's bytes
-    /// to the cold tier (keyed by its hash) so a later request can promote it
-    /// back. Must be called right after any fresh `alloc` of pages for a slot,
-    /// before the slot writes into them. No demote when the cold tier is
-    /// disabled. Lock order table(released)→apc→store→cold.
-    pub fn apc_prune_realloc(&self, pages: &[PageId]) {
-        if pages.is_empty() {
+    /// LMCache demote: before a reuse `alloc` auto-prunes their hashes, offload
+    /// the blocks on the `n` pages `alloc` is about to reuse to the cold tier
+    /// (keyed by hash — their bytes are still intact at this point). No-op when
+    /// the cold tier is disabled. Call right BEFORE growing the cache. Lock
+    /// order table → store → cold.
+    pub fn apc_demote_reuse(&self, n: usize) {
+        if n == 0 {
             return;
         }
-        let mut apc = self.apc.lock().expect("apc lock");
-        let evicting = apc.hashes_for_pages(pages);
-        if !evicting.is_empty() {
-            let store = self.store.lock().expect("store lock");
-            let mut cold = self.cold.lock().expect("cold lock");
-            if cold.is_enabled() {
-                for (hash, page) in evicting {
-                    if let Some(bytes) = store.read_page(page) {
-                        cold.demote(hash, bytes);
-                    }
+        let table = self.table.lock().expect("table lock");
+        let reuse = table.peek_reuse(n);
+        let evicting = table.apc_hashes_for_pages(&reuse);
+        if evicting.is_empty() {
+            return;
+        }
+        let store = self.store.lock().expect("store lock");
+        let mut cold = self.cold.lock().expect("cold lock");
+        if cold.is_enabled() {
+            for (hash, page) in evicting {
+                if let Some(bytes) = store.read_page(page) {
+                    cold.demote(hash, bytes);
                 }
             }
         }
-        apc.remove_pages(pages);
     }
 
     /// `(hits, misses, entries)` of the APC index, for stats/telemetry.
     pub fn apc_stats(&self) -> (u64, u64, usize) {
-        let a = self.apc.lock().expect("apc lock");
-        (a.hits(), a.misses(), a.len())
+        self.table.lock().expect("table lock").apc_stats()
     }
 }
 
@@ -325,10 +302,9 @@ mod tests {
         shared.with_table_mut(|t| t.free(&pages));
 
         // Slot B frees, then those pages are PHYSICALLY realloc'd for new
-        // content → prune drops the stale hashes.
+        // content → `alloc` AUTO-prunes the stale hashes.
         shared.with_table_mut(|t| t.free(&got));
-        let fresh = shared.with_table_mut(|t| t.alloc(2).expect("realloc 2"));
-        shared.apc_prune_realloc(&fresh);
+        let _fresh = shared.with_table_mut(|t| t.alloc(2).expect("realloc 2"));
         assert!(
             shared.apc_acquire_prefix(&[h0, h1]).is_empty(),
             "pruned hashes no longer resolve after physical realloc"
@@ -349,13 +325,18 @@ mod tests {
         shared.with_store_mut(|s| assert!(s.write_page(page, &payload)));
         shared.apc_register(&[(h, page)]);
 
-        // The page is PHYSICALLY reused for new content → demote its block to the
-        // cold tier (keyed by hash) + prune the hot entry, then overwrite it.
-        shared.apc_prune_realloc(&[page]);
+        // Request 1 completes: free the page (content retained, still indexed).
+        shared.with_table_mut(|t| t.free(&[page]));
+        // A new slot is about to reuse it → DEMOTE its block to the cold tier
+        // (peeks the free list before the grow), then `alloc` reuses the page +
+        // AUTO-prunes its hot hash, and the slot overwrites it with new content.
+        shared.apc_demote_reuse(1);
+        let reused = shared.with_table_mut(|t| t.alloc(1).expect("reuse")[0]);
+        assert_eq!(reused, page, "reused the just-freed MRU page");
         shared.with_store_mut(|s| assert!(s.write_page(page, &vec![0f32; stride])));
 
-        // Acquire by hash: hot MISS (pruned) → promote from the cold tier into a
-        // fresh page holding the original bytes.
+        // Acquire by hash: hot MISS (auto-pruned) → promote from the cold tier
+        // into a fresh page holding the original bytes.
         let got = shared.apc_acquire_prefix(&[h]);
         assert_eq!(got.len(), 1, "promoted the block from the cold tier");
         let promoted = got[0];
