@@ -12,18 +12,23 @@ description = "Backend-agnostic NPU device model: enumeration, disable-by-index,
 [dependencies]
 serde = { workspace = true }
 tracing.workspace = true
-# Runtime loader for the AMD XRT NPU runtime under `npu-ryzenai` (src/ryzenai.rs
-# dlopen's xrt_coreutil, mirroring how rustllama-l0-sys loads ze_loader). Optional
-# + feature-gated, so the default build pulls nothing.
+# Runtime loader for the bundled vendor NPU runtimes (Intel OpenVINO via
+# src/openvino.rs, AMD XRT via src/ryzenai.rs) — both dlopen their runtime next
+# to the binary, mirroring how rustllama-l0-sys loads ze_loader. Optional +
+# feature-gated; pulled whenever a vendor backend is enabled.
 libloading = { version = "0.8", optional = true }
 
 [features]
-default = []
-# Intel NPU via the OpenVINO C API (Apache-2.0). REAL enumeration FFI
-# (src/openvino.rs); build.rs links `openvino_c` from the SDK located via
-# OPENVINO_DIR / INTEL_OPENVINO_DIR. Off by default so the normal build needs no
-# SDK and stays toolchain-free. The offload/inference FFI lands with op-offload.
-npu-openvino = []
+# Both vendor backends are ON by default: they runtime-load (dlopen) their
+# vendor runtime, so they need no SDK at build time and stay toolchain-free, and
+# the shipped binary carries NPU support out of the box (the release bundles the
+# Apache-2.0 OpenVINO + XRT runtimes next to it). A build with
+# `--no-default-features` is fully deviceless (enumerates nothing).
+default = ["npu-openvino", "npu-ryzenai"]
+# Intel NPU via the OpenVINO C API (Apache-2.0). Enumeration FFI in
+# src/openvino.rs runtime-loads `openvino_c` (bundled next to the binary);
+# absent runtime / no NPU → empty. The offload/inference FFI lands with op-offload.
+npu-openvino = ["dep:libloading"]
 # AMD NPU via the Ryzen AI / XRT stack. Enumerates by runtime-loading XRT
 # (`xrt_coreutil`) via libloading — compiles here, but the XRT call path is
 # WRITE-BLIND (no Ryzen AI SDK/HW on this box) and validated on AMD NPU HW.

@@ -2,16 +2,18 @@
 //!
 //! NPUs are reached only through a vendor runtime — Intel via OpenVINO, AMD via
 //! the Ryzen AI / XRT stack — so the actual enumeration + offload FFI lives in
-//! feature-gated vendor backends. Intel (`npu-openvino`) is REAL: `openvino.rs`
-//! enumerates NPUs through the OpenVINO C API (linked from the SDK by
-//! `build.rs`). AMD (`npu-ryzenai`) is a stub until a Ryzen AI SDK is available
-//! to compile against. This crate is the vendor-neutral surface the rest of the
+//! feature-gated vendor backends. Both are ON by default and RUNTIME-LOAD their
+//! vendor runtime (`openvino.rs` dlopen's `openvino_c`; `ryzenai.rs` dlopen's
+//! `xrt_coreutil`): the release artifact BUNDLES those Apache-2.0 runtimes next
+//! to the binary, so NPU support works with no user install, and a box without
+//! the runtime (or without an NPU) enumerates nothing — fail-soft, never a
+//! load-time crash. This crate is the vendor-neutral surface the rest of the
 //! runtime uses, so NPUs get the same device management as GPUs:
 //! **enumeration**, **disable-by-index** (mirroring `RUSTLLAMA_DISABLED_GPUS`),
 //! and a **fingerprint** slug folded into the tuner's system fingerprint.
 //!
-//! With no `npu-*` feature (or no NPU hardware) [`enumerate`] returns empty and
-//! the whole surface is inert — identical behavior to a build without NPUs.
+//! With `--no-default-features` (or no NPU hardware) [`enumerate`] returns empty
+//! and the whole surface is inert — identical behavior to a build without NPUs.
 //!
 //! Device-index space: NPUs occupy a 0-based range of their own; the unified
 //! cross-backend index space (GPUs offset by SYCL count, then CUDA, then NPUs)
@@ -50,7 +52,20 @@ pub struct NpuInfo {
 
 /// Enumerate all NPUs across the enabled vendor backends, re-indexed 0-based
 /// across the merged set. Empty without any `npu-*` feature or NPU hardware.
+///
+/// Probed once per process and cached: the vendor dlopen + runtime init is
+/// non-trivial, and `enumerate` feeds hot paths (the system fingerprint, the
+/// placement tier build), so repeating it would be wasteful. The device set
+/// does not change within a process run.
 pub fn enumerate() -> Vec<NpuInfo> {
+    static CACHE: std::sync::OnceLock<Vec<NpuInfo>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(enumerate_uncached).clone()
+}
+
+/// The actual probe (see [`enumerate`]). Not self-referential — the vendor
+/// backends never call back into [`enumerate`] — so it is safe to run inside the
+/// `OnceLock` initializer.
+fn enumerate_uncached() -> Vec<NpuInfo> {
     #[allow(unused_mut)]
     let mut out: Vec<NpuInfo> = Vec::new();
     #[cfg(feature = "npu-openvino")]
@@ -63,7 +78,7 @@ pub fn enumerate() -> Vec<NpuInfo> {
     out
 }
 
-// Intel NPU enumeration via the real OpenVINO C API FFI (`src/openvino.rs`).
+// Intel NPU enumeration via the OpenVINO C API, runtime-loaded (`src/openvino.rs`).
 #[cfg(feature = "npu-openvino")]
 fn openvino_enumerate() -> Vec<NpuInfo> {
     openvino::enumerate()
@@ -144,16 +159,31 @@ mod tests {
         assert_eq!(parse_indices(""), Vec::<u32>::new());
     }
 
-    // Only the default (no vendor backend) build is guaranteed deviceless; a
-    // build with a real backend (e.g. npu-openvino) may enumerate NPUs on NPU
-    // hardware, so the "empty" invariant is scoped to the stub-free build.
+    // A `--no-default-features` (deviceless) build is guaranteed to enumerate
+    // nothing; a build with a vendor backend may enumerate NPUs on NPU hardware,
+    // so the "empty" invariant is scoped to the no-backend build.
     #[cfg(not(any(feature = "npu-openvino", feature = "npu-ryzenai")))]
     #[test]
     fn no_backend_enumerates_empty() {
-        // No npu-* feature in a plain build → no devices, inert fingerprint.
+        // No npu-* feature → no devices, inert fingerprint.
         assert!(enumerate().is_empty());
         assert_eq!(npu_fingerprint(&[]), "npu:none");
         assert!(usable_npus(&[]).is_empty());
+    }
+
+    // With a vendor backend compiled in, enumeration must FAIL SOFT on a host
+    // lacking the bundled runtime / an NPU — i.e. not panic and respect the
+    // disable gate. (On actual NPU hardware with the runtime present this would
+    // return devices; the assertions hold either way.)
+    #[cfg(any(feature = "npu-openvino", feature = "npu-ryzenai"))]
+    #[test]
+    fn backend_enumeration_is_fail_soft() {
+        let all = enumerate();
+        // Disabling every enumerated index yields no usable NPUs.
+        let all_idx: Vec<u32> = all.iter().map(|n| n.index).collect();
+        assert!(usable_npus(&all_idx).is_empty());
+        // Fingerprint is deterministic and non-empty.
+        assert!(!npu_fingerprint(&[]).is_empty());
     }
 
     #[test]
