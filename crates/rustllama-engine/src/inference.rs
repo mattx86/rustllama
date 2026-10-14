@@ -754,6 +754,12 @@ struct EngineState {
     /// is not yet wired for hybrid models; restoring resets this
     /// cache to its initial state.
     delta_net_cache: Option<rustllama_models::llama_arch::DeltaNetCache>,
+    /// vLLM automatic-prefix-cache index for the PAGED backends — the
+    /// content-addressed block index that lets a new prompt reacquire the KV
+    /// blocks of an earlier request (even a completed one whose pages were
+    /// freed but not yet reused) by content hash. The paged analog of `pool`
+    /// (which serves the `Contiguous` backend); empty + unused on contiguous.
+    apc: rustllama_models::apc::ApcIndex,
 }
 
 impl EngineState {
@@ -787,10 +793,10 @@ impl EngineState {
         min_reuse: usize,
         prompt_max: usize,
     ) -> usize {
-        // Paged KV (V1) has no per-tensor `restore_prefix` analog —
-        // the prefix cache is a contiguous-only feature for now.
-        // Reset and start fresh; the lost optimization is documented
-        // in the kv_cache_layout config field's docstring.
+        // The Contiguous backend reuses via the snapshot `pool` (below); the
+        // Paged backends reuse via the vLLM APC index (`self.apc`) — block-level,
+        // content-addressed reuse that revives even a completed request's freed
+        // KV by content hash. Same mechanism the paged serving engine uses.
         let kv = match &mut self.kv_backend {
             KvBackend::Contiguous(kv) => kv,
             KvBackend::Paged { cache, table, .. }
@@ -800,9 +806,41 @@ impl EngineState {
             | KvBackend::PagedMxfp4 { cache, table, .. }
             | KvBackend::PagedMxfp6 { cache, table, .. }
             | KvBackend::PagedMxfp8 { cache, table, .. } => {
+                use rustllama_models::apc;
+                let page_size = table.page_size() as usize;
+                if !enabled || prompt_max == 0 || page_size == 0 {
+                    cache.release(table);
+                    self.last_ids.clear();
+                    return 0;
+                }
+                // Register the just-finished request's full blocks (prompt +
+                // generated tokens, in `last_ids`) against the pages that still
+                // hold their KV — block i ↔ page i — so a later prompt can
+                // reacquire them by content hash. BEFORE release (pages valid).
+                if !self.last_ids.is_empty() {
+                    let chain = apc::block_hash_chain(&self.last_ids, page_size);
+                    let pages = cache.pages();
+                    let n = chain.len().min(pages.len());
+                    for i in 0..n {
+                        self.apc.register(chain[i], pages[i]);
+                    }
+                }
+                // Free the finished request's pages: they drop to refcount 0 but
+                // keep their contents + index entries, so the reacquire below can
+                // revive the matching prefix instead of recomputing it.
                 cache.release(table);
                 self.last_ids.clear();
-                return 0;
+                // vLLM APC: reacquire the longest matching block prefix of the
+                // NEW prompt into the now-fresh cache; prefill then starts at
+                // that boundary and the caller's ensure_capacity grows the
+                // suffix pages exactly as it would without reuse.
+                let chain = apc::block_hash_chain(prompt_u32, page_size);
+                let shared_pages = apc::acquire_prefix(&mut self.apc, table, &chain);
+                let shared_lcp = shared_pages.len() * page_size;
+                if !shared_pages.is_empty() {
+                    cache.pin_shared_prefix(shared_pages, shared_lcp as u32);
+                }
+                return shared_lcp;
             }
         };
         if !enabled || prompt_max == 0 {
@@ -1625,6 +1663,7 @@ impl CpuEngine {
                 last_ids: Vec::new(),
                 pool: PrefixCachePool::new(DEFAULT_PREFIX_CACHE_MAX_SNAPSHOTS),
                 delta_net_cache,
+                apc: rustllama_models::apc::ApcIndex::new(),
             })),
             sycl_worker: Arc::new(SyclWorker::spawn()),
             max_ctx: ctx,
@@ -2256,6 +2295,7 @@ impl CpuEngine {
                 last_ids: Vec::new(),
                 pool: PrefixCachePool::new(DEFAULT_PREFIX_CACHE_MAX_SNAPSHOTS),
                 delta_net_cache,
+                apc: rustllama_models::apc::ApcIndex::new(),
             })),
             sycl_worker: Arc::new(SyclWorker::spawn()),
             max_ctx: ctx,
@@ -2418,6 +2458,7 @@ impl CpuEngine {
                 last_ids: Vec::new(),
                 pool: PrefixCachePool::new(DEFAULT_PREFIX_CACHE_MAX_SNAPSHOTS),
                 delta_net_cache,
+                apc: rustllama_models::apc::ApcIndex::new(),
             })),
             sycl_worker: Arc::new(SyclWorker::spawn()),
             max_ctx: ctx,
@@ -3763,6 +3804,7 @@ impl CpuEngine {
                 last_ids: Vec::new(),
                 pool: PrefixCachePool::new(self.prefix_cache_max_snapshots),
                 delta_net_cache,
+                apc: rustllama_models::apc::ApcIndex::new(),
             })),
             // Forks share the same SYCL worker. Their generations
             // serialize through it, which matches our single-flight
@@ -7720,6 +7762,9 @@ fn drive_vlm_generation(
         last_ids,
         pool,
         delta_net_cache,
+        // The VLM prefill path uses the contiguous snapshot pool (image-hash
+        // gated); block-level APC for the paged VLM path is a follow-up.
+        apc: _,
     } = &mut *state_guard;
 
     // Hybrid models: the VLM prefix pool stores KV-only snapshots for

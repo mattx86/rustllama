@@ -137,26 +137,7 @@ impl SharedPagedKv {
     pub fn apc_acquire_prefix(&self, chain: &[BlockHash]) -> Vec<PageId> {
         let mut table = self.table.lock().expect("table lock");
         let mut apc = self.apc.lock().expect("apc lock");
-        let mut out = Vec::new();
-        for &h in chain {
-            let Some(page) = apc.get(h) else {
-                break; // gap — vLLM reuses only a contiguous prefix
-            };
-            let acquired = if table.refs_of(page) > 0 {
-                table.add_ref(&[page]);
-                true
-            } else {
-                table.reacquire(page)
-            };
-            if acquired {
-                out.push(page);
-            } else {
-                // Page vanished (physically reused) — drop the stale entry.
-                apc.remove(h);
-                break;
-            }
-        }
-        out
+        crate::apc::acquire_prefix(&mut apc, &mut table, chain)
     }
 
     /// Register finalized blocks: each `(block_hash, page)` becomes reusable by
