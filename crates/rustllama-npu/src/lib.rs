@@ -92,6 +92,27 @@ fn ryzenai_enumerate() -> Vec<NpuInfo> {
     ryzenai::enumerate()
 }
 
+/// Candidate filesystem locations for a BUNDLED vendor runtime library, tried in
+/// order by the vendor loaders: next to the binary (the Windows release stages
+/// DLLs flat there), in a `lib/` subdir next to the binary (the Linux release's
+/// bundled-`.so` dir), then the bare name (a system install / PATH /
+/// LD_LIBRARY_PATH). Trying an ABSOLUTE exe-relative path is what makes the
+/// bundled case work on Linux: `dlopen` of a bare name does NOT search the
+/// executable's directory or its `DT_RUNPATH`, only `DT_RPATH` / LD_LIBRARY_PATH
+/// / the default dirs — so a `.so` sitting in `./lib` would otherwise be missed.
+#[cfg(any(feature = "npu-openvino", feature = "npu-ryzenai"))]
+fn bundled_lib_candidates(name: &str) -> Vec<std::path::PathBuf> {
+    let mut v = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            v.push(dir.join(name)); // flat next to the binary (Windows)
+            v.push(dir.join("lib").join(name)); // ./lib next to the binary (Linux)
+        }
+    }
+    v.push(std::path::PathBuf::from(name)); // system / PATH / LD_LIBRARY_PATH
+    v
+}
+
 /// Parse a comma-separated index list (e.g. "0,2"), ignoring blanks/garbage —
 /// matches the `RUSTLLAMA_DISABLED_GPUS` parsing.
 fn parse_indices(s: &str) -> Vec<u32> {

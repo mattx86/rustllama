@@ -53,14 +53,16 @@ pub(crate) fn enumerate() -> Vec<NpuInfo> {
 
 /// Load XRT and call `xclProbe`. None on any failure (fail-soft).
 fn probe_count() -> Option<u32> {
-    for name in XRT_LIBS {
+    let cands: Vec<std::path::PathBuf> =
+        XRT_LIBS.iter().flat_map(|n| crate::bundled_lib_candidates(n)).collect();
+    for cand in cands {
         // SAFETY: Library::new runs the library's initializer (DllMain / _init).
         // XRT is first-party AMD code; the risk is bounded. Any error → try the
         // next candidate, then give up.
-        let lib = match unsafe { libloading::Library::new(name) } {
+        let lib = match unsafe { libloading::Library::new(&cand) } {
             Ok(l) => l,
             Err(e) => {
-                tracing::debug!("npu-ryzenai: {name} not loadable: {e}");
+                tracing::debug!("npu-ryzenai: {} not loadable: {e}", cand.display());
                 continue;
             }
         };
@@ -68,13 +70,13 @@ fn probe_count() -> Option<u32> {
         let probe: libloading::Symbol<XclProbeFn> = match unsafe { lib.get(b"xclProbe\0") } {
             Ok(s) => s,
             Err(e) => {
-                tracing::debug!("npu-ryzenai: {name} has no xclProbe: {e}");
+                tracing::debug!("npu-ryzenai: {} has no xclProbe: {e}", cand.display());
                 continue;
             }
         };
         // SAFETY: signature matches the export; `xclProbe` needs no prior init.
         let n = unsafe { probe() };
-        tracing::info!("npu-ryzenai: XRT ({name}) reports {n} device(s)");
+        tracing::info!("npu-ryzenai: XRT ({}) reports {n} device(s)", cand.display());
         return Some(n as u32);
     }
     None

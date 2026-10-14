@@ -53,12 +53,15 @@ type OvCoreGetPropertyFn = unsafe extern "C" fn(
 ) -> OvStatus;
 type OvFreeFn = unsafe extern "C" fn(content: *const c_char);
 
-/// Candidate `openvino_c` library names; the OS loader searches the exe dir
-/// (Windows) / `$ORIGIN` RPATH (Linux) first, where the release stages it.
+/// `openvino_c` library file name per OS. The release bundles this (and the
+/// bare→SONAME symlink on Linux) next to the binary; [`crate::bundled_lib_candidates`]
+/// resolves the exe-relative path.
 #[cfg(windows)]
-const OV_LIBS: &[&str] = &["openvino_c.dll"];
-#[cfg(not(windows))]
-const OV_LIBS: &[&str] = &["libopenvino_c.so", "libopenvino_c.so.2026"];
+const OV_LIB: &str = "openvino_c.dll";
+#[cfg(target_os = "macos")]
+const OV_LIB: &str = "libopenvino_c.dylib";
+#[cfg(all(unix, not(target_os = "macos")))]
+const OV_LIB: &str = "libopenvino_c.so";
 
 /// Enumerate Intel NPUs OpenVINO can see. Returns empty (never panics) on any
 /// failure — missing runtime, missing symbol, or FFI error. `index` is left 0
@@ -139,18 +142,16 @@ unsafe fn enumerate_inner() -> Result<Vec<NpuInfo>, String> {
     Ok(out)
 }
 
-/// Try each candidate name; first that loads wins. Err if none load.
+/// Try the bundled exe-relative locations, then the bare name; first that loads
+/// wins. Err if none load.
 unsafe fn load_openvino() -> Result<libloading::Library, String> {
     let mut last = String::new();
-    for name in OV_LIBS {
+    for cand in crate::bundled_lib_candidates(OV_LIB) {
         // SAFETY: Library::new runs the library's initializer (DllMain / _init).
         // OpenVINO is first-party Intel code; the risk is bounded.
-        match libloading::Library::new(name) {
+        match libloading::Library::new(&cand) {
             Ok(l) => return Ok(l),
-            Err(e) => {
-                last = format!("{name}: {e}");
-                tracing::debug!("npu-openvino: {last}");
-            }
+            Err(e) => last = format!("{}: {e}", cand.display()),
         }
     }
     Err(format!("OpenVINO runtime not loadable ({last})"))
