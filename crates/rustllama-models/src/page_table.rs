@@ -95,6 +95,34 @@ impl PageTable {
         }
     }
 
+    /// APC un-evict: revive a page that is currently on the free list
+    /// (refcount 0) back to refcount 1 **without clearing its contents**.
+    /// A freed page still physically holds its old block's KV until the
+    /// page is re-allocated, so a content-hash (prefix-cache) hit can bring
+    /// the block back instead of recomputing it — this is what makes
+    /// completed requests' KV reusable. Removes the page from the free list
+    /// and returns `true`; returns `false` when the page is NOT free
+    /// (refcount > 0 — already live, so the caller should [`add_ref`] it
+    /// instead; or the page was since physically reused and its old content
+    /// is gone). The caller (the APC index owner) must drop the page's stale
+    /// hash entries whenever `alloc` hands that page out for new content.
+    ///
+    /// [`add_ref`]: Self::add_ref
+    pub fn reacquire(&mut self, page: PageId) -> bool {
+        if self.refs[page.0 as usize] != 0 {
+            return false; // live (or out-of-range handled by index) — not a revival
+        }
+        match self.free.iter().position(|p| *p == page) {
+            Some(pos) => {
+                self.free.swap_remove(pos);
+                self.refs[page.0 as usize] = 1;
+                true
+            }
+            // refcount 0 but not on the free list should never happen; be safe.
+            None => false,
+        }
+    }
+
     /// Decrement reference counts. Pages whose count reaches 0 go
     /// back on the free list. Idempotent on the assumption that the
     /// caller is the sole owner of `pages` for this drop event (no
@@ -155,6 +183,26 @@ mod tests {
         // Slot B finishes — pages return to free list.
         t.free(&pages);
         assert_eq!(t.free_count(), 4);
+    }
+
+    /// APC un-evict: a freed page can be reacquired off the free list
+    /// (refcount 0 → 1) and later re-freed, round-tripping the free count.
+    /// Reacquiring a LIVE page fails (the caller must `add_ref` instead).
+    #[test]
+    fn reacquire_revives_a_freed_page() {
+        let mut t = PageTable::new(3, 16);
+        let pages = t.alloc(1).expect("alloc 1");
+        let p = pages[0];
+        t.free(&pages);
+        assert_eq!(t.free_count(), 3);
+        // Revive it (content-hash hit).
+        assert!(t.reacquire(p), "a free page should reacquire");
+        assert_eq!(t.free_count(), 2);
+        // Reacquiring a now-live page fails.
+        assert!(!t.reacquire(p), "a live page must not reacquire");
+        // Freeing it returns it to the list.
+        t.free(&[p]);
+        assert_eq!(t.free_count(), 3);
     }
 
     /// `add_ref` followed by N+1 `free` calls is a defensive no-op

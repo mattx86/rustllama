@@ -11,6 +11,7 @@ pub mod imatrix_collect;
 pub mod kv_bias;
 pub mod llama_arch;
 pub mod llama_config;
+pub mod apc;
 pub mod mamba_arch;
 pub mod moe;
 pub mod page_table;
