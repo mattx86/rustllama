@@ -80,7 +80,7 @@ unsafe fn enumerate_inner() -> Result<Vec<NpuInfo>, String> {
     // Load the bundled OpenVINO C runtime (absent on non-release / non-NPU hosts
     // → fail soft). Keep `lib` alive for the whole call; the fn pointers copied
     // out of it stay valid only while it is loaded.
-    let lib = load_openvino()?;
+    let lib = load_runtime()?;
     let ov_core_create = *get::<OvCoreCreateFn>(&lib, b"ov_core_create\0")?;
     let ov_core_free = *get::<OvCoreFreeFn>(&lib, b"ov_core_free\0")?;
     let ov_get_devices =
@@ -142,9 +142,10 @@ unsafe fn enumerate_inner() -> Result<Vec<NpuInfo>, String> {
     Ok(out)
 }
 
-/// Try the bundled exe-relative locations, then the bare name; first that loads
-/// wins. Err if none load.
-unsafe fn load_openvino() -> Result<libloading::Library, String> {
+/// Load the OpenVINO C runtime from the bundled exe-relative locations, then the
+/// bare name; first that loads wins. Err if none load. Shared by enumeration
+/// (this module) and compute offload (`offload.rs`).
+pub(crate) unsafe fn load_runtime() -> Result<libloading::Library, String> {
     let mut last = String::new();
     for cand in crate::bundled_lib_candidates(OV_LIB) {
         // SAFETY: Library::new runs the library's initializer (DllMain / _init).

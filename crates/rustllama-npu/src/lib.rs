@@ -30,6 +30,14 @@ mod openvino;
 #[cfg(feature = "npu-ryzenai")]
 mod ryzenai;
 
+// Intel NPU COMPUTE offload (Phase 5) — op-level MatMul via OpenVINO. Write-blind
+// (validated on NPU HW via `doctor --npu-parity` + the tuner verdict).
+#[cfg(feature = "npu-openvino")]
+mod offload;
+
+#[cfg(feature = "npu-openvino")]
+pub use offload::NpuExecutor;
+
 /// NPU vendor (which runtime drives it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NpuVendor {
@@ -113,6 +121,53 @@ fn bundled_lib_candidates(name: &str) -> Vec<std::path::PathBuf> {
     v
 }
 
+/// Result of the NPU compute-offload parity self-check vs the CPU reference
+/// (Phase 5). Feature-agnostic so the `doctor` + tuner-verdict wiring can depend
+/// on it in any build; `supported == false` is a SKIP (no NPU / backend off).
+#[derive(Debug, Clone, Copy)]
+pub struct NpuParity {
+    /// An NPU + the offload path were available (else the check is a SKIP).
+    pub supported: bool,
+    /// Cosine similarity vs the CPU reference (1.0 == identical direction).
+    pub cos: f64,
+    /// Max relative elementwise error vs the CPU reference.
+    pub max_rel: f64,
+    /// Passed the correctness thresholds.
+    pub pass: bool,
+}
+
+impl NpuParity {
+    /// The SKIP result — no NPU / offload backend present.
+    pub const fn skipped() -> NpuParity {
+        NpuParity { supported: false, cos: 0.0, max_rel: 0.0, pass: false }
+    }
+}
+
+/// Whether Intel NPU COMPUTE offload (OpenVINO MatMul) is available on this host
+/// — the backend is compiled in AND an NPU + its runtime are present. Always
+/// `false` without the `npu-openvino` feature or off NPU hardware.
+pub fn npu_offload_available() -> bool {
+    #[cfg(feature = "npu-openvino")]
+    {
+        return offload::NpuExecutor::new().is_some();
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Run the NPU matmul parity self-check (Phase 5). SKIP ([`NpuParity::skipped`])
+/// without the backend or an NPU; otherwise the measured cos / max_rel / pass
+/// vs the CPU reference — read by `doctor --npu-parity` and the tuner verdict
+/// (`npu:matmul_f32`) that fail-closed-gates the dispatch.
+pub fn npu_matmul_parity() -> NpuParity {
+    #[cfg(feature = "npu-openvino")]
+    {
+        return offload::matmul_parity();
+    }
+    #[allow(unreachable_code)]
+    NpuParity::skipped()
+}
+
 /// Parse a comma-separated index list (e.g. "0,2"), ignoring blanks/garbage —
 /// matches the `RUSTLLAMA_DISABLED_GPUS` parsing.
 fn parse_indices(s: &str) -> Vec<u32> {
@@ -178,6 +233,16 @@ mod tests {
     fn parse_indices_ignores_garbage() {
         assert_eq!(parse_indices("0,2, 3 ,x,"), vec![0, 2, 3]);
         assert_eq!(parse_indices(""), Vec::<u32>::new());
+    }
+
+    // Phase-5 offload must FAIL SOFT off NPU hardware: no panic, a SKIP result,
+    // and the invariants pass⇒supported and available⇒parity-supported hold.
+    #[cfg(feature = "npu-openvino")]
+    #[test]
+    fn offload_parity_is_fail_soft() {
+        let p = npu_matmul_parity();
+        assert!(!p.pass || p.supported, "pass can't be true without support");
+        assert!(!npu_offload_available() || p.supported);
     }
 
     // A `--no-default-features` (deviceless) build is guaranteed to enumerate
