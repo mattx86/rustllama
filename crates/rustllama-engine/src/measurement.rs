@@ -21,6 +21,37 @@ use crate::inference::CpuEngine;
 use crate::SamplingParams;
 use rustllama_models::llama_arch::KvDtype;
 
+/// Collect `repeats` timed decode runs (clearing the prefix cache before each)
+/// and return the (UNSORTED) tok/s runs + the last error seen — the shared
+/// inner loop of the tuner's decode A/B sweeps. Each run is one
+/// `generate_token_ids` whose `last_request_stats()` gives `tokens_generated /
+/// (decode_ms/1000)`. Factored out of ~half a dozen copy-pasted sweep loops;
+/// the caller keeps its own warmup + sort + median/max + result shaping (which
+/// differ between sweeps — simple vs even-averaged median, etc.).
+fn collect_decode_tok_s(
+    cpu: &mut CpuEngine,
+    prompt_ids: &[i32],
+    decode_tokens: u32,
+    repeats: u32,
+    sampling: &SamplingParams,
+) -> (Vec<f64>, Option<String>) {
+    let mut runs: Vec<f64> = Vec::with_capacity(repeats as usize);
+    let mut last_err: Option<String> = None;
+    for _ in 0..repeats {
+        cpu.clear_prefix_cache();
+        match cpu.generate_token_ids(prompt_ids, decode_tokens, sampling) {
+            Ok(_) => {
+                let stats = cpu.last_request_stats();
+                if stats.decode_ms > 0.0 && stats.tokens_generated > 0 {
+                    runs.push((stats.tokens_generated as f64) / (stats.decode_ms / 1000.0));
+                }
+            }
+            Err(e) => last_err = Some(e.to_string()),
+        }
+    }
+    (runs, last_err)
+}
+
 /// Per-candidate result from a placement sweep. `median_tps` is
 /// `None` when every measurement run for this candidate failed
 /// (warmup error, generate error, etc.) — `error` carries the
@@ -405,20 +436,9 @@ pub fn measure_per_device_perf(
         // One untimed warmup (JIT / USM upload / page-in).
         cpu.generate_token_ids(&prompt_ids, decode_tokens, &sampling)
             .map_err(|e| format!("warmup failed: {e}"))?;
-        let mut runs: Vec<f64> = Vec::with_capacity(repeats as usize);
-        let mut last_err: Option<String> = None;
-        for _ in 0..repeats {
-            cpu.clear_prefix_cache();
-            match cpu.generate_token_ids(&prompt_ids, decode_tokens, &sampling) {
-                Ok(_) => {
-                    let stats = cpu.last_request_stats();
-                    if stats.decode_ms > 0.0 && stats.tokens_generated > 0 {
-                        runs.push((stats.tokens_generated as f64) / (stats.decode_ms / 1000.0));
-                    }
-                }
-                Err(e) => last_err = Some(e.to_string()),
-            }
-        }
+        // `cpu` is already `&mut CpuEngine` here (closure param) — reborrow.
+        let (mut runs, last_err) =
+            collect_decode_tok_s(cpu, &prompt_ids, decode_tokens, repeats, &sampling);
         if runs.is_empty() {
             return Err(last_err.unwrap_or_else(|| "every measurement run failed".into()));
         }
@@ -796,20 +816,8 @@ pub fn measure_kv_dtype_candidates(
             }
         };
 
-        let mut runs: Vec<f64> = Vec::with_capacity(repeats as usize);
-        let mut last_err: Option<String> = None;
-        for _ in 0..repeats {
-            cpu.clear_prefix_cache();
-            match cpu.generate_token_ids(&prompt_ids, decode_tokens, &sampling) {
-                Ok(_) => {
-                    let stats = cpu.last_request_stats();
-                    if stats.decode_ms > 0.0 && stats.tokens_generated > 0 {
-                        runs.push((stats.tokens_generated as f64) / (stats.decode_ms / 1000.0));
-                    }
-                }
-                Err(e) => last_err = Some(e.to_string()),
-            }
-        }
+        let (mut runs, last_err) =
+            collect_decode_tok_s(&mut cpu, &prompt_ids, decode_tokens, repeats, &sampling);
         if runs.is_empty() {
             report_candidates.push(KvDtypeCandidateResult {
                 kv_dtype: dt,
@@ -933,20 +941,8 @@ pub fn measure_flash_attention_candidates(
             continue;
         }
 
-        let mut runs: Vec<f64> = Vec::with_capacity(repeats as usize);
-        let mut last_err: Option<String> = None;
-        for _ in 0..repeats {
-            cpu.clear_prefix_cache();
-            match cpu.generate_token_ids(&prompt_ids, decode_tokens, &sampling) {
-                Ok(_) => {
-                    let stats = cpu.last_request_stats();
-                    if stats.decode_ms > 0.0 && stats.tokens_generated > 0 {
-                        runs.push((stats.tokens_generated as f64) / (stats.decode_ms / 1000.0));
-                    }
-                }
-                Err(e) => last_err = Some(e.to_string()),
-            }
-        }
+        let (mut runs, last_err) =
+            collect_decode_tok_s(&mut cpu, &prompt_ids, decode_tokens, repeats, &sampling);
         if runs.is_empty() {
             report_candidates.push(FlashAttentionCandidateResult {
                 flash_attention: flag,
@@ -1082,20 +1078,8 @@ pub fn measure_kv_layout_candidates(
             continue;
         }
 
-        let mut runs: Vec<f64> = Vec::with_capacity(repeats as usize);
-        let mut last_err: Option<String> = None;
-        for _ in 0..repeats {
-            cpu.clear_prefix_cache();
-            match cpu.generate_token_ids(&prompt_ids, decode_tokens, &sampling) {
-                Ok(_) => {
-                    let stats = cpu.last_request_stats();
-                    if stats.decode_ms > 0.0 && stats.tokens_generated > 0 {
-                        runs.push((stats.tokens_generated as f64) / (stats.decode_ms / 1000.0));
-                    }
-                }
-                Err(e) => last_err = Some(e.to_string()),
-            }
-        }
+        let (mut runs, last_err) =
+            collect_decode_tok_s(&mut cpu, &prompt_ids, decode_tokens, repeats, &sampling);
         if runs.is_empty() {
             report_candidates.push(KvLayoutCandidateResult {
                 kv_cache_layout: layout.clone(),
@@ -1364,20 +1348,8 @@ pub fn measure_flash_kv_min_candidates(
             continue;
         }
 
-        let mut runs: Vec<f64> = Vec::with_capacity(repeats as usize);
-        let mut last_err: Option<String> = None;
-        for _ in 0..repeats {
-            cpu.clear_prefix_cache();
-            match cpu.generate_token_ids(&prompt_ids, decode_tokens, &sampling) {
-                Ok(_) => {
-                    let stats = cpu.last_request_stats();
-                    if stats.decode_ms > 0.0 && stats.tokens_generated > 0 {
-                        runs.push((stats.tokens_generated as f64) / (stats.decode_ms / 1000.0));
-                    }
-                }
-                Err(e) => last_err = Some(e.to_string()),
-            }
-        }
+        let (mut runs, last_err) =
+            collect_decode_tok_s(&mut cpu, &prompt_ids, decode_tokens, repeats, &sampling);
         if runs.is_empty() {
             report_candidates.push(FlashKvMinCandidateResult {
                 kv_min,
@@ -1672,20 +1644,8 @@ pub fn measure_kv_page_size_candidates(
             continue;
         }
 
-        let mut runs: Vec<f64> = Vec::with_capacity(repeats as usize);
-        let mut last_err: Option<String> = None;
-        for _ in 0..repeats {
-            cpu.clear_prefix_cache();
-            match cpu.generate_token_ids(&prompt_ids, decode_tokens, &sampling) {
-                Ok(_) => {
-                    let stats = cpu.last_request_stats();
-                    if stats.decode_ms > 0.0 && stats.tokens_generated > 0 {
-                        runs.push((stats.tokens_generated as f64) / (stats.decode_ms / 1000.0));
-                    }
-                }
-                Err(e) => last_err = Some(e.to_string()),
-            }
-        }
+        let (mut runs, last_err) =
+            collect_decode_tok_s(&mut cpu, &prompt_ids, decode_tokens, repeats, &sampling);
         if runs.is_empty() {
             report_candidates.push(KvPageSizeCandidateResult {
                 page_size,
@@ -1815,20 +1775,8 @@ pub fn measure_flash_v3_kv_tile_candidates(
             continue;
         }
 
-        let mut runs: Vec<f64> = Vec::with_capacity(repeats as usize);
-        let mut last_err: Option<String> = None;
-        for _ in 0..repeats {
-            cpu.clear_prefix_cache();
-            match cpu.generate_token_ids(&prompt_ids, decode_tokens, &sampling) {
-                Ok(_) => {
-                    let stats = cpu.last_request_stats();
-                    if stats.decode_ms > 0.0 && stats.tokens_generated > 0 {
-                        runs.push((stats.tokens_generated as f64) / (stats.decode_ms / 1000.0));
-                    }
-                }
-                Err(e) => last_err = Some(e.to_string()),
-            }
-        }
+        let (mut runs, last_err) =
+            collect_decode_tok_s(&mut cpu, &prompt_ids, decode_tokens, repeats, &sampling);
         if runs.is_empty() {
             report_candidates.push(FlashV3KvTileCandidateResult {
                 kv_tile,
@@ -2003,20 +1951,8 @@ pub fn measure_moe_placement_candidates(
             });
             continue;
         }
-        let mut runs: Vec<f64> = Vec::with_capacity(repeats as usize);
-        let mut last_err: Option<String> = None;
-        for _ in 0..repeats {
-            cpu.clear_prefix_cache();
-            match cpu.generate_token_ids(&prompt_ids, decode_tokens, &sampling) {
-                Ok(_) => {
-                    let stats = cpu.last_request_stats();
-                    if stats.decode_ms > 0.0 && stats.tokens_generated > 0 {
-                        runs.push((stats.tokens_generated as f64) / (stats.decode_ms / 1000.0));
-                    }
-                }
-                Err(e) => last_err = Some(e.to_string()),
-            }
-        }
+        let (mut runs, last_err) =
+            collect_decode_tok_s(&mut cpu, &prompt_ids, decode_tokens, repeats, &sampling);
         if runs.is_empty() {
             report_candidates.push(MoePlacementCandidateResult {
                 label: label.to_string(),
