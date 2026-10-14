@@ -24,7 +24,11 @@ thiserror.workspace = true
 tracing.workspace = true
 half.workspace = true
 rustllama-tensor = { path = "../rustllama-tensor" }
-rustllama-gguf = { path = "../rustllama-gguf", default-features = false }
+# `encoder` is required: accel.rs re-encodes to GGUF quant on the MoE spill
+# cold tier (spill_encode_gguf) and synthesizes a Q4_K probe in the SYCL-tier
+# self-check. Previously only pulled transitively (kv-bias-write / test deps),
+# so a narrow build of models/engine failed to resolve `rustllama_gguf::encode`.
+rustllama-gguf = { path = "../rustllama-gguf", default-features = false, features = ["encoder"] }
 rustllama-kernels-cpu = { path = "../rustllama-kernels-cpu" }
 # q★ co-execution in `moe.rs`: `rayon::join` runs the CPU expert
 # branch on a pool worker while the GPU branch keeps the engine
