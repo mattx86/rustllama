@@ -324,6 +324,29 @@ const REDIST_MANIFEST: &[(&str, RedistGroup)] = &[
     // no longer redistributed — this trims the installer by ~249 MB.
 ];
 
+/// Intel NPU runtime (OpenVINO) libraries bundled next to the binary so the
+/// `rustllama-npu` backend works with no user install. Paths are relative to
+/// `<openvino_root>/runtime`. This is the FULL **offload-ready** set (~122 MB):
+/// enumeration (core + C API + NPU plugin + TBB) PLUS the in-plugin NPU graph
+/// compiler (`openvino_intel_npu_compiler.dll`, ~96 MB, + its loader) so the
+/// artifact can COMPILE models to the NPU without relying on a compiler-in-
+/// driver, PLUS the GGUF/IR model frontends so OpenVINO can ingest our model
+/// files directly when the op-offload path (Phase 5) lands. (A HETERO/AUTO CPU
+/// fallback plugin would be added here if Phase 5 offloads partial graphs.)
+const OPENVINO_NPU_DLLS: &[&str] = &[
+    "bin/intel64/Release/openvino.dll",
+    "bin/intel64/Release/openvino_c.dll",
+    "bin/intel64/Release/openvino_intel_npu_plugin.dll",
+    "bin/intel64/Release/openvino_intel_npu_vm_runtime.dll",
+    "bin/intel64/Release/openvino_intel_npu_compiler_loader.dll",
+    // The big one (~96 MB): the NPU graph compiler, for model offload.
+    "bin/intel64/Release/openvino_intel_npu_compiler.dll",
+    // Model frontends so OpenVINO can read GGUF / IR directly for offload.
+    "bin/intel64/Release/openvino_gguf_frontend.dll",
+    "bin/intel64/Release/openvino_ir_frontend.dll",
+    "3rdparty/tbb/bin/tbb12.dll",
+];
+
 #[derive(Debug, Clone, Copy)]
 enum RedistGroup {
     Compiler,
@@ -407,11 +430,96 @@ fn stage_redist(out: Option<PathBuf>, allow_missing: bool) -> Result<()> {
         }
     }
 
+    // Bundle the NPU vendor runtimes into the same staging dir (best-effort).
+    stage_npu_runtime(&out_dir)?;
+
     println!("\n== manifest (paste into docs/oneapi-redist.md) ==\n");
     println!("| DLL | Source | Size (bytes) |");
     println!("|-----|--------|--------------|");
     for (name, src, size) in &manifest_rows {
         println!("| `{name}` | `{}` | {size} |", src.display());
+    }
+
+    Ok(())
+}
+
+/// OpenVINO SDK root from OPENVINO_DIR / INTEL_OPENVINO_DIR (the latter is what
+/// the SDK's `setupvars` exports). None when neither points at an existing dir.
+fn openvino_root() -> Option<PathBuf> {
+    std::env::var("OPENVINO_DIR")
+        .or_else(|_| std::env::var("INTEL_OPENVINO_DIR"))
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+}
+
+/// Stage the bundled NPU vendor runtimes beside the SYCL DLLs (best-effort, so
+/// a release still succeeds without them — the NPU backends dlopen the runtime
+/// and fail soft). Intel (OpenVINO) is bundled when `OPENVINO_DIR` /
+/// `INTEL_OPENVINO_DIR` points at an SDK; AMD (XRT) when `XILINX_XRT` does. A
+/// missing OpenVINO root prints a loud warning so an NPU-enabled release isn't
+/// shipped silently without the Intel runtime.
+fn stage_npu_runtime(out_dir: &std::path::Path) -> Result<()> {
+    println!("\n== NPU runtime (bundled, best-effort) ==\n");
+
+    // Intel — OpenVINO (the lean enumeration set; see OPENVINO_NPU_DLLS).
+    match openvino_root() {
+        Some(root) => {
+            let rt = root.join("runtime");
+            let mut staged = 0usize;
+            for rel in OPENVINO_NPU_DLLS {
+                let src = rt.join(rel);
+                let name = match src.file_name().and_then(|s| s.to_str()) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                if !src.exists() {
+                    println!("  MISSING  {rel}");
+                    continue;
+                }
+                let dst = out_dir.join(name);
+                std::fs::copy(&src, &dst)
+                    .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
+                let size = std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0);
+                println!("  ok       {name} ({size} bytes)");
+                staged += 1;
+            }
+            println!(
+                "  OpenVINO NPU libs staged: {staged}/{} (from {})",
+                OPENVINO_NPU_DLLS.len(),
+                root.display()
+            );
+        }
+        None => {
+            println!(
+                "  WARNING: OPENVINO_DIR / INTEL_OPENVINO_DIR not set — Intel NPU \
+                 (OpenVINO) runtime NOT bundled. Set it to an OpenVINO SDK root to \
+                 ship Intel NPU support in this artifact."
+            );
+        }
+    }
+
+    // AMD — XRT (just the core enumeration lib). Optional; quiet when absent.
+    match std::env::var("XILINX_XRT")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+    {
+        Some(xrt) => {
+            let cand = [xrt.join("bin").join("xrt_coreutil.dll"), xrt.join("xrt_coreutil.dll")];
+            match cand.iter().find(|p| p.exists()) {
+                Some(src) => {
+                    let dst = out_dir.join("xrt_coreutil.dll");
+                    std::fs::copy(src, &dst)
+                        .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
+                    println!("  ok       xrt_coreutil.dll (AMD NPU)");
+                }
+                None => println!("  WARNING: XILINX_XRT set but xrt_coreutil.dll not found under it."),
+            }
+        }
+        None => {
+            println!("  note: XILINX_XRT not set — AMD NPU (XRT) runtime not bundled (optional).");
+        }
     }
 
     Ok(())
