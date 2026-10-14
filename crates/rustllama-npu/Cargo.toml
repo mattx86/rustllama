@@ -12,6 +12,10 @@ description = "Backend-agnostic NPU device model: enumeration, disable-by-index,
 [dependencies]
 serde = { workspace = true }
 tracing.workspace = true
+# Runtime loader for the AMD XRT NPU runtime under `npu-ryzenai` (src/ryzenai.rs
+# dlopen's xrt_coreutil, mirroring how rustllama-l0-sys loads ze_loader). Optional
+# + feature-gated, so the default build pulls nothing.
+libloading = { version = "0.8", optional = true }
 
 [features]
 default = []
@@ -20,6 +24,7 @@ default = []
 # OPENVINO_DIR / INTEL_OPENVINO_DIR. Off by default so the normal build needs no
 # SDK and stays toolchain-free. The offload/inference FFI lands with op-offload.
 npu-openvino = []
-# AMD NPU via the Ryzen AI / XRT stack. Same shape as npu-openvino; the FFI is a
-# stub until a Ryzen AI SDK is available to compile-verify against.
-npu-ryzenai = []
+# AMD NPU via the Ryzen AI / XRT stack. Enumerates by runtime-loading XRT
+# (`xrt_coreutil`) via libloading — compiles here, but the XRT call path is
+# WRITE-BLIND (no Ryzen AI SDK/HW on this box) and validated on AMD NPU HW.
+npu-ryzenai = ["dep:libloading"]

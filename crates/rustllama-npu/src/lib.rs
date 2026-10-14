@@ -24,6 +24,10 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "npu-openvino")]
 mod openvino;
 
+// AMD NPU enumeration over the XRT runtime (runtime-loaded; see ryzenai.rs).
+#[cfg(feature = "npu-ryzenai")]
+mod ryzenai;
+
 /// NPU vendor (which runtime drives it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NpuVendor {
@@ -65,13 +69,12 @@ fn openvino_enumerate() -> Vec<NpuInfo> {
     openvino::enumerate()
 }
 
-// AMD NPU enumeration stub — the Ryzen AI / XRT FFI lands in a later phase
-// (write-blind: no Ryzen AI SDK on this box). Present now so the device model +
-// feature gate are complete.
+// AMD NPU enumeration via the XRT runtime FFI (`src/ryzenai.rs`). The XRT call
+// path is write-blind (validated on Ryzen AI HW) but compiles here and fails
+// soft to an empty list off AMD NPU hardware.
 #[cfg(feature = "npu-ryzenai")]
 fn ryzenai_enumerate() -> Vec<NpuInfo> {
-    tracing::debug!("npu-ryzenai: enumeration not yet implemented");
-    Vec::new()
+    ryzenai::enumerate()
 }
 
 /// Parse a comma-separated index list (e.g. "0,2"), ignoring blanks/garbage —
