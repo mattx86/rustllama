@@ -263,6 +263,20 @@ headless box; the GUI build just adds the egui desktop shell):
 - macOS arm64 (Apple Silicon) `.tar.gz` (GUI) — `scripts/release-macos.sh arm64`
 - macOS x86_64 (Intel) `.tar.gz` (GUI) — `scripts/release-macos.sh x86_64`
 
+**Bundled NPU runtimes (x86_64 Windows + Linux).** The `rustllama-npu` backend
+dlopen's a vendor runtime (Intel OpenVINO / AMD XRT, both Apache-2.0) that the
+release **bundles next to the binary** — user installs nothing (the one piece we
+can't ship, the NPU kernel driver, is already present on NPU-equipped machines).
+Windows staging is in `xtask stage-redist` (needs `OPENVINO_DIR` / `XILINX_XRT`
+set); Linux staging is in `_release_package.sh` (reads `OPENVINO_DIR`, which
+`Dockerfile.linux-gpu` points at an /opt/openvino install). The full
+offload-ready OpenVINO set (~122 MB: core + NPU plugin + the ~96 MB graph
+compiler + GGUF/IR frontends) ships so the artifact can offload to the NPU once
+the op-offload path lands. Best-effort + fail-soft: a box without the runtime or
+an NPU enumerates nothing. aarch64/macOS carry no NPU runtime (no x86 Intel/AMD
+NPU there). The loader resolves the lib exe-relative (Windows: flat beside the
+binary; Linux: `./lib` — `dlopen` of a bare name can't find `./lib`).
+
 **CUDA arch coverage** (`RUSTLLAMA_CUDA_ARCHS`, set per release in
 `_release_build_linux.sh` / `release-windows.bat`): x86 ships
 `75;80;86;89;90a;100a;120a` (Turing → consumer Blackwell), aarch64 that +
@@ -299,6 +313,14 @@ ID can replace `-` later). Packaging helpers: `_release_package.ps1` (bsdtar),
   unless `[server].require_auth_loopback`).
 - `RUSTLLAMA_GUI_EMBEDDED` — set by the GUI; skips the blocking startup autotune.
 - `RUSTLLAMA_DISABLED_GPUS` — exclude specific GPUs from selection.
+- `RUSTLLAMA_DISABLED_NPUS` — exclude specific NPUs by index (the NPU analog of
+  `RUSTLLAMA_DISABLED_GPUS`); `RUSTLLAMA_NPU_ENABLED=0` sidelines all NPUs. NPUs
+  are enumerated (Intel via OpenVINO, AMD via XRT; both dlopen'd, default-on) and
+  folded into `system_fingerprint()` like GPUs. `[inference].disabled_npus` /
+  `npu_enabled` are the config equivalents.
+- `OPENVINO_DIR` / `INTEL_OPENVINO_DIR`, `XILINX_XRT` — **release-staging only**
+  (not read at runtime): point the NPU-runtime bundling at an OpenVINO / XRT SDK
+  (see Release builds). The shipped binary dlopen's the bundled libs, no env var.
 - `RUSTLLAMA_IQ_GPU=1` — run IQ1_S imatrix weighting on the GPU during quantize.
 - (No env var) **MoE tiered-expert engine — AUTO on CUDA, no knob.** A MoE model
   on a CUDA box automatically promotes its hottest experts (usage-ranked from the
