@@ -158,6 +158,18 @@ impl ApcIndex {
         self.map.retain(|_, e| !pages.contains(&e.page));
     }
 
+    /// Every `(hash, page)` entry pointing at one of `pages`. The LMCache demote
+    /// path uses this to offload each about-to-be-overwritten block's bytes
+    /// keyed by its hash, just before [`remove_pages`](Self::remove_pages) drops
+    /// the stale entries.
+    pub fn hashes_for_pages(&self, pages: &[PageId]) -> Vec<(BlockHash, PageId)> {
+        self.map
+            .iter()
+            .filter(|(_, e)| pages.contains(&e.page))
+            .map(|(&h, e)| (BlockHash(h), e.page))
+            .collect()
+    }
+
     /// The LRU victim hash among current entries (for a size-capped index).
     pub fn lru_victim(&self) -> Option<BlockHash> {
         self.map

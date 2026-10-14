@@ -43,6 +43,27 @@ impl KvColdTier {
         self.cap_bytes > 0
     }
 
+    /// Set the byte budget (e.g. from config at engine init), evicting LRU
+    /// entries if the new cap is smaller. `0` disables + clears the tier.
+    pub fn set_cap_bytes(&mut self, cap_bytes: usize) {
+        self.cap_bytes = cap_bytes;
+        if cap_bytes == 0 {
+            self.map.clear();
+            self.bytes = 0;
+            return;
+        }
+        while self.bytes > cap_bytes {
+            match self.lru_key() {
+                Some(k) => {
+                    if let Some(e) = self.map.remove(&k) {
+                        self.bytes -= e.bytes.len() * std::mem::size_of::<f32>();
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+
     /// Offload a block's page bytes under its hash. No-op when disabled or a
     /// single block exceeds the whole budget. Evicts LRU entries to make room.
     pub fn demote(&mut self, hash: BlockHash, bytes: &[f32]) {
