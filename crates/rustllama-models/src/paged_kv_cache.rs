@@ -910,6 +910,94 @@ mod tests {
         }
     }
 
+    fn pattern_kv(pos: u32, layer: u32, n_heads: usize, hd: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut k = vec![0f32; n_heads * hd];
+        let mut v = vec![0f32; n_heads * hd];
+        for h in 0..n_heads {
+            for d in 0..hd {
+                let val = (layer as f32) * 1.0e6 + (pos as f32) * 1000.0 + (h as f32) * 10.0 + d as f32;
+                k[h * hd + d] = val;
+                v[h * hd + d] = -val;
+            }
+        }
+        (k, v)
+    }
+
+    /// The correctness guarantee vLLM APC rests on: after a request's blocks are
+    /// registered and the request completes (pages freed), a later request with
+    /// the SAME prefix content reacquires those blocks by content hash and reads
+    /// back the EXACT KV bytes the first request wrote — reacquire revives
+    /// retained content, it does not recompute. This mirrors the engine's
+    /// register → release → acquire_prefix → pin_shared_prefix sequence exactly,
+    /// across all layers, without needing a model forward pass.
+    #[test]
+    fn apc_reacquire_preserves_kv_content() {
+        use crate::apc::{acquire_prefix, block_hash_chain, ApcIndex};
+        let mut store = small_store(); // page_size 4, 2 layers, 3 heads, head_dim 8
+        let mut table = PageTable::new(4, 4);
+        let mut index = ApcIndex::new();
+        let n_heads = store.n_kv_heads() as usize;
+        let hd = store.head_dim() as usize;
+        let page_size = store.page_size() as usize; // 4
+        let n_blocks = 2usize;
+        let n_tokens = (n_blocks * page_size) as u32; // 8 = two full blocks
+
+        // --- Request 1: prefill every layer with a unique pattern, then
+        // register the two blocks of prompt [10..14, 20..24]. ---
+        let prompt: Vec<u32> = vec![10, 11, 12, 13, 20, 21, 22, 23];
+        let chain = block_hash_chain(&prompt, page_size);
+        assert_eq!(chain.len(), n_blocks);
+
+        let mut cache1 = PagedKvCache::new_for(&store);
+        cache1.ensure_capacity(&mut table, n_tokens).unwrap();
+        for layer in 0..store.n_layers() {
+            for pos in 0..n_tokens {
+                let (k, v) = pattern_kv(pos, layer, n_heads, hd);
+                cache1.write_token(&mut store, layer, pos, &k, &v).expect("write");
+            }
+        }
+        let pages1: Vec<_> = cache1.pages().to_vec();
+        for (i, h) in chain.iter().enumerate() {
+            index.register(*h, pages1[i]);
+        }
+
+        // --- Request 1 completes: free (content retained + still indexed). ---
+        cache1.release(&mut table);
+        assert_eq!(table.free_count(), 4);
+
+        // --- Request 2: same prompt → reacquire both blocks by content hash. ---
+        let chain2 = block_hash_chain(&prompt, page_size);
+        let shared = acquire_prefix(&mut index, &mut table, &chain2);
+        assert_eq!(shared, pages1, "reacquired the same physical pages");
+        assert_eq!(table.free_count(), 2, "reacquired pages left the free list");
+
+        // Pin into a fresh cache and gather — every layer must match request 1.
+        let mut cache2 = PagedKvCache::new_for(&store);
+        cache2.pin_shared_prefix(shared, n_tokens);
+        let need = n_heads * (n_tokens as usize) * hd;
+        for layer in 0..store.n_layers() {
+            let mut k_out = vec![0f32; need];
+            let mut v_out = vec![0f32; need];
+            cache2.gather_layer(&store, layer, &mut k_out, &mut v_out).expect("gather");
+            for h in 0..n_heads {
+                for pos in 0..n_tokens as usize {
+                    for d in 0..hd {
+                        let off = h * (n_tokens as usize) * hd + pos * hd + d;
+                        let (k, v) = pattern_kv(pos as u32, layer, n_heads, hd);
+                        assert!(
+                            (k_out[off] - k[h * hd + d]).abs() < 1e-6,
+                            "K mismatch after reacquire: layer={layer} h={h} pos={pos} d={d}"
+                        );
+                        assert!(
+                            (v_out[off] - v[h * hd + d]).abs() < 1e-6,
+                            "V mismatch after reacquire: layer={layer} h={h} pos={pos} d={d}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn release_returns_pages_and_resets_seq_len() {
         let store = small_store();
