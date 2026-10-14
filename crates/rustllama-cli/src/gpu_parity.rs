@@ -577,14 +577,30 @@ pub fn collect_xmx_verdict() -> Vec<(String, Option<bool>)> {
         .collect()
 }
 
-/// Intel NPU compute-offload verdict for `tune --validate-kernels`: run the NPU
-/// MatMul parity (Phase 5, OpenVINO) and map it to the `npu:matmul_f32` verdict
-/// the accel dispatch reads. `None` (SKIP) when no NPU / OpenVINO runtime is
-/// present → nothing is persisted → the dispatch stays off (fail-closed).
+/// Intel NPU compute-offload verdicts for `tune --validate-kernels`:
+///   - `npu:matmul_f32` — CORRECTNESS: the NPU MatMul (Phase 5, OpenVINO) matched
+///     the CPU reference (parity).
+///   - `npu:faster_than_gpu` — PERF: the NPU beat the GPU/CPU at a representative
+///     prefill GEMM (`rustllama_engine::npu_perf_probe`). Only measured
+///     when the NPU is present AND correct (a slow or broken NPU shouldn't be
+///     perf-ranked). The accel dispatch ANDs both, so the NPU auto-enables only
+///     where it's correct AND the fastest matrix engine — the measured NPU-vs-GPU
+///     decision that replaces the old hardcoded CUDA-first gate.
+/// `None` (SKIP) on either when no NPU is present → nothing persisted → the
+/// dispatch stays off (fail-closed).
 pub fn collect_npu_verdict() -> Vec<(String, Option<bool>)> {
     let r = rustllama_npu::npu_matmul_parity();
-    let verdict = if r.supported { Some(r.pass) } else { None };
-    vec![("npu:matmul_f32".to_string(), verdict)]
+    let correct = if r.supported { Some(r.pass) } else { None };
+    // Only perf-rank a present, correct NPU; otherwise SKIP (None) the perf slot.
+    let perf = if matches!(correct, Some(true)) {
+        rustllama_engine::npu_perf_probe()
+    } else {
+        None
+    };
+    vec![
+        ("npu:matmul_f32".to_string(), correct),
+        ("npu:faster_than_gpu".to_string(), perf),
+    ]
 }
 
 fn emit(name: &str, verdict: &str, detail: &str) {

@@ -20,8 +20,8 @@
 //! Granularity note: a fresh (M,K,N) requires a compile, so the win is on the
 //! fixed-shape, compute-heavy PREFILL GEMMs (the weight shapes are fixed; M is
 //! the prompt length). Per-token decode matvec is latency-bound by the host
-//! round-trip and stays on CPU/GPU. Bucketing M to amortize compiles across
-//! prefill lengths is a follow-up.
+//! round-trip and stays on CPU/GPU. M is bucketed to a power of two
+//! ([`bucket_m`]) so distinct prefill lengths reuse one compiled graph.
 
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
@@ -231,6 +231,14 @@ impl NpuExecutor {
     /// Compile (cached) + run a MatMul of `A[a_rows,a_cols]` by `B[b_rows,b_cols]`
     /// with optional `transpose_b`. Output is `a_rows × (transpose_b ? b_rows :
     /// b_cols)`.
+    ///
+    /// **M-bucketing:** the batch dim `a_rows` (the prompt length on a prefill
+    /// GEMM) is rounded up to a power-of-two bucket ([`bucket_m`]) so distinct
+    /// prefill lengths share ONE compiled graph — compilation runs the ~96 MB
+    /// NPU graph compiler and dwarfs the GEMM, so amortizing it across lengths is
+    /// the dominant win. The activation is zero-padded to the bucket and the
+    /// output sliced back, so the result is identical to an exact-`a_rows`
+    /// compile (the padded rows produce padded output rows we drop).
     #[allow(clippy::too_many_arguments)]
     unsafe fn exec_matmul(
         &self,
@@ -243,7 +251,18 @@ impl NpuExecutor {
         transpose_b: bool,
     ) -> Option<Vec<f32>> {
         let out_cols = if transpose_b { b_rows } else { b_cols };
-        let compiled = self.compiled_matmul(a_rows, a_cols, b_rows, b_cols, transpose_b)?;
+        let m_bucket = bucket_m(a_rows);
+        let compiled = self.compiled_matmul(m_bucket, a_cols, b_rows, b_cols, transpose_b)?;
+
+        // Pad the activation up to the bucket's row count (zero rows → zero
+        // output rows, which we slice off). Borrow when already bucket-aligned.
+        let a_padded: std::borrow::Cow<[f32]> = if m_bucket == a_rows {
+            std::borrow::Cow::Borrowed(a)
+        } else {
+            let mut v = vec![0f32; m_bucket * a_cols];
+            v[..a_rows * a_cols].copy_from_slice(a);
+            std::borrow::Cow::Owned(v)
+        };
 
         let mut req: *mut OvInferRequest = ptr::null_mut();
         if (self.api.create_request)(compiled, &mut req) != OV_OK || req.is_null() {
@@ -251,18 +270,25 @@ impl NpuExecutor {
         }
         // Guard so the request is always freed.
         let out = (|| {
-            let ta = self.make_input(&[a_rows, a_cols], a)?;
+            let ta = self.make_input(&[m_bucket, a_cols], &a_padded)?;
             let tb = self.make_input(&[b_rows, b_cols], b)?;
             let ok = (self.api.set_input)(req, 0, ta) == OV_OK
                 && (self.api.set_input)(req, 1, tb) == OV_OK
                 && (self.api.infer)(req) == OV_OK;
-            let result = if ok { self.read_output(req, a_rows * out_cols) } else { None };
+            let result = if ok { self.read_output(req, m_bucket * out_cols) } else { None };
             (self.api.tensor_free)(ta);
             (self.api.tensor_free)(tb);
             result
         })();
         (self.api.request_free)(req);
-        out
+        // Slice the padded output back to the real `a_rows`.
+        out.map(|full| {
+            if m_bucket == a_rows {
+                full
+            } else {
+                full[..a_rows * out_cols].to_vec()
+            }
+        })
     }
 
     /// Get (or compile + cache) the NPU MatMul graph for this shape.
@@ -392,6 +418,16 @@ impl Drop for NpuExecutor {
     }
 }
 
+/// Round the batch dim `M` (a prefill GEMM's prompt length) up to a
+/// compile-amortizing bucket: the next power of two, min 16. A compile runs the
+/// ~96 MB NPU graph compiler, so collapsing the many distinct prefill lengths
+/// onto ~log2(max_ctx) buckets turns per-length compiles into a handful. The
+/// padding waste is at most ~2× the GEMM — negligible beside a fresh compile,
+/// and only on the compute-amortized prefill path.
+fn bucket_m(m: usize) -> usize {
+    m.next_power_of_two().max(16)
+}
+
 /// Minimal OpenVINO IR (v11) for `C = MatMul(A[ar,ac], B[br,bc])` with optional
 /// `transpose_b`, both f32 graph inputs. Output is `ar × (transpose_b ? br :
 /// bc)`. Static shapes (the NPU compiler wants them); no weights blob needed.
@@ -483,4 +519,31 @@ pub(crate) fn matmul_parity() -> NpuParity {
     let cos = if na > 0.0 && nb > 0.0 { dot / (na.sqrt() * nb.sqrt()) } else { 0.0 };
     let pass = cos >= 0.9999 && max_rel <= 1e-2;
     NpuParity { supported: true, cos, max_rel, pass }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bucket_m_rounds_to_pow2_min16() {
+        assert_eq!(bucket_m(1), 16);
+        assert_eq!(bucket_m(16), 16);
+        assert_eq!(bucket_m(17), 32);
+        assert_eq!(bucket_m(31), 32);
+        assert_eq!(bucket_m(64), 64);
+        assert_eq!(bucket_m(129), 256);
+        assert_eq!(bucket_m(2048), 2048);
+        // A bucket never shrinks the batch (no lost rows).
+        for m in [1usize, 15, 100, 777, 4096] {
+            assert!(bucket_m(m) >= m);
+        }
+    }
+
+    #[test]
+    fn matmul_ir_output_cols_follow_transpose_b() {
+        // transpose_b=false → out cols = b_cols; true → out cols = b_rows.
+        assert!(matmul_ir(16, 8, 8, 32, false).contains("<dim>16</dim><dim>32</dim>"));
+        assert!(matmul_ir(16, 8, 32, 8, true).contains("<dim>16</dim><dim>32</dim>"));
+    }
 }

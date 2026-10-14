@@ -857,17 +857,146 @@ fn npu_executor() -> Option<&'static rustllama_npu::NpuExecutor> {
     EX.get_or_init(rustllama_npu::NpuExecutor::new).as_ref()
 }
 
+/// Set true only for the brief window of [`npu_perf_probe`] while it times the
+/// non-NPU dispatch, so the NPU block short-circuits and the probe measures the
+/// GPU/CPU path it is racing the NPU against (avoids self-timing).
+static NPU_PROBE_SUPPRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Whether the Intel NPU compute-offload path is enabled. **AUTOMATIC** — no env
-/// var: it turns on only when the NPU MatMul passed the on-device self-check
-/// (`tune --validate-kernels` → `kernel_verdict("npu:matmul_f32")`) on this
-/// machine AND an NPU + its runtime are present. FAIL-CLOSED: never validated
-/// (or no NPU) → `false`, so the offload stays off and the CPU/GPU ladder runs.
+/// var: it turns on only when BOTH on-device self-checks passed
+/// (`tune --validate-kernels`): the NPU MatMul matched the CPU reference
+/// (`kernel_verdict("npu:matmul_f32")`) AND the NPU was measured FASTER than the
+/// GPU/CPU at a representative prefill GEMM (`kernel_verdict("npu:faster_than_gpu")`,
+/// from [`npu_perf_probe`]) — so the NPU auto-enables only where it is both
+/// correct and the fastest matrix engine, which subsumes the old hardcoded
+/// CUDA-first gate. FAIL-CLOSED: either verdict missing (or no NPU) → `false`.
 /// Cached once (process-wide); inert until a `--validate-kernels` pass on real
-/// NPU hardware stamps the verdict, so this is byte-identical on every host
-/// without one.
+/// NPU hardware stamps both verdicts.
 fn npu_offload_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
-    *EN.get_or_init(|| kernel_verdict("npu:matmul_f32") && npu_executor().is_some())
+    *EN.get_or_init(|| {
+        kernel_verdict("npu:matmul_f32")
+            && kernel_verdict("npu:faster_than_gpu")
+            && npu_executor().is_some()
+    })
+}
+
+/// On-device perf probe: is the NPU faster than the GPU (or CPU, when no GPU) at
+/// a representative prefill GEMM? Times the REAL NPU dispatch against the REAL
+/// non-NPU dispatch (CUDA/SYCL/MLX if present, else the CPU matvec) on a Q4_K
+/// weight — the same paths production runs. `None` when there is no NPU (nothing
+/// to rank). `tune --validate-kernels` caches the result as
+/// `npu:faster_than_gpu`, which [`npu_offload_enabled`] ANDs with the correctness
+/// verdict. Write-blind: authored here, measured on NPU hardware.
+pub fn npu_perf_probe() -> Option<bool> {
+    let exec = npu_executor()?;
+    // Representative prefill GEMM: weight [m,k] Q4_K, activation [n,k], out [n,m].
+    let (m, k, n) = (2048usize, 2048usize, 64usize);
+    let total = m * k;
+    let w_f32: Vec<f32> = (0..total)
+        .map(|i| (((i as i64).wrapping_mul(2_654_435_761) % 2000) as f32 - 1000.0) * 0.001)
+        .collect();
+    let x: Vec<f32> = (0..n * k)
+        .map(|j| (((j as i64).wrapping_mul(40_503) % 1000) as f32 - 500.0) * 0.002)
+        .collect();
+    let mut w_bytes = vec![0u8; (total / 256) * 144];
+    rustllama_gguf::encode_k::encode_q4_k(&w_f32, &mut w_bytes);
+    let shape: Vec<u64> = vec![m as u64, k as u64];
+    let w = Tensor {
+        device: rustllama_tensor::Device::Cpu,
+        dtype: Dtype::Q4_KRaw,
+        strides: rustllama_tensor::contiguous_strides(&shape),
+        shape,
+        storage: rustllama_tensor::Storage::CpuOwned(w_bytes.into()),
+        name: "npu-perf-probe".into(),
+    };
+    let w_deq = dtype_dequant_to_f32(w.dtype, as_bytes(&w), total)?;
+    let mut out = vec![0f32; n * m];
+
+    const REPS: u32 = 8;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+    // Make the GPU matvec blocks eligible (they gate on the layer cutoff), so the
+    // non-NPU timing can actually use the GPU rather than silently hitting CPU.
+    set_n_gpu_layers(u32::MAX);
+    set_current_layer_idx(0);
+    // Warm both: compile the NPU graph, upload GPU weights / prime caches.
+    let _ = exec.matmul_xwt_f32(&x, n, k, &w_deq, m);
+    NPU_PROBE_SUPPRESS.store(true, Ordering::Relaxed);
+    crate::llama_arch::matvec_tensor_batched_dispatch(&w, &x, &mut out, m, k, n);
+    let t0 = Instant::now();
+    for _ in 0..REPS {
+        crate::llama_arch::matvec_tensor_batched_dispatch(&w, &x, &mut out, m, k, n);
+    }
+    let t_other = t0.elapsed();
+    NPU_PROBE_SUPPRESS.store(false, Ordering::Relaxed);
+
+    let t1 = Instant::now();
+    for _ in 0..REPS {
+        let _ = exec.matmul_xwt_f32(&x, n, k, &w_deq, m);
+    }
+    let t_npu = t1.elapsed();
+    Some(t_npu < t_other)
+}
+
+/// Bounded host-side cache of dequantized f32 weights for the NPU offload, keyed
+/// by the weight's GGUF host pointer (weights are static for the model's life),
+/// so repeated prefills skip re-dequantizing the same weight. LRU-evicted under
+/// a fixed byte cap — the whole model in f32 would be gigabytes, so this retains
+/// only the hottest weights. (`rustllama-models` doesn't depend on
+/// `rustllama-runtime`, so the cap is a fixed constant rather than a free-RAM
+/// fraction.)
+struct NpuDequantCache {
+    map: HashMap<usize, (std::sync::Arc<Vec<f32>>, u64)>,
+    bytes: usize,
+    cap_bytes: usize,
+    clock: u64,
+}
+
+impl NpuDequantCache {
+    fn get(&mut self, ptr: usize) -> Option<std::sync::Arc<Vec<f32>>> {
+        self.clock += 1;
+        let c = self.clock;
+        self.map.get_mut(&ptr).map(|e| {
+            e.1 = c;
+            e.0.clone()
+        })
+    }
+
+    fn insert(&mut self, ptr: usize, w: std::sync::Arc<Vec<f32>>) {
+        let wb = w.len() * std::mem::size_of::<f32>();
+        if wb > self.cap_bytes {
+            return; // one weight bigger than the whole cap → don't thrash.
+        }
+        if let Some(old) = self.map.remove(&ptr) {
+            self.bytes = self.bytes.saturating_sub(old.0.len() * std::mem::size_of::<f32>());
+        }
+        while self.bytes + wb > self.cap_bytes {
+            let Some(victim) = self.map.iter().min_by_key(|(_, e)| e.1).map(|(&k, _)| k) else {
+                break;
+            };
+            if let Some(old) = self.map.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(old.0.len() * std::mem::size_of::<f32>());
+            }
+        }
+        self.clock += 1;
+        self.bytes += wb;
+        self.map.insert(ptr, (w, self.clock));
+    }
+}
+
+fn npu_dequant_cache() -> &'static Mutex<NpuDequantCache> {
+    static C: OnceLock<Mutex<NpuDequantCache>> = OnceLock::new();
+    C.get_or_init(|| {
+        Mutex::new(NpuDequantCache {
+            map: HashMap::new(),
+            bytes: 0,
+            // 1 GiB of hot dequantized weights — bounded, never the whole model.
+            cap_bytes: 1024 * 1024 * 1024,
+            clock: 0,
+        })
+    })
 }
 
 /// Batched NPU GEMM `out[n,m] = x[n,k]·w[m,k]ᵀ`: dequantize `W`→f32 and run it on
@@ -888,9 +1017,22 @@ fn try_npu_gemm_f32(w: &Tensor, x: &[f32], out: &mut [f32], m: usize, k: usize, 
     let Some(exec) = npu_executor() else {
         return false;
     };
-    // Dequant W→f32 (m×k). None for exotic codebook/ternary dtypes → skip.
-    let Some(w_f32) = dtype_dequant_to_f32(w.dtype, as_bytes(w), m * k) else {
-        return false;
+    // Dequant W→f32 (m×k), reusing a cached dequant for a hot weight. The weight
+    // host pointer is a stable key (weights are mmap'd once). None for exotic
+    // codebook/ternary dtypes → skip.
+    let ptr = as_bytes(w).as_ptr() as usize;
+    let w_f32 = match npu_dequant_cache().lock().ok().and_then(|mut c| c.get(ptr)) {
+        Some(cached) => cached,
+        None => {
+            let Some(deq) = dtype_dequant_to_f32(w.dtype, as_bytes(w), m * k) else {
+                return false;
+            };
+            let arc = std::sync::Arc::new(deq);
+            if let Ok(mut c) = npu_dequant_cache().lock() {
+                c.insert(ptr, arc.clone());
+            }
+            arc
+        }
     };
     let Some(res) = exec.matmul_xwt_f32(x, n, k, &w_f32, m) else {
         return false;
@@ -12959,12 +13101,16 @@ pub fn try_matvec_tensor_batched_usm_f32(
         }
     }
     // Intel NPU compute offload (Phase 5): a batched f32 GEMM on the NPU via
-    // OpenVINO. Gated on `!cuda_active()` so the CUDA-first doctrine holds (a
-    // CUDA GPU, if present, wins via the block below); the NPU is the next
-    // matrix-engine tier when no CUDA GPU is present (an NPU laptop, or an Intel
-    // host after XMX misses). Verdict-gated + fail-closed → INERT (byte-
-    // identical) until `tune --validate-kernels` passes on real NPU hardware.
-    if npu_offload_enabled() && !cuda_active() && !tensor_forced_to_cpu(&w.name) {
+    // OpenVINO. `npu_offload_enabled()` now requires the MEASURED perf verdict
+    // (`npu:faster_than_gpu`) on top of correctness, so it fires only where the
+    // NPU actually beats the GPU/CPU at this GEMM — no hardcoded CUDA-first gate.
+    // The probe-suppress short-circuits during `npu_perf_probe` so it can time
+    // the non-NPU path. Verdict-gated + fail-closed → INERT (byte-identical)
+    // until `tune --validate-kernels` passes BOTH verdicts on real NPU hardware.
+    if npu_offload_enabled()
+        && !NPU_PROBE_SUPPRESS.load(std::sync::atomic::Ordering::Relaxed)
+        && !tensor_forced_to_cpu(&w.name)
+    {
         if try_npu_gemm_f32(w, x, out, m, k, n) {
             return true;
         }
