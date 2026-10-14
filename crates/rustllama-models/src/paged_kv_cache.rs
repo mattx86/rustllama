@@ -233,6 +233,13 @@ impl PagedKvCache {
         }
     }
 
+    /// The pages assigned to this request, position-ascending (page `i` holds
+    /// positions `[i*page_size, (i+1)*page_size)`). Used by the APC layer to map
+    /// a block-hash chain to the pages holding each block for registration.
+    pub fn pages(&self) -> &[crate::page_table::PageId] {
+        &self.pages
+    }
+
     /// G2.4: Q8_0 paged variant. The cache itself only holds page IDs
     /// + seq_len + page_size — independent of how the store quantizes
     /// the cells, so the only difference vs `new_for` is the source
@@ -724,7 +731,16 @@ impl PagedKvCache {
         // capacity once and never re-grows, so KV eviction does not
         // apply here (v1). Route through the plain allocator so a set
         // eviction env var can never engage on a shared/batched cache.
-        shared.with_table_mut(|table| self.ensure_capacity_plain(table, n_total))
+        let before = self.pages.len();
+        let r = shared.with_table_mut(|table| self.ensure_capacity_plain(table, n_total));
+        // APC correctness: any pages just PHYSICALLY allocated for this slot's
+        // new content must drop their stale block-hash entries — their old
+        // block's KV is about to be overwritten, so a content-hash hit must no
+        // longer resolve to them. (No-op when the APC index is empty.)
+        if r.is_ok() && self.pages.len() > before {
+            shared.apc_prune_realloc(&self.pages[before..]);
+        }
+        r
     }
 
     /// Shared-store variant of [`Self::write_token`]. Writes a

@@ -147,6 +147,17 @@ impl ApcIndex {
         self.map.retain(|_, e| e.page != page);
     }
 
+    /// Drop every mapping pointing at any page in `pages` — one pass over the
+    /// index. Called when those pages are PHYSICALLY re-allocated for new
+    /// content, invalidating their old block hashes. (`pages` is a small
+    /// per-alloc batch, so the linear `contains` is cheap.)
+    pub fn remove_pages(&mut self, pages: &[PageId]) {
+        if pages.is_empty() {
+            return;
+        }
+        self.map.retain(|_, e| !pages.contains(&e.page));
+    }
+
     /// The LRU victim hash among current entries (for a size-capped index).
     pub fn lru_victim(&self) -> Option<BlockHash> {
         self.map

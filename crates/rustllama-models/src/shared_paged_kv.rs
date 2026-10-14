@@ -28,17 +28,24 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::page_table::PageTable;
+use crate::apc::{ApcIndex, BlockHash};
+use crate::page_table::{PageId, PageTable};
 use crate::paged_kv_store::PagedKvStore;
 
 /// Multi-owner handle to a paged KV store + its page table.
 /// Cheap to clone (`Arc` increments). Pass clones into per-slot
 /// `PagedKvCache` instances so they can all reach the same byte
 /// storage and free list.
+///
+/// Also owns the process-wide [`ApcIndex`] (vLLM automatic prefix caching):
+/// the content-addressed block index that lets a new request reacquire the KV
+/// blocks of an earlier (even completed) request by content hash. Lock order:
+/// **table → apc → store** — the acquire path holds table + apc together.
 #[derive(Clone)]
 pub struct SharedPagedKv {
     store: Arc<Mutex<PagedKvStore>>,
     table: Arc<Mutex<PageTable>>,
+    apc: Arc<Mutex<ApcIndex>>,
 }
 
 impl std::fmt::Debug for SharedPagedKv {
@@ -62,6 +69,7 @@ impl SharedPagedKv {
         Self {
             store: Arc::new(Mutex::new(store)),
             table: Arc::new(Mutex::new(table)),
+            apc: Arc::new(Mutex::new(ApcIndex::new())),
         }
     }
 
@@ -109,6 +117,74 @@ impl SharedPagedKv {
     pub fn with_table_mut<R>(&self, f: impl FnOnce(&mut PageTable) -> R) -> R {
         let mut t = self.table.lock().expect("table lock");
         f(&mut *t)
+    }
+
+    /// Lock-and-execute helper for the APC block index (register / prune /
+    /// stats). Acquired AFTER the table when both are needed.
+    pub fn with_apc_mut<R>(&self, f: impl FnOnce(&mut ApcIndex) -> R) -> R {
+        let mut a = self.apc.lock().expect("apc lock");
+        f(&mut *a)
+    }
+
+    /// vLLM APC acquire: for a prompt's block-hash `chain`, find the longest
+    /// leading run of blocks present in the index whose pages are still valid,
+    /// acquire one reference to each (REACQUIRE a freed page — reviving its
+    /// retained KV — or ADD_REF a live one), and return them in page order. The
+    /// returned pages are ref-held by the caller, exactly like a fresh `alloc`,
+    /// so [`crate::paged_kv_cache::PagedKvCache::pin_shared_prefix`] +
+    /// `release` balance them. A stale entry (its page since reused) stops the
+    /// run and is pruned. Holds table → apc.
+    pub fn apc_acquire_prefix(&self, chain: &[BlockHash]) -> Vec<PageId> {
+        let mut table = self.table.lock().expect("table lock");
+        let mut apc = self.apc.lock().expect("apc lock");
+        let mut out = Vec::new();
+        for &h in chain {
+            let Some(page) = apc.get(h) else {
+                break; // gap — vLLM reuses only a contiguous prefix
+            };
+            let acquired = if table.refs_of(page) > 0 {
+                table.add_ref(&[page]);
+                true
+            } else {
+                table.reacquire(page)
+            };
+            if acquired {
+                out.push(page);
+            } else {
+                // Page vanished (physically reused) — drop the stale entry.
+                apc.remove(h);
+                break;
+            }
+        }
+        out
+    }
+
+    /// Register finalized blocks: each `(block_hash, page)` becomes reusable by
+    /// a later request with the same prefix content.
+    pub fn apc_register(&self, entries: &[(BlockHash, PageId)]) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut apc = self.apc.lock().expect("apc lock");
+        for (h, p) in entries {
+            apc.register(*h, *p);
+        }
+    }
+
+    /// Prune stale index entries for pages that were just PHYSICALLY allocated
+    /// for new content (their old block hashes no longer describe them). Must
+    /// be called right after any fresh `alloc` of pages for a slot.
+    pub fn apc_prune_realloc(&self, pages: &[PageId]) {
+        if pages.is_empty() {
+            return;
+        }
+        self.with_apc_mut(|apc| apc.remove_pages(pages));
+    }
+
+    /// `(hits, misses, entries)` of the APC index, for stats/telemetry.
+    pub fn apc_stats(&self) -> (u64, u64, usize) {
+        let a = self.apc.lock().expect("apc lock");
+        (a.hits(), a.misses(), a.len())
     }
 }
 
@@ -172,6 +248,44 @@ mod tests {
         assert_eq!(c.free_pages(), 2);
         c.with_table_mut(|t| t.free(&pages));
         assert_eq!(a.free_pages(), 4);
+    }
+
+    #[test]
+    fn apc_register_reacquire_and_prune() {
+        use crate::apc::chain_block_hash;
+        let shared = small_shared(); // 4 pages, page_size 4
+        // Slot A: alloc 2 pages, register their block hashes (2 blocks of 4).
+        let pages = shared.with_table_mut(|t| t.alloc(2).expect("alloc 2"));
+        let h0 = chain_block_hash(None, &[1, 2, 3, 4]);
+        let h1 = chain_block_hash(Some(h0), &[5, 6, 7, 8]);
+        shared.apc_register(&[(h0, pages[0]), (h1, pages[1])]);
+
+        // Slot A completes → free. Pages drop to refcount 0 but stay in the
+        // index (their KV content is still valid + reusable).
+        shared.with_table_mut(|t| t.free(&pages));
+        assert_eq!(shared.free_pages(), 4);
+
+        // Slot B re-asks the same prefix → reacquires both blocks by content
+        // hash, pulling them back off the free list without recompute.
+        let got = shared.apc_acquire_prefix(&[h0, h1]);
+        assert_eq!(got, pages, "reacquired the same physical pages");
+        assert_eq!(shared.free_pages(), 2, "reacquired pages left the free list");
+
+        // A gap in the chain stops the run: an unknown third block isn't shared.
+        let h_other = chain_block_hash(Some(h1), &[99, 99, 99, 99]);
+        assert_eq!(shared.apc_acquire_prefix(&[h0, h1, h_other]).len(), 2);
+        // (that last acquire add_ref'd h0/h1 again — release those extra refs)
+        shared.with_table_mut(|t| t.free(&pages));
+
+        // Slot B frees, then those pages are PHYSICALLY realloc'd for new
+        // content → prune drops the stale hashes.
+        shared.with_table_mut(|t| t.free(&got));
+        let fresh = shared.with_table_mut(|t| t.alloc(2).expect("realloc 2"));
+        shared.apc_prune_realloc(&fresh);
+        assert!(
+            shared.apc_acquire_prefix(&[h0, h1]).is_empty(),
+            "pruned hashes no longer resolve after physical realloc"
+        );
     }
 
     #[test]

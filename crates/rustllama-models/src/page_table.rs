@@ -60,6 +60,17 @@ impl PageTable {
         self.free.len()
     }
 
+    /// Current reference count of a page. `0` ⇒ on the free list (its content
+    /// is still valid until re-allocated — see [`reacquire`]); `> 0` ⇒ live and
+    /// held by that many slots. Used by the APC acquire path to choose between
+    /// [`add_ref`] (live) and [`reacquire`] (free).
+    ///
+    /// [`reacquire`]: Self::reacquire
+    /// [`add_ref`]: Self::add_ref
+    pub fn refs_of(&self, page: PageId) -> u32 {
+        self.refs.get(page.0 as usize).copied().unwrap_or(0)
+    }
+
     /// Allocate `n` pages, returning them in the order they were
     /// popped (most-recently-freed first). Returns `None` if the
     /// pool is short of `n` pages — the scheduler should keep the
