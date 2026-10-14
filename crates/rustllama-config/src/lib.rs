@@ -621,6 +621,15 @@ pub struct InferenceConfig {
     /// wins).
     #[serde(default)]
     pub kv_persist_mb: u64,
+    /// LMCache CPU cold tier (paged backend): cap in MB for an in-RAM store of
+    /// EVICTED KV blocks, keyed by content hash. When a block's page is about to
+    /// be physically reused, its bytes are offloaded here (demote) instead of
+    /// lost; a later request that shares that block promotes it back instead of
+    /// recomputing. `0` (default) disables the tier — pure APC (hot-only) then.
+    /// Only the paged backend uses it (the one that does block-level APC).
+    /// Promoted to `RUSTLLAMA_KV_COLD_TIER_MB` at startup (a user-set env wins).
+    #[serde(default)]
+    pub kv_cold_tier_mb: u64,
     /// Memory-budget mode: `"manual"` (default) keeps the explicit
     /// knobs (`moe_expert_cache_mb`, `lock_ram_mb`) authoritative;
     /// `"auto"` derives the expert-cache budget at engine load from
@@ -883,6 +892,7 @@ impl Default for InferenceConfig {
             // which passed 2026-09-20).
             prefill_batched_hybrid: true,
             kv_persist_mb: 0,
+            kv_cold_tier_mb: 0,
             memory_budget: default_memory_budget(),
         }
     }

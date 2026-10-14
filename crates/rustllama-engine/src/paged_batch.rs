@@ -230,6 +230,18 @@ impl PagedBatchEngine {
         ))?;
         let table = PageTable::new(total_pages, page_size);
         let shared = SharedPagedKv::new(store, table);
+        // LMCache: enable the CPU cold tier when configured (the CLI promotes
+        // `[inference].kv_cold_tier_mb` to this env var). Evicted KV blocks are
+        // then offloaded to RAM instead of lost, and promoted back on a later
+        // content-hash hit. `0`/unset = pure APC.
+        if let Some(mb) = std::env::var("RUSTLLAMA_KV_COLD_TIER_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&mb| mb > 0)
+        {
+            shared.set_cold_cap_bytes(mb * 1024 * 1024);
+            tracing::info!(cap_mb = mb, "LMCache CPU cold tier enabled (paged serving engine)");
+        }
         let model = Arc::new(model);
         let model_id = path
             .file_stem()
