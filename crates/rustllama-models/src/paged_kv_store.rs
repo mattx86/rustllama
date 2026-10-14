@@ -135,6 +135,34 @@ impl PagedKvStore {
         self.page_stride
     }
 
+    /// Borrow one page's full contiguous KV slab (every layer, both K and V,
+    /// all heads × positions). A page is the outermost axis, so this is one
+    /// contiguous slice — the natural unit for LMCache cold-tier offload.
+    /// `None` if `page` is out of range.
+    pub fn read_page(&self, page: crate::page_table::PageId) -> Option<&[f32]> {
+        let off = (page.0 as usize).checked_mul(self.page_stride)?;
+        self.data.get(off..off + self.page_stride)
+    }
+
+    /// Overwrite one page's full contiguous KV slab from `src` (exactly
+    /// `page_stride` elements) — used to PROMOTE a block back from the cold tier
+    /// into a freshly-allocated page. Returns false on a size/range mismatch.
+    pub fn write_page(&mut self, page: crate::page_table::PageId, src: &[f32]) -> bool {
+        if src.len() != self.page_stride {
+            return false;
+        }
+        let Some(off) = (page.0 as usize).checked_mul(self.page_stride) else {
+            return false;
+        };
+        match self.data.get_mut(off..off + self.page_stride) {
+            Some(dst) => {
+                dst.copy_from_slice(src);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Internal: offset within `data` for one (page, layer, kv_axis,
     /// head, pos) cell. Returns `None` on any out-of-range axis so
     /// upstream bugs fail loudly rather than silently address into
@@ -1256,6 +1284,22 @@ mod tests {
         let s = small_store();
         // 2 (layers) * 2 (K|V) * 3 (heads) * 4 (page_size) * 8 (head_dim) = 384
         assert_eq!(s.page_stride(), 384);
+    }
+
+    #[test]
+    fn read_write_page_round_trips() {
+        let mut s = small_store();
+        let stride = s.page_stride(); // 384
+        let payload: Vec<f32> = (0..stride).map(|i| i as f32 * 0.5 - 7.0).collect();
+        // Write a whole page (LMCache promote) and read it back (demote).
+        assert!(s.write_page(PageId(2), &payload));
+        assert_eq!(s.read_page(PageId(2)).unwrap(), payload.as_slice());
+        // A different page is untouched (still zero).
+        assert!(s.read_page(PageId(0)).unwrap().iter().all(|&x| x == 0.0));
+        // Wrong-size write and out-of-range page are rejected.
+        assert!(!s.write_page(PageId(0), &payload[..10]));
+        assert!(s.read_page(PageId(99)).is_none());
+        assert!(!s.write_page(PageId(99), &payload));
     }
 
     #[test]
