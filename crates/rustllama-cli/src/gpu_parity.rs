@@ -5043,3 +5043,36 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+// =====================================================================
+// NPU compute-offload parity (`rustllama doctor --npu-parity`)
+// =====================================================================
+
+/// Grade the Intel NPU MatMul offload (Phase 5) against the CPU reference.
+/// SKIPs cleanly off NPU hardware / without the bundled OpenVINO runtime. This
+/// is the first real numeric validation of the write-blind offload path.
+pub fn run_npu_parity() -> anyhow::Result<()> {
+    println!("Intel NPU compute-offload parity (OpenVINO MatMul, Phase 5)");
+    let r = rustllama_npu::npu_matmul_parity();
+    if !r.supported {
+        println!(
+            "  matmul:f32               SKIP        no NPU device / OpenVINO runtime not loaded"
+        );
+        println!("\nsummary: SKIP (no NPU offload available on this host)");
+        return Ok(());
+    }
+    let verdict = if r.pass { "OK" } else { "MISCOMPUTE" };
+    println!("  matmul:f32               {verdict:<11} cos={:.6} max_rel={:.4}", r.cos, r.max_rel);
+    if r.pass {
+        println!(
+            "\nsummary: OK — the NPU MatMul offload matches the CPU reference; the \
+             dispatch verdict `npu:matmul_f32` can auto-enable it."
+        );
+    } else {
+        println!(
+            "\nsummary: MISCOMPUTE — the NPU MatMul offload disagrees with the CPU \
+             reference; dispatch stays fail-closed (NPU offload off)."
+        );
+    }
+    Ok(())
+}

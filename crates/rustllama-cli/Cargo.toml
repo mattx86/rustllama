@@ -56,6 +56,9 @@ rustllama-runtime = { path = "../rustllama-runtime" }
 rustllama-hub = { path = "../rustllama-hub" }
 rustllama-server = { path = "../rustllama-server" }
 rustllama-engine = { path = "../rustllama-engine" }
+# NPU device model + compute offload — `doctor --npu-parity` grades the Intel
+# NPU MatMul offload (Phase 5) vs the CPU reference.
+rustllama-npu = { path = "../rustllama-npu" }
 rustllama-client = { path = "../rustllama-client" }
 rustllama-lsp = { path = "../rustllama-lsp" }
 rustllama-tuner = { path = "../rustllama-tuner" }

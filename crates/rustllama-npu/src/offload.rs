@@ -417,7 +417,11 @@ pub(crate) fn matmul_parity() -> NpuParity {
     let b: Vec<f32> = (0..k * n).map(|i| (((i * 40503) >> 4) as f32 % 13.0) - 6.0).collect();
 
     let Some(got) = exec.matmul_f32(&a, m, k, &b, n) else {
-        return skip;
+        // An NPU is present but the offload FAILED (bad IR / compile / infer).
+        // Surface it as a correctness failure, not a clean SKIP, so the
+        // write-blind path gets investigated on hardware rather than silently
+        // looking "unsupported".
+        return NpuParity { supported: true, cos: 0.0, max_rel: f64::INFINITY, pass: false };
     };
     // CPU reference.
     let mut want = vec![0f32; m * n];

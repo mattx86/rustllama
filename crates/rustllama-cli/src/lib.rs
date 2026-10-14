@@ -94,6 +94,13 @@ pub enum Command {
         /// on the author's box, so this is its first real validation.
         #[arg(long, default_value_t = false)]
         sycl_tier_parity: bool,
+        /// Validate Intel NPU COMPUTE offload (Phase 5): compile a MatMul to the
+        /// NPU via OpenVINO and grade it vs the CPU reference. SKIPs cleanly off
+        /// NPU hardware (or without the bundled OpenVINO runtime). WRITE-BLIND:
+        /// no NPU on the author's box, so this is the offload path's first real
+        /// numeric validation.
+        #[arg(long, default_value_t = false)]
+        npu_parity: bool,
     },
     /// Print the rustllama version.
     Version,
@@ -979,6 +986,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             cpu_parity,
             metal_parity,
             sycl_tier_parity,
+            npu_parity,
         } => {
             if let Some(probe) = sycl_parity_probe {
                 crate::gpu_parity::run_probe(&probe)
@@ -992,6 +1000,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 crate::gpu_parity::run_metal_parity()
             } else if sycl_tier_parity {
                 crate::gpu_parity::run_sycl_tier_parity()
+            } else if npu_parity {
+                crate::gpu_parity::run_npu_parity()
             } else {
                 doctor(&config_path, sycl_smoke).await
             }
