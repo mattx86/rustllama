@@ -1031,6 +1031,14 @@ pub async fn chat(State(state): State<AppState>, Json(req): Json<OllamaChatReque
         .as_ref()
         .and_then(|e| e.count_chat_prompt(&msgs).ok())
         .unwrap_or(0);
+    // E2-ingress: clamp the generation budget to the context window.
+    if let Some(max_ctx) = serving.cpu_engine.as_ref().map(|e| e.max_ctx()) {
+        if let Some((code, msg)) =
+            crate::clamp_max_tokens_to_ctx(&mut sampling, prompt_eval_count as usize, max_ctx)
+        {
+            return (code, msg).into_response();
+        }
+    }
 
     let handle = match serving.try_acquire().await {
         Ok(p) => p,
@@ -1043,7 +1051,8 @@ pub async fn chat(State(state): State<AppState>, Json(req): Json<OllamaChatReque
     };
 
     if req.stream {
-        let id = format!("ollama-{:032x}", now_unix_secs() as u128);
+        // E1: process-unique id (see `crate::new_request_id`).
+        let id = crate::new_request_id("ollama");
         let cancel_guard = state.register_cancel(&id);
         stream_ndjson_chat(
             model_id,
@@ -1145,6 +1154,14 @@ async fn ollama_chat_with_tools(
         .encode(&prompt, tokenizer.add_bos_token())
         .map(|ids| ids.len() as u32)
         .unwrap_or(0);
+    // E2-ingress: clamp the generation budget to the context window.
+    if let Some((code, msg)) = crate::clamp_max_tokens_to_ctx(
+        &mut sampling,
+        prompt_eval_count as usize,
+        shared_cpu.max_ctx(),
+    ) {
+        return (code, Json(json!({ "error": msg }))).into_response();
+    }
 
     let handle = match serving.try_acquire().await {
         Ok(p) => p,
@@ -1167,7 +1184,8 @@ async fn ollama_chat_with_tools(
     // `tool_calls` object per completed call), terminated by the final
     // `done: true` object — instead of a single bare JSON object.
     if req.stream {
-        let id = format!("ollama-{:032x}", now_unix_secs() as u128);
+        // E1: process-unique id (see `crate::new_request_id`).
+        let id = crate::new_request_id("ollama");
         let cancel_guard = state.register_cancel(&id);
         return stream_ndjson_chat_tools(
             model_id,
@@ -1664,6 +1682,18 @@ pub async fn generate(
         PreparedGenerate::Raw { count }
     };
 
+    // E2-ingress: clamp the generation budget to the context window.
+    let prompt_count = match &prepared {
+        PreparedGenerate::Chat { count, .. } | PreparedGenerate::Raw { count } => *count,
+    };
+    if let Some(max_ctx) = shared_cpu.as_ref().map(|e| e.max_ctx()) {
+        if let Some((code, msg)) =
+            crate::clamp_max_tokens_to_ctx(&mut sampling, prompt_count as usize, max_ctx)
+        {
+            return (code, Json(json!({ "error": msg }))).into_response();
+        }
+    }
+
     // Wait on the gate now that tokenization is done.
     let handle = match pregate_permit.acquire_gate().await {
         Ok(h) => h,
@@ -1687,7 +1717,8 @@ pub async fn generate(
     };
 
     if req.stream {
-        let id = format!("ollama-{:032x}", now_unix_secs() as u128);
+        // E1: process-unique id (see `crate::new_request_id`).
+        let id = crate::new_request_id("ollama");
         let cancel_guard = state.register_cancel(&id);
         stream_ndjson_generate(
             model_id,
@@ -1849,13 +1880,6 @@ where
         .header("x-rustllama-request-id", id)
         .body(Body::from_stream(stream))
         .unwrap()
-}
-
-fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn sampling_from_options(opts: Option<&OllamaOptions>) -> SamplingParams {

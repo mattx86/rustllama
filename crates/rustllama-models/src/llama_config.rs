@@ -146,6 +146,11 @@ pub struct RopeScaling {
     /// (defaults 32.0 / 1.0).
     pub beta_fast: f32,
     pub beta_slow: f32,
+    /// Llama-3.1 `rope.scaling.low_freq_factor` / `high_freq_factor` — the
+    /// piecewise frequency-smoothing bounds for [`RopeScalingKind::Llama3`]
+    /// (defaults 1.0 / 4.0 per Meta's reference). Ignored by every other kind.
+    pub low_freq_factor: f32,
+    pub high_freq_factor: f32,
 }
 
 /// Which RoPE scaling scheme a model declares.
@@ -163,6 +168,11 @@ pub enum RopeScalingKind {
     Yarn,
     /// Phi-3 LongRoPE (per-dim short/long factor arrays).
     LongRope,
+    /// Llama-3.1 piecewise frequency smoothing: low-frequency dims interpolate
+    /// (÷`factor`), high-frequency dims extrapolate (unchanged), and the band in
+    /// between blends by `low_freq_factor`/`high_freq_factor` over
+    /// `original_context_length`.
+    Llama3,
 }
 
 #[derive(Debug, Clone)]
@@ -378,11 +388,37 @@ impl LlamaConfig {
         let n_mtp_heads = u32_optional(gguf, &key("mtp.head_count")).unwrap_or(0);
 
         let moe = match u32_optional(gguf, &key("expert_count")) {
-            Some(n) if n > 0 => Some(MoeConfig {
-                n_experts: n,
-                n_experts_used: u32_optional(gguf, &key("expert_used_count")).unwrap_or(1),
-                n_experts_shared: u32_optional(gguf, &key("expert_shared_count")).unwrap_or(0),
-            }),
+            Some(n) if n > 0 => {
+                let n_experts_used =
+                    u32_optional(gguf, &key("expert_used_count")).unwrap_or(1);
+                // C4: validate the routing shape at LOAD, not deep in the hot
+                // path. `route_topk_into` indexes `n_experts_used` of the
+                // `n_experts` experts; `used > total` reads past the expert
+                // table and `used == 0` means a MoE layer that routes to
+                // nothing (NaN logits). A corrupt / mislabeled GGUF must fail
+                // loud here so `moe.rs`'s `top_k <= n_experts` / `top_k > 0`
+                // invariants can stay cheap `debug_assert`s on the per-token
+                // path.
+                if n_experts_used == 0 {
+                    return Err(ConfigError::Invalid(format!(
+                        "{}.expert_used_count is 0 — a MoE layer must route to \
+                         at least one expert",
+                        arch
+                    )));
+                }
+                if n_experts_used > n {
+                    return Err(ConfigError::Invalid(format!(
+                        "{}.expert_used_count ({}) exceeds expert_count ({})",
+                        arch, n_experts_used, n
+                    )));
+                }
+                Some(MoeConfig {
+                    n_experts: n,
+                    n_experts_used,
+                    n_experts_shared: u32_optional(gguf, &key("expert_shared_count"))
+                        .unwrap_or(0),
+                })
+            }
             _ => None,
         };
 
@@ -562,6 +598,35 @@ fn parse_hadamard(gguf: &Gguf) -> Result<Option<HadamardConfig>, ConfigError> {
             return Err(bad(format!("duplicate prism.hadamard.weight_names entry: {name}")));
         }
     }
+    // C2: gate/up foldedness must be PAIRED. The fused gate+up dispatch
+    // (`matvec_tensor_gate_up_fused_dispatch`) feeds ONE activation to both
+    // projections, so the Hadamard pre-rotation is applied (or not) to both
+    // together — a model that folded only `ffn_gate` but not the sibling
+    // `ffn_up` (or vice versa) would silently rotate one matmul's input and
+    // not the other's → garbage output. The forward path only `debug_assert`s
+    // this (`llama_arch.rs:336`); validate it at LOAD so a release build
+    // refuses such a GGUF instead of mis-serving it. The substring swap covers
+    // all three gate/up pairs (`ffn_gate.weight`↔`ffn_up.weight`,
+    // `ffn_gate_exps`↔`ffn_up_exps`, `ffn_gate_shexp`↔`ffn_up_shexp`).
+    for name in &weight_names {
+        if name.contains("ffn_gate") {
+            let sibling = name.replace("ffn_gate", "ffn_up");
+            if !seen.contains(&sibling) {
+                return Err(bad(format!(
+                    "prism.hadamard.weight_names folds {name} but not its fused \
+                     sibling {sibling} — gate/up foldedness must be paired"
+                )));
+            }
+        } else if name.contains("ffn_up") {
+            let sibling = name.replace("ffn_up", "ffn_gate");
+            if !seen.contains(&sibling) {
+                return Err(bad(format!(
+                    "prism.hadamard.weight_names folds {name} but not its fused \
+                     sibling {sibling} — gate/up foldedness must be paired"
+                )));
+            }
+        }
+    }
     let inverse_weight_names =
         str_array(gguf, "prism.hadamard.inverse_weight_names").unwrap_or_default();
     for name in &inverse_weight_names {
@@ -724,8 +789,10 @@ fn parse_rope_scaling(gguf: &Gguf, arch: &str) -> Option<RopeScaling> {
         "linear" => RopeScalingKind::Linear,
         "yarn" => RopeScalingKind::Yarn,
         "longrope" => RopeScalingKind::LongRope,
-        // llama.cpp emits "none" for unscaled; "dynamic"/"ntk" for NTK-aware.
+        // llama.cpp emits "none" for unscaled; "dynamic"/"ntk" for NTK-aware;
+        // "llama3" for the Llama-3.1 piecewise frequency smoothing.
         "dynamic" | "ntk" => RopeScalingKind::Ntk,
+        "llama3" => RopeScalingKind::Llama3,
         _ => return None,
     };
     Some(RopeScaling {
@@ -735,5 +802,7 @@ fn parse_rope_scaling(gguf: &Gguf, arch: &str) -> Option<RopeScaling> {
         attn_factor: f32_optional(gguf, &key("rope.scaling.attn_factor")).unwrap_or(1.0),
         beta_fast: f32_optional(gguf, &key("rope.scaling.beta_fast")).unwrap_or(32.0),
         beta_slow: f32_optional(gguf, &key("rope.scaling.beta_slow")).unwrap_or(1.0),
+        low_freq_factor: f32_optional(gguf, &key("rope.scaling.low_freq_factor")).unwrap_or(1.0),
+        high_freq_factor: f32_optional(gguf, &key("rope.scaling.high_freq_factor")).unwrap_or(4.0),
     })
 }

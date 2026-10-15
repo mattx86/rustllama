@@ -11192,6 +11192,29 @@ void rsl_silu_mul_usm(rsl_stream* s,
     }).wait();
 })
 
+// F32-precision twin of `rsl_silu_mul_usm` (F2). `out[i] = silu(x[i]) * y[i]`
+// with f32 USM in/out — no f16 round-trip of the SwiGLU activation.
+void rsl_silu_mul_f32_usm(rsl_stream* s,
+                          const float* x_usm, const float* y_usm,
+                          float* out_usm, int n) RSL_FFI_BODY_VOID("rsl_silu_mul_f32_usm", {
+    if (s == nullptr || x_usm == nullptr || y_usm == nullptr || out_usm == nullptr) return;
+    if (n <= 0) return;
+    auto& q = s->q;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(static_cast<std::size_t>(n))),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+            const int i = static_cast<int>(it.get_global_id(0));
+            if (i >= n) return;
+            const float xv = x_usm[i];
+            const float yv = y_usm[i];
+            const float silu = xv / (1.0f + sycl::exp(-xv));
+            out_usm[i] = silu * yv;
+        });
+    }).wait();
+})
+
 // G2: KV-cache Q8_0 quantize-on-store. Reads f32 activations laid out
 // as `[n_new][n_kv_heads][head_dim]` contiguous, writes i8 quantized
 // bytes + per-row f32 scales into the strided KV-cache layout
@@ -11841,6 +11864,38 @@ void rsl_rmsnorm_usm(rsl_stream* s,
                 float v = bits_to_f32(x_usm[base + i]);
                 float wv = bits_to_f32(w_usm[i]);
                 y_usm[base + i] = f32_to_bits(v * scale * wv);
+            }
+        });
+    }).wait();
+})
+
+// F32-precision twin of `rsl_rmsnorm_usm` (F2). Same algorithm and topology,
+// but x / w / y are f32 USM — so the chain stays single-precision and the
+// caller skips the F32→F16→F32 round-trip the f16 variant forces (which
+// otherwise drifts the normalized activation on every decode layer).
+void rsl_rmsnorm_f32_usm(rsl_stream* s,
+                         const float* x_usm, const float* w_usm,
+                         float* y_usm,
+                         int n_rows, int d, float eps) RSL_FFI_BODY_VOID("rsl_rmsnorm_f32_usm", {
+    if (s == nullptr || x_usm == nullptr || w_usm == nullptr || y_usm == nullptr) return;
+    if (n_rows <= 0 || d <= 0) return;
+    auto& q = s->q;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(n_rows)),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+            const int r = static_cast<int>(it.get_global_id(0));
+            if (r >= n_rows) return;
+            const int base = r * d;
+            float sum_sq = 0.0f;
+            for (int i = 0; i < d; ++i) {
+                const float v = x_usm[base + i];
+                sum_sq += v * v;
+            }
+            const float scale = 1.0f / sycl::sqrt(sum_sq / static_cast<float>(d) + eps);
+            for (int i = 0; i < d; ++i) {
+                y_usm[base + i] = x_usm[base + i] * scale * w_usm[i];
             }
         });
     }).wait();

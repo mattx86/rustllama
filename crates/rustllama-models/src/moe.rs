@@ -71,6 +71,22 @@ fn no_shared_expert() -> bool {
     *C.get_or_init(|| std::env::var("RUSTLLAMA_NO_SHARED_EXPERT").is_ok())
 }
 
+/// Shared-expert FFN width = the gate weight's OUTPUT dim. A gate weight
+/// `[out, in]` is stored in GGUF as dims `[in = d_model, out = width]`
+/// (`ne[0]` is the contraction/input dim — the same order the routed +
+/// dense matvecs assume, e.g. `matvec_tensor(w, x, out, m = d_ff,
+/// k = d_model)`), so `shape.first()` is `d_model`, NOT the width. Derive
+/// it from `element_count / d_model`: correct regardless of dim order, and
+/// for both DeepSeek-V3 (width == d_ff) and Qwen2-MoE / Qwen3.5-MoE (a
+/// wider or `shared_expert_feed_forward_length`-sized shared FFN, which
+/// then takes the per-call-buffer branch). See the fix in commit 648a068
+/// (`moe_ffn_one_into`) — this hoists it so the `_parts` / chunk siblings
+/// use the same derivation instead of the routed-expert `d_ff`.
+#[inline]
+pub(crate) fn shared_expert_width(w_gate: &Tensor, d_model: usize) -> usize {
+    (w_gate.element_count() / (d_model as u64).max(1)).max(1) as usize
+}
+
 /// Result of routing one token through the MoE router.
 #[derive(Debug, Clone)]
 pub struct RoutedExperts {
@@ -530,18 +546,9 @@ pub fn moe_ffn_one_into(
             }
             None => 1.0,
         };
-        // Shared FFN width = the gate weight's OUTPUT dim. A gate weight
-        // [out, in] is stored in GGUF with dims = [in = d_model, out =
-        // shared_d_ff] (ne[0] is the contraction/input dim — the same order
-        // the routed + dense matvecs assume, e.g. `matvec_tensor(w, x, out,
-        // m = d_ff, k = d_model)`). So `shape.first()` is d_model, NOT the
-        // width — using it mis-sized the shared expert to d_model (half the
-        // real width on the synth DeepSeek shape: 64 vs 128) and tripped the
-        // `w.len() == m*k` assert in the down matvec. Derive the width from
-        // element_count / d_model instead: correct regardless of dim order,
-        // and for both DeepSeek-V3 (width == d_ff) and Qwen2-MoE (wider shared
-        // FFN, which then takes the per-call-buffer branch below).
-        let shared_d_ff = (w_g.element_count() / (d_model as u64).max(1)).max(1) as usize;
+        // Shared FFN width = the gate weight's OUTPUT dim (see
+        // `shared_expert_width`). DeepSeek-V3 == d_ff; Qwen2-MoE wider.
+        let shared_d_ff = shared_expert_width(w_g, d_model);
         if shared_d_ff <= d_ff {
             crate::llama_arch::matvec_tensor_gate_up_fused_dispatch(
                 w_g,
@@ -730,11 +737,44 @@ pub fn moe_ffn_one_into_parts(
             } else {
                 1.0
             };
-            crate::llama_arch::matvec_tensor_gate_up_fused_dispatch(
-                w_g, w_u, hidden, gate_buf, up_buf, d_ff, d_model,
-            );
-            k::silu_mul_f32(gate_buf, up_buf, ff_buf);
-            crate::llama_arch::matvec_tensor_dispatch(w_d, ff_buf, down_buf, d_model, d_ff);
+            // Shared-expert width may differ from the routed `d_ff`
+            // (Qwen3.5-MoE `shared_expert_feed_forward_length`); sizing the
+            // matvecs to `d_ff` silently truncated gate/up and gave the down
+            // matvec the wrong row stride in release. Derive the real width.
+            let shared_d_ff = shared_expert_width(w_g, d_model);
+            if shared_d_ff <= d_ff {
+                crate::llama_arch::matvec_tensor_gate_up_fused_dispatch(
+                    w_g,
+                    w_u,
+                    hidden,
+                    &mut gate_buf[..shared_d_ff],
+                    &mut up_buf[..shared_d_ff],
+                    shared_d_ff,
+                    d_model,
+                );
+                k::silu_mul_f32(
+                    &gate_buf[..shared_d_ff],
+                    &up_buf[..shared_d_ff],
+                    &mut ff_buf[..shared_d_ff],
+                );
+                crate::llama_arch::matvec_tensor_dispatch(
+                    w_d,
+                    &ff_buf[..shared_d_ff],
+                    down_buf,
+                    d_model,
+                    shared_d_ff,
+                );
+            } else {
+                // Wider shared FFN than the routed scratch — allocate per call.
+                let mut sg = vec![0.0f32; shared_d_ff];
+                let mut su = vec![0.0f32; shared_d_ff];
+                let mut sf = vec![0.0f32; shared_d_ff];
+                crate::llama_arch::matvec_tensor_gate_up_fused_dispatch(
+                    w_g, w_u, hidden, &mut sg, &mut su, shared_d_ff, d_model,
+                );
+                k::silu_mul_f32(&sg, &su, &mut sf);
+                crate::llama_arch::matvec_tensor_dispatch(w_d, &sf, down_buf, d_model, shared_d_ff);
+            }
             for j in 0..d_model {
                 out[j] += shared_weight * down_buf[j];
             }
@@ -864,25 +904,30 @@ pub fn moe_ffn_chunk_into_parts(
         return;
     }
     if let (Some(w_g), Some(w_u), Some(w_d)) = (w_gate_shared, w_up_shared, w_down_shared) {
-        let mut sh_gate = vec![0.0f32; n_tokens * d_ff];
-        let mut sh_up = vec![0.0f32; n_tokens * d_ff];
-        let mut sh_ff = vec![0.0f32; n_tokens * d_ff];
+        // Shared-expert width may differ from the routed `d_ff`
+        // (Qwen3.5-MoE `shared_expert_feed_forward_length`); size the
+        // gate/up/ff scratch to the real width so the batched matvecs don't
+        // truncate the activation or mis-stride the down projection.
+        let shared_d_ff = shared_expert_width(w_g, d_model);
+        let mut sh_gate = vec![0.0f32; n_tokens * shared_d_ff];
+        let mut sh_up = vec![0.0f32; n_tokens * shared_d_ff];
+        let mut sh_ff = vec![0.0f32; n_tokens * shared_d_ff];
         let mut sh_down = vec![0.0f32; n_tokens * d_model];
         crate::llama_arch::matvec_tensor_batched_dispatch(
-            w_g, hidden_rows, &mut sh_gate, d_ff, d_model, n_tokens,
+            w_g, hidden_rows, &mut sh_gate, shared_d_ff, d_model, n_tokens,
         );
         crate::llama_arch::matvec_tensor_batched_dispatch(
-            w_u, hidden_rows, &mut sh_up, d_ff, d_model, n_tokens,
+            w_u, hidden_rows, &mut sh_up, shared_d_ff, d_model, n_tokens,
         );
         for i in 0..n_tokens {
             k::silu_mul_f32(
-                &sh_gate[i * d_ff..(i + 1) * d_ff],
-                &sh_up[i * d_ff..(i + 1) * d_ff],
-                &mut sh_ff[i * d_ff..(i + 1) * d_ff],
+                &sh_gate[i * shared_d_ff..(i + 1) * shared_d_ff],
+                &sh_up[i * shared_d_ff..(i + 1) * shared_d_ff],
+                &mut sh_ff[i * shared_d_ff..(i + 1) * shared_d_ff],
             );
         }
         crate::llama_arch::matvec_tensor_batched_dispatch(
-            w_d, &sh_ff, &mut sh_down, d_model, d_ff, n_tokens,
+            w_d, &sh_ff, &mut sh_down, d_model, shared_d_ff, n_tokens,
         );
         for t in 0..n_tokens {
             let shared_weight = if let Some(sr) = shared_router {

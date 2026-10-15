@@ -375,6 +375,13 @@ fn probe_names() -> Vec<String> {
     // norm) as one in-order submit-chain, vs the CPU reference end to end. The one
     // orchestration probe that isn't covered by the per-op kernels above.
     v.push("attn:dev_resident_block_sycl".to_string());
+    // B1/F2: the F32-precision residual/norm/activation USM fusions vs their
+    // CPU references. These keep the residual stream in f32 (no F16 round-trip),
+    // which is the correctness fix B1 lands. Small elementwise kernels — safe to
+    // bank alongside the attention probes before the matvec families.
+    v.push("fused:add_rmsnorm_f32".to_string());
+    v.push("fused:rmsnorm_f32".to_string());
+    v.push("fused:silu_mul_f32".to_string());
     for l in LAYOUTS {
         v.push(format!("matvec:{}", l.name));
     }
@@ -870,7 +877,198 @@ fn probe_matvec_batched(stream: &sk::SyclStream, name: &str, dtype: &str, starte
     }
 }
 
+/// B1: parity for the fused residual-add + RMSNorm F32 kernel
+/// (`rsl_add_rmsnorm_f32_usm`) vs the CPU reference (`add_inplace_f32` then
+/// per-row `rmsnorm_f32_row`). F32 end-to-end — the fix for the f16 round-trip
+/// that drifted the residual stream on every SYCL decode layer. Grades BOTH the
+/// written-back residual (`hidden`) and the normalized output (`y_norm`).
+fn probe_add_rmsnorm_f32(stream: &sk::SyclStream, name: &str, started: Instant) {
+    const D: usize = 256;
+    const N: usize = 3;
+    const EPS: f32 = 1e-5;
+    let total = N * D;
+    let hidden = gen_x(total, 61);
+    let branch = gen_x(total, 62);
+    let w = gen_x(D, 63);
+    let mut cpu_hidden = hidden.clone();
+    k::add_inplace_f32(&mut cpu_hidden, &branch);
+    let mut cpu_y = vec![0f32; total];
+    for r in 0..N {
+        k::rmsnorm_f32_row(
+            &cpu_hidden[r * D..(r + 1) * D],
+            &w,
+            &mut cpu_y[r * D..(r + 1) * D],
+            EPS,
+        );
+    }
+    let bufs = (
+        sk::SyclSharedBuffer::<f32>::alloc(stream, total),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, total),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, D),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, total),
+    );
+    let (mut hb, mut bb, mut wb, mut yb) = match bufs {
+        (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+        _ => {
+            emit(name, "KERNEL_ERR", "usm-alloc-failed");
+            return;
+        }
+    };
+    hb.as_mut_slice().copy_from_slice(&hidden);
+    bb.as_mut_slice().copy_from_slice(&branch);
+    wb.as_mut_slice().copy_from_slice(&w);
+    yb.as_mut_slice().fill(f32::NAN);
+    let res = sk::add_rmsnorm_f32_usm_raw(
+        stream,
+        hb.as_mut_ptr(),
+        bb.as_ptr(),
+        wb.as_ptr(),
+        yb.as_mut_ptr(),
+        N as u32,
+        D as u32,
+        EPS,
+    );
+    let ms = started.elapsed().as_millis();
+    match res {
+        Err(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
+        Ok(()) => {
+            let (ch, rh) = compare(hb.as_slice(), &cpu_hidden);
+            let (cy, ry) = compare(yb.as_slice(), &cpu_y);
+            let (cos, max_rel) = (ch.min(cy), rh.max(ry));
+            let verdict = if cos > 0.9999 && max_rel < 0.01 {
+                "OK"
+            } else {
+                "MISCOMPUTE"
+            };
+            emit(
+                name,
+                verdict,
+                &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"),
+            );
+        }
+    }
+}
+
+/// F2: parity for the F32 RMSNorm USM kernel (`rsl_rmsnorm_f32_usm`) vs CPU
+/// `rmsnorm_f32_row`. No f16 round-trip of the normalized activation.
+fn probe_rmsnorm_f32(stream: &sk::SyclStream, name: &str, started: Instant) {
+    const D: usize = 256;
+    const N: usize = 3;
+    const EPS: f32 = 1e-5;
+    let total = N * D;
+    let x = gen_x(total, 64);
+    let w = gen_x(D, 65);
+    let mut cpu_y = vec![0f32; total];
+    for r in 0..N {
+        k::rmsnorm_f32_row(
+            &x[r * D..(r + 1) * D],
+            &w,
+            &mut cpu_y[r * D..(r + 1) * D],
+            EPS,
+        );
+    }
+    let bufs = (
+        sk::SyclSharedBuffer::<f32>::alloc(stream, total),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, D),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, total),
+    );
+    let (mut xb, mut wb, mut yb) = match bufs {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        _ => {
+            emit(name, "KERNEL_ERR", "usm-alloc-failed");
+            return;
+        }
+    };
+    xb.as_mut_slice().copy_from_slice(&x);
+    wb.as_mut_slice().copy_from_slice(&w);
+    yb.as_mut_slice().fill(f32::NAN);
+    // SAFETY: three USM allocations on `stream`, sized above; kernel waits.
+    let res = unsafe {
+        sk::rmsnorm_f32_usm_raw(
+            stream,
+            xb.as_ptr(),
+            wb.as_ptr(),
+            yb.as_mut_ptr(),
+            N as u32,
+            D as u32,
+            EPS,
+        )
+    };
+    let ms = started.elapsed().as_millis();
+    match res {
+        Err(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
+        Ok(()) => {
+            let (cos, max_rel) = compare(yb.as_slice(), &cpu_y);
+            let verdict = if cos > 0.9999 && max_rel < 0.01 {
+                "OK"
+            } else {
+                "MISCOMPUTE"
+            };
+            emit(
+                name,
+                verdict,
+                &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"),
+            );
+        }
+    }
+}
+
+/// F2: parity for the F32 SwiGLU `silu(x)*y` USM kernel
+/// (`rsl_silu_mul_f32_usm`) vs CPU `silu_mul_f32`. No f16 round-trip.
+fn probe_silu_mul_f32(stream: &sk::SyclStream, name: &str, started: Instant) {
+    const N: usize = 512;
+    let x = gen_x(N, 66);
+    let y = gen_x(N, 67);
+    let mut cpu_out = vec![0f32; N];
+    k::silu_mul_f32(&x, &y, &mut cpu_out);
+    let bufs = (
+        sk::SyclSharedBuffer::<f32>::alloc(stream, N),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, N),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, N),
+    );
+    let (mut xb, mut yb, mut ob) = match bufs {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        _ => {
+            emit(name, "KERNEL_ERR", "usm-alloc-failed");
+            return;
+        }
+    };
+    xb.as_mut_slice().copy_from_slice(&x);
+    yb.as_mut_slice().copy_from_slice(&y);
+    ob.as_mut_slice().fill(f32::NAN);
+    // SAFETY: three USM allocations on `stream`, sized above; kernel waits.
+    let res = unsafe {
+        sk::silu_mul_f32_usm_raw(stream, xb.as_ptr(), yb.as_ptr(), ob.as_mut_ptr(), N as u32)
+    };
+    let ms = started.elapsed().as_millis();
+    match res {
+        Err(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
+        Ok(()) => {
+            let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
+            let verdict = if cos > 0.9999 && max_rel < 0.01 {
+                "OK"
+            } else {
+                "MISCOMPUTE"
+            };
+            emit(
+                name,
+                verdict,
+                &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"),
+            );
+        }
+    }
+}
+
 fn probe_fused(stream: &sk::SyclStream, name: &str, dtype: &str, started: Instant) {
+    // B1/F2: the F32 residual/norm/activation fusions are not dtype-keyed
+    // gate/up matvecs — dispatch them before the LAYOUTS lookup (which would
+    // panic on these names).
+    match dtype {
+        "add_rmsnorm_f32" => return probe_add_rmsnorm_f32(stream, name, started),
+        "rmsnorm_f32" => return probe_rmsnorm_f32(stream, name, started),
+        "silu_mul_f32" => return probe_silu_mul_f32(stream, name, started),
+        _ => {}
+    }
     let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
     let x = gen_x(MV_K, 43);
     let cpu = cpu_matvec_for(dtype);

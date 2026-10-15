@@ -179,6 +179,17 @@ mod imp {
             eps: f32,
         );
 
+        // F2: f32 twin — no f16 round-trip of the normalized activation.
+        pub(super) fn rsl_rmsnorm_f32_usm(
+            s: *mut rsl_stream,
+            x_usm: *const f32,
+            w_usm: *const f32,
+            y_usm: *mut f32,
+            n_rows: c_int,
+            d: c_int,
+            eps: f32,
+        );
+
         pub(super) fn rsl_rmsnorm_residual_usm(
             s: *mut rsl_stream,
             x_usm: *const u16,
@@ -1122,6 +1133,15 @@ mod imp {
             n: c_int,
         );
 
+        // F2: f32 twin — no f16 round-trip of the SwiGLU activation.
+        pub(super) fn rsl_silu_mul_f32_usm(
+            s: *mut rsl_stream,
+            x_usm: *const f32,
+            y_usm: *const f32,
+            out_usm: *mut f32,
+            n: c_int,
+        );
+
         pub(super) fn rsl_embedding_lookup_usm(
             s: *mut rsl_stream,
             table_usm: *const u16,
@@ -1694,6 +1714,26 @@ mod imp {
         unsafe { rsl_consume_last_l0_import_code() }
     }
 
+    /// D3: the quantized-KV flash kernels size their per-head on-chip scratch
+    /// for `head_dim <= RSL_FLASH_MAX_HEAD_DIM` (256) and `return;` WITHOUT
+    /// writing output above that — so a larger head_dim would leave the
+    /// caller's out buffer stale and the void kernel reports no error. Reject
+    /// here so the wrapper returns `Err(InvalidShape)` and the dispatch falls
+    /// back to the CPU reference (mirrors the `accel.rs` `ok_shape` cap and the
+    /// CUDA `rsl_cuda.cu:2697` status return). F3 note: the C++ kernels still
+    /// `return;` void on this shape rather than returning an int status; this
+    /// Rust-side cap (plus the `accel.rs` gate that declines before the call)
+    /// is what guarantees a hd>256 shape can never read as success.
+    #[inline]
+    pub(super) fn quant_flash_head_dim_ok(fn_name: &str, head_dim: u32) -> Result<()> {
+        if head_dim > 256 {
+            return Err(SyclError::InvalidShape(format!(
+                "{fn_name}: head_dim={head_dim} exceeds the 256 quant-KV flash kernel cap"
+            )));
+        }
+        Ok(())
+    }
+
     /// the engine would propagate garbage / NaN through the rest
     /// of the forward pass.
     pub(super) fn consume_error() -> Result<()> {
@@ -1975,6 +2015,31 @@ mod imp {
         // (x, y) and d (w).
         unsafe {
             rsl_rmsnorm_usm(
+                stream.raw,
+                x_usm,
+                w_usm,
+                y_usm,
+                n_rows as c_int,
+                d as c_int,
+                eps,
+            );
+        }
+        consume_error()
+    }
+
+    /// F2: f32-precision twin of [`rmsnorm_usm`]. x / w / y are f32 USM.
+    pub fn rmsnorm_f32_usm(
+        stream: &SyclStream,
+        x_usm: *const f32,
+        w_usm: *const f32,
+        y_usm: *mut f32,
+        n_rows: u32,
+        d: u32,
+        eps: f32,
+    ) -> Result<()> {
+        // SAFETY: as `rmsnorm_usm` — sizing/liveness is the caller's job.
+        unsafe {
+            rsl_rmsnorm_f32_usm(
                 stream.raw,
                 x_usm,
                 w_usm,
@@ -2324,6 +2389,7 @@ mod imp {
                 "flash_attn_decode_q4_0_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
             )));
         }
+        quant_flash_head_dim_ok("flash_attn_decode_q4_0_usm", head_dim)?;
         // SAFETY: USM pointer ownership / sizing is the caller's
         // responsibility. We just forward to the C ABI.
         unsafe {
@@ -2355,6 +2421,7 @@ mod imp {
                 "flash_attn_prefill_q4_0_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
             )));
         }
+        quant_flash_head_dim_ok("flash_attn_prefill_q4_0_usm", head_dim)?;
         if kv_len_base.saturating_add(n_new) > max_ctx {
             return Err(SyclError::InvalidShape(format!(
                 "flash_attn_prefill_q4_0_usm: kv_len_base={kv_len_base} + n_new={n_new} > max_ctx={max_ctx}"
@@ -2389,6 +2456,7 @@ mod imp {
                 "flash_attn_decode_nvfp4_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
             )));
         }
+        quant_flash_head_dim_ok("flash_attn_decode_nvfp4_usm", head_dim)?;
         // SAFETY: as above.
         unsafe {
             rsl_flash_attn_decode_nvfp4_usm(
@@ -2419,6 +2487,7 @@ mod imp {
                 "flash_attn_prefill_nvfp4_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
             )));
         }
+        quant_flash_head_dim_ok("flash_attn_prefill_nvfp4_usm", head_dim)?;
         if kv_len_base.saturating_add(n_new) > max_ctx {
             return Err(SyclError::InvalidShape(format!(
                 "flash_attn_prefill_nvfp4_usm: kv_len_base={kv_len_base} + n_new={n_new} > max_ctx={max_ctx}"
@@ -2457,6 +2526,7 @@ mod imp {
                 "flash_attn_decode_mxfp4_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
             )));
         }
+        quant_flash_head_dim_ok("flash_attn_decode_mxfp4_usm", head_dim)?;
         // SAFETY: as above.
         unsafe {
             rsl_flash_attn_decode_mxfp4_usm(
@@ -2487,6 +2557,7 @@ mod imp {
                 "flash_attn_prefill_mxfp4_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
             )));
         }
+        quant_flash_head_dim_ok("flash_attn_prefill_mxfp4_usm", head_dim)?;
         if kv_len_base.saturating_add(n_new) > max_ctx {
             return Err(SyclError::InvalidShape(format!(
                 "flash_attn_prefill_mxfp4_usm: kv_len_base={kv_len_base} + n_new={n_new} > max_ctx={max_ctx}"
@@ -2521,6 +2592,7 @@ mod imp {
                 "flash_attn_decode_mxfp6_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
             )));
         }
+        quant_flash_head_dim_ok("flash_attn_decode_mxfp6_usm", head_dim)?;
         // SAFETY: as above.
         unsafe {
             rsl_flash_attn_decode_mxfp6_usm(
@@ -2551,6 +2623,7 @@ mod imp {
                 "flash_attn_prefill_mxfp6_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
             )));
         }
+        quant_flash_head_dim_ok("flash_attn_prefill_mxfp6_usm", head_dim)?;
         if kv_len_base.saturating_add(n_new) > max_ctx {
             return Err(SyclError::InvalidShape(format!(
                 "flash_attn_prefill_mxfp6_usm: kv_len_base={kv_len_base} + n_new={n_new} > max_ctx={max_ctx}"
@@ -2585,6 +2658,7 @@ mod imp {
                 "flash_attn_decode_mxfp8_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
             )));
         }
+        quant_flash_head_dim_ok("flash_attn_decode_mxfp8_usm", head_dim)?;
         // SAFETY: as above.
         unsafe {
             rsl_flash_attn_decode_mxfp8_usm(
@@ -2615,6 +2689,7 @@ mod imp {
                 "flash_attn_prefill_mxfp8_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
             )));
         }
+        quant_flash_head_dim_ok("flash_attn_prefill_mxfp8_usm", head_dim)?;
         if kv_len_base.saturating_add(n_new) > max_ctx {
             return Err(SyclError::InvalidShape(format!(
                 "flash_attn_prefill_mxfp8_usm: kv_len_base={kv_len_base} + n_new={n_new} > max_ctx={max_ctx}"
@@ -2652,6 +2727,7 @@ mod imp {
                 "flash_attn_decode_tq_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
             )));
         }
+        quant_flash_head_dim_ok("flash_attn_decode_tq_usm", head_dim)?;
         // SAFETY: as above.
         unsafe {
             rsl_flash_attn_decode_tq_usm(
@@ -2686,6 +2762,7 @@ mod imp {
                 "flash_attn_prefill_tq_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
             )));
         }
+        quant_flash_head_dim_ok("flash_attn_prefill_tq_usm", head_dim)?;
         if kv_len_base.saturating_add(n_new) > max_ctx {
             return Err(SyclError::InvalidShape(format!(
                 "flash_attn_prefill_tq_usm: kv_len_base={kv_len_base} + n_new={n_new} > max_ctx={max_ctx}"
@@ -2723,6 +2800,7 @@ mod imp {
                 "flash_attn_decode_q8_0_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
             )));
         }
+        quant_flash_head_dim_ok("flash_attn_decode_q8_0_usm", head_dim)?;
         // SAFETY: as above.
         unsafe {
             rsl_flash_attn_decode_q8_0_usm(
@@ -2755,6 +2833,7 @@ mod imp {
                 "flash_attn_prefill_q8_0_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
             )));
         }
+        quant_flash_head_dim_ok("flash_attn_prefill_q8_0_usm", head_dim)?;
         if kv_len_base.saturating_add(n_new) > max_ctx {
             return Err(SyclError::InvalidShape(format!(
                 "flash_attn_prefill_q8_0_usm: kv_len_base={kv_len_base} + n_new={n_new} > max_ctx={max_ctx}"
@@ -4463,6 +4542,21 @@ mod imp {
         // SAFETY: same contract as rope_usm.
         unsafe {
             rsl_silu_mul_usm(stream.raw, x_usm, y_usm, out_usm, n as c_int);
+        }
+        consume_error()
+    }
+
+    /// F2: f32-precision twin of [`silu_mul_usm`]. x / y / out are f32 USM.
+    pub fn silu_mul_f32_usm(
+        stream: &SyclStream,
+        x_usm: *const f32,
+        y_usm: *const f32,
+        out_usm: *mut f32,
+        n: u32,
+    ) -> Result<()> {
+        // SAFETY: same contract as `silu_mul_usm`.
+        unsafe {
+            rsl_silu_mul_f32_usm(stream.raw, x_usm, y_usm, out_usm, n as c_int);
         }
         consume_error()
     }
@@ -7777,6 +7871,23 @@ pub fn add_rmsnorm_f32_usm_raw(
     imp::add_rmsnorm_f32_usm(stream, hidden, branch, w, y_norm, n_rows, d, eps)
 }
 
+/// F2: f32-precision variant of [`rmsnorm_usm_raw`] — x / w / y f32 USM,
+/// no f16 round-trip of the normalized activation.
+///
+/// # Safety
+/// `x` / `y` sized ≥ `n_rows * d`; `w` sized ≥ `d`; all USM on `stream`.
+pub unsafe fn rmsnorm_f32_usm_raw(
+    stream: &SyclStream,
+    x: *const f32,
+    w: *const f32,
+    y: *mut f32,
+    n_rows: u32,
+    d: u32,
+    eps: f32,
+) -> Result<()> {
+    imp::rmsnorm_f32_usm(stream, x, w, y, n_rows, d, eps)
+}
+
 // (A second `flash_attn_decode_usm_raw` definition I added in an
 // earlier pass was deleted here — the canonical raw-pointer entry
 // lives below alongside the `_raw` variant for rmsnorm. Keeping
@@ -10180,6 +10291,18 @@ pub unsafe fn silu_mul_usm_raw(
     n: u32,
 ) -> Result<()> {
     imp::silu_mul_usm(stream, x_usm, y_usm, out_usm, n)
+}
+
+/// F2: f32-precision raw-pointer entry for USM silu_mul (no f16 round-trip).
+/// SAFETY: see module contract.
+pub unsafe fn silu_mul_f32_usm_raw(
+    stream: &SyclStream,
+    x_usm: *const f32,
+    y_usm: *const f32,
+    out_usm: *mut f32,
+    n: u32,
+) -> Result<()> {
+    imp::silu_mul_f32_usm(stream, x_usm, y_usm, out_usm, n)
 }
 
 /// Raw-pointer entry for USM embedding_lookup. `ids` may be a

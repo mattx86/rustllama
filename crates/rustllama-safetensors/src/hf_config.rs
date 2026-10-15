@@ -12,7 +12,7 @@
 //! names mirror that schema verbatim; some keys are optional and
 //! default to derived / well-known values when absent.
 
-use rustllama_models::llama_config::{LlamaConfig, MoeConfig};
+use rustllama_models::llama_config::{LlamaConfig, MoeConfig, RopeScaling, RopeScalingKind};
 use serde::Deserialize;
 
 /// HuggingFace `config.json` shape — just the fields rustllama needs.
@@ -87,6 +87,53 @@ struct HfConfigJson {
     /// tensor itself at build time (this field only flags presence).
     #[serde(default)]
     shared_expert_intermediate_size: Option<u32>,
+
+    // ---- RoPE scaling + logit soft-capping + SWA (I3) --------------
+    // Optional so every dense/MoE config without them parses unchanged.
+    // Mapped onto the SAME `LlamaConfig` fields the GGUF parser fills so a
+    // safetensors model matches its GGUF twin on long-context RoPE (Llama-3.1
+    // llama3 / Qwen2.5 YaRN), Gemma2 soft-caps, and sliding-window attention.
+    #[serde(default)]
+    rope_scaling: Option<RopeScalingJson>,
+    /// Gemma2 final-logit soft-cap (`c * tanh(logits / c)`).
+    #[serde(default)]
+    final_logit_softcapping: Option<f32>,
+    /// Gemma2 attention-score soft-cap.
+    #[serde(default)]
+    attn_logit_softcapping: Option<f32>,
+    /// Mistral / Gemma2 / gpt-oss sliding-window span.
+    #[serde(default)]
+    sliding_window: Option<u32>,
+}
+
+/// HF `config.json` `rope_scaling` object. HF has used both `rope_type` (newer)
+/// and `type` (older) for the scheme name — accept either. Every numeric field
+/// is optional and defaults to its scheme's convention when absent.
+#[derive(Debug, Deserialize)]
+struct RopeScalingJson {
+    /// Scheme name. `rope_type` (newer transformers) with `type` as the legacy
+    /// alias.
+    #[serde(default, alias = "type")]
+    rope_type: Option<String>,
+    #[serde(default)]
+    factor: Option<f32>,
+    /// The pre-extension training context. Maps to `RopeScaling::orig_ctx`
+    /// (the GGUF `rope.scaling.original_context_length`).
+    #[serde(default)]
+    original_max_position_embeddings: Option<u32>,
+    /// Llama-3.1 piecewise-smoothing bounds.
+    #[serde(default)]
+    low_freq_factor: Option<f32>,
+    #[serde(default)]
+    high_freq_factor: Option<f32>,
+    /// YaRN attention-temperature input (`attn_factor` in GGUF).
+    #[serde(default)]
+    attention_factor: Option<f32>,
+    /// YaRN interpolation ramp bounds.
+    #[serde(default)]
+    beta_fast: Option<f32>,
+    #[serde(default)]
+    beta_slow: Option<f32>,
 }
 
 /// HF allows `eos_token_id: 151645` or `eos_token_id: [151645, 151643]`.
@@ -191,6 +238,10 @@ pub fn parse_hf_config(json: &str) -> Result<LlamaConfig, HfConfigError> {
         raw.intermediate_size as usize
     };
 
+    // I3: RoPE context-extension scaling, mapped onto the same `RopeScaling`
+    // the GGUF parser fills so a safetensors model matches its GGUF twin.
+    let rope_scaling = raw.rope_scaling.as_ref().and_then(map_rope_scaling);
+
     Ok(LlamaConfig {
         arch,
         n_layers: raw.num_hidden_layers as usize,
@@ -213,7 +264,42 @@ pub fn parse_hf_config(json: &str) -> Result<LlamaConfig, HfConfigError> {
         moe, // MoE now parsed from HF config (MLX MoE load path)
         hybrid: None, // HF configs don't yet carry SSM keys for our hybrid path
         hadamard: None, // Prism rotation metadata is GGUF-only
-        ..Default::default() // rope_scaling / softcapping / scaling-factors: HF-parse is a follow-up
+        // I3: RoPE scaling + Gemma2 logit soft-caps + sliding window now parse
+        // from the HF config (were always `Default` before).
+        rope_scaling,
+        attn_logit_softcapping: raw.attn_logit_softcapping,
+        final_logit_softcapping: raw.final_logit_softcapping,
+        // HF's `sliding_window` is the span; the layer-alternation PATTERN isn't
+        // a scalar in HF config (it's architectural), so leave it `None` (=
+        // all-SWA, the Mistral convention) — Gemma2's alternation needs the GGUF
+        // `sliding_window_pattern` key, absent here.
+        sliding_window: raw.sliding_window.filter(|&w| w > 0),
+        ..Default::default() // remaining scaling-factors: GGUF-only for now
+    })
+}
+
+/// Map an HF `rope_scaling` object onto a [`RopeScaling`], or `None` when the
+/// scheme name is absent / `"default"` / unrecognized (unscaled — positions use
+/// the baked `rope_theta`). Mirrors the GGUF `parse_rope_scaling` type mapping.
+fn map_rope_scaling(j: &RopeScalingJson) -> Option<RopeScaling> {
+    let kind = match j.rope_type.as_deref()?.to_ascii_lowercase().as_str() {
+        "linear" => RopeScalingKind::Linear,
+        "yarn" => RopeScalingKind::Yarn,
+        "longrope" | "su" => RopeScalingKind::LongRope,
+        "dynamic" | "ntk" => RopeScalingKind::Ntk,
+        "llama3" => RopeScalingKind::Llama3,
+        // "default"/"none"/unknown ⇒ no scaling.
+        _ => return None,
+    };
+    Some(RopeScaling {
+        kind,
+        factor: j.factor.unwrap_or(1.0),
+        orig_ctx: j.original_max_position_embeddings.unwrap_or(0),
+        attn_factor: j.attention_factor.unwrap_or(1.0),
+        beta_fast: j.beta_fast.unwrap_or(32.0),
+        beta_slow: j.beta_slow.unwrap_or(1.0),
+        low_freq_factor: j.low_freq_factor.unwrap_or(1.0),
+        high_freq_factor: j.high_freq_factor.unwrap_or(4.0),
     })
 }
 
@@ -407,6 +493,93 @@ mod tests {
         }"#;
         let cfg = parse_hf_config(json).unwrap();
         assert_eq!(cfg.arch, "llama");
+    }
+
+    #[test]
+    fn parses_llama31_llama3_rope_scaling() {
+        // I3: a Llama-3.1 config.json carries `rope_scaling.rope_type =
+        // "llama3"` with the piecewise-smoothing factors. These must land on
+        // the SAME `RopeScaling` fields the GGUF parser fills (so a safetensors
+        // Llama-3.1 matches its GGUF twin on long-context RoPE).
+        let json = r#"{
+            "architectures": ["LlamaForCausalLM"],
+            "hidden_size": 4096,
+            "intermediate_size": 14336,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "max_position_embeddings": 131072,
+            "vocab_size": 128256,
+            "rope_theta": 500000.0,
+            "rope_scaling": {
+                "rope_type": "llama3",
+                "factor": 8.0,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 8192
+            }
+        }"#;
+        let cfg = parse_hf_config(json).unwrap();
+        let rs = cfg.rope_scaling.expect("llama3 rope scaling parsed");
+        assert_eq!(rs.kind, RopeScalingKind::Llama3);
+        assert!((rs.factor - 8.0).abs() < 1e-6);
+        assert_eq!(rs.orig_ctx, 8192);
+        assert!((rs.low_freq_factor - 1.0).abs() < 1e-6);
+        assert!((rs.high_freq_factor - 4.0).abs() < 1e-6);
+        // No soft-caps / sliding window on Llama-3.1.
+        assert!(cfg.attn_logit_softcapping.is_none());
+        assert!(cfg.sliding_window.is_none());
+    }
+
+    #[test]
+    fn parses_gemma2_softcap_and_sliding_window() {
+        // I3: Gemma2 declares attention + final logit soft-caps and a sliding
+        // window. These must reach the same `LlamaConfig` fields the GGUF
+        // parser fills (Gemma2 is numerically wrong without the soft-caps).
+        let json = r#"{
+            "architectures": ["Gemma2ForCausalLM"],
+            "hidden_size": 2304,
+            "intermediate_size": 9216,
+            "num_hidden_layers": 26,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "max_position_embeddings": 8192,
+            "vocab_size": 256000,
+            "attn_logit_softcapping": 50.0,
+            "final_logit_softcapping": 30.0,
+            "sliding_window": 4096
+        }"#;
+        let cfg = parse_hf_config(json).unwrap();
+        assert!((cfg.attn_logit_softcapping.unwrap() - 50.0).abs() < 1e-6);
+        assert!((cfg.final_logit_softcapping.unwrap() - 30.0).abs() < 1e-6);
+        assert_eq!(cfg.sliding_window, Some(4096));
+        // No rope scaling declared → None (unscaled).
+        assert!(cfg.rope_scaling.is_none());
+    }
+
+    #[test]
+    fn parses_yarn_rope_scaling_with_type_alias() {
+        // Older HF configs use `type` instead of `rope_type`; accept both.
+        let json = r#"{
+            "architectures": ["Qwen2ForCausalLM"],
+            "hidden_size": 3584,
+            "intermediate_size": 18944,
+            "num_hidden_layers": 28,
+            "num_attention_heads": 28,
+            "num_key_value_heads": 4,
+            "max_position_embeddings": 131072,
+            "vocab_size": 152064,
+            "rope_scaling": {
+                "type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 32768
+            }
+        }"#;
+        let cfg = parse_hf_config(json).unwrap();
+        let rs = cfg.rope_scaling.expect("yarn rope scaling parsed");
+        assert_eq!(rs.kind, RopeScalingKind::Yarn);
+        assert!((rs.factor - 4.0).abs() < 1e-6);
+        assert_eq!(rs.orig_ctx, 32768);
     }
 
     #[test]

@@ -4098,6 +4098,38 @@ pub fn rope_inv_freq_table_scaled(
             let theta2 = rope_theta * factor.powf(d / (d - 2.0).max(1.0));
             rope_inv_freq_table(head_dim, theta2)
         }
+        // Llama-3.1 piecewise frequency smoothing (Meta reference /
+        // HF `_compute_llama3_parameters`): a dim's wavelength `2π/f` decides
+        // whether it extrapolates (high freq → unchanged), interpolates (low
+        // freq → f/factor), or blends linearly over the band between the
+        // `low_freq_factor`/`high_freq_factor` wavelengths. At factor 1.0 this
+        // is the identity (handled by the early-return above).
+        RopeScalingKind::Llama3 => {
+            let orig = s.orig_ctx as f32;
+            if orig <= 0.0 {
+                // No original context length → smoothing is undefined; fall back
+                // to plain position interpolation (every freq ÷ factor).
+                return base.iter().map(|f| f / factor).collect();
+            }
+            let low_ff = s.low_freq_factor;
+            let high_ff = s.high_freq_factor;
+            let low_freq_wavelen = orig / low_ff.max(f32::EPSILON);
+            let high_freq_wavelen = orig / high_ff.max(f32::EPSILON);
+            let band = (high_ff - low_ff).abs().max(f32::EPSILON);
+            base.iter()
+                .map(|&f| {
+                    let wavelen = 2.0 * std::f32::consts::PI / f;
+                    if wavelen < high_freq_wavelen {
+                        f
+                    } else if wavelen > low_freq_wavelen {
+                        f / factor
+                    } else {
+                        let smooth = (orig / wavelen - low_ff) / band;
+                        (1.0 - smooth) * (f / factor) + smooth * f
+                    }
+                })
+                .collect()
+        }
         // YaRN: per-dim ramp between interpolation (low-freq dims) and
         // extrapolation (high-freq dims), gated by beta_fast/beta_slow.
         RopeScalingKind::Yarn | RopeScalingKind::LongRope => {
@@ -4309,6 +4341,7 @@ mod tests {
             RopeScalingKind::Ntk,
             RopeScalingKind::Yarn,
             RopeScalingKind::LongRope,
+            RopeScalingKind::Llama3,
         ] {
             let s = RopeScaling {
                 kind,
@@ -4317,6 +4350,8 @@ mod tests {
                 attn_factor: 1.0,
                 beta_fast: 32.0,
                 beta_slow: 1.0,
+                low_freq_factor: 1.0,
+                high_freq_factor: 4.0,
             };
             let scaled = rope_inv_freq_table_scaled(head_dim, theta, Some(&s));
             assert_eq!(scaled.len(), base.len(), "{kind:?} len");
@@ -4339,6 +4374,8 @@ mod tests {
             attn_factor: 1.0,
             beta_fast: 32.0,
             beta_slow: 1.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
         };
         // Linear: every frequency divided by the factor (slower rotation).
         let t = rope_inv_freq_table_scaled(head_dim, theta, Some(&mk(RopeScalingKind::Linear)));
@@ -4709,16 +4746,21 @@ struct UsmAttnContext {
     // `Option` field stores at most one buffer sized to the
     // largest request seen so far — grows monotonically (a
     // larger d_ff request reallocates).
-    rmsnorm_x: Option<sk::SyclSharedBuffer<'static, u16>>,
-    rmsnorm_w: Option<sk::SyclSharedBuffer<'static, u16>>,
-    rmsnorm_y: Option<sk::SyclSharedBuffer<'static, u16>>,
+    // B1/F2: f32 (not f16-bits) — the rmsnorm / add_rmsnorm / silu_mul USM
+    // paths now keep the activation + residual stream in f32 end-to-end, so
+    // these scratch buffers hold raw f32 and the kernels are the f32 twins
+    // (`rsl_{rmsnorm,add_rmsnorm,silu_mul}_f32_usm`). No F32→F16→F32 round-trip
+    // — the f16 pack drifted the residual on every decode layer.
+    rmsnorm_x: Option<sk::SyclSharedBuffer<'static, f32>>,
+    rmsnorm_w: Option<sk::SyclSharedBuffer<'static, f32>>,
+    rmsnorm_y: Option<sk::SyclSharedBuffer<'static, f32>>,
     /// Extra residual-branch USM slot for the fused
     /// `try_add_rmsnorm_usm_f32` path. Shares the same lazy-grow
     /// semantics as `rmsnorm_x`.
-    rmsnorm_branch: Option<sk::SyclSharedBuffer<'static, u16>>,
-    silu_x: Option<sk::SyclSharedBuffer<'static, u16>>,
-    silu_y: Option<sk::SyclSharedBuffer<'static, u16>>,
-    silu_out: Option<sk::SyclSharedBuffer<'static, u16>>,
+    rmsnorm_branch: Option<sk::SyclSharedBuffer<'static, f32>>,
+    silu_x: Option<sk::SyclSharedBuffer<'static, f32>>,
+    silu_y: Option<sk::SyclSharedBuffer<'static, f32>>,
+    silu_out: Option<sk::SyclSharedBuffer<'static, f32>>,
     rope_qk: Option<sk::SyclSharedBuffer<'static, u16>>,
     /// RoPE `inv_freq` table cached + uploaded as USM. Keyed on
     /// `(head_dim, rope_theta_bits)` so it's only rebuilt when the
@@ -6804,13 +6846,23 @@ fn try_flash_attn_decode_usm_quant(
     }
     // Per-format block constraint (matches each CPU quantizer's /
     // kernel's own asserts — we decline instead of panicking).
-    let ok_shape = match fmt {
-        QuantKv::Q4_0 => hd % 32 == 0,
-        QuantKv::Q8_0 => true,
-        QuantKv::Nvfp4 => hd % 16 == 0,
-        QuantKv::Tq { bits } => matches!(bits, 1 | 2 | 4 | 8) && hd.is_power_of_two(),
-        QuantKv::Mxfp4 | QuantKv::Mxfp6 | QuantKv::Mxfp8 => hd % 32 == 0,
-    };
+    //
+    // D3: `head_dim <= 256` is a HARD cap for every quant format. The
+    // `rsl_flash_attn_decode_<fmt>_usm` kernels size their per-head on-chip
+    // scratch for `head_dim <= 256`; above that they `return;` without writing
+    // `out_scratch_f32` (see `rsl_kernels.cpp`). This helper would then read
+    // that stale scratch and report success, so a head_dim-512 model (some
+    // large MoE / future arch) would silently serve garbage. Capping here makes
+    // the helper decline so the caller uses the CPU reference instead. F3 makes
+    // the kernels return a nonzero status as a second line of defense.
+    let ok_shape = hd <= 256
+        && match fmt {
+            QuantKv::Q4_0 => hd % 32 == 0,
+            QuantKv::Q8_0 => true,
+            QuantKv::Nvfp4 => hd % 16 == 0,
+            QuantKv::Tq { bits } => matches!(bits, 1 | 2 | 4 | 8) && hd.is_power_of_two(),
+            QuantKv::Mxfp4 | QuantKv::Mxfp6 | QuantKv::Mxfp8 => hd % 32 == 0,
+        };
     if !ok_shape {
         return false;
     }
@@ -11308,21 +11360,21 @@ pub fn try_rmsnorm_usm_f32(
         let Some(ctx) = slot.as_mut() else {
             return false;
         };
-        if !ensure_scratch(&ctx.stream, &mut ctx.rmsnorm_x, total)
-            || !ensure_scratch(&ctx.stream, &mut ctx.rmsnorm_w, d)
-            || !ensure_scratch(&ctx.stream, &mut ctx.rmsnorm_y, total)
+        if !ensure_scratch_f32(&ctx.stream, &mut ctx.rmsnorm_x, total)
+            || !ensure_scratch_f32(&ctx.stream, &mut ctx.rmsnorm_w, d)
+            || !ensure_scratch_f32(&ctx.stream, &mut ctx.rmsnorm_y, total)
         {
             return false;
         }
-        // F3: SIMD F32 → F16-bits packing into USM. Page-mapped on
+        // B1/F2: write f32 straight into USM (no F32→F16 pack). Page-mapped on
         // iGPU so the store goes straight to shared memory.
         {
             let x_buf = ctx.rmsnorm_x.as_mut().expect("just allocated");
-            rustllama_kernels_cpu::f32_to_f16_bits(x, &mut x_buf.as_mut_slice()[..total]);
+            x_buf.as_mut_slice()[..total].copy_from_slice(x);
         }
         {
             let w_buf = ctx.rmsnorm_w.as_mut().expect("just allocated");
-            rustllama_kernels_cpu::f32_to_f16_bits(&w[..d], &mut w_buf.as_mut_slice()[..d]);
+            w_buf.as_mut_slice()[..d].copy_from_slice(&w[..d]);
         }
         // Run the kernel via the raw FFI entry — the safe wrapper
         // would require simultaneous &mut borrows the borrow
@@ -11336,7 +11388,7 @@ pub fn try_rmsnorm_usm_f32(
         // call (we hold the borrow). The kernel `.wait()`s before
         // returning so host reads below don't race the device.
         let ok = unsafe {
-            sk::rmsnorm_usm_raw(
+            sk::rmsnorm_f32_usm_raw(
                 &*stream_raw,
                 x_ptr,
                 w_ptr,
@@ -11350,11 +11402,9 @@ pub fn try_rmsnorm_usm_f32(
         if !ok {
             return false;
         }
-        // Convert USM f16 → host f32.
+        // Copy the f32 result straight back (no F16 unpack).
         let y_buf = ctx.rmsnorm_y.as_ref().expect("just used");
-        for (i, dst) in y.iter_mut().enumerate() {
-            *dst = f16::from_bits(y_buf.as_slice()[i]).to_f32();
-        }
+        y.copy_from_slice(&y_buf.as_slice()[..total]);
         true
     })
 }
@@ -11397,27 +11447,30 @@ pub fn try_add_rmsnorm_usm_f32(
         let Some(ctx) = slot.as_mut() else {
             return false;
         };
-        if !ensure_scratch(&ctx.stream, &mut ctx.rmsnorm_x, total)
-            || !ensure_scratch(&ctx.stream, &mut ctx.rmsnorm_branch, total)
-            || !ensure_scratch(&ctx.stream, &mut ctx.rmsnorm_w, d)
-            || !ensure_scratch(&ctx.stream, &mut ctx.rmsnorm_y, total)
+        if !ensure_scratch_f32(&ctx.stream, &mut ctx.rmsnorm_x, total)
+            || !ensure_scratch_f32(&ctx.stream, &mut ctx.rmsnorm_branch, total)
+            || !ensure_scratch_f32(&ctx.stream, &mut ctx.rmsnorm_w, d)
+            || !ensure_scratch_f32(&ctx.stream, &mut ctx.rmsnorm_y, total)
         {
             return false;
         }
-        // F3: SIMD F32 → F16-bits packing for the three inputs.
+        // B1: write f32 straight into USM — NO F32→F16 pack. The residual
+        // stream (`hidden`) is f32 throughout; packing it to f16 here and
+        // unpacking on readback drifted the running residual on every decode
+        // layer (the bug this fixes).
         {
             let h_buf = ctx.rmsnorm_x.as_mut().expect("just allocated");
-            rustllama_kernels_cpu::f32_to_f16_bits(hidden, &mut h_buf.as_mut_slice()[..total]);
+            h_buf.as_mut_slice()[..total].copy_from_slice(hidden);
         }
         {
             let b_buf = ctx.rmsnorm_branch.as_mut().expect("just allocated");
-            rustllama_kernels_cpu::f32_to_f16_bits(branch, &mut b_buf.as_mut_slice()[..total]);
+            b_buf.as_mut_slice()[..total].copy_from_slice(branch);
         }
         {
             let w_buf = ctx.rmsnorm_w.as_mut().expect("just allocated");
-            rustllama_kernels_cpu::f32_to_f16_bits(&w[..d], &mut w_buf.as_mut_slice()[..d]);
+            w_buf.as_mut_slice()[..d].copy_from_slice(&w[..d]);
         }
-        // Dispatch the fused kernel via the raw FFI (the safe wrapper
+        // Dispatch the fused F32 kernel via the raw FFI (the safe wrapper
         // would require overlapping &mut borrows the borrow checker
         // refuses; same pattern as `try_rmsnorm_usm_f32`).
         let stream_raw: *const sk::SyclStream = &ctx.stream;
@@ -11429,7 +11482,7 @@ pub fn try_add_rmsnorm_usm_f32(
         // all sized correctly per the checks above. The kernel
         // `.wait()`s before returning.
         let ok = unsafe {
-            sk::add_rmsnorm_usm_raw(
+            sk::add_rmsnorm_f32_usm_raw(
                 &*stream_raw,
                 hidden_ptr,
                 branch_ptr,
@@ -11444,16 +11497,12 @@ pub fn try_add_rmsnorm_usm_f32(
         if !ok {
             return false;
         }
-        // Copy results back: the residual sum (now in USM `rmsnorm_x`)
-        // overwrites `hidden`; the normalized output goes to `y_norm`.
+        // Copy f32 results straight back: the residual sum (now in USM
+        // `rmsnorm_x`) overwrites `hidden`; the normalized output → `y_norm`.
         let h_after = ctx.rmsnorm_x.as_ref().expect("just used");
-        for (i, dst) in hidden.iter_mut().enumerate() {
-            *dst = f16::from_bits(h_after.as_slice()[i]).to_f32();
-        }
+        hidden.copy_from_slice(&h_after.as_slice()[..total]);
         let y_buf = ctx.rmsnorm_y.as_ref().expect("just used");
-        for (i, dst) in y_norm.iter_mut().enumerate() {
-            *dst = f16::from_bits(y_buf.as_slice()[i]).to_f32();
-        }
+        y_norm.copy_from_slice(&y_buf.as_slice()[..total]);
         true
     })
 }
@@ -11477,22 +11526,21 @@ pub fn try_silu_mul_usm_f32(x: &[f32], y: &[f32], out: &mut [f32]) -> bool {
         let Some(ctx) = slot.as_mut() else {
             return false;
         };
-        if !ensure_scratch(&ctx.stream, &mut ctx.silu_x, n)
-            || !ensure_scratch(&ctx.stream, &mut ctx.silu_y, n)
-            || !ensure_scratch(&ctx.stream, &mut ctx.silu_out, n)
+        if !ensure_scratch_f32(&ctx.stream, &mut ctx.silu_x, n)
+            || !ensure_scratch_f32(&ctx.stream, &mut ctx.silu_y, n)
+            || !ensure_scratch_f32(&ctx.stream, &mut ctx.silu_out, n)
         {
             return false;
         }
         {
-            // F3: SIMD F32 → F16-bits packing (F16C-accelerated).
-            // Replaces the scalar `half::f16::from_f32(v).to_bits()`
-            // loop that ran twice (one per input) per call.
+            // F2: write f32 straight into USM — no F32→F16 round-trip of the
+            // SwiGLU activation.
             let x_buf = ctx.silu_x.as_mut().unwrap();
-            rustllama_kernels_cpu::f32_to_f16_bits(x, &mut x_buf.as_mut_slice()[..n]);
+            x_buf.as_mut_slice()[..n].copy_from_slice(x);
         }
         {
             let y_buf = ctx.silu_y.as_mut().unwrap();
-            rustllama_kernels_cpu::f32_to_f16_bits(y, &mut y_buf.as_mut_slice()[..n]);
+            y_buf.as_mut_slice()[..n].copy_from_slice(y);
         }
         let stream_raw: *const sk::SyclStream = &ctx.stream;
         let x_ptr = ctx.silu_x.as_ref().unwrap().as_ptr();
@@ -11500,15 +11548,13 @@ pub fn try_silu_mul_usm_f32(x: &[f32], y: &[f32], out: &mut [f32]) -> bool {
         let out_ptr = ctx.silu_out.as_mut().unwrap().as_mut_ptr();
         let ok =
             // SAFETY: USM allocations on this stream, sized; kernel waits.
-            unsafe { sk::silu_mul_usm_raw(&*stream_raw, x_ptr, y_ptr, out_ptr, n as u32) }
+            unsafe { sk::silu_mul_f32_usm_raw(&*stream_raw, x_ptr, y_ptr, out_ptr, n as u32) }
                 .is_ok();
         if !ok {
             return false;
         }
         let out_buf = ctx.silu_out.as_ref().unwrap();
-        for (i, dst) in out.iter_mut().enumerate() {
-            *dst = f16::from_bits(out_buf.as_slice()[i]).to_f32();
-        }
+        out.copy_from_slice(&out_buf.as_slice()[..n]);
         true
     })
 }

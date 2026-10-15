@@ -120,10 +120,16 @@ impl PageTable {
     /// `add_ref` on those M pages so they survive slot A's
     /// eventual `free`. Each page must currently be allocated
     /// (refcount > 0) — otherwise the caller is fishing pages off
-    /// the free list, which is a logic bug. Debug builds assert.
+    /// the free list, which is a logic bug.
+    ///
+    /// C3: release-mode `assert!` (not `debug_assert!`). Adding a ref to a
+    /// FREE page double-hands-out the physical page — two slots then write
+    /// the same KV block and silently corrupt each other's cache. A data-
+    /// dependent invariant (page-sharing admission runs on real traffic, not
+    /// just tests), so it must fail loud in release, not only in debug.
     pub fn add_ref(&mut self, pages: &[PageId]) {
         for p in pages {
-            debug_assert!(
+            assert!(
                 self.refs[p.0 as usize] > 0,
                 "add_ref on page {p:?} which is on the free list — caller \
                  must hold an allocation handle before sharing it"

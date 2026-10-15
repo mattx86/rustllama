@@ -4564,6 +4564,13 @@ impl CpuEngine {
             || prompt_ids.len() < 2
             || self.model.weights.is_hybrid()
             || self.kv_dtype_cached != KvDtype::F32
+            // D2a: CacheBlend IS the contiguous-F32 prefill path, and its
+            // `forward_prefill_cacheblend` passes window=0/softcap=0. A
+            // sliding-window or Gemma2-softcap model re-roped here would attend
+            // the full history / skip the logit cap → wrong output. Fall back to
+            // plain generation until D2b threads per-layer window/softcap in.
+            || self.model.cfg.sliding_window.is_some()
+            || self.model.cfg.attn_logit_softcapping.is_some()
         {
             return self.generate_token_ids(&prompt_ids, n_new, sampling);
         }

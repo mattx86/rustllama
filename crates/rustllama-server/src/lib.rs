@@ -902,6 +902,60 @@ impl AuditSink {
     }
 }
 
+/// Process-unique request id: `prefix-<unix_ns><seq>`. E1: the old
+/// `format!("…-{:032x}", unix_ts())` had ONE-SECOND resolution, so two
+/// requests in the same second collided — `register_cancel` overwrote the
+/// first's cancel flag and the first guard's drop then removed the second's
+/// entry, making same-second requests uncancellable and letting `/v1/cancel`
+/// hit the wrong request. Nanosecond timestamp + a monotonic per-process
+/// counter makes every id unique regardless of clock resolution or a clock
+/// that doesn't advance between calls. No new dependency (no uuid/rand).
+pub(crate) fn new_request_id(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{ns:016x}{seq:08x}")
+}
+
+/// E2-ingress: clamp a request's generation budget to the model's context
+/// window, with OpenAI semantics — `max_tokens` is TRUNCATED to the room that
+/// remains after the prompt (`min(requested, max_ctx - prompt_len)`), and a
+/// prompt that doesn't fit at all is a `400`, not a silent stop at `hit_cap`.
+///
+/// The engine already refuses `prompt + max_tokens > max_ctx` (E2's checked
+/// add in `paged_batch`/`inference`), but refusing is the wrong behavior for an
+/// API client that just wants "as many tokens as fit": OpenAI clamps. Doing it
+/// here, at the handler boundary where the prompt-token count and the loaded
+/// engine's `max_ctx` are both known, keeps every generation arm consistent.
+///
+/// Returns `Some((status, msg))` for the caller to send when the prompt alone
+/// is too long; otherwise mutates `sampling.max_tokens` in place and returns
+/// `None`.
+pub(crate) fn clamp_max_tokens_to_ctx(
+    sampling: &mut rustllama_engine::SamplingParams,
+    prompt_len: usize,
+    max_ctx: usize,
+) -> Option<(StatusCode, String)> {
+    if prompt_len >= max_ctx {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "prompt is {prompt_len} tokens but the model's context window is \
+                 {max_ctx}; shorten the prompt or messages"
+            ),
+        ));
+    }
+    let room = (max_ctx - prompt_len) as u32;
+    if sampling.max_tokens > room {
+        sampling.max_tokens = room;
+    }
+    None
+}
+
 /// RAII handle that removes a request's cancellation entry on drop.
 /// Streaming handlers hold one for the request lifetime. The dereferenced
 /// `Arc<AtomicBool>` is the actual signal: pass it to the engine, and
@@ -916,7 +970,14 @@ pub struct CancelGuard {
 impl Drop for CancelGuard {
     fn drop(&mut self) {
         if let Ok(mut m) = self.cancellations.lock() {
-            m.remove(&self.id);
+            // E1: remove only OUR entry. If (defensively) a colliding id had
+            // replaced ours, the stored flag is a different `Arc` — leave it so
+            // the live request that owns it stays cancellable.
+            if m.get(&self.id)
+                .is_some_and(|existing| Arc::ptr_eq(existing, &self.flag))
+            {
+                m.remove(&self.id);
+            }
         }
     }
 }
@@ -2621,7 +2682,6 @@ async fn load_model(
             "load_model: MTP / NextN self-speculative decoding enabled (hybrid + NextN only)"
         );
     }
-    cpu.set_mtp_speculative(applied_mtp);
     // Tree-structured MTP speculation (Feature 4): enabled from the config flag;
     // a no-op fallback on models without MTP heads / on the hybrid path. The
     // per-depth branching WIDTHS honor the `tune --tree-widths` winner (gated by
@@ -2629,7 +2689,7 @@ async fn load_model(
     // speculative_mtp auto-apply above. A non-capable model (sweep SKIPped → no
     // cached winner) falls back to the config value, which the engine then
     // ignores anyway (no draft head ⇒ classic decode).
-    if cfg_for_tuning.inference.speculative_tree {
+    let tree_widths = if cfg_for_tuning.inference.speculative_tree {
         let applied_widths = if cfg_for_tuning.tuning.auto_apply_tree_widths {
             tuner_cached_tree_widths()
                 .unwrap_or_else(|| cfg_for_tuning.inference.speculative_tree_widths.clone())
@@ -2649,8 +2709,39 @@ async fn load_model(
             widths = ?applied_widths,
             "load_model: tree-structured MTP speculation enabled (non-hybrid MTP heads only)"
         );
-        cpu.set_tree_speculative(Some(applied_widths));
+        Some(applied_widths)
+    } else {
+        None
+    };
+    // X1+D5: the HTTP load path previously applied MTP + tree but NOT n-gram or
+    // CacheBlend — the serve path applied n-gram + CacheBlend but not tree. Both
+    // now resolve the full winner set and apply it through the one
+    // `TunerWinners::apply_to`, so an HTTP-loaded model matches a CLI-served
+    // one. (Draft-model spec is CLI-serve-only — the HTTP load never loads a
+    // second model — so `draft` stays `None` here.)
+    let ngram_winner = if cfg_for_tuning.inference.speculative_ngram {
+        Some(rustllama_engine::speculative::NgramDrafterConfig {
+            n_match: cfg_for_tuning.inference.ngram_n_match as usize,
+            n_draft: cfg_for_tuning.inference.ngram_n_draft as usize,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+    let cacheblend_ratio = if cfg_for_tuning.tuning.auto_apply_cacheblend {
+        tuner_cached_cacheblend_ratio(&model_key)
+    } else {
+        None
     }
+    .unwrap_or(cfg_for_tuning.inference.cacheblend_recompute_ratio);
+    rustllama_engine::tuner_apply::TunerWinners {
+        draft: None,
+        ngram: ngram_winner,
+        mtp: applied_mtp,
+        tree_widths,
+        cacheblend_ratio: Some(cacheblend_ratio),
+    }
+    .apply_to(&mut cpu);
     let model_id = cpu.model_id().to_string();
     let cpu = Arc::new(cpu);
     // Pre-upload packed-quant weights to USM on a blocking-pool
@@ -3789,6 +3880,17 @@ fn tuner_cached_tree_widths() -> Option<Vec<u32>> {
     let key = rustllama_tuner::system_fingerprint();
     let tuning = rustllama_tuner::load_cache(&cache_dir, &key).ok()??;
     tuning.winner_tree_widths.filter(|w| !w.is_empty())
+}
+
+/// Cached CacheBlend recompute-ratio winner for `model_stem`. `Some(0.0)` ⇒ the
+/// stage ran and disabled CacheBlend; `None` ⇒ untuned (caller falls back to
+/// `[inference].cacheblend_recompute_ratio`). Mirrors the CLI's
+/// `cacheblend_ratio_from_cache_or_default` (X1+D5 parity).
+fn tuner_cached_cacheblend_ratio(model_stem: &str) -> Option<f32> {
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    let tuning = rustllama_tuner::load_cache(&cache_dir, &key).ok()??;
+    rustllama_tuner::cacheblend_ratio_for(&tuning, model_stem)
 }
 
 // --- additional tuner-cache siblings (mirror the CLI serve load path) --------

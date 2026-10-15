@@ -28,6 +28,23 @@ pub(crate) fn matvec_tensor_dispatch(
     m: usize,
     k_dim: usize,
 ) {
+    // C1a: the weight must hold exactly `m * k_dim` elements. Every kernel
+    // below (CPU + USM) indexes `w` as an `m × k` matrix; an oversized or
+    // undersized weight silently reads the wrong rows / stride (this is how
+    // the shared-expert-width bug mis-strided in release — debug_assert in
+    // the kernels caught it only in tests). Order-agnostic (one u64 compare),
+    // negligible next to the matvec. If a legitimate caller intentionally
+    // views a sub-range, relax that call site, not this check.
+    assert_eq!(
+        w.element_count() as usize,
+        m * k_dim,
+        "matvec_tensor_dispatch: weight `{}` has {} elements, expected m*k = {}*{} = {}",
+        w.name,
+        w.element_count(),
+        m,
+        k_dim,
+        m * k_dim,
+    );
     // Three-tier dispatch:
     //   1. Quantized USM matvec (Q8_0 / Q4_K / Q5_K / Q6_K) —
     //      packed-format-specific kernels with hand-tuned LWS.
@@ -95,6 +112,18 @@ pub(crate) fn matvec_tensor_batched_dispatch(
     k_dim: usize,
     n_rows: usize,
 ) {
+    // C1a: the shared weight is an `m_dim × k_dim` matrix (reused across all
+    // `n_rows`); see `matvec_tensor_dispatch`.
+    assert_eq!(
+        w.element_count() as usize,
+        m_dim * k_dim,
+        "matvec_tensor_batched_dispatch: weight `{}` has {} elements, expected m*k = {}*{} = {}",
+        w.name,
+        w.element_count(),
+        m_dim,
+        k_dim,
+        m_dim * k_dim,
+    );
     if crate::accel::try_matvec_tensor_batched_usm_f32(w, x, out, m_dim, k_dim, n_rows) {
         return;
     }
@@ -135,6 +164,28 @@ pub(crate) fn matvec_tensor_gate_up_fused_dispatch(
     m: usize,
     k_dim: usize,
 ) {
+    // C1a: both projections are `m × k_dim` matrices; see
+    // `matvec_tensor_dispatch`. Guards the gate/up shared-expert path too.
+    assert_eq!(
+        w_gate.element_count() as usize,
+        m * k_dim,
+        "gate_up_fused: gate `{}` has {} elements, expected {}*{} = {}",
+        w_gate.name,
+        w_gate.element_count(),
+        m,
+        k_dim,
+        m * k_dim,
+    );
+    assert_eq!(
+        w_up.element_count() as usize,
+        m * k_dim,
+        "gate_up_fused: up `{}` has {} elements, expected {}*{} = {}",
+        w_up.name,
+        w_up.element_count(),
+        m,
+        k_dim,
+        m * k_dim,
+    );
     // During imatrix calibration, force the two-matvec base path so
     // each tensor is recorded exactly once via `matvec_tensor_dispatch`
     // (the fused USM kernel bypasses that hook). No double-count: only
@@ -1697,15 +1748,37 @@ fn load_hybrid_layers(
                 &up_per_expert,
                 &down_per_expert,
             );
+            let w_gate_shared =
+                load_optional_weight(gguf, &format!("{prefix}.ffn_gate_shexp.weight"));
+            // A1-warn: the shared-expert FFN width is DERIVED from the gate
+            // weight's element count (`shared_expert_width`), which is what the
+            // forward path sizes its matvecs to. If the model also declares
+            // `expert_shared_feed_forward_length` and it disagrees with that
+            // derivation, the metadata is wrong (or a convention we don't
+            // handle) — warn so a mis-sized shared expert is diagnosable rather
+            // than silently truncating. The derived width always wins (it can't
+            // overflow the tensor); this only surfaces the discrepancy.
+            if let (Some(w_g), Some(declared)) =
+                (&w_gate_shared, hyb_cfg.shared_expert_feed_forward_length)
+            {
+                let derived = crate::moe::shared_expert_width(w_g, d_model);
+                if derived != declared as usize {
+                    tracing::warn!(
+                        layer = i,
+                        declared = declared,
+                        derived = derived,
+                        "hybrid MoE loader: shared_expert_feed_forward_length \
+                         disagrees with the gate-weight-derived width; using the \
+                         derived width"
+                    );
+                }
+            }
             HybridFfn::Moe {
                 router: load_weight(gguf, &format!("{prefix}.ffn_gate_inp.weight"))?,
                 w_gate_exps,
                 w_up_exps,
                 w_down_exps,
-                w_gate_shared: load_optional_weight(
-                    gguf,
-                    &format!("{prefix}.ffn_gate_shexp.weight"),
-                ),
+                w_gate_shared,
                 w_up_shared: load_optional_weight(
                     gguf,
                     &format!("{prefix}.ffn_up_shexp.weight"),
@@ -10960,8 +11033,13 @@ impl LlamaModel {
                     // CacheBlend is an opt-in KV feature whose CPU twin is the plain
                     // (non-windowed, non-capped) `gqa_attention_flash_prefill`, so
                     // it carries no SWA / softcap here — window=0 / softcap=0.0.
-                    // (SWA / Gemma2 models are coerced to the contiguous F32 path in
-                    // the engine, which runs the windowed/capped kernels instead.)
+                    // A sliding-window / Gemma2-softcap model would therefore be
+                    // mis-served (full-history attention, no logit cap), so D2a
+                    // gates CacheBlend OFF for those models at the engine
+                    // (`inference.rs`: `sliding_window.is_some() ||
+                    // attn_logit_softcapping.is_some()` falls back to plain
+                    // generation); D2b will thread per-layer window/softcap here
+                    // and lift that gate.
                     let used_gpu = crate::accel::try_flash_attn_prefill_gpu_f32(
                         &q_r, kslab, vslab, &mut attn_out,
                         n_heads, n_kv_heads, head_dim, max_ctx, 0, nr, 0, 0.0,
@@ -11698,9 +11776,12 @@ impl LlamaModel {
             // exactly there); fall back to CPU if SYCL is off /
             // hook returns false. This is the PAGED prefill path, whose CPU twin
             // is the plain `gqa_attention_flash_prefill` — it carries no SWA /
-            // softcap (window=0 / softcap=0.0). SWA / Gemma2 models are coerced to
-            // the contiguous F32 path in the engine (paged masking/softcap is not
-            // wired), so they never reach here.
+            // softcap (window=0 / softcap=0.0). An SWA / Gemma2-softcap model
+            // reaches a paged forward only via `PagedBatchEngine`, which (D1a,
+            // `paged_batch.rs` load gate) now REFUSES such models at load — and
+            // the contiguous `CpuEngine` coerces them to its F32 path. So no
+            // window/softcap model is served through this kernel; when D1b wires
+            // per-layer masking/softcap here, that refusal lifts.
             let used_gpu = crate::accel::try_flash_attn_prefill_gpu_f32(
                 &q_buf,
                 &k_slab,

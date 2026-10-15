@@ -101,6 +101,21 @@ pub fn gemm_f16_w_f32_a(w: &[f16], x: &[f32], c: &mut [f32], m: usize, n: usize,
 /// the per-layer per-token hot path on Llama forward.
 #[inline]
 pub fn matvec_tensor(w: &Tensor, x: &[f32], out: &mut [f32], m: usize, k: usize) {
+    // C1a: `w` is indexed as an `m × k` matrix by every kernel below; a
+    // weight whose element count != m*k reads the wrong rows/stride and
+    // silently corrupts output in release (the per-kernel `debug_assert`s
+    // caught this only in tests). Release-checked here so direct callers
+    // (shared-router, spilled experts) are guarded too.
+    assert_eq!(
+        w.element_count() as usize,
+        m * k,
+        "matvec_tensor: weight `{}` has {} elements, expected m*k = {}*{} = {}",
+        w.name,
+        w.element_count(),
+        m,
+        k,
+        m * k,
+    );
     // F16/F32 carry their own row-count auto-dispatchers.
     match w.dtype {
         Dtype::F16 => return matvec_f16_w_f32_a(as_slice_f16(w), x, out, m, k),

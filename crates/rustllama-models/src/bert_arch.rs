@@ -97,6 +97,18 @@ impl PoolingType {
             _ => Self::Mean,
         }
     }
+
+    /// I1: llama.cpp writes `pooling_type` as a u32 enum, NOT a string:
+    /// 0 = none, 1 = mean, 2 = cls, 3 = last, 4 = rank. Reading only the
+    /// string form made every llama.cpp-produced CLS GGUF silently fall back
+    /// to mean pooling (wrong embeddings). `last`/`rank`/`none` aren't
+    /// implemented yet → mean (the safe pooled default); `cls` → Cls.
+    fn from_u32(v: u32) -> Self {
+        match v {
+            2 => Self::Cls,
+            _ => Self::Mean,
+        }
+    }
 }
 
 impl BertConfig {
@@ -147,7 +159,11 @@ impl BertConfig {
         let pooling_type = gguf
             .metadata_get(&key("pooling_type"))
             .and_then(|v| match v {
+                // llama.cpp writes a u32 enum; some converters a string.
                 MetadataValue::String(s) => Some(PoolingType::from_str(s)),
+                MetadataValue::U32(n) => Some(PoolingType::from_u32(*n)),
+                MetadataValue::I32(n) => Some(PoolingType::from_u32(*n as u32)),
+                MetadataValue::U64(n) => Some(PoolingType::from_u32(*n as u32)),
                 _ => None,
             })
             .unwrap_or(PoolingType::Mean);

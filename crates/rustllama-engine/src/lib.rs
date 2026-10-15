@@ -30,6 +30,7 @@ pub mod sampler_gpu;
 pub mod sampling;
 pub mod speculative;
 pub mod sycl_accel;
+pub mod tuner_apply;
 pub mod sycl_resources;
 pub mod tool_grammar;
 

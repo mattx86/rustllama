@@ -950,10 +950,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // CPU. CPU-only hosts keep the F16 default (faster on CPU). See
     // project-hybrid-forward-perf.
     if std::env::var_os("RUSTLLAMA_KEEP_QUANT_RAW").is_none() {
+        // F18: count an MLX/Metal device (Apple Silicon) as "GPU present"
+        // too — its matvec dispatch also runs the packed `*Raw` path, so a
+        // dequant-to-F16 default would force it off the fast kernel. Mirrors
+        // the SYCL + CUDA checks.
         let gpu_present = rustllama_kernels_sycl::device_count()
             .map(|n| n > 0)
             .unwrap_or(false)
-            || rustllama_kernels_cuda::device_count() > 0;
+            || rustllama_kernels_cuda::device_count() > 0
+            || rustllama_kernels_mlx::device_count() > 0;
         if gpu_present {
             std::env::set_var("RUSTLLAMA_KEEP_QUANT_RAW", "1");
         }
@@ -3871,21 +3876,12 @@ async fn serve(
             // [inference].k_dtype / v_dtype are set they override
             // [inference].kv_dtype; otherwise both fall back to the
             // homogeneous value. Engine storage today is a coupled
-            // `KvLayer` enum that pairs K and V into one variant
-            // per dtype, so K's dtype is what reaches the kernel
-            // when the two differ. We warn rather than refuse so
-            // configs already targeting future per-side storage
-            // continue to load.
-            let (k_str, v_str) = cfg.inference.resolved_kv_dtypes();
-            if k_str != v_str {
-                tracing::warn!(
-                    k = k_str,
-                    v = v_str,
-                    "[inference].k_dtype and v_dtype differ; engine storage \
-                         currently couples K/V — V's setting will mirror K until \
-                         per-side KV storage lands"
-                );
-            }
+            // `KvLayer` enum that pairs K and V into one variant per
+            // dtype, so K's dtype is what reaches the kernel when the two
+            // differ. I2: `k_dtype != v_dtype` is now REJECTED at
+            // `rustllama_config::validate` (the single source of truth), so by
+            // the time we get here the two always agree — just resolve K.
+            let (k_str, _v_str) = cfg.inference.resolved_kv_dtypes();
             // Tuner-cache override for kv_dtype + kv_cache_layout:
             // when the user has the corresponding auto_apply flag
             // on (default) AND a cached winner exists, use that
@@ -4044,6 +4040,16 @@ async fn serve(
             }
             cpu.set_prefill_chunk_size(applied_batch_size as usize);
             cpu.set_max_tool_iterations(cfg.inference.max_tool_iterations);
+            // X1+D5: collect the speculative / CacheBlend winners and apply
+            // them through the ONE `TunerWinners::apply_to` (shared with the
+            // HTTP model-load path) rather than scattered `cpu.set_*` calls.
+            let mut spec_draft_winner: Option<(
+                std::sync::Arc<dyn rustllama_engine::Engine>,
+                u32,
+            )> = None;
+            let mut spec_ngram_winner: Option<
+                rustllama_engine::speculative::NgramDrafterConfig,
+            > = None;
             if let Some(draft_path) = cfg.inference.speculative_draft_path.as_deref() {
                 // Two-model speculative decoding. The draft loads
                 // with F32 KV (it's small; exactness helps
@@ -4067,10 +4073,10 @@ async fn serve(
                 cpu.draft_compatible_with(&draft)
                     .map_err(|e| anyhow::anyhow!("speculative draft model rejected: {e}"))?;
                 let k = cfg.inference.speculative_draft_k.max(1);
-                cpu.set_draft_speculative(Some((
+                spec_draft_winner = Some((
                     std::sync::Arc::new(draft) as std::sync::Arc<dyn rustllama_engine::Engine>,
                     k,
-                )));
+                ));
                 tracing::info!(
                     draft = %draft_path.display(),
                     k,
@@ -4079,13 +4085,11 @@ async fn serve(
                 );
             }
             if cfg.inference.speculative_ngram {
-                cpu.set_ngram_speculative(Some(
-                    rustllama_engine::speculative::NgramDrafterConfig {
-                        n_match: cfg.inference.ngram_n_match as usize,
-                        n_draft: cfg.inference.ngram_n_draft as usize,
-                        ..Default::default()
-                    },
-                ));
+                spec_ngram_winner = Some(rustllama_engine::speculative::NgramDrafterConfig {
+                    n_match: cfg.inference.ngram_n_match as usize,
+                    n_draft: cfg.inference.ngram_n_draft as usize,
+                    ..Default::default()
+                });
                 tracing::info!(
                     n_match = cfg.inference.ngram_n_match,
                     n_draft = cfg.inference.ngram_n_draft,
@@ -4108,7 +4112,6 @@ async fn serve(
                     "tuner cache: applied speculative_mtp winner"
                 );
             }
-            cpu.set_mtp_speculative(applied_mtp);
             if applied_mtp {
                 tracing::info!(
                     "MTP / NextN self-speculative decoding enabled (raw-softmax \
@@ -4133,13 +4136,35 @@ async fn serve(
             let applied_cacheblend =
                 cacheblend_ratio_from_cache_or_default(cfg.tuning.auto_apply_cacheblend, &model_key)
                     .unwrap_or(cfg.inference.cacheblend_recompute_ratio);
-            cpu.set_cacheblend(Some(applied_cacheblend));
             if applied_cacheblend > 0.0 {
                 tracing::info!(
                     ratio = applied_cacheblend,
                     "CacheBlend enabled (non-prefix RAG KV reuse on `documents` requests)"
                 );
             }
+            // Tree-structured MTP speculation widths (resurrects
+            // `tree_widths_from_cache_or_default`): honor the `tune
+            // --tree-widths` winner (gated by auto_apply_tree_widths) over the
+            // config default. A model with no MTP head ignores it at dispatch.
+            let spec_tree_winner = if cfg.inference.speculative_tree {
+                Some(
+                    tree_widths_from_cache_or_default(cfg.tuning.auto_apply_tree_widths)
+                        .unwrap_or_else(|| cfg.inference.speculative_tree_widths.clone()),
+                )
+            } else {
+                None
+            };
+            // X1+D5: apply every speculative / CacheBlend winner through the one
+            // shared function. (flash_attention / n_gpu_layers / prefix_cache
+            // are NOT speculative winners and stay as their own direct calls.)
+            rustllama_engine::tuner_apply::TunerWinners {
+                draft: spec_draft_winner,
+                ngram: spec_ngram_winner,
+                mtp: applied_mtp,
+                tree_widths: spec_tree_winner,
+                cacheblend_ratio: Some(applied_cacheblend),
+            }
+            .apply_to(&mut cpu);
             // Pull CPU-force patterns from
             // `[inference].placement.overrides` FIRST — the placement
             // decision below (VRAM-fit planner + first-load probe)

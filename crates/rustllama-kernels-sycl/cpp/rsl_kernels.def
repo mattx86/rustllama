@@ -49,6 +49,7 @@ EXPORTS
 
     ; USM-resident kernels
     rsl_rmsnorm_usm
+    rsl_rmsnorm_f32_usm
     rsl_rmsnorm_residual_usm
     rsl_add_rmsnorm_usm
     rsl_add_rmsnorm_f32_usm
@@ -142,6 +143,7 @@ EXPORTS
     rsl_try_alloc_host_baseline
     rsl_rope_usm
     rsl_silu_mul_usm
+    rsl_silu_mul_f32_usm
     rsl_embedding_lookup_usm
     rsl_kv_quantize_q8_0_store_usm
     rsl_encode_q6_k_blocks_usm

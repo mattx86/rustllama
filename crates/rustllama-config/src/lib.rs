@@ -1397,6 +1397,21 @@ pub fn validate(cfg: &Config) -> Result<()> {
                 .to_string(),
         ));
     }
+    // I2: K and V cache dtypes must match. The engine's KV storage is a
+    // coupled `KvLayer` enum — one variant pairs K and V at a single dtype, so
+    // a config that sets `v_dtype != k_dtype` does NOT get per-side storage:
+    // V silently uses K's dtype and the config lies about what's running.
+    // Reject at load (the single source of truth) until per-side KV storage
+    // (M6/F4) makes distinct dtypes real.
+    let (k_dtype, v_dtype) = cfg.inference.resolved_kv_dtypes();
+    if !k_dtype.eq_ignore_ascii_case(v_dtype) {
+        return Err(ConfigError::Validation(format!(
+            "[inference].k_dtype (\"{k_dtype}\") and v_dtype (\"{v_dtype}\") differ — the \
+             engine couples K/V storage today, so distinct per-side dtypes would be \
+             silently ignored (V would use K's). Set them equal (or use the single \
+             [inference].kv_dtype) until per-side KV storage lands."
+        )));
+    }
     Ok(())
 }
 
@@ -1765,6 +1780,27 @@ mod tests {
         // Both off leaves no compute tier — rejected.
         c.inference.cpu_enabled = false;
         c.inference.gpu_enabled = false;
+        assert!(validate(&c).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_mismatched_kv_dtypes() {
+        // I2: distinct k_dtype / v_dtype can't be honored (engine couples
+        // K/V), so validate must reject it rather than silently use K's.
+        let mut c = Config::default();
+        // Default (both None → kv_dtype for both) is fine.
+        assert!(validate(&c).is_ok());
+        // Equal explicit dtypes are fine.
+        c.inference.k_dtype = Some("q8_0".into());
+        c.inference.v_dtype = Some("q8_0".into());
+        assert!(validate(&c).is_ok());
+        // Differing dtypes are rejected.
+        c.inference.v_dtype = Some("q4_0".into());
+        assert!(validate(&c).is_err());
+        // One side set, the other falling back to kv_dtype and differing.
+        c.inference.kv_dtype = "f32".into();
+        c.inference.k_dtype = Some("q8_0".into());
+        c.inference.v_dtype = None;
         assert!(validate(&c).is_err());
     }
 

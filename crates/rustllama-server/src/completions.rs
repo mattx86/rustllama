@@ -116,7 +116,7 @@ pub async fn completions(
         Ok(p) => p,
         Err(be) => return be.into_response(),
     };
-    let sampling = build_sampling(&req);
+    let mut sampling = build_sampling(&req);
     let model = req.model.clone().unwrap_or_else(|| serving.model_id.clone());
 
     let shared_cpu = match serving.cpu_engine.as_ref() {
@@ -180,6 +180,13 @@ pub async fn completions(
     // Prompt token count = length of the full assembled context (already
     // includes any FIM special tokens + prepended documents). Cheap and exact.
     let prompt_tokens = prompt_ids.len() as u32;
+    // E2-ingress: clamp the generation budget to the context window (OpenAI
+    // semantics) now that the prompt length + engine max_ctx are both known.
+    if let Some((code, msg)) =
+        crate::clamp_max_tokens_to_ctx(&mut sampling, prompt_ids.len(), shared_cpu.max_ctx())
+    {
+        return (code, msg).into_response();
+    }
     // Now wait on the gate; tokenization is already done.
     let permit = match pregate_permit.acquire_gate().await {
         Ok(h) => h,
@@ -535,7 +542,8 @@ fn unix_ts() -> u64 {
 }
 
 fn request_id() -> String {
-    format!("cmpl-{:032x}", unix_ts() as u128)
+    // E1: process-unique (ns + counter). See `crate::new_request_id`.
+    crate::new_request_id("cmpl")
 }
 
 /// Short stable label for the engine's active KV dtype — mirror of

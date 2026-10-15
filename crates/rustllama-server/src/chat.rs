@@ -816,6 +816,14 @@ async fn chat_with_tools(state: AppState, req: ChatRequest) -> Response {
         .encode(&prompt, tokenizer.add_bos_token())
         .map(|ids| ids.len() as u32)
         .unwrap_or(0);
+    // E2-ingress: clamp the generation budget to the context window.
+    if let Some((code, msg)) = crate::clamp_max_tokens_to_ctx(
+        &mut sampling,
+        prompt_tokens as usize,
+        shared_cpu.max_ctx(),
+    ) {
+        return (code, msg).into_response();
+    }
 
     // Drive the streaming engine so we can collect per-token logprobs
     // alongside the text. This used to call `cpu.generate_text(...)`
@@ -1040,6 +1048,14 @@ async fn chat_stream_with_tools(state: AppState, req: ChatRequest) -> Response {
         .encode(&prompt, tokenizer.add_bos_token())
         .map(|ids| ids.len() as u32)
         .unwrap_or(0);
+    // E2-ingress: clamp the generation budget to the context window.
+    if let Some((code, msg)) = crate::clamp_max_tokens_to_ctx(
+        &mut sampling,
+        prompt_tokens as usize,
+        shared_cpu.max_ctx(),
+    ) {
+        return (code, msg).into_response();
+    }
 
     // Wait on the gate now that all pre-engine work is done.
     let handle = match permit.acquire_gate().await {
@@ -2375,7 +2391,9 @@ fn kv_dtype_label(cpu: &rustllama_engine::CpuEngine) -> &'static str {
 }
 
 fn request_id() -> String {
-    format!("chatcmpl-{:032x}", unix_ts() as u128)
+    // E1: process-unique (ns + counter), not second-resolution. See
+    // `crate::new_request_id`.
+    crate::new_request_id("chatcmpl")
 }
 
 async fn chat_blocking(state: AppState, req: ChatRequest) -> Response {
@@ -2390,7 +2408,7 @@ async fn chat_blocking(state: AppState, req: ChatRequest) -> Response {
         Ok(p) => p,
         Err(be) => return be.into_response(),
     };
-    let sampling = build_sampling(&req);
+    let mut sampling = build_sampling(&req);
     let model = req.model.unwrap_or_else(|| serving.model_id.clone());
     let want_logprobs = sampling.logprobs.is_some();
     let msgs: Vec<ChatMessage> = match wire_messages_to_engine(req.messages) {
@@ -2402,6 +2420,14 @@ async fn chat_blocking(state: AppState, req: ChatRequest) -> Response {
         .as_ref()
         .and_then(|e| e.count_chat_prompt(&msgs).ok())
         .unwrap_or(0);
+    // E2-ingress: clamp the generation budget to the context window.
+    if let Some(max_ctx) = shared_cpu.as_ref().map(|e| e.max_ctx()) {
+        if let Some((code, msg)) =
+            crate::clamp_max_tokens_to_ctx(&mut sampling, prompt_tokens as usize, max_ctx)
+        {
+            return (code, msg).into_response();
+        }
+    }
     let handle = match permit.acquire_gate().await {
         Ok(h) => h,
         Err(be) => return be.into_response(),
@@ -2541,7 +2567,7 @@ async fn chat_stream(state: AppState, req: ChatRequest) -> Response {
         Ok(p) => p,
         Err(be) => return be.into_response(),
     };
-    let sampling = build_sampling(&req);
+    let mut sampling = build_sampling(&req);
     let model = req.model.unwrap_or_else(|| serving.model_id.clone());
     let id = request_id();
     let cancel_guard = state.register_cancel(&id);
@@ -2567,6 +2593,14 @@ async fn chat_stream(state: AppState, req: ChatRequest) -> Response {
         .as_ref()
         .and_then(|e| e.count_chat_prompt(&msgs).ok())
         .unwrap_or(0);
+    // E2-ingress: clamp the generation budget to the context window.
+    if let Some(max_ctx) = shared_cpu.as_ref().map(|e| e.max_ctx()) {
+        if let Some((code, msg)) =
+            crate::clamp_max_tokens_to_ctx(&mut sampling, prompt_tokens as usize, max_ctx)
+        {
+            return (code, msg).into_response();
+        }
+    }
 
     // Wait on the per-model gate. Earlier admission + tokenization
     // already happened; this is the only step that actually

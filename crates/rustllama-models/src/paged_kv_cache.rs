@@ -374,12 +374,17 @@ impl PagedKvCache {
         pages: Vec<crate::page_table::PageId>,
         seq_len: u32,
     ) {
-        debug_assert!(
+        // C3: release-mode asserts (not `debug_assert`). Both guard real
+        // data-dependent invariants hit on live prefix-share admission: a
+        // non-fresh cache would leak/overwrite already-written pages, and a
+        // non-page-aligned `seq_len` would make every later `gather_layer`
+        // read the wrong token window — both silently corrupt KV in release.
+        assert!(
             self.pages.is_empty() && self.seq_len == 0,
             "pin_shared_prefix expects a freshly-built cache; call it before \
              ensure_capacity / any write_token"
         );
-        debug_assert_eq!(
+        assert_eq!(
             seq_len,
             (pages.len() as u32).saturating_mul(self.page_size),
             "shared prefix must end on a page boundary — partial-page \

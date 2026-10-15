@@ -252,6 +252,44 @@ impl PagedBatchEngine {
         let max_slots = max_slots.max(1);
         let gguf = Gguf::open(path)?;
         let model = LlamaModel::load(&gguf)?;
+
+        // D1a: fail-closed model gate. `PagedBatchEngine` is selected by
+        // `[server].fused_decode` and previously did NO gating — so a model
+        // whose paged forward path is wrong or missing was served silently:
+        //   * HYBRID (DeltaNet/SSM): NO paged forward walks `hybrid_layers` at
+        //     all → refuse unconditionally (lifted by F8, hybrid CB).
+        //   * SWA / Gemma2-softcap: the paged prefill/decode forwards don't yet
+        //     carry the per-layer window / logit cap → refuse until D1b threads
+        //     them (then this relaxes to hybrid-only).
+        //   * MoE: the ragged path (`forward_ragged_paged_f32`) handles
+        //     `moe_blocks`, but the budget-0 INLINE prefill
+        //     (`forward_prefill_paged_f32`) loops only `weights.blocks` — empty
+        //     for MoE → zero-layer prefill + garbage KV that then pollutes APC.
+        //     Refuse only when there is no token budget (T1 removes this path).
+        if model.weights.is_hybrid() {
+            return Err(CpuEngineError::Other(
+                "continuous batching (fused_decode) does not support hybrid \
+                 (DeltaNet/SSM) models yet; use the default engine for this model"
+                    .into(),
+            ));
+        }
+        if model.cfg.sliding_window.is_some() || model.cfg.attn_logit_softcapping.is_some() {
+            return Err(CpuEngineError::Other(
+                "continuous batching (fused_decode) does not yet support \
+                 sliding-window / logit-softcap models (e.g. Gemma2, Mistral-SWA); \
+                 use the default engine for this model"
+                    .into(),
+            ));
+        }
+        if model.weights.is_moe() && config_max_batched_tokens == 0 {
+            return Err(CpuEngineError::Other(
+                "continuous batching (fused_decode) requires \
+                 [inference].max_num_batched_tokens > 0 for MoE models (the ragged \
+                 prefill path handles experts; the inline path does not)"
+                    .into(),
+            ));
+        }
+
         let ctx = max_ctx.min(model.cfg.ctx_train.max(max_ctx));
         let tokenizer = if with_tokenizer {
             Some(Arc::new(Tokenizer::from_gguf(&gguf)?))
@@ -479,8 +517,15 @@ impl PagedBatchEngine {
                         .into(),
                 ));
             }
-            let total_capacity = (prompt.len() as u32) + sampling.max_tokens;
-            if total_capacity as usize > self.max_ctx {
+            // E2: client-controlled `max_tokens` can make `prompt_len +
+            // max_tokens` wrap u32 in release (no overflow checks) → the
+            // `> max_ctx` guard below is bypassed and generation silently
+            // stops at `hit_cap`. Compute in usize with a checked add.
+            let total_capacity = prompt
+                .len()
+                .checked_add(sampling.max_tokens as usize)
+                .unwrap_or(usize::MAX);
+            if total_capacity > self.max_ctx {
                 return Err(CpuEngineError::PromptTooLong {
                     prompt_len: prompt.len(),
                     max_ctx: self.max_ctx,
@@ -528,7 +573,10 @@ impl PagedBatchEngine {
             }
 
             cache
-                .ensure_capacity_shared(&self.shared, total_capacity)
+                // E2: `total_capacity` is a usize now (checked add); it is
+                // `<= self.max_ctx` here, which fits u32, so the cast can't
+                // truncate.
+                .ensure_capacity_shared(&self.shared, total_capacity as u32)
                 .map_err(|short| CpuEngineError::Other(format!(
                     "paged batch: pool short by {short} pages on slot prefill"
                 )))?;
@@ -1040,8 +1088,13 @@ fn admit_request(
             "empty prompt (every request needs at least one prompt token)".into(),
         ));
     }
-    let total_capacity = (prompt.len() as u32) + sampling.max_tokens;
-    if total_capacity as usize > ctx.max_ctx {
+    // E2: checked add in usize (see the sibling site) — a client `max_tokens`
+    // near u32::MAX would otherwise wrap past this guard in release.
+    let total_capacity = prompt
+        .len()
+        .checked_add(sampling.max_tokens as usize)
+        .unwrap_or(usize::MAX);
+    if total_capacity > ctx.max_ctx {
         return Err(EngineError::Engine(format!(
             "prompt too long: {} tokens + max_tokens {} > max_ctx {}",
             prompt.len(),
@@ -1109,7 +1162,9 @@ fn admit_request(
     }
 
     cache
-        .ensure_capacity_shared(&ctx.shared, total_capacity)
+        // E2: `total_capacity` is a usize now (checked add); it is
+        // `<= ctx.max_ctx` here, which fits u32, so the cast can't truncate.
+        .ensure_capacity_shared(&ctx.shared, total_capacity as u32)
         .map_err(|short| {
             EngineError::Engine(format!(
                 "paged batch admit: pool short by {short} pages \
