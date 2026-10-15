@@ -284,6 +284,46 @@ fn gpu_matvec_for(name: &str) -> GpuMatvecRaw {
     }
 }
 
+/// F16-activation (mixed-precision) packed matvec: same as [`GpuMatvecRaw`] but
+/// the activation vector `x` is `*const u16` (f16 bits), halving its
+/// per-output-row re-read bandwidth. `out[m] = W[m,:]·x16`.
+type GpuMatvecF16inRaw =
+    unsafe fn(&sk::SyclStream, *const u8, *const u16, *mut f32, u32, u32, u32) -> sk::Result<()>;
+
+/// The f16-activation matvec kernel for `name`, or `None` for a format with no
+/// f16-in kernel (the mixed-precision path then stays on the f32 matvec). Drives
+/// the `matvec_f16in:` probes (P5b: graded vs an f16-activation-roundtrip
+/// reference AND perf-gated). Mirrors the dtype coverage of the `h8_call!` table
+/// in `accel::try_matvec_tensor_f16in_usm_f32`.
+fn gpu_matvec_f16in_for(name: &str) -> Option<GpuMatvecF16inRaw> {
+    Some(match name {
+        "q8_0" => sk::matvec_q8_0_f16in_packed_f32_usm_raw,
+        "q4_k" => sk::matvec_q4_k_f16in_packed_f32_usm_raw,
+        "q5_k" => sk::matvec_q5_k_f16in_packed_f32_usm_raw,
+        "q6_k" => sk::matvec_q6_k_f16in_packed_f32_usm_raw,
+        "iq4_nl" => sk::matvec_iq4_nl_f16in_packed_f32_usm_raw,
+        "iq4_xs" => sk::matvec_iq4_xs_f16in_packed_f32_usm_raw,
+        "iq1_s" => sk::matvec_iq1_s_f16in_packed_f32_usm_raw,
+        "iq1_m" => sk::matvec_iq1_m_f16in_packed_f32_usm_raw,
+        "iq2_xxs" => sk::matvec_iq2_xxs_f16in_packed_f32_usm_raw,
+        "iq2_xs" => sk::matvec_iq2_xs_f16in_packed_f32_usm_raw,
+        "iq2_s" => sk::matvec_iq2_s_f16in_packed_f32_usm_raw,
+        "iq3_xxs" => sk::matvec_iq3_xxs_f16in_packed_f32_usm_raw,
+        "iq3_s" => sk::matvec_iq3_s_f16in_packed_f32_usm_raw,
+        "ptq1_0" => sk::matvec_ptq1_0_f16in_packed_f32_usm_raw,
+        _ => return None,
+    })
+}
+
+/// Per-element f16 round-trip of activations (f32 → f16 → f32). The FAIR
+/// reference for an f16-activation kernel (the analogue of [`int8_act_roundtrip`]
+/// for the int8 kernels): dequantizing x back to f32 and running the normal
+/// f32-activation matvec reproduces what the kernel computes up to accumulation
+/// order, so the probe grades KERNEL correctness — not the inherent f16 loss.
+fn f16_act_roundtrip(x: &[f32]) -> Vec<f32> {
+    x.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect()
+}
+
 /// The batched (prefill) packed-matvec kernel for `name`, or `None` for a
 /// format that has only the single-row kernel (so the batched prefill path
 /// falls to CPU). Drives the `matvecb:` probes — the ONLY parity coverage of
@@ -400,6 +440,14 @@ fn probe_names() -> Vec<String> {
         // kernel — their FFN dispatch uses two separate single-row matvecs.
         if gpu_fused_for(l.name).is_some() {
             v.push(format!("fused:{}", l.name));
+        }
+    }
+    // P5b: F16-activation (mixed-precision) matvecs — only the formats with an
+    // f16-in kernel (`gpu_matvec_f16in_for`). Graded vs an f16-roundtrip ref AND
+    // perf-gated; back `accel::mixed_precision_matvec_enabled` per dtype.
+    for l in LAYOUTS {
+        if gpu_matvec_f16in_for(l.name).is_some() {
+            v.push(format!("matvec_f16in:{}", l.name));
         }
     }
     // XMX/DPAS bf16 tensor-core GEMM (Arc Xe-HPG / PVC Xe-HPC). SKIPs unless
@@ -589,6 +637,78 @@ pub fn collect_xmx_verdict() -> Vec<(String, Option<bool>)> {
         .collect()
 }
 
+/// P5b — bank the `sampler:gpu` verdict: ON only where the GPU sampler chain
+/// both MATCHES the CPU sampler AND is FASTER. Runs in-process (like
+/// [`collect_xmx_verdict`]); returns empty off SYCL (no verdict → the sampler
+/// stays on CPU). Replaces the removed `RUSTLLAMA_SAMPLER_GPU` env gate.
+///
+/// Correctness: the whole-vocab temp+softmax kernel vs the CPU reference, plus
+/// the argmax kernel vs a scalar argmax. Perf: the GPU temp+softmax+argmax (what
+/// a greedy sample runs) vs the CPU path over a realistic vocab. The per-kernel
+/// host wrappers transfer per call (the engine's `SamplerGpuContext` keeps logits
+/// resident across the chain), so this perf read is CONSERVATIVE — it biases
+/// toward OFF, never toward wrongly enabling a slow path (fail-closed).
+pub fn collect_sampler_gpu_verdict() -> Vec<(String, Option<bool>)> {
+    let stream = match sk::create_stream(0) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let key = rustllama_tuner::VERDICT_SAMPLER_GPU.to_string();
+    const VOCAB: usize = 32_000;
+    let base = gen_x(VOCAB, 0x5A17);
+    let inv_temp = 1.0f32 / 0.7;
+    // Correctness #1: GPU temp+softmax vs CPU reference.
+    let mut cpu = base.clone();
+    k::fused_temp_softmax_inplace(&mut cpu, inv_temp);
+    let mut gpu = base.clone();
+    match sk::sampler_temp_softmax_host(&stream, &mut gpu, inv_temp) {
+        Ok(()) => {}
+        // No sampler kernel on this device → SKIP (capability absent).
+        Err(_) => return vec![(key, None)],
+    }
+    let (cos, max_rel) = compare(&gpu, &cpu);
+    let softmax_ok = cos > 0.999 && max_rel < 0.02;
+    // Correctness #2: GPU argmax vs scalar argmax (over the softmaxed probs).
+    let cpu_argmax = cpu
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0);
+    let argmax_ok = matches!(sk::sampler_argmax_host(&stream, &cpu), Ok(idx) if idx == cpu_argmax);
+    if !(softmax_ok && argmax_ok) {
+        return vec![(key, Some(false))];
+    }
+    // Perf: GPU temp+softmax+argmax vs the CPU equivalent over the same vocab.
+    const ITERS: usize = 50;
+    let t0 = Instant::now();
+    for _ in 0..ITERS {
+        let mut c = base.clone();
+        k::fused_temp_softmax_inplace(&mut c, inv_temp);
+        let _ = c
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
+    }
+    let t_cpu = t0.elapsed().as_secs_f64();
+    let t1 = Instant::now();
+    for _ in 0..ITERS {
+        let mut g = base.clone();
+        if sk::sampler_temp_softmax_host(&stream, &mut g, inv_temp).is_ok() {
+            let _ = sk::sampler_argmax_host(&stream, &g);
+        }
+    }
+    let t_gpu = t1.elapsed().as_secs_f64();
+    let faster = t_gpu < t_cpu;
+    let status = if faster { "OK" } else { "SLOW" };
+    emit(
+        &key,
+        status,
+        &format!("cos={cos:.6} gpu={:.2}ms cpu={:.2}ms", t_gpu * 1e3, t_cpu * 1e3),
+    );
+    vec![(key, Some(faster))]
+}
+
 /// Intel NPU compute-offload verdicts for `tune --validate-kernels`:
 ///   - `npu:matmul_f32` — CORRECTNESS: the NPU MatMul (Phase 5, OpenVINO) matched
 ///     the CPU reference (parity).
@@ -652,6 +772,7 @@ pub fn run_probe(name: &str) -> anyhow::Result<()> {
     match kind {
         "matvec" => probe_matvec(&stream, name, rest, started),
         "matvecb" => probe_matvec_batched(&stream, name, rest, started),
+        "matvec_f16in" => probe_matvec_f16in(&stream, name, rest, started),
         "fused" => probe_fused(&stream, name, rest, started),
         "attn" => probe_attn(&stream, name, rest, started),
         "xmx" => probe_xmx(&stream, name, started),
@@ -795,6 +916,96 @@ fn probe_matvec(stream: &sk::SyclStream, name: &str, dtype: &str, started: Insta
                 &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"),
             );
         }
+    }
+}
+
+/// P5b — F16-activation (mixed-precision) matvec probe: grades the f16-in kernel
+/// vs the FAIR f16-activation-roundtrip reference (so it checks kernel
+/// correctness, not the inherent f16 loss) AND perf-gates it (the path is LOSSY,
+/// so it auto-enables only where it is also FASTER than the f32-activation
+/// matvec). Verdict key `matvec_f16in:<dtype>`. A `MISCOMPUTE` here on this Iris
+/// Xe is EXPECTED+correct for an affected dtype — it keeps the lossy path OFF.
+fn probe_matvec_f16in(stream: &sk::SyclStream, name: &str, dtype: &str, started: Instant) {
+    let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
+    let Some(gpu_f16) = gpu_matvec_f16in_for(dtype) else {
+        emit(name, "SKIP", "no-f16in-kernel");
+        return;
+    };
+    let gpu_f32 = gpu_matvec_for(dtype);
+    let cpu = cpu_matvec_for(dtype);
+    let x = gen_x(MV_K, 42);
+    // Pick a weight whose f32 CPU output is finite (same picker as the f32 probe).
+    let Some((w, _)) = finite_ref(layout, cpu, &x) else {
+        emit(name, "SKIP", "no-finite-reference");
+        return;
+    };
+    // Fair reference: the f32 matvec run on f16-roundtripped activations.
+    let xr = f16_act_roundtrip(&x);
+    let mut cpu_out = vec![0f32; MV_M];
+    cpu(&w, &xr, &mut cpu_out, MV_M, MV_K);
+    if !cpu_out.iter().all(|v| v.is_finite()) {
+        emit(name, "SKIP", "no-finite-reference");
+        return;
+    }
+    let x16: Vec<u16> = x.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
+    let (mut wb, mut xb16, mut xbf32, mut ob) = match (
+        sk::SyclSharedBuffer::<u8>::alloc(stream, w.len()),
+        sk::SyclSharedBuffer::<u16>::alloc(stream, MV_K),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, MV_K),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, MV_M),
+    ) {
+        (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+        _ => {
+            emit(name, "KERNEL_ERR", "usm-alloc-failed");
+            return;
+        }
+    };
+    wb.as_mut_slice().copy_from_slice(&w);
+    xb16.as_mut_slice().copy_from_slice(&x16);
+    xbf32.as_mut_slice().copy_from_slice(&x);
+    ob.as_mut_slice().fill(f32::NAN);
+    // Correctness: run the f16-in kernel once, grade vs the fair reference.
+    // SAFETY: live USM allocations on `stream` sized (M,K)/(K)/(M); the kernel
+    // derives extents from (m,k) and waits before returning.
+    if let Err(e) =
+        unsafe { gpu_f16(stream, wb.as_ptr(), xb16.as_ptr(), ob.as_mut_ptr(), MV_M as u32, MV_K as u32, 0) }
+    {
+        emit(name, "KERNEL_ERR", &format!("{e}"));
+        return;
+    }
+    let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
+    if !(cos > 0.999 && max_rel < 0.02) {
+        emit(name, "MISCOMPUTE", &format!("cos={cos:.6} max_rel={max_rel:.4}"));
+        return;
+    }
+    // Perf gate: the f16-in path is lossy, so enable it ONLY when it also beats
+    // the f32-activation matvec. Warm once, then time ITERS dispatches of each.
+    const ITERS: u32 = 40;
+    let _ = unsafe { gpu_f16(stream, wb.as_ptr(), xb16.as_ptr(), ob.as_mut_ptr(), MV_M as u32, MV_K as u32, 0) };
+    let t0 = Instant::now();
+    for _ in 0..ITERS {
+        let _ = unsafe { gpu_f16(stream, wb.as_ptr(), xb16.as_ptr(), ob.as_mut_ptr(), MV_M as u32, MV_K as u32, 0) };
+    }
+    let t_f16 = t0.elapsed().as_secs_f64();
+    let _ = unsafe { gpu_f32(stream, wb.as_ptr(), xbf32.as_ptr(), ob.as_mut_ptr(), MV_M as u32, MV_K as u32, 0) };
+    let t1 = Instant::now();
+    for _ in 0..ITERS {
+        let _ = unsafe { gpu_f32(stream, wb.as_ptr(), xbf32.as_ptr(), ob.as_mut_ptr(), MV_M as u32, MV_K as u32, 0) };
+    }
+    let t_f32 = t1.elapsed().as_secs_f64();
+    let ms = started.elapsed().as_millis();
+    if t_f16 < t_f32 {
+        emit(
+            name,
+            "OK",
+            &format!("cos={cos:.6} max_rel={max_rel:.4} f16={:.2}ms f32={:.2}ms ms={ms}", t_f16 * 1e3, t_f32 * 1e3),
+        );
+    } else {
+        emit(
+            name,
+            "SLOW",
+            &format!("correct but not faster: f16={:.2}ms f32={:.2}ms ms={ms}", t_f16 * 1e3, t_f32 * 1e3),
+        );
     }
 }
 
@@ -2514,7 +2725,13 @@ fn probe_attn_tq(stream: &sk::SyclStream, name: &str, dir: &str, started: Instan
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(90);
 
-pub fn run_parent() -> anyhow::Result<()> {
+/// Drive every SYCL parity probe (one isolated subprocess each) and return a row
+/// `(name, verdict, detail)` per probe, printing the per-probe matrix as it goes.
+/// `verdict` is the probe's status string: `OK` / `MISCOMPUTE` / `KERNEL_ERR` /
+/// `SKIP` / `SLOW` (from the child's `PARITY` line) or `CRASH` / `HANG` (the
+/// parent's classification of a dead/timed-out child). Shared by [`run_parent`]
+/// (prints the summary) and [`collect_sycl_verdicts`] (P5a: banks the verdicts).
+fn run_parent_rows() -> anyhow::Result<Vec<(String, String, String)>> {
     let exe = std::env::current_exe()?;
     let names = probe_names();
     println!(
@@ -2529,7 +2746,6 @@ pub fn run_parent() -> anyhow::Result<()> {
     }
     println!();
     let mut rows: Vec<(String, String, String)> = Vec::new();
-    let mut counts: std::collections::BTreeMap<&'static str, usize> = Default::default();
     for name in &names {
         let mut child = std::process::Command::new(&exe)
             .args(["doctor", "--sycl-parity-probe", name])
@@ -2572,17 +2788,26 @@ pub fn run_parent() -> anyhow::Result<()> {
                 format!("killed after {}s", PROBE_TIMEOUT.as_secs()),
             ),
         };
+        println!("  {name:<24} {verdict:<11} {detail}");
+        rows.push((name.clone(), verdict, detail));
+    }
+    Ok(rows)
+}
+
+pub fn run_parent() -> anyhow::Result<()> {
+    let rows = run_parent_rows()?;
+    let mut counts: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    for (_, verdict, _) in &rows {
         let key: &'static str = match verdict.as_str() {
             "OK" => "OK",
             "MISCOMPUTE" => "MISCOMPUTE",
             "KERNEL_ERR" => "KERNEL_ERR",
+            "SLOW" => "SLOW",
             "CRASH" => "CRASH",
             "HANG" => "HANG",
             _ => "SKIP",
         };
         *counts.entry(key).or_default() += 1;
-        println!("  {name:<20} {verdict:<11} {detail}");
-        rows.push((name.clone(), verdict, detail));
     }
     println!();
     let summary: Vec<String> = counts.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -2602,6 +2827,33 @@ pub fn run_parent() -> anyhow::Result<()> {
         println!("\nall exercised kernels match their CPU references on this backend.");
     }
     Ok(())
+}
+
+/// P5a — bank the SYCL parity verdicts into the tuner cache. Runs the full probe
+/// matrix ([`run_parent_rows`]) and maps each row's status to an auto-enable
+/// verdict: `SKIP` ⇒ `None` (capability absent; leave unset so the gate's own
+/// capability check decides), `CRASH` / `HANG` ⇒ `Some(false)` (device loss ⇒
+/// fail-closed; `probe_status_to_verdict` leaves those `None`, so they are forced
+/// here), everything else through [`probe_status_to_verdict`] (`OK` ⇒
+/// `Some(true)`; `MISCOMPUTE` / `KERNEL_ERR` / `SLOW` ⇒ `Some(false)`). This is
+/// what finally banks the SYCL `fused:*` / `matvec:*` / `matvecb:*` / `attn:*` /
+/// `matvec_f16in:*` verdicts — previously the SYCL harness printed them but
+/// nothing persisted them. `xmx:gemm` is intentionally skipped: it is banked by
+/// the dedicated in-process [`collect_xmx_verdict`], so excluding it here keeps a
+/// single source of truth for that key.
+pub fn collect_sycl_verdicts() -> anyhow::Result<Vec<(String, Option<bool>)>> {
+    let rows = run_parent_rows()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(name, _, _)| name != "xmx:gemm")
+        .map(|(name, status, _detail)| {
+            let v = match status.as_str() {
+                "CRASH" | "HANG" => Some(false),
+                other => probe_status_to_verdict(other),
+            };
+            (name, v)
+        })
+        .collect())
 }
 
 // ===============================================================

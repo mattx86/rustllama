@@ -263,6 +263,44 @@ pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK_CUDA_GRAPH: &str = "attn:dev_resident_
 /// dispatch (there is no MLX qk-head-norm kernel).
 pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK_MLX: &str = "attn:dev_resident_block_mlx";
 
+// --- P5b: verdict keys that replaced default-off env gates -----------
+//
+// Each key below is the auto-enable verdict for a GPU path that used to be
+// gated by a `RUSTLLAMA_*` env var (default off). The dispatch reads the
+// verdict (fail-closed: absent / `false` ⇒ OFF), and `tune --validate-kernels`
+// banks it on-device — the same discipline as the tensor-core keys above.
+
+/// Per-dtype fused gate+up matvec (one dispatch computing both FFN projections).
+/// The actual keys are `fused:<dtype>` (e.g. `fused:q4_k`), banked by the SYCL
+/// `probe_fused` parity probes; this is the shared PREFIX. Backs
+/// `accel::moe_gate_up_fused_enabled`. The MoE fused path was turned off after
+/// the 2026-09-06 Iris-Xe/OpenCL garbage incident; on that backend the per-dtype
+/// `fused:*` probe grades MISCOMPUTE, so the gate now auto-detects + stays off.
+pub const VERDICT_FUSED_GATE_UP_PREFIX: &str = "fused:";
+/// Per-dtype F16-activation (mixed-precision) packed matvec. Keys are
+/// `matvec_f16in:<dtype>`, banked by the SYCL `probe_matvec_f16in` probes —
+/// graded vs an f16-activation-roundtrip reference (so the probe grades kernel
+/// correctness, not the inherent f16 loss) AND perf-gated (`SLOW` ⇒ fail). Backs
+/// `accel::mixed_precision_matvec_enabled`. Lossy, so it auto-enables ONLY where
+/// correct AND faster than the f32-activation matvec.
+pub const VERDICT_MATVEC_F16IN_PREFIX: &str = "matvec_f16in:";
+/// GPU-resident sampler pipeline (penalty → temp+softmax → top-k → draw). A
+/// correctness-AND-perf verdict banked by `collect_sampler_gpu_verdict`: ON only
+/// where the GPU chain matches the CPU sampler AND is faster. Backs
+/// `rustllama_engine::sampling` (replaces `RUSTLLAMA_SAMPLER_GPU`).
+pub const VERDICT_SAMPLER_GPU: &str = "sampler:gpu";
+/// USM-resident KV cache. A PERF verdict banked by `collect_kv_usm_verdict`
+/// (USM write/read bandwidth vs a host buffer): ON only where USM is faster.
+/// Backs `llama_arch::try_open_usm_kv_stream` (replaces `RUSTLLAMA_USM_KV`). On a
+/// unified-memory iGPU (USM IS host memory) this is a wash → fail-closed OFF.
+pub const VERDICT_KV_USM: &str = "kv:usm";
+/// GPU dequant of K-quant sources during quantize (quantize-time, not inference).
+/// A parity verdict read by the `quantize` command, which passes the decision
+/// into the (toolchain-free) gguf pipeline. Backs `gguf::quantize` (replaces
+/// `RUSTLLAMA_GPU_DEQUANT`). No on-device banking probe yet (P6 follow-up: a
+/// dequant parity probe through `SyclIqEncoder`) → fail-closed OFF.
+pub const VERDICT_DEQUANT_GPU: &str = "dequant:gpu";
+
 /// Read the on-device verdict for a kernel probe name, if one has been
 /// recorded. `None` = never validated (or the probe SKIPped because the
 /// device lacks the capability) — callers treat that as "off".
@@ -274,6 +312,46 @@ pub fn verdict_for(result: &TuningResult, name: &str) -> Option<bool> {
 /// `tune --validate-kernels` stage.
 pub fn set_verdict(result: &mut TuningResult, name: &str, pass: bool) {
     result.kernel_verdicts.insert(name.to_string(), pass);
+}
+
+/// T4 — build identity that changes whenever the crate VERSION *or any GPU
+/// kernel source* changes. Format: `"{version}+{sycl}+{cuda}+{mlx}"`, where each
+/// `{backend}` is the FNV-1a hash that the backend's `build.rs` computed over its
+/// kernel sources and exposed as `rustllama_kernels_*::KERNEL_HASH`.
+///
+/// Stamped into [`TuningResult::kernel_build_id`] by `tune --validate-kernels`
+/// and compared (not just `rustllama_version`) at the first-load verdict
+/// self-heal sites, so an intra-version kernel fix re-validates on next load
+/// without a manual `tune --validate-kernels` — the old check keyed on the crate
+/// version alone, which never changes within a release. An old cache (field
+/// absent → serde default `""`) never equals a real build id, so it is treated
+/// as stale and re-validated (safe).
+pub fn kernel_build_id() -> String {
+    format!(
+        "{}+{}+{}+{}",
+        env!("CARGO_PKG_VERSION"),
+        rustllama_kernels_sycl::KERNEL_HASH,
+        rustllama_kernels_cuda::KERNEL_HASH,
+        rustllama_kernels_mlx::KERNEL_HASH,
+    )
+}
+
+/// Read this host's banked kernel verdict for `name` straight from the on-disk
+/// tuner cache (keyed by [`system_fingerprint`]), fail-closed: a missing cache
+/// dir / cache file / key ⇒ `false`. The verdict reader for callers that CANNOT
+/// link `rustllama-models` and so can't reach `accel::kernel_verdict` — notably
+/// `rustllama-cli`, which decides whether to pass `gpu_dequant` into the
+/// toolchain-free gguf quantize pipeline (`dequant:gpu` verdict). Uncached (each
+/// call re-reads), which is fine for the one-shot quantize command.
+pub fn cached_kernel_verdict(name: &str) -> bool {
+    let Some(dir) = default_cache_dir() else {
+        return false;
+    };
+    let key = system_fingerprint();
+    match load_cache(&dir, &key) {
+        Ok(Some(t)) => t.kernel_verdicts.get(name).copied().unwrap_or(false),
+        _ => false,
+    }
 }
 
 /// Read the autotuned CacheBlend recompute ratio for a model (keyed by file
@@ -520,6 +598,15 @@ pub struct TuningResult {
     /// ISO-8601 timestamp of the last successful tune.
     pub last_tuned: Option<String>,
     pub rustllama_version: String,
+    /// T4 — the [`kernel_build_id`] (`"{version}+{sycl}+{cuda}+{mlx}"`) stamped
+    /// by the last `tune --validate-kernels`. The first-load verdict self-heal
+    /// compares THIS (not just `rustllama_version`) against the current build's
+    /// id, so a kernel-source edit WITHIN a crate version re-validates
+    /// automatically. `#[serde(default)]` → old caches (which lack the key) load
+    /// with `""`, which never equals a real build id ⇒ treated as stale ⇒
+    /// re-validated (safe).
+    #[serde(default)]
+    pub kernel_build_id: String,
 }
 
 /// A model's fitted decision-calibration: a single temperature
@@ -573,6 +660,7 @@ impl TuningResult {
             cacheblend_recompute_ratio: HashMap::new(),
             last_tuned: None,
             rustllama_version: env!("CARGO_PKG_VERSION").to_string(),
+            kernel_build_id: kernel_build_id(),
         }
     }
 }
@@ -981,6 +1069,58 @@ fn fnv1a(s: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T4: the build id is well-formed — four `+`-separated parts
+    /// (`version+sycl+cuda+mlx`), the first being the crate version, and the
+    /// kernel-hash parts are the real 16-hex FNV digests the three kernel
+    /// `build.rs` scripts emitted (never the `env!` default). Proves the build
+    /// wiring reached the tuner.
+    #[test]
+    fn kernel_build_id_is_well_formed() {
+        let id = kernel_build_id();
+        let parts: Vec<&str> = id.split('+').collect();
+        assert_eq!(parts.len(), 4, "expected version+sycl+cuda+mlx, got {id:?}");
+        assert_eq!(parts[0], env!("CARGO_PKG_VERSION"));
+        for h in &parts[1..] {
+            assert_eq!(h.len(), 16, "kernel hash {h:?} is not 16 hex chars");
+            assert!(
+                h.chars().all(|c| c.is_ascii_hexdigit()),
+                "kernel hash {h:?} is not hex"
+            );
+        }
+        // An empty `TuningResult` stamps the current build id; an old cache
+        // (serde default `""`) never matches it, so it self-heals (re-validates).
+        let empty = TuningResult::empty("fp".into(), DeviceFingerprint::default());
+        assert_eq!(empty.kernel_build_id, id);
+        assert_ne!(String::new(), id);
+    }
+
+    /// T4 anchor (the plan's "a unit test comparing two hashes"): the same
+    /// FNV-1a-64 fold the kernel `build.rs` scripts use is edit-sensitive — a
+    /// one-byte whitespace change to a kernel source flips the digest, so the
+    /// build id changes and the first-load self-heal re-validates on next load.
+    #[test]
+    fn kernel_source_hash_changes_on_whitespace_edit() {
+        // Mirrors `fnv1a_kernel_sources` in each kernel crate's build.rs: fold
+        // each file's NAME then its BYTES into one FNV-1a-64 (name-then-bytes so
+        // a rename also changes the digest).
+        fn fnv1a(files: &[(&str, &[u8])]) -> String {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for (name, bytes) in files {
+                // name-then-bytes, matching `fnv1a_kernel_sources` in build.rs.
+                for &b in name.as_bytes().iter().chain(bytes.iter()) {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            format!("{h:016x}")
+        }
+        let before = fnv1a(&[("rsl_kernels.cpp", b"// kernel source\nint x = 1;\n")]);
+        // One extra whitespace char (a no-op comment edit the plan describes).
+        let after = fnv1a(&[("rsl_kernels.cpp", b"// kernel source \nint x = 1;\n")]);
+        assert_ne!(before, after, "FNV digest must change on a whitespace edit");
+        assert_eq!(before.len(), 16);
+    }
 
     #[test]
     fn slug_is_filesystem_safe() {

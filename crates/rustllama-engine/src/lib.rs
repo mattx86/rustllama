@@ -37,6 +37,9 @@ pub mod tool_grammar;
 pub use inference::{CpuEngine, CpuEngineError};
 pub use rustllama_models::accel::moe_dev_resident_hits;
 pub use rustllama_models::accel::set_synthetic_run;
+/// P5b: force the default-off GPU fusions OFF (imatrix recording needs every
+/// tensor to route through the base `matvec_tensor_dispatch` hook).
+pub use rustllama_models::accel::set_fusions_disabled;
 pub use rustllama_models::accel::{sycl_tier_self_check, SyclTierCheck};
 pub use rustllama_models::accel::{amd_npu_perf_probe, npu_perf_probe};
 pub use rustllama_models::imatrix_collect;

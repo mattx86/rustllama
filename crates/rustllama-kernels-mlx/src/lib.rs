@@ -37,6 +37,12 @@
 use std::collections::HashMap;
 use std::os::raw::{c_char, c_int, c_void};
 
+/// T4: FNV-1a-64 hash (hex) of this crate's kernel sources, computed by
+/// `build.rs` and injected via `cargo:rustc-env=RSL_MLX_KERNEL_HASH`. Folded
+/// (with the SYCL/CUDA twins) into `rustllama_tuner::kernel_build_id()` so a
+/// Metal/MLX kernel edit re-triggers the first-load verdict self-heal.
+pub const KERNEL_HASH: &str = env!("RSL_MLX_KERNEL_HASH");
+
 /// Opaque handle to the C `rsl_mlx_stream` (device + Metal command queue /
 /// MLX stream).
 #[repr(C)]

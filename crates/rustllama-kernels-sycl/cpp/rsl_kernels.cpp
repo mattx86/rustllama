@@ -11220,7 +11220,7 @@ void rsl_silu_mul_f32_usm(rsl_stream* s,
 // bytes + per-row f32 scales into the strided KV-cache layout
 // `[n_kv_heads][max_ctx][head_dim]`. Replaces the CPU
 // `quantize_row_q8_0` loop in the prefill/decode paths when KV cache
-// is USM-resident (`RUSTLLAMA_USM_KV=1`).
+// is USM-resident (the `kv:usm` verdict; was `RUSTLLAMA_USM_KV`).
 //
 // Per-row algorithm matches `quantize_row_q8_0` exactly:
 //   max_abs = max(|src[i]|)
@@ -12908,10 +12908,11 @@ void rsl_matvec_ptq1_0_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm,
 // Iris Xe's narrow memory bus where each output row re-reads the full
 // K-length activation.
 //
-// Gated behind `RUSTLLAMA_MIXED_PRECISION_MATVEC=1` (default off): F16
-// activations lose ~3 mantissa bits, so this stays opt-in until
-// validated within tolerance on hardware (Open Risk #7 — F16
-// underflow on near-zero activations).
+// Per-dtype `matvec_f16in:<dtype>` verdict-gated at the call site (was
+// `RUSTLLAMA_MIXED_PRECISION_MATVEC`): F16 activations lose ~3 mantissa
+// bits, so the probe grades vs an f16-roundtrip ref AND perf-gates, and
+// the path auto-enables only where correct AND faster (Open Risk #7 —
+// F16 underflow on near-zero activations).
 #define RSL_H8_BEGIN(LWS) \
     const std::size_t global = ((static_cast<std::size_t>(M) + (LWS) - 1) / (LWS)) * (LWS); \
     q.submit([&](sycl::handler& h) { \

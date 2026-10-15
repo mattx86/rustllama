@@ -18,6 +18,13 @@
 
 use std::fmt;
 
+/// T4: FNV-1a-64 hash (hex) of this crate's kernel sources, computed by
+/// `build.rs` and injected via `cargo:rustc-env=RSL_SYCL_KERNEL_HASH`. The tuner
+/// folds this (with the CUDA/MLX twins) into `kernel_build_id()` so a kernel-
+/// source edit — even within one crate version — changes the build id and the
+/// first-load self-heal re-runs `tune --validate-kernels`.
+pub const KERNEL_HASH: &str = env!("RSL_SYCL_KERNEL_HASH");
+
 #[cfg(feature = "encoder")]
 pub mod iq_encoder;
 

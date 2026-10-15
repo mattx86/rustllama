@@ -58,6 +58,11 @@ fn main() {
     println!("cargo:rerun-if-changed=cpp/rsl_kernels.def");
     println!("cargo:rerun-if-changed=build.rs");
 
+    // T4: emit RSL_SYCL_KERNEL_HASH on EVERY target (real + stub paths), before
+    // the stub early-return below, so the crate's `KERNEL_HASH` const is always
+    // defined and the tuner's `kernel_build_id()` self-heals on a kernel edit.
+    emit_kernel_hash();
+
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     // Stub the SYCL backend wherever Intel oneAPI cannot exist:
@@ -105,6 +110,57 @@ fn main() {
     println!("cargo:rerun-if-changed=include/rsl_kernels.h");
     println!("cargo:rerun-if-env-changed=ONEAPI_ROOT");
     println!("cargo:rerun-if-env-changed=CMPLR_ROOT");
+}
+
+/// T4 (kernel-source-hash verdict self-heal): FNV-1a-64 hash of this backend's
+/// kernel sources (`cpp/*.cpp` + `cpp/*.hpp` + `include/*.h`), emitted as
+/// `cargo:rustc-env=RSL_SYCL_KERNEL_HASH=<hex>` (read by this crate's
+/// `KERNEL_HASH` const, folded into `rustllama_tuner::kernel_build_id()`). The
+/// file list is sorted so the hash is deterministic; each file's NAME is hashed
+/// before its bytes so a rename changes the hash; a `rerun-if-changed` is emitted
+/// per file so an edit re-runs this script. Empty/missing dir → the FNV basis
+/// (still a valid hex; the version component of the build id still differentiates
+/// builds). Runs on every target so `env!("RSL_SYCL_KERNEL_HASH")` always resolves.
+fn emit_kernel_hash() {
+    let hash = fnv1a_kernel_sources(&[("cpp", &["cpp", "hpp"]), ("include", &["h"])]);
+    println!("cargo:rustc-env=RSL_SYCL_KERNEL_HASH={hash}");
+}
+
+/// Collect the source files under each `(dir, extensions)` pair (relative to the
+/// crate root, cargo's build-script cwd), sort them for determinism, emit a
+/// `rerun-if-changed` per file, and fold their names + bytes into one FNV-1a-64
+/// hash returned as a 16-hex string.
+fn fnv1a_kernel_sources(dirs: &[(&str, &[&str])]) -> String {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for (dir, exts) in dirs {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                    if exts.contains(&ext) {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+    }
+    files.sort();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let fold = |bytes: &[u8], h: &mut u64| {
+        for &b in bytes {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for f in &files {
+        println!("cargo:rerun-if-changed={}", f.display());
+        let name = f.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        fold(name.as_bytes(), &mut h);
+        if let Ok(bytes) = std::fs::read(f) {
+            fold(&bytes, &mut h);
+        }
+    }
+    format!("{h:016x}")
 }
 
 /// Stub targets (non-x86_64, OR macOS on any arch): build a no-op C stub

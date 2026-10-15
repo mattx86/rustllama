@@ -86,9 +86,9 @@ pub(crate) fn matvec_tensor_dispatch(
         crate::imatrix_collect::record(&w.name, x);
     }
 
-    // H8: F16-input mixed-precision matvec (gated by
-    // RUSTLLAMA_MIXED_PRECISION_MATVEC, default off). Tried before the
-    // F32 USM path; on miss falls straight through with no cost.
+    // H8: F16-input mixed-precision matvec (per-dtype `matvec_f16in:<dtype>`
+    // verdict-gated, fail-closed). Tried before the F32 USM path; on miss
+    // (dtype off / no verdict) falls straight through with no cost.
     if crate::accel::try_matvec_tensor_f16in_usm_f32(w, x, out, m, k_dim) {
         return;
     }
@@ -3022,7 +3022,7 @@ pub struct KvCache {
     /// softmax-invariant, so no read side exists. `None` = uncentered.
     pub kv_bias: Option<std::sync::Arc<crate::kv_bias::KvBiasData>>,
     /// G2: optional SYCL stream owning the KV-layer USM allocations.
-    /// `None` when `RUSTLLAMA_USM_KV` is unset/0 or SYCL is unavailable;
+    /// `None` when the `kv:usm` verdict is OFF or SYCL is unavailable;
     /// the layers' `KvBuf`s are then all `Host`-backed.
     pub usm_stream: Option<Box<rustllama_kernels_sycl::SyclStream>>,
 }
@@ -3108,17 +3108,19 @@ fn alloc_kv_buf_u8(
 
 
 /// G2: try to construct a SYCL stream for KV-cache USM allocations.
-/// Returns `Some(Box<stream>)` when `RUSTLLAMA_USM_KV=1` and SYCL has
-/// a device; `None` otherwise. Cached after first parse so repeated
-/// `KvCache::new_with_dtype` calls don't re-parse the env var.
+/// Returns `Some(Box<stream>)` when the `kv:usm` verdict is ON and SYCL has
+/// a device; `None` otherwise. Cached after first read so repeated
+/// `KvCache::new_with_dtype` calls don't re-check.
+///
+/// P5b: the USM-resident KV path auto-enables from the on-device PERF verdict
+/// `kv:usm` (banked by `tune --validate-kernels` only where USM memory beat a
+/// host buffer), replacing the removed `RUSTLLAMA_USM_KV` env gate. Fail-closed:
+/// on a unified-memory iGPU (USM IS host memory) this is a wash → no verdict →
+/// host-resident KV, byte-identical to before.
 fn try_open_usm_kv_stream() -> Option<Box<rustllama_kernels_sycl::SyclStream>> {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| {
-        std::env::var("RUSTLLAMA_USM_KV")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    });
+    let enabled =
+        *ENABLED.get_or_init(|| crate::accel::kernel_verdict(rustllama_tuner::VERDICT_KV_USM));
     if !enabled {
         return None;
     }
@@ -9153,8 +9155,9 @@ impl LlamaModel {
 
             // H6: try the fully-fused output-proj + residual + norm
             // kernel first (one GPU dispatch for matvec(W_o) + add +
-            // rmsnorm). Gated behind RUSTLLAMA_FUSED_OUT_PROJ_NORM
-            // (default off) + dtype coverage; on success it writes the
+            // rmsnorm). P5b: `fused_out_proj_norm_enabled()` is fail-closed
+            // OFF until the composite `fused:out_proj_norm` verdict lands (P6)
+            // + dtype coverage; on success it writes the
             // residual sum into `hidden` AND the normalized output into
             // `h_norm`, so we skip the separate out-proj matvec and the
             // add_rmsnorm ladder below entirely.

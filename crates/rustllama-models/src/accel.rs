@@ -490,6 +490,82 @@ pub(crate) fn kernel_verdict(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Public verdict reader for OTHER crates (e.g. `rustllama-engine`'s GPU
+/// sampler) that need the same fail-closed auto-enable decision but can't reach
+/// the `pub(crate)` [`kernel_verdict`]. Same semantics: `true` only when `tune
+/// --validate-kernels` recorded a pass on this machine; absent / `false` ⇒ OFF.
+pub fn verdict_enabled(name: &str) -> bool {
+    kernel_verdict(name)
+}
+
+/// Canonical parity-probe dtype name for a packed `Dtype` (e.g. `Q4_KRaw` →
+/// `"q4_k"`), matching the SYCL `probe_names()` keys in `gpu_parity.rs`. `None`
+/// for a dtype with no packed-matvec probe. Used to build the per-dtype verdict
+/// keys (`fused:<name>`, `matvec_f16in:<name>`) the P5b gates read, so a
+/// per-dtype on-device verdict decides each path (fail-closed when the key is
+/// absent — e.g. the dtype has no such kernel, or it was never validated).
+fn dtype_probe_name(dtype: Dtype) -> Option<&'static str> {
+    Some(match dtype {
+        Dtype::Q8_0Raw => "q8_0",
+        Dtype::Q4_KRaw => "q4_k",
+        Dtype::Q5_KRaw => "q5_k",
+        Dtype::Q6_KRaw => "q6_k",
+        Dtype::IQ4_NLRaw => "iq4_nl",
+        Dtype::IQ4_XSRaw => "iq4_xs",
+        Dtype::IQ1_SRaw => "iq1_s",
+        Dtype::IQ1_MRaw => "iq1_m",
+        Dtype::IQ2_XXSRaw => "iq2_xxs",
+        Dtype::IQ2_XSRaw => "iq2_xs",
+        Dtype::IQ2_SRaw => "iq2_s",
+        Dtype::IQ3_XXSRaw => "iq3_xxs",
+        Dtype::IQ3_SRaw => "iq3_s",
+        Dtype::PTQ1_0Raw => "ptq1_0",
+        Dtype::Q4_0Raw => "q4_0",
+        Dtype::Q5_0Raw => "q5_0",
+        Dtype::Q4_1Raw => "q4_1",
+        Dtype::Q5_1Raw => "q5_1",
+        Dtype::Q2_KRaw => "q2_k",
+        Dtype::Q3_KRaw => "q3_k",
+        Dtype::Q8_KRaw => "q8_k",
+        Dtype::PQ2_0Raw => "pq2_0",
+        Dtype::Mxfp4Raw => "mxfp4",
+        Dtype::Mxfp6Raw => "mxfp6",
+        Dtype::Mxfp8Raw => "mxfp8",
+        _ => return None,
+    })
+}
+
+/// Whether the per-dtype FUSED gate+up matvec is verdict-enabled for `dtype`.
+/// P5b: reads `fused:<dtype>` (banked by the SYCL `probe_fused` parity probes),
+/// fail-closed. On the Iris-Xe/OpenCL backend that produced garbage in the
+/// 2026-09-06 incident the fused probe grades MISCOMPUTE, so this stays OFF
+/// automatically — the device auto-detects as unsafe. Replaces the removed
+/// `RUSTLLAMA_MOE_GATE_UP_FUSED` env gate.
+fn moe_gate_up_fused_enabled(dtype: Dtype) -> bool {
+    if fusions_disabled() {
+        return false;
+    }
+    match dtype_probe_name(dtype) {
+        Some(name) => kernel_verdict(&format!("{}{}", rustllama_tuner::VERDICT_FUSED_GATE_UP_PREFIX, name)),
+        None => false,
+    }
+}
+
+/// Whether the per-dtype F16-activation (mixed-precision) matvec is
+/// verdict-enabled for `dtype`. P5b: reads `matvec_f16in:<dtype>` (banked by the
+/// SYCL `probe_matvec_f16in` probes — graded vs an f16-roundtrip reference AND
+/// perf-gated), fail-closed. Lossy, so ON only where correct AND faster.
+/// Replaces the removed `RUSTLLAMA_MIXED_PRECISION_MATVEC` env gate.
+fn mixed_precision_matvec_enabled(dtype: Dtype) -> bool {
+    if fusions_disabled() {
+        return false;
+    }
+    match dtype_probe_name(dtype) {
+        Some(name) => kernel_verdict(&format!("{}{}", rustllama_tuner::VERDICT_MATVEC_F16IN_PREFIX, name)),
+        None => false,
+    }
+}
+
 /// Whether the Blackwell FP4 tensor-core GEMM path is enabled. **AUTOMATIC** —
 /// no env var: it turns on only when BOTH FP4 TC GEMM kernels (NVFP4 + MXFP4)
 /// passed the on-device self-check (`tune --validate-kernels` → `kernel_verdict`)
@@ -2845,6 +2921,28 @@ pub fn set_synthetic_run(on: bool) {
 /// Whether this process is doing synthetic (benchmark/tune) decode.
 pub fn synthetic_run() -> bool {
     SYNTHETIC_RUN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Process-wide override to force the P5b default-off GPU FUSIONS OFF regardless
+/// of their on-device verdicts: the MoE gate+up fused matvec, the
+/// mixed-precision (f16-activation) matvec, and the out-proj+norm fusion. These
+/// paths COMBINE or BYPASS per-tensor `matvec_tensor_dispatch` calls, so the
+/// imatrix command sets this before load → every quantizable tensor still routes
+/// through the base dispatch recording hook exactly once. Replaces the old
+/// `set_var("RUSTLLAMA_MOE_GATE_UP_FUSED"/…, "0")` now that the gates read
+/// verdicts, not env vars.
+static FUSIONS_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Force all P5b GPU fusions OFF (see [`FUSIONS_DISABLED`]). Used by the imatrix
+/// recording path. Re-exported as `rustllama_engine::set_fusions_disabled`.
+pub fn set_fusions_disabled(disabled: bool) {
+    FUSIONS_DISABLED.store(disabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the P5b fusions are force-disabled for this process.
+fn fusions_disabled() -> bool {
+    FUSIONS_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Drop the in-flight refcount on a pinned expert after its matvecs.
@@ -11958,6 +12056,19 @@ impl PackedMatvecKind {
     }
 }
 
+/// P5b — whether the full attn-output-proj + residual + post-attn-norm fusion is
+/// enabled. Returns `false` (OFF) unconditionally: the fusion is a two-kernel
+/// chain orchestrated in `accel` (not a single kernel), so there is no clean
+/// single-kernel parity probe to verdict-gate it, and the two parts
+/// (`matvec:<dtype>` + `fused:add_rmsnorm_f32`) are already parity-covered. The
+/// removed `RUSTLLAMA_FUSED_OUT_PROJ_NORM` env gate was default-off, so this is
+/// behavior-identical. The fusion RETURNS under P6 with its own composite verdict
+/// (`fused:out_proj_norm`) once a probe for the chained path lands — until then,
+/// fail-closed OFF (no env gate).
+fn fused_out_proj_norm_enabled() -> bool {
+    false
+}
+
 /// USM-resident weight matvec dispatch with per-dtype routing. The
 /// v1-locked quants (Q8_0Raw, Q4_KRaw, Q5_KRaw) are wired to USM
 /// kernels; other quant formats return `false` so the caller falls
@@ -11976,73 +12087,6 @@ impl PackedMatvecKind {
 /// byte-len)` pair and cached for the lifetime of the USM context.
 /// Subsequent calls against the same weight tensor pay only the
 /// small `x` upload + kernel dispatch + small `out` readback.
-/// H4 infrastructure: env-var gate for MoE gate+up batched matvec.
-/// `RUSTLLAMA_MOE_GATE_UP_FUSED=1` opts into the fused per-expert
-/// matvec dispatch (when the per-dtype `matvec_gate_up_packed_*_usm`
-/// SYCL kernels are wired). Default off until kernels land. Reading
-/// this env var here lets future kernel-implementation work flip a
-/// single switch without re-plumbing the engine.
-pub fn moe_gate_up_fused_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        // Default OFF. The default-ON experiment (opt Tranche 3.3;
-        // the table covers every shipping expert dtype and the
-        // unfused path pays ~320 extra dispatches per decoded token
-        // on a 256-expert top-8 model) produced OUTRIGHT GARBAGE
-        // logits on the first hardware that actually executed the
-        // fused kernels: Iris Xe on the OpenCL fallback backend,
-        // Qwen3.6-35B IQ2_XXS experts, 2026-09-06 — greedy decode
-        // emitted mixed-script token soup with fused ON and correct
-        // text with fused OFF, all else equal. The failure-latch
-        // can't catch this class (the kernels return Ok). Do not
-        // re-enable by default until the fused kernels have per-
-        // dtype GPU-vs-CPU parity tests that run on the target
-        // backend. `RUSTLLAMA_MOE_GATE_UP_FUSED=1` opts in for A/B.
-        std::env::var("RUSTLLAMA_MOE_GATE_UP_FUSED")
-            .ok()
-            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-            .unwrap_or(false)
-    })
-}
-
-/// H6 infrastructure: env-var gate for full attn-output-proj +
-/// residual + post-attn-norm fusion. `RUSTLLAMA_FUSED_OUT_PROJ_NORM=1`
-/// opts into a new per-dtype `matvec_add_rmsnorm_packed_*_usm` kernel
-/// (when wired). The two-op `try_add_rmsnorm_usm_f32` fusion (Tier F)
-/// is already on by default; this gate covers the additional matvec
-/// fold.
-pub fn fused_out_proj_norm_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("RUSTLLAMA_FUSED_OUT_PROJ_NORM")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
-
-/// H8 (deferred): F16 input mixed-precision matvec. Today all GPU
-/// matvecs read activations as F32 USM. F16 inputs with F32
-/// accumulators would cut activation-memory bandwidth ~2× — a
-/// material win on Iris Xe's ~8 GB/s memory budget. Implementation
-/// requires a new SYCL kernel variant per dtype (Q8_0, Q4_K, Q5_K,
-/// Q6_K, IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS — ~12 variants)
-/// reading `*const u16` activations + `bits_to_f32()` conversion in
-/// the inner loop. F16 has ~6.5e-5 minimum subnormal; near-zero
-/// activations risk underflow so a parity bound + env-var-default-off
-/// gate is required before promoting. `RUSTLLAMA_MIXED_PRECISION_MATVEC`
-/// is reserved as the activation env var; reading it returns `false`
-/// until the kernels land.
-pub fn mixed_precision_matvec_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("RUSTLLAMA_MIXED_PRECISION_MATVEC")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
-
 pub fn try_matvec_tensor_usm_f32(
     w: &Tensor,
     x: &[f32],
@@ -12643,7 +12687,7 @@ pub fn try_matvec_tensor_gate_up_fused_cuda_f32(
     m: usize,
     k: usize,
 ) -> bool {
-    if !moe_gate_up_fused_enabled() || !cuda_active() {
+    if !moe_gate_up_fused_enabled(w_gate.dtype) || !cuda_active() {
         return false;
     }
     if tensor_forced_to_cpu(&w_gate.name) || tensor_forced_to_cpu(&w_up.name) {
@@ -12692,7 +12736,7 @@ pub fn try_matvec_tensor_gate_up_fused_mlx_f32(
     m: usize,
     k: usize,
 ) -> bool {
-    if !moe_gate_up_fused_enabled() || !mlx_active() {
+    if !moe_gate_up_fused_enabled(w_gate.dtype) || !mlx_active() {
         return false;
     }
     if tensor_forced_to_cpu(&w_gate.name) || tensor_forced_to_cpu(&w_up.name) {
@@ -12754,7 +12798,7 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
     m: usize,
     k: usize,
 ) -> bool {
-    if !moe_gate_up_fused_enabled() {
+    if !moe_gate_up_fused_enabled(w_gate.dtype) {
         return false;
     }
     if !usm_attn_enabled() {
@@ -13082,7 +13126,9 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
 /// ffn_norm scale; `y_norm` receives the normalized output (next
 /// block's gate/up input).
 ///
-/// Gated behind `RUSTLLAMA_FUSED_OUT_PROJ_NORM=1` (default off).
+/// P5b: gated by `fused_out_proj_norm_enabled()`, which is fail-closed OFF until
+/// the composite `fused:out_proj_norm` verdict lands (P6); the old
+/// `RUSTLLAMA_FUSED_OUT_PROJ_NORM` env gate was removed.
 ///
 /// Implementation (post-bisect rewrite, 2026-05-29): chains two
 /// proven kernels instead of a single fused one. The original
@@ -13310,12 +13356,13 @@ pub fn try_matvec_out_proj_add_rmsnorm_usm_f32(
 /// as F16 (halving its memory traffic on the GPU's per-output-row
 /// re-read). Weights stay packed; output stays F32.
 ///
-/// Gated behind `RUSTLLAMA_MIXED_PRECISION_MATVEC=1` (default off):
-/// F16 activations drop ~3 mantissa bits, so this stays opt-in until
-/// validated within tolerance on hardware (Open Risk #7). Returns
-/// `false` when off, the dtype has no F16-input kernel, the layer is
-/// CPU-resident, or any shape check fails — caller falls through to
-/// the F32 USM path then CPU.
+/// P5b: per-dtype verdict-gated by `mixed_precision_matvec_enabled(w.dtype)` →
+/// `matvec_f16in:<dtype>` (banked by the SYCL probe, graded vs an f16-roundtrip
+/// reference AND perf-gated — F16 activations drop ~3 mantissa bits, so this
+/// lossy path auto-enables ONLY where correct AND faster than the f32 matvec).
+/// The `RUSTLLAMA_MIXED_PRECISION_MATVEC` env gate was removed. Returns `false`
+/// when off, the dtype has no F16-input kernel, the layer is CPU-resident, or
+/// any shape check fails — caller falls through to the F32 USM path then CPU.
 pub fn try_matvec_tensor_f16in_usm_f32(
     w: &Tensor,
     x: &[f32],
@@ -13323,7 +13370,7 @@ pub fn try_matvec_tensor_f16in_usm_f32(
     m: usize,
     k: usize,
 ) -> bool {
-    if !mixed_precision_matvec_enabled() {
+    if !mixed_precision_matvec_enabled(w.dtype) {
         return false;
     }
     if !usm_attn_enabled() {

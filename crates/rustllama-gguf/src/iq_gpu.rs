@@ -172,11 +172,11 @@ pub trait IqGpuEncoder {
     /// Q5_K, Q6_K). Returns `Unavailable` by default; `SyclIqEncoder`
     /// overrides to dispatch the matching SYCL dequant kernel.
     ///
-    /// The pipeline calls this from its producer thread when
-    /// `RUSTLLAMA_GPU_DEQUANT=1` is set; on `Unavailable` the pipeline
-    /// falls back to the CPU `dequant_to_f32` path. `src_dtype` must
-    /// be one of the four K-quant variants; other dtypes return
-    /// `Unavailable`.
+    /// The pipeline calls this from its producer thread when the caller passed
+    /// `gpu_dequant = true` (the `quantize` command passes the `dequant:gpu`
+    /// on-device verdict); on `Unavailable` the pipeline falls back to the CPU
+    /// `dequant_to_f32` path. `src_dtype` must be one of the four K-quant
+    /// variants; other dtypes return `Unavailable`.
     fn try_dequant_kquant_to_f32(
         &self,
         _src_dtype: crate::GgmlType,

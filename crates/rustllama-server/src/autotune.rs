@@ -394,17 +394,18 @@ pub fn maybe_first_load_autotune(model_path: &Path, console: bool) {
 }
 
 /// Whether the on-device GPU-kernel verdicts need (re)validating for the
-/// CURRENT build: `true` when the tuner cache's `rustllama_version` differs
-/// from this build (a kernel change may have flipped a verdict) or there is
-/// no cache yet. Independent of whether any model is tuned. Conservative: an
-/// unreadable cache returns `false` so we never spawn a probe on a bad cache.
+/// CURRENT build: `true` when the tuner cache's `kernel_build_id` differs from
+/// this build (T4: the version PLUS the three kernel-source hashes — so a kernel
+/// change flips it even within one crate version) or there is no cache yet.
+/// Independent of whether any model is tuned. Conservative: an unreadable cache
+/// returns `false` so we never spawn a probe on a bad cache.
 fn kernel_validation_stale() -> bool {
     let Some(dir) = rustllama_tuner::default_cache_dir() else {
         return false;
     };
     let key = rustllama_tuner::system_fingerprint();
     match rustllama_tuner::load_cache(&dir, &key) {
-        Ok(Some(t)) => t.rustllama_version != env!("CARGO_PKG_VERSION"),
+        Ok(Some(t)) => t.kernel_build_id != rustllama_tuner::kernel_build_id(),
         Ok(None) => true,
         Err(_) => false,
     }

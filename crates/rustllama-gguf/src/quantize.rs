@@ -724,8 +724,9 @@ pub fn quantize_gguf_to_path_with_encoder<P: AsRef<std::path::Path>>(
     output_path: P,
     plan: &QuantizePlan,
     encoder: &dyn crate::iq_gpu::IqGpuEncoder,
+    gpu_dequant: bool,
 ) -> Result<QuantizeStats, QuantizeError> {
-    quantize_gguf_to_path_with_encoder_imatrix(src, output_path, plan, encoder, None)
+    quantize_gguf_to_path_with_encoder_imatrix(src, output_path, plan, encoder, None, gpu_dequant)
 }
 
 /// GPU-encoder pipeline with optional importance-matrix weighting.
@@ -741,6 +742,7 @@ pub fn quantize_gguf_to_path_with_encoder_imatrix<P: AsRef<std::path::Path>>(
     plan: &QuantizePlan,
     encoder: &dyn crate::iq_gpu::IqGpuEncoder,
     imatrix: Option<&crate::imatrix::Imatrix>,
+    gpu_dequant: bool,
 ) -> Result<QuantizeStats, QuantizeError> {
     let mut dst = GgufMmapWriter::create(&output_path)?;
 
@@ -867,17 +869,16 @@ pub fn quantize_gguf_to_path_with_encoder_imatrix<P: AsRef<std::path::Path>>(
     // `IQ2_BATCH_CHUNK_CAP` (caps merged-f32 memory at ~8 MiB).
     if !iq_jobs.is_empty() {
         const IQ2_BATCH_CHUNK_CAP: usize = 256 * 1024;
-        // G5 integrated switch: when set, the producer skips CPU
-        // dequant for K-quant sources (Q3_K/Q4_K/Q5_K/Q6_K) and the
-        // consumer dispatches the GPU dequant kernel on the encoder's
-        // queue before the IQ search. Trades G3's CPU-dequant
-        // pipelining for GPU dequant on the consumer thread; on iGPU
-        // expected to be roughly a wash, on dGPU expected to save
-        // PCIe upload time. Default off to preserve G3's behavior.
-        let gpu_dequant = std::env::var("RUSTLLAMA_GPU_DEQUANT")
-            .ok()
-            .as_deref()
-            == Some("1");
+        // G5 integrated switch: when `gpu_dequant` is set, the producer skips
+        // CPU dequant for K-quant sources (Q3_K/Q4_K/Q5_K/Q6_K) and the
+        // consumer dispatches the GPU dequant kernel on the encoder's queue
+        // before the IQ search. Trades G3's CPU-dequant pipelining for GPU
+        // dequant on the consumer thread; on iGPU expected to be roughly a
+        // wash, on dGPU expected to save PCIe upload time. P5b: the decision is
+        // the caller's `gpu_dequant` arg — the `quantize` command passes the
+        // `dequant:gpu` on-device verdict (fail-closed OFF), replacing the
+        // removed `RUSTLLAMA_GPU_DEQUANT` env read (this crate is toolchain-free
+        // and can't read the tuner cache itself).
         let (tx, rx) = std::sync::mpsc::sync_channel::<DequantedTensor>(2);
         let producer_res: Result<(), QuantizeError> = std::thread::scope(|s| {
             let producer = s.spawn(move || -> Result<(), QuantizeError> {
@@ -2035,6 +2036,7 @@ mod tests {
             &tmp_b,
             &plan,
             &crate::iq_gpu::CpuFallbackEncoder,
+            false,
         )
         .unwrap();
         let bytes_b = std::fs::read(&tmp_b).unwrap();
@@ -2099,6 +2101,7 @@ mod tests {
                 &tmp_b,
                 &plan,
                 &crate::iq_gpu::CpuFallbackEncoder,
+                false,
             )
             .unwrap();
             let ba = std::fs::read(&tmp_a).unwrap();

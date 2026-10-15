@@ -1299,8 +1299,9 @@ void rsl_matvec_iq3_s_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm, co
 void rsl_matvec_ptq1_0_add_rmsnorm_usm(rsl_stream* s, const void* w_bytes_usm, const float* attn_usm, float* hidden_usm, const float* w_norm_usm, float* y_norm_usm, int M, int K, float eps, int lws);
 
 /* H8: F16-input mixed-precision matvec. `x_f16` is the activation vector
- * as F16 bits; weights stay packed, accumulator + output stay F32. Gated
- * behind RUSTLLAMA_MIXED_PRECISION_MATVEC at the call site. */
+ * as F16 bits; weights stay packed, accumulator + output stay F32.
+ * Per-dtype `matvec_f16in:<dtype>` verdict-gated at the call site (was
+ * RUSTLLAMA_MIXED_PRECISION_MATVEC). */
 void rsl_matvec_q8_0_f16in_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm, const uint16_t* x_f16, float* out_usm, int M, int K, int lws);
 void rsl_matvec_q4_k_f16in_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm, const uint16_t* x_f16, float* out_usm, int M, int K, int lws);
 void rsl_matvec_q5_k_f16in_packed_f32_usm(rsl_stream* s, const void* w_bytes_usm, const uint16_t* x_f16, float* out_usm, int M, int K, int lws);

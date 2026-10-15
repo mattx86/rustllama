@@ -47,6 +47,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MLX_LIB_DIR");
     println!("cargo:rerun-if-env-changed=MLX_INCLUDE_DIR");
 
+    // T4: emit RSL_MLX_KERNEL_HASH on EVERY target (real + stub paths), so the
+    // crate's `KERNEL_HASH` const is always defined and the tuner's
+    // `kernel_build_id()` self-heals on a Metal/MLX kernel edit.
+    emit_kernel_hash();
+
     // IQ codebook grids for the Metal IQ1/IQ2/IQ3 kernels — generated from the
     // gguf crate's Rust grid sources into $OUT/iq_grids_metal.h (a Metal header
     // of `constant` arrays). Emitted UNCONDITIONALLY so the parse is exercised
@@ -68,6 +73,55 @@ fn main() {
     } else {
         build_mlx_stub(&out_path);
     }
+}
+
+/// T4 (kernel-source-hash verdict self-heal): FNV-1a-64 hash of this backend's
+/// kernel sources (`mlx/*.mm` + `mlx/*.metal` + `mlx/*.h`), emitted as
+/// `cargo:rustc-env=RSL_MLX_KERNEL_HASH=<hex>` (read by this crate's
+/// `KERNEL_HASH` const, folded into `rustllama_tuner::kernel_build_id()`). Sorted
+/// file list for determinism; the file NAME is hashed before its bytes so a
+/// rename changes the hash; a `rerun-if-changed` per file re-runs this script on
+/// an edit. Runs on every target so `env!("RSL_MLX_KERNEL_HASH")` always resolves.
+fn emit_kernel_hash() {
+    let hash = fnv1a_kernel_sources(&[("mlx", &["mm", "metal", "h"])]);
+    println!("cargo:rustc-env=RSL_MLX_KERNEL_HASH={hash}");
+}
+
+/// Collect the source files under each `(dir, extensions)` pair (relative to the
+/// crate root, cargo's build-script cwd), sort them for determinism, emit a
+/// `rerun-if-changed` per file, and fold their names + bytes into one FNV-1a-64
+/// hash returned as a 16-hex string.
+fn fnv1a_kernel_sources(dirs: &[(&str, &[&str])]) -> String {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for (dir, exts) in dirs {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                    if exts.contains(&ext) {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+    }
+    files.sort();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let fold = |bytes: &[u8], h: &mut u64| {
+        for &b in bytes {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for f in &files {
+        println!("cargo:rerun-if-changed={}", f.display());
+        let name = f.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        fold(name.as_bytes(), &mut h);
+        if let Ok(bytes) = std::fs::read(f) {
+            fold(&bytes, &mut h);
+        }
+    }
+    format!("{h:016x}")
 }
 
 // ============================================================

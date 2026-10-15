@@ -359,6 +359,25 @@ ID can replace `-` later). Packaging helpers: `_release_package.ps1` (bsdtar),
   `kernel_verdicts`), not env flags. The XMX kernel is always compiled now
   (`build.rs` always emits `-DRSL_SYCL_XMX`; safe on non-XMX GPUs — JIT `spir64`,
   only launched when capable + verdict-enabled).
+- (Removed, P5b) `RUSTLLAMA_MOE_GATE_UP_FUSED` / `_MIXED_PRECISION_MATVEC` /
+  `_FUSED_OUT_PROJ_NORM` / `_SAMPLER_GPU` / `_USM_KV` / `_GPU_DEQUANT`: these
+  default-off GPU fusions/paths now **auto-enable from an on-device verdict**
+  (fail-closed), not env flags. MoE gate+up fused → per-dtype `fused:<dtype>`
+  (the Iris-Xe/OpenCL garbage incident now auto-detects as MISCOMPUTE → stays
+  off); mixed-precision matvec → per-dtype `matvec_f16in:<dtype>` (graded vs an
+  f16-roundtrip ref AND perf-gated); GPU sampler → `sampler:gpu` (correct AND
+  faster); USM KV → `kv:usm` (perf; reserved, banking stage is P6); GPU
+  quantize-dequant → `dequant:gpu` (the `quantize` cmd reads it and passes the
+  decision into the toolchain-free gguf pipeline). `fused_out_proj_norm` is
+  fail-closed OFF until its composite `fused:out_proj_norm` verdict lands (P6).
+  The imatrix command forces all fusions off via
+  `rustllama_engine::set_fusions_disabled(true)` (was `set_var(...,"0")`).
+- (Removed env gating, T4-related) the verdict self-heal now keys on
+  `rustllama_tuner::kernel_build_id()` = `{version}+{sycl}+{cuda}+{mlx}` kernel-
+  source FNV hashes (each kernel `build.rs` emits `RSL_<B>_KERNEL_HASH` →
+  `KERNEL_HASH` const), so an **intra-version kernel source edit auto-re-runs**
+  `tune --validate-kernels` on next load — no manual `tune --validate-kernels`
+  (the GOTCHA that it keyed on `CARGO_PKG_VERSION` alone is fixed).
 - Perf levers (production CPU-path recipe): `SYCL_DISPATCH=0`, `LOCK_RAM_MB`
   (also an `[inference]` key), `TERNARY_FASTDOT=1`, `PROFILE_HYBRID_PREFILL`.
 

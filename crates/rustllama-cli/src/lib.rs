@@ -1824,6 +1824,13 @@ fn cmd_quantize(
         } else {
             None
         };
+        // P5b: GPU dequant of K-quant sources during the IQ encode is gated by
+        // the on-device `dequant:gpu` verdict (fail-closed OFF), replacing the
+        // removed `RUSTLLAMA_GPU_DEQUANT` env var. Read from the tuner cache
+        // here (cli can't link `rustllama-models`) and passed into the
+        // toolchain-free gguf pipeline.
+        let gpu_dequant =
+            rustllama_tuner::cached_kernel_verdict(rustllama_tuner::VERDICT_DEQUANT_GPU);
         if let Some(encoder) = gpu_encoder.as_ref() {
             rustllama_gguf::quantize::quantize_gguf_to_path_with_encoder_imatrix(
                 &src,
@@ -1831,6 +1838,7 @@ fn cmd_quantize(
                 &plan,
                 encoder,
                 Some(im),
+                gpu_dequant,
             )
             .map_err(|e| anyhow::anyhow!("quantize pipeline failed: {e}"))?
         } else {
@@ -1846,12 +1854,15 @@ fn cmd_quantize(
         let use_gpu = std::env::var("RUSTLLAMA_IQ_GPU")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        // P5b: `dequant:gpu` verdict (fail-closed OFF) replaces RUSTLLAMA_GPU_DEQUANT.
+        let gpu_dequant =
+            rustllama_tuner::cached_kernel_verdict(rustllama_tuner::VERDICT_DEQUANT_GPU);
         if use_gpu {
             match rustllama_kernels_sycl::iq_encoder::SyclIqEncoder::new(0) {
                 Ok(encoder) => {
                     println!("quantize: IQ GPU encoder enabled (experimental — needs hardware validation)");
                     rustllama_gguf::quantize::quantize_gguf_to_path_with_encoder(
-                        &src, output, &plan, &encoder,
+                        &src, output, &plan, &encoder, gpu_dequant,
                     )
                     .map_err(|e| anyhow::anyhow!("quantize pipeline failed: {e}"))?
                 }
@@ -2360,20 +2371,14 @@ fn cmd_imatrix(
     use rustllama_engine::{imatrix_collect, CpuEngine, SamplingParams};
     use rustllama_gguf::imatrix::Imatrix;
 
-    // Disable the forward-pass fusions that bypass the base
-    // `matvec_tensor_dispatch` hook, so every quantizable tensor is
-    // recorded exactly once. Set before load — the `*_enabled()`
-    // accessors cache their value on first read.
+    // Disable the forward-pass fusions that COMBINE or BYPASS the base
+    // `matvec_tensor_dispatch` hook, so every quantizable tensor is recorded
+    // exactly once. P5b: these gates now read on-device verdicts (not env vars),
+    // so force them off via the process-wide override before load.
     // (H3 QKV concat is no longer an env gate; it is built at load but
     // consumed only by the MTP-head forward, not the base `forward_one`
     // recording path, so it needs no disabling here.)
-    for k in [
-        "RUSTLLAMA_MOE_GATE_UP_FUSED",
-        "RUSTLLAMA_FUSED_OUT_PROJ_NORM",
-        "RUSTLLAMA_MIXED_PRECISION_MATVEC",
-    ] {
-        std::env::set_var(k, "0");
-    }
+    rustllama_engine::set_fusions_disabled(true);
 
     let ctx = ctx_size.max(1);
     let kv_dtype = parse_kv_dtype("f32")?;
@@ -6179,6 +6184,24 @@ fn cmd_tune_validate_kernels() -> anyhow::Result<()> {
     }
     verdicts.extend(crate::gpu_parity::collect_xmx_verdict());
     verdicts.extend(crate::gpu_parity::collect_npu_verdict());
+    // P5a: bank the SYCL parity harness verdicts (`fused:*` / `matvec:*` /
+    // `matvecb:*` / `attn:*` / `matvec_f16in:*`) — previously the SYCL harness
+    // printed these but nothing persisted them, so the P5b fusion gates (e.g.
+    // `moe_gate_up_fused` per-dtype `fused:<dtype>`) had no verdict to read. On a
+    // host with no SYCL device every probe SKIPs fast (child create_stream Err),
+    // so this is cheap off-SYCL.
+    match crate::gpu_parity::collect_sycl_verdicts() {
+        Ok(mut v) => verdicts.append(&mut v),
+        Err(e) => tracing::warn!(error = %e, "SYCL kernel validation probes failed"),
+    }
+    // P5b: in-process correctness+perf collector for the GPU sampler chain (the
+    // verdict replacement for the removed RUSTLLAMA_SAMPLER_GPU env gate). SKIPs
+    // → None off SYCL. The `kv:usm` verdict (was RUSTLLAMA_USM_KV) is left
+    // RESERVED + fail-closed OFF: a faithful perf verdict needs a decode A/B
+    // (USM KV's win is GPU-side flash-attention access, which a CPU-side
+    // micro-bench would mis-measure — it would wrongly say OFF on a dGPU), so
+    // its banking stage is a P6 follow-up rather than a misleading micro-probe.
+    verdicts.extend(crate::gpu_parity::collect_sampler_gpu_verdict());
 
     // Keep only decided verdicts (OK / MISCOMPUTE); SKIP (capability
     // absent) carries no information and is left unset.
@@ -6226,6 +6249,10 @@ pub fn persist_kernel_verdicts(verdicts: &[(String, bool)]) -> anyhow::Result<()
         set_verdict(&mut tuning, name, *pass);
     }
     tuning.rustllama_version = env!("CARGO_PKG_VERSION").to_string();
+    // T4: stamp the kernel-source build id so the first-load self-heal
+    // re-validates when a kernel source changed WITHIN this crate version (not
+    // only on a version bump).
+    tuning.kernel_build_id = rustllama_tuner::kernel_build_id();
     tuning.last_tuned = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -7907,14 +7934,16 @@ fn cmd_tune_all(
         .unwrap_or(false);
     // Kernel verdicts are cached ONLY if present AND stamped by the
     // CURRENT build — a different build may have changed the kernels (e.g.
-    // a Blackwell GEMM fix), so re-validate on a version change. This is
+    // a Blackwell GEMM fix), so re-validate on a build change. This is
     // the self-heal that auto-refreshes verdicts after an upgrade without
-    // the user clearing any cache.
+    // the user clearing any cache. T4: compare the kernel-source BUILD ID
+    // (`{version}+{sycl}+{cuda}+{mlx}` kernel-source hashes), not just the
+    // crate version, so an intra-version kernel edit also re-validates. An
+    // old cache (serde-default `""`) never matches ⇒ re-validate (safe).
+    let build_id = rustllama_tuner::kernel_build_id();
     let has_kernel_verdicts = cached
         .as_ref()
-        .map(|t| {
-            !t.kernel_verdicts.is_empty() && t.rustllama_version == env!("CARGO_PKG_VERSION")
-        })
+        .map(|t| !t.kernel_verdicts.is_empty() && t.kernel_build_id == build_id)
         .unwrap_or(false);
     // #2 device-attn PERF verdict — build-stamped like the kernel verdicts
     // (a new build may change the block's cost), keyed by its own name so it's
@@ -7933,7 +7962,7 @@ fn cmd_tune_all(
                     .contains_key(rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK_SYCL)
                 || t.kernel_verdicts
                     .contains_key(rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK_MLX))
-                && t.rustllama_version == env!("CARGO_PKG_VERSION")
+                && t.kernel_build_id == build_id
         })
         .unwrap_or(false);
     // MTP self-speculation + chunked SSM prefill: both persist a
@@ -9250,6 +9279,36 @@ pub fn cmd_tuning_show(config_path: &std::path::Path) -> anyhow::Result<()> {
     match tuning.winner_tree_widths.as_ref() {
         Some(w) => println!("  tree_widths     = {w:?}"),
         None => println!("  tree_widths     = (none — run `rustllama tune --tree-widths`)"),
+    }
+    println!();
+    // On-device GPU-kernel verdicts (populated by `tune --validate-kernels`).
+    // These are the auto-enable decisions the dispatch layer reads: `true` =
+    // matched the CPU reference on this machine (and, for a perf-gated/lossy
+    // probe, also faster), `false` = miscomputed / crashed / not-faster →
+    // fail-closed OFF. A verdict absent from the map was never validated (or the
+    // probe SKIPped for lack of the capability) and also reads as OFF.
+    println!("kernel verdicts ({}):", tuning.kernel_verdicts.len());
+    // T4: the build id the verdicts were stamped under. When it differs from the
+    // CURRENT build (`{version}+{sycl}+{cuda}+{mlx}` kernel-source hashes), the
+    // first-load self-heal re-runs `tune --validate-kernels` automatically.
+    let cur_build = rustllama_tuner::kernel_build_id();
+    let stamped = if tuning.kernel_build_id.is_empty() {
+        "(unstamped — pre-T4 cache; will re-validate)".to_string()
+    } else if tuning.kernel_build_id == cur_build {
+        format!("{} (current)", tuning.kernel_build_id)
+    } else {
+        format!("{} (STALE vs current {cur_build} — will re-validate)", tuning.kernel_build_id)
+    };
+    println!("  kernel_build_id   = {stamped}");
+    if tuning.kernel_verdicts.is_empty() {
+        println!("  (none — run `rustllama tune --validate-kernels` on a GPU host to populate)");
+    } else {
+        let mut keys: Vec<&String> = tuning.kernel_verdicts.keys().collect();
+        keys.sort();
+        for k in keys {
+            let v = tuning.kernel_verdicts[k];
+            println!("  {k:<32} {}", if v { "ON  (pass)" } else { "off (fail-closed)" });
+        }
     }
     Ok(())
 }

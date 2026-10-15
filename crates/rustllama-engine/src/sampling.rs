@@ -193,14 +193,14 @@ pub struct Sampler {
     /// `params.mirostat == 0`.
     mirostat_mu: f32,
     /// Lazily-initialized GPU-side sampler context. Only constructed
-    /// when `RUSTLLAMA_SAMPLER_GPU=1` and the GPU path is taken on a
-    /// given call. Falls back silently to CPU on init failure or
-    /// when params disqualify the call (grammar / mirostat / top-p
-    /// / typical-p / logprobs / top_k too large).
+    /// when the `sampler:gpu` verdict is ON (see `gpu_enabled`) and the
+    /// GPU path is taken on a given call. Falls back silently to CPU on
+    /// init failure or when params disqualify the call (grammar /
+    /// mirostat / top-p / typical-p / logprobs / top_k too large).
     gpu_ctx: Option<crate::sampler_gpu::SamplerGpuContext>,
-    /// Cached env-var read: `true` ⇒ try GPU before CPU on each
-    /// `sample()`. Read once on construction so the per-sample hot
-    /// path doesn't `getenv` every call.
+    /// Cached auto-enable decision: `true` ⇒ try GPU before CPU on each
+    /// `sample()`. Read once on construction (from the on-device
+    /// `sampler:gpu` verdict) so the per-sample hot path doesn't re-check.
     gpu_enabled: bool,
 }
 
@@ -219,9 +219,11 @@ impl Sampler {
     pub fn new(params: SamplingParams) -> Self {
         let rng = Rng::from_seed(params.seed);
         let mirostat_mu = 2.0 * params.mirostat_tau;
-        let gpu_enabled = std::env::var("RUSTLLAMA_SAMPLER_GPU")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        // P5b: the GPU sampler path auto-enables from the on-device verdict
+        // `sampler:gpu` (banked by `tune --validate-kernels` only where the GPU
+        // chain matched the CPU sampler AND was faster), replacing the removed
+        // `RUSTLLAMA_SAMPLER_GPU` env gate. Fail-closed: no verdict ⇒ CPU sampler.
+        let gpu_enabled = rustllama_models::accel::verdict_enabled(rustllama_tuner::VERDICT_SAMPLER_GPU);
         Self {
             params,
             rng,
@@ -352,8 +354,8 @@ impl Sampler {
             }
         }
 
-        // GPU short-circuit (F1 engine integration). When
-        // `RUSTLLAMA_SAMPLER_GPU=1` and the params/grammar don't
+        // GPU short-circuit (F1 engine integration). When the
+        // `sampler:gpu` verdict is ON and the params/grammar don't
         // disqualify, run the whole sampler pipeline on GPU and
         // return the chosen id. Falls through to CPU on any GPU
         // failure mode (init / kernel error / unsupported params).
@@ -1830,9 +1832,9 @@ mod tests {
         }
     }
 
-    /// F1 engine integration: `Sampler::sample` with
-    /// `RUSTLLAMA_SAMPLER_GPU=1` exercises the full chain through
-    /// `SamplerGpuContext`. Skips on hosts without SYCL (mock
+    /// F1 engine integration: `Sampler::sample` with the GPU path
+    /// enabled (via the private `gpu_enabled` field) exercises the full
+    /// chain through `SamplerGpuContext`. Skips on hosts without SYCL (mock
     /// builds — gpu_enabled flips to false on init failure).
     /// Verifies the call succeeds (returns a valid token id), the
     /// CPU `Rng` state advanced (proving the GPU stream ran), and
@@ -1866,8 +1868,8 @@ mod tests {
         let mut logits = synth_probs(403, 4096);
         let recent: Vec<u32> = vec![3, 17, 42];
         // GPU path. Enable the GPU sampler on THIS instance only, via
-        // the private field — do NOT mutate the process-global
-        // RUSTLLAMA_SAMPLER_GPU env var. Rust's test harness runs
+        // the private field — independent of the process-global
+        // `sampler:gpu` verdict. Rust's test harness runs
         // `#[test]` fns concurrently across threads, and `Sampler::new`
         // caches the env flag into `gpu_enabled` at construction, so a
         // global `set_var` here races other tests: on a real GPU host it
