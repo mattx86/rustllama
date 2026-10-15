@@ -484,6 +484,21 @@ pub enum Command {
         /// Repeats per arm for the MTP sweep (median picks the winner).
         #[arg(long, default_value_t = 3)]
         speculative_mtp_repeats: u32,
+        /// Tree-WIDTH sweep: for a model carrying MTP/NextN draft heads, measure
+        /// tree-structured speculation decode tok/s across a small set of
+        /// per-depth branching-width vectors (`[2]`, `[2,2]`, `[2,2,2]`, `[4,2]`,
+        /// `[2,2,2,2]`, `[4,4,2]`, + the configured default) and persist the
+        /// vector with the best effective tok/s under `winner_tree_widths`.
+        /// Auto-applied to `[inference].speculative_tree_widths` on next load
+        /// when `[tuning].auto_apply_tree_widths = true`. A model with no draft
+        /// head SKIPs (nothing to tune) — the write-blind reality on public
+        /// models today, so the sweep degrades to SKIP cleanly.
+        #[arg(long)]
+        tree_widths: bool,
+        /// Repeats per candidate for the tree-width sweep (median picks the
+        /// winner).
+        #[arg(long, default_value_t = 3)]
+        tree_widths_repeats: u32,
         /// Chunked-parallel SSM (DeltaNet) prefill A/B sweep: measure
         /// prefill tok/s with the chunked path off vs on and pick the
         /// faster arm. Hybrid models only; a non-hybrid model records
@@ -1271,6 +1286,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             moe_placement,
             speculative_mtp,
             speculative_mtp_repeats,
+            tree_widths,
+            tree_widths_repeats,
             ssm_prefill_chunked,
             ssm_prefill_chunked_repeats,
             decision_calibrate,
@@ -1348,6 +1365,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 flash_v3_kv_tile,
                 moe_placement,
                 speculative_mtp,
+                tree_widths,
                 ssm_prefill_chunked,
                 decision_calibrate,
                 per_device_perf,
@@ -1365,7 +1383,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     "tune: --placement / --batch-size / --threads / --kv-dtype / \
                      --flash-attention / --kv-layout / --flash-kv-min / \
                      --prefix-snapshots / --kv-page-size / --flash-v3-kv-tile / \
-                     --moe-placement / --speculative-mtp / --ssm-prefill-chunked / \
+                     --moe-placement / --speculative-mtp / --tree-widths / \
+                     --ssm-prefill-chunked / \
                      --decision-calibrate / --per-device-perf / --validate-kernels / \
                      --dev-attn / --moe-vram-margin / --cacheblend / --all are exclusive; \
                      pick at most one"
@@ -1485,6 +1504,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if speculative_mtp {
                 return cmd_tune_speculative_mtp(&config_path, model, speculative_mtp_repeats);
+            }
+            if tree_widths {
+                return cmd_tune_tree_widths(&config_path, model, tree_widths_repeats);
             }
             if ssm_prefill_chunked {
                 return cmd_tune_ssm_prefill_chunked(
@@ -6883,6 +6905,106 @@ fn cmd_tune_speculative_mtp(
     Ok(())
 }
 
+/// Sweep tree-structured MTP speculation across per-depth branching-WIDTH
+/// candidate vectors by measured EFFECTIVE decode tok/s; pick the best + persist
+/// it under `winner_tree_widths`. Loads the model once and drains the tree-spec
+/// stream per candidate (accept rate is reported, tok/s decides).
+///
+/// Gate: a model with no MTP/NextN draft head can't run tree spec, so the sweep
+/// SKIPs — prints a SKIP line and writes NO winner (the config default stays in
+/// force; nothing to tune). This is the write-blind reality on every publicly
+/// available GGUF (no small MTP-head model exists), so the stage must degrade to
+/// SKIP cleanly rather than error. Auto-applied on next load when
+/// `[tuning].auto_apply_tree_widths = true`.
+fn cmd_tune_tree_widths(
+    config_path: &std::path::Path,
+    model_override: Option<String>,
+    repeats: u32,
+) -> anyhow::Result<()> {
+    use rustllama_engine::measurement::{measure_tree_widths, MeasurementConfig};
+
+    let cfg = rustllama_config::load(config_path).unwrap_or_default();
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
+    if repeats == 0 {
+        anyhow::bail!("--tree-widths-repeats must be >= 1");
+    }
+
+    let (k, _) = cfg.inference.resolved_kv_dtypes();
+    let m_cfg = MeasurementConfig {
+        kv_dtype: parse_kv_dtype(k)?,
+        kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
+        flash_attention: cfg.inference.flash_attention,
+        n_gpu_layers: cfg.inference.n_gpu_layers,
+    };
+
+    // Candidate grid: a small, fixed set covering shallow-narrow → deeper/wider
+    // caterpillar shapes, PLUS whatever `[inference].speculative_tree_widths` is
+    // configured to, so the configured value always competes. Deduped,
+    // order-preserving (the configured default is appended only if novel).
+    let mut candidates: Vec<Vec<u32>> = vec![
+        vec![2],
+        vec![2, 2],
+        vec![2, 2, 2],
+        vec![4, 2],
+        vec![2, 2, 2, 2],
+        vec![4, 4, 2],
+    ];
+    let configured = cfg.inference.speculative_tree_widths.clone();
+    if !configured.is_empty() && !candidates.contains(&configured) {
+        candidates.push(configured);
+    }
+
+    println!("rustllama tune --tree-widths");
+    println!("  model      = {}", model_path.display());
+    println!("  repeats    = {repeats} (median per candidate)");
+    println!("  candidates = {candidates:?}");
+    println!();
+
+    let report = measure_tree_widths(&model_path, &m_cfg, &candidates, repeats as usize)
+        .map_err(|e| anyhow::anyhow!("tree-widths measurement failed: {e}"))?;
+
+    // SKIP cleanly on a non-tree-capable model. Unlike the MTP A/B (which records
+    // Some(false)), there is no "off" width vector to persist — leaving the
+    // winner unset means the config default is used, so the sweep writes nothing.
+    if !report.capable {
+        println!("  skipped: model carries no MTP/NextN draft head (tree spec inert)");
+        return Ok(());
+    }
+
+    let fmt_tps = |t: Option<f64>| {
+        t.map(|v| format!("{v:.2} tps")).unwrap_or_else(|| "—".to_string())
+    };
+    let fmt_acc = |a: Option<f64>| {
+        a.map(|v| format!("{:.0}%", v * 100.0)).unwrap_or_else(|| "—".to_string())
+    };
+    println!("  {:>14}  {:>12}  {:>8}", "widths", "decode tps", "accept");
+    for c in &report.candidates {
+        println!(
+            "  {:>14}  {:>12}  {:>8}",
+            format!("{:?}", c.widths),
+            fmt_tps(c.tok_s),
+            fmt_acc(c.accept),
+        );
+    }
+    if let Some(err) = report.error.as_ref() {
+        println!("  note: {err}");
+    }
+    println!();
+
+    // Winner = the candidate with the best measured effective tok/s (ties broken
+    // deterministically toward the smaller tree — see `pick_tree_widths`).
+    match rustllama_tuner::pick_tree_widths(&report.candidates) {
+        Some(winner) => {
+            println!("  → pick: speculative_tree_widths = {winner:?}");
+            if let Err(e) = persist_tree_widths_winner(&winner) {
+                tracing::warn!(error = %e, "failed to persist tree_widths winner");
+            }
+        }
+        None => println!("  → no candidate completed; falling back to config value"),
+    }
+    Ok(())
+}
+
 /// A/B the chunked-parallel SSM (DeltaNet) prefill path by measured
 /// prefill tok/s. Loads the model once and toggles the
 /// `RUSTLLAMA_SSM_PREFILL_CHUNKED` env var (read per-forward) between
@@ -7772,6 +7894,15 @@ fn cmd_tune_all(
         .as_ref()
         .map(|t| t.speculative_mtp.is_some())
         .unwrap_or(false);
+    // Tree-width winner. Unlike MTP it does NOT persist a sentinel on a
+    // non-capable model (there is no "off" width vector) — the sweep SKIPs and
+    // writes nothing — so `is_some()` is the "already tuned" probe. A SKIPped
+    // (write-blind) model therefore re-runs the stage each `tune --all`, which is
+    // a fast capability probe + clean SKIP, never an error.
+    let has_tree_widths = cached
+        .as_ref()
+        .map(|t| t.winner_tree_widths.is_some())
+        .unwrap_or(false);
     let has_ssm_prefill_chunked = cached
         .as_ref()
         .map(|t| t.ssm_prefill_chunked.is_some())
@@ -8131,6 +8262,22 @@ fn cmd_tune_all(
     }
 
     println!();
+    println!("Stage 9b/10: tree-width (branching-width tree-spec decode tok/s)");
+    println!("--------");
+    if skip(has_tree_widths) {
+        println!("(skipped: tree_widths winner already cached)");
+    } else if let Err(e) = run_tune_stage_subprocess(
+        config_path,
+        &model_clone_for_stages,
+        "--tree-widths",
+        thorough,
+        "9b (tree-width)",
+        &[],
+    ) {
+        tracing::warn!(error = %e, "stage 9b (tree-width) failed; continuing");
+    }
+
+    println!();
     println!("Stage 10/10: chunked SSM prefill (prefill tok/s)");
     println!("--------");
     if skip(has_ssm_prefill_chunked) {
@@ -8253,6 +8400,39 @@ pub fn persist_speculative_mtp_winner_to(
     let mut tuning =
         load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
     tuning.speculative_mtp = Some(v);
+    tuning.last_tuned = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| format!("{}", d.as_secs()));
+    save_cache(cache_dir, &tuning)?;
+    Ok(cache_path_for(cache_dir, key))
+}
+
+/// Persist the tree-width winner (`[inference].speculative_tree_widths`) to the
+/// tuner cache, keyed by the whole-system fingerprint like the other spec
+/// winners. Graceful no-op when no cache dir resolves.
+pub fn persist_tree_widths_winner(widths: &[u32]) -> anyhow::Result<()> {
+    let Some(cache_dir) = rustllama_tuner::default_cache_dir() else {
+        tracing::warn!("no tuner cache dir resolvable; skipping tree_widths persistence");
+        return Ok(());
+    };
+    let (key, device) = rustllama_tuner::cache_context();
+    let path = persist_tree_widths_winner_to(&cache_dir, &key, &device, widths)?;
+    println!("saved tree_widths winner to {}", path.display());
+    Ok(())
+}
+
+pub fn persist_tree_widths_winner_to(
+    cache_dir: &std::path::Path,
+    key: &str,
+    device: &rustllama_tuner::DeviceFingerprint,
+    widths: &[u32],
+) -> anyhow::Result<std::path::PathBuf> {
+    use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
+    std::fs::create_dir_all(cache_dir)?;
+    let mut tuning =
+        load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
+    tuning.winner_tree_widths = Some(widths.to_vec());
     tuning.last_tuned = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -8663,6 +8843,31 @@ pub fn speculative_mtp_from_cache_or_default_to(
         .and_then(|t| t.speculative_mtp)
 }
 
+/// The autotuned `speculative_tree_widths` winner from the tuner cache, when
+/// `[tuning].auto_apply_tree_widths` is on. `None` = untuned / no draft head
+/// (sweep SKIPped) / auto-apply off — the caller then keeps the config
+/// `[inference].speculative_tree_widths` unchanged. Mirrors
+/// `speculative_mtp_from_cache_or_default`.
+pub fn tree_widths_from_cache_or_default(auto_apply: bool) -> Option<Vec<u32>> {
+    if !auto_apply {
+        return None;
+    }
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    tree_widths_from_cache_or_default_to(&cache_dir, &key)
+}
+
+pub fn tree_widths_from_cache_or_default_to(
+    cache_dir: &std::path::Path,
+    key: &str,
+) -> Option<Vec<u32>> {
+    rustllama_tuner::load_cache(cache_dir, key)
+        .ok()
+        .flatten()
+        .and_then(|t| t.winner_tree_widths)
+        .filter(|w| !w.is_empty())
+}
+
 /// The autotuned CacheBlend recompute ratio for `model_stem` from the tuner
 /// cache, when `[tuning].auto_apply_cacheblend` is on. `Some(0.0)` means the
 /// stage ran and disabled CacheBlend; `None` means untuned (caller falls back
@@ -8986,6 +9191,16 @@ pub fn cmd_tuning_show(config_path: &std::path::Path) -> anyhow::Result<()> {
         None => {
             println!("  (none — run `rustllama tune --batch-size` to populate)")
         }
+    }
+    println!();
+    println!("speculative winners:");
+    match tuning.speculative_mtp {
+        Some(b) => println!("  speculative_mtp = {b}"),
+        None => println!("  speculative_mtp = (none — run `rustllama tune --speculative-mtp`)"),
+    }
+    match tuning.winner_tree_widths.as_ref() {
+        Some(w) => println!("  tree_widths     = {w:?}"),
+        None => println!("  tree_widths     = (none — run `rustllama tune --tree-widths`)"),
     }
     Ok(())
 }

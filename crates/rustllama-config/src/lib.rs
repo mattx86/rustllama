@@ -1146,6 +1146,15 @@ pub struct TuningConfig {
     pub auto_apply_flash_attention: bool,
     #[serde(default = "default_true_serde")]
     pub auto_apply_speculative_mtp: bool,
+    /// When `true` (default), the engine overrides
+    /// `[inference].speculative_tree_widths` with the `tune --tree-widths`
+    /// winner (the per-depth branching-width vector with the best measured
+    /// effective decode tok/s) on load. When off (or no cache entry — e.g. the
+    /// model carries no MTP/NextN draft head, so the sweep SKIPped), the config
+    /// `speculative_tree_widths` is used unchanged. Mirrors
+    /// `auto_apply_speculative_mtp`.
+    #[serde(default = "default_true_serde")]
+    pub auto_apply_tree_widths: bool,
     #[serde(default = "default_true_serde")]
     pub auto_apply_ssm_prefill_chunked: bool,
     /// When `true` (default), the engine overrides
@@ -1217,6 +1226,7 @@ impl Default for TuningConfig {
             auto_apply_kv_dtype: true,
             auto_apply_flash_attention: true,
             auto_apply_speculative_mtp: true,
+            auto_apply_tree_widths: true,
             auto_apply_ssm_prefill_chunked: true,
             auto_apply_kv_cache_layout: true,
             auto_apply_flash_kv_min: true,

@@ -450,6 +450,17 @@ pub struct TuningResult {
     /// model. Some(true)=faster with MTP, Some(false)=faster without, None=untuned.
     #[serde(default)]
     pub speculative_mtp: Option<bool>,
+    /// Autotune winner: the best per-depth branching WIDTH vector for
+    /// tree-structured MTP speculation (`[inference].speculative_tree_widths`),
+    /// picked by the `tune --tree-widths` sweep as the candidate with the highest
+    /// measured effective decode tok/s. `None` = untuned OR the model carries no
+    /// MTP/NextN draft head (tree spec inert — the sweep SKIPs and writes
+    /// nothing). Applied on load over the config default when
+    /// `[tuning].auto_apply_tree_widths` is on. Stored as the raw width vector so
+    /// it round-trips the TOML cache unchanged. `#[serde(default)]` → old caches
+    /// (which lack the key) still load, no schema-version bump.
+    #[serde(default)]
+    pub winner_tree_widths: Option<Vec<u32>>,
     /// Autotune winner: use the chunked-parallel SSM prefill scan (hybrid
     /// models). Some(true)=chunked prefill was faster, None=untuned.
     #[serde(default)]
@@ -554,6 +565,7 @@ impl TuningResult {
             moe_placement: None,
             moe_gpu_split_permille: None,
             speculative_mtp: None,
+            winner_tree_widths: None,
             ssm_prefill_chunked: None,
             decision_calibration: HashMap::new(),
             per_device_perf: HashMap::new(),
@@ -878,6 +890,83 @@ pub fn npu_perf_key(npu: &rustllama_npu::NpuInfo) -> String {
     format!("npu:{:?}:{}:{}", npu.vendor, safe_name, npu.index)
 }
 
+/// One tree-width candidate's measured result, as handed to [`pick_tree_widths`].
+///
+/// The `tune --tree-widths` sweep drives tree-structured MTP speculation once
+/// per candidate width vector and fills one of these per candidate. `tok_s` is
+/// the median EFFECTIVE decode throughput (the real objective — accepted tokens
+/// per wall-second, so a wider tree that drafts more but gets rejected more is
+/// correctly penalized); `accept` is the speculative accept rate (drafted →
+/// accepted) for that candidate — REPORTED for insight, NOT used to rank. A
+/// candidate whose measurement failed carries `tok_s == None` and is skipped by
+/// the picker.
+///
+/// The type (and the picker below) live in this toolchain-free crate so the
+/// selection logic can be unit-tested with plain `cargo test -p rustllama-tuner`
+/// — the on-device measurement itself is write-blind (no small MTP-head GGUF is
+/// public), so the DECISION logic is what the tests pin.
+#[derive(Debug, Clone)]
+pub struct TreeWidthMeasurement {
+    /// The per-depth branching width vector this result measured.
+    pub widths: Vec<u32>,
+    /// Median effective decode tok/s, or `None` if every run for this candidate
+    /// failed.
+    pub tok_s: Option<f64>,
+    /// Speculative accept rate (accepted / drafted) for this candidate, or
+    /// `None` if it could not be computed. Reported only.
+    pub accept: Option<f64>,
+}
+
+/// Pick the winning tree-width vector from a sweep's per-candidate measurements.
+///
+/// Objective: MAXIMIZE measured effective decode tok/s (`tok_s`) — the real
+/// end-to-end speed the user feels, already net of wasted verify compute on
+/// rejected branches. Candidates whose measurement failed (`tok_s == None`) are
+/// ignored. Returns `None` when NO candidate produced a measurement (the caller
+/// then leaves the config default in place).
+///
+/// Ties are broken DETERMINISTICALLY so the same inputs always yield the same
+/// winner regardless of candidate ordering or sub-noise-floor tok/s wobble: when
+/// two candidates are within [`TREE_WIDTHS_TPS_EPS`] tok/s of each other, prefer
+/// the SMALLER tree (fewer total nodes = `sum(widths)` = less verify compute and
+/// KV footprint per round), and if still tied prefer the candidate that appears
+/// EARLIER in the input slice. A strictly faster candidate (beyond the epsilon)
+/// always wins outright — the tie-break only decides a statistical dead heat.
+pub fn pick_tree_widths(candidates: &[TreeWidthMeasurement]) -> Option<Vec<u32>> {
+    let mut best: Option<(&TreeWidthMeasurement, f64, u32)> = None; // (cand, tok_s, node_sum)
+    for cand in candidates {
+        let Some(tps) = cand.tok_s else { continue };
+        let nodes: u32 = cand.widths.iter().copied().sum();
+        best = Some(match best {
+            None => (cand, tps, nodes),
+            Some((b_cand, b_tps, b_nodes)) => {
+                if tps > b_tps + TREE_WIDTHS_TPS_EPS {
+                    // Strictly faster → new winner.
+                    (cand, tps, nodes)
+                } else if tps + TREE_WIDTHS_TPS_EPS < b_tps {
+                    // Strictly slower → keep the incumbent.
+                    (b_cand, b_tps, b_nodes)
+                } else if nodes < b_nodes {
+                    // Dead heat on tok/s → prefer the cheaper (smaller) tree.
+                    (cand, tps, nodes)
+                } else {
+                    // Dead heat AND not smaller → keep the earlier candidate
+                    // (iteration order == input order, so this is stable).
+                    (b_cand, b_tps, b_nodes)
+                }
+            }
+        });
+    }
+    best.map(|(c, _, _)| c.widths.clone())
+}
+
+/// Tok/s dead-heat threshold for [`pick_tree_widths`]'s tie-break. Two
+/// candidates within this of each other are treated as equal and decided by the
+/// deterministic smaller-tree / earlier-index rule rather than by measurement
+/// noise. Small but non-zero so bit-identical floats and sub-noise wobble both
+/// resolve the same way.
+pub const TREE_WIDTHS_TPS_EPS: f64 = 1e-6;
+
 /// FNV-1a 64-bit — deterministic across processes (unlike `DefaultHasher`,
 /// whose seed is randomized), so the system-fingerprint slug is stable.
 fn fnv1a(s: &str) -> u64 {
@@ -982,6 +1071,84 @@ mod tests {
         assert_eq!(tuned_q4k_usm_lws(&back, 1536, 1536), Some(64));
         assert_eq!(tuned_q4k_usm_lws(&back, 8960, 1536), Some(128));
         assert_eq!(tuned_q4k_usm_lws(&back, 256, 1536), Some(32));
+    }
+
+    #[test]
+    fn pick_tree_widths_maximizes_tok_s() {
+        // The picker's whole job: return the candidate with the highest measured
+        // effective decode tok/s. `[4, 2]` is fastest here, so it wins outright.
+        let cands = vec![
+            TreeWidthMeasurement { widths: vec![2], tok_s: Some(10.0), accept: Some(0.5) },
+            TreeWidthMeasurement { widths: vec![2, 2], tok_s: Some(12.0), accept: Some(0.6) },
+            TreeWidthMeasurement { widths: vec![4, 2], tok_s: Some(15.0), accept: Some(0.55) },
+            TreeWidthMeasurement { widths: vec![2, 2, 2, 2], tok_s: Some(11.0), accept: Some(0.7) },
+        ];
+        assert_eq!(pick_tree_widths(&cands), Some(vec![4, 2]));
+    }
+
+    #[test]
+    fn pick_tree_widths_skips_failed_and_handles_empty() {
+        // A failed measurement (`tok_s == None`) is ignored, even if it would
+        // otherwise be "first". With every candidate failed the picker yields
+        // None (caller keeps the config default).
+        let cands = vec![
+            TreeWidthMeasurement { widths: vec![2], tok_s: None, accept: None },
+            TreeWidthMeasurement { widths: vec![2, 2], tok_s: Some(9.5), accept: Some(0.4) },
+        ];
+        assert_eq!(pick_tree_widths(&cands), Some(vec![2, 2]));
+
+        let all_failed = vec![
+            TreeWidthMeasurement { widths: vec![2], tok_s: None, accept: None },
+            TreeWidthMeasurement { widths: vec![4, 2], tok_s: None, accept: None },
+        ];
+        assert_eq!(pick_tree_widths(&all_failed), None);
+        assert_eq!(pick_tree_widths(&[]), None);
+    }
+
+    #[test]
+    fn pick_tree_widths_breaks_ties_deterministically() {
+        // Dead heat on tok/s (identical values): the tie-break prefers the
+        // SMALLER tree (fewer total nodes). `[2,2]` (sum 4) beats `[4,2,2]`
+        // (sum 8) despite appearing later — a hand-checkable, order-independent
+        // outcome.
+        let cands = vec![
+            TreeWidthMeasurement { widths: vec![4, 2, 2], tok_s: Some(13.0), accept: Some(0.6) },
+            TreeWidthMeasurement { widths: vec![2, 2], tok_s: Some(13.0), accept: Some(0.5) },
+        ];
+        assert_eq!(pick_tree_widths(&cands), Some(vec![2, 2]));
+
+        // Equal tok/s AND equal node sum → the EARLIER candidate wins (stable).
+        let equal_size = vec![
+            TreeWidthMeasurement { widths: vec![3, 1], tok_s: Some(7.0), accept: Some(0.3) },
+            TreeWidthMeasurement { widths: vec![2, 2], tok_s: Some(7.0), accept: Some(0.9) },
+        ];
+        assert_eq!(pick_tree_widths(&equal_size), Some(vec![3, 1]));
+
+        // A strictly faster (beyond-eps) candidate wins regardless of its size,
+        // so the tie-break never overrides a real speed difference.
+        let real_diff = vec![
+            TreeWidthMeasurement { widths: vec![2], tok_s: Some(10.0), accept: Some(0.5) },
+            TreeWidthMeasurement { widths: vec![4, 4, 2], tok_s: Some(20.0), accept: Some(0.8) },
+        ];
+        assert_eq!(pick_tree_widths(&real_diff), Some(vec![4, 4, 2]));
+    }
+
+    #[test]
+    fn winner_tree_widths_survives_toml_roundtrip() {
+        // The width winner must persist across process restarts like every other
+        // cached winner (serde default keeps old caches loadable).
+        let fp = DeviceFingerprint {
+            pci_id: 0x8086,
+            driver_ver: "32.0.101.7076".into(),
+            name: "Iris Xe".into(),
+            vram_mb: 0,
+        };
+        let mut r = TuningResult::empty("test-sys".to_string(), fp);
+        assert_eq!(r.winner_tree_widths, None);
+        r.winner_tree_widths = Some(vec![4, 2]);
+        let s = toml::to_string(&r).expect("toml encode");
+        let back: TuningResult = toml::from_str(&s).expect("toml decode");
+        assert_eq!(back.winner_tree_widths, Some(vec![4, 2]));
     }
 
     #[test]

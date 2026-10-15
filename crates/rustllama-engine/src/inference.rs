@@ -6281,10 +6281,11 @@ fn mtp_round(
 ///
 /// Requires the contiguous F32 KV backend (the tree verify + compaction are
 /// F32-contiguous); returns an error otherwise so the caller falls back. Default
-/// sampling penalties are a no-op; non-default penalties are applied to the
-/// root decision only (the per-node path penalties are a refinement — a request
-/// with penalties still decodes correctly, just not token-identical to the
-/// classic penalized sampler on the deeper tree nodes).
+/// sampling penalties are a no-op; non-default repeat/frequency/presence
+/// penalties are applied BOTH to the root verified distribution AND, per node,
+/// to the drafted tree (`build_mtp_tree`), so the proposed branches respect the
+/// same penalties the sampler does (neutral penalties leave the tree
+/// byte-identical).
 #[allow(clippy::too_many_arguments)]
 fn tree_mtp_round(
     model: &LlamaModel,
@@ -6325,18 +6326,30 @@ fn tree_mtp_round(
     debug_assert_eq!(state.kv_backend.seq_len(), base_pos + 1);
 
     // Penalty history for the first speculative token = `last_ids` (== [0,
-    // base_pos)) plus the just-forwarded tip. Default penalties ⇒ no-op.
+    // base_pos)) plus the just-forwarded tip. Built ONCE and shared by the root
+    // target penalty (below) and the PER-NODE draft penalties threaded into
+    // `build_mtp_tree` — so both the verified distribution AND the proposed tree
+    // respect the same repeat/frequency/presence penalties the classic sampler
+    // does. Default penalties ⇒ empty context + a no-op everywhere (the tree is
+    // byte-identical to the pre-penalty path; the common decode stays
+    // allocation-free).
+    let recent: Vec<u32> = if penalize {
+        let mut r = state.last_ids.clone();
+        r.push(next_input as u32);
+        r
+    } else {
+        Vec::new()
+    };
     if penalize {
-        let mut recent = state.last_ids.clone();
-        recent.push(next_input as u32);
         crate::sampling::apply_all_penalties(&mut main_logits, &recent, repeat, frequency, presence);
     }
     let main_dist = softmax_to_vec(&main_logits);
 
     // --- Build the draft tree; bail to a single-token sample if empty or it
-    //     would overflow the context. ---
+    //     would overflow the context. Per-node penalties steer the drafted
+    //     branches to match the sampler (neutral ⇒ unchanged tree). ---
     let widths_usz: Vec<usize> = widths.iter().map(|&w| (w as usize).max(1)).collect();
-    let nodes = build_mtp_tree(&head_logits, &widths_usz);
+    let nodes = build_mtp_tree(&head_logits, &widths_usz, &recent, repeat, frequency, presence);
     let fits = !nodes.is_empty() && base_pos + 1 + nodes.len() <= max_ctx;
     if !fits {
         // No tree (no heads / overflow) ⇒ commit one token from target_root,
@@ -6441,9 +6454,12 @@ fn tree_mtp_round(
 ///
 /// Requires the contiguous F32 KV backend + a DeltaNet cache (the hybrid path
 /// forces contiguous F32 KV at load); returns an error otherwise so the caller
-/// falls back. Default sampling penalties are a no-op; non-default penalties are
-/// applied to the root decision only (the same deeper-node caveat the dense tree
-/// round documents).
+/// falls back. Default sampling penalties are a no-op; non-default
+/// repeat/frequency/presence penalties are applied BOTH to the root verified
+/// distribution AND, per node, to the drafted tree (`build_mtp_tree`), so the
+/// proposed branches respect the same penalties the sampler does (neutral
+/// penalties leave the tree byte-identical) — the same contract the dense
+/// [`tree_mtp_round`] documents.
 #[allow(clippy::too_many_arguments)]
 fn tree_mtp_round_hybrid(
     model: &LlamaModel,
@@ -6496,10 +6512,18 @@ fn tree_mtp_round_hybrid(
     debug_assert_eq!(state.kv_backend.seq_len(), base_pos + 1);
 
     // Penalty history for the first speculative token = `last_ids` (== [0,
-    // base_pos)) plus the just-forwarded tip. Default penalties ⇒ no-op.
+    // base_pos)) plus the just-forwarded tip. Built ONCE and shared by the root
+    // target penalty (below) and the PER-NODE draft penalties threaded into
+    // `build_mtp_tree` (same contract as the dense `tree_mtp_round`). Default
+    // penalties ⇒ empty context + a no-op everywhere (byte-identical tree).
+    let recent: Vec<u32> = if penalize {
+        let mut r = state.last_ids.clone();
+        r.push(next_input as u32);
+        r
+    } else {
+        Vec::new()
+    };
     if penalize {
-        let mut recent = state.last_ids.clone();
-        recent.push(next_input as u32);
         crate::sampling::apply_all_penalties(&mut main_logits, &recent, repeat, frequency, presence);
     }
     let main_dist = softmax_to_vec(&main_logits);
@@ -6507,9 +6531,10 @@ fn tree_mtp_round_hybrid(
     // --- Build the caterpillar; bail to a single-token sample if it is empty
     //     (no draft head / degenerate logits) or would overflow the context.
     //     Nodes occupy depth slots `base_pos + 1 + depth`, so the deepest slot
-    //     touched is `base_pos + 1 + max_depth`. ---
+    //     touched is `base_pos + 1 + max_depth`. Per-node penalties steer the
+    //     drafted branches to match the sampler (neutral ⇒ unchanged tree). ---
     let widths_usz: Vec<usize> = widths.iter().map(|&w| (w as usize).max(1)).collect();
-    let nodes = build_mtp_tree(&head_logits, &widths_usz);
+    let nodes = build_mtp_tree(&head_logits, &widths_usz, &recent, repeat, frequency, presence);
     let depths = tree_depths(&nodes);
     let max_depth = depths.iter().copied().max().unwrap_or(0) as usize;
     let fits = !nodes.is_empty() && base_pos + 1 + max_depth + 1 <= max_ctx;

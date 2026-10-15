@@ -2316,6 +2316,232 @@ pub fn measure_speculative_mtp(
     })
 }
 
+/// Outcome of [`measure_tree_widths`].
+///
+/// `capable` is `false` when the loaded model carries no MTP/NextN draft head,
+/// so tree-structured speculation is inert (a silent fall-back to classic
+/// decode) — `candidates` is then empty and the CLI SKIPs the axis, writing no
+/// winner. This is the write-blind reality on every publicly available GGUF (no
+/// small MTP-head model exists), so the sweep must degrade to this SKIP cleanly.
+///
+/// When `capable` is `true`, `candidates` holds one
+/// [`rustllama_tuner::TreeWidthMeasurement`] per swept width vector — its median
+/// EFFECTIVE decode tok/s (the objective) and its speculative accept rate
+/// (reported). The CLI feeds `candidates` to [`rustllama_tuner::pick_tree_widths`]
+/// to choose + persist the winner.
+#[derive(Debug, Clone, Default)]
+pub struct TreeWidthsReport {
+    pub capable: bool,
+    pub candidates: Vec<rustllama_tuner::TreeWidthMeasurement>,
+    pub error: Option<String>,
+}
+
+/// Measure tree-structured MTP speculation decode throughput across a set of
+/// per-depth branching-WIDTH candidate vectors, so the tuner can pick the best
+/// `[inference].speculative_tree_widths`.
+///
+/// Loads the model ONCE. Tree spec is driven directly by the `tree_widths`
+/// argument to [`CpuEngine::speculate_mtp_stream_from_ids`] (NOT a hot engine
+/// flag), so each candidate just drains that stream with its own width vector —
+/// no reload, no setter. The capability probe uses
+/// [`CpuEngine::set_tree_speculative`] + [`CpuEngine::tree_speculative`]: a model
+/// with no draft head reads back `false`, and we return `capable: false` with no
+/// measurements (the CLI SKIPs).
+///
+/// Objective = EFFECTIVE decode tok/s, timed first-yield → last-yield so prefill
+/// is excluded (comparable to the MTP sweep's ON arm) and the wall-clock already
+/// nets out tree verify + rejected-branch waste — a wider tree that drafts more
+/// but accepts less is correctly ranked lower. Accept rate is read from the
+/// engine's lifetime speculation counters (delta over the candidate's timed
+/// runs) and REPORTED alongside; it does not rank.
+///
+/// Deterministic (temp=0) synthetic decode, mirroring the MTP sweep's
+/// quick-by-default sizing.
+pub fn measure_tree_widths(
+    model_path: &Path,
+    cfg: &MeasurementConfig,
+    candidates: &[Vec<u32>],
+    repeats: usize,
+) -> Result<TreeWidthsReport, String> {
+    use futures::StreamExt;
+
+    // Same quick-by-default sizing as `measure_speculative_mtp`.
+    const PROMPT_TOKENS: u32 = 64;
+    const DECODE_TOKENS: u32 = 16;
+    let ctx_size = (PROMPT_TOKENS as usize + DECODE_TOKENS as usize + 8).max(128);
+
+    let mut cpu = CpuEngine::load_with_options_and_layout(
+        model_path,
+        ctx_size,
+        true,
+        cfg.kv_dtype,
+        &cfg.kv_cache_layout,
+    )
+    .map_err(|e| format!("load failed: {e}"))?;
+    cpu.set_prefix_cache(false);
+    cpu.set_flash_attention(cfg.flash_attention);
+    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+
+    // Capability probe: set a trivial width vector and read the EFFECTIVE getter
+    // (`tree_spec.is_some() && model_supports_tree()`). No reload needed — the
+    // capability is a property of the loaded weights. Not capable ⇒ report it and
+    // let the CLI skip the axis (the write-blind SKIP on every public model).
+    cpu.set_tree_speculative(Some(vec![2]));
+    let capable = cpu.tree_speculative();
+    cpu.set_tree_speculative(None);
+    if !capable {
+        return Ok(TreeWidthsReport {
+            capable: false,
+            ..Default::default()
+        });
+    }
+
+    let vocab = cpu.vocab_size() as i32;
+    let prompt_ids: Vec<i32> = (0..PROMPT_TOKENS as i32)
+        .map(|i| 1 + (i % vocab.max(2).saturating_sub(1)))
+        .collect();
+    let sampling = SamplingParams {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        typical_p: 1.0,
+        repeat_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        seed: 0,
+        max_tokens: DECODE_TOKENS,
+        stop: Vec::new(),
+        ..SamplingParams::default()
+    };
+
+    // Drain the tree-spec stream for one width vector and return the median
+    // effective decode tok/s + the accept rate over the timed runs. Mirrors
+    // `measure_speculative_mtp`'s `bench_mtp`, parameterized on the widths and
+    // additionally sampling the engine's cumulative speculation counters to
+    // derive this candidate's accept rate (drafted → accepted).
+    let bench_widths = |cpu: &mut CpuEngine, widths: &[u32]| -> (Option<f64>, Option<f64>, Option<String>) {
+        let tw = Some(widths.to_vec());
+        // Untimed warmup drain.
+        cpu.clear_prefix_cache();
+        match cpu.speculate_mtp_stream_from_ids(prompt_ids.clone(), sampling.clone(), tw.clone()) {
+            Ok(mut stream) => {
+                let warm = futures::executor::block_on(async {
+                    while let Some(item) = stream.next().await {
+                        if let Err(e) = item {
+                            return Err(e.to_string());
+                        }
+                    }
+                    Ok(())
+                });
+                if let Err(e) = warm {
+                    return (None, None, Some(format!("warmup failed: {e}")));
+                }
+            }
+            Err(e) => return (None, None, Some(format!("warmup stream init failed: {e}"))),
+        }
+
+        // Snapshot the lifetime speculation counters AFTER warmup so the accept
+        // rate reflects only this candidate's timed runs.
+        let spec_before = cpu.cumulative_request_stats();
+        let mut runs: Vec<f64> = Vec::with_capacity(repeats);
+        let mut last_err: Option<String> = None;
+        for _ in 0..repeats {
+            cpu.clear_prefix_cache();
+            let mut stream = match cpu.speculate_mtp_stream_from_ids(
+                prompt_ids.clone(),
+                sampling.clone(),
+                tw.clone(),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    continue;
+                }
+            };
+            let drained = futures::executor::block_on(async {
+                let mut generated = 0usize;
+                let mut t_first: Option<std::time::Instant> = None;
+                let mut t_last = std::time::Instant::now();
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(_) => {
+                            let now = std::time::Instant::now();
+                            if t_first.is_none() {
+                                t_first = Some(now);
+                            }
+                            t_last = now;
+                            generated += 1;
+                        }
+                        Err(e) => return Err(e.to_string()),
+                    }
+                }
+                Ok((generated, t_first, t_last))
+            });
+            match drained {
+                Ok((generated, Some(t_first), t_last)) if generated >= 2 => {
+                    let decode_s = (t_last - t_first).as_secs_f64();
+                    if decode_s > 0.0 {
+                        runs.push((generated - 1) as f64 / decode_s);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let spec_after = cpu.cumulative_request_stats();
+        let drafted = spec_after
+            .total_spec_drafted
+            .saturating_sub(spec_before.total_spec_drafted);
+        let accepted = spec_after
+            .total_spec_accepted
+            .saturating_sub(spec_before.total_spec_accepted);
+        let accept = if drafted > 0 {
+            Some(accepted as f64 / drafted as f64)
+        } else {
+            None
+        };
+        if runs.is_empty() {
+            return (
+                None,
+                accept,
+                Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
+            );
+        }
+        runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = if runs.len() % 2 == 1 {
+            runs[runs.len() / 2]
+        } else {
+            (runs[runs.len() / 2 - 1] + runs[runs.len() / 2]) / 2.0
+        };
+        (Some(median), accept, None)
+    };
+
+    let mut results: Vec<rustllama_tuner::TreeWidthMeasurement> = Vec::with_capacity(candidates.len());
+    let mut first_err: Option<String> = None;
+    for widths in candidates {
+        let (tok_s, accept, err) = bench_widths(&mut cpu, widths);
+        if let Some(e) = err {
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
+        results.push(rustllama_tuner::TreeWidthMeasurement {
+            widths: widths.clone(),
+            tok_s,
+            accept,
+        });
+    }
+
+    // Restore the engine's default (no tree spec).
+    cpu.set_tree_speculative(None);
+
+    Ok(TreeWidthsReport {
+        capable: true,
+        candidates: results,
+        error: first_err,
+    })
+}
+
 /// A/B the chunked-parallel SSM (DeltaNet) prefill path by measured
 /// PREFILL tok/s.
 ///

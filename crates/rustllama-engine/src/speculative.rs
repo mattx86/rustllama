@@ -1007,16 +1007,65 @@ fn argmax_and_softmax_p(logits: &[f32]) -> (usize, f32) {
 /// reduces EXACTLY to the linear [`MtpDrafter`] chain (pinned by
 /// `mtp_tree_width_one_is_a_chain`). Each node's `q` is the head's softmax
 /// probability at that candidate (the `p/q` acceptance denominator).
-pub fn build_mtp_tree(head_logits: &[Vec<f32>], widths: &[usize]) -> Vec<TreeNode> {
+///
+/// ## Per-node drafting penalties
+///
+/// `recent` + (`repeat`, `frequency`, `presence`) are the SAME repetition /
+/// frequency / presence penalties the linear sampler applies. They are applied
+/// to a COPY of each head's logit row BEFORE the top-k softmax, so the drafter
+/// proposes branches that respect the penalties the real sampler uses — raising
+/// the accept rate (the target has already penalized the same tokens, so a draft
+/// the sampler would crush to near-zero is not wastefully proposed) and
+/// steering the tree away from loops. The penalty history for the MAIN
+/// (accepted) path deepens as we descend: level `d`'s context is `recent` plus
+/// the main (penalized-argmax) token chosen at each shallower level `0..d`,
+/// mirroring the tokens that would precede this draft position on the committed
+/// path. The alternative siblings at a level share that level's context (they
+/// are competing children of the same main ancestor).
+///
+/// **Neutral = byte-identical.** When all three penalties are at their defaults
+/// (`repeat == 1.0`, `frequency == 0.0`, `presence == 0.0`) this takes the exact
+/// pre-penalty path — no clone, no context walk, `top_k_softmax` straight off
+/// the raw head logits — so the tree is bit-for-bit what it was before penalties
+/// existed (pinned by `mtp_tree_penalty_neutral_is_byte_identical`). This also
+/// keeps the common (no-penalty) decode path allocation-free, exactly like the
+/// linear [`mtp_round`](crate::inference)'s `penalize` short-circuit.
+pub fn build_mtp_tree(
+    head_logits: &[Vec<f32>],
+    widths: &[usize],
+    recent: &[u32],
+    repeat: f32,
+    frequency: f32,
+    presence: f32,
+) -> Vec<TreeNode> {
+    let penalize = repeat != 1.0 || frequency != 0.0 || presence != 0.0;
     let mut nodes: Vec<TreeNode> = Vec::new();
     // Parent for the NEXT level's nodes = this level's main (argmax) node.
     let mut main_parent: Option<usize> = None;
+    // Accumulated penalty history for the main path: `recent` plus the main
+    // token chosen at each level so far. Only materialized when penalizing
+    // (default penalties never touch it → byte-identical fast path).
+    let mut ctx: Vec<u32> = if penalize { recent.to_vec() } else { Vec::new() };
     for (d, logits) in head_logits.iter().enumerate() {
         if logits.is_empty() {
             break;
         }
         let w = widths.get(d).copied().unwrap_or(1).max(1);
-        let topk = top_k_softmax(logits, w);
+        let topk = if penalize {
+            // Penalize a COPY of this level's logits with the SAME sampler the
+            // linear path uses, then take the top-k off the penalized row. A
+            // strong repeat/frequency/presence penalty on an already-seen token
+            // demotes it below its rivals (or out of the top-k entirely), so the
+            // drafter stops proposing the loop the sampler would reject anyway
+            // (pinned by `mtp_tree_strong_repeat_demotes_seen_token`).
+            let mut penalized = logits.clone();
+            crate::sampling::apply_all_penalties(
+                &mut penalized, &ctx, repeat, frequency, presence,
+            );
+            top_k_softmax(&penalized, w)
+        } else {
+            top_k_softmax(logits, w)
+        };
         if topk.is_empty() {
             break;
         }
@@ -1024,7 +1073,13 @@ pub fn build_mtp_tree(head_logits: &[Vec<f32>], widths: &[usize]) -> Vec<TreeNod
         for (id, q) in topk {
             nodes.push(TreeNode { id, q, parent: main_parent });
         }
-        // The argmax candidate is pushed first, so the main node is level_start.
+        // The argmax (after penalties) candidate is pushed first, so the main
+        // node is `level_start`. Extend the main-path context by it for the next
+        // level's penalty — this is the token that would precede the next draft
+        // position on the accepted path.
+        if penalize {
+            ctx.push(nodes[level_start].id);
+        }
         main_parent = Some(level_start);
     }
     nodes
@@ -1149,7 +1204,8 @@ mod mtp_drafter_tests {
             vec![-1.0, -2.0, -3.0, -4.0],
         ];
         let chain = MtpDrafter::default().propose(&heads);
-        let nodes = build_mtp_tree(&heads, &[1, 1, 1]);
+        // Neutral penalties (the default-decode args).
+        let nodes = build_mtp_tree(&heads, &[1, 1, 1], &[], 1.0, 0.0, 0.0);
         assert_eq!(nodes.len(), chain.len());
         for (d, (node, draft)) in nodes.iter().zip(chain.iter()).enumerate() {
             assert_eq!(node.id, draft.id, "level {d} id");
@@ -1167,7 +1223,7 @@ mod mtp_drafter_tests {
             vec![0.0, 1.0, 0.5, -1.0], // argmax 1, runner-up 2
             vec![5.0, 0.0, 4.0, 0.0],  // argmax 0, runner-up 2
         ];
-        let nodes = build_mtp_tree(&heads, &[2, 2]);
+        let nodes = build_mtp_tree(&heads, &[2, 2], &[], 1.0, 0.0, 0.0);
         assert_eq!(nodes.len(), 4, "sum(widths) nodes");
         // Level 0: nodes 0,1 at root (parent None); node 0 is the argmax (id 1).
         assert_eq!(nodes[0].parent, None);
@@ -1179,6 +1235,72 @@ mod mtp_drafter_tests {
         assert_eq!(nodes[3].parent, Some(0));
         assert_eq!(nodes[2].id, 0, "level-1 argmax");
         assert_eq!(tree_depths(&nodes), vec![0, 0, 1, 1]);
+    }
+
+    // ---- per-node drafting penalties (Feature 4b) ----
+
+    /// THE neutral-penalty parity guard: `build_mtp_tree` with repeat=1.0,
+    /// frequency=0.0, presence=0.0 must produce the BYTE-IDENTICAL tree to the
+    /// pre-penalty path — same ids, same `q` bits, same parents — REGARDLESS of
+    /// the `recent` context passed, because neutral penalties never read it. This
+    /// pins the "default decode is unchanged" contract: the penalty threading is
+    /// invisible unless a non-default penalty is actually set.
+    #[test]
+    fn mtp_tree_penalty_neutral_is_byte_identical() {
+        let heads = vec![
+            vec![0.0, 1.0, 0.5, -1.0, 0.2],
+            vec![5.0, 0.0, 4.0, 0.0, 1.0],
+            vec![-1.0, 2.0, -3.0, 0.5, 0.0],
+        ];
+        let widths = [2usize, 2, 1];
+        // Baseline: neutral penalties, EMPTY context (the old 2-arg behavior).
+        let baseline = build_mtp_tree(&heads, &widths, &[], 1.0, 0.0, 0.0);
+        // Same call but with a NON-empty recent context that INCLUDES tokens the
+        // tree drafts (1, 2, 0, …). Neutral penalties must ignore it entirely, so
+        // the tree is identical bit-for-bit.
+        let seen = [1u32, 2, 0, 3, 1, 2];
+        let with_ctx = build_mtp_tree(&heads, &widths, &seen, 1.0, 0.0, 0.0);
+        assert_eq!(baseline.len(), with_ctx.len());
+        for (a, b) in baseline.iter().zip(with_ctx.iter()) {
+            assert_eq!(a.id, b.id, "neutral: id must match");
+            // Bit-exact on q — neutral penalties mean the SAME softmax inputs, so
+            // not merely approximately-equal but identical float bits.
+            assert_eq!(a.q.to_bits(), b.q.to_bits(), "neutral: q bits must match");
+            assert_eq!(a.parent, b.parent, "neutral: parent must match");
+        }
+        // And it is genuinely the pre-penalty tree (argmax-first caterpillar).
+        assert_eq!(baseline[0].id, 1, "level-0 argmax");
+        assert_eq!(baseline[2].parent, Some(0), "level-1 hangs off the main node");
+    }
+
+    /// A strong repetition penalty on an already-seen token demotes it from the
+    /// drafted node set — deterministic + hand-checkable. Without penalties the
+    /// level-0 argmax is token 1 (highest logit). Token 1 appears in `recent`, so
+    /// a large repeat penalty divides its (positive) logit down below token 2's,
+    /// flipping the drafted main node from 1 to 2 and evicting 1 from a width-1
+    /// top-k.
+    #[test]
+    fn mtp_tree_strong_repeat_demotes_seen_token() {
+        // Level 0 logits: token 1 is the clear argmax (2.0), token 2 next (1.5).
+        let heads = vec![vec![0.0f32, 2.0, 1.5, -1.0]];
+        // No penalty: argmax token 1 is drafted (and it's the only node at w=1).
+        let plain = build_mtp_tree(&heads, &[1], &[], 1.0, 0.0, 0.0);
+        assert_eq!(plain[0].id, 1, "without penalties the argmax (1) is drafted");
+
+        // Token 1 was recently generated; a strong repeat penalty (4.0) divides
+        // its +2.0 logit to 0.5, dropping it below token 2's untouched 1.5. With
+        // width 1 the drafter now proposes token 2, NOT the looping token 1.
+        let seen = [1u32];
+        let penalized = build_mtp_tree(&heads, &[1], &seen, 4.0, 0.0, 0.0);
+        assert_eq!(penalized.len(), 1);
+        assert_ne!(penalized[0].id, 1, "the seen token must be demoted out of the draft");
+        assert_eq!(penalized[0].id, 2, "the drafter picks the next-best unseen token");
+
+        // At width 2 the seen token may still appear as a non-main sibling, but it
+        // must NOT be the main (first/argmax) node — that governs the accepted
+        // path, and demoting it there is the point.
+        let w2 = build_mtp_tree(&heads, &[2], &seen, 4.0, 0.0, 0.0);
+        assert_eq!(w2[0].id, 2, "penalized argmax (main node) is the unseen token");
     }
 
     #[test]

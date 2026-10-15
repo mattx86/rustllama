@@ -2623,14 +2623,33 @@ async fn load_model(
     }
     cpu.set_mtp_speculative(applied_mtp);
     // Tree-structured MTP speculation (Feature 4): enabled from the config flag;
-    // a no-op fallback on models without MTP heads / on the hybrid path.
+    // a no-op fallback on models without MTP heads / on the hybrid path. The
+    // per-depth branching WIDTHS honor the `tune --tree-widths` winner (gated by
+    // [tuning].auto_apply_tree_widths) over the config default, mirroring the
+    // speculative_mtp auto-apply above. A non-capable model (sweep SKIPped → no
+    // cached winner) falls back to the config value, which the engine then
+    // ignores anyway (no draft head ⇒ classic decode).
     if cfg_for_tuning.inference.speculative_tree {
+        let applied_widths = if cfg_for_tuning.tuning.auto_apply_tree_widths {
+            tuner_cached_tree_widths()
+                .unwrap_or_else(|| cfg_for_tuning.inference.speculative_tree_widths.clone())
+        } else {
+            cfg_for_tuning.inference.speculative_tree_widths.clone()
+        };
+        if applied_widths != cfg_for_tuning.inference.speculative_tree_widths {
+            tracing::info!(
+                model = %model_key,
+                configured = ?cfg_for_tuning.inference.speculative_tree_widths,
+                applied = ?applied_widths,
+                "load_model: applied tuner tree_widths winner"
+            );
+        }
         tracing::info!(
             model = %model_key,
-            widths = ?cfg_for_tuning.inference.speculative_tree_widths,
+            widths = ?applied_widths,
             "load_model: tree-structured MTP speculation enabled (non-hybrid MTP heads only)"
         );
-        cpu.set_tree_speculative(Some(cfg_for_tuning.inference.speculative_tree_widths.clone()));
+        cpu.set_tree_speculative(Some(applied_widths));
     }
     let model_id = cpu.model_id().to_string();
     let cpu = Arc::new(cpu);
@@ -3758,6 +3777,18 @@ fn tuner_cached_speculative_mtp() -> Option<bool> {
     let key = rustllama_tuner::system_fingerprint();
     let tuning = rustllama_tuner::load_cache(&cache_dir, &key).ok()??;
     tuning.speculative_mtp
+}
+
+/// Look up the cached tree-width winner (`[inference].speculative_tree_widths`)
+/// for this system. `None` on cache miss, an unresolvable cache dir, or an
+/// empty/absent winner (non-capable model whose `tune --tree-widths` SKIPped) —
+/// the caller then falls back to the config value. Mirrors
+/// `tuner_cached_speculative_mtp`.
+fn tuner_cached_tree_widths() -> Option<Vec<u32>> {
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    let tuning = rustllama_tuner::load_cache(&cache_dir, &key).ok()??;
+    tuning.winner_tree_widths.filter(|w| !w.is_empty())
 }
 
 // --- additional tuner-cache siblings (mirror the CLI serve load path) --------
