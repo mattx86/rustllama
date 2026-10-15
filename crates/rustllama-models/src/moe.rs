@@ -530,11 +530,18 @@ pub fn moe_ffn_one_into(
             }
             None => 1.0,
         };
-        // Shared FFN width = w_gate_shared rows. Equals d_ff for
-        // DeepSeek-V3 (reuse the routed-expert scratch); wider for
-        // Qwen2-MoE, where the d_ff-sized scratch would overflow, so
-        // allocate per-call shared buffers.
-        let shared_d_ff = w_g.shape.first().copied().unwrap_or(d_ff as u64) as usize;
+        // Shared FFN width = the gate weight's OUTPUT dim. A gate weight
+        // [out, in] is stored in GGUF with dims = [in = d_model, out =
+        // shared_d_ff] (ne[0] is the contraction/input dim — the same order
+        // the routed + dense matvecs assume, e.g. `matvec_tensor(w, x, out,
+        // m = d_ff, k = d_model)`). So `shape.first()` is d_model, NOT the
+        // width — using it mis-sized the shared expert to d_model (half the
+        // real width on the synth DeepSeek shape: 64 vs 128) and tripped the
+        // `w.len() == m*k` assert in the down matvec. Derive the width from
+        // element_count / d_model instead: correct regardless of dim order,
+        // and for both DeepSeek-V3 (width == d_ff) and Qwen2-MoE (wider shared
+        // FFN, which then takes the per-call-buffer branch below).
+        let shared_d_ff = (w_g.element_count() / (d_model as u64).max(1)).max(1) as usize;
         if shared_d_ff <= d_ff {
             crate::llama_arch::matvec_tensor_gate_up_fused_dispatch(
                 w_g,
