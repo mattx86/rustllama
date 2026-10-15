@@ -1284,6 +1284,22 @@ impl CpuEngine {
         } else {
             kv_dtype
         };
+        // Gemma2 attention-logit soft-capping (`s = c·tanh(s/c)` on every
+        // attention score, before softmax) is applied only in the F32 contiguous
+        // CPU attention kernels today — the quant-KV + paged + GPU flash paths
+        // carry no softcap arg, so a capping model is coerced to f32 contiguous
+        // KV for numerical correctness (the output is WRONG without the cap).
+        // Non-capping models (the common case) are untouched.
+        let kv_dtype = if model.cfg.attn_logit_softcapping.is_some() && kv_dtype != KvDtype::F32 {
+            tracing::warn!(
+                requested = ?kv_dtype,
+                "attention-softcap model (Gemma2): defaulting KV cache to f32 (the \
+                 soft-capping attention kernels are f32-only)"
+            );
+            KvDtype::F32
+        } else {
+            kv_dtype
+        };
         let kv_layout: &str = if model.weights.is_hybrid() && kv_layout != "contiguous" {
             tracing::warn!(
                 requested = %kv_layout,
@@ -1296,6 +1312,13 @@ impl CpuEngine {
                 requested = %kv_layout,
                 "sliding-window model: coercing to contiguous KV (paged SWA \
                  masking is not yet wired)"
+            );
+            "contiguous"
+        } else if model.cfg.attn_logit_softcapping.is_some() && kv_layout != "contiguous" {
+            tracing::warn!(
+                requested = %kv_layout,
+                "attention-softcap model (Gemma2): coercing to contiguous KV \
+                 (the paged attention path carries no softcap arg)"
             );
             "contiguous"
         } else {

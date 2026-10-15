@@ -6995,7 +6995,13 @@ impl LlamaModel {
                                 // GPU hook has no window arg so SWA uses the CPU
                                 // windowed kernel.
                                 let swa_win = self.cfg.swa_window(li);
+                                // Gemma2 attention-logit soft-cap (0.0 ⇒ no cap).
+                                // The GPU hook carries no softcap arg either, so a
+                                // capping model declines it and takes the capped
+                                // CPU kernel (fail-closed, never skip the cap).
+                                let softcap = self.cfg.attn_logit_softcapping.unwrap_or(0.0);
                                 let used_gpu = swa_win == 0
+                                    && softcap == 0.0
                                     && crate::accel::try_flash_attn_prefill_gpu_f32(
                                         &hoist_qrows[..nb * d_q], k, v,
                                         &mut hoist_attn_out[..nb * d_q],
@@ -7003,11 +7009,11 @@ impl LlamaModel {
                                         kv_len_base, nb,
                                     );
                                 if !used_gpu {
-                                    k::gqa_attention_flash_prefill_windowed(
+                                    k::gqa_attention_flash_prefill_capped_windowed(
                                         &hoist_qrows[..nb * d_q], k, v,
                                         &mut hoist_attn_out[..nb * d_q],
                                         n_heads, n_kv_heads, head_dim, max_ctx,
-                                        kv_len_base, nb, swa_win,
+                                        kv_len_base, nb, swa_win, softcap,
                                     );
                                 }
                             }
@@ -7770,7 +7776,15 @@ impl LlamaModel {
             // below, which applies it. Non-scaled + linear/NTK keep the device
             // blocks, fed `self.rope_inv_freq` — the scaled table, byte-identical
             // to the base table when the model carries no scaling.
-            let device_attn = if self.yarn_mscale == 1.0 {
+            //
+            // Gemma2 attention-logit soft-capping is likewise a no-go for the
+            // device blocks: they fuse the Q·K score on-device and apply neither
+            // the YaRN mscale nor the `s = c*tanh(s/c)` cap, so a capping model
+            // must fall to the software path below (which runs the capped CPU
+            // kernels). Fail-closed — never silently skip the cap.
+            let device_attn = if self.yarn_mscale == 1.0
+                && self.cfg.attn_logit_softcapping.is_none()
+            {
                 if let KvLayer::F32 { k, v } = &mut kv.layers[layer_idx] {
                     // Feature 1b: PREFER the CUDA-GRAPH block — it captures this
                     // layer's whole device chain into a cudaGraph and replays it
@@ -8084,19 +8098,23 @@ impl LlamaModel {
                     // to the GPU. The kernel reads them in place.
                     // Returns true if the kernel ran; false falls
                     // through to the CPU flash/standard path below.
-                    let gpu_handled = crate::accel::try_flash_attn_decode_gpu_f32(
-                        &q_buf,
-                        &k_buf,
-                        &v_buf,
-                        &mut attn_out,
-                        layer_idx,
-                        cur_pos as u32,
-                        n_heads as u32,
-                        n_kv_heads as u32,
-                        head_dim as u32,
-                        max_ctx as u32,
-                        cfg.n_layers as u32,
-                    );
+                    // Gemma2 attention-logit soft-capping has no softcap arg in
+                    // the GPU flash kernel, so a capping model declines the GPU
+                    // hook and takes the capped CPU kernel below (fail-closed).
+                    let gpu_handled = cfg.attn_logit_softcapping.is_none()
+                        && crate::accel::try_flash_attn_decode_gpu_f32(
+                            &q_buf,
+                            &k_buf,
+                            &v_buf,
+                            &mut attn_out,
+                            layer_idx,
+                            cur_pos as u32,
+                            n_heads as u32,
+                            n_kv_heads as u32,
+                            head_dim as u32,
+                            max_ctx as u32,
+                            cfg.n_layers as u32,
+                        );
                     if gpu_handled {
                         // attn_out already populated by the SYCL
                         // kernel; skip CPU flash + standard paths.
@@ -8124,8 +8142,12 @@ impl LlamaModel {
                     // Sliding-window span for this layer (0 ⇒ full attention,
                     // bit-identical to a non-SWA model).
                     let swa_win = cfg.swa_window(layer_idx);
+                    // Gemma2 attention-logit soft-cap for every layer (0.0 ⇒ no
+                    // cap, bit-identical). Threaded alongside the SWA window into
+                    // the fused capped+windowed kernel.
+                    let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
                     if crate::accel::flash_attention_enabled() && kv_len >= flash_min {
-                        k::gqa_attention_flash_decode_windowed(
+                        k::gqa_attention_flash_decode_capped_windowed(
                             &q_buf,
                             k,
                             v,
@@ -8136,9 +8158,10 @@ impl LlamaModel {
                             max_ctx,
                             kv_len,
                             swa_win,
+                            softcap,
                         );
                     } else {
-                        k::gqa_attention_one_step_windowed(
+                        k::gqa_attention_one_step_capped_windowed(
                             &q_buf,
                             k,
                             v,
@@ -8149,6 +8172,7 @@ impl LlamaModel {
                             max_ctx,
                             kv_len,
                             swa_win,
+                            softcap,
                         );
                     }
                     } // end `else` block for non-USM CPU attention
@@ -10462,6 +10486,10 @@ impl LlamaModel {
                         // The GPU prefill hook has no window arg, so SWA layers
                         // skip it and take the windowed CPU kernel.
                         let swa_win = cfg.swa_window(layer_idx);
+                        // Gemma2 attention-logit soft-cap (0.0 ⇒ no cap). The GPU
+                        // hook carries no softcap arg, so a capping model also
+                        // skips it and takes the capped CPU kernel (fail-closed).
+                        let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
                         // GPU prefill attention via SYCL — falls back
                         // to the CPU path below if USM is disabled, the
                         // GPU is unavailable, or any sanity check fails.
@@ -10469,6 +10497,7 @@ impl LlamaModel {
                         // kernel, copy out — see `try_flash_attn_prefill_usm_f32`
                         // for the layout contract.
                         let used_gpu = swa_win == 0
+                            && softcap == 0.0
                             && crate::accel::try_flash_attn_prefill_gpu_f32(
                                 &q_buf,
                                 k,
@@ -10482,7 +10511,7 @@ impl LlamaModel {
                                 n_new,
                             );
                         if !used_gpu {
-                            k::gqa_attention_flash_prefill_windowed(
+                            k::gqa_attention_flash_prefill_capped_windowed(
                                 &q_buf,
                                 k,
                                 v,
@@ -10494,6 +10523,7 @@ impl LlamaModel {
                                 kv_len_base,
                                 n_new,
                                 swa_win,
+                                softcap,
                             );
                         }
                     }
