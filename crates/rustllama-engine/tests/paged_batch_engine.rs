@@ -314,16 +314,17 @@ async fn paged_batch_streaming_two_concurrent_submits_each_matches_reference() {
     let _ = std::fs::remove_file(&tmp);
 }
 
-/// Feature 3b identity + ragged-driver end-to-end: with the batched-token
-/// budget ON (`load_with_batched_tokens`, ragged mixed prefill+decode) the
-/// generated tokens are IDENTICAL to the budget-0 inline path (pre-3b). The two
-/// engines run the same two concurrent prompts under greedy sampling; the
-/// budget-0 engine is the known-good reference (inline prefill +
-/// `forward_decode_paged_batched_f32`), the budgeted engine routes every tick
-/// through `forward_ragged_paged_f32`. Prompts are longer than the budget so
-/// the ragged path actually chunks the prefill across multiple ticks before
-/// steady-state decode. Byte-identical token streams ⇒ (a) budget-0 reproduces
-/// pre-3b and (b) the ragged fusion changed no output.
+/// Ragged-driver identity across budgets: a SMALL finite batched-token budget
+/// (which chunks the prefill across several ticks) produces token streams
+/// IDENTICAL to an unbounded budget (which prefills the whole prompt in one
+/// ragged tick). Both engines run the same two concurrent prompts under greedy
+/// sampling and route every tick through the single ragged forward
+/// (`forward_ragged_paged_f32`) — T1 made ragged the only driver path. The
+/// budget-0 engine resolves to `usize::MAX` (unbounded, one-shot prefill) and
+/// is the known-good reference; the budget-2 engine chunks the prefill since
+/// the prompts are longer than the budget. Byte-identical token streams ⇒ the
+/// per-tick prefill chunking changes no output (only a one-tick latency shift
+/// on drain).
 #[tokio::test]
 async fn paged_batch_ragged_budget_matches_inline_budget_zero() {
     let tmp = write_gguf("ragged-vs-inline");
@@ -360,13 +361,14 @@ async fn paged_batch_ragged_budget_matches_inline_budget_zero() {
         futures::future::join(ca, cb).await
     }
 
-    // Budget 0 = inline prefill + batched decode (pre-3b reference).
+    // Budget 0 ⇒ usize::MAX = unbounded ragged prefill (whole prompt in one
+    // tick); the known-good reference.
     let inline = PagedBatchEngine::load_with_batched_tokens(&tmp, 32, 2, 0).expect("inline load");
     let (in_a, in_b) = run_pair(&inline, prompt_a.clone(), prompt_b.clone(), n_tokens).await;
     drop(inline);
 
-    // Budget > 0 = ragged mixed prefill+decode. Budget 2 < suffix len 5 forces
-    // multi-tick chunked prefill before decode.
+    // Budget 2 < suffix len 5 ⇒ the ragged path chunks the prefill across
+    // multiple ticks before steady-state decode.
     let ragged = PagedBatchEngine::load_with_batched_tokens(&tmp, 32, 2, 2).expect("ragged load");
     let (rg_a, rg_b) = run_pair(&ragged, prompt_a.clone(), prompt_b.clone(), n_tokens).await;
     drop(ragged);
@@ -380,6 +382,49 @@ async fn paged_batch_ragged_budget_matches_inline_budget_zero() {
     assert_eq!(
         in_b, rg_b,
         "ragged (budget>0) slot B diverged from inline (budget=0): ragged={rg_b:?} inline={in_b:?}"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// T1 explicit: an UNBOUNDED budget (`usize::MAX`, what
+/// `resolve_max_batched_tokens` maps 0 / unset to) prefills the whole prompt in
+/// ONE ragged tick, and must produce the same tokens as a SMALL finite budget
+/// that chunks the same prompt across several ticks. There is one execution
+/// path (the ragged forward); only the per-tick prefill chunking differs. Short
+/// single-slot prompt, greedy — one tick either way vs multi-tick.
+#[tokio::test]
+async fn paged_batch_ragged_unbounded_budget_matches_small_finite() {
+    use futures::StreamExt;
+    let tmp = write_gguf("ragged-unbounded-vs-finite");
+    let prompt: Vec<i32> = vec![3, 1, 4, 1, 5, 9, 2];
+    let n_tokens = 4u32;
+
+    async fn run_one(engine: &PagedBatchEngine, p: Vec<i32>, n: u32) -> Vec<i32> {
+        let mut s = engine.submit_streaming(p, greedy(n)).expect("submit");
+        let mut out = Vec::new();
+        while let Some(item) = s.next().await {
+            out.push(item.expect("tok").id as i32);
+        }
+        out
+    }
+
+    // Budget 0 ⇒ usize::MAX (unbounded, one-shot ragged prefill).
+    let unbounded =
+        PagedBatchEngine::load_with_batched_tokens(&tmp, 32, 1, 0).expect("unbounded load");
+    let out_unbounded = run_one(&unbounded, prompt.clone(), n_tokens).await;
+    drop(unbounded);
+
+    // Budget 2 < prompt len ⇒ the ragged path chunks the prefill over ticks.
+    let finite =
+        PagedBatchEngine::load_with_batched_tokens(&tmp, 32, 1, 2).expect("finite load");
+    let out_finite = run_one(&finite, prompt.clone(), n_tokens).await;
+    drop(finite);
+
+    assert_eq!(out_unbounded.len(), n_tokens as usize, "unbounded token count");
+    assert_eq!(
+        out_unbounded, out_finite,
+        "unbounded (usize::MAX) budget diverged from a small finite budget: \
+         unbounded={out_unbounded:?} finite={out_finite:?}"
     );
     let _ = std::fs::remove_file(&tmp);
 }
