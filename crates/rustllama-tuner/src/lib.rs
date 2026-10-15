@@ -247,6 +247,21 @@ pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK_SYCL: &str = "attn:dev_resident_block_
 /// PERF-only verdict. Read by `accel::dev_attn_cuda_graph_enabled`; at dispatch
 /// the graph path is preferred over the eager CUDA block when ON (f32-KV-only).
 pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK_CUDA_GRAPH: &str = "attn:dev_resident_block_cuda_graph";
+/// Apple-Metal/MLX twin of [`VERDICT_ATTN_DEV_RESIDENT_BLOCK`] (Feature 1c) —
+/// the #2 on-device activation-residency DECODE attention block encoded into ONE
+/// Metal command buffer with ONE compute encoder (rmsnorm→qkv→rope→KV-mirror
+/// write→flash→o→residual+norm), committed with a SINGLE `waitUntilCompleted`
+/// instead of the per-op commit+wait flood. Separate verdict because the win/loss
+/// profile is per-backend: the Metal block collapses the per-op command-buffer
+/// submit+sync overhead on the unified-memory Apple GPU (no PCIe transfer like
+/// CUDA, no in-order-queue submit like SYCL). Same PERF-only semantics — the
+/// block is bit-exact f32 end to end (the KV mirror is F32 on Metal, so there is
+/// no f16 round-trip at all), correctness validated by `doctor --metal-parity`
+/// (`attn:dev_resident_block_mlx`), so `tune --dev-attn` enables it only where it
+/// beats the per-op MLX path on THIS device+model (fail-closed off otherwise).
+/// Read by `accel::dev_attn_mlx_enabled`; f32-KV-only + no-Qwen3-head-norm at
+/// dispatch (there is no MLX qk-head-norm kernel).
+pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK_MLX: &str = "attn:dev_resident_block_mlx";
 
 /// Read the on-device verdict for a kernel probe name, if one has been
 /// recorded. `None` = never validated (or the probe SKIPped because the

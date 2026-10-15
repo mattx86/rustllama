@@ -2472,9 +2472,14 @@ pub struct DevAttnReport {
     pub error: Option<String>,
     /// Which device-resident block the A/B drove, so the CLI persists the right
     /// (disjoint) verdict key: `true` = the Feature-1a SYCL block (SYCL/USM GPU,
-    /// no CUDA), `false` = the #2 CUDA block. `rustllama-cli` doesn't link
-    /// `rustllama-models`, so it can't read the backend itself.
+    /// no CUDA), `false` = the #2 CUDA block OR the Feature-1c MLX block (see
+    /// `is_mlx`). `rustllama-cli` doesn't link `rustllama-models`, so it can't
+    /// read the backend itself.
     pub is_sycl: bool,
+    /// `true` when the A/B drove the Feature-1c Apple-Metal/MLX block (MLX active,
+    /// not CUDA, not SYCL) — the CLI then persists `attn:dev_resident_block_mlx`.
+    /// Disjoint from `is_sycl`: at most one of the two is set (CUDA ⇒ both false).
+    pub is_mlx: bool,
     /// Feature 1b (CUDA only): median DECODE tok/s with the CUDA-GRAPH block
     /// forced on (vs the eager device block = `on_tps`). `None` when not measured
     /// (not CUDA, or the graph arm never engaged).
@@ -2511,8 +2516,8 @@ pub fn measure_dev_attn(
         return Ok(DevAttnReport {
             capable: false,
             error: Some(
-                "no active NVIDIA GPU and no active SYCL/USM GPU — device-resident \
-                 attention cannot run"
+                "no active NVIDIA GPU, SYCL/USM GPU, or Apple Metal/MLX GPU — \
+                 device-resident attention cannot run"
                     .into(),
             ),
             ..Default::default()
@@ -2645,6 +2650,7 @@ pub fn measure_dev_attn(
                     .into(),
             ),
             is_sycl: false,
+            is_mlx: false,
             graph_tps: None,
             graph_winner: None,
         });
@@ -2661,14 +2667,19 @@ pub fn measure_dev_attn(
         (true, Some(on), Some(gr)) if on > 0.0 => Some(gr > on * WIN_MARGIN),
         _ => None,
     };
+    // Which backend's block engaged: CUDA runs the #2 block; off CUDA it was the
+    // Feature-1c MLX block when Metal is active, else the Feature-1a SYCL block.
+    // `is_sycl` / `is_mlx` are disjoint (both false on CUDA) so the CLI persists
+    // exactly one verdict key.
+    let is_mlx = !is_cuda && rustllama_models::accel::mlx_active();
     Ok(DevAttnReport {
         capable: true,
         off_tps,
         on_tps,
         winner,
         error: off_err.or(on_err),
-        // CUDA runs the #2 block; otherwise the engaged block was Feature-1a SYCL.
-        is_sycl: !is_cuda,
+        is_sycl: !is_cuda && !is_mlx,
+        is_mlx,
         graph_tps,
         graph_winner,
     })

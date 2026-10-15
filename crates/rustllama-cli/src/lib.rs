@@ -6217,11 +6217,14 @@ fn cmd_tune_dev_attn(
                 }
             );
             // The A/B drove whichever device-resident block this host runs — the
-            // CUDA #2 block, or the Feature-1a SYCL block on a USM GPU with no
-            // CUDA. Persist the matching (disjoint) verdict key so the right
-            // dispatch gate reads it. `report.is_sycl` carries the backend since
-            // `rustllama-cli` can't query `rustllama-models` itself.
-            let verdict_name = if report.is_sycl {
+            // CUDA #2 block, the Feature-1a SYCL block on a USM GPU with no CUDA,
+            // or the Feature-1c MLX block on an Apple GPU. Persist the matching
+            // (disjoint) verdict key so the right dispatch gate reads it.
+            // `report.is_mlx` / `is_sycl` carry the backend since `rustllama-cli`
+            // can't query `rustllama-models` itself.
+            let verdict_name = if report.is_mlx {
+                rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK_MLX
+            } else if report.is_sycl {
                 rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK_SYCL
             } else {
                 rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK
@@ -7746,16 +7749,19 @@ fn cmd_tune_all(
     // (a new build may change the block's cost), keyed by its own name so it's
     // independent of the parity verdicts. `Some(false)` (measured no-win) still
     // counts as decided, so use `contains_key`.
-    // A host runs exactly one backend's A/B — the CUDA #2 block or the Feature-1a
-    // SYCL block — persisting its own (disjoint) key, so EITHER key present means
-    // dev-attn is decided for this host.
+    // A host runs exactly one backend's A/B — the CUDA #2 block, the Feature-1a
+    // SYCL block, or the Feature-1c MLX block — persisting its own (disjoint)
+    // key, so ANY of the three keys present means dev-attn is decided for this
+    // host.
     let has_dev_attn = cached
         .as_ref()
         .map(|t| {
             (t.kernel_verdicts
                 .contains_key(rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK)
                 || t.kernel_verdicts
-                    .contains_key(rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK_SYCL))
+                    .contains_key(rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK_SYCL)
+                || t.kernel_verdicts
+                    .contains_key(rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK_MLX))
                 && t.rustllama_version == env!("CARGO_PKG_VERSION")
         })
         .unwrap_or(false);

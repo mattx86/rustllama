@@ -175,6 +175,35 @@ kernel void rsl_mlx_rope_f32_kernel(
     qk[b + j + half] = x0 * si + x1 * c;
 }
 
+// Scatter one decode token's K (or V) row [n_kv_heads*head_dim] (head-major,
+// contiguous) into the F32 KV mirror at `pos`:
+//   mirror[(h*max_ctx + pos)*head_dim + d] = src[h*head_dim + d].
+// Flat grid over n_kv_heads*head_dim, one work-item per (h,d). Used ONLY by the
+// device-resident decode block (rsl_mlx_decode_attn_block_f32) to write this
+// token's post-RoPE K / plain V into the resident mirror ON DEVICE, mid-chain,
+// so the flash-decode op below can read the full [0, pos] range without a host
+// round-trip. (The per-op MLX decode path writes the mirror host-side instead.)
+// The MLX mirror is F32 (unlike the SYCL block's f16 mirror) because the MLX
+// flash-decode kernel reads F32 K/V — so the whole decode block stays single-
+// precision end to end (bit-exact to the CPU reference up to reduction order),
+// with no f16 round-trip anywhere. The SYCL analogue is rsl_kv_write_f16_nowait.
+kernel void rsl_mlx_kv_write_f32_kernel(
+    device const float *src    [[buffer(0)]],
+    device       float *mirror [[buffer(1)]],
+    constant int &n_kv_heads   [[buffer(2)]],
+    constant int &head_dim     [[buffer(3)]],
+    constant int &pos          [[buffer(4)]],
+    constant int &max_ctx      [[buffer(5)]],
+    uint gid                   [[thread_position_in_grid]])
+{
+    const int total = n_kv_heads * head_dim;
+    const int flat = (int)gid;
+    if (flat >= total) return;
+    const int h = flat / head_dim;
+    const int d = flat % head_dim;
+    mirror[(h * max_ctx + pos) * head_dim + d] = src[flat];
+}
+
 // out[i] = silu(x[i]) * y[i], silu(v) = v / (1 + exp(-v)). Ports rsl_silu_mul_usm.
 kernel void rsl_mlx_silu_mul_f32_kernel(
     device const float *x   [[buffer(0)]],

@@ -5428,6 +5428,175 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                 }
             }
         }
+
+        // ---- Feature 1c: device-resident DECODE attention block ----
+        // The orchestration probe (Metal twin of the SYCL `probe_decode_block`):
+        // the WHOLE per-layer decode attention chain in ONE command buffer
+        // (rsl_mlx_decode_attn_block_f32) vs a CPU reference computing the
+        // identical sequence on identical inputs. The individual kernels (matvec /
+        // flash / rmsnorm / rope) are already covered above, so this validates the
+        // CHAINING, the f32-activation residency, and the F32 KV-mirror
+        // scatter/read. The MLX mirror is F32 (unlike the SYCL block's f16
+        // mirror), so the chain is bit-exact to the CPU reference up to float
+        // reduction order — no f16 rounding anywhere. Q4_K weights, a small
+        // realistic shape, a short pre-seeded KV history (so the flash spans
+        // multiple positions). Same loose gate as the SYCL decode-block probe
+        // (cos > 0.995, max_rel < 0.10) — the f32 mirror only makes passing
+        // easier, so this won't false-pass a broken kernel.
+        {
+            const HEAD_DIM: usize = 128;
+            const N_HEADS: usize = 8;
+            const N_KV: usize = 2;
+            const D_MODEL: usize = 1024;
+            const MAX_CTX: usize = 64;
+            const POS: usize = 5; // 5 seeded history rows + this token => kv_len = 6
+            const EPS: f32 = 1e-5;
+            const THETA: f32 = 10000.0;
+            let name = "attn:dev_resident_block_mlx";
+            let d_q = N_HEADS * HEAD_DIM;
+            let d_kv = N_KV * HEAD_DIM;
+            let half = HEAD_DIM / 2;
+            let kv_len = POS + 1;
+            // Q4_K weights (M x K packed bytes): Wq [d_q x D_MODEL], Wk/Wv
+            // [d_kv x D_MODEL], Wo [D_MODEL x d_q] — same synthesis + CPU matvec
+            // the matvec probes use, so the per-row dequant matches the kernel.
+            let layout = LAYOUTS.iter().find(|l| l.name == "q4_k").expect("q4_k layout");
+            let cpu_mv = cpu_matvec_for("q4_k");
+            let wq = gen_quant_bytes(layout, d_q, D_MODEL, 0x1111);
+            let wk = gen_quant_bytes(layout, d_kv, D_MODEL, 0x2222);
+            let wv = gen_quant_bytes(layout, d_kv, D_MODEL, 0x3333);
+            let wo = gen_quant_bytes(layout, D_MODEL, d_q, 0x4444);
+            let mut rng = XorShift(0xDEC0DE);
+            let hidden0: Vec<f32> = (0..D_MODEL).map(|_| rng.f32_pm(0.6)).collect();
+            let attn_norm: Vec<f32> = (0..D_MODEL).map(|_| 0.5 + rng.f32_pm(0.2)).collect();
+            let ffn_norm: Vec<f32> = (0..D_MODEL).map(|_| 0.5 + rng.f32_pm(0.2)).collect();
+            let inv_freq: Vec<f32> = (0..half)
+                .map(|j| 1.0f32 / THETA.powf(2.0 * j as f32 / HEAD_DIM as f32))
+                .collect();
+            // F32 KV history [0,POS) per kv-head (head-major) — exact, no
+            // rounding (the MLX mirror is f32). Rows >= POS stay zero; the block
+            // writes row POS itself.
+            let mirror_elems = N_KV * MAX_CTX * HEAD_DIM;
+            let mut k_hist = vec![0f32; mirror_elems];
+            let mut v_hist = vec![0f32; mirror_elems];
+            for h in 0..N_KV {
+                for t in 0..POS {
+                    for d in 0..HEAD_DIM {
+                        let idx = (h * MAX_CTX + t) * HEAD_DIM + d;
+                        k_hist[idx] = rng.f32_pm(0.6);
+                        v_hist[idx] = rng.f32_pm(0.6);
+                    }
+                }
+            }
+            // ---- CPU reference (identical op sequence, all f32) ----
+            let rope = |qk: &mut [f32], nh: usize| {
+                for hh in 0..nh {
+                    let base = hh * HEAD_DIM;
+                    for j in 0..half {
+                        let angle = POS as f32 * inv_freq[j];
+                        let (s, c) = angle.sin_cos();
+                        let x0 = qk[base + j];
+                        let x1 = qk[base + j + half];
+                        qk[base + j] = x0 * c - x1 * s;
+                        qk[base + j + half] = x0 * s + x1 * c;
+                    }
+                }
+            };
+            let mut hnorm = vec![0f32; D_MODEL];
+            k::rmsnorm_f32_row(&hidden0, &attn_norm, &mut hnorm, EPS);
+            let mut q_ref = vec![0f32; d_q];
+            let mut k_ref = vec![0f32; d_kv];
+            let mut v_ref = vec![0f32; d_kv];
+            cpu_mv(&wq, &hnorm, &mut q_ref, d_q, D_MODEL);
+            cpu_mv(&wk, &hnorm, &mut k_ref, d_kv, D_MODEL);
+            cpu_mv(&wv, &hnorm, &mut v_ref, d_kv, D_MODEL);
+            rope(&mut q_ref, N_HEADS);
+            rope(&mut k_ref, N_KV);
+            // The full f32 KV cache the reference flash reads: history [0,POS) +
+            // the new (post-RoPE K / plain V) at POS — matching exactly what the
+            // device mirror holds after the block's KV-write.
+            let mut kcache = k_hist.clone();
+            let mut vcache = v_hist.clone();
+            for h in 0..N_KV {
+                for d in 0..HEAD_DIM {
+                    let idx = (h * MAX_CTX + POS) * HEAD_DIM + d;
+                    kcache[idx] = k_ref[h * HEAD_DIM + d];
+                    vcache[idx] = v_ref[h * HEAD_DIM + d];
+                }
+            }
+            let mut attn_ref = vec![0f32; d_q];
+            k::gqa_attention_one_step(
+                &q_ref, &kcache, &vcache, &mut attn_ref,
+                N_HEADS, N_KV, HEAD_DIM, MAX_CTX, kv_len,
+            );
+            let mut o_ref = vec![0f32; D_MODEL];
+            cpu_mv(&wo, &attn_ref, &mut o_ref, D_MODEL, d_q);
+            let mut hidden_ref = hidden0.clone();
+            for i in 0..D_MODEL {
+                hidden_ref[i] += o_ref[i];
+            }
+            let mut hnorm2_ref = vec![0f32; D_MODEL];
+            k::rmsnorm_f32_row(&hidden_ref, &ffn_norm, &mut hnorm2_ref, EPS);
+            if !hidden_ref.iter().chain(hnorm2_ref.iter()).all(|v| v.is_finite()) {
+                cu_emit(name, "SKIP", "cpu-reference-nonfinite");
+                *counts.entry("SKIP").or_default() += 1;
+            } else if let (Some(bwq), Some(bwk), Some(bwv), Some(bwo), Some(mut kmir), Some(mut vmir)) = (
+                mk::MlxDeviceBuffer::from_host(&fs, &wq),
+                mk::MlxDeviceBuffer::from_host(&fs, &wk),
+                mk::MlxDeviceBuffer::from_host(&fs, &wv),
+                mk::MlxDeviceBuffer::from_host(&fs, &wo),
+                mk_upload_f32(&fs, &k_hist),
+                mk_upload_f32(&fs, &v_hist),
+            ) {
+                let mut hidden_dev = hidden0.clone();
+                let mut hnorm2_dev = vec![0f32; D_MODEL];
+                let mut k_row_dev = vec![0f32; d_kv];
+                let mut v_row_dev = vec![0f32; d_kv];
+                // SAFETY: weights/mirror are live device buffers on `fs`; the host
+                // slices are sized to the dims; kq/kk/kv/ko = 0 (Q4_K); the block
+                // syncs before returning. The mirror holds the f32 history [0,POS);
+                // the block writes row POS + the flash reads [0,POS].
+                let res = unsafe {
+                    mk::decode_attn_block_f32(
+                        &fs,
+                        bwq.as_ptr(), 0,
+                        bwk.as_ptr(), 0,
+                        bwv.as_ptr(), 0,
+                        bwo.as_ptr(), 0,
+                        attn_norm.as_ptr(),
+                        ffn_norm.as_ptr(),
+                        inv_freq.as_ptr(),
+                        hidden_dev.as_mut_ptr(),
+                        hnorm2_dev.as_mut_ptr(),
+                        k_row_dev.as_mut_ptr(),
+                        v_row_dev.as_mut_ptr(),
+                        kmir.as_mut_ptr(),
+                        vmir.as_mut_ptr(),
+                        N_HEADS as u32, N_KV as u32, HEAD_DIM as u32, D_MODEL as u32,
+                        POS as u32, MAX_CTX as u32, kv_len as u32, EPS,
+                    )
+                };
+                match res {
+                    Ok(true) => {
+                        // Grade both device outputs (the residual hidden + the
+                        // post-attn norm == FFN input) jointly vs the CPU ref.
+                        let mut gpu = hidden_dev.clone();
+                        gpu.extend_from_slice(&hnorm2_dev);
+                        let mut cpu = hidden_ref.clone();
+                        cpu.extend_from_slice(&hnorm2_ref);
+                        cu_grade(name, &gpu, &cpu, 0.995, 0.10, &mut counts);
+                    }
+                    Ok(false) => {
+                        cu_emit(name, "SKIP", "block-declined");
+                        *counts.entry("SKIP").or_default() += 1;
+                    }
+                    Err(e) => {
+                        cu_emit(name, "KERNEL_ERR", &format!("{e:?}"));
+                        *counts.entry("KERNEL_ERR").or_default() += 1;
+                    }
+                }
+            }
+        }
     }
 
     println!();

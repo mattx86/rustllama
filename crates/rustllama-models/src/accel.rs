@@ -8186,11 +8186,12 @@ fn dev_attn_sycl_enabled() -> bool {
 /// Whether a device-resident DECODE attention block can run on this host at all
 /// — read by `tune --dev-attn` to decide whether to load the model for the A/B.
 /// True on an active NVIDIA GPU (the #2 CUDA block) OR an active SYCL/USM GPU
-/// (the Feature-1a block). The `tune` arm forces the path on and confirms it
-/// engaged via `dev_attn_hits`, so this only needs to gate "is any such path
-/// even possible here".
+/// (the Feature-1a block) OR an active Apple Metal/MLX GPU (the Feature-1c
+/// block). The `tune` arm forces the path on and confirms it engaged via
+/// `dev_attn_hits`, so this only needs to gate "is any such path even possible
+/// here".
 pub fn dev_attn_capable() -> bool {
-    cuda_active() || usm_attn_enabled()
+    cuda_active() || usm_attn_enabled() || mlx_active()
 }
 
 /// Feature-1a weight-format support gate: map a packed quant `Dtype` to the C++
@@ -8442,6 +8443,300 @@ pub fn try_decode_attn_block_sycl_f32(
                  — the whole decode attention block runs USM-resident on one \
                  in-order submit-chain (perf-gated verdict \
                  attn:dev_resident_block_sycl) (logged once)"
+            );
+        }
+    }
+    ran
+}
+
+/// Whether the Feature-1c Apple-Metal/MLX device-resident DECODE attention block
+/// is enabled. The MLX twin of [`dev_attn_enabled`] / [`dev_attn_sycl_enabled`]:
+/// **AUTOMATIC, no env var** — perf-gated on verdict
+/// [`VERDICT_ATTN_DEV_RESIDENT_BLOCK_MLX`] (persisted by the MLX arm of
+/// `tune --dev-attn`). The tuner's per-arm force override (shared with the
+/// CUDA/SYCL blocks via `DEV_ATTN_FORCE`) short-circuits the verdict so the A/B
+/// drives both arms. Fail-closed: unmeasured / not-a-win ⇒ off (the per-op MLX
+/// path runs). The block is correctness-validated (`doctor --metal-parity`), so
+/// the gate is purely perf.
+fn dev_attn_mlx_enabled() -> bool {
+    match DEV_ATTN_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK_MLX))
+}
+
+/// Feature-1c weight-format support gate: map a packed quant `Dtype` to the
+/// Metal orchestrator's weight format code (0 = Q4_K, 1 = Q8_0) + its K
+/// alignment. `None` = a format the device-resident block doesn't dispatch (the
+/// caller then declines → the per-op MLX/CPU ladder runs). Curated-small on
+/// purpose, mirroring the SYCL block's [`sycl_block_weight_kind`] 1:1 — these two
+/// cover the overwhelming majority of real models, and every other weight format
+/// fail-closes to the proven per-op path.
+fn mlx_block_weight_kind(dtype: Dtype) -> Option<(i32, usize)> {
+    match dtype {
+        Dtype::Q4_KRaw => Some((0, 256)),
+        Dtype::Q8_0Raw => Some((1, 32)),
+        _ => None,
+    }
+}
+
+/// Resolve a weight tensor to a live MLX device pointer for the device-resident
+/// block: a cached per-block upload (keyed on the host bytes' address, uploaded
+/// once into a StorageModeShared MTLBuffer). `None` ⇒ the upload was declined
+/// (alloc) and the caller must fall back. Mirrors the SYCL block's
+/// [`resolve_block_weight_usm`]; the returned `*const c_void` points at the
+/// STABLE device allocation (MTLBuffer contents), not into the cache map, so a
+/// later insert's rehash can't invalidate it.
+fn resolve_block_weight_mlx(
+    ctx: &mut MlxAttnContext,
+    w: &Tensor,
+) -> Option<*const std::ffi::c_void> {
+    let wb = as_bytes(w);
+    let key = wb.as_ptr() as usize;
+    if let Some(buf) = ctx.block_weights.get(&key) {
+        // Size-match guard: a host address reused across a model reload for a
+        // different-sized weight must not serve a stale buffer (the per-entry
+        // safety net; a clean reload drops the whole ctx).
+        if buf.len_bytes() == wb.len() {
+            return Some(buf.as_ptr());
+        }
+        ctx.block_weights.remove(&key);
+    }
+    let buf = mk::MlxDeviceBuffer::from_host(&ctx.stream, wb)?;
+    // SAFETY: the `'_`→`'static` widening is the same lifetime lie the MLX
+    // mirrors tell (`ensure_mlx_dev`): the buffer borrows `ctx.stream`, declared
+    // LAST in `MlxAttnContext`, so declaration-order field drop frees every
+    // `block_weights` entry while the stream is still alive.
+    let buf: mk::MlxDeviceBuffer<'static> =
+        unsafe { std::mem::transmute::<mk::MlxDeviceBuffer<'_>, mk::MlxDeviceBuffer<'static>>(buf) };
+    let ptr = buf.as_ptr();
+    ctx.block_weights.insert(key, buf);
+    Some(ptr)
+}
+
+/// Feature 1c: run the WHOLE DECODE attention block for one token on the Apple
+/// Metal GPU as ONE command buffer with ONE compute encoder (one sync per layer)
+/// — the MLX twin of [`try_decode_attn_block_cuda_f32`] /
+/// [`try_decode_attn_block_sycl_f32`]. Collapses the per-op `commit` +
+/// `waitUntilCompleted` flood (rmsnorm, 3 qkv matvecs, 2 RoPEs, 2 KV-mirror
+/// writes, flash-decode, o matvec, residual+norm) into ONE committed buffer that
+/// syncs once, with the activation resident in a single MTLBuffer across every
+/// op. On success `hidden` is updated (residual done), `h_norm2` holds the
+/// post-attn RMSNorm (the FFN input), the host KV cache is appended + coherent,
+/// and the device F32 KV mirror + `kv_valid_len_f32` advanced — so the whole host
+/// attention path is skipped. Returns `false` (caller runs the per-op MLX/CPU
+/// ladder, host buffers untouched) unless: the perf verdict is on, MLX is active,
+/// there are no qkv biases, there is no Qwen3 q/k head-norm (no MLX `qk_head_norm`
+/// kernel — correctness-first decline), and q/k/v/o are all Q4_K or Q8_0. F32 KV
+/// only. `k_cache`/`v_cache` are the layer's host KV slabs (head-major), used to
+/// seed the mirror's prefill history. ATTENTION-ONLY (no fused dense FFN — the
+/// caller runs the host FFN), matching the SYCL block.
+#[allow(clippy::too_many_arguments)]
+pub fn try_decode_attn_block_mlx_f32(
+    w_q: &Tensor,
+    w_k: &Tensor,
+    w_v: &Tensor,
+    w_o: &Tensor,
+    attn_norm: &[f32],
+    post_norm: &[f32],
+    q_norm: Option<&[f32]>,
+    k_norm: Option<&[f32]>,
+    has_qkv_bias: bool,
+    inv_freq: &[f32],
+    hidden: &mut [f32],
+    h_norm2: &mut [f32],
+    k_buf: &mut [f32],
+    v_buf: &mut [f32],
+    k_cache: &mut [f32],
+    v_cache: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    d_model: usize,
+    pos: usize,
+    max_ctx: usize,
+    n_layers: usize,
+    layer_idx: usize,
+    rms_eps: f32,
+) -> bool {
+    // Gates (correctness-first): perf verdict/force, MLX active for this layer,
+    // no qkv bias, and no Qwen3 head-norm (there is no MLX `qk_head_norm` kernel,
+    // so a head-norm model MUST take the per-op path that applies it on the host).
+    if !dev_attn_mlx_enabled()
+        || !mlx_active()
+        || !gpu_active_for_current_layer()
+        || has_qkv_bias
+        || q_norm.is_some()
+        || k_norm.is_some()
+    {
+        return false;
+    }
+    let d_q = n_heads * head_dim;
+    let d_kv = n_kv_heads * head_dim;
+    if hidden.len() != d_model
+        || h_norm2.len() != d_model
+        || k_buf.len() != d_kv
+        || v_buf.len() != d_kv
+        || attn_norm.len() != d_model
+        || post_norm.len() != d_model
+        || inv_freq.len() != head_dim / 2
+        || head_dim % 2 != 0
+        || n_kv_heads == 0
+        || n_heads % n_kv_heads != 0
+        || layer_idx >= n_layers
+        || pos >= max_ctx
+        || k_cache.len() < d_kv * max_ctx
+        || v_cache.len() < d_kv * max_ctx
+    {
+        return false;
+    }
+    // Weight-format gate: all four must be a supported code AND K-aligned. q/k/v
+    // consume K = d_model; o consumes K = d_q.
+    let (Some((kq, aq)), Some((kk, ak)), Some((kv_c, av)), Some((ko, ao))) = (
+        mlx_block_weight_kind(w_q.dtype),
+        mlx_block_weight_kind(w_k.dtype),
+        mlx_block_weight_kind(w_v.dtype),
+        mlx_block_weight_kind(w_o.dtype),
+    ) else {
+        return false;
+    };
+    if d_model % aq != 0 || d_model % ak != 0 || d_model % av != 0 || d_q % ao != 0 {
+        return false;
+    }
+    let cfg = MlxAttnConfig {
+        n_layers: n_layers as u32,
+        n_heads: n_heads as u32,
+        n_kv_heads: n_kv_heads as u32,
+        head_dim: head_dim as u32,
+        max_ctx: max_ctx as u32,
+    };
+    // Seed the F32 KV mirror with the prefill history rows [valid..pos) from the
+    // host KV cache (a no-op once resident) BEFORE borrowing the context below —
+    // this call re-enters MLX_ATTN itself, so it must not nest inside our own
+    // borrow. After it, `kv_valid_len_f32[layer_idx] == pos` (so the gap check
+    // passes) and the context exists with the matching cfg. Identical to the seed
+    // the per-op MLX flash-decode path runs.
+    mlx_decode_seed_kv_f32(
+        k_cache,
+        v_cache,
+        layer_idx,
+        pos as u32,
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        max_ctx as u32,
+        n_layers as u32,
+    );
+    let kv_len = (pos + 1) as u32;
+    let mirror_bytes = n_kv_heads * max_ctx * head_dim * 4;
+    let ran = MLX_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let needs_rebuild = match slot.as_ref() {
+            Some(ctx) => ctx.cfg != cfg,
+            None => true,
+        };
+        if needs_rebuild {
+            *slot = MlxAttnContext::try_new(cfg);
+            if slot.is_none() {
+                return false;
+            }
+        }
+        let ctx = slot.as_mut().expect("mlx ctx just built");
+        // F32 staleness + contiguous-validity gate (same as the per-op decode
+        // path): a new sequence (epoch bump) invalidates every layer's resident
+        // length; the flash below reads rows [0, pos] from the mirror, so a gap
+        // means the seed couldn't fill the history → decline to the CPU path.
+        let epoch = USM_KV_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if ctx.kv_epoch_f32 != epoch {
+            for v in ctx.kv_valid_len_f32.iter_mut() {
+                *v = 0;
+            }
+            ctx.kv_epoch_f32 = epoch;
+        }
+        let valid = ctx.kv_valid_len_f32[layer_idx];
+        if pos as u32 > valid {
+            return false;
+        }
+        // Ensure the layer's persistent F32 K/V mirrors exist (the seed normally
+        // allocated them already; this covers pos==0 with no history to seed).
+        if !ensure_mlx_dev(&mut ctx.dev_k_mirror[layer_idx], &ctx.stream, mirror_bytes)
+            || !ensure_mlx_dev(&mut ctx.dev_v_mirror[layer_idx], &ctx.stream, mirror_bytes)
+        {
+            return false;
+        }
+        // Resolve the four weights to device pointers (cached per-block upload).
+        // Sequential (not a tuple) because each borrows `ctx` mutably to upload;
+        // the returned `*const c_void` points at the STABLE device allocation.
+        let Some(wq_ptr) = resolve_block_weight_mlx(ctx, w_q) else { return false };
+        let Some(wk_ptr) = resolve_block_weight_mlx(ctx, w_k) else { return false };
+        let Some(wv_ptr) = resolve_block_weight_mlx(ctx, w_v) else { return false };
+        let Some(wo_ptr) = resolve_block_weight_mlx(ctx, w_o) else { return false };
+        // Extract the remaining raw pointers (raw ptrs don't hold the borrow).
+        let stream_raw: *const mk::MlxStream = &ctx.stream;
+        let kmir = ctx.dev_k_mirror[layer_idx].as_mut().unwrap().as_mut_ptr();
+        let vmir = ctx.dev_v_mirror[layer_idx].as_mut().unwrap().as_mut_ptr();
+        // SAFETY: weight device pointers are live (cached on this ctx's stream);
+        // the host slices (`hidden`/`h_norm2`/`k_buf`/`v_buf`/norms/`inv_freq`)
+        // are sized to the dims (validated above); `kmir`/`vmir` are this ctx's
+        // F32 K/V mirrors, seeded to `pos`; the block syncs before returning so
+        // there's no host/device overlap on the staged slab.
+        let res = unsafe {
+            mk::decode_attn_block_f32(
+                &*stream_raw,
+                wq_ptr, kq,
+                wk_ptr, kk,
+                wv_ptr, kv_c,
+                wo_ptr, ko,
+                attn_norm.as_ptr(),
+                post_norm.as_ptr(),
+                inv_freq.as_ptr(),
+                hidden.as_mut_ptr(),
+                h_norm2.as_mut_ptr(),
+                k_buf.as_mut_ptr(),
+                v_buf.as_mut_ptr(),
+                kmir,
+                vmir,
+                n_heads as u32,
+                n_kv_heads as u32,
+                head_dim as u32,
+                d_model as u32,
+                pos as u32,
+                max_ctx as u32,
+                kv_len,
+                rms_eps,
+            )
+        };
+        match res {
+            Ok(true) => {
+                // The device KV-write scattered mirror row [pos]; advance the
+                // valid range the same way the per-op decode path does.
+                if pos as u32 == valid {
+                    ctx.kv_valid_len_f32[layer_idx] = pos as u32 + 1;
+                }
+                true
+            }
+            _ => false,
+        }
+    });
+    if ran {
+        // Append this token's post-RoPE K / plain V (just written into k_buf/v_buf
+        // by the block) into the host KV cache at `pos` (head-major), so the host
+        // cache stays coherent for a later CPU fallback / the next mirror seed.
+        for h in 0..n_kv_heads {
+            let dst = (h * max_ctx + pos) * head_dim;
+            let src = h * head_dim;
+            k_cache[dst..dst + head_dim].copy_from_slice(&k_buf[src..src + head_dim]);
+            v_cache[dst..dst + head_dim].copy_from_slice(&v_buf[src..src + head_dim]);
+        }
+        if DEV_ATTN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            tracing::info!(
+                "Feature 1c Metal/MLX on-device activation-residency attention \
+                 ENGAGED — the whole decode attention block runs in ONE Metal \
+                 command buffer (one sync per layer) (perf-gated verdict \
+                 attn:dev_resident_block_mlx) (logged once)"
             );
         }
     }
@@ -9859,6 +10154,16 @@ struct MlxAttnContext {
     dev_prefill_v_scales: Option<mk::MlxDeviceBuffer<'static>>,
     dev_prefill_q: Option<mk::MlxDeviceBuffer<'static>>,
     dev_prefill_out: Option<mk::MlxDeviceBuffer<'static>>,
+    // ---- Feature-1c device-resident block weight residency ----
+    // q/k/v/o weight bytes uploaded ONCE (keyed by host byte address) for the
+    // `try_decode_attn_block_mlx_f32` chain. Separate from `MlxMatvecCache` (the
+    // per-op path's cache) exactly as the SYCL block carries its own
+    // `packed_weight_cache` on `UsmAttnContext` — the block passes these device
+    // pointers straight into `rsl_mlx_decode_attn_block_f32`. A size-mismatched
+    // entry (host address reused across a model reload) is evicted + re-uploaded
+    // in `resolve_block_weight_mlx` (the per-entry safety net; a clean reload
+    // drops the whole context via `clear_mlx_attn_context`).
+    block_weights: HashMap<usize, mk::MlxDeviceBuffer<'static>>,
     // ---- owning stream (declared LAST so the buffers above free first) --
     stream: mk::MlxStream,
 }
@@ -9894,6 +10199,7 @@ impl MlxAttnContext {
             dev_prefill_v_scales: None,
             dev_prefill_q: None,
             dev_prefill_out: None,
+            block_weights: HashMap::new(),
             stream,
         })
     }

@@ -136,3 +136,6 @@ EXPORTS
 
     ; Sampling
     rsl_mlx_argmax_f32
+
+    ; Feature 1c: device-resident DECODE attention block (one command buffer)
+    rsl_mlx_decode_attn_block_f32

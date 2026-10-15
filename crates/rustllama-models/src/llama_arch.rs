@@ -7759,6 +7759,10 @@ impl LlamaModel {
             // per-layer (no cross-layer hidden residency), so it must NOT set
             // `hidden_dev_resident` below.
             let mut device_attn_is_sycl = false;
+            // Feature 1c (Metal/MLX sibling): set when the MLX device-resident
+            // block handled this layer. Attention-only + per-layer exactly like
+            // the SYCL block, so it likewise must NOT set `hidden_dev_resident`.
+            let mut device_attn_is_mlx = false;
             // The fused CUDA decode block (and its SYCL sibling) rotate with the
             // inv-freq table but do NOT apply the YaRN attention `mscale` (they
             // fuse the Q·K score on-device, so Q can't be post-scaled). Run them
@@ -7879,7 +7883,49 @@ impl LlamaModel {
                             cfg.rms_eps,
                         );
                         device_attn_is_sycl = sycl_ran;
-                        sycl_ran
+                        if sycl_ran {
+                            true
+                        } else {
+                            // Feature 1c: the Metal/MLX device-resident DECODE
+                            // block, tried when neither CUDA nor SYCL ran. Inert
+                            // off Apple Silicon (the gate returns false →
+                            // byte-identical path). Attention-only: `h_norm`
+                            // holds the post-attn norm (FFN input), so the host
+                            // FFN below runs unchanged; `device_dense_ffn` stays
+                            // false. Fed the same scaled rope table as the
+                            // CUDA/SYCL blocks.
+                            let mlx_ran = crate::accel::try_decode_attn_block_mlx_f32(
+                                block.w_q(),
+                                block.w_k(),
+                                block.w_v(),
+                                block.w_o(),
+                                block.attn_norm(),
+                                block.ffn_norm(),
+                                block.q_norm(),
+                                block.k_norm(),
+                                block.b_q().is_some()
+                                    || block.b_k().is_some()
+                                    || block.b_v().is_some(),
+                                &self.rope_inv_freq,
+                                &mut hidden,
+                                &mut h_norm,
+                                &mut k_buf,
+                                &mut v_buf,
+                                k,
+                                v,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                d,
+                                cur_pos,
+                                kv_max_ctx,
+                                cfg.n_layers,
+                                layer_idx,
+                                cfg.rms_eps,
+                            );
+                            device_attn_is_mlx = mlx_ran;
+                            mlx_ran
+                        }
                     }
                 } else {
                     false
@@ -7889,9 +7935,11 @@ impl LlamaModel {
             };
             if device_attn {
                 // Cross-layer: hidden stays on device (host stale); per-layer:
-                // it was downloaded, so host is authoritative. The SYCL block is
-                // always per-layer, so it never keeps hidden resident.
-                hidden_dev_resident = cross_layer && !device_attn_is_sycl;
+                // it was downloaded, so host is authoritative. The SYCL + MLX
+                // blocks are always per-layer, so they never keep hidden
+                // resident.
+                hidden_dev_resident =
+                    cross_layer && !device_attn_is_sycl && !device_attn_is_mlx;
             } else if hidden_dev_resident {
                 // The device path declined this layer but the slab holds the
                 // current hidden (a prior dense layer left it resident); refresh

@@ -472,6 +472,40 @@ extern "C" {
         out_idx: *mut c_int,
     ) -> c_int;
 
+    // Feature 1c: device-resident DECODE attention block (one command buffer).
+    // wq/wk/wv/wo + k_mirror/v_mirror are DEVICE pointers; norms/inv_freq +
+    // hidden/h_norm2/k_row/v_row are HOST f32. kq/kk/kv_kind/ko are weight
+    // format codes (0=Q4_K, 1=Q8_0). Returns 1 on success, 0 on decline.
+    #[allow(clippy::too_many_arguments)]
+    fn rsl_mlx_decode_attn_block_f32(
+        s: *mut RslMlxStreamRaw,
+        wq_dev: *const c_void,
+        kq: c_int,
+        wk_dev: *const c_void,
+        kk: c_int,
+        wv_dev: *const c_void,
+        kv_kind: c_int,
+        wo_dev: *const c_void,
+        ko: c_int,
+        attn_norm: *const f32,
+        ffn_norm: *const f32,
+        inv_freq: *const f32,
+        hidden: *mut f32,
+        h_norm2: *mut f32,
+        k_row: *mut f32,
+        v_row: *mut f32,
+        k_mirror: *mut c_void,
+        v_mirror: *mut c_void,
+        n_heads: c_int,
+        n_kv_heads: c_int,
+        head_dim: c_int,
+        d_model: c_int,
+        pos: c_int,
+        max_ctx: c_int,
+        kv_len: c_int,
+        rms_eps: f32,
+    ) -> c_int;
+
     fn rsl_mlx_consume_error_count() -> c_int;
 }
 
@@ -1662,6 +1696,84 @@ pub unsafe fn argmax_f32(
     } else {
         Err(MlxError::Kernel(rc))
     }
+}
+
+/// Feature 1c: run the WHOLE per-layer DECODE attention block on the Metal GPU
+/// as ONE command buffer with ONE compute encoder (the C ABI
+/// `rsl_mlx_decode_attn_block_f32`) — rmsnorm → q/k/v matvec → RoPE → KV-mirror
+/// write → flash-decode → o-proj → residual + rmsnorm — committed with a SINGLE
+/// `waitUntilCompleted` instead of the per-op commit+wait flood. `Ok(true)` =
+/// the block ran and wrote `hidden`/`h_norm2`/`k_row`/`v_row`; `Ok(false)` = the
+/// Metal side declined (bad shape / alloc / unsupported matvec code / GPU error)
+/// — the caller must fall back to the per-op MLX/CPU ladder, as the host buffers
+/// are then unchanged (results are copied out only on success). `kq/kk/kv_kind/ko`
+/// are weight format codes (0 = Q4_K, 1 = Q8_0). `k_mirror`/`v_mirror` are the
+/// layer's persistent F32 KV device buffers, pre-seeded with rows `[0, pos)`.
+/// The MLX KV mirror is F32 (not f16 like SYCL), so the chain is bit-exact f32
+/// end to end.
+///
+/// # Safety
+///
+/// Every pointer must be live for the call and sized to the shape arguments:
+/// `wX_dev` the packed weight bytes (device); `attn_norm`/`ffn_norm` ≥ `d_model`,
+/// `inv_freq` ≥ `head_dim/2`, `hidden`/`h_norm2` ≥ `d_model`, `k_row`/`v_row` ≥
+/// `n_kv_heads*head_dim` (host); `k_mirror`/`v_mirror` ≥
+/// `n_kv_heads*max_ctx*head_dim` f32 (device). The block syncs before returning,
+/// so there is no host/device overlap on the staged buffers.
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn decode_attn_block_f32(
+    stream: &MlxStream,
+    wq_dev: *const c_void,
+    kq: i32,
+    wk_dev: *const c_void,
+    kk: i32,
+    wv_dev: *const c_void,
+    kv_kind: i32,
+    wo_dev: *const c_void,
+    ko: i32,
+    attn_norm: *const f32,
+    ffn_norm: *const f32,
+    inv_freq: *const f32,
+    hidden: *mut f32,
+    h_norm2: *mut f32,
+    k_row: *mut f32,
+    v_row: *mut f32,
+    k_mirror: *mut c_void,
+    v_mirror: *mut c_void,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    d_model: u32,
+    pos: u32,
+    max_ctx: u32,
+    kv_len: u32,
+    rms_eps: f32,
+) -> Result<bool, MlxError> {
+    let ran = rsl_mlx_decode_attn_block_f32(
+        stream.raw(),
+        wq_dev, kq as c_int,
+        wk_dev, kk as c_int,
+        wv_dev, kv_kind as c_int,
+        wo_dev, ko as c_int,
+        attn_norm, ffn_norm, inv_freq,
+        hidden, h_norm2, k_row, v_row,
+        k_mirror, v_mirror,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        d_model as c_int,
+        pos as c_int,
+        max_ctx as c_int,
+        kv_len as c_int,
+        rms_eps,
+    );
+    // A non-zero kernel-error latch means an encode/launch failure even if the
+    // return code didn't capture it — treat it as a decline (fall back to CPU).
+    if consume_error_count() != 0 {
+        return Ok(false);
+    }
+    Ok(ran == 1)
 }
 
 // ============================================================

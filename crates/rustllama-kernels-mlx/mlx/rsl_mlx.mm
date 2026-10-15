@@ -1442,3 +1442,325 @@ extern "C" int rsl_mlx_argmax_f32(rsl_mlx_stream *s, const float *logits,
 }
 
 #undef RSL_MLX_STUB_KERNEL
+
+// ===========================================================================
+// Feature 1c: Apple-Metal / MLX device-resident DECODE attention block
+//             (rsl_mlx_decode_attn_block_f32)
+// ===========================================================================
+//
+// WHY: the per-op MLX decode path pays, PER OP, a full `[cb commit]` +
+// `[cb waitUntilCompleted]` round-trip (see mlx_run) — one for the rmsnorm, one
+// for each of the three qkv matvecs, one per RoPE, the KV-mirror writes, the
+// flash-decode, the o-proj matvec, and the residual+norm. Each commit/wait hands
+// the GPU one tiny kernel then blocks the host until it finishes, so the whole
+// per-layer attention chain is a flood of serialized submit+sync stalls. This
+// entry encodes the WHOLE per-layer chain into ONE command buffer with ONE
+// compute encoder and syncs ONCE at the end — the Metal analogue of the CUDA
+// `decode_attn_block_f32` and the SYCL `rsl_decode_attn_block_usm`. The
+// activations stay resident in a single StorageModeShared MTLBuffer ("slab")
+// across every op; the weights + KV mirror stay resident in their own device
+// buffers (resolved from the registry); nothing round-trips to the host until
+// the single final wait.
+//
+// ORDERING / HAZARDS: a default `[cb computeCommandEncoder]` is a SERIAL encoder
+// (MTLDispatchTypeSerial). On Apple Silicon every buffer here is
+// StorageModeShared with the default MTLHazardTrackingModeTracked, so the serial
+// encoder AUTOMATICALLY inserts the memory barriers between successive
+// `dispatchThreadgroups` calls that read/write the same tracked resource (the
+// slab, the mirror). That is exactly the op-to-op dependency chain we need
+// (rmsnorm writes hnorm → the qkv matvecs read it → RoPE rewrites q/k → the
+// KV-write reads k → flash reads the mirror → the o matvec reads attn →
+// add_rmsnorm reads o), so no explicit barrier is required and the result is
+// identical to running each op in its own committed buffer — just without the
+// per-op host sync. (This is the documented Metal behavior for tracked resources
+// on a serial compute encoder.)
+//
+// PRECISION: the whole block runs in f32 END TO END, including the KV mirror
+// (the MLX flash-decode kernel reads F32 K/V, unlike the SYCL block's f16
+// mirror) — so it is bit-exact to the CPU reference up to float reduction order,
+// with no f16 round-trip anywhere. Correctness is validated by
+// `doctor --metal-parity` (`attn:dev_resident_block_mlx`); this is a PERF-gated
+// path (`attn:dev_resident_block_mlx` verdict), fail-closed off otherwise.
+//
+// ATTENTION-ONLY (no fused dense FFN), matching the SYCL block: `h_norm2` holds
+// the post-attn RMSNorm (the FFN input) so the Rust caller runs the host FFN
+// exactly as it does for the SYCL/CUDA-attention-only path. Qwen3 q/k head-norm
+// has no MLX kernel, so the Rust caller declines those models before calling
+// here (no q_norm/k_norm argument).
+//
+// !!! WRITE-BLIND — authored on a non-Apple host, NEVER compiled (`xcrun metal`
+// / clang ObjC++ only exist on macOS) or run on a GPU. The first Mac build is
+// expected to need fixes; it is PERF-gated off until `tune --dev-attn` measures
+// it a win AND `doctor --metal-parity` grades it OK vs the CPU reference. On a
+// non-Apple host this whole function is the inert stub below (returns 0).
+
+#if RSL_MLX_HAVE_METAL
+// Map a device-resident-block weight format code to its packed-matvec kernel +
+// K alignment. 0 = Q4_K (256-wide super-block), 1 = Q8_0 (32-wide block). The
+// Rust caller (try_decode_attn_block_mlx_f32) declines any other format, so an
+// unknown code never reaches here; a nil name ⇒ decline. Curated-small on
+// purpose — these two cover the overwhelming majority of real models, mirroring
+// the SYCL block's rsl_block_matvec_nowait (0=Q4_K, 1=Q8_0).
+static NSString *mlx_block_matvec_kernel(int code, int *k_align) {
+    switch (code) {
+        case 0: if (k_align) *k_align = 256; return @"rsl_mlx_matvec_q4_k_packed_f32_kernel";
+        case 1: if (k_align) *k_align = 32;  return @"rsl_mlx_matvec_q8_0_packed_f32_kernel";
+        default: if (k_align) *k_align = 0;  return nil;
+    }
+}
+#endif
+
+extern "C" int rsl_mlx_decode_attn_block_f32(
+    rsl_mlx_stream *s,
+    // q/k/v/o weights: DEVICE pointers (registry-resolvable) to the packed bytes
+    // + a format code each (0=Q4_K, 1=Q8_0). The Rust caller uploaded + cached
+    // them (one device buffer per weight, keyed by host byte-address).
+    const void *wq_dev, int kq,
+    const void *wk_dev, int kk,
+    const void *wv_dev, int kv_kind,
+    const void *wo_dev, int ko,
+    // Norms + inv_freq as HOST f32 (staged into the slab here — tiny O(d_model)
+    // vectors, unlike the big cached weights).
+    const float *attn_norm, const float *ffn_norm, const float *inv_freq,
+    // hidden: HOST f32, in (pre-attn residual) AND out (post-attn residual).
+    float *hidden,
+    // h_norm2: HOST f32 out — the post-attn RMSNorm == the FFN input.
+    float *h_norm2,
+    // k_row / v_row: HOST f32 out — this token's post-RoPE K / plain V
+    // (head-major), for the caller to append to the host KV cache.
+    float *k_row, float *v_row,
+    // KV MIRROR: the layer's persistent F32 device-resident K/V buffers
+    // (DEVICE pointers, registry-resolvable), already seeded with the prefill
+    // history rows [0, pos) by the caller.
+    void *k_mirror, void *v_mirror,
+    int n_heads, int n_kv_heads, int head_dim, int d_model,
+    int pos, int max_ctx, int kv_len, float rms_eps) {
+#if RSL_MLX_HAVE_METAL
+    if (!s || !wq_dev || !wk_dev || !wv_dev || !wo_dev || !attn_norm || !ffn_norm
+        || !inv_freq || !hidden || !h_norm2 || !k_row || !v_row || !k_mirror
+        || !v_mirror) {
+        return 0;
+    }
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || d_model <= 0
+        || (head_dim % 2) != 0 || (n_heads % n_kv_heads) != 0
+        || kv_len <= 0 || kv_len > max_ctx || pos < 0 || pos >= max_ctx) {
+        return 0;
+    }
+    const int d_q = n_heads * head_dim;
+    const int d_kv = n_kv_heads * head_dim;
+    const int half = head_dim / 2;
+    // Per-weight matvec kernel + K alignment (fail-closed on an unknown code or
+    // a non-K-aligned dim — q/k/v consume K=d_model, o consumes K=d_q).
+    int aq = 0, ak = 0, av = 0, ao = 0;
+    NSString *mvq_name = mlx_block_matvec_kernel(kq, &aq);
+    NSString *mvk_name = mlx_block_matvec_kernel(kk, &ak);
+    NSString *mvv_name = mlx_block_matvec_kernel(kv_kind, &av);
+    NSString *mvo_name = mlx_block_matvec_kernel(ko, &ao);
+    if (mvq_name == nil || mvk_name == nil || mvv_name == nil || mvo_name == nil) return 0;
+    if ((d_model % aq) != 0 || (d_model % ak) != 0 || (d_model % av) != 0 || (d_q % ao) != 0) {
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLDevice> dev = s->device;
+        // Resolve weights + KV mirrors to (buffer, offset). All were allocated
+        // through rsl_mlx_malloc_* so they are in the registry; a miss ⇒ decline.
+        size_t owq=0, owk=0, owv=0, owo=0, okm=0, ovm=0;
+        id<MTLBuffer> bwq = mlx_resolve(wq_dev, &owq);
+        id<MTLBuffer> bwk = mlx_resolve(wk_dev, &owk);
+        id<MTLBuffer> bwv = mlx_resolve(wv_dev, &owv);
+        id<MTLBuffer> bwo = mlx_resolve(wo_dev, &owo);
+        id<MTLBuffer> bkm = mlx_resolve(k_mirror, &okm);
+        id<MTLBuffer> bvm = mlx_resolve(v_mirror, &ovm);
+        if (bwq==nil||bwk==nil||bwv==nil||bwo==nil||bkm==nil||bvm==nil) { g_rsl_mlx_errors++; return 0; }
+        // Build every pipeline up front so a missing/failed kernel declines
+        // BEFORE we encode anything (error latched by mlx_pipeline).
+        id<MTLComputePipelineState> pso_rms = mlx_pipeline(dev, @"rsl_mlx_rmsnorm_f32_kernel");
+        id<MTLComputePipelineState> pso_mvq = mlx_pipeline(dev, mvq_name);
+        id<MTLComputePipelineState> pso_mvk = mlx_pipeline(dev, mvk_name);
+        id<MTLComputePipelineState> pso_mvv = mlx_pipeline(dev, mvv_name);
+        id<MTLComputePipelineState> pso_rope = mlx_pipeline(dev, @"rsl_mlx_rope_f32_kernel");
+        id<MTLComputePipelineState> pso_kvw = mlx_pipeline(dev, @"rsl_mlx_kv_write_f32_kernel");
+        id<MTLComputePipelineState> pso_flash = mlx_pipeline(dev, @"rsl_mlx_flash_attn_decode_f32_kernel");
+        id<MTLComputePipelineState> pso_mvo = mlx_pipeline(dev, mvo_name);
+        id<MTLComputePipelineState> pso_add = mlx_pipeline(dev, @"rsl_mlx_add_rmsnorm_f32_kernel");
+        if (pso_rms==nil||pso_mvq==nil||pso_mvk==nil||pso_mvv==nil||pso_rope==nil
+            ||pso_kvw==nil||pso_flash==nil||pso_mvo==nil||pso_add==nil) {
+            return 0;  // error already latched
+        }
+        // ONE slab for every intermediate activation + the tiny norm/inv_freq
+        // host copies. StorageModeShared ⇒ `.contents` is host-addressable, so
+        // host inputs stage in and host outputs read back with plain memcpy (no
+        // explicit H2D/D2H). Single alloc + single free per call; the WIN is
+        // collapsing the ~10 commit+wait pairs into one, not avoiding this slab.
+        //   layout: hidden | hnorm | q | k | v | attn | o | hnorm2 | an | fn | if
+        const size_t off_hidden = 0;
+        const size_t off_hnorm  = off_hidden + (size_t)d_model;
+        const size_t off_q      = off_hnorm  + (size_t)d_model;
+        const size_t off_k      = off_q      + (size_t)d_q;
+        const size_t off_v      = off_k      + (size_t)d_kv;
+        const size_t off_attn   = off_v      + (size_t)d_kv;
+        const size_t off_o      = off_attn   + (size_t)d_q;
+        const size_t off_hnorm2 = off_o      + (size_t)d_model;
+        const size_t off_an     = off_hnorm2 + (size_t)d_model;
+        const size_t off_fn     = off_an     + (size_t)d_model;
+        const size_t off_if     = off_fn     + (size_t)d_model;
+        const size_t slab_elems = off_if     + (size_t)half;
+        id<MTLBuffer> slab = [dev newBufferWithLength:slab_elems * sizeof(float)
+                                              options:MTLResourceStorageModeShared];
+        if (slab == nil) { g_rsl_mlx_errors++; return 0; }
+        float *sb = (float *)[slab contents];
+        // Stage host inputs into the slab.
+        std::memcpy(sb + off_hidden, hidden,    (size_t)d_model * sizeof(float));
+        std::memcpy(sb + off_an,     attn_norm, (size_t)d_model * sizeof(float));
+        std::memcpy(sb + off_fn,     ffn_norm,  (size_t)d_model * sizeof(float));
+        std::memcpy(sb + off_if,     inv_freq,  (size_t)half    * sizeof(float));
+
+        // Scalar args (setBytes copies immediately, so locals may be reused /
+        // reassigned after each call). Byte offsets into the slab are element
+        // offsets * 4 — 4-byte aligned, which is the only requirement for a
+        // `device`-address-space binding on Apple-family GPUs (the one HW this
+        // real path runs on).
+        const int dm = d_model, nh = n_heads, nkv = n_kv_heads, hd = head_dim;
+        const int pp = pos, mc = max_ctx, kl = kv_len, one = 1;
+        const float eps = rms_eps;
+
+        id<MTLCommandBuffer> cb = [s->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+        // --- 1. h_norm = rmsnorm(hidden) * attn_norm (one 32-lane group) ---
+        [enc setComputePipelineState:pso_rms];
+        [enc setBuffer:slab offset:off_hidden * sizeof(float) atIndex:0];
+        [enc setBuffer:slab offset:off_an     * sizeof(float) atIndex:1];
+        [enc setBuffer:slab offset:off_hnorm  * sizeof(float) atIndex:2];
+        [enc setBytes:&dm length:sizeof(int) atIndex:3];
+        [enc setBytes:&eps length:sizeof(float) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+        // --- 2. q = Wq @ h_norm ; k = Wk @ h_norm ; v = Wv @ h_norm ---
+        // Each: one 32-lane group per output row; W at index 0, x (h_norm) at 1,
+        // out at 2, then K/M/N scalars. K = d_model for all three.
+        { int kcol = d_model, mrow = d_q;
+          [enc setComputePipelineState:pso_mvq];
+          [enc setBuffer:bwq offset:owq atIndex:0];
+          [enc setBuffer:slab offset:off_hnorm * sizeof(float) atIndex:1];
+          [enc setBuffer:slab offset:off_q     * sizeof(float) atIndex:2];
+          [enc setBytes:&kcol length:sizeof(int) atIndex:3];
+          [enc setBytes:&mrow length:sizeof(int) atIndex:4];
+          [enc setBytes:&one length:sizeof(int) atIndex:5];
+          [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)d_q, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; }
+        { int kcol = d_model, mrow = d_kv;
+          [enc setComputePipelineState:pso_mvk];
+          [enc setBuffer:bwk offset:owk atIndex:0];
+          [enc setBuffer:slab offset:off_hnorm * sizeof(float) atIndex:1];
+          [enc setBuffer:slab offset:off_k     * sizeof(float) atIndex:2];
+          [enc setBytes:&kcol length:sizeof(int) atIndex:3];
+          [enc setBytes:&mrow length:sizeof(int) atIndex:4];
+          [enc setBytes:&one length:sizeof(int) atIndex:5];
+          [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)d_kv, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; }
+        { int kcol = d_model, mrow = d_kv;
+          [enc setComputePipelineState:pso_mvv];
+          [enc setBuffer:bwv offset:owv atIndex:0];
+          [enc setBuffer:slab offset:off_hnorm * sizeof(float) atIndex:1];
+          [enc setBuffer:slab offset:off_v     * sizeof(float) atIndex:2];
+          [enc setBytes:&kcol length:sizeof(int) atIndex:3];
+          [enc setBytes:&mrow length:sizeof(int) atIndex:4];
+          [enc setBytes:&one length:sizeof(int) atIndex:5];
+          [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)d_kv, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; }
+
+        // --- 3. RoPE q (n_heads) + RoPE k (n_kv_heads), in place ---
+        { const NSUInteger total = (NSUInteger)n_heads * (NSUInteger)half;
+          const NSUInteger tg = 256;
+          [enc setComputePipelineState:pso_rope];
+          [enc setBuffer:slab offset:off_q  * sizeof(float) atIndex:0];
+          [enc setBuffer:slab offset:off_if * sizeof(float) atIndex:1];
+          [enc setBytes:&nh length:sizeof(int) atIndex:2];
+          [enc setBytes:&hd length:sizeof(int) atIndex:3];
+          [enc setBytes:&pp length:sizeof(int) atIndex:4];
+          [enc dispatchThreadgroups:MTLSizeMake((total + tg - 1) / tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)]; }
+        { const NSUInteger total = (NSUInteger)n_kv_heads * (NSUInteger)half;
+          const NSUInteger tg = 256;
+          [enc setComputePipelineState:pso_rope];
+          [enc setBuffer:slab offset:off_k  * sizeof(float) atIndex:0];
+          [enc setBuffer:slab offset:off_if * sizeof(float) atIndex:1];
+          [enc setBytes:&nkv length:sizeof(int) atIndex:2];
+          [enc setBytes:&hd length:sizeof(int) atIndex:3];
+          [enc setBytes:&pp length:sizeof(int) atIndex:4];
+          [enc dispatchThreadgroups:MTLSizeMake((total + tg - 1) / tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)]; }
+
+        // --- 4. Scatter post-RoPE k / plain v into the F32 mirror at `pos` ---
+        { const NSUInteger total = (NSUInteger)n_kv_heads * (NSUInteger)head_dim;
+          const NSUInteger tg = 256;
+          [enc setComputePipelineState:pso_kvw];
+          [enc setBuffer:slab offset:off_k * sizeof(float) atIndex:0];
+          [enc setBuffer:bkm offset:okm atIndex:1];
+          [enc setBytes:&nkv length:sizeof(int) atIndex:2];
+          [enc setBytes:&hd length:sizeof(int) atIndex:3];
+          [enc setBytes:&pp length:sizeof(int) atIndex:4];
+          [enc setBytes:&mc length:sizeof(int) atIndex:5];
+          [enc dispatchThreadgroups:MTLSizeMake((total + tg - 1) / tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+          [enc setComputePipelineState:pso_kvw];
+          [enc setBuffer:slab offset:off_v * sizeof(float) atIndex:0];
+          [enc setBuffer:bvm offset:ovm atIndex:1];
+          [enc setBytes:&nkv length:sizeof(int) atIndex:2];
+          [enc setBytes:&hd length:sizeof(int) atIndex:3];
+          [enc setBytes:&pp length:sizeof(int) atIndex:4];
+          [enc setBytes:&mc length:sizeof(int) atIndex:5];
+          [enc dispatchThreadgroups:MTLSizeMake((total + tg - 1) / tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)]; }
+
+        // --- 5. FlashAttention decode over the mirror [0, kv_len) → attn ---
+        [enc setComputePipelineState:pso_flash];
+        [enc setBuffer:slab offset:off_q * sizeof(float) atIndex:0];
+        [enc setBuffer:bkm offset:okm atIndex:1];
+        [enc setBuffer:bvm offset:ovm atIndex:2];
+        [enc setBuffer:slab offset:off_attn * sizeof(float) atIndex:3];
+        [enc setBytes:&nh length:sizeof(int) atIndex:4];
+        [enc setBytes:&nkv length:sizeof(int) atIndex:5];
+        [enc setBytes:&hd length:sizeof(int) atIndex:6];
+        [enc setBytes:&mc length:sizeof(int) atIndex:7];
+        [enc setBytes:&kl length:sizeof(int) atIndex:8];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+        // --- 6. o = Wo @ attn (K = d_q, M = d_model) ---
+        { int kcol = d_q, mrow = d_model;
+          [enc setComputePipelineState:pso_mvo];
+          [enc setBuffer:bwo offset:owo atIndex:0];
+          [enc setBuffer:slab offset:off_attn * sizeof(float) atIndex:1];
+          [enc setBuffer:slab offset:off_o    * sizeof(float) atIndex:2];
+          [enc setBytes:&kcol length:sizeof(int) atIndex:3];
+          [enc setBytes:&mrow length:sizeof(int) atIndex:4];
+          [enc setBytes:&one length:sizeof(int) atIndex:5];
+          [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)d_model, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; }
+
+        // --- 7. hidden += o ; h_norm2 = rmsnorm(hidden) * ffn_norm ---
+        [enc setComputePipelineState:pso_add];
+        [enc setBuffer:slab offset:off_hidden * sizeof(float) atIndex:0];
+        [enc setBuffer:slab offset:off_o      * sizeof(float) atIndex:1];
+        [enc setBuffer:slab offset:off_fn     * sizeof(float) atIndex:2];
+        [enc setBuffer:slab offset:off_hnorm2 * sizeof(float) atIndex:3];
+        [enc setBytes:&dm length:sizeof(int) atIndex:4];
+        [enc setBytes:&eps length:sizeof(float) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+        // ONE commit + ONE wait for the whole layer's chain.
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) { g_rsl_mlx_errors++; return 0; }
+
+        // Slab is host-addressable; read the results back.
+        std::memcpy(hidden,  sb + off_hidden, (size_t)d_model * sizeof(float));
+        std::memcpy(h_norm2, sb + off_hnorm2, (size_t)d_model * sizeof(float));
+        std::memcpy(k_row,   sb + off_k,      (size_t)d_kv    * sizeof(float));
+        std::memcpy(v_row,   sb + off_v,      (size_t)d_kv    * sizeof(float));
+        return 1;
+    }
+#else
+    (void)s; (void)wq_dev; (void)kq; (void)wk_dev; (void)kk; (void)wv_dev;
+    (void)kv_kind; (void)wo_dev; (void)ko; (void)attn_norm; (void)ffn_norm;
+    (void)inv_freq; (void)hidden; (void)h_norm2; (void)k_row; (void)v_row;
+    (void)k_mirror; (void)v_mirror; (void)n_heads; (void)n_kv_heads;
+    (void)head_dim; (void)d_model; (void)pos; (void)max_ctx; (void)kv_len;
+    (void)rms_eps;
+    return 0;  // inert off Apple Silicon — the caller runs the per-op/CPU ladder
+#endif
+}
