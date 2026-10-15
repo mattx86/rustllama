@@ -4323,6 +4323,51 @@ pub struct DecodeSlot<'a> {
     pub logits_out: &'a mut [f32],
 }
 
+/// One slot's contribution to a RAGGED mixed-batch forward
+/// ([`LlamaModel::forward_ragged_paged_f32`], Feature 3b). A ragged batch
+/// concatenates several slots' query tokens end-to-end into ONE token buffer so
+/// the input projections + FFN batch over the whole concatenated token dim in a
+/// single kernel launch, while attention loops per slot (each slot has its own
+/// positions, causal mask, and paged KV history).
+///
+/// Per-slot descriptor semantics — this is the subtle bookkeeping:
+///   - `n_query` is how many query tokens this slot contributes. `n_query == 1`
+///     ⇒ a **DECODE** row (one new token; gather `[0, pos+1)` + flash-decode).
+///     `n_query > 1` ⇒ a **PREFILL CHUNK** (several new prompt tokens;
+///     flash-prefill with varlen causal masking). One ragged batch may freely
+///     mix both kinds — that is the whole point of the feature.
+///   - `start_pos` is the ABSOLUTE KV position of this slot's FIRST query token.
+///     Query `j` (`j in 0..n_query`) sits at absolute position `start_pos + j`,
+///     which drives three things at once: its RoPE rotation angle, the paged-KV
+///     write slot, and the causal-mask base (`kv_len_base = start_pos`, so query
+///     `j` attends `[0, start_pos + j]`). For a decode row this is just the
+///     slot's current `pos`.
+///   - The slot's rows occupy the CONTIGUOUS range `[row_off, row_off+n_query)`
+///     of the concatenated buffers, where `row_off` is the running sum of the
+///     preceding slots' `n_query` — so the `tokens` buffer handed to the forward
+///     MUST be laid out in the same slot order as the descriptor slice. The
+///     forward recomputes `row_off` internally and asserts
+///     `sum(n_query) == tokens.len()`.
+///   - `cache` is this slot's paged KV cache (the `kv_page_table` of the plan):
+///     the forward appends `n_query` new K/V rows at `[start_pos,
+///     start_pos+n_query)` and gathers `[0, start_pos+n_query)` for attention.
+///   - `logits_out` is a `[vocab_size]` buffer for this slot's LAST query
+///     token's logits, OR an EMPTY slice to SKIP the LM head for this slot. A
+///     decode row passes a real buffer (it samples its next token); a prefill
+///     chunk that has not yet reached the prompt's end passes an empty slice
+///     (its logits are unused — exactly as the serial paged prefill discards
+///     them), so the LM head only runs for the rows that need it.
+///
+/// As with [`DecodeSlot`], the per-slot `cache` / `logits_out` borrows must be
+/// disjoint across slots — the caller builds them from by-index disjoint
+/// borrows.
+pub struct RaggedSlot<'a> {
+    pub n_query: usize,
+    pub start_pos: u32,
+    pub cache: &'a mut crate::paged_kv_cache::PagedKvCache,
+    pub logits_out: &'a mut [f32],
+}
+
 impl LlamaModel {
     /// Enumerate the model's CPU-backed weight ranges in page-lock
     /// priority order (tier 0 first). The Windows page-lock path
@@ -9522,6 +9567,446 @@ impl LlamaModel {
         for (i, slot) in slots.iter_mut().enumerate() {
             slot.logits_out
                 .copy_from_slice(&logits_all[i * vocab..(i + 1) * vocab]);
+        }
+    }
+
+    /// Feature 3b: a TRUE RAGGED mixed prefill+decode forward over a paged KV
+    /// pool (F32 KV). ONE forward pass advances several slots at once, where
+    /// each slot is EITHER mid-prompt-prefill (contributing `n_query > 1` chunk
+    /// tokens) OR decoding (contributing a single `n_query == 1` query row) —
+    /// freely mixed in the same batch. This unifies what the driver previously
+    /// did as two separate forwards ([`Self::forward_prefill_paged_f32`] then
+    /// [`Self::forward_decode_paged_batched_f32`]); the budget-0 driver path
+    /// still uses those two directly, so this is the single path only when the
+    /// per-tick batched-token budget is on.
+    ///
+    /// # How the batch is laid out
+    ///
+    /// `tokens` is the CONCATENATED query-token buffer: slot 0's `n_query`
+    /// tokens, then slot 1's, … in `slots` order. Slot `s`'s rows occupy
+    /// `[row_off(s), row_off(s)+n_query(s))` of every per-token scratch buffer,
+    /// where `row_off(s)` is the running sum of the preceding slots' `n_query`.
+    /// `total = Σ n_query` is the batched row count and MUST equal
+    /// `tokens.len()`.
+    ///
+    /// # What batches vs what loops (the core of the feature)
+    ///
+    /// * **Input projections + FFN batch over the concatenated row dim.** The
+    ///   Q/K/V projections, the attention-output projection, and the dense/MoE
+    ///   FFN each run ONCE over all `total` rows via
+    ///   [`matvec_tensor_batched_dispatch`] (or the per-row MoE loop). These ops
+    ///   are per-row INDEPENDENT — row `r`'s output depends only on row `r`'s
+    ///   input and the (shared, read-only) weights — so batching `n_a` prefill
+    ///   rows together with `n_b` decode rows produces, for each row, EXACTLY
+    ///   the value that row would get if projected alone. That independence is
+    ///   what makes the ragged pass bit-identical (up to fp reduction order) to
+    ///   running the slots' prefills and decodes as separate forwards, and it is
+    ///   the whole throughput win (one kernel launch instead of two).
+    ///
+    /// * **RoPE, the paged KV write, the gather, and attention loop PER SLOT.**
+    ///   Position is per-token (`start_pos + j`), causal masking is per-slot
+    ///   (`kv_len_base = start_pos`), and each slot reads its own paged KV
+    ///   history — none of that can be shared across slots, so these stay in a
+    ///   per-slot loop. A slot with `n_query > 1` routes through the varlen
+    ///   causal `gqa_attention_flash_prefill*` (identical mask to the serial
+    ///   paged prefill); a slot with `n_query == 1` does the decode gather +
+    ///   `gqa_attention_flash_decode*` / `gqa_attention_one_step*` at the same
+    ///   `flash_kv_len_min()` threshold the batched decoder uses — so each
+    ///   slot's attention output is bit-identical to its standalone forward.
+    ///
+    /// # SWA / softcap
+    ///
+    /// The per-layer sliding-window span and Gemma2 attention-logit soft-cap are
+    /// threaded into the attention calls (the `*_capped_windowed` kernels + the
+    /// window/softcap args of the GPU prefill hook), so an SWA / Gemma2 model
+    /// stays correct inside a mixed batch. At `window == 0` / `softcap == 0.0`
+    /// (every ordinary model) these delegate to the plain kernels and are
+    /// byte-identical to the non-ragged paged forwards.
+    ///
+    /// # Logits
+    ///
+    /// Only slots with a non-empty `logits_out` get the final norm + LM head
+    /// (decode rows that need to sample); a prefill chunk mid-prompt passes an
+    /// empty slice and its LM head is skipped — matching the serial paged
+    /// prefill, which discards all but the last token's logits (and here even
+    /// those, since the driver samples a prefilled slot on the NEXT tick's
+    /// decode row, not from its final prefill chunk).
+    ///
+    /// # Contract
+    ///
+    /// F32 paged KV only (the paged v1 dtype). The caller must have
+    /// `ensure_capacity_shared`'d each slot's cache to at least
+    /// `start_pos + n_query`. Per-slot `cache` / `logits_out` borrows must be
+    /// disjoint. Parity is pinned by
+    /// `forward_ragged_paged_f32_mixed_matches_sequential_prefill_then_decode`.
+    pub fn forward_ragged_paged_f32(
+        &self,
+        tokens: &[i32],
+        slots: &mut [crate::llama_arch::RaggedSlot<'_>],
+        shared: &crate::shared_paged_kv::SharedPagedKv,
+    ) {
+        let n_slots = slots.len();
+        if n_slots == 0 {
+            return;
+        }
+        let cfg = &self.cfg;
+        let d = cfg.d_model;
+        let n_heads = cfg.n_heads;
+        let n_kv_heads = cfg.n_kv_heads;
+        let head_dim = cfg.head_dim;
+        let d_q = n_heads * head_dim;
+        let d_kv = n_kv_heads * head_dim;
+        let d_ff = cfg.d_ff;
+        let vocab = cfg.vocab_size;
+
+        // Running-sum row offset per slot into the concatenated `[total]` row
+        // dim. `tokens` MUST be laid out in this same slot order; we assert the
+        // total matches so a misbuilt batch panics at the boundary, not inside a
+        // wrong-size gather 300 lines down.
+        let total: usize = slots.iter().map(|s| s.n_query).sum();
+        assert_eq!(
+            total,
+            tokens.len(),
+            "ragged forward: concatenated token count {} != Σ n_query {}",
+            tokens.len(),
+            total,
+        );
+        if total == 0 {
+            return;
+        }
+        let mut row_off = vec![0usize; n_slots];
+        {
+            let mut acc = 0usize;
+            for (i, s) in slots.iter().enumerate() {
+                row_off[i] = acc;
+                acc += s.n_query;
+            }
+        }
+        // Per-slot sanity (cheap; pins the panic site to the bad slot).
+        for (i, s) in slots.iter().enumerate() {
+            assert!(s.n_query >= 1, "ragged slot {i}: n_query must be >= 1");
+            debug_assert!(
+                (s.start_pos as usize + s.n_query) as u32 <= s.cache.capacity_tokens(),
+                "ragged slot {i}: end pos {} > cache capacity {} \
+                 (caller must ensure_capacity_shared first)",
+                s.start_pos as usize + s.n_query,
+                s.cache.capacity_tokens(),
+            );
+            debug_assert!(
+                s.logits_out.is_empty() || s.logits_out.len() == vocab,
+                "ragged slot {i}: logits_out len {} must be 0 (skip LM head) or vocab {vocab}",
+                s.logits_out.len(),
+            );
+        }
+
+        // Batched scratch over the concatenated row dim — same shapes the
+        // prefill / batched-decode mirrors use, just sized to `total` rows that
+        // may belong to different slots.
+        let mut hidden = vec![0f32; total * d];
+        let mut h_norm = vec![0f32; total * d];
+        let mut q_buf = vec![0f32; total * d_q];
+        let mut k_buf = vec![0f32; total * d_kv];
+        let mut v_buf = vec![0f32; total * d_kv];
+        let mut attn_out = vec![0f32; total * d_q];
+        let mut attn_proj = vec![0f32; total * d];
+        let mut gate_buf = vec![0f32; total * d_ff];
+        let mut up_buf = vec![0f32; total * d_ff];
+        let mut ffn_buf = vec![0f32; total * d_ff];
+        let mut ffn_out = vec![0f32; total * d];
+
+        // Per-layer gather slab, reused across slots within a layer (each slot's
+        // gather overwrites it before that slot's attention reads it). Sized to
+        // the largest slot's kv_len so one buffer covers every slot.
+        let max_kv_len = slots
+            .iter()
+            .map(|s| s.start_pos as usize + s.n_query)
+            .max()
+            .unwrap_or(0);
+        let slab_len = n_kv_heads * max_kv_len * head_dim;
+        let mut k_slab = vec![0f32; slab_len];
+        let mut v_slab = vec![0f32; slab_len];
+
+        // Embed every concatenated token into its hidden row.
+        for (r, &tok) in tokens.iter().enumerate() {
+            k::embed_lookup_tensor(
+                &self.weights.token_embd,
+                &[tok],
+                &mut hidden[r * d..(r + 1) * d],
+                d,
+            );
+        }
+
+        // MoE per-token scratch (per-token routing ⇒ a per-row loop, exactly
+        // like the batched decoder).
+        let moe_cfg = cfg.moe.clone();
+        let (mut moe_gate_one, mut moe_up_one, mut moe_ff_one, mut moe_down_one) =
+            if moe_cfg.is_some() {
+                (vec![0f32; d_ff], vec![0f32; d_ff], vec![0f32; d_ff], vec![0f32; d])
+            } else {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            };
+        let (mut moe_expert_logits, mut moe_routed_picks) = if let Some(m) = moe_cfg.as_ref() {
+            (vec![0f32; m.n_experts as usize], Vec::with_capacity(m.n_experts_used as usize))
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        let attn_views: Vec<&dyn AttnBlock> =
+            if let Some(mbs) = self.weights.moe_blocks.as_ref() {
+                mbs.iter().map(|b| b as &dyn AttnBlock).collect()
+            } else {
+                self.weights
+                    .blocks
+                    .iter()
+                    .map(|b| b as &dyn AttnBlock)
+                    .collect()
+            };
+
+        let n_layers_used = std::env::var("RUSTLLAMA_MAX_LAYERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(attn_views.len())
+            .min(attn_views.len());
+
+        for (layer_idx, block) in attn_views.iter().take(n_layers_used).enumerate() {
+            crate::accel::set_current_layer_idx(layer_idx as u32);
+            // Per-row pre-attention rmsnorm.
+            for r in 0..total {
+                k::rmsnorm_f32_row(
+                    &hidden[r * d..(r + 1) * d],
+                    block.attn_norm(),
+                    &mut h_norm[r * d..(r + 1) * d],
+                    cfg.rms_eps,
+                );
+            }
+            // Batched Q / K / V projections over the whole concatenated row dim.
+            matvec_tensor_batched_dispatch(block.w_q(), &h_norm, &mut q_buf, d_q, d, total);
+            matvec_tensor_batched_dispatch(block.w_k(), &h_norm, &mut k_buf, d_kv, d, total);
+            matvec_tensor_batched_dispatch(block.w_v(), &h_norm, &mut v_buf, d_kv, d, total);
+
+            // Per-slot / per-token bias + Qwen3 q/k-norm + RoPE. Position is
+            // `start_pos + j` for query `j` in the slot (for a decode row,
+            // `start_pos` itself). q/k/v live in separate buffers so the three
+            // disjoint `&mut` row slices coexist.
+            for (i, s) in slots.iter().enumerate() {
+                let base = row_off[i];
+                for j in 0..s.n_query {
+                    let r = base + j;
+                    let q_row = &mut q_buf[r * d_q..(r + 1) * d_q];
+                    let k_row = &mut k_buf[r * d_kv..(r + 1) * d_kv];
+                    let v_row = &mut v_buf[r * d_kv..(r + 1) * d_kv];
+                    if let Some(bq) = block.b_q() {
+                        k::add_inplace_f32(q_row, bq);
+                    }
+                    if let Some(bk) = block.b_k() {
+                        k::add_inplace_f32(k_row, bk);
+                    }
+                    if let Some(bv) = block.b_v() {
+                        k::add_inplace_f32(v_row, bv);
+                    }
+                    apply_qk_head_norm(
+                        block.q_norm(),
+                        block.k_norm(),
+                        q_row,
+                        k_row,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        cfg.rms_eps,
+                    );
+                    let pos = s.start_pos + j as u32;
+                    self.rope_inplace(q_row, n_heads, head_dim, pos);
+                    self.rope_inplace(k_row, n_kv_heads, head_dim, pos);
+                }
+            }
+
+            // Per-slot: write this slot's new K/V rows, gather its full KV
+            // history for the layer, run the slot-kind-appropriate attention.
+            let swa_win = cfg.swa_window(layer_idx);
+            let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
+            for (i, s) in slots.iter_mut().enumerate() {
+                let base = row_off[i];
+                let kv_len = s.start_pos as usize + s.n_query;
+                // Write each of this slot's new tokens' K/V rows.
+                for j in 0..s.n_query {
+                    let r = base + j;
+                    let pos = s.start_pos + j as u32;
+                    let k_row = &k_buf[r * d_kv..(r + 1) * d_kv];
+                    let v_row = &v_buf[r * d_kv..(r + 1) * d_kv];
+                    s.cache
+                        .write_token_shared(shared, layer_idx as u32, pos, k_row, v_row)
+                        .expect("ragged write_token_shared: pos < capacity (asserted above)");
+                }
+                // Gather `[0, kv_len)` into the shared slab prefix.
+                let slab_used = n_kv_heads * kv_len * head_dim;
+                let k_slice = &mut k_slab[..slab_used];
+                let v_slice = &mut v_slab[..slab_used];
+                s.cache
+                    .gather_layer_shared(shared, layer_idx as u32, k_slice, v_slice)
+                    .expect("ragged gather_layer_shared: cache covers kv_len positions");
+
+                let q_slice = &q_buf[base * d_q..(base + s.n_query) * d_q];
+                let out_slice = &mut attn_out[base * d_q..(base + s.n_query) * d_q];
+                if s.n_query > 1 {
+                    // PREFILL CHUNK — varlen causal flash-prefill. `kv_len_base
+                    // = start_pos`, `n_new = n_query`: query `j` attends
+                    // `[0, start_pos + j]`, exactly the serial paged prefill's
+                    // mask. GPU hook first (self-contained copy-in/out; inert
+                    // off-GPU), CPU capped+windowed fallback otherwise.
+                    let used_gpu = crate::accel::try_flash_attn_prefill_gpu_f32(
+                        q_slice,
+                        k_slice,
+                        v_slice,
+                        out_slice,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        kv_len,
+                        s.start_pos as usize,
+                        s.n_query,
+                        swa_win as u32,
+                        softcap,
+                    );
+                    if !used_gpu {
+                        k::gqa_attention_flash_prefill_capped_windowed(
+                            q_slice,
+                            k_slice,
+                            v_slice,
+                            out_slice,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            kv_len,
+                            s.start_pos as usize,
+                            s.n_query,
+                            swa_win,
+                            softcap,
+                        );
+                    }
+                } else {
+                    // DECODE ROW — gather + flash-decode / standard at the same
+                    // threshold the batched decoder uses, so this row is
+                    // bit-identical to its standalone decode. No GPU decode hook
+                    // here: like `forward_decode_paged_batched_f32`, the batched
+                    // paged path does not seed the device-resident KV mirror the
+                    // GPU decode kernel needs, so decode stays on the CPU slab.
+                    let flash_min = flash_kv_len_min();
+                    if crate::accel::flash_attention_enabled() && kv_len >= flash_min {
+                        k::gqa_attention_flash_decode_capped_windowed(
+                            q_slice, k_slice, v_slice, out_slice, n_heads, n_kv_heads, head_dim,
+                            kv_len, kv_len, swa_win, softcap,
+                        );
+                    } else {
+                        k::gqa_attention_one_step_capped_windowed(
+                            q_slice, k_slice, v_slice, out_slice, n_heads, n_kv_heads, head_dim,
+                            kv_len, kv_len, swa_win, softcap,
+                        );
+                    }
+                }
+            }
+
+            // Batched output projection + per-row residual + post-attn rmsnorm.
+            matvec_tensor_batched_dispatch(block.w_o(), &attn_out, &mut attn_proj, d, d_q, total);
+            for r in 0..total {
+                let proj_row = &attn_proj[r * d..(r + 1) * d];
+                let h_row = &mut hidden[r * d..(r + 1) * d];
+                if !skip_attn_enabled() {
+                    k::add_inplace_f32(h_row, proj_row);
+                }
+                let n_row = &mut h_norm[r * d..(r + 1) * d];
+                k::rmsnorm_f32_row(h_row, block.ffn_norm(), n_row, cfg.rms_eps);
+            }
+            // FFN: per-row MoE loop OR dense batched matvec ladder.
+            if let Some(moe) = moe_cfg.as_ref() {
+                let mb = &self.weights.moe_blocks.as_ref().unwrap()[layer_idx];
+                for r in 0..total {
+                    let n_row = &h_norm[r * d..(r + 1) * d];
+                    let out_row = &mut ffn_out[r * d..(r + 1) * d];
+                    crate::moe::moe_ffn_one_into(
+                        n_row,
+                        mb,
+                        d,
+                        d_ff,
+                        moe.n_experts as usize,
+                        moe.n_experts_used as usize,
+                        out_row,
+                        &mut moe_gate_one,
+                        &mut moe_up_one,
+                        &mut moe_ff_one,
+                        &mut moe_down_one,
+                        &mut moe_expert_logits,
+                        &mut moe_routed_picks,
+                    );
+                }
+            } else {
+                let dense_block = &self.weights.blocks[layer_idx];
+                matvec_tensor_batched_dispatch(
+                    &dense_block.w_gate, &h_norm, &mut gate_buf, d_ff, d, total,
+                );
+                matvec_tensor_batched_dispatch(
+                    &dense_block.w_up, &h_norm, &mut up_buf, d_ff, d, total,
+                );
+                for r in 0..total {
+                    k::silu_mul_f32(
+                        &gate_buf[r * d_ff..(r + 1) * d_ff],
+                        &up_buf[r * d_ff..(r + 1) * d_ff],
+                        &mut ffn_buf[r * d_ff..(r + 1) * d_ff],
+                    );
+                }
+                matvec_tensor_batched_dispatch(
+                    &dense_block.w_down, &ffn_buf, &mut ffn_out, d, d_ff, total,
+                );
+            }
+            // Per-row FFN residual.
+            if !skip_ffn_enabled() {
+                for r in 0..total {
+                    k::add_inplace_f32(
+                        &mut hidden[r * d..(r + 1) * d],
+                        &ffn_out[r * d..(r + 1) * d],
+                    );
+                }
+            }
+        }
+
+        // Final norm + LM head for the rows that want logits only: the LAST
+        // query token of each slot carrying a non-empty `logits_out` (decode
+        // rows). Prefill chunks mid-prompt are skipped — their logits are unused
+        // (the driver samples a prefilled slot on its next tick's decode row).
+        // Per-row CPU rmsnorm here (bit-identical to the batched decoder's
+        // CPU-fallback final norm); the LM-head matmul still goes through the
+        // batched dispatch (one GEMM over the logit rows), row-independent so
+        // each row equals its standalone LM head.
+        let logit_rows: Vec<(usize, usize)> = slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.logits_out.is_empty())
+            .map(|(i, s)| (i, row_off[i] + s.n_query - 1))
+            .collect();
+        if logit_rows.is_empty() {
+            return;
+        }
+        let n_logit = logit_rows.len();
+        let lm_head = self
+            .weights
+            .output
+            .as_ref()
+            .unwrap_or(&self.weights.token_embd);
+        let mut final_norm = vec![0f32; n_logit * d];
+        for (p, &(_, row)) in logit_rows.iter().enumerate() {
+            k::rmsnorm_f32_row(
+                &hidden[row * d..(row + 1) * d],
+                &self.weights.output_norm,
+                &mut final_norm[p * d..(p + 1) * d],
+                cfg.rms_eps,
+            );
+        }
+        let mut logits_all = vec![0f32; n_logit * vocab];
+        matvec_tensor_batched_dispatch(lm_head, &final_norm, &mut logits_all, vocab, d, n_logit);
+        self.finalize_logits(&mut logits_all);
+        for (p, &(slot_i, _)) in logit_rows.iter().enumerate() {
+            slots[slot_i]
+                .logits_out
+                .copy_from_slice(&logits_all[p * vocab..(p + 1) * vocab]);
         }
     }
 

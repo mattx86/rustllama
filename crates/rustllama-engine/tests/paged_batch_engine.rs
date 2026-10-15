@@ -314,6 +314,76 @@ async fn paged_batch_streaming_two_concurrent_submits_each_matches_reference() {
     let _ = std::fs::remove_file(&tmp);
 }
 
+/// Feature 3b identity + ragged-driver end-to-end: with the batched-token
+/// budget ON (`load_with_batched_tokens`, ragged mixed prefill+decode) the
+/// generated tokens are IDENTICAL to the budget-0 inline path (pre-3b). The two
+/// engines run the same two concurrent prompts under greedy sampling; the
+/// budget-0 engine is the known-good reference (inline prefill +
+/// `forward_decode_paged_batched_f32`), the budgeted engine routes every tick
+/// through `forward_ragged_paged_f32`. Prompts are longer than the budget so
+/// the ragged path actually chunks the prefill across multiple ticks before
+/// steady-state decode. Byte-identical token streams ⇒ (a) budget-0 reproduces
+/// pre-3b and (b) the ragged fusion changed no output.
+#[tokio::test]
+async fn paged_batch_ragged_budget_matches_inline_budget_zero() {
+    let tmp = write_gguf("ragged-vs-inline");
+    let prompt_a: Vec<i32> = vec![5, 1, 4, 2, 3];
+    let prompt_b: Vec<i32> = vec![8, 0, 3, 7, 1];
+    let n_tokens = 4u32;
+
+    // Collect both slots' token-id streams from a 2-slot engine run concurrently.
+    async fn run_pair(
+        engine: &PagedBatchEngine,
+        pa: Vec<i32>,
+        pb: Vec<i32>,
+        n: u32,
+    ) -> (Vec<i32>, Vec<i32>) {
+        use futures::StreamExt;
+        let sa = engine.submit_streaming(pa, greedy(n)).expect("submit A");
+        let sb = engine.submit_streaming(pb, greedy(n)).expect("submit B");
+        let ca = async move {
+            let mut out = Vec::new();
+            let mut s = sa;
+            while let Some(item) = s.next().await {
+                out.push(item.expect("tok A").id as i32);
+            }
+            out
+        };
+        let cb = async move {
+            let mut out = Vec::new();
+            let mut s = sb;
+            while let Some(item) = s.next().await {
+                out.push(item.expect("tok B").id as i32);
+            }
+            out
+        };
+        futures::future::join(ca, cb).await
+    }
+
+    // Budget 0 = inline prefill + batched decode (pre-3b reference).
+    let inline = PagedBatchEngine::load_with_batched_tokens(&tmp, 32, 2, 0).expect("inline load");
+    let (in_a, in_b) = run_pair(&inline, prompt_a.clone(), prompt_b.clone(), n_tokens).await;
+    drop(inline);
+
+    // Budget > 0 = ragged mixed prefill+decode. Budget 2 < suffix len 5 forces
+    // multi-tick chunked prefill before decode.
+    let ragged = PagedBatchEngine::load_with_batched_tokens(&tmp, 32, 2, 2).expect("ragged load");
+    let (rg_a, rg_b) = run_pair(&ragged, prompt_a.clone(), prompt_b.clone(), n_tokens).await;
+    drop(ragged);
+
+    assert_eq!(in_a.len(), n_tokens as usize, "inline slot A token count");
+    assert_eq!(rg_a.len(), n_tokens as usize, "ragged slot A token count");
+    assert_eq!(
+        in_a, rg_a,
+        "ragged (budget>0) slot A diverged from inline (budget=0): ragged={rg_a:?} inline={in_a:?}"
+    );
+    assert_eq!(
+        in_b, rg_b,
+        "ragged (budget>0) slot B diverged from inline (budget=0): ragged={rg_b:?} inline={in_b:?}"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
 /// Dropping the engine cleanly shuts down the driver thread. The
 /// test relies on the driver's `recv() → None` path firing when
 /// the request channel closes; if shutdown were buggy the test

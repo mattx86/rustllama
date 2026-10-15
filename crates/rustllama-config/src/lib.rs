@@ -648,6 +648,27 @@ pub struct InferenceConfig {
     /// chunk-KV cache + the LMCache cold/disk tiers auto-size from free RAM.
     #[serde(default)]
     pub cacheblend_recompute_ratio: f32,
+    /// Continuous-batching token budget per driver tick for the fused-decode
+    /// **paged** serving engine (`[server].fused_decode = true`). `0` (the
+    /// default) = OFF: each request's prompt prefills INLINE at admission and
+    /// decode runs as its own batched forward — today's behavior, byte-identical.
+    ///
+    /// A positive value turns on the **ragged mixed prefill+decode** path: the
+    /// driver builds ONE forward per tick over a concatenated token buffer that
+    /// mixes in-progress prompt-prefill CHUNKS (budgeted to roughly this many
+    /// prompt tokens) with the 1-query decode rows of every active slot, so a
+    /// long prompt no longer monopolizes the driver and other slots keep
+    /// decoding (TTFT fairness + one fused kernel launch instead of a prefill
+    /// call then a decode call). The ragged forward is output-identical (up to
+    /// fp reduction order) to running those prefills and decodes separately —
+    /// pinned by the engine/model-crate parity tests. Paged-only + F32-only; a
+    /// non-paged or quant-KV config takes the existing path regardless.
+    ///
+    /// BACKS the `RUSTLLAMA_MAX_BATCHED_TOKENS` env var (which the paged driver
+    /// also reads): the env wins when set, matching the repo's env-over-config
+    /// tiering. Named after vLLM's `max_num_batched_tokens`.
+    #[serde(default)]
+    pub max_num_batched_tokens: u32,
     /// Memory-budget mode: `"manual"` (default) keeps the explicit
     /// knobs (`moe_expert_cache_mb`, `lock_ram_mb`) authoritative;
     /// `"auto"` derives the expert-cache budget at engine load from
@@ -917,6 +938,10 @@ impl Default for InferenceConfig {
             prefill_batched_hybrid: true,
             kv_persist_mb: 0,
             cacheblend_recompute_ratio: 0.0,
+            // Ragged mixed prefill+decode OFF by default: paged serving keeps
+            // the inline-prefill + separate-batched-decode path (byte-identical
+            // to pre-3b). Set >0 (or `RUSTLLAMA_MAX_BATCHED_TOKENS`) to fuse.
+            max_num_batched_tokens: 0,
             memory_budget: default_memory_budget(),
         }
     }

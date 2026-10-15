@@ -210,7 +210,26 @@ impl PagedBatchEngine {
         max_ctx: usize,
         max_slots: u32,
     ) -> Result<Self, CpuEngineError> {
-        Self::load_inner(path, max_ctx, max_slots, true)
+        // Config budget 0 ⇒ the ragged mixed path is OFF unless the
+        // `RUSTLLAMA_MAX_BATCHED_TOKENS` env var opts in (env still honored for
+        // back-compat; see `resolve_max_batched_tokens`).
+        Self::load_inner(path, max_ctx, max_slots, true, 0)
+    }
+
+    /// Same as [`Self::load`] but with the `[inference].max_num_batched_tokens`
+    /// config value threaded in. Feature 3b: a positive budget turns on the
+    /// ragged mixed prefill+decode driver path (one fused forward per tick). The
+    /// `RUSTLLAMA_MAX_BATCHED_TOKENS` env var still overrides it (env-over-config,
+    /// matching the repo's tiering) — see [`resolve_max_batched_tokens`]. The
+    /// resolved value is stamped into [`DriverContext::max_batched_tokens`] so
+    /// the driver loop never reads the env itself.
+    pub fn load_with_batched_tokens(
+        path: &Path,
+        max_ctx: usize,
+        max_slots: u32,
+        max_num_batched_tokens: usize,
+    ) -> Result<Self, CpuEngineError> {
+        Self::load_inner(path, max_ctx, max_slots, true, max_num_batched_tokens)
     }
 
     /// Same as [`Self::load`] but without a tokenizer — for callers
@@ -220,7 +239,7 @@ impl PagedBatchEngine {
         max_ctx: usize,
         max_slots: u32,
     ) -> Result<Self, CpuEngineError> {
-        Self::load_inner(path, max_ctx, max_slots, false)
+        Self::load_inner(path, max_ctx, max_slots, false, 0)
     }
 
     fn load_inner(
@@ -228,6 +247,7 @@ impl PagedBatchEngine {
         max_ctx: usize,
         max_slots: u32,
         with_tokenizer: bool,
+        config_max_batched_tokens: usize,
     ) -> Result<Self, CpuEngineError> {
         let max_slots = max_slots.max(1);
         let gguf = Gguf::open(path)?;
@@ -307,16 +327,22 @@ impl PagedBatchEngine {
             page_size,
             active_slot_count: Arc::clone(&active_slot_count),
             last_stats: Arc::clone(&last_stats),
-            // Chunked-prefill token budget per driver tick (Feature 3). `0`
-            // (unset) = OFF: `admit_request` does the whole prompt's prefill
-            // inline before the slot goes active, exactly as before. A positive
-            // value interleaves prefill CHUNKS with decode ticks so a long
-            // prompt stops monopolizing the driver and other slots keep
-            // decoding (TTFT fairness under concurrent load).
-            max_batched_tokens: std::env::var("RUSTLLAMA_MAX_BATCHED_TOKENS")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0),
+            // Chunked / ragged prefill token budget per driver tick (Features
+            // 3a + 3b). `0` (unset) = OFF: `admit_request` does the whole
+            // prompt's prefill inline before the slot goes active, exactly as
+            // before (byte-identical). A positive value defers prefill into
+            // budgeted CHUNKS and routes the tick through the RAGGED mixed
+            // forward (`forward_ragged_paged_f32`): one fused pass over the
+            // prefill chunks + the decode rows of every active slot, so a long
+            // prompt stops monopolizing the driver (TTFT fairness) and prefill
+            // + decode share a single kernel-launch sequence.
+            //
+            // Precedence (env-over-config, matching the repo's flag>env>config
+            // tiering): a user-set `RUSTLLAMA_MAX_BATCHED_TOKENS` wins; otherwise
+            // the `[inference].max_num_batched_tokens` config value threaded in
+            // via `load_with_batched_tokens`. Resolved HERE so the driver loop
+            // reads only `ctx.max_batched_tokens`, never the env.
+            max_batched_tokens: resolve_max_batched_tokens(config_max_batched_tokens),
         };
         let driver_handle = std::thread::Builder::new()
             .name("rustllama-paged-batch-driver".to_string())
@@ -831,6 +857,24 @@ impl Drop for PagedBatchEngine {
 //     it without needing any extra synchronization beyond the
 //     incoming request channel.
 
+/// Resolve the effective per-tick batched-token budget with the repo's
+/// env-over-config precedence. The `RUSTLLAMA_MAX_BATCHED_TOKENS` env var wins
+/// when set to a parseable `usize` (back-compat: it was the only control pre-3b
+/// and still is for callers that go through [`PagedBatchEngine::load`]);
+/// otherwise the `[inference].max_num_batched_tokens` config value
+/// (`config_val`) applies. `0` from both = OFF (the default). Resolving here
+/// keeps the resolution in ONE place and lets the driver loop treat
+/// `ctx.max_batched_tokens` as the single source of truth.
+pub(crate) fn resolve_max_batched_tokens(config_val: usize) -> usize {
+    match std::env::var("RUSTLLAMA_MAX_BATCHED_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        Some(env_val) => env_val, // env wins when present + parseable
+        None => config_val,       // else the config-threaded value
+    }
+}
+
 /// Inputs the driver thread captures by value when spawning.
 struct DriverContext {
     model: Arc<LlamaModel>,
@@ -922,12 +966,28 @@ fn driver_loop(
             continue;
         }
 
-        // ---- Chunked-prefill tick: advance any PREFILLING slots by a budgeted
-        //      chunk (no-op when the budget is 0 / no slot is prefilling). ----
-        run_prefill_tick(&ctx, &mut active);
+        // ---- Advance all slots one tick. ----
+        // Budget 0 (default): the UNCHANGED 3a/pre-3b path — a no-op prefill
+        // tick (nothing is deferred at budget 0: `admit_request` prefilled
+        // inline) followed by a separate batched-decode forward. Byte-identical
+        // to pre-3b.
+        //
+        // Budget > 0 (Feature 3b): the RAGGED path — ONE fused forward per tick
+        // mixing budgeted prompt-prefill chunks with every active decode slot's
+        // 1-query row, replacing the prefill-then-decode pair. Output-identical
+        // (up to fp reduction order) to running those two forwards separately
+        // — pinned by the parity tests.
+        if ctx.max_batched_tokens > 0 {
+            run_ragged_tick(&ctx, &mut active, vocab);
+        } else {
+            // ---- Chunked-prefill tick: advance any PREFILLING slots by a
+            //      budgeted chunk (no-op when the budget is 0 / no slot is
+            //      prefilling). ----
+            run_prefill_tick(&ctx, &mut active);
 
-        // ---- One fused decode tick (skips still-prefilling slots) ----
-        run_decode_tick(&ctx, &mut active, vocab);
+            // ---- One fused decode tick (skips still-prefilling slots) ----
+            run_decode_tick(&ctx, &mut active, vocab);
+        }
 
         // ---- Drop fully-done slots, releasing their pages ----
         // Each removed slot publishes a final `RequestStats`
@@ -1388,6 +1448,209 @@ fn run_decode_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
         let hit_cap = slot.state.next_pos >= slot.state.cache.capacity_tokens();
         if hit_max || hit_eos || hit_cap {
             slot.state.done = true;
+        }
+    }
+}
+
+/// Which way a slot participates in a ragged tick (Feature 3b).
+#[derive(Clone, Copy)]
+enum RaggedKind {
+    /// Still-prefilling slot contributing `chunk` prompt tokens this tick.
+    Prefill { chunk: usize },
+    /// Decode-ready slot contributing its single next-query row.
+    Decode,
+}
+
+/// Feature 3b: ONE ragged mixed prefill+decode tick (used instead of the
+/// `run_prefill_tick` + `run_decode_tick` pair when `ctx.max_batched_tokens >
+/// 0`). It plans a single batch that mixes budgeted prompt-prefill CHUNKS from
+/// the still-prefilling slots with the 1-query decode rows of every
+/// decode-ready slot, issues ONE [`LlamaModel::forward_ragged_paged_f32`], then
+/// does the per-slot bookkeeping that the two separate ticks used to do:
+/// prefill-chunk cursor advance + on-drain APC registration/timing, and decode
+/// sampling + token streaming + stop conditions.
+///
+/// Scheduling note (vs the 3a two-forward path): a slot that DRAINS its last
+/// prefill chunk this tick produces no token this tick — its final prompt KV is
+/// only written by THIS forward, so it becomes decode-ready and emits its first
+/// token on the NEXT tick's decode row. That is a one-tick latency shift, not a
+/// token change: the generated SEQUENCE is identical to the 3a / budget-0 path
+/// (pinned by the engine identity test). The token budget bounds only the
+/// (expensive) prefill work; decode rows are always included so every running
+/// slot keeps advancing.
+fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize) {
+    use rustllama_models::llama_arch::RaggedSlot;
+    // `PagedKvCache` is already imported at module scope.
+
+    let m = active.len();
+
+    // Prompt-cancellation propagation, same as `run_decode_tick`: a closed
+    // response channel ⇒ mark the slot done before paying for the forward, so
+    // the retain pass frees its pages for queued requests.
+    for i in 0..m {
+        if !active[i].state.done && active[i].response_tx.is_closed() {
+            active[i].state.done = true;
+        }
+    }
+
+    // --- Plan the ragged batch (slot order == concatenated token order) ---
+    // Each non-done slot contributes EITHER a budgeted prefill chunk (if still
+    // prefilling) OR one decode row (if decode-ready). A still-prefilling slot
+    // that gets 0 budget this tick contributes nothing and stays prefilling.
+    // Decode rows do not consume the prefill budget — the budget caps only the
+    // prompt-prefill tokens, mirroring `run_prefill_tick`.
+    let mut budget = ctx.max_batched_tokens;
+    let mut tokens: Vec<i32> = Vec::new();
+    // plan entry: (active slot index, kind, n_query, start_pos).
+    let mut plan: Vec<(usize, RaggedKind, usize, u32)> = Vec::new();
+    for i in 0..m {
+        if active[i].state.done {
+            continue;
+        }
+        if let Some(job) = active[i].state.prefill_job.as_ref() {
+            let remaining = job.suffix.len() - job.cursor;
+            let chunk = budget.min(remaining);
+            if chunk == 0 {
+                continue; // out of budget this tick; slot stays prefilling
+            }
+            let start_pos = (job.base + job.cursor) as u32;
+            tokens.extend_from_slice(&job.suffix[job.cursor..job.cursor + chunk]);
+            plan.push((i, RaggedKind::Prefill { chunk }, chunk, start_pos));
+            budget -= chunk;
+        } else {
+            tokens.push(active[i].state.next_input);
+            plan.push((i, RaggedKind::Decode, 1, active[i].state.next_pos));
+        }
+    }
+    if plan.is_empty() {
+        // Nothing to advance (e.g. every prefilling slot was starved of budget
+        // — can't happen while budget > 0 and any slot is prefilling, but guard
+        // anyway so the driver loop makes forward progress).
+        return;
+    }
+
+    // Per-decode-row logits buffers (prefill chunks discard logits → empty
+    // slice, which the forward reads as "skip the LM head for this slot").
+    let mut logits_store: Vec<Vec<f32>> = plan
+        .iter()
+        .map(|(_, kind, _, _)| match kind {
+            RaggedKind::Decode => vec![0f32; vocab],
+            RaggedKind::Prefill { .. } => Vec::new(),
+        })
+        .collect();
+
+    // Build the ragged descriptor slice with by-index disjoint borrows: each
+    // slot participates at most once, so the `Option::take` trick hands out one
+    // `&mut PagedKvCache` per slot; `logits_store.iter_mut()` gives each row its
+    // own `&mut [f32]`.
+    let mut cache_refs: Vec<Option<&mut PagedKvCache>> =
+        active.iter_mut().map(|s| Some(&mut s.state.cache)).collect();
+    let mut ragged: Vec<RaggedSlot> = Vec::with_capacity(plan.len());
+    for ((i, _kind, n_query, start_pos), logits_slot) in plan.iter().zip(logits_store.iter_mut()) {
+        let cache = cache_refs[*i]
+            .take()
+            .expect("each slot participates in the ragged batch at most once");
+        ragged.push(RaggedSlot {
+            n_query: *n_query,
+            start_pos: *start_pos,
+            cache,
+            logits_out: logits_slot.as_mut_slice(),
+        });
+    }
+
+    let tick_start = std::time::Instant::now();
+    ctx.model
+        .forward_ragged_paged_f32(&tokens, &mut ragged, &ctx.shared);
+    let tick_ms = tick_start.elapsed().as_secs_f64() * 1000.0;
+    // Release the borrows held through the forward before touching `active`.
+    drop(ragged);
+    drop(cache_refs);
+
+    // Amortize the forward's wall time across the decode rows it produced (same
+    // per-slot decode_ms accounting as `run_decode_tick`; prefill timing is set
+    // from the job's `started` on drain, below).
+    let n_decode = plan
+        .iter()
+        .filter(|e| matches!(e.1, RaggedKind::Decode))
+        .count();
+    let per_slot_ms = if n_decode > 0 {
+        tick_ms / n_decode as f64
+    } else {
+        0.0
+    };
+
+    // --- Per-slot post-processing ---
+    for (p, &(i, kind, _n_query, _start_pos)) in plan.iter().enumerate() {
+        match kind {
+            RaggedKind::Prefill { chunk } => {
+                // Advance the cursor; on drain, register the prompt's APC blocks
+                // (deferred from admit) + finalize prefill timing + clear the
+                // job so the next tick decodes the slot. Mirrors
+                // `run_prefill_tick`'s completion logic.
+                let slot = &mut active[i];
+                let drained = {
+                    let job = slot
+                        .state
+                        .prefill_job
+                        .as_mut()
+                        .expect("prefill plan entry without a prefill job");
+                    job.cursor += chunk;
+                    job.cursor >= job.suffix.len()
+                };
+                if drained {
+                    let pages = slot.state.cache.pages();
+                    let job = slot
+                        .state
+                        .prefill_job
+                        .take()
+                        .expect("prefill job present on drain");
+                    if !job.chain.is_empty() {
+                        let k = job.chain.len().min(pages.len());
+                        let entries: Vec<_> =
+                            (0..k).map(|idx| (job.chain[idx], pages[idx])).collect();
+                        ctx.shared.apc_register(&entries);
+                    }
+                    slot.state.prefill_ms = job.started.elapsed().as_secs_f64() * 1000.0;
+                    let _ = (job.prompt_len, job.cache_hit_tokens); // already on SlotState
+                }
+            }
+            RaggedKind::Decode => {
+                active[i].state.decode_ms += per_slot_ms;
+                let logits = logits_store[p].as_mut_slice();
+                let slot = &mut active[i];
+                let SlotState {
+                    sampler, history, ..
+                } = &mut slot.state;
+                let next_tok = sampler.sample(logits, history);
+                slot.state.history.push(next_tok);
+                slot.state.next_input = next_tok as i32;
+                slot.state.next_pos += 1;
+                slot.state.n_emitted += 1;
+
+                let text = match &ctx.tokenizer {
+                    Some(tok) => tok.decode(&[next_tok], false).unwrap_or_default(),
+                    None => String::new(),
+                };
+                let token = Token {
+                    id: next_tok,
+                    text,
+                    logprobs: None,
+                };
+                if slot.response_tx.blocking_send(Ok(token)).is_err() {
+                    slot.state.done = true;
+                    continue;
+                }
+                let hit_max = slot.state.n_emitted >= slot.state.sampling.max_tokens;
+                let hit_eos = slot
+                    .state
+                    .eos
+                    .map(|e| (next_tok as i32) == e)
+                    .unwrap_or(false);
+                let hit_cap = slot.state.next_pos >= slot.state.cache.capacity_tokens();
+                if hit_max || hit_eos || hit_cap {
+                    slot.state.done = true;
+                }
+            }
         }
     }
 }

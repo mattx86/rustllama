@@ -3774,7 +3774,18 @@ async fn serve(
                 max_slots = concurrency,
                 "loading PagedBatchEngine (fused-decode CB mode)"
             );
-            let paged = PagedBatchEngine::load(path, max_ctx, concurrency as u32).map_err(|e| {
+            // Feature 3b: thread `[inference].max_num_batched_tokens` into the
+            // paged driver. `0` (default) keeps the inline-prefill + separate
+            // batched-decode path; a positive budget turns on the ragged mixed
+            // prefill+decode forward. `RUSTLLAMA_MAX_BATCHED_TOKENS` still wins
+            // (env-over-config) — resolved inside the engine.
+            let paged = PagedBatchEngine::load_with_batched_tokens(
+                path,
+                max_ctx,
+                concurrency as u32,
+                cfg.inference.max_num_batched_tokens as usize,
+            )
+            .map_err(|e| {
                 anyhow::anyhow!("failed to load fused-decode model {}: {e}", path.display())
             })?;
             let model_id = paged.model_id().to_string();
