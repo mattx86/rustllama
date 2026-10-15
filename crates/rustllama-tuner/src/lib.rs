@@ -233,6 +233,20 @@ pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK: &str = "attn:dev_resident_block";
 /// the per-op SYCL path on THIS device+model (fail-closed off otherwise). Read by
 /// `accel::dev_attn_sycl_enabled`; f32-KV-only + no-Qwen3-head-norm at dispatch.
 pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK_SYCL: &str = "attn:dev_resident_block_sycl";
+/// CUDA-graph twin of [`VERDICT_ATTN_DEV_RESIDENT_BLOCK`] (Feature 1b) — the #2
+/// device-resident DECODE attention block captured into a `cudaGraph` and
+/// replayed as ONE launch, instead of the eager block's per-op kernel
+/// launch+sync. Separate verdict because it is a refinement OF the CUDA eager
+/// block measured against it: `tune --dev-attn` A/Bs graph-vs-eager on CUDA and
+/// enables the graph path only where it beats the eager device block on THIS
+/// device+model (fail-closed off otherwise — the graph's per-launch saving is a
+/// no-win when attention isn't the decode bottleneck, and capture carries its
+/// own overhead). The captured chain runs the IDENTICAL kernels/math as the
+/// eager block, so correctness is the eager block's (graded in-process by
+/// `doctor --cuda-parity attn:dev_resident_block_cuda_graph`); this is a
+/// PERF-only verdict. Read by `accel::dev_attn_cuda_graph_enabled`; at dispatch
+/// the graph path is preferred over the eager CUDA block when ON (f32-KV-only).
+pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK_CUDA_GRAPH: &str = "attn:dev_resident_block_cuda_graph";
 
 /// Read the on-device verdict for a kernel probe name, if one has been
 /// recorded. `None` = never validated (or the probe SKIPped because the

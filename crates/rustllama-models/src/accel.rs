@@ -7768,6 +7768,35 @@ pub fn dev_attn_hits() -> u64 {
     DEV_ATTN_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Feature-1b CUDA-graph force override, the graph twin of [`DEV_ATTN_FORCE`]:
+/// -1 = verdict decides, 0 = force the graph path OFF (so the eager CUDA block
+/// runs), 1 = force it ON. SEPARATE from `DEV_ATTN_FORCE` so `tune --dev-attn`
+/// can hold the eager device block on while A/B-ing graph-vs-eager (arm A: this
+/// = 0 → eager; arm B: this = 1 → graph). NOT a user knob.
+static DEV_ATTN_GRAPH_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+/// Count of decode tokens where the Feature-1b CUDA-GRAPH attention block
+/// actually ran (incremented per successful [`try_decode_attn_block_cuda_graph_f32`]).
+/// The graph A/B reads it to confirm the graph arm engaged.
+static DEV_ATTN_GRAPH_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Force the Feature-1b CUDA-graph attention path on/off for the current process
+/// (the `tune --dev-attn` graph A/B only). `None` clears the override → the
+/// verdict decides.
+pub fn set_dev_attn_graph_force(v: Option<bool>) {
+    let code: i8 = match v {
+        None => -1,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    DEV_ATTN_GRAPH_FORCE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many decode tokens have run through the Feature-1b CUDA-graph attention
+/// block so far (process-global). The graph A/B compares this across its arm.
+pub fn dev_attn_graph_hits() -> u64 {
+    DEV_ATTN_GRAPH_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Runtime override for the MoE tiered-expert VRAM MARGIN (bytes) — the headroom
 /// reserved below free VRAM when `load_inner` projects the expert-promotion
 /// budget (`budget = free_vram − non_expert_weights − margin`). `u64::MAX` =
@@ -7812,6 +7841,25 @@ fn dev_attn_enabled() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK))
+}
+
+/// Whether the Feature-1b CUDA-graph attention block is enabled. **AUTOMATIC, no
+/// env var** — the graph twin of [`dev_attn_enabled`], perf-gated on verdict
+/// [`VERDICT_ATTN_DEV_RESIDENT_BLOCK_CUDA_GRAPH`] (persisted by `tune --dev-attn`
+/// only where the graph path beat the eager CUDA block). Uses its OWN force
+/// override ([`DEV_ATTN_GRAPH_FORCE`]) so the A/B can drive graph-vs-eager
+/// independently of the eager device/host override. Fail-closed: unmeasured /
+/// not-a-win ⇒ off (the eager CUDA block, itself gated, runs instead). The
+/// captured chain is the same kernels as the eager block, so the gate is purely
+/// perf (correctness via `doctor --cuda-parity`).
+fn dev_attn_cuda_graph_enabled() -> bool {
+    match DEV_ATTN_GRAPH_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK_CUDA_GRAPH))
 }
 
 /// Run the WHOLE attention block for one decode token on the GPU, keeping the
@@ -7969,6 +8017,151 @@ pub fn try_decode_attn_block_cuda_f32(
         }
     }
     // (attention ran on device, dense FFN ran on device)
+    (ok, ok && ffn_requested)
+}
+
+/// Feature 1b: the CUDA-GRAPH twin of [`try_decode_attn_block_cuda_f32`]. Runs
+/// the IDENTICAL device-resident attention block, but via
+/// `CudaMatvecCache::decode_attn_block_f32_graph` — the whole per-layer kernel
+/// chain is captured into a `cudaGraph` and replayed as ONE launch, collapsing
+/// the eager block's per-op launch+sync cost. Gated on its OWN perf verdict
+/// (`dev_attn_cuda_graph_enabled` → `attn:dev_resident_block_cuda_graph`) AND
+/// `cuda_active()`; returns `(false, false)` otherwise so the caller falls to
+/// the eager CUDA block (itself gated), then the SYCL block, then the host path.
+/// FAIL-SOFT end to end: a failed capture / launch inside the cache method falls
+/// back to the eager block internally and returns false here, host buffers
+/// untouched. Same preconditions as the eager block: no qkv bias, packed-quant
+/// q/k/v/o, f32 KV. On success `hidden`/`h_norm2`/`k_buf`/`v_buf` are updated
+/// exactly as the eager path leaves them and the host KV cache is appended.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+pub fn try_decode_attn_block_cuda_graph_f32(
+    w_q: &Tensor,
+    w_k: &Tensor,
+    w_v: &Tensor,
+    w_o: &Tensor,
+    attn_norm: &[f32],
+    post_norm: &[f32],
+    q_norm: Option<&[f32]>,
+    k_norm: Option<&[f32]>,
+    has_qkv_bias: bool,
+    inv_freq: &[f32],
+    hidden: &mut [f32],
+    h_norm2: &mut [f32],
+    k_buf: &mut [f32],
+    v_buf: &mut [f32],
+    k_cache: &mut [f32],
+    v_cache: &mut [f32],
+    dense_ffn: Option<(&Tensor, &Tensor, &Tensor, usize)>,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    d_model: usize,
+    pos: usize,
+    max_ctx: usize,
+    n_layers: usize,
+    layer_idx: usize,
+    rms_eps: f32,
+    upload_hidden: bool,
+    download_hidden: bool,
+) -> (bool, bool) {
+    if !dev_attn_cuda_graph_enabled() || !cuda_active() || has_qkv_bias {
+        return (false, false);
+    }
+    let (Some(kq), Some(kk), Some(kv), Some(ko)) = (
+        dtype_to_cuda_kind(w_q.dtype),
+        dtype_to_cuda_kind(w_k.dtype),
+        dtype_to_cuda_kind(w_v.dtype),
+        dtype_to_cuda_kind(w_o.dtype),
+    ) else {
+        return (false, false);
+    };
+    let (qb, kb, vb, ob) = (
+        w_q.storage.as_bytes(),
+        w_k.storage.as_bytes(),
+        w_v.storage.as_bytes(),
+        w_o.storage.as_bytes(),
+    );
+    // Device dense-FFN arg: only when asked AND all three weights are packed
+    // (else attention-only; the caller runs the host FFN). Mirrors the eager fn.
+    let ffn_dev: Option<(
+        (ck::CudaPackedKind, usize, &[u8]),
+        (ck::CudaPackedKind, usize, &[u8]),
+        (ck::CudaPackedKind, usize, &[u8]),
+        usize,
+    )> = dense_ffn.and_then(|(wg, wu, wd, d_ff)| {
+        let kg = dtype_to_cuda_kind(wg.dtype)?;
+        let ku = dtype_to_cuda_kind(wu.dtype)?;
+        let kd = dtype_to_cuda_kind(wd.dtype)?;
+        let gb = wg.storage.as_bytes();
+        let ub = wu.storage.as_bytes();
+        let db = wd.storage.as_bytes();
+        Some((
+            (kg, gb.as_ptr() as usize, gb),
+            (ku, ub.as_ptr() as usize, ub),
+            (kd, db.as_ptr() as usize, db),
+            d_ff,
+        ))
+    });
+    let ffn_requested = ffn_dev.is_some();
+    let Some(cache) = cuda_cache() else {
+        return (false, false);
+    };
+    let Ok(mut g) = cache.lock() else {
+        return (false, false);
+    };
+    // SAFETY: weight byte-slices outlive the call; host buffers are sized to the
+    // dims (caller contract); the cache owns the stream + mirror. The graph
+    // method seeds the mirror's prefill history then captures + replays the block.
+    let ok = unsafe {
+        g.seed_attn_mirror_f32(
+            layer_idx, k_cache, v_cache, pos, n_kv_heads, head_dim, max_ctx, n_layers,
+        ) && g.decode_attn_block_f32_graph(
+            (kq, qb.as_ptr() as usize, qb),
+            (kk, kb.as_ptr() as usize, kb),
+            (kv, vb.as_ptr() as usize, vb),
+            (ko, ob.as_ptr() as usize, ob),
+            attn_norm,
+            post_norm,
+            q_norm,
+            k_norm,
+            inv_freq,
+            hidden,
+            h_norm2,
+            k_buf,
+            v_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            d_model,
+            pos,
+            max_ctx,
+            n_layers,
+            layer_idx,
+            rms_eps,
+            ffn_dev,
+            upload_hidden,
+            download_hidden,
+        )
+    };
+    if ok {
+        // Append this token's post-RoPE K/V into the host KV cache at `pos`
+        // (head-major) — identical bookkeeping to the eager path.
+        for h in 0..n_kv_heads {
+            let dst = (h * max_ctx + pos) * head_dim;
+            let src = h * head_dim;
+            k_cache[dst..dst + head_dim].copy_from_slice(&k_buf[src..src + head_dim]);
+            v_cache[dst..dst + head_dim].copy_from_slice(&v_buf[src..src + head_dim]);
+        }
+        if DEV_ATTN_GRAPH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            tracing::info!(
+                "Feature 1b CUDA-graph on-device activation-residency attention \
+                 ENGAGED — the whole decode attention block is captured into a \
+                 cudaGraph and replayed as ONE launch per layer (perf-gated \
+                 verdict attn:dev_resident_block_cuda_graph) (logged once)"
+            );
+        }
+    }
     (ok, ok && ffn_requested)
 }
 

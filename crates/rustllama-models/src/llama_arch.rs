@@ -7768,36 +7768,78 @@ impl LlamaModel {
             // to the base table when the model carries no scaling.
             let device_attn = if self.yarn_mscale == 1.0 {
                 if let KvLayer::F32 { k, v } = &mut kv.layers[layer_idx] {
-                    let (attn_ran, ffn_ran) = crate::accel::try_decode_attn_block_cuda_f32(
-                        block.w_q(),
-                        block.w_k(),
-                        block.w_v(),
-                        block.w_o(),
-                        block.attn_norm(),
-                        block.ffn_norm(),
-                        block.q_norm(),
-                        block.k_norm(),
-                        block.b_q().is_some() || block.b_k().is_some() || block.b_v().is_some(),
-                        &self.rope_inv_freq,
-                        &mut hidden,
-                        &mut h_norm,
-                        &mut k_buf,
-                        &mut v_buf,
-                        k,
-                        v,
-                        dense_ffn_arg,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        d,
-                        cur_pos,
-                        kv_max_ctx,
-                        cfg.n_layers,
-                        layer_idx,
-                        cfg.rms_eps,
-                        upload_hidden,
-                        download_hidden,
-                    );
+                    // Feature 1b: PREFER the CUDA-GRAPH block — it captures this
+                    // layer's whole device chain into a cudaGraph and replays it
+                    // as ONE launch (gated on `attn:dev_resident_block_cuda_graph`).
+                    // It declines (false) when its verdict is off, or falls back
+                    // internally + returns false if a capture/launch fails, leaving
+                    // the host buffers untouched — in which case the eager CUDA
+                    // block (itself gated on `attn:dev_resident_block`) runs next.
+                    let (mut attn_ran, mut ffn_ran) =
+                        crate::accel::try_decode_attn_block_cuda_graph_f32(
+                            block.w_q(),
+                            block.w_k(),
+                            block.w_v(),
+                            block.w_o(),
+                            block.attn_norm(),
+                            block.ffn_norm(),
+                            block.q_norm(),
+                            block.k_norm(),
+                            block.b_q().is_some() || block.b_k().is_some() || block.b_v().is_some(),
+                            &self.rope_inv_freq,
+                            &mut hidden,
+                            &mut h_norm,
+                            &mut k_buf,
+                            &mut v_buf,
+                            k,
+                            v,
+                            dense_ffn_arg,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            d,
+                            cur_pos,
+                            kv_max_ctx,
+                            cfg.n_layers,
+                            layer_idx,
+                            cfg.rms_eps,
+                            upload_hidden,
+                            download_hidden,
+                        );
+                    if !attn_ran {
+                        let (a_eager, f_eager) = crate::accel::try_decode_attn_block_cuda_f32(
+                            block.w_q(),
+                            block.w_k(),
+                            block.w_v(),
+                            block.w_o(),
+                            block.attn_norm(),
+                            block.ffn_norm(),
+                            block.q_norm(),
+                            block.k_norm(),
+                            block.b_q().is_some() || block.b_k().is_some() || block.b_v().is_some(),
+                            &self.rope_inv_freq,
+                            &mut hidden,
+                            &mut h_norm,
+                            &mut k_buf,
+                            &mut v_buf,
+                            k,
+                            v,
+                            dense_ffn_arg,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            d,
+                            cur_pos,
+                            kv_max_ctx,
+                            cfg.n_layers,
+                            layer_idx,
+                            cfg.rms_eps,
+                            upload_hidden,
+                            download_hidden,
+                        );
+                        attn_ran = a_eager;
+                        ffn_ran = f_eager;
+                    }
                     device_dense_ffn = ffn_ran;
                     if attn_ran {
                         true

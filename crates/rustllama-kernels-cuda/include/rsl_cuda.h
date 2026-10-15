@@ -55,6 +55,28 @@ int rsl_cuda_memcpy_h2d(rsl_cuda_stream *s, void *dst_dev, const void *src_host,
 int rsl_cuda_memcpy_d2h(rsl_cuda_stream *s, void *dst_host, const void *src_dev,
                         unsigned long long n_bytes);
 
+/* ============================================================
+ * CUDA graph capture for the device-resident DECODE attention block
+ * (Feature 1b). Async memcpy variants (non-synchronizing, so they can be
+ * captured / batched), a stream sync, and the graph lifecycle. Every entry
+ * returns a status; the Rust caller falls back to the eager block on any
+ * non-zero return (fail-soft). Opaque graph/exec handles are void*.
+ * ============================================================ */
+int rsl_cuda_memcpy_h2d_async(rsl_cuda_stream *s, void *dst_dev,
+                              const void *src_host, unsigned long long n_bytes);
+int rsl_cuda_memcpy_d2h_async(rsl_cuda_stream *s, void *dst_host,
+                              const void *src_dev, unsigned long long n_bytes);
+int rsl_cuda_memcpy_d2d_async(rsl_cuda_stream *s, void *dst_dev,
+                              const void *src_dev, unsigned long long n_bytes);
+int rsl_cuda_stream_sync(rsl_cuda_stream *s);
+int rsl_cuda_graph_begin_capture(rsl_cuda_stream *s);
+int rsl_cuda_graph_end_capture(rsl_cuda_stream *s, void **out_graph);
+int rsl_cuda_graph_instantiate(void *graph, void **out_exec);
+int rsl_cuda_graph_exec_update(void *exec, void *graph);
+int rsl_cuda_graph_launch(void *exec, rsl_cuda_stream *s);
+void rsl_cuda_graph_destroy(void *graph);
+void rsl_cuda_graph_exec_destroy(void *exec);
+
 /* PrismML PTQ1_0 (Bonsai ternary) packed matvec. Block layout 28 B / 128
  * weights: { qs:[u8;24], qh:[u8;2], d:f16 }. K must be a multiple of 128.
  * All pointers are DEVICE pointers. `w_bytes` = M*(K/128)*28 bytes.

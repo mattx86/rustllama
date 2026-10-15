@@ -142,6 +142,36 @@ extern "C" {
         src_dev: *const c_void,
         n_bytes: u64,
     ) -> c_int;
+    // CUDA graph capture for the device-resident DECODE attention block
+    // (Feature 1b). Async memcpy variants + stream sync + graph lifecycle; every
+    // entry returns a status and the Rust caller falls back to the eager block on
+    // any non-zero return. Graph/exec handles are opaque `*mut c_void`.
+    fn rsl_cuda_memcpy_h2d_async(
+        s: *mut RslCudaStreamRaw,
+        dst_dev: *mut c_void,
+        src_host: *const c_void,
+        n_bytes: u64,
+    ) -> c_int;
+    fn rsl_cuda_memcpy_d2h_async(
+        s: *mut RslCudaStreamRaw,
+        dst_host: *mut c_void,
+        src_dev: *const c_void,
+        n_bytes: u64,
+    ) -> c_int;
+    fn rsl_cuda_memcpy_d2d_async(
+        s: *mut RslCudaStreamRaw,
+        dst_dev: *mut c_void,
+        src_dev: *const c_void,
+        n_bytes: u64,
+    ) -> c_int;
+    fn rsl_cuda_stream_sync(s: *mut RslCudaStreamRaw) -> c_int;
+    fn rsl_cuda_graph_begin_capture(s: *mut RslCudaStreamRaw) -> c_int;
+    fn rsl_cuda_graph_end_capture(s: *mut RslCudaStreamRaw, out_graph: *mut *mut c_void) -> c_int;
+    fn rsl_cuda_graph_instantiate(graph: *mut c_void, out_exec: *mut *mut c_void) -> c_int;
+    fn rsl_cuda_graph_exec_update(exec: *mut c_void, graph: *mut c_void) -> c_int;
+    fn rsl_cuda_graph_launch(exec: *mut c_void, s: *mut RslCudaStreamRaw) -> c_int;
+    fn rsl_cuda_graph_destroy(graph: *mut c_void);
+    fn rsl_cuda_graph_exec_destroy(exec: *mut c_void);
     fn rsl_cuda_matvec_ptq1_0_packed_f32(
         s: *mut RslCudaStreamRaw,
         w_bytes_dev: *const c_void,
@@ -1105,6 +1135,86 @@ impl<'s> Drop for CudaDeviceBuffer<'s> {
 pub fn consume_error_count() -> i32 {
     // SAFETY: FFI; no arguments.
     unsafe { rsl_cuda_consume_error_count() }
+}
+
+// ---- CUDA graph capture helpers (Feature 1b) -----------------------------
+// Thin safe wrappers over the graph FFI, used by
+// `CudaMatvecCache::decode_attn_block_f32_graph`. Each returns `true`/a handle
+// on success; the caller treats any failure as "fall back to the eager block".
+
+/// Begin capturing `stream` into a graph. `true` on success.
+fn graph_begin_capture(stream: &CudaStream) -> bool {
+    // SAFETY: FFI; the stream handle is live for the call.
+    unsafe { rsl_cuda_graph_begin_capture(stream.raw()) == 0 }
+}
+
+/// End capture, returning the captured graph handle (`None` on failure — the
+/// stream is returned to the non-capturing state either way).
+fn graph_end_capture(stream: &CudaStream) -> Option<*mut c_void> {
+    let mut graph: *mut c_void = std::ptr::null_mut();
+    // SAFETY: FFI; `graph` is written on success.
+    let rc = unsafe { rsl_cuda_graph_end_capture(stream.raw(), &mut graph as *mut *mut c_void) };
+    if rc == 0 && !graph.is_null() {
+        Some(graph)
+    } else {
+        None
+    }
+}
+
+/// Instantiate a captured `graph` into an executable (`None` on failure).
+///
+/// SAFETY: `graph` is a live graph handle from [`graph_end_capture`].
+unsafe fn graph_instantiate(graph: *mut c_void) -> Option<CudaGraphExecHandle> {
+    let mut exec: *mut c_void = std::ptr::null_mut();
+    let rc = rsl_cuda_graph_instantiate(graph, &mut exec as *mut *mut c_void);
+    if rc == 0 && !exec.is_null() {
+        Some(CudaGraphExecHandle { exec })
+    } else {
+        None
+    }
+}
+
+/// Patch `exec` in place from a freshly captured `graph` of identical topology.
+/// `true` only when the update fully succeeded (else the caller re-instantiates).
+///
+/// SAFETY: `exec`/`graph` are live handles on this cache's device.
+unsafe fn graph_exec_update(exec: &CudaGraphExecHandle, graph: *mut c_void) -> bool {
+    rsl_cuda_graph_exec_update(exec.exec, graph) == 0
+}
+
+/// Launch `exec` on `stream` (async; pair with [`stream_sync`]). `true` on success.
+///
+/// SAFETY: `exec` is a live executable graph; `stream` is its device's stream.
+unsafe fn graph_launch(exec: &CudaGraphExecHandle, stream: &CudaStream) -> bool {
+    rsl_cuda_graph_launch(exec.exec, stream.raw()) == 0
+}
+
+/// Block until all queued stream work (incl. a graph launch) completes.
+fn stream_sync(stream: &CudaStream) -> bool {
+    // SAFETY: FFI; the stream handle is live for the call.
+    unsafe { rsl_cuda_stream_sync(stream.raw()) == 0 }
+}
+
+/// Free a captured graph handle (the exec is independent once instantiated /
+/// updated). Null-safe.
+///
+/// SAFETY: `graph` is a live graph handle or null.
+unsafe fn graph_destroy(graph: *mut c_void) {
+    rsl_cuda_graph_destroy(graph);
+}
+
+/// Async device→device copy of `n_bytes` from `src` to `dst` on `stream` (the
+/// graph path's KV-mirror scatter, issued inside the capture region). `true` on
+/// success.
+///
+/// SAFETY: `dst`/`src` are live device pointers on `stream` with ≥ `n_bytes`.
+unsafe fn memcpy_d2d_async(
+    stream: &CudaStream,
+    dst: *mut c_void,
+    src: *const c_void,
+    n_bytes: usize,
+) -> bool {
+    rsl_cuda_memcpy_d2d_async(stream.raw(), dst, src, n_bytes as u64) == 0
 }
 
 /// PTQ1_0 packed matvec on device pointers: `out[M] = W(M,K) @ x[K]`.
@@ -2416,6 +2526,35 @@ impl RawDevBuf {
         // SAFETY: caller keeps the offset within cap_bytes.
         unsafe { (self.ptr as *mut f32).add(f32_offset) }
     }
+    /// ASYNC H2D copy of `src` into this buffer at `byte_offset` (the graph
+    /// path's non-synchronizing upload; pair with a stream sync). Returns false
+    /// on a bad range / launch failure. (Feature 1b.)
+    fn upload_at_async(&mut self, byte_offset: usize, src: &[u8]) -> bool {
+        if byte_offset + src.len() > self.cap_bytes {
+            return false;
+        }
+        // SAFETY: dst is within the live cap_bytes allocation.
+        let dst = unsafe { (self.ptr as *mut u8).add(byte_offset) as *mut c_void };
+        let rc = unsafe {
+            rsl_cuda_memcpy_h2d_async(self.raw_stream, dst, src.as_ptr() as *const c_void, src.len() as u64)
+        };
+        rc == 0
+    }
+    /// ASYNC D2H copy of `dst.len()` bytes from `byte_offset` into `dst` (the
+    /// graph path's deferred drain, issued AFTER the post-launch stream sync, so
+    /// the graph has already completed). Returns false on a bad range / launch
+    /// failure. (Feature 1b.)
+    fn download_at_async(&self, byte_offset: usize, dst: &mut [u8]) -> bool {
+        if byte_offset + dst.len() > self.cap_bytes {
+            return false;
+        }
+        // SAFETY: src is within the live cap_bytes allocation.
+        let src = unsafe { (self.ptr as *const u8).add(byte_offset) as *const c_void };
+        let rc = unsafe {
+            rsl_cuda_memcpy_d2h_async(self.raw_stream, dst.as_mut_ptr() as *mut c_void, src, dst.len() as u64)
+        };
+        rc == 0
+    }
 }
 
 impl Drop for RawDevBuf {
@@ -2424,6 +2563,29 @@ impl Drop for RawDevBuf {
         unsafe { rsl_cuda_free(self.raw_stream, self.ptr) };
     }
 }
+
+/// An instantiated CUDA graph executable (`cudaGraphExec_t`) for the Feature-1b
+/// device-resident attention block, cached per layer in [`CudaMatvecCache`].
+/// Opaque `*mut c_void` handle; freed once on drop via the FFI. The exec is
+/// refreshed every decode step (re-captured graph → `exec_update`, or
+/// re-instantiate) so it never holds a stale device pointer — but it is still
+/// destroyed on model reload (`clear`) and on an attention-shape change.
+struct CudaGraphExecHandle {
+    exec: *mut c_void,
+}
+
+impl Drop for CudaGraphExecHandle {
+    fn drop(&mut self) {
+        if !self.exec.is_null() {
+            // SAFETY: `exec` came from rsl_cuda_graph_instantiate; freed once.
+            unsafe { rsl_cuda_graph_exec_destroy(self.exec) };
+        }
+    }
+}
+
+// SAFETY: driven from the single owning worker thread, like CudaStream — the
+// handle is never shared concurrently.
+unsafe impl Send for CudaGraphExecHandle {}
 
 /// Process-/model-lifetime device-resident weight cache + scratch for
 /// the packed-matvec CUDA dispatch. See the module comment above.
@@ -2448,6 +2610,12 @@ pub struct CudaMatvecCache {
     attn_mirror_ctx: (u32, u32, u32), // (n_layers, n_kv_heads*head_dim, max_ctx) — rebuild on change
     attn_act: Option<RawDevBuf>,   // activation slab: hidden|h_norm|q|k|v|attn_out|o|h_norm2
     attn_norms: Option<RawDevBuf>, // norm-weight slab: attn_norm|post_norm|q_norm|k_norm|inv_freq
+    // Feature 1b: one cached CUDA-graph executable per layer for the graph-mode
+    // attention block (`decode_attn_block_f32_graph`). `None` until the first
+    // graph capture for that layer instantiates it; refreshed every step via
+    // exec_update. Sized to n_layers (rebuilt on a layer-count change); dropped
+    // (execs destroyed) on model reload via `clear`.
+    attn_graph_exec: Vec<Option<CudaGraphExecHandle>>,
     used_bytes: usize,
     budget_bytes: usize,
     stream: CudaStream,
@@ -2471,6 +2639,7 @@ impl CudaMatvecCache {
             attn_mirror_ctx: (0, 0, 0),
             attn_act: None,
             attn_norms: None,
+            attn_graph_exec: Vec::new(),
             used_bytes: 0,
             budget_bytes,
             stream,
@@ -2498,6 +2667,11 @@ impl CudaMatvecCache {
     pub fn clear(&mut self) {
         self.weights.clear();
         self.used_bytes = 0;
+        // Feature 1b: destroy any cached graph executables. Their captured nodes
+        // reference this model's device buffers (weights/mirrors/activation slab),
+        // which are now evicted; the next model re-captures + re-instantiates from
+        // scratch. Empties the Vec (Drop frees each cudaGraphExec_t).
+        self.attn_graph_exec = Vec::new();
     }
 
     fn ensure_scratch(slot: &mut Option<RawDevBuf>, stream: &CudaStream, need_bytes: usize) -> bool {
@@ -3106,6 +3280,431 @@ impl CudaMatvecCache {
                     std::slice::from_raw_parts_mut(h_norm2.as_mut_ptr() as *mut u8, d_model * 4)
                 };
                 if !a.download_at(o_hn2 * 4, h2b) {
+                    return false;
+                }
+            }
+        }
+        consume_error_count() == 0
+    }
+
+    /// CUDA-graph-captured twin of [`Self::decode_attn_block_f32`] (Feature 1b).
+    /// Runs the IDENTICAL device chain + math, but captures the whole chain into
+    /// a `cudaGraph` and replays it as ONE launch, collapsing the per-op CPU
+    /// launch/sync cost the eager block pays for every kernel. The result is the
+    /// same (same kernels, same inputs) — this only changes HOW the ops are
+    /// submitted, so correctness tracks the eager block (verdict-gated by the
+    /// caller; graded by `doctor --cuda-parity attn:dev_resident_block_cuda_graph`).
+    ///
+    /// Capture rules handled here (a sync / a synchronous memcpy inside a capture
+    /// region is illegal): the hidden/norm H2D uploads + the weight pre-warm run
+    /// EAGER *before* `begin_capture`; the post-RoPE K/V write into the device KV
+    /// mirror is an async device→device copy issued INSIDE the capture; and the
+    /// post-RoPE K/V + hidden/h_norm2 device→host copies (for the host KV cache /
+    /// the FFN input) are DEFERRED to AFTER the single post-launch stream sync.
+    /// Per-layer the executable graph is instantiated once then patched in place
+    /// (`exec_update`) with the grown kv_len/pos each step; a topology change
+    /// re-instantiates.
+    ///
+    /// FAIL-SOFT: ANY failure at any step (capture begin/end, a kernel launch, an
+    /// instantiate/update, the launch or sync) ends the capture, destroys the
+    /// partial graph, drains the error latch, and returns `false` — leaving the
+    /// host buffers (`hidden`/`h_norm2`/`k_row_out`/`v_row_out`) UNTOUCHED and the
+    /// mirror `valid_len` un-advanced, so the caller re-runs the proven eager
+    /// block (which re-does the mirror write at `pos`) with no corruption.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::decode_attn_block_f32`]: weight byte-slices live
+    /// for the call, host buffers are sized to the dims, and the cache owns the
+    /// stream + mirrors.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn decode_attn_block_f32_graph(
+        &mut self,
+        wq: (CudaPackedKind, usize, &[u8]),
+        wk: (CudaPackedKind, usize, &[u8]),
+        wv: (CudaPackedKind, usize, &[u8]),
+        wo: (CudaPackedKind, usize, &[u8]),
+        attn_norm: &[f32],
+        post_norm: &[f32],
+        q_norm: Option<&[f32]>,
+        k_norm: Option<&[f32]>,
+        inv_freq: &[f32],
+        hidden: &mut [f32],
+        h_norm2: &mut [f32],
+        k_row_out: &mut [f32],
+        v_row_out: &mut [f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        d_model: usize,
+        pos: usize,
+        max_ctx: usize,
+        n_layers: usize,
+        layer_idx: usize,
+        rms_eps: f32,
+        dense_ffn: Option<(
+            (CudaPackedKind, usize, &[u8]),
+            (CudaPackedKind, usize, &[u8]),
+            (CudaPackedKind, usize, &[u8]),
+            usize,
+        )>,
+        upload_hidden: bool,
+        download_hidden: bool,
+    ) -> bool {
+        let ok = unsafe {
+            self.decode_attn_block_f32_graph_impl(
+                wq, wk, wv, wo, attn_norm, post_norm, q_norm, k_norm, inv_freq, hidden, h_norm2,
+                k_row_out, v_row_out, n_heads, n_kv_heads, head_dim, d_model, pos, max_ctx,
+                n_layers, layer_idx, rms_eps, dense_ffn, upload_hidden, download_hidden,
+            )
+        };
+        if !ok {
+            // Drain any latched capture/launch error so the caller's eager
+            // fallback (same stream) starts from a clean latch — otherwise its
+            // first `consume_error_count` would see this failure and decline too.
+            let _ = consume_error_count();
+        }
+        ok
+    }
+
+    /// Inner body of [`Self::decode_attn_block_f32_graph`]; returns `false` on any
+    /// failure (the public wrapper then drains the error latch). Kept separate so
+    /// the drain happens on every failure path without duplicating it.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn decode_attn_block_f32_graph_impl(
+        &mut self,
+        wq: (CudaPackedKind, usize, &[u8]),
+        wk: (CudaPackedKind, usize, &[u8]),
+        wv: (CudaPackedKind, usize, &[u8]),
+        wo: (CudaPackedKind, usize, &[u8]),
+        attn_norm: &[f32],
+        post_norm: &[f32],
+        q_norm: Option<&[f32]>,
+        k_norm: Option<&[f32]>,
+        inv_freq: &[f32],
+        hidden: &mut [f32],
+        h_norm2: &mut [f32],
+        k_row_out: &mut [f32],
+        v_row_out: &mut [f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        d_model: usize,
+        pos: usize,
+        max_ctx: usize,
+        n_layers: usize,
+        layer_idx: usize,
+        rms_eps: f32,
+        dense_ffn: Option<(
+            (CudaPackedKind, usize, &[u8]),
+            (CudaPackedKind, usize, &[u8]),
+            (CudaPackedKind, usize, &[u8]),
+            usize,
+        )>,
+        upload_hidden: bool,
+        download_hidden: bool,
+    ) -> bool {
+        let d_q = n_heads * head_dim;
+        let d_kv = n_kv_heads * head_dim;
+        let d_ff = dense_ffn.as_ref().map(|f| f.3).unwrap_or(0);
+        // Shape validation — identical to the eager block.
+        if hidden.len() != d_model
+            || h_norm2.len() != d_model
+            || k_row_out.len() != d_kv
+            || v_row_out.len() != d_kv
+            || attn_norm.len() != d_model
+            || post_norm.len() != d_model
+            || inv_freq.len() != head_dim / 2
+            || head_dim % 2 != 0
+            || layer_idx >= n_layers
+            || pos >= max_ctx
+            || n_kv_heads == 0
+            || n_heads % n_kv_heads != 0
+        {
+            return false;
+        }
+        // Per-layer F32 KV mirror on this stream; rebuilt on a shape change. On a
+        // shape change ALSO drop every cached graph exec (its nodes reference the
+        // old-shape mirror/slab pointers, and a different n_kv_heads changes the
+        // mirror-scatter topology → an exec_update would fail anyway).
+        let mctx = (n_layers as u32, d_kv as u32, max_ctx as u32);
+        if self.attn_mirror_ctx != mctx {
+            self.attn_k_mirror = (0..n_layers).map(|_| None).collect();
+            self.attn_v_mirror = (0..n_layers).map(|_| None).collect();
+            self.attn_valid_len = vec![0; n_layers];
+            self.attn_mirror_ctx = mctx;
+            self.attn_graph_exec = (0..n_layers).map(|_| None).collect();
+        }
+        // First use (or a layer-count change not caught above): size the exec Vec.
+        if self.attn_graph_exec.len() != n_layers {
+            self.attn_graph_exec = (0..n_layers).map(|_| None).collect();
+        }
+        let valid = self.attn_valid_len[layer_idx];
+        if pos as u32 > valid {
+            return false; // mirror gap: caller seeds the prefill history / falls back
+        }
+        let act_bytes = (4 * d_model + 2 * d_q + 2 * d_kv + 3 * d_ff) * 4;
+        let norm_bytes = (2 * d_model + 2 * head_dim + head_dim / 2) * 4;
+        let mir_bytes = d_kv * max_ctx * 4;
+        if !Self::ensure_scratch(&mut self.attn_act, &self.stream, act_bytes)
+            || !Self::ensure_scratch(&mut self.attn_norms, &self.stream, norm_bytes)
+            || !Self::ensure_scratch(&mut self.attn_k_mirror[layer_idx], &self.stream, mir_bytes)
+            || !Self::ensure_scratch(&mut self.attn_v_mirror[layer_idx], &self.stream, mir_bytes)
+        {
+            return false;
+        }
+        // Activation-slab f32 offsets (same as the eager block).
+        let (o_hidden, o_hnorm, o_q, o_k, o_v, o_attn, o_o, o_hn2) = (
+            0,
+            d_model,
+            2 * d_model,
+            2 * d_model + d_q,
+            2 * d_model + d_q + d_kv,
+            2 * d_model + d_q + 2 * d_kv,
+            2 * d_model + 2 * d_q + 2 * d_kv,
+            3 * d_model + 2 * d_q + 2 * d_kv,
+        );
+        let ffn_base = 4 * d_model + 2 * d_q + 2 * d_kv;
+        let (o_gate, o_up, o_act) = (ffn_base, ffn_base + d_ff, ffn_base + 2 * d_ff);
+        let (no_attn, no_post, no_qn, no_kn, no_if) =
+            (0, d_model, 2 * d_model, 2 * d_model + head_dim, 2 * d_model + 2 * head_dim);
+        let fb = |s: &[f32]| -> &[u8] {
+            unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
+        };
+
+        // ---- Weight pre-warm (BEFORE capture): a weight's first-use upload in
+        // `ensure_weight` is a synchronous H2D (illegal inside a capture region),
+        // so force all weights resident now. A cached weight is a cheap no-op.
+        if !self.ensure_weight(wq.1, wq.2)
+            || !self.ensure_weight(wk.1, wk.2)
+            || !self.ensure_weight(wv.1, wv.2)
+            || !self.ensure_weight(wo.1, wo.2)
+        {
+            return false;
+        }
+        if let Some((wg, wu, wd, _)) = dense_ffn {
+            if !self.ensure_weight(wg.1, wg.2)
+                || !self.ensure_weight(wu.1, wu.2)
+                || !self.ensure_weight(wd.1, wd.2)
+            {
+                return false;
+            }
+        }
+
+        // ---- Host→device uploads (BEFORE capture): hidden (unless resident from
+        // the previous layer) + the per-layer norm weights. Async-issued on the
+        // stream, then a stream sync leaves the device idle so capture starts
+        // clean. (On pageable host memory these complete synchronously anyway.)
+        if upload_hidden && !self.attn_act.as_mut().unwrap().upload_at_async(o_hidden * 4, fb(hidden)) {
+            return false;
+        }
+        {
+            let nrm = self.attn_norms.as_mut().unwrap();
+            if !nrm.upload_at_async(no_attn * 4, fb(attn_norm))
+                || !nrm.upload_at_async(no_post * 4, fb(post_norm))
+                || !nrm.upload_at_async(no_if * 4, fb(inv_freq))
+            {
+                return false;
+            }
+            if let Some(w) = q_norm {
+                if !nrm.upload_at_async(no_qn * 4, fb(w)) {
+                    return false;
+                }
+            }
+            if let Some(w) = k_norm {
+                if !nrm.upload_at_async(no_kn * 4, fb(w)) {
+                    return false;
+                }
+            }
+        }
+        if !stream_sync(&self.stream) {
+            return false;
+        }
+
+        // Raw device pointers into the two slabs + the mirror (copied out → no
+        // borrow held across the capture chain's `&mut self` matvec calls).
+        let (ph, phn, pq, pk, pv, pat, po, phn2, p_gate, p_up, p_act) = {
+            let a = self.attn_act.as_ref().unwrap();
+            (
+                a.f32_ptr_at(o_hidden),
+                a.f32_ptr_at(o_hnorm),
+                a.f32_ptr_at(o_q),
+                a.f32_ptr_at(o_k),
+                a.f32_ptr_at(o_v),
+                a.f32_ptr_at(o_attn),
+                a.f32_ptr_at(o_o),
+                a.f32_ptr_at(o_hn2),
+                a.f32_ptr_at(o_gate),
+                a.f32_ptr_at(o_up),
+                a.f32_ptr_at(o_act),
+            )
+        };
+        let (pan, ppn, pqn, pkn, pif) = {
+            let n = self.attn_norms.as_ref().unwrap();
+            (
+                n.f32_ptr_at(no_attn),
+                n.f32_ptr_at(no_post),
+                n.f32_ptr_at(no_qn),
+                n.f32_ptr_at(no_kn),
+                n.f32_ptr_at(no_if),
+            )
+        };
+        let km_base = self.attn_k_mirror[layer_idx].as_ref().unwrap().ptr as *mut f32;
+        let vm_base = self.attn_v_mirror[layer_idx].as_ref().unwrap().ptr as *mut f32;
+
+        // ================= BEGIN CAPTURE =================
+        if !graph_begin_capture(&self.stream) {
+            return false;
+        }
+        // Run the whole device chain; accumulate success WITHOUT early-returning
+        // (we must always reach `end_capture` to restore the stream). `&&`
+        // short-circuits so once a step fails the rest are skipped.
+        let mut chain_ok = true;
+        // 1. attn RMSNorm.
+        chain_ok = chain_ok
+            && unsafe { rmsnorm_dev_f32(&self.stream, ph, pan, phn, 1, d_model, rms_eps).is_ok() };
+        // 2. q/k/v projections (device-I/O; weights pre-warmed so no upload).
+        chain_ok = chain_ok && unsafe { self.matvec_packed_dev_io(wq.0, wq.1, wq.2, phn, pq, d_q, d_model) };
+        chain_ok = chain_ok && unsafe { self.matvec_packed_dev_io(wk.0, wk.1, wk.2, phn, pk, d_kv, d_model) };
+        chain_ok = chain_ok && unsafe { self.matvec_packed_dev_io(wv.0, wv.1, wv.2, phn, pv, d_kv, d_model) };
+        // 3. Qwen3 qk-head-norm (in place, device).
+        if q_norm.is_some() {
+            chain_ok = chain_ok
+                && unsafe { qk_head_norm_f32(&self.stream, pq, pqn, n_heads, head_dim, rms_eps).is_ok() };
+        }
+        if k_norm.is_some() {
+            chain_ok = chain_ok
+                && unsafe { qk_head_norm_f32(&self.stream, pk, pkn, n_kv_heads, head_dim, rms_eps).is_ok() };
+        }
+        // 4. RoPE (both device, in place) at absolute `pos`.
+        chain_ok = chain_ok && unsafe { rope_f32(&self.stream, pq, n_heads, head_dim, pos, pif).is_ok() };
+        chain_ok = chain_ok && unsafe { rope_f32(&self.stream, pk, n_kv_heads, head_dim, pos, pif).is_ok() };
+        // 5. Scatter the post-RoPE K / plain V into the F32 KV mirror at `pos`,
+        //    one kv-head at a time (head-major), via async DEVICE→DEVICE copies
+        //    (NO host round-trip — that is what makes the chain capturable). The
+        //    device→host copy for the host KV cache is deferred past the sync.
+        let row_bytes = head_dim * 4;
+        for h in 0..n_kv_heads {
+            let kd = unsafe { km_base.add((h * max_ctx + pos) * head_dim) } as *mut c_void;
+            let ks = unsafe { pk.add(h * head_dim) } as *const c_void;
+            chain_ok = chain_ok && unsafe { memcpy_d2d_async(&self.stream, kd, ks, row_bytes) };
+            let vd = unsafe { vm_base.add((h * max_ctx + pos) * head_dim) } as *mut c_void;
+            let vs = unsafe { pv.add(h * head_dim) } as *const c_void;
+            chain_ok = chain_ok && unsafe { memcpy_d2d_async(&self.stream, vd, vs, row_bytes) };
+        }
+        // 6. Flash decode over [0, pos+1) against the mirror → attn_out (device).
+        chain_ok = chain_ok
+            && unsafe {
+                flash_attn_decode_f32(
+                    &self.stream,
+                    pq,
+                    km_base as *const f32,
+                    vm_base as *const f32,
+                    pat,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    pos + 1,
+                )
+                .is_ok()
+            };
+        // 7. o projection (device-I/O); 8. fused residual + post-attn RMSNorm.
+        chain_ok = chain_ok && unsafe { self.matvec_packed_dev_io(wo.0, wo.1, wo.2, pat, po, d_model, d_q) };
+        chain_ok = chain_ok
+            && unsafe { add_rmsnorm_f32(&self.stream, ph, po, ppn, phn2, 1, d_model, rms_eps).is_ok() };
+        // 8b. Optional dense SwiGLU FFN, device-resident (ffn_out reuses `po`).
+        if let Some((wg, wu, wd, _)) = dense_ffn {
+            chain_ok = chain_ok && unsafe { self.matvec_packed_dev_io(wg.0, wg.1, wg.2, phn2, p_gate, d_ff, d_model) };
+            chain_ok = chain_ok && unsafe { self.matvec_packed_dev_io(wu.0, wu.1, wu.2, phn2, p_up, d_ff, d_model) };
+            chain_ok = chain_ok && unsafe { silu_mul_f32(&self.stream, p_gate, p_up, p_act, d_ff).is_ok() };
+            chain_ok = chain_ok && unsafe { self.matvec_packed_dev_io(wd.0, wd.1, wd.2, p_act, po, d_model, d_ff) };
+            chain_ok = chain_ok && unsafe { add_f32(&self.stream, ph, po, d_model).is_ok() };
+        }
+        // ================= END CAPTURE (always) =================
+        let graph = graph_end_capture(&self.stream);
+        let Some(graph) = graph else {
+            // Capture failed/invalidated; the stream was reset by end_capture.
+            return false;
+        };
+        if !chain_ok {
+            unsafe { graph_destroy(graph) };
+            return false;
+        }
+
+        // Instantiate (first time for this layer) or patch the cached exec in
+        // place (subsequent steps — cheap; updates the grown kv_len/pos + the
+        // mirror-scatter offset). A failed update re-instantiates. The captured
+        // graph is freed once the exec reflects it (the exec is independent).
+        let have_exec = self.attn_graph_exec[layer_idx].is_some();
+        let mut launch_exec_ok = true;
+        if have_exec {
+            let updated = {
+                let exec = self.attn_graph_exec[layer_idx].as_ref().unwrap();
+                unsafe { graph_exec_update(exec, graph) }
+            };
+            if !updated {
+                // Topology changed (e.g. FFN toggled): drop + re-instantiate.
+                self.attn_graph_exec[layer_idx] = None;
+                match unsafe { graph_instantiate(graph) } {
+                    Some(e) => self.attn_graph_exec[layer_idx] = Some(e),
+                    None => launch_exec_ok = false,
+                }
+            }
+        } else {
+            match unsafe { graph_instantiate(graph) } {
+                Some(e) => self.attn_graph_exec[layer_idx] = Some(e),
+                None => launch_exec_ok = false,
+            }
+        }
+        unsafe { graph_destroy(graph) };
+        if !launch_exec_ok {
+            return false;
+        }
+
+        // Launch the executable graph, then ONE stream sync.
+        {
+            let exec = self.attn_graph_exec[layer_idx].as_ref().unwrap();
+            if !unsafe { graph_launch(exec, &self.stream) } {
+                return false;
+            }
+        }
+        if !stream_sync(&self.stream) {
+            return false;
+        }
+        if consume_error_count() != 0 {
+            return false;
+        }
+
+        // Mirror row [pos] is now written by the graph; advance the valid range
+        // exactly like the eager block (only when filling the next contiguous pos).
+        if pos as u32 == valid {
+            self.attn_valid_len[layer_idx] = pos as u32 + 1;
+        }
+
+        // ---- DEFERRED device→host copies (AFTER the sync, so the graph has
+        // completed): the post-RoPE K/V row into the host KV cache, and the
+        // updated hidden / post-attn norm. Async-issued on the now-idle stream
+        // (on pageable host memory these complete synchronously).
+        {
+            let a = self.attn_act.as_ref().unwrap();
+            let kb: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(k_row_out.as_mut_ptr() as *mut u8, d_kv * 4) };
+            let vb: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(v_row_out.as_mut_ptr() as *mut u8, d_kv * 4) };
+            if !a.download_at_async(o_k * 4, kb) || !a.download_at_async(o_v * 4, vb) {
+                return false;
+            }
+            if download_hidden {
+                let hb: &mut [u8] =
+                    unsafe { std::slice::from_raw_parts_mut(hidden.as_mut_ptr() as *mut u8, d_model * 4) };
+                if !a.download_at_async(o_hidden * 4, hb) {
+                    return false;
+                }
+            }
+            if dense_ffn.is_none() {
+                let h2b: &mut [u8] =
+                    unsafe { std::slice::from_raw_parts_mut(h_norm2.as_mut_ptr() as *mut u8, d_model * 4) };
+                if !a.download_at_async(o_hn2 * 4, h2b) {
                     return false;
                 }
             }

@@ -2475,6 +2475,14 @@ pub struct DevAttnReport {
     /// no CUDA), `false` = the #2 CUDA block. `rustllama-cli` doesn't link
     /// `rustllama-models`, so it can't read the backend itself.
     pub is_sycl: bool,
+    /// Feature 1b (CUDA only): median DECODE tok/s with the CUDA-GRAPH block
+    /// forced on (vs the eager device block = `on_tps`). `None` when not measured
+    /// (not CUDA, or the graph arm never engaged).
+    pub graph_tps: Option<f64>,
+    /// `Some(true)` when the graph arm engaged AND beat the eager device block by
+    /// the win margin — the CLI then persists `attn:dev_resident_block_cuda_graph`.
+    /// `None` = not measured / graph never engaged (verdict left unset → off).
+    pub graph_winner: Option<bool>,
 }
 
 /// A/B the #2 on-device activation-residency attention block by measured DECODE
@@ -2590,17 +2598,40 @@ pub fn measure_dev_attn(
         (Some(median), None)
     };
 
-    // OFF arm: the host attention path (current production decode).
+    // OFF arm: the host attention path (current production decode). Pin the
+    // Feature-1b graph override OFF for the OFF and eager-ON arms so a cached
+    // graph verdict can't engage and skew either baseline.
+    rustllama_models::accel::set_dev_attn_graph_force(Some(false));
     rustllama_models::accel::set_dev_attn_force(Some(false));
     let (off_tps, off_err) = bench(&mut cpu);
 
-    // ON arm: the #2 device-resident block. Snapshot the hit counter around it to
-    // confirm the block actually fired — if it never did, the A/B is meaningless.
+    // ON arm: the #2 device-resident block (EAGER). Snapshot the hit counter
+    // around it to confirm the block actually fired — if it never did, the A/B is
+    // meaningless.
     let hits_before = rustllama_models::accel::dev_attn_hits();
     rustllama_models::accel::set_dev_attn_force(Some(true));
     let (on_tps, on_err) = bench(&mut cpu);
     let engaged = rustllama_models::accel::dev_attn_hits() > hits_before;
-    rustllama_models::accel::set_dev_attn_force(None); // clear the override
+
+    // GRAPH arm (Feature 1b, CUDA only): keep the eager device override on (so the
+    // CUDA path is live) and force the graph path on; it is PREFERRED over the
+    // eager block at the dispatch site, so this measures the graph block. SYCL has
+    // no graph path — the override is a no-op there, so only measure on CUDA.
+    let is_cuda = rustllama_models::accel::cuda_active();
+    let (graph_tps, graph_engaged) = if engaged && is_cuda {
+        let gh_before = rustllama_models::accel::dev_attn_graph_hits();
+        rustllama_models::accel::set_dev_attn_graph_force(Some(true));
+        let (gtps, _gerr) = bench(&mut cpu);
+        let gengaged = rustllama_models::accel::dev_attn_graph_hits() > gh_before;
+        rustllama_models::accel::set_dev_attn_graph_force(Some(false));
+        (gtps, gengaged)
+    } else {
+        (None, false)
+    };
+
+    // Clear both overrides → the verdicts decide at serve time.
+    rustllama_models::accel::set_dev_attn_force(None);
+    rustllama_models::accel::set_dev_attn_graph_force(None);
 
     if !engaged {
         return Ok(DevAttnReport {
@@ -2614,11 +2645,20 @@ pub fn measure_dev_attn(
                     .into(),
             ),
             is_sycl: false,
+            graph_tps: None,
+            graph_winner: None,
         });
     }
 
     let winner = match (off_tps, on_tps) {
         (Some(off), Some(on)) if off > 0.0 => Some(on > off * WIN_MARGIN),
+        _ => None,
+    };
+    // Graph winner: it must have engaged AND beaten the EAGER device block (its
+    // baseline — the graph only ever runs where the eager device block already
+    // runs) by the same clear-win margin. Fail-closed otherwise (verdict unset).
+    let graph_winner = match (graph_engaged, on_tps, graph_tps) {
+        (true, Some(on), Some(gr)) if on > 0.0 => Some(gr > on * WIN_MARGIN),
         _ => None,
     };
     Ok(DevAttnReport {
@@ -2628,7 +2668,9 @@ pub fn measure_dev_attn(
         winner,
         error: off_err.or(on_err),
         // CUDA runs the #2 block; otherwise the engaged block was Feature-1a SYCL.
-        is_sycl: !rustllama_models::accel::cuda_active(),
+        is_sycl: !is_cuda,
+        graph_tps,
+        graph_winner,
     })
 }
 

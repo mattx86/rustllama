@@ -6228,6 +6228,29 @@ fn cmd_tune_dev_attn(
             };
             persist_kernel_verdicts(&[(verdict_name.to_string(), win)])?;
             println!("  → persisted verdict {verdict_name} = {win}");
+            // Feature 1b (CUDA only): the graph arm A/Bs the CUDA-graph block
+            // against the EAGER device block. Persist its disjoint verdict only
+            // when it engaged + measured faster (`graph_winner = Some(true)`);
+            // Some(false) persists off (measured, not a win); None leaves it
+            // unset (never measured — not CUDA / never engaged). The graph path
+            // is correctness-checked separately by `doctor --cuda-parity`.
+            if let (Some(graph), Some(gwin)) = (report.graph_tps, report.graph_winner) {
+                let on = report.on_tps.unwrap_or(0.0);
+                println!(
+                    "  graph attn     = {graph:.2} tok/s  ({:+.1}% vs eager dev)",
+                    if on > 0.0 { (graph / on - 1.0) * 100.0 } else { 0.0 }
+                );
+                let gname = rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK_CUDA_GRAPH;
+                persist_kernel_verdicts(&[(gname.to_string(), gwin)])?;
+                println!(
+                    "  → {} (persisted verdict {gname} = {gwin})",
+                    if gwin {
+                        "ENABLE — CUDA-graph attention is faster than the eager block here"
+                    } else {
+                        "keep eager block — CUDA-graph attention is not a win here"
+                    }
+                );
+            }
         }
         _ => {
             println!(

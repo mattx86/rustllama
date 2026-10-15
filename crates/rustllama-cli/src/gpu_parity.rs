@@ -4285,6 +4285,167 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         drop(keep);
     }
 
+    // ---- Feature 1b: CUDA-graph device-resident attention block ----
+    // Drive `CudaMatvecCache::decode_attn_block_f32_graph` (the whole attention
+    // block captured into a cudaGraph + replayed) vs a CPU reference computing the
+    // IDENTICAL op sequence on identical inputs. Validates the CHAINING + the
+    // capture/replay + the async D2D KV-mirror scatter (not just the individual
+    // kernels, which are covered above). Q4_K weights, a small realistic shape, a
+    // short pre-seeded F32 KV history so the flash spans multiple positions. The
+    // CUDA block's mirror is full F32 (no f16 rounding), so the only non-exactness
+    // is the device parallel reduce in rmsnorm/flash — gated like the f32 flash
+    // probe (cos > 0.995, max_rel < 0.10). Name MUST equal the dispatch verdict
+    // `attn:dev_resident_block_cuda_graph` so a later validate-kernels run reads it.
+    {
+        let name = "attn:dev_resident_block_cuda_graph";
+        const HEAD_DIM: usize = 128;
+        const N_HEADS: usize = 8;
+        const N_KV: usize = 2;
+        const D_MODEL: usize = 1024;
+        const MAX_CTX: usize = 64;
+        const POS: usize = 5; // 5 seeded history rows + this token => kv_len = 6
+        const EPS: f32 = 1e-5;
+        const THETA: f32 = 10000.0;
+        let d_q = N_HEADS * HEAD_DIM;
+        let d_kv = N_KV * HEAD_DIM;
+        let half = HEAD_DIM / 2;
+        let kv_len = POS + 1;
+
+        let layout = LAYOUTS.iter().find(|l| l.name == "q4_k").expect("q4_k layout");
+        let cpu_mv = cpu_matvec_for("q4_k");
+        let wq = gen_quant_bytes(layout, d_q, D_MODEL, 0x1111);
+        let wk = gen_quant_bytes(layout, d_kv, D_MODEL, 0x2222);
+        let wv = gen_quant_bytes(layout, d_kv, D_MODEL, 0x3333);
+        let wo = gen_quant_bytes(layout, D_MODEL, d_q, 0x4444);
+
+        let mut rng = XorShift(0xC0DEC0DE);
+        let hidden0: Vec<f32> = (0..D_MODEL).map(|_| rng.f32_pm(0.6)).collect();
+        let attn_norm: Vec<f32> = (0..D_MODEL).map(|_| 0.5 + rng.f32_pm(0.2)).collect();
+        let ffn_norm: Vec<f32> = (0..D_MODEL).map(|_| 0.5 + rng.f32_pm(0.2)).collect();
+        let inv_freq: Vec<f32> = (0..half)
+            .map(|j| 1.0f32 / THETA.powf(2.0 * j as f32 / HEAD_DIM as f32))
+            .collect();
+        // F32 KV history rows [0, POS) per kv-head (head-major) — NO f16 rounding
+        // (the CUDA mirror is f32, unlike the SYCL f16 mirror).
+        let hist_elems = N_KV * MAX_CTX * HEAD_DIM;
+        let mut kcache = vec![0f32; hist_elems];
+        let mut vcache = vec![0f32; hist_elems];
+        for h in 0..N_KV {
+            for t in 0..POS {
+                for dd in 0..HEAD_DIM {
+                    let idx = (h * MAX_CTX + t) * HEAD_DIM + dd;
+                    kcache[idx] = rng.f32_pm(0.6);
+                    vcache[idx] = rng.f32_pm(0.6);
+                }
+            }
+        }
+
+        // ---- CPU reference (identical op sequence) ----
+        let rope = |qk: &mut [f32], nh: usize| {
+            for hh in 0..nh {
+                let base = hh * HEAD_DIM;
+                for j in 0..half {
+                    let angle = POS as f32 * inv_freq[j];
+                    let (s, c) = angle.sin_cos();
+                    let x0 = qk[base + j];
+                    let x1 = qk[base + j + half];
+                    qk[base + j] = x0 * c - x1 * s;
+                    qk[base + j + half] = x0 * s + x1 * c;
+                }
+            }
+        };
+        let mut hnorm = vec![0f32; D_MODEL];
+        k::rmsnorm_f32_row(&hidden0, &attn_norm, &mut hnorm, EPS);
+        let mut q_ref = vec![0f32; d_q];
+        let mut k_ref = vec![0f32; d_kv];
+        let mut v_ref = vec![0f32; d_kv];
+        cpu_mv(&wq, &hnorm, &mut q_ref, d_q, D_MODEL);
+        cpu_mv(&wk, &hnorm, &mut k_ref, d_kv, D_MODEL);
+        cpu_mv(&wv, &hnorm, &mut v_ref, d_kv, D_MODEL);
+        rope(&mut q_ref, N_HEADS);
+        rope(&mut k_ref, N_KV);
+        // Reference KV cache: the f32 history + the new post-RoPE K / plain V at
+        // POS, exactly what the device mirror holds after the scatter.
+        let mut ref_k = kcache.clone();
+        let mut ref_v = vcache.clone();
+        for h in 0..N_KV {
+            for dd in 0..HEAD_DIM {
+                let idx = (h * MAX_CTX + POS) * HEAD_DIM + dd;
+                ref_k[idx] = k_ref[h * HEAD_DIM + dd];
+                ref_v[idx] = v_ref[h * HEAD_DIM + dd];
+            }
+        }
+        let mut attn_ref = vec![0f32; d_q];
+        k::gqa_attention_one_step(
+            &q_ref, &ref_k, &ref_v, &mut attn_ref, N_HEADS, N_KV, HEAD_DIM, MAX_CTX, kv_len,
+        );
+        let mut o_ref = vec![0f32; D_MODEL];
+        cpu_mv(&wo, &attn_ref, &mut o_ref, D_MODEL, d_q);
+        let mut hidden_ref = hidden0.clone();
+        for i in 0..D_MODEL {
+            hidden_ref[i] += o_ref[i];
+        }
+        let mut hnorm2_ref = vec![0f32; D_MODEL];
+        k::rmsnorm_f32_row(&hidden_ref, &ffn_norm, &mut hnorm2_ref, EPS);
+
+        if !hidden_ref.iter().chain(hnorm2_ref.iter()).all(|v| v.is_finite()) {
+            cu_emit(name, "SKIP", "cpu-reference-nonfinite");
+            *counts.entry("SKIP").or_default() += 1;
+        } else if let Some(mut cache) = ck::CudaMatvecCache::new(0, 16 << 20) {
+            let mut hidden_dev = hidden0.clone();
+            let mut hnorm2_dev = vec![0f32; D_MODEL];
+            let mut k_row = vec![0f32; d_kv];
+            let mut v_row = vec![0f32; d_kv];
+            // SAFETY: host buffers are sized to the dims; weight slices live for the
+            // call; the cache owns the stream + mirror. n_layers = 1, layer 0.
+            let ok = unsafe {
+                cache.seed_attn_mirror_f32(
+                    0, &kcache, &vcache, POS, N_KV, HEAD_DIM, MAX_CTX, 1,
+                ) && cache.decode_attn_block_f32_graph(
+                    (ck::CudaPackedKind::Q4_K, wq.as_ptr() as usize, &wq),
+                    (ck::CudaPackedKind::Q4_K, wk.as_ptr() as usize, &wk),
+                    (ck::CudaPackedKind::Q4_K, wv.as_ptr() as usize, &wv),
+                    (ck::CudaPackedKind::Q4_K, wo.as_ptr() as usize, &wo),
+                    &attn_norm,
+                    &ffn_norm,
+                    None,
+                    None,
+                    &inv_freq,
+                    &mut hidden_dev,
+                    &mut hnorm2_dev,
+                    &mut k_row,
+                    &mut v_row,
+                    N_HEADS,
+                    N_KV,
+                    HEAD_DIM,
+                    D_MODEL,
+                    POS,
+                    MAX_CTX,
+                    1,
+                    0,
+                    EPS,
+                    None,
+                    true,
+                    true,
+                )
+            };
+            if ok {
+                // Grade the residual hidden + the post-attn norm (FFN input) jointly.
+                let mut gpu = hidden_dev.clone();
+                gpu.extend_from_slice(&hnorm2_dev);
+                let mut cpu = hidden_ref.clone();
+                cpu.extend_from_slice(&hnorm2_ref);
+                cu_grade(name, &gpu, &cpu, 0.995, 0.10, &mut counts);
+            } else {
+                cu_emit(name, "SKIP", "graph-block-declined");
+                *counts.entry("SKIP").or_default() += 1;
+            }
+        } else {
+            cu_emit(name, "KERNEL_ERR", "cache-create-failed");
+            *counts.entry("KERNEL_ERR").or_default() += 1;
+        }
+    }
+
     println!();
     let summary: Vec<String> = counts.iter().map(|(k, v)| format!("{k}={v}")).collect();
     println!("summary: {}", summary.join("  "));

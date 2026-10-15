@@ -32,11 +32,24 @@
 // turns a non-zero count into a CPU fallback (mirrors the SYCL crate).
 static thread_local int g_rsl_cuda_errors = 0;
 
+// Per-thread CUDA-graph capture flag (Feature 1b). Set between
+// rsl_cuda_graph_begin_capture / _end_capture on the owning worker thread. While
+// it is set, rsl_cuda_check MUST NOT call cudaDeviceSynchronize: a device sync
+// inside a stream-capture region is ILLEGAL and invalidates the in-flight
+// capture. Thread-local to match the single-worker-thread model of
+// g_rsl_cuda_errors; it is only ever 1 during the new graph path, so the eager
+// (non-graph) code path through rsl_cuda_check below is byte-for-byte unchanged.
+static thread_local int g_rsl_cuda_capturing = 0;
+
 // Check the last launch + a synchronize; on error, log once, bump the latch,
-// and return non-zero.
+// and return non-zero. During graph capture the synchronize is SKIPPED (illegal
+// mid-capture) — only the launch-queue status from cudaGetLastError is checked;
+// the graph's real execution errors surface at cudaGraphLaunch + the single
+// stream sync after it (Feature 1b). When not capturing this is identical to
+// the original: cudaGetLastError then cudaDeviceSynchronize.
 static int rsl_cuda_check(const char *fn) {
     cudaError_t e = cudaGetLastError();
-    if (e == cudaSuccess) e = cudaDeviceSynchronize();
+    if (!g_rsl_cuda_capturing && e == cudaSuccess) e = cudaDeviceSynchronize();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "[rsl-cuda] %s failed: %s\n", fn, cudaGetErrorString(e));
         ++g_rsl_cuda_errors;
@@ -314,6 +327,163 @@ extern "C" int rsl_cuda_memcpy_d2h(rsl_cuda_stream *s, void *dst_host,
     return cudaMemcpy(dst_host, src_dev, (size_t)n_bytes, cudaMemcpyDeviceToHost) == cudaSuccess
                ? 0
                : -1;
+}
+
+// ============================================================
+// CUDA graph capture for the device-resident DECODE attention block (Feature
+// 1b). The eager block issues one synchronous cudaMemcpy + one implicit
+// cudaDeviceSynchronize per kernel, so it pays a CPU launch/sync cost for every
+// op in the chain. Capturing the whole device chain into a cudaGraph and
+// replaying it as ONE launch collapses that per-op overhead. Everything here is
+// best-effort + fail-soft: every entry returns a status and the Rust caller
+// falls back to the proven eager block on any non-zero return.
+//
+// Stream-capture rules the chain must obey (why the eager memcpy path can't be
+// captured as-is): inside a capture region a cudaDeviceSynchronize / a
+// synchronous cudaMemcpy is ILLEGAL and invalidates the capture. So the capture
+// path (a) suppresses rsl_cuda_check's device sync via g_rsl_cuda_capturing,
+// (b) writes the KV mirror with an async device->device copy instead of the
+// eager device->host->device round-trip, and (c) defers the post-RoPE K/V +
+// hidden device->host copies to AFTER the single post-launch stream sync.
+// ============================================================
+
+// Async H2D / D2H / D2D on the stream (NON-synchronizing, unlike the plain
+// cudaMemcpy entries above). Used by the graph path: D2D scatters the post-RoPE
+// K/V row into the device KV mirror INSIDE the captured region (capturable);
+// H2D pre-stages the hidden/norm uploads before capture; D2H drains the host KV
+// cache / hidden after the graph's single stream sync. Return 0 on success.
+extern "C" int rsl_cuda_memcpy_h2d_async(rsl_cuda_stream *s, void *dst_dev,
+                                         const void *src_host, unsigned long long n_bytes) {
+    if (!s) return -1;
+    cudaSetDevice(s->device);
+    return cudaMemcpyAsync(dst_dev, src_host, (size_t)n_bytes, cudaMemcpyHostToDevice,
+                           s->stream) == cudaSuccess
+               ? 0
+               : -1;
+}
+extern "C" int rsl_cuda_memcpy_d2h_async(rsl_cuda_stream *s, void *dst_host,
+                                         const void *src_dev, unsigned long long n_bytes) {
+    if (!s) return -1;
+    cudaSetDevice(s->device);
+    return cudaMemcpyAsync(dst_host, src_dev, (size_t)n_bytes, cudaMemcpyDeviceToHost,
+                           s->stream) == cudaSuccess
+               ? 0
+               : -1;
+}
+extern "C" int rsl_cuda_memcpy_d2d_async(rsl_cuda_stream *s, void *dst_dev,
+                                         const void *src_dev, unsigned long long n_bytes) {
+    if (!s) return -1;
+    cudaSetDevice(s->device);
+    return cudaMemcpyAsync(dst_dev, src_dev, (size_t)n_bytes, cudaMemcpyDeviceToDevice,
+                           s->stream) == cudaSuccess
+               ? 0
+               : -1;
+}
+
+// Block until all prior work queued on the stream completes (the ONE sync after
+// a graph launch). Return 0 on success.
+extern "C" int rsl_cuda_stream_sync(rsl_cuda_stream *s) {
+    if (!s) return -1;
+    cudaSetDevice(s->device);
+    return cudaStreamSynchronize(s->stream) == cudaSuccess ? 0 : -1;
+}
+
+// Begin capturing the stream into a graph. Sets the per-thread capture flag so
+// rsl_cuda_check skips its device sync for the duration. ThreadLocal capture
+// mode: the block is driven from one owning worker thread, so a thread-local
+// capture can't be disturbed by (and can't disturb) unrelated work on other
+// threads. Returns 0 on success; non-zero leaves the flag CLEAR so a later
+// rsl_cuda_check still syncs normally.
+extern "C" int rsl_cuda_graph_begin_capture(rsl_cuda_stream *s) {
+    if (!s) return -1;
+    cudaSetDevice(s->device);
+    cudaError_t e = cudaStreamBeginCapture(s->stream, cudaStreamCaptureModeThreadLocal);
+    if (e != cudaSuccess) return (int)e;
+    g_rsl_cuda_capturing = 1;
+    return 0;
+}
+
+// End capture, returning the captured graph via *out_graph. ALWAYS clears the
+// capture flag first (so a failing rsl_cuda_check on the fallback path syncs
+// again). On a capture error the stream is returned to the non-capturing state
+// and *out_graph is null (the caller falls back to the eager block). Returns 0
+// on success, non-zero (the cudaError_t) otherwise.
+extern "C" int rsl_cuda_graph_end_capture(rsl_cuda_stream *s, void **out_graph) {
+    if (!s || !out_graph) return -1;
+    g_rsl_cuda_capturing = 0;
+    cudaSetDevice(s->device);
+    cudaGraph_t graph = nullptr;
+    cudaError_t e = cudaStreamEndCapture(s->stream, &graph);
+    if (e != cudaSuccess) {
+        *out_graph = nullptr;
+        // Drain any sticky error so the caller's eager fallback starts clean.
+        cudaGetLastError();
+        return (int)e;
+    }
+    *out_graph = (void *)graph;
+    return 0;
+}
+
+// Instantiate a graph into an executable graph (the expensive step — done once
+// per layer, then reused via exec_update). Returns 0 on success; *out_exec is
+// null on failure.
+extern "C" int rsl_cuda_graph_instantiate(void *graph, void **out_exec) {
+    if (!graph || !out_exec) return -1;
+    cudaGraphExec_t exec = nullptr;
+#if CUDART_VERSION >= 12000
+    cudaError_t e = cudaGraphInstantiate(&exec, (cudaGraph_t)graph, 0);
+#else
+    cudaError_t e = cudaGraphInstantiate(&exec, (cudaGraph_t)graph, nullptr, nullptr, 0);
+#endif
+    if (e != cudaSuccess) {
+        *out_exec = nullptr;
+        cudaGetLastError();
+        return (int)e;
+    }
+    *out_exec = (void *)exec;
+    return 0;
+}
+
+// Patch an existing executable graph in place from a freshly captured graph of
+// IDENTICAL topology — cheap relative to re-instantiate, and how the per-decode
+// grown kv_len / pos (kernel args + the mirror-scatter memcpy offset) are
+// updated each step. Returns 0 only when the update fully succeeded; any error /
+// topology mismatch returns non-zero so the caller re-instantiates. The
+// cudaGraphExecUpdate signature changed across CUDA major versions; guard it.
+extern "C" int rsl_cuda_graph_exec_update(void *exec, void *graph) {
+    if (!exec || !graph) return -1;
+#if CUDART_VERSION >= 12000
+    cudaGraphExecUpdateResultInfo info;
+    std::memset(&info, 0, sizeof(info));
+    cudaError_t e = cudaGraphExecUpdate((cudaGraphExec_t)exec, (cudaGraph_t)graph, &info);
+    cudaGetLastError(); // clear sticky status either way
+    if (e != cudaSuccess || info.result != cudaGraphExecUpdateSuccess) return -1;
+#else
+    cudaGraphNode_t err_node = nullptr;
+    cudaGraphExecUpdateResult res = cudaGraphExecUpdateError;
+    cudaError_t e =
+        cudaGraphExecUpdate((cudaGraphExec_t)exec, (cudaGraph_t)graph, &err_node, &res);
+    cudaGetLastError();
+    if (e != cudaSuccess || res != cudaGraphExecUpdateSuccess) return -1;
+#endif
+    return 0;
+}
+
+// Launch an executable graph on the stream (async — pair with
+// rsl_cuda_stream_sync). Return 0 on success.
+extern "C" int rsl_cuda_graph_launch(void *exec, rsl_cuda_stream *s) {
+    if (!exec || !s) return -1;
+    cudaSetDevice(s->device);
+    cudaError_t e = cudaGraphLaunch((cudaGraphExec_t)exec, s->stream);
+    return e == cudaSuccess ? 0 : (int)e;
+}
+
+// Free a captured graph / an executable graph. Null-safe.
+extern "C" void rsl_cuda_graph_destroy(void *graph) {
+    if (graph) cudaGraphDestroy((cudaGraph_t)graph);
+}
+extern "C" void rsl_cuda_graph_exec_destroy(void *exec) {
+    if (exec) cudaGraphExecDestroy((cudaGraphExec_t)exec);
 }
 
 __device__ __forceinline__ float rsl_f16_bits_to_f32(unsigned short bits) {
