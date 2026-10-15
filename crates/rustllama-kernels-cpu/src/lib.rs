@@ -13966,6 +13966,135 @@ fn gqa_attention_flash_prefill_scalar(
     }
 }
 
+/// Tree-mask variant of [`gqa_attention_flash_prefill`] for speculative TREE
+/// verification (Feature 4): each of the `n_new` tree nodes attends the whole
+/// committed prefix `[0, kv_len_base)` PLUS only its own ancestor chain among
+/// the tree slots `[kv_len_base, kv_len_base + n_new)` — NOT the full causal
+/// prefix. `parent[i]` is the tree-local parent index of node `i`, or any
+/// negative value for a depth-1 node (child of the committed tip / root level);
+/// `parent` MUST be topologically ordered (`parent[i] < i`). Node `i` lives at
+/// cache slot `kv_len_base + i` (the caller writes its post-RoPE K/V there,
+/// roped at the node's DEPTH position, and runs this once per layer).
+///
+/// Mirrors the scalar [`gqa_attention_flash_prefill`] online-softmax math
+/// op-for-op, swapping only the causal admission for the ancestor-mask test, so
+/// a CHAIN-shaped tree (`parent[i] == i-1`) is **bit-identical** to the causal
+/// flash-prefill — the `tree_prefill_chain_matches_causal` parity guard. Scalar
+/// only: tree verify runs over a handful of nodes, so the K-outer cache win of
+/// the SIMD twins isn't worth duplicating the mask logic.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_tree_prefill(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+    parent: &[i32],
+) {
+    debug_assert_eq!(q.len(), n_new * n_heads * head_dim);
+    debug_assert_eq!(out.len(), n_new * n_heads * head_dim);
+    debug_assert_eq!(k_cache.len(), n_kv_heads * max_ctx * head_dim);
+    debug_assert_eq!(v_cache.len(), n_kv_heads * max_ctx * head_dim);
+    debug_assert!(kv_len_base + n_new <= max_ctx);
+    debug_assert_eq!(n_heads % n_kv_heads, 0);
+    debug_assert_eq!(parent.len(), n_new);
+    if n_new == 0 {
+        return;
+    }
+    for x in out.iter_mut() {
+        *x = 0.0;
+    }
+    // Precompute each node's ancestor-or-self set among the tree slots:
+    // `attends[i][j]` ⇔ node `j` is `i` itself or one of `i`'s ancestors, so
+    // query `i` admits key slot `kv_len_base + j`. O(n_new · depth) once; the
+    // topological order (`parent[i] < i`) lets a single forward pass inherit the
+    // parent's set. For a chain this is the lower-triangular (causal) mask.
+    let mut attends = vec![vec![false; n_new]; n_new];
+    for i in 0..n_new {
+        attends[i][i] = true;
+        let p = parent[i];
+        if p >= 0 && (p as usize) < i {
+            // Inherit the parent's ancestor set (all strict ancestors of i).
+            for j in 0..n_new {
+                if attends[p as usize][j] {
+                    attends[i][j] = true;
+                }
+            }
+        }
+    }
+    let n_gqa = n_heads / n_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let kv_len_total = kv_len_base + n_new;
+    let mut m_state = vec![f32::NEG_INFINITY; n_new];
+    let mut l_state = vec![0.0f32; n_new];
+
+    for kv_h in 0..n_kv_heads {
+        let cache_base = kv_h * max_ctx * head_dim;
+        for q_in_group in 0..n_gqa {
+            let h = kv_h * n_gqa + q_in_group;
+            for slot in m_state.iter_mut() {
+                *slot = f32::NEG_INFINITY;
+            }
+            for slot in l_state.iter_mut() {
+                *slot = 0.0;
+            }
+            for t in 0..kv_len_total {
+                let k_off = cache_base + t * head_dim;
+                let k_row = &k_cache[k_off..k_off + head_dim];
+                let v_row = &v_cache[k_off..k_off + head_dim];
+                // Admission: committed-prefix keys (t < kv_len_base) are seen by
+                // EVERY node; tree-slot keys only by nodes whose ancestor chain
+                // contains that slot's node. Iterate q_pos in the SAME 0..n_new
+                // order as the causal kernel so a chain reduces bit-for-bit.
+                let tree_node = if t >= kv_len_base {
+                    Some(t - kv_len_base)
+                } else {
+                    None
+                };
+                for q_pos in 0..n_new {
+                    let admit = match tree_node {
+                        None => true,
+                        Some(kn) => attends[q_pos][kn],
+                    };
+                    if !admit {
+                        continue;
+                    }
+                    let q_off = (q_pos * n_heads + h) * head_dim;
+                    let q_row = &q[q_off..q_off + head_dim];
+                    let mut s = 0f32;
+                    for d in 0..head_dim {
+                        s += q_row[d] * k_row[d];
+                    }
+                    s *= scale;
+                    let m_old = m_state[q_pos];
+                    let m_new = m_old.max(s);
+                    let rescale = if m_old.is_finite() { (m_old - m_new).exp() } else { 0.0 };
+                    let p = (s - m_new).exp();
+                    l_state[q_pos] = l_state[q_pos] * rescale + p;
+                    let out_off = (q_pos * n_heads + h) * head_dim;
+                    for d in 0..head_dim {
+                        out[out_off + d] = out[out_off + d] * rescale + p * v_row[d];
+                    }
+                    m_state[q_pos] = m_new;
+                }
+            }
+            for q_pos in 0..n_new {
+                let l = l_state[q_pos];
+                let inv_l = if l > 0.0 { 1.0 / l } else { 0.0 };
+                let out_off = (q_pos * n_heads + h) * head_dim;
+                for d in 0..head_dim {
+                    out[out_off + d] *= inv_l;
+                }
+            }
+        }
+    }
+}
+
 /// AVX-2 + FMA specialization of [`gqa_attention_flash_prefill`].
 /// Preserves the cache-friendly K-outer ordering (each K/V row is
 /// loaded once per kv_h and reused across admitted queries) while
@@ -18887,6 +19016,111 @@ mod tests {
                 (a - b).abs()
             );
         }
+    }
+
+    /// THE tree-attention parity guard: a CHAIN-shaped tree
+    /// (`parent[i] == i-1`) must be BIT-identical to the causal scalar
+    /// flash-prefill — proving the ancestor mask reduces exactly to causal.
+    #[test]
+    fn tree_prefill_chain_matches_causal_bitexact() {
+        let n_heads = 4usize;
+        let n_kv_heads = 2usize; // exercise GQA grouping
+        let head_dim = 8usize;
+        let max_ctx = 16usize;
+        let kv_len_base = 3usize; // committed prefix
+        let n_new = 5usize; // tree nodes
+        let mut s = 0x7EE_12345_u32;
+        let q: Vec<f32> = (0..n_new * n_heads * head_dim).map(|_| lcg(&mut s)).collect();
+        let k_cache: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let v_cache: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let mut out_causal = vec![0f32; n_new * n_heads * head_dim];
+        let mut out_tree = vec![0f32; n_new * n_heads * head_dim];
+        gqa_attention_flash_prefill_scalar(
+            &q, &k_cache, &v_cache, &mut out_causal, n_heads, n_kv_heads, head_dim,
+            max_ctx, kv_len_base, n_new,
+        );
+        let chain: Vec<i32> = (0..n_new as i32).map(|i| i - 1).collect(); // parent[0] = -1
+        gqa_attention_tree_prefill(
+            &q, &k_cache, &v_cache, &mut out_tree, n_heads, n_kv_heads, head_dim,
+            max_ctx, kv_len_base, n_new, &chain,
+        );
+        let cb: Vec<u32> = out_causal.iter().map(|v| v.to_bits()).collect();
+        let tb: Vec<u32> = out_tree.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(cb, tb, "chain-tree attention must be bit-identical to causal");
+    }
+
+    /// Two root-level siblings (no committed prefix) each attend only
+    /// themselves ⇒ single-key softmax ⇒ each node's output IS that node's V.
+    #[test]
+    fn tree_prefill_siblings_attend_only_self() {
+        let n_heads = 1usize;
+        let n_kv_heads = 1usize;
+        let head_dim = 4usize;
+        let max_ctx = 2usize;
+        let n_new = 2usize;
+        let mut s = 0xA11CE_u32;
+        let q: Vec<f32> = (0..n_new * head_dim).map(|_| lcg(&mut s)).collect();
+        let k_cache: Vec<f32> = (0..max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let v_cache: Vec<f32> = (0..max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let mut out = vec![0f32; n_new * head_dim];
+        let parent = [-1i32, -1]; // two independent root candidates
+        gqa_attention_tree_prefill(
+            &q, &k_cache, &v_cache, &mut out, n_heads, n_kv_heads, head_dim,
+            max_ctx, 0, n_new, &parent,
+        );
+        for node in 0..n_new {
+            for d in 0..head_dim {
+                let got = out[node * head_dim + d];
+                let want = v_cache[node * head_dim + d];
+                assert!((got - want).abs() < 1e-6, "node {node} dim {d}: {got} != {want}");
+            }
+        }
+    }
+
+    /// Branch isolation: node 1 and node 2 are siblings (both children of
+    /// root node 0). Node 1 attends {0,1} and must be INVARIANT to node 2's
+    /// K/V (it's not an ancestor); node 2's own output does change.
+    #[test]
+    fn tree_prefill_branch_ignores_sibling_kv() {
+        let n_heads = 2usize;
+        let n_kv_heads = 1usize;
+        let head_dim = 6usize;
+        let max_ctx = 8usize;
+        let n_new = 3usize; // node0=root, node1=child(0), node2=child(0)
+        let parent = [-1i32, 0, 0];
+        let mut s = 0xBEE5_u32;
+        let q: Vec<f32> = (0..n_new * n_heads * head_dim).map(|_| lcg(&mut s)).collect();
+        let k_cache: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let mut v_a: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let mut out_a = vec![0f32; n_new * n_heads * head_dim];
+        gqa_attention_tree_prefill(
+            &q, &k_cache, &v_a, &mut out_a, n_heads, n_kv_heads, head_dim,
+            max_ctx, 0, n_new, &parent,
+        );
+        // Perturb node 2's V (cache slot 2) and recompute.
+        for d in 0..head_dim {
+            v_a[2 * head_dim + d] += 1.0;
+        }
+        let mut out_b = vec![0f32; n_new * n_heads * head_dim];
+        gqa_attention_tree_prefill(
+            &q, &k_cache, &v_a, &mut out_b, n_heads, n_kv_heads, head_dim,
+            max_ctx, 0, n_new, &parent,
+        );
+        // Node 0 (attends {0}) and node 1 (attends {0,1}) must be unchanged;
+        // node 2 (attends {0,2}) must change.
+        for node in [0usize, 1] {
+            for i in 0..n_heads * head_dim {
+                let off = node * n_heads * head_dim + i;
+                assert_eq!(
+                    out_a[off].to_bits(),
+                    out_b[off].to_bits(),
+                    "node {node} must ignore sibling node 2's V"
+                );
+            }
+        }
+        let n2 = 2 * n_heads * head_dim;
+        let changed = (0..n_heads * head_dim).any(|i| out_a[n2 + i] != out_b[n2 + i]);
+        assert!(changed, "node 2 must reflect its own changed V");
     }
 
     #[test]
