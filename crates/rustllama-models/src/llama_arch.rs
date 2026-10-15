@@ -7865,11 +7865,14 @@ impl LlamaModel {
                         // Feature 1a: the SYCL device-resident DECODE block, tried
                         // when the CUDA block didn't run (no CUDA, or it declined).
                         // Inert off SYCL (the gate returns false → byte-identical
-                        // path). Attention-only: `h_norm` holds the post-attn norm
-                        // (FFN input), so the host FFN below runs unchanged;
-                        // `device_dense_ffn` stays false. Fed the same scaled rope
-                        // table as the CUDA block.
-                        let sycl_ran = crate::accel::try_decode_attn_block_sycl_f32(
+                        // path). Now also handed `dense_ffn_arg` so a pure-dense
+                        // layer's SwiGLU FFN runs USM-resident too (gate/up/silu/
+                        // down/residual on the same submit-chain); `sycl_ffn` then
+                        // drives `device_dense_ffn` so the host FFN below is
+                        // skipped. It stays attention-only (sycl_ffn=false, host
+                        // FFN runs) for MoE/hybrid layers or non-dispatchable FFN
+                        // weights. Fed the same scaled rope table as the CUDA block.
+                        let (sycl_ran, sycl_ffn) = crate::accel::try_decode_attn_block_sycl_f32(
                             block.w_q(),
                             block.w_k(),
                             block.w_v(),
@@ -7886,6 +7889,7 @@ impl LlamaModel {
                             &mut v_buf,
                             k,
                             v,
+                            dense_ffn_arg,
                             n_heads,
                             n_kv_heads,
                             head_dim,
@@ -7898,17 +7902,20 @@ impl LlamaModel {
                         );
                         device_attn_is_sycl = sycl_ran;
                         if sycl_ran {
+                            device_dense_ffn = sycl_ffn;
                             true
                         } else {
                             // Feature 1c: the Metal/MLX device-resident DECODE
                             // block, tried when neither CUDA nor SYCL ran. Inert
                             // off Apple Silicon (the gate returns false →
-                            // byte-identical path). Attention-only: `h_norm`
-                            // holds the post-attn norm (FFN input), so the host
-                            // FFN below runs unchanged; `device_dense_ffn` stays
-                            // false. Fed the same scaled rope table as the
-                            // CUDA/SYCL blocks.
-                            let mlx_ran = crate::accel::try_decode_attn_block_mlx_f32(
+                            // byte-identical path). Now also handed `dense_ffn_arg`
+                            // so a pure-dense layer's SwiGLU FFN runs in the same
+                            // Metal command buffer; `mlx_ffn` then drives
+                            // `device_dense_ffn` so the host FFN below is skipped.
+                            // Attention-only (mlx_ffn=false, host FFN runs) for
+                            // MoE/hybrid layers or non-dispatchable FFN weights.
+                            // Fed the same scaled rope table as the CUDA/SYCL blocks.
+                            let (mlx_ran, mlx_ffn) = crate::accel::try_decode_attn_block_mlx_f32(
                                 block.w_q(),
                                 block.w_k(),
                                 block.w_v(),
@@ -7927,6 +7934,7 @@ impl LlamaModel {
                                 &mut v_buf,
                                 k,
                                 v,
+                                dense_ffn_arg,
                                 n_heads,
                                 n_kv_heads,
                                 head_dim,
@@ -7938,6 +7946,9 @@ impl LlamaModel {
                                 cfg.rms_eps,
                             );
                             device_attn_is_mlx = mlx_ran;
+                            if mlx_ran {
+                                device_dense_ffn = mlx_ffn;
+                            }
                             mlx_ran
                         }
                     }

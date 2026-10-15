@@ -14158,6 +14158,45 @@ static inline sycl::event rsl_add_rmsnorm_f32_nowait(
     });
 }
 
+// SwiGLU activation, f32 I/O, nowait: act[i] = silu(gate[i]) * up[i], with
+// silu(v) = v / (1 + exp(-v)). The f32 twin of the shipped f16 `rsl_silu_mul_usm`
+// (same math, minus the bits<->f32 round-trip) so the dense-FFN leg of the
+// decode block stays single-precision end to end — bit-exact to the CPU SwiGLU
+// reference up to float reduction order, matching the attention legs above. One
+// work-item per element on the shared in-order queue (no `.wait()`).
+static inline sycl::event rsl_silu_mul_f32_nowait(
+    sycl::queue& q, const float* gate, const float* up, float* act, int n) {
+    return q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(n)),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+            const int i = static_cast<int>(it.get_global_id(0));
+            if (i >= n) return;
+            const float g = gate[i];
+            const float silu = g / (1.0f + sycl::exp(-g));
+            act[i] = silu * up[i];
+        });
+    });
+}
+
+// Elementwise residual add, f32 I/O, nowait: dst[i] += src[i]. The SYCL twin of
+// the CUDA block's `add_f32` (used there for `hidden += ffn_out`). One work-item
+// per element on the shared in-order queue (no `.wait()`).
+static inline sycl::event rsl_add_f32_nowait(
+    sycl::queue& q, float* dst, const float* src, int n) {
+    return q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(n)),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+            const int i = static_cast<int>(it.get_global_id(0));
+            if (i >= n) return;
+            dst[i] += src[i];
+        });
+    });
+}
+
 // Dispatch one SUPPORTED decode-block matvec format WITHOUT waiting. 0 = Q4_K,
 // 1 = Q8_0 (the Rust caller declines any other format, so an unsupported code
 // never reaches here). Reuses the shipped single-row matvec impls at their
@@ -14178,8 +14217,20 @@ extern "C" {
 // (hidden/h_norm2/k_row/v_row written), 0 on any bad shape / alloc / unsupported
 // matvec code — on 0 the Rust caller falls back to the per-op SYCL/CPU ladder and
 // the host buffers are left as passed (results are copied out only on success).
-// Attention-only (no fused dense FFN yet — the caller runs the host FFN exactly
-// as it does for the CUDA attention-only path).
+//
+// Optional fused dense SwiGLU FFN (#2 Phase 1, SYCL sibling of the CUDA block's
+// `dense_ffn`): when `d_ff > 0` AND all three FFN weight pointers are non-null,
+// the block continues device-resident past the attention residual with
+// gate/up = W·h_norm2, act = silu(gate)⊙up, ffn_out = W_down·act, hidden +=
+// ffn_out — so a whole DENSE layer's decode stays on one submit-chain. When the
+// FFN ran, `*ffn_ran` is set to 1 and the caller SKIPS the host FFN (hidden
+// already carries the FFN residual); `h_norm2` is then the intermediate FFN
+// input and left unread (not copied back). When `d_ff <= 0` / any null FFN
+// pointer / a MoE or hybrid layer, the block stays ATTENTION-ONLY (the historical
+// behavior) — `*ffn_ran` = 0, `h_norm2` is copied back, and the caller runs the
+// host FFN exactly as for the CUDA attention-only path. The FFN leg stays f32 end
+// to end (same bit-exact chain as the attention legs). `ffn_ran` may be null
+// (treated as "don't report").
 int rsl_decode_attn_block_usm(
     rsl_stream* s,
     // q/k/v/o weights: USM-resident packed bytes + a format code each
@@ -14188,12 +14239,23 @@ int rsl_decode_attn_block_usm(
     const void* wk_usm, int kk,
     const void* wv_usm, int kv_kind,
     const void* wo_usm, int ko,
+    // Optional dense-FFN weights (gate/up/down): USM-resident packed bytes + a
+    // format code each (0=Q4_K, 1=Q8_0), plus `d_ff`. All-null + d_ff<=0 ⇒
+    // attention-only. The caller only supplies these for a pure-dense layer whose
+    // three FFN weights are all dispatchable; otherwise it passes nulls/0.
+    const void* wg_usm, int kg,
+    const void* wu_usm, int ku,
+    const void* wd_usm, int kd,
+    int d_ff,
+    int* ffn_ran,
     // Norms + inv_freq as HOST f32 (copied into shared scratch here — tiny
     // O(d_model) vectors, unlike the big cached weights).
     const float* attn_norm, const float* ffn_norm, const float* inv_freq,
-    // hidden: HOST f32, in (pre-attn residual) AND out (post-attn residual).
+    // hidden: HOST f32, in (pre-attn residual) AND out (post-attn [+ FFN]
+    // residual).
     float* hidden,
-    // h_norm2: HOST f32 out — the post-attn RMSNorm == the FFN input.
+    // h_norm2: HOST f32 out — the post-attn RMSNorm == the FFN input. Copied back
+    // only when the device FFN did NOT run (else it is an unread intermediate).
     float* h_norm2,
     // k_row / v_row: HOST f32 out — this token's post-RoPE K / plain V
     // (head-major), for the caller to append to the host KV cache.
@@ -14204,6 +14266,7 @@ int rsl_decode_attn_block_usm(
     int n_heads, int n_kv_heads, int head_dim, int d_model,
     int pos, int max_ctx, int kv_len, float rms_eps)
     RSL_FFI_BODY_RET("rsl_decode_attn_block_usm", 0, {
+    if (ffn_ran != nullptr) *ffn_ran = 0;
     if (s == nullptr) return 0;
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || d_model <= 0
         || (head_dim % 2) != 0 || (n_heads % n_kv_heads) != 0
@@ -14213,6 +14276,12 @@ int rsl_decode_attn_block_usm(
     const int d_q = n_heads * head_dim;
     const int d_kv = n_kv_heads * head_dim;
     const int half = head_dim / 2;
+    // Dense-FFN gate: run the fused FFN only when the caller supplied a positive
+    // d_ff AND all three weight pointers (fail-closed — any missing piece leaves
+    // the block attention-only, exactly as before this feature existed).
+    const bool do_ffn = (d_ff > 0 && wg_usm != nullptr && wu_usm != nullptr
+                         && wd_usm != nullptr);
+    const int dff = do_ffn ? d_ff : 0;
     auto& q = s->q;
     // One shared-USM f32 slab for every intermediate activation + the tiny
     // norm/inv_freq copies. malloc_shared is host-addressable so the host inputs
@@ -14220,6 +14289,10 @@ int rsl_decode_attn_block_usm(
     // H2D/D2H). Single alloc + single free per call; the WIN is collapsing the
     // ~10 submit+wait pairs into one FIFO + one wait, not avoiding this slab.
     //   layout: hidden | hnorm | q | k | v | attn | o | hnorm2 | an | fn | if
+    //           [ | gate | up | act ]   (the bracketed FFN region only when
+    //           do_ffn; dff==0 collapses it to zero width otherwise). ffn_out
+    //           reuses `o` — free once the attention residual+norm has consumed
+    //           it — exactly like the CUDA block.
     const size_t off_hidden = 0;
     const size_t off_hnorm  = off_hidden + d_model;
     const size_t off_q      = off_hnorm  + d_model;
@@ -14231,7 +14304,10 @@ int rsl_decode_attn_block_usm(
     const size_t off_an     = off_hnorm2 + d_model;
     const size_t off_fn     = off_an     + d_model;
     const size_t off_if     = off_fn     + d_model;
-    const size_t slab_elems = off_if     + half;
+    const size_t off_gate   = off_if     + half;
+    const size_t off_up     = off_gate   + dff;
+    const size_t off_act    = off_up     + dff;
+    const size_t slab_elems = off_act    + dff;
     float* slab = sycl::malloc_shared<float>(slab_elems, q);
     if (slab == nullptr) return 0;
     float* p_hidden = slab + off_hidden;
@@ -14245,6 +14321,10 @@ int rsl_decode_attn_block_usm(
     float* p_an     = slab + off_an;
     float* p_fn     = slab + off_fn;
     float* p_if     = slab + off_if;
+    // FFN slab pointers (valid only when do_ffn; unused otherwise).
+    float* p_gate   = slab + off_gate;
+    float* p_up     = slab + off_up;
+    float* p_act    = slab + off_act;
     // Stage host inputs into the shared slab.
     std::memcpy(p_hidden, hidden, static_cast<size_t>(d_model) * sizeof(float));
     std::memcpy(p_an, attn_norm, static_cast<size_t>(d_model) * sizeof(float));
@@ -14267,14 +14347,39 @@ int rsl_decode_attn_block_usm(
         if (ok)
             rsl_add_rmsnorm_f32_nowait(q, p_hidden, p_o, p_fn, p_hnorm2, 1, d_model, rms_eps);
     }
+    // --- optional fused dense SwiGLU FFN, still device-resident on the SAME
+    //     in-order queue (no extra sync). gate/up = W·h_norm2 →
+    //     act = silu(gate)⊙up → ffn_out (reusing `p_o`, free after the residual
+    //     add above consumed it) = W_down·act → hidden += ffn_out. In-order FIFO
+    //     guarantees the ffn_out write to `p_o` happens strictly after
+    //     add_rmsnorm read it, so reusing `p_o` is hazard-free. Any unsupported
+    //     FFN matvec code fail-closes the whole block (→ caller host fallback).
+    bool ffn_done = false;
+    if (ok && do_ffn) {
+        ok = ok && rsl_block_matvec_nowait(q, kg, wg_usm, p_hnorm2, p_gate, dff, d_model);
+        ok = ok && rsl_block_matvec_nowait(q, ku, wu_usm, p_hnorm2, p_up, dff, d_model);
+        if (ok) {
+            rsl_silu_mul_f32_nowait(q, p_gate, p_up, p_act, dff);
+            ok = rsl_block_matvec_nowait(q, kd, wd_usm, p_act, p_o, d_model, dff);
+            if (ok) {
+                rsl_add_f32_nowait(q, p_hidden, p_o, d_model);
+                ffn_done = true;
+            }
+        }
+    }
     // ONE sync for the whole layer's chain.
     q.wait();
     if (ok) {
-        // Shared slab is host-addressable; read results back out.
+        // Shared slab is host-addressable; read results back out. When the device
+        // FFN ran, `hidden` already carries the FFN residual and `h_norm2` is an
+        // unread intermediate (the caller skips the host FFN) — so skip its copy,
+        // mirroring the CUDA block.
         std::memcpy(hidden, p_hidden, static_cast<size_t>(d_model) * sizeof(float));
-        std::memcpy(h_norm2, p_hnorm2, static_cast<size_t>(d_model) * sizeof(float));
+        if (!ffn_done)
+            std::memcpy(h_norm2, p_hnorm2, static_cast<size_t>(d_model) * sizeof(float));
         std::memcpy(k_row, p_k, static_cast<size_t>(d_kv) * sizeof(float));
         std::memcpy(v_row, p_v, static_cast<size_t>(d_kv) * sizeof(float));
+        if (ffn_ran != nullptr) *ffn_ran = ffn_done ? 1 : 0;
     }
     sycl::free(slab, q);
     return ok ? 1 : 0;

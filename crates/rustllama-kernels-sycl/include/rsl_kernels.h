@@ -1337,6 +1337,15 @@ int rsl_decode_attn_block_usm(rsl_stream* s,
                               const void* wk_usm, int kk,
                               const void* wv_usm, int kv_kind,
                               const void* wo_usm, int ko,
+                              /* optional dense SwiGLU FFN (gate/up/down) +
+                                 d_ff; all-null + d_ff<=0 => attention-only.
+                                 *ffn_ran set to 1 when the device FFN ran
+                                 (caller then skips the host FFN). */
+                              const void* wg_usm, int kg,
+                              const void* wu_usm, int ku,
+                              const void* wd_usm, int kd,
+                              int d_ff,
+                              int* ffn_ran,
                               const float* attn_norm, const float* ffn_norm,
                               const float* inv_freq,
                               float* hidden, float* h_norm2,

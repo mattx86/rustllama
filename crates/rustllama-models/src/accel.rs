@@ -8241,6 +8241,7 @@ fn resolve_block_weight_usm(ctx: &mut UsmAttnContext, w: &Tensor) -> Option<*con
 /// q/k/v/o are all Q4_K or Q8_0. F32 KV only. `k_cache`/`v_cache` are the layer's
 /// host KV slabs (head-major), used to seed the mirror's prefill history.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub fn try_decode_attn_block_sycl_f32(
     w_q: &Tensor,
     w_k: &Tensor,
@@ -8258,6 +8259,11 @@ pub fn try_decode_attn_block_sycl_f32(
     v_buf: &mut [f32],
     k_cache: &mut [f32],
     v_cache: &mut [f32],
+    // Optional dense SwiGLU FFN `(w_gate, w_up, w_down, d_ff)` to run
+    // device-resident right after the attention block (#2 Phase 1, SYCL sibling
+    // of the CUDA block). `None` ⇒ attention-only (MoE / hybrid layers keep the
+    // host FFN). Mirrors `try_decode_attn_block_cuda_f32`'s `dense_ffn`.
+    dense_ffn: Option<(&Tensor, &Tensor, &Tensor, usize)>,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -8267,7 +8273,7 @@ pub fn try_decode_attn_block_sycl_f32(
     n_layers: usize,
     layer_idx: usize,
     rms_eps: f32,
-) -> bool {
+) -> (bool, bool) {
     // Gates (correctness-first): perf verdict/force, USM+SYCL active, no qkv bias,
     // and no Qwen3 head-norm (there is no USM `qk_head_norm` kernel, so a head-norm
     // model MUST take the per-op path that applies it on the host).
@@ -8278,7 +8284,7 @@ pub fn try_decode_attn_block_sycl_f32(
         || q_norm.is_some()
         || k_norm.is_some()
     {
-        return false;
+        return (false, false);
     }
     let d_q = n_heads * head_dim;
     let d_kv = n_kv_heads * head_dim;
@@ -8297,7 +8303,7 @@ pub fn try_decode_attn_block_sycl_f32(
         || k_cache.len() < d_kv * max_ctx
         || v_cache.len() < d_kv * max_ctx
     {
-        return false;
+        return (false, false);
     }
     // Weight-format gate: all four must be a supported code AND K-aligned. q/k/v
     // consume K = d_model; o consumes K = d_q.
@@ -8307,11 +8313,28 @@ pub fn try_decode_attn_block_sycl_f32(
         sycl_block_weight_kind(w_v.dtype),
         sycl_block_weight_kind(w_o.dtype),
     ) else {
-        return false;
+        return (false, false);
     };
     if d_model % aq != 0 || d_model % ak != 0 || d_model % av != 0 || d_q % ao != 0 {
-        return false;
+        return (false, false);
     }
+    // Dense-FFN format gate (mirrors the CUDA path: only build the device-FFN arg
+    // when the caller asked AND all three FFN weights are a supported code AND
+    // K-aligned). gate/up consume K = d_model; down consumes K = d_ff. Any failure
+    // ⇒ FFN runs on the host (`None`), the block stays attention-only — the
+    // attention still runs device-resident. `d_ff > 0` required.
+    let ffn_fmt: Option<((i32, i32, i32), usize)> = dense_ffn.and_then(|(wg, wu, wd, d_ff)| {
+        if d_ff == 0 {
+            return None;
+        }
+        let (kg, ag) = sycl_block_weight_kind(wg.dtype)?;
+        let (ku, au) = sycl_block_weight_kind(wu.dtype)?;
+        let (kd, ad) = sycl_block_weight_kind(wd.dtype)?;
+        if d_model % ag != 0 || d_model % au != 0 || d_ff % ad != 0 {
+            return None;
+        }
+        Some(((kg, ku, kd), d_ff))
+    });
     let cfg = UsmAttnConfig {
         n_layers: n_layers as u32,
         n_heads: n_heads as u32,
@@ -8339,7 +8362,10 @@ pub fn try_decode_attn_block_sycl_f32(
         n_layers as u32,
     );
     let kv_len = (pos + 1) as u32;
-    let ran = USM_ATTN.with(|cell| {
+    // Returns `(ran, ffn_ran)`: `ran` = the device block handled this layer's
+    // attention; `ffn_ran` = the fused dense FFN also ran on device (so the host
+    // FFN must be skipped). `(false, _)` ⇒ decline to the per-op/CPU ladder.
+    let (ran, ffn_ran) = USM_ATTN.with(|cell| {
         let mut slot = cell.borrow_mut();
         let needs_rebuild = match slot.as_ref() {
             Some(ctx) => ctx.cfg != cfg,
@@ -8348,7 +8374,7 @@ pub fn try_decode_attn_block_sycl_f32(
         if needs_rebuild {
             *slot = UsmAttnContext::try_new(cfg);
             if slot.is_none() {
-                return false;
+                return (false, false);
             }
         }
         let ctx = slot.as_mut().expect("usm ctx just built");
@@ -8365,16 +8391,42 @@ pub fn try_decode_attn_block_sycl_f32(
         }
         let valid = ctx.kv_valid_len[layer_idx];
         if pos as u32 > valid {
-            return false;
+            return (false, false);
         }
         // Resolve the four weights to USM pointers (preloaded or cached upload).
         // Sequential (not a tuple) because each borrows `ctx` mutably to upload;
         // the returned `*const u8` points at the STABLE USM allocation, not into
         // the cache map, so a later insert's rehash can't invalidate it.
-        let Some(wq_ptr) = resolve_block_weight_usm(ctx, w_q) else { return false };
-        let Some(wk_ptr) = resolve_block_weight_usm(ctx, w_k) else { return false };
-        let Some(wv_ptr) = resolve_block_weight_usm(ctx, w_v) else { return false };
-        let Some(wo_ptr) = resolve_block_weight_usm(ctx, w_o) else { return false };
+        let Some(wq_ptr) = resolve_block_weight_usm(ctx, w_q) else { return (false, false) };
+        let Some(wk_ptr) = resolve_block_weight_usm(ctx, w_k) else { return (false, false) };
+        let Some(wv_ptr) = resolve_block_weight_usm(ctx, w_v) else { return (false, false) };
+        let Some(wo_ptr) = resolve_block_weight_usm(ctx, w_o) else { return (false, false) };
+        // Resolve the dense-FFN weights the same way (only when the format gate
+        // above accepted them). SEQUENTIAL `let`s (not one tuple expression) so
+        // each reborrows `ctx` in turn — the returned USM pointer is a raw ptr
+        // that does not hold the borrow. If any FFN weight fails to resolve
+        // (alloc), drop to attention-only (`dense_ffn_raw = None`) rather than
+        // declining the whole block — the attention still runs device-resident
+        // and the host FFN takes over, so the layer stays correct.
+        let dense_ffn_raw = if let Some(((kg, ku, kd), d_ff)) = ffn_fmt {
+            // ffn_fmt is Some only when `dense_ffn` was Some (format gate above).
+            let (wg_t, wu_t, wd_t) = dense_ffn.map(|t| (t.0, t.1, t.2)).unwrap();
+            let rg = resolve_block_weight_usm(ctx, wg_t);
+            let ru = resolve_block_weight_usm(ctx, wu_t);
+            let rd = resolve_block_weight_usm(ctx, wd_t);
+            if let (Some(wg), Some(wu), Some(wd)) = (rg, ru, rd) {
+                Some((
+                    wg as *const std::ffi::c_void, kg,
+                    wu as *const std::ffi::c_void, ku,
+                    wd as *const std::ffi::c_void, kd,
+                    d_ff as u32,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         // Extract the remaining raw pointers (raw ptrs don't hold the borrow).
         let stream_raw: *const sk::SyclStream = &ctx.stream;
         let kmir = ctx.k_caches[layer_idx].as_mut_ptr();
@@ -8383,7 +8435,8 @@ pub fn try_decode_attn_block_sycl_f32(
         // preloaded); the host slices (`hidden`/`h_norm2`/`k_buf`/`v_buf`/norms/
         // `inv_freq`) are sized to the dims (validated above); `kmir`/`vmir` are
         // this ctx's f16 K/V caches, seeded to `pos`; the block syncs before
-        // returning so there's no host/device overlap on the staged slab.
+        // returning so there's no host/device overlap on the staged slab. The
+        // dense-FFN USM pointers (when `Some`) are likewise stable cached uploads.
         let res = unsafe {
             sk::decode_attn_block_usm_raw(
                 &*stream_raw,
@@ -8391,6 +8444,7 @@ pub fn try_decode_attn_block_sycl_f32(
                 wk_ptr as *const std::ffi::c_void, kk,
                 wv_ptr as *const std::ffi::c_void, kv_c,
                 wo_ptr as *const std::ffi::c_void, ko,
+                dense_ffn_raw,
                 attn_norm.as_ptr(),
                 post_norm.as_ptr(),
                 inv_freq.as_ptr(),
@@ -8411,19 +8465,19 @@ pub fn try_decode_attn_block_sycl_f32(
             )
         };
         match res {
-            Ok(true) => {
+            Ok((true, ffn)) => {
                 // The device scatter wrote mirror row [pos]; advance the valid
                 // range the same way the per-op decode path does.
                 if pos as u32 == valid {
                     ctx.kv_valid_len[layer_idx] = pos as u32 + 1;
                 }
                 note_sycl_success();
-                true
+                (true, ffn)
             }
-            Ok(false) => false,
+            Ok((false, _)) => (false, false),
             Err(_) => {
                 note_sycl_failure();
-                false
+                (false, false)
             }
         }
     });
@@ -8438,15 +8492,25 @@ pub fn try_decode_attn_block_sycl_f32(
             v_cache[dst..dst + head_dim].copy_from_slice(&v_buf[src..src + head_dim]);
         }
         if DEV_ATTN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
-            tracing::info!(
-                "Feature 1a SYCL on-device activation-residency attention ENGAGED \
-                 — the whole decode attention block runs USM-resident on one \
-                 in-order submit-chain (perf-gated verdict \
-                 attn:dev_resident_block_sycl) (logged once)"
-            );
+            if ffn_ran {
+                tracing::info!(
+                    "Feature 1a SYCL on-device activation-residency ENGAGED — the \
+                     whole DENSE layer (attention + SwiGLU FFN) runs USM-resident on \
+                     one in-order submit-chain (perf-gated verdict \
+                     attn:dev_resident_block_sycl) (logged once)"
+                );
+            } else {
+                tracing::info!(
+                    "Feature 1a SYCL on-device activation-residency attention ENGAGED \
+                     — the whole decode attention block runs USM-resident on one \
+                     in-order submit-chain (perf-gated verdict \
+                     attn:dev_resident_block_sycl) (logged once)"
+                );
+            }
         }
     }
-    ran
+    // (attention ran on device, dense FFN ran on device)
+    (ran, ffn_ran)
 }
 
 /// Whether the Feature-1c Apple-Metal/MLX device-resident DECODE attention block
@@ -8532,9 +8596,12 @@ fn resolve_block_weight_mlx(
 /// there are no qkv biases, there is no Qwen3 q/k head-norm (no MLX `qk_head_norm`
 /// kernel — correctness-first decline), and q/k/v/o are all Q4_K or Q8_0. F32 KV
 /// only. `k_cache`/`v_cache` are the layer's host KV slabs (head-major), used to
-/// seed the mirror's prefill history. ATTENTION-ONLY (no fused dense FFN — the
-/// caller runs the host FFN), matching the SYCL block.
+/// seed the mirror's prefill history. Optional fused dense SwiGLU FFN (`dense_ffn
+/// = Some((w_gate, w_up, w_down, d_ff))`) runs the whole dense layer in the one
+/// command buffer, matching the CUDA/SYCL blocks; `None` ⇒ attention-only (MoE /
+/// hybrid layers keep the host FFN). Returns `(attn_ran, ffn_ran)`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub fn try_decode_attn_block_mlx_f32(
     w_q: &Tensor,
     w_k: &Tensor,
@@ -8552,6 +8619,9 @@ pub fn try_decode_attn_block_mlx_f32(
     v_buf: &mut [f32],
     k_cache: &mut [f32],
     v_cache: &mut [f32],
+    // Optional dense SwiGLU FFN `(w_gate, w_up, w_down, d_ff)`; `None` ⇒
+    // attention-only. Mirrors `try_decode_attn_block_cuda_f32`'s `dense_ffn`.
+    dense_ffn: Option<(&Tensor, &Tensor, &Tensor, usize)>,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -8561,7 +8631,7 @@ pub fn try_decode_attn_block_mlx_f32(
     n_layers: usize,
     layer_idx: usize,
     rms_eps: f32,
-) -> bool {
+) -> (bool, bool) {
     // Gates (correctness-first): perf verdict/force, MLX active for this layer,
     // no qkv bias, and no Qwen3 head-norm (there is no MLX `qk_head_norm` kernel,
     // so a head-norm model MUST take the per-op path that applies it on the host).
@@ -8572,7 +8642,7 @@ pub fn try_decode_attn_block_mlx_f32(
         || q_norm.is_some()
         || k_norm.is_some()
     {
-        return false;
+        return (false, false);
     }
     let d_q = n_heads * head_dim;
     let d_kv = n_kv_heads * head_dim;
@@ -8591,7 +8661,7 @@ pub fn try_decode_attn_block_mlx_f32(
         || k_cache.len() < d_kv * max_ctx
         || v_cache.len() < d_kv * max_ctx
     {
-        return false;
+        return (false, false);
     }
     // Weight-format gate: all four must be a supported code AND K-aligned. q/k/v
     // consume K = d_model; o consumes K = d_q.
@@ -8601,11 +8671,27 @@ pub fn try_decode_attn_block_mlx_f32(
         mlx_block_weight_kind(w_v.dtype),
         mlx_block_weight_kind(w_o.dtype),
     ) else {
-        return false;
+        return (false, false);
     };
     if d_model % aq != 0 || d_model % ak != 0 || d_model % av != 0 || d_q % ao != 0 {
-        return false;
+        return (false, false);
     }
+    // Dense-FFN format gate (mirrors the CUDA/SYCL paths): build the device-FFN
+    // arg only when the caller asked AND all three FFN weights are supported +
+    // K-aligned (gate/up consume K=d_model, down consumes K=d_ff). Any miss ⇒
+    // FFN on the host (`None`), the block stays attention-only.
+    let ffn_fmt: Option<((i32, i32, i32), usize)> = dense_ffn.and_then(|(wg, wu, wd, d_ff)| {
+        if d_ff == 0 {
+            return None;
+        }
+        let (kg, ag) = mlx_block_weight_kind(wg.dtype)?;
+        let (ku, au) = mlx_block_weight_kind(wu.dtype)?;
+        let (kd, ad) = mlx_block_weight_kind(wd.dtype)?;
+        if d_model % ag != 0 || d_model % au != 0 || d_ff % ad != 0 {
+            return None;
+        }
+        Some(((kg, ku, kd), d_ff))
+    });
     let cfg = MlxAttnConfig {
         n_layers: n_layers as u32,
         n_heads: n_heads as u32,
@@ -8632,7 +8718,10 @@ pub fn try_decode_attn_block_mlx_f32(
     );
     let kv_len = (pos + 1) as u32;
     let mirror_bytes = n_kv_heads * max_ctx * head_dim * 4;
-    let ran = MLX_ATTN.with(|cell| {
+    // Returns `(ran, ffn_ran)` like the SYCL path: `ran` = the device block
+    // handled this layer's attention; `ffn_ran` = the fused dense FFN also ran on
+    // device (host FFN skipped). `(false, _)` ⇒ decline to the per-op/CPU ladder.
+    let (ran, ffn_ran) = MLX_ATTN.with(|cell| {
         let mut slot = cell.borrow_mut();
         let needs_rebuild = match slot.as_ref() {
             Some(ctx) => ctx.cfg != cfg,
@@ -8641,7 +8730,7 @@ pub fn try_decode_attn_block_mlx_f32(
         if needs_rebuild {
             *slot = MlxAttnContext::try_new(cfg);
             if slot.is_none() {
-                return false;
+                return (false, false);
             }
         }
         let ctx = slot.as_mut().expect("mlx ctx just built");
@@ -8658,22 +8747,42 @@ pub fn try_decode_attn_block_mlx_f32(
         }
         let valid = ctx.kv_valid_len_f32[layer_idx];
         if pos as u32 > valid {
-            return false;
+            return (false, false);
         }
         // Ensure the layer's persistent F32 K/V mirrors exist (the seed normally
         // allocated them already; this covers pos==0 with no history to seed).
         if !ensure_mlx_dev(&mut ctx.dev_k_mirror[layer_idx], &ctx.stream, mirror_bytes)
             || !ensure_mlx_dev(&mut ctx.dev_v_mirror[layer_idx], &ctx.stream, mirror_bytes)
         {
-            return false;
+            return (false, false);
         }
         // Resolve the four weights to device pointers (cached per-block upload).
         // Sequential (not a tuple) because each borrows `ctx` mutably to upload;
         // the returned `*const c_void` points at the STABLE device allocation.
-        let Some(wq_ptr) = resolve_block_weight_mlx(ctx, w_q) else { return false };
-        let Some(wk_ptr) = resolve_block_weight_mlx(ctx, w_k) else { return false };
-        let Some(wv_ptr) = resolve_block_weight_mlx(ctx, w_v) else { return false };
-        let Some(wo_ptr) = resolve_block_weight_mlx(ctx, w_o) else { return false };
+        let Some(wq_ptr) = resolve_block_weight_mlx(ctx, w_q) else { return (false, false) };
+        let Some(wk_ptr) = resolve_block_weight_mlx(ctx, w_k) else { return (false, false) };
+        let Some(wv_ptr) = resolve_block_weight_mlx(ctx, w_v) else { return (false, false) };
+        let Some(wo_ptr) = resolve_block_weight_mlx(ctx, w_o) else { return (false, false) };
+        // Resolve the dense-FFN weights the same way (only when the format gate
+        // accepted them). SEQUENTIAL `let`s so each reborrows `ctx` in turn (the
+        // returned device pointer is a raw ptr that does not hold the borrow). A
+        // resolve miss drops to attention-only (`None`) rather than declining the
+        // whole block — the attention still runs device-resident and the host FFN
+        // takes over.
+        let dense_ffn_raw = if let Some(((kg, ku, kd), d_ff)) = ffn_fmt {
+            // ffn_fmt is Some only when `dense_ffn` was Some (format gate above).
+            let (wg_t, wu_t, wd_t) = dense_ffn.map(|t| (t.0, t.1, t.2)).unwrap();
+            let rg = resolve_block_weight_mlx(ctx, wg_t);
+            let ru = resolve_block_weight_mlx(ctx, wu_t);
+            let rd = resolve_block_weight_mlx(ctx, wd_t);
+            if let (Some(wg), Some(wu), Some(wd)) = (rg, ru, rd) {
+                Some((wg, kg, wu, ku, wd, kd, d_ff as u32))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         // Extract the remaining raw pointers (raw ptrs don't hold the borrow).
         let stream_raw: *const mk::MlxStream = &ctx.stream;
         let kmir = ctx.dev_k_mirror[layer_idx].as_mut().unwrap().as_mut_ptr();
@@ -8682,7 +8791,8 @@ pub fn try_decode_attn_block_mlx_f32(
         // the host slices (`hidden`/`h_norm2`/`k_buf`/`v_buf`/norms/`inv_freq`)
         // are sized to the dims (validated above); `kmir`/`vmir` are this ctx's
         // F32 K/V mirrors, seeded to `pos`; the block syncs before returning so
-        // there's no host/device overlap on the staged slab.
+        // there's no host/device overlap on the staged slab. The dense-FFN device
+        // pointers (when `Some`) are likewise stable cached uploads.
         let res = unsafe {
             mk::decode_attn_block_f32(
                 &*stream_raw,
@@ -8690,6 +8800,7 @@ pub fn try_decode_attn_block_mlx_f32(
                 wk_ptr, kk,
                 wv_ptr, kv_c,
                 wo_ptr, ko,
+                dense_ffn_raw,
                 attn_norm.as_ptr(),
                 post_norm.as_ptr(),
                 inv_freq.as_ptr(),
@@ -8710,15 +8821,15 @@ pub fn try_decode_attn_block_mlx_f32(
             )
         };
         match res {
-            Ok(true) => {
+            Ok((true, ffn)) => {
                 // The device KV-write scattered mirror row [pos]; advance the
                 // valid range the same way the per-op decode path does.
                 if pos as u32 == valid {
                     ctx.kv_valid_len_f32[layer_idx] = pos as u32 + 1;
                 }
-                true
+                (true, ffn)
             }
-            _ => false,
+            _ => (false, false),
         }
     });
     if ran {
@@ -8732,15 +8843,25 @@ pub fn try_decode_attn_block_mlx_f32(
             v_cache[dst..dst + head_dim].copy_from_slice(&v_buf[src..src + head_dim]);
         }
         if DEV_ATTN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
-            tracing::info!(
-                "Feature 1c Metal/MLX on-device activation-residency attention \
-                 ENGAGED — the whole decode attention block runs in ONE Metal \
-                 command buffer (one sync per layer) (perf-gated verdict \
-                 attn:dev_resident_block_mlx) (logged once)"
-            );
+            if ffn_ran {
+                tracing::info!(
+                    "Feature 1c Metal/MLX on-device activation-residency ENGAGED — \
+                     the whole DENSE layer (attention + SwiGLU FFN) runs in ONE \
+                     Metal command buffer (one sync per layer) (perf-gated verdict \
+                     attn:dev_resident_block_mlx) (logged once)"
+                );
+            } else {
+                tracing::info!(
+                    "Feature 1c Metal/MLX on-device activation-residency attention \
+                     ENGAGED — the whole decode attention block runs in ONE Metal \
+                     command buffer (one sync per layer) (perf-gated verdict \
+                     attn:dev_resident_block_mlx) (logged once)"
+                );
+            }
         }
     }
-    ran
+    // (attention ran on device, dense FFN ran on device)
+    (ran, ffn_ran)
 }
 
 /// Drain the cross-layer-resident `hidden` (#2 Phase 2) from the CUDA activation

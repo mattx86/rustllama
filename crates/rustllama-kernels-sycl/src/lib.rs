@@ -238,6 +238,17 @@ mod imp {
             kv_kind: c_int,
             wo_usm: *const std::ffi::c_void,
             ko: c_int,
+            // Optional dense SwiGLU FFN (gate/up/down) + format codes + d_ff.
+            // All-null + d_ff<=0 ⇒ attention-only; `ffn_ran` (nullable) receives
+            // 1 when the device FFN ran so the caller skips the host FFN.
+            wg_usm: *const std::ffi::c_void,
+            kg: c_int,
+            wu_usm: *const std::ffi::c_void,
+            ku: c_int,
+            wd_usm: *const std::ffi::c_void,
+            kd: c_int,
+            d_ff: c_int,
+            ffn_ran: *mut c_int,
             attn_norm: *const f32,
             ffn_norm: *const f32,
             inv_freq: *const f32,
@@ -5696,13 +5707,22 @@ pub unsafe fn flash_attn_decode_usm_raw(
 /// Feature 1a: run the WHOLE per-layer DECODE attention block on the SYCL
 /// in-order queue as one submit-chain with a single final sync (the C++
 /// `rsl_decode_attn_block_usm`). Replaces the per-token flood of independent
-/// `q.submit().wait()` dispatches. `Ok(true)` = the block ran and wrote
-/// `hidden`/`h_norm2`/`k_row`/`v_row`; `Ok(false)` = the C++ side declined
+/// `q.submit().wait()` dispatches. `Ok((true, ffn_ran))` = the block ran and
+/// wrote `hidden`/`h_norm2`/`k_row`/`v_row` (and when `ffn_ran`, also the fused
+/// dense FFN residual into `hidden`); `Ok((false, _))` = the C++ side declined
 /// (bad shape / alloc / unsupported matvec code) — the caller must fall back to
 /// the per-op ladder, as the host buffers are then unchanged. `Err` = an FFI
 /// exception was latched. `kq/kk/kv_kind/ko` are weight format codes
 /// (0 = Q4_K, 1 = Q8_0). `k_mirror`/`v_mirror` are the layer's persistent f16
 /// USM KV buffers, pre-seeded with rows `[0, pos)`.
+///
+/// Optional dense SwiGLU FFN: pass `dense_ffn = Some((wg, kg, wu, ku, wd, kd,
+/// d_ff))` (each weight a USM-resident packed-byte pointer + format code) to run
+/// gate/up→silu→down→`hidden += ffn_out` device-resident right after the
+/// attention residual — the whole dense layer on one submit-chain. `None`
+/// (or `d_ff == 0`) ⇒ attention-only (historical behavior): the second tuple
+/// element of the result is then `false` and the caller runs the host FFN. When
+/// the FFN ran, `h_norm2` is an unread intermediate and is NOT written back.
 ///
 /// # Safety
 ///
@@ -5710,8 +5730,10 @@ pub unsafe fn flash_attn_decode_usm_raw(
 /// `wX_usm` the packed weight bytes (USM); `attn_norm`/`ffn_norm` ≥ `d_model`,
 /// `inv_freq` ≥ `head_dim/2`, `hidden`/`h_norm2` ≥ `d_model`, `k_row`/`v_row` ≥
 /// `n_kv_heads*head_dim` (host); `k_mirror`/`v_mirror` ≥
-/// `n_kv_heads*max_ctx*head_dim` (USM). The block syncs before returning, so no
-/// host/device overlap on the staged buffers.
+/// `n_kv_heads*max_ctx*head_dim` (USM). The dense-FFN weights (when `Some`) are
+/// USM packed bytes sized to `[d_ff×d_model]` (gate/up) and `[d_model×d_ff]`
+/// (down). The block syncs before returning, so no host/device overlap on the
+/// staged buffers.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn decode_attn_block_usm_raw(
     stream: &SyclStream,
@@ -5723,6 +5745,16 @@ pub unsafe fn decode_attn_block_usm_raw(
     kv_kind: i32,
     wo_usm: *const std::ffi::c_void,
     ko: i32,
+    // Optional dense FFN: (w_gate, k_gate, w_up, k_up, w_down, k_down, d_ff).
+    dense_ffn: Option<(
+        *const std::ffi::c_void,
+        i32,
+        *const std::ffi::c_void,
+        i32,
+        *const std::ffi::c_void,
+        i32,
+        u32,
+    )>,
     attn_norm: *const f32,
     ffn_norm: *const f32,
     inv_freq: *const f32,
@@ -5740,13 +5772,26 @@ pub unsafe fn decode_attn_block_usm_raw(
     max_ctx: u32,
     kv_len: u32,
     rms_eps: f32,
-) -> Result<bool> {
+) -> Result<(bool, bool)> {
+    // Unpack the optional dense-FFN tuple into the raw C args (null pointers +
+    // d_ff=0 when absent ⇒ the C++ side stays attention-only, fail-closed).
+    let null = std::ptr::null::<std::ffi::c_void>();
+    let (wg, kg, wu, ku, wd, kd, d_ff) = match dense_ffn {
+        Some((wg, kg, wu, ku, wd, kd, d_ff)) => (wg, kg, wu, ku, wd, kd, d_ff as i32),
+        None => (null, 0i32, null, 0i32, null, 0i32, 0i32),
+    };
+    let mut ffn_ran: std::os::raw::c_int = 0;
     let ran = imp::rsl_decode_attn_block_usm(
         stream.raw,
         wq_usm, kq as std::os::raw::c_int,
         wk_usm, kk as std::os::raw::c_int,
         wv_usm, kv_kind as std::os::raw::c_int,
         wo_usm, ko as std::os::raw::c_int,
+        wg, kg as std::os::raw::c_int,
+        wu, ku as std::os::raw::c_int,
+        wd, kd as std::os::raw::c_int,
+        d_ff as std::os::raw::c_int,
+        &mut ffn_ran as *mut std::os::raw::c_int,
         attn_norm, ffn_norm, inv_freq,
         hidden, h_norm2, k_row, v_row,
         k_mirror, v_mirror,
@@ -5760,7 +5805,7 @@ pub unsafe fn decode_attn_block_usm_raw(
         rms_eps,
     );
     imp::consume_error()?;
-    Ok(ran == 1)
+    Ok((ran == 1, ran == 1 && ffn_ran == 1))
 }
 
 /// Raw-pointer variant of [`rmsnorm_usm`]. Same SAFETY contract as

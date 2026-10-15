@@ -1249,12 +1249,21 @@ const TQ_PROBE_BITS: u8 = 2;
 /// the chain is f32 end-to-end, the only lossy step is the f16 KV mirror (same
 /// rounding the per-op decode path carries), so the gate matches the f32 flash
 /// probe's (cos > 0.995, max_rel < 0.10).
+///
+/// This probe exercises the FFN-INCLUSIVE path: it passes the dense SwiGLU FFN
+/// weights (gate/up/down) so the block runs gate/up→silu→down→residual on-device
+/// too, and grades the FINAL `hidden` (attention residual + FFN residual) against
+/// a CPU reference that computes attention AND the same SwiGLU FFN. (When the FFN
+/// runs, `h_norm2` is an unread intermediate, so it is not graded — the device
+/// doesn't copy it back.) The attention-only path is covered by production decode
+/// + is the fallback; this validates the bigger per-layer win.
 fn probe_decode_block(stream: &sk::SyclStream, name: &str, started: Instant) {
     use std::ffi::c_void;
     const HEAD_DIM: usize = 128;
     const N_HEADS: usize = 8;
     const N_KV: usize = 2;
     const D_MODEL: usize = 1024;
+    const D_FF: usize = 2048; // SwiGLU FFN inner dim (256-aligned for Q4_K)
     const MAX_CTX: usize = 64;
     const POS: usize = 5; // 5 seeded history rows + this token => kv_len = 6
     const EPS: f32 = 1e-5;
@@ -1266,13 +1275,17 @@ fn probe_decode_block(stream: &sk::SyclStream, name: &str, started: Instant) {
 
     // Q4_K weights (M x K packed bytes): Wq [d_q x D_MODEL], Wk/Wv [d_kv x
     // D_MODEL], Wo [D_MODEL x d_q]. Same synthesis + CPU reference matvec the
-    // matvec probes use, so the per-row dequant matches the device kernel.
+    // matvec probes use, so the per-row dequant matches the device kernel. The
+    // dense-FFN weights: Wgate/Wup [D_FF x D_MODEL], Wdown [D_MODEL x D_FF].
     let layout = LAYOUTS.iter().find(|l| l.name == "q4_k").expect("q4_k layout");
     let cpu_mv = cpu_matvec_for("q4_k");
     let wq = gen_quant_bytes(layout, d_q, D_MODEL, 0x1111);
     let wk = gen_quant_bytes(layout, d_kv, D_MODEL, 0x2222);
     let wv = gen_quant_bytes(layout, d_kv, D_MODEL, 0x3333);
     let wo = gen_quant_bytes(layout, D_MODEL, d_q, 0x4444);
+    let wgate = gen_quant_bytes(layout, D_FF, D_MODEL, 0x5555);
+    let wup = gen_quant_bytes(layout, D_FF, D_MODEL, 0x6666);
+    let wdown = gen_quant_bytes(layout, D_MODEL, D_FF, 0x7777);
 
     // Norms, hidden, inv_freq, and the synthetic KV history.
     let mut rng = XorShift(0xDEC0DE);
@@ -1352,7 +1365,21 @@ fn probe_decode_block(stream: &sk::SyclStream, name: &str, started: Instant) {
     }
     let mut hnorm2_ref = vec![0f32; D_MODEL];
     k::rmsnorm_f32_row(&hidden_ref, &ffn_norm, &mut hnorm2_ref, EPS);
-    if !hidden_ref.iter().chain(hnorm2_ref.iter()).all(|v| v.is_finite()) {
+    // Dense SwiGLU FFN reference: gate/up = W·hnorm2, act = silu(gate)⊙up,
+    // ffn_out = Wdown·act, hidden += ffn_out — the same op sequence the device
+    // FFN leg runs. `hidden_ref` becomes the FINAL post-FFN residual we grade.
+    let mut gate_ref = vec![0f32; D_FF];
+    let mut up_ref = vec![0f32; D_FF];
+    cpu_mv(&wgate, &hnorm2_ref, &mut gate_ref, D_FF, D_MODEL);
+    cpu_mv(&wup, &hnorm2_ref, &mut up_ref, D_FF, D_MODEL);
+    let mut act_ref = vec![0f32; D_FF];
+    k::silu_mul_f32(&gate_ref, &up_ref, &mut act_ref);
+    let mut ffn_out_ref = vec![0f32; D_MODEL];
+    cpu_mv(&wdown, &act_ref, &mut ffn_out_ref, D_MODEL, D_FF);
+    for i in 0..D_MODEL {
+        hidden_ref[i] += ffn_out_ref[i];
+    }
+    if !hidden_ref.iter().all(|v| v.is_finite()) {
         emit(name, "SKIP", "cpu-reference-nonfinite");
         return;
     }
@@ -1367,13 +1394,19 @@ fn probe_decode_block(stream: &sk::SyclStream, name: &str, started: Instant) {
         wvb.as_mut_slice().copy_from_slice(&wv);
         let mut wob = sk::SyclSharedBuffer::<u8>::alloc(stream, wo.len())?;
         wob.as_mut_slice().copy_from_slice(&wo);
+        let mut wgb = sk::SyclSharedBuffer::<u8>::alloc(stream, wgate.len())?;
+        wgb.as_mut_slice().copy_from_slice(&wgate);
+        let mut wub = sk::SyclSharedBuffer::<u8>::alloc(stream, wup.len())?;
+        wub.as_mut_slice().copy_from_slice(&wup);
+        let mut wdb = sk::SyclSharedBuffer::<u8>::alloc(stream, wdown.len())?;
+        wdb.as_mut_slice().copy_from_slice(&wdown);
         let mut kmir = sk::SyclSharedBuffer::<u16>::alloc(stream, hist_elems)?;
         kmir.as_mut_slice().copy_from_slice(&k_hist_f16);
         let mut vmir = sk::SyclSharedBuffer::<u16>::alloc(stream, hist_elems)?;
         vmir.as_mut_slice().copy_from_slice(&v_hist_f16);
-        Ok((wqb, wkb, wvb, wob, kmir, vmir))
+        Ok((wqb, wkb, wvb, wob, wgb, wub, wdb, kmir, vmir))
     })();
-    let (wqb, wkb, wvb, wob, mut kmir, mut vmir) = match alloc {
+    let (wqb, wkb, wvb, wob, wgb, wub, wdb, mut kmir, mut vmir) = match alloc {
         Ok(t) => t,
         Err(_) => {
             emit(name, "KERNEL_ERR", "usm-alloc-failed");
@@ -1384,9 +1417,10 @@ fn probe_decode_block(stream: &sk::SyclStream, name: &str, started: Instant) {
     let mut hnorm2_dev = vec![0f32; D_MODEL];
     let mut k_row_dev = vec![0f32; d_kv];
     let mut v_row_dev = vec![0f32; d_kv];
-    // SAFETY: all USM buffers (weights, mirrors) live on `stream`; the norm /
-    // hidden / inv_freq / out slices are host-sized to the dims; the block syncs
-    // before returning. kq/kk/kv/ko = 0 (Q4_K).
+    // SAFETY: all USM buffers (weights, FFN weights, mirrors) live on `stream`;
+    // the norm / hidden / inv_freq / out slices are host-sized to the dims; the
+    // block syncs before returning. kq/kk/kv/ko + FFN codes = 0 (Q4_K). Passing
+    // the dense-FFN tuple exercises the FFN-inclusive path.
     let res = unsafe {
         sk::decode_attn_block_usm_raw(
             stream,
@@ -1394,6 +1428,12 @@ fn probe_decode_block(stream: &sk::SyclStream, name: &str, started: Instant) {
             wkb.as_ptr() as *const c_void, 0,
             wvb.as_ptr() as *const c_void, 0,
             wob.as_ptr() as *const c_void, 0,
+            Some((
+                wgb.as_ptr() as *const c_void, 0,
+                wub.as_ptr() as *const c_void, 0,
+                wdb.as_ptr() as *const c_void, 0,
+                D_FF as u32,
+            )),
             attn_norm.as_ptr(),
             ffn_norm.as_ptr(),
             inv_freq.as_ptr(),
@@ -1415,22 +1455,31 @@ fn probe_decode_block(stream: &sk::SyclStream, name: &str, started: Instant) {
     };
     let ms = started.elapsed().as_millis();
     match res {
-        Ok(true) => {
-            // Grade both device outputs (the residual hidden + the post-attn
-            // norm == FFN input) jointly against the CPU reference.
-            let mut gpu = hidden_dev.clone();
-            gpu.extend_from_slice(&hnorm2_dev);
-            let mut cpu = hidden_ref.clone();
-            cpu.extend_from_slice(&hnorm2_ref);
-            let (cos, max_rel) = compare(&gpu, &cpu);
-            let verdict = if cos > 0.995 && max_rel < 0.10 {
+        // `ffn_ran` must be true — the probe always supplies dispatchable Q4_K
+        // FFN weights, so the device FFN leg ran and `hidden_dev` carries the full
+        // attention+FFN residual. (`hnorm2_dev` is the unread FFN input, not
+        // copied back, so it isn't graded.) Grade the per-layer residual DELTA
+        // (`hidden - hidden0` = the attention + FFN contribution) rather than the
+        // raw `hidden`, so the large shared input residual can't mask an FFN
+        // miscompute (cosine of two near-equal big vectors is ~1 regardless).
+        Ok((true, ffn_ran)) => {
+            let gpu_delta: Vec<f32> =
+                hidden_dev.iter().zip(&hidden0).map(|(h, h0)| h - h0).collect();
+            let cpu_delta: Vec<f32> =
+                hidden_ref.iter().zip(&hidden0).map(|(h, h0)| h - h0).collect();
+            let (cos, max_rel) = compare(&gpu_delta, &cpu_delta);
+            let verdict = if cos > 0.995 && max_rel < 0.10 && ffn_ran {
                 "OK"
             } else {
                 "MISCOMPUTE"
             };
-            emit(name, verdict, &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"));
+            emit(
+                name,
+                verdict,
+                &format!("cos={cos:.6} max_rel={max_rel:.4} ffn_ran={ffn_ran} ms={ms}"),
+            );
         }
-        Ok(false) => emit(name, "SKIP", &format!("block-declined ms={ms}")),
+        Ok((false, _)) => emit(name, "SKIP", &format!("block-declined ms={ms}")),
         Err(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
     }
 }
@@ -5443,11 +5492,17 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
         // multiple positions). Same loose gate as the SYCL decode-block probe
         // (cos > 0.995, max_rel < 0.10) — the f32 mirror only makes passing
         // easier, so this won't false-pass a broken kernel.
+        //
+        // Like the SYCL probe, this exercises the FFN-INCLUSIVE path: it supplies
+        // the dense SwiGLU FFN weights (gate/up/down) so the block runs the whole
+        // dense layer on-device, and grades the FINAL `hidden` (attention + FFN
+        // residual) vs a CPU reference computing attention AND the same SwiGLU FFN.
         {
             const HEAD_DIM: usize = 128;
             const N_HEADS: usize = 8;
             const N_KV: usize = 2;
             const D_MODEL: usize = 1024;
+            const D_FF: usize = 2048; // SwiGLU FFN inner dim (256-aligned for Q4_K)
             const MAX_CTX: usize = 64;
             const POS: usize = 5; // 5 seeded history rows + this token => kv_len = 6
             const EPS: f32 = 1e-5;
@@ -5460,12 +5515,16 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
             // Q4_K weights (M x K packed bytes): Wq [d_q x D_MODEL], Wk/Wv
             // [d_kv x D_MODEL], Wo [D_MODEL x d_q] — same synthesis + CPU matvec
             // the matvec probes use, so the per-row dequant matches the kernel.
+            // The dense-FFN weights: Wgate/Wup [D_FF x D_MODEL], Wdown [D_MODEL x D_FF].
             let layout = LAYOUTS.iter().find(|l| l.name == "q4_k").expect("q4_k layout");
             let cpu_mv = cpu_matvec_for("q4_k");
             let wq = gen_quant_bytes(layout, d_q, D_MODEL, 0x1111);
             let wk = gen_quant_bytes(layout, d_kv, D_MODEL, 0x2222);
             let wv = gen_quant_bytes(layout, d_kv, D_MODEL, 0x3333);
             let wo = gen_quant_bytes(layout, D_MODEL, d_q, 0x4444);
+            let wgate = gen_quant_bytes(layout, D_FF, D_MODEL, 0x5555);
+            let wup = gen_quant_bytes(layout, D_FF, D_MODEL, 0x6666);
+            let wdown = gen_quant_bytes(layout, D_MODEL, D_FF, 0x7777);
             let mut rng = XorShift(0xDEC0DE);
             let hidden0: Vec<f32> = (0..D_MODEL).map(|_| rng.f32_pm(0.6)).collect();
             let attn_norm: Vec<f32> = (0..D_MODEL).map(|_| 0.5 + rng.f32_pm(0.2)).collect();
@@ -5537,14 +5596,34 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
             }
             let mut hnorm2_ref = vec![0f32; D_MODEL];
             k::rmsnorm_f32_row(&hidden_ref, &ffn_norm, &mut hnorm2_ref, EPS);
-            if !hidden_ref.iter().chain(hnorm2_ref.iter()).all(|v| v.is_finite()) {
+            // Dense SwiGLU FFN reference: gate/up = W·hnorm2, act = silu(gate)⊙up,
+            // ffn_out = Wdown·act, hidden += ffn_out — the op sequence the device
+            // FFN leg runs. `hidden_ref` becomes the FINAL post-FFN residual.
+            let mut gate_ref = vec![0f32; D_FF];
+            let mut up_ref = vec![0f32; D_FF];
+            cpu_mv(&wgate, &hnorm2_ref, &mut gate_ref, D_FF, D_MODEL);
+            cpu_mv(&wup, &hnorm2_ref, &mut up_ref, D_FF, D_MODEL);
+            let mut act_ref = vec![0f32; D_FF];
+            k::silu_mul_f32(&gate_ref, &up_ref, &mut act_ref);
+            let mut ffn_out_ref = vec![0f32; D_MODEL];
+            cpu_mv(&wdown, &act_ref, &mut ffn_out_ref, D_MODEL, D_FF);
+            for i in 0..D_MODEL {
+                hidden_ref[i] += ffn_out_ref[i];
+            }
+            if !hidden_ref.iter().all(|v| v.is_finite()) {
                 cu_emit(name, "SKIP", "cpu-reference-nonfinite");
                 *counts.entry("SKIP").or_default() += 1;
-            } else if let (Some(bwq), Some(bwk), Some(bwv), Some(bwo), Some(mut kmir), Some(mut vmir)) = (
+            } else if let (
+                Some(bwq), Some(bwk), Some(bwv), Some(bwo),
+                Some(bwg), Some(bwu), Some(bwd), Some(mut kmir), Some(mut vmir),
+            ) = (
                 mk::MlxDeviceBuffer::from_host(&fs, &wq),
                 mk::MlxDeviceBuffer::from_host(&fs, &wk),
                 mk::MlxDeviceBuffer::from_host(&fs, &wv),
                 mk::MlxDeviceBuffer::from_host(&fs, &wo),
+                mk::MlxDeviceBuffer::from_host(&fs, &wgate),
+                mk::MlxDeviceBuffer::from_host(&fs, &wup),
+                mk::MlxDeviceBuffer::from_host(&fs, &wdown),
                 mk_upload_f32(&fs, &k_hist),
                 mk_upload_f32(&fs, &v_hist),
             ) {
@@ -5552,10 +5631,11 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                 let mut hnorm2_dev = vec![0f32; D_MODEL];
                 let mut k_row_dev = vec![0f32; d_kv];
                 let mut v_row_dev = vec![0f32; d_kv];
-                // SAFETY: weights/mirror are live device buffers on `fs`; the host
-                // slices are sized to the dims; kq/kk/kv/ko = 0 (Q4_K); the block
-                // syncs before returning. The mirror holds the f32 history [0,POS);
-                // the block writes row POS + the flash reads [0,POS].
+                // SAFETY: weights/FFN weights/mirror are live device buffers on
+                // `fs`; the host slices are sized to the dims; kq/kk/kv/ko + FFN
+                // codes = 0 (Q4_K); the block syncs before returning. The mirror
+                // holds the f32 history [0,POS); the block writes row POS + the
+                // flash reads [0,POS]. The dense-FFN tuple exercises the FFN path.
                 let res = unsafe {
                     mk::decode_attn_block_f32(
                         &fs,
@@ -5563,6 +5643,7 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                         bwk.as_ptr(), 0,
                         bwv.as_ptr(), 0,
                         bwo.as_ptr(), 0,
+                        Some((bwg.as_ptr(), 0, bwu.as_ptr(), 0, bwd.as_ptr(), 0, D_FF as u32)),
                         attn_norm.as_ptr(),
                         ffn_norm.as_ptr(),
                         inv_freq.as_ptr(),
@@ -5577,16 +5658,26 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                     )
                 };
                 match res {
-                    Ok(true) => {
-                        // Grade both device outputs (the residual hidden + the
-                        // post-attn norm == FFN input) jointly vs the CPU ref.
-                        let mut gpu = hidden_dev.clone();
-                        gpu.extend_from_slice(&hnorm2_dev);
-                        let mut cpu = hidden_ref.clone();
-                        cpu.extend_from_slice(&hnorm2_ref);
-                        cu_grade(name, &gpu, &cpu, 0.995, 0.10, &mut counts);
+                    // `ffn_ran` must be true — dispatchable Q4_K FFN weights are
+                    // supplied, so the device FFN leg ran and `hidden_dev` carries
+                    // the full attention+FFN residual (`hnorm2_dev` is the unread
+                    // FFN input, not copied back, so it isn't graded). Grade the
+                    // per-layer residual DELTA (`hidden - hidden0` = the attention
+                    // + FFN contribution) so the large shared input residual can't
+                    // mask an FFN miscompute.
+                    Ok((true, ffn_ran)) => {
+                        if ffn_ran {
+                            let gpu_delta: Vec<f32> =
+                                hidden_dev.iter().zip(&hidden0).map(|(h, h0)| h - h0).collect();
+                            let cpu_delta: Vec<f32> =
+                                hidden_ref.iter().zip(&hidden0).map(|(h, h0)| h - h0).collect();
+                            cu_grade(name, &gpu_delta, &cpu_delta, 0.995, 0.10, &mut counts);
+                        } else {
+                            cu_emit(name, "MISCOMPUTE", "ffn-leg-did-not-run");
+                            *counts.entry("MISCOMPUTE").or_default() += 1;
+                        }
                     }
-                    Ok(false) => {
+                    Ok((false, _)) => {
                         cu_emit(name, "SKIP", "block-declined");
                         *counts.entry("SKIP").or_default() += 1;
                     }

@@ -473,9 +473,12 @@ extern "C" {
     ) -> c_int;
 
     // Feature 1c: device-resident DECODE attention block (one command buffer).
-    // wq/wk/wv/wo + k_mirror/v_mirror are DEVICE pointers; norms/inv_freq +
-    // hidden/h_norm2/k_row/v_row are HOST f32. kq/kk/kv_kind/ko are weight
-    // format codes (0=Q4_K, 1=Q8_0). Returns 1 on success, 0 on decline.
+    // wq/wk/wv/wo + wg/wu/wd + k_mirror/v_mirror are DEVICE pointers; norms/
+    // inv_freq + hidden/h_norm2/k_row/v_row are HOST f32. kq/kk/kv_kind/ko +
+    // kg/ku/kd are weight format codes (0=Q4_K, 1=Q8_0). The gate/up/down weights
+    // + d_ff are the OPTIONAL fused dense SwiGLU FFN (null + d_ff<=0 ⇒
+    // attention-only); `ffn_ran` (nullable) receives 1 when the device FFN ran.
+    // Returns 1 on success, 0 on decline.
     #[allow(clippy::too_many_arguments)]
     fn rsl_mlx_decode_attn_block_f32(
         s: *mut RslMlxStreamRaw,
@@ -487,6 +490,14 @@ extern "C" {
         kv_kind: c_int,
         wo_dev: *const c_void,
         ko: c_int,
+        wg_dev: *const c_void,
+        kg: c_int,
+        wu_dev: *const c_void,
+        ku: c_int,
+        wd_dev: *const c_void,
+        kd: c_int,
+        d_ff: c_int,
+        ffn_ran: *mut c_int,
         attn_norm: *const f32,
         ffn_norm: *const f32,
         inv_freq: *const f32,
@@ -1701,16 +1712,24 @@ pub unsafe fn argmax_f32(
 /// Feature 1c: run the WHOLE per-layer DECODE attention block on the Metal GPU
 /// as ONE command buffer with ONE compute encoder (the C ABI
 /// `rsl_mlx_decode_attn_block_f32`) — rmsnorm → q/k/v matvec → RoPE → KV-mirror
-/// write → flash-decode → o-proj → residual + rmsnorm — committed with a SINGLE
-/// `waitUntilCompleted` instead of the per-op commit+wait flood. `Ok(true)` =
-/// the block ran and wrote `hidden`/`h_norm2`/`k_row`/`v_row`; `Ok(false)` = the
-/// Metal side declined (bad shape / alloc / unsupported matvec code / GPU error)
-/// — the caller must fall back to the per-op MLX/CPU ladder, as the host buffers
-/// are then unchanged (results are copied out only on success). `kq/kk/kv_kind/ko`
-/// are weight format codes (0 = Q4_K, 1 = Q8_0). `k_mirror`/`v_mirror` are the
-/// layer's persistent F32 KV device buffers, pre-seeded with rows `[0, pos)`.
-/// The MLX KV mirror is F32 (not f16 like SYCL), so the chain is bit-exact f32
-/// end to end.
+/// write → flash-decode → o-proj → residual + rmsnorm [→ optional dense SwiGLU
+/// FFN] — committed with a SINGLE `waitUntilCompleted` instead of the per-op
+/// commit+wait flood. `Ok((true, ffn_ran))` = the block ran and wrote
+/// `hidden`/`h_norm2`/`k_row`/`v_row` (and when `ffn_ran`, also the fused dense
+/// FFN residual into `hidden`); `Ok((false, _))` = the Metal side declined (bad
+/// shape / alloc / unsupported matvec code / GPU error) — the caller must fall
+/// back to the per-op MLX/CPU ladder, as the host buffers are then unchanged
+/// (results are copied out only on success). `kq/kk/kv_kind/ko` are weight format
+/// codes (0 = Q4_K, 1 = Q8_0). `k_mirror`/`v_mirror` are the layer's persistent
+/// F32 KV device buffers, pre-seeded with rows `[0, pos)`. The MLX KV mirror is
+/// F32 (not f16 like SYCL), so the chain is bit-exact f32 end to end.
+///
+/// Optional dense SwiGLU FFN: pass `dense_ffn = Some((wg, kg, wu, ku, wd, kd,
+/// d_ff))` (each weight a device pointer + format code) to run
+/// gate/up→silu→down→`hidden += ffn_out` in the SAME command buffer — the whole
+/// dense layer. `None` (or `d_ff == 0`) ⇒ attention-only: the second tuple
+/// element of the result is then `false` and the caller runs the host FFN. When
+/// the FFN ran, `h_norm2` is an unread intermediate and is NOT written back.
 ///
 /// # Safety
 ///
@@ -1718,10 +1737,13 @@ pub unsafe fn argmax_f32(
 /// `wX_dev` the packed weight bytes (device); `attn_norm`/`ffn_norm` ≥ `d_model`,
 /// `inv_freq` ≥ `head_dim/2`, `hidden`/`h_norm2` ≥ `d_model`, `k_row`/`v_row` ≥
 /// `n_kv_heads*head_dim` (host); `k_mirror`/`v_mirror` ≥
-/// `n_kv_heads*max_ctx*head_dim` f32 (device). The block syncs before returning,
-/// so there is no host/device overlap on the staged buffers.
+/// `n_kv_heads*max_ctx*head_dim` f32 (device). The dense-FFN weights (when
+/// `Some`) are device packed bytes sized to `[d_ff×d_model]` (gate/up) and
+/// `[d_model×d_ff]` (down). The block syncs before returning, so there is no
+/// host/device overlap on the staged buffers.
 #[allow(clippy::missing_safety_doc)]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub unsafe fn decode_attn_block_f32(
     stream: &MlxStream,
     wq_dev: *const c_void,
@@ -1732,6 +1754,8 @@ pub unsafe fn decode_attn_block_f32(
     kv_kind: i32,
     wo_dev: *const c_void,
     ko: i32,
+    // Optional dense FFN: (w_gate, k_gate, w_up, k_up, w_down, k_down, d_ff).
+    dense_ffn: Option<(*const c_void, i32, *const c_void, i32, *const c_void, i32, u32)>,
     attn_norm: *const f32,
     ffn_norm: *const f32,
     inv_freq: *const f32,
@@ -1749,13 +1773,26 @@ pub unsafe fn decode_attn_block_f32(
     max_ctx: u32,
     kv_len: u32,
     rms_eps: f32,
-) -> Result<bool, MlxError> {
+) -> Result<(bool, bool), MlxError> {
+    // Unpack the optional dense-FFN tuple into the raw C args (null pointers +
+    // d_ff=0 when absent ⇒ attention-only, fail-closed on the Metal side).
+    let null = core::ptr::null::<c_void>();
+    let (wg, kg, wu, ku, wd, kd, d_ff) = match dense_ffn {
+        Some((wg, kg, wu, ku, wd, kd, d_ff)) => (wg, kg, wu, ku, wd, kd, d_ff as c_int),
+        None => (null, 0, null, 0, null, 0, 0),
+    };
+    let mut ffn_ran: c_int = 0;
     let ran = rsl_mlx_decode_attn_block_f32(
         stream.raw(),
         wq_dev, kq as c_int,
         wk_dev, kk as c_int,
         wv_dev, kv_kind as c_int,
         wo_dev, ko as c_int,
+        wg, kg as c_int,
+        wu, ku as c_int,
+        wd, kd as c_int,
+        d_ff,
+        &mut ffn_ran as *mut c_int,
         attn_norm, ffn_norm, inv_freq,
         hidden, h_norm2, k_row, v_row,
         k_mirror, v_mirror,
@@ -1771,9 +1808,9 @@ pub unsafe fn decode_attn_block_f32(
     // A non-zero kernel-error latch means an encode/launch failure even if the
     // return code didn't capture it — treat it as a decline (fall back to CPU).
     if consume_error_count() != 0 {
-        return Ok(false);
+        return Ok((false, false));
     }
-    Ok(ran == 1)
+    Ok((ran == 1, ran == 1 && ffn_ran == 1))
 }
 
 // ============================================================

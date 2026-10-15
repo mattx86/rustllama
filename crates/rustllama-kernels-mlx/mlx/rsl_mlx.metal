@@ -219,6 +219,21 @@ kernel void rsl_mlx_silu_mul_f32_kernel(
     out[i] = silu * y[i];
 }
 
+// Elementwise residual add: dst[i] += src[i]. The Metal twin of the CUDA block's
+// `add_f32` / the SYCL `rsl_add_f32_nowait` — used by the device-resident decode
+// block's fused dense FFN leg to fold `ffn_out` back into `hidden`. Flat grid,
+// one work-item per element, bounds-checked.
+kernel void rsl_mlx_add_f32_kernel(
+    device       float *dst [[buffer(0)]],
+    device const float *src [[buffer(1)]],
+    constant int &n         [[buffer(2)]],
+    uint gid                [[thread_position_in_grid]])
+{
+    const int i = (int)gid;
+    if (i >= n) return;
+    dst[i] += src[i];
+}
+
 // out[i,:] = table[ids[i],:] (d elems); ids[i] < 0 -> zero row. Flat grid
 // over n_ids*d. `ids` is a device pointer. Ports rsl_embedding_lookup_usm.
 kernel void rsl_mlx_embedding_lookup_f32_kernel(

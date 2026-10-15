@@ -302,17 +302,24 @@ int rsl_mlx_argmax_f32(rsl_mlx_stream *s, const float *logits, int vocab,
  * rsl_mlx.mm. Returns 1 on full success (hidden/h_norm2/k_row/v_row written), 0
  * on any bad shape / alloc / unsupported matvec code / GPU error — on 0 the Rust
  * caller falls back to the per-op MLX/CPU ladder with the host buffers unchanged.
- * Attention-only (no fused dense FFN — the caller runs the host FFN). F32 KV
- * mirror only; no Qwen3 q/k head-norm (no MLX kernel). wq/wk/wv/wo + k_mirror/
- * v_mirror are DEVICE pointers; attn_norm/ffn_norm/inv_freq + hidden/h_norm2/
- * k_row/v_row are HOST f32. kq/kk/kv_kind/ko are weight format codes (0=Q4_K,
- * 1=Q8_0). k_mirror/v_mirror are the layer's persistent F32 KV buffers, seeded
- * with rows [0, pos). */
+ * Optional fused dense SwiGLU FFN (gate/up/down + d_ff): when supplied (non-null
+ * + d_ff>0) the whole DENSE layer's decode runs in the ONE command buffer and
+ * *ffn_ran is set to 1 (caller skips the host FFN); otherwise attention-only
+ * (the caller runs the host FFN). F32 KV mirror only; no Qwen3 q/k head-norm (no
+ * MLX kernel). wq/wk/wv/wo + wg/wu/wd + k_mirror/v_mirror are DEVICE pointers;
+ * attn_norm/ffn_norm/inv_freq + hidden/h_norm2/k_row/v_row are HOST f32.
+ * kq/kk/kv_kind/ko + kg/ku/kd are weight format codes (0=Q4_K, 1=Q8_0).
+ * k_mirror/v_mirror are the layer's persistent F32 KV buffers, seeded with rows
+ * [0, pos). ffn_ran may be null. */
 int rsl_mlx_decode_attn_block_f32(rsl_mlx_stream *s,
                                   const void *wq_dev, int kq,
                                   const void *wk_dev, int kk,
                                   const void *wv_dev, int kv_kind,
                                   const void *wo_dev, int ko,
+                                  const void *wg_dev, int kg,
+                                  const void *wu_dev, int ku,
+                                  const void *wd_dev, int kd,
+                                  int d_ff, int *ffn_ran,
                                   const float *attn_norm, const float *ffn_norm,
                                   const float *inv_freq, float *hidden,
                                   float *h_norm2, float *k_row, float *v_row,

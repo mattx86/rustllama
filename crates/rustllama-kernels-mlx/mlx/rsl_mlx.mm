@@ -1482,11 +1482,19 @@ extern "C" int rsl_mlx_argmax_f32(rsl_mlx_stream *s, const float *logits,
 // `doctor --metal-parity` (`attn:dev_resident_block_mlx`); this is a PERF-gated
 // path (`attn:dev_resident_block_mlx` verdict), fail-closed off otherwise.
 //
-// ATTENTION-ONLY (no fused dense FFN), matching the SYCL block: `h_norm2` holds
-// the post-attn RMSNorm (the FFN input) so the Rust caller runs the host FFN
-// exactly as it does for the SYCL/CUDA-attention-only path. Qwen3 q/k head-norm
-// has no MLX kernel, so the Rust caller declines those models before calling
-// here (no q_norm/k_norm argument).
+// OPTIONAL fused dense SwiGLU FFN (matching the CUDA + SYCL blocks): when the
+// caller supplies the gate/up/down weights + `d_ff > 0`, the block continues
+// device-resident past the attention residual with gate/up = W·h_norm2,
+// act = silu(gate)⊙up, ffn_out = W_down·act, hidden += ffn_out — all encoded
+// into the SAME command buffer (no extra commit/wait), so a whole DENSE layer's
+// decode is one committed buffer. `*ffn_ran` is then 1 and the Rust caller skips
+// the host FFN (`hidden` already carries the FFN residual); `h_norm2` is the
+// unread FFN input and is NOT copied back. When no FFN weights are supplied
+// (d_ff<=0 / any null pointer — a MoE or hybrid layer), the block stays
+// ATTENTION-ONLY: `h_norm2` holds the post-attn RMSNorm (the FFN input) and the
+// Rust caller runs the host FFN exactly as for the attention-only path. Qwen3
+// q/k head-norm has no MLX kernel, so the Rust caller declines those models
+// before calling here (no q_norm/k_norm argument).
 //
 // !!! WRITE-BLIND — authored on a non-Apple host, NEVER compiled (`xcrun metal`
 // / clang ObjC++ only exist on macOS) or run on a GPU. The first Mac build is
@@ -1519,12 +1527,22 @@ extern "C" int rsl_mlx_decode_attn_block_f32(
     const void *wk_dev, int kk,
     const void *wv_dev, int kv_kind,
     const void *wo_dev, int ko,
+    // Optional dense-FFN weights (gate/up/down): DEVICE pointers + a format code
+    // each, plus `d_ff`. All-null + d_ff<=0 ⇒ attention-only. `ffn_ran` (nullable)
+    // receives 1 when the device FFN ran so the Rust caller skips the host FFN.
+    const void *wg_dev, int kg,
+    const void *wu_dev, int ku,
+    const void *wd_dev, int kd,
+    int d_ff,
+    int *ffn_ran,
     // Norms + inv_freq as HOST f32 (staged into the slab here — tiny O(d_model)
     // vectors, unlike the big cached weights).
     const float *attn_norm, const float *ffn_norm, const float *inv_freq,
-    // hidden: HOST f32, in (pre-attn residual) AND out (post-attn residual).
+    // hidden: HOST f32, in (pre-attn residual) AND out (post-attn [+ FFN]
+    // residual).
     float *hidden,
-    // h_norm2: HOST f32 out — the post-attn RMSNorm == the FFN input.
+    // h_norm2: HOST f32 out — the post-attn RMSNorm == the FFN input. Copied back
+    // only when the device FFN did NOT run (else an unread intermediate).
     float *h_norm2,
     // k_row / v_row: HOST f32 out — this token's post-RoPE K / plain V
     // (head-major), for the caller to append to the host KV cache.
@@ -1536,6 +1554,7 @@ extern "C" int rsl_mlx_decode_attn_block_f32(
     int n_heads, int n_kv_heads, int head_dim, int d_model,
     int pos, int max_ctx, int kv_len, float rms_eps) {
 #if RSL_MLX_HAVE_METAL
+    if (ffn_ran) *ffn_ran = 0;
     if (!s || !wq_dev || !wk_dev || !wv_dev || !wo_dev || !attn_norm || !ffn_norm
         || !inv_freq || !hidden || !h_norm2 || !k_row || !v_row || !k_mirror
         || !v_mirror) {
@@ -1560,6 +1579,23 @@ extern "C" int rsl_mlx_decode_attn_block_f32(
     if ((d_model % aq) != 0 || (d_model % ak) != 0 || (d_model % av) != 0 || (d_q % ao) != 0) {
         return 0;
     }
+    // Dense-FFN gate (fail-closed, mirroring the SYCL/CUDA blocks): run the fused
+    // FFN only when d_ff>0, all three weight pointers are non-null, and each FFN
+    // matvec format is supported + K-aligned (gate/up consume K=d_model, down
+    // consumes K=d_ff). Any miss ⇒ attention-only (the caller runs the host FFN).
+    int ag = 0, au = 0, ad = 0;
+    NSString *mvg_name = nil, *mvu_name = nil, *mvd_name = nil;
+    bool do_ffn = (d_ff > 0 && wg_dev && wu_dev && wd_dev);
+    if (do_ffn) {
+        mvg_name = mlx_block_matvec_kernel(kg, &ag);
+        mvu_name = mlx_block_matvec_kernel(ku, &au);
+        mvd_name = mlx_block_matvec_kernel(kd, &ad);
+        if (mvg_name == nil || mvu_name == nil || mvd_name == nil
+            || (d_model % ag) != 0 || (d_model % au) != 0 || (d_ff % ad) != 0) {
+            do_ffn = false;  // unsupported FFN format ⇒ attention-only, caller host-FFN
+        }
+    }
+    const int dff = do_ffn ? d_ff : 0;
     @autoreleasepool {
         id<MTLDevice> dev = s->device;
         // Resolve weights + KV mirrors to (buffer, offset). All were allocated
@@ -1572,6 +1608,17 @@ extern "C" int rsl_mlx_decode_attn_block_f32(
         id<MTLBuffer> bkm = mlx_resolve(k_mirror, &okm);
         id<MTLBuffer> bvm = mlx_resolve(v_mirror, &ovm);
         if (bwq==nil||bwk==nil||bwv==nil||bwo==nil||bkm==nil||bvm==nil) { g_rsl_mlx_errors++; return 0; }
+        // Dense-FFN weights (only when do_ffn). A resolve miss ⇒ drop to
+        // attention-only rather than failing the block (the attention still runs
+        // device-resident; the caller runs the host FFN).
+        size_t owg=0, owu=0, owd=0;
+        id<MTLBuffer> bwg = nil, bwu = nil, bwd = nil;
+        if (do_ffn) {
+            bwg = mlx_resolve(wg_dev, &owg);
+            bwu = mlx_resolve(wu_dev, &owu);
+            bwd = mlx_resolve(wd_dev, &owd);
+            if (bwg==nil||bwu==nil||bwd==nil) do_ffn = false;
+        }
         // Build every pipeline up front so a missing/failed kernel declines
         // BEFORE we encode anything (error latched by mlx_pipeline).
         id<MTLComputePipelineState> pso_rms = mlx_pipeline(dev, @"rsl_mlx_rmsnorm_f32_kernel");
@@ -1587,12 +1634,32 @@ extern "C" int rsl_mlx_decode_attn_block_f32(
             ||pso_kvw==nil||pso_flash==nil||pso_mvo==nil||pso_add==nil) {
             return 0;  // error already latched
         }
+        // FFN pipelines (gate/up/down matvecs + silu_mul + add). Built only when
+        // do_ffn; a nil pipeline drops to attention-only (fail-closed).
+        id<MTLComputePipelineState> pso_mvg = nil, pso_mvu = nil, pso_mvd = nil;
+        id<MTLComputePipelineState> pso_silu = nil, pso_addf = nil;
+        if (do_ffn) {
+            pso_mvg  = mlx_pipeline(dev, mvg_name);
+            pso_mvu  = mlx_pipeline(dev, mvu_name);
+            pso_mvd  = mlx_pipeline(dev, mvd_name);
+            pso_silu = mlx_pipeline(dev, @"rsl_mlx_silu_mul_f32_kernel");
+            pso_addf = mlx_pipeline(dev, @"rsl_mlx_add_f32_kernel");
+            // A nil FFN pipeline drops to attention-only (the attention still
+            // runs device-resident; the caller runs the host FFN) — strictly
+            // better than declining the whole layer, and fail-closed.
+            if (pso_mvg==nil||pso_mvu==nil||pso_mvd==nil||pso_silu==nil||pso_addf==nil) {
+                do_ffn = false;
+            }
+        }
         // ONE slab for every intermediate activation + the tiny norm/inv_freq
         // host copies. StorageModeShared ⇒ `.contents` is host-addressable, so
         // host inputs stage in and host outputs read back with plain memcpy (no
         // explicit H2D/D2H). Single alloc + single free per call; the WIN is
         // collapsing the ~10 commit+wait pairs into one, not avoiding this slab.
         //   layout: hidden | hnorm | q | k | v | attn | o | hnorm2 | an | fn | if
+        //           [ | gate | up | act ]   (bracketed FFN region only when
+        //           do_ffn; dff==0 collapses it). ffn_out reuses `o` — free once
+        //           step 7's residual+norm consumed it — like the CUDA/SYCL blocks.
         const size_t off_hidden = 0;
         const size_t off_hnorm  = off_hidden + (size_t)d_model;
         const size_t off_q      = off_hnorm  + (size_t)d_model;
@@ -1604,7 +1671,10 @@ extern "C" int rsl_mlx_decode_attn_block_f32(
         const size_t off_an     = off_hnorm2 + (size_t)d_model;
         const size_t off_fn     = off_an     + (size_t)d_model;
         const size_t off_if     = off_fn     + (size_t)d_model;
-        const size_t slab_elems = off_if     + (size_t)half;
+        const size_t off_gate   = off_if     + (size_t)half;
+        const size_t off_up     = off_gate   + (size_t)dff;
+        const size_t off_act    = off_up     + (size_t)dff;
+        const size_t slab_elems = off_act    + (size_t)dff;
         id<MTLBuffer> slab = [dev newBufferWithLength:slab_elems * sizeof(float)
                                               options:MTLResourceStorageModeShared];
         if (slab == nil) { g_rsl_mlx_errors++; return 0; }
@@ -1741,26 +1811,91 @@ extern "C" int rsl_mlx_decode_attn_block_f32(
         [enc setBytes:&eps length:sizeof(float) atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
+        // --- 8. optional fused dense SwiGLU FFN, encoded into the SAME encoder
+        //     (no extra commit/wait): gate = Wg@h_norm2 ; up = Wu@h_norm2 ;
+        //     act = silu(gate)⊙up ; o = Wd@act (REUSES `o`, free after step 7) ;
+        //     hidden += o. The serial compute encoder's automatic barriers on the
+        //     tracked slab give the gate/up→silu→down→add dependency chain for
+        //     free (same as the attention legs). All f32 → bit-exact to the CPU
+        //     SwiGLU reference up to reduction order. ---
+        if (do_ffn) {
+            // gate = Wg @ h_norm2 (K = d_model, M = d_ff, N = 1).
+            { int kcol = d_model, mrow = d_ff;
+              [enc setComputePipelineState:pso_mvg];
+              [enc setBuffer:bwg offset:owg atIndex:0];
+              [enc setBuffer:slab offset:off_hnorm2 * sizeof(float) atIndex:1];
+              [enc setBuffer:slab offset:off_gate   * sizeof(float) atIndex:2];
+              [enc setBytes:&kcol length:sizeof(int) atIndex:3];
+              [enc setBytes:&mrow length:sizeof(int) atIndex:4];
+              [enc setBytes:&one length:sizeof(int) atIndex:5];
+              [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)d_ff, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; }
+            // up = Wu @ h_norm2 (K = d_model, M = d_ff, N = 1).
+            { int kcol = d_model, mrow = d_ff;
+              [enc setComputePipelineState:pso_mvu];
+              [enc setBuffer:bwu offset:owu atIndex:0];
+              [enc setBuffer:slab offset:off_hnorm2 * sizeof(float) atIndex:1];
+              [enc setBuffer:slab offset:off_up     * sizeof(float) atIndex:2];
+              [enc setBytes:&kcol length:sizeof(int) atIndex:3];
+              [enc setBytes:&mrow length:sizeof(int) atIndex:4];
+              [enc setBytes:&one length:sizeof(int) atIndex:5];
+              [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)d_ff, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; }
+            // act = silu(gate) ⊙ up (flat grid over d_ff elements).
+            { const NSUInteger total = (NSUInteger)d_ff;
+              const NSUInteger tg = 256;
+              [enc setComputePipelineState:pso_silu];
+              [enc setBuffer:slab offset:off_gate * sizeof(float) atIndex:0];
+              [enc setBuffer:slab offset:off_up   * sizeof(float) atIndex:1];
+              [enc setBuffer:slab offset:off_act  * sizeof(float) atIndex:2];
+              [enc setBytes:&dff length:sizeof(int) atIndex:3];
+              [enc dispatchThreadgroups:MTLSizeMake((total + tg - 1) / tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)]; }
+            // o = Wd @ act (K = d_ff, M = d_model, N = 1) — reuses the `o` slot.
+            { int kcol = d_ff, mrow = d_model;
+              [enc setComputePipelineState:pso_mvd];
+              [enc setBuffer:bwd offset:owd atIndex:0];
+              [enc setBuffer:slab offset:off_act * sizeof(float) atIndex:1];
+              [enc setBuffer:slab offset:off_o   * sizeof(float) atIndex:2];
+              [enc setBytes:&kcol length:sizeof(int) atIndex:3];
+              [enc setBytes:&mrow length:sizeof(int) atIndex:4];
+              [enc setBytes:&one length:sizeof(int) atIndex:5];
+              [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)d_model, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; }
+            // hidden += o (flat grid over d_model elements).
+            { const NSUInteger total = (NSUInteger)d_model;
+              const NSUInteger tg = 256;
+              [enc setComputePipelineState:pso_addf];
+              [enc setBuffer:slab offset:off_hidden * sizeof(float) atIndex:0];
+              [enc setBuffer:slab offset:off_o      * sizeof(float) atIndex:1];
+              [enc setBytes:&dm length:sizeof(int) atIndex:2];
+              [enc dispatchThreadgroups:MTLSizeMake((total + tg - 1) / tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)]; }
+        }
+
         // ONE commit + ONE wait for the whole layer's chain.
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
         if (cb.status == MTLCommandBufferStatusError) { g_rsl_mlx_errors++; return 0; }
 
-        // Slab is host-addressable; read the results back.
+        // Slab is host-addressable; read the results back. When the device FFN
+        // ran, `hidden` already carries the FFN residual and `h_norm2` is an
+        // unread intermediate (the caller skips the host FFN) — so skip its copy,
+        // mirroring the CUDA/SYCL blocks, and report it via `ffn_ran`.
         std::memcpy(hidden,  sb + off_hidden, (size_t)d_model * sizeof(float));
-        std::memcpy(h_norm2, sb + off_hnorm2, (size_t)d_model * sizeof(float));
+        if (!do_ffn)
+            std::memcpy(h_norm2, sb + off_hnorm2, (size_t)d_model * sizeof(float));
         std::memcpy(k_row,   sb + off_k,      (size_t)d_kv    * sizeof(float));
         std::memcpy(v_row,   sb + off_v,      (size_t)d_kv    * sizeof(float));
+        if (ffn_ran) *ffn_ran = do_ffn ? 1 : 0;
         return 1;
     }
 #else
     (void)s; (void)wq_dev; (void)kq; (void)wk_dev; (void)kk; (void)wv_dev;
-    (void)kv_kind; (void)wo_dev; (void)ko; (void)attn_norm; (void)ffn_norm;
+    (void)kv_kind; (void)wo_dev; (void)ko; (void)wg_dev; (void)kg; (void)wu_dev;
+    (void)ku; (void)wd_dev; (void)kd; (void)d_ff; (void)ffn_ran;
+    (void)attn_norm; (void)ffn_norm;
     (void)inv_freq; (void)hidden; (void)h_norm2; (void)k_row; (void)v_row;
     (void)k_mirror; (void)v_mirror; (void)n_heads; (void)n_kv_heads;
     (void)head_dim; (void)d_model; (void)pos; (void)max_ctx; (void)kv_len;
     (void)rms_eps;
+    if (ffn_ran) *ffn_ran = 0;
     return 0;  // inert off Apple Silicon — the caller runs the per-op/CPU ladder
 #endif
 }
