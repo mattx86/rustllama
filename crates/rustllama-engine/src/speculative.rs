@@ -229,6 +229,23 @@ pub struct TreeNode {
     pub parent: Option<usize>,
 }
 
+/// Outcome of tree-structured verification: like [`SpeculationOutcome`] but also
+/// carrying the flattened tree-node INDEX of each accepted token, so the engine
+/// can compact the accepted path's (scattered) K/V cache slots into contiguous
+/// committed positions without a second forward pass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TreeVerifyOutcome {
+    /// Accepted token ids along the single best path (root → …).
+    pub accepted: Vec<u32>,
+    /// Flattened node index of each accepted token (parallel to `accepted`). The
+    /// token at `accepted[j]` was tree node `accepted_nodes[j]`, living at cache
+    /// slot `committed_len + accepted_nodes[j]` after the verify forward.
+    pub accepted_nodes: Vec<usize>,
+    /// Next token to commit after the accepted path (residual sample on reject /
+    /// bonus on full-path acceptance).
+    pub replacement: u32,
+}
+
 /// Tree-structured speculative verification — the branching generalization of
 /// [`accept_reject`]. Walks the single best accepted path from the root level
 /// down the tree, running the same recursive-rejection test at each frontier.
@@ -258,13 +275,14 @@ pub fn tree_accept_reject(
     target_root: &[f32],
     target_next: &[&[f32]],
     rng: &mut Rng,
-) -> SpeculationOutcome {
+) -> TreeVerifyOutcome {
     assert_eq!(
         target_next.len(),
         nodes.len(),
         "speculative: target_next must have one distribution per tree node"
     );
     let mut accepted: Vec<u32> = Vec::with_capacity(nodes.len());
+    let mut accepted_nodes: Vec<usize> = Vec::with_capacity(nodes.len());
     // The frontier: whose children we're choosing among, and the target
     // distribution that governs that choice. `None` = the root level (children
     // of the committed tip); `Some(j)` = children of accepted node `j`.
@@ -295,6 +313,7 @@ pub fn tree_accept_reject(
             if u <= ratio {
                 // Accept this child: commit it and descend into its subtree.
                 accepted.push(node.id);
+                accepted_nodes.push(j);
                 frontier = Some(j);
                 current_target = target_next[j];
                 descended = true;
@@ -334,8 +353,9 @@ pub fn tree_accept_reject(
             }
             None => multinomial(current_target, rng),
         };
-        return SpeculationOutcome {
+        return TreeVerifyOutcome {
             accepted,
+            accepted_nodes,
             replacement,
         };
     }
@@ -350,13 +370,14 @@ pub fn tree_accept_reject_greedy(
     nodes: &[TreeNode],
     target_root: &[f32],
     target_next: &[&[f32]],
-) -> SpeculationOutcome {
+) -> TreeVerifyOutcome {
     assert_eq!(
         target_next.len(),
         nodes.len(),
         "speculative: target_next must have one distribution per tree node"
     );
     let mut accepted: Vec<u32> = Vec::with_capacity(nodes.len());
+    let mut accepted_nodes: Vec<usize> = Vec::with_capacity(nodes.len());
     let mut frontier: Option<usize> = None;
     let mut current_target: &[f32] = target_root;
     loop {
@@ -369,12 +390,14 @@ pub fn tree_accept_reject_greedy(
         match hit {
             Some((j, node)) => {
                 accepted.push(node.id);
+                accepted_nodes.push(j);
                 frontier = Some(j);
                 current_target = target_next[j];
             }
             None => {
-                return SpeculationOutcome {
+                return TreeVerifyOutcome {
                     accepted,
+                    accepted_nodes,
                     replacement: am,
                 };
             }
@@ -635,7 +658,11 @@ mod tests {
             let mut r_tree = mk_rng(seed);
             let lin = accept_reject(&drafts, &target, &mut r_lin);
             let tree = tree_accept_reject(&nodes, target_root, &target_next, &mut r_tree);
-            assert_eq!(lin, tree, "chain tree must match linear at seed {seed}");
+            assert_eq!(lin.accepted, tree.accepted, "chain accepted at seed {seed}");
+            assert_eq!(lin.replacement, tree.replacement, "chain replacement at seed {seed}");
+            // For a chain, each accepted token IS its own node index.
+            let expect_nodes: Vec<usize> = (0..tree.accepted.len()).collect();
+            assert_eq!(tree.accepted_nodes, expect_nodes, "chain node indices at seed {seed}");
         }
     }
 
@@ -658,7 +685,8 @@ mod tests {
         let target_next: Vec<&[f32]> = p[1..].to_vec();
         let lin = accept_reject_greedy(&drafts, &p);
         let tree = tree_accept_reject_greedy(&nodes, p[0], &target_next);
-        assert_eq!(lin, tree);
+        assert_eq!(lin.accepted, tree.accepted);
+        assert_eq!(lin.replacement, tree.replacement);
     }
 
     /// Branching walk (greedy, fully deterministic): with two depth-1 candidates
@@ -969,6 +997,86 @@ fn argmax_and_softmax_p(logits: &[f32]) -> (usize, f32) {
     (max_idx, p.clamp(1e-30, 1.0))
 }
 
+/// Build a speculative draft TREE from a model's MTP-head logits (the tree
+/// analogue of [`MtpDrafter::propose`]). `head_logits[d]` is head `d`'s
+/// full-vocab logit row — head `d` independently predicts the token `d+1`
+/// positions ahead. The tree is a "caterpillar": a main chain down the per-head
+/// argmax, with `widths[d]-1` alternative siblings branching off the main node
+/// at each depth. Only the main (argmax) node of each level gets children, so
+/// the node count is `sum(widths)` — compact, and `width == 1` at every depth
+/// reduces EXACTLY to the linear [`MtpDrafter`] chain (pinned by
+/// `mtp_tree_width_one_is_a_chain`). Each node's `q` is the head's softmax
+/// probability at that candidate (the `p/q` acceptance denominator).
+pub fn build_mtp_tree(head_logits: &[Vec<f32>], widths: &[usize]) -> Vec<TreeNode> {
+    let mut nodes: Vec<TreeNode> = Vec::new();
+    // Parent for the NEXT level's nodes = this level's main (argmax) node.
+    let mut main_parent: Option<usize> = None;
+    for (d, logits) in head_logits.iter().enumerate() {
+        if logits.is_empty() {
+            break;
+        }
+        let w = widths.get(d).copied().unwrap_or(1).max(1);
+        let topk = top_k_softmax(logits, w);
+        if topk.is_empty() {
+            break;
+        }
+        let level_start = nodes.len();
+        for (id, q) in topk {
+            nodes.push(TreeNode { id, q, parent: main_parent });
+        }
+        // The argmax candidate is pushed first, so the main node is level_start.
+        main_parent = Some(level_start);
+    }
+    nodes
+}
+
+/// Per-node tree depth (the RoPE-position offset): `0` for a root-level node,
+/// else `depth(parent) + 1`. Topological order (`parent < self`) lets one pass
+/// fill it. Feeds `forward_tree_verify_f32`'s `depths` argument.
+pub fn tree_depths(nodes: &[TreeNode]) -> Vec<u32> {
+    let mut depths = vec![0u32; nodes.len()];
+    for (i, n) in nodes.iter().enumerate() {
+        depths[i] = match n.parent {
+            Some(p) => depths[p] + 1,
+            None => 0,
+        };
+    }
+    depths
+}
+
+/// Top-`k` `(token_id, softmax_prob)` by logit, highest first. Softmax is over
+/// the FULL row (numerically stable), so `prob` matches [`argmax_and_softmax_p`]
+/// exactly at `k == 1` (the chain-reduction relies on this). `k` is clamped to
+/// the vocab size.
+fn top_k_softmax(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
+    if logits.is_empty() || k == 0 {
+        return Vec::new();
+    }
+    let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let denom: f32 = logits.iter().map(|&v| (v - max_val).exp()).sum::<f32>().max(1e-30);
+    let inv = 1.0 / denom;
+    let kk = k.min(logits.len());
+    // Small k over a big vocab → a k-pass selection beats a full sort.
+    let mut used = vec![false; logits.len()];
+    let mut out: Vec<(u32, f32)> = Vec::with_capacity(kk);
+    for _ in 0..kk {
+        let mut best = usize::MAX;
+        let mut best_v = f32::NEG_INFINITY;
+        for (i, &v) in logits.iter().enumerate() {
+            if !used[i] && v > best_v {
+                best_v = v;
+                best = i;
+            }
+        }
+        if best == usize::MAX {
+            break;
+        }
+        used[best] = true;
+        out.push((best as u32, ((best_v - max_val).exp() * inv).clamp(1e-30, 1.0)));
+    }
+    out
+}
+
 #[cfg(test)]
 mod mtp_drafter_tests {
     use super::*;
@@ -1026,6 +1134,71 @@ mod mtp_drafter_tests {
         let heads = vec![vec![0.1, 0.2, 0.3], vec![], vec![1.0]];
         let drafts = d.propose(&heads);
         assert_eq!(drafts.len(), 1, "stops at the first empty head");
+    }
+
+    // ---- tree drafter (Feature 4b) ----
+
+    /// Degenerate guard: `build_mtp_tree` with width 1 at every depth is the
+    /// linear `MtpDrafter` chain — same ids, same `q`, chained parents, depths
+    /// `0,1,2,…`. So tree spec at width 1 == the existing linear MTP spec.
+    #[test]
+    fn mtp_tree_width_one_is_a_chain() {
+        let heads = vec![
+            vec![0.0, 1.0, 0.5, -1.0],
+            vec![3.0, -2.0, 5.0, 4.9, 0.0],
+            vec![-1.0, -2.0, -3.0, -4.0],
+        ];
+        let chain = MtpDrafter::default().propose(&heads);
+        let nodes = build_mtp_tree(&heads, &[1, 1, 1]);
+        assert_eq!(nodes.len(), chain.len());
+        for (d, (node, draft)) in nodes.iter().zip(chain.iter()).enumerate() {
+            assert_eq!(node.id, draft.id, "level {d} id");
+            assert!((node.q - draft.q).abs() < 1e-6, "level {d} q");
+            assert_eq!(node.parent, if d == 0 { None } else { Some(d - 1) }, "level {d} parent");
+        }
+        assert_eq!(tree_depths(&nodes), vec![0, 1, 2]);
+    }
+
+    /// Branching: width 2 at the first two depths yields a caterpillar — 2
+    /// root-level candidates, and the main (argmax) root node gets 2 children.
+    #[test]
+    fn mtp_tree_branches_with_width() {
+        let heads = vec![
+            vec![0.0, 1.0, 0.5, -1.0], // argmax 1, runner-up 2
+            vec![5.0, 0.0, 4.0, 0.0],  // argmax 0, runner-up 2
+        ];
+        let nodes = build_mtp_tree(&heads, &[2, 2]);
+        assert_eq!(nodes.len(), 4, "sum(widths) nodes");
+        // Level 0: nodes 0,1 at root (parent None); node 0 is the argmax (id 1).
+        assert_eq!(nodes[0].parent, None);
+        assert_eq!(nodes[1].parent, None);
+        assert_eq!(nodes[0].id, 1, "argmax first");
+        assert_eq!(nodes[1].id, 2, "runner-up second");
+        // Level 1: nodes 2,3 are children of the main level-0 node (index 0).
+        assert_eq!(nodes[2].parent, Some(0));
+        assert_eq!(nodes[3].parent, Some(0));
+        assert_eq!(nodes[2].id, 0, "level-1 argmax");
+        assert_eq!(tree_depths(&nodes), vec![0, 0, 1, 1]);
+    }
+
+    #[test]
+    fn top_k_softmax_orders_desc_and_sums_sane() {
+        let logits = vec![1.0, 3.0, 2.0, 0.0];
+        let top = top_k_softmax(&logits, 3);
+        assert_eq!(top.len(), 3);
+        assert_eq!(top[0].0, 1, "highest logit first");
+        assert_eq!(top[1].0, 2);
+        assert_eq!(top[2].0, 0);
+        // probs descending, each in (0,1].
+        assert!(top[0].1 >= top[1].1 && top[1].1 >= top[2].1);
+        for (_, q) in &top {
+            assert!(*q > 0.0 && *q <= 1.0);
+        }
+        // k==1 matches argmax_and_softmax_p exactly (the chain-reduction basis).
+        let (amax, aq) = argmax_and_softmax_p(&logits);
+        let t1 = top_k_softmax(&logits, 1);
+        assert_eq!(t1[0].0 as usize, amax);
+        assert!((t1[0].1 - aq).abs() < 1e-7);
     }
 }
 

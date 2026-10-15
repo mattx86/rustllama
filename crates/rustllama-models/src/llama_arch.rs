@@ -2991,6 +2991,42 @@ impl KvCache {
         Self::new_with_dtype(cfg, max_ctx, KvDtype::F32)
     }
 
+    /// Compact scattered token K/V slots into contiguous positions starting at
+    /// `base`, for speculative TREE verification (Feature 4). After
+    /// [`Self::forward_tree_verify_f32`]-style verification writes every tree
+    /// node's K/V to slot `base + node_index`, the accepted root→leaf path's
+    /// nodes sit at scattered slots `base + src_slots[j]`; this moves each to its
+    /// committed position `base + j` across every F32 layer. The caller then
+    /// sets `seq_len = base + src_slots.len()` and keeps decoding as though the
+    /// accepted path had been an ordinary contiguous prefill — so tree spec pays
+    /// ONE forward per round (no linear-replay of the accepted path).
+    ///
+    /// F32-only (the tree-spec KV path). A depth-`j` node's flat index is always
+    /// `>= j`, so `src_slots[j] >= j` and the ascending in-place copy never
+    /// clobbers a not-yet-moved source; `src == j` slots are skipped.
+    pub fn compact_tokens(&mut self, base: usize, src_slots: &[usize]) {
+        let max_ctx = self.max_ctx;
+        let head_dim = self.head_dim;
+        let n_kv_heads = self.n_kv_heads;
+        for layer in self.layers.iter_mut() {
+            let KvLayer::F32 { k, v } = layer else {
+                continue;
+            };
+            for (j, &src) in src_slots.iter().enumerate() {
+                if src == j {
+                    continue;
+                }
+                debug_assert!(src >= j, "compact source slot {src} must be >= dest {j}");
+                for h in 0..n_kv_heads {
+                    let src_off = (h * max_ctx + base + src) * head_dim;
+                    let dst_off = (h * max_ctx + base + j) * head_dim;
+                    k.copy_within(src_off..src_off + head_dim, dst_off);
+                    v.copy_within(src_off..src_off + head_dim, dst_off);
+                }
+            }
+        }
+    }
+
     /// Total bytes of K/V buffer storage across all layers. Exact (it
     /// walks the allocated buffers). With sparse construction
     /// ([`Self::new_with_dtype_sparse`]) hybrid models report only
@@ -13611,6 +13647,50 @@ mod tests {
         model.forward_tree_verify_f32(&rest, 2, &depths2, &parent2, &mut kv_tree2, &mut tree2);
         for (i, (&a, &b)) in tree2.iter().zip(lin2.iter()).enumerate() {
             assert!((a - b).abs() < 1e-3, "tree-chain(prefix) logit[{i}]: tree={a} lin={b}");
+        }
+    }
+
+    /// Tree-spec commit guard: `compact_tokens` moves a scattered accepted
+    /// path's K/V (slots base+{0,2,4}) into contiguous committed slots
+    /// base+{0,1,2}, for every F32 layer + head, leaving the data intact.
+    #[test]
+    fn kvcache_compact_tokens_moves_scattered_slots() {
+        let cfg = synth_cfg(2, 2, 8);
+        let max_ctx = 16usize;
+        let n_kv_heads = cfg.n_kv_heads;
+        let head_dim = cfg.head_dim;
+        let base = 3usize;
+        let n_nodes = 5usize;
+        let mut kv = KvCache::new(&cfg, max_ctx);
+        // Stamp slot s with value `s*100 + h*10 + d` (k) / +0.5 (v).
+        let stamp = |s: usize, h: usize, d: usize| (s * 100 + h * 10 + d) as f32;
+        for layer in kv.layers.iter_mut() {
+            if let KvLayer::F32 { k, v } = layer {
+                for s in 0..n_nodes {
+                    for h in 0..n_kv_heads {
+                        for d in 0..head_dim {
+                            let off = (h * max_ctx + base + s) * head_dim + d;
+                            k[off] = stamp(s, h, d);
+                            v[off] = stamp(s, h, d) + 0.5;
+                        }
+                    }
+                }
+            }
+        }
+        let src = vec![0usize, 2, 4]; // accepted path at scattered nodes
+        kv.compact_tokens(base, &src);
+        for layer in kv.layers.iter() {
+            if let KvLayer::F32 { k, v } = layer {
+                for (j, &s) in src.iter().enumerate() {
+                    for h in 0..n_kv_heads {
+                        for d in 0..head_dim {
+                            let off = (h * max_ctx + base + j) * head_dim + d;
+                            assert_eq!(k[off], stamp(s, h, d), "k j={j} src={s} h={h} d={d}");
+                            assert_eq!(v[off], stamp(s, h, d) + 0.5, "v j={j} src={s}");
+                        }
+                    }
+                }
+            }
         }
     }
 
