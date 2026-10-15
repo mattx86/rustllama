@@ -209,6 +209,179 @@ pub fn accept_reject_greedy(
     }
 }
 
+/// One node of a drafted token TREE (EAGLE / Medusa / SpecInfer style).
+///
+/// A tree generalizes the linear draft chain: instead of one proposed
+/// continuation, the drafter proposes a branching set of candidates, and a
+/// single target forward (with a tree attention mask, so each node attends only
+/// its ancestors) scores them all at once. Verification then walks the single
+/// best accepted root→leaf path.
+#[derive(Debug, Clone, Copy)]
+pub struct TreeNode {
+    /// Candidate token id at this node.
+    pub id: u32,
+    /// Draft probability the drafter assigned to this token at this position
+    /// (the `q` in the `p/q` acceptance ratio).
+    pub q: f32,
+    /// Index of the parent node in the same slice, or `None` for a depth-1
+    /// candidate (a child of the already-committed context tip, i.e. the root
+    /// level). Nodes MUST be topologically ordered: `parent < self index`.
+    pub parent: Option<usize>,
+}
+
+/// Tree-structured speculative verification — the branching generalization of
+/// [`accept_reject`]. Walks the single best accepted path from the root level
+/// down the tree, running the same recursive-rejection test at each frontier.
+///
+/// Inputs:
+///   - `nodes`: the draft tree, topologically ordered (`parent < self`).
+///   - `target_root`: the target distribution for the FIRST speculative token
+///     (at the committed context tip); the depth-1 candidates test against it.
+///   - `target_next[j]`: the target distribution for the token that FOLLOWS
+///     node `j`'s path — consulted only once node `j` is accepted, to test its
+///     children and (if it becomes a leaf of the accepted path) draw the bonus.
+///     `target_next.len()` MUST equal `nodes.len()`.
+///   - `rng`: the shared seeded RNG, so by-seed determinism extends here too.
+///
+/// At each frontier the siblings are tried in slice order with independent
+/// uniform draws; the first to pass its `u <= min(1, p/q)` test is accepted and
+/// the walk descends into it. A rejected sibling's mass is removed from the
+/// residual pool (`max(0, residual[id] - q)`) before the next sibling is tried,
+/// so when every sibling rejects the replacement is drawn from the renormalized
+/// residual — exactly the recursive-rejection scheme that keeps tree
+/// verification unbiased. With one child per frontier this is **bit-identical**
+/// (same RNG draw sequence, same residual) to [`accept_reject`] over the
+/// equivalent chain — the property `tree_accept_reject_matches_linear_for_chain`
+/// pins.
+pub fn tree_accept_reject(
+    nodes: &[TreeNode],
+    target_root: &[f32],
+    target_next: &[&[f32]],
+    rng: &mut Rng,
+) -> SpeculationOutcome {
+    assert_eq!(
+        target_next.len(),
+        nodes.len(),
+        "speculative: target_next must have one distribution per tree node"
+    );
+    let mut accepted: Vec<u32> = Vec::with_capacity(nodes.len());
+    // The frontier: whose children we're choosing among, and the target
+    // distribution that governs that choice. `None` = the root level (children
+    // of the committed tip); `Some(j)` = children of accepted node `j`.
+    let mut frontier: Option<usize> = None;
+    let mut current_target: &[f32] = target_root;
+
+    loop {
+        // Residual pool for this frontier: starts as the governing target and
+        // loses each rejected sibling's mass. Only materialized (cloned) if a
+        // reject actually happens, to keep the all-accept path allocation-light
+        // past the descent.
+        let mut residual: Option<Vec<f32>> = None;
+        let mut descended = false;
+
+        for (j, node) in nodes.iter().enumerate() {
+            if node.parent != frontier {
+                continue;
+            }
+            let id = node.id as usize;
+            let p = if id < current_target.len() {
+                current_target[id]
+            } else {
+                0.0
+            };
+            let q = node.q.max(1e-30);
+            let ratio = (p / q).min(1.0);
+            let u = rng.next_f32();
+            if u <= ratio {
+                // Accept this child: commit it and descend into its subtree.
+                accepted.push(node.id);
+                frontier = Some(j);
+                current_target = target_next[j];
+                descended = true;
+                break;
+            }
+            // Reject: strike this sibling's mass from the residual pool so a
+            // later replacement sample can't re-pick it.
+            let r = residual.get_or_insert_with(|| current_target.to_vec());
+            if id < r.len() {
+                r[id] = (r[id] - q).max(0.0);
+            }
+        }
+
+        if descended {
+            continue;
+        }
+
+        // No child accepted at this frontier (every sibling rejected, or this
+        // is a leaf of the accepted path with no children at all). Draw the
+        // replacement / bonus from the residual pool (== `current_target` when
+        // no sibling was tried, i.e. the leaf-bonus case).
+        let replacement = match residual {
+            Some(mut r) => {
+                let sum: f32 = r.iter().sum();
+                if sum > 0.0 {
+                    let inv = 1.0 / sum;
+                    for v in r.iter_mut() {
+                        *v *= inv;
+                    }
+                    multinomial(&r, rng)
+                } else {
+                    // The governing distribution was a delta on the rejected
+                    // candidate(s); fall back to its argmax (mirrors the linear
+                    // path's degenerate branch).
+                    argmax(current_target)
+                }
+            }
+            None => multinomial(current_target, rng),
+        };
+        return SpeculationOutcome {
+            accepted,
+            replacement,
+        };
+    }
+}
+
+/// Exact temperature→0 limit of [`tree_accept_reject`] (the tree analogue of
+/// [`accept_reject_greedy`]): at each frontier accept the child that IS the
+/// governing distribution's argmax, else reject and replace with that argmax.
+/// Fully deterministic. Reduces to [`accept_reject_greedy`] token-for-token for
+/// a chain-shaped tree.
+pub fn tree_accept_reject_greedy(
+    nodes: &[TreeNode],
+    target_root: &[f32],
+    target_next: &[&[f32]],
+) -> SpeculationOutcome {
+    assert_eq!(
+        target_next.len(),
+        nodes.len(),
+        "speculative: target_next must have one distribution per tree node"
+    );
+    let mut accepted: Vec<u32> = Vec::with_capacity(nodes.len());
+    let mut frontier: Option<usize> = None;
+    let mut current_target: &[f32] = target_root;
+    loop {
+        let am = argmax(current_target);
+        // Find the child (if any) matching the argmax; accept + descend.
+        let hit = nodes
+            .iter()
+            .enumerate()
+            .find(|(_, n)| n.parent == frontier && n.id == am);
+        match hit {
+            Some((j, node)) => {
+                accepted.push(node.id);
+                frontier = Some(j);
+                current_target = target_next[j];
+            }
+            None => {
+                return SpeculationOutcome {
+                    accepted,
+                    replacement: am,
+                };
+            }
+        }
+    }
+}
+
 fn multinomial(probs: &[f32], rng: &mut Rng) -> u32 {
     let u = rng.next_f32();
     let mut cum = 0.0f32;
@@ -416,6 +589,141 @@ mod tests {
         let target = [p.as_slice()]; // missing the bonus slot
         let mut rng = mk_rng(0);
         let _ = accept_reject(&drafts, &target, &mut rng);
+    }
+
+    // ---- Tree-structured verification (Feature 4a) ----
+
+    /// Build the chain-shaped tree equivalent of a linear draft: node `j`'s
+    /// parent is `j-1` (root for `j==0`).
+    fn chain_tree(drafts: &[DraftToken]) -> Vec<TreeNode> {
+        drafts
+            .iter()
+            .enumerate()
+            .map(|(j, d)| TreeNode {
+                id: d.id,
+                q: d.q,
+                parent: if j == 0 { None } else { Some(j - 1) },
+            })
+            .collect()
+    }
+
+    /// THE parity guard: over a chain-shaped tree, `tree_accept_reject` must be
+    /// bit-for-bit identical to the linear `accept_reject` for the same seed —
+    /// same accepted prefix AND same replacement — proving the tree walk's RNG
+    /// draw sequence + residual math reduce exactly to the pinned linear path.
+    #[test]
+    fn tree_accept_reject_matches_linear_for_chain() {
+        let drafts = vec![
+            DraftToken { id: 1, q: 0.4 },
+            DraftToken { id: 2, q: 0.55 },
+            DraftToken { id: 3, q: 0.2 },
+        ];
+        // 5-token vocab; a mix of agreement/disagreement so the sweep exercises
+        // accept-all, early-reject, and mid-chain-reject outcomes.
+        let p0 = [0.1f32, 0.5, 0.2, 0.1, 0.1];
+        let p1 = [0.2f32, 0.1, 0.4, 0.2, 0.1];
+        let p2 = [0.3f32, 0.1, 0.1, 0.4, 0.1];
+        let p3 = [0.25f32, 0.25, 0.25, 0.25, 0.0];
+        let target = [p0.as_slice(), p1.as_slice(), p2.as_slice(), p3.as_slice()];
+
+        let nodes = chain_tree(&drafts);
+        let target_root = target[0];
+        let target_next: Vec<&[f32]> = target[1..].to_vec();
+
+        for seed in 0u64..512 {
+            let mut r_lin = mk_rng(seed);
+            let mut r_tree = mk_rng(seed);
+            let lin = accept_reject(&drafts, &target, &mut r_lin);
+            let tree = tree_accept_reject(&nodes, target_root, &target_next, &mut r_tree);
+            assert_eq!(lin, tree, "chain tree must match linear at seed {seed}");
+        }
+    }
+
+    /// Greedy chain parity: the temp→0 tree walk must match `accept_reject_greedy`
+    /// token-for-token over the equivalent chain.
+    #[test]
+    fn tree_greedy_matches_linear_for_chain() {
+        let drafts = vec![
+            DraftToken { id: 2, q: 0.5 },
+            DraftToken { id: 3, q: 0.5 },
+            DraftToken { id: 1, q: 0.5 },
+        ];
+        let p = [
+            &[0.0f32, 0.1, 0.8, 0.1][..],
+            &[0.1f32, 0.0, 0.1, 0.8][..],
+            &[0.8f32, 0.1, 0.1, 0.0][..],
+            &[0.0f32, 1.0, 0.0, 0.0][..],
+        ];
+        let nodes = chain_tree(&drafts);
+        let target_next: Vec<&[f32]> = p[1..].to_vec();
+        let lin = accept_reject_greedy(&drafts, &p);
+        let tree = tree_accept_reject_greedy(&nodes, p[0], &target_next);
+        assert_eq!(lin, tree);
+    }
+
+    /// Branching walk (greedy, fully deterministic): with two depth-1 candidates
+    /// the walk must descend the argmax child — NOT just the first in slice
+    /// order — then continue down its subtree to a leaf + bonus.
+    #[test]
+    fn tree_greedy_walks_best_branch() {
+        // Root children: node0=id1 (NOT argmax), node1=id2 (argmax). Then
+        // node1's child node2=id5 (argmax of target_next[1]). node2 is a leaf.
+        let nodes = vec![
+            TreeNode { id: 1, q: 0.5, parent: None },
+            TreeNode { id: 2, q: 0.5, parent: None },
+            TreeNode { id: 5, q: 0.5, parent: Some(1) },
+        ];
+        let target_root = [0.1f32, 0.2, 0.7, 0.0, 0.0, 0.0]; // argmax = 2 → node1
+        // target_next indexed by node: [node0, node1, node2].
+        let tn0 = [1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0]; // unused (node0 not taken)
+        let tn1 = [0.0f32, 0.0, 0.0, 0.0, 0.0, 1.0]; // argmax = 5 → node2
+        let tn2 = [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // leaf bonus → argmax = 3
+        let target_next = [tn0.as_slice(), tn1.as_slice(), tn2.as_slice()];
+        let out = tree_accept_reject_greedy(&nodes, &target_root, &target_next);
+        assert_eq!(out.accepted, vec![2, 5], "must walk the argmax branch");
+        assert_eq!(out.replacement, 3, "leaf bonus = argmax(target_next[leaf])");
+    }
+
+    /// A rejected sibling's mass is struck from the residual: when every depth-1
+    /// candidate rejects, the replacement is drawn from the renormalized pool and
+    /// can't be a rejected candidate's token.
+    #[test]
+    fn tree_stochastic_rejects_all_siblings_then_resamples() {
+        // Two root candidates id1, id2; target_root puts ZERO mass on both, so
+        // both always reject (ratio 0). Residual = target_root with 1,2 struck
+        // (already zero) → support {0, 3} → replacement ∈ {0, 3}, never 1 or 2.
+        let nodes = vec![
+            TreeNode { id: 1, q: 0.9, parent: None },
+            TreeNode { id: 2, q: 0.9, parent: None },
+        ];
+        let target_root = [0.5f32, 0.0, 0.0, 0.5];
+        let tn = [1.0f32, 0.0, 0.0, 0.0];
+        let target_next = [tn.as_slice(), tn.as_slice()];
+        for seed in 0u64..64 {
+            let mut rng = mk_rng(seed);
+            let out = tree_accept_reject(&nodes, &target_root, &target_next, &mut rng);
+            assert!(out.accepted.is_empty(), "both siblings must reject at seed {seed}");
+            assert!(
+                matches!(out.replacement, 0 | 3),
+                "replacement from residual support {{0,3}}, got {} at seed {seed}",
+                out.replacement
+            );
+        }
+    }
+
+    /// Empty tree ⇒ no speculation: draw one token from the root distribution.
+    #[test]
+    fn tree_empty_returns_root_sample() {
+        let nodes: Vec<TreeNode> = vec![];
+        let target_root = [0.0f32, 0.0, 1.0, 0.0];
+        let target_next: Vec<&[f32]> = vec![];
+        let mut rng = mk_rng(5);
+        let out = tree_accept_reject(&nodes, &target_root, &target_next, &mut rng);
+        assert!(out.accepted.is_empty());
+        assert_eq!(out.replacement, 2);
+        // Greedy twin: argmax of the root.
+        let out_g = tree_accept_reject_greedy(&nodes, &target_root, &target_next);
+        assert_eq!(out_g.replacement, 2);
     }
 }
 
