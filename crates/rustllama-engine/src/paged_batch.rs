@@ -110,6 +110,33 @@ struct SlotState {
     /// page-aligned shared prefix length) — those positions skipped
     /// prefill. Reported as `cache_hit_tokens` on completion.
     cache_hit_tokens: u32,
+    /// Chunked-prefill progress (Feature 3). `None` = this slot's prompt is
+    /// fully prefilled and it is decode-ready (the only state when chunked
+    /// prefill is off). `Some(job)` = the driver is still forwarding the prompt
+    /// in chunks; the slot is SKIPPED by the decode tick until it drains.
+    prefill_job: Option<PrefillJob>,
+}
+
+/// In-flight chunked prefill for one slot (Feature 3). `admit_request` stages
+/// the slot (pages, shared-prefix, APC acquire, capacity) then, instead of
+/// forwarding the whole suffix inline, hands the driver this job; each
+/// `run_prefill_tick` forwards a budget-limited chunk until the suffix drains,
+/// at which point the prompt's blocks are registered in the APC index and the
+/// slot becomes decode-ready.
+struct PrefillJob {
+    /// The prompt suffix still to forward (`prompt[shared_lcp..]`).
+    suffix: Vec<i32>,
+    /// How many suffix tokens have been forwarded so far.
+    cursor: usize,
+    /// Cache position the suffix starts at (the shared-prefix length).
+    base: usize,
+    /// APC block-hash chain for the FULL prompt, registered once on completion
+    /// so a later request reuses this KV (the inline path registers at admit).
+    chain: Vec<rustllama_models::apc::BlockHash>,
+    /// Prompt length + wall-clock start, for the completion `RequestStats`.
+    prompt_len: u32,
+    cache_hit_tokens: u32,
+    started: std::time::Instant,
 }
 
 /// Incoming-request message sent from `submit_streaming` callers
@@ -280,6 +307,16 @@ impl PagedBatchEngine {
             page_size,
             active_slot_count: Arc::clone(&active_slot_count),
             last_stats: Arc::clone(&last_stats),
+            // Chunked-prefill token budget per driver tick (Feature 3). `0`
+            // (unset) = OFF: `admit_request` does the whole prompt's prefill
+            // inline before the slot goes active, exactly as before. A positive
+            // value interleaves prefill CHUNKS with decode ticks so a long
+            // prompt stops monopolizing the driver and other slots keep
+            // decoding (TTFT fairness under concurrent load).
+            max_batched_tokens: std::env::var("RUSTLLAMA_MAX_BATCHED_TOKENS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
         };
         let driver_handle = std::thread::Builder::new()
             .name("rustllama-paged-batch-driver".to_string())
@@ -509,6 +546,8 @@ impl PagedBatchEngine {
                 decode_ms: 0.0,
                 tokens_prefilled,
                 cache_hit_tokens: shared_lcp as u32,
+                // The synchronous batched path always prefills inline.
+                prefill_job: None,
             });
         }
 
@@ -809,6 +848,9 @@ struct DriverContext {
     /// The driver writes it on retain-removal; the engine's
     /// `last_request_stats_snapshot` impl reads it.
     last_stats: Arc<std::sync::Mutex<Option<RequestStats>>>,
+    /// Chunked-prefill token budget per tick (`RUSTLLAMA_MAX_BATCHED_TOKENS`);
+    /// `0` = off (inline full prefill in `admit_request`). See the construction.
+    max_batched_tokens: usize,
 }
 
 fn driver_loop(
@@ -880,7 +922,11 @@ fn driver_loop(
             continue;
         }
 
-        // ---- One fused decode tick ----
+        // ---- Chunked-prefill tick: advance any PREFILLING slots by a budgeted
+        //      chunk (no-op when the budget is 0 / no slot is prefilling). ----
+        run_prefill_tick(&ctx, &mut active);
+
+        // ---- One fused decode tick (skips still-prefilling slots) ----
         run_decode_tick(&ctx, &mut active, vocab);
 
         // ---- Drop fully-done slots, releasing their pages ----
@@ -1012,6 +1058,44 @@ fn admit_request(
             ))
         })?;
 
+    // Chunked prefill (Feature 3): with a token budget set AND a suffix to
+    // forward, DEFER the prefill to the driver so it interleaves with other
+    // slots' decode (TTFT fairness). The slot goes active in a PREFILLING state;
+    // the decode tick skips it and `run_prefill_tick` drains it a chunk at a
+    // time, registering the prompt's APC blocks + finalizing timing on
+    // completion. Budget 0 (default) ⇒ this branch is skipped and the inline
+    // full prefill below runs exactly as before.
+    if ctx.max_batched_tokens > 0 && shared_lcp < prompt.len() {
+        let suffix: Vec<i32> = prompt[shared_lcp..].to_vec();
+        let last = *prompt.last().expect("non-empty prompt");
+        let tokens_prefilled = prompt.len() as u32;
+        let sampler = Sampler::new(sampling.clone());
+        return Ok(SlotState {
+            sampling,
+            eos,
+            cache,
+            sampler,
+            history: prompt_u32,
+            next_pos: tokens_prefilled, // finalized (unchanged) when prefill drains
+            next_input: last,
+            n_emitted: 0,
+            done: false,
+            prefill_ms: 0.0, // set from `started` on completion
+            decode_ms: 0.0,
+            tokens_prefilled,
+            cache_hit_tokens: shared_lcp as u32,
+            prefill_job: Some(PrefillJob {
+                suffix,
+                cursor: 0,
+                base: shared_lcp,
+                chain,
+                prompt_len: tokens_prefilled,
+                cache_hit_tokens: shared_lcp as u32,
+                started: std::time::Instant::now(),
+            }),
+        });
+    }
+
     // Prefill only the suffix [shared_lcp, prompt.len()). When the
     // full prompt lives in shared pages (rare: exact-match re-ask
     // of an active slot's history) the prefill is skipped entirely —
@@ -1056,6 +1140,7 @@ fn admit_request(
         decode_ms: 0.0,
         tokens_prefilled,
         cache_hit_tokens: shared_lcp as u32,
+        prefill_job: None,
     })
 }
 
@@ -1134,6 +1219,59 @@ fn pick_shared_prefix_from_slots(
 /// `active`. Same shape as the inner loop of
 /// `generate_batched_token_ids` but feeds tokens back into each
 /// slot's `response_tx` instead of accumulating into a Vec.
+/// Chunked-prefill tick (Feature 3): spend up to `ctx.max_batched_tokens` of
+/// prompt-prefill work across the still-prefilling slots this tick, so a long
+/// prompt is forwarded in chunks interleaved with other slots' decode instead
+/// of monopolizing the driver. Chunking a paged prefill is parity-safe — each
+/// chunk's attention reads the prior chunks' K/V already in the cache, so
+/// forwarding `[a,b)` then `[b,c)` matches one `[a,c)` call. When a slot's suffix
+/// drains, its prompt blocks are registered in the APC index (deferred from
+/// admit) and the slot becomes decode-ready. No-op when the budget is 0.
+fn run_prefill_tick(ctx: &DriverContext, active: &mut [DriverSlot]) {
+    let mut budget = ctx.max_batched_tokens;
+    if budget == 0 {
+        return;
+    }
+    for slot in active.iter_mut() {
+        if budget == 0 {
+            break;
+        }
+        let (cursor, base, suffix_len) = match slot.state.prefill_job.as_ref() {
+            Some(j) => (j.cursor, j.base, j.suffix.len()),
+            None => continue,
+        };
+        let n = budget.min(suffix_len - cursor);
+        if n > 0 {
+            let chunk: Vec<i32> =
+                slot.state.prefill_job.as_ref().unwrap().suffix[cursor..cursor + n].to_vec();
+            let start_pos = (base + cursor) as u32;
+            ctx.shared.with_store_mut(|store| {
+                let _ = ctx.model.forward_prefill_paged_f32(
+                    &chunk,
+                    start_pos,
+                    &mut slot.state.cache,
+                    store,
+                );
+            });
+            slot.state.prefill_job.as_mut().unwrap().cursor += n;
+            budget -= n;
+        }
+        if slot.state.prefill_job.as_ref().unwrap().cursor >= suffix_len {
+            // Prefill drained → register APC blocks (deferred from admit) +
+            // finalize timing, then clear the job so the decode tick picks it up.
+            let pages = slot.state.cache.pages();
+            let job = slot.state.prefill_job.take().expect("job present");
+            if !job.chain.is_empty() {
+                let k = job.chain.len().min(pages.len());
+                let entries: Vec<_> = (0..k).map(|i| (job.chain[i], pages[i])).collect();
+                ctx.shared.apc_register(&entries);
+            }
+            slot.state.prefill_ms = job.started.elapsed().as_secs_f64() * 1000.0;
+            let _ = (job.prompt_len, job.cache_hit_tokens); // already on SlotState
+        }
+    }
+}
+
 fn run_decode_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize) {
     let m = active.len();
     // E3.1: prompt cancellation propagation. Before paying the cost
@@ -1152,7 +1290,11 @@ fn run_decode_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
             active[i].state.done = true;
         }
     }
-    let active_indices: Vec<usize> = (0..m).filter(|&i| !active[i].state.done).collect();
+    // Decode only slots that are both live AND past prefill (a still-prefilling
+    // slot has no decode frontier yet; `run_prefill_tick` advances it).
+    let active_indices: Vec<usize> = (0..m)
+        .filter(|&i| !active[i].state.done && active[i].state.prefill_job.is_none())
+        .collect();
     if active_indices.is_empty() {
         return;
     }
