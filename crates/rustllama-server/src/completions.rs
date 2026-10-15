@@ -353,7 +353,7 @@ pub async fn completions(
         // n-gram arm, but drafts come from the model's NextN head. Takes
         // precedence over n-gram when both are enabled.
         let prompt_ids_i32: Vec<i32> = prompt_ids.iter().map(|&v| v as i32).collect();
-        let mut st = match cpu.speculate_mtp_stream_from_ids(prompt_ids_i32, sampling.clone()) {
+        let mut st = match cpu.speculate_mtp_stream_from_ids(prompt_ids_i32, sampling.clone(), None) {
             Ok(st) => st,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
@@ -605,7 +605,7 @@ async fn completions_stream(
         tokio::spawn(async move {
             use futures::StreamExt;
             let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&v| v as i32).collect();
-            match cpu_inner.speculate_mtp_stream_from_ids(prompt_i32, sampling_inner) {
+            match cpu_inner.speculate_mtp_stream_from_ids(prompt_i32, sampling_inner, None) {
                 Ok(mut st) => {
                     while let Some(item) = st.next().await {
                         let mapped = item.map_err(|e| e.to_string());

@@ -2622,6 +2622,16 @@ async fn load_model(
         );
     }
     cpu.set_mtp_speculative(applied_mtp);
+    // Tree-structured MTP speculation (Feature 4): enabled from the config flag;
+    // a no-op fallback on models without MTP heads / on the hybrid path.
+    if cfg_for_tuning.inference.speculative_tree {
+        tracing::info!(
+            model = %model_key,
+            widths = ?cfg_for_tuning.inference.speculative_tree_widths,
+            "load_model: tree-structured MTP speculation enabled (non-hybrid MTP heads only)"
+        );
+        cpu.set_tree_speculative(Some(cfg_for_tuning.inference.speculative_tree_widths.clone()));
+    }
     let model_id = cpu.model_id().to_string();
     let cpu = Arc::new(cpu);
     // Pre-upload packed-quant weights to USM on a blocking-pool

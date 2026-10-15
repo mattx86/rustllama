@@ -527,6 +527,21 @@ pub struct InferenceConfig {
     /// raw-softmax sampling caveat as the other speculative paths.
     #[serde(default)]
     pub speculative_mtp: bool,
+    /// Tree-structured MTP speculation (Feature 4). Default `false`. When `true`
+    /// on a model carrying MTP/NextN heads, each round builds a DRAFT TREE from
+    /// the heads' top-k candidates, verifies the whole tree in ONE forward (each
+    /// node attends only its ancestors), and commits the single best accepted
+    /// root→leaf path — a branching generalization of `speculative_mtp` that can
+    /// accept more tokens per round. Non-hybrid contiguous-f32 path only;
+    /// silently falls back to classic decode otherwise. Takes precedence over
+    /// `speculative_mtp` / `speculative_ngram`. Same raw-softmax caveat.
+    #[serde(default)]
+    pub speculative_tree: bool,
+    /// Per-depth branching widths for `speculative_tree` (tree node count =
+    /// their sum). Default `[2, 2, 2, 2]` (a depth-4 tree, 8 nodes). Width 1 at a
+    /// depth disables branching there; all-ones reduces to linear MTP spec.
+    #[serde(default = "default_speculative_tree_widths")]
+    pub speculative_tree_widths: Vec<u32>,
     /// Use the chunked-parallel SSM prefill scan for hybrid (DeltaNet)
     /// models. Autotuner-selected; promoted to RUSTLLAMA_SSM_PREFILL_CHUNKED
     /// at serve load. Default false.
@@ -709,6 +724,10 @@ fn default_speculative_draft_k() -> u32 {
     8
 }
 
+fn default_speculative_tree_widths() -> Vec<u32> {
+    vec![2, 2, 2, 2]
+}
+
 fn default_ngram_n_draft() -> u32 {
     4
 }
@@ -878,6 +897,8 @@ impl Default for InferenceConfig {
             kv_page_size: default_kv_page_size(),
             speculative_ngram: false,
             speculative_mtp: false,
+            speculative_tree: false,
+            speculative_tree_widths: default_speculative_tree_widths(),
             ssm_prefill_chunked: false,
             speculative_draft_path: None,
             speculative_draft_k: default_speculative_draft_k(),

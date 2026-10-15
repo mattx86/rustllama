@@ -2212,7 +2212,7 @@ pub fn measure_speculative_mtp(
         use futures::StreamExt;
         // Untimed warmup: drain one full stream.
         cpu.clear_prefix_cache();
-        match cpu.speculate_mtp_stream_from_ids(prompt_ids.clone(), sampling.clone()) {
+        match cpu.speculate_mtp_stream_from_ids(prompt_ids.clone(), sampling.clone(), None) {
             Ok(mut stream) => {
                 let warm = futures::executor::block_on(async {
                     while let Some(item) = stream.next().await {
@@ -2234,7 +2234,7 @@ pub fn measure_speculative_mtp(
         for _ in 0..repeats {
             cpu.clear_prefix_cache();
             let mut stream = match cpu
-                .speculate_mtp_stream_from_ids(prompt_ids.clone(), sampling.clone())
+                .speculate_mtp_stream_from_ids(prompt_ids.clone(), sampling.clone(), None)
             {
                 Ok(s) => s,
                 Err(e) => {

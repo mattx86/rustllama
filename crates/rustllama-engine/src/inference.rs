@@ -110,6 +110,12 @@ pub struct CpuEngine {
     /// no NextN head or isn't hybrid, so leaving it on for a non-MTP
     /// model costs nothing.
     mtp_spec: bool,
+    /// Tree-structured MTP speculation (Feature 4). `Some(widths)` enables it on
+    /// a non-hybrid model with MTP heads; `None` (default) off. Per-depth
+    /// branching widths from `[inference].speculative_tree_widths`. Takes
+    /// precedence over `mtp_spec` / `ngram_spec`; a no-op fallback on models
+    /// without MTP heads or on the hybrid path.
+    tree_spec: Option<Vec<u32>>,
     /// Per-request performance + cache-hit stats from the most recent
     /// generation. Reset to defaults at the start of each request and
     /// committed at the end. Reads are race-free as long as the caller
@@ -1708,6 +1714,7 @@ impl CpuEngine {
             ngram_spec: None,
             draft_spec: None,
             mtp_spec: false,
+            tree_spec: None,
             image_wrapper: None,
             vision_feature_memo: Arc::new(Mutex::new(None)),
             lock_registry,
@@ -2340,6 +2347,7 @@ impl CpuEngine {
             ngram_spec: None,
             draft_spec: None,
             mtp_spec: false,
+            tree_spec: None,
             image_wrapper: None,
             vision_feature_memo: Arc::new(Mutex::new(None)),
             lock_registry,
@@ -2503,6 +2511,7 @@ impl CpuEngine {
             ngram_spec: None,
             draft_spec: None,
             mtp_spec: false,
+            tree_spec: None,
             image_wrapper: None,
             vision_feature_memo: Arc::new(Mutex::new(None)),
             lock_registry,
@@ -3521,6 +3530,22 @@ impl CpuEngine {
         self.model.weights.is_hybrid() && self.model.weights.nextn_head.is_some()
     }
 
+    /// Enable (or clear) tree-structured MTP speculation (Feature 4). Set at load
+    /// time from `[inference].speculative_tree` + `speculative_tree_widths`.
+    pub fn set_tree_speculative(&mut self, widths: Option<Vec<u32>>) {
+        self.tree_spec = widths.filter(|w| !w.is_empty());
+    }
+
+    /// Whether tree spec is enabled AND the loaded model can use it: non-hybrid
+    /// (the tree verify forward is F32-contiguous, no DeltaNet) with MTP heads.
+    pub fn tree_speculative(&self) -> bool {
+        self.tree_spec.is_some() && self.model_supports_tree()
+    }
+
+    fn model_supports_tree(&self) -> bool {
+        !self.model.weights.is_hybrid() && self.model.weights.mtp_heads.is_some()
+    }
+
     /// Set (or clear) the CacheBlend recompute ratio applied to RAG `documents`
     /// requests. The serve load path calls this with the autotuned ratio (`tune
     /// --cacheblend` winner when `[tuning].auto_apply_cacheblend`) or the
@@ -3888,6 +3913,7 @@ impl CpuEngine {
             draft_spec: self.draft_spec.clone(),
             // MTP self-speculation is a plain Copy bool; forks inherit it.
             mtp_spec: self.mtp_spec,
+            tree_spec: self.tree_spec.clone(),
             image_wrapper: self.image_wrapper.clone(),
             vision_feature_memo: Arc::clone(&self.vision_feature_memo),
             // Forks share the parent's locked ranges: they use the same
@@ -6202,6 +6228,147 @@ fn mtp_round(
     }
 }
 
+/// One TREE MTP self-speculation round (Feature 4), the branching generalization
+/// of [`mtp_round`] for NON-hybrid models carrying MTP heads. Reuses the
+/// parity-guarded tree primitives end-to-end: one tip forward produces the main
+/// (target_root) distribution + per-head drafts; [`build_mtp_tree`] shapes a
+/// draft tree; [`LlamaModel::forward_tree_verify_f32`] scores every node in ONE
+/// forward (each node attends only its ancestors); [`tree_accept_reject`] walks
+/// the best accepted path; and [`KvCache::compact_tokens`] moves the accepted
+/// path's scattered K/V into contiguous committed slots — so an accepted run of
+/// `a` tokens costs ONE verify forward, no replay.
+///
+/// Requires the contiguous F32 KV backend (the tree verify + compaction are
+/// F32-contiguous); returns an error otherwise so the caller falls back. Default
+/// sampling penalties are a no-op; non-default penalties are applied to the
+/// root decision only (the per-node path penalties are a refinement — a request
+/// with penalties still decodes correctly, just not token-identical to the
+/// classic penalized sampler on the deeper tree nodes).
+#[allow(clippy::too_many_arguments)]
+fn tree_mtp_round(
+    model: &LlamaModel,
+    state: &Arc<Mutex<EngineState>>,
+    next_input: i32,
+    next_pos: u32,
+    widths: &[u32],
+    max_ctx: usize,
+    greedy: bool,
+    rng: &mut Rng,
+    vocab: usize,
+    repeat: f32,
+    frequency: f32,
+    presence: f32,
+) -> Result<MtpRoundOutcome> {
+    use crate::speculative::{
+        build_mtp_tree, tree_accept_reject, tree_accept_reject_greedy, tree_depths,
+    };
+    let penalize = repeat != 1.0 || frequency != 0.0 || presence != 0.0;
+    let mut state = state.lock().expect("state lock");
+    let base_pos = next_pos as usize;
+
+    if !matches!(state.kv_backend, KvBackend::Contiguous(_)) {
+        return Err(CpuEngineError::Other(
+            "tree speculation requires the contiguous KV backend".to_string(),
+        ));
+    }
+
+    // --- Tip forward: main (target_root) + per-MTP-head drafts. Writes the tip
+    //     token's K/V at `base_pos`; kv.seq_len = base_pos + 1. ---
+    let n_mtp = model.weights.mtp_heads.as_ref().map(|h| h.len()).unwrap_or(0);
+    let mut main_logits = vec![0f32; vocab];
+    let mut head_logits: Vec<Vec<f32>> = vec![vec![0f32; vocab]; n_mtp];
+    {
+        let KvBackend::Contiguous(kv) = &mut state.kv_backend else { unreachable!() };
+        model.forward_one_with_mtp_logits(next_input, next_pos, kv, &mut main_logits, &mut head_logits);
+    }
+    debug_assert_eq!(state.kv_backend.seq_len(), base_pos + 1);
+
+    // Penalty history for the first speculative token = `last_ids` (== [0,
+    // base_pos)) plus the just-forwarded tip. Default penalties ⇒ no-op.
+    if penalize {
+        let mut recent = state.last_ids.clone();
+        recent.push(next_input as u32);
+        crate::sampling::apply_all_penalties(&mut main_logits, &recent, repeat, frequency, presence);
+    }
+    let main_dist = softmax_to_vec(&main_logits);
+
+    // --- Build the draft tree; bail to a single-token sample if empty or it
+    //     would overflow the context. ---
+    let widths_usz: Vec<usize> = widths.iter().map(|&w| (w as usize).max(1)).collect();
+    let nodes = build_mtp_tree(&head_logits, &widths_usz);
+    let fits = !nodes.is_empty() && base_pos + 1 + nodes.len() <= max_ctx;
+    if !fits {
+        // No tree (no heads / overflow) ⇒ commit one token from target_root,
+        // exactly the empty-draft accept/reject (== classic sample).
+        let drafts: [DraftToken; 0] = [];
+        let target: [&[f32]; 1] = [main_dist.as_slice()];
+        let out = if greedy {
+            accept_reject_greedy(&drafts, &target)
+        } else {
+            accept_reject(&drafts, &target, rng)
+        };
+        state.kv_backend.set_seq_len(base_pos + 1);
+        state.last_ids.push(next_input as u32);
+        return Ok(MtpRoundOutcome {
+            committed: vec![out.replacement],
+            next_input: out.replacement as i32,
+            next_pos: base_pos as u32 + 1,
+            pending: None,
+            drafted: 0,
+            accepted: 0,
+        });
+    }
+
+    // --- Tree verify forward: per-node target_next. Writes each node's K/V to
+    //     slot `base_pos + 1 + node_index`, attending prefix + ancestors. ---
+    let node_tokens: Vec<i32> = nodes.iter().map(|n| n.id as i32).collect();
+    let depths = tree_depths(&nodes);
+    let parent: Vec<i32> = nodes
+        .iter()
+        .map(|n| n.parent.map(|p| p as i32).unwrap_or(-1))
+        .collect();
+    let mut tree_logits = vec![0f32; nodes.len() * vocab];
+    {
+        let KvBackend::Contiguous(kv) = &mut state.kv_backend else { unreachable!() };
+        model.forward_tree_verify_f32(&node_tokens, next_pos + 1, &depths, &parent, kv, &mut tree_logits);
+    }
+    let next_dists: Vec<Vec<f32>> = (0..nodes.len())
+        .map(|i| softmax_to_vec(&tree_logits[i * vocab..(i + 1) * vocab]))
+        .collect();
+    let next_refs: Vec<&[f32]> = next_dists.iter().map(|d| d.as_slice()).collect();
+
+    // --- Walk the best accepted path. ---
+    let outcome = if greedy {
+        tree_accept_reject_greedy(&nodes, &main_dist, &next_refs)
+    } else {
+        tree_accept_reject(&nodes, &main_dist, &next_refs, rng)
+    };
+    let a = outcome.accepted.len();
+
+    // --- Commit: compact the accepted path's scattered K/V into contiguous
+    //     slots, then truncate. One verify forward paid for `a` tokens. ---
+    {
+        let KvBackend::Contiguous(kv) = &mut state.kv_backend else { unreachable!() };
+        kv.compact_tokens(base_pos + 1, &outcome.accepted_nodes);
+    }
+    state.kv_backend.set_seq_len(base_pos + 1 + a);
+    // last_ids mirrors the committed KV coverage: context + tip + accepted path.
+    state.last_ids.push(next_input as u32);
+    state.last_ids.extend(outcome.accepted.iter().copied());
+    debug_assert_eq!(state.last_ids.len(), state.kv_backend.seq_len());
+
+    let mut committed = outcome.accepted;
+    committed.push(outcome.replacement);
+    Ok(MtpRoundOutcome {
+        committed,
+        next_input: outcome.replacement as i32,
+        next_pos: base_pos as u32 + 1 + a as u32,
+        pending: None,
+        drafted: nodes.len(),
+        accepted: a,
+    })
+}
+
 // ----- streaming Engine impl -----
 
 impl Engine for CpuEngine {
@@ -6366,9 +6533,16 @@ impl Engine for CpuEngine {
         // prose). Grammar-free only, same raw-softmax caveat as the
         // other speculative paths. Silent fall-through to n-gram/classic
         // on models without a NextN head.
+        // Tree-structured MTP spec (Feature 4) takes precedence over linear MTP
+        // / n-gram when enabled on a non-hybrid MTP model.
+        if let Some(widths) = self.tree_spec.clone() {
+            if s.grammar.is_none() && self.model_supports_tree() {
+                return self.speculate_mtp_stream(prompt, s.clone(), Some(widths));
+            }
+        }
         if self.mtp_spec && s.grammar.is_none() {
             if self.model_supports_mtp() {
-                return self.speculate_mtp_stream(prompt, s.clone());
+                return self.speculate_mtp_stream(prompt, s.clone(), None);
             }
             mtp_fallback_log_once();
         }
@@ -6385,9 +6559,14 @@ impl Engine for CpuEngine {
         // spawn path so the call still produces a Stream rather than panic.
         // MTP / NextN self-speculation takes precedence over n-gram; a
         // no-op fall-through on non-MTP models. Grammar-free only.
+        if let Some(widths) = self.tree_spec.clone() {
+            if s.grammar.is_none() && self.model_supports_tree() {
+                return self.speculate_mtp_stream(prompt.to_string(), s.clone(), Some(widths));
+            }
+        }
         if self.mtp_spec && s.grammar.is_none() {
             if self.model_supports_mtp() {
-                return self.speculate_mtp_stream(prompt.to_string(), s.clone());
+                return self.speculate_mtp_stream(prompt.to_string(), s.clone(), None);
             }
             mtp_fallback_log_once();
         }
@@ -6978,6 +7157,7 @@ impl CpuEngine {
         &self,
         prompt: String,
         s: SamplingParams,
+        tree_widths: Option<Vec<u32>>,
     ) -> EngineResult<TokenStream> {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             crate::EngineError::Unimplemented("speculate_mtp requires a tokenizer")
@@ -6988,7 +7168,7 @@ impl CpuEngine {
             .into_iter()
             .map(|t| t as i32)
             .collect();
-        self.speculate_mtp_stream_from_ids(initial_prompt_ids, s)
+        self.speculate_mtp_stream_from_ids(initial_prompt_ids, s, tree_widths)
     }
 
     /// ID-level MTP / NextN self-speculative decode driver.
@@ -7012,6 +7192,7 @@ impl CpuEngine {
         &self,
         initial_prompt_ids: Vec<i32>,
         s: SamplingParams,
+        tree_widths: Option<Vec<u32>>,
     ) -> EngineResult<TokenStream> {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             crate::EngineError::Unimplemented("speculate_mtp requires a tokenizer")
@@ -7180,13 +7361,27 @@ impl CpuEngine {
                 let np = next_pos;
                 let pend = pending;
                 let vocab_c = vocab;
+                // Tree spec (Feature 4) when widths are set + the model supports
+                // it; otherwise the linear NextN `mtp_round`. Both return
+                // `MtpRoundOutcome`, so the whole stream (emit / stop / stats) is
+                // shared.
+                let tw = tree_widths.clone();
+                let mc = max_ctx;
                 let joined = worker
                     .run_blocking(move || {
-                        let out = mtp_round(
-                            &model_c, &state_c, ni, np, pend, allow_spec,
-                            greedy_spec, &mut rng_c, vocab_c,
-                            repeat_pen, freq_pen, pres_pen,
-                        );
+                        let out = if let Some(widths) = tw {
+                            tree_mtp_round(
+                                &model_c, &state_c, ni, np, &widths, mc,
+                                greedy_spec, &mut rng_c, vocab_c,
+                                repeat_pen, freq_pen, pres_pen,
+                            )
+                        } else {
+                            mtp_round(
+                                &model_c, &state_c, ni, np, pend, allow_spec,
+                                greedy_spec, &mut rng_c, vocab_c,
+                                repeat_pen, freq_pen, pres_pen,
+                            )
+                        };
                         (out, rng_c)
                     })
                     .await;
