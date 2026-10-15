@@ -4094,6 +4094,167 @@ struct TreeAttn<'a> {
     parent: &'a [i32],
 }
 
+// ============================================================
+// Recurrent-state-under-tree verification (Feature 4, hybrid path)
+// ============================================================
+//
+// WHY A SEPARATE WALK (the subtle part):
+//   For a TRANSFORMER layer, tree verification is a single batched forward
+//   with an ancestor attention mask — node `j` attends only its ancestors,
+//   and the KV rows are order-independent (attention is a weighted sum over a
+//   *set*). That is exactly what [`LlamaModel::forward_tree_verify_f32`] does
+//   via [`TreeAttn`].
+//
+//   A RECURRENT layer (DeltaNet / Mamba / SSM) has no such freedom. Its output
+//   at a token is a function of a SEQUENTIAL state `s` that was folded one
+//   token at a time: `s_t = f(s_{t-1}, x_t)`. Two tree branches that share a
+//   root diverge into DIFFERENT state evolutions after the branch point, so a
+//   single linear scan over the flattened node list would advance one shared
+//   state THROUGH every branch and compute garbage for all but the first.
+//
+//   The correct construction is the "caterpillar" walk: snapshot the recurrent
+//   state at the verified branch root, then visit the tree in parent-before-
+//   child order; at each node, RESTORE the state its PARENT left, advance it by
+//   that node's single token, and record the post-step state for the node's own
+//   children. Siblings each restart from the shared parent state, so branches
+//   never contaminate one another.
+//
+// WHY A DEPTH-FIRST ORDER (and how it keeps the ATTENTION layers correct too):
+//   The hybrid forward interleaves recurrent and full-attention layers on the
+//   SAME residual stream, so one walk must satisfy both. We place node `j`'s K/V
+//   at cache slot `start_pos + depth(j)` (NOT its flattened index). Because each
+//   node has exactly one parent, a node's ancestor chain occupies exactly one
+//   slot per depth `0..depth(j)` — a CONTIGUOUS causal window `[0, start_pos +
+//   depth(j)]`. Visiting depth-first guarantees that at the instant node `j` is
+//   stepped, slots `start_pos + 0 ..= start_pos + depth(j)` hold precisely `j`'s
+//   root→`j` path (the descent just wrote them, and a node's subtree only ever
+//   writes STRICTLY DEEPER slots, so an ancestor slot is never clobbered while
+//   one of its descendants is live). So the ordinary causal single-token forward
+//   `[0, pos+1)` *is* "prefix + ancestors + self" for the attention layers, with
+//   zero masking — the recurrent snapshot/restore is the only added machinery.
+//
+// DEGENERATE CASE (the parity anchor): a CHAIN-shaped tree (`parent[j] == j-1`,
+//   `depth[j] == j`) makes every restore a no-op (we restore the state we just
+//   snapshotted) and every step sequential, so the walk reduces BIT-FOR-BIT to
+//   the linear per-token forward. `toy_recurrent_tree_walk_chain_matches_serial`
+//   pins this on the shared walk code; the real hybrid forward inherits it
+//   because `step` is the already-validated single-token hybrid forward.
+
+/// Driver the [`tree_recurrent_walk`] calls into for each node. Splitting the
+/// walk (pure ordering + snapshot bookkeeping) from the per-node work (the
+/// model forward, or a toy recurrence in tests) lets the SAME walk code be
+/// exercised bit-exactly by a unit test and by the real hybrid verify — the
+/// write-blind safety property, since no public MTP-hybrid GGUF exists to
+/// validate end-to-end.
+pub(crate) trait RecurrentTreeDriver {
+    /// An immutable copy of the recurrent state, cheap enough to clone once per
+    /// node that has children (the caterpillar's main chain).
+    type Snapshot: Clone;
+    /// Capture the current live recurrent state.
+    fn snapshot(&self) -> Self::Snapshot;
+    /// Overwrite the live recurrent state with a previously captured snapshot.
+    fn restore(&mut self, snap: &Self::Snapshot);
+    /// Advance the live recurrent state by node `j`'s single token and record
+    /// node `j`'s output. The walk guarantees it called [`Self::restore`] with
+    /// node `j`'s parent snapshot (or the root snapshot for a root-level node)
+    /// immediately before this call, and that `j`'s ancestors were stepped
+    /// earlier in the current descent (so any ancestor-dependent state — KV
+    /// slots for the attention layers — is already in place).
+    fn step(&mut self, j: usize);
+}
+
+/// Walk a speculative draft TREE in parent-before-child, depth-first order,
+/// driving the recurrent state through each branch independently (see the
+/// module comment above for the full rationale).
+///
+/// `parent[j]` is node `j`'s tree-local parent index, or negative for a
+/// root-level node; it MUST be topologically ordered (`parent[j] < j`). The
+/// driver's live state must enter at the verified branch root; it is left in an
+/// UNSPECIFIED (last-visited-leaf) state on return, so a caller that needs a
+/// particular node's post-state must snapshot it itself or replay.
+pub(crate) fn tree_recurrent_walk<D: RecurrentTreeDriver>(driver: &mut D, parent: &[i32]) {
+    let n = parent.len();
+    if n == 0 {
+        return;
+    }
+    // Build child adjacency + the root set in one pass.
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut roots: Vec<usize> = Vec::new();
+    for (j, &p) in parent.iter().enumerate() {
+        if p < 0 {
+            roots.push(j);
+        } else {
+            let pu = p as usize;
+            debug_assert!(
+                pu < j,
+                "tree_recurrent_walk: parent {pu} must be topologically before child {j}"
+            );
+            children[pu].push(j);
+        }
+    }
+    // The recurrent state as it enters = the branch-root state. Every root-level
+    // node restarts from it.
+    let root_snap = driver.snapshot();
+    // Explicit DFS stack of (node, snapshot-to-restore-before-stepping-it). We
+    // push children in reverse so they pop in natural (slice) order, which keeps
+    // the main (argmax-first) branch of a caterpillar on top and matches the
+    // flattened node order a chain produces.
+    let mut stack: Vec<(usize, D::Snapshot)> = Vec::with_capacity(n);
+    for &r in roots.iter().rev() {
+        stack.push((r, root_snap.clone()));
+    }
+    while let Some((j, snap)) = stack.pop() {
+        driver.restore(&snap);
+        driver.step(j);
+        if !children[j].is_empty() {
+            // Only clone when there are children to seed — the caterpillar's
+            // leaf siblings never reach here, so the all-main-chain case clones
+            // exactly once per depth.
+            let my_snap = driver.snapshot();
+            for &c in children[j].iter().rev() {
+                stack.push((c, my_snap.clone()));
+            }
+        }
+    }
+}
+
+/// [`RecurrentTreeDriver`] for the real hybrid verify forward. `step(j)` is the
+/// single-token hybrid forward at `pos = start_pos + depths[j]` (which both
+/// writes node `j`'s K/V at that slot and advances the DeltaNet recurrence by
+/// one token), capturing node `j`'s logits; snapshot/restore round-trip the
+/// DeltaNet recurrent + conv state. See [`LlamaModel::forward_tree_verify_hybrid_f32`].
+struct HybridTreeVerifyDriver<'a> {
+    model: &'a LlamaModel,
+    kv: &'a mut KvCache,
+    dn: &'a mut DeltaNetCache,
+    tokens: &'a [i32],
+    start_pos: u32,
+    depths: &'a [u32],
+    logits_out: &'a mut [f32],
+    vocab: usize,
+}
+
+impl RecurrentTreeDriver for HybridTreeVerifyDriver<'_> {
+    type Snapshot = DeltaNetSnapshot;
+    fn snapshot(&self) -> DeltaNetSnapshot {
+        self.dn.snapshot()
+    }
+    fn restore(&mut self, snap: &DeltaNetSnapshot) {
+        self.dn.restore(snap);
+    }
+    fn step(&mut self, j: usize) {
+        let pos = self.start_pos + self.depths[j];
+        let out = &mut self.logits_out[j * self.vocab..(j + 1) * self.vocab];
+        // `forward_one_hybrid` writes K/V at slot `pos`, attends `[0, pos+1)`,
+        // and folds the token into the DeltaNet state — exactly one node's worth
+        // of recurrent advance. The walk has already restored this node's parent
+        // state and (via the depth-first descent) laid down its ancestor KV, so
+        // this call sees precisely "prefix + ancestors + self".
+        self.model
+            .forward_one_hybrid(self.tokens[j], pos, self.kv, self.dn, out);
+    }
+}
+
 /// A CPU-backed weight range the Windows page-lock path may pin into
 /// the working set. `addr`/`len` describe the *backing buffer* (for
 /// `CpuOwnedSlice` this is the parent Arc, so dedup-by-`addr` locks a
@@ -7350,6 +7511,93 @@ impl LlamaModel {
         );
     }
 
+    /// Hybrid TIP forward for tree speculation (Feature 4, hybrid path):
+    /// advances the KV + DeltaNet caches by the single `token_id` at `pos` and
+    /// returns `main_logits_out` (the next-token distribution) plus one
+    /// full-vocab logit row per available DRAFT head.
+    ///
+    /// Draft-head policy (fail-closed — no draft head ⇒ empty vec ⇒ the caller's
+    /// round is inert, same as the non-hybrid driver without MTP heads):
+    ///   * `mtp_heads` (DeepSeek-V3 style, multiple depths) is preferred when
+    ///     present — one sidecar pass per head, yielding a multi-DEPTH draft
+    ///     tree via [`crate::speculative::build_mtp_tree`].
+    ///   * else the single `nextn_head` (qwen35moe) produces ONE draft row,
+    ///     conditioned on the main head's argmax (the best available guess for
+    ///     the `+1` token the NextN composition consumes) — a single-depth,
+    ///     width-`widths[0]` tree. A poor guess only lowers draft acceptance,
+    ///     never correctness (every node is re-verified by the tree walk).
+    ///
+    /// Reuses [`Self::forward_one_hybrid_to_hidden`] (so the recurrent + KV state
+    /// advance is byte-identical to the normal hybrid decode) and the already-
+    /// tested [`Self::forward_mtp_head_sidecar`] / [`nextn_compose_logits_f32`]
+    /// head compositions. Panics if the model isn't hybrid.
+    pub fn forward_one_hybrid_with_draft_heads(
+        &self,
+        token_id: i32,
+        pos: u32,
+        kv: &mut KvCache,
+        dn_cache: &mut DeltaNetCache,
+        main_logits_out: &mut [f32],
+    ) -> Vec<Vec<f32>> {
+        let cfg = &self.cfg;
+        assert!(
+            self.weights.is_hybrid(),
+            "forward_one_hybrid_with_draft_heads called on non-hybrid model"
+        );
+        assert_eq!(main_logits_out.len(), cfg.vocab_size);
+        let d = cfg.d_model;
+        let hidden = self.forward_one_hybrid_to_hidden(token_id, pos, kv, dn_cache);
+
+        // Main LM head (identical to `forward_one_hybrid`'s tail).
+        let mut final_norm = vec![0.0f32; d];
+        k::rmsnorm_f32_row(&hidden, &self.weights.output_norm, &mut final_norm, cfg.rms_eps);
+        let lm_head = self.weights.output.as_ref().unwrap_or(&self.weights.token_embd);
+        {
+            let mut had_buf: Vec<f32> = Vec::new();
+            let x_in =
+                hadamard_pre(self.weights.hadamard.as_ref(), lm_head, &final_norm, &mut had_buf);
+            matvec_tensor_dispatch(lm_head, x_in, main_logits_out, cfg.vocab_size, d);
+        }
+
+        // Draft heads.
+        if let Some(heads) = self.weights.mtp_heads.as_ref() {
+            let mut out = Vec::with_capacity(heads.len());
+            for head in heads {
+                let mut row = vec![0.0f32; cfg.vocab_size];
+                self.forward_mtp_head_sidecar(&hidden, head, &mut row);
+                out.push(row);
+            }
+            out
+        } else if let Some(head) = self.weights.nextn_head.as_ref() {
+            // argmax of the main head = the most likely `+1` token, which the
+            // NextN head conditions on to predict `+2`.
+            let next_tok = main_logits_out
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                    if v > bv {
+                        (i, v)
+                    } else {
+                        (bi, bv)
+                    }
+                })
+                .0 as i32;
+            let mut row = vec![0.0f32; cfg.vocab_size];
+            nextn_compose_logits_f32(
+                &hidden,
+                next_tok,
+                &self.weights.token_embd,
+                head,
+                lm_head,
+                cfg.rms_eps,
+                &mut row,
+            );
+            vec![row]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// E4 phase 4b: forward + per-MTP-head logits.
     ///
     /// Runs the standard `forward_one` to produce the main next-
@@ -9942,6 +10190,86 @@ impl LlamaModel {
             LmHeadMode::All(logits_out),
             Some(TreeAttn { depths, parent }),
         );
+    }
+
+    /// HYBRID tree-structured speculative verification forward (F32 KV) — the
+    /// recurrent-model counterpart of [`Self::forward_tree_verify_f32`].
+    ///
+    /// A hybrid model interleaves full-attention layers with recurrent
+    /// (DeltaNet / SSM) layers whose state is SEQUENTIAL, so the single batched
+    /// ancestor-masked forward the dense tree path uses is *wrong* for the
+    /// recurrent layers (see the [`tree_recurrent_walk`] module comment). This
+    /// method instead walks the tree node-by-node in parent-before-child,
+    /// depth-first order, reusing the fully-validated single-token hybrid
+    /// forward ([`Self::forward_one_hybrid`]) as the per-node step:
+    ///
+    ///   * **Recurrent layers** get the caterpillar treatment — the walk
+    ///     snapshots `dn_cache` at the branch root and, for each node, restores
+    ///     its parent's post-step snapshot before stepping, so every branch
+    ///     evolves its own recurrent state from the shared ancestor.
+    ///   * **Attention layers** are correct *for free*: node `j` is stepped at
+    ///     `pos = start_pos + depths[j]`, writing its K/V to slot `start_pos +
+    ///     depths[j]` and attending the ordinary causal window `[0, pos]`.
+    ///     Because each node's unique ancestor chain occupies one slot per depth
+    ///     and the depth-first order never clobbers a live ancestor slot, that
+    ///     window is exactly "prefix + ancestors + self".
+    ///
+    /// `parent[j]` is the tree-local parent index (negative = root level),
+    /// topologically ordered (`parent[j] < j`). Writes per-node logits into
+    /// `logits_out` (`[nodes × vocab]`, row `j` = node `j`).
+    ///
+    /// CONTRACT: on return, `kv.seq_len` and `dn_cache` are in an UNSPECIFIED
+    /// (last-DFS-leaf) state — the walk overwrites shared depth slots and the
+    /// live recurrent state as it explores. A caller that commits an accepted
+    /// path MUST re-establish it (the engine snapshots `dn_cache` beforehand and
+    /// replays the accepted tokens — a recurrence can't be compacted in place
+    /// the way dense KV can via [`KvCache::compact_tokens`]).
+    ///
+    /// A CHAIN-shaped tree (`depths[j] == j`, `parent[j] == j-1`) reduces this to
+    /// `n` sequential [`Self::forward_one_hybrid`] calls — i.e. the linear hybrid
+    /// decode — bit-for-bit, because every snapshot/restore round-trips the state
+    /// we just produced. That reduction is the write-blind correctness anchor
+    /// (`toy_recurrent_tree_walk_chain_matches_serial` pins the shared walk;
+    /// `forward_tree_verify_hybrid_chain_matches_serial_on_real_model` validates
+    /// the whole forward on real weights when a GGUF is supplied).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_tree_verify_hybrid_f32(
+        &self,
+        tokens: &[i32],
+        start_pos: u32,
+        depths: &[u32],
+        parent: &[i32],
+        kv: &mut KvCache,
+        dn_cache: &mut DeltaNetCache,
+        logits_out: &mut [f32],
+    ) {
+        let n = tokens.len();
+        assert_eq!(depths.len(), n, "hybrid tree verify: one depth per node");
+        assert_eq!(parent.len(), n, "hybrid tree verify: one parent per node");
+        assert_eq!(
+            logits_out.len(),
+            n * self.cfg.vocab_size,
+            "forward_tree_verify_hybrid_f32: logits_out must be nodes * vocab_size"
+        );
+        assert!(
+            self.weights.is_hybrid(),
+            "forward_tree_verify_hybrid_f32 called on non-hybrid model — use forward_tree_verify_f32"
+        );
+        if n == 0 {
+            return;
+        }
+        let vocab = self.cfg.vocab_size;
+        let mut driver = HybridTreeVerifyDriver {
+            model: self,
+            kv,
+            dn: dn_cache,
+            tokens,
+            start_pos,
+            depths,
+            logits_out,
+            vocab,
+        };
+        tree_recurrent_walk(&mut driver, parent);
     }
 
     /// CacheBlend selective-recompute prefill (F32 KV, dense + MoE, full-rope).
@@ -13924,6 +14252,191 @@ mod tests {
         for (i, (&a, &b)) in tree2.iter().zip(lin2.iter()).enumerate() {
             assert!((a - b).abs() < 1e-3, "tree-chain(prefix) logit[{i}]: tree={a} lin={b}");
         }
+    }
+
+    // ---- Feature 4 (hybrid path): recurrent-state-under-tree walk ----
+
+    /// Toy recurrent driver standing in for a DeltaNet/SSM layer's sequential
+    /// state update, so the SHARED [`tree_recurrent_walk`] logic (the novel,
+    /// write-blind-risky part) can be pinned bit-exactly without a real
+    /// MTP-hybrid GGUF. `fold` has the shape of a real recurrence — the new
+    /// state mixes the previous state with its neighbor and folds in the token —
+    /// which is ORDER-SENSITIVE: a mis-ordered walk, or one that leaks state
+    /// across sibling branches, produces a different bit pattern.
+    struct ToyRecurrentDriver {
+        state: Vec<f32>,
+        tokens: Vec<i32>,
+        /// Per-node post-step state (what each node would hand its children).
+        out: Vec<Vec<f32>>,
+    }
+
+    impl ToyRecurrentDriver {
+        fn new(dim: usize, tokens: Vec<i32>) -> Self {
+            let n = tokens.len();
+            Self { state: vec![0.0; dim], tokens, out: vec![Vec::new(); n] }
+        }
+        /// `s'[i] = 0.5·s[i] + 0.25·s[(i+1) mod S] + sin(0.1·(x + i))`.
+        fn fold(state: &mut [f32], x: i32) {
+            let s = state.len();
+            let xf = x as f32;
+            let prev: Vec<f32> = state.to_vec();
+            for i in 0..s {
+                let nb = prev[(i + 1) % s];
+                state[i] = 0.5 * prev[i] + 0.25 * nb + (0.1 * (xf + i as f32)).sin();
+            }
+        }
+    }
+
+    impl RecurrentTreeDriver for ToyRecurrentDriver {
+        type Snapshot = Vec<f32>;
+        fn snapshot(&self) -> Vec<f32> {
+            self.state.clone()
+        }
+        fn restore(&mut self, snap: &Vec<f32>) {
+            self.state.copy_from_slice(snap);
+        }
+        fn step(&mut self, j: usize) {
+            Self::fold(&mut self.state, self.tokens[j]);
+            self.out[j] = self.state.clone();
+        }
+    }
+
+    /// THE write-blind correctness anchor: a CHAIN-shaped tree (`parent[j] ==
+    /// j-1`) driven through `tree_recurrent_walk` must reproduce the plain
+    /// SEQUENTIAL recurrent scan BIT-FOR-BIT. This exercises the exact shared
+    /// walk code the real hybrid verify uses — every snapshot/restore round-trips
+    /// the state we just produced, so the degenerate chain is identity-equal to
+    /// folding the tokens one at a time. The analogue of
+    /// `forward_tree_verify_f32_chain_matches_speculation` for the recurrent path.
+    #[test]
+    fn toy_recurrent_tree_walk_chain_matches_serial() {
+        let tokens = vec![3i32, 9, 1, 7, 4, 2];
+        let dim = 5;
+        let parent: Vec<i32> = (0..tokens.len() as i32).map(|i| i - 1).collect();
+        let mut drv = ToyRecurrentDriver::new(dim, tokens.clone());
+        tree_recurrent_walk(&mut drv, &parent);
+
+        // Reference: a plain sequential scan from the zero state.
+        let mut s = vec![0.0f32; dim];
+        let mut serial: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
+        for &t in &tokens {
+            ToyRecurrentDriver::fold(&mut s, t);
+            serial.push(s.clone());
+        }
+
+        assert_eq!(drv.out.len(), serial.len());
+        for (j, (a, b)) in drv.out.iter().zip(serial.iter()).enumerate() {
+            assert_eq!(a.len(), b.len(), "node {j} state dim");
+            for (i, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "chain node {j} dim {i}: walk={x} serial={y}"
+                );
+            }
+        }
+    }
+
+    /// Branching guard: a caterpillar tree (the shape `build_mtp_tree` emits)
+    /// must restore each node from its PARENT's post-step state — sibling
+    /// branches restart from the shared parent and never leak state into one
+    /// another. Hand-computes every node's expected state from explicit folds
+    /// and asserts bit-exact, isolating the restore-from-parent semantics that
+    /// make recurrent tree verification correct.
+    #[test]
+    fn toy_recurrent_tree_walk_branches_restore_from_parent() {
+        let dim = 4;
+        // Caterpillar: level 0 = {node0 (main), node1 (leaf)}; level 1 =
+        // {node2 (main, child of 0), node3 (leaf, child of 0)}; level 2 =
+        // {node4 (child of 2)}. Exactly `build_mtp_tree(.., [2, 2, 1])` shape.
+        let tokens = vec![5i32, 8, 2, 9, 6];
+        let parent = vec![-1i32, -1, 0, 0, 2];
+        let mut drv = ToyRecurrentDriver::new(dim, tokens.clone());
+        tree_recurrent_walk(&mut drv, &parent);
+
+        let root = vec![0.0f32; dim];
+        let fold = |base: &[f32], x: i32| {
+            let mut s = base.to_vec();
+            ToyRecurrentDriver::fold(&mut s, x);
+            s
+        };
+        let n0 = fold(&root, tokens[0]); // from root
+        let n1 = fold(&root, tokens[1]); // sibling of n0 → ALSO from root
+        let n2 = fold(&n0, tokens[2]); // child of n0
+        let n3 = fold(&n0, tokens[3]); // sibling of n2 → from n0, not n2
+        let n4 = fold(&n2, tokens[4]); // child of n2
+        let expect = [n0, n1, n2, n3, n4];
+
+        for (j, exp) in expect.iter().enumerate() {
+            assert_eq!(drv.out[j].len(), exp.len(), "node {j} state dim");
+            for (i, (&x, &y)) in drv.out[j].iter().zip(exp.iter()).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "branch node {j} dim {i}: walk={x} expected={y}"
+                );
+            }
+        }
+    }
+
+    /// Real-weights validation hook (mirrors
+    /// `hybrid_from_embeds_matches_token_prefill_on_real_model`): on a REAL
+    /// hybrid GGUF named by `RUSTLLAMA_REAL_HYBRID_GGUF`, a CHAIN-shaped tree
+    /// run through [`LlamaModel::forward_tree_verify_hybrid_f32`] must reproduce
+    /// `n` sequential [`LlamaModel::forward_one_hybrid`] calls BIT-FOR-BIT
+    /// (identical forward calls at identical positions — the degenerate chain is
+    /// the linear decode). `#[ignore]`d so it never runs in CI (no fixture
+    /// on-box); the user runs it on real hardware with a hybrid model.
+    #[test]
+    #[ignore]
+    fn forward_tree_verify_hybrid_chain_matches_serial_on_real_model() {
+        let Ok(path) = std::env::var("RUSTLLAMA_REAL_HYBRID_GGUF") else {
+            eprintln!("RUSTLLAMA_REAL_HYBRID_GGUF not set — skipping");
+            return;
+        };
+        let gguf = Gguf::open(&path).expect("open gguf");
+        let cfg = crate::llama_config::LlamaConfig::from_gguf(&gguf).expect("config");
+        assert!(cfg.hybrid.is_some(), "fixture must be a hybrid model");
+        let weights = LlamaWeights::from_gguf(&gguf, &cfg).expect("weights");
+        let model = LlamaModel::from_parts(cfg, weights);
+        let hybrid = model.weights.hybrid_layers.as_ref().expect("hybrid layers");
+        let vocab = model.cfg.vocab_size;
+        let tokens: Vec<i32> = vec![3, 1000, 25, 4096, 77];
+        let n = tokens.len();
+        let max_ctx = 64usize;
+
+        // Reference: n sequential single-token hybrid forwards.
+        let mut kv_ref = KvCache::new_with_dtype(&model.cfg, max_ctx, KvDtype::F32);
+        let mut dn_ref = DeltaNetCache::new_for_hybrid(&model.cfg, hybrid).expect("dn");
+        let mut ref_logits = vec![0f32; n * vocab];
+        for (i, &t) in tokens.iter().enumerate() {
+            model.forward_one_hybrid(
+                t,
+                i as u32,
+                &mut kv_ref,
+                &mut dn_ref,
+                &mut ref_logits[i * vocab..(i + 1) * vocab],
+            );
+        }
+
+        // Tree verify over a CHAIN (parent[j]=j-1, depth[j]=j), start_pos 0.
+        let mut kv_tree = KvCache::new_with_dtype(&model.cfg, max_ctx, KvDtype::F32);
+        let mut dn_tree = DeltaNetCache::new_for_hybrid(&model.cfg, hybrid).expect("dn");
+        let depths: Vec<u32> = (0..n as u32).collect();
+        let parent: Vec<i32> = (0..n as i32).map(|i| i - 1).collect();
+        let mut tree_logits = vec![0f32; n * vocab];
+        model.forward_tree_verify_hybrid_f32(
+            &tokens, 0, &depths, &parent, &mut kv_tree, &mut dn_tree, &mut tree_logits,
+        );
+
+        for (i, (&a, &b)) in tree_logits.iter().zip(ref_logits.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "hybrid tree-chain logit[{i}]: tree={a} serial={b}"
+            );
+        }
+        eprintln!("hybrid tree-verify chain==serial OK ({n} nodes × {vocab} vocab)");
     }
 
     /// Tree-spec commit guard: `compact_tokens` moves a scattered accepted

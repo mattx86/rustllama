@@ -3563,14 +3563,28 @@ impl CpuEngine {
         self.tree_spec = widths.filter(|w| !w.is_empty());
     }
 
-    /// Whether tree spec is enabled AND the loaded model can use it: non-hybrid
-    /// (the tree verify forward is F32-contiguous, no DeltaNet) with MTP heads.
+    /// Whether tree spec is enabled AND the loaded model can use it. Both
+    /// architecture families are supported: a NON-hybrid model with MTP heads
+    /// (the F32-contiguous batched tree verify) and a HYBRID model with a draft
+    /// head (the recurrent-state tree walk — see [`tree_mtp_round_hybrid`]).
     pub fn tree_speculative(&self) -> bool {
         self.tree_spec.is_some() && self.model_supports_tree()
     }
 
+    /// A model can draft+verify a tree iff it carries a DRAFT head. Non-hybrid
+    /// models draft from DeepSeek-style `mtp_heads`; hybrid models draft from
+    /// either `mtp_heads` OR the single qwen35moe `nextn_head` (the hybrid tree
+    /// verify handles the DeltaNet/SSM recurrence under the tree). WITHOUT a
+    /// draft head the round is inert — classic decode — so this gate keeps the
+    /// driver honest: no draft head ⇒ no tree spec, same as the linear MTP
+    /// driver's `model_supports_mtp`.
     fn model_supports_tree(&self) -> bool {
-        !self.model.weights.is_hybrid() && self.model.weights.mtp_heads.is_some()
+        let w = &self.model.weights;
+        if w.is_hybrid() {
+            w.mtp_heads.is_some() || w.nextn_head.is_some()
+        } else {
+            w.mtp_heads.is_some()
+        }
     }
 
     /// Set (or clear) the CacheBlend recompute ratio applied to RAG `documents`
@@ -6396,6 +6410,224 @@ fn tree_mtp_round(
     })
 }
 
+/// One TREE MTP self-speculation round for a HYBRID model (Feature 4, hybrid
+/// path) — the recurrent-architecture counterpart of [`tree_mtp_round`].
+///
+/// A hybrid model carries DeltaNet/SSM layers whose state is SEQUENTIAL, so the
+/// dense tree path's single batched ancestor-masked verify + `compact_tokens`
+/// commit does not apply. This round instead:
+///
+///   1. **Tip forward** — [`LlamaModel::forward_one_hybrid_with_draft_heads`]
+///      advances the KV + DeltaNet caches by `next_input` and returns the main
+///      distribution plus one logit row per draft head (DeepSeek `mtp_heads`,
+///      else the qwen35moe `nextn_head`).
+///   2. **Tree build** — [`build_mtp_tree`] shapes a caterpillar from the head
+///      logits (width 1 everywhere ⇒ the linear MTP chain, pinned by
+///      `mtp_tree_width_one_is_a_chain`).
+///   3. **Recurrent tree verify** — [`LlamaModel::forward_tree_verify_hybrid_f32`]
+///      walks the tree node-by-node, snapshotting/restoring the DeltaNet state so
+///      each branch evolves its own recurrence from the shared ancestor (the
+///      "caterpillar" walk). Attention layers stay correct because each node is
+///      stepped at `start_pos + depth` so its ancestor K/V form a contiguous
+///      causal window.
+///   4. **Walk + commit** — [`tree_accept_reject`] picks the accepted path, then
+///      we RESTORE the tip recurrent snapshot and REPLAY the accepted tokens via
+///      [`LlamaModel::forward_speculation_batched_hybrid`]. Unlike dense KV, a
+///      recurrence can't be compacted in place, so the accepted path is re-walked
+///      from the tip state — exactly the reject-replay pattern
+///      [`verify_and_commit_speculation`] uses on hybrids. The verify forward
+///      scores the whole tree in one DFS; the replay pays only for the `a`
+///      ACCEPTED tokens.
+///
+/// Requires the contiguous F32 KV backend + a DeltaNet cache (the hybrid path
+/// forces contiguous F32 KV at load); returns an error otherwise so the caller
+/// falls back. Default sampling penalties are a no-op; non-default penalties are
+/// applied to the root decision only (the same deeper-node caveat the dense tree
+/// round documents).
+#[allow(clippy::too_many_arguments)]
+fn tree_mtp_round_hybrid(
+    model: &LlamaModel,
+    state: &Arc<Mutex<EngineState>>,
+    next_input: i32,
+    next_pos: u32,
+    widths: &[u32],
+    max_ctx: usize,
+    greedy: bool,
+    rng: &mut Rng,
+    vocab: usize,
+    repeat: f32,
+    frequency: f32,
+    presence: f32,
+) -> Result<MtpRoundOutcome> {
+    use crate::speculative::{
+        build_mtp_tree, tree_accept_reject, tree_accept_reject_greedy, tree_depths,
+    };
+    let penalize = repeat != 1.0 || frequency != 0.0 || presence != 0.0;
+    let mut state = state.lock().expect("state lock");
+    let base_pos = next_pos as usize;
+
+    // Tree verify + the DeltaNet replay both require the contiguous F32 KV
+    // backend AND a DeltaNet cache. The dispatch already gated on hybrid + a
+    // draft head; this guards a paged-KV misconfiguration with a clean error.
+    let contiguous_ok = matches!(state.kv_backend, KvBackend::Contiguous(_))
+        && state.delta_net_cache.is_some();
+    if !contiguous_ok {
+        return Err(CpuEngineError::Other(
+            "hybrid tree speculation requires the contiguous KV backend and a \
+             DeltaNet cache"
+                .to_string(),
+        ));
+    }
+
+    // --- Tip forward: main distribution + per-head drafts. Advances KV +
+    //     DeltaNet by the tip token; kv.seq_len = base_pos + 1. ---
+    let mut main_logits = vec![0f32; vocab];
+    let head_logits: Vec<Vec<f32>> = {
+        let EngineState {
+            kv_backend, delta_net_cache, ..
+        } = &mut *state;
+        match (kv_backend, delta_net_cache.as_mut()) {
+            (KvBackend::Contiguous(kv), Some(dn)) => {
+                model.forward_one_hybrid_with_draft_heads(next_input, next_pos, kv, dn, &mut main_logits)
+            }
+            _ => unreachable!("contiguous_ok checked above"),
+        }
+    };
+    debug_assert_eq!(state.kv_backend.seq_len(), base_pos + 1);
+
+    // Penalty history for the first speculative token = `last_ids` (== [0,
+    // base_pos)) plus the just-forwarded tip. Default penalties ⇒ no-op.
+    if penalize {
+        let mut recent = state.last_ids.clone();
+        recent.push(next_input as u32);
+        crate::sampling::apply_all_penalties(&mut main_logits, &recent, repeat, frequency, presence);
+    }
+    let main_dist = softmax_to_vec(&main_logits);
+
+    // --- Build the caterpillar; bail to a single-token sample if it is empty
+    //     (no draft head / degenerate logits) or would overflow the context.
+    //     Nodes occupy depth slots `base_pos + 1 + depth`, so the deepest slot
+    //     touched is `base_pos + 1 + max_depth`. ---
+    let widths_usz: Vec<usize> = widths.iter().map(|&w| (w as usize).max(1)).collect();
+    let nodes = build_mtp_tree(&head_logits, &widths_usz);
+    let depths = tree_depths(&nodes);
+    let max_depth = depths.iter().copied().max().unwrap_or(0) as usize;
+    let fits = !nodes.is_empty() && base_pos + 1 + max_depth + 1 <= max_ctx;
+    if !fits {
+        // No tree ⇒ commit one token from target_root, exactly the empty-draft
+        // accept/reject (== classic sample). KV/DeltaNet already cover the tip.
+        let drafts: [DraftToken; 0] = [];
+        let target: [&[f32]; 1] = [main_dist.as_slice()];
+        let out = if greedy {
+            accept_reject_greedy(&drafts, &target)
+        } else {
+            accept_reject(&drafts, &target, rng)
+        };
+        state.kv_backend.set_seq_len(base_pos + 1);
+        state.last_ids.push(next_input as u32);
+        debug_assert_eq!(state.last_ids.len(), state.kv_backend.seq_len());
+        return Ok(MtpRoundOutcome {
+            committed: vec![out.replacement],
+            next_input: out.replacement as i32,
+            next_pos: base_pos as u32 + 1,
+            pending: None,
+            drafted: 0,
+            accepted: 0,
+        });
+    }
+
+    // Snapshot the TIP recurrent state. It is BOTH the verify walk's branch root
+    // AND the replay base — the walk overwrites shared depth slots and the live
+    // DeltaNet state, so this snapshot is how the commit re-establishes a clean
+    // starting point. Reset discipline: a fresh snapshot each round means a later
+    // round / model reload can never reuse a stale per-node recurrent state.
+    let dn_tip = state.delta_net_cache.as_ref().map(|dn| dn.snapshot());
+
+    // --- Recurrent tree verify forward: per-node logits via the DFS walk. ---
+    let node_tokens: Vec<i32> = nodes.iter().map(|n| n.id as i32).collect();
+    let parent: Vec<i32> = nodes
+        .iter()
+        .map(|n| n.parent.map(|p| p as i32).unwrap_or(-1))
+        .collect();
+    let mut tree_logits = vec![0f32; nodes.len() * vocab];
+    {
+        let EngineState {
+            kv_backend, delta_net_cache, ..
+        } = &mut *state;
+        match (kv_backend, delta_net_cache.as_mut()) {
+            (KvBackend::Contiguous(kv), Some(dn)) => {
+                model.forward_tree_verify_hybrid_f32(
+                    &node_tokens,
+                    next_pos + 1,
+                    &depths,
+                    &parent,
+                    kv,
+                    dn,
+                    &mut tree_logits,
+                );
+            }
+            _ => unreachable!("contiguous_ok checked above"),
+        }
+    }
+    let next_dists: Vec<Vec<f32>> = (0..nodes.len())
+        .map(|i| softmax_to_vec(&tree_logits[i * vocab..(i + 1) * vocab]))
+        .collect();
+    let next_refs: Vec<&[f32]> = next_dists.iter().map(|d| d.as_slice()).collect();
+
+    // --- Walk the best accepted path. ---
+    let outcome = if greedy {
+        tree_accept_reject_greedy(&nodes, &main_dist, &next_refs)
+    } else {
+        tree_accept_reject(&nodes, &main_dist, &next_refs, rng)
+    };
+    let a = outcome.accepted.len();
+
+    // --- Commit: restore the tip recurrent state and REPLAY the accepted path
+    //     so KV (contiguous slots base_pos+1..) + DeltaNet both cover exactly
+    //     `tip ++ accepted`. A recurrence can't be compacted like dense KV, so
+    //     the accepted tokens are re-walked from the tip state (one forward's
+    //     weight traffic over `a` tokens). ---
+    if let (Some(dn), Some(snap)) = (state.delta_net_cache.as_mut(), dn_tip.as_ref()) {
+        dn.restore(snap);
+    }
+    state.kv_backend.set_seq_len(base_pos + 1);
+    if a > 0 {
+        let replay: Vec<i32> = outcome.accepted.iter().map(|&c| c as i32).collect();
+        let mut replay_logits = vec![0f32; replay.len() * vocab];
+        let EngineState {
+            kv_backend, delta_net_cache, ..
+        } = &mut *state;
+        match (kv_backend, delta_net_cache.as_mut()) {
+            (KvBackend::Contiguous(kv), Some(dn)) => {
+                model.forward_speculation_batched_hybrid(
+                    &replay,
+                    (base_pos + 1) as u32,
+                    kv,
+                    dn,
+                    &mut replay_logits,
+                );
+            }
+            _ => unreachable!("contiguous_ok checked above"),
+        }
+    }
+    state.kv_backend.set_seq_len(base_pos + 1 + a);
+    // last_ids mirrors the committed KV coverage: context + tip + accepted path.
+    state.last_ids.push(next_input as u32);
+    state.last_ids.extend(outcome.accepted.iter().copied());
+    debug_assert_eq!(state.last_ids.len(), state.kv_backend.seq_len());
+
+    let mut committed = outcome.accepted;
+    committed.push(outcome.replacement);
+    Ok(MtpRoundOutcome {
+        committed,
+        next_input: outcome.replacement as i32,
+        next_pos: base_pos as u32 + 1 + a as u32,
+        pending: None,
+        drafted: nodes.len(),
+        accepted: a,
+    })
+}
+
 // ----- streaming Engine impl -----
 
 impl Engine for CpuEngine {
@@ -7397,11 +7629,22 @@ impl CpuEngine {
                 let joined = worker
                     .run_blocking(move || {
                         let out = if let Some(widths) = tw {
-                            tree_mtp_round(
-                                &model_c, &state_c, ni, np, &widths, mc,
-                                greedy_spec, &mut rng_c, vocab_c,
-                                repeat_pen, freq_pen, pres_pen,
-                            )
+                            // Tree spec: hybrid models go through the recurrent-
+                            // state tree walk; dense/MoE through the batched
+                            // ancestor-masked verify. Both return MtpRoundOutcome.
+                            if model_c.weights.is_hybrid() {
+                                tree_mtp_round_hybrid(
+                                    &model_c, &state_c, ni, np, &widths, mc,
+                                    greedy_spec, &mut rng_c, vocab_c,
+                                    repeat_pen, freq_pen, pres_pen,
+                                )
+                            } else {
+                                tree_mtp_round(
+                                    &model_c, &state_c, ni, np, &widths, mc,
+                                    greedy_spec, &mut rng_c, vocab_c,
+                                    repeat_pen, freq_pen, pres_pen,
+                                )
+                            }
                         } else {
                             mtp_round(
                                 &model_c, &state_c, ni, np, pend, allow_spec,
