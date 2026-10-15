@@ -4449,6 +4449,34 @@ impl LlamaModel {
         }
     }
 
+    /// Apply model-level post-processing to raw LM-head logits before they feed
+    /// sampling / acceptance: Cohere `logit_scale` (multiply) then Gemma2
+    /// `final_logit_softcapping` (`c·tanh(l/c)`). No-op — and byte-identical —
+    /// when the model declares neither (the common case). Elementwise, so it
+    /// works on a single `[vocab]` row or a batched `[m·vocab]` buffer alike.
+    /// Called at every LM-head output site that produces committed-sampling or
+    /// speculation-target logits. (Note: Gemma2 ALSO needs attention-logit
+    /// softcapping, a kernel change not yet wired — so this alone fully fixes
+    /// Cohere but only partially Gemma2.)
+    #[inline]
+    pub(crate) fn finalize_logits(&self, logits: &mut [f32]) {
+        if let Some(s) = self.cfg.logit_scale {
+            if s != 1.0 {
+                for l in logits.iter_mut() {
+                    *l *= s;
+                }
+            }
+        }
+        if let Some(c) = self.cfg.final_logit_softcapping {
+            if c != 0.0 {
+                let inv = 1.0 / c;
+                for l in logits.iter_mut() {
+                    *l = c * (*l * inv).tanh();
+                }
+            }
+        }
+    }
+
     /// Eagerly upload every packed-quant weight tensor in the model
     /// to the per-thread USM weight cache. Non-packed weights
     /// (F32 / F16 / Q*_K dequant-to-F16 variants) are skipped.
@@ -7505,6 +7533,7 @@ impl LlamaModel {
             .or(self.weights.output.as_ref())
             .unwrap_or(&self.weights.token_embd);
         matvec_tensor_dispatch(lm_head, &final_norm, logits_out, cfg.vocab_size, d);
+        self.finalize_logits(logits_out);
     }
 
     /// Multi-position forward returning per-position logits.
@@ -8655,6 +8684,7 @@ impl LlamaModel {
             .as_ref()
             .unwrap_or(&self.weights.token_embd);
         matvec_tensor_dispatch(lm_head, &final_norm, logits_out, cfg.vocab_size, d);
+        self.finalize_logits(logits_out);
 
         kv.seq_len = kv.seq_len.max(cur_pos + 1);
 
@@ -9038,6 +9068,7 @@ impl LlamaModel {
         let _ = used_gpu_norm;
         let mut logits_all = vec![0f32; m * vocab];
         matvec_tensor_batched_dispatch(lm_head, &final_norm_all, &mut logits_all, vocab, d, m);
+        self.finalize_logits(&mut logits_all);
         for (i, slot) in slots.iter_mut().enumerate() {
             slot.logits_out
                 .copy_from_slice(&logits_all[i * vocab..(i + 1) * vocab]);
@@ -9515,6 +9546,7 @@ impl LlamaModel {
             .as_ref()
             .unwrap_or(&self.weights.token_embd);
         matvec_tensor_dispatch(lm_head, &final_norm, logits_out, cfg.vocab_size, d);
+        self.finalize_logits(logits_out);
 
         // Return the scratch buffers to the TLS cell so the next
         // paged decode on this thread reuses the same heap storage
@@ -10029,6 +10061,7 @@ impl LlamaModel {
         let lm_head = self.weights.output.as_ref().unwrap_or(&self.weights.token_embd);
         let mut logits = vec![0.0f32; vocab];
         matvec_tensor_batched_dispatch(lm_head, &final_norm, &mut logits, vocab, d, 1);
+        self.finalize_logits(&mut logits);
         logits
     }
 
@@ -10442,6 +10475,7 @@ impl LlamaModel {
                     last_hidden, &self.weights.output_norm, &mut final_norm, cfg.rms_eps,
                 );
                 matvec_tensor_dispatch(lm_head, &final_norm, out, cfg.vocab_size, d);
+                self.finalize_logits(out);
             }
             LmHeadMode::All(out) => {
                 // Norm all `n_new` rows of hidden into a contiguous
@@ -10710,6 +10744,7 @@ impl LlamaModel {
             .unwrap_or(&self.weights.token_embd);
         let mut logits = vec![0f32; cfg.vocab_size];
         matvec_tensor_dispatch(lm_head, &final_norm, &mut logits, cfg.vocab_size, d);
+        self.finalize_logits(&mut logits);
         logits
     }
 
@@ -11063,6 +11098,7 @@ impl LlamaModel {
                     last_hidden, &self.weights.output_norm, &mut final_norm, cfg.rms_eps,
                 );
                 matvec_tensor_dispatch(lm_head, &final_norm, out, cfg.vocab_size, d);
+                self.finalize_logits(out);
             }
             LmHeadMode::All(out) => {
                 let mut final_norm_all = vec![0f32; n_new * d];
@@ -11408,6 +11444,7 @@ impl LlamaModel {
                     last_hidden, &self.weights.output_norm, &mut final_norm, cfg.rms_eps,
                 );
                 matvec_tensor_dispatch(lm_head, &final_norm, out, cfg.vocab_size, d);
+                self.finalize_logits(out);
             }
             LmHeadMode::All(out) => {
                 let mut final_norm_all = vec![0f32; n_new * d];
@@ -11756,6 +11793,7 @@ impl LlamaModel {
                     last_hidden, &self.weights.output_norm, &mut final_norm, cfg.rms_eps,
                 );
                 matvec_tensor_dispatch(lm_head, &final_norm, out, cfg.vocab_size, d);
+                self.finalize_logits(out);
             }
             LmHeadMode::All(out) => {
                 let mut final_norm_all = vec![0f32; n_new * d];
@@ -12100,6 +12138,7 @@ impl LlamaModel {
                     last_hidden, &self.weights.output_norm, &mut final_norm, cfg.rms_eps,
                 );
                 matvec_tensor_dispatch(lm_head, &final_norm, out, cfg.vocab_size, d);
+                self.finalize_logits(out);
             }
             LmHeadMode::All(out) => {
                 let mut final_norm_all = vec![0f32; n_new * d];
@@ -12467,6 +12506,7 @@ impl LlamaModel {
                     last_hidden, &self.weights.output_norm, &mut final_norm, cfg.rms_eps,
                 );
                 matvec_tensor_dispatch(lm_head, &final_norm, out, cfg.vocab_size, d);
+                self.finalize_logits(out);
             }
             LmHeadMode::All(out) => {
                 let mut final_norm_all = vec![0f32; n_new * d];
@@ -13731,6 +13771,34 @@ mod tests {
         assert!(!cfg.is_swa_layer(2)); // (3)%3=0 → global
         assert_eq!(cfg.swa_window(2), 0);
         assert!(!cfg.is_swa_layer(5)); // (6)%3=0 → global
+    }
+
+    /// `finalize_logits` is a no-op without metadata (byte-identical), applies
+    /// Cohere `logit_scale` as a multiply, and Gemma2 `final_logit_softcapping`
+    /// as `c·tanh(l/c)`.
+    #[test]
+    fn finalize_logits_scale_and_softcap() {
+        // No metadata → unchanged.
+        let model = synth_llama_model(&synth_cfg(1, 1, 4));
+        let orig = vec![1.0f32, -2.0, 3.0, 0.0];
+        let mut l = orig.clone();
+        model.finalize_logits(&mut l);
+        assert_eq!(l, orig, "no-op without scale/softcap");
+        // logit_scale multiplies.
+        let mut cfg = synth_cfg(1, 1, 4);
+        cfg.logit_scale = Some(2.0);
+        let model = synth_llama_model(&cfg);
+        let mut l = vec![1.0f32, -2.0, 3.0];
+        model.finalize_logits(&mut l);
+        assert_eq!(l, vec![2.0, -4.0, 6.0]);
+        // final softcap: c·tanh(l/c).
+        let mut cfg = synth_cfg(1, 1, 4);
+        cfg.final_logit_softcapping = Some(5.0);
+        let model = synth_llama_model(&cfg);
+        let mut l = vec![10.0f32, -10.0];
+        model.finalize_logits(&mut l);
+        let want0 = 5.0 * (10.0f32 / 5.0).tanh();
+        assert!((l[0] - want0).abs() < 1e-6 && (l[1] + want0).abs() < 1e-6);
     }
 
     // ---- CacheBlend ----
