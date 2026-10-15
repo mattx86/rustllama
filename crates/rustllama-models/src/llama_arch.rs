@@ -4047,6 +4047,17 @@ pub fn rope_tables_from_cfg(cfg: &LlamaConfig) -> (Vec<f32>, f32) {
     )
 }
 
+/// Tree-attention descriptor threaded into the batched F32 forward for
+/// speculative TREE verification (Feature 4). Borrowed views over the caller's
+/// per-node arrays; `depths[i]` = node `i`'s tree depth (its RoPE position is
+/// `start_pos + depths[i]`), `parent[i]` = tree-local parent index (negative =
+/// root level). See [`LlamaModel::forward_tree_verify_f32`].
+#[derive(Clone, Copy)]
+struct TreeAttn<'a> {
+    depths: &'a [u32],
+    parent: &'a [i32],
+}
+
 /// A CPU-backed weight range the Windows page-lock path may pin into
 /// the working set. `addr`/`len` describe the *backing buffer* (for
 /// `CpuOwnedSlice` this is the parent Arc, so dedup-by-`addr` locks a
@@ -9570,6 +9581,7 @@ impl LlamaModel {
         self.forward_prefill_batched_f32_inner(
             tokens, start_pos, kv,
             LmHeadMode::Last(&mut logits),
+            None,
         );
         logits
     }
@@ -9604,6 +9616,50 @@ impl LlamaModel {
         self.forward_prefill_batched_f32_inner(
             tokens, start_pos, kv,
             LmHeadMode::All(logits_out),
+            None,
+        );
+    }
+
+    /// Tree-structured speculative verification forward (F32 KV). Scores a draft
+    /// TREE in ONE batched forward: node `i`'s token is at cache slot
+    /// `start_pos + i`, RoPE'd at its DEPTH (`depths[i]`), and attends only the
+    /// committed prefix `[0, start_pos)` plus its own ancestor chain (via
+    /// [`rustllama_kernels_cpu::gqa_attention_tree_prefill`]). Writes per-node
+    /// logits into `logits_out` (`[nodes × vocab]`, row `i` = node `i`), which
+    /// [`crate::speculative`-style tree accept/reject] then walks.
+    ///
+    /// `parent[i]` is the tree-local parent index (negative = depth-1 / root
+    /// level), topologically ordered (`parent[i] < i`). A CHAIN-shaped tree
+    /// (`depths[i] == i`, `parent[i] == i-1`) reduces to
+    /// [`Self::forward_speculation_batched_f32`] (within attention-reduction
+    /// tolerance) — pinned by `forward_tree_verify_f32_chain_matches_speculation`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_tree_verify_f32(
+        &self,
+        tokens: &[i32],
+        start_pos: u32,
+        depths: &[u32],
+        parent: &[i32],
+        kv: &mut KvCache,
+        logits_out: &mut [f32],
+    ) {
+        let n_new = tokens.len();
+        assert_eq!(depths.len(), n_new, "tree verify: one depth per node");
+        assert_eq!(parent.len(), n_new, "tree verify: one parent per node");
+        assert_eq!(
+            logits_out.len(),
+            n_new * self.cfg.vocab_size,
+            "forward_tree_verify_f32: logits_out must be nodes * vocab_size"
+        );
+        if n_new == 0 {
+            return;
+        }
+        self.forward_prefill_batched_f32_inner(
+            tokens,
+            start_pos,
+            kv,
+            LmHeadMode::All(logits_out),
+            Some(TreeAttn { depths, parent }),
         );
     }
 
@@ -9986,12 +10042,20 @@ impl LlamaModel {
         crate::accel::usm_attn_kv_epoch_bump();
     }
 
+    /// Tree-attention descriptor for the speculative tree-verify path (the
+    /// `Some(..)` arm of [`Self::forward_prefill_batched_f32_inner`]). `depths[i]`
+    /// is tree node `i`'s depth — its RoPE position is `start_pos + depths[i]`
+    /// (siblings share a position); `parent[i]` is the tree-local parent index
+    /// (negative = depth-1 / root level) driving the ancestor attention mask.
+    /// `None` everywhere else ⇒ the ordinary sequential causal prefill, unchanged.
     fn forward_prefill_batched_f32_inner(
+
         &self,
         tokens: &[i32],
         start_pos: u32,
         kv: &mut KvCache,
         mode: LmHeadMode<'_>,
+        tree: Option<TreeAttn<'_>>,
     ) {
         let cfg = &self.cfg;
         let n_new = tokens.len();
@@ -10129,7 +10193,13 @@ impl LlamaModel {
                     head_dim,
                     cfg.rms_eps,
                 );
-                let pos_i = (kv_len_base + i) as u32;
+                // RoPE position: sequential for ordinary prefill; the tree
+                // node's DEPTH for tree verify (siblings share a position), so a
+                // chain tree (`depths[i] == i`) matches the sequential path.
+                let pos_i = match &tree {
+                    Some(t) => kv_len_base as u32 + t.depths[i],
+                    None => (kv_len_base + i) as u32,
+                };
                 // Same neox/half-split convention as forward_one; batched
                 // prefill stays on the CPU path (scaled table applied for
                 // rope-scaled models, byte-identical theta otherwise).
@@ -10154,26 +10224,32 @@ impl LlamaModel {
                             v[dst..dst + head_dim].copy_from_slice(src_v);
                         }
                     }
-                    // GPU prefill attention via SYCL — falls back
-                    // to the CPU path below if USM is disabled, the
-                    // GPU is unavailable, or any sanity check fails.
-                    // The hook is internally a one-shot copy in,
-                    // kernel, copy out — see `try_flash_attn_prefill_usm_f32`
-                    // for the layout contract.
-                    let used_gpu = crate::accel::try_flash_attn_prefill_gpu_f32(
-                        &q_buf,
-                        k,
-                        v,
-                        &mut attn_out,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        max_ctx,
-                        kv_len_base,
-                        n_new,
-                    );
-                    if !used_gpu {
-                        k::gqa_attention_flash_prefill(
+                    if let Some(t) = &tree {
+                        // Tree verify: each node attends only its ancestor chain
+                        // (+ the committed prefix). No GPU tree kernel yet, so
+                        // this stays on the CPU primitive; a chain tree reduces
+                        // bit-for-bit to the causal flash-prefill below.
+                        k::gqa_attention_tree_prefill(
+                            &q_buf,
+                            k,
+                            v,
+                            &mut attn_out,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            kv_len_base,
+                            n_new,
+                            t.parent,
+                        );
+                    } else {
+                        // GPU prefill attention via SYCL — falls back
+                        // to the CPU path below if USM is disabled, the
+                        // GPU is unavailable, or any sanity check fails.
+                        // The hook is internally a one-shot copy in,
+                        // kernel, copy out — see `try_flash_attn_prefill_usm_f32`
+                        // for the layout contract.
+                        let used_gpu = crate::accel::try_flash_attn_prefill_gpu_f32(
                             &q_buf,
                             k,
                             v,
@@ -10185,6 +10261,20 @@ impl LlamaModel {
                             kv_len_base,
                             n_new,
                         );
+                        if !used_gpu {
+                            k::gqa_attention_flash_prefill(
+                                &q_buf,
+                                k,
+                                v,
+                                &mut attn_out,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                max_ctx,
+                                kv_len_base,
+                                n_new,
+                            );
+                        }
                     }
                 }
                 _ => unreachable!("forward_prefill_batched_f32 entered with non-F32 KV"),
@@ -13472,6 +13562,56 @@ mod tests {
         let _ = max_diff;
         // KV state matches: same writes, same seq_len.
         assert_eq!(kv_ref.seq_len, kv_batched.seq_len);
+    }
+
+    /// Feature 4 degenerate-case guard: a CHAIN-shaped tree (`depths[i]==i`,
+    /// `parent[i]==i-1`) run through `forward_tree_verify_f32` must match the
+    /// linear `forward_speculation_batched_f32` — same per-node logits (within
+    /// the attention-reduction-order tolerance the linear-vs-serial test uses) —
+    /// at both `start_pos == 0` and past a committed prefix. Proves the tree
+    /// depth-RoPE + ancestor-mask forward reduces exactly to the pinned linear
+    /// verify, so only genuine branching diverges.
+    #[test]
+    fn forward_tree_verify_f32_chain_matches_speculation() {
+        let cfg = synth_cfg(2, 2, 8);
+        let model = synth_llama_model(&cfg);
+        let vocab = cfg.vocab_size;
+        let max_ctx = 16;
+
+        // Part A: no committed prefix.
+        let tokens: Vec<i32> = vec![5, 7, 2, 14, 3];
+        let mut kv_lin = KvCache::new(&cfg, max_ctx);
+        let mut lin_logits = vec![0f32; tokens.len() * vocab];
+        model.forward_speculation_batched_f32(&tokens, 0, &mut kv_lin, &mut lin_logits);
+
+        let mut kv_tree = KvCache::new(&cfg, max_ctx);
+        let mut tree_logits = vec![0f32; tokens.len() * vocab];
+        let depths: Vec<u32> = (0..tokens.len() as u32).collect();
+        let parent: Vec<i32> = (0..tokens.len() as i32).map(|i| i - 1).collect();
+        model.forward_tree_verify_f32(&tokens, 0, &depths, &parent, &mut kv_tree, &mut tree_logits);
+        for (i, (&a, &b)) in tree_logits.iter().zip(lin_logits.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-3, "tree-chain logit[{i}]: tree={a} lin={b}");
+        }
+        assert_eq!(kv_lin.seq_len, kv_tree.seq_len);
+
+        // Part B: past a committed 2-token prefix (exercises prefix attention +
+        // the `start_pos + depth` RoPE position).
+        let prefix = vec![9i32, 4];
+        let rest = vec![5i32, 7, 2];
+        let mut kv_lin2 = KvCache::new(&cfg, max_ctx);
+        let _ = model.forward_prefill_batched_f32(&prefix, 0, &mut kv_lin2);
+        let mut lin2 = vec![0f32; rest.len() * vocab];
+        model.forward_speculation_batched_f32(&rest, 2, &mut kv_lin2, &mut lin2);
+
+        let mut kv_tree2 = KvCache::new(&cfg, max_ctx);
+        let _ = model.forward_prefill_batched_f32(&prefix, 0, &mut kv_tree2);
+        let mut tree2 = vec![0f32; rest.len() * vocab];
+        let depths2: Vec<u32> = (0..rest.len() as u32).collect();
+        let parent2: Vec<i32> = (0..rest.len() as i32).map(|i| i - 1).collect();
+        model.forward_tree_verify_f32(&rest, 2, &depths2, &parent2, &mut kv_tree2, &mut tree2);
+        for (i, (&a, &b)) in tree2.iter().zip(lin2.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-3, "tree-chain(prefix) logit[{i}]: tree={a} lin={b}");
+        }
     }
 
     // ---- CacheBlend ----
