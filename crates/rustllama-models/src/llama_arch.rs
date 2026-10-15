@@ -6963,17 +6963,23 @@ impl LlamaModel {
                         match kv_layer {
                             KvLayer::F32 { k, v } => {
                                 sub_whiten = false;
-                                if !crate::accel::try_flash_attn_prefill_gpu_f32(
-                                    &hoist_qrows[..nb * d_q], k, v,
-                                    &mut hoist_attn_out[..nb * d_q],
-                                    n_heads, n_kv_heads, head_dim, max_ctx,
-                                    kv_len_base, nb,
-                                ) {
-                                    k::gqa_attention_flash_prefill(
+                                // SWA span for this layer (0 ⇒ full causal); the
+                                // GPU hook has no window arg so SWA uses the CPU
+                                // windowed kernel.
+                                let swa_win = self.cfg.swa_window(li);
+                                let used_gpu = swa_win == 0
+                                    && crate::accel::try_flash_attn_prefill_gpu_f32(
                                         &hoist_qrows[..nb * d_q], k, v,
                                         &mut hoist_attn_out[..nb * d_q],
                                         n_heads, n_kv_heads, head_dim, max_ctx,
                                         kv_len_base, nb,
+                                    );
+                                if !used_gpu {
+                                    k::gqa_attention_flash_prefill_windowed(
+                                        &hoist_qrows[..nb * d_q], k, v,
+                                        &mut hoist_attn_out[..nb * d_q],
+                                        n_heads, n_kv_heads, head_dim, max_ctx,
+                                        kv_len_base, nb, swa_win,
                                     );
                                 }
                             }
@@ -7951,8 +7957,11 @@ impl LlamaModel {
                     // settled before the recurrence becomes the bulk
                     // of the work.
                     let flash_min = flash_kv_len_min();
+                    // Sliding-window span for this layer (0 ⇒ full attention,
+                    // bit-identical to a non-SWA model).
+                    let swa_win = cfg.swa_window(layer_idx);
                     if crate::accel::flash_attention_enabled() && kv_len >= flash_min {
-                        k::gqa_attention_flash_decode(
+                        k::gqa_attention_flash_decode_windowed(
                             &q_buf,
                             k,
                             v,
@@ -7962,9 +7971,10 @@ impl LlamaModel {
                             head_dim,
                             max_ctx,
                             kv_len,
+                            swa_win,
                         );
                     } else {
-                        k::gqa_attention_one_step(
+                        k::gqa_attention_one_step_windowed(
                             &q_buf,
                             k,
                             v,
@@ -7974,6 +7984,7 @@ impl LlamaModel {
                             head_dim,
                             max_ctx,
                             kv_len,
+                            swa_win,
                         );
                     }
                     } // end `else` block for non-USM CPU attention
@@ -10279,26 +10290,18 @@ impl LlamaModel {
                             t.parent,
                         );
                     } else {
+                        // Sliding-window span for this layer (0 ⇒ full causal).
+                        // The GPU prefill hook has no window arg, so SWA layers
+                        // skip it and take the windowed CPU kernel.
+                        let swa_win = cfg.swa_window(layer_idx);
                         // GPU prefill attention via SYCL — falls back
                         // to the CPU path below if USM is disabled, the
                         // GPU is unavailable, or any sanity check fails.
                         // The hook is internally a one-shot copy in,
                         // kernel, copy out — see `try_flash_attn_prefill_usm_f32`
                         // for the layout contract.
-                        let used_gpu = crate::accel::try_flash_attn_prefill_gpu_f32(
-                            &q_buf,
-                            k,
-                            v,
-                            &mut attn_out,
-                            n_heads,
-                            n_kv_heads,
-                            head_dim,
-                            max_ctx,
-                            kv_len_base,
-                            n_new,
-                        );
-                        if !used_gpu {
-                            k::gqa_attention_flash_prefill(
+                        let used_gpu = swa_win == 0
+                            && crate::accel::try_flash_attn_prefill_gpu_f32(
                                 &q_buf,
                                 k,
                                 v,
@@ -10309,6 +10312,20 @@ impl LlamaModel {
                                 max_ctx,
                                 kv_len_base,
                                 n_new,
+                            );
+                        if !used_gpu {
+                            k::gqa_attention_flash_prefill_windowed(
+                                &q_buf,
+                                k,
+                                v,
+                                &mut attn_out,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                max_ctx,
+                                kv_len_base,
+                                n_new,
+                                swa_win,
                             );
                         }
                     }
@@ -13692,6 +13709,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// SWA per-layer selection: no window off SWA; all layers windowed with no
+    /// pattern (Mistral); every `p`-th layer global with a pattern (Gemma2).
+    #[test]
+    fn swa_is_swa_layer_and_window() {
+        let mut cfg = synth_cfg(6, 2, 8);
+        assert!(!cfg.is_swa_layer(0));
+        assert_eq!(cfg.swa_window(0), 0);
+        // All-SWA (no pattern → Mistral-style).
+        cfg.sliding_window = Some(128);
+        for i in 0..6 {
+            assert!(cfg.is_swa_layer(i), "all-SWA layer {i}");
+            assert_eq!(cfg.swa_window(i), 128);
+        }
+        // Gemma2-style: every 3rd layer ((idx+1)%3==0) is a GLOBAL layer.
+        cfg.sliding_window_pattern = Some(3);
+        assert!(cfg.is_swa_layer(0)); // (1)%3=1 → SWA
+        assert!(cfg.is_swa_layer(1)); // (2)%3=2 → SWA
+        assert!(!cfg.is_swa_layer(2)); // (3)%3=0 → global
+        assert_eq!(cfg.swa_window(2), 0);
+        assert!(!cfg.is_swa_layer(5)); // (6)%3=0 → global
     }
 
     // ---- CacheBlend ----

@@ -1264,11 +1264,32 @@ impl CpuEngine {
         } else {
             kv_dtype
         };
+        // Sliding-window attention windows only the F32 contiguous attention
+        // kernels today (the quant-KV + paged + GPU paths carry no window arg),
+        // so an SWA model is coerced to f32 contiguous KV for masking
+        // correctness. Non-SWA models (the common case) are untouched.
+        let kv_dtype = if model.cfg.sliding_window.is_some() && kv_dtype != KvDtype::F32 {
+            tracing::warn!(
+                requested = ?kv_dtype,
+                "sliding-window model: defaulting KV cache to f32 (the windowed \
+                 attention kernels are f32-only)"
+            );
+            KvDtype::F32
+        } else {
+            kv_dtype
+        };
         let kv_layout: &str = if model.weights.is_hybrid() && kv_layout != "contiguous" {
             tracing::warn!(
                 requested = %kv_layout,
                 "hybrid model: paged KV layouts are not supported by the \
                  hybrid path — coercing to contiguous for this load"
+            );
+            "contiguous"
+        } else if model.cfg.sliding_window.is_some() && kv_layout != "contiguous" {
+            tracing::warn!(
+                requested = %kv_layout,
+                "sliding-window model: coercing to contiguous KV (paged SWA \
+                 masking is not yet wired)"
             );
             "contiguous"
         } else {

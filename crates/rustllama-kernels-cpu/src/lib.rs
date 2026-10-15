@@ -13524,7 +13524,38 @@ pub fn gqa_attention_one_step(
     }
     #[cfg(not(target_arch = "aarch64"))]
     gqa_attention_one_step_scalar(
-        q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0,
+    );
+}
+
+/// Sliding-window variant of [`gqa_attention_one_step`]: the decode query
+/// attends only cached positions `[kv_len-window, kv_len)`. `window == 0` (no
+/// SWA) or `window >= kv_len` (nothing trimmed) delegates to the full-attention
+/// dispatcher above (SIMD), so SWA-off callers are bit-identical; a trimming
+/// window runs the windowed scalar path (no windowed SIMD twin — SWA layers are
+/// a minority, correctness-first).
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_one_step_windowed(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len: usize,
+    window: usize,
+) {
+    let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+    if start == 0 {
+        gqa_attention_one_step(
+            q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        );
+        return;
+    }
+    gqa_attention_one_step_scalar(
+        q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, start,
     );
 }
 
@@ -13615,31 +13646,38 @@ pub(crate) fn gqa_attention_one_step_scalar(
     head_dim: usize,
     max_ctx: usize,
     kv_len: usize,
+    start: usize,
 ) {
+    // Sliding-window lower bound: the query attends only cached positions
+    // `[start, kv_len)`. `start == 0` is full attention (bit-identical to the
+    // pre-SWA kernel). The window only trims the attended range; K/V values are
+    // unchanged (they're per-token projections).
+    let start = start.min(kv_len);
+    let win = kv_len - start;
     let n_gqa = n_heads / n_kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut scores = vec![0.0f32; kv_len];
+    let mut scores = vec![0.0f32; win];
     for h in 0..n_heads {
         let kv_h = h / n_gqa;
         let q_h = &q[h * head_dim..(h + 1) * head_dim];
-        for t in 0..kv_len {
+        for (i, t) in (start..kv_len).enumerate() {
             let k_off = (kv_h * max_ctx + t) * head_dim;
             let k_row = &k_cache[k_off..k_off + head_dim];
             let mut acc = 0.0f32;
             for d in 0..head_dim {
                 acc += q_h[d] * k_row[d];
             }
-            scores[t] = acc * scale;
+            scores[i] = acc * scale;
         }
         softmax_f32_inplace(&mut scores);
         let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
         for v in out_h.iter_mut() {
             *v = 0.0;
         }
-        for t in 0..kv_len {
+        for (i, t) in (start..kv_len).enumerate() {
             let v_off = (kv_h * max_ctx + t) * head_dim;
             let v_row = &v_cache[v_off..v_off + head_dim];
-            let s = scores[t];
+            let s = scores[i];
             for d in 0..head_dim {
                 out_h[d] += s * v_row[d];
             }
@@ -13788,7 +13826,36 @@ pub fn gqa_attention_flash_decode(
     }
     #[cfg(not(target_arch = "aarch64"))]
     gqa_attention_flash_decode_scalar(
-        q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0,
+    );
+}
+
+/// Sliding-window variant of [`gqa_attention_flash_decode`] — attends only
+/// `[kv_len-window, kv_len)`. `window == 0` / `>= kv_len` delegates to the
+/// full-attention dispatcher (SIMD, bit-identical); a trimming window runs the
+/// windowed scalar online-softmax.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_flash_decode_windowed(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len: usize,
+    window: usize,
+) {
+    let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+    if start == 0 {
+        gqa_attention_flash_decode(
+            q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        );
+        return;
+    }
+    gqa_attention_flash_decode_scalar(
+        q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, start,
     );
 }
 
@@ -13867,7 +13934,37 @@ pub fn gqa_attention_flash_prefill(
     }
     gqa_attention_flash_prefill_scalar(
         q, k_cache, v_cache, out, n_heads, n_kv_heads,
-        head_dim, max_ctx, kv_len_base, n_new,
+        head_dim, max_ctx, kv_len_base, n_new, 0,
+    );
+}
+
+/// Sliding-window variant of [`gqa_attention_flash_prefill`]: a query at abs pos
+/// `P` attends keys in `[P-window+1, P]` instead of the full causal `[0, P]`.
+/// `window == 0` delegates to the full-causal dispatcher (SIMD, bit-identical);
+/// non-zero runs the windowed scalar (no windowed SIMD twin).
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_flash_prefill_windowed(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+    window: usize,
+) {
+    if window == 0 {
+        gqa_attention_flash_prefill(
+            q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        );
+        return;
+    }
+    gqa_attention_flash_prefill_scalar(
+        q, k_cache, v_cache, out, n_heads, n_kv_heads,
+        head_dim, max_ctx, kv_len_base, n_new, window,
     );
 }
 
@@ -13883,6 +13980,7 @@ fn gqa_attention_flash_prefill_scalar(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    window: usize,
 ) {
     debug_assert_eq!(q.len(), n_new * n_heads * head_dim);
     debug_assert_eq!(out.len(), n_new * n_heads * head_dim);
@@ -13933,7 +14031,22 @@ fn gqa_attention_flash_prefill_scalar(
                 // `t < kv_len_base` that's all queries; for
                 // `t >= kv_len_base` it's `[t - kv_len_base, n_new)`.
                 let q_pos_min = t.saturating_sub(kv_len_base);
-                for q_pos in q_pos_min..n_new {
+                // Sliding-window upper bound: a query at abs pos
+                // `P = kv_len_base + q_pos` attends `t` only when
+                // `t >= P - window + 1`, i.e. `q_pos <= t - kv_len_base +
+                // window - 1`. `window == 0` ⇒ no upper bound (`n_new - 1`), so
+                // the admitted range is the unchanged causal `q_pos_min..n_new`.
+                // Signed since `t` may be in the committed prefix.
+                let q_pos_hi = if window > 0 {
+                    let hi = t as isize - kv_len_base as isize + window as isize - 1;
+                    if hi < q_pos_min as isize {
+                        continue; // no query attends this key under the window
+                    }
+                    (hi as usize).min(n_new - 1)
+                } else {
+                    n_new - 1
+                };
+                for q_pos in q_pos_min..=q_pos_hi {
                     let q_off = (q_pos * n_heads + h) * head_dim;
                     let q_row = &q[q_off..q_off + head_dim];
                     let mut s = 0f32;
@@ -14362,7 +14475,11 @@ pub(crate) fn gqa_attention_flash_decode_scalar(
     head_dim: usize,
     max_ctx: usize,
     kv_len: usize,
+    start: usize,
 ) {
+    // Sliding-window lower bound: attend only `[start, kv_len)`. `start == 0` is
+    // full attention, bit-identical to the pre-SWA kernel.
+    let start = start.min(kv_len);
     let n_gqa = n_heads / n_kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
     for h in 0..n_heads {
@@ -14379,7 +14496,7 @@ pub(crate) fn gqa_attention_flash_decode_scalar(
         // Initialize m at -inf so the first iteration sets it.
         let mut m = f32::NEG_INFINITY;
         let mut l = 0.0f32;
-        for t in 0..kv_len {
+        for t in start..kv_len {
             let k_off = (kv_h * max_ctx + t) * head_dim;
             let k_row = &k_cache[k_off..k_off + head_dim];
             // score = scale * (q · k_row)
@@ -18994,6 +19111,7 @@ mod tests {
             head_dim,
             max_ctx,
             kv_len,
+            0,
         );
         // SAFETY: feature-detected above.
         unsafe {
@@ -19037,7 +19155,7 @@ mod tests {
         let mut out_tree = vec![0f32; n_new * n_heads * head_dim];
         gqa_attention_flash_prefill_scalar(
             &q, &k_cache, &v_cache, &mut out_causal, n_heads, n_kv_heads, head_dim,
-            max_ctx, kv_len_base, n_new,
+            max_ctx, kv_len_base, n_new, 0,
         );
         let chain: Vec<i32> = (0..n_new as i32).map(|i| i - 1).collect(); // parent[0] = -1
         gqa_attention_tree_prefill(
@@ -19121,6 +19239,137 @@ mod tests {
         let n2 = 2 * n_heads * head_dim;
         let changed = (0..n_heads * head_dim).any(|i| out_a[n2 + i] != out_b[n2 + i]);
         assert!(changed, "node 2 must reflect its own changed V");
+    }
+
+    // ---- sliding-window attention (SWA) ----
+
+    /// `window == 0` and `window >= kv_len` must be BIT-identical to the full
+    /// (unwindowed) decode — the compiler-free SWA parity guard.
+    #[test]
+    fn swa_decode_window_zero_or_full_matches_unwindowed() {
+        let n_heads = 2usize;
+        let n_kv_heads = 2usize;
+        let head_dim = 6usize;
+        let max_ctx = 16usize;
+        let kv_len = 9usize;
+        let mut s = 0x5A5Au32;
+        let q: Vec<f32> = (0..n_heads * head_dim).map(|_| lcg(&mut s)).collect();
+        let k: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let v: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let mut full = vec![0f32; n_heads * head_dim];
+        gqa_attention_one_step(&q, &k, &v, &mut full, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
+        let fb: Vec<u32> = full.iter().map(|x| x.to_bits()).collect();
+        for &window in &[0usize, kv_len, kv_len + 5] {
+            let mut w = vec![0f32; n_heads * head_dim];
+            gqa_attention_one_step_windowed(
+                &q, &k, &v, &mut w, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window,
+            );
+            let wb: Vec<u32> = w.iter().map(|x| x.to_bits()).collect();
+            assert_eq!(fb, wb, "window {window} (0 or >= kv_len) must equal full decode");
+        }
+    }
+
+    /// A trimming window masks out positions before `[kv_len-window, kv_len)`:
+    /// the output is invariant to perturbing the excluded K/V.
+    #[test]
+    fn swa_decode_ignores_positions_before_window() {
+        let n_heads = 2usize;
+        let n_kv_heads = 1usize;
+        let head_dim = 4usize;
+        let max_ctx = 8usize;
+        let kv_len = 6usize;
+        let window = 2usize;
+        let start = kv_len - window; // 4 → attend only [4,6)
+        let mut s = 0x1234u32;
+        let q: Vec<f32> = (0..n_heads * head_dim).map(|_| lcg(&mut s)).collect();
+        let mut k: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let mut v: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let mut out_a = vec![0f32; n_heads * head_dim];
+        gqa_attention_one_step_windowed(
+            &q, &k, &v, &mut out_a, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window,
+        );
+        // Also flash-decode agrees with one-step under the window.
+        let mut out_fd = vec![0f32; n_heads * head_dim];
+        gqa_attention_flash_decode_windowed(
+            &q, &k, &v, &mut out_fd, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window,
+        );
+        for i in 0..n_heads * head_dim {
+            assert!((out_a[i] - out_fd[i]).abs() < 1e-5, "one_step vs flash_decode SWA at {i}");
+        }
+        // Perturb the EXCLUDED positions [0, start); windowed output must not move.
+        for h in 0..n_kv_heads {
+            for t in 0..start {
+                for d in 0..head_dim {
+                    k[(h * max_ctx + t) * head_dim + d] += 9.0;
+                    v[(h * max_ctx + t) * head_dim + d] -= 5.0;
+                }
+            }
+        }
+        let mut out_b = vec![0f32; n_heads * head_dim];
+        gqa_attention_one_step_windowed(
+            &q, &k, &v, &mut out_b, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window,
+        );
+        let ab: Vec<u32> = out_a.iter().map(|x| x.to_bits()).collect();
+        let bb: Vec<u32> = out_b.iter().map(|x| x.to_bits()).collect();
+        assert_eq!(ab, bb, "SWA decode must ignore K/V before the window");
+    }
+
+    /// Prefill: a window `>= kv_len_total` is full causal — bit-identical to the
+    /// scalar flash-prefill — and a small window masks far-back keys (a late
+    /// query is invariant to perturbing positions outside its window).
+    #[test]
+    fn swa_prefill_large_window_full_small_window_masks() {
+        let n_heads = 2usize;
+        let n_kv_heads = 1usize;
+        let head_dim = 8usize;
+        let max_ctx = 16usize;
+        let kv_len_base = 2usize;
+        let n_new = 5usize;
+        let mut s = 0x9E37u32;
+        let q: Vec<f32> = (0..n_new * n_heads * head_dim).map(|_| lcg(&mut s)).collect();
+        let mut k: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let mut v: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        // Large window ≡ full causal (bit-exact vs the scalar reference).
+        let mut full = vec![0f32; n_new * n_heads * head_dim];
+        gqa_attention_flash_prefill_scalar(
+            &q, &k, &v, &mut full, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, 0,
+        );
+        let mut big = vec![0f32; n_new * n_heads * head_dim];
+        gqa_attention_flash_prefill_windowed(
+            &q, &k, &v, &mut big, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, max_ctx,
+        );
+        let fb: Vec<u32> = full.iter().map(|x| x.to_bits()).collect();
+        let bb: Vec<u32> = big.iter().map(|x| x.to_bits()).collect();
+        assert_eq!(fb, bb, "window >= ctx must equal full causal prefill");
+        // Small window: the LAST query (abs pos kv_len_base+n_new-1) attends only
+        // the last `window` keys; perturbing earlier keys must not move its row.
+        let window = 2usize;
+        let mut out_a = vec![0f32; n_new * n_heads * head_dim];
+        gqa_attention_flash_prefill_windowed(
+            &q, &k, &v, &mut out_a, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window,
+        );
+        // Last query P = kv_len_base + (n_new-1); its window is [P-1, P]. Perturb
+        // the committed prefix (positions 0..kv_len_base), which it can't see.
+        for h in 0..n_kv_heads {
+            for t in 0..kv_len_base {
+                for d in 0..head_dim {
+                    k[(h * max_ctx + t) * head_dim + d] += 3.0;
+                    v[(h * max_ctx + t) * head_dim + d] += 3.0;
+                }
+            }
+        }
+        let mut out_b = vec![0f32; n_new * n_heads * head_dim];
+        gqa_attention_flash_prefill_windowed(
+            &q, &k, &v, &mut out_b, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window,
+        );
+        let last = (n_new - 1) * n_heads * head_dim;
+        for i in 0..n_heads * head_dim {
+            assert_eq!(
+                out_a[last + i].to_bits(),
+                out_b[last + i].to_bits(),
+                "last query must ignore keys outside its window"
+            );
+        }
     }
 
     #[test]
@@ -20723,7 +20972,7 @@ mod tests {
             let mut os = vec![0f32; n_heads * head_dim];
             let mut on = vec![0f32; n_heads * head_dim];
             gqa_attention_one_step_scalar(
-                &q, &k, &v, &mut os, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                &q, &k, &v, &mut os, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0,
             );
             unsafe {
                 gqa_attention_one_step_neon(
@@ -20747,7 +20996,7 @@ mod tests {
             let mut os = vec![0f32; n_heads * head_dim];
             let mut on = vec![0f32; n_heads * head_dim];
             gqa_attention_flash_decode_scalar(
-                &q, &k, &v, &mut os, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                &q, &k, &v, &mut os, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0,
             );
             unsafe {
                 gqa_attention_flash_decode_neon(

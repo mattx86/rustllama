@@ -91,8 +91,43 @@ pub struct LlamaConfig {
     /// Sliding-window attention span (`{arch}.attention.sliding_window`),
     /// Mistral / Gemma2 / gpt-oss. When `Some(w)`, SWA layers attend only the
     /// last `w` tokens — a KV-memory + speed win and a masking-correctness fix.
-    /// Parsed here; the forward masking + bounded-KV path is a follow-up.
+    /// Applied in the forward via the windowed attention kernels; see
+    /// [`Self::swa_window`].
     pub sliding_window: Option<u32>,
+    /// Sliding-window LAYER pattern (`{arch}.attention.sliding_window_pattern`).
+    /// `None` ⇒ every layer is SWA (Mistral-style, all-SWA). `Some(p)` ⇒ the
+    /// Gemma2/gpt-oss alternation where one global (full-attention) layer recurs
+    /// every `p` layers; the rest are SWA. See [`Self::is_swa_layer`].
+    pub sliding_window_pattern: Option<u32>,
+}
+
+impl LlamaConfig {
+    /// Whether layer `idx` uses sliding-window attention. `false` when the model
+    /// declares no `sliding_window`. All layers when there's no pattern
+    /// (Mistral). With a pattern `p` (Gemma2/gpt-oss), every `p`-th layer is a
+    /// GLOBAL (full-attention) layer and the rest are SWA — the common
+    /// convention `(idx + 1) % p == 0 ⇒ global`.
+    pub fn is_swa_layer(&self, idx: usize) -> bool {
+        if self.sliding_window.is_none() {
+            return false;
+        }
+        match self.sliding_window_pattern {
+            None => true,
+            Some(0) | Some(1) => true,
+            Some(p) => ((idx as u32) + 1) % p != 0,
+        }
+    }
+
+    /// The attention window to pass the windowed kernels for layer `idx`: the
+    /// `sliding_window` span on an SWA layer, else `0` (no window ⇒ the full-
+    /// attention kernel path, bit-identical to a non-SWA model).
+    pub fn swa_window(&self, idx: usize) -> usize {
+        if self.is_swa_layer(idx) {
+            self.sliding_window.map(|w| w as usize).unwrap_or(0)
+        } else {
+            0
+        }
+    }
 }
 
 /// RoPE context-extension scaling parameters (`{arch}.rope.scaling.*`).
@@ -394,6 +429,9 @@ impl LlamaConfig {
         // Sliding-window attention span (Mistral/Gemma2/gpt-oss). `0` ⇒ none.
         let sliding_window =
             u32_optional(gguf, &key("attention.sliding_window")).filter(|&w| w > 0);
+        // Layer alternation pattern (Gemma2/gpt-oss); absent ⇒ all-SWA (Mistral).
+        let sliding_window_pattern =
+            u32_optional(gguf, &key("attention.sliding_window_pattern")).filter(|&p| p > 0);
 
         let cfg = Self {
             arch,
@@ -422,6 +460,7 @@ impl LlamaConfig {
             embedding_scale,
             attention_scale,
             sliding_window,
+            sliding_window_pattern,
         };
         // Diagnostic: print key config values at load time so hybrid
         // model bugs can be quickly localized to a wrong-loaded constant.
