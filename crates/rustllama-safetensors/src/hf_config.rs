@@ -213,6 +213,7 @@ pub fn parse_hf_config(json: &str) -> Result<LlamaConfig, HfConfigError> {
         moe, // MoE now parsed from HF config (MLX MoE load path)
         hybrid: None, // HF configs don't yet carry SSM keys for our hybrid path
         hadamard: None, // Prism rotation metadata is GGUF-only
+        ..Default::default() // rope_scaling / softcapping / scaling-factors: HF-parse is a follow-up
     })
 }
 

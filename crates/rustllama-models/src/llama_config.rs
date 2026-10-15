@@ -7,7 +7,7 @@
 
 use rustllama_gguf::{Gguf, MetadataValue};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LlamaConfig {
     pub arch: String,
     pub n_layers: usize,
@@ -63,6 +63,71 @@ pub struct LlamaConfig {
     /// weight-load time — a model with this metadata refuses to run
     /// on a forward path that hasn't wired the transform).
     pub hadamard: Option<HadamardConfig>,
+    /// RoPE context-extension scaling (`{arch}.rope.scaling.*`). `None` =
+    /// no scaling (the common case) → positions use the baked `rope_theta`.
+    /// `Some` for models that ship a scaling scheme (Qwen2.5-128k YaRN,
+    /// Llama-3.1, CodeLlama linear, Phi-3-128k longrope): the loader builds
+    /// a scaled inverse-frequency table so inference past
+    /// `rope.scaling.original_context_length` stays coherent instead of
+    /// degrading. See [`RopeScaling`].
+    pub rope_scaling: Option<RopeScaling>,
+    /// Gemma2 attention-score logit soft-cap (`{arch}.attn_logit_softcapping`).
+    /// When `Some(c)`, each attention score is `c * tanh(score / c)` before
+    /// softmax. Gemma2 output is numerically wrong without it. `None` on
+    /// every other model → no capping.
+    pub attn_logit_softcapping: Option<f32>,
+    /// Gemma2 final-logit soft-cap (`{arch}.final_logit_softcapping`). When
+    /// `Some(c)`, LM-head logits are `c * tanh(logits / c)` before sampling.
+    pub final_logit_softcapping: Option<f32>,
+    /// Final-logit multiplier (`{arch}.logit_scale`), Cohere Command-R/R+.
+    /// When `Some(s)`, LM-head logits are multiplied by `s`. `None` = 1.0.
+    pub logit_scale: Option<f32>,
+    /// Token-embedding multiplier (`{arch}.embedding_scale`), Gemma
+    /// (`√d_model`). When `Some(s)`, the embedding lookup is scaled by `s`.
+    pub embedding_scale: Option<f32>,
+    /// Attention-score scale override (`{arch}.attention.scale`). When `Some`,
+    /// replaces the default `1/√head_dim` QK scale (some Gemma/OLMo variants).
+    pub attention_scale: Option<f32>,
+    /// Sliding-window attention span (`{arch}.attention.sliding_window`),
+    /// Mistral / Gemma2 / gpt-oss. When `Some(w)`, SWA layers attend only the
+    /// last `w` tokens — a KV-memory + speed win and a masking-correctness fix.
+    /// Parsed here; the forward masking + bounded-KV path is a follow-up.
+    pub sliding_window: Option<u32>,
+}
+
+/// RoPE context-extension scaling parameters (`{arch}.rope.scaling.*`).
+#[derive(Debug, Clone)]
+pub struct RopeScaling {
+    pub kind: RopeScalingKind,
+    /// `rope.scaling.factor` — the context-extension factor (new_ctx / orig_ctx).
+    pub factor: f32,
+    /// `rope.scaling.original_context_length` — the ctx the model was trained at
+    /// before extension (0 ⇒ fall back to `ctx_train`).
+    pub orig_ctx: u32,
+    /// `rope.scaling.attn_factor` — YaRN attention-temperature `mscale` input
+    /// (default 1.0).
+    pub attn_factor: f32,
+    /// `rope.scaling.beta_fast` / `beta_slow` — YaRN interpolation ramp bounds
+    /// (defaults 32.0 / 1.0).
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+}
+
+/// Which RoPE scaling scheme a model declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RopeScalingKind {
+    #[default]
+    None,
+    /// Position-interpolation: inv-freqs divided by `factor` (CodeLlama).
+    Linear,
+    /// NTK-aware: base `theta` rescaled by `factor^(d/(d-2))` (dynamic variants
+    /// recompute per current length past `orig_ctx`).
+    Ntk,
+    /// YaRN: per-dimension interpolation/extrapolation ramp (beta_fast/slow) +
+    /// an attention `mscale` (Qwen2.5-128k, Llama-3.1-style).
+    Yarn,
+    /// Phi-3 LongRoPE (per-dim short/long factor arrays).
+    LongRope,
 }
 
 #[derive(Debug, Clone)]
@@ -316,6 +381,20 @@ impl LlamaConfig {
 
         let hadamard = parse_hadamard(gguf)?;
 
+        // RoPE context-extension scaling (`{arch}.rope.scaling.*`). Absent on
+        // most models → `None` (positions use the baked `rope_theta`).
+        let rope_scaling = parse_rope_scaling(gguf, &arch);
+        // Gemma2 logit soft-capping + per-family scaling factors. Each is
+        // `None` on models that don't declare it → no behavior change.
+        let attn_logit_softcapping = f32_optional(gguf, &key("attn_logit_softcapping"));
+        let final_logit_softcapping = f32_optional(gguf, &key("final_logit_softcapping"));
+        let logit_scale = f32_optional(gguf, &key("logit_scale"));
+        let embedding_scale = f32_optional(gguf, &key("embedding_scale"));
+        let attention_scale = f32_optional(gguf, &key("attention.scale"));
+        // Sliding-window attention span (Mistral/Gemma2/gpt-oss). `0` ⇒ none.
+        let sliding_window =
+            u32_optional(gguf, &key("attention.sliding_window")).filter(|&w| w > 0);
+
         let cfg = Self {
             arch,
             n_layers,
@@ -336,6 +415,13 @@ impl LlamaConfig {
             moe,
             hybrid,
             hadamard,
+            rope_scaling,
+            attn_logit_softcapping,
+            final_logit_softcapping,
+            logit_scale,
+            embedding_scale,
+            attention_scale,
+            sliding_window,
         };
         // Diagnostic: print key config values at load time so hybrid
         // model bugs can be quickly localized to a wrong-loaded constant.
@@ -582,4 +668,33 @@ fn f32_optional(gguf: &Gguf, key: &str) -> Option<f32> {
         MetadataValue::F64(v) => Some(*v as f32),
         _ => None,
     }
+}
+
+fn str_optional(gguf: &Gguf, key: &str) -> Option<String> {
+    match gguf.metadata_get(key)? {
+        MetadataValue::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Parse `{arch}.rope.scaling.*` into a [`RopeScaling`], or `None` when the
+/// model declares no scaling scheme (`type` absent / `"none"` / unknown).
+fn parse_rope_scaling(gguf: &Gguf, arch: &str) -> Option<RopeScaling> {
+    let key = |s: &str| format!("{arch}.{s}");
+    let kind = match str_optional(gguf, &key("rope.scaling.type"))?.as_str() {
+        "linear" => RopeScalingKind::Linear,
+        "yarn" => RopeScalingKind::Yarn,
+        "longrope" => RopeScalingKind::LongRope,
+        // llama.cpp emits "none" for unscaled; "dynamic"/"ntk" for NTK-aware.
+        "dynamic" | "ntk" => RopeScalingKind::Ntk,
+        _ => return None,
+    };
+    Some(RopeScaling {
+        kind,
+        factor: f32_optional(gguf, &key("rope.scaling.factor")).unwrap_or(1.0),
+        orig_ctx: u32_optional(gguf, &key("rope.scaling.original_context_length")).unwrap_or(0),
+        attn_factor: f32_optional(gguf, &key("rope.scaling.attn_factor")).unwrap_or(1.0),
+        beta_fast: f32_optional(gguf, &key("rope.scaling.beta_fast")).unwrap_or(32.0),
+        beta_slow: f32_optional(gguf, &key("rope.scaling.beta_slow")).unwrap_or(1.0),
+    })
 }

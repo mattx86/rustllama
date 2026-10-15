@@ -270,9 +270,9 @@ pub fn build_llama_model_from_safetensors(
         });
     }
 
-    Ok(LlamaModel {
-        cfg: cfg.clone(),
-        weights: LlamaWeights {
+    Ok(LlamaModel::from_parts(
+        cfg.clone(),
+        LlamaWeights {
             token_embd,
             blocks,
             moe_blocks: None,
@@ -283,7 +283,7 @@ pub fn build_llama_model_from_safetensors(
             nextn_head: None,
             hadamard: None,
         },
-    })
+    ))
 }
 
 /// Assemble a MoE [`LlamaModel`] from the converted-tensor list.
@@ -505,9 +505,9 @@ fn build_moe_model_from_safetensors(
         });
     }
 
-    Ok(LlamaModel {
-        cfg: cfg.clone(),
-        weights: LlamaWeights {
+    Ok(LlamaModel::from_parts(
+        cfg.clone(),
+        LlamaWeights {
             token_embd,
             blocks: Vec::new(),
             moe_blocks: Some(mbs),
@@ -518,7 +518,7 @@ fn build_moe_model_from_safetensors(
             nextn_head: None,
             hadamard: None,
         },
-    })
+    ))
 }
 
 /// Take a required MoE tensor by GGUF name with no shape check — used

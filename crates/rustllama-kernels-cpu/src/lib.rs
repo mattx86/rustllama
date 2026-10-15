@@ -12384,6 +12384,52 @@ pub fn rope_inplace_neox(x: &mut [f32], n_heads: usize, head_dim: usize, pos: u3
         &heap_cs[..]
     };
 
+    rope_apply_cs(x, n_heads, head_dim, half, cs);
+}
+
+/// RoPE (NeoX half-split) with a PRECOMPUTED inverse-frequency table — one entry
+/// per dim-pair (`inv_freq.len() == head_dim/2`). This is the context-extension
+/// scaling path: the loader builds the table once via
+/// `accel::rope_inv_freq_table_scaled` (linear / NTK / YaRN) and feeds it here,
+/// so every token's rotation uses the scaled frequencies instead of the baked
+/// `theta`. `rope_inplace_neox` is the equivalent scalar-`theta` wrapper (it
+/// builds the same table from `theta` inline).
+pub fn rope_inplace_neox_invfreq(
+    x: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    pos: u32,
+    inv_freq: &[f32],
+) {
+    debug_assert_eq!(x.len(), n_heads * head_dim);
+    debug_assert_eq!(head_dim % 2, 0);
+    let half = head_dim / 2;
+    debug_assert_eq!(inv_freq.len(), half);
+    const STACK_MAX_HALF: usize = 128;
+    let mut stack_cs = [0.0f32; 2 * STACK_MAX_HALF];
+    let heap_cs: Vec<f32>;
+    let cs: &[f32] = if half <= STACK_MAX_HALF {
+        for i in 0..half {
+            let p = pos as f32 * inv_freq[i];
+            stack_cs[2 * i] = p.cos();
+            stack_cs[2 * i + 1] = p.sin();
+        }
+        &stack_cs[..2 * half]
+    } else {
+        heap_cs = (0..half)
+            .flat_map(|i| {
+                let p = pos as f32 * inv_freq[i];
+                [p.cos(), p.sin()]
+            })
+            .collect();
+        &heap_cs[..]
+    };
+    rope_apply_cs(x, n_heads, head_dim, half, cs);
+}
+
+/// Shared cos/sin → rotate dispatch for the NeoX RoPE variants (AVX2 → NEON →
+/// scalar). `cs` is the interleaved `[cos0,sin0,cos1,sin1,…]` slab.
+fn rope_apply_cs(x: &mut [f32], n_heads: usize, head_dim: usize, half: usize, cs: &[f32]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -20257,6 +20303,38 @@ mod tests {
                     (av - bv).abs() < 1e-4,
                     "rope SIMD parity at ({n_heads},{head_dim}) idx={i}: \
                      simd={av} scalar={bv}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rope_invfreq_table_matches_scalar_theta_bit_for_bit() {
+        // The context-extension RoPE path (`rope_inplace_neox_invfreq`) must be
+        // BYTE-identical to the baked-theta `rope_inplace_neox` when fed the
+        // table the base theta produces — this is what lets a rope-scaled model
+        // at the unscaled frequencies (and every non-scaled model routed through
+        // the shared `rope_inplace` helper) reproduce the old output exactly.
+        for &(n_heads, head_dim) in
+            &[(1usize, 64usize), (4, 64), (8, 128), (32, 128), (1, 32), (2, 256)]
+        {
+            let theta = 10000.0f32;
+            let half = head_dim / 2;
+            // Build the table exactly as `accel::rope_inv_freq_table` does.
+            let inv_freq: Vec<f32> = (0..half)
+                .map(|j| 1.0f32 / theta.powf((2 * j) as f32 / head_dim as f32))
+                .collect();
+            for &pos in &[0u32, 1, 17, 4096] {
+                let x = rand_vec(n_heads * head_dim, (n_heads * head_dim) as u32 + pos);
+                let mut a = x.clone();
+                let mut b = x.clone();
+                rope_inplace_neox(&mut a, n_heads, head_dim, pos, theta);
+                rope_inplace_neox_invfreq(&mut b, n_heads, head_dim, pos, &inv_freq);
+                let ab: Vec<u32> = a.iter().map(|v| v.to_bits()).collect();
+                let bb: Vec<u32> = b.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(
+                    ab, bb,
+                    "rope table vs theta differ at ({n_heads},{head_dim}) pos={pos}"
                 );
             }
         }

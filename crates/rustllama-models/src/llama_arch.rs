@@ -4022,6 +4022,29 @@ pub(crate) fn quantize_row_q8_0(row: &[f32], out_q: &mut [i8]) -> f32 {
 pub struct LlamaModel {
     pub cfg: LlamaConfig,
     pub weights: LlamaWeights,
+    /// Precomputed RoPE inverse-frequency table (`head_dim/2` entries) with
+    /// context-extension scaling applied (`cfg.rope_scaling`), built ONCE at
+    /// construction so the per-token forward doesn't recompute it. For
+    /// non-scaled models this equals the base NeoX table, so the scaled path is
+    /// byte-identical. The single source of truth fed to every backend's RoPE.
+    pub rope_inv_freq: Vec<f32>,
+    /// YaRN attention `mscale` (`1.0` off YaRN); multiplies the query after RoPE
+    /// so attention scores carry the YaRN temperature.
+    pub yarn_mscale: f32,
+}
+
+/// Build the scaled RoPE table + YaRN mscale from a config (see
+/// [`crate::accel::rope_inv_freq_table_scaled`]). Used at every [`LlamaModel`]
+/// construction so the tables are always consistent with `cfg.rope_scaling`.
+pub fn rope_tables_from_cfg(cfg: &LlamaConfig) -> (Vec<f32>, f32) {
+    (
+        crate::accel::rope_inv_freq_table_scaled(
+            cfg.head_dim,
+            cfg.rope_theta,
+            cfg.rope_scaling.as_ref(),
+        ),
+        crate::accel::rope_yarn_mscale(cfg.rope_scaling.as_ref()),
+    )
 }
 
 /// A CPU-backed weight range the Windows page-lock path may pin into
@@ -4282,6 +4305,22 @@ impl LlamaModel {
         out
     }
 
+    /// Assemble a model from its parts, precomputing the scaled RoPE table +
+    /// YaRN mscale ONCE here so every construction path (GGUF load, allow-moe,
+    /// synth, and the safetensors AWQ/GPTQ/MLX builders in `rustllama-safetensors`)
+    /// gets consistent tables and the per-token forward never recomputes them.
+    /// Public so the out-of-crate safetensors loaders can build through it rather
+    /// than the struct literal (which would silently skip the table precompute).
+    pub fn from_parts(cfg: LlamaConfig, weights: LlamaWeights) -> Self {
+        let (rope_inv_freq, yarn_mscale) = rope_tables_from_cfg(&cfg);
+        Self {
+            cfg,
+            weights,
+            rope_inv_freq,
+            yarn_mscale,
+        }
+    }
+
     pub fn load(gguf: &Gguf) -> Result<Self, LlamaLoadError> {
         let cfg = LlamaConfig::from_gguf(gguf)?;
         let weights = LlamaWeights::from_gguf(gguf, &cfg)?;
@@ -4292,7 +4331,7 @@ impl LlamaModel {
         // Mixtral / DeepSeek-V3 GGUFs now load and generate through
         // the regular engine boundary. Performance: scalar per-expert
         // matvec, no batched MoE prefill — phase 2-D adds those.
-        Ok(Self { cfg, weights })
+        Ok(Self::from_parts(cfg, weights))
     }
 
     /// Like [`Self::load`], but does NOT reject MoE architectures.
@@ -4310,7 +4349,57 @@ impl LlamaModel {
     pub fn load_allow_moe(gguf: &Gguf) -> Result<Self, LlamaLoadError> {
         let cfg = LlamaConfig::from_gguf(gguf)?;
         let weights = LlamaWeights::from_gguf(gguf, &cfg)?;
-        Ok(Self { cfg, weights })
+        Ok(Self::from_parts(cfg, weights))
+    }
+
+    /// Centralized RoPE application for one Q or K activation buffer
+    /// (`n_heads × head_dim` contiguous, per-head NeoX split-halves layout).
+    ///
+    /// Reproduces the existing theta-based NeoX / interleaved dispatch
+    /// **byte-identically** for models WITHOUT context-extension scaling (the
+    /// common case — `rope_scaling` is `None` ⇒ the base theta path, and
+    /// `yarn_mscale == 1.0` ⇒ no post-scale), so coherence on e.g. Qwen2.5 is
+    /// unchanged. When the model carries `rope.scaling.*` (YaRN / NTK / linear)
+    /// and this is the full-rotation NeoX path, it drives RoPE from the
+    /// precomputed scaled inverse-frequency table instead of the scalar theta.
+    ///
+    /// The YaRN attention `mscale` multiplies the rotated vector for BOTH Q and
+    /// K (matching the reference: each is scaled by `mscale`, so the `q·k`
+    /// attention logit carries `mscale²` = the YaRN `1/t` temperature). Linear
+    /// and NTK leave `mscale == 1.0`.
+    ///
+    /// Interleaved (GPT-J pairing) + scaling is a documented gap: interleaved
+    /// stays on the scalar-theta kernel (no interleaved table variant); the
+    /// `mscale` post-scale still applies. Models shipping YaRN use NeoX.
+    #[inline]
+    fn rope_inplace(&self, buf: &mut [f32], n_heads: usize, head_dim: usize, pos: u32) {
+        self.rope_rotate_inplace(buf, n_heads, head_dim, pos);
+        // YaRN temperature: scale the rotated vector (applied to BOTH Q and K,
+        // so the q·k logit carries mscale² = the YaRN 1/t). `1.0` off YaRN ⇒
+        // no-op, keeping non-scaled models byte-identical.
+        if self.yarn_mscale != 1.0 {
+            for x in buf.iter_mut() {
+                *x *= self.yarn_mscale;
+            }
+        }
+    }
+
+    /// Rotation-only RoPE — the pure positional rotation WITHOUT the YaRN
+    /// `mscale`. Used where mscale must not be (re)applied: CacheBlend's `delta`
+    /// re-rope, where the stored K already carries mscale from its isolated
+    /// prefill and the re-base only adds the positional offset (RoPE is
+    /// angle-additive per frequency, so rotating by `delta` composes with the
+    /// chunk's local rotation; the scalar mscale does not and must stay single).
+    #[inline]
+    fn rope_rotate_inplace(&self, buf: &mut [f32], n_heads: usize, head_dim: usize, pos: u32) {
+        let cfg = &self.cfg;
+        if rope_interleaved_enabled() {
+            k::rope_inplace_interleaved(buf, n_heads, head_dim, pos, cfg.rope_theta);
+        } else if cfg.rope_scaling.is_some() && self.rope_inv_freq.len() * 2 == head_dim {
+            k::rope_inplace_neox_invfreq(buf, n_heads, head_dim, pos, &self.rope_inv_freq);
+        } else {
+            k::rope_inplace_neox(buf, n_heads, head_dim, pos, cfg.rope_theta);
+        }
     }
 
     /// Eagerly upload every packed-quant weight tensor in the model
@@ -7583,39 +7672,50 @@ impl LlamaModel {
             let cross_layer = dense_ffn_arg.is_some();
             let upload_hidden = if cross_layer { !hidden_dev_resident } else { true };
             let download_hidden = !cross_layer;
-            let device_attn = if let KvLayer::F32 { k, v } = &mut kv.layers[layer_idx] {
-                let (attn_ran, ffn_ran) = crate::accel::try_decode_attn_block_cuda_f32(
-                    block.w_q(),
-                    block.w_k(),
-                    block.w_v(),
-                    block.w_o(),
-                    block.attn_norm(),
-                    block.ffn_norm(),
-                    block.q_norm(),
-                    block.k_norm(),
-                    block.b_q().is_some() || block.b_k().is_some() || block.b_v().is_some(),
-                    rope_inv_freq,
-                    &mut hidden,
-                    &mut h_norm,
-                    &mut k_buf,
-                    &mut v_buf,
-                    k,
-                    v,
-                    dense_ffn_arg,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    d,
-                    cur_pos,
-                    kv_max_ctx,
-                    cfg.n_layers,
-                    layer_idx,
-                    cfg.rms_eps,
-                    upload_hidden,
-                    download_hidden,
-                );
-                device_dense_ffn = ffn_ran;
-                attn_ran
+            // The fused CUDA decode block rotates with the inv-freq table but
+            // does NOT apply the YaRN attention `mscale` (it fuses the Q·K score
+            // on-device, so Q can't be post-scaled). Run it only when `mscale`
+            // is a no-op; YaRN models fall to the software path below, which
+            // applies `mscale`. Non-scaled + linear/NTK (`mscale == 1.0`) keep
+            // the device block, fed `self.rope_inv_freq` — the scaled table,
+            // byte-identical to the base table when the model carries no scaling.
+            let device_attn = if self.yarn_mscale == 1.0 {
+                if let KvLayer::F32 { k, v } = &mut kv.layers[layer_idx] {
+                    let (attn_ran, ffn_ran) = crate::accel::try_decode_attn_block_cuda_f32(
+                        block.w_q(),
+                        block.w_k(),
+                        block.w_v(),
+                        block.w_o(),
+                        block.attn_norm(),
+                        block.ffn_norm(),
+                        block.q_norm(),
+                        block.k_norm(),
+                        block.b_q().is_some() || block.b_k().is_some() || block.b_v().is_some(),
+                        &self.rope_inv_freq,
+                        &mut hidden,
+                        &mut h_norm,
+                        &mut k_buf,
+                        &mut v_buf,
+                        k,
+                        v,
+                        dense_ffn_arg,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        d,
+                        cur_pos,
+                        kv_max_ctx,
+                        cfg.n_layers,
+                        layer_idx,
+                        cfg.rms_eps,
+                        upload_hidden,
+                        download_hidden,
+                    );
+                    device_dense_ffn = ffn_ran;
+                    attn_ran
+                } else {
+                    false
+                }
             } else {
                 false
             };
@@ -7675,7 +7775,17 @@ impl LlamaModel {
             // Interleaved layout has no SYCL kernel today (the GPU
             // kernel ships only the neox/half-split convention), so
             // that path stays CPU-only.
-            if rope_interleaved_enabled() {
+            if self.cfg.rope_scaling.is_some() {
+                // Context-extension scaling (YaRN/NTK/linear): drive RoPE from
+                // the precomputed scaled table on the CPU path. Correctness
+                // first — the GPU rope ladder below is scalar-theta only (the
+                // cached `scratch.rope_inv_freq` is the UNSCALED base table), so
+                // threading the scaled table through the USM kernel is a
+                // write-blind follow-up. RoPE is a tiny slice of decode compute,
+                // so the CPU detour here is negligible.
+                self.rope_inplace(&mut q_buf, n_heads, head_dim, pos);
+                self.rope_inplace(&mut k_buf, n_kv_heads, head_dim, pos);
+            } else if rope_interleaved_enabled() {
                 k::rope_inplace_interleaved(&mut q_buf, n_heads, head_dim, pos, cfg.rope_theta);
                 k::rope_inplace_interleaved(&mut k_buf, n_kv_heads, head_dim, pos, cfg.rope_theta);
             } else {
@@ -8698,13 +8808,8 @@ impl LlamaModel {
                     head_dim,
                     cfg.rms_eps,
                 );
-                if rope_interleaved_enabled() {
-                    k::rope_inplace_interleaved(q_row, n_heads, head_dim, slot.pos, cfg.rope_theta);
-                    k::rope_inplace_interleaved(k_row, n_kv_heads, head_dim, slot.pos, cfg.rope_theta);
-                } else {
-                    k::rope_inplace_neox(q_row, n_heads, head_dim, slot.pos, cfg.rope_theta);
-                    k::rope_inplace_neox(k_row, n_kv_heads, head_dim, slot.pos, cfg.rope_theta);
-                }
+                self.rope_inplace(q_row, n_heads, head_dim, slot.pos);
+                self.rope_inplace(k_row, n_kv_heads, head_dim, slot.pos);
             }
 
             // Per-slot: write the new K/V row to that slot's cache
@@ -9275,13 +9380,8 @@ impl LlamaModel {
                 head_dim,
                 cfg.rms_eps,
             );
-            if rope_interleaved_enabled() {
-                k::rope_inplace_interleaved(&mut q_buf, n_heads, head_dim, pos, cfg.rope_theta);
-                k::rope_inplace_interleaved(&mut k_buf, n_kv_heads, head_dim, pos, cfg.rope_theta);
-            } else {
-                k::rope_inplace_neox(&mut q_buf, n_heads, head_dim, pos, cfg.rope_theta);
-                k::rope_inplace_neox(&mut k_buf, n_kv_heads, head_dim, pos, cfg.rope_theta);
-            }
+            self.rope_inplace(&mut q_buf, n_heads, head_dim, pos);
+            self.rope_inplace(&mut k_buf, n_kv_heads, head_dim, pos);
 
             // Paged write: append this token's K/V row, then gather
             // [0, kv_len) for attention.
@@ -9672,13 +9772,8 @@ impl LlamaModel {
                         block.q_norm(), block.k_norm(), q_row, k_row,
                         n_heads, n_kv_heads, head_dim, cfg.rms_eps,
                     );
-                    if rope_interleaved_enabled() {
-                        k::rope_inplace_interleaved(q_row, n_heads, head_dim, pos, cfg.rope_theta);
-                        k::rope_inplace_interleaved(k_row, n_kv_heads, head_dim, pos, cfg.rope_theta);
-                    } else {
-                        k::rope_inplace_neox(q_row, n_heads, head_dim, pos, cfg.rope_theta);
-                        k::rope_inplace_neox(k_row, n_kv_heads, head_dim, pos, cfg.rope_theta);
-                    }
+                    self.rope_inplace(q_row, n_heads, head_dim, pos);
+                    self.rope_inplace(k_row, n_kv_heads, head_dim, pos);
                     let posu = r_idx[j];
                     for h in 0..n_kv_heads {
                         let dst = (h * max_ctx + posu) * head_dim;
@@ -9875,11 +9970,7 @@ impl LlamaModel {
                 }
                 // Re-base by the constant offset (identity when off == 0).
                 if delta != 0 {
-                    if rope_interleaved_enabled() {
-                        k::rope_inplace_interleaved(&mut k_scratch, n_kv_heads, head_dim, delta, cfg.rope_theta);
-                    } else {
-                        k::rope_inplace_neox(&mut k_scratch, n_kv_heads, head_dim, delta, cfg.rope_theta);
-                    }
+                    self.rope_rotate_inplace(&mut k_scratch, n_kv_heads, head_dim, delta);
                 }
                 // Scatter K (re-roped) + V (verbatim) into the live slab.
                 let posu = off + j;
@@ -9920,9 +10011,6 @@ impl LlamaModel {
             kv_len_base + n_new <= max_ctx,
             "prefill batch overflows max_ctx: {kv_len_base} + {n_new} > {max_ctx}"
         );
-
-        // Pre-compute RoPE inv-freq once.
-        let rope_inv_freq = crate::accel::rope_inv_freq_table(head_dim, cfg.rope_theta);
 
         // Per-token embed → hidden state `[n_new, d]`. The body
         // below treats this as a contiguous row-major buffer; row
@@ -10042,17 +10130,11 @@ impl LlamaModel {
                     cfg.rms_eps,
                 );
                 let pos_i = (kv_len_base + i) as u32;
-                if rope_interleaved_enabled() {
-                    k::rope_inplace_interleaved(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
-                    k::rope_inplace_interleaved(k_row, n_kv_heads, head_dim, pos_i, cfg.rope_theta);
-                } else {
-                    // Use the same neox/half-split convention as
-                    // forward_one. Skip SYCL routing for now —
-                    // batched prefill stays on the CPU path.
-                    let _ = &rope_inv_freq;
-                    k::rope_inplace_neox(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
-                    k::rope_inplace_neox(k_row, n_kv_heads, head_dim, pos_i, cfg.rope_theta);
-                }
+                // Same neox/half-split convention as forward_one; batched
+                // prefill stays on the CPU path (scaled table applied for
+                // rope-scaled models, byte-identical theta otherwise).
+                self.rope_inplace(q_row, n_heads, head_dim, pos_i);
+                self.rope_inplace(k_row, n_kv_heads, head_dim, pos_i);
             }
 
             // Append all n_new K/V rows to the cache, then run one
@@ -10307,8 +10389,6 @@ impl LlamaModel {
             cache.capacity_tokens(),
         );
 
-        let rope_inv_freq = crate::accel::rope_inv_freq_table(head_dim, cfg.rope_theta);
-
         let mut hidden = vec![0f32; n_new * d];
         for (i, &tok) in tokens.iter().enumerate() {
             k::embed_lookup_tensor(
@@ -10389,14 +10469,8 @@ impl LlamaModel {
                     cfg.rms_eps,
                 );
                 let pos_i = (kv_len_base + i) as u32;
-                if rope_interleaved_enabled() {
-                    k::rope_inplace_interleaved(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
-                    k::rope_inplace_interleaved(k_row, n_kv_heads, head_dim, pos_i, cfg.rope_theta);
-                } else {
-                    let _ = &rope_inv_freq;
-                    k::rope_inplace_neox(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
-                    k::rope_inplace_neox(k_row, n_kv_heads, head_dim, pos_i, cfg.rope_theta);
-                }
+                self.rope_inplace(q_row, n_heads, head_dim, pos_i);
+                self.rope_inplace(k_row, n_kv_heads, head_dim, pos_i);
             }
 
             // Paged write: append each new token's K/V row to the
@@ -10673,13 +10747,8 @@ impl LlamaModel {
                     cfg.rms_eps,
                 );
                 let pos_i = (kv_len_base + i) as u32;
-                if rope_interleaved_enabled() {
-                    k::rope_inplace_interleaved(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
-                    k::rope_inplace_interleaved(k_row, n_kv_heads, head_dim, pos_i, cfg.rope_theta);
-                } else {
-                    k::rope_inplace_neox(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
-                    k::rope_inplace_neox(k_row, n_kv_heads, head_dim, pos_i, cfg.rope_theta);
-                }
+                self.rope_inplace(q_row, n_heads, head_dim, pos_i);
+                self.rope_inplace(k_row, n_kv_heads, head_dim, pos_i);
             }
 
             // Quantize all n_new K/V rows into the TQ packed cache,
@@ -11044,13 +11113,8 @@ impl LlamaModel {
                     cfg.rms_eps,
                 );
                 let pos_i = (kv_len_base + i) as u32;
-                if rope_interleaved_enabled() {
-                    k::rope_inplace_interleaved(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
-                    k::rope_inplace_interleaved(k_row, n_kv_heads, head_dim, pos_i, cfg.rope_theta);
-                } else {
-                    k::rope_inplace_neox(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
-                    k::rope_inplace_neox(k_row, n_kv_heads, head_dim, pos_i, cfg.rope_theta);
-                }
+                self.rope_inplace(q_row, n_heads, head_dim, pos_i);
+                self.rope_inplace(k_row, n_kv_heads, head_dim, pos_i);
             }
 
             // Quantize all n_new K/V rows into the Q8_0 cache, then
@@ -11393,13 +11457,8 @@ impl LlamaModel {
                     cfg.rms_eps,
                 );
                 let pos_i = (kv_len_base + i) as u32;
-                if rope_interleaved_enabled() {
-                    k::rope_inplace_interleaved(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
-                    k::rope_inplace_interleaved(k_row, n_kv_heads, head_dim, pos_i, cfg.rope_theta);
-                } else {
-                    k::rope_inplace_neox(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
-                    k::rope_inplace_neox(k_row, n_kv_heads, head_dim, pos_i, cfg.rope_theta);
-                }
+                self.rope_inplace(q_row, n_heads, head_dim, pos_i);
+                self.rope_inplace(k_row, n_kv_heads, head_dim, pos_i);
             }
 
             // Quantize all n_new K/V rows per-block into the NVFP4
@@ -11781,13 +11840,8 @@ impl LlamaModel {
                     cfg.rms_eps,
                 );
                 let pos_i = (kv_len_base + i) as u32;
-                if rope_interleaved_enabled() {
-                    k::rope_inplace_interleaved(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
-                    k::rope_inplace_interleaved(k_row, n_kv_heads, head_dim, pos_i, cfg.rope_theta);
-                } else {
-                    k::rope_inplace_neox(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
-                    k::rope_inplace_neox(k_row, n_kv_heads, head_dim, pos_i, cfg.rope_theta);
-                }
+                self.rope_inplace(q_row, n_heads, head_dim, pos_i);
+                self.rope_inplace(k_row, n_kv_heads, head_dim, pos_i);
             }
 
             // MXFP KV write + batched flash prefill. `mxfp_kv_prefill`
@@ -12087,13 +12141,8 @@ impl LlamaModel {
                     cfg.rms_eps,
                 );
                 let pos_i = (kv_len_base + i) as u32;
-                if rope_interleaved_enabled() {
-                    k::rope_inplace_interleaved(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
-                    k::rope_inplace_interleaved(k_row, n_kv_heads, head_dim, pos_i, cfg.rope_theta);
-                } else {
-                    k::rope_inplace_neox(q_row, n_heads, head_dim, pos_i, cfg.rope_theta);
-                    k::rope_inplace_neox(k_row, n_kv_heads, head_dim, pos_i, cfg.rope_theta);
-                }
+                self.rope_inplace(q_row, n_heads, head_dim, pos_i);
+                self.rope_inplace(k_row, n_kv_heads, head_dim, pos_i);
             }
 
             // Quantize all n_new K/V rows into the Q4_0 cache, then
@@ -12337,10 +12386,8 @@ mod tests {
         let gguf = Gguf::open(&path).expect("open gguf");
         let cfg = crate::llama_config::LlamaConfig::from_gguf(&gguf).expect("config");
         assert!(cfg.hybrid.is_some(), "fixture must be a hybrid model");
-        let model = LlamaModel {
-            weights: LlamaWeights::from_gguf(&gguf, &cfg).expect("weights"),
-            cfg,
-        };
+        let weights = LlamaWeights::from_gguf(&gguf, &cfg).expect("weights");
+        let model = LlamaModel::from_parts(cfg, weights);
         let hybrid = model.weights.hybrid_layers.as_ref().expect("hybrid layers");
         let tokens: Vec<i32> = vec![3, 1000, 25, 4096, 77];
 
@@ -12382,6 +12429,7 @@ mod tests {
             moe: None,
             hybrid: None,
             hadamard: None,
+            ..Default::default()
         }
     }
 
@@ -12520,9 +12568,9 @@ mod tests {
                 k_norm: None,
             });
         }
-        LlamaModel {
-            cfg: cfg.clone(),
-            weights: LlamaWeights {
+        LlamaModel::from_parts(
+            cfg.clone(),
+            LlamaWeights {
                 token_embd,
                 blocks,
                 moe_blocks: None,
@@ -12533,7 +12581,7 @@ mod tests {
                 nextn_head: None,
                 hadamard: None,
             },
-        }
+        )
     }
 
     /// Parity probe: `forward_prefill_paged_f32` returns bit-

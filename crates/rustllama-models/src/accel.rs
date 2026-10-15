@@ -4058,6 +4058,92 @@ pub fn rope_inv_freq_table(head_dim: usize, rope_theta: f32) -> Vec<f32> {
         .collect()
 }
 
+/// RoPE inverse-frequency table with context-extension scaling applied
+/// (`{arch}.rope.scaling.*`). `None` or [`RopeScalingKind::None`] returns the
+/// unscaled [`rope_inv_freq_table`]. Linear = position interpolation (freqs /
+/// factor); NTK = base-theta rescale; YaRN/LongRope = per-dimension
+/// interpolation↔extrapolation ramp (llama.cpp convention). Compute once at
+/// load and feed the table to every backend's RoPE kernel — this is the single
+/// source of truth so the scalar-theta path can't disagree with it.
+///
+/// At `factor == 1.0` this is bit-identical to [`rope_inv_freq_table`] for every
+/// scheme (the identity the parity test pins).
+pub fn rope_inv_freq_table_scaled(
+    head_dim: usize,
+    rope_theta: f32,
+    scaling: Option<&crate::llama_config::RopeScaling>,
+) -> Vec<f32> {
+    use crate::llama_config::RopeScalingKind;
+    let base = rope_inv_freq_table(head_dim, rope_theta);
+    let Some(s) = scaling else {
+        return base;
+    };
+    let factor = s.factor;
+    // `factor <= 1.0` (or NaN) is "no context extension" for every scheme, so
+    // return the base table verbatim — both correct AND bit-identical to the
+    // scalar-theta path (the YaRN ramp's `interp·(1-r) + base·r` would otherwise
+    // round away from `base` even at factor 1.0). This is the identity the
+    // parity test pins.
+    if !(factor > 1.0) {
+        return base;
+    }
+    match s.kind {
+        RopeScalingKind::None => base,
+        // Position interpolation: every frequency slowed by `factor`.
+        RopeScalingKind::Linear => base.iter().map(|f| f / factor).collect(),
+        // NTK-aware: rescale the base so high freqs barely move, low freqs
+        // interpolate. `theta' = theta * factor^(d/(d-2))`.
+        RopeScalingKind::Ntk => {
+            let d = head_dim as f32;
+            let theta2 = rope_theta * factor.powf(d / (d - 2.0).max(1.0));
+            rope_inv_freq_table(head_dim, theta2)
+        }
+        // YaRN: per-dim ramp between interpolation (low-freq dims) and
+        // extrapolation (high-freq dims), gated by beta_fast/beta_slow.
+        RopeScalingKind::Yarn | RopeScalingKind::LongRope => {
+            let half = head_dim / 2;
+            let orig = s.orig_ctx as f32;
+            if orig <= 0.0 || rope_theta <= 1.0 {
+                // No original context → fall back to linear interpolation.
+                return base.iter().map(|f| f / factor).collect();
+            }
+            // Pair index j where a dimension completes `n_rot` rotations over
+            // `orig` tokens (llama.cpp `rope_yarn_corr_dim`).
+            let corr = |n_rot: f32| -> f32 {
+                head_dim as f32 * (orig / (n_rot * 2.0 * std::f32::consts::PI)).ln()
+                    / (2.0 * rope_theta.ln())
+            };
+            let low = corr(s.beta_fast).floor().max(0.0);
+            let high = corr(s.beta_slow).ceil().min((half.max(1) - 1) as f32);
+            let denom = (high - low).max(0.001);
+            base.iter()
+                .enumerate()
+                .map(|(j, &f)| {
+                    let interp = f / factor;
+                    // ramp_mix: 1 = extrapolate (high freq / small j), 0 = interpolate.
+                    let ramp = 1.0 - ((j as f32 - low) / denom).clamp(0.0, 1.0);
+                    interp * (1.0 - ramp) + f * ramp
+                })
+                .collect()
+        }
+    }
+}
+
+/// YaRN attention-temperature `mscale` to multiply attention scores by when
+/// YaRN scaling is active: `(1 + 0.1·ln(factor)) · attn_factor`. `1.0` for every
+/// non-YaRN scheme (and YaRN at factor 1.0), so applying it unconditionally is a
+/// no-op off YaRN.
+pub fn rope_yarn_mscale(scaling: Option<&crate::llama_config::RopeScaling>) -> f32 {
+    use crate::llama_config::RopeScalingKind;
+    match scaling {
+        Some(s) if matches!(s.kind, RopeScalingKind::Yarn | RopeScalingKind::LongRope) => {
+            let f = s.factor.max(1.0);
+            (1.0 + 0.1 * f.ln()) * s.attn_factor
+        }
+        _ => 1.0,
+    }
+}
+
 /// Try to run SwiGLU's elementwise `silu(x) * y` on the SYCL device
 /// installed on this thread. Same fall-back semantics as
 /// [`try_rmsnorm_f32`]: returns `true` only if the kernel actually
@@ -4203,6 +4289,77 @@ mod tests {
         // Last entry (j = half-1 = 31) is 1 / theta^(62/64) ≈ 1.65e-4.
         let expected_last = 1.0f32 / rope_theta.powf(62.0 / 64.0);
         assert!((table[31] - expected_last).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rope_scaled_table_is_identity_without_extension() {
+        use crate::llama_config::{RopeScaling, RopeScalingKind};
+        let head_dim = 64;
+        let theta = 10000.0f32;
+        let base = rope_inv_freq_table(head_dim, theta);
+        // `None` scaling returns the base table verbatim.
+        assert_eq!(rope_inv_freq_table_scaled(head_dim, theta, None), base);
+        // Every scheme at factor == 1.0 (no extension) is BIT-identical to the
+        // base table — this is the guard that a rope-scaled model collapses to
+        // the exact scalar-theta path when the factor is a no-op, so coherence
+        // on non-extended models can't drift.
+        for kind in [
+            RopeScalingKind::None,
+            RopeScalingKind::Linear,
+            RopeScalingKind::Ntk,
+            RopeScalingKind::Yarn,
+            RopeScalingKind::LongRope,
+        ] {
+            let s = RopeScaling {
+                kind,
+                factor: 1.0,
+                orig_ctx: 4096,
+                attn_factor: 1.0,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+            };
+            let scaled = rope_inv_freq_table_scaled(head_dim, theta, Some(&s));
+            assert_eq!(scaled.len(), base.len(), "{kind:?} len");
+            assert_eq!(scaled, base, "{kind:?} must equal base at factor 1.0");
+            // mscale is a no-op at factor 1.0 for every scheme.
+            assert_eq!(rope_yarn_mscale(Some(&s)), 1.0, "{kind:?} mscale@1");
+        }
+    }
+
+    #[test]
+    fn rope_scaled_table_extends_at_factor_gt_one() {
+        use crate::llama_config::{RopeScaling, RopeScalingKind};
+        let head_dim = 64;
+        let theta = 10000.0f32;
+        let base = rope_inv_freq_table(head_dim, theta);
+        let mk = |kind| RopeScaling {
+            kind,
+            factor: 4.0,
+            orig_ctx: 4096,
+            attn_factor: 1.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+        };
+        // Linear: every frequency divided by the factor (slower rotation).
+        let t = rope_inv_freq_table_scaled(head_dim, theta, Some(&mk(RopeScalingKind::Linear)));
+        for (&a, &b) in t.iter().zip(base.iter()) {
+            assert!((a - b / 4.0).abs() < 1e-9, "linear = base/factor");
+        }
+        // NTK rescales the base theta up, so every freq shrinks vs base (but by
+        // less than the full /factor of linear, and strictly nonzero).
+        let n = rope_inv_freq_table_scaled(head_dim, theta, Some(&mk(RopeScalingKind::Ntk)));
+        assert_eq!(n.len(), base.len());
+        assert!((n[0] - base[0]).abs() < 1e-6, "ntk leaves the j=0 freq ≈ unchanged");
+        assert!(n.iter().all(|&v| v > 0.0));
+        // YaRN: per-dim freqs bounded between full interpolation (base/factor)
+        // and full extrapolation (base); mscale grows as (1 + 0.1·ln factor).
+        let yarn = mk(RopeScalingKind::Yarn);
+        let yt = rope_inv_freq_table_scaled(head_dim, theta, Some(&yarn));
+        for (&v, &b) in yt.iter().zip(base.iter()) {
+            assert!(v >= b / 4.0 - 1e-6 && v <= b + 1e-6, "yarn freq {v} in band");
+        }
+        let m = rope_yarn_mscale(Some(&yarn));
+        assert!((m - (1.0 + 0.1 * 4.0f32.ln())).abs() < 1e-6 && m > 1.0, "yarn mscale");
     }
 
     #[test]

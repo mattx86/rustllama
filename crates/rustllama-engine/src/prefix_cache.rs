@@ -582,6 +582,7 @@ mod tests {
             moe: None,
             hybrid: None,
             hadamard: None,
+            ..Default::default()
         }
     }
 
