@@ -975,42 +975,82 @@ void rsl_flash_attn_decode_usm(rsl_stream* s,
                 const int kv_h = hh / n_gqa;
                 const int q_base = hh * head_dim;
                 const int out_base = hh * head_dim;
-            // Zero accumulator.
-            for (int i = 0; i < head_dim; ++i) {
-                out_usm[out_base + i] = 0;
-            }
-            float m = -INFINITY;
-            float l = 0.0f;
-            for (int t = t_start; t < kv_len; ++t) {
-                const int k_off = (kv_h * max_ctx + t) * head_dim;
-                // Q · K row.
-                float s_dot = 0.0f;
-                for (int i = 0; i < head_dim; ++i) {
-                    float qv = bits_to_f32(q_usm[q_base + i]);
-                    float kv = bits_to_f32(k_usm[k_off + i]);
-                    s_dot += qv * kv;
+            // PRECISION: keep the running weighted-V accumulator in f32
+            // across the whole kv loop, converting to f16 only at the end.
+            // The original v1 stored the accumulator in the f16 `out_usm`
+            // and read-modified-wrote it EVERY timestep, re-rounding to a
+            // 10-bit mantissa on each of up to `kv_len` steps — that
+            // per-step requantization was a real precision loss (max_rel
+            // ~0.12 vs the f32 CPU reference; v2/v3 keep an f32 accumulator
+            // and land ~0.04). A private f32 array covers the whole
+            // decode-kernel suite's head_dim<=256 assumption (cf. v2's
+            // MAX_DIM_PER_LANE). The rare head_dim>256 (no real model —
+            // v2/v3 also reject it) keeps the legacy in-place f16
+            // accumulation so v1 stays the universal fallback.
+            constexpr int RSL_FA_V1_MAXDIM = 256;
+            if (head_dim <= RSL_FA_V1_MAXDIM) {
+                float acc[RSL_FA_V1_MAXDIM];
+                for (int i = 0; i < head_dim; ++i) acc[i] = 0.0f;
+                float m = -INFINITY;
+                float l = 0.0f;
+                for (int t = t_start; t < kv_len; ++t) {
+                    const int k_off = (kv_h * max_ctx + t) * head_dim;
+                    // Q · K row.
+                    float s_dot = 0.0f;
+                    for (int i = 0; i < head_dim; ++i) {
+                        s_dot += bits_to_f32(q_usm[q_base + i]) * bits_to_f32(k_usm[k_off + i]);
+                    }
+                    s_dot *= scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
+                    // Online softmax update.
+                    const float m_new = sycl::fmax(m, s_dot);
+                    const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
+                    const float p = sycl::exp(s_dot - m_new);
+                    l = l * rescale + p;
+                    // V accumulation with rescale — stays in f32 `acc`.
+                    const int v_off = (kv_h * max_ctx + t) * head_dim;
+                    for (int i = 0; i < head_dim; ++i) {
+                        acc[i] = acc[i] * rescale + p * bits_to_f32(v_usm[v_off + i]);
+                    }
+                    m = m_new;
                 }
-                s_dot *= scale;
-                // Gemma2 attention-logit soft-cap (no-op at softcap==0).
-                if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
-                // Online softmax update.
-                const float m_new = sycl::fmax(m, s_dot);
-                const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
-                const float p = sycl::exp(s_dot - m_new);
-                l = l * rescale + p;
-                // V accumulation with rescale.
-                const int v_off = (kv_h * max_ctx + t) * head_dim;
+                const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+                for (int i = 0; i < head_dim; ++i) {
+                    out_usm[out_base + i] = f32_to_bits(acc[i] * inv_l);
+                }
+            } else {
+                // Legacy in-place f16 accumulation (head_dim > 256 only).
+                for (int i = 0; i < head_dim; ++i) {
+                    out_usm[out_base + i] = 0;
+                }
+                float m = -INFINITY;
+                float l = 0.0f;
+                for (int t = t_start; t < kv_len; ++t) {
+                    const int k_off = (kv_h * max_ctx + t) * head_dim;
+                    float s_dot = 0.0f;
+                    for (int i = 0; i < head_dim; ++i) {
+                        s_dot += bits_to_f32(q_usm[q_base + i]) * bits_to_f32(k_usm[k_off + i]);
+                    }
+                    s_dot *= scale;
+                    if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
+                    const float m_new = sycl::fmax(m, s_dot);
+                    const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
+                    const float p = sycl::exp(s_dot - m_new);
+                    l = l * rescale + p;
+                    const int v_off = (kv_h * max_ctx + t) * head_dim;
+                    for (int i = 0; i < head_dim; ++i) {
+                        const float cur = bits_to_f32(out_usm[out_base + i]);
+                        const float vv = bits_to_f32(v_usm[v_off + i]);
+                        out_usm[out_base + i] = f32_to_bits(cur * rescale + p * vv);
+                    }
+                    m = m_new;
+                }
+                const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
                 for (int i = 0; i < head_dim; ++i) {
                     const float cur = bits_to_f32(out_usm[out_base + i]);
-                    const float vv = bits_to_f32(v_usm[v_off + i]);
-                    out_usm[out_base + i] = f32_to_bits(cur * rescale + p * vv);
+                    out_usm[out_base + i] = f32_to_bits(cur * inv_l);
                 }
-                m = m_new;
-            }
-            const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
-            for (int i = 0; i < head_dim; ++i) {
-                const float cur = bits_to_f32(out_usm[out_base + i]);
-                out_usm[out_base + i] = f32_to_bits(cur * inv_l);
             }
         });
     }).wait();
