@@ -314,6 +314,8 @@ fn spill_part_to_tensor(part: crate::accel::SpilledPart, orig: &Tensor) -> Optio
                 strides: orig.strides.clone(),
                 storage: rustllama_tensor::Storage::CpuOwned(bytes.into()),
                 name: orig.name.clone(),
+                // Reconstructs the original expert tensor → inherit its order.
+                dim_order: orig.dim_order,
             })
         }
         // Low-bit spill decoded back to f32 (lossy vs the source): build
@@ -1100,6 +1102,8 @@ pub fn expert_view(big: &Tensor, expert_idx: usize, d_out: usize, d_in: usize) -
         strides: vec![d_in as i64, 1],
         storage: big.storage.slice(offset, bytes_per_expert),
         name: format!("{}.e{expert_idx}", big.name),
+        // The carved per-expert matrix is physical row-major `[out, in]`.
+        dim_order: rustllama_tensor::DimOrder::RowMajor,
     }
 }
 
@@ -1107,7 +1111,7 @@ pub fn expert_view(big: &Tensor, expert_idx: usize, d_out: usize, d_in: usize) -
 mod tests {
     use super::*;
     use half::f16;
-    use rustllama_tensor::{Device, Dtype, Storage as TStorage};
+    use rustllama_tensor::{Device, DimOrder, Dtype, Storage as TStorage};
 
     /// q★ split-exec parity: the concurrent CPU/GPU-partitioned loop
     /// must match the serial routed loop within fp-association
@@ -1309,6 +1313,8 @@ mod tests {
             strides: vec![k as i64, 1],
             storage: TStorage::CpuOwned(bytes.into()),
             name: name.into(),
+            // Built from explicit row-major `[out=m, in=k]` values.
+            dim_order: DimOrder::RowMajor,
         }
     }
 
@@ -1409,6 +1415,8 @@ mod tests {
             strides: vec![(d_out * d_in) as i64, d_in as i64, 1],
             storage: TStorage::CpuOwned(bytes.into()),
             name: "q4k_exps".into(),
+            // 3-D GGUF-order stack; expert_view re-tags each slice RowMajor.
+            dim_order: DimOrder::GgmlNe,
         };
 
         let e0 = expert_view(&big, 0, d_out, d_in);
@@ -1444,6 +1452,7 @@ mod tests {
             strides: vec![(d_out * d_in) as i64, d_in as i64, 1],
             storage: TStorage::CpuOwned(bytes.into()),
             name: "iq4xs_exps".into(),
+            dim_order: DimOrder::GgmlNe,
         };
         for (e, marker) in [(0, 0x11u8), (1, 0x22), (2, 0x33), (3, 0x44)] {
             let v = expert_view(&big, e, d_out, d_in);
@@ -1475,6 +1484,7 @@ mod tests {
             strides: vec![4, 2, 1],
             storage: TStorage::CpuOwned(bytes.into()),
             name: "exps".into(),
+            dim_order: DimOrder::GgmlNe,
         };
         let e0 = expert_view(&big, 0, 2, 2);
         let e0_slice = e0.storage.cast_slice::<u8>();
@@ -1532,6 +1542,8 @@ mod tests {
                     strides: vec![(d_out * d_in) as i64, d_in as i64, 1],
                     storage: TStorage::CpuOwned(bytes.into()),
                     name: name.into(),
+                    // 3-D GGUF-order stack; sliced per-expert via expert_view.
+                    dim_order: DimOrder::GgmlNe,
                 }
             };
 

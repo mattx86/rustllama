@@ -931,6 +931,8 @@ where
         shape,
         storage: rustllama_tensor::Storage::CpuOwned(w_bytes.into()),
         name: "npu-perf-probe".into(),
+        // Physical row-major [out=m, in=k].
+        dim_order: rustllama_tensor::DimOrder::RowMajor,
     };
     let w_deq = dtype_dequant_to_f32(w.dtype, as_bytes(&w), total)?;
     let mut out = vec![0f32; n * m];
@@ -2316,6 +2318,8 @@ pub fn sycl_tier_self_check() -> SyclTierCheck {
         shape,
         storage: rustllama_tensor::Storage::CpuOwned(w_bytes.into()),
         name: "sycl-tier-probe".into(),
+        // Physical row-major [out=m, in=k].
+        dim_order: rustllama_tensor::DimOrder::RowMajor,
     };
     let Some(dev) = upload_bytes_to_device(w.storage.as_bytes()) else {
         return SyclTierCheck::Skip(
@@ -6235,14 +6239,23 @@ pub fn preload_packed_tensor_to_usm(w: &Tensor) -> bool {
         Dtype::Mxfp8Raw => PackedMatvecKind::Mxfp8,
         _ => return false,
     };
-    // Weight tensors are shaped `[M, K]` (out × in). The engine's
-    // matvec call passes `(M=shape[0], k=shape[1])`, so we mirror.
+    // A3: size the upload by the weight's logical (out, in) via the
+    // DimOrder-aware accessors — NOT raw shape[0]/shape[1]. A dense GGUF
+    // weight is `[in, out]` (GgmlNe) while an expert_view / safetensors
+    // weight is `[out, in]` (RowMajor); `out_dim()`/`in_dim()` read the
+    // right axis for both. The prior `m=shape[0], k=shape[1]` took the
+    // CONTRACTION dim as `m` for dense GGUF and then aligned on the
+    // OUTPUT dim — which skipped e.g. a Q6_K LM head (vocab 151936, not
+    // 256-aligned) whose real contraction dim (d_model) IS aligned, so it
+    // never preloaded. `expected_bytes = out * row_bytes(in)` is symmetric
+    // in the two dims, so this only fixes WHICH axis the alignment reads
+    // (now the true contraction dim).
     let shape = &w.shape;
     if shape.len() < 2 {
         return false;
     }
-    let m = shape[0] as usize;
-    let k = shape[1] as usize;
+    let m = w.out_dim();
+    let k = w.in_dim();
     if k == 0 || m == 0 || k % kind.k_alignment() != 0 {
         return false;
     }
@@ -12002,23 +12015,6 @@ pub fn fused_out_proj_norm_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("RUSTLLAMA_FUSED_OUT_PROJ_NORM")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
-
-/// H3 infrastructure: env-var gate for load-time QKV-concat fusion.
-/// `RUSTLLAMA_QKV_FUSED=1` opts in to the load-path concatenation of
-/// separate `w_q` / `w_k` / `w_v` tensors into a fused
-/// `[d_q + 2*d_kv, d_model]` weight that the forward path dispatches
-/// via a single matvec call. Default off until the load-path concat
-/// + per-block dispatch wiring lands. Hybrid Qwen3.5-MoE DeltaNet
-/// already uses fused `attn_qkv` natively and is H3-compliant.
-pub fn qkv_fused_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("RUSTLLAMA_QKV_FUSED")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)

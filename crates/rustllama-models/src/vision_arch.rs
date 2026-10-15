@@ -1777,6 +1777,15 @@ fn tensor_from_info(
         strides,
         storage,
         name: name.to_string(),
+        // Vision (mmproj) tensors carry an ambiguous axis order: real
+        // GGUFs ship `[in, out]` while the synthetic test fixtures ship
+        // `[out, in]`, and the vision forward dispatches from the config's
+        // `d_ff` / `d_model` either way (never reading the order off the
+        // tensor). Mark it Unspecified so `out_dim()`/`in_dim()` and the
+        // C1b dispatch check don't cross-check a shape whose order isn't
+        // reliably known — the config dims the caller passes are the
+        // source of truth here.
+        dim_order: rustllama_tensor::DimOrder::Unspecified,
     })
 }
 
@@ -1868,6 +1877,8 @@ fn split_fused_qkv(
             strides: contiguous_strides_for(&part_shape),
             storage: Storage::CpuOwned(slice.into()),
             name: format!("{}::{tag}", fused.name),
+            // Split of the fused QKV weight → inherit its axis order.
+            dim_order: fused.dim_order,
         }
     };
     Ok((mk(0, "q"), mk(1, "k"), mk(2, "v")))
@@ -1898,6 +1909,8 @@ fn tensor_to_f32(t: Tensor) -> Result<Tensor, VisionLoadError> {
                 strides: t.strides.clone(),
                 storage: Storage::CpuOwned(out.into()),
                 name: t.name.clone(),
+                // dtype-only coercion preserves the source axis order.
+                dim_order: t.dim_order,
             })
         }
         other => Err(VisionLoadError::UnsupportedTensorDtypeName {

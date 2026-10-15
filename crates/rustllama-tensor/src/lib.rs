@@ -1067,6 +1067,48 @@ impl std::fmt::Debug for Storage {
     }
 }
 
+/// Logical axis order of a 2-D weight matrix's [`Tensor::shape`].
+///
+/// A linear weight `y = W·x` has two logical dims: the OUTPUT (row)
+/// dim and the INPUT / contraction (column) dim. The physical
+/// row-major byte layout is always the same — `out` rows of `in`
+/// contiguous elements — but the two load paths disagree on the ORDER
+/// of the `shape` vector:
+///
+/// - GGUF stores `ne[0]` = the contraction (input) dim and `ne[1]` =
+///   the output dim, so [`Tensor::from_gguf`] copies dims verbatim and
+///   the tensor carries `shape == [in, out]` → [`DimOrder::GgmlNe`].
+/// - The safetensors / MLX builders and the MoE [`expert_view`] carve
+///   / transpose into `shape == [out, in]` → [`DimOrder::RowMajor`].
+///
+/// One `Tensor` type therefore carries BOTH orders. [`Tensor::out_dim`]
+/// / [`Tensor::in_dim`] read the correct axis per this tag so a perf
+/// site (tuner LWS key, USM preload alignment, QKV concat) never has to
+/// guess — guessing is exactly the bug class this tag closes.
+///
+/// Default is [`DimOrder::GgmlNe`]: any constructor that forgets to set
+/// the tag stays GGUF-correct (the common case), so a missed migration
+/// site degrades to "untagged GGUF weight", never a wrong answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DimOrder {
+    /// `shape == [in, out]` — GGUF `ne` order (the default).
+    #[default]
+    GgmlNe,
+    /// `shape == [out, in]` — row-major `[out, in]`.
+    RowMajor,
+    /// The 2-D axis order is NOT reliably encoded in the shape vector:
+    /// the consumer passes authoritative `(m, k)` dims from config
+    /// rather than reading them off the tensor. This is the vision
+    /// (mmproj) case — real GGUFs ship `[in, out]` while some synthetic
+    /// fixtures ship `[out, in]`, and the vision forward dispatches from
+    /// the config's `d_ff` / `d_model` either way. [`Tensor::out_dim`] /
+    /// [`Tensor::in_dim`] fall back to the GGUF interpretation for this
+    /// tag, and the C1b dispatch orientation check skips it (the dims the
+    /// caller passes are the source of truth, so there is nothing to
+    /// cross-check against a shape whose order is ambiguous).
+    Unspecified,
+}
+
 #[derive(Debug, Clone)]
 pub struct Tensor {
     pub device: Device,
@@ -1076,12 +1118,59 @@ pub struct Tensor {
     pub storage: Storage,
     /// Human-readable name; carried through for diagnostics.
     pub name: String,
+    /// Logical axis order of `shape` for a 2-D weight matrix. See
+    /// [`DimOrder`]. Defaults to `GgmlNe`; slices / views inherit the
+    /// parent's order.
+    pub dim_order: DimOrder,
 }
 
 impl Tensor {
     /// Element count according to the shape.
     pub fn element_count(&self) -> u64 {
         self.shape.iter().copied().product()
+    }
+
+    /// Output (row) dimension of a 2-D weight matrix, resolved per
+    /// [`Tensor::dim_order`]. This is the `m` the matvec dispatch
+    /// passes.
+    ///
+    /// These accessors exist for 2-D weight matrices — the only tensors
+    /// whose `[out, in]` vs `[in, out]` orientation the matvec dispatch
+    /// must disambiguate. For a 1-D tensor the whole vector is treated
+    /// as the output (`out_dim == shape[0]`, `in_dim == 1`); for >2-D
+    /// (e.g. a 3-D MoE expert stack `[in, out, n_experts]`) the two
+    /// leading logical dims are read per the tag and any further
+    /// batch/expert dims are ignored — callers slice those to 2-D
+    /// ([`expert_view`]) before dispatch, so the >2-D path is only a
+    /// defensive fallback. `expected_bytes = out_dim * row_bytes(in_dim)`
+    /// is symmetric in the two dims, so this orientation choice is
+    /// byte-accounting-neutral; it only decides which axis the
+    /// alignment / cache key reads.
+    pub fn out_dim(&self) -> usize {
+        match self.shape.len() {
+            0 => 1,
+            1 => self.shape[0] as usize,
+            // Unspecified falls back to the GGUF `[in, out]` interpretation.
+            _ => match self.dim_order {
+                DimOrder::RowMajor => self.shape[0] as usize,
+                DimOrder::GgmlNe | DimOrder::Unspecified => self.shape[1] as usize,
+            },
+        }
+    }
+
+    /// Input (contraction) dimension of a 2-D weight matrix, resolved
+    /// per [`Tensor::dim_order`]. This is the `k` the matvec dispatch
+    /// passes (the activation width). See [`Tensor::out_dim`] for the
+    /// 1-D / >2-D fallback behaviour.
+    pub fn in_dim(&self) -> usize {
+        match self.shape.len() {
+            0 | 1 => 1,
+            // Unspecified falls back to the GGUF `[in, out]` interpretation.
+            _ => match self.dim_order {
+                DimOrder::RowMajor => self.shape[1] as usize,
+                DimOrder::GgmlNe | DimOrder::Unspecified => self.shape[0] as usize,
+            },
+        }
     }
 
     /// Allocate a zero-initialized owned CPU tensor of unquantized dtype.
@@ -1099,10 +1188,15 @@ impl Tensor {
             shape,
             storage: Storage::CpuOwned(bytes.into()),
             name: String::new(),
+            // Scratch / zero tensors carry no weight orientation; the
+            // GGUF-order default is harmless (never matvec'd as a weight).
+            dim_order: DimOrder::GgmlNe,
         }
     }
 
-    /// Wrap an owned `Vec<f32>` as a tensor.
+    /// Wrap an owned `Vec<f32>` as a tensor. Callers build these as
+    /// physical row-major `[out, in]` (e.g. the fused QKV concat, test
+    /// weights), so the tensor is tagged [`DimOrder::RowMajor`].
     pub fn from_vec_f32(name: impl Into<String>, shape: Shape, data: Vec<f32>) -> Self {
         let expected: u64 = shape.iter().copied().product();
         assert_eq!(data.len() as u64, expected, "shape vs data length");
@@ -1114,6 +1208,7 @@ impl Tensor {
             shape,
             storage: Storage::CpuOwned(bytes.into()),
             name: name.into(),
+            dim_order: DimOrder::RowMajor,
         }
     }
 
@@ -1174,6 +1269,8 @@ impl Tensor {
                     shape: info.dims.clone(),
                     storage: Storage::MmapBorrowed { backing, offset, len },
                     name: name.to_string(),
+                    // GGUF `ne` dims copied verbatim → shape is [in, out].
+                    dim_order: DimOrder::GgmlNe,
                 })
             }
             // Not a raw passthrough (or source mismatch) → owned path.
@@ -1686,6 +1783,8 @@ fn load_tensor_bytes(
         shape: shape.clone(),
         storage: Storage::CpuOwned(bytes.into()),
         name: name.to_string(),
+        // GGUF `ne` dims copied verbatim → shape is [in, out].
+        dim_order: DimOrder::GgmlNe,
     })
 }
 
@@ -1892,6 +1991,47 @@ mod tests {
     }
 
     #[test]
+    fn dim_order_resolves_out_in_per_tag() {
+        // Same physical shape [64, 128] read two ways: the tag decides
+        // which axis is output vs input/contraction.
+        let data = vec![0.0f32; 64 * 128];
+        // GgmlNe: shape == [in, out] → in_dim=shape[0]=64, out_dim=shape[1]=128.
+        let mut ggml = Tensor::from_vec_f32("ggml", vec![64, 128], data.clone());
+        ggml.dim_order = DimOrder::GgmlNe;
+        assert_eq!(ggml.out_dim(), 128);
+        assert_eq!(ggml.in_dim(), 64);
+        // RowMajor: shape == [out, in] → the reverse of the same shape.
+        let mut row = Tensor::from_vec_f32("row", vec![64, 128], data);
+        row.dim_order = DimOrder::RowMajor;
+        assert_eq!(row.out_dim(), 64);
+        assert_eq!(row.in_dim(), 128);
+    }
+
+    #[test]
+    fn from_vec_f32_defaults_to_row_major() {
+        // The builder tags RowMajor (physical [out, in]); a [out=4, in=3]
+        // weight reports out_dim=4 / in_dim=3.
+        let t = Tensor::from_vec_f32("w", vec![4, 3], vec![0.0; 12]);
+        assert_eq!(t.dim_order, DimOrder::RowMajor);
+        assert_eq!(t.out_dim(), 4);
+        assert_eq!(t.in_dim(), 3);
+    }
+
+    #[test]
+    fn out_in_dim_handle_non_2d_shapes() {
+        // 1-D: the whole vector is the output, in_dim collapses to 1.
+        let v = Tensor::from_vec_f32("bias", vec![8], vec![0.0; 8]);
+        assert_eq!(v.out_dim(), 8);
+        assert_eq!(v.in_dim(), 1);
+        // >2-D (GgmlNe expert stack [in, out, n_experts]): leading two
+        // logical dims per the tag, trailing dims ignored.
+        let mut stack = Tensor::from_vec_f32("exps", vec![3, 5, 2], vec![0.0; 30]);
+        stack.dim_order = DimOrder::GgmlNe;
+        assert_eq!(stack.in_dim(), 3);
+        assert_eq!(stack.out_dim(), 5);
+    }
+
+    #[test]
     fn f16_view_works() {
         let mut bytes = Vec::with_capacity(4);
         for v in [1.0f32, 2.0, 3.0, 4.0] {
@@ -1906,6 +2046,7 @@ mod tests {
             strides: vec![1],
             storage: Storage::CpuOwned(bytes.into()),
             name: "x".into(),
+            dim_order: DimOrder::GgmlNe,
         };
         let view = as_slice_f16(&t);
         assert_eq!(view.len(), 4);

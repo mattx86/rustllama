@@ -25,7 +25,7 @@ use rustllama_models::llama_arch::{
     LlamaBlockWeights, LlamaModel, LlamaMoeBlockWeights, LlamaWeights,
 };
 use rustllama_models::llama_config::{LlamaConfig, MoeConfig};
-use rustllama_tensor::{contiguous_strides, Device, Dtype, Storage, Tensor};
+use rustllama_tensor::{contiguous_strides, Device, DimOrder, Dtype, Storage, Tensor};
 
 use crate::convert::{ConvertedDtype, ConvertedTensor};
 
@@ -676,6 +676,9 @@ fn converted_to_tensor(ct: ConvertedTensor) -> Tensor {
         strides,
         storage: Storage::CpuOwned(Arc::<[u8]>::from(ct.bytes)),
         name: ct.gguf_name,
+        // The safetensors / MLX converters emit the logical `[out, in]`
+        // shape in `ct.shape` (see `convert.rs` transpose / `mlx.rs`).
+        dim_order: DimOrder::RowMajor,
     }
 }
 

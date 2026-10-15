@@ -281,7 +281,7 @@ pub fn matvec_tensor_serial(w: &Tensor, x: &[f32], out: &mut [f32], m: usize, k:
 #[cfg(test)]
 mod matvec_parallel_parity {
     use super::*;
-    use rustllama_tensor::{Device, Storage};
+    use rustllama_tensor::{Device, DimOrder, Storage};
 
     /// Rows past the default parallel gate (M ≥ 256) so the parallel
     /// path actually engages.
@@ -291,10 +291,12 @@ mod matvec_parallel_parity {
         Tensor {
             device: Device::Cpu,
             dtype,
+            // Physical row-major [out=M, in=k].
             shape: vec![M as u64, k as u64],
             strides: vec![k as i64, 1],
             storage: Storage::CpuOwned(bytes.into()),
             name: "parity".into(),
+            dim_order: DimOrder::RowMajor,
         }
     }
 

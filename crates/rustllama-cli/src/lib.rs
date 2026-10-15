@@ -2364,11 +2364,13 @@ fn cmd_imatrix(
     // `matvec_tensor_dispatch` hook, so every quantizable tensor is
     // recorded exactly once. Set before load — the `*_enabled()`
     // accessors cache their value on first read.
+    // (H3 QKV concat is no longer an env gate; it is built at load but
+    // consumed only by the MTP-head forward, not the base `forward_one`
+    // recording path, so it needs no disabling here.)
     for k in [
         "RUSTLLAMA_MOE_GATE_UP_FUSED",
         "RUSTLLAMA_FUSED_OUT_PROJ_NORM",
         "RUSTLLAMA_MIXED_PRECISION_MATVEC",
-        "RUSTLLAMA_QKV_FUSED",
     ] {
         std::env::set_var(k, "0");
     }
@@ -5066,8 +5068,19 @@ fn cmd_tune(
             if info.dtype != k_def.ggml_type || info.dims.len() < 2 {
                 continue;
             }
-            let m = info.dims[0] as usize;
-            let k = info.dims[1] as usize;
+            // A2: key the sweep by (m = OUT, k = IN) — the SAME order the
+            // runtime `tuned_lws_for(kernel, m=out, k=in)` looks up (the
+            // matvec dispatch passes m=output-rows, k=contraction). GGUF `ne`
+            // stores dims as [in, out] (ne[0] = contraction, block-aligned),
+            // so out = dims[1], in = dims[0]. The prior `m=dims[0], k=dims[1]`
+            // keyed (in, out) — a miss for every non-square shape at runtime —
+            // and aligned on the OUTPUT dim, filtering out e.g. an LM head
+            // whose output (vocab) isn't 256-aligned though its real
+            // contraction dim is. Aligning on `k` = the contraction dim is
+            // the correct block-size gate, and the sweep now benches the
+            // kernel at its true (out-rows, in-cols) geometry.
+            let m = info.dims[1] as usize;
+            let k = info.dims[0] as usize;
             if m == 0 || k == 0 || k % k_def.k_align != 0 {
                 continue;
             }

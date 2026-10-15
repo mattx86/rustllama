@@ -45,6 +45,27 @@ pub(crate) fn matvec_tensor_dispatch(
         k_dim,
         m * k_dim,
     );
+    // C1b (tests only): on a 2-D weight, the DimOrder-tagged orientation
+    // must resolve to the SAME (out, in) the caller passes — this catches
+    // a TRANSPOSED weight (identical element count, swapped dims) that
+    // C1a's order-agnostic u64 compare can't. Guarded to 2-D (out_dim /
+    // in_dim's domain) and debug-only: during the DimOrder migration an
+    // un-migrated constructor still defaults to GGUF order, so a stale tag
+    // must never panic a release build.
+    debug_assert!(
+        w.shape.len() != 2
+            || w.dim_order == rustllama_tensor::DimOrder::Unspecified
+            || (w.out_dim(), w.in_dim()) == (m, k_dim),
+        "matvec_tensor_dispatch: weight `{}` dim_order {:?} shape {:?} \
+         resolves to (out={}, in={}) but caller passed (m={}, k={})",
+        w.name,
+        w.dim_order,
+        w.shape,
+        w.out_dim(),
+        w.in_dim(),
+        m,
+        k_dim,
+    );
     // Three-tier dispatch:
     //   1. Quantized USM matvec (Q8_0 / Q4_K / Q5_K / Q6_K) —
     //      packed-format-specific kernels with hand-tuned LWS.
@@ -124,6 +145,21 @@ pub(crate) fn matvec_tensor_batched_dispatch(
         k_dim,
         m_dim * k_dim,
     );
+    // C1b (tests only): see `matvec_tensor_dispatch`.
+    debug_assert!(
+        w.shape.len() != 2
+            || w.dim_order == rustllama_tensor::DimOrder::Unspecified
+            || (w.out_dim(), w.in_dim()) == (m_dim, k_dim),
+        "matvec_tensor_batched_dispatch: weight `{}` dim_order {:?} shape {:?} \
+         resolves to (out={}, in={}) but caller passed (m={}, k={})",
+        w.name,
+        w.dim_order,
+        w.shape,
+        w.out_dim(),
+        w.in_dim(),
+        m_dim,
+        k_dim,
+    );
     if crate::accel::try_matvec_tensor_batched_usm_f32(w, x, out, m_dim, k_dim, n_rows) {
         return;
     }
@@ -185,6 +221,36 @@ pub(crate) fn matvec_tensor_gate_up_fused_dispatch(
         m,
         k_dim,
         m * k_dim,
+    );
+    // C1b (tests only): both projections' tagged orientation must match
+    // the caller's (out, in); see `matvec_tensor_dispatch`.
+    debug_assert!(
+        w_gate.shape.len() != 2
+            || w_gate.dim_order == rustllama_tensor::DimOrder::Unspecified
+            || (w_gate.out_dim(), w_gate.in_dim()) == (m, k_dim),
+        "gate_up_fused: gate `{}` dim_order {:?} shape {:?} resolves to \
+         (out={}, in={}) but caller passed (m={}, k={})",
+        w_gate.name,
+        w_gate.dim_order,
+        w_gate.shape,
+        w_gate.out_dim(),
+        w_gate.in_dim(),
+        m,
+        k_dim,
+    );
+    debug_assert!(
+        w_up.shape.len() != 2
+            || w_up.dim_order == rustllama_tensor::DimOrder::Unspecified
+            || (w_up.out_dim(), w_up.in_dim()) == (m, k_dim),
+        "gate_up_fused: up `{}` dim_order {:?} shape {:?} resolves to \
+         (out={}, in={}) but caller passed (m={}, k={})",
+        w_up.name,
+        w_up.dim_order,
+        w_up.shape,
+        w_up.out_dim(),
+        w_up.in_dim(),
+        m,
+        k_dim,
     );
     // During imatrix calibration, force the two-matvec base path so
     // each tensor is recorded exactly once via `matvec_tensor_dispatch`
@@ -683,16 +749,15 @@ pub struct LlamaBlockWeights {
     pub w_q: Tensor,         // [n_heads * head_dim, d_model] F32
     pub w_k: Tensor,         // [n_kv_heads * head_dim, d_model] F32
     pub w_v: Tensor,         // [n_kv_heads * head_dim, d_model] F32
-    /// H3: optionally-populated fused QKV weight. When all three of
-    /// `w_q`, `w_k`, `w_v` are F32 + same `d_model` column and
-    /// `RUSTLLAMA_QKV_FUSED=1` is set, `concat_qkv_f32` packs them
-    /// into a single `[d_q + 2*d_kv, d_model]` tensor at load time.
-    /// The forward path dispatches one matvec into a combined output
-    /// buffer instead of three separate dispatches — saves ~2/3 of
-    /// the per-attention dispatch overhead on supported models.
-    /// Quantized w_q/w_k/w_v aren't yet supported (bit-packed concat
-    /// is a future variant); the optional stays `None` and the
-    /// forward path falls through to the per-tensor matvecs.
+    /// H3: fused QKV weight, populated at load (default-on, A4) whenever
+    /// all three of `w_q` / `w_k` / `w_v` are F32 and share `d_model`
+    /// (the contraction dim). `concat_qkv_f32` packs them into a single
+    /// row-major `[d_q + 2*d_kv, d_model]` tensor; the forward path
+    /// dispatches one matvec into a combined output buffer instead of
+    /// three separate dispatches — bit-exact to the three matvecs.
+    /// Quantized w_q/w_k/w_v aren't yet supported (bit-packed concat is a
+    /// future variant); the optional stays `None` and the forward path
+    /// falls through to the per-tensor matvecs.
     pub w_qkv_fused: Option<Tensor>,
     pub w_o: Tensor,         // [d_model, n_heads * head_dim] F32
     /// Optional attention projection biases. Qwen2 has them; vanilla Llama
@@ -1448,14 +1513,13 @@ impl LlamaWeights {
                 let w_q = load_weight(gguf, &format!("{prefix}.attn_q.weight"))?;
                 let w_k = load_weight(gguf, &format!("{prefix}.attn_k.weight"))?;
                 let w_v = load_weight(gguf, &format!("{prefix}.attn_v.weight"))?;
-                // H3: try to fuse w_q / w_k / w_v at load time. Only
-                // takes effect when env-var is set and all three are
-                // F32 (quantized concat is a follow-up).
-                let w_qkv_fused = if crate::accel::qkv_fused_enabled() {
-                    concat_qkv_f32(&w_q, &w_k, &w_v)
-                } else {
-                    None
-                };
+                // H3 (A4): fuse w_q / w_k / w_v at load time whenever the
+                // shapes allow (all three F32 + matching d_model). Default-on,
+                // no env gate — the concat is bit-exact to the three separate
+                // matvecs. Returns None for quantized weights (the common
+                // case; bit-packed concat is a follow-up), so the forward
+                // path falls through to the per-tensor matvecs there.
+                let w_qkv_fused = concat_qkv_f32(&w_q, &w_k, &w_v);
                 blocks.push(LlamaBlockWeights {
                     attn_norm: load_norm(gguf, &format!("{prefix}.attn_norm.weight"))?,
                     w_q,
@@ -2326,39 +2390,44 @@ fn load_norm(gguf: &Gguf, name: &str) -> Result<Vec<f32>, LlamaLoadError> {
 
 /// H3: concat F32 `w_q` / `w_k` / `w_v` into one
 /// `[d_q + 2*d_kv, d_model]` fused tensor. Returns `None` when any
-/// input isn't F32 or the column dims don't match (quant-format
-/// concat is a future variant — the bit-packed layouts don't share
-/// the same per-row stride math).
+/// input isn't F32 (quant-format concat is a future variant — the
+/// bit-packed layouts don't share the same per-row stride math) or the
+/// contraction (input / d_model) dim doesn't match across the three.
 ///
-/// GGUF stores weight matrices as `[out_rows, d_model]` in row-major;
-/// concat is a simple per-row stacking on the leading axis.
+/// A4: the gate compares `in_dim()` (the contraction dim, d_model) —
+/// NOT the output width. On a GQA model the OUTPUT widths differ
+/// (`n_heads*head_dim` for Q vs `n_kv*head_dim` for K/V), so the old
+/// "columns match" gate — which read the GGUF `[in, out]` tensor's LAST
+/// dim (the output) — rejected every GQA model and the fusion never
+/// fired. The physical byte layout is row-major `[out, in]` regardless
+/// of the shape-vector order, so concatenating the raw f32 slices stacks
+/// the three weights on the OUTPUT axis; the result is tagged
+/// [`rustllama_tensor::DimOrder::RowMajor`] with shape `[sum_out, d_model]`.
 fn concat_qkv_f32(w_q: &Tensor, w_k: &Tensor, w_v: &Tensor) -> Option<Tensor> {
     if w_q.dtype != Dtype::F32 || w_k.dtype != Dtype::F32 || w_v.dtype != Dtype::F32 {
         return None;
     }
-    // Shape is `[rows, cols]`; the `cols` dim must match (= d_model)
-    // for the concat to be meaningful.
     if w_q.shape.len() != 2 || w_k.shape.len() != 2 || w_v.shape.len() != 2 {
         return None;
     }
-    let cols = w_q.shape[w_q.shape.len() - 1];
-    if w_k.shape[w_k.shape.len() - 1] != cols || w_v.shape[w_v.shape.len() - 1] != cols {
+    // The contraction (input) dim must match for the stacked matvec to
+    // share one activation vector; GQA makes the output widths differ.
+    let d_model = w_q.in_dim();
+    if w_k.in_dim() != d_model || w_v.in_dim() != d_model {
         return None;
     }
-    let rows_q = w_q.shape[0];
-    let rows_k = w_k.shape[0];
-    let rows_v = w_v.shape[0];
-    let total_rows = rows_q + rows_k + rows_v;
+    let total_out = w_q.out_dim() + w_k.out_dim() + w_v.out_dim();
     let q_slice = rustllama_tensor::as_slice_f32(w_q);
     let k_slice = rustllama_tensor::as_slice_f32(w_k);
     let v_slice = rustllama_tensor::as_slice_f32(w_v);
-    let mut fused = Vec::with_capacity((total_rows * cols) as usize);
+    let mut fused = Vec::with_capacity(total_out * d_model);
     fused.extend_from_slice(q_slice);
     fused.extend_from_slice(k_slice);
     fused.extend_from_slice(v_slice);
+    // from_vec_f32 already tags RowMajor; shape is physical `[out, in]`.
     Some(Tensor::from_vec_f32(
         format!("{}_qkv_fused", w_q.name),
-        vec![total_rows, cols],
+        vec![total_out as u64, d_model as u64],
         fused,
     ))
 }
@@ -7833,11 +7902,11 @@ impl LlamaModel {
         let mut k_buf = vec![0f32; d_kv];
         let mut v_buf = vec![0f32; d_kv];
         // H3: when `w_qkv_fused` is populated (load-time concat of
-        // F32 w_q/w_k/w_v with `RUSTLLAMA_QKV_FUSED=1`), do ONE
-        // matvec into a stacked output buffer and slice into the
-        // three per-head buffers. Saves ~2/3 of the per-attention
-        // dispatch overhead. Falls through to three matvecs when
-        // the fused tensor isn't available (most models today).
+        // F32 w_q/w_k/w_v — default-on, A4), do ONE matvec into a
+        // stacked output buffer and slice into the three per-head
+        // buffers. Saves ~2/3 of the per-attention dispatch overhead.
+        // Falls through to three matvecs when the fused tensor isn't
+        // available (quantized weights — most models today).
         if let Some(w_qkv) = block.w_qkv_fused.as_ref() {
             let mut qkv_out = vec![0f32; d_q + 2 * d_kv];
             matvec_tensor_dispatch(w_qkv, &h_norm, &mut qkv_out, d_q + 2 * d_kv, d);
@@ -13665,6 +13734,78 @@ impl crate::Model for LlamaModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A4 anchor: the load-time fused QKV weight (`concat_qkv_f32`)
+    /// dispatched as ONE matvec must be byte-identical to three separate
+    /// `matvec_tensor_dispatch` calls on a GQA shape (where Q's output
+    /// width differs from K/V's — the case the old `cols`-match gate
+    /// wrongly rejected). Also exercises the DimOrder accessors end to
+    /// end: GgmlNe source weights `[in, out]` fused into a RowMajor
+    /// `[sum_out, d_model]`, both dispatched without tripping C1b.
+    #[test]
+    fn fused_qkv_matches_three_separate_matvecs_on_gqa_shape() {
+        // Build a GGUF-shaped F32 weight: shape == [in, out] (GgmlNe),
+        // physical data row-major [out, in] — exactly `from_gguf`'s output.
+        fn gguf_f32(name: &str, in_dim: usize, out_dim: usize, seed: u32) -> Tensor {
+            let mut data = vec![0f32; out_dim * in_dim];
+            for o in 0..out_dim {
+                for i in 0..in_dim {
+                    let x = (seed as u64)
+                        .wrapping_mul(1_000_003)
+                        .wrapping_add((o * in_dim + i) as u64);
+                    data[o * in_dim + i] = (((x ^ (x >> 13)) & 0x3ff) as f32) / 1024.0 - 0.5;
+                }
+            }
+            let mut t = Tensor::from_vec_f32(name, vec![in_dim as u64, out_dim as u64], data);
+            t.dim_order = rustllama_tensor::DimOrder::GgmlNe;
+            t
+        }
+
+        // GQA: 4 query heads, 2 kv heads, head_dim 8 → d_q=32, d_kv=16,
+        // and a non-square d_model so a silent axis swap would diverge.
+        let d_model = 24usize;
+        let d_q = 32usize;
+        let d_kv = 16usize;
+
+        let w_q = gguf_f32("blk.0.attn_q.weight", d_model, d_q, 1);
+        let w_k = gguf_f32("blk.0.attn_k.weight", d_model, d_kv, 2);
+        let w_v = gguf_f32("blk.0.attn_v.weight", d_model, d_kv, 3);
+
+        // The fused weight must build (the gate compares in_dim == d_model
+        // across q/k/v; GQA output widths differ but must NOT block it).
+        let fused = concat_qkv_f32(&w_q, &w_k, &w_v).expect("GQA QKV must fuse");
+        assert_eq!(fused.dim_order, rustllama_tensor::DimOrder::RowMajor);
+        assert_eq!(fused.out_dim(), d_q + 2 * d_kv);
+        assert_eq!(fused.in_dim(), d_model);
+
+        let h: Vec<f32> = (0..d_model).map(|i| (i as f32) * 0.03 - 0.4).collect();
+
+        // Three separate matvecs (the fall-through path).
+        let mut q_out = vec![0f32; d_q];
+        let mut k_out = vec![0f32; d_kv];
+        let mut v_out = vec![0f32; d_kv];
+        matvec_tensor_dispatch(&w_q, &h, &mut q_out, d_q, d_model);
+        matvec_tensor_dispatch(&w_k, &h, &mut k_out, d_kv, d_model);
+        matvec_tensor_dispatch(&w_v, &h, &mut v_out, d_kv, d_model);
+
+        // One fused matvec over the stacked rows.
+        let mut qkv_out = vec![0f32; d_q + 2 * d_kv];
+        matvec_tensor_dispatch(&fused, &h, &mut qkv_out, d_q + 2 * d_kv, d_model);
+
+        // Byte-identical, slice by slice.
+        let bits = |s: &[f32]| s.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&qkv_out[..d_q]), bits(&q_out), "Q slice differs");
+        assert_eq!(
+            bits(&qkv_out[d_q..d_q + d_kv]),
+            bits(&k_out),
+            "K slice differs"
+        );
+        assert_eq!(
+            bits(&qkv_out[d_q + d_kv..]),
+            bits(&v_out),
+            "V slice differs"
+        );
+    }
 
     /// Diagnostic (V-4): on a REAL hybrid GGUF named by
     /// RUSTLLAMA_REAL_HYBRID_GGUF, the from-embeds hybrid prefill fed

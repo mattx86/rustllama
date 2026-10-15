@@ -719,6 +719,8 @@ fn tensor_from_info(
         strides,
         storage,
         name: name.to_string(),
+        // GGUF `ne` dims copied verbatim → shape is [in, out].
+        dim_order: rustllama_tensor::DimOrder::GgmlNe,
     }
 }
 
