@@ -7972,6 +7972,289 @@ pub fn try_decode_attn_block_cuda_f32(
     (ok, ok && ffn_requested)
 }
 
+/// Whether the Feature-1a SYCL device-resident DECODE attention block is enabled.
+/// The SYCL twin of [`dev_attn_enabled`]: **AUTOMATIC, no env var** — perf-gated
+/// on verdict [`VERDICT_ATTN_DEV_RESIDENT_BLOCK_SYCL`] (persisted by the SYCL arm
+/// of `tune --dev-attn`). The tuner's per-arm force override (shared with the CUDA
+/// block via `DEV_ATTN_FORCE`) short-circuits the verdict so the A/B drives both
+/// arms. Fail-closed: unmeasured / not-a-win ⇒ off (the per-op SYCL path runs).
+/// The block is already correctness-validated (`doctor --sycl-parity`), so the
+/// gate is purely perf.
+fn dev_attn_sycl_enabled() -> bool {
+    match DEV_ATTN_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK_SYCL))
+}
+
+/// Whether a device-resident DECODE attention block can run on this host at all
+/// — read by `tune --dev-attn` to decide whether to load the model for the A/B.
+/// True on an active NVIDIA GPU (the #2 CUDA block) OR an active SYCL/USM GPU
+/// (the Feature-1a block). The `tune` arm forces the path on and confirms it
+/// engaged via `dev_attn_hits`, so this only needs to gate "is any such path
+/// even possible here".
+pub fn dev_attn_capable() -> bool {
+    cuda_active() || usm_attn_enabled()
+}
+
+/// Feature-1a weight-format support gate: map a packed quant `Dtype` to the C++
+/// orchestrator's weight format code (0 = Q4_K, 1 = Q8_0) + its K alignment.
+/// `None` = a format the device-resident block doesn't dispatch (the caller then
+/// declines → the per-op SYCL/CPU ladder runs). Curated-small on purpose: these
+/// two cover the overwhelming majority of real models, and every other weight
+/// format fail-closes to the proven per-op path.
+fn sycl_block_weight_kind(dtype: Dtype) -> Option<(i32, usize)> {
+    match dtype {
+        Dtype::Q4_KRaw => Some((0, 256)),
+        Dtype::Q8_0Raw => Some((1, 32)),
+        _ => None,
+    }
+}
+
+/// Resolve a weight tensor to a live USM pointer for the device-resident block:
+/// a preloaded `SyclUsm` pointer when present, else a cached packed-USM upload
+/// (keyed on the host bytes' address, uploaded once). `None` ⇒ the upload was
+/// declined (budget / alloc) and the caller must fall back. Mirrors the pointer
+/// resolution in `try_matvec_tensor_usm_f32`.
+fn resolve_block_weight_usm(ctx: &mut UsmAttnContext, w: &Tensor) -> Option<*const u8> {
+    if let Some(p) = w.storage.sycl_usm_ptr() {
+        return Some(p);
+    }
+    let wb = as_bytes(w);
+    let key = wb.as_ptr() as usize;
+    let is_mmap = w.storage.mmap_borrowed_ptr_len().is_some();
+    if !ctx.cache_packed_weight(key, wb.len(), wb, is_mmap) {
+        return None;
+    }
+    Some(ctx.packed_weight_cache[&key].as_ptr())
+}
+
+/// Feature 1a: run the WHOLE DECODE attention block for one token on the SYCL
+/// in-order queue as a single submit-chain (one sync per layer), the SYCL twin of
+/// [`try_decode_attn_block_cuda_f32`]. Collapses the per-token flood of
+/// independent `q.submit().wait()` dispatches (rmsnorm, 3 qkv matvecs, 2 RoPEs,
+/// flash-decode, o matvec, residual+norm) into ONE FIFO on the shared stream with
+/// the activation resident in USM across every op. On success `hidden` is updated
+/// (residual done), `h_norm` holds the post-attn RMSNorm (the FFN input), the host
+/// KV cache is appended + coherent, and the device f16 KV mirror + `kv_valid_len`
+/// advanced — so the whole host attention path is skipped. Returns `false` (caller
+/// runs the per-op SYCL/CPU ladder, host buffers untouched) unless: the perf
+/// verdict is on, USM/SYCL is active, there are no qkv biases, there is no Qwen3
+/// q/k head-norm (no USM `qk_head_norm` kernel — correctness-first decline), and
+/// q/k/v/o are all Q4_K or Q8_0. F32 KV only. `k_cache`/`v_cache` are the layer's
+/// host KV slabs (head-major), used to seed the mirror's prefill history.
+#[allow(clippy::too_many_arguments)]
+pub fn try_decode_attn_block_sycl_f32(
+    w_q: &Tensor,
+    w_k: &Tensor,
+    w_v: &Tensor,
+    w_o: &Tensor,
+    attn_norm: &[f32],
+    post_norm: &[f32],
+    q_norm: Option<&[f32]>,
+    k_norm: Option<&[f32]>,
+    has_qkv_bias: bool,
+    inv_freq: &[f32],
+    hidden: &mut [f32],
+    h_norm2: &mut [f32],
+    k_buf: &mut [f32],
+    v_buf: &mut [f32],
+    k_cache: &mut [f32],
+    v_cache: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    d_model: usize,
+    pos: usize,
+    max_ctx: usize,
+    n_layers: usize,
+    layer_idx: usize,
+    rms_eps: f32,
+) -> bool {
+    // Gates (correctness-first): perf verdict/force, USM+SYCL active, no qkv bias,
+    // and no Qwen3 head-norm (there is no USM `qk_head_norm` kernel, so a head-norm
+    // model MUST take the per-op path that applies it on the host).
+    if !dev_attn_sycl_enabled()
+        || !usm_attn_enabled()
+        || !gpu_active_for_current_layer()
+        || has_qkv_bias
+        || q_norm.is_some()
+        || k_norm.is_some()
+    {
+        return false;
+    }
+    let d_q = n_heads * head_dim;
+    let d_kv = n_kv_heads * head_dim;
+    if hidden.len() != d_model
+        || h_norm2.len() != d_model
+        || k_buf.len() != d_kv
+        || v_buf.len() != d_kv
+        || attn_norm.len() != d_model
+        || post_norm.len() != d_model
+        || inv_freq.len() != head_dim / 2
+        || head_dim % 2 != 0
+        || n_kv_heads == 0
+        || n_heads % n_kv_heads != 0
+        || layer_idx >= n_layers
+        || pos >= max_ctx
+        || k_cache.len() < d_kv * max_ctx
+        || v_cache.len() < d_kv * max_ctx
+    {
+        return false;
+    }
+    // Weight-format gate: all four must be a supported code AND K-aligned. q/k/v
+    // consume K = d_model; o consumes K = d_q.
+    let (Some((kq, aq)), Some((kk, ak)), Some((kv_c, av)), Some((ko, ao))) = (
+        sycl_block_weight_kind(w_q.dtype),
+        sycl_block_weight_kind(w_k.dtype),
+        sycl_block_weight_kind(w_v.dtype),
+        sycl_block_weight_kind(w_o.dtype),
+    ) else {
+        return false;
+    };
+    if d_model % aq != 0 || d_model % ak != 0 || d_model % av != 0 || d_q % ao != 0 {
+        return false;
+    }
+    let cfg = UsmAttnConfig {
+        n_layers: n_layers as u32,
+        n_heads: n_heads as u32,
+        n_kv_heads: n_kv_heads as u32,
+        head_dim: head_dim as u32,
+        max_ctx: max_ctx as u32,
+        d: 0,
+        d_ff: 0,
+    };
+    // Seed the f16 KV mirror with the prefill history rows [valid..pos) from the
+    // host KV cache (a no-op once resident) BEFORE borrowing the context below —
+    // this call re-enters USM_ATTN itself, so it must not nest inside our own
+    // borrow. After it, `kv_valid_len[layer_idx] == pos` (so the gap check passes)
+    // and the context exists with the matching cfg. Identical to the seed the
+    // per-op SYCL flash-decode path runs.
+    usm_decode_seed_kv_f32(
+        k_cache,
+        v_cache,
+        layer_idx,
+        pos as u32,
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        max_ctx as u32,
+        n_layers as u32,
+    );
+    let kv_len = (pos + 1) as u32;
+    let ran = USM_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let needs_rebuild = match slot.as_ref() {
+            Some(ctx) => ctx.cfg != cfg,
+            None => true,
+        };
+        if needs_rebuild {
+            *slot = UsmAttnContext::try_new(cfg);
+            if slot.is_none() {
+                return false;
+            }
+        }
+        let ctx = slot.as_mut().expect("usm ctx just built");
+        // Staleness + contiguous-validity gate (same as the per-op decode path):
+        // the flash below reads rows 0..=pos from the mirror; a gap means the seed
+        // couldn't fill the history (prefill ran elsewhere), so decline to the CPU
+        // path which reads the host KV directly.
+        let epoch = USM_KV_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if ctx.kv_epoch != epoch {
+            for v in ctx.kv_valid_len.iter_mut() {
+                *v = 0;
+            }
+            ctx.kv_epoch = epoch;
+        }
+        let valid = ctx.kv_valid_len[layer_idx];
+        if pos as u32 > valid {
+            return false;
+        }
+        // Resolve the four weights to USM pointers (preloaded or cached upload).
+        // Sequential (not a tuple) because each borrows `ctx` mutably to upload;
+        // the returned `*const u8` points at the STABLE USM allocation, not into
+        // the cache map, so a later insert's rehash can't invalidate it.
+        let Some(wq_ptr) = resolve_block_weight_usm(ctx, w_q) else { return false };
+        let Some(wk_ptr) = resolve_block_weight_usm(ctx, w_k) else { return false };
+        let Some(wv_ptr) = resolve_block_weight_usm(ctx, w_v) else { return false };
+        let Some(wo_ptr) = resolve_block_weight_usm(ctx, w_o) else { return false };
+        // Extract the remaining raw pointers (raw ptrs don't hold the borrow).
+        let stream_raw: *const sk::SyclStream = &ctx.stream;
+        let kmir = ctx.k_caches[layer_idx].as_mut_ptr();
+        let vmir = ctx.v_caches[layer_idx].as_mut_ptr();
+        // SAFETY: weight USM pointers are live (cached on this ctx's stream or
+        // preloaded); the host slices (`hidden`/`h_norm2`/`k_buf`/`v_buf`/norms/
+        // `inv_freq`) are sized to the dims (validated above); `kmir`/`vmir` are
+        // this ctx's f16 K/V caches, seeded to `pos`; the block syncs before
+        // returning so there's no host/device overlap on the staged slab.
+        let res = unsafe {
+            sk::decode_attn_block_usm_raw(
+                &*stream_raw,
+                wq_ptr as *const std::ffi::c_void, kq,
+                wk_ptr as *const std::ffi::c_void, kk,
+                wv_ptr as *const std::ffi::c_void, kv_c,
+                wo_ptr as *const std::ffi::c_void, ko,
+                attn_norm.as_ptr(),
+                post_norm.as_ptr(),
+                inv_freq.as_ptr(),
+                hidden.as_mut_ptr(),
+                h_norm2.as_mut_ptr(),
+                k_buf.as_mut_ptr(),
+                v_buf.as_mut_ptr(),
+                kmir,
+                vmir,
+                n_heads as u32,
+                n_kv_heads as u32,
+                head_dim as u32,
+                d_model as u32,
+                pos as u32,
+                max_ctx as u32,
+                kv_len,
+                rms_eps,
+            )
+        };
+        match res {
+            Ok(true) => {
+                // The device scatter wrote mirror row [pos]; advance the valid
+                // range the same way the per-op decode path does.
+                if pos as u32 == valid {
+                    ctx.kv_valid_len[layer_idx] = pos as u32 + 1;
+                }
+                note_sycl_success();
+                true
+            }
+            Ok(false) => false,
+            Err(_) => {
+                note_sycl_failure();
+                false
+            }
+        }
+    });
+    if ran {
+        // Append this token's post-RoPE K / plain V (just written into k_buf/v_buf
+        // by the block) into the host KV cache at `pos` (head-major), so the host
+        // cache stays coherent for a later CPU fallback / the next mirror seed.
+        for h in 0..n_kv_heads {
+            let dst = (h * max_ctx + pos) * head_dim;
+            let src = h * head_dim;
+            k_cache[dst..dst + head_dim].copy_from_slice(&k_buf[src..src + head_dim]);
+            v_cache[dst..dst + head_dim].copy_from_slice(&v_buf[src..src + head_dim]);
+        }
+        if DEV_ATTN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            tracing::info!(
+                "Feature 1a SYCL on-device activation-residency attention ENGAGED \
+                 — the whole decode attention block runs USM-resident on one \
+                 in-order submit-chain (perf-gated verdict \
+                 attn:dev_resident_block_sycl) (logged once)"
+            );
+        }
+    }
+    ran
+}
+
 /// Drain the cross-layer-resident `hidden` (#2 Phase 2) from the CUDA activation
 /// slab to the host. The caller uses this when a dense model finishes its
 /// device-resident layer run (before the final norm / LM head) or must fall back

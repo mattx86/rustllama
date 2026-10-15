@@ -1322,6 +1322,30 @@ void rsl_dequant_q6_k_to_f32_usm(rsl_stream* s,
                                   float* out_usm,
                                   int n_blocks);
 
+/* Feature 1a: SYCL device-resident DECODE attention block. Submits the whole
+ * per-layer attention chain (rmsnorm -> q/k/v matvec -> RoPE -> f16-mirror write
+ * -> flash-decode -> o matvec -> residual+norm) as ONE in-order FIFO and syncs
+ * once, instead of a per-op flood of submit+wait. Activations run f32 end-to-end;
+ * the reused f16 KV mirror (`k_caches`/`v_caches`) is the only lossy step.
+ * `kq/kk/kv_kind/ko` are weight format codes (0=Q4_K, 1=Q8_0). `k_mirror`/
+ * `v_mirror` are the layer's persistent f16 USM KV buffers, pre-seeded with
+ * rows [0,pos). Returns 1 on success (hidden/h_norm2/k_row/v_row written),
+ * 0 on bad shape / alloc / unsupported code (caller falls back to the per-op
+ * ladder). Attention-only; the caller runs the FFN. */
+int rsl_decode_attn_block_usm(rsl_stream* s,
+                              const void* wq_usm, int kq,
+                              const void* wk_usm, int kk,
+                              const void* wv_usm, int kv_kind,
+                              const void* wo_usm, int ko,
+                              const float* attn_norm, const float* ffn_norm,
+                              const float* inv_freq,
+                              float* hidden, float* h_norm2,
+                              float* k_row, float* v_row,
+                              uint16_t* k_mirror, uint16_t* v_mirror,
+                              int n_heads, int n_kv_heads, int head_dim,
+                              int d_model, int pos, int max_ctx, int kv_len,
+                              float rms_eps);
+
 #ifdef __cplusplus
 }
 #endif

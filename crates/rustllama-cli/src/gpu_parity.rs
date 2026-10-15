@@ -370,6 +370,11 @@ fn probe_names() -> Vec<String> {
     v.push("attn:prefill_q8_0".to_string());
     v.push("attn:decode_tq".to_string());
     v.push("attn:prefill_tq".to_string());
+    // Feature 1a: the WHOLE device-resident DECODE attention block (rmsnorm ->
+    // q/k/v matvec -> RoPE -> f16-mirror write -> flash -> o matvec -> residual+
+    // norm) as one in-order submit-chain, vs the CPU reference end to end. The one
+    // orchestration probe that isn't covered by the per-op kernels above.
+    v.push("attn:dev_resident_block_sycl".to_string());
     for l in LAYOUTS {
         v.push(format!("matvec:{}", l.name));
     }
@@ -1234,6 +1239,202 @@ fn dequant_kv_tq(
 /// byte-aligned edges).
 const TQ_PROBE_BITS: u8 = 2;
 
+/// Feature 1a parity probe: the WHOLE device-resident DECODE attention block
+/// (`rsl_decode_attn_block_usm`) vs a CPU reference computing the identical
+/// sequence on identical inputs. This is the only orchestration probe — the
+/// individual kernels (matvec / flash / rmsnorm) are already covered above — so
+/// it validates the CHAINING, the f32-activation residency, and the f16 KV-mirror
+/// scatter/read. Q4_K weights, a small realistic shape, a short pre-seeded KV
+/// history (so the flash spans multiple positions). cos ~1.0 / small max_rel:
+/// the chain is f32 end-to-end, the only lossy step is the f16 KV mirror (same
+/// rounding the per-op decode path carries), so the gate matches the f32 flash
+/// probe's (cos > 0.995, max_rel < 0.10).
+fn probe_decode_block(stream: &sk::SyclStream, name: &str, started: Instant) {
+    use std::ffi::c_void;
+    const HEAD_DIM: usize = 128;
+    const N_HEADS: usize = 8;
+    const N_KV: usize = 2;
+    const D_MODEL: usize = 1024;
+    const MAX_CTX: usize = 64;
+    const POS: usize = 5; // 5 seeded history rows + this token => kv_len = 6
+    const EPS: f32 = 1e-5;
+    const THETA: f32 = 10000.0;
+    let d_q = N_HEADS * HEAD_DIM;
+    let d_kv = N_KV * HEAD_DIM;
+    let half = HEAD_DIM / 2;
+    let kv_len = POS + 1;
+
+    // Q4_K weights (M x K packed bytes): Wq [d_q x D_MODEL], Wk/Wv [d_kv x
+    // D_MODEL], Wo [D_MODEL x d_q]. Same synthesis + CPU reference matvec the
+    // matvec probes use, so the per-row dequant matches the device kernel.
+    let layout = LAYOUTS.iter().find(|l| l.name == "q4_k").expect("q4_k layout");
+    let cpu_mv = cpu_matvec_for("q4_k");
+    let wq = gen_quant_bytes(layout, d_q, D_MODEL, 0x1111);
+    let wk = gen_quant_bytes(layout, d_kv, D_MODEL, 0x2222);
+    let wv = gen_quant_bytes(layout, d_kv, D_MODEL, 0x3333);
+    let wo = gen_quant_bytes(layout, D_MODEL, d_q, 0x4444);
+
+    // Norms, hidden, inv_freq, and the synthetic KV history.
+    let mut rng = XorShift(0xDEC0DE);
+    let hidden0: Vec<f32> = (0..D_MODEL).map(|_| rng.f32_pm(0.6)).collect();
+    let attn_norm: Vec<f32> = (0..D_MODEL).map(|_| 0.5 + rng.f32_pm(0.2)).collect();
+    let ffn_norm: Vec<f32> = (0..D_MODEL).map(|_| 0.5 + rng.f32_pm(0.2)).collect();
+    let inv_freq: Vec<f32> = (0..half)
+        .map(|j| 1.0f32 / THETA.powf(2.0 * j as f32 / HEAD_DIM as f32))
+        .collect();
+    // History rows [0, POS) per kv-head (head-major), as f32 then f16-rounded.
+    let hist_elems = N_KV * MAX_CTX * HEAD_DIM;
+    let mut k_hist_f16 = vec![0u16; hist_elems];
+    let mut v_hist_f16 = vec![0u16; hist_elems];
+    for h in 0..N_KV {
+        for t in 0..POS {
+            for d in 0..HEAD_DIM {
+                let idx = (h * MAX_CTX + t) * HEAD_DIM + d;
+                k_hist_f16[idx] = half::f16::from_f32(rng.f32_pm(0.6)).to_bits();
+                v_hist_f16[idx] = half::f16::from_f32(rng.f32_pm(0.6)).to_bits();
+            }
+        }
+    }
+
+    // ---- CPU reference (identical op sequence) ----
+    let rope = |qk: &mut [f32], nh: usize| {
+        for hh in 0..nh {
+            let base = hh * HEAD_DIM;
+            for j in 0..half {
+                let angle = POS as f32 * inv_freq[j];
+                let (s, c) = angle.sin_cos();
+                let x0 = qk[base + j];
+                let x1 = qk[base + j + half];
+                qk[base + j] = x0 * c - x1 * s;
+                qk[base + j + half] = x0 * s + x1 * c;
+            }
+        }
+    };
+    let mut hnorm = vec![0f32; D_MODEL];
+    k::rmsnorm_f32_row(&hidden0, &attn_norm, &mut hnorm, EPS);
+    let mut q_ref = vec![0f32; d_q];
+    let mut k_ref = vec![0f32; d_kv];
+    let mut v_ref = vec![0f32; d_kv];
+    cpu_mv(&wq, &hnorm, &mut q_ref, d_q, D_MODEL);
+    cpu_mv(&wk, &hnorm, &mut k_ref, d_kv, D_MODEL);
+    cpu_mv(&wv, &hnorm, &mut v_ref, d_kv, D_MODEL);
+    rope(&mut q_ref, N_HEADS);
+    rope(&mut k_ref, N_KV);
+    // Build the full f32 KV cache the reference flash reads: the f16-rounded
+    // history for [0,POS) + the f16-rounded new (post-RoPE K / plain V) at POS —
+    // matching exactly what the device mirror holds.
+    let mut kcache = vec![0f32; hist_elems];
+    let mut vcache = vec![0f32; hist_elems];
+    for h in 0..N_KV {
+        for t in 0..POS {
+            for d in 0..HEAD_DIM {
+                let idx = (h * MAX_CTX + t) * HEAD_DIM + d;
+                kcache[idx] = half::f16::from_bits(k_hist_f16[idx]).to_f32();
+                vcache[idx] = half::f16::from_bits(v_hist_f16[idx]).to_f32();
+            }
+        }
+        for d in 0..HEAD_DIM {
+            let idx = (h * MAX_CTX + POS) * HEAD_DIM + d;
+            kcache[idx] = half::f16::from_f32(k_ref[h * HEAD_DIM + d]).to_f32();
+            vcache[idx] = half::f16::from_f32(v_ref[h * HEAD_DIM + d]).to_f32();
+        }
+    }
+    let mut attn_ref = vec![0f32; d_q];
+    k::gqa_attention_one_step(
+        &q_ref, &kcache, &vcache, &mut attn_ref,
+        N_HEADS, N_KV, HEAD_DIM, MAX_CTX, kv_len,
+    );
+    let mut o_ref = vec![0f32; D_MODEL];
+    cpu_mv(&wo, &attn_ref, &mut o_ref, D_MODEL, d_q);
+    let mut hidden_ref = hidden0.clone();
+    for i in 0..D_MODEL {
+        hidden_ref[i] += o_ref[i];
+    }
+    let mut hnorm2_ref = vec![0f32; D_MODEL];
+    k::rmsnorm_f32_row(&hidden_ref, &ffn_norm, &mut hnorm2_ref, EPS);
+    if !hidden_ref.iter().chain(hnorm2_ref.iter()).all(|v| v.is_finite()) {
+        emit(name, "SKIP", "cpu-reference-nonfinite");
+        return;
+    }
+
+    // ---- Device: upload weights + seed mirror, run the block ----
+    let alloc = (|| -> sk::Result<_> {
+        let mut wqb = sk::SyclSharedBuffer::<u8>::alloc(stream, wq.len())?;
+        wqb.as_mut_slice().copy_from_slice(&wq);
+        let mut wkb = sk::SyclSharedBuffer::<u8>::alloc(stream, wk.len())?;
+        wkb.as_mut_slice().copy_from_slice(&wk);
+        let mut wvb = sk::SyclSharedBuffer::<u8>::alloc(stream, wv.len())?;
+        wvb.as_mut_slice().copy_from_slice(&wv);
+        let mut wob = sk::SyclSharedBuffer::<u8>::alloc(stream, wo.len())?;
+        wob.as_mut_slice().copy_from_slice(&wo);
+        let mut kmir = sk::SyclSharedBuffer::<u16>::alloc(stream, hist_elems)?;
+        kmir.as_mut_slice().copy_from_slice(&k_hist_f16);
+        let mut vmir = sk::SyclSharedBuffer::<u16>::alloc(stream, hist_elems)?;
+        vmir.as_mut_slice().copy_from_slice(&v_hist_f16);
+        Ok((wqb, wkb, wvb, wob, kmir, vmir))
+    })();
+    let (wqb, wkb, wvb, wob, mut kmir, mut vmir) = match alloc {
+        Ok(t) => t,
+        Err(_) => {
+            emit(name, "KERNEL_ERR", "usm-alloc-failed");
+            return;
+        }
+    };
+    let mut hidden_dev = hidden0.clone();
+    let mut hnorm2_dev = vec![0f32; D_MODEL];
+    let mut k_row_dev = vec![0f32; d_kv];
+    let mut v_row_dev = vec![0f32; d_kv];
+    // SAFETY: all USM buffers (weights, mirrors) live on `stream`; the norm /
+    // hidden / inv_freq / out slices are host-sized to the dims; the block syncs
+    // before returning. kq/kk/kv/ko = 0 (Q4_K).
+    let res = unsafe {
+        sk::decode_attn_block_usm_raw(
+            stream,
+            wqb.as_ptr() as *const c_void, 0,
+            wkb.as_ptr() as *const c_void, 0,
+            wvb.as_ptr() as *const c_void, 0,
+            wob.as_ptr() as *const c_void, 0,
+            attn_norm.as_ptr(),
+            ffn_norm.as_ptr(),
+            inv_freq.as_ptr(),
+            hidden_dev.as_mut_ptr(),
+            hnorm2_dev.as_mut_ptr(),
+            k_row_dev.as_mut_ptr(),
+            v_row_dev.as_mut_ptr(),
+            kmir.as_mut_ptr(),
+            vmir.as_mut_ptr(),
+            N_HEADS as u32,
+            N_KV as u32,
+            HEAD_DIM as u32,
+            D_MODEL as u32,
+            POS as u32,
+            MAX_CTX as u32,
+            kv_len as u32,
+            EPS,
+        )
+    };
+    let ms = started.elapsed().as_millis();
+    match res {
+        Ok(true) => {
+            // Grade both device outputs (the residual hidden + the post-attn
+            // norm == FFN input) jointly against the CPU reference.
+            let mut gpu = hidden_dev.clone();
+            gpu.extend_from_slice(&hnorm2_dev);
+            let mut cpu = hidden_ref.clone();
+            cpu.extend_from_slice(&hnorm2_ref);
+            let (cos, max_rel) = compare(&gpu, &cpu);
+            let verdict = if cos > 0.995 && max_rel < 0.10 {
+                "OK"
+            } else {
+                "MISCOMPUTE"
+            };
+            emit(name, verdict, &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"));
+        }
+        Ok(false) => emit(name, "SKIP", &format!("block-declined ms={ms}")),
+        Err(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
+    }
+}
+
 fn probe_attn(stream: &sk::SyclStream, name: &str, variant: &str, started: Instant) {
     // Quant-KV variants (decode_mxfp4 … prefill_nvfp4) run the F32-Q /
     // packed-K/V flash kernels and grade against the full-precision CPU
@@ -1241,6 +1442,10 @@ fn probe_attn(stream: &sk::SyclStream, name: &str, variant: &str, started: Insta
     // Split here so each keeps its own buffer setup (f16 vs f32 + packed).
     // Q8_0 KV first: its per-row-scale layout isn't a `QuantKvFormat`, so it has
     // its own probe (routed before the block-format check, which would miss it).
+    if variant == "dev_resident_block_sycl" {
+        probe_decode_block(stream, name, started);
+        return;
+    }
     if variant == "decode_q8_0" {
         probe_attn_q8_0(stream, name, "decode", started);
         return;

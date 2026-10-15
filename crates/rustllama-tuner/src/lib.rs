@@ -222,6 +222,17 @@ pub const VERDICT_MATVEC_Q4K_W4A8: &str = "matvec:q4_k_w4a8";
 /// configs where attention isn't the bottleneck, a win only on a dense model or
 /// a fully-fitting GPU). Read by `accel::dev_attn_enabled`; f32-KV-only at dispatch.
 pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK: &str = "attn:dev_resident_block";
+/// SYCL (USM) twin of [`VERDICT_ATTN_DEV_RESIDENT_BLOCK`] — the #2 on-device
+/// activation-residency DECODE attention block run on the SYCL in-order queue
+/// (Feature 1a). Separate verdict because the win/loss profile is per-backend:
+/// the SYCL block collapses a per-token FLOOD of independent `q.submit().wait()`
+/// dispatches into ONE submit-chain that syncs once per layer, so the measured
+/// saving is the SYCL dispatch/sync overhead (not a PCIe transfer like CUDA).
+/// Same PERF-only semantics: the block is already correct (parity-validated via
+/// `doctor --sycl-parity`), so `tune --dev-attn` enables it only where it beats
+/// the per-op SYCL path on THIS device+model (fail-closed off otherwise). Read by
+/// `accel::dev_attn_sycl_enabled`; f32-KV-only + no-Qwen3-head-norm at dispatch.
+pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK_SYCL: &str = "attn:dev_resident_block_sycl";
 
 /// Read the on-device verdict for a kernel probe name, if one has been
 /// recorded. `None` = never validated (or the probe SKIPped because the

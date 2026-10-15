@@ -7754,13 +7754,18 @@ impl LlamaModel {
             let cross_layer = dense_ffn_arg.is_some();
             let upload_hidden = if cross_layer { !hidden_dev_resident } else { true };
             let download_hidden = !cross_layer;
-            // The fused CUDA decode block rotates with the inv-freq table but
-            // does NOT apply the YaRN attention `mscale` (it fuses the Q·K score
-            // on-device, so Q can't be post-scaled). Run it only when `mscale`
-            // is a no-op; YaRN models fall to the software path below, which
-            // applies `mscale`. Non-scaled + linear/NTK (`mscale == 1.0`) keep
-            // the device block, fed `self.rope_inv_freq` — the scaled table,
-            // byte-identical to the base table when the model carries no scaling.
+            // Feature 1a (SYCL sibling of the #2 CUDA block): set when the SYCL
+            // device-resident block handled this layer. It is attention-only and
+            // per-layer (no cross-layer hidden residency), so it must NOT set
+            // `hidden_dev_resident` below.
+            let mut device_attn_is_sycl = false;
+            // The fused CUDA decode block (and its SYCL sibling) rotate with the
+            // inv-freq table but do NOT apply the YaRN attention `mscale` (they
+            // fuse the Q·K score on-device, so Q can't be post-scaled). Run them
+            // only when `mscale` is a no-op; YaRN models fall to the software path
+            // below, which applies it. Non-scaled + linear/NTK keep the device
+            // blocks, fed `self.rope_inv_freq` — the scaled table, byte-identical
+            // to the base table when the model carries no scaling.
             let device_attn = if self.yarn_mscale == 1.0 {
                 if let KvLayer::F32 { k, v } = &mut kv.layers[layer_idx] {
                     let (attn_ran, ffn_ran) = crate::accel::try_decode_attn_block_cuda_f32(
@@ -7794,7 +7799,46 @@ impl LlamaModel {
                         download_hidden,
                     );
                     device_dense_ffn = ffn_ran;
-                    attn_ran
+                    if attn_ran {
+                        true
+                    } else {
+                        // Feature 1a: the SYCL device-resident DECODE block, tried
+                        // when the CUDA block didn't run (no CUDA, or it declined).
+                        // Inert off SYCL (the gate returns false → byte-identical
+                        // path). Attention-only: `h_norm` holds the post-attn norm
+                        // (FFN input), so the host FFN below runs unchanged;
+                        // `device_dense_ffn` stays false. Fed the same scaled rope
+                        // table as the CUDA block.
+                        let sycl_ran = crate::accel::try_decode_attn_block_sycl_f32(
+                            block.w_q(),
+                            block.w_k(),
+                            block.w_v(),
+                            block.w_o(),
+                            block.attn_norm(),
+                            block.ffn_norm(),
+                            block.q_norm(),
+                            block.k_norm(),
+                            block.b_q().is_some() || block.b_k().is_some() || block.b_v().is_some(),
+                            &self.rope_inv_freq,
+                            &mut hidden,
+                            &mut h_norm,
+                            &mut k_buf,
+                            &mut v_buf,
+                            k,
+                            v,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            d,
+                            cur_pos,
+                            kv_max_ctx,
+                            cfg.n_layers,
+                            layer_idx,
+                            cfg.rms_eps,
+                        );
+                        device_attn_is_sycl = sycl_ran;
+                        sycl_ran
+                    }
                 } else {
                     false
                 }
@@ -7803,8 +7847,9 @@ impl LlamaModel {
             };
             if device_attn {
                 // Cross-layer: hidden stays on device (host stale); per-layer:
-                // it was downloaded, so host is authoritative.
-                hidden_dev_resident = cross_layer;
+                // it was downloaded, so host is authoritative. The SYCL block is
+                // always per-layer, so it never keeps hidden resident.
+                hidden_dev_resident = cross_layer && !device_attn_is_sycl;
             } else if hidden_dev_resident {
                 // The device path declined this layer but the slab holds the
                 // current hidden (a prior dense layer left it resident); refresh

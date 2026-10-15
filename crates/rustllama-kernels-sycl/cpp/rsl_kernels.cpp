@@ -3023,14 +3023,17 @@ inline void matvec_q8_0_packed_f32_usm_impl(
     const void* w_bytes_usm,
     const float* x_usm,
     float* out_usm,
-    int M, int K) {
+    int M, int K,
+    // Feature 1a: see `matvec_q4_k_packed_f32_usm_impl` — `false` drops the
+    // trailing `.wait()` so the op chains on the shared in-order queue.
+    bool wait_after = true) {
     constexpr std::size_t LWS = LWS_T;
     const int blocks_per_row = K / 32;
     const int bytes_per_row = blocks_per_row * 34;
     const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
     const std::size_t global =
         ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
-    q.submit([&](sycl::handler& h) {
+    auto ev = q.submit([&](sycl::handler& h) {
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(LWS)),
             [=](sycl::nd_item<1> it) {
@@ -3054,7 +3057,8 @@ inline void matvec_q8_0_packed_f32_usm_impl(
                 }
                 out_usm[m] = acc;
             });
-    }).wait();
+    });
+    if (wait_after) ev.wait();
 }
 
 extern "C" {
@@ -3212,14 +3216,20 @@ inline void matvec_q4_k_packed_f32_usm_impl(
     const void* w_bytes_usm,
     const float* x_usm,
     float* out_usm,
-    int M, int K) {
+    int M, int K,
+    // Feature 1a (device-resident decode block): `false` enqueues the matvec
+    // on the shared in-order queue WITHOUT the trailing `.wait()`, so the whole
+    // per-layer attention chain submits as one FIFO that the orchestrator syncs
+    // ONCE at the end. Defaults to `true` so every existing single-op caller
+    // (the `rsl_matvec_q4_k_packed_f32_usm` switch arms) keeps its wait.
+    bool wait_after = true) {
     constexpr std::size_t LWS = LWS_T;
     const int blocks_per_row = K / 256;
     const int bytes_per_row = blocks_per_row * 144;
     const uint8_t* w_bytes = static_cast<const uint8_t*>(w_bytes_usm);
     const std::size_t global =
         ((static_cast<std::size_t>(M) + LWS - 1) / LWS) * LWS;
-    q.submit([&](sycl::handler& h) {
+    auto ev = q.submit([&](sycl::handler& h) {
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(LWS)),
             [=](sycl::nd_item<1> it) {
@@ -3268,7 +3278,8 @@ inline void matvec_q4_k_packed_f32_usm_impl(
                 }
                 out_usm[m] = acc;
             });
-    }).wait();
+    });
+    if (wait_after) ev.wait();
 }
 
 // Reopen extern "C" so the dispatcher's linkage matches the
@@ -13970,3 +13981,303 @@ void rsl_dequant_q6_k_to_f32_usm(rsl_stream* s,
 
 
 }  // extern "C"
+
+
+// ===========================================================================
+// Feature 1a: SYCL device-resident DECODE attention block
+//             (rsl_decode_attn_block_usm)
+// ===========================================================================
+//
+// WHY: decode on SYCL was a per-token FLOOD of independent `q.submit().wait()`
+// dispatches — one rmsnorm, three qkv matvecs, two RoPEs, a flash-decode, an
+// o-proj matvec, a residual+norm — each paying a full submit + host sync. On an
+// in-order queue the FIFO already guarantees op ordering, so the waits between
+// ops are pure overhead. This entry submits the WHOLE per-layer attention chain
+// as one FIFO against RESIDENT USM activation slabs and syncs ONCE at the end.
+// It mirrors the CUDA `decode_attn_block_f32` precedent (same op sequence), with
+// the SYCL-specific wrinkle handled below.
+//
+// PRECISION (the one real design choice): the shipped USM primitives are
+// SPLIT-precision — `rmsnorm_usm` / `rope_usm` / `flash_attn_decode_usm` are
+// f16-I/O (u16 bits), while the matvecs and `add_rmsnorm_f32_usm` are f32-I/O,
+// and there is NO USM `qk_head_norm` kernel. Chaining them in their native
+// precisions would need an f16<->f32 convert at every boundary (and lossy f16
+// rounding on the normalized activation). Instead the block runs its activations
+// in f32 END TO END (f32 twins of rmsnorm/RoPE/flash below, reusing the f32
+// matvecs + f32 add_rmsnorm unchanged), so it is bit-exact to the CPU reference
+// up to float reduction order. The ONLY lossy step is the KV MIRROR, which stays
+// f16 on purpose: it IS the `k_caches`/`v_caches` residency this block REUSES and
+// the next decode step reads, and its rounding already sits inside the parity
+// tolerance the per-op decode path carries. Qwen3 head-norm (q_norm/k_norm) has
+// no USM kernel, so the Rust caller declines those models before calling here.
+
+// --- f32, nowait twins of the split-precision USM primitives ---
+// Each submits on the shared in-order queue WITHOUT a trailing `.wait()` so the
+// whole chain FIFOs; the orchestrator calls `q.wait()` once at the end. The math
+// is identical to the shipped f16 kernels, minus the bits<->f32 round-trip.
+
+// RMSNorm, f32 I/O (decode is n_rows==1). Matches `rsl_rmsnorm_usm`.
+static inline sycl::event rsl_rmsnorm_f32_nowait(
+    sycl::queue& q, const float* x, const float* w, float* y,
+    int n_rows, int d, float eps) {
+    return q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(n_rows)),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+            const int r = static_cast<int>(it.get_global_id(0));
+            if (r >= n_rows) return;
+            const int base = r * d;
+            float sum_sq = 0.0f;
+            for (int i = 0; i < d; ++i) { const float v = x[base + i]; sum_sq += v * v; }
+            const float scale = 1.0f / sycl::sqrt(sum_sq / static_cast<float>(d) + eps);
+            for (int i = 0; i < d; ++i) y[base + i] = x[base + i] * scale * w[i];
+        });
+    });
+}
+
+// RoPE (neox / half-split), f32 I/O, in place. Matches `rsl_rope_usm`, but reads
+// `inv_freq` as f32 so the chain stays single-precision (no f16 freq table).
+static inline sycl::event rsl_rope_f32_nowait(
+    sycl::queue& q, float* qk, int n_heads, int head_dim, int pos,
+    const float* inv_freq) {
+    const int half = head_dim / 2;
+    const int total = n_heads * half;
+    return q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(total)),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+            const int flat = static_cast<int>(it.get_global_id(0));
+            if (flat >= total) return;
+            const int head = flat / half;
+            const int j = flat % half;
+            const float angle = static_cast<float>(pos) * inv_freq[j];
+            const float c = sycl::cos(angle);
+            const float si = sycl::sin(angle);
+            const int b = head * head_dim;
+            const float x0 = qk[b + j];
+            const float x1 = qk[b + j + half];
+            qk[b + j] = x0 * c - x1 * si;
+            qk[b + j + half] = x0 * si + x1 * c;
+        });
+    });
+}
+
+// Scatter one decode token's K (or V) row [n_kv_heads*head_dim], head-major
+// contiguous, into the f16 KV mirror at `pos`:
+//   mirror[(h*max_ctx + pos)*head_dim + d] = f16(src[h*head_dim + d]).
+// One work-item per (h,d). This is the ONLY f16 conversion in the chain — the
+// mirror IS the reused `k_caches`/`v_caches` residency the next decode step
+// reads, and its rounding sits inside the per-op decode parity gate.
+static inline sycl::event rsl_kv_write_f16_nowait(
+    sycl::queue& q, const float* src, uint16_t* mirror,
+    int n_kv_heads, int head_dim, int pos, int max_ctx) {
+    const int total = n_kv_heads * head_dim;
+    return q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(total)),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+            const int flat = static_cast<int>(it.get_global_id(0));
+            if (flat >= total) return;
+            const int hh = flat / head_dim;
+            const int d = flat % head_dim;
+            mirror[(hh * max_ctx + pos) * head_dim + d] = f32_to_bits(src[flat]);
+        });
+    });
+}
+
+// FlashAttention decode: F32 query/out over the F16 KV MIRROR. Algorithmically
+// identical to the shipped `rsl_flash_attn_decode_usm` (online softmax, one
+// work-item per query head) — only the I/O precision differs: q/out stay f32
+// (fed straight from the f32 matvec+RoPE and into the f32 o-proj, no convert),
+// while K/V come from the f16 mirror via `bits_to_f32` (same as the f16 kernel).
+static inline sycl::event rsl_flash_decode_f32q_f16kv_nowait(
+    sycl::queue& q, const float* q_in, const uint16_t* k_mir, const uint16_t* v_mir,
+    float* out, int n_heads, int n_kv_heads, int head_dim, int max_ctx, int kv_len) {
+    const int n_gqa = n_heads / n_kv_heads;
+    const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    return q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(n_heads)),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+            const int hh = static_cast<int>(it.get_global_id(0));
+            if (hh >= n_heads) return;
+            const int kv_h = hh / n_gqa;
+            const int q_base = hh * head_dim;
+            const int out_base = hh * head_dim;
+            for (int i = 0; i < head_dim; ++i) out[out_base + i] = 0.0f;
+            float m = -INFINITY;
+            float l = 0.0f;
+            for (int t = 0; t < kv_len; ++t) {
+                const int kv_off = (kv_h * max_ctx + t) * head_dim;
+                float s_dot = 0.0f;
+                for (int i = 0; i < head_dim; ++i)
+                    s_dot += q_in[q_base + i] * bits_to_f32(k_mir[kv_off + i]);
+                s_dot *= scale;
+                const float m_new = sycl::fmax(m, s_dot);
+                const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
+                const float p = sycl::exp(s_dot - m_new);
+                l = l * rescale + p;
+                for (int i = 0; i < head_dim; ++i) {
+                    const float cur = out[out_base + i];
+                    out[out_base + i] = cur * rescale + p * bits_to_f32(v_mir[kv_off + i]);
+                }
+                m = m_new;
+            }
+            const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+            for (int i = 0; i < head_dim; ++i) out[out_base + i] *= inv_l;
+        });
+    });
+}
+
+// Fused residual-add + RMSNorm, f32 I/O, nowait. Same math as the shipped
+// `rsl_add_rmsnorm_f32_usm` (hidden += branch; y = rmsnorm(hidden)*w).
+static inline sycl::event rsl_add_rmsnorm_f32_nowait(
+    sycl::queue& q, float* hidden, const float* branch, const float* w,
+    float* y_norm, int n_rows, int d, float eps) {
+    return q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(n_rows)),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+            const int r = static_cast<int>(it.get_global_id(0));
+            if (r >= n_rows) return;
+            const int base = r * d;
+            float sum_sq = 0.0f;
+            for (int i = 0; i < d; ++i) {
+                const float s_val = hidden[base + i] + branch[base + i];
+                hidden[base + i] = s_val;
+                sum_sq += s_val * s_val;
+            }
+            const float scale = 1.0f / sycl::sqrt(sum_sq / static_cast<float>(d) + eps);
+            for (int i = 0; i < d; ++i) y_norm[base + i] = hidden[base + i] * scale * w[i];
+        });
+    });
+}
+
+// Dispatch one SUPPORTED decode-block matvec format WITHOUT waiting. 0 = Q4_K,
+// 1 = Q8_0 (the Rust caller declines any other format, so an unsupported code
+// never reaches here). Reuses the shipped single-row matvec impls at their
+// default LWS with `wait_after=false`. Returns false on an unknown code.
+static inline bool rsl_block_matvec_nowait(
+    sycl::queue& q, int kind, const void* w, const float* x, float* out,
+    int M, int K) {
+    switch (kind) {
+        case 0: matvec_q4_k_packed_f32_usm_impl<64>(q, w, x, out, M, K, false); return true;
+        case 1: matvec_q8_0_packed_f32_usm_impl<64>(q, w, x, out, M, K, false); return true;
+        default: return false;
+    }
+}
+
+extern "C" {
+
+// Feature 1a entry point. See the big comment above. Returns 1 on full success
+// (hidden/h_norm2/k_row/v_row written), 0 on any bad shape / alloc / unsupported
+// matvec code — on 0 the Rust caller falls back to the per-op SYCL/CPU ladder and
+// the host buffers are left as passed (results are copied out only on success).
+// Attention-only (no fused dense FFN yet — the caller runs the host FFN exactly
+// as it does for the CUDA attention-only path).
+int rsl_decode_attn_block_usm(
+    rsl_stream* s,
+    // q/k/v/o weights: USM-resident packed bytes + a format code each
+    // (0=Q4_K, 1=Q8_0). Caller uploaded + cached them.
+    const void* wq_usm, int kq,
+    const void* wk_usm, int kk,
+    const void* wv_usm, int kv_kind,
+    const void* wo_usm, int ko,
+    // Norms + inv_freq as HOST f32 (copied into shared scratch here — tiny
+    // O(d_model) vectors, unlike the big cached weights).
+    const float* attn_norm, const float* ffn_norm, const float* inv_freq,
+    // hidden: HOST f32, in (pre-attn residual) AND out (post-attn residual).
+    float* hidden,
+    // h_norm2: HOST f32 out — the post-attn RMSNorm == the FFN input.
+    float* h_norm2,
+    // k_row / v_row: HOST f32 out — this token's post-RoPE K / plain V
+    // (head-major), for the caller to append to the host KV cache.
+    float* k_row, float* v_row,
+    // KV MIRROR: the layer's persistent f16 `k_caches`/`v_caches` USM buffers,
+    // already seeded with the prefill history rows [0, pos) by the caller.
+    uint16_t* k_mirror, uint16_t* v_mirror,
+    int n_heads, int n_kv_heads, int head_dim, int d_model,
+    int pos, int max_ctx, int kv_len, float rms_eps)
+    RSL_FFI_BODY_RET("rsl_decode_attn_block_usm", 0, {
+    if (s == nullptr) return 0;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || d_model <= 0
+        || (head_dim % 2) != 0 || (n_heads % n_kv_heads) != 0
+        || kv_len <= 0 || kv_len > max_ctx || pos < 0 || pos >= max_ctx) {
+        return 0;
+    }
+    const int d_q = n_heads * head_dim;
+    const int d_kv = n_kv_heads * head_dim;
+    const int half = head_dim / 2;
+    auto& q = s->q;
+    // One shared-USM f32 slab for every intermediate activation + the tiny
+    // norm/inv_freq copies. malloc_shared is host-addressable so the host inputs
+    // stage in and the host outputs read back with plain memcpy (no explicit
+    // H2D/D2H). Single alloc + single free per call; the WIN is collapsing the
+    // ~10 submit+wait pairs into one FIFO + one wait, not avoiding this slab.
+    //   layout: hidden | hnorm | q | k | v | attn | o | hnorm2 | an | fn | if
+    const size_t off_hidden = 0;
+    const size_t off_hnorm  = off_hidden + d_model;
+    const size_t off_q      = off_hnorm  + d_model;
+    const size_t off_k      = off_q      + d_q;
+    const size_t off_v      = off_k      + d_kv;
+    const size_t off_attn   = off_v      + d_kv;
+    const size_t off_o      = off_attn   + d_q;
+    const size_t off_hnorm2 = off_o      + d_model;
+    const size_t off_an     = off_hnorm2 + d_model;
+    const size_t off_fn     = off_an     + d_model;
+    const size_t off_if     = off_fn     + d_model;
+    const size_t slab_elems = off_if     + half;
+    float* slab = sycl::malloc_shared<float>(slab_elems, q);
+    if (slab == nullptr) return 0;
+    float* p_hidden = slab + off_hidden;
+    float* p_hnorm  = slab + off_hnorm;
+    float* p_q      = slab + off_q;
+    float* p_k      = slab + off_k;
+    float* p_v      = slab + off_v;
+    float* p_attn   = slab + off_attn;
+    float* p_o      = slab + off_o;
+    float* p_hnorm2 = slab + off_hnorm2;
+    float* p_an     = slab + off_an;
+    float* p_fn     = slab + off_fn;
+    float* p_if     = slab + off_if;
+    // Stage host inputs into the shared slab.
+    std::memcpy(p_hidden, hidden, static_cast<size_t>(d_model) * sizeof(float));
+    std::memcpy(p_an, attn_norm, static_cast<size_t>(d_model) * sizeof(float));
+    std::memcpy(p_fn, ffn_norm, static_cast<size_t>(d_model) * sizeof(float));
+    std::memcpy(p_if, inv_freq, static_cast<size_t>(half) * sizeof(float));
+    // --- the device-resident chain, all nowait on the in-order queue ---
+    bool ok = true;
+    rsl_rmsnorm_f32_nowait(q, p_hidden, p_an, p_hnorm, 1, d_model, rms_eps);
+    ok = ok && rsl_block_matvec_nowait(q, kq, wq_usm, p_hnorm, p_q, d_q, d_model);
+    ok = ok && rsl_block_matvec_nowait(q, kk, wk_usm, p_hnorm, p_k, d_kv, d_model);
+    ok = ok && rsl_block_matvec_nowait(q, kv_kind, wv_usm, p_hnorm, p_v, d_kv, d_model);
+    if (ok) {
+        rsl_rope_f32_nowait(q, p_q, n_heads, head_dim, pos, p_if);
+        rsl_rope_f32_nowait(q, p_k, n_kv_heads, head_dim, pos, p_if);
+        rsl_kv_write_f16_nowait(q, p_k, k_mirror, n_kv_heads, head_dim, pos, max_ctx);
+        rsl_kv_write_f16_nowait(q, p_v, v_mirror, n_kv_heads, head_dim, pos, max_ctx);
+        rsl_flash_decode_f32q_f16kv_nowait(q, p_q, k_mirror, v_mirror, p_attn,
+                                           n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
+        ok = rsl_block_matvec_nowait(q, ko, wo_usm, p_attn, p_o, d_model, d_q);
+        if (ok)
+            rsl_add_rmsnorm_f32_nowait(q, p_hidden, p_o, p_fn, p_hnorm2, 1, d_model, rms_eps);
+    }
+    // ONE sync for the whole layer's chain.
+    q.wait();
+    if (ok) {
+        // Shared slab is host-addressable; read results back out.
+        std::memcpy(hidden, p_hidden, static_cast<size_t>(d_model) * sizeof(float));
+        std::memcpy(h_norm2, p_hnorm2, static_cast<size_t>(d_model) * sizeof(float));
+        std::memcpy(k_row, p_k, static_cast<size_t>(d_kv) * sizeof(float));
+        std::memcpy(v_row, p_v, static_cast<size_t>(d_kv) * sizeof(float));
+    }
+    sycl::free(slab, q);
+    return ok ? 1 : 0;
+})
+
+}  // extern "C" — Feature 1a device-resident decode block

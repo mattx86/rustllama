@@ -225,6 +225,38 @@ mod imp {
             kv_len: c_int,
         );
 
+        // Feature 1a: device-resident DECODE attention block. See the Rust
+        // wrapper `decode_attn_block_usm_raw` + the C++ `rsl_decode_attn_block_usm`.
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn rsl_decode_attn_block_usm(
+            s: *mut rsl_stream,
+            wq_usm: *const std::ffi::c_void,
+            kq: c_int,
+            wk_usm: *const std::ffi::c_void,
+            kk: c_int,
+            wv_usm: *const std::ffi::c_void,
+            kv_kind: c_int,
+            wo_usm: *const std::ffi::c_void,
+            ko: c_int,
+            attn_norm: *const f32,
+            ffn_norm: *const f32,
+            inv_freq: *const f32,
+            hidden: *mut f32,
+            h_norm2: *mut f32,
+            k_row: *mut f32,
+            v_row: *mut f32,
+            k_mirror: *mut u16,
+            v_mirror: *mut u16,
+            n_heads: c_int,
+            n_kv_heads: c_int,
+            head_dim: c_int,
+            d_model: c_int,
+            pos: c_int,
+            max_ctx: c_int,
+            kv_len: c_int,
+            rms_eps: f32,
+        ) -> c_int;
+
         pub(super) fn rsl_flash_attn_decode_v2_usm(
             s: *mut rsl_stream,
             q_usm: *const u16,
@@ -5659,6 +5691,76 @@ pub unsafe fn flash_attn_decode_usm_raw(
         stream, q_usm, k_usm, v_usm, out_usm,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
     )
+}
+
+/// Feature 1a: run the WHOLE per-layer DECODE attention block on the SYCL
+/// in-order queue as one submit-chain with a single final sync (the C++
+/// `rsl_decode_attn_block_usm`). Replaces the per-token flood of independent
+/// `q.submit().wait()` dispatches. `Ok(true)` = the block ran and wrote
+/// `hidden`/`h_norm2`/`k_row`/`v_row`; `Ok(false)` = the C++ side declined
+/// (bad shape / alloc / unsupported matvec code) — the caller must fall back to
+/// the per-op ladder, as the host buffers are then unchanged. `Err` = an FFI
+/// exception was latched. `kq/kk/kv_kind/ko` are weight format codes
+/// (0 = Q4_K, 1 = Q8_0). `k_mirror`/`v_mirror` are the layer's persistent f16
+/// USM KV buffers, pre-seeded with rows `[0, pos)`.
+///
+/// # Safety
+///
+/// Every pointer must be live for the call and sized to the shape arguments:
+/// `wX_usm` the packed weight bytes (USM); `attn_norm`/`ffn_norm` ≥ `d_model`,
+/// `inv_freq` ≥ `head_dim/2`, `hidden`/`h_norm2` ≥ `d_model`, `k_row`/`v_row` ≥
+/// `n_kv_heads*head_dim` (host); `k_mirror`/`v_mirror` ≥
+/// `n_kv_heads*max_ctx*head_dim` (USM). The block syncs before returning, so no
+/// host/device overlap on the staged buffers.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn decode_attn_block_usm_raw(
+    stream: &SyclStream,
+    wq_usm: *const std::ffi::c_void,
+    kq: i32,
+    wk_usm: *const std::ffi::c_void,
+    kk: i32,
+    wv_usm: *const std::ffi::c_void,
+    kv_kind: i32,
+    wo_usm: *const std::ffi::c_void,
+    ko: i32,
+    attn_norm: *const f32,
+    ffn_norm: *const f32,
+    inv_freq: *const f32,
+    hidden: *mut f32,
+    h_norm2: *mut f32,
+    k_row: *mut f32,
+    v_row: *mut f32,
+    k_mirror: *mut u16,
+    v_mirror: *mut u16,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    d_model: u32,
+    pos: u32,
+    max_ctx: u32,
+    kv_len: u32,
+    rms_eps: f32,
+) -> Result<bool> {
+    let ran = imp::rsl_decode_attn_block_usm(
+        stream.raw,
+        wq_usm, kq as std::os::raw::c_int,
+        wk_usm, kk as std::os::raw::c_int,
+        wv_usm, kv_kind as std::os::raw::c_int,
+        wo_usm, ko as std::os::raw::c_int,
+        attn_norm, ffn_norm, inv_freq,
+        hidden, h_norm2, k_row, v_row,
+        k_mirror, v_mirror,
+        n_heads as std::os::raw::c_int,
+        n_kv_heads as std::os::raw::c_int,
+        head_dim as std::os::raw::c_int,
+        d_model as std::os::raw::c_int,
+        pos as std::os::raw::c_int,
+        max_ctx as std::os::raw::c_int,
+        kv_len as std::os::raw::c_int,
+        rms_eps,
+    );
+    imp::consume_error()?;
+    Ok(ran == 1)
 }
 
 /// Raw-pointer variant of [`rmsnorm_usm`]. Same SAFETY contract as

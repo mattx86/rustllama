@@ -2470,6 +2470,11 @@ pub struct DevAttnReport {
     pub on_tps: Option<f64>,
     pub winner: Option<bool>,
     pub error: Option<String>,
+    /// Which device-resident block the A/B drove, so the CLI persists the right
+    /// (disjoint) verdict key: `true` = the Feature-1a SYCL block (SYCL/USM GPU,
+    /// no CUDA), `false` = the #2 CUDA block. `rustllama-cli` doesn't link
+    /// `rustllama-models`, so it can't read the backend itself.
+    pub is_sycl: bool,
 }
 
 /// A/B the #2 on-device activation-residency attention block by measured DECODE
@@ -2489,12 +2494,19 @@ pub fn measure_dev_attn(
     cfg: &MeasurementConfig,
     repeats: usize,
 ) -> Result<DevAttnReport, String> {
-    // #2 runs only on CUDA; nothing to measure otherwise (return BEFORE loading
-    // so a non-CUDA host wastes no model load).
-    if !rustllama_models::accel::cuda_active() {
+    // A device-resident block runs on CUDA (#2) OR SYCL/USM (Feature 1a); nothing
+    // to measure on a host with neither (return BEFORE loading so it wastes no
+    // model load). The A/B itself is backend-agnostic — it forces the shared
+    // `dev_attn` override on/off and times decode either way; whichever block is
+    // live engages, confirmed by the `dev_attn_hits` engagement check below.
+    if !rustllama_models::accel::dev_attn_capable() {
         return Ok(DevAttnReport {
             capable: false,
-            error: Some("CUDA-only: no active NVIDIA GPU — device-resident attention cannot run".into()),
+            error: Some(
+                "no active NVIDIA GPU and no active SYCL/USM GPU — device-resident \
+                 attention cannot run"
+                    .into(),
+            ),
             ..Default::default()
         });
     }
@@ -2598,9 +2610,10 @@ pub fn measure_dev_attn(
             winner: None,
             error: Some(
                 "device-resident attention never engaged (non-packed q/k/v/o, qkv \
-                 bias, or unsupported shape) — verdict left unset"
+                 bias, Qwen3 head-norm, or unsupported shape) — verdict left unset"
                     .into(),
             ),
+            is_sycl: false,
         });
     }
 
@@ -2614,6 +2627,8 @@ pub fn measure_dev_attn(
         on_tps,
         winner,
         error: off_err.or(on_err),
+        // CUDA runs the #2 block; otherwise the engaged block was Feature-1a SYCL.
+        is_sycl: !rustllama_models::accel::cuda_active(),
     })
 }
 
