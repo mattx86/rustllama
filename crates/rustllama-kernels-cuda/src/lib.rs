@@ -352,6 +352,9 @@ extern "C" {
         head_dim: c_int,
         max_ctx: c_int,
         kv_len: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
     fn rsl_cuda_flash_attn_prefill_f32(
         s: *mut RslCudaStreamRaw,
@@ -365,6 +368,9 @@ extern "C" {
         max_ctx: c_int,
         kv_len_base: c_int,
         n_new: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
 
     // Quantized-KV flash attention (F32 Q/out, packed K/V dequantized
@@ -1845,6 +1851,10 @@ pub unsafe fn flash_attn_decode_f32(
     head_dim: usize,
     max_ctx: usize,
     kv_len: usize,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); see the CPU
+    // `gqa_attention_flash_decode_capped_windowed`. Byte-identical at 0/0.
+    window: i32,
+    softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_decode_f32(
         stream.raw(),
@@ -1857,6 +1867,8 @@ pub unsafe fn flash_attn_decode_f32(
         head_dim as c_int,
         max_ctx as c_int,
         kv_len as c_int,
+        window as c_int,
+        softcap,
     );
     if rc == 0 {
         Ok(())
@@ -1884,6 +1896,10 @@ pub unsafe fn flash_attn_prefill_f32(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); see the CPU
+    // `gqa_attention_flash_prefill_capped_windowed`. Byte-identical at 0/0.
+    window: i32,
+    softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_prefill_f32(
         stream.raw(),
@@ -1897,6 +1913,8 @@ pub unsafe fn flash_attn_prefill_f32(
         max_ctx as c_int,
         kv_len_base as c_int,
         n_new as c_int,
+        window as c_int,
+        softcap,
     );
     if rc == 0 {
         Ok(())
@@ -2997,6 +3015,12 @@ impl CudaMatvecCache {
         n_layers: usize,
         layer_idx: usize,
         rms_eps: f32,
+        // Per-layer SWA window (0 = full causal) + Gemma2 attention-logit
+        // soft-cap (0 = off) for THIS layer's internal flash-decode. Passthrough
+        // no-ops at 0 so a non-SWA / non-Gemma2 layer is byte-identical to the
+        // pre-feature block (see `flash_attn_decode_f32`).
+        window: i32,
+        softcap: f32,
         // Optional dense SwiGLU FFN run device-resident right after the attention
         // block (gate/up → silu → down → residual), so a whole dense layer's
         // decode stays on device. `Some((w_gate, w_up, w_down, d_ff))`, each
@@ -3220,6 +3244,9 @@ impl CudaMatvecCache {
                 head_dim,
                 max_ctx,
                 pos + 1,
+                // Per-layer SWA window / Gemma2 soft-cap for this decode step.
+                window,
+                softcap,
             )
             .is_err()
             {
@@ -3341,6 +3368,10 @@ impl CudaMatvecCache {
         n_layers: usize,
         layer_idx: usize,
         rms_eps: f32,
+        // Per-layer SWA window (0 = full) + Gemma2 attention-logit soft-cap
+        // (0 = off); threaded into the captured flash-decode. Passthrough at 0.
+        window: i32,
+        softcap: f32,
         dense_ffn: Option<(
             (CudaPackedKind, usize, &[u8]),
             (CudaPackedKind, usize, &[u8]),
@@ -3354,7 +3385,8 @@ impl CudaMatvecCache {
             self.decode_attn_block_f32_graph_impl(
                 wq, wk, wv, wo, attn_norm, post_norm, q_norm, k_norm, inv_freq, hidden, h_norm2,
                 k_row_out, v_row_out, n_heads, n_kv_heads, head_dim, d_model, pos, max_ctx,
-                n_layers, layer_idx, rms_eps, dense_ffn, upload_hidden, download_hidden,
+                n_layers, layer_idx, rms_eps, window, softcap, dense_ffn, upload_hidden,
+                download_hidden,
             )
         };
         if !ok {
@@ -3394,6 +3426,10 @@ impl CudaMatvecCache {
         n_layers: usize,
         layer_idx: usize,
         rms_eps: f32,
+        // Per-layer SWA window (0 = full) + Gemma2 soft-cap (0 = off); see the
+        // eager block. Passthrough no-ops at 0.
+        window: i32,
+        softcap: f32,
         dense_ffn: Option<(
             (CudaPackedKind, usize, &[u8]),
             (CudaPackedKind, usize, &[u8]),
@@ -3605,6 +3641,9 @@ impl CudaMatvecCache {
                     head_dim,
                     max_ctx,
                     pos + 1,
+                    // Per-layer SWA window / Gemma2 soft-cap for this decode step.
+                    window,
+                    softcap,
                 )
                 .is_ok()
             };

@@ -260,6 +260,9 @@ extern "C" {
         head_dim: c_int,
         max_ctx: c_int,
         kv_len: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
     fn rsl_mlx_flash_attn_prefill_f32(
         s: *mut RslMlxStreamRaw,
@@ -273,6 +276,9 @@ extern "C" {
         max_ctx: c_int,
         kv_len_base: c_int,
         n_new: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
 
     // Quantized-KV flash attention (F32 Q/out, packed K/V dequantized on the
@@ -515,6 +521,9 @@ extern "C" {
         max_ctx: c_int,
         kv_len: c_int,
         rms_eps: f32,
+        // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
 
     fn rsl_mlx_consume_error_count() -> c_int;
@@ -1239,6 +1248,10 @@ pub unsafe fn flash_attn_decode_f32(
     head_dim: usize,
     max_ctx: usize,
     kv_len: usize,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); see the CPU
+    // `gqa_attention_flash_decode_capped_windowed`. Byte-identical at 0/0.
+    window: i32,
+    softcap: f32,
 ) -> Result<(), MlxError> {
     let rc = rsl_mlx_flash_attn_decode_f32(
         stream.raw(),
@@ -1251,6 +1264,8 @@ pub unsafe fn flash_attn_decode_f32(
         head_dim as c_int,
         max_ctx as c_int,
         kv_len as c_int,
+        window as c_int,
+        softcap,
     );
     if rc == 0 {
         Ok(())
@@ -1278,6 +1293,10 @@ pub unsafe fn flash_attn_prefill_f32(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); see the CPU
+    // `gqa_attention_flash_prefill_capped_windowed`. Byte-identical at 0/0.
+    window: i32,
+    softcap: f32,
 ) -> Result<(), MlxError> {
     let rc = rsl_mlx_flash_attn_prefill_f32(
         stream.raw(),
@@ -1291,6 +1310,8 @@ pub unsafe fn flash_attn_prefill_f32(
         max_ctx as c_int,
         kv_len_base as c_int,
         n_new as c_int,
+        window as c_int,
+        softcap,
     );
     if rc == 0 {
         Ok(())
@@ -1773,6 +1794,11 @@ pub unsafe fn decode_attn_block_f32(
     max_ctx: u32,
     kv_len: u32,
     rms_eps: f32,
+    // Per-layer SWA window (0=full causal) + Gemma2 attention-logit soft-cap
+    // (0=off), threaded into the block's internal flash-decode. Passthrough
+    // no-ops at 0 so a non-SWA / non-Gemma2 layer is byte-identical.
+    window: i32,
+    softcap: f32,
 ) -> Result<(bool, bool), MlxError> {
     // Unpack the optional dense-FFN tuple into the raw C args (null pointers +
     // d_ff=0 when absent ⇒ attention-only, fail-closed on the Metal side).
@@ -1804,6 +1830,8 @@ pub unsafe fn decode_attn_block_f32(
         max_ctx as c_int,
         kv_len as c_int,
         rms_eps,
+        window as c_int,
+        softcap,
     );
     // A non-zero kernel-error latch means an encode/launch failure even if the
     // return code didn't capture it — treat it as a decline (fall back to CPU).

@@ -930,13 +930,22 @@ void rsl_rmsnorm(rsl_stream* s,
 //
 // Mirrors the CPU `gqa_attention_flash_decode` algorithm exactly
 // so bit-for-bit parity holds (up to float reduction order).
+// `window` (0 = full causal) + `softcap` (0 = off) mirror the CPU reference
+// `gqa_attention_flash_decode_capped_windowed`: a sliding window trims the
+// attended range to the last `window` cached positions, and the Gemma2
+// attention-logit soft-cap `s = c*tanh(s/c)` is applied AFTER the `1/sqrt`
+// scale and BEFORE the online-softmax max/exp. Both are passthrough no-ops at
+// 0 — the window=0/softcap=0 instruction path is byte-identical to the
+// pre-feature kernel (the two guards fold away), so non-SWA / non-Gemma2 models
+// are unaffected.
 void rsl_flash_attn_decode_usm(rsl_stream* s,
                                const uint16_t* q_usm,
                                const uint16_t* k_usm,
                                const uint16_t* v_usm,
                                uint16_t* out_usm,
                                int n_heads, int n_kv_heads,
-                               int head_dim, int max_ctx, int kv_len) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_usm", {
+                               int head_dim, int max_ctx, int kv_len,
+                               int window, float softcap) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_usm", {
     if (s == nullptr || q_usm == nullptr || k_usm == nullptr || v_usm == nullptr || out_usm == nullptr) return;
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || kv_len <= 0) {
         // kv_len == 0 case: zero the output and return. We use the
@@ -952,6 +961,10 @@ void rsl_flash_attn_decode_usm(rsl_stream* s,
     auto& q = s->q;
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    // Sliding-window lower bound: attend only `[t_start, kv_len)`. Matches the
+    // CPU `..._windowed` composition (`start = kv_len - window`, saturating;
+    // window==0 or window>=kv_len ⇒ t_start=0 ⇒ full attention).
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
     q.submit([&](sycl::handler& h) {
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(n_heads)),
@@ -968,7 +981,7 @@ void rsl_flash_attn_decode_usm(rsl_stream* s,
             }
             float m = -INFINITY;
             float l = 0.0f;
-            for (int t = 0; t < kv_len; ++t) {
+            for (int t = t_start; t < kv_len; ++t) {
                 const int k_off = (kv_h * max_ctx + t) * head_dim;
                 // Q · K row.
                 float s_dot = 0.0f;
@@ -978,6 +991,8 @@ void rsl_flash_attn_decode_usm(rsl_stream* s,
                     s_dot += qv * kv;
                 }
                 s_dot *= scale;
+                // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
                 // Online softmax update.
                 const float m_new = sycl::fmax(m, s_dot);
                 const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
@@ -1055,7 +1070,8 @@ void rsl_flash_attn_decode_v2_usm(rsl_stream* s,
                                   const uint16_t* v_usm,
                                   uint16_t* out_usm,
                                   int n_heads, int n_kv_heads,
-                                  int head_dim, int max_ctx, int kv_len) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_v2_usm", {
+                                  int head_dim, int max_ctx, int kv_len,
+                                  int window, float softcap) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_v2_usm", {
     if (s == nullptr || q_usm == nullptr || k_usm == nullptr || v_usm == nullptr || out_usm == nullptr) return;
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
     if (kv_len <= 0) {
@@ -1074,6 +1090,8 @@ void rsl_flash_attn_decode_v2_usm(rsl_stream* s,
 
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    // SWA lower bound + softcap, same composition as v1 (see its comment).
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
 
     auto& q_queue = s->q;
     // Global = n_heads sub-groups × SG_SIZE WIs each. Local = SG_SIZE
@@ -1110,7 +1128,7 @@ void rsl_flash_attn_decode_v2_usm(rsl_stream* s,
                 float m_state = -INFINITY;
                 float l_state = 0.0f;
 
-                for (int t = 0; t < kv_len; ++t) {
+                for (int t = t_start; t < kv_len; ++t) {
                     const int kv_off = (kv_h * max_ctx + t) * head_dim;
                     // Partial dot — this lane's contribution.
                     float partial = 0.0f;
@@ -1122,6 +1140,8 @@ void rsl_flash_attn_decode_v2_usm(rsl_stream* s,
                     float full_dot = sycl::reduce_over_group(
                         sg, partial, sycl::plus<float>());
                     full_dot *= scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) full_dot = softcap * sycl::tanh(full_dot / softcap);
                     // Online softmax update. Every lane computes the
                     // same values (deterministic; m_state/l_state
                     // start identical across lanes and update from
@@ -1222,12 +1242,17 @@ inline void flash_attn_decode_v3_tpl(sycl::queue& q_queue,
                                      const uint16_t* v_usm,
                                      uint16_t* out_usm,
                                      int n_heads, int n_kv_heads,
-                                     int head_dim, int max_ctx, int kv_len) {
+                                     int head_dim, int max_ctx, int kv_len,
+                                     int window, float softcap) {
     // H11: KV_TILE is now templated so the dispatcher can pick
     // 16/32/64 based on kv_len. 32 was the historic default.
     constexpr int KV_TILE = KV_TILE_T;
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    // SWA lower bound (see v1). The SLM tile loop still walks from 0 and loads
+    // whole tiles cooperatively; the per-position guard below skips positions
+    // `< t_start` so the online-softmax attends exactly `[t_start, kv_len)`.
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
     const std::size_t slm_elems = static_cast<std::size_t>(KV_TILE) * head_dim;
     const std::size_t global_size =
         static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(SG_SIZE);
@@ -1277,6 +1302,8 @@ inline void flash_attn_decode_v3_tpl(sycl::queue& q_queue,
                     sycl::group_barrier(it.get_group());
 
                     for (int t_off = 0; t_off < kv_block_size; ++t_off) {
+                        // SWA: skip cached positions before the window start.
+                        if (kv_base + t_off < t_start) continue;
                         const int tile_off = t_off * head_dim;
                         float partial = 0.0f;
                         #pragma unroll
@@ -1287,6 +1314,8 @@ inline void flash_attn_decode_v3_tpl(sycl::queue& q_queue,
                         float full_dot = sycl::reduce_over_group(
                             sg, partial, sycl::plus<float>());
                         full_dot *= scale;
+                        // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                        if (softcap > 0.0f) full_dot = softcap * sycl::tanh(full_dot / softcap);
                         const float m_new = sycl::fmax(m_state, full_dot);
                         const float rescale =
                             sycl::isfinite(m_state) ? sycl::exp(m_state - m_new) : 0.0f;
@@ -1322,12 +1351,15 @@ inline void flash_attn_decode_v3_generic(sycl::queue& q_queue,
                                          uint16_t* out_usm,
                                          int n_heads, int n_kv_heads,
                                          int head_dim, int max_ctx, int kv_len,
-                                         int dim_per_lane) {
+                                         int dim_per_lane,
+                                         int window, float softcap) {
     constexpr int SG_SIZE = 16;
     constexpr int MAX_DIM_PER_LANE = 16;
     constexpr int KV_TILE = 32;
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    // SWA lower bound (see v1 / the templated v3 helper).
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
     const std::size_t slm_elems = static_cast<std::size_t>(KV_TILE) * head_dim;
     const std::size_t global_size =
         static_cast<std::size_t>(n_heads) * static_cast<std::size_t>(SG_SIZE);
@@ -1374,6 +1406,8 @@ inline void flash_attn_decode_v3_generic(sycl::queue& q_queue,
                     sycl::group_barrier(it.get_group());
 
                     for (int t_off = 0; t_off < kv_block_size; ++t_off) {
+                        // SWA: skip cached positions before the window start.
+                        if (kv_base + t_off < t_start) continue;
                         const int tile_off = t_off * head_dim;
                         float partial = 0.0f;
                         for (int d = 0; d < dim_per_lane; ++d) {
@@ -1383,6 +1417,8 @@ inline void flash_attn_decode_v3_generic(sycl::queue& q_queue,
                         float full_dot = sycl::reduce_over_group(
                             sg, partial, sycl::plus<float>());
                         full_dot *= scale;
+                        // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                        if (softcap > 0.0f) full_dot = softcap * sycl::tanh(full_dot / softcap);
                         const float m_new = sycl::fmax(m_state, full_dot);
                         const float rescale =
                             sycl::isfinite(m_state) ? sycl::exp(m_state - m_new) : 0.0f;
@@ -1413,7 +1449,8 @@ void rsl_flash_attn_decode_v3_usm(rsl_stream* s,
                                   const uint16_t* v_usm,
                                   uint16_t* out_usm,
                                   int n_heads, int n_kv_heads,
-                                  int head_dim, int max_ctx, int kv_len) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_v3_usm", {
+                                  int head_dim, int max_ctx, int kv_len,
+                                  int window, float softcap) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_v3_usm", {
     if (s == nullptr || q_usm == nullptr || k_usm == nullptr || v_usm == nullptr || out_usm == nullptr) return;
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
     if (kv_len <= 0) {
@@ -1454,30 +1491,30 @@ void rsl_flash_attn_decode_v3_usm(rsl_stream* s,
     switch (dim_per_lane) {
         case 4:
             switch (effective_tile) {
-                case 16: flash_attn_decode_v3_tpl<4, SG_SIZE, 16>(q_queue, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len); break;
-                case 64: flash_attn_decode_v3_tpl<4, SG_SIZE, 64>(q_queue, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len); break;
-                default: flash_attn_decode_v3_tpl<4, SG_SIZE, 32>(q_queue, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len); break;
+                case 16: flash_attn_decode_v3_tpl<4, SG_SIZE, 16>(q_queue, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap); break;
+                case 64: flash_attn_decode_v3_tpl<4, SG_SIZE, 64>(q_queue, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap); break;
+                default: flash_attn_decode_v3_tpl<4, SG_SIZE, 32>(q_queue, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap); break;
             }
             break;
         case 8:
             switch (effective_tile) {
-                case 16: flash_attn_decode_v3_tpl<8, SG_SIZE, 16>(q_queue, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len); break;
-                case 64: flash_attn_decode_v3_tpl<8, SG_SIZE, 64>(q_queue, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len); break;
-                default: flash_attn_decode_v3_tpl<8, SG_SIZE, 32>(q_queue, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len); break;
+                case 16: flash_attn_decode_v3_tpl<8, SG_SIZE, 16>(q_queue, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap); break;
+                case 64: flash_attn_decode_v3_tpl<8, SG_SIZE, 64>(q_queue, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap); break;
+                default: flash_attn_decode_v3_tpl<8, SG_SIZE, 32>(q_queue, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap); break;
             }
             break;
         case 16:
             switch (effective_tile) {
-                case 16: flash_attn_decode_v3_tpl<16, SG_SIZE, 16>(q_queue, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len); break;
-                case 64: flash_attn_decode_v3_tpl<16, SG_SIZE, 64>(q_queue, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len); break;
-                default: flash_attn_decode_v3_tpl<16, SG_SIZE, 32>(q_queue, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len); break;
+                case 16: flash_attn_decode_v3_tpl<16, SG_SIZE, 16>(q_queue, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap); break;
+                case 64: flash_attn_decode_v3_tpl<16, SG_SIZE, 64>(q_queue, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap); break;
+                default: flash_attn_decode_v3_tpl<16, SG_SIZE, 32>(q_queue, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap); break;
             }
             break;
         default:
             flash_attn_decode_v3_generic(
                 q_queue, q_usm, k_usm, v_usm, out_usm,
                 n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                dim_per_lane);
+                dim_per_lane, window, softcap);
             break;
     }
 })
@@ -1502,6 +1539,12 @@ void rsl_flash_attn_decode_v3_usm(rsl_stream* s,
 // `n_heads % n_kv_heads == 0`. The K/V cache must already contain
 // the n_new new rows appended at positions `[kv_len_base,
 // kv_len_base + n_new)` — the caller's append-then-attend pattern.
+// `window` (0 = full causal) + `softcap` (0 = off) mirror the CPU reference
+// `gqa_attention_flash_prefill_capped_windowed`: a query at absolute position
+// `P = kv_len_base + q_pos` attends keys `[max(0, P-window+1), P]` instead of
+// the full causal `[0, P]`, and the Gemma2 soft-cap `s = c*tanh(s/c)` is applied
+// after the `1/sqrt` scale and before the online-softmax max/exp. Passthrough
+// no-ops at 0 (byte-identical instruction path).
 void rsl_flash_attn_prefill_usm(rsl_stream* s,
                                 const float* q_usm,
                                 const float* k_cache_usm,
@@ -1509,7 +1552,8 @@ void rsl_flash_attn_prefill_usm(rsl_stream* s,
                                 float* out_usm,
                                 int n_heads, int n_kv_heads,
                                 int head_dim, int max_ctx,
-                                int kv_len_base, int n_new) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_usm", {
+                                int kv_len_base, int n_new,
+                                int window, float softcap) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_usm", {
     if (s == nullptr || q_usm == nullptr || k_cache_usm == nullptr
         || v_cache_usm == nullptr || out_usm == nullptr) return;
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
@@ -1541,18 +1585,24 @@ void rsl_flash_attn_prefill_usm(rsl_stream* s,
                 // attends absolute positions `[0, kv_len_base + q_pos]`
                 // inclusive (its own newly-appended K/V row included).
                 const int kv_len_for_q = kv_len_base + q_pos + 1;
+                // SWA lower bound: P = kv_len_base + q_pos; attend `[P-window+1, P]`.
+                const int p_abs = kv_len_base + q_pos;
+                const int t_start = (window > 0 && p_abs - window + 1 > 0)
+                    ? (p_abs - window + 1) : 0;
                 for (int i = 0; i < head_dim; ++i) {
                     out_usm[out_off + i] = 0.0f;
                 }
                 float m_state = -INFINITY;
                 float l_state = 0.0f;
-                for (int t = 0; t < kv_len_for_q; ++t) {
+                for (int t = t_start; t < kv_len_for_q; ++t) {
                     const int kv_off = (kv_h * max_ctx + t) * head_dim;
                     float s_dot = 0.0f;
                     for (int i = 0; i < head_dim; ++i) {
                         s_dot += q_usm[q_off + i] * k_cache_usm[kv_off + i];
                     }
                     s_dot *= scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
                     const float m_new = sycl::fmax(m_state, s_dot);
                     const float rescale =
                         sycl::isfinite(m_state) ? sycl::exp(m_state - m_new) : 0.0f;
@@ -2481,7 +2531,8 @@ void rsl_flash_attn_prefill_v2_usm(rsl_stream* s,
                                    float* out_usm,
                                    int n_heads, int n_kv_heads,
                                    int head_dim, int max_ctx,
-                                   int kv_len_base, int n_new) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_v2_usm", {
+                                   int kv_len_base, int n_new,
+                                   int window, float softcap) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_v2_usm", {
     if (s == nullptr || q_usm == nullptr || k_cache_usm == nullptr
         || v_cache_usm == nullptr || out_usm == nullptr) return;
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
@@ -2522,6 +2573,10 @@ void rsl_flash_attn_prefill_v2_usm(rsl_stream* s,
                 // included since the caller appended the new K/V
                 // rows before invocation).
                 const int kv_len_for_q = kv_len_base + q_pos + 1;
+                // SWA lower bound: P = kv_len_base + q_pos; attend `[P-window+1, P]`.
+                const int p_abs = kv_len_base + q_pos;
+                const int t_start = (window > 0 && p_abs - window + 1 > 0)
+                    ? (p_abs - window + 1) : 0;
 
                 float q_slice[MAX_DIM_PER_LANE];
                 for (int d = 0; d < dim_per_lane; ++d) {
@@ -2534,7 +2589,7 @@ void rsl_flash_attn_prefill_v2_usm(rsl_stream* s,
                 float m_state = -INFINITY;
                 float l_state = 0.0f;
 
-                for (int t = 0; t < kv_len_for_q; ++t) {
+                for (int t = t_start; t < kv_len_for_q; ++t) {
                     const int kv_off = (kv_h * max_ctx + t) * head_dim;
                     float partial = 0.0f;
                     for (int d = 0; d < dim_per_lane; ++d) {
@@ -2543,6 +2598,8 @@ void rsl_flash_attn_prefill_v2_usm(rsl_stream* s,
                     float full_dot = sycl::reduce_over_group(
                         sg, partial, sycl::plus<float>());
                     full_dot *= scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) full_dot = softcap * sycl::tanh(full_dot / softcap);
                     const float m_new = sycl::fmax(m_state, full_dot);
                     const float rescale =
                         sycl::isfinite(m_state) ? sycl::exp(m_state - m_new) : 0.0f;
@@ -2584,7 +2641,8 @@ void rsl_flash_attn_prefill_v3_usm(rsl_stream* s,
                                    float* out_usm,
                                    int n_heads, int n_kv_heads,
                                    int head_dim, int max_ctx,
-                                   int kv_len_base, int n_new) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_v3_usm", {
+                                   int kv_len_base, int n_new,
+                                   int window, float softcap) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_v3_usm", {
     if (s == nullptr || q_usm == nullptr || k_cache_usm == nullptr
         || v_cache_usm == nullptr || out_usm == nullptr) return;
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
@@ -2623,6 +2681,13 @@ void rsl_flash_attn_prefill_v3_usm(rsl_stream* s,
                 const int out_base = q_base;
                 const int lane_off = lane * dim_per_lane;
                 const int kv_len_for_q = kv_len_base + q_pos + 1;
+                // SWA lower bound: P = kv_len_base + q_pos; attend `[P-window+1, P]`.
+                // The SLM tiles still load from 0; the per-position guard below
+                // skips positions `< t_start` so the online-softmax attends only
+                // the windowed range (matching the CPU reference).
+                const int p_abs = kv_len_base + q_pos;
+                const int t_start = (window > 0 && p_abs - window + 1 > 0)
+                    ? (p_abs - window + 1) : 0;
 
                 float q_slice[MAX_DIM_PER_LANE];
                 for (int d = 0; d < dim_per_lane; ++d) {
@@ -2651,6 +2716,8 @@ void rsl_flash_attn_prefill_v3_usm(rsl_stream* s,
                     sycl::group_barrier(it.get_group());
 
                     for (int t_off = 0; t_off < kv_block_size; ++t_off) {
+                        // SWA: skip cached positions before the window start.
+                        if (kv_base + t_off < t_start) continue;
                         const int tile_off = t_off * head_dim;
                         float partial = 0.0f;
                         for (int d = 0; d < dim_per_lane; ++d) {
@@ -2659,6 +2726,8 @@ void rsl_flash_attn_prefill_v3_usm(rsl_stream* s,
                         float full_dot = sycl::reduce_over_group(
                             sg, partial, sycl::plus<float>());
                         full_dot *= scale;
+                        // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                        if (softcap > 0.0f) full_dot = softcap * sycl::tanh(full_dot / softcap);
                         const float m_new = sycl::fmax(m_state, full_dot);
                         const float rescale =
                             sycl::isfinite(m_state) ? sycl::exp(m_state - m_new) : 0.0f;
@@ -14095,9 +14164,13 @@ static inline sycl::event rsl_kv_write_f16_nowait(
 // while K/V come from the f16 mirror via `bits_to_f32` (same as the f16 kernel).
 static inline sycl::event rsl_flash_decode_f32q_f16kv_nowait(
     sycl::queue& q, const float* q_in, const uint16_t* k_mir, const uint16_t* v_mir,
-    float* out, int n_heads, int n_kv_heads, int head_dim, int max_ctx, int kv_len) {
+    float* out, int n_heads, int n_kv_heads, int head_dim, int max_ctx, int kv_len,
+    int window, float softcap) {
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    // SWA lower bound + Gemma2 soft-cap, same composition as the shipped
+    // `rsl_flash_attn_decode_usm` (window=0/softcap=0 ⇒ byte-identical).
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
     return q.submit([&](sycl::handler& h) {
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(n_heads)),
@@ -14111,12 +14184,14 @@ static inline sycl::event rsl_flash_decode_f32q_f16kv_nowait(
             for (int i = 0; i < head_dim; ++i) out[out_base + i] = 0.0f;
             float m = -INFINITY;
             float l = 0.0f;
-            for (int t = 0; t < kv_len; ++t) {
+            for (int t = t_start; t < kv_len; ++t) {
                 const int kv_off = (kv_h * max_ctx + t) * head_dim;
                 float s_dot = 0.0f;
                 for (int i = 0; i < head_dim; ++i)
                     s_dot += q_in[q_base + i] * bits_to_f32(k_mir[kv_off + i]);
                 s_dot *= scale;
+                // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
                 const float m_new = sycl::fmax(m, s_dot);
                 const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
                 const float p = sycl::exp(s_dot - m_new);
@@ -14264,7 +14339,12 @@ int rsl_decode_attn_block_usm(
     // already seeded with the prefill history rows [0, pos) by the caller.
     uint16_t* k_mirror, uint16_t* v_mirror,
     int n_heads, int n_kv_heads, int head_dim, int d_model,
-    int pos, int max_ctx, int kv_len, float rms_eps)
+    int pos, int max_ctx, int kv_len, float rms_eps,
+    // SWA window (0 = full causal) + Gemma2 attention-logit soft-cap (0 = off)
+    // for THIS layer, threaded into the block's internal flash-decode so a
+    // Mistral-SWA / Gemma2 layer runs device-resident correctly. Passthrough
+    // no-ops at 0 (byte-identical to the pre-feature block).
+    int window, float softcap)
     RSL_FFI_BODY_RET("rsl_decode_attn_block_usm", 0, {
     if (ffn_ran != nullptr) *ffn_ran = 0;
     if (s == nullptr) return 0;
@@ -14342,7 +14422,8 @@ int rsl_decode_attn_block_usm(
         rsl_kv_write_f16_nowait(q, p_k, k_mirror, n_kv_heads, head_dim, pos, max_ctx);
         rsl_kv_write_f16_nowait(q, p_v, v_mirror, n_kv_heads, head_dim, pos, max_ctx);
         rsl_flash_decode_f32q_f16kv_nowait(q, p_q, k_mirror, v_mirror, p_attn,
-                                           n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
+                                           n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                                           window, softcap);
         ok = rsl_block_matvec_nowait(q, ko, wo_usm, p_attn, p_o, d_model, d_q);
         if (ok)
             rsl_add_rmsnorm_f32_nowait(q, p_hidden, p_o, p_fn, p_hnorm2, 1, d_model, rms_eps);

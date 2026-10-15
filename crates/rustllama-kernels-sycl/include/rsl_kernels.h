@@ -230,13 +230,19 @@ void rsl_add_rmsnorm_usm(rsl_stream* s,
  * sequentially with the online-softmax state. GQA is supported
  * (n_heads is a multiple of n_kv_heads); each Q head reads from
  * `kv_h = h / (n_heads / n_kv_heads)`. */
+/* `window` (0 = full causal) trims the attended range to the last `window`
+ * cached positions; `softcap` (0 = off) applies the Gemma2 attention-logit
+ * soft-cap `s = c*tanh(s/c)` after the scale and before softmax. Both are
+ * byte-identical passthroughs at 0 (SWA / Gemma2 support — see the CPU
+ * `gqa_attention_flash_decode_capped_windowed`). */
 void rsl_flash_attn_decode_usm(rsl_stream* s,
                                const uint16_t* q_usm,
                                const uint16_t* k_usm,
                                const uint16_t* v_usm,
                                uint16_t* out_usm,
                                int n_heads, int n_kv_heads,
-                               int head_dim, int max_ctx, int kv_len);
+                               int head_dim, int max_ctx, int kv_len,
+                               int window, float softcap);
 
 /* FA-v2 decode (sub-group cooperation). Same shape/semantics as the
  * v1 entry above, but each attention head is processed by a 16-WI
@@ -254,7 +260,8 @@ void rsl_flash_attn_decode_v2_usm(rsl_stream* s,
                                   const uint16_t* v_usm,
                                   uint16_t* out_usm,
                                   int n_heads, int n_kv_heads,
-                                  int head_dim, int max_ctx, int kv_len);
+                                  int head_dim, int max_ctx, int kv_len,
+                                  int window, float softcap);
 
 /* FA-v3 decode (SLM K/V tiling + sub-group cooperation). Same shape
  * constraints as v2 (head_dim % 16 == 0, ≤ 256). Reads K/V from
@@ -268,7 +275,8 @@ void rsl_flash_attn_decode_v3_usm(rsl_stream* s,
                                   const uint16_t* v_usm,
                                   uint16_t* out_usm,
                                   int n_heads, int n_kv_heads,
-                                  int head_dim, int max_ctx, int kv_len);
+                                  int head_dim, int max_ctx, int kv_len,
+                                  int window, float softcap);
 
 /* USM-resident FlashAttention prefill — F32 variant.
  *
@@ -288,6 +296,10 @@ void rsl_flash_attn_decode_v3_usm(rsl_stream* s,
  * cross-WI sync (each maintains its own online-softmax state). The
  * inner t-loop's float op order matches the CPU scalar reference so
  * outputs are bit-identical for matching inputs. */
+/* `window` (0 = full causal): a query at absolute position P attends keys
+ * `[max(0, P-window+1), P]`; `softcap` (0 = off): Gemma2 attention-logit cap
+ * after the scale, before softmax. Byte-identical passthroughs at 0 (see the
+ * CPU `gqa_attention_flash_prefill_capped_windowed`). */
 void rsl_flash_attn_prefill_usm(rsl_stream* s,
                                 const float* q_usm,
                                 const float* k_cache_usm,
@@ -295,7 +307,8 @@ void rsl_flash_attn_prefill_usm(rsl_stream* s,
                                 float* out_usm,
                                 int n_heads, int n_kv_heads,
                                 int head_dim, int max_ctx,
-                                int kv_len_base, int n_new);
+                                int kv_len_base, int n_new,
+                                int window, float softcap);
 
 /* FA-v2 prefill (sub-group cooperation). Same shape/semantics as the
  * v1 entry above, but each (head, q_pos) is processed by a 16-WI
@@ -310,7 +323,8 @@ void rsl_flash_attn_prefill_v2_usm(rsl_stream* s,
                                    float* out_usm,
                                    int n_heads, int n_kv_heads,
                                    int head_dim, int max_ctx,
-                                   int kv_len_base, int n_new);
+                                   int kv_len_base, int n_new,
+                                   int window, float softcap);
 
 /* FA-v3 prefill (SLM K/V tiling + sub-group cooperation). Same shape
  * constraints as v2. Per-q causal mask drives a per-row tile bound
@@ -322,7 +336,8 @@ void rsl_flash_attn_prefill_v3_usm(rsl_stream* s,
                                    float* out_usm,
                                    int n_heads, int n_kv_heads,
                                    int head_dim, int max_ctx,
-                                   int kv_len_base, int n_new);
+                                   int kv_len_base, int n_new,
+                                   int window, float softcap);
 
 /* Quantized-KV FlashAttention (F32 Q / F32 out, packed K/V dequantized
  * on the fly). Byte-exact ports of the CPU reference kernels in
@@ -1353,7 +1368,11 @@ int rsl_decode_attn_block_usm(rsl_stream* s,
                               uint16_t* k_mirror, uint16_t* v_mirror,
                               int n_heads, int n_kv_heads, int head_dim,
                               int d_model, int pos, int max_ctx, int kv_len,
-                              float rms_eps);
+                              float rms_eps,
+                              /* per-layer SWA window (0=full) + Gemma2
+                                 attention-logit soft-cap (0=off); passthrough
+                                 no-ops at 0. */
+                              int window, float softcap);
 
 #ifdef __cplusplus
 }

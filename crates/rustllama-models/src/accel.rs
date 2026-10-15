@@ -6464,6 +6464,11 @@ pub fn try_flash_attn_decode_usm_f32(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    // Per-layer SWA window (0=full causal) + Gemma2 attention-logit soft-cap
+    // (0=off). Threaded into the flash-decode kernels so a Mistral-SWA /
+    // Gemma2 layer runs on the GPU bit-exact to the CPU capped+windowed path.
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if !usm_attn_enabled() || !gpu_active_for_current_layer() {
         return false;
@@ -6608,19 +6613,19 @@ pub fn try_flash_attn_decode_usm_f32(
         let v3_ok = want_v3
             && sk::flash_attn_decode_v3_usm(
                 stream, q_buf, k_buf, v_buf, out_buf,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
             )
             .is_ok();
         let v2_ok = !v3_ok && want_v2
             && sk::flash_attn_decode_v2_usm(
                 stream, q_buf, k_buf, v_buf, out_buf,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
             )
             .is_ok();
         if !v3_ok && !v2_ok {
             if sk::flash_attn_decode_usm(
                 stream, q_buf, k_buf, v_buf, out_buf,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
             )
             .is_err()
             {
@@ -7590,6 +7595,9 @@ pub fn try_flash_attn_decode_cuda_f32(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if !cuda_active() || !gpu_active_for_current_layer() {
         return false;
@@ -7722,6 +7730,7 @@ pub fn try_flash_attn_decode_cuda_f32(
             ck::flash_attn_decode_f32(
                 stream, q_ptr, k_ptr, v_ptr, out_ptr,
                 n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                window as i32, softcap,
             )
         }
         .is_ok();
@@ -7903,6 +7912,11 @@ pub fn try_decode_attn_block_cuda_f32(
     n_layers: usize,
     layer_idx: usize,
     rms_eps: f32,
+    // Per-layer SWA window (0=full causal) + Gemma2 attention-logit soft-cap
+    // (0=off) for THIS layer's flash-decode inside the block. Passthrough no-ops
+    // at 0, so a non-SWA / non-Gemma2 layer is byte-identical.
+    window: u32,
+    softcap: f32,
     // Cross-layer hidden residency (#2 Phase 2): `upload_hidden=false` ⇒ hidden
     // is already device-resident from the previous layer; `download_hidden=false`
     // ⇒ leave it resident for the next layer. Per-layer default is `(true, true)`.
@@ -7984,6 +7998,8 @@ pub fn try_decode_attn_block_cuda_f32(
             n_layers,
             layer_idx,
             rms_eps,
+            window as i32,
+            softcap,
             ffn_dev,
             upload_hidden,
             download_hidden,
@@ -8062,6 +8078,9 @@ pub fn try_decode_attn_block_cuda_graph_f32(
     n_layers: usize,
     layer_idx: usize,
     rms_eps: f32,
+    // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
     upload_hidden: bool,
     download_hidden: bool,
 ) -> (bool, bool) {
@@ -8139,6 +8158,8 @@ pub fn try_decode_attn_block_cuda_graph_f32(
             n_layers,
             layer_idx,
             rms_eps,
+            window as i32,
+            softcap,
             ffn_dev,
             upload_hidden,
             download_hidden,
@@ -8273,6 +8294,11 @@ pub fn try_decode_attn_block_sycl_f32(
     n_layers: usize,
     layer_idx: usize,
     rms_eps: f32,
+    // Per-layer SWA window (0=full causal) + Gemma2 attention-logit soft-cap
+    // (0=off) for THIS layer's flash-decode inside the block. Passthrough no-ops
+    // at 0 so a non-SWA / non-Gemma2 layer is byte-identical.
+    window: u32,
+    softcap: f32,
 ) -> (bool, bool) {
     // Gates (correctness-first): perf verdict/force, USM+SYCL active, no qkv bias,
     // and no Qwen3 head-norm (there is no USM `qk_head_norm` kernel, so a head-norm
@@ -8462,6 +8488,8 @@ pub fn try_decode_attn_block_sycl_f32(
                 max_ctx as u32,
                 kv_len,
                 rms_eps,
+                window,
+                softcap,
             )
         };
         match res {
@@ -8631,6 +8659,11 @@ pub fn try_decode_attn_block_mlx_f32(
     n_layers: usize,
     layer_idx: usize,
     rms_eps: f32,
+    // Per-layer SWA window (0=full causal) + Gemma2 attention-logit soft-cap
+    // (0=off) for THIS layer's flash-decode inside the block. Passthrough no-ops
+    // at 0, so a non-SWA / non-Gemma2 layer is byte-identical.
+    window: u32,
+    softcap: f32,
 ) -> (bool, bool) {
     // Gates (correctness-first): perf verdict/force, MLX active for this layer,
     // no qkv bias, and no Qwen3 head-norm (there is no MLX `qk_head_norm` kernel,
@@ -8818,6 +8851,8 @@ pub fn try_decode_attn_block_mlx_f32(
                 max_ctx as u32,
                 kv_len,
                 rms_eps,
+                window as i32,
+                softcap,
             )
         };
         match res {
@@ -10429,6 +10464,9 @@ pub fn try_flash_attn_decode_mlx_f32(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if !mlx_active() || !gpu_active_for_current_layer() {
         return false;
@@ -10555,6 +10593,7 @@ pub fn try_flash_attn_decode_mlx_f32(
             mk::flash_attn_decode_f32(
                 stream, q_ptr, k_ptr, v_ptr, out_ptr,
                 n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                window as i32, softcap,
             )
         }
         .is_ok();
@@ -10917,11 +10956,16 @@ pub fn try_flash_attn_decode_gpu_f32(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    // Threaded into whichever backend runs (CUDA/MLX/SYCL) so a Mistral-SWA /
+    // Gemma2 layer runs on the GPU bit-exact to the CPU capped+windowed path.
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if cuda_active()
         && try_flash_attn_decode_cuda_f32(
             q, k_row, v_row, out, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
         )
     {
         return true;
@@ -10929,14 +10973,14 @@ pub fn try_flash_attn_decode_gpu_f32(
     if mlx_active()
         && try_flash_attn_decode_mlx_f32(
             q, k_row, v_row, out, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
         )
     {
         return true;
     }
     try_flash_attn_decode_usm_f32(
         q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
     )
 }
 
@@ -14756,6 +14800,11 @@ pub fn try_flash_attn_prefill_usm_f32(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // Per-layer SWA window (0=full causal) + Gemma2 attention-logit soft-cap
+    // (0=off), threaded into the prefill kernels (bit-exact to the CPU
+    // capped+windowed reference). Passthrough no-ops at 0.
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if !usm_attn_enabled() {
         log_prefill_attn_skip_once("usm_attn_enabled = false");
@@ -14832,7 +14881,7 @@ pub fn try_flash_attn_prefill_usm_f32(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as u32, n_kv_heads as u32,
                     head_dim as u32, max_ctx as u32,
-                    kv_len_base as u32, n_new as u32,
+                    kv_len_base as u32, n_new as u32, window, softcap,
                 )
             }
             .is_ok();
@@ -14842,7 +14891,7 @@ pub fn try_flash_attn_prefill_usm_f32(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as u32, n_kv_heads as u32,
                     head_dim as u32, max_ctx as u32,
-                    kv_len_base as u32, n_new as u32,
+                    kv_len_base as u32, n_new as u32, window, softcap,
                 )
             }
             .is_ok();
@@ -14852,7 +14901,7 @@ pub fn try_flash_attn_prefill_usm_f32(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as u32, n_kv_heads as u32,
                     head_dim as u32, max_ctx as u32,
-                    kv_len_base as u32, n_new as u32,
+                    kv_len_base as u32, n_new as u32, window, softcap,
                 )
             };
             if result.is_err() {
@@ -15098,6 +15147,9 @@ pub fn try_flash_attn_prefill_cuda_f32(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if !cuda_active() || !gpu_active_for_current_layer() {
         return false;
@@ -15174,6 +15226,7 @@ pub fn try_flash_attn_prefill_cuda_f32(
             ck::flash_attn_prefill_f32(
                 stream, q_ptr, k_ptr, v_ptr, out_ptr,
                 n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                window as i32, softcap,
             )
         }
         .is_ok();
@@ -15378,6 +15431,9 @@ pub fn try_flash_attn_prefill_mlx_f32(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if !mlx_active() || !gpu_active_for_current_layer() {
         return false;
@@ -15452,6 +15508,7 @@ pub fn try_flash_attn_prefill_mlx_f32(
             mk::flash_attn_prefill_f32(
                 stream, q_ptr, k_ptr, v_ptr, out_ptr,
                 n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                window as i32, softcap,
             )
         }
         .is_ok();
@@ -15663,10 +15720,15 @@ pub fn try_flash_attn_prefill_gpu_f32(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off),
+    // threaded into whichever backend runs. Passthrough no-ops at 0.
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if cuda_active()
         && try_flash_attn_prefill_cuda_f32(
             q, k, v, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            window, softcap,
         )
     {
         return true;
@@ -15674,12 +15736,14 @@ pub fn try_flash_attn_prefill_gpu_f32(
     if mlx_active()
         && try_flash_attn_prefill_mlx_f32(
             q, k, v, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            window, softcap,
         )
     {
         return true;
     }
     try_flash_attn_prefill_usm_f32(
         q, k, v, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        window, softcap,
     )
 }
 

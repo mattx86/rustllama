@@ -223,6 +223,9 @@ mod imp {
             head_dim: c_int,
             max_ctx: c_int,
             kv_len: c_int,
+            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            window: c_int,
+            softcap: f32,
         );
 
         // Feature 1a: device-resident DECODE attention block. See the Rust
@@ -266,6 +269,9 @@ mod imp {
             max_ctx: c_int,
             kv_len: c_int,
             rms_eps: f32,
+            // per-layer SWA window (0=full) + Gemma2 soft-cap (0=off).
+            window: c_int,
+            softcap: f32,
         ) -> c_int;
 
         pub(super) fn rsl_flash_attn_decode_v2_usm(
@@ -279,6 +285,8 @@ mod imp {
             head_dim: c_int,
             max_ctx: c_int,
             kv_len: c_int,
+            window: c_int,
+            softcap: f32,
         );
 
         pub(super) fn rsl_flash_attn_decode_v3_usm(
@@ -292,6 +300,8 @@ mod imp {
             head_dim: c_int,
             max_ctx: c_int,
             kv_len: c_int,
+            window: c_int,
+            softcap: f32,
         );
 
         pub(super) fn rsl_flash_attn_prefill_usm(
@@ -306,6 +316,9 @@ mod imp {
             max_ctx: c_int,
             kv_len_base: c_int,
             n_new: c_int,
+            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            window: c_int,
+            softcap: f32,
         );
 
         pub(super) fn rsl_flash_attn_prefill_v2_usm(
@@ -320,6 +333,8 @@ mod imp {
             max_ctx: c_int,
             kv_len_base: c_int,
             n_new: c_int,
+            window: c_int,
+            softcap: f32,
         );
 
         pub(super) fn rsl_flash_attn_prefill_v3_usm(
@@ -334,6 +349,8 @@ mod imp {
             max_ctx: c_int,
             kv_len_base: c_int,
             n_new: c_int,
+            window: c_int,
+            softcap: f32,
         );
 
         // Quantized-KV flash attention (F32 Q/out, packed K/V + optional
@@ -2078,6 +2095,9 @@ mod imp {
         head_dim: u32,
         max_ctx: u32,
         kv_len: u32,
+        // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2098,6 +2118,8 @@ mod imp {
                 head_dim as c_int,
                 max_ctx as c_int,
                 kv_len as c_int,
+                window as c_int,
+                softcap,
             );
         }
         consume_error()
@@ -2117,6 +2139,8 @@ mod imp {
         head_dim: u32,
         max_ctx: u32,
         kv_len: u32,
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2133,6 +2157,7 @@ mod imp {
                 stream.raw, q_usm, k_usm, v_usm, out_usm,
                 n_heads as c_int, n_kv_heads as c_int,
                 head_dim as c_int, max_ctx as c_int, kv_len as c_int,
+                window as c_int, softcap,
             );
         }
         consume_error()
@@ -2152,6 +2177,8 @@ mod imp {
         max_ctx: u32,
         kv_len_base: u32,
         n_new: u32,
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2174,6 +2201,7 @@ mod imp {
                 n_heads as c_int, n_kv_heads as c_int,
                 head_dim as c_int, max_ctx as c_int,
                 kv_len_base as c_int, n_new as c_int,
+                window as c_int, softcap,
             );
         }
         consume_error()
@@ -2195,6 +2223,8 @@ mod imp {
         head_dim: u32,
         max_ctx: u32,
         kv_len: u32,
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2220,6 +2250,8 @@ mod imp {
                 head_dim as c_int,
                 max_ctx as c_int,
                 kv_len as c_int,
+                window as c_int,
+                softcap,
             );
         }
         consume_error()
@@ -2238,6 +2270,8 @@ mod imp {
         max_ctx: u32,
         kv_len_base: u32,
         n_new: u32,
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2264,6 +2298,8 @@ mod imp {
                 max_ctx as c_int,
                 kv_len_base as c_int,
                 n_new as c_int,
+                window as c_int,
+                softcap,
             );
         }
         consume_error()
@@ -2752,6 +2788,8 @@ mod imp {
         max_ctx: u32,
         kv_len_base: u32,
         n_new: u32,
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2783,6 +2821,8 @@ mod imp {
                 max_ctx as c_int,
                 kv_len_base as c_int,
                 n_new as c_int,
+                window as c_int,
+                softcap,
             );
         }
         consume_error()
@@ -5701,6 +5741,7 @@ pub unsafe fn flash_attn_decode_usm_raw(
     imp::flash_attn_decode_usm(
         stream, q_usm, k_usm, v_usm, out_usm,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        0, 0.0, // raw variant is full-attention/no-softcap (kept for callers)
     )
 }
 
@@ -5772,6 +5813,11 @@ pub unsafe fn decode_attn_block_usm_raw(
     max_ctx: u32,
     kv_len: u32,
     rms_eps: f32,
+    // Per-layer SWA window (0=full causal) + Gemma2 attention-logit soft-cap
+    // (0=off), threaded into the block's internal flash-decode. Passthrough
+    // no-ops at 0 so a non-SWA / non-Gemma2 layer is byte-identical.
+    window: u32,
+    softcap: f32,
 ) -> Result<(bool, bool)> {
     // Unpack the optional dense-FFN tuple into the raw C args (null pointers +
     // d_ff=0 when absent ⇒ the C++ side stays attention-only, fail-closed).
@@ -5803,6 +5849,8 @@ pub unsafe fn decode_attn_block_usm_raw(
         max_ctx as std::os::raw::c_int,
         kv_len as std::os::raw::c_int,
         rms_eps,
+        window as std::os::raw::c_int,
+        softcap,
     );
     imp::consume_error()?;
     Ok((ran == 1, ran == 1 && ffn_ran == 1))
@@ -7765,6 +7813,10 @@ pub fn flash_attn_decode_usm(
     head_dim: u32,
     max_ctx: u32,
     kv_len: u32,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); see the
+    // CPU `gqa_attention_flash_decode_capped_windowed`. Byte-identical at 0/0.
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
         return Err(SyclError::InvalidShape(format!(
@@ -7814,6 +7866,8 @@ pub fn flash_attn_decode_usm(
         head_dim,
         max_ctx,
         kv_len,
+        window,
+        softcap,
     )
 }
 
@@ -7833,6 +7887,8 @@ pub fn flash_attn_decode_v3_usm(
     head_dim: u32,
     max_ctx: u32,
     kv_len: u32,
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
         return Err(SyclError::InvalidShape(format!(
@@ -7858,7 +7914,7 @@ pub fn flash_attn_decode_v3_usm(
     }
     imp::flash_attn_decode_v3_usm(
         stream, q.as_ptr(), k.as_ptr(), v.as_ptr(), out.as_mut_ptr(),
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
     )
 }
 
@@ -7898,6 +7954,7 @@ pub unsafe fn flash_attn_decode_v3_usm_raw(
     imp::flash_attn_decode_v3_usm(
         stream, q_usm, k_usm, v_usm, out_usm,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        0, 0.0, // raw variant is full-attention/no-softcap
     )
 }
 
@@ -7917,6 +7974,8 @@ pub fn flash_attn_decode_v2_usm(
     head_dim: u32,
     max_ctx: u32,
     kv_len: u32,
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
         return Err(SyclError::InvalidShape(format!(
@@ -7951,6 +8010,8 @@ pub fn flash_attn_decode_v2_usm(
         head_dim,
         max_ctx,
         kv_len,
+        window,
+        softcap,
     )
 }
 
@@ -8040,6 +8101,7 @@ pub fn flash_attn_prefill_usm(
         max_ctx,
         kv_len_base,
         n_new,
+        0, 0.0, // safe wrapper is full-causal/no-softcap
     )
 }
 
@@ -8083,6 +8145,7 @@ pub fn flash_attn_prefill_v3_usm(
     imp::flash_attn_prefill_v3_usm(
         stream, q.as_ptr(), k_cache.as_ptr(), v_cache.as_ptr(), out.as_mut_ptr(),
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        0, 0.0, // safe wrapper is full-causal/no-softcap
     )
 }
 
@@ -8103,6 +8166,8 @@ pub unsafe fn flash_attn_prefill_v3_usm_raw(
     max_ctx: u32,
     kv_len_base: u32,
     n_new: u32,
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
         return Err(SyclError::InvalidShape(format!(
@@ -8122,6 +8187,7 @@ pub unsafe fn flash_attn_prefill_v3_usm_raw(
     imp::flash_attn_prefill_v3_usm(
         stream, q_usm, k_cache_usm, v_cache_usm, out_usm,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        window, softcap,
     )
 }
 
@@ -8176,6 +8242,7 @@ pub fn flash_attn_prefill_v2_usm(
         max_ctx,
         kv_len_base,
         n_new,
+        0, 0.0, // safe wrapper is full-causal/no-softcap
     )
 }
 
@@ -8209,6 +8276,8 @@ pub unsafe fn flash_attn_prefill_usm_raw(
     max_ctx: u32,
     kv_len_base: u32,
     n_new: u32,
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
         return Err(SyclError::InvalidShape(format!(
@@ -8232,6 +8301,8 @@ pub unsafe fn flash_attn_prefill_usm_raw(
         max_ctx,
         kv_len_base,
         n_new,
+        window,
+        softcap,
     )
 }
 
@@ -8645,6 +8716,7 @@ pub unsafe fn flash_attn_decode_v2_usm_raw(
     imp::flash_attn_decode_v2_usm(
         stream, q_usm, k_usm, v_usm, out_usm,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        0, 0.0, // raw variant is full-attention/no-softcap
     )
 }
 
@@ -8663,6 +8735,8 @@ pub unsafe fn flash_attn_prefill_v2_usm_raw(
     max_ctx: u32,
     kv_len_base: u32,
     n_new: u32,
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
         return Err(SyclError::InvalidShape(format!(
@@ -8682,6 +8756,7 @@ pub unsafe fn flash_attn_prefill_v2_usm_raw(
     imp::flash_attn_prefill_v2_usm(
         stream, q_usm, k_cache_usm, v_cache_usm, out_usm,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        window, softcap,
     )
 }
 
@@ -10312,7 +10387,7 @@ mod tests {
             v: &SyclSharedBuffer<u16>,
             out: &mut SyclSharedBuffer<u16>,
         ) -> Result<()> {
-            flash_attn_decode_usm(s, q, k, v, out, 4, 2, 16, 32, 8)
+            flash_attn_decode_usm(s, q, k, v, out, 4, 2, 16, 32, 8, 0, 0.0)
         }
         // Verify the multi-buffer pattern compiles: alloc four
         // distinct SyclSharedBuffer values borrowing the same
@@ -10323,7 +10398,7 @@ mod tests {
             let k = SyclSharedBuffer::<u16>::alloc(stream, 2048)?;
             let v = SyclSharedBuffer::<u16>::alloc(stream, 2048)?;
             let mut out = SyclSharedBuffer::<u16>::alloc(stream, 64)?;
-            flash_attn_decode_usm(stream, &q, &k, &v, &mut out, 4, 2, 16, 32, 8)
+            flash_attn_decode_usm(stream, &q, &k, &v, &mut out, 4, 2, 16, 32, 8, 0, 0.0)
         }
         let _ = _signature;
         let _ = _multi_buffer;
@@ -11791,7 +11866,7 @@ mod tests {
         // Run the kernel through the safe wrapper.
         flash_attn_decode_usm(
             &stream, &q_buf, &k_buf, &v_buf, &mut out_buf,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0,
         ).expect("flash_attn_decode_usm");
         // Read back results.
         // Build f32 CPU inputs (mirroring f16 round-trip storage).
@@ -12033,7 +12108,7 @@ mod tests {
         }
         flash_attn_decode_v2_usm(
             &stream, &q_buf, &k_buf, &v_buf, &mut out_buf,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0,
         )
         .expect("flash_attn_decode_v2_usm");
 
@@ -12135,7 +12210,7 @@ mod tests {
         for dst in out_buf.as_mut_slice().iter_mut() { *dst = 0; }
         flash_attn_decode_v3_usm(
             &stream, &q_buf, &k_buf, &v_buf, &mut out_buf,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0,
         )
         .expect("flash_attn_decode_v3_usm");
 

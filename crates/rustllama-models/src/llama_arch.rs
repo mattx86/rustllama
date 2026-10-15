@@ -5691,6 +5691,11 @@ impl LlamaModel {
                                 head_dim as u32, max_ctx as u32,
                                 cfg.n_layers as u32,
                             );
+                            // This is the gated-attention (sigmoid Q-gate) decode
+                            // path — NOT a Gemma2 / Mistral-SWA arch, so there is no
+                            // sliding window or attention-logit soft-cap here (the
+                            // CPU twin is the plain `gqa_attention_flash_decode`).
+                            // Pass window=0 / softcap=0.0 (full attention, no cap).
                             if !crate::accel::try_flash_attn_decode_gpu_f32(
                                 &q_buf,
                                 &k_buf[..n_kv_heads * head_dim],
@@ -5703,6 +5708,8 @@ impl LlamaModel {
                                 head_dim as u32,
                                 max_ctx as u32,
                                 cfg.n_layers as u32,
+                                0,
+                                0.0,
                             ) {
                                 k::gqa_attention_flash_decode(
                                     &q_buf, k, v, &mut attn_out,
@@ -6991,23 +6998,20 @@ impl LlamaModel {
                         match kv_layer {
                             KvLayer::F32 { k, v } => {
                                 sub_whiten = false;
-                                // SWA span for this layer (0 ⇒ full causal); the
-                                // GPU hook has no window arg so SWA uses the CPU
-                                // windowed kernel.
-                                let swa_win = self.cfg.swa_window(li);
+                                // SWA span for this layer (0 ⇒ full causal) +
                                 // Gemma2 attention-logit soft-cap (0.0 ⇒ no cap).
-                                // The GPU hook carries no softcap arg either, so a
-                                // capping model declines it and takes the capped
-                                // CPU kernel (fail-closed, never skip the cap).
+                                // Both are now THREADED into the GPU prefill kernel
+                                // (bit-exact to the CPU capped+windowed path), so an
+                                // SWA / Gemma2 layer runs on the GPU too — no more
+                                // fail-closed decline. Passthrough at 0/0.0.
+                                let swa_win = self.cfg.swa_window(li);
                                 let softcap = self.cfg.attn_logit_softcapping.unwrap_or(0.0);
-                                let used_gpu = swa_win == 0
-                                    && softcap == 0.0
-                                    && crate::accel::try_flash_attn_prefill_gpu_f32(
-                                        &hoist_qrows[..nb * d_q], k, v,
-                                        &mut hoist_attn_out[..nb * d_q],
-                                        n_heads, n_kv_heads, head_dim, max_ctx,
-                                        kv_len_base, nb,
-                                    );
+                                let used_gpu = crate::accel::try_flash_attn_prefill_gpu_f32(
+                                    &hoist_qrows[..nb * d_q], k, v,
+                                    &mut hoist_attn_out[..nb * d_q],
+                                    n_heads, n_kv_heads, head_dim, max_ctx,
+                                    kv_len_base, nb, swa_win as u32, softcap,
+                                );
                                 if !used_gpu {
                                     k::gqa_attention_flash_prefill_capped_windowed(
                                         &hoist_qrows[..nb * d_q], k, v,
@@ -7777,15 +7781,33 @@ impl LlamaModel {
             // blocks, fed `self.rope_inv_freq` — the scaled table, byte-identical
             // to the base table when the model carries no scaling.
             //
-            // Gemma2 attention-logit soft-capping is likewise a no-go for the
-            // device blocks: they fuse the Q·K score on-device and apply neither
-            // the YaRN mscale nor the `s = c*tanh(s/c)` cap, so a capping model
-            // must fall to the software path below (which runs the capped CPU
-            // kernels). Fail-closed — never silently skip the cap.
-            let device_attn = if self.yarn_mscale == 1.0
-                && self.cfg.attn_logit_softcapping.is_none()
-            {
+            // Gemma2 attention-logit soft-capping AND sliding-window attention are
+            // now THREADED into the device blocks (the flash-decode inside each
+            // block applies `s = c*tanh(s/c)` after the scale and trims to the last
+            // `window` positions, bit-exact to the CPU capped+windowed kernel), so a
+            // Gemma2 / Mistral-SWA model runs device-resident too. The per-layer
+            // `dev_window` (0 on a global/non-SWA layer) + `dev_softcap` (0 when the
+            // model has no cap) are passed to every block below; passthrough at 0/0
+            // keeps non-SWA / non-Gemma2 layers byte-identical.
+            //
+            // The YaRN attention `mscale` is still a no-go for the device blocks:
+            // they fuse the Q·K score on-device, so Q can't be post-scaled. Run them
+            // only when `mscale` is a no-op; YaRN models fall to the software path
+            // below, which applies it. Non-scaled + linear/NTK keep the device
+            // blocks, fed `self.rope_inv_freq` — the scaled table, byte-identical to
+            // the base table when the model carries no scaling.
+            let device_attn = if self.yarn_mscale == 1.0 {
                 if let KvLayer::F32 { k, v } = &mut kv.layers[layer_idx] {
+                    // Per-layer SWA window (0 ⇒ full causal) + Gemma2 attention-logit
+                    // soft-cap (0.0 ⇒ no cap), threaded into every device block's
+                    // internal flash-decode (see the block fns). Before this, an SWA
+                    // model reaching the device block would have attended the FULL
+                    // history (no window arg) — WRONG output; the window arg closes
+                    // that (the engine already coerces SWA/softcap models to F32 KV,
+                    // which is the only KV dtype the device block accepts, so they
+                    // genuinely reach here).
+                    let dev_window = self.cfg.swa_window(layer_idx) as u32;
+                    let dev_softcap = self.cfg.attn_logit_softcapping.unwrap_or(0.0);
                     // Feature 1b: PREFER the CUDA-GRAPH block — it captures this
                     // layer's whole device chain into a cudaGraph and replays it
                     // as ONE launch (gated on `attn:dev_resident_block_cuda_graph`).
@@ -7821,6 +7843,8 @@ impl LlamaModel {
                             cfg.n_layers,
                             layer_idx,
                             cfg.rms_eps,
+                            dev_window,
+                            dev_softcap,
                             upload_hidden,
                             download_hidden,
                         );
@@ -7852,6 +7876,8 @@ impl LlamaModel {
                             cfg.n_layers,
                             layer_idx,
                             cfg.rms_eps,
+                            dev_window,
+                            dev_softcap,
                             upload_hidden,
                             download_hidden,
                         );
@@ -7899,6 +7925,8 @@ impl LlamaModel {
                             cfg.n_layers,
                             layer_idx,
                             cfg.rms_eps,
+                            dev_window,
+                            dev_softcap,
                         );
                         device_attn_is_sycl = sycl_ran;
                         if sycl_ran {
@@ -7944,6 +7972,8 @@ impl LlamaModel {
                                 cfg.n_layers,
                                 layer_idx,
                                 cfg.rms_eps,
+                                dev_window,
+                                dev_softcap,
                             );
                             device_attn_is_mlx = mlx_ran;
                             if mlx_ran {
@@ -8109,23 +8139,29 @@ impl LlamaModel {
                     // to the GPU. The kernel reads them in place.
                     // Returns true if the kernel ran; false falls
                     // through to the CPU flash/standard path below.
-                    // Gemma2 attention-logit soft-capping has no softcap arg in
-                    // the GPU flash kernel, so a capping model declines the GPU
-                    // hook and takes the capped CPU kernel below (fail-closed).
-                    let gpu_handled = cfg.attn_logit_softcapping.is_none()
-                        && crate::accel::try_flash_attn_decode_gpu_f32(
-                            &q_buf,
-                            &k_buf,
-                            &v_buf,
-                            &mut attn_out,
-                            layer_idx,
-                            cur_pos as u32,
-                            n_heads as u32,
-                            n_kv_heads as u32,
-                            head_dim as u32,
-                            max_ctx as u32,
-                            cfg.n_layers as u32,
-                        );
+                    // Sliding-window span for this layer (0 ⇒ full attention) +
+                    // Gemma2 attention-logit soft-cap (0.0 ⇒ no cap). Both are now
+                    // THREADED into the GPU flash kernel (bit-exact to the CPU
+                    // capped+windowed path), so an SWA / Gemma2 layer runs on the
+                    // GPU too (no more fail-closed decline). Computed here so they
+                    // feed both the GPU hook and the CPU fallback below.
+                    let swa_win = cfg.swa_window(layer_idx);
+                    let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
+                    let gpu_handled = crate::accel::try_flash_attn_decode_gpu_f32(
+                        &q_buf,
+                        &k_buf,
+                        &v_buf,
+                        &mut attn_out,
+                        layer_idx,
+                        cur_pos as u32,
+                        n_heads as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        max_ctx as u32,
+                        cfg.n_layers as u32,
+                        swa_win as u32,
+                        softcap,
+                    );
                     if gpu_handled {
                         // attn_out already populated by the SYCL
                         // kernel; skip CPU flash + standard paths.
@@ -8150,13 +8186,9 @@ impl LlamaModel {
                     // settled before the recurrence becomes the bulk
                     // of the work.
                     let flash_min = flash_kv_len_min();
-                    // Sliding-window span for this layer (0 ⇒ full attention,
-                    // bit-identical to a non-SWA model).
-                    let swa_win = cfg.swa_window(layer_idx);
-                    // Gemma2 attention-logit soft-cap for every layer (0.0 ⇒ no
-                    // cap, bit-identical). Threaded alongside the SWA window into
-                    // the fused capped+windowed kernel.
-                    let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
+                    // `swa_win` / `softcap` for this layer are computed above (they
+                    // also feed the GPU hook); reused here for the CPU fallback's
+                    // fused capped+windowed kernel (0/0.0 ⇒ bit-identical).
                     if crate::accel::flash_attention_enabled() && kv_len >= flash_min {
                         k::gqa_attention_flash_decode_capped_windowed(
                             &q_buf,
@@ -10112,9 +10144,14 @@ impl LlamaModel {
                 if r_is_full {
                     // Contiguous queries 0..nr (row j is at position j),
                     // kv_len_base = 0. Shared GPU prefill hook, CPU fallback.
+                    // CacheBlend is an opt-in KV feature whose CPU twin is the plain
+                    // (non-windowed, non-capped) `gqa_attention_flash_prefill`, so
+                    // it carries no SWA / softcap here — window=0 / softcap=0.0.
+                    // (SWA / Gemma2 models are coerced to the contiguous F32 path in
+                    // the engine, which runs the windowed/capped kernels instead.)
                     let used_gpu = crate::accel::try_flash_attn_prefill_gpu_f32(
                         &q_r, kslab, vslab, &mut attn_out,
-                        n_heads, n_kv_heads, head_dim, max_ctx, 0, nr,
+                        n_heads, n_kv_heads, head_dim, max_ctx, 0, nr, 0, 0.0,
                     );
                     if !used_gpu {
                         k::gqa_attention_flash_prefill(
@@ -10493,34 +10530,34 @@ impl LlamaModel {
                             t.parent,
                         );
                     } else {
-                        // Sliding-window span for this layer (0 ⇒ full causal).
-                        // The GPU prefill hook has no window arg, so SWA layers
-                        // skip it and take the windowed CPU kernel.
+                        // Sliding-window span for this layer (0 ⇒ full causal) +
+                        // Gemma2 attention-logit soft-cap (0.0 ⇒ no cap). Both are
+                        // now THREADED into the GPU prefill kernel (bit-exact to the
+                        // CPU capped+windowed path), so an SWA / Gemma2 layer runs on
+                        // the GPU too — no more fail-closed decline. Passthrough at
+                        // 0/0.0 keeps non-SWA / non-Gemma2 layers byte-identical.
                         let swa_win = cfg.swa_window(layer_idx);
-                        // Gemma2 attention-logit soft-cap (0.0 ⇒ no cap). The GPU
-                        // hook carries no softcap arg, so a capping model also
-                        // skips it and takes the capped CPU kernel (fail-closed).
                         let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
-                        // GPU prefill attention via SYCL — falls back
+                        // GPU prefill attention via SYCL/CUDA/MLX — falls back
                         // to the CPU path below if USM is disabled, the
                         // GPU is unavailable, or any sanity check fails.
                         // The hook is internally a one-shot copy in,
                         // kernel, copy out — see `try_flash_attn_prefill_usm_f32`
                         // for the layout contract.
-                        let used_gpu = swa_win == 0
-                            && softcap == 0.0
-                            && crate::accel::try_flash_attn_prefill_gpu_f32(
-                                &q_buf,
-                                k,
-                                v,
-                                &mut attn_out,
-                                n_heads,
-                                n_kv_heads,
-                                head_dim,
-                                max_ctx,
-                                kv_len_base,
-                                n_new,
-                            );
+                        let used_gpu = crate::accel::try_flash_attn_prefill_gpu_f32(
+                            &q_buf,
+                            k,
+                            v,
+                            &mut attn_out,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            kv_len_base,
+                            n_new,
+                            swa_win as u32,
+                            softcap,
+                        );
                         if !used_gpu {
                             k::gqa_attention_flash_prefill_capped_windowed(
                                 &q_buf,
@@ -10846,7 +10883,11 @@ impl LlamaModel {
             // Attention — try the SYCL F32 prefill path first
             // (passes max_ctx = kv_len because the slab is sized
             // exactly there); fall back to CPU if SYCL is off /
-            // hook returns false.
+            // hook returns false. This is the PAGED prefill path, whose CPU twin
+            // is the plain `gqa_attention_flash_prefill` — it carries no SWA /
+            // softcap (window=0 / softcap=0.0). SWA / Gemma2 models are coerced to
+            // the contiguous F32 path in the engine (paged masking/softcap is not
+            // wired), so they never reach here.
             let used_gpu = crate::accel::try_flash_attn_prefill_gpu_f32(
                 &q_buf,
                 &k_slab,
@@ -10858,6 +10899,8 @@ impl LlamaModel {
                 kv_len,
                 kv_len_base,
                 n_new,
+                0,
+                0.0,
             );
             if !used_gpu {
                 k::gqa_attention_flash_prefill(

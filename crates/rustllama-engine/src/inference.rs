@@ -1270,31 +1270,35 @@ impl CpuEngine {
         } else {
             kv_dtype
         };
-        // Sliding-window attention windows only the F32 contiguous attention
-        // kernels today (the quant-KV + paged + GPU paths carry no window arg),
-        // so an SWA model is coerced to f32 contiguous KV for masking
-        // correctness. Non-SWA models (the common case) are untouched.
+        // Sliding-window attention is implemented only for F32 KV: the windowed
+        // CPU kernels AND the F32-contiguous GPU flash/decode-block path (which
+        // now threads the per-layer `window` uniform) are f32-only — the quant-KV
+        // and paged paths still carry no window arg. So an SWA model is coerced to
+        // F32 KV for masking correctness; on a GPU it then runs the windowed F32
+        // flash/device-block kernels (not CPU-only). Non-SWA models are untouched.
         let kv_dtype = if model.cfg.sliding_window.is_some() && kv_dtype != KvDtype::F32 {
             tracing::warn!(
                 requested = ?kv_dtype,
                 "sliding-window model: defaulting KV cache to f32 (the windowed \
-                 attention kernels are f32-only)"
+                 attention kernels — CPU and GPU — are f32-only)"
             );
             KvDtype::F32
         } else {
             kv_dtype
         };
         // Gemma2 attention-logit soft-capping (`s = c·tanh(s/c)` on every
-        // attention score, before softmax) is applied only in the F32 contiguous
-        // CPU attention kernels today — the quant-KV + paged + GPU flash paths
-        // carry no softcap arg, so a capping model is coerced to f32 contiguous
-        // KV for numerical correctness (the output is WRONG without the cap).
-        // Non-capping models (the common case) are untouched.
+        // attention score, before softmax) is implemented only for F32 KV: the
+        // capped CPU kernels AND the F32-contiguous GPU flash/decode-block path
+        // (which now threads the per-layer `softcap` uniform) — the quant-KV and
+        // paged paths still carry no softcap arg. So a capping model is coerced to
+        // F32 KV for numerical correctness (the output is WRONG without the cap);
+        // on a GPU it then runs the capped F32 kernels. Non-capping models are
+        // untouched.
         let kv_dtype = if model.cfg.attn_logit_softcapping.is_some() && kv_dtype != KvDtype::F32 {
             tracing::warn!(
                 requested = ?kv_dtype,
                 "attention-softcap model (Gemma2): defaulting KV cache to f32 (the \
-                 soft-capping attention kernels are f32-only)"
+                 soft-capping attention kernels — CPU and GPU — are f32-only)"
             );
             KvDtype::F32
         } else {

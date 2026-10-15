@@ -2587,11 +2587,21 @@ extern "C" int rsl_cuda_embedding_lookup_f32(rsl_cuda_stream *s,
 // Shared use = (W*head_dim + 2*W)*4 B = ~4.2 KB @ W=8/head_dim=128, ≤8.3 KB
 // through head_dim 256 — far under the 48 KB floor, no opt-in / device query.
 #define RSL_FLASH_DECODE_W 8  // warps per head = KV-sequence split factor
+// `window` (0 = full causal) + `softcap` (0 = off) mirror the CPU reference
+// `gqa_attention_flash_decode_capped_windowed`: a sliding window trims the
+// attended range to the last `window` cached positions, and the Gemma2
+// attention-logit soft-cap `s = c*tanh(s/c)` is applied AFTER the `1/sqrt`
+// scale and BEFORE the online-softmax max/exp. Both are passthrough no-ops at 0
+// (window=0 ⇒ t_start=0 ⇒ full attention; softcap=0 ⇒ the tanh guard folds
+// away), so a non-SWA / non-Gemma2 model is byte-identical to the pre-feature
+// kernel. The per-warp `t < t_start` skip is WARP-UNIFORM (t depends on `warp`,
+// not `lane`), so it cannot desync the __shfl reduction below.
 __global__ void flash_attn_decode_f32_kernel(const float *q, const float *k,
                                              const float *v, float *out,
                                              int n_heads, int n_gqa,
                                              int head_dim, int max_ctx,
-                                             int kv_len, float scale) {
+                                             int kv_len, float scale,
+                                             int window, float softcap) {
     extern __shared__ float smem[];
     float *sh_acc = smem;                                   // [W * head_dim]
     float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;   // [W]
@@ -2613,9 +2623,14 @@ __global__ void flash_attn_decode_f32_kernel(const float *q, const float *k,
     }
     float m = -INFINITY, l = 0.f;
 
+    // Sliding-window lower bound: attend only `[t_start, kv_len)`. Matches the
+    // CPU `..._windowed` composition (`start = kv_len - window`, saturating;
+    // window==0 or window>=kv_len ⇒ t_start=0 ⇒ full attention).
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
     // Warp `warp` handles KV positions warp, warp+W, warp+2W, … (strided, so
     // consecutive positions are read by consecutive warps each step → good L2).
     for (int t = warp; t < kv_len; t += RSL_FLASH_DECODE_W) {
+        if (t < t_start) continue;  // SWA: before the window start (warp-uniform)
         const int kv_off = (kv_h * max_ctx + t) * head_dim;
         float partial = 0.f;
         for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
@@ -2624,6 +2639,8 @@ __global__ void flash_attn_decode_f32_kernel(const float *q, const float *k,
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_down_sync(0xffffffffu, partial, off);
         float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
+        // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+        if (softcap > 0.f) s_dot = softcap * tanhf(s_dot / softcap);
         float m_new = fmaxf(m, s_dot);
         float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
         float p = expf(s_dot - m_new);
@@ -2664,12 +2681,15 @@ __global__ void flash_attn_decode_f32_kernel(const float *q, const float *k,
     }
 }
 
+// `window` (0 = full causal) + `softcap` (0 = off): SWA / Gemma2 support,
+// threaded straight into the kernel (byte-identical passthroughs at 0/0).
 extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
                                               const float *q, const float *k,
                                               const float *v, float *out,
                                               int n_heads, int n_kv_heads,
                                               int head_dim, int max_ctx,
-                                              int kv_len) {
+                                              int kv_len,
+                                              int window, float softcap) {
     if (!s || !q || !k || !v || !out) return -1;
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0)
         return -1;
@@ -2689,7 +2709,8 @@ extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
                             2 * RSL_FLASH_DECODE_W) *
                    sizeof(float);
     flash_attn_decode_f32_kernel<<<grid, block, shmem, s->stream>>>(
-        q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len, scale);
+        q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len, scale,
+        window, softcap);
     return rsl_cuda_check("rsl_cuda_flash_attn_decode_f32");
 }
 
@@ -2724,12 +2745,22 @@ extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
 // device capability query is needed. Block = 128 threads (<< the 1024 cap).
 #define RSL_FLASH_PREFILL_BQ 4   // query rows (warps) per block
 #define RSL_FLASH_PREFILL_BK 16  // KV positions staged per shared tile
+// `window` (0 = full causal) + `softcap` (0 = off) mirror the CPU reference
+// `gqa_attention_flash_prefill_capped_windowed`: a query at absolute position
+// `P = kv_len_base + q_pos` attends keys `[max(0, P-window+1), P]` instead of
+// the full causal `[0, P]`, and the Gemma2 soft-cap `s = c*tanh(s/c)` is applied
+// after the `1/sqrt` scale and before the online-softmax max/exp. Passthrough
+// no-ops at 0 (byte-identical instruction path). The block's tile loop still
+// walks from t0=0 (its bound is block-uniform so every warp reaches the shared
+// __syncthreads); the per-query window is a per-position skip in the active
+// inner loop, exactly like the SYCL v3 prefill helper.
 __global__ void flash_attn_prefill_f32_kernel(const float *q, const float *k,
                                               const float *v, float *out,
                                               int n_heads, int n_gqa,
                                               int head_dim, int max_ctx,
                                               int kv_len_base, int n_new,
-                                              float scale) {
+                                              float scale,
+                                              int window, float softcap) {
     extern __shared__ float smem[];  // [BK*head_dim] K then [BK*head_dim] V
     float *k_tile = smem;
     float *v_tile = smem + RSL_FLASH_PREFILL_BK * head_dim;
@@ -2750,6 +2781,9 @@ __global__ void flash_attn_prefill_f32_kernel(const float *q, const float *k,
     const int q_last = min(q_base + RSL_FLASH_PREFILL_BQ - 1, n_new - 1);
     const int p_self = kv_len_base + q_pos;    // meaningful only if active
     const int p_block_max = kv_len_base + q_last;
+    // SWA per-query lower bound: query at abs pos p_self attends `[t_start, p_self]`.
+    // window==0 (or the window reaching position 0) ⇒ t_start=0 ⇒ full causal.
+    const int t_start = (window > 0 && p_self - window + 1 > 0) ? (p_self - window + 1) : 0;
 
     // Each lane owns head dims {lane, lane+32, ...}; qreg/acc hold that slice.
     float qreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
@@ -2785,6 +2819,9 @@ __global__ void flash_attn_prefill_f32_kernel(const float *q, const float *k,
             // Causal: this query sees positions t0..min(t0+BK-1, p_self).
             int jmax = min(RSL_FLASH_PREFILL_BK, p_self - t0 + 1);
             for (int j = 0; j < jmax; ++j) {
+                // SWA: skip positions before the window start (loop-var `j` is
+                // warp-uniform, so this cannot desync the __shfl reduction).
+                if (t0 + j < t_start) continue;
                 const float *krow = k_tile + j * head_dim;
                 float partial = 0.f;
                 for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
@@ -2794,6 +2831,8 @@ __global__ void flash_attn_prefill_f32_kernel(const float *q, const float *k,
                 for (int off = 16; off > 0; off >>= 1)
                     partial += __shfl_down_sync(0xffffffffu, partial, off);
                 float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
+                // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                if (softcap > 0.f) s_dot = softcap * tanhf(s_dot / softcap);
                 float m_new = fmaxf(m, s_dot);
                 float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
                 float p = expf(s_dot - m_new);
@@ -2813,12 +2852,15 @@ __global__ void flash_attn_prefill_f32_kernel(const float *q, const float *k,
     }
 }
 
+// `window` (0 = full causal) + `softcap` (0 = off): SWA / Gemma2 support
+// (byte-identical passthroughs at 0/0).
 extern "C" int rsl_cuda_flash_attn_prefill_f32(rsl_cuda_stream *s,
                                                const float *q, const float *k,
                                                const float *v, float *out,
                                                int n_heads, int n_kv_heads,
                                                int head_dim, int max_ctx,
-                                               int kv_len_base, int n_new) {
+                                               int kv_len_base, int n_new,
+                                               int window, float softcap) {
     if (!s || !q || !k || !v || !out) return -1;
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 ||
         n_new <= 0)
@@ -2836,7 +2878,7 @@ extern "C" int rsl_cuda_flash_attn_prefill_f32(rsl_cuda_stream *s,
         (size_t)2 * RSL_FLASH_PREFILL_BK * head_dim * sizeof(float);
     flash_attn_prefill_f32_kernel<<<grid, block, shmem, s->stream>>>(
         q, k, v, out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new,
-        scale);
+        scale, window, softcap);
     return rsl_cuda_check("rsl_cuda_flash_attn_prefill_f32");
 }
 

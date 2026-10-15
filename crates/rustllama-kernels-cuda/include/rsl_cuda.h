@@ -187,19 +187,30 @@ int rsl_cuda_embedding_lookup_f32(rsl_cuda_stream *s, const float *table,
 
 /* FlashAttention decode (single query per head):
  *   q=[n_heads,head_dim], k/v=[n_kv_heads,max_ctx,head_dim],
- *   out=[n_heads,head_dim]. GQA via n_heads%n_kv_heads==0. */
+ *   out=[n_heads,head_dim]. GQA via n_heads%n_kv_heads==0.
+ *   `window` (0 = full causal) trims the attended range to the last `window`
+ *   cached positions; `softcap` (0 = off) applies the Gemma2 attention-logit
+ *   soft-cap `s = c*tanh(s/c)` after the scale and before softmax. Both are
+ *   byte-identical passthroughs at 0 — see the CPU
+ *   `gqa_attention_flash_decode_capped_windowed`. */
 int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s, const float *q,
                                    const float *k, const float *v, float *out,
                                    int n_heads, int n_kv_heads, int head_dim,
-                                   int max_ctx, int kv_len);
+                                   int max_ctx, int kv_len,
+                                   int window, float softcap);
 
 /* FlashAttention prefill (causal, n_new queries):
  *   q/out=[n_new,n_heads,head_dim], k/v=[n_kv_heads,max_ctx,head_dim].
- *   query q_pos attends absolute [0, kv_len_base+q_pos]. */
+ *   query q_pos attends absolute [0, kv_len_base+q_pos].
+ *   `window` (0 = full causal): a query at abs pos P attends keys
+ *   `[max(0, P-window+1), P]`; `softcap` (0 = off): Gemma2 attention-logit cap
+ *   after the scale, before softmax. Byte-identical passthroughs at 0 — see the
+ *   CPU `gqa_attention_flash_prefill_capped_windowed`. */
 int rsl_cuda_flash_attn_prefill_f32(rsl_cuda_stream *s, const float *q,
                                     const float *k, const float *v, float *out,
                                     int n_heads, int n_kv_heads, int head_dim,
-                                    int max_ctx, int kv_len_base, int n_new);
+                                    int max_ctx, int kv_len_base, int n_new,
+                                    int window, float softcap);
 
 /* Quantized-KV FlashAttention: F32 Q / F32 out, packed K/V dequantized
  * on the fly (byte-exact ports of the CPU reference kernels in

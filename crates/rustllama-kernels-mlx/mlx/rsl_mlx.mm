@@ -1166,9 +1166,11 @@ extern "C" int rsl_mlx_embedding_lookup_f32(rsl_mlx_stream *s, const float *tabl
 // FlashAttention (F32 K/V) — LIVE. GQA online-softmax: one 32-lane group per
 // query (decode) / per (head, q_pos) (prefill); head_dim capped at 256 (the
 // shader's threadgroup accumulator). Ports rsl_flash_attn_{decode,prefill}_usm.
+// `window` (0 = full causal) + `softcap` (0 = off): SWA / Gemma2 support,
+// threaded into the Metal kernel as two extra constants (byte-identical at 0/0).
 extern "C" int rsl_mlx_flash_attn_decode_f32(rsl_mlx_stream *s, const float *q,
     const float *k, const float *v, float *out, int n_heads, int n_kv_heads,
-    int head_dim, int max_ctx, int kv_len) {
+    int head_dim, int max_ctx, int kv_len, int window, float softcap) {
 #if RSL_MLX_HAVE_METAL
     if (!s || !q || !k || !v || !out) return -1;
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || kv_len <= 0) return -1;
@@ -1179,7 +1181,8 @@ extern "C" int rsl_mlx_flash_attn_decode_f32(rsl_mlx_stream *s, const float *q,
     id<MTLBuffer> bv = mlx_resolve(v, &ov);
     id<MTLBuffer> bo = mlx_resolve(out, &oo);
     if (bq == nil || bk == nil || bv == nil || bo == nil) { g_rsl_mlx_errors++; return -1; }
-    int nh = n_heads, nkv = n_kv_heads, hd = head_dim, mc = max_ctx, kl = kv_len;
+    int nh = n_heads, nkv = n_kv_heads, hd = head_dim, mc = max_ctx, kl = kv_len, win = window;
+    float sc = softcap;
     MTLSize grid = MTLSizeMake((NSUInteger)n_heads, 1, 1);
     MTLSize tpg = MTLSizeMake(32, 1, 1);
     return mlx_run(s, @"rsl_mlx_flash_attn_decode_f32_kernel", grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
@@ -1192,14 +1195,17 @@ extern "C" int rsl_mlx_flash_attn_decode_f32(rsl_mlx_stream *s, const float *q,
         [enc setBytes:&hd length:sizeof(int) atIndex:6];
         [enc setBytes:&mc length:sizeof(int) atIndex:7];
         [enc setBytes:&kl length:sizeof(int) atIndex:8];
+        [enc setBytes:&win length:sizeof(int) atIndex:9];
+        [enc setBytes:&sc length:sizeof(float) atIndex:10];
     });
 #else
-    (void)s;(void)q;(void)k;(void)v;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len; RSL_MLX_STUB_KERNEL
+    (void)s;(void)q;(void)k;(void)v;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len;(void)window;(void)softcap; RSL_MLX_STUB_KERNEL
 #endif
 }
+// `window` / `softcap` as above; see the CPU `gqa_attention_flash_prefill_capped_windowed`.
 extern "C" int rsl_mlx_flash_attn_prefill_f32(rsl_mlx_stream *s, const float *q,
     const float *k, const float *v, float *out, int n_heads, int n_kv_heads,
-    int head_dim, int max_ctx, int kv_len_base, int n_new) {
+    int head_dim, int max_ctx, int kv_len_base, int n_new, int window, float softcap) {
 #if RSL_MLX_HAVE_METAL
     if (!s || !q || !k || !v || !out) return -1;
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return -1;
@@ -1211,7 +1217,8 @@ extern "C" int rsl_mlx_flash_attn_prefill_f32(rsl_mlx_stream *s, const float *q,
     id<MTLBuffer> bv = mlx_resolve(v, &ov);
     id<MTLBuffer> bo = mlx_resolve(out, &oo);
     if (bq == nil || bk == nil || bv == nil || bo == nil) { g_rsl_mlx_errors++; return -1; }
-    int nh = n_heads, nkv = n_kv_heads, hd = head_dim, mc = max_ctx, kb = kv_len_base, nn = n_new;
+    int nh = n_heads, nkv = n_kv_heads, hd = head_dim, mc = max_ctx, kb = kv_len_base, nn = n_new, win = window;
+    float sc = softcap;
     MTLSize grid = MTLSizeMake((NSUInteger)n_heads, (NSUInteger)n_new, 1);
     MTLSize tpg = MTLSizeMake(32, 1, 1);
     return mlx_run(s, @"rsl_mlx_flash_attn_prefill_f32_kernel", grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
@@ -1225,9 +1232,11 @@ extern "C" int rsl_mlx_flash_attn_prefill_f32(rsl_mlx_stream *s, const float *q,
         [enc setBytes:&mc length:sizeof(int) atIndex:7];
         [enc setBytes:&kb length:sizeof(int) atIndex:8];
         [enc setBytes:&nn length:sizeof(int) atIndex:9];
+        [enc setBytes:&win length:sizeof(int) atIndex:10];
+        [enc setBytes:&sc length:sizeof(float) atIndex:11];
     });
 #else
-    (void)s;(void)q;(void)k;(void)v;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len_base;(void)n_new; RSL_MLX_STUB_KERNEL
+    (void)s;(void)q;(void)k;(void)v;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len_base;(void)n_new;(void)window;(void)softcap; RSL_MLX_STUB_KERNEL
 #endif
 }
 
@@ -1552,7 +1561,11 @@ extern "C" int rsl_mlx_decode_attn_block_f32(
     // history rows [0, pos) by the caller.
     void *k_mirror, void *v_mirror,
     int n_heads, int n_kv_heads, int head_dim, int d_model,
-    int pos, int max_ctx, int kv_len, float rms_eps) {
+    int pos, int max_ctx, int kv_len, float rms_eps,
+    // Per-layer SWA window (0 = full causal) + Gemma2 attention-logit soft-cap
+    // (0 = off) for THIS layer's internal flash-decode. Passthrough no-ops at 0,
+    // so a non-SWA / non-Gemma2 layer is byte-identical to the pre-feature block.
+    int window, float softcap) {
 #if RSL_MLX_HAVE_METAL
     if (ffn_ran) *ffn_ran = 0;
     if (!s || !wq_dev || !wk_dev || !wv_dev || !wo_dev || !attn_norm || !ffn_norm
@@ -1692,6 +1705,9 @@ extern "C" int rsl_mlx_decode_attn_block_f32(
         // real path runs on).
         const int dm = d_model, nh = n_heads, nkv = n_kv_heads, hd = head_dim;
         const int pp = pos, mc = max_ctx, kl = kv_len, one = 1;
+        // Per-layer SWA window + Gemma2 soft-cap for the fused flash-decode step.
+        const int win = window;
+        const float sc = softcap;
         const float eps = rms_eps;
 
         id<MTLCommandBuffer> cb = [s->queue commandBuffer];
@@ -1777,7 +1793,9 @@ extern "C" int rsl_mlx_decode_attn_block_f32(
           [enc setBytes:&mc length:sizeof(int) atIndex:5];
           [enc dispatchThreadgroups:MTLSizeMake((total + tg - 1) / tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)]; }
 
-        // --- 5. FlashAttention decode over the mirror [0, kv_len) → attn ---
+        // --- 5. FlashAttention decode over the mirror [0, kv_len) → attn.
+        //     `win`/`sc` apply this layer's SWA window + Gemma2 soft-cap (0/0 ⇒
+        //     byte-identical to the pre-feature block). ---
         [enc setComputePipelineState:pso_flash];
         [enc setBuffer:slab offset:off_q * sizeof(float) atIndex:0];
         [enc setBuffer:bkm offset:okm atIndex:1];
@@ -1788,6 +1806,8 @@ extern "C" int rsl_mlx_decode_attn_block_f32(
         [enc setBytes:&hd length:sizeof(int) atIndex:6];
         [enc setBytes:&mc length:sizeof(int) atIndex:7];
         [enc setBytes:&kl length:sizeof(int) atIndex:8];
+        [enc setBytes:&win length:sizeof(int) atIndex:9];
+        [enc setBytes:&sc length:sizeof(float) atIndex:10];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
         // --- 6. o = Wo @ attn (K = d_q, M = d_model) ---
@@ -1894,7 +1914,7 @@ extern "C" int rsl_mlx_decode_attn_block_f32(
     (void)inv_freq; (void)hidden; (void)h_norm2; (void)k_row; (void)v_row;
     (void)k_mirror; (void)v_mirror; (void)n_heads; (void)n_kv_heads;
     (void)head_dim; (void)d_model; (void)pos; (void)max_ctx; (void)kv_len;
-    (void)rms_eps;
+    (void)rms_eps; (void)window; (void)softcap;
     if (ffn_ran) *ffn_ran = 0;
     return 0;  // inert off Apple Silicon — the caller runs the per-op/CPU ladder
 #endif
