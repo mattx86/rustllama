@@ -119,6 +119,13 @@ pub enum Command {
         /// `--model` (the server default).
         #[arg(long, value_name = "GGUF")]
         lora: Option<std::path::PathBuf>,
+        /// EAGLE draft-head companion GGUF (P10b) to attach to the startup
+        /// model for self-speculative decoding (`eagle > MTP > n-gram > none`).
+        /// Overrides `[model].eagle_head`. Applied to the FIRST `--model` (the
+        /// server default) on the contiguous-KV engine (not the fused-decode
+        /// paged path).
+        #[arg(long, value_name = "GGUF")]
+        eagle_head: Option<std::path::PathBuf>,
         /// Bind address — overrides `[server].bind_addr`. Accepts an
         /// IPv4/IPv6 literal or hostname (IPv6 needs no brackets here,
         /// e.g. `--ip ::1`). Bind `0.0.0.0` (or `::`) to expose the
@@ -1089,6 +1096,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Serve {
             model,
             lora,
+            eagle_head,
             ip,
             port,
             api_key,
@@ -1101,6 +1109,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 &config_path,
                 model,
                 lora,
+                eagle_head,
                 ip,
                 port,
                 api_key,
@@ -3664,6 +3673,7 @@ async fn serve(
     config_path: &std::path::Path,
     models: Vec<std::path::PathBuf>,
     lora: Option<std::path::PathBuf>,
+    eagle_head: Option<std::path::PathBuf>,
     ip: Option<String>,
     port: Option<u16>,
     api_key: Option<String>,
@@ -3697,6 +3707,12 @@ async fn serve(
     // default model).
     if let Some(lp) = lora {
         cfg.model.lora = Some(lp);
+    }
+
+    // `--eagle-head` overrides `[model].eagle_head` (P10b EAGLE draft head for
+    // the startup default model).
+    if let Some(ep) = eagle_head {
+        cfg.model.eagle_head = Some(ep);
     }
 
     // Device / memory-tier CLI flags override the corresponding
@@ -3926,9 +3942,17 @@ async fn serve(
     // (default) startup model only. Cloned out of `cfg` so the per-model
     // borrow below doesn't conflict with the loop's other `cfg` reads.
     let startup_lora_path = cfg.model.lora.clone();
+    // P10b: the `[model].eagle_head` / `--eagle-head` companion attaches to the
+    // FIRST (default) startup model only. Cloned out of `cfg` like the LoRA path.
+    let startup_eagle_path = cfg.model.eagle_head.clone();
     for (model_idx, path) in startup_models.iter().enumerate() {
         let startup_lora: Option<&std::path::Path> = if model_idx == 0 {
             startup_lora_path.as_deref()
+        } else {
+            None
+        };
+        let startup_eagle: Option<&std::path::Path> = if model_idx == 0 {
+            startup_eagle_path.as_deref()
         } else {
             None
         };
@@ -3937,6 +3961,17 @@ async fn serve(
             tracing::warn!(
                 model = %path.display(),
                 "--lora / [model].lora ignored: LoRA merge is GGUF-only (this is a model directory)"
+            );
+        }
+        // P10b — the EAGLE head attaches on the contiguous-KV CpuEngine only.
+        // Warn (then skip) when the first model routes through the fused-decode
+        // paged engine or is a model directory.
+        if startup_eagle.is_some() && (use_fused_decode || path.is_dir()) {
+            tracing::warn!(
+                model = %path.display(),
+                "--eagle-head / [model].eagle_head ignored: EAGLE speculation \
+                 attaches on the contiguous-KV engine (not the fused-decode paged \
+                 path / a model directory)"
             );
         }
         // Mandatory first-load auto-tune for THIS model, before it loads.
@@ -4349,6 +4384,22 @@ async fn serve(
                 cacheblend_ratio: Some(applied_cacheblend),
             }
             .apply_to(&mut cpu);
+            // P10b — attach the EAGLE draft head (companion GGUF) to the FIRST
+            // startup model. Load-time validated against the base; a malformed
+            // head fails the load loudly (fail-closed). Takes precedence over
+            // MTP/NextN + n-gram at dispatch. GGUF-only (a model directory has
+            // no base to match), and gated to dense/MoE at dispatch time.
+            if let Some(ep) = startup_eagle {
+                cpu.attach_eagle_head(ep).map_err(|e| {
+                    anyhow::anyhow!("failed to attach EAGLE head {}: {e}", ep.display())
+                })?;
+                tracing::info!(
+                    eagle_head = %ep.display(),
+                    "EAGLE trained draft-head speculative decoding enabled \
+                     (eagle > MTP > n-gram; grammar requests fall back to the \
+                     classic sampler)"
+                );
+            }
             // Pull CPU-force patterns from
             // `[inference].placement.overrides` FIRST — the placement
             // decision below (VRAM-fit planner + first-load probe)

@@ -1121,6 +1121,136 @@ pub fn write_synthetic_lora_adapter_gguf(path: &Path, params: &SynthLoraAdapter)
     write_gguf_file(path, m, &tensors);
 }
 
+/// Parameters for a synthetic P10b EAGLE draft-head companion GGUF, matched to
+/// a [`SynthLlama`] base. Emits the public clean-room EAGLE head namespace
+/// (`adapter.type = "eagle"` + `eagle.*` tensors) that
+/// `rustllama_models::llama_arch::EagleHead::from_gguf` loads.
+#[derive(Debug, Clone)]
+pub struct SynthEagleHead {
+    /// Base geometry the head drafts for (its tensors are sized from
+    /// `d_model` / `n_heads` / `head_dim` / `d_ff` / `vocab`).
+    pub base: SynthLlama,
+    /// RNG seed for the head's weight values.
+    pub seed: u64,
+    /// When `true`, emit a dedicated `eagle.output.weight` LM head +
+    /// `eagle.token_embd.weight`; otherwise the head ties to the base output /
+    /// embedding (the common case, and what `EagleHead { lm_head: None,
+    /// token_embd: None }` exercises).
+    pub own_lm_head: bool,
+}
+
+impl Default for SynthEagleHead {
+    fn default() -> Self {
+        Self {
+            base: SynthLlama::default(),
+            seed: 0xEA61_E5EE,
+            own_lm_head: false,
+        }
+    }
+}
+
+/// Write a synthetic EAGLE draft-head companion GGUF to `path`, matched to
+/// `params.base`. Carries the fusion projection (`eagle.fc.weight` +
+/// pre-fusion `enorm`/`hnorm` + `fc.bias`), one decoder block
+/// (`eagle.{attn_*,ffn_*}`), and — when `own_lm_head` is set — a dedicated
+/// output norm + LM head + embedding (else tied to the base).
+pub fn write_synthetic_eagle_head_gguf(path: &Path, params: &SynthEagleHead) {
+    let b = &params.base;
+    let d_model = b.d_model;
+    let d_q = b.n_heads * b.head_dim;
+    let d_kv = b.n_kv_heads * b.head_dim;
+    let d_ff = b.d_ff;
+    let vocab = b.vocab;
+    let seed = params.seed;
+
+    let mut m = MetaBuilder::new();
+    // Base arch + adapter identity (clean-room EAGLE head namespace).
+    m.string("general.architecture", "llama");
+    m.string("general.type", "adapter");
+    m.string("adapter.type", "eagle");
+    m.u32("eagle.embedding_length", d_model);
+
+    let f32w = |name: &str, dims: Vec<u64>, n: usize, tseed: u64| -> TensorSpec {
+        TensorSpec::f32(name, dims, random_f32(n, tseed))
+    };
+
+    let mut tensors: Vec<TensorSpec> = Vec::new();
+    // Fusion: concat([embed, hidden]) [2·d] → [d]. ggml ne = [in, out].
+    tensors.push(f32w(
+        "eagle.fc.weight",
+        vec![(2 * d_model) as u64, d_model as u64],
+        (2 * d_model * d_model) as usize,
+        seed.wrapping_add(1),
+    ));
+    tensors.push(f32w("eagle.fc.bias", vec![d_model as u64], d_model as usize, seed.wrapping_add(2)));
+    tensors.push(f32w("eagle.enorm.weight", vec![d_model as u64], d_model as usize, seed.wrapping_add(3)));
+    tensors.push(f32w("eagle.hnorm.weight", vec![d_model as u64], d_model as usize, seed.wrapping_add(4)));
+
+    // Decoder block (same shapes as a base `blk.{i}.*` layer).
+    tensors.push(f32w("eagle.attn_norm.weight", vec![d_model as u64], d_model as usize, seed.wrapping_add(10)));
+    tensors.push(f32w(
+        "eagle.attn_q.weight",
+        vec![d_model as u64, d_q as u64],
+        (d_model * d_q) as usize,
+        seed.wrapping_add(11),
+    ));
+    tensors.push(f32w(
+        "eagle.attn_k.weight",
+        vec![d_model as u64, d_kv as u64],
+        (d_model * d_kv) as usize,
+        seed.wrapping_add(12),
+    ));
+    tensors.push(f32w(
+        "eagle.attn_v.weight",
+        vec![d_model as u64, d_kv as u64],
+        (d_model * d_kv) as usize,
+        seed.wrapping_add(13),
+    ));
+    tensors.push(f32w(
+        "eagle.attn_output.weight",
+        vec![d_q as u64, d_model as u64],
+        (d_q * d_model) as usize,
+        seed.wrapping_add(14),
+    ));
+    tensors.push(f32w("eagle.ffn_norm.weight", vec![d_model as u64], d_model as usize, seed.wrapping_add(15)));
+    tensors.push(f32w(
+        "eagle.ffn_gate.weight",
+        vec![d_model as u64, d_ff as u64],
+        (d_model * d_ff) as usize,
+        seed.wrapping_add(16),
+    ));
+    tensors.push(f32w(
+        "eagle.ffn_up.weight",
+        vec![d_model as u64, d_ff as u64],
+        (d_model * d_ff) as usize,
+        seed.wrapping_add(17),
+    ));
+    tensors.push(f32w(
+        "eagle.ffn_down.weight",
+        vec![d_ff as u64, d_model as u64],
+        (d_ff * d_model) as usize,
+        seed.wrapping_add(18),
+    ));
+
+    if params.own_lm_head {
+        tensors.push(f32w("eagle.output_norm.weight", vec![d_model as u64], d_model as usize, seed.wrapping_add(20)));
+        tensors.push(f32w(
+            "eagle.output.weight",
+            vec![d_model as u64, vocab as u64],
+            (d_model * vocab) as usize,
+            seed.wrapping_add(21),
+        ));
+        tensors.push(f32w(
+            "eagle.token_embd.weight",
+            vec![d_model as u64, vocab as u64],
+            (d_model * vocab) as usize,
+            seed.wrapping_add(22),
+        ));
+    }
+
+    write_gguf_file(path, m, &tensors);
+}
+
 /// Hyperparameters for the synthetic BERT-family embedding model.
 /// Defaults produce a tiny 2-layer / 64-d_model BERT useful for
 /// round-trip + load tests of `rustllama_models::bert_arch`.

@@ -876,6 +876,14 @@ pub enum LlamaLoadError {
     Tensor(#[from] TensorError),
     #[error("expected dtype F32 for weight `{0}`")]
     NotF32(String),
+    /// P10b — a companion EAGLE draft-head GGUF (`[model].eagle_head` /
+    /// `serve --eagle-head`) is present but malformed: not tagged
+    /// `adapter.type = "eagle"`, missing the required `eagle.fc.weight`, or a
+    /// fusion-projection shape that disagrees with the base `d_model`. Hard
+    /// error so a misconfigured head can't silently degrade (or mis-draft)
+    /// decode — the fail-closed contract.
+    #[error("eagle head: {0}")]
+    Eagle(String),
     /// `prism.hadamard.*` metadata present but inconsistent with the
     /// model's tensors, or present on a model shape whose forward
     /// path hasn't wired the activation transform. Hard error: a
@@ -1344,6 +1352,133 @@ pub struct MtpHead {
     /// variants emit a dedicated `mtp.{i}.output.weight` per head; most
     /// share with the main LM head.
     pub lm_head: Option<Tensor>,
+}
+
+/// P10b — a trained EAGLE draft head (Li et al. 2024, "EAGLE: Speculative
+/// Sampling Requires Rethinking Feature Uncertainty").
+///
+/// Loaded from a COMPANION GGUF (not the base file — detected via
+/// `[model].eagle_head` / `serve --eagle-head`, mirroring P11's `--lora`
+/// wiring). An EAGLE head is a small autoregressive module that drafts a
+/// continuation from the base model's top hidden state + the embedding of the
+/// last token. Its structure mirrors the NextN/MTP sidecar ([`MtpHead`] /
+/// [`NextNHead`]): a fusion of `concat([token_embed, hidden])` down to
+/// `d_model`, one transformer-ish block, and an LM head tied (by default) to
+/// the base model's output.
+///
+/// Unlike MTP's per-position heads, EAGLE runs this SINGLE head REPEATEDLY
+/// (see [`LlamaModel::forward_eagle_head`]) to grow a draft of arbitrary depth:
+/// each step fuses the running feature with the last drafted token's embedding,
+/// runs the block, and emits a next-token distribution whose argmax feeds the
+/// following step. The base model then verifies the resulting draft tree with
+/// the SHARED tree-spec stack ([`LlamaModel::forward_tree_verify_f32`] +
+/// `tree_accept_reject`), so EAGLE only replaces the DRAFTING.
+///
+/// On-disk tensor namespace (clean-room; `general.type = "adapter"` +
+/// `adapter.type = "eagle"`):
+///   - `eagle.fc.weight`     `[d_model, 2·d_model]` (required) — fusion proj.
+///   - `eagle.fc.bias`       `[d_model]`            (optional).
+///   - `eagle.enorm.weight`  `[d_model]`  (optional) — pre-fusion embed norm.
+///   - `eagle.hnorm.weight`  `[d_model]`  (optional) — pre-fusion hidden norm.
+///   - `eagle.{attn_norm,attn_q,attn_k,attn_v,attn_output,ffn_norm,ffn_gate,
+///      ffn_up,ffn_down}.weight` — the decoder block (same shapes as a base
+///      `blk.{i}.*` layer); `attn_{q,k,v}.bias` optional.
+///   - `eagle.output_norm.weight` `[d_model]` (optional) — else reuse the base
+///      `output_norm`.
+///   - `eagle.token_embd.weight`  `[vocab, d_model]` (optional) — else reuse
+///      the base `token_embd` (the common case: EAGLE ties the embedding).
+///   - `eagle.output.weight`      `[vocab, d_model]` (optional) — else tie to
+///      the base `output` / `token_embd`.
+#[derive(Debug)]
+pub struct EagleHead {
+    /// Fusion projection of `concat([token_embed, hidden])` `[2·d_model]` down
+    /// to `[d_model]` — the block's input hidden. Mirrors `NextNHead::eh_proj`.
+    pub fc: Tensor,
+    /// Optional fusion bias `[d_model]`.
+    pub fc_bias: Option<Vec<f32>>,
+    /// Optional RMSNorm applied to the token embedding before fusion.
+    pub embed_norm: Option<Vec<f32>>,
+    /// Optional RMSNorm applied to the base hidden before fusion.
+    pub hidden_norm: Option<Vec<f32>>,
+    /// The draft decoder block (attn + FFN), structurally one transformer layer
+    /// — reuses [`LlamaBlockWeights`] exactly like [`MtpHead::block`].
+    pub block: LlamaBlockWeights,
+    /// Optional own output norm. `None` => reuse the base `output_norm`.
+    pub output_norm: Option<Vec<f32>>,
+    /// Optional own token embedding `[vocab, d_model]`. `None` => reuse the
+    /// base `token_embd` (the common, tied case).
+    pub token_embd: Option<Tensor>,
+    /// Optional own LM head. `None` => tie to the base `output` (or
+    /// `token_embd` if the base head is itself tied).
+    pub lm_head: Option<Tensor>,
+}
+
+impl EagleHead {
+    /// Parse an EAGLE draft head from an already-open companion GGUF. `cfg` is
+    /// the BASE model's config (the head is validated against the base
+    /// `d_model` / `vocab_size`). Fail-closed: a file lacking
+    /// `adapter.type = "eagle"` or the required `eagle.fc.weight` is rejected
+    /// so a misconfigured path can never silently degrade decode.
+    pub fn from_gguf(gguf: &Gguf, cfg: &LlamaConfig) -> Result<Self, LlamaLoadError> {
+        let atype = gguf
+            .metadata_get("adapter.type")
+            .and_then(|v| v.as_string())
+            .map(|s| s.to_string());
+        if atype.as_deref() != Some("eagle") {
+            return Err(LlamaLoadError::Eagle(format!(
+                "not an EAGLE head GGUF: `adapter.type` is {atype:?} (want \"eagle\")"
+            )));
+        }
+        let d = cfg.d_model;
+        let fc = load_weight(gguf, "eagle.fc.weight")?;
+        // The fusion maps [2·d_model] → [d_model]; verify before it reaches the
+        // matvec (C1a would panic otherwise — fail loudly here with context).
+        if (fc.out_dim(), fc.in_dim()) != (d, 2 * d) {
+            return Err(LlamaLoadError::Eagle(format!(
+                "eagle.fc.weight is ({}, {}), expected (d_model={d}, 2·d_model={})",
+                fc.out_dim(),
+                fc.in_dim(),
+                2 * d
+            )));
+        }
+        let block = LlamaBlockWeights {
+            attn_norm: load_norm(gguf, "eagle.attn_norm.weight")?,
+            w_q: load_weight(gguf, "eagle.attn_q.weight")?,
+            w_k: load_weight(gguf, "eagle.attn_k.weight")?,
+            w_v: load_weight(gguf, "eagle.attn_v.weight")?,
+            // The draft head isn't on the base hot path; skip the load-time
+            // QKV concat (the forward falls through to three matvecs).
+            w_qkv_fused: None,
+            w_o: load_weight(gguf, "eagle.attn_output.weight")?,
+            b_q: load_optional_norm(gguf, "eagle.attn_q.bias"),
+            b_k: load_optional_norm(gguf, "eagle.attn_k.bias"),
+            b_v: load_optional_norm(gguf, "eagle.attn_v.bias"),
+            ffn_norm: load_norm(gguf, "eagle.ffn_norm.weight")?,
+            w_gate: load_weight(gguf, "eagle.ffn_gate.weight")?,
+            w_up: load_weight(gguf, "eagle.ffn_up.weight")?,
+            w_down: load_weight(gguf, "eagle.ffn_down.weight")?,
+            q_norm: load_optional_norm(gguf, "eagle.attn_q_norm.weight"),
+            k_norm: load_optional_norm(gguf, "eagle.attn_k_norm.weight"),
+        };
+        Ok(Self {
+            fc,
+            fc_bias: load_optional_norm(gguf, "eagle.fc.bias"),
+            embed_norm: load_optional_norm(gguf, "eagle.enorm.weight"),
+            hidden_norm: load_optional_norm(gguf, "eagle.hnorm.weight"),
+            block,
+            output_norm: load_optional_norm(gguf, "eagle.output_norm.weight"),
+            token_embd: load_optional_weight(gguf, "eagle.token_embd.weight"),
+            lm_head: load_optional_weight(gguf, "eagle.output.weight"),
+        })
+    }
+
+    /// Open + parse an EAGLE head from a companion GGUF path, validated against
+    /// the base model's `cfg`.
+    pub fn from_path(path: &std::path::Path, cfg: &LlamaConfig) -> Result<Self, LlamaLoadError> {
+        let gguf = Gguf::open(path)
+            .map_err(|e| LlamaLoadError::Eagle(format!("gguf open failed: {e}")))?;
+        Self::from_gguf(&gguf, cfg)
+    }
 }
 
 #[derive(Debug)]
@@ -10155,6 +10290,265 @@ impl LlamaModel {
             .unwrap_or(&self.weights.token_embd);
         matvec_tensor_dispatch(lm_head, &final_norm, logits_out, cfg.vocab_size, d);
         self.finalize_logits(logits_out);
+    }
+
+    /// P10b — one dense/MoE decode step that ALSO captures the post-last-layer
+    /// hidden state (pre-output-norm) into `hidden_out`. This is the base
+    /// feature an EAGLE draft head fuses with the last token's embedding — the
+    /// SAME hidden [`Self::forward_one_with_mtp_logits`] snapshots for the MTP
+    /// sidecars (the "second-to-top" feature in EAGLE's terms). Writes the
+    /// tip token's K/V at `pos` and the main distribution into
+    /// `main_logits_out`, exactly like a classic decode at `(token_id, pos)`,
+    /// so the tip forward is bit-identical to a plain decode — only the hidden
+    /// capture is added on top. Not valid for hybrid / MLA models (which take
+    /// different forward bodies); the EAGLE dispatch gates those out.
+    pub fn forward_one_with_hidden(
+        &self,
+        token_id: i32,
+        pos: u32,
+        kv: &mut KvCache,
+        main_logits_out: &mut [f32],
+        hidden_out: &mut Vec<f32>,
+    ) {
+        let cfg = &self.cfg;
+        let d = cfg.d_model;
+        let d_q = cfg.n_heads * cfg.head_dim;
+        let d_kv = cfg.n_kv_heads * cfg.head_dim;
+        let d_ff = cfg.d_ff;
+        let head_dim = cfg.head_dim;
+        let (n_experts, top_k) = cfg
+            .moe
+            .as_ref()
+            .map(|m| (m.n_experts as usize, m.n_experts_used as usize))
+            .unwrap_or((0, 0));
+        crate::accel::with_forward_scratch(
+            d, d_q, d_kv, d_ff, head_dim, cfg.rope_theta, n_experts, top_k,
+            |scratch| {
+                self.forward_one_with_scratch_inner(
+                    EmbedInput::Token(token_id),
+                    pos,
+                    kv,
+                    main_logits_out,
+                    scratch,
+                );
+                // `forward_one_with_scratch_inner` leaves `scratch.hidden`
+                // holding the post-last-layer hidden (pre-output-norm) — the
+                // EAGLE head's base feature.
+                *hidden_out = scratch.hidden.clone();
+            },
+        );
+    }
+
+    /// P10b — run the EAGLE draft head AUTOREGRESSIVELY to grow `depth` draft
+    /// positions, returning one full-vocab logit row per position. This is the
+    /// drop-in replacement for the MTP path's per-head `mtp_logits_out`: the
+    /// returned rows feed [`crate::speculative::build_mtp_tree`] exactly as the
+    /// MTP head logits do, so the tree shape + verify + accept are the shared
+    /// tree-spec stack and EAGLE only changes the DRAFTING.
+    ///
+    /// Each step (Li et al. 2024):
+    ///   1. Embed the current token (the head's own `token_embd` if present,
+    ///      else the base's — the common tied case).
+    ///   2. Fuse `concat([embed, feature])` → `h_in` via `fc` (+ optional
+    ///      pre-fusion norms + bias). `feature` is the base hidden at step 0,
+    ///      then the draft block's OWN output hidden thereafter — EAGLE's
+    ///      autoregressive feature recurrence.
+    ///   3. Run the single-position decoder block → `(block_hidden, logits)`.
+    ///   4. Record `logits`; advance `feature = block_hidden` and `token` to
+    ///      the block's argmax (the main-path token `build_mtp_tree` also takes
+    ///      as the main node of this level).
+    ///
+    /// Single-position self-attention reduces to broadcasting V across the GQA
+    /// query heads (softmax over one position is 1.0), the same simplification
+    /// [`Self::forward_mtp_head_sidecar`] uses — the draft head carries no KV
+    /// of its own in this clean-room port, so its autoregressive signal flows
+    /// entirely through the fused feature. Fully deterministic (argmax advance,
+    /// no RNG).
+    pub fn forward_eagle_head(
+        &self,
+        head: &EagleHead,
+        base_hidden: &[f32],
+        last_token: i32,
+        depth: usize,
+    ) -> Vec<Vec<f32>> {
+        let d = self.cfg.d_model;
+        let vocab = self.cfg.vocab_size;
+        assert_eq!(
+            base_hidden.len(),
+            d,
+            "forward_eagle_head: base_hidden must be d_model ({d}), got {}",
+            base_hidden.len()
+        );
+        let mut rows: Vec<Vec<f32>> = Vec::with_capacity(depth);
+        let mut feature = base_hidden.to_vec();
+        let mut token = last_token;
+        for _ in 0..depth {
+            let embed = self.eagle_embed(head, token);
+            let h_in = self.eagle_fuse(head, &embed, &feature);
+            let mut logits = vec![0f32; vocab];
+            let block_hidden = self.eagle_block_forward(head, &h_in, &mut logits);
+            // Advance by the (penalty-free) argmax — the main-path token.
+            let mut best_i = 0usize;
+            let mut best_v = f32::NEG_INFINITY;
+            for (i, &v) in logits.iter().enumerate() {
+                if v > best_v {
+                    best_v = v;
+                    best_i = i;
+                }
+            }
+            rows.push(logits);
+            feature = block_hidden;
+            token = best_i as i32;
+        }
+        rows
+    }
+
+    /// Embed one token for the EAGLE head: its own `token_embd` table when
+    /// present, else the base embedding (the tied case). Returns a `d_model`
+    /// row.
+    fn eagle_embed(&self, head: &EagleHead, token: i32) -> Vec<f32> {
+        let d = self.cfg.d_model;
+        match head.token_embd.as_ref() {
+            Some(tbl) => {
+                let mut out = vec![0f32; d];
+                k::embed_lookup_tensor(tbl, &[token], &mut out, d);
+                out
+            }
+            // Reuse the fully-validated base embedding lookup.
+            None => self.embed_tokens(&[token]),
+        }
+    }
+
+    /// Fuse `concat([embed, feature])` → the block's input hidden via the EAGLE
+    /// `fc` projection (+ optional pre-fusion RMSNorms and bias). Mirrors the
+    /// NextN head's `eh_proj` over `concat([embed_{t+1}, hidden_t])`.
+    fn eagle_fuse(&self, head: &EagleHead, embed: &[f32], feature: &[f32]) -> Vec<f32> {
+        let cfg = &self.cfg;
+        let d = cfg.d_model;
+        // Optional pre-fusion norms (applied to a copy so the inputs are
+        // untouched for the caller's own bookkeeping).
+        let embed_n = match head.embed_norm.as_ref() {
+            Some(w) => {
+                let mut o = vec![0f32; d];
+                k::rmsnorm_f32_row(embed, w, &mut o, cfg.rms_eps);
+                o
+            }
+            None => embed.to_vec(),
+        };
+        let feat_n = match head.hidden_norm.as_ref() {
+            Some(w) => {
+                let mut o = vec![0f32; d];
+                k::rmsnorm_f32_row(feature, w, &mut o, cfg.rms_eps);
+                o
+            }
+            None => feature.to_vec(),
+        };
+        // concat([embed, feature]) — embed first, matching eh_proj's order.
+        let mut cat = vec![0f32; 2 * d];
+        cat[..d].copy_from_slice(&embed_n);
+        cat[d..].copy_from_slice(&feat_n);
+        let mut h_in = vec![0f32; d];
+        matvec_tensor_dispatch(&head.fc, &cat, &mut h_in, d, 2 * d);
+        if let Some(b) = head.fc_bias.as_ref() {
+            for (h, bv) in h_in.iter_mut().zip(b.iter()) {
+                *h += *bv;
+            }
+        }
+        h_in
+    }
+
+    /// Single-position EAGLE decoder block over the fused hidden `h_in`
+    /// (residual base). Runs attn (GQA V-broadcast) + SwiGLU FFN, writes the
+    /// head's logits into `logits_out`, and returns the post-block hidden
+    /// (pre-output-norm) — the feature the next autoregressive step fuses.
+    /// Same block topology as [`Self::forward_mtp_head_sidecar`], differing
+    /// only in that the residual base is the fused `h_in` and the output
+    /// norm / LM head fall back to the head's own tensors when present.
+    fn eagle_block_forward(
+        &self,
+        head: &EagleHead,
+        h_in: &[f32],
+        logits_out: &mut [f32],
+    ) -> Vec<f32> {
+        let cfg = &self.cfg;
+        let d = cfg.d_model;
+        let n_heads = cfg.n_heads;
+        let n_kv_heads = cfg.n_kv_heads;
+        let head_dim = cfg.head_dim;
+        let d_q = n_heads * head_dim;
+        let d_kv = n_kv_heads * head_dim;
+        let d_ff = cfg.d_ff;
+        let block = &head.block;
+
+        let mut h_norm = vec![0f32; d];
+        k::rmsnorm_f32_row(h_in, &block.attn_norm, &mut h_norm, cfg.rms_eps);
+
+        let mut q_buf = vec![0f32; d_q];
+        let mut k_buf = vec![0f32; d_kv];
+        let mut v_buf = vec![0f32; d_kv];
+        matvec_tensor_dispatch(&block.w_q, &h_norm, &mut q_buf, d_q, d);
+        matvec_tensor_dispatch(&block.w_k, &h_norm, &mut k_buf, d_kv, d);
+        matvec_tensor_dispatch(&block.w_v, &h_norm, &mut v_buf, d_kv, d);
+        if let Some(bq) = block.b_q.as_ref() {
+            for (q, b) in q_buf.iter_mut().zip(bq.iter()) {
+                *q += *b;
+            }
+        }
+        if let Some(bk) = block.b_k.as_ref() {
+            for (kk, b) in k_buf.iter_mut().zip(bk.iter()) {
+                *kk += *b;
+            }
+        }
+        if let Some(bv) = block.b_v.as_ref() {
+            for (v, b) in v_buf.iter_mut().zip(bv.iter()) {
+                *v += *b;
+            }
+        }
+
+        // Single-position self-attention = broadcast V across the GQA query
+        // heads (softmax over one position is 1.0).
+        let mut attn_out = vec![0f32; d_q];
+        let n_gqa = n_heads / n_kv_heads.max(1);
+        for h in 0..n_heads {
+            let kv_h = h / n_gqa.max(1);
+            let src = &v_buf[kv_h * head_dim..(kv_h + 1) * head_dim];
+            let dst = &mut attn_out[h * head_dim..(h + 1) * head_dim];
+            dst.copy_from_slice(src);
+        }
+
+        let mut attn_proj = vec![0f32; d];
+        matvec_tensor_dispatch(&block.w_o, &attn_out, &mut attn_proj, d, d_q);
+
+        let mut hidden = h_in.to_vec();
+        k::add_inplace_f32(&mut hidden, &attn_proj);
+
+        let mut h_norm_ffn = vec![0f32; d];
+        k::rmsnorm_f32_row(&hidden, &block.ffn_norm, &mut h_norm_ffn, cfg.rms_eps);
+
+        let mut gate_buf = vec![0f32; d_ff];
+        let mut up_buf = vec![0f32; d_ff];
+        let mut ffn_buf = vec![0f32; d_ff];
+        let mut ffn_out = vec![0f32; d];
+        matvec_tensor_dispatch(&block.w_gate, &h_norm_ffn, &mut gate_buf, d_ff, d);
+        matvec_tensor_dispatch(&block.w_up, &h_norm_ffn, &mut up_buf, d_ff, d);
+        k::silu_mul_f32(&gate_buf, &up_buf, &mut ffn_buf);
+        matvec_tensor_dispatch(&block.w_down, &ffn_buf, &mut ffn_out, d, d_ff);
+        k::add_inplace_f32(&mut hidden, &ffn_out);
+
+        // Project to vocab: the head's own output norm / LM head when present,
+        // else tie to the base (output_norm, then output / token_embd).
+        let out_norm = head.output_norm.as_ref().unwrap_or(&self.weights.output_norm);
+        let mut final_norm = vec![0f32; d];
+        k::rmsnorm_f32_row(&hidden, out_norm, &mut final_norm, cfg.rms_eps);
+        let lm_head = head
+            .lm_head
+            .as_ref()
+            .or(self.weights.output.as_ref())
+            .unwrap_or(&self.weights.token_embd);
+        matvec_tensor_dispatch(lm_head, &final_norm, logits_out, cfg.vocab_size, d);
+        self.finalize_logits(logits_out);
+        // Return the pre-output-norm hidden — the next step's fused feature.
+        hidden
     }
 
     /// Multi-position forward returning per-position logits.

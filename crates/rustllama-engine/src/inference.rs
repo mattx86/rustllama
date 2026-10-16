@@ -117,6 +117,15 @@ pub struct CpuEngine {
     /// precedence over `mtp_spec` / `ngram_spec`; a no-op fallback on models
     /// without MTP heads or on the hybrid path.
     tree_spec: Option<Vec<u32>>,
+    /// P10b — a loaded EAGLE draft head (companion GGUF, from
+    /// `[model].eagle_head` / `serve --eagle-head`). `Some` enables EAGLE
+    /// tree speculation on a dense/MoE model with the contiguous KV backend:
+    /// the head drafts autoregressively and the base verifies via the shared
+    /// tree-spec stack ([`tree_eagle_round`]). Takes PRECEDENCE over the
+    /// in-base MTP/NextN + n-gram drafters (`eagle > MTP > n-gram > none`).
+    /// `None` (default) leaves every other decode path byte-identical — the
+    /// fail-closed contract. Forks inherit the parent's head (`Arc`-shared).
+    eagle_head: Option<Arc<rustllama_models::llama_arch::EagleHead>>,
     /// Per-request performance + cache-hit stats from the most recent
     /// generation. Reset to defaults at the start of each request and
     /// committed at the end. Reads are race-free as long as the caller
@@ -1870,6 +1879,7 @@ impl CpuEngine {
             draft_spec: None,
             mtp_spec: false,
             tree_spec: None,
+            eagle_head: None,
             image_wrapper: None,
             vision_feature_memo: Arc::new(Mutex::new(None)),
             lock_registry,
@@ -2503,6 +2513,7 @@ impl CpuEngine {
             draft_spec: None,
             mtp_spec: false,
             tree_spec: None,
+            eagle_head: None,
             image_wrapper: None,
             vision_feature_memo: Arc::new(Mutex::new(None)),
             lock_registry,
@@ -2667,6 +2678,7 @@ impl CpuEngine {
             draft_spec: None,
             mtp_spec: false,
             tree_spec: None,
+            eagle_head: None,
             image_wrapper: None,
             vision_feature_memo: Arc::new(Mutex::new(None)),
             lock_registry,
@@ -3731,6 +3743,51 @@ impl CpuEngine {
         }
     }
 
+    /// P10b — attach (or clear) a loaded EAGLE draft head. `Some` routes
+    /// grammar-free, non-SWA-ring decode on a supported model through
+    /// [`Self::speculate_eagle_stream`]; `None` restores the pre-EAGLE path
+    /// byte-identically. Forks inherit the head.
+    pub fn set_eagle_head(
+        &mut self,
+        head: Option<Arc<rustllama_models::llama_arch::EagleHead>>,
+    ) {
+        self.eagle_head = head;
+    }
+
+    /// The loaded EAGLE head, if any (for the serve/HTTP load paths + tests).
+    pub fn eagle_head(&self) -> Option<Arc<rustllama_models::llama_arch::EagleHead>> {
+        self.eagle_head.clone()
+    }
+
+    /// P10b — load an EAGLE draft head from a companion GGUF and attach it,
+    /// validated against this model's config. Mirrors P11's `--lora` attach
+    /// (load-then-set). Errors (not an eagle GGUF / shape mismatch / missing
+    /// fusion) propagate so a misconfigured path fails the load loudly rather
+    /// than silently degrading decode.
+    pub fn attach_eagle_head(&mut self, path: &std::path::Path) -> Result<()> {
+        let head = rustllama_models::llama_arch::EagleHead::from_path(path, &self.model.cfg)
+            .map_err(|e| CpuEngineError::Other(format!("eagle head load failed: {e}")))?;
+        self.eagle_head = Some(Arc::new(head));
+        Ok(())
+    }
+
+    /// Whether EAGLE speculation is enabled AND the loaded model can use it: a
+    /// dense/MoE model (NOT hybrid / MLA — those take different forward bodies
+    /// the EAGLE tip forward doesn't cover). The dense contiguous tree verify
+    /// is the shared stack; the per-round guard also re-checks the backend.
+    pub fn eagle_speculative(&self) -> bool {
+        self.eagle_head.is_some() && self.model_supports_eagle()
+    }
+
+    /// A model can host an EAGLE draft head iff it runs the standard dense/MoE
+    /// forward ([`LlamaModel::forward_one_with_hidden`] captures its hidden) —
+    /// i.e. NOT hybrid and NOT MLA. The companion head is model-matched; this
+    /// gate keeps the driver honest on an arch the tip forward can't feed.
+    fn model_supports_eagle(&self) -> bool {
+        let w = &self.model.weights;
+        !w.is_hybrid() && !w.is_mla()
+    }
+
     /// Set (or clear) the CacheBlend recompute ratio applied to RAG `documents`
     /// requests. The serve load path calls this with the autotuned ratio (`tune
     /// --cacheblend` winner when `[tuning].auto_apply_cacheblend`) or the
@@ -4110,6 +4167,8 @@ impl CpuEngine {
             // MTP self-speculation is a plain Copy bool; forks inherit it.
             mtp_spec: self.mtp_spec,
             tree_spec: self.tree_spec.clone(),
+            // P10b — forks inherit the parent's EAGLE head (Arc-shared).
+            eagle_head: self.eagle_head.clone(),
             image_wrapper: self.image_wrapper.clone(),
             vision_feature_memo: Arc::clone(&self.vision_feature_memo),
             // Forks share the parent's locked ranges: they use the same
@@ -6745,6 +6804,108 @@ fn mtp_round(
 /// same penalties the sampler does (neutral penalties leave the tree
 /// byte-identical).
 #[allow(clippy::too_many_arguments)]
+/// Shared DENSE tree-spec tail (Feature 4 + P10b): given an already-built draft
+/// tree `nodes` + the (penalty-applied) root distribution `main_dist`, run the
+/// batched ancestor-masked verify, walk the accepted path, and commit it into
+/// the contiguous F32 KV via [`KvCache::compact_tokens`]. Factored so BOTH the
+/// MTP self-spec round ([`tree_mtp_round`]) and the EAGLE round
+/// ([`tree_eagle_round`]) reuse ONE verify/accept/commit — EAGLE only replaces
+/// the DRAFTING that produces `nodes`. The caller holds the state lock and has
+/// already run the tip forward (K/V at `base_pos`, `kv.seq_len == base_pos+1`).
+#[allow(clippy::too_many_arguments)]
+fn dense_tree_verify_commit(
+    model: &LlamaModel,
+    state: &mut EngineState,
+    next_input: i32,
+    base_pos: usize,
+    main_dist: &[f32],
+    nodes: &[crate::speculative::TreeNode],
+    max_ctx: usize,
+    greedy: bool,
+    rng: &mut Rng,
+    vocab: usize,
+) -> MtpRoundOutcome {
+    use crate::speculative::{tree_accept_reject, tree_accept_reject_greedy, tree_depths};
+    let fits = !nodes.is_empty() && base_pos + 1 + nodes.len() <= max_ctx;
+    if !fits {
+        // No tree (no drafts / overflow) ⇒ commit one token from target_root,
+        // exactly the empty-draft accept/reject (== classic sample).
+        let drafts: [DraftToken; 0] = [];
+        let target: [&[f32]; 1] = [main_dist];
+        let out = if greedy {
+            accept_reject_greedy(&drafts, &target)
+        } else {
+            accept_reject(&drafts, &target, rng)
+        };
+        state.kv_backend.set_seq_len(base_pos + 1);
+        state.last_ids.push(next_input as u32);
+        return MtpRoundOutcome {
+            committed: vec![out.replacement],
+            next_input: out.replacement as i32,
+            next_pos: base_pos as u32 + 1,
+            pending: None,
+            drafted: 0,
+            accepted: 0,
+        };
+    }
+
+    // --- Tree verify forward: per-node target_next. Writes each node's K/V to
+    //     slot `base_pos + 1 + node_index`, attending prefix + ancestors. ---
+    let node_tokens: Vec<i32> = nodes.iter().map(|n| n.id as i32).collect();
+    let depths = tree_depths(nodes);
+    let parent: Vec<i32> = nodes
+        .iter()
+        .map(|n| n.parent.map(|p| p as i32).unwrap_or(-1))
+        .collect();
+    let mut tree_logits = vec![0f32; nodes.len() * vocab];
+    {
+        let KvBackend::Contiguous(kv) = &mut state.kv_backend else { unreachable!() };
+        model.forward_tree_verify_f32(
+            &node_tokens,
+            base_pos as u32 + 1,
+            &depths,
+            &parent,
+            kv,
+            &mut tree_logits,
+        );
+    }
+    let next_dists: Vec<Vec<f32>> = (0..nodes.len())
+        .map(|i| softmax_to_vec(&tree_logits[i * vocab..(i + 1) * vocab]))
+        .collect();
+    let next_refs: Vec<&[f32]> = next_dists.iter().map(|d| d.as_slice()).collect();
+
+    // --- Walk the best accepted path. ---
+    let outcome = if greedy {
+        tree_accept_reject_greedy(nodes, main_dist, &next_refs)
+    } else {
+        tree_accept_reject(nodes, main_dist, &next_refs, rng)
+    };
+    let a = outcome.accepted.len();
+
+    // --- Commit: compact the accepted path's scattered K/V into contiguous
+    //     slots, then truncate. One verify forward paid for `a` tokens. ---
+    {
+        let KvBackend::Contiguous(kv) = &mut state.kv_backend else { unreachable!() };
+        kv.compact_tokens(base_pos + 1, &outcome.accepted_nodes);
+    }
+    state.kv_backend.set_seq_len(base_pos + 1 + a);
+    // last_ids mirrors the committed KV coverage: context + tip + accepted path.
+    state.last_ids.push(next_input as u32);
+    state.last_ids.extend(outcome.accepted.iter().copied());
+    debug_assert_eq!(state.last_ids.len(), state.kv_backend.seq_len());
+
+    let mut committed = outcome.accepted;
+    committed.push(outcome.replacement);
+    MtpRoundOutcome {
+        committed,
+        next_input: outcome.replacement as i32,
+        next_pos: base_pos as u32 + 1 + a as u32,
+        pending: None,
+        drafted: nodes.len(),
+        accepted: a,
+    }
+}
+
 fn tree_mtp_round(
     model: &LlamaModel,
     state: &Arc<Mutex<EngineState>>,
@@ -6759,9 +6920,7 @@ fn tree_mtp_round(
     frequency: f32,
     presence: f32,
 ) -> Result<MtpRoundOutcome> {
-    use crate::speculative::{
-        build_mtp_tree, tree_accept_reject, tree_accept_reject_greedy, tree_depths,
-    };
+    use crate::speculative::build_mtp_tree;
     let penalize = repeat != 1.0 || frequency != 0.0 || presence != 0.0;
     let mut state = state.lock().expect("state lock");
     let base_pos = next_pos as usize;
@@ -6803,82 +6962,95 @@ fn tree_mtp_round(
     }
     let main_dist = softmax_to_vec(&main_logits);
 
-    // --- Build the draft tree; bail to a single-token sample if empty or it
-    //     would overflow the context. Per-node penalties steer the drafted
-    //     branches to match the sampler (neutral ⇒ unchanged tree). ---
+    // --- Build the draft tree; the shared dense tail verifies + commits it
+    //     (bails to a single-token sample if empty / would overflow). Per-node
+    //     penalties steer the drafted branches to match the sampler (neutral ⇒
+    //     unchanged tree). ---
     let widths_usz: Vec<usize> = widths.iter().map(|&w| (w as usize).max(1)).collect();
     let nodes = build_mtp_tree(&head_logits, &widths_usz, &recent, repeat, frequency, presence);
-    let fits = !nodes.is_empty() && base_pos + 1 + nodes.len() <= max_ctx;
-    if !fits {
-        // No tree (no heads / overflow) ⇒ commit one token from target_root,
-        // exactly the empty-draft accept/reject (== classic sample).
-        let drafts: [DraftToken; 0] = [];
-        let target: [&[f32]; 1] = [main_dist.as_slice()];
-        let out = if greedy {
-            accept_reject_greedy(&drafts, &target)
-        } else {
-            accept_reject(&drafts, &target, rng)
-        };
-        state.kv_backend.set_seq_len(base_pos + 1);
-        state.last_ids.push(next_input as u32);
-        return Ok(MtpRoundOutcome {
-            committed: vec![out.replacement],
-            next_input: out.replacement as i32,
-            next_pos: base_pos as u32 + 1,
-            pending: None,
-            drafted: 0,
-            accepted: 0,
-        });
+    Ok(dense_tree_verify_commit(
+        model, &mut *state, next_input, base_pos, &main_dist, &nodes, max_ctx, greedy, rng, vocab,
+    ))
+}
+
+/// P10b — one EAGLE tree self-speculation round (the dense/MoE counterpart of
+/// [`tree_mtp_round`]). Identical plumbing EXCEPT the drafting: instead of the
+/// base model's per-position MTP sidecars, a SINGLE trained EAGLE head
+/// ([`LlamaModel::forward_eagle_head`]) is run autoregressively from the base's
+/// captured top hidden + the tip token's embedding to produce the per-depth
+/// draft logit rows. Those rows feed the SAME [`build_mtp_tree`] +
+/// [`dense_tree_verify_commit`] (verify → accept → compact-commit) the MTP
+/// round uses, so EAGLE only replaces the DRAFT source.
+///
+/// Requires the contiguous F32 KV backend + a dense/MoE model (the tip forward
+/// [`LlamaModel::forward_one_with_hidden`] doesn't cover hybrid / MLA — the
+/// dispatch gates those out); returns an error otherwise so the caller falls
+/// back. Default sampling penalties are a no-op; non-default
+/// repeat/frequency/presence penalties are applied BOTH to the root verified
+/// distribution AND, per node, to the drafted tree (`build_mtp_tree`) — the
+/// same contract [`tree_mtp_round`] documents.
+#[allow(clippy::too_many_arguments)]
+fn tree_eagle_round(
+    model: &LlamaModel,
+    state: &Arc<Mutex<EngineState>>,
+    eagle: &rustllama_models::llama_arch::EagleHead,
+    next_input: i32,
+    next_pos: u32,
+    widths: &[u32],
+    max_ctx: usize,
+    greedy: bool,
+    rng: &mut Rng,
+    vocab: usize,
+    repeat: f32,
+    frequency: f32,
+    presence: f32,
+) -> Result<MtpRoundOutcome> {
+    use crate::speculative::build_mtp_tree;
+    let penalize = repeat != 1.0 || frequency != 0.0 || presence != 0.0;
+    let mut state = state.lock().expect("state lock");
+    let base_pos = next_pos as usize;
+
+    if !matches!(state.kv_backend, KvBackend::Contiguous(_)) {
+        return Err(CpuEngineError::Other(
+            "EAGLE tree speculation requires the contiguous KV backend".to_string(),
+        ));
     }
 
-    // --- Tree verify forward: per-node target_next. Writes each node's K/V to
-    //     slot `base_pos + 1 + node_index`, attending prefix + ancestors. ---
-    let node_tokens: Vec<i32> = nodes.iter().map(|n| n.id as i32).collect();
-    let depths = tree_depths(&nodes);
-    let parent: Vec<i32> = nodes
-        .iter()
-        .map(|n| n.parent.map(|p| p as i32).unwrap_or(-1))
-        .collect();
-    let mut tree_logits = vec![0f32; nodes.len() * vocab];
+    // --- Tip forward: main (target_root) distribution + the base hidden the
+    //     EAGLE head fuses. Writes the tip token's K/V at `base_pos`;
+    //     kv.seq_len = base_pos + 1. ---
+    let mut main_logits = vec![0f32; vocab];
+    let mut base_hidden: Vec<f32> = Vec::new();
     {
         let KvBackend::Contiguous(kv) = &mut state.kv_backend else { unreachable!() };
-        model.forward_tree_verify_f32(&node_tokens, next_pos + 1, &depths, &parent, kv, &mut tree_logits);
+        model.forward_one_with_hidden(next_input, next_pos, kv, &mut main_logits, &mut base_hidden);
     }
-    let next_dists: Vec<Vec<f32>> = (0..nodes.len())
-        .map(|i| softmax_to_vec(&tree_logits[i * vocab..(i + 1) * vocab]))
-        .collect();
-    let next_refs: Vec<&[f32]> = next_dists.iter().map(|d| d.as_slice()).collect();
+    debug_assert_eq!(state.kv_backend.seq_len(), base_pos + 1);
 
-    // --- Walk the best accepted path. ---
-    let outcome = if greedy {
-        tree_accept_reject_greedy(&nodes, &main_dist, &next_refs)
+    // Penalty history for the first speculative token = `last_ids` (== [0,
+    // base_pos)) plus the just-forwarded tip. Shared by the root target penalty
+    // and the per-node draft penalties (same contract as `tree_mtp_round`).
+    let recent: Vec<u32> = if penalize {
+        let mut r = state.last_ids.clone();
+        r.push(next_input as u32);
+        r
     } else {
-        tree_accept_reject(&nodes, &main_dist, &next_refs, rng)
+        Vec::new()
     };
-    let a = outcome.accepted.len();
-
-    // --- Commit: compact the accepted path's scattered K/V into contiguous
-    //     slots, then truncate. One verify forward paid for `a` tokens. ---
-    {
-        let KvBackend::Contiguous(kv) = &mut state.kv_backend else { unreachable!() };
-        kv.compact_tokens(base_pos + 1, &outcome.accepted_nodes);
+    if penalize {
+        crate::sampling::apply_all_penalties(&mut main_logits, &recent, repeat, frequency, presence);
     }
-    state.kv_backend.set_seq_len(base_pos + 1 + a);
-    // last_ids mirrors the committed KV coverage: context + tip + accepted path.
-    state.last_ids.push(next_input as u32);
-    state.last_ids.extend(outcome.accepted.iter().copied());
-    debug_assert_eq!(state.last_ids.len(), state.kv_backend.seq_len());
+    let main_dist = softmax_to_vec(&main_logits);
 
-    let mut committed = outcome.accepted;
-    committed.push(outcome.replacement);
-    Ok(MtpRoundOutcome {
-        committed,
-        next_input: outcome.replacement as i32,
-        next_pos: base_pos as u32 + 1 + a as u32,
-        pending: None,
-        drafted: nodes.len(),
-        accepted: a,
-    })
+    // --- Draft: run the EAGLE head autoregressively to `widths.len()` depths,
+    //     producing one full-vocab logit row per depth — the drop-in for the
+    //     MTP sidecar logits. Then shape the tree exactly like the MTP round. ---
+    let widths_usz: Vec<usize> = widths.iter().map(|&w| (w as usize).max(1)).collect();
+    let head_logits = model.forward_eagle_head(eagle, &base_hidden, next_input, widths_usz.len());
+    let nodes = build_mtp_tree(&head_logits, &widths_usz, &recent, repeat, frequency, presence);
+    Ok(dense_tree_verify_commit(
+        model, &mut *state, next_input, base_pos, &main_dist, &nodes, max_ctx, greedy, rng, vocab,
+    ))
 }
 
 /// One TREE MTP self-speculation round for a HYBRID model (Feature 4, hybrid
@@ -7273,6 +7445,16 @@ impl Engine for CpuEngine {
                 return self.speculate(&prompt, draft.clone(), *k, s);
             }
         }
+        // P10b — EAGLE trained draft head: takes PRECEDENCE over the in-base
+        // MTP/NextN + n-gram drafters (`eagle > MTP > n-gram > none`). A
+        // loaded head on a supported (dense/MoE, non-SWA-ring) model drafts a
+        // tree autoregressively; the base verifies via the shared tree-spec
+        // stack. Grammar-free only, same raw-softmax caveat as the others.
+        if let Some(head) = self.eagle_head.clone() {
+            if s.grammar.is_none() && allow_spec && self.model_supports_eagle() {
+                return self.speculate_eagle_stream(prompt, s.clone(), head);
+            }
+        }
         // MTP / NextN self-speculation: takes precedence over n-gram
         // (the model's own NextN head beats prompt-lookup on free
         // prose). Grammar-free only, same raw-softmax caveat as the
@@ -7305,6 +7487,12 @@ impl Engine for CpuEngine {
         // MTP / NextN self-speculation takes precedence over n-gram; a
         // no-op fall-through on non-MTP models. Grammar-free only.
         let allow_spec = !self.swa_ring_decode();
+        // P10b — EAGLE head first (`eagle > MTP > n-gram > none`).
+        if let Some(head) = self.eagle_head.clone() {
+            if s.grammar.is_none() && allow_spec && self.model_supports_eagle() {
+                return self.speculate_eagle_stream(prompt.to_string(), s.clone(), head);
+            }
+        }
         if let Some(widths) = self.tree_spec.clone() {
             if s.grammar.is_none() && allow_spec && self.model_supports_tree() {
                 return self.speculate_mtp_stream(prompt.to_string(), s.clone(), Some(widths));
@@ -7999,6 +8187,65 @@ impl CpuEngine {
         s: SamplingParams,
         tree_widths: Option<Vec<u32>>,
     ) -> EngineResult<TokenStream> {
+        self.speculate_tree_stream_from_ids(initial_prompt_ids, s, tree_widths, None)
+    }
+
+    /// P10b — text entry for EAGLE tree speculation. Tokenizes `prompt` (BOS
+    /// policy) and forwards to [`Self::speculate_eagle_stream_from_ids`].
+    /// PRECONDITIONS (checked by `chat` / `generate` via
+    /// [`Self::model_supports_eagle`] before routing here): a loaded EAGLE head,
+    /// a dense/MoE model, a grammar-free request, and no SWA ring.
+    pub fn speculate_eagle_stream(
+        &self,
+        prompt: String,
+        s: SamplingParams,
+        head: Arc<rustllama_models::llama_arch::EagleHead>,
+    ) -> EngineResult<TokenStream> {
+        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
+            crate::EngineError::Unimplemented("speculate_eagle requires a tokenizer")
+        })?;
+        let add_bos = tokenizer.add_bos_token();
+        let initial_prompt_ids: Vec<i32> = tokenizer
+            .encode(&prompt, add_bos)?
+            .into_iter()
+            .map(|t| t as i32)
+            .collect();
+        self.speculate_eagle_stream_from_ids(initial_prompt_ids, s, head)
+    }
+
+    /// P10b — ID-level EAGLE tree self-speculative decode driver. Shares the
+    /// whole MTP tree-spec stream (prefill, per-round verify, streaming / stop /
+    /// EOS / stats) via [`Self::speculate_tree_stream_from_ids`]; the only
+    /// difference is the drafter ([`tree_eagle_round`] runs the trained head
+    /// instead of the base MTP sidecars). Tree widths come from the configured
+    /// `speculative_tree_widths` (else the `[2,2,2,2]` default) — EAGLE always
+    /// drafts a tree.
+    pub fn speculate_eagle_stream_from_ids(
+        &self,
+        initial_prompt_ids: Vec<i32>,
+        s: SamplingParams,
+        head: Arc<rustllama_models::llama_arch::EagleHead>,
+    ) -> EngineResult<TokenStream> {
+        let widths = self
+            .tree_spec
+            .clone()
+            .filter(|w| !w.is_empty())
+            .unwrap_or_else(|| vec![2, 2, 2, 2]);
+        self.speculate_tree_stream_from_ids(initial_prompt_ids, s, Some(widths), Some(head))
+    }
+
+    /// Shared tree-spec stream body for the MTP (Feature 4) and EAGLE (P10b)
+    /// drafters. `eagle = Some(head)` routes each round through
+    /// [`tree_eagle_round`]; `None` keeps the MTP dispatch
+    /// (`tree_mtp_round` / `tree_mtp_round_hybrid` / linear `mtp_round`). Every
+    /// other stage — prefill, streaming, stop / EOS / stats — is identical.
+    fn speculate_tree_stream_from_ids(
+        &self,
+        initial_prompt_ids: Vec<i32>,
+        s: SamplingParams,
+        tree_widths: Option<Vec<u32>>,
+        eagle: Option<Arc<rustllama_models::llama_arch::EagleHead>>,
+    ) -> EngineResult<TokenStream> {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             crate::EngineError::Unimplemented("speculate_mtp requires a tokenizer")
         })?;
@@ -8038,6 +8285,8 @@ impl CpuEngine {
         let flash_attention = self.flash_attention;
         let n_gpu_layers = self.n_gpu_layers;
         let cpu_force_patterns = self.cpu_force_patterns.clone();
+        // P10b — the EAGLE head (if routing EAGLE spec), owned by the stream.
+        let eagle = eagle;
 
         let stream = async_stream::stream! {
             let mut rng_slot = Some(Rng::from_seed(seed));
@@ -8166,15 +8415,27 @@ impl CpuEngine {
                 let np = next_pos;
                 let pend = pending;
                 let vocab_c = vocab;
-                // Tree spec (Feature 4) when widths are set + the model supports
-                // it; otherwise the linear NextN `mtp_round`. Both return
-                // `MtpRoundOutcome`, so the whole stream (emit / stop / stats) is
-                // shared.
+                // P10b — EAGLE head first: the trained draft head drafts the
+                // tree, verified via the shared dense stack. Else tree spec
+                // (Feature 4) when widths are set + the model supports it; else
+                // the linear NextN `mtp_round`. All return `MtpRoundOutcome`, so
+                // the whole stream (emit / stop / stats) is shared.
                 let tw = tree_widths.clone();
                 let mc = max_ctx;
+                let eagle_c = eagle.clone();
                 let joined = worker
                     .run_blocking(move || {
-                        let out = if let Some(widths) = tw {
+                        let out = if let Some(head) = eagle_c.as_ref() {
+                            // EAGLE tree spec (dense/MoE contiguous): the head
+                            // drafts autoregressively; verify/accept/commit is
+                            // the shared `dense_tree_verify_commit` stack.
+                            let widths = tw.unwrap_or_else(|| vec![2, 2, 2, 2]);
+                            tree_eagle_round(
+                                &model_c, &state_c, head, ni, np, &widths, mc,
+                                greedy_spec, &mut rng_c, vocab_c,
+                                repeat_pen, freq_pen, pres_pen,
+                            )
+                        } else if let Some(widths) = tw {
                             // Tree spec: hybrid models go through the recurrent-
                             // state tree walk; dense/MoE through the batched
                             // ancestor-masked verify. Both return MtpRoundOutcome.

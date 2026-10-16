@@ -262,6 +262,12 @@ pub struct ModelConfig {
     /// quantized bases are left packed. The `serve --lora` flag overrides this.
     #[serde(default)]
     pub lora: Option<PathBuf>,
+    /// Optional EAGLE draft-head companion GGUF (P10b). When set, a loaded
+    /// dense/MoE model drafts with the trained head and verifies via the shared
+    /// tree-spec stack (`eagle > MTP > n-gram > none`). The `serve --eagle-head`
+    /// flag overrides this. `None` leaves every other decode path unchanged.
+    #[serde(default)]
+    pub eagle_head: Option<PathBuf>,
 }
 
 impl Default for ModelConfig {
@@ -272,6 +278,7 @@ impl Default for ModelConfig {
             chat_template: "auto".to_string(),
             mmproj: None,
             lora: None,
+            eagle_head: None,
         }
     }
 }
