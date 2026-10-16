@@ -425,7 +425,7 @@ impl PagedBatchEngine {
         // Config budget 0 ⇒ the ragged mixed path is OFF unless the
         // `RUSTLLAMA_MAX_BATCHED_TOKENS` env var opts in (env still honored for
         // back-compat; see `resolve_max_batched_tokens`).
-        Self::load_inner(path, max_ctx, max_slots, true, 0, None)
+        Self::load_inner(path, max_ctx, max_slots, true, 0, None, None)
     }
 
     /// Same as [`Self::load`] but with the `[inference].max_num_batched_tokens`
@@ -441,7 +441,28 @@ impl PagedBatchEngine {
         max_slots: u32,
         max_num_batched_tokens: usize,
     ) -> Result<Self, CpuEngineError> {
-        Self::load_inner(path, max_ctx, max_slots, true, max_num_batched_tokens, None)
+        Self::load_inner(path, max_ctx, max_slots, true, max_num_batched_tokens, None, None)
+    }
+
+    /// P11: like [`Self::load_with_batched_tokens`] but merges a LoRA adapter
+    /// GGUF (`lora`) into the model at load (Phase 1 merge). `None` is the
+    /// un-adapted base.
+    pub fn load_with_batched_tokens_and_lora(
+        path: &Path,
+        max_ctx: usize,
+        max_slots: u32,
+        max_num_batched_tokens: usize,
+        lora: Option<&Path>,
+    ) -> Result<Self, CpuEngineError> {
+        Self::load_inner(
+            path,
+            max_ctx,
+            max_slots,
+            true,
+            max_num_batched_tokens,
+            None,
+            lora,
+        )
     }
 
     /// Same as [`Self::load`] but without a tokenizer — for callers
@@ -451,7 +472,7 @@ impl PagedBatchEngine {
         max_ctx: usize,
         max_slots: u32,
     ) -> Result<Self, CpuEngineError> {
-        Self::load_inner(path, max_ctx, max_slots, false, 0, None)
+        Self::load_inner(path, max_ctx, max_slots, false, 0, None, None)
     }
 
     /// Test-only: like [`Self::load_token_id_only`] but with an explicit page
@@ -469,7 +490,7 @@ impl PagedBatchEngine {
         max_slots: u32,
         total_pages: u32,
     ) -> Result<Self, CpuEngineError> {
-        Self::load_inner(path, max_ctx, max_slots, false, 0, Some(total_pages))
+        Self::load_inner(path, max_ctx, max_slots, false, 0, Some(total_pages), None)
     }
 
     fn load_inner(
@@ -479,10 +500,31 @@ impl PagedBatchEngine {
         with_tokenizer: bool,
         config_max_batched_tokens: usize,
         pool_pages_override: Option<u32>,
+        lora: Option<&Path>,
     ) -> Result<Self, CpuEngineError> {
         let max_slots = max_slots.max(1);
         let gguf = Gguf::open(path)?;
-        let model = LlamaModel::load(&gguf)?;
+        let mut model = LlamaModel::load(&gguf)?;
+        // P11: merge a LoRA adapter at load (Phase 1); see the `CpuEngine`
+        // twin in `inference.rs`.
+        if let Some(lora_path) = lora {
+            let lgguf = Gguf::open(lora_path)?;
+            let adapter =
+                rustllama_models::lora::LoraAdapter::from_gguf(&lgguf, "default").map_err(|e| {
+                    CpuEngineError::Other(format!(
+                        "LoRA adapter load failed ({}): {e}",
+                        lora_path.display()
+                    ))
+                })?;
+            let stats = model.weights.merge_lora(&adapter);
+            tracing::info!(
+                adapter = %lora_path.display(),
+                merged = stats.merged,
+                skipped_quant = stats.skipped_quant,
+                shape_mismatch = stats.shape_mismatch,
+                "LoRA adapter merged at load (P11 Phase 1, paged engine)"
+            );
+        }
 
         // D1a (relaxed by D1b, then F8): fail-closed model gate.
         // `PagedBatchEngine` is selected by `[server].fused_decode` and

@@ -11,6 +11,7 @@ pub mod imatrix_collect;
 pub mod kv_bias;
 pub mod llama_arch;
 pub mod llama_config;
+pub mod lora;
 pub mod apc;
 pub mod cacheblend;
 pub mod kv_cold_tier;

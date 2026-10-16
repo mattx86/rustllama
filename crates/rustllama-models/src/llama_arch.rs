@@ -89,16 +89,20 @@ pub(crate) fn matvec_tensor_dispatch(
     // H8: F16-input mixed-precision matvec (per-dtype `matvec_f16in:<dtype>`
     // verdict-gated, fail-closed). Tried before the F32 USM path; on miss
     // (dtype off / no verdict) falls straight through with no cost.
-    if crate::accel::try_matvec_tensor_f16in_usm_f32(w, x, out, m, k_dim) {
-        return;
+    let base_done = crate::accel::try_matvec_tensor_f16in_usm_f32(w, x, out, m, k_dim)
+        || crate::accel::try_matvec_tensor_usm_f32(w, x, out, m, k_dim)
+        || crate::accel::try_matvec_f16_usm_f32(w, x, out, m, k_dim);
+    if !base_done {
+        k::matvec_tensor(w, x, out, m, k_dim);
     }
-    if crate::accel::try_matvec_tensor_usm_f32(w, x, out, m, k_dim) {
-        return;
-    }
-    if crate::accel::try_matvec_f16_usm_f32(w, x, out, m, k_dim) {
-        return;
-    }
-    k::matvec_tensor(w, x, out, m, k_dim);
+    // P11 (LoRA, Phase 2): additive low-rank delta `y += s·B·(A·x)` for the
+    // thread-active adapter, applied once around whichever base path ran. A
+    // no-op (one thread_local borrow + Option check, no write to `out`) unless
+    // an adapter is active AND adapts `w.name`, so the no-LoRA path stays
+    // byte-identical. The batched / gate-up-fused fast paths funnel an
+    // *adapted* tensor through this single-row dispatch (see their gates) so
+    // the delta is applied exactly once per row.
+    crate::lora::apply_delta(&w.name, x, out);
 }
 
 /// Numerically-stable logistic sigmoid `1 / (1 + e^-x)`, evaluated as
@@ -160,7 +164,15 @@ pub(crate) fn matvec_tensor_batched_dispatch(
         m_dim,
         k_dim,
     );
-    if crate::accel::try_matvec_tensor_batched_usm_f32(w, x, out, m_dim, k_dim, n_rows) {
+    // P11 (LoRA): when the thread-active adapter adapts THIS tensor, bypass
+    // the batched USM + PTQ1_0 fast paths (which don't run the per-row LoRA
+    // hook) so every row funnels through the single-row `matvec_tensor_dispatch`
+    // — the delta then lands exactly once per row. Non-adapted tensors (and the
+    // no-LoRA case) keep the fast paths, so default behavior is byte-identical.
+    let lora_adapted = crate::lora::lora_adapts(&w.name);
+    if !lora_adapted
+        && crate::accel::try_matvec_tensor_batched_usm_f32(w, x, out, m_dim, k_dim, n_rows)
+    {
         return;
     }
     // PTQ1_0 (the 27B's every projection/FFN/LM-head dtype): the CPU
@@ -173,7 +185,7 @@ pub(crate) fn matvec_tensor_batched_dispatch(
     // batched USM gate above now maps PTQ1_0 (matching the single-row
     // gate), so `try_matvec_tensor_batched_usm_f32` handles it on-device
     // first — this fallback is the CPU-placed / no-GPU path only.
-    if w.dtype == rustllama_tensor::Dtype::PTQ1_0Raw && n_rows > 1 {
+    if !lora_adapted && w.dtype == rustllama_tensor::Dtype::PTQ1_0Raw && n_rows > 1 {
         k::matvec_tensor_batched(w, x, out, m_dim, k_dim, n_rows);
         return;
     }
@@ -260,7 +272,13 @@ pub(crate) fn matvec_tensor_gate_up_fused_dispatch(
     // (Apple), then the SYCL USM path. Each is inert off its backend
     // (`cuda_active`/`mlx_active`/USM-ctx checks) and returns false on a miss,
     // falling through to the two-matvec base path below.
-    if !crate::imatrix_collect::is_collecting()
+    // P11 (LoRA): if either projection is adapted by the thread-active
+    // adapter, force the two-matvec base path so each `matvec_tensor_dispatch`
+    // applies its own delta exactly once (the fused kernels bypass that hook).
+    let lora_adapted =
+        crate::lora::lora_adapts(&w_gate.name) || crate::lora::lora_adapts(&w_up.name);
+    if !lora_adapted
+        && !crate::imatrix_collect::is_collecting()
         && (crate::accel::try_matvec_tensor_gate_up_fused_cuda_f32(
             w_gate, w_up, x, gate_out, up_out, m, k_dim,
         ) || crate::accel::try_matvec_tensor_gate_up_fused_mlx_f32(
@@ -1438,6 +1456,54 @@ impl LlamaWeights {
     /// of the dense/GQA path.
     pub fn is_mla(&self) -> bool {
         self.mla_blocks.is_some()
+    }
+
+    /// P11 Phase 1 — merge a LoRA adapter's delta into the F32/F16/BF16 base
+    /// weights in place (`W += s·B·A`). Covers the attention projections +
+    /// dense FFN + LM head of dense and MoE blocks. Quantized bases are left
+    /// packed (counted in [`crate::lora::MergeStats::skipped_quant`]) for the
+    /// Phase-2 delta path; MoE expert stacks are 3-D and not LoRA targets.
+    /// The fused QKV copy (A4) is dropped on any Q/K/V merge so the forward
+    /// re-dispatches the merged per-tensor projections.
+    pub fn merge_lora(&mut self, adapter: &crate::lora::LoraAdapter) -> crate::lora::MergeStats {
+        let mut stats = crate::lora::MergeStats::default();
+        fn apply(
+            adapter: &crate::lora::LoraAdapter,
+            t: &mut Tensor,
+            stats: &mut crate::lora::MergeStats,
+        ) {
+            match crate::lora::merge_tensor_in_place(adapter, t) {
+                crate::lora::MergeOutcome::Merged => stats.merged += 1,
+                crate::lora::MergeOutcome::SkippedQuant => stats.skipped_quant += 1,
+                crate::lora::MergeOutcome::ShapeMismatch => stats.shape_mismatch += 1,
+                crate::lora::MergeOutcome::NotTargeted => {}
+            }
+        }
+        for b in &mut self.blocks {
+            let before = stats.merged;
+            apply(adapter, &mut b.w_q, &mut stats);
+            apply(adapter, &mut b.w_k, &mut stats);
+            apply(adapter, &mut b.w_v, &mut stats);
+            if stats.merged != before {
+                b.w_qkv_fused = None;
+            }
+            apply(adapter, &mut b.w_o, &mut stats);
+            apply(adapter, &mut b.w_gate, &mut stats);
+            apply(adapter, &mut b.w_up, &mut stats);
+            apply(adapter, &mut b.w_down, &mut stats);
+        }
+        if let Some(moe) = &mut self.moe_blocks {
+            for b in moe {
+                apply(adapter, &mut b.w_q, &mut stats);
+                apply(adapter, &mut b.w_k, &mut stats);
+                apply(adapter, &mut b.w_v, &mut stats);
+                apply(adapter, &mut b.w_o, &mut stats);
+            }
+        }
+        if let Some(o) = &mut self.output {
+            apply(adapter, o, &mut stats);
+        }
+        stats
     }
 
     /// MoE tiered-expert engine (Phase 1c): promote the hottest experts'
@@ -6374,6 +6440,49 @@ impl LlamaModel {
         let cfg = LlamaConfig::from_gguf(gguf)?;
         let weights = LlamaWeights::from_gguf(gguf, &cfg)?;
         Ok(Self::from_parts(cfg, weights))
+    }
+
+    /// P11 Phase 1 — load a base GGUF and merge one LoRA adapter GGUF at load
+    /// (`W += s·B·A` for F32/F16 base tensors; quantized bases stay packed for
+    /// the Phase-2 delta path). Returns the merged model plus the merge tally.
+    pub fn load_with_lora(
+        base: &Gguf,
+        lora: &Gguf,
+    ) -> Result<(Self, crate::lora::MergeStats), crate::lora::LoraError> {
+        let mut model =
+            Self::load_allow_moe(base).map_err(|e| crate::lora::LoraError::BaseLoad(e.to_string()))?;
+        let adapter = crate::lora::LoraAdapter::from_gguf(lora, "default")?;
+        let stats = model.weights.merge_lora(&adapter);
+        Ok((model, stats))
+    }
+
+    /// P11 Phase 2/3 — run [`Self::forward_one`] with `adapter` selected for
+    /// this call only (the thread's previous selection is restored on return,
+    /// even on panic). `None` selects the un-adapted base, which is
+    /// byte-identical to a plain `forward_one`.
+    pub fn forward_one_with_lora(
+        &self,
+        token_id: i32,
+        pos: u32,
+        kv: &mut KvCache,
+        logits_out: &mut [f32],
+        adapter: Option<&std::sync::Arc<crate::lora::LoraAdapter>>,
+    ) {
+        let _scope = crate::lora::scope_active_lora(adapter.cloned());
+        self.forward_one(token_id, pos, kv, logits_out);
+    }
+
+    /// P11 Phase 2/3 — [`Self::forward_prefill`] with a scoped adapter
+    /// selection (see [`Self::forward_one_with_lora`]).
+    pub fn forward_prefill_with_lora(
+        &self,
+        tokens: &[i32],
+        start_pos: u32,
+        kv: &mut KvCache,
+        adapter: Option<&std::sync::Arc<crate::lora::LoraAdapter>>,
+    ) -> Vec<f32> {
+        let _scope = crate::lora::scope_active_lora(adapter.cloned());
+        self.forward_prefill(tokens, start_pos, kv)
     }
 
     /// Centralized RoPE application for one Q or K activation buffer

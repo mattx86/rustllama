@@ -257,6 +257,11 @@ pub struct ModelConfig {
     /// verifies the projector/decoder dims and refuses mismatches.
     #[serde(default)]
     pub mmproj: Option<PathBuf>,
+    /// Optional LoRA adapter GGUF (P11) to merge into this model at load.
+    /// Phase-1 merge-at-load: F32/F16 base projections get `W += (alpha/rank)·B·A`;
+    /// quantized bases are left packed. The `serve --lora` flag overrides this.
+    #[serde(default)]
+    pub lora: Option<PathBuf>,
 }
 
 impl Default for ModelConfig {
@@ -266,6 +271,7 @@ impl Default for ModelConfig {
             hub: None,
             chat_template: "auto".to_string(),
             mmproj: None,
+            lora: None,
         }
     }
 }

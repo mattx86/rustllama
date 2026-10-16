@@ -1101,12 +1101,12 @@ impl CpuEngine {
     /// Load a model from a GGUF, without a tokenizer. Only the token-ID API
     /// is available; calls to [`Engine::generate`] / [`Engine::chat`] error.
     pub fn load(path: &Path, max_ctx: usize) -> Result<Self> {
-        Self::load_inner(path, max_ctx, false, KvDtype::F32, "contiguous", 0)
+        Self::load_inner(path, max_ctx, false, KvDtype::F32, "contiguous", 0, None)
     }
 
     /// Load a model **and** a tokenizer from the same GGUF.
     pub fn load_with_tokenizer(path: &Path, max_ctx: usize) -> Result<Self> {
-        Self::load_inner(path, max_ctx, true, KvDtype::F32, "contiguous", 0)
+        Self::load_inner(path, max_ctx, true, KvDtype::F32, "contiguous", 0, None)
     }
 
     /// Same as [`load_with_tokenizer`] but with an explicit KV-cache dtype.
@@ -1117,7 +1117,7 @@ impl CpuEngine {
         with_tokenizer: bool,
         kv_dtype: KvDtype,
     ) -> Result<Self> {
-        Self::load_inner(path, max_ctx, with_tokenizer, kv_dtype, "contiguous", 0)
+        Self::load_inner(path, max_ctx, with_tokenizer, kv_dtype, "contiguous", 0, None)
     }
 
     /// Same as [`load_with_options`] but with an explicit
@@ -1133,7 +1133,7 @@ impl CpuEngine {
         kv_dtype: KvDtype,
         kv_layout: &str,
     ) -> Result<Self> {
-        Self::load_inner(path, max_ctx, with_tokenizer, kv_dtype, kv_layout, 0)
+        Self::load_inner(path, max_ctx, with_tokenizer, kv_dtype, kv_layout, 0, None)
     }
 
     /// Variant of [`Self::load_with_options_and_layout`] that takes
@@ -1150,7 +1150,30 @@ impl CpuEngine {
         kv_layout: &str,
         kv_page_size: u32,
     ) -> Result<Self> {
-        Self::load_inner(path, max_ctx, with_tokenizer, kv_dtype, kv_layout, kv_page_size)
+        Self::load_inner(path, max_ctx, with_tokenizer, kv_dtype, kv_layout, kv_page_size, None)
+    }
+
+    /// P11: like [`Self::load_with_options_layout_and_page_size`] but merges a
+    /// LoRA adapter GGUF (`lora`) into the model at load (Phase 1 merge). `None`
+    /// is the un-adapted base, byte-identical to the plain constructor.
+    pub fn load_with_options_layout_page_size_and_lora(
+        path: &Path,
+        max_ctx: usize,
+        with_tokenizer: bool,
+        kv_dtype: KvDtype,
+        kv_layout: &str,
+        kv_page_size: u32,
+        lora: Option<&Path>,
+    ) -> Result<Self> {
+        Self::load_inner(
+            path,
+            max_ctx,
+            with_tokenizer,
+            kv_dtype,
+            kv_layout,
+            kv_page_size,
+            lora,
+        )
     }
 
     /// Read the autotuned MoE VRAM margin (bytes) for `model_id` from the tuner
@@ -1176,6 +1199,7 @@ impl CpuEngine {
         kv_dtype: KvDtype,
         kv_layout: &str,
         kv_page_size: u32,
+        lora: Option<&Path>,
     ) -> Result<Self> {
         // Model DIRECTORY (an MLX affine checkpoint, or an AWQ/GPTQ folder
         // export): there is no GGUF tensor table to open, so route it through
@@ -1241,6 +1265,28 @@ impl CpuEngine {
             )));
         }
         let mut model = LlamaModel::load(&gguf)?;
+        // P11: merge a LoRA adapter at load (Phase 1). F32/F16 base
+        // projections get `W += (alpha/rank)·B·A`; quantized bases are left
+        // packed (reported as skipped) for the Phase-2 delta path. A missing
+        // or malformed adapter is a hard load error — the user asked for it.
+        if let Some(lora_path) = lora {
+            let lgguf = Gguf::open(lora_path)?;
+            let adapter =
+                rustllama_models::lora::LoraAdapter::from_gguf(&lgguf, "default").map_err(|e| {
+                    CpuEngineError::Other(format!(
+                        "LoRA adapter load failed ({}): {e}",
+                        lora_path.display()
+                    ))
+                })?;
+            let stats = model.weights.merge_lora(&adapter);
+            tracing::info!(
+                adapter = %lora_path.display(),
+                merged = stats.merged,
+                skipped_quant = stats.skipped_quant,
+                shape_mismatch = stats.shape_mismatch,
+                "LoRA adapter merged at load (P11 Phase 1)"
+            );
+        }
         // Hybrid transformer+DeltaNet (qwen35moe-family) models now
         // load AND run a forward pass — Phase 3.7b plumbing routes
         // these to `forward_one_hybrid` instead of the dense forward.
@@ -2132,7 +2178,7 @@ impl CpuEngine {
         // means a malformed text GGUF surfaces first (faster, more
         // common failure) rather than after the mmproj cost.
         let mut engine =
-            Self::load_inner(text_path, max_ctx, true, KvDtype::F32, "contiguous", 0)?;
+            Self::load_inner(text_path, max_ctx, true, KvDtype::F32, "contiguous", 0, None)?;
         engine.attach_mmproj(mmproj_path, image_placeholder, placeholder_mode)?;
         Ok(engine)
     }

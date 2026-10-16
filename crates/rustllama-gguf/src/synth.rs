@@ -1019,6 +1019,108 @@ pub fn write_synthetic_deepseek_mla_gguf(path: &Path, params: &SynthMla) {
     write_gguf_file(path, m, &tensors);
 }
 
+// ----------------------------------------------------------------
+// LoRA adapter GGUF (P11) — merge / delta-apply / multi-LoRA fixture
+// ----------------------------------------------------------------
+
+/// Hyperparameters for a synthetic LoRA adapter GGUF matched to a base
+/// [`SynthLlama`] model. Emits the public ggml adapter keys
+/// (`general.type = "adapter"`, `adapter.type = "lora"`,
+/// `adapter.lora.alpha`) + per-projection `<base>.weight.lora_a` /
+/// `.lora_b` factor pairs sized from the base geometry, so the LoRA
+/// merge / delta-apply / multi-LoRA tests run without a real downloaded
+/// adapter. Factors are F32 (exact) with deterministic RNG values.
+///
+/// Factor layout (matches the real ggml adapter convention this repo
+/// reads): `lora_a` has ggml `ne = [in, rank]` (→ `A [rank,in]`) and
+/// `lora_b` has `ne = [rank, out]` (→ `B [out,rank]`); the effective
+/// update is `W += (alpha/rank)·B·A`.
+#[derive(Debug, Clone)]
+pub struct SynthLoraAdapter {
+    /// Base geometry the adapter targets (its projections are sized from
+    /// `n_heads`/`head_dim`/`d_model`/`d_ff`/`n_layers`).
+    pub base: SynthLlama,
+    /// Low-rank dimension of every factor pair.
+    pub rank: u32,
+    /// `adapter.lora.alpha`; effective per-tensor scale is `alpha / rank`.
+    pub alpha: f32,
+    /// RNG seed for the factor values (distinct seeds ⇒ distinct adapters,
+    /// which the multi-LoRA test relies on).
+    pub seed: u64,
+}
+
+impl Default for SynthLoraAdapter {
+    fn default() -> Self {
+        Self {
+            base: SynthLlama::default(),
+            rank: 8,
+            alpha: 16.0,
+            seed: 0x10_4A_5EED,
+        }
+    }
+}
+
+/// Write a synthetic LoRA adapter GGUF to `path`, matched to `params.base`.
+/// Adapts the dense per-layer attention + FFN projections (`attn_q`,
+/// `attn_k`, `attn_v`, `attn_output`, `ffn_gate`, `ffn_up`, `ffn_down`) with
+/// F32 low-rank factor pairs keyed by the base tensor names.
+pub fn write_synthetic_lora_adapter_gguf(path: &Path, params: &SynthLoraAdapter) {
+    let b = &params.base;
+    let rank = params.rank;
+    let d_model = b.d_model;
+    let d_q = b.n_heads * b.head_dim;
+    let d_kv = b.n_kv_heads * b.head_dim;
+    let d_ff = b.d_ff;
+
+    let mut m = MetaBuilder::new();
+    // Base arch + adapter identity (public ggml adapter spec).
+    m.string("general.architecture", "llama");
+    m.string("general.type", "adapter");
+    m.string("adapter.type", "lora");
+    m.f32("adapter.lora.alpha", params.alpha);
+
+    let f32t = |name: &str, dims: Vec<u64>, n: usize, tseed: u64| -> TensorSpec {
+        TensorSpec::f32(name, dims, random_f32(n, tseed))
+    };
+
+    // (projection base-name, out, in) — base GGUF ne is `[in, out]`.
+    let projections: [(&str, u32, u32); 7] = [
+        ("attn_q", d_q, d_model),
+        ("attn_k", d_kv, d_model),
+        ("attn_v", d_kv, d_model),
+        ("attn_output", d_model, d_q),
+        ("ffn_gate", d_ff, d_model),
+        ("ffn_up", d_ff, d_model),
+        ("ffn_down", d_model, d_ff),
+    ];
+
+    let mut tensors: Vec<TensorSpec> = Vec::new();
+    for i in 0..b.n_layers {
+        for (pi, (proj, out, inp)) in projections.iter().enumerate() {
+            let base_name = format!("blk.{i}.{proj}.weight");
+            let sd = params
+                .seed
+                .wrapping_add((i as u64) * 1000 + (pi as u64) * 13 + 1);
+            // lora_a: ggml ne [in, rank]  (physical rank rows × in cols).
+            tensors.push(f32t(
+                &format!("{base_name}.lora_a"),
+                vec![*inp as u64, rank as u64],
+                (*inp * rank) as usize,
+                sd,
+            ));
+            // lora_b: ggml ne [rank, out] (physical out rows × rank cols).
+            tensors.push(f32t(
+                &format!("{base_name}.lora_b"),
+                vec![rank as u64, *out as u64],
+                (rank * *out) as usize,
+                sd.wrapping_add(0x5_0000),
+            ));
+        }
+    }
+
+    write_gguf_file(path, m, &tensors);
+}
+
 /// Hyperparameters for the synthetic BERT-family embedding model.
 /// Defaults produce a tiny 2-layer / 64-d_model BERT useful for
 /// round-trip + load tests of `rustllama_models::bert_arch`.

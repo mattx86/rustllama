@@ -113,6 +113,12 @@ pub enum Command {
         /// empty and you load a model via the GUI / `POST /v1/models/load`).
         #[arg(long, value_name = "GGUF")]
         model: Vec<std::path::PathBuf>,
+        /// LoRA adapter GGUF (P11) to merge into the startup model at load
+        /// (Phase-1 merge-at-load: `W += (alpha/rank)·B·A` for F32/F16 base
+        /// projections). Overrides `[model].lora`. Applied to the FIRST
+        /// `--model` (the server default).
+        #[arg(long, value_name = "GGUF")]
+        lora: Option<std::path::PathBuf>,
         /// Bind address — overrides `[server].bind_addr`. Accepts an
         /// IPv4/IPv6 literal or hostname (IPv6 needs no brackets here,
         /// e.g. `--ip ::1`). Bind `0.0.0.0` (or `::`) to expose the
@@ -1082,6 +1088,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Serve {
             model,
+            lora,
             ip,
             port,
             api_key,
@@ -1093,6 +1100,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             serve(
                 &config_path,
                 model,
+                lora,
                 ip,
                 port,
                 api_key,
@@ -3655,6 +3663,7 @@ fn log_backend_selection() {
 async fn serve(
     config_path: &std::path::Path,
     models: Vec<std::path::PathBuf>,
+    lora: Option<std::path::PathBuf>,
     ip: Option<String>,
     port: Option<u16>,
     api_key: Option<String>,
@@ -3682,6 +3691,12 @@ async fn serve(
     // `Authorization: Bearer <token>`; empty keeps open access.
     if let Some(key) = api_key {
         cfg.server.api_key = key;
+    }
+
+    // `--lora` overrides `[model].lora` (P11 merge-at-load for the startup
+    // default model).
+    if let Some(lp) = lora {
+        cfg.model.lora = Some(lp);
     }
 
     // Device / memory-tier CLI flags override the corresponding
@@ -3907,7 +3922,23 @@ async fn serve(
     // (The GUI's on-demand loads go through POST /v1/models/load, which runs
     // the same mandatory tune behind its progress modal.)
     let mut loaded_startup: Vec<(ServingModel, String)> = Vec::new();
-    for path in &startup_models {
+    // P11: the `[model].lora` / `--lora` adapter merges into the FIRST
+    // (default) startup model only. Cloned out of `cfg` so the per-model
+    // borrow below doesn't conflict with the loop's other `cfg` reads.
+    let startup_lora_path = cfg.model.lora.clone();
+    for (model_idx, path) in startup_models.iter().enumerate() {
+        let startup_lora: Option<&std::path::Path> = if model_idx == 0 {
+            startup_lora_path.as_deref()
+        } else {
+            None
+        };
+        // A directory model has no GGUF to merge into (warn + skip below).
+        if startup_lora.is_some() && path.is_dir() {
+            tracing::warn!(
+                model = %path.display(),
+                "--lora / [model].lora ignored: LoRA merge is GGUF-only (this is a model directory)"
+            );
+        }
         // Mandatory first-load auto-tune for THIS model, before it loads.
         // The tune subprocess loads via the GGUF path, so a model DIRECTORY
         // (MLX / safetensors export) has no GGUF to tune — skip the sweep;
@@ -3932,11 +3963,12 @@ async fn serve(
             // batched-decode path; a positive budget turns on the ragged mixed
             // prefill+decode forward. `RUSTLLAMA_MAX_BATCHED_TOKENS` still wins
             // (env-over-config) — resolved inside the engine.
-            let paged = PagedBatchEngine::load_with_batched_tokens(
+            let paged = PagedBatchEngine::load_with_batched_tokens_and_lora(
                 path,
                 max_ctx,
                 concurrency as u32,
                 cfg.inference.max_num_batched_tokens as usize,
+                startup_lora.filter(|_| !path.is_dir()),
             )
             .map_err(|e| {
                 anyhow::anyhow!("failed to load fused-decode model {}: {e}", path.display())
@@ -4115,13 +4147,14 @@ async fn serve(
                     anyhow::anyhow!("failed to load model {}: {e}", path.display())
                 })?
             } else {
-                CpuEngine::load_with_options_layout_and_page_size(
+                CpuEngine::load_with_options_layout_page_size_and_lora(
                     path,
                     max_ctx,
                     true,
                     kv_dtype,
                     &applied_layout,
                     applied_page_size,
+                    startup_lora,
                 )
                 .map_err(|e| {
                     anyhow::anyhow!("failed to load model {}: {e}", path.display())
