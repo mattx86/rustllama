@@ -536,19 +536,55 @@ fn dtype_probe_name(dtype: Dtype) -> Option<&'static str> {
 }
 
 /// Whether the per-dtype FUSED gate+up matvec is verdict-enabled for `dtype`.
-/// P5b: reads `fused:<dtype>` (banked by the SYCL `probe_fused` parity probes),
-/// fail-closed. On the Iris-Xe/OpenCL backend that produced garbage in the
-/// 2026-09-06 incident the fused probe grades MISCOMPUTE, so this stays OFF
-/// automatically — the device auto-detects as unsafe. Replaces the removed
-/// `RUSTLLAMA_MOE_GATE_UP_FUSED` env gate.
+///
+/// C-A (2026-09-06 fail-closed policy): the fused gate/up kernel was disabled
+/// after an Iris-Xe/OpenCL incident where a full-model MoE decode (Qwen3.6-35B,
+/// IQ2_XXS experts) produced garbage logits. P5b replaced the env gate with the
+/// bare `fused:<dtype>` GEMM parity verdict — but that probe is a generic
+/// ~512×2048 single GEMM that grades correct on BOTH backends here and so would
+/// auto-enable a path the probe does not actually exercise the way the model
+/// does. This gate therefore requires TWO verdicts, both fail-closed (missing ⇒
+/// OFF): the bare `fused:<dtype>` kernel parity AND
+/// `moe:gate_up_coherent:<dtype>` — the real per-expert MoE forward (several
+/// experts, realistic non-512 shapes, SwiGLU, routing-weighted sum) graded
+/// fused ≡ separate-matvec ≡ CPU. The SYCL dispatch additionally hard-excludes
+/// the OpenCL-fallback backend (the incident backend) via
+/// [`sycl_fused_backend_trustworthy`], so fusing can never re-enable on the
+/// exact 2026-09-06 conditions. Replaces the removed `RUSTLLAMA_MOE_GATE_UP_FUSED`
+/// env gate.
 fn moe_gate_up_fused_enabled(dtype: Dtype) -> bool {
     if fusions_disabled() {
         return false;
     }
     match dtype_probe_name(dtype) {
-        Some(name) => kernel_verdict(&format!("{}{}", rustllama_tuner::VERDICT_FUSED_GATE_UP_PREFIX, name)),
+        Some(name) => {
+            kernel_verdict(&format!(
+                "{}{}",
+                rustllama_tuner::VERDICT_FUSED_GATE_UP_PREFIX, name
+            )) && kernel_verdict(&format!(
+                "{}{}",
+                rustllama_tuner::VERDICT_MOE_GATE_UP_COHERENT_PREFIX, name
+            ))
+        }
         None => false,
     }
+}
+
+/// C-A conservative backend gate for the SYCL fused gate/up path: `true` only on
+/// the Level-Zero backend. The 2026-09-06 token-soup incident was on the OpenCL
+/// FALLBACK backend (Intel Compute Runtime / `ze_loader` missing), across
+/// several kernel families; even though the per-dtype coherence probe now grades
+/// the fused path correct in isolation here, that synthetic harness does NOT
+/// reproduce the original full-model failure, so the incident backend stays
+/// hard-excluded regardless of the verdict — and regardless of the
+/// `RUSTLLAMA_USM_ATTN=1` force that `usm_attn_enabled` honours (this guard is
+/// not overridable: the fused kernel is the exact incident path). Fail-closed:
+/// an unknown / no-name backend ⇒ `false`. Only consulted on the SYCL fused
+/// dispatch, so returning `false` when there is no SYCL device (CUDA/MLX host,
+/// `current_backend_name(0) == None`) is harmless — those backends fuse through
+/// their own dispatchers.
+fn sycl_fused_backend_trustworthy() -> bool {
+    matches!(sk::current_backend_name(0), Some("level_zero"))
 }
 
 /// Whether the per-dtype F16-activation (mixed-precision) matvec is
@@ -12999,6 +13035,13 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
         return false;
     }
     if !usm_attn_enabled() {
+        return false;
+    }
+    // C-A fail-closed: never fuse on the OpenCL-fallback backend — the exact
+    // 2026-09-06 token-soup incident backend. This is independent of the
+    // verdict AND of the RUSTLLAMA_USM_ATTN force, so the fused path (the
+    // incident path) can never run on the incident conditions.
+    if !sycl_fused_backend_trustworthy() {
         return false;
     }
     if tensor_forced_to_cpu(&w_gate.name) || tensor_forced_to_cpu(&w_up.name) {

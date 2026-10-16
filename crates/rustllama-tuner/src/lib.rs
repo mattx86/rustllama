@@ -272,11 +272,30 @@ pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK_MLX: &str = "attn:dev_resident_block_m
 
 /// Per-dtype fused gate+up matvec (one dispatch computing both FFN projections).
 /// The actual keys are `fused:<dtype>` (e.g. `fused:q4_k`), banked by the SYCL
-/// `probe_fused` parity probes; this is the shared PREFIX. Backs
-/// `accel::moe_gate_up_fused_enabled`. The MoE fused path was turned off after
-/// the 2026-09-06 Iris-Xe/OpenCL garbage incident; on that backend the per-dtype
-/// `fused:*` probe grades MISCOMPUTE, so the gate now auto-detects + stays off.
+/// `probe_fused` parity probes; this is the shared PREFIX. The BARE-KERNEL
+/// parity check — a single ~512×2048 GEMM graded vs the CPU matvec. Necessary
+/// but NOT sufficient to turn the path on: `accel::moe_gate_up_fused_enabled`
+/// ANDs this with [`VERDICT_MOE_GATE_UP_COHERENT_PREFIX`] (the real per-expert
+/// MoE forward), because this generic shape does not reproduce the 2026-09-06
+/// Iris-Xe/OpenCL token-soup incident the fused path was disabled for.
 pub const VERDICT_FUSED_GATE_UP_PREFIX: &str = "fused:";
+/// Per-dtype REAL-MoE-FORWARD coherence verdict for the fused gate+up path.
+/// Keys are `moe:gate_up_coherent:<dtype>`, banked by the SYCL/CUDA/MLX
+/// `probe_moe_gate_up_coherent` probes. Unlike [`VERDICT_FUSED_GATE_UP_PREFIX`]
+/// (a bare ~512×2048 single GEMM graded vs the CPU matvec), these run the
+/// per-expert FFN the model actually executes — several experts, realistic
+/// NON-512 `[d_ff, d_model]` expert shapes, the SwiGLU `silu(gate)·up`
+/// nonlinearity, routing-weighted summed — and grade the FUSED path against
+/// BOTH the separate-matvec GPU path (does fusing change the answer?) AND the
+/// CPU reference (is the fused math right at all?). This is the faithful
+/// reproduction of the path that produced garbage logits on 2026-09-06 (Iris Xe,
+/// Qwen3.6-35B IQ2_XXS experts); the later-found root cause (a since-removed
+/// `(ptr,len)` activation dedup) is NOT reproduced by the bare GEMM probe, so
+/// the dispatch requires THIS verdict too. In addition the SYCL dispatch
+/// hard-excludes the OpenCL-fallback backend — the exact incident backend —
+/// regardless of any verdict (fail-closed by construction on the incident
+/// conditions). Fail-closed: a missing key ⇒ OFF.
+pub const VERDICT_MOE_GATE_UP_COHERENT_PREFIX: &str = "moe:gate_up_coherent:";
 /// Per-dtype F16-activation (mixed-precision) packed matvec. Keys are
 /// `matvec_f16in:<dtype>`, banked by the SYCL `probe_matvec_f16in` probes —
 /// graded vs an f16-activation-roundtrip reference (so the probe grades kernel
@@ -1120,6 +1139,26 @@ mod tests {
         let after = fnv1a(&[("rsl_kernels.cpp", b"// kernel source \nint x = 1;\n")]);
         assert_ne!(before, after, "FNV digest must change on a whitespace edit");
         assert_eq!(before.len(), 16);
+    }
+
+    /// C-A: the fused gate+up dispatch is gated on TWO verdict families — the
+    /// bare-GEMM parity (`fused:`) AND the real-MoE coherence (`moe:gate_up_
+    /// coherent:`). Pin that both prefixes exist, are distinct, and that a
+    /// per-dtype coherence verdict round-trips through the cache helpers so
+    /// `verdict_for` reads back what `set_verdict` wrote (fail-closed on absence).
+    #[test]
+    fn moe_gate_up_coherence_verdict_roundtrips() {
+        assert_eq!(VERDICT_FUSED_GATE_UP_PREFIX, "fused:");
+        assert_eq!(VERDICT_MOE_GATE_UP_COHERENT_PREFIX, "moe:gate_up_coherent:");
+        assert_ne!(VERDICT_FUSED_GATE_UP_PREFIX, VERDICT_MOE_GATE_UP_COHERENT_PREFIX);
+        let mut t = TuningResult::empty("fp".into(), DeviceFingerprint::default());
+        let key = format!("{VERDICT_MOE_GATE_UP_COHERENT_PREFIX}iq2_xxs");
+        // Absent ⇒ unset (the dispatch gate treats this as OFF).
+        assert_eq!(verdict_for(&t, &key), None);
+        set_verdict(&mut t, &key, true);
+        assert_eq!(verdict_for(&t, &key), Some(true));
+        set_verdict(&mut t, &key, false);
+        assert_eq!(verdict_for(&t, &key), Some(false));
     }
 
     #[test]

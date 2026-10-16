@@ -442,6 +442,16 @@ fn probe_names() -> Vec<String> {
             v.push(format!("fused:{}", l.name));
         }
     }
+    // C-A: real-MoE-forward coherence probe per fused dtype — the per-expert FFN
+    // (several experts, non-512 shapes, SwiGLU, routing sum) graded fused ≡
+    // separate ≡ CPU. `accel::moe_gate_up_fused_enabled` ANDs this with the bare
+    // `fused:` parity above, so the generic-GEMM pass alone can't re-enable the
+    // 2026-09-06 incident path. Adjacent to `fused:` so both bank together.
+    for l in LAYOUTS {
+        if gpu_fused_for(l.name).is_some() {
+            v.push(format!("moe:gate_up_coherent:{}", l.name));
+        }
+    }
     // P5b: F16-activation (mixed-precision) matvecs — only the formats with an
     // f16-in kernel (`gpu_matvec_f16in_for`). Graded vs an f16-roundtrip ref AND
     // perf-gated; back `accel::mixed_precision_matvec_enabled` per dtype.
@@ -774,6 +784,11 @@ pub fn run_probe(name: &str) -> anyhow::Result<()> {
         "matvecb" => probe_matvec_batched(&stream, name, rest, started),
         "matvec_f16in" => probe_matvec_f16in(&stream, name, rest, started),
         "fused" => probe_fused(&stream, name, rest, started),
+        // C-A: `moe:gate_up_coherent:<dtype>` — real-MoE-forward coherence.
+        "moe" => match rest.strip_prefix("gate_up_coherent:") {
+            Some(dt) => probe_moe_gate_up_coherent(&stream, name, dt, started),
+            None => emit(name, "SKIP", "unknown-moe-probe"),
+        },
         "attn" => probe_attn(&stream, name, rest, started),
         "xmx" => probe_xmx(&stream, name, started),
         _ => anyhow::bail!("unknown probe kind {kind}"),
@@ -794,6 +809,56 @@ fn finite_ref(layout: &QuantLayout, cpu: CpuMatvec, x: &[f32]) -> Option<(Vec<u8
         let w = gen_quant_bytes(layout, MV_M, MV_K, 0xC0FFEE ^ (attempt * 7919));
         let mut r = vec![0f32; MV_M];
         cpu(&w, x, &mut r, MV_M, MV_K);
+        if r.iter().all(|v| v.is_finite()) {
+            return Some((w, r));
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------
+// C-A — real-MoE-forward coherence probe shapes/structure.
+//
+// The bare `fused:` probe grades ONE 512×2048 GEMM vs the CPU matvec. The
+// 2026-09-06 token-soup incident was a FULL-MODEL MoE decode (Qwen3.6-35B,
+// IQ2_XXS experts) — several experts per layer, non-512 `[d_ff, d_model]`
+// shapes, the SwiGLU nonlinearity, routing-weighted summed. These constants
+// reproduce that forward structure on-device so the coherence verdict exercises
+// the path the model actually runs, not a generic single GEMM.
+// ---------------------------------------------------------------
+
+/// Realistic per-expert gate/up shapes `(d_ff rows = M, d_model cols = K)`,
+/// deliberately NON-512 and spanning real MoE experts. `K` is a multiple of 256
+/// so every K-quant (256-block) and legacy (32-block) fused format tiles.
+const MOE_COH_SHAPES: &[(usize, usize)] = &[(768, 2048), (1536, 1024), (256, 1536)];
+/// How many routed experts the coherence probe sums per shape (top-k structure).
+const MOE_COH_EXPERTS: usize = 3;
+/// Deterministic router weights for the summed experts. The absolute scale is
+/// irrelevant to a cosine/relative grade; only that the sum mixes experts.
+const MOE_COH_ROUTE_W: [f32; MOE_COH_EXPERTS] = [0.6, 0.3, 0.1];
+
+/// SwiGLU gate activation: `silu(v) = v·sigmoid(v)` — the FFN nonlinearity the
+/// fused gate output feeds through before the elementwise `·up`.
+fn silu(v: f32) -> f32 {
+    v / (1.0 + (-v).exp())
+}
+
+/// Generate a quant weight tensor of shape `(m, k)` whose CPU-reference matvec
+/// output over `x` is fully finite, bumping the seed on pathological quant-bit
+/// combinations (the `(m, k)`-parametric twin of [`finite_ref`]). Returns the
+/// packed bytes + the CPU reference output, or `None` after 8 failed attempts.
+fn coh_gen_finite(
+    layout: &QuantLayout,
+    cpu: CpuMatvec,
+    m: usize,
+    k: usize,
+    x: &[f32],
+    seed: u32,
+) -> Option<(Vec<u8>, Vec<f32>)> {
+    for attempt in 0..8u32 {
+        let w = gen_quant_bytes(layout, m, k, seed ^ (attempt.wrapping_mul(2654435761) | 1));
+        let mut r = vec![0f32; m];
+        cpu(&w, x, &mut r, m, k);
         if r.iter().all(|v| v.is_finite()) {
             return Some((w, r));
         }
@@ -994,17 +1059,23 @@ fn probe_matvec_f16in(stream: &sk::SyclStream, name: &str, dtype: &str, started:
     }
     let t_f32 = t1.elapsed().as_secs_f64();
     let ms = started.elapsed().as_millis();
-    if t_f16 < t_f32 {
+    // C-B: the f16-activation path is LOSSY, so require a CONSERVATIVE ≥10%
+    // speedup (`t_f16 < 0.9·t_f32`), not the strict `t_f16 < t_f32` that flipped
+    // ON/off run-to-run on ~2% near-ties. A borderline-faster lossy path is not
+    // worth the quality hit, and the margin keeps the verdict stable across
+    // noisy micro-bench runs. Fail-closed on a tie → SLOW → off.
+    const F16_MARGIN: f64 = 0.9;
+    if t_f16 < F16_MARGIN * t_f32 {
         emit(
             name,
             "OK",
-            &format!("cos={cos:.6} max_rel={max_rel:.4} f16={:.2}ms f32={:.2}ms ms={ms}", t_f16 * 1e3, t_f32 * 1e3),
+            &format!("cos={cos:.6} max_rel={max_rel:.4} f16={:.2}ms f32={:.2}ms (≥10% faster) ms={ms}", t_f16 * 1e3, t_f32 * 1e3),
         );
     } else {
         emit(
             name,
             "SLOW",
-            &format!("correct but not faster: f16={:.2}ms f32={:.2}ms ms={ms}", t_f16 * 1e3, t_f32 * 1e3),
+            &format!("correct but not ≥10% faster: f16={:.2}ms f32={:.2}ms ms={ms}", t_f16 * 1e3, t_f32 * 1e3),
         );
     }
 }
@@ -1351,6 +1422,151 @@ fn probe_fused(stream: &sk::SyclStream, name: &str, dtype: &str, started: Instan
             );
         }
     }
+}
+
+/// C-A — real-MoE-forward coherence probe (verdict `moe:gate_up_coherent:<dtype>`).
+/// For each realistic expert shape in [`MOE_COH_SHAPES`], builds
+/// [`MOE_COH_EXPERTS`] distinct experts and runs the per-expert FFN the model
+/// executes — `silu(gate)·up`, routing-weighted summed — THREE ways: the GPU
+/// FUSED gate/up kernel, the GPU SEPARATE two-matvec path, and the CPU
+/// reference. It then grades the fused intermediate against BOTH the separate
+/// path (does fusing perturb the answer? — the exact thing the enabled vs
+/// disabled dispatch differs by) AND the CPU reference (is the fused math right
+/// at all?). `OK` only if every shape passes both; `MISCOMPUTE` otherwise —
+/// which is the correct fail-closed verdict for a device/shape where fusing
+/// diverges, the 2026-09-06 failure mode the bare `fused:` GEMM probe misses.
+fn probe_moe_gate_up_coherent(
+    stream: &sk::SyclStream,
+    name: &str,
+    dtype: &str,
+    started: Instant,
+) {
+    let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
+    let cpu = cpu_matvec_for(dtype);
+    let Some(gpu_fused) = gpu_fused_for(dtype) else {
+        emit(name, "SKIP", "no-fused-kernel");
+        return;
+    };
+    let gpu_mv = gpu_matvec_for(dtype);
+
+    // Worst case across all shapes: OK iff every shape agrees on both axes.
+    let mut worst_cos_cpu = 1.0f64;
+    let mut worst_rel_cpu = 0.0f64;
+    let mut worst_cos_sep = 1.0f64;
+    let mut worst_rel_sep = 0.0f64;
+
+    for (si, &(m, k)) in MOE_COH_SHAPES.iter().enumerate() {
+        let x = gen_x(k, 0x5EED_0001 ^ (si as u32).wrapping_mul(7919));
+        // Device activation buffer (shared by every expert's 3 dispatches).
+        let Ok(mut xb) = sk::SyclSharedBuffer::<f32>::alloc(stream, k) else {
+            emit(name, "KERNEL_ERR", "usm-alloc-failed(x)");
+            return;
+        };
+        xb.as_mut_slice().copy_from_slice(&x);
+
+        let mut inter_cpu = vec![0f32; m];
+        let mut inter_sep = vec![0f32; m];
+        let mut inter_fused = vec![0f32; m];
+
+        for e in 0..MOE_COH_EXPERTS {
+            let w_route = MOE_COH_ROUTE_W[e];
+            let sg = 0xC0DE_0000u32 ^ ((si * 97 + e * 13) as u32);
+            let su = 0xBEEF_0000u32 ^ ((si * 131 + e * 17) as u32);
+            let Some((wg, cpu_g)) = coh_gen_finite(layout, cpu, m, k, &x, sg) else {
+                emit(name, "SKIP", "no-finite-reference(gate)");
+                return;
+            };
+            let Some((wu, cpu_u)) = coh_gen_finite(layout, cpu, m, k, &x, su) else {
+                emit(name, "SKIP", "no-finite-reference(up)");
+                return;
+            };
+            // Device weight + output buffers for this expert.
+            let (mut gb, mut ub, mut sep_g_b, mut sep_u_b, mut fus_g_b, mut fus_u_b) = match (
+                sk::SyclSharedBuffer::<u8>::alloc(stream, wg.len()),
+                sk::SyclSharedBuffer::<u8>::alloc(stream, wu.len()),
+                sk::SyclSharedBuffer::<f32>::alloc(stream, m),
+                sk::SyclSharedBuffer::<f32>::alloc(stream, m),
+                sk::SyclSharedBuffer::<f32>::alloc(stream, m),
+                sk::SyclSharedBuffer::<f32>::alloc(stream, m),
+            ) {
+                (Ok(a), Ok(b), Ok(c), Ok(d), Ok(e_), Ok(f)) => (a, b, c, d, e_, f),
+                _ => {
+                    emit(name, "KERNEL_ERR", "usm-alloc-failed(expert)");
+                    return;
+                }
+            };
+            gb.as_mut_slice().copy_from_slice(&wg);
+            ub.as_mut_slice().copy_from_slice(&wu);
+            sep_g_b.as_mut_slice().fill(f32::NAN);
+            sep_u_b.as_mut_slice().fill(f32::NAN);
+            fus_g_b.as_mut_slice().fill(f32::NAN);
+            fus_u_b.as_mut_slice().fill(f32::NAN);
+
+            // SEPARATE path: two independent single-row matvecs.
+            // SAFETY: live USM buffers sized (M,K)/(K)/(M); kernel waits before return.
+            let sep = unsafe {
+                gpu_mv(stream, gb.as_ptr(), xb.as_ptr(), sep_g_b.as_mut_ptr(), m as u32, k as u32, 0)
+                    .and_then(|()| {
+                        gpu_mv(stream, ub.as_ptr(), xb.as_ptr(), sep_u_b.as_mut_ptr(), m as u32, k as u32, 0)
+                    })
+            };
+            if let Err(e_) = sep {
+                emit(name, "KERNEL_ERR", &format!("separate-matvec {e_}"));
+                return;
+            }
+            // FUSED path: one dispatch computes both projections.
+            // SAFETY: as above; two weights, two outputs.
+            let fus = unsafe {
+                gpu_fused(
+                    stream,
+                    gb.as_ptr(),
+                    ub.as_ptr(),
+                    xb.as_ptr(),
+                    fus_g_b.as_mut_ptr(),
+                    fus_u_b.as_mut_ptr(),
+                    m as u32,
+                    k as u32,
+                    0,
+                )
+            };
+            if let Err(e_) = fus {
+                emit(name, "KERNEL_ERR", &format!("fused {e_}"));
+                return;
+            }
+
+            // Accumulate the routing-weighted SwiGLU intermediate for each path.
+            let (sg_out, su_out) = (sep_g_b.as_slice(), sep_u_b.as_slice());
+            let (fg_out, fu_out) = (fus_g_b.as_slice(), fus_u_b.as_slice());
+            for j in 0..m {
+                inter_cpu[j] += w_route * silu(cpu_g[j]) * cpu_u[j];
+                inter_sep[j] += w_route * silu(sg_out[j]) * su_out[j];
+                inter_fused[j] += w_route * silu(fg_out[j]) * fu_out[j];
+            }
+        }
+
+        let (cos_cpu, rel_cpu) = compare(&inter_fused, &inter_cpu);
+        let (cos_sep, rel_sep) = compare(&inter_fused, &inter_sep);
+        worst_cos_cpu = worst_cos_cpu.min(cos_cpu);
+        worst_rel_cpu = worst_rel_cpu.max(rel_cpu);
+        worst_cos_sep = worst_cos_sep.min(cos_sep);
+        worst_rel_sep = worst_rel_sep.max(rel_sep);
+    }
+
+    let ms = started.elapsed().as_millis();
+    // fused≡CPU (correctness, SwiGLU-amplified so looser) AND fused≡separate
+    // (fusion must not perturb the answer; both GPU, so tighter).
+    let cpu_ok = worst_cos_cpu > 0.999 && worst_rel_cpu < 0.05;
+    let sep_ok = worst_cos_sep > 0.9995 && worst_rel_sep < 0.02;
+    let verdict = if cpu_ok && sep_ok { "OK" } else { "MISCOMPUTE" };
+    let backend = sk::current_backend_name(0).unwrap_or("none");
+    emit(
+        name,
+        verdict,
+        &format!(
+            "backend={backend} cos_cpu={worst_cos_cpu:.6} rel_cpu={worst_rel_cpu:.4} \
+             cos_sep={worst_cos_sep:.6} rel_sep={worst_rel_sep:.4} ms={ms}"
+        ),
+    );
 }
 
 fn to_f16_buf<'s>(
@@ -3162,6 +3378,73 @@ fn ref_flash_prefill(
     out
 }
 
+/// C-A CUDA coherence helper: dispatch the single-row packed matvec for one of
+/// the 14 fused-capable formats by name, so the coherence probe can run gate +
+/// up without triplicating the match. SAFETY: `w`/`x`/`o` must be live device
+/// buffers sized `(m,k)`/`(k)`/`(m)`; the wrapper synchronizes before returning.
+#[allow(clippy::too_many_arguments)]
+unsafe fn cuda_coh_matvec(
+    dtype: &str,
+    s: &ck::CudaStream,
+    w: *const std::ffi::c_void,
+    x: *const f32,
+    o: *mut f32,
+    m: usize,
+    k: usize,
+) -> Result<(), ck::CudaError> {
+    match dtype {
+        "q8_0" => ck::matvec_q8_0_packed_f32(s, w, x, o, m, k),
+        "q4_k" => ck::matvec_q4_k_packed_f32(s, w, x, o, m, k),
+        "q6_k" => ck::matvec_q6_k_packed_f32(s, w, x, o, m, k),
+        "q5_k" => ck::matvec_q5_k_packed_f32(s, w, x, o, m, k),
+        "iq4_nl" => ck::matvec_iq4_nl_packed_f32(s, w, x, o, m, k),
+        "iq4_xs" => ck::matvec_iq4_xs_packed_f32(s, w, x, o, m, k),
+        "iq1_s" => ck::matvec_iq1_s_packed_f32(s, w, x, o, m, k),
+        "iq1_m" => ck::matvec_iq1_m_packed_f32(s, w, x, o, m, k),
+        "iq2_xxs" => ck::matvec_iq2_xxs_packed_f32(s, w, x, o, m, k),
+        "iq2_xs" => ck::matvec_iq2_xs_packed_f32(s, w, x, o, m, k),
+        "iq2_s" => ck::matvec_iq2_s_packed_f32(s, w, x, o, m, k),
+        "iq3_xxs" => ck::matvec_iq3_xxs_packed_f32(s, w, x, o, m, k),
+        "iq3_s" => ck::matvec_iq3_s_packed_f32(s, w, x, o, m, k),
+        "ptq1_0" => ck::matvec_ptq1_0_packed_f32(s, w, x, o, m, k),
+        _ => Err(ck::CudaError::Kernel(-999)),
+    }
+}
+
+/// C-A CUDA coherence helper: dispatch the fused gate+up matvec for one of the
+/// 14 fused-capable formats by name. SAFETY as [`cuda_coh_matvec`], with two
+/// weights + two outputs.
+#[allow(clippy::too_many_arguments)]
+unsafe fn cuda_coh_fused(
+    dtype: &str,
+    s: &ck::CudaStream,
+    gw: *const std::ffi::c_void,
+    uw: *const std::ffi::c_void,
+    x: *const f32,
+    go: *mut f32,
+    uo: *mut f32,
+    m: usize,
+    k: usize,
+) -> Result<(), ck::CudaError> {
+    match dtype {
+        "q8_0" => ck::matvec_q8_0_gate_up_fused(s, gw, uw, x, go, uo, m, k),
+        "q4_k" => ck::matvec_q4_k_gate_up_fused(s, gw, uw, x, go, uo, m, k),
+        "q6_k" => ck::matvec_q6_k_gate_up_fused(s, gw, uw, x, go, uo, m, k),
+        "q5_k" => ck::matvec_q5_k_gate_up_fused(s, gw, uw, x, go, uo, m, k),
+        "iq4_nl" => ck::matvec_iq4_nl_gate_up_fused(s, gw, uw, x, go, uo, m, k),
+        "iq4_xs" => ck::matvec_iq4_xs_gate_up_fused(s, gw, uw, x, go, uo, m, k),
+        "iq1_s" => ck::matvec_iq1_s_gate_up_fused(s, gw, uw, x, go, uo, m, k),
+        "iq1_m" => ck::matvec_iq1_m_gate_up_fused(s, gw, uw, x, go, uo, m, k),
+        "iq2_xxs" => ck::matvec_iq2_xxs_gate_up_fused(s, gw, uw, x, go, uo, m, k),
+        "iq2_xs" => ck::matvec_iq2_xs_gate_up_fused(s, gw, uw, x, go, uo, m, k),
+        "iq2_s" => ck::matvec_iq2_s_gate_up_fused(s, gw, uw, x, go, uo, m, k),
+        "iq3_xxs" => ck::matvec_iq3_xxs_gate_up_fused(s, gw, uw, x, go, uo, m, k),
+        "iq3_s" => ck::matvec_iq3_s_gate_up_fused(s, gw, uw, x, go, uo, m, k),
+        "ptq1_0" => ck::matvec_ptq1_0_gate_up_fused(s, gw, uw, x, go, uo, m, k),
+        _ => Err(ck::CudaError::Kernel(-999)),
+    }
+}
+
 pub fn run_cuda_parity() -> anyhow::Result<()> {
     println!("CUDA kernel parity harness (native NVIDIA backend, in-process)");
     let n_dev = ck::device_count();
@@ -3548,6 +3831,118 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 cu_grade(&name, &got, &refv, 0.999, 0.02, &mut counts);
             }
         }
+    }
+
+    // ---- C-A: real-MoE-forward coherence (verdict moe:gate_up_coherent:<dtype>) ----
+    // CUDA twin of the SYCL coherence probe (WRITE-BLIND — settles on the pod):
+    // the per-expert FFN (several experts, non-512 shapes, SwiGLU, routing sum)
+    // graded FUSED ≡ SEPARATE two-matvec ≡ CPU. `accel::moe_gate_up_fused_enabled`
+    // ANDs this with the bare `fused:` parity above, so a generic-GEMM pass alone
+    // cannot re-enable the 2026-09-06 incident path.
+    for dtype in [
+        "q8_0", "q4_k", "q6_k", "q5_k", "iq4_nl", "iq4_xs", "iq1_s", "iq1_m",
+        "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "ptq1_0",
+    ] {
+        let name = format!("moe:gate_up_coherent:{dtype}");
+        let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
+        let cpu = cpu_matvec_for(dtype);
+        let mut worst_cos_cpu = 1.0f64;
+        let mut worst_rel_cpu = 0.0f64;
+        let mut worst_cos_sep = 1.0f64;
+        let mut worst_rel_sep = 0.0f64;
+        let mut failed: Option<(&'static str, String)> = None;
+        'shapes: for (si, &(m, k)) in MOE_COH_SHAPES.iter().enumerate() {
+            let x = gen_x(k, 0x5EED_0001 ^ (si as u32).wrapping_mul(7919));
+            let Some(xb) = cu_upload_f32(&stream, &x) else {
+                failed = Some(("KERNEL_ERR", "device-alloc-failed(x)".into()));
+                break 'shapes;
+            };
+            let mut inter_cpu = vec![0f32; m];
+            let mut inter_sep = vec![0f32; m];
+            let mut inter_fused = vec![0f32; m];
+            for e in 0..MOE_COH_EXPERTS {
+                let w_route = MOE_COH_ROUTE_W[e];
+                let sg = 0xC0DE_0000u32 ^ ((si * 97 + e * 13) as u32);
+                let su = 0xBEEF_0000u32 ^ ((si * 131 + e * 17) as u32);
+                let Some((wg, cpu_g)) = coh_gen_finite(layout, cpu, m, k, &x, sg) else {
+                    failed = Some(("SKIP", "no-finite-reference(gate)".into()));
+                    break 'shapes;
+                };
+                let Some((wu, cpu_u)) = coh_gen_finite(layout, cpu, m, k, &x, su) else {
+                    failed = Some(("SKIP", "no-finite-reference(up)".into()));
+                    break 'shapes;
+                };
+                let (
+                    Some(gwb),
+                    Some(uwb),
+                    Some(mut sg_o),
+                    Some(mut su_o),
+                    Some(mut fg_o),
+                    Some(mut fu_o),
+                ) = (
+                    ck::CudaDeviceBuffer::from_host(&stream, &wg),
+                    ck::CudaDeviceBuffer::from_host(&stream, &wu),
+                    ck::CudaDeviceBuffer::alloc(&stream, m * 4),
+                    ck::CudaDeviceBuffer::alloc(&stream, m * 4),
+                    ck::CudaDeviceBuffer::alloc(&stream, m * 4),
+                    ck::CudaDeviceBuffer::alloc(&stream, m * 4),
+                )
+                else {
+                    failed = Some(("KERNEL_ERR", "device-alloc-failed(expert)".into()));
+                    break 'shapes;
+                };
+                // SAFETY: live device buffers on `stream` sized (M,K)/(M); each
+                // wrapper synchronizes before returning.
+                let res = unsafe {
+                    let gw = gwb.as_ptr();
+                    let uw = uwb.as_ptr();
+                    let xp = xb.as_ptr() as *const f32;
+                    let sgo = sg_o.as_mut_ptr() as *mut f32;
+                    let suo = su_o.as_mut_ptr() as *mut f32;
+                    let fgo = fg_o.as_mut_ptr() as *mut f32;
+                    let fuo = fu_o.as_mut_ptr() as *mut f32;
+                    cuda_coh_matvec(dtype, &stream, gw, xp, sgo, m, k)
+                        .and_then(|()| cuda_coh_matvec(dtype, &stream, uw, xp, suo, m, k))
+                        .and_then(|()| cuda_coh_fused(dtype, &stream, gw, uw, xp, fgo, fuo, m, k))
+                };
+                if let Err(e_) = res {
+                    failed = Some(("KERNEL_ERR", format!("{e_}")));
+                    break 'shapes;
+                }
+                let sg_out = cu_download_f32(&sg_o, m);
+                let su_out = cu_download_f32(&su_o, m);
+                let fg_out = cu_download_f32(&fg_o, m);
+                let fu_out = cu_download_f32(&fu_o, m);
+                for j in 0..m {
+                    inter_cpu[j] += w_route * silu(cpu_g[j]) * cpu_u[j];
+                    inter_sep[j] += w_route * silu(sg_out[j]) * su_out[j];
+                    inter_fused[j] += w_route * silu(fg_out[j]) * fu_out[j];
+                }
+            }
+            let (cos_cpu, rel_cpu) = compare(&inter_fused, &inter_cpu);
+            let (cos_sep, rel_sep) = compare(&inter_fused, &inter_sep);
+            worst_cos_cpu = worst_cos_cpu.min(cos_cpu);
+            worst_rel_cpu = worst_rel_cpu.max(rel_cpu);
+            worst_cos_sep = worst_cos_sep.min(cos_sep);
+            worst_rel_sep = worst_rel_sep.max(rel_sep);
+        }
+        if let Some((v, detail)) = failed {
+            cu_emit(&name, v, &detail);
+            *counts.entry(v).or_default() += 1;
+            continue;
+        }
+        let cpu_ok = worst_cos_cpu > 0.999 && worst_rel_cpu < 0.05;
+        let sep_ok = worst_cos_sep > 0.9995 && worst_rel_sep < 0.02;
+        let verdict = if cpu_ok && sep_ok { "OK" } else { "MISCOMPUTE" };
+        cu_emit(
+            &name,
+            verdict,
+            &format!(
+                "cos_cpu={worst_cos_cpu:.6} rel_cpu={worst_rel_cpu:.4} \
+                 cos_sep={worst_cos_sep:.6} rel_sep={worst_rel_sep:.4}"
+            ),
+        );
+        *counts.entry(verdict).or_default() += 1;
     }
 
     // ---- Q4_K prefill GEMM (verdict: gemm:q4_k_f32, BIT-EXACT + perf-gated) ----
@@ -5483,6 +5878,99 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
             cu_emit(&name, "KERNEL_ERR", "matvec_gate_up_fused returned false");
             *counts.entry("KERNEL_ERR").or_default() += 1;
         }
+    }
+
+    // ---- C-A: real-MoE-forward coherence (verdict moe:gate_up_coherent:<dtype>) ----
+    // MLX twin of the SYCL/CUDA coherence probe (WRITE-BLIND — settles on a Mac):
+    // the per-expert FFN (several experts, non-512 shapes, SwiGLU, routing sum)
+    // graded FUSED ≡ SEPARATE two-matvec ≡ CPU. `accel::moe_gate_up_fused_enabled`
+    // ANDs this with the bare `fused:` parity above. Distinct per-expert cache
+    // keys so no stale-weight aliasing across iterations.
+    for (di, dtype) in [
+        "q8_0", "q4_k", "q6_k", "q5_k", "iq4_nl", "iq4_xs", "iq1_s", "iq1_m",
+        "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "ptq1_0",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let Some(kind) = mlx_kind_for(dtype) else {
+            continue;
+        };
+        let name = format!("moe:gate_up_coherent:{dtype}");
+        let layout = LAYOUTS.iter().find(|l| l.name == *dtype).expect("layout");
+        let cpu = cpu_matvec_for(dtype);
+        let mut worst_cos_cpu = 1.0f64;
+        let mut worst_rel_cpu = 0.0f64;
+        let mut worst_cos_sep = 1.0f64;
+        let mut worst_rel_sep = 0.0f64;
+        let mut failed: Option<(&'static str, String)> = None;
+        'shapes: for (si, &(m, k)) in MOE_COH_SHAPES.iter().enumerate() {
+            let x = gen_x(k, 0x5EED_0001 ^ (si as u32).wrapping_mul(7919));
+            let mut inter_cpu = vec![0f32; m];
+            let mut inter_sep = vec![0f32; m];
+            let mut inter_fused = vec![0f32; m];
+            for e in 0..MOE_COH_EXPERTS {
+                let w_route = MOE_COH_ROUTE_W[e];
+                let sg = 0xC0DE_0000u32 ^ ((si * 97 + e * 13) as u32);
+                let su = 0xBEEF_0000u32 ^ ((si * 131 + e * 17) as u32);
+                let Some((wg, cpu_g)) = coh_gen_finite(layout, cpu, m, k, &x, sg) else {
+                    failed = Some(("SKIP", "no-finite-reference(gate)".into()));
+                    break 'shapes;
+                };
+                let Some((wu, cpu_u)) = coh_gen_finite(layout, cpu, m, k, &x, su) else {
+                    failed = Some(("SKIP", "no-finite-reference(up)".into()));
+                    break 'shapes;
+                };
+                // Unique cache keys per (dtype, shape, expert, gate/up).
+                let base = 0x4D0E_0000 + ((di * 64 + si * 8 + e) * 2);
+                let (g_key, u_key) = (base, base + 1);
+                let mut sep_g = vec![0f32; m];
+                let mut sep_u = vec![0f32; m];
+                let mut fus_g = vec![0f32; m];
+                let mut fus_u = vec![0f32; m];
+                let ok_sep = cache.matvec_packed(kind, g_key, &wg, &x, &mut sep_g, m, k)
+                    && cache.matvec_packed(kind, u_key, &wu, &x, &mut sep_u, m, k);
+                if !ok_sep {
+                    failed = Some(("KERNEL_ERR", "separate matvec returned false".into()));
+                    break 'shapes;
+                }
+                let ok_fused = cache.matvec_gate_up_fused(
+                    kind, g_key, &wg, u_key, &wu, &x, &mut fus_g, &mut fus_u, m, k,
+                );
+                if !ok_fused {
+                    failed = Some(("KERNEL_ERR", "matvec_gate_up_fused returned false".into()));
+                    break 'shapes;
+                }
+                for j in 0..m {
+                    inter_cpu[j] += w_route * silu(cpu_g[j]) * cpu_u[j];
+                    inter_sep[j] += w_route * silu(sep_g[j]) * sep_u[j];
+                    inter_fused[j] += w_route * silu(fus_g[j]) * fus_u[j];
+                }
+            }
+            let (cos_cpu, rel_cpu) = compare(&inter_fused, &inter_cpu);
+            let (cos_sep, rel_sep) = compare(&inter_fused, &inter_sep);
+            worst_cos_cpu = worst_cos_cpu.min(cos_cpu);
+            worst_rel_cpu = worst_rel_cpu.max(rel_cpu);
+            worst_cos_sep = worst_cos_sep.min(cos_sep);
+            worst_rel_sep = worst_rel_sep.max(rel_sep);
+        }
+        if let Some((v, detail)) = failed {
+            cu_emit(&name, v, &detail);
+            *counts.entry(v).or_default() += 1;
+            continue;
+        }
+        let cpu_ok = worst_cos_cpu > 0.999 && worst_rel_cpu < 0.05;
+        let sep_ok = worst_cos_sep > 0.9995 && worst_rel_sep < 0.02;
+        let verdict = if cpu_ok && sep_ok { "OK" } else { "MISCOMPUTE" };
+        cu_emit(
+            &name,
+            verdict,
+            &format!(
+                "cos_cpu={worst_cos_cpu:.6} rel_cpu={worst_rel_cpu:.4} \
+                 cos_sep={worst_cos_sep:.6} rel_sep={worst_rel_sep:.4}"
+            ),
+        );
+        *counts.entry(verdict).or_default() += 1;
     }
 
     // ---- Dense f32 matvec (host-pointer reference path) ----
