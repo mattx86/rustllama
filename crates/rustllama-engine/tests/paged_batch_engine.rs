@@ -8,8 +8,9 @@
 //! max_tokens stop conditions, and page release back to the
 //! shared pool at slot completion.
 
+use rustllama_engine::batch_scheduler::Priority;
 use rustllama_engine::paged_batch::PagedBatchEngine;
-use rustllama_engine::{CpuEngine, SamplingParams};
+use rustllama_engine::{CpuEngine, EngineError, SamplingParams, SubmitOpts};
 use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama, SynthMoe};
 
 fn write_gguf(tag: &str) -> std::path::PathBuf {
@@ -889,6 +890,161 @@ async fn paged_batch_streaming_string_stop_terminates() {
         stopped.len(),
         1,
         "driver-path string stop must end generation after the first token (decoded={s0:?})"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// ============================================================
+// P14: per-request deadline → timeout cancel
+// ============================================================
+
+/// P14 deadline: a request submitted with an already-elapsed deadline is
+/// cancelled by the driver — it flips the request's cancel flag (reusing the
+/// `CancelGuard.flag` mechanism) and ends the stream with a `DeadlineExceeded`
+/// terminal (the "timeout" finish reason), distinct from a natural stop. No
+/// token is streamed for a request that was already past its deadline at
+/// admission.
+#[tokio::test]
+async fn paged_batch_deadline_cancels_with_timeout_and_flips_flag() {
+    use futures::StreamExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let tmp = write_gguf("deadline-timeout");
+    let batch = PagedBatchEngine::load(&tmp, 32, 1).expect("load");
+
+    let flag = Arc::new(AtomicBool::new(false));
+    let opts = SubmitOpts {
+        priority: Priority::DEFAULT,
+        // Already elapsed by the time the driver inspects it.
+        deadline: Some(std::time::Instant::now()),
+        cancel_flag: Some(flag.clone()),
+    };
+    let mut s = batch
+        .submit_streaming_with_opts(vec![1, 2, 3], greedy(20), opts)
+        .expect("submit");
+
+    let mut saw_timeout = false;
+    let mut tokens = 0;
+    while let Some(item) = s.next().await {
+        match item {
+            Ok(_) => tokens += 1,
+            Err(e) => {
+                assert!(
+                    matches!(e, EngineError::DeadlineExceeded),
+                    "deadline terminal must be DeadlineExceeded (got {e})"
+                );
+                saw_timeout = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_timeout, "past-deadline request must end with a timeout terminal");
+    assert_eq!(tokens, 0, "a request already past its deadline streams no tokens");
+    assert!(
+        flag.load(Ordering::Acquire),
+        "the deadline must flip the request's cancel flag"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// ============================================================
+// F5: recompute preemption transparency
+// ============================================================
+
+/// F5: force page exhaustion (a TINY 1-page pool, `max_slots=2`) so admitting a
+/// higher-priority request B preempts the lower-priority running request A.
+/// A's pages are freed and it is re-admitted later (recompute from its prompt)
+/// — and its FULL token stream must be byte-identical to an uninterrupted solo
+/// run (greedy). Preemption affects only timing/scheduling, never the tokens.
+#[tokio::test]
+async fn paged_batch_preempted_request_resumes_byte_identical() {
+    use futures::StreamExt;
+
+    let tmp = write_gguf("preempt-transparency");
+    let prompt_a: Vec<i32> = vec![3, 1, 4, 1, 5];
+    let prompt_b: Vec<i32> = vec![9, 2, 6, 5, 3];
+    let a_tokens = 8u32;
+
+    // Reference: A run ALONE (normal pool, 1 slot) — the uninterrupted greedy
+    // sequence the preempted-then-resumed run must reproduce exactly.
+    let ref_engine = PagedBatchEngine::load_token_id_only(&tmp, 32, 1).expect("ref load");
+    let ref_a: Vec<u32> = {
+        let mut s = ref_engine
+            .submit_streaming(prompt_a.clone(), greedy(a_tokens))
+            .expect("ref submit");
+        let mut out = Vec::new();
+        while let Some(item) = s.next().await {
+            out.push(item.expect("ref tok").id);
+        }
+        out
+    };
+    drop(ref_engine);
+    assert_eq!(ref_a.len(), a_tokens as usize, "reference ran to max_tokens");
+
+    // Contention engine: 1-page pool, 2 slots. A holding the single page means
+    // admitting B cannot find free pages → B preempts the lower-priority A.
+    let eng = PagedBatchEngine::load_token_id_only_with_pool_pages(&tmp, 32, 2, 1)
+        .expect("tiny-pool load");
+
+    // Submit A (LOW) and read its first 2 tokens so it is admitted + running
+    // with 2 tokens already streamed (exercises the skip-already-streamed path).
+    let mut sa = eng
+        .submit_streaming_with_opts(
+            prompt_a.clone(),
+            greedy(a_tokens),
+            SubmitOpts {
+                priority: Priority::LOW,
+                ..Default::default()
+            },
+        )
+        .expect("submit A");
+    let mut a_out: Vec<u32> = Vec::new();
+    for _ in 0..2 {
+        let t = sa.next().await.expect("A token").expect("A ok");
+        a_out.push(t.id);
+    }
+
+    // Submit B (HIGH) — forces preemption of A (single page already held by A).
+    let sb = eng
+        .submit_streaming_with_opts(
+            prompt_b.clone(),
+            greedy(4),
+            SubmitOpts {
+                priority: Priority::HIGH,
+                ..Default::default()
+            },
+        )
+        .expect("submit B");
+
+    // Drain B fully (frees the page so A can resume) + the REST of A, together.
+    let drain_b = async move {
+        let mut s = sb;
+        let mut n = 0u32;
+        while let Some(item) = s.next().await {
+            let _ = item.expect("B token");
+            n += 1;
+        }
+        n
+    };
+    let drain_a_rest = async move {
+        let mut rest = Vec::new();
+        while let Some(item) = sa.next().await {
+            rest.push(item.expect("A token (rest)").id);
+        }
+        rest
+    };
+    let (b_n, a_rest) = futures::future::join(drain_b, drain_a_rest).await;
+    assert_eq!(b_n, 4, "B produced its tokens");
+    a_out.extend(a_rest);
+
+    assert_eq!(
+        a_out, ref_a,
+        "preempted+resumed A diverged from a solo run: got={a_out:?} ref={ref_a:?}"
+    );
+    assert!(
+        eng.preemptions_for_tests() >= 1,
+        "A must have been preempted at least once (page exhaustion was not forced)"
     );
     let _ = std::fs::remove_file(&tmp);
 }

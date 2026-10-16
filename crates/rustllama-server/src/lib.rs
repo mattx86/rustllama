@@ -146,13 +146,13 @@ pub struct ServingModel {
     pub cpu_engine: Option<Arc<rustllama_engine::CpuEngine>>,
     pub model_id: String,
     pub gate: Arc<Semaphore>,
-    /// Per-model scheduler. Today this is a [`SingleFlightScheduler`]
-    /// that matches the `Semaphore(1)` gate's behavior exactly — admit
-    /// at most one slot at a time, queue the rest. When continuous
-    /// batching lands, this swaps to a `ContinuousBatchingScheduler`
-    /// and the `Semaphore` gate goes away; the wire-protocol surface
-    /// (`try_acquire`/`PermitGuard`) stays unchanged so handlers don't
-    /// need updates.
+    /// Per-model scheduler. A [`SingleFlightScheduler`] by default (matches the
+    /// `Semaphore(1)` gate — admit one at a time, queue the rest) or a
+    /// [`MultiFlightScheduler`] when `[server].concurrency > 1`. For a
+    /// fused-decode model the real continuous-batching admission (priority heap
+    /// + F5 preemption, P14) lives inside the `PagedBatchEngine` driver thread;
+    /// this scheduler + the `Semaphore` gate provide the server-side
+    /// backpressure/queue-depth accounting around it.
     pub scheduler: SharedScheduler,
     /// Live count of "in-flight + waiting" requests against this model.
     /// Incremented in `try_acquire` before the gate await, decremented

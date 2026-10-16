@@ -27,20 +27,23 @@
 //!     across all admitted slots until each reaches its `max_tokens`
 //!     or an EOS token.
 //!
-//! What lands in 3.7e:
-//!   - Async streaming entry (`generate_chat_streaming` / SSE) so
-//!     the server can route admitted requests into this engine
-//!     instead of into per-fork [`crate::inference::CpuEngine`]s when
-//!     `[server].fused_decode = true`.
-//!   - Scheduler integration: per-slot lifecycle events
-//!     (`Scheduler::admit` on request start, `complete` on EOS /
-//!     max_tokens / cancel) so the existing
-//!     [`ContinuousBatchingScheduler`] bookkeeping reflects real
-//!     in-flight slots.
+//! Async + scheduling surface:
+//!   - Async streaming entry (`submit_streaming` / SSE) so the server
+//!     routes admitted requests into this engine instead of per-fork
+//!     [`crate::inference::CpuEngine`]s when `[server].fused_decode = true`.
+//!   - P14: the driver thread admits from a priority-ordered heap
+//!     (`X-RustLlama-Priority` → [`crate::SubmitOpts::priority`]) rather than
+//!     FIFO, enforces per-request deadlines (flipping the request's cancel
+//!     flag), and does F5 recompute preemption of the lowest-priority running
+//!     slot on page exhaustion. See [`PagedBatchEngine::submit_streaming_with_opts`].
 
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::BinaryHeap;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::Stream;
 use rustllama_gguf::Gguf;
@@ -51,12 +54,13 @@ use rustllama_models::paged_kv_store::PagedKvStore;
 use rustllama_models::shared_paged_kv::SharedPagedKv;
 use rustllama_tokenizer::{ChatMessage as TokChat, Tokenizer};
 
+use crate::batch_scheduler::Priority;
 use crate::grammar::GrammarMask;
 use crate::inference::CpuEngineError;
 use crate::sampling::Sampler;
 use crate::{
     ChatMessage, Engine, EngineError, GrammarKind, Metrics, RequestStats, Result as EngineResult,
-    SamplingParams, Token, TokenStream,
+    SamplingParams, SubmitOpts, Token, TokenStream,
 };
 
 /// P9 feature parity: tool-call grammar recursion cap for the paged driver.
@@ -228,6 +232,24 @@ struct SlotState {
     /// spanning several tokens is caught. Only grown when `stop_strings` is
     /// non-empty (no detok cost otherwise).
     stop_buf: String,
+    /// F5 recompute-preemption replay counter. `0` for a normal slot. When a
+    /// slot is preempted (its pages freed), it re-admits as a FRESH prefill of
+    /// its ORIGINAL prompt with `skip_emit` set to the number of tokens it had
+    /// already streamed; the deterministic greedy/seeded forward regenerates
+    /// those tokens bit-for-bit, and the decode path SUPPRESSES streaming them
+    /// (decrementing `skip_emit`) so the client's stream is byte-identical to
+    /// an uninterrupted run — the already-sent tokens are not re-sent. Once it
+    /// reaches `0`, streaming resumes normally. This replay reuses the exact
+    /// prefill+decode code path, so transparency holds regardless of the
+    /// paged position convention.
+    skip_emit: u32,
+    /// F5: total tokens actually STREAMED to the client over this slot's whole
+    /// (possibly multi-resume) life. PRESERVED across a preemption (unlike
+    /// `n_emitted`, which resets to 0 each resume and counts regenerations).
+    /// On preemption the resume's `skip_emit` is set to this, so a slot
+    /// preempted AGAIN mid-replay still skips exactly the already-seen tokens
+    /// and never re-streams one.
+    emitted_to_client: u32,
 }
 
 /// In-flight chunked prefill for one slot. `admit_request` stages the slot
@@ -258,14 +280,36 @@ struct NewRequest {
     prompt: Vec<i32>,
     sampling: SamplingParams,
     response_tx: tokio::sync::mpsc::Sender<EngineResult<Token>>,
+    /// P14: admission priority (higher admits sooner from the driver's heap;
+    /// FIFO within equal priority via the driver's arrival counter).
+    priority: Priority,
+    /// P14: optional absolute per-request deadline; the driver cancels the
+    /// slot when it elapses.
+    deadline: Option<Instant>,
+    /// P14: optional cancel flag the driver flips on deadline expiry (the
+    /// server's `CancelGuard.flag`).
+    cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 /// Per-slot driver state — `SlotState` plus the channel back to
-/// the submitting caller's stream.
+/// the submitting caller's stream and its P14 scheduling metadata.
 struct DriverSlot {
     state: SlotState,
     response_tx: tokio::sync::mpsc::Sender<EngineResult<Token>>,
+    /// P14 scheduling: admission priority. Drives both which waiter admits
+    /// first AND which running slot F5 preempts (the lowest-priority one).
+    priority: Priority,
+    /// P14: absolute deadline (if any). Checked each tick + at admission.
+    deadline: Option<Instant>,
+    /// P14: cancel flag flipped on deadline expiry.
+    cancel_flag: Option<Arc<AtomicBool>>,
+    /// Monotonic arrival order (FIFO tiebreaker within a priority level).
+    /// Assigned by the driver when the request first enters the waiting heap;
+    /// a preempted-and-requeued slot keeps its ORIGINAL value so it does not
+    /// lose its place to newer same-priority arrivals.
+    arrival_seq: u64,
 }
+
 
 pub struct PagedBatchEngine {
     model: Arc<LlamaModel>,
@@ -307,6 +351,10 @@ pub struct PagedBatchEngine {
     /// the GUI Status page's "Last request: prefill X ms,
     /// decode Y ms, …" row.
     last_stats: Arc<std::sync::Mutex<Option<RequestStats>>>,
+    /// F5: cumulative count of preemptions the driver has performed. Shared
+    /// with the driver thread; read by tests to confirm the recompute-
+    /// preemption path actually fired under page exhaustion.
+    preemptions: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl PagedBatchEngine {
@@ -326,7 +374,7 @@ impl PagedBatchEngine {
         // Config budget 0 ⇒ the ragged mixed path is OFF unless the
         // `RUSTLLAMA_MAX_BATCHED_TOKENS` env var opts in (env still honored for
         // back-compat; see `resolve_max_batched_tokens`).
-        Self::load_inner(path, max_ctx, max_slots, true, 0)
+        Self::load_inner(path, max_ctx, max_slots, true, 0, None)
     }
 
     /// Same as [`Self::load`] but with the `[inference].max_num_batched_tokens`
@@ -342,7 +390,7 @@ impl PagedBatchEngine {
         max_slots: u32,
         max_num_batched_tokens: usize,
     ) -> Result<Self, CpuEngineError> {
-        Self::load_inner(path, max_ctx, max_slots, true, max_num_batched_tokens)
+        Self::load_inner(path, max_ctx, max_slots, true, max_num_batched_tokens, None)
     }
 
     /// Same as [`Self::load`] but without a tokenizer — for callers
@@ -352,7 +400,25 @@ impl PagedBatchEngine {
         max_ctx: usize,
         max_slots: u32,
     ) -> Result<Self, CpuEngineError> {
-        Self::load_inner(path, max_ctx, max_slots, false, 0)
+        Self::load_inner(path, max_ctx, max_slots, false, 0, None)
+    }
+
+    /// Test-only: like [`Self::load_token_id_only`] but with an explicit page
+    /// pool size (pages), SMALLER than the `max_slots × pages_per_slot` the
+    /// production path reserves. A production pool is sized so `max_slots`
+    /// concurrent requests each at `max_ctx` always fit — so page exhaustion
+    /// (and thus F5 preemption) can never trigger from admission. An
+    /// undersized pool is the realistic memory-constrained config vLLM targets
+    /// with preemption; this constructor lets the engine tests exercise the
+    /// F5 recompute-preemption path deterministically.
+    #[doc(hidden)]
+    pub fn load_token_id_only_with_pool_pages(
+        path: &Path,
+        max_ctx: usize,
+        max_slots: u32,
+        total_pages: u32,
+    ) -> Result<Self, CpuEngineError> {
+        Self::load_inner(path, max_ctx, max_slots, false, 0, Some(total_pages))
     }
 
     fn load_inner(
@@ -361,6 +427,7 @@ impl PagedBatchEngine {
         max_slots: u32,
         with_tokenizer: bool,
         config_max_batched_tokens: usize,
+        pool_pages_override: Option<u32>,
     ) -> Result<Self, CpuEngineError> {
         let max_slots = max_slots.max(1);
         let gguf = Gguf::open(path)?;
@@ -424,11 +491,17 @@ impl PagedBatchEngine {
         };
         let page_size = DEFAULT_PAGE_SIZE;
         let pages_per_slot = (ctx as u32).div_ceil(page_size);
-        let total_pages = pages_per_slot
-            .checked_mul(max_slots)
-            .ok_or_else(|| CpuEngineError::Other(format!(
-                "paged batch pool overflow: pages_per_slot={pages_per_slot} * max_slots={max_slots}"
-            )))?;
+        // Production sizing: enough pages for `max_slots` requests each at the
+        // full context. A test may pass a SMALLER `pool_pages_override` to
+        // force page exhaustion and exercise F5 recompute preemption.
+        let total_pages = match pool_pages_override {
+            Some(p) => p.max(1),
+            None => pages_per_slot
+                .checked_mul(max_slots)
+                .ok_or_else(|| CpuEngineError::Other(format!(
+                    "paged batch pool overflow: pages_per_slot={pages_per_slot} * max_slots={max_slots}"
+                )))?,
+        };
         let store = PagedKvStore::new(
             total_pages,
             model.cfg.n_layers as u32,
@@ -482,6 +555,7 @@ impl PagedBatchEngine {
             Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let last_stats: Arc<std::sync::Mutex<Option<RequestStats>>> =
             Arc::new(std::sync::Mutex::new(None));
+        let preemptions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let driver_ctx = DriverContext {
             model: Arc::clone(&model),
             tokenizer: tokenizer.clone(),
@@ -489,8 +563,10 @@ impl PagedBatchEngine {
             max_ctx: ctx,
             max_slots,
             page_size,
+            total_pages,
             active_slot_count: Arc::clone(&active_slot_count),
             last_stats: Arc::clone(&last_stats),
+            preemptions: Arc::clone(&preemptions),
             // Per-tick prompt-prefill token budget for the single ragged
             // driver path (T1). Every tick routes through the RAGGED mixed
             // forward (`forward_ragged_paged_f32`): one fused pass over the
@@ -560,11 +636,20 @@ impl PagedBatchEngine {
             driver_handle: Some(driver_handle),
             active_slot_count,
             last_stats,
+            preemptions,
         })
     }
 
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    /// F5 (test-only): number of recompute preemptions the driver has performed
+    /// since load. Lets the preemption anchor confirm the path actually fired
+    /// under forced page exhaustion.
+    #[doc(hidden)]
+    pub fn preemptions_for_tests(&self) -> usize {
+        self.preemptions.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Direct handle to the driver's `active_slot_count` atomic
@@ -761,6 +846,8 @@ impl PagedBatchEngine {
                 grammar,
                 stop_strings,
                 stop_buf: String::new(),
+                skip_emit: 0,
+                emitted_to_client: 0,
             });
         }
 
@@ -914,6 +1001,21 @@ impl PagedBatchEngine {
         prompt: Vec<i32>,
         sampling: SamplingParams,
     ) -> EngineResult<TokenStream> {
+        self.submit_streaming_with_opts(prompt, sampling, SubmitOpts::default())
+    }
+
+    /// P14: like [`Self::submit_streaming`] but with per-request scheduling
+    /// options — admission `priority` (drives the driver's priority-ordered
+    /// admission heap) and an optional `deadline` + `cancel_flag` (the driver
+    /// flips the flag and ends the slot with a [`EngineError::DeadlineExceeded`]
+    /// terminal once the deadline elapses). [`SubmitOpts::default`] reproduces
+    /// [`Self::submit_streaming`] exactly (DEFAULT priority, no deadline).
+    pub fn submit_streaming_with_opts(
+        &self,
+        prompt: Vec<i32>,
+        sampling: SamplingParams,
+        opts: SubmitOpts,
+    ) -> EngineResult<TokenStream> {
         let request_tx = self
             .request_tx
             .as_ref()
@@ -928,6 +1030,9 @@ impl PagedBatchEngine {
                 prompt,
                 sampling,
                 response_tx,
+                priority: opts.priority,
+                deadline: opts.deadline,
+                cancel_flag: opts.cancel_flag,
             })
             .map_err(|_| EngineError::Engine("paged-batch driver thread has exited".into()))?;
         let stream = async_stream::stream! {
@@ -946,6 +1051,19 @@ impl PagedBatchEngine {
         prompt: &str,
         sampling: SamplingParams,
     ) -> EngineResult<TokenStream> {
+        self.submit_text_streaming_with_opts(prompt, sampling, SubmitOpts::default())
+    }
+
+    /// P14: opts-aware [`Self::submit_text_streaming`] — tokenizes then submits
+    /// with the given scheduling options. Used by the `Engine::chat_scheduled`
+    /// / `generate_scheduled` overrides so the server's parsed
+    /// priority/deadline reach the driver.
+    pub fn submit_text_streaming_with_opts(
+        &self,
+        prompt: &str,
+        sampling: SamplingParams,
+        opts: SubmitOpts,
+    ) -> EngineResult<TokenStream> {
         let tokenizer = self
             .tokenizer
             .as_ref()
@@ -960,7 +1078,7 @@ impl PagedBatchEngine {
                 "prompt tokenized to zero tokens (after BOS handling)".into(),
             ));
         }
-        self.submit_streaming(token_ids, sampling)
+        self.submit_streaming_with_opts(token_ids, sampling, opts)
     }
 }
 
@@ -1116,6 +1234,13 @@ struct DriverContext {
     max_ctx: usize,
     max_slots: u32,
     page_size: u32,
+    /// Total pages in the shared pool. P14/F5: a request whose full capacity
+    /// needs MORE than this can never be scheduled even by preempting every
+    /// other slot, so the admission path rejects it up front (fatal) instead
+    /// of spinning. With production sizing this is `max_slots * pages_per_slot`
+    /// so every request fits; an undersized (test) pool makes F5 preemption
+    /// reachable.
+    total_pages: u32,
     /// Shared atomic the driver bumps on admission + decrements on
     /// slot completion. Engine-side `metrics()` reads it for the
     /// `paged_active_slots` field surfaced on the GUI Status page.
@@ -1124,6 +1249,9 @@ struct DriverContext {
     /// The driver writes it on retain-removal; the engine's
     /// `last_request_stats_snapshot` impl reads it.
     last_stats: Arc<std::sync::Mutex<Option<RequestStats>>>,
+    /// F5: count of slots the driver has preempted (for observability + tests).
+    /// Bumped in [`preempt_slot`].
+    preemptions: Arc<std::sync::atomic::AtomicUsize>,
     /// Per-tick prompt-prefill token budget for the single ragged driver path
     /// (`RUSTLLAMA_MAX_BATCHED_TOKENS` / `[inference].max_num_batched_tokens`).
     /// Already resolved: `0` was mapped to `usize::MAX` (unbounded — whole
@@ -1132,73 +1260,302 @@ struct DriverContext {
     max_batched_tokens: usize,
 }
 
+/// P14/F5: one unit of pending admission work in the driver's priority heap.
+/// A FRESH submit carries `skip_emit == 0`; an F5-preempted slot is requeued as
+/// the SAME request (its ORIGINAL prompt + response channel + scheduling
+/// metadata) with `skip_emit` = the tokens it had already streamed, so the
+/// deterministic replay regenerates-but-does-not-restream them.
+struct PendingReq {
+    prompt: Vec<i32>,
+    sampling: SamplingParams,
+    response_tx: tokio::sync::mpsc::Sender<EngineResult<Token>>,
+    priority: Priority,
+    deadline: Option<Instant>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    /// Monotonic arrival order (FIFO tiebreaker within a priority level).
+    /// Preserved across a preemption so a resumed slot keeps its place.
+    arrival_seq: u64,
+    /// F5 replay counter — 0 for a fresh request.
+    skip_emit: u32,
+}
+
+/// Max-heap entry ordering [`PendingReq`] by (priority DESC, arrival_seq ASC).
+struct PendingEntry(PendingReq);
+impl PartialEq for PendingEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.priority == other.0.priority && self.0.arrival_seq == other.0.arrival_seq
+    }
+}
+impl Eq for PendingEntry {}
+impl Ord for PendingEntry {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        // Higher priority pops first; within equal priority the OLDER
+        // (smaller arrival_seq) pops first — invert the seq comparison so the
+        // max-heap surfaces the oldest.
+        self.0
+            .priority
+            .cmp(&other.0.priority)
+            .then_with(|| other.0.arrival_seq.cmp(&self.0.arrival_seq))
+    }
+}
+impl PartialOrd for PendingEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// True when `deadline` is set and has elapsed.
+#[inline]
+fn deadline_expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|d| Instant::now() >= d)
+}
+
+/// P14: end a slot/request cleanly on deadline expiry — flip the request's
+/// cancel flag (reusing the server's `CancelGuard.flag` mechanism so its
+/// stream-watch loop observes the cancellation) and emit a
+/// [`EngineError::DeadlineExceeded`] terminal so the consumer can report a
+/// `"timeout"` finish reason distinct from a user-initiated cancel.
+fn fire_deadline_timeout(
+    response_tx: &tokio::sync::mpsc::Sender<EngineResult<Token>>,
+    cancel_flag: &Option<Arc<AtomicBool>>,
+) {
+    if let Some(flag) = cancel_flag {
+        flag.store(true, std::sync::atomic::Ordering::Release);
+    }
+    let _ = response_tx.blocking_send(Err(EngineError::DeadlineExceeded));
+}
+
+/// F5: pick the lowest-priority RUNNING slot strictly below `incoming`
+/// priority (ties broken by largest `arrival_seq` — newest preempted first).
+/// Returns its index in `active`, or `None` if no running slot ranks below the
+/// incoming request (so preemption would not help).
+fn pick_preemption_victim(active: &[DriverSlot], incoming: Priority) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (i, s) in active.iter().enumerate() {
+        if s.state.done || s.priority >= incoming {
+            continue;
+        }
+        match best {
+            None => best = Some(i),
+            Some(b) => {
+                let bslot = &active[b];
+                if s.priority < bslot.priority
+                    || (s.priority == bslot.priority && s.arrival_seq > bslot.arrival_seq)
+                {
+                    best = Some(i);
+                }
+            }
+        }
+    }
+    best
+}
+
+/// F5: free a running slot's pages and requeue it for a later recompute resume.
+/// The slot's SlotState is discarded (the resume rebuilds it from the ORIGINAL
+/// prompt via the normal prefill path); only its response channel, scheduling
+/// metadata, and already-streamed token count (`skip_emit`) are preserved.
+fn preempt_slot(ctx: &DriverContext, mut slot: DriverSlot, pending: &mut BinaryHeap<PendingEntry>) {
+    ctx.preemptions
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+    slot.state.cache.release_shared(&ctx.shared);
+    // Original prompt = the first `tokens_prefilled` tokens of `history`
+    // (history = prompt ++ generated). Rebuild it as the resume's prompt.
+    let p = slot.state.tokens_prefilled as usize;
+    let prompt: Vec<i32> = slot.state.history[..p.min(slot.state.history.len())]
+        .iter()
+        .map(|&t| t as i32)
+        .collect();
+    pending.push(PendingEntry(PendingReq {
+        prompt,
+        sampling: slot.state.sampling.clone(),
+        response_tx: slot.response_tx,
+        priority: slot.priority,
+        deadline: slot.deadline,
+        cancel_flag: slot.cancel_flag,
+        arrival_seq: slot.arrival_seq,
+        // Already-streamed tokens: regenerate silently on resume. Use the
+        // persistent client-seen count (NOT `n_emitted`, which resets each
+        // resume) so a slot preempted mid-replay still skips exactly the
+        // tokens the client already received.
+        skip_emit: slot.state.emitted_to_client,
+    }));
+}
+
+/// P14/F5: make room for a request needing `needed` pages + one free slot,
+/// preempting the lowest-priority running slots strictly below `incoming`
+/// until there is a free slot AND enough free pages. Returns `true` on success,
+/// `false` if no further (lower-priority) slot can be preempted.
+fn make_room(
+    ctx: &DriverContext,
+    active: &mut Vec<DriverSlot>,
+    pending: &mut BinaryHeap<PendingEntry>,
+    needed: usize,
+    incoming: Priority,
+) -> bool {
+    loop {
+        if (active.len() as u32) < ctx.max_slots && ctx.shared.free_pages() >= needed {
+            return true;
+        }
+        match pick_preemption_victim(active, incoming) {
+            Some(idx) => {
+                let victim = active.remove(idx);
+                preempt_slot(ctx, victim, pending);
+            }
+            None => return false,
+        }
+    }
+}
+
 fn driver_loop(
     ctx: DriverContext,
     mut request_rx: tokio::sync::mpsc::UnboundedReceiver<NewRequest>,
 ) {
     let mut active: Vec<DriverSlot> = Vec::new();
+    // P14: waiting work ordered by priority (then FIFO by arrival). Fresh
+    // submits drain off the channel into here; F5-preempted slots requeue here.
+    let mut pending: BinaryHeap<PendingEntry> = BinaryHeap::new();
+    let mut next_seq: u64 = 0;
     let vocab = ctx.model.cfg.vocab_size;
     let eos = ctx.model.cfg.eos_token_id.map(|e| e as i32);
+    let page_size = ctx.page_size as usize;
 
     loop {
-        // ---- Admit new requests (non-blocking drain) ----
-        // Each tick we pull as many newly-submitted requests as
-        // the channel has buffered. The hard cap is `max_slots`
-        // active at once; requests beyond that stay in the
-        // channel and get admitted as slots free up on completion.
-        while (active.len() as u32) < ctx.max_slots {
-            let msg = match request_rx.try_recv() {
-                Ok(m) => m,
+        // ---- Drain newly-submitted requests into the priority heap ----
+        let mut disconnected = false;
+        loop {
+            match request_rx.try_recv() {
+                Ok(m) => {
+                    pending.push(PendingEntry(PendingReq {
+                        prompt: m.prompt,
+                        sampling: m.sampling,
+                        response_tx: m.response_tx,
+                        priority: m.priority,
+                        deadline: m.deadline,
+                        cancel_flag: m.cancel_flag,
+                        arrival_seq: next_seq,
+                        skip_emit: 0,
+                    }));
+                    next_seq += 1;
+                }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    // All senders gone and no active work — clean exit.
-                    if active.is_empty() {
-                        return;
-                    }
+                    disconnected = true;
                     break;
-                }
-            };
-            // Admit. If admission fails (prompt too long, pool
-            // exhausted, etc.), surface the error on the request's
-            // channel and skip — the response stream sees one Err
-            // and closes.
-            match admit_request(&ctx, msg.prompt, msg.sampling, eos, &active) {
-                Ok(state) => {
-                    active.push(DriverSlot {
-                        state,
-                        response_tx: msg.response_tx,
-                    });
-                    ctx.active_slot_count
-                        .store(active.len(), std::sync::atomic::Ordering::Release);
-                }
-                Err(e) => {
-                    // Best-effort: caller may have dropped the rx already.
-                    let _ = msg.response_tx.blocking_send(Err(e));
                 }
             }
         }
 
-        // ---- Idle case: no active slots, wait for the next request ----
-        if active.is_empty() {
-            // Blocking recv — driver thread is idle, no CPU spin.
-            let msg = match request_rx.blocking_recv() {
-                Some(m) => m,
-                None => return, // all senders dropped, shutdown
-            };
-            match admit_request(&ctx, msg.prompt, msg.sampling, eos, &active) {
+        // ---- Admit from the heap (priority order) with F5 preemption ----
+        // Pop the highest-priority waiter; drop expired/invalid ones; preempt
+        // lower-priority running slots to free capacity when exhausted. Stop as
+        // soon as the top waiter cannot be admitted even with preemption (so a
+        // waiter that can't fit never starves the heap in a busy loop).
+        while let Some(PendingEntry(req)) = pending.pop() {
+            // Client gone before admission — drop silently.
+            if req.response_tx.is_closed() {
+                continue;
+            }
+            // Deadline already elapsed in the queue — cancel with a timeout.
+            if deadline_expired(req.deadline) {
+                fire_deadline_timeout(&req.response_tx, &req.cancel_flag);
+                continue;
+            }
+            // Validate shape (empty / too long / larger than the whole pool) —
+            // these are fatal to the request, surfaced as an Err terminal.
+            if req.prompt.is_empty() {
+                let _ = req.response_tx.blocking_send(Err(EngineError::Engine(
+                    "empty prompt (every request needs at least one prompt token)".into(),
+                )));
+                continue;
+            }
+            let total_capacity = req
+                .prompt
+                .len()
+                .checked_add(req.sampling.max_tokens as usize)
+                .unwrap_or(usize::MAX);
+            if total_capacity > ctx.max_ctx {
+                let _ = req.response_tx.blocking_send(Err(EngineError::Engine(format!(
+                    "prompt too long: {} tokens + max_tokens {} > max_ctx {}",
+                    req.prompt.len(),
+                    req.sampling.max_tokens,
+                    ctx.max_ctx,
+                ))));
+                continue;
+            }
+            let needed = total_capacity.div_ceil(page_size.max(1));
+            if needed > ctx.total_pages as usize {
+                let _ = req.response_tx.blocking_send(Err(EngineError::Engine(format!(
+                    "request needs {needed} pages but the paged pool holds only {} \
+                     (shorten the prompt or lower max_tokens)",
+                    ctx.total_pages,
+                ))));
+                continue;
+            }
+            // Make room (free slot + pages), preempting lower-priority slots.
+            if !make_room(&ctx, &mut active, &mut pending, needed, req.priority) {
+                // Can't schedule the top waiter yet — requeue it and stop; it
+                // retries next tick once a running slot frees pages.
+                pending.push(PendingEntry(req));
+                break;
+            }
+            match admit_request(&ctx, &req.prompt, &req.sampling, eos, &active, req.skip_emit) {
                 Ok(state) => {
                     active.push(DriverSlot {
                         state,
-                        response_tx: msg.response_tx,
+                        response_tx: req.response_tx,
+                        priority: req.priority,
+                        deadline: req.deadline,
+                        cancel_flag: req.cancel_flag,
+                        arrival_seq: req.arrival_seq,
                     });
                     ctx.active_slot_count
                         .store(active.len(), std::sync::atomic::Ordering::Release);
                 }
                 Err(e) => {
-                    let _ = msg.response_tx.blocking_send(Err(e));
+                    // Shouldn't happen after `make_room` guaranteed capacity;
+                    // surface defensively rather than panic.
+                    let _ = req.response_tx.blocking_send(Err(e));
                 }
             }
+        }
+
+        // ---- Shutdown / idle ----
+        if active.is_empty() {
+            // Nothing running and nothing admittable. If the senders are all
+            // gone, exit; otherwise block for the next submit (no CPU spin).
+            if disconnected && pending.is_empty() {
+                return;
+            }
+            if pending.is_empty() {
+                let msg = match request_rx.blocking_recv() {
+                    Some(m) => m,
+                    None => return, // all senders dropped
+                };
+                pending.push(PendingEntry(PendingReq {
+                    prompt: msg.prompt,
+                    sampling: msg.sampling,
+                    response_tx: msg.response_tx,
+                    priority: msg.priority,
+                    deadline: msg.deadline,
+                    cancel_flag: msg.cancel_flag,
+                    arrival_seq: next_seq,
+                    skip_emit: 0,
+                }));
+                next_seq += 1;
+            }
+            // Loop back to admit the (now non-empty) heap. `pending` non-empty
+            // with `active` empty means every waiter was just requeued as
+            // un-admittable — which can only happen when `needed > total_pages`
+            // (already rejected above), so this does not spin.
             continue;
+        }
+
+        // ---- Deadline sweep over running slots (mid-generation timeout) ----
+        for slot in active.iter_mut() {
+            if !slot.state.done && deadline_expired(slot.deadline) {
+                fire_deadline_timeout(&slot.response_tx, &slot.cancel_flag);
+                slot.state.done = true;
+            }
         }
 
         // ---- Advance all slots one tick (the single ragged path). ----
@@ -1252,12 +1609,18 @@ fn driver_loop(
 /// the slot's initial decoder state (positioned at `prompt.len()`,
 /// ready for the first fused decode tick to produce token #0 of
 /// the response).
+///
+/// `skip_emit` is `0` for a fresh request and `n_emitted` for an F5 preempted
+/// resume (the number of already-streamed tokens the deterministic replay
+/// regenerates but must NOT re-stream). Borrows `prompt`/`sampling` so the
+/// driver keeps ownership for a requeue when admission has to wait.
 fn admit_request(
     ctx: &DriverContext,
-    prompt: Vec<i32>,
-    sampling: SamplingParams,
+    prompt: &[i32],
+    sampling: &SamplingParams,
     eos: Option<i32>,
     active: &[DriverSlot],
+    skip_emit: u32,
 ) -> EngineResult<SlotState> {
     if prompt.is_empty() {
         return Err(EngineError::Engine(
@@ -1313,7 +1676,7 @@ fn admit_request(
     //      physically reused (`PageTable::reacquire` revives their retained KV).
     // The APC lookup acquires ref-held pages up front; we keep whichever source
     // reuses more, releasing the other's refs.
-    let (live_pages, live_lcp) = pick_shared_prefix(&prompt, active, page_size);
+    let (live_pages, live_lcp) = pick_shared_prefix(prompt, active, page_size);
     let prompt_u32: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
     let chain = rustllama_models::apc::block_hash_chain(&prompt_u32, page_size);
     let apc_pages = ctx.shared.apc_acquire_prefix(&chain);
@@ -1363,10 +1726,10 @@ fn admit_request(
         let tokens_prefilled = prompt.len() as u32;
         let sampler = Sampler::new(sampling.clone());
         // P9 feature parity: grammar + string stops per slot.
-        let grammar = build_paged_grammar(&ctx.model, ctx.tokenizer.as_ref(), &sampling);
+        let grammar = build_paged_grammar(&ctx.model, ctx.tokenizer.as_ref(), sampling);
         let stop_strings = sampling.stop.clone();
         return Ok(SlotState {
-            sampling,
+            sampling: sampling.clone(),
             eos,
             cache,
             sampler,
@@ -1391,6 +1754,8 @@ fn admit_request(
             grammar,
             stop_strings,
             stop_buf: String::new(),
+            skip_emit,
+            emitted_to_client: skip_emit,
         });
     }
 
@@ -1418,11 +1783,11 @@ fn admit_request(
     let next_pos = tokens_prefilled;
     let sampler = Sampler::new(sampling.clone());
     // P9 feature parity: grammar + string stops per slot.
-    let grammar = build_paged_grammar(&ctx.model, ctx.tokenizer.as_ref(), &sampling);
+    let grammar = build_paged_grammar(&ctx.model, ctx.tokenizer.as_ref(), sampling);
     let stop_strings = sampling.stop.clone();
     let history: Vec<u32> = prompt_u32;
     Ok(SlotState {
-        sampling,
+        sampling: sampling.clone(),
         eos,
         cache,
         sampler,
@@ -1439,6 +1804,8 @@ fn admit_request(
         grammar,
         stop_strings,
         stop_buf: String::new(),
+        skip_emit,
+        emitted_to_client: skip_emit,
     })
 }
 
@@ -1720,18 +2087,30 @@ fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
                         .any(|s| !s.is_empty() && buf.contains(s.as_str()))
                 };
 
-                let text = match &ctx.tokenizer {
-                    Some(tok) => tok.decode(&[next_tok], false).unwrap_or_default(),
-                    None => String::new(),
-                };
-                let token = Token {
-                    id: next_tok,
-                    text,
-                    logprobs: None,
-                };
-                if slot.response_tx.blocking_send(Ok(token)).is_err() {
-                    slot.state.done = true;
-                    continue;
+                // F5 recompute-preemption replay: a resumed slot regenerates
+                // its already-streamed tokens bit-for-bit (deterministic greedy
+                // / seeded forward) but must NOT re-stream them — suppress the
+                // send while `skip_emit` counts down. State (history, next_pos,
+                // sampler, grammar, stop_buf) is advanced identically either
+                // way, so once `skip_emit` hits 0 the stream continues exactly
+                // where the uninterrupted run left off (byte-identical output).
+                if slot.state.skip_emit > 0 {
+                    slot.state.skip_emit -= 1;
+                } else {
+                    let text = match &ctx.tokenizer {
+                        Some(tok) => tok.decode(&[next_tok], false).unwrap_or_default(),
+                        None => String::new(),
+                    };
+                    let token = Token {
+                        id: next_tok,
+                        text,
+                        logprobs: None,
+                    };
+                    if slot.response_tx.blocking_send(Ok(token)).is_err() {
+                        slot.state.done = true;
+                        continue;
+                    }
+                    slot.state.emitted_to_client += 1;
                 }
                 let hit_max = slot.state.n_emitted >= slot.state.sampling.max_tokens;
                 let hit_eos = slot
@@ -1821,5 +2200,107 @@ mod tests {
             gguf_has_vision_indicator(&clip_gguf),
             "clip mmproj GGUF must trip the F6-A VLM guard"
         );
+    }
+
+    // ============================================================
+    // P14: priority-ordered admission + deadline enforcement
+    // ============================================================
+
+    /// Build a throwaway `PendingReq` with a given priority + arrival order.
+    /// The response channel is a live (unused) mpsc sender.
+    fn pending(priority: Priority, arrival_seq: u64) -> PendingEntry {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<EngineResult<Token>>(4);
+        PendingEntry(PendingReq {
+            prompt: vec![1, 2, 3],
+            sampling: SamplingParams::default(),
+            response_tx: tx,
+            priority,
+            deadline: None,
+            cancel_flag: None,
+            arrival_seq,
+            skip_emit: 0,
+        })
+    }
+
+    /// P14 admit order: the driver pops the HIGHEST-priority waiter first,
+    /// regardless of arrival order — so a high-priority request admits before a
+    /// low-priority one that was queued earlier. This is the core of P14: the
+    /// `X-RustLlama-Priority` value drives real admission order, not FIFO.
+    #[test]
+    fn pending_heap_pops_highest_priority_first() {
+        let mut heap: BinaryHeap<PendingEntry> = BinaryHeap::new();
+        // Queue LOW first (arrival 0), then HIGH (arrival 1), then DEFAULT (2).
+        heap.push(pending(Priority::LOW, 0));
+        heap.push(pending(Priority::HIGH, 1));
+        heap.push(pending(Priority::DEFAULT, 2));
+        // Even though LOW arrived first, HIGH pops first, then DEFAULT, then LOW.
+        assert_eq!(heap.pop().unwrap().0.priority, Priority::HIGH);
+        assert_eq!(heap.pop().unwrap().0.priority, Priority::DEFAULT);
+        assert_eq!(heap.pop().unwrap().0.priority, Priority::LOW);
+        assert!(heap.pop().is_none());
+    }
+
+    /// P14 FIFO tiebreak: within one priority level, the OLDER arrival_seq pops
+    /// first — equal-priority requests keep strict arrival order.
+    #[test]
+    fn pending_heap_is_fifo_within_equal_priority() {
+        let mut heap: BinaryHeap<PendingEntry> = BinaryHeap::new();
+        // Push newest-first to prove ordering isn't just insertion order.
+        heap.push(pending(Priority::DEFAULT, 2));
+        heap.push(pending(Priority::DEFAULT, 0));
+        heap.push(pending(Priority::DEFAULT, 1));
+        assert_eq!(heap.pop().unwrap().0.arrival_seq, 0);
+        assert_eq!(heap.pop().unwrap().0.arrival_seq, 1);
+        assert_eq!(heap.pop().unwrap().0.arrival_seq, 2);
+    }
+
+    /// P14 mixed: higher priority always wins; FIFO only breaks ties.
+    #[test]
+    fn pending_heap_priority_then_fifo() {
+        let mut heap: BinaryHeap<PendingEntry> = BinaryHeap::new();
+        heap.push(pending(Priority::DEFAULT, 0)); // older default
+        heap.push(pending(Priority::DEFAULT, 1)); // newer default
+        heap.push(pending(Priority::HIGH, 2)); // newest but highest
+        let a = heap.pop().unwrap().0;
+        assert_eq!(a.priority, Priority::HIGH, "highest priority first");
+        assert_eq!(heap.pop().unwrap().0.arrival_seq, 0, "then oldest default");
+        assert_eq!(heap.pop().unwrap().0.arrival_seq, 1, "then newer default");
+    }
+
+    /// P14 deadline: `fire_deadline_timeout` flips the request's cancel flag
+    /// (the `CancelGuard.flag` mechanism) AND emits a `DeadlineExceeded`
+    /// terminal so the consumer can report a `"timeout"` finish reason. This is
+    /// exactly what the driver does when a request passes its deadline. Run as
+    /// a plain `#[test]` (NOT `#[tokio::test]`) because `fire_deadline_timeout`
+    /// uses `blocking_send` — valid on the driver's std thread, but a panic if
+    /// called from inside a tokio runtime. The end-to-end driver path is
+    /// covered by `paged_batch_deadline_cancels_with_timeout_and_flips_flag`.
+    #[test]
+    fn deadline_timeout_flips_flag_and_emits_terminal() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<EngineResult<Token>>(4);
+        let flag = Arc::new(AtomicBool::new(false));
+        fire_deadline_timeout(&tx, &Some(flag.clone()));
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Acquire),
+            "deadline must flip the cancel flag"
+        );
+        let item = rx.blocking_recv().expect("terminal item");
+        assert!(
+            matches!(item, Err(EngineError::DeadlineExceeded)),
+            "deadline terminal must be EngineError::DeadlineExceeded (the timeout reason)"
+        );
+    }
+
+    /// `deadline_expired` is the per-request timeout predicate: past deadlines
+    /// fire, future deadlines + `None` do not.
+    #[test]
+    fn deadline_expired_predicate() {
+        assert!(!deadline_expired(None));
+        assert!(deadline_expired(Some(
+            Instant::now() - std::time::Duration::from_millis(1)
+        )));
+        assert!(!deadline_expired(Some(
+            Instant::now() + std::time::Duration::from_secs(60)
+        )));
     }
 }

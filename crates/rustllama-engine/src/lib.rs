@@ -253,6 +253,34 @@ fn default_dynatemp_exponent() -> f32 {
     1.0
 }
 
+/// P14: per-request scheduling options for the continuous-batching
+/// (`PagedBatchEngine`) admission path. Carries the request's admission
+/// **priority** (higher runs sooner when the driver's waiting queue is
+/// contended) and an optional per-request **deadline** (an absolute
+/// [`std::time::Instant`]; when it elapses the driver flips the request's
+/// cancel flag so the slot ends cleanly with a `DeadlineExceeded` terminal).
+///
+/// Consumed by [`crate::paged_batch::PagedBatchEngine::submit_streaming_with_opts`].
+/// Defaults are behaviour-preserving: `Priority::DEFAULT`, no deadline, no
+/// cancel flag — a request submitted with [`Self::default`] admits in FIFO
+/// arrival order exactly as before this feature landed, which is what the
+/// plain `submit_streaming` / `Engine::{chat,generate}` path passes.
+#[derive(Clone, Default)]
+pub struct SubmitOpts {
+    /// Admission priority. Higher admits sooner from the driver's waiting
+    /// heap; ties break FIFO by arrival order. Defaults to
+    /// `Priority::DEFAULT`.
+    pub priority: crate::batch_scheduler::Priority,
+    /// Optional absolute deadline. When `Some(t)` and `Instant::now() >= t`,
+    /// the driver flips [`Self::cancel_flag`] (if set), ends the slot, and
+    /// emits [`EngineError::DeadlineExceeded`] as the stream terminal.
+    pub deadline: Option<std::time::Instant>,
+    /// Optional cancel flag to flip on deadline expiry. The server passes its
+    /// `CancelGuard.flag` here so the existing stream-watch loop observes the
+    /// cancellation and the slot ends via the same mechanism as `/v1/cancel`.
+    pub cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
 /// Grammar kinds the sampler understands. Add new variants here as
 /// new constraints land (regex, code-syntax, …).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -593,6 +621,13 @@ pub enum EngineError {
          vision"
     )]
     VisionNotSupported,
+    /// P14: the request's per-request deadline elapsed before generation
+    /// finished. The scheduler flips the request's cancel flag and ends the
+    /// slot cleanly, emitting this as the terminal stream item so the caller
+    /// can report a `"timeout"` finish reason (distinct from a user-initiated
+    /// `/v1/cancel`, which just drops the stream).
+    #[error("request deadline exceeded")]
+    DeadlineExceeded,
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;

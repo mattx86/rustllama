@@ -31,8 +31,8 @@
 //! layout directly without the gather copy.
 //!
 //! Not in this module:
-//!   - Per-slot page assignment lives in
-//!     [`crate::batch_scheduler::PagedKv::slot_pages`].
+//!   - Per-slot page assignment lives in each request's
+//!     [`crate::paged_kv_cache::PagedKvCache`] (its `pages` list).
 //!   - Quantized KV (Q8_0, TurboQuant, NVFP4) variants — once the
 //!     F32 path is end-to-end we'll add `PagedKvStoreQ8_0` etc.
 //!     mirroring the existing `KvLayer` variants.
@@ -241,7 +241,7 @@ impl PagedKvStore {
     /// Returns `Some(())` on success, `None` if `pos` exceeds the
     /// slot's allocated capacity or any input length is wrong. The
     /// caller is expected to have already called
-    /// [`crate::batch_scheduler::PagedKv::grow_slot`] to ensure the
+    /// [`crate::paged_kv_cache::PagedKvCache::ensure_capacity`] to ensure the
     /// page exists before invoking.
     pub fn write_token(
         &mut self,

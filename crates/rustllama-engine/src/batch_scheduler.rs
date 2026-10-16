@@ -1,41 +1,25 @@
-//! Continuous-batching scheduler scaffold.
+//! Request-admission scheduler + slot/priority bookkeeping.
 //!
-//! This module exists to lock in the API surface that the full
-//! continuous-batching implementation needs, before the implementation
-//! itself lands. The current shipped engine path is single-flight:
-//! one in-flight generation at a time per model, gated by a
-//! `Semaphore(1)` at the server layer. That gate works but caps
-//! throughput at 1 request × tokens/sec.
+//! The server layer gates per-model concurrency with a `Semaphore` and tracks
+//! admission through a [`Scheduler`]: [`SingleFlightScheduler`] (the default —
+//! one in-flight generation per model) and [`MultiFlightScheduler`] (capacity
+//! `concurrency`). These run OVER the engine; the actual fused continuous-
+//! batching driver lives in [`crate::paged_batch`] (the `PagedBatchEngine`),
+//! which owns its own priority-ordered admission heap + F5 recompute
+//! preemption (P14). The shared pieces here are:
 //!
-//! The data structures here describe how a future implementation
-//! would coexist with the existing engine:
+//! - [`SlotPool`] tracks N independent in-flight generations with a
+//!   priority-ordered waiting queue (FIFO within a priority level).
+//! - [`Priority`] — the admission priority carried on every request (the HTTP
+//!   `X-RustLlama-Priority` header), consumed by both the `SlotPool` waiting
+//!   queue and the `PagedBatchEngine` driver's heap.
+//! - [`PageTable`] owns a free-list of fixed-size KV pages (re-exported from
+//!   `rustllama-models`).
+//! - [`Scheduler`] is the server-side admission interface.
 //!
-//! - [`SlotPool`] tracks N independent in-flight generations.
-//! - [`PageTable`] owns a free-list of fixed-size KV pages and
-//!   maintains a page-per-slot mapping.
-//! - [`Scheduler`] is the dispatch loop interface. The shipped
-//!   implementation, [`SingleFlightScheduler`], serializes — same
-//!   behavior as the live server. The future
-//!   `ContinuousBatchingScheduler` will admit multiple slots and
-//!   issue fused forward passes via a paged-attention kernel.
-//!
-//! Why land the scaffold now? It pins the API so:
-//!   1. The server's `ServingModel` / `try_acquire` flow can target
-//!      `Scheduler::admit` instead of the raw semaphore once we
-//!      flip the switch — no callsite churn.
-//!   2. The KV-cache module knows what page geometry to plan for.
-//!   3. Test fixtures can already exercise the slot lifecycle so
-//!      we catch regressions when the real scheduler lands.
-//!
-//! What's NOT in this commit:
-//!   - The paged-attention kernel itself (needs SYCL + CPU paths).
-//!   - The fused decode step that advances multiple slots in one
-//!     forward pass.
-//!   - Spec/sequence dependencies between slots (e.g., parent ↔
-//!     sibling for speculative decoding's reject-and-continue).
-//!
-//! All of those swap in behind the `Scheduler` trait without
-//! touching the slot/page bookkeeping below.
+//! (The earlier `ContinuousBatchingScheduler` / `PagedKv` scaffolds were
+//! retired once the real driver — `PagedBatchEngine` + its paged KV store —
+//! landed; nothing consumed them.)
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -525,183 +509,6 @@ impl Scheduler for MultiFlightScheduler {
 /// layer uses to swap implementations without rebuilds.
 pub type SharedScheduler = Arc<dyn Scheduler>;
 
-/// Paged KV cache layout — the storage shape continuous batching
-/// will use once the fused forward pass lands. Each slot owns a list
-/// of `PageId`s from a shared [`PageTable`]; the page is the
-/// allocation unit, sized to a fixed number of token positions.
-///
-/// Currently a **scaffold**: shape + bookkeeping only. The actual
-/// per-page K/V byte storage and the kernel that reads across page
-/// boundaries during attention land in the dedicated paged-attention
-/// follow-up. Sticking the scaffold here lets the server's
-/// admission path target it (via [`ContinuousBatchingScheduler`])
-/// without churn when the storage materializes.
-#[derive(Debug)]
-pub struct PagedKv {
-    /// Free-list-backed page allocator. Pages are returned to the
-    /// free list when their owning slot completes.
-    pub pages: PageTable,
-    /// Per-slot page assignment. Slot index → list of pages assigned
-    /// to that slot, in order. Length matches the scheduler's slot
-    /// pool capacity.
-    pub slot_pages: Vec<Vec<PageId>>,
-    /// Number of K/V layers in the model. Each page entry covers
-    /// `page_size` token positions across `n_layers` (the byte
-    /// storage layout multiplies in the layer count). Pinned here so
-    /// page-cost accounting doesn't have to thread `n_layers` through
-    /// every call site.
-    pub n_layers: u32,
-}
-
-impl PagedKv {
-    pub fn new(total_pages: u32, page_size: u32, n_layers: u32, slot_capacity: usize) -> Self {
-        Self {
-            pages: PageTable::new(total_pages, page_size),
-            slot_pages: vec![Vec::new(); slot_capacity],
-            n_layers,
-        }
-    }
-
-    /// Allocate enough pages to cover `n_tokens` additional positions
-    /// for the slot at index `slot_idx`. Returns `Ok(())` on success
-    /// or `Err(needed)` if the page pool is short. On failure no
-    /// pages are allocated (the partial-success scenario would
-    /// require a rollback path that's not worth the complexity at
-    /// scaffold stage).
-    pub fn grow_slot(&mut self, slot_idx: usize, n_tokens: u32) -> Result<(), usize> {
-        let already = self.slot_pages[slot_idx]
-            .len()
-            .saturating_mul(self.pages.page_size() as usize) as u32;
-        let want_total = already + n_tokens;
-        let pages_needed = want_total.div_ceil(self.pages.page_size()) as usize;
-        let have = self.slot_pages[slot_idx].len();
-        if pages_needed <= have {
-            return Ok(());
-        }
-        let new_pages = pages_needed - have;
-        match self.pages.alloc(new_pages) {
-            Some(pages) => {
-                self.slot_pages[slot_idx].extend(pages);
-                Ok(())
-            }
-            None => Err(new_pages.saturating_sub(self.pages.free_count())),
-        }
-    }
-
-    /// Release every page held by `slot_idx` back to the free list
-    /// and clear the slot's assignment. Idempotent: a re-released
-    /// slot is a no-op.
-    pub fn release_slot(&mut self, slot_idx: usize) {
-        let pages = std::mem::take(&mut self.slot_pages[slot_idx]);
-        self.pages.free(&pages);
-    }
-
-    /// How many token positions the slot can currently hold across
-    /// its allocated pages. Drives the "do I need to allocate more?"
-    /// check at scheduler-step boundaries.
-    pub fn slot_capacity_tokens(&self, slot_idx: usize) -> u32 {
-        self.slot_pages[slot_idx].len() as u32 * self.pages.page_size()
-    }
-}
-
-/// Continuous-batching scheduler. Admits up to `capacity` concurrent
-/// slots and reports every active slot in `Decoding` state on each
-/// `step()`, so the engine can issue a single fused forward pass
-/// that advances every admitted slot by one token. Identical
-/// admission semantics to [`MultiFlightScheduler`]; the real
-/// difference is the consumer — a fused-forward engine, not N
-/// independent generation loops.
-///
-/// Scaffold-stage today: the actual fused forward kernel doesn't
-/// exist yet. Wiring this scheduler into [`crate::inference::CpuEngine`]
-/// requires the paged-attention SIMD work that ships in a follow-up.
-/// The structures are here so server admission can target it without
-/// churn at switchover time.
-pub struct ContinuousBatchingScheduler {
-    inner: std::sync::Mutex<ContinuousBatchingState>,
-    id_gen: RequestIdGen,
-}
-
-struct ContinuousBatchingState {
-    pool: SlotPool,
-    paged_kv: PagedKv,
-}
-
-impl ContinuousBatchingScheduler {
-    /// Build a continuous-batching scheduler with `slot_capacity`
-    /// concurrent slots and a paged KV cache sized to
-    /// `total_pages × page_size × n_layers` token positions.
-    pub fn new(
-        slot_capacity: usize,
-        total_pages: u32,
-        page_size: u32,
-        n_layers: u32,
-    ) -> Self {
-        let slot_capacity = slot_capacity.max(1);
-        Self {
-            inner: std::sync::Mutex::new(ContinuousBatchingState {
-                pool: SlotPool::new(slot_capacity),
-                paged_kv: PagedKv::new(total_pages, page_size, n_layers, slot_capacity),
-            }),
-            id_gen: RequestIdGen::default(),
-        }
-    }
-
-    /// Snapshot of the paged KV's free-page count. Exposed for the
-    /// `/v1/metrics` endpoint + GUI Status page.
-    pub fn free_pages(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("scheduler lock")
-            .paged_kv
-            .pages
-            .free_count()
-    }
-}
-
-impl Scheduler for ContinuousBatchingScheduler {
-    fn admit(&self, mut slot: Slot) -> RequestId {
-        let id = self.id_gen.next();
-        slot.request_id = id;
-        let mut g = self.inner.lock().expect("scheduler lock");
-        g.pool.admit(slot);
-        id
-    }
-
-    fn step(&self) -> SchedulerStep {
-        let g = self.inner.lock().expect("scheduler lock");
-        let decode_ids: Vec<RequestId> = g
-            .pool
-            .active()
-            .filter(|s| matches!(s.state, SlotState::Decoding))
-            .map(|s| s.request_id)
-            .collect();
-        SchedulerStep {
-            decode_ids,
-            completed_ids: Vec::new(),
-        }
-    }
-
-    fn complete(&self, id: RequestId) {
-        let mut g = self.inner.lock().expect("scheduler lock");
-        // Look up the slot index BEFORE we tell the pool to complete
-        // (which removes the slot). The paged KV then releases the
-        // pages associated with that index back to the free list.
-        if let Some(idx) = g.pool.index_of(id) {
-            g.paged_kv.release_slot(idx);
-        }
-        g.pool.complete(id);
-    }
-
-    fn pending(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("scheduler lock")
-            .pool
-            .pending()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,58 +647,9 @@ mod tests {
     }
 
     #[test]
-    fn paged_kv_grow_and_release_round_trips_pages() {
-        // 4-page pool, 16 tokens per page, 32 layers, 2 slots.
-        // Grow each slot to hold 24 tokens (= 2 pages each) → 4
-        // pages allocated total → free count goes from 4 → 0. Then
-        // release one slot → 2 pages freed.
-        let mut paged = PagedKv::new(4, 16, 32, 2);
-        assert_eq!(paged.pages.free_count(), 4);
-        paged.grow_slot(0, 24).expect("alloc slot 0");
-        assert_eq!(paged.pages.free_count(), 2);
-        paged.grow_slot(1, 24).expect("alloc slot 1");
-        assert_eq!(paged.pages.free_count(), 0);
-        assert_eq!(paged.slot_capacity_tokens(0), 32);
-        assert_eq!(paged.slot_capacity_tokens(1), 32);
-
-        paged.release_slot(0);
-        assert_eq!(paged.pages.free_count(), 2);
-        assert_eq!(paged.slot_capacity_tokens(0), 0);
-        assert_eq!(paged.slot_capacity_tokens(1), 32);
-    }
-
-    #[test]
-    fn paged_kv_grow_returns_err_when_pool_short() {
-        // 2-page pool, 16 tokens per page. Asking for 64 tokens (= 4
-        // pages) on a fresh slot can't fit; the grow_slot signals the
-        // shortfall and leaves the pool intact.
-        let mut paged = PagedKv::new(2, 16, 32, 1);
-        let r = paged.grow_slot(0, 64);
-        assert!(r.is_err(), "should report insufficient pages");
-        assert_eq!(paged.pages.free_count(), 2, "no pages should be consumed");
-        assert_eq!(paged.slot_pages[0].len(), 0);
-    }
-
-    #[test]
-    fn continuous_batching_admit_step_complete_round_trips() {
-        let s = ContinuousBatchingScheduler::new(3, 8, 16, 32);
-        let a = s.admit(slot(RequestId(0), SlotState::Decoding));
-        let b = s.admit(slot(RequestId(0), SlotState::Decoding));
-        let c = s.admit(slot(RequestId(0), SlotState::Decoding));
-        // 3 active slots, 8 free pages, step plans all three.
-        assert_eq!(s.pending(), 3);
-        assert_eq!(s.free_pages(), 8);
-        assert_eq!(s.step().decode_ids.len(), 3);
-        s.complete(a);
-        s.complete(b);
-        s.complete(c);
-        assert_eq!(s.pending(), 0);
-    }
-
-    #[test]
     fn slot_pool_index_of_returns_slot_position() {
-        // SlotPool::index_of is the bridge between the SlotPool and
-        // the PagedKv's slot-indexed page lists. Pin that:
+        // SlotPool::index_of maps a request id → its slot index (used by
+        // paged scheduling to release a slot's pages on completion). Pin that:
         //   - admitting a slot to slot index 0 → index_of returns 0
         //   - admitting another to index 1 → index_of returns 1
         //   - completing slot 0 → index_of returns None
