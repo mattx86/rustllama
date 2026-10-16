@@ -123,17 +123,17 @@ struct Evictor {
 }
 
 impl Evictor {
-    /// Parse the eviction env vars once. Returns `None` (the default,
-    /// unbounded cache) unless a budget is set.
+    /// Resolve the eviction policy from the runtime config cells. Returns `None`
+    /// (the default, unbounded cache) unless a budget is set.
+    ///
+    /// P16: the three `RUSTLLAMA_KV_*` env vars are now `[inference]` config keys
+    /// (`kv_sliding_window` / `kv_heavy_hitter` / `kv_heavy_sink`) surfaced
+    /// through the `accel` cells, which still initialize from the legacy env var
+    /// on first read (so env continues to work as an override, env wins). The
+    /// value semantics are unchanged from the old direct env parse.
     fn from_env() -> Option<Evictor> {
-        let sliding = std::env::var("RUSTLLAMA_KV_SLIDING_WINDOW")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .filter(|&n| n > 0);
-        let heavy = std::env::var("RUSTLLAMA_KV_HEAVY_HITTER")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .filter(|&n| n > 0);
+        let sliding = crate::accel::kv_sliding_window();
+        let heavy = crate::accel::kv_heavy_hitter();
         let policy = match (sliding, heavy) {
             // Heavy-hitter wins when both are set; sliding bounds `keep`.
             (bound, Some(keep)) => {
@@ -141,10 +141,7 @@ impl Evictor {
                     Some(w) => keep.min(w),
                     None => keep,
                 };
-                let sink = std::env::var("RUSTLLAMA_KV_HEAVY_SINK")
-                    .ok()
-                    .and_then(|v| v.trim().parse::<u32>().ok())
-                    .unwrap_or(DEFAULT_HEAVY_SINK_TOKENS);
+                let sink = crate::accel::kv_heavy_sink().unwrap_or(DEFAULT_HEAVY_SINK_TOKENS);
                 EvictPolicy::HeavyHitter { keep, sink }
             }
             (Some(window), None) => EvictPolicy::SlidingWindow { window },

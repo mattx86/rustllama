@@ -7495,13 +7495,84 @@ pub struct SyclSharedBuffer<'s, T: Copy> {
     locked_bytes: usize,
 }
 
+/// P16: the USM-lock gate + budget are now settable `[inference]` config keys
+/// (`lock_usm` / `lock_usm_mb`), not bare env reads. The cells INITIALIZE from
+/// `RUSTLLAMA_LOCK_USM` / `RUSTLLAMA_LOCK_USM_MB` on first read (so a user-set
+/// env var — the back-compat override — still wins on a bare load), defaulting
+/// to off / 1024 MB. The serve/HTTP load (via `LoadOptions`) stores the resolved
+/// config value with [`set_lock_usm`] / [`set_lock_usm_mb`]; env-overrides-win
+/// is resolved in `LoadOptions::from_input`. Cross-platform so `accel` can call
+/// the setters unconditionally; only the Windows `usm_pin` path reads them.
+#[allow(dead_code)]
+mod lock_usm_cfg {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    use std::sync::OnceLock;
+
+    fn enabled_cell() -> &'static AtomicU8 {
+        static C: OnceLock<AtomicU8> = OnceLock::new();
+        C.get_or_init(|| {
+            AtomicU8::new(
+                if std::env::var("RUSTLLAMA_LOCK_USM")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+                {
+                    1
+                } else {
+                    0
+                },
+            )
+        })
+    }
+
+    fn budget_mb_cell() -> &'static AtomicU64 {
+        static C: OnceLock<AtomicU64> = OnceLock::new();
+        C.get_or_init(|| {
+            AtomicU64::new(
+                std::env::var("RUSTLLAMA_LOCK_USM_MB")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(1024),
+            )
+        })
+    }
+
+    pub(crate) fn enabled() -> bool {
+        enabled_cell().load(Ordering::Relaxed) != 0
+    }
+
+    pub(crate) fn budget_bytes() -> u64 {
+        budget_mb_cell()
+            .load(Ordering::Relaxed)
+            .saturating_mul(1024 * 1024)
+    }
+
+    pub(crate) fn set_enabled(on: bool) {
+        enabled_cell().store(if on { 1 } else { 0 }, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_budget_mb(mb: u64) {
+        budget_mb_cell().store(mb, Ordering::Relaxed);
+    }
+}
+
+/// P16: enable/disable Windows USM pinning (`[inference].lock_usm`). A process
+/// that never calls this keeps the `RUSTLLAMA_LOCK_USM` env value / off default,
+/// so behavior stays byte-identical. No-op effect off Windows (no pin path).
+pub fn set_lock_usm(on: bool) {
+    lock_usm_cfg::set_enabled(on);
+}
+
+/// P16: set the Windows USM-pin budget in MB (`[inference].lock_usm_mb`).
+pub fn set_lock_usm_mb(mb: u64) {
+    lock_usm_cfg::set_budget_mb(mb);
+}
+
 /// Windows USM-pinning gate + budget for [`SyclSharedBuffer::pin`].
-/// `RUSTLLAMA_LOCK_USM=1` enables; `RUSTLLAMA_LOCK_USM_MB` (default
-/// 1024) caps total pinned USM bytes across the process.
+/// Gated by [`lock_usm_cfg`] (`lock_usm` config key / `RUSTLLAMA_LOCK_USM`;
+/// `lock_usm_mb` / `RUSTLLAMA_LOCK_USM_MB`, default 1024 MB).
 #[cfg(windows)]
 mod usm_pin {
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
 
     extern "system" {
         fn VirtualLock(addr: *const core::ffi::c_void, size: usize) -> i32;
@@ -7509,23 +7580,11 @@ mod usm_pin {
     }
 
     fn enabled() -> bool {
-        static CELL: OnceLock<bool> = OnceLock::new();
-        *CELL.get_or_init(|| {
-            std::env::var("RUSTLLAMA_LOCK_USM")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false)
-        })
+        super::lock_usm_cfg::enabled()
     }
 
     fn budget_bytes() -> u64 {
-        static CELL: OnceLock<u64> = OnceLock::new();
-        *CELL.get_or_init(|| {
-            std::env::var("RUSTLLAMA_LOCK_USM_MB")
-                .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .unwrap_or(1024)
-                .saturating_mul(1024 * 1024)
-        })
+        super::lock_usm_cfg::budget_bytes()
     }
 
     static PINNED: AtomicU64 = AtomicU64::new(0);

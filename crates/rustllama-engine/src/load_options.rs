@@ -52,6 +52,25 @@ pub struct LoadOptionsInput {
     /// Already resolved from the tuner cache by the caller (permille).
     pub moe_gpu_split_permille: u32,
     pub hybrid_kv_any: bool,
+    // --- P16 autotune axes (already resolved from the tuner cache by the
+    // caller; `None` = no winner ⇒ keep the kernel's historical default). ---
+    /// Parallel-matvec crossover (M rows).
+    pub parallel_matvec_crossover: Option<u32>,
+    /// GPU-vs-CPU matvec FLOP crossover.
+    pub matvec_min_flops: Option<u64>,
+    /// DeltaNet prefill chunk length.
+    pub ssm_chunk: Option<u32>,
+    // --- P16 config keys (from `[inference]`; `None`/default = off). ---
+    /// Paged-KV sliding-window retention (token positions); `None` = off.
+    pub kv_sliding_window: Option<u32>,
+    /// Paged-KV heavy-hitter recent-keep (token positions); `None` = off.
+    pub kv_heavy_hitter: Option<u32>,
+    /// Paged-KV heavy-hitter sink block size (default 4).
+    pub kv_heavy_sink: u32,
+    /// VirtualLock SYCL USM into the working set (Windows).
+    pub lock_usm: bool,
+    /// USM-pin budget cap (MB).
+    pub lock_usm_mb: u64,
 }
 
 /// Typed, env-wins-resolved snapshot of the config-mirroring feature/sizing
@@ -71,6 +90,16 @@ pub struct LoadOptions {
     pub moe_experts_cpu: bool,
     pub moe_gpu_split_permille: u32,
     pub hybrid_kv_any: bool,
+    /// P16 autotune axes (`None` = keep the kernel default — byte-identical).
+    pub parallel_matvec_crossover: Option<u32>,
+    pub matvec_min_flops: Option<u64>,
+    pub ssm_chunk: Option<u32>,
+    /// P16 config keys.
+    pub kv_sliding_window: Option<u32>,
+    pub kv_heavy_hitter: Option<u32>,
+    pub kv_heavy_sink: u32,
+    pub lock_usm: bool,
+    pub lock_usm_mb: u64,
 }
 
 /// `true` when `RUSTLLAMA_<name>` is set to a truthy value (non-empty, not
@@ -143,6 +172,51 @@ impl LoadOptions {
             .map(|p| p.min(1000))
             .unwrap_or(input.moe_gpu_split_permille.min(1000));
 
+        // P16: autotune axes — env (the legacy per-knob override) wins; else the
+        // caller's cache-resolved winner (`None` ⇒ keep the kernel default).
+        let parallel_matvec_crossover = std::env::var("RUSTLLAMA_PARALLEL_MATVEC_M")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map(Some)
+            .unwrap_or(input.parallel_matvec_crossover);
+        let matvec_min_flops = std::env::var("RUSTLLAMA_MATVEC_MIN_FLOPS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(Some)
+            .unwrap_or(input.matvec_min_flops);
+        let ssm_chunk = std::env::var("RUSTLLAMA_SSM_CHUNK")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&c| c > 0)
+            .map(Some)
+            .unwrap_or(input.ssm_chunk);
+
+        // P16: config keys — env wins, else the typed config value.
+        let kv_sliding_window = std::env::var("RUSTLLAMA_KV_SLIDING_WINDOW")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .map(Some)
+            .unwrap_or(input.kv_sliding_window);
+        let kv_heavy_hitter = std::env::var("RUSTLLAMA_KV_HEAVY_HITTER")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .map(Some)
+            .unwrap_or(input.kv_heavy_hitter);
+        let kv_heavy_sink = std::env::var("RUSTLLAMA_KV_HEAVY_SINK")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(input.kv_heavy_sink);
+        let lock_usm = match std::env::var("RUSTLLAMA_LOCK_USM") {
+            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Err(_) => input.lock_usm,
+        };
+        let lock_usm_mb = std::env::var("RUSTLLAMA_LOCK_USM_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(input.lock_usm_mb);
+
         LoadOptions {
             zerocopy_weights,
             lock_ram_mb,
@@ -155,6 +229,14 @@ impl LoadOptions {
             moe_experts_cpu,
             moe_gpu_split_permille,
             hybrid_kv_any,
+            parallel_matvec_crossover,
+            matvec_min_flops,
+            ssm_chunk,
+            kv_sliding_window,
+            kv_heavy_hitter,
+            kv_heavy_sink,
+            lock_usm,
+            lock_usm_mb,
         }
     }
 
@@ -183,6 +265,24 @@ impl LoadOptions {
         if let Some(v) = &self.memory_budget {
             accel::set_memory_budget_directive(v.clone());
         }
+        // P16 autotune axes: apply a winner only when present; `None` leaves the
+        // kernel's env/historical default untouched (byte-identical).
+        if let Some(m) = self.parallel_matvec_crossover {
+            accel::set_parallel_matvec_crossover(m);
+        }
+        if let Some(f) = self.matvec_min_flops {
+            accel::set_matvec_min_flops(f);
+        }
+        if let Some(c) = self.ssm_chunk {
+            accel::set_ssm_chunk(c);
+        }
+        // P16 config keys: applied unconditionally (resolved from config, env
+        // already folded in above) so a multi-model reload resets them cleanly.
+        accel::set_kv_sliding_window(self.kv_sliding_window);
+        accel::set_kv_heavy_hitter(self.kv_heavy_hitter);
+        accel::set_kv_heavy_sink(Some(self.kv_heavy_sink));
+        accel::set_lock_usm(self.lock_usm);
+        accel::set_lock_usm_mb(self.lock_usm_mb);
     }
 
     /// The `(env_key, value)` pairs a spawned `tune --all` subprocess needs to
@@ -222,6 +322,128 @@ impl LoadOptions {
                 self.moe_expert_cache_mb.to_string(),
             ));
         }
+        // P16: the USM lock + paged-KV evictor affect residency/perf, so a tune
+        // child should measure under the same config-resolved state. The three
+        // swept axes (crossover / min_flops / ssm_chunk) are intentionally
+        // OMITTED — the sweep RE-MEASURES them, so pinning them would defeat it
+        // (mirrors the MoE-placement / hybrid-KV omission above).
+        if self.lock_usm {
+            out.push(("RUSTLLAMA_LOCK_USM", "1".to_string()));
+            out.push(("RUSTLLAMA_LOCK_USM_MB", self.lock_usm_mb.to_string()));
+        }
+        if let Some(n) = self.kv_sliding_window {
+            out.push(("RUSTLLAMA_KV_SLIDING_WINDOW", n.to_string()));
+        }
+        if let Some(n) = self.kv_heavy_hitter {
+            out.push(("RUSTLLAMA_KV_HEAVY_HITTER", n.to_string()));
+            out.push(("RUSTLLAMA_KV_HEAVY_SINK", self.kv_heavy_sink.to_string()));
+        }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The P16-relevant env vars this crate reads in `from_input`. Cleared at the
+    /// top of each test so resolution is deterministic (config/input is the
+    /// source), regardless of the host's environment.
+    const P16_ENVS: &[&str] = &[
+        "RUSTLLAMA_PARALLEL_MATVEC_M",
+        "RUSTLLAMA_MATVEC_MIN_FLOPS",
+        "RUSTLLAMA_SSM_CHUNK",
+        "RUSTLLAMA_KV_SLIDING_WINDOW",
+        "RUSTLLAMA_KV_HEAVY_HITTER",
+        "RUSTLLAMA_KV_HEAVY_SINK",
+        "RUSTLLAMA_LOCK_USM",
+        "RUSTLLAMA_LOCK_USM_MB",
+    ];
+    fn clear_p16_envs() {
+        for k in P16_ENVS {
+            std::env::remove_var(k);
+        }
+    }
+
+    /// P16 resolution, all three scenarios in ONE test so the process-global env
+    /// mutations are serialized (cargo runs `#[test]`s in parallel threads, and
+    /// these knobs read `std::env`, so splitting them would race).
+    ///
+    /// 1. Byte-identical default: an all-default Input (no cached winners, config
+    ///    defaults, no env) resolves the three swept axes to `None` — so
+    ///    `LoadOptions::apply` leaves the kernels at their historical constants.
+    /// 2. A cached winner / config value flows through when no env override.
+    /// 3. Env wins over the config/cache value (back-compat override).
+    #[test]
+    fn p16_resolution_defaults_config_and_env_wins() {
+        // --- (1) defaults → None / off (byte-identical) ---
+        clear_p16_envs();
+        let input = LoadOptionsInput {
+            kv_heavy_sink: 4,
+            lock_usm_mb: 1024,
+            ..LoadOptionsInput::default()
+        };
+        let opts = LoadOptions::from_input(&input);
+        assert_eq!(opts.parallel_matvec_crossover, None);
+        assert_eq!(opts.matvec_min_flops, None);
+        assert_eq!(opts.ssm_chunk, None);
+        assert_eq!(opts.kv_sliding_window, None);
+        assert_eq!(opts.kv_heavy_hitter, None);
+        assert!(!opts.lock_usm);
+        assert_eq!(opts.lock_usm_mb, 1024);
+
+        // --- (2) cached winner / config value flows through (no env) ---
+        clear_p16_envs();
+        let input = LoadOptionsInput {
+            parallel_matvec_crossover: Some(512),
+            matvec_min_flops: Some(1 << 22),
+            ssm_chunk: Some(128),
+            kv_sliding_window: Some(4096),
+            kv_heavy_hitter: Some(1024),
+            kv_heavy_sink: 8,
+            lock_usm: true,
+            lock_usm_mb: 2048,
+            ..LoadOptionsInput::default()
+        };
+        let opts = LoadOptions::from_input(&input);
+        assert_eq!(opts.parallel_matvec_crossover, Some(512));
+        assert_eq!(opts.matvec_min_flops, Some(1 << 22));
+        assert_eq!(opts.ssm_chunk, Some(128));
+        assert_eq!(opts.kv_sliding_window, Some(4096));
+        assert_eq!(opts.kv_heavy_hitter, Some(1024));
+        assert_eq!(opts.kv_heavy_sink, 8);
+        assert!(opts.lock_usm);
+        assert_eq!(opts.lock_usm_mb, 2048);
+
+        // --- (3) env overrides win for every P16 knob ---
+        std::env::set_var("RUSTLLAMA_PARALLEL_MATVEC_M", "64");
+        std::env::set_var("RUSTLLAMA_MATVEC_MIN_FLOPS", "1048576");
+        std::env::set_var("RUSTLLAMA_SSM_CHUNK", "32");
+        std::env::set_var("RUSTLLAMA_KV_SLIDING_WINDOW", "777");
+        std::env::set_var("RUSTLLAMA_KV_HEAVY_HITTER", "555");
+        std::env::set_var("RUSTLLAMA_KV_HEAVY_SINK", "9");
+        std::env::set_var("RUSTLLAMA_LOCK_USM", "1");
+        std::env::set_var("RUSTLLAMA_LOCK_USM_MB", "333");
+        let input = LoadOptionsInput {
+            parallel_matvec_crossover: Some(512),
+            matvec_min_flops: Some(1 << 30),
+            ssm_chunk: Some(256),
+            kv_sliding_window: Some(4096),
+            kv_heavy_hitter: Some(2048),
+            kv_heavy_sink: 4,
+            lock_usm: false,
+            lock_usm_mb: 1024,
+            ..LoadOptionsInput::default()
+        };
+        let opts = LoadOptions::from_input(&input);
+        assert_eq!(opts.parallel_matvec_crossover, Some(64));
+        assert_eq!(opts.matvec_min_flops, Some(1_048_576));
+        assert_eq!(opts.ssm_chunk, Some(32));
+        assert_eq!(opts.kv_sliding_window, Some(777));
+        assert_eq!(opts.kv_heavy_hitter, Some(555));
+        assert_eq!(opts.kv_heavy_sink, 9);
+        assert!(opts.lock_usm);
+        assert_eq!(opts.lock_usm_mb, 333);
+        clear_p16_envs();
     }
 }

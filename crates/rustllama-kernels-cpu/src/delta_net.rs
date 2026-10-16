@@ -1146,20 +1146,48 @@ pub fn delta_net_layer_forward_f32(
 /// intra-chunk work small while still giving rayon enough chunks to spread.
 pub const SSM_CHUNK_DEFAULT: usize = 64;
 
-/// Chunk length for the prefill scan, read once from `RUSTLLAMA_SSM_CHUNK`.
-/// `0`/unset → [`SSM_CHUNK_DEFAULT`]; `1` forces the exact per-token
-/// sequential path. Cached in a `OnceLock` so we don't touch the
-/// environment per SSM layer per prefill. (Plain env→value init — not a
-/// self-referential `OnceLock`.)
-fn ssm_chunk_len() -> usize {
-    static CHUNK: OnceLock<usize> = OnceLock::new();
-    *CHUNK.get_or_init(|| {
-        std::env::var("RUSTLLAMA_SSM_CHUNK")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&c| c > 0)
-            .unwrap_or(SSM_CHUNK_DEFAULT)
+/// P16: the DeltaNet prefill chunk length is now a settable autotune axis
+/// (`tune --ssm-chunk`), not just the on/off toggle `ssm_prefill_chunked`. The
+/// cell INITIALIZES from `RUSTLLAMA_SSM_CHUNK` on first read (`0`/unset →
+/// [`SSM_CHUNK_DEFAULT`]; `1` forces the exact per-token path), so a user-set env
+/// var — the back-compat override — still wins on a bare load. The sweep winner
+/// (and the serve/HTTP load, via `LoadOptions`) store the per-host length with
+/// [`set_ssm_chunk`]; a process that never stores keeps the env/default value, so
+/// the scan is byte-identical to pre-P16.
+fn ssm_chunk_cell() -> &'static std::sync::atomic::AtomicUsize {
+    use std::sync::atomic::AtomicUsize;
+    static CHUNK: OnceLock<AtomicUsize> = OnceLock::new();
+    CHUNK.get_or_init(|| {
+        AtomicUsize::new(
+            std::env::var("RUSTLLAMA_SSM_CHUNK")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .filter(|&c| c > 0)
+                .unwrap_or(SSM_CHUNK_DEFAULT),
+        )
     })
+}
+
+/// Chunk length for the prefill scan. `0`/unset env → [`SSM_CHUNK_DEFAULT`];
+/// `1` forces the exact per-token sequential path. Overridable by the autotuner
+/// / serve load via [`set_ssm_chunk`].
+fn ssm_chunk_len() -> usize {
+    ssm_chunk_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Store the autotuned DeltaNet prefill chunk length. A length of `0` is
+/// normalized to [`SSM_CHUNK_DEFAULT`] (so a stray 0 never disables the scan);
+/// `1` forces the per-token path. Called by the `tune --ssm-chunk` winner + the
+/// engine load path; a process that never calls this keeps the env/default value.
+pub fn set_ssm_chunk(len: usize) {
+    let v = if len == 0 { SSM_CHUNK_DEFAULT } else { len };
+    ssm_chunk_cell().store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the current chunk length (for the autotune sweep's save/restore around
+/// its candidate arms).
+pub fn ssm_chunk_current() -> usize {
+    ssm_chunk_len()
 }
 
 /// Per-chunk operators, all independent of the incoming recurrent state so
@@ -1487,6 +1515,32 @@ pub fn delta_rule_prefill_chunked_with_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P16: the DeltaNet chunk length default is the byte-identical historical
+    /// constant (64), and the setter round-trips so the `tune --ssm-chunk`
+    /// winner / serve load can override it. A `0` normalizes back to the default
+    /// (a stray 0 must never disable the scan). A process that never calls the
+    /// setter keeps the default ⇒ the scan is byte-identical to pre-P16.
+    #[test]
+    fn ssm_chunk_default_and_setter() {
+        assert_eq!(
+            SSM_CHUNK_DEFAULT, 64,
+            "the historical default chunk length must stay 64 for byte-identical scans"
+        );
+        set_ssm_chunk(128);
+        assert_eq!(ssm_chunk_current(), 128);
+        set_ssm_chunk(32);
+        assert_eq!(ssm_chunk_current(), 32);
+        // `1` forces the exact per-token path (a real, distinct length).
+        set_ssm_chunk(1);
+        assert_eq!(ssm_chunk_current(), 1);
+        // `0` normalizes to the default rather than disabling the scan.
+        set_ssm_chunk(0);
+        assert_eq!(ssm_chunk_current(), SSM_CHUNK_DEFAULT);
+        // Restore the default so we don't leak state to sibling tests.
+        set_ssm_chunk(SSM_CHUNK_DEFAULT);
+        assert_eq!(ssm_chunk_current(), 64);
+    }
 
     /// Verify conv1d state-shifting is a true depthwise convolution.
     /// Setup: 2 channels, kernel 3. Feed 4 tokens through; check the

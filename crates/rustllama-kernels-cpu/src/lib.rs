@@ -11237,19 +11237,56 @@ pub fn matvec_f16_w_f32_a(w: &[f16], x: &[f32], out: &mut [f32], m: usize, k: us
     matvec_f16_w_f32_a_serial(w, x, out, m, k);
 }
 
-/// Read the parallel-matvec crossover once per process. Default
-/// `256` is set by the Iris Xe microbench; users on different
-/// hosts override via `RUSTLLAMA_PARALLEL_MATVEC_M`. `0` disables
-/// the parallel path entirely (always serial).
-fn parallel_matvec_crossover() -> usize {
+/// The parallel-matvec crossover (M rows) used when no autotune winner is
+/// cached AND `RUSTLLAMA_PARALLEL_MATVEC_M` is unset — the historical Iris Xe
+/// microbench constant. Keeping this the default means a bare `LlamaModel::load`
+/// / unit test / `doctor` (anything that never applies a tuner winner) dispatches
+/// byte-identically to before P16.
+pub const PARALLEL_MATVEC_CROSSOVER_DEFAULT: usize = 256;
+
+/// P16: the parallel-matvec crossover is now a settable autotune axis. The cell
+/// still INITIALIZES from `RUSTLLAMA_PARALLEL_MATVEC_M` on first read (so a
+/// user-set env var — the back-compat override — wins on a bare load), defaulting
+/// to [`PARALLEL_MATVEC_CROSSOVER_DEFAULT`]. The `tune --parallel-matvec-crossover`
+/// sweep + the serve/HTTP load (via `LoadOptions`) store the per-host winner with
+/// [`set_parallel_matvec_crossover`]; env-overrides-win precedence is resolved in
+/// `LoadOptions::from_input`, so a store only ever carries the already-resolved
+/// value.
+fn parallel_matvec_crossover_cell() -> &'static std::sync::atomic::AtomicUsize {
+    use std::sync::atomic::AtomicUsize;
     use std::sync::OnceLock;
-    static GATE: OnceLock<usize> = OnceLock::new();
-    *GATE.get_or_init(|| {
-        std::env::var("RUSTLLAMA_PARALLEL_MATVEC_M")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(256)
+    static GATE: OnceLock<AtomicUsize> = OnceLock::new();
+    GATE.get_or_init(|| {
+        AtomicUsize::new(
+            std::env::var("RUSTLLAMA_PARALLEL_MATVEC_M")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(PARALLEL_MATVEC_CROSSOVER_DEFAULT),
+        )
     })
+}
+
+/// Read the parallel-matvec crossover. Default
+/// [`PARALLEL_MATVEC_CROSSOVER_DEFAULT`] (256) is set by the Iris Xe microbench;
+/// `0` disables the parallel path entirely (always serial). The autotuner /
+/// serve load can override it via [`set_parallel_matvec_crossover`].
+fn parallel_matvec_crossover() -> usize {
+    parallel_matvec_crossover_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Store the autotuned parallel-matvec crossover (M rows). `0` forces the serial
+/// path always; any positive value is the M-threshold above which a quant/f16
+/// matvec goes rayon-parallel. Called by the `tune` sweep winner + the engine
+/// load path; a process that never calls this keeps the env/default value, so
+/// defaults stay byte-identical.
+pub fn set_parallel_matvec_crossover(m: usize) {
+    parallel_matvec_crossover_cell().store(m, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the current parallel-matvec crossover (for the autotune sweep's
+/// save/restore around its A/B arms).
+pub fn parallel_matvec_crossover_current() -> usize {
+    parallel_matvec_crossover()
 }
 
 /// Widen four f16 bit-patterns (each zero-extended into a `u32` lane) to
@@ -16078,6 +16115,29 @@ unsafe fn gqa_attention_one_step_q8_0_avx2(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P16: the parallel-matvec crossover default is the byte-identical
+    /// historical Iris-Xe constant (256), and the setter round-trips so the
+    /// autotune winner / serve load can override it. A process that never calls
+    /// the setter keeps this default ⇒ the dispatch is byte-identical to pre-P16.
+    #[test]
+    fn parallel_matvec_crossover_default_and_setter() {
+        assert_eq!(
+            PARALLEL_MATVEC_CROSSOVER_DEFAULT, 256,
+            "the historical default must stay 256 for byte-identical dispatch"
+        );
+        // Round-trip a cached winner.
+        set_parallel_matvec_crossover(512);
+        assert_eq!(parallel_matvec_crossover_current(), 512);
+        set_parallel_matvec_crossover(64);
+        assert_eq!(parallel_matvec_crossover_current(), 64);
+        // `0` means "always serial" — stored verbatim (not normalized).
+        set_parallel_matvec_crossover(0);
+        assert_eq!(parallel_matvec_crossover_current(), 0);
+        // Restore the default so we don't leak state to sibling tests.
+        set_parallel_matvec_crossover(PARALLEL_MATVEC_CROSSOVER_DEFAULT);
+        assert_eq!(parallel_matvec_crossover_current(), 256);
+    }
 
     /// Reverse of [`unpack_q4k_scales`] used by the
     /// `rustllama-kernels-sycl` Q4_K_M / Q5_K_M parity tests. The

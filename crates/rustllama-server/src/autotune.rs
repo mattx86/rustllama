@@ -282,6 +282,19 @@ pub fn run_autotune_blocking(
             moe_experts_cpu: false,
             moe_gpu_split_permille: 0,
             hybrid_kv_any: false,
+            // P16: the three numeric perf-knob axes are RE-MEASURED by the sweep,
+            // so they are not pinned on the child (tune_child_env omits them).
+            parallel_matvec_crossover: None,
+            matvec_min_flops: None,
+            ssm_chunk: None,
+            // The USM lock + paged evictor affect residency/perf, so the child
+            // measures under the same config-resolved state (tune_child_env
+            // forwards them).
+            kv_sliding_window: (inf.kv_sliding_window > 0).then_some(inf.kv_sliding_window),
+            kv_heavy_hitter: (inf.kv_heavy_hitter > 0).then_some(inf.kv_heavy_hitter),
+            kv_heavy_sink: inf.kv_heavy_sink,
+            lock_usm: inf.lock_usm,
+            lock_usm_mb: inf.lock_usm_mb,
         });
         for (k, v) in opts.tune_child_env() {
             if std::env::var_os(k).is_none() {

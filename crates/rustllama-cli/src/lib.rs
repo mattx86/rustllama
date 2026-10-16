@@ -510,6 +510,42 @@ pub enum Command {
         /// Repeats per arm for the chunked-SSM-prefill sweep.
         #[arg(long, default_value_t = 3)]
         ssm_prefill_chunked_repeats: u32,
+        /// P16: sweep the CPU parallel-matvec crossover (M rows) — the
+        /// row-count above which a quant/f16 matvec goes rayon-parallel.
+        /// Measures decode tok/s per candidate and persists the winner under
+        /// `parallel_matvec_crossover` (applied on next load when
+        /// `[tuning].auto_apply_perf_knobs = true`). No winner → the historical
+        /// 256 default (byte-identical).
+        #[arg(long)]
+        parallel_matvec_crossover: bool,
+        #[arg(long, default_value = "64,128,256,512,1024")]
+        parallel_matvec_crossover_candidates: String,
+        /// P16: sweep the GPU-vs-CPU matvec FLOP crossover — a matvec below this
+        /// FLOP count stays on CPU. Measures decode tok/s per candidate and
+        /// persists the winner under `matvec_min_flops`. No winner → `0` (no
+        /// threshold — every matvec GPU-eligible, byte-identical).
+        #[arg(long)]
+        matvec_min_flops: bool,
+        #[arg(long, default_value = "0,1048576,4194304,16777216,67108864")]
+        matvec_min_flops_candidates: String,
+        /// P16: sweep the DeltaNet prefill chunk LENGTH (the tuner previously
+        /// only toggled the chunked path on/off). Hybrid models only; measures
+        /// prefill tok/s per candidate and persists the winner under `ssm_chunk`.
+        /// No winner → the historical 64 default (byte-identical).
+        #[arg(long)]
+        ssm_chunk: bool,
+        #[arg(long, default_value = "32,64,128,256")]
+        ssm_chunk_candidates: String,
+        /// Repeats per candidate for the P16 numeric perf-knob sweeps.
+        #[arg(long, default_value_t = 3)]
+        perf_knob_repeats: u32,
+        /// P16: the autotune OBJECTIVE the sweeps rank candidates by —
+        /// `throughput` (default, maximize tok/s) or `watts` (maximize
+        /// tokens-per-joule). NOT a swept value; it selects the mode the sweeps
+        /// optimize against. Overrides `RUSTLLAMA_TUNE_OPTIMIZE_FOR` /
+        /// `[tuning].optimize_for` for this run (and reaches `--all` sub-stages).
+        #[arg(long)]
+        optimize_for: Option<String>,
         /// Decision-calibration (temperature scaling for typed
         /// decisions). Loads the model, fits a calibration temperature
         /// over the labeled decision set, and persists it to the tuner
@@ -1295,6 +1331,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             tree_widths_repeats,
             ssm_prefill_chunked,
             ssm_prefill_chunked_repeats,
+            parallel_matvec_crossover,
+            parallel_matvec_crossover_candidates,
+            matvec_min_flops,
+            matvec_min_flops_candidates,
+            ssm_chunk,
+            ssm_chunk_candidates,
+            perf_knob_repeats,
+            optimize_for,
             decision_calibrate,
             per_device_perf,
             validate_kernels,
@@ -1311,6 +1355,20 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             // representative routing would poison the real-usage sidecar that
             // ranks which experts get promoted to the device tier.
             rustllama_engine::set_synthetic_run(true);
+            // P16: the `--optimize-for` flag selects the autotune objective.
+            // Promote it to the env the measurement + `resolve_optimize_for`
+            // read (and that the `tune --all` subprocess stages inherit), so the
+            // flag wins over config for this whole run. A user-set env is left
+            // alone only when the flag is absent.
+            if let Some(of) = optimize_for.as_deref() {
+                match rustllama_tuner::OptimizeFor::parse(of) {
+                    Some(o) => std::env::set_var("RUSTLLAMA_TUNE_OPTIMIZE_FOR", o.as_str()),
+                    None => anyhow::bail!(
+                        "tune --optimize-for: unrecognized objective {of:?} (expected \
+                         'throughput' or 'watts')"
+                    ),
+                }
+            }
             // `tune --show` just prints the tuner-cache state (the former
             // `tuning show`) and runs no sweep.
             if show {
@@ -1372,6 +1430,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 speculative_mtp,
                 tree_widths,
                 ssm_prefill_chunked,
+                parallel_matvec_crossover,
+                matvec_min_flops,
+                ssm_chunk,
                 decision_calibrate,
                 per_device_perf,
                 validate_kernels,
@@ -1389,7 +1450,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                      --flash-attention / --kv-layout / --flash-kv-min / \
                      --prefix-snapshots / --kv-page-size / --flash-v3-kv-tile / \
                      --moe-placement / --speculative-mtp / --tree-widths / \
-                     --ssm-prefill-chunked / \
+                     --ssm-prefill-chunked / --parallel-matvec-crossover / \
+                     --matvec-min-flops / --ssm-chunk / \
                      --decision-calibrate / --per-device-perf / --validate-kernels / \
                      --dev-attn / --moe-vram-margin / --cacheblend / --all are exclusive; \
                      pick at most one"
@@ -1518,6 +1580,35 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     &config_path,
                     model,
                     ssm_prefill_chunked_repeats,
+                );
+            }
+            if parallel_matvec_crossover {
+                return cmd_tune_parallel_matvec_crossover(
+                    &config_path,
+                    model,
+                    &parallel_matvec_crossover_candidates,
+                    prompt_tokens,
+                    eff_decode_tokens,
+                    perf_knob_repeats,
+                );
+            }
+            if matvec_min_flops {
+                return cmd_tune_matvec_min_flops(
+                    &config_path,
+                    model,
+                    &matvec_min_flops_candidates,
+                    prompt_tokens,
+                    eff_decode_tokens,
+                    perf_knob_repeats,
+                );
+            }
+            if ssm_chunk {
+                return cmd_tune_ssm_chunk(
+                    &config_path,
+                    model,
+                    &ssm_chunk_candidates,
+                    prompt_tokens,
+                    perf_knob_repeats,
                 );
             }
             if decision_calibrate {
@@ -2113,6 +2204,7 @@ fn cmd_tune_moe_placement(
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
     let ctx_size =
         (prompt_tokens as usize + decode_tokens as usize + 8).max(cfg.inference.ctx_size as usize);
@@ -2289,6 +2381,13 @@ fn promote_memory_env_from_config(
         || ssm_prefill_chunked_from_cache_or_default(tuning.auto_apply_ssm_prefill_chunked)
             == Some(true);
 
+    // P16: the three numeric perf-knob winners (host-wide) from the tuner cache,
+    // gated by `[tuning].auto_apply_perf_knobs`. `None` ⇒ the engine keeps the
+    // kernel's historical default (byte-identical). The evictor + USM-lock come
+    // straight from the `[inference]` config keys (env still wins in `from_input`).
+    let (pmc_winner, mmf_winner, ssm_chunk_winner) =
+        perf_knob_winners_from_cache(tuning.auto_apply_perf_knobs);
+
     // Build ONCE, resolve env-overrides-win inside `from_input`, apply to the
     // process-local accel cells (no `set_var`). `hybrid_kv_any` is set
     // separately by the serve load from the coherence-validated kv-dtype
@@ -2305,6 +2404,14 @@ fn promote_memory_env_from_config(
         moe_experts_cpu: experts_cpu,
         moe_gpu_split_permille: gpu_split,
         hybrid_kv_any: false,
+        parallel_matvec_crossover: pmc_winner,
+        matvec_min_flops: mmf_winner,
+        ssm_chunk: ssm_chunk_winner,
+        kv_sliding_window: (inference.kv_sliding_window > 0).then_some(inference.kv_sliding_window),
+        kv_heavy_hitter: (inference.kv_heavy_hitter > 0).then_some(inference.kv_heavy_hitter),
+        kv_heavy_sink: inference.kv_heavy_sink,
+        lock_usm: inference.lock_usm,
+        lock_usm_mb: inference.lock_usm_mb,
     });
     opts.apply();
     if opts.moe_expert_cache_mb > 0 {
@@ -5483,6 +5590,7 @@ fn cmd_tune_threads(
         kv_cache_layout: "paged".to_string(),
         flash_attention: true,
         n_gpu_layers: 0,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
     let prompt_tokens = 32u32;
     let ctx_size = (prompt_tokens as usize + decode_tokens as usize + 8).max(128);
@@ -5555,6 +5663,7 @@ fn measure_end_to_end_tok_s(
         kv_cache_layout: "contiguous".to_string(),
         flash_attention: true,
         n_gpu_layers: u32::MAX,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
     let report = measure_placement_candidates(
         model_path,
@@ -5920,6 +6029,7 @@ pub fn measure_placement_candidates(
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: resolve_optimize_for(cfg),
     };
 
     println!();
@@ -6079,6 +6189,7 @@ fn cmd_tune_per_device_perf(
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
     let ctx_size =
         (prompt_tokens as usize + decode_tokens as usize + 8).max(cfg.inference.ctx_size as usize);
@@ -6281,6 +6392,7 @@ fn cmd_tune_dev_attn(
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
 
     let report =
@@ -6501,6 +6613,7 @@ fn cmd_tune_moe_vram_margin(
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
 
     println!("rustllama tune --moe-vram-margin");
@@ -6613,6 +6726,7 @@ fn cmd_tune_kv_dtype(
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
     let ctx_size =
         (prompt_tokens as usize + decode_tokens as usize + 8).max(cfg.inference.ctx_size as usize);
@@ -6836,6 +6950,7 @@ fn cmd_tune_flash_attention(
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
     let ctx_size =
         (prompt_tokens as usize + decode_tokens as usize + 8).max(cfg.inference.ctx_size as usize);
@@ -6928,6 +7043,7 @@ fn cmd_tune_speculative_mtp(
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
 
     println!("rustllama tune --speculative-mtp");
@@ -6999,6 +7115,7 @@ fn cmd_tune_tree_widths(
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
 
     // Candidate grid: a small, fixed set covering shallow-narrow → deeper/wider
@@ -7112,6 +7229,7 @@ fn cmd_tune_ssm_prefill_chunked(
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
 
     let report = measure_ssm_prefill_chunked(&model_path, &m_cfg, repeats as usize)
@@ -7137,6 +7255,221 @@ fn cmd_tune_ssm_prefill_chunked(
     println!("  → pick: ssm_prefill_chunked = {winner}");
     if let Err(e) = persist_ssm_prefill_chunked_winner(winner) {
         tracing::warn!(error = %e, "failed to persist ssm_prefill_chunked winner");
+    }
+    Ok(())
+}
+
+// ============================================================
+// P16: numeric perf-knob sweep commands.
+// ============================================================
+
+/// Parse a comma-separated numeric candidate list (shared by the P16 sweeps).
+fn parse_u64_candidates(csv: &str, flag: &str) -> anyhow::Result<Vec<u64>> {
+    let v: Vec<u64> = csv
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<u64>())
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("invalid {flag} list: {e}"))?;
+    if v.is_empty() {
+        anyhow::bail!("{flag} produced no values");
+    }
+    Ok(v)
+}
+
+/// Build a `MeasurementConfig` from config + the resolved tune objective.
+fn perf_knob_measurement_cfg(
+    cfg: &rustllama_config::Config,
+) -> anyhow::Result<rustllama_engine::measurement::MeasurementConfig> {
+    let (k, _) = cfg.inference.resolved_kv_dtypes();
+    Ok(rustllama_engine::measurement::MeasurementConfig {
+        kv_dtype: parse_kv_dtype(k)?,
+        kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
+        flash_attention: cfg.inference.flash_attention,
+        n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: resolve_optimize_for(cfg),
+    })
+}
+
+/// Print one numeric perf-knob sweep's candidate table.
+fn print_perf_candidates(candidates: &[rustllama_tuner::PerfCandidate], metric_label: &str) {
+    let fmt = |t: Option<f64>| {
+        t.map(|v| format!("{v:.2} tps")).unwrap_or_else(|| "—".to_string())
+    };
+    let fmt_j = |t: Option<f64>| {
+        t.map(|v| format!("{v:.2} tok/J")).unwrap_or_else(|| "—".to_string())
+    };
+    println!("  {:>12}  {:>14}  {:>14}", "value", metric_label, "energy");
+    for c in candidates {
+        println!(
+            "  {:>12}  {:>14}  {:>14}",
+            c.value,
+            fmt(c.tok_s),
+            fmt_j(c.tokens_per_joule),
+        );
+    }
+}
+
+/// P16: sweep the CPU parallel-matvec crossover. Persists the winner under
+/// `parallel_matvec_crossover`; no measurable winner → nothing persisted (the
+/// engine keeps the 256 default, byte-identical).
+fn cmd_tune_parallel_matvec_crossover(
+    config_path: &std::path::Path,
+    model_override: Option<String>,
+    candidates_csv: &str,
+    prompt_tokens: u32,
+    decode_tokens: u32,
+    repeats: u32,
+) -> anyhow::Result<()> {
+    use rustllama_engine::measurement::measure_parallel_matvec_crossover;
+    let cfg = rustllama_config::load(config_path).unwrap_or_default();
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
+    if repeats == 0 {
+        anyhow::bail!("--perf-knob-repeats must be >= 1");
+    }
+    let candidates = parse_u64_candidates(candidates_csv, "--parallel-matvec-crossover-candidates")?;
+    let m_cfg = perf_knob_measurement_cfg(&cfg)?;
+
+    println!("rustllama tune --parallel-matvec-crossover");
+    println!("  model      = {}", model_path.display());
+    println!("  candidates = {candidates:?}");
+    println!("  objective  = {}", m_cfg.optimize_for.as_str());
+    println!("  repeats    = {repeats} (median per candidate)");
+    println!();
+
+    let report = measure_parallel_matvec_crossover(
+        &model_path,
+        &m_cfg,
+        &candidates,
+        repeats as usize,
+        prompt_tokens,
+        decode_tokens,
+    )
+    .map_err(|e| anyhow::anyhow!("parallel-matvec-crossover measurement failed: {e}"))?;
+    print_perf_candidates(&report.candidates, "decode tps");
+    if let Some(err) = report.error.as_ref() {
+        println!("  note: {err}");
+    }
+    println!();
+    let default = rustllama_kernels_cpu::PARALLEL_MATVEC_CROSSOVER_DEFAULT as u64;
+    match rustllama_tuner::pick_perf_knob(&report.candidates, m_cfg.optimize_for, default) {
+        Some(v) => {
+            println!("  → pick: parallel_matvec_crossover = {v}");
+            if let Err(e) = persist_parallel_matvec_crossover_winner(v as u32) {
+                tracing::warn!(error = %e, "failed to persist parallel_matvec_crossover winner");
+            }
+        }
+        None => println!("  → no measurable winner; keeping default {default} (unchanged)"),
+    }
+    Ok(())
+}
+
+/// P16: sweep the GPU-vs-CPU matvec FLOP crossover. Persists the winner under
+/// `matvec_min_flops`; no winner → the `0` default (byte-identical).
+fn cmd_tune_matvec_min_flops(
+    config_path: &std::path::Path,
+    model_override: Option<String>,
+    candidates_csv: &str,
+    prompt_tokens: u32,
+    decode_tokens: u32,
+    repeats: u32,
+) -> anyhow::Result<()> {
+    use rustllama_engine::measurement::measure_matvec_min_flops;
+    let cfg = rustllama_config::load(config_path).unwrap_or_default();
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
+    if repeats == 0 {
+        anyhow::bail!("--perf-knob-repeats must be >= 1");
+    }
+    let candidates = parse_u64_candidates(candidates_csv, "--matvec-min-flops-candidates")?;
+    let m_cfg = perf_knob_measurement_cfg(&cfg)?;
+
+    println!("rustllama tune --matvec-min-flops");
+    println!("  model      = {}", model_path.display());
+    println!("  candidates = {candidates:?}");
+    println!("  objective  = {}", m_cfg.optimize_for.as_str());
+    println!("  repeats    = {repeats} (median per candidate)");
+    println!();
+
+    let report = measure_matvec_min_flops(
+        &model_path,
+        &m_cfg,
+        &candidates,
+        repeats as usize,
+        prompt_tokens,
+        decode_tokens,
+    )
+    .map_err(|e| anyhow::anyhow!("matvec-min-flops measurement failed: {e}"))?;
+    print_perf_candidates(&report.candidates, "decode tps");
+    if let Some(err) = report.error.as_ref() {
+        println!("  note: {err}");
+    }
+    println!();
+    // Historical default (accel::MATVEC_MIN_FLOPS_DEFAULT): 0 = no threshold,
+    // every matvec GPU-eligible. The CLI doesn't link rustllama-models, so the
+    // value is mirrored here (a dead-heat tie-break keeps it → byte-identical).
+    let default = 0u64;
+    match rustllama_tuner::pick_perf_knob(&report.candidates, m_cfg.optimize_for, default) {
+        Some(v) => {
+            println!("  → pick: matvec_min_flops = {v}");
+            if let Err(e) = persist_matvec_min_flops_winner(v) {
+                tracing::warn!(error = %e, "failed to persist matvec_min_flops winner");
+            }
+        }
+        None => println!("  → no measurable winner; keeping default {default} (unchanged)"),
+    }
+    Ok(())
+}
+
+/// P16: sweep the DeltaNet prefill chunk length. Hybrid models only; persists
+/// the winner under `ssm_chunk`. No winner / non-hybrid → the 64 default.
+fn cmd_tune_ssm_chunk(
+    config_path: &std::path::Path,
+    model_override: Option<String>,
+    candidates_csv: &str,
+    prompt_tokens: u32,
+    repeats: u32,
+) -> anyhow::Result<()> {
+    use rustllama_engine::measurement::measure_ssm_chunk;
+    let cfg = rustllama_config::load(config_path).unwrap_or_default();
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
+    if repeats == 0 {
+        anyhow::bail!("--perf-knob-repeats must be >= 1");
+    }
+    let candidates = parse_u64_candidates(candidates_csv, "--ssm-chunk-candidates")?;
+    let m_cfg = perf_knob_measurement_cfg(&cfg)?;
+
+    println!("rustllama tune --ssm-chunk");
+    println!("  model      = {}", model_path.display());
+    println!("  candidates = {candidates:?}");
+    println!("  objective  = {}", m_cfg.optimize_for.as_str());
+    println!("  repeats    = {repeats} (median per candidate)");
+    println!();
+
+    // The chunk LENGTH only affects the chunked-parallel SSM (DeltaNet) prefill
+    // path, which exists only on hybrid models. SKIP cleanly otherwise (nothing
+    // to tune → leave the winner unset → engine keeps the 64 default).
+    if !gguf_is_hybrid(&model_path) {
+        println!("  skipped: not a hybrid model (ssm_chunk inert)");
+        return Ok(());
+    }
+
+    let report = measure_ssm_chunk(&model_path, &m_cfg, &candidates, repeats as usize, prompt_tokens)
+        .map_err(|e| anyhow::anyhow!("ssm-chunk measurement failed: {e}"))?;
+    print_perf_candidates(&report.candidates, "prefill tps");
+    if let Some(err) = report.error.as_ref() {
+        println!("  note: {err}");
+    }
+    println!();
+    let default = rustllama_kernels_cpu::delta_net::SSM_CHUNK_DEFAULT as u64;
+    match rustllama_tuner::pick_perf_knob(&report.candidates, m_cfg.optimize_for, default) {
+        Some(v) => {
+            println!("  → pick: ssm_chunk = {v}");
+            if let Err(e) = persist_ssm_chunk_winner(v as u32) {
+                tracing::warn!(error = %e, "failed to persist ssm_chunk winner");
+            }
+        }
+        None => println!("  → no measurable winner; keeping default {default} (unchanged)"),
     }
     Ok(())
 }
@@ -7179,6 +7512,7 @@ fn cmd_tune_flash_kv_min(
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
     // Decode must exceed the largest candidate or the threshold
     // doesn't actually affect dispatch (we'd measure the same path
@@ -7289,6 +7623,7 @@ fn cmd_tune_prefix_snapshots(
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
     let ctx_size =
         (prompt_tokens as usize + decode_tokens as usize + 8).max(cfg.inference.ctx_size as usize);
@@ -7407,6 +7742,7 @@ fn cmd_tune_flash_v3_kv_tile(
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
     let ctx_size =
         (prompt_tokens as usize + decode_tokens as usize + 8).max(cfg.inference.ctx_size as usize);
@@ -7520,6 +7856,7 @@ fn cmd_tune_kv_page_size(
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
     let ctx_size =
         (prompt_tokens as usize + decode_tokens as usize + 8).max(cfg.inference.ctx_size as usize);
@@ -7626,6 +7963,7 @@ fn cmd_tune_kv_layout(
         kv_cache_layout: candidates[0].clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
     let ctx_size =
         (prompt_tokens as usize + decode_tokens as usize + 8).max(cfg.inference.ctx_size as usize);
@@ -7973,6 +8311,18 @@ fn cmd_tune_all(
         .as_ref()
         .map(|t| t.ssm_prefill_chunked.is_some())
         .unwrap_or(false);
+    // P16 numeric perf-knob axes (host-wide, like batch_size/threads). `is_some()`
+    // is the "already tuned" probe; ssm_chunk SKIPs (writes nothing) on a
+    // non-hybrid model, so it re-probes cheaply each run — same as tree-widths.
+    let has_parallel_matvec_crossover = cached
+        .as_ref()
+        .map(|t| t.parallel_matvec_crossover.is_some())
+        .unwrap_or(false);
+    let has_matvec_min_flops = cached
+        .as_ref()
+        .map(|t| t.matvec_min_flops.is_some())
+        .unwrap_or(false);
+    let has_ssm_chunk = cached.as_ref().map(|t| t.ssm_chunk.is_some()).unwrap_or(false);
 
     let skip = |populated: bool| skip_cached && !force && populated;
 
@@ -8360,6 +8710,58 @@ fn cmd_tune_all(
         tracing::warn!(error = %e, "stage 10 (chunked SSM prefill) failed; continuing");
     }
 
+    // P16 numeric perf-knob axes. Host-wide (not per-model); each is a short
+    // candidate sweep that persists its winner (or keeps the default on a tie /
+    // SKIP). They run AFTER the earlier stages so they measure under the chosen
+    // kv_dtype / placement (coordinate descent).
+    println!();
+    println!("Stage 10a/10: parallel-matvec crossover (decode tok/s)");
+    println!("--------");
+    if skip(has_parallel_matvec_crossover) {
+        println!("(skipped: parallel_matvec_crossover winner already cached)");
+    } else if let Err(e) = run_tune_stage_subprocess(
+        config_path,
+        &model_clone_for_stages,
+        "--parallel-matvec-crossover",
+        thorough,
+        "10a (parallel-matvec crossover)",
+        &[],
+    ) {
+        tracing::warn!(error = %e, "stage 10a (parallel-matvec crossover) failed; continuing");
+    }
+
+    println!();
+    println!("Stage 10b/10: matvec GPU/CPU FLOP crossover (decode tok/s)");
+    println!("--------");
+    if skip(has_matvec_min_flops) {
+        println!("(skipped: matvec_min_flops winner already cached)");
+    } else if let Err(e) = run_tune_stage_subprocess(
+        config_path,
+        &model_clone_for_stages,
+        "--matvec-min-flops",
+        thorough,
+        "10b (matvec min-flops)",
+        &[],
+    ) {
+        tracing::warn!(error = %e, "stage 10b (matvec min-flops) failed; continuing");
+    }
+
+    println!();
+    println!("Stage 10c/10: DeltaNet prefill chunk length (prefill tok/s)");
+    println!("--------");
+    if skip(has_ssm_chunk) {
+        println!("(skipped: ssm_chunk winner already cached)");
+    } else if let Err(e) = run_tune_stage_subprocess(
+        config_path,
+        &model_clone_for_stages,
+        "--ssm-chunk",
+        thorough,
+        "10c (DeltaNet chunk length)",
+        &[],
+    ) {
+        tracing::warn!(error = %e, "stage 10c (DeltaNet chunk length) failed; continuing");
+    }
+
     println!();
     println!("=== tune --all complete ===");
     println!("All winners persisted to the tuner cache; the engine will pick");
@@ -8537,6 +8939,92 @@ pub fn persist_ssm_prefill_chunked_winner_to(
         .map(|d| format!("{}", d.as_secs()));
     save_cache(cache_dir, &tuning)?;
     Ok(cache_path_for(cache_dir, key))
+}
+
+// --- P16: numeric perf-knob winner persistence (keyed by system fingerprint,
+// like the other host-wide winners — these are per-host, not per-model). ---
+
+pub fn persist_parallel_matvec_crossover_winner(v: u32) -> anyhow::Result<()> {
+    let Some(cache_dir) = rustllama_tuner::default_cache_dir() else {
+        tracing::warn!("no tuner cache dir resolvable; skipping parallel_matvec_crossover persistence");
+        return Ok(());
+    };
+    let (key, device) = rustllama_tuner::cache_context();
+    use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
+    std::fs::create_dir_all(&cache_dir)?;
+    let mut tuning = load_cache(&cache_dir, &key)?
+        .unwrap_or_else(|| TuningResult::empty(key.clone(), device.clone()));
+    tuning.parallel_matvec_crossover = Some(v);
+    tuning.last_tuned = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| format!("{}", d.as_secs()));
+    save_cache(&cache_dir, &tuning)?;
+    println!("saved parallel_matvec_crossover winner to {}", cache_path_for(&cache_dir, &key).display());
+    Ok(())
+}
+
+pub fn persist_matvec_min_flops_winner(v: u64) -> anyhow::Result<()> {
+    let Some(cache_dir) = rustllama_tuner::default_cache_dir() else {
+        tracing::warn!("no tuner cache dir resolvable; skipping matvec_min_flops persistence");
+        return Ok(());
+    };
+    let (key, device) = rustllama_tuner::cache_context();
+    use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
+    std::fs::create_dir_all(&cache_dir)?;
+    let mut tuning = load_cache(&cache_dir, &key)?
+        .unwrap_or_else(|| TuningResult::empty(key.clone(), device.clone()));
+    tuning.matvec_min_flops = Some(v);
+    tuning.last_tuned = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| format!("{}", d.as_secs()));
+    save_cache(&cache_dir, &tuning)?;
+    println!("saved matvec_min_flops winner to {}", cache_path_for(&cache_dir, &key).display());
+    Ok(())
+}
+
+pub fn persist_ssm_chunk_winner(v: u32) -> anyhow::Result<()> {
+    let Some(cache_dir) = rustllama_tuner::default_cache_dir() else {
+        tracing::warn!("no tuner cache dir resolvable; skipping ssm_chunk persistence");
+        return Ok(());
+    };
+    let (key, device) = rustllama_tuner::cache_context();
+    use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
+    std::fs::create_dir_all(&cache_dir)?;
+    let mut tuning = load_cache(&cache_dir, &key)?
+        .unwrap_or_else(|| TuningResult::empty(key.clone(), device.clone()));
+    tuning.ssm_chunk = Some(v);
+    tuning.last_tuned = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| format!("{}", d.as_secs()));
+    save_cache(&cache_dir, &tuning)?;
+    println!("saved ssm_chunk winner to {}", cache_path_for(&cache_dir, &key).display());
+    Ok(())
+}
+
+/// P16 read-back: the three numeric perf-knob winners from the tuner cache,
+/// gated by `[tuning].auto_apply_perf_knobs`. `None` when off / no cache / no
+/// winner → the engine keeps the kernel's historical default (byte-identical).
+pub fn perf_knob_winners_from_cache(
+    auto_apply: bool,
+) -> (Option<u32>, Option<u64>, Option<u32>) {
+    if !auto_apply {
+        return (None, None, None);
+    }
+    let Some(cache_dir) = rustllama_tuner::default_cache_dir() else {
+        return (None, None, None);
+    };
+    let key = rustllama_tuner::system_fingerprint();
+    match rustllama_tuner::load_cache(&cache_dir, &key) {
+        Ok(Some(t)) => (
+            t.parallel_matvec_crossover,
+            t.matvec_min_flops,
+            t.ssm_chunk,
+        ),
+        _ => (None, None, None),
+    }
 }
 
 pub fn persist_kv_cache_layout_winner(layout: &str) -> anyhow::Result<()> {
@@ -9171,6 +9659,22 @@ pub fn batch_size_from_cache_or_default_to(
     }
 }
 
+/// P16: resolve the autotune OBJECTIVE (`optimize_for`) that the sweeps rank
+/// candidates by. Precedence: the `tune --optimize-for` flag (promoted to
+/// `RUSTLLAMA_TUNE_OPTIMIZE_FOR` at the Tune dispatch, so it also reaches the
+/// `tune --all` subprocess stages) > a user-set `RUSTLLAMA_TUNE_OPTIMIZE_FOR` >
+/// `[tuning].optimize_for`. An unrecognized value falls back to the default
+/// (`Throughput`), so a typo never silently changes the objective.
+fn resolve_optimize_for(cfg: &rustllama_config::Config) -> rustllama_tuner::OptimizeFor {
+    use rustllama_tuner::OptimizeFor;
+    if let Ok(v) = std::env::var("RUSTLLAMA_TUNE_OPTIMIZE_FOR") {
+        if let Some(o) = OptimizeFor::parse(&v) {
+            return o;
+        }
+    }
+    OptimizeFor::parse(&cfg.tuning.optimize_for).unwrap_or_default()
+}
+
 /// CLI parity with the GUI Status page's "Tuner cache" panel:
 /// print the per-device tuner state in human-readable form.
 /// Returns Ok(()) regardless of whether a SYCL device is visible —
@@ -9271,6 +9775,49 @@ pub fn cmd_tuning_show(config_path: &std::path::Path) -> anyhow::Result<()> {
         None => println!("  tree_widths     = (none — run `rustllama tune --tree-widths`)"),
     }
     println!();
+    // P16: numeric perf-knob axis winners + the objective they were ranked by.
+    // "(none)" = no winner cached → the engine keeps the kernel's historical
+    // default (byte-identical): crossover 256, min_flops 0, chunk 64.
+    println!("perf-knob winners (objective = {}):", cfg.tuning.optimize_for);
+    match tuning.parallel_matvec_crossover {
+        Some(v) => println!("  parallel_matvec_crossover = {v}"),
+        None => println!(
+            "  parallel_matvec_crossover = (none — default 256; run \
+             `rustllama tune --parallel-matvec-crossover`)"
+        ),
+    }
+    match tuning.matvec_min_flops {
+        Some(v) => println!("  matvec_min_flops          = {v}"),
+        None => println!(
+            "  matvec_min_flops          = (none — default 0; run \
+             `rustllama tune --matvec-min-flops`)"
+        ),
+    }
+    match tuning.ssm_chunk {
+        Some(v) => println!("  ssm_chunk                 = {v}"),
+        None => println!(
+            "  ssm_chunk                 = (none — default 64; run \
+             `rustllama tune --ssm-chunk`)"
+        ),
+    }
+    println!("  auto_apply_perf_knobs     = {}", cfg.tuning.auto_apply_perf_knobs);
+    println!();
+    // P16: the paged-KV evictor + USM-lock config keys (not swept — runtime
+    // config; `[inference]`, env `RUSTLLAMA_KV_*` / `RUSTLLAMA_LOCK_USM*` wins).
+    println!("paged-KV evictor / USM-lock config:");
+    println!(
+        "  kv_sliding_window = {} (0 = off)",
+        cfg.inference.kv_sliding_window
+    );
+    println!(
+        "  kv_heavy_hitter   = {} (0 = off)  sink = {}",
+        cfg.inference.kv_heavy_hitter, cfg.inference.kv_heavy_sink
+    );
+    println!(
+        "  lock_usm          = {}  budget = {} MB",
+        cfg.inference.lock_usm, cfg.inference.lock_usm_mb
+    );
+    println!();
     // On-device GPU-kernel verdicts (populated by `tune --validate-kernels`).
     // These are the auto-enable decisions the dispatch layer reads: `true` =
     // matched the CPU reference on this machine (and, for a perf-gated/lossy
@@ -9341,6 +9888,7 @@ pub fn measure_batch_size_candidates(
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
 
     let report = engine_measure_batch(model_path, candidates, prompt_tokens, repeats, &m_cfg)?;

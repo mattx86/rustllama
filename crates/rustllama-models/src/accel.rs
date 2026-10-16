@@ -2447,6 +2447,128 @@ pub fn set_lock_ram_mb_directive(directive: String) {
     }
 }
 
+// ============================================================
+// P16: autotune-axis + config-key setters (accel is the single `LoadOptions`
+// surface; these forward to the crate that actually reads the knob).
+// ============================================================
+
+/// P16: apply the autotuned parallel-matvec crossover (M rows). Forwards to the
+/// CPU-kernel cell that `matvec_f16_w_f32_a` + the packed-quant matvecs read.
+pub fn set_parallel_matvec_crossover(m: u32) {
+    rustllama_kernels_cpu::set_parallel_matvec_crossover(m as usize);
+}
+
+/// Current parallel-matvec crossover (for the sweep's save/restore).
+pub fn parallel_matvec_crossover() -> u32 {
+    rustllama_kernels_cpu::parallel_matvec_crossover_current() as u32
+}
+
+/// P16: apply the autotuned DeltaNet prefill chunk LENGTH. Forwards to the
+/// CPU-kernel cell `delta_rule_prefill_chunked` reads.
+pub fn set_ssm_chunk(len: u32) {
+    rustllama_kernels_cpu::delta_net::set_ssm_chunk(len as usize);
+}
+
+/// Current DeltaNet prefill chunk length (for the sweep's save/restore).
+pub fn ssm_chunk() -> u32 {
+    rustllama_kernels_cpu::delta_net::ssm_chunk_current() as u32
+}
+
+/// P16: apply `[inference].lock_usm`. Forwards to the SYCL USM-pin gate.
+pub fn set_lock_usm(on: bool) {
+    sk::set_lock_usm(on);
+}
+
+/// P16: apply `[inference].lock_usm_mb`. Forwards to the SYCL USM-pin budget.
+pub fn set_lock_usm_mb(mb: u64) {
+    sk::set_lock_usm_mb(mb);
+}
+
+// --- P16: paged-KV eviction config cells --------------------------------------
+// The paged evictor (`paged_kv_cache::Evictor`) used to read three env vars
+// directly; they are now `[inference]` config keys surfaced through these cells.
+// Each cell INITIALIZES from its legacy `RUSTLLAMA_KV_*` env var on first read
+// (so a bare load / a user-set env var keeps working), and the serve/HTTP load
+// overrides via the setter with the env-wins-resolved config value. Sentinel
+// encoding: `0` = "unset" for the window/hitter cells (matches the old
+// `filter(|&n| n > 0)`); `u32::MAX` = "unset" for the sink cell (so an explicit
+// `0` sink is distinguishable from "use the default 4").
+
+fn kv_sliding_window_cell() -> &'static std::sync::atomic::AtomicU32 {
+    static C: std::sync::OnceLock<std::sync::atomic::AtomicU32> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        std::sync::atomic::AtomicU32::new(
+            std::env::var("RUSTLLAMA_KV_SLIDING_WINDOW")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(0),
+        )
+    })
+}
+
+fn kv_heavy_hitter_cell() -> &'static std::sync::atomic::AtomicU32 {
+    static C: std::sync::OnceLock<std::sync::atomic::AtomicU32> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        std::sync::atomic::AtomicU32::new(
+            std::env::var("RUSTLLAMA_KV_HEAVY_HITTER")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(0),
+        )
+    })
+}
+
+fn kv_heavy_sink_cell() -> &'static std::sync::atomic::AtomicU32 {
+    static C: std::sync::OnceLock<std::sync::atomic::AtomicU32> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        std::sync::atomic::AtomicU32::new(
+            std::env::var("RUSTLLAMA_KV_HEAVY_SINK")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(u32::MAX),
+        )
+    })
+}
+
+/// Sliding-window retention (token positions); `None` = off (unbounded).
+pub fn kv_sliding_window() -> Option<u32> {
+    match kv_sliding_window_cell().load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// Heavy-hitter recent-keep (token positions); `None` = off.
+pub fn kv_heavy_hitter() -> Option<u32> {
+    match kv_heavy_hitter_cell().load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// Heavy-hitter sink block size (token positions); `None` = use the policy
+/// default (4).
+pub fn kv_heavy_sink() -> Option<u32> {
+    match kv_heavy_sink_cell().load(std::sync::atomic::Ordering::Relaxed) {
+        u32::MAX => None,
+        n => Some(n),
+    }
+}
+
+pub fn set_kv_sliding_window(v: Option<u32>) {
+    kv_sliding_window_cell().store(v.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_kv_heavy_hitter(v: Option<u32>) {
+    kv_heavy_hitter_cell().store(v.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_kv_heavy_sink(v: Option<u32>) {
+    kv_heavy_sink_cell().store(v.unwrap_or(u32::MAX), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// `RUSTLLAMA_MEMORY_BUDGET` — `"auto"` enables the load-time expert-cache
 /// budget planner. Override-or-env, same precedence as the other knobs.
 fn memory_budget_override_cell() -> &'static std::sync::Mutex<Option<String>> {
@@ -14139,14 +14261,47 @@ pub fn try_embedding_lookup_usm_f32(
 /// the gate has zero behavioral effect until a user benchmarks their
 /// hardware. Sub-threshold matvecs return `false` and fall through
 /// to the CPU SIMD path.
+/// The GPU-vs-CPU matvec FLOP crossover, when no autotune winner is cached AND
+/// `RUSTLLAMA_MATVEC_MIN_FLOPS` is unset. `0` = no threshold (every matvec is
+/// GPU-eligible — the historical behavior), so a bare load stays byte-identical.
+pub const MATVEC_MIN_FLOPS_DEFAULT: u64 = 0;
+
+/// P16: the matvec GPU/CPU FLOP crossover is now a settable autotune axis
+/// (`tune --matvec-min-flops`). The cell INITIALIZES from
+/// `RUSTLLAMA_MATVEC_MIN_FLOPS` on first read (so a user-set env var wins on a
+/// bare load), defaulting to [`MATVEC_MIN_FLOPS_DEFAULT`] (0). The sweep winner +
+/// the serve/HTTP load (via `LoadOptions`) store the per-host value with
+/// [`set_matvec_min_flops`]; env-overrides-win is resolved in
+/// `LoadOptions::from_input`.
+fn matvec_min_flops_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static MIN_FLOPS: std::sync::OnceLock<std::sync::atomic::AtomicU64> =
+        std::sync::OnceLock::new();
+    MIN_FLOPS.get_or_init(|| {
+        std::sync::atomic::AtomicU64::new(
+            std::env::var("RUSTLLAMA_MATVEC_MIN_FLOPS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(MATVEC_MIN_FLOPS_DEFAULT),
+        )
+    })
+}
+
+/// Read the current matvec GPU/CPU FLOP crossover (for the autotune sweep's
+/// save/restore around its candidate arms).
+pub fn matvec_min_flops() -> u64 {
+    matvec_min_flops_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Store the autotuned matvec GPU/CPU FLOP crossover. `0` = no threshold (every
+/// matvec is GPU-eligible); a positive value keeps a matvec below that FLOP
+/// count on CPU. A process that never calls this keeps the env/default value, so
+/// defaults stay byte-identical.
+pub fn set_matvec_min_flops(min: u64) {
+    matvec_min_flops_cell().store(min, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn matvec_above_min_flops(flops: u64) -> bool {
-    static MIN_FLOPS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let min = *MIN_FLOPS.get_or_init(|| {
-        std::env::var("RUSTLLAMA_MATVEC_MIN_FLOPS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0)
-    });
+    let min = matvec_min_flops();
     if min == 0 {
         return true;
     }

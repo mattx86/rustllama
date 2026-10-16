@@ -15,7 +15,7 @@
 
 use std::path::Path;
 
-use rustllama_tuner::PlacementPlan;
+use rustllama_tuner::{OptimizeFor, PerfCandidate, PlacementPlan};
 
 use crate::inference::CpuEngine;
 use crate::SamplingParams;
@@ -125,6 +125,12 @@ pub struct MeasurementConfig {
     /// Initial `n_gpu_layers` used for the batch-size sweep load.
     /// Ignored by the placement sweep (it overwrites per candidate).
     pub n_gpu_layers: u32,
+    /// P16: the objective the sweep ranks candidates by (`Throughput` =
+    /// tok/s, the default; `Watts` = tokens-per-joule). Resolved by the
+    /// caller from `tune --optimize-for` / `RUSTLLAMA_TUNE_OPTIMIZE_FOR` /
+    /// `[tuning].optimize_for`, and threaded here in place of the former
+    /// inline env read in `measure_placement_candidates`.
+    pub optimize_for: OptimizeFor,
 }
 
 /// Drive the engine through each placement candidate, time decode
@@ -273,17 +279,13 @@ pub fn measure_placement_candidates(
             tokens_per_joule,
         });
 
-        // Winning metric. `RUSTLLAMA_TUNE_OPTIMIZE_FOR=watts` flips
-        // the picker to tokens-per-joule (laptop / battery
-        // sensitive); default is tok/s (throughput).
-        let optimize_for_watts = std::env::var("RUSTLLAMA_TUNE_OPTIMIZE_FOR")
-            .ok()
-            .as_deref()
-            == Some("watts");
-        let score = if optimize_for_watts {
-            tokens_per_joule.unwrap_or(median)
-        } else {
-            median
+        // Winning metric. P16: the objective is a resolved config/flag setting
+        // (`cfg.optimize_for`), no longer an inline env read. `Watts` flips the
+        // picker to tokens-per-joule (laptop / battery sensitive); the default
+        // `Throughput` ranks by tok/s.
+        let score = match cfg.optimize_for {
+            OptimizeFor::Watts => tokens_per_joule.unwrap_or(median),
+            OptimizeFor::Throughput => median,
         };
         if score > best_tps {
             best_tps = score;
@@ -2676,6 +2678,286 @@ pub fn measure_ssm_prefill_chunked(
         winner,
         error,
     })
+}
+
+// ============================================================
+// P16: numeric perf-knob sweeps (parallel_matvec_crossover / matvec_min_flops /
+// ssm_chunk). Each loads the model ONCE and, for each candidate value, applies
+// the knob via its `accel` setter (a hot, per-forward-read cell — no reload),
+// then measures median throughput + energy so the tuner's `pick_perf_knob` can
+// rank per the resolved `optimize_for` objective. The three axes differ only in
+// (a) which setter the candidate toggles and (b) whether the metric is DECODE
+// (crossover / min_flops) or PREFILL (ssm_chunk) tok/s.
+// ============================================================
+
+/// Which throughput metric a numeric perf-knob sweep ranks by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnobMetric {
+    /// Median decode tok/s (`generate_token_ids` → `decode_ms`).
+    Decode,
+    /// Median prefill tok/s (`max_tokens = 1` → `prefill_ms`).
+    Prefill,
+}
+
+/// Outcome of a numeric perf-knob sweep. `candidates` holds one
+/// [`PerfCandidate`] per swept value (median tok/s + tokens-per-joule); the CLI
+/// feeds it to [`rustllama_tuner::pick_perf_knob`] with the resolved objective to
+/// choose + persist the winner. `error` carries the first arm's failure message
+/// when some candidate failed.
+#[derive(Debug, Clone, Default)]
+pub struct PerfKnobReport {
+    pub candidates: Vec<PerfCandidate>,
+    pub error: Option<String>,
+}
+
+/// Measure one candidate's median throughput + energy on an already-loaded
+/// engine (one untimed warmup + `repeats` timed runs). Mirrors the decode/
+/// prefill metric patterns used by the placement + ssm-prefill sweeps, with the
+/// placement sweep's Sysman energy sampling folded in so `optimize_for = watts`
+/// has a tokens-per-joule score to rank by.
+fn measure_one_knob_candidate(
+    cpu: &mut CpuEngine,
+    prompt_ids: &[i32],
+    sampling: &SamplingParams,
+    metric: KnobMetric,
+    repeats: usize,
+    sysman: Option<&SysmanProbe>,
+    prompt_tokens: u32,
+    decode_tokens: u32,
+) -> (Option<f64>, Option<f64>, Option<String>) {
+    let gen_tokens = match metric {
+        KnobMetric::Decode => decode_tokens,
+        KnobMetric::Prefill => 1,
+    };
+    // Untimed warmup.
+    cpu.clear_prefix_cache();
+    if let Err(e) = cpu.generate_token_ids(prompt_ids, gen_tokens, sampling) {
+        return (None, None, Some(format!("warmup failed: {e}")));
+    }
+    let energy_before = sysman.and_then(|p| p.sample_energy());
+    let mut runs: Vec<f64> = Vec::with_capacity(repeats);
+    let mut total_generated: u64 = 0;
+    let mut last_err: Option<String> = None;
+    for _ in 0..repeats {
+        cpu.clear_prefix_cache();
+        match cpu.generate_token_ids(prompt_ids, gen_tokens, sampling) {
+            Ok(_) => {
+                let stats = cpu.last_request_stats();
+                match metric {
+                    KnobMetric::Decode => {
+                        if stats.decode_ms > 0.0 && stats.tokens_generated > 0 {
+                            runs.push((stats.tokens_generated as f64) / (stats.decode_ms / 1000.0));
+                            total_generated += stats.tokens_generated as u64;
+                        }
+                    }
+                    KnobMetric::Prefill => {
+                        let pf_ms = stats.prefill_ms;
+                        let prefilled = stats.tokens_prefilled.max(prompt_tokens);
+                        if pf_ms > 0.0 && prefilled > 0 {
+                            runs.push((prefilled as f64) / (pf_ms / 1000.0));
+                            total_generated += prefilled as u64;
+                        }
+                    }
+                }
+            }
+            Err(e) => last_err = Some(e.to_string()),
+        }
+    }
+    let energy_after = sysman.and_then(|p| p.sample_energy());
+    let tokens_per_joule = match (energy_before, energy_after) {
+        (Some((e0, t0)), Some((e1, t1))) if t1 > t0 && e1 > e0 => {
+            let de_uj = (e1 - e0) as f64;
+            Some(total_generated as f64 / (de_uj * 1e-6))
+        }
+        _ => None,
+    };
+    if runs.is_empty() {
+        return (
+            None,
+            tokens_per_joule,
+            Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
+        );
+    }
+    runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = if runs.len() % 2 == 1 {
+        runs[runs.len() / 2]
+    } else {
+        (runs[runs.len() / 2 - 1] + runs[runs.len() / 2]) / 2.0
+    };
+    (Some(median), tokens_per_joule, None)
+}
+
+/// Shared driver for the three numeric perf-knob sweeps. Loads the model once,
+/// then for each candidate: `apply(value)` (the knob's `accel` setter) → measure
+/// → record. Restores the knob to `restore_value` before returning so the sweep
+/// doesn't leak state to the rest of the process.
+fn measure_perf_knob_generic(
+    model_path: &Path,
+    cfg: &MeasurementConfig,
+    candidates: &[u64],
+    repeats: usize,
+    metric: KnobMetric,
+    prompt_tokens: u32,
+    decode_tokens: u32,
+    apply: impl Fn(u64),
+    restore_value: u64,
+) -> Result<PerfKnobReport, String> {
+    let ctx_size = (prompt_tokens as usize + decode_tokens as usize + 8).max(128);
+    let mut cpu = CpuEngine::load_with_options_and_layout(
+        model_path,
+        ctx_size,
+        true,
+        cfg.kv_dtype,
+        &cfg.kv_cache_layout,
+    )
+    .map_err(|e| format!("load failed: {e}"))?;
+    cpu.set_prefix_cache(false);
+    cpu.set_flash_attention(cfg.flash_attention);
+    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+
+    let vocab = cpu.vocab_size() as i32;
+    let prompt_ids: Vec<i32> = (0..prompt_tokens as i32)
+        .map(|i| 1 + (i % vocab.max(2).saturating_sub(1)))
+        .collect();
+    let gen_tokens = match metric {
+        KnobMetric::Decode => decode_tokens,
+        KnobMetric::Prefill => 1,
+    };
+    let sampling = SamplingParams {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        typical_p: 1.0,
+        repeat_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        seed: 0,
+        max_tokens: gen_tokens,
+        stop: Vec::new(),
+        ..SamplingParams::default()
+    };
+
+    let sysman = if cfg.optimize_for == OptimizeFor::Watts {
+        open_sysman_probe()
+    } else {
+        None
+    };
+
+    let mut results: Vec<PerfCandidate> = Vec::with_capacity(candidates.len());
+    let mut first_err: Option<String> = None;
+    for &value in candidates {
+        apply(value);
+        let (tok_s, tokens_per_joule, err) = measure_one_knob_candidate(
+            &mut cpu,
+            &prompt_ids,
+            &sampling,
+            metric,
+            repeats,
+            sysman.as_ref(),
+            prompt_tokens,
+            decode_tokens,
+        );
+        if let Some(e) = err {
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
+        results.push(PerfCandidate {
+            value,
+            tok_s,
+            tokens_per_joule,
+        });
+    }
+    // Restore the pre-sweep value.
+    apply(restore_value);
+
+    Ok(PerfKnobReport {
+        candidates: results,
+        error: first_err,
+    })
+}
+
+/// A/B the CPU parallel-matvec crossover (M rows) by measured DECODE tok/s.
+/// Toggles `accel::set_parallel_matvec_crossover` per candidate on one loaded
+/// engine. On a fully-GPU-resident model the CPU matvec barely runs, so the
+/// candidates tie and `pick_perf_knob` keeps the default — fail-safe.
+pub fn measure_parallel_matvec_crossover(
+    model_path: &Path,
+    cfg: &MeasurementConfig,
+    candidates: &[u64],
+    repeats: usize,
+    prompt_tokens: u32,
+    decode_tokens: u32,
+) -> Result<PerfKnobReport, String> {
+    let saved = rustllama_models::accel::parallel_matvec_crossover() as u64;
+    measure_perf_knob_generic(
+        model_path,
+        cfg,
+        candidates,
+        repeats,
+        KnobMetric::Decode,
+        prompt_tokens,
+        decode_tokens,
+        |v| rustllama_models::accel::set_parallel_matvec_crossover(v as u32),
+        saved,
+    )
+}
+
+/// A/B the GPU-vs-CPU matvec FLOP crossover by measured DECODE tok/s. Toggles
+/// `accel::set_matvec_min_flops` per candidate on one loaded engine. On a
+/// CPU-only host (no GPU dispatch) the threshold is inert, so candidates tie and
+/// the default is kept — fail-safe.
+pub fn measure_matvec_min_flops(
+    model_path: &Path,
+    cfg: &MeasurementConfig,
+    candidates: &[u64],
+    repeats: usize,
+    prompt_tokens: u32,
+    decode_tokens: u32,
+) -> Result<PerfKnobReport, String> {
+    let saved = rustllama_models::accel::matvec_min_flops();
+    measure_perf_knob_generic(
+        model_path,
+        cfg,
+        candidates,
+        repeats,
+        KnobMetric::Decode,
+        prompt_tokens,
+        decode_tokens,
+        rustllama_models::accel::set_matvec_min_flops,
+        saved,
+    )
+}
+
+/// A/B the DeltaNet prefill chunk length by measured PREFILL tok/s. Toggles
+/// `accel::set_ssm_chunk` per candidate on one loaded engine. Only meaningful on
+/// a hybrid (DeltaNet) model with the chunked path enabled; the CLI gates the
+/// call on `gguf_is_hybrid`, so on anything else it is never invoked.
+pub fn measure_ssm_chunk(
+    model_path: &Path,
+    cfg: &MeasurementConfig,
+    candidates: &[u64],
+    repeats: usize,
+    prompt_tokens: u32,
+) -> Result<PerfKnobReport, String> {
+    let saved = rustllama_models::accel::ssm_chunk() as u64;
+    // The chunked SSM prefill path must be ON for the chunk-length knob to take
+    // effect; force it for the sweep and restore after.
+    let saved_chunked = rustllama_models::accel::ssm_prefill_chunked();
+    rustllama_models::accel::set_ssm_prefill_chunked(true);
+    let out = measure_perf_knob_generic(
+        model_path,
+        cfg,
+        candidates,
+        repeats,
+        KnobMetric::Prefill,
+        prompt_tokens,
+        1,
+        |v| rustllama_models::accel::set_ssm_chunk(v as u32),
+        saved,
+    );
+    rustllama_models::accel::set_ssm_prefill_chunked(saved_chunked);
+    out
 }
 
 /// Outcome of [`measure_dev_attn`] — the #2 device-resident attention A/B.

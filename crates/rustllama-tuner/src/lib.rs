@@ -573,6 +573,29 @@ pub struct TuningResult {
     /// models). Some(true)=chunked prefill was faster, None=untuned.
     #[serde(default)]
     pub ssm_prefill_chunked: Option<bool>,
+    /// P16 autotune axis: the per-host parallel-matvec crossover (M rows) — the
+    /// threshold above which a quant/f16 CPU matvec goes rayon-parallel. Picked
+    /// by `tune --parallel-matvec-crossover` (decode tok/s per candidate, best
+    /// per `optimize_for`). `None` (serde default, so old caches load) → the
+    /// engine keeps the historical 256 default
+    /// (`rustllama_kernels_cpu::PARALLEL_MATVEC_CROSSOVER_DEFAULT`), byte-identical.
+    #[serde(default)]
+    pub parallel_matvec_crossover: Option<u32>,
+    /// P16 autotune axis: the per-host GPU-vs-CPU matvec FLOP crossover — a
+    /// matvec below this FLOP count stays on CPU rather than dispatching to the
+    /// GPU. Picked by `tune --matvec-min-flops`. `None` (serde default) → the
+    /// engine keeps the historical `0` default (no threshold — every matvec is
+    /// GPU-eligible), byte-identical.
+    #[serde(default)]
+    pub matvec_min_flops: Option<u64>,
+    /// P16 autotune axis: the per-host DeltaNet prefill chunk LENGTH (the tuner
+    /// previously only toggled the chunked path on/off via `ssm_prefill_chunked`;
+    /// this picks its length). Picked by `tune --ssm-chunk` (prefill tok/s per
+    /// candidate). `None` (serde default) → the engine keeps the historical 64
+    /// default (`rustllama_kernels_cpu::delta_net::SSM_CHUNK_DEFAULT`),
+    /// byte-identical.
+    #[serde(default)]
+    pub ssm_chunk: Option<u32>,
     /// Per-model decision-probability calibration, keyed by model file
     /// stem like `placement`. Fit by the decision-calibration stage of
     /// `tune --all`: the temperature that best calibrates the model's
@@ -685,6 +708,9 @@ impl TuningResult {
             speculative_mtp: None,
             winner_tree_widths: None,
             ssm_prefill_chunked: None,
+            parallel_matvec_crossover: None,
+            matvec_min_flops: None,
+            ssm_chunk: None,
             decision_calibration: HashMap::new(),
             per_device_perf: HashMap::new(),
             kernel_verdicts: HashMap::new(),
@@ -1086,6 +1112,152 @@ pub fn pick_tree_widths(candidates: &[TreeWidthMeasurement]) -> Option<Vec<u32>>
 /// resolve the same way.
 pub const TREE_WIDTHS_TPS_EPS: f64 = 1e-6;
 
+// ============================================================
+// P16: autotune objective + numeric perf-knob picker
+// ============================================================
+
+/// The objective the autotune sweeps optimize against. NOT a swept value — it
+/// is the MODE the other sweeps rank candidates by. `Throughput` maximizes
+/// decode/prefill tok/s (the default, byte-identical to the historical tuner);
+/// `Watts` maximizes energy efficiency (tokens-per-joule) for laptop / battery-
+/// sensitive hosts. Resolved flag > env (`RUSTLLAMA_TUNE_OPTIMIZE_FOR`) > config
+/// (`[tuning].optimize_for`) by the CLI; threaded into the measurement loop in
+/// place of the former inline env read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OptimizeFor {
+    /// Maximize tok/s (default).
+    #[default]
+    Throughput,
+    /// Maximize tokens-per-joule (energy efficiency).
+    Watts,
+}
+
+impl OptimizeFor {
+    /// Parse a config/flag/env string. Accepts `"throughput"`/`"tps"`/`"speed"`
+    /// and `"watts"`/`"joule"`/`"energy"`/`"efficiency"` (case-insensitive).
+    /// Returns `None` on an unrecognized value so the caller can keep the default.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "throughput" | "tps" | "tok/s" | "toks" | "speed" | "" => Some(OptimizeFor::Throughput),
+            "watts" | "watt" | "joule" | "joules" | "energy" | "efficiency" | "tok/joule" => {
+                Some(OptimizeFor::Watts)
+            }
+            _ => None,
+        }
+    }
+
+    /// Canonical config string (round-trips through [`Self::parse`]).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OptimizeFor::Throughput => "throughput",
+            OptimizeFor::Watts => "watts",
+        }
+    }
+
+    /// The score this objective ranks a candidate by, given its measured tok/s
+    /// and tokens-per-joule. For `Watts`, fall back to tok/s when no energy
+    /// reading is available (non-Intel host / no power domain), so the picker
+    /// still ranks sensibly rather than discarding every candidate.
+    pub fn score(&self, tok_s: Option<f64>, tokens_per_joule: Option<f64>) -> Option<f64> {
+        match self {
+            OptimizeFor::Throughput => tok_s,
+            OptimizeFor::Watts => tokens_per_joule.or(tok_s),
+        }
+    }
+}
+
+/// One numeric perf-knob candidate's measurement (shared by the
+/// `parallel_matvec_crossover` / `matvec_min_flops` / `ssm_chunk` sweeps). The
+/// `value` is the knob setting measured; `tok_s` / `tokens_per_joule` are its
+/// median decode-or-prefill throughput and energy efficiency (the latter `None`
+/// off a power-instrumented host). A candidate whose every run failed carries
+/// `tok_s == None` and is skipped by the picker.
+///
+/// The type + the picker below live in this toolchain-free crate so the
+/// selection logic is unit-testable with plain `cargo test -p rustllama-tuner`
+/// — the on-device measurement itself is HW/model-gated, so the DECISION logic
+/// is what the tests pin.
+#[derive(Debug, Clone)]
+pub struct PerfCandidate {
+    /// The knob value this candidate measured.
+    pub value: u64,
+    /// Median throughput (decode or prefill tok/s), or `None` if every run
+    /// failed.
+    pub tok_s: Option<f64>,
+    /// Tokens-per-joule for this candidate, or `None` when no power reading was
+    /// available. Ranked only under `OptimizeFor::Watts`.
+    pub tokens_per_joule: Option<f64>,
+}
+
+/// Relative dead-heat threshold for [`pick_perf_knob`]. Two candidates whose
+/// scores are within this FRACTION of each other are a statistical tie and
+/// decided by the deterministic default-preference tie-break rather than by
+/// measurement noise. 0.5% is well under run-to-run decode-tok/s wobble on these
+/// hosts while still letting a real win decide outright.
+pub const PERF_KNOB_REL_EPS: f64 = 0.005;
+
+/// Pick the winning numeric perf-knob value from a sweep's per-candidate
+/// measurements, maximizing the score for `objective` (tok/s for `Throughput`,
+/// tokens-per-joule for `Watts`).
+///
+/// Candidates whose measurement failed (score `None`) are ignored. Returns
+/// `None` when NO candidate produced a usable score — the caller then keeps the
+/// historical hard-coded default, so the knob stays byte-identical to pre-P16.
+///
+/// Ties are broken DETERMINISTICALLY toward SAFETY: when two candidates are
+/// within [`PERF_KNOB_REL_EPS`] of each other, prefer the one EQUAL to
+/// `default_value` (so a dead heat keeps today's constant → byte-identical),
+/// else the one CLOSEST to `default_value`, else the candidate appearing EARLIER
+/// in the slice. A candidate that beats the field beyond the epsilon always wins
+/// outright — the tie-break only decides a statistical dead heat, so the sweep
+/// never ships a worse-than-default value on noise alone.
+pub fn pick_perf_knob(
+    candidates: &[PerfCandidate],
+    objective: OptimizeFor,
+    default_value: u64,
+) -> Option<u64> {
+    // (value, score, is_default, distance-to-default)
+    let mut best: Option<(u64, f64)> = None;
+    for cand in candidates {
+        let Some(score) = objective.score(cand.tok_s, cand.tokens_per_joule) else {
+            continue;
+        };
+        best = Some(match best {
+            None => (cand.value, score),
+            Some((b_val, b_score)) => {
+                // Relative epsilon around the incumbent's score.
+                let eps = b_score.abs().max(1.0) * PERF_KNOB_REL_EPS;
+                if score > b_score + eps {
+                    // Strictly better → new winner.
+                    (cand.value, score)
+                } else if score + eps < b_score {
+                    // Strictly worse → keep incumbent.
+                    (b_val, b_score)
+                } else {
+                    // Dead heat → prefer the default, else the value closest to
+                    // the default, else keep the earlier (incumbent) candidate.
+                    let cand_is_def = cand.value == default_value;
+                    let inc_is_def = b_val == default_value;
+                    if cand_is_def && !inc_is_def {
+                        (cand.value, score)
+                    } else if inc_is_def && !cand_is_def {
+                        (b_val, b_score)
+                    } else {
+                        let cand_dist = cand.value.abs_diff(default_value);
+                        let inc_dist = b_val.abs_diff(default_value);
+                        if cand_dist < inc_dist {
+                            (cand.value, score)
+                        } else {
+                            (b_val, b_score)
+                        }
+                    }
+                }
+            }
+        });
+    }
+    best.map(|(v, _)| v)
+}
+
 /// FNV-1a 64-bit — deterministic across processes (unlike `DefaultHasher`,
 /// whose seed is randomized), so the system-fingerprint slug is stable.
 fn fnv1a(s: &str) -> u64 {
@@ -1334,6 +1506,125 @@ mod tests {
             TreeWidthMeasurement { widths: vec![4, 4, 2], tok_s: Some(20.0), accept: Some(0.8) },
         ];
         assert_eq!(pick_tree_widths(&real_diff), Some(vec![4, 4, 2]));
+    }
+
+    // ---- P16: OptimizeFor + pick_perf_knob ----
+
+    #[test]
+    fn optimize_for_parse_roundtrips() {
+        assert_eq!(OptimizeFor::parse("throughput"), Some(OptimizeFor::Throughput));
+        assert_eq!(OptimizeFor::parse("TPS"), Some(OptimizeFor::Throughput));
+        assert_eq!(OptimizeFor::parse("watts"), Some(OptimizeFor::Watts));
+        assert_eq!(OptimizeFor::parse("Energy"), Some(OptimizeFor::Watts));
+        assert_eq!(OptimizeFor::parse("nonsense"), None);
+        // default is Throughput; canonical strings round-trip.
+        assert_eq!(OptimizeFor::default(), OptimizeFor::Throughput);
+        assert_eq!(OptimizeFor::parse(OptimizeFor::Throughput.as_str()), Some(OptimizeFor::Throughput));
+        assert_eq!(OptimizeFor::parse(OptimizeFor::Watts.as_str()), Some(OptimizeFor::Watts));
+    }
+
+    /// Throughput objective: the picker returns the value with the highest
+    /// tok/s (a clear win beyond the relative epsilon decides outright).
+    #[test]
+    fn pick_perf_knob_throughput_maximizes_tps() {
+        let cands = vec![
+            PerfCandidate { value: 64, tok_s: Some(10.0), tokens_per_joule: Some(5.0) },
+            PerfCandidate { value: 128, tok_s: Some(12.0), tokens_per_joule: Some(4.0) },
+            PerfCandidate { value: 256, tok_s: Some(15.0), tokens_per_joule: Some(3.0) },
+            PerfCandidate { value: 512, tok_s: Some(11.0), tokens_per_joule: Some(2.0) },
+        ];
+        assert_eq!(pick_perf_knob(&cands, OptimizeFor::Throughput, 256), Some(256));
+    }
+
+    /// Watts objective picks a DIFFERENT winner than throughput on the same
+    /// candidate set — proving the objective actually steers the pick.
+    #[test]
+    fn pick_perf_knob_watts_picks_per_joule_winner() {
+        let cands = vec![
+            PerfCandidate { value: 64, tok_s: Some(10.0), tokens_per_joule: Some(5.0) },
+            PerfCandidate { value: 128, tok_s: Some(12.0), tokens_per_joule: Some(4.0) },
+            PerfCandidate { value: 256, tok_s: Some(15.0), tokens_per_joule: Some(3.0) },
+        ];
+        // Throughput → 256 (15 tok/s); Watts → 64 (5 tok/J).
+        assert_eq!(pick_perf_knob(&cands, OptimizeFor::Throughput, 256), Some(256));
+        assert_eq!(pick_perf_knob(&cands, OptimizeFor::Watts, 256), Some(64));
+    }
+
+    /// A cached winner OVERRIDES the default: when a non-default value is
+    /// strictly fastest, the picker returns it (not the default).
+    #[test]
+    fn pick_perf_knob_winner_overrides_default() {
+        let cands = vec![
+            PerfCandidate { value: 256, tok_s: Some(10.0), tokens_per_joule: None }, // default
+            PerfCandidate { value: 1024, tok_s: Some(18.0), tokens_per_joule: None },
+        ];
+        assert_eq!(pick_perf_knob(&cands, OptimizeFor::Throughput, 256), Some(1024));
+    }
+
+    /// Absent winner → None, so the caller keeps the historical constant
+    /// (byte-identical). Also: a statistical dead heat resolves TOWARD the
+    /// default, so noise alone never ships a worse-than-default value.
+    #[test]
+    fn pick_perf_knob_absent_and_dead_heat_keep_default() {
+        // No measurement at all → None (caller uses the hard-coded default).
+        assert_eq!(pick_perf_knob(&[], OptimizeFor::Throughput, 256), None);
+        let all_failed = vec![
+            PerfCandidate { value: 64, tok_s: None, tokens_per_joule: None },
+            PerfCandidate { value: 256, tok_s: None, tokens_per_joule: None },
+        ];
+        assert_eq!(pick_perf_knob(&all_failed, OptimizeFor::Throughput, 256), None);
+
+        // Dead heat (all within the 0.5% relative epsilon): the DEFAULT value is
+        // preferred even though it appears last, so the pick == default ⇒
+        // byte-identical. 100.0 vs 100.2 vs 100.1 are all within eps.
+        let dead_heat = vec![
+            PerfCandidate { value: 64, tok_s: Some(100.2), tokens_per_joule: None },
+            PerfCandidate { value: 128, tok_s: Some(100.1), tokens_per_joule: None },
+            PerfCandidate { value: 256, tok_s: Some(100.0), tokens_per_joule: None },
+        ];
+        assert_eq!(pick_perf_knob(&dead_heat, OptimizeFor::Throughput, 256), Some(256));
+
+        // Dead heat with NO candidate equal to the default → the CLOSEST to the
+        // default wins (128 is nearer 200 than 64 is).
+        let no_default = vec![
+            PerfCandidate { value: 64, tok_s: Some(100.2), tokens_per_joule: None },
+            PerfCandidate { value: 128, tok_s: Some(100.0), tokens_per_joule: None },
+        ];
+        assert_eq!(pick_perf_knob(&no_default, OptimizeFor::Throughput, 200), Some(128));
+    }
+
+    /// The three P16 numeric winners persist across a TOML round-trip, and old
+    /// caches lacking the keys still load (serde default → None).
+    #[test]
+    fn perf_knob_winners_survive_toml_roundtrip() {
+        let mut t = TuningResult::empty("fp".into(), DeviceFingerprint::default());
+        t.parallel_matvec_crossover = Some(512);
+        t.matvec_min_flops = Some(1 << 20);
+        t.ssm_chunk = Some(128);
+        let s = toml::to_string(&t).unwrap();
+        let back: TuningResult = toml::from_str(&s).unwrap();
+        assert_eq!(back.parallel_matvec_crossover, Some(512));
+        assert_eq!(back.matvec_min_flops, Some(1 << 20));
+        assert_eq!(back.ssm_chunk, Some(128));
+
+        // Old-cache compatibility: serialize a cache WITHOUT the P16 keys (strip
+        // them from the TOML) and confirm it still loads, with the three winners
+        // defaulting to None (the `#[serde(default)]` contract — no schema bump).
+        let empty = TuningResult::empty("fp".into(), DeviceFingerprint::default());
+        let full = toml::to_string(&empty).unwrap();
+        let stripped: String = full
+            .lines()
+            .filter(|l| {
+                !l.starts_with("parallel_matvec_crossover")
+                    && !l.starts_with("matvec_min_flops")
+                    && !l.starts_with("ssm_chunk")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let old: TuningResult = toml::from_str(&stripped).unwrap();
+        assert_eq!(old.parallel_matvec_crossover, None);
+        assert_eq!(old.matvec_min_flops, None);
+        assert_eq!(old.ssm_chunk, None);
     }
 
     #[test]

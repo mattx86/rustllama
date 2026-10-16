@@ -3468,6 +3468,7 @@ fn run_placement_sweep_blocking(
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
 
     // Step 4: run the engine's measurement loop.
@@ -3621,6 +3622,7 @@ fn run_batch_size_sweep_blocking(
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
         flash_attention: cfg.inference.flash_attention,
         n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
     let candidates: Vec<usize> = req.candidates.iter().map(|n| *n as usize).collect();
     let report = measure_batch_size_candidates(

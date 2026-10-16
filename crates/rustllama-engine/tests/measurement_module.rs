@@ -21,6 +21,7 @@ fn default_measurement_cfg() -> MeasurementConfig {
         kv_cache_layout: "contiguous".into(),
         flash_attention: false,
         n_gpu_layers: 999,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     }
 }
 

@@ -680,6 +680,48 @@ pub struct InferenceConfig {
     /// startup (a user-set env var wins).
     #[serde(default = "default_memory_budget")]
     pub memory_budget: String,
+    /// P16: paged-KV sliding-window eviction. `0` (default) = off — the paged
+    /// cache is the unbounded cache, byte-identical. A positive value keeps only
+    /// the most recent N token positions on the single-owner decode path and
+    /// frees pages that fall out of the window (long-context memory relief).
+    /// Backs `RUSTLLAMA_KV_SLIDING_WINDOW` (env wins). Pairs with
+    /// `kv_heavy_hitter` (which, when set, bounds its recent-window `keep` to
+    /// this value). NB: this is the EXISTING global evictor given a config key;
+    /// the per-layer SWA ring (Gemma2-style alternating layers) is a separate
+    /// later item.
+    #[serde(default)]
+    pub kv_sliding_window: u32,
+    /// P16: paged-KV "heavy hitter" (StreamingLLM recency + attention-sink)
+    /// eviction. `0` (default) = off. A positive value keeps the `keep` most-
+    /// recent positions PLUS `kv_heavy_sink` leading sink positions; takes
+    /// precedence over `kv_sliding_window` when both are set. Backs
+    /// `RUSTLLAMA_KV_HEAVY_HITTER` (env wins).
+    #[serde(default)]
+    pub kv_heavy_hitter: u32,
+    /// P16: number of leading "attention sink" positions retained by
+    /// `kv_heavy_hitter` (StreamingLLM's finding is ~4; page-aligned up at
+    /// engage time). Only consulted when `kv_heavy_hitter > 0`. Backs
+    /// `RUSTLLAMA_KV_HEAVY_SINK` (env wins). Default 4.
+    #[serde(default = "default_kv_heavy_sink")]
+    pub kv_heavy_sink: u32,
+    /// P16: VirtualLock SYCL USM-shared allocations into the working set so the
+    /// OS can't page them to the pagefile (USM-shared is host RAM on an iGPU).
+    /// `false` (default) = off, byte-identical. Windows-only effect. Backs
+    /// `RUSTLLAMA_LOCK_USM` (env wins).
+    #[serde(default)]
+    pub lock_usm: bool,
+    /// P16: cap (MB) on total pinned USM bytes across the process when
+    /// `lock_usm` is on. Default 1024. Backs `RUSTLLAMA_LOCK_USM_MB` (env wins).
+    #[serde(default = "default_lock_usm_mb")]
+    pub lock_usm_mb: u64,
+}
+
+fn default_kv_heavy_sink() -> u32 {
+    4
+}
+
+fn default_lock_usm_mb() -> u64 {
+    1024
 }
 
 fn default_memory_budget() -> String {
@@ -944,6 +986,11 @@ impl Default for InferenceConfig {
             // to pre-3b). Set >0 (or `RUSTLLAMA_MAX_BATCHED_TOKENS`) to fuse.
             max_num_batched_tokens: 0,
             memory_budget: default_memory_budget(),
+            kv_sliding_window: 0,
+            kv_heavy_hitter: 0,
+            kv_heavy_sink: default_kv_heavy_sink(),
+            lock_usm: false,
+            lock_usm_mb: default_lock_usm_mb(),
         }
     }
 }
@@ -1237,10 +1284,27 @@ pub struct TuningConfig {
     /// stays off for it.
     #[serde(default = "default_true_serde")]
     pub auto_apply_cacheblend: bool,
+    /// P16: when `true` (default), the three numeric perf-knob autotune winners
+    /// (`parallel_matvec_crossover`, `matvec_min_flops`, `ssm_chunk`) are applied
+    /// from the tuner cache on load. Off (or no cache entry) → the historical
+    /// hard-coded defaults, byte-identical.
+    #[serde(default = "default_true_serde")]
+    pub auto_apply_perf_knobs: bool,
+    /// P16: the autotune OBJECTIVE the sweeps rank candidates by — `"throughput"`
+    /// (default, maximize tok/s) or `"watts"` (maximize tokens-per-joule, for
+    /// battery-sensitive hosts). NOT a swept value: it is the mode the sweeps
+    /// optimize against. Resolved flag (`tune --optimize-for`) > env
+    /// (`RUSTLLAMA_TUNE_OPTIMIZE_FOR`) > this config key.
+    #[serde(default = "default_optimize_for")]
+    pub optimize_for: String,
 }
 
 fn default_true_serde() -> bool {
     true
+}
+
+fn default_optimize_for() -> String {
+    "throughput".to_string()
 }
 
 impl Default for TuningConfig {
@@ -1262,6 +1326,8 @@ impl Default for TuningConfig {
             auto_apply_moe_placement: true,
             auto_apply_decision_calibration: true,
             auto_apply_cacheblend: true,
+            auto_apply_perf_knobs: true,
+            optimize_for: default_optimize_for(),
         }
     }
 }
@@ -1665,6 +1731,50 @@ mod tests {
         let s = toml::to_string(&c).unwrap();
         let back: Config = toml::from_str(&s).unwrap();
         assert_eq!(c.server.port, back.server.port);
+    }
+
+    /// P16: the new KV-evictor + USM-lock + optimize_for config keys default to
+    /// "off / historical behavior" so a config that omits them is byte-identical
+    /// to pre-P16, and they survive a TOML round-trip (old configs still load).
+    #[test]
+    fn p16_config_keys_defaults_and_roundtrip() {
+        let c = Config::default();
+        // Evictor off by default → unbounded paged cache (byte-identical).
+        assert_eq!(c.inference.kv_sliding_window, 0);
+        assert_eq!(c.inference.kv_heavy_hitter, 0);
+        assert_eq!(c.inference.kv_heavy_sink, 4);
+        // USM lock off by default, 1 GiB budget cap.
+        assert!(!c.inference.lock_usm);
+        assert_eq!(c.inference.lock_usm_mb, 1024);
+        // Tuner objective = throughput by default; perf-knob auto-apply on.
+        assert_eq!(c.tuning.optimize_for, "throughput");
+        assert!(c.tuning.auto_apply_perf_knobs);
+
+        // A config file that predates these keys must still load, with defaults.
+        let minimal = "[model]\n[inference]\n[server]\n[ui]\n[tuning]\n\
+                       [embeddings]\n[reranker]\n";
+        let loaded: Config = toml::from_str(minimal).unwrap_or_default();
+        assert_eq!(loaded.inference.kv_sliding_window, 0);
+        assert_eq!(loaded.inference.kv_heavy_sink, 4);
+        assert_eq!(loaded.inference.lock_usm_mb, 1024);
+        assert_eq!(loaded.tuning.optimize_for, "throughput");
+
+        // Round-trip preserves explicit values.
+        let mut c2 = Config::default();
+        c2.inference.kv_sliding_window = 4096;
+        c2.inference.kv_heavy_hitter = 1024;
+        c2.inference.kv_heavy_sink = 8;
+        c2.inference.lock_usm = true;
+        c2.inference.lock_usm_mb = 2048;
+        c2.tuning.optimize_for = "watts".to_string();
+        let s = toml::to_string(&c2).unwrap();
+        let back: Config = toml::from_str(&s).unwrap();
+        assert_eq!(back.inference.kv_sliding_window, 4096);
+        assert_eq!(back.inference.kv_heavy_hitter, 1024);
+        assert_eq!(back.inference.kv_heavy_sink, 8);
+        assert!(back.inference.lock_usm);
+        assert_eq!(back.inference.lock_usm_mb, 2048);
+        assert_eq!(back.tuning.optimize_for, "watts");
     }
 
     #[test]
