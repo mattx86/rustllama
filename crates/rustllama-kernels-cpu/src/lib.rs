@@ -8,6 +8,7 @@
 //! All kernels are naive scalar loops. SIMD (AVX2 / AVX-512) and the SYCL
 //! GPU equivalents come in later phases; correctness first.
 
+pub mod cascade;
 pub mod delta_net;
 pub mod mlx_affine;
 pub mod mxfp;
