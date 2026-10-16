@@ -1122,6 +1122,239 @@ pub fn measure_kv_layout_candidates(
     })
 }
 
+/// Per-engine result from the P9 `tune --batching` A/B. `median_tps` is the
+/// **single-stream effective throughput** — generated tokens ÷ the full
+/// (prefill + decode) wall time of one request — the user-perceived number the
+/// perf gate must not regress.
+#[derive(Debug, Clone)]
+pub struct BatchingEngineResult {
+    /// `"paged"` (the continuous-batching `PagedBatchEngine`) or
+    /// `"contiguous"` (the single-stream `CpuEngine`).
+    pub engine: String,
+    pub warmup_ms: f64,
+    pub median_tps: Option<f64>,
+    pub max_tps: Option<f64>,
+    pub error: Option<String>,
+}
+
+/// Outcome of [`measure_batching_candidates`]. `winner` is `"paged"` when the
+/// batching engine is parity-or-faster single-stream (so default-on is safe),
+/// else `"contiguous"`. `None` when neither engine produced a run.
+#[derive(Debug, Clone)]
+pub struct BatchingMeasurementReport {
+    pub total_load_ms: f64,
+    pub winner: Option<String>,
+    pub paged_tps: Option<f64>,
+    pub contiguous_tps: Option<f64>,
+    pub candidates: Vec<BatchingEngineResult>,
+}
+
+/// P9 batching A/B: a batching winner is `"paged"` as long as the paged engine
+/// is within `(1 - PARITY) ×` the contiguous engine's single-stream tok/s —
+/// i.e. "parity-or-better" keeps continuous batching default-ON (its
+/// concurrency win dominates once >1 request is in flight), and only a CLEAR
+/// single-stream loss flips the serve path back to contiguous.
+const BATCHING_PARITY_MARGIN: f64 = 0.97;
+
+/// P9 `tune --batching` A/B: measure SINGLE-STREAM (one request, no
+/// concurrency) prefill+decode throughput on the continuous-batching
+/// `PagedBatchEngine` vs the contiguous `CpuEngine`, and decide whether
+/// default-on continuous batching regresses the single-user case.
+///
+/// Both engines run the SAME synthetic prompt (shifted per repeat so neither
+/// the contiguous prefix cache nor the paged APC short-circuits the prefill)
+/// under greedy sampling, and each request's full wall time (prefill + decode)
+/// is measured; the per-engine score is generated-tokens ÷ wall-seconds,
+/// median over `repeats`. The winner is `"paged"` when it's parity-or-faster
+/// (see [`BATCHING_PARITY_MARGIN`]), else `"contiguous"`.
+pub fn measure_batching_candidates(
+    model_path: &Path,
+    ctx_size: usize,
+    prompt_tokens: u32,
+    decode_tokens: u32,
+    repeats: u32,
+    cfg: &MeasurementConfig,
+) -> crate::Result<BatchingMeasurementReport> {
+    use crate::paged_batch::PagedBatchEngine;
+
+    let mut total_load_ms = 0.0f64;
+    let mut candidates: Vec<BatchingEngineResult> = Vec::with_capacity(2);
+
+    // Greedy, deterministic sampling. No string stops / grammar — this
+    // measures the raw forward throughput, which is what both engines share.
+    let sampling = |n: u32| SamplingParams {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        typical_p: 1.0,
+        repeat_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        seed: 0,
+        max_tokens: n,
+        stop: Vec::new(),
+        ..SamplingParams::default()
+    };
+    // A prompt of `prompt_tokens` ids, shifted by `salt` so a different call
+    // never content-matches a prior one (dodges prefix-cache / APC reuse).
+    let make_prompt = |vocab: i32, salt: i64| -> Vec<i32> {
+        let v = vocab.max(2) as i64;
+        (0..prompt_tokens as i64)
+            .map(|i| (1 + (i + salt).rem_euclid(v - 1)) as i32)
+            .collect()
+    };
+    let median_max = |mut runs: Vec<f64>| -> (Option<f64>, Option<f64>) {
+        if runs.is_empty() {
+            return (None, None);
+        }
+        runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = if runs.len() % 2 == 1 {
+            runs[runs.len() / 2]
+        } else {
+            (runs[runs.len() / 2 - 1] + runs[runs.len() / 2]) / 2.0
+        };
+        (Some(median), Some(runs[runs.len() - 1]))
+    };
+
+    // ---- Contiguous CpuEngine (the single-stream reference) ----
+    let contiguous_tps = {
+        let load_start = std::time::Instant::now();
+        let loaded = CpuEngine::load_with_options_and_layout(
+            model_path,
+            ctx_size,
+            true,
+            cfg.kv_dtype,
+            "contiguous",
+        );
+        total_load_ms += load_start.elapsed().as_secs_f64() * 1000.0;
+        match loaded {
+            Err(e) => {
+                candidates.push(BatchingEngineResult {
+                    engine: "contiguous".into(),
+                    warmup_ms: 0.0,
+                    median_tps: None,
+                    max_tps: None,
+                    error: Some(format!("load failed: {e}")),
+                });
+                None
+            }
+            Ok(mut cpu) => {
+                cpu.set_prefix_cache(false);
+                cpu.set_flash_attention(cfg.flash_attention);
+                cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+                let vocab = cpu.vocab_size() as i32;
+                let warmup_t = std::time::Instant::now();
+                let _ = cpu.generate_token_ids(&make_prompt(vocab, -1), decode_tokens, &sampling(decode_tokens));
+                let warmup_ms = warmup_t.elapsed().as_secs_f64() * 1000.0;
+                let mut runs: Vec<f64> = Vec::new();
+                let mut last_err: Option<String> = None;
+                for r in 0..repeats {
+                    cpu.clear_prefix_cache();
+                    let p = make_prompt(vocab, r as i64);
+                    let t = std::time::Instant::now();
+                    match cpu.generate_token_ids(&p, decode_tokens, &sampling(decode_tokens)) {
+                        Ok(out) if !out.is_empty() => {
+                            let secs = t.elapsed().as_secs_f64();
+                            if secs > 0.0 {
+                                runs.push(out.len() as f64 / secs);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => last_err = Some(e.to_string()),
+                    }
+                }
+                let (median, max) = median_max(runs);
+                candidates.push(BatchingEngineResult {
+                    engine: "contiguous".into(),
+                    warmup_ms,
+                    median_tps: median,
+                    max_tps: max,
+                    error: if median.is_none() { last_err } else { None },
+                });
+                median
+            }
+        }
+    };
+
+    // ---- Paged PagedBatchEngine (the continuous-batching engine), M=1 ----
+    let paged_tps = {
+        let load_start = std::time::Instant::now();
+        let loaded = PagedBatchEngine::load(model_path, ctx_size, 1);
+        total_load_ms += load_start.elapsed().as_secs_f64() * 1000.0;
+        match loaded {
+            Err(e) => {
+                candidates.push(BatchingEngineResult {
+                    engine: "paged".into(),
+                    warmup_ms: 0.0,
+                    median_tps: None,
+                    max_tps: None,
+                    error: Some(format!("load failed: {e}")),
+                });
+                None
+            }
+            Ok(paged) => {
+                let vocab = paged.vocab_size() as i32;
+                let warmup_t = std::time::Instant::now();
+                let _ = paged.generate_batched_token_ids(vec![(
+                    make_prompt(vocab, -1),
+                    sampling(decode_tokens),
+                )]);
+                let warmup_ms = warmup_t.elapsed().as_secs_f64() * 1000.0;
+                let mut runs: Vec<f64> = Vec::new();
+                let mut last_err: Option<String> = None;
+                for r in 0..repeats {
+                    let p = make_prompt(vocab, r as i64);
+                    let t = std::time::Instant::now();
+                    match paged.generate_batched_token_ids(vec![(p, sampling(decode_tokens))]) {
+                        Ok(outs) if outs.first().map(|o| !o.is_empty()).unwrap_or(false) => {
+                            let secs = t.elapsed().as_secs_f64();
+                            if secs > 0.0 {
+                                runs.push(outs[0].len() as f64 / secs);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => last_err = Some(e.to_string()),
+                    }
+                }
+                let (median, max) = median_max(runs);
+                candidates.push(BatchingEngineResult {
+                    engine: "paged".into(),
+                    warmup_ms,
+                    median_tps: median,
+                    max_tps: max,
+                    error: if median.is_none() { last_err } else { None },
+                });
+                median
+            }
+        }
+    };
+
+    // Decide the winner. Paged wins on parity-or-better (its real payoff is
+    // multi-request concurrency, which this single-stream A/B can't see, so a
+    // near-tie keeps continuous batching on). A clear single-stream loss flips
+    // the serve path back to contiguous.
+    let winner = match (paged_tps, contiguous_tps) {
+        (Some(p), Some(c)) => {
+            if p >= c * BATCHING_PARITY_MARGIN {
+                Some("paged".to_string())
+            } else {
+                Some("contiguous".to_string())
+            }
+        }
+        (Some(_), None) => Some("paged".to_string()),
+        (None, Some(_)) => Some("contiguous".to_string()),
+        (None, None) => None,
+    };
+
+    Ok(BatchingMeasurementReport {
+        total_load_ms,
+        winner,
+        paged_tps,
+        contiguous_tps,
+        candidates,
+    })
+}
+
 /// Drive the engine through each batch-size candidate, time the
 /// prefill phase of a synthetic prompt, pick the highest-throughput
 /// candidate. Decode tokens are pinned to 1 so the measurement

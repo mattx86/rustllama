@@ -51,12 +51,78 @@ use rustllama_models::paged_kv_store::PagedKvStore;
 use rustllama_models::shared_paged_kv::SharedPagedKv;
 use rustllama_tokenizer::{ChatMessage as TokChat, Tokenizer};
 
+use crate::grammar::GrammarMask;
 use crate::inference::CpuEngineError;
 use crate::sampling::Sampler;
 use crate::{
-    ChatMessage, Engine, EngineError, Metrics, RequestStats, Result as EngineResult,
+    ChatMessage, Engine, EngineError, GrammarKind, Metrics, RequestStats, Result as EngineResult,
     SamplingParams, Token, TokenStream,
 };
+
+/// P9 feature parity: tool-call grammar recursion cap for the paged driver.
+/// Mirrors `CpuEngine`'s `DEFAULT_MAX_TOOL_ITERATIONS` (8) — the paged engine
+/// has no per-request tool-iteration knob, so it uses the same default the
+/// contiguous engine starts from.
+const PAGED_MAX_TOOL_ITERATIONS: u32 = 8;
+
+/// P9 feature parity: build the per-request grammar mask for the paged driver,
+/// mirroring `CpuEngine::build_grammar`. Returns `None` when no grammar was
+/// requested, or (fail-soft, like the contiguous path) when the engine has no
+/// tokenizer to pre-decode the vocab. Built once per request at admission —
+/// each slot owns its own advancing `GrammarMask`.
+fn build_paged_grammar(
+    model: &LlamaModel,
+    tokenizer: Option<&Arc<Tokenizer>>,
+    sampling: &SamplingParams,
+) -> Option<GrammarMask> {
+    let kind = sampling.grammar.as_ref()?;
+    let tokenizer = match tokenizer {
+        Some(t) => t,
+        None => {
+            tracing::warn!(
+                "grammar requested ({kind:?}) but paged engine has no tokenizer; ignoring"
+            );
+            return None;
+        }
+    };
+    let vocab = model.cfg.vocab_size;
+    let eos = model.cfg.eos_token_id;
+    let decode = |id: u32| tokenizer.decode_single(id, true).unwrap_or_default().into_bytes();
+    match kind {
+        GrammarKind::Json => Some(GrammarMask::new_json(vocab, eos, decode)),
+        GrammarKind::JsonSchema { schema } => Some(GrammarMask::new_json_schema(
+            schema.clone(),
+            vocab,
+            eos,
+            decode,
+        )),
+        GrammarKind::ToolCallStream {
+            schemas_by_name,
+            min_completed,
+        } => Some(GrammarMask::new_tool_call_stream(
+            schemas_by_name.clone(),
+            PAGED_MAX_TOOL_ITERATIONS,
+            *min_completed,
+            vocab,
+            eos,
+            decode,
+        )),
+        GrammarKind::Code { language } => {
+            Some(GrammarMask::new_code_for_language(language, vocab, eos, decode))
+        }
+        GrammarKind::Regex { pattern } => match GrammarMask::new_regex(pattern, vocab, eos, decode) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    pattern,
+                    "invalid regex pattern in GrammarKind::Regex — ignoring grammar on paged engine"
+                );
+                None
+            }
+        },
+    }
+}
 
 /// V1 page size for the shared paged pool. Matches
 /// [`crate::kv_backend::DEFAULT_PAGE_SIZE`] so the two paged
@@ -146,6 +212,22 @@ struct SlotState {
     /// prompt in chunks; the slot contributes prefill rows (not a decode row)
     /// to the ragged tick until it drains.
     prefill_job: Option<PrefillJob>,
+    /// P9 feature parity: the per-slot grammar / structured-output mask
+    /// (`response_format`, tool grammar), built from `sampling.grammar` at
+    /// admission. `None` = unconstrained. The decode path samples via
+    /// `Sampler::sample_with_grammar` + advances it per token, exactly like the
+    /// contiguous `CpuEngine` — so a grammar request behaves identically on the
+    /// batching engine.
+    grammar: Option<GrammarMask>,
+    /// P9 feature parity: client-supplied string stop sequences
+    /// (`sampling.stop`). Empty = none. Matched against [`Self::stop_buf`].
+    stop_strings: Vec<String>,
+    /// P9 feature parity: the running detokenized output buffer used for
+    /// string-stop matching. Accumulated via `decode_single(id, true)`
+    /// (matching `CpuEngine::drive_generation`), so a multi-token stop string
+    /// spanning several tokens is caught. Only grown when `stop_strings` is
+    /// non-empty (no detok cost otherwise).
+    stop_buf: String,
 }
 
 /// In-flight chunked prefill for one slot. `admit_request` stages the slot
@@ -527,10 +609,15 @@ impl PagedBatchEngine {
     ///     store lock (no inter-request batching for prefill yet).
     ///   - Decode steps after all prefills complete run as **one
     ///     fused call per tick** covering every still-active slot.
-    ///   - Stop conditions: per-request `max_tokens` or EOS token
-    ///     from the model config. String stop sequences and grammar
-    ///     constraints are not yet plumbed through — defer to
-    ///     [`crate::inference::CpuEngine`] for those today.
+    ///   - Stop conditions: per-request `max_tokens`, the model's EOS
+    ///     token, cache capacity, OR a client string stop sequence
+    ///     (`sampling.stop`). P9 brought the paged engine to feature
+    ///     parity with [`crate::inference::CpuEngine`]: `sampling.grammar`
+    ///     (structured output / tool grammar) is applied per slot via
+    ///     [`Sampler::sample_with_grammar`], and string stops are matched
+    ///     against the slot's running detok buffer — same semantics as the
+    ///     contiguous path (the stop-completing token is emitted, then the
+    ///     slot ends).
     ///   - Request count must be `<= max_slots`. Exceeding it
     ///     returns an error rather than queuing (queueing is the
     ///     scheduler's job in 3.7e).
@@ -651,6 +738,9 @@ impl PagedBatchEngine {
             let tokens_prefilled = prompt.len() as u32;
             let next_pos = tokens_prefilled;
             let sampler = Sampler::new(sampling.clone());
+            // P9 feature parity: grammar + string stops per slot.
+            let grammar = build_paged_grammar(&self.model, self.tokenizer.as_ref(), &sampling);
+            let stop_strings = sampling.stop.clone();
             let history: Vec<u32> = prompt_u32;
             slots.push(SlotState {
                 sampling,
@@ -668,6 +758,9 @@ impl PagedBatchEngine {
                 cache_hit_tokens: shared_lcp as u32,
                 // The synchronous batched path always prefills inline.
                 prefill_job: None,
+                grammar,
+                stop_strings,
+                stop_buf: String::new(),
             });
         }
 
@@ -735,18 +828,47 @@ impl PagedBatchEngine {
             for &i in &active_indices {
                 let logits = &mut step_logits[i];
                 let slot = &mut slots[i];
-                let SlotState {
-                    sampler,
-                    history,
-                    ..
-                } = slot;
-                let next_tok = sampler.sample(logits, history);
+                // P9: grammar-masked sample + grammar advance (feature parity
+                // with `CpuEngine::generate_token_ids`).
+                let next_tok = {
+                    let SlotState {
+                        sampler,
+                        history,
+                        grammar,
+                        ..
+                    } = slot;
+                    let tok = sampler.sample_with_grammar(logits, history, grammar.as_ref());
+                    if let Some(g) = grammar.as_mut() {
+                        g.advance(tok);
+                    }
+                    tok
+                };
                 outputs[i].push(next_tok as i32);
                 slots[i].history.push(next_tok);
                 slots[i].next_input = next_tok as i32;
                 slots[i].next_pos += 1;
                 slots[i].n_emitted += 1;
-                // Stop conditions: max_tokens or EOS.
+                // P9 string-stop detection: accumulate the detok buffer exactly
+                // like the contiguous CpuEngine (`decode_single(id, true)`) and
+                // match. The stop-completing token is still emitted (it's in
+                // `outputs[i]`), then the slot stops — mirroring
+                // `drive_generation`.
+                let hit_stop = if slots[i].stop_strings.is_empty() {
+                    false
+                } else {
+                    let piece = self
+                        .tokenizer
+                        .as_ref()
+                        .and_then(|t| t.decode_single(next_tok, true).ok())
+                        .unwrap_or_default();
+                    let slot = &mut slots[i];
+                    slot.stop_buf.push_str(&piece);
+                    let buf = &slot.stop_buf;
+                    slot.stop_strings
+                        .iter()
+                        .any(|s| !s.is_empty() && buf.contains(s.as_str()))
+                };
+                // Stop conditions: max_tokens, EOS, capacity, or a string stop.
                 let hit_max = slots[i].n_emitted >= slots[i].sampling.max_tokens;
                 let hit_eos = slots[i]
                     .eos
@@ -757,7 +879,7 @@ impl PagedBatchEngine {
                 // when total_capacity was sized to prompt + max_tokens,
                 // but guards against config drift.
                 let hit_cap = slots[i].next_pos >= slots[i].cache.capacity_tokens();
-                if hit_max || hit_eos || hit_cap {
+                if hit_max || hit_eos || hit_cap || hit_stop {
                     slots[i].done = true;
                     slots[i].cache.release_shared(&self.shared);
                 }
@@ -1240,6 +1362,9 @@ fn admit_request(
         let last = *prompt.last().expect("non-empty prompt");
         let tokens_prefilled = prompt.len() as u32;
         let sampler = Sampler::new(sampling.clone());
+        // P9 feature parity: grammar + string stops per slot.
+        let grammar = build_paged_grammar(&ctx.model, ctx.tokenizer.as_ref(), &sampling);
+        let stop_strings = sampling.stop.clone();
         return Ok(SlotState {
             sampling,
             eos,
@@ -1263,6 +1388,9 @@ fn admit_request(
                 cache_hit_tokens: shared_lcp as u32,
                 started: std::time::Instant::now(),
             }),
+            grammar,
+            stop_strings,
+            stop_buf: String::new(),
         });
     }
 
@@ -1289,6 +1417,9 @@ fn admit_request(
     let tokens_prefilled = prompt.len() as u32;
     let next_pos = tokens_prefilled;
     let sampler = Sampler::new(sampling.clone());
+    // P9 feature parity: grammar + string stops per slot.
+    let grammar = build_paged_grammar(&ctx.model, ctx.tokenizer.as_ref(), &sampling);
+    let stop_strings = sampling.stop.clone();
     let history: Vec<u32> = prompt_u32;
     Ok(SlotState {
         sampling,
@@ -1305,6 +1436,9 @@ fn admit_request(
         tokens_prefilled,
         cache_hit_tokens: shared_lcp as u32,
         prefill_job: None,
+        grammar,
+        stop_strings,
+        stop_buf: String::new(),
     })
 }
 
@@ -1545,14 +1679,46 @@ fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
                 active[i].state.decode_ms += per_slot_ms;
                 let logits = logits_store[p].as_mut_slice();
                 let slot = &mut active[i];
-                let SlotState {
-                    sampler, history, ..
-                } = &mut slot.state;
-                let next_tok = sampler.sample(logits, history);
+                // P9 feature parity: grammar-masked sample + grammar advance,
+                // identical to `CpuEngine::drive_generation`.
+                let next_tok = {
+                    let SlotState {
+                        sampler,
+                        history,
+                        grammar,
+                        ..
+                    } = &mut slot.state;
+                    let tok = sampler.sample_with_grammar(logits, history, grammar.as_ref());
+                    if let Some(g) = grammar.as_mut() {
+                        g.advance(tok);
+                    }
+                    tok
+                };
                 slot.state.history.push(next_tok);
                 slot.state.next_input = next_tok as i32;
                 slot.state.next_pos += 1;
                 slot.state.n_emitted += 1;
+
+                // P9 string-stop detection: accumulate the detok buffer like the
+                // contiguous CpuEngine (`decode_single(id, true)`) and match, so
+                // a stop string spanning several tokens is caught. The
+                // stop-completing token is still streamed (below), then the slot
+                // ends — mirroring `drive_generation`'s "emit then break".
+                let hit_stop = if slot.state.stop_strings.is_empty() {
+                    false
+                } else {
+                    let piece = ctx
+                        .tokenizer
+                        .as_ref()
+                        .and_then(|t| t.decode_single(next_tok, true).ok())
+                        .unwrap_or_default();
+                    slot.state.stop_buf.push_str(&piece);
+                    let buf = &slot.state.stop_buf;
+                    slot.state
+                        .stop_strings
+                        .iter()
+                        .any(|s| !s.is_empty() && buf.contains(s.as_str()))
+                };
 
                 let text = match &ctx.tokenizer {
                     Some(tok) => tok.decode(&[next_tok], false).unwrap_or_default(),
@@ -1574,7 +1740,7 @@ fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
                     .map(|e| (next_tok as i32) == e)
                     .unwrap_or(false);
                 let hit_cap = slot.state.next_pos >= slot.state.cache.capacity_tokens();
-                if hit_max || hit_eos || hit_cap {
+                if hit_max || hit_eos || hit_cap || hit_stop {
                     slot.state.done = true;
                 }
             }

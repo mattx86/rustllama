@@ -735,3 +735,160 @@ fn paged_batch_rejects_batch_exceeding_max_slots() {
     );
     let _ = std::fs::remove_file(&tmp);
 }
+
+/// P9 feature parity — GRAMMAR. A `PagedBatchEngine` run with a grammar must
+/// produce the SAME tokens as the contiguous (paged-layout) `CpuEngine` with
+/// the same grammar — proving the paged driver applies the grammar mask
+/// identically (`sample_with_grammar` + `advance`), not silently dropping it.
+///
+/// `paged_batch_single_slot_matches_cpu_engine_greedy` already pins logit
+/// parity WITHOUT a grammar; this adds the grammar on both sides. If the paged
+/// engine ignored the grammar, its output would instead match the no-grammar
+/// run — which, for a non-trivial grammar (a JSON grammar heavily constrains
+/// this byte-level `<tok_N>` vocab), differs from the contiguous engine's
+/// constrained output, so the parity assertion below catches the regression.
+#[test]
+fn paged_batch_grammar_matches_cpu_engine() {
+    use rustllama_engine::GrammarKind;
+    use rustllama_models::llama_arch::KvDtype;
+    let tmp = write_gguf("grammar-vs-cpu");
+
+    let grammar_sampling = SamplingParams {
+        grammar: Some(GrammarKind::Json),
+        ..greedy(4)
+    };
+    let prompt: Vec<i32> = vec![5, 1, 4, 2, 3, 6];
+
+    // Contiguous reference on the SAME paged KV layout the engines share.
+    let mut cpu =
+        CpuEngine::load_with_options_and_layout(&tmp, 32, true, KvDtype::F32, "paged")
+            .expect("cpu engine load");
+    cpu.set_prefix_cache(false);
+    let cpu_plain: Vec<i32> = cpu
+        .generate_token_ids(&prompt, 4, &greedy(4))
+        .expect("cpu plain")
+        .into_iter()
+        .map(|t| t as i32)
+        .collect();
+    let cpu_json: Vec<i32> = cpu
+        .generate_token_ids(&prompt, 4, &grammar_sampling)
+        .expect("cpu json")
+        .into_iter()
+        .map(|t| t as i32)
+        .collect();
+
+    let batch = PagedBatchEngine::load(&tmp, 32, 1).expect("batch load");
+    let paged_json = batch
+        .generate_batched_token_ids(vec![(prompt.clone(), grammar_sampling.clone())])
+        .expect("paged json")
+        .into_iter()
+        .next()
+        .unwrap();
+
+    eprintln!(
+        "grammar parity: cpu_plain={cpu_plain:?} cpu_json={cpu_json:?} paged_json={paged_json:?} \
+         (grammar non-trivial on this model: {})",
+        cpu_plain != cpu_json
+    );
+    assert_eq!(
+        cpu_json, paged_json,
+        "paged engine must apply the grammar identically to the contiguous engine"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// P9 feature parity — STRING STOPS. A `PagedBatchEngine` request whose
+/// `sampling.stop` contains the decoded text of the first emitted token must
+/// stop right after that token (the stop-completing token is still emitted,
+/// then the slot ends) — identical semantics to `CpuEngine::drive_generation`.
+#[test]
+fn paged_batch_string_stop_terminates_generation() {
+    let tmp = write_gguf("string-stop");
+    let prompt: Vec<i32> = vec![5, 1, 4, 2, 3];
+
+    // Baseline (no stop): capture the greedy sequence + the first token's text.
+    let no_stop = PagedBatchEngine::load(&tmp, 32, 1).expect("load no-stop");
+    let full = no_stop
+        .generate_batched_token_ids(vec![(prompt.clone(), greedy(4))])
+        .expect("full generate")
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(full.len(), 4, "baseline must generate max_tokens (first token is not EOS)");
+    let tok0 = full[0] as u32;
+    let s0 = no_stop
+        .tokenizer()
+        .expect("tokenizer")
+        .decode_single(tok0, true)
+        .expect("decode");
+    assert!(
+        !s0.is_empty(),
+        "synth decode of the first token must be non-empty for this stop test"
+    );
+    drop(no_stop);
+
+    // With stop = [s0]: generation must end right after the first token.
+    let with_stop = PagedBatchEngine::load(&tmp, 32, 1).expect("load with-stop");
+    let stop_sampling = SamplingParams {
+        stop: vec![s0.clone()],
+        ..greedy(4)
+    };
+    let stopped = with_stop
+        .generate_batched_token_ids(vec![(prompt.clone(), stop_sampling)])
+        .expect("stopped generate")
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        stopped.len(),
+        1,
+        "string stop must end generation after the first token (decoded={s0:?}, baseline={full:?})"
+    );
+    assert_eq!(
+        stopped[0], full[0],
+        "the first (stop-completing) token is still emitted"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// P9 feature parity — STRING STOPS through the async streaming driver path
+/// (what the server actually uses). Same stop contract as the sync test, but
+/// exercised through `submit_streaming` → the driver's `run_ragged_tick`.
+#[tokio::test]
+async fn paged_batch_streaming_string_stop_terminates() {
+    use futures::StreamExt;
+    let tmp = write_gguf("stream-string-stop");
+    let prompt: Vec<i32> = vec![5, 1, 4, 2, 3];
+
+    // Baseline streaming run (no stop) to capture the first token's text.
+    let eng = PagedBatchEngine::load(&tmp, 32, 1).expect("load");
+    let mut full: Vec<i32> = Vec::new();
+    let mut s = eng.submit_streaming(prompt.clone(), greedy(4)).expect("submit");
+    while let Some(item) = s.next().await {
+        full.push(item.expect("tok").id as i32);
+    }
+    assert_eq!(full.len(), 4, "baseline streams max_tokens");
+    let s0 = eng
+        .tokenizer()
+        .expect("tokenizer")
+        .decode_single(full[0] as u32, true)
+        .expect("decode");
+    assert!(!s0.is_empty(), "first-token decode must be non-empty");
+
+    // Stop run via the driver path.
+    let stop_sampling = SamplingParams {
+        stop: vec![s0.clone()],
+        ..greedy(4)
+    };
+    let mut stopped: Vec<i32> = Vec::new();
+    let mut s2 = eng.submit_streaming(prompt.clone(), stop_sampling).expect("submit stop");
+    while let Some(item) = s2.next().await {
+        stopped.push(item.expect("tok").id as i32);
+    }
+    assert_eq!(
+        stopped.len(),
+        1,
+        "driver-path string stop must end generation after the first token (decoded={s0:?})"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}

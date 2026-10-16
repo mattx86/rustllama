@@ -512,6 +512,17 @@ pub struct TuningResult {
     /// or `"paged"`). `None` = no entry.
     #[serde(default)]
     pub kv_cache_layout: Option<String>,
+    /// P9: single-stream serving-engine winner from `tune --batching` —
+    /// `"paged"` (the continuous-batching `PagedBatchEngine` is
+    /// parity-or-faster for the single-user case, so default-on is safe)
+    /// or `"contiguous"` (the contiguous `CpuEngine` is measurably faster
+    /// single-stream, so the serve path falls back to it). `None` =
+    /// untuned; the serve path then uses the default-on batching engine.
+    /// Consumed when `[server].fused_decode` is unset +
+    /// `[tuning].auto_apply_batching` is on (an explicit `fused_decode`
+    /// always wins). `#[serde(default)]` → old caches still load.
+    #[serde(default)]
+    pub batching_engine: Option<String>,
     /// Winning `[inference].flash_attention_kv_min` threshold from
     /// `rustllama tune --flash-kv-min`. Surfaces to the kernel
     /// dispatch via the `RUSTLLAMA_FLASH_KV_LEN_MIN` env var the
@@ -699,6 +710,7 @@ impl TuningResult {
             kv_dtype_groups: None,
             flash_attention: None,
             kv_cache_layout: None,
+            batching_engine: None,
             flash_kv_min: None,
             prefix_cache_max_snapshots: None,
             kv_page_size: None,

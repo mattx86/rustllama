@@ -649,25 +649,22 @@ pub struct InferenceConfig {
     #[serde(default)]
     pub cacheblend_recompute_ratio: f32,
     /// Continuous-batching token budget per driver tick for the fused-decode
-    /// **paged** serving engine (`[server].fused_decode = true`). `0` (the
-    /// default) = OFF: each request's prompt prefills INLINE at admission and
-    /// decode runs as its own batched forward — today's behavior, byte-identical.
+    /// **paged** serving engine (`[server].fused_decode`). **Default `2048`**
+    /// (P9): the ragged driver chunks a long prompt's prefill to this many
+    /// tokens per tick, so one slot's big prompt no longer monopolizes the
+    /// driver and the other slots keep decoding (TTFT fairness). `0` = unbounded
+    /// — the whole prompt prefills in ONE ragged tick (the pre-P9 behavior).
     ///
-    /// A positive value turns on the **ragged mixed prefill+decode** path: the
-    /// driver builds ONE forward per tick over a concatenated token buffer that
-    /// mixes in-progress prompt-prefill CHUNKS (budgeted to roughly this many
-    /// prompt tokens) with the 1-query decode rows of every active slot, so a
-    /// long prompt no longer monopolizes the driver and other slots keep
-    /// decoding (TTFT fairness + one fused kernel launch instead of a prefill
-    /// call then a decode call). The ragged forward is output-identical (up to
-    /// fp reduction order) to running those prefills and decodes separately —
-    /// pinned by the engine/model-crate parity tests. Paged-only + F32-only; a
-    /// non-paged or quant-KV config takes the existing path regardless.
+    /// The ragged forward is output-identical (up to fp reduction order) to
+    /// running those prefills and decodes separately — pinned by the
+    /// engine/model-crate parity tests, so the chunking changes no token, only
+    /// scheduling fairness. Paged-only + F32-only; a non-paged or quant-KV
+    /// config takes the existing path regardless.
     ///
     /// BACKS the `RUSTLLAMA_MAX_BATCHED_TOKENS` env var (which the paged driver
     /// also reads): the env wins when set, matching the repo's env-over-config
     /// tiering. Named after vLLM's `max_num_batched_tokens`.
-    #[serde(default)]
+    #[serde(default = "default_max_num_batched_tokens")]
     pub max_num_batched_tokens: u32,
     /// Memory-budget mode: `"manual"` (default) keeps the explicit
     /// knobs (`moe_expert_cache_mb`, `lock_ram_mb`) authoritative;
@@ -718,6 +715,14 @@ pub struct InferenceConfig {
 
 fn default_kv_heavy_sink() -> u32 {
     4
+}
+
+/// P9: default continuous-batching per-tick prefill budget (tokens). A
+/// positive value chunks a long prompt's prefill across driver ticks for
+/// TTFT fairness; `0` is unbounded (whole prompt in one tick). Output is
+/// identical either way — only scheduling differs.
+fn default_max_num_batched_tokens() -> u32 {
+    2048
 }
 
 fn default_lock_usm_mb() -> u64 {
@@ -981,10 +986,11 @@ impl Default for InferenceConfig {
             prefill_batched_hybrid: true,
             kv_persist_mb: 0,
             cacheblend_recompute_ratio: 0.0,
-            // Ragged mixed prefill+decode OFF by default: paged serving keeps
-            // the inline-prefill + separate-batched-decode path (byte-identical
-            // to pre-3b). Set >0 (or `RUSTLLAMA_MAX_BATCHED_TOKENS`) to fuse.
-            max_num_batched_tokens: 0,
+            // P9: default 2048 — the ragged driver chunks long-prompt prefill
+            // for TTFT fairness under continuous batching (output-identical to
+            // unbounded; only scheduling differs). `0` restores unbounded
+            // (whole prompt in one tick). Env `RUSTLLAMA_MAX_BATCHED_TOKENS` wins.
+            max_num_batched_tokens: default_max_num_batched_tokens(),
             memory_budget: default_memory_budget(),
             kv_sliding_window: 0,
             kv_heavy_hitter: 0,
@@ -1043,39 +1049,50 @@ pub struct ServerConfig {
     /// cap — the registry grows unbounded.
     pub max_loaded_models: u32,
     /// Number of concurrent generations a single model serves in
-    /// parallel. `1` (the default) is the safe single-flight path: one
-    /// in-flight request per model, others queue on the gate. `>1`
-    /// activates the multi-flight pool — each slot owns an independent
-    /// KV cache via `CpuEngine::fork_for_concurrent_use`, so memory
-    /// cost grows roughly linearly with concurrency (one KV cache per
-    /// fork). Tune up for multi-user serving, leave at `1` for
-    /// single-developer use (where one request at a time + the prefix
-    /// cache gives the best end-to-end throughput).
+    /// parallel. **Default `4`** (P9): with continuous batching on
+    /// (the default — see [`Self::fused_decode`]) this sizes the
+    /// `PagedBatchEngine`'s `max_slots` — up to 4 requests share ONE
+    /// paged KV pool + one fused decode tick, so the slots are cheap
+    /// (no per-request KV-cache duplication).
+    ///
+    /// On the CONTIGUOUS fallback path (`fused_decode = false`), `>1`
+    /// instead activates the per-fork multi-flight pool — each fork owns
+    /// an independent KV cache via `CpuEngine::fork_for_concurrent_use`,
+    /// so memory grows ~linearly with concurrency. To avoid a memory
+    /// regression for the single user, the serve path only builds those
+    /// forks when the operator EXPLICITLY set `fused_decode = false`; an
+    /// automatic fallback (perf-gate / VLM guard) keeps the contiguous
+    /// pool single-flight regardless of this value (that path buys no
+    /// real request parallelism today anyway).
     pub concurrency: u32,
-    /// Use fused multi-slot decode instead of the per-fork
-    /// multi-flight pool when serving concurrent requests. Requires
-    /// `[inference] kv_cache_layout = "paged"` — fused decode is
-    /// only wired for paged KV today.
+    /// Continuous batching: use the fused multi-slot `PagedBatchEngine`
+    /// (one shared paged KV pool + one driver thread batching every
+    /// in-flight request into a single forward per decode tick) instead
+    /// of the per-fork multi-flight contiguous pool.
     ///
-    /// When `true` + paged KV: `ServingModel` builds a single
-    /// `PagedBatchEngine` with `max_slots = concurrency`. M
-    /// concurrent HTTP requests share one paged KV pool + one
-    /// driver thread, with one fused decode kernel-launch
-    /// sequence per tick (instead of M independent forks each
-    /// issuing their own launches). On integrated GPUs where
-    /// kernel-launch overhead is a fraction of decode time, this
-    /// is the headline CB throughput win.
+    /// **P9 default-ON, perf-gated.** This is an `Option<bool>` so the
+    /// serve path can tell an EXPLICIT choice from "not set":
+    ///   - `Some(true)` / `Some(false)` — the operator wrote the key:
+    ///     honored verbatim (explicit config WINS over the tuner).
+    ///   - `None` (absent, the default) — the batching engine is used
+    ///     UNLESS `tune --batching` measured the contiguous engine
+    ///     faster for the single-user case on this (system, model)
+    ///     (`TuningResult::batching_engine == "contiguous"` +
+    ///     `[tuning].auto_apply_batching`), in which case the serve path
+    ///     falls back to contiguous automatically. A fresh box with no
+    ///     tuner data uses the batching engine (correct by the D1/D1b
+    ///     paged gates); the first-load autotune then measures + may
+    ///     switch it. Precedence: explicit config > tuner winner > the
+    ///     default-on batching engine.
     ///
-    /// When `false` (the default): falls back to the existing
-    /// per-fork multi-flight pool. Concurrent requests still run
-    /// in parallel, but each owns its own KV state — works with
-    /// any `kv_cache_layout` (contiguous or paged).
-    ///
-    /// Requires `[inference].kv_cache_layout = "paged"` (the loader
-    /// warns and ignores the flag otherwise, since fused decode shares
-    /// one paged KV pool across concurrent requests).
+    /// The `PagedBatchEngine` builds its own paged KV pool, so this flag
+    /// alone is sufficient regardless of `[inference].kv_cache_layout`
+    /// (the loader just warns on a `!= "paged"` mismatch). A
+    /// vision/multimodal (`[model].mmproj`) or hybrid model forces the
+    /// contiguous engine (fail-closed VLM / hybrid guards) irrespective
+    /// of this flag.
     #[serde(default)]
-    pub fused_decode: bool,
+    pub fused_decode: Option<bool>,
     /// Per-request audit log. When `true`, the server appends a
     /// JSONL entry (`ts_ms`, `method`, `path`, `query`, `status`,
     /// `latency_ms`) to [`Self::audit_log_path`] after each
@@ -1146,16 +1163,17 @@ impl Default for ServerConfig {
             cors_origins: Vec::new(),
             max_pending_per_model: 4,
             max_loaded_models: 4,
-            // Default to 1: all forks share the model's single
-            // serial SyclWorker thread, so extra forks buy ZERO
-            // request parallelism today — they only multiply KV-cache
-            // RAM (one full max_ctx cache each) and let requests 2..N
-            // pass admission just to sit invisibly in the worker's
-            // queue with no first token. Metrics polling and /api/tags
-            // don't need forks (they don't take the generation gate).
-            // Raise this only alongside real multi-worker execution.
-            concurrency: 1,
-            fused_decode: false,
+            // P9: default 4. With continuous batching on (the default),
+            // this is the PagedBatchEngine's max_slots — up to 4 requests
+            // share ONE paged KV pool + one fused decode tick, so slots
+            // are cheap (no per-request KV duplication). On an EXPLICIT
+            // contiguous fallback it sizes the per-fork pool; an automatic
+            // fallback stays single-flight regardless (see the serve path).
+            concurrency: 4,
+            // P9: default-ON (None ⇒ batching engine unless the tuner's
+            // `tune --batching` winner says contiguous is faster for the
+            // single-user case). `Some(x)` = explicit operator override.
+            fused_decode: None,
             audit_log: false,
             audit_log_path: String::new(),
             rate_limit_per_minute: 0,
@@ -1236,6 +1254,16 @@ pub struct TuningConfig {
     /// gates on continuous batching.
     #[serde(default = "default_true_serde")]
     pub auto_apply_kv_cache_layout: bool,
+    /// P9: when `true` (default), the serve path consults the
+    /// `tune --batching` winner (`TuningResult::batching_engine`) to
+    /// decide between the continuous-batching `PagedBatchEngine` and the
+    /// contiguous `CpuEngine` for the single-user case — but ONLY when
+    /// `[server].fused_decode` is left unset (an explicit `fused_decode`
+    /// always wins). Off ⇒ the tuner never flips the engine; the
+    /// default-on batching engine (or the explicit `fused_decode`) is
+    /// used regardless of what the A/B measured.
+    #[serde(default = "default_true_serde")]
+    pub auto_apply_batching: bool,
     /// When `true` (default), the engine overrides
     /// `[inference].flash_attention_kv_min` with the cached winner.
     /// Tuner sweep picks the host-specific break-even crossover
@@ -1319,6 +1347,7 @@ impl Default for TuningConfig {
             auto_apply_tree_widths: true,
             auto_apply_ssm_prefill_chunked: true,
             auto_apply_kv_cache_layout: true,
+            auto_apply_batching: true,
             auto_apply_flash_kv_min: true,
             auto_apply_prefix_cache_max_snapshots: true,
             auto_apply_kv_page_size: true,
