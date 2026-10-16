@@ -1320,18 +1320,26 @@ impl AppState {
     }
 
     /// Remove a model from the registry. Returns the removed entry, or
-    /// `None` if the id wasn't registered. Refuses to remove the last
-    /// remaining model (server would have nothing to serve).
+    /// `None` if the id wasn't registered (→ the handler maps that to a
+    /// 404). Refuses to remove the **last remaining model** — the server
+    /// would be left with nothing to serve — returning `Err` (→ 400). This
+    /// also enforces the documented "can't unload the current default"
+    /// contract in the single-model case, where the only model IS the
+    /// default.
     pub async fn unload(&self, model_id: &str) -> Result<Option<ServingModel>, &'static str> {
         let mut g = self.inner.write().await;
+        // Unknown id → Ok(None) so the handler 404s. Distinguish this from
+        // the last-model refusal below (which 400s) before touching the map.
+        if !g.models.contains_key(model_id) {
+            return Ok(None);
+        }
+        if g.models.len() == 1 {
+            return Err("cannot unload the last remaining model — load another \
+                        model first, or stop the server");
+        }
         let removed = g.models.remove(model_id);
-        // If the default was removed, promote the next remaining id — or
-        // clear it when the registry is now empty. "Eject" intentionally
-        // frees the last model too (LM Studio semantics): the server
-        // tolerates an empty registry (every request path resolves via
-        // `resolve`/`try_current`, which return None → "model not loaded"),
-        // and dropping the last `ServingModel` releases its weights/RAM.
-        // Clearing `default_id` keeps `try_current().is_empty()` accurate.
+        // If the default was removed (and others remain), promote the next
+        // id so a valid default always exists.
         if g.default_id == model_id {
             g.default_id = g.models.keys().next().cloned().unwrap_or_default();
         }
@@ -2254,6 +2262,26 @@ async fn load_model(
                 .into_response();
         }
     };
+    // Validate a request-provided kv_dtype up front — BEFORE the
+    // (blocking) first-load autotune and the load itself — so an unknown
+    // spelling is a clean 400 client error, not a 500 after a wasted tune +
+    // failed load. The coherence guardrail below (`coherence_safe_kv_dtype`)
+    // only downgrades aggressive-but-*valid* quants to f32; handed an
+    // unrecognized string it would also return "f32", silently swallowing
+    // the typo and letting the load proceed. Catch it here instead.
+    if let Some(s) = req.kv_dtype.as_deref() {
+        if !s.is_empty() && rustllama_engine::KvDtype::parse(s).is_none() {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "unknown kv_dtype `{s}` (expected: f32, q8_0, q4_0, \
+                     tq1/tq2/tq4/tq8, nvfp4, or mxfp4/mxfp6/mxfp8)"
+                ),
+            )
+                .into_response();
+        }
+    }
+
     // Model-card-driven ctx_size: when the caller didn't pin a
     // value, respect what the model was trained for, capped at the
     // historical 8192 default so a 1M-ctx model doesn't allocate

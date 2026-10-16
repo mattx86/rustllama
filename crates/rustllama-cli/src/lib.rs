@@ -11954,7 +11954,9 @@ mod tests {
                 "expected Q8_0 for {s:?}"
             );
         }
-        assert!(parse_kv_dtype("q4_0").is_err());
+        // q4_0 KV is now a supported, autotune-picked dtype (contiguous
+        // backend; whitening + kv-bias calibration). It used to be rejected.
+        assert!(matches!(parse_kv_dtype("q4_0").unwrap(), KvDtype::Q4_0));
         assert!(parse_kv_dtype("nonsense").is_err());
     }
 }

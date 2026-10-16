@@ -431,29 +431,64 @@ fn load_auto_loads_mlx_directory_and_runs_forward() {
 }
 
 #[test]
-fn load_mlx_direct_entry_loads_with_dequanted_weights() {
+fn load_mlx_direct_entry_loads_with_packed_affine_weights() {
     // Direct `load_mlx` (bypassing the dispatcher) + a weight sanity
-    // check: the dequanted q_proj must hold finite, non-zero values.
+    // check. MLX load no longer dequantizes a quantized linear to f16 at
+    // load: since the packed-residency change (`703736c`) + the load-time
+    // GGUF-quant transcode (`953595e`), the weight stays in a packed,
+    // self-describing blob — native `MlxAffineRaw` in slim builds (the
+    // `encoder` feature OFF, which is the case for `cargo test
+    // -p rustllama-engine`), or a transcoded Q4_1 / Q4_K / Q8_0 when
+    // `encoder` is on. The weights only materialize to f32 inside the
+    // matvec kernel (the forward-run test above covers that end to end).
+    // So: assert the packed residency landed with the correct LOGICAL
+    // [out, in] shape and — on the native path — decodes to finite,
+    // non-zero affine parameters (the "not garbage / not zeroed" guard the
+    // old dequant check gave us, now applied to the packed blob).
+    use rustllama_tensor::Dtype;
+
     let dir = build_mlx_dir("direct");
     let engine = CpuEngine::load_mlx(&dir, 64).expect("load_mlx");
     let model = engine.__model_for_test();
     let blk = &model.weights.blocks[0];
-    // q_proj dequants to [d_model, d_model] = [64, 64], stored f16.
+    // Logical [out, in] = [d_model, d_model] = [64, 64], carried in
+    // `ct.shape` regardless of the packed on-cache representation.
     assert_eq!(blk.w_q.shape, vec![64, 64]);
+    // Packed-quant residency — NOT a dequanted f16/f32 tensor.
+    assert!(
+        matches!(
+            blk.w_q.dtype,
+            Dtype::MlxAffineRaw | Dtype::Q4_1Raw | Dtype::Q4_KRaw | Dtype::Q8_0Raw
+        ),
+        "q_proj must stay in packed-quant residency, got {:?}",
+        blk.w_q.dtype
+    );
     let bytes: Vec<u8> = match &blk.w_q.storage {
         rustllama_tensor::Storage::CpuOwned(b) => b.as_ref().to_vec(),
         _ => panic!("expected CpuOwned"),
     };
-    let f16s: &[f16] = cast_slice(&bytes);
-    assert_eq!(f16s.len(), 64 * 64);
-    assert!(
-        f16s.iter().all(|h| h.to_f32().is_finite()),
-        "every dequanted weight must be finite"
-    );
-    assert!(
-        f16s.iter().any(|h| h.to_f32().abs() > 1e-4),
-        "dequant must not zero out the whole tensor"
-    );
+    assert!(!bytes.is_empty(), "packed weight blob must not be empty");
+    // On the native (encoder-off) path the blob is the MLX-affine format;
+    // decode it and confirm the group scales are finite and not all zero
+    // (all-zero scales would dequant the whole tensor to zero).
+    if blk.w_q.dtype == Dtype::MlxAffineRaw {
+        let view = rustllama_tensor::MlxAffineBlobView::parse(&bytes)
+            .expect("MlxAffineRaw blob parses");
+        assert_eq!((view.rows, view.cols), (64, 64));
+        let scales: Vec<f32> = view
+            .scales_f16
+            .chunks_exact(2)
+            .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect();
+        assert!(
+            scales.iter().all(|s| s.is_finite()),
+            "every group scale must be finite"
+        );
+        assert!(
+            scales.iter().any(|s| s.abs() > 1e-4),
+            "dequant must not zero out the whole tensor (all group scales ~0)"
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

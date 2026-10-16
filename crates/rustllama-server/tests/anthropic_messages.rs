@@ -207,9 +207,17 @@ async fn messages_unknown_model_returns_404() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    // body should mention the unknown model.
-    let text = body.as_str().unwrap_or("");
-    assert!(text.contains("no-such-model"), "body: {text}");
+    // The handler returns the structured OpenAI/Anthropic error envelope
+    // (`model_not_found` → `openai_error`), same as /v1/chat/completions —
+    // a JSON object `{"error":{"message":...}}`, not a plain-text body. Read
+    // the message out of the envelope and confirm it names the unknown model.
+    let text = body
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| body.to_string());
+    assert!(text.contains("no-such-model"), "body: {body}");
 }
 
 #[tokio::test]

@@ -1137,13 +1137,25 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_device_returns_none_in_mock_build() {
-        // When no SYCL device is visible at runtime — the usual
-        // `cargo test` host — the live probe should produce None
-        // rather than panic or yield garbage.
-        // Real-GPU builds verify the success path via the engine's
-        // sycl_resources tests instead.
-        assert!(fingerprint_device(0).is_none());
+    fn fingerprint_device_probe_does_not_panic() {
+        // Host-agnostic: on a no-SYCL host (CI) the live probe returns
+        // None; on a host with a real SYCL GPU (a dev box with an Iris Xe
+        // or Arc) it returns Some. Either way the probe must not panic,
+        // and any fingerprint it returns must be well-formed — a named
+        // device. (We can't assert concrete field values without pinning
+        // to specific hardware.)
+        if let Some(fp) = fingerprint_device(0) {
+            let DeviceFingerprint {
+                pci_id: _,
+                driver_ver: _,
+                name,
+                vram_mb: _,
+            } = &fp;
+            assert!(
+                !name.is_empty(),
+                "a probed SYCL device must report a non-empty name: {fp:?}"
+            );
+        }
     }
 
     #[test]
