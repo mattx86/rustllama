@@ -47,7 +47,7 @@ use std::time::Instant;
 
 use futures::Stream;
 use rustllama_gguf::Gguf;
-use rustllama_models::llama_arch::{DecodeSlot, LlamaModel};
+use rustllama_models::llama_arch::{DecodeSlot, DeltaNetCache, KvCache, KvDtype, LlamaModel};
 use rustllama_models::page_table::PageTable;
 use rustllama_models::paged_kv_cache::PagedKvCache;
 use rustllama_models::paged_kv_store::PagedKvStore;
@@ -164,6 +164,31 @@ fn gguf_has_vision_indicator(gguf: &Gguf) -> bool {
         .any(|t| t.name.starts_with("v.") || t.name.contains("mmproj") || t.name.contains(".vision."))
 }
 
+/// F8: per-slot recurrent + attention state for a HYBRID (DeltaNet/SSM)
+/// model. The paged KV store has no per-position addressing for the
+/// recurrent half (a DeltaNet snapshot is valid only at the exact token
+/// position it was captured — see [`DeltaNetCache`]), so a hybrid slot
+/// does NOT use the shared paged pool. Instead it carries its OWN
+/// contiguous F32 KV cache (for the full-attention layers) + its OWN
+/// `DeltaNetCache` (for the SSM/recurrent layers) and is driven through the
+/// SAME `forward_prefill_hybrid` / `forward_one_hybrid` the contiguous
+/// `CpuEngine` uses — so a paged hybrid slot's output is BIT-IDENTICAL to
+/// the contiguous engine on the same prompt + sampling. Multiple hybrid
+/// slots interleave at the driver's tick granularity, each advancing its
+/// own `kv` + `dn` independently, so there is no cross-slot contamination
+/// of the recurrent state (the F8 anchor).
+struct HybridSlotState {
+    /// Contiguous F32 KV cache for the full-attention layers (SSM layers'
+    /// slabs are allocated-but-unused — the hybrid forward never writes KV
+    /// on an SSM layer). Sized to `max_ctx`.
+    kv: KvCache,
+    /// Per-slot DeltaNet recurrent state (conv + recurrent per SSM layer).
+    dn: DeltaNetCache,
+    /// `kv.max_ctx` as u32 — the slot's write capacity, used for the
+    /// `hit_cap` stop check in place of the paged `cache.capacity_tokens()`.
+    capacity: u32,
+}
+
 /// Per-slot in-flight state: which prompt + sampling params it's
 /// running, its KV cache, sampler RNG / Mirostat state, and the
 /// growing output token list. The engine owns a `Vec<SlotState>`
@@ -172,6 +197,12 @@ struct SlotState {
     sampling: SamplingParams,
     eos: Option<i32>,
     cache: PagedKvCache,
+    /// F8: `Some` for a HYBRID model's slot (per-slot contiguous KV +
+    /// DeltaNet recurrent state; the paged `cache` above stays an empty
+    /// placeholder and its page ops are no-ops). `None` for every
+    /// dense / MoE model — the paged `cache` is the real KV store and
+    /// the slot machinery is byte-identical to the pre-F8 path.
+    hybrid: Option<HybridSlotState>,
     sampler: Sampler,
     /// Growing emitted-token list — used both as the per-slot
     /// "next input" source and as the repetition-penalty history.
@@ -257,6 +288,19 @@ struct SlotState {
     /// `None` for a slot whose model carries no draft head (spec never engages)
     /// and for greedy spec (deterministic, no draws).
     spec_rng: Option<crate::sampling::Rng>,
+}
+
+impl SlotState {
+    /// Token write-capacity for the `hit_cap` stop check. A HYBRID slot
+    /// (F8) stores KV in its own contiguous cache, so its capacity is that
+    /// cache's `max_ctx`; a dense/MoE slot uses the paged `cache`'s
+    /// capacity. Keeps the shared decode-commit path dtype-agnostic.
+    fn effective_capacity_tokens(&self) -> u32 {
+        match &self.hybrid {
+            Some(h) => h.capacity,
+            None => self.cache.capacity_tokens(),
+        }
+    }
 }
 
 /// In-flight chunked prefill for one slot. `admit_request` stages the slot
@@ -440,23 +484,29 @@ impl PagedBatchEngine {
         let gguf = Gguf::open(path)?;
         let model = LlamaModel::load(&gguf)?;
 
-        // D1a (relaxed by D1b): fail-closed model gate. `PagedBatchEngine` is
-        // selected by `[server].fused_decode` and previously did NO gating — so a
-        // model whose paged forward path is wrong or missing was served silently.
-        //   * HYBRID (DeltaNet/SSM): NO paged forward walks `hybrid_layers` at
-        //     all → refuse unconditionally (lifted by F8, hybrid CB).
-        //   * SWA / Gemma2-softcap: D1b threaded the per-layer sliding-window span
-        //     + attention-logit soft-cap through the F32 paged forwards
-        //     (`forward_ragged_paged_f32` — the driver path —, plus the batched /
-        //     single-token decode + inline-prefill helpers), so these models are
-        //     now served correctly here. This engine's KV store is F32-ONLY
-        //     (`PagedKvStore`, no quant-KV paged path), and the F32 windowed/capped
-        //     kernels carry window/softcap, so there is no non-F32 paged path left
-        //     to fence off — the old refusal is gone. (F1 has since taught the
-        //     CONTIGUOUS quant-KV flash kernels window/softcap, but this paged
-        //     engine still has no quant-KV store; if one is ever added, re-gate on
-        //     `(sliding_window||softcap) && dtype!=F32` until the PAGED quant-KV
-        //     forwards also carry the window/softcap uniforms.)
+        // D1a (relaxed by D1b, then F8): fail-closed model gate.
+        // `PagedBatchEngine` is selected by `[server].fused_decode` and
+        // previously did NO gating — so a model whose paged forward path is
+        // wrong or missing was served silently.
+        //   * HYBRID (DeltaNet/SSM): F8 lifted the blanket refusal. A hybrid
+        //     slot does not use the shared paged pool at all — the recurrent
+        //     half has no per-position addressing, so paged prefix reuse can't
+        //     apply to it. Instead each hybrid slot carries its OWN contiguous
+        //     F32 KV + its OWN `DeltaNetCache` and is driven through the SAME
+        //     `forward_prefill_hybrid` / `forward_one_hybrid` the contiguous
+        //     `CpuEngine` uses (see [`HybridSlotState`], [`build_hybrid_slot_state`],
+        //     [`run_hybrid_tick`]) — BIT-IDENTICAL to contiguous, so it is
+        //     correct to admit. The one hybrid sub-case still refused:
+        //     SWA / attention-logit soft-cap, because the hybrid forward
+        //     hardcodes window=0 / softcap=0.0 for its attention layers (it has
+        //     no windowed/capped hybrid kernel), so a hybrid model that ALSO
+        //     declares sliding-window or a soft-cap can't be served correctly on
+        //     EITHER engine here — fail-closed with a pointed message rather than
+        //     serve it wrong. (No real hybrid arch declares these today.)
+        //   * SWA / Gemma2-softcap (non-hybrid): D1b threaded the per-layer
+        //     sliding-window span + attention-logit soft-cap through the F32 paged
+        //     forwards, so these models are served correctly here. The paged KV
+        //     store is F32-ONLY, so there is no non-F32 paged path to fence off.
         //
         // MoE is NOT refused here. The old refusal fenced off the budget-0 INLINE
         // prefill (`forward_prefill_paged_f32`), which loops only `weights.blocks`
@@ -464,10 +514,16 @@ impl PagedBatchEngine {
         // forward (`forward_ragged_paged_f32`), which handles `moe_blocks` — and a
         // zero budget means UNBOUNDED ragged prefill, not the inline path. So MoE
         // is served correctly on the paged engine at any budget; the gate is gone.
-        if model.weights.is_hybrid() {
+        if model.weights.is_hybrid()
+            && (model.cfg.sliding_window.is_some()
+                || model.cfg.attn_logit_softcapping.is_some())
+        {
             return Err(CpuEngineError::Other(
-                "continuous batching (fused_decode) does not support hybrid \
-                 (DeltaNet/SSM) models yet; use the default engine for this model"
+                "continuous batching (fused_decode) does not support a HYBRID \
+                 (DeltaNet/SSM) model that also uses sliding-window attention or \
+                 attention-logit soft-capping (the hybrid forward has no \
+                 windowed/capped attention kernel); disable fused_decode to serve \
+                 this model on the default engine"
                     .into(),
             ));
         }
@@ -756,6 +812,24 @@ impl PagedBatchEngine {
                     max_ctx: self.max_ctx,
                 });
             }
+            // F8: a HYBRID model's slot carries its own contiguous KV +
+            // DeltaNet state (no shared pool, no cross-request prefix share),
+            // prefilled through the contiguous hybrid forward — bit-identical
+            // to `CpuEngine`. Build it and move to the next request.
+            if self.model.weights.is_hybrid() {
+                let state = build_hybrid_slot_state(
+                    &self.model,
+                    self.tokenizer.as_ref(),
+                    self.max_ctx,
+                    &prompt,
+                    &sampling,
+                    eos,
+                    0,
+                )
+                .map_err(|e| CpuEngineError::Other(format!("hybrid slot build: {e}")))?;
+                slots.push(state);
+                continue;
+            }
             // PagedKvCache::new_for only reads geometry. Build a
             // throwaway store for it — the shared one would
             // require a lock.
@@ -838,6 +912,9 @@ impl PagedBatchEngine {
                 sampling,
                 eos,
                 cache,
+                // Dense/MoE sync-batch slot: the paged `cache` is the real KV
+                // store (hybrid gets its own path below).
+                hybrid: None,
                 sampler,
                 history,
                 next_pos,
@@ -877,43 +954,65 @@ impl PagedBatchEngine {
             let mut step_logits: Vec<Vec<f32>> =
                 (0..m).map(|_| vec![0f32; vocab]).collect();
 
-            // Snapshot per-slot scalars (token + pos) BEFORE we
-            // start the mutable-borrow phase — otherwise the
-            // mutable borrow on `slots.iter_mut()` blocks the
-            // shared reads below.
-            let next_inputs: Vec<i32> =
-                active_indices.iter().map(|&i| slots[i].next_input).collect();
-            let next_positions: Vec<u32> =
-                active_indices.iter().map(|&i| slots[i].next_pos).collect();
-            // Build DecodeSlot vec with disjoint borrows on the
-            // active slots' caches + logits. The `Option::take`
-            // trick gives us by-index disjoint borrows safely
-            // (each index is taken at most once).
-            let mut cache_refs: Vec<Option<&mut PagedKvCache>> =
-                slots.iter_mut().map(|s| Some(&mut s.cache)).collect();
-            let mut logits_refs: Vec<Option<&mut Vec<f32>>> =
-                step_logits.iter_mut().map(Some).collect();
+            // F8: a HYBRID model advances each active slot with its OWN
+            // `forward_one_hybrid` against its OWN contiguous KV + DeltaNet
+            // state (no shared paged forward). Independent per slot, so a
+            // multi-slot batch keeps each slot's recurrent state isolated.
+            if self.model.weights.is_hybrid() {
+                for &i in &active_indices {
+                    let next_input = slots[i].next_input;
+                    let next_pos = slots[i].next_pos;
+                    let hyb = slots[i]
+                        .hybrid
+                        .as_mut()
+                        .expect("hybrid sync slot without hybrid state");
+                    self.model.forward_one_hybrid(
+                        next_input,
+                        next_pos,
+                        &mut hyb.kv,
+                        &mut hyb.dn,
+                        step_logits[i].as_mut_slice(),
+                    );
+                }
+            } else {
+                // Snapshot per-slot scalars (token + pos) BEFORE we
+                // start the mutable-borrow phase — otherwise the
+                // mutable borrow on `slots.iter_mut()` blocks the
+                // shared reads below.
+                let next_inputs: Vec<i32> =
+                    active_indices.iter().map(|&i| slots[i].next_input).collect();
+                let next_positions: Vec<u32> =
+                    active_indices.iter().map(|&i| slots[i].next_pos).collect();
+                // Build DecodeSlot vec with disjoint borrows on the
+                // active slots' caches + logits. The `Option::take`
+                // trick gives us by-index disjoint borrows safely
+                // (each index is taken at most once).
+                let mut cache_refs: Vec<Option<&mut PagedKvCache>> =
+                    slots.iter_mut().map(|s| Some(&mut s.cache)).collect();
+                let mut logits_refs: Vec<Option<&mut Vec<f32>>> =
+                    step_logits.iter_mut().map(Some).collect();
 
-            let mut decode_slots: Vec<DecodeSlot> =
-                Vec::with_capacity(active_indices.len());
-            for (k, &i) in active_indices.iter().enumerate() {
-                let cache = cache_refs[i].take().unwrap();
-                let logits = logits_refs[i].take().unwrap();
-                decode_slots.push(DecodeSlot {
-                    token_id: next_inputs[k],
-                    pos: next_positions[k],
-                    cache,
-                    logits_out: logits.as_mut_slice(),
-                });
+                let mut decode_slots: Vec<DecodeSlot> =
+                    Vec::with_capacity(active_indices.len());
+                for (k, &i) in active_indices.iter().enumerate() {
+                    let cache = cache_refs[i].take().unwrap();
+                    let logits = logits_refs[i].take().unwrap();
+                    decode_slots.push(DecodeSlot {
+                        token_id: next_inputs[k],
+                        pos: next_positions[k],
+                        cache,
+                        logits_out: logits.as_mut_slice(),
+                    });
+                }
+
+                self.model
+                    .forward_decode_paged_batched_f32(&mut decode_slots, &self.shared);
+                // Release the borrows before sampling — we need
+                // `&mut slots` again.
+                drop(decode_slots);
+                drop(cache_refs);
+                drop(logits_refs);
             }
-
-            self.model
-                .forward_decode_paged_batched_f32(&mut decode_slots, &self.shared);
-            // Release the borrows before sampling — we need
-            // `&mut slots` again.
-            drop(decode_slots);
-            drop(cache_refs);
-            drop(logits_refs);
 
             // Sample per active slot, update state, check stop.
             // Field destructuring on `&mut slots[i]` gives disjoint
@@ -973,9 +1072,12 @@ impl PagedBatchEngine {
                 // (can't write any more tokens). Should not happen
                 // when total_capacity was sized to prompt + max_tokens,
                 // but guards against config drift.
-                let hit_cap = slots[i].next_pos >= slots[i].cache.capacity_tokens();
+                // F8: hybrid slots store KV in their own contiguous cache, so
+                // use the effective capacity (the paged `cache` is empty there).
+                let hit_cap = slots[i].next_pos >= slots[i].effective_capacity_tokens();
                 if hit_max || hit_eos || hit_cap || hit_stop {
                     slots[i].done = true;
+                    // No-op for a hybrid slot (empty placeholder paged cache).
                     slots[i].cache.release_shared(&self.shared);
                 }
             }
@@ -1490,7 +1592,14 @@ fn driver_loop(
                 ))));
                 continue;
             }
-            let needed = total_capacity.div_ceil(page_size.max(1));
+            // F8: a HYBRID slot never touches the shared page pool (its KV +
+            // recurrent state are per-slot contiguous), so it needs 0 pages —
+            // `make_room` then gates it on a free SLOT alone, not free pages.
+            let needed = if ctx.model.weights.is_hybrid() {
+                0
+            } else {
+                total_capacity.div_ceil(page_size.max(1))
+            };
             if needed > ctx.total_pages as usize {
                 let _ = req.response_tx.blocking_send(Err(EngineError::Engine(format!(
                     "request needs {needed} pages but the paged pool holds only {} \
@@ -1613,6 +1722,107 @@ fn driver_loop(
     }
 }
 
+/// F8: build the per-slot state for one HYBRID (DeltaNet/SSM) request.
+///
+/// Unlike the dense/MoE path, a hybrid slot does NOT touch the shared paged
+/// pool (the `cache` field is an empty placeholder whose page ops no-op).
+/// It carries its own contiguous F32 `KvCache` + its own `DeltaNetCache`,
+/// and is prefilled + decoded through the SAME `forward_one_hybrid` the
+/// contiguous `CpuEngine` uses — so the resulting token stream is
+/// BIT-IDENTICAL to the contiguous engine on the same prompt + sampling.
+///
+/// Handoff convention mirrors the contiguous engine EXACTLY (so the streams
+/// match): prefill forwards `prompt[..n-1]` (positions `[0, n-1)`), leaving
+/// the slot positioned at `next_pos = n-1` with `next_input = prompt[n-1]`;
+/// the first decode tick forwards that last prompt token to produce the
+/// first output token (`drive_generation`'s `split_at(len-1)` pattern).
+/// Prefill is driven TOKEN-BY-TOKEN via `forward_one_hybrid`, matching the
+/// contiguous default (`prefill_batched_hybrid` off) so the KV + recurrent
+/// state are built identically.
+///
+/// `skip_emit` is `0` for a fresh request and the already-streamed count for
+/// an F5 preempted resume (regenerated deterministically, not re-streamed).
+fn build_hybrid_slot_state(
+    model: &LlamaModel,
+    tokenizer: Option<&Arc<Tokenizer>>,
+    max_ctx: usize,
+    prompt: &[i32],
+    sampling: &SamplingParams,
+    eos: Option<i32>,
+    skip_emit: u32,
+) -> EngineResult<SlotState> {
+    debug_assert!(!prompt.is_empty(), "build_hybrid_slot_state: empty prompt");
+    let hybrid_layers = model
+        .weights
+        .hybrid_layers
+        .as_ref()
+        .expect("build_hybrid_slot_state called on a non-hybrid model — dispatch bug");
+    let mut kv = KvCache::new_with_dtype(&model.cfg, max_ctx, KvDtype::F32);
+    let mut dn = DeltaNetCache::new_for_hybrid(&model.cfg, hybrid_layers)
+        .map_err(|e| EngineError::Engine(format!("hybrid DeltaNet cache init: {e}")))?;
+    let capacity = kv.max_ctx as u32;
+    let vocab = model.cfg.vocab_size;
+
+    // Prefill `prompt[..n-1]` token-by-token (contiguous-engine default path),
+    // advancing BOTH the contiguous KV and the per-slot DeltaNet state. The
+    // last prompt token is held back as `next_input` for the first decode.
+    let prefill_start = std::time::Instant::now();
+    let n = prompt.len();
+    if n > 1 {
+        let mut scratch = vec![0f32; vocab];
+        for (pos, &tok) in prompt[..n - 1].iter().enumerate() {
+            model.forward_one_hybrid(tok, pos as u32, &mut kv, &mut dn, &mut scratch);
+        }
+    }
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+
+    let last = *prompt.last().expect("non-empty prompt");
+    let tokens_prefilled = n as u32;
+    let next_pos = (n - 1) as u32;
+    let sampler = Sampler::new(sampling.clone());
+    let grammar = build_paged_grammar(model, tokenizer, sampling);
+    let stop_strings = sampling.stop.clone();
+    let history: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
+
+    // An empty placeholder paged cache: hybrid KV lives in `hybrid.kv`, so the
+    // paged `cache` never acquires pages and its `release_shared` is a no-op.
+    let geom_store = PagedKvStore::new(
+        1,
+        model.cfg.n_layers as u32,
+        model.cfg.n_kv_heads as u32,
+        DEFAULT_PAGE_SIZE,
+        model.cfg.head_dim as u32,
+    )
+    .ok_or_else(|| EngineError::Engine("hybrid slot geom store: zero dim".into()))?;
+    let cache = PagedKvCache::new_for(&geom_store);
+
+    Ok(SlotState {
+        sampling: sampling.clone(),
+        eos,
+        cache,
+        hybrid: Some(HybridSlotState { kv, dn, capacity }),
+        sampler,
+        history,
+        next_pos,
+        next_input: last,
+        n_emitted: 0,
+        done: false,
+        prefill_ms,
+        decode_ms: 0.0,
+        tokens_prefilled,
+        // No paged shared-prefix for hybrid — the recurrent state can't be
+        // prefix-shared (no per-position addressing), so nothing is reused.
+        cache_hit_tokens: 0,
+        prefill_job: None,
+        grammar,
+        stop_strings,
+        stop_buf: String::new(),
+        skip_emit,
+        emitted_to_client: skip_emit,
+        spec_rng: None,
+    })
+}
+
 /// Prefill + slot-state-build for one admitted request. Returns
 /// the slot's initial decoder state (positioned at `prompt.len()`,
 /// ready for the first fused decode tick to produce token #0 of
@@ -1649,6 +1859,22 @@ fn admit_request(
             ctx.max_ctx,
         )));
     }
+
+    // F8: HYBRID (DeltaNet/SSM) models bypass the paged pool entirely —
+    // per-slot contiguous KV + DeltaNet state, prefilled + decoded through the
+    // contiguous hybrid forward. No shared-prefix / APC / page allocation.
+    if ctx.model.weights.is_hybrid() {
+        return build_hybrid_slot_state(
+            &ctx.model,
+            ctx.tokenizer.as_ref(),
+            ctx.max_ctx,
+            prompt,
+            sampling,
+            eos,
+            skip_emit,
+        );
+    }
+
     let geom_store = PagedKvStore::new(
         1,
         ctx.model.cfg.n_layers as u32,
@@ -1740,6 +1966,7 @@ fn admit_request(
             sampling: sampling.clone(),
             eos,
             cache,
+            hybrid: None,
             sampler,
             history: prompt_u32,
             next_pos: tokens_prefilled, // finalized (unchanged) when prefill drains
@@ -1799,6 +2026,7 @@ fn admit_request(
         sampling: sampling.clone(),
         eos,
         cache,
+        hybrid: None,
         sampler,
         history,
         next_pos,
@@ -1920,6 +2148,15 @@ enum RaggedKind {
 fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize) {
     use rustllama_models::llama_arch::RaggedSlot;
     // `PagedKvCache` is already imported at module scope.
+
+    // F8: HYBRID (DeltaNet/SSM) models use a dedicated per-slot tick — their
+    // recurrent state can't be cross-slot-fused into the ragged paged forward,
+    // and each slot carries its own contiguous KV + DeltaNet state. The dense /
+    // MoE path below is untouched (byte-identical) for non-hybrid models.
+    if ctx.model.weights.is_hybrid() {
+        run_hybrid_tick(ctx, active, vocab);
+        return;
+    }
 
     let m = active.len();
 
@@ -2080,83 +2317,9 @@ fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
             RaggedKind::Decode => {
                 active[i].state.decode_ms += per_slot_ms;
                 let logits = logits_store[p].as_mut_slice();
-                let slot = &mut active[i];
-                // P9 feature parity: grammar-masked sample + grammar advance,
-                // identical to `CpuEngine::drive_generation`.
-                let next_tok = {
-                    let SlotState {
-                        sampler,
-                        history,
-                        grammar,
-                        ..
-                    } = &mut slot.state;
-                    let tok = sampler.sample_with_grammar(logits, history, grammar.as_ref());
-                    if let Some(g) = grammar.as_mut() {
-                        g.advance(tok);
-                    }
-                    tok
-                };
-                slot.state.history.push(next_tok);
-                slot.state.next_input = next_tok as i32;
-                slot.state.next_pos += 1;
-                slot.state.n_emitted += 1;
-
-                // P9 string-stop detection: accumulate the detok buffer like the
-                // contiguous CpuEngine (`decode_single(id, true)`) and match, so
-                // a stop string spanning several tokens is caught. The
-                // stop-completing token is still streamed (below), then the slot
-                // ends — mirroring `drive_generation`'s "emit then break".
-                let hit_stop = if slot.state.stop_strings.is_empty() {
-                    false
-                } else {
-                    let piece = ctx
-                        .tokenizer
-                        .as_ref()
-                        .and_then(|t| t.decode_single(next_tok, true).ok())
-                        .unwrap_or_default();
-                    slot.state.stop_buf.push_str(&piece);
-                    let buf = &slot.state.stop_buf;
-                    slot.state
-                        .stop_strings
-                        .iter()
-                        .any(|s| !s.is_empty() && buf.contains(s.as_str()))
-                };
-
-                // F5 recompute-preemption replay: a resumed slot regenerates
-                // its already-streamed tokens bit-for-bit (deterministic greedy
-                // / seeded forward) but must NOT re-stream them — suppress the
-                // send while `skip_emit` counts down. State (history, next_pos,
-                // sampler, grammar, stop_buf) is advanced identically either
-                // way, so once `skip_emit` hits 0 the stream continues exactly
-                // where the uninterrupted run left off (byte-identical output).
-                if slot.state.skip_emit > 0 {
-                    slot.state.skip_emit -= 1;
-                } else {
-                    let text = match &ctx.tokenizer {
-                        Some(tok) => tok.decode(&[next_tok], false).unwrap_or_default(),
-                        None => String::new(),
-                    };
-                    let token = Token {
-                        id: next_tok,
-                        text,
-                        logprobs: None,
-                    };
-                    if slot.response_tx.blocking_send(Ok(token)).is_err() {
-                        slot.state.done = true;
-                        continue;
-                    }
-                    slot.state.emitted_to_client += 1;
-                }
-                let hit_max = slot.state.n_emitted >= slot.state.sampling.max_tokens;
-                let hit_eos = slot
-                    .state
-                    .eos
-                    .map(|e| (next_tok as i32) == e)
-                    .unwrap_or(false);
-                let hit_cap = slot.state.next_pos >= slot.state.cache.capacity_tokens();
-                if hit_max || hit_eos || hit_cap || hit_stop {
-                    slot.state.done = true;
-                }
+                // Shared with the F8 hybrid tick: sample + grammar advance +
+                // string stops + F5 skip-emit streaming + stop conditions.
+                commit_decode_token(ctx, &mut active[i], logits);
             }
         }
     }
@@ -2170,6 +2333,148 @@ fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
             continue;
         }
         run_spec_round_for_slot(ctx, &mut active[i], vocab);
+    }
+}
+
+/// Sample one decode token from `logits` into `slot` and apply all the
+/// per-token bookkeeping: P9 grammar-masked sample + grammar advance, history
+/// push, position/emit counters, P9 string-stop detection, F5 skip-emit
+/// streaming suppression, and the stop conditions (max_tokens / EOS /
+/// capacity / string-stop → `done`). Shared VERBATIM between the dense ragged
+/// decode row and the F8 hybrid tick so both behave identically — the only
+/// difference between callers is how `logits` was produced (batched paged
+/// forward vs per-slot `forward_one_hybrid`). `hit_cap` uses
+/// [`SlotState::effective_capacity_tokens`] so it is correct for both the
+/// paged `cache` and a hybrid slot's contiguous KV.
+fn commit_decode_token(ctx: &DriverContext, slot: &mut DriverSlot, logits: &mut [f32]) {
+    // P9 feature parity: grammar-masked sample + grammar advance, identical to
+    // `CpuEngine::drive_generation`.
+    let next_tok = {
+        let SlotState {
+            sampler,
+            history,
+            grammar,
+            ..
+        } = &mut slot.state;
+        let tok = sampler.sample_with_grammar(logits, history, grammar.as_ref());
+        if let Some(g) = grammar.as_mut() {
+            g.advance(tok);
+        }
+        tok
+    };
+    slot.state.history.push(next_tok);
+    slot.state.next_input = next_tok as i32;
+    slot.state.next_pos += 1;
+    slot.state.n_emitted += 1;
+
+    // P9 string-stop detection: accumulate the detok buffer like the contiguous
+    // CpuEngine (`decode_single(id, true)`) and match, so a stop string
+    // spanning several tokens is caught. The stop-completing token is still
+    // streamed (below), then the slot ends — mirroring `drive_generation`'s
+    // "emit then break".
+    let hit_stop = if slot.state.stop_strings.is_empty() {
+        false
+    } else {
+        let piece = ctx
+            .tokenizer
+            .as_ref()
+            .and_then(|t| t.decode_single(next_tok, true).ok())
+            .unwrap_or_default();
+        slot.state.stop_buf.push_str(&piece);
+        let buf = &slot.state.stop_buf;
+        slot.state
+            .stop_strings
+            .iter()
+            .any(|s| !s.is_empty() && buf.contains(s.as_str()))
+    };
+
+    // F5 recompute-preemption replay: a resumed slot regenerates its already-
+    // streamed tokens bit-for-bit (deterministic greedy / seeded forward) but
+    // must NOT re-stream them — suppress the send while `skip_emit` counts down.
+    if slot.state.skip_emit > 0 {
+        slot.state.skip_emit -= 1;
+    } else {
+        let text = match &ctx.tokenizer {
+            Some(tok) => tok.decode(&[next_tok], false).unwrap_or_default(),
+            None => String::new(),
+        };
+        let token = Token {
+            id: next_tok,
+            text,
+            logprobs: None,
+        };
+        if slot.response_tx.blocking_send(Ok(token)).is_err() {
+            slot.state.done = true;
+            return;
+        }
+        slot.state.emitted_to_client += 1;
+    }
+    let hit_max = slot.state.n_emitted >= slot.state.sampling.max_tokens;
+    let hit_eos = slot
+        .state
+        .eos
+        .map(|e| (next_tok as i32) == e)
+        .unwrap_or(false);
+    let hit_cap = slot.state.next_pos >= slot.state.effective_capacity_tokens();
+    if hit_max || hit_eos || hit_cap || hit_stop {
+        slot.state.done = true;
+    }
+}
+
+/// F8 — the single driver tick for a HYBRID (DeltaNet/SSM) model. Each
+/// decode-ready slot is advanced ONE token by its OWN `forward_one_hybrid`
+/// against its OWN contiguous KV + `DeltaNetCache` ([`HybridSlotState`]), then
+/// committed through the shared [`commit_decode_token`] (so sampling / grammar
+/// / stops / F5 / streaming behave exactly like the dense path). Slots are
+/// INDEPENDENT by construction — slot A's forward reads and writes only slot
+/// A's `kv`/`dn`, so interleaving multiple hybrid requests in one tick can
+/// never contaminate another slot's recurrent state (the F8 2-slot anchor).
+///
+/// This is the "ragged tick" for hybrid: the DeltaNet recurrence cannot be
+/// cross-slot-fused into one kernel launch the way dense attention can (the
+/// recurrent state is per-sequence and has no per-position addressing), so the
+/// hybrid form of continuous batching is a per-slot sequential advance under
+/// the one shared driver — concurrent requests, per-slot state, full
+/// scheduling / priority / deadline / streaming / grammar / stop machinery.
+/// There is no prefill-job phase (hybrid prefill runs inline at admission in
+/// [`build_hybrid_slot_state`]), so every active slot contributes a decode row.
+fn run_hybrid_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize) {
+    let m = active.len();
+    // Prompt-cancellation propagation (mirrors the dense tick): a closed
+    // response channel ⇒ mark done before paying for the forward.
+    for slot in active.iter_mut().take(m) {
+        if !slot.state.done && slot.response_tx.is_closed() {
+            slot.state.done = true;
+        }
+    }
+
+    let mut logits = vec![0f32; vocab];
+    for slot in active.iter_mut() {
+        if slot.state.done {
+            continue;
+        }
+        let tick_start = std::time::Instant::now();
+        let next_input = slot.state.next_input;
+        let next_pos = slot.state.next_pos;
+        {
+            let hyb = slot
+                .state
+                .hybrid
+                .as_mut()
+                .expect("run_hybrid_tick slot without hybrid state — dispatch bug");
+            // Independent per-slot forward: writes KV at `next_pos` into this
+            // slot's own contiguous cache and advances this slot's own DeltaNet
+            // recurrent state — never touches any other slot.
+            ctx.model.forward_one_hybrid(
+                next_input,
+                next_pos,
+                &mut hyb.kv,
+                &mut hyb.dn,
+                &mut logits,
+            );
+        }
+        slot.state.decode_ms += tick_start.elapsed().as_secs_f64() * 1000.0;
+        commit_decode_token(ctx, slot, &mut logits);
     }
 }
 

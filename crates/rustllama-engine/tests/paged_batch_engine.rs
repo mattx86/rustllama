@@ -11,7 +11,7 @@
 use rustllama_engine::batch_scheduler::Priority;
 use rustllama_engine::paged_batch::PagedBatchEngine;
 use rustllama_engine::{CpuEngine, EngineError, SamplingParams, SubmitOpts};
-use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama, SynthMoe};
+use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthHybrid, SynthLlama, SynthMoe};
 
 fn write_gguf(tag: &str) -> std::path::PathBuf {
     let tmp = std::env::temp_dir().join(format!("rustllama-paged-batch-{tag}.gguf"));
@@ -1045,6 +1045,199 @@ async fn paged_batch_preempted_request_resumes_byte_identical() {
     assert!(
         eng.preemptions_for_tests() >= 1,
         "A must have been preempted at least once (page exhaustion was not forced)"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// ============================================================
+// F8 — hybrid continuous batching (per-slot DeltaNet state)
+// ============================================================
+//
+// These anchors pin the F8 contract: a HYBRID (attention + DeltaNet/SSM)
+// model served through the PAGED continuous-batching engine produces the
+// SAME tokens as the CONTIGUOUS `CpuEngine`, and two concurrent hybrid slots
+// keep their recurrent state independent. The synthetic hybrid GGUF is a
+// dense (non-MoE) qwen35moe-shaped toy: `full_attention_interval = 2` →
+// layers 1,3 are full-attention, layers 0,2 are DeltaNet/SSM; the writer
+// emits the full SSM tensor set so the model loads + runs the real
+// `forward_one_hybrid`.
+
+/// Tiny loadable + runnable synthetic HYBRID GGUF. Geometry is chosen so the
+/// hybrid forward's shape asserts all hold (head_v_dim = head_dim = 8,
+/// n_v_heads = ssm_inner/head_dim = 4, n_qk_heads = d_model/head_dim = 4).
+fn write_hybrid_gguf(tag: &str) -> std::path::PathBuf {
+    let tmp = std::env::temp_dir().join(format!("rustllama-paged-hybrid-{tag}.gguf"));
+    let params = SynthLlama {
+        n_layers: 4,
+        n_heads: 4,
+        n_kv_heads: 2,
+        head_dim: 8,
+        d_model: 32,
+        d_ff: 64,
+        vocab: 32,
+        ctx: 64,
+        hybrid: Some(SynthHybrid {
+            full_attention_interval: 2,
+            ssm_state_size: 8,
+            ssm_conv_kernel: 4,
+            ssm_group_count: 1,
+            ssm_time_step_rank: 2,
+            ssm_inner_size: 32,
+            shared_expert_feed_forward_length: None,
+            nextn_predict_layers: 0,
+        }),
+        ..SynthLlama::default()
+    };
+    write_synthetic_llama_gguf(&tmp, &params);
+    tmp
+}
+
+/// F8 anchor #1: a single paged-hybrid slot decodes BIT-IDENTICALLY to the
+/// contiguous `CpuEngine` on the same prompt + greedy decode. The paged slot
+/// carries its own contiguous KV + DeltaNet state and runs the SAME
+/// `forward_one_hybrid` the contiguous engine uses, so the token streams must
+/// match exactly. D1a having been relaxed is implicit in the load succeeding.
+#[test]
+fn paged_hybrid_single_slot_matches_cpu_engine_greedy() {
+    use rustllama_models::llama_arch::KvDtype;
+    let tmp = write_hybrid_gguf("m1-vs-cpu");
+
+    let mut cpu = CpuEngine::load_with_options_and_layout(
+        &tmp, 64, true, KvDtype::F32, "contiguous",
+    )
+    .expect("cpu engine load (hybrid)");
+    cpu.set_prefix_cache(false);
+
+    let batch = PagedBatchEngine::load(&tmp, 64, 1).expect("paged hybrid load");
+
+    let prompt: Vec<i32> = vec![3, 1, 4, 1, 5, 9];
+    let cpu_out = cpu
+        .generate_token_ids(&prompt, 5, &greedy(5))
+        .expect("cpu generate (hybrid)");
+    let batch_outs = batch
+        .generate_batched_token_ids(vec![(prompt.clone(), greedy(5))])
+        .expect("paged hybrid generate");
+
+    assert_eq!(batch_outs.len(), 1, "one request in, one out");
+    let batch_out: Vec<i32> = batch_outs[0].clone();
+    let cpu_i32: Vec<i32> = cpu_out.iter().map(|&t| t as i32).collect();
+    assert_eq!(
+        cpu_i32, batch_out,
+        "paged hybrid diverged from contiguous CpuEngine: cpu={cpu_i32:?} paged={batch_out:?}"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// F8 anchor #2: two concurrent hybrid slots keep INDEPENDENT recurrent
+/// state. Each slot's fused output must equal its single-slot reference —
+/// if slot A's DeltaNet state leaked into slot B (or vice versa), the fused
+/// outputs would diverge from the solo runs. This is the per-slot
+/// recurrent-state isolation guarantee.
+#[test]
+fn paged_hybrid_two_slots_each_matches_single_slot_reference() {
+    let tmp = write_hybrid_gguf("m2-independent");
+
+    let batch = PagedBatchEngine::load(&tmp, 64, 2).expect("paged hybrid load");
+
+    let prompt_a: Vec<i32> = vec![5, 1, 4, 2, 3, 7];
+    let prompt_b: Vec<i32> = vec![8, 0, 7, 6, 1, 2];
+
+    let ref_a = PagedBatchEngine::load(&tmp, 64, 1)
+        .expect("ref a load")
+        .generate_batched_token_ids(vec![(prompt_a.clone(), greedy(5))])
+        .expect("ref a generate")
+        .into_iter()
+        .next()
+        .unwrap();
+    let ref_b = PagedBatchEngine::load(&tmp, 64, 1)
+        .expect("ref b load")
+        .generate_batched_token_ids(vec![(prompt_b.clone(), greedy(5))])
+        .expect("ref b generate")
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let outs = batch
+        .generate_batched_token_ids(vec![
+            (prompt_a.clone(), greedy(5)),
+            (prompt_b.clone(), greedy(5)),
+        ])
+        .expect("fused hybrid generate");
+    assert_eq!(outs.len(), 2);
+    assert_eq!(
+        outs[0], ref_a,
+        "hybrid slot A recurrent state contaminated: fused={:?} ref={:?}",
+        outs[0], ref_a,
+    );
+    assert_eq!(
+        outs[1], ref_b,
+        "hybrid slot B recurrent state contaminated: fused={:?} ref={:?}",
+        outs[1], ref_b,
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// F8 anchor #3: the async STREAMING driver path (submit + driver thread +
+/// `run_hybrid_tick`) serves two concurrent hybrid requests, each matching
+/// its single-slot reference — the real continuous-batching path, not just
+/// the synchronous batch API.
+#[tokio::test]
+async fn paged_hybrid_streaming_two_concurrent_submits_each_matches_reference() {
+    use futures::StreamExt;
+    let tmp = write_hybrid_gguf("stream-m2");
+    let batch = PagedBatchEngine::load(&tmp, 64, 2).expect("paged hybrid load");
+
+    let prompt_a: Vec<i32> = vec![5, 1, 4, 2, 3, 7];
+    let prompt_b: Vec<i32> = vec![8, 0, 7, 6, 1, 2];
+    let n_tokens = 5u32;
+
+    let ref_a = PagedBatchEngine::load(&tmp, 64, 1)
+        .unwrap()
+        .generate_batched_token_ids(vec![(prompt_a.clone(), greedy(n_tokens))])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let ref_b = PagedBatchEngine::load(&tmp, 64, 1)
+        .unwrap()
+        .generate_batched_token_ids(vec![(prompt_b.clone(), greedy(n_tokens))])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let stream_a = batch
+        .submit_streaming(prompt_a.clone(), greedy(n_tokens))
+        .expect("submit A");
+    let stream_b = batch
+        .submit_streaming(prompt_b.clone(), greedy(n_tokens))
+        .expect("submit B");
+
+    let collect_a = async move {
+        let mut out = Vec::new();
+        let mut s = stream_a;
+        while let Some(item) = s.next().await {
+            out.push(item.expect("token A").id as i32);
+        }
+        out
+    };
+    let collect_b = async move {
+        let mut out = Vec::new();
+        let mut s = stream_b;
+        while let Some(item) = s.next().await {
+            out.push(item.expect("token B").id as i32);
+        }
+        out
+    };
+    let (out_a, out_b) = futures::future::join(collect_a, collect_b).await;
+
+    assert_eq!(
+        out_a, ref_a,
+        "streaming hybrid slot A diverged from reference: stream={out_a:?} ref={ref_a:?}",
+    );
+    assert_eq!(
+        out_b, ref_b,
+        "streaming hybrid slot B diverged from reference: stream={out_b:?} ref={ref_b:?}",
     );
     let _ = std::fs::remove_file(&tmp);
 }

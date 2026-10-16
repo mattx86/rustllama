@@ -410,7 +410,11 @@ pub fn write_synthetic_llama_gguf(path: &Path, params: &SynthLlama) {
         seed.wrapping_add(1),
     ));
 
-    for i in 0..n_layers {
+    // Hybrid attention+SSM models (qwen35moe / Bonsai-2 shape) need an
+    // ENTIRELY different per-layer tensor set than dense/MoE llama, so the
+    // standard loop below is skipped when `hybrid` is set and the hybrid
+    // emission block (just before `output_norm`) runs instead.
+    for i in (0..n_layers).filter(|_| hybrid.is_none()) {
         let prefix = format!("blk.{i}");
         tensors.push(TensorSpec::f32(
             &format!("{prefix}.attn_norm.weight"),
@@ -522,6 +526,171 @@ pub fn write_synthetic_llama_gguf(path: &Path, params: &SynthLlama) {
                 (d_ff * d_model) as usize,
                 seed.wrapping_add(900 + i as u64),
             ));
+        }
+    }
+
+    // Hybrid attention+SSM tensor set, emitted when `hybrid` is set (the
+    // dense/MoE per-layer loop above was skipped). SSM layers carry the 11
+    // DeltaNet tensors; full-attention layers carry a GATED q-proj (`2*d_q`
+    // output, chunked into query+gate in the forward); BOTH carry
+    // `post_attention_norm.weight` (not `ffn_norm.weight`) + a dense SwiGLU FFN
+    // (no MoE — a dense hybrid, the Bonsai-2 shape). Geometry is derived so the
+    // hybrid forward's shape asserts (`DeltaNetCache::new_for_hybrid` +
+    // `forward_one_hybrid_to_hidden`) all hold:
+    //   head_v_dim = head_dim, n_v_heads = ssm_inner_size / head_dim,
+    //   head_qk_dim = head_v_dim,
+    //   n_qk_heads  = group_count > 1 ? group_count : d_model / head_qk_dim,
+    //   qkv_dim     = 2*n_qk_heads*head_qk_dim + ssm_inner_size.
+    // Weight values are arbitrary RNG: the hybrid parity tests compare the
+    // PAGED engine against the CONTIGUOUS engine on the SAME weights, so only
+    // internal consistency (finite, deterministic output) is required, not a
+    // match to any external (HF) reference.
+    if let Some(h) = hybrid {
+        let ssm_inner = h.ssm_inner_size;
+        let conv_kernel = h.ssm_conv_kernel.max(1);
+        let head_v_dim = head_dim;
+        assert!(
+            head_v_dim > 0 && ssm_inner % head_v_dim == 0,
+            "synth hybrid: ssm_inner_size ({ssm_inner}) must be divisible by head_dim ({head_v_dim})"
+        );
+        let n_v_heads = ssm_inner / head_v_dim;
+        let head_qk_dim = head_v_dim;
+        let n_qk_heads = if h.ssm_group_count > 1 {
+            h.ssm_group_count
+        } else {
+            assert!(
+                d_model % head_qk_dim == 0,
+                "synth hybrid: d_model ({d_model}) must be divisible by head_dim ({head_qk_dim})"
+            );
+            d_model / head_qk_dim
+        };
+        let qkv_dim = 2 * n_qk_heads * head_qk_dim + ssm_inner;
+        let d_q = n_heads * head_dim;
+        let d_kv = n_kv_heads * head_dim;
+        let interval = h.full_attention_interval.max(1);
+        for i in 0..n_layers {
+            let prefix = format!("blk.{i}");
+            let sd = seed.wrapping_add(10_000 + (i as u64) * 50);
+            // Pre-attention + post-attention (pre-FFN) norms — both kinds.
+            tensors.push(TensorSpec::f32(
+                &format!("{prefix}.attn_norm.weight"),
+                vec![d_model as u64],
+                random_f32(d_model as usize, sd),
+            ));
+            tensors.push(TensorSpec::f32(
+                &format!("{prefix}.post_attention_norm.weight"),
+                vec![d_model as u64],
+                random_f32(d_model as usize, sd.wrapping_add(1)),
+            ));
+            // Dense SwiGLU FFN (no MoE → `HybridFfn::Dense`).
+            tensors.push(weight_tensor(
+                &format!("{prefix}.ffn_gate.weight"),
+                vec![d_model as u64, d_ff as u64],
+                (d_model * d_ff) as usize,
+                sd.wrapping_add(2),
+            ));
+            tensors.push(weight_tensor(
+                &format!("{prefix}.ffn_up.weight"),
+                vec![d_model as u64, d_ff as u64],
+                (d_model * d_ff) as usize,
+                sd.wrapping_add(3),
+            ));
+            tensors.push(weight_tensor(
+                &format!("{prefix}.ffn_down.weight"),
+                vec![d_ff as u64, d_model as u64],
+                (d_ff * d_model) as usize,
+                sd.wrapping_add(4),
+            ));
+            // Layer kind: the loader keys on `attn_q.weight` PRESENCE (SSM
+            // layers never carry it), with `(i+1) % interval == 0` as the
+            // modulo twin. Emit full-attn tensors on modulo layers, SSM
+            // tensors elsewhere, so presence and modulo agree.
+            let is_full_attn = (i + 1) % interval == 0;
+            if is_full_attn {
+                // GATED q-proj: output width is `2*d_q` (query || per-head gate).
+                tensors.push(weight_tensor(
+                    &format!("{prefix}.attn_q.weight"),
+                    vec![d_model as u64, (2 * d_q) as u64],
+                    (d_model * 2 * d_q) as usize,
+                    sd.wrapping_add(10),
+                ));
+                tensors.push(weight_tensor(
+                    &format!("{prefix}.attn_k.weight"),
+                    vec![d_model as u64, d_kv as u64],
+                    (d_model * d_kv) as usize,
+                    sd.wrapping_add(11),
+                ));
+                tensors.push(weight_tensor(
+                    &format!("{prefix}.attn_v.weight"),
+                    vec![d_model as u64, d_kv as u64],
+                    (d_model * d_kv) as usize,
+                    sd.wrapping_add(12),
+                ));
+                tensors.push(weight_tensor(
+                    &format!("{prefix}.attn_output.weight"),
+                    vec![d_q as u64, d_model as u64],
+                    (d_q * d_model) as usize,
+                    sd.wrapping_add(13),
+                ));
+            } else {
+                // SSM / DeltaNet layer — the 11-tensor set.
+                tensors.push(weight_tensor(
+                    &format!("{prefix}.attn_qkv.weight"),
+                    vec![d_model as u64, qkv_dim as u64],
+                    (d_model * qkv_dim) as usize,
+                    sd.wrapping_add(10),
+                ));
+                tensors.push(weight_tensor(
+                    &format!("{prefix}.attn_gate.weight"),
+                    vec![d_model as u64, ssm_inner as u64],
+                    (d_model * ssm_inner) as usize,
+                    sd.wrapping_add(11),
+                ));
+                // conv1d: `[conv_kernel, qkv_dim]` — the loader reads the LAST
+                // dim as the depthwise conv channel count (== qkv_dim).
+                tensors.push(weight_tensor(
+                    &format!("{prefix}.ssm_conv1d.weight"),
+                    vec![conv_kernel as u64, qkv_dim as u64],
+                    (conv_kernel * qkv_dim) as usize,
+                    sd.wrapping_add(12),
+                ));
+                // `ssm_dt.bias` / `ssm_a` are norm-style f32 vectors of length
+                // n_v_heads (ssm_a's length is how the loader derives n_v_heads).
+                tensors.push(TensorSpec::f32(
+                    &format!("{prefix}.ssm_dt.bias"),
+                    vec![n_v_heads as u64],
+                    random_f32(n_v_heads as usize, sd.wrapping_add(13)),
+                ));
+                tensors.push(TensorSpec::f32(
+                    &format!("{prefix}.ssm_a"),
+                    vec![n_v_heads as u64],
+                    random_f32(n_v_heads as usize, sd.wrapping_add(14)),
+                ));
+                tensors.push(weight_tensor(
+                    &format!("{prefix}.ssm_alpha.weight"),
+                    vec![d_model as u64, n_v_heads as u64],
+                    (d_model * n_v_heads) as usize,
+                    sd.wrapping_add(15),
+                ));
+                tensors.push(weight_tensor(
+                    &format!("{prefix}.ssm_beta.weight"),
+                    vec![d_model as u64, n_v_heads as u64],
+                    (d_model * n_v_heads) as usize,
+                    sd.wrapping_add(16),
+                ));
+                // Gated-RMSNorm weight is per-(v-head) of width head_v_dim.
+                tensors.push(TensorSpec::f32(
+                    &format!("{prefix}.ssm_norm.weight"),
+                    vec![head_v_dim as u64],
+                    random_f32(head_v_dim as usize, sd.wrapping_add(17)),
+                ));
+                tensors.push(weight_tensor(
+                    &format!("{prefix}.ssm_out.weight"),
+                    vec![ssm_inner as u64, d_model as u64],
+                    (ssm_inner * d_model) as usize,
+                    sd.wrapping_add(18),
+                ));
+            }
         }
     }
 
