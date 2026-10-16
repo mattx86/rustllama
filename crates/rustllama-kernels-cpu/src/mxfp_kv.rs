@@ -221,6 +221,8 @@ fn flash_decode_generic(
     kv_len: usize,
     bytes_per_row: usize,
     deq: DeqRow,
+    window: usize,
+    softcap: f32,
 ) {
     assert_eq!(head_dim % 32, 0, "head_dim must be a multiple of 32");
     assert_eq!(q.len(), n_heads * head_dim);
@@ -235,6 +237,8 @@ fn flash_decode_generic(
     }
     let n_gqa = n_heads / n_kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
+    // Decode window lower bound (0 ⇒ full attention).
+    let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
     DECODE_SCRATCH.with(|cell| {
         let (k_all, v_all) = &mut *cell.borrow_mut();
         let need = n_kv_heads * kv_len * head_dim;
@@ -264,7 +268,7 @@ fn flash_decode_generic(
                 let kv_h = h / n_gqa;
                 let q_h = &q[h * head_dim..(h + 1) * head_dim];
                 let base = kv_h * kv_len * head_dim;
-                crate::turboquant::online_softmax_attn_f32_scratch(
+                crate::turboquant::online_softmax_attn_f32_scratch_capped_windowed(
                     q_h,
                     &k_all[base..base + kv_len * head_dim],
                     &v_all[base..base + kv_len * head_dim],
@@ -272,6 +276,8 @@ fn flash_decode_generic(
                     head_dim,
                     kv_len,
                     scale,
+                    start,
+                    softcap,
                 );
             });
     });
@@ -291,6 +297,8 @@ fn flash_prefill_generic(
     n_new: usize,
     bytes_per_row: usize,
     deq: DeqRow,
+    window: usize,
+    softcap: f32,
 ) {
     assert_eq!(head_dim % 32, 0, "head_dim must be a multiple of 32");
     assert_eq!(q.len(), n_new * n_heads * head_dim);
@@ -335,9 +343,10 @@ fn flash_prefill_generic(
                 let h = idx % n_heads;
                 let kv_h = h / n_gqa;
                 let kv_len_i = kv_len_base + i + 1;
+                let start_i = if window > 0 { kv_len_i.saturating_sub(window) } else { 0 };
                 let q_h = &q[idx * head_dim..(idx + 1) * head_dim];
                 let base = kv_h * total_positions * head_dim;
-                crate::turboquant::online_softmax_attn_f32_scratch(
+                crate::turboquant::online_softmax_attn_f32_scratch_capped_windowed(
                     q_h,
                     &k_all[base..base + kv_len_i * head_dim],
                     &v_all[base..base + kv_len_i * head_dim],
@@ -345,13 +354,15 @@ fn flash_prefill_generic(
                     head_dim,
                     kv_len_i,
                     scale,
+                    start_i,
+                    softcap,
                 );
             });
     });
 }
 
 macro_rules! mxfp_kv_flash {
-    ($decode:ident, $prefill:ident, $deq:path, $bpb:expr) => {
+    ($decode:ident, $prefill:ident, $decode_cw:ident, $prefill_cw:ident, $deq:path, $bpb:expr) => {
         /// FlashAttention decode for this MXFP KV format.
         #[allow(clippy::too_many_arguments)]
         pub fn $decode(
@@ -368,7 +379,33 @@ macro_rules! mxfp_kv_flash {
             let bytes_per_row = (head_dim / 32) * $bpb;
             flash_decode_generic(
                 q, k_packed, v_packed, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                bytes_per_row, $deq,
+                bytes_per_row, $deq, 0, 0.0,
+            );
+        }
+        /// Sliding-window + Gemma2 soft-cap FlashAttention decode for this MXFP
+        /// KV format. `window == 0` attends `[0, kv_len)`; otherwise the decode
+        /// window `[kv_len-window, kv_len)`. `softcap > 0.0` applies
+        /// `s = c*tanh(s/c)` after the scale and before the online-softmax
+        /// max/exp (Gemma2). `window == 0 && softcap == 0.0` is BIT-IDENTICAL to
+        #[doc = concat!("[`", stringify!($decode), "`].")]
+        #[allow(clippy::too_many_arguments)]
+        pub fn $decode_cw(
+            q: &[f32],
+            k_packed: &[u8],
+            v_packed: &[u8],
+            out: &mut [f32],
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            max_ctx: usize,
+            kv_len: usize,
+            window: usize,
+            softcap: f32,
+        ) {
+            let bytes_per_row = (head_dim / 32) * $bpb;
+            flash_decode_generic(
+                q, k_packed, v_packed, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                bytes_per_row, $deq, window, softcap,
             );
         }
         /// FlashAttention prefill for this MXFP KV format.
@@ -388,7 +425,34 @@ macro_rules! mxfp_kv_flash {
             let bytes_per_row = (head_dim / 32) * $bpb;
             flash_prefill_generic(
                 q, k_packed, v_packed, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base,
-                n_new, bytes_per_row, $deq,
+                n_new, bytes_per_row, $deq, 0, 0.0,
+            );
+        }
+        /// Sliding-window + Gemma2 soft-cap FlashAttention prefill for this MXFP
+        /// KV format. Query `i` (abs pos `kv_len_base + i`) attends
+        /// `[start_i, kv_len_i)` with `kv_len_i = kv_len_base + i + 1` and
+        /// `start_i = kv_len_i.saturating_sub(window)` (window 0 ⇒ full causal).
+        /// `window == 0 && softcap == 0.0` is BIT-IDENTICAL to
+        #[doc = concat!("[`", stringify!($prefill), "`].")]
+        #[allow(clippy::too_many_arguments)]
+        pub fn $prefill_cw(
+            q: &[f32],
+            k_packed: &[u8],
+            v_packed: &[u8],
+            out: &mut [f32],
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            max_ctx: usize,
+            kv_len_base: usize,
+            n_new: usize,
+            window: usize,
+            softcap: f32,
+        ) {
+            let bytes_per_row = (head_dim / 32) * $bpb;
+            flash_prefill_generic(
+                q, k_packed, v_packed, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base,
+                n_new, bytes_per_row, $deq, window, softcap,
             );
         }
     };
@@ -397,18 +461,24 @@ macro_rules! mxfp_kv_flash {
 mxfp_kv_flash!(
     gqa_attention_flash_decode_mxfp4,
     gqa_attention_flash_prefill_mxfp4,
+    gqa_attention_flash_decode_mxfp4_capped_windowed,
+    gqa_attention_flash_prefill_mxfp4_capped_windowed,
     dequantize_row_mxfp4,
     MXFP4_BLOCK_BYTES
 );
 mxfp_kv_flash!(
     gqa_attention_flash_decode_mxfp6,
     gqa_attention_flash_prefill_mxfp6,
+    gqa_attention_flash_decode_mxfp6_capped_windowed,
+    gqa_attention_flash_prefill_mxfp6_capped_windowed,
     dequantize_row_mxfp6,
     MXFP6_BLOCK_BYTES
 );
 mxfp_kv_flash!(
     gqa_attention_flash_decode_mxfp8,
     gqa_attention_flash_prefill_mxfp8,
+    gqa_attention_flash_decode_mxfp8_capped_windowed,
+    gqa_attention_flash_prefill_mxfp8_capped_windowed,
     dequantize_row_mxfp8,
     MXFP8_BLOCK_BYTES
 );
@@ -533,5 +603,142 @@ mod tests {
                 .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
             assert!(err < 1e-4, "mxfp6 prefill row {i} err={err}");
         }
+    }
+
+    // ---- Sliding-window + Gemma2 soft-cap (`_capped_windowed`) tests ----
+
+    /// Naive windowed + soft-capped single-head attention over f32 K/V. The
+    /// query attends only `[start, kv_len)`; `softcap > 0.0` caps each logit.
+    fn naive_attn_cw(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        head_dim: usize,
+        kv_len: usize,
+        start: usize,
+        softcap: f32,
+    ) -> Vec<f32> {
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut scores = Vec::new();
+        for t in start..kv_len {
+            let mut dot = 0f32;
+            for d in 0..head_dim {
+                dot += q[d] * k[t * head_dim + d];
+            }
+            let mut s = dot * scale;
+            if softcap > 0.0 {
+                s = softcap * (s / softcap).tanh();
+            }
+            scores.push(s);
+        }
+        let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut denom = 0f32;
+        for s in scores.iter_mut() {
+            *s = (*s - m).exp();
+            denom += *s;
+        }
+        let mut out = vec![0f32; head_dim];
+        for (i, t) in (start..kv_len).enumerate() {
+            let w = if denom > 0.0 { scores[i] / denom } else { 0.0 };
+            for d in 0..head_dim {
+                out[d] += w * v[t * head_dim + d];
+            }
+        }
+        out
+    }
+
+    /// Quantize deterministic single-kv-head MXFP4 K/V for `positions` slots.
+    fn build_mxfp4_cache(head_dim: usize, max_ctx: usize, positions: usize) -> (Vec<u8>, Vec<u8>, Vec<f32>, Vec<f32>) {
+        let bpr = (head_dim / 32) * MXFP4_BLOCK_BYTES;
+        let kf: Vec<f32> = (0..positions * head_dim).map(|i| ((i * 7) % 23) as f32 * 0.03 - 0.3).collect();
+        let vf: Vec<f32> = (0..positions * head_dim).map(|i| ((i * 5) % 19) as f32 * 0.04 - 0.35).collect();
+        let mut kp = vec![0u8; max_ctx * bpr];
+        let mut vp = vec![0u8; max_ctx * bpr];
+        for t in 0..positions {
+            for blk in 0..head_dim / 32 {
+                let src = t * head_dim + blk * 32;
+                let dst = t * bpr + blk * MXFP4_BLOCK_BYTES;
+                quantize_block_mxfp4(&kf[src..src + 32], &mut kp[dst..dst + MXFP4_BLOCK_BYTES]);
+                quantize_block_mxfp4(&vf[src..src + 32], &mut vp[dst..dst + MXFP4_BLOCK_BYTES]);
+            }
+        }
+        // Dequantize back so the reference sees the exact values the kernel reads.
+        let mut kd = vec![0f32; positions * head_dim];
+        let mut vd = vec![0f32; positions * head_dim];
+        for t in 0..positions {
+            dequantize_row_mxfp4(&kp[t * bpr..t * bpr + bpr], &mut kd[t * head_dim..(t + 1) * head_dim]);
+            dequantize_row_mxfp4(&vp[t * bpr..t * bpr + bpr], &mut vd[t * head_dim..(t + 1) * head_dim]);
+        }
+        (kp, vp, kd, vd)
+    }
+
+    #[test]
+    fn mxfp_capped_windowed_passthrough_bit_identical() {
+        // `_capped_windowed(0, 0.0)` must be BIT-IDENTICAL to the base kernel for
+        // decode AND prefill, across all three MXFP widths (the macro expansion).
+        let head_dim = 64;
+        let max_ctx = 16;
+        let kv_len = 9;
+        let (kp, vp, _kd, _vd) = build_mxfp4_cache(head_dim, max_ctx, kv_len);
+        let q: Vec<f32> = (0..head_dim).map(|i| (i as f32).sin() * 0.2).collect();
+
+        let mut base = vec![0f32; head_dim];
+        let mut cw = vec![0f32; head_dim];
+        gqa_attention_flash_decode_mxfp4(&q, &kp, &vp, &mut base, 1, 1, head_dim, max_ctx, kv_len);
+        gqa_attention_flash_decode_mxfp4_capped_windowed(&q, &kp, &vp, &mut cw, 1, 1, head_dim, max_ctx, kv_len, 0, 0.0);
+        assert_eq!(base, cw, "mxfp4 decode passthrough not bit-identical");
+
+        // Prefill passthrough.
+        let kv_len_base = 2;
+        let n_new = 5;
+        let (kp2, vp2, _, _) = build_mxfp4_cache(head_dim, max_ctx, kv_len_base + n_new);
+        let qp: Vec<f32> = (0..n_new * head_dim).map(|i| (i as f32).cos() * 0.15).collect();
+        let mut base_pf = vec![0f32; n_new * head_dim];
+        let mut cw_pf = vec![0f32; n_new * head_dim];
+        gqa_attention_flash_prefill_mxfp4(&qp, &kp2, &vp2, &mut base_pf, 1, 1, head_dim, max_ctx, kv_len_base, n_new);
+        gqa_attention_flash_prefill_mxfp4_capped_windowed(&qp, &kp2, &vp2, &mut cw_pf, 1, 1, head_dim, max_ctx, kv_len_base, n_new, 0, 0.0);
+        assert_eq!(base_pf, cw_pf, "mxfp4 prefill passthrough not bit-identical");
+
+        // mxfp8 decode passthrough (second macro arm).
+        let bpr8 = (head_dim / 32) * MXFP8_BLOCK_BYTES;
+        let kvf: Vec<f32> = (0..kv_len * head_dim).map(|i| ((i * 3) % 29) as f32 * 0.02 - 0.3).collect();
+        let mut kp8 = vec![0u8; max_ctx * bpr8];
+        let mut vp8 = vec![0u8; max_ctx * bpr8];
+        for t in 0..kv_len {
+            for blk in 0..head_dim / 32 {
+                let src = t * head_dim + blk * 32;
+                let dst = t * bpr8 + blk * MXFP8_BLOCK_BYTES;
+                quantize_block_mxfp8(&kvf[src..src + 32], &mut kp8[dst..dst + MXFP8_BLOCK_BYTES]);
+                quantize_block_mxfp8(&kvf[src..src + 32], &mut vp8[dst..dst + MXFP8_BLOCK_BYTES]);
+            }
+        }
+        let mut base8 = vec![0f32; head_dim];
+        let mut cw8 = vec![0f32; head_dim];
+        gqa_attention_flash_decode_mxfp8(&q, &kp8, &vp8, &mut base8, 1, 1, head_dim, max_ctx, kv_len);
+        gqa_attention_flash_decode_mxfp8_capped_windowed(&q, &kp8, &vp8, &mut cw8, 1, 1, head_dim, max_ctx, kv_len, 0, 0.0);
+        assert_eq!(base8, cw8, "mxfp8 decode passthrough not bit-identical");
+    }
+
+    #[test]
+    fn mxfp4_windowed_and_softcap_match_naive() {
+        let head_dim = 64;
+        let max_ctx = 16;
+        let kv_len = 5;
+        let (kp, vp, kd, vd) = build_mxfp4_cache(head_dim, max_ctx, kv_len);
+        let q: Vec<f32> = (0..head_dim).map(|i| (i as f32).sin() * 0.2).collect();
+
+        // (b) windowed: window=2, kv_len=5 ⇒ start = 3.
+        let mut got = vec![0f32; head_dim];
+        gqa_attention_flash_decode_mxfp4_capped_windowed(&q, &kp, &vp, &mut got, 1, 1, head_dim, max_ctx, kv_len, 2, 0.0);
+        let want = naive_attn_cw(&q, &kd, &vd, head_dim, kv_len, 3, 0.0);
+        let err = got.iter().zip(&want).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(err < 1e-4, "mxfp4 windowed err={err}");
+
+        // (c) soft-cap: softcap=50.0, full window (start=0).
+        let mut got_sc = vec![0f32; head_dim];
+        gqa_attention_flash_decode_mxfp4_capped_windowed(&q, &kp, &vp, &mut got_sc, 1, 1, head_dim, max_ctx, kv_len, 0, 50.0);
+        let want_sc = naive_attn_cw(&q, &kd, &vd, head_dim, kv_len, 0, 50.0);
+        let err_sc = got_sc.iter().zip(&want_sc).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(err_sc < 1e-4, "mxfp4 softcap err={err_sc}");
     }
 }

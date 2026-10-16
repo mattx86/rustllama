@@ -392,6 +392,9 @@ extern "C" {
         head_dim: c_int,
         max_ctx: c_int,
         kv_len: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
     fn rsl_cuda_flash_attn_prefill_q4_0(
         s: *mut RslCudaStreamRaw,
@@ -405,6 +408,9 @@ extern "C" {
         max_ctx: c_int,
         kv_len_base: c_int,
         n_new: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
     fn rsl_cuda_flash_attn_decode_nvfp4(
         s: *mut RslCudaStreamRaw,
@@ -417,6 +423,9 @@ extern "C" {
         head_dim: c_int,
         max_ctx: c_int,
         kv_len: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
     fn rsl_cuda_flash_attn_prefill_nvfp4(
         s: *mut RslCudaStreamRaw,
@@ -430,6 +439,9 @@ extern "C" {
         max_ctx: c_int,
         kv_len_base: c_int,
         n_new: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
     // MXFP4/6/8-KV flash: 32-elem blocks + trailing E8M0 scale byte
     // (bytes_per_row = (head_dim/32)*{17,25,33}); mirror the NVFP4 entries.
@@ -444,6 +456,9 @@ extern "C" {
         head_dim: c_int,
         max_ctx: c_int,
         kv_len: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
     fn rsl_cuda_flash_attn_prefill_mxfp4(
         s: *mut RslCudaStreamRaw,
@@ -457,6 +472,9 @@ extern "C" {
         max_ctx: c_int,
         kv_len_base: c_int,
         n_new: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
     fn rsl_cuda_flash_attn_decode_mxfp6(
         s: *mut RslCudaStreamRaw,
@@ -469,6 +487,9 @@ extern "C" {
         head_dim: c_int,
         max_ctx: c_int,
         kv_len: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
     fn rsl_cuda_flash_attn_prefill_mxfp6(
         s: *mut RslCudaStreamRaw,
@@ -482,6 +503,9 @@ extern "C" {
         max_ctx: c_int,
         kv_len_base: c_int,
         n_new: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
     fn rsl_cuda_flash_attn_decode_mxfp8(
         s: *mut RslCudaStreamRaw,
@@ -494,6 +518,9 @@ extern "C" {
         head_dim: c_int,
         max_ctx: c_int,
         kv_len: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
     fn rsl_cuda_flash_attn_prefill_mxfp8(
         s: *mut RslCudaStreamRaw,
@@ -507,6 +534,9 @@ extern "C" {
         max_ctx: c_int,
         kv_len_base: c_int,
         n_new: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
     fn rsl_cuda_flash_attn_decode_tq(
         s: *mut RslCudaStreamRaw,
@@ -522,6 +552,9 @@ extern "C" {
         head_dim: c_int,
         max_ctx: c_int,
         kv_len: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
     fn rsl_cuda_flash_attn_prefill_tq(
         s: *mut RslCudaStreamRaw,
@@ -538,6 +571,9 @@ extern "C" {
         max_ctx: c_int,
         kv_len_base: c_int,
         n_new: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
     // Q8_0-KV flash: i8 K/V slab + per-row f32 scale (see safe wrappers).
     fn rsl_cuda_flash_attn_decode_q8_0(
@@ -553,6 +589,9 @@ extern "C" {
         head_dim: c_int,
         max_ctx: c_int,
         kv_len: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
     fn rsl_cuda_flash_attn_prefill_q8_0(
         s: *mut RslCudaStreamRaw,
@@ -568,6 +607,9 @@ extern "C" {
         max_ctx: c_int,
         kv_len_base: c_int,
         n_new: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
     ) -> c_int;
     fn rsl_cuda_argmax_f32(
         s: *mut RslCudaStreamRaw,
@@ -1948,10 +1990,15 @@ pub unsafe fn flash_attn_decode_q4_0(
     head_dim: usize,
     max_ctx: usize,
     kv_len: usize,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); the last
+    // two params by contract (see `flash_attn_decode_f32`). Byte-identical at 0/0.
+    window: i32,
+    softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_decode_q4_0(
         stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
         n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int, kv_len as c_int,
+        window as c_int, softcap,
     );
     if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
 }
@@ -1975,11 +2022,16 @@ pub unsafe fn flash_attn_prefill_q4_0(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); the last
+    // two params by contract (see `flash_attn_prefill_f32`). Byte-identical at 0/0.
+    window: i32,
+    softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_prefill_q4_0(
         stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
         n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
         kv_len_base as c_int, n_new as c_int,
+        window as c_int, softcap,
     );
     if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
 }
@@ -2001,10 +2053,15 @@ pub unsafe fn flash_attn_decode_nvfp4(
     head_dim: usize,
     max_ctx: usize,
     kv_len: usize,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); the last
+    // two params by contract (see `flash_attn_decode_f32`). Byte-identical at 0/0.
+    window: i32,
+    softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_decode_nvfp4(
         stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
         n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int, kv_len as c_int,
+        window as c_int, softcap,
     );
     if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
 }
@@ -2027,11 +2084,16 @@ pub unsafe fn flash_attn_prefill_nvfp4(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); the last
+    // two params by contract (see `flash_attn_prefill_f32`). Byte-identical at 0/0.
+    window: i32,
+    softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_prefill_nvfp4(
         stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
         n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
         kv_len_base as c_int, n_new as c_int,
+        window as c_int, softcap,
     );
     if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
 }
@@ -2054,10 +2116,15 @@ pub unsafe fn flash_attn_decode_mxfp4(
     head_dim: usize,
     max_ctx: usize,
     kv_len: usize,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); the last
+    // two params by contract (see `flash_attn_decode_f32`). Byte-identical at 0/0.
+    window: i32,
+    softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_decode_mxfp4(
         stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
         n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int, kv_len as c_int,
+        window as c_int, softcap,
     );
     if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
 }
@@ -2080,11 +2147,16 @@ pub unsafe fn flash_attn_prefill_mxfp4(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); the last
+    // two params by contract (see `flash_attn_prefill_f32`). Byte-identical at 0/0.
+    window: i32,
+    softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_prefill_mxfp4(
         stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
         n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
         kv_len_base as c_int, n_new as c_int,
+        window as c_int, softcap,
     );
     if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
 }
@@ -2107,10 +2179,15 @@ pub unsafe fn flash_attn_decode_mxfp6(
     head_dim: usize,
     max_ctx: usize,
     kv_len: usize,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); the last
+    // two params by contract (see `flash_attn_decode_f32`). Byte-identical at 0/0.
+    window: i32,
+    softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_decode_mxfp6(
         stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
         n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int, kv_len as c_int,
+        window as c_int, softcap,
     );
     if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
 }
@@ -2133,11 +2210,16 @@ pub unsafe fn flash_attn_prefill_mxfp6(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); the last
+    // two params by contract (see `flash_attn_prefill_f32`). Byte-identical at 0/0.
+    window: i32,
+    softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_prefill_mxfp6(
         stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
         n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
         kv_len_base as c_int, n_new as c_int,
+        window as c_int, softcap,
     );
     if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
 }
@@ -2160,10 +2242,15 @@ pub unsafe fn flash_attn_decode_mxfp8(
     head_dim: usize,
     max_ctx: usize,
     kv_len: usize,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); the last
+    // two params by contract (see `flash_attn_decode_f32`). Byte-identical at 0/0.
+    window: i32,
+    softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_decode_mxfp8(
         stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
         n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int, kv_len as c_int,
+        window as c_int, softcap,
     );
     if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
 }
@@ -2186,11 +2273,16 @@ pub unsafe fn flash_attn_prefill_mxfp8(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); the last
+    // two params by contract (see `flash_attn_prefill_f32`). Byte-identical at 0/0.
+    window: i32,
+    softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_prefill_mxfp8(
         stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
         n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
         kv_len_base as c_int, n_new as c_int,
+        window as c_int, softcap,
     );
     if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
 }
@@ -2217,11 +2309,16 @@ pub unsafe fn flash_attn_decode_tq(
     head_dim: usize,
     max_ctx: usize,
     kv_len: usize,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); the last
+    // two params by contract (see `flash_attn_decode_f32`). Byte-identical at 0/0.
+    window: i32,
+    softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_decode_tq(
         stream.raw(), q, k_packed, v_packed, k_scales, v_scales, bits as c_int,
         out, n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
         max_ctx as c_int, kv_len as c_int,
+        window as c_int, softcap,
     );
     if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
 }
@@ -2247,11 +2344,16 @@ pub unsafe fn flash_attn_prefill_tq(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); the last
+    // two params by contract (see `flash_attn_prefill_f32`). Byte-identical at 0/0.
+    window: i32,
+    softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_prefill_tq(
         stream.raw(), q, k_packed, v_packed, k_scales, v_scales, bits as c_int,
         out, n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
         max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
+        window as c_int, softcap,
     );
     if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
 }
@@ -2280,11 +2382,16 @@ pub unsafe fn flash_attn_decode_q8_0(
     head_dim: usize,
     max_ctx: usize,
     kv_len: usize,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); the last
+    // two params by contract (see `flash_attn_decode_f32`). Byte-identical at 0/0.
+    window: i32,
+    softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_decode_q8_0(
         stream.raw(), q, k_packed, v_packed, k_scales, v_scales, out,
         n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
         max_ctx as c_int, kv_len as c_int,
+        window as c_int, softcap,
     );
     if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
 }
@@ -2311,11 +2418,16 @@ pub unsafe fn flash_attn_prefill_q8_0(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off); the last
+    // two params by contract (see `flash_attn_prefill_f32`). Byte-identical at 0/0.
+    window: i32,
+    softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_prefill_q8_0(
         stream.raw(), q, k_packed, v_packed, k_scales, v_scales, out,
         n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
         max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
+        window as c_int, softcap,
     );
     if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
 }

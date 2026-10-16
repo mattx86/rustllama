@@ -225,25 +225,29 @@ int rsl_cuda_flash_attn_prefill_f32(rsl_cuda_stream *s, const float *q,
  *             kv_h*max_ctx + t, matching the packed row layout).
  * head_dim is capped at 256 (fixed per-thread dequant buffer); the
  * launcher returns -1 on larger / mis-shaped inputs so the caller
- * falls back to the CPU kernel. Return 0 on success. */
+ * falls back to the CPU kernel. Every entry takes trailing `window`
+ * (0 = full causal, else attend only the last `window` keys) + `softcap`
+ * (0 = off, else the Gemma2 attention-logit cap `s = c*tanh(s/c)` after the
+ * scale, before softmax) — byte-identical passthroughs at 0, mirroring the
+ * CPU `*_capped_windowed` references. Return 0 on success. */
 int rsl_cuda_flash_attn_decode_q4_0(rsl_cuda_stream *s, const float *q,
                                     const void *k_packed, const void *v_packed,
                                     float *out, int n_heads, int n_kv_heads,
-                                    int head_dim, int max_ctx, int kv_len);
+                                    int head_dim, int max_ctx, int kv_len, int window, float softcap);
 int rsl_cuda_flash_attn_prefill_q4_0(rsl_cuda_stream *s, const float *q,
                                      const void *k_packed, const void *v_packed,
                                      float *out, int n_heads, int n_kv_heads,
                                      int head_dim, int max_ctx,
-                                     int kv_len_base, int n_new);
+                                     int kv_len_base, int n_new, int window, float softcap);
 int rsl_cuda_flash_attn_decode_nvfp4(rsl_cuda_stream *s, const float *q,
                                      const void *k_packed, const void *v_packed,
                                      float *out, int n_heads, int n_kv_heads,
-                                     int head_dim, int max_ctx, int kv_len);
+                                     int head_dim, int max_ctx, int kv_len, int window, float softcap);
 int rsl_cuda_flash_attn_prefill_nvfp4(rsl_cuda_stream *s, const float *q,
                                       const void *k_packed, const void *v_packed,
                                       float *out, int n_heads, int n_kv_heads,
                                       int head_dim, int max_ctx,
-                                      int kv_len_base, int n_new);
+                                      int kv_len_base, int n_new, int window, float softcap);
 /* MXFP4/6/8-KV FlashAttention: F32 Q / F32 out, packed K/V dequantized on
  * the fly. Each format is 32 elems/block with a trailing E8M0 scale byte
  * (bytes_per_row = (head_dim/32)*{17,25,33} for MXFP4/6/8); head_dim % 32
@@ -252,42 +256,42 @@ int rsl_cuda_flash_attn_prefill_nvfp4(rsl_cuda_stream *s, const float *q,
 int rsl_cuda_flash_attn_decode_mxfp4(rsl_cuda_stream *s, const float *q,
                                      const void *k_packed, const void *v_packed,
                                      float *out, int n_heads, int n_kv_heads,
-                                     int head_dim, int max_ctx, int kv_len);
+                                     int head_dim, int max_ctx, int kv_len, int window, float softcap);
 int rsl_cuda_flash_attn_prefill_mxfp4(rsl_cuda_stream *s, const float *q,
                                       const void *k_packed, const void *v_packed,
                                       float *out, int n_heads, int n_kv_heads,
                                       int head_dim, int max_ctx,
-                                      int kv_len_base, int n_new);
+                                      int kv_len_base, int n_new, int window, float softcap);
 int rsl_cuda_flash_attn_decode_mxfp6(rsl_cuda_stream *s, const float *q,
                                      const void *k_packed, const void *v_packed,
                                      float *out, int n_heads, int n_kv_heads,
-                                     int head_dim, int max_ctx, int kv_len);
+                                     int head_dim, int max_ctx, int kv_len, int window, float softcap);
 int rsl_cuda_flash_attn_prefill_mxfp6(rsl_cuda_stream *s, const float *q,
                                       const void *k_packed, const void *v_packed,
                                       float *out, int n_heads, int n_kv_heads,
                                       int head_dim, int max_ctx,
-                                      int kv_len_base, int n_new);
+                                      int kv_len_base, int n_new, int window, float softcap);
 int rsl_cuda_flash_attn_decode_mxfp8(rsl_cuda_stream *s, const float *q,
                                      const void *k_packed, const void *v_packed,
                                      float *out, int n_heads, int n_kv_heads,
-                                     int head_dim, int max_ctx, int kv_len);
+                                     int head_dim, int max_ctx, int kv_len, int window, float softcap);
 int rsl_cuda_flash_attn_prefill_mxfp8(rsl_cuda_stream *s, const float *q,
                                       const void *k_packed, const void *v_packed,
                                       float *out, int n_heads, int n_kv_heads,
                                       int head_dim, int max_ctx,
-                                      int kv_len_base, int n_new);
+                                      int kv_len_base, int n_new, int window, float softcap);
 int rsl_cuda_flash_attn_decode_tq(rsl_cuda_stream *s, const float *q,
                                   const void *k_packed, const void *v_packed,
                                   const float *k_scales, const float *v_scales,
                                   int bits, float *out, int n_heads,
                                   int n_kv_heads, int head_dim, int max_ctx,
-                                  int kv_len);
+                                  int kv_len, int window, float softcap);
 int rsl_cuda_flash_attn_prefill_tq(rsl_cuda_stream *s, const float *q,
                                    const void *k_packed, const void *v_packed,
                                    const float *k_scales, const float *v_scales,
                                    int bits, float *out, int n_heads,
                                    int n_kv_heads, int head_dim, int max_ctx,
-                                   int kv_len_base, int n_new);
+                                   int kv_len_base, int n_new, int window, float softcap);
 
 /* Q8_0-KV FlashAttention: F32 Q / F32 out, i8 K/V slab + per-row f32 scale.
  * Byte-exact port of the CPU gqa_attention_flash_decode_q8_0 / _prefill_q8_0.
@@ -296,18 +300,20 @@ int rsl_cuda_flash_attn_prefill_tq(rsl_cuda_stream *s, const float *q,
  * f32 [n_kv_heads*max_ctx] indexed kv_h*max_ctx + t (same shape as the TQ
  * scales). The kernel dots the raw i8 codes and factors the row scale out of
  * the inner loop, matching the CPU reference. head_dim capped by the shared
- * shape guard. Return 0 on success. */
+ * shape guard. Trailing `window` (0 = full causal) + `softcap` (0 = off,
+ * Gemma2 attention-logit cap) as the other quant-flash entries — byte-
+ * identical passthroughs at 0. Return 0 on success. */
 int rsl_cuda_flash_attn_decode_q8_0(rsl_cuda_stream *s, const float *q,
                                     const void *k_packed, const void *v_packed,
                                     const float *k_scales, const float *v_scales,
                                     float *out, int n_heads, int n_kv_heads,
-                                    int head_dim, int max_ctx, int kv_len);
+                                    int head_dim, int max_ctx, int kv_len, int window, float softcap);
 int rsl_cuda_flash_attn_prefill_q8_0(rsl_cuda_stream *s, const float *q,
                                      const void *k_packed, const void *v_packed,
                                      const float *k_scales, const float *v_scales,
                                      float *out, int n_heads, int n_kv_heads,
                                      int head_dim, int max_ctx,
-                                     int kv_len_base, int n_new);
+                                     int kv_len_base, int n_new, int window, float softcap);
 
 /* Greedy argmax over `vocab` F32 logits; writes chosen index to out_idx[0]
  * (lowest index on ties). */

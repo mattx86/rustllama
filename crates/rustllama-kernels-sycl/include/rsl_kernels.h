@@ -356,36 +356,40 @@ void rsl_flash_attn_prefill_v3_usm(rsl_stream* s,
  * head_dim is capped at 256; the kernel early-returns on larger /
  * mis-shaped inputs so the caller falls back to CPU. All pointers are
  * USM allocations on the bound device's context. */
-void rsl_flash_attn_decode_q4_0_usm(rsl_stream* s,
+int rsl_flash_attn_decode_q4_0_usm(rsl_stream* s,
                                     const float* q_usm,
                                     const void* k_packed_usm,
                                     const void* v_packed_usm,
                                     float* out_usm,
                                     int n_heads, int n_kv_heads,
-                                    int head_dim, int max_ctx, int kv_len);
-void rsl_flash_attn_prefill_q4_0_usm(rsl_stream* s,
+                                    int head_dim, int max_ctx, int kv_len,
+                                    int window, float softcap);
+int rsl_flash_attn_prefill_q4_0_usm(rsl_stream* s,
                                      const float* q_usm,
                                      const void* k_packed_usm,
                                      const void* v_packed_usm,
                                      float* out_usm,
                                      int n_heads, int n_kv_heads,
                                      int head_dim, int max_ctx,
-                                     int kv_len_base, int n_new);
-void rsl_flash_attn_decode_nvfp4_usm(rsl_stream* s,
+                                     int kv_len_base, int n_new,
+                                    int window, float softcap);
+int rsl_flash_attn_decode_nvfp4_usm(rsl_stream* s,
                                      const float* q_usm,
                                      const void* k_packed_usm,
                                      const void* v_packed_usm,
                                      float* out_usm,
                                      int n_heads, int n_kv_heads,
-                                     int head_dim, int max_ctx, int kv_len);
-void rsl_flash_attn_prefill_nvfp4_usm(rsl_stream* s,
+                                     int head_dim, int max_ctx, int kv_len,
+                                    int window, float softcap);
+int rsl_flash_attn_prefill_nvfp4_usm(rsl_stream* s,
                                       const float* q_usm,
                                       const void* k_packed_usm,
                                       const void* v_packed_usm,
                                       float* out_usm,
                                       int n_heads, int n_kv_heads,
                                       int head_dim, int max_ctx,
-                                      int kv_len_base, int n_new);
+                                      int kv_len_base, int n_new,
+                                    int window, float softcap);
 /* OCP Microscaling (MX) KV FlashAttention: MXFP4 / MXFP6 / MXFP8. Same
  * shape/semantics as the NVFP4 entries above; the K/V slab is
  * `[n_kv_heads, max_ctx, bytes_per_row]` with 32-element blocks (one
@@ -395,52 +399,58 @@ void rsl_flash_attn_prefill_nvfp4_usm(rsl_stream* s,
  *   MXFP8 : bytes_per_row = (head_dim/32)*33
  * head_dim is capped at 256; the kernel early-returns on larger /
  * mis-shaped inputs so the caller falls back to CPU. */
-void rsl_flash_attn_decode_mxfp4_usm(rsl_stream* s,
+int rsl_flash_attn_decode_mxfp4_usm(rsl_stream* s,
                                      const float* q_usm,
                                      const void* k_packed_usm,
                                      const void* v_packed_usm,
                                      float* out_usm,
                                      int n_heads, int n_kv_heads,
-                                     int head_dim, int max_ctx, int kv_len);
-void rsl_flash_attn_prefill_mxfp4_usm(rsl_stream* s,
+                                     int head_dim, int max_ctx, int kv_len,
+                                    int window, float softcap);
+int rsl_flash_attn_prefill_mxfp4_usm(rsl_stream* s,
                                       const float* q_usm,
                                       const void* k_packed_usm,
                                       const void* v_packed_usm,
                                       float* out_usm,
                                       int n_heads, int n_kv_heads,
                                       int head_dim, int max_ctx,
-                                      int kv_len_base, int n_new);
-void rsl_flash_attn_decode_mxfp6_usm(rsl_stream* s,
+                                      int kv_len_base, int n_new,
+                                    int window, float softcap);
+int rsl_flash_attn_decode_mxfp6_usm(rsl_stream* s,
                                      const float* q_usm,
                                      const void* k_packed_usm,
                                      const void* v_packed_usm,
                                      float* out_usm,
                                      int n_heads, int n_kv_heads,
-                                     int head_dim, int max_ctx, int kv_len);
-void rsl_flash_attn_prefill_mxfp6_usm(rsl_stream* s,
+                                     int head_dim, int max_ctx, int kv_len,
+                                    int window, float softcap);
+int rsl_flash_attn_prefill_mxfp6_usm(rsl_stream* s,
                                       const float* q_usm,
                                       const void* k_packed_usm,
                                       const void* v_packed_usm,
                                       float* out_usm,
                                       int n_heads, int n_kv_heads,
                                       int head_dim, int max_ctx,
-                                      int kv_len_base, int n_new);
-void rsl_flash_attn_decode_mxfp8_usm(rsl_stream* s,
+                                      int kv_len_base, int n_new,
+                                    int window, float softcap);
+int rsl_flash_attn_decode_mxfp8_usm(rsl_stream* s,
                                      const float* q_usm,
                                      const void* k_packed_usm,
                                      const void* v_packed_usm,
                                      float* out_usm,
                                      int n_heads, int n_kv_heads,
-                                     int head_dim, int max_ctx, int kv_len);
-void rsl_flash_attn_prefill_mxfp8_usm(rsl_stream* s,
+                                     int head_dim, int max_ctx, int kv_len,
+                                    int window, float softcap);
+int rsl_flash_attn_prefill_mxfp8_usm(rsl_stream* s,
                                       const float* q_usm,
                                       const void* k_packed_usm,
                                       const void* v_packed_usm,
                                       float* out_usm,
                                       int n_heads, int n_kv_heads,
                                       int head_dim, int max_ctx,
-                                      int kv_len_base, int n_new);
-void rsl_flash_attn_decode_tq_usm(rsl_stream* s,
+                                      int kv_len_base, int n_new,
+                                    int window, float softcap);
+int rsl_flash_attn_decode_tq_usm(rsl_stream* s,
                                   const float* q_usm,
                                   const void* k_packed_usm,
                                   const void* v_packed_usm,
@@ -449,8 +459,9 @@ void rsl_flash_attn_decode_tq_usm(rsl_stream* s,
                                   int bits,
                                   float* out_usm,
                                   int n_heads, int n_kv_heads,
-                                  int head_dim, int max_ctx, int kv_len);
-void rsl_flash_attn_prefill_tq_usm(rsl_stream* s,
+                                  int head_dim, int max_ctx, int kv_len,
+                                    int window, float softcap);
+int rsl_flash_attn_prefill_tq_usm(rsl_stream* s,
                                    const float* q_usm,
                                    const void* k_packed_usm,
                                    const void* v_packed_usm,
@@ -460,7 +471,8 @@ void rsl_flash_attn_prefill_tq_usm(rsl_stream* s,
                                    float* out_usm,
                                    int n_heads, int n_kv_heads,
                                    int head_dim, int max_ctx,
-                                   int kv_len_base, int n_new);
+                                   int kv_len_base, int n_new,
+                                    int window, float softcap);
 /* Q8_0-KV FlashAttention: F32 Q / F32 out, i8 K/V slab + per-row f32 scale.
  * Byte-exact port of the CPU gqa_attention_flash_decode_q8_0 / _prefill_q8_0.
  * K/V are PLAIN i8 slabs [n_kv_heads, max_ctx, head_dim] (one byte per
@@ -468,7 +480,7 @@ void rsl_flash_attn_prefill_tq_usm(rsl_stream* s,
  * per-row absmax f32 [n_kv_heads*max_ctx] (indexed kv_h*max_ctx + t, same
  * shape as the TQ scales). The kernel dots the raw i8 codes and factors the
  * row scale out of the inner loop (no materialized row, no head_dim cap). */
-void rsl_flash_attn_decode_q8_0_usm(rsl_stream* s,
+int rsl_flash_attn_decode_q8_0_usm(rsl_stream* s,
                                     const float* q_usm,
                                     const void* k_packed_usm,
                                     const void* v_packed_usm,
@@ -476,8 +488,9 @@ void rsl_flash_attn_decode_q8_0_usm(rsl_stream* s,
                                     const float* v_scales_usm,
                                     float* out_usm,
                                     int n_heads, int n_kv_heads,
-                                    int head_dim, int max_ctx, int kv_len);
-void rsl_flash_attn_prefill_q8_0_usm(rsl_stream* s,
+                                    int head_dim, int max_ctx, int kv_len,
+                                    int window, float softcap);
+int rsl_flash_attn_prefill_q8_0_usm(rsl_stream* s,
                                      const float* q_usm,
                                      const void* k_packed_usm,
                                      const void* v_packed_usm,
@@ -486,7 +499,8 @@ void rsl_flash_attn_prefill_q8_0_usm(rsl_stream* s,
                                      float* out_usm,
                                      int n_heads, int n_kv_heads,
                                      int head_dim, int max_ctx,
-                                     int kv_len_base, int n_new);
+                                     int kv_len_base, int n_new,
+                                    int window, float softcap);
 
 /* USM-resident F16 GEMM: `C[M,N] = A[M,K] @ B[K,N]`, row-major.
  * Pointers MUST be USM allocations on the bound device's context.

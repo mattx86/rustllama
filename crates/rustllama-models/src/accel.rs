@@ -7276,6 +7276,11 @@ fn try_flash_attn_decode_usm_quant(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    // Per-layer SWA window (0=full causal) + Gemma2 attention-logit soft-cap
+    // (0=off). Threaded into the quant flash-decode kernels so a Mistral-SWA /
+    // Gemma2 layer runs on the GPU bit-exact to the CPU capped+windowed path.
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if !usm_attn_enabled() || !gpu_active_for_current_layer() {
         return false;
@@ -7579,31 +7584,31 @@ fn try_flash_attn_decode_usm_quant(
             match fmt {
                 QuantKv::Q4_0 => sk::flash_attn_decode_q4_0_usm_raw(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
                 ),
                 QuantKv::Q8_0 => sk::flash_attn_decode_q8_0_usm_raw(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
                 ),
                 QuantKv::Nvfp4 => sk::flash_attn_decode_nvfp4_usm_raw(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
                 ),
                 QuantKv::Tq { bits } => sk::flash_attn_decode_tq_usm_raw(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
                 ),
                 QuantKv::Mxfp4 => sk::flash_attn_decode_mxfp4_usm_raw(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
                 ),
                 QuantKv::Mxfp6 => sk::flash_attn_decode_mxfp6_usm_raw(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
                 ),
                 QuantKv::Mxfp8 => sk::flash_attn_decode_mxfp8_usm_raw(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
                 ),
             }
         }
@@ -7634,10 +7639,12 @@ pub fn try_flash_attn_decode_usm_q4_0(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    window: u32,
+    softcap: f32,
 ) -> bool {
     try_flash_attn_decode_usm_quant(
         QuantKv::Q4_0, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
     )
 }
 
@@ -7655,10 +7662,12 @@ pub fn try_flash_attn_decode_usm_q8_0(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    window: u32,
+    softcap: f32,
 ) -> bool {
     try_flash_attn_decode_usm_quant(
         QuantKv::Q8_0, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
     )
 }
 
@@ -7676,10 +7685,12 @@ pub fn try_flash_attn_decode_usm_nvfp4(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    window: u32,
+    softcap: f32,
 ) -> bool {
     try_flash_attn_decode_usm_quant(
         QuantKv::Nvfp4, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
     )
 }
 
@@ -7698,10 +7709,12 @@ pub fn try_flash_attn_decode_usm_tq(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    window: u32,
+    softcap: f32,
 ) -> bool {
     try_flash_attn_decode_usm_quant(
         QuantKv::Tq { bits }, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
     )
 }
 
@@ -10438,6 +10451,11 @@ fn try_flash_attn_decode_cuda_quant(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    // Per-layer SWA window (0=full causal) + Gemma2 attention-logit soft-cap
+    // (0=off). Threaded into the quant flash-decode kernels so a Mistral-SWA /
+    // Gemma2 layer runs on the GPU bit-exact to the CPU capped+windowed path.
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if !cuda_active() || !gpu_active_for_current_layer() {
         return false;
@@ -10620,30 +10638,37 @@ fn try_flash_attn_decode_cuda_quant(
                 QuantKv::Q4_0 => ck::flash_attn_decode_q4_0(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                    window as i32, softcap,
                 ),
                 QuantKv::Q8_0 => ck::flash_attn_decode_q8_0(
                     stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, out_ptr,
                     n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                    window as i32, softcap,
                 ),
                 QuantKv::Nvfp4 => ck::flash_attn_decode_nvfp4(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                    window as i32, softcap,
                 ),
                 QuantKv::Tq { bits } => ck::flash_attn_decode_tq(
                     stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
                     n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                    window as i32, softcap,
                 ),
                 QuantKv::Mxfp4 => ck::flash_attn_decode_mxfp4(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                    window as i32, softcap,
                 ),
                 QuantKv::Mxfp6 => ck::flash_attn_decode_mxfp6(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                    window as i32, softcap,
                 ),
                 QuantKv::Mxfp8 => ck::flash_attn_decode_mxfp8(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                    window as i32, softcap,
                 ),
             }
         }
@@ -10674,10 +10699,12 @@ pub fn try_flash_attn_decode_cuda_q4_0(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    window: u32,
+    softcap: f32,
 ) -> bool {
     try_flash_attn_decode_cuda_quant(
         QuantKv::Q4_0, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
     )
 }
 
@@ -10695,10 +10722,12 @@ pub fn try_flash_attn_decode_cuda_q8_0(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    window: u32,
+    softcap: f32,
 ) -> bool {
     try_flash_attn_decode_cuda_quant(
         QuantKv::Q8_0, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
     )
 }
 
@@ -10716,10 +10745,12 @@ pub fn try_flash_attn_decode_cuda_nvfp4(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    window: u32,
+    softcap: f32,
 ) -> bool {
     try_flash_attn_decode_cuda_quant(
         QuantKv::Nvfp4, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
     )
 }
 
@@ -10738,10 +10769,12 @@ pub fn try_flash_attn_decode_cuda_tq(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    window: u32,
+    softcap: f32,
 ) -> bool {
     try_flash_attn_decode_cuda_quant(
         QuantKv::Tq { bits }, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
     )
 }
 
@@ -11143,6 +11176,11 @@ fn try_flash_attn_decode_mlx_quant(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    // Per-layer SWA window (0=full causal) + Gemma2 attention-logit soft-cap
+    // (0=off). Threaded into the quant flash-decode kernels so a Mistral-SWA /
+    // Gemma2 layer runs on the GPU bit-exact to the CPU capped+windowed path.
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if !mlx_active() || !gpu_active_for_current_layer() {
         return false;
@@ -11314,30 +11352,37 @@ fn try_flash_attn_decode_mlx_quant(
                 QuantKv::Q4_0 => mk::flash_attn_decode_q4_0(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                    window as i32, softcap,
                 ),
                 QuantKv::Q8_0 => mk::flash_attn_decode_q8_0(
                     stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, out_ptr,
                     n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                    window as i32, softcap,
                 ),
                 QuantKv::Nvfp4 => mk::flash_attn_decode_nvfp4(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                    window as i32, softcap,
                 ),
                 QuantKv::Tq { bits } => mk::flash_attn_decode_tq(
                     stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
                     n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                    window as i32, softcap,
                 ),
                 QuantKv::Mxfp4 => mk::flash_attn_decode_mxfp4(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                    window as i32, softcap,
                 ),
                 QuantKv::Mxfp6 => mk::flash_attn_decode_mxfp6(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                    window as i32, softcap,
                 ),
                 QuantKv::Mxfp8 => mk::flash_attn_decode_mxfp8(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as usize, n_kv, hd, mc, kv_len as usize,
+                    window as i32, softcap,
                 ),
             }
         }
@@ -11368,10 +11413,12 @@ pub fn try_flash_attn_decode_mlx_q4_0(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    window: u32,
+    softcap: f32,
 ) -> bool {
     try_flash_attn_decode_mlx_quant(
         QuantKv::Q4_0, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
     )
 }
 
@@ -11389,10 +11436,12 @@ pub fn try_flash_attn_decode_mlx_q8_0(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    window: u32,
+    softcap: f32,
 ) -> bool {
     try_flash_attn_decode_mlx_quant(
         QuantKv::Q8_0, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
     )
 }
 
@@ -11410,10 +11459,12 @@ pub fn try_flash_attn_decode_mlx_nvfp4(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    window: u32,
+    softcap: f32,
 ) -> bool {
     try_flash_attn_decode_mlx_quant(
         QuantKv::Nvfp4, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
     )
 }
 
@@ -11432,10 +11483,12 @@ pub fn try_flash_attn_decode_mlx_tq(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    window: u32,
+    softcap: f32,
 ) -> bool {
     try_flash_attn_decode_mlx_quant(
         QuantKv::Tq { bits }, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
     )
 }
 
@@ -11516,11 +11569,15 @@ pub fn try_flash_attn_decode_gpu_q4_0(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off),
+    // threaded into whichever backend runs. Passthrough no-ops at 0.
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if cuda_active()
         && try_flash_attn_decode_cuda_q4_0(
             q, k_row, v_row, out, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
         )
     {
         return true;
@@ -11528,14 +11585,14 @@ pub fn try_flash_attn_decode_gpu_q4_0(
     if mlx_active()
         && try_flash_attn_decode_mlx_q4_0(
             q, k_row, v_row, out, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
         )
     {
         return true;
     }
     try_flash_attn_decode_usm_q4_0(
         q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
     )
 }
 
@@ -11553,11 +11610,15 @@ pub fn try_flash_attn_decode_gpu_q8_0(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off),
+    // threaded into whichever backend runs. Passthrough no-ops at 0.
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if cuda_active()
         && try_flash_attn_decode_cuda_q8_0(
             q, k_row, v_row, out, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
         )
     {
         return true;
@@ -11565,14 +11626,14 @@ pub fn try_flash_attn_decode_gpu_q8_0(
     if mlx_active()
         && try_flash_attn_decode_mlx_q8_0(
             q, k_row, v_row, out, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
         )
     {
         return true;
     }
     try_flash_attn_decode_usm_q8_0(
         q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
     )
 }
 
@@ -11590,11 +11651,15 @@ pub fn try_flash_attn_decode_gpu_nvfp4(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off),
+    // threaded into whichever backend runs. Passthrough no-ops at 0.
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if cuda_active()
         && try_flash_attn_decode_cuda_nvfp4(
             q, k_row, v_row, out, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
         )
     {
         return true;
@@ -11602,14 +11667,14 @@ pub fn try_flash_attn_decode_gpu_nvfp4(
     if mlx_active()
         && try_flash_attn_decode_mlx_nvfp4(
             q, k_row, v_row, out, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
         )
     {
         return true;
     }
     try_flash_attn_decode_usm_nvfp4(
         q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
     )
 }
 
@@ -11631,11 +11696,15 @@ macro_rules! mxfp_decode_gpu_combinator {
             head_dim: u32,
             max_ctx: u32,
             n_layers: u32,
+            // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap
+            // (0=off), threaded into whichever backend runs. Passthrough no-ops at 0.
+            window: u32,
+            softcap: f32,
         ) -> bool {
             if cuda_active()
                 && try_flash_attn_decode_cuda_quant(
                     $kv, q, k_row, v_row, out, layer_idx, pos,
-                    n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+                    n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
                 )
             {
                 return true;
@@ -11643,14 +11712,14 @@ macro_rules! mxfp_decode_gpu_combinator {
             if mlx_active()
                 && try_flash_attn_decode_mlx_quant(
                     $kv, q, k_row, v_row, out, layer_idx, pos,
-                    n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+                    n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
                 )
             {
                 return true;
             }
             try_flash_attn_decode_usm_quant(
                 $kv, q, k_row, v_row, out, layer_idx, pos,
-                n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+                n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
             )
         }
     };
@@ -11674,11 +11743,15 @@ pub fn try_flash_attn_decode_gpu_tq(
     head_dim: u32,
     max_ctx: u32,
     n_layers: u32,
+    // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off),
+    // threaded into whichever backend runs. Passthrough no-ops at 0.
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if cuda_active()
         && try_flash_attn_decode_cuda_tq(
             q, k_row, v_row, out, bits, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
         )
     {
         return true;
@@ -11686,14 +11759,14 @@ pub fn try_flash_attn_decode_gpu_tq(
     if mlx_active()
         && try_flash_attn_decode_mlx_tq(
             q, k_row, v_row, out, bits, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
         )
     {
         return true;
     }
     try_flash_attn_decode_usm_tq(
         q, k_row, v_row, out, bits, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
     )
 }
 
@@ -15461,6 +15534,11 @@ fn try_flash_attn_prefill_usm_quant(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // Per-layer SWA window (0=full causal) + Gemma2 attention-logit soft-cap
+    // (0=off). Threaded into the quant flash-prefill kernels so a Mistral-SWA /
+    // Gemma2 layer runs on the GPU bit-exact to the CPU capped+windowed path.
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if !usm_attn_enabled() {
         log_prefill_attn_skip_once("usm_attn_enabled = false");
@@ -15569,37 +15647,37 @@ fn try_flash_attn_prefill_usm_quant(
                 QuantKv::Q4_0 => sk::flash_attn_prefill_q4_0_usm_raw(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as u32, n_kv_heads as u32, head_dim as u32,
-                    max_ctx as u32, kv_len_base as u32, n_new as u32,
+                    max_ctx as u32, kv_len_base as u32, n_new as u32, window, softcap,
                 ),
                 QuantKv::Q8_0 => sk::flash_attn_prefill_q8_0_usm_raw(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, out_ptr,
                     n_heads as u32, n_kv_heads as u32, head_dim as u32,
-                    max_ctx as u32, kv_len_base as u32, n_new as u32,
+                    max_ctx as u32, kv_len_base as u32, n_new as u32, window, softcap,
                 ),
                 QuantKv::Nvfp4 => sk::flash_attn_prefill_nvfp4_usm_raw(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as u32, n_kv_heads as u32, head_dim as u32,
-                    max_ctx as u32, kv_len_base as u32, n_new as u32,
+                    max_ctx as u32, kv_len_base as u32, n_new as u32, window, softcap,
                 ),
                 QuantKv::Tq { bits } => sk::flash_attn_prefill_tq_usm_raw(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
                     n_heads as u32, n_kv_heads as u32, head_dim as u32,
-                    max_ctx as u32, kv_len_base as u32, n_new as u32,
+                    max_ctx as u32, kv_len_base as u32, n_new as u32, window, softcap,
                 ),
                 QuantKv::Mxfp4 => sk::flash_attn_prefill_mxfp4_usm_raw(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as u32, n_kv_heads as u32, head_dim as u32,
-                    max_ctx as u32, kv_len_base as u32, n_new as u32,
+                    max_ctx as u32, kv_len_base as u32, n_new as u32, window, softcap,
                 ),
                 QuantKv::Mxfp6 => sk::flash_attn_prefill_mxfp6_usm_raw(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as u32, n_kv_heads as u32, head_dim as u32,
-                    max_ctx as u32, kv_len_base as u32, n_new as u32,
+                    max_ctx as u32, kv_len_base as u32, n_new as u32, window, softcap,
                 ),
                 QuantKv::Mxfp8 => sk::flash_attn_prefill_mxfp8_usm_raw(
                     &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads as u32, n_kv_heads as u32, head_dim as u32,
-                    max_ctx as u32, kv_len_base as u32, n_new as u32,
+                    max_ctx as u32, kv_len_base as u32, n_new as u32, window, softcap,
                 ),
             }
         }
@@ -15744,6 +15822,11 @@ fn try_flash_attn_prefill_cuda_quant(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // Per-layer SWA window (0=full causal) + Gemma2 attention-logit soft-cap
+    // (0=off). Threaded into the quant flash-prefill kernels so a Mistral-SWA /
+    // Gemma2 layer runs on the GPU bit-exact to the CPU capped+windowed path.
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if !cuda_active() || !gpu_active_for_current_layer() {
         return false;
@@ -15863,30 +15946,37 @@ fn try_flash_attn_prefill_cuda_quant(
                 QuantKv::Q4_0 => ck::flash_attn_prefill_q4_0(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                    window as i32, softcap,
                 ),
                 QuantKv::Q8_0 => ck::flash_attn_prefill_q8_0(
                     stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, out_ptr,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                    window as i32, softcap,
                 ),
                 QuantKv::Nvfp4 => ck::flash_attn_prefill_nvfp4(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                    window as i32, softcap,
                 ),
                 QuantKv::Tq { bits } => ck::flash_attn_prefill_tq(
                     stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                    window as i32, softcap,
                 ),
                 QuantKv::Mxfp4 => ck::flash_attn_prefill_mxfp4(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                    window as i32, softcap,
                 ),
                 QuantKv::Mxfp6 => ck::flash_attn_prefill_mxfp6(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                    window as i32, softcap,
                 ),
                 QuantKv::Mxfp8 => ck::flash_attn_prefill_mxfp8(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                    window as i32, softcap,
                 ),
             }
         }
@@ -16025,6 +16115,11 @@ fn try_flash_attn_prefill_mlx_quant(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // Per-layer SWA window (0=full causal) + Gemma2 attention-logit soft-cap
+    // (0=off). Threaded into the quant flash-prefill kernels so a Mistral-SWA /
+    // Gemma2 layer runs on the GPU bit-exact to the CPU capped+windowed path.
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if !mlx_active() || !gpu_active_for_current_layer() {
         return false;
@@ -16144,30 +16239,37 @@ fn try_flash_attn_prefill_mlx_quant(
                 QuantKv::Q4_0 => mk::flash_attn_prefill_q4_0(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                    window as i32, softcap,
                 ),
                 QuantKv::Q8_0 => mk::flash_attn_prefill_q8_0(
                     stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, out_ptr,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                    window as i32, softcap,
                 ),
                 QuantKv::Nvfp4 => mk::flash_attn_prefill_nvfp4(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                    window as i32, softcap,
                 ),
                 QuantKv::Tq { bits } => mk::flash_attn_prefill_tq(
                     stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                    window as i32, softcap,
                 ),
                 QuantKv::Mxfp4 => mk::flash_attn_prefill_mxfp4(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                    window as i32, softcap,
                 ),
                 QuantKv::Mxfp6 => mk::flash_attn_prefill_mxfp6(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                    window as i32, softcap,
                 ),
                 QuantKv::Mxfp8 => mk::flash_attn_prefill_mxfp8(
                     stream, q_ptr, k_ptr, v_ptr, out_ptr,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                    window as i32, softcap,
                 ),
             }
         }
@@ -16244,11 +16346,15 @@ pub fn try_flash_attn_prefill_gpu_q4_0(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off),
+    // threaded into whichever backend runs. Passthrough no-ops at 0.
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if cuda_active()
         && try_flash_attn_prefill_cuda_quant(
             QuantKv::Q4_0, q, k_packed, v_packed, &[], &[], out,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
         )
     {
         return true;
@@ -16256,14 +16362,14 @@ pub fn try_flash_attn_prefill_gpu_q4_0(
     if mlx_active()
         && try_flash_attn_prefill_mlx_quant(
             QuantKv::Q4_0, q, k_packed, v_packed, &[], &[], out,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
         )
     {
         return true;
     }
     try_flash_attn_prefill_usm_quant(
         QuantKv::Q4_0, q, k_packed, v_packed, &[], &[], out,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
     )
 }
 
@@ -16284,6 +16390,10 @@ pub fn try_flash_attn_prefill_gpu_q8_0(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off),
+    // threaded into whichever backend runs. Passthrough no-ops at 0.
+    window: u32,
+    softcap: f32,
 ) -> bool {
     let k_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(k_q.as_ptr() as *const u8, k_q.len()) };
@@ -16292,7 +16402,7 @@ pub fn try_flash_attn_prefill_gpu_q8_0(
     if cuda_active()
         && try_flash_attn_prefill_cuda_quant(
             QuantKv::Q8_0, q, k_bytes, v_bytes, k_scales, v_scales, out,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
         )
     {
         return true;
@@ -16300,14 +16410,14 @@ pub fn try_flash_attn_prefill_gpu_q8_0(
     if mlx_active()
         && try_flash_attn_prefill_mlx_quant(
             QuantKv::Q8_0, q, k_bytes, v_bytes, k_scales, v_scales, out,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
         )
     {
         return true;
     }
     try_flash_attn_prefill_usm_quant(
         QuantKv::Q8_0, q, k_bytes, v_bytes, k_scales, v_scales, out,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
     )
 }
 
@@ -16324,11 +16434,15 @@ pub fn try_flash_attn_prefill_gpu_nvfp4(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off),
+    // threaded into whichever backend runs. Passthrough no-ops at 0.
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if cuda_active()
         && try_flash_attn_prefill_cuda_quant(
             QuantKv::Nvfp4, q, k_packed, v_packed, &[], &[], out,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
         )
     {
         return true;
@@ -16336,14 +16450,14 @@ pub fn try_flash_attn_prefill_gpu_nvfp4(
     if mlx_active()
         && try_flash_attn_prefill_mlx_quant(
             QuantKv::Nvfp4, q, k_packed, v_packed, &[], &[], out,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
         )
     {
         return true;
     }
     try_flash_attn_prefill_usm_quant(
         QuantKv::Nvfp4, q, k_packed, v_packed, &[], &[], out,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
     )
 }
 
@@ -16362,11 +16476,15 @@ macro_rules! mxfp_prefill_gpu_combinator {
             max_ctx: usize,
             kv_len_base: usize,
             n_new: usize,
+            // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap
+            // (0=off), threaded into whichever backend runs. Passthrough no-ops at 0.
+            window: u32,
+            softcap: f32,
         ) -> bool {
             if cuda_active()
                 && try_flash_attn_prefill_cuda_quant(
                     $kv, q, k_packed, v_packed, &[], &[], out,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
                 )
             {
                 return true;
@@ -16374,14 +16492,14 @@ macro_rules! mxfp_prefill_gpu_combinator {
             if mlx_active()
                 && try_flash_attn_prefill_mlx_quant(
                     $kv, q, k_packed, v_packed, &[], &[], out,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
                 )
             {
                 return true;
             }
             try_flash_attn_prefill_usm_quant(
                 $kv, q, k_packed, v_packed, &[], &[], out,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
             )
         }
     };
@@ -16406,11 +16524,15 @@ pub fn try_flash_attn_prefill_gpu_tq(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off),
+    // threaded into whichever backend runs. Passthrough no-ops at 0.
+    window: u32,
+    softcap: f32,
 ) -> bool {
     if cuda_active()
         && try_flash_attn_prefill_cuda_quant(
             QuantKv::Tq { bits }, q, k_packed, v_packed, k_scales, v_scales, out,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
         )
     {
         return true;
@@ -16418,14 +16540,14 @@ pub fn try_flash_attn_prefill_gpu_tq(
     if mlx_active()
         && try_flash_attn_prefill_mlx_quant(
             QuantKv::Tq { bits }, q, k_packed, v_packed, k_scales, v_scales, out,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
         )
     {
         return true;
     }
     try_flash_attn_prefill_usm_quant(
         QuantKv::Tq { bits }, q, k_packed, v_packed, k_scales, v_scales, out,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
     )
 }
 

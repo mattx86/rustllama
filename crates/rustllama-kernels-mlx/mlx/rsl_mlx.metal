@@ -2983,8 +2983,12 @@ inline float rsl_mxfp8_kv_elem(device const uchar *p, int i) {
 
 // Generate the decode + prefill kernel pair for a scale-free per-element KV
 // format. BPR(head_dim) = bytes per K/V row; DEQ(ptr,i) dequants element i.
-#define RSL_MLX_FLASH_KV_PAIR(SUFFIX, BPR, DEQ)                                    \
-kernel void rsl_mlx_flash_attn_decode_##SUFFIX##_kernel(                           \
+// `window` (0=full causal) + `softcap` (0=off) mirror the F32 flash + CPU
+// `*_capped_windowed` reference: SWA trims the attended range to the last
+// `window` cached positions; the Gemma2 soft-cap `s=c*tanh(s/c)` applies
+// after the 1/sqrt scale, before the online-softmax. Byte-identical at 0/0.
+#define RSL_MLX_FLASH_KV_PAIR(SUFFIX, BPR, DEQ)                                   \
+kernel void rsl_mlx_flash_attn_decode_##SUFFIX##_kernel(                          \
     device const float *q [[buffer(0)]],                                          \
     device const uchar *k_packed [[buffer(1)]],                                   \
     device const uchar *v_packed [[buffer(2)]],                                   \
@@ -2992,6 +2996,7 @@ kernel void rsl_mlx_flash_attn_decode_##SUFFIX##_kernel(                        
     constant int &n_heads [[buffer(4)]], constant int &n_kv_heads [[buffer(5)]],  \
     constant int &head_dim [[buffer(6)]], constant int &max_ctx [[buffer(7)]],    \
     constant int &kv_len [[buffer(8)]],                                           \
+    constant int &window [[buffer(9)]], constant float &softcap [[buffer(10)]],   \
     uint head [[threadgroup_position_in_grid]],                                   \
     uint lane [[thread_position_in_threadgroup]],                                 \
     uint lane_count [[threads_per_threadgroup]])                                  \
@@ -3003,15 +3008,19 @@ kernel void rsl_mlx_flash_attn_decode_##SUFFIX##_kernel(                        
     const int q_base = (int)head * head_dim;                                      \
     const float scale = 1.0f / sqrt((float)head_dim);                             \
     const int bpr = (BPR);                                                        \
+    /* SWA lower bound: attend only [t_start, kv_len) (window==0/>=kv_len => 0). */ \
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;  \
     for (int i = (int)lane; i < head_dim; i += (int)lane_count) tg_acc[i] = 0.0f; \
     threadgroup_barrier(mem_flags::mem_threadgroup);                              \
     float m = -INFINITY, l = 0.0f;                                                \
-    for (int t = 0; t < kv_len; ++t) {                                            \
+    for (int t = t_start; t < kv_len; ++t) {                                      \
         device const uchar *kp = k_packed + (ulong)(kv_h * max_ctx + t) * bpr;    \
         float partial = 0.0f;                                                     \
         for (int i = (int)lane; i < head_dim; i += (int)lane_count)               \
             partial += q[q_base + i] * DEQ(kp, i);                                \
-        const float s_dot = simd_sum(partial) * scale;                           \
+        float s_dot = simd_sum(partial) * scale;                                  \
+        /* Gemma2 attention-logit soft-cap (no-op at softcap==0). */              \
+        if (softcap > 0.0f) s_dot = softcap * tanh(s_dot / softcap);              \
         const float m_new = fmax(m, s_dot);                                       \
         const float rescale = isfinite(m) ? exp(m - m_new) : 0.0f;                \
         const float p = exp(s_dot - m_new);                                       \
@@ -3021,7 +3030,7 @@ kernel void rsl_mlx_flash_attn_decode_##SUFFIX##_kernel(                        
             tg_acc[i] = tg_acc[i] * rescale + p * DEQ(vp, i);                     \
         m = m_new;                                                                \
     }                                                                             \
-    const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;                            \
+    const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;                             \
     for (int i = (int)lane; i < head_dim; i += (int)lane_count)                   \
         out[q_base + i] = tg_acc[i] * inv_l;                                      \
 }                                                                                 \
@@ -3033,6 +3042,7 @@ kernel void rsl_mlx_flash_attn_prefill_##SUFFIX##_kernel(                       
     constant int &n_heads [[buffer(4)]], constant int &n_kv_heads [[buffer(5)]],  \
     constant int &head_dim [[buffer(6)]], constant int &max_ctx [[buffer(7)]],    \
     constant int &kv_len_base [[buffer(8)]], constant int &n_new [[buffer(9)]],   \
+    constant int &window [[buffer(10)]], constant float &softcap [[buffer(11)]],  \
     uint2 tgpos [[threadgroup_position_in_grid]],                                 \
     uint lane [[thread_position_in_threadgroup]],                                 \
     uint lane_count [[threads_per_threadgroup]])                                  \
@@ -3045,17 +3055,22 @@ kernel void rsl_mlx_flash_attn_prefill_##SUFFIX##_kernel(                       
     const int kv_h = hh / n_gqa;                                                  \
     const int q_off = (q_pos * n_heads + hh) * head_dim;                          \
     const int kv_len_for_q = kv_len_base + q_pos + 1;                             \
+    /* SWA lower bound: P = kv_len_base + q_pos; attend [t_start, P]. */          \
+    const int p_abs = kv_len_base + q_pos;                                        \
+    const int t_start = (window > 0 && p_abs - window + 1 > 0) ? (p_abs - window + 1) : 0; \
     const float scale = 1.0f / sqrt((float)head_dim);                             \
     const int bpr = (BPR);                                                        \
     for (int i = (int)lane; i < head_dim; i += (int)lane_count) tg_acc[i] = 0.0f; \
     threadgroup_barrier(mem_flags::mem_threadgroup);                              \
     float m = -INFINITY, l = 0.0f;                                                \
-    for (int t = 0; t < kv_len_for_q; ++t) {                                      \
+    for (int t = t_start; t < kv_len_for_q; ++t) {                                \
         device const uchar *kp = k_packed + (ulong)(kv_h * max_ctx + t) * bpr;    \
         float partial = 0.0f;                                                     \
         for (int i = (int)lane; i < head_dim; i += (int)lane_count)               \
             partial += q[q_off + i] * DEQ(kp, i);                                 \
-        const float s_dot = simd_sum(partial) * scale;                           \
+        float s_dot = simd_sum(partial) * scale;                                  \
+        /* Gemma2 attention-logit soft-cap (no-op at softcap==0). */              \
+        if (softcap > 0.0f) s_dot = softcap * tanh(s_dot / softcap);              \
         const float m_new = fmax(m, s_dot);                                       \
         const float rescale = isfinite(m) ? exp(m - m_new) : 0.0f;                \
         const float p = exp(s_dot - m_new);                                       \
@@ -3065,7 +3080,7 @@ kernel void rsl_mlx_flash_attn_prefill_##SUFFIX##_kernel(                       
             tg_acc[i] = tg_acc[i] * rescale + p * DEQ(vp, i);                     \
         m = m_new;                                                                \
     }                                                                             \
-    const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;                            \
+    const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;                             \
     for (int i = (int)lane; i < head_dim; i += (int)lane_count)                   \
         out[q_off + i] = tg_acc[i] * inv_l;                                       \
 }
@@ -3089,6 +3104,7 @@ kernel void rsl_mlx_flash_attn_decode_q8_0_kernel(
     constant int &n_heads [[buffer(6)]], constant int &n_kv_heads [[buffer(7)]],
     constant int &head_dim [[buffer(8)]], constant int &max_ctx [[buffer(9)]],
     constant int &kv_len [[buffer(10)]],
+    constant int &window [[buffer(11)]], constant float &softcap [[buffer(12)]],
     uint head [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]],
     uint lane_count [[threads_per_threadgroup]])
@@ -3099,16 +3115,20 @@ kernel void rsl_mlx_flash_attn_decode_q8_0_kernel(
     const int kv_h = (int)head / n_gqa;
     const int q_base = (int)head * head_dim;
     const float scale = 1.0f / sqrt((float)head_dim);
+    // SWA lower bound: attend only [t_start, kv_len) (window==0/>=kv_len => 0).
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
     for (int i = (int)lane; i < head_dim; i += (int)lane_count) tg_acc[i] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float m = -INFINITY, l = 0.0f;
-    for (int t = 0; t < kv_len; ++t) {
+    for (int t = t_start; t < kv_len; ++t) {
         const int ridx = kv_h * max_ctx + t;
         device const char *kp = k_slab + (ulong)ridx * head_dim;
         float partial = 0.0f;
         for (int i = (int)lane; i < head_dim; i += (int)lane_count)
             partial += q[q_base + i] * (float)((int)kp[i]);
-        const float s_dot = simd_sum(partial) * (k_scales[ridx] * scale);
+        float s_dot = simd_sum(partial) * (k_scales[ridx] * scale);
+        // Gemma2 attention-logit soft-cap (no-op at softcap==0); after the per-row k_scale.
+        if (softcap > 0.0f) s_dot = softcap * tanh(s_dot / softcap);
         const float m_new = fmax(m, s_dot);
         const float rescale = isfinite(m) ? exp(m - m_new) : 0.0f;
         const float p = exp(s_dot - m_new);
@@ -3133,6 +3153,7 @@ kernel void rsl_mlx_flash_attn_prefill_q8_0_kernel(
     constant int &n_heads [[buffer(6)]], constant int &n_kv_heads [[buffer(7)]],
     constant int &head_dim [[buffer(8)]], constant int &max_ctx [[buffer(9)]],
     constant int &kv_len_base [[buffer(10)]], constant int &n_new [[buffer(11)]],
+    constant int &window [[buffer(12)]], constant float &softcap [[buffer(13)]],
     uint2 tgpos [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]],
     uint lane_count [[threads_per_threadgroup]])
@@ -3145,17 +3166,22 @@ kernel void rsl_mlx_flash_attn_prefill_q8_0_kernel(
     const int kv_h = hh / n_gqa;
     const int q_off = (q_pos * n_heads + hh) * head_dim;
     const int kv_len_for_q = kv_len_base + q_pos + 1;
+    // SWA lower bound: P = kv_len_base + q_pos; attend [t_start, P].
+    const int p_abs = kv_len_base + q_pos;
+    const int t_start = (window > 0 && p_abs - window + 1 > 0) ? (p_abs - window + 1) : 0;
     const float scale = 1.0f / sqrt((float)head_dim);
     for (int i = (int)lane; i < head_dim; i += (int)lane_count) tg_acc[i] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float m = -INFINITY, l = 0.0f;
-    for (int t = 0; t < kv_len_for_q; ++t) {
+    for (int t = t_start; t < kv_len_for_q; ++t) {
         const int ridx = kv_h * max_ctx + t;
         device const char *kp = k_slab + (ulong)ridx * head_dim;
         float partial = 0.0f;
         for (int i = (int)lane; i < head_dim; i += (int)lane_count)
             partial += q[q_off + i] * (float)((int)kp[i]);
-        const float s_dot = simd_sum(partial) * (k_scales[ridx] * scale);
+        float s_dot = simd_sum(partial) * (k_scales[ridx] * scale);
+        // Gemma2 attention-logit soft-cap (no-op at softcap==0); after the per-row k_scale.
+        if (softcap > 0.0f) s_dot = softcap * tanh(s_dot / softcap);
         const float m_new = fmax(m, s_dot);
         const float rescale = isfinite(m) ? exp(m - m_new) : 0.0f;
         const float p = exp(s_dot - m_new);
@@ -3226,6 +3252,7 @@ kernel void rsl_mlx_flash_attn_decode_tq_kernel(
     constant int &n_heads [[buffer(7)]], constant int &n_kv_heads [[buffer(8)]],
     constant int &head_dim [[buffer(9)]], constant int &max_ctx [[buffer(10)]],
     constant int &kv_len [[buffer(11)]],
+    constant int &window [[buffer(12)]], constant float &softcap [[buffer(13)]],
     uint head [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]],
     uint lane_count [[threads_per_threadgroup]])
@@ -3238,16 +3265,20 @@ kernel void rsl_mlx_flash_attn_decode_tq_kernel(
     const int q_base = (int)head * head_dim;
     const float scale = 1.0f / sqrt((float)head_dim);
     const int bpr = (head_dim * bits + 7) / 8;
+    // SWA lower bound: attend only [t_start, kv_len) (window==0/>=kv_len => 0).
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
     for (int i = (int)lane; i < head_dim; i += (int)lane_count) tg_acc[i] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float m = -INFINITY, l = 0.0f;
-    for (int t = 0; t < kv_len; ++t) {
+    for (int t = t_start; t < kv_len; ++t) {
         const int ridx = kv_h * max_ctx + t;
         rsl_tq_fill_row(tg_row, k_packed + (ulong)ridx * bpr, k_scales[ridx], bits, head_dim, lane, lane_count);
         float partial = 0.0f;
         for (int i = (int)lane; i < head_dim; i += (int)lane_count)
             partial += q[q_base + i] * tg_row[i];
-        const float s_dot = simd_sum(partial) * scale;
+        float s_dot = simd_sum(partial) * scale;
+        // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+        if (softcap > 0.0f) s_dot = softcap * tanh(s_dot / softcap);
         const float m_new = fmax(m, s_dot);
         const float rescale = isfinite(m) ? exp(m - m_new) : 0.0f;
         const float p = exp(s_dot - m_new);
@@ -3272,6 +3303,7 @@ kernel void rsl_mlx_flash_attn_prefill_tq_kernel(
     constant int &n_heads [[buffer(7)]], constant int &n_kv_heads [[buffer(8)]],
     constant int &head_dim [[buffer(9)]], constant int &max_ctx [[buffer(10)]],
     constant int &kv_len_base [[buffer(11)]], constant int &n_new [[buffer(12)]],
+    constant int &window [[buffer(13)]], constant float &softcap [[buffer(14)]],
     uint2 tgpos [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]],
     uint lane_count [[threads_per_threadgroup]])
@@ -3285,18 +3317,23 @@ kernel void rsl_mlx_flash_attn_prefill_tq_kernel(
     const int kv_h = hh / n_gqa;
     const int q_off = (q_pos * n_heads + hh) * head_dim;
     const int kv_len_for_q = kv_len_base + q_pos + 1;
+    // SWA lower bound: P = kv_len_base + q_pos; attend [t_start, P].
+    const int p_abs = kv_len_base + q_pos;
+    const int t_start = (window > 0 && p_abs - window + 1 > 0) ? (p_abs - window + 1) : 0;
     const float scale = 1.0f / sqrt((float)head_dim);
     const int bpr = (head_dim * bits + 7) / 8;
     for (int i = (int)lane; i < head_dim; i += (int)lane_count) tg_acc[i] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float m = -INFINITY, l = 0.0f;
-    for (int t = 0; t < kv_len_for_q; ++t) {
+    for (int t = t_start; t < kv_len_for_q; ++t) {
         const int ridx = kv_h * max_ctx + t;
         rsl_tq_fill_row(tg_row, k_packed + (ulong)ridx * bpr, k_scales[ridx], bits, head_dim, lane, lane_count);
         float partial = 0.0f;
         for (int i = (int)lane; i < head_dim; i += (int)lane_count)
             partial += q[q_off + i] * tg_row[i];
-        const float s_dot = simd_sum(partial) * scale;
+        float s_dot = simd_sum(partial) * scale;
+        // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+        if (softcap > 0.0f) s_dot = softcap * tanh(s_dot / softcap);
         const float m_new = fmax(m, s_dot);
         const float rescale = isfinite(m) ? exp(m - m_new) : 0.0f;
         const float p = exp(s_dot - m_new);

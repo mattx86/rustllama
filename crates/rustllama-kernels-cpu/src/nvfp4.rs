@@ -516,6 +516,34 @@ pub fn gqa_attention_flash_decode_nvfp4(
     max_ctx: usize,
     kv_len: usize,
 ) {
+    // Thin wrapper: full-causal, no soft-cap. BIT-IDENTICAL to the pre-window
+    // kernel (`_capped_windowed` routes `start == 0 && softcap == 0.0` through
+    // the same SIMD online-softmax helper).
+    gqa_attention_flash_decode_nvfp4_capped_windowed(
+        q, k_packed, v_packed, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0,
+    );
+}
+
+/// Sliding-window + Gemma2 soft-cap variant of [`gqa_attention_flash_decode_nvfp4`].
+/// `window == 0` attends `[0, kv_len)`; otherwise the DECODE window
+/// `[kv_len-window, kv_len)`. `softcap > 0.0` applies `s = c*tanh(s/c)` after the
+/// `1/sqrt(head_dim)` scale and before the online-softmax max/exp (Gemma2).
+/// `window == 0 && softcap == 0.0` dispatches the same SIMD helper as the base
+/// kernel — BIT-IDENTICAL for every non-SWA quant model.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_flash_decode_nvfp4_capped_windowed(
+    q: &[f32],
+    k_packed: &[u8],
+    v_packed: &[u8],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len: usize,
+    window: usize,
+    softcap: f32,
+) {
     assert_eq!(head_dim % NVFP4_BLOCK_ELEMS, 0, "head_dim must be a multiple of 16");
     let blocks_per_row = head_dim / NVFP4_BLOCK_ELEMS;
     let bytes_per_row = blocks_per_row * NVFP4_BLOCK_BYTES;
@@ -534,6 +562,8 @@ pub fn gqa_attention_flash_decode_nvfp4(
 
     let n_gqa = n_heads / n_kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
+    // Decode window lower bound (0 ⇒ full attention).
+    let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
 
     // Per-kv-head dequant scratch — sized `kv_len × head_dim`
     // instead of the full `max_ctx × head_dim`. Re-used across the
@@ -569,8 +599,8 @@ pub fn gqa_attention_flash_decode_nvfp4(
             let h = kv_h * n_gqa + qh_off;
             let q_h = &q[h * head_dim..(h + 1) * head_dim];
             let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
-            crate::turboquant::online_softmax_attn_f32_scratch(
-                q_h, &k_h_scratch, &v_h_scratch, out_h, head_dim, kv_len, scale,
+            crate::turboquant::online_softmax_attn_f32_scratch_capped_windowed(
+                q_h, &k_h_scratch, &v_h_scratch, out_h, head_dim, kv_len, scale, start, softcap,
             );
         }
     }
@@ -599,6 +629,36 @@ pub fn gqa_attention_flash_prefill_nvfp4(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+) {
+    // Thin wrapper: full-causal, no soft-cap. BIT-IDENTICAL to the pre-window
+    // kernel.
+    gqa_attention_flash_prefill_nvfp4_capped_windowed(
+        q, k_packed, v_packed, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, 0,
+        0.0,
+    );
+}
+
+/// Sliding-window + Gemma2 soft-cap variant of [`gqa_attention_flash_prefill_nvfp4`].
+/// Query `i` (abs pos `kv_len_base + i`) attends `[start_i, kv_len_i)` where
+/// `kv_len_i = kv_len_base + i + 1` and `start_i = kv_len_i.saturating_sub(window)`
+/// (window 0 ⇒ `start_i = 0`). `softcap > 0.0` applies `s = c*tanh(s/c)` after the
+/// scale and before the online-softmax max/exp. `window == 0 && softcap == 0.0`
+/// dispatches the same SIMD helper as the base kernel — BIT-IDENTICAL for non-SWA
+/// models.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_flash_prefill_nvfp4_capped_windowed(
+    q: &[f32],
+    k_packed: &[u8],
+    v_packed: &[u8],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+    window: usize,
+    softcap: f32,
 ) {
     assert_eq!(head_dim % NVFP4_BLOCK_ELEMS, 0, "head_dim must be a multiple of 16");
     let blocks_per_row = head_dim / NVFP4_BLOCK_ELEMS;
@@ -648,11 +708,12 @@ pub fn gqa_attention_flash_prefill_nvfp4(
             let h = kv_h * n_gqa + qh_off;
             for i in 0..n_new {
                 let kv_len_i = kv_len_base + i + 1;
+                let start_i = if window > 0 { kv_len_i.saturating_sub(window) } else { 0 };
                 let q_off = (i * n_heads + h) * head_dim;
                 let q_h = &q[q_off..q_off + head_dim];
                 let out_off = (i * n_heads + h) * head_dim;
                 let out_h = &mut out[out_off..out_off + head_dim];
-                crate::turboquant::online_softmax_attn_f32_scratch(
+                crate::turboquant::online_softmax_attn_f32_scratch_capped_windowed(
                     q_h,
                     &k_h_scratch[..kv_len_i * head_dim],
                     &v_h_scratch[..kv_len_i * head_dim],
@@ -660,6 +721,8 @@ pub fn gqa_attention_flash_prefill_nvfp4(
                     head_dim,
                     kv_len_i,
                     scale,
+                    start_i,
+                    softcap,
                 );
             }
         }
@@ -1023,6 +1086,171 @@ mod tests {
                 avg_err < max_abs * 0.25,
                 "row {r} avg error {avg_err} too large vs max_abs {max_abs}",
             );
+        }
+    }
+
+    // ---- Sliding-window + Gemma2 soft-cap (`_capped_windowed`) tests ----
+
+    /// Build a deterministic quantized NVFP4 KV cache for the fixture.
+    fn synth_nvfp4_cache(
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx: usize,
+        positions: usize,
+        seed: usize,
+    ) -> Vec<u8> {
+        let blocks_per_row = head_dim / NVFP4_BLOCK_ELEMS;
+        let bytes_per_row = blocks_per_row * NVFP4_BLOCK_BYTES;
+        let mut packed = vec![0u8; n_kv_heads * max_ctx * bytes_per_row];
+        for kv_h in 0..n_kv_heads {
+            for t in 0..positions {
+                let p_off = (kv_h * max_ctx + t) * bytes_per_row;
+                let row: Vec<f32> = (0..head_dim)
+                    .map(|d| ((kv_h * 7 + t * 3 + d + seed) % 13) as f32 * 0.1 - 0.6)
+                    .collect();
+                for b in 0..blocks_per_row {
+                    let elem_off = b * NVFP4_BLOCK_ELEMS;
+                    let blk_dst = p_off + b * NVFP4_BLOCK_BYTES;
+                    quantize_block(
+                        &row[elem_off..elem_off + NVFP4_BLOCK_ELEMS],
+                        &mut packed[blk_dst..blk_dst + NVFP4_BLOCK_BYTES],
+                    );
+                }
+            }
+        }
+        packed
+    }
+
+    /// Naive windowed + soft-capped decode-step reference over DEQUANTIZED
+    /// NVFP4 K/V.
+    #[allow(clippy::too_many_arguments)]
+    fn naive_nvfp4_decode_ref(
+        q: &[f32],
+        k_packed: &[u8],
+        v_packed: &[u8],
+        out: &mut [f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx: usize,
+        kv_len: usize,
+        window: usize,
+        softcap: f32,
+    ) {
+        let blocks_per_row = head_dim / NVFP4_BLOCK_ELEMS;
+        let bytes_per_row = blocks_per_row * NVFP4_BLOCK_BYTES;
+        let n_gqa = n_heads / n_kv_heads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+        let mut kf = vec![0f32; n_kv_heads * kv_len * head_dim];
+        let mut vf = vec![0f32; n_kv_heads * kv_len * head_dim];
+        for kv_h in 0..n_kv_heads {
+            for t in 0..kv_len {
+                let p_off = (kv_h * max_ctx + t) * bytes_per_row;
+                let o = (kv_h * kv_len + t) * head_dim;
+                for b in 0..blocks_per_row {
+                    let src = p_off + b * NVFP4_BLOCK_BYTES;
+                    let dk = o + b * NVFP4_BLOCK_ELEMS;
+                    dequantize_block(&k_packed[src..src + NVFP4_BLOCK_BYTES], &mut kf[dk..dk + NVFP4_BLOCK_ELEMS]);
+                    dequantize_block(&v_packed[src..src + NVFP4_BLOCK_BYTES], &mut vf[dk..dk + NVFP4_BLOCK_ELEMS]);
+                }
+            }
+        }
+        for h in 0..n_heads {
+            let kv_h = h / n_gqa;
+            let q_h = &q[h * head_dim..(h + 1) * head_dim];
+            let mut scores = Vec::new();
+            for t in start..kv_len {
+                let o = (kv_h * kv_len + t) * head_dim;
+                let mut acc = 0f32;
+                for d in 0..head_dim {
+                    acc += q_h[d] * kf[o + d];
+                }
+                let mut s = acc * scale;
+                if softcap > 0.0 {
+                    s = softcap * (s / softcap).tanh();
+                }
+                scores.push(s);
+            }
+            let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut denom = 0f32;
+            for s in scores.iter_mut() {
+                *s = (*s - m).exp();
+                denom += *s;
+            }
+            let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
+            for v in out_h.iter_mut() {
+                *v = 0.0;
+            }
+            for (i, t) in (start..kv_len).enumerate() {
+                let w = if denom > 0.0 { scores[i] / denom } else { 0.0 };
+                let o = (kv_h * kv_len + t) * head_dim;
+                for d in 0..head_dim {
+                    out_h[d] += w * vf[o + d];
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nvfp4_capped_windowed_passthrough_bit_identical() {
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 16;
+        let max_ctx = 64;
+        let kv_len = 20;
+        let kp = synth_nvfp4_cache(n_kv_heads, head_dim, max_ctx, kv_len, 1);
+        let vp = synth_nvfp4_cache(n_kv_heads, head_dim, max_ctx, kv_len, 2);
+        let q: Vec<f32> = (0..n_heads * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.12).collect();
+
+        // Decode passthrough.
+        let mut base = vec![0f32; n_heads * head_dim];
+        let mut cw = vec![0f32; n_heads * head_dim];
+        gqa_attention_flash_decode_nvfp4(&q, &kp, &vp, &mut base, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
+        gqa_attention_flash_decode_nvfp4_capped_windowed(&q, &kp, &vp, &mut cw, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0);
+        assert_eq!(base, cw, "nvfp4 flash-decode passthrough not bit-identical");
+
+        // Prefill passthrough.
+        let kv_len_base = 8;
+        let n_new = 6;
+        let total = kv_len_base + n_new;
+        let kp2 = synth_nvfp4_cache(n_kv_heads, head_dim, max_ctx, total, 3);
+        let vp2 = synth_nvfp4_cache(n_kv_heads, head_dim, max_ctx, total, 4);
+        let qp: Vec<f32> = (0..n_new * n_heads * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.12).collect();
+        let mut base_pf = vec![0f32; n_new * n_heads * head_dim];
+        let mut cw_pf = vec![0f32; n_new * n_heads * head_dim];
+        gqa_attention_flash_prefill_nvfp4(&qp, &kp2, &vp2, &mut base_pf, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new);
+        gqa_attention_flash_prefill_nvfp4_capped_windowed(&qp, &kp2, &vp2, &mut cw_pf, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, 0, 0.0);
+        assert_eq!(base_pf, cw_pf, "nvfp4 flash-prefill passthrough not bit-identical");
+    }
+
+    #[test]
+    fn nvfp4_windowed_and_softcap_match_naive() {
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 16;
+        let max_ctx = 64;
+        let kv_len = 5;
+        let kp = synth_nvfp4_cache(n_kv_heads, head_dim, max_ctx, kv_len, 1);
+        let vp = synth_nvfp4_cache(n_kv_heads, head_dim, max_ctx, kv_len, 2);
+        let q: Vec<f32> = (0..n_heads * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.12).collect();
+
+        // (b) windowed: window=2, kv_len=5.
+        let mut naive = vec![0f32; n_heads * head_dim];
+        naive_nvfp4_decode_ref(&q, &kp, &vp, &mut naive, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 2, 0.0);
+        let mut got = vec![0f32; n_heads * head_dim];
+        gqa_attention_flash_decode_nvfp4_capped_windowed(&q, &kp, &vp, &mut got, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 2, 0.0);
+        for (g, n) in got.iter().zip(naive.iter()) {
+            assert!((g - n).abs() < 1e-5, "nvfp4 windowed {g} vs naive {n}");
+        }
+
+        // (c) soft-cap: softcap=50.0, full window.
+        let mut naive_sc = vec![0f32; n_heads * head_dim];
+        naive_nvfp4_decode_ref(&q, &kp, &vp, &mut naive_sc, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 50.0);
+        let mut got_sc = vec![0f32; n_heads * head_dim];
+        gqa_attention_flash_decode_nvfp4_capped_windowed(&q, &kp, &vp, &mut got_sc, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 50.0);
+        for (g, n) in got_sc.iter().zip(naive_sc.iter()) {
+            assert!((g - n).abs() < 1e-5, "nvfp4 softcap {g} vs naive {n}");
         }
     }
 }

@@ -296,9 +296,11 @@ impl PagedBatchEngine {
         //     now served correctly here. This engine's KV store is F32-ONLY
         //     (`PagedKvStore`, no quant-KV paged path), and the F32 windowed/capped
         //     kernels carry window/softcap, so there is no non-F32 paged path left
-        //     to fence off — the old refusal is gone. (If a quant-KV paged store
-        //     is ever added, re-gate on `(sliding_window||softcap) && dtype!=F32`
-        //     until F1 teaches the quant-KV flash kernels window/softcap.)
+        //     to fence off — the old refusal is gone. (F1 has since taught the
+        //     CONTIGUOUS quant-KV flash kernels window/softcap, but this paged
+        //     engine still has no quant-KV store; if one is ever added, re-gate on
+        //     `(sliding_window||softcap) && dtype!=F32` until the PAGED quant-KV
+        //     forwards also carry the window/softcap uniforms.)
         //
         // MoE is NOT refused here. The old refusal fenced off the budget-0 INLINE
         // prefill (`forward_prefill_paged_f32`), which loops only `weights.blocks`

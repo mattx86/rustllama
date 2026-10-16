@@ -384,8 +384,10 @@ mod imp {
             n_kv_heads: c_int,
             head_dim: c_int,
             max_ctx: c_int,
-            kv_len: c_int,
-        );
+            kv_len: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            window: c_int,
+            softcap: f32,
+        ) -> c_int;
         pub(super) fn rsl_flash_attn_prefill_q4_0_usm(
             s: *mut rsl_stream,
             q_usm: *const f32,
@@ -397,8 +399,10 @@ mod imp {
             head_dim: c_int,
             max_ctx: c_int,
             kv_len_base: c_int,
-            n_new: c_int,
-        );
+            n_new: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            window: c_int,
+            softcap: f32,
+        ) -> c_int;
         pub(super) fn rsl_flash_attn_decode_nvfp4_usm(
             s: *mut rsl_stream,
             q_usm: *const f32,
@@ -409,8 +413,10 @@ mod imp {
             n_kv_heads: c_int,
             head_dim: c_int,
             max_ctx: c_int,
-            kv_len: c_int,
-        );
+            kv_len: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            window: c_int,
+            softcap: f32,
+        ) -> c_int;
         pub(super) fn rsl_flash_attn_prefill_nvfp4_usm(
             s: *mut rsl_stream,
             q_usm: *const f32,
@@ -422,8 +428,10 @@ mod imp {
             head_dim: c_int,
             max_ctx: c_int,
             kv_len_base: c_int,
-            n_new: c_int,
-        );
+            n_new: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            window: c_int,
+            softcap: f32,
+        ) -> c_int;
         // OCP Microscaling (MX) KV FlashAttention: MXFP4/6/8. Same
         // signatures as the NVFP4 pair above (block layout differs on the
         // C++ side only: 32-elem blocks, bytes_per_row = (head_dim/32)*
@@ -438,8 +446,10 @@ mod imp {
             n_kv_heads: c_int,
             head_dim: c_int,
             max_ctx: c_int,
-            kv_len: c_int,
-        );
+            kv_len: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            window: c_int,
+            softcap: f32,
+        ) -> c_int;
         pub(super) fn rsl_flash_attn_prefill_mxfp4_usm(
             s: *mut rsl_stream,
             q_usm: *const f32,
@@ -451,8 +461,10 @@ mod imp {
             head_dim: c_int,
             max_ctx: c_int,
             kv_len_base: c_int,
-            n_new: c_int,
-        );
+            n_new: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            window: c_int,
+            softcap: f32,
+        ) -> c_int;
         pub(super) fn rsl_flash_attn_decode_mxfp6_usm(
             s: *mut rsl_stream,
             q_usm: *const f32,
@@ -463,8 +475,10 @@ mod imp {
             n_kv_heads: c_int,
             head_dim: c_int,
             max_ctx: c_int,
-            kv_len: c_int,
-        );
+            kv_len: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            window: c_int,
+            softcap: f32,
+        ) -> c_int;
         pub(super) fn rsl_flash_attn_prefill_mxfp6_usm(
             s: *mut rsl_stream,
             q_usm: *const f32,
@@ -476,8 +490,10 @@ mod imp {
             head_dim: c_int,
             max_ctx: c_int,
             kv_len_base: c_int,
-            n_new: c_int,
-        );
+            n_new: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            window: c_int,
+            softcap: f32,
+        ) -> c_int;
         pub(super) fn rsl_flash_attn_decode_mxfp8_usm(
             s: *mut rsl_stream,
             q_usm: *const f32,
@@ -488,8 +504,10 @@ mod imp {
             n_kv_heads: c_int,
             head_dim: c_int,
             max_ctx: c_int,
-            kv_len: c_int,
-        );
+            kv_len: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            window: c_int,
+            softcap: f32,
+        ) -> c_int;
         pub(super) fn rsl_flash_attn_prefill_mxfp8_usm(
             s: *mut rsl_stream,
             q_usm: *const f32,
@@ -501,8 +519,10 @@ mod imp {
             head_dim: c_int,
             max_ctx: c_int,
             kv_len_base: c_int,
-            n_new: c_int,
-        );
+            n_new: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            window: c_int,
+            softcap: f32,
+        ) -> c_int;
         pub(super) fn rsl_flash_attn_decode_tq_usm(
             s: *mut rsl_stream,
             q_usm: *const f32,
@@ -516,8 +536,10 @@ mod imp {
             n_kv_heads: c_int,
             head_dim: c_int,
             max_ctx: c_int,
-            kv_len: c_int,
-        );
+            kv_len: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            window: c_int,
+            softcap: f32,
+        ) -> c_int;
         pub(super) fn rsl_flash_attn_prefill_tq_usm(
             s: *mut rsl_stream,
             q_usm: *const f32,
@@ -532,8 +554,10 @@ mod imp {
             head_dim: c_int,
             max_ctx: c_int,
             kv_len_base: c_int,
-            n_new: c_int,
-        );
+            n_new: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            window: c_int,
+            softcap: f32,
+        ) -> c_int;
         // Q8_0-KV flash: i8 K/V slab + per-row f32 scale (like TQ, no bits).
         pub(super) fn rsl_flash_attn_decode_q8_0_usm(
             s: *mut rsl_stream,
@@ -547,8 +571,10 @@ mod imp {
             n_kv_heads: c_int,
             head_dim: c_int,
             max_ctx: c_int,
-            kv_len: c_int,
-        );
+            kv_len: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            window: c_int,
+            softcap: f32,
+        ) -> c_int;
         pub(super) fn rsl_flash_attn_prefill_q8_0_usm(
             s: *mut rsl_stream,
             q_usm: *const f32,
@@ -562,8 +588,10 @@ mod imp {
             head_dim: c_int,
             max_ctx: c_int,
             kv_len_base: c_int,
-            n_new: c_int,
-        );
+            n_new: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            window: c_int,
+            softcap: f32,
+        ) -> c_int;
 
         pub(super) fn rsl_gemm_f16_usm(
             s: *mut rsl_stream,
@@ -2390,6 +2418,10 @@ mod imp {
         head_dim: u32,
         max_ctx: u32,
         kv_len: u32,
+        // Per-layer SWA window (0=full causal) + Gemma2 attention-logit
+        // soft-cap (0=off); byte-identical passthroughs at 0/0.
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2399,14 +2431,22 @@ mod imp {
         quant_flash_head_dim_ok("flash_attn_decode_q4_0_usm", head_dim)?;
         // SAFETY: USM pointer ownership / sizing is the caller's
         // responsibility. We just forward to the C ABI.
-        unsafe {
+        let rc = unsafe {
             rsl_flash_attn_decode_q4_0_usm(
                 stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
                 n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
                 max_ctx as c_int, kv_len as c_int,
-            );
+                window as c_int,
+                softcap,
+            )
+        };
+        consume_error()?;
+        if rc != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_decode_q4_0_usm: quant-KV flash declined shape (rc={rc})"
+            )));
         }
-        consume_error()
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2422,6 +2462,10 @@ mod imp {
         max_ctx: u32,
         kv_len_base: u32,
         n_new: u32,
+        // Per-layer SWA window (0=full causal) + Gemma2 attention-logit
+        // soft-cap (0=off); byte-identical passthroughs at 0/0.
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2435,14 +2479,22 @@ mod imp {
             )));
         }
         // SAFETY: as above.
-        unsafe {
+        let rc = unsafe {
             rsl_flash_attn_prefill_q4_0_usm(
                 stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
                 n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
                 max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
-            );
+                window as c_int,
+                softcap,
+            )
+        };
+        consume_error()?;
+        if rc != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_q4_0_usm: quant-KV flash declined shape (rc={rc})"
+            )));
         }
-        consume_error()
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2457,6 +2509,10 @@ mod imp {
         head_dim: u32,
         max_ctx: u32,
         kv_len: u32,
+        // Per-layer SWA window (0=full causal) + Gemma2 attention-logit
+        // soft-cap (0=off); byte-identical passthroughs at 0/0.
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2465,14 +2521,22 @@ mod imp {
         }
         quant_flash_head_dim_ok("flash_attn_decode_nvfp4_usm", head_dim)?;
         // SAFETY: as above.
-        unsafe {
+        let rc = unsafe {
             rsl_flash_attn_decode_nvfp4_usm(
                 stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
                 n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
                 max_ctx as c_int, kv_len as c_int,
-            );
+                window as c_int,
+                softcap,
+            )
+        };
+        consume_error()?;
+        if rc != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_decode_nvfp4_usm: quant-KV flash declined shape (rc={rc})"
+            )));
         }
-        consume_error()
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2488,6 +2552,10 @@ mod imp {
         max_ctx: u32,
         kv_len_base: u32,
         n_new: u32,
+        // Per-layer SWA window (0=full causal) + Gemma2 attention-logit
+        // soft-cap (0=off); byte-identical passthroughs at 0/0.
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2501,14 +2569,22 @@ mod imp {
             )));
         }
         // SAFETY: as above.
-        unsafe {
+        let rc = unsafe {
             rsl_flash_attn_prefill_nvfp4_usm(
                 stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
                 n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
                 max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
-            );
+                window as c_int,
+                softcap,
+            )
+        };
+        consume_error()?;
+        if rc != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_nvfp4_usm: quant-KV flash declined shape (rc={rc})"
+            )));
         }
-        consume_error()
+        Ok(())
     }
 
     // ---- OCP Microscaling (MX) KV FlashAttention: MXFP4 / MXFP6 / MXFP8 ----
@@ -2527,6 +2603,10 @@ mod imp {
         head_dim: u32,
         max_ctx: u32,
         kv_len: u32,
+        // Per-layer SWA window (0=full causal) + Gemma2 attention-logit
+        // soft-cap (0=off); byte-identical passthroughs at 0/0.
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2535,14 +2615,22 @@ mod imp {
         }
         quant_flash_head_dim_ok("flash_attn_decode_mxfp4_usm", head_dim)?;
         // SAFETY: as above.
-        unsafe {
+        let rc = unsafe {
             rsl_flash_attn_decode_mxfp4_usm(
                 stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
                 n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
                 max_ctx as c_int, kv_len as c_int,
-            );
+                window as c_int,
+                softcap,
+            )
+        };
+        consume_error()?;
+        if rc != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_decode_mxfp4_usm: quant-KV flash declined shape (rc={rc})"
+            )));
         }
-        consume_error()
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2558,6 +2646,10 @@ mod imp {
         max_ctx: u32,
         kv_len_base: u32,
         n_new: u32,
+        // Per-layer SWA window (0=full causal) + Gemma2 attention-logit
+        // soft-cap (0=off); byte-identical passthroughs at 0/0.
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2571,14 +2663,22 @@ mod imp {
             )));
         }
         // SAFETY: as above.
-        unsafe {
+        let rc = unsafe {
             rsl_flash_attn_prefill_mxfp4_usm(
                 stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
                 n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
                 max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
-            );
+                window as c_int,
+                softcap,
+            )
+        };
+        consume_error()?;
+        if rc != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_mxfp4_usm: quant-KV flash declined shape (rc={rc})"
+            )));
         }
-        consume_error()
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2593,6 +2693,10 @@ mod imp {
         head_dim: u32,
         max_ctx: u32,
         kv_len: u32,
+        // Per-layer SWA window (0=full causal) + Gemma2 attention-logit
+        // soft-cap (0=off); byte-identical passthroughs at 0/0.
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2601,14 +2705,22 @@ mod imp {
         }
         quant_flash_head_dim_ok("flash_attn_decode_mxfp6_usm", head_dim)?;
         // SAFETY: as above.
-        unsafe {
+        let rc = unsafe {
             rsl_flash_attn_decode_mxfp6_usm(
                 stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
                 n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
                 max_ctx as c_int, kv_len as c_int,
-            );
+                window as c_int,
+                softcap,
+            )
+        };
+        consume_error()?;
+        if rc != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_decode_mxfp6_usm: quant-KV flash declined shape (rc={rc})"
+            )));
         }
-        consume_error()
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2624,6 +2736,10 @@ mod imp {
         max_ctx: u32,
         kv_len_base: u32,
         n_new: u32,
+        // Per-layer SWA window (0=full causal) + Gemma2 attention-logit
+        // soft-cap (0=off); byte-identical passthroughs at 0/0.
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2637,14 +2753,22 @@ mod imp {
             )));
         }
         // SAFETY: as above.
-        unsafe {
+        let rc = unsafe {
             rsl_flash_attn_prefill_mxfp6_usm(
                 stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
                 n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
                 max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
-            );
+                window as c_int,
+                softcap,
+            )
+        };
+        consume_error()?;
+        if rc != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_mxfp6_usm: quant-KV flash declined shape (rc={rc})"
+            )));
         }
-        consume_error()
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2659,6 +2783,10 @@ mod imp {
         head_dim: u32,
         max_ctx: u32,
         kv_len: u32,
+        // Per-layer SWA window (0=full causal) + Gemma2 attention-logit
+        // soft-cap (0=off); byte-identical passthroughs at 0/0.
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2667,14 +2795,22 @@ mod imp {
         }
         quant_flash_head_dim_ok("flash_attn_decode_mxfp8_usm", head_dim)?;
         // SAFETY: as above.
-        unsafe {
+        let rc = unsafe {
             rsl_flash_attn_decode_mxfp8_usm(
                 stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
                 n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
                 max_ctx as c_int, kv_len as c_int,
-            );
+                window as c_int,
+                softcap,
+            )
+        };
+        consume_error()?;
+        if rc != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_decode_mxfp8_usm: quant-KV flash declined shape (rc={rc})"
+            )));
         }
-        consume_error()
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2690,6 +2826,10 @@ mod imp {
         max_ctx: u32,
         kv_len_base: u32,
         n_new: u32,
+        // Per-layer SWA window (0=full causal) + Gemma2 attention-logit
+        // soft-cap (0=off); byte-identical passthroughs at 0/0.
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2703,14 +2843,22 @@ mod imp {
             )));
         }
         // SAFETY: as above.
-        unsafe {
+        let rc = unsafe {
             rsl_flash_attn_prefill_mxfp8_usm(
                 stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
                 n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
                 max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
-            );
+                window as c_int,
+                softcap,
+            )
+        };
+        consume_error()?;
+        if rc != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_mxfp8_usm: quant-KV flash declined shape (rc={rc})"
+            )));
         }
-        consume_error()
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2728,6 +2876,10 @@ mod imp {
         head_dim: u32,
         max_ctx: u32,
         kv_len: u32,
+        // Per-layer SWA window (0=full causal) + Gemma2 attention-logit
+        // soft-cap (0=off); byte-identical passthroughs at 0/0.
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2736,15 +2888,23 @@ mod imp {
         }
         quant_flash_head_dim_ok("flash_attn_decode_tq_usm", head_dim)?;
         // SAFETY: as above.
-        unsafe {
+        let rc = unsafe {
             rsl_flash_attn_decode_tq_usm(
                 stream.raw, q_usm, k_packed_usm, v_packed_usm, k_scales_usm,
                 v_scales_usm, bits as c_int, out_usm, n_heads as c_int,
                 n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
                 kv_len as c_int,
-            );
+                window as c_int,
+                softcap,
+            )
+        };
+        consume_error()?;
+        if rc != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_decode_tq_usm: quant-KV flash declined shape (rc={rc})"
+            )));
         }
-        consume_error()
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2763,6 +2923,10 @@ mod imp {
         max_ctx: u32,
         kv_len_base: u32,
         n_new: u32,
+        // Per-layer SWA window (0=full causal) + Gemma2 attention-logit
+        // soft-cap (0=off); byte-identical passthroughs at 0/0.
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2776,15 +2940,23 @@ mod imp {
             )));
         }
         // SAFETY: as above.
-        unsafe {
+        let rc = unsafe {
             rsl_flash_attn_prefill_tq_usm(
                 stream.raw, q_usm, k_packed_usm, v_packed_usm, k_scales_usm,
                 v_scales_usm, bits as c_int, out_usm, n_heads as c_int,
                 n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
                 kv_len_base as c_int, n_new as c_int,
-            );
+                window as c_int,
+                softcap,
+            )
+        };
+        consume_error()?;
+        if rc != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_tq_usm: quant-KV flash declined shape (rc={rc})"
+            )));
         }
-        consume_error()
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2801,6 +2973,10 @@ mod imp {
         head_dim: u32,
         max_ctx: u32,
         kv_len: u32,
+        // Per-layer SWA window (0=full causal) + Gemma2 attention-logit
+        // soft-cap (0=off); byte-identical passthroughs at 0/0.
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2809,14 +2985,22 @@ mod imp {
         }
         quant_flash_head_dim_ok("flash_attn_decode_q8_0_usm", head_dim)?;
         // SAFETY: as above.
-        unsafe {
+        let rc = unsafe {
             rsl_flash_attn_decode_q8_0_usm(
                 stream.raw, q_usm, k_packed_usm, v_packed_usm, k_scales_usm,
                 v_scales_usm, out_usm, n_heads as c_int, n_kv_heads as c_int,
                 head_dim as c_int, max_ctx as c_int, kv_len as c_int,
-            );
+                window as c_int,
+                softcap,
+            )
+        };
+        consume_error()?;
+        if rc != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_decode_q8_0_usm: quant-KV flash declined shape (rc={rc})"
+            )));
         }
-        consume_error()
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2834,6 +3018,10 @@ mod imp {
         max_ctx: u32,
         kv_len_base: u32,
         n_new: u32,
+        // Per-layer SWA window (0=full causal) + Gemma2 attention-logit
+        // soft-cap (0=off); byte-identical passthroughs at 0/0.
+        window: u32,
+        softcap: f32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2847,15 +3035,23 @@ mod imp {
             )));
         }
         // SAFETY: as above.
-        unsafe {
+        let rc = unsafe {
             rsl_flash_attn_prefill_q8_0_usm(
                 stream.raw, q_usm, k_packed_usm, v_packed_usm, k_scales_usm,
                 v_scales_usm, out_usm, n_heads as c_int, n_kv_heads as c_int,
                 head_dim as c_int, max_ctx as c_int, kv_len_base as c_int,
                 n_new as c_int,
-            );
+                window as c_int,
+                softcap,
+            )
+        };
+        consume_error()?;
+        if rc != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_prefill_q8_0_usm: quant-KV flash declined shape (rc={rc})"
+            )));
         }
-        consume_error()
+        Ok(())
     }
 
     /// FA-v2 prefill entry point (sub-group cooperation). Same
@@ -8511,10 +8707,14 @@ pub unsafe fn flash_attn_decode_q4_0_usm_raw(
     head_dim: u32,
     max_ctx: u32,
     kv_len: u32,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_decode_q4_0_usm(
         stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        window, softcap,
     )
 }
 
@@ -8537,10 +8737,14 @@ pub unsafe fn flash_attn_prefill_q4_0_usm_raw(
     max_ctx: u32,
     kv_len_base: u32,
     n_new: u32,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_prefill_q4_0_usm(
         stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        window, softcap,
     )
 }
 
@@ -8561,10 +8765,14 @@ pub unsafe fn flash_attn_decode_nvfp4_usm_raw(
     head_dim: u32,
     max_ctx: u32,
     kv_len: u32,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_decode_nvfp4_usm(
         stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        window, softcap,
     )
 }
 
@@ -8586,10 +8794,14 @@ pub unsafe fn flash_attn_prefill_nvfp4_usm_raw(
     max_ctx: u32,
     kv_len_base: u32,
     n_new: u32,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_prefill_nvfp4_usm(
         stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        window, softcap,
     )
 }
 
@@ -8610,10 +8822,14 @@ pub unsafe fn flash_attn_decode_mxfp4_usm_raw(
     head_dim: u32,
     max_ctx: u32,
     kv_len: u32,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_decode_mxfp4_usm(
         stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        window, softcap,
     )
 }
 
@@ -8635,10 +8851,14 @@ pub unsafe fn flash_attn_prefill_mxfp4_usm_raw(
     max_ctx: u32,
     kv_len_base: u32,
     n_new: u32,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_prefill_mxfp4_usm(
         stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        window, softcap,
     )
 }
 
@@ -8659,10 +8879,14 @@ pub unsafe fn flash_attn_decode_mxfp6_usm_raw(
     head_dim: u32,
     max_ctx: u32,
     kv_len: u32,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_decode_mxfp6_usm(
         stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        window, softcap,
     )
 }
 
@@ -8684,10 +8908,14 @@ pub unsafe fn flash_attn_prefill_mxfp6_usm_raw(
     max_ctx: u32,
     kv_len_base: u32,
     n_new: u32,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_prefill_mxfp6_usm(
         stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        window, softcap,
     )
 }
 
@@ -8708,10 +8936,14 @@ pub unsafe fn flash_attn_decode_mxfp8_usm_raw(
     head_dim: u32,
     max_ctx: u32,
     kv_len: u32,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_decode_mxfp8_usm(
         stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        window, softcap,
     )
 }
 
@@ -8733,10 +8965,14 @@ pub unsafe fn flash_attn_prefill_mxfp8_usm_raw(
     max_ctx: u32,
     kv_len_base: u32,
     n_new: u32,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_prefill_mxfp8_usm(
         stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        window, softcap,
     )
 }
 
@@ -8762,10 +8998,14 @@ pub unsafe fn flash_attn_decode_tq_usm_raw(
     head_dim: u32,
     max_ctx: u32,
     kv_len: u32,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_decode_tq_usm(
         stream, q_usm, k_packed_usm, v_packed_usm, k_scales_usm, v_scales_usm,
         bits, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        window, softcap,
     )
 }
 
@@ -8790,10 +9030,14 @@ pub unsafe fn flash_attn_prefill_tq_usm_raw(
     max_ctx: u32,
     kv_len_base: u32,
     n_new: u32,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_prefill_tq_usm(
         stream, q_usm, k_packed_usm, v_packed_usm, k_scales_usm, v_scales_usm,
         bits, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        window, softcap,
     )
 }
 
@@ -8819,10 +9063,14 @@ pub unsafe fn flash_attn_decode_q8_0_usm_raw(
     head_dim: u32,
     max_ctx: u32,
     kv_len: u32,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_decode_q8_0_usm(
         stream, q_usm, k_packed_usm, v_packed_usm, k_scales_usm, v_scales_usm,
         out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        window, softcap,
     )
 }
 
@@ -8846,10 +9094,14 @@ pub unsafe fn flash_attn_prefill_q8_0_usm_raw(
     max_ctx: u32,
     kv_len_base: u32,
     n_new: u32,
+    // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: u32,
+    softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_prefill_q8_0_usm(
         stream, q_usm, k_packed_usm, v_packed_usm, k_scales_usm, v_scales_usm,
         out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+        window, softcap,
     )
 }
 

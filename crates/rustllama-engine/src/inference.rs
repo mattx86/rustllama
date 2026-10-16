@@ -1277,57 +1277,94 @@ impl CpuEngine {
         } else {
             kv_dtype
         };
-        // Sliding-window attention is implemented only for F32 KV: the windowed
-        // CPU kernels, the F32-contiguous GPU flash/decode-block path, and (D1b)
-        // the F32 PAGED forwards all thread the per-layer `window` uniform — but
-        // the QUANT-KV flash kernels still carry no window arg (lifted by F1). So
-        // an SWA model is KEPT coerced to F32 KV for masking correctness; it may
-        // then use either the contiguous or the paged F32 layout (D1b lifted the
-        // SWA layout→contiguous coercion below). Non-SWA models are untouched.
-        let kv_dtype = if model.cfg.sliding_window.is_some() && kv_dtype != KvDtype::F32 {
+        // F1: the CONTIGUOUS quant-KV flash kernels (CPU `*_capped_windowed` +
+        // the SYCL/CUDA/MLX quant flash) now carry the per-layer sliding-window
+        // span + Gemma2 attention-logit soft-cap, so an SWA / softcap model may
+        // KEEP these quant KV dtypes instead of being coerced to F32. f16/bf16
+        // stay fail-closed → F32 (their windowed path is not wired yet), as does
+        // any future dtype — matching "KEEP fail-closed for any dtype whose quant
+        // flash still lacks window/softcap". NOTE the PAGED quant-KV forwards
+        // (`PagedKvStoreOps`, `llama_arch.rs`) still IGNORE window/softcap, so the
+        // `kv_layout` coercion below pins an SWA/softcap + quant-KV model to the
+        // CONTIGUOUS layout (where the windowed/capped kernels live).
+        let quant_kv_windowed = matches!(
+            kv_dtype,
+            KvDtype::Q8_0
+                | KvDtype::Tq(_)
+                | KvDtype::Nvfp4
+                | KvDtype::Q4_0
+                | KvDtype::Mxfp4
+                | KvDtype::Mxfp6
+                | KvDtype::Mxfp8
+        );
+        // Sliding-window attention: F32 KV always windows (CPU + F32-contiguous
+        // GPU flash/decode-block + the F32 PAGED forwards, D1b). A quant KV dtype
+        // whose flash now carries the window uniform (F1, `quant_kv_windowed`) is
+        // ALSO honored verbatim on the contiguous path; every other non-F32 dtype
+        // is still coerced to F32 for masking correctness. Non-SWA untouched.
+        let kv_dtype = if model.cfg.sliding_window.is_some()
+            && kv_dtype != KvDtype::F32
+            && !quant_kv_windowed
+        {
             tracing::warn!(
                 requested = ?kv_dtype,
-                "sliding-window model: defaulting KV cache to f32 (the windowed \
-                 attention kernels — CPU and GPU — are f32-only)"
+                "sliding-window model: defaulting KV cache to f32 (this dtype's \
+                 windowed attention kernels are not available; F1 covers q4_0 / \
+                 q8_0 / nvfp4 / tq / mxfp4-6-8)"
             );
             KvDtype::F32
         } else {
             kv_dtype
         };
         // Gemma2 attention-logit soft-capping (`s = c·tanh(s/c)` on every
-        // attention score, before softmax) is implemented only for F32 KV: the
-        // capped CPU kernels, the F32-contiguous GPU flash/decode-block path, and
-        // (D1b) the F32 PAGED forwards all thread the per-layer `softcap` uniform
-        // — but the QUANT-KV flash kernels still carry no softcap arg (lifted by
-        // F1). So a capping model is KEPT coerced to F32 KV for numerical
-        // correctness (the output is WRONG without the cap); it may then use the
-        // contiguous or the paged F32 layout. Non-capping models are untouched.
-        let kv_dtype = if model.cfg.attn_logit_softcapping.is_some() && kv_dtype != KvDtype::F32 {
+        // attention score, before softmax): same rule as the sliding-window
+        // coercion just above — F32 and the F1 `quant_kv_windowed` quant dtypes
+        // carry the per-layer softcap on the contiguous path and are honored;
+        // other non-F32 dtypes are coerced to F32 (the output is WRONG without
+        // the cap). Non-capping models are untouched.
+        let kv_dtype = if model.cfg.attn_logit_softcapping.is_some()
+            && kv_dtype != KvDtype::F32
+            && !quant_kv_windowed
+        {
             tracing::warn!(
                 requested = ?kv_dtype,
-                "attention-softcap model (Gemma2): defaulting KV cache to f32 (the \
-                 soft-capping attention kernels — CPU and GPU — are f32-only)"
+                "attention-softcap model (Gemma2): defaulting KV cache to f32 (this \
+                 dtype's soft-capping attention kernels are not available; F1 covers \
+                 q4_0 / q8_0 / nvfp4 / tq / mxfp4-6-8)"
             );
             KvDtype::F32
         } else {
             kv_dtype
         };
-        // D1b LIFTED the SWA / softcap `kv_layout → contiguous` coercions: the F32
-        // paged forwards now thread the per-layer sliding-window span + Gemma2
-        // attention-logit soft-cap (`forward_one_paged_f32`,
+        // D1b LIFTED the SWA / softcap `kv_layout → contiguous` coercion for F32
+        // KV: the F32 paged forwards thread the per-layer sliding-window span +
+        // Gemma2 attention-logit soft-cap (`forward_one_paged_f32`,
         // `forward_decode_paged_batched_f32`, `forward_ragged_paged_f32`, and the
         // inline `forward_prefill_paged_f32`), so an SWA / softcap model may use a
-        // PAGED F32 KV layout. This is safe because the kv_dtype coercions just
-        // above UNCONDITIONALLY pin an SWA / softcap model to F32 KV (quant-KV
-        // paged still carries no window/softcap until F1), so a paged SWA/softcap
-        // model is always F32 here — exactly the path that now windows + caps.
-        // The HYBRID layout coercion is KEPT: no paged forward walks hybrid
-        // (DeltaNet/SSM) layers yet (lifted by F8).
+        // PAGED **F32** KV layout. F1 then lifted the SWA/softcap kv_dtype coercion
+        // for the quant dtypes (above) — but the PAGED quant-KV forwards
+        // (`PagedKvStoreOps`) still IGNORE window/softcap (they take `_window` /
+        // `_softcap`), so an SWA/softcap model with a quant KV dtype is pinned to
+        // the CONTIGUOUS layout here, where the windowed/capped quant kernels run.
+        // (Lifting this needs the paged quant forwards to carry window/softcap too
+        // — a T2/F-series follow-up.) The HYBRID layout coercion is KEPT: no paged
+        // forward walks hybrid (DeltaNet/SSM) layers yet (lifted by F8).
+        let swa_or_softcap = model.cfg.sliding_window.is_some()
+            || model.cfg.attn_logit_softcapping.is_some();
         let kv_layout: &str = if model.weights.is_hybrid() && kv_layout != "contiguous" {
             tracing::warn!(
                 requested = %kv_layout,
                 "hybrid model: paged KV layouts are not supported by the \
                  hybrid path — coercing to contiguous for this load"
+            );
+            "contiguous"
+        } else if swa_or_softcap && kv_dtype != KvDtype::F32 && kv_layout != "contiguous" {
+            tracing::warn!(
+                requested = %kv_layout,
+                kv_dtype = ?kv_dtype,
+                "sliding-window / softcap model with quant KV: coercing to the \
+                 contiguous layout (the paged quant-KV forwards do not yet carry \
+                 the window/softcap uniforms; the contiguous quant kernels do)"
             );
             "contiguous"
         } else {

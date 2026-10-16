@@ -1676,27 +1676,30 @@ void rsl_flash_attn_prefill_usm(rsl_stream* s,
 // scales (indexed kv_h*max_ctx + t) + bit width.
 // ============================================================
 
-void rsl_flash_attn_decode_q4_0_usm(rsl_stream* s,
+int rsl_flash_attn_decode_q4_0_usm(rsl_stream* s,
                                     const float* q_usm,
                                     const void* k_packed_usm,
                                     const void* v_packed_usm,
                                     float* out_usm,
                                     int n_heads, int n_kv_heads,
                                     int head_dim, int max_ctx,
-                                    int kv_len) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_q4_0_usm", {
+                                    int kv_len,
+                                    int window, float softcap) RSL_FFI_BODY_RET("rsl_flash_attn_decode_q4_0_usm", -1, {
     if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
-        || v_packed_usm == nullptr || out_usm == nullptr) return;
-    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
-    if ((n_heads % n_kv_heads) != 0) return;
-    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return;
+        || v_packed_usm == nullptr || out_usm == nullptr) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return -1;
     auto& q = s->q;
     if (kv_len <= 0) {
         std::size_t total = static_cast<std::size_t>(n_heads) * head_dim;
         q.memset(out_usm, 0, total * sizeof(float)).wait();
-        return;
+        return 0;
     }
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    // SWA lower bound: attend only [t_start, kv_len). window==0 => full.
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
     const int bytes_per_row = (head_dim / 32) * 18;
     const uint8_t* k_bytes = static_cast<const uint8_t*>(k_packed_usm);
     const uint8_t* v_bytes = static_cast<const uint8_t*>(v_packed_usm);
@@ -1713,12 +1716,14 @@ void rsl_flash_attn_decode_q4_0_usm(rsl_stream* s,
                 float row[RSL_FLASH_MAX_HEAD_DIM];
                 for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] = 0.0f;
                 float m = -INFINITY, l = 0.0f;
-                for (int t = 0; t < kv_len; ++t) {
+                for (int t = t_start; t < kv_len; ++t) {
                     const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
                     deq_q4_0_row(kp, row, head_dim);
                     float s_dot = 0.0f;
                     for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_base + i] * row[i];
                     s_dot *= scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
                     const float m_new = sycl::fmax(m, s_dot);
                     const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
                     const float p = sycl::exp(s_dot - m_new);
@@ -1733,22 +1738,24 @@ void rsl_flash_attn_decode_q4_0_usm(rsl_stream* s,
                 for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] *= inv_l;
             });
     }).wait();
+    return 0;
 })
 
-void rsl_flash_attn_prefill_q4_0_usm(rsl_stream* s,
+int rsl_flash_attn_prefill_q4_0_usm(rsl_stream* s,
                                      const float* q_usm,
                                      const void* k_packed_usm,
                                      const void* v_packed_usm,
                                      float* out_usm,
                                      int n_heads, int n_kv_heads,
                                      int head_dim, int max_ctx,
-                                     int kv_len_base, int n_new) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_q4_0_usm", {
+                                     int kv_len_base, int n_new,
+                                    int window, float softcap) RSL_FFI_BODY_RET("rsl_flash_attn_prefill_q4_0_usm", -1, {
     if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
-        || v_packed_usm == nullptr || out_usm == nullptr) return;
-    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return;
-    if ((n_heads % n_kv_heads) != 0) return;
-    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return;
-    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return;
+        || v_packed_usm == nullptr || out_usm == nullptr) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return -1;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
     auto& q = s->q;
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
@@ -1769,15 +1776,19 @@ void rsl_flash_attn_prefill_q4_0_usm(rsl_stream* s,
                 const int q_off = (q_pos * n_heads + hh) * head_dim;
                 const int out_off = q_off;
                 const int kv_len_for_q = kv_len_base + q_pos + 1;
+                // SWA per-query lower bound (abs pos P=kv_len_for_q-1).
+                const int t_start = (window > 0 && kv_len_for_q - window > 0) ? (kv_len_for_q - window) : 0;
                 float row[RSL_FLASH_MAX_HEAD_DIM];
                 for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] = 0.0f;
                 float m = -INFINITY, l = 0.0f;
-                for (int t = 0; t < kv_len_for_q; ++t) {
+                for (int t = t_start; t < kv_len_for_q; ++t) {
                     const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
                     deq_q4_0_row(kp, row, head_dim);
                     float s_dot = 0.0f;
                     for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_off + i] * row[i];
                     s_dot *= scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
                     const float m_new = sycl::fmax(m, s_dot);
                     const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
                     const float p = sycl::exp(s_dot - m_new);
@@ -1792,6 +1803,7 @@ void rsl_flash_attn_prefill_q4_0_usm(rsl_stream* s,
                 for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] *= inv_l;
             });
     }).wait();
+    return 0;
 })
 
 // ---- Q8_0-KV decode / prefill (i8 slab + per-row f32 scale) ----
@@ -1806,7 +1818,7 @@ void rsl_flash_attn_prefill_q4_0_usm(rsl_stream* s,
 // (s *= k_scale*attn_scale; out += (p*v_scale)*i8). We reproduce that
 // factoring exactly for float parity, so there is NO private row buffer here
 // and head_dim is unconstrained (no block-alignment, no power-of-two).
-void rsl_flash_attn_decode_q8_0_usm(rsl_stream* s,
+int rsl_flash_attn_decode_q8_0_usm(rsl_stream* s,
                                     const float* q_usm,
                                     const void* k_packed_usm,
                                     const void* v_packed_usm,
@@ -1815,20 +1827,23 @@ void rsl_flash_attn_decode_q8_0_usm(rsl_stream* s,
                                     float* out_usm,
                                     int n_heads, int n_kv_heads,
                                     int head_dim, int max_ctx,
-                                    int kv_len) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_q8_0_usm", {
+                                    int kv_len,
+                                    int window, float softcap) RSL_FFI_BODY_RET("rsl_flash_attn_decode_q8_0_usm", -1, {
     if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
         || v_packed_usm == nullptr || k_scales_usm == nullptr
-        || v_scales_usm == nullptr || out_usm == nullptr) return;
-    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
-    if ((n_heads % n_kv_heads) != 0) return;
+        || v_scales_usm == nullptr || out_usm == nullptr) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
     auto& q = s->q;
     if (kv_len <= 0) {
         std::size_t total = static_cast<std::size_t>(n_heads) * head_dim;
         q.memset(out_usm, 0, total * sizeof(float)).wait();
-        return;
+        return 0;
     }
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    // SWA lower bound: attend only [t_start, kv_len). window==0 => full.
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
     const int8_t* k_bytes = static_cast<const int8_t*>(k_packed_usm);
     const int8_t* v_bytes = static_cast<const int8_t*>(v_packed_usm);
     q.submit([&](sycl::handler& h) {
@@ -1843,13 +1858,15 @@ void rsl_flash_attn_decode_q8_0_usm(rsl_stream* s,
                 const int out_base = hh * head_dim;
                 for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] = 0.0f;
                 float m = -INFINITY, l = 0.0f;
-                for (int t = 0; t < kv_len; ++t) {
+                for (int t = t_start; t < kv_len; ++t) {
                     const std::size_t ridx = static_cast<std::size_t>(kv_h * max_ctx + t);
                     const int8_t* kp = k_bytes + ridx * head_dim;
                     float s_dot = 0.0f;
                     for (int i = 0; i < head_dim; ++i)
                         s_dot += q_usm[q_base + i] * static_cast<float>(kp[i]);
                     s_dot *= k_scales_usm[ridx] * scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
                     const float m_new = sycl::fmax(m, s_dot);
                     const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
                     const float p = sycl::exp(s_dot - m_new);
@@ -1865,9 +1882,10 @@ void rsl_flash_attn_decode_q8_0_usm(rsl_stream* s,
                 for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] *= inv_l;
             });
     }).wait();
+    return 0;
 })
 
-void rsl_flash_attn_prefill_q8_0_usm(rsl_stream* s,
+int rsl_flash_attn_prefill_q8_0_usm(rsl_stream* s,
                                      const float* q_usm,
                                      const void* k_packed_usm,
                                      const void* v_packed_usm,
@@ -1876,13 +1894,14 @@ void rsl_flash_attn_prefill_q8_0_usm(rsl_stream* s,
                                      float* out_usm,
                                      int n_heads, int n_kv_heads,
                                      int head_dim, int max_ctx,
-                                     int kv_len_base, int n_new) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_q8_0_usm", {
+                                     int kv_len_base, int n_new,
+                                    int window, float softcap) RSL_FFI_BODY_RET("rsl_flash_attn_prefill_q8_0_usm", -1, {
     if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
         || v_packed_usm == nullptr || k_scales_usm == nullptr
-        || v_scales_usm == nullptr || out_usm == nullptr) return;
-    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return;
-    if ((n_heads % n_kv_heads) != 0) return;
-    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return;
+        || v_scales_usm == nullptr || out_usm == nullptr) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
     auto& q = s->q;
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
@@ -1902,15 +1921,19 @@ void rsl_flash_attn_prefill_q8_0_usm(rsl_stream* s,
                 const int q_off = (q_pos * n_heads + hh) * head_dim;
                 const int out_off = q_off;
                 const int kv_len_for_q = kv_len_base + q_pos + 1;
+                // SWA per-query lower bound (abs pos P=kv_len_for_q-1).
+                const int t_start = (window > 0 && kv_len_for_q - window > 0) ? (kv_len_for_q - window) : 0;
                 for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] = 0.0f;
                 float m = -INFINITY, l = 0.0f;
-                for (int t = 0; t < kv_len_for_q; ++t) {
+                for (int t = t_start; t < kv_len_for_q; ++t) {
                     const std::size_t ridx = static_cast<std::size_t>(kv_h * max_ctx + t);
                     const int8_t* kp = k_bytes + ridx * head_dim;
                     float s_dot = 0.0f;
                     for (int i = 0; i < head_dim; ++i)
                         s_dot += q_usm[q_off + i] * static_cast<float>(kp[i]);
                     s_dot *= k_scales_usm[ridx] * scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
                     const float m_new = sycl::fmax(m, s_dot);
                     const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
                     const float p = sycl::exp(s_dot - m_new);
@@ -1926,29 +1949,33 @@ void rsl_flash_attn_prefill_q8_0_usm(rsl_stream* s,
                 for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] *= inv_l;
             });
     }).wait();
+    return 0;
 })
 
-void rsl_flash_attn_decode_nvfp4_usm(rsl_stream* s,
+int rsl_flash_attn_decode_nvfp4_usm(rsl_stream* s,
                                      const float* q_usm,
                                      const void* k_packed_usm,
                                      const void* v_packed_usm,
                                      float* out_usm,
                                      int n_heads, int n_kv_heads,
                                      int head_dim, int max_ctx,
-                                     int kv_len) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_nvfp4_usm", {
+                                     int kv_len,
+                                    int window, float softcap) RSL_FFI_BODY_RET("rsl_flash_attn_decode_nvfp4_usm", -1, {
     if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
-        || v_packed_usm == nullptr || out_usm == nullptr) return;
-    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
-    if ((n_heads % n_kv_heads) != 0) return;
-    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 16) != 0) return;
+        || v_packed_usm == nullptr || out_usm == nullptr) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 16) != 0) return -1;
     auto& q = s->q;
     if (kv_len <= 0) {
         std::size_t total = static_cast<std::size_t>(n_heads) * head_dim;
         q.memset(out_usm, 0, total * sizeof(float)).wait();
-        return;
+        return 0;
     }
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    // SWA lower bound: attend only [t_start, kv_len). window==0 => full.
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
     const int bytes_per_row = (head_dim / 16) * 9;
     const uint8_t* k_bytes = static_cast<const uint8_t*>(k_packed_usm);
     const uint8_t* v_bytes = static_cast<const uint8_t*>(v_packed_usm);
@@ -1965,12 +1992,14 @@ void rsl_flash_attn_decode_nvfp4_usm(rsl_stream* s,
                 float row[RSL_FLASH_MAX_HEAD_DIM];
                 for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] = 0.0f;
                 float m = -INFINITY, l = 0.0f;
-                for (int t = 0; t < kv_len; ++t) {
+                for (int t = t_start; t < kv_len; ++t) {
                     const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
                     deq_nvfp4_row(kp, row, head_dim);
                     float s_dot = 0.0f;
                     for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_base + i] * row[i];
                     s_dot *= scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
                     const float m_new = sycl::fmax(m, s_dot);
                     const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
                     const float p = sycl::exp(s_dot - m_new);
@@ -1985,22 +2014,24 @@ void rsl_flash_attn_decode_nvfp4_usm(rsl_stream* s,
                 for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] *= inv_l;
             });
     }).wait();
+    return 0;
 })
 
-void rsl_flash_attn_prefill_nvfp4_usm(rsl_stream* s,
+int rsl_flash_attn_prefill_nvfp4_usm(rsl_stream* s,
                                       const float* q_usm,
                                       const void* k_packed_usm,
                                       const void* v_packed_usm,
                                       float* out_usm,
                                       int n_heads, int n_kv_heads,
                                       int head_dim, int max_ctx,
-                                      int kv_len_base, int n_new) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_nvfp4_usm", {
+                                      int kv_len_base, int n_new,
+                                    int window, float softcap) RSL_FFI_BODY_RET("rsl_flash_attn_prefill_nvfp4_usm", -1, {
     if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
-        || v_packed_usm == nullptr || out_usm == nullptr) return;
-    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return;
-    if ((n_heads % n_kv_heads) != 0) return;
-    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 16) != 0) return;
-    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return;
+        || v_packed_usm == nullptr || out_usm == nullptr) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 16) != 0) return -1;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
     auto& q = s->q;
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
@@ -2021,15 +2052,19 @@ void rsl_flash_attn_prefill_nvfp4_usm(rsl_stream* s,
                 const int q_off = (q_pos * n_heads + hh) * head_dim;
                 const int out_off = q_off;
                 const int kv_len_for_q = kv_len_base + q_pos + 1;
+                // SWA per-query lower bound (abs pos P=kv_len_for_q-1).
+                const int t_start = (window > 0 && kv_len_for_q - window > 0) ? (kv_len_for_q - window) : 0;
                 float row[RSL_FLASH_MAX_HEAD_DIM];
                 for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] = 0.0f;
                 float m = -INFINITY, l = 0.0f;
-                for (int t = 0; t < kv_len_for_q; ++t) {
+                for (int t = t_start; t < kv_len_for_q; ++t) {
                     const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
                     deq_nvfp4_row(kp, row, head_dim);
                     float s_dot = 0.0f;
                     for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_off + i] * row[i];
                     s_dot *= scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
                     const float m_new = sycl::fmax(m, s_dot);
                     const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
                     const float p = sycl::exp(s_dot - m_new);
@@ -2044,6 +2079,7 @@ void rsl_flash_attn_prefill_nvfp4_usm(rsl_stream* s,
                 for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] *= inv_l;
             });
     }).wait();
+    return 0;
 })
 
 // =========================================================================
@@ -2059,27 +2095,30 @@ void rsl_flash_attn_prefill_nvfp4_usm(rsl_stream* s,
 // =========================================================================
 
 // ---- MXFP4 KV (17 B / 32 elems: 16 nibble-pair bytes + E8M0 scale) ----
-void rsl_flash_attn_decode_mxfp4_usm(rsl_stream* s,
+int rsl_flash_attn_decode_mxfp4_usm(rsl_stream* s,
                                      const float* q_usm,
                                      const void* k_packed_usm,
                                      const void* v_packed_usm,
                                      float* out_usm,
                                      int n_heads, int n_kv_heads,
                                      int head_dim, int max_ctx,
-                                     int kv_len) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_mxfp4_usm", {
+                                     int kv_len,
+                                    int window, float softcap) RSL_FFI_BODY_RET("rsl_flash_attn_decode_mxfp4_usm", -1, {
     if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
-        || v_packed_usm == nullptr || out_usm == nullptr) return;
-    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
-    if ((n_heads % n_kv_heads) != 0) return;
-    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return;
+        || v_packed_usm == nullptr || out_usm == nullptr) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return -1;
     auto& q = s->q;
     if (kv_len <= 0) {
         std::size_t total = static_cast<std::size_t>(n_heads) * head_dim;
         q.memset(out_usm, 0, total * sizeof(float)).wait();
-        return;
+        return 0;
     }
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    // SWA lower bound: attend only [t_start, kv_len). window==0 => full.
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
     const int bytes_per_row = (head_dim / 32) * 17;
     const uint8_t* k_bytes = static_cast<const uint8_t*>(k_packed_usm);
     const uint8_t* v_bytes = static_cast<const uint8_t*>(v_packed_usm);
@@ -2096,12 +2135,14 @@ void rsl_flash_attn_decode_mxfp4_usm(rsl_stream* s,
                 float row[RSL_FLASH_MAX_HEAD_DIM];
                 for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] = 0.0f;
                 float m = -INFINITY, l = 0.0f;
-                for (int t = 0; t < kv_len; ++t) {
+                for (int t = t_start; t < kv_len; ++t) {
                     const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
                     deq_mxfp4_row(kp, row, head_dim);
                     float s_dot = 0.0f;
                     for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_base + i] * row[i];
                     s_dot *= scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
                     const float m_new = sycl::fmax(m, s_dot);
                     const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
                     const float p = sycl::exp(s_dot - m_new);
@@ -2116,22 +2157,24 @@ void rsl_flash_attn_decode_mxfp4_usm(rsl_stream* s,
                 for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] *= inv_l;
             });
     }).wait();
+    return 0;
 })
 
-void rsl_flash_attn_prefill_mxfp4_usm(rsl_stream* s,
+int rsl_flash_attn_prefill_mxfp4_usm(rsl_stream* s,
                                       const float* q_usm,
                                       const void* k_packed_usm,
                                       const void* v_packed_usm,
                                       float* out_usm,
                                       int n_heads, int n_kv_heads,
                                       int head_dim, int max_ctx,
-                                      int kv_len_base, int n_new) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_mxfp4_usm", {
+                                      int kv_len_base, int n_new,
+                                    int window, float softcap) RSL_FFI_BODY_RET("rsl_flash_attn_prefill_mxfp4_usm", -1, {
     if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
-        || v_packed_usm == nullptr || out_usm == nullptr) return;
-    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return;
-    if ((n_heads % n_kv_heads) != 0) return;
-    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return;
-    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return;
+        || v_packed_usm == nullptr || out_usm == nullptr) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return -1;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
     auto& q = s->q;
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
@@ -2152,15 +2195,19 @@ void rsl_flash_attn_prefill_mxfp4_usm(rsl_stream* s,
                 const int q_off = (q_pos * n_heads + hh) * head_dim;
                 const int out_off = q_off;
                 const int kv_len_for_q = kv_len_base + q_pos + 1;
+                // SWA per-query lower bound (abs pos P=kv_len_for_q-1).
+                const int t_start = (window > 0 && kv_len_for_q - window > 0) ? (kv_len_for_q - window) : 0;
                 float row[RSL_FLASH_MAX_HEAD_DIM];
                 for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] = 0.0f;
                 float m = -INFINITY, l = 0.0f;
-                for (int t = 0; t < kv_len_for_q; ++t) {
+                for (int t = t_start; t < kv_len_for_q; ++t) {
                     const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
                     deq_mxfp4_row(kp, row, head_dim);
                     float s_dot = 0.0f;
                     for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_off + i] * row[i];
                     s_dot *= scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
                     const float m_new = sycl::fmax(m, s_dot);
                     const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
                     const float p = sycl::exp(s_dot - m_new);
@@ -2175,30 +2222,34 @@ void rsl_flash_attn_prefill_mxfp4_usm(rsl_stream* s,
                 for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] *= inv_l;
             });
     }).wait();
+    return 0;
 })
 
 // ---- MXFP6 KV (25 B / 32 elems: 24-byte E3M2 bitstream + E8M0 scale) ----
-void rsl_flash_attn_decode_mxfp6_usm(rsl_stream* s,
+int rsl_flash_attn_decode_mxfp6_usm(rsl_stream* s,
                                      const float* q_usm,
                                      const void* k_packed_usm,
                                      const void* v_packed_usm,
                                      float* out_usm,
                                      int n_heads, int n_kv_heads,
                                      int head_dim, int max_ctx,
-                                     int kv_len) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_mxfp6_usm", {
+                                     int kv_len,
+                                    int window, float softcap) RSL_FFI_BODY_RET("rsl_flash_attn_decode_mxfp6_usm", -1, {
     if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
-        || v_packed_usm == nullptr || out_usm == nullptr) return;
-    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
-    if ((n_heads % n_kv_heads) != 0) return;
-    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return;
+        || v_packed_usm == nullptr || out_usm == nullptr) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return -1;
     auto& q = s->q;
     if (kv_len <= 0) {
         std::size_t total = static_cast<std::size_t>(n_heads) * head_dim;
         q.memset(out_usm, 0, total * sizeof(float)).wait();
-        return;
+        return 0;
     }
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    // SWA lower bound: attend only [t_start, kv_len). window==0 => full.
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
     const int bytes_per_row = (head_dim / 32) * 25;
     const uint8_t* k_bytes = static_cast<const uint8_t*>(k_packed_usm);
     const uint8_t* v_bytes = static_cast<const uint8_t*>(v_packed_usm);
@@ -2215,12 +2266,14 @@ void rsl_flash_attn_decode_mxfp6_usm(rsl_stream* s,
                 float row[RSL_FLASH_MAX_HEAD_DIM];
                 for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] = 0.0f;
                 float m = -INFINITY, l = 0.0f;
-                for (int t = 0; t < kv_len; ++t) {
+                for (int t = t_start; t < kv_len; ++t) {
                     const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
                     deq_mxfp6_row(kp, row, head_dim);
                     float s_dot = 0.0f;
                     for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_base + i] * row[i];
                     s_dot *= scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
                     const float m_new = sycl::fmax(m, s_dot);
                     const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
                     const float p = sycl::exp(s_dot - m_new);
@@ -2235,22 +2288,24 @@ void rsl_flash_attn_decode_mxfp6_usm(rsl_stream* s,
                 for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] *= inv_l;
             });
     }).wait();
+    return 0;
 })
 
-void rsl_flash_attn_prefill_mxfp6_usm(rsl_stream* s,
+int rsl_flash_attn_prefill_mxfp6_usm(rsl_stream* s,
                                       const float* q_usm,
                                       const void* k_packed_usm,
                                       const void* v_packed_usm,
                                       float* out_usm,
                                       int n_heads, int n_kv_heads,
                                       int head_dim, int max_ctx,
-                                      int kv_len_base, int n_new) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_mxfp6_usm", {
+                                      int kv_len_base, int n_new,
+                                    int window, float softcap) RSL_FFI_BODY_RET("rsl_flash_attn_prefill_mxfp6_usm", -1, {
     if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
-        || v_packed_usm == nullptr || out_usm == nullptr) return;
-    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return;
-    if ((n_heads % n_kv_heads) != 0) return;
-    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return;
-    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return;
+        || v_packed_usm == nullptr || out_usm == nullptr) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return -1;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
     auto& q = s->q;
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
@@ -2271,15 +2326,19 @@ void rsl_flash_attn_prefill_mxfp6_usm(rsl_stream* s,
                 const int q_off = (q_pos * n_heads + hh) * head_dim;
                 const int out_off = q_off;
                 const int kv_len_for_q = kv_len_base + q_pos + 1;
+                // SWA per-query lower bound (abs pos P=kv_len_for_q-1).
+                const int t_start = (window > 0 && kv_len_for_q - window > 0) ? (kv_len_for_q - window) : 0;
                 float row[RSL_FLASH_MAX_HEAD_DIM];
                 for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] = 0.0f;
                 float m = -INFINITY, l = 0.0f;
-                for (int t = 0; t < kv_len_for_q; ++t) {
+                for (int t = t_start; t < kv_len_for_q; ++t) {
                     const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
                     deq_mxfp6_row(kp, row, head_dim);
                     float s_dot = 0.0f;
                     for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_off + i] * row[i];
                     s_dot *= scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
                     const float m_new = sycl::fmax(m, s_dot);
                     const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
                     const float p = sycl::exp(s_dot - m_new);
@@ -2294,30 +2353,34 @@ void rsl_flash_attn_prefill_mxfp6_usm(rsl_stream* s,
                 for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] *= inv_l;
             });
     }).wait();
+    return 0;
 })
 
 // ---- MXFP8 KV (33 B / 32 elems: 32 E4M3 bytes + E8M0 scale) ----
-void rsl_flash_attn_decode_mxfp8_usm(rsl_stream* s,
+int rsl_flash_attn_decode_mxfp8_usm(rsl_stream* s,
                                      const float* q_usm,
                                      const void* k_packed_usm,
                                      const void* v_packed_usm,
                                      float* out_usm,
                                      int n_heads, int n_kv_heads,
                                      int head_dim, int max_ctx,
-                                     int kv_len) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_mxfp8_usm", {
+                                     int kv_len,
+                                    int window, float softcap) RSL_FFI_BODY_RET("rsl_flash_attn_decode_mxfp8_usm", -1, {
     if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
-        || v_packed_usm == nullptr || out_usm == nullptr) return;
-    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
-    if ((n_heads % n_kv_heads) != 0) return;
-    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return;
+        || v_packed_usm == nullptr || out_usm == nullptr) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return -1;
     auto& q = s->q;
     if (kv_len <= 0) {
         std::size_t total = static_cast<std::size_t>(n_heads) * head_dim;
         q.memset(out_usm, 0, total * sizeof(float)).wait();
-        return;
+        return 0;
     }
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    // SWA lower bound: attend only [t_start, kv_len). window==0 => full.
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
     const int bytes_per_row = (head_dim / 32) * 33;
     const uint8_t* k_bytes = static_cast<const uint8_t*>(k_packed_usm);
     const uint8_t* v_bytes = static_cast<const uint8_t*>(v_packed_usm);
@@ -2334,12 +2397,14 @@ void rsl_flash_attn_decode_mxfp8_usm(rsl_stream* s,
                 float row[RSL_FLASH_MAX_HEAD_DIM];
                 for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] = 0.0f;
                 float m = -INFINITY, l = 0.0f;
-                for (int t = 0; t < kv_len; ++t) {
+                for (int t = t_start; t < kv_len; ++t) {
                     const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
                     deq_mxfp8_row(kp, row, head_dim);
                     float s_dot = 0.0f;
                     for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_base + i] * row[i];
                     s_dot *= scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
                     const float m_new = sycl::fmax(m, s_dot);
                     const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
                     const float p = sycl::exp(s_dot - m_new);
@@ -2354,22 +2419,24 @@ void rsl_flash_attn_decode_mxfp8_usm(rsl_stream* s,
                 for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] *= inv_l;
             });
     }).wait();
+    return 0;
 })
 
-void rsl_flash_attn_prefill_mxfp8_usm(rsl_stream* s,
+int rsl_flash_attn_prefill_mxfp8_usm(rsl_stream* s,
                                       const float* q_usm,
                                       const void* k_packed_usm,
                                       const void* v_packed_usm,
                                       float* out_usm,
                                       int n_heads, int n_kv_heads,
                                       int head_dim, int max_ctx,
-                                      int kv_len_base, int n_new) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_mxfp8_usm", {
+                                      int kv_len_base, int n_new,
+                                    int window, float softcap) RSL_FFI_BODY_RET("rsl_flash_attn_prefill_mxfp8_usm", -1, {
     if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
-        || v_packed_usm == nullptr || out_usm == nullptr) return;
-    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return;
-    if ((n_heads % n_kv_heads) != 0) return;
-    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return;
-    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return;
+        || v_packed_usm == nullptr || out_usm == nullptr) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim % 32) != 0) return -1;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
     auto& q = s->q;
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
@@ -2390,15 +2457,19 @@ void rsl_flash_attn_prefill_mxfp8_usm(rsl_stream* s,
                 const int q_off = (q_pos * n_heads + hh) * head_dim;
                 const int out_off = q_off;
                 const int kv_len_for_q = kv_len_base + q_pos + 1;
+                // SWA per-query lower bound (abs pos P=kv_len_for_q-1).
+                const int t_start = (window > 0 && kv_len_for_q - window > 0) ? (kv_len_for_q - window) : 0;
                 float row[RSL_FLASH_MAX_HEAD_DIM];
                 for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] = 0.0f;
                 float m = -INFINITY, l = 0.0f;
-                for (int t = 0; t < kv_len_for_q; ++t) {
+                for (int t = t_start; t < kv_len_for_q; ++t) {
                     const uint8_t* kp = k_bytes + static_cast<std::size_t>(kv_h * max_ctx + t) * bytes_per_row;
                     deq_mxfp8_row(kp, row, head_dim);
                     float s_dot = 0.0f;
                     for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_off + i] * row[i];
                     s_dot *= scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
                     const float m_new = sycl::fmax(m, s_dot);
                     const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
                     const float p = sycl::exp(s_dot - m_new);
@@ -2413,9 +2484,10 @@ void rsl_flash_attn_prefill_mxfp8_usm(rsl_stream* s,
                 for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] *= inv_l;
             });
     }).wait();
+    return 0;
 })
 
-void rsl_flash_attn_decode_tq_usm(rsl_stream* s,
+int rsl_flash_attn_decode_tq_usm(rsl_stream* s,
                                   const float* q_usm,
                                   const void* k_packed_usm,
                                   const void* v_packed_usm,
@@ -2425,22 +2497,25 @@ void rsl_flash_attn_decode_tq_usm(rsl_stream* s,
                                   float* out_usm,
                                   int n_heads, int n_kv_heads,
                                   int head_dim, int max_ctx,
-                                  int kv_len) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_tq_usm", {
+                                  int kv_len,
+                                    int window, float softcap) RSL_FFI_BODY_RET("rsl_flash_attn_decode_tq_usm", -1, {
     if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
         || v_packed_usm == nullptr || k_scales_usm == nullptr
-        || v_scales_usm == nullptr || out_usm == nullptr) return;
-    if (bits != 1 && bits != 2 && bits != 4 && bits != 8) return;
-    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
-    if ((n_heads % n_kv_heads) != 0) return;
-    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim & (head_dim - 1)) != 0) return;
+        || v_scales_usm == nullptr || out_usm == nullptr) return -1;
+    if (bits != 1 && bits != 2 && bits != 4 && bits != 8) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim & (head_dim - 1)) != 0) return -1;
     auto& q = s->q;
     if (kv_len <= 0) {
         std::size_t total = static_cast<std::size_t>(n_heads) * head_dim;
         q.memset(out_usm, 0, total * sizeof(float)).wait();
-        return;
+        return 0;
     }
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    // SWA lower bound: attend only [t_start, kv_len). window==0 => full.
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
     const int bytes_per_row = (head_dim * bits + 7) / 8;
     const uint8_t* k_bytes = static_cast<const uint8_t*>(k_packed_usm);
     const uint8_t* v_bytes = static_cast<const uint8_t*>(v_packed_usm);
@@ -2457,12 +2532,14 @@ void rsl_flash_attn_decode_tq_usm(rsl_stream* s,
                 float row[RSL_FLASH_MAX_HEAD_DIM];
                 for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] = 0.0f;
                 float m = -INFINITY, l = 0.0f;
-                for (int t = 0; t < kv_len; ++t) {
+                for (int t = t_start; t < kv_len; ++t) {
                     const std::size_t ridx = static_cast<std::size_t>(kv_h * max_ctx + t);
                     deq_tq_row(k_bytes + ridx * bytes_per_row, k_scales_usm[ridx], bits, row, head_dim);
                     float s_dot = 0.0f;
                     for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_base + i] * row[i];
                     s_dot *= scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
                     const float m_new = sycl::fmax(m, s_dot);
                     const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
                     const float p = sycl::exp(s_dot - m_new);
@@ -2476,9 +2553,10 @@ void rsl_flash_attn_decode_tq_usm(rsl_stream* s,
                 for (int i = 0; i < head_dim; ++i) out_usm[out_base + i] *= inv_l;
             });
     }).wait();
+    return 0;
 })
 
-void rsl_flash_attn_prefill_tq_usm(rsl_stream* s,
+int rsl_flash_attn_prefill_tq_usm(rsl_stream* s,
                                    const float* q_usm,
                                    const void* k_packed_usm,
                                    const void* v_packed_usm,
@@ -2488,15 +2566,16 @@ void rsl_flash_attn_prefill_tq_usm(rsl_stream* s,
                                    float* out_usm,
                                    int n_heads, int n_kv_heads,
                                    int head_dim, int max_ctx,
-                                   int kv_len_base, int n_new) RSL_FFI_BODY_VOID("rsl_flash_attn_prefill_tq_usm", {
+                                   int kv_len_base, int n_new,
+                                    int window, float softcap) RSL_FFI_BODY_RET("rsl_flash_attn_prefill_tq_usm", -1, {
     if (s == nullptr || q_usm == nullptr || k_packed_usm == nullptr
         || v_packed_usm == nullptr || k_scales_usm == nullptr
-        || v_scales_usm == nullptr || out_usm == nullptr) return;
-    if (bits != 1 && bits != 2 && bits != 4 && bits != 8) return;
-    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return;
-    if ((n_heads % n_kv_heads) != 0) return;
-    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim & (head_dim - 1)) != 0) return;
-    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return;
+        || v_scales_usm == nullptr || out_usm == nullptr) return -1;
+    if (bits != 1 && bits != 2 && bits != 4 && bits != 8) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM || (head_dim & (head_dim - 1)) != 0) return -1;
+    if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
     auto& q = s->q;
     const int n_gqa = n_heads / n_kv_heads;
     const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
@@ -2517,15 +2596,19 @@ void rsl_flash_attn_prefill_tq_usm(rsl_stream* s,
                 const int q_off = (q_pos * n_heads + hh) * head_dim;
                 const int out_off = q_off;
                 const int kv_len_for_q = kv_len_base + q_pos + 1;
+                // SWA per-query lower bound (abs pos P=kv_len_for_q-1).
+                const int t_start = (window > 0 && kv_len_for_q - window > 0) ? (kv_len_for_q - window) : 0;
                 float row[RSL_FLASH_MAX_HEAD_DIM];
                 for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] = 0.0f;
                 float m = -INFINITY, l = 0.0f;
-                for (int t = 0; t < kv_len_for_q; ++t) {
+                for (int t = t_start; t < kv_len_for_q; ++t) {
                     const std::size_t ridx = static_cast<std::size_t>(kv_h * max_ctx + t);
                     deq_tq_row(k_bytes + ridx * bytes_per_row, k_scales_usm[ridx], bits, row, head_dim);
                     float s_dot = 0.0f;
                     for (int i = 0; i < head_dim; ++i) s_dot += q_usm[q_off + i] * row[i];
                     s_dot *= scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
                     const float m_new = sycl::fmax(m, s_dot);
                     const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
                     const float p = sycl::exp(s_dot - m_new);
@@ -2539,6 +2622,7 @@ void rsl_flash_attn_prefill_tq_usm(rsl_stream* s,
                 for (int i = 0; i < head_dim; ++i) out_usm[out_off + i] *= inv_l;
             });
     }).wait();
+    return 0;
 })
 
 // FlashAttention v2 prefill (sub-group cooperation, F32 K/V cache).

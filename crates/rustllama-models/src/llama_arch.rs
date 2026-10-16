@@ -4258,6 +4258,12 @@ fn mxfp_kv_decode(
     max_ctx: usize,
     kv_len: usize,
     n_layers: usize,
+    // Per-layer SWA window (0=full) + Gemma2 attn-logit soft-cap (0.0=off),
+    // threaded into the GPU dispatch AND the CPU `_capped_windowed` fallback.
+    // Dense callers pass real values; hybrid callers pass 0 / 0.0 (passthrough
+    // == byte-identical to the base kernel).
+    window: u32,
+    softcap: f32,
 ) {
     use rustllama_kernels_cpu::{mxfp, mxfp_kv};
     let (blk_bytes, qfn): (usize, fn(&[f32], &mut [u8])) = match fmt {
@@ -4293,7 +4299,7 @@ fn mxfp_kv_decode(
         n_heads as u32, n_kv_heads as u32, head_dim as u32, max_ctx as u32, n_layers as u32,
     );
     #[allow(clippy::type_complexity)]
-    let gpu_fn: fn(&[f32], &[f32], &[f32], &mut [f32], usize, u32, u32, u32, u32, u32, u32) -> bool =
+    let gpu_fn: fn(&[f32], &[f32], &[f32], &mut [f32], usize, u32, u32, u32, u32, u32, u32, u32, f32) -> bool =
         match fmt {
             KvDtype::Mxfp4 => crate::accel::try_flash_attn_decode_gpu_mxfp4,
             KvDtype::Mxfp6 => crate::accel::try_flash_attn_decode_gpu_mxfp6,
@@ -4302,16 +4308,20 @@ fn mxfp_kv_decode(
     let gpu_ok = gpu_fn(
         q_buf, k_rows, v_rows, attn_out, li, cur_pos as u32,
         n_heads as u32, n_kv_heads as u32, head_dim as u32, max_ctx as u32, n_layers as u32,
+        window, softcap,
     );
     if !gpu_ok {
         #[allow(clippy::type_complexity)]
-        let cpu_fn: fn(&[f32], &[u8], &[u8], &mut [f32], usize, usize, usize, usize, usize) =
+        let cpu_fn: fn(&[f32], &[u8], &[u8], &mut [f32], usize, usize, usize, usize, usize, usize, f32) =
             match fmt {
-                KvDtype::Mxfp4 => mxfp_kv::gqa_attention_flash_decode_mxfp4,
-                KvDtype::Mxfp6 => mxfp_kv::gqa_attention_flash_decode_mxfp6,
-                _ => mxfp_kv::gqa_attention_flash_decode_mxfp8,
+                KvDtype::Mxfp4 => mxfp_kv::gqa_attention_flash_decode_mxfp4_capped_windowed,
+                KvDtype::Mxfp6 => mxfp_kv::gqa_attention_flash_decode_mxfp6_capped_windowed,
+                _ => mxfp_kv::gqa_attention_flash_decode_mxfp8_capped_windowed,
             };
-        cpu_fn(q_buf, k_packed, v_packed, attn_out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
+        cpu_fn(
+            q_buf, k_packed, v_packed, attn_out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            window as usize, softcap,
+        );
     }
 }
 
@@ -4334,6 +4344,12 @@ fn mxfp_kv_prefill(
     max_ctx: usize,
     kv_len_base: usize,
     n_new: usize,
+    // Per-layer SWA window (0=full) + Gemma2 attn-logit soft-cap (0.0=off),
+    // threaded into the GPU dispatch AND the CPU `_capped_windowed` fallback.
+    // Dense callers pass real values; hybrid callers pass 0 / 0.0 (passthrough
+    // == byte-identical to the base kernel).
+    window: u32,
+    softcap: f32,
 ) {
     use rustllama_kernels_cpu::{mxfp, mxfp_kv};
     let (blk_bytes, qfn): (usize, fn(&[f32], &mut [u8])) = match fmt {
@@ -4357,7 +4373,7 @@ fn mxfp_kv_prefill(
         }
     }
     #[allow(clippy::type_complexity)]
-    let gpu_fn: fn(&[f32], &[u8], &[u8], &mut [f32], usize, usize, usize, usize, usize, usize) -> bool =
+    let gpu_fn: fn(&[f32], &[u8], &[u8], &mut [f32], usize, usize, usize, usize, usize, usize, u32, f32) -> bool =
         match fmt {
             KvDtype::Mxfp4 => crate::accel::try_flash_attn_prefill_gpu_mxfp4,
             KvDtype::Mxfp6 => crate::accel::try_flash_attn_prefill_gpu_mxfp6,
@@ -4365,19 +4381,19 @@ fn mxfp_kv_prefill(
         };
     let gpu_ok = gpu_fn(
         q_buf, k_packed, v_packed, attn_out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base,
-        n_new,
+        n_new, window, softcap,
     );
     if !gpu_ok {
         #[allow(clippy::type_complexity)]
-        let cpu_fn: fn(&[f32], &[u8], &[u8], &mut [f32], usize, usize, usize, usize, usize, usize) =
+        let cpu_fn: fn(&[f32], &[u8], &[u8], &mut [f32], usize, usize, usize, usize, usize, usize, usize, f32) =
             match fmt {
-                KvDtype::Mxfp4 => mxfp_kv::gqa_attention_flash_prefill_mxfp4,
-                KvDtype::Mxfp6 => mxfp_kv::gqa_attention_flash_prefill_mxfp6,
-                _ => mxfp_kv::gqa_attention_flash_prefill_mxfp8,
+                KvDtype::Mxfp4 => mxfp_kv::gqa_attention_flash_prefill_mxfp4_capped_windowed,
+                KvDtype::Mxfp6 => mxfp_kv::gqa_attention_flash_prefill_mxfp6_capped_windowed,
+                _ => mxfp_kv::gqa_attention_flash_prefill_mxfp8_capped_windowed,
             };
         cpu_fn(
             q_buf, k_packed, v_packed, attn_out, n_heads, n_kv_heads, head_dim, max_ctx,
-            kv_len_base, n_new,
+            kv_len_base, n_new, window as usize, softcap,
         );
     }
 }
@@ -4813,10 +4829,12 @@ pub struct RaggedSlot<'a> {
 // byte-identical (pinned by `tests/golden_batched_prefill.rs`).
 //
 // `window` / `softcap` (the D1b sliding-window + Gemma2 attn-logit soft-cap
-// uniforms) and the optional `tree` descriptor are threaded in; only the F32
-// impl consults them. The quant impls always receive window=0 / softcap=0.0
-// / tree=None — matching their pre-refactor behaviour, which never threaded
-// SWA/softcap and never supported tree verify.
+// uniforms) and the optional `tree` descriptor are threaded in. Every impl —
+// F32 and the quant dtypes (F1) — now threads `window`/`softcap` into both its
+// GPU dispatch and its CPU `_capped_windowed` fallback (passthrough at 0 / 0.0,
+// byte-identical to the base kernel for ordinary models). Only `tree` is
+// F32-only; the quant impls always receive tree=None (they never supported
+// tree verify) and `debug_assert!` it.
 trait BatchedKv {
     #[allow(clippy::too_many_arguments)]
     fn write_and_attend(
@@ -4954,8 +4972,8 @@ impl BatchedKv for TqKv {
         max_ctx: usize,
         kv_len_base: usize,
         n_new: usize,
-        _window: usize,
-        _softcap: f32,
+        window: usize,
+        softcap: f32,
         tree: Option<&TreeAttn<'_>>,
     ) {
         debug_assert!(tree.is_none(), "TQ batched prefill has no tree-verify path");
@@ -5013,8 +5031,10 @@ impl BatchedKv for TqKv {
                     max_ctx,
                     kv_len_base,
                     n_new,
+                    window as u32,
+                    softcap,
                 ) {
-                    rustllama_kernels_cpu::turboquant::gqa_attention_flash_prefill_tq(
+                    rustllama_kernels_cpu::turboquant::gqa_attention_flash_prefill_tq_capped_windowed(
                         q_buf,
                         k_packed,
                         k_scales,
@@ -5028,6 +5048,8 @@ impl BatchedKv for TqKv {
                         max_ctx,
                         kv_len_base,
                         n_new,
+                        window,
+                        softcap,
                     );
                 }
             }
@@ -5054,8 +5076,8 @@ impl BatchedKv for Q8_0Kv {
         max_ctx: usize,
         kv_len_base: usize,
         n_new: usize,
-        _window: usize,
-        _softcap: f32,
+        window: usize,
+        softcap: f32,
         tree: Option<&TreeAttn<'_>>,
     ) {
         debug_assert!(tree.is_none(), "Q8_0 batched prefill has no tree-verify path");
@@ -5091,8 +5113,10 @@ impl BatchedKv for Q8_0Kv {
                     max_ctx,
                     kv_len_base,
                     n_new,
+                    window as u32,
+                    softcap,
                 ) {
-                    k::gqa_attention_flash_prefill_q8_0(
+                    k::gqa_attention_flash_prefill_q8_0_capped_windowed(
                         q_buf,
                         k_q,
                         k_scales,
@@ -5105,6 +5129,8 @@ impl BatchedKv for Q8_0Kv {
                         max_ctx,
                         kv_len_base,
                         n_new,
+                        window,
+                        softcap,
                     );
                 }
             }
@@ -5131,8 +5157,8 @@ impl BatchedKv for Nvfp4Kv {
         max_ctx: usize,
         kv_len_base: usize,
         n_new: usize,
-        _window: usize,
-        _softcap: f32,
+        window: usize,
+        softcap: f32,
         tree: Option<&TreeAttn<'_>>,
     ) {
         debug_assert!(tree.is_none(), "NVFP4 batched prefill has no tree-verify path");
@@ -5176,8 +5202,10 @@ impl BatchedKv for Nvfp4Kv {
                     max_ctx,
                     kv_len_base,
                     n_new,
+                    window as u32,
+                    softcap,
                 ) {
-                    rustllama_kernels_cpu::nvfp4::gqa_attention_flash_prefill_nvfp4(
+                    rustllama_kernels_cpu::nvfp4::gqa_attention_flash_prefill_nvfp4_capped_windowed(
                         q_buf,
                         k_packed,
                         v_packed,
@@ -5188,6 +5216,8 @@ impl BatchedKv for Nvfp4Kv {
                         max_ctx,
                         kv_len_base,
                         n_new,
+                        window,
+                        softcap,
                     );
                 }
             }
@@ -5217,8 +5247,8 @@ impl BatchedKv for MxfpKv {
         max_ctx: usize,
         kv_len_base: usize,
         n_new: usize,
-        _window: usize,
-        _softcap: f32,
+        window: usize,
+        softcap: f32,
         tree: Option<&TreeAttn<'_>>,
     ) {
         debug_assert!(tree.is_none(), "MXFP batched prefill has no tree-verify path");
@@ -5230,6 +5260,7 @@ impl BatchedKv for MxfpKv {
                 mxfp_kv_prefill(
                     self.fmt, q_buf, k_buf, v_buf, k_packed, v_packed, attn_out,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+                    window as u32, softcap,
                 );
             }
             _ => unreachable!("forward_prefill_batched_mxfp entered with non-MXFP KV"),
@@ -5257,8 +5288,8 @@ impl BatchedKv for Q4_0Kv {
         max_ctx: usize,
         kv_len_base: usize,
         n_new: usize,
-        _window: usize,
-        _softcap: f32,
+        window: usize,
+        softcap: f32,
         tree: Option<&TreeAttn<'_>>,
     ) {
         debug_assert!(tree.is_none(), "Q4_0 batched prefill has no tree-verify path");
@@ -5325,8 +5356,10 @@ impl BatchedKv for Q4_0Kv {
                     max_ctx,
                     kv_len_base,
                     n_new,
+                    window as u32,
+                    softcap,
                 ) {
-                    q4_0_kv::gqa_attention_flash_prefill_q4_0(
+                    q4_0_kv::gqa_attention_flash_prefill_q4_0_capped_windowed(
                         q_buf,
                         k_q,
                         v_q,
@@ -5337,6 +5370,8 @@ impl BatchedKv for Q4_0Kv {
                         max_ctx,
                         kv_len_base,
                         n_new,
+                        window,
+                        softcap,
                     );
                 }
                 if whiten {
@@ -7060,6 +7095,9 @@ impl LlamaModel {
                                 head_dim as u32,
                                 max_ctx as u32,
                                 cfg.n_layers as u32,
+                                // Hybrid (SSM/attn) layers never carry SWA/soft-cap: pass 0 / 0.0.
+                                0,
+                                0.0,
                             ) {
                                 q4_0_kv::gqa_attention_flash_decode_q4_0(
                                     &q_buf, k_q, v_q, &mut attn_out,
@@ -7122,6 +7160,9 @@ impl LlamaModel {
                                 head_dim as u32,
                                 max_ctx as u32,
                                 cfg.n_layers as u32,
+                                // Hybrid (SSM/attn) layers never carry SWA/soft-cap: pass 0 / 0.0.
+                                0,
+                                0.0,
                             ) {
                                 k::gqa_attention_flash_decode_q8_0(
                                     &q_buf, k_q, k_scales, v_q, v_scales, &mut attn_out,
@@ -7179,6 +7220,9 @@ impl LlamaModel {
                                 head_dim as u32,
                                 max_ctx as u32,
                                 cfg.n_layers as u32,
+                                // Hybrid (SSM/attn) layers never carry SWA/soft-cap: pass 0 / 0.0.
+                                0,
+                                0.0,
                             ) {
                                 rustllama_kernels_cpu::turboquant::gqa_attention_flash_decode_tq(
                                     &q_buf, k_packed, k_scales, v_packed, v_scales, *bits, &mut attn_out,
@@ -7242,6 +7286,9 @@ impl LlamaModel {
                                 head_dim as u32,
                                 max_ctx as u32,
                                 cfg.n_layers as u32,
+                                // Hybrid (SSM/attn) layers never carry SWA/soft-cap: pass 0 / 0.0.
+                                0,
+                                0.0,
                             ) {
                                 rustllama_kernels_cpu::nvfp4::gqa_attention_flash_decode_nvfp4(
                                     &q_buf, k_packed, v_packed, &mut attn_out,
@@ -7260,6 +7307,8 @@ impl LlamaModel {
                                 KvDtype::Mxfp4, &q_buf, &k_buf, &v_buf, k_packed, v_packed,
                                 &mut attn_out, li, cur_pos, n_heads, n_kv_heads, head_dim, max_ctx,
                                 kv_len, cfg.n_layers,
+                                // Hybrid (SSM/attn) layers never carry SWA/soft-cap: pass 0 / 0.0.
+                                0, 0.0,
                             );
                             if !no_qgate_enabled() {
                                 for (a, g) in attn_out.iter_mut().zip(attn_gate_buf.iter()) {
@@ -7272,6 +7321,8 @@ impl LlamaModel {
                                 KvDtype::Mxfp6, &q_buf, &k_buf, &v_buf, k_packed, v_packed,
                                 &mut attn_out, li, cur_pos, n_heads, n_kv_heads, head_dim, max_ctx,
                                 kv_len, cfg.n_layers,
+                                // Hybrid (SSM/attn) layers never carry SWA/soft-cap: pass 0 / 0.0.
+                                0, 0.0,
                             );
                             if !no_qgate_enabled() {
                                 for (a, g) in attn_out.iter_mut().zip(attn_gate_buf.iter()) {
@@ -7284,6 +7335,8 @@ impl LlamaModel {
                                 KvDtype::Mxfp8, &q_buf, &k_buf, &v_buf, k_packed, v_packed,
                                 &mut attn_out, li, cur_pos, n_heads, n_kv_heads, head_dim, max_ctx,
                                 kv_len, cfg.n_layers,
+                                // Hybrid (SSM/attn) layers never carry SWA/soft-cap: pass 0 / 0.0.
+                                0, 0.0,
                             );
                             if !no_qgate_enabled() {
                                 for (a, g) in attn_out.iter_mut().zip(attn_gate_buf.iter()) {
@@ -8298,65 +8351,81 @@ impl LlamaModel {
                             }
                             KvLayer::Q4_0 { k_q, v_q } => {
                                 sub_whiten = q4_0_whiten_active(head_dim);
+                                // SWA span (0 ⇒ full) + Gemma2 soft-cap (0.0 ⇒ none)
+                                // for this layer, threaded into the GPU + CPU paths.
+                                let swa_win = self.cfg.swa_window(li);
+                                let softcap = self.cfg.attn_logit_softcapping.unwrap_or(0.0);
                                 if !crate::accel::try_flash_attn_prefill_gpu_q4_0(
                                     &hoist_qrows[..nb * d_q], k_q, v_q,
                                     &mut hoist_attn_out[..nb * d_q],
                                     n_heads, n_kv_heads, head_dim, max_ctx,
-                                    kv_len_base, nb,
+                                    kv_len_base, nb, swa_win as u32, softcap,
                                 ) {
-                                    q4_0_kv::gqa_attention_flash_prefill_q4_0(
+                                    q4_0_kv::gqa_attention_flash_prefill_q4_0_capped_windowed(
                                         &hoist_qrows[..nb * d_q], k_q, v_q,
                                         &mut hoist_attn_out[..nb * d_q],
                                         n_heads, n_kv_heads, head_dim, max_ctx,
-                                        kv_len_base, nb,
+                                        kv_len_base, nb, swa_win, softcap,
                                     );
                                 }
                             }
                             KvLayer::Q8_0 { k_q, k_scales, v_q, v_scales } => {
                                 sub_whiten = false;
+                                // SWA span (0 ⇒ full) + Gemma2 soft-cap (0.0 ⇒ none)
+                                // for this layer, threaded into the GPU + CPU paths.
+                                let swa_win = self.cfg.swa_window(li);
+                                let softcap = self.cfg.attn_logit_softcapping.unwrap_or(0.0);
                                 if !crate::accel::try_flash_attn_prefill_gpu_q8_0(
                                     &hoist_qrows[..nb * d_q], k_q, k_scales, v_q, v_scales,
                                     &mut hoist_attn_out[..nb * d_q],
                                     n_heads, n_kv_heads, head_dim, max_ctx,
-                                    kv_len_base, nb,
+                                    kv_len_base, nb, swa_win as u32, softcap,
                                 ) {
-                                    k::gqa_attention_flash_prefill_q8_0(
+                                    k::gqa_attention_flash_prefill_q8_0_capped_windowed(
                                         &hoist_qrows[..nb * d_q], k_q, k_scales, v_q, v_scales,
                                         &mut hoist_attn_out[..nb * d_q],
                                         n_heads, n_kv_heads, head_dim, max_ctx,
-                                        kv_len_base, nb,
+                                        kv_len_base, nb, swa_win, softcap,
                                     );
                                 }
                             }
                             KvLayer::TurboQuant { bits, k_packed, k_scales, v_packed, v_scales } => {
                                 sub_whiten = false;
+                                // SWA span (0 ⇒ full) + Gemma2 soft-cap (0.0 ⇒ none)
+                                // for this layer, threaded into the GPU + CPU paths.
+                                let swa_win = self.cfg.swa_window(li);
+                                let softcap = self.cfg.attn_logit_softcapping.unwrap_or(0.0);
                                 if !crate::accel::try_flash_attn_prefill_gpu_tq(
                                     &hoist_qrows[..nb * d_q], k_packed, k_scales, v_packed, v_scales,
                                     *bits, &mut hoist_attn_out[..nb * d_q],
                                     n_heads, n_kv_heads, head_dim, max_ctx,
-                                    kv_len_base, nb,
+                                    kv_len_base, nb, swa_win as u32, softcap,
                                 ) {
-                                    rustllama_kernels_cpu::turboquant::gqa_attention_flash_prefill_tq(
+                                    rustllama_kernels_cpu::turboquant::gqa_attention_flash_prefill_tq_capped_windowed(
                                         &hoist_qrows[..nb * d_q], k_packed, k_scales, v_packed, v_scales,
                                         *bits, &mut hoist_attn_out[..nb * d_q],
                                         n_heads, n_kv_heads, head_dim, max_ctx,
-                                        kv_len_base, nb,
+                                        kv_len_base, nb, swa_win, softcap,
                                     );
                                 }
                             }
                             KvLayer::Nvfp4 { k_packed, v_packed } => {
                                 sub_whiten = false;
+                                // SWA span (0 ⇒ full) + Gemma2 soft-cap (0.0 ⇒ none)
+                                // for this layer, threaded into the GPU + CPU paths.
+                                let swa_win = self.cfg.swa_window(li);
+                                let softcap = self.cfg.attn_logit_softcapping.unwrap_or(0.0);
                                 if !crate::accel::try_flash_attn_prefill_gpu_nvfp4(
                                     &hoist_qrows[..nb * d_q], k_packed, v_packed,
                                     &mut hoist_attn_out[..nb * d_q],
                                     n_heads, n_kv_heads, head_dim, max_ctx,
-                                    kv_len_base, nb,
+                                    kv_len_base, nb, swa_win as u32, softcap,
                                 ) {
-                                    rustllama_kernels_cpu::nvfp4::gqa_attention_flash_prefill_nvfp4(
+                                    rustllama_kernels_cpu::nvfp4::gqa_attention_flash_prefill_nvfp4_capped_windowed(
                                         &hoist_qrows[..nb * d_q], k_packed, v_packed,
                                         &mut hoist_attn_out[..nb * d_q],
                                         n_heads, n_kv_heads, head_dim, max_ctx,
-                                        kv_len_base, nb,
+                                        kv_len_base, nb, swa_win, softcap,
                                     );
                                 }
                             }
@@ -8364,43 +8433,61 @@ impl LlamaModel {
                             // per-position quantize pass); no whitening.
                             KvLayer::Mxfp4 { k_packed, v_packed } => {
                                 sub_whiten = false;
+                                // SWA span (0 ⇒ full) + Gemma2 soft-cap (0.0 ⇒ none)
+                                // for this layer, threaded into the GPU + CPU paths.
+                                let swa_win = self.cfg.swa_window(li);
+                                let softcap = self.cfg.attn_logit_softcapping.unwrap_or(0.0);
                                 if !crate::accel::try_flash_attn_prefill_gpu_mxfp4(
                                     &hoist_qrows[..nb * d_q], k_packed, v_packed,
                                     &mut hoist_attn_out[..nb * d_q],
                                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, nb,
+                                    swa_win as u32, softcap,
                                 ) {
-                                    rustllama_kernels_cpu::mxfp_kv::gqa_attention_flash_prefill_mxfp4(
+                                    rustllama_kernels_cpu::mxfp_kv::gqa_attention_flash_prefill_mxfp4_capped_windowed(
                                         &hoist_qrows[..nb * d_q], k_packed, v_packed,
                                         &mut hoist_attn_out[..nb * d_q],
                                         n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, nb,
+                                        swa_win, softcap,
                                     );
                                 }
                             }
                             KvLayer::Mxfp6 { k_packed, v_packed } => {
                                 sub_whiten = false;
+                                // SWA span (0 ⇒ full) + Gemma2 soft-cap (0.0 ⇒ none)
+                                // for this layer, threaded into the GPU + CPU paths.
+                                let swa_win = self.cfg.swa_window(li);
+                                let softcap = self.cfg.attn_logit_softcapping.unwrap_or(0.0);
                                 if !crate::accel::try_flash_attn_prefill_gpu_mxfp6(
                                     &hoist_qrows[..nb * d_q], k_packed, v_packed,
                                     &mut hoist_attn_out[..nb * d_q],
                                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, nb,
+                                    swa_win as u32, softcap,
                                 ) {
-                                    rustllama_kernels_cpu::mxfp_kv::gqa_attention_flash_prefill_mxfp6(
+                                    rustllama_kernels_cpu::mxfp_kv::gqa_attention_flash_prefill_mxfp6_capped_windowed(
                                         &hoist_qrows[..nb * d_q], k_packed, v_packed,
                                         &mut hoist_attn_out[..nb * d_q],
                                         n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, nb,
+                                        swa_win, softcap,
                                     );
                                 }
                             }
                             KvLayer::Mxfp8 { k_packed, v_packed } => {
                                 sub_whiten = false;
+                                // SWA span (0 ⇒ full) + Gemma2 soft-cap (0.0 ⇒ none)
+                                // for this layer, threaded into the GPU + CPU paths.
+                                let swa_win = self.cfg.swa_window(li);
+                                let softcap = self.cfg.attn_logit_softcapping.unwrap_or(0.0);
                                 if !crate::accel::try_flash_attn_prefill_gpu_mxfp8(
                                     &hoist_qrows[..nb * d_q], k_packed, v_packed,
                                     &mut hoist_attn_out[..nb * d_q],
                                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, nb,
+                                    swa_win as u32, softcap,
                                 ) {
-                                    rustllama_kernels_cpu::mxfp_kv::gqa_attention_flash_prefill_mxfp8(
+                                    rustllama_kernels_cpu::mxfp_kv::gqa_attention_flash_prefill_mxfp8_capped_windowed(
                                         &hoist_qrows[..nb * d_q], k_packed, v_packed,
                                         &mut hoist_attn_out[..nb * d_q],
                                         n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, nb,
+                                        swa_win, softcap,
                                     );
                                 }
                             }
@@ -9634,6 +9721,12 @@ impl LlamaModel {
                         max_ctx as u32,
                         cfg.n_layers as u32,
                     );
+                    // SWA span for this layer (0 ⇒ full causal) + Gemma2
+                    // attn-logit soft-cap (0.0 ⇒ no cap), threaded into the GPU
+                    // dispatch AND the CPU capped+windowed fallback below
+                    // (passthrough at 0 / 0.0 ⇒ bit-identical to the base path).
+                    let swa_win = cfg.swa_window(layer_idx);
+                    let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
                     if !crate::accel::try_flash_attn_decode_gpu_q8_0(
                         &q_buf,
                         &k_buf,
@@ -9646,10 +9739,12 @@ impl LlamaModel {
                         head_dim as u32,
                         max_ctx as u32,
                         cfg.n_layers as u32,
+                        swa_win as u32,
+                        softcap,
                     ) {
                     let flash_min = flash_kv_len_min();
                     if crate::accel::flash_attention_enabled() && kv_len >= flash_min {
-                        k::gqa_attention_flash_decode_q8_0(
+                        k::gqa_attention_flash_decode_q8_0_capped_windowed(
                             &q_buf,
                             k_q,
                             k_scales,
@@ -9661,9 +9756,11 @@ impl LlamaModel {
                             head_dim,
                             max_ctx,
                             kv_len,
+                            swa_win,
+                            softcap,
                         );
                     } else {
-                        k::gqa_attention_one_step_q8_0(
+                        k::gqa_attention_one_step_q8_0_capped_windowed(
                             &q_buf,
                             k_q,
                             k_scales,
@@ -9675,6 +9772,8 @@ impl LlamaModel {
                             head_dim,
                             max_ctx,
                             kv_len,
+                            swa_win,
+                            softcap,
                         );
                     }
                     } // end else: CPU Q8_0 attention (GPU declined)
@@ -9754,6 +9853,12 @@ impl LlamaModel {
                         max_ctx as u32,
                         cfg.n_layers as u32,
                     );
+                    // SWA span for this layer (0 ⇒ full causal) + Gemma2
+                    // attn-logit soft-cap (0.0 ⇒ no cap), threaded into the GPU
+                    // dispatch AND the CPU capped+windowed fallback below
+                    // (passthrough at 0 / 0.0 ⇒ bit-identical to the base path).
+                    let swa_win = cfg.swa_window(layer_idx);
+                    let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
                     if !crate::accel::try_flash_attn_decode_gpu_tq(
                         &q_buf,
                         &k_buf,
@@ -9767,10 +9872,12 @@ impl LlamaModel {
                         head_dim as u32,
                         max_ctx as u32,
                         cfg.n_layers as u32,
+                        swa_win as u32,
+                        softcap,
                     ) {
                     let flash_min = flash_kv_len_min();
                     if crate::accel::flash_attention_enabled() && kv_len >= flash_min {
-                        rustllama_kernels_cpu::turboquant::gqa_attention_flash_decode_tq(
+                        rustllama_kernels_cpu::turboquant::gqa_attention_flash_decode_tq_capped_windowed(
                             &q_buf,
                             k_packed,
                             k_scales,
@@ -9783,9 +9890,11 @@ impl LlamaModel {
                             head_dim,
                             max_ctx,
                             kv_len,
+                            swa_win,
+                            softcap,
                         );
                     } else {
-                        rustllama_kernels_cpu::turboquant::gqa_attention_one_step_tq(
+                        rustllama_kernels_cpu::turboquant::gqa_attention_one_step_tq_capped_windowed(
                             &q_buf,
                             k_packed,
                             k_scales,
@@ -9798,6 +9907,8 @@ impl LlamaModel {
                             head_dim,
                             max_ctx,
                             kv_len,
+                            swa_win,
+                            softcap,
                         );
                     }
                     } // end else: CPU TurboQuant attention (GPU declined)
@@ -9861,6 +9972,12 @@ impl LlamaModel {
                         max_ctx as u32,
                         cfg.n_layers as u32,
                     );
+                    // SWA span for this layer (0 ⇒ full causal) + Gemma2
+                    // attn-logit soft-cap (0.0 ⇒ no cap), threaded into the GPU
+                    // dispatch AND both CPU fallbacks below (the flash kernel and
+                    // the slab-dequant one_step); passthrough at 0 / 0.0.
+                    let swa_win = cfg.swa_window(layer_idx);
+                    let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
                     if !crate::accel::try_flash_attn_decode_gpu_nvfp4(
                         &q_buf,
                         &k_buf,
@@ -9873,10 +9990,12 @@ impl LlamaModel {
                         head_dim as u32,
                         max_ctx as u32,
                         cfg.n_layers as u32,
+                        swa_win as u32,
+                        softcap,
                     ) {
                     let flash_min = flash_kv_len_min();
                     if crate::accel::flash_attention_enabled() && kv_len >= flash_min {
-                        rustllama_kernels_cpu::nvfp4::gqa_attention_flash_decode_nvfp4(
+                        rustllama_kernels_cpu::nvfp4::gqa_attention_flash_decode_nvfp4_capped_windowed(
                             &q_buf,
                             k_packed,
                             v_packed,
@@ -9886,6 +10005,8 @@ impl LlamaModel {
                             head_dim,
                             max_ctx,
                             kv_len,
+                            swa_win,
+                            softcap,
                         );
                     } else {
                         let mut k_f32 = vec![0f32; n_kv_heads * max_ctx * head_dim];
@@ -9919,7 +10040,7 @@ impl LlamaModel {
                                 }
                             }
                         }
-                        k::gqa_attention_one_step(
+                        k::gqa_attention_one_step_capped_windowed(
                             &q_buf,
                             &k_f32,
                             &v_f32,
@@ -9929,24 +10050,31 @@ impl LlamaModel {
                             head_dim,
                             max_ctx,
                             kv_len,
+                            swa_win,
+                            softcap,
                         );
                     }
                     } // end else: CPU NVFP4 attention (GPU declined)
                 }
+                // Dense MXFP decode: SWA window + Gemma2 soft-cap for this layer
+                // thread straight into the helper (passthrough at 0 / 0.0).
                 KvLayer::Mxfp4 { k_packed, v_packed } => mxfp_kv_decode(
                     KvDtype::Mxfp4, &q_buf, &k_buf, &v_buf, k_packed, v_packed, &mut attn_out,
                     layer_idx, cur_pos, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
                     cfg.n_layers,
+                    cfg.swa_window(layer_idx) as u32, cfg.attn_logit_softcapping.unwrap_or(0.0),
                 ),
                 KvLayer::Mxfp6 { k_packed, v_packed } => mxfp_kv_decode(
                     KvDtype::Mxfp6, &q_buf, &k_buf, &v_buf, k_packed, v_packed, &mut attn_out,
                     layer_idx, cur_pos, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
                     cfg.n_layers,
+                    cfg.swa_window(layer_idx) as u32, cfg.attn_logit_softcapping.unwrap_or(0.0),
                 ),
                 KvLayer::Mxfp8 { k_packed, v_packed } => mxfp_kv_decode(
                     KvDtype::Mxfp8, &q_buf, &k_buf, &v_buf, k_packed, v_packed, &mut attn_out,
                     layer_idx, cur_pos, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
                     cfg.n_layers,
+                    cfg.swa_window(layer_idx) as u32, cfg.attn_logit_softcapping.unwrap_or(0.0),
                 ),
                 KvLayer::Q4_0 { k_q, v_q } => {
                     use rustllama_kernels_cpu::q4_0_kv;
@@ -10015,6 +10143,12 @@ impl LlamaModel {
                         max_ctx as u32,
                         cfg.n_layers as u32,
                     );
+                    // SWA span for this layer (0 ⇒ full causal) + Gemma2
+                    // attn-logit soft-cap (0.0 ⇒ no cap), threaded into the GPU
+                    // dispatch AND both CPU fallbacks below (the flash kernel and
+                    // the slab-dequant one_step); passthrough at 0 / 0.0.
+                    let swa_win = cfg.swa_window(layer_idx);
+                    let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
                     if !crate::accel::try_flash_attn_decode_gpu_q4_0(
                         &q_buf,
                         &k_buf,
@@ -10027,10 +10161,12 @@ impl LlamaModel {
                         head_dim as u32,
                         max_ctx as u32,
                         cfg.n_layers as u32,
+                        swa_win as u32,
+                        softcap,
                     ) {
                     let flash_min = flash_kv_len_min();
                     if crate::accel::flash_attention_enabled() && kv_len >= flash_min {
-                        q4_0_kv::gqa_attention_flash_decode_q4_0(
+                        q4_0_kv::gqa_attention_flash_decode_q4_0_capped_windowed(
                             &q_buf,
                             k_q,
                             v_q,
@@ -10040,6 +10176,8 @@ impl LlamaModel {
                             head_dim,
                             max_ctx,
                             kv_len,
+                            swa_win,
+                            softcap,
                         );
                     } else {
                         let mut k_f32 = vec![0f32; n_kv_heads * max_ctx * head_dim];
@@ -10059,7 +10197,7 @@ impl LlamaModel {
                                 );
                             }
                         }
-                        k::gqa_attention_one_step(
+                        k::gqa_attention_one_step_capped_windowed(
                             &q_buf,
                             &k_f32,
                             &v_f32,
@@ -10069,6 +10207,8 @@ impl LlamaModel {
                             head_dim,
                             max_ctx,
                             kv_len,
+                            swa_win,
+                            softcap,
                         );
                     }
                     } // end else: CPU Q4_0 attention (GPU declined)

@@ -15296,6 +15296,89 @@ fn gqa_attention_one_step_q8_0_scalar(
     }
 }
 
+/// Sliding-window + Gemma2 soft-cap variant of [`gqa_attention_one_step_q8_0`].
+/// `window == 0` attends `[0, kv_len)`; otherwise the DECODE window
+/// `[kv_len-window, kv_len)`. `softcap > 0.0` applies the attention-logit cap
+/// `s = c*tanh(s/c)` — where `s` is the SCALED logit that already folds in the
+/// per-row k_scale (`raw_dot * k_scale * attn_scale`) — before softmax (Gemma2).
+/// `window == 0 && softcap == 0.0` delegates to the SIMD-dispatched base kernel
+/// (BIT-IDENTICAL); otherwise a scalar windowed 3-pass reproduces the q8_0 row-
+/// scale factoring exactly.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn gqa_attention_one_step_q8_0_capped_windowed(
+    q: &[f32],
+    k_q: &[i8],
+    k_scales: &[f32],
+    v_q: &[i8],
+    v_scales: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len: usize,
+    window: usize,
+    softcap: f32,
+) {
+    debug_assert_eq!(q.len(), n_heads * head_dim);
+    debug_assert_eq!(out.len(), n_heads * head_dim);
+    debug_assert_eq!(k_q.len(), n_kv_heads * max_ctx * head_dim);
+    debug_assert_eq!(v_q.len(), n_kv_heads * max_ctx * head_dim);
+    debug_assert_eq!(k_scales.len(), n_kv_heads * max_ctx);
+    debug_assert_eq!(v_scales.len(), n_kv_heads * max_ctx);
+    debug_assert!(kv_len <= max_ctx);
+    // Full-causal, no cap ⇒ the SIMD-dispatched base kernel, bit-identical.
+    if window == 0 && softcap <= 0.0 {
+        gqa_attention_one_step_q8_0(
+            q, k_q, k_scales, v_q, v_scales, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        );
+        return;
+    }
+    let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+    let start = start.min(kv_len);
+    let win = kv_len - start;
+    let n_gqa = n_heads / n_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut scores = vec![0.0f32; win];
+    for h in 0..n_heads {
+        let kv_h = h / n_gqa;
+        let q_h = &q[h * head_dim..(h + 1) * head_dim];
+        for (i, t) in (start..kv_len).enumerate() {
+            let row_idx = kv_h * max_ctx + t;
+            let k_off = row_idx * head_dim;
+            let k_row = &k_q[k_off..k_off + head_dim];
+            let row_scale = k_scales[row_idx];
+            let mut acc = 0.0f32;
+            for d in 0..head_dim {
+                acc += q_h[d] * (k_row[d] as f32);
+            }
+            // Scaled logit includes the per-row k_scale; the Gemma2 cap applies
+            // to THAT. No-op at softcap == 0.0.
+            let s = acc * row_scale * scale;
+            scores[i] = if softcap > 0.0 {
+                softcap * (s / softcap).tanh()
+            } else {
+                s
+            };
+        }
+        softmax_f32_inplace(&mut scores);
+        let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
+        for v in out_h.iter_mut() {
+            *v = 0.0;
+        }
+        for (i, t) in (start..kv_len).enumerate() {
+            let row_idx = kv_h * max_ctx + t;
+            let v_off = row_idx * head_dim;
+            let v_row = &v_q[v_off..v_off + head_dim];
+            let row_scale = v_scales[row_idx];
+            let s_eff = scores[i] * row_scale;
+            for d in 0..head_dim {
+                out_h[d] += s_eff * (v_row[d] as f32);
+            }
+        }
+    }
+}
+
 /// FlashAttention-decode variant of [`gqa_attention_one_step_q8_0`].
 /// Mirrors the F32 + TQ flash kernels — fuses Q·Kᵀ, softmax, and ·V
 /// into a single pass over `kv_len` with the online-softmax
@@ -15422,6 +15505,95 @@ fn gqa_attention_flash_decode_q8_0_scalar(
     }
 }
 
+/// Sliding-window + Gemma2 soft-cap variant of [`gqa_attention_flash_decode_q8_0`].
+/// `window == 0` attends `[0, kv_len)`; otherwise the DECODE window
+/// `[kv_len-window, kv_len)`. `softcap > 0.0` applies `s = c*tanh(s/c)` to the
+/// SCALED logit (which already folds in the per-row k_scale) before the
+/// online-softmax max/exp (Gemma2). `window == 0 && softcap == 0.0` delegates to
+/// the SIMD-dispatched base kernel (BIT-IDENTICAL); otherwise a scalar windowed
+/// online-softmax reproduces the q8_0 row-scale factoring exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_flash_decode_q8_0_capped_windowed(
+    q: &[f32],
+    k_q: &[i8],
+    k_scales: &[f32],
+    v_q: &[i8],
+    v_scales: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len: usize,
+    window: usize,
+    softcap: f32,
+) {
+    debug_assert_eq!(q.len(), n_heads * head_dim);
+    debug_assert_eq!(out.len(), n_heads * head_dim);
+    debug_assert_eq!(k_q.len(), n_kv_heads * max_ctx * head_dim);
+    debug_assert_eq!(v_q.len(), n_kv_heads * max_ctx * head_dim);
+    debug_assert_eq!(k_scales.len(), n_kv_heads * max_ctx);
+    debug_assert_eq!(v_scales.len(), n_kv_heads * max_ctx);
+    debug_assert!(kv_len <= max_ctx);
+    if kv_len == 0 {
+        for v in out.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
+    // Full-causal, no cap ⇒ the SIMD-dispatched base kernel, bit-identical.
+    if window == 0 && softcap <= 0.0 {
+        gqa_attention_flash_decode_q8_0(
+            q, k_q, k_scales, v_q, v_scales, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        );
+        return;
+    }
+    let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+    let n_gqa = n_heads / n_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    for h in 0..n_heads {
+        let kv_h = h / n_gqa;
+        let q_h = &q[h * head_dim..(h + 1) * head_dim];
+        let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
+        for v in out_h.iter_mut() {
+            *v = 0.0;
+        }
+        let mut m = f32::NEG_INFINITY;
+        let mut l = 0.0f32;
+        for t in start..kv_len {
+            let row_idx = kv_h * max_ctx + t;
+            let k_off = row_idx * head_dim;
+            let k_row = &k_q[k_off..k_off + head_dim];
+            let k_row_scale = k_scales[row_idx];
+            let mut s = 0.0f32;
+            for d in 0..head_dim {
+                s += q_h[d] * (k_row[d] as f32);
+            }
+            s *= k_row_scale * scale;
+            // Gemma2 soft-cap on the scaled logit (no-op at softcap == 0.0).
+            if softcap > 0.0 {
+                s = softcap * (s / softcap).tanh();
+            }
+            let m_new = m.max(s);
+            let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+            let p = (s - m_new).exp();
+            l = l * rescale + p;
+            let v_off = row_idx * head_dim;
+            let v_row = &v_q[v_off..v_off + head_dim];
+            let v_row_scale = v_scales[row_idx];
+            let p_eff = p * v_row_scale;
+            for d in 0..head_dim {
+                out_h[d] = out_h[d] * rescale + p_eff * (v_row[d] as f32);
+            }
+            m = m_new;
+        }
+        let inv_l = if l > 0.0 { 1.0 / l } else { 0.0 };
+        for v in out_h.iter_mut() {
+            *v *= inv_l;
+        }
+    }
+}
+
 /// Multi-query FlashAttention prefill for Q8_0 KV. Same online-
 /// softmax + inline-dequant pattern as
 /// [`gqa_attention_flash_decode_q8_0`] but processes `n_new`
@@ -15532,6 +15704,99 @@ fn gqa_attention_flash_prefill_q8_0_scalar(
                     s += q_h[d] * (k_row[d] as f32);
                 }
                 s *= k_row_scale * scale;
+                let m_new = m.max(s);
+                let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+                let p = (s - m_new).exp();
+                l = l * rescale + p;
+                let v_off = row_idx * head_dim;
+                let v_row = &v_q[v_off..v_off + head_dim];
+                let v_row_scale = v_scales[row_idx];
+                let p_eff = p * v_row_scale;
+                for d in 0..head_dim {
+                    out_h[d] = out_h[d] * rescale + p_eff * (v_row[d] as f32);
+                }
+                m = m_new;
+            }
+            let inv_l = if l > 0.0 { 1.0 / l } else { 0.0 };
+            for v in out_h.iter_mut() {
+                *v *= inv_l;
+            }
+        }
+    }
+}
+
+/// Sliding-window + Gemma2 soft-cap variant of [`gqa_attention_flash_prefill_q8_0`].
+/// Query `i` (abs pos `kv_len_base + i`) attends `[start_i, kv_len_i)` where
+/// `kv_len_i = kv_len_base + i + 1` and `start_i = kv_len_i.saturating_sub(window)`
+/// (window 0 ⇒ full causal). `softcap > 0.0` applies `s = c*tanh(s/c)` to the
+/// scaled logit (per-row k_scale already folded in) before the online-softmax
+/// max/exp. `window == 0 && softcap == 0.0` delegates to the SIMD-dispatched base
+/// kernel (BIT-IDENTICAL); otherwise a scalar windowed online-softmax reproduces
+/// the q8_0 row-scale factoring exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_flash_prefill_q8_0_capped_windowed(
+    q: &[f32],
+    k_q: &[i8],
+    k_scales: &[f32],
+    v_q: &[i8],
+    v_scales: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_len_base: usize,
+    n_new: usize,
+    window: usize,
+    softcap: f32,
+) {
+    debug_assert_eq!(q.len(), n_new * n_heads * head_dim);
+    debug_assert_eq!(out.len(), n_new * n_heads * head_dim);
+    debug_assert_eq!(k_q.len(), n_kv_heads * max_ctx * head_dim);
+    debug_assert_eq!(v_q.len(), n_kv_heads * max_ctx * head_dim);
+    debug_assert_eq!(k_scales.len(), n_kv_heads * max_ctx);
+    debug_assert_eq!(v_scales.len(), n_kv_heads * max_ctx);
+    debug_assert!(kv_len_base + n_new <= max_ctx);
+    if n_new == 0 {
+        return;
+    }
+    // Full-causal, no cap ⇒ the SIMD-dispatched base kernel, bit-identical.
+    if window == 0 && softcap <= 0.0 {
+        gqa_attention_flash_prefill_q8_0(
+            q, k_q, k_scales, v_q, v_scales, out, n_heads, n_kv_heads, head_dim, max_ctx,
+            kv_len_base, n_new,
+        );
+        return;
+    }
+    let n_gqa = n_heads / n_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    for i in 0..n_new {
+        let kv_len_i = kv_len_base + i + 1;
+        let start_i = if window > 0 { kv_len_i.saturating_sub(window) } else { 0 };
+        let q_base = i * n_heads * head_dim;
+        let out_base = i * n_heads * head_dim;
+        for h in 0..n_heads {
+            let kv_h = h / n_gqa;
+            let q_h = &q[q_base + h * head_dim..q_base + (h + 1) * head_dim];
+            let out_h = &mut out[out_base + h * head_dim..out_base + (h + 1) * head_dim];
+            for v in out_h.iter_mut() {
+                *v = 0.0;
+            }
+            let mut m = f32::NEG_INFINITY;
+            let mut l = 0.0f32;
+            for t in start_i..kv_len_i {
+                let row_idx = kv_h * max_ctx + t;
+                let k_off = row_idx * head_dim;
+                let k_row = &k_q[k_off..k_off + head_dim];
+                let k_row_scale = k_scales[row_idx];
+                let mut s = 0.0f32;
+                for d in 0..head_dim {
+                    s += q_h[d] * (k_row[d] as f32);
+                }
+                s *= k_row_scale * scale;
+                if softcap > 0.0 {
+                    s = softcap * (s / softcap).tanh();
+                }
                 let m_new = m.max(s);
                 let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
                 let p = (s - m_new).exp();
@@ -16348,6 +16613,179 @@ mod tests {
             max_err < 1e-5,
             "Q8_0 flash vs standard max abs error {max_err} > 1e-5",
         );
+    }
+
+    // ---- Q8_0 sliding-window + Gemma2 soft-cap (`_capped_windowed`) tests ----
+
+    /// Build a deterministic Q8_0 KV cache (per-row absmax/127 scale).
+    fn q8_0_build_cache(
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx: usize,
+        positions: usize,
+    ) -> (Vec<i8>, Vec<f32>, Vec<i8>, Vec<f32>) {
+        let mut k_q = vec![0i8; n_kv_heads * max_ctx * head_dim];
+        let mut v_q = vec![0i8; n_kv_heads * max_ctx * head_dim];
+        let mut k_scales = vec![0f32; n_kv_heads * max_ctx];
+        let mut v_scales = vec![0f32; n_kv_heads * max_ctx];
+        for kv_h in 0..n_kv_heads {
+            for t in 0..positions {
+                let row_idx = kv_h * max_ctx + t;
+                let off = row_idx * head_dim;
+                let k_row: Vec<f32> = (0..head_dim)
+                    .map(|d| ((kv_h * 7 + t * 3 + d) % 13) as f32 * 0.1 - 0.6)
+                    .collect();
+                let absmax = k_row.iter().fold(0f32, |a, b| a.max(b.abs()));
+                let sc = if absmax > 0.0 { absmax / 127.0 } else { 1.0 };
+                k_scales[row_idx] = sc;
+                for d in 0..head_dim {
+                    k_q[off + d] = (k_row[d] / sc).round().clamp(-128.0, 127.0) as i8;
+                }
+                let v_row: Vec<f32> = (0..head_dim)
+                    .map(|d| ((kv_h * 5 + t * 2 + d) % 11) as f32 * 0.15 - 0.7)
+                    .collect();
+                let absmax = v_row.iter().fold(0f32, |a, b| a.max(b.abs()));
+                let sc = if absmax > 0.0 { absmax / 127.0 } else { 1.0 };
+                v_scales[row_idx] = sc;
+                for d in 0..head_dim {
+                    v_q[off + d] = (v_row[d] / sc).round().clamp(-128.0, 127.0) as i8;
+                }
+            }
+        }
+        (k_q, k_scales, v_q, v_scales)
+    }
+
+    /// Naive windowed + soft-capped decode-step reference over DEQUANTIZED
+    /// Q8_0 K/V (`k_dequant[d] = k_q[d] * k_scale`). The scaled logit therefore
+    /// folds in the per-row k_scale exactly as the kernel does.
+    #[allow(clippy::too_many_arguments)]
+    fn naive_q8_0_decode_ref(
+        q: &[f32],
+        k_q: &[i8],
+        k_scales: &[f32],
+        v_q: &[i8],
+        v_scales: &[f32],
+        out: &mut [f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx: usize,
+        kv_len: usize,
+        window: usize,
+        softcap: f32,
+    ) {
+        let n_gqa = n_heads / n_kv_heads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+        for h in 0..n_heads {
+            let kv_h = h / n_gqa;
+            let q_h = &q[h * head_dim..(h + 1) * head_dim];
+            let mut scores = Vec::new();
+            for t in start..kv_len {
+                let row_idx = kv_h * max_ctx + t;
+                let k_off = row_idx * head_dim;
+                let ks = k_scales[row_idx];
+                let mut acc = 0f32;
+                for d in 0..head_dim {
+                    acc += q_h[d] * (k_q[k_off + d] as f32 * ks);
+                }
+                let mut s = acc * scale;
+                if softcap > 0.0 {
+                    s = softcap * (s / softcap).tanh();
+                }
+                scores.push(s);
+            }
+            let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut denom = 0f32;
+            for s in scores.iter_mut() {
+                *s = (*s - m).exp();
+                denom += *s;
+            }
+            let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
+            for v in out_h.iter_mut() {
+                *v = 0.0;
+            }
+            for (i, t) in (start..kv_len).enumerate() {
+                let row_idx = kv_h * max_ctx + t;
+                let v_off = row_idx * head_dim;
+                let vs = v_scales[row_idx];
+                let w = if denom > 0.0 { scores[i] / denom } else { 0.0 };
+                for d in 0..head_dim {
+                    out_h[d] += w * (v_q[v_off + d] as f32 * vs);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q8_0_capped_windowed_passthrough_bit_identical() {
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 16;
+        let max_ctx = 64;
+        let kv_len = 20;
+        let (k_q, k_scales, v_q, v_scales) = q8_0_build_cache(n_kv_heads, head_dim, max_ctx, kv_len);
+        let q: Vec<f32> = (0..n_heads * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.12).collect();
+
+        // Decode passthrough.
+        let mut base = vec![0f32; n_heads * head_dim];
+        let mut cw = vec![0f32; n_heads * head_dim];
+        gqa_attention_flash_decode_q8_0(&q, &k_q, &k_scales, &v_q, &v_scales, &mut base, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
+        gqa_attention_flash_decode_q8_0_capped_windowed(&q, &k_q, &k_scales, &v_q, &v_scales, &mut cw, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0);
+        assert_eq!(base, cw, "q8_0 flash-decode passthrough not bit-identical");
+
+        // One-step passthrough.
+        let mut base_os = vec![0f32; n_heads * head_dim];
+        let mut cw_os = vec![0f32; n_heads * head_dim];
+        gqa_attention_one_step_q8_0(&q, &k_q, &k_scales, &v_q, &v_scales, &mut base_os, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
+        gqa_attention_one_step_q8_0_capped_windowed(&q, &k_q, &k_scales, &v_q, &v_scales, &mut cw_os, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0);
+        assert_eq!(base_os, cw_os, "q8_0 one-step passthrough not bit-identical");
+
+        // Prefill passthrough.
+        let kv_len_base = 8;
+        let n_new = 6;
+        let (k_q2, k_scales2, v_q2, v_scales2) = q8_0_build_cache(n_kv_heads, head_dim, max_ctx, kv_len_base + n_new);
+        let qp: Vec<f32> = (0..n_new * n_heads * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.12).collect();
+        let mut base_pf = vec![0f32; n_new * n_heads * head_dim];
+        let mut cw_pf = vec![0f32; n_new * n_heads * head_dim];
+        gqa_attention_flash_prefill_q8_0(&qp, &k_q2, &k_scales2, &v_q2, &v_scales2, &mut base_pf, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new);
+        gqa_attention_flash_prefill_q8_0_capped_windowed(&qp, &k_q2, &k_scales2, &v_q2, &v_scales2, &mut cw_pf, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, 0, 0.0);
+        assert_eq!(base_pf, cw_pf, "q8_0 flash-prefill passthrough not bit-identical");
+    }
+
+    #[test]
+    fn q8_0_windowed_and_softcap_match_naive() {
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 16;
+        let max_ctx = 64;
+        let kv_len = 5;
+        let (k_q, k_scales, v_q, v_scales) = q8_0_build_cache(n_kv_heads, head_dim, max_ctx, kv_len);
+        let q: Vec<f32> = (0..n_heads * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.12).collect();
+
+        // (b) windowed: window=2, kv_len=5 — flash-decode AND one_step match naive.
+        let mut naive = vec![0f32; n_heads * head_dim];
+        naive_q8_0_decode_ref(&q, &k_q, &k_scales, &v_q, &v_scales, &mut naive, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 2, 0.0);
+        let mut flash = vec![0f32; n_heads * head_dim];
+        gqa_attention_flash_decode_q8_0_capped_windowed(&q, &k_q, &k_scales, &v_q, &v_scales, &mut flash, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 2, 0.0);
+        let mut os = vec![0f32; n_heads * head_dim];
+        gqa_attention_one_step_q8_0_capped_windowed(&q, &k_q, &k_scales, &v_q, &v_scales, &mut os, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 2, 0.0);
+        for ((f, o), n) in flash.iter().zip(os.iter()).zip(naive.iter()) {
+            assert!((f - n).abs() < 1e-5, "q8_0 windowed flash {f} vs naive {n}");
+            assert!((o - n).abs() < 1e-5, "q8_0 windowed one_step {o} vs naive {n}");
+        }
+
+        // (c) soft-cap: softcap=50.0, full window.
+        let mut naive_sc = vec![0f32; n_heads * head_dim];
+        naive_q8_0_decode_ref(&q, &k_q, &k_scales, &v_q, &v_scales, &mut naive_sc, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 50.0);
+        let mut flash_sc = vec![0f32; n_heads * head_dim];
+        gqa_attention_flash_decode_q8_0_capped_windowed(&q, &k_q, &k_scales, &v_q, &v_scales, &mut flash_sc, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 50.0);
+        let mut os_sc = vec![0f32; n_heads * head_dim];
+        gqa_attention_one_step_q8_0_capped_windowed(&q, &k_q, &k_scales, &v_q, &v_scales, &mut os_sc, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 50.0);
+        for ((f, o), n) in flash_sc.iter().zip(os_sc.iter()).zip(naive_sc.iter()) {
+            assert!((f - n).abs() < 1e-5, "q8_0 softcap flash {f} vs naive {n}");
+            assert!((o - n).abs() < 1e-5, "q8_0 softcap one_step {o} vs naive {n}");
+        }
     }
 
     #[test]

@@ -401,7 +401,8 @@ static int mlx_gate_up_fused_align(rsl_mlx_stream *s, NSString *kernel_name,
 static int mlx_flash_kv_decode(rsl_mlx_stream *s, NSString *name, const float *q,
                                const void *k, const void *v, float *out,
                                int n_heads, int n_kv_heads, int head_dim,
-                               int max_ctx, int kv_len, int k_align) {
+                               int max_ctx, int kv_len, int window, float softcap,
+                               int k_align) {
     if (!s || !q || !k || !v || !out) return -1;
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || kv_len <= 0) return -1;
     if ((n_heads % n_kv_heads) != 0 || head_dim > 256 || (head_dim % k_align) != 0) return -1;
@@ -409,6 +410,7 @@ static int mlx_flash_kv_decode(rsl_mlx_stream *s, NSString *name, const float *q
     id<MTLBuffer> bq = mlx_resolve(q, &oq), bk = mlx_resolve(k, &ok), bv = mlx_resolve(v, &ov), bo = mlx_resolve(out, &oo);
     if (bq == nil || bk == nil || bv == nil || bo == nil) { g_rsl_mlx_errors++; return -1; }
     int nh = n_heads, nkv = n_kv_heads, hd = head_dim, mc = max_ctx, kl = kv_len;
+    int win = window; float sc = softcap;
     MTLSize grid = MTLSizeMake((NSUInteger)n_heads, 1, 1), tpg = MTLSizeMake(32, 1, 1);
     return mlx_run(s, name, grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bq offset:oq atIndex:0];
@@ -420,12 +422,16 @@ static int mlx_flash_kv_decode(rsl_mlx_stream *s, NSString *name, const float *q
         [enc setBytes:&hd length:sizeof(int) atIndex:6];
         [enc setBytes:&mc length:sizeof(int) atIndex:7];
         [enc setBytes:&kl length:sizeof(int) atIndex:8];
+        // SWA window + Gemma2 soft-cap (0/0 => byte-identical).
+        [enc setBytes:&win length:sizeof(int) atIndex:9];
+        [enc setBytes:&sc length:sizeof(float) atIndex:10];
     });
 }
 static int mlx_flash_kv_prefill(rsl_mlx_stream *s, NSString *name, const float *q,
                                 const void *k, const void *v, float *out,
                                 int n_heads, int n_kv_heads, int head_dim,
-                                int max_ctx, int kv_len_base, int n_new, int k_align) {
+                                int max_ctx, int kv_len_base, int n_new, int window, float softcap,
+                                int k_align) {
     if (!s || !q || !k || !v || !out) return -1;
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return -1;
     if ((n_heads % n_kv_heads) != 0 || head_dim > 256 || (head_dim % k_align) != 0) return -1;
@@ -434,6 +440,7 @@ static int mlx_flash_kv_prefill(rsl_mlx_stream *s, NSString *name, const float *
     id<MTLBuffer> bq = mlx_resolve(q, &oq), bk = mlx_resolve(k, &ok), bv = mlx_resolve(v, &ov), bo = mlx_resolve(out, &oo);
     if (bq == nil || bk == nil || bv == nil || bo == nil) { g_rsl_mlx_errors++; return -1; }
     int nh = n_heads, nkv = n_kv_heads, hd = head_dim, mc = max_ctx, kb = kv_len_base, nn = n_new;
+    int win = window; float sc = softcap;
     MTLSize grid = MTLSizeMake((NSUInteger)n_heads, (NSUInteger)n_new, 1), tpg = MTLSizeMake(32, 1, 1);
     return mlx_run(s, name, grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bq offset:oq atIndex:0];
@@ -446,6 +453,9 @@ static int mlx_flash_kv_prefill(rsl_mlx_stream *s, NSString *name, const float *
         [enc setBytes:&mc length:sizeof(int) atIndex:7];
         [enc setBytes:&kb length:sizeof(int) atIndex:8];
         [enc setBytes:&nn length:sizeof(int) atIndex:9];
+        // SWA window + Gemma2 soft-cap (0/0 => byte-identical).
+        [enc setBytes:&win length:sizeof(int) atIndex:10];
+        [enc setBytes:&sc length:sizeof(float) atIndex:11];
     });
 }
 #endif  // RSL_MLX_HAVE_METAL
@@ -1260,14 +1270,16 @@ extern "C" int rsl_mlx_flash_attn_prefill_f32(rsl_mlx_stream *s, const float *q,
 #define RSL_MLX_FLASH_KV(SUFFIX, KALIGN)                                           \
     extern "C" int rsl_mlx_flash_attn_decode_##SUFFIX(rsl_mlx_stream *s,           \
         const float *q, const void *k_packed, const void *v_packed, float *out,   \
-        int n_heads, int n_kv_heads, int head_dim, int max_ctx, int kv_len)        \
+        int n_heads, int n_kv_heads, int head_dim, int max_ctx, int kv_len,        \
+        int window, float softcap)                                                 \
         { return mlx_flash_kv_decode(s, @"rsl_mlx_flash_attn_decode_" #SUFFIX "_kernel", \
-            q, k_packed, v_packed, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, KALIGN); } \
+            q, k_packed, v_packed, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap, KALIGN); } \
     extern "C" int rsl_mlx_flash_attn_prefill_##SUFFIX(rsl_mlx_stream *s,          \
         const float *q, const void *k_packed, const void *v_packed, float *out,   \
-        int n_heads, int n_kv_heads, int head_dim, int max_ctx, int kv_len_base, int n_new) \
+        int n_heads, int n_kv_heads, int head_dim, int max_ctx, int kv_len_base, int n_new, \
+        int window, float softcap)                                                 \
         { return mlx_flash_kv_prefill(s, @"rsl_mlx_flash_attn_prefill_" #SUFFIX "_kernel", \
-            q, k_packed, v_packed, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, KALIGN); }
+            q, k_packed, v_packed, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap, KALIGN); }
 #else
 #define RSL_MLX_FLASH_KV(SUFFIX, KALIGN)                                           \
     extern "C" int rsl_mlx_flash_attn_decode_##SUFFIX(rsl_mlx_stream *s,           \
@@ -1293,7 +1305,7 @@ RSL_MLX_FLASH_KV(mxfp8, 32)
 extern "C" int rsl_mlx_flash_attn_decode_tq(rsl_mlx_stream *s, const float *q,
     const void *k_packed, const void *v_packed, const float *k_scales,
     const float *v_scales, int bits, float *out, int n_heads, int n_kv_heads,
-    int head_dim, int max_ctx, int kv_len) {
+    int head_dim, int max_ctx, int kv_len, int window, float softcap) {
 #if RSL_MLX_HAVE_METAL
     if (!s || !q || !k_packed || !v_packed || !k_scales || !v_scales || !out) return -1;
     if (bits != 1 && bits != 2 && bits != 4 && bits != 8) return -1;
@@ -1304,6 +1316,7 @@ extern "C" int rsl_mlx_flash_attn_decode_tq(rsl_mlx_stream *s, const float *q,
         bks=mlx_resolve(k_scales,&oks), bvs=mlx_resolve(v_scales,&ovs), bo=mlx_resolve(out,&oo);
     if(bq==nil||bk==nil||bv==nil||bks==nil||bvs==nil||bo==nil){g_rsl_mlx_errors++;return -1;}
     int bb=bits,nh=n_heads,nkv=n_kv_heads,hd=head_dim,mc=max_ctx,kl=kv_len;
+    int win=window; float sc=softcap;
     MTLSize grid=MTLSizeMake((NSUInteger)n_heads,1,1), tpg=MTLSizeMake(32,1,1);
     return mlx_run(s,@"rsl_mlx_flash_attn_decode_tq_kernel",grid,tpg,^(id<MTLComputeCommandEncoder> enc){
         [enc setBuffer:bq offset:oq atIndex:0];
@@ -1318,15 +1331,18 @@ extern "C" int rsl_mlx_flash_attn_decode_tq(rsl_mlx_stream *s, const float *q,
         [enc setBytes:&hd length:sizeof(int) atIndex:9];
         [enc setBytes:&mc length:sizeof(int) atIndex:10];
         [enc setBytes:&kl length:sizeof(int) atIndex:11];
+        // SWA window + Gemma2 soft-cap (0/0 => byte-identical).
+        [enc setBytes:&win length:sizeof(int) atIndex:12];
+        [enc setBytes:&sc length:sizeof(float) atIndex:13];
     });
 #else
-    (void)s;(void)q;(void)k_packed;(void)v_packed;(void)k_scales;(void)v_scales;(void)bits;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len; return -1;
+    (void)s;(void)q;(void)k_packed;(void)v_packed;(void)k_scales;(void)v_scales;(void)bits;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len;(void)window;(void)softcap; return -1;
 #endif
 }
 extern "C" int rsl_mlx_flash_attn_prefill_tq(rsl_mlx_stream *s, const float *q,
     const void *k_packed, const void *v_packed, const float *k_scales,
     const float *v_scales, int bits, float *out, int n_heads, int n_kv_heads,
-    int head_dim, int max_ctx, int kv_len_base, int n_new) {
+    int head_dim, int max_ctx, int kv_len_base, int n_new, int window, float softcap) {
 #if RSL_MLX_HAVE_METAL
     if (!s || !q || !k_packed || !v_packed || !k_scales || !v_scales || !out) return -1;
     if (bits != 1 && bits != 2 && bits != 4 && bits != 8) return -1;
@@ -1338,6 +1354,7 @@ extern "C" int rsl_mlx_flash_attn_prefill_tq(rsl_mlx_stream *s, const float *q,
         bks=mlx_resolve(k_scales,&oks), bvs=mlx_resolve(v_scales,&ovs), bo=mlx_resolve(out,&oo);
     if(bq==nil||bk==nil||bv==nil||bks==nil||bvs==nil||bo==nil){g_rsl_mlx_errors++;return -1;}
     int bb=bits,nh=n_heads,nkv=n_kv_heads,hd=head_dim,mc=max_ctx,kb=kv_len_base,nn=n_new;
+    int win=window; float sc=softcap;
     MTLSize grid=MTLSizeMake((NSUInteger)n_heads,(NSUInteger)n_new,1), tpg=MTLSizeMake(32,1,1);
     return mlx_run(s,@"rsl_mlx_flash_attn_prefill_tq_kernel",grid,tpg,^(id<MTLComputeCommandEncoder> enc){
         [enc setBuffer:bq offset:oq atIndex:0];
@@ -1353,9 +1370,12 @@ extern "C" int rsl_mlx_flash_attn_prefill_tq(rsl_mlx_stream *s, const float *q,
         [enc setBytes:&mc length:sizeof(int) atIndex:10];
         [enc setBytes:&kb length:sizeof(int) atIndex:11];
         [enc setBytes:&nn length:sizeof(int) atIndex:12];
+        // SWA window + Gemma2 soft-cap (0/0 => byte-identical).
+        [enc setBytes:&win length:sizeof(int) atIndex:13];
+        [enc setBytes:&sc length:sizeof(float) atIndex:14];
     });
 #else
-    (void)s;(void)q;(void)k_packed;(void)v_packed;(void)k_scales;(void)v_scales;(void)bits;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len_base;(void)n_new; return -1;
+    (void)s;(void)q;(void)k_packed;(void)v_packed;(void)k_scales;(void)v_scales;(void)bits;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len_base;(void)n_new;(void)window;(void)softcap; return -1;
 #endif
 }
 
@@ -1364,7 +1384,7 @@ extern "C" int rsl_mlx_flash_attn_prefill_tq(rsl_mlx_stream *s, const float *q,
 extern "C" int rsl_mlx_flash_attn_decode_q8_0(rsl_mlx_stream *s, const float *q,
     const void *k_packed, const void *v_packed, const float *k_scales,
     const float *v_scales, float *out, int n_heads, int n_kv_heads,
-    int head_dim, int max_ctx, int kv_len) {
+    int head_dim, int max_ctx, int kv_len, int window, float softcap) {
 #if RSL_MLX_HAVE_METAL
     if (!s || !q || !k_packed || !v_packed || !k_scales || !v_scales || !out) return -1;
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || kv_len <= 0) return -1;
@@ -1374,6 +1394,7 @@ extern "C" int rsl_mlx_flash_attn_decode_q8_0(rsl_mlx_stream *s, const float *q,
         bks=mlx_resolve(k_scales,&oks), bvs=mlx_resolve(v_scales,&ovs), bo=mlx_resolve(out,&oo);
     if(bq==nil||bk==nil||bv==nil||bks==nil||bvs==nil||bo==nil){g_rsl_mlx_errors++;return -1;}
     int nh=n_heads,nkv=n_kv_heads,hd=head_dim,mc=max_ctx,kl=kv_len;
+    int win=window; float sc=softcap;
     MTLSize grid=MTLSizeMake((NSUInteger)n_heads,1,1), tpg=MTLSizeMake(32,1,1);
     return mlx_run(s,@"rsl_mlx_flash_attn_decode_q8_0_kernel",grid,tpg,^(id<MTLComputeCommandEncoder> enc){
         [enc setBuffer:bq offset:oq atIndex:0];
@@ -1387,15 +1408,18 @@ extern "C" int rsl_mlx_flash_attn_decode_q8_0(rsl_mlx_stream *s, const float *q,
         [enc setBytes:&hd length:sizeof(int) atIndex:8];
         [enc setBytes:&mc length:sizeof(int) atIndex:9];
         [enc setBytes:&kl length:sizeof(int) atIndex:10];
+        // SWA window + Gemma2 soft-cap (0/0 => byte-identical).
+        [enc setBytes:&win length:sizeof(int) atIndex:11];
+        [enc setBytes:&sc length:sizeof(float) atIndex:12];
     });
 #else
-    (void)s;(void)q;(void)k_packed;(void)v_packed;(void)k_scales;(void)v_scales;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len; return -1;
+    (void)s;(void)q;(void)k_packed;(void)v_packed;(void)k_scales;(void)v_scales;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len;(void)window;(void)softcap; return -1;
 #endif
 }
 extern "C" int rsl_mlx_flash_attn_prefill_q8_0(rsl_mlx_stream *s, const float *q,
     const void *k_packed, const void *v_packed, const float *k_scales,
     const float *v_scales, float *out, int n_heads, int n_kv_heads,
-    int head_dim, int max_ctx, int kv_len_base, int n_new) {
+    int head_dim, int max_ctx, int kv_len_base, int n_new, int window, float softcap) {
 #if RSL_MLX_HAVE_METAL
     if (!s || !q || !k_packed || !v_packed || !k_scales || !v_scales || !out) return -1;
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0 || n_new <= 0) return -1;
@@ -1406,6 +1430,7 @@ extern "C" int rsl_mlx_flash_attn_prefill_q8_0(rsl_mlx_stream *s, const float *q
         bks=mlx_resolve(k_scales,&oks), bvs=mlx_resolve(v_scales,&ovs), bo=mlx_resolve(out,&oo);
     if(bq==nil||bk==nil||bv==nil||bks==nil||bvs==nil||bo==nil){g_rsl_mlx_errors++;return -1;}
     int nh=n_heads,nkv=n_kv_heads,hd=head_dim,mc=max_ctx,kb=kv_len_base,nn=n_new;
+    int win=window; float sc=softcap;
     MTLSize grid=MTLSizeMake((NSUInteger)n_heads,(NSUInteger)n_new,1), tpg=MTLSizeMake(32,1,1);
     return mlx_run(s,@"rsl_mlx_flash_attn_prefill_q8_0_kernel",grid,tpg,^(id<MTLComputeCommandEncoder> enc){
         [enc setBuffer:bq offset:oq atIndex:0];
@@ -1420,9 +1445,12 @@ extern "C" int rsl_mlx_flash_attn_prefill_q8_0(rsl_mlx_stream *s, const float *q
         [enc setBytes:&mc length:sizeof(int) atIndex:9];
         [enc setBytes:&kb length:sizeof(int) atIndex:10];
         [enc setBytes:&nn length:sizeof(int) atIndex:11];
+        // SWA window + Gemma2 soft-cap (0/0 => byte-identical).
+        [enc setBytes:&win length:sizeof(int) atIndex:12];
+        [enc setBytes:&sc length:sizeof(float) atIndex:13];
     });
 #else
-    (void)s;(void)q;(void)k_packed;(void)v_packed;(void)k_scales;(void)v_scales;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len_base;(void)n_new; return -1;
+    (void)s;(void)q;(void)k_packed;(void)v_packed;(void)k_scales;(void)v_scales;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len_base;(void)n_new;(void)window;(void)softcap; return -1;
 #endif
 }
 

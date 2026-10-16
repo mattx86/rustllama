@@ -3131,7 +3131,7 @@ __device__ __forceinline__ void rsl_deq_tq_row(const unsigned char *p,
     for (int i = 0; i < head_dim; ++i) row[i] *= inv_n;
 }
 
-// ---- Q4_0-KV decode / prefill ----
+// ---- Q4_0-KV per-element dequant (used by the templated packed kernels) ----
 // Dequant ONE element `e` of a Q4_0 KV row (byte-identical to the per-row
 // rsl_deq_q4_0_row above: f16 block scale, low nibble for the first 16 of a
 // 32-block, high nibble for the rest, minus 8). Used by the flash-decoding
@@ -3147,17 +3147,65 @@ __device__ __forceinline__ float rsl_deq_q4_0_elem(const unsigned char *p, int e
     return (float)(nib - 8) * d;
 }
 
-// Q4_0 KV (ggml 18-byte blocks, embedded f16 per-32 scale) flash-decoding.
-// Same warp-cooperative structure as flash_attn_decode_f32_kernel; each lane
-// dequantizes its head dims on the fly via rsl_deq_q4_0_elem (the per-block
-// scale is already folded in, so no separate per-row scale). Replaces the old
-// one-thread-per-head serial kernel.
-__global__ void flash_attn_decode_q4_0_kernel(const float *q,
-                                              const unsigned char *k_packed,
-                                              const unsigned char *v_packed,
-                                              float *out, int n_heads, int n_gqa,
-                                              int head_dim, int max_ctx,
-                                              int kv_len, float scale) {
+// ---- Templated packed-KV flash decode / prefill (P18 consolidation) ----
+// The five packed KV formats (Q4_0, NVFP4, MXFP4, MXFP6, MXFP8) differ only in
+// their per-element / per-row dequant and bytes_per_row, so a single templated
+// decode kernel + a single templated prefill kernel now serve all five — the
+// format is a compile-time `Deq` functor supplying bytes_per_row(head_dim),
+// elem(p,e) and row(p,dst,head_dim), each a thin wrapper over the byte-exact
+// rsl_deq_<fmt>_{elem,row} helpers above (UNCHANGED, so the math is identical
+// per format to the pre-consolidation per-format kernels). Q8_0 and TQ keep
+// their own standalone kernels (their math differs: Q8_0 factors the per-row
+// scale out of the loop; TQ runs a warp-cooperative WHT), so they are NOT
+// templatized here.
+struct DeqQ4_0 {
+    __device__ static int bytes_per_row(int head_dim) { return (head_dim / 32) * 18; }
+    __device__ static float elem(const unsigned char *p, int e) { return rsl_deq_q4_0_elem(p, e); }
+    __device__ static void row(const unsigned char *p, float *dst, int head_dim) { rsl_deq_q4_0_row(p, dst, head_dim); }
+};
+struct DeqNVFP4 {
+    __device__ static int bytes_per_row(int head_dim) { return (head_dim / 16) * 9; }
+    __device__ static float elem(const unsigned char *p, int e) { return rsl_deq_nvfp4_elem(p, e); }
+    __device__ static void row(const unsigned char *p, float *dst, int head_dim) { rsl_deq_nvfp4_row(p, dst, head_dim); }
+};
+struct DeqMXFP4 {
+    __device__ static int bytes_per_row(int head_dim) { return (head_dim / 32) * 17; }
+    __device__ static float elem(const unsigned char *p, int e) { return rsl_deq_mxfp4_elem(p, e); }
+    __device__ static void row(const unsigned char *p, float *dst, int head_dim) { rsl_deq_mxfp4_row(p, dst, head_dim); }
+};
+struct DeqMXFP6 {
+    __device__ static int bytes_per_row(int head_dim) { return (head_dim / 32) * 25; }
+    __device__ static float elem(const unsigned char *p, int e) { return rsl_deq_mxfp6_elem(p, e); }
+    __device__ static void row(const unsigned char *p, float *dst, int head_dim) { rsl_deq_mxfp6_row(p, dst, head_dim); }
+};
+struct DeqMXFP8 {
+    __device__ static int bytes_per_row(int head_dim) { return (head_dim / 32) * 33; }
+    __device__ static float elem(const unsigned char *p, int e) { return rsl_deq_mxfp8_elem(p, e); }
+    __device__ static void row(const unsigned char *p, float *dst, int head_dim) { rsl_deq_mxfp8_row(p, dst, head_dim); }
+};
+
+// Templated packed-KV flash-decoding. Same warp-cooperative structure as
+// flash_attn_decode_f32_kernel (one block per head, W warps split kv_len, 32
+// lanes split head_dim, shared-mem flash merge); each lane dequantizes its head
+// dims on the fly via Deq::elem (the per-block scale is already folded in, so no
+// separate per-row scale). `window` (0 = full causal) + `softcap` (0 = off)
+// mirror the CPU reference `gqa_attention_flash_decode_capped_windowed` and the
+// f32 flash kernel: a sliding window trims the attended range to the last
+// `window` cached positions, and the Gemma2 attention-logit soft-cap
+// `s = c*tanh(s/c)` is applied AFTER the 1/sqrt scale and BEFORE the
+// online-softmax max/exp. Both are passthrough no-ops at 0 (window=0 ⇒
+// t_start=0 ⇒ full attention; softcap=0 ⇒ the tanh guard folds away), so a
+// non-SWA / non-Gemma2 model is byte-identical to the pre-feature kernel. The
+// per-warp `t < t_start` skip is WARP-UNIFORM (t depends on `warp`, not `lane`),
+// so it cannot desync the __shfl reduction below.
+template <typename Deq>
+__global__ void flash_attn_decode_packed_kernel(const float *q,
+                                                const unsigned char *k_packed,
+                                                const unsigned char *v_packed,
+                                                float *out, int n_heads, int n_gqa,
+                                                int head_dim, int max_ctx,
+                                                int kv_len, float scale,
+                                                int window, float softcap) {
     extern __shared__ float smem[];
     float *sh_acc = smem;
     float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;
@@ -3169,7 +3217,7 @@ __global__ void flash_attn_decode_q4_0_kernel(const float *q,
     const int warp = threadIdx.y;
     const int kv_h = hh / n_gqa;
     const int q_off = hh * head_dim;
-    const int bytes_per_row = (head_dim / 32) * 18;
+    const int bytes_per_row = Deq::bytes_per_row(head_dim);
 
     float qreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
     float acc[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
@@ -3179,16 +3227,22 @@ __global__ void flash_attn_decode_q4_0_kernel(const float *q,
     }
     float m = -INFINITY, l = 0.f;
 
+    // Sliding-window lower bound: attend only `[t_start, kv_len)`. Matches the
+    // CPU `..._windowed` (window==0 or window>=kv_len ⇒ t_start=0 ⇒ full).
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
     for (int t = warp; t < kv_len; t += RSL_FLASH_DECODE_W) {
+        if (t < t_start) continue;  // SWA: before the window start (warp-uniform)
         const unsigned char *kp =
             k_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
         float partial = 0.f;
         for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
-            partial += qreg[seg] * rsl_deq_q4_0_elem(kp, d);
+            partial += qreg[seg] * Deq::elem(kp, d);
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_down_sync(0xffffffffu, partial, off);
         float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
+        // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+        if (softcap > 0.f) s_dot = softcap * tanhf(s_dot / softcap);
         float m_new = fmaxf(m, s_dot);
         float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
         float p = expf(s_dot - m_new);
@@ -3196,7 +3250,7 @@ __global__ void flash_attn_decode_q4_0_kernel(const float *q,
         const unsigned char *vp =
             v_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
         for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
-            acc[seg] = acc[seg] * rescale + p * rsl_deq_q4_0_elem(vp, d);
+            acc[seg] = acc[seg] * rescale + p * Deq::elem(vp, d);
         m = m_new;
     }
 
@@ -3229,13 +3283,24 @@ __global__ void flash_attn_decode_q4_0_kernel(const float *q,
     }
 }
 
-__global__ void flash_attn_prefill_q4_0_kernel(const float *q,
-                                               const unsigned char *k_packed,
-                                               const unsigned char *v_packed,
-                                               float *out, int n_heads, int n_gqa,
-                                               int head_dim, int max_ctx,
-                                               int kv_len_base, int n_new,
-                                               float scale) {
+// Templated packed-KV flash-prefill (naive one-thread-per-(head, q_pos), same
+// math as the pre-consolidation per-format prefill kernels — NOT the FA-2 tiled
+// path, deferred). Dequants a full K/V row via Deq::row. `window` (0 = full
+// causal) + `softcap` (0 = off) mirror the CPU reference
+// `gqa_attention_flash_prefill_capped_windowed`: a query at abs pos
+// P = kv_len_base + q_pos attends keys `[max(0, P-window+1), P]` and the Gemma2
+// soft-cap is applied after the scale, before softmax. The out row is zeroed
+// first, so starting the loop at t_start is correct. Byte-identical passthroughs
+// at 0 (window=0 ⇒ t_start=0 ⇒ full causal; softcap=0 ⇒ no-op).
+template <typename Deq>
+__global__ void flash_attn_prefill_packed_kernel(const float *q,
+                                                 const unsigned char *k_packed,
+                                                 const unsigned char *v_packed,
+                                                 float *out, int n_heads, int n_gqa,
+                                                 int head_dim, int max_ctx,
+                                                 int kv_len_base, int n_new,
+                                                 float scale,
+                                                 int window, float softcap) {
     int hh = blockIdx.x * blockDim.x + threadIdx.x;
     int q_pos = blockIdx.y;
     if (hh >= n_heads || q_pos >= n_new) return;
@@ -3243,462 +3308,28 @@ __global__ void flash_attn_prefill_q4_0_kernel(const float *q,
     int q_off = (q_pos * n_heads + hh) * head_dim;
     int out_off = q_off;
     int kv_len_for_q = kv_len_base + q_pos + 1;
-    int bytes_per_row = (head_dim / 32) * 18;
+    int bytes_per_row = Deq::bytes_per_row(head_dim);
     float row[RSL_FLASH_MAX_HEAD_DIM];
     for (int i = 0; i < head_dim; ++i) out[out_off + i] = 0.f;
     float m = -INFINITY, l = 0.f;
-    for (int t = 0; t < kv_len_for_q; ++t) {
+    // SWA per-query lower bound: query at abs pos (kv_len_for_q-1) attends
+    // `[t_start, kv_len_for_q)`. window==0 (or the window reaching position 0)
+    // ⇒ t_start=0 ⇒ full causal.
+    const int t_start = (window > 0 && kv_len_for_q - window > 0) ? (kv_len_for_q - window) : 0;
+    for (int t = t_start; t < kv_len_for_q; ++t) {
         const unsigned char *kp = k_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        rsl_deq_q4_0_row(kp, row, head_dim);
+        Deq::row(kp, row, head_dim);
         float s_dot = 0.f;
         for (int i = 0; i < head_dim; ++i) s_dot += q[q_off + i] * row[i];
         s_dot *= scale;
+        // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+        if (softcap > 0.f) s_dot = softcap * tanhf(s_dot / softcap);
         float m_new = fmaxf(m, s_dot);
         float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
         float p = expf(s_dot - m_new);
         l = l * rescale + p;
         const unsigned char *vp = v_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        rsl_deq_q4_0_row(vp, row, head_dim);
-        for (int i = 0; i < head_dim; ++i)
-            out[out_off + i] = out[out_off + i] * rescale + p * row[i];
-        m = m_new;
-    }
-    float inv_l = (l > 0.f) ? 1.f / l : 0.f;
-    for (int i = 0; i < head_dim; ++i) out[out_off + i] *= inv_l;
-}
-
-// ---- NVFP4-KV decode / prefill ----
-// NVFP4 KV (9-byte blocks of 16, FP8 E4M3 block scale) flash-decoding.
-__global__ void flash_attn_decode_nvfp4_kernel(const float *q,
-                                               const unsigned char *k_packed,
-                                               const unsigned char *v_packed,
-                                               float *out, int n_heads, int n_gqa,
-                                               int head_dim, int max_ctx,
-                                               int kv_len, float scale) {
-    extern __shared__ float smem[];
-    float *sh_acc = smem;
-    float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;
-    float *sh_l = sh_m + RSL_FLASH_DECODE_W;
-    const int hh = blockIdx.x;
-    if (hh >= n_heads) return;
-    const int lane = threadIdx.x;
-    const int warp = threadIdx.y;
-    const int kv_h = hh / n_gqa;
-    const int q_off = hh * head_dim;
-    const int bytes_per_row = (head_dim / 16) * 9;
-    float qreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
-    float acc[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
-    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
-        qreg[seg] = q[q_off + d];
-        acc[seg] = 0.f;
-    }
-    float m = -INFINITY, l = 0.f;
-    for (int t = warp; t < kv_len; t += RSL_FLASH_DECODE_W) {
-        const unsigned char *kp = k_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        float partial = 0.f;
-        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
-            partial += qreg[seg] * rsl_deq_nvfp4_elem(kp, d);
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            partial += __shfl_down_sync(0xffffffffu, partial, off);
-        float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
-        float m_new = fmaxf(m, s_dot);
-        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
-        float p = expf(s_dot - m_new);
-        l = l * rescale + p;
-        const unsigned char *vp = v_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
-            acc[seg] = acc[seg] * rescale + p * rsl_deq_nvfp4_elem(vp, d);
-        m = m_new;
-    }
-    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
-        sh_acc[warp * head_dim + d] = acc[seg];
-    if (lane == 0) {
-        sh_m[warp] = m;
-        sh_l[warp] = l;
-    }
-    __syncthreads();
-    float m_g = -INFINITY;
-    #pragma unroll
-    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w) m_g = fmaxf(m_g, sh_m[w]);
-    float l_g = 0.f;
-    #pragma unroll
-    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
-        l_g += sh_l[w] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
-    float inv_l = (l_g > 0.f) ? 1.f / l_g : 0.f;
-    const int tid = warp * 32 + lane;
-    const int nthreads = RSL_FLASH_DECODE_W * 32;
-    const int out_off = hh * head_dim;
-    for (int d = tid; d < head_dim; d += nthreads) {
-        float o = 0.f;
-        #pragma unroll
-        for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
-            o += sh_acc[w * head_dim + d] *
-                 (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
-        out[out_off + d] = o * inv_l;
-    }
-}
-
-__global__ void flash_attn_prefill_nvfp4_kernel(const float *q,
-                                                const unsigned char *k_packed,
-                                                const unsigned char *v_packed,
-                                                float *out, int n_heads, int n_gqa,
-                                                int head_dim, int max_ctx,
-                                                int kv_len_base, int n_new,
-                                                float scale) {
-    int hh = blockIdx.x * blockDim.x + threadIdx.x;
-    int q_pos = blockIdx.y;
-    if (hh >= n_heads || q_pos >= n_new) return;
-    int kv_h = hh / n_gqa;
-    int q_off = (q_pos * n_heads + hh) * head_dim;
-    int out_off = q_off;
-    int kv_len_for_q = kv_len_base + q_pos + 1;
-    int bytes_per_row = (head_dim / 16) * 9;
-    float row[RSL_FLASH_MAX_HEAD_DIM];
-    for (int i = 0; i < head_dim; ++i) out[out_off + i] = 0.f;
-    float m = -INFINITY, l = 0.f;
-    for (int t = 0; t < kv_len_for_q; ++t) {
-        const unsigned char *kp = k_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        rsl_deq_nvfp4_row(kp, row, head_dim);
-        float s_dot = 0.f;
-        for (int i = 0; i < head_dim; ++i) s_dot += q[q_off + i] * row[i];
-        s_dot *= scale;
-        float m_new = fmaxf(m, s_dot);
-        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
-        float p = expf(s_dot - m_new);
-        l = l * rescale + p;
-        const unsigned char *vp = v_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        rsl_deq_nvfp4_row(vp, row, head_dim);
-        for (int i = 0; i < head_dim; ++i)
-            out[out_off + i] = out[out_off + i] * rescale + p * row[i];
-        m = m_new;
-    }
-    float inv_l = (l > 0.f) ? 1.f / l : 0.f;
-    for (int i = 0; i < head_dim; ++i) out[out_off + i] *= inv_l;
-}
-
-// ---- MXFP4-KV decode / prefill (17 B / 32-elem block, E8M0 scale) ----
-// MXFP4 KV (17-byte blocks of 32, E8M0 shared scale) flash-decoding.
-__global__ void flash_attn_decode_mxfp4_kernel(const float *q,
-                                               const unsigned char *k_packed,
-                                               const unsigned char *v_packed,
-                                               float *out, int n_heads, int n_gqa,
-                                               int head_dim, int max_ctx,
-                                               int kv_len, float scale) {
-    extern __shared__ float smem[];
-    float *sh_acc = smem;
-    float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;
-    float *sh_l = sh_m + RSL_FLASH_DECODE_W;
-    const int hh = blockIdx.x;
-    if (hh >= n_heads) return;
-    const int lane = threadIdx.x;
-    const int warp = threadIdx.y;
-    const int kv_h = hh / n_gqa;
-    const int q_off = hh * head_dim;
-    const int bytes_per_row = (head_dim / 32) * 17;
-    float qreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
-    float acc[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
-    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
-        qreg[seg] = q[q_off + d];
-        acc[seg] = 0.f;
-    }
-    float m = -INFINITY, l = 0.f;
-    for (int t = warp; t < kv_len; t += RSL_FLASH_DECODE_W) {
-        const unsigned char *kp = k_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        float partial = 0.f;
-        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
-            partial += qreg[seg] * rsl_deq_mxfp4_elem(kp, d);
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            partial += __shfl_down_sync(0xffffffffu, partial, off);
-        float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
-        float m_new = fmaxf(m, s_dot);
-        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
-        float p = expf(s_dot - m_new);
-        l = l * rescale + p;
-        const unsigned char *vp = v_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
-            acc[seg] = acc[seg] * rescale + p * rsl_deq_mxfp4_elem(vp, d);
-        m = m_new;
-    }
-    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
-        sh_acc[warp * head_dim + d] = acc[seg];
-    if (lane == 0) {
-        sh_m[warp] = m;
-        sh_l[warp] = l;
-    }
-    __syncthreads();
-    float m_g = -INFINITY;
-    #pragma unroll
-    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w) m_g = fmaxf(m_g, sh_m[w]);
-    float l_g = 0.f;
-    #pragma unroll
-    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
-        l_g += sh_l[w] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
-    float inv_l = (l_g > 0.f) ? 1.f / l_g : 0.f;
-    const int tid = warp * 32 + lane;
-    const int nthreads = RSL_FLASH_DECODE_W * 32;
-    const int out_off = hh * head_dim;
-    for (int d = tid; d < head_dim; d += nthreads) {
-        float o = 0.f;
-        #pragma unroll
-        for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
-            o += sh_acc[w * head_dim + d] *
-                 (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
-        out[out_off + d] = o * inv_l;
-    }
-}
-
-__global__ void flash_attn_prefill_mxfp4_kernel(const float *q,
-                                                const unsigned char *k_packed,
-                                                const unsigned char *v_packed,
-                                                float *out, int n_heads, int n_gqa,
-                                                int head_dim, int max_ctx,
-                                                int kv_len_base, int n_new,
-                                                float scale) {
-    int hh = blockIdx.x * blockDim.x + threadIdx.x;
-    int q_pos = blockIdx.y;
-    if (hh >= n_heads || q_pos >= n_new) return;
-    int kv_h = hh / n_gqa;
-    int q_off = (q_pos * n_heads + hh) * head_dim;
-    int out_off = q_off;
-    int kv_len_for_q = kv_len_base + q_pos + 1;
-    int bytes_per_row = (head_dim / 32) * 17;
-    float row[RSL_FLASH_MAX_HEAD_DIM];
-    for (int i = 0; i < head_dim; ++i) out[out_off + i] = 0.f;
-    float m = -INFINITY, l = 0.f;
-    for (int t = 0; t < kv_len_for_q; ++t) {
-        const unsigned char *kp = k_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        rsl_deq_mxfp4_row(kp, row, head_dim);
-        float s_dot = 0.f;
-        for (int i = 0; i < head_dim; ++i) s_dot += q[q_off + i] * row[i];
-        s_dot *= scale;
-        float m_new = fmaxf(m, s_dot);
-        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
-        float p = expf(s_dot - m_new);
-        l = l * rescale + p;
-        const unsigned char *vp = v_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        rsl_deq_mxfp4_row(vp, row, head_dim);
-        for (int i = 0; i < head_dim; ++i)
-            out[out_off + i] = out[out_off + i] * rescale + p * row[i];
-        m = m_new;
-    }
-    float inv_l = (l > 0.f) ? 1.f / l : 0.f;
-    for (int i = 0; i < head_dim; ++i) out[out_off + i] *= inv_l;
-}
-
-// ---- MXFP6-KV decode / prefill (25 B / 32-elem block, E8M0 scale) ----
-// MXFP6 KV (25-byte blocks of 32, E8M0 scale, 6-bit E3M2 codes) flash-decoding.
-__global__ void flash_attn_decode_mxfp6_kernel(const float *q,
-                                               const unsigned char *k_packed,
-                                               const unsigned char *v_packed,
-                                               float *out, int n_heads, int n_gqa,
-                                               int head_dim, int max_ctx,
-                                               int kv_len, float scale) {
-    extern __shared__ float smem[];
-    float *sh_acc = smem;
-    float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;
-    float *sh_l = sh_m + RSL_FLASH_DECODE_W;
-    const int hh = blockIdx.x;
-    if (hh >= n_heads) return;
-    const int lane = threadIdx.x;
-    const int warp = threadIdx.y;
-    const int kv_h = hh / n_gqa;
-    const int q_off = hh * head_dim;
-    const int bytes_per_row = (head_dim / 32) * 25;
-    float qreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
-    float acc[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
-    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
-        qreg[seg] = q[q_off + d];
-        acc[seg] = 0.f;
-    }
-    float m = -INFINITY, l = 0.f;
-    for (int t = warp; t < kv_len; t += RSL_FLASH_DECODE_W) {
-        const unsigned char *kp = k_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        float partial = 0.f;
-        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
-            partial += qreg[seg] * rsl_deq_mxfp6_elem(kp, d);
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            partial += __shfl_down_sync(0xffffffffu, partial, off);
-        float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
-        float m_new = fmaxf(m, s_dot);
-        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
-        float p = expf(s_dot - m_new);
-        l = l * rescale + p;
-        const unsigned char *vp = v_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
-            acc[seg] = acc[seg] * rescale + p * rsl_deq_mxfp6_elem(vp, d);
-        m = m_new;
-    }
-    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
-        sh_acc[warp * head_dim + d] = acc[seg];
-    if (lane == 0) {
-        sh_m[warp] = m;
-        sh_l[warp] = l;
-    }
-    __syncthreads();
-    float m_g = -INFINITY;
-    #pragma unroll
-    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w) m_g = fmaxf(m_g, sh_m[w]);
-    float l_g = 0.f;
-    #pragma unroll
-    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
-        l_g += sh_l[w] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
-    float inv_l = (l_g > 0.f) ? 1.f / l_g : 0.f;
-    const int tid = warp * 32 + lane;
-    const int nthreads = RSL_FLASH_DECODE_W * 32;
-    const int out_off = hh * head_dim;
-    for (int d = tid; d < head_dim; d += nthreads) {
-        float o = 0.f;
-        #pragma unroll
-        for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
-            o += sh_acc[w * head_dim + d] *
-                 (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
-        out[out_off + d] = o * inv_l;
-    }
-}
-
-__global__ void flash_attn_prefill_mxfp6_kernel(const float *q,
-                                                const unsigned char *k_packed,
-                                                const unsigned char *v_packed,
-                                                float *out, int n_heads, int n_gqa,
-                                                int head_dim, int max_ctx,
-                                                int kv_len_base, int n_new,
-                                                float scale) {
-    int hh = blockIdx.x * blockDim.x + threadIdx.x;
-    int q_pos = blockIdx.y;
-    if (hh >= n_heads || q_pos >= n_new) return;
-    int kv_h = hh / n_gqa;
-    int q_off = (q_pos * n_heads + hh) * head_dim;
-    int out_off = q_off;
-    int kv_len_for_q = kv_len_base + q_pos + 1;
-    int bytes_per_row = (head_dim / 32) * 25;
-    float row[RSL_FLASH_MAX_HEAD_DIM];
-    for (int i = 0; i < head_dim; ++i) out[out_off + i] = 0.f;
-    float m = -INFINITY, l = 0.f;
-    for (int t = 0; t < kv_len_for_q; ++t) {
-        const unsigned char *kp = k_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        rsl_deq_mxfp6_row(kp, row, head_dim);
-        float s_dot = 0.f;
-        for (int i = 0; i < head_dim; ++i) s_dot += q[q_off + i] * row[i];
-        s_dot *= scale;
-        float m_new = fmaxf(m, s_dot);
-        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
-        float p = expf(s_dot - m_new);
-        l = l * rescale + p;
-        const unsigned char *vp = v_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        rsl_deq_mxfp6_row(vp, row, head_dim);
-        for (int i = 0; i < head_dim; ++i)
-            out[out_off + i] = out[out_off + i] * rescale + p * row[i];
-        m = m_new;
-    }
-    float inv_l = (l > 0.f) ? 1.f / l : 0.f;
-    for (int i = 0; i < head_dim; ++i) out[out_off + i] *= inv_l;
-}
-
-// ---- MXFP8-KV decode / prefill (33 B / 32-elem block, E8M0 scale) ----
-// MXFP8 KV (33-byte blocks of 32, E8M0 scale, E4M3 codes) flash-decoding.
-__global__ void flash_attn_decode_mxfp8_kernel(const float *q,
-                                               const unsigned char *k_packed,
-                                               const unsigned char *v_packed,
-                                               float *out, int n_heads, int n_gqa,
-                                               int head_dim, int max_ctx,
-                                               int kv_len, float scale) {
-    extern __shared__ float smem[];
-    float *sh_acc = smem;
-    float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;
-    float *sh_l = sh_m + RSL_FLASH_DECODE_W;
-    const int hh = blockIdx.x;
-    if (hh >= n_heads) return;
-    const int lane = threadIdx.x;
-    const int warp = threadIdx.y;
-    const int kv_h = hh / n_gqa;
-    const int q_off = hh * head_dim;
-    const int bytes_per_row = (head_dim / 32) * 33;
-    float qreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
-    float acc[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
-    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
-        qreg[seg] = q[q_off + d];
-        acc[seg] = 0.f;
-    }
-    float m = -INFINITY, l = 0.f;
-    for (int t = warp; t < kv_len; t += RSL_FLASH_DECODE_W) {
-        const unsigned char *kp = k_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        float partial = 0.f;
-        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
-            partial += qreg[seg] * rsl_deq_mxfp8_elem(kp, d);
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            partial += __shfl_down_sync(0xffffffffu, partial, off);
-        float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
-        float m_new = fmaxf(m, s_dot);
-        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
-        float p = expf(s_dot - m_new);
-        l = l * rescale + p;
-        const unsigned char *vp = v_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
-            acc[seg] = acc[seg] * rescale + p * rsl_deq_mxfp8_elem(vp, d);
-        m = m_new;
-    }
-    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
-        sh_acc[warp * head_dim + d] = acc[seg];
-    if (lane == 0) {
-        sh_m[warp] = m;
-        sh_l[warp] = l;
-    }
-    __syncthreads();
-    float m_g = -INFINITY;
-    #pragma unroll
-    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w) m_g = fmaxf(m_g, sh_m[w]);
-    float l_g = 0.f;
-    #pragma unroll
-    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
-        l_g += sh_l[w] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
-    float inv_l = (l_g > 0.f) ? 1.f / l_g : 0.f;
-    const int tid = warp * 32 + lane;
-    const int nthreads = RSL_FLASH_DECODE_W * 32;
-    const int out_off = hh * head_dim;
-    for (int d = tid; d < head_dim; d += nthreads) {
-        float o = 0.f;
-        #pragma unroll
-        for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
-            o += sh_acc[w * head_dim + d] *
-                 (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
-        out[out_off + d] = o * inv_l;
-    }
-}
-
-__global__ void flash_attn_prefill_mxfp8_kernel(const float *q,
-                                                const unsigned char *k_packed,
-                                                const unsigned char *v_packed,
-                                                float *out, int n_heads, int n_gqa,
-                                                int head_dim, int max_ctx,
-                                                int kv_len_base, int n_new,
-                                                float scale) {
-    int hh = blockIdx.x * blockDim.x + threadIdx.x;
-    int q_pos = blockIdx.y;
-    if (hh >= n_heads || q_pos >= n_new) return;
-    int kv_h = hh / n_gqa;
-    int q_off = (q_pos * n_heads + hh) * head_dim;
-    int out_off = q_off;
-    int kv_len_for_q = kv_len_base + q_pos + 1;
-    int bytes_per_row = (head_dim / 32) * 33;
-    float row[RSL_FLASH_MAX_HEAD_DIM];
-    for (int i = 0; i < head_dim; ++i) out[out_off + i] = 0.f;
-    float m = -INFINITY, l = 0.f;
-    for (int t = 0; t < kv_len_for_q; ++t) {
-        const unsigned char *kp = k_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        rsl_deq_mxfp8_row(kp, row, head_dim);
-        float s_dot = 0.f;
-        for (int i = 0; i < head_dim; ++i) s_dot += q[q_off + i] * row[i];
-        s_dot *= scale;
-        float m_new = fmaxf(m, s_dot);
-        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
-        float p = expf(s_dot - m_new);
-        l = l * rescale + p;
-        const unsigned char *vp = v_packed + (size_t)(kv_h * max_ctx + t) * bytes_per_row;
-        rsl_deq_mxfp8_row(vp, row, head_dim);
+        Deq::row(vp, row, head_dim);
         for (int i = 0; i < head_dim; ++i)
             out[out_off + i] = out[out_off + i] * rescale + p * row[i];
         m = m_new;
@@ -3764,7 +3395,7 @@ __global__ void flash_attn_decode_tq_kernel(const float *q,
                                             const float *v_scales, int bits,
                                             float *out, int n_heads, int n_gqa,
                                             int head_dim, int max_ctx,
-                                            int kv_len, float scale) {
+                                            int kv_len, float scale, int window, float softcap) {
     extern __shared__ float smem[];
     float *sh_acc = smem;
     float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;
@@ -3784,7 +3415,11 @@ __global__ void flash_attn_decode_tq_kernel(const float *q,
         acc[seg] = 0.f;
     }
     float m = -INFINITY, l = 0.f;
+    // Sliding-window lower bound (SWA): attend only `[t_start, kv_len)`.
+    // window==0 or window>=kv_len ⇒ t_start=0 ⇒ full attention.
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
     for (int t = warp; t < kv_len; t += RSL_FLASH_DECODE_W) {
+        if (t < t_start) continue;  // SWA: before the window start (warp-uniform)
         const size_t ridx = (size_t)(kv_h * max_ctx + t);
         rsl_tq_dequant_wht_warp(k_packed + ridx * bytes_per_row, k_scales[ridx], bits,
                                 scratch, head_dim, lane);
@@ -3795,6 +3430,8 @@ __global__ void flash_attn_decode_tq_kernel(const float *q,
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_down_sync(0xffffffffu, partial, off);
         float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
+        // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+        if (softcap > 0.f) s_dot = softcap * tanhf(s_dot / softcap);
         float m_new = fmaxf(m, s_dot);
         float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
         float p = expf(s_dot - m_new);
@@ -3844,7 +3481,7 @@ __global__ void flash_attn_prefill_tq_kernel(const float *q,
                                              float *out, int n_heads, int n_gqa,
                                              int head_dim, int max_ctx,
                                              int kv_len_base, int n_new,
-                                             float scale) {
+                                             float scale, int window, float softcap) {
     int hh = blockIdx.x * blockDim.x + threadIdx.x;
     int q_pos = blockIdx.y;
     if (hh >= n_heads || q_pos >= n_new) return;
@@ -3856,12 +3493,17 @@ __global__ void flash_attn_prefill_tq_kernel(const float *q,
     float row[RSL_FLASH_MAX_HEAD_DIM];
     for (int i = 0; i < head_dim; ++i) out[out_off + i] = 0.f;
     float m = -INFINITY, l = 0.f;
-    for (int t = 0; t < kv_len_for_q; ++t) {
+    // SWA per-query lower bound: query at abs pos (kv_len_for_q-1) attends
+    // `[t_start, kv_len_for_q)`. window==0 (or the window reaching pos 0) ⇒ full.
+    const int t_start = (window > 0 && kv_len_for_q - window > 0) ? (kv_len_for_q - window) : 0;
+    for (int t = t_start; t < kv_len_for_q; ++t) {
         size_t ridx = (size_t)(kv_h * max_ctx + t);
         rsl_deq_tq_row(k_packed + ridx * bytes_per_row, k_scales[ridx], bits, row, head_dim);
         float s_dot = 0.f;
         for (int i = 0; i < head_dim; ++i) s_dot += q[q_off + i] * row[i];
         s_dot *= scale;
+        // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+        if (softcap > 0.f) s_dot = softcap * tanhf(s_dot / softcap);
         float m_new = fmaxf(m, s_dot);
         float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
         float p = expf(s_dot - m_new);
@@ -3896,7 +3538,7 @@ static int rsl_flash_kv_shape_ok(int n_heads, int n_kv_heads, int head_dim,
 extern "C" int rsl_cuda_flash_attn_decode_q4_0(rsl_cuda_stream *s, const float *q,
                                                const void *k_packed, const void *v_packed,
                                                float *out, int n_heads, int n_kv_heads,
-                                               int head_dim, int max_ctx, int kv_len) {
+                                               int head_dim, int max_ctx, int kv_len, int window, float softcap) {
     if (!s || !q || !k_packed || !v_packed || !out) return -1;
     if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 32) != 0) return -1;
     cudaSetDevice(s->device);
@@ -3911,9 +3553,9 @@ extern "C" int rsl_cuda_flash_attn_decode_q4_0(rsl_cuda_stream *s, const float *
     size_t shmem = (size_t)(RSL_FLASH_DECODE_W * head_dim +
                             2 * RSL_FLASH_DECODE_W) *
                    sizeof(float);
-    flash_attn_decode_q4_0_kernel<<<grid, block, shmem, s->stream>>>(
+    flash_attn_decode_packed_kernel<DeqQ4_0><<<grid, block, shmem, s->stream>>>(
         q, (const unsigned char *)k_packed, (const unsigned char *)v_packed, out,
-        n_heads, n_gqa, head_dim, max_ctx, kv_len, scale);
+        n_heads, n_gqa, head_dim, max_ctx, kv_len, scale, window, softcap);
     return rsl_cuda_check("rsl_cuda_flash_attn_decode_q4_0");
 }
 
@@ -3921,7 +3563,7 @@ extern "C" int rsl_cuda_flash_attn_prefill_q4_0(rsl_cuda_stream *s, const float 
                                                 const void *k_packed, const void *v_packed,
                                                 float *out, int n_heads, int n_kv_heads,
                                                 int head_dim, int max_ctx,
-                                                int kv_len_base, int n_new) {
+                                                int kv_len_base, int n_new, int window, float softcap) {
     if (!s || !q || !k_packed || !v_packed || !out || n_new <= 0) return -1;
     if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 32) != 0) return -1;
     if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
@@ -3930,16 +3572,16 @@ extern "C" int rsl_cuda_flash_attn_prefill_q4_0(rsl_cuda_stream *s, const float 
     float scale = 1.0f / sqrtf((float)head_dim);
     int t = 64;
     dim3 b((n_heads + t - 1) / t, (unsigned)n_new);
-    flash_attn_prefill_q4_0_kernel<<<b, t, 0, s->stream>>>(
+    flash_attn_prefill_packed_kernel<DeqQ4_0><<<b, t, 0, s->stream>>>(
         q, (const unsigned char *)k_packed, (const unsigned char *)v_packed, out,
-        n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale);
+        n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale, window, softcap);
     return rsl_cuda_check("rsl_cuda_flash_attn_prefill_q4_0");
 }
 
 extern "C" int rsl_cuda_flash_attn_decode_nvfp4(rsl_cuda_stream *s, const float *q,
                                                 const void *k_packed, const void *v_packed,
                                                 float *out, int n_heads, int n_kv_heads,
-                                                int head_dim, int max_ctx, int kv_len) {
+                                                int head_dim, int max_ctx, int kv_len, int window, float softcap) {
     if (!s || !q || !k_packed || !v_packed || !out) return -1;
     if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 16) != 0) return -1;
     cudaSetDevice(s->device);
@@ -3953,9 +3595,9 @@ extern "C" int rsl_cuda_flash_attn_decode_nvfp4(rsl_cuda_stream *s, const float 
     dim3 grid((unsigned)n_heads);
     size_t shmem = (size_t)(RSL_FLASH_DECODE_W * head_dim +
                             2 * RSL_FLASH_DECODE_W) * sizeof(float);
-    flash_attn_decode_nvfp4_kernel<<<grid, block, shmem, s->stream>>>(
+    flash_attn_decode_packed_kernel<DeqNVFP4><<<grid, block, shmem, s->stream>>>(
         q, (const unsigned char *)k_packed, (const unsigned char *)v_packed, out,
-        n_heads, n_gqa, head_dim, max_ctx, kv_len, scale);
+        n_heads, n_gqa, head_dim, max_ctx, kv_len, scale, window, softcap);
     return rsl_cuda_check("rsl_cuda_flash_attn_decode_nvfp4");
 }
 
@@ -3963,7 +3605,7 @@ extern "C" int rsl_cuda_flash_attn_prefill_nvfp4(rsl_cuda_stream *s, const float
                                                  const void *k_packed, const void *v_packed,
                                                  float *out, int n_heads, int n_kv_heads,
                                                  int head_dim, int max_ctx,
-                                                 int kv_len_base, int n_new) {
+                                                 int kv_len_base, int n_new, int window, float softcap) {
     if (!s || !q || !k_packed || !v_packed || !out || n_new <= 0) return -1;
     if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 16) != 0) return -1;
     if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
@@ -3972,9 +3614,9 @@ extern "C" int rsl_cuda_flash_attn_prefill_nvfp4(rsl_cuda_stream *s, const float
     float scale = 1.0f / sqrtf((float)head_dim);
     int t = 64;
     dim3 b((n_heads + t - 1) / t, (unsigned)n_new);
-    flash_attn_prefill_nvfp4_kernel<<<b, t, 0, s->stream>>>(
+    flash_attn_prefill_packed_kernel<DeqNVFP4><<<b, t, 0, s->stream>>>(
         q, (const unsigned char *)k_packed, (const unsigned char *)v_packed, out,
-        n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale);
+        n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale, window, softcap);
     return rsl_cuda_check("rsl_cuda_flash_attn_prefill_nvfp4");
 }
 
@@ -3982,7 +3624,7 @@ extern "C" int rsl_cuda_flash_attn_prefill_nvfp4(rsl_cuda_stream *s, const float
 extern "C" int rsl_cuda_flash_attn_decode_mxfp4(rsl_cuda_stream *s, const float *q,
                                                 const void *k_packed, const void *v_packed,
                                                 float *out, int n_heads, int n_kv_heads,
-                                                int head_dim, int max_ctx, int kv_len) {
+                                                int head_dim, int max_ctx, int kv_len, int window, float softcap) {
     if (!s || !q || !k_packed || !v_packed || !out) return -1;
     if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 32) != 0) return -1;
     cudaSetDevice(s->device);
@@ -3996,9 +3638,9 @@ extern "C" int rsl_cuda_flash_attn_decode_mxfp4(rsl_cuda_stream *s, const float 
     dim3 grid((unsigned)n_heads);
     size_t shmem = (size_t)(RSL_FLASH_DECODE_W * head_dim +
                             2 * RSL_FLASH_DECODE_W) * sizeof(float);
-    flash_attn_decode_mxfp4_kernel<<<grid, block, shmem, s->stream>>>(
+    flash_attn_decode_packed_kernel<DeqMXFP4><<<grid, block, shmem, s->stream>>>(
         q, (const unsigned char *)k_packed, (const unsigned char *)v_packed, out,
-        n_heads, n_gqa, head_dim, max_ctx, kv_len, scale);
+        n_heads, n_gqa, head_dim, max_ctx, kv_len, scale, window, softcap);
     return rsl_cuda_check("rsl_cuda_flash_attn_decode_mxfp4");
 }
 
@@ -4006,7 +3648,7 @@ extern "C" int rsl_cuda_flash_attn_prefill_mxfp4(rsl_cuda_stream *s, const float
                                                  const void *k_packed, const void *v_packed,
                                                  float *out, int n_heads, int n_kv_heads,
                                                  int head_dim, int max_ctx,
-                                                 int kv_len_base, int n_new) {
+                                                 int kv_len_base, int n_new, int window, float softcap) {
     if (!s || !q || !k_packed || !v_packed || !out || n_new <= 0) return -1;
     if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 32) != 0) return -1;
     if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
@@ -4015,16 +3657,16 @@ extern "C" int rsl_cuda_flash_attn_prefill_mxfp4(rsl_cuda_stream *s, const float
     float scale = 1.0f / sqrtf((float)head_dim);
     int t = 64;
     dim3 b((n_heads + t - 1) / t, (unsigned)n_new);
-    flash_attn_prefill_mxfp4_kernel<<<b, t, 0, s->stream>>>(
+    flash_attn_prefill_packed_kernel<DeqMXFP4><<<b, t, 0, s->stream>>>(
         q, (const unsigned char *)k_packed, (const unsigned char *)v_packed, out,
-        n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale);
+        n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale, window, softcap);
     return rsl_cuda_check("rsl_cuda_flash_attn_prefill_mxfp4");
 }
 
 extern "C" int rsl_cuda_flash_attn_decode_mxfp6(rsl_cuda_stream *s, const float *q,
                                                 const void *k_packed, const void *v_packed,
                                                 float *out, int n_heads, int n_kv_heads,
-                                                int head_dim, int max_ctx, int kv_len) {
+                                                int head_dim, int max_ctx, int kv_len, int window, float softcap) {
     if (!s || !q || !k_packed || !v_packed || !out) return -1;
     if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 32) != 0) return -1;
     cudaSetDevice(s->device);
@@ -4038,9 +3680,9 @@ extern "C" int rsl_cuda_flash_attn_decode_mxfp6(rsl_cuda_stream *s, const float 
     dim3 grid((unsigned)n_heads);
     size_t shmem = (size_t)(RSL_FLASH_DECODE_W * head_dim +
                             2 * RSL_FLASH_DECODE_W) * sizeof(float);
-    flash_attn_decode_mxfp6_kernel<<<grid, block, shmem, s->stream>>>(
+    flash_attn_decode_packed_kernel<DeqMXFP6><<<grid, block, shmem, s->stream>>>(
         q, (const unsigned char *)k_packed, (const unsigned char *)v_packed, out,
-        n_heads, n_gqa, head_dim, max_ctx, kv_len, scale);
+        n_heads, n_gqa, head_dim, max_ctx, kv_len, scale, window, softcap);
     return rsl_cuda_check("rsl_cuda_flash_attn_decode_mxfp6");
 }
 
@@ -4048,7 +3690,7 @@ extern "C" int rsl_cuda_flash_attn_prefill_mxfp6(rsl_cuda_stream *s, const float
                                                  const void *k_packed, const void *v_packed,
                                                  float *out, int n_heads, int n_kv_heads,
                                                  int head_dim, int max_ctx,
-                                                 int kv_len_base, int n_new) {
+                                                 int kv_len_base, int n_new, int window, float softcap) {
     if (!s || !q || !k_packed || !v_packed || !out || n_new <= 0) return -1;
     if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 32) != 0) return -1;
     if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
@@ -4057,16 +3699,16 @@ extern "C" int rsl_cuda_flash_attn_prefill_mxfp6(rsl_cuda_stream *s, const float
     float scale = 1.0f / sqrtf((float)head_dim);
     int t = 64;
     dim3 b((n_heads + t - 1) / t, (unsigned)n_new);
-    flash_attn_prefill_mxfp6_kernel<<<b, t, 0, s->stream>>>(
+    flash_attn_prefill_packed_kernel<DeqMXFP6><<<b, t, 0, s->stream>>>(
         q, (const unsigned char *)k_packed, (const unsigned char *)v_packed, out,
-        n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale);
+        n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale, window, softcap);
     return rsl_cuda_check("rsl_cuda_flash_attn_prefill_mxfp6");
 }
 
 extern "C" int rsl_cuda_flash_attn_decode_mxfp8(rsl_cuda_stream *s, const float *q,
                                                 const void *k_packed, const void *v_packed,
                                                 float *out, int n_heads, int n_kv_heads,
-                                                int head_dim, int max_ctx, int kv_len) {
+                                                int head_dim, int max_ctx, int kv_len, int window, float softcap) {
     if (!s || !q || !k_packed || !v_packed || !out) return -1;
     if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 32) != 0) return -1;
     cudaSetDevice(s->device);
@@ -4080,9 +3722,9 @@ extern "C" int rsl_cuda_flash_attn_decode_mxfp8(rsl_cuda_stream *s, const float 
     dim3 grid((unsigned)n_heads);
     size_t shmem = (size_t)(RSL_FLASH_DECODE_W * head_dim +
                             2 * RSL_FLASH_DECODE_W) * sizeof(float);
-    flash_attn_decode_mxfp8_kernel<<<grid, block, shmem, s->stream>>>(
+    flash_attn_decode_packed_kernel<DeqMXFP8><<<grid, block, shmem, s->stream>>>(
         q, (const unsigned char *)k_packed, (const unsigned char *)v_packed, out,
-        n_heads, n_gqa, head_dim, max_ctx, kv_len, scale);
+        n_heads, n_gqa, head_dim, max_ctx, kv_len, scale, window, softcap);
     return rsl_cuda_check("rsl_cuda_flash_attn_decode_mxfp8");
 }
 
@@ -4090,7 +3732,7 @@ extern "C" int rsl_cuda_flash_attn_prefill_mxfp8(rsl_cuda_stream *s, const float
                                                  const void *k_packed, const void *v_packed,
                                                  float *out, int n_heads, int n_kv_heads,
                                                  int head_dim, int max_ctx,
-                                                 int kv_len_base, int n_new) {
+                                                 int kv_len_base, int n_new, int window, float softcap) {
     if (!s || !q || !k_packed || !v_packed || !out || n_new <= 0) return -1;
     if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 32) != 0) return -1;
     if (kv_len_base < 0 || kv_len_base + n_new > max_ctx) return -1;
@@ -4099,9 +3741,9 @@ extern "C" int rsl_cuda_flash_attn_prefill_mxfp8(rsl_cuda_stream *s, const float
     float scale = 1.0f / sqrtf((float)head_dim);
     int t = 64;
     dim3 b((n_heads + t - 1) / t, (unsigned)n_new);
-    flash_attn_prefill_mxfp8_kernel<<<b, t, 0, s->stream>>>(
+    flash_attn_prefill_packed_kernel<DeqMXFP8><<<b, t, 0, s->stream>>>(
         q, (const unsigned char *)k_packed, (const unsigned char *)v_packed, out,
-        n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale);
+        n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale, window, softcap);
     return rsl_cuda_check("rsl_cuda_flash_attn_prefill_mxfp8");
 }
 
@@ -4110,7 +3752,7 @@ extern "C" int rsl_cuda_flash_attn_decode_tq(rsl_cuda_stream *s, const float *q,
                                              const float *k_scales, const float *v_scales,
                                              int bits, float *out, int n_heads,
                                              int n_kv_heads, int head_dim, int max_ctx,
-                                             int kv_len) {
+                                             int kv_len, int window, float softcap) {
     if (!s || !q || !k_packed || !v_packed || !k_scales || !v_scales || !out) return -1;
     if (bits != 1 && bits != 2 && bits != 4 && bits != 8) return -1;
     if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 0) != 0) return -1;
@@ -4128,7 +3770,7 @@ extern "C" int rsl_cuda_flash_attn_decode_tq(rsl_cuda_stream *s, const float *q,
                    sizeof(float);
     flash_attn_decode_tq_kernel<<<grid, block, shmem, s->stream>>>(
         q, (const unsigned char *)k_packed, (const unsigned char *)v_packed,
-        k_scales, v_scales, bits, out, n_heads, n_gqa, head_dim, max_ctx, kv_len, scale);
+        k_scales, v_scales, bits, out, n_heads, n_gqa, head_dim, max_ctx, kv_len, scale, window, softcap);
     return rsl_cuda_check("rsl_cuda_flash_attn_decode_tq");
 }
 
@@ -4137,7 +3779,7 @@ extern "C" int rsl_cuda_flash_attn_prefill_tq(rsl_cuda_stream *s, const float *q
                                               const float *k_scales, const float *v_scales,
                                               int bits, float *out, int n_heads,
                                               int n_kv_heads, int head_dim, int max_ctx,
-                                              int kv_len_base, int n_new) {
+                                              int kv_len_base, int n_new, int window, float softcap) {
     if (!s || !q || !k_packed || !v_packed || !k_scales || !v_scales || !out || n_new <= 0)
         return -1;
     if (bits != 1 && bits != 2 && bits != 4 && bits != 8) return -1;
@@ -4151,7 +3793,7 @@ extern "C" int rsl_cuda_flash_attn_prefill_tq(rsl_cuda_stream *s, const float *q
     flash_attn_prefill_tq_kernel<<<b, t, 0, s->stream>>>(
         q, (const unsigned char *)k_packed, (const unsigned char *)v_packed,
         k_scales, v_scales, bits, out, n_heads, n_gqa, head_dim, max_ctx,
-        kv_len_base, n_new, scale);
+        kv_len_base, n_new, scale, window, softcap);
     return rsl_cuda_check("rsl_cuda_flash_attn_prefill_tq");
 }
 
@@ -4183,7 +3825,7 @@ __global__ void flash_attn_decode_q8_0_kernel(const float *q,
                                               const float *v_scales,
                                               float *out, int n_heads, int n_gqa,
                                               int head_dim, int max_ctx,
-                                              int kv_len, float scale) {
+                                              int kv_len, float scale, int window, float softcap) {
     extern __shared__ float smem[];
     float *sh_acc = smem;
     float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;
@@ -4204,7 +3846,11 @@ __global__ void flash_attn_decode_q8_0_kernel(const float *q,
     }
     float m = -INFINITY, l = 0.f;
 
+    // Sliding-window lower bound (SWA): attend only `[t_start, kv_len)`.
+    // window==0 or window>=kv_len ⇒ t_start=0 ⇒ full attention.
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
     for (int t = warp; t < kv_len; t += RSL_FLASH_DECODE_W) {
+        if (t < t_start) continue;  // SWA: before the window start (warp-uniform)
         const size_t ridx = (size_t)(kv_h * max_ctx + t);
         const signed char *kp = k_q + ridx * head_dim;
         float partial = 0.f;
@@ -4214,6 +3860,8 @@ __global__ void flash_attn_decode_q8_0_kernel(const float *q,
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_down_sync(0xffffffffu, partial, off);
         float s_dot = __shfl_sync(0xffffffffu, partial, 0) * (k_scales[ridx] * scale);
+        // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+        if (softcap > 0.f) s_dot = softcap * tanhf(s_dot / softcap);
         float m_new = fmaxf(m, s_dot);
         float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
         float p = expf(s_dot - m_new);
@@ -4262,7 +3910,7 @@ __global__ void flash_attn_prefill_q8_0_kernel(const float *q,
                                                float *out, int n_heads, int n_gqa,
                                                int head_dim, int max_ctx,
                                                int kv_len_base, int n_new,
-                                               float scale) {
+                                               float scale, int window, float softcap) {
     int hh = blockIdx.x * blockDim.x + threadIdx.x;
     int q_pos = blockIdx.y;
     if (hh >= n_heads || q_pos >= n_new) return;
@@ -4272,12 +3920,17 @@ __global__ void flash_attn_prefill_q8_0_kernel(const float *q,
     int kv_len_for_q = kv_len_base + q_pos + 1;
     for (int i = 0; i < head_dim; ++i) out[out_off + i] = 0.f;
     float m = -INFINITY, l = 0.f;
-    for (int t = 0; t < kv_len_for_q; ++t) {
+    // SWA per-query lower bound: query at abs pos (kv_len_for_q-1) attends
+    // `[t_start, kv_len_for_q)`. window==0 (or the window reaching pos 0) ⇒ full.
+    const int t_start = (window > 0 && kv_len_for_q - window > 0) ? (kv_len_for_q - window) : 0;
+    for (int t = t_start; t < kv_len_for_q; ++t) {
         size_t ridx = (size_t)(kv_h * max_ctx + t);
         const signed char *kp = k_q + ridx * head_dim;
         float s_dot = 0.f;
         for (int i = 0; i < head_dim; ++i) s_dot += q[q_off + i] * (float)kp[i];
         s_dot *= k_scales[ridx] * scale;
+        // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+        if (softcap > 0.f) s_dot = softcap * tanhf(s_dot / softcap);
         float m_new = fmaxf(m, s_dot);
         float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
         float p = expf(s_dot - m_new);
@@ -4296,7 +3949,7 @@ extern "C" int rsl_cuda_flash_attn_decode_q8_0(rsl_cuda_stream *s, const float *
                                                const void *k_packed, const void *v_packed,
                                                const float *k_scales, const float *v_scales,
                                                float *out, int n_heads, int n_kv_heads,
-                                               int head_dim, int max_ctx, int kv_len) {
+                                               int head_dim, int max_ctx, int kv_len, int window, float softcap) {
     if (!s || !q || !k_packed || !v_packed || !k_scales || !v_scales || !out) return -1;
     // blk_elems = 1: no block-alignment requirement (one i8 per element).
     if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 1) != 0) return -1;
@@ -4314,7 +3967,7 @@ extern "C" int rsl_cuda_flash_attn_decode_q8_0(rsl_cuda_stream *s, const float *
                    sizeof(float);
     flash_attn_decode_q8_0_kernel<<<grid, block, shmem, s->stream>>>(
         q, (const signed char *)k_packed, k_scales, (const signed char *)v_packed, v_scales,
-        out, n_heads, n_gqa, head_dim, max_ctx, kv_len, scale);
+        out, n_heads, n_gqa, head_dim, max_ctx, kv_len, scale, window, softcap);
     return rsl_cuda_check("rsl_cuda_flash_attn_decode_q8_0");
 }
 
@@ -4323,7 +3976,7 @@ extern "C" int rsl_cuda_flash_attn_prefill_q8_0(rsl_cuda_stream *s, const float 
                                                 const float *k_scales, const float *v_scales,
                                                 float *out, int n_heads, int n_kv_heads,
                                                 int head_dim, int max_ctx,
-                                                int kv_len_base, int n_new) {
+                                                int kv_len_base, int n_new, int window, float softcap) {
     if (!s || !q || !k_packed || !v_packed || !k_scales || !v_scales || !out || n_new <= 0)
         return -1;
     if (rsl_flash_kv_shape_ok(n_heads, n_kv_heads, head_dim, max_ctx, 1) != 0) return -1;
@@ -4335,7 +3988,7 @@ extern "C" int rsl_cuda_flash_attn_prefill_q8_0(rsl_cuda_stream *s, const float 
     dim3 b((n_heads + t - 1) / t, (unsigned)n_new);
     flash_attn_prefill_q8_0_kernel<<<b, t, 0, s->stream>>>(
         q, (const signed char *)k_packed, k_scales, (const signed char *)v_packed, v_scales,
-        out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale);
+        out, n_heads, n_gqa, head_dim, max_ctx, kv_len_base, n_new, scale, window, softcap);
     return rsl_cuda_check("rsl_cuda_flash_attn_prefill_q8_0");
 }
 

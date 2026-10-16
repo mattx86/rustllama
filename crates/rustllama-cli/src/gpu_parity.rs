@@ -2479,18 +2479,6 @@ fn probe_attn_quant_kv(
         // large max_rel). Matches the CUDA probe's reference.
         let kc_dq = dequant_kv_cache(fmt, &kp, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
         let vc_dq = dequant_kv_cache(fmt, &vp, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
-        let mut cpu_out = vec![0f32; AT_HEADS * AT_HEAD_DIM];
-        k::gqa_attention_one_step(
-            &q,
-            &kc_dq,
-            &vc_dq,
-            &mut cpu_out,
-            AT_HEADS,
-            AT_KV_HEADS,
-            AT_HEAD_DIM,
-            AT_MAX_CTX,
-            AT_KV_LEN,
-        );
         let alloc = (|| -> sk::Result<_> {
             let mut qb = sk::SyclSharedBuffer::<f32>::alloc(stream, q.len())?;
             qb.as_mut_slice().copy_from_slice(&q);
@@ -2498,8 +2486,7 @@ fn probe_attn_quant_kv(
             kb.as_mut_slice().copy_from_slice(&kp);
             let mut vb = sk::SyclSharedBuffer::<u8>::alloc(stream, vp.len())?;
             vb.as_mut_slice().copy_from_slice(&vp);
-            let mut ob = sk::SyclSharedBuffer::<f32>::alloc(stream, cpu_out.len())?;
-            ob.as_mut_slice().fill(f32::NAN);
+            let ob = sk::SyclSharedBuffer::<f32>::alloc(stream, AT_HEADS * AT_HEAD_DIM)?;
             Ok((qb, kb, vb, ob))
         })();
         let (qb, kb, vb, mut ob) = match alloc {
@@ -2509,57 +2496,85 @@ fn probe_attn_quant_kv(
                 return;
             }
         };
-        // SAFETY: all four are live USM allocations on `stream`; q/out are
-        // F32 [n_heads*head_dim], k/v packed U8 [n_kv_heads*max_ctx*
-        // bytes_per_row] (built by quantize_kv_cache); the kernels wait
-        // before returning.
-        let res = unsafe {
-            match fmt.name {
-                "mxfp4" => sk::flash_attn_decode_mxfp4_usm_raw(
-                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                    AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                    AT_MAX_CTX as u32, AT_KV_LEN as u32,
-                ),
-                "mxfp6" => sk::flash_attn_decode_mxfp6_usm_raw(
-                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                    AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                    AT_MAX_CTX as u32, AT_KV_LEN as u32,
-                ),
-                "mxfp8" => sk::flash_attn_decode_mxfp8_usm_raw(
-                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                    AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                    AT_MAX_CTX as u32, AT_KV_LEN as u32,
-                ),
-                "nvfp4" => sk::flash_attn_decode_nvfp4_usm_raw(
-                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                    AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                    AT_MAX_CTX as u32, AT_KV_LEN as u32,
-                ),
-                "q4_0" => sk::flash_attn_decode_q4_0_usm_raw(
-                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                    AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                    AT_MAX_CTX as u32, AT_KV_LEN as u32,
-                ),
-                _ => {
-                    emit(name, "SKIP", "unknown-format");
-                    return;
+        // F1: fold three cases into the ONE attn:decode_<fmt> verdict (same
+        // pattern as the f32 probe): passthrough (0,0.0) must stay bit-identical,
+        // a sliding-window case (16,0.0) — AT_KV_LEN trims to the last 16 — and
+        // the Gemma2 softcap (0,50.0). The CPU reference runs the SAME (window,
+        // softcap) over the IDENTICAL dequantized K/V, so a cap/window-blind
+        // kernel fails the combined verdict (fail-closed).
+        let cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
+        let mut ok_all = true;
+        let mut worst_cos = 1.0f64;
+        let mut worst_rel = 0.0f64;
+        let mut kernel_err: Option<String> = None;
+        for (window, softcap) in cases {
+            let mut cpu_out = vec![0f32; AT_HEADS * AT_HEAD_DIM];
+            k::gqa_attention_one_step_capped_windowed(
+                &q, &kc_dq, &vc_dq, &mut cpu_out,
+                AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN,
+                window as usize, softcap,
+            );
+            ob.as_mut_slice().fill(f32::NAN);
+            // SAFETY: all four are live USM allocations on `stream`; q/out are
+            // F32 [n_heads*head_dim], k/v packed U8 [n_kv_heads*max_ctx*
+            // bytes_per_row] (built by quantize_kv_cache); the kernels wait.
+            let res = unsafe {
+                match fmt.name {
+                    "mxfp4" => sk::flash_attn_decode_mxfp4_usm_raw(
+                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
+                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32, AT_KV_LEN as u32, window, softcap,
+                    ),
+                    "mxfp6" => sk::flash_attn_decode_mxfp6_usm_raw(
+                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
+                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32, AT_KV_LEN as u32, window, softcap,
+                    ),
+                    "mxfp8" => sk::flash_attn_decode_mxfp8_usm_raw(
+                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
+                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32, AT_KV_LEN as u32, window, softcap,
+                    ),
+                    "nvfp4" => sk::flash_attn_decode_nvfp4_usm_raw(
+                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
+                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32, AT_KV_LEN as u32, window, softcap,
+                    ),
+                    "q4_0" => sk::flash_attn_decode_q4_0_usm_raw(
+                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
+                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32, AT_KV_LEN as u32, window, softcap,
+                    ),
+                    _ => {
+                        emit(name, "SKIP", "unknown-format");
+                        return;
+                    }
                 }
+            };
+            if let Err(e) = res {
+                kernel_err = Some(format!("{e}"));
+                break;
             }
-        };
+            let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
+            if !(cos > fmt.cos_min && max_rel < fmt.rel_max) {
+                ok_all = false;
+            }
+            if cos < worst_cos {
+                worst_cos = cos;
+            }
+            if max_rel > worst_rel {
+                worst_rel = max_rel;
+            }
+        }
         let ms = started.elapsed().as_millis();
-        match res {
-            Err(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
-            Ok(()) => {
-                let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
-                let verdict = if cos > fmt.cos_min && max_rel < fmt.rel_max {
-                    "OK"
-                } else {
-                    "MISCOMPUTE"
-                };
+        match kernel_err {
+            Some(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
+            None => {
+                let verdict = if ok_all { "OK" } else { "MISCOMPUTE" };
                 emit(
                     name,
                     verdict,
-                    &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"),
+                    &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50) ms={ms}"),
                 );
             }
         }
@@ -2580,19 +2595,6 @@ fn probe_attn_quant_kv(
         // max_rel reflects kernel reassociation, not quantization loss.
         let kc_dq = dequant_kv_cache(fmt, &kp, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
         let vc_dq = dequant_kv_cache(fmt, &vp, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
-        let mut cpu_out = vec![0f32; q.len()];
-        k::gqa_attention_flash_prefill(
-            &q,
-            &kc_dq,
-            &vc_dq,
-            &mut cpu_out,
-            AT_HEADS,
-            AT_KV_HEADS,
-            AT_HEAD_DIM,
-            AT_MAX_CTX,
-            AT_PREFILL_BASE,
-            AT_PREFILL_NEW,
-        );
         let alloc = (|| -> sk::Result<_> {
             let mut qb = sk::SyclSharedBuffer::<f32>::alloc(stream, q.len())?;
             qb.as_mut_slice().copy_from_slice(&q);
@@ -2600,8 +2602,7 @@ fn probe_attn_quant_kv(
             kb.as_mut_slice().copy_from_slice(&kp);
             let mut vb = sk::SyclSharedBuffer::<u8>::alloc(stream, vp.len())?;
             vb.as_mut_slice().copy_from_slice(&vp);
-            let mut ob = sk::SyclSharedBuffer::<f32>::alloc(stream, cpu_out.len())?;
-            ob.as_mut_slice().fill(f32::NAN);
+            let ob = sk::SyclSharedBuffer::<f32>::alloc(stream, q.len())?;
             Ok((qb, kb, vb, ob))
         })();
         let (qb, kb, vb, mut ob) = match alloc {
@@ -2611,55 +2612,87 @@ fn probe_attn_quant_kv(
                 return;
             }
         };
-        // SAFETY: as in the decode arm; q/out are F32 [n_new*n_heads*
-        // head_dim], k/v packed U8; kernels wait before returning.
-        let res = unsafe {
-            match fmt.name {
-                "mxfp4" => sk::flash_attn_prefill_mxfp4_usm_raw(
-                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                    AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                    AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
-                ),
-                "mxfp6" => sk::flash_attn_prefill_mxfp6_usm_raw(
-                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                    AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                    AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
-                ),
-                "mxfp8" => sk::flash_attn_prefill_mxfp8_usm_raw(
-                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                    AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                    AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
-                ),
-                "nvfp4" => sk::flash_attn_prefill_nvfp4_usm_raw(
-                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                    AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                    AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
-                ),
-                "q4_0" => sk::flash_attn_prefill_q4_0_usm_raw(
-                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                    AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                    AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
-                ),
-                _ => {
-                    emit(name, "SKIP", "unknown-format");
-                    return;
+        // F1: three cases into the ONE attn:prefill_<fmt> verdict (see the decode
+        // arm): passthrough (0,0.0), a sliding window (16,0.0), the Gemma2 softcap
+        // (0,50.0); CPU `..._flash_prefill_capped_windowed` applies the SAME over
+        // the identical dequantized K/V.
+        let cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
+        let mut ok_all = true;
+        let mut worst_cos = 1.0f64;
+        let mut worst_rel = 0.0f64;
+        let mut kernel_err: Option<String> = None;
+        for (window, softcap) in cases {
+            let mut cpu_out = vec![0f32; q.len()];
+            k::gqa_attention_flash_prefill_capped_windowed(
+                &q, &kc_dq, &vc_dq, &mut cpu_out,
+                AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX,
+                AT_PREFILL_BASE, AT_PREFILL_NEW, window as usize, softcap,
+            );
+            ob.as_mut_slice().fill(f32::NAN);
+            // SAFETY: as in the decode arm; q/out are F32 [n_new*n_heads*
+            // head_dim], k/v packed U8; kernels wait before returning.
+            let res = unsafe {
+                match fmt.name {
+                    "mxfp4" => sk::flash_attn_prefill_mxfp4_usm_raw(
+                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
+                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
+                        window, softcap,
+                    ),
+                    "mxfp6" => sk::flash_attn_prefill_mxfp6_usm_raw(
+                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
+                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
+                        window, softcap,
+                    ),
+                    "mxfp8" => sk::flash_attn_prefill_mxfp8_usm_raw(
+                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
+                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
+                        window, softcap,
+                    ),
+                    "nvfp4" => sk::flash_attn_prefill_nvfp4_usm_raw(
+                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
+                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
+                        window, softcap,
+                    ),
+                    "q4_0" => sk::flash_attn_prefill_q4_0_usm_raw(
+                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
+                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
+                        window, softcap,
+                    ),
+                    _ => {
+                        emit(name, "SKIP", "unknown-format");
+                        return;
+                    }
                 }
+            };
+            if let Err(e) = res {
+                kernel_err = Some(format!("{e}"));
+                break;
             }
-        };
+            let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
+            if !(cos > fmt.cos_min && max_rel < fmt.rel_max) {
+                ok_all = false;
+            }
+            if cos < worst_cos {
+                worst_cos = cos;
+            }
+            if max_rel > worst_rel {
+                worst_rel = max_rel;
+            }
+        }
         let ms = started.elapsed().as_millis();
-        match res {
-            Err(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
-            Ok(()) => {
-                let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
-                let verdict = if cos > fmt.cos_min && max_rel < fmt.rel_max {
-                    "OK"
-                } else {
-                    "MISCOMPUTE"
-                };
+        match kernel_err {
+            Some(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
+            None => {
+                let verdict = if ok_all { "OK" } else { "MISCOMPUTE" };
                 emit(
                     name,
                     verdict,
-                    &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"),
+                    &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50) ms={ms}"),
                 );
             }
         }
@@ -2726,35 +2759,60 @@ fn probe_attn_q8_0(stream: &sk::SyclStream, name: &str, dir: &str, started: Inst
         let (vslab, vsc) = quantize_kv_q8_0(&vcache, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
         let kdq = dequant_kv_q8_0(&kslab, &ksc, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
         let vdq = dequant_kv_q8_0(&vslab, &vsc, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
-        let mut cpu_out = vec![0f32; AT_HEADS * AT_HEAD_DIM];
-        k::gqa_attention_one_step(
-            &q, &kdq, &vdq, &mut cpu_out,
-            AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN,
-        );
         let (qb, kb, vb, ksb, vsb, mut ob) =
-            match run(&q, &kslab, &ksc, &vslab, &vsc, cpu_out.len()) {
+            match run(&q, &kslab, &ksc, &vslab, &vsc, AT_HEADS * AT_HEAD_DIM) {
                 Ok(t) => t,
                 Err(_) => {
                     emit(name, "KERNEL_ERR", "usm-alloc-failed");
                     return;
                 }
             };
-        // SAFETY: all USM buffers live on `stream`, sized to the geometry; the
-        // kernel waits before returning.
-        let res = unsafe {
-            sk::flash_attn_decode_q8_0_usm_raw(
-                stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ksb.as_ptr(), vsb.as_ptr(),
-                ob.as_mut_ptr(), AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                AT_MAX_CTX as u32, AT_KV_LEN as u32,
-            )
-        };
+        // F1: passthrough (0,0.0) + sliding-window (16,0.0) + Gemma2 softcap
+        // (0,50.0) fold into the ONE attn:decode_q8_0 verdict; CPU reference
+        // caps/windows the identical dequantized K/V.
+        let cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
+        let mut ok_all = true;
+        let mut worst_cos = 1.0f64;
+        let mut worst_rel = 0.0f64;
+        let mut kernel_err: Option<String> = None;
+        for (window, softcap) in cases {
+            let mut cpu_out = vec![0f32; AT_HEADS * AT_HEAD_DIM];
+            k::gqa_attention_one_step_capped_windowed(
+                &q, &kdq, &vdq, &mut cpu_out,
+                AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN,
+                window as usize, softcap,
+            );
+            ob.as_mut_slice().fill(f32::NAN);
+            // SAFETY: all USM buffers live on `stream`, sized to the geometry;
+            // the kernel waits before returning.
+            let res = unsafe {
+                sk::flash_attn_decode_q8_0_usm_raw(
+                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ksb.as_ptr(), vsb.as_ptr(),
+                    ob.as_mut_ptr(), AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
+                    AT_MAX_CTX as u32, AT_KV_LEN as u32, window, softcap,
+                )
+            };
+            if let Err(e) = res {
+                kernel_err = Some(format!("{e}"));
+                break;
+            }
+            let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
+            if !(cos > 0.999 && max_rel < 0.05) {
+                ok_all = false;
+            }
+            if cos < worst_cos {
+                worst_cos = cos;
+            }
+            if max_rel > worst_rel {
+                worst_rel = max_rel;
+            }
+        }
         let ms = started.elapsed().as_millis();
-        match res {
-            Err(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
-            Ok(()) => {
-                let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
-                let verdict = if cos > 0.999 && max_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
-                emit(name, verdict, &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"));
+        match kernel_err {
+            Some(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
+            None => {
+                let verdict = if ok_all { "OK" } else { "MISCOMPUTE" };
+                emit(name, verdict, &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50) ms={ms}"));
             }
         }
     } else if dir == "prefill" {
@@ -2768,34 +2826,58 @@ fn probe_attn_q8_0(stream: &sk::SyclStream, name: &str, dir: &str, started: Inst
         let (vslab, vsc) = quantize_kv_q8_0(&vcache, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
         let kdq = dequant_kv_q8_0(&kslab, &ksc, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
         let vdq = dequant_kv_q8_0(&vslab, &vsc, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
-        let mut cpu_out = vec![0f32; q.len()];
-        k::gqa_attention_flash_prefill(
-            &q, &kdq, &vdq, &mut cpu_out,
-            AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_PREFILL_BASE, AT_PREFILL_NEW,
-        );
         let (qb, kb, vb, ksb, vsb, mut ob) =
-            match run(&q, &kslab, &ksc, &vslab, &vsc, cpu_out.len()) {
+            match run(&q, &kslab, &ksc, &vslab, &vsc, q.len()) {
                 Ok(t) => t,
                 Err(_) => {
                     emit(name, "KERNEL_ERR", "usm-alloc-failed");
                     return;
                 }
             };
-        // SAFETY: as the decode arm, q/out sized for AT_PREFILL_NEW queries.
-        let res = unsafe {
-            sk::flash_attn_prefill_q8_0_usm_raw(
-                stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ksb.as_ptr(), vsb.as_ptr(),
-                ob.as_mut_ptr(), AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
-            )
-        };
+        // F1: passthrough + sliding-window + Gemma2 softcap into the ONE verdict.
+        let cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
+        let mut ok_all = true;
+        let mut worst_cos = 1.0f64;
+        let mut worst_rel = 0.0f64;
+        let mut kernel_err: Option<String> = None;
+        for (window, softcap) in cases {
+            let mut cpu_out = vec![0f32; q.len()];
+            k::gqa_attention_flash_prefill_capped_windowed(
+                &q, &kdq, &vdq, &mut cpu_out,
+                AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_PREFILL_BASE, AT_PREFILL_NEW,
+                window as usize, softcap,
+            );
+            ob.as_mut_slice().fill(f32::NAN);
+            // SAFETY: as the decode arm, q/out sized for AT_PREFILL_NEW queries.
+            let res = unsafe {
+                sk::flash_attn_prefill_q8_0_usm_raw(
+                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ksb.as_ptr(), vsb.as_ptr(),
+                    ob.as_mut_ptr(), AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
+                    AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
+                    window, softcap,
+                )
+            };
+            if let Err(e) = res {
+                kernel_err = Some(format!("{e}"));
+                break;
+            }
+            let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
+            if !(cos > 0.999 && max_rel < 0.05) {
+                ok_all = false;
+            }
+            if cos < worst_cos {
+                worst_cos = cos;
+            }
+            if max_rel > worst_rel {
+                worst_rel = max_rel;
+            }
+        }
         let ms = started.elapsed().as_millis();
-        match res {
-            Err(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
-            Ok(()) => {
-                let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
-                let verdict = if cos > 0.999 && max_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
-                emit(name, verdict, &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"));
+        match kernel_err {
+            Some(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
+            None => {
+                let verdict = if ok_all { "OK" } else { "MISCOMPUTE" };
+                emit(name, verdict, &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50) ms={ms}"));
             }
         }
     } else {
@@ -2858,35 +2940,58 @@ fn probe_attn_tq(stream: &sk::SyclStream, name: &str, dir: &str, started: Instan
         let (vslab, vsc) = quantize_kv_tq(&vcache, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
         let kdq = dequant_kv_tq(&kslab, &ksc, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
         let vdq = dequant_kv_tq(&vslab, &vsc, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
-        let mut cpu_out = vec![0f32; AT_HEADS * AT_HEAD_DIM];
-        k::gqa_attention_one_step(
-            &q, &kdq, &vdq, &mut cpu_out,
-            AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN,
-        );
         let (qb, kb, vb, ksb, vsb, mut ob) =
-            match run(&q, &kslab, &ksc, &vslab, &vsc, cpu_out.len()) {
+            match run(&q, &kslab, &ksc, &vslab, &vsc, AT_HEADS * AT_HEAD_DIM) {
                 Ok(t) => t,
                 Err(_) => {
                     emit(name, "KERNEL_ERR", "usm-alloc-failed");
                     return;
                 }
             };
-        // SAFETY: all USM buffers live on `stream`, sized to the geometry; the
-        // kernel waits before returning.
-        let res = unsafe {
-            sk::flash_attn_decode_tq_usm_raw(
-                stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ksb.as_ptr(), vsb.as_ptr(),
-                bits as u32, ob.as_mut_ptr(), AT_HEADS as u32, AT_KV_HEADS as u32,
-                AT_HEAD_DIM as u32, AT_MAX_CTX as u32, AT_KV_LEN as u32,
-            )
-        };
+        // F1: passthrough + sliding-window + Gemma2 softcap into the ONE verdict.
+        let cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
+        let mut ok_all = true;
+        let mut worst_cos = 1.0f64;
+        let mut worst_rel = 0.0f64;
+        let mut kernel_err: Option<String> = None;
+        for (window, softcap) in cases {
+            let mut cpu_out = vec![0f32; AT_HEADS * AT_HEAD_DIM];
+            k::gqa_attention_one_step_capped_windowed(
+                &q, &kdq, &vdq, &mut cpu_out,
+                AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN,
+                window as usize, softcap,
+            );
+            ob.as_mut_slice().fill(f32::NAN);
+            // SAFETY: all USM buffers live on `stream`, sized to the geometry;
+            // the kernel waits before returning.
+            let res = unsafe {
+                sk::flash_attn_decode_tq_usm_raw(
+                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ksb.as_ptr(), vsb.as_ptr(),
+                    bits as u32, ob.as_mut_ptr(), AT_HEADS as u32, AT_KV_HEADS as u32,
+                    AT_HEAD_DIM as u32, AT_MAX_CTX as u32, AT_KV_LEN as u32, window, softcap,
+                )
+            };
+            if let Err(e) = res {
+                kernel_err = Some(format!("{e}"));
+                break;
+            }
+            let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
+            if !(cos > 0.999 && max_rel < 0.05) {
+                ok_all = false;
+            }
+            if cos < worst_cos {
+                worst_cos = cos;
+            }
+            if max_rel > worst_rel {
+                worst_rel = max_rel;
+            }
+        }
         let ms = started.elapsed().as_millis();
-        match res {
-            Err(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
-            Ok(()) => {
-                let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
-                let verdict = if cos > 0.999 && max_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
-                emit(name, verdict, &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms} bits={bits}"));
+        match kernel_err {
+            Some(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
+            None => {
+                let verdict = if ok_all { "OK" } else { "MISCOMPUTE" };
+                emit(name, verdict, &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50) ms={ms} bits={bits}"));
             }
         }
     } else if dir == "prefill" {
@@ -2900,34 +3005,58 @@ fn probe_attn_tq(stream: &sk::SyclStream, name: &str, dir: &str, started: Instan
         let (vslab, vsc) = quantize_kv_tq(&vcache, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
         let kdq = dequant_kv_tq(&kslab, &ksc, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
         let vdq = dequant_kv_tq(&vslab, &vsc, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
-        let mut cpu_out = vec![0f32; q.len()];
-        k::gqa_attention_flash_prefill(
-            &q, &kdq, &vdq, &mut cpu_out,
-            AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_PREFILL_BASE, AT_PREFILL_NEW,
-        );
         let (qb, kb, vb, ksb, vsb, mut ob) =
-            match run(&q, &kslab, &ksc, &vslab, &vsc, cpu_out.len()) {
+            match run(&q, &kslab, &ksc, &vslab, &vsc, q.len()) {
                 Ok(t) => t,
                 Err(_) => {
                     emit(name, "KERNEL_ERR", "usm-alloc-failed");
                     return;
                 }
             };
-        // SAFETY: as the decode arm, q/out sized for AT_PREFILL_NEW queries.
-        let res = unsafe {
-            sk::flash_attn_prefill_tq_usm_raw(
-                stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ksb.as_ptr(), vsb.as_ptr(),
-                bits as u32, ob.as_mut_ptr(), AT_HEADS as u32, AT_KV_HEADS as u32,
-                AT_HEAD_DIM as u32, AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
-            )
-        };
+        // F1: passthrough + sliding-window + Gemma2 softcap into the ONE verdict.
+        let cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
+        let mut ok_all = true;
+        let mut worst_cos = 1.0f64;
+        let mut worst_rel = 0.0f64;
+        let mut kernel_err: Option<String> = None;
+        for (window, softcap) in cases {
+            let mut cpu_out = vec![0f32; q.len()];
+            k::gqa_attention_flash_prefill_capped_windowed(
+                &q, &kdq, &vdq, &mut cpu_out,
+                AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_PREFILL_BASE, AT_PREFILL_NEW,
+                window as usize, softcap,
+            );
+            ob.as_mut_slice().fill(f32::NAN);
+            // SAFETY: as the decode arm, q/out sized for AT_PREFILL_NEW queries.
+            let res = unsafe {
+                sk::flash_attn_prefill_tq_usm_raw(
+                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ksb.as_ptr(), vsb.as_ptr(),
+                    bits as u32, ob.as_mut_ptr(), AT_HEADS as u32, AT_KV_HEADS as u32,
+                    AT_HEAD_DIM as u32, AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
+                    window, softcap,
+                )
+            };
+            if let Err(e) = res {
+                kernel_err = Some(format!("{e}"));
+                break;
+            }
+            let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
+            if !(cos > 0.999 && max_rel < 0.05) {
+                ok_all = false;
+            }
+            if cos < worst_cos {
+                worst_cos = cos;
+            }
+            if max_rel > worst_rel {
+                worst_rel = max_rel;
+            }
+        }
         let ms = started.elapsed().as_millis();
-        match res {
-            Err(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
-            Ok(()) => {
-                let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
-                let verdict = if cos > 0.999 && max_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
-                emit(name, verdict, &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms} bits={bits}"));
+        match kernel_err {
+            Some(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
+            None => {
+                let verdict = if ok_all { "OK" } else { "MISCOMPUTE" };
+                emit(name, verdict, &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50) ms={ms} bits={bits}"));
             }
         }
     } else {
@@ -3283,6 +3412,11 @@ fn ref_silu_mul(x: &[f32], y: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+// Retained as the simple (window=0, softcap=0) flash-decode reference twin of
+// `ref_flash_prefill`. The quant-KV CUDA/MLX probes now grade against the
+// `_capped_windowed` reference (so they exercise SWA + soft-cap), so this twin
+// has no live caller at the moment — kept for symmetry + ad-hoc reference use.
+#[allow(dead_code)]
 fn ref_flash_decode(
     q: &[f32],
     kc: &[f32],
@@ -4781,115 +4915,167 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
 
             // Same-quant reference: dequantize the identical packed K/V and run
             // the f32 flash reference on THAT (per-format — each format
-            // round-trips differently).
+            // round-trips differently). F1: the `_capped_windowed` reference
+            // applies the per-case (window, softcap) just like the f32 flash
+            // section above, so the probe actually exercises the kernel's SWA +
+            // Gemma2 soft-cap (fail-closed: a kernel that ignores either uniform
+            // misses the combined verdict). At (0,0.0) it equals `ref_flash_*`.
             let kc_dq = dequant_kv_cache(fmt, &kp, n_kv_heads, head_dim, max_ctx, upto);
             let vc_dq = dequant_kv_cache(fmt, &vp, n_kv_heads, head_dim, max_ctx, upto);
-            let cpu_dec = ref_flash_decode(
-                &q, &kc_dq, &vc_dq, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-            );
-            let cpu_pre = ref_flash_prefill(
-                &qp, &kc_dq, &vc_dq, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-            );
 
-            // decode
+            // decode — fold passthrough + sliding-window (kv_len=40 ⇒ window=16
+            // trims) + Gemma2 soft-cap into the one `attn:decode_<fmt>` verdict.
             if let (Some(qb), Some(kb), Some(vb), Some(mut ob)) = (
                 cu_upload_f32(&stream, &q),
                 ck::CudaDeviceBuffer::from_host(&stream, &kp),
                 ck::CudaDeviceBuffer::from_host(&stream, &vp),
                 ck::CudaDeviceBuffer::alloc(&stream, n_heads * head_dim * 4),
             ) {
-                // SAFETY: q/out are F32 device buffers [n_heads*head_dim];
-                // k/v are packed device buffers [n_kv_heads*max_ctx*
-                // bytes_per_row]; the wrappers synchronize before returning.
-                let res = unsafe {
-                    let q = qb.as_ptr() as *const f32;
-                    let k = kb.as_ptr();
-                    let v = vb.as_ptr();
-                    let o = ob.as_mut_ptr() as *mut f32;
-                    match fmt.name {
-                        "mxfp4" => ck::flash_attn_decode_mxfp4(
-                            &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                        ),
-                        "mxfp6" => ck::flash_attn_decode_mxfp6(
-                            &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                        ),
-                        "mxfp8" => ck::flash_attn_decode_mxfp8(
-                            &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                        ),
-                        "nvfp4" => ck::flash_attn_decode_nvfp4(
-                            &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                        ),
-                        "q4_0" => ck::flash_attn_decode_q4_0(
-                            &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                        ),
-                        _ => unreachable!(),
+                let dec_cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
+                let (mut worst_cos, mut worst_rel) = (1.0f64, 0.0f64);
+                let mut err: Option<String> = None;
+                for (window, softcap) in dec_cases {
+                    let mut cpu_dec = vec![0f32; n_heads * head_dim];
+                    k::gqa_attention_flash_decode_capped_windowed(
+                        &q, &kc_dq, &vc_dq, &mut cpu_dec,
+                        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                        window as usize, softcap,
+                    );
+                    // SAFETY: q/out are F32 device buffers [n_heads*head_dim];
+                    // k/v are packed device buffers [n_kv_heads*max_ctx*
+                    // bytes_per_row]; the wrappers synchronize before returning.
+                    let res = unsafe {
+                        let q = qb.as_ptr() as *const f32;
+                        let k = kb.as_ptr();
+                        let v = vb.as_ptr();
+                        let o = ob.as_mut_ptr() as *mut f32;
+                        match fmt.name {
+                            "mxfp4" => ck::flash_attn_decode_mxfp4(
+                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                                window as i32, softcap,
+                            ),
+                            "mxfp6" => ck::flash_attn_decode_mxfp6(
+                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                                window as i32, softcap,
+                            ),
+                            "mxfp8" => ck::flash_attn_decode_mxfp8(
+                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                                window as i32, softcap,
+                            ),
+                            "nvfp4" => ck::flash_attn_decode_nvfp4(
+                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                                window as i32, softcap,
+                            ),
+                            "q4_0" => ck::flash_attn_decode_q4_0(
+                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                                window as i32, softcap,
+                            ),
+                            _ => unreachable!(),
+                        }
+                    };
+                    if let Err(e) = res {
+                        err = Some(format!("{e}"));
+                        break;
                     }
-                };
-                match res {
-                    Ok(()) => cu_grade(
-                        &dname,
-                        &cu_download_f32(&ob, n_heads * head_dim),
-                        &cpu_dec,
-                        fmt.cos_min,
-                        fmt.rel_max,
-                        &mut counts,
-                    ),
-                    Err(e) => {
+                    let (cos, max_rel) = compare(&cu_download_f32(&ob, n_heads * head_dim), &cpu_dec);
+                    worst_cos = worst_cos.min(cos);
+                    worst_rel = worst_rel.max(max_rel);
+                }
+                match err {
+                    Some(e) => {
                         cu_emit(&dname, "KERNEL_ERR", &format!("{e}"));
                         *counts.entry("KERNEL_ERR").or_default() += 1;
+                    }
+                    None => {
+                        let key: &'static str = if worst_cos > fmt.cos_min && worst_rel < fmt.rel_max {
+                            "OK"
+                        } else {
+                            "MISCOMPUTE"
+                        };
+                        *counts.entry(key).or_default() += 1;
+                        cu_emit(
+                            &dname,
+                            key,
+                            &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"),
+                        );
                     }
                 }
             }
 
-            // prefill
+            // prefill — queries reach abs pos 15, so window=4 genuinely trims
+            // (query 15 attends 12..15). Same three-case fold.
             if let (Some(qb), Some(kb), Some(vb), Some(mut ob)) = (
                 cu_upload_f32(&stream, &qp),
                 ck::CudaDeviceBuffer::from_host(&stream, &kp),
                 ck::CudaDeviceBuffer::from_host(&stream, &vp),
                 ck::CudaDeviceBuffer::alloc(&stream, n_new * n_heads * head_dim * 4),
             ) {
-                // SAFETY: q/out F32 [n_new*n_heads*head_dim]; k/v packed as above.
-                let res = unsafe {
-                    let q = qb.as_ptr() as *const f32;
-                    let k = kb.as_ptr();
-                    let v = vb.as_ptr();
-                    let o = ob.as_mut_ptr() as *mut f32;
-                    match fmt.name {
-                        "mxfp4" => ck::flash_attn_prefill_mxfp4(
-                            &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base,
-                            n_new,
-                        ),
-                        "mxfp6" => ck::flash_attn_prefill_mxfp6(
-                            &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base,
-                            n_new,
-                        ),
-                        "mxfp8" => ck::flash_attn_prefill_mxfp8(
-                            &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base,
-                            n_new,
-                        ),
-                        "nvfp4" => ck::flash_attn_prefill_nvfp4(
-                            &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base,
-                            n_new,
-                        ),
-                        "q4_0" => ck::flash_attn_prefill_q4_0(
-                            &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base,
-                            n_new,
-                        ),
-                        _ => unreachable!(),
+                let pre_cases: [(u32, f32); 3] = [(0, 0.0), (4, 0.0), (0, 50.0)];
+                let (mut worst_cos, mut worst_rel) = (1.0f64, 0.0f64);
+                let mut err: Option<String> = None;
+                for (window, softcap) in pre_cases {
+                    let mut cpu_pre = vec![0f32; n_new * n_heads * head_dim];
+                    k::gqa_attention_flash_prefill_capped_windowed(
+                        &qp, &kc_dq, &vc_dq, &mut cpu_pre,
+                        n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
+                        window as usize, softcap,
+                    );
+                    // SAFETY: q/out F32 [n_new*n_heads*head_dim]; k/v packed as above.
+                    let res = unsafe {
+                        let q = qb.as_ptr() as *const f32;
+                        let k = kb.as_ptr();
+                        let v = vb.as_ptr();
+                        let o = ob.as_mut_ptr() as *mut f32;
+                        match fmt.name {
+                            "mxfp4" => ck::flash_attn_prefill_mxfp4(
+                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base,
+                                n_new, window as i32, softcap,
+                            ),
+                            "mxfp6" => ck::flash_attn_prefill_mxfp6(
+                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base,
+                                n_new, window as i32, softcap,
+                            ),
+                            "mxfp8" => ck::flash_attn_prefill_mxfp8(
+                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base,
+                                n_new, window as i32, softcap,
+                            ),
+                            "nvfp4" => ck::flash_attn_prefill_nvfp4(
+                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base,
+                                n_new, window as i32, softcap,
+                            ),
+                            "q4_0" => ck::flash_attn_prefill_q4_0(
+                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base,
+                                n_new, window as i32, softcap,
+                            ),
+                            _ => unreachable!(),
+                        }
+                    };
+                    if let Err(e) = res {
+                        err = Some(format!("{e}"));
+                        break;
                     }
-                };
-                match res {
-                    Ok(()) => cu_grade(
-                        &pname,
-                        &cu_download_f32(&ob, n_new * n_heads * head_dim),
-                        &cpu_pre,
-                        fmt.cos_min,
-                        fmt.rel_max,
-                        &mut counts,
-                    ),
-                    Err(e) => {
+                    let (cos, max_rel) =
+                        compare(&cu_download_f32(&ob, n_new * n_heads * head_dim), &cpu_pre);
+                    worst_cos = worst_cos.min(cos);
+                    worst_rel = worst_rel.max(max_rel);
+                }
+                match err {
+                    Some(e) => {
                         cu_emit(&pname, "KERNEL_ERR", &format!("{e}"));
                         *counts.entry("KERNEL_ERR").or_default() += 1;
+                    }
+                    None => {
+                        let key: &'static str = if worst_cos > fmt.cos_min && worst_rel < fmt.rel_max {
+                            "OK"
+                        } else {
+                            "MISCOMPUTE"
+                        };
+                        *counts.entry(key).or_default() += 1;
+                        cu_emit(
+                            &pname,
+                            key,
+                            &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa4+cap50)"),
+                        );
                     }
                 }
             }
@@ -4913,9 +5099,9 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         let (vslab, vsc) = quantize_kv_q8_0(&vc, n_kv_heads, head_dim, max_ctx, upto);
         let kdq = dequant_kv_q8_0(&kslab, &ksc, n_kv_heads, head_dim, max_ctx, upto);
         let vdq = dequant_kv_q8_0(&vslab, &vsc, n_kv_heads, head_dim, max_ctx, upto);
-        let cpu_dec = ref_flash_decode(&q, &kdq, &vdq, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
-        let cpu_pre = ref_flash_prefill(&qp, &kdq, &vdq, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new);
-        // decode
+        // decode — fold the three (window, softcap) cases into one verdict, with
+        // the `_capped_windowed` f32 reference on the dequantized slab (at (0,0.0)
+        // it equals `ref_flash_decode`). kv_len=40 ⇒ window=16 trims.
         if let (Some(qb), Some(kb), Some(vb), Some(ksb), Some(vsb), Some(mut ob)) = (
             cu_upload_f32(&stream, &q),
             ck::CudaDeviceBuffer::from_host(&stream, i8_as_bytes(&kslab)),
@@ -4924,36 +5110,57 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             cu_upload_f32(&stream, &vsc),
             ck::CudaDeviceBuffer::alloc(&stream, n_heads * head_dim * 4),
         ) {
-            // SAFETY: q/out F32; k/v i8 slabs; k/v scales F32 — all live device
-            // buffers on `stream`; the wrapper synchronizes before returning.
-            let res = unsafe {
-                ck::flash_attn_decode_q8_0(
-                    &stream,
-                    qb.as_ptr() as *const f32,
-                    kb.as_ptr(),
-                    vb.as_ptr(),
-                    ksb.as_ptr() as *const f32,
-                    vsb.as_ptr() as *const f32,
-                    ob.as_mut_ptr() as *mut f32,
+            let dec_cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
+            let (mut worst_cos, mut worst_rel) = (1.0f64, 0.0f64);
+            let mut err: Option<String> = None;
+            for (window, softcap) in dec_cases {
+                let mut cpu_dec = vec![0f32; n_heads * head_dim];
+                k::gqa_attention_flash_decode_capped_windowed(
+                    &q, &kdq, &vdq, &mut cpu_dec,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                )
-            };
-            match res {
-                Ok(()) => cu_grade(
-                    "attn:decode_q8_0",
-                    &cu_download_f32(&ob, n_heads * head_dim),
-                    &cpu_dec,
-                    0.999,
-                    0.05,
-                    &mut counts,
-                ),
-                Err(e) => {
+                    window as usize, softcap,
+                );
+                // SAFETY: q/out F32; k/v i8 slabs; k/v scales F32 — all live device
+                // buffers on `stream`; the wrapper synchronizes before returning.
+                let res = unsafe {
+                    ck::flash_attn_decode_q8_0(
+                        &stream,
+                        qb.as_ptr() as *const f32,
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ksb.as_ptr() as *const f32,
+                        vsb.as_ptr() as *const f32,
+                        ob.as_mut_ptr() as *mut f32,
+                        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                        window as i32, softcap,
+                    )
+                };
+                if let Err(e) = res {
+                    err = Some(format!("{e}"));
+                    break;
+                }
+                let (cos, max_rel) = compare(&cu_download_f32(&ob, n_heads * head_dim), &cpu_dec);
+                worst_cos = worst_cos.min(cos);
+                worst_rel = worst_rel.max(max_rel);
+            }
+            match err {
+                Some(e) => {
                     cu_emit("attn:decode_q8_0", "KERNEL_ERR", &format!("{e}"));
                     *counts.entry("KERNEL_ERR").or_default() += 1;
                 }
+                None => {
+                    let key: &'static str =
+                        if worst_cos > 0.999 && worst_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
+                    *counts.entry(key).or_default() += 1;
+                    cu_emit(
+                        "attn:decode_q8_0",
+                        key,
+                        &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"),
+                    );
+                }
             }
         }
-        // prefill
+        // prefill — queries reach abs pos 15, so window=4 genuinely trims.
         if let (Some(qb), Some(kb), Some(vb), Some(ksb), Some(vsb), Some(mut ob)) = (
             cu_upload_f32(&stream, &qp),
             ck::CudaDeviceBuffer::from_host(&stream, i8_as_bytes(&kslab)),
@@ -4962,31 +5169,53 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             cu_upload_f32(&stream, &vsc),
             ck::CudaDeviceBuffer::alloc(&stream, n_new * n_heads * head_dim * 4),
         ) {
-            // SAFETY: as the decode arm, with q/out sized for n_new queries.
-            let res = unsafe {
-                ck::flash_attn_prefill_q8_0(
-                    &stream,
-                    qb.as_ptr() as *const f32,
-                    kb.as_ptr(),
-                    vb.as_ptr(),
-                    ksb.as_ptr() as *const f32,
-                    vsb.as_ptr() as *const f32,
-                    ob.as_mut_ptr() as *mut f32,
+            let pre_cases: [(u32, f32); 3] = [(0, 0.0), (4, 0.0), (0, 50.0)];
+            let (mut worst_cos, mut worst_rel) = (1.0f64, 0.0f64);
+            let mut err: Option<String> = None;
+            for (window, softcap) in pre_cases {
+                let mut cpu_pre = vec![0f32; n_new * n_heads * head_dim];
+                k::gqa_attention_flash_prefill_capped_windowed(
+                    &qp, &kdq, &vdq, &mut cpu_pre,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                )
-            };
-            match res {
-                Ok(()) => cu_grade(
-                    "attn:prefill_q8_0",
-                    &cu_download_f32(&ob, n_new * n_heads * head_dim),
-                    &cpu_pre,
-                    0.999,
-                    0.05,
-                    &mut counts,
-                ),
-                Err(e) => {
+                    window as usize, softcap,
+                );
+                // SAFETY: as the decode arm, with q/out sized for n_new queries.
+                let res = unsafe {
+                    ck::flash_attn_prefill_q8_0(
+                        &stream,
+                        qb.as_ptr() as *const f32,
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ksb.as_ptr() as *const f32,
+                        vsb.as_ptr() as *const f32,
+                        ob.as_mut_ptr() as *mut f32,
+                        n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
+                        window as i32, softcap,
+                    )
+                };
+                if let Err(e) = res {
+                    err = Some(format!("{e}"));
+                    break;
+                }
+                let (cos, max_rel) =
+                    compare(&cu_download_f32(&ob, n_new * n_heads * head_dim), &cpu_pre);
+                worst_cos = worst_cos.min(cos);
+                worst_rel = worst_rel.max(max_rel);
+            }
+            match err {
+                Some(e) => {
                     cu_emit("attn:prefill_q8_0", "KERNEL_ERR", &format!("{e}"));
                     *counts.entry("KERNEL_ERR").or_default() += 1;
+                }
+                None => {
+                    let key: &'static str =
+                        if worst_cos > 0.999 && worst_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
+                    *counts.entry(key).or_default() += 1;
+                    cu_emit(
+                        "attn:prefill_q8_0",
+                        key,
+                        &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa4+cap50)"),
+                    );
                 }
             }
         }
@@ -5008,9 +5237,9 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         let (vslab, vsc) = quantize_kv_tq(&vc, bits, n_kv_heads, head_dim, max_ctx, upto);
         let kdq = dequant_kv_tq(&kslab, &ksc, bits, n_kv_heads, head_dim, max_ctx, upto);
         let vdq = dequant_kv_tq(&vslab, &vsc, bits, n_kv_heads, head_dim, max_ctx, upto);
-        let cpu_dec = ref_flash_decode(&q, &kdq, &vdq, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
-        let cpu_pre = ref_flash_prefill(&qp, &kdq, &vdq, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new);
-        // decode
+        // decode — fold the three (window, softcap) cases into one verdict, with
+        // the `_capped_windowed` f32 reference on the dequantized slab (at (0,0.0)
+        // it equals `ref_flash_decode`). kv_len=40 ⇒ window=16 trims.
         if let (Some(qb), Some(kb), Some(vb), Some(ksb), Some(vsb), Some(mut ob)) = (
             cu_upload_f32(&stream, &q),
             ck::CudaDeviceBuffer::from_host(&stream, &kslab),
@@ -5019,37 +5248,58 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             cu_upload_f32(&stream, &vsc),
             ck::CudaDeviceBuffer::alloc(&stream, n_heads * head_dim * 4),
         ) {
-            // SAFETY: q/out F32; k/v packed TQ slabs; k/v scales F32 — live
-            // device buffers on `stream`.
-            let res = unsafe {
-                ck::flash_attn_decode_tq(
-                    &stream,
-                    qb.as_ptr() as *const f32,
-                    kb.as_ptr(),
-                    vb.as_ptr(),
-                    ksb.as_ptr() as *const f32,
-                    vsb.as_ptr() as *const f32,
-                    bits as u32,
-                    ob.as_mut_ptr() as *mut f32,
+            let dec_cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
+            let (mut worst_cos, mut worst_rel) = (1.0f64, 0.0f64);
+            let mut err: Option<String> = None;
+            for (window, softcap) in dec_cases {
+                let mut cpu_dec = vec![0f32; n_heads * head_dim];
+                k::gqa_attention_flash_decode_capped_windowed(
+                    &q, &kdq, &vdq, &mut cpu_dec,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                )
-            };
-            match res {
-                Ok(()) => cu_grade(
-                    "attn:decode_tq",
-                    &cu_download_f32(&ob, n_heads * head_dim),
-                    &cpu_dec,
-                    0.999,
-                    0.05,
-                    &mut counts,
-                ),
-                Err(e) => {
+                    window as usize, softcap,
+                );
+                // SAFETY: q/out F32; k/v packed TQ slabs; k/v scales F32 — live
+                // device buffers on `stream`.
+                let res = unsafe {
+                    ck::flash_attn_decode_tq(
+                        &stream,
+                        qb.as_ptr() as *const f32,
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ksb.as_ptr() as *const f32,
+                        vsb.as_ptr() as *const f32,
+                        bits as u32,
+                        ob.as_mut_ptr() as *mut f32,
+                        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                        window as i32, softcap,
+                    )
+                };
+                if let Err(e) = res {
+                    err = Some(format!("{e}"));
+                    break;
+                }
+                let (cos, max_rel) = compare(&cu_download_f32(&ob, n_heads * head_dim), &cpu_dec);
+                worst_cos = worst_cos.min(cos);
+                worst_rel = worst_rel.max(max_rel);
+            }
+            match err {
+                Some(e) => {
                     cu_emit("attn:decode_tq", "KERNEL_ERR", &format!("{e}"));
                     *counts.entry("KERNEL_ERR").or_default() += 1;
                 }
+                None => {
+                    let key: &'static str =
+                        if worst_cos > 0.999 && worst_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
+                    *counts.entry(key).or_default() += 1;
+                    cu_emit(
+                        "attn:decode_tq",
+                        key,
+                        &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"),
+                    );
+                }
             }
         }
-        // prefill
+        // prefill — queries reach abs pos 15, so window=4 genuinely trims.
         if let (Some(qb), Some(kb), Some(vb), Some(ksb), Some(vsb), Some(mut ob)) = (
             cu_upload_f32(&stream, &qp),
             ck::CudaDeviceBuffer::from_host(&stream, &kslab),
@@ -5058,32 +5308,54 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             cu_upload_f32(&stream, &vsc),
             ck::CudaDeviceBuffer::alloc(&stream, n_new * n_heads * head_dim * 4),
         ) {
-            // SAFETY: as the decode arm, q/out sized for n_new queries.
-            let res = unsafe {
-                ck::flash_attn_prefill_tq(
-                    &stream,
-                    qb.as_ptr() as *const f32,
-                    kb.as_ptr(),
-                    vb.as_ptr(),
-                    ksb.as_ptr() as *const f32,
-                    vsb.as_ptr() as *const f32,
-                    bits as u32,
-                    ob.as_mut_ptr() as *mut f32,
+            let pre_cases: [(u32, f32); 3] = [(0, 0.0), (4, 0.0), (0, 50.0)];
+            let (mut worst_cos, mut worst_rel) = (1.0f64, 0.0f64);
+            let mut err: Option<String> = None;
+            for (window, softcap) in pre_cases {
+                let mut cpu_pre = vec![0f32; n_new * n_heads * head_dim];
+                k::gqa_attention_flash_prefill_capped_windowed(
+                    &qp, &kdq, &vdq, &mut cpu_pre,
                     n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                )
-            };
-            match res {
-                Ok(()) => cu_grade(
-                    "attn:prefill_tq",
-                    &cu_download_f32(&ob, n_new * n_heads * head_dim),
-                    &cpu_pre,
-                    0.999,
-                    0.05,
-                    &mut counts,
-                ),
-                Err(e) => {
+                    window as usize, softcap,
+                );
+                // SAFETY: as the decode arm, q/out sized for n_new queries.
+                let res = unsafe {
+                    ck::flash_attn_prefill_tq(
+                        &stream,
+                        qb.as_ptr() as *const f32,
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ksb.as_ptr() as *const f32,
+                        vsb.as_ptr() as *const f32,
+                        bits as u32,
+                        ob.as_mut_ptr() as *mut f32,
+                        n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
+                        window as i32, softcap,
+                    )
+                };
+                if let Err(e) = res {
+                    err = Some(format!("{e}"));
+                    break;
+                }
+                let (cos, max_rel) =
+                    compare(&cu_download_f32(&ob, n_new * n_heads * head_dim), &cpu_pre);
+                worst_cos = worst_cos.min(cos);
+                worst_rel = worst_rel.max(max_rel);
+            }
+            match err {
+                Some(e) => {
                     cu_emit("attn:prefill_tq", "KERNEL_ERR", &format!("{e}"));
                     *counts.entry("KERNEL_ERR").or_default() += 1;
+                }
+                None => {
+                    let key: &'static str =
+                        if worst_cos > 0.999 && worst_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
+                    *counts.entry(key).or_default() += 1;
+                    cu_emit(
+                        "attn:prefill_tq",
+                        key,
+                        &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa4+cap50)"),
+                    );
                 }
             }
         }
@@ -6310,86 +6582,130 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                 let vp = quantize_kv_cache(fmt, &vc, n_kv_heads, head_dim, max_ctx, upto);
                 let kc_dq = dequant_kv_cache(fmt, &kp, n_kv_heads, head_dim, max_ctx, upto);
                 let vc_dq = dequant_kv_cache(fmt, &vp, n_kv_heads, head_dim, max_ctx, upto);
-                let cpu_dec = ref_flash_decode(
-                    &q, &kc_dq, &vc_dq, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                );
-                let cpu_pre = ref_flash_prefill(
-                    &qp, &kc_dq, &vc_dq, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                );
 
-                // decode
+                // decode — fold passthrough + sliding-window (kv_len=40 ⇒ window=16
+                // trims) + Gemma2 soft-cap into the one `attn:decode_<fmt>` verdict,
+                // via the `_capped_windowed` f32 ref on the dequantized cache (at
+                // (0,0.0) it equals `ref_flash_decode`).
                 if let (Some(qb), Some(kb), Some(vb), Some(mut ob)) = (
                     mk_upload_f32(&fs, &q),
                     mk::MlxDeviceBuffer::from_host(&fs, &kp),
                     mk::MlxDeviceBuffer::from_host(&fs, &vp),
                     mk::MlxDeviceBuffer::alloc(&fs, n_heads * head_dim * 4),
                 ) {
-                    // SAFETY: q/out F32 [n_heads*head_dim]; k/v packed device
-                    // buffers [n_kv_heads*max_ctx*bytes_per_row] on `fs`.
-                    let res = unsafe {
-                        let q = qb.as_ptr() as *const f32;
-                        let k = kb.as_ptr();
-                        let v = vb.as_ptr();
-                        let o = ob.as_mut_ptr() as *mut f32;
-                        match fmt.name {
-                            "mxfp4" => mk::flash_attn_decode_mxfp4(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len),
-                            "mxfp6" => mk::flash_attn_decode_mxfp6(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len),
-                            "mxfp8" => mk::flash_attn_decode_mxfp8(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len),
-                            "nvfp4" => mk::flash_attn_decode_nvfp4(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len),
-                            "q4_0" => mk::flash_attn_decode_q4_0(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len),
-                            _ => unreachable!(),
+                    let dec_cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
+                    let (mut worst_cos, mut worst_rel) = (1.0f64, 0.0f64);
+                    let mut err: Option<String> = None;
+                    for (window, softcap) in dec_cases {
+                        let mut cpu_dec = vec![0f32; n_heads * head_dim];
+                        k::gqa_attention_flash_decode_capped_windowed(
+                            &q, &kc_dq, &vc_dq, &mut cpu_dec,
+                            n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                            window as usize, softcap,
+                        );
+                        // SAFETY: q/out F32 [n_heads*head_dim]; k/v packed device
+                        // buffers [n_kv_heads*max_ctx*bytes_per_row] on `fs`.
+                        let res = unsafe {
+                            let q = qb.as_ptr() as *const f32;
+                            let k = kb.as_ptr();
+                            let v = vb.as_ptr();
+                            let o = ob.as_mut_ptr() as *mut f32;
+                            match fmt.name {
+                                "mxfp4" => mk::flash_attn_decode_mxfp4(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window as i32, softcap),
+                                "mxfp6" => mk::flash_attn_decode_mxfp6(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window as i32, softcap),
+                                "mxfp8" => mk::flash_attn_decode_mxfp8(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window as i32, softcap),
+                                "nvfp4" => mk::flash_attn_decode_nvfp4(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window as i32, softcap),
+                                "q4_0" => mk::flash_attn_decode_q4_0(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window as i32, softcap),
+                                _ => unreachable!(),
+                            }
+                        };
+                        if let Err(e) = res {
+                            err = Some(format!("{e:?}"));
+                            break;
                         }
-                    };
-                    match res {
-                        Ok(()) => cu_grade(
-                            &dname,
-                            &mk_download_f32(&ob, n_heads * head_dim),
-                            &cpu_dec,
-                            fmt.cos_min,
-                            fmt.rel_max,
-                            &mut counts,
-                        ),
-                        Err(e) => {
-                            cu_emit(&dname, "KERNEL_ERR", &format!("{e:?}"));
+                        let (cos, max_rel) = compare(&mk_download_f32(&ob, n_heads * head_dim), &cpu_dec);
+                        worst_cos = worst_cos.min(cos);
+                        worst_rel = worst_rel.max(max_rel);
+                    }
+                    match err {
+                        Some(e) => {
+                            cu_emit(&dname, "KERNEL_ERR", &e);
                             *counts.entry("KERNEL_ERR").or_default() += 1;
+                        }
+                        None => {
+                            let key: &'static str = if worst_cos > fmt.cos_min && worst_rel < fmt.rel_max {
+                                "OK"
+                            } else {
+                                "MISCOMPUTE"
+                            };
+                            *counts.entry(key).or_default() += 1;
+                            cu_emit(
+                                &dname,
+                                key,
+                                &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"),
+                            );
                         }
                     }
                 }
 
-                // prefill
+                // prefill — queries reach abs pos 15, so window=4 genuinely trims.
                 if let (Some(qb), Some(kb), Some(vb), Some(mut ob)) = (
                     mk_upload_f32(&fs, &qp),
                     mk::MlxDeviceBuffer::from_host(&fs, &kp),
                     mk::MlxDeviceBuffer::from_host(&fs, &vp),
                     mk::MlxDeviceBuffer::alloc(&fs, n_new * n_heads * head_dim * 4),
                 ) {
-                    // SAFETY: q/out F32 [n_new*n_heads*head_dim]; k/v packed as above.
-                    let res = unsafe {
-                        let q = qb.as_ptr() as *const f32;
-                        let k = kb.as_ptr();
-                        let v = vb.as_ptr();
-                        let o = ob.as_mut_ptr() as *mut f32;
-                        match fmt.name {
-                            "mxfp4" => mk::flash_attn_prefill_mxfp4(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new),
-                            "mxfp6" => mk::flash_attn_prefill_mxfp6(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new),
-                            "mxfp8" => mk::flash_attn_prefill_mxfp8(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new),
-                            "nvfp4" => mk::flash_attn_prefill_nvfp4(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new),
-                            "q4_0" => mk::flash_attn_prefill_q4_0(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new),
-                            _ => unreachable!(),
+                    let pre_cases: [(u32, f32); 3] = [(0, 0.0), (4, 0.0), (0, 50.0)];
+                    let (mut worst_cos, mut worst_rel) = (1.0f64, 0.0f64);
+                    let mut err: Option<String> = None;
+                    for (window, softcap) in pre_cases {
+                        let mut cpu_pre = vec![0f32; n_new * n_heads * head_dim];
+                        k::gqa_attention_flash_prefill_capped_windowed(
+                            &qp, &kc_dq, &vc_dq, &mut cpu_pre,
+                            n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
+                            window as usize, softcap,
+                        );
+                        // SAFETY: q/out F32 [n_new*n_heads*head_dim]; k/v packed as above.
+                        let res = unsafe {
+                            let q = qb.as_ptr() as *const f32;
+                            let k = kb.as_ptr();
+                            let v = vb.as_ptr();
+                            let o = ob.as_mut_ptr() as *mut f32;
+                            match fmt.name {
+                                "mxfp4" => mk::flash_attn_prefill_mxfp4(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new, window as i32, softcap),
+                                "mxfp6" => mk::flash_attn_prefill_mxfp6(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new, window as i32, softcap),
+                                "mxfp8" => mk::flash_attn_prefill_mxfp8(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new, window as i32, softcap),
+                                "nvfp4" => mk::flash_attn_prefill_nvfp4(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new, window as i32, softcap),
+                                "q4_0" => mk::flash_attn_prefill_q4_0(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new, window as i32, softcap),
+                                _ => unreachable!(),
+                            }
+                        };
+                        if let Err(e) = res {
+                            err = Some(format!("{e:?}"));
+                            break;
                         }
-                    };
-                    match res {
-                        Ok(()) => cu_grade(
-                            &pname,
-                            &mk_download_f32(&ob, n_new * n_heads * head_dim),
-                            &cpu_pre,
-                            fmt.cos_min,
-                            fmt.rel_max,
-                            &mut counts,
-                        ),
-                        Err(e) => {
-                            cu_emit(&pname, "KERNEL_ERR", &format!("{e:?}"));
+                        let (cos, max_rel) =
+                            compare(&mk_download_f32(&ob, n_new * n_heads * head_dim), &cpu_pre);
+                        worst_cos = worst_cos.min(cos);
+                        worst_rel = worst_rel.max(max_rel);
+                    }
+                    match err {
+                        Some(e) => {
+                            cu_emit(&pname, "KERNEL_ERR", &e);
                             *counts.entry("KERNEL_ERR").or_default() += 1;
+                        }
+                        None => {
+                            let key: &'static str = if worst_cos > fmt.cos_min && worst_rel < fmt.rel_max {
+                                "OK"
+                            } else {
+                                "MISCOMPUTE"
+                            };
+                            *counts.entry(key).or_default() += 1;
+                            cu_emit(
+                                &pname,
+                                key,
+                                &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa4+cap50)"),
+                            );
                         }
                     }
                 }
@@ -6412,9 +6728,9 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
             let (vslab, vsc) = quantize_kv_q8_0(&vc, n_kv_heads, head_dim, max_ctx, upto);
             let kdq = dequant_kv_q8_0(&kslab, &ksc, n_kv_heads, head_dim, max_ctx, upto);
             let vdq = dequant_kv_q8_0(&vslab, &vsc, n_kv_heads, head_dim, max_ctx, upto);
-            let cpu_dec = ref_flash_decode(&q, &kdq, &vdq, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
-            let cpu_pre = ref_flash_prefill(&qp, &kdq, &vdq, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new);
-            // decode
+            // decode — fold the three (window, softcap) cases into one verdict, with
+            // the `_capped_windowed` f32 ref on the dequantized slab (at (0,0.0) it
+            // equals `ref_flash_decode`). kv_len=40 ⇒ window=16 trims.
             if let (Some(qb), Some(kb), Some(vb), Some(ksb), Some(vsb), Some(mut ob)) = (
                 mk_upload_f32(&fs, &q),
                 mk::MlxDeviceBuffer::from_host(&fs, i8_as_bytes(&kslab)),
@@ -6423,36 +6739,57 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                 mk_upload_f32(&fs, &vsc),
                 mk::MlxDeviceBuffer::alloc(&fs, n_heads * head_dim * 4),
             ) {
-                // SAFETY: q/out F32; k/v i8 slabs; k/v scales F32 — all live
-                // device buffers on `fs`.
-                let res = unsafe {
-                    mk::flash_attn_decode_q8_0(
-                        &fs,
-                        qb.as_ptr() as *const f32,
-                        kb.as_ptr(),
-                        vb.as_ptr(),
-                        ksb.as_ptr() as *const f32,
-                        vsb.as_ptr() as *const f32,
-                        ob.as_mut_ptr() as *mut f32,
+                let dec_cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
+                let (mut worst_cos, mut worst_rel) = (1.0f64, 0.0f64);
+                let mut err: Option<String> = None;
+                for (window, softcap) in dec_cases {
+                    let mut cpu_dec = vec![0f32; n_heads * head_dim];
+                    k::gqa_attention_flash_decode_capped_windowed(
+                        &q, &kdq, &vdq, &mut cpu_dec,
                         n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                    )
-                };
-                match res {
-                    Ok(()) => cu_grade(
-                        "attn:decode_q8_0",
-                        &mk_download_f32(&ob, n_heads * head_dim),
-                        &cpu_dec,
-                        0.999,
-                        0.05,
-                        &mut counts,
-                    ),
-                    Err(e) => {
-                        cu_emit("attn:decode_q8_0", "KERNEL_ERR", &format!("{e:?}"));
+                        window as usize, softcap,
+                    );
+                    // SAFETY: q/out F32; k/v i8 slabs; k/v scales F32 — all live
+                    // device buffers on `fs`.
+                    let res = unsafe {
+                        mk::flash_attn_decode_q8_0(
+                            &fs,
+                            qb.as_ptr() as *const f32,
+                            kb.as_ptr(),
+                            vb.as_ptr(),
+                            ksb.as_ptr() as *const f32,
+                            vsb.as_ptr() as *const f32,
+                            ob.as_mut_ptr() as *mut f32,
+                            n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                            window as i32, softcap,
+                        )
+                    };
+                    if let Err(e) = res {
+                        err = Some(format!("{e:?}"));
+                        break;
+                    }
+                    let (cos, max_rel) = compare(&mk_download_f32(&ob, n_heads * head_dim), &cpu_dec);
+                    worst_cos = worst_cos.min(cos);
+                    worst_rel = worst_rel.max(max_rel);
+                }
+                match err {
+                    Some(e) => {
+                        cu_emit("attn:decode_q8_0", "KERNEL_ERR", &e);
                         *counts.entry("KERNEL_ERR").or_default() += 1;
+                    }
+                    None => {
+                        let key: &'static str =
+                            if worst_cos > 0.999 && worst_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
+                        *counts.entry(key).or_default() += 1;
+                        cu_emit(
+                            "attn:decode_q8_0",
+                            key,
+                            &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"),
+                        );
                     }
                 }
             }
-            // prefill
+            // prefill — queries reach abs pos 15, so window=4 genuinely trims.
             if let (Some(qb), Some(kb), Some(vb), Some(ksb), Some(vsb), Some(mut ob)) = (
                 mk_upload_f32(&fs, &qp),
                 mk::MlxDeviceBuffer::from_host(&fs, i8_as_bytes(&kslab)),
@@ -6461,31 +6798,53 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                 mk_upload_f32(&fs, &vsc),
                 mk::MlxDeviceBuffer::alloc(&fs, n_new * n_heads * head_dim * 4),
             ) {
-                // SAFETY: as the decode arm, with q/out sized for n_new queries.
-                let res = unsafe {
-                    mk::flash_attn_prefill_q8_0(
-                        &fs,
-                        qb.as_ptr() as *const f32,
-                        kb.as_ptr(),
-                        vb.as_ptr(),
-                        ksb.as_ptr() as *const f32,
-                        vsb.as_ptr() as *const f32,
-                        ob.as_mut_ptr() as *mut f32,
+                let pre_cases: [(u32, f32); 3] = [(0, 0.0), (4, 0.0), (0, 50.0)];
+                let (mut worst_cos, mut worst_rel) = (1.0f64, 0.0f64);
+                let mut err: Option<String> = None;
+                for (window, softcap) in pre_cases {
+                    let mut cpu_pre = vec![0f32; n_new * n_heads * head_dim];
+                    k::gqa_attention_flash_prefill_capped_windowed(
+                        &qp, &kdq, &vdq, &mut cpu_pre,
                         n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                    )
-                };
-                match res {
-                    Ok(()) => cu_grade(
-                        "attn:prefill_q8_0",
-                        &mk_download_f32(&ob, n_new * n_heads * head_dim),
-                        &cpu_pre,
-                        0.999,
-                        0.05,
-                        &mut counts,
-                    ),
-                    Err(e) => {
-                        cu_emit("attn:prefill_q8_0", "KERNEL_ERR", &format!("{e:?}"));
+                        window as usize, softcap,
+                    );
+                    // SAFETY: as the decode arm, with q/out sized for n_new queries.
+                    let res = unsafe {
+                        mk::flash_attn_prefill_q8_0(
+                            &fs,
+                            qb.as_ptr() as *const f32,
+                            kb.as_ptr(),
+                            vb.as_ptr(),
+                            ksb.as_ptr() as *const f32,
+                            vsb.as_ptr() as *const f32,
+                            ob.as_mut_ptr() as *mut f32,
+                            n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
+                            window as i32, softcap,
+                        )
+                    };
+                    if let Err(e) = res {
+                        err = Some(format!("{e:?}"));
+                        break;
+                    }
+                    let (cos, max_rel) =
+                        compare(&mk_download_f32(&ob, n_new * n_heads * head_dim), &cpu_pre);
+                    worst_cos = worst_cos.min(cos);
+                    worst_rel = worst_rel.max(max_rel);
+                }
+                match err {
+                    Some(e) => {
+                        cu_emit("attn:prefill_q8_0", "KERNEL_ERR", &e);
                         *counts.entry("KERNEL_ERR").or_default() += 1;
+                    }
+                    None => {
+                        let key: &'static str =
+                            if worst_cos > 0.999 && worst_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
+                        *counts.entry(key).or_default() += 1;
+                        cu_emit(
+                            "attn:prefill_q8_0",
+                            key,
+                            &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa4+cap50)"),
+                        );
                     }
                 }
             }
@@ -6508,9 +6867,9 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
             let (vslab, vsc) = quantize_kv_tq(&vc, bits, n_kv_heads, head_dim, max_ctx, upto);
             let kdq = dequant_kv_tq(&kslab, &ksc, bits, n_kv_heads, head_dim, max_ctx, upto);
             let vdq = dequant_kv_tq(&vslab, &vsc, bits, n_kv_heads, head_dim, max_ctx, upto);
-            let cpu_dec = ref_flash_decode(&q, &kdq, &vdq, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
-            let cpu_pre = ref_flash_prefill(&qp, &kdq, &vdq, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new);
-            // decode
+            // decode — fold the three (window, softcap) cases into one verdict, with
+            // the `_capped_windowed` f32 ref on the dequantized slab (at (0,0.0) it
+            // equals `ref_flash_decode`). kv_len=40 ⇒ window=16 trims.
             if let (Some(qb), Some(kb), Some(vb), Some(ksb), Some(vsb), Some(mut ob)) = (
                 mk_upload_f32(&fs, &q),
                 mk::MlxDeviceBuffer::from_host(&fs, &kslab),
@@ -6519,37 +6878,58 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                 mk_upload_f32(&fs, &vsc),
                 mk::MlxDeviceBuffer::alloc(&fs, n_heads * head_dim * 4),
             ) {
-                // SAFETY: q/out F32; k/v packed TQ slabs; k/v scales F32 — live
-                // device buffers on `fs`.
-                let res = unsafe {
-                    mk::flash_attn_decode_tq(
-                        &fs,
-                        qb.as_ptr() as *const f32,
-                        kb.as_ptr(),
-                        vb.as_ptr(),
-                        ksb.as_ptr() as *const f32,
-                        vsb.as_ptr() as *const f32,
-                        bits as u32,
-                        ob.as_mut_ptr() as *mut f32,
+                let dec_cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
+                let (mut worst_cos, mut worst_rel) = (1.0f64, 0.0f64);
+                let mut err: Option<String> = None;
+                for (window, softcap) in dec_cases {
+                    let mut cpu_dec = vec![0f32; n_heads * head_dim];
+                    k::gqa_attention_flash_decode_capped_windowed(
+                        &q, &kdq, &vdq, &mut cpu_dec,
                         n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                    )
-                };
-                match res {
-                    Ok(()) => cu_grade(
-                        "attn:decode_tq",
-                        &mk_download_f32(&ob, n_heads * head_dim),
-                        &cpu_dec,
-                        0.999,
-                        0.05,
-                        &mut counts,
-                    ),
-                    Err(e) => {
-                        cu_emit("attn:decode_tq", "KERNEL_ERR", &format!("{e:?}"));
+                        window as usize, softcap,
+                    );
+                    // SAFETY: q/out F32; k/v packed TQ slabs; k/v scales F32 — live
+                    // device buffers on `fs`.
+                    let res = unsafe {
+                        mk::flash_attn_decode_tq(
+                            &fs,
+                            qb.as_ptr() as *const f32,
+                            kb.as_ptr(),
+                            vb.as_ptr(),
+                            ksb.as_ptr() as *const f32,
+                            vsb.as_ptr() as *const f32,
+                            bits as u32,
+                            ob.as_mut_ptr() as *mut f32,
+                            n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+                            window as i32, softcap,
+                        )
+                    };
+                    if let Err(e) = res {
+                        err = Some(format!("{e:?}"));
+                        break;
+                    }
+                    let (cos, max_rel) = compare(&mk_download_f32(&ob, n_heads * head_dim), &cpu_dec);
+                    worst_cos = worst_cos.min(cos);
+                    worst_rel = worst_rel.max(max_rel);
+                }
+                match err {
+                    Some(e) => {
+                        cu_emit("attn:decode_tq", "KERNEL_ERR", &e);
                         *counts.entry("KERNEL_ERR").or_default() += 1;
+                    }
+                    None => {
+                        let key: &'static str =
+                            if worst_cos > 0.999 && worst_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
+                        *counts.entry(key).or_default() += 1;
+                        cu_emit(
+                            "attn:decode_tq",
+                            key,
+                            &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"),
+                        );
                     }
                 }
             }
-            // prefill
+            // prefill — queries reach abs pos 15, so window=4 genuinely trims.
             if let (Some(qb), Some(kb), Some(vb), Some(ksb), Some(vsb), Some(mut ob)) = (
                 mk_upload_f32(&fs, &qp),
                 mk::MlxDeviceBuffer::from_host(&fs, &kslab),
@@ -6558,32 +6938,54 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                 mk_upload_f32(&fs, &vsc),
                 mk::MlxDeviceBuffer::alloc(&fs, n_new * n_heads * head_dim * 4),
             ) {
-                // SAFETY: as the decode arm, q/out sized for n_new queries.
-                let res = unsafe {
-                    mk::flash_attn_prefill_tq(
-                        &fs,
-                        qb.as_ptr() as *const f32,
-                        kb.as_ptr(),
-                        vb.as_ptr(),
-                        ksb.as_ptr() as *const f32,
-                        vsb.as_ptr() as *const f32,
-                        bits as u32,
-                        ob.as_mut_ptr() as *mut f32,
+                let pre_cases: [(u32, f32); 3] = [(0, 0.0), (4, 0.0), (0, 50.0)];
+                let (mut worst_cos, mut worst_rel) = (1.0f64, 0.0f64);
+                let mut err: Option<String> = None;
+                for (window, softcap) in pre_cases {
+                    let mut cpu_pre = vec![0f32; n_new * n_heads * head_dim];
+                    k::gqa_attention_flash_prefill_capped_windowed(
+                        &qp, &kdq, &vdq, &mut cpu_pre,
                         n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                    )
-                };
-                match res {
-                    Ok(()) => cu_grade(
-                        "attn:prefill_tq",
-                        &mk_download_f32(&ob, n_new * n_heads * head_dim),
-                        &cpu_pre,
-                        0.999,
-                        0.05,
-                        &mut counts,
-                    ),
-                    Err(e) => {
-                        cu_emit("attn:prefill_tq", "KERNEL_ERR", &format!("{e:?}"));
+                        window as usize, softcap,
+                    );
+                    // SAFETY: as the decode arm, q/out sized for n_new queries.
+                    let res = unsafe {
+                        mk::flash_attn_prefill_tq(
+                            &fs,
+                            qb.as_ptr() as *const f32,
+                            kb.as_ptr(),
+                            vb.as_ptr(),
+                            ksb.as_ptr() as *const f32,
+                            vsb.as_ptr() as *const f32,
+                            bits as u32,
+                            ob.as_mut_ptr() as *mut f32,
+                            n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
+                            window as i32, softcap,
+                        )
+                    };
+                    if let Err(e) = res {
+                        err = Some(format!("{e:?}"));
+                        break;
+                    }
+                    let (cos, max_rel) =
+                        compare(&mk_download_f32(&ob, n_new * n_heads * head_dim), &cpu_pre);
+                    worst_cos = worst_cos.min(cos);
+                    worst_rel = worst_rel.max(max_rel);
+                }
+                match err {
+                    Some(e) => {
+                        cu_emit("attn:prefill_tq", "KERNEL_ERR", &e);
                         *counts.entry("KERNEL_ERR").or_default() += 1;
+                    }
+                    None => {
+                        let key: &'static str =
+                            if worst_cos > 0.999 && worst_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
+                        *counts.entry(key).or_default() += 1;
+                        cu_emit(
+                            "attn:prefill_tq",
+                            key,
+                            &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa4+cap50)"),
+                        );
                     }
                 }
             }
