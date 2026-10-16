@@ -2398,16 +2398,22 @@ async fn load_model(
         .unwrap_or("unknown-model")
         .to_string();
 
-    // ENV-transported tuner winners (system-level; read by the kernels at
-    // dispatch time). Guarded by `is_none()` so a value the operator — or the
-    // `serve` startup load — already set always wins; only ever applied when a
-    // real cache winner exists, so the no-winner path is left untouched.
+    // Tuner winners applied at HTTP load. `is_none()` on the legacy env var
+    // keeps a value the operator — or the `serve` startup load — already set
+    // winning; only applied when a real cache winner exists.
+    //
+    // T3: `ssm_prefill_chunked` is now the typed accel knob (process-local),
+    // set via its setter instead of a `set_var`. `flash_v3_kv_tile` +
+    // `flash_attention_kv_min` STAY env (justified remainders): the v3 KV tile
+    // is read by the SYCL C++ kernel via `std::getenv`, and the kv-len-min
+    // reader is a `OnceLock` the tuner sweep toggles through the env var — so
+    // both keep the env transport for a behavior-preserving T3.
     if cfg_for_tuning.tuning.auto_apply_ssm_prefill_chunked
         && std::env::var_os("RUSTLLAMA_SSM_PREFILL_CHUNKED").is_none()
         && tuner_cached_ssm_prefill_chunked() == Some(true)
     {
-        std::env::set_var("RUSTLLAMA_SSM_PREFILL_CHUNKED", "1");
-        tracing::info!(model = %model_key, "load_model: applied ssm_prefill_chunked winner (env)");
+        rustllama_engine::set_ssm_prefill_chunked(true);
+        tracing::info!(model = %model_key, "load_model: applied ssm_prefill_chunked winner");
     }
     if cfg_for_tuning.tuning.auto_apply_flash_v3_kv_tile
         && std::env::var_os("RUSTLLAMA_FLASH_V3_KV_TILE").is_none()
@@ -2473,7 +2479,8 @@ async fn load_model(
                 // not a manual env var, decides quant hybrid KV). Harmless on
                 // non-hybrids, where the coercion never fires.
                 if trust_winner && !safe.eq_ignore_ascii_case("f32") {
-                    std::env::set_var("RUSTLLAMA_HYBRID_KV_ANY", "1");
+                    // T3: typed accel knob (was `set_var("RUSTLLAMA_HYBRID_KV_ANY")`).
+                    rustllama_engine::set_hybrid_kv_any(true);
                 }
                 match rustllama_engine::KvDtype::parse(&safe) {
                     Some(d) => d,

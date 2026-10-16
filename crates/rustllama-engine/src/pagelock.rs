@@ -29,23 +29,28 @@ pub enum LockBudget {
 /// `auto` (case-insensitive) → Auto; a positive integer → Bytes(MB).
 pub fn lock_ram_budget() -> LockBudget {
     static CELL: OnceLock<LockBudget> = OnceLock::new();
-    *CELL.get_or_init(|| match std::env::var("RUSTLLAMA_LOCK_RAM_MB") {
-        Ok(v) => {
-            let v = v.trim();
-            if v.eq_ignore_ascii_case("auto") {
-                LockBudget::Auto
-            } else if v.is_empty() {
-                LockBudget::Off
-            } else {
-                match v.parse::<u64>() {
-                    Ok(0) => LockBudget::Off,
-                    Ok(mb) => LockBudget::Bytes(mb.saturating_mul(1024 * 1024)),
-                    Err(_) => LockBudget::Off,
+    // T3: the directive comes from the typed `LoadOptions` (via the accel
+    // override cell) when the engine set it, else the legacy
+    // `RUSTLLAMA_LOCK_RAM_MB` env var (back-compat). Still parsed once.
+    *CELL.get_or_init(
+        || match rustllama_models::accel::lock_ram_mb_directive() {
+            Some(v) => {
+                let v = v.trim();
+                if v.eq_ignore_ascii_case("auto") {
+                    LockBudget::Auto
+                } else if v.is_empty() {
+                    LockBudget::Off
+                } else {
+                    match v.parse::<u64>() {
+                        Ok(0) => LockBudget::Off,
+                        Ok(mb) => LockBudget::Bytes(mb.saturating_mul(1024 * 1024)),
+                        Err(_) => LockBudget::Off,
+                    }
                 }
             }
-        }
-        Err(_) => LockBudget::Off,
-    })
+            None => LockBudget::Off,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------

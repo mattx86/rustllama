@@ -39,11 +39,9 @@ pub fn rlkv_path(model_path: &Path) -> PathBuf {
 /// `0`/unset disables persistence entirely. Read per call (load and
 /// teardown only, not hot-path).
 pub fn kv_persist_cap_bytes() -> u64 {
-    std::env::var("RUSTLLAMA_KV_PERSIST_MB")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0)
-        .saturating_mul(1024 * 1024)
+    // T3: typed `LoadOptions`-backed accel knob (env-initialized from
+    // `RUSTLLAMA_KV_PERSIST_MB` for back-compat).
+    rustllama_models::accel::kv_persist_mb().saturating_mul(1024 * 1024)
 }
 
 fn push_u32(buf: &mut Vec<u8>, v: u32) {

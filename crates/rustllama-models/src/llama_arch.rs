@@ -528,12 +528,10 @@ fn dump_acts_dir() -> Option<&'static str> {
 }
 
 fn prefill_batched_enabled() -> bool {
-    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *C.get_or_init(|| {
-        std::env::var("RUSTLLAMA_PREFILL_BATCHED")
-            .map(|v| !v.is_empty() && v != "0" && v.to_ascii_lowercase() != "false")
-            .unwrap_or(false)
-    })
+    // T3: read the typed `LoadOptions`-backed accel knob (env-initialized
+    // for back-compat, overridden by the engine at load) instead of a
+    // per-process `std::env::var` parse cached here.
+    crate::accel::prefill_batched()
 }
 
 /// A/B lever: `RUSTLLAMA_NO_HADAMARD=1` skips the Prism activation
@@ -2374,13 +2372,11 @@ pub fn zerocopy_borrow_stats() -> (u64, u64) {
 /// GGUF mmap rather than copying to owned heap. Read once. Pairs with
 /// `RUSTLLAMA_KEEP_QUANT_RAW=1` (only raw-kept tensors are borrowable).
 fn zerocopy_weights_enabled() -> bool {
-    use std::sync::OnceLock;
-    static CELL: OnceLock<bool> = OnceLock::new();
-    *CELL.get_or_init(|| {
-        std::env::var("RUSTLLAMA_ZEROCOPY_WEIGHTS")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    // T3: typed `LoadOptions`-backed accel knob (env-initialized for
+    // back-compat, overridden by the engine at load). The engine also
+    // auto-enables it in-process when the MoE expert cache / memory budget
+    // needs file-backed, pinnable experts.
+    crate::accel::zerocopy_weights()
 }
 
 fn load_norm(gguf: &Gguf, name: &str) -> Result<Vec<f32>, LlamaLoadError> {
@@ -6721,8 +6717,10 @@ impl LlamaModel {
         // computes the per-head delta recurrence with the chunked-parallel
         // kernel (`delta_rule_prefill_chunked`) instead of nb sequential
         // per-token `delta_rule_step` calls. Read ONCE here, outside the
-        // token loops. Unset ⇒ the byte-identical per-token path runs.
-        let ssm_prefill_chunked = std::env::var_os("RUSTLLAMA_SSM_PREFILL_CHUNKED").is_some();
+        // token loops. Off ⇒ the byte-identical per-token path runs.
+        // T3: typed `LoadOptions`-backed accel knob (env-initialized for
+        // back-compat; the tuner's SSM sweep toggles it via the setter).
+        let ssm_prefill_chunked = crate::accel::ssm_prefill_chunked();
         // Prism Hadamard rotation state + scratch (see decode twin).
         let had = self.weights.hadamard.as_ref();
         let mut had_buf: Vec<f32> = Vec::new();
@@ -8118,9 +8116,7 @@ impl LlamaModel {
             self.weights.blocks.len()
         };
         // Optional debug: limit to first N layers via RUSTLLAMA_MAX_LAYERS env.
-        let n_layers_used = std::env::var("RUSTLLAMA_MAX_LAYERS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
+        let n_layers_used = crate::accel::max_layers_cap()
             .unwrap_or(n_blocks_total)
             .min(n_blocks_total);
 
@@ -9477,9 +9473,7 @@ impl LlamaModel {
                     .collect()
             };
 
-        let n_layers_used = std::env::var("RUSTLLAMA_MAX_LAYERS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
+        let n_layers_used = crate::accel::max_layers_cap()
             .unwrap_or(attn_views.len())
             .min(attn_views.len());
 
@@ -9915,9 +9909,7 @@ impl LlamaModel {
                     .collect()
             };
 
-        let n_layers_used = std::env::var("RUSTLLAMA_MAX_LAYERS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
+        let n_layers_used = crate::accel::max_layers_cap()
             .unwrap_or(attn_views.len())
             .min(attn_views.len());
 
@@ -10511,9 +10503,7 @@ impl LlamaModel {
             self.weights.blocks.len()
         };
 
-        let n_layers_used = std::env::var("RUSTLLAMA_MAX_LAYERS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
+        let n_layers_used = crate::accel::max_layers_cap()
             .unwrap_or(n_blocks_total)
             .min(n_blocks_total);
 
@@ -11416,9 +11406,7 @@ impl LlamaModel {
                     .collect()
             };
 
-        let n_layers_used = std::env::var("RUSTLLAMA_MAX_LAYERS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
+        let n_layers_used = crate::accel::max_layers_cap()
             .unwrap_or(attn_views.len())
             .min(attn_views.len());
 
@@ -11800,9 +11788,7 @@ impl LlamaModel {
         let mut k_slab = vec![0f32; slab_len];
         let mut v_slab = vec![0f32; slab_len];
 
-        let n_layers_used = std::env::var("RUSTLLAMA_MAX_LAYERS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
+        let n_layers_used = crate::accel::max_layers_cap()
             .unwrap_or(self.weights.blocks.len())
             .min(self.weights.blocks.len());
 
@@ -12093,9 +12079,7 @@ impl LlamaModel {
                     .collect()
             };
 
-        let n_layers_used = std::env::var("RUSTLLAMA_MAX_LAYERS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
+        let n_layers_used = crate::accel::max_layers_cap()
             .unwrap_or(attn_views.len())
             .min(attn_views.len());
 
@@ -12460,9 +12444,7 @@ impl LlamaModel {
                     .collect()
             };
 
-        let n_layers_used = std::env::var("RUSTLLAMA_MAX_LAYERS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
+        let n_layers_used = crate::accel::max_layers_cap()
             .unwrap_or(attn_views.len())
             .min(attn_views.len());
 
@@ -12805,9 +12787,7 @@ impl LlamaModel {
                     .collect()
             };
 
-        let n_layers_used = std::env::var("RUSTLLAMA_MAX_LAYERS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
+        let n_layers_used = crate::accel::max_layers_cap()
             .unwrap_or(attn_views.len())
             .min(attn_views.len());
 
@@ -13189,9 +13169,7 @@ impl LlamaModel {
                     .collect()
             };
 
-        let n_layers_used = std::env::var("RUSTLLAMA_MAX_LAYERS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
+        let n_layers_used = crate::accel::max_layers_cap()
             .unwrap_or(attn_views.len())
             .min(attn_views.len());
 
@@ -13497,9 +13475,7 @@ impl LlamaModel {
                     .collect()
             };
 
-        let n_layers_used = std::env::var("RUSTLLAMA_MAX_LAYERS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
+        let n_layers_used = crate::accel::max_layers_cap()
             .unwrap_or(attn_views.len())
             .min(attn_views.len());
 

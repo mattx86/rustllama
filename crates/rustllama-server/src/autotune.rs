@@ -254,6 +254,41 @@ pub fn run_autotune_blocking(
         }
     }
     cmd.arg("--model").arg(model_path);
+    // T3: the tune subprocess is a SEPARATE process — it does NOT share this
+    // process's `accel` load-option cells (the typed `LoadOptions` that
+    // replaced the config→env `set_var` bridges). So the config→runtime knobs
+    // the serve load applies IN-PROCESS (zerocopy / lock-ram /
+    // prefill-batched(_hybrid) / memory-budget / kv-persist / moe-expert-cache
+    // / ssm) must still reach the child, or its sweeps would measure under
+    // default conditions. Set them on the CHILD's env — a child-scoped set,
+    // NOT a process-global `std::env::set_var` — from the same (default-path)
+    // config the child itself resolves. Any env var the operator set is
+    // inherited by the child and wins (hence the `is_none()` guard). This
+    // preserves the old promote-to-env inheritance without a racy global
+    // write. (The MoE-placement + hybrid-KV knobs are re-measured by the
+    // sweep, so `tune_child_env` omits them.)
+    if let Some(cfg_path) = rustllama_config::default_config_path() {
+        let cfg = rustllama_config::load(&cfg_path).unwrap_or_default();
+        let inf = &cfg.inference;
+        let opts = rustllama_engine::LoadOptions::from_input(&rustllama_engine::LoadOptionsInput {
+            zerocopy_weights: inf.zerocopy_weights,
+            lock_ram_mb: inf.lock_ram_mb.clone(),
+            prefill_batched: inf.prefill_batched,
+            prefill_batched_hybrid: inf.prefill_batched_hybrid,
+            memory_budget: inf.memory_budget.clone(),
+            ssm_prefill_chunked: inf.ssm_prefill_chunked,
+            kv_persist_mb: inf.kv_persist_mb,
+            moe_expert_cache_mb: inf.moe_expert_cache_mb,
+            moe_experts_cpu: false,
+            moe_gpu_split_permille: 0,
+            hybrid_kv_any: false,
+        });
+        for (k, v) in opts.tune_child_env() {
+            if std::env::var_os(k).is_none() {
+                cmd.env(k, v);
+            }
+        }
+    }
     // Ask the child's tracing layer not to colorize — belt-and-suspenders
     // alongside strip_ansi(), so the progress log stays clean text.
     cmd.env("NO_COLOR", "1");

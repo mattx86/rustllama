@@ -117,7 +117,9 @@ pub fn scratch_projection(vocab_size: usize, d_model: usize, d_ff: usize) -> u64
 /// load. Anything else (or unset) keeps manual budgets. Read per call
 /// (load-time only, not hot-path).
 pub fn auto_memory_budget_enabled() -> bool {
-    std::env::var("RUSTLLAMA_MEMORY_BUDGET")
+    // T3: directive from the typed `LoadOptions` (accel override cell) when
+    // set by the engine, else the legacy `RUSTLLAMA_MEMORY_BUDGET` env var.
+    rustllama_models::accel::memory_budget_directive()
         .map(|v| v.trim().eq_ignore_ascii_case("auto"))
         .unwrap_or(false)
 }

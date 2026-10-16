@@ -19,6 +19,7 @@ pub mod expert_cache;
 pub mod grammar;
 pub mod kv_backend;
 pub mod kv_persist;
+pub mod load_options;
 pub mod measurement;
 pub mod memory_budget;
 pub mod multi_gpu;
@@ -35,6 +36,14 @@ pub mod sycl_resources;
 pub mod tool_grammar;
 
 pub use inference::{CpuEngine, CpuEngineError};
+pub use load_options::{LoadOptions, LoadOptionsInput};
+// T3: re-export the typed load-option setters/getters so the CLI + server
+// (which don't depend on `rustllama-models` directly) can drive them at the
+// few non-`promote_memory` sites (calibration tooling, serve/HTTP cache
+// winners, the kv-dtype sweep) instead of a process-global `set_var`.
+pub use rustllama_models::accel::{
+    set_hybrid_kv_any, set_prefill_batched_hybrid, set_ssm_prefill_chunked, set_zerocopy_weights,
+};
 pub use rustllama_models::accel::moe_dev_resident_hits;
 pub use rustllama_models::accel::set_synthetic_run;
 /// P5b: force the default-off GPU fusions OFF (imatrix recording needs every

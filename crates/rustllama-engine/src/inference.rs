@@ -1185,12 +1185,15 @@ impl CpuEngine {
         rustllama_models::accel::reset_device_caches_for_new_model();
         if (rustllama_models::accel::moe_expert_cache_max_bytes() > 0
             || crate::memory_budget::auto_memory_budget_enabled())
-            && std::env::var_os("RUSTLLAMA_ZEROCOPY_WEIGHTS").is_none()
+            && !rustllama_models::accel::zerocopy_weights()
         {
-            std::env::set_var("RUSTLLAMA_ZEROCOPY_WEIGHTS", "1");
+            // T3: in-process auto-enable via the typed accel knob (was a
+            // process-global `set_var("RUSTLLAMA_ZEROCOPY_WEIGHTS", "1")`).
+            rustllama_models::accel::set_zerocopy_weights(true);
             tracing::info!(
                 "moe expert cache enabled — auto-enabling zero-copy weights \
-                 (RUSTLLAMA_ZEROCOPY_WEIGHTS=1); pinning requires file-backed experts"
+                 (packed quant tensors borrowed from the mmap; pinning requires \
+                 file-backed experts)"
             );
         }
         let gguf = Gguf::open(path)?;
@@ -1254,7 +1257,10 @@ impl CpuEngine {
         // — so a validated quant hybrid KV is honored verbatim here while
         // an unqualified one still falls to F32. (A user may still set it
         // manually to force an un-swept dtype.)
-        let hybrid_kv_any = std::env::var_os("RUSTLLAMA_HYBRID_KV_ANY").is_some();
+        // T3: typed `LoadOptions`-backed accel knob (env-initialized for
+        // back-compat; set by the autotune kv-dtype sweep + the serve/HTTP
+        // load when it applies a coherence-validated cache winner).
+        let hybrid_kv_any = rustllama_models::accel::hybrid_kv_any();
         let kv_dtype = if model.weights.is_hybrid()
             && !hybrid_kv_any
             && kv_dtype != KvDtype::F32
@@ -5301,7 +5307,8 @@ fn run_chunked_prefill(
     // backend forward each chunk through `LlamaModel::forward_prefill`
     // — one multi-query flash-prefill attention call per layer per
     // chunk instead of a `forward_one` per token. Gated by
-    // `[inference].prefill_batched` (promoted to the env var below);
+    // `[inference].prefill_batched` (the typed `accel::prefill_batched()`
+    // load-option knob, applied from config/env by `LoadOptions`);
     // `forward_prefill` itself picks the batched kernel per KV dtype
     // and would serial-loop otherwise, so the gate doubles as the
     // dispatch condition. Cancellation granularity becomes the chunk —
@@ -5309,9 +5316,7 @@ fn run_chunked_prefill(
     // per-chunk `last_ids` snapshot cadence is unchanged.
     let batched = !model.weights.is_hybrid()
         && matches!(state.kv_backend, KvBackend::Contiguous(_))
-        && std::env::var("RUSTLLAMA_PREFILL_BATCHED")
-            .map(|v| !v.is_empty() && v != "0" && v.to_ascii_lowercase() != "false")
-            .unwrap_or(false);
+        && rustllama_models::accel::prefill_batched();
     if batched {
         while idx < prefill.len() {
             if should_stop() {
@@ -5347,9 +5352,7 @@ fn run_chunked_prefill(
     // (or RUSTLLAMA_PREFILL_BATCHED_HYBRID=1) after an A/B.
     let batched_hybrid = model.weights.is_hybrid()
         && matches!(state.kv_backend, KvBackend::Contiguous(_))
-        && std::env::var("RUSTLLAMA_PREFILL_BATCHED_HYBRID")
-            .map(|v| !v.is_empty() && v != "0" && v.to_ascii_lowercase() != "false")
-            .unwrap_or(false);
+        && rustllama_models::accel::prefill_batched_hybrid();
     if batched_hybrid {
         while idx < prefill.len() {
             if should_stop() {

@@ -2646,24 +2646,23 @@ pub fn measure_ssm_prefill_chunked(
         (Some(median), None)
     };
 
-    // Save the pre-sweep env state so the toggle doesn't leak to the
-    // rest of the process.
-    let saved_env = std::env::var_os("RUSTLLAMA_SSM_PREFILL_CHUNKED");
+    // Save the pre-sweep state so the toggle doesn't leak to the rest of
+    // the process. T3: the SSM-prefill flag is the typed accel knob (read
+    // per-forward), toggled here via the setter instead of a process-global
+    // `set_var`.
+    let saved = rustllama_models::accel::ssm_prefill_chunked();
 
-    // OFF arm: REMOVE the var (the gate is `is_some()`, so `"0"` ≠ off).
-    std::env::remove_var("RUSTLLAMA_SSM_PREFILL_CHUNKED");
+    // OFF arm.
+    rustllama_models::accel::set_ssm_prefill_chunked(false);
     let (off_prefill_tps, off_err) = bench(&mut cpu);
 
-    // ON arm: set the var — read per-forward, so it takes effect on the
-    // next generate with no reload.
-    std::env::set_var("RUSTLLAMA_SSM_PREFILL_CHUNKED", "1");
+    // ON arm — read per-forward, so it takes effect on the next generate
+    // with no reload.
+    rustllama_models::accel::set_ssm_prefill_chunked(true);
     let (on_prefill_tps, on_err) = bench(&mut cpu);
 
-    // Restore the pre-sweep env state.
-    match saved_env {
-        Some(v) => std::env::set_var("RUSTLLAMA_SSM_PREFILL_CHUNKED", v),
-        None => std::env::remove_var("RUSTLLAMA_SSM_PREFILL_CHUNKED"),
-    }
+    // Restore the pre-sweep state.
+    rustllama_models::accel::set_ssm_prefill_chunked(saved);
 
     let winner = match (off_prefill_tps, on_prefill_tps) {
         (Some(off), Some(on)) => Some(on > off),

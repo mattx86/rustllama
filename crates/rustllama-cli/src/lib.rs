@@ -2233,30 +2233,15 @@ fn promote_memory_env_from_config(
     inference: &rustllama_config::InferenceConfig,
     tuning: &rustllama_config::TuningConfig,
 ) {
-    if inference.moe_expert_cache_mb > 0
-        && std::env::var_os("RUSTLLAMA_MOE_EXPERT_CACHE_MB").is_none()
-    {
-        std::env::set_var(
-            "RUSTLLAMA_MOE_EXPERT_CACHE_MB",
-            inference.moe_expert_cache_mb.to_string(),
-        );
-        tracing::info!(
-            budget_mb = inference.moe_expert_cache_mb,
-            "moe_expert_cache_mb: expert-pin cache enabled from config"
-        );
-    }
-    if inference.zerocopy_weights && std::env::var_os("RUSTLLAMA_ZEROCOPY_WEIGHTS").is_none() {
-        std::env::set_var("RUSTLLAMA_ZEROCOPY_WEIGHTS", "1");
-    }
-    let lock_ram = inference.lock_ram_mb.trim();
-    if !lock_ram.is_empty()
-        && lock_ram != "0"
-        && std::env::var_os("RUSTLLAMA_LOCK_RAM_MB").is_none()
-    {
-        std::env::set_var("RUSTLLAMA_LOCK_RAM_MB", lock_ram);
-    }
-    // GPU disable-list: promote `[inference].disabled_gpus` into the env
-    // both the metrics probe and the SYCL dispatch selection read.
+    // --- Device-tier disable-lists: KEPT as env (justified) ---------------
+    // These are read by multiple crates (`rustllama-runtime`,
+    // `rustllama-npu`, the engine placement / `multi_gpu`, `accel`'s SYCL +
+    // CUDA selection, the server inventory) BEFORE any model load, and are
+    // inherited by the `tune --all` autotune subprocess. They are
+    // process-global DEVICE SELECTION, not a per-load config mirror, so they
+    // stay env (the justified-remainder class, alongside `keep_quant_raw` and
+    // the C++-`getenv` flash-v3 KV tile). T3 migrated the per-load
+    // feature/sizing knobs below to the typed `LoadOptions`.
     if !inference.disabled_gpus.is_empty() && std::env::var_os("RUSTLLAMA_DISABLED_GPUS").is_none()
     {
         let list = inference
@@ -2268,8 +2253,6 @@ fn promote_memory_env_from_config(
         std::env::set_var("RUSTLLAMA_DISABLED_GPUS", &list);
         tracing::info!(disabled_gpus = %list, "GPU disable-list applied from config");
     }
-    // NPU disable-list: promote `[inference].disabled_npus` into the env that
-    // `rustllama_npu::usable_npus` + the system fingerprint read.
     if !inference.disabled_npus.is_empty() && std::env::var_os("RUSTLLAMA_DISABLED_NPUS").is_none() {
         let list = inference
             .disabled_npus
@@ -2280,14 +2263,13 @@ fn promote_memory_env_from_config(
         std::env::set_var("RUSTLLAMA_DISABLED_NPUS", &list);
         tracing::info!(disabled_npus = %list, "NPU disable-list applied from config");
     }
-    // CPU compute tier (disable-list + on/off + VRAM-only mode).
+    // CPU compute tier (disable-list + on/off + VRAM-only mode) — also env.
     promote_cpu_tier_env_from_config(inference);
+
+    // --- Feature / sizing knobs: typed `LoadOptions` (T3) -----------------
     // MoE routed-expert placement is fully AUTO: the tuner-cache winner
-    // (populated by `rustllama tune --moe-placement`, gated by
-    // `[tuning].auto_apply_moe_placement`) decides it — there is no
-    // user-facing config key; the heat planner / tuner owns the
-    // routed-expert tier. No cache entry (or auto-apply off) ⇒ uniform
-    // (a no-op). Promoted to the env vars accel reads at first use.
+    // (gated by `[tuning].auto_apply_moe_placement`) decides it — no cache
+    // entry (or auto-apply off) ⇒ uniform (a no-op).
     let (experts_cpu, gpu_split) =
         match moe_placement_from_cache_or_default(tuning.auto_apply_moe_placement) {
             Some((mode, split)) => {
@@ -2300,63 +2282,43 @@ fn promote_memory_env_from_config(
             }
             None => (false, 0),
         };
-    if experts_cpu && std::env::var_os("RUSTLLAMA_MOE_EXPERTS_CPU").is_none() {
-        std::env::set_var("RUSTLLAMA_MOE_EXPERTS_CPU", "1");
-        tracing::info!(
-            "moe_placement: routed experts pinned to CPU (attn/shared stay GPU-eligible)"
-        );
+    // Chunked-parallel SSM (DeltaNet) prefill: the config flag OR a `true`
+    // tuner winner (the config→env promotion + the serve-side cache override
+    // used to be two separate `set_var`s; folded here into the one knob).
+    let ssm_prefill_chunked = inference.ssm_prefill_chunked
+        || ssm_prefill_chunked_from_cache_or_default(tuning.auto_apply_ssm_prefill_chunked)
+            == Some(true);
+
+    // Build ONCE, resolve env-overrides-win inside `from_input`, apply to the
+    // process-local accel cells (no `set_var`). `hybrid_kv_any` is set
+    // separately by the serve load from the coherence-validated kv-dtype
+    // winner (and by the kv-dtype sweep itself).
+    let opts = rustllama_engine::LoadOptions::from_input(&rustllama_engine::LoadOptionsInput {
+        zerocopy_weights: inference.zerocopy_weights,
+        lock_ram_mb: inference.lock_ram_mb.clone(),
+        prefill_batched: inference.prefill_batched,
+        prefill_batched_hybrid: inference.prefill_batched_hybrid,
+        memory_budget: inference.memory_budget.clone(),
+        ssm_prefill_chunked,
+        kv_persist_mb: inference.kv_persist_mb,
+        moe_expert_cache_mb: inference.moe_expert_cache_mb,
+        moe_experts_cpu: experts_cpu,
+        moe_gpu_split_permille: gpu_split,
+        hybrid_kv_any: false,
+    });
+    opts.apply();
+    if opts.moe_expert_cache_mb > 0 {
+        tracing::info!(budget_mb = opts.moe_expert_cache_mb, "moe_expert_cache_mb: expert-pin cache enabled");
     }
-    if gpu_split > 0 && std::env::var_os("RUSTLLAMA_MOE_GPU_SPLIT_PERMILLE").is_none() {
-        std::env::set_var("RUSTLLAMA_MOE_GPU_SPLIT_PERMILLE", gpu_split.to_string());
-        tracing::info!(
-            gpu_split_permille = gpu_split,
-            "moe_placement: q★ CPU/GPU expert co-execution enabled"
-        );
+    if opts.prefill_batched {
+        tracing::info!("prefill_batched: chunked prefill routes through the batched flash-prefill path");
     }
-    if inference.prefill_batched && std::env::var_os("RUSTLLAMA_PREFILL_BATCHED").is_none() {
-        std::env::set_var("RUSTLLAMA_PREFILL_BATCHED", "1");
-        tracing::info!(
-            "prefill_batched: chunked prefill routes through the batched flash-prefill path"
-        );
-    }
-    if inference.memory_budget.trim().eq_ignore_ascii_case("auto")
-        && std::env::var_os("RUSTLLAMA_MEMORY_BUDGET").is_none()
-    {
-        std::env::set_var("RUSTLLAMA_MEMORY_BUDGET", "auto");
-        tracing::info!(
-            "memory_budget=auto: expert-cache budget will be planned from measured RAM at load"
-        );
-    }
-    if inference.prefill_batched_hybrid
-        && std::env::var_os("RUSTLLAMA_PREFILL_BATCHED_HYBRID").is_none()
-    {
-        std::env::set_var("RUSTLLAMA_PREFILL_BATCHED_HYBRID", "1");
-        tracing::info!(
-            "prefill_batched_hybrid: hybrid chunk prefill with grouped-expert execution enabled"
-        );
-    }
-    if inference.ssm_prefill_chunked
-        && std::env::var_os("RUSTLLAMA_SSM_PREFILL_CHUNKED").is_none()
-    {
-        std::env::set_var("RUSTLLAMA_SSM_PREFILL_CHUNKED", "1");
-        tracing::info!(
-            "ssm_prefill_chunked: chunked-parallel SSM (DeltaNet) prefill path enabled from config"
-        );
-    }
-    if inference.kv_persist_mb > 0 && std::env::var_os("RUSTLLAMA_KV_PERSIST_MB").is_none() {
-        std::env::set_var(
-            "RUSTLLAMA_KV_PERSIST_MB",
-            inference.kv_persist_mb.to_string(),
-        );
-        tracing::info!(
-            cap_mb = inference.kv_persist_mb,
-            "kv_persist_mb: warm-restart KV persistence enabled"
-        );
+    if opts.ssm_prefill_chunked {
+        tracing::info!("ssm_prefill_chunked: chunked-parallel SSM (DeltaNet) prefill path enabled");
     }
     // LMCache cold/disk tiers + the CacheBlend chunk-KV cache auto-size from
-    // free RAM at load (no env var, no manual MB). The CacheBlend recompute
-    // ratio is applied separately via `cpu.set_cacheblend(...)` from the tuner
-    // winner / config fallback (see the serve load path).
+    // free RAM at load. The CacheBlend recompute ratio is applied separately
+    // via `cpu.set_cacheblend(...)` from the tuner winner / config fallback.
 }
 
 /// Generate an importance matrix by running calibration text through
@@ -2624,10 +2586,14 @@ fn cmd_decision_calibrate(config_path: &std::path::Path, model: Option<String>) 
         .unwrap_or("unknown-model")
         .to_string();
 
+    // `keep_quant_raw` stays env (not migrated — process-global, re-derived
+    // at each process entry; justified remainder). The migrated knobs use the
+    // typed accel setters (T3); an explicit `PREFILL_BATCHED_HYBRID` env var
+    // still wins (checked here).
     std::env::set_var("RUSTLLAMA_KEEP_QUANT_RAW", "1");
-    std::env::set_var("RUSTLLAMA_ZEROCOPY_WEIGHTS", "1");
-    if std::env::var("RUSTLLAMA_PREFILL_BATCHED_HYBRID").is_err() {
-        std::env::set_var("RUSTLLAMA_PREFILL_BATCHED_HYBRID", "1");
+    rustllama_engine::set_zerocopy_weights(true);
+    if std::env::var_os("RUSTLLAMA_PREFILL_BATCHED_HYBRID").is_none() {
+        rustllama_engine::set_prefill_batched_hybrid(true);
     }
 
     println!(
@@ -2787,11 +2753,13 @@ fn cmd_kv_calibrate(
     // blocks + zero-copy mmap (an owned copy of a 27B-class model
     // would double RAM), and the chunk-batched hybrid prefill so 8
     // prompts don't take half an hour at serial per-token speed. Set
-    // before load — the `*_enabled()` accessors cache on first read.
+    // before load — the accessors cache on first read. `keep_quant_raw`
+    // stays env (justified remainder); the migrated knobs use the typed
+    // accel setters (T3), with an explicit env var still winning.
     std::env::set_var("RUSTLLAMA_KEEP_QUANT_RAW", "1");
-    std::env::set_var("RUSTLLAMA_ZEROCOPY_WEIGHTS", "1");
-    if std::env::var("RUSTLLAMA_PREFILL_BATCHED_HYBRID").is_err() {
-        std::env::set_var("RUSTLLAMA_PREFILL_BATCHED_HYBRID", "1");
+    rustllama_engine::set_zerocopy_weights(true);
+    if std::env::var_os("RUSTLLAMA_PREFILL_BATCHED_HYBRID").is_none() {
+        rustllama_engine::set_prefill_batched_hybrid(true);
     }
 
     let ctx = ctx_size.max(64);
@@ -3848,23 +3816,19 @@ async fn serve(
                      (packed USM pre-upload + packed GPU matvec; skips F16 dequant)"
                 );
             }
+            // T3: `promote_memory_env_from_config` now applies the typed
+            // `LoadOptions` (zerocopy / lock-ram / prefill-batched(_hybrid) /
+            // memory-budget / kv-persist / moe-* / ssm) to the process-local
+            // accel cells — including the SSM chunked-prefill tuner-cache
+            // winner, folded into that call (its former `set_var` here is
+            // gone). The device-tier disable-lists it still promotes stay env.
             promote_memory_env_from_config(&cfg.inference, &cfg.tuning);
-            // Chunked-parallel SSM (DeltaNet) prefill: honor the tuner-cache
-            // winner too. The config→env promotion already ran inside
-            // `promote_memory_env_from_config` above; this additionally enables
-            // the path when the cache holds a `true` winner and config left it
-            // off. A user-set env var wins over both (checked via `is_none`).
-            if ssm_prefill_chunked_from_cache_or_default(cfg.tuning.auto_apply_ssm_prefill_chunked)
-                == Some(true)
-                && std::env::var_os("RUSTLLAMA_SSM_PREFILL_CHUNKED").is_none()
-            {
-                std::env::set_var("RUSTLLAMA_SSM_PREFILL_CHUNKED", "1");
-                tracing::info!("tuner cache: applied ssm_prefill_chunked winner");
-            }
-            // Export the autotuned flash-attn-v3 KV_TILE to the env
-            // var the SYCL kernel reads at dispatch time. Only set
-            // when the cache holds an entry AND the user hasn't
-            // already set the env var (user override wins). Missing
+            // Export the autotuned flash-attn-v3 KV_TILE to the env var the
+            // SYCL kernel reads at dispatch time. KEPT as env (justified): the
+            // C++ kernel reads it via `std::getenv` (rsl_kernels.cpp), so it
+            // cannot be threaded through the typed `LoadOptions` without a
+            // kernel-signature change. Only set when the cache holds an entry
+            // AND the user hasn't already set it (user override wins). Missing
             // cache → leave unset → kernel defaults to 32.
             if std::env::var_os("RUSTLLAMA_FLASH_V3_KV_TILE").is_none() {
                 if let Some(t) =
@@ -3874,8 +3838,13 @@ async fn serve(
                     std::env::set_var("RUSTLLAMA_FLASH_V3_KV_TILE", t.to_string());
                 }
             }
-            // Promote the typed `[inference].flash_attention_kv_min` to
-            // the env var the kernel-dispatch site reads. Precedence:
+            // Promote the typed `[inference].flash_attention_kv_min` to the
+            // env var the kernel-dispatch site reads. KEPT as env (justified):
+            // the reader (`llama_arch::flash_kv_len_min`) caches it in a
+            // `OnceLock`, and the tuner's flash-kv-min sweep toggles the env
+            // var per candidate; migrating it to a settable accel cell would
+            // change that measurement semantics, so it stays env for a
+            // behavior-preserving T3. Precedence:
             //   1. User-set env var (lets the tuner sweep without
             //      rewriting config).
             //   2. Tuner cache winner (auto-apply via
@@ -3947,7 +3916,9 @@ async fn serve(
             // (nothing to lift otherwise); harmless on non-hybrids, where the
             // coercion never fires.
             if from_cache && !safe_kv_dtype_str.eq_ignore_ascii_case("f32") {
-                std::env::set_var("RUSTLLAMA_HYBRID_KV_ANY", "1");
+                // T3: typed accel knob (was `set_var("RUSTLLAMA_HYBRID_KV_ANY")`);
+                // read in-process by the engine's load-time hybrid-KV coercion.
+                rustllama_engine::set_hybrid_kv_any(true);
             }
             let kv_dtype = parse_kv_dtype(&safe_kv_dtype_str)?;
 
@@ -6605,14 +6576,15 @@ fn cmd_tune_kv_dtype(
     // coherence-first gate decide: an aggressive quant that diverges from the
     // f32 reference (e.g. 1-bit tq1) is rejected automatically, a coherent one
     // is adopted + persisted. We set the hybrid-KV-any flag for THIS tune
-    // subprocess so each candidate is honored verbatim during measurement —
+    // subprocess (in-process, via the typed accel knob — T3, was a
+    // `set_var`) so each candidate is honored verbatim during measurement —
     // otherwise the engine's load-time hybrid coercion would force every
     // non-f32/q4_0 candidate to f32 and the sweep would grade f32 against
     // itself. The persisted winner is a coherence-VALIDATED choice the serve
     // path then honors with no user env var. Non-hybrids are unaffected.
     let is_hybrid = gguf_is_hybrid(&model_path);
     if is_hybrid {
-        std::env::set_var("RUSTLLAMA_HYBRID_KV_ANY", "1");
+        rustllama_engine::set_hybrid_kv_any(true);
     }
 
     let candidates: Vec<rustllama_engine::KvDtype> = candidates_csv

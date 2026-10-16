@@ -2249,6 +2249,203 @@ pub fn set_moe_expert_cache_max_bytes(bytes: u64) {
     moe_expert_cache_cap_cell().store(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
+// ===========================================================================
+// T3: typed load-option knobs (replace the config→env `set_var` bridges).
+//
+// Each cell initializes ONCE from its legacy `RUSTLLAMA_*` env var — so a
+// bare `LlamaModel::load`, a unit test, or `doctor` with no `CpuEngine`
+// still honors a user-set env var (back-compat) — and is then OVERRIDDEN by
+// the engine's `LoadOptions::apply` at load from the typed, env-wins-resolved
+// config value (the ONE place precedence lives is the CLI load path). Reads
+// are a relaxed atomic load: no per-forward env parse, and crucially NO
+// process-global `std::env::set_var` write (which races concurrent loads and
+// is `unsafe` in edition 2024). These back the `accel::*()` getters that
+// replaced the scattered `std::env::var("RUSTLLAMA_…")` reads for the
+// config-mirroring feature/sizing knobs.
+// ===========================================================================
+
+/// `RUSTLLAMA_ZEROCOPY_WEIGHTS` — borrow raw quant tensors from the GGUF
+/// mmap rather than copying to owned heap (pairs with keep-quant-raw).
+fn zerocopy_weights_cell() -> &'static std::sync::atomic::AtomicBool {
+    static C: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(
+            std::env::var("RUSTLLAMA_ZEROCOPY_WEIGHTS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+        )
+    })
+}
+
+pub fn zerocopy_weights() -> bool {
+    zerocopy_weights_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_zerocopy_weights(enabled: bool) {
+    zerocopy_weights_cell().store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `RUSTLLAMA_PREFILL_BATCHED` — route non-hybrid contiguous prefill through
+/// the batched flash-prefill path. Truthy = non-empty, not "0", not "false".
+fn prefill_batched_cell() -> &'static std::sync::atomic::AtomicBool {
+    static C: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(
+            std::env::var("RUSTLLAMA_PREFILL_BATCHED")
+                .map(|v| !v.is_empty() && v != "0" && v.to_ascii_lowercase() != "false")
+                .unwrap_or(false),
+        )
+    })
+}
+
+pub fn prefill_batched() -> bool {
+    prefill_batched_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_prefill_batched(enabled: bool) {
+    prefill_batched_cell().store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `RUSTLLAMA_PREFILL_BATCHED_HYBRID` — hybrid chunk prefill with
+/// grouped-expert execution. Same truthiness as `prefill_batched`.
+fn prefill_batched_hybrid_cell() -> &'static std::sync::atomic::AtomicBool {
+    static C: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(
+            std::env::var("RUSTLLAMA_PREFILL_BATCHED_HYBRID")
+                .map(|v| !v.is_empty() && v != "0" && v.to_ascii_lowercase() != "false")
+                .unwrap_or(false),
+        )
+    })
+}
+
+pub fn prefill_batched_hybrid() -> bool {
+    prefill_batched_hybrid_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_prefill_batched_hybrid(enabled: bool) {
+    prefill_batched_hybrid_cell().store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `RUSTLLAMA_SSM_PREFILL_CHUNKED` — chunked-parallel SSM (DeltaNet)
+/// prefill. Legacy env gate was `var_os(..).is_some()` (PRESENT = on, even
+/// `"0"`); the tuner's SSM sweep now toggles this via the setter.
+fn ssm_prefill_chunked_cell() -> &'static std::sync::atomic::AtomicBool {
+    static C: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(
+            std::env::var_os("RUSTLLAMA_SSM_PREFILL_CHUNKED").is_some(),
+        )
+    })
+}
+
+pub fn ssm_prefill_chunked() -> bool {
+    ssm_prefill_chunked_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_ssm_prefill_chunked(enabled: bool) {
+    ssm_prefill_chunked_cell().store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `RUSTLLAMA_HYBRID_KV_ANY` — honor a quantized hybrid KV dtype verbatim
+/// (lift the load-time coercion to f32). Legacy env gate: PRESENT = on. Set
+/// by the autotune kv-dtype sweep + by the serve/HTTP load when applying a
+/// coherence-validated cache winner.
+fn hybrid_kv_any_cell() -> &'static std::sync::atomic::AtomicBool {
+    static C: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(std::env::var_os("RUSTLLAMA_HYBRID_KV_ANY").is_some())
+    })
+}
+
+pub fn hybrid_kv_any() -> bool {
+    hybrid_kv_any_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_hybrid_kv_any(enabled: bool) {
+    hybrid_kv_any_cell().store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `RUSTLLAMA_KV_PERSIST_MB` — cap (MB) on the warm-restart KV sidecar; `0`
+/// disables. Read by the engine at load/teardown.
+fn kv_persist_mb_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static C: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        std::sync::atomic::AtomicU64::new(
+            std::env::var("RUSTLLAMA_KV_PERSIST_MB")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0),
+        )
+    })
+}
+
+pub fn kv_persist_mb() -> u64 {
+    kv_persist_mb_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_kv_persist_mb(mb: u64) {
+    kv_persist_mb_cell().store(mb, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `RUSTLLAMA_LOCK_RAM_MB` — RAM-lock budget directive (`"auto"` | MB |
+/// unset). Stored as the raw string; the engine's `pagelock` parses it.
+/// Returns the engine-set override if present, else the legacy env var.
+fn lock_ram_mb_override_cell() -> &'static std::sync::Mutex<Option<String>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+pub fn lock_ram_mb_directive() -> Option<String> {
+    if let Ok(g) = lock_ram_mb_override_cell().lock() {
+        if let Some(v) = g.as_ref() {
+            return Some(v.clone());
+        }
+    }
+    std::env::var("RUSTLLAMA_LOCK_RAM_MB").ok()
+}
+
+pub fn set_lock_ram_mb_directive(directive: String) {
+    if let Ok(mut g) = lock_ram_mb_override_cell().lock() {
+        *g = Some(directive);
+    }
+}
+
+/// `RUSTLLAMA_MEMORY_BUDGET` — `"auto"` enables the load-time expert-cache
+/// budget planner. Override-or-env, same precedence as the other knobs.
+fn memory_budget_override_cell() -> &'static std::sync::Mutex<Option<String>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+pub fn memory_budget_directive() -> Option<String> {
+    if let Ok(g) = memory_budget_override_cell().lock() {
+        if let Some(v) = g.as_ref() {
+            return Some(v.clone());
+        }
+    }
+    std::env::var("RUSTLLAMA_MEMORY_BUDGET").ok()
+}
+
+pub fn set_memory_budget_directive(directive: String) {
+    if let Ok(mut g) = memory_budget_override_cell().lock() {
+        *g = Some(directive);
+    }
+}
+
+/// Debug-only forward-pass layer cap `RUSTLLAMA_MAX_LAYERS` — parsed ONCE
+/// (was re-parsed in ~11 copy-pasted forward sites in `llama_arch`). `None`
+/// ⇒ run every layer. Stays env-driven (a debug lever, not a config mirror);
+/// this just de-duplicates the parse behind an `OnceLock`.
+pub fn max_layers_cap() -> Option<usize> {
+    static C: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        std::env::var("RUSTLLAMA_MAX_LAYERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+    })
+}
+
 /// MoE tiered-expert engine: `true` once experts were promoted to device memory
 /// this load (set by the trigger in the engine when `promote_experts_to_device`
 /// moved ≥1 expert). Read by MoE-aware placement (`per_layer_weight_bytes`
