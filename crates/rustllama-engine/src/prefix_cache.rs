@@ -421,6 +421,14 @@ impl PrefixCachePool {
         if self.max_entries == 0 || ids.is_empty() {
             return;
         }
+        // P2: never pool-snapshot a SWA ring cache — its ring layers hold only
+        // the last `window` positions, so `snapshot_prefix` can't capture the
+        // full prefix and a later restore would be wrong. Skipping the INSERT
+        // keeps the pool empty of ring entries, so no restore ever targets a
+        // ring live cache (covers the text AND VLM prefix-cache paths).
+        if live_kv.has_ring_layers() {
+            return;
+        }
         // For text-only, kv.seq_len == ids.len(). For VLM,
         // kv.seq_len is the expanded length and is what we want to
         // snapshot. Don't clip `ids` for VLM — placeholders are part
@@ -457,6 +465,12 @@ impl PrefixCachePool {
             return;
         }
         if ids.len() != live_kv.seq_len {
+            return;
+        }
+        // P2: ring caches can't be pool-snapshotted (see
+        // `snapshot_and_insert_with_image_hash`). Hybrid models aren't SWA, so
+        // this is belt-and-suspenders.
+        if live_kv.has_ring_layers() {
             return;
         }
         // Attention layers are exactly the ones whose DeltaNet state

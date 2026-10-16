@@ -851,7 +851,13 @@ impl EngineState {
                 return shared_lcp;
             }
         };
-        if !enabled || prompt_max == 0 {
+        // P2: a contiguous SWA ring cache only physically holds the last
+        // `window` positions per ring layer, so the snapshot-pool prefix
+        // reuse (which assumes a full `max_ctx` history) can't restore it.
+        // Treat it like "reuse disabled": reset + full re-prefill. Correct
+        // (never serves stale/overwritten rows); the only cost is a missed
+        // prefix-cache optimization on SWA models.
+        if !enabled || prompt_max == 0 || kv.has_ring_layers() {
             kv.reset();
             if let Some(dn) = self.delta_net_cache.as_mut() {
                 dn.reset();
@@ -985,6 +991,13 @@ impl EngineState {
         // later turns can still match — but skip the pool snapshot.
         if ids.len() >= PREFIX_REUSE_MIN_TOKENS {
             if let KvBackend::Contiguous(kv) = &self.kv_backend {
+                // P2: don't pool-snapshot a SWA ring cache — its ring layers
+                // don't hold the full prefix, so a later restore would be
+                // wrong (prefix reuse is disabled for ring models in
+                // `prepare_prefix_reuse`; this keeps the pool free of them).
+                if kv.has_ring_layers() {
+                    return;
+                }
                 match self.delta_net_cache.as_ref() {
                     // Hybrid: a turn end is a semantic anchor —
                     // capture KV + recurrent state together (Phase 5)
@@ -3613,6 +3626,22 @@ impl CpuEngine {
         self.tree_spec.is_some() && self.model_supports_tree()
     }
 
+    /// P2: true iff this engine's contiguous KV cache has any SWA ring
+    /// layer. All speculative drivers (n-gram / MTP / tree / draft-model)
+    /// verify via a BATCHED target forward (and tree spec compacts KV with
+    /// [`KvCache::compact_tokens`]) — both assume a full `max_ctx`-strided
+    /// contiguous history and would mis-address a `cap`-strided ring, so a
+    /// ring model falls back to classic single-token decode (which drives
+    /// the ring-aware decode arm). Cheap read-lock; the dispatch sites that
+    /// call this do not hold the state lock. A poisoned lock defaults to
+    /// `true` (disable spec — the safe direction).
+    fn swa_ring_decode(&self) -> bool {
+        match self.state.lock() {
+            Ok(st) => matches!(&st.kv_backend, KvBackend::Contiguous(kv) if kv.has_ring_layers()),
+            Err(_) => true,
+        }
+    }
+
     /// A model can draft+verify a tree iff it carries a DRAFT head. Non-hybrid
     /// models draft from DeepSeek-style `mtp_heads`; hybrid models draft from
     /// either `mtp_heads` OR the single qwen35moe `nextn_head` (the hybrid tree
@@ -4535,7 +4564,12 @@ impl CpuEngine {
             next_input = next_tok as i32;
             next_pos += 1;
             if (next_pos as usize) >= self.max_ctx {
-                break;
+                // P1: try a context shift (generate past ctx_size) before
+                // giving up. `false` ⇒ disabled/inapplicable ⇒ stop as before.
+                if !try_context_shift(&self.model, &mut state.kv_backend, self.max_ctx, &mut next_pos)
+                {
+                    break;
+                }
             }
         }
         chrome.flush();
@@ -4626,7 +4660,17 @@ impl CpuEngine {
 
         // The backend layout (contiguous vs paged) is fixed at load; CacheBlend
         // injects at absolute offsets into a contiguous F32 slab.
-        if !matches!(state.kv_backend, KvBackend::Contiguous(_)) {
+        //
+        // P2: a SWA ring cache is `cap`-strided and ring-addressed, so
+        // CacheBlend's absolute-offset KV injection + re-RoPE would corrupt it
+        // (and it also builds isolated chunk snapshots via the batched prefill,
+        // which the ring doesn't support). Fall back to a plain generate for
+        // ring models — correct, just without the RAG KV-reuse optimization.
+        let kv_is_ring = matches!(
+            &state.kv_backend,
+            KvBackend::Contiguous(kv) if kv.has_ring_layers()
+        );
+        if !matches!(state.kv_backend, KvBackend::Contiguous(_)) || kv_is_ring {
             drop(state);
             return self.generate_token_ids(&prompt_ids, n_new, sampling);
         }
@@ -5308,7 +5352,14 @@ fn cacheblend_get_or_build_snapshot(
     }
     // Miss: compute the isolated snapshot (no cache lock held). A standalone
     // prefill at position 0 leaves the chunk's KV for re-roped placement.
-    let mut scratch = rustllama_models::llama_arch::KvCache::new(&model.cfg, chunk.len().max(1));
+    // P2: force a NON-ring (full-slab) cache — this chunk prefill is then
+    // snapshotted at absolute offsets, which a SWA ring can't represent (the
+    // full slab still masks an SWA model's window correctly).
+    let mut scratch = rustllama_models::llama_arch::KvCache::new_with_dtype_no_ring(
+        &model.cfg,
+        chunk.len().max(1),
+        rustllama_models::llama_arch::KvDtype::F32,
+    );
     let _ = model.forward_prefill_batched_f32(chunk, 0, &mut scratch);
     let snap = Arc::new(scratch.snapshot_prefix(chunk.len()));
     cache
@@ -6862,8 +6913,11 @@ impl Engine for CpuEngine {
         // Draft-model speculation, when paired. Grammar requests keep
         // the classic sampler for the same raw-softmax reason as the
         // n-gram path.
+        // P2: a contiguous SWA ring cache can't serve the batched/compacting
+        // speculative verify — fall back to classic single-token decode.
+        let allow_spec = !self.swa_ring_decode();
         if let Some((draft, k)) = self.draft_spec.as_ref() {
-            if s.grammar.is_none() {
+            if s.grammar.is_none() && allow_spec {
                 return self.speculate(&prompt, draft.clone(), *k, s);
             }
         }
@@ -6875,18 +6929,18 @@ impl Engine for CpuEngine {
         // Tree-structured MTP spec (Feature 4) takes precedence over linear MTP
         // / n-gram when enabled on a non-hybrid MTP model.
         if let Some(widths) = self.tree_spec.clone() {
-            if s.grammar.is_none() && self.model_supports_tree() {
+            if s.grammar.is_none() && allow_spec && self.model_supports_tree() {
                 return self.speculate_mtp_stream(prompt, s.clone(), Some(widths));
             }
         }
-        if self.mtp_spec && s.grammar.is_none() {
+        if self.mtp_spec && s.grammar.is_none() && allow_spec {
             if self.model_supports_mtp() {
                 return self.speculate_mtp_stream(prompt, s.clone(), None);
             }
             mtp_fallback_log_once();
         }
         if let Some(cfg) = self.ngram_spec {
-            if s.grammar.is_none() {
+            if s.grammar.is_none() && allow_spec {
                 return self.speculate_ngram_stream(prompt, cfg, s.clone());
             }
         }
@@ -6898,19 +6952,20 @@ impl Engine for CpuEngine {
         // spawn path so the call still produces a Stream rather than panic.
         // MTP / NextN self-speculation takes precedence over n-gram; a
         // no-op fall-through on non-MTP models. Grammar-free only.
+        let allow_spec = !self.swa_ring_decode();
         if let Some(widths) = self.tree_spec.clone() {
-            if s.grammar.is_none() && self.model_supports_tree() {
+            if s.grammar.is_none() && allow_spec && self.model_supports_tree() {
                 return self.speculate_mtp_stream(prompt.to_string(), s.clone(), Some(widths));
             }
         }
-        if self.mtp_spec && s.grammar.is_none() {
+        if self.mtp_spec && s.grammar.is_none() && allow_spec {
             if self.model_supports_mtp() {
                 return self.speculate_mtp_stream(prompt.to_string(), s.clone(), None);
             }
             mtp_fallback_log_once();
         }
         if let Some(cfg) = self.ngram_spec {
-            if s.grammar.is_none() {
+            if s.grammar.is_none() && allow_spec {
                 return self.speculate_ngram_stream(prompt.to_string(), cfg, s.clone());
             }
         }
@@ -8439,7 +8494,12 @@ fn drive_generation(
         next_input = next_tok as i32;
         next_pos += 1;
         if (next_pos as usize) >= max_ctx {
-            break;
+            // P1: context shift (generate past ctx_size) on the streaming
+            // path. `state` is the held EngineState guard. `false` ⇒
+            // disabled/inapplicable ⇒ stop as before (byte-identical).
+            if !try_context_shift(&model, &mut state.kv_backend, max_ctx, &mut next_pos) {
+                break;
+            }
         }
     }
 
@@ -8988,6 +9048,51 @@ fn drive_vlm_generation(
     }
     *last_ids = history;
     Ok(())
+}
+
+/// P1: on hitting `max_ctx` mid-generation, try a llama.cpp-style context
+/// shift so generation CONTINUES instead of hard-stopping. Keeps the first
+/// `keep` positions (the BOS/system prefix), drops the next chunk, and
+/// re-RoPE's the retained suffix down to stay contiguous (see
+/// [`KvCache::context_shift`]). Returns `true` when the shift applied —
+/// `*next_pos` is set to the new (lower) write position and the caller keeps
+/// going — or `false` when context-shift is disabled or inapplicable, in
+/// which case the caller stops exactly as it did before (byte-identical).
+///
+/// Scope: contiguous **F32** KV + un-scaled NeoX RoPE only. Scaled-RoPE
+/// models (the K rows carry a scaled inv-freq the base-theta shift kernel
+/// doesn't reproduce), quant/half KV, and the paged backends all return
+/// `false` (keep the hard-stop) — fail-safe, never a silent-corruption shift.
+fn try_context_shift(
+    model: &LlamaModel,
+    backend: &mut KvBackend,
+    max_ctx: usize,
+    next_pos: &mut u32,
+) -> bool {
+    if !rustllama_models::accel::context_shift_enabled() {
+        return false;
+    }
+    if model.cfg.rope_scaling.is_some() {
+        return false;
+    }
+    let KvBackend::Contiguous(kv) = backend else {
+        return false;
+    };
+    if !kv.is_uniform_f32() {
+        return false;
+    }
+    // Keep the configured prefix (clamped so there is always room to discard).
+    let keep = (rustllama_models::accel::context_shift_keep() as usize).min(max_ctx / 2);
+    // Discard half of the non-kept span — llama.cpp's `(n_ctx - n_keep) / 2`.
+    let discard = max_ctx.saturating_sub(keep) / 2;
+    if discard == 0 {
+        return false;
+    }
+    if !kv.context_shift(keep, discard, model.cfg.rope_theta) {
+        return false;
+    }
+    *next_pos = kv.seq_len as u32;
+    true
 }
 
 /// one-line and the grow logic is owned by exactly one function.

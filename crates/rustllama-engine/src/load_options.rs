@@ -71,6 +71,13 @@ pub struct LoadOptionsInput {
     pub lock_usm: bool,
     /// USM-pin budget cap (MB).
     pub lock_usm_mb: u64,
+    /// P1: generate past `ctx_size` via llama.cpp-style context shift
+    /// (`[inference].context_shift`). `false` (default) keeps the historic
+    /// `PromptTooLong` / hard-stop behavior byte-identical.
+    pub context_shift: bool,
+    /// P1: leading positions retained across a context shift
+    /// (`[inference].context_shift_keep`).
+    pub context_shift_keep: u32,
 }
 
 /// Typed, env-wins-resolved snapshot of the config-mirroring feature/sizing
@@ -100,6 +107,9 @@ pub struct LoadOptions {
     pub kv_heavy_sink: u32,
     pub lock_usm: bool,
     pub lock_usm_mb: u64,
+    /// P1 context shift (generate past `ctx_size`).
+    pub context_shift: bool,
+    pub context_shift_keep: u32,
 }
 
 /// `true` when `RUSTLLAMA_<name>` is set to a truthy value (non-empty, not
@@ -216,6 +226,15 @@ impl LoadOptions {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(input.lock_usm_mb);
+        // P1 context shift — env wins, else the typed config value.
+        let context_shift = match std::env::var("RUSTLLAMA_CONTEXT_SHIFT") {
+            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Err(_) => input.context_shift,
+        };
+        let context_shift_keep = std::env::var("RUSTLLAMA_CONTEXT_SHIFT_KEEP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(input.context_shift_keep);
 
         LoadOptions {
             zerocopy_weights,
@@ -237,6 +256,8 @@ impl LoadOptions {
             kv_heavy_sink,
             lock_usm,
             lock_usm_mb,
+            context_shift,
+            context_shift_keep,
         }
     }
 
@@ -283,6 +304,10 @@ impl LoadOptions {
         accel::set_kv_heavy_sink(Some(self.kv_heavy_sink));
         accel::set_lock_usm(self.lock_usm);
         accel::set_lock_usm_mb(self.lock_usm_mb);
+        // P1 context shift (resolved from config + env above; applied
+        // unconditionally so a multi-model reload resets it cleanly).
+        accel::set_context_shift(self.context_shift);
+        accel::set_context_shift_keep(self.context_shift_keep);
     }
 
     /// The `(env_key, value)` pairs a spawned `tune --all` subprocess needs to

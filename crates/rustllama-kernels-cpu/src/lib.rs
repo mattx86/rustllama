@@ -12481,6 +12481,49 @@ pub fn rope_inplace_neox_invfreq(
     rope_apply_cs(x, n_heads, head_dim, half, cs);
 }
 
+/// P1 context-shift: rotate every row of `x` by a SIGNED position delta
+/// `shift` (NeoX half-split), reusing the same inv-freq + rotate machinery
+/// as [`rope_inplace_neox`]. A row originally RoPE'd for absolute position
+/// `p` is left RoPE'd for `p + shift` after this call, so with `shift < 0`
+/// (the context-shift drop) it moves the row DOWN by `|shift|` positions.
+///
+/// Used to re-RoPE the RETAINED K rows after a context-shift drops a gap
+/// out of the middle of the KV cache: each retained row at old position `p`
+/// is shifted by `-discard` so it occupies the contiguous position
+/// `p - discard` the sequence now expects. A 2-D rotation by `shift·freq`
+/// composes exactly (algebraically) with the row's baked-in `p·freq`
+/// rotation, so a shifted row equals a fresh RoPE at `p + shift` to within
+/// float rounding (the P1 `shift ≡ re-prefill` anchor). `shift == 0` is the
+/// identity rotation (cos 0 = 1, sin 0 = 0) — a true no-op.
+pub fn rope_shift_inplace(x: &mut [f32], n_heads: usize, head_dim: usize, shift: i32, theta: f32) {
+    debug_assert_eq!(x.len(), n_heads * head_dim);
+    debug_assert_eq!(head_dim % 2, 0);
+    let half = head_dim / 2;
+    const STACK_MAX_HALF: usize = 128;
+    let mut stack_cs = [0.0f32; 2 * STACK_MAX_HALF];
+    let heap_cs: Vec<f32>;
+    let s = shift as f32;
+    let cs: &[f32] = if half <= STACK_MAX_HALF {
+        for i in 0..half {
+            let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
+            let p = s * freq;
+            stack_cs[2 * i] = p.cos();
+            stack_cs[2 * i + 1] = p.sin();
+        }
+        &stack_cs[..2 * half]
+    } else {
+        heap_cs = (0..half)
+            .flat_map(|i| {
+                let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
+                let p = s * freq;
+                [p.cos(), p.sin()]
+            })
+            .collect();
+        &heap_cs[..]
+    };
+    rope_apply_cs(x, n_heads, head_dim, half, cs);
+}
+
 /// Shared cos/sin → rotate dispatch for the NeoX RoPE variants (AVX2 → NEON →
 /// scalar). `cs` is the interleaved `[cos0,sin0,cos1,sin1,…]` slab.
 fn rope_apply_cs(x: &mut [f32], n_heads: usize, head_dim: usize, half: usize, cs: &[f32]) {
@@ -17069,6 +17112,46 @@ mod tests {
         rope_inplace_neox(&mut x, 1, 8, 42, 10000.0);
         let n_out: f32 = x.iter().map(|v| v * v).sum();
         assert!((n_in - n_out).abs() < 1e-3, "in {n_in} out {n_out}");
+    }
+
+    /// P1 ANCHOR (kernel level): re-RoPE-ing a stored row by a negative
+    /// position delta equals a fresh RoPE at the shifted position — this is
+    /// exactly the re-rotation the context-shift applies to retained K rows.
+    #[test]
+    fn rope_shift_inplace_matches_fresh_rope_at_shifted_position() {
+        let head_dim = 8usize;
+        let n_heads = 3usize;
+        let theta = 10000.0f32;
+        let base: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| (i as f32 * 0.137).sin() * 1.7 - 0.3)
+            .collect();
+        for &(p, discard) in &[(20u32, 7i32), (31, 16), (8, 8), (100, 1)] {
+            // Stored row: RoPE'd at absolute position `p`, then shifted down.
+            let mut shifted = base.clone();
+            rope_inplace_neox(&mut shifted, n_heads, head_dim, p, theta);
+            rope_shift_inplace(&mut shifted, n_heads, head_dim, -discard, theta);
+            // Reference: a fresh RoPE at the post-shift position `p - discard`.
+            let mut fresh = base.clone();
+            rope_inplace_neox(&mut fresh, n_heads, head_dim, p - discard as u32, theta);
+            let maxdiff = shifted
+                .iter()
+                .zip(fresh.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                maxdiff < 1e-5,
+                "rope_shift(p={p}, -{discard}) vs fresh rope at {}: max|Δ|={maxdiff}",
+                p - discard as u32
+            );
+        }
+        // A zero shift is the identity rotation.
+        let mut z = base.clone();
+        rope_inplace_neox(&mut z, n_heads, head_dim, 42, theta);
+        let before = z.clone();
+        rope_shift_inplace(&mut z, n_heads, head_dim, 0, theta);
+        for (a, b) in z.iter().zip(before.iter()) {
+            assert!((a - b).abs() < 1e-6, "zero shift must be a no-op");
+        }
     }
 
     #[test]

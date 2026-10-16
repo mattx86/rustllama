@@ -3696,15 +3696,19 @@ pub fn measure_cacheblend_ratio(
             continue;
         }
 
-        // Full-prefill reference.
-        let mut kv_ref = KvCache::new(&model.cfg, ctx_size);
+        // Full-prefill reference. P2: force a NON-ring (full-slab) cache —
+        // CacheBlend builds isolated chunk snapshots + injects at absolute
+        // offsets, which a SWA ring (cap-strided) can't represent; the full
+        // slab still masks the window correctly on an SWA model.
+        let mut kv_ref = KvCache::new_with_dtype_no_ring(&model.cfg, ctx_size, KvDtype::F32);
         let ref_logits = model.forward_prefill_batched_f32(&assembled, 0, &mut kv_ref);
 
         // Isolated chunk snapshots → placements.
         let mut placements: Vec<ChunkPlacement> = Vec::with_capacity(N_CHUNKS);
         let mut off = 0usize;
         for c in &chunks {
-            let mut scratch = KvCache::new(&model.cfg, c.len().max(1));
+            let mut scratch =
+                KvCache::new_with_dtype_no_ring(&model.cfg, c.len().max(1), KvDtype::F32);
             let _ = model.forward_prefill_batched_f32(c, 0, &mut scratch);
             placements.push(ChunkPlacement {
                 offset: off,
@@ -3714,7 +3718,7 @@ pub fn measure_cacheblend_ratio(
         }
 
         for (ri, &ratio) in candidates.iter().enumerate() {
-            let mut kv_cb = KvCache::new(&model.cfg, ctx_size);
+            let mut kv_cb = KvCache::new_with_dtype_no_ring(&model.cfg, ctx_size, KvDtype::F32);
             let cb_logits = model.forward_prefill_cacheblend(
                 &assembled,
                 &placements,

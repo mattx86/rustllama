@@ -230,7 +230,7 @@ impl KvBackend {
                             model_cfg.head_dim as u32,
                         )
                         .ok_or(KvBackendError::PagedStoreShape)?;
-                        let cache = PagedKvCache::new_for(&store);
+                        let cache = PagedKvCache::new_for_with_cfg(&store, model_cfg);
                         Ok(KvBackend::Paged { cache, store, table })
                     }
                     KvDtype::Q8_0 => {

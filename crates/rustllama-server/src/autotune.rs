@@ -295,6 +295,11 @@ pub fn run_autotune_blocking(
             kv_heavy_sink: inf.kv_heavy_sink,
             lock_usm: inf.lock_usm,
             lock_usm_mb: inf.lock_usm_mb,
+            // P1: the sweep uses bounded prompts that never overflow ctx, so
+            // context-shift doesn't affect measurements — carried through for
+            // config fidelity only.
+            context_shift: inf.context_shift,
+            context_shift_keep: inf.context_shift_keep,
         });
         for (k, v) in opts.tune_child_env() {
             if std::env::var_os(k).is_none() {

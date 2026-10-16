@@ -711,9 +711,28 @@ pub struct InferenceConfig {
     /// `lock_usm` is on. Default 1024. Backs `RUSTLLAMA_LOCK_USM_MB` (env wins).
     #[serde(default = "default_lock_usm_mb")]
     pub lock_usm_mb: u64,
+    /// P1: generate PAST `ctx_size` instead of hard-stopping. When `true`,
+    /// hitting the context limit mid-generation keeps the first
+    /// `context_shift_keep` positions, drops the next chunk, and re-RoPE's the
+    /// retained K down to stay contiguous (llama.cpp-style `--keep` + KV shift),
+    /// then continues. `false` (default) keeps the historic `PromptTooLong` /
+    /// stop behavior byte-identical. Contiguous F32 KV + un-scaled NeoX RoPE
+    /// only (other layouts fall back to the hard-stop). Backs
+    /// `RUSTLLAMA_CONTEXT_SHIFT` (env wins).
+    #[serde(default)]
+    pub context_shift: bool,
+    /// P1: number of leading positions (the BOS/system prefix) retained across
+    /// a context shift. Only consulted when `context_shift` is on. Default 4.
+    /// Backs `RUSTLLAMA_CONTEXT_SHIFT_KEEP` (env wins).
+    #[serde(default = "default_context_shift_keep")]
+    pub context_shift_keep: u32,
 }
 
 fn default_kv_heavy_sink() -> u32 {
+    4
+}
+
+fn default_context_shift_keep() -> u32 {
     4
 }
 
@@ -997,6 +1016,8 @@ impl Default for InferenceConfig {
             kv_heavy_sink: default_kv_heavy_sink(),
             lock_usm: false,
             lock_usm_mb: default_lock_usm_mb(),
+            context_shift: false,
+            context_shift_keep: default_context_shift_keep(),
         }
     }
 }

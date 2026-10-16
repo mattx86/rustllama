@@ -153,6 +153,41 @@ impl Evictor {
             engaged: false,
         })
     }
+
+    /// P2: resolve the paged evictor for a specific MODEL. The explicit
+    /// global override (`[inference].kv_sliding_window` / `_heavy_hitter` /
+    /// `_heavy_sink`, env-initialized) still wins — a user who sets it takes
+    /// responsibility for the policy. Otherwise a paged sliding window is
+    /// auto-enabled from the model's own `sliding_window`, but ONLY for a
+    /// UNIFORMLY-SWA model (every layer is SWA).
+    ///
+    /// Why not per-layer: a paged page holds EVERY layer's KV for its
+    /// position range (`page i ↔ positions [i·ps, (i+1)·ps)` across all
+    /// layers), so freeing a page drops that range for all layers at once.
+    /// On an ALTERNATING-layer model (Gemma2: SWA layers interleaved with
+    /// full-attention "global" layers) the global layers still need the old
+    /// positions, so page-granular eviction would corrupt them. Such models
+    /// therefore get NO auto paged eviction here — their SWA memory win comes
+    /// from the contiguous F32 ring (see [`crate::llama_arch::KvCache`]).
+    fn from_config(cfg: &crate::llama_config::LlamaConfig) -> Option<Evictor> {
+        // Explicit global override first (env / config key).
+        if let Some(e) = Self::from_env() {
+            return Some(e);
+        }
+        let window = cfg.sliding_window?;
+        if window == 0 {
+            return None;
+        }
+        let all_swa = cfg.n_layers > 0 && (0..cfg.n_layers).all(|i| cfg.is_swa_layer(i));
+        if !all_swa {
+            return None;
+        }
+        Some(Evictor {
+            policy: EvictPolicy::SlidingWindow { window },
+            page_base: Vec::new(),
+            engaged: false,
+        })
+    }
 }
 
 /// Whether the page starting at absolute `base` is retained when the
@@ -227,6 +262,21 @@ impl PagedKvCache {
             seq_len: 0,
             page_size: store.page_size(),
             evict: Evictor::from_env(),
+        }
+    }
+
+    /// P2: like [`Self::new_for`] but resolves the evictor from the MODEL's
+    /// sliding-window config ([`Evictor::from_config`]) — so a uniformly-SWA
+    /// model gets an auto paged sliding window keyed to its own window span
+    /// (the global config/env keys still override). F32 paged is the only
+    /// layout an SWA model reaches (quant-KV SWA is pinned to contiguous), so
+    /// this is the one paged constructor that needs the per-model window.
+    pub fn new_for_with_cfg(store: &PagedKvStore, cfg: &crate::llama_config::LlamaConfig) -> Self {
+        Self {
+            pages: Vec::new(),
+            seq_len: 0,
+            page_size: store.page_size(),
+            evict: Evictor::from_config(cfg),
         }
     }
 

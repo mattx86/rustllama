@@ -1888,6 +1888,17 @@ pub struct ForwardScratch {
     /// at length 0 (Vec struct is ~24 bytes).
     pub paged_k_slab: Vec<f32>,
     pub paged_v_slab: Vec<f32>,
+    /// P2: compact gather slabs for an F32 SWA **ring** decode layer. The
+    /// ring slab is `cap`-strided and ring-addressed; before attention the
+    /// live window (`win_len <= cap` positions) is gathered here in
+    /// ASCENDING position order as `[n_kv_heads, win_len, head_dim]`, then
+    /// the existing CPU flash/one-step kernel runs over it with stride =
+    /// `win_len` and `window = 0` (every gathered position is in-window),
+    /// which is bit-identical to the unbounded masked SWA path. Sized to
+    /// `n_kv_heads × window × head_dim` on first use; empty (24-byte Vec)
+    /// on every non-SWA model.
+    pub swa_ring_k: Vec<f32>,
+    pub swa_ring_v: Vec<f32>,
 }
 
 impl ForwardScratch {
@@ -1958,6 +1969,7 @@ impl ForwardScratch {
         resize_zero(&mut self.paged_k_slab, need);
         resize_zero(&mut self.paged_v_slab, need);
     }
+
 }
 
 fn resize_zero(v: &mut Vec<f32>, n: usize) {
@@ -2567,6 +2579,62 @@ pub fn set_kv_heavy_hitter(v: Option<u32>) {
 
 pub fn set_kv_heavy_sink(v: Option<u32>) {
     kv_heavy_sink_cell().store(v.unwrap_or(u32::MAX), std::sync::atomic::Ordering::Relaxed);
+}
+
+// P1 context shift. `RUSTLLAMA_CONTEXT_SHIFT=1` (or the `[inference]
+// .context_shift` config key via the load path) enables llama.cpp-style
+// generation past `ctx_size`: on overflow the first `context_shift_keep`
+// positions are kept, a chunk after them is dropped, and the retained K is
+// re-RoPE'd down to stay contiguous. OFF by default ⇒ the historic
+// `PromptTooLong` / hard-stop behavior is byte-identical.
+fn context_shift_cell() -> &'static std::sync::atomic::AtomicBool {
+    static C: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(
+            std::env::var("RUSTLLAMA_CONTEXT_SHIFT")
+                .ok()
+                .map(|v| {
+                    let v = v.trim();
+                    v == "1" || v.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false),
+        )
+    })
+}
+
+fn context_shift_keep_cell() -> &'static std::sync::atomic::AtomicU32 {
+    static C: std::sync::OnceLock<std::sync::atomic::AtomicU32> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        std::sync::atomic::AtomicU32::new(
+            std::env::var("RUSTLLAMA_CONTEXT_SHIFT_KEEP")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(DEFAULT_CONTEXT_SHIFT_KEEP),
+        )
+    })
+}
+
+/// Default number of leading positions retained across a context shift (the
+/// system/BOS prefix). Small + safe; a request's own `context_shift_keep`
+/// config key overrides it.
+pub const DEFAULT_CONTEXT_SHIFT_KEEP: u32 = 4;
+
+/// Whether context-shift (generate past `ctx_size`) is enabled.
+pub fn context_shift_enabled() -> bool {
+    context_shift_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Number of leading positions to keep across a context shift.
+pub fn context_shift_keep() -> u32 {
+    context_shift_keep_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_context_shift(enabled: bool) {
+    context_shift_cell().store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_context_shift_keep(keep: u32) {
+    context_shift_keep_cell().store(keep, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `RUSTLLAMA_MEMORY_BUDGET` — `"auto"` enables the load-time expert-cache

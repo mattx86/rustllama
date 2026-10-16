@@ -3078,6 +3078,19 @@ pub struct KvCache {
     /// [`Self::dtype`] for the representative (layer-0) dtype and
     /// [`Self::uniform_dtype`] to gate the uniform-only batched paths.
     pub layer_dtypes: Vec<KvDtype>,
+    /// P2: per-layer physical KV capacity in POSITIONS (one entry per
+    /// layer). `max_ctx` for ordinary (full-attention) layers — their
+    /// slab is byte-for-byte the historic `max_ctx`-strided allocation.
+    /// A sliding-window (SWA) **F32** layer whose window `w` satisfies
+    /// `0 < w < max_ctx` instead gets a bounded capacity `w`: its K/V
+    /// slab is allocated `[n_kv_heads, w, head_dim]` (actual memory
+    /// reduction, not just masking) and the decode path addresses it as
+    /// a RING — position `p` lives at slot `p % w` — gathering the live
+    /// window into a compact scratch for attention. Non-F32 SWA layers
+    /// keep `max_ctx` (their windowed kernels mask a full slab; the ring
+    /// is F32-only for now). The per-head slab stride for layer `li` is
+    /// therefore `layer_caps[li]`, NOT `max_ctx`, on a ring layer.
+    pub layer_caps: Vec<usize>,
     /// K-cache mean-centering bias (fork `kv_bar` parity) — attached
     /// by the engine after load when a validated sidecar exists.
     /// Subtracted from K rows in the Q4_0 write arms only; exactly
@@ -3268,9 +3281,162 @@ fn try_open_usm_kv_stream() -> Option<Box<rustllama_kernels_sycl::SyclStream>> {
     }
 }
 
+/// P2: the ring capacity (in positions) for layer `li`. An F32
+/// sliding-window layer whose window `w` is strictly inside the context
+/// (`0 < w < max_ctx`) gets a bounded slab of `w` positions, addressed as
+/// a ring on write/read. Every other layer — full-attention layers, and
+/// SWA layers on a non-F32 KV dtype (their windowed kernels mask a full
+/// slab) — keeps `max_ctx`, so its allocation and indexing are byte-for-
+/// byte unchanged. Single source of truth for both allocation sizing and
+/// the decode-path ring arithmetic.
+#[inline]
+fn swa_ring_cap(cfg: &LlamaConfig, dtype: KvDtype, li: usize, max_ctx: usize) -> usize {
+    if matches!(dtype, KvDtype::F32) {
+        let w = cfg.swa_window(li);
+        if w > 0 && w < max_ctx {
+            return w;
+        }
+    }
+    max_ctx
+}
+
 impl KvCache {
     pub fn new(cfg: &LlamaConfig, max_ctx: usize) -> Self {
         Self::new_with_dtype(cfg, max_ctx, KvDtype::F32)
+    }
+
+    /// P2: physical capacity (positions) of layer `li`'s KV slab — i.e. its
+    /// per-head stride. Equals `max_ctx` for every ordinary layer; smaller
+    /// (the window) for an F32 SWA ring layer.
+    #[inline]
+    pub fn layer_cap(&self, li: usize) -> usize {
+        self.layer_caps.get(li).copied().unwrap_or(self.max_ctx)
+    }
+
+    /// P2: true iff layer `li` is a bounded SWA ring (cap below `max_ctx`).
+    /// A ring layer's slab is addressed `pos % cap`, so the full-history
+    /// fast paths (batched prefill, prefix snapshot/restore, tree-spec
+    /// compaction, the device-resident decode blocks) must route around it.
+    #[inline]
+    pub fn is_ring_layer(&self, li: usize) -> bool {
+        self.layer_cap(li) < self.max_ctx
+    }
+
+    /// P2: true iff ANY layer is a bounded SWA ring. The engine reads this
+    /// to keep a ring model off the paths that assume a full `max_ctx`-
+    /// strided contiguous history (see [`Self::is_ring_layer`]).
+    #[inline]
+    pub fn has_ring_layers(&self) -> bool {
+        self.max_ctx > 0 && self.layer_caps.iter().any(|&c| c < self.max_ctx)
+    }
+
+    /// P1 CONTEXT SHIFT. Drop positions `[keep, keep + discard)` from the KV
+    /// cache and slide the retained suffix down by `discard` so the sequence
+    /// re-occupies contiguous positions `[0, seq_len - discard)`, re-RoPE-ing
+    /// every moved K row by `-discard` (NeoX, via
+    /// [`rustllama_kernels_cpu::rope_shift_inplace`]). After this the caller
+    /// continues generating at `new_seq_len = seq_len - discard` exactly as if
+    /// the retained tokens had been prefilled at the shifted positions — the
+    /// state matches a fresh re-prefill of the retained sequence to within
+    /// float rounding (the P1 anchor).
+    ///
+    /// Composition with the P2 per-layer ring:
+    /// - **Full-attention (non-ring) F32 layers** get the classic left-shift +
+    ///   re-RoPE of the retained suffix.
+    /// - **SWA ring layers** hold only the recent `window`; those positions
+    ///   are all in the moved suffix (validated below), so each ring row is
+    ///   re-RoPE'd by `-discard` and re-slotted to its new `pos % cap` (the
+    ///   same renumbering a re-prefill would produce). V rows move unrotated.
+    ///
+    /// Returns `false` WITHOUT mutating anything when it can't guarantee a
+    /// correct result — a non-F32 (or placeholder) layer, out-of-range
+    /// `keep`/`discard`, or a ring whose live window would straddle the kept
+    /// head / dropped gap. The caller then keeps today's hard-stop behavior.
+    /// `rope_theta` must be the model's base theta; context shift is only
+    /// wired for un-scaled NeoX RoPE (the engine gates on that).
+    #[must_use]
+    pub fn context_shift(&mut self, keep: usize, discard: usize, rope_theta: f32) -> bool {
+        let seq = self.seq_len;
+        if discard == 0 || keep >= seq || keep + discard >= seq {
+            return false;
+        }
+        let max_ctx = self.max_ctx;
+        let hd = self.head_dim;
+        let n_h = self.n_kv_heads;
+        let caps = self.layer_caps.clone();
+        // Pre-validate every layer is shiftable before mutating any of them.
+        for (li, layer) in self.layers.iter().enumerate() {
+            match layer {
+                KvLayer::F32 { k, .. } if k.len() == n_h * caps[li] * hd => {}
+                _ => return false, // non-F32, or a sparse/placeholder layer
+            }
+            let cap = caps[li];
+            if cap < max_ctx {
+                // Ring: the live window must lie entirely in the moved suffix
+                // so the whole ring renumbers by a uniform `-discard`.
+                let win_len = seq.min(cap);
+                let first = seq - win_len;
+                if first < keep + discard {
+                    return false;
+                }
+            }
+        }
+        let shift = -(discard as i32);
+        let new_seq = seq - discard;
+        for (li, layer) in self.layers.iter_mut().enumerate() {
+            let cap = caps[li];
+            let KvLayer::F32 { k, v } = layer else {
+                unreachable!("validated F32 above");
+            };
+            if cap >= max_ctx {
+                // Full-attention layer: left-shift the retained suffix, re-RoPE
+                // each moved K row. Ascending order is clobber-safe (dst < src),
+                // and a moved+roped row's new index is below every later src, so
+                // it is never re-read.
+                for p in (keep + discard)..seq {
+                    let np = p - discard;
+                    for h in 0..n_h {
+                        let src = (h * max_ctx + p) * hd;
+                        let dst = (h * max_ctx + np) * hd;
+                        k.copy_within(src..src + hd, dst);
+                        v.copy_within(src..src + hd, dst);
+                        k::rope_shift_inplace(&mut k[dst..dst + hd], 1, hd, shift, rope_theta);
+                    }
+                }
+            } else {
+                // Ring layer: gather the live window (re-RoPE'd) then write each
+                // row back at its NEW slot `new_pos % cap`. Two passes via a temp
+                // so an old slot isn't overwritten before it is read.
+                let win_len = seq.min(cap);
+                let first = seq - win_len;
+                let mut tk = vec![0f32; n_h * win_len * hd];
+                let mut tv = vec![0f32; n_h * win_len * hd];
+                for j in 0..win_len {
+                    let old_p = first + j;
+                    for h in 0..n_h {
+                        let src = (h * cap + (old_p % cap)) * hd;
+                        let td = (h * win_len + j) * hd;
+                        tk[td..td + hd].copy_from_slice(&k[src..src + hd]);
+                        tv[td..td + hd].copy_from_slice(&v[src..src + hd]);
+                        k::rope_shift_inplace(&mut tk[td..td + hd], 1, hd, shift, rope_theta);
+                    }
+                }
+                for j in 0..win_len {
+                    let new_p = (first + j) - discard;
+                    for h in 0..n_h {
+                        let td = (h * win_len + j) * hd;
+                        let dst = (h * cap + (new_p % cap)) * hd;
+                        k[dst..dst + hd].copy_from_slice(&tk[td..td + hd]);
+                        v[dst..dst + hd].copy_from_slice(&tv[td..td + hd]);
+                    }
+                }
+            }
+        }
+        self.seq_len = new_seq;
+        // The rotated/moved rows invalidate any thread-local USM / device KV
+        // mirror: force a re-upload so the GPU can't serve stale rows.
+        crate::accel::usm_attn_kv_epoch_bump();
+        true
     }
 
     /// F4: the representative KV dtype — the dtype of layer 0 (which, in
@@ -3317,6 +3483,13 @@ impl KvCache {
     /// `>= j`, so `src_slots[j] >= j` and the ascending in-place copy never
     /// clobbers a not-yet-moved source; `src == j` slots are skipped.
     pub fn compact_tokens(&mut self, base: usize, src_slots: &[usize]) {
+        // P2: tree-spec compaction assumes `max_ctx`-strided slabs. The engine
+        // disables speculation for SWA ring models (see `swa_ring_decode`), so
+        // this is never reached with a ring layer; assert it in debug builds.
+        debug_assert!(
+            !self.has_ring_layers(),
+            "compact_tokens on a SWA ring cache (tree-spec must be disabled for ring models)"
+        );
         let max_ctx = self.max_ctx;
         let head_dim = self.head_dim;
         let n_kv_heads = self.n_kv_heads;
@@ -3382,7 +3555,7 @@ impl KvCache {
     /// attention-sink layers at f32/q8_0, the rest cheaper). Allocation
     /// and the attention dispatch key off each layer's dtype.
     pub fn new_with_layer_dtypes(cfg: &LlamaConfig, max_ctx: usize, dtypes: &[KvDtype]) -> Self {
-        Self::new_with_layer_dtypes_impl(cfg, max_ctx, dtypes.to_vec(), None)
+        Self::new_with_layer_dtypes_impl(cfg, max_ctx, dtypes.to_vec(), None, true)
     }
 
     /// Sparse [`Self::new_with_layer_dtypes`] (hybrid keep-mask aware).
@@ -3393,7 +3566,16 @@ impl KvCache {
         keep: &[bool],
     ) -> Self {
         assert_eq!(keep.len(), cfg.n_layers, "keep mask must have one entry per layer");
-        Self::new_with_layer_dtypes_impl(cfg, max_ctx, dtypes.to_vec(), Some(keep))
+        Self::new_with_layer_dtypes_impl(cfg, max_ctx, dtypes.to_vec(), Some(keep), true)
+    }
+
+    /// P2: build a cache for a sliding-window model WITHOUT the bounded ring
+    /// — every layer gets a full `max_ctx` slab and the forward applies SWA
+    /// by MASKING (the pre-P2 behavior). This is the reference the ring is
+    /// graded against (ring ≡ masked-unbounded), and the shape a config
+    /// could request to opt out of the ring's memory saving.
+    pub fn new_with_dtype_no_ring(cfg: &LlamaConfig, max_ctx: usize, dtype: KvDtype) -> Self {
+        Self::new_with_layer_dtypes_impl(cfg, max_ctx, vec![dtype; cfg.n_layers], None, false)
     }
 
     fn new_with_dtype_impl(
@@ -3405,7 +3587,7 @@ impl KvCache {
         // F4: a uniform cache is just a per-layer cache with every entry
         // equal — same allocation path, so an all-same cache is
         // byte-identical to the historic single-dtype construction.
-        Self::new_with_layer_dtypes_impl(cfg, max_ctx, vec![dtype; cfg.n_layers], keep)
+        Self::new_with_layer_dtypes_impl(cfg, max_ctx, vec![dtype; cfg.n_layers], keep, true)
     }
 
     fn new_with_layer_dtypes_impl(
@@ -3413,6 +3595,7 @@ impl KvCache {
         max_ctx: usize,
         layer_dtypes: Vec<KvDtype>,
         keep: Option<&[bool]>,
+        ring_enabled: bool,
     ) -> Self {
         assert_eq!(
             layer_dtypes.len(),
@@ -3421,11 +3604,28 @@ impl KvCache {
         );
         let total_rows = cfg.n_kv_heads * max_ctx;
         let row_floats = total_rows * cfg.head_dim;
+        // P2: per-layer ring capacity. An F32 sliding-window layer with a
+        // window strictly inside the context gets a bounded slab sized to
+        // the window (ring-addressed on write/read); everything else keeps
+        // the full `max_ctx` slab (byte-identical to before — the common
+        // `cap == max_ctx` case allocates exactly as it always did).
+        let layer_caps: Vec<usize> = (0..cfg.n_layers)
+            .map(|li| {
+                if ring_enabled {
+                    swa_ring_cap(cfg, layer_dtypes[li], li, max_ctx)
+                } else {
+                    max_ctx
+                }
+            })
+            .collect();
         let usm_stream = try_open_usm_kv_stream();
         let stream_ref = usm_stream.as_deref();
         let layers = (0..cfg.n_layers)
             .map(|li| {
                 let dtype = layer_dtypes[li];
+                // F32 real-slab size honors this layer's ring cap; for a
+                // non-ring layer `cap == max_ctx` so this equals `row_floats`.
+                let cap_floats = layer_caps[li] * cfg.n_kv_heads * cfg.head_dim;
                 if let Some(keep) = keep {
                     if !keep[li] {
                         // Zero-length host placeholder — this layer's
@@ -3486,8 +3686,8 @@ impl KvCache {
                 }
                 match dtype {
                 KvDtype::F32 => KvLayer::F32 {
-                    k: alloc_kv_buf_f32(stream_ref, row_floats),
-                    v: alloc_kv_buf_f32(stream_ref, row_floats),
+                    k: alloc_kv_buf_f32(stream_ref, cap_floats),
+                    v: alloc_kv_buf_f32(stream_ref, cap_floats),
                 },
                 KvDtype::F16 => KvLayer::Half {
                     bf16: false,
@@ -3594,6 +3794,7 @@ impl KvCache {
             n_kv_heads: cfg.n_kv_heads,
             head_dim: cfg.head_dim,
             layer_dtypes,
+            layer_caps,
             kv_bias: None,
             usm_stream,
         }
@@ -3702,6 +3903,14 @@ impl KvCache {
             prefix_len <= self.seq_len,
             "snapshot_prefix {prefix_len} exceeds seq_len {}",
             self.seq_len
+        );
+        // P2: a ring layer holds only the last `cap` positions, so it can't
+        // snapshot a `max_ctx`-strided prefix. The engine disables prefix-
+        // cache snapshot/restore for ring models (see `commit_snapshot`); a
+        // ring cache must never reach here.
+        debug_assert!(
+            !self.has_ring_layers(),
+            "snapshot_prefix on a SWA ring cache (prefix cache must be disabled for ring models)"
         );
         let n_h = self.n_kv_heads;
         let hd = self.head_dim;
@@ -9098,6 +9307,13 @@ impl LlamaModel {
         let mut moe_routed_picks = std::mem::take(&mut scratch.moe_routed_picks);
         // TurboQuant KV-append scratch — see ForwardScratch::tq_scratch.
         let mut tq_scratch = std::mem::take(&mut scratch.tq_scratch);
+        // P2: SWA-ring gather slabs, taken as locals (like the others) so the
+        // ring decode arm can grow them without re-borrowing `scratch` — the
+        // `rope_inv_freq` reference below holds an immutable borrow of `scratch`
+        // for the whole layer loop, so a `scratch.*` mutable call there won't
+        // compile. Put back at the bottom.
+        let mut swa_ring_k = std::mem::take(&mut scratch.swa_ring_k);
+        let mut swa_ring_v = std::mem::take(&mut scratch.swa_ring_v);
 
         match input {
             EmbedInput::Token(token_id) => {
@@ -9170,6 +9386,15 @@ impl LlamaModel {
             // path for layers past the `[inference].n_gpu_layers`
             // cutoff.
             crate::accel::set_current_layer_idx(layer_idx as u32);
+            // P2: is this an F32 SWA ring layer? A ring layer's slab is
+            // `cap`-strided and ring-addressed (`pos % cap`), so the
+            // device-resident decode blocks + the USM/CUDA GPU flash hooks
+            // (which assume a `max_ctx`-strided contiguous slab written at
+            // `cur_pos`) MUST be declined for it; its attention runs through
+            // the ring write + compact gather + CPU flash below. Non-ring
+            // layers (`cap == max_ctx`) keep every existing path unchanged.
+            let cap_l = kv.layer_cap(layer_idx);
+            let is_ring_l = cap_l < kv.max_ctx;
             // ---- attention ----
             // Dispatch ladder: USM-resident SYCL (shared stream
             // with the attention kernel, no per-call alloc) →
@@ -9247,7 +9472,7 @@ impl LlamaModel {
             // below, which applies it. Non-scaled + linear/NTK keep the device
             // blocks, fed `self.rope_inv_freq` — the scaled table, byte-identical to
             // the base table when the model carries no scaling.
-            let device_attn = if self.yarn_mscale == 1.0 {
+            let device_attn = if self.yarn_mscale == 1.0 && !is_ring_l {
                 if let KvLayer::F32 { k, v } = &mut kv.layers[layer_idx] {
                     // Per-layer SWA window (0 ⇒ full causal) + Gemma2 attention-logit
                     // soft-cap (0.0 ⇒ no cap), threaded into every device block's
@@ -9555,6 +9780,64 @@ impl LlamaModel {
             let kv_layer = &mut kv.layers[layer_idx];
             let kv_len = cur_pos + 1;
             match kv_layer {
+                KvLayer::F32 { k, v } if is_ring_l => {
+                    // P2 SWA RING decode. Slab is `cap`-strided, ring-addressed.
+                    // `cap == swa_window` here (a ring exists only when the window
+                    // is strictly inside the context), so the live window is the
+                    // whole ring. Write the new row at `cur_pos % cap`, gather the
+                    // live window [cur_pos-win_len+1, cur_pos] into the compact
+                    // scratch in ASCENDING position order, then run the CPU flash /
+                    // one-step kernel over it with stride = `win_len` and window 0.
+                    // Every gathered position is in-window, so window 0 (full over
+                    // the compact set) reproduces the unbounded masked SWA path's
+                    // attended set in the same order ⇒ bit-identical logits, while
+                    // the slab itself is only `cap` positions (the memory win).
+                    // The device-resident blocks + GPU flash hooks + CUDA mirror
+                    // seed are all declined above for a ring layer (they assume a
+                    // `max_ctx` slab written at `cur_pos`), so none run here.
+                    let cap = cap_l;
+                    let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
+                    let slot = cur_pos % cap;
+                    for h in 0..n_kv_heads {
+                        let dst = (h * cap + slot) * head_dim;
+                        k[dst..dst + head_dim]
+                            .copy_from_slice(&k_buf[h * head_dim..(h + 1) * head_dim]);
+                        v[dst..dst + head_dim]
+                            .copy_from_slice(&v_buf[h * head_dim..(h + 1) * head_dim]);
+                    }
+                    let win_len = kv_len.min(cap);
+                    let first_pos = kv_len - win_len; // = cur_pos + 1 - win_len
+                    let used = n_kv_heads * win_len * head_dim;
+                    // Grow the (locally-owned) gather slabs; the gather fully
+                    // overwrites `[..used]` so no zero-fill is needed.
+                    if swa_ring_k.len() < used {
+                        swa_ring_k.resize(used, 0.0);
+                        swa_ring_v.resize(used, 0.0);
+                    }
+                    for h in 0..n_kv_heads {
+                        for j in 0..win_len {
+                            let pos = first_pos + j;
+                            let src = (h * cap + (pos % cap)) * head_dim;
+                            let dst = (h * win_len + j) * head_dim;
+                            swa_ring_k[dst..dst + head_dim]
+                                .copy_from_slice(&k[src..src + head_dim]);
+                            swa_ring_v[dst..dst + head_dim]
+                                .copy_from_slice(&v[src..src + head_dim]);
+                        }
+                    }
+                    let flash_min = flash_kv_len_min();
+                    if crate::accel::flash_attention_enabled() && win_len >= flash_min {
+                        k::gqa_attention_flash_decode_capped_windowed(
+                            &q_buf, &swa_ring_k[..used], &swa_ring_v[..used], &mut attn_out,
+                            n_heads, n_kv_heads, head_dim, win_len, win_len, 0, softcap,
+                        );
+                    } else {
+                        k::gqa_attention_one_step_capped_windowed(
+                            &q_buf, &swa_ring_k[..used], &swa_ring_v[..used], &mut attn_out,
+                            n_heads, n_kv_heads, head_dim, win_len, win_len, 0, softcap,
+                        );
+                    }
+                }
                 KvLayer::F32 { k, v } => {
                     for h in 0..n_kv_heads {
                         let dst = (h * max_ctx + cur_pos) * head_dim;
@@ -10462,6 +10745,8 @@ impl LlamaModel {
         scratch.moe_expert_logits = moe_expert_logits;
         scratch.moe_routed_picks = moe_routed_picks;
         scratch.tq_scratch = tq_scratch;
+        scratch.swa_ring_k = swa_ring_k;
+        scratch.swa_ring_v = swa_ring_v;
     }
 
     /// Fused multi-slot decode: advance M independent slots by one
@@ -11853,7 +12138,16 @@ impl LlamaModel {
         // cache (`uniform_dtype() == None`) skips them and uses the serial
         // `forward_one` loop below, which dispatches each layer on its own
         // `KvLayer` variant and is correct for any mix.
-        if batched_on && !tokens.is_empty() && kv.uniform_dtype().is_some() {
+        // P2: a cache with any SWA ring layer uses the serial `forward_one`
+        // loop below. The batched prefill kernels stride every layer's slab
+        // by `max_ctx` and compute all N queries against the FINAL cache
+        // state — both wrong for a `cap`-strided ring that overwrites older
+        // positions as it fills. The serial loop drives each token through
+        // the ring-aware decode arm, which is correct (and O(n·window), not
+        // O(n²), on the windowed layers).
+        if batched_on && !tokens.is_empty() && kv.uniform_dtype().is_some()
+            && !kv.has_ring_layers()
+        {
             match kv.layers.first() {
                 Some(KvLayer::F32 { .. }) => {
                     return self.forward_prefill_batched_f32(tokens, start_pos, kv);
@@ -13714,6 +14008,194 @@ mod tests {
         )
     }
 
+    /// P2 helper: a sliding-window variant of [`synth_cfg`]. `pattern`
+    /// = `None` makes every layer SWA (Mistral-style); `Some(p)` makes
+    /// every `p`-th layer a full-attention "global" layer (Gemma2-style).
+    fn swa_cfg(
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        window: u32,
+        pattern: Option<u32>,
+    ) -> LlamaConfig {
+        let mut c = synth_cfg(n_layers, n_kv_heads, head_dim);
+        c.sliding_window = Some(window);
+        c.sliding_window_pattern = pattern;
+        c
+    }
+
+    /// P2 ANCHOR: the bounded SWA ring's decode logits equal the
+    /// unbounded-but-masked SWA path's logits at every position —
+    /// including well past the window, where the ring wraps repeatedly —
+    /// AND the ring actually uses less memory. The reference cache
+    /// ([`KvCache::new_with_dtype_no_ring`]) keeps full `max_ctx` slabs and
+    /// masks; the ring cache ([`KvCache::new`]) stores only `window`
+    /// positions per SWA layer and gathers.
+    #[test]
+    fn swa_ring_decode_matches_masked_unbounded() {
+        let window = 4u32;
+        let max_ctx = 24usize; // decode 6× past the window
+        for pattern in [None, Some(2u32)] {
+            let cfg = swa_cfg(4, 2, 8, window, pattern);
+            let model = synth_llama_model(&cfg);
+            let mut ring = KvCache::new(&cfg, max_ctx);
+            let mut masked = KvCache::new_with_dtype_no_ring(&cfg, max_ctx, KvDtype::F32);
+            assert!(
+                ring.has_ring_layers(),
+                "SWA model (pattern={pattern:?}) must produce at least one ring layer"
+            );
+            assert!(!masked.has_ring_layers(), "no-ring reference must be full-slab");
+
+            let vocab = cfg.vocab_size;
+            let toks: Vec<i32> = (0..max_ctx as i32).map(|i| (i * 7 + 3) % 256).collect();
+            let mut lr = vec![0f32; vocab];
+            let mut lm = vec![0f32; vocab];
+            for (pos, &t) in toks.iter().enumerate() {
+                model.forward_one(t, pos as u32, &mut ring, &mut lr);
+                model.forward_one(t, pos as u32, &mut masked, &mut lm);
+                let maxdiff = lr
+                    .iter()
+                    .zip(lm.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    maxdiff <= 1e-4,
+                    "ring vs masked diverged at pos {pos} (pattern={pattern:?}): max|Δ|={maxdiff}"
+                );
+            }
+            assert!(
+                ring.approx_bytes() < masked.approx_bytes(),
+                "ring must use less KV memory (pattern={pattern:?}): ring={} masked={}",
+                ring.approx_bytes(),
+                masked.approx_bytes(),
+            );
+        }
+    }
+
+    /// P2: the ring is per-LAYER — on an alternating (Gemma2-style) model
+    /// only the SWA layers are bounded; the global full-attention layers
+    /// keep the full `max_ctx` slab.
+    #[test]
+    fn swa_ring_is_per_layer_on_alternating_pattern() {
+        let window = 4u32;
+        let max_ctx = 24usize;
+        // pattern=2 ⇒ layer `(idx+1)%2==0` is GLOBAL: layers 1,3 global; 0,2 SWA.
+        let cfg = swa_cfg(4, 2, 8, window, Some(2));
+        let kv = KvCache::new(&cfg, max_ctx);
+        assert!(kv.is_ring_layer(0) && !kv.is_ring_layer(1));
+        assert!(kv.is_ring_layer(2) && !kv.is_ring_layer(3));
+        assert_eq!(kv.layer_cap(0), window as usize);
+        assert_eq!(kv.layer_cap(1), max_ctx);
+    }
+
+    /// P2: a non-SWA model NEVER rings, and the ring code path leaves its
+    /// decode byte-for-byte identical (same allocation, same forward).
+    #[test]
+    fn non_swa_model_never_rings_and_decode_byte_identical() {
+        let max_ctx = 24usize;
+        let cfg = synth_cfg(3, 2, 8); // sliding_window = None
+        let model = synth_llama_model(&cfg);
+        assert!(!KvCache::new(&cfg, max_ctx).has_ring_layers());
+
+        let mut k1 = KvCache::new(&cfg, max_ctx);
+        let mut k2 = KvCache::new_with_dtype_no_ring(&cfg, max_ctx, KvDtype::F32);
+        assert_eq!(
+            k1.approx_bytes(),
+            k2.approx_bytes(),
+            "non-SWA ring vs no-ring allocation must match exactly"
+        );
+        let vocab = cfg.vocab_size;
+        let toks: Vec<i32> = (0..12i32).map(|i| (i * 5 + 1) % 256).collect();
+        let mut l1 = vec![0f32; vocab];
+        let mut l2 = vec![0f32; vocab];
+        for (pos, &t) in toks.iter().enumerate() {
+            model.forward_one(t, pos as u32, &mut k1, &mut l1);
+            model.forward_one(t, pos as u32, &mut k2, &mut l2);
+            assert_eq!(l1, l2, "non-SWA decode must be byte-identical at pos {pos}");
+        }
+    }
+
+    /// P1 ANCHOR: a context shift leaves the KV ≡ a fresh re-prefill of the
+    /// retained token sequence at the shifted positions, so continuation is
+    /// coherent. Proven on a 1-LAYER model, where every layer's K/V is a pure
+    /// function of its own token (layer-0 K/V don't depend on attention
+    /// history) — so dropping the middle chunk and re-RoPE-ing the suffix
+    /// reproduces exactly what a re-prefill of the retained tokens would build.
+    /// Exercised for full-attention AND an all-SWA ring model (the ring layer's
+    /// re-slot + re-RoPE composes with the shift).
+    #[test]
+    fn context_shift_matches_reprefill_of_retained_tokens() {
+        let max_ctx = 32usize;
+        let n = 20usize;
+        let keep = 3usize;
+        let discard = 6usize;
+        for swa in [None, Some(4u32)] {
+            let cfg = match swa {
+                Some(w) => swa_cfg(1, 2, 8, w, None),
+                None => synth_cfg(1, 2, 8),
+            };
+            let model = synth_llama_model(&cfg);
+            let theta = cfg.rope_theta;
+            let vocab = cfg.vocab_size;
+            let toks: Vec<i32> = (0..n as i32).map(|i| (i * 11 + 5) % 256).collect();
+            let probe = 123i32;
+
+            // SHIFTED: prefill all, context-shift, probe at the new position.
+            let mut kv = KvCache::new(&cfg, max_ctx);
+            let mut scratch = vec![0f32; vocab];
+            for (p, &t) in toks.iter().enumerate() {
+                model.forward_one(t, p as u32, &mut kv, &mut scratch);
+            }
+            assert!(
+                kv.context_shift(keep, discard, theta),
+                "context_shift should apply (swa={swa:?})"
+            );
+            assert_eq!(kv.seq_len, n - discard);
+            let mut l_shift = vec![0f32; vocab];
+            model.forward_one(probe, (n - discard) as u32, &mut kv, &mut l_shift);
+
+            // REFERENCE: re-prefill the retained tokens, probe at the same pos.
+            let mut ret: Vec<i32> = toks[..keep].to_vec();
+            ret.extend_from_slice(&toks[keep + discard..]);
+            assert_eq!(ret.len(), n - discard);
+            let mut kv2 = KvCache::new(&cfg, max_ctx);
+            let mut scratch2 = vec![0f32; vocab];
+            for (p, &t) in ret.iter().enumerate() {
+                model.forward_one(t, p as u32, &mut kv2, &mut scratch2);
+            }
+            let mut l_ref = vec![0f32; vocab];
+            model.forward_one(probe, ret.len() as u32, &mut kv2, &mut l_ref);
+
+            let maxdiff = l_shift
+                .iter()
+                .zip(l_ref.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                maxdiff < 1e-4,
+                "context_shift logits must match a re-prefill (swa={swa:?}): max|Δ|={maxdiff}"
+            );
+        }
+    }
+
+    /// P1: `context_shift` is fail-safe — it returns `false` WITHOUT mutating
+    /// the cache for out-of-range parameters (so the engine keeps today's
+    /// hard-stop), and a ring whose live window would straddle the kept head /
+    /// dropped gap is refused rather than corrupted.
+    #[test]
+    fn context_shift_refuses_bad_params_without_mutating() {
+        let cfg = synth_cfg(2, 2, 8);
+        let model = synth_llama_model(&cfg);
+        let mut kv = KvCache::new(&cfg, 32);
+        let mut l = vec![0f32; cfg.vocab_size];
+        for p in 0..10u32 {
+            model.forward_one((p as i32 + 1) % 256, p, &mut kv, &mut l);
+        }
+        assert!(!kv.context_shift(0, 0, cfg.rope_theta), "discard=0 must refuse");
+        assert!(!kv.context_shift(10, 5, cfg.rope_theta), "keep>=seq must refuse");
+        assert_eq!(kv.seq_len, 10, "a refused shift must not change seq_len");
+    }
+
     /// Parity probe: `forward_prefill_paged_f32` returns bit-
     /// identical logits to `forward_prefill_batched_f32` for the
     /// same model + tokens. Proves the gather path's data layout
@@ -14156,7 +14638,12 @@ mod tests {
         let max_ctx = 16;
 
         // --- Contiguous reference (windowed/capped kernels). ---
-        let mut contig_kv = KvCache::new(cfg, max_ctx);
+        // P2: the reference is the FULL-slab masked path (what the paged side
+        // computes — full history, windowed) via `new_with_dtype_no_ring`, not
+        // the bounded SWA ring. The ring's equivalence to this masked path is
+        // covered separately by `swa_ring_decode_matches_masked_unbounded`; the
+        // ring also can't run the batched prefill this test calls directly.
+        let mut contig_kv = KvCache::new_with_dtype_no_ring(cfg, max_ctx, KvDtype::F32);
         let prefill_contig = model.forward_prefill_batched_f32(&prompt, 0, &mut contig_kv);
         let mut decode_contig = vec![0f32; cfg.vocab_size];
         model.forward_one(last_tok, n_prompt as u32, &mut contig_kv, &mut decode_contig);
@@ -15088,7 +15575,9 @@ mod tests {
     /// Build a chunk's isolated KV snapshot the way the engine will: a
     /// standalone F32-KV prefill of the chunk at position 0.
     fn chunk_snapshot(model: &LlamaModel, cfg: &LlamaConfig, chunk: &[i32]) -> KvSnapshot {
-        let mut kv = KvCache::new(cfg, 32);
+        // P2: CacheBlend snapshots a full prefix — force a non-ring (full-slab)
+        // cache so an SWA cfg doesn't bound the slab below the chunk length.
+        let mut kv = KvCache::new_with_dtype_no_ring(cfg, 32, KvDtype::F32);
         let _ = model.forward_prefill_batched_f32(chunk, 0, &mut kv);
         kv.snapshot_prefix(chunk.len())
     }
@@ -15168,7 +15657,10 @@ mod tests {
         let suffix_start = chunk1.len() + chunk2.len();
         let max_ctx = 32;
 
-        let mut kv_ref = KvCache::new(&cfg, max_ctx);
+        // P2: CacheBlend operates on a full-slab (absolute-offset injection),
+        // so force non-ring caches for the SWA cfg. The windowed/capped kernels
+        // still mask correctly on the full slab.
+        let mut kv_ref = KvCache::new_with_dtype_no_ring(&cfg, max_ctx, KvDtype::F32);
         let ref_logits = model.forward_prefill_batched_f32(&assembled, 0, &mut kv_ref);
 
         let placements = vec![
@@ -15181,7 +15673,7 @@ mod tests {
                 snapshot: Arc::new(chunk_snapshot(&model, &cfg, &chunk2)),
             },
         ];
-        let mut kv_cb = KvCache::new(&cfg, max_ctx);
+        let mut kv_cb = KvCache::new_with_dtype_no_ring(&cfg, max_ctx, KvDtype::F32);
         let cb_logits = model.forward_prefill_cacheblend(
             &assembled,
             &placements,

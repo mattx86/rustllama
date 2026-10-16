@@ -2433,6 +2433,8 @@ fn promote_memory_env_from_config(
         kv_heavy_sink: inference.kv_heavy_sink,
         lock_usm: inference.lock_usm,
         lock_usm_mb: inference.lock_usm_mb,
+        context_shift: inference.context_shift,
+        context_shift_keep: inference.context_shift_keep,
     });
     opts.apply();
     if opts.moe_expert_cache_mb > 0 {
