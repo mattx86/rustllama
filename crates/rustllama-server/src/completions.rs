@@ -72,6 +72,17 @@ pub struct CompletionRequest {
     /// Legacy-completions `logprobs`: an integer 0..=5 giving the number of
     /// top alternative logprobs to return per token. `None` disables.
     pub logprobs: Option<u32>,
+    /// P12a — OpenAI `n`: how many independent completions to return for the
+    /// prompt. `None` / `1` (default) is the single-completion path, which is
+    /// byte-identical to before this field existed. `> 1` returns `n`
+    /// `choices`, each a distinct seeded sample that shares the prompt prefix.
+    /// Not supported with `stream: true`.
+    pub n: Option<u32>,
+    /// P12a — OpenAI `best_of`: generate `best_of` completions server-side and
+    /// return the `n` best by length-normalized cumulative logprob. Defaults
+    /// to `n`; must be `>= n`. `best_of == n == 1` is the untouched single
+    /// path. Not supported with `stream: true`.
+    pub best_of: Option<u32>,
     /// CacheBlend (rustllama extension): retrieved RAG context chunks, each a
     /// document whose KV is precomputed in isolation and blended into the
     /// prompt. They are prepended to `prompt` as context; when CacheBlend is
@@ -126,6 +137,29 @@ pub async fn completions(
     let Some(serving) = state.resolve(req.model.as_deref()).await else {
         return model_not_found(req.model.as_deref());
     };
+    // P12a: resolve n / best_of. `best_of` defaults to `n` and must be >= n;
+    // `n_candidates = max(n, best_of) = best_of` completions are generated,
+    // and the top `n_choices` are returned. `n_candidates == 1` is the
+    // untouched single-completion path. Streaming + multi is rejected (OpenAI
+    // disallows `best_of` with stream, and we don't multiplex `n` choices
+    // over one SSE channel).
+    let n_choices = req.n.unwrap_or(1).max(1);
+    let best_of = req.best_of.unwrap_or(n_choices);
+    if best_of < n_choices {
+        return (
+            StatusCode::BAD_REQUEST,
+            "best_of must be >= n".to_string(),
+        )
+            .into_response();
+    }
+    let n_candidates = n_choices.max(best_of);
+    if n_candidates > 1 && req.stream {
+        return (
+            StatusCode::BAD_REQUEST,
+            "n > 1 / best_of > 1 is not supported with stream=true".to_string(),
+        )
+            .into_response();
+    }
     // Two-phase admission: tokenizer access + FIM prompt assembly +
     // prompt-token count all happen against the Arc-shared CPU engine
     // BEFORE the gate wait, so the work overlaps any in-flight
@@ -255,6 +289,78 @@ pub async fn completions(
     // Non-streaming path: hold the permit for the duration of generation.
     let _permit = permit;
 
+    // P12a — multi-completion (`n` / `best_of`) path. Generates
+    // `n_candidates` independent samples that share the prompt prefix (the
+    // engine's prefix cache makes candidates 1.. an LCP no-op), each seeded
+    // from `seed + i` so candidate 0 reproduces the single-completion result
+    // and the set is deterministic by seed. When `best_of > n` the
+    // candidates are ranked by length-normalized cumulative logprob and the
+    // top `n` are returned; otherwise generation order is kept. Runs on the
+    // classic sampler (no spec/logprobs) — consistent with the non-streaming
+    // completions path, which already doesn't stop-truncate or spec on the
+    // logprobs arm.
+    if n_candidates > 1 {
+        let prompt_ids_m = prompt_ids.clone();
+        let sampling_m = sampling.clone();
+        let cpu_m = cpu.clone();
+        let gen = tokio::task::spawn_blocking(move || {
+            generate_ranked_candidates(&cpu_m, &prompt_ids_m, &sampling_m, n_candidates)
+        })
+        .await;
+        // (`&cpu_m` deref-coerces `&Arc<CpuEngine>` → `&CpuEngine`.)
+        let mut cands = match gen {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        // Total generated tokens across ALL candidates — OpenAI bills every
+        // best_of completion, not just the returned ones.
+        let total_completion_tokens: u32 = cands.iter().map(|c| c.completion_tokens).sum();
+        // best_of culling: rank by score (descending) and keep the top n.
+        if best_of > n_choices {
+            cands.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        cands.truncate(n_choices as usize);
+        let prompt_for_echo = if req.echo {
+            req.prompt.clone()
+        } else {
+            String::new()
+        };
+        let choices: Vec<CompletionChoice> = cands
+            .iter()
+            .enumerate()
+            .map(|(idx, c)| CompletionChoice {
+                text: format!("{}{}", prompt_for_echo, c.text),
+                index: idx as u32,
+                logprobs: None,
+                finish_reason: if c.completion_tokens >= sampling.max_tokens {
+                    "length"
+                } else {
+                    "stop"
+                },
+            })
+            .collect();
+        let stats = cpu.last_request_stats();
+        let fingerprint =
+            crate::system_fingerprint(&state.version, &model, kv_dtype_label(&cpu));
+        return Json(CompletionResponse {
+            id: request_id(),
+            object: "text_completion",
+            created: unix_ts(),
+            model,
+            choices,
+            usage: Some(
+                Usage::new(prompt_tokens, total_completion_tokens).with_stats(&stats),
+            ),
+            system_fingerprint: fingerprint,
+        })
+        .into_response();
+    }
+
     // Non-streaming: run generation, return JSON.
     let cpu_for_blocking = cpu.clone();
     let prompt_for_echo = if req.echo {
@@ -264,23 +370,23 @@ pub async fn completions(
     };
     let want_logprobs = req.logprobs;
 
-    // N-gram speculation for completions, routed at the ID level so
-    // this endpoint's own tokenization (no BOS; FIM specials for
-    // `suffix` requests) is preserved — re-encoding text through
-    // `Engine::generate` would change the prompt. Gated like chat
-    // (grammar-free only); logprobs requests take the classic arm
-    // above this one (the speculative path yields no logprobs).
-    // Draft-model speculation stays chat-only: its drafter consumes
-    // text and would re-encode the prompt differently.
-    let spec_ngram = if sampling.grammar.is_none() {
-        cpu.ngram_speculative()
-    } else {
-        None
-    };
-    // MTP / NextN self-speculation takes precedence over n-gram (same
-    // grammar-free gate). `mtp_speculative()` already verifies the loaded
-    // model carries a NextN head, so this is `false` on non-MTP models.
-    let spec_mtp = sampling.grammar.is_none() && cpu.mtp_speculative();
+    // Speculative decoding for completions, routed at the ID level so this
+    // endpoint's own tokenization (no BOS; FIM specials for `suffix`
+    // requests) is preserved — re-encoding text would change the prompt.
+    // P10a: draft-model spec now runs here too (via the ID-level
+    // `speculate_draft_stream_from_ids`), with the same precedence as
+    // `Engine::generate`: draft > MTP > n-gram. A grammar or a logprobs
+    // request disables spec (the verify runs on raw softmax, yields no
+    // per-token logprobs) — encoded in `pick_completion_spec_mode`.
+    let spec_ngram = cpu.ngram_speculative();
+    let spec_draft = cpu.draft_speculative();
+    let spec_mode = pick_completion_spec_mode(
+        sampling.grammar.is_some(),
+        want_logprobs.is_some(),
+        spec_draft.is_some(),
+        cpu.mtp_speculative(),
+        spec_ngram.is_some(),
+    );
 
     let (text, logprobs_out, completion_tokens) = if !doc_chunks.is_empty() {
         // CacheBlend arm (RAG `documents` present): reuse each chunk's isolated
@@ -373,83 +479,141 @@ pub async fn completions(
             text_offset,
         };
         (text_acc, Some(logprobs_payload), tok_count)
-    } else if spec_mtp {
-        // MTP / NextN self-speculative path — same draining shape as the
-        // n-gram arm, but drafts come from the model's NextN head. Takes
-        // precedence over n-gram when both are enabled.
-        let prompt_ids_i32: Vec<i32> = prompt_ids.iter().map(|&v| v as i32).collect();
-        let mut st = match cpu.speculate_mtp_stream_from_ids(prompt_ids_i32, sampling.clone(), None) {
-            Ok(st) => st,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        };
-        use futures::StreamExt;
-        let mut text = String::new();
-        while let Some(item) = st.next().await {
-            match item {
-                Ok(tok) => text.push_str(&tok.text),
-                Err(e) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-                }
-            }
-        }
-        let completion_tokens = cpu
-            .tokenizer()
-            .and_then(|t| t.encode(&text, false).ok())
-            .map(|ids| ids.len() as u32)
-            .unwrap_or(0);
-        (text, None, completion_tokens)
-    } else if let Some(ng) = spec_ngram {
-        // Speculative path: drain the ID-level TokenStream here in
-        // the async handler — its verify rounds run on
-        // `spawn_blocking` internally, so this does not block the
-        // runtime. Stop strings are honored inside the stream
-        // (engine-side), same as the classic `generate_*` methods.
-        let prompt_ids_i32: Vec<i32> = prompt_ids.iter().map(|&v| v as i32).collect();
-        let mut st = match cpu.speculate_ngram_stream_from_ids(prompt_ids_i32, ng, sampling.clone())
-        {
-            Ok(st) => st,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        };
-        use futures::StreamExt;
-        let mut text = String::new();
-        while let Some(item) = st.next().await {
-            match item {
-                Ok(tok) => text.push_str(&tok.text),
-                Err(e) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-                }
-            }
-        }
-        // Completion tokens: re-tokenize the generated text, matching
-        // the classic arm below.
-        let completion_tokens = cpu
-            .tokenizer()
-            .and_then(|t| t.encode(&text, false).ok())
-            .map(|ids| ids.len() as u32)
-            .unwrap_or(0);
-        (text, None, completion_tokens)
     } else {
-        // Clone the sampling config before moving it into the blocking
-        // closure — the outer fn still needs `sampling.max_tokens` for
-        // the finish_reason decision below.
-        let sampling_inner = sampling.clone();
-        let result =
-            tokio::task::spawn_blocking(move || cpu_for_blocking.generate_text_from_ids(&prompt_ids, &sampling_inner))
+        match spec_mode {
+            CompletionSpecMode::Draft => {
+                // P10a: draft-model speculative decoding at the ID level, so
+                // the endpoint's exact tokenization (no BOS; FIM specials) is
+                // what the target verifies. Takes precedence over MTP/n-gram.
+                let (draft, k) = spec_draft.expect("spec_mode==Draft implies spec_draft");
+                let prompt_ids_i32: Vec<i32> =
+                    prompt_ids.iter().map(|&v| v as i32).collect();
+                let mut st = match cpu
+                    .speculate_draft_stream_from_ids(prompt_ids_i32, draft, k, sampling.clone())
+                {
+                    Ok(st) => st,
+                    Err(e) => {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                            .into_response()
+                    }
+                };
+                use futures::StreamExt;
+                let mut text = String::new();
+                while let Some(item) = st.next().await {
+                    match item {
+                        Ok(tok) => text.push_str(&tok.text),
+                        Err(e) => {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                                .into_response()
+                        }
+                    }
+                }
+                let completion_tokens = cpu
+                    .tokenizer()
+                    .and_then(|t| t.encode(&text, false).ok())
+                    .map(|ids| ids.len() as u32)
+                    .unwrap_or(0);
+                (text, None, completion_tokens)
+            }
+            CompletionSpecMode::Mtp => {
+                // MTP / NextN self-speculative path — same draining shape as
+                // the n-gram arm, but drafts come from the model's NextN head.
+                let prompt_ids_i32: Vec<i32> =
+                    prompt_ids.iter().map(|&v| v as i32).collect();
+                let mut st = match cpu
+                    .speculate_mtp_stream_from_ids(prompt_ids_i32, sampling.clone(), None)
+                {
+                    Ok(st) => st,
+                    Err(e) => {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                            .into_response()
+                    }
+                };
+                use futures::StreamExt;
+                let mut text = String::new();
+                while let Some(item) = st.next().await {
+                    match item {
+                        Ok(tok) => text.push_str(&tok.text),
+                        Err(e) => {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                                .into_response()
+                        }
+                    }
+                }
+                let completion_tokens = cpu
+                    .tokenizer()
+                    .and_then(|t| t.encode(&text, false).ok())
+                    .map(|ids| ids.len() as u32)
+                    .unwrap_or(0);
+                (text, None, completion_tokens)
+            }
+            CompletionSpecMode::Ngram => {
+                // Speculative path: drain the ID-level TokenStream here in
+                // the async handler — its verify rounds run on
+                // `spawn_blocking` internally, so this does not block the
+                // runtime. Stop strings are honored inside the stream
+                // (engine-side), same as the classic `generate_*` methods.
+                let ng = spec_ngram.expect("spec_mode==Ngram implies spec_ngram");
+                let prompt_ids_i32: Vec<i32> =
+                    prompt_ids.iter().map(|&v| v as i32).collect();
+                let mut st = match cpu
+                    .speculate_ngram_stream_from_ids(prompt_ids_i32, ng, sampling.clone())
+                {
+                    Ok(st) => st,
+                    Err(e) => {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                            .into_response()
+                    }
+                };
+                use futures::StreamExt;
+                let mut text = String::new();
+                while let Some(item) = st.next().await {
+                    match item {
+                        Ok(tok) => text.push_str(&tok.text),
+                        Err(e) => {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                                .into_response()
+                        }
+                    }
+                }
+                let completion_tokens = cpu
+                    .tokenizer()
+                    .and_then(|t| t.encode(&text, false).ok())
+                    .map(|ids| ids.len() as u32)
+                    .unwrap_or(0);
+                (text, None, completion_tokens)
+            }
+            CompletionSpecMode::None => {
+                // Clone the sampling config before moving it into the blocking
+                // closure — the outer fn still needs `sampling.max_tokens` for
+                // the finish_reason decision below.
+                let sampling_inner = sampling.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    cpu_for_blocking.generate_text_from_ids(&prompt_ids, &sampling_inner)
+                })
                 .await;
-        let text = match result {
-            Ok(Ok(t)) => t,
-            Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        };
+                let text = match result {
+                    Ok(Ok(t)) => t,
+                    Ok(Err(e)) => {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                            .into_response()
+                    }
+                    Err(e) => {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                            .into_response()
+                    }
+                };
 
-        // Completion tokens: re-tokenize the generated text. Approximate but
-        // matches what OpenAI reports.
-        let completion_tokens = cpu
-            .tokenizer()
-            .and_then(|t| t.encode(&text, false).ok())
-            .map(|ids| ids.len() as u32)
-            .unwrap_or(0);
-        (text, None, completion_tokens)
+                // Completion tokens: re-tokenize the generated text.
+                // Approximate but matches what OpenAI reports.
+                let completion_tokens = cpu
+                    .tokenizer()
+                    .and_then(|t| t.encode(&text, false).ok())
+                    .map(|ids| ids.len() as u32)
+                    .unwrap_or(0);
+                (text, None, completion_tokens)
+            }
+        }
     };
 
     let full_text = format!("{}{}", prompt_for_echo, text);
@@ -582,6 +746,104 @@ fn build_sampling(req: &CompletionRequest) -> SamplingParams {
     s
 }
 
+/// Which speculative-decode driver the non-streaming `/v1/completions`
+/// handler routes a request through. P10a adds `Draft` (draft-model spec,
+/// previously chat-only) at the top of the precedence order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionSpecMode {
+    /// Classic single-token decode (`generate_text_from_ids`).
+    None,
+    /// Draft-model speculation (`speculate_draft_stream_from_ids`).
+    Draft,
+    /// MTP / NextN self-speculation.
+    Mtp,
+    /// N-gram (prompt-lookup) speculation.
+    Ngram,
+}
+
+/// Resolve the completions speculative-decode mode. A grammar-constrained OR
+/// a logprobs request disables spec entirely (the speculative verify runs on
+/// raw softmax and yields no per-token logprobs, so those take the classic
+/// arms). Otherwise precedence is draft > MTP > n-gram, matching
+/// `Engine::generate` on the chat path. Pure so the routing policy is unit
+/// testable without a live engine.
+pub(crate) fn pick_completion_spec_mode(
+    grammar: bool,
+    want_logprobs: bool,
+    has_draft: bool,
+    has_mtp: bool,
+    has_ngram: bool,
+) -> CompletionSpecMode {
+    if grammar || want_logprobs {
+        return CompletionSpecMode::None;
+    }
+    if has_draft {
+        CompletionSpecMode::Draft
+    } else if has_mtp {
+        CompletionSpecMode::Mtp
+    } else if has_ngram {
+        CompletionSpecMode::Ngram
+    } else {
+        CompletionSpecMode::None
+    }
+}
+
+/// One generated completion in the P12a `n` / `best_of` path, with the
+/// length-normalized cumulative chosen-token logprob used for `best_of`
+/// ranking.
+struct RankedCandidate {
+    text: String,
+    /// Mean chosen-token logprob (cumulative logprob / tokens). Higher is
+    /// "better" per OpenAI `best_of`. `NEG_INFINITY` for an empty completion
+    /// so it never wins a ranking.
+    score: f32,
+    completion_tokens: u32,
+}
+
+/// Generate `g` independent completions sharing the prompt prefix. Candidate
+/// `i` samples from `seed + i`, so candidate 0 reproduces the single
+/// completion byte-for-byte and the whole set is deterministic by seed. The
+/// engine's prefix cache makes candidates `1..` an LCP no-op on the prompt.
+/// Runs on the classic logprobs sampler (no spec) so every candidate carries
+/// its cumulative chosen-token logprob for `best_of` ranking.
+fn generate_ranked_candidates(
+    cpu: &rustllama_engine::CpuEngine,
+    prompt_ids: &[u32],
+    sampling: &SamplingParams,
+    g: u32,
+) -> Result<Vec<RankedCandidate>, String> {
+    let tokenizer = cpu
+        .tokenizer()
+        .ok_or_else(|| "n/best_of path requires a tokenizer".to_string())?;
+    let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&v| v as i32).collect();
+    let base_seed = sampling.seed;
+    let mut out = Vec::with_capacity(g as usize);
+    for i in 0..g {
+        let mut s_i = sampling.clone();
+        s_i.seed = base_seed.wrapping_add(i as u64);
+        let pairs = cpu
+            .generate_token_ids_with_logprobs(&prompt_i32, s_i.max_tokens, &s_i, 0)
+            .map_err(|e| e.to_string())?;
+        let ids: Vec<u32> = pairs.iter().map(|(id, _)| *id).collect();
+        let text = tokenizer.decode(&ids, true).map_err(|e| e.to_string())?;
+        let cum: f32 = pairs.iter().map(|(_, lp)| lp.logprob).sum();
+        let n_tok = pairs.len() as u32;
+        // Length-normalized (per-token mean) logprob — OpenAI's best_of
+        // criterion. Empty completions score -inf so they never win.
+        let score = if n_tok > 0 {
+            cum / n_tok as f32
+        } else {
+            f32::NEG_INFINITY
+        };
+        out.push(RankedCandidate {
+            text,
+            score,
+            completion_tokens: n_tok,
+        });
+    }
+    Ok(out)
+}
+
 fn unix_ts() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -657,7 +919,34 @@ async fn completions_stream(
     // MTP / NextN self-speculation, precedence over n-gram; same gate.
     // `mtp_speculative()` is `false` on models without a NextN head.
     let spec_mtp = sampling.grammar.is_none() && logprobs_k.is_none() && cpu.mtp_speculative();
-    if spec_mtp {
+    // P10a: draft-model spec, highest precedence (same gate: grammar-free,
+    // no logprobs). ID-level so the endpoint's tokenization is preserved.
+    let spec_draft = if sampling.grammar.is_none() && logprobs_k.is_none() {
+        cpu.draft_speculative()
+    } else {
+        None
+    };
+    if let Some((draft, k)) = spec_draft {
+        // Draft-model self-speculative stream — same forwarding shape as the
+        // MTP / n-gram arms; drafts come from the paired draft model.
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&v| v as i32).collect();
+            match cpu_inner.speculate_draft_stream_from_ids(prompt_i32, draft, k, sampling_inner) {
+                Ok(mut st) => {
+                    while let Some(item) = st.next().await {
+                        let mapped = item.map_err(|e| e.to_string());
+                        if tx.send(mapped).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e.to_string())).await;
+                }
+            }
+        });
+    } else if spec_mtp {
         // MTP self-speculative stream — same forwarding shape as the
         // n-gram arm below; drafts come from the model's NextN head.
         tokio::spawn(async move {
@@ -863,7 +1152,10 @@ async fn completions_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_prompt_ids, build_sampling, CompletionRequest};
+    use super::{
+        build_prompt_ids, build_sampling, pick_completion_spec_mode, CompletionRequest,
+        CompletionSpecMode,
+    };
     use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
     use rustllama_gguf::Gguf;
     use rustllama_tokenizer::Tokenizer;
@@ -1007,6 +1299,79 @@ mod tests {
         assert_eq!(got[off + 1 + suffix_ids.len()], fim.middle);
         assert_eq!(got.len(), prefix_ids.len() + suffix_ids.len() + 3);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- P12a: n / best_of parsing --------------------------------------
+
+    #[test]
+    fn n_and_best_of_parse_from_request() {
+        let value = serde_json::json!({
+            "prompt": "hi",
+            "max_tokens": 4,
+            "n": 3,
+            "best_of": 5,
+        });
+        let req: CompletionRequest =
+            serde_json::from_value(value).expect("CompletionRequest parses");
+        assert_eq!(req.n, Some(3));
+        assert_eq!(req.best_of, Some(5));
+    }
+
+    #[test]
+    fn n_and_best_of_absent_are_none() {
+        let value = serde_json::json!({ "prompt": "hi", "max_tokens": 4 });
+        let req: CompletionRequest =
+            serde_json::from_value(value).expect("CompletionRequest parses");
+        assert_eq!(req.n, None, "absent n must be None (handler defaults to 1)");
+        assert_eq!(req.best_of, None, "absent best_of must be None (defaults to n)");
+    }
+
+    // ----- P10a: completions speculative-mode routing ---------------------
+
+    #[test]
+    fn spec_mode_draft_takes_precedence() {
+        // With a draft model present (and no grammar/logprobs), the draft
+        // arm engages even when MTP / n-gram are also available.
+        assert_eq!(
+            pick_completion_spec_mode(false, false, true, true, true),
+            CompletionSpecMode::Draft
+        );
+    }
+
+    #[test]
+    fn spec_mode_grammar_disables_spec() {
+        // A grammar request must fall back to the classic sampler even with
+        // a draft model attached (the verify can't honor a grammar mask).
+        assert_eq!(
+            pick_completion_spec_mode(true, false, true, true, true),
+            CompletionSpecMode::None
+        );
+    }
+
+    #[test]
+    fn spec_mode_logprobs_disables_spec() {
+        // A logprobs request takes the classic logprobs arm (spec yields no
+        // per-token logprobs).
+        assert_eq!(
+            pick_completion_spec_mode(false, true, true, false, false),
+            CompletionSpecMode::None
+        );
+    }
+
+    #[test]
+    fn spec_mode_mtp_then_ngram_then_none() {
+        assert_eq!(
+            pick_completion_spec_mode(false, false, false, true, true),
+            CompletionSpecMode::Mtp
+        );
+        assert_eq!(
+            pick_completion_spec_mode(false, false, false, false, true),
+            CompletionSpecMode::Ngram
+        );
+        assert_eq!(
+            pick_completion_spec_mode(false, false, false, false, false),
+            CompletionSpecMode::None
+        );
     }
 
     #[test]

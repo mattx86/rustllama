@@ -209,6 +209,130 @@ pub fn accept_reject_greedy(
     }
 }
 
+/// Shannon entropy (in nats) of an already-normalized probability row.
+/// `0·ln0` is treated as 0. Used by [`accept_reject_typical`] to set the
+/// per-position acceptance bar.
+fn entropy_nats(probs: &[f32]) -> f32 {
+    let mut h = 0.0f32;
+    for &p in probs {
+        if p > 0.0 {
+            h -= p * p.ln();
+        }
+    }
+    h
+}
+
+/// P10a — EAGLE / Medusa **typical acceptance** (Cai et al. 2024), an
+/// opt-in alternative to the Chen et al. rejection test in [`accept_reject`].
+///
+/// A drafted token is accepted when the TARGET assigns it at least a
+/// per-position *typical* probability:
+///
+/// ```text
+/// threshold_i = min(epsilon, delta * exp(-H(target_i)))        // H in nats
+/// accept draft_i  iff  target_i[draft_i.id] >= threshold_i
+/// ```
+///
+/// When the target is peaked (low entropy — e.g. low temperature) the
+/// entropy term `exp(-H)` → 1 so the threshold saturates at `epsilon`, and
+/// any draft the target still rates ≥ `epsilon` is accepted. When the
+/// target is flat (high entropy) the threshold drops below `epsilon`, so
+/// even low-probability-but-"typical" drafts pass. Either way this accepts
+/// MORE drafts than rejection sampling, which is the throughput win —
+/// paid for with a small distributional bias (typical acceptance does NOT
+/// preserve the target distribution the way Chen et al. does), hence it is
+/// gated behind [`crate::SamplingParams::spec_typical_accept`].
+///
+/// DETERMINISM: the accept/stop decision depends only on the target
+/// probabilities (no RNG). The sole RNG draw is the replacement/bonus
+/// `multinomial` over the target distribution, so the function is
+/// seed-deterministic exactly like [`accept_reject`]. On the first
+/// rejection the replacement is drawn from the FULL target distribution at
+/// that position (the draft is discarded rather than residual-corrected);
+/// on full acceptance the bonus is drawn from `target_probs[K]`.
+///
+/// Panics if `target_probs.len() != drafts.len() + 1` (the bonus slot is
+/// mandatory), matching [`accept_reject`].
+pub fn accept_reject_typical(
+    drafts: &[DraftToken],
+    target_probs: &[&[f32]],
+    epsilon: f32,
+    delta: f32,
+    rng: &mut Rng,
+) -> SpeculationOutcome {
+    assert_eq!(
+        target_probs.len(),
+        drafts.len() + 1,
+        "speculative: target_probs must have one extra position for the bonus token"
+    );
+    let mut accepted: Vec<u32> = Vec::with_capacity(drafts.len());
+    for (i, draft) in drafts.iter().enumerate() {
+        let id = draft.id as usize;
+        let p = if id < target_probs[i].len() {
+            target_probs[i][id]
+        } else {
+            0.0
+        };
+        // min(epsilon, delta·exp(-H)) — the Medusa typical-acceptance bar.
+        let threshold = epsilon.min(delta * (-entropy_nats(target_probs[i])).exp());
+        if p >= threshold {
+            accepted.push(draft.id);
+        } else {
+            // Reject: discard the draft and sample the replacement straight
+            // from the target distribution at this position (no residual).
+            let chosen = multinomial(target_probs[i], rng);
+            return SpeculationOutcome {
+                accepted,
+                replacement: chosen,
+            };
+        }
+    }
+    // All K drafts accepted — sample the bonus from the next target position.
+    let bonus = multinomial(target_probs[drafts.len()], rng);
+    SpeculationOutcome {
+        accepted,
+        replacement: bonus,
+    }
+}
+
+/// Which acceptance rule a speculative verify round uses. Resolved once per
+/// round from the request's sampling knobs: greedy (temperature ≤ 0),
+/// otherwise the opt-in [`Typical`](AcceptMode::Typical) mode when
+/// `spec_typical_accept` is set, otherwise the default
+/// [`Rejection`](AcceptMode::Rejection) sampling.
+#[derive(Debug, Clone, Copy)]
+pub enum AcceptMode {
+    /// Exact temperature→0 limit — accept iff the draft is the target argmax
+    /// ([`accept_reject_greedy`]). Fully deterministic.
+    Greedy,
+    /// Chen et al. rejection sampling ([`accept_reject`]) — the default;
+    /// preserves the target distribution.
+    Rejection,
+    /// EAGLE / Medusa typical acceptance ([`accept_reject_typical`]) —
+    /// opt-in, accepts more aggressively.
+    Typical { epsilon: f32, delta: f32 },
+}
+
+/// Single entry point the engine's speculative verify loops call so the
+/// three acceptance rules share one dispatch. [`AcceptMode::Rejection`] is
+/// byte-identical (same RNG draw sequence) to calling [`accept_reject`]
+/// directly, so leaving typical acceptance off preserves the pre-P10a
+/// behavior exactly.
+pub fn accept_reject_dispatch(
+    drafts: &[DraftToken],
+    target_probs: &[&[f32]],
+    mode: AcceptMode,
+    rng: &mut Rng,
+) -> SpeculationOutcome {
+    match mode {
+        AcceptMode::Greedy => accept_reject_greedy(drafts, target_probs),
+        AcceptMode::Rejection => accept_reject(drafts, target_probs, rng),
+        AcceptMode::Typical { epsilon, delta } => {
+            accept_reject_typical(drafts, target_probs, epsilon, delta, rng)
+        }
+    }
+}
+
 /// One node of a drafted token TREE (EAGLE / Medusa / SpecInfer style).
 ///
 /// A tree generalizes the linear draft chain: instead of one proposed
@@ -508,6 +632,132 @@ mod tests {
         let out = accept_reject(&drafts, &target, &mut rng);
         assert_eq!(out.accepted, vec![1, 2, 3]);
         assert_eq!(out.replacement, 4);
+    }
+
+    // ----- P10a: typical acceptance + dispatch --------------------------
+
+    /// THE off-identical anchor: [`accept_reject_dispatch`] in
+    /// [`AcceptMode::Rejection`] must be byte-for-byte identical to calling
+    /// [`accept_reject`] directly (same RNG draw sequence), across seeds —
+    /// so leaving typical acceptance OFF preserves the pre-P10a behavior.
+    #[test]
+    fn dispatch_rejection_is_byte_identical_to_accept_reject() {
+        let drafts = vec![
+            DraftToken { id: 1, q: 0.5 },
+            DraftToken { id: 2, q: 0.5 },
+        ];
+        let p0 = vec![0.05, 0.9, 0.05, 0.0, 0.0];
+        let p1 = vec![0.5, 0.0, 0.0, 0.5, 0.0];
+        let p2 = vec![0.25, 0.25, 0.25, 0.25, 0.0];
+        let target = [p0.as_slice(), p1.as_slice(), p2.as_slice()];
+        for seed in [0u64, 1, 7, 42, 0xC0FFEE, u64::MAX] {
+            let mut ra = mk_rng(seed);
+            let mut rb = mk_rng(seed);
+            let direct = accept_reject(&drafts, &target, &mut ra);
+            let dispatched =
+                accept_reject_dispatch(&drafts, &target, AcceptMode::Rejection, &mut rb);
+            assert_eq!(
+                direct, dispatched,
+                "Rejection dispatch diverged from accept_reject at seed {seed}"
+            );
+        }
+    }
+
+    /// Greedy dispatch == [`accept_reject_greedy`] (no RNG consumed).
+    #[test]
+    fn dispatch_greedy_is_identical_to_accept_reject_greedy() {
+        let drafts = vec![DraftToken { id: 0, q: 0.1 }];
+        let p0 = [0.51f32, 0.49, 0.0, 0.0];
+        let p1 = [0.0f32, 0.0, 1.0, 0.0];
+        let target = [&p0[..], &p1[..]];
+        let direct = accept_reject_greedy(&drafts, &target);
+        let mut rng = mk_rng(123);
+        let dispatched = accept_reject_dispatch(&drafts, &target, AcceptMode::Greedy, &mut rng);
+        assert_eq!(direct, dispatched);
+    }
+
+    /// Typical acceptance: when the target strongly agrees with every draft,
+    /// all are accepted and the bonus is drawn from the extra slot.
+    #[test]
+    fn typical_accepts_when_target_agrees() {
+        let drafts = vec![
+            DraftToken { id: 1, q: 0.1 },
+            DraftToken { id: 2, q: 0.1 },
+            DraftToken { id: 3, q: 0.1 },
+        ];
+        let p0 = vec![0.0, 1.0, 0.0, 0.0, 0.0];
+        let p1 = vec![0.0, 0.0, 1.0, 0.0, 0.0];
+        let p2 = vec![0.0, 0.0, 0.0, 1.0, 0.0];
+        let p_bonus = vec![0.0, 0.0, 0.0, 0.0, 1.0];
+        let target = [p0.as_slice(), p1.as_slice(), p2.as_slice(), p_bonus.as_slice()];
+        let mut rng = mk_rng(0xC0FFEE);
+        let out = accept_reject_typical(&drafts, &target, 0.09, 0.3, &mut rng);
+        assert_eq!(out.accepted, vec![1, 2, 3]);
+        assert_eq!(out.replacement, 4);
+    }
+
+    /// Typical acceptance walks the accepted prefix then stops at the first
+    /// draft the target rates below the per-position bar. Hand-checked:
+    /// `p0[token1]=0.9 ≥ 0.09` accepts; `p1[token2]=0.01 < 0.09` rejects.
+    #[test]
+    fn typical_partial_accept_then_reject() {
+        let drafts = vec![
+            DraftToken { id: 1, q: 0.5 },
+            DraftToken { id: 2, q: 0.5 },
+            DraftToken { id: 3, q: 0.5 },
+        ];
+        let p0 = vec![0.05, 0.9, 0.05, 0.0, 0.0]; // token1 → accept
+        let p1 = vec![0.6, 0.39, 0.01, 0.0, 0.0]; // token2 (p=0.01) → reject
+        let p2 = vec![0.25, 0.25, 0.25, 0.25, 0.0];
+        let p_bonus = vec![1.0, 0.0, 0.0, 0.0, 0.0];
+        let target = [p0.as_slice(), p1.as_slice(), p2.as_slice(), p_bonus.as_slice()];
+        let mut rng = mk_rng(7);
+        let out = accept_reject_typical(&drafts, &target, 0.09, 0.3, &mut rng);
+        assert_eq!(out.accepted, vec![1], "only draft[0] clears the typical bar");
+        // Replacement is sampled from p1 (support {0, 1, 2}).
+        assert!(matches!(out.replacement, 0 | 1 | 2));
+    }
+
+    /// Same seed ⇒ identical typical-acceptance outcome.
+    #[test]
+    fn typical_is_seed_deterministic() {
+        let drafts = vec![DraftToken { id: 1, q: 0.5 }];
+        let p0 = vec![0.6, 0.39, 0.01, 0.0]; // token1 p=0.39 ≥ 0.09 → accept
+        let p_bonus = vec![0.3, 0.3, 0.2, 0.2];
+        let target = [p0.as_slice(), p_bonus.as_slice()];
+        let mut r1 = mk_rng(2024);
+        let mut r2 = mk_rng(2024);
+        let a = accept_reject_typical(&drafts, &target, 0.09, 0.3, &mut r1);
+        let b = accept_reject_typical(&drafts, &target, 0.09, 0.3, &mut r2);
+        assert_eq!(a, b, "same seed must yield identical typical outcome");
+    }
+
+    /// The entropy term lowers the bar below `epsilon` on a flat
+    /// (high-entropy) target: a draft rated 0.05 by the target is accepted,
+    /// though 0.05 < epsilon (0.09) — it clears `delta·exp(-H) ≈ 0.03`.
+    #[test]
+    fn typical_entropy_lowers_bar_on_flat_targets() {
+        let mut row = vec![0.05f32];
+        row.resize(10, 0.95f32 / 9.0);
+        let bonus = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let drafts = vec![DraftToken { id: 0, q: 0.5 }];
+        let target = [row.as_slice(), bonus.as_slice()];
+        let mut rng = mk_rng(1);
+        let out = accept_reject_typical(&drafts, &target, 0.09, 0.3, &mut rng);
+        assert_eq!(out.accepted, vec![0], "flat target lowers the bar below epsilon");
+    }
+
+    /// On a peaked (low-entropy) target the bar saturates at `epsilon`, so a
+    /// draft rated 0.02 is rejected.
+    #[test]
+    fn typical_peaked_bar_saturates_at_epsilon() {
+        let p0 = vec![0.96f32, 0.02, 0.01, 0.01];
+        let p_bonus = vec![1.0f32, 0.0, 0.0, 0.0];
+        let drafts = vec![DraftToken { id: 1, q: 0.5 }];
+        let target = [p0.as_slice(), p_bonus.as_slice()];
+        let mut rng = mk_rng(1);
+        let out = accept_reject_typical(&drafts, &target, 0.09, 0.3, &mut rng);
+        assert!(out.accepted.is_empty(), "0.02 < epsilon on a peaked target → reject");
     }
 
     #[test]

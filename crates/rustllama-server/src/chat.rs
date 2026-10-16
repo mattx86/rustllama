@@ -106,6 +106,16 @@ pub struct ChatRequest {
     /// Number of top alternative logprobs to include alongside each
     /// chosen token (0..=20). Implies `logprobs: true`.
     pub top_logprobs: Option<u32>,
+    /// P12a — OpenAI `n`: how many chat-completion choices to generate.
+    /// `None` / `1` (default) is the single-choice path, byte-identical to
+    /// before this field existed. `> 1` returns `n` `choices`, each a
+    /// distinct seeded sample sharing the prompt prefix. Not supported with
+    /// `stream: true` or with tools/functions.
+    pub n: Option<u32>,
+    /// P12a — `best_of` is only meaningful on `/v1/completions` (OpenAI does
+    /// not define it for chat). Accepted here for request-struct parity; the
+    /// handler rejects `best_of > n` with a pointed 400.
+    pub best_of: Option<u32>,
     /// OpenAI streaming knob. With `include_usage: true` we emit a final
     /// chunk containing the `usage` block before `[DONE]`.
     pub stream_options: Option<StreamOptions>,
@@ -521,6 +531,40 @@ pub async fn chat_completions(
     // response_format: prepend instructions to the messages before any
     // template rendering. This works for plain chat, streaming, and tools.
     req.messages = apply_response_format(req.messages, &req.response_format);
+
+    // P12a — validate n / best_of up front. `n > 1` returns multiple choices
+    // on the plain non-streaming path; `best_of` is a completions-only knob
+    // (OpenAI has no chat `best_of`), so a `best_of > n` on chat is a clean
+    // 400 rather than a silently-ignored field. Streaming and the tools path
+    // keep n == 1 (we don't multiplex choices over SSE or fan out tool-call
+    // parsing); n > 1 there is an explicit 400.
+    let n_choices = req.n.unwrap_or(1).max(1);
+    if let Some(best_of) = req.best_of {
+        if best_of > n_choices {
+            return (
+                StatusCode::BAD_REQUEST,
+                "best_of > n is only supported on /v1/completions",
+            )
+                .into_response();
+        }
+    }
+    if n_choices > 1 {
+        if req.stream {
+            return (
+                StatusCode::BAD_REQUEST,
+                "n > 1 is not supported with stream=true",
+            )
+                .into_response();
+        }
+        let has_tools = req.tools.is_some() || req.functions.is_some();
+        if has_tools || req.allow_clarify == Some(true) {
+            return (
+                StatusCode::BAD_REQUEST,
+                "n > 1 is not supported with tools/functions",
+            )
+                .into_response();
+        }
+    }
 
     // Tools / functions request: needs explicit prompt building (via the
     // tokenizer chat template with `tools` exposed) and incremental parsing
@@ -2503,52 +2547,91 @@ async fn chat_blocking(state: AppState, req: ChatRequest) -> Response {
     // `last_request_stats()` read further down — both touch
     // per-request state.
     let cpu = handle.cpu_engine.clone();
-    let mut stream = match handle.engine.chat(&msgs, &sampling) {
-        Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
 
-    let mut content = String::new();
-    let mut logprob_tokens: Vec<TokenLogprobOut> = Vec::new();
-    let mut completion_tokens = 0u32;
-    while let Some(tok) = stream.next().await {
-        match tok {
-            Ok(t) => {
-                if want_logprobs {
-                    if let Some(lp) = t.logprobs.as_ref() {
-                        logprob_tokens.push(make_token_logprob_out(&t.text, lp, cpu.as_deref()));
-                    }
-                }
-                content.push_str(&t.text);
-                completion_tokens += 1;
-            }
+    // P12a: generate `n_choices` independent choices sharing the prompt
+    // prefix. Choice i samples from `seed + i`, so choice 0 reproduces the
+    // single-choice result byte-for-byte (n == 1 is unchanged) and the whole
+    // set is deterministic by seed. The engine's prefix cache makes choices
+    // 1.. an LCP no-op on the prompt. Each choice carries its own
+    // finish_reason / logprobs / diffs.
+    let n_choices = req.n.unwrap_or(1).max(1);
+    let base_seed = sampling.seed;
+    let mut choices: Vec<ChatChoice> = Vec::with_capacity(n_choices as usize);
+    let mut total_completion_tokens = 0u32;
+    for idx in 0..n_choices {
+        let mut sampling_i = sampling.clone();
+        sampling_i.seed = base_seed.wrapping_add(idx as u64);
+        let mut stream = match handle.engine.chat(&msgs, &sampling_i) {
+            Ok(s) => s,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+
+        let mut content = String::new();
+        let mut logprob_tokens: Vec<TokenLogprobOut> = Vec::new();
+        let mut completion_tokens = 0u32;
+        while let Some(tok) = stream.next().await {
+            match tok {
+                Ok(t) => {
+                    if want_logprobs {
+                        if let Some(lp) = t.logprobs.as_ref() {
+                            logprob_tokens
+                                .push(make_token_logprob_out(&t.text, lp, cpu.as_deref()));
+                        }
+                    }
+                    content.push_str(&t.text);
+                    completion_tokens += 1;
+                }
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
+            }
         }
+        total_completion_tokens += completion_tokens;
+
+        let logprobs_out = if want_logprobs {
+            Some(ChoiceLogprobs {
+                content: logprob_tokens,
+            })
+        } else {
+            None
+        };
+
+        // Diff mode: when the caller set response_format.type = "diff", parse
+        // SEARCH/REPLACE hunks out of the raw text and surface them in
+        // `message.diffs`. The raw content stays in `message.content` so
+        // clients can keep their own diff parser if they want.
+        let diffs = if matches!(
+            req.response_format.as_ref().map(|r| r.kind.as_str()),
+            Some("diff")
+        ) {
+            parse_diff_blocks(&content)
+        } else {
+            None
+        };
+
+        choices.push(ChatChoice {
+            index: idx,
+            message: ChatMessageOut {
+                role: "assistant",
+                content: Some(content),
+                tool_calls: None,
+                diffs,
+            },
+            // OpenAI spec: `"length"` when truncated by `max_tokens`,
+            // `"stop"` for a natural end-of-stream.
+            finish_reason: if completion_tokens >= sampling.max_tokens {
+                "length"
+            } else {
+                "stop"
+            },
+            logprobs: logprobs_out,
+        });
     }
 
-    let logprobs_out = if want_logprobs {
-        Some(ChoiceLogprobs {
-            content: logprob_tokens,
-        })
-    } else {
-        None
-    };
-
-    // Diff mode: when the caller set response_format.type = "diff", parse
-    // SEARCH/REPLACE hunks out of the raw text and surface them in
-    // `message.diffs`. The raw content stays in `message.content` so
-    // clients can keep their own diff parser if they want.
-    let diffs = if matches!(
-        req.response_format.as_ref().map(|r| r.kind.as_str()),
-        Some("diff")
-    ) {
-        parse_diff_blocks(&content)
-    } else {
-        None
-    };
-
-    // Capture per-request stats while the gate permit is still held.
-    let usage_base = Usage::new(prompt_tokens, completion_tokens);
+    // Capture per-request stats while the gate permit is still held. With
+    // n > 1 the engine timing stats reflect the last choice; billed
+    // completion tokens are the sum across all choices (OpenAI semantics).
+    let usage_base = Usage::new(prompt_tokens, total_completion_tokens);
     let usage = match cpu.as_deref() {
         Some(cpu) => usage_base.with_stats(&cpu.last_request_stats()),
         None => usage_base,
@@ -2561,26 +2644,7 @@ async fn chat_blocking(state: AppState, req: ChatRequest) -> Response {
         object: "chat.completion",
         created: unix_ts(),
         model,
-        choices: vec![ChatChoice {
-            index: 0,
-            message: ChatMessageOut {
-                role: "assistant",
-                content: Some(content),
-                tool_calls: None,
-                diffs,
-            },
-            // OpenAI spec: `"length"` when truncated by `max_tokens`,
-            // `"stop"` for a natural end-of-stream. Until this commit
-            // we always reported `"stop"` — clients that act on the
-            // distinction (e.g. retrying with a larger budget) were
-            // mis-served. Pin the spec-correct mapping.
-            finish_reason: if completion_tokens >= sampling.max_tokens {
-                "length"
-            } else {
-                "stop"
-            },
-            logprobs: logprobs_out,
-        }],
+        choices,
         usage: Some(usage),
         system_fingerprint: fingerprint,
     })
@@ -3094,6 +3158,30 @@ mod tests {
             }
             other => panic!("expected GrammarKind::Code, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn n_and_best_of_parse_from_chat_request() {
+        // P12a: `n` + `best_of` parse off the chat request struct. `best_of`
+        // is accepted for parity (handler rejects best_of > n on chat).
+        let value = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 4,
+            "n": 3,
+            "best_of": 3,
+        });
+        let req: ChatRequest = serde_json::from_value(value).expect("ChatRequest parses");
+        assert_eq!(req.n, Some(3));
+        assert_eq!(req.best_of, Some(3));
+
+        // Absent → None (handler defaults n to 1 → the untouched path).
+        let value = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 4,
+        });
+        let req: ChatRequest = serde_json::from_value(value).expect("ChatRequest parses");
+        assert_eq!(req.n, None);
+        assert_eq!(req.best_of, None);
     }
 
     #[test]

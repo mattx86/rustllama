@@ -223,6 +223,29 @@ pub struct SamplingParams {
     /// Typical 1.0 (linear).
     #[serde(default = "default_dynatemp_exponent")]
     pub dynatemp_exponent: f32,
+    /// P10a — speculative TYPICAL acceptance (EAGLE / Medusa, Cai et al.
+    /// 2024). `false` (default) keeps the standard Chen et al. rejection
+    /// sampling in the draft-model / n-gram speculative verify, so behavior
+    /// is byte-identical to the pre-P10a path. When `true`, a drafted token
+    /// is accepted whenever the TARGET assigns it at least a per-position
+    /// *typical* probability (see [`speculative::accept_reject_typical`]) —
+    /// which accepts more aggressively (higher throughput) at the cost of a
+    /// small distributional bias, so it is opt-in. Only consulted on the
+    /// stochastic speculative path (temperature > 0); greedy decode is
+    /// already the argmax limit and ignores this flag. Seed-deterministic
+    /// either way.
+    #[serde(default)]
+    pub spec_typical_accept: bool,
+    /// Typical-acceptance `epsilon`: the hard upper bound on the per-position
+    /// acceptance threshold `min(epsilon, delta·exp(-H))`. Ignored when
+    /// `spec_typical_accept == false`. Medusa's default is 0.09.
+    #[serde(default = "default_spec_typical_epsilon")]
+    pub spec_typical_epsilon: f32,
+    /// Typical-acceptance `delta`: scales the entropy-driven term of the
+    /// threshold. Ignored when `spec_typical_accept == false`. Medusa's
+    /// default is 0.3.
+    #[serde(default = "default_spec_typical_delta")]
+    pub spec_typical_delta: f32,
 }
 
 fn default_mirostat_tau() -> f32 {
@@ -251,6 +274,14 @@ fn default_xtc_threshold() -> f32 {
 
 fn default_dynatemp_exponent() -> f32 {
     1.0
+}
+
+fn default_spec_typical_epsilon() -> f32 {
+    0.09
+}
+
+fn default_spec_typical_delta() -> f32 {
+    0.3
 }
 
 /// P14: per-request scheduling options for the continuous-batching
@@ -353,6 +384,9 @@ impl Default for SamplingParams {
             xtc_threshold: default_xtc_threshold(),
             dynatemp_range: 0.0,
             dynatemp_exponent: default_dynatemp_exponent(),
+            spec_typical_accept: false,
+            spec_typical_epsilon: default_spec_typical_epsilon(),
+            spec_typical_delta: default_spec_typical_delta(),
         }
     }
 }

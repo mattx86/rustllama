@@ -20,7 +20,8 @@ use crate::kv_backend::KvBackend;
 use crate::prefix_cache::PrefixCachePool;
 use crate::sampling::{compute_logprobs, Rng, Sampler};
 use crate::speculative::{
-    accept_reject, accept_reject_greedy, DraftToken, MtpDrafter, NgramDrafter, NgramDrafterConfig,
+    accept_reject, accept_reject_dispatch, accept_reject_greedy, AcceptMode, DraftToken,
+    MtpDrafter, NgramDrafter, NgramDrafterConfig,
 };
 use crate::{
     ChatMessage, Engine, GrammarKind, Metrics, RequestStats, Result as EngineResult,
@@ -3694,6 +3695,17 @@ impl CpuEngine {
         self.draft_spec = draft;
     }
 
+    /// The paired draft engine + per-round candidate count, if draft-model
+    /// speculation is active on this engine (set via
+    /// [`Self::set_draft_speculative`], inherited by forks). The server
+    /// routes `/v1/completions` through the ID-level
+    /// [`Self::speculate_draft_stream_from_ids`] when this is `Some` and the
+    /// request is grammar-free — mirroring how the chat path's
+    /// `Engine::generate` consults `draft_spec`.
+    pub fn draft_speculative(&self) -> Option<(std::sync::Arc<dyn Engine>, u32)> {
+        self.draft_spec.clone()
+    }
+
     /// Cheap tokenizer/vocab compatibility check between this engine
     /// (the target) and a prospective draft engine. Speculative
     /// accept/reject compares token IDS, so the two models must share
@@ -5943,6 +5955,7 @@ fn verify_and_commit_speculation(
     prompt_ids: &[i32],
     drafts: &[DraftToken],
     greedy: bool,
+    typical: Option<(f32, f32)>,
     rng: &mut Rng,
     repeat_penalty: f32,
     frequency_penalty: f32,
@@ -6014,11 +6027,18 @@ fn verify_and_commit_speculation(
         dists
     };
     let refs: Vec<&[f32]> = dists.iter().map(|d| d.as_slice()).collect();
-    let outcome = if greedy {
-        accept_reject_greedy(drafts, &refs)
+    // P10a: greedy stays the exact argmax limit; otherwise the opt-in
+    // typical-acceptance mode (when the request set it) else the default
+    // Chen et al. rejection sampling — `typical == None` is byte-identical
+    // to the pre-P10a `accept_reject` call.
+    let mode = if greedy {
+        AcceptMode::Greedy
+    } else if let Some((epsilon, delta)) = typical {
+        AcceptMode::Typical { epsilon, delta }
     } else {
-        accept_reject(drafts, &refs, rng)
+        AcceptMode::Rejection
     };
+    let outcome = accept_reject_dispatch(drafts, &refs, mode, rng);
     let a = outcome.accepted.len();
     if a == k {
         // Full acceptance (always the case for K=0 rounds): state is
@@ -7018,7 +7038,6 @@ impl Engine for CpuEngine {
             // single-engine path.
             return self.generate(prompt, s);
         }
-
         let tokenizer = self
             .tokenizer
             .clone()
@@ -7029,13 +7048,61 @@ impl Engine for CpuEngine {
             .into_iter()
             .map(|t| t as i32)
             .collect();
+        // Hand off to the shared multi-round driver. The ID-level
+        // `/v1/completions` entry (`speculate_draft_stream_from_ids`) shares it.
+        self.speculate_from_parts(initial_prompt_ids, prompt.to_string(), draft, k, s.clone())
+    }
+}
+
+impl CpuEngine {
+    /// ID-level entry for DRAFT-MODEL speculative decoding — the P10a
+    /// `/v1/completions` route. The endpoint tokenizes its own prompt (no
+    /// BOS; FIM specials for `suffix`), so re-encoding text through
+    /// [`Engine::speculate`] would change the prompt. The target verify is
+    /// already ID-based; only the draft is driven from text, seeded by
+    /// decoding `initial_prompt_ids` (a mismatched draft tokenization only
+    /// lowers acceptance, never correctness — the target's ids are
+    /// authoritative). Mirrors `speculate_ngram_stream_from_ids`.
+    pub fn speculate_draft_stream_from_ids(
+        &self,
+        initial_prompt_ids: Vec<i32>,
+        draft: std::sync::Arc<dyn Engine>,
+        k: u32,
+        s: SamplingParams,
+    ) -> EngineResult<TokenStream> {
+        let k = k.max(1);
+        let tokenizer = self
+            .tokenizer
+            .clone()
+            .ok_or_else(|| crate::EngineError::Unimplemented("speculate requires a tokenizer"))?;
+        let ids_u32: Vec<u32> = initial_prompt_ids.iter().map(|&t| t as u32).collect();
+        let initial_prompt_text = tokenizer.decode(&ids_u32, true).unwrap_or_default();
+        self.speculate_from_parts(initial_prompt_ids, initial_prompt_text, draft, k, s)
+    }
+
+    /// Shared multi-round draft-model speculation driver behind both the
+    /// text [`Engine::speculate`] and the ID-level
+    /// [`Self::speculate_draft_stream_from_ids`]. `initial_prompt_text`
+    /// drives the draft; `initial_prompt_ids` drives the authoritative
+    /// target verify.
+    fn speculate_from_parts(
+        &self,
+        initial_prompt_ids: Vec<i32>,
+        initial_prompt_text: String,
+        draft: std::sync::Arc<dyn Engine>,
+        k: u32,
+        s: SamplingParams,
+    ) -> EngineResult<TokenStream> {
         if initial_prompt_ids.is_empty() {
             let stream = async_stream::stream! {
                 if false { yield Ok(Token { id: 0, text: String::new(), logprobs: None }); }
             };
             return Ok(Box::pin(stream));
         }
-
+        let tokenizer = self
+            .tokenizer
+            .clone()
+            .ok_or_else(|| crate::EngineError::Unimplemented("speculate requires a tokenizer"))?;
         // Per-round draft sampling: K tokens with logprobs for `q`.
         let mut draft_sampling = s.clone();
         draft_sampling.max_tokens = k;
@@ -7047,6 +7114,13 @@ impl Engine for CpuEngine {
         let model_eos = self.model.cfg.eos_token_id;
         let stop_strings = s.stop.clone();
         let greedy_spec = s.temperature <= 0.0;
+        // P10a: resolve the opt-in typical-acceptance knob once; `None`
+        // keeps the default Chen et al. rejection sampling (byte-identical).
+        let typical = if s.spec_typical_accept {
+            Some((s.spec_typical_epsilon, s.spec_typical_delta))
+        } else {
+            None
+        };
 
         // Snapshot the cloned Arc handles. Moving these into the async
         // stream sidesteps `&self` borrows for the whole stream lifetime.
@@ -7055,7 +7129,6 @@ impl Engine for CpuEngine {
         let prefix_cache = self.prefix_cache;
         let prefill_chunk_size = self.prefill_chunk_size;
         let max_ctx = self.max_ctx;
-        let initial_prompt_text = prompt.to_string();
         let cumulative_stats = self.cumulative_stats.clone();
         // Publish live throughput to last_stats/EMA so the GUI tok/s
         // isn't blank under speculative decode (the non-spec path does
@@ -7183,6 +7256,7 @@ impl Engine for CpuEngine {
                         let out = verify_and_commit_speculation(
                             model_c, state_c, prefix_cache, prefill_chunk_size, max_ctx,
                             &prompt_ids_for_verify, &drafts_for_verify, greedy_spec,
+                            typical,
                             &mut rng_c, 1.0, 0.0, 0.0,
                         );
                         (out, rng_c)
@@ -7270,9 +7344,7 @@ impl Engine for CpuEngine {
         };
         Ok(Box::pin(stream))
     }
-}
 
-impl CpuEngine {
     /// N-gram (prompt-lookup) speculative-decoding driver — no draft
     /// model. Each round:
     ///   1. [`NgramDrafter::propose`] scans the running token history for
@@ -7351,6 +7423,13 @@ impl CpuEngine {
         let model_eos = self.model.cfg.eos_token_id;
         let stop_strings = s.stop.clone();
         let greedy_spec = s.temperature <= 0.0;
+        // P10a: opt-in typical acceptance; `None` keeps the default Chen et
+        // al. rejection sampling (byte-identical to the pre-P10a path).
+        let typical = if s.spec_typical_accept {
+            Some((s.spec_typical_epsilon, s.spec_typical_delta))
+        } else {
+            None
+        };
         // Sampling penalties applied to the target logits before each
         // round's accept/reject verify (keeps greedy-with-penalties
         // token-for-token identical to the classic path).
@@ -7456,7 +7535,7 @@ impl CpuEngine {
                         let out = verify_and_commit_speculation(
                             model_c, state_c, prefix_cache, prefill_chunk_size, max_ctx,
                             &prompt_ids_for_verify, &drafts_for_verify, greedy_spec,
-                            &mut rng_c, repeat_pen, freq_pen, pres_pen,
+                            typical, &mut rng_c, repeat_pen, freq_pen, pres_pen,
                         );
                         (out, rng_c)
                     })
