@@ -47,6 +47,29 @@ pub struct ChatRequest {
     pub mirostat_tau: Option<f32>,
     /// Mirostat learning rate. Ignored when `mirostat == 0`.
     pub mirostat_eta: Option<f32>,
+    /// min-p sampling (common llama.cpp / Ollama extension): keep only
+    /// tokens with `p >= min_p * p_max` after temperature. `0` disables.
+    pub min_p: Option<f32>,
+    /// OpenAI `logit_bias`: a `{ "<token_id>": bias }` map; each bias
+    /// (−100..100) is added to that token's logit before sampling. A
+    /// large negative value effectively bans the token.
+    pub logit_bias: Option<std::collections::HashMap<String, f32>>,
+    /// DRY sequence-repetition penalty (llama.cpp extension). `0`
+    /// (default) disables.
+    pub dry_multiplier: Option<f32>,
+    pub dry_base: Option<f32>,
+    pub dry_allowed_length: Option<u32>,
+    /// DRY sequence breakers, as TOKEN IDS at which repetition matching
+    /// resets (this server takes ids, not strings).
+    pub dry_sequence_breakers: Option<Vec<u32>>,
+    /// XTC (eXclude Top Choices) sampler (llama.cpp extension). `0`
+    /// probability (default) disables.
+    pub xtc_probability: Option<f32>,
+    pub xtc_threshold: Option<f32>,
+    /// Dynamic-temperature (dynatemp) range + exponent (llama.cpp
+    /// extension). `0` range (default) disables.
+    pub dynatemp_range: Option<f32>,
+    pub dynatemp_exponent: Option<f32>,
     /// Optional OpenAI-style tool definitions. When present, we render the
     /// chat template with `tools` exposed (which Qwen / DeepSeek / Llama-3
     /// chat templates branch on to inject function-calling instructions)
@@ -2094,6 +2117,18 @@ pub(crate) fn extract_tool_schemas(
     out
 }
 
+/// Convert an OpenAI `logit_bias` map (`{ "<token_id>": bias }`, keys are
+/// token ids as strings) into the engine's `(token_id, bias)` list.
+/// Unparseable keys are skipped. The order is irrelevant — the engine adds
+/// each bias to its token's logit independently. Shared with `completions`.
+pub(crate) fn parse_openai_logit_bias(
+    map: &std::collections::HashMap<String, f32>,
+) -> Vec<(u32, f32)> {
+    map.iter()
+        .filter_map(|(k, &v)| k.parse::<u32>().ok().map(|id| (id, v)))
+        .collect()
+}
+
 fn build_sampling(req: &ChatRequest) -> SamplingParams {
     let mut s = SamplingParams::default();
     if let Some(t) = req.temperature {
@@ -2132,6 +2167,36 @@ fn build_sampling(req: &ChatRequest) -> SamplingParams {
     }
     if let Some(e) = req.mirostat_eta {
         s.mirostat_eta = e;
+    }
+    if let Some(mp) = req.min_p {
+        s.min_p = mp;
+    }
+    if let Some(lb) = req.logit_bias.as_ref() {
+        s.logit_bias = parse_openai_logit_bias(lb);
+    }
+    if let Some(dm) = req.dry_multiplier {
+        s.dry_multiplier = dm;
+    }
+    if let Some(db) = req.dry_base {
+        s.dry_base = db;
+    }
+    if let Some(dal) = req.dry_allowed_length {
+        s.dry_allowed_length = dal;
+    }
+    if let Some(dsb) = req.dry_sequence_breakers.as_ref() {
+        s.dry_sequence_breakers = dsb.clone();
+    }
+    if let Some(xp) = req.xtc_probability {
+        s.xtc_probability = xp;
+    }
+    if let Some(xt) = req.xtc_threshold {
+        s.xtc_threshold = xt;
+    }
+    if let Some(dr) = req.dynatemp_range {
+        s.dynatemp_range = dr;
+    }
+    if let Some(de) = req.dynatemp_exponent {
+        s.dynatemp_exponent = de;
     }
     // logprobs: `top_logprobs` implies `logprobs: true` per OpenAI spec.
     if req.logprobs || req.top_logprobs.is_some() {
@@ -3081,6 +3146,52 @@ mod tests {
         assert_eq!(sampling.mirostat, defaults.mirostat);
         assert!((sampling.mirostat_tau - defaults.mirostat_tau).abs() < 1e-6);
         assert!((sampling.mirostat_eta - defaults.mirostat_eta).abs() < 1e-6);
+    }
+
+    #[test]
+    fn p13_samplers_thread_into_sampling_params_for_chat() {
+        // min_p + logit_bias (OpenAI map) + DRY + XTC + dynatemp all land
+        // on the SamplingParams the engine consumes.
+        let value = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 4,
+            "min_p": 0.05,
+            "logit_bias": { "17": -100.0, "42": 3.5 },
+            "dry_multiplier": 0.8,
+            "dry_base": 1.75,
+            "dry_allowed_length": 3,
+            "dry_sequence_breakers": [13, 27],
+            "xtc_probability": 0.5,
+            "xtc_threshold": 0.15,
+            "dynatemp_range": 0.4,
+            "dynatemp_exponent": 1.2,
+        });
+        let req: ChatRequest = serde_json::from_value(value).expect("ChatRequest parses");
+        let s = build_sampling(&req);
+        assert!((s.min_p - 0.05).abs() < 1e-6);
+        let mut lb = s.logit_bias.clone();
+        lb.sort_by_key(|&(id, _)| id);
+        assert_eq!(lb, vec![(17, -100.0), (42, 3.5)]);
+        assert!((s.dry_multiplier - 0.8).abs() < 1e-6);
+        assert!((s.dry_base - 1.75).abs() < 1e-6);
+        assert_eq!(s.dry_allowed_length, 3);
+        assert_eq!(s.dry_sequence_breakers, vec![13, 27]);
+        assert!((s.xtc_probability - 0.5).abs() < 1e-6);
+        assert!((s.xtc_threshold - 0.15).abs() < 1e-6);
+        assert!((s.dynatemp_range - 0.4).abs() < 1e-6);
+        assert!((s.dynatemp_exponent - 1.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn p13_samplers_absent_keep_defaults_for_chat() {
+        let req = chat_request_with_seed(None);
+        let s = build_sampling(&req);
+        let d = rustllama_engine::SamplingParams::default();
+        assert_eq!(s.min_p, d.min_p);
+        assert!(s.logit_bias.is_empty());
+        assert_eq!(s.dry_multiplier, d.dry_multiplier);
+        assert_eq!(s.xtc_probability, d.xtc_probability);
+        assert_eq!(s.dynatemp_range, d.dynatemp_range);
     }
 
     #[test]

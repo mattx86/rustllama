@@ -46,6 +46,24 @@ pub struct CompletionRequest {
     pub mirostat: Option<u32>,
     pub mirostat_tau: Option<f32>,
     pub mirostat_eta: Option<f32>,
+    /// min-p sampling: keep only tokens with `p >= min_p * p_max`. `0`
+    /// disables.
+    pub min_p: Option<f32>,
+    /// OpenAI `logit_bias`: `{ "<token_id>": bias }` added to logits
+    /// before sampling.
+    pub logit_bias: Option<std::collections::HashMap<String, f32>>,
+    /// DRY sequence-repetition penalty. `0` (default) disables.
+    pub dry_multiplier: Option<f32>,
+    pub dry_base: Option<f32>,
+    pub dry_allowed_length: Option<u32>,
+    /// DRY sequence breakers as TOKEN IDS.
+    pub dry_sequence_breakers: Option<Vec<u32>>,
+    /// XTC (eXclude Top Choices) sampler. `0` probability disables.
+    pub xtc_probability: Option<f32>,
+    pub xtc_threshold: Option<f32>,
+    /// Dynamic-temperature (dynatemp). `0` range disables.
+    pub dynatemp_range: Option<f32>,
+    pub dynatemp_exponent: Option<f32>,
     #[serde(default)]
     pub echo: bool,
     /// OpenAI streaming knob. `include_usage: true` adds a final usage
@@ -531,6 +549,36 @@ fn build_sampling(req: &CompletionRequest) -> SamplingParams {
     if let Some(e) = req.mirostat_eta {
         s.mirostat_eta = e;
     }
+    if let Some(mp) = req.min_p {
+        s.min_p = mp;
+    }
+    if let Some(lb) = req.logit_bias.as_ref() {
+        s.logit_bias = crate::chat::parse_openai_logit_bias(lb);
+    }
+    if let Some(dm) = req.dry_multiplier {
+        s.dry_multiplier = dm;
+    }
+    if let Some(db) = req.dry_base {
+        s.dry_base = db;
+    }
+    if let Some(dal) = req.dry_allowed_length {
+        s.dry_allowed_length = dal;
+    }
+    if let Some(dsb) = req.dry_sequence_breakers.as_ref() {
+        s.dry_sequence_breakers = dsb.clone();
+    }
+    if let Some(xp) = req.xtc_probability {
+        s.xtc_probability = xp;
+    }
+    if let Some(xt) = req.xtc_threshold {
+        s.xtc_threshold = xt;
+    }
+    if let Some(dr) = req.dynatemp_range {
+        s.dynatemp_range = dr;
+    }
+    if let Some(de) = req.dynatemp_exponent {
+        s.dynatemp_exponent = de;
+    }
     s
 }
 
@@ -878,6 +926,37 @@ mod tests {
         assert_eq!(sampling.mirostat, 1);
         assert!((sampling.mirostat_tau - 3.0).abs() < 1e-6);
         assert!((sampling.mirostat_eta - 0.05).abs() < 1e-6);
+    }
+
+    #[test]
+    fn p13_samplers_thread_into_sampling_params_for_completions() {
+        let value = serde_json::json!({
+            "prompt": "hi",
+            "max_tokens": 4,
+            "min_p": 0.03,
+            "logit_bias": { "7": -100.0 },
+            "dry_multiplier": 1.0,
+            "dry_base": 1.5,
+            "dry_allowed_length": 2,
+            "dry_sequence_breakers": [5],
+            "xtc_probability": 0.3,
+            "xtc_threshold": 0.2,
+            "dynatemp_range": 0.25,
+            "dynatemp_exponent": 0.9,
+        });
+        let req: CompletionRequest =
+            serde_json::from_value(value).expect("CompletionRequest parses");
+        let s = build_sampling(&req);
+        assert!((s.min_p - 0.03).abs() < 1e-6);
+        assert_eq!(s.logit_bias, vec![(7, -100.0)]);
+        assert!((s.dry_multiplier - 1.0).abs() < 1e-6);
+        assert!((s.dry_base - 1.5).abs() < 1e-6);
+        assert_eq!(s.dry_allowed_length, 2);
+        assert_eq!(s.dry_sequence_breakers, vec![5]);
+        assert!((s.xtc_probability - 0.3).abs() < 1e-6);
+        assert!((s.xtc_threshold - 0.2).abs() < 1e-6);
+        assert!((s.dynatemp_range - 0.25).abs() < 1e-6);
+        assert!((s.dynatemp_exponent - 0.9).abs() < 1e-6);
     }
 
     fn synth_path(tag: &str) -> std::path::PathBuf {

@@ -260,6 +260,19 @@ impl Sampler {
         if self.params.top_k > rustllama_kernels_sycl::MAX_TOP_K_GPU {
             return false;
         }
+        // P13: the GPU sampler kernel chain only implements
+        // penalties + temp + top-k + top-p. If any of the newer CPU
+        // samplers (logit_bias, DRY, min-p, XTC, dynatemp) is active,
+        // the GPU path would silently ignore it and produce a wrong
+        // token — fall through to the full CPU pipeline instead.
+        if !self.params.logit_bias.is_empty()
+            || self.params.dry_multiplier > 0.0
+            || self.params.min_p > 0.0
+            || self.params.xtc_probability > 0.0
+            || self.params.dynatemp_range > 0.0
+        {
+            return false;
+        }
         true
     }
 
@@ -365,6 +378,21 @@ impl Sampler {
             }
         }
 
+        // P13 pipeline order (matches llama.cpp's default sampler chain
+        // where it is canonical):
+        //   logit_bias → penalties (rep/freq/pres + DRY) → dynatemp/temp
+        //   → min-p → top-k → top-p → typical → XTC → final sample.
+        // Every P13 stage is a no-op at its default, so with the new
+        // fields unset this function is byte-identical to the pre-P13
+        // sampler (including the RNG stream — XTC draws only when on).
+
+        // 0. logit_bias (OpenAI): add the per-token bias straight onto
+        //    the LOGITS first — before penalties / temperature / any
+        //    truncation — so a large negative bias bans a token and a
+        //    large positive one forces it, in BOTH the greedy and the
+        //    sampled paths. No-op when the bias list is empty.
+        apply_logit_bias(logits, &self.params.logit_bias);
+
         // 1. Repetition / frequency / presence penalties (all logit-space).
         apply_all_penalties(
             logits,
@@ -374,17 +402,45 @@ impl Sampler {
             self.params.presence_penalty,
         );
 
-        // 2. Greedy short-circuit when temperature is zero (after penalties).
+        // 1b. DRY sequence-repetition penalty — same logit space as the
+        //     penalties above. No-op when `dry_multiplier == 0`.
+        if self.params.dry_multiplier > 0.0 {
+            apply_dry(
+                logits,
+                recent,
+                self.params.dry_multiplier,
+                self.params.dry_base,
+                self.params.dry_allowed_length as usize,
+                &self.params.dry_sequence_breakers,
+            );
+        }
+
+        // 2. Greedy short-circuit when temperature is zero (after
+        //    logit_bias + penalties, so bans/forces/repetition still bite
+        //    the argmax). min-p / top-k / top-p / typical / XTC are
+        //    distribution-shapers that don't change an argmax, so greedy
+        //    correctly ignores them.
         if self.params.temperature <= 0.0 {
             return argmax_with_grammar(logits, grammar);
         }
 
-        // 3 + 4. F1: fused temperature scale + softmax. Combines what
-        // was two passes (multiply by inv_temp, then max-scan inside
-        // softmax) into a single pass with the temp multiply folded
-        // into the max scan — saves one full vocab read per token.
-        let inv_t = 1.0 / self.params.temperature;
-        rustllama_kernels_cpu::fused_temp_softmax_inplace(logits, inv_t);
+        // 3 + 4. Temperature scale + softmax. Default path: the F1 fused
+        // temp+softmax (one pass, temp multiply folded into the max scan).
+        // With dynatemp (`dynatemp_range > 0`) the effective temperature
+        // is entropy-scaled per token first; the fixed-temp branch stays
+        // byte-identical to the pre-P13 path.
+        if self.params.dynatemp_range > 0.0 {
+            let dyn_t = dynatemp_effective_temp(
+                logits,
+                self.params.temperature,
+                self.params.dynatemp_range,
+                self.params.dynatemp_exponent,
+            );
+            rustllama_kernels_cpu::fused_temp_softmax_inplace(logits, 1.0 / dyn_t);
+        } else {
+            let inv_t = 1.0 / self.params.temperature;
+            rustllama_kernels_cpu::fused_temp_softmax_inplace(logits, inv_t);
+        }
 
         // 5. Mirostat: when enabled, it OWNS truncation — bypass
         // top-k/top-p entirely (they would re-cut the distribution
@@ -406,21 +462,43 @@ impl Sampler {
                 &mut self.mirostat_mu,
             );
         } else {
-            // 6a. Optional top-k.
+            // 6a. Optional min-p. Canonical position: BEFORE top-k /
+            // top-p (llama.cpp's default sampler chain applies min-p
+            // early). Keeps only tokens with `p >= min_p * p_max`
+            // (p_max = the most-probable token's prob), then
+            // renormalizes. No-op when `min_p == 0`.
+            if self.params.min_p > 0.0 {
+                apply_min_p(logits, self.params.min_p);
+            }
+            // 6b. Optional top-k.
             if self.params.top_k > 0 && (self.params.top_k as usize) < logits.len() {
                 apply_top_k(logits, self.params.top_k as usize);
             }
-            // 6b. Optional top-p (nucleus).
+            // 6c. Optional top-p (nucleus).
             if self.params.top_p > 0.0 && self.params.top_p < 1.0 {
                 apply_top_p(logits, self.params.top_p);
             }
-            // 6c. Optional typical-p (locally-typical sampling).
+            // 6d. Optional typical-p (locally-typical sampling).
             // Same `0.0 < p < 1.0` gate as top-p so callers disable
             // by setting `1.0` (the default). Applied after top-p:
             // top-p narrows to the high-mass tokens, typical-p then
             // re-truncates by typicality within that surviving set.
             if self.params.typical_p > 0.0 && self.params.typical_p < 1.0 {
                 apply_typical_p(logits, self.params.typical_p);
+            }
+            // 6e. Optional XTC (eXclude Top Choices). Applied LAST in
+            // the truncation chain (after typical-p): with probability
+            // `xtc_probability`, drop all but the least-probable of the
+            // tokens above `xtc_threshold`. Draws exactly one RNG value,
+            // and ONLY when enabled — so the default path consumes no
+            // randomness and the seed stream stays byte-identical.
+            if self.params.xtc_probability > 0.0 {
+                apply_xtc(
+                    logits,
+                    self.params.xtc_probability,
+                    self.params.xtc_threshold,
+                    &mut self.rng,
+                );
             }
         }
 
@@ -721,6 +799,254 @@ fn apply_repetition_penalty(logits: &mut [f32], recent: &[u32], penalty: f32) {
         let v = logits[idx];
         logits[idx] = if v >= 0.0 { v / penalty } else { v * penalty };
     }
+}
+
+/// OpenAI `logit_bias`: add `bias` to each listed token's LOGIT. Applied
+/// first in the sampler, before penalties / temperature / filtering, so a
+/// large-magnitude bias behaves as a soft ban (≈ −100) or force (≈ +100).
+/// Out-of-range token ids are ignored. Empty list ⇒ byte-identical no-op.
+pub(crate) fn apply_logit_bias(logits: &mut [f32], biases: &[(u32, f32)]) {
+    for &(tok, bias) in biases {
+        if let Some(l) = logits.get_mut(tok as usize) {
+            *l += bias;
+        }
+    }
+}
+
+/// DRY ("Don't Repeat Yourself") — the sequence-level repetition penalty
+/// (p-e-w, text-generation-webui PR #5677; llama.cpp `llama_sampler_dry`).
+///
+/// For the current context suffix, DRY penalizes any token that would
+/// **extend a repeated n-gram**: if the last `L` tokens of the context
+/// equal the `L` tokens ending somewhere earlier, then the token that
+/// *followed* that earlier occurrence — if chosen next — would grow the
+/// repeat to length `L + 1`. Such a token's logit is reduced by
+/// `multiplier * base^(L - allowed_length)` for the largest matching `L`,
+/// but only when `L >= allowed_length` (shorter repeats are free). This
+/// matches llama.cpp's exponent (`match_len - allowed_length`).
+///
+/// `recent` is the context (prompt + generated) the engine already passes
+/// for the token-level penalties. Matching is done over the reversed
+/// context with the Z-algorithm (O(n)); `seq_breakers` are token ids at
+/// which a match may not cross — the most recent breaker in the suffix
+/// caps every match length (single-token breakers, the common case).
+///
+/// Operates in logit space, alongside the other penalties, before the
+/// temperature softmax. `multiplier == 0` is handled by the caller (never
+/// invoked), so this is only reached when DRY is enabled.
+pub(crate) fn apply_dry(
+    logits: &mut [f32],
+    recent: &[u32],
+    multiplier: f32,
+    base: f32,
+    allowed_length: usize,
+    seq_breakers: &[u32],
+) {
+    // Guard rails mirror llama.cpp: a base below 1 would make longer
+    // repeats *cheaper*, and fewer than 2 context tokens can't form a
+    // repeat.
+    let n = recent.len();
+    if multiplier <= 0.0 || base < 1.0 || n < 2 {
+        return;
+    }
+
+    let is_breaker = |tok: u32| seq_breakers.contains(&tok);
+
+    // rep_limit: scan backward from the last token; the first sequence
+    // breaker at distance `m` caps every match at `m` tokens (a repeat
+    // may not contain / cross a breaker). No breaker ⇒ the whole window.
+    let mut rep_limit = n;
+    for m in 0..n {
+        if is_breaker(recent[n - 1 - m]) {
+            rep_limit = m;
+            break;
+        }
+    }
+    if rep_limit < allowed_length {
+        // No match can reach `allowed_length`, so nothing is penalizable.
+        return;
+    }
+
+    // Z-algorithm over the reversed context: `rev[i] = recent[n-1-i]`,
+    // so `rev[0]` is the most-recent token. `z[i]` = length of the
+    // longest common prefix of `rev` and `rev[i..]` = how many of the
+    // most-recent tokens match the tokens ending `i` positions earlier.
+    let rev = |i: usize| recent[n - 1 - i];
+    let mut z = vec![0usize; n];
+    let (mut l, mut r) = (0usize, 0usize);
+    for i in 1..n {
+        if i < r {
+            z[i] = (r - i).min(z[i - l]);
+        }
+        while i + z[i] < n && rev(z[i]) == rev(i + z[i]) {
+            z[i] += 1;
+        }
+        if i + z[i] > r {
+            l = i;
+            r = i + z[i];
+        }
+    }
+
+    // For each earlier occurrence (shift `i`), the token that would
+    // continue the repeat is `recent[n - i]` (the token just after the
+    // earlier window). Record the longest match length per such token.
+    let mut max_repeat: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for i in 1..n {
+        let match_len = z[i].min(rep_limit);
+        if match_len >= allowed_length {
+            let token = recent[n - i];
+            let e = max_repeat.entry(token).or_insert(0);
+            if match_len > *e {
+                *e = match_len;
+            }
+        }
+    }
+
+    // Apply the exponential penalty. Clamp the exponent so `base^exp`
+    // can't overflow to +inf (which would poison the softmax); a clamp
+    // at 64 already yields an effectively-banning penalty for any
+    // sensible `base`/`multiplier`.
+    for (token, match_len) in max_repeat {
+        let exponent = (match_len - allowed_length) as f32;
+        let penalty = multiplier * base.powf(exponent.min(64.0));
+        if let Some(l) = logits.get_mut(token as usize) {
+            *l -= penalty;
+        }
+    }
+}
+
+/// min-p truncation: keep only tokens whose probability is at least
+/// `min_p * p_max` (p_max = the largest probability in the distribution),
+/// zero the rest, and renormalize. `probs` must already be a normalized
+/// softmax distribution (the sampler calls this right after the
+/// temperature softmax). Always keeps at least the argmax token.
+fn apply_min_p(probs: &mut [f32], min_p: f32) {
+    if probs.is_empty() || min_p <= 0.0 {
+        return;
+    }
+    let p_max = probs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !(p_max > 0.0) {
+        return;
+    }
+    let threshold = min_p * p_max;
+    let mut sum = 0.0f32;
+    for p in probs.iter_mut() {
+        // `>=` keeps the argmax (its own prob equals p_max >= threshold)
+        // and any ties with it, matching llama.cpp's min-p cutoff.
+        if *p < threshold {
+            *p = 0.0;
+        } else {
+            sum += *p;
+        }
+    }
+    if sum > 0.0 {
+        let inv = 1.0 / sum;
+        for p in probs.iter_mut() {
+            *p *= inv;
+        }
+    }
+}
+
+/// XTC ("eXclude Top Choices", p-e-w PR #6335; llama.cpp
+/// `llama_sampler_xtc`). With probability `probability`, remove all but
+/// the **least-probable** of the tokens whose probability is at least
+/// `threshold` — i.e. drop the most-probable choices, keeping the lowest
+/// one above the threshold plus the entire below-threshold tail — then
+/// renormalize. This deliberately steers away from the obvious tokens to
+/// keep long-form generation diverse.
+///
+/// `probs` must be a normalized softmax distribution. Draws exactly one
+/// uniform from `rng` (the per-token coin flip); the caller only invokes
+/// this when `probability > 0`, so the default sampler path never touches
+/// the RNG here and stays seed-byte-identical.
+fn apply_xtc(probs: &mut [f32], probability: f32, threshold: f32, rng: &mut Rng) {
+    if probs.len() < 2 {
+        return;
+    }
+    // Per-token coin flip FIRST (consumes one RNG value whenever XTC is
+    // enabled, regardless of outcome — matching llama.cpp, so the stream
+    // is deterministic under a seed).
+    let chance = rng.next_f32();
+    if chance >= probability {
+        return;
+    }
+    // Collect the above-threshold tokens. XTC keeps the single
+    // lowest-probability one among them and drops the rest; tokens below
+    // threshold are untouched. Need ≥ 2 above threshold for XTC to do
+    // anything (otherwise there is no "top choice" to exclude).
+    let mut above: Vec<usize> = (0..probs.len()).filter(|&i| probs[i] >= threshold).collect();
+    if above.len() < 2 {
+        return;
+    }
+    // Index of the least-probable above-threshold token to KEEP. Ties
+    // resolve to the highest index for determinism (mirrors llama.cpp's
+    // "last in descending-sorted order").
+    let keep = *above
+        .iter()
+        .min_by(|&&a, &&b| {
+            probs[a]
+                .partial_cmp(&probs[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.cmp(&a))
+        })
+        .expect("above has >= 2 elements");
+    above.retain(|&i| i != keep);
+    for &i in &above {
+        probs[i] = 0.0;
+    }
+    let sum: f32 = probs.iter().sum();
+    if sum > 0.0 {
+        let inv = 1.0 / sum;
+        for p in probs.iter_mut() {
+            *p *= inv;
+        }
+    }
+}
+
+/// Dynamic-temperature (dynatemp / llama.cpp `temp_ext`): derive a
+/// per-token effective temperature from the distribution's normalized
+/// (Shannon) entropy. Returns a temperature in
+/// `[max(0, base - range), base + range]`:
+///   `dyn = min_t + (max_t - min_t) * norm_entropy^exponent`
+/// where `norm_entropy = H / log(n)` is the softmax entropy at
+/// temperature 1 normalized by the maximum possible entropy. A flat
+/// (uncertain) distribution ⇒ high entropy ⇒ hotter temperature; a
+/// peaked (confident) one ⇒ low entropy ⇒ cooler. The result is clamped
+/// to a small positive floor so the caller's `1.0 / dyn` divide stays
+/// finite. `logits` are the raw (pre-temperature) logits and are left
+/// unchanged — only the scalar temperature is returned.
+fn dynatemp_effective_temp(logits: &[f32], base: f32, range: f32, exponent: f32) -> f32 {
+    let n = logits.len();
+    let min_t = (base - range).max(0.0);
+    let max_t = base + range;
+    if n <= 1 || max_t <= min_t {
+        return base.max(1e-6);
+    }
+    // Softmax of the raw logits (temperature 1), numerically stable.
+    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for &v in logits {
+        sum += (v - max_logit).exp();
+    }
+    if !(sum > 0.0) {
+        return base.max(1e-6);
+    }
+    // Shannon entropy H = -Σ p ln p of that softmax.
+    let mut entropy = 0.0f32;
+    for &v in logits {
+        let p = (v - max_logit).exp() / sum;
+        if p > 0.0 {
+            entropy -= p * p.ln();
+        }
+    }
+    let max_entropy = (n as f32).ln(); // = -ln(1/n)
+    let norm = if max_entropy > 0.0 {
+        (entropy / max_entropy).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let dyn_t = min_t + (max_t - min_t) * norm.powf(exponent);
+    dyn_t.max(1e-6)
 }
 
 // Softmax now flows through `kernels_cpu::fused_temp_softmax_inplace`
@@ -2094,6 +2420,437 @@ mod tests {
             state, cpu_final,
             "gpu RNG state must match cpu RNG state after equal-length stream"
         );
+    }
+
+    // ============================================================
+    // P13 samplers: min-p, logit_bias, DRY, XTC, dynatemp
+    // ============================================================
+
+    /// Raw (pre-softmax) logits with a wide dynamic range — the sampler
+    /// applies its own temperature softmax, so these feed `Sampler::sample`
+    /// / the reference pipeline directly (unlike `synth_probs`, which is
+    /// already normalized).
+    fn synth_logits(seed: u32, n: usize) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(2654435761).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                let u = (s >> 8) as f32 / (1u32 << 24) as f32;
+                u * 8.0 - 4.0
+            })
+            .collect()
+    }
+
+    /// The exact pre-P13 sampler pipeline (penalties → temp+softmax →
+    /// top-k → top-p → typical → multinomial) for the "defaults
+    /// byte-identical" proof. Mirrors the non-mirostat, no-grammar path
+    /// `Sampler::sample` takes at default params.
+    fn reference_sample_pre_p13(
+        logits: &mut [f32],
+        recent: &[u32],
+        params: &SamplingParams,
+        rng: &mut Rng,
+    ) -> u32 {
+        apply_all_penalties(
+            logits,
+            recent,
+            params.repeat_penalty,
+            params.frequency_penalty,
+            params.presence_penalty,
+        );
+        if params.temperature <= 0.0 {
+            return argmax(logits);
+        }
+        rustllama_kernels_cpu::fused_temp_softmax_inplace(logits, 1.0 / params.temperature);
+        if params.top_k > 0 && (params.top_k as usize) < logits.len() {
+            apply_top_k(logits, params.top_k as usize);
+        }
+        if params.top_p > 0.0 && params.top_p < 1.0 {
+            apply_top_p(logits, params.top_p);
+        }
+        if params.typical_p > 0.0 && params.typical_p < 1.0 {
+            apply_typical_p(logits, params.typical_p);
+        }
+        multinomial(logits, rng)
+    }
+
+    #[test]
+    fn p13_defaults_are_the_documented_noops() {
+        let d = SamplingParams::default();
+        assert_eq!(d.min_p, 0.0);
+        assert!(d.logit_bias.is_empty());
+        assert_eq!(d.dry_multiplier, 0.0);
+        assert!(d.dry_sequence_breakers.is_empty());
+        assert_eq!(d.xtc_probability, 0.0);
+        assert_eq!(d.dynatemp_range, 0.0);
+    }
+
+    #[test]
+    fn p13_defaults_byte_identical_to_pre_p13_pipeline() {
+        // With every P13 field at its no-op default, `Sampler::sample`
+        // must produce exactly what the pre-P13 pipeline produced for the
+        // same logits + RNG stream — token-for-token over many steps.
+        let params = SamplingParams {
+            seed: 0x0BADF00D,
+            ..SamplingParams::default()
+        };
+        let mut s = Sampler::new(params.clone());
+        s.gpu_enabled = false; // compare against the CPU reference
+        let mut ref_rng = Rng::from_seed(params.seed);
+        let recent: Vec<u32> = vec![1, 2, 3];
+        for step in 0..32u32 {
+            let base = synth_logits(step + 1, 256);
+            let got = s.sample(&mut base.clone(), &recent);
+            let want = reference_sample_pre_p13(&mut base.clone(), &recent, &params, &mut ref_rng);
+            assert_eq!(got, want, "defaults must be byte-identical at step {step}");
+        }
+    }
+
+    #[test]
+    fn p13_inert_knobs_do_not_leak_at_default_gates() {
+        // The non-gate DRY/XTC/dynatemp knobs (base / allowed_length /
+        // threshold / exponent) must be inert while their gates
+        // (multiplier / probability / range) are at the default 0.
+        let a = SamplingParams {
+            seed: 0x5EED,
+            ..SamplingParams::default()
+        };
+        let b = SamplingParams {
+            dry_base: 3.3,
+            dry_allowed_length: 7,
+            xtc_threshold: 0.42,
+            dynatemp_exponent: 2.5,
+            ..a.clone()
+        };
+        let mut sa = Sampler::new(a);
+        let mut sb = Sampler::new(b);
+        sa.gpu_enabled = false;
+        sb.gpu_enabled = false;
+        for step in 0..16u32 {
+            let base = synth_logits(step + 100, 200);
+            assert_eq!(
+                sa.sample(&mut base.clone(), &[]),
+                sb.sample(&mut base.clone(), &[]),
+                "inert knobs changed output while gates are off (step {step})"
+            );
+        }
+    }
+
+    // ----- min-p -----------------------------------------------------------
+
+    #[test]
+    fn min_p_filters_below_threshold() {
+        // p_max = 0.5, min_p = 0.3 → threshold 0.15. Keep p >= 0.15.
+        let mut probs = vec![0.5f32, 0.25, 0.15, 0.10];
+        apply_min_p(&mut probs, 0.3);
+        assert!(probs[0] > 0.0 && probs[1] > 0.0 && probs[2] > 0.0);
+        assert_eq!(probs[3], 0.0, "0.10 < 0.15 threshold must be dropped");
+        let sum: f32 = probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "renormalize to 1.0, got {sum}");
+    }
+
+    #[test]
+    fn min_p_high_keeps_only_the_top() {
+        // min_p = 0.6, p_max = 0.5 → threshold 0.30 → only the top survives.
+        let mut probs = vec![0.5f32, 0.25, 0.15, 0.10];
+        apply_min_p(&mut probs, 0.6);
+        assert!((probs[0] - 1.0).abs() < 1e-5);
+        assert_eq!(probs[1], 0.0);
+        assert_eq!(probs[2], 0.0);
+        assert_eq!(probs[3], 0.0);
+    }
+
+    #[test]
+    fn min_p_zero_is_noop() {
+        let mut probs = vec![0.5f32, 0.25, 0.15, 0.10];
+        let before = probs.clone();
+        apply_min_p(&mut probs, 0.0);
+        assert_eq!(probs, before);
+    }
+
+    // ----- logit_bias ------------------------------------------------------
+
+    #[test]
+    fn logit_bias_ban_removes_argmax() {
+        // Greedy path: token 1 is the argmax; a −100 bias on it must
+        // elect the next-highest (token 2).
+        let params = SamplingParams {
+            temperature: 0.0,
+            logit_bias: vec![(1, -100.0)],
+            ..SamplingParams::default()
+        };
+        let mut s = Sampler::new(params);
+        s.gpu_enabled = false;
+        let mut logits = vec![1.0f32, 5.0, 3.0, 2.0];
+        assert_eq!(s.sample(&mut logits, &[]), 2, "ban on argmax elects token 2");
+    }
+
+    #[test]
+    fn logit_bias_force_elects_token() {
+        let params = SamplingParams {
+            temperature: 0.0,
+            logit_bias: vec![(3, 100.0)],
+            ..SamplingParams::default()
+        };
+        let mut s = Sampler::new(params);
+        s.gpu_enabled = false;
+        let mut logits = vec![1.0f32, 5.0, 3.0, 2.0];
+        assert_eq!(s.sample(&mut logits, &[]), 3, "+100 bias forces token 3");
+    }
+
+    #[test]
+    fn logit_bias_out_of_range_ignored() {
+        let mut logits = vec![1.0f32, 2.0, 3.0];
+        apply_logit_bias(&mut logits, &[(99, -100.0), (1, 5.0)]);
+        assert!((logits[1] - 7.0).abs() < 1e-6, "in-range bias applied");
+        assert!((logits[0] - 1.0).abs() < 1e-6);
+        assert!((logits[2] - 3.0).abs() < 1e-6);
+    }
+
+    // ----- DRY -------------------------------------------------------------
+
+    /// Naive O(n²) DRY reference: for each earlier end-index, grow the
+    /// common suffix (capped at `rep_limit`), record the continuing
+    /// token's longest match. Cross-checks the Z-algorithm path.
+    fn apply_dry_naive(
+        logits: &mut [f32],
+        recent: &[u32],
+        multiplier: f32,
+        base: f32,
+        allowed_length: usize,
+        seq_breakers: &[u32],
+    ) {
+        let n = recent.len();
+        if multiplier <= 0.0 || base < 1.0 || n < 2 {
+            return;
+        }
+        let is_breaker = |t: u32| seq_breakers.contains(&t);
+        let mut rep_limit = n;
+        for m in 0..n {
+            if is_breaker(recent[n - 1 - m]) {
+                rep_limit = m;
+                break;
+            }
+        }
+        if rep_limit < allowed_length {
+            return;
+        }
+        let mut max_repeat: std::collections::HashMap<u32, usize> =
+            std::collections::HashMap::new();
+        for e in 0..n - 1 {
+            let mut lmatch = 0usize;
+            while e >= lmatch
+                && lmatch < rep_limit
+                && recent[e - lmatch] == recent[n - 1 - lmatch]
+            {
+                lmatch += 1;
+            }
+            if lmatch >= allowed_length {
+                let token = recent[e + 1];
+                let slot = max_repeat.entry(token).or_insert(0);
+                if lmatch > *slot {
+                    *slot = lmatch;
+                }
+            }
+        }
+        for (token, lmatch) in max_repeat {
+            let exponent = (lmatch - allowed_length) as f32;
+            let penalty = multiplier * base.powf(exponent.min(64.0));
+            if let Some(l) = logits.get_mut(token as usize) {
+                *l -= penalty;
+            }
+        }
+    }
+
+    #[test]
+    fn dry_penalizes_repeat_extension() {
+        // Context A B C A B (10 11 12 10 11): the suffix "A B" matched the
+        // earlier "A B" (pos 0-1) which was followed by C (12); choosing C
+        // would extend the repeat, so C is penalized. L = 2, allowed = 1 →
+        // penalty = 2.0 * 1.75^(2-1) = 3.5.
+        let recent = vec![10u32, 11, 12, 10, 11];
+        let mut logits = vec![0.0f32; 20];
+        apply_dry(&mut logits, &recent, 2.0, 1.75, 1, &[]);
+        assert!(
+            (logits[12] + 3.5).abs() < 1e-4,
+            "token 12 should be penalized by 3.5, got {}",
+            logits[12]
+        );
+        for (i, &v) in logits.iter().enumerate() {
+            if i != 12 {
+                assert_eq!(v, 0.0, "token {i} must be untouched");
+            }
+        }
+    }
+
+    #[test]
+    fn dry_respects_allowed_length() {
+        // match length 2 < allowed_length 3 → no penalty at all.
+        let recent = vec![10u32, 11, 12, 10, 11];
+        let mut logits = vec![0.0f32; 20];
+        apply_dry(&mut logits, &recent, 2.0, 1.75, 3, &[]);
+        for &v in &logits {
+            assert_eq!(v, 0.0);
+        }
+    }
+
+    #[test]
+    fn dry_sequence_breaker_suppresses_penalty() {
+        // Marking the last token (11) as a breaker caps rep_limit at 0, so
+        // the repeat that would penalize token 12 is suppressed.
+        let recent = vec![10u32, 11, 12, 10, 11];
+        let mut logits = vec![0.0f32; 20];
+        apply_dry(&mut logits, &recent, 2.0, 1.75, 1, &[11]);
+        for &v in &logits {
+            assert_eq!(v, 0.0, "breaker should suppress all DRY penalties");
+        }
+    }
+
+    #[test]
+    fn dry_multiplier_zero_is_noop() {
+        let recent = vec![10u32, 11, 12, 10, 11];
+        let mut logits = vec![0.0f32; 20];
+        apply_dry(&mut logits, &recent, 0.0, 1.75, 1, &[]);
+        for &v in &logits {
+            assert_eq!(v, 0.0);
+        }
+    }
+
+    #[test]
+    fn dry_zalgorithm_matches_naive_reference() {
+        // Random token streams with a small alphabet (so repeats are
+        // frequent) — the O(n) Z-algorithm path must match the O(n²)
+        // naive reference, with and without sequence breakers.
+        for seed in 0..40u32 {
+            let n = 8 + (seed as usize % 40);
+            let mut s = seed.wrapping_mul(747796405).wrapping_add(2891336453);
+            let recent: Vec<u32> = (0..n)
+                .map(|_| {
+                    s = s.wrapping_mul(747796405).wrapping_add(2891336453);
+                    (s >> 28) % 6 // alphabet 0..6
+                })
+                .collect();
+            let breakers: &[u32] = if seed % 2 == 0 { &[] } else { &[0u32] };
+            let allowed = 1 + (seed as usize % 3);
+            let mut a = vec![0.0f32; 6];
+            let mut b = vec![0.0f32; 6];
+            apply_dry(&mut a, &recent, 1.3, 1.75, allowed, breakers);
+            apply_dry_naive(&mut b, &recent, 1.3, 1.75, allowed, breakers);
+            for i in 0..6 {
+                assert!(
+                    (a[i] - b[i]).abs() < 1e-4,
+                    "DRY Z vs naive mismatch seed={seed} tok={i}: {} vs {}",
+                    a[i],
+                    b[i]
+                );
+            }
+        }
+    }
+
+    // ----- XTC -------------------------------------------------------------
+
+    #[test]
+    fn xtc_drops_top_choices_above_threshold() {
+        // above threshold 0.1 = {0.5, 0.3, 0.15}; XTC keeps the least of
+        // them (0.15 at idx 2) + the below-threshold tail (0.05 at idx 3),
+        // dropping idx 0 and idx 1.
+        let mut probs = vec![0.5f32, 0.3, 0.15, 0.05];
+        let mut rng = Rng::from_seed(1);
+        apply_xtc(&mut probs, 1.0, 0.1, &mut rng);
+        assert_eq!(probs[0], 0.0, "top choice dropped");
+        assert_eq!(probs[1], 0.0, "second choice dropped");
+        assert!(probs[2] > 0.0, "least above-threshold token kept");
+        assert!(probs[3] > 0.0, "below-threshold token kept");
+        let sum: f32 = probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "renormalize to 1.0, got {sum}");
+    }
+
+    #[test]
+    fn xtc_noop_when_fewer_than_two_above_threshold() {
+        let mut probs = vec![0.7f32, 0.1, 0.1, 0.1];
+        let before = probs.clone();
+        let mut rng = Rng::from_seed(2);
+        apply_xtc(&mut probs, 1.0, 0.5, &mut rng); // only 0.7 >= 0.5
+        assert_eq!(probs, before, "XTC with <2 above-threshold is a no-op");
+    }
+
+    #[test]
+    fn xtc_probability_gate_can_skip() {
+        // probability 0 would be gated out by the caller; here we call the
+        // function directly with a tiny probability and a seed whose first
+        // draw lands above it, so XTC must leave probs untouched.
+        let mut probs = vec![0.5f32, 0.3, 0.15, 0.05];
+        let before = probs.clone();
+        // Find a seed whose first next_f32() exceeds 0.01.
+        let mut rng = Rng::from_seed(12345);
+        apply_xtc(&mut probs, 0.01, 0.1, &mut rng);
+        // Overwhelmingly likely the draw exceeded 0.01 → no change.
+        assert_eq!(probs, before, "coin-flip above probability leaves probs untouched");
+    }
+
+    // ----- dynatemp --------------------------------------------------------
+
+    #[test]
+    fn dynatemp_scales_temperature_with_entropy() {
+        let (base, range, exp) = (1.0f32, 0.5f32, 1.0f32);
+        // Flat logits → uniform softmax → maximum entropy → hottest temp.
+        let flat = vec![0.0f32; 64];
+        let t_flat = dynatemp_effective_temp(&flat, base, range, exp);
+        assert!(
+            (t_flat - (base + range)).abs() < 1e-3,
+            "flat distribution → max temp, got {t_flat}"
+        );
+        // Sharply peaked → near-zero entropy → coolest temp.
+        let mut peaked = vec![0.0f32; 64];
+        peaked[0] = 50.0;
+        let t_peak = dynatemp_effective_temp(&peaked, base, range, exp);
+        assert!(
+            (t_peak - (base - range)).abs() < 1e-2,
+            "peaked distribution → min temp, got {t_peak}"
+        );
+        assert!(t_peak < t_flat, "peaked temp must be below flat temp");
+    }
+
+    #[test]
+    fn dynatemp_range_zero_returns_base() {
+        let logits = synth_logits(7, 64);
+        let t = dynatemp_effective_temp(&logits, 0.8, 0.0, 1.0);
+        assert!((t - 0.8).abs() < 1e-6, "range 0 → base temp, got {t}");
+    }
+
+    // ----- seed determinism across all P13 samplers ------------------------
+
+    #[test]
+    fn p13_all_samplers_seed_reproducible() {
+        let params = SamplingParams {
+            seed: 0xFEED_FACE,
+            temperature: 0.8,
+            top_p: 0.95,
+            top_k: 40,
+            min_p: 0.02,
+            logit_bias: vec![(5, 1.5), (9, -2.0)],
+            dry_multiplier: 1.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            xtc_probability: 0.5,
+            xtc_threshold: 0.1,
+            dynatemp_range: 0.3,
+            dynatemp_exponent: 1.0,
+            ..SamplingParams::default()
+        };
+        let mut s1 = Sampler::new(params.clone());
+        let mut s2 = Sampler::new(params);
+        s1.gpu_enabled = false;
+        s2.gpu_enabled = false;
+        let recent: Vec<u32> = vec![5, 9, 5, 9, 12];
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        for step in 0..24u32 {
+            let base = synth_logits(step + 1, 128);
+            a.push(s1.sample(&mut base.clone(), &recent));
+            b.push(s2.sample(&mut base.clone(), &recent));
+        }
+        assert_eq!(a, b, "all P13 samplers enabled must stay seed-deterministic");
     }
 
     /// F1 scaffold: GPU fused temp+softmax kernel. Same dispatch

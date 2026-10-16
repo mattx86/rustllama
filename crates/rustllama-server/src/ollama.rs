@@ -976,6 +976,21 @@ pub struct OllamaOptions {
     pub mirostat: Option<u32>,
     pub mirostat_tau: Option<f32>,
     pub mirostat_eta: Option<f32>,
+    /// min-p sampling (standard Ollama option). `0` disables.
+    pub min_p: Option<f32>,
+    /// DRY sequence-repetition penalty (llama.cpp / Ollama option set).
+    /// `0` (default) disables.
+    pub dry_multiplier: Option<f32>,
+    pub dry_base: Option<f32>,
+    pub dry_allowed_length: Option<u32>,
+    /// DRY sequence breakers as TOKEN IDS (this server takes ids).
+    pub dry_sequence_breakers: Option<Vec<u32>>,
+    /// XTC (eXclude Top Choices) sampler. `0` probability disables.
+    pub xtc_probability: Option<f32>,
+    pub xtc_threshold: Option<f32>,
+    /// Dynamic-temperature (dynatemp). `0` range disables.
+    pub dynatemp_range: Option<f32>,
+    pub dynatemp_exponent: Option<f32>,
 }
 
 fn default_true() -> bool {
@@ -1926,6 +1941,33 @@ fn sampling_from_options(opts: Option<&OllamaOptions>) -> SamplingParams {
     if let Some(e) = o.mirostat_eta {
         s.mirostat_eta = e;
     }
+    if let Some(mp) = o.min_p {
+        s.min_p = mp;
+    }
+    if let Some(dm) = o.dry_multiplier {
+        s.dry_multiplier = dm;
+    }
+    if let Some(db) = o.dry_base {
+        s.dry_base = db;
+    }
+    if let Some(dal) = o.dry_allowed_length {
+        s.dry_allowed_length = dal;
+    }
+    if let Some(dsb) = o.dry_sequence_breakers.as_ref() {
+        s.dry_sequence_breakers = dsb.clone();
+    }
+    if let Some(xp) = o.xtc_probability {
+        s.xtc_probability = xp;
+    }
+    if let Some(xt) = o.xtc_threshold {
+        s.xtc_threshold = xt;
+    }
+    if let Some(dr) = o.dynatemp_range {
+        s.dynatemp_range = dr;
+    }
+    if let Some(de) = o.dynatemp_exponent {
+        s.dynatemp_exponent = de;
+    }
     s
 }
 
@@ -2320,6 +2362,33 @@ mod tests {
         assert_eq!(sampling.mirostat, 2);
         assert!((sampling.mirostat_tau - 4.5).abs() < 1e-6);
         assert!((sampling.mirostat_eta - 0.15).abs() < 1e-6);
+    }
+
+    #[test]
+    fn p13_samplers_thread_into_sampling_params_for_ollama() {
+        let value = serde_json::json!({
+            "min_p": 0.04,
+            "dry_multiplier": 0.9,
+            "dry_base": 1.6,
+            "dry_allowed_length": 4,
+            "dry_sequence_breakers": [8, 9],
+            "xtc_probability": 0.6,
+            "xtc_threshold": 0.12,
+            "dynatemp_range": 0.5,
+            "dynatemp_exponent": 1.1,
+        });
+        let opts: OllamaOptions =
+            serde_json::from_value(value).expect("OllamaOptions parses");
+        let s = sampling_from_options(Some(&opts));
+        assert!((s.min_p - 0.04).abs() < 1e-6);
+        assert!((s.dry_multiplier - 0.9).abs() < 1e-6);
+        assert!((s.dry_base - 1.6).abs() < 1e-6);
+        assert_eq!(s.dry_allowed_length, 4);
+        assert_eq!(s.dry_sequence_breakers, vec![8, 9]);
+        assert!((s.xtc_probability - 0.6).abs() < 1e-6);
+        assert!((s.xtc_threshold - 0.12).abs() < 1e-6);
+        assert!((s.dynatemp_range - 0.5).abs() < 1e-6);
+        assert!((s.dynatemp_exponent - 1.1).abs() < 1e-6);
     }
 
     #[test]

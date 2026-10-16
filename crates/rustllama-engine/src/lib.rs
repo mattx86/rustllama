@@ -159,6 +159,70 @@ pub struct SamplingParams {
     /// the trajectory. Typical: 0.1. Ignored when `mirostat == 0`.
     #[serde(default = "default_mirostat_eta")]
     pub mirostat_eta: f32,
+    /// Minimum-probability sampling (min-p). After the temperature
+    /// softmax, keep only tokens whose probability is at least
+    /// `min_p * p_max` (where `p_max` is the most-probable token's
+    /// probability), zero the rest, renormalize. Applied BEFORE
+    /// top-k / top-p — the canonical min-p position in llama.cpp's
+    /// default sampler chain. `0.0` (default) disables. Typical 0.05.
+    #[serde(default)]
+    pub min_p: f32,
+    /// OpenAI `logit_bias`: an additive bias applied to each listed
+    /// token's LOGIT *first*, before any penalty / temperature /
+    /// filtering. `(token_id, bias)` pairs; bias is in `[-100, 100]`
+    /// per the OpenAI contract (a large negative value effectively
+    /// bans the token; a large positive one forces it). Empty
+    /// (default) disables.
+    #[serde(default)]
+    pub logit_bias: Vec<(u32, f32)>,
+    /// DRY ("Don't Repeat Yourself") sequence-repetition penalty
+    /// multiplier (p-e-w / llama.cpp `llama_sampler_dry`). `0.0`
+    /// (default) disables. When > 0, a token that would extend a
+    /// repeated n-gram from the context is penalized in logit space
+    /// by `dry_multiplier * dry_base^(match_len - dry_allowed_length)`.
+    /// See [`sampling`]'s `apply_dry`.
+    #[serde(default)]
+    pub dry_multiplier: f32,
+    /// DRY penalty base — exponential growth per extra repeated token.
+    /// Ignored when `dry_multiplier == 0`. Typical 1.75.
+    #[serde(default = "default_dry_base")]
+    pub dry_base: f32,
+    /// DRY: repeats whose matched length is below this are not
+    /// penalized. Ignored when `dry_multiplier == 0`. Typical 2.
+    #[serde(default = "default_dry_allowed_length")]
+    pub dry_allowed_length: u32,
+    /// DRY sequence breakers: token ids at which repetition matching
+    /// resets (e.g. newline / punctuation). A penalized repeat may not
+    /// span one of these. Empty (default) = no breakers (match across
+    /// the whole context). Ignored when `dry_multiplier == 0`.
+    #[serde(default)]
+    pub dry_sequence_breakers: Vec<u32>,
+    /// XTC ("eXclude Top Choices") probability (p-e-w / llama.cpp
+    /// `llama_sampler_xtc`). With this probability *per token*, remove
+    /// all but the least-probable of the tokens whose probability is
+    /// at least `xtc_threshold` — dropping the most-probable choices to
+    /// keep generation diverse. `0.0` (default) disables **and consumes
+    /// no RNG**, so seed streams stay byte-identical to the pre-XTC
+    /// sampler. Typical 0.5.
+    #[serde(default)]
+    pub xtc_probability: f32,
+    /// XTC threshold: only tokens with probability ≥ this are eligible
+    /// for XTC removal. Ignored when `xtc_probability == 0`. Typical 0.1.
+    #[serde(default = "default_xtc_threshold")]
+    pub xtc_threshold: f32,
+    /// Dynamic-temperature range (dynatemp — entropy-scaled temperature,
+    /// llama.cpp `temp_ext`). When > 0, the effective temperature varies
+    /// per token within `[temperature - range, temperature + range]` by
+    /// the distribution's normalized entropy (flat/uncertain → hotter,
+    /// peaked/confident → cooler). `0.0` (default) disables — the
+    /// temperature step is byte-identical to the fixed-temperature path.
+    #[serde(default)]
+    pub dynatemp_range: f32,
+    /// Dynatemp exponent shaping the normalized-entropy → temperature
+    /// map (`norm_entropy^exponent`). Ignored when `dynatemp_range == 0`.
+    /// Typical 1.0 (linear).
+    #[serde(default = "default_dynatemp_exponent")]
+    pub dynatemp_exponent: f32,
 }
 
 fn default_mirostat_tau() -> f32 {
@@ -170,6 +234,22 @@ fn default_mirostat_eta() -> f32 {
 }
 
 fn default_typical_p() -> f32 {
+    1.0
+}
+
+fn default_dry_base() -> f32 {
+    1.75
+}
+
+fn default_dry_allowed_length() -> u32 {
+    2
+}
+
+fn default_xtc_threshold() -> f32 {
+    0.1
+}
+
+fn default_dynatemp_exponent() -> f32 {
     1.0
 }
 
@@ -235,6 +315,16 @@ impl Default for SamplingParams {
             mirostat: 0,
             mirostat_tau: default_mirostat_tau(),
             mirostat_eta: default_mirostat_eta(),
+            min_p: 0.0,
+            logit_bias: Vec::new(),
+            dry_multiplier: 0.0,
+            dry_base: default_dry_base(),
+            dry_allowed_length: default_dry_allowed_length(),
+            dry_sequence_breakers: Vec::new(),
+            xtc_probability: 0.0,
+            xtc_threshold: default_xtc_threshold(),
+            dynatemp_range: 0.0,
+            dynatemp_exponent: default_dynatemp_exponent(),
         }
     }
 }
