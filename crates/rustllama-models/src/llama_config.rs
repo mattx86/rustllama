@@ -45,6 +45,19 @@ pub struct LlamaConfig {
     /// inference attempt so users get a clear "MoE not yet
     /// implemented" message rather than a cryptic shape mismatch.
     pub moe: Option<MoeConfig>,
+    /// Multi-head Latent Attention (MLA) configuration for
+    /// DeepSeek-V2/V3 (`deepseek2` arch). `Some` when the GGUF declares
+    /// `{arch}.attention.kv_lora_rank` (the compressed-KV latent width)
+    /// — the signal that this model replaces plain GQA attention with
+    /// the low-rank Q/KV projections + decoupled RoPE + compressed-latent
+    /// KV cache described in the DeepSeek-V2 paper. `None` on every
+    /// non-MLA model. The loader uses the presence of this field to
+    /// bind the `attn_kv_a_mqa`/`attn_kv_b`/`attn_q_a`/… tensor set into
+    /// an `MlaBlock` and route the forward through `forward_one_mla`
+    /// instead of the dense/GQA path (which would die at the missing
+    /// `attn_k.weight`). The MoE FFN side (when `moe` is also `Some`)
+    /// is unchanged — DeepSeek-V2/V3 are MLA attention + MoE FFN.
+    pub mla: Option<MlaConfig>,
     /// Hybrid transformer+SSM (Mamba-style) configuration.
     /// `Some` when the GGUF declares `{arch}.full_attention_interval`
     /// AND the `{arch}.ssm.*` family of metadata keys. Models that
@@ -295,6 +308,59 @@ pub struct MoeConfig {
     pub topk_group: u32,
 }
 
+/// Multi-head Latent Attention (MLA) hyperparameters (DeepSeek-V2/V3).
+///
+/// MLA factors attention through two low-rank latents (public DeepSeek-V2
+/// paper + the GGUF `deepseek2` tensor layout):
+///   - **Q**: `hidden → attn_q_a → RMSNorm → attn_q_b` to per-head
+///     `[qk_nope_head_dim + qk_rope_head_dim]` (or a single direct
+///     `attn_q` when `q_lora_rank` is absent — DeepSeek-V2-Lite).
+///   - **KV**: `hidden → attn_kv_a_mqa` splits into a compressed latent
+///     `[kv_lora_rank]` (RMSNorm'd by `attn_kv_a_norm`) + a single
+///     decoupled-RoPE key `[qk_rope_head_dim]` shared across heads
+///     (MQA-style). `attn_kv_b` up-projects the latent to the per-head
+///     non-rotary K and V `[qk_nope_head_dim + v_head_dim]`.
+///
+/// Only the `qk_rope_head_dim` slice of Q and the single decoupled key
+/// are rotated (decoupled RoPE); the `qk_nope` slice is not. The KV
+/// cache stores ONLY the compressed latent + the decoupled rope key per
+/// token — the memory win.
+#[derive(Debug, Clone)]
+pub struct MlaConfig {
+    /// Low-rank Q compression rank (`{arch}.attention.q_lora_rank`).
+    /// `None` / 0 on small variants (DeepSeek-V2-Lite) that project Q
+    /// directly from the hidden state with a single `attn_q.weight`;
+    /// `Some(r)` on V2 / V3 which factor Q through
+    /// `attn_q_a` → `attn_q_a_norm` → `attn_q_b`.
+    pub q_lora_rank: Option<usize>,
+    /// Compressed KV latent width (`{arch}.attention.kv_lora_rank`). The
+    /// per-token KV cache stores THIS many f32 (+ the decoupled rope
+    /// key) instead of the full per-head K/V — the MLA memory win.
+    pub kv_lora_rank: usize,
+    /// Non-rotary per-head Q/K width. Read from `{arch}.attention.key_length`,
+    /// but DERIVED from the `attn_kv_b` output width when possible
+    /// (`out/n_heads − v_head_dim`), since some converters set
+    /// `key_length` to the COMBINED `nope + rope` width.
+    pub qk_nope_head_dim: usize,
+    /// Rotary (decoupled-RoPE) width — both the per-head Q rope slice and
+    /// the single shared decoupled-RoPE key (`{arch}.rope.dimension_count`).
+    /// Must be even (it is rotated).
+    pub qk_rope_head_dim: usize,
+    /// Per-head V width (= the attention-output per-head width),
+    /// `{arch}.attention.value_length`.
+    pub v_head_dim: usize,
+}
+
+impl MlaConfig {
+    /// Combined per-head Q/K width that the attention score runs over
+    /// (and whose reciprocal-sqrt is the default QK scale):
+    /// `qk_nope_head_dim + qk_rope_head_dim`.
+    #[inline]
+    pub fn qk_head_dim(&self) -> usize {
+        self.qk_nope_head_dim + self.qk_rope_head_dim
+    }
+}
+
 impl Default for MoeConfig {
     /// Mixtral / Qwen3-MoE routing: softmax + renormalize, no groups,
     /// scale 1.0. Non-GGUF construction sites (safetensors / Ollama) use
@@ -506,6 +572,57 @@ impl LlamaConfig {
             _ => None,
         };
 
+        // MLA detection (DeepSeek-V2/V3). The presence of
+        // `{arch}.attention.kv_lora_rank` (> 0) is the signal: a
+        // `deepseek2`-arch model with a compressed-KV latent uses MLA
+        // attention, which carries an entirely different tensor set
+        // (`attn_kv_a_mqa`/`attn_kv_b`/`attn_q_a`/…) than the GQA path.
+        let mla = match u32_optional(gguf, &key("attention.kv_lora_rank")) {
+            Some(kvr) if kvr > 0 => {
+                let kv_lora_rank = kvr as usize;
+                // The rotary width is the single decoupled-RoPE key / Q-rope
+                // slice (`rope.dimension_count`); fall back to the dense
+                // `head_dim` if the key is absent.
+                let qk_rope_head_dim = u32_optional(gguf, &key("rope.dimension_count"))
+                    .map(|v| v as usize)
+                    .unwrap_or(head_dim);
+                // Per-head V width. `value_length` on real deepseek2 GGUFs.
+                let v_head_dim = u32_optional(gguf, &key("attention.value_length"))
+                    .map(|v| v as usize)
+                    .unwrap_or(head_dim);
+                // qk_nope_head_dim: prefer DERIVING it from the actual
+                // `attn_kv_b` output width — `out = n_heads * (qk_nope +
+                // v_head_dim)` — since that is authoritative and robust to
+                // the `key_length` convention (some converters store the
+                // COMBINED nope+rope width there). Fall back to the
+                // `key_length` metadata, then the dense head_dim.
+                let qk_nope_from_tensor = gguf
+                    .tensor("blk.0.attn_kv_b.weight")
+                    .and_then(|t| t.dims.get(1).copied())
+                    .map(|out| out as usize)
+                    .filter(|&out| n_heads > 0 && out % n_heads == 0)
+                    .map(|out| out / n_heads)
+                    .filter(|&per_head| per_head > v_head_dim)
+                    .map(|per_head| per_head - v_head_dim);
+                let qk_nope_head_dim = qk_nope_from_tensor
+                    .or_else(|| u32_optional(gguf, &key("attention.key_length")).map(|v| v as usize))
+                    .unwrap_or(head_dim);
+                // q_lora_rank is optional: absent / 0 ⇒ Q is a direct
+                // `attn_q.weight` projection (DeepSeek-V2-Lite).
+                let q_lora_rank = u32_optional(gguf, &key("attention.q_lora_rank"))
+                    .filter(|&r| r > 0)
+                    .map(|r| r as usize);
+                Some(MlaConfig {
+                    q_lora_rank,
+                    kv_lora_rank,
+                    qk_nope_head_dim,
+                    qk_rope_head_dim,
+                    v_head_dim,
+                })
+            }
+            _ => None,
+        };
+
         let hadamard = parse_hadamard(gguf)?;
 
         // RoPE context-extension scaling (`{arch}.rope.scaling.*`). Absent on
@@ -543,6 +660,7 @@ impl LlamaConfig {
             tie_word_embeddings,
             n_mtp_heads,
             moe,
+            mla,
             hybrid,
             hadamard,
             rope_scaling,
@@ -558,10 +676,10 @@ impl LlamaConfig {
         // model bugs can be quickly localized to a wrong-loaded constant.
         eprintln!(
             "[CFG DUMP] arch={} n_layers={} d_model={} n_heads={} n_kv_heads={} \
-             head_dim={} rope_dim={} rope_theta={} d_ff={} vocab={} moe={:?} hybrid={:?}",
+             head_dim={} rope_dim={} rope_theta={} d_ff={} vocab={} moe={:?} mla={:?} hybrid={:?}",
             cfg.arch, cfg.n_layers, cfg.d_model, cfg.n_heads, cfg.n_kv_heads,
             cfg.head_dim, cfg.rope_dim, cfg.rope_theta, cfg.d_ff, cfg.vocab_size,
-            cfg.moe, cfg.hybrid,
+            cfg.moe, cfg.mla, cfg.hybrid,
         );
         Ok(cfg)
     }

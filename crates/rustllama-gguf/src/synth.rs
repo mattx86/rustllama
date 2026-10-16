@@ -264,6 +264,60 @@ pub struct SynthMoe {
     pub n_experts_shared: u32,
 }
 
+/// Hyperparameters for a synthetic DeepSeek-V2/V3-style MLA model
+/// (`deepseek2` arch). Produces the full Multi-head Latent Attention
+/// tensor set — low-rank Q (optional), compressed-latent KV, decoupled
+/// RoPE key, up-projection — plus a per-layer FFN (dense for the first
+/// `n_dense_layers`, MoE after, mirroring DeepSeek's `first_k_dense_replace`).
+/// Small enough to run the REAL `forward_one_mla` in a unit test.
+#[derive(Debug, Clone, Copy)]
+pub struct SynthMla {
+    pub n_layers: u32,
+    pub n_heads: u32,
+    pub d_model: u32,
+    /// Dense / shared-expert FFN width.
+    pub d_ff: u32,
+    pub vocab: u32,
+    pub ctx: u32,
+    pub seed: u64,
+    /// `Some(r)` emits the low-rank Q path (`attn_q_a`→norm→`attn_q_b`);
+    /// `None` emits a single direct `attn_q` (DeepSeek-V2-Lite shape).
+    pub q_lora_rank: Option<u32>,
+    pub kv_lora_rank: u32,
+    pub qk_nope_head_dim: u32,
+    /// Rotary width — must be even (it is RoPE-rotated).
+    pub qk_rope_head_dim: u32,
+    pub v_head_dim: u32,
+    /// `Some` ⇒ MoE FFN on the layers at/after `n_dense_layers`; `None`
+    /// ⇒ every layer is a dense SwiGLU FFN.
+    pub moe: Option<SynthMoe>,
+    /// Number of leading layers that use a DENSE FFN even when `moe` is
+    /// `Some` (DeepSeek `first_k_dense_replace`). Ignored when `moe` is
+    /// `None` (all dense).
+    pub n_dense_layers: u32,
+}
+
+impl Default for SynthMla {
+    fn default() -> Self {
+        Self {
+            n_layers: 2,
+            n_heads: 2,
+            d_model: 32,
+            d_ff: 64,
+            vocab: 32,
+            ctx: 64,
+            seed: 0xD339_5EE2,
+            q_lora_rank: Some(16),
+            kv_lora_rank: 16,
+            qk_nope_head_dim: 8,
+            qk_rope_head_dim: 8,
+            v_head_dim: 8,
+            moe: None,
+            n_dense_layers: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SynthHybrid {
     pub full_attention_interval: u32,
@@ -740,6 +794,229 @@ pub fn write_synthetic_llama_gguf(path: &Path, params: &SynthLlama) {
         }
     }
     file.flush().unwrap();
+}
+
+/// Write a synthetic DeepSeek-V2/V3-style MLA GGUF (`deepseek2` arch) to
+/// `path`. Emits the full Multi-head Latent Attention tensor set so a
+/// loadable fixture drives the REAL `forward_one_mla`:
+///   - per layer: `attn_norm`, the Q path (`attn_q_a`+`attn_q_a_norm`+
+///     `attn_q_b` when `q_lora_rank` is `Some`, else a single `attn_q`),
+///     the KV path (`attn_kv_a_mqa`+`attn_kv_a_norm`+`attn_kv_b`),
+///     `attn_output`, and a dense or MoE FFN.
+/// GGUF dims are column-major `[in, out]` — the same convention the
+/// Llama writer uses — so the loader's `out_dim`/`in_dim` resolve
+/// correctly. Weight values are deterministic small RNG (coherence isn't
+/// the point; LOAD + finite logits + naive≡absorbed equality are).
+pub fn write_synthetic_deepseek_mla_gguf(path: &Path, params: &SynthMla) {
+    let SynthMla {
+        n_layers,
+        n_heads,
+        d_model,
+        d_ff,
+        vocab,
+        ctx,
+        seed,
+        q_lora_rank,
+        kv_lora_rank,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        v_head_dim,
+        moe,
+        n_dense_layers,
+    } = *params;
+
+    assert!(qk_rope_head_dim % 2 == 0, "qk_rope_head_dim must be even (it is RoPE-rotated)");
+    let qk_head_dim = qk_nope_head_dim + qk_rope_head_dim;
+    let q_out = n_heads * qk_head_dim; // per-head [nope | rope]
+    let kv_a_out = kv_lora_rank + qk_rope_head_dim; // latent | decoupled rope key
+    let kv_b_out = n_heads * (qk_nope_head_dim + v_head_dim); // per-head [nope-K | V]
+    let o_in = n_heads * v_head_dim;
+
+    // All weights F16, norms F32 — matches real-world GGUFs.
+    let wt = |name: &str, dims: Vec<u64>, n: usize, tseed: u64| -> TensorSpec {
+        let f32s = random_f32(n, tseed);
+        let f16s = f32s.into_iter().map(f16::from_f32).collect();
+        TensorSpec::f16(name, dims, f16s)
+    };
+    let norm = |name: &str, n: usize, tseed: u64| -> TensorSpec {
+        // Norm weights near 1.0 so RMSNorm behaves like a real model's.
+        let v: Vec<f32> = random_f32(n, tseed).into_iter().map(|x| 1.0 + x).collect();
+        TensorSpec::f32(name, vec![n as u64], v)
+    };
+
+    let mut m = MetaBuilder::new();
+    m.string("general.architecture", "deepseek2");
+    m.u32("deepseek2.block_count", n_layers);
+    m.u32("deepseek2.embedding_length", d_model);
+    m.u32("deepseek2.feed_forward_length", d_ff);
+    m.u32("deepseek2.attention.head_count", n_heads);
+    m.u32("deepseek2.attention.head_count_kv", n_heads);
+    m.f32("deepseek2.attention.layer_norm_rms_epsilon", 1e-5);
+    // MLA dims. `key_length` = qk_nope_head_dim (the loader also derives
+    // it from the attn_kv_b tensor, so either reading is consistent).
+    m.u32("deepseek2.attention.key_length", qk_nope_head_dim);
+    m.u32("deepseek2.attention.value_length", v_head_dim);
+    m.u32("deepseek2.rope.dimension_count", qk_rope_head_dim);
+    m.f32("deepseek2.rope.freq_base", 10000.0);
+    m.u32("deepseek2.context_length", ctx);
+    m.u32("deepseek2.attention.kv_lora_rank", kv_lora_rank);
+    if let Some(r) = q_lora_rank {
+        m.u32("deepseek2.attention.q_lora_rank", r);
+    }
+    if let Some(mc) = moe {
+        m.u32("deepseek2.expert_count", mc.n_experts);
+        m.u32("deepseek2.expert_used_count", mc.n_experts_used);
+        m.u32("deepseek2.expert_feed_forward_length", d_ff);
+        if mc.n_experts_shared > 0 {
+            m.u32("deepseek2.expert_shared_count", mc.n_experts_shared);
+        }
+    }
+    let vocab_tokens: Vec<String> = (0..vocab).map(|i| format!("<tok_{i}>")).collect();
+    m.array_strings("tokenizer.ggml.tokens", &vocab_tokens);
+    m.string("tokenizer.ggml.model", "gpt2");
+    m.array_strings("tokenizer.ggml.merges", &[]);
+    m.string(
+        "tokenizer.ggml.chat_template",
+        "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>\n'}}{% endfor %}{% if add_generation_prompt %}{{'<|im_start|>assistant\n'}}{% endif %}",
+    );
+    m.u32("tokenizer.ggml.bos_token_id", 1);
+    m.u32("tokenizer.ggml.eos_token_id", 2);
+
+    let mut tensors = Vec::new();
+    tensors.push(wt(
+        "token_embd.weight",
+        vec![d_model as u64, vocab as u64],
+        (vocab * d_model) as usize,
+        seed.wrapping_add(1),
+    ));
+
+    for i in 0..n_layers {
+        let prefix = format!("blk.{i}");
+        let sd = seed.wrapping_add(10_000 + (i as u64) * 100);
+        tensors.push(norm(&format!("{prefix}.attn_norm.weight"), d_model as usize, sd));
+        // Q path.
+        match q_lora_rank {
+            Some(r) => {
+                tensors.push(wt(
+                    &format!("{prefix}.attn_q_a.weight"),
+                    vec![d_model as u64, r as u64],
+                    (d_model * r) as usize,
+                    sd.wrapping_add(1),
+                ));
+                tensors.push(norm(&format!("{prefix}.attn_q_a_norm.weight"), r as usize, sd.wrapping_add(2)));
+                tensors.push(wt(
+                    &format!("{prefix}.attn_q_b.weight"),
+                    vec![r as u64, q_out as u64],
+                    (r * q_out) as usize,
+                    sd.wrapping_add(3),
+                ));
+            }
+            None => {
+                tensors.push(wt(
+                    &format!("{prefix}.attn_q.weight"),
+                    vec![d_model as u64, q_out as u64],
+                    (d_model * q_out) as usize,
+                    sd.wrapping_add(1),
+                ));
+            }
+        }
+        // KV path.
+        tensors.push(wt(
+            &format!("{prefix}.attn_kv_a_mqa.weight"),
+            vec![d_model as u64, kv_a_out as u64],
+            (d_model * kv_a_out) as usize,
+            sd.wrapping_add(4),
+        ));
+        tensors.push(norm(&format!("{prefix}.attn_kv_a_norm.weight"), kv_lora_rank as usize, sd.wrapping_add(5)));
+        tensors.push(wt(
+            &format!("{prefix}.attn_kv_b.weight"),
+            vec![kv_lora_rank as u64, kv_b_out as u64],
+            (kv_lora_rank * kv_b_out) as usize,
+            sd.wrapping_add(6),
+        ));
+        tensors.push(wt(
+            &format!("{prefix}.attn_output.weight"),
+            vec![o_in as u64, d_model as u64],
+            (o_in * d_model) as usize,
+            sd.wrapping_add(7),
+        ));
+        // FFN. Dense for the first `n_dense_layers` (or all layers when
+        // `moe` is None); MoE after.
+        let is_dense = moe.is_none() || i < n_dense_layers;
+        tensors.push(norm(&format!("{prefix}.ffn_norm.weight"), d_model as usize, sd.wrapping_add(8)));
+        if is_dense {
+            tensors.push(wt(
+                &format!("{prefix}.ffn_gate.weight"),
+                vec![d_model as u64, d_ff as u64],
+                (d_model * d_ff) as usize,
+                sd.wrapping_add(9),
+            ));
+            tensors.push(wt(
+                &format!("{prefix}.ffn_up.weight"),
+                vec![d_model as u64, d_ff as u64],
+                (d_model * d_ff) as usize,
+                sd.wrapping_add(10),
+            ));
+            tensors.push(wt(
+                &format!("{prefix}.ffn_down.weight"),
+                vec![d_ff as u64, d_model as u64],
+                (d_ff * d_model) as usize,
+                sd.wrapping_add(11),
+            ));
+        } else {
+            let mc = moe.unwrap();
+            let n_e = mc.n_experts as u64;
+            tensors.push(wt(
+                &format!("{prefix}.ffn_gate_inp.weight"),
+                vec![d_model as u64, n_e],
+                (d_model * mc.n_experts) as usize,
+                sd.wrapping_add(9),
+            ));
+            tensors.push(wt(
+                &format!("{prefix}.ffn_gate_exps.weight"),
+                vec![d_model as u64, d_ff as u64, n_e],
+                (d_model * d_ff * mc.n_experts) as usize,
+                sd.wrapping_add(10),
+            ));
+            tensors.push(wt(
+                &format!("{prefix}.ffn_up_exps.weight"),
+                vec![d_model as u64, d_ff as u64, n_e],
+                (d_model * d_ff * mc.n_experts) as usize,
+                sd.wrapping_add(11),
+            ));
+            tensors.push(wt(
+                &format!("{prefix}.ffn_down_exps.weight"),
+                vec![d_ff as u64, d_model as u64, n_e],
+                (d_ff * d_model * mc.n_experts) as usize,
+                sd.wrapping_add(12),
+            ));
+            if mc.n_experts_shared > 0 {
+                tensors.push(wt(
+                    &format!("{prefix}.ffn_gate_shexp.weight"),
+                    vec![d_model as u64, d_ff as u64],
+                    (d_model * d_ff) as usize,
+                    sd.wrapping_add(13),
+                ));
+                tensors.push(wt(
+                    &format!("{prefix}.ffn_up_shexp.weight"),
+                    vec![d_model as u64, d_ff as u64],
+                    (d_model * d_ff) as usize,
+                    sd.wrapping_add(14),
+                ));
+                tensors.push(wt(
+                    &format!("{prefix}.ffn_down_shexp.weight"),
+                    vec![d_ff as u64, d_model as u64],
+                    (d_ff * d_model) as usize,
+                    sd.wrapping_add(15),
+                ));
+            }
+        }
+    }
+
+    tensors.push(norm("output_norm.weight", d_model as usize, seed.wrapping_add(99999)));
+    // output.weight omitted → tied to token_embd.
+
+    write_gguf_file(path, m, &tensors);
 }
 
 /// Hyperparameters for the synthetic BERT-family embedding model.
@@ -1532,6 +1809,50 @@ pub fn write_synthetic_qwen3vl_mmproj_gguf(path: &Path, deepstack_true: bool) {
     file.write_all(&info.buf).unwrap();
     file.write_all(&vec![0u8; pad_before as usize]).unwrap();
     for t in &tensors {
+        file.write_all(&t.bytes).unwrap();
+        let pad = (alignment - (t.bytes.len() as u64 % alignment)) % alignment;
+        if pad > 0 {
+            file.write_all(&vec![0u8; pad as usize]).unwrap();
+        }
+    }
+    file.flush().unwrap();
+}
+
+/// Assemble + write a GGUF file from built metadata + tensor specs —
+/// the same header/alignment/data layout the Llama / BERT / mmproj
+/// synths inline. Factored out for the MLA writer.
+fn write_gguf_file(path: &Path, m: MetaBuilder, tensors: &[TensorSpec]) {
+    let mut prefix = Writer::new();
+    prefix.buf.extend_from_slice(GGUF_MAGIC);
+    prefix.u32(GGUF_VERSION);
+    prefix.u64(tensors.len() as u64);
+    prefix.u64(m.n as u64);
+    let mut header_kv = m.w.buf;
+    prefix.buf.append(&mut header_kv);
+
+    let alignment: u64 = 32;
+    let mut info = Writer::new();
+    let mut rolling: u64 = 0;
+    for t in tensors {
+        info.str_(&t.name);
+        info.u32(t.dims.len() as u32);
+        for d in &t.dims {
+            info.u64(*d);
+        }
+        info.u32(t.dtype);
+        info.u64(rolling);
+        let pad = (alignment - (t.bytes.len() as u64 % alignment)) % alignment;
+        rolling += t.bytes.len() as u64 + pad;
+    }
+
+    let pre_data_len = (prefix.buf.len() + info.buf.len()) as u64;
+    let pad_before = (alignment - (pre_data_len % alignment)) % alignment;
+
+    let mut file = std::fs::File::create(path).expect("create");
+    file.write_all(&prefix.buf).unwrap();
+    file.write_all(&info.buf).unwrap();
+    file.write_all(&vec![0u8; pad_before as usize]).unwrap();
+    for t in tensors {
         file.write_all(&t.bytes).unwrap();
         let pad = (alignment - (t.bytes.len() as u64 % alignment)) % alignment;
         if pad > 0 {

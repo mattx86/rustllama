@@ -459,6 +459,178 @@ pub(crate) fn dense_ffn_chunk_into(
     matvec_tensor_batched_dispatch(w_down, ff_in, out_rows, d, d_ff, n_tokens);
 }
 
+/// Numerically-stable in-place softmax over `x` (subtract max, exp,
+/// normalize). Used by the MLA attention paths.
+#[inline]
+fn mla_softmax_inplace(x: &mut [f32]) {
+    if x.is_empty() {
+        return;
+    }
+    let mut m = f32::NEG_INFINITY;
+    for &v in x.iter() {
+        if v > m {
+            m = v;
+        }
+    }
+    let mut sum = 0.0f32;
+    for v in x.iter_mut() {
+        *v = (*v - m).exp();
+        sum += *v;
+    }
+    let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+    for v in x.iter_mut() {
+        *v *= inv;
+    }
+}
+
+/// M1 — ABSORBED MLA attention for one query position (DeepSeek-V2/V3).
+///
+/// Folds `attn_kv_b` into the per-head Q and output projections so the
+/// score runs against the stored `[kv_lora_rank]` latent directly, never
+/// materializing per-head K/V:
+///   - nope score `q_nope · k_nope[p]` = `q_nope · (W_nope·c[p])`
+///     = `(W_nopeᵀ·q_nope) · c[p]` = `q_abs · c[p]`
+///   - output `Σ_p a[p]·v[p]` = `Σ_p a[p]·(W_v·c[p])` = `W_v·(Σ_p a[p]·c[p])`
+///     = `W_v · c_bar`
+///
+/// `w_kv_b_f32` is the dequanted `attn_kv_b` laid out row-major
+/// `[n_heads·(qk_nope+v_hd), kv_lora_rank]` (flat `o·kvr + k`). `q_all` is
+/// the per-head `[nope | rope]` query (rope slice already rotated).
+#[allow(clippy::too_many_arguments)]
+fn mla_attend_absorbed(
+    w_kv_b_f32: &[f32],
+    q_all: &[f32],
+    latent: &[f32],
+    rope_key: &[f32],
+    attn_out: &mut [f32],
+    n_heads: usize,
+    qk_nope: usize,
+    qk_rope: usize,
+    v_hd: usize,
+    kvr: usize,
+    kv_b_per_head: usize,
+    kv_len: usize,
+    scale: f32,
+) {
+    let qk = qk_nope + qk_rope;
+    let mut q_abs = vec![0.0f32; kvr];
+    let mut c_bar = vec![0.0f32; kvr];
+    let mut scores = vec![0.0f32; kv_len];
+    for h in 0..n_heads {
+        let q_nope = &q_all[h * qk..h * qk + qk_nope];
+        let q_rope = &q_all[h * qk + qk_nope..(h + 1) * qk];
+        // Fold q into the latent basis: q_abs[k] = Σ_n W_nope[h][n][k]·q_nope[n].
+        for v in q_abs.iter_mut() {
+            *v = 0.0;
+        }
+        for (n, &qn) in q_nope.iter().enumerate() {
+            let base = (h * kv_b_per_head + n) * kvr;
+            let wrow = &w_kv_b_f32[base..base + kvr];
+            for (acc, &w) in q_abs.iter_mut().zip(wrow.iter()) {
+                *acc += w * qn;
+            }
+        }
+        // Scores against each cached latent + decoupled rope key.
+        for p in 0..kv_len {
+            let c = &latent[p * kvr..p * kvr + kvr];
+            let kr = &rope_key[p * qk_rope..p * qk_rope + qk_rope];
+            let mut s = 0.0f32;
+            for (a, b) in q_abs.iter().zip(c.iter()) {
+                s += a * b;
+            }
+            for (a, b) in q_rope.iter().zip(kr.iter()) {
+                s += a * b;
+            }
+            scores[p] = s * scale;
+        }
+        mla_softmax_inplace(&mut scores[..kv_len]);
+        // c_bar = Σ_p a[p]·latent[p].
+        for v in c_bar.iter_mut() {
+            *v = 0.0;
+        }
+        for p in 0..kv_len {
+            let a = scores[p];
+            let c = &latent[p * kvr..p * kvr + kvr];
+            for (acc, &cv) in c_bar.iter_mut().zip(c.iter()) {
+                *acc += a * cv;
+            }
+        }
+        // out[h][vd] = W_v[h][vd] · c_bar.
+        for vd in 0..v_hd {
+            let base = (h * kv_b_per_head + qk_nope + vd) * kvr;
+            let wrow = &w_kv_b_f32[base..base + kvr];
+            let mut acc = 0.0f32;
+            for (&w, &cb) in wrow.iter().zip(c_bar.iter()) {
+                acc += w * cb;
+            }
+            attn_out[h * v_hd + vd] = acc;
+        }
+    }
+}
+
+/// M1 — NAIVE MLA attention for one query position. Materializes per-head
+/// K/V from the stored latent via the REAL `attn_kv_b` matvec, then runs
+/// standard attention. Mathematically identical to [`mla_attend_absorbed`]
+/// — the parity anchor that proves the absorbed weight-fold is correct.
+#[allow(clippy::too_many_arguments)]
+fn mla_attend_naive(
+    block: &MlaBlockWeights,
+    q_all: &[f32],
+    latent: &[f32],
+    rope_key: &[f32],
+    attn_out: &mut [f32],
+    n_heads: usize,
+    qk_nope: usize,
+    qk_rope: usize,
+    v_hd: usize,
+    kvr: usize,
+    kv_b_per_head: usize,
+    kv_len: usize,
+    scale: f32,
+) {
+    let qk = qk_nope + qk_rope;
+    let kv_b_out = n_heads * kv_b_per_head;
+    // Materialize [nope-K | V] per head per cached position from the latent.
+    let mut kvb_all = vec![0.0f32; kv_len * kv_b_out];
+    for p in 0..kv_len {
+        let c = &latent[p * kvr..p * kvr + kvr];
+        matvec_tensor_dispatch(
+            &block.w_kv_b,
+            c,
+            &mut kvb_all[p * kv_b_out..(p + 1) * kv_b_out],
+            kv_b_out,
+            kvr,
+        );
+    }
+    let mut scores = vec![0.0f32; kv_len];
+    for h in 0..n_heads {
+        let q_nope = &q_all[h * qk..h * qk + qk_nope];
+        let q_rope = &q_all[h * qk + qk_nope..(h + 1) * qk];
+        for p in 0..kv_len {
+            let off = p * kv_b_out + h * kv_b_per_head;
+            let k_nope = &kvb_all[off..off + qk_nope];
+            let kr = &rope_key[p * qk_rope..p * qk_rope + qk_rope];
+            let mut s = 0.0f32;
+            for (a, b) in q_nope.iter().zip(k_nope.iter()) {
+                s += a * b;
+            }
+            for (a, b) in q_rope.iter().zip(kr.iter()) {
+                s += a * b;
+            }
+            scores[p] = s * scale;
+        }
+        mla_softmax_inplace(&mut scores[..kv_len]);
+        for vd in 0..v_hd {
+            let mut acc = 0.0f32;
+            for p in 0..kv_len {
+                let vval = kvb_all[p * kv_b_out + h * kv_b_per_head + qk_nope + vd];
+                acc += scores[p] * vval;
+            }
+            attn_out[h * v_hd + vd] = acc;
+        }
+    }
+}
+
 // Cached hot-path env levers ("set before the first forward"). The
 // hybrid decode loop consulted several of these per layer per token;
 // `std::env::var` takes the process-wide env lock and allocates, so
@@ -1062,6 +1234,61 @@ pub enum HybridLayer {
     Ssm(SsmBlockWeights),
 }
 
+/// One Multi-head Latent Attention (MLA) transformer block
+/// (DeepSeek-V2/V3, `deepseek2` arch). Clean-room from the public
+/// DeepSeek-V2 paper + the GGUF tensor layout.
+///
+/// Attention tensors (GGUF `[in, out]` order):
+///   - **Q**: either the low-rank path `attn_q_a` `[d_model, q_lora_rank]`
+///     → RMSNorm `attn_q_a_norm` `[q_lora_rank]` → `attn_q_b`
+///     `[q_lora_rank, n_heads·qk_head_dim]`, OR a single direct `attn_q`
+///     `[d_model, n_heads·qk_head_dim]` (DeepSeek-V2-Lite). `qk_head_dim
+///     = qk_nope_head_dim + qk_rope_head_dim`.
+///   - **KV**: `attn_kv_a_mqa` `[d_model, kv_lora_rank + qk_rope_head_dim]`
+///     produces the compressed latent (first `kv_lora_rank`, RMSNorm'd by
+///     `attn_kv_a_norm`) + the single decoupled-RoPE key (last
+///     `qk_rope_head_dim`, shared across heads). `attn_kv_b`
+///     `[kv_lora_rank, n_heads·(qk_nope_head_dim + v_head_dim)]`
+///     up-projects the latent to per-head non-rotary K and V.
+///   - **Out**: `attn_output` `[n_heads·v_head_dim, d_model]`.
+///
+/// The FFN is a dense SwiGLU or a routed-expert MoE per layer (reusing
+/// [`HybridFfn`]) — DeepSeek stacks a few dense layers before the MoE
+/// layers (`first_k_dense_replace`).
+#[derive(Debug)]
+pub struct MlaBlockWeights {
+    pub attn_norm: Vec<f32>, // [d_model]
+    /// Low-rank Q down-projection `[d_model, q_lora_rank]`. `None` on the
+    /// direct-Q variant (V2-Lite), where `w_q` is `Some` instead.
+    pub w_q_a: Option<Tensor>,
+    /// RMSNorm on the Q latent (`[q_lora_rank]`). `Some` iff `w_q_a` is.
+    pub q_a_norm: Option<Vec<f32>>,
+    /// Q up-projection `[q_lora_rank, n_heads·qk_head_dim]`. `Some` iff
+    /// `w_q_a` is.
+    pub w_q_b: Option<Tensor>,
+    /// Direct Q projection `[d_model, n_heads·qk_head_dim]` (V2-Lite).
+    /// `Some` iff the low-rank Q tensors are absent.
+    pub w_q: Option<Tensor>,
+    /// Fused KV down-projection → `[kv_lora_rank | qk_rope_head_dim]`.
+    pub w_kv_a_mqa: Tensor,
+    /// RMSNorm on the compressed KV latent (`[kv_lora_rank]`).
+    pub kv_a_norm: Vec<f32>,
+    /// KV up-projection `[kv_lora_rank, n_heads·(qk_nope + v_head_dim)]`.
+    pub w_kv_b: Tensor,
+    /// Dequanted f32 copy of `w_kv_b`, laid out row-major `[out, in]` =
+    /// `[n_heads·(qk_nope + v_head_dim), kv_lora_rank]`. Built once at load
+    /// so the ABSORBED decode can fold `w_kv_b` into the per-head Q/output
+    /// projections (score against the latent directly). The NAIVE path
+    /// materializes per-head K/V from the latent via the regular matvec
+    /// dispatch on `w_kv_b`, so it doesn't consult this.
+    pub w_kv_b_f32: Vec<f32>,
+    /// Attention output projection `[n_heads·v_head_dim, d_model]`.
+    pub w_o: Tensor,
+    pub ffn_norm: Vec<f32>, // [d_model]
+    /// Dense SwiGLU or routed-expert MoE FFN (per layer).
+    pub ffn: HybridFfn,
+}
+
 /// MTP head as it appears on `qwen35moe` (and likely other Qwen
 /// hybrid variants going forward). On-disk tensor layout:
 /// `blk.{N}.nextn.{eh_proj, enorm, hnorm, shared_head_norm}.weight`
@@ -1121,6 +1348,13 @@ pub struct LlamaWeights {
     /// `(i + 1) % full_attention_interval == 0`. Mutually
     /// exclusive with `blocks` / `moe_blocks`.
     pub hybrid_layers: Option<Vec<HybridLayer>>,
+    /// M1: Multi-head Latent Attention transformer blocks (DeepSeek-V2/V3,
+    /// `deepseek2` arch). `None` unless the GGUF declares
+    /// `{arch}.attention.kv_lora_rank`. Each block carries the low-rank
+    /// Q/KV projections + the compressed-latent KV path + a dense or MoE
+    /// FFN. Mutually exclusive with `blocks` / `moe_blocks` /
+    /// `hybrid_layers`; the forward routes through `forward_one_mla`.
+    pub mla_blocks: Option<Vec<MlaBlockWeights>>,
     pub output_norm: Vec<f32>, // [d_model]
     /// LM head. `None` => use tied `token_embd`.
     pub output: Option<Tensor>, // F32
@@ -1196,6 +1430,14 @@ impl LlamaWeights {
 
     pub fn is_moe(&self) -> bool {
         self.moe_blocks.is_some()
+    }
+
+    /// `true` when this model uses Multi-head Latent Attention
+    /// (DeepSeek-V2/V3). The forward entry points route MLA models to
+    /// [`LlamaModel::forward_one_mla`] / the serial MLA prefill instead
+    /// of the dense/GQA path.
+    pub fn is_mla(&self) -> bool {
+        self.mla_blocks.is_some()
     }
 
     /// MoE tiered-expert engine (Phase 1c): promote the hottest experts'
@@ -1423,9 +1665,17 @@ impl LlamaWeights {
         // + full-attention layer pattern, plain SwiGLU FFN).
         // Populate exactly one of `blocks` / `moe_blocks` /
         // `hybrid_layers`; the other two stay empty / None.
-        let (blocks, moe_blocks, hybrid_layers) = if let Some(hyb_cfg) = cfg.hybrid.as_ref() {
+        let (blocks, moe_blocks, hybrid_layers, mla_blocks) = if let Some(hyb_cfg) =
+            cfg.hybrid.as_ref()
+        {
             let layers = load_hybrid_layers(gguf, cfg, cfg.moe.as_ref(), hyb_cfg)?;
-            (Vec::new(), None, Some(layers))
+            (Vec::new(), None, Some(layers), None)
+        } else if let Some(mla_cfg) = cfg.mla.as_ref() {
+            // M1: Multi-head Latent Attention (DeepSeek-V2/V3). The MLA
+            // attention tensor set replaces the GQA Q/K/V projections; the
+            // FFN stays dense or MoE (per layer — DeepSeek's first-k-dense).
+            let layers = load_mla_layers(gguf, cfg, mla_cfg, cfg.moe.as_ref())?;
+            (Vec::new(), None, None, Some(layers))
         } else if let Some(moe_cfg) = cfg.moe.as_ref() {
             let n_experts = moe_cfg.n_experts as usize;
             let d_model = cfg.d_model;
@@ -1527,7 +1777,7 @@ impl LlamaWeights {
                     down_per_expert,
                 });
             }
-            (Vec::new(), Some(mbs), None)
+            (Vec::new(), Some(mbs), None, None)
         } else {
             let mut blocks = Vec::with_capacity(cfg.n_layers);
             for i in 0..cfg.n_layers {
@@ -1562,7 +1812,7 @@ impl LlamaWeights {
                     k_norm: load_optional_norm(gguf, &format!("{prefix}.attn_k_norm.weight")),
                 });
             }
-            (blocks, None, None)
+            (blocks, None, None, None)
         };
 
         // MTP heads. Pure-additive: models without MTP metadata have
@@ -1686,6 +1936,7 @@ impl LlamaWeights {
             blocks,
             moe_blocks,
             hybrid_layers,
+            mla_blocks,
             output_norm,
             output,
             mtp_heads,
@@ -1959,6 +2210,138 @@ fn load_hybrid_layers(
                 ffn,
             }));
         }
+    }
+    Ok(out)
+}
+
+/// Load the per-layer weights for a Multi-head Latent Attention
+/// (DeepSeek-V2/V3) model. The Q path is low-rank (`attn_q_a`/`_a_norm`/
+/// `_q_b`) or direct (`attn_q`); the KV path is always
+/// `attn_kv_a_mqa`/`_a_norm`/`_kv_b`. The FFN is decided PER LAYER by
+/// tensor presence — DeepSeek stacks a few dense SwiGLU layers before the
+/// MoE layers (`first_k_dense_replace`), so a model-wide dense-vs-MoE
+/// decision (as the hybrid loader makes) would be wrong here.
+fn load_mla_layers(
+    gguf: &Gguf,
+    cfg: &LlamaConfig,
+    mla_cfg: &crate::llama_config::MlaConfig,
+    moe_cfg: Option<&crate::llama_config::MoeConfig>,
+) -> Result<Vec<MlaBlockWeights>, LlamaLoadError> {
+    let d_model = cfg.d_model;
+    let d_ff = cfg.d_ff;
+    let n_heads = cfg.n_heads;
+    let kv_lora_rank = mla_cfg.kv_lora_rank;
+    let kv_b_out = n_heads * (mla_cfg.qk_nope_head_dim + mla_cfg.v_head_dim);
+    let mut out = Vec::with_capacity(cfg.n_layers);
+    for i in 0..cfg.n_layers {
+        let prefix = format!("blk.{i}");
+        // FFN: dense or MoE, decided per LAYER by tensor presence.
+        let is_moe_layer = moe_cfg.is_some()
+            && gguf
+                .tensor(&format!("{prefix}.ffn_gate_exps.weight"))
+                .is_some();
+        let ffn = if is_moe_layer {
+            let moe_cfg = moe_cfg.unwrap();
+            let n_experts = moe_cfg.n_experts as usize;
+            let w_gate_exps = load_weight(gguf, &format!("{prefix}.ffn_gate_exps.weight"))?;
+            let w_up_exps = load_weight(gguf, &format!("{prefix}.ffn_up_exps.weight"))?;
+            let w_down_exps = load_weight(gguf, &format!("{prefix}.ffn_down_exps.weight"))?;
+            let gate_per_expert: Vec<Tensor> = (0..n_experts)
+                .map(|e| crate::moe::expert_view(&w_gate_exps, e, d_ff, d_model))
+                .collect();
+            let up_per_expert: Vec<Tensor> = (0..n_experts)
+                .map(|e| crate::moe::expert_view(&w_up_exps, e, d_ff, d_model))
+                .collect();
+            let down_per_expert: Vec<Tensor> = (0..n_experts)
+                .map(|e| crate::moe::expert_view(&w_down_exps, e, d_model, d_ff))
+                .collect();
+            crate::accel::register_layer_experts(
+                i as u32,
+                &gate_per_expert,
+                &up_per_expert,
+                &down_per_expert,
+            );
+            HybridFfn::Moe {
+                router: load_weight(gguf, &format!("{prefix}.ffn_gate_inp.weight"))?,
+                w_gate_exps,
+                w_up_exps,
+                w_down_exps,
+                w_gate_shared: load_optional_weight(
+                    gguf,
+                    &format!("{prefix}.ffn_gate_shexp.weight"),
+                ),
+                w_up_shared: load_optional_weight(gguf, &format!("{prefix}.ffn_up_shexp.weight")),
+                w_down_shared: load_optional_weight(
+                    gguf,
+                    &format!("{prefix}.ffn_down_shexp.weight"),
+                ),
+                // DeepSeek-V3 runs its shared expert ungated (shared_router None);
+                // Qwen2-MoE's sigmoid shared gate isn't an MLA arch.
+                shared_router: load_optional_weight(
+                    gguf,
+                    &format!("{prefix}.ffn_gate_inp_shexp.weight"),
+                ),
+                gate_per_expert,
+                up_per_expert,
+                down_per_expert,
+            }
+        } else {
+            HybridFfn::Dense {
+                w_gate: load_weight(gguf, &format!("{prefix}.ffn_gate.weight"))?,
+                w_up: load_weight(gguf, &format!("{prefix}.ffn_up.weight"))?,
+                w_down: load_weight(gguf, &format!("{prefix}.ffn_down.weight"))?,
+            }
+        };
+
+        // Q path: low-rank (q_a→norm→q_b) or direct (q). Keyed on both the
+        // config's `q_lora_rank` AND tensor presence so a mislabeled GGUF
+        // falls back cleanly.
+        let has_q_lora = mla_cfg.q_lora_rank.is_some()
+            && gguf.tensor(&format!("{prefix}.attn_q_a.weight")).is_some();
+        let (w_q_a, q_a_norm, w_q_b, w_q) = if has_q_lora {
+            (
+                Some(load_weight(gguf, &format!("{prefix}.attn_q_a.weight"))?),
+                Some(load_norm(gguf, &format!("{prefix}.attn_q_a_norm.weight"))?),
+                Some(load_weight(gguf, &format!("{prefix}.attn_q_b.weight"))?),
+                None,
+            )
+        } else {
+            (
+                None,
+                None,
+                None,
+                Some(load_weight(gguf, &format!("{prefix}.attn_q.weight"))?),
+            )
+        };
+
+        // KV path. Dequant `attn_kv_b` to f32 once for the absorbed-decode
+        // weight fold (row-major `[out, in]`: flat `o*kv_lora_rank + k`).
+        let w_kv_b = load_weight(gguf, &format!("{prefix}.attn_kv_b.weight"))?;
+        let n_kv_b = w_kv_b.element_count() as usize;
+        debug_assert_eq!(
+            n_kv_b,
+            kv_b_out * kv_lora_rank,
+            "attn_kv_b element count {} != n_heads*(qk_nope+v)*kv_lora_rank = {}",
+            n_kv_b,
+            kv_b_out * kv_lora_rank
+        );
+        let mut w_kv_b_f32 = vec![0.0f32; n_kv_b];
+        dequant_or_copy_to_f32(&w_kv_b, &mut w_kv_b_f32);
+
+        out.push(MlaBlockWeights {
+            attn_norm: load_norm(gguf, &format!("{prefix}.attn_norm.weight"))?,
+            w_q_a,
+            q_a_norm,
+            w_q_b,
+            w_q,
+            w_kv_a_mqa: load_weight(gguf, &format!("{prefix}.attn_kv_a_mqa.weight"))?,
+            kv_a_norm: load_norm(gguf, &format!("{prefix}.attn_kv_a_norm.weight"))?,
+            w_kv_b,
+            w_kv_b_f32,
+            w_o: load_weight(gguf, &format!("{prefix}.attn_output.weight"))?,
+            ffn_norm: load_norm(gguf, &format!("{prefix}.ffn_norm.weight"))?,
+            ffn,
+        });
     }
     Ok(out)
 }
@@ -3057,6 +3440,46 @@ impl KvDtype {
     }
 }
 
+/// M1: the Multi-head Latent Attention KV cache (DeepSeek-V2/V3). Unlike
+/// the per-head K/V slabs the `KvLayer` variants hold, MLA stores ONLY
+/// the compressed KV latent `[kv_lora_rank]` + the single decoupled-RoPE
+/// key `[qk_rope_head_dim]` per token per layer — the memory win. Both
+/// the naive and absorbed attention paths read from here (naive
+/// materializes per-head K/V from the latent on the fly; absorbed scores
+/// against the latent directly).
+#[derive(Debug, Clone)]
+pub struct MlaKvCache {
+    /// Per layer: compressed-latent slab, row-major `[max_ctx, kv_lora_rank]`.
+    pub latent: Vec<Vec<f32>>,
+    /// Per layer: decoupled-RoPE key slab, row-major
+    /// `[max_ctx, qk_rope_head_dim]`.
+    pub rope_key: Vec<Vec<f32>>,
+    pub kv_lora_rank: usize,
+    pub qk_rope_head_dim: usize,
+    pub max_ctx: usize,
+}
+
+impl MlaKvCache {
+    fn new(n_layers: usize, max_ctx: usize, kv_lora_rank: usize, qk_rope_head_dim: usize) -> Self {
+        Self {
+            latent: (0..n_layers).map(|_| vec![0.0f32; max_ctx * kv_lora_rank]).collect(),
+            rope_key: (0..n_layers)
+                .map(|_| vec![0.0f32; max_ctx * qk_rope_head_dim])
+                .collect(),
+            kv_lora_rank,
+            qk_rope_head_dim,
+            max_ctx,
+        }
+    }
+
+    /// Total bytes held across all layers (feeds the cache's
+    /// `approx_bytes` so the memory planner accounts the MLA slabs).
+    pub fn approx_bytes(&self) -> usize {
+        let per = |v: &Vec<Vec<f32>>| v.iter().map(|s| s.len() * 4).sum::<usize>();
+        per(&self.latent) + per(&self.rope_key)
+    }
+}
+
 pub struct KvCache {
     /// **Field declaration order matters**: `layers` drops before
     /// `usm_stream`, so any `KvBuf::Usm` allocations are freed before
@@ -3064,6 +3487,11 @@ pub struct KvCache {
     /// the USM buffers is a transmute over `usm_stream`'s lifetime;
     /// this drop order is the safety guarantee.
     pub layers: Vec<KvLayer>,
+    /// M1: `Some` on a Multi-head Latent Attention model (DeepSeek-V2/V3),
+    /// where `layers` holds zero-length F32 placeholders and the real KV
+    /// (the compressed latent + decoupled rope key) lives here. `None` on
+    /// every other model.
+    pub mla: Option<MlaKvCache>,
     pub seq_len: usize,
     pub max_ctx: usize,
     pub n_kv_heads: usize,
@@ -3112,6 +3540,7 @@ impl std::fmt::Debug for KvCache {
             .field("head_dim", &self.head_dim)
             .field("dtype", &self.dtype())
             .field("layer_dtypes", &self.layer_dtypes)
+            .field("mla", &self.mla.is_some())
             .finish()
     }
 }
@@ -3519,7 +3948,8 @@ impl KvCache {
     /// cache reports every slab, used or not. Feeds the
     /// memory-budget planner's peak projection.
     pub fn approx_bytes(&self) -> usize {
-        self.layers.iter().map(|l| l.approx_bytes()).sum()
+        self.layers.iter().map(|l| l.approx_bytes()).sum::<usize>()
+            + self.mla.as_ref().map(|m| m.approx_bytes()).unwrap_or(0)
     }
 
     pub fn new_with_dtype(cfg: &LlamaConfig, max_ctx: usize, dtype: KvDtype) -> Self {
@@ -3602,6 +4032,38 @@ impl KvCache {
             cfg.n_layers,
             "layer_dtypes must have one entry per layer"
         );
+        // M1: MLA models store ONLY the compressed KV latent + the decoupled
+        // rope key per token (the memory win), not per-head K/V. Build the
+        // dedicated MLA cache; `layers` gets zero-length F32 placeholders so the
+        // layer-walking bookkeeping (approx_bytes, reset, prefix snapshot) sees
+        // uniform empty F32 layers and no-ops on them. `forward_one_mla` reads
+        // `self.mla` exclusively. Ignores the requested `kv_dtype` (the latent
+        // is always f32) and never uses USM.
+        if let Some(mla) = cfg.mla.as_ref() {
+            let layers = (0..cfg.n_layers)
+                .map(|_| KvLayer::F32 {
+                    k: KvBuf::from_vec(Vec::new()),
+                    v: KvBuf::from_vec(Vec::new()),
+                })
+                .collect();
+            return Self {
+                layers,
+                mla: Some(MlaKvCache::new(
+                    cfg.n_layers,
+                    max_ctx,
+                    mla.kv_lora_rank,
+                    mla.qk_rope_head_dim,
+                )),
+                seq_len: 0,
+                max_ctx,
+                n_kv_heads: cfg.n_kv_heads,
+                head_dim: cfg.head_dim,
+                layer_dtypes: vec![KvDtype::F32; cfg.n_layers],
+                layer_caps: vec![max_ctx; cfg.n_layers],
+                kv_bias: None,
+                usm_stream: None,
+            };
+        }
         let total_rows = cfg.n_kv_heads * max_ctx;
         let row_floats = total_rows * cfg.head_dim;
         // P2: per-layer ring capacity. An F32 sliding-window layer with a
@@ -3789,6 +4251,7 @@ impl KvCache {
             .collect();
         Self {
             layers,
+            mla: None,
             seq_len: 0,
             max_ctx,
             n_kv_heads: cfg.n_kv_heads,
@@ -3888,6 +4351,16 @@ impl KvCache {
                         *x = 0;
                     }
                 }
+            }
+        }
+        // M1: clear the MLA latent + rope-key slabs (reads are bounded by
+        // seq_len, so this is belt-and-suspenders against stale rows).
+        if let Some(mla) = self.mla.as_mut() {
+            for s in mla.latent.iter_mut() {
+                s.fill(0.0);
+            }
+            for s in mla.rope_key.iter_mut() {
+                s.fill(0.0);
             }
         }
         self.seq_len = 0;
@@ -6233,6 +6706,11 @@ impl LlamaModel {
         kv: &mut KvCache,
         logits_out: &mut [f32],
     ) {
+        // M1: MLA path (see `forward_one`).
+        if self.weights.is_mla() {
+            self.forward_one_mla_impl(EmbedInput::Embed(embed_row), pos, kv, logits_out, true);
+            return;
+        }
         let cfg = &self.cfg;
         // Phase 2 of the qwen35moe roadmap binds hybrid tensors but
         // does not implement the SSM forward kernel; bail with a
@@ -6364,6 +6842,13 @@ impl LlamaModel {
     /// Forward pass on **one** token. Caller advances position via the KV cache.
     /// Returns the logit vector of length `vocab_size`.
     pub fn forward_one(&self, token_id: i32, pos: u32, kv: &mut KvCache, logits_out: &mut [f32]) {
+        // M1: MLA models (DeepSeek-V2/V3) run the dedicated low-rank /
+        // compressed-latent attention path. Branch before the generic
+        // dense/MoE body (which would die on the absent Q/K/V tensors).
+        if self.weights.is_mla() {
+            self.forward_one_mla_impl(EmbedInput::Token(token_id), pos, kv, logits_out, true);
+            return;
+        }
         let cfg = &self.cfg;
         // Guard the dense forward against a mis-dispatched hybrid model
         // (mirrors `forward_one_from_embed`): a hybrid model routed here
@@ -6424,6 +6909,276 @@ impl LlamaModel {
                 );
             },
         );
+    }
+
+    // ============================================================
+    // M1 — Multi-head Latent Attention (DeepSeek-V2/V3)
+    // ============================================================
+
+    /// Single-token MLA forward with the ABSORBED decode (score against
+    /// the compressed latent directly). Public entry used by `forward_one`
+    /// for DeepSeek-V2/V3 (`deepseek2`) models.
+    pub fn forward_one_mla(
+        &self,
+        token_id: i32,
+        pos: u32,
+        kv: &mut KvCache,
+        logits_out: &mut [f32],
+    ) {
+        self.forward_one_mla_impl(EmbedInput::Token(token_id), pos, kv, logits_out, true);
+    }
+
+    /// Single-token MLA forward with the NAIVE decode (materialize per-head
+    /// K/V from the stored latent via the real `attn_kv_b` matvec, then
+    /// standard attention). Mathematically identical to
+    /// [`Self::forward_one_mla`] — the parity anchor that proves the
+    /// absorbed weight-fold is correct. Exposed for the parity test.
+    #[doc(hidden)]
+    pub fn forward_one_mla_naive(
+        &self,
+        token_id: i32,
+        pos: u32,
+        kv: &mut KvCache,
+        logits_out: &mut [f32],
+    ) {
+        self.forward_one_mla_impl(EmbedInput::Token(token_id), pos, kv, logits_out, false);
+    }
+
+    /// The shared MLA forward body. `absorbed` picks the decode form:
+    /// `true` folds `attn_kv_b` into the per-head Q/output projections and
+    /// scores against the `[kv_lora_rank]` latent directly (the
+    /// memory-saving path); `false` materializes per-head K/V from the
+    /// latent (naive). Both store ONLY the compressed latent + the
+    /// decoupled RoPE key per token (the MLA KV-memory win).
+    fn forward_one_mla_impl(
+        &self,
+        input: EmbedInput<'_>,
+        pos: u32,
+        kv: &mut KvCache,
+        logits_out: &mut [f32],
+        absorbed: bool,
+    ) {
+        let cfg = &self.cfg;
+        let mla = cfg
+            .mla
+            .as_ref()
+            .expect("forward_one_mla_impl on a non-MLA model");
+        let blocks = self
+            .weights
+            .mla_blocks
+            .as_ref()
+            .expect("forward_one_mla_impl: mla_blocks not loaded");
+        assert_eq!(logits_out.len(), cfg.vocab_size);
+        assert_eq!(blocks.len(), cfg.n_layers);
+
+        let d = cfg.d_model;
+        let n_heads = cfg.n_heads;
+        let qk_nope = mla.qk_nope_head_dim;
+        let qk_rope = mla.qk_rope_head_dim;
+        let qk = qk_nope + qk_rope; // combined per-head Q/K width
+        let v_hd = mla.v_head_dim;
+        let kvr = mla.kv_lora_rank;
+        let q_lora = mla.q_lora_rank.unwrap_or(0);
+        let d_ff = cfg.d_ff;
+        let kv_b_per_head = qk_nope + v_hd; // attn_kv_b per-head output width
+        let (n_experts, top_k) = cfg
+            .moe
+            .as_ref()
+            .map(|m| (m.n_experts as usize, m.n_experts_used as usize))
+            .unwrap_or((0, 0));
+
+        let cur_pos = pos as usize;
+        let kv_len = cur_pos + 1;
+        {
+            let mla_kv = kv
+                .mla
+                .as_ref()
+                .expect("forward_one_mla_impl: MLA KV cache not allocated");
+            assert!(cur_pos < mla_kv.max_ctx, "pos {cur_pos} exceeds max_ctx");
+        }
+
+        // Decoupled-RoPE inv-freq table for the `qk_rope` slice. DeepSeek
+        // uses YaRN, so build the SCALED table (no-op / base table when the
+        // model declares no scaling). The YaRN temperature folds into the
+        // softmax scale below (mscale² over every score dim), matching the
+        // reference — not a per-element q/k post-scale.
+        let rope_tab = crate::accel::rope_inv_freq_table_scaled(
+            qk_rope,
+            cfg.rope_theta,
+            cfg.rope_scaling.as_ref(),
+        );
+        let use_tab = rope_tab.len() * 2 == qk_rope;
+        let mscale = self.yarn_mscale;
+        let scale = cfg
+            .attention_scale
+            .unwrap_or(1.0 / (qk as f32).sqrt())
+            * mscale
+            * mscale;
+
+        // ---- embed ----
+        let mut hidden = vec![0.0f32; d];
+        match input {
+            EmbedInput::Token(t) => {
+                k::embed_lookup_tensor(&self.weights.token_embd, &[t], &mut hidden, d);
+            }
+            EmbedInput::Embed(row) => {
+                assert_eq!(row.len(), d, "embed_row must be d_model long");
+                hidden.copy_from_slice(row);
+            }
+        }
+
+        // Reusable per-layer scratch.
+        let mut h_norm = vec![0.0f32; d];
+        let mut q_all = vec![0.0f32; n_heads * qk]; // per-head [nope | rope]
+        let mut q_lat = vec![0.0f32; q_lora.max(1)];
+        let mut q_lat_n = vec![0.0f32; q_lora.max(1)];
+        let mut kv_a = vec![0.0f32; kvr + qk_rope];
+        let mut latent_n = vec![0.0f32; kvr];
+        let mut rope_pack = vec![0.0f32; qk_rope.max(1)];
+        let mut attn_out = vec![0.0f32; n_heads * v_hd];
+        let mut o_proj = vec![0.0f32; d];
+        // FFN scratch.
+        let mut gate_buf = vec![0.0f32; d_ff.max(1)];
+        let mut up_buf = vec![0.0f32; d_ff.max(1)];
+        let mut ff_buf = vec![0.0f32; d_ff.max(1)];
+        let mut down_buf = vec![0.0f32; d];
+        let mut ffn_out = vec![0.0f32; d];
+        let mut expert_logits = vec![0.0f32; n_experts.max(1)];
+        let mut picks: Vec<(usize, f32)> = Vec::new();
+        let mut had_buf: Vec<f32> = Vec::new();
+
+        for (layer_idx, block) in blocks.iter().enumerate() {
+            // 1. Pre-attention RMSNorm.
+            k::rmsnorm_f32_row(&hidden, &block.attn_norm, &mut h_norm, cfg.rms_eps);
+
+            // 2. Q projection → per-head [nope | rope].
+            if let (Some(w_q_a), Some(q_a_norm), Some(w_q_b)) =
+                (&block.w_q_a, &block.q_a_norm, &block.w_q_b)
+            {
+                matvec_tensor_dispatch(w_q_a, &h_norm, &mut q_lat[..q_lora], q_lora, d);
+                k::rmsnorm_f32_row(&q_lat[..q_lora], q_a_norm, &mut q_lat_n[..q_lora], cfg.rms_eps);
+                matvec_tensor_dispatch(w_q_b, &q_lat_n[..q_lora], &mut q_all, n_heads * qk, q_lora);
+            } else {
+                let w_q = block
+                    .w_q
+                    .as_ref()
+                    .expect("MLA block has neither low-rank nor direct Q");
+                matvec_tensor_dispatch(w_q, &h_norm, &mut q_all, n_heads * qk, d);
+            }
+
+            // 3. Decoupled RoPE on the `qk_rope` slice of each Q head.
+            for h in 0..n_heads {
+                let s = h * qk + qk_nope;
+                rope_pack.copy_from_slice(&q_all[s..s + qk_rope]);
+                self.mla_rope(&mut rope_pack, qk_rope, pos, use_tab, &rope_tab);
+                q_all[s..s + qk_rope].copy_from_slice(&rope_pack);
+            }
+
+            // 4. KV down-projection → [latent | decoupled rope key].
+            matvec_tensor_dispatch(&block.w_kv_a_mqa, &h_norm, &mut kv_a, kvr + qk_rope, d);
+            // RMSNorm the compressed latent.
+            k::rmsnorm_f32_row(&kv_a[..kvr], &block.kv_a_norm, &mut latent_n, cfg.rms_eps);
+            // RoPE the single decoupled key (shared across heads).
+            rope_pack.copy_from_slice(&kv_a[kvr..kvr + qk_rope]);
+            self.mla_rope(&mut rope_pack, qk_rope, pos, use_tab, &rope_tab);
+
+            // 5. Store ONLY the latent + decoupled rope key at `cur_pos`.
+            {
+                let mla_kv = kv.mla.as_mut().unwrap();
+                mla_kv.latent[layer_idx][cur_pos * kvr..(cur_pos + 1) * kvr]
+                    .copy_from_slice(&latent_n);
+                mla_kv.rope_key[layer_idx][cur_pos * qk_rope..(cur_pos + 1) * qk_rope]
+                    .copy_from_slice(&rope_pack);
+            }
+
+            // 6. Attention over the cached latents → attn_out [n_heads * v_hd].
+            {
+                let mla_kv = kv.mla.as_ref().unwrap();
+                let latent = &mla_kv.latent[layer_idx];
+                let rope_key = &mla_kv.rope_key[layer_idx];
+                if absorbed {
+                    mla_attend_absorbed(
+                        &block.w_kv_b_f32, &q_all, latent, rope_key, &mut attn_out,
+                        n_heads, qk_nope, qk_rope, v_hd, kvr, kv_b_per_head, kv_len, scale,
+                    );
+                } else {
+                    mla_attend_naive(
+                        block, &q_all, latent, rope_key, &mut attn_out,
+                        n_heads, qk_nope, qk_rope, v_hd, kvr, kv_b_per_head, kv_len, scale,
+                    );
+                }
+            }
+
+            // 7. Output projection + residual.
+            matvec_tensor_dispatch(&block.w_o, &attn_out, &mut o_proj, d, n_heads * v_hd);
+            k::add_inplace_f32(&mut hidden, &o_proj);
+
+            // 8. Post-attention RMSNorm → FFN → residual.
+            k::rmsnorm_f32_row(&hidden, &block.ffn_norm, &mut h_norm, cfg.rms_eps);
+            match &block.ffn {
+                HybridFfn::Moe {
+                    router,
+                    gate_per_expert,
+                    up_per_expert,
+                    down_per_expert,
+                    w_gate_shared,
+                    w_up_shared,
+                    w_down_shared,
+                    shared_router,
+                    ..
+                } => crate::moe::moe_ffn_one_into_parts(
+                    &h_norm,
+                    router,
+                    &crate::moe::router_spec_for(cfg),
+                    gate_per_expert,
+                    up_per_expert,
+                    down_per_expert,
+                    w_gate_shared.as_ref(),
+                    w_up_shared.as_ref(),
+                    w_down_shared.as_ref(),
+                    shared_router.as_ref(),
+                    d,
+                    d_ff,
+                    n_experts,
+                    top_k,
+                    &mut ffn_out,
+                    &mut gate_buf,
+                    &mut up_buf,
+                    &mut ff_buf,
+                    &mut down_buf,
+                    &mut expert_logits,
+                    &mut picks,
+                ),
+                HybridFfn::Dense { w_gate, w_up, w_down } => dense_ffn_one_into(
+                    w_gate, w_up, w_down, &h_norm, d, d_ff, &mut ffn_out,
+                    &mut gate_buf, &mut up_buf, &mut ff_buf, None, &mut had_buf,
+                ),
+            }
+            k::add_inplace_f32(&mut hidden, &ffn_out);
+        }
+
+        // ---- final norm + LM head ----
+        let mut final_norm = vec![0.0f32; d];
+        k::rmsnorm_f32_row(&hidden, &self.weights.output_norm, &mut final_norm, cfg.rms_eps);
+        let lm_head = self.weights.output.as_ref().unwrap_or(&self.weights.token_embd);
+        matvec_tensor_dispatch(lm_head, &final_norm, logits_out, cfg.vocab_size, d);
+        self.finalize_logits(logits_out);
+
+        // Advance the MLA sequence length (mirrors the KvCache bookkeeping
+        // the dense path does via the engine).
+        kv.seq_len = kv.seq_len.max(kv_len);
+    }
+
+    /// NeoX half-split RoPE on one `qk_rope`-wide vector (the decoupled
+    /// rope key, or one Q head's rope slice). Uses the scaled inv-freq
+    /// table when it matches `qk_rope`, else the scalar-theta kernel.
+    #[inline]
+    fn mla_rope(&self, buf: &mut [f32], qk_rope: usize, pos: u32, use_tab: bool, tab: &[f32]) {
+        if use_tab {
+            k::rope_inplace_neox_invfreq(buf, 1, qk_rope, pos, tab);
+        } else {
+            k::rope_inplace_neox(buf, 1, qk_rope, pos, self.cfg.rope_theta);
+        }
     }
 
     /// Phase 3.7b: single-token forward for hybrid attention+DeltaNet
@@ -12574,6 +13329,11 @@ impl LlamaModel {
         // O(n²), on the windowed layers).
         if batched_on && !tokens.is_empty() && kv.uniform_dtype().is_some()
             && !kv.has_ring_layers()
+            // M1: MLA has no batched-prefill kernel — its placeholder F32
+            // `layers` would route to the dense batched path and run ZERO
+            // real layers. Fall through to the serial `forward_one` loop,
+            // which dispatches each token through `forward_one_mla`.
+            && !self.weights.is_mla()
         {
             match kv.layers.first() {
                 Some(KvLayer::F32 { .. }) => {
@@ -14426,6 +15186,7 @@ mod tests {
                 blocks,
                 moe_blocks: None,
                 hybrid_layers: None,
+                mla_blocks: None,
                 output_norm,
                 output: None, // tie embeddings
                 mtp_heads: None,

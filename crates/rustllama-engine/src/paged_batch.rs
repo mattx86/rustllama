@@ -527,6 +527,21 @@ impl PagedBatchEngine {
                     .into(),
             ));
         }
+        // M1: MLA (DeepSeek-V2/V3) is fail-closed off continuous batching. The
+        // paged KV store holds per-head K/V; MLA stores a compressed latent +
+        // a decoupled rope key and runs its own `forward_one_mla` against the
+        // contiguous MLA cache. There is no paged MLA forward yet, so serving
+        // one here would run zero MLA layers. Refuse with a pointed message
+        // (mirrors the hybrid gate); the contiguous `CpuEngine` serves it.
+        if model.weights.is_mla() {
+            return Err(CpuEngineError::Other(
+                "continuous batching (fused_decode) does not support MLA \
+                 (DeepSeek-V2/V3) attention yet — its compressed-latent KV cache \
+                 has no paged store; disable fused_decode to serve this model on \
+                 the default (contiguous) engine"
+                    .into(),
+            ));
+        }
         // F6-A: fail-closed VLM guard (P9 default-on prereq). A vision/mmproj model
         // has no image-embed row source in the ragged paged forward yet (F6-B adds
         // it), so serving one here would silently drop every image → text-only,

@@ -858,7 +858,13 @@ impl EngineState {
         // Treat it like "reuse disabled": reset + full re-prefill. Correct
         // (never serves stale/overwritten rows); the only cost is a missed
         // prefix-cache optimization on SWA models.
-        if !enabled || prompt_max == 0 || kv.has_ring_layers() {
+        //
+        // M1: MLA (DeepSeek-V2/V3) stores its KV in `kv.mla` (the compressed
+        // latent), NOT in `kv.layers` — the snapshot pool's `snapshot_prefix`/
+        // `restore_prefix` only walk `kv.layers` (empty placeholders for MLA),
+        // so a restored "prefix" would carry no latents. Same treatment: reset
+        // + full re-prefill (correct; prefix-cache reuse for MLA is a follow-up).
+        if !enabled || prompt_max == 0 || kv.has_ring_layers() || kv.mla.is_some() {
             kv.reset();
             if let Some(dn) = self.delta_net_cache.as_mut() {
                 dn.reset();
@@ -996,7 +1002,10 @@ impl EngineState {
                 // don't hold the full prefix, so a later restore would be
                 // wrong (prefix reuse is disabled for ring models in
                 // `prepare_prefix_reuse`; this keeps the pool free of them).
-                if kv.has_ring_layers() {
+                // M1: same for MLA — its KV lives in `kv.mla`, not the
+                // (empty) `kv.layers` the pool snapshots; reuse is disabled
+                // for MLA too, so keep its useless empty snapshots out.
+                if kv.has_ring_layers() || kv.mla.is_some() {
                     return;
                 }
                 match self.delta_net_cache.as_ref() {
@@ -1363,13 +1372,30 @@ impl CpuEngine {
         // (Lifting this needs the paged quant forwards to carry window/softcap too
         // — a T2/F-series follow-up.) The HYBRID layout coercion is KEPT: no paged
         // forward walks hybrid (DeltaNet/SSM) layers yet (lifted by F8).
+        // M1: MLA (DeepSeek-V2/V3) stores a compressed latent, not per-head
+        // K/V — the paged backends have no MLA store, so MLA is fail-closed to
+        // the contiguous layout + an f32 latent (the MLA cache ignores the
+        // requested kv_dtype, but coerce it for honest logging).
+        let kv_dtype = if model.weights.is_mla() && kv_dtype != KvDtype::F32 {
+            tracing::warn!(
+                requested = ?kv_dtype,
+                "MLA model (DeepSeek-V2/V3): the compressed-latent KV cache is \
+                 f32-only — ignoring the requested KV dtype"
+            );
+            KvDtype::F32
+        } else {
+            kv_dtype
+        };
         let swa_or_softcap = model.cfg.sliding_window.is_some()
             || model.cfg.attn_logit_softcapping.is_some();
-        let kv_layout: &str = if model.weights.is_hybrid() && kv_layout != "contiguous" {
+        let kv_layout: &str = if (model.weights.is_hybrid() || model.weights.is_mla())
+            && kv_layout != "contiguous"
+        {
             tracing::warn!(
                 requested = %kv_layout,
-                "hybrid model: paged KV layouts are not supported by the \
-                 hybrid path — coercing to contiguous for this load"
+                is_mla = model.weights.is_mla(),
+                "hybrid / MLA model: paged KV layouts are not supported by this \
+                 forward path — coercing to contiguous for this load"
             );
             "contiguous"
         } else if swa_or_softcap && kv_dtype != KvDtype::F32 && kv_layout != "contiguous" {

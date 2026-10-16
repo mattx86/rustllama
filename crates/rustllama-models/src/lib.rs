@@ -57,7 +57,12 @@ impl ModelArch {
             // per-layer MoE forward path. NOTE: this enum is vestigial —
             // the real loader (`LlamaConfig::from_gguf`) is arch-string-
             // agnostic and metadata-driven, so these GGUFs load and
-            // inference regardless of this classification. Qwen3 / Qwen3.5
+            // inference regardless of this classification. In particular
+            // `deepseek2` routes to the MLA (Multi-head Latent Attention)
+            // forward — `forward_one_mla` — whenever the GGUF declares
+            // `{arch}.attention.kv_lora_rank` (via `cfg.mla` →
+            // `weights.mla_blocks`), NOT the plain-Llama GQA path (which
+            // would die at the absent `attn_k.weight`). Qwen3 / Qwen3.5
             // MoE (incl. the hybrid DeltaNet-SSM + MTP variants that back
             // Ornith 1.5) run through the regular engine boundary today;
             // the earlier "needs SSM/MTP wiring first" caveat is resolved.

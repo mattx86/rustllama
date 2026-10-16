@@ -234,6 +234,8 @@ fn auto_n_gpu_layers_inner(
 ) -> AutoPlacementDecision {
     let total_layers = if let Some(hyb) = weights.hybrid_layers.as_ref() {
         hyb.len() as u32
+    } else if let Some(mla) = weights.mla_blocks.as_ref() {
+        mla.len() as u32
     } else if let Some(moe) = weights.moe_blocks.as_ref() {
         moe.len() as u32
     } else {
@@ -469,6 +471,22 @@ pub fn per_layer_weight_bytes(
                 }
             })
             .collect()
+    } else if let Some(mla) = weights.mla_blocks.as_ref() {
+        // M1: MLA (DeepSeek-V2/V3) per-layer bytes — the low-rank Q/KV
+        // projections + the up-projection + output + the FFN. Without this
+        // arm the planner would count an empty `blocks` and strand MLA on CPU
+        // with n_gpu_layers=0 (the same miscount the hybrid arm above fixes).
+        mla.iter()
+            .map(|b| {
+                count_opt(&b.w_q_a)
+                    + count_opt(&b.w_q_b)
+                    + count_opt(&b.w_q)
+                    + count_tensor(&b.w_kv_a_mqa)
+                    + count_tensor(&b.w_kv_b)
+                    + count_tensor(&b.w_o)
+                    + ffn_bytes(&b.ffn)
+            })
+            .collect()
     } else if let Some(moe) = weights.moe_blocks.as_ref() {
         // MoE-aware placement: when the tiered-expert engine is active the
         // per-expert weights are sized SEPARATELY (promoted to VRAM up to the
@@ -557,6 +575,7 @@ mod tests {
             blocks: vec![mk_block(0), mk_block(1)],
             moe_blocks: None,
             hybrid_layers: None,
+            mla_blocks: None,
             output_norm: vec![],
             output: None,
             mtp_heads: None,
@@ -591,6 +610,7 @@ mod tests {
             blocks: vec![block],
             moe_blocks: None,
             hybrid_layers: None,
+            mla_blocks: None,
             output_norm: vec![],
             output: None,
             mtp_heads: None,
@@ -628,6 +648,7 @@ mod tests {
             blocks: vec![block],
             moe_blocks: None,
             hybrid_layers: None,
+            mla_blocks: None,
             output_norm: vec![],
             output: None,
             mtp_heads: None,

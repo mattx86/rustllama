@@ -233,6 +233,24 @@ fn collect_tensors(weights: &LlamaWeights) -> Vec<TensorInfo> {
                 }
             }
         }
+    } else if let Some(mla) = weights.mla_blocks.as_ref() {
+        // M1: MLA (DeepSeek-V2/V3) — the low-rank Q/KV projections + the
+        // up-projection + output + the per-layer FFN (dense or MoE).
+        for b in mla {
+            if let Some(t) = b.w_q_a.as_ref() {
+                out.push(info_of(t));
+            }
+            if let Some(t) = b.w_q_b.as_ref() {
+                out.push(info_of(t));
+            }
+            if let Some(t) = b.w_q.as_ref() {
+                out.push(info_of(t));
+            }
+            out.push(info_of(&b.w_kv_a_mqa));
+            out.push(info_of(&b.w_kv_b));
+            out.push(info_of(&b.w_o));
+            push_hybrid_ffn(&mut out, &b.ffn);
+        }
     } else if let Some(moe) = weights.moe_blocks.as_ref() {
         for b in moe {
             out.push(info_of(&b.w_q));
@@ -654,6 +672,8 @@ pub fn plan_heat_placement(
 ) -> Option<HeatPlacementOutcome> {
     let total_layers = if let Some(hyb) = weights.hybrid_layers.as_ref() {
         hyb.len() as u32
+    } else if let Some(mla) = weights.mla_blocks.as_ref() {
+        mla.len() as u32
     } else if let Some(moe) = weights.moe_blocks.as_ref() {
         moe.len() as u32
     } else {
@@ -814,6 +834,7 @@ mod tests {
             }],
             moe_blocks: None,
             hybrid_layers: None,
+            mla_blocks: None,
             output_norm: vec![],
             output: Some(mk("output.weight", 100)),
             mtp_heads: None,
