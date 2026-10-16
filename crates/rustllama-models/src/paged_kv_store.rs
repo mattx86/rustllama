@@ -338,6 +338,60 @@ impl PagedKvStore {
         Some(())
     }
 
+    /// F7 tree-spec commit: move a speculative tree's ACCEPTED-path K/V rows
+    /// into contiguous committed positions. After a paged tree verify wrote
+    /// every node's K/V at absolute position `base + node_index`, the accepted
+    /// root→leaf path's nodes sit at scattered positions `base + src_slots[j]`;
+    /// this copies each to its committed position `base + j`, across every layer
+    /// and head. The caller then shrinks the cache's `seq_len` to `base +
+    /// src_slots.len()` (reclaiming the rejected drafts' positions — the paged
+    /// analog of the contiguous [`crate::llama_arch::KvCache::compact_tokens`] +
+    /// truncate). `pages` is the slot's page list (absolute position → page via
+    /// `page_size`). F32 store only (the paged tree-spec KV path).
+    ///
+    /// A depth-`j` node's flat index is always `>= j`, so `src_slots[j] >= j`
+    /// and the ascending copy never clobbers a not-yet-moved source; `src == j`
+    /// slots (the common all-accept / chain case) are skipped. Reading each row
+    /// into a short temp first keeps `src == dst` page aliasing safe.
+    pub fn compact_positions(&mut self, pages: &[PageId], base: usize, src_slots: &[usize]) {
+        let ps = self.page_size as usize;
+        for (j, &src) in src_slots.iter().enumerate() {
+            if src == j {
+                continue;
+            }
+            debug_assert!(src >= j, "compact source slot {src} must be >= dest {j}");
+            let src_pos = base + src;
+            let dst_pos = base + j;
+            let (Some(&src_page), Some(&dst_page)) = (pages.get(src_pos / ps), pages.get(dst_pos / ps))
+            else {
+                debug_assert!(false, "compact_positions: pos out of the slot's page range");
+                continue;
+            };
+            let src_in = (src_pos % ps) as u32;
+            let dst_in = (dst_pos % ps) as u32;
+            for layer in 0..self.n_layers {
+                for h in 0..self.n_kv_heads {
+                    // Read src rows into temps first so a same-page src/dst move
+                    // (common when both positions share one page) is overlap-safe.
+                    let k = match self.k_row(src_page, layer, h, src_in) {
+                        Some(r) => r.to_vec(),
+                        None => continue,
+                    };
+                    let v = match self.v_row(src_page, layer, h, src_in) {
+                        Some(r) => r.to_vec(),
+                        None => continue,
+                    };
+                    if let Some(dst) = self.k_row_mut(dst_page, layer, h, dst_in) {
+                        dst.copy_from_slice(&k);
+                    }
+                    if let Some(dst) = self.v_row_mut(dst_page, layer, h, dst_in) {
+                        dst.copy_from_slice(&v);
+                    }
+                }
+            }
+        }
+    }
+
     /// Zero out every cell of one page. Used when a freed page is
     /// re-allocated to a new slot — leftover bytes from the previous
     /// owner are never read by attention (the kv_len bound guards

@@ -250,6 +250,13 @@ struct SlotState {
     /// preempted AGAIN mid-replay still skips exactly the already-seen tokens
     /// and never re-streams one.
     emitted_to_client: u32,
+    /// F7: the seeded RNG for this slot's MTP/tree speculative rounds
+    /// (non-greedy accept/reject). Lazily created on the first spec round from
+    /// `sampling.seed`, then reused across rounds so by-seed determinism holds —
+    /// mirroring the contiguous `speculate_mtp_stream`'s one-RNG-per-stream. Stays
+    /// `None` for a slot whose model carries no draft head (spec never engages)
+    /// and for greedy spec (deterministic, no draws).
+    spec_rng: Option<crate::sampling::Rng>,
 }
 
 /// In-flight chunked prefill for one slot. `admit_request` stages the slot
@@ -848,6 +855,7 @@ impl PagedBatchEngine {
                 stop_buf: String::new(),
                 skip_emit: 0,
                 emitted_to_client: 0,
+                spec_rng: None,
             });
         }
 
@@ -1756,6 +1764,7 @@ fn admit_request(
             stop_buf: String::new(),
             skip_emit,
             emitted_to_client: skip_emit,
+            spec_rng: None,
         });
     }
 
@@ -1806,6 +1815,7 @@ fn admit_request(
         stop_buf: String::new(),
         skip_emit,
         emitted_to_client: skip_emit,
+        spec_rng: None,
     })
 }
 
@@ -1922,6 +1932,22 @@ fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
         }
     }
 
+    // F7: MTP/tree speculation is a MODEL-LEVEL property — a dense (non-hybrid)
+    // model carrying an MTP draft head (`mtp_heads`). When set, a decode-ready,
+    // grammar-free slot runs a per-slot speculative round INSTEAD of a plain
+    // decode row (handled after the ragged forward). A grammar slot keeps the
+    // classic decode row (spec is disabled under a grammar, matching the
+    // contiguous path). SWA / softcap models are excluded: the paged tree
+    // verify (like the contiguous `forward_tree_verify_f32`) uses the plain
+    // ancestor-masked attention without window/softcap, and MTP models are
+    // neither — so fail-closed to classic decode if they ever co-occur. When
+    // `spec_enabled` is false (every current model, incl. all test GGUFs), the
+    // planning + forward below are byte-identical to the pre-F7 path.
+    let spec_enabled = !ctx.model.weights.is_hybrid()
+        && ctx.model.weights.mtp_heads.is_some()
+        && ctx.model.cfg.sliding_window.is_none()
+        && ctx.model.cfg.attn_logit_softcapping.is_none();
+
     // --- Plan the ragged batch (slot order == concatenated token order) ---
     // Each non-done slot contributes EITHER a budgeted prefill chunk (if still
     // prefilling) OR one decode row (if decode-ready). A still-prefilling slot
@@ -1932,6 +1958,9 @@ fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
     let mut tokens: Vec<i32> = Vec::new();
     // plan entry: (active slot index, kind, n_query, start_pos).
     let mut plan: Vec<(usize, RaggedKind, usize, u32)> = Vec::new();
+    // F7: decode-ready, spec-eligible slots handled by a per-slot speculative
+    // round after the ragged forward (not added to the batched decode plan).
+    let mut spec_slots: Vec<usize> = Vec::new();
     for i in 0..m {
         if active[i].state.done {
             continue;
@@ -1946,15 +1975,21 @@ fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
             tokens.extend_from_slice(&job.suffix[job.cursor..job.cursor + chunk]);
             plan.push((i, RaggedKind::Prefill { chunk }, chunk, start_pos));
             budget -= chunk;
+        } else if spec_enabled && active[i].state.grammar.is_none() {
+            // F7: decode-ready spec slot — run its MTP/tree round separately.
+            spec_slots.push(i);
         } else {
             tokens.push(active[i].state.next_input);
             plan.push((i, RaggedKind::Decode, 1, active[i].state.next_pos));
         }
     }
-    if plan.is_empty() {
+    if plan.is_empty() && spec_slots.is_empty() {
         // Nothing to advance (e.g. every prefilling slot was starved of budget
         // — can't happen while budget > 0 and any slot is prefilling, but guard
-        // anyway so the driver loop makes forward progress).
+        // anyway so the driver loop makes forward progress). F7: when only
+        // spec slots are pending, `plan` is empty but `spec_slots` is not, so
+        // we fall through to the spec pass below (the ragged forward is a no-op
+        // on the empty plan).
         return;
     }
 
@@ -1989,7 +2024,7 @@ fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
 
     let tick_start = std::time::Instant::now();
     ctx.model
-        .forward_ragged_paged_f32(&tokens, &mut ragged, &ctx.shared);
+        .forward_ragged_paged_f32(&tokens, &mut ragged, &ctx.shared, None);
     let tick_ms = tick_start.elapsed().as_secs_f64() * 1000.0;
     // Release the borrows held through the forward before touching `active`.
     drop(ragged);
@@ -2123,6 +2158,223 @@ fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
                     slot.state.done = true;
                 }
             }
+        }
+    }
+
+    // F7: per-slot MTP/tree speculative rounds for the decode-ready,
+    // grammar-free slots of a draft-head model. Serial per slot (the contiguous
+    // engine also speculates one request at a time); the batched prefill/decode
+    // fusion above still covers every non-spec slot. Empty unless `spec_enabled`.
+    for &i in &spec_slots {
+        if active[i].state.done {
+            continue;
+        }
+        run_spec_round_for_slot(ctx, &mut active[i], vocab);
+    }
+}
+
+/// F7 — ONE MTP/tree speculative round for a decode-ready paged slot, the paged
+/// analog of the contiguous dense `tree_mtp_round`:
+///
+///   1. **Tip forward** — [`LlamaModel::forward_one_with_mtp_logits_paged`]
+///      writes `next_input`'s K/V at `base_pos` and returns the MAIN
+///      distribution + one draft-logit row per MTP head.
+///   2. **Tree build** — [`build_mtp_tree`] shapes a draft tree (chain by
+///      default → the pinned linear reduction). Bails to a single-token sample
+///      (empty-draft accept/reject) when the tree is empty or would overflow.
+///   3. **Tree verify** — [`LlamaModel::forward_tree_verify_paged_f32`] scores
+///      every node in ONE forward (each node attends prefix + ancestors) over
+///      the slot's paged KV, writing node `i` at `base_pos + 1 + i`.
+///   4. **Walk + commit** — [`tree_accept_reject`] picks the accepted path;
+///      [`PagedKvStore::compact_positions`] moves the accepted path's scattered
+///      K/V into contiguous committed slots and `set_seq_len_for_rollback`
+///      reclaims the rejected drafts' positions (the paged "free rejected
+///      pages"). For a CHAIN tree the accepted path is already contiguous, so
+///      the compaction is a no-op — which is why chain ≡ linear decode.
+///
+/// Committed tokens stream with the same skip_emit / stop / EOS / max-tokens
+/// bookkeeping as the classic decode row. Reuses `build_mtp_tree` /
+/// `tree_accept_reject` / `tree_depths` / `accept_reject` (no duplicated spec
+/// algorithm). Write-blind: no public dense-MTP GGUF exists on-box, so this
+/// runs only against real MTP weights on HW; the forward reductions are pinned
+/// at the model layer by `forward_tree_verify_paged_f32_chain_matches_linear`.
+fn run_spec_round_for_slot(ctx: &DriverContext, slot: &mut DriverSlot, vocab: usize) {
+    use crate::inference::softmax_to_vec;
+    use crate::sampling::{apply_all_penalties, Rng};
+    use crate::speculative::{
+        accept_reject, accept_reject_greedy, build_mtp_tree, tree_accept_reject,
+        tree_accept_reject_greedy, tree_depths, DraftToken,
+    };
+
+    let n_mtp = ctx
+        .model
+        .weights
+        .mtp_heads
+        .as_ref()
+        .map(|h| h.len())
+        .unwrap_or(0);
+    debug_assert!(n_mtp > 0, "spec round entered without MTP heads");
+
+    // Snapshot the scalars we need before taking the mutable cache borrow.
+    let base_pos = slot.state.next_pos;
+    let next_input = slot.state.next_input;
+    let greedy = slot.state.sampling.temperature <= 0.0;
+    let repeat = slot.state.sampling.repeat_penalty;
+    let frequency = slot.state.sampling.frequency_penalty;
+    let presence = slot.state.sampling.presence_penalty;
+    let seed = slot.state.sampling.seed;
+    let max_tokens = slot.state.sampling.max_tokens;
+    let penalize = repeat != 1.0 || frequency != 0.0 || presence != 0.0;
+    let max_ctx = ctx.max_ctx;
+
+    // --- Tip forward: main distribution + per-head drafts. ---
+    let mut main_logits = vec![0f32; vocab];
+    let mut head_logits: Vec<Vec<f32>> = vec![vec![0f32; vocab]; n_mtp];
+    ctx.model.forward_one_with_mtp_logits_paged(
+        next_input,
+        base_pos,
+        &mut slot.state.cache,
+        &ctx.shared,
+        &mut main_logits,
+        &mut head_logits,
+    );
+
+    // Penalty history for the first speculative token. In the paged slot
+    // `history` already ends with `next_input` (the tip), so it IS the recent
+    // context the contiguous `tree_mtp_round` builds as `last_ids + next_input`.
+    let recent: Vec<u32> = if penalize {
+        slot.state.history.clone()
+    } else {
+        Vec::new()
+    };
+    if penalize {
+        apply_all_penalties(&mut main_logits, &recent, repeat, frequency, presence);
+    }
+    let main_dist = softmax_to_vec(&main_logits);
+
+    // --- Build the draft tree. Default widths = a chain of length n_mtp (the
+    //     pinned linear-MTP shape; a wider tree is a config-driven follow-up). ---
+    let widths: Vec<usize> = vec![1usize; n_mtp];
+    let nodes = build_mtp_tree(&head_logits, &widths, &recent, repeat, frequency, presence);
+    let base = base_pos as usize;
+    let fits = !nodes.is_empty()
+        && base + 1 + nodes.len() <= max_ctx
+        && (base + 1 + nodes.len()) as u32 <= slot.state.cache.capacity_tokens();
+
+    // Committed tokens this round + the slot's new (next_input, next_pos).
+    let committed: Vec<u32>;
+    if !fits {
+        // No tree (no draft / overflow) ⇒ commit one token from the tip's main
+        // distribution via the empty-draft accept/reject — identical to the
+        // classic single-token sample the contiguous path falls back to. The
+        // tip's K/V already covers `base_pos`; next write is `base_pos + 1`.
+        let no_drafts: [DraftToken; 0] = [];
+        let target: [&[f32]; 1] = [main_dist.as_slice()];
+        let out = if greedy {
+            accept_reject_greedy(&no_drafts, &target)
+        } else {
+            let rng = slot.state.spec_rng.get_or_insert_with(|| Rng::from_seed(seed));
+            accept_reject(&no_drafts, &target, rng)
+        };
+        committed = vec![out.replacement];
+        slot.state.next_input = out.replacement as i32;
+        slot.state.next_pos = base_pos + 1;
+    } else {
+        // --- Tree verify + walk the accepted path. ---
+        let node_tokens: Vec<i32> = nodes.iter().map(|n| n.id as i32).collect();
+        let depths = tree_depths(&nodes);
+        let parent: Vec<i32> = nodes
+            .iter()
+            .map(|n| n.parent.map(|p| p as i32).unwrap_or(-1))
+            .collect();
+        let mut tree_logits = vec![0f32; nodes.len() * vocab];
+        ctx.model.forward_tree_verify_paged_f32(
+            &node_tokens,
+            base_pos + 1,
+            &depths,
+            &parent,
+            &mut slot.state.cache,
+            &ctx.shared,
+            &mut tree_logits,
+        );
+        let next_dists: Vec<Vec<f32>> = (0..nodes.len())
+            .map(|i| softmax_to_vec(&tree_logits[i * vocab..(i + 1) * vocab]))
+            .collect();
+        let next_refs: Vec<&[f32]> = next_dists.iter().map(|d| d.as_slice()).collect();
+        let outcome = if greedy {
+            tree_accept_reject_greedy(&nodes, &main_dist, &next_refs)
+        } else {
+            let rng = slot.state.spec_rng.get_or_insert_with(|| Rng::from_seed(seed));
+            tree_accept_reject(&nodes, &main_dist, &next_refs, rng)
+        };
+        let a = outcome.accepted.len();
+        // Commit: compact the accepted path's scattered K/V into the contiguous
+        // committed slots `[base_pos + 1, base_pos + 1 + a)`, then shrink the
+        // watermark so the rejected drafts' positions are reclaimed.
+        let pages: Vec<_> = slot.state.cache.pages().to_vec();
+        ctx.shared.with_store_mut(|store| {
+            store.compact_positions(&pages, base + 1, &outcome.accepted_nodes);
+        });
+        slot
+            .state
+            .cache
+            .set_seq_len_for_rollback(base_pos + 1 + a as u32);
+        let mut c = outcome.accepted;
+        c.push(outcome.replacement);
+        committed = c;
+        slot.state.next_input = outcome.replacement as i32;
+        slot.state.next_pos = base_pos + 1 + a as u32;
+    }
+
+    // --- Emit committed tokens with the classic decode bookkeeping. ---
+    for &id in &committed {
+        slot.state.history.push(id);
+        slot.state.n_emitted += 1;
+
+        // String-stop detection (same running-detok-buffer match as the decode
+        // row): the stop-completing token is still streamed, then the slot ends.
+        let hit_stop = if slot.state.stop_strings.is_empty() {
+            false
+        } else {
+            let piece = ctx
+                .tokenizer
+                .as_ref()
+                .and_then(|t| t.decode_single(id, true).ok())
+                .unwrap_or_default();
+            slot.state.stop_buf.push_str(&piece);
+            let buf = &slot.state.stop_buf;
+            slot.state
+                .stop_strings
+                .iter()
+                .any(|s| !s.is_empty() && buf.contains(s.as_str()))
+        };
+
+        // F5 replay: suppress streaming regenerated tokens while skip_emit > 0.
+        if slot.state.skip_emit > 0 {
+            slot.state.skip_emit -= 1;
+        } else {
+            let text = match &ctx.tokenizer {
+                Some(tok) => tok.decode(&[id], false).unwrap_or_default(),
+                None => String::new(),
+            };
+            let token = Token {
+                id,
+                text,
+                logprobs: None,
+            };
+            if slot.response_tx.blocking_send(Ok(token)).is_err() {
+                slot.state.done = true;
+                return;
+            }
+            slot.state.emitted_to_client += 1;
+        }
+
+        let hit_max = slot.state.n_emitted >= max_tokens;
+        let hit_eos = slot.state.eos.map(|e| (id as i32) == e).unwrap_or(false);
+        let hit_cap = slot.state.next_pos >= slot.state.cache.capacity_tokens();
+        if hit_max || hit_eos || hit_cap || hit_stop {
+            slot.state.done = true;
+            return;
         }
     }
 }

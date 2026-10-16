@@ -152,6 +152,91 @@ fn vlm_prefill_with_image_advances_kv_by_spliced_length() {
     let _ = std::fs::remove_file(&mmproj_path);
 }
 
+/// F6-B end-to-end anchor: the paged VLM prefill
+/// ([`LlamaModel::forward_prefill_paged_from_embeds_f32`]) must produce the SAME
+/// logits as the contiguous VLM prefill ([`LlamaModel::forward_prefill_from_embeds`])
+/// for the same prompt + image, bit-tolerant (batched-vs-serial reduction
+/// order). Both run over the IDENTICAL spliced buffer built from the synthetic
+/// clip mmproj's real projected patch features, so this pins that the paged
+/// image-embed-row write matches contiguous. Real-model coherence is
+/// validate-on-HW (no public mmproj GGUF on-box).
+#[test]
+fn vlm_prefill_paged_matches_contiguous_with_image() {
+    use rustllama_models::page_table::PageTable;
+    use rustllama_models::paged_kv_cache::PagedKvCache;
+    use rustllama_models::paged_kv_store::PagedKvStore;
+    use rustllama_models::shared_paged_kv::SharedPagedKv;
+    use rustllama_models::vision_arch::{
+        prepare_vlm_inputs_with_mode, splice_image_embeddings, PlaceholderMode,
+    };
+
+    let (engine, img_id, text_path, mmproj_path) = build_vlm_engine("paged-vs-contig");
+    let cfg = engine.llama_config().clone();
+    let model = engine.__model_for_test();
+    let d_model = cfg.d_model;
+    let prompt: Vec<i32> = vec![1, 2, img_id as i32, 3]; // 1 placeholder + text
+    let png = make_test_png(11);
+    let payloads: Vec<&[u8]> = vec![png.as_slice()];
+
+    // Build the spliced INPUT embeddings exactly as `vlm_prefill_ids` does
+    // (real mmproj patch features at the placeholder, text rows elsewhere).
+    let vision = engine.vision().expect("vision loaded");
+    let prompt_u32: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
+    let vlm_inputs = prepare_vlm_inputs_with_mode(
+        vision.as_ref(),
+        &prompt_u32,
+        img_id,
+        &payloads,
+        PlaceholderMode::OnePerImage,
+    )
+    .expect("prepare_vlm_inputs");
+    let text_embeds = model.embed_tokens(&prompt);
+    let feat_slices = vlm_inputs.feature_slices();
+    let spliced =
+        splice_image_embeddings(&text_embeds, &vlm_inputs.positions, &feat_slices, d_model)
+            .expect("splice");
+    let seq_len = spliced.len() / d_model;
+    assert!(seq_len > prompt.len(), "image splice should expand the sequence");
+
+    // Contiguous VLM forward.
+    let mut kv = KvCache::new(&cfg, engine.max_ctx());
+    let logits_c = model.forward_prefill_from_embeds(&spliced, 0, &mut kv);
+
+    // Paged VLM forward over the SAME spliced buffer.
+    let page_size = 16u32;
+    let total_pages = (seq_len as u32).div_ceil(page_size).max(1);
+    let store = PagedKvStore::new(
+        total_pages,
+        cfg.n_layers as u32,
+        cfg.n_kv_heads as u32,
+        page_size,
+        cfg.head_dim as u32,
+    )
+    .expect("paged store");
+    let table = PageTable::new(total_pages, page_size);
+    let shared = SharedPagedKv::new(store, table);
+    let mut cache = PagedKvCache::new_with_page_size(page_size);
+    cache
+        .ensure_capacity_shared(&shared, seq_len as u32)
+        .expect("ensure_capacity_shared");
+    let logits_p = model.forward_prefill_paged_from_embeds_f32(&spliced, 0, &mut cache, &shared);
+
+    assert_eq!(logits_c.len(), logits_p.len());
+    let mut max_diff = 0f32;
+    for (i, (&a, &b)) in logits_c.iter().zip(logits_p.iter()).enumerate() {
+        let diff = (a - b).abs();
+        max_diff = max_diff.max(diff);
+        assert!(
+            diff < 1e-3,
+            "paged VLM logit[{i}] diverges from contiguous: paged={b} contiguous={a} (diff {diff})"
+        );
+    }
+    let _ = max_diff;
+
+    let _ = std::fs::remove_file(&text_path);
+    let _ = std::fs::remove_file(&mmproj_path);
+}
+
 #[test]
 fn vlm_prefill_rejects_placeholder_image_count_mismatch() {
     // Two placeholders in the prompt but only one image attached —

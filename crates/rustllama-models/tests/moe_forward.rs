@@ -677,7 +677,7 @@ fn forward_ragged_paged_f32_mixed_matches_sequential_prefill_then_decode() {
                 logits_out: rag_b_logits.as_mut_slice(),
             },
         ];
-        model.forward_ragged_paged_f32(&tokens, &mut slots, &rag_shared);
+        model.forward_ragged_paged_f32(&tokens, &mut slots, &rag_shared, None);
     }
     // Same follow-up decode on A (proves the ragged pass wrote A's KV identically).
     let mut rag_a_logits = vec![0f32; cfg.vocab_size];
@@ -777,7 +777,7 @@ fn forward_ragged_paged_f32_all_decode_matches_batched_decode() {
             RaggedSlot { n_query: 1, start_pos: n as u32, cache: &mut rag_a, logits_out: rag_a_logits.as_mut_slice() },
             RaggedSlot { n_query: 1, start_pos: n as u32, cache: &mut rag_b, logits_out: rag_b_logits.as_mut_slice() },
         ];
-        model.forward_ragged_paged_f32(&tokens, &mut slots, &rag_shared);
+        model.forward_ragged_paged_f32(&tokens, &mut slots, &rag_shared, None);
     }
 
     let max_err = |x: &[f32], y: &[f32]| -> f32 {

@@ -5539,7 +5539,7 @@ fn run_chunked_prefill(
 /// AVX2/AVX-512 paths). Called K+1 times per speculation verify in
 /// `verify_speculation_inner`; SIMD-accelerated softmax pays back
 /// at vocab=128K.
-fn softmax_to_vec(logits: &[f32]) -> Vec<f32> {
+pub(crate) fn softmax_to_vec(logits: &[f32]) -> Vec<f32> {
     let mut out = logits.to_vec();
     rustllama_kernels_cpu::softmax_f32_inplace(&mut out);
     out

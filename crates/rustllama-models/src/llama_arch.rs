@@ -9104,6 +9104,91 @@ impl LlamaModel {
         }
     }
 
+    /// F7 — paged analog of [`Self::forward_one_with_mtp_logits`]. Runs ONE
+    /// paged decode step for `token_id` at `pos` over the slot's paged KV
+    /// (`shared` pool), writing the tip token's K/V and the MAIN distribution,
+    /// then runs each MTP head's sidecar over the captured post-last-layer
+    /// hidden to produce the per-head draft logits the tree builder consumes.
+    ///
+    /// The main forward REUSES the fully-validated single-token paged inner
+    /// ([`Self::forward_one_paged_f32_inner`], driven under the shared store
+    /// lock), so the tip's main logits are identical to a classic paged decode
+    /// at the same `(token_id, pos)` — only the MTP sidecars are added on top.
+    /// Bit-identical to a classic paged decode when the model has no MTP heads
+    /// (`mtp_logits_out` must then be empty, matching the contiguous twin). The
+    /// caller must `ensure_capacity_shared` the cache to at least `pos + 1`.
+    pub fn forward_one_with_mtp_logits_paged(
+        &self,
+        token_id: i32,
+        pos: u32,
+        cache: &mut crate::paged_kv_cache::PagedKvCache,
+        shared: &crate::shared_paged_kv::SharedPagedKv,
+        main_logits_out: &mut [f32],
+        mtp_logits_out: &mut [Vec<f32>],
+    ) {
+        let cfg = &self.cfg;
+        let d = cfg.d_model;
+        let n_heads = cfg.n_heads;
+        let n_kv_heads = cfg.n_kv_heads;
+        let head_dim = cfg.head_dim;
+        let d_q = n_heads * head_dim;
+        let d_kv = n_kv_heads * head_dim;
+        let d_ff = cfg.d_ff;
+        let (n_experts, top_k) = cfg
+            .moe
+            .as_ref()
+            .map(|m| (m.n_experts as usize, m.n_experts_used as usize))
+            .unwrap_or((0, 0));
+        // Decode semantics: the tip attends `[0, pos + 1)` (its own row + the
+        // committed prefix), exactly like a single-token paged decode.
+        let kv_len = pos as usize + 1;
+        let mut captured_hidden: Vec<f32> = Vec::new();
+        crate::accel::with_forward_scratch(
+            d, d_q, d_kv, d_ff, head_dim, cfg.rope_theta, n_experts, top_k,
+            |scratch| {
+                // The single-token paged inner takes an already-locked store;
+                // the batch driver reaches the store through `shared`.
+                shared.with_store_mut(|store| {
+                    self.forward_one_paged_f32_inner(
+                        token_id,
+                        pos,
+                        cache,
+                        store,
+                        main_logits_out,
+                        scratch,
+                        kv_len,
+                    );
+                });
+                // `forward_one_paged_f32_inner` leaves `scratch.hidden` holding
+                // the post-last-layer hidden (pre-output-norm) — exactly what
+                // every MTP head consumes (same contract the contiguous
+                // `forward_one_with_mtp_logits` relies on).
+                captured_hidden = scratch.hidden.clone();
+            },
+        );
+
+        let heads = match self.weights.mtp_heads.as_ref() {
+            Some(h) => h,
+            None => {
+                assert!(
+                    mtp_logits_out.is_empty(),
+                    "forward_one_with_mtp_logits_paged: model has no MTP heads but caller \
+                     requested {} head logits — pass an empty slice for non-MTP models",
+                    mtp_logits_out.len()
+                );
+                return;
+            }
+        };
+        assert_eq!(
+            mtp_logits_out.len(),
+            heads.len(),
+            "forward_one_with_mtp_logits_paged: mtp_logits_out length must equal n_mtp_heads"
+        );
+        for (k_idx, head) in heads.iter().enumerate() {
+            self.forward_mtp_head_sidecar(&captured_hidden, head, &mut mtp_logits_out[k_idx]);
+        }
+    }
+
     /// Single-position sidecar transformer block for one MTP head.
     /// See `forward_one_with_mtp_logits` for the topology rationale.
     fn forward_mtp_head_sidecar(
@@ -11188,11 +11273,23 @@ impl LlamaModel {
     /// `start_pos + n_query`. Per-slot `cache` / `logits_out` borrows must be
     /// disjoint. Parity is pinned by
     /// `forward_ragged_paged_f32_mixed_matches_sequential_prefill_then_decode`.
+    ///
+    /// F6-B — image-embed-row source: `embed_rows` optionally supplies the
+    /// `[Σ n_query × d_model]` row-major INPUT embeddings for the concatenated
+    /// token buffer instead of the per-token embedding-table lookup. `None`
+    /// (the driver's text path) is byte-identical to the token-id embed. `Some`
+    /// is the VLM path — a prompt's image-placeholder positions carry projected
+    /// patch embeddings (from the vision splice, exactly like the contiguous
+    /// `forward_prefill_from_embeds`), so the spliced rows get written into the
+    /// paged KV. The rows still RoPE + attend at their sequential `start_pos +
+    /// j` positions, identical to the token path; only the first embed step
+    /// differs. See `forward_prefill_paged_from_embeds_f32`.
     pub fn forward_ragged_paged_f32(
         &self,
         tokens: &[i32],
         slots: &mut [crate::llama_arch::RaggedSlot<'_>],
         shared: &crate::shared_paged_kv::SharedPagedKv,
+        embed_rows: Option<&[f32]>,
     ) {
         let n_slots = slots.len();
         if n_slots == 0 {
@@ -11275,14 +11372,32 @@ impl LlamaModel {
         let mut k_slab = vec![0f32; slab_len];
         let mut v_slab = vec![0f32; slab_len];
 
-        // Embed every concatenated token into its hidden row.
-        for (r, &tok) in tokens.iter().enumerate() {
-            k::embed_lookup_tensor(
-                &self.weights.token_embd,
-                &[tok],
-                &mut hidden[r * d..(r + 1) * d],
-                d,
-            );
+        // Embed every concatenated token into its hidden row. F6-B: when
+        // `embed_rows` is supplied (the VLM splice path), copy the pre-computed
+        // input embeddings verbatim instead of the token-id lookup — the
+        // image-placeholder rows carry projected patch features. `None` (the
+        // text path) keeps the byte-identical token-embed lookup.
+        match embed_rows {
+            Some(rows) => {
+                assert_eq!(
+                    rows.len(),
+                    total * d,
+                    "forward_ragged_paged_f32: embed_rows len {} != Σ n_query × d_model {}",
+                    rows.len(),
+                    total * d,
+                );
+                hidden.copy_from_slice(rows);
+            }
+            None => {
+                for (r, &tok) in tokens.iter().enumerate() {
+                    k::embed_lookup_tensor(
+                        &self.weights.token_embd,
+                        &[tok],
+                        &mut hidden[r * d..(r + 1) * d],
+                        d,
+                    );
+                }
+            }
         }
 
         // MoE per-token scratch (per-token routing ⇒ a per-row loop, exactly
@@ -11555,6 +11670,318 @@ impl LlamaModel {
                 .logits_out
                 .copy_from_slice(&logits_all[p * vocab..(p + 1) * vocab]);
         }
+    }
+
+    /// F6-B — paged VLM prefill from a pre-spliced INPUT-embedding buffer.
+    /// The paged analog of the contiguous [`Self::forward_prefill_from_embeds`]:
+    /// given a `[seq_len × d_model]` row-major embedding sequence (the vision
+    /// splice output — text-token rows with image-placeholder positions replaced
+    /// by projected patch rows), write every row's K/V into the slot's paged
+    /// cache at positions `[start_pos, start_pos + seq_len)` and return the FINAL
+    /// position's logits (same shape `forward_prefill_paged_f32` returns).
+    ///
+    /// Routes through [`Self::forward_ragged_paged_f32`] with a single prefill
+    /// slot and the `embed_rows` source, so it shares the batched layer body
+    /// (bit-tolerant to the serial contiguous `forward_prefill_from_embeds` up to
+    /// flash-prefill reduction order, exactly like the text batched-vs-serial
+    /// prefill). The caller must `ensure_capacity_shared` the cache to at least
+    /// `start_pos + seq_len` first.
+    pub fn forward_prefill_paged_from_embeds_f32(
+        &self,
+        embeds: &[f32],
+        start_pos: u32,
+        cache: &mut crate::paged_kv_cache::PagedKvCache,
+        shared: &crate::shared_paged_kv::SharedPagedKv,
+    ) -> Vec<f32> {
+        let d = self.cfg.d_model;
+        assert_eq!(
+            embeds.len() % d,
+            0,
+            "forward_prefill_paged_from_embeds_f32: embeds.len()={} not a multiple of d_model={}",
+            embeds.len(),
+            d,
+        );
+        let n_new = embeds.len() / d;
+        let mut logits = vec![0f32; self.cfg.vocab_size];
+        if n_new == 0 {
+            return logits;
+        }
+        // One ragged PREFILL slot covering the whole spliced sequence; the
+        // ragged forward writes each row's K/V and emits the LAST row's logits
+        // (its `logit_rows` picks the final query of a slot with a non-empty
+        // `logits_out`), matching the contiguous prefill's "return final logits".
+        let dummy_tokens: Vec<i32> = vec![0; n_new];
+        let mut slot = crate::llama_arch::RaggedSlot {
+            n_query: n_new,
+            start_pos,
+            cache,
+            logits_out: &mut logits,
+        };
+        self.forward_ragged_paged_f32(
+            &dummy_tokens,
+            std::slice::from_mut(&mut slot),
+            shared,
+            Some(embeds),
+        );
+        logits
+    }
+
+    /// F7 — paged tree-structured speculative verification forward (F32 KV).
+    /// The paged analog of [`Self::forward_tree_verify_f32`]: scores a draft
+    /// TREE in ONE forward over the slot's paged KV. Node `i`'s token is written
+    /// to paged slot `start_pos + i`, RoPE'd at its DEPTH (`start_pos +
+    /// depths[i]`), and attends only the committed prefix `[0, start_pos)` plus
+    /// its own ancestor chain among the tree slots (via the shared
+    /// [`rustllama_kernels_cpu::gqa_attention_tree_prefill`] over the gathered
+    /// slab). Writes per-node logits into `logits_out` (`[nodes × vocab]`).
+    ///
+    /// `parent[i]` is the tree-local parent index (negative = root level),
+    /// topologically ordered (`parent[i] < i`). A CHAIN-shaped tree
+    /// (`depths[i] == i`, `parent[i] == i-1`) reduces to `n` sequential paged
+    /// decodes — bit-exact up to the flash-vs-tree attention reduction order,
+    /// the same tolerance the contiguous chain guard uses — pinned by
+    /// `forward_tree_verify_paged_f32_chain_matches_linear`. Reuses
+    /// `gqa_attention_tree_prefill` (no duplicated mask math) and handles both
+    /// dense and MoE blocks like [`Self::forward_ragged_paged_f32`].
+    ///
+    /// Contract: F32 paged KV only; the caller must `ensure_capacity_shared` the
+    /// cache to at least `start_pos + nodes.len()`, and the committed prefix
+    /// `[0, start_pos)` (including the tip written by
+    /// [`Self::forward_one_with_mtp_logits_paged`]) must already be resident.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_tree_verify_paged_f32(
+        &self,
+        tokens: &[i32],
+        start_pos: u32,
+        depths: &[u32],
+        parent: &[i32],
+        cache: &mut crate::paged_kv_cache::PagedKvCache,
+        shared: &crate::shared_paged_kv::SharedPagedKv,
+        logits_out: &mut [f32],
+    ) {
+        let cfg = &self.cfg;
+        let n_new = tokens.len();
+        assert_eq!(depths.len(), n_new, "paged tree verify: one depth per node");
+        assert_eq!(parent.len(), n_new, "paged tree verify: one parent per node");
+        assert_eq!(
+            logits_out.len(),
+            n_new * cfg.vocab_size,
+            "forward_tree_verify_paged_f32: logits_out must be nodes * vocab_size"
+        );
+        if n_new == 0 {
+            return;
+        }
+        let d = cfg.d_model;
+        let n_heads = cfg.n_heads;
+        let n_kv_heads = cfg.n_kv_heads;
+        let head_dim = cfg.head_dim;
+        let d_q = n_heads * head_dim;
+        let d_kv = n_kv_heads * head_dim;
+        let d_ff = cfg.d_ff;
+        let vocab = cfg.vocab_size;
+        let kv_len_base = start_pos as usize;
+        // Total positions attended = committed prefix + the tree nodes. The
+        // gather slab is strided by this (it is the `max_ctx` the tree kernel
+        // sees), and `kv_len_base + n_new == kv_len` holds exactly.
+        let kv_len = kv_len_base + n_new;
+        debug_assert!(
+            (kv_len as u32) <= cache.capacity_tokens(),
+            "paged tree verify: cache capacity {} < kv_len {kv_len} \
+             (caller must ensure_capacity_shared first)",
+            cache.capacity_tokens(),
+        );
+
+        let mut hidden = vec![0f32; n_new * d];
+        let mut h_norm = vec![0f32; n_new * d];
+        let mut q_buf = vec![0f32; n_new * d_q];
+        let mut k_buf = vec![0f32; n_new * d_kv];
+        let mut v_buf = vec![0f32; n_new * d_kv];
+        let mut attn_out = vec![0f32; n_new * d_q];
+        let mut attn_proj = vec![0f32; n_new * d];
+        let mut gate_buf = vec![0f32; n_new * d_ff];
+        let mut up_buf = vec![0f32; n_new * d_ff];
+        let mut ffn_buf = vec![0f32; n_new * d_ff];
+        let mut ffn_out = vec![0f32; n_new * d];
+
+        let slab_len = n_kv_heads * kv_len * head_dim;
+        let mut k_slab = vec![0f32; slab_len];
+        let mut v_slab = vec![0f32; slab_len];
+
+        for (i, &tok) in tokens.iter().enumerate() {
+            k::embed_lookup_tensor(
+                &self.weights.token_embd,
+                &[tok],
+                &mut hidden[i * d..(i + 1) * d],
+                d,
+            );
+        }
+
+        let moe_cfg = cfg.moe.clone();
+        let (mut moe_gate_one, mut moe_up_one, mut moe_ff_one, mut moe_down_one) =
+            if moe_cfg.is_some() {
+                (vec![0f32; d_ff], vec![0f32; d_ff], vec![0f32; d_ff], vec![0f32; d])
+            } else {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            };
+        let (mut moe_expert_logits, mut moe_routed_picks) = if let Some(m) = moe_cfg.as_ref() {
+            (vec![0f32; m.n_experts as usize], Vec::with_capacity(m.n_experts_used as usize))
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        let attn_views: Vec<&dyn AttnBlock> =
+            if let Some(mbs) = self.weights.moe_blocks.as_ref() {
+                mbs.iter().map(|b| b as &dyn AttnBlock).collect()
+            } else {
+                self.weights.blocks.iter().map(|b| b as &dyn AttnBlock).collect()
+            };
+        let n_layers_used = crate::accel::max_layers_cap()
+            .unwrap_or(attn_views.len())
+            .min(attn_views.len());
+
+        for (layer_idx, block) in attn_views.iter().take(n_layers_used).enumerate() {
+            crate::accel::set_current_layer_idx(layer_idx as u32);
+            for i in 0..n_new {
+                k::rmsnorm_f32_row(
+                    &hidden[i * d..(i + 1) * d],
+                    block.attn_norm(),
+                    &mut h_norm[i * d..(i + 1) * d],
+                    cfg.rms_eps,
+                );
+            }
+            matvec_tensor_batched_dispatch(block.w_q(), &h_norm, &mut q_buf, d_q, d, n_new);
+            matvec_tensor_batched_dispatch(block.w_k(), &h_norm, &mut k_buf, d_kv, d, n_new);
+            matvec_tensor_batched_dispatch(block.w_v(), &h_norm, &mut v_buf, d_kv, d, n_new);
+            // Per-node bias + Qwen3 q/k-norm + RoPE at the node's DEPTH position
+            // (siblings share a position), so a chain tree matches sequential.
+            for i in 0..n_new {
+                let q_row = &mut q_buf[i * d_q..(i + 1) * d_q];
+                let k_row = &mut k_buf[i * d_kv..(i + 1) * d_kv];
+                let v_row = &mut v_buf[i * d_kv..(i + 1) * d_kv];
+                if let Some(bq) = block.b_q() {
+                    k::add_inplace_f32(q_row, bq);
+                }
+                if let Some(bk) = block.b_k() {
+                    k::add_inplace_f32(k_row, bk);
+                }
+                if let Some(bv) = block.b_v() {
+                    k::add_inplace_f32(v_row, bv);
+                }
+                apply_qk_head_norm(
+                    block.q_norm(),
+                    block.k_norm(),
+                    q_row,
+                    k_row,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    cfg.rms_eps,
+                );
+                let pos = start_pos + depths[i];
+                self.rope_inplace(q_row, n_heads, head_dim, pos);
+                self.rope_inplace(k_row, n_kv_heads, head_dim, pos);
+            }
+            // Write each node's K/V at its FLAT paged position `start_pos + i`.
+            for i in 0..n_new {
+                let pos = start_pos + i as u32;
+                let k_row = &k_buf[i * d_kv..(i + 1) * d_kv];
+                let v_row = &v_buf[i * d_kv..(i + 1) * d_kv];
+                cache
+                    .write_token_shared(shared, layer_idx as u32, pos, k_row, v_row)
+                    .expect("paged tree verify write_token_shared: pos < capacity");
+            }
+            // Gather `[0, kv_len)` (committed prefix + tree nodes) into the slab.
+            cache
+                .gather_layer_shared(shared, layer_idx as u32, &mut k_slab, &mut v_slab)
+                .expect("paged tree verify gather_layer_shared: cache covers kv_len");
+            // Ancestor-masked attention: the committed prefix `[0, start_pos)` is
+            // seen by every node; a tree slot only by nodes whose ancestor chain
+            // contains it. Slab stride == `kv_len`, tree slots at `[start_pos,
+            // start_pos + n_new)`. A chain `parent` reduces this to causal.
+            k::gqa_attention_tree_prefill(
+                &q_buf,
+                &k_slab,
+                &v_slab,
+                &mut attn_out,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_len,
+                kv_len_base,
+                n_new,
+                parent,
+            );
+            matvec_tensor_batched_dispatch(block.w_o(), &attn_out, &mut attn_proj, d, d_q, n_new);
+            for i in 0..n_new {
+                let proj_row = &attn_proj[i * d..(i + 1) * d];
+                let h_row = &mut hidden[i * d..(i + 1) * d];
+                if !skip_attn_enabled() {
+                    k::add_inplace_f32(h_row, proj_row);
+                }
+                let n_row = &mut h_norm[i * d..(i + 1) * d];
+                k::rmsnorm_f32_row(h_row, block.ffn_norm(), n_row, cfg.rms_eps);
+            }
+            if let Some(moe) = moe_cfg.as_ref() {
+                let mb = &self.weights.moe_blocks.as_ref().unwrap()[layer_idx];
+                for i in 0..n_new {
+                    let n_row = &h_norm[i * d..(i + 1) * d];
+                    let out_row = &mut ffn_out[i * d..(i + 1) * d];
+                    crate::moe::moe_ffn_one_into(
+                        n_row,
+                        mb,
+                        d,
+                        d_ff,
+                        moe.n_experts as usize,
+                        moe.n_experts_used as usize,
+                        out_row,
+                        &mut moe_gate_one,
+                        &mut moe_up_one,
+                        &mut moe_ff_one,
+                        &mut moe_down_one,
+                        &mut moe_expert_logits,
+                        &mut moe_routed_picks,
+                    );
+                }
+            } else {
+                let dense_block = &self.weights.blocks[layer_idx];
+                matvec_tensor_batched_dispatch(&dense_block.w_gate, &h_norm, &mut gate_buf, d_ff, d, n_new);
+                matvec_tensor_batched_dispatch(&dense_block.w_up, &h_norm, &mut up_buf, d_ff, d, n_new);
+                for i in 0..n_new {
+                    k::silu_mul_f32(
+                        &gate_buf[i * d_ff..(i + 1) * d_ff],
+                        &up_buf[i * d_ff..(i + 1) * d_ff],
+                        &mut ffn_buf[i * d_ff..(i + 1) * d_ff],
+                    );
+                }
+                matvec_tensor_batched_dispatch(&dense_block.w_down, &ffn_buf, &mut ffn_out, d, d_ff, n_new);
+            }
+            if !skip_ffn_enabled() {
+                for i in 0..n_new {
+                    k::add_inplace_f32(
+                        &mut hidden[i * d..(i + 1) * d],
+                        &ffn_out[i * d..(i + 1) * d],
+                    );
+                }
+            }
+        }
+
+        // Final norm + LM head for EVERY node (per-node logits for the verifier).
+        let lm_head = self
+            .weights
+            .output
+            .as_ref()
+            .unwrap_or(&self.weights.token_embd);
+        let mut final_norm = vec![0f32; n_new * d];
+        for i in 0..n_new {
+            k::rmsnorm_f32_row(
+                &hidden[i * d..(i + 1) * d],
+                &self.weights.output_norm,
+                &mut final_norm[i * d..(i + 1) * d],
+                cfg.rms_eps,
+            );
+        }
+        matvec_tensor_batched_dispatch(lm_head, &final_norm, logits_out, vocab, d, n_new);
+        self.finalize_logits(logits_out);
     }
 
     /// Paged-KV variant of [`Self::forward_one`] (single decode step).
@@ -15276,6 +15703,224 @@ mod tests {
         model.forward_tree_verify_f32(&rest, 2, &depths2, &parent2, &mut kv_tree2, &mut tree2);
         for (i, (&a, &b)) in tree2.iter().zip(lin2.iter()).enumerate() {
             assert!((a - b).abs() < 1e-3, "tree-chain(prefix) logit[{i}]: tree={a} lin={b}");
+        }
+    }
+
+    /// F7 degenerate-case anchor (paged twin of
+    /// `forward_tree_verify_f32_chain_matches_speculation`): a CHAIN-shaped tree
+    /// (`depths[i]==i`, `parent[i]==i-1`) run through
+    /// [`LlamaModel::forward_tree_verify_paged_f32`] must match `n` sequential
+    /// paged decodes of the same tokens at the same positions — within the
+    /// attention-reduction tolerance the linear-vs-tree kernels differ by. This
+    /// pins that the paged depth-RoPE + ancestor-mask forward reduces exactly to
+    /// linear paged decode, so only genuine branching diverges. Model-blind (no
+    /// MTP head needed — it scores arbitrary tokens as a chain).
+    #[test]
+    fn forward_tree_verify_paged_f32_chain_matches_linear() {
+        use crate::shared_paged_kv::SharedPagedKv;
+        let cfg = synth_cfg(2, 2, 8);
+        let model = synth_llama_model(&cfg);
+        let vocab = cfg.vocab_size;
+        let tokens: Vec<i32> = vec![5, 7, 2, 14, 3];
+        let n = tokens.len();
+        let page_size = 4u32;
+        let max_ctx = 32u32;
+        let total_pages = max_ctx.div_ceil(page_size);
+
+        // Linear reference: n sequential single-slot paged decodes feeding
+        // tokens[i] at pos i, capturing each step's logits. (Fresh store so the
+        // reference KV is independent of the tree run.)
+        let lin_store = crate::paged_kv_store::PagedKvStore::new(
+            total_pages, cfg.n_layers as u32, cfg.n_kv_heads as u32, page_size, cfg.head_dim as u32,
+        )
+        .expect("lin store");
+        let lin_table = crate::page_table::PageTable::new(total_pages, page_size);
+        let lin_shared = SharedPagedKv::new(lin_store, lin_table);
+        let mut lin_cache = crate::paged_kv_cache::PagedKvCache::new_with_page_size(page_size);
+        lin_cache.ensure_capacity_shared(&lin_shared, n as u32).expect("lin cap");
+        let mut lin_logits = vec![0f32; n * vocab];
+        for (i, &tok) in tokens.iter().enumerate() {
+            let mut slot = DecodeSlot {
+                token_id: tok,
+                pos: i as u32,
+                cache: &mut lin_cache,
+                logits_out: &mut lin_logits[i * vocab..(i + 1) * vocab],
+            };
+            model.forward_decode_paged_batched_f32(std::slice::from_mut(&mut slot), &lin_shared);
+        }
+
+        // Tree run: a chain tree over the same tokens at start_pos 0.
+        let tree_store = crate::paged_kv_store::PagedKvStore::new(
+            total_pages, cfg.n_layers as u32, cfg.n_kv_heads as u32, page_size, cfg.head_dim as u32,
+        )
+        .expect("tree store");
+        let tree_table = crate::page_table::PageTable::new(total_pages, page_size);
+        let tree_shared = SharedPagedKv::new(tree_store, tree_table);
+        let mut tree_cache = crate::paged_kv_cache::PagedKvCache::new_with_page_size(page_size);
+        tree_cache.ensure_capacity_shared(&tree_shared, n as u32).expect("tree cap");
+        let depths: Vec<u32> = (0..n as u32).collect();
+        let parent: Vec<i32> = (0..n as i32).map(|i| i - 1).collect();
+        let mut tree_logits = vec![0f32; n * vocab];
+        model.forward_tree_verify_paged_f32(
+            &tokens, 0, &depths, &parent, &mut tree_cache, &tree_shared, &mut tree_logits,
+        );
+
+        let mut max_diff = 0f32;
+        for (i, (&a, &b)) in tree_logits.iter().zip(lin_logits.iter()).enumerate() {
+            let diff = (a - b).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 1e-3,
+                "paged tree-chain logit[{i}]: tree={a} linear={b} (diff {diff})"
+            );
+        }
+        let _ = max_diff;
+    }
+
+    /// F7 commit anchor (paged twin of `kvcache_compact_tokens_moves_scattered_slots`):
+    /// [`crate::paged_kv_store::PagedKvStore::compact_positions`] moves a scattered
+    /// accepted path's K/V (positions base+{0,2,4}) into the contiguous committed
+    /// positions base+{0,1,2}, for every layer + head, leaving the data intact —
+    /// across a page boundary (page_size 4, base 3 ⇒ positions span pages 0/1/2).
+    #[test]
+    fn paged_compact_positions_moves_scattered_slots() {
+        let page_size = 4u32;
+        let n_layers = 2u32;
+        let n_kv_heads = 2u32;
+        let head_dim = 8u32;
+        let total_pages = 4u32; // covers positions [0, 16)
+        let mut store = crate::paged_kv_store::PagedKvStore::new(
+            total_pages, n_layers, n_kv_heads, page_size, head_dim,
+        )
+        .expect("store");
+        let pages: Vec<crate::page_table::PageId> =
+            (0..total_pages).map(crate::page_table::PageId).collect();
+        let base = 3usize;
+        let n_nodes = 5usize;
+        let stamp = |pos: usize, h: u32, dd: u32| (pos as f32) * 100.0 + (h as f32) * 10.0 + dd as f32;
+        // Stamp tree slots base+{0..5} with distinct values on every layer+head.
+        for s in 0..n_nodes {
+            let pos = (base + s) as u32;
+            let k_row: Vec<f32> =
+                (0..n_kv_heads * head_dim).map(|i| stamp(base + s, i / head_dim, i % head_dim)).collect();
+            let v_row: Vec<f32> = k_row.iter().map(|x| x + 0.5).collect();
+            for layer in 0..n_layers {
+                store.write_token(&pages, layer, pos, &k_row, &v_row).expect("write");
+            }
+        }
+        // Accept scattered path nodes {0, 2, 4} → committed positions {0, 1, 2}.
+        let accepted = [0usize, 2, 4];
+        store.compact_positions(&pages, base, &accepted);
+        // After compaction, committed position base+j holds node accepted[j]'s data.
+        for (j, &src) in accepted.iter().enumerate() {
+            let dst_pos = base + j;
+            let page = pages[dst_pos / page_size as usize];
+            let in_page = (dst_pos % page_size as usize) as u32;
+            for h in 0..n_kv_heads {
+                let k = store.k_row(page, 0, h, in_page).expect("k row");
+                for (dd, &val) in k.iter().enumerate() {
+                    let expect = stamp(base + src, h, dd as u32);
+                    assert_eq!(
+                        val.to_bits(),
+                        expect.to_bits(),
+                        "compacted K[j={j} src={src} h={h} d={dd}]: got {val} want {expect}"
+                    );
+                }
+                let v = store.v_row(page, 1, h, in_page).expect("v row");
+                for (dd, &val) in v.iter().enumerate() {
+                    let expect = stamp(base + src, h, dd as u32) + 0.5;
+                    assert_eq!(val.to_bits(), expect.to_bits(), "compacted V[j={j} src={src}]");
+                }
+            }
+        }
+    }
+
+    /// F6-B anchor (paged VLM ≡ contiguous VLM at the forward level): a spliced
+    /// INPUT-embedding buffer run through [`LlamaModel::forward_prefill_paged_from_embeds_f32`]
+    /// must match the contiguous [`LlamaModel::forward_prefill_from_embeds`] on
+    /// the SAME buffer, within the batched-vs-serial reduction tolerance. The
+    /// embed rows stand in for a vision splice (text rows + projected image
+    /// rows); the real mmproj-driven splice is exercised end-to-end in the
+    /// engine's `vlm_prefill_paged_matches_contiguous_with_image`.
+    #[test]
+    fn forward_prefill_paged_from_embeds_f32_matches_contiguous_from_embeds() {
+        use crate::shared_paged_kv::SharedPagedKv;
+        let cfg = synth_cfg(2, 2, 8);
+        let model = synth_llama_model(&cfg);
+        let d = cfg.d_model;
+        let vocab = cfg.vocab_size;
+        let n = 6usize;
+        // Arbitrary "spliced" embeddings (a VLM splice is just a row buffer).
+        let embeds: Vec<f32> = (0..n * d).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+
+        let mut contig_kv = KvCache::new(&cfg, 32);
+        let logits_c = model.forward_prefill_from_embeds(&embeds, 0, &mut contig_kv);
+
+        let page_size = 4u32;
+        let total_pages = 32u32.div_ceil(page_size);
+        let store = crate::paged_kv_store::PagedKvStore::new(
+            total_pages, cfg.n_layers as u32, cfg.n_kv_heads as u32, page_size, cfg.head_dim as u32,
+        )
+        .expect("store");
+        let table = crate::page_table::PageTable::new(total_pages, page_size);
+        let shared = SharedPagedKv::new(store, table);
+        let mut cache = crate::paged_kv_cache::PagedKvCache::new_with_page_size(page_size);
+        cache.ensure_capacity_shared(&shared, n as u32).expect("cap");
+        let logits_p = model.forward_prefill_paged_from_embeds_f32(&embeds, 0, &mut cache, &shared);
+
+        assert_eq!(logits_c.len(), logits_p.len());
+        for (i, (&a, &b)) in logits_c.iter().zip(logits_p.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-3,
+                "paged-from-embeds logit[{i}]: paged={b} contiguous={a}"
+            );
+        }
+        let _ = vocab;
+    }
+
+    /// F6-B text-only-identity: feeding `embed_tokens(tokens)` through the paged
+    /// embed-row prefill must match a paged TOKEN prefill of the same tokens,
+    /// within the batched reduction tolerance — i.e. the embed-row source is a
+    /// faithful substitute for the token-id lookup on the text path (the VLM
+    /// model's text-only requests stay correct).
+    #[test]
+    fn forward_prefill_paged_from_embeds_f32_text_matches_token_prefill() {
+        use crate::shared_paged_kv::SharedPagedKv;
+        let cfg = synth_cfg(2, 2, 8);
+        let model = synth_llama_model(&cfg);
+        let tokens: Vec<i32> = vec![3, 1, 4, 1, 5, 9];
+        let n = tokens.len();
+        let embeds = model.embed_tokens(&tokens);
+
+        let page_size = 4u32;
+        let total_pages = 32u32.div_ceil(page_size);
+        // Token prefill reference (direct-store path).
+        let mut tok_store = crate::paged_kv_store::PagedKvStore::new(
+            total_pages, cfg.n_layers as u32, cfg.n_kv_heads as u32, page_size, cfg.head_dim as u32,
+        )
+        .expect("tok store");
+        let mut tok_table = crate::page_table::PageTable::new(total_pages, page_size);
+        let mut tok_cache = crate::paged_kv_cache::PagedKvCache::new_for(&tok_store);
+        tok_cache.ensure_capacity(&mut tok_table, n as u32).expect("tok cap");
+        let logits_tok = model.forward_prefill_paged_f32(&tokens, 0, &mut tok_cache, &mut tok_store);
+
+        // Embed-row prefill (ragged/shared path).
+        let store = crate::paged_kv_store::PagedKvStore::new(
+            total_pages, cfg.n_layers as u32, cfg.n_kv_heads as u32, page_size, cfg.head_dim as u32,
+        )
+        .expect("store");
+        let table = crate::page_table::PageTable::new(total_pages, page_size);
+        let shared = SharedPagedKv::new(store, table);
+        let mut cache = crate::paged_kv_cache::PagedKvCache::new_with_page_size(page_size);
+        cache.ensure_capacity_shared(&shared, n as u32).expect("cap");
+        let logits_emb = model.forward_prefill_paged_from_embeds_f32(&embeds, 0, &mut cache, &shared);
+
+        assert_eq!(logits_tok.len(), logits_emb.len());
+        for (i, (&a, &b)) in logits_tok.iter().zip(logits_emb.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-3,
+                "paged embed-row vs token prefill logit[{i}]: embed={b} token={a}"
+            );
         }
     }
 
