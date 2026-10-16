@@ -9546,6 +9546,14 @@ impl LlamaModel {
             // Attention is per-slot because each slot has its own
             // kv_len and its own KV history — fused attention
             // requires a paged-attention kernel that we'll add later.
+            // D1b: per-layer SWA window (0 ⇒ full attention) + Gemma2 attn-logit
+            // soft-cap (0.0 ⇒ none), threaded into the capped+windowed decode
+            // kernels so an SWA / Gemma2-softcap model is correct on the paged
+            // batched decode path. At 0 / 0.0 the capped+windowed kernels delegate
+            // to the plain decode dispatchers, byte-identical for every ordinary
+            // (non-SWA, non-softcap) model.
+            let swa_win = cfg.swa_window(layer_idx);
+            let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
             for (i, slot) in slots.iter_mut().enumerate() {
                 let kv_len = slot.pos as usize + 1;
                 let k_row = &k_buf[i * d_kv..(i + 1) * d_kv];
@@ -9570,14 +9578,14 @@ impl LlamaModel {
                 let q_row = &q_buf[i * d_q..(i + 1) * d_q];
                 let out_row = &mut attn_out[i * d_q..(i + 1) * d_q];
                 if crate::accel::flash_attention_enabled() && kv_len >= flash_min {
-                    k::gqa_attention_flash_decode(
+                    k::gqa_attention_flash_decode_capped_windowed(
                         q_row, k_slice, v_slice, out_row,
-                        n_heads, n_kv_heads, head_dim, kv_len, kv_len,
+                        n_heads, n_kv_heads, head_dim, kv_len, kv_len, swa_win, softcap,
                     );
                 } else {
-                    k::gqa_attention_one_step(
+                    k::gqa_attention_one_step_capped_windowed(
                         q_row, k_slice, v_slice, out_row,
-                        n_heads, n_kv_heads, head_dim, kv_len, kv_len,
+                        n_heads, n_kv_heads, head_dim, kv_len, kv_len, swa_win, softcap,
                     );
                 }
             }
@@ -10569,16 +10577,23 @@ impl LlamaModel {
             // kv_len (different accumulation order between the two
             // kernels would otherwise diverge by a few rounding
             // bits).
+            // D1b: per-layer SWA window (0 ⇒ full) + Gemma2 attn-logit soft-cap
+            // (0.0 ⇒ none), threaded into the capped+windowed decode kernels so
+            // an SWA / softcap model is correct on the single-token paged decode
+            // path. At 0 / 0.0 these delegate to the plain decode dispatchers —
+            // byte-identical to the pre-D1b path for every ordinary model.
+            let swa_win = cfg.swa_window(layer_idx);
+            let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
             let flash_min = flash_kv_len_min();
             if crate::accel::flash_attention_enabled() && kv_len >= flash_min {
-                k::gqa_attention_flash_decode(
+                k::gqa_attention_flash_decode_capped_windowed(
                     &q_buf, &paged_k_slab[..slab_len], &paged_v_slab[..slab_len], &mut attn_out,
-                    n_heads, n_kv_heads, head_dim, kv_len, kv_len,
+                    n_heads, n_kv_heads, head_dim, kv_len, kv_len, swa_win, softcap,
                 );
             } else {
-                k::gqa_attention_one_step(
+                k::gqa_attention_one_step_capped_windowed(
                     &q_buf, &paged_k_slab[..slab_len], &paged_v_slab[..slab_len], &mut attn_out,
-                    n_heads, n_kv_heads, head_dim, kv_len, kv_len,
+                    n_heads, n_kv_heads, head_dim, kv_len, kv_len, swa_win, softcap,
                 );
             }
 
@@ -10925,6 +10940,11 @@ impl LlamaModel {
     /// recomputed set, since the suffix is). Leaves `kv` holding the blended KV
     /// (fresh for recomputed positions, isolated-cached for the rest) so decode
     /// can continue from `seq_len = tokens.len()`.
+    ///
+    /// SWA / softcap: the per-layer sliding-window span and Gemma2 attention-logit
+    /// soft-cap are threaded into both attention branches (D2b), so a windowed /
+    /// capped model re-assembles correctly. F32 KV only (asserted via the
+    /// `KvLayer::F32` match arms); the engine gates CacheBlend to F32 KV.
     pub fn forward_prefill_cacheblend(
         &self,
         tokens: &[i32],
@@ -11093,6 +11113,16 @@ impl LlamaModel {
             // attends over `0..=its_pos` via a per-row CPU step: the blended KV
             // is host-resident so a per-row GPU copy would re-upload the whole
             // slab each row (a loss), and no scatter-position GPU kernel exists.
+            // D2b: per-layer SWA window (0 ⇒ full attention) + Gemma2 attn-logit
+            // soft-cap (0.0 ⇒ none), threaded into BOTH CacheBlend attention
+            // branches below so a sliding-window / Gemma2-softcap model is
+            // re-assembled with the correct mask + logit cap. At 0 / 0.0 these
+            // delegate to the plain `gqa_attention_flash_prefill` /
+            // `gqa_attention_one_step`, byte-identical to the pre-D2b path for
+            // every ordinary model (CacheBlend is F32-only; the engine still gates
+            // it off for non-F32 KV, so window/softcap always ride the F32 path).
+            let swa_win = cfg.swa_window(layer_idx);
+            let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
             let mut attn_out = vec![0f32; nr * d_q];
             {
                 let (kslab, vslab) = match &kv.layers[layer_idx] {
@@ -11101,33 +11131,32 @@ impl LlamaModel {
                 };
                 if r_is_full {
                     // Contiguous queries 0..nr (row j is at position j),
-                    // kv_len_base = 0. Shared GPU prefill hook, CPU fallback.
-                    // CacheBlend is an opt-in KV feature whose CPU twin is the plain
-                    // (non-windowed, non-capped) `gqa_attention_flash_prefill`, so
-                    // it carries no SWA / softcap here — window=0 / softcap=0.0.
-                    // A sliding-window / Gemma2-softcap model would therefore be
-                    // mis-served (full-history attention, no logit cap), so D2a
-                    // gates CacheBlend OFF for those models at the engine
-                    // (`inference.rs`: `sliding_window.is_some() ||
-                    // attn_logit_softcapping.is_some()` falls back to plain
-                    // generation); D2b will thread per-layer window/softcap here
-                    // and lift that gate.
+                    // kv_len_base = 0. Shared GPU prefill hook (carries
+                    // window/softcap), CPU capped+windowed fallback.
                     let used_gpu = crate::accel::try_flash_attn_prefill_gpu_f32(
                         &q_r, kslab, vslab, &mut attn_out,
-                        n_heads, n_kv_heads, head_dim, max_ctx, 0, nr, 0, 0.0,
+                        n_heads, n_kv_heads, head_dim, max_ctx, 0, nr,
+                        swa_win as u32, softcap,
                     );
                     if !used_gpu {
-                        k::gqa_attention_flash_prefill(
+                        k::gqa_attention_flash_prefill_capped_windowed(
                             &q_r, kslab, vslab, &mut attn_out,
                             n_heads, n_kv_heads, head_dim, max_ctx, 0, nr,
+                            swa_win, softcap,
                         );
                     }
                 } else {
+                    // Scattered HKVD subset: query j at real position `r_idx[j]`
+                    // attends `[0, r_idx[j]]` (kv_len = r_idx[j] + 1). The
+                    // capped+windowed decode kernel trims to `[kv_len-window,
+                    // kv_len)` = `[pos-window+1, pos+1)`, matching the prefill
+                    // window semantics.
                     for j in 0..nr {
-                        k::gqa_attention_one_step(
+                        k::gqa_attention_one_step_capped_windowed(
                             &q_r[j * d_q..(j + 1) * d_q], kslab, vslab,
                             &mut attn_out[j * d_q..(j + 1) * d_q],
                             n_heads, n_kv_heads, head_dim, max_ctx, r_idx[j] + 1,
+                            swa_win, softcap,
                         );
                     }
                 }
@@ -11846,14 +11875,17 @@ impl LlamaModel {
             // Attention — try the SYCL F32 prefill path first
             // (passes max_ctx = kv_len because the slab is sized
             // exactly there); fall back to CPU if SYCL is off /
-            // hook returns false. This is the PAGED prefill path, whose CPU twin
-            // is the plain `gqa_attention_flash_prefill` — it carries no SWA /
-            // softcap (window=0 / softcap=0.0). An SWA / Gemma2-softcap model
-            // reaches a paged forward only via `PagedBatchEngine`, which (D1a,
-            // `paged_batch.rs` load gate) now REFUSES such models at load — and
-            // the contiguous `CpuEngine` coerces them to its F32 path. So no
-            // window/softcap model is served through this kernel; when D1b wires
-            // per-layer masking/softcap here, that refusal lifts.
+            // hook returns false. This is the PAGED prefill path.
+            // D1b: per-layer SWA window (0 ⇒ full causal) + Gemma2 attn-logit
+            // soft-cap (0.0 ⇒ none) are threaded into BOTH the F32 GPU prefill
+            // hook (which carries them, bit-exact to the CPU reference) and the
+            // CPU `gqa_attention_flash_prefill_capped_windowed` fallback — so a
+            // dense SWA (Mistral-SWA) / Gemma2-softcap model prefilled through
+            // this path (e.g. `generate_batched_token_ids`) masks and caps
+            // correctly. At 0 / 0.0 both delegate to the plain prefill, so an
+            // ordinary model is byte-identical to the pre-D1b path.
+            let swa_win = cfg.swa_window(layer_idx);
+            let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
             let used_gpu = crate::accel::try_flash_attn_prefill_gpu_f32(
                 &q_buf,
                 &k_slab,
@@ -11865,11 +11897,11 @@ impl LlamaModel {
                 kv_len,
                 kv_len_base,
                 n_new,
-                0,
-                0.0,
+                swa_win as u32,
+                softcap,
             );
             if !used_gpu {
-                k::gqa_attention_flash_prefill(
+                k::gqa_attention_flash_prefill_capped_windowed(
                     &q_buf,
                     &k_slab,
                     &v_slab,
@@ -11880,6 +11912,8 @@ impl LlamaModel {
                     kv_len,
                     kv_len_base,
                     n_new,
+                    swa_win,
+                    softcap,
                 );
             }
 
@@ -14450,6 +14484,144 @@ mod tests {
         }
     }
 
+    /// D1b core anchor: a paged-F32 forward (inline prefill + single-token decode
+    /// + batched decode) is BIT-IDENTICAL to the contiguous-F32 forward for the
+    /// same tokens, because both run the same `*_capped_windowed` CPU kernels. At
+    /// `window=0 / softcap=0` (the overwhelming common case) these delegate to the
+    /// plain dispatchers, so this is also the "ordinary model is byte-identical"
+    /// regression guard. With a sliding window / Gemma2 soft-cap set, it pins the
+    /// new correctness path: paged SWA/softcap ≡ contiguous SWA/softcap.
+    fn assert_paged_matches_contiguous(cfg: &LlamaConfig) {
+        let model = synth_llama_model(cfg);
+        // Prompt longer than the test window (3) so the window actually trims.
+        let prompt: Vec<i32> = vec![5, 11, 2, 19, 7, 1];
+        let n_prompt = prompt.len();
+        let last_tok = prompt[n_prompt - 1];
+        let max_ctx = 16;
+
+        // --- Contiguous reference (windowed/capped kernels). ---
+        let mut contig_kv = KvCache::new(cfg, max_ctx);
+        let prefill_contig = model.forward_prefill_batched_f32(&prompt, 0, &mut contig_kv);
+        let mut decode_contig = vec![0f32; cfg.vocab_size];
+        model.forward_one(last_tok, n_prompt as u32, &mut contig_kv, &mut decode_contig);
+
+        // --- Paged (single-owner inline prefill + single-token decode). ---
+        let total_cap = (n_prompt + 1) as u32;
+        let page_size = 4;
+        let pages = total_cap.div_ceil(page_size);
+        let mk_store = || {
+            crate::paged_kv_store::PagedKvStore::new(
+                pages,
+                cfg.n_layers as u32,
+                cfg.n_kv_heads as u32,
+                page_size,
+                cfg.head_dim as u32,
+            )
+            .unwrap()
+        };
+        let mut store = mk_store();
+        let mut table = crate::page_table::PageTable::new(pages, page_size);
+        let mut cache = crate::paged_kv_cache::PagedKvCache::new_for(&store);
+        cache.ensure_capacity(&mut table, total_cap).unwrap();
+        let prefill_paged = model.forward_prefill_paged_f32(&prompt, 0, &mut cache, &mut store);
+        let mut decode_paged = vec![0f32; cfg.vocab_size];
+        model.forward_one_paged_f32(
+            last_tok,
+            n_prompt as u32,
+            &mut cache,
+            &mut store,
+            &mut decode_paged,
+        );
+
+        // Inline-prefill final-position logits must match bit-for-bit.
+        for (i, (&a, &b)) in prefill_contig.iter().zip(prefill_paged.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "prefill logit[{i}]: contiguous={a} paged={b}"
+            );
+        }
+        // Single-token paged decode must match the contiguous decode bit-for-bit.
+        for (i, (&a, &b)) in decode_contig.iter().zip(decode_paged.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "decode logit[{i}]: contiguous={a} paged={b}"
+            );
+        }
+
+        // --- Batched paged decode (single slot) must equal the contiguous decode. ---
+        let shared = crate::shared_paged_kv::SharedPagedKv::new(
+            mk_store(),
+            crate::page_table::PageTable::new(pages, page_size),
+        );
+        let geom_store = mk_store();
+        let mut bcache = crate::paged_kv_cache::PagedKvCache::new_for(&geom_store);
+        bcache.ensure_capacity_shared(&shared, total_cap).unwrap();
+        shared.with_store_mut(|store| {
+            let _ = model.forward_prefill_paged_f32(&prompt, 0, &mut bcache, store);
+        });
+        let mut decode_batched = vec![0f32; cfg.vocab_size];
+        let mut slots = vec![crate::llama_arch::DecodeSlot {
+            token_id: last_tok,
+            pos: n_prompt as u32,
+            cache: &mut bcache,
+            logits_out: &mut decode_batched,
+        }];
+        model.forward_decode_paged_batched_f32(&mut slots, &shared);
+        drop(slots);
+        for (i, (&a, &b)) in decode_contig.iter().zip(decode_batched.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "batched decode logit[{i}]: contiguous={a} batched={b}"
+            );
+        }
+    }
+
+    /// The critical regression guard: at `window=0 / softcap=0` (every ordinary
+    /// model), the D1b change is BYTE-IDENTICAL to the contiguous forward.
+    #[test]
+    fn paged_window_zero_byte_identical_to_contiguous() {
+        assert_paged_matches_contiguous(&synth_cfg(2, 2, 8));
+    }
+
+    /// Paged SWA decode/prefill ≡ contiguous windowed, all-SWA (Mistral-style).
+    #[test]
+    fn paged_swa_all_layers_matches_contiguous_windowed() {
+        let mut cfg = synth_cfg(2, 2, 8);
+        cfg.sliding_window = Some(3);
+        assert_paged_matches_contiguous(&cfg);
+    }
+
+    /// Paged SWA ≡ contiguous with the Gemma2-style alternating pattern (every
+    /// `p`-th layer global, the rest windowed).
+    #[test]
+    fn paged_swa_pattern_matches_contiguous_windowed() {
+        let mut cfg = synth_cfg(4, 2, 8);
+        cfg.sliding_window = Some(3);
+        cfg.sliding_window_pattern = Some(2);
+        assert_paged_matches_contiguous(&cfg);
+    }
+
+    /// Paged Gemma2 attention-logit soft-cap ≡ contiguous capped (no window).
+    #[test]
+    fn paged_softcap_matches_contiguous_capped() {
+        let mut cfg = synth_cfg(2, 2, 8);
+        cfg.attn_logit_softcapping = Some(50.0);
+        assert_paged_matches_contiguous(&cfg);
+    }
+
+    /// Paged SWA + softcap together (full Gemma2 shape) ≡ contiguous.
+    #[test]
+    fn paged_swa_and_softcap_matches_contiguous() {
+        let mut cfg = synth_cfg(4, 2, 8);
+        cfg.sliding_window = Some(3);
+        cfg.sliding_window_pattern = Some(2);
+        cfg.attn_logit_softcapping = Some(50.0);
+        assert_paged_matches_contiguous(&cfg);
+    }
+
     /// Hybrid placement parity: the forward output is invariant to
     /// `n_gpu_layers` in mock mode. Both `n_gpu_layers=u32::MAX`
     /// (all GPU, all USM helpers run their full body) and
@@ -15312,6 +15484,60 @@ mod tests {
         assert!(
             cos > 0.9995,
             "CacheBlend(exact) vs full prefill cosine {cos} too low"
+        );
+        assert_eq!(kv_cb.seq_len, assembled.len());
+    }
+
+    /// D2b: CacheBlend at `recompute_ratio=1.0` on a sliding-window + Gemma2
+    /// soft-cap model ≡ a plain windowed/capped full prefill. Mirrors
+    /// `cacheblend_exact_matches_full_prefill` with the window + soft-cap set, so
+    /// it pins that `forward_prefill_cacheblend` now threads per-layer
+    /// window/softcap through both attention branches (the D2b fix) — before it,
+    /// the un-windowed CacheBlend attention would diverge from the windowed
+    /// reference. Gated on cosine (reduction-order difference, same as the anchor).
+    #[test]
+    fn cacheblend_exact_matches_full_prefill_swa_softcap() {
+        use crate::cacheblend::{CacheBlendConfig, ChunkPlacement};
+        use std::sync::Arc;
+        let mut cfg = synth_cfg(4, 2, 8);
+        cfg.sliding_window = Some(3);
+        cfg.sliding_window_pattern = Some(2);
+        cfg.attn_logit_softcapping = Some(50.0);
+        let model = synth_llama_model(&cfg);
+        let chunk1: Vec<i32> = vec![5, 7, 2, 14];
+        let chunk2: Vec<i32> = vec![3, 9, 1, 6];
+        let suffix: Vec<i32> = vec![11, 4];
+        let assembled: Vec<i32> =
+            chunk1.iter().chain(&chunk2).chain(&suffix).copied().collect();
+        let suffix_start = chunk1.len() + chunk2.len();
+        let max_ctx = 32;
+
+        let mut kv_ref = KvCache::new(&cfg, max_ctx);
+        let ref_logits = model.forward_prefill_batched_f32(&assembled, 0, &mut kv_ref);
+
+        let placements = vec![
+            ChunkPlacement {
+                offset: 0,
+                snapshot: Arc::new(chunk_snapshot(&model, &cfg, &chunk1)),
+            },
+            ChunkPlacement {
+                offset: chunk1.len(),
+                snapshot: Arc::new(chunk_snapshot(&model, &cfg, &chunk2)),
+            },
+        ];
+        let mut kv_cb = KvCache::new(&cfg, max_ctx);
+        let cb_logits = model.forward_prefill_cacheblend(
+            &assembled,
+            &placements,
+            suffix_start,
+            CacheBlendConfig { recompute_ratio: 1.0, selection_layer: 1 },
+            &mut kv_cb,
+        );
+
+        let cos = cosine(&cb_logits, &ref_logits);
+        assert!(
+            cos > 0.9995,
+            "CacheBlend(exact, SWA+softcap) vs full prefill cosine {cos} too low"
         );
         assert_eq!(kv_cb.seq_len, assembled.len());
     }

@@ -64,6 +64,36 @@ use crate::{
 /// `PagedBatchEngine`) agree on the page geometry.
 pub const DEFAULT_PAGE_SIZE: u32 = 16;
 
+/// Best-effort detection of a vision / multimodal (VLM) GGUF from what a text
+/// decoder's own file reveals. Used by the F6-A fail-closed paged VLM guard.
+///
+/// The common VLM shape is TWO files — a text-decoder GGUF (which carries no
+/// vision tensors) plus a separate `mmproj-*.gguf` holding the vision tower
+/// under `v.*` / `clip.*`. So this check does NOT fire on an ordinary two-file
+/// VLM's text half; the PRIMARY guard for that case is the serve load path,
+/// which forces the contiguous `CpuEngine` whenever a `[model].mmproj` companion
+/// is configured. This helper is the defense-in-depth half: it catches a
+/// COMBINED single-file VLM GGUF — any `clip.*` / `*.vision.*` metadata key, a
+/// `clip` / `siglip` / vision architecture, or a vision-namespaced tensor
+/// (`v.` prefix, `mmproj`, or `.vision.`) — that would otherwise slip past the
+/// mmproj check and be served text-only.
+fn gguf_has_vision_indicator(gguf: &Gguf) -> bool {
+    if let Some(arch) = gguf.architecture() {
+        let a = arch.to_ascii_lowercase();
+        if a == "clip" || a == "siglip" || a.contains("vision") {
+            return true;
+        }
+    }
+    if gguf.metadata().iter().any(|(k, _)| {
+        k.starts_with("clip.") || k.contains(".vision.") || k.starts_with("vision.")
+    }) {
+        return true;
+    }
+    gguf.tensors()
+        .iter()
+        .any(|t| t.name.starts_with("v.") || t.name.contains("mmproj") || t.name.contains(".vision."))
+}
+
 /// Per-slot in-flight state: which prompt + sampling params it's
 /// running, its KV cache, sampler RNG / Mirostat state, and the
 /// growing output token list. The engine owns a `Vec<SlotState>`
@@ -254,22 +284,28 @@ impl PagedBatchEngine {
         let gguf = Gguf::open(path)?;
         let model = LlamaModel::load(&gguf)?;
 
-        // D1a: fail-closed model gate. `PagedBatchEngine` is selected by
-        // `[server].fused_decode` and previously did NO gating — so a model
-        // whose paged forward path is wrong or missing was served silently:
+        // D1a (relaxed by D1b): fail-closed model gate. `PagedBatchEngine` is
+        // selected by `[server].fused_decode` and previously did NO gating — so a
+        // model whose paged forward path is wrong or missing was served silently.
         //   * HYBRID (DeltaNet/SSM): NO paged forward walks `hybrid_layers` at
         //     all → refuse unconditionally (lifted by F8, hybrid CB).
-        //   * SWA / Gemma2-softcap: the paged prefill/decode forwards don't yet
-        //     carry the per-layer window / logit cap → refuse until D1b threads
-        //     them (then this relaxes to hybrid-only).
+        //   * SWA / Gemma2-softcap: D1b threaded the per-layer sliding-window span
+        //     + attention-logit soft-cap through the F32 paged forwards
+        //     (`forward_ragged_paged_f32` — the driver path —, plus the batched /
+        //     single-token decode + inline-prefill helpers), so these models are
+        //     now served correctly here. This engine's KV store is F32-ONLY
+        //     (`PagedKvStore`, no quant-KV paged path), and the F32 windowed/capped
+        //     kernels carry window/softcap, so there is no non-F32 paged path left
+        //     to fence off — the old refusal is gone. (If a quant-KV paged store
+        //     is ever added, re-gate on `(sliding_window||softcap) && dtype!=F32`
+        //     until F1 teaches the quant-KV flash kernels window/softcap.)
         //
-        // MoE is NO LONGER refused here. The old refusal fenced off the
-        // budget-0 INLINE prefill (`forward_prefill_paged_f32`), which loops
-        // only `weights.blocks` (empty for MoE). After T1 the driver has a
-        // single path — the ragged forward (`forward_ragged_paged_f32`), which
-        // handles `moe_blocks` — and a zero budget means UNBOUNDED ragged
-        // prefill, not the inline path. So MoE is served correctly on the paged
-        // engine at any budget; the gate is gone.
+        // MoE is NOT refused here. The old refusal fenced off the budget-0 INLINE
+        // prefill (`forward_prefill_paged_f32`), which loops only `weights.blocks`
+        // (empty for MoE). After T1 the driver has a single path — the ragged
+        // forward (`forward_ragged_paged_f32`), which handles `moe_blocks` — and a
+        // zero budget means UNBOUNDED ragged prefill, not the inline path. So MoE
+        // is served correctly on the paged engine at any budget; the gate is gone.
         if model.weights.is_hybrid() {
             return Err(CpuEngineError::Other(
                 "continuous batching (fused_decode) does not support hybrid \
@@ -277,11 +313,21 @@ impl PagedBatchEngine {
                     .into(),
             ));
         }
-        if model.cfg.sliding_window.is_some() || model.cfg.attn_logit_softcapping.is_some() {
+        // F6-A: fail-closed VLM guard (P9 default-on prereq). A vision/mmproj model
+        // has no image-embed row source in the ragged paged forward yet (F6-B adds
+        // it), so serving one here would silently drop every image → text-only,
+        // mis-served output. VLM-ness in rustllama is normally signalled by a
+        // SEPARATE mmproj companion GGUF (the text decoder carries no vision
+        // tensors), which this load site does not see — so the PRIMARY guard lives
+        // where the mmproj IS known: the serve load path forces the contiguous
+        // `CpuEngine` (which `attach_mmproj`s) whenever `[model].mmproj` is set
+        // (cli `serve`). This block is the defense-in-depth half: it catches a
+        // COMBINED single-file VLM GGUF (vision tensors / `clip.*` metadata in the
+        // same file) that would otherwise slip past the mmproj check.
+        if gguf_has_vision_indicator(&gguf) {
             return Err(CpuEngineError::Other(
-                "continuous batching (fused_decode) does not yet support \
-                 sliding-window / logit-softcap models (e.g. Gemma2, Mistral-SWA); \
-                 use the default engine for this model"
+                "continuous batching (fused_decode) does not support vision / \
+                 multimodal (VLM) models yet; use the default engine for this model"
                     .into(),
             ));
         }
@@ -1579,5 +1625,33 @@ mod tests {
         let a: &[i32] = &[1, 2, -1, 4];
         let b: &[u32] = &[1, 2, 3, 4];
         assert_eq!(compute_lcp_i32_u32(a, b), 2);
+    }
+
+    /// F6-A: the paged VLM guard's combined-file detector must NOT fire on an
+    /// ordinary text GGUF (a false positive would wrongly refuse every normal
+    /// fused-decode model) and MUST fire on a vision GGUF (clip `general.
+    /// architecture`, `clip.*` metadata, `v.*` tensors). The common two-file VLM
+    /// is caught earlier by the serve-time `[model].mmproj` check; this detector
+    /// is the combined single-file defense-in-depth.
+    #[test]
+    fn vision_indicator_detects_clip_not_text() {
+        use rustllama_gguf::synth::{
+            write_synthetic_clip_mmproj_gguf, write_synthetic_llama_gguf, SynthLlama,
+        };
+        let text = std::env::temp_dir().join("rustllama-f6a-text-guard.gguf");
+        write_synthetic_llama_gguf(&text, &SynthLlama::default());
+        let text_gguf = Gguf::open(&text).expect("open synth text gguf");
+        assert!(
+            !gguf_has_vision_indicator(&text_gguf),
+            "ordinary text GGUF must not trip the F6-A VLM guard"
+        );
+
+        let clip = std::env::temp_dir().join("rustllama-f6a-clip-guard.gguf");
+        write_synthetic_clip_mmproj_gguf(&clip);
+        let clip_gguf = Gguf::open(&clip).expect("open synth clip gguf");
+        assert!(
+            gguf_has_vision_indicator(&clip_gguf),
+            "clip mmproj GGUF must trip the F6-A VLM guard"
+        );
     }
 }

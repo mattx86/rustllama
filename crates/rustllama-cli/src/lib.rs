@@ -3695,7 +3695,23 @@ async fn serve(
     // `PagedBatchEngine` builds its own paged KV pool, so `fused_decode` alone is
     // sufficient; we no longer silently no-op when `kv_cache_layout` is left at
     // the "contiguous" default. Warn on the mismatch instead of ignoring the flag.
-    let use_fused_decode = cfg.server.fused_decode;
+    let mut use_fused_decode = cfg.server.fused_decode;
+    // F6-A: fail-closed VLM guard (primary site). A vision/multimodal model is
+    // served as a text-decoder GGUF + a separate `[model].mmproj` companion that
+    // only the contiguous `CpuEngine` knows how to `attach_mmproj`. The
+    // `PagedBatchEngine` has no image-embed row source yet (F6-B), so loading a
+    // VLM there would silently drop every image → text-only output. The mmproj
+    // companion is known HERE (not at `PagedBatchEngine::load`, which sees only
+    // the text GGUF), so force the contiguous engine when one is configured.
+    if use_fused_decode && cfg.model.mmproj.is_some() {
+        tracing::warn!(
+            "fused_decode requested but [model].mmproj (vision/VLM) is configured; \
+             falling back to the contiguous CpuEngine (continuous batching has no \
+             image-embed path yet). Unset [model].mmproj or disable fused_decode to \
+             silence this."
+        );
+        use_fused_decode = false;
+    }
     if use_fused_decode && cfg.inference.kv_cache_layout != "paged" {
         tracing::warn!(
             kv_cache_layout = %cfg.inference.kv_cache_layout,
