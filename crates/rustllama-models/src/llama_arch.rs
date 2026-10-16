@@ -2873,6 +2873,18 @@ pub enum KvLayer {
         k_packed: KvBuf<u8>,
         v_packed: KvBuf<u8>,
     },
+    /// Half-precision KV (M6): two bytes per element, no block scale.
+    /// `bf16=false` stores IEEE f16 bit patterns, `bf16=true` stores
+    /// bfloat16 bit patterns; either way `k`/`v` are `u16` slabs sized
+    /// `[n_kv_heads, max_ctx, head_dim]` (one `u16` per value, same row
+    /// stride math as the F32 slab). Attention dequantizes the live
+    /// region to an f32 scratch and dispatches the existing F32 kernels,
+    /// so output equals the F32 path over f16/bf16-rounded K/V.
+    Half {
+        bf16: bool,
+        k: KvBuf<u16>,
+        v: KvBuf<u16>,
+    },
 }
 
 impl KvLayer {
@@ -2898,6 +2910,7 @@ impl KvLayer {
             KvLayer::Mxfp4 { k_packed, v_packed }
             | KvLayer::Mxfp6 { k_packed, v_packed }
             | KvLayer::Mxfp8 { k_packed, v_packed } => b(k_packed) + b(v_packed),
+            KvLayer::Half { k, v, .. } => b(k) + b(v),
         }
     }
 }
@@ -2922,6 +2935,8 @@ impl std::fmt::Debug for KvLayer {
                 .field("k_packed", k_packed).field("v_packed", v_packed).finish(),
             KvLayer::Mxfp8 { k_packed, v_packed } => f.debug_struct("Mxfp8")
                 .field("k_packed", k_packed).field("v_packed", v_packed).finish(),
+            KvLayer::Half { bf16, k, v } => f.debug_struct("Half")
+                .field("bf16", bf16).field("k", k).field("v", v).finish(),
         }
     }
 }
@@ -2947,6 +2962,16 @@ impl std::fmt::Debug for KvLayer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvDtype {
     F32,
+    /// IEEE-754 half (`f16`, 1-5-10). Two bytes per element, no block
+    /// scale — the usual mid-range KV option between f32 and q8_0. K/V
+    /// rows are stored as f16 bit patterns and dequantized to f32 on the
+    /// attention read, so the compute is bit-for-bit the F32 kernel over
+    /// f16-rounded inputs (M6). `head_dim`-agnostic (no block alignment).
+    F16,
+    /// Google bfloat16 (`bf16`, 1-8-7). Two bytes per element, no block
+    /// scale. Same store-f16bits/dequant-to-f32 path as [`Self::F16`] but
+    /// with bf16's wider exponent + 7-bit mantissa (M6).
+    Bf16,
     Q8_0,
     Tq(u8),
     Nvfp4,
@@ -2977,6 +3002,8 @@ impl KvDtype {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "f32" => Some(KvDtype::F32),
+            "f16" | "fp16" | "float16" => Some(KvDtype::F16),
+            "bf16" | "bfloat16" => Some(KvDtype::Bf16),
             "q8_0" => Some(KvDtype::Q8_0),
             "q4_0" => Some(KvDtype::Q4_0),
             "tq1" => Some(KvDtype::Tq(1)),
@@ -3006,6 +3033,8 @@ impl KvDtype {
         match self {
             // 4-byte float, no overhead.
             KvDtype::F32 => 32.0,
+            // 2-byte half floats, no block scale.
+            KvDtype::F16 | KvDtype::Bf16 => 16.0,
             // 1 byte/element + 1 f16 scale per 32 elements.
             // Overhead: 16 / 32 = 0.5 bit/element.
             KvDtype::Q8_0 => 8.5,
@@ -3039,7 +3068,16 @@ pub struct KvCache {
     pub max_ctx: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
-    pub dtype: KvDtype,
+    /// F4: per-layer KV dtype (one entry per layer). The common case is
+    /// all entries equal — then the cache is byte-for-byte the old
+    /// single-dtype cache. A per-layer-GROUP spec (e.g. attention-sink
+    /// layers at f32/q8_0, the rest at a cheaper dtype) stores distinct
+    /// entries. The actual storage + attention dispatch keys off each
+    /// layer's [`KvLayer`] variant, so per-layer dtype is honored
+    /// automatically once the slabs are allocated this way; use
+    /// [`Self::dtype`] for the representative (layer-0) dtype and
+    /// [`Self::uniform_dtype`] to gate the uniform-only batched paths.
+    pub layer_dtypes: Vec<KvDtype>,
     /// K-cache mean-centering bias (fork `kv_bar` parity) — attached
     /// by the engine after load when a validated sidecar exists.
     /// Subtracted from K rows in the Q4_0 write arms only; exactly
@@ -3059,7 +3097,8 @@ impl std::fmt::Debug for KvCache {
             .field("max_ctx", &self.max_ctx)
             .field("n_kv_heads", &self.n_kv_heads)
             .field("head_dim", &self.head_dim)
-            .field("dtype", &self.dtype)
+            .field("dtype", &self.dtype())
+            .field("layer_dtypes", &self.layer_dtypes)
             .finish()
     }
 }
@@ -3129,6 +3168,81 @@ fn alloc_kv_buf_u8(
     }
     KvBuf::host_zeroed(len)
 }
+fn alloc_kv_buf_u16(
+    stream: Option<&rustllama_kernels_sycl::SyclStream>,
+    len: usize,
+) -> KvBuf<u16> {
+    if let Some(s) = stream {
+        match rustllama_kernels_sycl::SyclSharedBuffer::<u16>::alloc(s, len) {
+            Ok(mut buf) => {
+                for x in buf.as_mut_slice() { *x = 0; }
+                let buf: rustllama_kernels_sycl::SyclSharedBuffer<'static, u16> =
+                    unsafe { std::mem::transmute(buf) };
+                return KvBuf::Usm(buf);
+            }
+            Err(_) => {}
+        }
+    }
+    KvBuf::host_zeroed(len)
+}
+
+// M6: half-precision (f16 / bf16) KV row conversions. Storage is one
+// `u16` bit pattern per element; `bf16` selects bfloat16 vs IEEE f16.
+// `encode` rounds an f32 row to half on write; `decode` is the exact
+// widening back to f32 on the attention read.
+#[inline]
+fn half_encode_row(bf16: bool, src: &[f32], dst: &mut [u16]) {
+    debug_assert_eq!(src.len(), dst.len());
+    if bf16 {
+        for (d, &x) in dst.iter_mut().zip(src.iter()) {
+            *d = half::bf16::from_f32(x).to_bits();
+        }
+    } else {
+        for (d, &x) in dst.iter_mut().zip(src.iter()) {
+            *d = half::f16::from_f32(x).to_bits();
+        }
+    }
+}
+#[inline]
+fn half_decode_row(bf16: bool, src: &[u16], dst: &mut [f32]) {
+    debug_assert_eq!(src.len(), dst.len());
+    if bf16 {
+        for (d, &b) in dst.iter_mut().zip(src.iter()) {
+            *d = half::bf16::from_bits(b).to_f32();
+        }
+    } else {
+        for (d, &b) in dst.iter_mut().zip(src.iter()) {
+            *d = half::f16::from_bits(b).to_f32();
+        }
+    }
+}
+
+/// Dequantize the live `[n_kv_heads, kv_len, head_dim]` region of a
+/// half-precision KV slab (head-major, `max_ctx` stride) into COMPACT
+/// f32 `k_out`/`v_out` slabs laid out `[n_kv_heads, kv_len, head_dim]`
+/// (stride `kv_len`). The caller then runs the existing F32 attention
+/// kernels passing `kv_len` as the `max_ctx` stride argument. Keeps the
+/// scratch O(kv_len) rather than materializing the full `max_ctx` slab.
+#[allow(clippy::too_many_arguments)]
+fn half_dequant_region(
+    bf16: bool,
+    k: &[u16],
+    v: &[u16],
+    n_kv_heads: usize,
+    max_ctx: usize,
+    head_dim: usize,
+    kv_len: usize,
+    k_out: &mut [f32],
+    v_out: &mut [f32],
+) {
+    for h in 0..n_kv_heads {
+        let src_base = h * max_ctx * head_dim;
+        let dst_base = h * kv_len * head_dim;
+        let n = kv_len * head_dim;
+        half_decode_row(bf16, &k[src_base..src_base + n], &mut k_out[dst_base..dst_base + n]);
+        half_decode_row(bf16, &v[src_base..src_base + n], &mut v_out[dst_base..dst_base + n]);
+    }
+}
 
 
 /// G2: try to construct a SYCL stream for KV-cache USM allocations.
@@ -3157,6 +3271,36 @@ fn try_open_usm_kv_stream() -> Option<Box<rustllama_kernels_sycl::SyclStream>> {
 impl KvCache {
     pub fn new(cfg: &LlamaConfig, max_ctx: usize) -> Self {
         Self::new_with_dtype(cfg, max_ctx, KvDtype::F32)
+    }
+
+    /// F4: the representative KV dtype — the dtype of layer 0 (which, in
+    /// the common all-same case, is every layer's dtype). Used for
+    /// logging, the `kv_dtype()` backend report, and the F32-only gates
+    /// that only need "is this cache uniformly F32?" (they pair this with
+    /// [`Self::uniform_dtype`]). Empty caches report F32.
+    pub fn dtype(&self) -> KvDtype {
+        self.layer_dtypes.first().copied().unwrap_or(KvDtype::F32)
+    }
+
+    /// F4: `Some(d)` when every layer shares dtype `d`; `None` when the
+    /// cache mixes dtypes per layer group. The uniform-only fast paths
+    /// (the batched prefill entry points + the speculation batched path)
+    /// gate on `Some` — a mixed cache falls through to the serial
+    /// per-layer forward, which dispatches each layer on its own
+    /// [`KvLayer`] variant and so is correct for any mix.
+    pub fn uniform_dtype(&self) -> Option<KvDtype> {
+        let first = *self.layer_dtypes.first()?;
+        if self.layer_dtypes.iter().all(|&d| d == first) {
+            Some(first)
+        } else {
+            None
+        }
+    }
+
+    /// True iff every layer is F32 (the condition the F32-only snapshot /
+    /// persistence paths actually want — not just "layer 0 is F32").
+    pub fn is_uniform_f32(&self) -> bool {
+        self.uniform_dtype() == Some(KvDtype::F32)
     }
 
     /// Compact scattered token K/V slots into contiguous positions starting at
@@ -3231,18 +3375,57 @@ impl KvCache {
         Self::new_with_dtype_impl(cfg, max_ctx, dtype, Some(keep))
     }
 
+    /// F4: construct a cache with an explicit per-layer dtype. `dtypes`
+    /// must have one entry per layer. The common all-same case is
+    /// byte-for-byte identical to [`Self::new_with_dtype`] with that
+    /// dtype; distinct entries give a per-layer-group cache (e.g.
+    /// attention-sink layers at f32/q8_0, the rest cheaper). Allocation
+    /// and the attention dispatch key off each layer's dtype.
+    pub fn new_with_layer_dtypes(cfg: &LlamaConfig, max_ctx: usize, dtypes: &[KvDtype]) -> Self {
+        Self::new_with_layer_dtypes_impl(cfg, max_ctx, dtypes.to_vec(), None)
+    }
+
+    /// Sparse [`Self::new_with_layer_dtypes`] (hybrid keep-mask aware).
+    pub fn new_with_layer_dtypes_sparse(
+        cfg: &LlamaConfig,
+        max_ctx: usize,
+        dtypes: &[KvDtype],
+        keep: &[bool],
+    ) -> Self {
+        assert_eq!(keep.len(), cfg.n_layers, "keep mask must have one entry per layer");
+        Self::new_with_layer_dtypes_impl(cfg, max_ctx, dtypes.to_vec(), Some(keep))
+    }
+
     fn new_with_dtype_impl(
         cfg: &LlamaConfig,
         max_ctx: usize,
         dtype: KvDtype,
         keep: Option<&[bool]>,
     ) -> Self {
+        // F4: a uniform cache is just a per-layer cache with every entry
+        // equal — same allocation path, so an all-same cache is
+        // byte-identical to the historic single-dtype construction.
+        Self::new_with_layer_dtypes_impl(cfg, max_ctx, vec![dtype; cfg.n_layers], keep)
+    }
+
+    fn new_with_layer_dtypes_impl(
+        cfg: &LlamaConfig,
+        max_ctx: usize,
+        layer_dtypes: Vec<KvDtype>,
+        keep: Option<&[bool]>,
+    ) -> Self {
+        assert_eq!(
+            layer_dtypes.len(),
+            cfg.n_layers,
+            "layer_dtypes must have one entry per layer"
+        );
         let total_rows = cfg.n_kv_heads * max_ctx;
         let row_floats = total_rows * cfg.head_dim;
         let usm_stream = try_open_usm_kv_stream();
         let stream_ref = usm_stream.as_deref();
         let layers = (0..cfg.n_layers)
             .map(|li| {
+                let dtype = layer_dtypes[li];
                 if let Some(keep) = keep {
                     if !keep[li] {
                         // Zero-length host placeholder — this layer's
@@ -3288,6 +3471,16 @@ impl KvCache {
                                 k_packed: KvBuf::from_vec(Vec::new()),
                                 v_packed: KvBuf::from_vec(Vec::new()),
                             },
+                            KvDtype::F16 => KvLayer::Half {
+                                bf16: false,
+                                k: KvBuf::from_vec(Vec::new()),
+                                v: KvBuf::from_vec(Vec::new()),
+                            },
+                            KvDtype::Bf16 => KvLayer::Half {
+                                bf16: true,
+                                k: KvBuf::from_vec(Vec::new()),
+                                v: KvBuf::from_vec(Vec::new()),
+                            },
                         };
                     }
                 }
@@ -3295,6 +3488,16 @@ impl KvCache {
                 KvDtype::F32 => KvLayer::F32 {
                     k: alloc_kv_buf_f32(stream_ref, row_floats),
                     v: alloc_kv_buf_f32(stream_ref, row_floats),
+                },
+                KvDtype::F16 => KvLayer::Half {
+                    bf16: false,
+                    k: alloc_kv_buf_u16(stream_ref, row_floats),
+                    v: alloc_kv_buf_u16(stream_ref, row_floats),
+                },
+                KvDtype::Bf16 => KvLayer::Half {
+                    bf16: true,
+                    k: alloc_kv_buf_u16(stream_ref, row_floats),
+                    v: alloc_kv_buf_u16(stream_ref, row_floats),
                 },
                 KvDtype::Q8_0 => KvLayer::Q8_0 {
                     k_q: alloc_kv_buf_i8(stream_ref, row_floats),
@@ -3390,7 +3593,7 @@ impl KvCache {
             max_ctx,
             n_kv_heads: cfg.n_kv_heads,
             head_dim: cfg.head_dim,
-            dtype,
+            layer_dtypes,
             kv_bias: None,
             usm_stream,
         }
@@ -3473,6 +3676,14 @@ impl KvCache {
                         *x = 0;
                     }
                     for x in v_packed.iter_mut() {
+                        *x = 0;
+                    }
+                }
+                KvLayer::Half { k, v, .. } => {
+                    for x in k.iter_mut() {
+                        *x = 0;
+                    }
+                    for x in v.iter_mut() {
                         *x = 0;
                     }
                 }
@@ -3656,6 +3867,24 @@ impl KvCache {
                         _ => KvLayer::Mxfp8 { k_packed: k, v_packed: v },
                     }
                 }
+                KvLayer::Half { bf16, k, v } => {
+                    // u16 half slab, head-major [n_h, prefix_len, head_dim].
+                    let mut snap_k = vec![0u16; n_h * prefix_len * hd];
+                    let mut snap_v = vec![0u16; n_h * prefix_len * hd];
+                    for h in 0..n_h {
+                        let src_base = h * self.max_ctx * hd;
+                        let dst_base = h * prefix_len * hd;
+                        snap_k[dst_base..dst_base + prefix_len * hd]
+                            .copy_from_slice(&k[src_base..src_base + prefix_len * hd]);
+                        snap_v[dst_base..dst_base + prefix_len * hd]
+                            .copy_from_slice(&v[src_base..src_base + prefix_len * hd]);
+                    }
+                    KvLayer::Half {
+                        bf16: *bf16,
+                        k: KvBuf::from_vec(snap_k),
+                        v: KvBuf::from_vec(snap_v),
+                    }
+                }
                 }
             })
             .collect();
@@ -3664,7 +3893,7 @@ impl KvCache {
             prefix_len,
             n_kv_heads: n_h,
             head_dim: hd,
-            dtype: self.dtype,
+            dtype: self.dtype(),
         }
     }
 
@@ -3678,7 +3907,11 @@ impl KvCache {
     /// F32 KV; other dtypes fall back to the full capture.
     pub fn snapshot_prefix_selective(&self, prefix_len: usize, keep: &[bool]) -> KvSnapshot {
         assert_eq!(keep.len(), self.layers.len());
-        if self.dtype != KvDtype::F32 {
+        // F4: the selective fast path is F32-only; a cache that isn't
+        // uniformly F32 (any quant/half layer, or a mixed per-layer
+        // cache) falls back to the full capture, which handles every
+        // layer dtype correctly.
+        if !self.is_uniform_f32() {
             return self.snapshot_prefix(prefix_len);
         }
         assert!(
@@ -3730,7 +3963,7 @@ impl KvCache {
             prefix_len,
             n_kv_heads: n_h,
             head_dim: hd,
-            dtype: self.dtype,
+            dtype: self.dtype(),
         }
     }
 
@@ -3752,7 +3985,10 @@ impl KvCache {
         crate::accel::usm_attn_kv_epoch_bump();
         assert_eq!(snap.n_kv_heads, self.n_kv_heads);
         assert_eq!(snap.head_dim, self.head_dim);
-        assert_eq!(snap.dtype, self.dtype);
+        // Representative-dtype sanity check; the per-layer `(live, src)`
+        // KvLayer-variant match below enforces the exact per-layer dtype
+        // and panics on any mismatch (so a mixed cache is fully covered).
+        assert_eq!(snap.dtype, self.dtype());
         assert!(
             snap.prefix_len <= self.max_ctx,
             "snapshot prefix_len {} exceeds max_ctx {}",
@@ -3906,6 +4142,19 @@ impl KvCache {
                 (KvLayer::Mxfp8 { k_packed, v_packed }, KvLayer::Mxfp8 { k_packed: skp, v_packed: svp }) => {
                     restore_mxfp_prefix(k_packed, v_packed, skp, svp, hd, n_h, self.max_ctx, pl,
                         rustllama_kernels_cpu::mxfp::MXFP8_BLOCK_BYTES);
+                }
+                (
+                    KvLayer::Half { k, v, .. },
+                    KvLayer::Half { k: sk, v: sv, .. },
+                ) => {
+                    for h in 0..n_h {
+                        let dst_base = h * self.max_ctx * hd;
+                        let src_base = h * pl * hd;
+                        k[dst_base..dst_base + pl * hd]
+                            .copy_from_slice(&sk[src_base..src_base + pl * hd]);
+                        v[dst_base..dst_base + pl * hd]
+                            .copy_from_slice(&sv[src_base..src_base + pl * hd]);
+                    }
                 }
                 _ => panic!("KvLayer dtype mismatch between live cache and snapshot"),
             }
@@ -4183,6 +4432,11 @@ impl KvLayer {
             KvLayer::Mxfp8 { k_packed, v_packed } => KvLayer::Mxfp8 {
                 k_packed: k_packed.clone(),
                 v_packed: v_packed.clone(),
+            },
+            KvLayer::Half { bf16, k, v } => KvLayer::Half {
+                bf16: *bf16,
+                k: k.clone(),
+                v: v.clone(),
             },
         }
     }
@@ -5090,6 +5344,80 @@ impl BatchedKv for Q4_0Kv {
                 }
             }
             _ => unreachable!("forward_prefill_batched_q4_0 entered with non-Q4_0 KV"),
+        }
+    }
+}
+
+/// Half-precision KV (f16 / bf16): write each new K/V row as half bit
+/// patterns, then dequantize the live `[0, kv_len_base + n_new)` region
+/// to a COMPACT f32 scratch and run the existing F32 flash-prefill
+/// (GPU→CPU) with the compact `kv_len` as the stride. Byte-for-byte the
+/// F32 batched path over f16/bf16-rounded K/V. `window`/`softcap` are
+/// threaded exactly like `F32Kv` (they're always 0/0.0 here because the
+/// engine coerces SWA / soft-cap models to F32 KV), and tree-verify is
+/// unsupported (half KV is never the tree-spec cache, which is F32).
+struct HalfKv {
+    bf16: bool,
+}
+impl BatchedKv for HalfKv {
+    fn write_and_attend(
+        &self,
+        kv: &mut KvCache,
+        layer_idx: usize,
+        q_buf: &mut [f32],
+        k_buf: &mut [f32],
+        v_buf: &mut [f32],
+        attn_out: &mut [f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx: usize,
+        kv_len_base: usize,
+        n_new: usize,
+        window: usize,
+        softcap: f32,
+        tree: Option<&TreeAttn<'_>>,
+    ) {
+        debug_assert!(tree.is_none(), "Half batched prefill has no tree-verify path");
+        let d_kv = n_kv_heads * head_dim;
+        let kv_layer = &mut kv.layers[layer_idx];
+        match kv_layer {
+            KvLayer::Half { bf16, k, v } => {
+                debug_assert_eq!(*bf16, self.bf16);
+                // 1. Write the new rows as half bit patterns.
+                for i in 0..n_new {
+                    let pos_i = kv_len_base + i;
+                    for h in 0..n_kv_heads {
+                        let dst = (h * max_ctx + pos_i) * head_dim;
+                        let src = i * d_kv + h * head_dim;
+                        half_encode_row(*bf16, &k_buf[src..src + head_dim], &mut k[dst..dst + head_dim]);
+                        half_encode_row(*bf16, &v_buf[src..src + head_dim], &mut v[dst..dst + head_dim]);
+                    }
+                }
+                // 2. Dequant the live region to compact f32 scratch and
+                //    run the F32 flash-prefill over it (stride = kv_len).
+                let kv_len = kv_len_base + n_new;
+                let mut k_f32 = vec![0f32; n_kv_heads * kv_len * head_dim];
+                let mut v_f32 = vec![0f32; n_kv_heads * kv_len * head_dim];
+                half_dequant_region(
+                    *bf16, k, v, n_kv_heads, max_ctx, head_dim, kv_len,
+                    &mut k_f32, &mut v_f32,
+                );
+                let used_gpu = crate::accel::try_flash_attn_prefill_gpu_f32(
+                    q_buf, &k_f32, &v_f32, attn_out,
+                    n_heads, n_kv_heads, head_dim,
+                    /* max_ctx (compact stride) */ kv_len,
+                    kv_len_base, n_new, window as u32, softcap,
+                );
+                if !used_gpu {
+                    k::gqa_attention_flash_prefill_capped_windowed(
+                        q_buf, &k_f32, &v_f32, attn_out,
+                        n_heads, n_kv_heads, head_dim,
+                        kv_len, kv_len_base, n_new, window, softcap,
+                    );
+                }
+            }
+            _ => unreachable!("forward_prefill_batched_half entered with non-Half KV"),
         }
     }
 }
@@ -6963,6 +7291,13 @@ impl LlamaModel {
                                 }
                             }
                         }
+                        // Hybrid models coerce f16/bf16 KV to F32 at load
+                        // (the windowed/soft-cap hybrid kernels are f32),
+                        // so a half-KV layer can never reach the hybrid
+                        // forward.
+                        KvLayer::Half { .. } => {
+                            unreachable!("hybrid forward: half (f16/bf16) KV is coerced to F32 at load")
+                        }
                     }
                     {
                         let x_in = hadamard_pre(had, &block.w_o, &attn_out, &mut had_buf);
@@ -7907,6 +8242,9 @@ impl LlamaModel {
                                 KvDtype::Mxfp8, &k_buf, &v_buf, k_packed, v_packed, cur_pos,
                                 n_kv_heads, head_dim, max_ctx,
                             ),
+                            KvLayer::Half { .. } => {
+                                unreachable!("hybrid forward: half (f16/bf16) KV is coerced to F32 at load")
+                            }
                         }
                         // Attention is DEFERRED: stash this token's
                         // (whitened, for Q4_0) query row and its
@@ -8065,6 +8403,9 @@ impl LlamaModel {
                                         n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, nb,
                                     );
                                 }
+                            }
+                            KvLayer::Half { .. } => {
+                                unreachable!("hybrid forward: half (f16/bf16) KV is coerced to F32 at load")
                             }
                         }
                     }
@@ -9737,6 +10078,52 @@ impl LlamaModel {
                         whiten_chunks_inplace(&mut attn_out, KV_WHITEN_CHUNK);
                     }
                 }
+                KvLayer::Half { bf16, k, v } => {
+                    // M6: write the new row as half bits, then dequant the
+                    // live region to a compact f32 scratch and run the F32
+                    // decode kernel (stride = kv_len). Output equals the F32
+                    // path over f16/bf16-rounded K/V. `swa_win`/`softcap`
+                    // are computed like the F32 arm (0/0.0 for ordinary
+                    // models; SWA/soft-cap models are coerced to F32 KV at
+                    // load, so half KV never sees a nonzero value here).
+                    let bf16 = *bf16;
+                    for h in 0..n_kv_heads {
+                        let dst = (h * max_ctx + cur_pos) * head_dim;
+                        half_encode_row(
+                            bf16,
+                            &k_buf[h * head_dim..(h + 1) * head_dim],
+                            &mut k[dst..dst + head_dim],
+                        );
+                        half_encode_row(
+                            bf16,
+                            &v_buf[h * head_dim..(h + 1) * head_dim],
+                            &mut v[dst..dst + head_dim],
+                        );
+                    }
+                    let swa_win = cfg.swa_window(layer_idx);
+                    let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
+                    let mut k_f32 = vec![0f32; n_kv_heads * kv_len * head_dim];
+                    let mut v_f32 = vec![0f32; n_kv_heads * kv_len * head_dim];
+                    half_dequant_region(
+                        bf16, k, v, n_kv_heads, max_ctx, head_dim, kv_len,
+                        &mut k_f32, &mut v_f32,
+                    );
+                    let flash_min = flash_kv_len_min();
+                    if crate::accel::flash_attention_enabled() && kv_len >= flash_min {
+                        k::gqa_attention_flash_decode_capped_windowed(
+                            &q_buf, &k_f32, &v_f32, &mut attn_out,
+                            n_heads, n_kv_heads, head_dim,
+                            /* max_ctx (compact stride) */ kv_len,
+                            kv_len, swa_win, softcap,
+                        );
+                    } else {
+                        k::gqa_attention_one_step_capped_windowed(
+                            &q_buf, &k_f32, &v_f32, &mut attn_out,
+                            n_heads, n_kv_heads, head_dim,
+                            kv_len, kv_len, swa_win, softcap,
+                        );
+                    }
+                }
             }
 
             // H6: try the fully-fused output-proj + residual + norm
@@ -11023,6 +11410,51 @@ impl LlamaModel {
         );
     }
 
+    /// M6: half-precision (f16 / bf16) paged forward dispatch. Like
+    /// [`Self::forward_one_paged_q8_0`], routes through the shared
+    /// `forward_one_paged_f32_inner` via the `PagedKvStoreOps` trait
+    /// object — the store widens its half cells to f32 on gather, so the
+    /// inner f32 attention path runs unchanged.
+    pub fn forward_one_paged_f16(
+        &self,
+        token_id: i32,
+        pos: u32,
+        cache: &mut crate::paged_kv_cache::PagedKvCache,
+        store: &mut crate::paged_kv_store::PagedKvStoreF16,
+        logits_out: &mut [f32],
+    ) {
+        let cfg = &self.cfg;
+        assert_eq!(logits_out.len(), cfg.vocab_size);
+        debug_assert!(
+            pos < cache.capacity_tokens(),
+            "forward_one_paged_f16: pos {pos} >= capacity {}",
+            cache.capacity_tokens(),
+        );
+
+        let d = cfg.d_model;
+        let n_heads = cfg.n_heads;
+        let n_kv_heads = cfg.n_kv_heads;
+        let head_dim = cfg.head_dim;
+        let d_q = n_heads * head_dim;
+        let d_kv = n_kv_heads * head_dim;
+        let d_ff = cfg.d_ff;
+        let kv_len = cache.retained_len_for_pos(pos);
+        let cfg_clone = self.cfg.clone();
+        let (moe_n_experts, moe_top_k) = match cfg_clone.moe.as_ref() {
+            Some(m) => (m.n_experts as usize, m.n_experts_used as usize),
+            None => (0, 0),
+        };
+        let _ = (n_heads, d_kv, d_q); // silence unused warnings; used inside _inner
+        crate::accel::with_forward_scratch(
+            d, d_q, d_kv, d_ff, head_dim, cfg.rope_theta, moe_n_experts, moe_top_k,
+            |scratch| self.forward_one_paged_f32_inner(
+                token_id, pos, cache,
+                store as &mut dyn crate::paged_kv_store::PagedKvStoreOps,
+                logits_out, scratch, kv_len,
+            ),
+        );
+    }
+
     /// Inner body of [`Self::forward_one_paged_f32`] — the scratch-
     /// borrowing wrapper. Same per-layer dataflow as the public
     /// entry; sourcing buffers from `ForwardScratch` instead of
@@ -11276,7 +11708,12 @@ impl LlamaModel {
         // Q8_0 / TurboQuant / NVFP4 variants so any KV dtype goes
         // through the batched path for MoE GGUFs.
         let batched_on = prefill_batched_enabled();
-        if batched_on && !tokens.is_empty() {
+        // F4: the batched prefill entry points assume a UNIFORM KV dtype
+        // (one `BatchedKv` impl for every layer). A mixed per-layer-group
+        // cache (`uniform_dtype() == None`) skips them and uses the serial
+        // `forward_one` loop below, which dispatches each layer on its own
+        // `KvLayer` variant and is correct for any mix.
+        if batched_on && !tokens.is_empty() && kv.uniform_dtype().is_some() {
             match kv.layers.first() {
                 Some(KvLayer::F32 { .. }) => {
                     return self.forward_prefill_batched_f32(tokens, start_pos, kv);
@@ -11292,6 +11729,13 @@ impl LlamaModel {
                 }
                 Some(KvLayer::Q4_0 { .. }) => {
                     return self.forward_prefill_batched_q4_0(tokens, start_pos, kv);
+                }
+                Some(KvLayer::Half { .. }) => {
+                    // Pattern binds nothing (mirrors the other arms) so no
+                    // borrow of `kv` persists into the `&mut kv` call;
+                    // `uniform_dtype()` returns an owned value.
+                    let bf16 = kv.uniform_dtype() == Some(KvDtype::Bf16);
+                    return self.forward_prefill_batched_half(bf16, tokens, start_pos, kv);
                 }
                 _ => {}
             }
@@ -12755,6 +13199,31 @@ impl LlamaModel {
         let mut logits = vec![0.0f32; self.cfg.vocab_size];
         self.forward_prefill_batched_inner(
             &Q4_0Kv, tokens, start_pos, kv,
+            LmHeadMode::Last(&mut logits),
+            None,
+        );
+        logits
+    }
+
+    /// Batched prefill for half-precision KV (M6). `bf16` selects
+    /// bfloat16 vs IEEE f16 storage; the write/attend body is in
+    /// [`HalfKv`] (store half bits, dequant the live region to f32, run
+    /// the F32 flash-prefill). Output equals the F32 batched path over
+    /// f16/bf16-rounded K/V.
+    pub fn forward_prefill_batched_half(
+        &self,
+        bf16: bool,
+        tokens: &[i32],
+        start_pos: u32,
+        kv: &mut KvCache,
+    ) -> Vec<f32> {
+        let n_new = tokens.len();
+        if n_new == 0 {
+            return vec![0.0f32; self.cfg.vocab_size];
+        }
+        let mut logits = vec![0.0f32; self.cfg.vocab_size];
+        self.forward_prefill_batched_inner(
+            &HalfKv { bf16 }, tokens, start_pos, kv,
             LmHeadMode::Last(&mut logits),
             None,
         );
@@ -14721,6 +15190,153 @@ mod tests {
         }
         let _ = max_diff;
         assert_eq!(kv_ref.seq_len, kv_batched.seq_len);
+    }
+
+    // ---- M6: f16 / bf16 KV ----
+
+    /// M6: `KvDtype::parse` accepts the half spellings.
+    #[test]
+    fn kv_dtype_parse_half_spellings() {
+        assert_eq!(KvDtype::parse("f16"), Some(KvDtype::F16));
+        assert_eq!(KvDtype::parse("fp16"), Some(KvDtype::F16));
+        assert_eq!(KvDtype::parse("float16"), Some(KvDtype::F16));
+        assert_eq!(KvDtype::parse("F16"), Some(KvDtype::F16));
+        assert_eq!(KvDtype::parse("bf16"), Some(KvDtype::Bf16));
+        assert_eq!(KvDtype::parse("bfloat16"), Some(KvDtype::Bf16));
+        assert_eq!(KvDtype::parse("BF16"), Some(KvDtype::Bf16));
+        assert_eq!(KvDtype::parse("nope"), None);
+    }
+
+    /// M6: f32 → half → f32 round-trips within the format's precision.
+    #[test]
+    fn half_kv_row_roundtrip_within_precision() {
+        let src: Vec<f32> = (0..64).map(|i| ((i as f32) - 32.0) * 0.37).collect();
+        let mut enc = vec![0u16; src.len()];
+        let mut dec = vec![0f32; src.len()];
+        // f16: ~10-bit mantissa ⇒ ~2^-10 relative error.
+        half_encode_row(false, &src, &mut enc);
+        half_decode_row(false, &enc, &mut dec);
+        for (&a, &b) in src.iter().zip(dec.iter()) {
+            let tol = a.abs() * 1e-3 + 1e-3;
+            assert!((a - b).abs() <= tol, "f16 roundtrip {a} -> {b}");
+        }
+        // bf16: 7-bit mantissa ⇒ ~2^-7 relative error.
+        half_encode_row(true, &src, &mut enc);
+        half_decode_row(true, &enc, &mut dec);
+        for (&a, &b) in src.iter().zip(dec.iter()) {
+            let tol = a.abs() * 1e-2 + 1e-2;
+            assert!((a - b).abs() <= tol, "bf16 roundtrip {a} -> {b}");
+        }
+    }
+
+    fn serial_last_logits(
+        model: &LlamaModel,
+        cfg: &LlamaConfig,
+        tokens: &[i32],
+        dt: KvDtype,
+        max_ctx: usize,
+    ) -> Vec<f32> {
+        let mut kv = KvCache::new_with_dtype(cfg, max_ctx, dt);
+        let mut logits = vec![0f32; cfg.vocab_size];
+        for (i, &tok) in tokens.iter().enumerate() {
+            model.forward_one(tok, i as u32, &mut kv, &mut logits);
+        }
+        logits
+    }
+
+    /// M6: an f16/bf16-KV forward stays close (cosine > 0.999) to the
+    /// f32-KV forward on a synth model — both the serial `forward_one`
+    /// decode path and the batched prefill path.
+    #[test]
+    fn half_kv_decode_parity_vs_f32() {
+        let cfg = synth_cfg(2, 2, 8);
+        let model = synth_llama_model(&cfg);
+        let tokens: Vec<i32> = vec![5, 7, 2, 14, 3, 9, 1, 11];
+        let max_ctx = 16;
+
+        // Serial decode path.
+        let f32_serial = serial_last_logits(&model, &cfg, &tokens, KvDtype::F32, max_ctx);
+        for dt in [KvDtype::F16, KvDtype::Bf16] {
+            let half = serial_last_logits(&model, &cfg, &tokens, dt, max_ctx);
+            let cos = cosine(&f32_serial, &half);
+            assert!(cos > 0.999, "{dt:?} serial decode cosine {cos} <= 0.999");
+        }
+
+        // Batched prefill path.
+        let mut kv_f32 = KvCache::new_with_dtype(&cfg, max_ctx, KvDtype::F32);
+        let f32_pf = model.forward_prefill_batched_f32(&tokens, 0, &mut kv_f32);
+        for bf16 in [false, true] {
+            let dt = if bf16 { KvDtype::Bf16 } else { KvDtype::F16 };
+            let mut kv_h = KvCache::new_with_dtype(&cfg, max_ctx, dt);
+            let half_pf = model.forward_prefill_batched_half(bf16, &tokens, 0, &mut kv_h);
+            let cos = cosine(&f32_pf, &half_pf);
+            assert!(cos > 0.999, "{dt:?} batched prefill cosine {cos} <= 0.999");
+        }
+    }
+
+    // ---- F4: per-layer KV dtype ----
+
+    /// F4 REGRESSION GUARD: a cache built with every layer set to dtype X
+    /// via `new_with_layer_dtypes` is byte-for-byte the historic
+    /// single-dtype cache — same per-layer variants, same `uniform_dtype`,
+    /// and bit-exact forward logits.
+    #[test]
+    fn kv_all_same_layer_dtypes_byte_identical() {
+        let cfg = synth_cfg(3, 2, 8);
+        let model = synth_llama_model(&cfg);
+        let tokens: Vec<i32> = vec![5, 7, 2, 14, 3];
+        let max_ctx = 16;
+        // Head_dim 8 ⇒ use dtypes that don't require 32-elem alignment.
+        for dt in [KvDtype::F32, KvDtype::F16, KvDtype::Bf16, KvDtype::Q8_0] {
+            let single = KvCache::new_with_dtype(&cfg, max_ctx, dt);
+            let per_layer =
+                KvCache::new_with_layer_dtypes(&cfg, max_ctx, &vec![dt; cfg.n_layers]);
+            assert_eq!(per_layer.layer_dtypes, vec![dt; cfg.n_layers]);
+            assert_eq!(per_layer.uniform_dtype(), Some(dt));
+            assert_eq!(single.dtype(), per_layer.dtype());
+            assert_eq!(
+                std::mem::discriminant(&single.layers[0]),
+                std::mem::discriminant(&per_layer.layers[0]),
+            );
+
+            let mut kv_a = KvCache::new_with_dtype(&cfg, max_ctx, dt);
+            let mut kv_b =
+                KvCache::new_with_layer_dtypes(&cfg, max_ctx, &vec![dt; cfg.n_layers]);
+            let la = model.forward_prefill(&tokens, 0, &mut kv_a);
+            let lb = model.forward_prefill(&tokens, 0, &mut kv_b);
+            assert_eq!(la, lb, "{dt:?} all-same per-layer != single-dtype (not byte-identical)");
+        }
+    }
+
+    /// F4: a genuinely MIXED per-layer cache (layer0=f32, layer1=f16,
+    /// layer2=q8_0) stores each layer at its own dtype, reports
+    /// `uniform_dtype()==None` (so it uses the serial per-layer forward),
+    /// and produces coherent finite logits.
+    #[test]
+    fn kv_mixed_layer_dtypes_runs_coherently() {
+        let cfg = synth_cfg(3, 2, 8);
+        let model = synth_llama_model(&cfg);
+        let tokens: Vec<i32> = vec![5, 7, 2, 14, 3];
+        let max_ctx = 16;
+        let spec = [KvDtype::F32, KvDtype::F16, KvDtype::Q8_0];
+        let mut kv = KvCache::new_with_layer_dtypes(&cfg, max_ctx, &spec);
+        assert_eq!(kv.layer_dtypes, spec.to_vec());
+        assert_eq!(kv.uniform_dtype(), None, "mixed cache must not read as uniform");
+        // Each layer stored at its own dtype (variant check).
+        assert!(matches!(kv.layers[0], KvLayer::F32 { .. }));
+        assert!(matches!(kv.layers[1], KvLayer::Half { bf16: false, .. }));
+        assert!(matches!(kv.layers[2], KvLayer::Q8_0 { .. }));
+
+        let logits = model.forward_prefill(&tokens, 0, &mut kv);
+        assert_eq!(logits.len(), cfg.vocab_size);
+        assert!(logits.iter().all(|x| x.is_finite()), "mixed-dtype logits must be finite");
+        assert_eq!(kv.seq_len, tokens.len());
+
+        // Snapshot/restore round-trips on a mixed cache (per-layer safe).
+        let snap = kv.snapshot_prefix(tokens.len());
+        let mut kv2 = KvCache::new_with_layer_dtypes(&cfg, max_ctx, &spec);
+        kv2.restore_prefix(&snap);
+        assert_eq!(kv2.seq_len, tokens.len());
     }
 
     /// E1 TurboQuant: per-position logits from the batched TQ-KV

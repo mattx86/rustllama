@@ -601,6 +601,8 @@ fn request_id() -> String {
 fn kv_dtype_label(cpu: &rustllama_engine::CpuEngine) -> &'static str {
     match cpu.kv_dtype() {
         rustllama_engine::KvDtype::F32 => "f32",
+        rustllama_engine::KvDtype::F16 => "f16",
+        rustllama_engine::KvDtype::Bf16 => "bf16",
         rustllama_engine::KvDtype::Q8_0 => "q8_0",
         rustllama_engine::KvDtype::Tq(_) => "tq",
         rustllama_engine::KvDtype::Nvfp4 => "nvfp4",

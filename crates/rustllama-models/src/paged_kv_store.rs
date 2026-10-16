@@ -420,6 +420,21 @@ impl PagedKvStoreOps for PagedKvStoreQ8_0 {
     fn total_pages(&self) -> u32 { PagedKvStoreQ8_0::total_pages(self) }
 }
 
+impl PagedKvStoreOps for PagedKvStoreF16 {
+    fn write_token(&mut self, pages: &[PageId], layer: u32, pos: u32, k: &[f32], v: &[f32]) -> Option<()> {
+        PagedKvStoreF16::write_token(self, pages, layer, pos, k, v)
+    }
+    fn gather_layer(&self, pages: &[PageId], layer: u32, kv_len: u32, k_out: &mut [f32], v_out: &mut [f32]) -> Option<()> {
+        PagedKvStoreF16::gather_layer(self, pages, layer, kv_len, k_out, v_out)
+    }
+    fn zero_page(&mut self, page: PageId) -> Option<()> { PagedKvStoreF16::zero_page(self, page) }
+    fn page_size(&self) -> u32 { PagedKvStoreF16::page_size(self) }
+    fn n_layers(&self) -> u32 { PagedKvStoreF16::n_layers(self) }
+    fn n_kv_heads(&self) -> u32 { PagedKvStoreF16::n_kv_heads(self) }
+    fn head_dim(&self) -> u32 { PagedKvStoreF16::head_dim(self) }
+    fn total_pages(&self) -> u32 { PagedKvStoreF16::total_pages(self) }
+}
+
 // ============================================================
 // G2.4: Q8_0 paged KV storage.
 // ============================================================
@@ -643,6 +658,238 @@ impl PagedKvStoreQ8_0 {
                     let dst_pos = out_head_base + (page_i * page_size + p) * hd;
                     self.dequantize_row_into(k_off, &mut k_out[dst_pos..dst_pos + hd]);
                     self.dequantize_row_into(v_off, &mut v_out[dst_pos..dst_pos + hd]);
+                }
+                pos_written += pos_in_this_page;
+            }
+        }
+        Some(())
+    }
+
+    /// Zero out one page (debug determinism — attention's kv_len bound
+    /// already guards against stale reads).
+    pub fn zero_page(&mut self, page: PageId) -> Option<()> {
+        if page.0 >= self.total_pages {
+            return None;
+        }
+        let start = (page.0 as usize) * self.page_stride;
+        let end = start + self.page_stride;
+        for v in &mut self.data[start..end] {
+            *v = 0;
+        }
+        Some(())
+    }
+}
+
+// ============================================================
+// M6: half-precision (f16 / bf16) paged KV storage.
+// ============================================================
+
+/// Half-precision paged KV storage. Same page geometry as
+/// [`PagedKvStore`] but each element is two bytes (an f16 or bf16 bit
+/// pattern, selected by `bf16`), with no block scale. `write_token`
+/// rounds the f32 K/V rows to half on write; `gather_layer` widens them
+/// back to f32 into the caller's contiguous `[n_kv_heads, kv_len,
+/// head_dim]` slabs, so the existing f32 attention kernels consume the
+/// gather output unchanged. Covers BOTH f16 and bf16 (the `bf16` flag is
+/// the only difference) — the mid-range paged KV option between f32 and
+/// q8_0.
+#[derive(Debug)]
+pub struct PagedKvStoreF16 {
+    /// True ⇒ bfloat16 bit patterns; false ⇒ IEEE f16.
+    bf16: bool,
+    /// Byte storage. Length = `total_pages × page_byte_stride`.
+    data: Vec<u8>,
+    total_pages: u32,
+    n_layers: u32,
+    n_kv_heads: u32,
+    page_size: u32,
+    head_dim: u32,
+    /// Precomputed strides (in bytes). `bytes_per_row = head_dim * 2`.
+    bytes_per_row: usize,
+    head_stride: usize,
+    kv_stride: usize,
+    layer_stride: usize,
+    page_stride: usize,
+}
+
+impl PagedKvStoreF16 {
+    /// Bytes of pool storage (memory-budget planner input).
+    pub fn approx_bytes(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn new(
+        total_pages: u32,
+        n_layers: u32,
+        n_kv_heads: u32,
+        page_size: u32,
+        head_dim: u32,
+        bf16: bool,
+    ) -> Option<Self> {
+        if total_pages == 0 || n_layers == 0 || n_kv_heads == 0
+            || page_size == 0 || head_dim == 0
+        {
+            return None;
+        }
+        let bytes_per_row = (head_dim as usize).checked_mul(2)?;
+        let head_stride = (page_size as usize).checked_mul(bytes_per_row)?;
+        let kv_stride = (n_kv_heads as usize).checked_mul(head_stride)?;
+        let layer_stride = kv_stride.checked_mul(2)?;
+        let page_stride = (n_layers as usize).checked_mul(layer_stride)?;
+        let total_bytes = (total_pages as usize).checked_mul(page_stride)?;
+        Some(Self {
+            bf16,
+            data: vec![0u8; total_bytes],
+            total_pages,
+            n_layers,
+            n_kv_heads,
+            page_size,
+            head_dim,
+            bytes_per_row,
+            head_stride,
+            kv_stride,
+            layer_stride,
+            page_stride,
+        })
+    }
+
+    pub fn total_pages(&self) -> u32 { self.total_pages }
+    pub fn n_layers(&self) -> u32 { self.n_layers }
+    pub fn n_kv_heads(&self) -> u32 { self.n_kv_heads }
+    pub fn page_size(&self) -> u32 { self.page_size }
+    pub fn head_dim(&self) -> u32 { self.head_dim }
+    pub fn page_stride(&self) -> usize { self.page_stride }
+    pub fn is_bf16(&self) -> bool { self.bf16 }
+
+    #[inline]
+    fn cell_offset(
+        &self,
+        page: PageId,
+        layer: u32,
+        kv_axis: u32,
+        h: u32,
+        pos_in_page: u32,
+    ) -> Option<usize> {
+        if page.0 >= self.total_pages
+            || layer >= self.n_layers
+            || kv_axis >= 2
+            || h >= self.n_kv_heads
+            || pos_in_page >= self.page_size
+        {
+            return None;
+        }
+        let off = (page.0 as usize) * self.page_stride
+            + (layer as usize) * self.layer_stride
+            + (kv_axis as usize) * self.kv_stride
+            + (h as usize) * self.head_stride
+            + (pos_in_page as usize) * self.bytes_per_row;
+        Some(off)
+    }
+
+    /// Round one f32 row to half and store its little-endian bit
+    /// patterns at `off` (`head_dim` values, 2 bytes each).
+    #[inline]
+    fn encode_row_into(&mut self, off: usize, src_row: &[f32]) {
+        debug_assert_eq!(src_row.len(), self.head_dim as usize);
+        let dst = &mut self.data[off..off + src_row.len() * 2];
+        if self.bf16 {
+            for (c, &x) in dst.chunks_exact_mut(2).zip(src_row.iter()) {
+                c.copy_from_slice(&half::bf16::from_f32(x).to_bits().to_le_bytes());
+            }
+        } else {
+            for (c, &x) in dst.chunks_exact_mut(2).zip(src_row.iter()) {
+                c.copy_from_slice(&half::f16::from_f32(x).to_bits().to_le_bytes());
+            }
+        }
+    }
+
+    /// Widen one stored half row back to f32.
+    #[inline]
+    fn decode_row_into(&self, off: usize, dst: &mut [f32]) {
+        let hd = self.head_dim as usize;
+        debug_assert_eq!(dst.len(), hd);
+        let src = &self.data[off..off + hd * 2];
+        if self.bf16 {
+            for (d, c) in dst.iter_mut().zip(src.chunks_exact(2)) {
+                *d = half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32();
+            }
+        } else {
+            for (d, c) in dst.iter_mut().zip(src.chunks_exact(2)) {
+                *d = half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32();
+            }
+        }
+    }
+
+    /// Same shape as [`PagedKvStore::write_token`] — round each f32 head
+    /// row to half and write into the paged storage.
+    pub fn write_token(
+        &mut self,
+        pages: &[PageId],
+        layer: u32,
+        pos: u32,
+        k: &[f32],
+        v: &[f32],
+    ) -> Option<()> {
+        let hd = self.head_dim as usize;
+        let need = (self.n_kv_heads as usize) * hd;
+        if k.len() != need || v.len() != need {
+            return None;
+        }
+        let page_idx = (pos / self.page_size) as usize;
+        let pos_in_page = pos % self.page_size;
+        let page = *pages.get(page_idx)?;
+        for h in 0..self.n_kv_heads {
+            let h_off_src = (h as usize) * hd;
+            let k_off = self.cell_offset(page, layer, 0, h, pos_in_page)?;
+            self.encode_row_into(k_off, &k[h_off_src..h_off_src + hd]);
+            let v_off = self.cell_offset(page, layer, 1, h, pos_in_page)?;
+            self.encode_row_into(v_off, &v[h_off_src..h_off_src + hd]);
+        }
+        Some(())
+    }
+
+    /// Same shape as [`PagedKvStore::gather_layer`] — widen each half row
+    /// back to f32 into the caller's contiguous `[n_kv_heads, kv_len,
+    /// head_dim]` slabs.
+    pub fn gather_layer(
+        &self,
+        pages: &[PageId],
+        layer: u32,
+        kv_len: u32,
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+    ) -> Option<()> {
+        if layer >= self.n_layers {
+            return None;
+        }
+        let hd = self.head_dim as usize;
+        let need = (self.n_kv_heads as usize) * (kv_len as usize) * hd;
+        if k_out.len() != need || v_out.len() != need {
+            return None;
+        }
+        let pages_needed = (kv_len as usize).div_ceil(self.page_size as usize);
+        if pages.len() < pages_needed {
+            return None;
+        }
+        let page_size = self.page_size as usize;
+        let kv_len_us = kv_len as usize;
+        for h in 0..self.n_kv_heads {
+            let out_head_base = (h as usize) * kv_len_us * hd;
+            let mut pos_written = 0usize;
+            for (page_i, &page) in pages.iter().enumerate() {
+                if pos_written >= kv_len_us {
+                    break;
+                }
+                let remaining = kv_len_us - pos_written;
+                let pos_in_this_page = remaining.min(page_size);
+                for p in 0..pos_in_this_page {
+                    let k_off = self.cell_offset(page, layer, 0, h, p as u32)
+                        .expect("page/layer/head/pos in range");
+                    let v_off = self.cell_offset(page, layer, 1, h, p as u32)
+                        .expect("page/layer/head/pos in range");
+                    let dst_pos = out_head_base + (page_i * page_size + p) * hd;
+                    self.decode_row_into(k_off, &mut k_out[dst_pos..dst_pos + hd]);
+                    self.decode_row_into(v_off, &mut v_out[dst_pos..dst_pos + hd]);
                 }
                 pos_written += pos_in_this_page;
             }
@@ -1300,6 +1547,57 @@ mod tests {
         assert!(!s.write_page(PageId(0), &payload[..10]));
         assert!(s.read_page(PageId(99)).is_none());
         assert!(!s.write_page(PageId(99), &payload));
+    }
+
+    /// M6: the paged half store round-trips f32 K/V rows through its
+    /// 2-byte cells within the format's precision (f16 and bf16), and
+    /// `gather_layer` widens them back to f32 for the attention kernels.
+    #[test]
+    fn paged_f16_store_write_gather_round_trips() {
+        for bf16 in [false, true] {
+            // 2 pages, 2 layers, 2 kv_heads, page_size 4, head_dim 8.
+            let mut s = PagedKvStoreF16::new(2, 2, 2, 4, 8, bf16).expect("f16 store");
+            assert_eq!(s.is_bf16(), bf16);
+            let n_heads = s.n_kv_heads() as usize;
+            let hd = s.head_dim() as usize;
+            let kv_len = 3u32;
+            let pages = [PageId(0)];
+            let mut k_in = vec![vec![0f32; n_heads * hd]; kv_len as usize];
+            let mut v_in = vec![vec![0f32; n_heads * hd]; kv_len as usize];
+            for (p, (kr, vr)) in k_in.iter_mut().zip(v_in.iter_mut()).enumerate() {
+                for i in 0..n_heads * hd {
+                    kr[i] = (p as f32) * 0.5 + i as f32 * 0.013 - 0.7;
+                    vr[i] = -(p as f32) * 0.25 - i as f32 * 0.011 + 0.4;
+                }
+                s.write_token(&pages, /*layer=*/ 1, p as u32, kr, vr)
+                    .expect("write token");
+            }
+            let mut k_out = vec![0f32; n_heads * kv_len as usize * hd];
+            let mut v_out = vec![0f32; n_heads * kv_len as usize * hd];
+            s.gather_layer(&pages, 1, kv_len, &mut k_out, &mut v_out)
+                .expect("gather");
+            // Layout: [n_kv_heads, kv_len, head_dim]. Compare vs input,
+            // allowing the half format's rounding.
+            let tol = if bf16 { 1e-2 } else { 2e-3 };
+            for h in 0..n_heads {
+                for p in 0..kv_len as usize {
+                    for d in 0..hd {
+                        let got_k = k_out[(h * kv_len as usize + p) * hd + d];
+                        let want_k = k_in[p][h * hd + d];
+                        assert!(
+                            (got_k - want_k).abs() <= want_k.abs() * tol + tol,
+                            "bf16={bf16} K[h{h} p{p} d{d}] {got_k} vs {want_k}"
+                        );
+                        let got_v = v_out[(h * kv_len as usize + p) * hd + d];
+                        let want_v = v_in[p][h * hd + d];
+                        assert!(
+                            (got_v - want_v).abs() <= want_v.abs() * tol + tol,
+                            "bf16={bf16} V[h{h} p{p} d{d}] {got_v} vs {want_v}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

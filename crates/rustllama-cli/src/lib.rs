@@ -417,7 +417,7 @@ pub enum Command {
         kv_dtype: bool,
         /// KV-dtype candidates (comma-separated). Default covers every
         /// v1-supported value. Honored only with `--kv-dtype`.
-        #[arg(long, default_value = "f32,q8_0,q4_0,tq1,tq2,tq4,tq8,nvfp4,mxfp4,mxfp6,mxfp8")]
+        #[arg(long, default_value = "f32,f16,bf16,q8_0,q4_0,tq1,tq2,tq4,tq8,nvfp4,mxfp4,mxfp6,mxfp8")]
         kv_dtype_candidates: String,
         /// Flash-attention on/off sweep. Reuses one loaded engine
         /// (flash is a hot toggle). Writes the winner under
@@ -8372,6 +8372,8 @@ fn cmd_tune_all(
 fn kv_dtype_to_str(dt: &rustllama_engine::KvDtype) -> String {
     match dt {
         rustllama_engine::KvDtype::F32 => "f32".to_string(),
+        rustllama_engine::KvDtype::F16 => "f16".to_string(),
+        rustllama_engine::KvDtype::Bf16 => "bf16".to_string(),
         rustllama_engine::KvDtype::Q8_0 => "q8_0".to_string(),
         rustllama_engine::KvDtype::Tq(bits) => format!("tq{bits}"),
         rustllama_engine::KvDtype::Nvfp4 => "nvfp4".to_string(),
@@ -9741,6 +9743,8 @@ fn bench(
 /// Map a `kv_dtype` config string to the enum the engine expects.
 /// Accepts common spellings:
 ///   - `""` / `"f32"` / `"fp32"` / `"float32"` → `F32` (default).
+///   - `"f16"` / `"fp16"` / `"float16"` → `F16`; `"bf16"` / `"bfloat16"`
+///     → `Bf16` (M6: 2-byte half KV, the mid-range option).
 ///   - `"q8"` / `"q8_0"` / `"int8"` → `Q8_0` (per-row 8-bit + scale).
 ///   - `"tq1"` / `"tq2"` / `"tq4"` / `"tq8"` → TurboQuant
 ///     (Walsh–Hadamard rotation + uniform N-bit quant).
@@ -9756,7 +9760,7 @@ fn parse_kv_dtype(s: &str) -> anyhow::Result<rustllama_engine::KvDtype> {
     if let Some(dtype) = rustllama_engine::KvDtype::parse(&lower) {
         return Ok(dtype);
     }
-    anyhow::bail!("unknown kv_dtype `{s}` (expected: f32, q8_0, q4_0, tq1, tq2, tq4, tq8, nvfp4)");
+    anyhow::bail!("unknown kv_dtype `{s}` (expected: f32, f16, bf16, q8_0, q4_0, tq1, tq2, tq4, tq8, nvfp4, mxfp4, mxfp6, mxfp8)");
 }
 
 // ----- chat history (unified sessions + conversations) -----

@@ -5492,9 +5492,10 @@ fn display_name(name: &str) -> &str {
 
 /// The KV-dtype option lists (mirror Settings.tsx). `_OPT` prepends `""`
 /// (rendered "— inherit —") for the optional per-channel K/V overrides.
-const KV_DTYPES: [&str; 8] = ["f32", "q8_0", "q4_0", "tq1", "tq2", "tq4", "tq8", "nvfp4"];
-const KV_DTYPES_OPT: [&str; 9] = [
-    "", "f32", "q8_0", "q4_0", "tq1", "tq2", "tq4", "tq8", "nvfp4",
+const KV_DTYPES: [&str; 10] =
+    ["f32", "f16", "bf16", "q8_0", "q4_0", "tq1", "tq2", "tq4", "tq8", "nvfp4"];
+const KV_DTYPES_OPT: [&str; 11] = [
+    "", "f32", "f16", "bf16", "q8_0", "q4_0", "tq1", "tq2", "tq4", "tq8", "nvfp4",
 ];
 /// UI theme options.
 const THEMES: [&str; 3] = ["system", "dark", "light"];

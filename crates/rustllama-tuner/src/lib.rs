@@ -493,6 +493,17 @@ pub struct TuningResult {
     /// entries survive a `KvDtype` enum bump.
     #[serde(default)]
     pub kv_dtype: Option<String>,
+    /// F4: optional PER-LAYER-GROUP KV dtype spec — one raw config
+    /// string per layer (e.g. `["f32", "f32", "q4_0", "q4_0", …]` for an
+    /// attention-sink-lossless / rest-cheaper split). `None` (the serde
+    /// default, so old caches load unchanged) means "all layers use
+    /// `kv_dtype`" — the uniform case. The current `--kv-dtype` sweep
+    /// still picks a single global `kv_dtype`; this slot carries a
+    /// per-group spec once a per-group search lands, and the engine load
+    /// builds the cache via `KvCache::new_with_layer_dtypes` when it is
+    /// `Some`.
+    #[serde(default)]
+    pub kv_dtype_groups: Option<Vec<String>>,
     /// Winning `[inference].flash_attention` setting. `None` = no
     /// entry, engine uses the config value.
     #[serde(default)]
@@ -662,6 +673,7 @@ impl TuningResult {
             threads: None,
             batch_size: None,
             kv_dtype: None,
+            kv_dtype_groups: None,
             flash_attention: None,
             kv_cache_layout: None,
             flash_kv_min: None,

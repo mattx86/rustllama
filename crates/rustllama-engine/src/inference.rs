@@ -811,7 +811,8 @@ impl EngineState {
             | KvBackend::PagedNvfp4 { cache, table, .. }
             | KvBackend::PagedMxfp4 { cache, table, .. }
             | KvBackend::PagedMxfp6 { cache, table, .. }
-            | KvBackend::PagedMxfp8 { cache, table, .. } => {
+            | KvBackend::PagedMxfp8 { cache, table, .. }
+            | KvBackend::PagedF16 { cache, table, .. } => {
                 use rustllama_models::apc;
                 let page_size = table.page_size() as usize;
                 if !enabled || prompt_max == 0 || page_size == 0 {
@@ -1834,7 +1835,7 @@ impl CpuEngine {
         let KvBackend::Contiguous(kv) = &s.kv_backend else {
             return;
         };
-        if kv.dtype != rustllama_models::llama_arch::KvDtype::F32 {
+        if !kv.is_uniform_f32() {
             tracing::info!("kv_persist: only F32 KV is persisted in v1; skipping load");
             return;
         }
@@ -1880,7 +1881,7 @@ impl CpuEngine {
         let KvBackend::Contiguous(kv) = &state.kv_backend else {
             return;
         };
-        if kv.dtype != rustllama_models::llama_arch::KvDtype::F32 {
+        if !kv.is_uniform_f32() {
             return;
         }
         match crate::kv_persist::save_pool(
@@ -5574,18 +5575,27 @@ fn spec_prefill_and_forward(
     // Pick the batched path when the live KV backend supports one;
     // otherwise fall through to the serial loop.
     let batched_dtype = match &state.kv_backend {
-        crate::kv_backend::KvBackend::Contiguous(kv) => match kv.dtype {
-            rustllama_models::llama_arch::KvDtype::F32 => Some(BatchedSpec::F32),
-            rustllama_models::llama_arch::KvDtype::Q8_0 => Some(BatchedSpec::Q8_0),
-            rustllama_models::llama_arch::KvDtype::Tq(_) => Some(BatchedSpec::Tq),
-            rustllama_models::llama_arch::KvDtype::Nvfp4 => Some(BatchedSpec::Nvfp4),
-            rustllama_models::llama_arch::KvDtype::Q4_0 => Some(BatchedSpec::Q4_0),
+        // F4: the speculation batched path has one spec for the whole
+        // cache, so it needs a UNIFORM dtype. A mixed per-layer cache
+        // (`uniform_dtype() == None`) falls through to the serial loop,
+        // which dispatches each layer on its own `KvLayer` variant.
+        crate::kv_backend::KvBackend::Contiguous(kv) => match kv.uniform_dtype() {
+            Some(rustllama_models::llama_arch::KvDtype::F32) => Some(BatchedSpec::F32),
+            Some(rustllama_models::llama_arch::KvDtype::Q8_0) => Some(BatchedSpec::Q8_0),
+            Some(rustllama_models::llama_arch::KvDtype::Tq(_)) => Some(BatchedSpec::Tq),
+            Some(rustllama_models::llama_arch::KvDtype::Nvfp4) => Some(BatchedSpec::Nvfp4),
+            Some(rustllama_models::llama_arch::KvDtype::Q4_0) => Some(BatchedSpec::Q4_0),
             // MXFP KV batched-spec fast path (Wave 2): one arm per
             // element format — `mxfp_kv_prefill` inside the batched
             // forward selects the block bytes + kernels.
-            rustllama_models::llama_arch::KvDtype::Mxfp4 => Some(BatchedSpec::Mxfp4),
-            rustllama_models::llama_arch::KvDtype::Mxfp6 => Some(BatchedSpec::Mxfp6),
-            rustllama_models::llama_arch::KvDtype::Mxfp8 => Some(BatchedSpec::Mxfp8),
+            Some(rustllama_models::llama_arch::KvDtype::Mxfp4) => Some(BatchedSpec::Mxfp4),
+            Some(rustllama_models::llama_arch::KvDtype::Mxfp6) => Some(BatchedSpec::Mxfp6),
+            Some(rustllama_models::llama_arch::KvDtype::Mxfp8) => Some(BatchedSpec::Mxfp8),
+            // M6: half KV has no speculation batched spec yet → serial.
+            Some(rustllama_models::llama_arch::KvDtype::F16)
+            | Some(rustllama_models::llama_arch::KvDtype::Bf16) => None,
+            // Mixed per-layer dtypes (F4) → serial per-layer forward.
+            None => None,
         },
         // Paged backend: serial fallback. Paged is F32-only in v1
         // (per the kv_backend gate); the F32 batched path can't be
@@ -8594,7 +8604,8 @@ fn drive_vlm_generation(
         | KvBackend::PagedNvfp4 { .. }
         | KvBackend::PagedMxfp4 { .. }
         | KvBackend::PagedMxfp6 { .. }
-        | KvBackend::PagedMxfp8 { .. } => {
+        | KvBackend::PagedMxfp8 { .. }
+        | KvBackend::PagedF16 { .. } => {
             return Err(crate::EngineError::Engine(
                 "VLM chat requires the contiguous KV backend in v1 — \
                  set [inference].kv_cache_layout = \"contiguous\""
@@ -8982,7 +8993,8 @@ fn forward_one_via_backend_hybrid(
             | KvBackend::PagedNvfp4 { .. }
             | KvBackend::PagedMxfp4 { .. }
             | KvBackend::PagedMxfp6 { .. }
-            | KvBackend::PagedMxfp8 { .. } => {
+            | KvBackend::PagedMxfp8 { .. }
+            | KvBackend::PagedF16 { .. } => {
                 // Hybrid models don't yet route through the paged
                 // backend — Phase 3.7b only supports contiguous KV.
                 panic!(
@@ -9046,6 +9058,13 @@ fn forward_one_via_backend_hybrid(
                 .expect("paged cache grow failed — pool was sized to max_ctx at engine load");
             model.forward_one_paged_mxfp8(token_id, pos, cache, store, logits_out);
         }
+        KvBackend::PagedF16 { cache, store, table } => {
+            // M6: half-precision (f16 / bf16) paged forward dispatch.
+            cache
+                .ensure_capacity(table, pos + 1)
+                .expect("paged cache grow failed — pool was sized to max_ctx at engine load");
+            model.forward_one_paged_f16(token_id, pos, cache, store, logits_out);
+        }
     }
 }
 
@@ -9091,7 +9110,8 @@ fn forward_one_with_mtp_drafts_via_backend(
         | KvBackend::PagedNvfp4 { .. }
         | KvBackend::PagedMxfp4 { .. }
         | KvBackend::PagedMxfp6 { .. }
-        | KvBackend::PagedMxfp8 { .. } => {
+        | KvBackend::PagedMxfp8 { .. }
+        | KvBackend::PagedF16 { .. } => {
             return Err(crate::EngineError::Unimplemented(
                 "MTP drafting on paged KV backend (forward_one_with_mtp_logits_paged is a \
                  follow-up; use the contiguous backend for MTP-driven speculation)",

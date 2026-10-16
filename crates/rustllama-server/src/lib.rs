@@ -4604,6 +4604,8 @@ async fn metrics(State(state): State<AppState>) -> Json<MetricsSnapshot> {
     let kv_dtype: Option<String> = serving.cpu_engine.as_ref().map(|cpu| {
         match cpu.kv_dtype() {
             rustllama_engine::KvDtype::F32 => "f32".to_string(),
+            rustllama_engine::KvDtype::F16 => "f16".to_string(),
+            rustllama_engine::KvDtype::Bf16 => "bf16".to_string(),
             rustllama_engine::KvDtype::Q8_0 => "q8_0".to_string(),
             rustllama_engine::KvDtype::Tq(bits) => format!("tq{bits}"),
             rustllama_engine::KvDtype::Nvfp4 => "nvfp4".to_string(),

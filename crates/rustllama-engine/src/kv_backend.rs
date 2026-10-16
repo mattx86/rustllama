@@ -117,6 +117,13 @@ pub enum KvBackend {
         store: rustllama_models::paged_kv_store::PagedKvStoreMxfp8,
         table: PageTable,
     },
+    /// M6: half-precision paged variant (f16 or bf16 — the store's
+    /// `is_bf16()` carries which). Two bytes per element, no block scale.
+    PagedF16 {
+        cache: PagedKvCache,
+        store: rustllama_models::paged_kv_store::PagedKvStoreF16,
+        table: PageTable,
+    },
 }
 
 impl KvBackend {
@@ -134,6 +141,7 @@ impl KvBackend {
             KvBackend::PagedMxfp4 { store, .. } => store.approx_bytes() as u64,
             KvBackend::PagedMxfp6 { store, .. } => store.approx_bytes() as u64,
             KvBackend::PagedMxfp8 { store, .. } => store.approx_bytes() as u64,
+            KvBackend::PagedF16 { store, .. } => store.approx_bytes() as u64,
         }
     }
 
@@ -310,6 +318,23 @@ impl KvBackend {
                         let cache = PagedKvCache::new_with_page_size(store.page_size());
                         Ok(KvBackend::PagedMxfp8 { cache, store, table })
                     }
+                    // M6: half-precision paged store (f16 / bf16). Two
+                    // bytes per element; `gather_layer` widens to f32 so
+                    // the existing attention kernels run unchanged.
+                    KvDtype::F16 | KvDtype::Bf16 => {
+                        let bf16 = matches!(kv_dtype, KvDtype::Bf16);
+                        let store = rustllama_models::paged_kv_store::PagedKvStoreF16::new(
+                            pages_for_one_request,
+                            model_cfg.n_layers as u32,
+                            model_cfg.n_kv_heads as u32,
+                            page_size,
+                            model_cfg.head_dim as u32,
+                            bf16,
+                        )
+                        .ok_or(KvBackendError::PagedStoreShape)?;
+                        let cache = PagedKvCache::new_with_page_size(store.page_size());
+                        Ok(KvBackend::PagedF16 { cache, store, table })
+                    }
                 }
             }
             other => Err(KvBackendError::UnknownLayout(other.to_string())),
@@ -328,6 +353,7 @@ impl KvBackend {
             KvBackend::PagedMxfp4 { cache, table, .. } => cache.release(table),
             KvBackend::PagedMxfp6 { cache, table, .. } => cache.release(table),
             KvBackend::PagedMxfp8 { cache, table, .. } => cache.release(table),
+            KvBackend::PagedF16 { cache, table, .. } => cache.release(table),
         }
     }
 
@@ -341,7 +367,8 @@ impl KvBackend {
             | KvBackend::PagedNvfp4 { cache, .. }
             | KvBackend::PagedMxfp4 { cache, .. }
             | KvBackend::PagedMxfp6 { cache, .. }
-            | KvBackend::PagedMxfp8 { cache, .. } => cache.seq_len() as usize,
+            | KvBackend::PagedMxfp8 { cache, .. }
+            | KvBackend::PagedF16 { cache, .. } => cache.seq_len() as usize,
         }
     }
 
@@ -362,14 +389,17 @@ impl KvBackend {
             | KvBackend::PagedNvfp4 { cache, .. }
             | KvBackend::PagedMxfp4 { cache, .. }
             | KvBackend::PagedMxfp6 { cache, .. }
-            | KvBackend::PagedMxfp8 { cache, .. } => cache.set_seq_len_for_rollback(n as u32),
+            | KvBackend::PagedMxfp8 { cache, .. }
+            | KvBackend::PagedF16 { cache, .. } => cache.set_seq_len_for_rollback(n as u32),
         }
     }
 
     /// Cell dtype. Reports the actual KvDtype the backend is storing.
+    /// For a contiguous cache this is the representative (layer-0) dtype
+    /// (F4: a mixed per-layer cache reports layer 0's dtype).
     pub fn kv_dtype(&self) -> KvDtype {
         match self {
-            KvBackend::Contiguous(kv) => kv.dtype,
+            KvBackend::Contiguous(kv) => kv.dtype(),
             KvBackend::Paged { .. } => KvDtype::F32,
             KvBackend::PagedQ8_0 { .. } => KvDtype::Q8_0,
             KvBackend::PagedTQ { store, .. } => KvDtype::Tq(store.bits()),
@@ -377,6 +407,9 @@ impl KvBackend {
             KvBackend::PagedMxfp4 { .. } => KvDtype::Mxfp4,
             KvBackend::PagedMxfp6 { .. } => KvDtype::Mxfp6,
             KvBackend::PagedMxfp8 { .. } => KvDtype::Mxfp8,
+            KvBackend::PagedF16 { store, .. } => {
+                if store.is_bf16() { KvDtype::Bf16 } else { KvDtype::F16 }
+            }
         }
     }
 
@@ -390,6 +423,7 @@ impl KvBackend {
                 | KvBackend::PagedMxfp4 { .. }
                 | KvBackend::PagedMxfp6 { .. }
                 | KvBackend::PagedMxfp8 { .. }
+                | KvBackend::PagedF16 { .. }
         )
     }
 
@@ -410,7 +444,8 @@ impl KvBackend {
             | KvBackend::PagedNvfp4 { table, .. }
             | KvBackend::PagedMxfp4 { table, .. }
             | KvBackend::PagedMxfp6 { table, .. }
-            | KvBackend::PagedMxfp8 { table, .. } => {
+            | KvBackend::PagedMxfp8 { table, .. }
+            | KvBackend::PagedF16 { table, .. } => {
                 Some((table.total(), table.free_count() as u32))
             }
         }

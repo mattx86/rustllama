@@ -795,10 +795,11 @@ pub fn coherence_safe_kv_dtype(
     force: bool,
 ) -> (String, Option<String>) {
     let r = requested.trim().to_ascii_lowercase();
-    // Universally coherent: exact F32, or 8-bit (negligible drift) —
-    // q8_0 and MXFP8 (E4M3 8-bit + per-32 E8M0 scale) are both ~8-bit
-    // and don't need per-model calibration. mxfp4/mxfp6 stay aggressive.
-    if r == "f32" || r == "q8_0" || r == "mxfp8" {
+    // Universally coherent: exact F32, half floats (f16/bf16 — near-
+    // lossless, 10-/7-bit mantissa, no per-model calibration), or 8-bit
+    // (negligible drift) — q8_0 and MXFP8 (E4M3 8-bit + per-32 E8M0
+    // scale) are both ~8-bit. mxfp4/mxfp6 stay aggressive.
+    if r == "f32" || r == "f16" || r == "bf16" || r == "q8_0" || r == "mxfp8" {
         return (requested.to_string(), None);
     }
     if force {
