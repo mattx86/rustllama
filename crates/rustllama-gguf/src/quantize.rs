@@ -1296,7 +1296,7 @@ fn target_block_size(dtype: GgmlType) -> u64 {
         // PrismML ternary group-128 formats (decode-only; no encoder).
         GgmlType::PQ2_0 | GgmlType::PTQ1_0 => 128,
         // OCP Microscaling: 32-element blocks (one E8M0 scale each).
-        GgmlType::Mxfp4 | GgmlType::Mxfp6 | GgmlType::Mxfp8 => 32,
+        GgmlType::Mxfp4Ggml | GgmlType::Mxfp4 | GgmlType::Mxfp6 | GgmlType::Mxfp8 => 32,
         // FP8 (E4M3, per-tensor scale): element-wise, no block.
         GgmlType::Fp8 => 1,
     }
@@ -1395,6 +1395,9 @@ fn dequant_to_f32(src_dtype: GgmlType, src_bytes: &[u8], out: &mut [f32]) -> Res
         GgmlType::PQ2_0 => dequant::dequant_pq2_0(src_bytes, out),
         GgmlType::PTQ1_0 => dequant::dequant_ptq1_0(src_bytes, out),
         // OCP Microscaling (self-contained block scale in the bytes).
+        // Upstream ggml MXFP4 (gpt-oss) as a re-quant source: decode its
+        // native 17-byte layout directly (scale first, split-half nibbles).
+        GgmlType::Mxfp4Ggml => dequant::dequant_mxfp4_ggml(src_bytes, out),
         GgmlType::Mxfp4 => dequant::dequant_mxfp4(src_bytes, out),
         GgmlType::Mxfp6 => dequant::dequant_mxfp6(src_bytes, out),
         GgmlType::Mxfp8 => dequant::dequant_mxfp8(src_bytes, out),
@@ -1517,7 +1520,10 @@ fn encode_from_f32(target_dtype: GgmlType, src: &[f32], dst: &mut [u8]) {
         // PQ2_0/PTQ1_0 are deliberately decode-only (we consume
         // PrismML's files; producing them means replicating their
         // Hadamard-rotated quantization pipeline, out of scope).
+        // Mxfp4Ggml (upstream id 39) is an INPUT-only dtype: we repack it
+        // to our Mxfp4 on load and only ever PRODUCE id 1025, never 39.
         GgmlType::Nvfp4
+        | GgmlType::Mxfp4Ggml
         | GgmlType::PQ2_0
         | GgmlType::PTQ1_0 => unreachable!(
             "encode_from_f32: encoder for {target_dtype:?} not implemented via the \

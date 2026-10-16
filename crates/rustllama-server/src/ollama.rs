@@ -2457,6 +2457,7 @@ mod tests {
                 n_experts: 8,
                 n_experts_used: 2,
                 n_experts_shared: 0,
+                ..Default::default()
             }),
             hybrid: None,
             hadamard: None,

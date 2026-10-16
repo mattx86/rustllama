@@ -8,12 +8,15 @@
 //! ## Routing
 //!
 //! [`route_topk`] projects the hidden state through the router matrix
-//! `[n_experts, d_model]`, applies softmax over expert logits, picks
-//! the top-K experts, and renormalizes the chosen K weights so they
-//! sum to 1.0. This is the canonical Mixtral / Qwen3-MoE recipe.
-//! DeepSeek-V3's "auxiliary-loss-free load balancing" variant differs
-//! in how the routing scores are computed but the post-selection
-//! weighted-sum shape is the same.
+//! `[n_experts, d_model]` and selects the top-K experts. The policy is
+//! carried by a [`RouterSpec`] (D4+M4), read from per-arch GGUF metadata:
+//! softmax gating + renormalized weights (the canonical Mixtral /
+//! Qwen3-MoE recipe, and the [`Default`]) OR sigmoid gating with
+//! group-limited top-K, a routed selection bias (`exp_probs_b`), and a
+//! `weights_scale` (DeepSeek-V3 / R1). qwen2moe additionally ships
+//! renormalization OFF. [`route_topk`] / [`route_topk_into`] use the
+//! default (softmax + renorm) policy; [`route_topk_into_spec`] is the
+//! policy-driven form the forward path calls.
 //!
 //! ## Per-expert FFN
 //!
@@ -46,19 +49,13 @@ use crate::llama_arch::LlamaMoeBlockWeights;
 // Cached hot-path env levers. These are consulted 40+ times per
 // decoded token (once per MoE layer); the previous per-call
 // `std::env::var` reads took the process-wide env lock each time.
-// All are "set before the first forward" A/B levers — notably
-// `RUSTLLAMA_NO_NORM_TOPK_PROB`, which is the production-required
-// configuration for the qwen35moe APEX variants (see the empirical
-// note in `route_topk_into`).
+// All are "set before the first forward" A/B debug levers. (The former
+// `RUSTLLAMA_NO_NORM_TOPK_PROB` override is GONE — top-k renormalization
+// is now driven by per-arch routing metadata via [`RouterSpec`], D4+M4.)
 
 fn debug_router_enabled() -> bool {
     static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *C.get_or_init(|| std::env::var("RUSTLLAMA_DEBUG_ROUTER").is_ok())
-}
-
-fn no_norm_topk_prob() -> bool {
-    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *C.get_or_init(|| std::env::var("RUSTLLAMA_NO_NORM_TOPK_PROB").is_ok())
 }
 
 fn debug_moe_split_enabled() -> bool {
@@ -85,6 +82,73 @@ fn no_shared_expert() -> bool {
 #[inline]
 pub(crate) fn shared_expert_width(w_gate: &Tensor, d_model: usize) -> usize {
     (w_gate.element_count() / (d_model as u64).max(1)).max(1) as usize
+}
+
+/// How the router turns expert logits into routing scores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatingFunc {
+    /// Mixtral / Qwen-MoE: softmax over all experts, then top-K.
+    Softmax,
+    /// DeepSeek-V3 / R1: independent sigmoid per expert (no cross-expert
+    /// normalization); selection + weighting use the sigmoid value.
+    Sigmoid,
+}
+
+/// Per-arch MoE routing policy, read from `{arch}.expert_*` GGUF metadata
+/// (D4+M4). [`Default`] is the Mixtral / Qwen3-MoE recipe (softmax →
+/// top-K → renormalize, no groups, scale 1.0), which is byte-identical to
+/// the pre-D4 hardcoded path — so the common case is unchanged.
+#[derive(Debug, Clone)]
+pub struct RouterSpec {
+    pub gating: GatingFunc,
+    /// Renormalize the selected top-K weights to sum to 1.0. qwen2moe
+    /// ships this `false`; Mixtral / Qwen3-MoE / DeepSeek-V3 `true`.
+    pub norm_topk: bool,
+    /// Final multiplier on the routed weights (`routed_scaling_factor` /
+    /// `expert_weights_scale`; DeepSeek-V3 uses 2.5). 1.0 elsewhere.
+    pub weights_scale: f32,
+    /// Group-limited top-K (DeepSeek-V3): number of expert groups. 0/1
+    /// disables grouping (the experts form a single group).
+    pub n_group: usize,
+    /// Number of groups kept before the within-group top-K. 0 disables
+    /// grouping.
+    pub topk_group: usize,
+}
+
+impl Default for RouterSpec {
+    fn default() -> Self {
+        Self {
+            gating: GatingFunc::Softmax,
+            norm_topk: true,
+            weights_scale: 1.0,
+            n_group: 0,
+            topk_group: 0,
+        }
+    }
+}
+
+impl From<&crate::llama_config::MoeConfig> for RouterSpec {
+    fn from(m: &crate::llama_config::MoeConfig) -> Self {
+        Self {
+            gating: if m.gating_sigmoid {
+                GatingFunc::Sigmoid
+            } else {
+                GatingFunc::Softmax
+            },
+            norm_topk: m.norm_topk,
+            weights_scale: m.weights_scale,
+            n_group: m.n_group as usize,
+            topk_group: m.topk_group as usize,
+        }
+    }
+}
+
+/// Build the active [`RouterSpec`] from a model config — the config's
+/// [`MoeConfig`](crate::llama_config::MoeConfig) when present, else the
+/// default (softmax + renorm) policy. Used by the hybrid MoE forward
+/// paths, which route loose tensors rather than a `LlamaMoeBlockWeights`.
+pub fn router_spec_for(cfg: &crate::llama_config::LlamaConfig) -> RouterSpec {
+    cfg.moe.as_ref().map(RouterSpec::from).unwrap_or_default()
 }
 
 /// Result of routing one token through the MoE router.
@@ -133,64 +197,157 @@ pub fn route_topk_into(
     expert_logits: &mut [f32],
     picks: &mut Vec<(usize, f32)>,
 ) {
+    // Default policy = softmax → top-K → renormalize (the Mixtral /
+    // Qwen3-MoE recipe). Byte-identical to the pre-D4 hardcoded path.
+    route_topk_into_spec(
+        hidden,
+        router,
+        n_experts,
+        top_k,
+        &RouterSpec::default(),
+        None,
+        expert_logits,
+        picks,
+    );
+}
+
+/// [`route_topk_into`] generalized by a [`RouterSpec`] (D4+M4): softmax OR
+/// sigmoid gating; an optional routed bias (`exp_probs_b`) that shifts
+/// SELECTION only, never the final weight; group-limited top-K; optional
+/// renormalization; and a final `weights_scale`. The default spec +
+/// `None` bias reproduces the softmax/renorm path bit-for-bit.
+///
+/// Weighting contract: the final weight of each selected expert is its
+/// own routing score (softmax prob or sigmoid value) — NOT the biased
+/// selection score — optionally renormalized over the top-K and scaled.
+#[allow(clippy::too_many_arguments)]
+pub fn route_topk_into_spec(
+    hidden: &[f32],
+    router: &Tensor,
+    n_experts: usize,
+    top_k: usize,
+    spec: &RouterSpec,
+    routed_bias: Option<&[f32]>,
+    expert_logits: &mut [f32],
+    picks: &mut Vec<(usize, f32)>,
+) {
     debug_assert!(top_k > 0, "top_k must be at least 1");
     debug_assert!(
         top_k <= n_experts,
         "top_k ({top_k}) cannot exceed n_experts ({n_experts})"
     );
     debug_assert_eq!(expert_logits.len(), n_experts);
-    let d_model = hidden.len();
-    // RUSTLLAMA_DEBUG_ROUTER: dump per-call router input stats so we
-    // can localize whether full-attn-layer MoE inputs are
-    // qualitatively different from SSM-layer ones (agent finding:
-    // the 32× MoE explosion on full-attn layers is the signature of
-    // a near-uniform router softmax — i.e. the router sees inputs
-    // it can't distinguish, suggesting upstream-of-router corruption
-    // in the full-attention block's output).
     let debug_router = debug_router_enabled();
+    let d_model = hidden.len();
 
-    // Step 1: router @ hidden → expert_logits.
+    // Step 1: router @ hidden → logits (stored in `expert_logits`).
     k::matvec_tensor(router, hidden, expert_logits, n_experts, d_model);
 
-    // Step 2: softmax over all experts. Subtract max for numerical
-    // stability (standard recipe).
-    let max = expert_logits
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
-    let mut exp_sum = 0f32;
-    for v in expert_logits.iter_mut() {
-        *v = (*v - max).exp();
-        exp_sum += *v;
-    }
-    if exp_sum > 0.0 {
-        let inv = 1.0 / exp_sum;
-        for v in expert_logits.iter_mut() {
-            *v *= inv;
+    // Step 2: gating → per-expert routing SCORE, written back in place.
+    match spec.gating {
+        GatingFunc::Softmax => {
+            // Softmax over all experts (subtract max for stability).
+            let max = expert_logits
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut exp_sum = 0f32;
+            for v in expert_logits.iter_mut() {
+                *v = (*v - max).exp();
+                exp_sum += *v;
+            }
+            if exp_sum > 0.0 {
+                let inv = 1.0 / exp_sum;
+                for v in expert_logits.iter_mut() {
+                    *v *= inv;
+                }
+            }
+        }
+        GatingFunc::Sigmoid => {
+            // DeepSeek-V3: independent sigmoid per expert, no cross-expert
+            // normalization. Selection + weighting use this value.
+            for v in expert_logits.iter_mut() {
+                *v = 1.0 / (1.0 + (-*v).exp());
+            }
         }
     }
 
-    // Step 3: top-K selection. Fill `picks` (clearing first) with
-    // (idx, weight) pairs, sort descending, truncate. The pre-
-    // allocated capacity means clear+push doesn't realloc.
-    picks.clear();
-    picks.extend(expert_logits.iter().copied().enumerate());
-    // Partial selection: O(n) select of the top-K boundary, then a
-    // sort of only the K winners — vs the previous full O(n log n)
-    // sort of all `n_experts` entries, 40+ times per decoded token
-    // on a 256-expert model. Same ordering contract (descending
-    // weight, index tiebreak — the total order makes the selected
-    // set deterministic); same pattern the sampler's top-k uses.
+    // Selection score = routing score (+ routed bias, when present). The
+    // bias (DeepSeek-V3 `exp_probs_b`) steers which experts win, not how
+    // much they weigh. With no bias this equals the score, so the picks +
+    // ordering below are byte-identical to the pre-D4 path.
+    let sel = |i: usize| -> f32 { expert_logits[i] + routed_bias.map(|b| b[i]).unwrap_or(0.0) };
+
     let cmp = |a: &(usize, f32), b: &(usize, f32)| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
     };
+
+    // Step 3 (DeepSeek-V3 only): group-limited top-K. Partition the
+    // experts into `n_group` contiguous groups, score each group by the
+    // sum of its top-2 selection scores, keep `topk_group` groups, and
+    // make experts outside them ineligible. Never engaged (no alloc) on
+    // the default path (`n_group <= 1`).
+    let use_groups = spec.n_group > 1
+        && spec.topk_group >= 1
+        && spec.topk_group < spec.n_group
+        && n_experts % spec.n_group == 0;
+    let eligible: Option<Vec<bool>> = if use_groups {
+        let per = n_experts / spec.n_group;
+        let mut group_scores: Vec<(usize, f32)> = (0..spec.n_group)
+            .map(|grp| {
+                let base = grp * per;
+                let (mut m1, mut m2) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+                for i in base..base + per {
+                    let s = sel(i);
+                    if s > m1 {
+                        m2 = m1;
+                        m1 = s;
+                    } else if s > m2 {
+                        m2 = s;
+                    }
+                }
+                (grp, if per >= 2 { m1 + m2 } else { m1 })
+            })
+            .collect();
+        group_scores.select_nth_unstable_by(spec.topk_group - 1, cmp);
+        let mut mask = vec![false; n_experts];
+        for &(grp, _) in &group_scores[..spec.topk_group] {
+            let base = grp * per;
+            for m in mask.iter_mut().skip(base).take(per) {
+                *m = true;
+            }
+        }
+        Some(mask)
+    } else {
+        None
+    };
+
+    // Step 4: top-K by selection score. `picks` carries (idx, sel) during
+    // ranking; the final weight is rewritten below. Preallocated capacity
+    // means clear+push doesn't realloc.
+    picks.clear();
+    for i in 0..n_experts {
+        if let Some(mask) = &eligible {
+            if !mask[i] {
+                continue;
+            }
+        }
+        picks.push((i, sel(i)));
+    }
     if top_k < picks.len() {
         picks.select_nth_unstable_by(top_k - 1, cmp);
         picks.truncate(top_k);
     }
     picks.sort_by(cmp);
+
+    // Step 5: the final weight of a selected expert is its routing SCORE
+    // (softmax/sigmoid value), not the biased selection score.
+    for (idx, w) in picks.iter_mut() {
+        *w = expert_logits[*idx];
+    }
+
     if debug_router {
         let top_max = picks.first().map(|p| p.1).unwrap_or(0.0);
         let top_sum: f32 = picks.iter().map(|(_, w)| *w).sum();
@@ -213,37 +370,23 @@ pub fn route_topk_into(
         );
     }
 
-    // Step 4: renormalize over the top-K so weights sum to 1.0.
-    // Mixtral / Qwen3-MoE / Qwen3-Next convention (the latter pins
-    // `norm_topk_prob=True` in both default config and the shipped
-    // 80B-A3B-Instruct config). Some MoE variants skip
-    // renormalization — the impact is a constant scaling factor
-    // baked into the down projection, so models trained with vs
-    // without renorm aren't drop-in compatible.
-    //
-    // Empirical note: on some qwen35moe variants, enabling
-    // renormalization causes the full-attention layers' MoE to
-    // amplify the residual ~30× per layer with a
-    // uniformly-negative bias — the residual stream explodes after
-    // L03 and the model produces gibberish. Disabling renorm
-    // produces a bounded mixed-sign residual stream and partial
-    // coherence (English words appearing in the output). Reason
-    // unclear: HF reference uses renorm; possible explanations
-    // include a quantization artifact in the router producing
-    // near-uniform top-K probabilities (where renorm's factor
-    // approaches `1/raw_sum` ~30×), or this fine-tuned variant
-    // being trained without renorm despite the upstream default.
-    // `RUSTLLAMA_NO_NORM_TOPK_PROB=1` skips renorm and is the
-    // working configuration for this model until the root cause
-    // is pinned.
-    let skip_renorm = no_norm_topk_prob();
-    if !skip_renorm {
+    // Step 6: renormalize the selected weights to sum to 1.0 (iff
+    // `norm_topk`; qwen2moe ships this false, Mixtral/Qwen3-MoE/DeepSeek-V3
+    // true — renorm vs no-renorm bakes a constant factor into the down
+    // projection, so the two aren't drop-in compatible), then apply the
+    // global `weights_scale` (DeepSeek-V3's `routed_scaling_factor`).
+    if spec.norm_topk {
         let topk_sum: f32 = picks.iter().map(|(_, w)| *w).sum();
         if topk_sum > 0.0 {
             let inv = 1.0 / topk_sum;
             for (_, w) in picks.iter_mut() {
                 *w *= inv;
             }
+        }
+    }
+    if spec.weights_scale != 1.0 {
+        for (_, w) in picks.iter_mut() {
+            *w *= spec.weights_scale;
         }
     }
 }
@@ -401,7 +544,19 @@ pub fn moe_ffn_one_into(
         *v = 0.0;
     }
 
-    route_topk_into(hidden, &block.router, n_experts, top_k, expert_logits, picks);
+    // D4+M4: route with the block's per-arch policy + routed bias
+    // (DeepSeek-V3 `exp_probs_b`). Default-spec blocks (Mixtral / Qwen3-MoE)
+    // reduce to the softmax→top-K→renorm path, byte-identical to before.
+    route_topk_into_spec(
+        hidden,
+        &block.router,
+        n_experts,
+        top_k,
+        &block.router_spec,
+        block.exp_probs_b.as_deref(),
+        expert_logits,
+        picks,
+    );
     // Hint the readahead thread before the first expert matvec: the
     // remaining picks (and the same indices on the next layers) start
     // faulting in from disk while pick 1 computes.
@@ -605,6 +760,7 @@ pub fn moe_ffn_one_into(
 pub fn moe_ffn_one_into_parts(
     hidden: &[f32],
     router: &Tensor,
+    spec: &RouterSpec,
     gate_per_expert: &[Tensor],
     up_per_expert: &[Tensor],
     down_per_expert: &[Tensor],
@@ -633,7 +789,10 @@ pub fn moe_ffn_one_into_parts(
     for v in out.iter_mut() {
         *v = 0.0;
     }
-    route_topk_into(hidden, router, n_experts, top_k, expert_logits, picks);
+    // D4+M4: hybrid MoE routing honours the arch's RouterSpec. Hybrid
+    // GGUFs carry no routed bias (`exp_probs_b` is DeepSeek-V3 only), so
+    // the bias is `None` here.
+    route_topk_into_spec(hidden, router, n_experts, top_k, spec, None, expert_logits, picks);
     // Readahead hint — see moe_ffn_one_into.
     crate::accel::note_routed_experts(picks);
 
@@ -812,6 +971,7 @@ pub fn moe_ffn_chunk_into_parts(
     hidden_rows: &[f32],
     n_tokens: usize,
     router: &Tensor,
+    spec: &RouterSpec,
     gate_per_expert: &[Tensor],
     up_per_expert: &[Tensor],
     down_per_expert: &[Tensor],
@@ -842,7 +1002,17 @@ pub fn moe_ffn_chunk_into_parts(
     let mut max_group = 0usize;
     for t in 0..n_tokens {
         let hidden = &hidden_rows[t * d_model..(t + 1) * d_model];
-        route_topk_into(hidden, router, n_experts, top_k, &mut expert_logits, &mut picks);
+        // D4+M4: per-arch routing policy; hybrid GGUFs carry no routed bias.
+        route_topk_into_spec(
+            hidden,
+            router,
+            n_experts,
+            top_k,
+            spec,
+            None,
+            &mut expert_logits,
+            &mut picks,
+        );
         for (e, w) in picks.iter() {
             assignments[*e].push((t, *w));
             max_group = max_group.max(assignments[*e].len());
@@ -1231,6 +1401,7 @@ mod tests {
             moe_ffn_one_into_parts(
                 &hidden_rows[t * d_model..(t + 1) * d_model],
                 &router,
+                &RouterSpec::default(),
                 &gates,
                 &ups,
                 &downs,
@@ -1259,6 +1430,7 @@ mod tests {
             &hidden_rows,
             n_tokens,
             &router,
+            &RouterSpec::default(),
             &gates,
             &ups,
             &downs,
@@ -1383,6 +1555,129 @@ mod tests {
         assert_eq!(routed.picks.len(), 3);
         let sum: f32 = routed.picks.iter().map(|(_, w)| *w).sum();
         assert!((sum - 1.0).abs() < 1e-4);
+    }
+
+    // ----- D4+M4: RouterSpec-driven routing -------------------------------
+
+    /// n×n identity router so `logits == hidden` exactly (1.0/0.0 are
+    /// exact in f16), letting tests feed logits directly as `hidden`.
+    fn identity_router(n: usize) -> Tensor {
+        let mut vals = vec![0.0f32; n * n];
+        for i in 0..n {
+            vals[i * n + i] = 1.0;
+        }
+        tensor_f16_from_rowmajor(&vals, n, n, "router_id")
+    }
+
+    fn run_spec(
+        logits: &[f32],
+        top_k: usize,
+        spec: &RouterSpec,
+        bias: Option<&[f32]>,
+    ) -> Vec<(usize, f32)> {
+        let n = logits.len();
+        let router = identity_router(n);
+        let mut el = vec![0.0f32; n];
+        let mut picks = Vec::with_capacity(top_k);
+        route_topk_into_spec(logits, &router, n, top_k, spec, bias, &mut el, &mut picks);
+        picks
+    }
+
+    #[test]
+    fn spec_default_is_byte_identical_to_route_topk() {
+        // The default RouterSpec must reproduce `route_topk_into` exactly.
+        let logits = vec![1.0, 3.0, 2.0, 0.0];
+        let router = identity_router(4);
+        let mut el_a = vec![0.0f32; 4];
+        let mut picks_a = Vec::new();
+        route_topk_into(&logits, &router, 4, 2, &mut el_a, &mut picks_a);
+        let picks_b = run_spec(&logits, 2, &RouterSpec::default(), None);
+        assert_eq!(picks_a, picks_b, "default spec == route_topk_into");
+    }
+
+    #[test]
+    fn spec_no_renorm_keeps_raw_softmax_weights() {
+        // qwen2moe: norm_topk=false → the top-K weights stay the raw
+        // softmax probabilities (they do NOT sum to 1).
+        let logits = vec![1.0, 3.0, 2.0, 0.0];
+        let spec = RouterSpec { norm_topk: false, ..Default::default() };
+        let picks = run_spec(&logits, 2, &spec, None);
+        // softmax([1,3,2,0]) ≈ [0.0871, 0.6439, 0.2369, 0.0321]; top-2 = 1,2.
+        assert_eq!(picks[0].0, 1);
+        assert_eq!(picks[1].0, 2);
+        assert!((picks[0].1 - 0.6439).abs() < 1e-3, "raw prob, got {}", picks[0].1);
+        assert!((picks[1].1 - 0.2369).abs() < 1e-3, "raw prob, got {}", picks[1].1);
+        let sum: f32 = picks.iter().map(|(_, w)| *w).sum();
+        assert!((sum - 0.8808).abs() < 1e-3, "no-renorm sum < 1, got {sum}");
+    }
+
+    #[test]
+    fn spec_sigmoid_gating_uses_sigmoid_scores() {
+        // DeepSeek-V3: sigmoid gating, per-expert, no cross-expert norm.
+        let logits = vec![1.0, 3.0, 2.0, 0.0];
+        let spec = RouterSpec {
+            gating: GatingFunc::Sigmoid,
+            norm_topk: false,
+            ..Default::default()
+        };
+        let picks = run_spec(&logits, 2, &spec, None);
+        // sigmoid ≈ [0.7311, 0.9526, 0.8808, 0.5]; top-2 = 1, 2.
+        assert_eq!(picks[0].0, 1);
+        assert_eq!(picks[1].0, 2);
+        assert!((picks[0].1 - 0.9526).abs() < 1e-3, "sigmoid weight, got {}", picks[0].1);
+        assert!((picks[1].1 - 0.8808).abs() < 1e-3, "sigmoid weight, got {}", picks[1].1);
+    }
+
+    #[test]
+    fn spec_weights_scale_multiplies_final_weights() {
+        // routed_scaling_factor: renormalized weights × 2.5 → sum 2.5.
+        let logits = vec![1.0, 3.0, 2.0, 0.0];
+        let spec = RouterSpec { weights_scale: 2.5, ..Default::default() };
+        let picks = run_spec(&logits, 2, &spec, None);
+        let sum: f32 = picks.iter().map(|(_, w)| *w).sum();
+        assert!((sum - 2.5).abs() < 1e-3, "sum == weights_scale, got {sum}");
+        // w0 = (0.6439/0.8808) * 2.5 ≈ 1.8276.
+        assert!((picks[0].1 - 1.8276).abs() < 2e-3, "scaled weight, got {}", picks[0].1);
+    }
+
+    #[test]
+    fn spec_routed_bias_shifts_selection_not_weight() {
+        // Bias picks a DIFFERENT expert than the raw scores would, but the
+        // stored weight is the UN-biased routing score.
+        let logits = vec![0.0, 1.0, 0.0, 0.0];
+        // Without bias, top-1 would be expert 1 (highest logit). The bias
+        // on expert 0 flips the selection to expert 0.
+        let bias = vec![10.0, 0.0, 0.0, 0.0];
+        let spec = RouterSpec { norm_topk: false, ..Default::default() };
+        let picks = run_spec(&logits, 1, &spec, Some(&bias));
+        // softmax([0,1,0,0]) ≈ [0.1749, 0.4753, 0.1749, 0.1749].
+        assert_eq!(picks[0].0, 0, "bias flips the selection to expert 0");
+        assert!(
+            (picks[0].1 - 0.1749).abs() < 1e-3,
+            "weight is expert 0's own score (not 10.17, not 0.4753), got {}",
+            picks[0].1
+        );
+    }
+
+    #[test]
+    fn spec_group_limited_topk_excludes_unselected_groups() {
+        // DeepSeek-V3 group routing: 2 groups {0,1},{2,3}, keep 1 group.
+        // Group score = sum of the group's top-2 selection scores.
+        let logits = vec![0.0, 2.0, 3.0, 1.0];
+        let spec = RouterSpec {
+            norm_topk: false,
+            n_group: 2,
+            topk_group: 1,
+            ..Default::default()
+        };
+        let picks = run_spec(&logits, 2, &spec, None);
+        // softmax ≈ [0.0321, 0.2369, 0.6439, 0.0871].
+        // group0 top-2 sum ≈ 0.2690; group1 top-2 sum ≈ 0.7310 → keep g1.
+        // top-2 within {2,3} → experts 2 then 3. Expert 1 (score 0.2369 >
+        // expert 3's 0.0871) is EXCLUDED because its group lost.
+        let idxs: Vec<usize> = picks.iter().map(|p| p.0).collect();
+        assert_eq!(idxs, vec![2, 3], "only the kept group's experts selected");
+        assert!(!idxs.contains(&1), "a higher-score expert in a dropped group is excluded");
     }
 
     // ----- expert_view ----------------------------------------------------
@@ -1564,6 +1859,8 @@ mod tests {
             k_norm: None,
             ffn_norm: vec![1.0; d_model],
             router: tensor_f16_from_rowmajor(&router_vals, n_experts, d_model, "router"),
+            router_spec: RouterSpec::default(),
+            exp_probs_b: None,
             w_gate_exps: make_exps(&gate_per_expert, d_ff, d_model, "gate_exps"),
             w_up_exps: make_exps(&up_per_expert, d_ff, d_model, "up_exps"),
             w_down_exps: make_exps(&down_per_expert, d_model, d_ff, "down_exps"),

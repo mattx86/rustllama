@@ -492,6 +492,12 @@ fn build_moe_model_from_safetensors(
             k_norm,
             ffn_norm,
             router,
+            // D4+M4: routing policy from the (HF-derived) MoE config. The
+            // safetensors/AWQ path carries no routed bias tensor today, so
+            // `exp_probs_b` stays None (wiring it from the checkpoint is a
+            // follow-up). Default spec = softmax + renorm, as before.
+            router_spec: rustllama_models::moe::router_spec_for(cfg),
+            exp_probs_b: None,
             w_gate_exps,
             w_up_exps,
             w_down_exps,
@@ -1019,6 +1025,7 @@ mod tests {
             n_experts: 8,
             n_experts_used: 2,
             n_experts_shared: 0,
+            ..Default::default()
         });
         let err = build_llama_model_from_safetensors(&cfg, Vec::new())
             .err()

@@ -868,6 +868,15 @@ pub struct LlamaMoeBlockWeights {
     /// one logit per expert which the forward pass softmax+top-K's
     /// to pick the routed experts.
     pub router: Tensor,
+    /// D4+M4: per-arch routing policy (gating function, top-K
+    /// renormalization, weight scale, group-limited routing). Derived
+    /// from `cfg.moe` at load. Default (Mixtral / Qwen3-MoE) reduces to
+    /// softmax → top-K → renormalize.
+    pub router_spec: crate::moe::RouterSpec,
+    /// DeepSeek-V3 routed-expert selection bias (`blk.N.exp_probs_b`).
+    /// Length `n_experts`; added to the routing scores for SELECTION only
+    /// (not the final weight). `None` on Mixtral / Qwen-MoE.
+    pub exp_probs_b: Option<Vec<f32>>,
     /// Gate projection across all experts.
     /// Shape `[n_experts, d_ff, d_model]`.
     pub w_gate_exps: Tensor,
@@ -1475,6 +1484,21 @@ impl LlamaWeights {
                     k_norm: load_optional_norm(gguf, &format!("{prefix}.attn_k_norm.weight")),
                     ffn_norm: load_norm(gguf, &format!("{prefix}.ffn_norm.weight"))?,
                     router: load_weight(gguf, &format!("{prefix}.ffn_gate_inp.weight"))?,
+                    // D4+M4: per-arch routing policy from the MoE metadata.
+                    router_spec: crate::moe::RouterSpec::from(moe_cfg),
+                    // DeepSeek-V3 routed-expert selection bias. Tensor name
+                    // varies across converters — accept the common spellings.
+                    // Only kept when it is a `[n_experts]` vector (so a
+                    // same-named tensor of another shape can't be mis-read
+                    // and then index out of range in the router).
+                    exp_probs_b: load_optional_norm(gguf, &format!("{prefix}.exp_probs_b.bias"))
+                        .or_else(|| {
+                            load_optional_norm(gguf, &format!("{prefix}.exp_probs_b.weight"))
+                        })
+                        .or_else(|| {
+                            load_optional_norm(gguf, &format!("{prefix}.ffn_gate_inp.bias"))
+                        })
+                        .filter(|v| v.len() == n_experts),
                     w_gate_exps,
                     w_up_exps,
                     w_down_exps,
@@ -2290,6 +2314,10 @@ fn load_weight(gguf: &Gguf, name: &str) -> Result<Tensor, LlamaLoadError> {
         // slab — no packed path ever runs. (FP8 with its per-tensor
         // metadata scale is handled by its own load path, not here.)
         GgmlType::Mxfp4 if !fits_in_l3 => Dtype::Mxfp4Raw,
+        // Upstream ggml MXFP4 (gpt-oss, id 39): request Mxfp4Raw so the
+        // load-time path repacks it to our layout (lossless) and the
+        // packed matvec runs on it exactly like a native-MXFP4 tensor.
+        GgmlType::Mxfp4Ggml if !fits_in_l3 => Dtype::Mxfp4Raw,
         GgmlType::Mxfp6 if !fits_in_l3 => Dtype::Mxfp6Raw,
         GgmlType::Mxfp8 if !fits_in_l3 => Dtype::Mxfp8Raw,
         other => {
@@ -5905,6 +5933,7 @@ impl LlamaModel {
                         } => crate::moe::moe_ffn_one_into_parts(
                             &tmp_d,
                             router,
+                            &crate::moe::router_spec_for(cfg),
                             gate_per_expert,
                             up_per_expert,
                             down_per_expert,
@@ -6399,6 +6428,7 @@ impl LlamaModel {
                         } => crate::moe::moe_ffn_one_into_parts(
                             &tmp_d,
                             router,
+                            &crate::moe::router_spec_for(cfg),
                             gate_per_expert,
                             up_per_expert,
                             down_per_expert,
@@ -7063,6 +7093,7 @@ impl LlamaModel {
                             &moe_in_rows,
                             n,
                             router,
+                            &crate::moe::router_spec_for(cfg),
                             gate_per_expert,
                             up_per_expert,
                             down_per_expert,
@@ -7530,6 +7561,7 @@ impl LlamaModel {
                             &moe_in_rows,
                             n,
                             router,
+                            &crate::moe::router_spec_for(cfg),
                             gate_per_expert,
                             up_per_expert,
                             down_per_expert,

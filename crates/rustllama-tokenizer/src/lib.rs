@@ -115,6 +115,11 @@ impl Tokenizer {
         let add_bos = read_bool_opt(gguf, "tokenizer.ggml.add_bos_token").unwrap_or(false);
         let add_eos = read_bool_opt(gguf, "tokenizer.ggml.add_eos_token").unwrap_or(false);
         let token_types = read_i32_array_opt(gguf, "tokenizer.ggml.token_type");
+        // M3: pre-tokenizer family (byte-level BPE) and SentencePiece
+        // dummy-prefix toggle. Both absent on most GGUFs → default paths.
+        let pre = read_string_opt(gguf, "tokenizer.ggml.pre");
+        let add_space_prefix =
+            read_bool_opt(gguf, "tokenizer.ggml.add_space_prefix").unwrap_or(true);
         // GGUF spec was ambiguous about the key for chat templates. Both
         // forms are in the wild — Qwen/DeepSeek use `tokenizer.chat_template`
         // (no ggml infix), older Llama-family conversions use
@@ -123,8 +128,19 @@ impl Tokenizer {
             .or_else(|| read_string_opt(gguf, "tokenizer.ggml.chat_template"));
 
         let inner = match model.as_str() {
-            "gpt2" => build_bpe_byte_level(&tokens, gguf, &token_types, bos, eos, pad, unk)?,
-            "llama" => build_unigram_spm(&tokens, gguf, &token_types, bos, eos, pad, unk)?,
+            "gpt2" => {
+                build_bpe_byte_level(&tokens, gguf, &token_types, bos, eos, pad, unk, pre.as_deref())?
+            }
+            "llama" => build_unigram_spm(
+                &tokens,
+                gguf,
+                &token_types,
+                bos,
+                eos,
+                pad,
+                unk,
+                add_space_prefix,
+            )?,
             "bert" => {
                 // BERT carries CLS/SEP/MASK rather than BOS/EOS. The
                 // GGUF spec stores them either under the dedicated keys
@@ -813,6 +829,7 @@ fn build_wordpiece_bert(
 /// Build a SentencePiece-style Unigram tokenizer from GGUF metadata.
 /// Covers `tokenizer.ggml.model = "llama"` — Llama-1/2, Mistral, TinyLlama,
 /// Phi-3, Yi. The actual scores are taken from `tokenizer.ggml.scores`.
+#[allow(clippy::too_many_arguments)]
 fn build_unigram_spm(
     tokens: &[String],
     gguf: &Gguf,
@@ -821,6 +838,7 @@ fn build_unigram_spm(
     eos: Option<u32>,
     pad: Option<u32>,
     unk: Option<u32>,
+    add_space_prefix: bool,
 ) -> Result<HfTokenizer> {
     let scores = read_f32_array_opt(gguf, "tokenizer.ggml.scores")
         .ok_or(TokenizerError::MissingMeta("tokenizer.ggml.scores"))?;
@@ -831,13 +849,23 @@ fn build_unigram_spm(
             tokens.len()
         )));
     }
-    build_unigram_spm_from_parts(tokens, &scores, token_types, bos, eos, pad, unk)
+    build_unigram_spm_from_parts(
+        tokens,
+        &scores,
+        token_types,
+        bos,
+        eos,
+        pad,
+        unk,
+        add_space_prefix,
+    )
 }
 
 /// Assemble the Unigram (SPM) tokenizer JSON from already-extracted
 /// vocab parts and hand it to `tokenizers`. Split out of
 /// [`build_unigram_spm`] so it can be unit-tested with a synthetic
 /// byte-token vocab without constructing a full GGUF fixture.
+#[allow(clippy::too_many_arguments)]
 fn build_unigram_spm_from_parts(
     tokens: &[String],
     scores: &[f32],
@@ -846,7 +874,15 @@ fn build_unigram_spm_from_parts(
     eos: Option<u32>,
     pad: Option<u32>,
     unk: Option<u32>,
+    add_space_prefix: bool,
 ) -> Result<HfTokenizer> {
+    // M3: `tokenizer.ggml.add_space_prefix` → Metaspace `prepend_scheme`.
+    // true (default, historical Llama behaviour) adds a single leading ▁
+    // to the input; false adds none. "first" / "never" are equivalent to
+    // the former "always" for this single-pre-tokenizer SPM path (the
+    // whole input is one segment, so "first" prepends exactly once), so
+    // the default stays byte-identical to pre-M3.
+    let prepend_scheme = if add_space_prefix { "first" } else { "never" };
     let vocab: Vec<Value> = tokens
         .iter()
         .zip(scores.iter())
@@ -908,7 +944,7 @@ fn build_unigram_spm_from_parts(
     let metaspace_decoder = json!({
         "type": "Metaspace",
         "replacement": "▁",
-        "prepend_scheme": "always",
+        "prepend_scheme": prepend_scheme,
     });
     let decoder = if has_byte_tokens {
         json!({
@@ -931,7 +967,7 @@ fn build_unigram_spm_from_parts(
         "pre_tokenizer": {
             "type": "Metaspace",
             "replacement": "▁",
-            "prepend_scheme": "always",
+            "prepend_scheme": prepend_scheme,
             "split": true,
         },
         "post_processor": null,
@@ -956,6 +992,83 @@ fn push_added(added: &mut Vec<Value>, id: u32, content: &str, special: bool) {
     }));
 }
 
+// Per-family byte-level BPE split regexes. These are DATA — the exact
+// `pre_tokenizer` Split pattern from each family's public `tokenizer.json`
+// (not llama.cpp code). They differ from the plain GPT-2 regex mainly in
+// how digits and leading whitespace are grouped (e.g. Qwen2 splits every
+// digit, Llama-3 groups 1-3, GPT-2 is unbounded), so reading
+// `tokenizer.ggml.pre` is what makes a Llama-3 / Qwen2 GGUF tokenize
+// bit-for-bit like its HF `tokenizer.json`.
+
+/// GPT-2 / original byte-level BPE. Identical to the regex HF's
+/// `ByteLevel{use_regex:true}` applies internally, so `gpt-2` models take
+/// the DEFAULT path below (byte-identical to pre-M3 behaviour).
+const RE_GPT2: &str =
+    r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
+/// Llama-3 (`llama-bpe`); `smaug-bpe` shares it. Case-insensitive
+/// contractions, letters allow one leading non-alnum, digits grouped 1-3.
+const RE_LLAMA3: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// Qwen2 — as Llama-3 but digits are split ONE at a time (`\p{N}`).
+const RE_QWEN2: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// Falcon — GPT-2 with a leading punctuation/symbol class.
+const RE_FALCON: &str = r"[\p{P}$+<=>^~|`]+|'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
+/// GPT-4o / o200k_base. Splits case runs and groups digits 1-3.
+const RE_GPT4O: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// Map a `tokenizer.ggml.pre` family key to its byte-level BPE split regex.
+/// `None` means "use the DEFAULT single-ByteLevel path" — returned for an
+/// absent key, for `gpt-2` (whose regex IS the ByteLevel default), and for
+/// any family we don't yet carry an exact regex for (so an unrecognized
+/// `pre` degrades to today's behaviour instead of a wrong split).
+fn bpe_family_regex(pre: Option<&str>) -> Option<&'static str> {
+    match pre? {
+        "llama3" | "llama-bpe" | "smaug-bpe" => Some(RE_LLAMA3),
+        "qwen2" => Some(RE_QWEN2),
+        "falcon" | "falcon3" => Some(RE_FALCON),
+        "gpt-4o" | "gpt4o" => Some(RE_GPT4O),
+        // gpt-2 (== ByteLevel default) + families without a verified exact
+        // regex (deepseek-*, command-r, tekken, jina-*, starcoder, …) fall
+        // to DEFAULT: byte-identical to pre-M3 for gpt-2, and never a
+        // mis-split for the rest (they get today's behaviour until their
+        // exact regex is added + HW-validated).
+        _ => None,
+    }
+}
+
+/// Build the byte-level BPE `pre_tokenizer` JSON for a `pre` family.
+/// Default (no family regex) = today's single `ByteLevel{use_regex:true}`
+/// so existing models are untouched. A known family gets
+/// `Sequence[Split{regex, Isolated}, ByteLevel{use_regex:false}]`: the
+/// Split does the family's regex chunking, then ByteLevel byte-maps each
+/// chunk without re-splitting.
+fn bpe_pretokenizer_json(pre: Option<&str>) -> Value {
+    match bpe_family_regex(pre) {
+        None => json!({
+            "type": "ByteLevel",
+            "add_prefix_space": false,
+            "trim_offsets": true,
+            "use_regex": true
+        }),
+        Some(regex) => json!({
+            "type": "Sequence",
+            "pretokenizers": [
+                {
+                    "type": "Split",
+                    "pattern": { "Regex": regex },
+                    "behavior": "Isolated",
+                    "invert": false
+                },
+                {
+                    "type": "ByteLevel",
+                    "add_prefix_space": false,
+                    "trim_offsets": true,
+                    "use_regex": false
+                }
+            ]
+        }),
+    }
+}
+
 fn build_bpe_byte_level(
     tokens: &[String],
     gguf: &Gguf,
@@ -964,6 +1077,7 @@ fn build_bpe_byte_level(
     eos: Option<u32>,
     pad: Option<u32>,
     unk: Option<u32>,
+    pre: Option<&str>,
 ) -> Result<HfTokenizer> {
     let merges_raw = read_string_array_opt(gguf, "tokenizer.ggml.merges").unwrap_or_default();
     let merges: Vec<Value> = merges_raw
@@ -1027,12 +1141,9 @@ fn build_bpe_byte_level(
         "padding": null,
         "added_tokens": added_tokens,
         "normalizer": null,
-        "pre_tokenizer": {
-            "type": "ByteLevel",
-            "add_prefix_space": false,
-            "trim_offsets": true,
-            "use_regex": true
-        },
+        // M3: per-family pre-tokenizer from `tokenizer.ggml.pre`. Default
+        // (absent / gpt-2 / unknown) is the historical single ByteLevel.
+        "pre_tokenizer": bpe_pretokenizer_json(pre),
         "post_processor": null,
         "decoder": {
             "type": "ByteLevel",
@@ -1140,6 +1251,156 @@ fn _unused_for_future_sp(_: &HashMap<String, f64>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- M3: pre-tokenizer families + SPM add_space_prefix ---------------
+
+    /// The pre-M3 default pre-tokenizer JSON (single ByteLevel, regex on).
+    fn default_bytelevel_json() -> Value {
+        json!({
+            "type": "ByteLevel",
+            "add_prefix_space": false,
+            "trim_offsets": true,
+            "use_regex": true
+        })
+    }
+
+    #[test]
+    fn bpe_default_pretokenizer_is_byte_identical_to_pre_m3() {
+        // Absent `pre` key, gpt-2, and any unrecognized family all produce
+        // the exact historical single-ByteLevel pre-tokenizer — so existing
+        // GGUF models tokenize byte-for-byte as before.
+        assert_eq!(bpe_pretokenizer_json(None), default_bytelevel_json());
+        assert_eq!(bpe_pretokenizer_json(Some("gpt-2")), default_bytelevel_json());
+        assert_eq!(bpe_pretokenizer_json(Some("gpt2")), default_bytelevel_json());
+        assert_eq!(
+            bpe_pretokenizer_json(Some("some-future-family")),
+            default_bytelevel_json()
+        );
+    }
+
+    #[test]
+    fn bpe_known_family_emits_split_then_bytelevel_sequence() {
+        let pt = bpe_pretokenizer_json(Some("llama3"));
+        assert_eq!(pt["type"], json!("Sequence"));
+        let seq = pt["pretokenizers"].as_array().unwrap();
+        assert_eq!(seq.len(), 2);
+        assert_eq!(seq[0]["type"], json!("Split"));
+        assert_eq!(seq[0]["behavior"], json!("Isolated"));
+        assert_eq!(seq[0]["pattern"]["Regex"], json!(RE_LLAMA3));
+        assert_eq!(seq[1]["type"], json!("ByteLevel"));
+        assert_eq!(seq[1]["use_regex"], json!(false));
+        // llama-bpe / smaug-bpe share the Llama-3 regex; qwen2 differs.
+        assert_eq!(
+            bpe_pretokenizer_json(Some("llama-bpe")),
+            bpe_pretokenizer_json(Some("llama3"))
+        );
+        assert_eq!(
+            bpe_pretokenizer_json(Some("smaug-bpe")),
+            bpe_pretokenizer_json(Some("llama3"))
+        );
+        assert_ne!(
+            bpe_pretokenizer_json(Some("qwen2")),
+            bpe_pretokenizer_json(Some("llama3"))
+        );
+    }
+
+    /// Tiny byte-level BPE over the digit "9" with merges 9→99→999→9999,
+    /// so the only thing that changes the output token ids is how the
+    /// family's pre-tokenizer regex GROUPS digits.
+    fn tiny_digit_bpe(pre: Option<&str>) -> HfTokenizer {
+        let mut vocab = serde_json::Map::new();
+        for (i, t) in ["9", "99", "999", "9999"].iter().enumerate() {
+            vocab.insert((*t).to_string(), json!(i));
+        }
+        let tj = json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": bpe_pretokenizer_json(pre),
+            "post_processor": null,
+            "decoder": {
+                "type": "ByteLevel",
+                "add_prefix_space": false,
+                "trim_offsets": true,
+                "use_regex": true
+            },
+            "model": {
+                "type": "BPE",
+                "dropout": null,
+                "unk_token": null,
+                "continuing_subword_prefix": null,
+                "end_of_word_suffix": null,
+                "fuse_unk": false,
+                "byte_fallback": false,
+                "ignore_merges": false,
+                "vocab": vocab,
+                "merges": [["9", "9"], ["99", "9"], ["999", "9"]],
+            }
+        });
+        HfTokenizer::from_bytes(&serde_json::to_vec(&tj).unwrap())
+            .expect("tiny digit BPE loads")
+    }
+
+    #[test]
+    fn pretokenizer_digit_grouping_matches_family() {
+        // Vocab ids: "9"=0, "99"=1, "999"=2, "9999"=3. Merges (by rank):
+        // 9+9→99, 99+9→999, 999+9→9999. Rank-based greedy BPE collapses a
+        // run of nines within ONE pre-token left-to-right by rank, so the
+        // family's digit GROUPING is what changes the ids.
+        //
+        // DEFAULT / gpt-2: GPT-2 `\p{N}+` → one pre-token "9999". Greedy BPE
+        // merges the two rank-0 9+9 pairs first → ["99","99"] = [1, 1].
+        assert_eq!(
+            tiny_digit_bpe(None).encode("9999", false).unwrap().get_ids(),
+            &[1, 1]
+        );
+        assert_eq!(
+            tiny_digit_bpe(Some("gpt-2")).encode("9999", false).unwrap().get_ids(),
+            &[1, 1]
+        );
+        // Llama-3 `\p{N}{1,3}` → "999" + "9" (greedy groups of ≤3) → [2, 0].
+        assert_eq!(
+            tiny_digit_bpe(Some("llama3")).encode("9999", false).unwrap().get_ids(),
+            &[2, 0]
+        );
+        // Qwen2 `\p{N}` → every digit split → four separate "9" tokens.
+        assert_eq!(
+            tiny_digit_bpe(Some("qwen2")).encode("9999", false).unwrap().get_ids(),
+            &[0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn spm_add_space_prefix_controls_leading_metaspace() {
+        // Vocab: <unk>(0), ▁(1), ▁hi(2), hi(3). Scores make the whole-word
+        // piece win in each case.
+        let tokens: Vec<String> = vec![
+            "<unk>".into(),
+            "\u{2581}".into(),
+            "\u{2581}hi".into(),
+            "hi".into(),
+        ];
+        let types: Vec<i32> = vec![2, 1, 1, 1];
+        let scores: Vec<f32> = vec![0.0, -5.0, 0.0, 0.0];
+
+        // add_space_prefix = true (default): a leading ▁ is prepended, so
+        // "hi" encodes as the "▁hi" piece (id 2).
+        let tok_true = build_unigram_spm_from_parts(
+            &tokens, &scores, &Some(types.clone()), None, None, None, Some(0), true,
+        )
+        .unwrap();
+        assert_eq!(tok_true.encode("hi", false).unwrap().get_ids(), &[2]);
+
+        // add_space_prefix = false: no leading ▁, so "hi" encodes as the
+        // bare "hi" piece (id 3).
+        let tok_false = build_unigram_spm_from_parts(
+            &tokens, &scores, &Some(types), None, None, None, Some(0), false,
+        )
+        .unwrap();
+        assert_eq!(tok_false.encode("hi", false).unwrap().get_ids(), &[3]);
+    }
 
     #[test]
     fn chat_template_renders_chatml() {
@@ -1333,6 +1594,7 @@ mod tests {
             None,
             None,
             Some(unk_id),
+            true,
         )
         .expect("build unigram with byte fallback");
 
@@ -1365,6 +1627,7 @@ mod tests {
             None,
             None,
             Some(0),
+            true,
         )
         .expect("build unigram without byte fallback");
         let enc = tok.encode("hi", false).expect("encode");

@@ -701,6 +701,81 @@ pub fn dequant_mxfp4(bytes: &[u8], out: &mut [f32]) {
     }
 }
 
+/// Dequantize the UPSTREAM ggml MXFP4 layout (`GGML_TYPE_MXFP4 = 39`,
+/// the quant gpt-oss ships) directly to f32. Same OCP math as
+/// [`dequant_mxfp4`], but the upstream `block_mxfp4` is
+/// `{ e: u8, qs: [u8; 16] }` — scale byte FIRST, then 16 nibble bytes
+/// packed in ggml's split-half order: byte `j`'s LOW nibble decodes
+/// element `j`, its HIGH nibble decodes element `j + 16` (the same
+/// convention `dequant_q4_0` uses). The E8M0 scale byte and the E2M1
+/// nibble codes are OCP-standard and byte-identical to ours, so the only
+/// differences vs [`dequant_mxfp4`] are the scale position and the
+/// nibble→element mapping. `out.len()` must equal `bytes.len() / 17 * 32`.
+pub fn dequant_mxfp4_ggml(bytes: &[u8], out: &mut [f32]) {
+    const BLOCK_BYTES: usize = 17;
+    const ELEMS: usize = 32;
+    let n_blocks = bytes.len() / BLOCK_BYTES;
+    debug_assert_eq!(bytes.len(), n_blocks * BLOCK_BYTES);
+    debug_assert_eq!(out.len(), n_blocks * ELEMS);
+    for b in 0..n_blocks {
+        let off = b * BLOCK_BYTES;
+        // Upstream: scale byte at the HEAD of the block.
+        let scale = e8m0_to_f32(bytes[off]);
+        let qs = &bytes[off + 1..off + 1 + 16];
+        let dst = b * ELEMS;
+        for j in 0..16 {
+            let byte = qs[j];
+            let lo = (byte & 0x0F) as usize;
+            let hi = ((byte >> 4) & 0x0F) as usize;
+            // ggml split-half packing: low nibble → elem j, high → elem j+16.
+            out[dst + j] = E2M1_CODEBOOK[lo] * scale;
+            out[dst + j + 16] = E2M1_CODEBOOK[hi] * scale;
+        }
+    }
+}
+
+/// Repack the upstream ggml MXFP4 layout (`GGML_TYPE_MXFP4 = 39`) into
+/// our [`crate::GgmlType::Mxfp4`] layout — a LOSSLESS byte permutation
+/// (no dequant/requant round-trip). Used at load time so the whole
+/// downstream compute stack (which already handles our Mxfp4Raw) runs
+/// unchanged on a gpt-oss GGUF.
+///
+/// Per 17-byte block: upstream is `{ e, qs[16] }` (scale first, nibbles
+/// in split-half order); ours is `{ qs[16], scale }` (scale last, nibbles
+/// paired adjacently). For output element `k`:
+///   - upstream code = `qs_in[k] & 0x0F` for `k < 16`, else `qs_in[k-16] >> 4`
+///   - our slot = low nibble of `qs_out[k/2]` for even `k`, else high nibble
+/// so we recover each element's 4-bit code from the upstream position and
+/// re-deposit it at our position. The scale byte copies across verbatim
+/// (both are OCP-standard E8M0).
+pub fn repack_mxfp4_ggml_to_ours(bytes: &[u8]) -> Vec<u8> {
+    const BLOCK_BYTES: usize = 17;
+    let n_blocks = bytes.len() / BLOCK_BYTES;
+    debug_assert_eq!(bytes.len(), n_blocks * BLOCK_BYTES);
+    let mut out = vec![0u8; n_blocks * BLOCK_BYTES];
+    for b in 0..n_blocks {
+        let off = b * BLOCK_BYTES;
+        let scale = bytes[off];
+        let qs_in = &bytes[off + 1..off + 1 + 16];
+        // Decode the 32 element codes from the upstream split-half layout.
+        let mut codes = [0u8; 32];
+        for j in 0..16 {
+            codes[j] = qs_in[j] & 0x0F;
+            codes[j + 16] = (qs_in[j] >> 4) & 0x0F;
+        }
+        // Re-pack adjacently (our layout): qs_out[m] = elem(2m) | elem(2m+1)<<4.
+        let dst = off; // our qs occupies the block's first 16 bytes
+        for m in 0..16 {
+            let lo = codes[2 * m] & 0x0F;
+            let hi = codes[2 * m + 1] & 0x0F;
+            out[dst + m] = lo | (hi << 4);
+        }
+        // Scale byte at the TAIL (our layout).
+        out[off + 16] = scale;
+    }
+    out
+}
+
 /// MXFP6 (OCP Microscaling, E3M2): 25 bytes per 32-weight block —
 /// `{ qs: [u8; 24], scale: u8 }`. `qs` is a little-endian bitstream of
 /// 32 × 6-bit E3M2 codes (element `j` at bit offset `6*j`); the trailing
@@ -2145,6 +2220,79 @@ pub fn dequant_iq4_xs(bytes: &[u8], out: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- M2: upstream ggml MXFP4 (id 39, gpt-oss) ------------------------
+
+    /// Build one upstream `block_mxfp4` (`{ e, qs[16] }`) from an E8M0
+    /// scale byte and 16 nibble bytes.
+    fn make_mxfp4_ggml_block(e: u8, qs: [u8; 16]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(17);
+        b.push(e);
+        b.extend_from_slice(&qs);
+        b
+    }
+
+    #[test]
+    fn mxfp4_ggml_dequant_matches_hand_computed_block() {
+        // Scale byte 128 → 2^(128-127) = 2.0. Nibbles chosen so every
+        // codebook index is hit in both the low and the high nibble:
+        // qs[j] low = j, high = 15 - j.
+        let scale = 2.0f32;
+        let mut qs = [0u8; 16];
+        for j in 0..16usize {
+            qs[j] = (j as u8) | (((15 - j) as u8) << 4);
+        }
+        let block = make_mxfp4_ggml_block(128, qs);
+
+        // Expected per ggml split-half layout: elem j = low nibble of
+        // byte j (→ codebook[j]); elem j+16 = high nibble of byte j
+        // (→ codebook[15-j]); all × scale.
+        let mut expected = [0f32; 32];
+        for j in 0..16usize {
+            expected[j] = E2M1_CODEBOOK[j] * scale;
+            expected[j + 16] = E2M1_CODEBOOK[15 - j] * scale;
+        }
+
+        let mut got = [0f32; 32];
+        dequant_mxfp4_ggml(&block, &mut got);
+        assert_eq!(got, expected, "ggml-layout dequant");
+    }
+
+    #[test]
+    fn mxfp4_ggml_repack_roundtrips_through_our_dequant() {
+        // Two blocks with different scales to catch block-stride bugs.
+        // e=127 → 1.0, e=129 → 4.0.
+        let mut src = Vec::new();
+        let mut per_block_scale = [1.0f32, 4.0f32];
+        let es = [127u8, 129u8];
+        for (bi, &e) in es.iter().enumerate() {
+            let mut qs = [0u8; 16];
+            for j in 0..16usize {
+                // Vary the packing per block so the two blocks differ.
+                qs[j] = ((j as u8 + bi as u8) & 0x0F) | ((((15 - j) as u8).wrapping_sub(bi as u8) & 0x0F) << 4);
+            }
+            src.extend_from_slice(&make_mxfp4_ggml_block(e, qs));
+            per_block_scale[bi] = e8m0_to_f32(e);
+        }
+
+        // Reference: decode the upstream bytes directly.
+        let mut via_ggml = [0f32; 64];
+        dequant_mxfp4_ggml(&src, &mut via_ggml);
+
+        // Repack to OUR layout, then decode with OUR decoder. Must be
+        // bit-identical (lossless byte permutation, no requant).
+        let repacked = repack_mxfp4_ggml_to_ours(&src);
+        assert_eq!(repacked.len(), src.len(), "17 bytes/block preserved");
+        let mut via_ours = [0f32; 64];
+        dequant_mxfp4(&repacked, &mut via_ours);
+        assert_eq!(via_ggml, via_ours, "repack+our-dequant == ggml-dequant");
+
+        // The scale byte must land at OUR tail position (index 16) in
+        // each repacked block, and decode to the same E8M0 value.
+        assert_eq!(repacked[16], es[0]);
+        assert_eq!(repacked[17 + 16], es[1]);
+        let _ = per_block_scale; // (documents intent; values checked above)
+    }
 
     /// Construct one Q4_K super-block from explicit (sc, mn) pairs.
     /// Returns the 144 bytes plus the decoded sc/mn arrays so tests can

@@ -13,7 +13,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 
-use rustllama_models::moe::{expert_view, moe_ffn_one_into_parts};
+use rustllama_models::moe::{expert_view, moe_ffn_one_into_parts, RouterSpec};
 use rustllama_tensor::Tensor;
 
 fn fixture_path() -> PathBuf {
@@ -136,7 +136,7 @@ fn moe_ffn_one_into_parts_matches_python_reference() {
     // 1. With router-gated shared expert (qwen35moe convention).
     let mut out_gated = vec![0f32; d_model];
     moe_ffn_one_into_parts(
-        &hidden, &router,
+        &hidden, &router, &RouterSpec::default(),
         &gate_per_expert, &up_per_expert, &down_per_expert,
         Some(&w_gate_shared), Some(&w_up_shared), Some(&w_down_shared),
         Some(&shared_router_tensor),
@@ -149,7 +149,7 @@ fn moe_ffn_one_into_parts_matches_python_reference() {
     // 2. With always-on shared expert (DeepSeek-V3 convention).
     let mut out_always_on = vec![0f32; d_model];
     moe_ffn_one_into_parts(
-        &hidden, &router,
+        &hidden, &router, &RouterSpec::default(),
         &gate_per_expert, &up_per_expert, &down_per_expert,
         Some(&w_gate_shared), Some(&w_up_shared), Some(&w_down_shared),
         None, // shared_router absent → always-on

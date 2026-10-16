@@ -275,6 +275,43 @@ pub struct MoeConfig {
     /// have 0. Sourced from `{arch}.expert_shared_count` (defaults
     /// to 0 when the key is absent).
     pub n_experts_shared: u32,
+    // ---- D4+M4: routing policy (per-arch gating metadata) ----
+    /// Router gating function. `false` = softmax (Mixtral / Qwen-MoE),
+    /// `true` = sigmoid (DeepSeek-V3 / R1). From `{arch}.expert_gating_func`
+    /// (ggml enum: 1 = softmax, 2 = sigmoid); defaults to softmax.
+    pub gating_sigmoid: bool,
+    /// Renormalize the selected top-K weights to sum to 1.0. From
+    /// `{arch}.expert_weights_norm`; default per arch — qwen2moe = false,
+    /// everything else = true (the Mixtral / Qwen3-MoE / DeepSeek-V3 norm).
+    pub norm_topk: bool,
+    /// Final scale on the routed weights (`{arch}.expert_weights_scale`;
+    /// DeepSeek-V3's `routed_scaling_factor` = 2.5). Defaults to 1.0.
+    pub weights_scale: f32,
+    /// Expert group count for DeepSeek-V3 group-limited routing
+    /// (`{arch}.expert_group_count`). 0 = no grouping.
+    pub n_group: u32,
+    /// Groups kept before the within-group top-K
+    /// (`{arch}.expert_group_used_count`). 0 = no grouping.
+    pub topk_group: u32,
+}
+
+impl Default for MoeConfig {
+    /// Mixtral / Qwen3-MoE routing: softmax + renormalize, no groups,
+    /// scale 1.0. Non-GGUF construction sites (safetensors / Ollama) use
+    /// `..Default::default()` for the routing fields, which preserves the
+    /// pre-D4 behaviour (softmax → top-K → renorm).
+    fn default() -> Self {
+        Self {
+            n_experts: 0,
+            n_experts_used: 0,
+            n_experts_shared: 0,
+            gating_sigmoid: false,
+            norm_topk: true,
+            weights_scale: 1.0,
+            n_group: 0,
+            topk_group: 0,
+        }
+    }
 }
 
 /// Derive the routed-expert FFN width from the combined `blk.0.ffn_gate_exps`
@@ -412,11 +449,30 @@ impl LlamaConfig {
                         arch, n_experts_used, n
                     )));
                 }
+                // D4+M4: per-arch routing policy. ggml stores
+                // `expert_gating_func` as an enum (1 = softmax, 2 = sigmoid).
+                // `expert_weights_norm` defaults per arch — qwen2moe omits it
+                // and means false; every other MoE arch means true.
+                let gating_sigmoid =
+                    u32_optional(gguf, &key("expert_gating_func")).unwrap_or(1) == 2;
+                let norm_topk_default = arch != "qwen2moe";
+                let norm_topk = bool_optional(gguf, &key("expert_weights_norm"))
+                    .unwrap_or(norm_topk_default);
+                let weights_scale =
+                    f32_optional(gguf, &key("expert_weights_scale")).unwrap_or(1.0);
+                let n_group = u32_optional(gguf, &key("expert_group_count")).unwrap_or(0);
+                let topk_group =
+                    u32_optional(gguf, &key("expert_group_used_count")).unwrap_or(0);
                 Some(MoeConfig {
                     n_experts: n,
                     n_experts_used,
                     n_experts_shared: u32_optional(gguf, &key("expert_shared_count"))
                         .unwrap_or(0),
+                    gating_sigmoid,
+                    norm_topk,
+                    weights_scale,
+                    n_group,
+                    topk_group,
                 })
             }
             _ => None,

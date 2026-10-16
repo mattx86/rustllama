@@ -1475,6 +1475,15 @@ fn load_tensor_bytes(
             dequant::dequant_mxfp4(src, &mut out);
             out
         }
+        GgmlType::Mxfp4Ggml => {
+            // Upstream ggml MXFP4 (gpt-oss). This dequant-to-f32 path is
+            // only hit when a (tiny) id-39 tensor is force-converted to
+            // F16/F32 at load; big tensors stay quantized and take the
+            // lossless byte-repack into Mxfp4Raw in Stage 2 below.
+            let mut out = vec![0f32; n_elements];
+            dequant::dequant_mxfp4_ggml(src, &mut out);
+            out
+        }
         GgmlType::Mxfp6 => {
             let mut out = vec![0f32; n_elements];
             dequant::dequant_mxfp6(src, &mut out);
@@ -1738,13 +1747,16 @@ fn load_tensor_bytes(
             src.to_vec()
         }
         Dtype::Mxfp4Raw => {
-            assert_eq!(
-                info.dtype,
-                GgmlType::Mxfp4,
-                "Dtype::Mxfp4Raw requires source dtype Mxfp4, got {:?}",
-                info.dtype
-            );
-            src.to_vec()
+            // Our native MXFP4 (id 1025) passes through; upstream ggml
+            // MXFP4 (id 39, gpt-oss) is LOSSLESSLY repacked into our layout
+            // so the whole downstream Mxfp4Raw compute stack runs unchanged.
+            match info.dtype {
+                GgmlType::Mxfp4 => src.to_vec(),
+                GgmlType::Mxfp4Ggml => dequant::repack_mxfp4_ggml_to_ours(src),
+                other => panic!(
+                    "Dtype::Mxfp4Raw requires source dtype Mxfp4 or Mxfp4Ggml, got {other:?}"
+                ),
+            }
         }
         Dtype::Mxfp6Raw => {
             assert_eq!(

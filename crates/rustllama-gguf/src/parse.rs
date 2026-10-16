@@ -158,6 +158,24 @@ pub enum GgmlType {
     /// `vpslld` by 16) so the original bit pattern is preserved through
     /// the entire compute path — no lossy BF16 → F16 round-trip.
     Bf16 = 30,
+    /// Upstream ggml MXFP4 (`GGML_TYPE_MXFP4 = 39`), the quant gpt-oss
+    /// (OpenAI) ships its MoE weights in. Same OCP Microscaling FP4 math
+    /// as our [`Self::Mxfp4`] (32 elems/block, one E8M0 scale byte + 16
+    /// bytes of packed E2M1 nibbles = 17 bytes/block), but a DIFFERENT
+    /// byte layout: upstream puts the scale FIRST (`{ e: u8, qs: [u8;16] }`)
+    /// and packs nibbles in the ggml split-half order (byte `j`'s low
+    /// nibble → element `j`, high nibble → element `j + 16` — same
+    /// convention as `block_q4_0`), whereas ours puts the scale LAST and
+    /// pairs nibbles adjacently (byte `j` → elements `2j`, `2j+1`). So
+    /// id 39 is NOT a drop-in alias for 1025: the loader repacks it to our
+    /// [`Dtype::Mxfp4Raw`] layout at load time (see
+    /// `rustllama_tensor::load_tensor_bytes` + `dequant::repack_mxfp4_ggml_to_ours`).
+    /// The E8M0 scale byte and the E2M1 nibble codes are OCP-standard and
+    /// identical between the two (ggml's internal ×2-codebook / half-scale
+    /// trick is value-preserving and doesn't change the stored bytes), so
+    /// the repack is a lossless byte permutation. We never PRODUCE id 39 —
+    /// our quantizer only emits 1025.
+    Mxfp4Ggml = 39,
     /// PQ2_0 (PrismML Bonsai): ternary weights in 2-bit slots at group
     /// 128. Block = `{ d: f16, qs: [u8; 32] }` = 34 bytes per 128
     /// weights (2.125 bpw). Codes unpack little-endian 2-bit
@@ -233,6 +251,9 @@ impl GgmlType {
             23 => Self::IQ4_XS,
             29 => Self::IQ1_M,
             30 => Self::Bf16,
+            // Upstream ggml MXFP4 (gpt-oss). Repacked to our Mxfp4Raw
+            // layout at load time — see the variant doc above.
+            39 => Self::Mxfp4Ggml,
             34 => Self::TQ1_0,
             35 => Self::TQ2_0,
             142 => Self::PQ2_0,
@@ -281,6 +302,9 @@ impl GgmlType {
             Self::PQ2_0 => "PQ2_0",
             Self::PTQ1_0 => "PTQ1_0",
             Self::Nvfp4 => "NVFP4",
+            // Displays as MXFP4 — it IS MXFP4, just the upstream ggml
+            // byte layout (gpt-oss); repacked to our Mxfp4 on load.
+            Self::Mxfp4Ggml => "MXFP4",
             Self::Mxfp4 => "MXFP4",
             Self::Mxfp6 => "MXFP6",
             Self::Mxfp8 => "MXFP8",
@@ -323,6 +347,7 @@ impl GgmlType {
                 | Self::PQ2_0
                 | Self::PTQ1_0
                 | Self::Nvfp4
+                | Self::Mxfp4Ggml
                 | Self::Mxfp4
                 | Self::Mxfp6
                 | Self::Mxfp8
@@ -363,6 +388,8 @@ impl GgmlType {
             Self::PTQ1_0 => blocks(n_elements, 128) * 28,
             Self::Nvfp4 => blocks(n_elements, 16) * 9,
             // OCP Microscaling: 32 elems/block + 1 E8M0 scale byte.
+            // Upstream ggml MXFP4 (gpt-oss) is the same 17 bytes/block.
+            Self::Mxfp4Ggml => blocks(n_elements, 32) * 17,
             Self::Mxfp4 => blocks(n_elements, 32) * 17,
             Self::Mxfp6 => blocks(n_elements, 32) * 25,
             Self::Mxfp8 => blocks(n_elements, 32) * 33,

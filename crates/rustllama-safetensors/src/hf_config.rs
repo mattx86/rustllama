@@ -219,6 +219,11 @@ pub fn parse_hf_config(json: &str) -> Result<LlamaConfig, HfConfigError> {
             } else {
                 0
             },
+            // Routing policy on the safetensors path keeps the pre-D4
+            // default (softmax + renorm). Reading HF config.json's
+            // `norm_topk_prob` / `scoring_func` here is a follow-up; the
+            // GGUF path (D4+M4) carries the per-arch metadata.
+            ..Default::default()
         })
     } else {
         None
