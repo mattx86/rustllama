@@ -83,6 +83,23 @@ pub struct CompletionRequest {
     /// to `n`; must be `>= n`. `best_of == n == 1` is the untouched single
     /// path. Not supported with `stream: true`.
     pub best_of: Option<u32>,
+    /// P12b — beam search (rustllama extension; OpenAI has no beam API).
+    /// `None` / `1` (default) is the ordinary sample-and-decode path. `> 1`
+    /// switches to DETERMINISTIC beam search with this many beams, returning
+    /// the top `n` (default 1) hypotheses ranked by length-penalty-adjusted
+    /// cumulative log-prob. Beam search ignores the stochastic sampler
+    /// (temperature/top-k/top-p) and the `best_of` sample-ranking path — it is
+    /// its own decode mode. Not supported with `stream: true`.
+    pub num_beams: Option<u32>,
+    /// P12b — length penalty (GNMT/HuggingFace exponent) applied when ranking
+    /// finished beams: `score = cum_logprob / len^length_penalty`. Default
+    /// `1.0`. `> 1` favors longer sequences, `< 1` favors shorter. Only
+    /// consulted when `num_beams > 1`.
+    pub length_penalty: Option<f32>,
+    /// P12b — stop beam search as soon as `num_beams` finished hypotheses
+    /// exist. Default `false` (keep expanding until the best finished beam is
+    /// provably unbeatable). Only consulted when `num_beams > 1`.
+    pub early_stopping: Option<bool>,
     /// CacheBlend (rustllama extension): retrieved RAG context chunks, each a
     /// document whose KV is precomputed in isolation and blended into the
     /// prompt. They are prepended to `prompt` as context; when CacheBlend is
@@ -157,6 +174,18 @@ pub async fn completions(
         return (
             StatusCode::BAD_REQUEST,
             "n > 1 / best_of > 1 is not supported with stream=true".to_string(),
+        )
+            .into_response();
+    }
+    // P12b — beam search. `num_beams > 1` is a distinct, deterministic decode
+    // mode that takes precedence over the n/best_of sample-ranking path. Like
+    // the other multi-output modes it can't be streamed (beams reorder as they
+    // expand), so reject stream up front with a clean 400.
+    let num_beams = req.num_beams.unwrap_or(1).max(1);
+    if num_beams > 1 && req.stream {
+        return (
+            StatusCode::BAD_REQUEST,
+            "beam search (num_beams > 1) is not supported with stream=true".to_string(),
         )
             .into_response();
     }
@@ -288,6 +317,65 @@ pub async fn completions(
     }
     // Non-streaming path: hold the permit for the duration of generation.
     let _permit = permit;
+
+    // P12b — beam search path. `num_beams > 1` runs the deterministic beam
+    // driver (its own decode mode — ignores the stochastic sampler and the
+    // n/best_of sample-ranking path) and returns the top `n` hypotheses ranked
+    // by length-penalty-adjusted cumulative log-prob. Each returned choice's
+    // index follows the ranking (0 = best beam).
+    if num_beams > 1 {
+        let beam_params = rustllama_engine::BeamParams {
+            num_beams: num_beams as usize,
+            length_penalty: req.length_penalty.unwrap_or(1.0),
+            early_stopping: req.early_stopping.unwrap_or(false),
+            num_return: n_choices as usize,
+        };
+        let prompt_ids_b = prompt_ids.clone();
+        let max_new = sampling.max_tokens;
+        let cpu_b = cpu.clone();
+        let gen = tokio::task::spawn_blocking(move || {
+            generate_beam_completions(&cpu_b, &prompt_ids_b, max_new, &beam_params)
+        })
+        .await;
+        let beams = match gen {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => return (StatusCode::BAD_REQUEST, e).into_response(),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        let total_completion_tokens: u32 = beams.iter().map(|b| b.completion_tokens).sum();
+        let prompt_for_echo = if req.echo {
+            req.prompt.clone()
+        } else {
+            String::new()
+        };
+        let choices: Vec<CompletionChoice> = beams
+            .iter()
+            .enumerate()
+            .map(|(idx, b)| CompletionChoice {
+                text: format!("{}{}", prompt_for_echo, b.text),
+                index: idx as u32,
+                logprobs: None,
+                finish_reason: if b.completion_tokens >= sampling.max_tokens {
+                    "length"
+                } else {
+                    "stop"
+                },
+            })
+            .collect();
+        let stats = cpu.last_request_stats();
+        let fingerprint =
+            crate::system_fingerprint(&state.version, &model, kv_dtype_label(&cpu));
+        return Json(CompletionResponse {
+            id: request_id(),
+            object: "text_completion",
+            created: unix_ts(),
+            model,
+            choices,
+            usage: Some(Usage::new(prompt_tokens, total_completion_tokens).with_stats(&stats)),
+            system_fingerprint: fingerprint,
+        })
+        .into_response();
+    }
 
     // P12a — multi-completion (`n` / `best_of`) path. Generates
     // `n_candidates` independent samples that share the prompt prefix (the
@@ -844,6 +932,40 @@ fn generate_ranked_candidates(
     Ok(out)
 }
 
+/// One returned beam-search hypothesis: its decoded text and token count.
+struct BeamCompletion {
+    text: String,
+    completion_tokens: u32,
+}
+
+/// Run deterministic beam search over `prompt_ids` and decode each returned
+/// hypothesis to text. Beams come back already ranked (best first) by the
+/// length-penalty-adjusted score. Maps the engine's "beam unsupported for this
+/// backend/model" error to a user-facing string the caller returns as a 400.
+fn generate_beam_completions(
+    cpu: &rustllama_engine::CpuEngine,
+    prompt_ids: &[u32],
+    max_new: u32,
+    params: &rustllama_engine::BeamParams,
+) -> Result<Vec<BeamCompletion>, String> {
+    let tokenizer = cpu
+        .tokenizer()
+        .ok_or_else(|| "beam search requires a tokenizer".to_string())?;
+    let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&v| v as i32).collect();
+    let beams = cpu
+        .generate_beam_token_ids(&prompt_i32, max_new, params)
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(beams.len());
+    for b in &beams {
+        let text = tokenizer.decode(&b.tokens, true).map_err(|e| e.to_string())?;
+        out.push(BeamCompletion {
+            text,
+            completion_tokens: b.tokens.len() as u32,
+        });
+    }
+    Ok(out)
+}
+
 fn unix_ts() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1324,6 +1446,34 @@ mod tests {
             serde_json::from_value(value).expect("CompletionRequest parses");
         assert_eq!(req.n, None, "absent n must be None (handler defaults to 1)");
         assert_eq!(req.best_of, None, "absent best_of must be None (defaults to n)");
+    }
+
+    #[test]
+    fn beam_params_parse_from_request() {
+        let value = serde_json::json!({
+            "prompt": "hi",
+            "max_tokens": 4,
+            "num_beams": 4,
+            "length_penalty": 0.8,
+            "early_stopping": true,
+            "n": 2,
+        });
+        let req: CompletionRequest =
+            serde_json::from_value(value).expect("CompletionRequest parses");
+        assert_eq!(req.num_beams, Some(4));
+        assert_eq!(req.length_penalty, Some(0.8));
+        assert_eq!(req.early_stopping, Some(true));
+        assert_eq!(req.n, Some(2));
+    }
+
+    #[test]
+    fn beam_params_absent_are_none() {
+        let value = serde_json::json!({ "prompt": "hi", "max_tokens": 4 });
+        let req: CompletionRequest =
+            serde_json::from_value(value).expect("CompletionRequest parses");
+        assert_eq!(req.num_beams, None, "absent num_beams must be None (defaults to 1)");
+        assert_eq!(req.length_penalty, None);
+        assert_eq!(req.early_stopping, None);
     }
 
     // ----- P10a: completions speculative-mode routing ---------------------

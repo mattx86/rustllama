@@ -116,6 +116,20 @@ pub struct ChatRequest {
     /// not define it for chat). Accepted here for request-struct parity; the
     /// handler rejects `best_of > n` with a pointed 400.
     pub best_of: Option<u32>,
+    /// P12b — beam search (rustllama extension). `None` / `1` (default) is the
+    /// ordinary sample-and-decode path. `> 1` switches to DETERMINISTIC beam
+    /// search with this many beams, returning the top `n` (default 1) choices
+    /// ranked by the length-penalty-adjusted cumulative log-prob. Beam search
+    /// is its own decode mode (ignores the stochastic sampler). Not supported
+    /// with `stream: true` or tools/functions.
+    pub num_beams: Option<u32>,
+    /// P12b — length penalty exponent for ranking finished beams
+    /// (`score = cum_logprob / len^length_penalty`). Default `1.0`. Only
+    /// consulted when `num_beams > 1`.
+    pub length_penalty: Option<f32>,
+    /// P12b — stop beam search once `num_beams` finished hypotheses exist.
+    /// Default `false`. Only consulted when `num_beams > 1`.
+    pub early_stopping: Option<bool>,
     /// OpenAI streaming knob. With `include_usage: true` we emit a final
     /// chunk containing the `usage` block before `[DONE]`.
     pub stream_options: Option<StreamOptions>,
@@ -561,6 +575,29 @@ pub async fn chat_completions(
             return (
                 StatusCode::BAD_REQUEST,
                 "n > 1 is not supported with tools/functions",
+            )
+                .into_response();
+        }
+    }
+
+    // P12b — beam search. `num_beams > 1` is a distinct, deterministic decode
+    // mode. Like `n > 1` it can't be streamed (beams reorder as they expand)
+    // and doesn't fan out tool-call parsing, so reject those up front with a
+    // clean 400. The non-streaming `chat_blocking` path runs the beam driver.
+    let num_beams = req.num_beams.unwrap_or(1).max(1);
+    if num_beams > 1 {
+        if req.stream {
+            return (
+                StatusCode::BAD_REQUEST,
+                "beam search (num_beams > 1) is not supported with stream=true",
+            )
+                .into_response();
+        }
+        let has_tools = req.tools.is_some() || req.functions.is_some();
+        if has_tools || req.allow_clarify == Some(true) {
+            return (
+                StatusCode::BAD_REQUEST,
+                "beam search (num_beams > 1) is not supported with tools/functions",
             )
                 .into_response();
         }
@@ -2548,6 +2585,85 @@ async fn chat_blocking(state: AppState, req: ChatRequest) -> Response {
     // per-request state.
     let cpu = handle.cpu_engine.clone();
 
+    // P12b — beam search. `num_beams > 1` runs the deterministic beam driver
+    // (its own decode mode, ignoring the stochastic sampler) and returns the
+    // top `n` hypotheses ranked by length-penalty-adjusted cumulative log-prob.
+    // Choice index follows the ranking (0 = best beam).
+    let num_beams = req.num_beams.unwrap_or(1).max(1);
+    if num_beams > 1 {
+        let Some(cpu_arc) = cpu.clone() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "beam search requires a real (non-mock) engine",
+            )
+                .into_response();
+        };
+        let beam_params = rustllama_engine::BeamParams {
+            num_beams: num_beams as usize,
+            length_penalty: req.length_penalty.unwrap_or(1.0),
+            early_stopping: req.early_stopping.unwrap_or(false),
+            num_return: req.n.unwrap_or(1).max(1) as usize,
+        };
+        let msgs_b = msgs.clone();
+        let max_new = sampling.max_tokens;
+        let cpu_b = cpu_arc.clone();
+        let gen = tokio::task::spawn_blocking(move || -> Result<Vec<(String, u32)>, String> {
+            let prompt_ids = cpu_b.chat_prompt_ids(&msgs_b).map_err(|e| e.to_string())?;
+            let beams = cpu_b
+                .generate_beam_token_ids(&prompt_ids, max_new, &beam_params)
+                .map_err(|e| e.to_string())?;
+            let tok = cpu_b
+                .tokenizer()
+                .ok_or_else(|| "beam search requires a tokenizer".to_string())?;
+            let mut out = Vec::with_capacity(beams.len());
+            for b in &beams {
+                let text = tok.decode(&b.tokens, true).map_err(|e| e.to_string())?;
+                out.push((text, b.tokens.len() as u32));
+            }
+            Ok(out)
+        })
+        .await;
+        let beams = match gen {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => return (StatusCode::BAD_REQUEST, e).into_response(),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        let total_completion_tokens: u32 = beams.iter().map(|(_, n)| *n).sum();
+        let choices: Vec<ChatChoice> = beams
+            .iter()
+            .enumerate()
+            .map(|(idx, (text, n))| ChatChoice {
+                index: idx as u32,
+                message: ChatMessageOut {
+                    role: "assistant",
+                    content: Some(text.clone()),
+                    tool_calls: None,
+                    diffs: None,
+                },
+                finish_reason: if *n >= sampling.max_tokens {
+                    "length"
+                } else {
+                    "stop"
+                },
+                logprobs: None,
+            })
+            .collect();
+        let usage = Usage::new(prompt_tokens, total_completion_tokens)
+            .with_stats(&cpu_arc.last_request_stats());
+        let fingerprint =
+            crate::system_fingerprint(&state.version, &model, kv_dtype_label(cpu_arc.as_ref()));
+        return Json(ChatResponse {
+            id: request_id(),
+            object: "chat.completion",
+            created: unix_ts(),
+            model,
+            choices,
+            usage: Some(usage),
+            system_fingerprint: fingerprint,
+        })
+        .into_response();
+    }
+
     // P12a: generate `n_choices` independent choices sharing the prompt
     // prefix. Choice i samples from `seed + i`, so choice 0 reproduces the
     // single-choice result byte-for-byte (n == 1 is unchanged) and the whole
@@ -3182,6 +3298,32 @@ mod tests {
         let req: ChatRequest = serde_json::from_value(value).expect("ChatRequest parses");
         assert_eq!(req.n, None);
         assert_eq!(req.best_of, None);
+    }
+
+    #[test]
+    fn beam_params_parse_from_chat_request() {
+        // P12b: num_beams / length_penalty / early_stopping parse off the chat
+        // request struct; absent → None (handler defaults num_beams to 1).
+        let value = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 4,
+            "num_beams": 3,
+            "length_penalty": 1.2,
+            "early_stopping": true,
+        });
+        let req: ChatRequest = serde_json::from_value(value).expect("ChatRequest parses");
+        assert_eq!(req.num_beams, Some(3));
+        assert_eq!(req.length_penalty, Some(1.2));
+        assert_eq!(req.early_stopping, Some(true));
+
+        let value = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 4,
+        });
+        let req: ChatRequest = serde_json::from_value(value).expect("ChatRequest parses");
+        assert_eq!(req.num_beams, None);
+        assert_eq!(req.length_penalty, None);
+        assert_eq!(req.early_stopping, None);
     }
 
     #[test]

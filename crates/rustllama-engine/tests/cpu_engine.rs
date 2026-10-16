@@ -6,7 +6,7 @@
 //!   - sane in-bounds token ids
 //! Phase 1 acceptance for the engine layer.
 
-use rustllama_engine::{CpuEngine, SamplingParams};
+use rustllama_engine::{BeamParams, CpuEngine, SamplingParams};
 use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
 
 fn build_engine(tag: &str) -> (CpuEngine, std::path::PathBuf) {
@@ -321,6 +321,131 @@ fn fork_for_concurrent_use_has_independent_state() {
         parent_snap_count_after,
         "fork generation must not bump parent's prefix-cache pool",
     );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// ---- P12b: beam search -------------------------------------------------
+
+/// Anchor: `num_beams == 1` is byte-identical to the greedy argmax decode.
+/// This proves the beam machinery (candidate build, selection, KV
+/// snapshot/restore fork, finalization) doesn't perturb the degenerate case.
+#[test]
+fn beam_one_equals_greedy_byte_identical() {
+    let (engine, tmp) = build_engine("beam-greedy");
+    let greedy_params = SamplingParams {
+        temperature: 0.0,
+        top_p: 0.0,
+        top_k: 0,
+        repeat_penalty: 1.0,
+        max_tokens: 6,
+        stop: vec![],
+        seed: 0,
+        ..SamplingParams::default()
+    };
+    let prompt = [3i32, 5, 7];
+    let greedy = engine
+        .generate_token_ids(&prompt, 6, &greedy_params)
+        .expect("greedy decode");
+
+    let bp = BeamParams {
+        num_beams: 1,
+        length_penalty: 1.0,
+        early_stopping: false,
+        num_return: 1,
+    };
+    let beams = engine
+        .generate_beam_token_ids(&prompt, 6, &bp)
+        .expect("beam decode");
+    assert_eq!(beams.len(), 1, "num_beams=1 returns exactly one hypothesis");
+    assert_eq!(
+        beams[0].tokens, greedy,
+        "num_beams=1 beam search must equal greedy decode token-for-token"
+    );
+
+    // Same under early_stopping=true (should not change the degenerate case).
+    let bp_es = BeamParams {
+        early_stopping: true,
+        ..bp
+    };
+    let beams_es = engine
+        .generate_beam_token_ids(&prompt, 6, &bp_es)
+        .expect("beam decode es");
+    assert_eq!(
+        beams_es[0].tokens, greedy,
+        "num_beams=1 with early_stopping must still equal greedy"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// Anchor: with `num_beams == 2` the returned beams are distinct sequences,
+/// ordered by the length-penalty-adjusted cumulative log-prob (best first).
+#[test]
+fn two_beams_distinct_and_ranked() {
+    let (engine, tmp) = build_engine("beam-two");
+    let prompt = [3i32, 5, 7];
+    let bp = BeamParams {
+        num_beams: 2,
+        length_penalty: 1.0,
+        early_stopping: false,
+        num_return: 2,
+    };
+    let beams = engine
+        .generate_beam_token_ids(&prompt, 5, &bp)
+        .expect("beam decode");
+    assert_eq!(beams.len(), 2, "num_return=2 returns two hypotheses");
+    assert_ne!(
+        beams[0].tokens, beams[1].tokens,
+        "beam search must return distinct sequences"
+    );
+    assert!(
+        beams[0].score >= beams[1].score,
+        "returned beams must be ordered by adjusted score (desc): {} vs {}",
+        beams[0].score,
+        beams[1].score
+    );
+
+    // Deterministic: same prompt → same beams.
+    let beams2 = engine
+        .generate_beam_token_ids(&prompt, 5, &bp)
+        .expect("beam decode 2");
+    assert_eq!(beams.len(), beams2.len());
+    for (a, b) in beams.iter().zip(beams2.iter()) {
+        assert_eq!(a.tokens, b.tokens, "beam search must be deterministic");
+    }
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// Beam search runs with larger `num_beams` without panicking and still
+/// returns distinct, correctly-ranked hypotheses (a 4-beam smoke test on the
+/// KV fork/restore machinery).
+#[test]
+fn four_beams_run_and_rank() {
+    let (engine, tmp) = build_engine("beam-four");
+    let prompt = [3i32, 5, 7];
+    let bp = BeamParams {
+        num_beams: 4,
+        length_penalty: 1.0,
+        early_stopping: false,
+        num_return: 3,
+    };
+    let beams = engine
+        .generate_beam_token_ids(&prompt, 6, &bp)
+        .expect("4-beam");
+    assert_eq!(beams.len(), 3, "num_return=3 returns three hypotheses");
+    // Distinct + ranked by adjusted score (descending).
+    for i in 1..beams.len() {
+        assert!(
+            beams[i - 1].score >= beams[i].score,
+            "beams must be ranked by adjusted score"
+        );
+        assert_ne!(
+            beams[i - 1].tokens, beams[i].tokens,
+            "returned beams must be distinct"
+        );
+    }
 
     let _ = std::fs::remove_file(&tmp);
 }

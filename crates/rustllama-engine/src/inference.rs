@@ -4498,6 +4498,28 @@ impl CpuEngine {
         Ok(ids.len() as u32)
     }
 
+    /// Render chat messages through the model's chat template and tokenize to
+    /// the exact prompt token ids `Engine::chat` would decode from — the same
+    /// path as [`Self::count_chat_prompt`], but returning the ids. Used by the
+    /// server's beam-search chat path, which needs token-level access the
+    /// text-streaming `Engine::chat` API doesn't expose.
+    pub fn chat_prompt_ids(&self, msgs: &[ChatMessage]) -> Result<Vec<i32>> {
+        let tokenizer = self
+            .tokenizer
+            .as_deref()
+            .ok_or(CpuEngineError::NoTokenizer("chat_prompt_ids"))?;
+        let tok_msgs: Vec<TokChat<'_>> = msgs
+            .iter()
+            .map(|m| TokChat {
+                role: &m.role,
+                content: &m.content,
+            })
+            .collect();
+        let prompt = tokenizer.render_chat(&tok_msgs, true)?;
+        let ids = tokenizer.encode(&prompt, tokenizer.add_bos_token())?;
+        Ok(ids.iter().map(|&t| t as i32).collect())
+    }
+
     /// Tokenize a free-text prompt with BOS (matches what `Engine::generate`
     /// does internally). Cheap helper for usage accounting in the
     /// `/v1/completions` non-FIM path.
@@ -4681,6 +4703,244 @@ impl CpuEngine {
         state.commit_snapshot(snapshot);
 
         Ok(out)
+    }
+
+    /// P12b — beam search. Maintains `num_beams` partial hypotheses, expands
+    /// each by its top candidates per step, keeps the global top `num_beams`
+    /// by cumulative log-prob, and returns the top `k` finished beams ranked by
+    /// the length-penalty-adjusted score.
+    ///
+    /// Beam search is **deterministic** (no sampling): the same prompt yields
+    /// the same beams. `num_beams == 1` is byte-identical to greedy
+    /// [`Self::generate_token_ids`] with a temperature-0 (argmax) sampler —
+    /// the server routes `num_beams == 1` through the normal path, but this
+    /// driver reproduces greedy so the parity anchor can prove the machinery
+    /// doesn't perturb the degenerate case.
+    ///
+    /// Per-beam KV is forked with the existing host-side
+    /// [`KvCache::snapshot_prefix`] / [`KvCache::restore_prefix`] (the same
+    /// primitive the prompt prefix cache uses): each beam carries a snapshot of
+    /// its K/V, which the driver restores before extending it. This works
+    /// regardless of USM backing. Beam search requires the **contiguous** KV
+    /// backend on a plain transformer — a hybrid DeltaNet recurrence, an MLA
+    /// latent cache, or a sliding-window ring layer aren't captured by the
+    /// snapshot, so those are refused with a clear error (the paged-engine beam
+    /// path is a noted follow-up).
+    pub fn generate_beam_token_ids(
+        &self,
+        prompt_ids: &[i32],
+        n_new: u32,
+        beam: &crate::beam::BeamParams,
+    ) -> Result<Vec<crate::beam::BeamHypothesis>> {
+        use crate::beam::{build_sorted_candidates, select_step, BeamPool};
+
+        let num_beams = beam.num_beams.max(1);
+        let _sycl_guard = install_sycl_dispatch_if_requested();
+        rustllama_models::accel::set_flash_attention(self.flash_attention);
+        rustllama_models::accel::set_n_gpu_layers(self.n_gpu_layers);
+        rustllama_models::accel::set_cpu_force_patterns(self.cpu_force_patterns.clone());
+        self.prepare_usm_for_sync_path();
+
+        if prompt_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let total_required = prompt_ids.len() + n_new as usize;
+        if total_required > self.max_ctx {
+            return Err(CpuEngineError::PromptTooLong {
+                prompt_len: prompt_ids.len(),
+                max_ctx: self.max_ctx,
+            });
+        }
+
+        let mut state = self.state.lock().expect("state lock");
+
+        // Beam search needs the contiguous KV backend (host-side
+        // snapshot/restore forks each beam's K/V) on a plain transformer.
+        {
+            let kv = match &state.kv_backend {
+                KvBackend::Contiguous(kv) => kv,
+                _ => {
+                    return Err(CpuEngineError::Other(
+                        "beam search requires the contiguous KV backend \
+                         (set [inference].kv_cache_layout = \"contiguous\")"
+                            .to_string(),
+                    ))
+                }
+            };
+            if self.model.weights.is_hybrid() || kv.mla.is_some() || kv.has_ring_layers() {
+                return Err(CpuEngineError::Other(
+                    "beam search is not supported for hybrid / MLA / sliding-window \
+                     models in this build"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // Fresh KV — beam search doesn't participate in the prefix cache.
+        state.reset();
+
+        let vocab = self.model.cfg.vocab_size;
+        let eos = self.model.cfg.eos_token_id;
+        let length_penalty = beam.length_penalty;
+        // Candidate breadth per beam: 2*num_beams guarantees num_beams non-EOS
+        // survivors (HuggingFace convention), capped at the vocab.
+        let cand_k = (2 * num_beams).min(vocab).max(1);
+
+        let prompt_u32: Vec<u32> = prompt_ids.iter().map(|&t| t as u32).collect();
+        let mut logits = vec![0f32; vocab];
+        let mut chrome = ChromeTracer::from_env();
+
+        // Prefill exactly like `generate_token_ids`: chunk-prefill
+        // prompt[..L-1], then one forward of the last prompt token to produce
+        // the first-token logits — identical code path, so num_beams=1 is
+        // byte-identical to greedy.
+        let (prefill, last) = prompt_ids.split_at(prompt_ids.len() - 1);
+        let _ = run_chunked_prefill(
+            &self.model,
+            &mut state,
+            &prompt_u32,
+            prefill,
+            0,
+            self.prefill_chunk_size,
+            &mut logits,
+            &mut chrome,
+            || false,
+        );
+        let prompt_len = prompt_ids.len();
+        {
+            let EngineState {
+                kv_backend,
+                delta_net_cache,
+                ..
+            } = &mut *state;
+            forward_one_via_backend_hybrid(
+                &self.model,
+                kv_backend,
+                delta_net_cache.as_mut(),
+                last[0],
+                (prompt_len - 1) as u32,
+                &mut logits,
+            );
+        }
+        // KV now holds positions [0, prompt_len); seq_len == prompt_len.
+
+        // Per-beam state. Each beam carries a host snapshot of its advanced
+        // K/V plus the next-token candidate set computed from its last forward.
+        struct LiveBeam {
+            tokens: Vec<u32>,
+            cum_logprob: f32,
+            snap: rustllama_models::llama_arch::KvSnapshot,
+            topk: Vec<(u32, f32)>,
+        }
+        let base_snap = match &state.kv_backend {
+            KvBackend::Contiguous(kv) => kv.snapshot_prefix(prompt_len),
+            _ => unreachable!("backend verified contiguous above"),
+        };
+        let mut active: Vec<LiveBeam> = vec![LiveBeam {
+            tokens: Vec::new(),
+            cum_logprob: 0.0,
+            snap: base_snap,
+            topk: top_k_by_logit(&logits, cand_k),
+        }];
+
+        let mut pool = BeamPool::new(num_beams, length_penalty);
+
+        for _step in 0..n_new {
+            // 1) Build + sort candidates across all live beams, then select the
+            //    survivors. `build_sorted_candidates` returns owned candidates,
+            //    so `per_beam`'s borrow of `active` ends on this line.
+            let cands = {
+                let per_beam: Vec<(f32, &[(u32, f32)])> = active
+                    .iter()
+                    .map(|b| (b.cum_logprob, b.topk.as_slice()))
+                    .collect();
+                build_sorted_candidates(&per_beam)
+            };
+            let sel = select_step(&cands, num_beams, eos);
+
+            // 2) Retire EOS-finishers to the pool. The stored tokens include
+            //    the EOS token to match greedy (which emits EOS before stopping).
+            for f in &sel.finished {
+                let mut toks = active[f.parent].tokens.clone();
+                toks.push(f.token);
+                pool.add(toks, f.cum_logprob);
+            }
+
+            if sel.continuing.is_empty() {
+                break;
+            }
+
+            // 3) Materialize each surviving beam: restore its parent's K/V,
+            //    forward the new token, snapshot the advanced K/V, recompute
+            //    its candidate set.
+            let mut next: Vec<LiveBeam> = Vec::with_capacity(sel.continuing.len());
+            for c in &sel.continuing {
+                let parent_len = active[c.parent].tokens.len();
+                let new_pos = (prompt_len + parent_len) as u32;
+                match &mut state.kv_backend {
+                    KvBackend::Contiguous(kv) => kv.restore_prefix(&active[c.parent].snap),
+                    _ => unreachable!("backend verified contiguous above"),
+                }
+                {
+                    let EngineState {
+                        kv_backend,
+                        delta_net_cache,
+                        ..
+                    } = &mut *state;
+                    forward_one_via_backend_hybrid(
+                        &self.model,
+                        kv_backend,
+                        delta_net_cache.as_mut(),
+                        c.token as i32,
+                        new_pos,
+                        &mut logits,
+                    );
+                }
+                let snap = match &state.kv_backend {
+                    KvBackend::Contiguous(kv) => kv.snapshot_prefix(prompt_len + parent_len + 1),
+                    _ => unreachable!("backend verified contiguous above"),
+                };
+                let mut toks = active[c.parent].tokens.clone();
+                toks.push(c.token);
+                next.push(LiveBeam {
+                    tokens: toks,
+                    cum_logprob: c.cum_logprob,
+                    snap,
+                    topk: top_k_by_logit(&logits, cand_k),
+                });
+            }
+            active = next;
+
+            // 4) Context-window guard — every live beam is the same length.
+            let cur_total = prompt_len + active[0].tokens.len();
+            if cur_total >= self.max_ctx {
+                break;
+            }
+
+            // 5) Early-stopping / unbeatable-bound done check.
+            let best_running = active
+                .iter()
+                .map(|b| b.cum_logprob)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let cur_len = active[0].tokens.len();
+            if pool.is_done(beam.early_stopping, best_running, cur_len) {
+                break;
+            }
+        }
+
+        // Finalize: any still-live beams become finished hypotheses (no EOS).
+        for b in active {
+            pool.add(b.tokens, b.cum_logprob);
+        }
+
+        // Reset so the next request re-prefills cleanly — beam left the live KV
+        // on the last materialized beam, which no longer matches `last_ids`.
+        state.reset();
+        chrome.flush();
+
+        let mut ranked = pool.into_ranked();
+        ranked.truncate(beam.k());
+        Ok(ranked)
     }
 
     /// CacheBlend generation (vLLM-style non-prefix KV reuse for RAG). The
@@ -9244,6 +9504,52 @@ fn try_context_shift(
     }
     *next_pos = kv.seq_len as u32;
     true
+}
+
+/// Sort `(token_id, logit)` pairs by logit DESCENDING, ties broken by the
+/// LOWER token id — so index 0 is the argmax with the same lowest-index
+/// tie-break as [`crate::sampling::argmax`].
+fn sort_desc_logit_then_idx(v: &mut [(u32, f32)]) {
+    v.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+}
+
+/// P12b beam-search helper: select the top-`k` tokens by raw logit (lowest-id
+/// tie-break, matching the greedy argmax) and return each as
+/// `(token, logprob)` where `logprob = logit - log_sum_exp(logits)`.
+/// Deterministic. The top element is always the argmax token, so a single
+/// beam's top candidate equals greedy's pick.
+fn top_k_by_logit(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
+    let k = k.min(logits.len()).max(1);
+    let lse = rustllama_kernels_cpu::log_sum_exp_f32(logits);
+    // Single-pass top-k by logit: maintain a length-k running buffer sorted
+    // descending; a strict `>` comparison keeps the lower index on ties.
+    let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
+    for (i, &v) in logits.iter().enumerate() {
+        if top.len() < k {
+            top.push((i as u32, v));
+            if top.len() == k {
+                sort_desc_logit_then_idx(&mut top);
+            }
+            continue;
+        }
+        if v > top[k - 1].1 {
+            top[k - 1] = (i as u32, v);
+            let mut j = k - 1;
+            while j > 0 && top[j].1 > top[j - 1].1 {
+                top.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+    }
+    // When the vocab is smaller than k the buffer was never sorted above.
+    if top.len() < k {
+        sort_desc_logit_then_idx(&mut top);
+    }
+    top.into_iter().map(|(id, logit)| (id, logit - lse)).collect()
 }
 
 /// one-line and the grow logic is owned by exactly one function.

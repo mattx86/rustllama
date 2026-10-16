@@ -14,6 +14,7 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 pub mod batch_scheduler;
+pub mod beam;
 pub mod inference;
 pub mod expert_cache;
 pub mod grammar;
@@ -35,6 +36,7 @@ pub mod tuner_apply;
 pub mod sycl_resources;
 pub mod tool_grammar;
 
+pub use beam::{BeamHypothesis, BeamParams};
 pub use inference::{CpuEngine, CpuEngineError};
 pub use load_options::{LoadOptions, LoadOptionsInput};
 // T3: re-export the typed load-option setters/getters so the CLI + server
