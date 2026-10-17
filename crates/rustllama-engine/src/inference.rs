@@ -4530,6 +4530,22 @@ impl CpuEngine {
                     }
                 }
             }
+            GrammarKind::Gbnf { grammar } => {
+                // Compile the GBNF text to the pushdown-automaton mask. A
+                // malformed grammar should have been rejected at the request
+                // boundary; degrade to "no grammar" defensively rather than
+                // panic on a worker thread.
+                match GrammarMask::new_gbnf(grammar, vocab, eos, decode) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "invalid GBNF grammar in GrammarKind::Gbnf — dropping grammar"
+                        );
+                        None
+                    }
+                }
+            }
         }
     }
 
@@ -5335,6 +5351,82 @@ impl CpuEngine {
         snapshot.extend(new_ids);
         state.commit_snapshot(snapshot);
 
+        Ok(out)
+    }
+
+    /// P15 (echo + logprobs): the per-token logprob of each PROMPT token under
+    /// the model — what OpenAI's `/v1/completions` returns when `echo: true`
+    /// AND `logprobs` are both set (the prompt logprobs are prepended to the
+    /// completion's).
+    ///
+    /// Returns a `Vec` the same length as `prompt_ids`. Index `0` is `None`:
+    /// the first prompt token has no preceding context, so its conditional
+    /// probability is undefined (OpenAI emits `null` there). Index `i > 0`
+    /// holds `logP(prompt[i] | prompt[0..i])` plus the top-`k` alternatives at
+    /// that position.
+    ///
+    /// Implemented as a fresh SERIAL forward over the prompt (one position at a
+    /// time): forwarding `prompt[pos]` at position `pos` yields the logits that
+    /// predict `prompt[pos+1]`, so one pass produces every conditional. This is
+    /// correct for every model family (dense / MoE / hybrid) and KV dtype — the
+    /// batched prefill keeps only the FINAL-position logits, which is why the
+    /// scan is needed. Only invoked on the opt-in echo+logprobs path, so the
+    /// extra forward work is acceptable. The engine's KV state is reset before
+    /// and after so neither a prior request nor the caller's own generation is
+    /// disturbed.
+    pub fn prompt_token_logprobs(
+        &self,
+        prompt_ids: &[i32],
+        k: usize,
+    ) -> Result<Vec<Option<crate::TokenLogprobs>>> {
+        let _sycl_guard = install_sycl_dispatch_if_requested();
+        rustllama_models::accel::set_flash_attention(self.flash_attention);
+        rustllama_models::accel::set_n_gpu_layers(self.n_gpu_layers);
+        rustllama_models::accel::set_cpu_force_patterns(self.cpu_force_patterns.clone());
+        self.prepare_usm_for_sync_path();
+
+        let l = prompt_ids.len();
+        if l == 0 {
+            return Ok(Vec::new());
+        }
+        if l > self.max_ctx {
+            return Err(CpuEngineError::PromptTooLong {
+                prompt_len: l,
+                max_ctx: self.max_ctx,
+            });
+        }
+        let vocab = self.model.cfg.vocab_size;
+        let mut logits = vec![0f32; vocab];
+        let mut out: Vec<Option<crate::TokenLogprobs>> = Vec::with_capacity(l);
+        // The first prompt token has no conditioning context → null logprob.
+        out.push(None);
+
+        let mut state = self.state.lock().expect("state lock");
+        // Fresh KV: an independent scan, not a continuation of any prior request.
+        state.reset();
+        for pos in 0..l.saturating_sub(1) {
+            {
+                let EngineState {
+                    kv_backend,
+                    delta_net_cache,
+                    ..
+                } = &mut *state;
+                forward_one_via_backend_hybrid(
+                    &self.model,
+                    kv_backend,
+                    delta_net_cache.as_mut(),
+                    prompt_ids[pos],
+                    pos as u32,
+                    &mut logits,
+                );
+            }
+            let next_tok = prompt_ids[pos + 1] as u32;
+            out.push(Some(compute_logprobs(&logits, next_tok, k)));
+        }
+        // Wipe the scan's KV so the caller's own generation starts from a known
+        // (empty) state — its `prepare_prefix_reuse` sees `last_ids` cleared and
+        // won't mistake the half-scan for a reusable live prefix.
+        state.reset();
         Ok(out)
     }
 
@@ -9014,6 +9106,18 @@ fn drive_generation(
                         error = %e,
                         pattern,
                         "invalid regex pattern in drive_generation — falling back to no grammar"
+                    );
+                    None
+                }
+            }
+        }
+        Some(GrammarKind::Gbnf { grammar }) => {
+            match GrammarMask::new_gbnf(grammar, vocab_size, model_eos, decode_one) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "invalid GBNF grammar in drive_generation — falling back to no grammar"
                     );
                     None
                 }

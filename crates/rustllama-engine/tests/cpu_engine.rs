@@ -449,3 +449,58 @@ fn four_beams_run_and_rank() {
 
     let _ = std::fs::remove_file(&tmp);
 }
+
+/// P15 (echo + logprobs): `prompt_token_logprobs` returns one entry per prompt
+/// token — the FIRST is `None` (no preceding context, OpenAI's `null`), and
+/// every later entry carries the real `logP(prompt[i] | prompt[0..i])` plus the
+/// top-k alternatives. Token-id based (not text) so it is deterministic on the
+/// synth model regardless of the tokenizer, and it exercises the exact method
+/// the server's `echo:true + logprobs:N` path prepends to the completion.
+#[test]
+fn prompt_token_logprobs_are_null_first_then_real() {
+    let (engine, tmp) = build_engine("prompt-logprobs");
+    let vocab = engine.vocab_size() as u32;
+
+    let prompt = [3i32, 5, 7, 9];
+    let lps = engine
+        .prompt_token_logprobs(&prompt, 3)
+        .expect("prompt logprobs");
+
+    // One entry per prompt token.
+    assert_eq!(lps.len(), prompt.len(), "one logprob slot per prompt token");
+    // First token has no conditioning context → null.
+    assert!(
+        lps[0].is_none(),
+        "first prompt token's logprob must be None (no context)"
+    );
+    // Every subsequent token carries a finite conditional logprob (<= 0 in log
+    // space) and its top-k alternatives are in-vocab and descending.
+    for (i, slot) in lps.iter().enumerate().skip(1) {
+        let lp = slot
+            .as_ref()
+            .unwrap_or_else(|| panic!("prompt token {i} must have a logprob"));
+        assert!(
+            lp.logprob.is_finite() && lp.logprob <= 1e-4,
+            "token {i} logprob {} must be a finite log-prob",
+            lp.logprob
+        );
+        assert!(lp.top.len() <= 3, "top-k respects k=3");
+        for alt in &lp.top {
+            assert!(alt.id < vocab, "alt id {} out of vocab {vocab}", alt.id);
+        }
+        for w in lp.top.windows(2) {
+            assert!(
+                w[0].logprob >= w[1].logprob,
+                "top-k alternatives must be descending"
+            );
+        }
+    }
+
+    // Empty prompt → empty result (defensive).
+    assert!(engine
+        .prompt_token_logprobs(&[], 1)
+        .expect("empty ok")
+        .is_empty());
+
+    let _ = std::fs::remove_file(&tmp);
+}

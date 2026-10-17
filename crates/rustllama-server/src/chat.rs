@@ -145,6 +145,14 @@ pub struct ChatRequest {
     /// tool grammar.
     #[serde(default)]
     pub allow_clarify: Option<bool>,
+    /// P15 — GBNF grammar (llama.cpp-server-style top-level field). When set to
+    /// a non-empty GBNF grammar text, the output is constrained to the grammar.
+    /// Takes effect unless a more specific `response_format` grammar or the
+    /// tool-call grammar is already engaged (same precedence as the other
+    /// grammar sources). A malformed grammar is rejected with a 400. See
+    /// [`rustllama_engine::GrammarKind::Gbnf`].
+    #[serde(default)]
+    pub grammar: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +173,12 @@ pub struct ResponseFormat {
     /// fixed enumerations) where JSON shape is overkill.
     #[serde(default)]
     pub pattern: Option<String>,
+    /// P15 — GBNF grammar TEXT for `kind = "gbnf"`
+    /// (`response_format: {"type":"gbnf","grammar":"root ::= ..."}`). Compiled
+    /// to a pushdown automaton and enforced at sampling time. A malformed
+    /// grammar is a 400 (see [`validate_response_format`]).
+    #[serde(default)]
+    pub grammar: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -541,6 +555,13 @@ pub async fn chat_completions(
     // dispatch where they're handled or ignored).
     if let Err(resp) = validate_response_format(req.response_format.as_ref()) {
         return resp;
+    }
+    // P15: validate a top-level `grammar` (llama.cpp-server style) up front so a
+    // malformed GBNF grammar is a clean 400 rather than a silently-dropped one.
+    if let Some(g) = req.grammar.as_ref().filter(|g| !g.trim().is_empty()) {
+        if let Err(resp) = validate_gbnf_body(g) {
+            return resp;
+        }
     }
     // response_format: prepend instructions to the messages before any
     // template rendering. This works for plain chat, streaming, and tools.
@@ -2340,7 +2361,27 @@ fn build_sampling(req: &ChatRequest) -> SamplingParams {
                     });
                 }
             }
+            "gbnf" => {
+                // GBNF grammar-constrained output. The grammar text rides on
+                // `response_format.grammar`; an empty/missing body falls back to
+                // "no grammar" (the boundary validator rejects a MALFORMED one
+                // with a 400 before we reach here).
+                if let Some(g) = fmt.grammar.as_ref().filter(|g| !g.trim().is_empty()) {
+                    s.grammar = Some(rustllama_engine::GrammarKind::Gbnf {
+                        grammar: g.clone(),
+                    });
+                }
+            }
             _ => {}
+        }
+    }
+    // P15: the llama.cpp-server-style top-level `grammar` field engages GBNF
+    // too. `response_format` is more specific, so it wins when both are set.
+    if s.grammar.is_none() {
+        if let Some(g) = req.grammar.as_ref().filter(|g| !g.trim().is_empty()) {
+            s.grammar = Some(rustllama_engine::GrammarKind::Gbnf {
+                grammar: g.clone(),
+            });
         }
     }
     s
@@ -2360,6 +2401,20 @@ pub(crate) fn validate_response_format(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     let Some(rf) = fmt else { return Ok(()) };
+    // P15: a `gbnf` response_format must carry a compilable grammar body.
+    if rf.kind == "gbnf" {
+        let Some(g) = rf.grammar.as_ref().filter(|g| !g.trim().is_empty()) else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": "response_format.type=gbnf requires a non-empty grammar",
+                    "detail": "Set `response_format.grammar` to the GBNF grammar text.",
+                })),
+            )
+                .into_response());
+        };
+        return validate_gbnf_body(g);
+    }
     if rf.kind != "regex" {
         return Ok(());
     }
@@ -2378,6 +2433,25 @@ pub(crate) fn validate_response_format(
             StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({
                 "error": "invalid regex pattern",
+                "detail": e.to_string(),
+            })),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+/// P15: compile a GBNF grammar body, mapping a parse failure to a 400. Shared
+/// by the `response_format: {"type":"gbnf"}` path and the top-level `grammar`
+/// request field.
+pub(crate) fn validate_gbnf_body(g: &str) -> std::result::Result<(), axum::response::Response> {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    if let Err(e) = rustllama_engine::gbnf::validate_gbnf(g) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "invalid GBNF grammar",
                 "detail": e.to_string(),
             })),
         )
@@ -3972,6 +4046,7 @@ mod tests {
             kind: "json_object".into(),
             json_schema: None,
             pattern: None,
+            grammar: None,
         });
         let out = apply_response_format(msgs, &rf);
         assert_eq!(out.len(), 2);
@@ -3992,6 +4067,7 @@ mod tests {
             kind: "json_schema".into(),
             json_schema: Some(schema),
             pattern: None,
+            grammar: None,
         });
         let out = apply_response_format(msgs, &rf);
         assert_eq!(out[0].role, "system");
@@ -4017,6 +4093,7 @@ mod tests {
             kind: "json_object".into(),
             json_schema: None,
             pattern: None,
+            grammar: None,
         });
         let out = apply_response_format(msgs, &rf);
         assert_eq!(out.len(), 2);
@@ -4048,6 +4125,7 @@ mod tests {
             kind: "yaml_object".into(),
             json_schema: None,
             pattern: None,
+            grammar: None,
         });
         let out = apply_response_format(msgs, &rf);
         // Unknown format is silently ignored — no system msg added.
@@ -4617,6 +4695,7 @@ Now the other.
             kind: "diff".into(),
             json_schema: None,
             pattern: None,
+            grammar: None,
         });
         let out = super::apply_response_format(msgs, &rf);
         assert_eq!(out.len(), 2);

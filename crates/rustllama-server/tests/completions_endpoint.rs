@@ -233,3 +233,185 @@ async fn completions_streaming_returns_sse_chunks_with_done_sentinel() {
     );
     let _ = std::fs::remove_file(&tmp);
 }
+
+/// P15 (echo + logprobs): with BOTH `echo: true` and `logprobs` set, the
+/// response prepends the PROMPT tokens + their logprobs to the completion's.
+/// The first prompt token's logprob is `null` (no preceding context) and the
+/// four logprobs arrays stay the same length — exactly what OpenAI's
+/// `/v1/completions` returns.
+///
+/// A FIM request is used because the synth model's vocab is the special tokens
+/// `<tok_i>` / FIM markers — a plain text prompt tokenizes to nothing, so the
+/// FIM wrapping (`<fim_prefix> … <fim_suffix> … <fim_middle>`) is what yields a
+/// non-empty, generatable prompt to exercise the prepend on. (The engine-level
+/// `prompt_token_logprobs` test pins the values deterministically.)
+#[tokio::test]
+async fn completions_echo_with_logprobs_prepends_prompt_logprobs() {
+    let (state, tmp) = build_state("echo-logprobs", true);
+    let app = router(state);
+
+    let (status, body) = post_json(
+        app,
+        "/v1/completions",
+        serde_json::json!({
+            "model": "completions-test",
+            "prompt": "<|tok_3|>",
+            "suffix": "<|tok_7|>",
+            "max_tokens": 3,
+            "temperature": 0.0,
+            "echo": true,
+            "logprobs": 2,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={}", String::from_utf8_lossy(&body));
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    let lp = &v["choices"][0]["logprobs"];
+    let tokens = lp["tokens"].as_array().expect("tokens array");
+    let token_logprobs = lp["token_logprobs"].as_array().expect("token_logprobs array");
+    let top_logprobs = lp["top_logprobs"].as_array().expect("top_logprobs array");
+    let text_offset = lp["text_offset"].as_array().expect("text_offset array");
+    // All four parallel arrays must agree in length.
+    let n = tokens.len();
+    assert_eq!(token_logprobs.len(), n);
+    assert_eq!(top_logprobs.len(), n);
+    assert_eq!(text_offset.len(), n);
+    // The FIM prompt is ≥3 tokens; with echo the arrays include those prompt
+    // tokens plus ≥1 completion token — strictly more than a completion-only run.
+    assert!(n >= 4, "echo+logprobs must include prompt tokens, got {n}");
+    // First prompt token has no conditioning context → null logprob + null top.
+    assert!(
+        token_logprobs[0].is_null(),
+        "first echoed prompt token's logprob must be null: {:?}",
+        token_logprobs[0]
+    );
+    assert!(top_logprobs[0].is_null(), "first top_logprobs must be null");
+    // The SECOND prompt token has a real conditional logprob (not null).
+    assert!(
+        token_logprobs[1].is_number(),
+        "second prompt token must carry a real logprob: {:?}",
+        token_logprobs[1]
+    );
+    // text_offset is monotonically non-decreasing into the echoed text.
+    let offs: Vec<u64> = text_offset.iter().map(|o| o.as_u64().unwrap()).collect();
+    assert_eq!(offs[0], 0, "first token begins at offset 0");
+    assert!(offs.windows(2).all(|w| w[1] >= w[0]), "offsets non-decreasing");
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// P15: `logprobs` WITHOUT `echo` is unchanged — every entry is a real number
+/// (no leading null) and the arrays cover only the completion tokens. Pins the
+/// shape the pre-P15 completion-only logprobs path produced. FIM prompt (see
+/// the echo test) so the synth model actually generates completion tokens.
+#[tokio::test]
+async fn completions_logprobs_without_echo_has_no_prompt_entries() {
+    let (state, tmp) = build_state("logprobs-only", true);
+    let app = router(state);
+
+    let (status, body) = post_json(
+        app,
+        "/v1/completions",
+        serde_json::json!({
+            "model": "completions-test",
+            "prompt": "<|tok_3|>",
+            "suffix": "<|tok_7|>",
+            "max_tokens": 3,
+            "temperature": 0.0,
+            "logprobs": 1,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={}", String::from_utf8_lossy(&body));
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    let lp = &v["choices"][0]["logprobs"];
+    let token_logprobs = lp["token_logprobs"].as_array().expect("token_logprobs array");
+    assert!(!token_logprobs.is_empty(), "completion produced logprobs");
+    assert!(
+        token_logprobs.iter().all(|x| x.is_number()),
+        "completion-only logprobs must all be real numbers (no null): {token_logprobs:?}"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// P15: `echo` WITHOUT `logprobs` is byte-identical to before — the response
+/// echoes the prompt and omits the `logprobs` object entirely.
+#[tokio::test]
+async fn completions_echo_without_logprobs_unchanged() {
+    let (state, tmp) = build_state("echo-only", false);
+    let app = router(state);
+
+    let (status, body) = post_json(
+        app,
+        "/v1/completions",
+        serde_json::json!({
+            "model": "completions-test",
+            "prompt": "<|tok_5|>",
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "echo": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={}", String::from_utf8_lossy(&body));
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert!(
+        v["choices"][0]["logprobs"].is_null(),
+        "echo without logprobs must omit the logprobs object"
+    );
+    assert!(v["choices"][0]["text"].is_string(), "echoed text present");
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// P15 (GBNF): a malformed `grammar` field is a clean 400 at the request
+/// boundary — before any generation — naming the failure.
+#[tokio::test]
+async fn completions_invalid_gbnf_grammar_returns_400() {
+    let (state, tmp) = build_state("gbnf-bad", false);
+    let app = router(state);
+
+    let (status, body) = post_json(
+        app,
+        "/v1/completions",
+        serde_json::json!({
+            "model": "completions-test",
+            "prompt": "<|tok_5|>",
+            "max_tokens": 2,
+            // No `root` rule → compile error → 400.
+            "grammar": "foo ::= \"x\"",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.to_lowercase().contains("gbnf") || body_str.contains("grammar"),
+        "400 body must name the GBNF grammar failure: {body_str}"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// P15 (GBNF): a VALID `grammar` passes the boundary and reaches the engine,
+/// which runs it to completion (200) — proving the GBNF constraint is wired
+/// through the sampler, not rejected.
+#[tokio::test]
+async fn completions_valid_gbnf_grammar_reaches_engine() {
+    let (state, tmp) = build_state("gbnf-ok", false);
+    let app = router(state);
+
+    let (status, body) = post_json(
+        app,
+        "/v1/completions",
+        serde_json::json!({
+            "model": "completions-test",
+            "prompt": "<|tok_5|>",
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "grammar": "root ::= [a-z]+ | [A-Z]+ | \"<|tok_5|>\"",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={}", String::from_utf8_lossy(&body));
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(v["object"], "text_completion");
+    let _ = std::fs::remove_file(&tmp);
+}

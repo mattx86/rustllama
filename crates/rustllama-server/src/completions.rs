@@ -108,6 +108,13 @@ pub struct CompletionRequest {
     /// (treated as plain prepended context) when empty or CacheBlend is off.
     #[serde(default)]
     pub documents: Option<Vec<String>>,
+    /// P15 — GBNF grammar (llama.cpp-server-style field). When set to a
+    /// non-empty GBNF grammar text, the output is constrained to the grammar
+    /// (the sampler masks out any token that would break it). A malformed
+    /// grammar is rejected with a 400 before generation. See
+    /// [`rustllama_engine::GrammarKind::Gbnf`].
+    #[serde(default)]
+    pub grammar: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -139,11 +146,17 @@ pub struct CompletionChoice {
 /// Per-OpenAI legacy completions logprobs shape:
 ///   { tokens: [...], token_logprobs: [...], top_logprobs: [{...}, ...],
 ///     text_offset: [...] }
+///
+/// `token_logprobs` / `top_logprobs` are `Option` so the FIRST prompt token on
+/// the `echo: true` + `logprobs` path serializes as JSON `null` (it has no
+/// preceding context, so its conditional logprob is undefined — OpenAI's
+/// contract). On the completion-only path every entry is `Some`, which
+/// serializes byte-identically to the pre-echo `Vec<f32>` / `Vec<Map>` shape.
 #[derive(Debug, Serialize)]
 pub struct LogprobsOut {
     pub tokens: Vec<String>,
-    pub token_logprobs: Vec<f32>,
-    pub top_logprobs: Vec<serde_json::Map<String, serde_json::Value>>,
+    pub token_logprobs: Vec<Option<f32>>,
+    pub top_logprobs: Vec<Option<serde_json::Map<String, serde_json::Value>>>,
     pub text_offset: Vec<usize>,
 }
 
@@ -154,6 +167,20 @@ pub async fn completions(
     let Some(serving) = state.resolve(req.model.as_deref()).await else {
         return model_not_found(req.model.as_deref());
     };
+    // P15: validate a supplied GBNF `grammar` up front so a malformed grammar
+    // is a clean 400 instead of being silently dropped at the engine dispatch.
+    if let Some(g) = req.grammar.as_ref().filter(|g| !g.trim().is_empty()) {
+        if let Err(e) = rustllama_engine::gbnf::validate_gbnf(g) {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": "invalid GBNF grammar",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    }
     // P12a: resolve n / best_of. `best_of` defaults to `n` and must be >= n;
     // `n_candidates = max(n, best_of) = best_of` completions are generated,
     // and the top `n_choices` are returned. `n_candidates == 1` is the
@@ -457,6 +484,12 @@ pub async fn completions(
         String::new()
     };
     let want_logprobs = req.logprobs;
+    // P15 (echo + logprobs): when BOTH are set, the logprobs arm prepends the
+    // prompt tokens + their logprobs to the completion's, and rebuilds the echo
+    // prefix from the DETOKENIZED prompt tokens so `text_offset` lines up with
+    // the returned `text`. It stores that prefix here; the final assembly uses
+    // it instead of the raw `prompt_for_echo`. `None` keeps today's behavior.
+    let mut prompt_echo_override: Option<String> = None;
 
     // Speculative decoding for completions, routed at the ID level so this
     // endpoint's own tokenization (no BOS; FIM specials for `suffix`
@@ -536,27 +569,73 @@ pub async fn completions(
             }
         };
 
-        let mut tokens_out = Vec::with_capacity(pairs.len());
-        let mut token_logprobs = Vec::with_capacity(pairs.len());
-        let mut top_logprobs = Vec::with_capacity(pairs.len());
-        let mut text_offset = Vec::with_capacity(pairs.len());
-        let mut text_acc = String::new();
-        let mut tok_count = 0u32;
+        // Detokenize one TopLogprob set into the OpenAI `{token: logprob}` map.
+        let build_top_map = |top: &[rustllama_engine::TopLogprob]| {
+            let mut m: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+            for alt in top {
+                let alt_str = tokenizer.decode_single(alt.id, true).unwrap_or_default();
+                m.insert(alt_str, serde_json::json!(alt.logprob));
+            }
+            m
+        };
 
+        let mut tokens_out: Vec<String> = Vec::new();
+        let mut token_logprobs: Vec<Option<f32>> = Vec::new();
+        let mut top_logprobs: Vec<Option<serde_json::Map<String, serde_json::Value>>> = Vec::new();
+        let mut text_offset: Vec<usize> = Vec::new();
+        // `text_acc` accumulates the FULL returned `text` so byte offsets are
+        // exact. On echo it opens with the detokenized prompt; otherwise it is
+        // the completion alone (byte-identical to the pre-P15 path).
+        let mut text_acc = String::new();
+
+        // P15 echo branch: prepend each prompt token + its logprob. The first
+        // prompt token's logprob/top are `null` (no preceding context).
+        if req.echo {
+            let prompt_ids_i32: Vec<i32> = prompt_ids.iter().map(|&v| v as i32).collect();
+            let cpu_p = cpu_for_blocking.clone();
+            let pids = prompt_ids_i32.clone();
+            let plps = match tokio::task::spawn_blocking(move || {
+                cpu_p.prompt_token_logprobs(&pids, k as usize)
+            })
+            .await
+            {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
+            };
+            for (pid, lp) in prompt_ids.iter().zip(plps.iter()) {
+                let tok_str = tokenizer.decode_single(*pid, true).unwrap_or_default();
+                text_offset.push(text_acc.len());
+                text_acc.push_str(&tok_str);
+                tokens_out.push(tok_str);
+                match lp {
+                    None => {
+                        token_logprobs.push(None);
+                        top_logprobs.push(None);
+                    }
+                    Some(lp) => {
+                        token_logprobs.push(Some(lp.logprob));
+                        top_logprobs.push(Some(build_top_map(&lp.top)));
+                    }
+                }
+            }
+            // The echo prefix IS the detokenized prompt we just laid down, so
+            // the final assembly must not prepend `prompt_for_echo` again.
+            prompt_echo_override = Some(text_acc.clone());
+        }
+
+        let mut tok_count = 0u32;
         for (id, lp) in pairs.iter() {
             let tok_str = tokenizer.decode_single(*id, true).unwrap_or_default();
             text_offset.push(text_acc.len());
             text_acc.push_str(&tok_str);
             tokens_out.push(tok_str);
-            token_logprobs.push(lp.logprob);
-
-            let mut top_map: serde_json::Map<String, serde_json::Value> =
-                serde_json::Map::new();
-            for alt in &lp.top {
-                let alt_str = tokenizer.decode_single(alt.id, true).unwrap_or_default();
-                top_map.insert(alt_str, serde_json::json!(alt.logprob));
-            }
-            top_logprobs.push(top_map);
+            token_logprobs.push(Some(lp.logprob));
+            top_logprobs.push(Some(build_top_map(&lp.top)));
             tok_count += 1;
         }
 
@@ -566,7 +645,14 @@ pub async fn completions(
             top_logprobs,
             text_offset,
         };
-        (text_acc, Some(logprobs_payload), tok_count)
+        // Return the COMPLETION-ONLY text; the prompt prefix (if any) is carried
+        // by `prompt_echo_override` and prepended at final assembly so the
+        // non-echo path stays byte-identical.
+        let completion_text: String = pairs
+            .iter()
+            .map(|(id, _)| tokenizer.decode_single(*id, true).unwrap_or_default())
+            .collect();
+        (completion_text, Some(logprobs_payload), tok_count)
     } else {
         match spec_mode {
             CompletionSpecMode::Draft => {
@@ -704,7 +790,12 @@ pub async fn completions(
         }
     };
 
-    let full_text = format!("{}{}", prompt_for_echo, text);
+    // P15: on echo+logprobs the prompt prefix is the DETOKENIZED prompt
+    // (`prompt_echo_override`), so `text_offset` aligns with the returned text;
+    // every other path uses the raw `prompt_for_echo` (empty when `echo` is off
+    // — byte-identical to before).
+    let echo_prefix = prompt_echo_override.unwrap_or(prompt_for_echo);
+    let full_text = format!("{}{}", echo_prefix, text);
     let stats = cpu.last_request_stats();
     let fingerprint =
         crate::system_fingerprint(&state.version, &model, kv_dtype_label(&cpu));
@@ -830,6 +921,14 @@ fn build_sampling(req: &CompletionRequest) -> SamplingParams {
     }
     if let Some(de) = req.dynatemp_exponent {
         s.dynatemp_exponent = de;
+    }
+    // P15: a non-empty `grammar` field engages the GBNF constraint. The grammar
+    // text was already validated (clean 400) at the request boundary; here it is
+    // compiled by the engine when the sampler builds its mask.
+    if let Some(g) = req.grammar.as_ref().filter(|g| !g.trim().is_empty()) {
+        s.grammar = Some(rustllama_engine::GrammarKind::Gbnf {
+            grammar: g.clone(),
+        });
     }
     s
 }

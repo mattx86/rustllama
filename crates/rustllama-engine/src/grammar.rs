@@ -195,6 +195,10 @@ enum ParserKind {
     ToolCall(crate::tool_grammar::ToolCallStreamGrammar),
     Code(CodeGrammarParser),
     Regex(RegexGrammarParser),
+    /// GBNF (GGML BNF) grammar — a nondeterministic pushdown automaton (so it
+    /// handles recursive, context-free grammars), compiled from GBNF TEXT. See
+    /// [`crate::gbnf`].
+    Gbnf(crate::gbnf::GbnfParser),
 }
 
 impl ParserKind {
@@ -205,6 +209,7 @@ impl ParserKind {
             ParserKind::ToolCall(p) => p.step(b),
             ParserKind::Code(p) => p.step(b),
             ParserKind::Regex(p) => p.step(b),
+            ParserKind::Gbnf(p) => p.step(b),
         }
     }
 
@@ -224,6 +229,10 @@ impl ParserKind {
             // when to stop; we expose match-state-reached via
             // can_terminate_now() so EOS becomes allowed.
             ParserKind::Regex(_) => false,
+            // GBNF is stream-shaped too: a rule can accept an unbounded suffix
+            // (`x*`), so "done" is never forced — `can_terminate_now` reports
+            // when a complete parse exists and EOS is legal.
+            ParserKind::Gbnf(_) => false,
         }
     }
 
@@ -234,6 +243,7 @@ impl ParserKind {
             ParserKind::ToolCall(p) => p.can_terminate_now(),
             ParserKind::Code(p) => p.can_terminate_now(),
             ParserKind::Regex(p) => p.can_terminate_now(),
+            ParserKind::Gbnf(p) => p.can_terminate_now(),
         }
     }
 }
@@ -680,6 +690,28 @@ impl GrammarMask {
     ) -> std::result::Result<Self, RegexGrammarError> {
         Ok(Self {
             parser: ParserKind::Regex(RegexGrammarParser::new(pattern)?),
+            token_bytes: Arc::new(decode_vocab(vocab_size, decode_one)),
+            eos_id,
+        })
+    }
+
+    /// Build a GBNF-constrained mask. The grammar TEXT is compiled to a
+    /// pushdown automaton (so recursive / context-free grammars work); every
+    /// candidate token's bytes are stepped through it. EOS is allowed any time
+    /// a complete parse exists ([`crate::gbnf::GbnfParser::can_terminate_now`]).
+    ///
+    /// Returns a [`crate::gbnf::GbnfError`] when the grammar text fails to
+    /// compile — surface that as a 400 at the request boundary (the server
+    /// validates up front; the dispatch sites also warn-and-drop defensively).
+    pub fn new_gbnf(
+        grammar: &str,
+        vocab_size: usize,
+        eos_id: Option<u32>,
+        decode_one: impl Fn(u32) -> Vec<u8>,
+    ) -> std::result::Result<Self, crate::gbnf::GbnfError> {
+        let compiled = crate::gbnf::CompiledGbnf::compile(grammar)?;
+        Ok(Self {
+            parser: ParserKind::Gbnf(crate::gbnf::GbnfParser::new(compiled)),
             token_bytes: Arc::new(decode_vocab(vocab_size, decode_one)),
             eos_id,
         })
@@ -2249,5 +2281,59 @@ mod tests {
         let _ = p;
         let mask = super::GrammarMask::new_regex(r"^\d+$", 1, None, |_| Vec::new()).unwrap();
         assert!(!mask.is_done(), "regex grammar must never report is_done=true");
+    }
+
+    /// P15 anchor: a GBNF grammar compiled into the existing mask machinery
+    /// constrains the sampler to grammar-accepting tokens, gates EOS on a
+    /// complete parse, and refuses tokens that would overrun the grammar.
+    #[test]
+    fn gbnf_mask_constrains_to_grammar() {
+        // root ::= "yes" | "no"
+        // Vocab: 0="yes", 1="no", 2="maybe", 3=EOS (empty decode).
+        let decode = |id: u32| -> Vec<u8> {
+            match id {
+                0 => b"yes".to_vec(),
+                1 => b"no".to_vec(),
+                2 => b"maybe".to_vec(),
+                _ => Vec::new(),
+            }
+        };
+        let mut mask =
+            super::GrammarMask::new_gbnf(r#"root ::= "yes" | "no""#, 4, Some(3), decode).unwrap();
+        assert!(mask.accepts(0), "\"yes\" matches the grammar");
+        assert!(mask.accepts(1), "\"no\" matches the grammar");
+        assert!(!mask.accepts(2), "\"maybe\" is not in the grammar");
+        assert!(
+            !mask.accepts(3),
+            "EOS before a complete value must be rejected"
+        );
+        // Commit "yes": the value is now complete.
+        mask.advance(0);
+        assert!(mask.accepts(3), "EOS after a complete \"yes\" is allowed");
+        assert!(
+            !mask.accepts(0),
+            "a second \"yes\" would overrun the grammar → rejected"
+        );
+    }
+
+    /// P15: a malformed GBNF grammar surfaces a compile error (the server maps
+    /// this to a clean 400), rather than silently constraining nothing.
+    #[test]
+    fn gbnf_mask_rejects_invalid_grammar() {
+        // No `root` rule.
+        assert!(super::GrammarMask::new_gbnf("foo ::= \"x\"", 1, None, |_| Vec::new()).is_err());
+        // Undefined rule reference.
+        assert!(super::GrammarMask::new_gbnf("root ::= undefined_rule", 1, None, |_| {
+            Vec::new()
+        })
+        .is_err());
+    }
+
+    /// P15: GBNF is stream-shaped (a rule may accept an unbounded suffix), so
+    /// `is_done` is always false — EOS is governed by `can_terminate_now`.
+    #[test]
+    fn gbnf_is_done_always_false() {
+        let mask = super::GrammarMask::new_gbnf("root ::= [a-z]+", 1, None, |_| Vec::new()).unwrap();
+        assert!(!mask.is_done(), "GBNF grammar must never report is_done=true");
     }
 }

@@ -125,6 +125,16 @@ fn build_paged_grammar(
                 None
             }
         },
+        GrammarKind::Gbnf { grammar } => match GrammarMask::new_gbnf(grammar, vocab, eos, decode) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "invalid GBNF grammar in GrammarKind::Gbnf — ignoring grammar on paged engine"
+                );
+                None
+            }
+        },
     }
 }
 
@@ -385,6 +395,11 @@ pub struct PagedBatchEngine {
     /// can `take` and `join` it after closing the request channel
     /// (closing → driver loop sees `recv() → None` and returns).
     driver_handle: Option<std::thread::JoinHandle<()>>,
+    /// P4s: the background emit worker's join handle (`None` when the overlap
+    /// pipeline is off). Joined in `Drop` AFTER the driver, by which point the
+    /// driver has dropped its `emit_tx` (closing the worker's channel), so the
+    /// worker has drained any queued tokens and exited.
+    emit_worker_handle: Option<std::thread::JoinHandle<()>>,
     /// Atomic count of slots the driver thread currently holds in
     /// its `active` Vec. Bumped on admission, decremented on
     /// `retain` removal at slot completion. Surfaced via
@@ -425,7 +440,7 @@ impl PagedBatchEngine {
         // Config budget 0 ⇒ the ragged mixed path is OFF unless the
         // `RUSTLLAMA_MAX_BATCHED_TOKENS` env var opts in (env still honored for
         // back-compat; see `resolve_max_batched_tokens`).
-        Self::load_inner(path, max_ctx, max_slots, true, 0, None, None)
+        Self::load_inner(path, max_ctx, max_slots, true, 0, None, None, true)
     }
 
     /// Same as [`Self::load`] but with the `[inference].max_num_batched_tokens`
@@ -441,7 +456,16 @@ impl PagedBatchEngine {
         max_slots: u32,
         max_num_batched_tokens: usize,
     ) -> Result<Self, CpuEngineError> {
-        Self::load_inner(path, max_ctx, max_slots, true, max_num_batched_tokens, None, None)
+        Self::load_inner(
+            path,
+            max_ctx,
+            max_slots,
+            true,
+            max_num_batched_tokens,
+            None,
+            None,
+            true,
+        )
     }
 
     /// P11: like [`Self::load_with_batched_tokens`] but merges a LoRA adapter
@@ -462,6 +486,7 @@ impl PagedBatchEngine {
             max_num_batched_tokens,
             None,
             lora,
+            true,
         )
     }
 
@@ -472,7 +497,20 @@ impl PagedBatchEngine {
         max_ctx: usize,
         max_slots: u32,
     ) -> Result<Self, CpuEngineError> {
-        Self::load_inner(path, max_ctx, max_slots, false, 0, None, None)
+        Self::load_inner(path, max_ctx, max_slots, false, 0, None, None, true)
+    }
+
+    /// P4s test hook: like [`Self::load_token_id_only`] but with the overlapped
+    /// emit pipeline explicitly on or off. Lets the overlap≡serial identity test
+    /// build the same model both ways and compare token streams.
+    #[doc(hidden)]
+    pub fn load_token_id_only_with_overlap(
+        path: &Path,
+        max_ctx: usize,
+        max_slots: u32,
+        overlap_emit: bool,
+    ) -> Result<Self, CpuEngineError> {
+        Self::load_inner(path, max_ctx, max_slots, false, 0, None, None, overlap_emit)
     }
 
     /// Test-only: like [`Self::load_token_id_only`] but with an explicit page
@@ -490,9 +528,10 @@ impl PagedBatchEngine {
         max_slots: u32,
         total_pages: u32,
     ) -> Result<Self, CpuEngineError> {
-        Self::load_inner(path, max_ctx, max_slots, false, 0, Some(total_pages), None)
+        Self::load_inner(path, max_ctx, max_slots, false, 0, Some(total_pages), None, true)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn load_inner(
         path: &Path,
         max_ctx: usize,
@@ -501,6 +540,7 @@ impl PagedBatchEngine {
         config_max_batched_tokens: usize,
         pool_pages_override: Option<u32>,
         lora: Option<&Path>,
+        overlap_emit: bool,
     ) -> Result<Self, CpuEngineError> {
         let max_slots = max_slots.max(1);
         let gguf = Gguf::open(path)?;
@@ -676,6 +716,23 @@ impl PagedBatchEngine {
         let last_stats: Arc<std::sync::Mutex<Option<RequestStats>>> =
             Arc::new(std::sync::Mutex::new(None));
         let preemptions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // P4s: optionally spawn the background emit worker. When on, the decode
+        // tick hands each streamed token's detok + send to this worker so it
+        // overlaps the next tick's forward; when off, the driver does the detok
+        // + send inline (byte-identical serial path). The worker exits when the
+        // `emit_tx` it receives on (held in `DriverContext`) drops at driver-loop
+        // end, after draining any queued tokens.
+        let (emit_tx, emit_worker_handle) = if overlap_emit {
+            let (tx, rx) = std::sync::mpsc::channel::<EmitMsg>();
+            let tok = tokenizer.clone();
+            let handle = std::thread::Builder::new()
+                .name("rustllama-paged-batch-emit".to_string())
+                .spawn(move || emit_worker(tok, rx))
+                .map_err(|e| CpuEngineError::Other(format!("emit worker spawn: {e}")))?;
+            (Some(tx), Some(handle))
+        } else {
+            (None, None)
+        };
         let driver_ctx = DriverContext {
             model: Arc::clone(&model),
             tokenizer: tokenizer.clone(),
@@ -705,6 +762,7 @@ impl PagedBatchEngine {
             // via `load_with_batched_tokens`. Resolved HERE so the driver loop
             // reads only `ctx.max_batched_tokens`, never the env.
             max_batched_tokens: resolve_max_batched_tokens(config_max_batched_tokens),
+            emit_tx,
         };
         let driver_handle = std::thread::Builder::new()
             .name("rustllama-paged-batch-driver".to_string())
@@ -754,6 +812,7 @@ impl PagedBatchEngine {
             model_id,
             request_tx: Some(request_tx),
             driver_handle: Some(driver_handle),
+            emit_worker_handle,
             active_slot_count,
             last_stats,
             preemptions,
@@ -1335,6 +1394,12 @@ impl Drop for PagedBatchEngine {
         if let Some(handle) = self.driver_handle.take() {
             let _ = handle.join();
         }
+        // P4s: the driver has now returned, dropping the `emit_tx` it owned via
+        // its `DriverContext`; the worker's channel is closed and it has drained
+        // + exited, so this join does not block.
+        if let Some(handle) = self.emit_worker_handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -1425,6 +1490,98 @@ struct DriverContext {
     /// prompt prefilled in one ragged tick). Never `0` here. See the
     /// construction and [`resolve_max_batched_tokens`].
     max_batched_tokens: usize,
+    /// P4s (overlapped scheduling): when `Some`, the per-token streaming
+    /// detokenization + channel send is handed to a background worker thread
+    /// instead of running inline in the decode tick, so it overlaps the NEXT
+    /// tick's forward pass. `None` keeps the serial inline path (byte-identical
+    /// token stream — the overlap only MOVES the detok/send off the hot path;
+    /// which tokens are produced, and in what order, is decided entirely by the
+    /// synchronous sampler, exactly as before). See [`emit_worker`] and
+    /// [`DriverContext::emit_stream_token`].
+    emit_tx: Option<std::sync::mpsc::Sender<EmitMsg>>,
+}
+
+/// P4s: one unit of pipelined stream output — detokenize `id` and send it on
+/// `out`. Produced in generation order by the (single-threaded) driver and
+/// consumed in FIFO order by the one [`emit_worker`], which preserves per-slot
+/// ordering: slot *i*'s tokens are enqueued in order, so the receiver sees them
+/// in order, then the channel's natural close (all senders dropped) as the
+/// terminal — identical to the serial path's observed stream.
+struct EmitMsg {
+    out: tokio::sync::mpsc::Sender<EngineResult<Token>>,
+    id: u32,
+}
+
+/// P4s background emit worker: detokenize each queued token and send it to its
+/// slot's response channel. Runs concurrently with the driver's forward pass,
+/// hiding the (small) detok + send latency behind the (large) model compute.
+///
+/// Purity / correctness: this does ONLY `decode(&[id]) + send`. It never
+/// touches slot state, sampling, grammar, or stop logic — all of which stay
+/// synchronous on the driver thread — so it cannot change WHICH tokens are
+/// produced or their order. `decode(&[id], false)` is a pure function of the
+/// id (a single-id detok, no streaming state), identical to the inline call it
+/// replaces. The worker exits when the `emit_tx` in [`DriverContext`] drops
+/// (driver loop end), after draining any queued tokens.
+fn emit_worker(tokenizer: Option<Arc<Tokenizer>>, rx: std::sync::mpsc::Receiver<EmitMsg>) {
+    while let Ok(msg) = rx.recv() {
+        let text = match &tokenizer {
+            Some(t) => t.decode(&[msg.id], false).unwrap_or_default(),
+            None => String::new(),
+        };
+        // A failed send means the client disconnected; the driver's
+        // `response_tx.is_closed()` check catches that next tick and ends the
+        // slot, so we just drop the token here (the client is gone).
+        let _ = msg.out.blocking_send(Ok(Token {
+            id: msg.id,
+            text,
+            logprobs: None,
+        }));
+    }
+}
+
+impl DriverContext {
+    /// P4s: emit one decode token to a slot's client channel. When the emit
+    /// pipeline is enabled (`emit_tx` set) the detok + send run on the
+    /// background [`emit_worker`] (overlapping the next tick's forward),
+    /// enqueued in generation order; otherwise they run inline (the serial,
+    /// byte-identical path).
+    ///
+    /// Returns `true` when the token was handed off and `false` ONLY on an
+    /// inline send failure (client disconnected) — so the serial caller ends
+    /// the slot exactly as before. In the pipelined case a disconnect is caught
+    /// one tick later by the driver's `response_tx.is_closed()` check, so this
+    /// always returns `true` there; the deferred detok/send never affects which
+    /// tokens a live client observes or their order.
+    fn emit_stream_token(
+        &self,
+        out: &tokio::sync::mpsc::Sender<EngineResult<Token>>,
+        id: u32,
+    ) -> bool {
+        match &self.emit_tx {
+            Some(tx) => {
+                // Single FIFO worker → per-slot order preserved. A closed worker
+                // channel cannot occur while the driver runs; ignore the result.
+                let _ = tx.send(EmitMsg {
+                    out: out.clone(),
+                    id,
+                });
+                true
+            }
+            None => {
+                let text = match &self.tokenizer {
+                    Some(t) => t.decode(&[id], false).unwrap_or_default(),
+                    None => String::new(),
+                };
+                out.blocking_send(Ok(Token {
+                    id,
+                    text,
+                    logprobs: None,
+                }))
+                .is_ok()
+            }
+        }
+    }
 }
 
 /// P14/F5: one unit of pending admission work in the driver's priority heap.
@@ -2451,16 +2608,12 @@ fn commit_decode_token(ctx: &DriverContext, slot: &mut DriverSlot, logits: &mut 
     if slot.state.skip_emit > 0 {
         slot.state.skip_emit -= 1;
     } else {
-        let text = match &ctx.tokenizer {
-            Some(tok) => tok.decode(&[next_tok], false).unwrap_or_default(),
-            None => String::new(),
-        };
-        let token = Token {
-            id: next_tok,
-            text,
-            logprobs: None,
-        };
-        if slot.response_tx.blocking_send(Ok(token)).is_err() {
+        // P4s: detok + send either inline (serial) or via the background emit
+        // worker (overlaps the next forward). Both produce the identical
+        // token/text on the client's channel; only an inline send FAILURE (the
+        // serial path) ends the slot here — the pipelined path relies on the
+        // `is_closed()` check at the top of the next tick.
+        if !ctx.emit_stream_token(&slot.response_tx, next_tok) {
             slot.state.done = true;
             return;
         }
@@ -2715,16 +2868,8 @@ fn run_spec_round_for_slot(ctx: &DriverContext, slot: &mut DriverSlot, vocab: us
         if slot.state.skip_emit > 0 {
             slot.state.skip_emit -= 1;
         } else {
-            let text = match &ctx.tokenizer {
-                Some(tok) => tok.decode(&[id], false).unwrap_or_default(),
-                None => String::new(),
-            };
-            let token = Token {
-                id,
-                text,
-                logprobs: None,
-            };
-            if slot.response_tx.blocking_send(Ok(token)).is_err() {
+            // P4s: same inline-or-pipelined emit as the plain decode row.
+            if !ctx.emit_stream_token(&slot.response_tx, id) {
                 slot.state.done = true;
                 return;
             }
@@ -2916,5 +3061,81 @@ mod tests {
         assert!(!deadline_expired(Some(
             Instant::now() + std::time::Duration::from_secs(60)
         )));
+    }
+
+    /// P4s anchor: the overlapped emit pipeline produces a BYTE-IDENTICAL token
+    /// stream to the serial (inline) path — same token ids, in the same order,
+    /// for every slot — over a multi-token greedy generation, both for a single
+    /// request AND two concurrent requests. The overlap only moves the detok +
+    /// send off the decode hot path (onto a background worker); which tokens are
+    /// produced, and in what order, is decided entirely by the synchronous
+    /// sampler, so the streams must match exactly.
+    #[test]
+    fn p4s_overlapped_emit_matches_serial_token_stream() {
+        use futures::StreamExt;
+        use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
+
+        let path = std::env::temp_dir().join("rustllama-p4s-overlap.gguf");
+        write_synthetic_llama_gguf(&path, &SynthLlama::default());
+
+        // Collect each slot's emitted token-id sequence for an engine built with
+        // the overlap pipeline on or off. Greedy (temperature 0) + fixed seed →
+        // deterministic generation, so any difference is the overlap's fault.
+        let run = |overlap: bool, n_slots: usize| -> Vec<Vec<u32>> {
+            let engine =
+                PagedBatchEngine::load_token_id_only_with_overlap(&path, 64, 4, overlap)
+                    .expect("load synth paged engine");
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            rt.block_on(async {
+                // Submit all slots first, then drain CONCURRENTLY (one task per
+                // stream) so a bounded per-slot channel can't head-of-line-block
+                // another slot's delivery.
+                let mut handles = Vec::new();
+                for s in 0..n_slots {
+                    let prompt: Vec<i32> = vec![1, 2, 3, (s as i32) + 4];
+                    let mut sampling = SamplingParams::default();
+                    sampling.temperature = 0.0;
+                    sampling.top_k = 0;
+                    sampling.top_p = 1.0;
+                    sampling.max_tokens = 8;
+                    sampling.seed = 1234;
+                    let stream = engine
+                        .submit_streaming(prompt, sampling)
+                        .expect("submit streaming");
+                    handles.push(tokio::spawn(async move {
+                        let mut st = stream;
+                        let mut ids = Vec::new();
+                        while let Some(item) = st.next().await {
+                            ids.push(item.expect("token").id);
+                        }
+                        ids
+                    }));
+                }
+                let mut outs = Vec::new();
+                for h in handles {
+                    outs.push(h.await.expect("stream task"));
+                }
+                outs
+            })
+        };
+
+        for n in [1usize, 2] {
+            let serial = run(false, n);
+            let overlapped = run(true, n);
+            assert_eq!(
+                serial, overlapped,
+                "P4s: overlapped emit must yield the identical token stream to serial (n_slots={n})"
+            );
+            // Sanity: generation actually produced tokens (so the test isn't
+            // vacuously comparing two empty streams).
+            assert!(
+                serial.iter().all(|s| !s.is_empty()),
+                "every slot should emit at least one token"
+            );
+        }
     }
 }

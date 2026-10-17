@@ -17,6 +17,7 @@ pub mod batch_scheduler;
 pub mod beam;
 pub mod inference;
 pub mod expert_cache;
+pub mod gbnf;
 pub mod grammar;
 pub mod kv_backend;
 pub mod kv_persist;
@@ -356,6 +357,13 @@ pub enum GrammarKind {
     /// "regex", "pattern": "..."}` extension. See
     /// [`grammar::RegexGrammarParser`] for the byte-DFA stepping.
     Regex { pattern: String },
+    /// GBNF (GGML BNF) grammar-constrained output. Carries the GBNF grammar
+    /// TEXT (llama.cpp's public grammar format); compiled to a pushdown
+    /// automaton so recursive / context-free grammars are enforced. Wires up
+    /// to the llama.cpp-server-style top-level `grammar` request field and a
+    /// `response_format: {"type": "gbnf", "grammar": "..."}` extension. See
+    /// [`gbnf`] for the compiler + stack machine.
+    Gbnf { grammar: String },
 }
 
 impl Default for SamplingParams {
