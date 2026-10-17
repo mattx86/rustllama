@@ -9025,6 +9025,91 @@ impl LlamaModel {
                         //    ([n_v_heads][nb][head_v_dim]) and gated-RMSNorm'd
                         //    per token per head, exactly as the per-token path.
                         let mut chunk_out = vec![0.0f32; n_v_heads * nb * head_v_dim];
+                        // P17: attempt the WHOLE-batch GPU DeltaNet chunked scan
+                        // (all V-heads in one `ssm:delta_net` kernel). Fail-closed:
+                        // `try_delta_net_chunk_prefill` returns false unless the
+                        // parity verdict passed AND this is a dedicated-VRAM SYCL
+                        // GPU (off on the Iris Xe box / any non-SYCL host), in which
+                        // case the CPU rayon path below runs byte-identically to
+                        // pre-P17. When it DOES run, it packs head-major q/k/v/g/beta
+                        // with the IDENTICAL per-head gather the CPU closure uses
+                        // (l2norm + q-scale on q, l2norm on k, decay =
+                        // ssm_a·softplus(alpha+dt_bias), sigmoid'd beta), threads
+                        // dn.recurrent_state through the kernel, and leaves the raw
+                        // (pre-gate) scan in `chunk_out` — the gated RMSNorm is then
+                        // applied below exactly as the per-token path does.
+                        let gpu_scan = {
+                            let mut q_pk = vec![0.0f32; n_v_heads * nb * head_qk_dim];
+                            let mut k_pk = vec![0.0f32; n_v_heads * nb * head_qk_dim];
+                            let mut v_pk = vec![0.0f32; n_v_heads * nb * head_v_dim];
+                            let mut g_pk = vec![0.0f32; n_v_heads * nb];
+                            let mut beta_pk = vec![0.0f32; n_v_heads * nb];
+                            for h in 0..n_v_heads {
+                                let kh = h % n_qk_heads;
+                                let q_off = kh * head_qk_dim;
+                                let k_off = q_block_size + kh * head_qk_dim;
+                                let v_off = q_block_size + k_block_size + h * head_v_dim;
+                                for bi in 0..nb {
+                                    let conv = &qkv_conv_sub[bi * qkv_dim..(bi + 1) * qkv_dim];
+                                    let base_qk = (h * nb + bi) * head_qk_dim;
+                                    let base_v = (h * nb + bi) * head_v_dim;
+                                    let qd = &mut q_pk[base_qk..base_qk + head_qk_dim];
+                                    qd.copy_from_slice(&conv[q_off..q_off + head_qk_dim]);
+                                    k::delta_net::l2norm_f32_inplace(qd, 1e-6);
+                                    for x in qd.iter_mut() {
+                                        *x *= q_scale;
+                                    }
+                                    let kd = &mut k_pk[base_qk..base_qk + head_qk_dim];
+                                    kd.copy_from_slice(&conv[k_off..k_off + head_qk_dim]);
+                                    k::delta_net::l2norm_f32_inplace(kd, 1e-6);
+                                    v_pk[base_v..base_v + head_v_dim]
+                                        .copy_from_slice(&conv[v_off..v_off + head_v_dim]);
+                                    g_pk[h * nb + bi] = block.ssm_a[h]
+                                        * delta_net_softplus(
+                                            hoist_alpha[bi * n_v_heads + h] + block.ssm_dt_bias[h],
+                                        );
+                                    beta_pk[h * nb + bi] = hoist_beta[bi * n_v_heads + h];
+                                }
+                            }
+                            crate::accel::try_delta_net_chunk_prefill(
+                                &q_pk,
+                                &k_pk,
+                                &v_pk,
+                                &g_pk,
+                                &beta_pk,
+                                &mut dn.recurrent_state[..n_v_heads * state_stride],
+                                &mut chunk_out,
+                                n_v_heads,
+                                nb,
+                                head_qk_dim,
+                                head_v_dim,
+                                k::delta_net::ssm_chunk_current(),
+                            )
+                        };
+                        if gpu_scan {
+                            // Gated RMSNorm per (head, token) on the raw GPU scan.
+                            // (rayon prelude is already in scope for this branch.)
+                            chunk_out
+                                .par_chunks_mut(nb * head_v_dim)
+                                .enumerate()
+                                .for_each(|(h, out_head_all)| {
+                                    let mut norm_scratch = vec![0.0f32; head_v_dim];
+                                    for bi in 0..nb {
+                                        let gate_head = &hoist_gate[bi * ssm_inner
+                                            + h * head_v_dim
+                                            ..bi * ssm_inner + (h + 1) * head_v_dim];
+                                        let out_bi = &mut out_head_all
+                                            [bi * head_v_dim..(bi + 1) * head_v_dim];
+                                        k::delta_net::gated_rmsnorm_f32_scratch(
+                                            out_bi,
+                                            gate_head,
+                                            &block.ssm_norm,
+                                            cfg.rms_eps,
+                                            &mut norm_scratch,
+                                        );
+                                    }
+                                });
+                        } else {
                         dn.recurrent_state[..n_v_heads * state_stride]
                             .par_chunks_mut(state_stride)
                             .zip(chunk_out.par_chunks_mut(nb * head_v_dim))
@@ -9090,6 +9175,7 @@ impl LlamaModel {
                                     );
                                 }
                             });
+                        }
                         // 3. Per-token assembly: gather this token's heads into
                         //    v_out_concat (head-major), then the SAME output-
                         //    projection hoist (tiled→grouped perm + Hadamard)

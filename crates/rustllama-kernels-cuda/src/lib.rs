@@ -73,6 +73,21 @@ extern "C" {
         m_rows: c_int,
         k_dim: c_int,
     ) -> c_int;
+    // P17: Gated-DeltaNet chunked-prefill recurrence over all V-heads (host-copy).
+    fn rsl_cuda_delta_net_chunk_f32(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        g: *const f32,
+        beta: *const f32,
+        state: *mut f32,
+        out: *mut f32,
+        n_heads: c_int,
+        seq_len: c_int,
+        head_qk_dim: c_int,
+        head_v_dim: c_int,
+        chunk_len: c_int,
+    ) -> c_int;
 
     // Device-resident path.
     fn rsl_cuda_stream_create(device_index: c_int) -> *mut RslCudaStreamRaw;
@@ -982,6 +997,58 @@ pub fn matvec_f32(
     // SAFETY: slices outlive the call; lengths are checked above.
     let rc = unsafe {
         rsl_cuda_matvec_f32(weights.as_ptr(), x.as_ptr(), out.as_mut_ptr(), m_rows as c_int, k_dim as c_int)
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// P17: Gated-DeltaNet chunked-prefill recurrence over ALL V-heads (host-copy).
+/// WRITE-BLIND CUDA mirror of the SYCL `delta_net_chunk_f32_usm_raw` + the CPU
+/// chunked reference. Head-major: `q`/`k` are `[n_heads*seq_len*head_qk_dim]`,
+/// `v`/`out` `[n_heads*seq_len*head_v_dim]`, `g`/`beta` `[n_heads*seq_len]`,
+/// `state` `[n_heads*head_qk_dim*head_v_dim]` read as incoming and overwritten
+/// with the post-sequence recurrent state. `chunk_len == 0` ⇒ 64.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_net_chunk_f32(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    state: &mut [f32],
+    out: &mut [f32],
+    n_heads: usize,
+    seq_len: usize,
+    head_qk_dim: usize,
+    head_v_dim: usize,
+    chunk_len: usize,
+) -> Result<(), CudaError> {
+    assert_eq!(q.len(), n_heads * seq_len * head_qk_dim);
+    assert_eq!(k.len(), n_heads * seq_len * head_qk_dim);
+    assert_eq!(v.len(), n_heads * seq_len * head_v_dim);
+    assert_eq!(g.len(), n_heads * seq_len);
+    assert_eq!(beta.len(), n_heads * seq_len);
+    assert_eq!(state.len(), n_heads * head_qk_dim * head_v_dim);
+    assert_eq!(out.len(), n_heads * seq_len * head_v_dim);
+    // SAFETY: slices outlive the call; lengths are checked above.
+    let rc = unsafe {
+        rsl_cuda_delta_net_chunk_f32(
+            q.as_ptr(),
+            k.as_ptr(),
+            v.as_ptr(),
+            g.as_ptr(),
+            beta.as_ptr(),
+            state.as_mut_ptr(),
+            out.as_mut_ptr(),
+            n_heads as c_int,
+            seq_len as c_int,
+            head_qk_dim as c_int,
+            head_v_dim as c_int,
+            chunk_len as c_int,
+        )
     };
     if rc == 0 {
         Ok(())

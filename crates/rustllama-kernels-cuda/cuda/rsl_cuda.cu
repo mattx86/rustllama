@@ -186,6 +186,213 @@ extern "C" int rsl_cuda_matvec_f32(const float *W, const float *x, float *out,
     return err == cudaSuccess ? 0 : -3;
 }
 
+// ---- P17: Gated-DeltaNet chunked-prefill recurrence (host-copy, f32) -------
+// WRITE-BLIND CUDA mirror of the SYCL `rsl_delta_net_chunk_f32_usm` + the CPU
+// reference `delta_rule_prefill_chunked_with_chunk`, batched over all V-heads.
+// Phase 1 builds every (head,chunk) plan in parallel (one thread per pair, state-
+// independent O(L²) operators); phase 2 threads the recurrent state serially
+// through the chunk boundaries (one thread per head). Numerically equivalent to
+// the per-token scan within f32 tolerance (≈1e-3). Validated vs the CPU chunked
+// reference by `doctor --cuda-parity ssm:delta_net` on the pod; dispatch is
+// verdict-gated + fail-closed. See the SYCL twin for the derivation + layouts.
+__global__ void delta_net_chunk_phase1_kernel(
+    const float *q, const float *k, const float *v, const float *g, const float *beta,
+    float *plans, int H, int T, int QK, int VD, int L0, int n_chunks) {
+    long long gid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)H * n_chunks;
+    if (gid >= total) return;
+    int hh = (int)(gid / n_chunks);
+    int cc = (int)(gid % n_chunks);
+    int start = cc * L0;
+    if (start >= T) return;
+    int len = min(start + L0, T) - start;
+
+    const float *qh = q + (size_t)hh * T * QK;
+    const float *kh = k + (size_t)hh * T * QK;
+    const float *vh = v + (size_t)hh * T * VD;
+    const float *gh = g + (size_t)hh * T;
+    const float *bh = beta + (size_t)hh * T;
+
+    size_t off_ulocal = (size_t)L0;
+    size_t off_w = off_ulocal + (size_t)L0 * VD;
+    size_t off_ointra = off_w + (size_t)L0 * QK;
+    size_t off_bw = off_ointra + (size_t)L0 * VD;
+    size_t off_qg = off_bw + (size_t)L0 * QK;
+    size_t off_kd = off_qg + (size_t)L0 * QK;
+    size_t off_lastdec = off_kd + (size_t)L0 * QK;
+    size_t plan_stride = off_lastdec + 1;
+
+    float *P = plans + ((size_t)hh * n_chunks + cc) * plan_stride;
+    float *cg = P; // off_cg == 0
+    float *u_local = P + off_ulocal;
+    float *w = P + off_w;
+    float *o_intra = P + off_ointra;
+    float *bw = P + off_bw;
+    float *qg = P + off_qg;
+    float *kd = P + off_kd;
+
+    float acc = 0.f;
+    for (int t = 0; t < len; ++t) { acc += gh[start + t]; cg[t] = acc; }
+    for (int t = 0; t < len; ++t) {
+        int gt = start + t; float bt = bh[gt];
+        for (int j = 0; j < VD; ++j) u_local[t*VD+j] = bt * vh[gt*VD+j];
+        float neg_bg = -bt * expf(cg[t]);
+        for (int i = 0; i < QK; ++i) w[t*QK+i] = neg_bg * kh[gt*QK+i];
+        for (int r = 0; r < t; ++r) {
+            int gr = start + r;
+            float kk = 0.f;
+            for (int i = 0; i < QK; ++i) kk += kh[gt*QK+i]*kh[gr*QK+i];
+            float coeff = bt * expf(cg[t]-cg[r]) * kk;
+            if (coeff != 0.f) {
+                for (int j = 0; j < VD; ++j) u_local[t*VD+j] -= coeff*u_local[r*VD+j];
+                for (int i = 0; i < QK; ++i) w[t*QK+i] -= coeff*w[r*QK+i];
+            }
+        }
+    }
+    for (int idx = 0; idx < len*VD; ++idx) o_intra[idx] = 0.f;
+    for (int idx = 0; idx < len*QK; ++idx) bw[idx] = 0.f;
+    for (int t = 0; t < len; ++t) {
+        int gt = start + t;
+        for (int r = 0; r <= t; ++r) {
+            int gr = start + r;
+            float kq = 0.f;
+            for (int i = 0; i < QK; ++i) kq += qh[gt*QK+i]*kh[gr*QK+i];
+            float b = expf(cg[t]-cg[r]) * kq;
+            if (b != 0.f) {
+                for (int j = 0; j < VD; ++j) o_intra[t*VD+j] += b*u_local[r*VD+j];
+                for (int i = 0; i < QK; ++i) bw[t*QK+i] += b*w[r*QK+i];
+            }
+        }
+    }
+    float cg_last = cg[len-1];
+    for (int t = 0; t < len; ++t) {
+        int gt = start + t;
+        float eg = expf(cg[t]);
+        float ekd = expf(cg_last - cg[t]);
+        for (int i = 0; i < QK; ++i) {
+            qg[t*QK+i] = eg * qh[gt*QK+i];
+            kd[t*QK+i] = ekd * kh[gt*QK+i];
+        }
+    }
+    P[off_lastdec] = expf(cg_last);
+}
+
+__global__ void delta_net_chunk_phase2_kernel(
+    float *state, float *out, const float *plans, float *fold,
+    int H, int T, int QK, int VD, int L0, int n_chunks) {
+    int hh = blockIdx.x * blockDim.x + threadIdx.x;
+    if (hh >= H) return;
+    size_t off_ulocal = (size_t)L0;
+    size_t off_w = off_ulocal + (size_t)L0 * VD;
+    size_t off_ointra = off_w + (size_t)L0 * QK;
+    size_t off_bw = off_ointra + (size_t)L0 * VD;
+    size_t off_qg = off_bw + (size_t)L0 * QK;
+    size_t off_kd = off_qg + (size_t)L0 * QK;
+    size_t off_lastdec = off_kd + (size_t)L0 * QK;
+    size_t plan_stride = off_lastdec + 1;
+    size_t fold_stride = (size_t)L0 * VD + 3u * (size_t)VD;
+
+    float *state_h = state + (size_t)hh * QK * VD;
+    float *out_h = out + (size_t)hh * T * VD;
+    float *F = fold + (size_t)hh * fold_stride;
+    float *u = F;
+    float *ws = F + (size_t)L0 * VD;
+    float *oiv = ws + VD;
+    float *ocv = oiv + VD;
+
+    for (int cc = 0; cc < n_chunks; ++cc) {
+        int start = cc * L0;
+        if (start >= T) break;
+        int len = min(start + L0, T) - start;
+        const float *P = plans + ((size_t)hh * n_chunks + cc) * plan_stride;
+        const float *u_local = P + off_ulocal;
+        const float *w = P + off_w;
+        const float *o_intra = P + off_ointra;
+        const float *bw = P + off_bw;
+        const float *qg = P + off_qg;
+        const float *kd = P + off_kd;
+        for (int t = 0; t < len; ++t) {
+            for (int j = 0; j < VD; ++j) { ws[j]=0.f; oiv[j]=0.f; ocv[j]=0.f; }
+            for (int i = 0; i < QK; ++i) {
+                float wi = w[t*QK+i], qi = qg[t*QK+i], bi = bw[t*QK+i];
+                const float *srow = state_h + (size_t)i*VD;
+                for (int j = 0; j < VD; ++j) {
+                    float sv = srow[j];
+                    ws[j] += wi*sv; oiv[j] += qi*sv; ocv[j] += bi*sv;
+                }
+            }
+            for (int j = 0; j < VD; ++j) {
+                float uj = u_local[t*VD+j] + ws[j];
+                u[t*VD+j] = uj;
+                out_h[(size_t)(start+t)*VD+j] = o_intra[t*VD+j] + ocv[j] + oiv[j];
+            }
+        }
+        float decay = P[off_lastdec];
+        for (int idx = 0; idx < QK*VD; ++idx) state_h[idx] *= decay;
+        for (int t = 0; t < len; ++t) {
+            for (int i = 0; i < QK; ++i) {
+                float ki = kd[t*QK+i];
+                if (ki != 0.f) {
+                    float *srow = state_h + (size_t)i*VD;
+                    for (int j = 0; j < VD; ++j) srow[j] += ki * u[t*VD+j];
+                }
+            }
+        }
+    }
+}
+
+extern "C" int rsl_cuda_delta_net_chunk_f32(
+    const float *q, const float *k, const float *v, const float *g, const float *beta,
+    float *state, float *out, int n_heads, int seq_len, int head_qk_dim,
+    int head_v_dim, int chunk_len) {
+    if (n_heads <= 0 || seq_len <= 0 || head_qk_dim <= 0 || head_v_dim <= 0) return -1;
+    int H = n_heads, T = seq_len, QK = head_qk_dim, VD = head_v_dim;
+    int L0 = (chunk_len <= 0) ? 64 : chunk_len;
+    int n_chunks = (T + L0 - 1) / L0;
+
+    size_t plan_stride = (size_t)L0 + 2u*(size_t)L0*VD + 4u*(size_t)L0*QK + 1u;
+    size_t fold_stride = (size_t)L0*VD + 3u*(size_t)VD;
+    size_t nq = (size_t)H*T*QK, nv = (size_t)H*T*VD, ng = (size_t)H*T, ns = (size_t)H*QK*VD;
+    size_t nplans = (size_t)H*n_chunks*plan_stride, nfold = (size_t)H*fold_stride;
+
+    float *dq=nullptr,*dk=nullptr,*dv=nullptr,*dg=nullptr,*db=nullptr,*ds=nullptr,
+          *dout=nullptr,*dplans=nullptr,*dfold=nullptr;
+    #define RSL_DN_FREE() do { \
+        if (dq) cudaFree(dq); if (dk) cudaFree(dk); if (dv) cudaFree(dv); \
+        if (dg) cudaFree(dg); if (db) cudaFree(db); if (ds) cudaFree(ds); \
+        if (dout) cudaFree(dout); if (dplans) cudaFree(dplans); if (dfold) cudaFree(dfold); \
+    } while (0)
+    if (cudaMalloc(&dq, nq*sizeof(float)) != cudaSuccess) { RSL_DN_FREE(); return -2; }
+    if (cudaMalloc(&dk, nq*sizeof(float)) != cudaSuccess) { RSL_DN_FREE(); return -2; }
+    if (cudaMalloc(&dv, nv*sizeof(float)) != cudaSuccess) { RSL_DN_FREE(); return -2; }
+    if (cudaMalloc(&dg, ng*sizeof(float)) != cudaSuccess) { RSL_DN_FREE(); return -2; }
+    if (cudaMalloc(&db, ng*sizeof(float)) != cudaSuccess) { RSL_DN_FREE(); return -2; }
+    if (cudaMalloc(&ds, ns*sizeof(float)) != cudaSuccess) { RSL_DN_FREE(); return -2; }
+    if (cudaMalloc(&dout, nv*sizeof(float)) != cudaSuccess) { RSL_DN_FREE(); return -2; }
+    if (cudaMalloc(&dplans, nplans*sizeof(float)) != cudaSuccess) { RSL_DN_FREE(); return -2; }
+    if (cudaMalloc(&dfold, nfold*sizeof(float)) != cudaSuccess) { RSL_DN_FREE(); return -2; }
+    cudaMemcpy(dq, q, nq*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dk, k, nq*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dv, v, nv*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dg, g, ng*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(db, beta, ng*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(ds, state, ns*sizeof(float), cudaMemcpyHostToDevice);
+    long long p1 = (long long)H * n_chunks;
+    int threads = 64;
+    int grid1 = (int)((p1 + threads - 1) / threads);
+    delta_net_chunk_phase1_kernel<<<grid1, threads>>>(dq,dk,dv,dg,db, dplans, H,T,QK,VD,L0,n_chunks);
+    int grid2 = (H + threads - 1) / threads;
+    delta_net_chunk_phase2_kernel<<<grid2, threads>>>(ds, dout, dplans, dfold, H,T,QK,VD,L0,n_chunks);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err == cudaSuccess) {
+        cudaMemcpy(out, dout, nv*sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(state, ds, ns*sizeof(float), cudaMemcpyDeviceToHost);
+    }
+    RSL_DN_FREE();
+    #undef RSL_DN_FREE
+    return err == cudaSuccess ? 0 : -3;
+}
+
 // ============================================================
 // Device-resident path: stream + device buffers + packed kernels
 // ============================================================

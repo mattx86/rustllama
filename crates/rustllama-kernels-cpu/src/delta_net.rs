@@ -217,6 +217,16 @@ pub fn l2norm_f32_inplace(x: &mut [f32], eps: f32) {
             return;
         }
     }
+    // AArch64 NEON (baseline on every aarch64 CPU — no runtime detect, matching
+    // the crate's other NEON ports for the DGX Spark / Grace Blackwell target).
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is always available on aarch64; lengths are not asserted
+        // here (the function handles any `x.len()` with a scalar tail).
+        unsafe { l2norm_f32_inplace_neon(x, eps) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     l2norm_f32_inplace_scalar(x, eps);
 }
 
@@ -317,6 +327,46 @@ unsafe fn l2norm_f32_inplace_avx512f(x: &mut [f32], eps: f32) {
     }
 }
 
+/// AArch64 NEON L2 normalize in place. 4-wide sum-of-squares (FMA) +
+/// broadcast scale; scalar tail. Mirrors [`l2norm_f32_inplace_avx2`]; the
+/// 4-lane horizontal reduce (`vaddvq_f32`) differs from the scalar sequential
+/// sum by a few ulp (well under the 1e-5 the SIMD-vs-scalar test allows).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn l2norm_f32_inplace_neon(x: &mut [f32], eps: f32) {
+    use std::arch::aarch64::*;
+    let n = x.len();
+    let n4 = n & !3;
+    let xp = x.as_mut_ptr();
+
+    let mut acc = vdupq_n_f32(0.0);
+    let mut p = 0;
+    while p < n4 {
+        let v = vld1q_f32(xp.add(p));
+        acc = vfmaq_f32(acc, v, v);
+        p += 4;
+    }
+    let mut sum_sq = vaddvq_f32(acc);
+    while p < n {
+        let v = *xp.add(p);
+        sum_sq += v * v;
+        p += 1;
+    }
+
+    let inv = (sum_sq + eps).sqrt().recip();
+    let inv_b = vdupq_n_f32(inv);
+    let mut p = 0;
+    while p < n4 {
+        let v = vld1q_f32(xp.add(p));
+        vst1q_f32(xp.add(p), vmulq_f32(v, inv_b));
+        p += 4;
+    }
+    while p < n {
+        *xp.add(p) *= inv;
+        p += 1;
+    }
+}
+
 /// Alloc-per-call wrapper around
 /// [`delta_rule_step_f32_with_scratch`] — kept for tests and one-shot
 /// callers. Hot paths (the hybrid decode/prefill loops, which run
@@ -391,6 +441,21 @@ pub fn delta_rule_step_f32_with_scratch(
             return;
         }
     }
+    // AArch64 NEON (baseline on every aarch64 CPU — no runtime detect). The
+    // DGX Spark / Grace Blackwell decode path for the hybrid DeltaNet recurrence
+    // (the measured hybrid tok/s ceiling); mirrors the AVX2 body 4-wide with the
+    // identical `i`-outer reduction order (so ≈1e-4 vs the scalar reference).
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is always available on aarch64; lengths asserted above.
+        unsafe {
+            delta_rule_step_f32_with_scratch_neon(
+                q, k, v, g, beta, state, out, head_qk_dim, head_v_dim, v_tilde,
+            )
+        };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     delta_rule_step_f32_with_scratch_scalar(
         q, k, v, g, beta, state, out, head_qk_dim, head_v_dim, v_tilde,
     );
@@ -749,6 +814,157 @@ unsafe fn delta_rule_step_f32_with_scratch_avx512(
             let rv = _mm512_loadu_ps(row.add(j));
             _mm512_storeu_ps(op.add(j), _mm512_fmadd_ps(rv, q_b, acc));
             j += 16;
+        }
+        while j < vd {
+            *op.add(j) += q_i * *row.add(j);
+            j += 1;
+        }
+    }
+}
+
+/// AArch64 NEON (f32×4 + FMA) DeltaNet recurrence step. The DGX Spark /
+/// Grace Blackwell port of the hybrid DeltaNet recurrence — the measured
+/// hybrid tok/s ceiling on the CPU path. Same algorithm and the identical
+/// `i`-outer reduction order as [`delta_rule_step_f32_with_scratch_avx2`],
+/// 4-wide inner bodies with a scalar tail; only the fused multiply-add differs
+/// from the scalar reference (≈1 ulp), so it tracks scalar to well within
+/// 1e-4. `vfmaq_f32(a, b, c)` computes `a + b*c`, matching the AVX2
+/// `_mm256_fmadd_ps` operand order at each site.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn delta_rule_step_f32_with_scratch_neon(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: f32,
+    beta: f32,
+    state: &mut [f32],
+    out: &mut [f32],
+    head_qk_dim: usize,
+    head_v_dim: usize,
+    v_tilde: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+    let vd = head_v_dim;
+    let vd4 = vd & !3;
+    let decay = g.exp();
+    let sp = state.as_mut_ptr();
+    let vtp = v_tilde.as_mut_ptr();
+
+    // 1. State decay over the flat [head_qk_dim * head_v_dim] buffer.
+    {
+        let total = head_qk_dim * vd;
+        let t4 = total & !3;
+        let decay_b = vdupq_n_f32(decay);
+        let mut p = 0;
+        while p < t4 {
+            let s = vld1q_f32(sp.add(p));
+            vst1q_f32(sp.add(p), vmulq_f32(s, decay_b));
+            p += 4;
+        }
+        while p < total {
+            *sp.add(p) *= decay;
+            p += 1;
+        }
+    }
+
+    // 2. v_tilde = S^T @ k (i outer to preserve the scalar reduction order).
+    {
+        let mut j = 0;
+        while j < vd4 {
+            vst1q_f32(vtp.add(j), vdupq_n_f32(0.0));
+            j += 4;
+        }
+        while j < vd {
+            *vtp.add(j) = 0.0;
+            j += 1;
+        }
+    }
+    for i in 0..head_qk_dim {
+        let k_i = *k.get_unchecked(i);
+        if k_i == 0.0 {
+            continue;
+        }
+        let k_b = vdupq_n_f32(k_i);
+        let row = sp.add(i * vd);
+        let mut j = 0;
+        while j < vd4 {
+            let acc = vld1q_f32(vtp.add(j));
+            let rv = vld1q_f32(row.add(j));
+            vst1q_f32(vtp.add(j), vfmaq_f32(acc, rv, k_b));
+            j += 4;
+        }
+        while j < vd {
+            *vtp.add(j) += *row.add(j) * k_i;
+            j += 1;
+        }
+    }
+    // v_tilde = (v - v_tilde) * beta.
+    {
+        let vp = v.as_ptr();
+        let beta_b = vdupq_n_f32(beta);
+        let mut j = 0;
+        while j < vd4 {
+            let vv = vld1q_f32(vp.add(j));
+            let tv = vld1q_f32(vtp.add(j));
+            vst1q_f32(vtp.add(j), vmulq_f32(vsubq_f32(vv, tv), beta_b));
+            j += 4;
+        }
+        while j < vd {
+            *vtp.add(j) = (*vp.add(j) - *vtp.add(j)) * beta;
+            j += 1;
+        }
+    }
+
+    // 3. Rank-1 update S[i, j] += k[i] * v_tilde[j].
+    for i in 0..head_qk_dim {
+        let k_i = *k.get_unchecked(i);
+        if k_i == 0.0 {
+            continue;
+        }
+        let k_b = vdupq_n_f32(k_i);
+        let row = sp.add(i * vd);
+        let mut j = 0;
+        while j < vd4 {
+            let sv = vld1q_f32(row.add(j));
+            let tv = vld1q_f32(vtp.add(j));
+            vst1q_f32(row.add(j), vfmaq_f32(sv, k_b, tv));
+            j += 4;
+        }
+        while j < vd {
+            *row.add(j) += k_i * *vtp.add(j);
+            j += 1;
+        }
+    }
+
+    // 4. Output out[j] = sum_i q[i] * S[i, j], i outer (reduction order
+    //    preserved).
+    let op = out.as_mut_ptr();
+    {
+        let mut j = 0;
+        while j < vd4 {
+            vst1q_f32(op.add(j), vdupq_n_f32(0.0));
+            j += 4;
+        }
+        while j < vd {
+            *op.add(j) = 0.0;
+            j += 1;
+        }
+    }
+    for i in 0..head_qk_dim {
+        let q_i = *q.get_unchecked(i);
+        if q_i == 0.0 {
+            continue;
+        }
+        let q_b = vdupq_n_f32(q_i);
+        let row = sp.add(i * vd);
+        let mut j = 0;
+        while j < vd4 {
+            let acc = vld1q_f32(op.add(j));
+            let rv = vld1q_f32(row.add(j));
+            vst1q_f32(op.add(j), vfmaq_f32(acc, rv, q_b));
+            j += 4;
         }
         while j < vd {
             *op.add(j) += q_i * *row.add(j);
@@ -1884,6 +2100,66 @@ mod tests {
                 for (a, b) in st_ref.iter().zip(st_s.iter()) {
                     assert!((a - b).abs() < 1e-4, "avx512 state qd={qd} vd={vd}");
                 }
+            }
+        }
+    }
+
+    /// Direct AArch64 NEON vs scalar for the DeltaNet recurrence step
+    /// (the hybrid tok/s-ceiling kernel). Mirrors `delta_rule_avx2_matches_scalar`
+    /// — compiled + run only on aarch64 (NEON is baseline there), validated under
+    /// QEMU like the crate's other NEON forward-pass ports. On x86 the NEON body
+    /// is `cfg`-compiled-out, so correctness there rests on the identical `i`-outer
+    /// structure shared with the AVX2 path (which this test's x86 twin covers).
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn delta_rule_neon_matches_scalar() {
+        for &(qd, vd) in &[(3usize, 5usize), (8, 8), (17, 131), (128, 128)] {
+            let mut st_ref = vec![0.0f32; qd * vd];
+            let mut st_s = vec![0.0f32; qd * vd];
+            let mut vt = vec![0.0f32; vd];
+            let mut o_ref = vec![0.0f32; vd];
+            let mut o_s = vec![0.0f32; vd];
+            for t in 0..4u32 {
+                let base = (qd + vd) as u32 * 131 + t * 701;
+                let q = rvec(qd, base + 1);
+                let k = rvec(qd, base + 2);
+                let v = rvec(vd, base + 3);
+                let g = rvec(1, base + 4)[0];
+                let beta = 0.6;
+                delta_rule_step_f32_with_scratch_scalar(
+                    &q, &k, &v, g, beta, &mut st_ref, &mut o_ref, qd, vd, &mut vt,
+                );
+                // SAFETY: NEON is baseline on aarch64; lengths match above.
+                unsafe {
+                    delta_rule_step_f32_with_scratch_neon(
+                        &q, &k, &v, g, beta, &mut st_s, &mut o_s, qd, vd, &mut vt,
+                    );
+                }
+                for j in 0..vd {
+                    assert!((o_ref[j] - o_s[j]).abs() < 1e-4, "neon out qd={qd} vd={vd} j={j}");
+                }
+                for (a, b) in st_ref.iter().zip(st_s.iter()) {
+                    assert!((a - b).abs() < 1e-4, "neon state qd={qd} vd={vd}");
+                }
+            }
+        }
+    }
+
+    /// Direct AArch64 NEON vs scalar for the per-head L2 norm (aarch64-only,
+    /// QEMU-validated). The dispatched `l2norm_simd_matches_scalar` also exercises
+    /// this on aarch64; this pins the NEON body specifically.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn l2norm_neon_matches_scalar() {
+        for &d in &[1usize, 3, 7, 8, 9, 16, 17, 128, 129] {
+            let x = rvec(d, d as u32 * 31 + 5);
+            let mut a = x.clone();
+            let mut b = x.clone();
+            // SAFETY: NEON is baseline on aarch64.
+            unsafe { l2norm_f32_inplace_neon(&mut a, 1e-6) };
+            l2norm_f32_inplace_scalar(&mut b, 1e-6);
+            for (i, (av, bv)) in a.iter().zip(b.iter()).enumerate() {
+                assert!((av - bv).abs() < 1e-5, "l2norm neon d={d} i={i}: neon={av} scalar={bv}");
             }
         }
     }

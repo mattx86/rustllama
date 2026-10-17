@@ -320,6 +320,17 @@ pub const VERDICT_KV_USM: &str = "kv:usm";
 /// dequant parity probe through `SyclIqEncoder`) → fail-closed OFF.
 pub const VERDICT_DEQUANT_GPU: &str = "dequant:gpu";
 
+/// P17: GPU DeltaNet chunked-prefill recurrence (the hybrid-model tok/s ceiling).
+/// A parity-AND-perf verdict: `tune --validate-kernels` grades the SYCL (and,
+/// write-blind, the CUDA/MLX) `delta_net_chunk` kernel against the CPU
+/// `delta_net.rs` chunked reference on identical inputs (tolerance ≈1e-3, the
+/// recurrence reduction-order budget) AND perf-gates it (the chunked GPU scan is
+/// an alternative to the SIMD/rayon CPU path, so it auto-enables only where it
+/// matches AND is faster). Backs `accel::delta_net_chunk_sycl_enabled` (+ the
+/// CUDA/MLX twins); fail-closed: absent / `false` ⇒ the hybrid DeltaNet forward
+/// stays byte-identical on the CPU path. No env gate.
+pub const VERDICT_SSM_DELTA_NET: &str = "ssm:delta_net";
+
 /// Read the on-device verdict for a kernel probe name, if one has been
 /// recorded. `None` = never validated (or the probe SKIPped because the
 /// device lacks the capability) — callers treat that as "off".

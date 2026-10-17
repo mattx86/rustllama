@@ -144,6 +144,7 @@ EXPORTS
     rsl_rope_usm
     rsl_silu_mul_usm
     rsl_silu_mul_f32_usm
+    rsl_delta_net_chunk_f32_usm
     rsl_embedding_lookup_usm
     rsl_kv_quantize_q8_0_store_usm
     rsl_encode_q6_k_blocks_usm

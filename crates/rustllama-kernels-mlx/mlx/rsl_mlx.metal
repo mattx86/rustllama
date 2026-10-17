@@ -3347,3 +3347,183 @@ kernel void rsl_mlx_flash_attn_prefill_tq_kernel(
     for (int i = (int)lane; i < head_dim; i += (int)lane_count)
         out[q_off + i] = tg_acc[i] * inv_l;
 }
+
+// ======================================================================
+// P17: Gated-DeltaNet chunked-prefill recurrence (the hybrid-model tok/s
+// ceiling). WRITE-BLIND Metal mirror of the SYCL/CUDA `delta_net_chunk`
+// kernels + the CPU `delta_rule_prefill_chunked_with_chunk` reference,
+// batched over all V-heads. ONE thread per work item (NOT a 32-lane
+// simd_sum group): phase 1 = one thread per (head, chunk) building the
+// state-independent O(L²) plan; phase 2 = one thread per head threading the
+// recurrent state serially through the chunk boundaries. Scratch (plans,
+// fold) are device buffers sized by the host shim. Numerically equivalent to
+// the per-token scan within f32 tolerance (~1e-3); validated vs the CPU
+// chunked reference by `doctor --metal-parity ssm:delta_net` on the Mac.
+// ======================================================================
+kernel void rsl_mlx_delta_net_chunk_phase1_kernel(
+    device const float *q      [[buffer(0)]],
+    device const float *k      [[buffer(1)]],
+    device const float *v      [[buffer(2)]],
+    device const float *g      [[buffer(3)]],
+    device const float *beta   [[buffer(4)]],
+    device       float *plans  [[buffer(5)]],
+    constant int &H            [[buffer(6)]],
+    constant int &T            [[buffer(7)]],
+    constant int &QK           [[buffer(8)]],
+    constant int &VD           [[buffer(9)]],
+    constant int &L0           [[buffer(10)]],
+    constant int &n_chunks     [[buffer(11)]],
+    uint gid                   [[thread_position_in_grid]])
+{
+    const ulong total = (ulong)H * (ulong)n_chunks;
+    if ((ulong)gid >= total) return;
+    const int hh = (int)((ulong)gid / (ulong)n_chunks);
+    const int cc = (int)((ulong)gid % (ulong)n_chunks);
+    const int start = cc * L0;
+    if (start >= T) return;
+    const int len = min(start + L0, T) - start;
+
+    device const float *qh = q + (ulong)hh * T * QK;
+    device const float *kh = k + (ulong)hh * T * QK;
+    device const float *vh = v + (ulong)hh * T * VD;
+    device const float *gh = g + (ulong)hh * T;
+    device const float *bh = beta + (ulong)hh * T;
+
+    const ulong off_ulocal  = (ulong)L0;
+    const ulong off_w       = off_ulocal + (ulong)L0 * VD;
+    const ulong off_ointra  = off_w + (ulong)L0 * QK;
+    const ulong off_bw      = off_ointra + (ulong)L0 * VD;
+    const ulong off_qg      = off_bw + (ulong)L0 * QK;
+    const ulong off_kd      = off_qg + (ulong)L0 * QK;
+    const ulong off_lastdec = off_kd + (ulong)L0 * QK;
+    const ulong plan_stride = off_lastdec + 1;
+
+    device float *P        = plans + ((ulong)hh * n_chunks + cc) * plan_stride;
+    device float *cg       = P;
+    device float *u_local  = P + off_ulocal;
+    device float *w        = P + off_w;
+    device float *o_intra  = P + off_ointra;
+    device float *bw       = P + off_bw;
+    device float *qg       = P + off_qg;
+    device float *kd       = P + off_kd;
+
+    float acc = 0.0f;
+    for (int t = 0; t < len; ++t) { acc += gh[start + t]; cg[t] = acc; }
+    for (int t = 0; t < len; ++t) {
+        const int gt = start + t; const float bt = bh[gt];
+        for (int j = 0; j < VD; ++j) u_local[t*VD+j] = bt * vh[gt*VD+j];
+        const float neg_bg = -bt * exp(cg[t]);
+        for (int i = 0; i < QK; ++i) w[t*QK+i] = neg_bg * kh[gt*QK+i];
+        for (int r = 0; r < t; ++r) {
+            const int gr = start + r;
+            float kk = 0.0f;
+            for (int i = 0; i < QK; ++i) kk += kh[gt*QK+i] * kh[gr*QK+i];
+            const float coeff = bt * exp(cg[t]-cg[r]) * kk;
+            if (coeff != 0.0f) {
+                for (int j = 0; j < VD; ++j) u_local[t*VD+j] -= coeff * u_local[r*VD+j];
+                for (int i = 0; i < QK; ++i) w[t*QK+i] -= coeff * w[r*QK+i];
+            }
+        }
+    }
+    for (int idx = 0; idx < len*VD; ++idx) o_intra[idx] = 0.0f;
+    for (int idx = 0; idx < len*QK; ++idx) bw[idx] = 0.0f;
+    for (int t = 0; t < len; ++t) {
+        const int gt = start + t;
+        for (int r = 0; r <= t; ++r) {
+            const int gr = start + r;
+            float kq = 0.0f;
+            for (int i = 0; i < QK; ++i) kq += qh[gt*QK+i] * kh[gr*QK+i];
+            const float b = exp(cg[t]-cg[r]) * kq;
+            if (b != 0.0f) {
+                for (int j = 0; j < VD; ++j) o_intra[t*VD+j] += b * u_local[r*VD+j];
+                for (int i = 0; i < QK; ++i) bw[t*QK+i] += b * w[r*QK+i];
+            }
+        }
+    }
+    const float cg_last = cg[len-1];
+    for (int t = 0; t < len; ++t) {
+        const int gt = start + t;
+        const float eg = exp(cg[t]);
+        const float ekd = exp(cg_last - cg[t]);
+        for (int i = 0; i < QK; ++i) {
+            qg[t*QK+i] = eg * qh[gt*QK+i];
+            kd[t*QK+i] = ekd * kh[gt*QK+i];
+        }
+    }
+    P[off_lastdec] = exp(cg_last);
+}
+
+kernel void rsl_mlx_delta_net_chunk_phase2_kernel(
+    device       float *state  [[buffer(0)]],
+    device       float *out    [[buffer(1)]],
+    device const float *plans  [[buffer(2)]],
+    device       float *fold   [[buffer(3)]],
+    constant int &H            [[buffer(4)]],
+    constant int &T            [[buffer(5)]],
+    constant int &QK           [[buffer(6)]],
+    constant int &VD           [[buffer(7)]],
+    constant int &L0           [[buffer(8)]],
+    constant int &n_chunks     [[buffer(9)]],
+    uint gid                   [[thread_position_in_grid]])
+{
+    const int hh = (int)gid;
+    if (hh >= H) return;
+
+    const ulong off_ulocal  = (ulong)L0;
+    const ulong off_w       = off_ulocal + (ulong)L0 * VD;
+    const ulong off_ointra  = off_w + (ulong)L0 * QK;
+    const ulong off_bw      = off_ointra + (ulong)L0 * VD;
+    const ulong off_qg      = off_bw + (ulong)L0 * QK;
+    const ulong off_kd      = off_qg + (ulong)L0 * QK;
+    const ulong off_lastdec = off_kd + (ulong)L0 * QK;
+    const ulong plan_stride = off_lastdec + 1;
+    const ulong fold_stride = (ulong)L0 * VD + 3u * (ulong)VD;
+
+    device float *state_h = state + (ulong)hh * QK * VD;
+    device float *out_h   = out + (ulong)hh * T * VD;
+    device float *F       = fold + (ulong)hh * fold_stride;
+    device float *u       = F;
+    device float *ws      = F + (ulong)L0 * VD;
+    device float *oiv     = ws + VD;
+    device float *ocv     = oiv + VD;
+
+    for (int cc = 0; cc < n_chunks; ++cc) {
+        const int start = cc * L0;
+        if (start >= T) break;
+        const int len = min(start + L0, T) - start;
+        device const float *P        = plans + ((ulong)hh * n_chunks + cc) * plan_stride;
+        device const float *u_local  = P + off_ulocal;
+        device const float *w        = P + off_w;
+        device const float *o_intra  = P + off_ointra;
+        device const float *bw       = P + off_bw;
+        device const float *qg       = P + off_qg;
+        device const float *kd       = P + off_kd;
+        for (int t = 0; t < len; ++t) {
+            for (int j = 0; j < VD; ++j) { ws[j]=0.0f; oiv[j]=0.0f; ocv[j]=0.0f; }
+            for (int i = 0; i < QK; ++i) {
+                const float wi = w[t*QK+i], qi = qg[t*QK+i], bi = bw[t*QK+i];
+                device const float *srow = state_h + (ulong)i*VD;
+                for (int j = 0; j < VD; ++j) {
+                    const float sv = srow[j];
+                    ws[j] += wi*sv; oiv[j] += qi*sv; ocv[j] += bi*sv;
+                }
+            }
+            for (int j = 0; j < VD; ++j) {
+                const float uj = u_local[t*VD+j] + ws[j];
+                u[t*VD+j] = uj;
+                out_h[(ulong)(start+t)*VD+j] = o_intra[t*VD+j] + ocv[j] + oiv[j];
+            }
+        }
+        const float decay = P[off_lastdec];
+        for (int idx = 0; idx < QK*VD; ++idx) state_h[idx] *= decay;
+        for (int t = 0; t < len; ++t) {
+            for (int i = 0; i < QK; ++i) {
+                const float ki = kd[t*QK+i];
+                if (ki != 0.0f) {
+                    device float *srow = state_h + (ulong)i*VD;
+                    for (int j = 0; j < VD; ++j) srow[j] += ki * u[t*VD+j];
+                }
+            }
+        }
+    }
+}

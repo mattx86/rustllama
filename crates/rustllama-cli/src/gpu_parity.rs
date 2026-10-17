@@ -422,6 +422,10 @@ fn probe_names() -> Vec<String> {
     v.push("fused:add_rmsnorm_f32".to_string());
     v.push("fused:rmsnorm_f32".to_string());
     v.push("fused:silu_mul_f32".to_string());
+    // P17: GPU Gated-DeltaNet chunked-prefill recurrence (the hybrid-model tok/s
+    // ceiling) vs the CPU chunked reference. f32 end to end; banked before the
+    // matvec families like the other small f32 USM kernels.
+    v.push("ssm:delta_net".to_string());
     for l in LAYOUTS {
         v.push(format!("matvec:{}", l.name));
     }
@@ -791,6 +795,8 @@ pub fn run_probe(name: &str) -> anyhow::Result<()> {
         },
         "attn" => probe_attn(&stream, name, rest, started),
         "xmx" => probe_xmx(&stream, name, started),
+        // P17: GPU DeltaNet chunked-prefill recurrence.
+        "ssm" => probe_delta_net(&stream, name, rest, started),
         _ => anyhow::bail!("unknown probe kind {kind}"),
     }
     Ok(())
@@ -1328,6 +1334,116 @@ fn probe_silu_mul_f32(stream: &sk::SyclStream, name: &str, started: Instant) {
         Ok(()) => {
             let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
             let verdict = if cos > 0.9999 && max_rel < 0.01 {
+                "OK"
+            } else {
+                "MISCOMPUTE"
+            };
+            emit(
+                name,
+                verdict,
+                &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"),
+            );
+        }
+    }
+}
+
+/// P17: parity for the GPU Gated-DeltaNet chunked-prefill kernel
+/// (`rsl_delta_net_chunk_f32_usm`) vs the CPU chunked reference
+/// (`delta_rule_prefill_chunked_with_chunk`) at the same chunk length, batched
+/// over all V-heads. Grades BOTH the per-token outputs and the final recurrent
+/// state (the recurrence carries state across chunks, so a boundary bug shows in
+/// the state even when the early tokens look right). f32 end to end; the chunked
+/// scan is tolerance-equal to the per-token recurrence (≈1e-3).
+fn probe_delta_net(stream: &sk::SyclStream, name: &str, _rest: &str, started: Instant) {
+    const H: usize = 4; // V-heads
+    const T: usize = 40; // sequence length (spans several chunks)
+    const QK: usize = 16; // head_qk_dim
+    const VD: usize = 24; // head_v_dim
+    const L0: usize = 8; // chunk length
+
+    // Head-major packed inputs, identical for CPU and GPU. q/k are L2-normed per
+    // token (as the real call site does before packing); g ≤ 0; beta ∈ (0.1,0.9).
+    let mut q = gen_x(H * T * QK, 71);
+    let mut kk = gen_x(H * T * QK, 72);
+    let v = gen_x(H * T * VD, 73);
+    for row in 0..H * T {
+        k::delta_net::l2norm_f32_inplace(&mut q[row * QK..(row + 1) * QK], 1e-6);
+        k::delta_net::l2norm_f32_inplace(&mut kk[row * QK..(row + 1) * QK], 1e-6);
+    }
+    let graw = gen_x(H * T, 74);
+    let braw = gen_x(H * T, 75);
+    let g: Vec<f32> = graw.iter().map(|x| -0.05 - 0.25 * x.abs()).collect();
+    let beta: Vec<f32> = braw.iter().map(|x| 0.1 + 0.8 * x.abs()).collect();
+
+    // CPU reference, per head, state starting at zero.
+    let mut cpu_out = vec![0f32; H * T * VD];
+    let mut cpu_state = vec![0f32; H * QK * VD];
+    for h in 0..H {
+        k::delta_net::delta_rule_prefill_chunked_with_chunk(
+            &q[h * T * QK..(h + 1) * T * QK],
+            &kk[h * T * QK..(h + 1) * T * QK],
+            &v[h * T * VD..(h + 1) * T * VD],
+            &g[h * T..(h + 1) * T],
+            &beta[h * T..(h + 1) * T],
+            &mut cpu_state[h * QK * VD..(h + 1) * QK * VD],
+            &mut cpu_out[h * T * VD..(h + 1) * T * VD],
+            T,
+            QK,
+            VD,
+            L0,
+        );
+    }
+
+    // GPU: seven USM buffers, run the kernel, read out + state back.
+    let bufs = (
+        sk::SyclSharedBuffer::<f32>::alloc(stream, H * T * QK),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, H * T * QK),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, H * T * VD),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, H * T),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, H * T),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, H * QK * VD),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, H * T * VD),
+    );
+    let (mut qb, mut kb, mut vb, mut gb, mut bb, mut sb, mut ob) = match bufs {
+        (Ok(a), Ok(b), Ok(c), Ok(d), Ok(e), Ok(f), Ok(gg)) => (a, b, c, d, e, f, gg),
+        _ => {
+            emit(name, "KERNEL_ERR", "usm-alloc-failed");
+            return;
+        }
+    };
+    qb.as_mut_slice().copy_from_slice(&q);
+    kb.as_mut_slice().copy_from_slice(&kk);
+    vb.as_mut_slice().copy_from_slice(&v);
+    gb.as_mut_slice().copy_from_slice(&g);
+    bb.as_mut_slice().copy_from_slice(&beta);
+    sb.as_mut_slice().fill(0.0); // state starts at zero
+    ob.as_mut_slice().fill(f32::NAN);
+    // SAFETY: seven USM allocations on `stream`, sized above; kernel waits.
+    let res = unsafe {
+        sk::delta_net_chunk_f32_usm_raw(
+            stream,
+            qb.as_ptr(),
+            kb.as_ptr(),
+            vb.as_ptr(),
+            gb.as_ptr(),
+            bb.as_ptr(),
+            sb.as_mut_ptr(),
+            ob.as_mut_ptr(),
+            H as u32,
+            T as u32,
+            QK as u32,
+            VD as u32,
+            L0 as u32,
+        )
+    };
+    let ms = started.elapsed().as_millis();
+    match res {
+        Err(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
+        Ok(()) => {
+            let (co, ro) = compare(ob.as_slice(), &cpu_out);
+            let (cs, rs) = compare(sb.as_slice(), &cpu_state);
+            let (cos, max_rel) = (co.min(cs), ro.max(rs));
+            let verdict = if cos > 0.999 && max_rel < 0.02 {
                 "OK"
             } else {
                 "MISCOMPUTE"
@@ -4563,6 +4679,62 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- P17: Gated-DeltaNet chunked-prefill recurrence (write-blind) ----
+    // Same construction as the SYCL `ssm:delta_net` probe: head-major packed
+    // inputs (q/k L2-normed per token), CPU chunked reference per head, graded
+    // against the CUDA kernel's per-token output AND the final recurrent state
+    // (concatenated). Validated on the pod; the dispatch gate reads this verdict.
+    {
+        const H: usize = 4;
+        const T: usize = 40;
+        const QK: usize = 16;
+        const VD: usize = 24;
+        const L0: usize = 8;
+        let mut q = gen_x(H * T * QK, 71);
+        let mut kk = gen_x(H * T * QK, 72);
+        let v = gen_x(H * T * VD, 73);
+        for row in 0..H * T {
+            k::delta_net::l2norm_f32_inplace(&mut q[row * QK..(row + 1) * QK], 1e-6);
+            k::delta_net::l2norm_f32_inplace(&mut kk[row * QK..(row + 1) * QK], 1e-6);
+        }
+        let g: Vec<f32> = gen_x(H * T, 74).iter().map(|x| -0.05 - 0.25 * x.abs()).collect();
+        let beta: Vec<f32> = gen_x(H * T, 75).iter().map(|x| 0.1 + 0.8 * x.abs()).collect();
+        let mut cpu_out = vec![0f32; H * T * VD];
+        let mut cpu_state = vec![0f32; H * QK * VD];
+        for h in 0..H {
+            k::delta_net::delta_rule_prefill_chunked_with_chunk(
+                &q[h * T * QK..(h + 1) * T * QK],
+                &kk[h * T * QK..(h + 1) * T * QK],
+                &v[h * T * VD..(h + 1) * T * VD],
+                &g[h * T..(h + 1) * T],
+                &beta[h * T..(h + 1) * T],
+                &mut cpu_state[h * QK * VD..(h + 1) * QK * VD],
+                &mut cpu_out[h * T * VD..(h + 1) * T * VD],
+                T,
+                QK,
+                VD,
+                L0,
+            );
+        }
+        let mut gpu_out = vec![0f32; H * T * VD];
+        let mut gpu_state = vec![0f32; H * QK * VD];
+        match ck::delta_net_chunk_f32(
+            &q, &kk, &v, &g, &beta, &mut gpu_state, &mut gpu_out, H, T, QK, VD, L0,
+        ) {
+            Ok(()) => {
+                let mut gpu_all = gpu_out.clone();
+                gpu_all.extend_from_slice(&gpu_state);
+                let mut cpu_all = cpu_out.clone();
+                cpu_all.extend_from_slice(&cpu_state);
+                cu_grade("ssm:delta_net", &gpu_all, &cpu_all, 0.999, 0.02, &mut counts);
+            }
+            Err(e) => {
+                cu_emit("ssm:delta_net", "KERNEL_ERR", &format!("{e}"));
+                *counts.entry("KERNEL_ERR").or_default() += 1;
+            }
+        }
+    }
+
     // ---- RoPE (device-resident) ----
     {
         let n_heads = 8usize;
@@ -6285,6 +6457,61 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
             Ok(()) => cu_grade("rmsnorm:f32", &gpu, &cpu, 0.9999, 0.01, &mut counts),
             Err(e) => {
                 cu_emit("rmsnorm:f32", "KERNEL_ERR", &format!("{e:?}"));
+                *counts.entry("KERNEL_ERR").or_default() += 1;
+            }
+        }
+    }
+
+    // ---- P17: Gated-DeltaNet chunked-prefill recurrence (write-blind) ----
+    // Metal twin of the SYCL/CUDA `ssm:delta_net` probe: head-major packed inputs
+    // (q/k L2-normed per token), CPU chunked reference per head, graded against the
+    // Metal kernel's per-token output AND the final recurrent state (concatenated).
+    {
+        const H: usize = 4;
+        const T: usize = 40;
+        const QK: usize = 16;
+        const VD: usize = 24;
+        const L0: usize = 8;
+        let mut q = gen_x(H * T * QK, 71);
+        let mut kk = gen_x(H * T * QK, 72);
+        let v = gen_x(H * T * VD, 73);
+        for row in 0..H * T {
+            k::delta_net::l2norm_f32_inplace(&mut q[row * QK..(row + 1) * QK], 1e-6);
+            k::delta_net::l2norm_f32_inplace(&mut kk[row * QK..(row + 1) * QK], 1e-6);
+        }
+        let g: Vec<f32> = gen_x(H * T, 74).iter().map(|x| -0.05 - 0.25 * x.abs()).collect();
+        let beta: Vec<f32> = gen_x(H * T, 75).iter().map(|x| 0.1 + 0.8 * x.abs()).collect();
+        let mut cpu_out = vec![0f32; H * T * VD];
+        let mut cpu_state = vec![0f32; H * QK * VD];
+        for h in 0..H {
+            k::delta_net::delta_rule_prefill_chunked_with_chunk(
+                &q[h * T * QK..(h + 1) * T * QK],
+                &kk[h * T * QK..(h + 1) * T * QK],
+                &v[h * T * VD..(h + 1) * T * VD],
+                &g[h * T..(h + 1) * T],
+                &beta[h * T..(h + 1) * T],
+                &mut cpu_state[h * QK * VD..(h + 1) * QK * VD],
+                &mut cpu_out[h * T * VD..(h + 1) * T * VD],
+                T,
+                QK,
+                VD,
+                L0,
+            );
+        }
+        let mut gpu_out = vec![0f32; H * T * VD];
+        let mut gpu_state = vec![0f32; H * QK * VD];
+        match mk::delta_net_chunk_f32(
+            &q, &kk, &v, &g, &beta, &mut gpu_state, &mut gpu_out, H, T, QK, VD, L0,
+        ) {
+            Ok(()) => {
+                let mut gpu_all = gpu_out.clone();
+                gpu_all.extend_from_slice(&gpu_state);
+                let mut cpu_all = cpu_out.clone();
+                cpu_all.extend_from_slice(&cpu_state);
+                cu_grade("ssm:delta_net", &gpu_all, &cpu_all, 0.999, 0.02, &mut counts);
+            }
+            Err(e) => {
+                cu_emit("ssm:delta_net", "KERNEL_ERR", &format!("{e:?}"));
                 *counts.entry("KERNEL_ERR").or_default() += 1;
             }
         }

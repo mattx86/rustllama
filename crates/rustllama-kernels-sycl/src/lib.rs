@@ -230,6 +230,26 @@ mod imp {
             eps: f32,
         );
 
+        // P17: Gated-DeltaNet chunked-prefill recurrence (f32 USM, head-major).
+        // See the C++ `rsl_delta_net_chunk_f32_usm` + the Rust wrapper
+        // `delta_net_chunk_f32_usm_raw` for layouts.
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn rsl_delta_net_chunk_f32_usm(
+            s: *mut rsl_stream,
+            q_usm: *const f32,
+            k_usm: *const f32,
+            v_usm: *const f32,
+            g_usm: *const f32,
+            beta_usm: *const f32,
+            state_usm: *mut f32,
+            out_usm: *mut f32,
+            n_heads: c_int,
+            seq_len: c_int,
+            head_qk_dim: c_int,
+            head_v_dim: c_int,
+            chunk_len: c_int,
+        );
+
         pub(super) fn rsl_flash_attn_decode_usm(
             s: *mut rsl_stream,
             q_usm: *const u16,
@@ -2178,6 +2198,46 @@ mod imp {
                 n_rows as c_int,
                 d as c_int,
                 eps,
+            );
+        }
+        consume_error()
+    }
+
+    /// P17: Gated-DeltaNet chunked-prefill recurrence (f32 USM, head-major).
+    /// All seven data pointers are USM allocations on `stream`; `state_usm` is
+    /// read as the incoming per-head recurrent state and overwritten with the
+    /// post-sequence state. See `delta_net_chunk_f32_usm_raw` for layouts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn delta_net_chunk_f32_usm(
+        stream: &SyclStream,
+        q_usm: *const f32,
+        k_usm: *const f32,
+        v_usm: *const f32,
+        g_usm: *const f32,
+        beta_usm: *const f32,
+        state_usm: *mut f32,
+        out_usm: *mut f32,
+        n_heads: u32,
+        seq_len: u32,
+        head_qk_dim: u32,
+        head_v_dim: u32,
+        chunk_len: u32,
+    ) -> Result<()> {
+        unsafe {
+            rsl_delta_net_chunk_f32_usm(
+                stream.raw,
+                q_usm,
+                k_usm,
+                v_usm,
+                g_usm,
+                beta_usm,
+                state_usm,
+                out_usm,
+                n_heads as c_int,
+                seq_len as c_int,
+                head_qk_dim as c_int,
+                head_v_dim as c_int,
+                chunk_len as c_int,
             );
         }
         consume_error()
@@ -8148,6 +8208,49 @@ pub unsafe fn rmsnorm_f32_usm_raw(
     eps: f32,
 ) -> Result<()> {
     imp::rmsnorm_f32_usm(stream, x, w, y, n_rows, d, eps)
+}
+
+/// P17: Gated-DeltaNet chunked-prefill recurrence on the GPU — the hybrid-model
+/// (Qwen3.5 / Ornith) tok/s ceiling. A direct port of the CPU reference
+/// `rustllama_kernels_cpu::delta_net::delta_rule_prefill_chunked_with_chunk`,
+/// batched over all V-heads: the intra-chunk O(L²) operators are built in
+/// parallel (over heads × chunks) and only the recurrent state is threaded
+/// serially through the chunk boundaries (per head). Numerically equivalent to
+/// the per-token scan within f32 reordered-accumulation tolerance (≈1e-3).
+///
+/// Layouts (all f32 USM on `stream`, head-major; `H`=n_heads, `T`=seq_len,
+/// `QK`=head_qk_dim, `VD`=head_v_dim):
+///   - `q` / `k`: `[H, T, QK]` — per-token query/key rows (caller L2-norms; q
+///     also pre-scaled). `v`: `[H, T, VD]` — per-token value rows.
+///   - `g` / `beta`: `[H, T]` — per-token log-decay (≤ 0) / sigmoid'd learning rate.
+///   - `state`: `[H, QK, VD]` — recurrent state (K-dim outer), IN and OUT in place.
+///   - `out`: `[H, T, VD]` — per-token outputs (written).
+/// `chunk_len` matches the CPU `ssm_chunk_len()` (0 ⇒ 64). Per-(head,chunk) plan
+/// + per-head fold scratch are `malloc_device` internally and freed before return.
+///
+/// # Safety
+/// Every pointer is a USM allocation on `stream`, sized per the layouts above;
+/// the kernel `.wait()`s before returning.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn delta_net_chunk_f32_usm_raw(
+    stream: &SyclStream,
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    g: *const f32,
+    beta: *const f32,
+    state: *mut f32,
+    out: *mut f32,
+    n_heads: u32,
+    seq_len: u32,
+    head_qk_dim: u32,
+    head_v_dim: u32,
+    chunk_len: u32,
+) -> Result<()> {
+    imp::delta_net_chunk_f32_usm(
+        stream, q, k, v, g, beta, state, out, n_heads, seq_len, head_qk_dim,
+        head_v_dim, chunk_len,
+    )
 }
 
 // (A second `flash_attn_decode_usm_raw` definition I added in an

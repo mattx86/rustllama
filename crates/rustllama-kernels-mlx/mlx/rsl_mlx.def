@@ -26,6 +26,7 @@ EXPORTS
     ; Host-pointer reference kernels (establish the FFI/parity pattern)
     rsl_mlx_rmsnorm_f32
     rsl_mlx_matvec_f32
+    rsl_mlx_delta_net_chunk_f32
 
     ; Stream / device-buffer lifecycle (device-resident path)
     rsl_mlx_stream_create

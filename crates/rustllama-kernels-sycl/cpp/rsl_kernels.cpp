@@ -22,6 +22,7 @@
 #include <cstring>
 #include <mutex>
 #include <sstream>
+#include <stdexcept> // std::runtime_error (P17 delta-net scratch alloc failure)
 #include <string>
 
 // Stash the most-recent USM allocation diagnostic. Set on every
@@ -11297,6 +11298,256 @@ void rsl_silu_mul_f32_usm(rsl_stream* s,
             out_usm[i] = silu * yv;
         });
     }).wait();
+})
+
+// P17: Gated-DeltaNet chunked-prefill recurrence on the GPU — the hybrid-model
+// (Qwen3.5 / Ornith) tok/s ceiling. A direct port of the CPU reference
+// `rustllama_kernels_cpu::delta_net::delta_rule_prefill_chunked_with_chunk`:
+// for ONE V-head the per-token delta recurrence is strictly serial, but the
+// O(L²) intra-chunk operators are independent of the incoming recurrent state,
+// so we split the T tokens into `L0`-length chunks, build every chunk's
+// `S_in`-independent operators in PARALLEL (phase 1, parallel over heads AND
+// chunks), then thread the recurrent state serially through only the chunk
+// boundaries (phase 2, parallel over heads). Numerically equivalent to the
+// per-token scan within f32 reordered-accumulation tolerance (≈1e-3); the
+// `ssm:delta_net` parity probe grades this against the CPU chunked reference at
+// the same `L0`.
+//
+// Layouts (all f32 USM, head-major; `H`=n_heads, `T`=seq_len, `QK`=head_qk_dim,
+// `VD`=head_v_dim):
+//   q_usm      [H][T][QK]   per-token query rows (caller L2-norms + q-scales)
+//   k_usm      [H][T][QK]   per-token key rows   (caller L2-norms)
+//   v_usm      [H][T][VD]   per-token value rows
+//   g_usm      [H][T]       per-token log-decay scalars (≤ 0 for this arch)
+//   beta_usm   [H][T]       per-token learning-rate scalars (already sigmoid'd)
+//   state_usm  [H][QK][VD]  recurrent state, IN and OUT (K-dim outer), in place
+//   out_usm    [H][T][VD]   per-token outputs (written)
+// `chunk_len` matches the CPU `ssm_chunk_len()` (0 → treated as 64); a request
+// with T==0 or any non-positive dim is a no-op. Internal per-(head,chunk) plan
+// scratch + per-head fold scratch are `malloc_device` and freed before return.
+void rsl_delta_net_chunk_f32_usm(
+    rsl_stream* s,
+    const float* q_usm,
+    const float* k_usm,
+    const float* v_usm,
+    const float* g_usm,
+    const float* beta_usm,
+    float* state_usm,
+    float* out_usm,
+    int n_heads,
+    int seq_len,
+    int head_qk_dim,
+    int head_v_dim,
+    int chunk_len
+) RSL_FFI_BODY_VOID("rsl_delta_net_chunk_f32_usm", {
+    if (s == nullptr || q_usm == nullptr || k_usm == nullptr || v_usm == nullptr
+        || g_usm == nullptr || beta_usm == nullptr || state_usm == nullptr
+        || out_usm == nullptr) return;
+    if (n_heads <= 0 || seq_len <= 0 || head_qk_dim <= 0 || head_v_dim <= 0) return;
+
+    const int H = n_heads;
+    const int T = seq_len;
+    const int QK = head_qk_dim;
+    const int VD = head_v_dim;
+    const int L0 = (chunk_len <= 0) ? 64 : chunk_len;
+    const int n_chunks = (T + L0 - 1) / L0;
+
+    auto& q = s->q;
+
+    // Per-(head,chunk) plan scratch. Offsets within one plan block (sized for a
+    // full L0-length chunk; the last chunk uses only its `len` rows):
+    //   cg[L0], u_local[L0*VD], w[L0*QK], o_intra[L0*VD], bw[L0*QK],
+    //   qg[L0*QK], kd[L0*QK], last_decay[1]
+    const std::size_t off_cg      = 0;
+    const std::size_t off_ulocal  = off_cg     + (std::size_t)L0;
+    const std::size_t off_w       = off_ulocal + (std::size_t)L0 * VD;
+    const std::size_t off_ointra  = off_w      + (std::size_t)L0 * QK;
+    const std::size_t off_bw      = off_ointra + (std::size_t)L0 * VD;
+    const std::size_t off_qg      = off_bw     + (std::size_t)L0 * QK;
+    const std::size_t off_kd      = off_qg     + (std::size_t)L0 * QK;
+    const std::size_t off_lastdec = off_kd     + (std::size_t)L0 * QK;
+    const std::size_t plan_stride = off_lastdec + 1;
+
+    // Per-head fold scratch: u[L0*VD] (threaded through the state carry) +
+    // ws/oi/oc[VD] (the three `[L×qk]·[qk×vd]` folds of S_in per token).
+    const std::size_t fold_stride = (std::size_t)L0 * VD + 3u * (std::size_t)VD;
+
+    const std::size_t plans_n = (std::size_t)H * n_chunks * plan_stride;
+    const std::size_t fold_n  = (std::size_t)H * fold_stride;
+
+    // USM-SHARED scratch (not malloc_device): shared USM is proven on every
+    // device we ship against — including the unified-memory Iris Xe, where
+    // malloc_device is untested — and the kernels touch it only on-device
+    // between the two serialized submits, so there is no host-coherence cost.
+    float* plans = sycl::malloc_shared<float>(plans_n, q);
+    float* fold  = sycl::malloc_shared<float>(fold_n, q);
+    if (plans == nullptr || fold == nullptr) {
+        if (plans) sycl::free(plans, q);
+        if (fold) sycl::free(fold, q);
+        throw std::runtime_error("delta_net_chunk: scratch USM alloc failed");
+    }
+
+    // ---- Phase 1: build every (head, chunk) plan (state-independent). ----
+    const std::size_t p1_items = (std::size_t)H * n_chunks;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(p1_items)),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+            const std::size_t gid = it.get_global_id(0);
+            if (gid >= p1_items) return;
+            const int hh = (int)(gid / (std::size_t)n_chunks);
+            const int cc = (int)(gid % (std::size_t)n_chunks);
+            const int start = cc * L0;
+            if (start >= T) return;
+            // NB: ternary not sycl::min — <windows.h> defines a `min` macro that
+            // would mangle a `sycl::min(...)` call into a syntax error here.
+            const int len = (start + L0 < T ? start + L0 : T) - start;
+
+            const float* qh = q_usm + (std::size_t)hh * T * QK;
+            const float* kh = k_usm + (std::size_t)hh * T * QK;
+            const float* vh = v_usm + (std::size_t)hh * T * VD;
+            const float* gh = g_usm + (std::size_t)hh * T;
+            const float* bh = beta_usm + (std::size_t)hh * T;
+
+            float* P        = plans + ((std::size_t)hh * n_chunks + cc) * plan_stride;
+            float* cg       = P + off_cg;
+            float* u_local  = P + off_ulocal;
+            float* w        = P + off_w;
+            float* o_intra  = P + off_ointra;
+            float* bw       = P + off_bw;
+            float* qg       = P + off_qg;
+            float* kd       = P + off_kd;
+
+            // Cumulative log-decay within the chunk.
+            float acc = 0.0f;
+            for (int t = 0; t < len; ++t) { acc += gh[start + t]; cg[t] = acc; }
+
+            // Forward-substitution solve of the unit-lower-triangular system for
+            // both RHS at once (u_local = (I+T)^-1 diag(β)V, w = (I+T)^-1 P).
+            for (int t = 0; t < len; ++t) {
+                const int gt = start + t;
+                const float bt = bh[gt];
+                for (int j = 0; j < VD; ++j) u_local[t * VD + j] = bt * vh[gt * VD + j];
+                const float neg_bg = -bt * sycl::exp(cg[t]);
+                for (int i = 0; i < QK; ++i) w[t * QK + i] = neg_bg * kh[gt * QK + i];
+                for (int r = 0; r < t; ++r) {
+                    const int gr = start + r;
+                    float kk = 0.0f;
+                    for (int i = 0; i < QK; ++i) kk += kh[gt * QK + i] * kh[gr * QK + i];
+                    const float coeff = bt * sycl::exp(cg[t] - cg[r]) * kk;
+                    if (coeff != 0.0f) {
+                        for (int j = 0; j < VD; ++j) u_local[t * VD + j] -= coeff * u_local[r * VD + j];
+                        for (int i = 0; i < QK; ++i) w[t * QK + i] -= coeff * w[r * QK + i];
+                    }
+                }
+            }
+
+            // Intra-chunk output operator B·U_local (o_intra) and B·W (bw).
+            for (int idx = 0; idx < len * VD; ++idx) o_intra[idx] = 0.0f;
+            for (int idx = 0; idx < len * QK; ++idx) bw[idx] = 0.0f;
+            for (int t = 0; t < len; ++t) {
+                const int gt = start + t;
+                for (int r = 0; r <= t; ++r) {
+                    const int gr = start + r;
+                    float kq = 0.0f;
+                    for (int i = 0; i < QK; ++i) kq += qh[gt * QK + i] * kh[gr * QK + i];
+                    const float b = sycl::exp(cg[t] - cg[r]) * kq;
+                    if (b != 0.0f) {
+                        for (int j = 0; j < VD; ++j) o_intra[t * VD + j] += b * u_local[r * VD + j];
+                        for (int i = 0; i < QK; ++i) bw[t * QK + i] += b * w[r * QK + i];
+                    }
+                }
+            }
+
+            // Inter-chunk output keys Q̂_t = Γ_t q_t and state-carry keys
+            // K̂_r = exp(cg_{L-1}-cg_r) k_r.
+            const float cg_last = cg[len - 1];
+            for (int t = 0; t < len; ++t) {
+                const int gt = start + t;
+                const float eg = sycl::exp(cg[t]);
+                const float ekd = sycl::exp(cg_last - cg[t]);
+                for (int i = 0; i < QK; ++i) {
+                    qg[t * QK + i] = eg * qh[gt * QK + i];
+                    kd[t * QK + i] = ekd * kh[gt * QK + i];
+                }
+            }
+            P[off_lastdec] = sycl::exp(cg_last);
+        });
+    }).wait();
+
+    // ---- Phase 2: thread the recurrent state through chunk boundaries. ----
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws((std::size_t)H)),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+            const int hh = (int)it.get_global_id(0);
+            if (hh >= H) return;
+
+            float* state_h = state_usm + (std::size_t)hh * QK * VD;
+            float* out_h   = out_usm + (std::size_t)hh * T * VD;
+            float* F       = fold + (std::size_t)hh * fold_stride;
+            float* u       = F;
+            float* ws      = F + (std::size_t)L0 * VD;
+            float* oiv     = ws + VD;
+            float* ocv     = oiv + VD;
+
+            for (int cc = 0; cc < n_chunks; ++cc) {
+                const int start = cc * L0;
+                if (start >= T) break;
+                // NB: ternary not sycl::min — <windows.h> defines a `min` macro that
+            // would mangle a `sycl::min(...)` call into a syntax error here.
+            const int len = (start + L0 < T ? start + L0 : T) - start;
+
+                const float* P        = plans + ((std::size_t)hh * n_chunks + cc) * plan_stride;
+                const float* u_local  = P + off_ulocal;
+                const float* w        = P + off_w;
+                const float* o_intra  = P + off_ointra;
+                const float* bw       = P + off_bw;
+                const float* qg       = P + off_qg;
+                const float* kd       = P + off_kd;
+
+                for (int t = 0; t < len; ++t) {
+                    for (int j = 0; j < VD; ++j) { ws[j] = 0.0f; oiv[j] = 0.0f; ocv[j] = 0.0f; }
+                    for (int i = 0; i < QK; ++i) {
+                        const float wi = w[t * QK + i];
+                        const float qi = qg[t * QK + i];
+                        const float bi = bw[t * QK + i];
+                        const float* srow = state_h + (std::size_t)i * VD;
+                        for (int j = 0; j < VD; ++j) {
+                            const float sv = srow[j];
+                            ws[j]  += wi * sv;
+                            oiv[j] += qi * sv;
+                            ocv[j] += bi * sv;
+                        }
+                    }
+                    for (int j = 0; j < VD; ++j) {
+                        const float uj = u_local[t * VD + j] + ws[j];
+                        u[t * VD + j] = uj;
+                        out_h[(std::size_t)(start + t) * VD + j] =
+                            o_intra[t * VD + j] + ocv[j] + oiv[j];
+                    }
+                }
+
+                // State carry: S ← Γ_{L-1}·S (no U dependence), then add K̂ᵀ·U.
+                const float decay = P[off_lastdec];
+                for (int idx = 0; idx < QK * VD; ++idx) state_h[idx] *= decay;
+                for (int t = 0; t < len; ++t) {
+                    for (int i = 0; i < QK; ++i) {
+                        const float ki = kd[t * QK + i];
+                        if (ki != 0.0f) {
+                            float* srow = state_h + (std::size_t)i * VD;
+                            for (int j = 0; j < VD; ++j) srow[j] += ki * u[t * VD + j];
+                        }
+                    }
+                }
+            }
+        });
+    }).wait();
+
+    sycl::free(plans, q);
+    sycl::free(fold, q);
 })
 
 // G2: KV-cache Q8_0 quantize-on-store. Reads f32 activations laid out

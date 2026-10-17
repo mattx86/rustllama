@@ -2486,6 +2486,147 @@ pub fn ssm_chunk() -> u32 {
     rustllama_kernels_cpu::delta_net::ssm_chunk_current() as u32
 }
 
+// ============================================================
+// P17: GPU DeltaNet chunked-prefill dispatch (the hybrid-model tok/s ceiling).
+// ============================================================
+
+/// Whether the GPU DeltaNet chunked-prefill kernel (`ssm:delta_net`) is
+/// auto-enabled for the hybrid SSM prefill. **AUTOMATIC, no env var** and
+/// fail-closed:
+///   1. the on-device PARITY verdict [`rustllama_tuner::VERDICT_SSM_DELTA_NET`]
+///      (banked per-backend by `tune --validate-kernels` → `doctor --sycl-parity`
+///      / `--cuda-parity` / `--metal-parity` grading the kernel ≡ the CPU chunked
+///      reference within ≈1e-3), AND
+///   2. a conservative PERF proxy — an active **CUDA** GPU, an active Apple
+///      **MLX** GPU, or a **dedicated-VRAM SYCL** GPU ([`sycl_dedicated_vram_bytes`]
+///      is `Some`). On a unified-memory integrated iGPU (Iris Xe: USM *is* host RAM,
+///      and the per-head work underutilizes the EUs) the chunked GPU scan is no
+///      faster than the SIMD+rayon CPU path, so it stays OFF — the same
+///      integrated-GPU fail-closed reasoning the MoE device tier uses. A measured
+///      on-device A/B (a `tune` SSM-prefill stage) is the follow-up that would
+///      replace this proxy with a real "measured faster".
+///
+/// When this is `false` (the Iris Xe box here, any non-GPU host, or an unvalidated
+/// device) the hybrid DeltaNet forward is BYTE-IDENTICAL to the CPU path.
+fn delta_net_chunk_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if !kernel_verdict(rustllama_tuner::VERDICT_SSM_DELTA_NET) {
+            return false;
+        }
+        cuda_active() || mlx_active() || sycl_dedicated_vram_bytes().is_some()
+    })
+}
+
+/// P17: run the Gated-DeltaNet chunked-prefill recurrence for ALL V-heads on the
+/// GPU, returning `true` iff it ran and wrote `out` + `state`. Routes CUDA-first
+/// (mirroring the matvec dispatch), else Apple MLX, else the SYCL USM path — the
+/// one validatable here. Fail-closed: returns `false` (so the caller runs the
+/// unchanged CPU per-head path) when the dispatch gate is off, no device is
+/// present, a buffer allocation fails, or the kernel reports an error. Inputs are
+/// head-major packed exactly as the CPU reference expects (`q`/`k` already
+/// L2-normed, `q` pre-scaled; `g` the per-token log-decay; `beta` already
+/// sigmoid'd); `state` is read as the incoming per-head recurrent state and
+/// overwritten with the post-sequence state.
+#[allow(clippy::too_many_arguments)]
+pub fn try_delta_net_chunk_prefill(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    state: &mut [f32],
+    out: &mut [f32],
+    n_heads: usize,
+    seq_len: usize,
+    head_qk_dim: usize,
+    head_v_dim: usize,
+    chunk_len: usize,
+) -> bool {
+    if !delta_net_chunk_enabled() {
+        return false;
+    }
+    if n_heads == 0 || seq_len == 0 || head_qk_dim == 0 || head_v_dim == 0 {
+        return false;
+    }
+    debug_assert_eq!(q.len(), n_heads * seq_len * head_qk_dim);
+    debug_assert_eq!(k.len(), n_heads * seq_len * head_qk_dim);
+    debug_assert_eq!(v.len(), n_heads * seq_len * head_v_dim);
+    debug_assert_eq!(g.len(), n_heads * seq_len);
+    debug_assert_eq!(beta.len(), n_heads * seq_len);
+    debug_assert_eq!(state.len(), n_heads * head_qk_dim * head_v_dim);
+    debug_assert_eq!(out.len(), n_heads * seq_len * head_v_dim);
+
+    // CUDA first (mirrors the CUDA-first matvec dispatch) — write-blind, pod-
+    // validated. The host-copy wrapper uploads/runs/downloads internally.
+    if cuda_active() {
+        return ck::delta_net_chunk_f32(
+            q, k, v, g, beta, state, out, n_heads, seq_len, head_qk_dim, head_v_dim, chunk_len,
+        )
+        .is_ok();
+    }
+    // Apple MLX (unified memory) — write-blind, Mac-validated.
+    if mlx_active() {
+        return mk::delta_net_chunk_f32(
+            q, k, v, g, beta, state, out, n_heads, seq_len, head_qk_dim, head_v_dim, chunk_len,
+        )
+        .is_ok();
+    }
+
+    // SYCL USM path (dedicated-VRAM Intel GPU) — validatable here.
+    let stream = match sk::create_stream(0) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let bufs = (
+        sk::SyclSharedBuffer::<f32>::alloc(&stream, q.len()),
+        sk::SyclSharedBuffer::<f32>::alloc(&stream, k.len()),
+        sk::SyclSharedBuffer::<f32>::alloc(&stream, v.len()),
+        sk::SyclSharedBuffer::<f32>::alloc(&stream, g.len()),
+        sk::SyclSharedBuffer::<f32>::alloc(&stream, beta.len()),
+        sk::SyclSharedBuffer::<f32>::alloc(&stream, state.len()),
+        sk::SyclSharedBuffer::<f32>::alloc(&stream, out.len()),
+    );
+    let (mut qb, mut kb, mut vb, mut gb, mut bb, mut sb, mut ob) = match bufs {
+        (Ok(a), Ok(b), Ok(c), Ok(d), Ok(e), Ok(f), Ok(gg)) => (a, b, c, d, e, f, gg),
+        _ => return false,
+    };
+    qb.as_mut_slice().copy_from_slice(q);
+    kb.as_mut_slice().copy_from_slice(k);
+    vb.as_mut_slice().copy_from_slice(v);
+    gb.as_mut_slice().copy_from_slice(g);
+    bb.as_mut_slice().copy_from_slice(beta);
+    sb.as_mut_slice().copy_from_slice(state); // incoming recurrent state
+    ob.as_mut_slice().fill(0.0);
+    // SAFETY: seven live USM allocations on `stream`, sized to the slices above;
+    // the kernel `.wait()`s before returning.
+    let res = unsafe {
+        sk::delta_net_chunk_f32_usm_raw(
+            &stream,
+            qb.as_ptr(),
+            kb.as_ptr(),
+            vb.as_ptr(),
+            gb.as_ptr(),
+            bb.as_ptr(),
+            sb.as_mut_ptr(),
+            ob.as_mut_ptr(),
+            n_heads as u32,
+            seq_len as u32,
+            head_qk_dim as u32,
+            head_v_dim as u32,
+            chunk_len as u32,
+        )
+    };
+    match res {
+        Ok(()) => {
+            out.copy_from_slice(ob.as_slice());
+            state.copy_from_slice(sb.as_slice());
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// P16: apply `[inference].lock_usm`. Forwards to the SYCL USM-pin gate.
 pub fn set_lock_usm(on: bool) {
     sk::set_lock_usm(on);

@@ -44,6 +44,14 @@ int rsl_mlx_rmsnorm_f32(const float *x, const float *w, float *y,
 int rsl_mlx_matvec_f32(const float *W, const float *x, float *out,
                        int m_rows, int k_dim);
 
+/* P17: Gated-DeltaNet chunked-prefill recurrence over all V-heads (host-copy,
+ * f32). q/k [H*T*QK], v [H*T*VD], g/beta [H*T], state [H*QK*VD] in/out,
+ * out [H*T*VD]. chunk_len 0 => 64. Returns 0 on success. */
+int rsl_mlx_delta_net_chunk_f32(const float *q, const float *k, const float *v,
+                                const float *g, const float *beta, float *state,
+                                float *out, int n_heads, int seq_len,
+                                int head_qk_dim, int head_v_dim, int chunk_len);
+
 /* ============================================================
  * Device-resident path (streams + device buffers)
  * ============================================================

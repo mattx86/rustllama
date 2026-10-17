@@ -620,6 +620,109 @@ extern "C" int rsl_mlx_matvec_f32(const float *W, const float *x, float *out,
 #endif
 }
 
+// P17: Gated-DeltaNet chunked-prefill recurrence over all V-heads (host-copy).
+// WRITE-BLIND Metal mirror of the SYCL/CUDA `delta_net_chunk` kernels. Two
+// compute encoders in ONE command buffer (ordered): phase 1 builds every
+// (head,chunk) plan into a private scratch buffer; phase 2 threads the
+// recurrent state through the chunk boundaries. Head-major host layouts; `state`
+// in/out. Validated vs the CPU chunked reference by `doctor --metal-parity`.
+extern "C" int rsl_mlx_delta_net_chunk_f32(const float *q, const float *k, const float *v,
+                                           const float *g, const float *beta, float *state,
+                                           float *out, int n_heads, int seq_len,
+                                           int head_qk_dim, int head_v_dim, int chunk_len) {
+#if RSL_MLX_HAVE_METAL
+    if (!q || !k || !v || !g || !beta || !state || !out) return -1;
+    if (n_heads <= 0 || seq_len <= 0 || head_qk_dim <= 0 || head_v_dim <= 0) return -1;
+    @autoreleasepool {
+        const int H = n_heads, T = seq_len, QK = head_qk_dim, VD = head_v_dim;
+        const int L0 = (chunk_len <= 0) ? 64 : chunk_len;
+        const int n_chunks = (T + L0 - 1) / L0;
+        id<MTLDevice> dev = mlx_device_at(0);
+        if (dev == nil) { g_rsl_mlx_errors++; return -1; }
+        id<MTLComputePipelineState> pso1 = mlx_pipeline(dev, @"rsl_mlx_delta_net_chunk_phase1_kernel");
+        id<MTLComputePipelineState> pso2 = mlx_pipeline(dev, @"rsl_mlx_delta_net_chunk_phase2_kernel");
+        if (pso1 == nil || pso2 == nil) return -1; // error already latched
+        id<MTLCommandQueue> cq = mlx_default_queue(dev);
+        if (cq == nil) { g_rsl_mlx_errors++; return -1; }
+
+        const size_t plan_stride = (size_t)L0 + 2u*(size_t)L0*VD + 4u*(size_t)L0*QK + 1u;
+        const size_t fold_stride = (size_t)L0*VD + 3u*(size_t)VD;
+        const NSUInteger nq = (NSUInteger)H*(NSUInteger)T*(NSUInteger)QK*sizeof(float);
+        const NSUInteger nv = (NSUInteger)H*(NSUInteger)T*(NSUInteger)VD*sizeof(float);
+        const NSUInteger ng = (NSUInteger)H*(NSUInteger)T*sizeof(float);
+        const NSUInteger ns = (NSUInteger)H*(NSUInteger)QK*(NSUInteger)VD*sizeof(float);
+        const NSUInteger nplans = (NSUInteger)((size_t)H*n_chunks*plan_stride)*sizeof(float);
+        const NSUInteger nfold = (NSUInteger)((size_t)H*fold_stride)*sizeof(float);
+
+        id<MTLBuffer> bQ = [dev newBufferWithBytes:q length:nq options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bK = [dev newBufferWithBytes:k length:nq options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bV = [dev newBufferWithBytes:v length:nv options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bG = [dev newBufferWithBytes:g length:ng options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bB = [dev newBufferWithBytes:beta length:ng options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bS = [dev newBufferWithBytes:state length:ns options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bO = [dev newBufferWithLength:nv options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bP = [dev newBufferWithLength:nplans options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> bF = [dev newBufferWithLength:nfold options:MTLResourceStorageModePrivate];
+        if (bQ==nil||bK==nil||bV==nil||bG==nil||bB==nil||bS==nil||bO==nil||bP==nil||bF==nil) {
+            g_rsl_mlx_errors++; return -1;
+        }
+
+        int H_=H,T_=T,QK_=QK,VD_=VD,L0_=L0,NC_=n_chunks;
+        id<MTLCommandBuffer> cb = [cq commandBuffer];
+        // Phase 1 — one thread per (head, chunk).
+        {
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:pso1];
+            [enc setBuffer:bQ offset:0 atIndex:0];
+            [enc setBuffer:bK offset:0 atIndex:1];
+            [enc setBuffer:bV offset:0 atIndex:2];
+            [enc setBuffer:bG offset:0 atIndex:3];
+            [enc setBuffer:bB offset:0 atIndex:4];
+            [enc setBuffer:bP offset:0 atIndex:5];
+            [enc setBytes:&H_ length:sizeof(int) atIndex:6];
+            [enc setBytes:&T_ length:sizeof(int) atIndex:7];
+            [enc setBytes:&QK_ length:sizeof(int) atIndex:8];
+            [enc setBytes:&VD_ length:sizeof(int) atIndex:9];
+            [enc setBytes:&L0_ length:sizeof(int) atIndex:10];
+            [enc setBytes:&NC_ length:sizeof(int) atIndex:11];
+            NSUInteger total1 = (NSUInteger)H * (NSUInteger)n_chunks;
+            NSUInteger tpg1 = total1 < 64 ? total1 : 64;
+            [enc dispatchThreads:MTLSizeMake(total1,1,1) threadsPerThreadgroup:MTLSizeMake(tpg1,1,1)];
+            [enc endEncoding];
+        }
+        // Phase 2 — one thread per head; same command buffer ⇒ ordered after phase 1.
+        {
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:pso2];
+            [enc setBuffer:bS offset:0 atIndex:0];
+            [enc setBuffer:bO offset:0 atIndex:1];
+            [enc setBuffer:bP offset:0 atIndex:2];
+            [enc setBuffer:bF offset:0 atIndex:3];
+            [enc setBytes:&H_ length:sizeof(int) atIndex:4];
+            [enc setBytes:&T_ length:sizeof(int) atIndex:5];
+            [enc setBytes:&QK_ length:sizeof(int) atIndex:6];
+            [enc setBytes:&VD_ length:sizeof(int) atIndex:7];
+            [enc setBytes:&L0_ length:sizeof(int) atIndex:8];
+            [enc setBytes:&NC_ length:sizeof(int) atIndex:9];
+            NSUInteger total2 = (NSUInteger)H;
+            NSUInteger tpg2 = total2 < 64 ? total2 : 64;
+            [enc dispatchThreads:MTLSizeMake(total2,1,1) threadsPerThreadgroup:MTLSizeMake(tpg2,1,1)];
+            [enc endEncoding];
+        }
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) { g_rsl_mlx_errors++; return -1; }
+        std::memcpy(out, [bO contents], (size_t)nv);
+        std::memcpy(state, [bS contents], (size_t)ns);
+        return 0;
+    }
+#else
+    (void)q;(void)k;(void)v;(void)g;(void)beta;(void)state;(void)out;
+    (void)n_heads;(void)seq_len;(void)head_qk_dim;(void)head_v_dim;(void)chunk_len;
+    return -1;
+#endif
+}
+
 // ---- Stream / device-buffer lifecycle ---------------------------------
 //
 // A stream owns the device it is bound to + a fresh MTLCommandQueue (the MLX
