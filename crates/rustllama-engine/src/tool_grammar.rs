@@ -597,7 +597,8 @@ mod tests {
     fn max_completed_zero_means_unlimited() {
         // No cap: 5 sequential tool calls are all accepted.
         let mut g = ToolCallStreamGrammar::new_with_max(one_tool(), 0);
-        let one = "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"X\"}}</tool_call>";
+        let one =
+            "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"X\"}}</tool_call>";
         for _ in 0..5 {
             assert!(drive(&mut g, one), "all 5 accepted with limit=0");
             assert!(drive(&mut g, " "), "whitespace between calls accepted");
@@ -609,7 +610,8 @@ mod tests {
     fn max_completed_limit_rejects_extra_open_marker() {
         // limit=2: first two complete, third's opener must reject.
         let mut g = ToolCallStreamGrammar::new_with_max(one_tool(), 2);
-        let one = "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"X\"}}</tool_call>";
+        let one =
+            "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"X\"}}</tool_call>";
         assert!(drive(&mut g, one));
         assert!(drive(&mut g, one));
         assert_eq!(g.completed_count(), 2);
@@ -624,7 +626,8 @@ mod tests {
     #[test]
     fn limit_blocked_flag_starts_false() {
         let mut g = ToolCallStreamGrammar::new_with_max(one_tool(), 2);
-        let one = "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"X\"}}</tool_call>";
+        let one =
+            "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"X\"}}</tool_call>";
         assert!(!g.limit_blocked());
         // Emitting up to the cap doesn't flip the flag — the cap only
         // affects the NEXT opener attempt.
@@ -637,14 +640,18 @@ mod tests {
     #[test]
     fn limit_blocked_flag_sets_when_extra_opener_rejected() {
         let mut g = ToolCallStreamGrammar::new_with_max(one_tool(), 1);
-        let one = "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"X\"}}</tool_call>";
+        let one =
+            "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"X\"}}</tool_call>";
         assert!(drive(&mut g, one));
         assert!(!g.limit_blocked());
         // Drive prefix of `<tool_call>` — all bytes up to but not
         // including the final `>` are still accepted.
         assert!(drive(&mut g, "<tool_call"));
         assert_eq!(g.step(b'>'), Step::Reject);
-        assert!(g.limit_blocked(), "limit_blocked must flip after the reject");
+        assert!(
+            g.limit_blocked(),
+            "limit_blocked must flip after the reject"
+        );
     }
 
     #[test]
@@ -652,7 +659,8 @@ mod tests {
         // After the cap is reached, plain text + EOS-shaped content
         // remains accepted; only the OPEN marker is gated.
         let mut g = ToolCallStreamGrammar::new_with_max(one_tool(), 1);
-        let one = "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"X\"}}</tool_call>";
+        let one =
+            "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"X\"}}</tool_call>";
         assert!(drive(&mut g, one));
         assert!(g.can_terminate_now());
         // Plain prose after the cap is fine.
@@ -674,12 +682,18 @@ mod tests {
         assert!(!g.can_terminate_now(), "min floor not met at start");
         // Some leading prose is fine and must NOT unblock termination.
         assert!(drive(&mut g, "Let me look that up. "));
-        assert!(!g.can_terminate_now(), "prose alone must not satisfy the floor");
+        assert!(
+            !g.can_terminate_now(),
+            "prose alone must not satisfy the floor"
+        );
         // One complete call satisfies the floor.
         let one =
             "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"X\"}}</tool_call>";
         assert!(drive(&mut g, one));
         assert_eq!(g.completed_count(), 1);
-        assert!(g.can_terminate_now(), "floor met after one call → EOS legal");
+        assert!(
+            g.can_terminate_now(),
+            "floor met after one call → EOS legal"
+        );
     }
 }

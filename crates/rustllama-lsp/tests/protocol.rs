@@ -37,8 +37,7 @@ fn parse_responses(bytes: &[u8]) -> Vec<serde_json::Value> {
         }
         let body_start = cursor + rel + 4;
         let body_end = body_start + content_length;
-        let v: serde_json::Value =
-            serde_json::from_slice(&bytes[body_start..body_end]).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes[body_start..body_end]).unwrap();
         out.push(v);
         cursor = body_end;
     }
@@ -133,7 +132,10 @@ fn initialize_then_shutdown_lifecycle() {
             || responses[0]["result"]["capabilities"]["inlineCompletionProvider"].is_null()
             || responses[0]["result"]["capabilities"]["inlineCompletionProvider"].is_boolean()
     );
-    assert_eq!(responses[0]["result"]["capabilities"]["textDocumentSync"], 2);
+    assert_eq!(
+        responses[0]["result"]["capabilities"]["textDocumentSync"],
+        2
+    );
     assert_eq!(responses[1]["id"], 2);
     assert!(responses[1]["result"].is_null());
 }

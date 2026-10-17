@@ -177,12 +177,10 @@ fn apply_frontmatter(card: &mut ModelCard, fm: &str) {
     let mut pending_list_key: Option<String> = None;
     let mut pending_list: Vec<String> = Vec::new();
 
-    let flush_list = |key: &str, items: Vec<String>, card: &mut ModelCard| {
-        match key {
-            "tags" => card.tags = items,
-            "language" | "languages" => card.language = items,
-            _ => {}
-        }
+    let flush_list = |key: &str, items: Vec<String>, card: &mut ModelCard| match key {
+        "tags" => card.tags = items,
+        "language" | "languages" => card.language = items,
+        _ => {}
     };
 
     for raw_line in fm.lines() {

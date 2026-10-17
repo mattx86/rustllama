@@ -1,4 +1,4 @@
-﻿//! Integration tests for the Ollama-compatible HTTP surface.
+//! Integration tests for the Ollama-compatible HTTP surface.
 //!
 //! Uses `MockEngine` for the request/response shape checks. Endpoints
 //! that require a real CpuEngine (`/api/show` needs the GGUF config,
@@ -39,9 +39,8 @@ async fn get_json(uri: &str) -> (StatusCode, serde_json::Value) {
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-    let body = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_else(|_| {
-        serde_json::Value::String(String::from_utf8_lossy(&bytes).to_string())
-    });
+    let body = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).to_string()));
     (status, body)
 }
 
@@ -124,8 +123,7 @@ async fn chat_streaming_emits_ndjson_with_final_done_true() {
     let lines: Vec<&str> = raw.lines().filter(|l| !l.is_empty()).collect();
     assert!(!lines.is_empty(), "expected at least one NDJSON line");
     // First line should be a chat delta with done=false.
-    let first: serde_json::Value =
-        serde_json::from_str(lines[0]).expect("first line is JSON");
+    let first: serde_json::Value = serde_json::from_str(lines[0]).expect("first line is JSON");
     assert_eq!(first["model"], "rustllama-mock");
     assert!(first["message"]["role"] == "assistant");
     // Last line carries done=true plus done_reason.
@@ -170,8 +168,7 @@ async fn generate_streaming_emits_ndjson_with_final_done_true() {
     assert!(!lines.is_empty());
     let first: serde_json::Value = serde_json::from_str(lines[0]).expect("first JSON");
     assert!(first["response"].is_string());
-    let last: serde_json::Value =
-        serde_json::from_str(lines.last().unwrap()).expect("last JSON");
+    let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).expect("last JSON");
     assert_eq!(last["done"], true);
 }
 
@@ -194,11 +191,8 @@ async fn show_requires_real_engine_returns_503_on_mock() {
     // `/api/show` needs the GGUF config (architecture, hyperparams, …)
     // which only `CpuEngine` exposes. The mock harness here doesn't
     // load a real engine, so the endpoint correctly degrades to 503.
-    let (status, body) = post_text(
-        "/api/show",
-        serde_json::json!({"model": "rustllama-mock"}),
-    )
-    .await;
+    let (status, body) =
+        post_text("/api/show", serde_json::json!({"model": "rustllama-mock"})).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
 }
 
@@ -253,8 +247,7 @@ async fn show_with_real_engine_returns_architecture_template_and_details() {
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-    let body: serde_json::Value =
-        serde_json::from_slice(&bytes).expect("/api/show returned JSON");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("/api/show returned JSON");
     assert_eq!(status, StatusCode::OK, "body: {body}");
 
     // Top-level response fields per the Ollama /api/show shape.
@@ -310,7 +303,11 @@ async fn show_accepts_name_alias_for_model() {
     // adapter must accept either spelling. We post the actual derived
     // file-stem under `name` to confirm the alias is honored.
     let (state, tmp) = build_state_with_real_cpu_engine("name-alias");
-    let derived_id = tmp.file_stem().and_then(|s| s.to_str()).unwrap().to_string();
+    let derived_id = tmp
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap()
+        .to_string();
     let app = router(state);
 
     let req = Request::builder()
@@ -476,7 +473,10 @@ async fn show_modelfile_carries_template_and_parameter_directives() {
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(resp.into_body(), 1 << 20).await.unwrap()).unwrap();
     let modelfile = body["modelfile"].as_str().expect("modelfile string");
-    assert!(modelfile.contains("FROM "), "modelfile must carry FROM: {modelfile:?}");
+    assert!(
+        modelfile.contains("FROM "),
+        "modelfile must carry FROM: {modelfile:?}"
+    );
     assert!(
         modelfile.contains("TEMPLATE \"\"\""),
         "modelfile must carry triple-quoted TEMPLATE block: {modelfile:?}"
@@ -627,7 +627,10 @@ async fn show_moe_with_shared_experts_surfaces_shared_count() {
     let resp = app.oneshot(req).await.unwrap();
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(resp.into_body(), 1 << 20).await.unwrap()).unwrap();
-    assert_eq!(body["model_info"]["llama.expert_shared_count"].as_u64(), Some(1));
+    assert_eq!(
+        body["model_info"]["llama.expert_shared_count"].as_u64(),
+        Some(1)
+    );
     let _ = std::fs::remove_file(&tmp);
 }
 

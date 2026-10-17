@@ -967,10 +967,7 @@ impl Client {
     /// `POST /v1/models/load` — load a GGUF into the server's registry.
     /// Pass exactly one of `path` or `hub`. The returned JSON includes
     /// `{ model_id, previous_model_id, is_default, loaded_at }`.
-    pub async fn load_model(
-        &self,
-        params: &LoadModelParams,
-    ) -> Result<serde_json::Value> {
+    pub async fn load_model(&self, params: &LoadModelParams) -> Result<serde_json::Value> {
         let url = join(&self.base, "/v1/models/load")?;
         let resp = self.http.post(url).json(params).send().await?;
         let status = resp.status();
@@ -1404,11 +1401,7 @@ impl Client {
     /// `POST /v1/decide/choice` — pick one option from `options` by scoring
     /// each as a continuation of `context`; returns per-option probabilities +
     /// the winning `value`/`index` (+ a `calibrated` flag).
-    pub async fn decide_choice(
-        &self,
-        context: &str,
-        options: &[String],
-    ) -> Result<DecideResult> {
+    pub async fn decide_choice(&self, context: &str, options: &[String]) -> Result<DecideResult> {
         let url = join(&self.base, "/v1/decide/choice")?;
         json_or_err(
             self.http
@@ -1747,7 +1740,10 @@ fn decode_event(bytes: &[u8], tool_acc: &mut Vec<ToolCall>) -> Vec<Result<ChatEv
     };
 
     for line in text.lines() {
-        let Some(payload) = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")) else {
+        let Some(payload) = line
+            .strip_prefix("data: ")
+            .or_else(|| line.strip_prefix("data:"))
+        else {
             continue;
         };
         let payload = payload.trim();
@@ -1758,7 +1754,11 @@ fn decode_event(bytes: &[u8], tool_acc: &mut Vec<ToolCall>) -> Vec<Result<ChatEv
         }
         match serde_json::from_str::<serde_json::Value>(payload) {
             Ok(v) => {
-                if let Some(err) = v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+                if let Some(err) = v
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                {
                     out.push(Ok(ChatEvent::Error(err.to_string())));
                     continue;
                 }
@@ -1777,7 +1777,11 @@ fn decode_event(bytes: &[u8], tool_acc: &mut Vec<ToolCall>) -> Vec<Result<ChatEv
                     // chunk as `delta.ask_user` (finish_reason "ask_user").
                     if let Some(ask) = delta.get("ask_user") {
                         out.push(Ok(ChatEvent::AskUser {
-                            id: ask.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                            id: ask
+                                .get("id")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string(),
                             prompt: ask
                                 .get("prompt")
                                 .and_then(|s| s.as_str())
@@ -1795,7 +1799,10 @@ fn decode_event(bytes: &[u8], tool_acc: &mut Vec<ToolCall>) -> Vec<Result<ChatEv
                         }));
                     }
                 }
-                if let Some(reason) = choice.and_then(|c| c.get("finish_reason")).and_then(|r| r.as_str()) {
+                if let Some(reason) = choice
+                    .and_then(|c| c.get("finish_reason"))
+                    .and_then(|r| r.as_str())
+                {
                     // Surface any reassembled tool calls once, right before
                     // Finish, so a frontend can gate them (confirm / auto-run).
                     if !tool_acc.is_empty() {
@@ -1905,7 +1912,10 @@ fn decode_completion_event(bytes: &[u8]) -> Vec<Result<CompletionEvent>> {
         }
     };
     for line in text.lines() {
-        let Some(payload) = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")) else {
+        let Some(payload) = line
+            .strip_prefix("data: ")
+            .or_else(|| line.strip_prefix("data:"))
+        else {
             continue;
         };
         let payload = payload.trim();
@@ -1914,17 +1924,26 @@ fn decode_completion_event(bytes: &[u8]) -> Vec<Result<CompletionEvent>> {
         }
         match serde_json::from_str::<serde_json::Value>(payload) {
             Ok(v) => {
-                if let Some(err) = v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+                if let Some(err) = v
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                {
                     out.push(Ok(CompletionEvent::Error(err.to_string())));
                     continue;
                 }
                 let choice = v.pointer("/choices/0");
-                if let Some(text_delta) = choice.and_then(|c| c.get("text")).and_then(|t| t.as_str()) {
+                if let Some(text_delta) =
+                    choice.and_then(|c| c.get("text")).and_then(|t| t.as_str())
+                {
                     if !text_delta.is_empty() {
                         out.push(Ok(CompletionEvent::Content(text_delta.to_string())));
                     }
                 }
-                if let Some(reason) = choice.and_then(|c| c.get("finish_reason")).and_then(|r| r.as_str()) {
+                if let Some(reason) = choice
+                    .and_then(|c| c.get("finish_reason"))
+                    .and_then(|r| r.as_str())
+                {
                     out.push(Ok(CompletionEvent::Finish(reason.to_string())));
                 }
                 if let Some(usage_val) = v.get("usage") {
@@ -1991,7 +2010,8 @@ mod tests {
                       \"arguments\":\"\"}}]}}]}";
         let args = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\
                     \"function\":{\"arguments\":\"{\\\"city\\\":\\\"NYC\\\"}\"}}]}}]}";
-        let fin = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}";
+        let fin =
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}";
 
         // Header + args chunks accumulate but emit no ChatEvent.
         assert!(decode_event(header.as_bytes(), &mut acc)
@@ -2036,7 +2056,11 @@ mod tests {
             .collect();
         assert_eq!(evts.len(), 2);
         match &evts[0] {
-            ChatEvent::AskUser { id, prompt, options } => {
+            ChatEvent::AskUser {
+                id,
+                prompt,
+                options,
+            } => {
                 assert_eq!(id, "call_9");
                 assert_eq!(prompt, "Which file?");
                 assert_eq!(options, &["a.rs".to_string(), "b.rs".to_string()]);
@@ -2293,9 +2317,18 @@ mod tests {
             ..Default::default()
         };
         let v = serde_json::to_value(&params).unwrap();
-        assert_eq!(v.get("name").and_then(|n| n.as_str()), Some("Qwen2.5-Coder-0.5B"));
-        assert!(v.get("path").is_none(), "path must be omitted for a cached load");
-        assert!(v.get("hub").is_none(), "hub must be omitted for a cached load");
+        assert_eq!(
+            v.get("name").and_then(|n| n.as_str()),
+            Some("Qwen2.5-Coder-0.5B")
+        );
+        assert!(
+            v.get("path").is_none(),
+            "path must be omitted for a cached load"
+        );
+        assert!(
+            v.get("hub").is_none(),
+            "hub must be omitted for a cached load"
+        );
     }
 
     /// `/api/tags` envelope → cached model list with detail badges.
@@ -2310,11 +2343,13 @@ mod tests {
                 "details": { "family": "qwen2", "parameter_size": "0.5B", "quantization_level": "Q4_K_M" }
             }]
         });
-        let models: Vec<TagsModel> =
-            serde_json::from_value::<TagsResponse>(body).unwrap().models;
+        let models: Vec<TagsModel> = serde_json::from_value::<TagsResponse>(body).unwrap().models;
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].size, 417_000_000);
-        assert_eq!(models[0].details.as_ref().unwrap().family.as_deref(), Some("qwen2"));
+        assert_eq!(
+            models[0].details.as_ref().unwrap().family.as_deref(),
+            Some("qwen2")
+        );
     }
 
     /// A slim `/v1/metrics` payload deserializes (every field lenient), and
@@ -2346,10 +2381,8 @@ mod tests {
     /// the message.
     #[test]
     fn ndjson_line_decodes_progress_error_and_skips_junk() {
-        let prog = decode_ndjson_line(
-            br#"{"status":"downloading","completed":512,"total":1024}"#,
-        )
-        .unwrap();
+        let prog = decode_ndjson_line(br#"{"status":"downloading","completed":512,"total":1024}"#)
+            .unwrap();
         assert_eq!(prog.status, "downloading");
         assert_eq!(prog.completed, Some(512));
         assert_eq!(prog.total, Some(1024));
@@ -2405,8 +2438,7 @@ mod tests {
     /// `/v1/tokenize` response → the composer counter reads `count`.
     #[test]
     fn tokenize_result_deserializes_count() {
-        let body =
-            serde_json::json!({ "count": 5, "tokens": [1, 2, 3, 4, 5], "model_id": "qwen" });
+        let body = serde_json::json!({ "count": 5, "tokens": [1, 2, 3, 4, 5], "model_id": "qwen" });
         let r: TokenizeResult = serde_json::from_value(body).unwrap();
         assert_eq!(r.count, 5);
         assert_eq!(r.tokens.len(), 5);
@@ -2537,8 +2569,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(env.conversations.len(), 1);
-        let empty: ConversationsEnvelope =
-            serde_json::from_value(serde_json::json!({})).unwrap();
+        let empty: ConversationsEnvelope = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(empty.conversations.is_empty());
     }
 }

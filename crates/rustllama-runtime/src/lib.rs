@@ -357,7 +357,11 @@ pub struct MemoryInfo {
 #[cfg(target_os = "linux")]
 fn cgroup_mem_limit() -> Option<(u64, u64)> {
     fn read_u64(path: &str) -> Option<u64> {
-        std::fs::read_to_string(path).ok()?.trim().parse::<u64>().ok()
+        std::fs::read_to_string(path)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
     }
     // A limit at/above this is effectively "no limit" (v1 unlimited sentinel is
     // ~u64::MAX rounded to the page size; a limit of exabytes is never real).
@@ -463,9 +467,8 @@ pub fn cpu_info() -> CpuInfo {
 #[cfg(windows)]
 pub fn gpu_busy_pct() -> Option<f32> {
     use windows_sys::Win32::System::Performance::{
-        PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
-        PdhGetFormattedCounterArrayW, PdhOpenQueryW, PDH_FMT_COUNTERVALUE_ITEM_W,
-        PDH_FMT_DOUBLE,
+        PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
+        PdhOpenQueryW, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE,
     };
     const PDH_MORE_DATA: u32 = 0x800007D2;
     const PDH_CSTATUS_VALID_DATA: u32 = 0;
@@ -573,9 +576,8 @@ pub fn gpu_busy_pct() -> Option<f32> {
 #[cfg(windows)]
 pub fn gpu_mem_used_bytes() -> Option<u64> {
     use windows_sys::Win32::System::Performance::{
-        PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
-        PdhGetFormattedCounterArrayW, PdhOpenQueryW, PDH_FMT_COUNTERVALUE_ITEM_W,
-        PDH_FMT_LARGE,
+        PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
+        PdhOpenQueryW, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_LARGE,
     };
     const PDH_MORE_DATA: u32 = 0x800007D2;
     const PDH_CSTATUS_VALID_DATA: u32 = 0;
@@ -720,7 +722,10 @@ pub fn paging_io_bytes_per_sec() -> Option<(u64, u64)> {
         PdhOpenQueryW, PDH_RAW_COUNTER,
     };
     const PAGE: u64 = 4096;
-    let paths = ["\\Memory\\Pages Input/sec\0", "\\Memory\\Pages Output/sec\0"];
+    let paths = [
+        "\\Memory\\Pages Input/sec\0",
+        "\\Memory\\Pages Output/sec\0",
+    ];
     // SAFETY: standard PDH open → add → collect → raw-read → close; every
     // fallible step is checked and the query is closed before returning.
     let (in_cum, out_cum) = unsafe {
@@ -799,7 +804,8 @@ pub fn paging_io_bytes_per_sec() -> Option<(u64, u64)> {
         txt.lines()
             .find_map(|l| {
                 let mut it = l.split_whitespace();
-                (it.next() == Some(k)).then(|| it.next().and_then(|v| v.parse::<u64>().ok()))
+                (it.next() == Some(k))
+                    .then(|| it.next().and_then(|v| v.parse::<u64>().ok()))
                     .flatten()
             })
             .unwrap_or(0)
@@ -998,9 +1004,14 @@ pub fn cpu_topology() -> CpuTopology {
     let logical = enumerate_logical_processors();
     let logical = if logical.is_empty() {
         // Failure fallback: at least enumerate the count we know about.
-        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
         (0..n as u32)
-            .map(|index| LogicalProcessor { index, core_class: CoreClass::Unknown })
+            .map(|index| LogicalProcessor {
+                index,
+                core_class: CoreClass::Unknown,
+            })
             .collect()
     } else {
         logical
@@ -1026,7 +1037,11 @@ fn cpu_package_identity() -> CpuPackage {
         let base_family = (eax >> 8) & 0xF;
         let ext_model = (eax >> 16) & 0xF;
         let ext_family = (eax >> 20) & 0xFF;
-        let family = if base_family == 0xF { base_family + ext_family } else { base_family };
+        let family = if base_family == 0xF {
+            base_family + ext_family
+        } else {
+            base_family
+        };
         let model = if base_family == 0x6 || base_family == 0xF {
             (ext_model << 4) | base_model
         } else {
@@ -1050,7 +1065,12 @@ fn cpu_package_identity() -> CpuPackage {
         if brand.is_empty() {
             brand = "CPU".to_string();
         }
-        CpuPackage { brand, family, model, stepping }
+        CpuPackage {
+            brand,
+            family,
+            model,
+            stepping,
+        }
     }
 }
 
@@ -1123,11 +1143,8 @@ fn enumerate_logical_processors() -> Vec<LogicalProcessor> {
             return Vec::new();
         }
         let mut buf = vec![0u8; len as usize];
-        let rc = GetLogicalProcessorInformationEx(
-            RELATION_PROCESSOR_CORE,
-            buf.as_mut_ptr(),
-            &mut len,
-        );
+        let rc =
+            GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, buf.as_mut_ptr(), &mut len);
         if rc == 0 {
             return Vec::new();
         }
@@ -1182,8 +1199,12 @@ fn enumerate_logical_processors() -> Vec<LogicalProcessor> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         // Match "cpuN" (not "cpufreq", "cpuidle", ...).
-        let Some(rest) = name.strip_prefix("cpu") else { continue };
-        let Ok(index) = rest.parse::<u32>() else { continue };
+        let Some(rest) = name.strip_prefix("cpu") else {
+            continue;
+        };
+        let Ok(index) = rest.parse::<u32>() else {
+            continue;
+        };
         // `cpu_capacity` (higher = more capable = P-core). Absent on plain
         // symmetric x86; falls through to Unknown via the single-class rule.
         let cap = std::fs::read_to_string(entry.path().join("cpu_capacity"))
@@ -1256,7 +1277,10 @@ fn classify(mut cores: Vec<(u32, u8)>) -> Vec<LogicalProcessor> {
     ranks.sort_unstable();
     ranks.dedup();
     let hybrid = ranks.len() >= 2;
-    let (min_r, max_r) = (ranks.first().copied().unwrap_or(0), ranks.last().copied().unwrap_or(0));
+    let (min_r, max_r) = (
+        ranks.first().copied().unwrap_or(0),
+        ranks.last().copied().unwrap_or(0),
+    );
     cores
         .into_iter()
         .map(|(index, eff)| {
@@ -1280,9 +1304,7 @@ fn classify(mut cores: Vec<(u32, u8)>) -> Vec<LogicalProcessor> {
 /// the pre-flight check stays at least as permissive as before.
 #[cfg(windows)]
 fn commit_budget(_phys_total: u64, _phys_avail: u64, _s: &sysinfo::System) -> (u64, u64) {
-    use windows_sys::Win32::System::SystemInformation::{
-        GlobalMemoryStatusEx, MEMORYSTATUSEX,
-    };
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut ms: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     ms.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: `ms` is a zeroed struct with the documented length
@@ -1351,12 +1373,18 @@ mod tests {
         // Commit total is always >= physical total (RAM + page-file /
         // swap >= RAM). Don't assert strict > because a host with no
         // swap configured is legal and the two will be equal.
-        assert!(m.commit_total_bytes >= m.total_bytes,
+        assert!(
+            m.commit_total_bytes >= m.total_bytes,
             "commit_total ({}) should be >= phys_total ({})",
-            m.commit_total_bytes, m.total_bytes);
-        assert!(m.commit_available_bytes >= m.available_bytes,
+            m.commit_total_bytes,
+            m.total_bytes
+        );
+        assert!(
+            m.commit_available_bytes >= m.available_bytes,
             "commit_avail ({}) should be >= phys_avail ({})",
-            m.commit_available_bytes, m.available_bytes);
+            m.commit_available_bytes,
+            m.available_bytes
+        );
         // Available never exceeds total.
         assert!(m.available_bytes <= m.total_bytes);
         assert!(m.commit_available_bytes <= m.commit_total_bytes);
@@ -1384,7 +1412,10 @@ mod tests {
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         {
-            assert!(p.portable, "expected portable=true by default (binary-relative)");
+            assert!(
+                p.portable,
+                "expected portable=true by default (binary-relative)"
+            );
             assert_eq!(p.config_dir, exe_dir, "config.toml sits beside the exe");
             assert_eq!(p.cache_dir, exe_dir.join("models"));
             assert_eq!(p.sessions_dir, exe_dir.join("sessions"));
@@ -1401,7 +1432,10 @@ mod tests {
         std::env::set_var("RUSTLLAMA_SYSTEM_DIRS", "1");
         let p = resolve_paths();
         std::env::remove_var("RUSTLLAMA_SYSTEM_DIRS");
-        assert!(!p.portable, "expected portable=false with RUSTLLAMA_SYSTEM_DIRS set");
+        assert!(
+            !p.portable,
+            "expected portable=false with RUSTLLAMA_SYSTEM_DIRS set"
+        );
         // System paths carry "rustllama" somewhere in the chain.
         assert!(p.config_dir.to_string_lossy().contains("rustllama"));
         assert!(p.cache_dir.to_string_lossy().contains("rustllama"));
@@ -1438,10 +1472,16 @@ mod tests {
         let first = acquire_server_lock().expect("acquire server lock");
         assert!(first.is_some(), "first acquisition should succeed");
         let second = acquire_server_lock().expect("second attempt should not error");
-        assert!(second.is_none(), "second acquisition should observe the held lock");
+        assert!(
+            second.is_none(),
+            "second acquisition should observe the held lock"
+        );
         drop(first);
         let third = acquire_server_lock().expect("re-acquire after release");
-        assert!(third.is_some(), "lock should be free again after the guard drops");
+        assert!(
+            third.is_some(),
+            "lock should be free again after the guard drops"
+        );
     }
 
     fn test_record(pid: u32, started_at: String) -> ServerRecord {

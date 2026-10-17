@@ -55,7 +55,11 @@ fn search_returns_inserted_messages_ranked_by_relevance() {
         .append_message(conv1, "user", "How do I deploy the migration?")
         .unwrap();
     store
-        .append_message(conv1, "assistant", "Run the migration script before the deploy.")
+        .append_message(
+            conv1,
+            "assistant",
+            "Run the migration script before the deploy.",
+        )
         .unwrap();
     let conv2 = store.create_conversation("Lunch ideas").unwrap();
     store
@@ -81,7 +85,9 @@ fn search_returns_inserted_messages_ranked_by_relevance() {
 fn search_supports_prefix_wildcard() {
     let store = HistoryStore::open_in_memory().unwrap();
     let id = store.create_conversation("test").unwrap();
-    store.append_message(id, "user", "deployment was successful").unwrap();
+    store
+        .append_message(id, "user", "deployment was successful")
+        .unwrap();
     store.append_message(id, "user", "lunch was tasty").unwrap();
     let hits = store.search_messages("deploy*", 10).unwrap();
     assert_eq!(hits.len(), 1, "prefix wildcard should match 'deployment'");
@@ -146,7 +152,10 @@ fn delete_conversation_removes_messages_from_fts() {
         .append_message(id, "user", "uniqueindexedword that we'll search for")
         .unwrap();
     assert_eq!(
-        store.search_messages("uniqueindexedword", 10).unwrap().len(),
+        store
+            .search_messages("uniqueindexedword", 10)
+            .unwrap()
+            .len(),
         1
     );
     store.delete_conversation(id).unwrap();
@@ -228,7 +237,12 @@ async fn search_endpoint_returns_400_on_invalid_fts_syntax() {
     // Stray unmatched-quote → FTS5 syntax error. Must come back
     // as 400 (client error) not 500 (server error).
     let (status, body) = get(app, "/api/conversations/search?q=%22unterminated").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
 }
 
 #[tokio::test]

@@ -220,33 +220,15 @@ pub fn build_apex_rules(tier: ApexTier, n_layers: usize) -> Vec<RecipeRule> {
     // Middle-layer routed experts — generic glob covering everything
     // we haven't already pinned with specific rules. The walker
     // takes the first match, so per-layer rules above win.
-    rules.push(RecipeRule::new(
-        "blk.*.ffn_gate_exps.weight",
-        routed_mid,
-    ));
-    rules.push(RecipeRule::new(
-        "blk.*.ffn_up_exps.weight",
-        routed_mid,
-    ));
-    rules.push(RecipeRule::new(
-        "blk.*.ffn_down_exps.weight",
-        routed_mid,
-    ));
+    rules.push(RecipeRule::new("blk.*.ffn_gate_exps.weight", routed_mid));
+    rules.push(RecipeRule::new("blk.*.ffn_up_exps.weight", routed_mid));
+    rules.push(RecipeRule::new("blk.*.ffn_down_exps.weight", routed_mid));
 
     // Shared-expert FFN tensors (DeepSeek-V3 family). Always-active
     // so APEX gives them the higher per-tier shared precision.
-    rules.push(RecipeRule::new(
-        "blk.*.ffn_gate_shexp.weight",
-        shared,
-    ));
-    rules.push(RecipeRule::new(
-        "blk.*.ffn_up_shexp.weight",
-        shared,
-    ));
-    rules.push(RecipeRule::new(
-        "blk.*.ffn_down_shexp.weight",
-        shared,
-    ));
+    rules.push(RecipeRule::new("blk.*.ffn_gate_shexp.weight", shared));
+    rules.push(RecipeRule::new("blk.*.ffn_up_shexp.weight", shared));
+    rules.push(RecipeRule::new("blk.*.ffn_down_shexp.weight", shared));
 
     // Attention projections. APEX assigns them uniformly across
     // layers (no edge gradient) per the README's "Q6_K uniformly"
@@ -321,10 +303,7 @@ mod tests {
         );
         // Random non-MoE tensor: caller falls through to plan
         // default (no rule matches `blk.0.attn_norm.weight`).
-        assert_eq!(
-            resolve_first_match("blk.0.attn_norm.weight", &rules),
-            None
-        );
+        assert_eq!(resolve_first_match("blk.0.attn_norm.weight", &rules), None);
     }
 
     /// Nano tier on a small (4-layer) model: every layer is an
@@ -441,10 +420,7 @@ mod tests {
                 resolve_first_match("blk.40.nextn.shared_head_norm.weight", &rules),
                 None
             );
-            assert_eq!(
-                resolve_first_match("mtp.0.attn_norm.weight", &rules),
-                None
-            );
+            assert_eq!(resolve_first_match("mtp.0.attn_norm.weight", &rules), None);
         }
     }
 }

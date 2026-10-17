@@ -858,7 +858,10 @@ pub fn write_synthetic_deepseek_mla_gguf(path: &Path, params: &SynthMla) {
         n_dense_layers,
     } = *params;
 
-    assert!(qk_rope_head_dim % 2 == 0, "qk_rope_head_dim must be even (it is RoPE-rotated)");
+    assert!(
+        qk_rope_head_dim % 2 == 0,
+        "qk_rope_head_dim must be even (it is RoPE-rotated)"
+    );
     let qk_head_dim = qk_nope_head_dim + qk_rope_head_dim;
     let q_out = n_heads * qk_head_dim; // per-head [nope | rope]
     let kv_a_out = kv_lora_rank + qk_rope_head_dim; // latent | decoupled rope key
@@ -926,7 +929,11 @@ pub fn write_synthetic_deepseek_mla_gguf(path: &Path, params: &SynthMla) {
     for i in 0..n_layers {
         let prefix = format!("blk.{i}");
         let sd = seed.wrapping_add(10_000 + (i as u64) * 100);
-        tensors.push(norm(&format!("{prefix}.attn_norm.weight"), d_model as usize, sd));
+        tensors.push(norm(
+            &format!("{prefix}.attn_norm.weight"),
+            d_model as usize,
+            sd,
+        ));
         // Q path.
         match q_lora_rank {
             Some(r) => {
@@ -936,7 +943,11 @@ pub fn write_synthetic_deepseek_mla_gguf(path: &Path, params: &SynthMla) {
                     (d_model * r) as usize,
                     sd.wrapping_add(1),
                 ));
-                tensors.push(norm(&format!("{prefix}.attn_q_a_norm.weight"), r as usize, sd.wrapping_add(2)));
+                tensors.push(norm(
+                    &format!("{prefix}.attn_q_a_norm.weight"),
+                    r as usize,
+                    sd.wrapping_add(2),
+                ));
                 tensors.push(wt(
                     &format!("{prefix}.attn_q_b.weight"),
                     vec![r as u64, q_out as u64],
@@ -960,7 +971,11 @@ pub fn write_synthetic_deepseek_mla_gguf(path: &Path, params: &SynthMla) {
             (d_model * kv_a_out) as usize,
             sd.wrapping_add(4),
         ));
-        tensors.push(norm(&format!("{prefix}.attn_kv_a_norm.weight"), kv_lora_rank as usize, sd.wrapping_add(5)));
+        tensors.push(norm(
+            &format!("{prefix}.attn_kv_a_norm.weight"),
+            kv_lora_rank as usize,
+            sd.wrapping_add(5),
+        ));
         tensors.push(wt(
             &format!("{prefix}.attn_kv_b.weight"),
             vec![kv_lora_rank as u64, kv_b_out as u64],
@@ -976,7 +991,11 @@ pub fn write_synthetic_deepseek_mla_gguf(path: &Path, params: &SynthMla) {
         // FFN. Dense for the first `n_dense_layers` (or all layers when
         // `moe` is None); MoE after.
         let is_dense = moe.is_none() || i < n_dense_layers;
-        tensors.push(norm(&format!("{prefix}.ffn_norm.weight"), d_model as usize, sd.wrapping_add(8)));
+        tensors.push(norm(
+            &format!("{prefix}.ffn_norm.weight"),
+            d_model as usize,
+            sd.wrapping_add(8),
+        ));
         if is_dense {
             tensors.push(wt(
                 &format!("{prefix}.ffn_gate.weight"),
@@ -1046,7 +1065,11 @@ pub fn write_synthetic_deepseek_mla_gguf(path: &Path, params: &SynthMla) {
         }
     }
 
-    tensors.push(norm("output_norm.weight", d_model as usize, seed.wrapping_add(99999)));
+    tensors.push(norm(
+        "output_norm.weight",
+        d_model as usize,
+        seed.wrapping_add(99999),
+    ));
     // output.weight omitted → tied to token_embd.
 
     write_gguf_file(path, m, &tensors);
@@ -1215,12 +1238,32 @@ pub fn write_synthetic_eagle_head_gguf(path: &Path, params: &SynthEagleHead) {
         (2 * d_model * d_model) as usize,
         seed.wrapping_add(1),
     ));
-    tensors.push(f32w("eagle.fc.bias", vec![d_model as u64], d_model as usize, seed.wrapping_add(2)));
-    tensors.push(f32w("eagle.enorm.weight", vec![d_model as u64], d_model as usize, seed.wrapping_add(3)));
-    tensors.push(f32w("eagle.hnorm.weight", vec![d_model as u64], d_model as usize, seed.wrapping_add(4)));
+    tensors.push(f32w(
+        "eagle.fc.bias",
+        vec![d_model as u64],
+        d_model as usize,
+        seed.wrapping_add(2),
+    ));
+    tensors.push(f32w(
+        "eagle.enorm.weight",
+        vec![d_model as u64],
+        d_model as usize,
+        seed.wrapping_add(3),
+    ));
+    tensors.push(f32w(
+        "eagle.hnorm.weight",
+        vec![d_model as u64],
+        d_model as usize,
+        seed.wrapping_add(4),
+    ));
 
     // Decoder block (same shapes as a base `blk.{i}.*` layer).
-    tensors.push(f32w("eagle.attn_norm.weight", vec![d_model as u64], d_model as usize, seed.wrapping_add(10)));
+    tensors.push(f32w(
+        "eagle.attn_norm.weight",
+        vec![d_model as u64],
+        d_model as usize,
+        seed.wrapping_add(10),
+    ));
     tensors.push(f32w(
         "eagle.attn_q.weight",
         vec![d_model as u64, d_q as u64],
@@ -1245,7 +1288,12 @@ pub fn write_synthetic_eagle_head_gguf(path: &Path, params: &SynthEagleHead) {
         (d_q * d_model) as usize,
         seed.wrapping_add(14),
     ));
-    tensors.push(f32w("eagle.ffn_norm.weight", vec![d_model as u64], d_model as usize, seed.wrapping_add(15)));
+    tensors.push(f32w(
+        "eagle.ffn_norm.weight",
+        vec![d_model as u64],
+        d_model as usize,
+        seed.wrapping_add(15),
+    ));
     tensors.push(f32w(
         "eagle.ffn_gate.weight",
         vec![d_model as u64, d_ff as u64],
@@ -1266,7 +1314,12 @@ pub fn write_synthetic_eagle_head_gguf(path: &Path, params: &SynthEagleHead) {
     ));
 
     if params.own_lm_head {
-        tensors.push(f32w("eagle.output_norm.weight", vec![d_model as u64], d_model as usize, seed.wrapping_add(20)));
+        tensors.push(f32w(
+            "eagle.output_norm.weight",
+            vec![d_model as u64],
+            d_model as usize,
+            seed.wrapping_add(20),
+        ));
         tensors.push(f32w(
             "eagle.output.weight",
             vec![d_model as u64, vocab as u64],
@@ -1415,11 +1468,10 @@ pub fn write_synthetic_bert_gguf(path: &Path, params: &SynthBert) {
     // WordPiece tokenizer will produce for a normalized + whitespace-
     // split + char-level-fallback input on lowercase text.
     let words: &[&str] = &[
-        "the", "a", "an", "and", "or", "is", "are", "was", "were", "be",
-        "to", "of", "in", "on", "at", "for", "with", "by", "from", "as",
-        "this", "that", "it", "i", "you", "he", "she", "we", "they",
-        "hello", "world", "test", "input", "embed", "model", "bert",
-        "fox", "dog", "cat", "jump", "over", "lazy", "quick", "brown",
+        "the", "a", "an", "and", "or", "is", "are", "was", "were", "be", "to", "of", "in", "on",
+        "at", "for", "with", "by", "from", "as", "this", "that", "it", "i", "you", "he", "she",
+        "we", "they", "hello", "world", "test", "input", "embed", "model", "bert", "fox", "dog",
+        "cat", "jump", "over", "lazy", "quick", "brown",
     ];
     for w in words {
         vocab_tokens.push((*w).to_string());
@@ -1456,10 +1508,7 @@ pub fn write_synthetic_bert_gguf(path: &Path, params: &SynthBert) {
     let token_types: Vec<i32> = vocab_tokens
         .iter()
         .map(|t| {
-            if matches!(
-                t.as_str(),
-                "[PAD]" | "[UNK]" | "[CLS]" | "[SEP]" | "[MASK]"
-            ) {
+            if matches!(t.as_str(), "[PAD]" | "[UNK]" | "[CLS]" | "[SEP]" | "[MASK]") {
                 3
             } else if t.starts_with("<unused_") {
                 5
@@ -1708,7 +1757,12 @@ pub fn write_synthetic_clip_mmproj_gguf(path: &Path) {
     // `[d_model, n_channels*ps*ps]` for the matvec hot path.
     tensors.push(f32_tensor(
         "v.patch_embd.weight",
-        vec![d_model as u64, n_channels as u64, patch_size as u64, patch_size as u64],
+        vec![
+            d_model as u64,
+            n_channels as u64,
+            patch_size as u64,
+            patch_size as u64,
+        ],
         (d_model * n_channels * patch_size * patch_size) as usize,
         seed.wrapping_add(1),
     ));
@@ -1970,8 +2024,18 @@ pub fn write_synthetic_qwen3vl_mmproj_gguf(path: &Path, deepstack_true: bool) {
         n_channels as u64,
         d_model as u64,
     ];
-    tensors.push(f32_tensor("v.patch_embd.weight", patch_dims.clone(), patch_elems, seed + 1));
-    tensors.push(f32_tensor("v.patch_embd.weight.1", patch_dims, patch_elems, seed + 2));
+    tensors.push(f32_tensor(
+        "v.patch_embd.weight",
+        patch_dims.clone(),
+        patch_elems,
+        seed + 1,
+    ));
+    tensors.push(f32_tensor(
+        "v.patch_embd.weight.1",
+        patch_dims,
+        patch_elems,
+        seed + 2,
+    ));
     tensors.push(f32_bias("v.patch_embd.bias", d_model as usize, seed + 3));
     // Position embedding — real dims order [d_model, rows], rows ==
     // patches (no class token).
@@ -2005,25 +2069,53 @@ pub fn write_synthetic_qwen3vl_mmproj_gguf(path: &Path, deepstack_true: bool) {
             (d_model * d_model) as usize,
             base + 3,
         ));
-        tensors.push(f32_bias(&format!("{prefix}.attn_out.bias"), d_model as usize, base + 4));
-        tensors.push(f32_bias(&format!("{prefix}.ln1.weight"), d_model as usize, base + 5));
-        tensors.push(f32_bias(&format!("{prefix}.ln1.bias"), d_model as usize, base + 6));
-        tensors.push(f32_bias(&format!("{prefix}.ln2.weight"), d_model as usize, base + 7));
-        tensors.push(f32_bias(&format!("{prefix}.ln2.bias"), d_model as usize, base + 8));
+        tensors.push(f32_bias(
+            &format!("{prefix}.attn_out.bias"),
+            d_model as usize,
+            base + 4,
+        ));
+        tensors.push(f32_bias(
+            &format!("{prefix}.ln1.weight"),
+            d_model as usize,
+            base + 5,
+        ));
+        tensors.push(f32_bias(
+            &format!("{prefix}.ln1.bias"),
+            d_model as usize,
+            base + 6,
+        ));
+        tensors.push(f32_bias(
+            &format!("{prefix}.ln2.weight"),
+            d_model as usize,
+            base + 7,
+        ));
+        tensors.push(f32_bias(
+            &format!("{prefix}.ln2.bias"),
+            d_model as usize,
+            base + 8,
+        ));
         tensors.push(f32_tensor(
             &format!("{prefix}.ffn_up.weight"),
             vec![d_model as u64, d_ff as u64],
             (d_ff * d_model) as usize,
             base + 9,
         ));
-        tensors.push(f32_bias(&format!("{prefix}.ffn_up.bias"), d_ff as usize, base + 10));
+        tensors.push(f32_bias(
+            &format!("{prefix}.ffn_up.bias"),
+            d_ff as usize,
+            base + 10,
+        ));
         tensors.push(f32_tensor(
             &format!("{prefix}.ffn_down.weight"),
             vec![d_ff as u64, d_model as u64],
             (d_model * d_ff) as usize,
             base + 11,
         ));
-        tensors.push(f32_bias(&format!("{prefix}.ffn_down.bias"), d_model as usize, base + 12));
+        tensors.push(f32_bias(
+            &format!("{prefix}.ffn_down.bias"),
+            d_model as usize,
+            base + 12,
+        ));
     }
 
     // Merger projector — mm.0 [4d, 4d] square, mm.2 [4d, d_text],
@@ -2142,4 +2234,3 @@ fn random_f32(n: usize, seed: u64) -> Vec<f32> {
     }
     out
 }
-

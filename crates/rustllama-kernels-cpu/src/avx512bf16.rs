@@ -169,6 +169,9 @@ mod tests {
             eprintln!("avx512bf16: not supported on this host — SKIP");
             return;
         }
-        assert!(avx512bf16_gemm_usable(), "AVX-512-BF16 present but self-check failed");
+        assert!(
+            avx512bf16_gemm_usable(),
+            "AVX-512-BF16 present but self-check failed"
+        );
     }
 }

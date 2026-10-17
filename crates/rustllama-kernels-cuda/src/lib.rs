@@ -218,90 +218,614 @@ extern "C" {
         n_elems: c_int,
         block: c_int,
     ) -> c_int;
-    fn rsl_cuda_matvec_q8_0_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_q8_0_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_q4_k_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_q4_k_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
+    fn rsl_cuda_matvec_q8_0_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q8_0_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q4_k_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q4_k_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
     // Q4_K prefill GEMM (Phase 1): tiled, shared-mem weight REUSE, f32 accumulate
     // (bit-exact). out[N,M] = x[N,K] . W[M,K]^T. Selected by accel.rs on the
     // prefill path via the `gemm:q4_k_f32` verdict.
-    fn rsl_cuda_gemm_q4_k_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
+    fn rsl_cuda_gemm_q4_k_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
     // Q4_K prefill GEMM (Phase 2): int8 tensor-core W8A8 (lossy). Same shape;
     // selected via the `gemm:q4_k_w8a8_tc` verdict.
-    fn rsl_cuda_gemm_q4_k_w8a8_tc(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
+    fn rsl_cuda_gemm_q4_k_w8a8_tc(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
     // Q4_K W4A8 DECODE matvec (single-row, lossy int8-activation). Selected via
     // the `matvec:q4_k_w4a8` verdict (correct + perf-gated vs the f32 matvec).
-    fn rsl_cuda_matvec_q4_k_w4a8(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_q6_k_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_q6_k_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
+    fn rsl_cuda_matvec_q4_k_w4a8(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q6_k_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q6_k_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
 
     // Additional packed matvecs (K-quants Q5_K/Q2_K/Q8_K, legacy quants
     // Q4_0/Q5_0/Q4_1/Q5_1, IQ family, NVFP4). One thread per output row.
-    fn rsl_cuda_matvec_q5_k_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_q5_k_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_q2_k_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_q2_k_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_q8_k_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_q8_k_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_q4_0_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_q4_0_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_q5_0_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_q5_0_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_q4_1_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_q4_1_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_q5_1_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_q5_1_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq4_nl_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq4_nl_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq4_xs_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq4_xs_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq2_xxs_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq2_xxs_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq2_xs_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq2_xs_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq2_s_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq2_s_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq3_xxs_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq3_xxs_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq3_s_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq3_s_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq1_s_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq1_s_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq1_m_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq1_m_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_nvfp4_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_nvfp4_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
+    fn rsl_cuda_matvec_q5_k_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q5_k_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q2_k_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q2_k_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q8_k_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q8_k_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q4_0_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q4_0_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q5_0_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q5_0_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q4_1_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q4_1_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q5_1_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q5_1_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq4_nl_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq4_nl_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq4_xs_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq4_xs_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq2_xxs_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq2_xxs_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq2_xs_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq2_xs_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq2_s_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq2_s_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq3_xxs_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq3_xxs_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq3_s_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq3_s_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq1_s_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq1_s_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq1_m_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq1_m_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_nvfp4_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_nvfp4_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
     // OCP Microscaling FP4/FP6/FP8. 32-elem blocks + trailing E8M0 scale
     // byte; K%32==0. MXFP4: 17 B, MXFP6: 25 B, MXFP8: 33 B per block.
-    fn rsl_cuda_matvec_mxfp4_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_mxfp4_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_mxfp6_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_mxfp6_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_mxfp8_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_mxfp8_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
+    fn rsl_cuda_matvec_mxfp4_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_mxfp4_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_mxfp6_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_mxfp6_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_mxfp8_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_mxfp8_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
     // Q3_K + PQ2_0 (parity-gap close). Q3_K: 110 B/256, K%256==0.
     // PQ2_0: 34 B/128, K%128==0.
-    fn rsl_cuda_matvec_q3_k_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_q3_k_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_cuda_matvec_pq2_0_packed_f32(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_pq2_0_packed_f32_batched(s: *mut RslCudaStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
+    fn rsl_cuda_matvec_q3_k_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q3_k_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_pq2_0_packed_f32(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_pq2_0_packed_f32_batched(
+        s: *mut RslCudaStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
 
     // Fused gate+up matvec (decode): one launch computes gate_out + up_out for
     // the FFN. gw/uw = packed gate/up weights [M,K]; gout/uout = [M] device ptrs.
-    fn rsl_cuda_matvec_q8_0_packed_f32_gate_up_fused(s: *mut RslCudaStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_q4_k_packed_f32_gate_up_fused(s: *mut RslCudaStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_q6_k_packed_f32_gate_up_fused(s: *mut RslCudaStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_q5_k_packed_f32_gate_up_fused(s: *mut RslCudaStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq4_nl_packed_f32_gate_up_fused(s: *mut RslCudaStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq4_xs_packed_f32_gate_up_fused(s: *mut RslCudaStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq1_s_packed_f32_gate_up_fused(s: *mut RslCudaStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq1_m_packed_f32_gate_up_fused(s: *mut RslCudaStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq2_xxs_packed_f32_gate_up_fused(s: *mut RslCudaStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq2_xs_packed_f32_gate_up_fused(s: *mut RslCudaStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq2_s_packed_f32_gate_up_fused(s: *mut RslCudaStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq3_xxs_packed_f32_gate_up_fused(s: *mut RslCudaStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_iq3_s_packed_f32_gate_up_fused(s: *mut RslCudaStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_cuda_matvec_ptq1_0_packed_f32_gate_up_fused(s: *mut RslCudaStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
+    fn rsl_cuda_matvec_q8_0_packed_f32_gate_up_fused(
+        s: *mut RslCudaStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q4_k_packed_f32_gate_up_fused(
+        s: *mut RslCudaStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q6_k_packed_f32_gate_up_fused(
+        s: *mut RslCudaStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_q5_k_packed_f32_gate_up_fused(
+        s: *mut RslCudaStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq4_nl_packed_f32_gate_up_fused(
+        s: *mut RslCudaStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq4_xs_packed_f32_gate_up_fused(
+        s: *mut RslCudaStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq1_s_packed_f32_gate_up_fused(
+        s: *mut RslCudaStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq1_m_packed_f32_gate_up_fused(
+        s: *mut RslCudaStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq2_xxs_packed_f32_gate_up_fused(
+        s: *mut RslCudaStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq2_xs_packed_f32_gate_up_fused(
+        s: *mut RslCudaStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq2_s_packed_f32_gate_up_fused(
+        s: *mut RslCudaStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq3_xxs_packed_f32_gate_up_fused(
+        s: *mut RslCudaStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_iq3_s_packed_f32_gate_up_fused(
+        s: *mut RslCudaStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_cuda_matvec_ptq1_0_packed_f32_gate_up_fused(
+        s: *mut RslCudaStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
 
     // Forward-pass primitives (device-resident, f32).
     fn rsl_cuda_add_rmsnorm_f32(
@@ -817,7 +1341,8 @@ pub unsafe fn gemm_mxfp8_tc_f32(
     n: usize,
     k: usize,
 ) -> Result<(), CudaError> {
-    let rc = rsl_cuda_gemm_mxfp8_tc_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int);
+    let rc =
+        rsl_cuda_gemm_mxfp8_tc_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int);
     if rc == 0 {
         Ok(())
     } else {
@@ -839,7 +1364,8 @@ pub unsafe fn gemm_mxfp6_tc_f32(
     n: usize,
     k: usize,
 ) -> Result<(), CudaError> {
-    let rc = rsl_cuda_gemm_mxfp6_tc_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int);
+    let rc =
+        rsl_cuda_gemm_mxfp6_tc_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int);
     if rc == 0 {
         Ok(())
     } else {
@@ -878,7 +1404,15 @@ pub unsafe fn gemm_mxfp8_wgmma_f32(
     tma: bool,
 ) -> Result<(), CudaError> {
     let rc = if tma {
-        rsl_cuda_gemm_mxfp8_wgmma_tma_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int)
+        rsl_cuda_gemm_mxfp8_wgmma_tma_f32(
+            stream.raw(),
+            w,
+            x,
+            out,
+            m as c_int,
+            n as c_int,
+            k as c_int,
+        )
     } else {
         rsl_cuda_gemm_mxfp8_wgmma_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int)
     };
@@ -933,7 +1467,8 @@ pub unsafe fn gemm_fp8_sp24_f32(
     n: usize,
     k: usize,
 ) -> Result<(), CudaError> {
-    let rc = rsl_cuda_gemm_fp8_sp24_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int);
+    let rc =
+        rsl_cuda_gemm_fp8_sp24_f32(stream.raw(), w, x, out, m as c_int, n as c_int, k as c_int);
     if rc == 0 {
         Ok(())
     } else {
@@ -996,7 +1531,14 @@ pub fn rmsnorm_f32(
     assert!(w.len() >= d);
     // SAFETY: slices outlive the call; lengths are checked above.
     let rc = unsafe {
-        rsl_cuda_rmsnorm_f32(x.as_ptr(), w.as_ptr(), y.as_mut_ptr(), n_rows as c_int, d as c_int, eps)
+        rsl_cuda_rmsnorm_f32(
+            x.as_ptr(),
+            w.as_ptr(),
+            y.as_mut_ptr(),
+            n_rows as c_int,
+            d as c_int,
+            eps,
+        )
     };
     if rc == 0 {
         Ok(())
@@ -1018,7 +1560,13 @@ pub fn matvec_f32(
     assert!(out.len() >= m_rows);
     // SAFETY: slices outlive the call; lengths are checked above.
     let rc = unsafe {
-        rsl_cuda_matvec_f32(weights.as_ptr(), x.as_ptr(), out.as_mut_ptr(), m_rows as c_int, k_dim as c_int)
+        rsl_cuda_matvec_f32(
+            weights.as_ptr(),
+            x.as_ptr(),
+            out.as_mut_ptr(),
+            m_rows as c_int,
+            k_dim as c_int,
+        )
     };
     if rc == 0 {
         Ok(())
@@ -1103,7 +1651,10 @@ impl CudaStream {
         if raw.is_null() {
             None
         } else {
-            Some(Self { raw, device: device_index })
+            Some(Self {
+                raw,
+                device: device_index,
+            })
         }
     }
     pub fn device(&self) -> u32 {
@@ -1142,7 +1693,11 @@ impl<'s> CudaDeviceBuffer<'s> {
         if ptr.is_null() {
             None
         } else {
-            Some(Self { ptr, len_bytes: src.len(), stream })
+            Some(Self {
+                ptr,
+                len_bytes: src.len(),
+                stream,
+            })
         }
     }
     /// Allocate `n_bytes` of uninitialized device memory.
@@ -1155,7 +1710,11 @@ impl<'s> CudaDeviceBuffer<'s> {
         if ptr.is_null() {
             None
         } else {
-            Some(Self { ptr, len_bytes: n_bytes, stream })
+            Some(Self {
+                ptr,
+                len_bytes: n_bytes,
+                stream,
+            })
         }
     }
     pub fn as_ptr(&self) -> *const c_void {
@@ -1421,8 +1980,14 @@ pub unsafe fn hadamard_forward(
     n_elems: usize,
     block: usize,
 ) -> Result<(), CudaError> {
-    let rc =
-        rsl_cuda_hadamard_forward(stream.raw(), x, signs, out, n_elems as c_int, block as c_int);
+    let rc = rsl_cuda_hadamard_forward(
+        stream.raw(),
+        x,
+        signs,
+        out,
+        n_elems as c_int,
+        block as c_int,
+    );
     if rc == 0 {
         Ok(())
     } else {
@@ -1556,20 +2121,62 @@ macro_rules! cuda_gate_up_fused {
         }
     };
 }
-cuda_gate_up_fused!(matvec_q8_0_gate_up_fused, rsl_cuda_matvec_q8_0_packed_f32_gate_up_fused);
-cuda_gate_up_fused!(matvec_q4_k_gate_up_fused, rsl_cuda_matvec_q4_k_packed_f32_gate_up_fused);
-cuda_gate_up_fused!(matvec_q6_k_gate_up_fused, rsl_cuda_matvec_q6_k_packed_f32_gate_up_fused);
-cuda_gate_up_fused!(matvec_q5_k_gate_up_fused, rsl_cuda_matvec_q5_k_packed_f32_gate_up_fused);
-cuda_gate_up_fused!(matvec_iq4_nl_gate_up_fused, rsl_cuda_matvec_iq4_nl_packed_f32_gate_up_fused);
-cuda_gate_up_fused!(matvec_iq4_xs_gate_up_fused, rsl_cuda_matvec_iq4_xs_packed_f32_gate_up_fused);
-cuda_gate_up_fused!(matvec_iq1_s_gate_up_fused, rsl_cuda_matvec_iq1_s_packed_f32_gate_up_fused);
-cuda_gate_up_fused!(matvec_iq1_m_gate_up_fused, rsl_cuda_matvec_iq1_m_packed_f32_gate_up_fused);
-cuda_gate_up_fused!(matvec_iq2_xxs_gate_up_fused, rsl_cuda_matvec_iq2_xxs_packed_f32_gate_up_fused);
-cuda_gate_up_fused!(matvec_iq2_xs_gate_up_fused, rsl_cuda_matvec_iq2_xs_packed_f32_gate_up_fused);
-cuda_gate_up_fused!(matvec_iq2_s_gate_up_fused, rsl_cuda_matvec_iq2_s_packed_f32_gate_up_fused);
-cuda_gate_up_fused!(matvec_iq3_xxs_gate_up_fused, rsl_cuda_matvec_iq3_xxs_packed_f32_gate_up_fused);
-cuda_gate_up_fused!(matvec_iq3_s_gate_up_fused, rsl_cuda_matvec_iq3_s_packed_f32_gate_up_fused);
-cuda_gate_up_fused!(matvec_ptq1_0_gate_up_fused, rsl_cuda_matvec_ptq1_0_packed_f32_gate_up_fused);
+cuda_gate_up_fused!(
+    matvec_q8_0_gate_up_fused,
+    rsl_cuda_matvec_q8_0_packed_f32_gate_up_fused
+);
+cuda_gate_up_fused!(
+    matvec_q4_k_gate_up_fused,
+    rsl_cuda_matvec_q4_k_packed_f32_gate_up_fused
+);
+cuda_gate_up_fused!(
+    matvec_q6_k_gate_up_fused,
+    rsl_cuda_matvec_q6_k_packed_f32_gate_up_fused
+);
+cuda_gate_up_fused!(
+    matvec_q5_k_gate_up_fused,
+    rsl_cuda_matvec_q5_k_packed_f32_gate_up_fused
+);
+cuda_gate_up_fused!(
+    matvec_iq4_nl_gate_up_fused,
+    rsl_cuda_matvec_iq4_nl_packed_f32_gate_up_fused
+);
+cuda_gate_up_fused!(
+    matvec_iq4_xs_gate_up_fused,
+    rsl_cuda_matvec_iq4_xs_packed_f32_gate_up_fused
+);
+cuda_gate_up_fused!(
+    matvec_iq1_s_gate_up_fused,
+    rsl_cuda_matvec_iq1_s_packed_f32_gate_up_fused
+);
+cuda_gate_up_fused!(
+    matvec_iq1_m_gate_up_fused,
+    rsl_cuda_matvec_iq1_m_packed_f32_gate_up_fused
+);
+cuda_gate_up_fused!(
+    matvec_iq2_xxs_gate_up_fused,
+    rsl_cuda_matvec_iq2_xxs_packed_f32_gate_up_fused
+);
+cuda_gate_up_fused!(
+    matvec_iq2_xs_gate_up_fused,
+    rsl_cuda_matvec_iq2_xs_packed_f32_gate_up_fused
+);
+cuda_gate_up_fused!(
+    matvec_iq2_s_gate_up_fused,
+    rsl_cuda_matvec_iq2_s_packed_f32_gate_up_fused
+);
+cuda_gate_up_fused!(
+    matvec_iq3_xxs_gate_up_fused,
+    rsl_cuda_matvec_iq3_xxs_packed_f32_gate_up_fused
+);
+cuda_gate_up_fused!(
+    matvec_iq3_s_gate_up_fused,
+    rsl_cuda_matvec_iq3_s_packed_f32_gate_up_fused
+);
+cuda_gate_up_fused!(
+    matvec_ptq1_0_gate_up_fused,
+    rsl_cuda_matvec_ptq1_0_packed_f32_gate_up_fused
+);
 
 /// Safe wrapper for the Q4_K prefill GEMM (tiled, shared-mem weight reuse, f32
 /// accumulate — bit-exact). `out` = [N,M] row-major, `x` = [N,K] row-major, `w`
@@ -1588,15 +2195,7 @@ pub unsafe fn gemm_q4_k_f32(
     k: usize,
     n: usize,
 ) -> Result<(), CudaError> {
-    let rc = rsl_cuda_gemm_q4_k_f32(
-        stream.raw(),
-        w,
-        x,
-        out,
-        m as c_int,
-        k as c_int,
-        n as c_int,
-    );
+    let rc = rsl_cuda_gemm_q4_k_f32(stream.raw(), w, x, out, m as c_int, k as c_int, n as c_int);
     if rc == 0 {
         Ok(())
     } else {
@@ -1620,15 +2219,8 @@ pub unsafe fn gemm_q4_k_w8a8_tc(
     k: usize,
     n: usize,
 ) -> Result<(), CudaError> {
-    let rc = rsl_cuda_gemm_q4_k_w8a8_tc(
-        stream.raw(),
-        w,
-        x,
-        out,
-        m as c_int,
-        k as c_int,
-        n as c_int,
-    );
+    let rc =
+        rsl_cuda_gemm_q4_k_w8a8_tc(stream.raw(), w, x, out, m as c_int, k as c_int, n as c_int);
     if rc == 0 {
         Ok(())
     } else {
@@ -1900,8 +2492,14 @@ pub unsafe fn qk_head_norm_f32(
     head_dim: usize,
     eps: f32,
 ) -> Result<(), CudaError> {
-    let rc =
-        rsl_cuda_qk_head_norm_f32(stream.raw(), buf, w, n_heads as c_int, head_dim as c_int, eps);
+    let rc = rsl_cuda_qk_head_norm_f32(
+        stream.raw(),
+        buf,
+        w,
+        n_heads as c_int,
+        head_dim as c_int,
+        eps,
+    );
     if rc == 0 {
         Ok(())
     } else {
@@ -2154,11 +2752,24 @@ pub unsafe fn flash_attn_decode_q4_0(
     softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_decode_q4_0(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int, kv_len as c_int,
-        window as c_int, softcap,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len as c_int,
+        window as c_int,
+        softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention prefill for a Q4_0 KV cache. `q`/`out` are
@@ -2186,12 +2797,25 @@ pub unsafe fn flash_attn_prefill_q4_0(
     softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_prefill_q4_0(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
-        kv_len_base as c_int, n_new as c_int,
-        window as c_int, softcap,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len_base as c_int,
+        n_new as c_int,
+        window as c_int,
+        softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention decode for an NVFP4 KV cache. Layout as
@@ -2217,11 +2841,24 @@ pub unsafe fn flash_attn_decode_nvfp4(
     softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_decode_nvfp4(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int, kv_len as c_int,
-        window as c_int, softcap,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len as c_int,
+        window as c_int,
+        softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention prefill for an NVFP4 KV cache.
@@ -2248,12 +2885,25 @@ pub unsafe fn flash_attn_prefill_nvfp4(
     softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_prefill_nvfp4(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
-        kv_len_base as c_int, n_new as c_int,
-        window as c_int, softcap,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len_base as c_int,
+        n_new as c_int,
+        window as c_int,
+        softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention decode for an MXFP4 KV cache. Layout as
@@ -2280,11 +2930,24 @@ pub unsafe fn flash_attn_decode_mxfp4(
     softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_decode_mxfp4(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int, kv_len as c_int,
-        window as c_int, softcap,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len as c_int,
+        window as c_int,
+        softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention prefill for an MXFP4 KV cache.
@@ -2311,12 +2974,25 @@ pub unsafe fn flash_attn_prefill_mxfp4(
     softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_prefill_mxfp4(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
-        kv_len_base as c_int, n_new as c_int,
-        window as c_int, softcap,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len_base as c_int,
+        n_new as c_int,
+        window as c_int,
+        softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention decode for an MXFP6 KV cache. Layout as
@@ -2343,11 +3019,24 @@ pub unsafe fn flash_attn_decode_mxfp6(
     softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_decode_mxfp6(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int, kv_len as c_int,
-        window as c_int, softcap,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len as c_int,
+        window as c_int,
+        softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention prefill for an MXFP6 KV cache.
@@ -2374,12 +3063,25 @@ pub unsafe fn flash_attn_prefill_mxfp6(
     softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_prefill_mxfp6(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
-        kv_len_base as c_int, n_new as c_int,
-        window as c_int, softcap,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len_base as c_int,
+        n_new as c_int,
+        window as c_int,
+        softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention decode for an MXFP8 KV cache. Layout as
@@ -2406,11 +3108,24 @@ pub unsafe fn flash_attn_decode_mxfp8(
     softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_decode_mxfp8(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int, kv_len as c_int,
-        window as c_int, softcap,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len as c_int,
+        window as c_int,
+        softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention prefill for an MXFP8 KV cache.
@@ -2437,12 +3152,25 @@ pub unsafe fn flash_attn_prefill_mxfp8(
     softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_prefill_mxfp8(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
-        kv_len_base as c_int, n_new as c_int,
-        window as c_int, softcap,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len_base as c_int,
+        n_new as c_int,
+        window as c_int,
+        softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention decode for a TurboQuant KV cache.
@@ -2473,12 +3201,27 @@ pub unsafe fn flash_attn_decode_tq(
     softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_decode_tq(
-        stream.raw(), q, k_packed, v_packed, k_scales, v_scales, bits as c_int,
-        out, n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
-        max_ctx as c_int, kv_len as c_int,
-        window as c_int, softcap,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        k_scales,
+        v_scales,
+        bits as c_int,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len as c_int,
+        window as c_int,
+        softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention prefill for a TurboQuant KV cache.
@@ -2508,12 +3251,28 @@ pub unsafe fn flash_attn_prefill_tq(
     softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_prefill_tq(
-        stream.raw(), q, k_packed, v_packed, k_scales, v_scales, bits as c_int,
-        out, n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
-        max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
-        window as c_int, softcap,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        k_scales,
+        v_scales,
+        bits as c_int,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len_base as c_int,
+        n_new as c_int,
+        window as c_int,
+        softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention decode for a Q8_0 KV cache. `q`/`out` are
@@ -2546,12 +3305,26 @@ pub unsafe fn flash_attn_decode_q8_0(
     softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_decode_q8_0(
-        stream.raw(), q, k_packed, v_packed, k_scales, v_scales, out,
-        n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
-        max_ctx as c_int, kv_len as c_int,
-        window as c_int, softcap,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        k_scales,
+        v_scales,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len as c_int,
+        window as c_int,
+        softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention prefill for a Q8_0 KV cache. `q`/`out` are
@@ -2582,12 +3355,27 @@ pub unsafe fn flash_attn_prefill_q8_0(
     softcap: f32,
 ) -> Result<(), CudaError> {
     let rc = rsl_cuda_flash_attn_prefill_q8_0(
-        stream.raw(), q, k_packed, v_packed, k_scales, v_scales, out,
-        n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
-        max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
-        window as c_int, softcap,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        k_scales,
+        v_scales,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len_base as c_int,
+        n_new as c_int,
+        window as c_int,
+        softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(CudaError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
 }
 
 /// Greedy argmax over `vocab` f32 logits; writes the chosen index to
@@ -2754,7 +3542,11 @@ impl RawDevBuf {
         if ptr.is_null() {
             None
         } else {
-            Some(Self { ptr, cap_bytes: n_bytes, raw_stream: stream.raw() })
+            Some(Self {
+                ptr,
+                cap_bytes: n_bytes,
+                raw_stream: stream.raw(),
+            })
         }
     }
     /// Upload `src` bytes (must be <= cap). Returns false on failure.
@@ -2799,7 +3591,12 @@ impl RawDevBuf {
         // SAFETY: dst is within the live cap_bytes allocation.
         let dst = unsafe { (self.ptr as *mut u8).add(byte_offset) as *mut c_void };
         let rc = unsafe {
-            rsl_cuda_memcpy_h2d(self.raw_stream, dst, src.as_ptr() as *const c_void, src.len() as u64)
+            rsl_cuda_memcpy_h2d(
+                self.raw_stream,
+                dst,
+                src.as_ptr() as *const c_void,
+                src.len() as u64,
+            )
         };
         rc == 0
     }
@@ -2811,7 +3608,12 @@ impl RawDevBuf {
         // SAFETY: src is within the live cap_bytes allocation.
         let src = unsafe { (self.ptr as *const u8).add(byte_offset) as *const c_void };
         let rc = unsafe {
-            rsl_cuda_memcpy_d2h(self.raw_stream, dst.as_mut_ptr() as *mut c_void, src, dst.len() as u64)
+            rsl_cuda_memcpy_d2h(
+                self.raw_stream,
+                dst.as_mut_ptr() as *mut c_void,
+                src,
+                dst.len() as u64,
+            )
         };
         rc == 0
     }
@@ -2830,7 +3632,12 @@ impl RawDevBuf {
         // SAFETY: dst is within the live cap_bytes allocation.
         let dst = unsafe { (self.ptr as *mut u8).add(byte_offset) as *mut c_void };
         let rc = unsafe {
-            rsl_cuda_memcpy_h2d_async(self.raw_stream, dst, src.as_ptr() as *const c_void, src.len() as u64)
+            rsl_cuda_memcpy_h2d_async(
+                self.raw_stream,
+                dst,
+                src.as_ptr() as *const c_void,
+                src.len() as u64,
+            )
         };
         rc == 0
     }
@@ -2845,7 +3652,12 @@ impl RawDevBuf {
         // SAFETY: src is within the live cap_bytes allocation.
         let src = unsafe { (self.ptr as *const u8).add(byte_offset) as *const c_void };
         let rc = unsafe {
-            rsl_cuda_memcpy_d2h_async(self.raw_stream, dst.as_mut_ptr() as *mut c_void, src, dst.len() as u64)
+            rsl_cuda_memcpy_d2h_async(
+                self.raw_stream,
+                dst.as_mut_ptr() as *mut c_void,
+                src,
+                dst.len() as u64,
+            )
         };
         rc == 0
     }
@@ -2902,7 +3714,7 @@ pub struct CudaMatvecCache {
     attn_v_mirror: Vec<Option<RawDevBuf>>,
     attn_valid_len: Vec<u32>,
     attn_mirror_ctx: (u32, u32, u32), // (n_layers, n_kv_heads*head_dim, max_ctx) — rebuild on change
-    attn_act: Option<RawDevBuf>,   // activation slab: hidden|h_norm|q|k|v|attn_out|o|h_norm2
+    attn_act: Option<RawDevBuf>,      // activation slab: hidden|h_norm|q|k|v|attn_out|o|h_norm2
     attn_norms: Option<RawDevBuf>, // norm-weight slab: attn_norm|post_norm|q_norm|k_norm|inv_freq
     // Feature 1b: one cached CUDA-graph executable per layer for the graph-mode
     // attention block (`decode_attn_block_f32_graph`). `None` until the first
@@ -2968,7 +3780,11 @@ impl CudaMatvecCache {
         self.attn_graph_exec = Vec::new();
     }
 
-    fn ensure_scratch(slot: &mut Option<RawDevBuf>, stream: &CudaStream, need_bytes: usize) -> bool {
+    fn ensure_scratch(
+        slot: &mut Option<RawDevBuf>,
+        stream: &CudaStream,
+        need_bytes: usize,
+    ) -> bool {
         let big_enough = matches!(slot, Some(b) if b.cap_bytes >= need_bytes);
         if big_enough {
             return true;
@@ -3041,8 +3857,7 @@ impl CudaMatvecCache {
         {
             return false;
         }
-        let x_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
+        let x_bytes: &[u8] = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
         if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
             return false;
         }
@@ -3053,32 +3868,84 @@ impl CudaMatvecCache {
         // for (M,K); the wrapper synchronizes before returning.
         let res = unsafe {
             match kind {
-                CudaPackedKind::Ptq1_0 => matvec_ptq1_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q8_0 => matvec_q8_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q4_K => matvec_q4_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q6_K => matvec_q6_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q5_K => matvec_q5_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q2_K => matvec_q2_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q8_K => matvec_q8_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q4_0 => matvec_q4_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q5_0 => matvec_q5_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q4_1 => matvec_q4_1_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q5_1 => matvec_q5_1_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Iq4_Nl => matvec_iq4_nl_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Iq4_Xs => matvec_iq4_xs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Iq2_Xxs => matvec_iq2_xxs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Iq2_Xs => matvec_iq2_xs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Iq2_S => matvec_iq2_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Iq3_Xxs => matvec_iq3_xxs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Iq3_S => matvec_iq3_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Iq1_S => matvec_iq1_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Iq1_M => matvec_iq1_m_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Nvfp4 => matvec_nvfp4_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Mxfp4 => matvec_mxfp4_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Mxfp6 => matvec_mxfp6_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Mxfp8 => matvec_mxfp8_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q3_K => matvec_q3_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Pq2_0 => matvec_pq2_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Ptq1_0 => {
+                    matvec_ptq1_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q8_0 => {
+                    matvec_q8_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q4_K => {
+                    matvec_q4_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q6_K => {
+                    matvec_q6_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q5_K => {
+                    matvec_q5_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q2_K => {
+                    matvec_q2_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q8_K => {
+                    matvec_q8_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q4_0 => {
+                    matvec_q4_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q5_0 => {
+                    matvec_q5_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q4_1 => {
+                    matvec_q4_1_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q5_1 => {
+                    matvec_q5_1_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Iq4_Nl => {
+                    matvec_iq4_nl_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Iq4_Xs => {
+                    matvec_iq4_xs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Iq2_Xxs => {
+                    matvec_iq2_xxs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Iq2_Xs => {
+                    matvec_iq2_xs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Iq2_S => {
+                    matvec_iq2_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Iq3_Xxs => {
+                    matvec_iq3_xxs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Iq3_S => {
+                    matvec_iq3_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Iq1_S => {
+                    matvec_iq1_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Iq1_M => {
+                    matvec_iq1_m_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Nvfp4 => {
+                    matvec_nvfp4_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Mxfp4 => {
+                    matvec_mxfp4_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Mxfp6 => {
+                    matvec_mxfp6_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Mxfp8 => {
+                    matvec_mxfp8_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q3_K => {
+                    matvec_q3_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Pq2_0 => {
+                    matvec_pq2_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
             }
         };
         if res.is_err() || consume_error_count() != 0 {
@@ -3130,8 +3997,7 @@ impl CudaMatvecCache {
         {
             return false;
         }
-        let x_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
+        let x_bytes: &[u8] = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
         if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
             return false;
         }
@@ -3144,32 +4010,84 @@ impl CudaMatvecCache {
         // `matvec_packed` exactly (same per-format row_dot → bit-exact).
         let res = unsafe {
             match kind {
-                CudaPackedKind::Ptq1_0 => matvec_ptq1_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q8_0 => matvec_q8_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q4_K => matvec_q4_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q6_K => matvec_q6_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q5_K => matvec_q5_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q2_K => matvec_q2_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q8_K => matvec_q8_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q4_0 => matvec_q4_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q5_0 => matvec_q5_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q4_1 => matvec_q4_1_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q5_1 => matvec_q5_1_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Iq4_Nl => matvec_iq4_nl_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Iq4_Xs => matvec_iq4_xs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Iq2_Xxs => matvec_iq2_xxs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Iq2_Xs => matvec_iq2_xs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Iq2_S => matvec_iq2_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Iq3_Xxs => matvec_iq3_xxs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Iq3_S => matvec_iq3_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Iq1_S => matvec_iq1_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Iq1_M => matvec_iq1_m_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Nvfp4 => matvec_nvfp4_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Mxfp4 => matvec_mxfp4_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Mxfp6 => matvec_mxfp6_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Mxfp8 => matvec_mxfp8_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Q3_K => matvec_q3_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                CudaPackedKind::Pq2_0 => matvec_pq2_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                CudaPackedKind::Ptq1_0 => {
+                    matvec_ptq1_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q8_0 => {
+                    matvec_q8_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q4_K => {
+                    matvec_q4_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q6_K => {
+                    matvec_q6_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q5_K => {
+                    matvec_q5_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q2_K => {
+                    matvec_q2_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q8_K => {
+                    matvec_q8_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q4_0 => {
+                    matvec_q4_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q5_0 => {
+                    matvec_q5_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q4_1 => {
+                    matvec_q4_1_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q5_1 => {
+                    matvec_q5_1_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Iq4_Nl => {
+                    matvec_iq4_nl_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Iq4_Xs => {
+                    matvec_iq4_xs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Iq2_Xxs => {
+                    matvec_iq2_xxs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Iq2_Xs => {
+                    matvec_iq2_xs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Iq2_S => {
+                    matvec_iq2_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Iq3_Xxs => {
+                    matvec_iq3_xxs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Iq3_S => {
+                    matvec_iq3_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Iq1_S => {
+                    matvec_iq1_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Iq1_M => {
+                    matvec_iq1_m_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Nvfp4 => {
+                    matvec_nvfp4_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Mxfp4 => {
+                    matvec_mxfp4_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Mxfp6 => {
+                    matvec_mxfp6_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Mxfp8 => {
+                    matvec_mxfp8_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Q3_K => {
+                    matvec_q3_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                CudaPackedKind::Pq2_0 => {
+                    matvec_pq2_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
             }
         };
         if res.is_err() || consume_error_count() != 0 {
@@ -3220,32 +4138,84 @@ impl CudaMatvecCache {
         // synchronizes. Same per-format row_dot as `matvec_packed` → bit-exact.
         let res = unsafe {
             match kind {
-                CudaPackedKind::Ptq1_0 => matvec_ptq1_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Q8_0 => matvec_q8_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Q4_K => matvec_q4_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Q6_K => matvec_q6_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Q5_K => matvec_q5_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Q2_K => matvec_q2_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Q8_K => matvec_q8_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Q4_0 => matvec_q4_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Q5_0 => matvec_q5_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Q4_1 => matvec_q4_1_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Q5_1 => matvec_q5_1_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Iq4_Nl => matvec_iq4_nl_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Iq4_Xs => matvec_iq4_xs_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Iq2_Xxs => matvec_iq2_xxs_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Iq2_Xs => matvec_iq2_xs_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Iq2_S => matvec_iq2_s_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Iq3_Xxs => matvec_iq3_xxs_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Iq3_S => matvec_iq3_s_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Iq1_S => matvec_iq1_s_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Iq1_M => matvec_iq1_m_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Nvfp4 => matvec_nvfp4_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Mxfp4 => matvec_mxfp4_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Mxfp6 => matvec_mxfp6_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Mxfp8 => matvec_mxfp8_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Q3_K => matvec_q3_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
-                CudaPackedKind::Pq2_0 => matvec_pq2_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k),
+                CudaPackedKind::Ptq1_0 => {
+                    matvec_ptq1_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Q8_0 => {
+                    matvec_q8_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Q4_K => {
+                    matvec_q4_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Q6_K => {
+                    matvec_q6_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Q5_K => {
+                    matvec_q5_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Q2_K => {
+                    matvec_q2_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Q8_K => {
+                    matvec_q8_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Q4_0 => {
+                    matvec_q4_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Q5_0 => {
+                    matvec_q5_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Q4_1 => {
+                    matvec_q4_1_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Q5_1 => {
+                    matvec_q5_1_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Iq4_Nl => {
+                    matvec_iq4_nl_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Iq4_Xs => {
+                    matvec_iq4_xs_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Iq2_Xxs => {
+                    matvec_iq2_xxs_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Iq2_Xs => {
+                    matvec_iq2_xs_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Iq2_S => {
+                    matvec_iq2_s_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Iq3_Xxs => {
+                    matvec_iq3_xxs_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Iq3_S => {
+                    matvec_iq3_s_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Iq1_S => {
+                    matvec_iq1_s_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Iq1_M => {
+                    matvec_iq1_m_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Nvfp4 => {
+                    matvec_nvfp4_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Mxfp4 => {
+                    matvec_mxfp4_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Mxfp6 => {
+                    matvec_mxfp6_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Mxfp8 => {
+                    matvec_mxfp8_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Q3_K => {
+                    matvec_q3_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
+                CudaPackedKind::Pq2_0 => {
+                    matvec_pq2_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                }
             }
         };
         res.is_ok() && consume_error_count() == 0
@@ -3376,14 +4346,25 @@ impl CudaMatvecCache {
         let ffn_base = 4 * d_model + 2 * d_q + 2 * d_kv;
         let (o_gate, o_up, o_act) = (ffn_base, ffn_base + d_ff, ffn_base + 2 * d_ff);
         // Norm-slab f32 offsets: attn_norm|post_norm|q_norm|k_norm|inv_freq.
-        let (no_attn, no_post, no_qn, no_kn, no_if) =
-            (0, d_model, 2 * d_model, 2 * d_model + head_dim, 2 * d_model + 2 * head_dim);
+        let (no_attn, no_post, no_qn, no_kn, no_if) = (
+            0,
+            d_model,
+            2 * d_model,
+            2 * d_model + head_dim,
+            2 * d_model + 2 * head_dim,
+        );
         let fb = |s: &[f32]| -> &[u8] {
             unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
         };
         // Upload hidden (unless it's already resident from the previous layer —
         // cross-layer residency) + the norm weights.
-        if upload_hidden && !self.attn_act.as_mut().unwrap().upload_at(o_hidden * 4, fb(hidden)) {
+        if upload_hidden
+            && !self
+                .attn_act
+                .as_mut()
+                .unwrap()
+                .upload_at(o_hidden * 4, fb(hidden))
+        {
             return false;
         }
         {
@@ -3659,9 +4640,32 @@ impl CudaMatvecCache {
     ) -> bool {
         let ok = unsafe {
             self.decode_attn_block_f32_graph_impl(
-                wq, wk, wv, wo, attn_norm, post_norm, q_norm, k_norm, inv_freq, hidden, h_norm2,
-                k_row_out, v_row_out, n_heads, n_kv_heads, head_dim, d_model, pos, max_ctx,
-                n_layers, layer_idx, rms_eps, window, softcap, dense_ffn, upload_hidden,
+                wq,
+                wk,
+                wv,
+                wo,
+                attn_norm,
+                post_norm,
+                q_norm,
+                k_norm,
+                inv_freq,
+                hidden,
+                h_norm2,
+                k_row_out,
+                v_row_out,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                d_model,
+                pos,
+                max_ctx,
+                n_layers,
+                layer_idx,
+                rms_eps,
+                window,
+                softcap,
+                dense_ffn,
+                upload_hidden,
                 download_hidden,
             )
         };
@@ -3777,8 +4781,13 @@ impl CudaMatvecCache {
         );
         let ffn_base = 4 * d_model + 2 * d_q + 2 * d_kv;
         let (o_gate, o_up, o_act) = (ffn_base, ffn_base + d_ff, ffn_base + 2 * d_ff);
-        let (no_attn, no_post, no_qn, no_kn, no_if) =
-            (0, d_model, 2 * d_model, 2 * d_model + head_dim, 2 * d_model + 2 * head_dim);
+        let (no_attn, no_post, no_qn, no_kn, no_if) = (
+            0,
+            d_model,
+            2 * d_model,
+            2 * d_model + head_dim,
+            2 * d_model + 2 * head_dim,
+        );
         let fb = |s: &[f32]| -> &[u8] {
             unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
         };
@@ -3806,7 +4815,13 @@ impl CudaMatvecCache {
         // the previous layer) + the per-layer norm weights. Async-issued on the
         // stream, then a stream sync leaves the device idle so capture starts
         // clean. (On pageable host memory these complete synchronously anyway.)
-        if upload_hidden && !self.attn_act.as_mut().unwrap().upload_at_async(o_hidden * 4, fb(hidden)) {
+        if upload_hidden
+            && !self
+                .attn_act
+                .as_mut()
+                .unwrap()
+                .upload_at_async(o_hidden * 4, fb(hidden))
+        {
             return false;
         }
         {
@@ -3875,21 +4890,30 @@ impl CudaMatvecCache {
         chain_ok = chain_ok
             && unsafe { rmsnorm_dev_f32(&self.stream, ph, pan, phn, 1, d_model, rms_eps).is_ok() };
         // 2. q/k/v projections (device-I/O; weights pre-warmed so no upload).
-        chain_ok = chain_ok && unsafe { self.matvec_packed_dev_io(wq.0, wq.1, wq.2, phn, pq, d_q, d_model) };
-        chain_ok = chain_ok && unsafe { self.matvec_packed_dev_io(wk.0, wk.1, wk.2, phn, pk, d_kv, d_model) };
-        chain_ok = chain_ok && unsafe { self.matvec_packed_dev_io(wv.0, wv.1, wv.2, phn, pv, d_kv, d_model) };
+        chain_ok = chain_ok
+            && unsafe { self.matvec_packed_dev_io(wq.0, wq.1, wq.2, phn, pq, d_q, d_model) };
+        chain_ok = chain_ok
+            && unsafe { self.matvec_packed_dev_io(wk.0, wk.1, wk.2, phn, pk, d_kv, d_model) };
+        chain_ok = chain_ok
+            && unsafe { self.matvec_packed_dev_io(wv.0, wv.1, wv.2, phn, pv, d_kv, d_model) };
         // 3. Qwen3 qk-head-norm (in place, device).
         if q_norm.is_some() {
             chain_ok = chain_ok
-                && unsafe { qk_head_norm_f32(&self.stream, pq, pqn, n_heads, head_dim, rms_eps).is_ok() };
+                && unsafe {
+                    qk_head_norm_f32(&self.stream, pq, pqn, n_heads, head_dim, rms_eps).is_ok()
+                };
         }
         if k_norm.is_some() {
             chain_ok = chain_ok
-                && unsafe { qk_head_norm_f32(&self.stream, pk, pkn, n_kv_heads, head_dim, rms_eps).is_ok() };
+                && unsafe {
+                    qk_head_norm_f32(&self.stream, pk, pkn, n_kv_heads, head_dim, rms_eps).is_ok()
+                };
         }
         // 4. RoPE (both device, in place) at absolute `pos`.
-        chain_ok = chain_ok && unsafe { rope_f32(&self.stream, pq, n_heads, head_dim, pos, pif).is_ok() };
-        chain_ok = chain_ok && unsafe { rope_f32(&self.stream, pk, n_kv_heads, head_dim, pos, pif).is_ok() };
+        chain_ok =
+            chain_ok && unsafe { rope_f32(&self.stream, pq, n_heads, head_dim, pos, pif).is_ok() };
+        chain_ok = chain_ok
+            && unsafe { rope_f32(&self.stream, pk, n_kv_heads, head_dim, pos, pif).is_ok() };
         // 5. Scatter the post-RoPE K / plain V into the F32 KV mirror at `pos`,
         //    one kv-head at a time (head-major), via async DEVICE→DEVICE copies
         //    (NO host round-trip — that is what makes the chain capturable). The
@@ -3924,15 +4948,26 @@ impl CudaMatvecCache {
                 .is_ok()
             };
         // 7. o projection (device-I/O); 8. fused residual + post-attn RMSNorm.
-        chain_ok = chain_ok && unsafe { self.matvec_packed_dev_io(wo.0, wo.1, wo.2, pat, po, d_model, d_q) };
         chain_ok = chain_ok
-            && unsafe { add_rmsnorm_f32(&self.stream, ph, po, ppn, phn2, 1, d_model, rms_eps).is_ok() };
+            && unsafe { self.matvec_packed_dev_io(wo.0, wo.1, wo.2, pat, po, d_model, d_q) };
+        chain_ok = chain_ok
+            && unsafe {
+                add_rmsnorm_f32(&self.stream, ph, po, ppn, phn2, 1, d_model, rms_eps).is_ok()
+            };
         // 8b. Optional dense SwiGLU FFN, device-resident (ffn_out reuses `po`).
         if let Some((wg, wu, wd, _)) = dense_ffn {
-            chain_ok = chain_ok && unsafe { self.matvec_packed_dev_io(wg.0, wg.1, wg.2, phn2, p_gate, d_ff, d_model) };
-            chain_ok = chain_ok && unsafe { self.matvec_packed_dev_io(wu.0, wu.1, wu.2, phn2, p_up, d_ff, d_model) };
-            chain_ok = chain_ok && unsafe { silu_mul_f32(&self.stream, p_gate, p_up, p_act, d_ff).is_ok() };
-            chain_ok = chain_ok && unsafe { self.matvec_packed_dev_io(wd.0, wd.1, wd.2, p_act, po, d_model, d_ff) };
+            chain_ok = chain_ok
+                && unsafe {
+                    self.matvec_packed_dev_io(wg.0, wg.1, wg.2, phn2, p_gate, d_ff, d_model)
+                };
+            chain_ok = chain_ok
+                && unsafe {
+                    self.matvec_packed_dev_io(wu.0, wu.1, wu.2, phn2, p_up, d_ff, d_model)
+                };
+            chain_ok = chain_ok
+                && unsafe { silu_mul_f32(&self.stream, p_gate, p_up, p_act, d_ff).is_ok() };
+            chain_ok = chain_ok
+                && unsafe { self.matvec_packed_dev_io(wd.0, wd.1, wd.2, p_act, po, d_model, d_ff) };
             chain_ok = chain_ok && unsafe { add_f32(&self.stream, ph, po, d_model).is_ok() };
         }
         // ================= END CAPTURE (always) =================
@@ -4002,23 +5037,27 @@ impl CudaMatvecCache {
         // (on pageable host memory these complete synchronously).
         {
             let a = self.attn_act.as_ref().unwrap();
-            let kb: &mut [u8] =
-                unsafe { std::slice::from_raw_parts_mut(k_row_out.as_mut_ptr() as *mut u8, d_kv * 4) };
-            let vb: &mut [u8] =
-                unsafe { std::slice::from_raw_parts_mut(v_row_out.as_mut_ptr() as *mut u8, d_kv * 4) };
+            let kb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(k_row_out.as_mut_ptr() as *mut u8, d_kv * 4)
+            };
+            let vb: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(v_row_out.as_mut_ptr() as *mut u8, d_kv * 4)
+            };
             if !a.download_at_async(o_k * 4, kb) || !a.download_at_async(o_v * 4, vb) {
                 return false;
             }
             if download_hidden {
-                let hb: &mut [u8] =
-                    unsafe { std::slice::from_raw_parts_mut(hidden.as_mut_ptr() as *mut u8, d_model * 4) };
+                let hb: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(hidden.as_mut_ptr() as *mut u8, d_model * 4)
+                };
                 if !a.download_at_async(o_hidden * 4, hb) {
                     return false;
                 }
             }
             if dense_ffn.is_none() {
-                let h2b: &mut [u8] =
-                    unsafe { std::slice::from_raw_parts_mut(h_norm2.as_mut_ptr() as *mut u8, d_model * 4) };
+                let h2b: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(h_norm2.as_mut_ptr() as *mut u8, d_model * 4)
+                };
                 if !a.download_at_async(o_hn2 * 4, h2b) {
                     return false;
                 }
@@ -4090,10 +5129,16 @@ impl CudaMatvecCache {
             return true; // already current
         }
         let kcb: &[u8] = unsafe {
-            std::slice::from_raw_parts(k_cache.as_ptr() as *const u8, std::mem::size_of_val(k_cache))
+            std::slice::from_raw_parts(
+                k_cache.as_ptr() as *const u8,
+                std::mem::size_of_val(k_cache),
+            )
         };
         let vcb: &[u8] = unsafe {
-            std::slice::from_raw_parts(v_cache.as_ptr() as *const u8, std::mem::size_of_val(v_cache))
+            std::slice::from_raw_parts(
+                v_cache.as_ptr() as *const u8,
+                std::mem::size_of_val(v_cache),
+            )
         };
         let n = pos - valid; // rows to upload per head
         {
@@ -4277,9 +5322,7 @@ impl CudaMatvecCache {
             return false;
         }
         let row_bytes = m * kind.row_bytes(k);
-        if k % kind.k_alignment() != 0
-            || gate_bytes.len() < row_bytes
-            || up_bytes.len() < row_bytes
+        if k % kind.k_alignment() != 0 || gate_bytes.len() < row_bytes || up_bytes.len() < row_bytes
         {
             return false;
         }
@@ -4291,8 +5334,7 @@ impl CudaMatvecCache {
         {
             return false;
         }
-        let x_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
+        let x_bytes: &[u8] = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
         if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
             return false;
         }
@@ -4306,20 +5348,146 @@ impl CudaMatvecCache {
         // sized for (M,K) / 2*M; the wrapper synchronizes before returning.
         let res = unsafe {
             match kind {
-                CudaPackedKind::Q8_0 => matvec_q8_0_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                CudaPackedKind::Q4_K => matvec_q4_k_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                CudaPackedKind::Q6_K => matvec_q6_k_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                CudaPackedKind::Q5_K => matvec_q5_k_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                CudaPackedKind::Iq4_Nl => matvec_iq4_nl_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                CudaPackedKind::Iq4_Xs => matvec_iq4_xs_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                CudaPackedKind::Iq1_S => matvec_iq1_s_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                CudaPackedKind::Iq1_M => matvec_iq1_m_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                CudaPackedKind::Iq2_Xxs => matvec_iq2_xxs_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                CudaPackedKind::Iq2_Xs => matvec_iq2_xs_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                CudaPackedKind::Iq2_S => matvec_iq2_s_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                CudaPackedKind::Iq3_Xxs => matvec_iq3_xxs_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                CudaPackedKind::Iq3_S => matvec_iq3_s_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                CudaPackedKind::Ptq1_0 => matvec_ptq1_0_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
+                CudaPackedKind::Q8_0 => matvec_q8_0_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                CudaPackedKind::Q4_K => matvec_q4_k_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                CudaPackedKind::Q6_K => matvec_q6_k_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                CudaPackedKind::Q5_K => matvec_q5_k_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                CudaPackedKind::Iq4_Nl => matvec_iq4_nl_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                CudaPackedKind::Iq4_Xs => matvec_iq4_xs_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                CudaPackedKind::Iq1_S => matvec_iq1_s_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                CudaPackedKind::Iq1_M => matvec_iq1_m_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                CudaPackedKind::Iq2_Xxs => matvec_iq2_xxs_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                CudaPackedKind::Iq2_Xs => matvec_iq2_xs_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                CudaPackedKind::Iq2_S => matvec_iq2_s_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                CudaPackedKind::Iq3_Xxs => matvec_iq3_xxs_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                CudaPackedKind::Iq3_S => matvec_iq3_s_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                CudaPackedKind::Ptq1_0 => matvec_ptq1_0_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
                 // No fused kernel for the remaining kinds — caller falls back.
                 _ => return false,
             }
@@ -4380,32 +5548,84 @@ impl CudaMatvecCache {
         // SAFETY: as `matvec_packed`, with x/out sized for N rows.
         let res = unsafe {
             match kind {
-                CudaPackedKind::Ptq1_0 => matvec_ptq1_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q8_0 => matvec_q8_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q4_K => matvec_q4_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q6_K => matvec_q6_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q5_K => matvec_q5_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q2_K => matvec_q2_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q8_K => matvec_q8_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q4_0 => matvec_q4_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q5_0 => matvec_q5_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q4_1 => matvec_q4_1_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q5_1 => matvec_q5_1_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Iq4_Nl => matvec_iq4_nl_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Iq4_Xs => matvec_iq4_xs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Iq2_Xxs => matvec_iq2_xxs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Iq2_Xs => matvec_iq2_xs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Iq2_S => matvec_iq2_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Iq3_Xxs => matvec_iq3_xxs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Iq3_S => matvec_iq3_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Iq1_S => matvec_iq1_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Iq1_M => matvec_iq1_m_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Nvfp4 => matvec_nvfp4_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Mxfp4 => matvec_mxfp4_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Mxfp6 => matvec_mxfp6_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Mxfp8 => matvec_mxfp8_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q3_K => matvec_q3_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Pq2_0 => matvec_pq2_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Ptq1_0 => {
+                    matvec_ptq1_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q8_0 => {
+                    matvec_q8_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q4_K => {
+                    matvec_q4_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q6_K => {
+                    matvec_q6_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q5_K => {
+                    matvec_q5_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q2_K => {
+                    matvec_q2_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q8_K => {
+                    matvec_q8_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q4_0 => {
+                    matvec_q4_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q5_0 => {
+                    matvec_q5_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q4_1 => {
+                    matvec_q4_1_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q5_1 => {
+                    matvec_q5_1_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Iq4_Nl => {
+                    matvec_iq4_nl_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Iq4_Xs => {
+                    matvec_iq4_xs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Iq2_Xxs => {
+                    matvec_iq2_xxs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Iq2_Xs => {
+                    matvec_iq2_xs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Iq2_S => {
+                    matvec_iq2_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Iq3_Xxs => {
+                    matvec_iq3_xxs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Iq3_S => {
+                    matvec_iq3_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Iq1_S => {
+                    matvec_iq1_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Iq1_M => {
+                    matvec_iq1_m_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Nvfp4 => {
+                    matvec_nvfp4_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Mxfp4 => {
+                    matvec_mxfp4_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Mxfp6 => {
+                    matvec_mxfp6_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Mxfp8 => {
+                    matvec_mxfp8_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q3_K => {
+                    matvec_q3_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Pq2_0 => {
+                    matvec_pq2_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
             }
         };
         if res.is_err() || consume_error_count() != 0 {
@@ -4467,32 +5687,84 @@ impl CudaMatvecCache {
         // `matvec_packed_batched` exactly (same per-format kernels → bit-exact).
         let res = unsafe {
             match kind {
-                CudaPackedKind::Ptq1_0 => matvec_ptq1_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q8_0 => matvec_q8_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q4_K => matvec_q4_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q6_K => matvec_q6_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q5_K => matvec_q5_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q2_K => matvec_q2_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q8_K => matvec_q8_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q4_0 => matvec_q4_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q5_0 => matvec_q5_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q4_1 => matvec_q4_1_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q5_1 => matvec_q5_1_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Iq4_Nl => matvec_iq4_nl_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Iq4_Xs => matvec_iq4_xs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Iq2_Xxs => matvec_iq2_xxs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Iq2_Xs => matvec_iq2_xs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Iq2_S => matvec_iq2_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Iq3_Xxs => matvec_iq3_xxs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Iq3_S => matvec_iq3_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Iq1_S => matvec_iq1_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Iq1_M => matvec_iq1_m_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Nvfp4 => matvec_nvfp4_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Mxfp4 => matvec_mxfp4_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Mxfp6 => matvec_mxfp6_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Mxfp8 => matvec_mxfp8_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Q3_K => matvec_q3_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                CudaPackedKind::Pq2_0 => matvec_pq2_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                CudaPackedKind::Ptq1_0 => {
+                    matvec_ptq1_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q8_0 => {
+                    matvec_q8_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q4_K => {
+                    matvec_q4_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q6_K => {
+                    matvec_q6_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q5_K => {
+                    matvec_q5_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q2_K => {
+                    matvec_q2_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q8_K => {
+                    matvec_q8_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q4_0 => {
+                    matvec_q4_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q5_0 => {
+                    matvec_q5_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q4_1 => {
+                    matvec_q4_1_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q5_1 => {
+                    matvec_q5_1_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Iq4_Nl => {
+                    matvec_iq4_nl_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Iq4_Xs => {
+                    matvec_iq4_xs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Iq2_Xxs => {
+                    matvec_iq2_xxs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Iq2_Xs => {
+                    matvec_iq2_xs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Iq2_S => {
+                    matvec_iq2_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Iq3_Xxs => {
+                    matvec_iq3_xxs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Iq3_S => {
+                    matvec_iq3_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Iq1_S => {
+                    matvec_iq1_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Iq1_M => {
+                    matvec_iq1_m_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Nvfp4 => {
+                    matvec_nvfp4_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Mxfp4 => {
+                    matvec_mxfp4_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Mxfp6 => {
+                    matvec_mxfp6_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Mxfp8 => {
+                    matvec_mxfp8_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Q3_K => {
+                    matvec_q3_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                CudaPackedKind::Pq2_0 => {
+                    matvec_pq2_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
             }
         };
         if res.is_err() || consume_error_count() != 0 {
@@ -4743,8 +6015,7 @@ impl CudaMatvecCache {
         {
             return false;
         }
-        let x_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
+        let x_bytes: &[u8] = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
         if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
             return false;
         }
@@ -4795,8 +6066,7 @@ impl CudaMatvecCache {
         {
             return false;
         }
-        let x_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
+        let x_bytes: &[u8] = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
         if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
             return false;
         }
@@ -5078,7 +6348,8 @@ impl CudaMatvecCache {
         let out_ptr = self.out_scratch.as_ref().unwrap().ptr as *mut f32;
         // SAFETY: w caller-guaranteed live device buffer; x/out device scratch
         // sized N·K / N·M; same kernel as `gemm_fp4_tc`.
-        let res = unsafe { gemm_fp4_tc_f32(kind, &self.stream, w_ptr_dev, x_ptr, out_ptr, m, n, k) };
+        let res =
+            unsafe { gemm_fp4_tc_f32(kind, &self.stream, w_ptr_dev, x_ptr, out_ptr, m, n, k) };
         if res.is_err() || consume_error_count() != 0 {
             return false;
         }

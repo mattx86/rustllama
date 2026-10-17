@@ -62,10 +62,7 @@ fn try_matvec_f16_usm_rejects_non_f16_dtype() {
     let x = vec![0.0f32; 32];
     let mut out = vec![0.0f32; 16];
     let used_gpu = try_matvec_f16_usm_f32(&w, &x, &mut out, 16, 32);
-    assert!(
-        !used_gpu,
-        "non-F16 dtype → helper rejects without erroring"
-    );
+    assert!(!used_gpu, "non-F16 dtype → helper rejects without erroring");
 }
 
 #[test]

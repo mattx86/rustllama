@@ -103,8 +103,7 @@ async fn capabilities_embeddings_off_when_slot_disabled() {
     // Dimensions absent (skip_serializing_if=None) — clients keying
     // off presence get a clean signal.
     assert!(
-        v["embeddings"].get("dimensions").is_none()
-            || v["embeddings"]["dimensions"].is_null(),
+        v["embeddings"].get("dimensions").is_none() || v["embeddings"]["dimensions"].is_null(),
         "dimensions must be absent when not configured: {}",
         v["embeddings"]
     );
@@ -116,10 +115,7 @@ async fn capabilities_embeddings_on_when_slot_enabled() {
     let v = get_caps(state).await;
     assert_eq!(v["embeddings"]["configured"], true);
     // Pre-load: dimensions null (no model loaded yet).
-    assert!(
-        v["embeddings"].get("dimensions").is_none()
-            || v["embeddings"]["dimensions"].is_null()
-    );
+    assert!(v["embeddings"].get("dimensions").is_none() || v["embeddings"]["dimensions"].is_null());
 }
 
 #[tokio::test]
@@ -167,8 +163,7 @@ async fn capabilities_history_reflects_feature_gate() {
     // test suite that has the feature gate.
     let v = get_caps(build_state()).await;
     assert_eq!(
-        v["history"]["enabled"],
-        false,
+        v["history"]["enabled"], false,
         "no history store attached → enabled=false"
     );
 }
@@ -194,8 +189,7 @@ async fn capabilities_fim_available_on_chat_model_with_fim_markers() {
     use rustllama_engine::CpuEngine;
     use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
 
-    let model_path =
-        std::env::temp_dir().join("rustllama-caps-fim-on.gguf");
+    let model_path = std::env::temp_dir().join("rustllama-caps-fim-on.gguf");
     write_synthetic_llama_gguf(
         &model_path,
         &SynthLlama {
@@ -240,8 +234,7 @@ async fn capabilities_moe_supported_true_on_default_state() {
     assert_eq!(v["moe"]["supported"], true);
     // No active model loaded → active_* fields absent (skip-serialize).
     assert!(
-        v["moe"].get("active_n_experts").is_none()
-            || v["moe"]["active_n_experts"].is_null(),
+        v["moe"].get("active_n_experts").is_none() || v["moe"]["active_n_experts"].is_null(),
         "no model loaded → no active expert count: {}",
         v["moe"]
     );
@@ -349,7 +342,11 @@ async fn capabilities_moe_active_counts_absent_for_dense_model() {
     let v = get_caps(state).await;
     assert_eq!(v["moe"]["supported"], true);
     // Dense model → no active expert counts.
-    for field in ["active_n_experts", "active_n_experts_used", "active_n_experts_shared"] {
+    for field in [
+        "active_n_experts",
+        "active_n_experts_used",
+        "active_n_experts_shared",
+    ] {
         assert!(
             v["moe"].get(field).is_none() || v["moe"][field].is_null(),
             "dense model: {field} must be absent: {}",
@@ -364,8 +361,7 @@ async fn capabilities_fim_unavailable_on_chat_model_without_fim_markers() {
     use rustllama_engine::CpuEngine;
     use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
 
-    let model_path =
-        std::env::temp_dir().join("rustllama-caps-fim-off.gguf");
+    let model_path = std::env::temp_dir().join("rustllama-caps-fim-off.gguf");
     write_synthetic_llama_gguf(
         &model_path,
         &SynthLlama {
@@ -388,8 +384,7 @@ async fn capabilities_fim_unavailable_on_chat_model_without_fim_markers() {
     let state = AppState::new(serving, "0.0.0-test".into());
     let v = get_caps(state).await;
     assert_eq!(
-        v["fim"]["available"],
-        false,
+        v["fim"]["available"], false,
         "chat model without FIM markers → fim.available=false"
     );
     let _ = std::fs::remove_file(&model_path);

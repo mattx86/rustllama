@@ -325,8 +325,7 @@ fn main() { }
     fn oversized_definition_gets_re_chunked() {
         // Construct a 200-line fn with max_lines=30 so the > 2*30=60
         // gate fires and we fall into the line-based sub-chunk path.
-        let body: String =
-            (0..200).map(|i| format!("    let v{i} = {i};\n")).collect();
+        let body: String = (0..200).map(|i| format!("    let v{i} = {i};\n")).collect();
         let src = format!("fn huge() {{\n{body}}}\n");
         let chunks = chunk_with_tree_sitter(PathBuf::from("h.rs"), &src, 30);
         // Should produce multiple sub-chunks rather than one giant one.

@@ -153,7 +153,12 @@ pub struct NpuParity {
 impl NpuParity {
     /// The SKIP result — no NPU / offload backend present.
     pub const fn skipped() -> NpuParity {
-        NpuParity { supported: false, cos: 0.0, max_rel: 0.0, pass: false }
+        NpuParity {
+            supported: false,
+            cos: 0.0,
+            max_rel: 0.0,
+            pass: false,
+        }
     }
 }
 
@@ -313,8 +318,18 @@ mod tests {
 
     #[test]
     fn fingerprint_is_stable_and_sorted() {
-        let a = NpuInfo { vendor: NpuVendor::Intel, name: "B".into(), index: 0, memory_bytes: 0 };
-        let b = NpuInfo { vendor: NpuVendor::Amd, name: "A".into(), index: 1, memory_bytes: 0 };
+        let a = NpuInfo {
+            vendor: NpuVendor::Intel,
+            name: "B".into(),
+            index: 0,
+            memory_bytes: 0,
+        };
+        let b = NpuInfo {
+            vendor: NpuVendor::Amd,
+            name: "A".into(),
+            index: 1,
+            memory_bytes: 0,
+        };
         // Build the slug the way npu_fingerprint does, order-independently.
         let mut p: Vec<String> = [&a, &b]
             .iter()

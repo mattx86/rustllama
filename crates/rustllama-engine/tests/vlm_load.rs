@@ -6,7 +6,9 @@
 //! and lands with its own end-to-end test.
 
 use rustllama_engine::{CpuEngine, Engine};
-use rustllama_gguf::synth::{write_synthetic_clip_mmproj_gguf, write_synthetic_llama_gguf, SynthLlama};
+use rustllama_gguf::synth::{
+    write_synthetic_clip_mmproj_gguf, write_synthetic_llama_gguf, SynthLlama,
+};
 
 /// Default text-decoder GGUF: d_model = 64. Mismatches the synth
 /// mmproj (d_text = 96) — used by the validation-failure test.

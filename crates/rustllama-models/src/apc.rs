@@ -103,7 +103,13 @@ impl ApcIndex {
     /// repoints at the freshest page (the old page is freed by its owner).
     pub fn register(&mut self, hash: BlockHash, page: PageId) {
         self.clock += 1;
-        self.map.insert(hash.0, Entry { page, last_used: self.clock });
+        self.map.insert(
+            hash.0,
+            Entry {
+                page,
+                last_used: self.clock,
+            },
+        );
     }
 
     /// Look up one block hash, bumping its LRU stamp. `None` = miss.
@@ -236,7 +242,7 @@ mod tests {
     fn match_prefix_stops_at_first_gap() {
         let mut idx = ApcIndex::new();
         let chain = block_hash_chain(&(0..64).collect::<Vec<u32>>(), 16); // 4 blocks
-        // Register blocks 0,1,3 — leave block 2 absent.
+                                                                          // Register blocks 0,1,3 — leave block 2 absent.
         idx.register(chain[0], PageId(10));
         idx.register(chain[1], PageId(11));
         idx.register(chain[3], PageId(13));

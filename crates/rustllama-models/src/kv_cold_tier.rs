@@ -40,7 +40,10 @@ pub struct KvColdTier {
 
 impl KvColdTier {
     pub fn new(cap_bytes: usize) -> Self {
-        Self { cap_bytes, ..Default::default() }
+        Self {
+            cap_bytes,
+            ..Default::default()
+        }
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -107,7 +110,13 @@ impl KvColdTier {
             }
         }
         self.clock += 1;
-        self.map.insert(hash.0, ColdEntry { bytes: bytes.to_vec(), last_used: self.clock });
+        self.map.insert(
+            hash.0,
+            ColdEntry {
+                bytes: bytes.to_vec(),
+                last_used: self.clock,
+            },
+        );
         self.bytes += cost;
     }
 
@@ -138,7 +147,10 @@ impl KvColdTier {
     }
 
     fn lru_key(&self) -> Option<u64> {
-        self.map.iter().min_by_key(|(_, e)| e.last_used).map(|(&k, _)| k)
+        self.map
+            .iter()
+            .min_by_key(|(_, e)| e.last_used)
+            .map(|(&k, _)| k)
     }
 
     pub fn len(&self) -> usize {
@@ -211,8 +223,10 @@ mod tests {
     #[test]
     fn cpu_tier_evicts_to_disk_and_promotes_back() {
         use crate::kv_disk_tier::KvDiskTier;
-        let p = std::env::temp_dir()
-            .join(format!("rustllama-coldtier-disk-{}.bin", std::process::id()));
+        let p = std::env::temp_dir().join(format!(
+            "rustllama-coldtier-disk-{}.bin",
+            std::process::id()
+        ));
         // CPU tier holds exactly one 2-elem (8-byte) block; disk holds more.
         let mut t = KvColdTier::new(8);
         t.attach_disk(KvDiskTier::new(&p, 2, 1 << 20).expect("disk"));
@@ -221,7 +235,10 @@ mod tests {
         t.demote(BlockHash(2), &[2.0, 2.0]);
         assert!(!t.contains(BlockHash(1)), "block 1 left the RAM tier");
         // Promoting block 1 → RAM miss → served from the disk tier.
-        assert_eq!(t.promote(BlockHash(1)).as_deref(), Some([1.0f32, 1.0].as_slice()));
+        assert_eq!(
+            t.promote(BlockHash(1)).as_deref(),
+            Some([1.0f32, 1.0].as_slice())
+        );
         let _ = std::fs::remove_file(&p);
     }
 }

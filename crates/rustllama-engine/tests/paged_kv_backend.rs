@@ -55,16 +55,13 @@ fn paged_engine_matches_contiguous_greedy_sequence() {
     // Disable prefix cache on both engines so the test compares
     // pure forward-pass behavior, not whether a cache lookup
     // happened to fire.
-    let mut contig = CpuEngine::load_with_options_and_layout(
-        &tmp, 32, true, KvDtype::F32, "contiguous",
-    )
-    .expect("contiguous load");
+    let mut contig =
+        CpuEngine::load_with_options_and_layout(&tmp, 32, true, KvDtype::F32, "contiguous")
+            .expect("contiguous load");
     contig.set_prefix_cache(false);
 
-    let mut paged = CpuEngine::load_with_options_and_layout(
-        &tmp, 32, true, KvDtype::F32, "paged",
-    )
-    .expect("paged load");
+    let mut paged = CpuEngine::load_with_options_and_layout(&tmp, 32, true, KvDtype::F32, "paged")
+        .expect("paged load");
     paged.set_prefix_cache(false);
 
     let prompt: Vec<i32> = (0..8).collect();
@@ -94,10 +91,8 @@ fn paged_engine_matches_contiguous_greedy_sequence() {
 fn paged_engine_reuses_pages_across_requests() {
     use rustllama_models::llama_arch::KvDtype;
     let tmp = write_gguf("page-reuse");
-    let mut paged = CpuEngine::load_with_options_and_layout(
-        &tmp, 32, true, KvDtype::F32, "paged",
-    )
-    .expect("paged load");
+    let mut paged = CpuEngine::load_with_options_and_layout(&tmp, 32, true, KvDtype::F32, "paged")
+        .expect("paged load");
     paged.set_prefix_cache(false);
 
     let prompt_a: Vec<i32> = (0..8).collect();
@@ -129,7 +124,11 @@ fn paged_engine_rejects_unknown_layout_at_load() {
     use rustllama_models::llama_arch::KvDtype;
     let tmp = write_gguf("unknown-layout");
     let msg = match CpuEngine::load_with_options_and_layout(
-        &tmp, 32, true, KvDtype::F32, "memory-mapped",
+        &tmp,
+        32,
+        true,
+        KvDtype::F32,
+        "memory-mapped",
     ) {
         Ok(_) => panic!("unknown layout must fail load"),
         Err(e) => e.to_string(),
@@ -162,10 +161,8 @@ fn paged_engine_rejects_unknown_layout_at_load() {
 fn paged_engine_fork_is_independent() {
     use rustllama_models::llama_arch::KvDtype;
     let tmp = write_gguf("paged-fork");
-    let mut parent = CpuEngine::load_with_options_and_layout(
-        &tmp, 32, true, KvDtype::F32, "paged",
-    )
-    .expect("paged parent load");
+    let mut parent = CpuEngine::load_with_options_and_layout(&tmp, 32, true, KvDtype::F32, "paged")
+        .expect("paged parent load");
     parent.set_prefix_cache(false);
 
     let mut fork = parent.fork_for_concurrent_use();
@@ -214,10 +211,8 @@ fn paged_engine_fork_is_independent() {
 fn paged_engine_accepts_q8_0_kv_dtype_at_load() {
     use rustllama_models::llama_arch::KvDtype;
     let tmp = write_gguf("paged-q8");
-    let engine = CpuEngine::load_with_options_and_layout(
-        &tmp, 32, true, KvDtype::Q8_0, "paged",
-    )
-    .expect("paged + Q8_0 loads (H9b)");
+    let engine = CpuEngine::load_with_options_and_layout(&tmp, 32, true, KvDtype::Q8_0, "paged")
+        .expect("paged + Q8_0 loads (H9b)");
     drop(engine);
     let _ = std::fs::remove_file(&tmp);
 }

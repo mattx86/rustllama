@@ -79,9 +79,7 @@ fn run_gui() -> anyhow::Result<()> {
     // crash leaves a forensic trail the user can share. Errors here
     // fall back to a no-op writer — better to lose logs than to
     // refuse to launch.
-    let log_path = rustllama_runtime::paths()
-        .cache_dir
-        .join("gui.log");
+    let log_path = rustllama_runtime::paths().cache_dir.join("gui.log");
     let _ = std::fs::create_dir_all(&rustllama_runtime::paths().cache_dir);
     let log_file = std::fs::OpenOptions::new()
         .create(true)
@@ -123,9 +121,18 @@ fn run_gui() -> anyhow::Result<()> {
             tracing::info!(
                 device_count = n,
                 device_0_name = info.as_ref().map(|i| i.name.as_str()).unwrap_or("?"),
-                device_0_driver = info.as_ref().map(|i| i.driver_version.as_str()).unwrap_or("?"),
-                device_0_vendor_id = info.as_ref().map(|i| format!("0x{:04X}", i.vendor_id)).unwrap_or_default(),
-                device_0_vram_mb = info.as_ref().map(|i| i.vram_bytes / (1024 * 1024)).unwrap_or(0),
+                device_0_driver = info
+                    .as_ref()
+                    .map(|i| i.driver_version.as_str())
+                    .unwrap_or("?"),
+                device_0_vendor_id = info
+                    .as_ref()
+                    .map(|i| format!("0x{:04X}", i.vendor_id))
+                    .unwrap_or_default(),
+                device_0_vram_mb = info
+                    .as_ref()
+                    .map(|i| i.vram_bytes / (1024 * 1024))
+                    .unwrap_or(0),
                 "SYCL device(s) detected — generation will dispatch to the GPU"
             );
         }

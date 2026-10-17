@@ -150,7 +150,10 @@ async fn http_get_text(url: &str) -> Result<String> {
         .await
         .map_err(|e| HubError::Http(e.to_string()))?;
     if !resp.status().is_success() {
-        return Err(HubError::Http(format!("HF API {} for {url}", resp.status())));
+        return Err(HubError::Http(format!(
+            "HF API {} for {url}",
+            resp.status()
+        )));
     }
     resp.text().await.map_err(|e| HubError::Http(e.to_string()))
 }
@@ -698,7 +701,9 @@ mod tests {
             "a dir without a quantization block must not surface as MLX"
         );
         assert!(
-            !models.iter().any(|m| m.name == "model" || m.name == "config"),
+            !models
+                .iter()
+                .any(|m| m.name == "model" || m.name == "config"),
             "safetensors / config.json must never surface as standalone models"
         );
 
@@ -715,7 +720,10 @@ mod tests {
             filename: "../../etc/passwd".into(),
         };
         let p = r.local_path(cache);
-        assert!(p.starts_with(cache), "sanitized path {p:?} escaped {cache:?}");
+        assert!(
+            p.starts_with(cache),
+            "sanitized path {p:?} escaped {cache:?}"
+        );
         assert!(
             !p.components().any(|c| c.as_os_str() == ".."),
             "path {p:?} must contain no `..` component"

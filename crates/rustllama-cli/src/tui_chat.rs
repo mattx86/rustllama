@@ -438,21 +438,15 @@ fn handle_event(
         // (0x08) for the Backspace key; crossterm decodes that as
         // Char('h')+CONTROL. Without this arm it would fall through to the
         // printable-char arm below and TYPE an 'h' instead of deleting.
-        (KeyCode::Char('h'), m)
-            if m.contains(KeyModifiers::CONTROL) && !app.streaming =>
-        {
+        (KeyCode::Char('h'), m) if m.contains(KeyModifiers::CONTROL) && !app.streaming => {
             app.input.pop();
         }
         // Ctrl-U clears the line, Ctrl-W deletes the last word — the usual
         // readline edits users expect in an input box.
-        (KeyCode::Char('u'), m)
-            if m.contains(KeyModifiers::CONTROL) && !app.streaming =>
-        {
+        (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) && !app.streaming => {
             app.input.clear();
         }
-        (KeyCode::Char('w'), m)
-            if m.contains(KeyModifiers::CONTROL) && !app.streaming =>
-        {
+        (KeyCode::Char('w'), m) if m.contains(KeyModifiers::CONTROL) && !app.streaming => {
             let keep = app.input.trim_end();
             let cut = keep.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
             app.input.truncate(cut);
@@ -589,7 +583,9 @@ fn spawn_stream(client: Arc<Client>, req: ChatRequest, tx: UnboundedSender<Strea
                                 tps
                             )));
                         }
-                        Ok(ChatEvent::AskUser { prompt, options, .. }) => {
+                        Ok(ChatEvent::AskUser {
+                            prompt, options, ..
+                        }) => {
                             let _ = tx.send(StreamMsg::AskUser { prompt, options });
                         }
                         Ok(ChatEvent::ToolCalls(calls)) => {
@@ -641,11 +637,7 @@ fn answer_pending_question(
 
 /// Deny a proposed tool call: push a brief "don't run that" user turn and
 /// continue the stream so the model answers directly instead.
-fn deny_pending_tools(
-    app: &mut App,
-    client: &Arc<Client>,
-    stream_tx: &UnboundedSender<StreamMsg>,
-) {
+fn deny_pending_tools(app: &mut App, client: &Arc<Client>, stream_tx: &UnboundedSender<StreamMsg>) {
     app.turns.push(Turn {
         role: "user".into(),
         content: "Please don't run that tool — answer directly instead.".into(),
@@ -1093,7 +1085,10 @@ fn ui(f: &mut Frame, app: &mut App) {
         ),
         // CLARIFY indicator (Ctrl-K toggles).
         Span::styled(
-            format!("  clarify:{}", if app.clarify_enabled { "on" } else { "off" }),
+            format!(
+                "  clarify:{}",
+                if app.clarify_enabled { "on" } else { "off" }
+            ),
             Style::default().fg(if app.clarify_enabled {
                 Color::Cyan
             } else {
@@ -1179,10 +1174,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         )]));
         for (i, opt) in options.iter().enumerate() {
             lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {}. ", i + 1),
-                    Style::default().fg(Color::Cyan),
-                ),
+                Span::styled(format!("  {}. ", i + 1), Style::default().fg(Color::Cyan)),
                 Span::raw(opt.clone()),
             ]));
         }

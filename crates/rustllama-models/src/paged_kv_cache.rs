@@ -331,11 +331,7 @@ impl PagedKvCache {
     /// original `pages * page_size`, byte-identical.
     pub fn capacity_tokens(&self) -> u32 {
         match self.evict.as_ref() {
-            Some(e) if e.engaged => e
-                .page_base
-                .last()
-                .map(|&b| b + self.page_size)
-                .unwrap_or(0),
+            Some(e) if e.engaged => e.page_base.last().map(|&b| b + self.page_size).unwrap_or(0),
             _ => (self.pages.len() as u32).saturating_mul(self.page_size),
         }
     }
@@ -416,11 +412,7 @@ impl PagedKvCache {
     /// `write_token` at `pos >= seq_len` allocates suffix pages via
     /// the normal `ensure_capacity` path; subsequent `gather_layer`
     /// reads the shared pages alongside any new ones.
-    pub fn pin_shared_prefix(
-        &mut self,
-        pages: Vec<crate::page_table::PageId>,
-        seq_len: u32,
-    ) {
+    pub fn pin_shared_prefix(&mut self, pages: Vec<crate::page_table::PageId>, seq_len: u32) {
         // C3: release-mode asserts (not `debug_assert`). Both guard real
         // data-dependent invariants hit on live prefix-share admission: a
         // non-fresh cache would leak/overwrite already-written pages, and a
@@ -449,11 +441,7 @@ impl PagedKvCache {
     ///
     /// Failure is atomic: on shortfall, no pages are consumed
     /// (same contract as [`PageTable::alloc`]).
-    pub fn ensure_capacity(
-        &mut self,
-        table: &mut PageTable,
-        n_total: u32,
-    ) -> Result<(), usize> {
+    pub fn ensure_capacity(&mut self, table: &mut PageTable, n_total: u32) -> Result<(), usize> {
         // Env-gated KV eviction (default-off; see the module comment).
         // Trigger only on incremental, decode-style growth — one new
         // position past the current watermark. Multi-token prefill and
@@ -474,11 +462,7 @@ impl PagedKvCache {
     /// non-engaged branch of [`Self::ensure_capacity`] and by the
     /// shared/continuous-batching path (which never evicts), so both
     /// stay byte-identical to the historical behavior.
-    fn ensure_capacity_plain(
-        &mut self,
-        table: &mut PageTable,
-        n_total: u32,
-    ) -> Result<(), usize> {
+    fn ensure_capacity_plain(&mut self, table: &mut PageTable, n_total: u32) -> Result<(), usize> {
         if n_total <= (self.pages.len() as u32).saturating_mul(self.page_size) {
             return Ok(());
         }
@@ -553,7 +537,10 @@ impl PagedKvCache {
         }
         let ps = self.page_size;
         let target_last_base = ((n_total - 1) / ps) * ps;
-        let cur_last_base = self.evict.as_ref().and_then(|e| e.page_base.last().copied());
+        let cur_last_base = self
+            .evict
+            .as_ref()
+            .and_then(|e| e.page_base.last().copied());
         let start = match cur_last_base {
             Some(b) if b >= target_last_base => return Ok(()),
             Some(b) => b + ps,
@@ -890,8 +877,12 @@ mod tests {
         let n = (store.n_kv_heads() * store.head_dim()) as usize;
         let row = vec![0.0; n];
         // pos 0..4 are valid.
-        cache.write_token(&mut store, 0, 0, &row, &row).expect("pos 0");
-        cache.write_token(&mut store, 0, 3, &row, &row).expect("pos 3");
+        cache
+            .write_token(&mut store, 0, 0, &row, &row)
+            .expect("pos 0");
+        cache
+            .write_token(&mut store, 0, 3, &row, &row)
+            .expect("pos 3");
         // pos 4 needs a second page — fail until ensure_capacity grows.
         assert!(cache.write_token(&mut store, 0, 4, &row, &row).is_none());
     }
@@ -906,13 +897,19 @@ mod tests {
         let hd = store.head_dim();
         // Write at pos 5 first (out-of-order) → seq_len = 6.
         let row = token_row(0.5, n_heads, hd);
-        cache.write_token(&mut store, 0, 5, &row, &row).expect("pos 5");
+        cache
+            .write_token(&mut store, 0, 5, &row, &row)
+            .expect("pos 5");
         assert_eq!(cache.seq_len(), 6);
         // Write at pos 2 → seq_len stays at 6 (lazy max).
-        cache.write_token(&mut store, 0, 2, &row, &row).expect("pos 2");
+        cache
+            .write_token(&mut store, 0, 2, &row, &row)
+            .expect("pos 2");
         assert_eq!(cache.seq_len(), 6);
         // Write at pos 7 → seq_len = 8.
-        cache.write_token(&mut store, 0, 7, &row, &row).expect("pos 7");
+        cache
+            .write_token(&mut store, 0, 7, &row, &row)
+            .expect("pos 7");
         assert_eq!(cache.seq_len(), 8);
     }
 
@@ -941,23 +938,31 @@ mod tests {
                     v[h * hd + d] = -val;
                 }
             }
-            cache.write_token(&mut store, layer, pos, &k, &v).expect("write");
+            cache
+                .write_token(&mut store, layer, pos, &k, &v)
+                .expect("write");
         }
         assert_eq!(cache.seq_len(), n_tokens);
         let need = n_heads * (n_tokens as usize) * hd;
         let mut k_out = vec![0f32; need];
         let mut v_out = vec![0f32; need];
-        cache.gather_layer(&store, layer, &mut k_out, &mut v_out).expect("gather");
+        cache
+            .gather_layer(&store, layer, &mut k_out, &mut v_out)
+            .expect("gather");
         // Cells follow the same pos*1000 + h*10 + d pattern.
         for h in 0..n_heads {
             for pos in 0..n_tokens as usize {
                 for d in 0..hd {
                     let off = h * (n_tokens as usize) * hd + pos * hd + d;
                     let want = (pos as f32) * 1000.0 + (h as f32) * 10.0 + d as f32;
-                    assert!((k_out[off] - want).abs() < 1e-6,
-                            "k mismatch h={h} pos={pos} d={d}");
-                    assert!((v_out[off] + want).abs() < 1e-6,
-                            "v mismatch h={h} pos={pos} d={d}");
+                    assert!(
+                        (k_out[off] - want).abs() < 1e-6,
+                        "k mismatch h={h} pos={pos} d={d}"
+                    );
+                    assert!(
+                        (v_out[off] + want).abs() < 1e-6,
+                        "v mismatch h={h} pos={pos} d={d}"
+                    );
                 }
             }
         }
@@ -968,7 +973,8 @@ mod tests {
         let mut v = vec![0f32; n_heads * hd];
         for h in 0..n_heads {
             for d in 0..hd {
-                let val = (layer as f32) * 1.0e6 + (pos as f32) * 1000.0 + (h as f32) * 10.0 + d as f32;
+                let val =
+                    (layer as f32) * 1.0e6 + (pos as f32) * 1000.0 + (h as f32) * 10.0 + d as f32;
                 k[h * hd + d] = val;
                 v[h * hd + d] = -val;
             }
@@ -1005,7 +1011,9 @@ mod tests {
         for layer in 0..store.n_layers() {
             for pos in 0..n_tokens {
                 let (k, v) = pattern_kv(pos, layer, n_heads, hd);
-                cache1.write_token(&mut store, layer, pos, &k, &v).expect("write");
+                cache1
+                    .write_token(&mut store, layer, pos, &k, &v)
+                    .expect("write");
             }
         }
         let pages1: Vec<_> = cache1.pages().to_vec();
@@ -1030,7 +1038,9 @@ mod tests {
         for layer in 0..store.n_layers() {
             let mut k_out = vec![0f32; need];
             let mut v_out = vec![0f32; need];
-            cache2.gather_layer(&store, layer, &mut k_out, &mut v_out).expect("gather");
+            cache2
+                .gather_layer(&store, layer, &mut k_out, &mut v_out)
+                .expect("gather");
             for h in 0..n_heads {
                 for pos in 0..n_tokens as usize {
                     for d in 0..hd {
@@ -1114,7 +1124,11 @@ mod tests {
         cache_a.ensure_capacity_shared(&shared, 4).expect("alloc A");
         cache_b.ensure_capacity_shared(&shared, 4).expect("alloc B");
         assert_eq!(shared.free_pages(), 2, "2 of 4 pages allocated");
-        assert_ne!(cache_a.pages(), cache_b.pages(), "disjoint page assignments");
+        assert_ne!(
+            cache_a.pages(),
+            cache_b.pages(),
+            "disjoint page assignments"
+        );
 
         // Each cache writes a unique pattern at pos 0, layer 0.
         let geom = shared.geometry();
@@ -1171,7 +1185,9 @@ mod tests {
         let shared = SharedPagedKv::new(store, table);
 
         let mut cache_a = PagedKvCache::new_for(&PagedKvStore::new(4, 2, 3, 4, 8).unwrap());
-        cache_a.ensure_capacity_shared(&shared, 16).expect("alloc 4 pages");
+        cache_a
+            .ensure_capacity_shared(&shared, 16)
+            .expect("alloc 4 pages");
         assert_eq!(shared.free_pages(), 0, "pool exhausted");
 
         cache_a.release_shared(&shared);
@@ -1220,7 +1236,9 @@ mod tests {
                 }
             }
             // Write to paged cache.
-            cache.write_token(&mut store, layer, pos, &k_row, &v_row).unwrap();
+            cache
+                .write_token(&mut store, layer, pos, &k_row, &v_row)
+                .unwrap();
             // Mirror write into contiguous slab — same indexing the
             // current F32 forward pass uses.
             for h in 0..n_heads {
@@ -1237,7 +1255,9 @@ mod tests {
         let need = n_heads * (n_tokens as usize) * hd;
         let mut gathered_k = vec![0f32; need];
         let mut gathered_v = vec![0f32; need];
-        cache.gather_layer(&store, layer, &mut gathered_k, &mut gathered_v).unwrap();
+        cache
+            .gather_layer(&store, layer, &mut gathered_k, &mut gathered_v)
+            .unwrap();
         // Compare: for each (h, pos) the gathered slab's row must
         // equal the contiguous slab's same (h, pos) row.
         for h in 0..n_heads {
@@ -1327,7 +1347,11 @@ mod tests {
         assert!(!cache.evict_engaged());
         assert_eq!(cache.pages().len(), 2, "6 tokens -> 2 pages (unchanged)");
         assert_eq!(cache.capacity_tokens(), 8, "raw page*page_size capacity");
-        assert_eq!(cache.retained_len_for_pos(5), 6, "retained == pos+1 when off");
+        assert_eq!(
+            cache.retained_len_for_pos(5),
+            6,
+            "retained == pos+1 when off"
+        );
         assert_eq!(cache.retained_len(), cache.seq_len());
     }
 
@@ -1348,7 +1372,9 @@ mod tests {
         for pos in 0..20u32 {
             cache.ensure_capacity(&mut table, pos + 1).expect("grow");
             let k = [pattern(pos, 0), pattern(pos, 1)];
-            cache.write_token(&mut store, layer, pos, &k, &k).expect("write");
+            cache
+                .write_token(&mut store, layer, pos, &k, &k)
+                .expect("write");
         }
         assert!(cache.evict_engaged(), "should engage once past the window");
         // Retained span bounded to [window, window + page_size).
@@ -1356,12 +1382,23 @@ mod tests {
         assert!((8..12).contains(&rl), "retained_len {rl} in [8, 12)");
         // Live page usage bounded (not the 5 pages a 20-token history
         // would need unbounded).
-        assert!(cache.pages().len() <= 3, "pages bounded: {}", cache.pages().len());
+        assert!(
+            cache.pages().len() <= 3,
+            "pages bounded: {}",
+            cache.pages().len()
+        );
         // Evicted pages returned to the pool.
-        assert!(table.free_count() >= 5, "old pages freed back: {}", table.free_count());
+        assert!(
+            table.free_count() >= 5,
+            "old pages freed back: {}",
+            table.free_count()
+        );
         // Retained window is contiguous (no hole for sliding window).
         let bases = &cache.evict.as_ref().unwrap().page_base;
-        assert!(bases.windows(2).all(|w| w[1] - w[0] == 4), "contiguous: {bases:?}");
+        assert!(
+            bases.windows(2).all(|w| w[1] - w[0] == 4),
+            "contiguous: {bases:?}"
+        );
         // The newest token is inside the retained set and reconstructs.
         verify_retained_reconstruction(&cache, &store, layer, &pattern);
     }
@@ -1381,7 +1418,9 @@ mod tests {
         for pos in 0..20u32 {
             cache.ensure_capacity(&mut table, pos + 1).expect("grow");
             let k = [pattern(pos, 0), pattern(pos, 1)];
-            cache.write_token(&mut store, layer, pos, &k, &k).expect("write");
+            cache
+                .write_token(&mut store, layer, pos, &k, &k)
+                .expect("write");
         }
         assert!(cache.evict_engaged());
         let bases = cache.evict.as_ref().unwrap().page_base.clone();

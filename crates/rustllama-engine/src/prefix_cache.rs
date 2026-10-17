@@ -614,7 +614,9 @@ mod tests {
                             // Pattern lets us trivially verify the snapshot
                             // copied the right (head, pos, dim) cells:
                             // value depends on all four indices.
-                            k[idx] = base + (li as f32) + (h as f32) * 0.1
+                            k[idx] = base
+                                + (li as f32)
+                                + (h as f32) * 0.1
                                 + (pos as f32) * 0.01
                                 + (d as f32) * 0.001;
                             v[idx] = -k[idx];
@@ -647,8 +649,7 @@ mod tests {
                 for h in 0..live.n_kv_heads {
                     for pos in 0..5 {
                         for d in 0..live.head_dim {
-                            let idx =
-                                h * live.max_ctx * live.head_dim + pos * live.head_dim + d;
+                            let idx = h * live.max_ctx * live.head_dim + pos * live.head_dim + d;
                             assert!((ok[idx] - rk[idx]).abs() < 1e-6);
                             assert!((ov[idx] - rv[idx]).abs() < 1e-6);
                         }
@@ -906,7 +907,11 @@ mod tests {
         // Refresh with a different KV pattern.
         fill_kv(&mut live, 4, 99.0);
         pool.snapshot_and_insert(vec![1, 2, 3, 4], &live);
-        assert_eq!(pool.len(), 1, "identical-ids reinsert must not grow the pool");
+        assert_eq!(
+            pool.len(),
+            1,
+            "identical-ids reinsert must not grow the pool"
+        );
     }
 
     #[test]
@@ -990,19 +995,13 @@ mod tests {
         fill_kv(&mut live, 4, 1.0);
         pool.snapshot_and_insert(vec![1, 2, 3, 4], &live); // text-only
         fill_kv(&mut live, 4, 2.0);
-        pool.snapshot_and_insert_with_image_hash(
-            vec![1, 2, 3, 4],
-            &live,
-            Some(0xCAFEBABE),
-        );
+        pool.snapshot_and_insert_with_image_hash(vec![1, 2, 3, 4], &live, Some(0xCAFEBABE));
         assert_eq!(pool.len(), 2, "different image classes coexist");
 
         // Text-only query should match the text-only entry only.
         let (_, lcp) = pool.find_best(&[1, 2, 3, 4]).expect("text match");
         assert_eq!(lcp, 4);
-        let entry = pool
-            .find_best_with_image_hash(&[1, 2, 3, 4], None)
-            .unwrap();
+        let entry = pool.find_best_with_image_hash(&[1, 2, 3, 4], None).unwrap();
         assert_eq!(pool.entries[entry.0].image_hash, None);
 
         // Image query with same hash matches the VLM entry only.
@@ -1030,11 +1029,7 @@ mod tests {
         // snapshot the 4-token ids; for VLM the snapshot keeps the
         // expanded kv_len.
         fill_kv(&mut live, 20, 1.0);
-        pool.snapshot_and_insert_with_image_hash(
-            vec![10, 20, 30, 40],
-            &live,
-            Some(0xFEEDFACE),
-        );
+        pool.snapshot_and_insert_with_image_hash(vec![10, 20, 30, 40], &live, Some(0xFEEDFACE));
         let snap = &pool.entries[0];
         assert_eq!(snap.ids, vec![10, 20, 30, 40]);
         assert_eq!(snap.kv_len, 20, "VLM entry holds expanded kv_len");
@@ -1050,17 +1045,9 @@ mod tests {
         let mut live = KvCache::new_with_dtype(&cfg, 32, KvDtype::F32);
         let mut pool = PrefixCachePool::new(4);
         fill_kv(&mut live, 4, 1.0);
-        pool.snapshot_and_insert_with_image_hash(
-            vec![1, 2, 3, 4],
-            &live,
-            Some(0xAA),
-        );
+        pool.snapshot_and_insert_with_image_hash(vec![1, 2, 3, 4], &live, Some(0xAA));
         fill_kv(&mut live, 7, 2.0);
-        pool.snapshot_and_insert_with_image_hash(
-            vec![1, 2, 3, 4, 5, 6, 7],
-            &live,
-            Some(0xAA),
-        );
+        pool.snapshot_and_insert_with_image_hash(vec![1, 2, 3, 4, 5, 6, 7], &live, Some(0xAA));
         // dedup may have collapsed these — see how many remain.
         // The 4-token is a prefix of the 7-token, so the 4-token
         // entry should have been removed by the dedup pass during
@@ -1165,7 +1152,11 @@ mod tests {
         pool.insert_snapshot(mk_anchor(&live, vec![1, 2, 3, 4]));
         fill_kv(&mut live, 4, 9.0);
         pool.insert_snapshot(mk_anchor(&live, vec![1, 2, 3, 4]));
-        assert_eq!(pool.len(), 1, "identical-ids anchor reinsert must not grow the pool");
+        assert_eq!(
+            pool.len(),
+            1,
+            "identical-ids anchor reinsert must not grow the pool"
+        );
     }
 
     #[test]
@@ -1198,7 +1189,11 @@ mod tests {
         // panicking on the max_ctx-strided slice.
         let snap = live.snapshot_prefix(5);
         assert!(snap.layers[0].approx_bytes() > 0);
-        assert_eq!(snap.layers[1].approx_bytes(), 0, "placeholder for skipped layer");
+        assert_eq!(
+            snap.layers[1].approx_bytes(),
+            0,
+            "placeholder for skipped layer"
+        );
         // Restore round-trips and skips the placeholder.
         live.reset();
         live.restore_prefix(&snap);

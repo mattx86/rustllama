@@ -65,8 +65,12 @@ pub fn binary_dot_usable() -> bool {
         if !vpopcntdq_supported() {
             return false;
         }
-        let w: Vec<u64> = (0..20).map(|i| (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
-        let x: Vec<u64> = (0..20).map(|i| (i as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)).collect();
+        let w: Vec<u64> = (0..20)
+            .map(|i| (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .collect();
+        let x: Vec<u64> = (0..20)
+            .map(|i| (i as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F))
+            .collect();
         // SAFETY: vpopcntdq_supported() checked above.
         let got = unsafe { binary_dot_vpopcntdq(&w, &x) };
         got == binary_dot_scalar(&w, &x)
@@ -188,17 +192,26 @@ mod tests {
     fn bitops_ext_match_reference_or_skip() {
         // GFNI runs on the dev box (AVX2-GFNI); the AVX-512 ones SKIP here.
         if gfni_supported() {
-            assert!(gfni_reverse_usable(), "GFNI present but bit-reverse self-check failed");
+            assert!(
+                gfni_reverse_usable(),
+                "GFNI present but bit-reverse self-check failed"
+            );
         } else {
             eprintln!("gfni: not supported — SKIP");
         }
         if vpopcntdq_supported() {
-            assert!(binary_dot_usable(), "VPOPCNTDQ present but binary-dot self-check failed");
+            assert!(
+                binary_dot_usable(),
+                "VPOPCNTDQ present but binary-dot self-check failed"
+            );
         } else {
             eprintln!("vpopcntdq: not supported — SKIP");
         }
         if vbmi2_supported() {
-            assert!(vbmi2_expand_usable(), "VBMI2 present but expand self-check failed");
+            assert!(
+                vbmi2_expand_usable(),
+                "VBMI2 present but expand self-check failed"
+            );
         } else {
             eprintln!("vbmi2: not supported — SKIP");
         }

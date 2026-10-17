@@ -71,7 +71,10 @@ async fn eagle_chain_matches_plain_greedy() {
     let (base, head) = write_base_and_head("chain");
     let mut cpu = CpuEngine::load_with_options(&base, 64, true, KvDtype::F32).expect("load base");
     cpu.attach_eagle_head(&head).expect("attach eagle head");
-    assert!(cpu.eagle_speculative(), "dense model + head ⇒ EAGLE engaged");
+    assert!(
+        cpu.eagle_speculative(),
+        "dense model + head ⇒ EAGLE engaged"
+    );
     // A chain tree (width 1 at every depth) is the degenerate case the parity
     // anchor pins: it must reduce EXACTLY to linear greedy decode.
     cpu.set_tree_speculative(Some(vec![1, 1, 1]));
@@ -147,7 +150,10 @@ fn no_head_is_byte_identical() {
 
     let plain_engine =
         CpuEngine::load_with_options(&base, 64, true, KvDtype::F32).expect("load plain");
-    assert!(plain_engine.eagle_head().is_none(), "fresh engine has no head");
+    assert!(
+        plain_engine.eagle_head().is_none(),
+        "fresh engine has no head"
+    );
     assert!(!plain_engine.eagle_speculative());
     let reference = plain_engine
         .generate_token_ids(&prompt, n, &greedy(n))

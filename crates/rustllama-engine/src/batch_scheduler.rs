@@ -289,11 +289,7 @@ impl SlotPool {
             return taken_slot;
         }
         // Maybe it was still on the waiting queue.
-        if let Some(pos) = self
-            .waiting
-            .iter()
-            .position(|s| s.request_id == id)
-        {
+        if let Some(pos) = self.waiting.iter().position(|s| s.request_id == id) {
             let mut taken = self.waiting.remove(pos).unwrap();
             taken.state = SlotState::Done;
             return Some(taken);
@@ -414,11 +410,7 @@ impl Scheduler for SingleFlightScheduler {
     }
 
     fn pending(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("scheduler lock")
-            .pool
-            .pending()
+        self.inner.lock().expect("scheduler lock").pool.pending()
     }
 }
 
@@ -497,11 +489,7 @@ impl Scheduler for MultiFlightScheduler {
     }
 
     fn pending(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("scheduler lock")
-            .pool
-            .pending()
+        self.inner.lock().expect("scheduler lock").pool.pending()
     }
 }
 
@@ -673,7 +661,11 @@ mod tests {
         decoding.next_pos = 5;
         let _ = s.admit(decoding);
         let step = s.step();
-        assert_eq!(step.decode_ids.len(), 1, "decoding slot must appear in step");
+        assert_eq!(
+            step.decode_ids.len(),
+            1,
+            "decoding slot must appear in step"
+        );
     }
 
     // ============================================================
@@ -691,7 +683,10 @@ mod tests {
         p.admit(slot(id2, SlotState::Pending));
         let s1_seq = p.find(id1).unwrap().admit_seq;
         let s2_seq = p.find(id2).unwrap().admit_seq;
-        assert!(s2_seq > s1_seq, "admit_seq must be monotonic: {s1_seq} {s2_seq}");
+        assert!(
+            s2_seq > s1_seq,
+            "admit_seq must be monotonic: {s1_seq} {s2_seq}"
+        );
     }
 
     #[test]
@@ -710,18 +705,27 @@ mod tests {
 
         // Complete the active slot → expect HIGH to drain in.
         p.complete(RequestId(1));
-        assert_eq!(p.find(RequestId(10)).map(|s| s.request_id), Some(RequestId(10)));
+        assert_eq!(
+            p.find(RequestId(10)).map(|s| s.request_id),
+            Some(RequestId(10))
+        );
         assert!(p.find(RequestId(20)).is_none());
         assert!(p.find(RequestId(30)).is_none());
 
         // Complete the HIGH slot → DEFAULT drains next.
         p.complete(RequestId(10));
-        assert_eq!(p.find(RequestId(20)).map(|s| s.request_id), Some(RequestId(20)));
+        assert_eq!(
+            p.find(RequestId(20)).map(|s| s.request_id),
+            Some(RequestId(20))
+        );
         assert!(p.find(RequestId(30)).is_none());
 
         // Complete the DEFAULT slot → LOW drains last.
         p.complete(RequestId(20));
-        assert_eq!(p.find(RequestId(30)).map(|s| s.request_id), Some(RequestId(30)));
+        assert_eq!(
+            p.find(RequestId(30)).map(|s| s.request_id),
+            Some(RequestId(30))
+        );
     }
 
     #[test]

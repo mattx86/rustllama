@@ -240,8 +240,7 @@ pub struct CpuEngine {
     /// `load_with_mmproj`; `OnePerPatch` (Qwen2-VL style) is selected
     /// via [`load_with_mmproj_with_mode`]. `None` when no mmproj is
     /// loaded.
-    placeholder_mode:
-        Option<rustllama_models::vision_arch::PlaceholderMode>,
+    placeholder_mode: Option<rustllama_models::vision_arch::PlaceholderMode>,
     /// Injectable placeholder text for image-bearing chat messages
     /// (D1: the engine, not the template, inserts the vision markers
     /// — even HF's real Qwen3-VL template emits ONE `<|image_pad|>`
@@ -603,12 +602,7 @@ impl Drop for SyclWorker {
         // join. Best-effort: if the channel is already closed (worker
         // panicked) the send fails silently and we still join.
         let _ = self.tx.send(SyclWorkItem::Shutdown);
-        if let Some(j) = self
-            .join
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
-        {
+        if let Some(j) = self.join.lock().ok().and_then(|mut g| g.take()) {
             // Engine drops are rare (process shutdown, model swap), so
             // briefly waiting for the worker to finish its current item
             // is acceptable. We don't have a stdlib timeout primitive,
@@ -923,9 +917,7 @@ impl EngineState {
             // clobbers it (mirrors the dense branch's stash) — the
             // current conversation stays warm if a different thread's
             // request lands in between.
-            if self.last_ids.len() >= PREFIX_REUSE_MIN_TOKENS
-                && kv.seq_len == self.last_ids.len()
-            {
+            if self.last_ids.len() >= PREFIX_REUSE_MIN_TOKENS && kv.seq_len == self.last_ids.len() {
                 if let Some(dn) = self.delta_net_cache.as_ref() {
                     let ids = self.last_ids.clone();
                     self.pool.snapshot_and_insert_hybrid(ids, kv, dn);
@@ -1145,7 +1137,15 @@ impl CpuEngine {
         with_tokenizer: bool,
         kv_dtype: KvDtype,
     ) -> Result<Self> {
-        Self::load_inner(path, max_ctx, with_tokenizer, kv_dtype, "contiguous", 0, None)
+        Self::load_inner(
+            path,
+            max_ctx,
+            with_tokenizer,
+            kv_dtype,
+            "contiguous",
+            0,
+            None,
+        )
     }
 
     /// Same as [`load_with_options`] but with an explicit
@@ -1178,7 +1178,15 @@ impl CpuEngine {
         kv_layout: &str,
         kv_page_size: u32,
     ) -> Result<Self> {
-        Self::load_inner(path, max_ctx, with_tokenizer, kv_dtype, kv_layout, kv_page_size, None)
+        Self::load_inner(
+            path,
+            max_ctx,
+            with_tokenizer,
+            kv_dtype,
+            kv_layout,
+            kv_page_size,
+            None,
+        )
     }
 
     /// P11: like [`Self::load_with_options_layout_and_page_size`] but merges a
@@ -1332,8 +1340,8 @@ impl CpuEngine {
         // or malformed adapter is a hard load error — the user asked for it.
         if let Some(lora_path) = lora {
             let lgguf = Gguf::open(lora_path)?;
-            let adapter =
-                rustllama_models::lora::LoraAdapter::from_gguf(&lgguf, "default").map_err(|e| {
+            let adapter = rustllama_models::lora::LoraAdapter::from_gguf(&lgguf, "default")
+                .map_err(|e| {
                     CpuEngineError::Other(format!(
                         "LoRA adapter load failed ({}): {e}",
                         lora_path.display()
@@ -1432,20 +1440,19 @@ impl CpuEngine {
         // whose flash now carries the window uniform (F1, `quant_kv_windowed`) is
         // ALSO honored verbatim on the contiguous path; every other non-F32 dtype
         // is still coerced to F32 for masking correctness. Non-SWA untouched.
-        let kv_dtype = if model.cfg.sliding_window.is_some()
-            && kv_dtype != KvDtype::F32
-            && !quant_kv_windowed
-        {
-            tracing::warn!(
-                requested = ?kv_dtype,
-                "sliding-window model: defaulting KV cache to f32 (this dtype's \
-                 windowed attention kernels are not available; F1 covers q4_0 / \
-                 q8_0 / nvfp4 / tq / mxfp4-6-8)"
-            );
-            KvDtype::F32
-        } else {
-            kv_dtype
-        };
+        let kv_dtype =
+            if model.cfg.sliding_window.is_some() && kv_dtype != KvDtype::F32 && !quant_kv_windowed
+            {
+                tracing::warn!(
+                    requested = ?kv_dtype,
+                    "sliding-window model: defaulting KV cache to f32 (this dtype's \
+                     windowed attention kernels are not available; F1 covers q4_0 / \
+                     q8_0 / nvfp4 / tq / mxfp4-6-8)"
+                );
+                KvDtype::F32
+            } else {
+                kv_dtype
+            };
         // Gemma2 attention-logit soft-capping (`s = c·tanh(s/c)` on every
         // attention score, before softmax): same rule as the sliding-window
         // coercion just above — F32 and the F1 `quant_kv_windowed` quant dtypes
@@ -1493,30 +1500,29 @@ impl CpuEngine {
         } else {
             kv_dtype
         };
-        let swa_or_softcap = model.cfg.sliding_window.is_some()
-            || model.cfg.attn_logit_softcapping.is_some();
-        let kv_layout: &str = if (model.weights.is_hybrid() || model.weights.is_mla())
-            && kv_layout != "contiguous"
-        {
-            tracing::warn!(
-                requested = %kv_layout,
-                is_mla = model.weights.is_mla(),
-                "hybrid / MLA model: paged KV layouts are not supported by this \
-                 forward path — coercing to contiguous for this load"
-            );
-            "contiguous"
-        } else if swa_or_softcap && kv_dtype != KvDtype::F32 && kv_layout != "contiguous" {
-            tracing::warn!(
-                requested = %kv_layout,
-                kv_dtype = ?kv_dtype,
-                "sliding-window / softcap model with quant KV: coercing to the \
-                 contiguous layout (the paged quant-KV forwards do not yet carry \
-                 the window/softcap uniforms; the contiguous quant kernels do)"
-            );
-            "contiguous"
-        } else {
-            kv_layout
-        };
+        let swa_or_softcap =
+            model.cfg.sliding_window.is_some() || model.cfg.attn_logit_softcapping.is_some();
+        let kv_layout: &str =
+            if (model.weights.is_hybrid() || model.weights.is_mla()) && kv_layout != "contiguous" {
+                tracing::warn!(
+                    requested = %kv_layout,
+                    is_mla = model.weights.is_mla(),
+                    "hybrid / MLA model: paged KV layouts are not supported by this \
+                     forward path — coercing to contiguous for this load"
+                );
+                "contiguous"
+            } else if swa_or_softcap && kv_dtype != KvDtype::F32 && kv_layout != "contiguous" {
+                tracing::warn!(
+                    requested = %kv_layout,
+                    kv_dtype = ?kv_dtype,
+                    "sliding-window / softcap model with quant KV: coercing to the \
+                     contiguous layout (the paged quant-KV forwards do not yet carry \
+                     the window/softcap uniforms; the contiguous quant kernels do)"
+                );
+                "contiguous"
+            } else {
+                kv_layout
+            };
         // Sparse KV for hybrid models: only full-attention layers get
         // real slabs (see `hybrid_kv_keep_mask`).
         let kv_keep = hybrid_kv_keep_mask(&model);
@@ -1786,84 +1792,84 @@ impl CpuEngine {
             rustllama_models::accel::sycl_dedicated_vram_bytes()
         };
         if let Some(avail) = tier_avail {
-          if model.weights.is_moe() {
-            let vram_expert_bytes: u64 = {
-                // Projected budget: free VRAM at load (weights upload lazily, so
-                // ~nothing is resident yet) − the non-expert weights (assumed all
-                // GPU-resident, conservative) − a margin for the device context,
-                // KV mirror, and fragmentation; capped at the total expert bytes.
-                let (expert_b, non_expert_b) = model.weights.vram_byte_breakdown();
-                // Margin = the decode KV mirror + a floor for the CUDA context,
-                // Q/out scratch, and fragmentation. The canonical KV cache is
-                // host RAM (`KvBuf::Host`), BUT the CUDA/Metal flash-DECODE path
-                // keeps a persistent per-layer device KV mirror in VRAM (packed,
-                // so its footprint scales with kv_dtype: f32 = 4 B/elem, q8_0 ≈
-                // 1.06, nvfp4 ≈ 0.56). Reserving the actual mirror means a
-                // quantized KV auto-frees that VRAM for more promoted experts.
-                // On-pod (Qwen3-30B-A3B, RTX 2000 Ada 16 GB): f32 → ~1.6 GB
-                // mirror → budget ~13.2 GB (~38 layers, 9.96 tok/s); q8_0 →
-                // ~0.43 GB mirror (floor dominates) → budget ~13.8 GB (~40) AND
-                // a 4× lighter attention read (q8_0 alone measured 9.96→11.37
-                // tok/s). The old flat 20% over-reserved ~1.8 GB; budget sweeps
-                // up to ~13.5 GB promote cleanly (fb steady, no thrash) since
-                // promoted experts are managed memory that pages to host under
-                // pressure — an under-reserve degrades to "slower", never OOM.
-                let kv_bytes_per_elem = (kv_dtype.approx_bits_per_element() / 8.0) as f64;
-                let kv_mirror = (model.cfg.n_layers as f64
+            if model.weights.is_moe() {
+                let vram_expert_bytes: u64 = {
+                    // Projected budget: free VRAM at load (weights upload lazily, so
+                    // ~nothing is resident yet) − the non-expert weights (assumed all
+                    // GPU-resident, conservative) − a margin for the device context,
+                    // KV mirror, and fragmentation; capped at the total expert bytes.
+                    let (expert_b, non_expert_b) = model.weights.vram_byte_breakdown();
+                    // Margin = the decode KV mirror + a floor for the CUDA context,
+                    // Q/out scratch, and fragmentation. The canonical KV cache is
+                    // host RAM (`KvBuf::Host`), BUT the CUDA/Metal flash-DECODE path
+                    // keeps a persistent per-layer device KV mirror in VRAM (packed,
+                    // so its footprint scales with kv_dtype: f32 = 4 B/elem, q8_0 ≈
+                    // 1.06, nvfp4 ≈ 0.56). Reserving the actual mirror means a
+                    // quantized KV auto-frees that VRAM for more promoted experts.
+                    // On-pod (Qwen3-30B-A3B, RTX 2000 Ada 16 GB): f32 → ~1.6 GB
+                    // mirror → budget ~13.2 GB (~38 layers, 9.96 tok/s); q8_0 →
+                    // ~0.43 GB mirror (floor dominates) → budget ~13.8 GB (~40) AND
+                    // a 4× lighter attention read (q8_0 alone measured 9.96→11.37
+                    // tok/s). The old flat 20% over-reserved ~1.8 GB; budget sweeps
+                    // up to ~13.5 GB promote cleanly (fb steady, no thrash) since
+                    // promoted experts are managed memory that pages to host under
+                    // pressure — an under-reserve degrades to "slower", never OOM.
+                    let kv_bytes_per_elem = (kv_dtype.approx_bits_per_element() / 8.0) as f64;
+                    let kv_mirror = (model.cfg.n_layers as f64
                     * 2.0 // K + V
                     * model.cfg.n_kv_heads as f64
                     * ctx as f64
                     * model.cfg.head_dim as f64
                     * kv_bytes_per_elem) as u64;
-                // Margin precedence: the tuner A/B override (set per candidate by
-                // the in-process `tune --moe-vram-margin` sweep) → the persisted
-                // per-model winner → the static `kv_mirror.max(1 GiB)` heuristic.
-                // An autotuned margin lets each host promote the decode-optimal
-                // expert count instead of the conservative default.
-                let heuristic_margin = kv_mirror.max(1024 * 1024 * 1024);
-                let margin = rustllama_models::accel::moe_vram_margin_override()
-                    .or_else(|| Self::moe_vram_margin_tuned(&model_id))
-                    .unwrap_or(heuristic_margin);
-                // Shared, unit-tested budget projection (P20). `Some(avail)` + a
-                // MoE model here → the same `avail − non_expert − margin` capped
-                // at expert bytes as before (byte-identical); the `None` /
-                // non-MoE arms (budget 0, inert) are exercised by the unit tests.
-                project_moe_tier_budget_bytes(Some(avail), true, expert_b, non_expert_b, margin)
-            };
-            if vram_expert_bytes > 0 {
-                // Usage ranking (hottest-first) from the persisted per-model
-                // sidecar, so a tight budget buys the most-routed experts. Cold
-                // start (no sidecar) ⇒ empty ⇒ promotion falls back to index
-                // order. Opening a throwaway learner just reads the sidecar; the
-                // session's own learner is initialized separately below.
-                let ranked = crate::expert_cache::UsageLearner::open(path)
-                    .map(|l| l.ranked_keys())
-                    .unwrap_or_default();
-                let (experts, bytes) =
-                    model.weights.promote_experts_to_device(vram_expert_bytes, &ranked);
-                if experts > 0 {
-                    // Arm MoE-aware placement + the non-promoted-expert CPU
-                    // routing (per_layer_weight_bytes excludes experts; the
-                    // dispatch forces un-promoted expert views to CPU).
-                    rustllama_models::accel::set_moe_tier_active(true);
-                    tracing::info!(
-                        experts,
-                        promoted_mb = bytes / (1024 * 1024),
-                        budget_mb = vram_expert_bytes / (1024 * 1024),
-                        ranked = ranked.len(),
-                        "moe tiered-expert: promoted hottest experts to GPU device memory"
-                    );
+                    // Margin precedence: the tuner A/B override (set per candidate by
+                    // the in-process `tune --moe-vram-margin` sweep) → the persisted
+                    // per-model winner → the static `kv_mirror.max(1 GiB)` heuristic.
+                    // An autotuned margin lets each host promote the decode-optimal
+                    // expert count instead of the conservative default.
+                    let heuristic_margin = kv_mirror.max(1024 * 1024 * 1024);
+                    let margin = rustllama_models::accel::moe_vram_margin_override()
+                        .or_else(|| Self::moe_vram_margin_tuned(&model_id))
+                        .unwrap_or(heuristic_margin);
+                    // Shared, unit-tested budget projection (P20). `Some(avail)` + a
+                    // MoE model here → the same `avail − non_expert − margin` capped
+                    // at expert bytes as before (byte-identical); the `None` /
+                    // non-MoE arms (budget 0, inert) are exercised by the unit tests.
+                    project_moe_tier_budget_bytes(Some(avail), true, expert_b, non_expert_b, margin)
+                };
+                if vram_expert_bytes > 0 {
+                    // Usage ranking (hottest-first) from the persisted per-model
+                    // sidecar, so a tight budget buys the most-routed experts. Cold
+                    // start (no sidecar) ⇒ empty ⇒ promotion falls back to index
+                    // order. Opening a throwaway learner just reads the sidecar; the
+                    // session's own learner is initialized separately below.
+                    let ranked = crate::expert_cache::UsageLearner::open(path)
+                        .map(|l| l.ranked_keys())
+                        .unwrap_or_default();
+                    let (experts, bytes) = model
+                        .weights
+                        .promote_experts_to_device(vram_expert_bytes, &ranked);
+                    if experts > 0 {
+                        // Arm MoE-aware placement + the non-promoted-expert CPU
+                        // routing (per_layer_weight_bytes excludes experts; the
+                        // dispatch forces un-promoted expert views to CPU).
+                        rustllama_models::accel::set_moe_tier_active(true);
+                        tracing::info!(
+                            experts,
+                            promoted_mb = bytes / (1024 * 1024),
+                            budget_mb = vram_expert_bytes / (1024 * 1024),
+                            ranked = ranked.len(),
+                            "moe tiered-expert: promoted hottest experts to GPU device memory"
+                        );
+                    }
                 }
             }
-          }
         }
         // Wrap the model in its Arc, then (Windows) VirtualLock the hot
         // weight tiers into RAM per RUSTLLAMA_LOCK_RAM_MB. Done after the
         // GGUF mmap drop + EmptyWorkingSet above so we re-resident only
         // the live owned weights, not the just-trimmed file pages.
         let model = Arc::new(model);
-        let lock_registry =
-            crate::pagelock::lock_model_into_ram(Arc::clone(&model)).map(Arc::new);
+        let lock_registry = crate::pagelock::lock_model_into_ram(Arc::clone(&model)).map(Arc::new);
         // Authoritative residency check: QueryWorkingSetEx reports the
         // Locked bit per page — confirms VirtualLock actually pinned the
         // ranges (vs. SetProcessWorkingSetSizeEx silently failing).
@@ -1881,8 +1887,7 @@ impl CpuEngine {
         }
         // Zero-copy confirmation: how many weight tensors were borrowed
         // straight from the GGUF mmap (Stage 8) vs. copied to owned heap.
-        let (zc_tensors, zc_bytes) =
-            rustllama_models::llama_arch::zerocopy_borrow_stats();
+        let (zc_tensors, zc_bytes) = rustllama_models::llama_arch::zerocopy_borrow_stats();
         if zc_tensors > 0 {
             tracing::info!(
                 model_id = %model_id,
@@ -2305,8 +2310,15 @@ impl CpuEngine {
         // Reuse the text-only load path; loading the mmproj second
         // means a malformed text GGUF surfaces first (faster, more
         // common failure) rather than after the mmproj cost.
-        let mut engine =
-            Self::load_inner(text_path, max_ctx, true, KvDtype::F32, "contiguous", 0, None)?;
+        let mut engine = Self::load_inner(
+            text_path,
+            max_ctx,
+            true,
+            KvDtype::F32,
+            "contiguous",
+            0,
+            None,
+        )?;
         engine.attach_mmproj(mmproj_path, image_placeholder, placeholder_mode)?;
         Ok(engine)
     }
@@ -2352,17 +2364,13 @@ impl CpuEngine {
         // differ only in how many runs of that id they expect in the
         // prompt.
         let tokenizer = engine.tokenizer.as_ref().ok_or_else(|| {
-            CpuEngineError::NoTokenizer(
-                "load_with_mmproj requires a tokenizer in the text GGUF",
-            )
+            CpuEngineError::NoTokenizer("load_with_mmproj requires a tokenizer in the text GGUF")
         })?;
-        let ids = tokenizer
-            .encode(image_placeholder, false)
-            .map_err(|e| {
-                CpuEngineError::Other(format!(
-                    "tokenize image placeholder '{image_placeholder}': {e}"
-                ))
-            })?;
+        let ids = tokenizer.encode(image_placeholder, false).map_err(|e| {
+            CpuEngineError::Other(format!(
+                "tokenize image placeholder '{image_placeholder}': {e}"
+            ))
+        })?;
         if ids.len() != 1 {
             return Err(CpuEngineError::Other(format!(
                 "image placeholder '{image_placeholder}' tokenizes to {} tokens; \
@@ -2404,9 +2412,7 @@ impl CpuEngine {
     /// Read-only access to the loaded vision tower, if any. Used by
     /// the chat path to call into [`prepare_vlm_inputs`] when image
     /// bytes are attached. `None` for the text-only configuration.
-    pub fn vision(
-        &self,
-    ) -> Option<&Arc<rustllama_models::vision_arch::VisionModel>> {
+    pub fn vision(&self) -> Option<&Arc<rustllama_models::vision_arch::VisionModel>> {
         self.vision.as_ref()
     }
 
@@ -2539,10 +2545,8 @@ impl CpuEngine {
             .map_err(|e| CpuEngineError::Other(format!("read safetensors: {e}")))?;
         let converted = rustllama_safetensors::convert_safetensors_to_gguf_tensors(&blob)
             .map_err(|e| CpuEngineError::Other(format!("safetensors convert: {e}")))?;
-        let model = rustllama_safetensors::build_llama_model_from_safetensors(
-            &cfg, converted,
-        )
-        .map_err(|e| CpuEngineError::Other(format!("safetensors build: {e}")))?;
+        let model = rustllama_safetensors::build_llama_model_from_safetensors(&cfg, converted)
+            .map_err(|e| CpuEngineError::Other(format!("safetensors build: {e}")))?;
 
         // Tokenizer: optional. Most HF releases ship `tokenizer.json`;
         // a small subset use the older `tokenizer.model` (SentencePiece)
@@ -2565,13 +2569,9 @@ impl CpuEngine {
         // load path). VLM + safetensors needs a future loader on the
         // vision side.
         let ctx = max_ctx.min(cfg.ctx_train.max(max_ctx));
-        let kv_backend = KvBackend::from_inference_config(
-            "contiguous",
-            &cfg,
-            ctx as u32,
-            KvDtype::F32,
-        )
-        .map_err(|e| CpuEngineError::Other(format!("kv_backend init: {e}")))?;
+        let kv_backend =
+            KvBackend::from_inference_config("contiguous", &cfg, ctx as u32, KvDtype::F32)
+                .map_err(|e| CpuEngineError::Other(format!("kv_backend init: {e}")))?;
 
         let model_id = path
             .file_stem()
@@ -2594,8 +2594,7 @@ impl CpuEngine {
 
         let delta_net_cache = build_delta_net_cache(&model)?;
         let model = Arc::new(model);
-        let lock_registry =
-            crate::pagelock::lock_model_into_ram(Arc::clone(&model)).map(Arc::new);
+        let lock_registry = crate::pagelock::lock_model_into_ram(Arc::clone(&model)).map(Arc::new);
         let kv_dtype_cached = kv_backend.kv_dtype();
         Ok(Self {
             model,
@@ -2710,9 +2709,8 @@ impl CpuEngine {
         let n_micro = mlx.micro.len();
         let n_full = mlx.full.len();
         let converted = Self::mlx_model_to_converted(&mlx)?;
-        let model =
-            rustllama_safetensors::build_llama_model_from_safetensors(&cfg, converted)
-                .map_err(|e| CpuEngineError::Other(format!("mlx model build: {e}")))?;
+        let model = rustllama_safetensors::build_llama_model_from_safetensors(&cfg, converted)
+            .map_err(|e| CpuEngineError::Other(format!("mlx model build: {e}")))?;
 
         // Tokenizer: optional, same posture as `load_safetensors` — most
         // mlx-community releases ship `tokenizer.json`; warn (don't fail)
@@ -2731,13 +2729,9 @@ impl CpuEngine {
         };
 
         let ctx = max_ctx.min(cfg.ctx_train.max(max_ctx));
-        let kv_backend = KvBackend::from_inference_config(
-            "contiguous",
-            &cfg,
-            ctx as u32,
-            KvDtype::F32,
-        )
-        .map_err(|e| CpuEngineError::Other(format!("kv_backend init: {e}")))?;
+        let kv_backend =
+            KvBackend::from_inference_config("contiguous", &cfg, ctx as u32, KvDtype::F32)
+                .map_err(|e| CpuEngineError::Other(format!("kv_backend init: {e}")))?;
 
         let model_id = dir
             .file_name()
@@ -2764,8 +2758,7 @@ impl CpuEngine {
 
         let delta_net_cache = build_delta_net_cache(&model)?;
         let model = Arc::new(model);
-        let lock_registry =
-            crate::pagelock::lock_model_into_ram(Arc::clone(&model)).map(Arc::new);
+        let lock_registry = crate::pagelock::lock_model_into_ram(Arc::clone(&model)).map(Arc::new);
         let kv_dtype_cached = kv_backend.kv_dtype();
         Ok(Self {
             model,
@@ -2900,7 +2893,9 @@ impl CpuEngine {
             let Some(rest) = module.strip_prefix("model.layers.") else {
                 return false;
             };
-            let Some(dot) = rest.find('.') else { return false };
+            let Some(dot) = rest.find('.') else {
+                return false;
+            };
             if rest[..dot].parse::<usize>().is_err() {
                 return false;
             }
@@ -2944,8 +2939,7 @@ impl CpuEngine {
         let force_native = std::env::var("RUSTLLAMA_MLX_NATIVE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let (mut n_q4_1, mut n_q4_k, mut n_q8_0, mut n_native) =
-            (0usize, 0usize, 0usize, 0usize);
+        let (mut n_q4_1, mut n_q4_k, mut n_q8_0, mut n_native) = (0usize, 0usize, 0usize, 0usize);
         for (module, q) in &mlx.quant {
             if is_moe && mlx_mlp_moe_module(module) {
                 continue; // handled by mlx_moe_to_converted (stacked)
@@ -3141,20 +3135,25 @@ impl CpuEngine {
         let n = q.n_elements() as usize;
         // `0` = keep native affine. `force_native` or a non-block-32 count
         // short-circuits before any dequant work.
-        let target_bits = if force_native || n % 32 != 0 { 0 } else { q.bits };
+        let target_bits = if force_native || n % 32 != 0 {
+            0
+        } else {
+            q.bits
+        };
 
         match target_bits {
             4 | 8 => {
                 let f32buf = Self::mlx_dequant_affine_f32(q, n);
                 // Dequantized f32 → the matching GGUF block-quant (4-bit →
                 // Q4_K/Q4_1, 8-bit → Q8_0). Shared with the micro path.
-                Self::transcode_f32_to_gguf(&f32buf, target_bits, q.in_features())
-                    .unwrap_or_else(|| {
+                Self::transcode_f32_to_gguf(&f32buf, target_bits, q.in_features()).unwrap_or_else(
+                    || {
                         // Unreachable for a real affine weight (in_features is
                         // a multiple of group_size ⇒ of 32); keep native as a
                         // defensive fallback rather than panicking.
                         (ConvertedDtype::MlxAffineRaw, q.to_blob())
-                    })
+                    },
+                )
             }
             // Native fallback: odd bit-width (2/3/5/6), RUSTLLAMA_MLX_NATIVE=1,
             // or a non-block-32 geometry.
@@ -3171,7 +3170,10 @@ impl CpuEngine {
         q: &rustllama_tensor::MlxAffineQuant,
         _force_native: bool,
     ) -> (rustllama_safetensors::ConvertedDtype, Vec<u8>) {
-        (rustllama_safetensors::ConvertedDtype::MlxAffineRaw, q.to_blob())
+        (
+            rustllama_safetensors::ConvertedDtype::MlxAffineRaw,
+            q.to_blob(),
+        )
     }
 
     /// Dequantize one packed MLX-affine weight to a flat f32 buffer in
@@ -3325,10 +3327,21 @@ impl CpuEngine {
             Down,
         }
         enum Role {
-            Expert { layer: usize, proj: Proj, expert: usize },
-            Router { layer: usize },
-            Shared { layer: usize, proj: Proj },
-            SharedGate { layer: usize },
+            Expert {
+                layer: usize,
+                proj: Proj,
+                expert: usize,
+            },
+            Router {
+                layer: usize,
+            },
+            Shared {
+                layer: usize,
+                proj: Proj,
+            },
+            SharedGate {
+                layer: usize,
+            },
         }
         fn proj_from(s: &str) -> Option<Proj> {
             match s {
@@ -3347,7 +3360,11 @@ impl CpuEngine {
                 let edot = e.find('.')?;
                 let expert: usize = e[..edot].parse().ok()?;
                 let proj = proj_from(&e[edot + 1..])?;
-                return Some(Role::Expert { layer, proj, expert });
+                return Some(Role::Expert {
+                    layer,
+                    proj,
+                    expert,
+                });
             }
             if mlp == "gate" {
                 return Some(Role::Router { layer });
@@ -3375,12 +3392,16 @@ impl CpuEngine {
         // from BOTH the affine and the microscaling maps.
         let mut staged: Vec<(Role, ConvertedDtype, Vec<u8>, Vec<u64>, String)> = Vec::new();
         for (module, q) in &mlx.quant {
-            let Some(role) = classify(module) else { continue };
+            let Some(role) = classify(module) else {
+                continue;
+            };
             let (dtype, bytes) = Self::mlx_quant_to_converted_bytes(q, false);
             staged.push((role, dtype, bytes, q.shape.clone(), module.clone()));
         }
         for (module, m) in &mlx.micro {
-            let Some(role) = classify(module) else { continue };
+            let Some(role) = classify(module) else {
+                continue;
+            };
             let (dtype, bytes) = Self::mlx_micro_to_converted_bytes(m)?;
             staged.push((role, dtype, bytes, m.shape.clone(), module.clone()));
         }
@@ -3389,8 +3410,10 @@ impl CpuEngine {
         // expert index (BTreeMap → ascending order); router / shared
         // emit single GGUF-named tensors immediately.
         // (layer, proj_code) -> expert_idx -> (dtype, bytes, [out, in]).
-        let mut experts: BTreeMap<(usize, u8), BTreeMap<usize, (ConvertedDtype, Vec<u8>, Vec<u64>)>> =
-            BTreeMap::new();
+        let mut experts: BTreeMap<
+            (usize, u8),
+            BTreeMap<usize, (ConvertedDtype, Vec<u8>, Vec<u64>)>,
+        > = BTreeMap::new();
         let mut out: Vec<ConvertedTensor> = Vec::new();
         for (role, dtype, bytes, shape, module) in staged {
             if matches!(dtype, ConvertedDtype::MlxAffineRaw) {
@@ -3402,7 +3425,11 @@ impl CpuEngine {
                 )));
             }
             match role {
-                Role::Expert { layer, proj, expert } => {
+                Role::Expert {
+                    layer,
+                    proj,
+                    expert,
+                } => {
                     experts
                         .entry((layer, proj_code(proj)))
                         .or_default()
@@ -3525,8 +3552,7 @@ impl CpuEngine {
     ) {
         self.vision = Some(vision);
         self.image_token_id = Some(image_token_id);
-        self.placeholder_mode =
-            Some(rustllama_models::vision_arch::PlaceholderMode::OnePerImage);
+        self.placeholder_mode = Some(rustllama_models::vision_arch::PlaceholderMode::OnePerImage);
     }
 
     /// Test-only: install vision tower with explicit placeholder
@@ -3548,9 +3574,7 @@ impl CpuEngine {
     /// `forward_prefill` on the same model without exposing the
     /// `model` Arc on the stable surface.
     #[doc(hidden)]
-    pub fn __model_for_test(
-        &self,
-    ) -> &rustllama_models::llama_arch::LlamaModel {
+    pub fn __model_for_test(&self) -> &rustllama_models::llama_arch::LlamaModel {
         &self.model
     }
 
@@ -3614,7 +3638,9 @@ impl CpuEngine {
             // wire image_token_id surfaces here cleanly.
             CpuEngineError::Other("image_token_id missing despite vision loaded".into())
         })?;
-        let placeholder_mode = self.placeholder_mode.unwrap_or(PlaceholderMode::OnePerImage);
+        let placeholder_mode = self
+            .placeholder_mode
+            .unwrap_or(PlaceholderMode::OnePerImage);
 
         // The `prepare_vlm_inputs` helper wants `u32` ids (token-vocab
         // domain), while the text-decoder forward path uses `i32` (so
@@ -3637,13 +3663,9 @@ impl CpuEngine {
         let d_model = self.model.cfg.d_model;
         debug_assert_eq!(vlm_inputs.d_text, d_model);
         let feat_slices = vlm_inputs.feature_slices();
-        let spliced = splice_image_embeddings(
-            &text_embeds,
-            &vlm_inputs.positions,
-            &feat_slices,
-            d_model,
-        )
-        .map_err(|e| CpuEngineError::Other(format!("vlm splice: {e}")))?;
+        let spliced =
+            splice_image_embeddings(&text_embeds, &vlm_inputs.positions, &feat_slices, d_model)
+                .map_err(|e| CpuEngineError::Other(format!("vlm splice: {e}")))?;
         // Final transformer prefill over the spliced embedding sequence.
         Ok(self
             .model
@@ -3891,10 +3913,7 @@ impl CpuEngine {
     /// grammar-free, non-SWA-ring decode on a supported model through
     /// [`Self::speculate_eagle_stream`]; `None` restores the pre-EAGLE path
     /// byte-identically. Forks inherit the head.
-    pub fn set_eagle_head(
-        &mut self,
-        head: Option<Arc<rustllama_models::llama_arch::EagleHead>>,
-    ) {
+    pub fn set_eagle_head(&mut self, head: Option<Arc<rustllama_models::llama_arch::EagleHead>>) {
         self.eagle_head = head;
     }
 
@@ -3961,10 +3980,7 @@ impl CpuEngine {
     /// draft model's acceptance rate beats prompt-lookup on free
     /// prose). The caller is responsible for tokenizer compatibility
     /// — use [`Self::draft_compatible_with`] before attaching.
-    pub fn set_draft_speculative(
-        &mut self,
-        draft: Option<(std::sync::Arc<dyn Engine>, u32)>,
-    ) {
+    pub fn set_draft_speculative(&mut self, draft: Option<(std::sync::Arc<dyn Engine>, u32)>) {
         self.draft_spec = draft;
     }
 
@@ -4439,13 +4455,14 @@ impl CpuEngine {
             }
         }
         // Load the measured per-device perf from the tuner cache.
-        let per_device_perf: std::collections::HashMap<String, f32> = rustllama_tuner::default_cache_dir()
-            .and_then(|dir| {
-                let key = rustllama_tuner::system_fingerprint();
-                rustllama_tuner::load_cache(&dir, &key).ok().flatten()
-            })
-            .map(|t| t.per_device_perf)
-            .unwrap_or_default();
+        let per_device_perf: std::collections::HashMap<String, f32> =
+            rustllama_tuner::default_cache_dir()
+                .and_then(|dir| {
+                    let key = rustllama_tuner::system_fingerprint();
+                    rustllama_tuner::load_cache(&dir, &key).ok().flatten()
+                })
+                .map(|t| t.per_device_perf)
+                .unwrap_or_default();
 
         match crate::multi_gpu::plan_heat_placement(
             &self.model.weights,
@@ -4632,7 +4649,12 @@ impl CpuEngine {
         // Pre-decoding 150k tokens takes ~30 ms on a modern CPU. We do
         // it once per request, not per token, so the amortized cost is
         // negligible compared to the forward pass.
-        let decode = |id: u32| tokenizer.decode_single(id, true).unwrap_or_default().into_bytes();
+        let decode = |id: u32| {
+            tokenizer
+                .decode_single(id, true)
+                .unwrap_or_default()
+                .into_bytes()
+        };
         match kind {
             GrammarKind::Json => Some(GrammarMask::new_json(vocab, eos, decode)),
             GrammarKind::JsonSchema { schema } => Some(GrammarMask::new_json_schema(
@@ -4641,16 +4663,17 @@ impl CpuEngine {
                 eos,
                 decode,
             )),
-            GrammarKind::ToolCallStream { schemas_by_name, min_completed } => {
-                Some(GrammarMask::new_tool_call_stream(
-                    schemas_by_name.clone(),
-                    self.max_tool_iterations,
-                    *min_completed,
-                    vocab,
-                    eos,
-                    decode,
-                ))
-            }
+            GrammarKind::ToolCallStream {
+                schemas_by_name,
+                min_completed,
+            } => Some(GrammarMask::new_tool_call_stream(
+                schemas_by_name.clone(),
+                self.max_tool_iterations,
+                *min_completed,
+                vocab,
+                eos,
+                decode,
+            )),
             GrammarKind::Code { language } => {
                 // `language` drives the parser's comment-recognition
                 // style. C-family ("rust", "javascript", "go", …) →
@@ -4658,7 +4681,9 @@ impl CpuEngine {
                 // "bash", …) → `#`. Unknown → no comment recognition
                 // (v1.0 behavior). Bracket-balance + string-aware
                 // tracking is universal across languages.
-                Some(GrammarMask::new_code_for_language(language, vocab, eos, decode))
+                Some(GrammarMask::new_code_for_language(
+                    language, vocab, eos, decode,
+                ))
             }
             GrammarKind::Regex { pattern } => {
                 // Anchored byte-DFA. A malformed pattern reaches here
@@ -4861,7 +4886,9 @@ impl CpuEngine {
             let t_fwd = std::time::Instant::now();
             {
                 let EngineState {
-                    kv_backend, delta_net_cache, ..
+                    kv_backend,
+                    delta_net_cache,
+                    ..
                 } = &mut *state;
                 forward_one_via_backend_hybrid(
                     &self.model,
@@ -4896,8 +4923,12 @@ impl CpuEngine {
             if (next_pos as usize) >= self.max_ctx {
                 // P1: try a context shift (generate past ctx_size) before
                 // giving up. `false` ⇒ disabled/inapplicable ⇒ stop as before.
-                if !try_context_shift(&self.model, &mut state.kv_backend, self.max_ctx, &mut next_pos)
-                {
+                if !try_context_shift(
+                    &self.model,
+                    &mut state.kv_backend,
+                    self.max_ctx,
+                    &mut next_pos,
+                ) {
                     break;
                 }
             }
@@ -5336,7 +5367,9 @@ impl CpuEngine {
             let t_fwd = std::time::Instant::now();
             {
                 let EngineState {
-                    kv_backend, delta_net_cache, ..
+                    kv_backend,
+                    delta_net_cache,
+                    ..
                 } = &mut *state;
                 forward_one_via_backend_hybrid(
                     &self.model,
@@ -5449,7 +5482,9 @@ impl CpuEngine {
             let t_fwd = std::time::Instant::now();
             {
                 let EngineState {
-                    kv_backend, delta_net_cache, ..
+                    kv_backend,
+                    delta_net_cache,
+                    ..
                 } = &mut *state;
                 forward_one_via_backend_hybrid(
                     &self.model,
@@ -5679,8 +5714,7 @@ impl CpuEngine {
         add_bos_on_first: bool,
         tx: tokio::sync::mpsc::Sender<std::result::Result<crate::Token, String>>,
     ) -> Result<()> {
-        let (chunk_tx, mut chunk_rx) =
-            tokio::sync::mpsc::channel::<Vec<i32>>(1);
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Vec<i32>>(1);
         let producer = {
             let engine = self.clone();
             let tx_closed = tx.clone();
@@ -5824,7 +5858,9 @@ impl CpuEngine {
             let t_fwd = std::time::Instant::now();
             {
                 let EngineState {
-                    kv_backend, delta_net_cache, ..
+                    kv_backend,
+                    delta_net_cache,
+                    ..
                 } = &mut *state;
                 forward_one_via_backend_hybrid(
                     &self.model,
@@ -5979,7 +6015,12 @@ fn cacheblend_cache_for_model(
     model_id: &str,
 ) -> Arc<Mutex<rustllama_models::cacheblend::ChunkKvCache>> {
     static REG: std::sync::OnceLock<
-        Mutex<std::collections::HashMap<String, Arc<Mutex<rustllama_models::cacheblend::ChunkKvCache>>>>,
+        Mutex<
+            std::collections::HashMap<
+                String,
+                Arc<Mutex<rustllama_models::cacheblend::ChunkKvCache>>,
+            >,
+        >,
     > = std::sync::OnceLock::new();
     let reg = REG.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     // ≤ 1/16 of free RAM, capped at 4 GiB. Demand-filled + LRU, so this only
@@ -5989,7 +6030,9 @@ fn cacheblend_cache_for_model(
     let mut map = reg.lock().expect("cacheblend registry");
     map.entry(model_id.to_string())
         .or_insert_with(|| {
-            Arc::new(Mutex::new(rustllama_models::cacheblend::ChunkKvCache::new(cap_bytes)))
+            Arc::new(Mutex::new(rustllama_models::cacheblend::ChunkKvCache::new(
+                cap_bytes,
+            )))
         })
         .clone()
 }
@@ -6110,7 +6153,9 @@ fn run_chunked_prefill(
             let t_chunk = std::time::Instant::now();
             {
                 let EngineState {
-                    kv_backend, delta_net_cache, ..
+                    kv_backend,
+                    delta_net_cache,
+                    ..
                 } = &mut *state;
                 let KvBackend::Contiguous(kv) = kv_backend else {
                     unreachable!("hybrid batched prefill gate verified a contiguous backend");
@@ -6142,7 +6187,9 @@ fn run_chunked_prefill(
             let t_tok = std::time::Instant::now();
             {
                 let EngineState {
-                    kv_backend, delta_net_cache, ..
+                    kv_backend,
+                    delta_net_cache,
+                    ..
                 } = &mut *state;
                 forward_one_via_backend_hybrid(
                     model,
@@ -6290,7 +6337,9 @@ fn spec_prefill_and_forward(
     // hybrid-prefill body with an all-positions LM head.
     if model.weights.is_hybrid() {
         let EngineState {
-            kv_backend, delta_net_cache, ..
+            kv_backend,
+            delta_net_cache,
+            ..
         } = state;
         match (kv_backend, delta_net_cache.as_mut()) {
             (crate::kv_backend::KvBackend::Contiguous(kv), Some(dn)) => {
@@ -6304,7 +6353,11 @@ fn spec_prefill_and_forward(
                 );
                 for i in 0..n_pos {
                     let row = &all_logits[i * vocab..(i + 1) * vocab];
-                    dists.push(if raw { row.to_vec() } else { softmax_to_vec(row) });
+                    dists.push(if raw {
+                        row.to_vec()
+                    } else {
+                        softmax_to_vec(row)
+                    });
                 }
             }
             _ => {
@@ -6355,42 +6408,72 @@ fn spec_prefill_and_forward(
         if let crate::kv_backend::KvBackend::Contiguous(ref mut kv) = state.kv_backend {
             match spec {
                 BatchedSpec::F32 => model.forward_speculation_batched_f32(
-                    &inputs, prefill.len() as u32, kv, &mut all_logits,
+                    &inputs,
+                    prefill.len() as u32,
+                    kv,
+                    &mut all_logits,
                 ),
                 BatchedSpec::Q8_0 => model.forward_speculation_batched_q8_0(
-                    &inputs, prefill.len() as u32, kv, &mut all_logits,
+                    &inputs,
+                    prefill.len() as u32,
+                    kv,
+                    &mut all_logits,
                 ),
                 BatchedSpec::Tq => model.forward_speculation_batched_tq(
-                    &inputs, prefill.len() as u32, kv, &mut all_logits,
+                    &inputs,
+                    prefill.len() as u32,
+                    kv,
+                    &mut all_logits,
                 ),
                 BatchedSpec::Nvfp4 => model.forward_speculation_batched_nvfp4(
-                    &inputs, prefill.len() as u32, kv, &mut all_logits,
+                    &inputs,
+                    prefill.len() as u32,
+                    kv,
+                    &mut all_logits,
                 ),
                 BatchedSpec::Q4_0 => model.forward_speculation_batched_q4_0(
-                    &inputs, prefill.len() as u32, kv, &mut all_logits,
+                    &inputs,
+                    prefill.len() as u32,
+                    kv,
+                    &mut all_logits,
                 ),
                 BatchedSpec::Mxfp4 => model.forward_speculation_batched_mxfp4(
-                    &inputs, prefill.len() as u32, kv, &mut all_logits,
+                    &inputs,
+                    prefill.len() as u32,
+                    kv,
+                    &mut all_logits,
                 ),
                 BatchedSpec::Mxfp6 => model.forward_speculation_batched_mxfp6(
-                    &inputs, prefill.len() as u32, kv, &mut all_logits,
+                    &inputs,
+                    prefill.len() as u32,
+                    kv,
+                    &mut all_logits,
                 ),
                 BatchedSpec::Mxfp8 => model.forward_speculation_batched_mxfp8(
-                    &inputs, prefill.len() as u32, kv, &mut all_logits,
+                    &inputs,
+                    prefill.len() as u32,
+                    kv,
+                    &mut all_logits,
                 ),
             }
         }
         for i in 0..n_pos {
             let row = &all_logits[i * vocab..(i + 1) * vocab];
-            dists.push(if raw { row.to_vec() } else { softmax_to_vec(row) });
+            dists.push(if raw {
+                row.to_vec()
+            } else {
+                softmax_to_vec(row)
+            });
         }
     } else {
         for (i, &input) in inputs.iter().enumerate() {
             let pos = prefill.len() as u32 + i as u32;
-            forward_one_via_backend(
-                model, &mut state.kv_backend, input, pos, &mut logits,
-            );
-            dists.push(if raw { logits.clone() } else { softmax_to_vec(&logits) });
+            forward_one_via_backend(model, &mut state.kv_backend, input, pos, &mut logits);
+            dists.push(if raw {
+                logits.clone()
+            } else {
+                softmax_to_vec(&logits)
+            });
         }
     }
     chrome.flush();
@@ -6631,8 +6714,7 @@ fn verify_and_commit_speculation(
     // decode with `repeat_penalty != 1.0` would diverge from classic
     // greedy. Default penalties ⇒ this is a no-op, so we keep the original
     // softmax path with zero behavior change (the common case).
-    let penalize =
-        repeat_penalty != 1.0 || frequency_penalty != 0.0 || presence_penalty != 0.0;
+    let penalize = repeat_penalty != 1.0 || frequency_penalty != 0.0 || presence_penalty != 0.0;
     let (dists, dn_base) = spec_prefill_and_forward(
         &model,
         &mut state,
@@ -6703,7 +6785,9 @@ fn verify_and_commit_speculation(
         let mut replay_logits = vec![0f32; replay.len() * vocab];
         {
             let EngineState {
-                kv_backend, delta_net_cache, ..
+                kv_backend,
+                delta_net_cache,
+                ..
             } = &mut *state;
             match (kv_backend, delta_net_cache.as_mut()) {
                 (crate::kv_backend::KvBackend::Contiguous(kv), Some(dn)) => {
@@ -6831,8 +6915,8 @@ fn mtp_round(
     // dispatch layer already gated on hybrid + NextN head; this guards a
     // paged-KV misconfiguration with a clean error instead of a panic
     // deep in the forward.
-    let contiguous_ok = matches!(state.kv_backend, KvBackend::Contiguous(_))
-        && state.delta_net_cache.is_some();
+    let contiguous_ok =
+        matches!(state.kv_backend, KvBackend::Contiguous(_)) && state.delta_net_cache.is_some();
     if !contiguous_ok {
         return Err(CpuEngineError::Other(
             "MTP self-speculation requires the contiguous KV backend and a \
@@ -6878,13 +6962,21 @@ fn mtp_round(
             let mut recent = state.last_ids.clone();
             recent.push(next_input as u32);
             crate::sampling::apply_all_penalties(
-                &mut two[0..vocab], &recent, repeat, frequency, presence,
+                &mut two[0..vocab],
+                &recent,
+                repeat,
+                frequency,
+                presence,
             );
             // row1 (bonus) predicts the token at base_pos+2: extend the
             // context by the forwarded draft.
             recent.push(draft.id);
             crate::sampling::apply_all_penalties(
-                &mut two[vocab..2 * vocab], &recent, repeat, frequency, presence,
+                &mut two[vocab..2 * vocab],
+                &recent,
+                repeat,
+                frequency,
+                presence,
             );
         }
         let row0 = softmax_to_vec(&two[0..vocab]);
@@ -6923,9 +7015,7 @@ fn mtp_round(
             // [next_input] so KV + DeltaNet both cover `[0, base_pos+1)`.
             // Mirrors `verify_and_commit_speculation`'s hybrid reject.
             state.kv_backend.set_seq_len(base_pos as usize);
-            if let (Some(dn), Some(snap)) =
-                (state.delta_net_cache.as_mut(), dn_base.as_ref())
-            {
+            if let (Some(dn), Some(snap)) = (state.delta_net_cache.as_mut(), dn_base.as_ref()) {
                 dn.restore(snap);
             }
             let mut one = vec![0f32; vocab];
@@ -7008,7 +7098,11 @@ fn mtp_round(
             let mut recent = state.last_ids.clone();
             recent.push(next_input as u32);
             crate::sampling::apply_all_penalties(
-                main_logits.as_mut_slice(), &recent, repeat, frequency, presence,
+                main_logits.as_mut_slice(),
+                &recent,
+                repeat,
+                frequency,
+                presence,
             );
         }
         let row0 = softmax_to_vec(&main_logits);
@@ -7115,7 +7209,9 @@ fn dense_tree_verify_commit(
         .collect();
     let mut tree_logits = vec![0f32; nodes.len() * vocab];
     {
-        let KvBackend::Contiguous(kv) = &mut state.kv_backend else { unreachable!() };
+        let KvBackend::Contiguous(kv) = &mut state.kv_backend else {
+            unreachable!()
+        };
         model.forward_tree_verify_f32(
             &node_tokens,
             base_pos as u32 + 1,
@@ -7141,7 +7237,9 @@ fn dense_tree_verify_commit(
     // --- Commit: compact the accepted path's scattered K/V into contiguous
     //     slots, then truncate. One verify forward paid for `a` tokens. ---
     {
-        let KvBackend::Contiguous(kv) = &mut state.kv_backend else { unreachable!() };
+        let KvBackend::Contiguous(kv) = &mut state.kv_backend else {
+            unreachable!()
+        };
         kv.compact_tokens(base_pos + 1, &outcome.accepted_nodes);
     }
     state.kv_backend.set_seq_len(base_pos + 1 + a);
@@ -7189,12 +7287,25 @@ fn tree_mtp_round(
 
     // --- Tip forward: main (target_root) + per-MTP-head drafts. Writes the tip
     //     token's K/V at `base_pos`; kv.seq_len = base_pos + 1. ---
-    let n_mtp = model.weights.mtp_heads.as_ref().map(|h| h.len()).unwrap_or(0);
+    let n_mtp = model
+        .weights
+        .mtp_heads
+        .as_ref()
+        .map(|h| h.len())
+        .unwrap_or(0);
     let mut main_logits = vec![0f32; vocab];
     let mut head_logits: Vec<Vec<f32>> = vec![vec![0f32; vocab]; n_mtp];
     {
-        let KvBackend::Contiguous(kv) = &mut state.kv_backend else { unreachable!() };
-        model.forward_one_with_mtp_logits(next_input, next_pos, kv, &mut main_logits, &mut head_logits);
+        let KvBackend::Contiguous(kv) = &mut state.kv_backend else {
+            unreachable!()
+        };
+        model.forward_one_with_mtp_logits(
+            next_input,
+            next_pos,
+            kv,
+            &mut main_logits,
+            &mut head_logits,
+        );
     }
     debug_assert_eq!(state.kv_backend.seq_len(), base_pos + 1);
 
@@ -7214,7 +7325,13 @@ fn tree_mtp_round(
         Vec::new()
     };
     if penalize {
-        crate::sampling::apply_all_penalties(&mut main_logits, &recent, repeat, frequency, presence);
+        crate::sampling::apply_all_penalties(
+            &mut main_logits,
+            &recent,
+            repeat,
+            frequency,
+            presence,
+        );
     }
     let main_dist = softmax_to_vec(&main_logits);
 
@@ -7223,9 +7340,25 @@ fn tree_mtp_round(
     //     penalties steer the drafted branches to match the sampler (neutral ⇒
     //     unchanged tree). ---
     let widths_usz: Vec<usize> = widths.iter().map(|&w| (w as usize).max(1)).collect();
-    let nodes = build_mtp_tree(&head_logits, &widths_usz, &recent, repeat, frequency, presence);
+    let nodes = build_mtp_tree(
+        &head_logits,
+        &widths_usz,
+        &recent,
+        repeat,
+        frequency,
+        presence,
+    );
     Ok(dense_tree_verify_commit(
-        model, &mut *state, next_input, base_pos, &main_dist, &nodes, max_ctx, greedy, rng, vocab,
+        model,
+        &mut *state,
+        next_input,
+        base_pos,
+        &main_dist,
+        &nodes,
+        max_ctx,
+        greedy,
+        rng,
+        vocab,
     ))
 }
 
@@ -7278,7 +7411,9 @@ fn tree_eagle_round(
     let mut main_logits = vec![0f32; vocab];
     let mut base_hidden: Vec<f32> = Vec::new();
     {
-        let KvBackend::Contiguous(kv) = &mut state.kv_backend else { unreachable!() };
+        let KvBackend::Contiguous(kv) = &mut state.kv_backend else {
+            unreachable!()
+        };
         model.forward_one_with_hidden(next_input, next_pos, kv, &mut main_logits, &mut base_hidden);
     }
     debug_assert_eq!(state.kv_backend.seq_len(), base_pos + 1);
@@ -7294,7 +7429,13 @@ fn tree_eagle_round(
         Vec::new()
     };
     if penalize {
-        crate::sampling::apply_all_penalties(&mut main_logits, &recent, repeat, frequency, presence);
+        crate::sampling::apply_all_penalties(
+            &mut main_logits,
+            &recent,
+            repeat,
+            frequency,
+            presence,
+        );
     }
     let main_dist = softmax_to_vec(&main_logits);
 
@@ -7303,9 +7444,25 @@ fn tree_eagle_round(
     //     MTP sidecar logits. Then shape the tree exactly like the MTP round. ---
     let widths_usz: Vec<usize> = widths.iter().map(|&w| (w as usize).max(1)).collect();
     let head_logits = model.forward_eagle_head(eagle, &base_hidden, next_input, widths_usz.len());
-    let nodes = build_mtp_tree(&head_logits, &widths_usz, &recent, repeat, frequency, presence);
+    let nodes = build_mtp_tree(
+        &head_logits,
+        &widths_usz,
+        &recent,
+        repeat,
+        frequency,
+        presence,
+    );
     Ok(dense_tree_verify_commit(
-        model, &mut *state, next_input, base_pos, &main_dist, &nodes, max_ctx, greedy, rng, vocab,
+        model,
+        &mut *state,
+        next_input,
+        base_pos,
+        &main_dist,
+        &nodes,
+        max_ctx,
+        greedy,
+        rng,
+        vocab,
     ))
 }
 
@@ -7371,8 +7528,8 @@ fn tree_mtp_round_hybrid(
     // Tree verify + the DeltaNet replay both require the contiguous F32 KV
     // backend AND a DeltaNet cache. The dispatch already gated on hybrid + a
     // draft head; this guards a paged-KV misconfiguration with a clean error.
-    let contiguous_ok = matches!(state.kv_backend, KvBackend::Contiguous(_))
-        && state.delta_net_cache.is_some();
+    let contiguous_ok =
+        matches!(state.kv_backend, KvBackend::Contiguous(_)) && state.delta_net_cache.is_some();
     if !contiguous_ok {
         return Err(CpuEngineError::Other(
             "hybrid tree speculation requires the contiguous KV backend and a \
@@ -7386,12 +7543,18 @@ fn tree_mtp_round_hybrid(
     let mut main_logits = vec![0f32; vocab];
     let head_logits: Vec<Vec<f32>> = {
         let EngineState {
-            kv_backend, delta_net_cache, ..
+            kv_backend,
+            delta_net_cache,
+            ..
         } = &mut *state;
         match (kv_backend, delta_net_cache.as_mut()) {
-            (KvBackend::Contiguous(kv), Some(dn)) => {
-                model.forward_one_hybrid_with_draft_heads(next_input, next_pos, kv, dn, &mut main_logits)
-            }
+            (KvBackend::Contiguous(kv), Some(dn)) => model.forward_one_hybrid_with_draft_heads(
+                next_input,
+                next_pos,
+                kv,
+                dn,
+                &mut main_logits,
+            ),
             _ => unreachable!("contiguous_ok checked above"),
         }
     };
@@ -7410,7 +7573,13 @@ fn tree_mtp_round_hybrid(
         Vec::new()
     };
     if penalize {
-        crate::sampling::apply_all_penalties(&mut main_logits, &recent, repeat, frequency, presence);
+        crate::sampling::apply_all_penalties(
+            &mut main_logits,
+            &recent,
+            repeat,
+            frequency,
+            presence,
+        );
     }
     let main_dist = softmax_to_vec(&main_logits);
 
@@ -7420,7 +7589,14 @@ fn tree_mtp_round_hybrid(
     //     touched is `base_pos + 1 + max_depth`. Per-node penalties steer the
     //     drafted branches to match the sampler (neutral ⇒ unchanged tree). ---
     let widths_usz: Vec<usize> = widths.iter().map(|&w| (w as usize).max(1)).collect();
-    let nodes = build_mtp_tree(&head_logits, &widths_usz, &recent, repeat, frequency, presence);
+    let nodes = build_mtp_tree(
+        &head_logits,
+        &widths_usz,
+        &recent,
+        repeat,
+        frequency,
+        presence,
+    );
     let depths = tree_depths(&nodes);
     let max_depth = depths.iter().copied().max().unwrap_or(0) as usize;
     let fits = !nodes.is_empty() && base_pos + 1 + max_depth + 1 <= max_ctx;
@@ -7463,7 +7639,9 @@ fn tree_mtp_round_hybrid(
     let mut tree_logits = vec![0f32; nodes.len() * vocab];
     {
         let EngineState {
-            kv_backend, delta_net_cache, ..
+            kv_backend,
+            delta_net_cache,
+            ..
         } = &mut *state;
         match (kv_backend, delta_net_cache.as_mut()) {
             (KvBackend::Contiguous(kv), Some(dn)) => {
@@ -7506,7 +7684,9 @@ fn tree_mtp_round_hybrid(
         let replay: Vec<i32> = outcome.accepted.iter().map(|&c| c as i32).collect();
         let mut replay_logits = vec![0f32; replay.len() * vocab];
         let EngineState {
-            kv_backend, delta_net_cache, ..
+            kv_backend,
+            delta_net_cache,
+            ..
         } = &mut *state;
         match (kv_backend, delta_net_cache.as_mut()) {
             (KvBackend::Contiguous(kv), Some(dn)) => {
@@ -7551,27 +7731,31 @@ impl Engine for CpuEngine {
         // minutes at a time. On contention we serve the last
         // published numbers instead — bounded staleness is exactly
         // right for a status poll.
-        let (context_used, paged_total_pages, paged_free_pages) =
-            match self.state.try_lock() {
-                Ok(s) => {
-                    let seq_len = s.kv_backend.seq_len() as u32;
-                    let (total, free) = s.kv_backend.paged_pool_stats().unwrap_or((0, 0));
-                    self.metrics_cache.seq_len.store(seq_len, Ordering::Relaxed);
-                    self.metrics_cache.paged_total.store(total, Ordering::Relaxed);
-                    self.metrics_cache.paged_free.store(free, Ordering::Relaxed);
-                    (seq_len, total, free)
-                }
-                Err(_) => (
-                    self.metrics_cache.seq_len.load(Ordering::Relaxed),
-                    self.metrics_cache.paged_total.load(Ordering::Relaxed),
-                    self.metrics_cache.paged_free.load(Ordering::Relaxed),
-                ),
-            };
+        let (context_used, paged_total_pages, paged_free_pages) = match self.state.try_lock() {
+            Ok(s) => {
+                let seq_len = s.kv_backend.seq_len() as u32;
+                let (total, free) = s.kv_backend.paged_pool_stats().unwrap_or((0, 0));
+                self.metrics_cache.seq_len.store(seq_len, Ordering::Relaxed);
+                self.metrics_cache
+                    .paged_total
+                    .store(total, Ordering::Relaxed);
+                self.metrics_cache.paged_free.store(free, Ordering::Relaxed);
+                (seq_len, total, free)
+            }
+            Err(_) => (
+                self.metrics_cache.seq_len.load(Ordering::Relaxed),
+                self.metrics_cache.paged_total.load(Ordering::Relaxed),
+                self.metrics_cache.paged_free.load(Ordering::Relaxed),
+            ),
+        };
         // CpuEngine is single-flight at the engine layer (concurrency
         // comes from forks). One "slot" is active iff the KV is
         // non-empty.
-        let paged_active_slots =
-            if context_used > 0 && paged_total_pages > 0 { 1 } else { 0 };
+        let paged_active_slots = if context_used > 0 && paged_total_pages > 0 {
+            1
+        } else {
+            0
+        };
         Metrics {
             tokens_per_second: 0.0,
             context_used,
@@ -7646,26 +7830,25 @@ impl Engine for CpuEngine {
         // (client-side injection) is left untouched.
         let injected: Vec<String>;
         let prompt = {
-            let contents: Vec<&str> = if let (true, Some(wrapper)) =
-                (has_images, self.image_wrapper.as_deref())
-            {
-                injected = msgs
-                    .iter()
-                    .map(|m| {
-                        if m.images.is_empty() || m.content.contains(wrapper) {
-                            m.content.clone()
-                        } else {
-                            let mut c = wrapper.repeat(m.images.len());
-                            c.push('\n');
-                            c.push_str(&m.content);
-                            c
-                        }
-                    })
-                    .collect();
-                injected.iter().map(|s| s.as_str()).collect()
-            } else {
-                msgs.iter().map(|m| m.content.as_str()).collect()
-            };
+            let contents: Vec<&str> =
+                if let (true, Some(wrapper)) = (has_images, self.image_wrapper.as_deref()) {
+                    injected = msgs
+                        .iter()
+                        .map(|m| {
+                            if m.images.is_empty() || m.content.contains(wrapper) {
+                                m.content.clone()
+                            } else {
+                                let mut c = wrapper.repeat(m.images.len());
+                                c.push('\n');
+                                c.push_str(&m.content);
+                                c
+                            }
+                        })
+                        .collect();
+                    injected.iter().map(|s| s.as_str()).collect()
+                } else {
+                    msgs.iter().map(|m| m.content.as_str()).collect()
+                };
             let tok_msgs: Vec<TokChat<'_>> = msgs
                 .iter()
                 .zip(contents.iter())
@@ -7682,8 +7865,7 @@ impl Engine for CpuEngine {
             // engine's image_token_id is what
             // `tokenizer.render_chat` will have produced for the
             // placeholder positions in the prompt.
-            let images: Vec<Vec<u8>> =
-                msgs.iter().flat_map(|m| m.images.iter().cloned()).collect();
+            let images: Vec<Vec<u8>> = msgs.iter().flat_map(|m| m.images.iter().cloned()).collect();
             return self.chat_vlm_stream(prompt, images, s.clone());
         }
         // N-gram speculative decoding, when enabled for this engine.
@@ -9377,7 +9559,9 @@ fn drive_generation(
                 // plain wrapper ("no DeltaNetCache passed") — this was
                 // the GUI chat path's crash on qwen35moe models.
                 let EngineState {
-                    kv_backend, delta_net_cache, ..
+                    kv_backend,
+                    delta_net_cache,
+                    ..
                 } = &mut *state;
                 forward_one_via_backend_hybrid(
                     model.as_ref(),
@@ -9463,28 +9647,31 @@ fn drive_generation(
 
     let mut sampler = Sampler::new(sampling.clone());
     let vocab_size = model.cfg.vocab_size;
-    let decode_one =
-        |id: u32| tokenizer.decode_single(id, true).unwrap_or_default().into_bytes();
+    let decode_one = |id: u32| {
+        tokenizer
+            .decode_single(id, true)
+            .unwrap_or_default()
+            .into_bytes()
+    };
     let mut grammar: Option<GrammarMask> = match sampling.grammar.as_ref() {
-        Some(GrammarKind::Json) => {
-            Some(GrammarMask::new_json(vocab_size, model_eos, decode_one))
-        }
+        Some(GrammarKind::Json) => Some(GrammarMask::new_json(vocab_size, model_eos, decode_one)),
         Some(GrammarKind::JsonSchema { schema }) => Some(GrammarMask::new_json_schema(
             schema.clone(),
             vocab_size,
             model_eos,
             decode_one,
         )),
-        Some(GrammarKind::ToolCallStream { schemas_by_name, min_completed }) => {
-            Some(GrammarMask::new_tool_call_stream(
-                schemas_by_name.clone(),
-                max_tool_iterations,
-                *min_completed,
-                vocab_size,
-                model_eos,
-                decode_one,
-            ))
-        }
+        Some(GrammarKind::ToolCallStream {
+            schemas_by_name,
+            min_completed,
+        }) => Some(GrammarMask::new_tool_call_stream(
+            schemas_by_name.clone(),
+            max_tool_iterations,
+            *min_completed,
+            vocab_size,
+            model_eos,
+            decode_one,
+        )),
         Some(GrammarKind::Code { language: _ }) => {
             Some(GrammarMask::new_code(vocab_size, model_eos, decode_one))
         }
@@ -9578,7 +9765,9 @@ fn drive_generation(
         {
             // Hybrid-aware dispatch — see the prefill loop above.
             let EngineState {
-                kv_backend, delta_net_cache, ..
+                kv_backend,
+                delta_net_cache,
+                ..
             } = &mut *state;
             forward_one_via_backend_hybrid(
                 model.as_ref(),
@@ -9728,10 +9917,7 @@ fn drive_generation(
 
 /// Length of the longest common prefix of two slices.
 fn compute_lcp(a: &[u32], b: &[u32]) -> usize {
-    a.iter()
-        .zip(b.iter())
-        .take_while(|(x, y)| x == y)
-        .count()
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
 /// Dispatch a single-token forward through whichever KV backend the
@@ -9797,14 +9983,11 @@ fn drive_vlm_generation(
     // vision is loaded, which atomically sets image_token_id and
     // placeholder_mode. Defense in depth: if any is None, surface
     // a clear error.
-    let vision = vision.ok_or_else(|| {
-        crate::EngineError::Engine("vlm chat: vision tower not loaded".into())
-    })?;
-    let image_token_id = image_token_id.ok_or_else(|| {
-        crate::EngineError::Engine("vlm chat: image_token_id not set".into())
-    })?;
-    let placeholder_mode =
-        placeholder_mode.unwrap_or(PlaceholderMode::OnePerImage);
+    let vision = vision
+        .ok_or_else(|| crate::EngineError::Engine("vlm chat: vision tower not loaded".into()))?;
+    let image_token_id = image_token_id
+        .ok_or_else(|| crate::EngineError::Engine("vlm chat: image_token_id not set".into()))?;
+    let placeholder_mode = placeholder_mode.unwrap_or(PlaceholderMode::OnePerImage);
 
     rustllama_models::accel::set_flash_attention(true);
 
@@ -9826,8 +10009,7 @@ fn drive_vlm_generation(
     // P-1: image_hash discriminates VLM cache entries from text-only
     // entries and from each other across distinct images.
     let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
-    let image_hash =
-        Some(crate::prefix_cache::fnv1a64_bytes_chained(&image_refs));
+    let image_hash = Some(crate::prefix_cache::fnv1a64_bytes_chained(&image_refs));
 
     let mut state_guard = state.lock().expect("state lock");
     // Destructure the lock guard into separate field references so
@@ -9881,262 +10063,245 @@ fn drive_vlm_generation(
         }
     };
 
-    let (mut logits, next_pos, prefix_token_count, prefix_kv_len) =
-        if let Some(idx) = cache_hit {
-            // Cache hit — restore KV state from the snapshot and
-            // re-prefill only the suffix tokens.
-            let snap = pool.touch(idx).clone();
-            kv.restore_prefix(&snap.kv);
-            let prefix_token_count = snap.ids.len();
-            let prefix_kv_len = snap.kv_len;
-            tracing::debug!(
-                cached_tokens = prefix_token_count,
-                cached_kv_positions = prefix_kv_len,
-                suffix_tokens = prompt_ids.len() - prefix_token_count,
-                "vlm prefix cache hit — re-prefilling suffix only"
-            );
+    let (mut logits, next_pos, prefix_token_count, prefix_kv_len) = if let Some(idx) = cache_hit {
+        // Cache hit — restore KV state from the snapshot and
+        // re-prefill only the suffix tokens.
+        let snap = pool.touch(idx).clone();
+        kv.restore_prefix(&snap.kv);
+        let prefix_token_count = snap.ids.len();
+        let prefix_kv_len = snap.kv_len;
+        tracing::debug!(
+            cached_tokens = prefix_token_count,
+            cached_kv_positions = prefix_kv_len,
+            suffix_tokens = prompt_ids.len() - prefix_token_count,
+            "vlm prefix cache hit — re-prefilling suffix only"
+        );
 
-            // Suffix = the new tokens this request adds beyond the
-            // cached prefix. Guaranteed image-free (full-prefix
-            // match means the placeholder is already covered).
-            let suffix = &prompt_ids[prefix_token_count..];
-            if suffix.is_empty() {
-                // No new tokens — generate from the cached state.
-                // The cached snapshot doesn't carry the post-prefix
-                // logits, so we run one forward_one at the boundary
-                // to recover them. The "boundary" token is the last
-                // cached id; we forward it again at position
-                // prefix_kv_len - 1 to read the logits. But the KV
-                // for that position is already populated, so do a
-                // dummy single-token re-run is unnecessary — instead
-                // just synthesize an empty stream. Real-world hit
-                // requires at least one new user token after the
-                // assistant reply, so suffix should be non-empty in
-                // practice.
-                let logits = vec![0.0f32; model.cfg.vocab_size];
-                (logits, prefix_kv_len as u32, prefix_token_count, prefix_kv_len)
-            } else {
-                // (hybrid never reaches here — vlm_prefix_cache_ok
-                // gated the lookup — so the dense from-embeds forward
-                // is always the right one. Primal rows == raw rows on
-                // non-Hadamard dense models.)
-                let suffix_embeds = model.embed_tokens_primal(suffix);
-                let logits = model.forward_prefill_from_embeds(
-                    &suffix_embeds,
-                    prefix_kv_len as u32,
-                    kv,
-                );
-                let next_pos = (prefix_kv_len + suffix.len()) as u32;
-                (logits, next_pos, prefix_token_count, prefix_kv_len + suffix.len())
-            }
+        // Suffix = the new tokens this request adds beyond the
+        // cached prefix. Guaranteed image-free (full-prefix
+        // match means the placeholder is already covered).
+        let suffix = &prompt_ids[prefix_token_count..];
+        if suffix.is_empty() {
+            // No new tokens — generate from the cached state.
+            // The cached snapshot doesn't carry the post-prefix
+            // logits, so we run one forward_one at the boundary
+            // to recover them. The "boundary" token is the last
+            // cached id; we forward it again at position
+            // prefix_kv_len - 1 to read the logits. But the KV
+            // for that position is already populated, so do a
+            // dummy single-token re-run is unnecessary — instead
+            // just synthesize an empty stream. Real-world hit
+            // requires at least one new user token after the
+            // assistant reply, so suffix should be non-empty in
+            // practice.
+            let logits = vec![0.0f32; model.cfg.vocab_size];
+            (
+                logits,
+                prefix_kv_len as u32,
+                prefix_token_count,
+                prefix_kv_len,
+            )
         } else {
-            // Miss: full fresh prefill. P-2 streaming-prefill (VLM
-            // analog): run the vision pipeline (per-image ViT
-            // forward + projector) on a background thread concurrent
-            // with tokenize-side work (placeholder-position scan +
-            // text embedding lookup) on this thread. Vision is the
-            // dominant cost of a fresh VLM prefill; overlapping it
-            // with the much-cheaper token side saves ~100ms+ of
-            // wall-clock latency per fresh request.
-            last_ids.clear();
-            kv.reset();
-            if let Some(dn) = delta_net_cache.as_mut() {
-                dn.reset();
-            }
+            // (hybrid never reaches here — vlm_prefix_cache_ok
+            // gated the lookup — so the dense from-embeds forward
+            // is always the right one. Primal rows == raw rows on
+            // non-Hadamard dense models.)
+            let suffix_embeds = model.embed_tokens_primal(suffix);
+            let logits =
+                model.forward_prefill_from_embeds(&suffix_embeds, prefix_kv_len as u32, kv);
+            let next_pos = (prefix_kv_len + suffix.len()) as u32;
+            (
+                logits,
+                next_pos,
+                prefix_token_count,
+                prefix_kv_len + suffix.len(),
+            )
+        }
+    } else {
+        // Miss: full fresh prefill. P-2 streaming-prefill (VLM
+        // analog): run the vision pipeline (per-image ViT
+        // forward + projector) on a background thread concurrent
+        // with tokenize-side work (placeholder-position scan +
+        // text embedding lookup) on this thread. Vision is the
+        // dominant cost of a fresh VLM prefill; overlapping it
+        // with the much-cheaper token side saves ~100ms+ of
+        // wall-clock latency per fresh request.
+        last_ids.clear();
+        kv.reset();
+        if let Some(dn) = delta_net_cache.as_mut() {
+            dn.reset();
+        }
 
-            // V-7 feature memo: a repeated image set (same chained
-            // hash) reuses the projected features and skips the ViT
-            // entirely. `image_hash` is Some(..) on this path.
-            let memo_hit: Option<Vec<Vec<f32>>> = image_hash.and_then(|h| {
-                feature_memo
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.as_ref().filter(|(k, _)| *k == h).map(|(_, f)| f.clone()))
+        // V-7 feature memo: a repeated image set (same chained
+        // hash) reuses the projected features and skips the ViT
+        // entirely. `image_hash` is Some(..) on this path.
+        let memo_hit: Option<Vec<Vec<f32>>> = image_hash.and_then(|h| {
+            feature_memo
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().filter(|(k, _)| *k == h).map(|(_, f)| f.clone()))
+        });
+        if memo_hit.is_some() {
+            tracing::debug!("vlm prefill: vision-feature memo hit — skipping ViT");
+        }
+        let vision_for_thread = Arc::clone(&vision);
+        let images_for_thread: Vec<Vec<u8>> = images.clone();
+        let memo_for_thread = memo_hit;
+        let vision_handle =
+            std::thread::spawn(move || -> std::result::Result<Vec<Vec<f32>>, String> {
+                if let Some(cached) = memo_for_thread {
+                    return Ok(cached);
+                }
+                let mut features = Vec::with_capacity(images_for_thread.len());
+                for img_bytes in &images_for_thread {
+                    let feat = vision_for_thread
+                        .forward_image_bytes(img_bytes)
+                        .map_err(|e| e.to_string())?;
+                    features.push(feat);
+                }
+                Ok(features)
             });
-            if memo_hit.is_some() {
-                tracing::debug!("vlm prefill: vision-feature memo hit — skipping ViT");
-            }
-            let vision_for_thread = Arc::clone(&vision);
-            let images_for_thread: Vec<Vec<u8>> = images.clone();
-            let memo_for_thread = memo_hit;
-            let vision_handle = std::thread::spawn(
-                move || -> std::result::Result<Vec<Vec<f32>>, String> {
-                    if let Some(cached) = memo_for_thread {
-                        return Ok(cached);
-                    }
-                    let mut features =
-                        Vec::with_capacity(images_for_thread.len());
-                    for img_bytes in &images_for_thread {
-                        let feat = vision_for_thread
-                            .forward_image_bytes(img_bytes)
-                            .map_err(|e| e.to_string())?;
-                        features.push(feat);
-                    }
-                    Ok(features)
-                },
-            );
 
-            // ----- Concurrent work on the main thread -----
-            // (1) Placeholder-position scan over the tokenized prompt.
-            //     The validation differs between modes:
-            //     - OnePerImage: positions.len() == images.len()
-            //     - OnePerPatch: runs of consecutive placeholders
-            //       must match per-image patch counts
-            let positions: Vec<usize> = prompt_u32
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &t)| {
-                    if t == image_token_id {
-                        Some(i)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            // OnePerImage mode validates here so the vision-thread
-            // resources free cleanly on a count mismatch. OnePerPatch
-            // mode needs the per-image patch counts from the vision
-            // pipeline to validate, so its check runs after the join.
-            if matches!(placeholder_mode, PlaceholderMode::OnePerImage)
-                && positions.len() != images.len()
-            {
-                let _ = vision_handle.join();
-                return Err(crate::EngineError::Engine(format!(
-                    "vlm prefill: prompt contains {} image-placeholder tokens \
+        // ----- Concurrent work on the main thread -----
+        // (1) Placeholder-position scan over the tokenized prompt.
+        //     The validation differs between modes:
+        //     - OnePerImage: positions.len() == images.len()
+        //     - OnePerPatch: runs of consecutive placeholders
+        //       must match per-image patch counts
+        let positions: Vec<usize> = prompt_u32
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &t)| if t == image_token_id { Some(i) } else { None })
+            .collect();
+        // OnePerImage mode validates here so the vision-thread
+        // resources free cleanly on a count mismatch. OnePerPatch
+        // mode needs the per-image patch counts from the vision
+        // pipeline to validate, so its check runs after the join.
+        if matches!(placeholder_mode, PlaceholderMode::OnePerImage)
+            && positions.len() != images.len()
+        {
+            let _ = vision_handle.join();
+            return Err(crate::EngineError::Engine(format!(
+                "vlm prefill: prompt contains {} image-placeholder tokens \
                      (id={image_token_id}) but the request attached {} image \
                      payloads",
-                    positions.len(),
-                    images.len(),
-                )));
+                positions.len(),
+                images.len(),
+            )));
+        }
+        // (2) Embed text tokens. CPU work, runs concurrent with
+        //     the spawned vision pipeline.
+        let text_embeds = model.embed_tokens_primal(&prompt_ids);
+        let d_text = vision.projector.d_text();
+
+        // ----- Join the vision thread -----
+        let features = vision_handle
+            .join()
+            .map_err(|_| crate::EngineError::Engine("vlm prefill: vision thread panicked".into()))?
+            .map_err(|e| crate::EngineError::Engine(format!("vlm prefill: {e}")))?;
+
+        // V-7: memoize the (possibly fresh) features for the next
+        // turn with the same image set.
+        if let (Some(h), Ok(mut g)) = (image_hash, feature_memo.lock()) {
+            *g = Some((h, features.clone()));
+        }
+
+        // OnePerPatch validation: count consecutive placeholder
+        // runs in the prompt and check they match per-image patch
+        // counts from the vision pipeline.
+        let per_patch_features: Vec<Vec<f32>>;
+        let final_positions: Vec<usize>;
+        let final_feature_slabs: Vec<&[f32]>;
+        match placeholder_mode {
+            PlaceholderMode::OnePerImage => {
+                final_positions = positions;
+                per_patch_features = Vec::new();
+                final_feature_slabs = features.iter().map(|f| f.as_slice()).collect();
+                let _ = &per_patch_features;
             }
-            // (2) Embed text tokens. CPU work, runs concurrent with
-            //     the spawned vision pipeline.
-            let text_embeds = model.embed_tokens_primal(&prompt_ids);
-            let d_text = vision.projector.d_text();
-
-            // ----- Join the vision thread -----
-            let features = vision_handle
-                .join()
-                .map_err(|_| {
-                    crate::EngineError::Engine(
-                        "vlm prefill: vision thread panicked".into(),
-                    )
-                })?
-                .map_err(|e| {
-                    crate::EngineError::Engine(format!("vlm prefill: {e}"))
-                })?;
-
-            // V-7: memoize the (possibly fresh) features for the next
-            // turn with the same image set.
-            if let (Some(h), Ok(mut g)) = (image_hash, feature_memo.lock()) {
-                *g = Some((h, features.clone()));
-            }
-
-            // OnePerPatch validation: count consecutive placeholder
-            // runs in the prompt and check they match per-image patch
-            // counts from the vision pipeline.
-            let per_patch_features: Vec<Vec<f32>>;
-            let final_positions: Vec<usize>;
-            let final_feature_slabs: Vec<&[f32]>;
-            match placeholder_mode {
-                PlaceholderMode::OnePerImage => {
-                    final_positions = positions;
-                    per_patch_features = Vec::new();
-                    final_feature_slabs =
-                        features.iter().map(|f| f.as_slice()).collect();
-                    let _ = &per_patch_features;
-                }
-                PlaceholderMode::OnePerPatch => {
-                    // Compute consecutive-run lengths in `positions`.
-                    let mut run_lengths: Vec<usize> = Vec::new();
-                    let mut current_run = 0usize;
-                    let mut prev_pos: Option<usize> = None;
-                    for &p in &positions {
-                        match prev_pos {
-                            Some(prev) if p == prev + 1 => current_run += 1,
-                            _ => {
-                                if current_run > 0 {
-                                    run_lengths.push(current_run);
-                                }
-                                current_run = 1;
+            PlaceholderMode::OnePerPatch => {
+                // Compute consecutive-run lengths in `positions`.
+                let mut run_lengths: Vec<usize> = Vec::new();
+                let mut current_run = 0usize;
+                let mut prev_pos: Option<usize> = None;
+                for &p in &positions {
+                    match prev_pos {
+                        Some(prev) if p == prev + 1 => current_run += 1,
+                        _ => {
+                            if current_run > 0 {
+                                run_lengths.push(current_run);
                             }
+                            current_run = 1;
                         }
-                        prev_pos = Some(p);
                     }
-                    if current_run > 0 {
-                        run_lengths.push(current_run);
-                    }
-                    let patches_per_image: Vec<usize> =
-                        features.iter().map(|f| f.len() / d_text).collect();
-                    if run_lengths != patches_per_image {
-                        return Err(crate::EngineError::Engine(format!(
-                            "vlm prefill (OnePerPatch): placeholder runs \
+                    prev_pos = Some(p);
+                }
+                if current_run > 0 {
+                    run_lengths.push(current_run);
+                }
+                let patches_per_image: Vec<usize> =
+                    features.iter().map(|f| f.len() / d_text).collect();
+                if run_lengths != patches_per_image {
+                    return Err(crate::EngineError::Engine(format!(
+                        "vlm prefill (OnePerPatch): placeholder runs \
                              {run_lengths:?} don't match per-image patch counts \
                              {patches_per_image:?}"
-                        )));
-                    }
-                    // Split each image's [num_patches, d_text] buffer
-                    // into per-patch [d_text] rows aligned with
-                    // positions (1:1 placeholder→patch substitution).
-                    let total_patches: usize = patches_per_image.iter().sum();
-                    let mut split: Vec<Vec<f32>> =
-                        Vec::with_capacity(total_patches);
-                    for feat in &features {
-                        let n_patches = feat.len() / d_text;
-                        for p in 0..n_patches {
-                            let row =
-                                feat[p * d_text..(p + 1) * d_text].to_vec();
-                            split.push(row);
-                        }
-                    }
-                    per_patch_features = split;
-                    final_positions = positions;
-                    final_feature_slabs = per_patch_features
-                        .iter()
-                        .map(|f| f.as_slice())
-                        .collect();
+                    )));
                 }
+                // Split each image's [num_patches, d_text] buffer
+                // into per-patch [d_text] rows aligned with
+                // positions (1:1 placeholder→patch substitution).
+                let total_patches: usize = patches_per_image.iter().sum();
+                let mut split: Vec<Vec<f32>> = Vec::with_capacity(total_patches);
+                for feat in &features {
+                    let n_patches = feat.len() / d_text;
+                    for p in 0..n_patches {
+                        let row = feat[p * d_text..(p + 1) * d_text].to_vec();
+                        split.push(row);
+                    }
+                }
+                per_patch_features = split;
+                final_positions = positions;
+                final_feature_slabs = per_patch_features.iter().map(|f| f.as_slice()).collect();
             }
+        }
 
-            let total_image_rows: usize = match placeholder_mode {
-                PlaceholderMode::OnePerImage => {
-                    features.iter().map(|f| f.len() / d_text).sum()
-                }
-                // OnePerPatch: total_image_rows == positions.len()
-                // because each placeholder maps 1:1 to one patch row,
-                // and the splice doesn't change the total length.
-                PlaceholderMode::OnePerPatch => final_positions.len(),
-            };
-            let spliced_len =
-                prompt_ids.len() - final_positions.len() + total_image_rows;
-            if spliced_len + (sampling.max_tokens as usize) > max_ctx {
-                return Err(crate::EngineError::Engine(format!(
-                    "vlm prefill too long: spliced_len={spliced_len} + \
-                     max_tokens={} > max_ctx={max_ctx}",
-                    sampling.max_tokens
-                )));
-            }
-            let feat_slices: Vec<&[f32]> = final_feature_slabs;
-            let positions = final_positions;
-            let spliced = rustllama_models::vision_arch::splice_image_embeddings(
-                &text_embeds,
-                &positions,
-                &feat_slices,
-                d_text,
-            )
-            .map_err(|e| crate::EngineError::Engine(format!("vlm splice: {e}")))?;
-            let logits = if is_hybrid {
-                let dn = delta_net_cache.as_mut().ok_or_else(|| {
-                    crate::EngineError::Engine(
-                        "vlm prefill: hybrid model without a DeltaNet cache".into(),
-                    )
-                })?;
-                model.forward_prefill_hybrid_from_embeds(&spliced, 0, kv, dn)
-            } else {
-                model.forward_prefill_from_embeds(&spliced, 0, kv)
-            };
-            (logits, spliced_len as u32, prompt_ids.len(), spliced_len)
+        let total_image_rows: usize = match placeholder_mode {
+            PlaceholderMode::OnePerImage => features.iter().map(|f| f.len() / d_text).sum(),
+            // OnePerPatch: total_image_rows == positions.len()
+            // because each placeholder maps 1:1 to one patch row,
+            // and the splice doesn't change the total length.
+            PlaceholderMode::OnePerPatch => final_positions.len(),
         };
+        let spliced_len = prompt_ids.len() - final_positions.len() + total_image_rows;
+        if spliced_len + (sampling.max_tokens as usize) > max_ctx {
+            return Err(crate::EngineError::Engine(format!(
+                "vlm prefill too long: spliced_len={spliced_len} + \
+                     max_tokens={} > max_ctx={max_ctx}",
+                sampling.max_tokens
+            )));
+        }
+        let feat_slices: Vec<&[f32]> = final_feature_slabs;
+        let positions = final_positions;
+        let spliced = rustllama_models::vision_arch::splice_image_embeddings(
+            &text_embeds,
+            &positions,
+            &feat_slices,
+            d_text,
+        )
+        .map_err(|e| crate::EngineError::Engine(format!("vlm splice: {e}")))?;
+        let logits = if is_hybrid {
+            let dn = delta_net_cache.as_mut().ok_or_else(|| {
+                crate::EngineError::Engine(
+                    "vlm prefill: hybrid model without a DeltaNet cache".into(),
+                )
+            })?;
+            model.forward_prefill_hybrid_from_embeds(&spliced, 0, kv, dn)
+        } else {
+            model.forward_prefill_from_embeds(&spliced, 0, kv)
+        };
+        (logits, spliced_len as u32, prompt_ids.len(), spliced_len)
+    };
 
     let _ = prefix_token_count; // structured here for readability + future logging
 
@@ -10210,11 +10375,7 @@ fn drive_vlm_generation(
         && spliced_len_for_snapshot >= PREFIX_REUSE_MIN_TOKENS
         && history.len() >= PREFIX_REUSE_MIN_TOKENS
     {
-        pool.snapshot_and_insert_with_image_hash(
-            history.clone(),
-            kv,
-            image_hash,
-        );
+        pool.snapshot_and_insert_with_image_hash(history.clone(), kv, image_hash);
     }
     *last_ids = history;
     Ok(())
@@ -10308,7 +10469,9 @@ fn top_k_by_logit(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
     if top.len() < k {
         sort_desc_logit_then_idx(&mut top);
     }
-    top.into_iter().map(|(id, logit)| (id, logit - lse)).collect()
+    top.into_iter()
+        .map(|(id, logit)| (id, logit - lse))
+        .collect()
 }
 
 /// one-line and the grow logic is owned by exactly one function.
@@ -10340,11 +10503,12 @@ fn forward_one_via_backend_hybrid(
     logits_out: &mut [f32],
 ) {
     if model.weights.is_hybrid() {
-        let dn = delta_net_cache.expect(
-            "engine bug: hybrid model loaded but no DeltaNetCache passed to forward_one",
-        );
+        let dn = delta_net_cache
+            .expect("engine bug: hybrid model loaded but no DeltaNetCache passed to forward_one");
         match backend {
-            KvBackend::Contiguous(kv) => model.forward_one_hybrid(token_id, pos, kv, dn, logits_out),
+            KvBackend::Contiguous(kv) => {
+                model.forward_one_hybrid(token_id, pos, kv, dn, logits_out)
+            }
             KvBackend::Paged { .. }
             | KvBackend::PagedQ8_0 { .. }
             | KvBackend::PagedTQ { .. }
@@ -10366,13 +10530,21 @@ fn forward_one_via_backend_hybrid(
     }
     match backend {
         KvBackend::Contiguous(kv) => model.forward_one(token_id, pos, kv, logits_out),
-        KvBackend::Paged { cache, store, table } => {
+        KvBackend::Paged {
+            cache,
+            store,
+            table,
+        } => {
             cache
                 .ensure_capacity(table, pos + 1)
                 .expect("paged cache grow failed — pool was sized to max_ctx at engine load");
             model.forward_one_paged_f32(token_id, pos, cache, store, logits_out);
         }
-        KvBackend::PagedQ8_0 { cache, store, table } => {
+        KvBackend::PagedQ8_0 {
+            cache,
+            store,
+            table,
+        } => {
             // H9a: Q8_0 paged forward dispatch — routes through the
             // shared `forward_one_paged_*_inner` via the
             // `PagedKvStoreOps` trait object.
@@ -10381,42 +10553,66 @@ fn forward_one_via_backend_hybrid(
                 .expect("paged cache grow failed — pool was sized to max_ctx at engine load");
             model.forward_one_paged_q8_0(token_id, pos, cache, store, logits_out);
         }
-        KvBackend::PagedTQ { cache, store, table } => {
+        KvBackend::PagedTQ {
+            cache,
+            store,
+            table,
+        } => {
             // H9b: TurboQuant paged forward dispatch.
             cache
                 .ensure_capacity(table, pos + 1)
                 .expect("paged cache grow failed — pool was sized to max_ctx at engine load");
             model.forward_one_paged_tq(token_id, pos, cache, store, logits_out);
         }
-        KvBackend::PagedNvfp4 { cache, store, table } => {
+        KvBackend::PagedNvfp4 {
+            cache,
+            store,
+            table,
+        } => {
             // H9b: NVFP4 paged forward dispatch.
             cache
                 .ensure_capacity(table, pos + 1)
                 .expect("paged cache grow failed — pool was sized to max_ctx at engine load");
             model.forward_one_paged_nvfp4(token_id, pos, cache, store, logits_out);
         }
-        KvBackend::PagedMxfp4 { cache, store, table } => {
+        KvBackend::PagedMxfp4 {
+            cache,
+            store,
+            table,
+        } => {
             // Wave 2: MXFP4 paged forward dispatch.
             cache
                 .ensure_capacity(table, pos + 1)
                 .expect("paged cache grow failed — pool was sized to max_ctx at engine load");
             model.forward_one_paged_mxfp4(token_id, pos, cache, store, logits_out);
         }
-        KvBackend::PagedMxfp6 { cache, store, table } => {
+        KvBackend::PagedMxfp6 {
+            cache,
+            store,
+            table,
+        } => {
             // Wave 2: MXFP6 paged forward dispatch.
             cache
                 .ensure_capacity(table, pos + 1)
                 .expect("paged cache grow failed — pool was sized to max_ctx at engine load");
             model.forward_one_paged_mxfp6(token_id, pos, cache, store, logits_out);
         }
-        KvBackend::PagedMxfp8 { cache, store, table } => {
+        KvBackend::PagedMxfp8 {
+            cache,
+            store,
+            table,
+        } => {
             // Wave 2: MXFP8 paged forward dispatch.
             cache
                 .ensure_capacity(table, pos + 1)
                 .expect("paged cache grow failed — pool was sized to max_ctx at engine load");
             model.forward_one_paged_mxfp8(token_id, pos, cache, store, logits_out);
         }
-        KvBackend::PagedF16 { cache, store, table } => {
+        KvBackend::PagedF16 {
+            cache,
+            store,
+            table,
+        } => {
             // M6: half-precision (f16 / bf16) paged forward dispatch.
             cache
                 .ensure_capacity(table, pos + 1)
@@ -10460,7 +10656,13 @@ fn forward_one_with_mtp_drafts_via_backend(
 
     match backend {
         KvBackend::Contiguous(kv) => {
-            model.forward_one_with_mtp_logits(token_id, pos, kv, &mut main_logits, &mut head_logits);
+            model.forward_one_with_mtp_logits(
+                token_id,
+                pos,
+                kv,
+                &mut main_logits,
+                &mut head_logits,
+            );
         }
         KvBackend::Paged { .. }
         | KvBackend::PagedQ8_0 { .. }
@@ -10510,8 +10712,7 @@ fn project_moe_tier_budget_bytes(
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_lcp, project_moe_tier_budget_bytes, update_ema_tok_s, RequestStats,
-        TOK_S_EMA_ALPHA,
+        compute_lcp, project_moe_tier_budget_bytes, update_ema_tok_s, RequestStats, TOK_S_EMA_ALPHA,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -10528,7 +10729,11 @@ mod tests {
 
     fn ema_value(slot: &AtomicU64) -> Option<f64> {
         let v = f64::from_bits(slot.load(Ordering::Relaxed));
-        if v.is_nan() { None } else { Some(v) }
+        if v.is_nan() {
+            None
+        } else {
+            Some(v)
+        }
     }
 
     // ---- P20: MoE tiered-expert VRAM-budget projection ----
@@ -10543,9 +10748,9 @@ mod tests {
         let got = project_moe_tier_budget_bytes(
             Some(avail),
             true,
-            20 * GIB,            // expert_bytes
-            2 * GIB,             // non_expert_bytes
-            3 * GIB / 2,         // margin
+            20 * GIB,    // expert_bytes
+            2 * GIB,     // non_expert_bytes
+            3 * GIB / 2, // margin
         );
         assert_eq!(got, 16 * GIB - 2 * GIB - 3 * GIB / 2);
         assert!(got > 0);
@@ -10560,7 +10765,7 @@ mod tests {
         let got = project_moe_tier_budget_bytes(
             Some(avail),
             true,
-            6 * GIB,  // expert_bytes — the cap
+            6 * GIB, // expert_bytes — the cap
             2 * GIB,
             1 * GIB,
         );
@@ -10616,9 +10821,15 @@ mod tests {
         // either divide-by-zero or pin EMA to 0). Slot stays unset.
         let slot = AtomicU64::new(f64::NAN.to_bits());
         update_ema_tok_s(&slot, &make_stats(1000.0, 0));
-        assert!(ema_value(&slot).is_none(), "zero-token request stayed unfolded");
+        assert!(
+            ema_value(&slot).is_none(),
+            "zero-token request stayed unfolded"
+        );
         update_ema_tok_s(&slot, &make_stats(0.0, 50));
-        assert!(ema_value(&slot).is_none(), "zero-time request stayed unfolded");
+        assert!(
+            ema_value(&slot).is_none(),
+            "zero-time request stayed unfolded"
+        );
         // First valid sample after the skipped ones still seeds.
         update_ema_tok_s(&slot, &make_stats(1000.0, 30));
         assert!((ema_value(&slot).unwrap() - 30.0).abs() < 1e-6);

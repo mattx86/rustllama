@@ -179,20 +179,55 @@ const LAYOUTS: &[QuantLayout] = &[
     // SYCL matvec kernels ship for each (`matvec_<fmt>_packed_f32{,_batched}_
     // usm`); listed here so both the matvec + matvecb probes exercise them.
     // Q5_0: 22B/32 = f16 d + u32 qh + 16 nibbles.
-    QuantLayout { name: "q5_0", block_elems: 32, block_bytes: 22, f16_scales: &[0] },
+    QuantLayout {
+        name: "q5_0",
+        block_elems: 32,
+        block_bytes: 22,
+        f16_scales: &[0],
+    },
     // Q4_1: 20B/32 = f16 d + f16 min + 16 nibbles.
-    QuantLayout { name: "q4_1", block_elems: 32, block_bytes: 20, f16_scales: &[0, 2] },
+    QuantLayout {
+        name: "q4_1",
+        block_elems: 32,
+        block_bytes: 20,
+        f16_scales: &[0, 2],
+    },
     // Q5_1: 24B/32 = f16 d + f16 min + u32 qh + 16 nibbles.
-    QuantLayout { name: "q5_1", block_elems: 32, block_bytes: 24, f16_scales: &[0, 2] },
+    QuantLayout {
+        name: "q5_1",
+        block_elems: 32,
+        block_bytes: 24,
+        f16_scales: &[0, 2],
+    },
     // Q2_K: 84B/256 = 16 scale bytes + 64 qs + f16 d + f16 dmin (at 80/82).
-    QuantLayout { name: "q2_k", block_elems: 256, block_bytes: 84, f16_scales: &[80, 82] },
+    QuantLayout {
+        name: "q2_k",
+        block_elems: 256,
+        block_bytes: 84,
+        f16_scales: &[80, 82],
+    },
     // Q3_K: 110B/256 = 32 hmask + 64 qs + 12 scales + f16 d (at 108).
-    QuantLayout { name: "q3_k", block_elems: 256, block_bytes: 110, f16_scales: &[108] },
+    QuantLayout {
+        name: "q3_k",
+        block_elems: 256,
+        block_bytes: 110,
+        f16_scales: &[108],
+    },
     // Q8_K: 292B/256 = F32 d (at 0) + 256 i8 qs + 16 i16 bsums. The scale is
     // F32, not f16 — `gen_quant_bytes` stamps it by name (see below).
-    QuantLayout { name: "q8_k", block_elems: 256, block_bytes: 292, f16_scales: &[] },
+    QuantLayout {
+        name: "q8_k",
+        block_elems: 256,
+        block_bytes: 292,
+        f16_scales: &[],
+    },
     // PQ2_0 (PrismML Bonsai): 34B/128 = f16 d + 32 packed 2-bit codes.
-    QuantLayout { name: "pq2_0", block_elems: 128, block_bytes: 34, f16_scales: &[0] },
+    QuantLayout {
+        name: "pq2_0",
+        block_elems: 128,
+        block_bytes: 34,
+        f16_scales: &[0],
+    },
 ];
 
 type CpuMatvec = fn(&[u8], &[f32], &mut [f32], usize, usize);
@@ -715,10 +750,7 @@ pub fn collect_sampler_gpu_verdict() -> Vec<(String, Option<bool>)> {
     for _ in 0..ITERS {
         let mut c = base.clone();
         k::fused_temp_softmax_inplace(&mut c, inv_temp);
-        let _ = c
-            .iter()
-            .cloned()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let _ = c.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     }
     let t_cpu = t0.elapsed().as_secs_f64();
     let t1 = Instant::now();
@@ -734,7 +766,11 @@ pub fn collect_sampler_gpu_verdict() -> Vec<(String, Option<bool>)> {
     emit(
         &key,
         status,
-        &format!("cos={cos:.6} gpu={:.2}ms cpu={:.2}ms", t_gpu * 1e3, t_cpu * 1e3),
+        &format!(
+            "cos={cos:.6} gpu={:.2}ms cpu={:.2}ms",
+            t_gpu * 1e3,
+            t_cpu * 1e3
+        ),
     );
     vec![(key, Some(faster))]
 }
@@ -944,10 +980,14 @@ fn probe_iq_encoder(_stream: &sk::SyclStream, name: &str, rest: &str, started: I
     let cpu_enc = CpuFallbackEncoder;
 
     const N: usize = 256; // chunks per delta
-    // IQ1_M uses ±delta sub-block scaling; include a zero and an IQ1_S-style
-    // positive delta so the sweep exercises the sign of the grid offset.
+                          // IQ1_M uses ±delta sub-block scaling; include a zero and an IQ1_S-style
+                          // positive delta so the sweep exercises the sign of the grid offset.
     let deltas = [-0.0625f32, 0.0, 0.125];
-    let zero = Iq8EltDeltaPick { grid_idx: 0, signed_score: 0.0, norm_sq: 0.0 };
+    let zero = Iq8EltDeltaPick {
+        grid_idx: 0,
+        signed_score: 0.0,
+        norm_sq: 0.0,
+    };
     let mut obj_gpu: Vec<f32> = Vec::with_capacity(N * deltas.len());
     let mut obj_cpu: Vec<f32> = Vec::with_capacity(N * deltas.len());
     let mut idx_match = 0usize;
@@ -960,11 +1000,17 @@ fn probe_iq_encoder(_stream: &sk::SyclStream, name: &str, rest: &str, started: I
             emit(
                 name,
                 "KERNEL_ERR",
-                &format!("gpu encode failed: {e} ms={}", started.elapsed().as_millis()),
+                &format!(
+                    "gpu encode failed: {e} ms={}",
+                    started.elapsed().as_millis()
+                ),
             );
             return;
         }
-        if cpu_enc.iq_8elt_delta_batched(&targets, delta, &mut c).is_err() {
+        if cpu_enc
+            .iq_8elt_delta_batched(&targets, delta, &mut c)
+            .is_err()
+        {
             emit(name, "KERNEL_ERR", "cpu reference encode failed");
             return;
         }
@@ -1130,7 +1176,10 @@ fn probe_matvec_f16in(stream: &sk::SyclStream, name: &str, dtype: &str, started:
         emit(name, "SKIP", "no-finite-reference");
         return;
     }
-    let x16: Vec<u16> = x.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
+    let x16: Vec<u16> = x
+        .iter()
+        .map(|&v| half::f16::from_f32(v).to_bits())
+        .collect();
     let (mut wb, mut xb16, mut xbf32, mut ob) = match (
         sk::SyclSharedBuffer::<u8>::alloc(stream, w.len()),
         sk::SyclSharedBuffer::<u16>::alloc(stream, MV_K),
@@ -1150,30 +1199,82 @@ fn probe_matvec_f16in(stream: &sk::SyclStream, name: &str, dtype: &str, started:
     // Correctness: run the f16-in kernel once, grade vs the fair reference.
     // SAFETY: live USM allocations on `stream` sized (M,K)/(K)/(M); the kernel
     // derives extents from (m,k) and waits before returning.
-    if let Err(e) =
-        unsafe { gpu_f16(stream, wb.as_ptr(), xb16.as_ptr(), ob.as_mut_ptr(), MV_M as u32, MV_K as u32, 0) }
-    {
+    if let Err(e) = unsafe {
+        gpu_f16(
+            stream,
+            wb.as_ptr(),
+            xb16.as_ptr(),
+            ob.as_mut_ptr(),
+            MV_M as u32,
+            MV_K as u32,
+            0,
+        )
+    } {
         emit(name, "KERNEL_ERR", &format!("{e}"));
         return;
     }
     let (cos, max_rel) = compare(ob.as_slice(), &cpu_out);
     if !(cos > 0.999 && max_rel < 0.02) {
-        emit(name, "MISCOMPUTE", &format!("cos={cos:.6} max_rel={max_rel:.4}"));
+        emit(
+            name,
+            "MISCOMPUTE",
+            &format!("cos={cos:.6} max_rel={max_rel:.4}"),
+        );
         return;
     }
     // Perf gate: the f16-in path is lossy, so enable it ONLY when it also beats
     // the f32-activation matvec. Warm once, then time ITERS dispatches of each.
     const ITERS: u32 = 40;
-    let _ = unsafe { gpu_f16(stream, wb.as_ptr(), xb16.as_ptr(), ob.as_mut_ptr(), MV_M as u32, MV_K as u32, 0) };
+    let _ = unsafe {
+        gpu_f16(
+            stream,
+            wb.as_ptr(),
+            xb16.as_ptr(),
+            ob.as_mut_ptr(),
+            MV_M as u32,
+            MV_K as u32,
+            0,
+        )
+    };
     let t0 = Instant::now();
     for _ in 0..ITERS {
-        let _ = unsafe { gpu_f16(stream, wb.as_ptr(), xb16.as_ptr(), ob.as_mut_ptr(), MV_M as u32, MV_K as u32, 0) };
+        let _ = unsafe {
+            gpu_f16(
+                stream,
+                wb.as_ptr(),
+                xb16.as_ptr(),
+                ob.as_mut_ptr(),
+                MV_M as u32,
+                MV_K as u32,
+                0,
+            )
+        };
     }
     let t_f16 = t0.elapsed().as_secs_f64();
-    let _ = unsafe { gpu_f32(stream, wb.as_ptr(), xbf32.as_ptr(), ob.as_mut_ptr(), MV_M as u32, MV_K as u32, 0) };
+    let _ = unsafe {
+        gpu_f32(
+            stream,
+            wb.as_ptr(),
+            xbf32.as_ptr(),
+            ob.as_mut_ptr(),
+            MV_M as u32,
+            MV_K as u32,
+            0,
+        )
+    };
     let t1 = Instant::now();
     for _ in 0..ITERS {
-        let _ = unsafe { gpu_f32(stream, wb.as_ptr(), xbf32.as_ptr(), ob.as_mut_ptr(), MV_M as u32, MV_K as u32, 0) };
+        let _ = unsafe {
+            gpu_f32(
+                stream,
+                wb.as_ptr(),
+                xbf32.as_ptr(),
+                ob.as_mut_ptr(),
+                MV_M as u32,
+                MV_K as u32,
+                0,
+            )
+        };
     }
     let t_f32 = t1.elapsed().as_secs_f64();
     let ms = started.elapsed().as_millis();
@@ -1187,13 +1288,21 @@ fn probe_matvec_f16in(stream: &sk::SyclStream, name: &str, dtype: &str, started:
         emit(
             name,
             "OK",
-            &format!("cos={cos:.6} max_rel={max_rel:.4} f16={:.2}ms f32={:.2}ms (≥10% faster) ms={ms}", t_f16 * 1e3, t_f32 * 1e3),
+            &format!(
+                "cos={cos:.6} max_rel={max_rel:.4} f16={:.2}ms f32={:.2}ms (≥10% faster) ms={ms}",
+                t_f16 * 1e3,
+                t_f32 * 1e3
+            ),
         );
     } else {
         emit(
             name,
             "SLOW",
-            &format!("correct but not ≥10% faster: f16={:.2}ms f32={:.2}ms ms={ms}", t_f16 * 1e3, t_f32 * 1e3),
+            &format!(
+                "correct but not ≥10% faster: f16={:.2}ms f32={:.2}ms ms={ms}",
+                t_f16 * 1e3,
+                t_f32 * 1e3
+            ),
         );
     }
 }
@@ -1627,7 +1736,11 @@ fn probe_rmsnorm_matvec(stream: &sk::SyclStream, name: &str, started: Instant) {
             } else {
                 "MISCOMPUTE"
             };
-            emit(name, verdict, &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"));
+            emit(
+                name,
+                verdict,
+                &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"),
+            );
         }
     }
 }
@@ -1688,7 +1801,11 @@ fn probe_down_residual(stream: &sk::SyclStream, name: &str, started: Instant) {
             } else {
                 "MISCOMPUTE"
             };
-            emit(name, verdict, &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"));
+            emit(
+                name,
+                verdict,
+                &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"),
+            );
         }
     }
 }
@@ -1782,7 +1899,11 @@ fn probe_out_proj_norm(stream: &sk::SyclStream, name: &str, started: Instant) {
             } else {
                 "MISCOMPUTE"
             };
-            emit(name, verdict, &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"));
+            emit(
+                name,
+                verdict,
+                &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"),
+            );
         }
     }
 }
@@ -1885,12 +2006,7 @@ fn probe_fused(stream: &sk::SyclStream, name: &str, dtype: &str, started: Instan
 /// at all?). `OK` only if every shape passes both; `MISCOMPUTE` otherwise —
 /// which is the correct fail-closed verdict for a device/shape where fusing
 /// diverges, the 2026-09-06 failure mode the bare `fused:` GEMM probe misses.
-fn probe_moe_gate_up_coherent(
-    stream: &sk::SyclStream,
-    name: &str,
-    dtype: &str,
-    started: Instant,
-) {
+fn probe_moe_gate_up_coherent(stream: &sk::SyclStream, name: &str, dtype: &str, started: Instant) {
     let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
     let cpu = cpu_matvec_for(dtype);
     let Some(gpu_fused) = gpu_fused_for(dtype) else {
@@ -1955,10 +2071,26 @@ fn probe_moe_gate_up_coherent(
             // SEPARATE path: two independent single-row matvecs.
             // SAFETY: live USM buffers sized (M,K)/(K)/(M); kernel waits before return.
             let sep = unsafe {
-                gpu_mv(stream, gb.as_ptr(), xb.as_ptr(), sep_g_b.as_mut_ptr(), m as u32, k as u32, 0)
-                    .and_then(|()| {
-                        gpu_mv(stream, ub.as_ptr(), xb.as_ptr(), sep_u_b.as_mut_ptr(), m as u32, k as u32, 0)
-                    })
+                gpu_mv(
+                    stream,
+                    gb.as_ptr(),
+                    xb.as_ptr(),
+                    sep_g_b.as_mut_ptr(),
+                    m as u32,
+                    k as u32,
+                    0,
+                )
+                .and_then(|()| {
+                    gpu_mv(
+                        stream,
+                        ub.as_ptr(),
+                        xb.as_ptr(),
+                        sep_u_b.as_mut_ptr(),
+                        m as u32,
+                        k as u32,
+                        0,
+                    )
+                })
             };
             if let Err(e_) = sep {
                 emit(name, "KERNEL_ERR", &format!("separate-matvec {e_}"));
@@ -2069,16 +2201,46 @@ struct QuantKvFormat {
 }
 
 const QUANT_KV_FORMATS: &[QuantKvFormat] = &[
-    QuantKvFormat { name: "mxfp4", block_elems: 32, block_bytes: 17, cos_min: 0.930, rel_max: 0.60 },
-    QuantKvFormat { name: "mxfp6", block_elems: 32, block_bytes: 25, cos_min: 0.980, rel_max: 0.25 },
-    QuantKvFormat { name: "mxfp8", block_elems: 32, block_bytes: 33, cos_min: 0.995, rel_max: 0.10 },
-    QuantKvFormat { name: "nvfp4", block_elems: 16, block_bytes: 9, cos_min: 0.970, rel_max: 0.30 },
+    QuantKvFormat {
+        name: "mxfp4",
+        block_elems: 32,
+        block_bytes: 17,
+        cos_min: 0.930,
+        rel_max: 0.60,
+    },
+    QuantKvFormat {
+        name: "mxfp6",
+        block_elems: 32,
+        block_bytes: 25,
+        cos_min: 0.980,
+        rel_max: 0.25,
+    },
+    QuantKvFormat {
+        name: "mxfp8",
+        block_elems: 32,
+        block_bytes: 33,
+        cos_min: 0.995,
+        rel_max: 0.10,
+    },
+    QuantKvFormat {
+        name: "nvfp4",
+        block_elems: 16,
+        block_bytes: 9,
+        cos_min: 0.970,
+        rel_max: 0.30,
+    },
     // Q4_0 KV (ggml 18B/32 block, embedded f16 scale) — live on all three GPU
     // flash-decode/prefill backends but previously ungraded. 4-bit, so the same
     // tolerance band as mxfp4. Formats with SEPARATE per-row scales (Q8_0 / TQ)
     // don't fit this block struct and are a follow-up (they need a scales
     // buffer threaded through the probe + the kernel call).
-    QuantKvFormat { name: "q4_0", block_elems: 32, block_bytes: 18, cos_min: 0.930, rel_max: 0.60 },
+    QuantKvFormat {
+        name: "q4_0",
+        block_elems: 32,
+        block_bytes: 18,
+        cos_min: 0.930,
+        rel_max: 0.60,
+    },
 ];
 
 /// Look up a quant-KV format by the suffix of an `attn:{decode,prefill}_*`
@@ -2352,7 +2514,10 @@ fn probe_decode_block(stream: &sk::SyclStream, name: &str, started: Instant) {
     // D_MODEL], Wo [D_MODEL x d_q]. Same synthesis + CPU reference matvec the
     // matvec probes use, so the per-row dequant matches the device kernel. The
     // dense-FFN weights: Wgate/Wup [D_FF x D_MODEL], Wdown [D_MODEL x D_FF].
-    let layout = LAYOUTS.iter().find(|l| l.name == "q4_k").expect("q4_k layout");
+    let layout = LAYOUTS
+        .iter()
+        .find(|l| l.name == "q4_k")
+        .expect("q4_k layout");
     let cpu_mv = cpu_matvec_for("q4_k");
     let wq = gen_quant_bytes(layout, d_q, D_MODEL, 0x1111);
     let wk = gen_quant_bytes(layout, d_kv, D_MODEL, 0x2222);
@@ -2485,8 +2650,17 @@ fn probe_decode_block(stream: &sk::SyclStream, name: &str, started: Instant) {
         // THIS (window, softcap). Only the attention step depends on the uniforms.
         let mut attn_ref = vec![0f32; d_q];
         k::gqa_attention_one_step_capped_windowed(
-            &q_ref, &kcache, &vcache, &mut attn_ref,
-            N_HEADS, N_KV, HEAD_DIM, MAX_CTX, kv_len, window as usize, softcap,
+            &q_ref,
+            &kcache,
+            &vcache,
+            &mut attn_ref,
+            N_HEADS,
+            N_KV,
+            HEAD_DIM,
+            MAX_CTX,
+            kv_len,
+            window as usize,
+            softcap,
         );
         let mut o_ref = vec![0f32; D_MODEL];
         cpu_mv(&wo, &attn_ref, &mut o_ref, D_MODEL, d_q);
@@ -2530,14 +2704,21 @@ fn probe_decode_block(stream: &sk::SyclStream, name: &str, started: Instant) {
         let res = unsafe {
             sk::decode_attn_block_usm_raw(
                 stream,
-                wqb.as_ptr() as *const c_void, 0,
-                wkb.as_ptr() as *const c_void, 0,
-                wvb.as_ptr() as *const c_void, 0,
-                wob.as_ptr() as *const c_void, 0,
+                wqb.as_ptr() as *const c_void,
+                0,
+                wkb.as_ptr() as *const c_void,
+                0,
+                wvb.as_ptr() as *const c_void,
+                0,
+                wob.as_ptr() as *const c_void,
+                0,
                 Some((
-                    wgb.as_ptr() as *const c_void, 0,
-                    wub.as_ptr() as *const c_void, 0,
-                    wdb.as_ptr() as *const c_void, 0,
+                    wgb.as_ptr() as *const c_void,
+                    0,
+                    wub.as_ptr() as *const c_void,
+                    0,
+                    wdb.as_ptr() as *const c_void,
+                    0,
                     D_FF as u32,
                 )),
                 attn_norm.as_ptr(),
@@ -2567,10 +2748,16 @@ fn probe_decode_block(stream: &sk::SyclStream, name: &str, started: Instant) {
             // DELTA (`hidden - hidden0`) so the large shared input residual can't
             // mask a miscompute (cosine of two near-equal big vectors is ~1).
             Ok((true, ffn_ran)) => {
-                let gpu_delta: Vec<f32> =
-                    hidden_dev.iter().zip(&hidden0).map(|(h, h0)| h - h0).collect();
-                let cpu_delta: Vec<f32> =
-                    hidden_ref.iter().zip(&hidden0).map(|(h, h0)| h - h0).collect();
+                let gpu_delta: Vec<f32> = hidden_dev
+                    .iter()
+                    .zip(&hidden0)
+                    .map(|(h, h0)| h - h0)
+                    .collect();
+                let cpu_delta: Vec<f32> = hidden_ref
+                    .iter()
+                    .zip(&hidden0)
+                    .map(|(h, h0)| h - h0)
+                    .collect();
                 let (cos, max_rel) = compare(&gpu_delta, &cpu_delta);
                 if !(cos > 0.995 && max_rel < 0.10 && ffn_ran) {
                     ok_all = false;
@@ -2698,28 +2885,63 @@ fn probe_attn(stream: &sk::SyclStream, name: &str, variant: &str, started: Insta
         for (window, softcap) in cases {
             let mut cpu_out = vec![0f32; AT_HEADS * AT_HEAD_DIM];
             k::gqa_attention_one_step_capped_windowed(
-                &q, &kcache, &vcache, &mut cpu_out,
-                AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN,
-                window as usize, softcap,
+                &q,
+                &kcache,
+                &vcache,
+                &mut cpu_out,
+                AT_HEADS,
+                AT_KV_HEADS,
+                AT_HEAD_DIM,
+                AT_MAX_CTX,
+                AT_KV_LEN,
+                window as usize,
+                softcap,
             );
             for b in ob.as_mut_slice().iter_mut() {
                 *b = 0;
             }
             let res = match v {
                 "v1" => sk::flash_attn_decode_usm(
-                    stream, &qb, &kb, &vb, &mut ob,
-                    AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                    AT_MAX_CTX as u32, AT_KV_LEN as u32, window, softcap,
+                    stream,
+                    &qb,
+                    &kb,
+                    &vb,
+                    &mut ob,
+                    AT_HEADS as u32,
+                    AT_KV_HEADS as u32,
+                    AT_HEAD_DIM as u32,
+                    AT_MAX_CTX as u32,
+                    AT_KV_LEN as u32,
+                    window,
+                    softcap,
                 ),
                 "v2" => sk::flash_attn_decode_v2_usm(
-                    stream, &qb, &kb, &vb, &mut ob,
-                    AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                    AT_MAX_CTX as u32, AT_KV_LEN as u32, window, softcap,
+                    stream,
+                    &qb,
+                    &kb,
+                    &vb,
+                    &mut ob,
+                    AT_HEADS as u32,
+                    AT_KV_HEADS as u32,
+                    AT_HEAD_DIM as u32,
+                    AT_MAX_CTX as u32,
+                    AT_KV_LEN as u32,
+                    window,
+                    softcap,
                 ),
                 "v3" => sk::flash_attn_decode_v3_usm(
-                    stream, &qb, &kb, &vb, &mut ob,
-                    AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                    AT_MAX_CTX as u32, AT_KV_LEN as u32, window, softcap,
+                    stream,
+                    &qb,
+                    &kb,
+                    &vb,
+                    &mut ob,
+                    AT_HEADS as u32,
+                    AT_KV_HEADS as u32,
+                    AT_HEAD_DIM as u32,
+                    AT_MAX_CTX as u32,
+                    AT_KV_LEN as u32,
+                    window,
+                    softcap,
                     0, // P19: tile_size 0 ⇒ the kernel's built-in heuristic
                 ),
                 _ => {
@@ -2807,9 +3029,18 @@ fn probe_attn(stream: &sk::SyclStream, name: &str, variant: &str, started: Insta
         for (window, softcap) in cases {
             let mut cpu_out = vec![0f32; q.len()];
             k::gqa_attention_flash_prefill_capped_windowed(
-                &q, &kcache, &vcache, &mut cpu_out,
-                AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX,
-                AT_PREFILL_BASE, AT_PREFILL_NEW, window as usize, softcap,
+                &q,
+                &kcache,
+                &vcache,
+                &mut cpu_out,
+                AT_HEADS,
+                AT_KV_HEADS,
+                AT_HEAD_DIM,
+                AT_MAX_CTX,
+                AT_PREFILL_BASE,
+                AT_PREFILL_NEW,
+                window as usize,
+                softcap,
             );
             ob.as_mut_slice().fill(f32::NAN);
             // SAFETY: USM pointers live on `stream`, lengths match the shape
@@ -2817,22 +3048,49 @@ fn probe_attn(stream: &sk::SyclStream, name: &str, variant: &str, started: Insta
             let res = unsafe {
                 match v {
                     "v1" => sk::flash_attn_prefill_usm_raw(
-                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                        AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
-                        window, softcap,
+                        stream,
+                        qb.as_ptr(),
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ob.as_mut_ptr(),
+                        AT_HEADS as u32,
+                        AT_KV_HEADS as u32,
+                        AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32,
+                        AT_PREFILL_BASE as u32,
+                        AT_PREFILL_NEW as u32,
+                        window,
+                        softcap,
                     ),
                     "v2" => sk::flash_attn_prefill_v2_usm_raw(
-                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                        AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
-                        window, softcap,
+                        stream,
+                        qb.as_ptr(),
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ob.as_mut_ptr(),
+                        AT_HEADS as u32,
+                        AT_KV_HEADS as u32,
+                        AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32,
+                        AT_PREFILL_BASE as u32,
+                        AT_PREFILL_NEW as u32,
+                        window,
+                        softcap,
                     ),
                     "v3" => sk::flash_attn_prefill_v3_usm_raw(
-                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                        AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
-                        window, softcap,
+                        stream,
+                        qb.as_ptr(),
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ob.as_mut_ptr(),
+                        AT_HEADS as u32,
+                        AT_KV_HEADS as u32,
+                        AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32,
+                        AT_PREFILL_BASE as u32,
+                        AT_PREFILL_NEW as u32,
+                        window,
+                        softcap,
                     ),
                     _ => {
                         emit(name, "SKIP", "unknown-variant");
@@ -2920,8 +3178,22 @@ fn probe_attn_quant_kv(
             .map(|_| rng.f32_pm(0.6))
             .collect();
         // Quantize K/V into the packed block layout the kernel decodes.
-        let kp = quantize_kv_cache(fmt, &kcache, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
-        let vp = quantize_kv_cache(fmt, &vcache, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
+        let kp = quantize_kv_cache(
+            fmt,
+            &kcache,
+            AT_KV_HEADS,
+            AT_HEAD_DIM,
+            AT_MAX_CTX,
+            AT_KV_LEN,
+        );
+        let vp = quantize_kv_cache(
+            fmt,
+            &vcache,
+            AT_KV_HEADS,
+            AT_HEAD_DIM,
+            AT_MAX_CTX,
+            AT_KV_LEN,
+        );
         // SAME-QUANT reference (Phase 2): dequantize the IDENTICAL packed K/V and
         // run the f32 attention on THAT, so max_rel isolates the kernel's
         // FMA/expf reassociation from the KV QUANTIZATION LOSS. The old
@@ -2961,9 +3233,17 @@ fn probe_attn_quant_kv(
         for (window, softcap) in cases {
             let mut cpu_out = vec![0f32; AT_HEADS * AT_HEAD_DIM];
             k::gqa_attention_one_step_capped_windowed(
-                &q, &kc_dq, &vc_dq, &mut cpu_out,
-                AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN,
-                window as usize, softcap,
+                &q,
+                &kc_dq,
+                &vc_dq,
+                &mut cpu_out,
+                AT_HEADS,
+                AT_KV_HEADS,
+                AT_HEAD_DIM,
+                AT_MAX_CTX,
+                AT_KV_LEN,
+                window as usize,
+                softcap,
             );
             ob.as_mut_slice().fill(f32::NAN);
             // SAFETY: all four are live USM allocations on `stream`; q/out are
@@ -2972,29 +3252,74 @@ fn probe_attn_quant_kv(
             let res = unsafe {
                 match fmt.name {
                     "mxfp4" => sk::flash_attn_decode_mxfp4_usm_raw(
-                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                        AT_MAX_CTX as u32, AT_KV_LEN as u32, window, softcap,
+                        stream,
+                        qb.as_ptr(),
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ob.as_mut_ptr(),
+                        AT_HEADS as u32,
+                        AT_KV_HEADS as u32,
+                        AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32,
+                        AT_KV_LEN as u32,
+                        window,
+                        softcap,
                     ),
                     "mxfp6" => sk::flash_attn_decode_mxfp6_usm_raw(
-                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                        AT_MAX_CTX as u32, AT_KV_LEN as u32, window, softcap,
+                        stream,
+                        qb.as_ptr(),
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ob.as_mut_ptr(),
+                        AT_HEADS as u32,
+                        AT_KV_HEADS as u32,
+                        AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32,
+                        AT_KV_LEN as u32,
+                        window,
+                        softcap,
                     ),
                     "mxfp8" => sk::flash_attn_decode_mxfp8_usm_raw(
-                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                        AT_MAX_CTX as u32, AT_KV_LEN as u32, window, softcap,
+                        stream,
+                        qb.as_ptr(),
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ob.as_mut_ptr(),
+                        AT_HEADS as u32,
+                        AT_KV_HEADS as u32,
+                        AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32,
+                        AT_KV_LEN as u32,
+                        window,
+                        softcap,
                     ),
                     "nvfp4" => sk::flash_attn_decode_nvfp4_usm_raw(
-                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                        AT_MAX_CTX as u32, AT_KV_LEN as u32, window, softcap,
+                        stream,
+                        qb.as_ptr(),
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ob.as_mut_ptr(),
+                        AT_HEADS as u32,
+                        AT_KV_HEADS as u32,
+                        AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32,
+                        AT_KV_LEN as u32,
+                        window,
+                        softcap,
                     ),
                     "q4_0" => sk::flash_attn_decode_q4_0_usm_raw(
-                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                        AT_MAX_CTX as u32, AT_KV_LEN as u32, window, softcap,
+                        stream,
+                        qb.as_ptr(),
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ob.as_mut_ptr(),
+                        AT_HEADS as u32,
+                        AT_KV_HEADS as u32,
+                        AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32,
+                        AT_KV_LEN as u32,
+                        window,
+                        softcap,
                     ),
                     _ => {
                         emit(name, "SKIP", "unknown-format");
@@ -3025,7 +3350,9 @@ fn probe_attn_quant_kv(
                 emit(
                     name,
                     verdict,
-                    &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50) ms={ms}"),
+                    &format!(
+                        "cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50) ms={ms}"
+                    ),
                 );
             }
         }
@@ -3075,9 +3402,18 @@ fn probe_attn_quant_kv(
         for (window, softcap) in cases {
             let mut cpu_out = vec![0f32; q.len()];
             k::gqa_attention_flash_prefill_capped_windowed(
-                &q, &kc_dq, &vc_dq, &mut cpu_out,
-                AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX,
-                AT_PREFILL_BASE, AT_PREFILL_NEW, window as usize, softcap,
+                &q,
+                &kc_dq,
+                &vc_dq,
+                &mut cpu_out,
+                AT_HEADS,
+                AT_KV_HEADS,
+                AT_HEAD_DIM,
+                AT_MAX_CTX,
+                AT_PREFILL_BASE,
+                AT_PREFILL_NEW,
+                window as usize,
+                softcap,
             );
             ob.as_mut_slice().fill(f32::NAN);
             // SAFETY: as in the decode arm; q/out are F32 [n_new*n_heads*
@@ -3085,34 +3421,79 @@ fn probe_attn_quant_kv(
             let res = unsafe {
                 match fmt.name {
                     "mxfp4" => sk::flash_attn_prefill_mxfp4_usm_raw(
-                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                        AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
-                        window, softcap,
+                        stream,
+                        qb.as_ptr(),
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ob.as_mut_ptr(),
+                        AT_HEADS as u32,
+                        AT_KV_HEADS as u32,
+                        AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32,
+                        AT_PREFILL_BASE as u32,
+                        AT_PREFILL_NEW as u32,
+                        window,
+                        softcap,
                     ),
                     "mxfp6" => sk::flash_attn_prefill_mxfp6_usm_raw(
-                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                        AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
-                        window, softcap,
+                        stream,
+                        qb.as_ptr(),
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ob.as_mut_ptr(),
+                        AT_HEADS as u32,
+                        AT_KV_HEADS as u32,
+                        AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32,
+                        AT_PREFILL_BASE as u32,
+                        AT_PREFILL_NEW as u32,
+                        window,
+                        softcap,
                     ),
                     "mxfp8" => sk::flash_attn_prefill_mxfp8_usm_raw(
-                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                        AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
-                        window, softcap,
+                        stream,
+                        qb.as_ptr(),
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ob.as_mut_ptr(),
+                        AT_HEADS as u32,
+                        AT_KV_HEADS as u32,
+                        AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32,
+                        AT_PREFILL_BASE as u32,
+                        AT_PREFILL_NEW as u32,
+                        window,
+                        softcap,
                     ),
                     "nvfp4" => sk::flash_attn_prefill_nvfp4_usm_raw(
-                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                        AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
-                        window, softcap,
+                        stream,
+                        qb.as_ptr(),
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ob.as_mut_ptr(),
+                        AT_HEADS as u32,
+                        AT_KV_HEADS as u32,
+                        AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32,
+                        AT_PREFILL_BASE as u32,
+                        AT_PREFILL_NEW as u32,
+                        window,
+                        softcap,
                     ),
                     "q4_0" => sk::flash_attn_prefill_q4_0_usm_raw(
-                        stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ob.as_mut_ptr(),
-                        AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                        AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
-                        window, softcap,
+                        stream,
+                        qb.as_ptr(),
+                        kb.as_ptr(),
+                        vb.as_ptr(),
+                        ob.as_mut_ptr(),
+                        AT_HEADS as u32,
+                        AT_KV_HEADS as u32,
+                        AT_HEAD_DIM as u32,
+                        AT_MAX_CTX as u32,
+                        AT_PREFILL_BASE as u32,
+                        AT_PREFILL_NEW as u32,
+                        window,
+                        softcap,
                     ),
                     _ => {
                         emit(name, "SKIP", "unknown-format");
@@ -3143,7 +3524,9 @@ fn probe_attn_quant_kv(
                 emit(
                     name,
                     verdict,
-                    &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50) ms={ms}"),
+                    &format!(
+                        "cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50) ms={ms}"
+                    ),
                 );
             }
         }
@@ -3205,11 +3588,29 @@ fn probe_attn_q8_0(stream: &sk::SyclStream, name: &str, dir: &str, started: Inst
     if dir == "decode" {
         let kcache = fill_kv(&mut rng, AT_KV_LEN);
         let vcache = fill_kv(&mut rng, AT_KV_LEN);
-        let q: Vec<f32> = (0..AT_HEADS * AT_HEAD_DIM).map(|_| rng.f32_pm(0.6)).collect();
-        let (kslab, ksc) = quantize_kv_q8_0(&kcache, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
-        let (vslab, vsc) = quantize_kv_q8_0(&vcache, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
-        let kdq = dequant_kv_q8_0(&kslab, &ksc, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
-        let vdq = dequant_kv_q8_0(&vslab, &vsc, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
+        let q: Vec<f32> = (0..AT_HEADS * AT_HEAD_DIM)
+            .map(|_| rng.f32_pm(0.6))
+            .collect();
+        let (kslab, ksc) =
+            quantize_kv_q8_0(&kcache, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
+        let (vslab, vsc) =
+            quantize_kv_q8_0(&vcache, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
+        let kdq = dequant_kv_q8_0(
+            &kslab,
+            &ksc,
+            AT_KV_HEADS,
+            AT_HEAD_DIM,
+            AT_MAX_CTX,
+            AT_KV_LEN,
+        );
+        let vdq = dequant_kv_q8_0(
+            &vslab,
+            &vsc,
+            AT_KV_HEADS,
+            AT_HEAD_DIM,
+            AT_MAX_CTX,
+            AT_KV_LEN,
+        );
         let (qb, kb, vb, ksb, vsb, mut ob) =
             match run(&q, &kslab, &ksc, &vslab, &vsc, AT_HEADS * AT_HEAD_DIM) {
                 Ok(t) => t,
@@ -3229,18 +3630,37 @@ fn probe_attn_q8_0(stream: &sk::SyclStream, name: &str, dir: &str, started: Inst
         for (window, softcap) in cases {
             let mut cpu_out = vec![0f32; AT_HEADS * AT_HEAD_DIM];
             k::gqa_attention_one_step_capped_windowed(
-                &q, &kdq, &vdq, &mut cpu_out,
-                AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN,
-                window as usize, softcap,
+                &q,
+                &kdq,
+                &vdq,
+                &mut cpu_out,
+                AT_HEADS,
+                AT_KV_HEADS,
+                AT_HEAD_DIM,
+                AT_MAX_CTX,
+                AT_KV_LEN,
+                window as usize,
+                softcap,
             );
             ob.as_mut_slice().fill(f32::NAN);
             // SAFETY: all USM buffers live on `stream`, sized to the geometry;
             // the kernel waits before returning.
             let res = unsafe {
                 sk::flash_attn_decode_q8_0_usm_raw(
-                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ksb.as_ptr(), vsb.as_ptr(),
-                    ob.as_mut_ptr(), AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                    AT_MAX_CTX as u32, AT_KV_LEN as u32, window, softcap,
+                    stream,
+                    qb.as_ptr(),
+                    kb.as_ptr(),
+                    vb.as_ptr(),
+                    ksb.as_ptr(),
+                    vsb.as_ptr(),
+                    ob.as_mut_ptr(),
+                    AT_HEADS as u32,
+                    AT_KV_HEADS as u32,
+                    AT_HEAD_DIM as u32,
+                    AT_MAX_CTX as u32,
+                    AT_KV_LEN as u32,
+                    window,
+                    softcap,
                 )
             };
             if let Err(e) = res {
@@ -3263,7 +3683,13 @@ fn probe_attn_q8_0(stream: &sk::SyclStream, name: &str, dir: &str, started: Inst
             Some(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
             None => {
                 let verdict = if ok_all { "OK" } else { "MISCOMPUTE" };
-                emit(name, verdict, &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50) ms={ms}"));
+                emit(
+                    name,
+                    verdict,
+                    &format!(
+                        "cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50) ms={ms}"
+                    ),
+                );
             }
         }
     } else if dir == "prefill" {
@@ -3277,14 +3703,13 @@ fn probe_attn_q8_0(stream: &sk::SyclStream, name: &str, dir: &str, started: Inst
         let (vslab, vsc) = quantize_kv_q8_0(&vcache, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
         let kdq = dequant_kv_q8_0(&kslab, &ksc, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
         let vdq = dequant_kv_q8_0(&vslab, &vsc, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
-        let (qb, kb, vb, ksb, vsb, mut ob) =
-            match run(&q, &kslab, &ksc, &vslab, &vsc, q.len()) {
-                Ok(t) => t,
-                Err(_) => {
-                    emit(name, "KERNEL_ERR", "usm-alloc-failed");
-                    return;
-                }
-            };
+        let (qb, kb, vb, ksb, vsb, mut ob) = match run(&q, &kslab, &ksc, &vslab, &vsc, q.len()) {
+            Ok(t) => t,
+            Err(_) => {
+                emit(name, "KERNEL_ERR", "usm-alloc-failed");
+                return;
+            }
+        };
         // F1: passthrough + sliding-window + Gemma2 softcap into the ONE verdict.
         let cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
         let mut ok_all = true;
@@ -3294,18 +3719,38 @@ fn probe_attn_q8_0(stream: &sk::SyclStream, name: &str, dir: &str, started: Inst
         for (window, softcap) in cases {
             let mut cpu_out = vec![0f32; q.len()];
             k::gqa_attention_flash_prefill_capped_windowed(
-                &q, &kdq, &vdq, &mut cpu_out,
-                AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_PREFILL_BASE, AT_PREFILL_NEW,
-                window as usize, softcap,
+                &q,
+                &kdq,
+                &vdq,
+                &mut cpu_out,
+                AT_HEADS,
+                AT_KV_HEADS,
+                AT_HEAD_DIM,
+                AT_MAX_CTX,
+                AT_PREFILL_BASE,
+                AT_PREFILL_NEW,
+                window as usize,
+                softcap,
             );
             ob.as_mut_slice().fill(f32::NAN);
             // SAFETY: as the decode arm, q/out sized for AT_PREFILL_NEW queries.
             let res = unsafe {
                 sk::flash_attn_prefill_q8_0_usm_raw(
-                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ksb.as_ptr(), vsb.as_ptr(),
-                    ob.as_mut_ptr(), AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
-                    AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
-                    window, softcap,
+                    stream,
+                    qb.as_ptr(),
+                    kb.as_ptr(),
+                    vb.as_ptr(),
+                    ksb.as_ptr(),
+                    vsb.as_ptr(),
+                    ob.as_mut_ptr(),
+                    AT_HEADS as u32,
+                    AT_KV_HEADS as u32,
+                    AT_HEAD_DIM as u32,
+                    AT_MAX_CTX as u32,
+                    AT_PREFILL_BASE as u32,
+                    AT_PREFILL_NEW as u32,
+                    window,
+                    softcap,
                 )
             };
             if let Err(e) = res {
@@ -3328,7 +3773,13 @@ fn probe_attn_q8_0(stream: &sk::SyclStream, name: &str, dir: &str, started: Inst
             Some(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
             None => {
                 let verdict = if ok_all { "OK" } else { "MISCOMPUTE" };
-                emit(name, verdict, &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50) ms={ms}"));
+                emit(
+                    name,
+                    verdict,
+                    &format!(
+                        "cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50) ms={ms}"
+                    ),
+                );
             }
         }
     } else {
@@ -3386,11 +3837,43 @@ fn probe_attn_tq(stream: &sk::SyclStream, name: &str, dir: &str, started: Instan
     if dir == "decode" {
         let kcache = fill_kv(&mut rng, AT_KV_LEN);
         let vcache = fill_kv(&mut rng, AT_KV_LEN);
-        let q: Vec<f32> = (0..AT_HEADS * AT_HEAD_DIM).map(|_| rng.f32_pm(0.6)).collect();
-        let (kslab, ksc) = quantize_kv_tq(&kcache, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
-        let (vslab, vsc) = quantize_kv_tq(&vcache, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
-        let kdq = dequant_kv_tq(&kslab, &ksc, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
-        let vdq = dequant_kv_tq(&vslab, &vsc, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN);
+        let q: Vec<f32> = (0..AT_HEADS * AT_HEAD_DIM)
+            .map(|_| rng.f32_pm(0.6))
+            .collect();
+        let (kslab, ksc) = quantize_kv_tq(
+            &kcache,
+            bits,
+            AT_KV_HEADS,
+            AT_HEAD_DIM,
+            AT_MAX_CTX,
+            AT_KV_LEN,
+        );
+        let (vslab, vsc) = quantize_kv_tq(
+            &vcache,
+            bits,
+            AT_KV_HEADS,
+            AT_HEAD_DIM,
+            AT_MAX_CTX,
+            AT_KV_LEN,
+        );
+        let kdq = dequant_kv_tq(
+            &kslab,
+            &ksc,
+            bits,
+            AT_KV_HEADS,
+            AT_HEAD_DIM,
+            AT_MAX_CTX,
+            AT_KV_LEN,
+        );
+        let vdq = dequant_kv_tq(
+            &vslab,
+            &vsc,
+            bits,
+            AT_KV_HEADS,
+            AT_HEAD_DIM,
+            AT_MAX_CTX,
+            AT_KV_LEN,
+        );
         let (qb, kb, vb, ksb, vsb, mut ob) =
             match run(&q, &kslab, &ksc, &vslab, &vsc, AT_HEADS * AT_HEAD_DIM) {
                 Ok(t) => t,
@@ -3408,18 +3891,38 @@ fn probe_attn_tq(stream: &sk::SyclStream, name: &str, dir: &str, started: Instan
         for (window, softcap) in cases {
             let mut cpu_out = vec![0f32; AT_HEADS * AT_HEAD_DIM];
             k::gqa_attention_one_step_capped_windowed(
-                &q, &kdq, &vdq, &mut cpu_out,
-                AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_KV_LEN,
-                window as usize, softcap,
+                &q,
+                &kdq,
+                &vdq,
+                &mut cpu_out,
+                AT_HEADS,
+                AT_KV_HEADS,
+                AT_HEAD_DIM,
+                AT_MAX_CTX,
+                AT_KV_LEN,
+                window as usize,
+                softcap,
             );
             ob.as_mut_slice().fill(f32::NAN);
             // SAFETY: all USM buffers live on `stream`, sized to the geometry;
             // the kernel waits before returning.
             let res = unsafe {
                 sk::flash_attn_decode_tq_usm_raw(
-                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ksb.as_ptr(), vsb.as_ptr(),
-                    bits as u32, ob.as_mut_ptr(), AT_HEADS as u32, AT_KV_HEADS as u32,
-                    AT_HEAD_DIM as u32, AT_MAX_CTX as u32, AT_KV_LEN as u32, window, softcap,
+                    stream,
+                    qb.as_ptr(),
+                    kb.as_ptr(),
+                    vb.as_ptr(),
+                    ksb.as_ptr(),
+                    vsb.as_ptr(),
+                    bits as u32,
+                    ob.as_mut_ptr(),
+                    AT_HEADS as u32,
+                    AT_KV_HEADS as u32,
+                    AT_HEAD_DIM as u32,
+                    AT_MAX_CTX as u32,
+                    AT_KV_LEN as u32,
+                    window,
+                    softcap,
                 )
             };
             if let Err(e) = res {
@@ -3452,18 +3955,35 @@ fn probe_attn_tq(stream: &sk::SyclStream, name: &str, dir: &str, started: Instan
         let q: Vec<f32> = (0..AT_PREFILL_NEW * AT_HEADS * AT_HEAD_DIM)
             .map(|_| rng.f32_pm(0.6))
             .collect();
-        let (kslab, ksc) = quantize_kv_tq(&kcache, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
-        let (vslab, vsc) = quantize_kv_tq(&vcache, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
-        let kdq = dequant_kv_tq(&kslab, &ksc, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
-        let vdq = dequant_kv_tq(&vslab, &vsc, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
-        let (qb, kb, vb, ksb, vsb, mut ob) =
-            match run(&q, &kslab, &ksc, &vslab, &vsc, q.len()) {
-                Ok(t) => t,
-                Err(_) => {
-                    emit(name, "KERNEL_ERR", "usm-alloc-failed");
-                    return;
-                }
-            };
+        let (kslab, ksc) =
+            quantize_kv_tq(&kcache, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
+        let (vslab, vsc) =
+            quantize_kv_tq(&vcache, bits, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, upto);
+        let kdq = dequant_kv_tq(
+            &kslab,
+            &ksc,
+            bits,
+            AT_KV_HEADS,
+            AT_HEAD_DIM,
+            AT_MAX_CTX,
+            upto,
+        );
+        let vdq = dequant_kv_tq(
+            &vslab,
+            &vsc,
+            bits,
+            AT_KV_HEADS,
+            AT_HEAD_DIM,
+            AT_MAX_CTX,
+            upto,
+        );
+        let (qb, kb, vb, ksb, vsb, mut ob) = match run(&q, &kslab, &ksc, &vslab, &vsc, q.len()) {
+            Ok(t) => t,
+            Err(_) => {
+                emit(name, "KERNEL_ERR", "usm-alloc-failed");
+                return;
+            }
+        };
         // F1: passthrough + sliding-window + Gemma2 softcap into the ONE verdict.
         let cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
         let mut ok_all = true;
@@ -3473,18 +3993,39 @@ fn probe_attn_tq(stream: &sk::SyclStream, name: &str, dir: &str, started: Instan
         for (window, softcap) in cases {
             let mut cpu_out = vec![0f32; q.len()];
             k::gqa_attention_flash_prefill_capped_windowed(
-                &q, &kdq, &vdq, &mut cpu_out,
-                AT_HEADS, AT_KV_HEADS, AT_HEAD_DIM, AT_MAX_CTX, AT_PREFILL_BASE, AT_PREFILL_NEW,
-                window as usize, softcap,
+                &q,
+                &kdq,
+                &vdq,
+                &mut cpu_out,
+                AT_HEADS,
+                AT_KV_HEADS,
+                AT_HEAD_DIM,
+                AT_MAX_CTX,
+                AT_PREFILL_BASE,
+                AT_PREFILL_NEW,
+                window as usize,
+                softcap,
             );
             ob.as_mut_slice().fill(f32::NAN);
             // SAFETY: as the decode arm, q/out sized for AT_PREFILL_NEW queries.
             let res = unsafe {
                 sk::flash_attn_prefill_tq_usm_raw(
-                    stream, qb.as_ptr(), kb.as_ptr(), vb.as_ptr(), ksb.as_ptr(), vsb.as_ptr(),
-                    bits as u32, ob.as_mut_ptr(), AT_HEADS as u32, AT_KV_HEADS as u32,
-                    AT_HEAD_DIM as u32, AT_MAX_CTX as u32, AT_PREFILL_BASE as u32, AT_PREFILL_NEW as u32,
-                    window, softcap,
+                    stream,
+                    qb.as_ptr(),
+                    kb.as_ptr(),
+                    vb.as_ptr(),
+                    ksb.as_ptr(),
+                    vsb.as_ptr(),
+                    bits as u32,
+                    ob.as_mut_ptr(),
+                    AT_HEADS as u32,
+                    AT_KV_HEADS as u32,
+                    AT_HEAD_DIM as u32,
+                    AT_MAX_CTX as u32,
+                    AT_PREFILL_BASE as u32,
+                    AT_PREFILL_NEW as u32,
+                    window,
+                    softcap,
                 )
             };
             if let Err(e) = res {
@@ -3781,9 +4322,13 @@ fn cu_tc_gemm_probe(
     // buffers on `stream`; the wrappers synchronize before returning.
     let res = unsafe {
         match which {
-            TcGemm::Nvfp4 => ck::gemm_fp4_tc_f32(ck::CudaFp4TcKind::Nvfp4, stream, wp, xp, op, m, n, k),
+            TcGemm::Nvfp4 => {
+                ck::gemm_fp4_tc_f32(ck::CudaFp4TcKind::Nvfp4, stream, wp, xp, op, m, n, k)
+            }
             TcGemm::Nvfp4Tma => ck::gemm_nvfp4_tc_tma_f32(stream, wp, xp, op, m, n, k),
-            TcGemm::Mxfp4 => ck::gemm_fp4_tc_f32(ck::CudaFp4TcKind::Mxfp4, stream, wp, xp, op, m, n, k),
+            TcGemm::Mxfp4 => {
+                ck::gemm_fp4_tc_f32(ck::CudaFp4TcKind::Mxfp4, stream, wp, xp, op, m, n, k)
+            }
             TcGemm::Mxfp8 => ck::gemm_mxfp8_tc_f32(stream, wp, xp, op, m, n, k),
             TcGemm::Mxfp6 => ck::gemm_mxfp6_tc_f32(stream, wp, xp, op, m, n, k),
             TcGemm::Fp8Wgmma => ck::gemm_mxfp8_wgmma_f32(stream, wp, xp, op, m, n, k, false),
@@ -4067,10 +4612,9 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
     // K constraints (ptq1_0 %128, q8_0/q4_0/q5_0/q4_1/q5_1 %32, the K-quants
     // %256) are all satisfied by MV_K=2048.
     for dtype in [
-        "ptq1_0", "q8_0", "q4_k", "q6_k", "mxfp4", "mxfp6", "mxfp8", "q5_k",
-        "iq4_nl", "iq4_xs", "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs", "iq2_s",
-        "iq3_xxs", "iq3_s", "q4_0", "q5_0", "q4_1", "q5_1", "q2_k", "q3_k",
-        "q8_k", "pq2_0",
+        "ptq1_0", "q8_0", "q4_k", "q6_k", "mxfp4", "mxfp6", "mxfp8", "q5_k", "iq4_nl", "iq4_xs",
+        "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "q4_0", "q5_0", "q4_1",
+        "q5_1", "q2_k", "q3_k", "q8_k", "pq2_0",
     ] {
         let name = format!("matvec:{dtype}");
         let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
@@ -4251,10 +4795,9 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
     // the CPU reference run per-row. (Q4_K's prefill GEMM is graded separately as
     // `gemm:q4_k_f32`; this grades the generic batched matvec path.)
     for dtype in [
-        "ptq1_0", "q8_0", "q4_k", "q6_k", "mxfp4", "mxfp6", "mxfp8", "q5_k",
-        "iq4_nl", "iq4_xs", "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs", "iq2_s",
-        "iq3_xxs", "iq3_s", "q4_0", "q5_0", "q4_1", "q5_1", "q2_k", "q3_k",
-        "q8_k", "pq2_0",
+        "ptq1_0", "q8_0", "q4_k", "q6_k", "mxfp4", "mxfp6", "mxfp8", "q5_k", "iq4_nl", "iq4_xs",
+        "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "q4_0", "q5_0", "q4_1",
+        "q5_1", "q2_k", "q3_k", "q8_k", "pq2_0",
     ] {
         let name = format!("matvecb:{dtype}");
         let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
@@ -4298,7 +4841,9 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             let x = xb.as_ptr() as *const f32;
             let o = ob.as_mut_ptr() as *mut f32;
             match dtype {
-                "ptq1_0" => ck::matvec_ptq1_0_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "ptq1_0" => {
+                    ck::matvec_ptq1_0_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N)
+                }
                 "q8_0" => ck::matvec_q8_0_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
                 "q4_k" => ck::matvec_q4_k_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
                 "q6_k" => ck::matvec_q6_k_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
@@ -4306,14 +4851,24 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 "mxfp6" => ck::matvec_mxfp6_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
                 "mxfp8" => ck::matvec_mxfp8_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
                 "q5_k" => ck::matvec_q5_k_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
-                "iq4_nl" => ck::matvec_iq4_nl_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
-                "iq4_xs" => ck::matvec_iq4_xs_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "iq4_nl" => {
+                    ck::matvec_iq4_nl_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N)
+                }
+                "iq4_xs" => {
+                    ck::matvec_iq4_xs_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N)
+                }
                 "iq1_s" => ck::matvec_iq1_s_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
                 "iq1_m" => ck::matvec_iq1_m_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
-                "iq2_xxs" => ck::matvec_iq2_xxs_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
-                "iq2_xs" => ck::matvec_iq2_xs_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "iq2_xxs" => {
+                    ck::matvec_iq2_xxs_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N)
+                }
+                "iq2_xs" => {
+                    ck::matvec_iq2_xs_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N)
+                }
                 "iq2_s" => ck::matvec_iq2_s_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
-                "iq3_xxs" => ck::matvec_iq3_xxs_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
+                "iq3_xxs" => {
+                    ck::matvec_iq3_xxs_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N)
+                }
                 "iq3_s" => ck::matvec_iq3_s_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
                 "q4_0" => ck::matvec_q4_0_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
                 "q5_0" => ck::matvec_q5_0_packed_f32_batched(&stream, w, x, o, MV_M, MV_K, MV_N),
@@ -4348,8 +4903,8 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
     // against two independent CPU matvecs (distinct gate/up weights), confirming
     // the dual-output write + the fusion wiring. Same 14 formats as SYCL.
     for dtype in [
-        "q8_0", "q4_k", "q6_k", "q5_k", "iq4_nl", "iq4_xs", "iq1_s", "iq1_m",
-        "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "ptq1_0",
+        "q8_0", "q4_k", "q6_k", "q5_k", "iq4_nl", "iq4_xs", "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs",
+        "iq2_s", "iq3_xxs", "iq3_s", "ptq1_0",
     ] {
         let name = format!("fused:{dtype}");
         let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
@@ -4393,16 +4948,28 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 "q4_k" => ck::matvec_q4_k_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
                 "q6_k" => ck::matvec_q6_k_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
                 "q5_k" => ck::matvec_q5_k_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
-                "iq4_nl" => ck::matvec_iq4_nl_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
-                "iq4_xs" => ck::matvec_iq4_xs_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
+                "iq4_nl" => {
+                    ck::matvec_iq4_nl_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K)
+                }
+                "iq4_xs" => {
+                    ck::matvec_iq4_xs_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K)
+                }
                 "iq1_s" => ck::matvec_iq1_s_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
                 "iq1_m" => ck::matvec_iq1_m_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
-                "iq2_xxs" => ck::matvec_iq2_xxs_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
-                "iq2_xs" => ck::matvec_iq2_xs_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
+                "iq2_xxs" => {
+                    ck::matvec_iq2_xxs_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K)
+                }
+                "iq2_xs" => {
+                    ck::matvec_iq2_xs_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K)
+                }
                 "iq2_s" => ck::matvec_iq2_s_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
-                "iq3_xxs" => ck::matvec_iq3_xxs_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
+                "iq3_xxs" => {
+                    ck::matvec_iq3_xxs_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K)
+                }
                 "iq3_s" => ck::matvec_iq3_s_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
-                "ptq1_0" => ck::matvec_ptq1_0_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K),
+                "ptq1_0" => {
+                    ck::matvec_ptq1_0_gate_up_fused(&stream, gw, uw, xp, go, uo, MV_M, MV_K)
+                }
                 _ => unreachable!(),
             }
         };
@@ -4428,8 +4995,8 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
     // ANDs this with the bare `fused:` parity above, so a generic-GEMM pass alone
     // cannot re-enable the 2026-09-06 incident path.
     for dtype in [
-        "q8_0", "q4_k", "q6_k", "q5_k", "iq4_nl", "iq4_xs", "iq1_s", "iq1_m",
-        "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "ptq1_0",
+        "q8_0", "q4_k", "q6_k", "q5_k", "iq4_nl", "iq4_xs", "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs",
+        "iq2_s", "iq3_xxs", "iq3_s", "ptq1_0",
     ] {
         let name = format!("moe:gate_up_coherent:{dtype}");
         let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
@@ -4587,7 +5154,11 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         // (1) Correctness — bit-exact vs the f32 Q4_K matvec reference.
         let (cos, max_rel) = compare(&cu_download_f32(&ob, GEMM_N * MV_M), &cpu_out);
         if !(cos > 0.999 && max_rel < 0.02) {
-            cu_emit(name, "MISCOMPUTE", &format!("cos={cos:.6} max_rel={max_rel:.4}"));
+            cu_emit(
+                name,
+                "MISCOMPUTE",
+                &format!("cos={cos:.6} max_rel={max_rel:.4}"),
+            );
             *counts.entry("MISCOMPUTE").or_default() += 1;
             continue;
         }
@@ -4701,7 +5272,11 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
         let (cos, max_rel) = compare(&cu_download_f32(&ob, TC_N * MV_M), &cpu_out);
         if !(cos > 0.999 && max_rel < 0.05) {
-            cu_emit(name, "MISCOMPUTE", &format!("cos={cos:.6} max_rel={max_rel:.4}"));
+            cu_emit(
+                name,
+                "MISCOMPUTE",
+                &format!("cos={cos:.6} max_rel={max_rel:.4}"),
+            );
             *counts.entry("MISCOMPUTE").or_default() += 1;
             continue;
         }
@@ -4808,7 +5383,11 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
         let (cos, max_rel) = compare(&cu_download_f32(&ob, MV_M), &cpu_out);
         if !(cos > 0.999 && max_rel < 0.05) {
-            cu_emit(name, "MISCOMPUTE", &format!("cos={cos:.6} max_rel={max_rel:.4}"));
+            cu_emit(
+                name,
+                "MISCOMPUTE",
+                &format!("cos={cos:.6} max_rel={max_rel:.4}"),
+            );
             *counts.entry("MISCOMPUTE").or_default() += 1;
             continue;
         }
@@ -4877,40 +5456,106 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
     // header is what this probe exists to check.
     if !ck::blackwell_tc_available(0) {
         for nm in [
-            "gemm:nvfp4_tc(W4A4)", "gemm:nvfp4_tc_tma(W4A4)", "gemm:mxfp4_tc(W4A4)",
-            "gemm:mxfp8_tc(W8A8)", "gemm:mxfp6_tc(W6A6)", "gemm:fp8_sp24(2:4)",
+            "gemm:nvfp4_tc(W4A4)",
+            "gemm:nvfp4_tc_tma(W4A4)",
+            "gemm:mxfp4_tc(W4A4)",
+            "gemm:mxfp8_tc(W8A8)",
+            "gemm:mxfp6_tc(W6A6)",
+            "gemm:fp8_sp24(2:4)",
         ] {
             cu_emit(nm, "SKIP", "not-sm12x-blackwell-or-no-tc-build");
             *counts.entry("SKIP").or_default() += 1;
         }
     } else {
         let (m, kd, n) = (64usize, 128usize, 16usize); // K % 64 == 0 (and % 32)
-        // NVFP4 weight: quantize random f32 → valid per-16 E4M3 blocks.
+                                                       // NVFP4 weight: quantize random f32 → valid per-16 E4M3 blocks.
         let wsrc = gen_x(m * kd, 77);
         let mut wnv = vec![0u8; m * (kd / 16) * 9];
         k::nvfp4::quantize_matrix(m, kd, &wsrc, &mut wnv);
         cu_tc_gemm_probe(
-            &stream, "gemm:nvfp4_tc(W4A4)", TcGemm::Nvfp4, &wnv,
-            k::nvfp4::matvec_nvfp4_w_f32_a, m, kd, n, &mut counts,
+            &stream,
+            "gemm:nvfp4_tc(W4A4)",
+            TcGemm::Nvfp4,
+            &wnv,
+            k::nvfp4::matvec_nvfp4_w_f32_a,
+            m,
+            kd,
+            n,
+            &mut counts,
         );
         // TMA-staged NVFP4 (Phase 4): same weight/ref, cp.async.bulk staging.
         cu_tc_gemm_probe(
-            &stream, "gemm:nvfp4_tc_tma(W4A4)", TcGemm::Nvfp4Tma, &wnv,
-            k::nvfp4::matvec_nvfp4_w_f32_a, m, kd, n, &mut counts,
+            &stream,
+            "gemm:nvfp4_tc_tma(W4A4)",
+            TcGemm::Nvfp4Tma,
+            &wnv,
+            k::nvfp4::matvec_nvfp4_w_f32_a,
+            m,
+            kd,
+            n,
+            &mut counts,
         );
         // MXFP4/6/8 weights: reuse the harness's valid-byte synth (E8M0 blocks).
-        let wmx4 = gen_quant_bytes(LAYOUTS.iter().find(|l| l.name == "mxfp4").unwrap(), m, kd, 0xC0FFEE);
-        cu_tc_gemm_probe(&stream, "gemm:mxfp4_tc(W4A4)", TcGemm::Mxfp4, &wmx4, k::mxfp::matvec_mxfp4_w_f32_a, m, kd, n, &mut counts);
-        let wmx8 = gen_quant_bytes(LAYOUTS.iter().find(|l| l.name == "mxfp8").unwrap(), m, kd, 0xBEEF11);
-        cu_tc_gemm_probe(&stream, "gemm:mxfp8_tc(W8A8)", TcGemm::Mxfp8, &wmx8, k::mxfp::matvec_mxfp8_w_f32_a, m, kd, n, &mut counts);
-        let wmx6 = gen_quant_bytes(LAYOUTS.iter().find(|l| l.name == "mxfp6").unwrap(), m, kd, 0xBEEF22);
-        cu_tc_gemm_probe(&stream, "gemm:mxfp6_tc(W6A6)", TcGemm::Mxfp6, &wmx6, k::mxfp::matvec_mxfp6_w_f32_a, m, kd, n, &mut counts);
+        let wmx4 = gen_quant_bytes(
+            LAYOUTS.iter().find(|l| l.name == "mxfp4").unwrap(),
+            m,
+            kd,
+            0xC0FFEE,
+        );
+        cu_tc_gemm_probe(
+            &stream,
+            "gemm:mxfp4_tc(W4A4)",
+            TcGemm::Mxfp4,
+            &wmx4,
+            k::mxfp::matvec_mxfp4_w_f32_a,
+            m,
+            kd,
+            n,
+            &mut counts,
+        );
+        let wmx8 = gen_quant_bytes(
+            LAYOUTS.iter().find(|l| l.name == "mxfp8").unwrap(),
+            m,
+            kd,
+            0xBEEF11,
+        );
+        cu_tc_gemm_probe(
+            &stream,
+            "gemm:mxfp8_tc(W8A8)",
+            TcGemm::Mxfp8,
+            &wmx8,
+            k::mxfp::matvec_mxfp8_w_f32_a,
+            m,
+            kd,
+            n,
+            &mut counts,
+        );
+        let wmx6 = gen_quant_bytes(
+            LAYOUTS.iter().find(|l| l.name == "mxfp6").unwrap(),
+            m,
+            kd,
+            0xBEEF22,
+        );
+        cu_tc_gemm_probe(
+            &stream,
+            "gemm:mxfp6_tc(W6A6)",
+            TcGemm::Mxfp6,
+            &wmx6,
+            k::mxfp::matvec_mxfp6_w_f32_a,
+            m,
+            kd,
+            n,
+            &mut counts,
+        );
 
         // 2:4 structured-sparse FP8 (Phase 5). Dense E4M3 weight; pruned
         // on-device. Graded vs the 2:4-pruned dense reference (loose: the GPU
         // path also E4M3-quantizes the activation). This probe is what reveals
         // whether the compressed-A / metadata layout is right on the Spark.
-        let wsp: Vec<u8> = gen_x(m * kd, 97).iter().map(|&v| k::nvfp4::f32_to_e4m3(v)).collect();
+        let wsp: Vec<u8> = gen_x(m * kd, 97)
+            .iter()
+            .map(|&v| k::nvfp4::f32_to_e4m3(v))
+            .collect();
         let xsp = gen_x(n * kd, 131);
         let cpu_sp = sp24_ref(&wsp, &xsp, m, kd, n);
         if let (Some(wb), Some(xb), Some(mut ob)) = (
@@ -4921,8 +5566,13 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             // SAFETY: wb (M·K E4M3 bytes), xb (N·K f32), ob (N·M f32) live on stream.
             let res = unsafe {
                 ck::gemm_fp8_sp24_f32(
-                    &stream, wb.as_ptr(), xb.as_ptr() as *const f32,
-                    ob.as_mut_ptr() as *mut f32, m, n, kd,
+                    &stream,
+                    wb.as_ptr(),
+                    xb.as_ptr() as *const f32,
+                    ob.as_mut_ptr() as *mut f32,
+                    m,
+                    n,
+                    kd,
                 )
             };
             match res {
@@ -4930,7 +5580,14 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                     cu_emit("gemm:fp8_sp24(2:4)", "KERNEL_ERR", &format!("{e}"));
                     *counts.entry("KERNEL_ERR").or_default() += 1;
                 }
-                Ok(()) => cu_grade("gemm:fp8_sp24(2:4)", &cu_download_f32(&ob, n * m), &cpu_sp, 0.85, 0.60, &mut counts),
+                Ok(()) => cu_grade(
+                    "gemm:fp8_sp24(2:4)",
+                    &cu_download_f32(&ob, n * m),
+                    &cpu_sp,
+                    0.85,
+                    0.60,
+                    &mut counts,
+                ),
             }
         }
     }
@@ -5035,8 +5692,14 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             k::delta_net::l2norm_f32_inplace(&mut q[row * QK..(row + 1) * QK], 1e-6);
             k::delta_net::l2norm_f32_inplace(&mut kk[row * QK..(row + 1) * QK], 1e-6);
         }
-        let g: Vec<f32> = gen_x(H * T, 74).iter().map(|x| -0.05 - 0.25 * x.abs()).collect();
-        let beta: Vec<f32> = gen_x(H * T, 75).iter().map(|x| 0.1 + 0.8 * x.abs()).collect();
+        let g: Vec<f32> = gen_x(H * T, 74)
+            .iter()
+            .map(|x| -0.05 - 0.25 * x.abs())
+            .collect();
+        let beta: Vec<f32> = gen_x(H * T, 75)
+            .iter()
+            .map(|x| 0.1 + 0.8 * x.abs())
+            .collect();
         let mut cpu_out = vec![0f32; H * T * VD];
         let mut cpu_state = vec![0f32; H * QK * VD];
         for h in 0..H {
@@ -5057,14 +5720,32 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         let mut gpu_out = vec![0f32; H * T * VD];
         let mut gpu_state = vec![0f32; H * QK * VD];
         match ck::delta_net_chunk_f32(
-            &q, &kk, &v, &g, &beta, &mut gpu_state, &mut gpu_out, H, T, QK, VD, L0,
+            &q,
+            &kk,
+            &v,
+            &g,
+            &beta,
+            &mut gpu_state,
+            &mut gpu_out,
+            H,
+            T,
+            QK,
+            VD,
+            L0,
         ) {
             Ok(()) => {
                 let mut gpu_all = gpu_out.clone();
                 gpu_all.extend_from_slice(&gpu_state);
                 let mut cpu_all = cpu_out.clone();
                 cpu_all.extend_from_slice(&cpu_state);
-                cu_grade("ssm:delta_net", &gpu_all, &cpu_all, 0.999, 0.02, &mut counts);
+                cu_grade(
+                    "ssm:delta_net",
+                    &gpu_all,
+                    &cpu_all,
+                    0.999,
+                    0.02,
+                    &mut counts,
+                );
             }
             Err(e) => {
                 cu_emit("ssm:delta_net", "KERNEL_ERR", &format!("{e}"));
@@ -5232,17 +5913,33 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             for (window, softcap) in dec_cases {
                 let mut cpu = vec![0f32; n_heads * head_dim];
                 k::gqa_attention_flash_decode_capped_windowed(
-                    &q, &kc, &vc, &mut cpu,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                    window as usize, softcap,
+                    &q,
+                    &kc,
+                    &vc,
+                    &mut cpu,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len,
+                    window as usize,
+                    softcap,
                 );
                 // SAFETY: q/out [n_heads*head_dim], k/v [n_kv_heads*max_ctx*head_dim] device f32.
                 let res = unsafe {
                     ck::flash_attn_decode_f32(
-                        &stream, qb.as_ptr() as *const f32, kb.as_ptr() as *const f32,
-                        vb.as_ptr() as *const f32, ob.as_mut_ptr() as *mut f32,
-                        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                        window as i32, softcap,
+                        &stream,
+                        qb.as_ptr() as *const f32,
+                        kb.as_ptr() as *const f32,
+                        vb.as_ptr() as *const f32,
+                        ob.as_mut_ptr() as *mut f32,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_len,
+                        window as i32,
+                        softcap,
                     )
                 };
                 if let Err(e) = res {
@@ -5259,8 +5956,11 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                     *counts.entry("KERNEL_ERR").or_default() += 1;
                 }
                 None => {
-                    let key: &'static str =
-                        if worst_cos > 0.999 && worst_rel < 0.02 { "OK" } else { "MISCOMPUTE" };
+                    let key: &'static str = if worst_cos > 0.999 && worst_rel < 0.02 {
+                        "OK"
+                    } else {
+                        "MISCOMPUTE"
+                    };
                     *counts.entry(key).or_default() += 1;
                     cu_emit(
                         "attn:decode",
@@ -5287,17 +5987,35 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             for (window, softcap) in pre_cases {
                 let mut cpu_p = vec![0f32; n_new * n_heads * head_dim];
                 k::gqa_attention_flash_prefill_capped_windowed(
-                    &qp, &kc, &vc, &mut cpu_p,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                    window as usize, softcap,
+                    &qp,
+                    &kc,
+                    &vc,
+                    &mut cpu_p,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_base,
+                    n_new,
+                    window as usize,
+                    softcap,
                 );
                 // SAFETY: q/out [n_new*n_heads*head_dim], k/v caches device f32.
                 let res = unsafe {
                     ck::flash_attn_prefill_f32(
-                        &stream, qb.as_ptr() as *const f32, kb.as_ptr() as *const f32,
-                        vb.as_ptr() as *const f32, ob.as_mut_ptr() as *mut f32,
-                        n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                        window as i32, softcap,
+                        &stream,
+                        qb.as_ptr() as *const f32,
+                        kb.as_ptr() as *const f32,
+                        vb.as_ptr() as *const f32,
+                        ob.as_mut_ptr() as *mut f32,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_base,
+                        n_new,
+                        window as i32,
+                        softcap,
                     )
                 };
                 if let Err(e) = res {
@@ -5315,8 +6033,11 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                     *counts.entry("KERNEL_ERR").or_default() += 1;
                 }
                 None => {
-                    let key: &'static str =
-                        if worst_cos > 0.999 && worst_rel < 0.02 { "OK" } else { "MISCOMPUTE" };
+                    let key: &'static str = if worst_cos > 0.999 && worst_rel < 0.02 {
+                        "OK"
+                    } else {
+                        "MISCOMPUTE"
+                    };
                     *counts.entry(key).or_default() += 1;
                     cu_emit(
                         "attn:prefill",
@@ -5376,9 +6097,7 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                     let _ = cu_download_f32(&ob, tnew * th * thd);
                     let gpu_ms = t0.elapsed().as_secs_f64() * 1000.0 / ITERS as f64;
                     let c0 = Instant::now();
-                    let _ = ref_flash_prefill(
-                        &q, &kc, &vc, th, tkv, thd, tmax, kv_base, tnew,
-                    );
+                    let _ = ref_flash_prefill(&q, &kc, &vc, th, tkv, thd, tmax, kv_base, tnew);
                     let cpu_ms = c0.elapsed().as_secs_f64() * 1000.0;
                     let speedup = if gpu_ms > 0.0 { cpu_ms / gpu_ms } else { 0.0 };
                     println!(
@@ -5447,9 +6166,17 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 for (window, softcap) in dec_cases {
                     let mut cpu_dec = vec![0f32; n_heads * head_dim];
                     k::gqa_attention_flash_decode_capped_windowed(
-                        &q, &kc_dq, &vc_dq, &mut cpu_dec,
-                        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                        window as usize, softcap,
+                        &q,
+                        &kc_dq,
+                        &vc_dq,
+                        &mut cpu_dec,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_len,
+                        window as usize,
+                        softcap,
                     );
                     // SAFETY: q/out are F32 device buffers [n_heads*head_dim];
                     // k/v are packed device buffers [n_kv_heads*max_ctx*
@@ -5461,24 +6188,74 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                         let o = ob.as_mut_ptr() as *mut f32;
                         match fmt.name {
                             "mxfp4" => ck::flash_attn_decode_mxfp4(
-                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                                window as i32, softcap,
+                                &stream,
+                                q,
+                                k,
+                                v,
+                                o,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                max_ctx,
+                                kv_len,
+                                window as i32,
+                                softcap,
                             ),
                             "mxfp6" => ck::flash_attn_decode_mxfp6(
-                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                                window as i32, softcap,
+                                &stream,
+                                q,
+                                k,
+                                v,
+                                o,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                max_ctx,
+                                kv_len,
+                                window as i32,
+                                softcap,
                             ),
                             "mxfp8" => ck::flash_attn_decode_mxfp8(
-                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                                window as i32, softcap,
+                                &stream,
+                                q,
+                                k,
+                                v,
+                                o,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                max_ctx,
+                                kv_len,
+                                window as i32,
+                                softcap,
                             ),
                             "nvfp4" => ck::flash_attn_decode_nvfp4(
-                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                                window as i32, softcap,
+                                &stream,
+                                q,
+                                k,
+                                v,
+                                o,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                max_ctx,
+                                kv_len,
+                                window as i32,
+                                softcap,
                             ),
                             "q4_0" => ck::flash_attn_decode_q4_0(
-                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                                window as i32, softcap,
+                                &stream,
+                                q,
+                                k,
+                                v,
+                                o,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                max_ctx,
+                                kv_len,
+                                window as i32,
+                                softcap,
                             ),
                             _ => unreachable!(),
                         }
@@ -5487,7 +6264,8 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                         err = Some(format!("{e}"));
                         break;
                     }
-                    let (cos, max_rel) = compare(&cu_download_f32(&ob, n_heads * head_dim), &cpu_dec);
+                    let (cos, max_rel) =
+                        compare(&cu_download_f32(&ob, n_heads * head_dim), &cpu_dec);
                     worst_cos = worst_cos.min(cos);
                     worst_rel = worst_rel.max(max_rel);
                 }
@@ -5497,16 +6275,19 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                         *counts.entry("KERNEL_ERR").or_default() += 1;
                     }
                     None => {
-                        let key: &'static str = if worst_cos > fmt.cos_min && worst_rel < fmt.rel_max {
-                            "OK"
-                        } else {
-                            "MISCOMPUTE"
-                        };
+                        let key: &'static str =
+                            if worst_cos > fmt.cos_min && worst_rel < fmt.rel_max {
+                                "OK"
+                            } else {
+                                "MISCOMPUTE"
+                            };
                         *counts.entry(key).or_default() += 1;
                         cu_emit(
                             &dname,
                             key,
-                            &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"),
+                            &format!(
+                                "cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"
+                            ),
                         );
                     }
                 }
@@ -5526,9 +6307,18 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 for (window, softcap) in pre_cases {
                     let mut cpu_pre = vec![0f32; n_new * n_heads * head_dim];
                     k::gqa_attention_flash_prefill_capped_windowed(
-                        &qp, &kc_dq, &vc_dq, &mut cpu_pre,
-                        n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                        window as usize, softcap,
+                        &qp,
+                        &kc_dq,
+                        &vc_dq,
+                        &mut cpu_pre,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_base,
+                        n_new,
+                        window as usize,
+                        softcap,
                     );
                     // SAFETY: q/out F32 [n_new*n_heads*head_dim]; k/v packed as above.
                     let res = unsafe {
@@ -5538,24 +6328,79 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                         let o = ob.as_mut_ptr() as *mut f32;
                         match fmt.name {
                             "mxfp4" => ck::flash_attn_prefill_mxfp4(
-                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base,
-                                n_new, window as i32, softcap,
+                                &stream,
+                                q,
+                                k,
+                                v,
+                                o,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                max_ctx,
+                                kv_base,
+                                n_new,
+                                window as i32,
+                                softcap,
                             ),
                             "mxfp6" => ck::flash_attn_prefill_mxfp6(
-                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base,
-                                n_new, window as i32, softcap,
+                                &stream,
+                                q,
+                                k,
+                                v,
+                                o,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                max_ctx,
+                                kv_base,
+                                n_new,
+                                window as i32,
+                                softcap,
                             ),
                             "mxfp8" => ck::flash_attn_prefill_mxfp8(
-                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base,
-                                n_new, window as i32, softcap,
+                                &stream,
+                                q,
+                                k,
+                                v,
+                                o,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                max_ctx,
+                                kv_base,
+                                n_new,
+                                window as i32,
+                                softcap,
                             ),
                             "nvfp4" => ck::flash_attn_prefill_nvfp4(
-                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base,
-                                n_new, window as i32, softcap,
+                                &stream,
+                                q,
+                                k,
+                                v,
+                                o,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                max_ctx,
+                                kv_base,
+                                n_new,
+                                window as i32,
+                                softcap,
                             ),
                             "q4_0" => ck::flash_attn_prefill_q4_0(
-                                &stream, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base,
-                                n_new, window as i32, softcap,
+                                &stream,
+                                q,
+                                k,
+                                v,
+                                o,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                max_ctx,
+                                kv_base,
+                                n_new,
+                                window as i32,
+                                softcap,
                             ),
                             _ => unreachable!(),
                         }
@@ -5575,11 +6420,12 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                         *counts.entry("KERNEL_ERR").or_default() += 1;
                     }
                     None => {
-                        let key: &'static str = if worst_cos > fmt.cos_min && worst_rel < fmt.rel_max {
-                            "OK"
-                        } else {
-                            "MISCOMPUTE"
-                        };
+                        let key: &'static str =
+                            if worst_cos > fmt.cos_min && worst_rel < fmt.rel_max {
+                                "OK"
+                            } else {
+                                "MISCOMPUTE"
+                            };
                         *counts.entry(key).or_default() += 1;
                         cu_emit(
                             &pname,
@@ -5598,7 +6444,8 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
     // scale args. Same-quant reference (dequant the identical slab+scales, run
     // f32 flash) → bit-close, so a tight 8-bit tolerance.
     {
-        let (n_heads, n_kv_heads, head_dim, max_ctx, kv_len) = (8usize, 2usize, 64usize, 128usize, 40usize);
+        let (n_heads, n_kv_heads, head_dim, max_ctx, kv_len) =
+            (8usize, 2usize, 64usize, 128usize, 40usize);
         let (kv_base, n_new) = (10usize, 6usize);
         let q = gen_x(n_heads * head_dim, 61);
         let kc = gen_x(n_kv_heads * max_ctx * head_dim, 63);
@@ -5626,9 +6473,17 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             for (window, softcap) in dec_cases {
                 let mut cpu_dec = vec![0f32; n_heads * head_dim];
                 k::gqa_attention_flash_decode_capped_windowed(
-                    &q, &kdq, &vdq, &mut cpu_dec,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                    window as usize, softcap,
+                    &q,
+                    &kdq,
+                    &vdq,
+                    &mut cpu_dec,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len,
+                    window as usize,
+                    softcap,
                 );
                 // SAFETY: q/out F32; k/v i8 slabs; k/v scales F32 — all live device
                 // buffers on `stream`; the wrapper synchronizes before returning.
@@ -5641,8 +6496,13 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                         ksb.as_ptr() as *const f32,
                         vsb.as_ptr() as *const f32,
                         ob.as_mut_ptr() as *mut f32,
-                        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                        window as i32, softcap,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_len,
+                        window as i32,
+                        softcap,
                     )
                 };
                 if let Err(e) = res {
@@ -5659,8 +6519,11 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                     *counts.entry("KERNEL_ERR").or_default() += 1;
                 }
                 None => {
-                    let key: &'static str =
-                        if worst_cos > 0.999 && worst_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
+                    let key: &'static str = if worst_cos > 0.999 && worst_rel < 0.05 {
+                        "OK"
+                    } else {
+                        "MISCOMPUTE"
+                    };
                     *counts.entry(key).or_default() += 1;
                     cu_emit(
                         "attn:decode_q8_0",
@@ -5685,9 +6548,18 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             for (window, softcap) in pre_cases {
                 let mut cpu_pre = vec![0f32; n_new * n_heads * head_dim];
                 k::gqa_attention_flash_prefill_capped_windowed(
-                    &qp, &kdq, &vdq, &mut cpu_pre,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                    window as usize, softcap,
+                    &qp,
+                    &kdq,
+                    &vdq,
+                    &mut cpu_pre,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_base,
+                    n_new,
+                    window as usize,
+                    softcap,
                 );
                 // SAFETY: as the decode arm, with q/out sized for n_new queries.
                 let res = unsafe {
@@ -5699,8 +6571,14 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                         ksb.as_ptr() as *const f32,
                         vsb.as_ptr() as *const f32,
                         ob.as_mut_ptr() as *mut f32,
-                        n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                        window as i32, softcap,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_base,
+                        n_new,
+                        window as i32,
+                        softcap,
                     )
                 };
                 if let Err(e) = res {
@@ -5718,8 +6596,11 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                     *counts.entry("KERNEL_ERR").or_default() += 1;
                 }
                 None => {
-                    let key: &'static str =
-                        if worst_cos > 0.999 && worst_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
+                    let key: &'static str = if worst_cos > 0.999 && worst_rel < 0.05 {
+                        "OK"
+                    } else {
+                        "MISCOMPUTE"
+                    };
                     *counts.entry(key).or_default() += 1;
                     cu_emit(
                         "attn:prefill_q8_0",
@@ -5735,7 +6616,8 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
     // WHT-packed bits-per-element slab + per-row f32 scales + a runtime `bits`
     // arg. Same-quant reference at TQ_PROBE_BITS (parity is bits-independent).
     {
-        let (n_heads, n_kv_heads, head_dim, max_ctx, kv_len) = (8usize, 2usize, 64usize, 128usize, 40usize);
+        let (n_heads, n_kv_heads, head_dim, max_ctx, kv_len) =
+            (8usize, 2usize, 64usize, 128usize, 40usize);
         let (kv_base, n_new) = (10usize, 6usize);
         let bits = TQ_PROBE_BITS;
         let q = gen_x(n_heads * head_dim, 61);
@@ -5764,9 +6646,17 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             for (window, softcap) in dec_cases {
                 let mut cpu_dec = vec![0f32; n_heads * head_dim];
                 k::gqa_attention_flash_decode_capped_windowed(
-                    &q, &kdq, &vdq, &mut cpu_dec,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                    window as usize, softcap,
+                    &q,
+                    &kdq,
+                    &vdq,
+                    &mut cpu_dec,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len,
+                    window as usize,
+                    softcap,
                 );
                 // SAFETY: q/out F32; k/v packed TQ slabs; k/v scales F32 — live
                 // device buffers on `stream`.
@@ -5780,8 +6670,13 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                         vsb.as_ptr() as *const f32,
                         bits as u32,
                         ob.as_mut_ptr() as *mut f32,
-                        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                        window as i32, softcap,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_len,
+                        window as i32,
+                        softcap,
                     )
                 };
                 if let Err(e) = res {
@@ -5798,8 +6693,11 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                     *counts.entry("KERNEL_ERR").or_default() += 1;
                 }
                 None => {
-                    let key: &'static str =
-                        if worst_cos > 0.999 && worst_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
+                    let key: &'static str = if worst_cos > 0.999 && worst_rel < 0.05 {
+                        "OK"
+                    } else {
+                        "MISCOMPUTE"
+                    };
                     *counts.entry(key).or_default() += 1;
                     cu_emit(
                         "attn:decode_tq",
@@ -5824,9 +6722,18 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             for (window, softcap) in pre_cases {
                 let mut cpu_pre = vec![0f32; n_new * n_heads * head_dim];
                 k::gqa_attention_flash_prefill_capped_windowed(
-                    &qp, &kdq, &vdq, &mut cpu_pre,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                    window as usize, softcap,
+                    &qp,
+                    &kdq,
+                    &vdq,
+                    &mut cpu_pre,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_base,
+                    n_new,
+                    window as usize,
+                    softcap,
                 );
                 // SAFETY: as the decode arm, q/out sized for n_new queries.
                 let res = unsafe {
@@ -5839,8 +6746,14 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                         vsb.as_ptr() as *const f32,
                         bits as u32,
                         ob.as_mut_ptr() as *mut f32,
-                        n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                        window as i32, softcap,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_base,
+                        n_new,
+                        window as i32,
+                        softcap,
                     )
                 };
                 if let Err(e) = res {
@@ -5858,8 +6771,11 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                     *counts.entry("KERNEL_ERR").or_default() += 1;
                 }
                 None => {
-                    let key: &'static str =
-                        if worst_cos > 0.999 && worst_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
+                    let key: &'static str = if worst_cos > 0.999 && worst_rel < 0.05 {
+                        "OK"
+                    } else {
+                        "MISCOMPUTE"
+                    };
                     *counts.entry(key).or_default() += 1;
                     cu_emit(
                         "attn:prefill_tq",
@@ -5947,7 +6863,14 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 .is_ok()
                     && ck::consume_error_count() == 0;
                 if ok {
-                    cu_grade(name, &cu_download_f32(&buf, NH * HD), &cpu, 0.999, 0.02, &mut counts);
+                    cu_grade(
+                        name,
+                        &cu_download_f32(&buf, NH * HD),
+                        &cpu,
+                        0.999,
+                        0.02,
+                        &mut counts,
+                    );
                 } else {
                     cu_emit(name, "KERNEL_ERR", "kernel-failed");
                     *counts.entry("KERNEL_ERR").or_default() += 1;
@@ -6039,7 +6962,15 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
             // on device 0, valid for the call; dims are kind-aligned.
             let ok = unsafe {
                 cache.moe_ffn_grouped_dev_resident(
-                    kind, &x, &gp, &upp, &dp, &wv, &mut out_gpu, D, D,
+                    kind,
+                    &x,
+                    &gp,
+                    &upp,
+                    &dp,
+                    &wv,
+                    &mut out_gpu,
+                    D,
+                    D,
                 )
             };
             if ok {
@@ -6081,7 +7012,10 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         let half = HEAD_DIM / 2;
         let kv_len = POS + 1;
 
-        let layout = LAYOUTS.iter().find(|l| l.name == "q4_k").expect("q4_k layout");
+        let layout = LAYOUTS
+            .iter()
+            .find(|l| l.name == "q4_k")
+            .expect("q4_k layout");
         let cpu_mv = cpu_matvec_for("q4_k");
         let wq = gen_quant_bytes(layout, d_q, D_MODEL, 0x1111);
         let wk = gen_quant_bytes(layout, d_kv, D_MODEL, 0x2222);
@@ -6170,8 +7104,17 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                     // CPU reference attention + o-proj + residual + post-norm.
                     let mut attn_ref = vec![0f32; d_q];
                     k::gqa_attention_one_step_capped_windowed(
-                        &q_ref, &ref_k, &ref_v, &mut attn_ref,
-                        N_HEADS, N_KV, HEAD_DIM, MAX_CTX, kv_len, window as usize, softcap,
+                        &q_ref,
+                        &ref_k,
+                        &ref_v,
+                        &mut attn_ref,
+                        N_HEADS,
+                        N_KV,
+                        HEAD_DIM,
+                        MAX_CTX,
+                        kv_len,
+                        window as usize,
+                        softcap,
                     );
                     let mut o_ref = vec![0f32; D_MODEL];
                     cpu_mv(&wo, &attn_ref, &mut o_ref, D_MODEL, d_q);
@@ -6181,7 +7124,11 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                     }
                     let mut hnorm2_ref = vec![0f32; D_MODEL];
                     k::rmsnorm_f32_row(&hidden_ref, &ffn_norm, &mut hnorm2_ref, EPS);
-                    if !hidden_ref.iter().chain(hnorm2_ref.iter()).all(|v| v.is_finite()) {
+                    if !hidden_ref
+                        .iter()
+                        .chain(hnorm2_ref.iter())
+                        .all(|v| v.is_finite())
+                    {
                         skip = Some("cpu-reference-nonfinite");
                         break;
                     }
@@ -6231,11 +7178,17 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                         break;
                     }
                     // Grade the residual hidden DELTA + the post-attn norm jointly.
-                    let mut gpu: Vec<f32> =
-                        hidden_dev.iter().zip(&hidden0).map(|(h, h0)| h - h0).collect();
+                    let mut gpu: Vec<f32> = hidden_dev
+                        .iter()
+                        .zip(&hidden0)
+                        .map(|(h, h0)| h - h0)
+                        .collect();
                     gpu.extend_from_slice(&hnorm2_dev);
-                    let mut cpu: Vec<f32> =
-                        hidden_ref.iter().zip(&hidden0).map(|(h, h0)| h - h0).collect();
+                    let mut cpu: Vec<f32> = hidden_ref
+                        .iter()
+                        .zip(&hidden0)
+                        .map(|(h, h0)| h - h0)
+                        .collect();
                     cpu.extend_from_slice(&hnorm2_ref);
                     let (cos, max_rel) = compare(&gpu, &cpu);
                     worst_cos = worst_cos.min(cos);
@@ -6247,8 +7200,11 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                         *counts.entry("SKIP").or_default() += 1;
                     }
                     None => {
-                        let key: &'static str =
-                            if worst_cos > 0.995 && worst_rel < 0.10 { "OK" } else { "MISCOMPUTE" };
+                        let key: &'static str = if worst_cos > 0.995 && worst_rel < 0.10 {
+                            "OK"
+                        } else {
+                            "MISCOMPUTE"
+                        };
                         *counts.entry(key).or_default() += 1;
                         cu_emit(
                             name,
@@ -6291,7 +7247,10 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         let half = HEAD_DIM / 2;
         let kv_len = POS + 1;
 
-        let layout = LAYOUTS.iter().find(|l| l.name == "q4_k").expect("q4_k layout");
+        let layout = LAYOUTS
+            .iter()
+            .find(|l| l.name == "q4_k")
+            .expect("q4_k layout");
         let cpu_mv = cpu_matvec_for("q4_k");
         let wq = gen_quant_bytes(layout, d_q, D_MODEL, 0x1A1A);
         let wk = gen_quant_bytes(layout, d_kv, D_MODEL, 0x2B2B);
@@ -6357,7 +7316,17 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
         let mut attn_ref = vec![0f32; d_q];
         k::gqa_attention_one_step_capped_windowed(
-            &q_ref, &ref_k, &ref_v, &mut attn_ref, N_HEADS, N_KV, HEAD_DIM, MAX_CTX, kv_len, 0, 0.0,
+            &q_ref,
+            &ref_k,
+            &ref_v,
+            &mut attn_ref,
+            N_HEADS,
+            N_KV,
+            HEAD_DIM,
+            MAX_CTX,
+            kv_len,
+            0,
+            0.0,
         );
         let mut o_ref = vec![0f32; D_MODEL];
         cpu_mv(&wo, &attn_ref, &mut o_ref, D_MODEL, d_q);
@@ -6422,9 +7391,21 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                             0,
                             0.0,
                             Some((
-                                (ck::CudaPackedKind::Q4_K, wg.as_ptr() as usize, wg.as_slice()),
-                                (ck::CudaPackedKind::Q4_K, wu.as_ptr() as usize, wu.as_slice()),
-                                (ck::CudaPackedKind::Q4_K, wd.as_ptr() as usize, wd.as_slice()),
+                                (
+                                    ck::CudaPackedKind::Q4_K,
+                                    wg.as_ptr() as usize,
+                                    wg.as_slice(),
+                                ),
+                                (
+                                    ck::CudaPackedKind::Q4_K,
+                                    wu.as_ptr() as usize,
+                                    wu.as_slice(),
+                                ),
+                                (
+                                    ck::CudaPackedKind::Q4_K,
+                                    wd.as_ptr() as usize,
+                                    wd.as_slice(),
+                                ),
                                 D_FF,
                             )),
                             true,
@@ -6437,17 +7418,30 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 } else {
                     // Grade the residual hidden DELTA (so the shared input can't
                     // mask an FFN miscompute) + the post-attn norm jointly.
-                    let mut gpu: Vec<f32> =
-                        hidden_dev.iter().zip(&hidden0).map(|(h, h0)| h - h0).collect();
+                    let mut gpu: Vec<f32> = hidden_dev
+                        .iter()
+                        .zip(&hidden0)
+                        .map(|(h, h0)| h - h0)
+                        .collect();
                     gpu.extend_from_slice(&hnorm2_dev);
-                    let mut cpu: Vec<f32> =
-                        hidden_final.iter().zip(&hidden0).map(|(h, h0)| h - h0).collect();
+                    let mut cpu: Vec<f32> = hidden_final
+                        .iter()
+                        .zip(&hidden0)
+                        .map(|(h, h0)| h - h0)
+                        .collect();
                     cpu.extend_from_slice(&hnorm2_ref);
                     let (cos, max_rel) = compare(&gpu, &cpu);
-                    let key: &'static str =
-                        if cos > 0.99 && max_rel < 0.15 { "OK" } else { "MISCOMPUTE" };
+                    let key: &'static str = if cos > 0.99 && max_rel < 0.15 {
+                        "OK"
+                    } else {
+                        "MISCOMPUTE"
+                    };
                     *counts.entry(key).or_default() += 1;
-                    cu_emit(name, key, &format!("cos={cos:.6} max_rel={max_rel:.4} (attn+ffn)"));
+                    cu_emit(
+                        name,
+                        key,
+                        &format!("cos={cos:.6} max_rel={max_rel:.4} (attn+ffn)"),
+                    );
                 }
             }
         }
@@ -6579,11 +7573,25 @@ pub fn run_cpu_parity() -> anyhow::Result<()> {
 
         let mut simd = vec![0f32; m];
         k::matvec_f32_serial(&w, &x, &mut simd, m, kd);
-        cu_grade("matvec:f32 simd-serial", &simd, &refv, 0.9999, 0.01, &mut counts);
+        cu_grade(
+            "matvec:f32 simd-serial",
+            &simd,
+            &refv,
+            0.9999,
+            0.01,
+            &mut counts,
+        );
 
         let mut par = vec![0f32; m];
         k::matvec_f32(&w, &x, &mut par, m, kd);
-        cu_grade("matvec:f32 parallel", &par, &refv, 0.9999, 0.01, &mut counts);
+        cu_grade(
+            "matvec:f32 parallel",
+            &par,
+            &refv,
+            0.9999,
+            0.01,
+            &mut counts,
+        );
     }
 
     // ---- F16 matvec: SIMD-serial + rayon-parallel vs the naive scalar gemm ----
@@ -6599,11 +7607,25 @@ pub fn run_cpu_parity() -> anyhow::Result<()> {
 
         let mut simd = vec![0f32; m];
         k::matvec_f16_w_f32_a_serial(&w, &x, &mut simd, m, kd);
-        cu_grade("matvec:f16 simd-serial", &simd, &refv, 0.9999, 0.01, &mut counts);
+        cu_grade(
+            "matvec:f16 simd-serial",
+            &simd,
+            &refv,
+            0.9999,
+            0.01,
+            &mut counts,
+        );
 
         let mut par = vec![0f32; m];
         k::matvec_f16_w_f32_a(&w, &x, &mut par, m, kd);
-        cu_grade("matvec:f16 parallel", &par, &refv, 0.9999, 0.01, &mut counts);
+        cu_grade(
+            "matvec:f16 parallel",
+            &par,
+            &refv,
+            0.9999,
+            0.01,
+            &mut counts,
+        );
     }
 
     // ---- PTQ1_0 ternary: production fastdot + batched vs the reference kernel ----
@@ -6621,12 +7643,26 @@ pub fn run_cpu_parity() -> anyhow::Result<()> {
             Some((w, refv)) => {
                 let mut fast = vec![0f32; MV_M];
                 k::matvec_ptq1_0_w_f32_a_fast(&w, &x, &mut fast, MV_M, MV_K);
-                cu_grade("matvec:ptq1_0 fastdot", &fast, &refv, 0.999, 0.02, &mut counts);
+                cu_grade(
+                    "matvec:ptq1_0 fastdot",
+                    &fast,
+                    &refv,
+                    0.999,
+                    0.02,
+                    &mut counts,
+                );
 
                 // Batched decode/replay path, single activation row.
                 let mut batched = vec![0f32; MV_M];
                 k::matvec_ptq1_0_w_f32_a_batched(&w, &x, &mut batched, MV_M, MV_K, 1);
-                cu_grade("matvec:ptq1_0 batched", &batched, &refv, 0.999, 0.02, &mut counts);
+                cu_grade(
+                    "matvec:ptq1_0 batched",
+                    &batched,
+                    &refv,
+                    0.999,
+                    0.02,
+                    &mut counts,
+                );
             }
             None => {
                 cu_emit("matvec:ptq1_0", "SKIP", "no-finite-reference");
@@ -6701,9 +7737,7 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
     println!("Metal (MLX) kernel parity harness (Apple GPU backend, in-process)");
     let n_dev = mk::device_count();
     if n_dev == 0 {
-        println!(
-            "no Metal device visible (non-Apple-Silicon host, or no Metal GPU) — all SKIP"
-        );
+        println!("no Metal device visible (non-Apple-Silicon host, or no Metal GPU) — all SKIP");
         println!("\nsummary: SKIP (no Metal device)");
         return Ok(());
     }
@@ -6807,8 +7841,8 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
     // graded against two independent CPU matvecs. Distinct synthetic cache keys
     // (not host pointers) so no stale-weight aliasing across iterations.
     for (idx, dtype) in [
-        "q8_0", "q4_k", "q6_k", "q5_k", "iq4_nl", "iq4_xs", "iq1_s", "iq1_m",
-        "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "ptq1_0",
+        "q8_0", "q4_k", "q6_k", "q5_k", "iq4_nl", "iq4_xs", "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs",
+        "iq2_s", "iq3_xxs", "iq3_s", "ptq1_0",
     ]
     .iter()
     .enumerate()
@@ -6858,8 +7892,8 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
     // ANDs this with the bare `fused:` parity above. Distinct per-expert cache
     // keys so no stale-weight aliasing across iterations.
     for (di, dtype) in [
-        "q8_0", "q4_k", "q6_k", "q5_k", "iq4_nl", "iq4_xs", "iq1_s", "iq1_m",
-        "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "ptq1_0",
+        "q8_0", "q4_k", "q6_k", "q5_k", "iq4_nl", "iq4_xs", "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs",
+        "iq2_s", "iq3_xxs", "iq3_s", "ptq1_0",
     ]
     .iter()
     .enumerate()
@@ -7006,8 +8040,14 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
             k::delta_net::l2norm_f32_inplace(&mut q[row * QK..(row + 1) * QK], 1e-6);
             k::delta_net::l2norm_f32_inplace(&mut kk[row * QK..(row + 1) * QK], 1e-6);
         }
-        let g: Vec<f32> = gen_x(H * T, 74).iter().map(|x| -0.05 - 0.25 * x.abs()).collect();
-        let beta: Vec<f32> = gen_x(H * T, 75).iter().map(|x| 0.1 + 0.8 * x.abs()).collect();
+        let g: Vec<f32> = gen_x(H * T, 74)
+            .iter()
+            .map(|x| -0.05 - 0.25 * x.abs())
+            .collect();
+        let beta: Vec<f32> = gen_x(H * T, 75)
+            .iter()
+            .map(|x| 0.1 + 0.8 * x.abs())
+            .collect();
         let mut cpu_out = vec![0f32; H * T * VD];
         let mut cpu_state = vec![0f32; H * QK * VD];
         for h in 0..H {
@@ -7028,14 +8068,32 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
         let mut gpu_out = vec![0f32; H * T * VD];
         let mut gpu_state = vec![0f32; H * QK * VD];
         match mk::delta_net_chunk_f32(
-            &q, &kk, &v, &g, &beta, &mut gpu_state, &mut gpu_out, H, T, QK, VD, L0,
+            &q,
+            &kk,
+            &v,
+            &g,
+            &beta,
+            &mut gpu_state,
+            &mut gpu_out,
+            H,
+            T,
+            QK,
+            VD,
+            L0,
         ) {
             Ok(()) => {
                 let mut gpu_all = gpu_out.clone();
                 gpu_all.extend_from_slice(&gpu_state);
                 let mut cpu_all = cpu_out.clone();
                 cpu_all.extend_from_slice(&cpu_state);
-                cu_grade("ssm:delta_net", &gpu_all, &cpu_all, 0.999, 0.02, &mut counts);
+                cu_grade(
+                    "ssm:delta_net",
+                    &gpu_all,
+                    &cpu_all,
+                    0.999,
+                    0.02,
+                    &mut counts,
+                );
             }
             Err(e) => {
                 cu_emit("ssm:delta_net", "KERNEL_ERR", &format!("{e:?}"));
@@ -7208,18 +8266,34 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                 for (window, softcap) in dec_cases {
                     let mut cpu = vec![0f32; n_heads * head_dim];
                     k::gqa_attention_flash_decode_capped_windowed(
-                        &q, &kc, &vc, &mut cpu,
-                        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                        window as usize, softcap,
+                        &q,
+                        &kc,
+                        &vc,
+                        &mut cpu,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_len,
+                        window as usize,
+                        softcap,
                     );
                     // SAFETY: q/out [n_heads*head_dim], k/v [n_kv_heads*max_ctx*
                     // head_dim] device f32 on `fs`.
                     let res = unsafe {
                         mk::flash_attn_decode_f32(
-                            &fs, qb.as_ptr() as *const f32, kb.as_ptr() as *const f32,
-                            vb.as_ptr() as *const f32, ob.as_mut_ptr() as *mut f32,
-                            n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                            window as i32, softcap,
+                            &fs,
+                            qb.as_ptr() as *const f32,
+                            kb.as_ptr() as *const f32,
+                            vb.as_ptr() as *const f32,
+                            ob.as_mut_ptr() as *mut f32,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            kv_len,
+                            window as i32,
+                            softcap,
                         )
                     };
                     if let Err(e) = res {
@@ -7236,13 +8310,18 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                         *counts.entry("KERNEL_ERR").or_default() += 1;
                     }
                     None => {
-                        let key: &'static str =
-                            if worst_cos > 0.999 && worst_rel < 0.02 { "OK" } else { "MISCOMPUTE" };
+                        let key: &'static str = if worst_cos > 0.999 && worst_rel < 0.02 {
+                            "OK"
+                        } else {
+                            "MISCOMPUTE"
+                        };
                         *counts.entry(key).or_default() += 1;
                         cu_emit(
                             "attn:decode",
                             key,
-                            &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"),
+                            &format!(
+                                "cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"
+                            ),
                         );
                     }
                 }
@@ -7263,17 +8342,35 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                 for (window, softcap) in pre_cases {
                     let mut cpu_p = vec![0f32; n_new * n_heads * head_dim];
                     k::gqa_attention_flash_prefill_capped_windowed(
-                        &qp, &kc, &vc, &mut cpu_p,
-                        n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                        window as usize, softcap,
+                        &qp,
+                        &kc,
+                        &vc,
+                        &mut cpu_p,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_base,
+                        n_new,
+                        window as usize,
+                        softcap,
                     );
                     // SAFETY: q/out [n_new*n_heads*head_dim], k/v caches device f32.
                     let res = unsafe {
                         mk::flash_attn_prefill_f32(
-                            &fs, qb.as_ptr() as *const f32, kb.as_ptr() as *const f32,
-                            vb.as_ptr() as *const f32, ob.as_mut_ptr() as *mut f32,
-                            n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                            window as i32, softcap,
+                            &fs,
+                            qb.as_ptr() as *const f32,
+                            kb.as_ptr() as *const f32,
+                            vb.as_ptr() as *const f32,
+                            ob.as_mut_ptr() as *mut f32,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            kv_base,
+                            n_new,
+                            window as i32,
+                            softcap,
                         )
                     };
                     if let Err(e) = res {
@@ -7291,8 +8388,11 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                         *counts.entry("KERNEL_ERR").or_default() += 1;
                     }
                     None => {
-                        let key: &'static str =
-                            if worst_cos > 0.999 && worst_rel < 0.02 { "OK" } else { "MISCOMPUTE" };
+                        let key: &'static str = if worst_cos > 0.999 && worst_rel < 0.02 {
+                            "OK"
+                        } else {
+                            "MISCOMPUTE"
+                        };
                         *counts.entry(key).or_default() += 1;
                         cu_emit(
                             "attn:prefill",
@@ -7353,9 +8453,17 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                     for (window, softcap) in dec_cases {
                         let mut cpu_dec = vec![0f32; n_heads * head_dim];
                         k::gqa_attention_flash_decode_capped_windowed(
-                            &q, &kc_dq, &vc_dq, &mut cpu_dec,
-                            n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                            window as usize, softcap,
+                            &q,
+                            &kc_dq,
+                            &vc_dq,
+                            &mut cpu_dec,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            kv_len,
+                            window as usize,
+                            softcap,
                         );
                         // SAFETY: q/out F32 [n_heads*head_dim]; k/v packed device
                         // buffers [n_kv_heads*max_ctx*bytes_per_row] on `fs`.
@@ -7365,11 +8473,76 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                             let v = vb.as_ptr();
                             let o = ob.as_mut_ptr() as *mut f32;
                             match fmt.name {
-                                "mxfp4" => mk::flash_attn_decode_mxfp4(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window as i32, softcap),
-                                "mxfp6" => mk::flash_attn_decode_mxfp6(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window as i32, softcap),
-                                "mxfp8" => mk::flash_attn_decode_mxfp8(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window as i32, softcap),
-                                "nvfp4" => mk::flash_attn_decode_nvfp4(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window as i32, softcap),
-                                "q4_0" => mk::flash_attn_decode_q4_0(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window as i32, softcap),
+                                "mxfp4" => mk::flash_attn_decode_mxfp4(
+                                    &fs,
+                                    q,
+                                    k,
+                                    v,
+                                    o,
+                                    n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    max_ctx,
+                                    kv_len,
+                                    window as i32,
+                                    softcap,
+                                ),
+                                "mxfp6" => mk::flash_attn_decode_mxfp6(
+                                    &fs,
+                                    q,
+                                    k,
+                                    v,
+                                    o,
+                                    n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    max_ctx,
+                                    kv_len,
+                                    window as i32,
+                                    softcap,
+                                ),
+                                "mxfp8" => mk::flash_attn_decode_mxfp8(
+                                    &fs,
+                                    q,
+                                    k,
+                                    v,
+                                    o,
+                                    n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    max_ctx,
+                                    kv_len,
+                                    window as i32,
+                                    softcap,
+                                ),
+                                "nvfp4" => mk::flash_attn_decode_nvfp4(
+                                    &fs,
+                                    q,
+                                    k,
+                                    v,
+                                    o,
+                                    n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    max_ctx,
+                                    kv_len,
+                                    window as i32,
+                                    softcap,
+                                ),
+                                "q4_0" => mk::flash_attn_decode_q4_0(
+                                    &fs,
+                                    q,
+                                    k,
+                                    v,
+                                    o,
+                                    n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    max_ctx,
+                                    kv_len,
+                                    window as i32,
+                                    softcap,
+                                ),
                                 _ => unreachable!(),
                             }
                         };
@@ -7377,7 +8550,8 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                             err = Some(format!("{e:?}"));
                             break;
                         }
-                        let (cos, max_rel) = compare(&mk_download_f32(&ob, n_heads * head_dim), &cpu_dec);
+                        let (cos, max_rel) =
+                            compare(&mk_download_f32(&ob, n_heads * head_dim), &cpu_dec);
                         worst_cos = worst_cos.min(cos);
                         worst_rel = worst_rel.max(max_rel);
                     }
@@ -7387,16 +8561,19 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                             *counts.entry("KERNEL_ERR").or_default() += 1;
                         }
                         None => {
-                            let key: &'static str = if worst_cos > fmt.cos_min && worst_rel < fmt.rel_max {
-                                "OK"
-                            } else {
-                                "MISCOMPUTE"
-                            };
+                            let key: &'static str =
+                                if worst_cos > fmt.cos_min && worst_rel < fmt.rel_max {
+                                    "OK"
+                                } else {
+                                    "MISCOMPUTE"
+                                };
                             *counts.entry(key).or_default() += 1;
                             cu_emit(
                                 &dname,
                                 key,
-                                &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"),
+                                &format!(
+                                    "cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"
+                                ),
                             );
                         }
                     }
@@ -7415,9 +8592,18 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                     for (window, softcap) in pre_cases {
                         let mut cpu_pre = vec![0f32; n_new * n_heads * head_dim];
                         k::gqa_attention_flash_prefill_capped_windowed(
-                            &qp, &kc_dq, &vc_dq, &mut cpu_pre,
-                            n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                            window as usize, softcap,
+                            &qp,
+                            &kc_dq,
+                            &vc_dq,
+                            &mut cpu_pre,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            kv_base,
+                            n_new,
+                            window as usize,
+                            softcap,
                         );
                         // SAFETY: q/out F32 [n_new*n_heads*head_dim]; k/v packed as above.
                         let res = unsafe {
@@ -7426,11 +8612,81 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                             let v = vb.as_ptr();
                             let o = ob.as_mut_ptr() as *mut f32;
                             match fmt.name {
-                                "mxfp4" => mk::flash_attn_prefill_mxfp4(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new, window as i32, softcap),
-                                "mxfp6" => mk::flash_attn_prefill_mxfp6(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new, window as i32, softcap),
-                                "mxfp8" => mk::flash_attn_prefill_mxfp8(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new, window as i32, softcap),
-                                "nvfp4" => mk::flash_attn_prefill_nvfp4(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new, window as i32, softcap),
-                                "q4_0" => mk::flash_attn_prefill_q4_0(&fs, q, k, v, o, n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new, window as i32, softcap),
+                                "mxfp4" => mk::flash_attn_prefill_mxfp4(
+                                    &fs,
+                                    q,
+                                    k,
+                                    v,
+                                    o,
+                                    n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    max_ctx,
+                                    kv_base,
+                                    n_new,
+                                    window as i32,
+                                    softcap,
+                                ),
+                                "mxfp6" => mk::flash_attn_prefill_mxfp6(
+                                    &fs,
+                                    q,
+                                    k,
+                                    v,
+                                    o,
+                                    n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    max_ctx,
+                                    kv_base,
+                                    n_new,
+                                    window as i32,
+                                    softcap,
+                                ),
+                                "mxfp8" => mk::flash_attn_prefill_mxfp8(
+                                    &fs,
+                                    q,
+                                    k,
+                                    v,
+                                    o,
+                                    n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    max_ctx,
+                                    kv_base,
+                                    n_new,
+                                    window as i32,
+                                    softcap,
+                                ),
+                                "nvfp4" => mk::flash_attn_prefill_nvfp4(
+                                    &fs,
+                                    q,
+                                    k,
+                                    v,
+                                    o,
+                                    n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    max_ctx,
+                                    kv_base,
+                                    n_new,
+                                    window as i32,
+                                    softcap,
+                                ),
+                                "q4_0" => mk::flash_attn_prefill_q4_0(
+                                    &fs,
+                                    q,
+                                    k,
+                                    v,
+                                    o,
+                                    n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    max_ctx,
+                                    kv_base,
+                                    n_new,
+                                    window as i32,
+                                    softcap,
+                                ),
                                 _ => unreachable!(),
                             }
                         };
@@ -7449,16 +8705,19 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                             *counts.entry("KERNEL_ERR").or_default() += 1;
                         }
                         None => {
-                            let key: &'static str = if worst_cos > fmt.cos_min && worst_rel < fmt.rel_max {
-                                "OK"
-                            } else {
-                                "MISCOMPUTE"
-                            };
+                            let key: &'static str =
+                                if worst_cos > fmt.cos_min && worst_rel < fmt.rel_max {
+                                    "OK"
+                                } else {
+                                    "MISCOMPUTE"
+                                };
                             *counts.entry(key).or_default() += 1;
                             cu_emit(
                                 &pname,
                                 key,
-                                &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa4+cap50)"),
+                                &format!(
+                                    "cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa4+cap50)"
+                                ),
                             );
                         }
                     }
@@ -7499,9 +8758,17 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                 for (window, softcap) in dec_cases {
                     let mut cpu_dec = vec![0f32; n_heads * head_dim];
                     k::gqa_attention_flash_decode_capped_windowed(
-                        &q, &kdq, &vdq, &mut cpu_dec,
-                        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                        window as usize, softcap,
+                        &q,
+                        &kdq,
+                        &vdq,
+                        &mut cpu_dec,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_len,
+                        window as usize,
+                        softcap,
                     );
                     // SAFETY: q/out F32; k/v i8 slabs; k/v scales F32 — all live
                     // device buffers on `fs`.
@@ -7514,15 +8781,21 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                             ksb.as_ptr() as *const f32,
                             vsb.as_ptr() as *const f32,
                             ob.as_mut_ptr() as *mut f32,
-                            n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                            window as i32, softcap,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            kv_len,
+                            window as i32,
+                            softcap,
                         )
                     };
                     if let Err(e) = res {
                         err = Some(format!("{e:?}"));
                         break;
                     }
-                    let (cos, max_rel) = compare(&mk_download_f32(&ob, n_heads * head_dim), &cpu_dec);
+                    let (cos, max_rel) =
+                        compare(&mk_download_f32(&ob, n_heads * head_dim), &cpu_dec);
                     worst_cos = worst_cos.min(cos);
                     worst_rel = worst_rel.max(max_rel);
                 }
@@ -7532,13 +8805,18 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                         *counts.entry("KERNEL_ERR").or_default() += 1;
                     }
                     None => {
-                        let key: &'static str =
-                            if worst_cos > 0.999 && worst_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
+                        let key: &'static str = if worst_cos > 0.999 && worst_rel < 0.05 {
+                            "OK"
+                        } else {
+                            "MISCOMPUTE"
+                        };
                         *counts.entry(key).or_default() += 1;
                         cu_emit(
                             "attn:decode_q8_0",
                             key,
-                            &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"),
+                            &format!(
+                                "cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"
+                            ),
                         );
                     }
                 }
@@ -7558,9 +8836,18 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                 for (window, softcap) in pre_cases {
                     let mut cpu_pre = vec![0f32; n_new * n_heads * head_dim];
                     k::gqa_attention_flash_prefill_capped_windowed(
-                        &qp, &kdq, &vdq, &mut cpu_pre,
-                        n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                        window as usize, softcap,
+                        &qp,
+                        &kdq,
+                        &vdq,
+                        &mut cpu_pre,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_base,
+                        n_new,
+                        window as usize,
+                        softcap,
                     );
                     // SAFETY: as the decode arm, with q/out sized for n_new queries.
                     let res = unsafe {
@@ -7572,8 +8859,14 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                             ksb.as_ptr() as *const f32,
                             vsb.as_ptr() as *const f32,
                             ob.as_mut_ptr() as *mut f32,
-                            n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                            window as i32, softcap,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            kv_base,
+                            n_new,
+                            window as i32,
+                            softcap,
                         )
                     };
                     if let Err(e) = res {
@@ -7591,8 +8884,11 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                         *counts.entry("KERNEL_ERR").or_default() += 1;
                     }
                     None => {
-                        let key: &'static str =
-                            if worst_cos > 0.999 && worst_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
+                        let key: &'static str = if worst_cos > 0.999 && worst_rel < 0.05 {
+                            "OK"
+                        } else {
+                            "MISCOMPUTE"
+                        };
                         *counts.entry(key).or_default() += 1;
                         cu_emit(
                             "attn:prefill_q8_0",
@@ -7638,9 +8934,17 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                 for (window, softcap) in dec_cases {
                     let mut cpu_dec = vec![0f32; n_heads * head_dim];
                     k::gqa_attention_flash_decode_capped_windowed(
-                        &q, &kdq, &vdq, &mut cpu_dec,
-                        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                        window as usize, softcap,
+                        &q,
+                        &kdq,
+                        &vdq,
+                        &mut cpu_dec,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_len,
+                        window as usize,
+                        softcap,
                     );
                     // SAFETY: q/out F32; k/v packed TQ slabs; k/v scales F32 — live
                     // device buffers on `fs`.
@@ -7654,15 +8958,21 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                             vsb.as_ptr() as *const f32,
                             bits as u32,
                             ob.as_mut_ptr() as *mut f32,
-                            n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                            window as i32, softcap,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            kv_len,
+                            window as i32,
+                            softcap,
                         )
                     };
                     if let Err(e) = res {
                         err = Some(format!("{e:?}"));
                         break;
                     }
-                    let (cos, max_rel) = compare(&mk_download_f32(&ob, n_heads * head_dim), &cpu_dec);
+                    let (cos, max_rel) =
+                        compare(&mk_download_f32(&ob, n_heads * head_dim), &cpu_dec);
                     worst_cos = worst_cos.min(cos);
                     worst_rel = worst_rel.max(max_rel);
                 }
@@ -7672,13 +8982,18 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                         *counts.entry("KERNEL_ERR").or_default() += 1;
                     }
                     None => {
-                        let key: &'static str =
-                            if worst_cos > 0.999 && worst_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
+                        let key: &'static str = if worst_cos > 0.999 && worst_rel < 0.05 {
+                            "OK"
+                        } else {
+                            "MISCOMPUTE"
+                        };
                         *counts.entry(key).or_default() += 1;
                         cu_emit(
                             "attn:decode_tq",
                             key,
-                            &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"),
+                            &format!(
+                                "cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"
+                            ),
                         );
                     }
                 }
@@ -7698,9 +9013,18 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                 for (window, softcap) in pre_cases {
                     let mut cpu_pre = vec![0f32; n_new * n_heads * head_dim];
                     k::gqa_attention_flash_prefill_capped_windowed(
-                        &qp, &kdq, &vdq, &mut cpu_pre,
-                        n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                        window as usize, softcap,
+                        &qp,
+                        &kdq,
+                        &vdq,
+                        &mut cpu_pre,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_base,
+                        n_new,
+                        window as usize,
+                        softcap,
                     );
                     // SAFETY: as the decode arm, q/out sized for n_new queries.
                     let res = unsafe {
@@ -7713,8 +9037,14 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                             vsb.as_ptr() as *const f32,
                             bits as u32,
                             ob.as_mut_ptr() as *mut f32,
-                            n_heads, n_kv_heads, head_dim, max_ctx, kv_base, n_new,
-                            window as i32, softcap,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            max_ctx,
+                            kv_base,
+                            n_new,
+                            window as i32,
+                            softcap,
                         )
                     };
                     if let Err(e) = res {
@@ -7732,8 +9062,11 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                         *counts.entry("KERNEL_ERR").or_default() += 1;
                     }
                     None => {
-                        let key: &'static str =
-                            if worst_cos > 0.999 && worst_rel < 0.05 { "OK" } else { "MISCOMPUTE" };
+                        let key: &'static str = if worst_cos > 0.999 && worst_rel < 0.05 {
+                            "OK"
+                        } else {
+                            "MISCOMPUTE"
+                        };
                         *counts.entry(key).or_default() += 1;
                         cu_emit(
                             "attn:prefill_tq",
@@ -7783,7 +9116,10 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
             // [d_kv x D_MODEL], Wo [D_MODEL x d_q] — same synthesis + CPU matvec
             // the matvec probes use, so the per-row dequant matches the kernel.
             // The dense-FFN weights: Wgate/Wup [D_FF x D_MODEL], Wdown [D_MODEL x D_FF].
-            let layout = LAYOUTS.iter().find(|l| l.name == "q4_k").expect("q4_k layout");
+            let layout = LAYOUTS
+                .iter()
+                .find(|l| l.name == "q4_k")
+                .expect("q4_k layout");
             let cpu_mv = cpu_matvec_for("q4_k");
             let wq = gen_quant_bytes(layout, d_q, D_MODEL, 0x1111);
             let wk = gen_quant_bytes(layout, d_kv, D_MODEL, 0x2222);
@@ -7857,8 +9193,15 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
             // block only overwrites row POS (deterministic from the reset hidden),
             // so no re-seed is needed between cases.
             if let (
-                Some(bwq), Some(bwk), Some(bwv), Some(bwo),
-                Some(bwg), Some(bwu), Some(bwd), Some(mut kmir), Some(mut vmir),
+                Some(bwq),
+                Some(bwk),
+                Some(bwv),
+                Some(bwo),
+                Some(bwg),
+                Some(bwu),
+                Some(bwd),
+                Some(mut kmir),
+                Some(mut vmir),
             ) = (
                 mk::MlxDeviceBuffer::from_host(&fs, &wq),
                 mk::MlxDeviceBuffer::from_host(&fs, &wk),
@@ -7887,8 +9230,17 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                     // CPU reference attention + o-proj + residual + post-norm + FFN.
                     let mut attn_ref = vec![0f32; d_q];
                     k::gqa_attention_one_step_capped_windowed(
-                        &q_ref, &kcache, &vcache, &mut attn_ref,
-                        N_HEADS, N_KV, HEAD_DIM, MAX_CTX, kv_len, window as usize, softcap,
+                        &q_ref,
+                        &kcache,
+                        &vcache,
+                        &mut attn_ref,
+                        N_HEADS,
+                        N_KV,
+                        HEAD_DIM,
+                        MAX_CTX,
+                        kv_len,
+                        window as usize,
+                        softcap,
                     );
                     let mut o_ref = vec![0f32; D_MODEL];
                     cpu_mv(&wo, &attn_ref, &mut o_ref, D_MODEL, d_q);
@@ -7924,11 +9276,23 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                     let res = unsafe {
                         mk::decode_attn_block_f32(
                             &fs,
-                            bwq.as_ptr(), 0,
-                            bwk.as_ptr(), 0,
-                            bwv.as_ptr(), 0,
-                            bwo.as_ptr(), 0,
-                            Some((bwg.as_ptr(), 0, bwu.as_ptr(), 0, bwd.as_ptr(), 0, D_FF as u32)),
+                            bwq.as_ptr(),
+                            0,
+                            bwk.as_ptr(),
+                            0,
+                            bwv.as_ptr(),
+                            0,
+                            bwo.as_ptr(),
+                            0,
+                            Some((
+                                bwg.as_ptr(),
+                                0,
+                                bwu.as_ptr(),
+                                0,
+                                bwd.as_ptr(),
+                                0,
+                                D_FF as u32,
+                            )),
                             attn_norm.as_ptr(),
                             ffn_norm.as_ptr(),
                             inv_freq.as_ptr(),
@@ -7938,9 +9302,16 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                             v_row_dev.as_mut_ptr(),
                             kmir.as_mut_ptr(),
                             vmir.as_mut_ptr(),
-                            N_HEADS as u32, N_KV as u32, HEAD_DIM as u32, D_MODEL as u32,
-                            POS as u32, MAX_CTX as u32, kv_len as u32, EPS,
-                            window as i32, softcap,
+                            N_HEADS as u32,
+                            N_KV as u32,
+                            HEAD_DIM as u32,
+                            D_MODEL as u32,
+                            POS as u32,
+                            MAX_CTX as u32,
+                            kv_len as u32,
+                            EPS,
+                            window as i32,
+                            softcap,
                         )
                     };
                     match res {
@@ -7952,10 +9323,16 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                                 early = Some(("MISCOMPUTE", "ffn-leg-did-not-run".to_string()));
                                 break;
                             }
-                            let gpu_delta: Vec<f32> =
-                                hidden_dev.iter().zip(&hidden0).map(|(h, h0)| h - h0).collect();
-                            let cpu_delta: Vec<f32> =
-                                hidden_ref.iter().zip(&hidden0).map(|(h, h0)| h - h0).collect();
+                            let gpu_delta: Vec<f32> = hidden_dev
+                                .iter()
+                                .zip(&hidden0)
+                                .map(|(h, h0)| h - h0)
+                                .collect();
+                            let cpu_delta: Vec<f32> = hidden_ref
+                                .iter()
+                                .zip(&hidden0)
+                                .map(|(h, h0)| h - h0)
+                                .collect();
                             let (cos, max_rel) = compare(&gpu_delta, &cpu_delta);
                             worst_cos = worst_cos.min(cos);
                             worst_rel = worst_rel.max(max_rel);
@@ -7976,8 +9353,11 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                         *counts.entry(verdict).or_default() += 1;
                     }
                     None => {
-                        let key: &'static str =
-                            if worst_cos > 0.995 && worst_rel < 0.10 { "OK" } else { "MISCOMPUTE" };
+                        let key: &'static str = if worst_cos > 0.995 && worst_rel < 0.10 {
+                            "OK"
+                        } else {
+                            "MISCOMPUTE"
+                        };
                         *counts.entry(key).or_default() += 1;
                         cu_emit(
                             name,
@@ -8025,7 +9405,10 @@ pub fn run_npu_parity() -> anyhow::Result<()> {
             return "SKIP";
         }
         let v = if r.pass { "OK" } else { "MISCOMPUTE" };
-        println!("  {label:<22} {v:<11} cos={:.6} max_rel={:.4}", r.cos, r.max_rel);
+        println!(
+            "  {label:<22} {v:<11} cos={:.6} max_rel={:.4}",
+            r.cos, r.max_rel
+        );
         let _ = verdict_name;
         if r.pass {
             "OK"

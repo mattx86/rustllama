@@ -91,7 +91,12 @@ fn build_paged_grammar(
     };
     let vocab = model.cfg.vocab_size;
     let eos = model.cfg.eos_token_id;
-    let decode = |id: u32| tokenizer.decode_single(id, true).unwrap_or_default().into_bytes();
+    let decode = |id: u32| {
+        tokenizer
+            .decode_single(id, true)
+            .unwrap_or_default()
+            .into_bytes()
+    };
     match kind {
         GrammarKind::Json => Some(GrammarMask::new_json(vocab, eos, decode)),
         GrammarKind::JsonSchema { schema } => Some(GrammarMask::new_json_schema(
@@ -111,10 +116,11 @@ fn build_paged_grammar(
             eos,
             decode,
         )),
-        GrammarKind::Code { language } => {
-            Some(GrammarMask::new_code_for_language(language, vocab, eos, decode))
-        }
-        GrammarKind::Regex { pattern } => match GrammarMask::new_regex(pattern, vocab, eos, decode) {
+        GrammarKind::Code { language } => Some(GrammarMask::new_code_for_language(
+            language, vocab, eos, decode,
+        )),
+        GrammarKind::Regex { pattern } => match GrammarMask::new_regex(pattern, vocab, eos, decode)
+        {
             Ok(m) => Some(m),
             Err(e) => {
                 tracing::warn!(
@@ -164,14 +170,16 @@ fn gguf_has_vision_indicator(gguf: &Gguf) -> bool {
             return true;
         }
     }
-    if gguf.metadata().iter().any(|(k, _)| {
-        k.starts_with("clip.") || k.contains(".vision.") || k.starts_with("vision.")
-    }) {
+    if gguf
+        .metadata()
+        .iter()
+        .any(|(k, _)| k.starts_with("clip.") || k.contains(".vision.") || k.starts_with("vision."))
+    {
         return true;
     }
-    gguf.tensors()
-        .iter()
-        .any(|t| t.name.starts_with("v.") || t.name.contains("mmproj") || t.name.contains(".vision."))
+    gguf.tensors().iter().any(|t| {
+        t.name.starts_with("v.") || t.name.contains("mmproj") || t.name.contains(".vision.")
+    })
 }
 
 /// F8: per-slot recurrent + attention state for a HYBRID (DeltaNet/SSM)
@@ -371,7 +379,6 @@ struct DriverSlot {
     arrival_seq: u64,
 }
 
-
 pub struct PagedBatchEngine {
     model: Arc<LlamaModel>,
     tokenizer: Option<Arc<Tokenizer>>,
@@ -432,11 +439,7 @@ impl PagedBatchEngine {
     /// `max_slots` is a hard cap — `generate_batched_token_ids`
     /// rejects request batches larger than this. The server's
     /// scheduler will gate admission at this cap once 3.7e lands.
-    pub fn load(
-        path: &Path,
-        max_ctx: usize,
-        max_slots: u32,
-    ) -> Result<Self, CpuEngineError> {
+    pub fn load(path: &Path, max_ctx: usize, max_slots: u32) -> Result<Self, CpuEngineError> {
         // Config budget 0 ⇒ the ragged mixed path is OFF unless the
         // `RUSTLLAMA_MAX_BATCHED_TOKENS` env var opts in (env still honored for
         // back-compat; see `resolve_max_batched_tokens`).
@@ -528,7 +531,16 @@ impl PagedBatchEngine {
         max_slots: u32,
         total_pages: u32,
     ) -> Result<Self, CpuEngineError> {
-        Self::load_inner(path, max_ctx, max_slots, false, 0, Some(total_pages), None, true)
+        Self::load_inner(
+            path,
+            max_ctx,
+            max_slots,
+            false,
+            0,
+            Some(total_pages),
+            None,
+            true,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -549,8 +561,8 @@ impl PagedBatchEngine {
         // twin in `inference.rs`.
         if let Some(lora_path) = lora {
             let lgguf = Gguf::open(lora_path)?;
-            let adapter =
-                rustllama_models::lora::LoraAdapter::from_gguf(&lgguf, "default").map_err(|e| {
+            let adapter = rustllama_models::lora::LoraAdapter::from_gguf(&lgguf, "default")
+                .map_err(|e| {
                     CpuEngineError::Other(format!(
                         "LoRA adapter load failed ({}): {e}",
                         lora_path.display()
@@ -597,8 +609,7 @@ impl PagedBatchEngine {
         // zero budget means UNBOUNDED ragged prefill, not the inline path. So MoE
         // is served correctly on the paged engine at any budget; the gate is gone.
         if model.weights.is_hybrid()
-            && (model.cfg.sliding_window.is_some()
-                || model.cfg.attn_logit_softcapping.is_some())
+            && (model.cfg.sliding_window.is_some() || model.cfg.attn_logit_softcapping.is_some())
         {
             return Err(CpuEngineError::Other(
                 "continuous batching (fused_decode) does not support a HYBRID \
@@ -669,9 +680,7 @@ impl PagedBatchEngine {
             page_size,
             model.cfg.head_dim as u32,
         )
-        .ok_or_else(|| CpuEngineError::Other(
-            "paged store init: geometry has a zero dim".into()
-        ))?;
+        .ok_or_else(|| CpuEngineError::Other("paged store init: geometry has a zero dim".into()))?;
         let table = PageTable::new(total_pages, page_size);
         let shared = SharedPagedKv::new(store, table);
         // LMCache: auto-size the CPU cold tier from free RAM (no env var). The
@@ -691,12 +700,19 @@ impl PagedBatchEngine {
                 cap_mb = cold_cap / (1024 * 1024),
                 "LMCache CPU cold tier auto-enabled (paged serving engine)"
             );
-            let path = std::env::temp_dir()
-                .join(format!("rustllama-lmcache-{}.bin", std::process::id()));
+            let path =
+                std::env::temp_dir().join(format!("rustllama-lmcache-{}.bin", std::process::id()));
             if shared.enable_disk_tier(&path, cold_cap) {
-                tracing::info!(cap_mb = cold_cap / (1024 * 1024), ?path, "LMCache disk tier auto-enabled");
+                tracing::info!(
+                    cap_mb = cold_cap / (1024 * 1024),
+                    ?path,
+                    "LMCache disk tier auto-enabled"
+                );
             } else {
-                tracing::warn!(?path, "LMCache disk tier could not be opened — RAM tier only");
+                tracing::warn!(
+                    ?path,
+                    "LMCache disk tier could not be opened — RAM tier only"
+                );
             }
         }
         let model = Arc::new(model);
@@ -711,8 +727,7 @@ impl PagedBatchEngine {
         // `request_rx`; exits cleanly when the channel closes
         // (Drop on PagedBatchEngine drops the matching tx).
         let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel::<NewRequest>();
-        let active_slot_count =
-            Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active_slot_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let last_stats: Arc<std::sync::Mutex<Option<RequestStats>>> =
             Arc::new(std::sync::Mutex::new(None));
         let preemptions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -910,8 +925,7 @@ impl PagedBatchEngine {
             let sampling: SamplingParams = sampling;
             if prompt.is_empty() {
                 return Err(CpuEngineError::Other(
-                    "empty prompt in batch (every slot needs at least one prompt token)"
-                        .into(),
+                    "empty prompt in batch (every slot needs at least one prompt token)".into(),
                 ));
             }
             // E2: client-controlled `max_tokens` can make `prompt_len +
@@ -992,9 +1006,11 @@ impl PagedBatchEngine {
                 // `<= self.max_ctx` here, which fits u32, so the cast can't
                 // truncate.
                 .ensure_capacity_shared(&self.shared, total_capacity as u32)
-                .map_err(|short| CpuEngineError::Other(format!(
-                    "paged batch: pool short by {short} pages on slot prefill"
-                )))?;
+                .map_err(|short| {
+                    CpuEngineError::Other(format!(
+                        "paged batch: pool short by {short} pages on slot prefill"
+                    ))
+                })?;
             // Prefill via single-owner forward_prefill_paged_f32 by
             // bridging through the shared store lock. Skip when the
             // entire prompt lives in shared pages.
@@ -1002,9 +1018,12 @@ impl PagedBatchEngine {
             if shared_lcp < prompt.len() {
                 let suffix: &[i32] = &prompt[shared_lcp..];
                 self.shared.with_store_mut(|store| {
-                    let _ = self
-                        .model
-                        .forward_prefill_paged_f32(suffix, shared_lcp as u32, &mut cache, store);
+                    let _ = self.model.forward_prefill_paged_f32(
+                        suffix,
+                        shared_lcp as u32,
+                        &mut cache,
+                        store,
+                    );
                 });
             }
             let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
@@ -1059,16 +1078,14 @@ impl PagedBatchEngine {
         // call advancing every still-active slot by one token.
         loop {
             // Filter to still-active slots.
-            let active_indices: Vec<usize> =
-                (0..m).filter(|&i| !slots[i].done).collect();
+            let active_indices: Vec<usize> = (0..m).filter(|&i| !slots[i].done).collect();
             if active_indices.is_empty() {
                 break;
             }
             // Allocate per-slot logits buffers for this step. Size
             // == m (one slot per logit row, padded with zeros for
             // done slots; we just don't borrow them).
-            let mut step_logits: Vec<Vec<f32>> =
-                (0..m).map(|_| vec![0f32; vocab]).collect();
+            let mut step_logits: Vec<Vec<f32>> = (0..m).map(|_| vec![0f32; vocab]).collect();
 
             // F8: a HYBRID model advances each active slot with its OWN
             // `forward_one_hybrid` against its OWN contiguous KV + DeltaNet
@@ -1095,8 +1112,10 @@ impl PagedBatchEngine {
                 // start the mutable-borrow phase — otherwise the
                 // mutable borrow on `slots.iter_mut()` blocks the
                 // shared reads below.
-                let next_inputs: Vec<i32> =
-                    active_indices.iter().map(|&i| slots[i].next_input).collect();
+                let next_inputs: Vec<i32> = active_indices
+                    .iter()
+                    .map(|&i| slots[i].next_input)
+                    .collect();
                 let next_positions: Vec<u32> =
                     active_indices.iter().map(|&i| slots[i].next_pos).collect();
                 // Build DecodeSlot vec with disjoint borrows on the
@@ -1108,8 +1127,7 @@ impl PagedBatchEngine {
                 let mut logits_refs: Vec<Option<&mut Vec<f32>>> =
                     step_logits.iter_mut().map(Some).collect();
 
-                let mut decode_slots: Vec<DecodeSlot> =
-                    Vec::with_capacity(active_indices.len());
+                let mut decode_slots: Vec<DecodeSlot> = Vec::with_capacity(active_indices.len());
                 for (k, &i) in active_indices.iter().enumerate() {
                     let cache = cache_refs[i].take().unwrap();
                     let logits = logits_refs[i].take().unwrap();
@@ -1242,15 +1260,13 @@ impl PagedBatchEngine {
         sampling: SamplingParams,
         opts: SubmitOpts,
     ) -> EngineResult<TokenStream> {
-        let request_tx = self
-            .request_tx
-            .as_ref()
-            .ok_or_else(|| EngineError::Engine("paged-batch engine has no driver (post-Drop)".into()))?;
+        let request_tx = self.request_tx.as_ref().ok_or_else(|| {
+            EngineError::Engine("paged-batch engine has no driver (post-Drop)".into())
+        })?;
         // Channel capacity 4 matches `CpuEngine::spawn_stream` —
         // keeps the engine ~one decode tick ahead of the SSE
         // consumer so a client disconnect drains fast.
-        let (response_tx, mut response_rx) =
-            tokio::sync::mpsc::channel::<EngineResult<Token>>(4);
+        let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<EngineResult<Token>>(4);
         request_tx
             .send(NewRequest {
                 prompt,
@@ -1290,10 +1306,9 @@ impl PagedBatchEngine {
         sampling: SamplingParams,
         opts: SubmitOpts,
     ) -> EngineResult<TokenStream> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| EngineError::Unimplemented("submit_text_streaming requires a tokenizer"))?;
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+            EngineError::Unimplemented("submit_text_streaming requires a tokenizer")
+        })?;
         // BOS handling defers to the tokenizer's per-model defaults
         // (same as `CpuEngine::spawn_stream`'s tokenize call inside
         // `drive_generation`).
@@ -1310,10 +1325,7 @@ impl PagedBatchEngine {
 
 impl Engine for PagedBatchEngine {
     fn last_request_stats_snapshot(&self) -> Option<RequestStats> {
-        self.last_stats
-            .lock()
-            .ok()
-            .and_then(|g| g.clone())
+        self.last_stats.lock().ok().and_then(|g| g.clone())
     }
 
     fn metrics(&self) -> Metrics {
@@ -1353,11 +1365,7 @@ impl Engine for PagedBatchEngine {
         Ok(tokenizer.encode(text, tokenizer.add_bos_token())?)
     }
 
-    fn chat(
-        &self,
-        msgs: &[ChatMessage],
-        s: &SamplingParams,
-    ) -> EngineResult<TokenStream> {
+    fn chat(&self, msgs: &[ChatMessage], s: &SamplingParams) -> EngineResult<TokenStream> {
         let tokenizer = self
             .tokenizer
             .as_ref()
@@ -1375,11 +1383,7 @@ impl Engine for PagedBatchEngine {
         self.submit_text_streaming(&prompt, s.clone())
     }
 
-    fn generate(
-        &self,
-        prompt: &str,
-        s: &SamplingParams,
-    ) -> EngineResult<TokenStream> {
+    fn generate(&self, prompt: &str, s: &SamplingParams) -> EngineResult<TokenStream> {
         self.submit_text_streaming(prompt, s.clone())
     }
 }
@@ -1798,12 +1802,14 @@ fn driver_loop(
                 .checked_add(req.sampling.max_tokens as usize)
                 .unwrap_or(usize::MAX);
             if total_capacity > ctx.max_ctx {
-                let _ = req.response_tx.blocking_send(Err(EngineError::Engine(format!(
-                    "prompt too long: {} tokens + max_tokens {} > max_ctx {}",
-                    req.prompt.len(),
-                    req.sampling.max_tokens,
-                    ctx.max_ctx,
-                ))));
+                let _ = req
+                    .response_tx
+                    .blocking_send(Err(EngineError::Engine(format!(
+                        "prompt too long: {} tokens + max_tokens {} > max_ctx {}",
+                        req.prompt.len(),
+                        req.sampling.max_tokens,
+                        ctx.max_ctx,
+                    ))));
                 continue;
             }
             // F8: a HYBRID slot never touches the shared page pool (its KV +
@@ -1815,11 +1821,13 @@ fn driver_loop(
                 total_capacity.div_ceil(page_size.max(1))
             };
             if needed > ctx.total_pages as usize {
-                let _ = req.response_tx.blocking_send(Err(EngineError::Engine(format!(
-                    "request needs {needed} pages but the paged pool holds only {} \
+                let _ = req
+                    .response_tx
+                    .blocking_send(Err(EngineError::Engine(format!(
+                        "request needs {needed} pages but the paged pool holds only {} \
                      (shorten the prompt or lower max_tokens)",
-                    ctx.total_pages,
-                ))));
+                        ctx.total_pages,
+                    ))));
                 continue;
             }
             // Make room (free slot + pages), preempting lower-priority slots.
@@ -1829,7 +1837,14 @@ fn driver_loop(
                 pending.push(PendingEntry(req));
                 break;
             }
-            match admit_request(&ctx, &req.prompt, &req.sampling, eos, &active, req.skip_emit) {
+            match admit_request(
+                &ctx,
+                &req.prompt,
+                &req.sampling,
+                eos,
+                &active,
+                req.skip_emit,
+            ) {
                 Ok(state) => {
                     active.push(DriverSlot {
                         state,
@@ -2458,8 +2473,10 @@ fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
     // slot participates at most once, so the `Option::take` trick hands out one
     // `&mut PagedKvCache` per slot; `logits_store.iter_mut()` gives each row its
     // own `&mut [f32]`.
-    let mut cache_refs: Vec<Option<&mut PagedKvCache>> =
-        active.iter_mut().map(|s| Some(&mut s.state.cache)).collect();
+    let mut cache_refs: Vec<Option<&mut PagedKvCache>> = active
+        .iter_mut()
+        .map(|s| Some(&mut s.state.cache))
+        .collect();
     let mut ragged: Vec<RaggedSlot> = Vec::with_capacity(plan.len());
     for ((i, _kind, n_query, start_pos), logits_slot) in plan.iter().zip(logits_store.iter_mut()) {
         let cache = cache_refs[*i]
@@ -2788,7 +2805,10 @@ fn run_spec_round_for_slot(ctx: &DriverContext, slot: &mut DriverSlot, vocab: us
         let out = if greedy {
             accept_reject_greedy(&no_drafts, &target)
         } else {
-            let rng = slot.state.spec_rng.get_or_insert_with(|| Rng::from_seed(seed));
+            let rng = slot
+                .state
+                .spec_rng
+                .get_or_insert_with(|| Rng::from_seed(seed));
             accept_reject(&no_drafts, &target, rng)
         };
         committed = vec![out.replacement];
@@ -2819,7 +2839,10 @@ fn run_spec_round_for_slot(ctx: &DriverContext, slot: &mut DriverSlot, vocab: us
         let outcome = if greedy {
             tree_accept_reject_greedy(&nodes, &main_dist, &next_refs)
         } else {
-            let rng = slot.state.spec_rng.get_or_insert_with(|| Rng::from_seed(seed));
+            let rng = slot
+                .state
+                .spec_rng
+                .get_or_insert_with(|| Rng::from_seed(seed));
             tree_accept_reject(&nodes, &main_dist, &next_refs, rng)
         };
         let a = outcome.accepted.len();
@@ -2830,8 +2853,7 @@ fn run_spec_round_for_slot(ctx: &DriverContext, slot: &mut DriverSlot, vocab: us
         ctx.shared.with_store_mut(|store| {
             store.compact_positions(&pages, base + 1, &outcome.accepted_nodes);
         });
-        slot
-            .state
+        slot.state
             .cache
             .set_seq_len_for_rollback(base_pos + 1 + a as u32);
         let mut c = outcome.accepted;
@@ -3082,9 +3104,8 @@ mod tests {
         // the overlap pipeline on or off. Greedy (temperature 0) + fixed seed →
         // deterministic generation, so any difference is the overlap's fault.
         let run = |overlap: bool, n_slots: usize| -> Vec<Vec<u32>> {
-            let engine =
-                PagedBatchEngine::load_token_id_only_with_overlap(&path, 64, 4, overlap)
-                    .expect("load synth paged engine");
+            let engine = PagedBatchEngine::load_token_id_only_with_overlap(&path, 64, 4, overlap)
+                .expect("load synth paged engine");
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()

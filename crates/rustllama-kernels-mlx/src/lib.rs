@@ -161,80 +161,581 @@ extern "C" {
         n_elems: c_int,
         block: c_int,
     ) -> c_int;
-    fn rsl_mlx_matvec_q8_0_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_q8_0_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_q4_k_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_q4_k_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_q6_k_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_q6_k_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
+    fn rsl_mlx_matvec_q8_0_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q8_0_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q4_k_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q4_k_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q6_k_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q6_k_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
 
     // Additional packed matvecs (K-quants Q5_K/Q2_K/Q8_K/Q3_K, legacy quants
     // Q4_0/Q5_0/Q4_1/Q5_1, IQ family, NVFP4/MXFP4/6/8, PQ2_0). One GPU
     // thread(group) per output row.
-    fn rsl_mlx_matvec_q5_k_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_q5_k_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_q2_k_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_q2_k_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_q8_k_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_q8_k_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_q4_0_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_q4_0_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_q5_0_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_q5_0_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_q4_1_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_q4_1_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_q5_1_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_q5_1_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq4_nl_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq4_nl_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq4_xs_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq4_xs_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq2_xxs_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq2_xxs_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq2_xs_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq2_xs_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq2_s_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq2_s_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq3_xxs_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq3_xxs_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq3_s_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq3_s_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq1_s_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq1_s_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq1_m_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq1_m_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_nvfp4_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_nvfp4_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
+    fn rsl_mlx_matvec_q5_k_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q5_k_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q2_k_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q2_k_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q8_k_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q8_k_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q4_0_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q4_0_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q5_0_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q5_0_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q4_1_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q4_1_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q5_1_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q5_1_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq4_nl_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq4_nl_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq4_xs_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq4_xs_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq2_xxs_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq2_xxs_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq2_xs_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq2_xs_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq2_s_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq2_s_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq3_xxs_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq3_xxs_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq3_s_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq3_s_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq1_s_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq1_s_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq1_m_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq1_m_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_nvfp4_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_nvfp4_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
     // OCP Microscaling FP4/FP6/FP8. 32-elem blocks + trailing E8M0 scale
     // byte; K%32==0. MXFP4: 17 B, MXFP6: 25 B, MXFP8: 33 B per block.
-    fn rsl_mlx_matvec_mxfp4_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_mxfp4_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_mxfp6_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_mxfp6_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_mxfp8_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_mxfp8_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
+    fn rsl_mlx_matvec_mxfp4_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_mxfp4_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_mxfp6_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_mxfp6_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_mxfp8_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_mxfp8_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
     // Q3_K + PQ2_0. Q3_K: 110 B/256, K%256==0. PQ2_0: 34 B/128, K%128==0.
-    fn rsl_mlx_matvec_q3_k_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_q3_k_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
-    fn rsl_mlx_matvec_pq2_0_packed_f32(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_pq2_0_packed_f32_batched(s: *mut RslMlxStreamRaw, w: *const c_void, x: *const f32, out: *mut f32, m: c_int, k: c_int, n: c_int) -> c_int;
+    fn rsl_mlx_matvec_q3_k_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q3_k_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_pq2_0_packed_f32(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_pq2_0_packed_f32_batched(
+        s: *mut RslMlxStreamRaw,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+    ) -> c_int;
 
     // Fused gate+up matvec (decode): one dispatch computes gate_out + up_out.
     // gw/uw = packed gate/up weights [M,K]; gout/uout = [M] device ptrs.
-    fn rsl_mlx_matvec_q8_0_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_q4_k_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_q6_k_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_q5_k_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq4_nl_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq4_xs_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq1_s_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq1_m_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq2_xxs_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq2_xs_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq2_s_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq3_xxs_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_iq3_s_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
-    fn rsl_mlx_matvec_ptq1_0_packed_f32_gate_up_fused(s: *mut RslMlxStreamRaw, gw: *const c_void, uw: *const c_void, x: *const f32, gout: *mut f32, uout: *mut f32, m: c_int, k: c_int) -> c_int;
+    fn rsl_mlx_matvec_q8_0_packed_f32_gate_up_fused(
+        s: *mut RslMlxStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q4_k_packed_f32_gate_up_fused(
+        s: *mut RslMlxStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q6_k_packed_f32_gate_up_fused(
+        s: *mut RslMlxStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_q5_k_packed_f32_gate_up_fused(
+        s: *mut RslMlxStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq4_nl_packed_f32_gate_up_fused(
+        s: *mut RslMlxStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq4_xs_packed_f32_gate_up_fused(
+        s: *mut RslMlxStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq1_s_packed_f32_gate_up_fused(
+        s: *mut RslMlxStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq1_m_packed_f32_gate_up_fused(
+        s: *mut RslMlxStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq2_xxs_packed_f32_gate_up_fused(
+        s: *mut RslMlxStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq2_xs_packed_f32_gate_up_fused(
+        s: *mut RslMlxStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq2_s_packed_f32_gate_up_fused(
+        s: *mut RslMlxStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq3_xxs_packed_f32_gate_up_fused(
+        s: *mut RslMlxStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_iq3_s_packed_f32_gate_up_fused(
+        s: *mut RslMlxStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
+    fn rsl_mlx_matvec_ptq1_0_packed_f32_gate_up_fused(
+        s: *mut RslMlxStreamRaw,
+        gw: *const c_void,
+        uw: *const c_void,
+        x: *const f32,
+        gout: *mut f32,
+        uout: *mut f32,
+        m: c_int,
+        k: c_int,
+    ) -> c_int;
 
     // Forward-pass primitives (device-resident, f32).
     fn rsl_mlx_add_rmsnorm_f32(
@@ -668,7 +1169,14 @@ pub fn rmsnorm_f32(
     assert!(w.len() >= d);
     // SAFETY: slices outlive the call; lengths are checked above.
     let rc = unsafe {
-        rsl_mlx_rmsnorm_f32(x.as_ptr(), w.as_ptr(), y.as_mut_ptr(), n_rows as c_int, d as c_int, eps)
+        rsl_mlx_rmsnorm_f32(
+            x.as_ptr(),
+            w.as_ptr(),
+            y.as_mut_ptr(),
+            n_rows as c_int,
+            d as c_int,
+            eps,
+        )
     };
     if rc == 0 {
         Ok(())
@@ -690,7 +1198,13 @@ pub fn matvec_f32(
     assert!(out.len() >= m_rows);
     // SAFETY: slices outlive the call; lengths are checked above.
     let rc = unsafe {
-        rsl_mlx_matvec_f32(weights.as_ptr(), x.as_ptr(), out.as_mut_ptr(), m_rows as c_int, k_dim as c_int)
+        rsl_mlx_matvec_f32(
+            weights.as_ptr(),
+            x.as_ptr(),
+            out.as_mut_ptr(),
+            m_rows as c_int,
+            k_dim as c_int,
+        )
     };
     if rc == 0 {
         Ok(())
@@ -776,7 +1290,10 @@ impl MlxStream {
         if raw.is_null() {
             None
         } else {
-            Some(Self { raw, device: device_index })
+            Some(Self {
+                raw,
+                device: device_index,
+            })
         }
     }
     pub fn device(&self) -> u32 {
@@ -820,7 +1337,11 @@ impl<'s> MlxDeviceBuffer<'s> {
         if ptr.is_null() {
             None
         } else {
-            Some(Self { ptr, len_bytes: src.len(), stream })
+            Some(Self {
+                ptr,
+                len_bytes: src.len(),
+                stream,
+            })
         }
     }
     /// Allocate `n_bytes` of uninitialized device memory.
@@ -833,7 +1354,11 @@ impl<'s> MlxDeviceBuffer<'s> {
         if ptr.is_null() {
             None
         } else {
-            Some(Self { ptr, len_bytes: n_bytes, stream })
+            Some(Self {
+                ptr,
+                len_bytes: n_bytes,
+                stream,
+            })
         }
     }
     pub fn as_ptr(&self) -> *const c_void {
@@ -1019,8 +1544,14 @@ pub unsafe fn hadamard_forward(
     n_elems: usize,
     block: usize,
 ) -> Result<(), MlxError> {
-    let rc =
-        rsl_mlx_hadamard_forward(stream.raw(), x, signs, out, n_elems as c_int, block as c_int);
+    let rc = rsl_mlx_hadamard_forward(
+        stream.raw(),
+        x,
+        signs,
+        out,
+        n_elems as c_int,
+        block as c_int,
+    );
     if rc == 0 {
         Ok(())
     } else {
@@ -1095,20 +1626,62 @@ macro_rules! mlx_gate_up_fused {
         }
     };
 }
-mlx_gate_up_fused!(matvec_q8_0_gate_up_fused, rsl_mlx_matvec_q8_0_packed_f32_gate_up_fused);
-mlx_gate_up_fused!(matvec_q4_k_gate_up_fused, rsl_mlx_matvec_q4_k_packed_f32_gate_up_fused);
-mlx_gate_up_fused!(matvec_q6_k_gate_up_fused, rsl_mlx_matvec_q6_k_packed_f32_gate_up_fused);
-mlx_gate_up_fused!(matvec_q5_k_gate_up_fused, rsl_mlx_matvec_q5_k_packed_f32_gate_up_fused);
-mlx_gate_up_fused!(matvec_iq4_nl_gate_up_fused, rsl_mlx_matvec_iq4_nl_packed_f32_gate_up_fused);
-mlx_gate_up_fused!(matvec_iq4_xs_gate_up_fused, rsl_mlx_matvec_iq4_xs_packed_f32_gate_up_fused);
-mlx_gate_up_fused!(matvec_iq1_s_gate_up_fused, rsl_mlx_matvec_iq1_s_packed_f32_gate_up_fused);
-mlx_gate_up_fused!(matvec_iq1_m_gate_up_fused, rsl_mlx_matvec_iq1_m_packed_f32_gate_up_fused);
-mlx_gate_up_fused!(matvec_iq2_xxs_gate_up_fused, rsl_mlx_matvec_iq2_xxs_packed_f32_gate_up_fused);
-mlx_gate_up_fused!(matvec_iq2_xs_gate_up_fused, rsl_mlx_matvec_iq2_xs_packed_f32_gate_up_fused);
-mlx_gate_up_fused!(matvec_iq2_s_gate_up_fused, rsl_mlx_matvec_iq2_s_packed_f32_gate_up_fused);
-mlx_gate_up_fused!(matvec_iq3_xxs_gate_up_fused, rsl_mlx_matvec_iq3_xxs_packed_f32_gate_up_fused);
-mlx_gate_up_fused!(matvec_iq3_s_gate_up_fused, rsl_mlx_matvec_iq3_s_packed_f32_gate_up_fused);
-mlx_gate_up_fused!(matvec_ptq1_0_gate_up_fused, rsl_mlx_matvec_ptq1_0_packed_f32_gate_up_fused);
+mlx_gate_up_fused!(
+    matvec_q8_0_gate_up_fused,
+    rsl_mlx_matvec_q8_0_packed_f32_gate_up_fused
+);
+mlx_gate_up_fused!(
+    matvec_q4_k_gate_up_fused,
+    rsl_mlx_matvec_q4_k_packed_f32_gate_up_fused
+);
+mlx_gate_up_fused!(
+    matvec_q6_k_gate_up_fused,
+    rsl_mlx_matvec_q6_k_packed_f32_gate_up_fused
+);
+mlx_gate_up_fused!(
+    matvec_q5_k_gate_up_fused,
+    rsl_mlx_matvec_q5_k_packed_f32_gate_up_fused
+);
+mlx_gate_up_fused!(
+    matvec_iq4_nl_gate_up_fused,
+    rsl_mlx_matvec_iq4_nl_packed_f32_gate_up_fused
+);
+mlx_gate_up_fused!(
+    matvec_iq4_xs_gate_up_fused,
+    rsl_mlx_matvec_iq4_xs_packed_f32_gate_up_fused
+);
+mlx_gate_up_fused!(
+    matvec_iq1_s_gate_up_fused,
+    rsl_mlx_matvec_iq1_s_packed_f32_gate_up_fused
+);
+mlx_gate_up_fused!(
+    matvec_iq1_m_gate_up_fused,
+    rsl_mlx_matvec_iq1_m_packed_f32_gate_up_fused
+);
+mlx_gate_up_fused!(
+    matvec_iq2_xxs_gate_up_fused,
+    rsl_mlx_matvec_iq2_xxs_packed_f32_gate_up_fused
+);
+mlx_gate_up_fused!(
+    matvec_iq2_xs_gate_up_fused,
+    rsl_mlx_matvec_iq2_xs_packed_f32_gate_up_fused
+);
+mlx_gate_up_fused!(
+    matvec_iq2_s_gate_up_fused,
+    rsl_mlx_matvec_iq2_s_packed_f32_gate_up_fused
+);
+mlx_gate_up_fused!(
+    matvec_iq3_xxs_gate_up_fused,
+    rsl_mlx_matvec_iq3_xxs_packed_f32_gate_up_fused
+);
+mlx_gate_up_fused!(
+    matvec_iq3_s_gate_up_fused,
+    rsl_mlx_matvec_iq3_s_packed_f32_gate_up_fused
+);
+mlx_gate_up_fused!(
+    matvec_ptq1_0_gate_up_fused,
+    rsl_mlx_matvec_ptq1_0_packed_f32_gate_up_fused
+);
 
 mlx_packed_matvec!(
     matvec_q8_0_packed_f32,
@@ -1551,12 +2124,24 @@ pub unsafe fn flash_attn_decode_q4_0(
     softcap: f32,
 ) -> Result<(), MlxError> {
     let rc = rsl_mlx_flash_attn_decode_q4_0(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int, kv_len as c_int,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len as c_int,
         window as c_int,
         softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(MlxError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(MlxError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention prefill for a Q4_0 KV cache. `q`/`out` are
@@ -1584,13 +2169,25 @@ pub unsafe fn flash_attn_prefill_q4_0(
     softcap: f32,
 ) -> Result<(), MlxError> {
     let rc = rsl_mlx_flash_attn_prefill_q4_0(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
-        kv_len_base as c_int, n_new as c_int,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len_base as c_int,
+        n_new as c_int,
         window as c_int,
         softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(MlxError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(MlxError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention decode for an NVFP4 KV cache. Layout as
@@ -1616,12 +2213,24 @@ pub unsafe fn flash_attn_decode_nvfp4(
     softcap: f32,
 ) -> Result<(), MlxError> {
     let rc = rsl_mlx_flash_attn_decode_nvfp4(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int, kv_len as c_int,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len as c_int,
         window as c_int,
         softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(MlxError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(MlxError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention prefill for an NVFP4 KV cache.
@@ -1648,13 +2257,25 @@ pub unsafe fn flash_attn_prefill_nvfp4(
     softcap: f32,
 ) -> Result<(), MlxError> {
     let rc = rsl_mlx_flash_attn_prefill_nvfp4(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
-        kv_len_base as c_int, n_new as c_int,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len_base as c_int,
+        n_new as c_int,
         window as c_int,
         softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(MlxError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(MlxError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention decode for an MXFP4 KV cache. Layout as
@@ -1681,12 +2302,24 @@ pub unsafe fn flash_attn_decode_mxfp4(
     softcap: f32,
 ) -> Result<(), MlxError> {
     let rc = rsl_mlx_flash_attn_decode_mxfp4(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int, kv_len as c_int,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len as c_int,
         window as c_int,
         softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(MlxError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(MlxError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention prefill for an MXFP4 KV cache.
@@ -1713,13 +2346,25 @@ pub unsafe fn flash_attn_prefill_mxfp4(
     softcap: f32,
 ) -> Result<(), MlxError> {
     let rc = rsl_mlx_flash_attn_prefill_mxfp4(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
-        kv_len_base as c_int, n_new as c_int,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len_base as c_int,
+        n_new as c_int,
         window as c_int,
         softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(MlxError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(MlxError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention decode for an MXFP6 KV cache. Layout as
@@ -1746,12 +2391,24 @@ pub unsafe fn flash_attn_decode_mxfp6(
     softcap: f32,
 ) -> Result<(), MlxError> {
     let rc = rsl_mlx_flash_attn_decode_mxfp6(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int, kv_len as c_int,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len as c_int,
         window as c_int,
         softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(MlxError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(MlxError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention prefill for an MXFP6 KV cache.
@@ -1778,13 +2435,25 @@ pub unsafe fn flash_attn_prefill_mxfp6(
     softcap: f32,
 ) -> Result<(), MlxError> {
     let rc = rsl_mlx_flash_attn_prefill_mxfp6(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
-        kv_len_base as c_int, n_new as c_int,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len_base as c_int,
+        n_new as c_int,
         window as c_int,
         softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(MlxError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(MlxError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention decode for an MXFP8 KV cache. Layout as
@@ -1811,12 +2480,24 @@ pub unsafe fn flash_attn_decode_mxfp8(
     softcap: f32,
 ) -> Result<(), MlxError> {
     let rc = rsl_mlx_flash_attn_decode_mxfp8(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int, kv_len as c_int,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len as c_int,
         window as c_int,
         softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(MlxError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(MlxError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention prefill for an MXFP8 KV cache.
@@ -1843,13 +2524,25 @@ pub unsafe fn flash_attn_prefill_mxfp8(
     softcap: f32,
 ) -> Result<(), MlxError> {
     let rc = rsl_mlx_flash_attn_prefill_mxfp8(
-        stream.raw(), q, k_packed, v_packed, out, n_heads as c_int,
-        n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
-        kv_len_base as c_int, n_new as c_int,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len_base as c_int,
+        n_new as c_int,
         window as c_int,
         softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(MlxError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(MlxError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention decode for a TurboQuant KV cache.
@@ -1880,13 +2573,27 @@ pub unsafe fn flash_attn_decode_tq(
     softcap: f32,
 ) -> Result<(), MlxError> {
     let rc = rsl_mlx_flash_attn_decode_tq(
-        stream.raw(), q, k_packed, v_packed, k_scales, v_scales, bits as c_int,
-        out, n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
-        max_ctx as c_int, kv_len as c_int,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        k_scales,
+        v_scales,
+        bits as c_int,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len as c_int,
         window as c_int,
         softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(MlxError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(MlxError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention prefill for a TurboQuant KV cache.
@@ -1916,13 +2623,28 @@ pub unsafe fn flash_attn_prefill_tq(
     softcap: f32,
 ) -> Result<(), MlxError> {
     let rc = rsl_mlx_flash_attn_prefill_tq(
-        stream.raw(), q, k_packed, v_packed, k_scales, v_scales, bits as c_int,
-        out, n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
-        max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        k_scales,
+        v_scales,
+        bits as c_int,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len_base as c_int,
+        n_new as c_int,
         window as c_int,
         softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(MlxError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(MlxError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention decode for a Q8_0 KV cache. `q`/`out` are
@@ -1955,13 +2677,26 @@ pub unsafe fn flash_attn_decode_q8_0(
     softcap: f32,
 ) -> Result<(), MlxError> {
     let rc = rsl_mlx_flash_attn_decode_q8_0(
-        stream.raw(), q, k_packed, v_packed, k_scales, v_scales, out,
-        n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
-        max_ctx as c_int, kv_len as c_int,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        k_scales,
+        v_scales,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len as c_int,
         window as c_int,
         softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(MlxError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(MlxError::Kernel(rc))
+    }
 }
 
 /// Quantized-KV FlashAttention prefill for a Q8_0 KV cache. `q`/`out` are
@@ -1992,13 +2727,27 @@ pub unsafe fn flash_attn_prefill_q8_0(
     softcap: f32,
 ) -> Result<(), MlxError> {
     let rc = rsl_mlx_flash_attn_prefill_q8_0(
-        stream.raw(), q, k_packed, v_packed, k_scales, v_scales, out,
-        n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
-        max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
+        stream.raw(),
+        q,
+        k_packed,
+        v_packed,
+        k_scales,
+        v_scales,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        max_ctx as c_int,
+        kv_len_base as c_int,
+        n_new as c_int,
         window as c_int,
         softcap,
     );
-    if rc == 0 { Ok(()) } else { Err(MlxError::Kernel(rc)) }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(MlxError::Kernel(rc))
+    }
 }
 
 /// Greedy argmax over `vocab` f32 logits; writes the chosen index to
@@ -2066,7 +2815,15 @@ pub unsafe fn decode_attn_block_f32(
     wo_dev: *const c_void,
     ko: i32,
     // Optional dense FFN: (w_gate, k_gate, w_up, k_up, w_down, k_down, d_ff).
-    dense_ffn: Option<(*const c_void, i32, *const c_void, i32, *const c_void, i32, u32)>,
+    dense_ffn: Option<(
+        *const c_void,
+        i32,
+        *const c_void,
+        i32,
+        *const c_void,
+        i32,
+        u32,
+    )>,
     attn_norm: *const f32,
     ffn_norm: *const f32,
     inv_freq: *const f32,
@@ -2100,18 +2857,31 @@ pub unsafe fn decode_attn_block_f32(
     let mut ffn_ran: c_int = 0;
     let ran = rsl_mlx_decode_attn_block_f32(
         stream.raw(),
-        wq_dev, kq as c_int,
-        wk_dev, kk as c_int,
-        wv_dev, kv_kind as c_int,
-        wo_dev, ko as c_int,
-        wg, kg as c_int,
-        wu, ku as c_int,
-        wd, kd as c_int,
+        wq_dev,
+        kq as c_int,
+        wk_dev,
+        kk as c_int,
+        wv_dev,
+        kv_kind as c_int,
+        wo_dev,
+        ko as c_int,
+        wg,
+        kg as c_int,
+        wu,
+        ku as c_int,
+        wd,
+        kd as c_int,
         d_ff,
         &mut ffn_ran as *mut c_int,
-        attn_norm, ffn_norm, inv_freq,
-        hidden, h_norm2, k_row, v_row,
-        k_mirror, v_mirror,
+        attn_norm,
+        ffn_norm,
+        inv_freq,
+        hidden,
+        h_norm2,
+        k_row,
+        v_row,
+        k_mirror,
+        v_mirror,
         n_heads as c_int,
         n_kv_heads as c_int,
         head_dim as c_int,
@@ -2277,7 +3047,11 @@ impl RawDevBuf {
         if ptr.is_null() {
             None
         } else {
-            Some(Self { ptr, cap_bytes: n_bytes, raw_stream: stream.raw() })
+            Some(Self {
+                ptr,
+                cap_bytes: n_bytes,
+                raw_stream: stream.raw(),
+            })
         }
     }
     /// Upload `src` bytes (must be <= cap). Returns false on failure.
@@ -2439,8 +3213,7 @@ impl MlxMatvecCache {
         {
             return false;
         }
-        let x_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
+        let x_bytes: &[u8] = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
         if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
             return false;
         }
@@ -2451,32 +3224,84 @@ impl MlxMatvecCache {
         // (M,K); the wrapper synchronizes before returning.
         let res = unsafe {
             match kind {
-                MlxPackedKind::Ptq1_0 => matvec_ptq1_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Q8_0 => matvec_q8_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Q4_K => matvec_q4_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Q6_K => matvec_q6_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Q5_K => matvec_q5_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Q2_K => matvec_q2_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Q8_K => matvec_q8_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Q4_0 => matvec_q4_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Q5_0 => matvec_q5_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Q4_1 => matvec_q4_1_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Q5_1 => matvec_q5_1_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Iq4_Nl => matvec_iq4_nl_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Iq4_Xs => matvec_iq4_xs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Iq2_Xxs => matvec_iq2_xxs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Iq2_Xs => matvec_iq2_xs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Iq2_S => matvec_iq2_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Iq3_Xxs => matvec_iq3_xxs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Iq3_S => matvec_iq3_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Iq1_S => matvec_iq1_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Iq1_M => matvec_iq1_m_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Nvfp4 => matvec_nvfp4_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Mxfp4 => matvec_mxfp4_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Mxfp6 => matvec_mxfp6_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Mxfp8 => matvec_mxfp8_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Q3_K => matvec_q3_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
-                MlxPackedKind::Pq2_0 => matvec_pq2_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k),
+                MlxPackedKind::Ptq1_0 => {
+                    matvec_ptq1_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Q8_0 => {
+                    matvec_q8_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Q4_K => {
+                    matvec_q4_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Q6_K => {
+                    matvec_q6_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Q5_K => {
+                    matvec_q5_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Q2_K => {
+                    matvec_q2_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Q8_K => {
+                    matvec_q8_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Q4_0 => {
+                    matvec_q4_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Q5_0 => {
+                    matvec_q5_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Q4_1 => {
+                    matvec_q4_1_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Q5_1 => {
+                    matvec_q5_1_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Iq4_Nl => {
+                    matvec_iq4_nl_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Iq4_Xs => {
+                    matvec_iq4_xs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Iq2_Xxs => {
+                    matvec_iq2_xxs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Iq2_Xs => {
+                    matvec_iq2_xs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Iq2_S => {
+                    matvec_iq2_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Iq3_Xxs => {
+                    matvec_iq3_xxs_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Iq3_S => {
+                    matvec_iq3_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Iq1_S => {
+                    matvec_iq1_s_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Iq1_M => {
+                    matvec_iq1_m_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Nvfp4 => {
+                    matvec_nvfp4_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Mxfp4 => {
+                    matvec_mxfp4_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Mxfp6 => {
+                    matvec_mxfp6_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Mxfp8 => {
+                    matvec_mxfp8_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Q3_K => {
+                    matvec_q3_k_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
+                MlxPackedKind::Pq2_0 => {
+                    matvec_pq2_0_packed_f32(&self.stream, w_ptr, x_ptr, out_ptr, m, k)
+                }
             }
         };
         if res.is_err() || consume_error_count() != 0 {
@@ -2512,9 +3337,7 @@ impl MlxMatvecCache {
             return false;
         }
         let row_bytes = m * kind.row_bytes(k);
-        if k % kind.k_alignment() != 0
-            || gate_bytes.len() < row_bytes
-            || up_bytes.len() < row_bytes
+        if k % kind.k_alignment() != 0 || gate_bytes.len() < row_bytes || up_bytes.len() < row_bytes
         {
             return false;
         }
@@ -2526,8 +3349,7 @@ impl MlxMatvecCache {
         {
             return false;
         }
-        let x_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
+        let x_bytes: &[u8] = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, k * 4) };
         if !self.x_scratch.as_mut().unwrap().upload(x_bytes) {
             return false;
         }
@@ -2541,20 +3363,146 @@ impl MlxMatvecCache {
         // sized for (M,K) / 2*M; the wrapper synchronizes before returning.
         let res = unsafe {
             match kind {
-                MlxPackedKind::Q8_0 => matvec_q8_0_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                MlxPackedKind::Q4_K => matvec_q4_k_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                MlxPackedKind::Q6_K => matvec_q6_k_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                MlxPackedKind::Q5_K => matvec_q5_k_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                MlxPackedKind::Iq4_Nl => matvec_iq4_nl_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                MlxPackedKind::Iq4_Xs => matvec_iq4_xs_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                MlxPackedKind::Iq1_S => matvec_iq1_s_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                MlxPackedKind::Iq1_M => matvec_iq1_m_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                MlxPackedKind::Iq2_Xxs => matvec_iq2_xxs_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                MlxPackedKind::Iq2_Xs => matvec_iq2_xs_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                MlxPackedKind::Iq2_S => matvec_iq2_s_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                MlxPackedKind::Iq3_Xxs => matvec_iq3_xxs_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                MlxPackedKind::Iq3_S => matvec_iq3_s_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
-                MlxPackedKind::Ptq1_0 => matvec_ptq1_0_gate_up_fused(&self.stream, gw_ptr, uw_ptr, x_ptr, gout_ptr, uout_ptr, m, k),
+                MlxPackedKind::Q8_0 => matvec_q8_0_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                MlxPackedKind::Q4_K => matvec_q4_k_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                MlxPackedKind::Q6_K => matvec_q6_k_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                MlxPackedKind::Q5_K => matvec_q5_k_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                MlxPackedKind::Iq4_Nl => matvec_iq4_nl_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                MlxPackedKind::Iq4_Xs => matvec_iq4_xs_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                MlxPackedKind::Iq1_S => matvec_iq1_s_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                MlxPackedKind::Iq1_M => matvec_iq1_m_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                MlxPackedKind::Iq2_Xxs => matvec_iq2_xxs_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                MlxPackedKind::Iq2_Xs => matvec_iq2_xs_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                MlxPackedKind::Iq2_S => matvec_iq2_s_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                MlxPackedKind::Iq3_Xxs => matvec_iq3_xxs_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                MlxPackedKind::Iq3_S => matvec_iq3_s_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
+                MlxPackedKind::Ptq1_0 => matvec_ptq1_0_gate_up_fused(
+                    &self.stream,
+                    gw_ptr,
+                    uw_ptr,
+                    x_ptr,
+                    gout_ptr,
+                    uout_ptr,
+                    m,
+                    k,
+                ),
                 // No fused kernel for the remaining kinds — caller falls back.
                 _ => return false,
             }
@@ -2615,32 +3563,84 @@ impl MlxMatvecCache {
         // SAFETY: as `matvec_packed`, with x/out sized for N rows.
         let res = unsafe {
             match kind {
-                MlxPackedKind::Ptq1_0 => matvec_ptq1_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Q8_0 => matvec_q8_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Q4_K => matvec_q4_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Q6_K => matvec_q6_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Q5_K => matvec_q5_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Q2_K => matvec_q2_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Q8_K => matvec_q8_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Q4_0 => matvec_q4_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Q5_0 => matvec_q5_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Q4_1 => matvec_q4_1_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Q5_1 => matvec_q5_1_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Iq4_Nl => matvec_iq4_nl_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Iq4_Xs => matvec_iq4_xs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Iq2_Xxs => matvec_iq2_xxs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Iq2_Xs => matvec_iq2_xs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Iq2_S => matvec_iq2_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Iq3_Xxs => matvec_iq3_xxs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Iq3_S => matvec_iq3_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Iq1_S => matvec_iq1_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Iq1_M => matvec_iq1_m_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Nvfp4 => matvec_nvfp4_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Mxfp4 => matvec_mxfp4_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Mxfp6 => matvec_mxfp6_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Mxfp8 => matvec_mxfp8_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Q3_K => matvec_q3_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
-                MlxPackedKind::Pq2_0 => matvec_pq2_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n),
+                MlxPackedKind::Ptq1_0 => {
+                    matvec_ptq1_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Q8_0 => {
+                    matvec_q8_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Q4_K => {
+                    matvec_q4_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Q6_K => {
+                    matvec_q6_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Q5_K => {
+                    matvec_q5_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Q2_K => {
+                    matvec_q2_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Q8_K => {
+                    matvec_q8_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Q4_0 => {
+                    matvec_q4_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Q5_0 => {
+                    matvec_q5_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Q4_1 => {
+                    matvec_q4_1_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Q5_1 => {
+                    matvec_q5_1_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Iq4_Nl => {
+                    matvec_iq4_nl_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Iq4_Xs => {
+                    matvec_iq4_xs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Iq2_Xxs => {
+                    matvec_iq2_xxs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Iq2_Xs => {
+                    matvec_iq2_xs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Iq2_S => {
+                    matvec_iq2_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Iq3_Xxs => {
+                    matvec_iq3_xxs_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Iq3_S => {
+                    matvec_iq3_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Iq1_S => {
+                    matvec_iq1_s_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Iq1_M => {
+                    matvec_iq1_m_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Nvfp4 => {
+                    matvec_nvfp4_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Mxfp4 => {
+                    matvec_mxfp4_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Mxfp6 => {
+                    matvec_mxfp6_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Mxfp8 => {
+                    matvec_mxfp8_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Q3_K => {
+                    matvec_q3_k_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
+                MlxPackedKind::Pq2_0 => {
+                    matvec_pq2_0_packed_f32_batched(&self.stream, w_ptr, x_ptr, out_ptr, m, k, n)
+                }
             }
         };
         if res.is_err() || consume_error_count() != 0 {

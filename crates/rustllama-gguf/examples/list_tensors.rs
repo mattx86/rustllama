@@ -15,7 +15,9 @@ fn main() {
         total_bytes += bytes;
         total_count += 1;
         let canonical = canonicalize(&info.name);
-        let entry = by_pattern.entry(canonical).or_insert((0, 0, format!("{:?}", info.dtype)));
+        let entry = by_pattern
+            .entry(canonical)
+            .or_insert((0, 0, format!("{:?}", info.dtype)));
         entry.0 += 1;
         entry.1 += bytes;
         if !entry.2.contains(&format!("{:?}", info.dtype)) {
@@ -23,7 +25,10 @@ fn main() {
         }
     }
     println!("source: {path}");
-    println!("total: {total_count} tensors, {:.2} MiB", total_bytes as f64 / (1024.0 * 1024.0));
+    println!(
+        "total: {total_count} tensors, {:.2} MiB",
+        total_bytes as f64 / (1024.0 * 1024.0)
+    );
     println!();
     println!("{:<55} {:>6} {:>14}  dtype", "pattern", "count", "MiB");
     for (pattern, (count, bytes, dtype)) in &by_pattern {
@@ -42,7 +47,13 @@ fn main() {
 // map to "blk.*.ffn_gate_exps.weight".
 fn canonicalize(name: &str) -> String {
     name.split('.')
-        .map(|seg| if seg.chars().all(|c| c.is_ascii_digit()) { "*".to_string() } else { seg.to_string() })
+        .map(|seg| {
+            if seg.chars().all(|c| c.is_ascii_digit()) {
+                "*".to_string()
+            } else {
+                seg.to_string()
+            }
+        })
         .collect::<Vec<_>>()
         .join(".")
 }

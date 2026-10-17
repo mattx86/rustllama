@@ -104,7 +104,10 @@ fn prefix_cache_does_not_change_output() {
     assert!(engine.prefix_cache_enabled(), "default should be on");
 
     let prompt = "The capital of France is";
-    let s = SamplingParams { max_tokens: 12, ..greedy() };
+    let s = SamplingParams {
+        max_tokens: 12,
+        ..greedy()
+    };
 
     let first = engine.generate_text(prompt, &s).expect("first");
     let second = engine.generate_text(prompt, &s).expect("second");
@@ -131,7 +134,10 @@ fn prefix_cache_extended_prompt_matches_fresh_run() {
 
     let prompt_a = "The capital of France is";
     let prompt_ab = "The capital of France is Paris. The capital of Germany is";
-    let s = SamplingParams { max_tokens: 8, ..greedy() };
+    let s = SamplingParams {
+        max_tokens: 8,
+        ..greedy()
+    };
 
     // Prime the cached engine with prompt A, then run prompt AB.
     let _ = cached.generate_text(prompt_a, &s).expect("prime");

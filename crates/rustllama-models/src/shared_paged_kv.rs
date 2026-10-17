@@ -250,7 +250,11 @@ mod tests {
             t.alloc(2).expect("alloc");
         });
         assert_eq!(a.free_pages(), 2);
-        assert_eq!(b.free_pages(), 2, "b sees a's allocation through shared Arc");
+        assert_eq!(
+            b.free_pages(),
+            2,
+            "b sees a's allocation through shared Arc"
+        );
     }
 
     #[test]
@@ -293,7 +297,7 @@ mod tests {
     fn apc_register_reacquire_and_prune() {
         use crate::apc::chain_block_hash;
         let shared = small_shared(); // 4 pages, page_size 4
-        // Slot A: alloc 2 pages, register their block hashes (2 blocks of 4).
+                                     // Slot A: alloc 2 pages, register their block hashes (2 blocks of 4).
         let pages = shared.with_table_mut(|t| t.alloc(2).expect("alloc 2"));
         let h0 = chain_block_hash(None, &[1, 2, 3, 4]);
         let h1 = chain_block_hash(Some(h0), &[5, 6, 7, 8]);
@@ -308,7 +312,11 @@ mod tests {
         // hash, pulling them back off the free list without recompute.
         let got = shared.apc_acquire_prefix(&[h0, h1]);
         assert_eq!(got, pages, "reacquired the same physical pages");
-        assert_eq!(shared.free_pages(), 2, "reacquired pages left the free list");
+        assert_eq!(
+            shared.free_pages(),
+            2,
+            "reacquired pages left the free list"
+        );
 
         // A gap in the chain stops the run: an unknown third block isn't shared.
         let h_other = chain_block_hash(Some(h1), &[99, 99, 99, 99]);

@@ -85,12 +85,7 @@ impl PagedKvStore {
         page_size: u32,
         head_dim: u32,
     ) -> Option<Self> {
-        if total_pages == 0
-            || n_layers == 0
-            || n_kv_heads == 0
-            || page_size == 0
-            || head_dim == 0
-        {
+        if total_pages == 0 || n_layers == 0 || n_kv_heads == 0 || page_size == 0 || head_dim == 0 {
             return None;
         }
         let head_stride = (page_size as usize) * (head_dim as usize);
@@ -362,7 +357,8 @@ impl PagedKvStore {
             debug_assert!(src >= j, "compact source slot {src} must be >= dest {j}");
             let src_pos = base + src;
             let dst_pos = base + j;
-            let (Some(&src_page), Some(&dst_page)) = (pages.get(src_pos / ps), pages.get(dst_pos / ps))
+            let (Some(&src_page), Some(&dst_page)) =
+                (pages.get(src_pos / ps), pages.get(dst_pos / ps))
             else {
                 debug_assert!(false, "compact_positions: pos out of the slot's page range");
                 continue;
@@ -445,48 +441,126 @@ pub trait PagedKvStoreOps: Send + Sync {
 }
 
 impl PagedKvStoreOps for PagedKvStore {
-    fn write_token(&mut self, pages: &[PageId], layer: u32, pos: u32, k: &[f32], v: &[f32]) -> Option<()> {
+    fn write_token(
+        &mut self,
+        pages: &[PageId],
+        layer: u32,
+        pos: u32,
+        k: &[f32],
+        v: &[f32],
+    ) -> Option<()> {
         PagedKvStore::write_token(self, pages, layer, pos, k, v)
     }
-    fn gather_layer(&self, pages: &[PageId], layer: u32, kv_len: u32, k_out: &mut [f32], v_out: &mut [f32]) -> Option<()> {
+    fn gather_layer(
+        &self,
+        pages: &[PageId],
+        layer: u32,
+        kv_len: u32,
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+    ) -> Option<()> {
         PagedKvStore::gather_layer(self, pages, layer, kv_len, k_out, v_out)
     }
-    fn zero_page(&mut self, page: PageId) -> Option<()> { PagedKvStore::zero_page(self, page) }
-    fn page_size(&self) -> u32 { PagedKvStore::page_size(self) }
-    fn n_layers(&self) -> u32 { PagedKvStore::n_layers(self) }
-    fn n_kv_heads(&self) -> u32 { PagedKvStore::n_kv_heads(self) }
-    fn head_dim(&self) -> u32 { PagedKvStore::head_dim(self) }
-    fn total_pages(&self) -> u32 { PagedKvStore::total_pages(self) }
+    fn zero_page(&mut self, page: PageId) -> Option<()> {
+        PagedKvStore::zero_page(self, page)
+    }
+    fn page_size(&self) -> u32 {
+        PagedKvStore::page_size(self)
+    }
+    fn n_layers(&self) -> u32 {
+        PagedKvStore::n_layers(self)
+    }
+    fn n_kv_heads(&self) -> u32 {
+        PagedKvStore::n_kv_heads(self)
+    }
+    fn head_dim(&self) -> u32 {
+        PagedKvStore::head_dim(self)
+    }
+    fn total_pages(&self) -> u32 {
+        PagedKvStore::total_pages(self)
+    }
 }
 
 impl PagedKvStoreOps for PagedKvStoreQ8_0 {
-    fn write_token(&mut self, pages: &[PageId], layer: u32, pos: u32, k: &[f32], v: &[f32]) -> Option<()> {
+    fn write_token(
+        &mut self,
+        pages: &[PageId],
+        layer: u32,
+        pos: u32,
+        k: &[f32],
+        v: &[f32],
+    ) -> Option<()> {
         PagedKvStoreQ8_0::write_token(self, pages, layer, pos, k, v)
     }
-    fn gather_layer(&self, pages: &[PageId], layer: u32, kv_len: u32, k_out: &mut [f32], v_out: &mut [f32]) -> Option<()> {
+    fn gather_layer(
+        &self,
+        pages: &[PageId],
+        layer: u32,
+        kv_len: u32,
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+    ) -> Option<()> {
         PagedKvStoreQ8_0::gather_layer(self, pages, layer, kv_len, k_out, v_out)
     }
-    fn zero_page(&mut self, page: PageId) -> Option<()> { PagedKvStoreQ8_0::zero_page(self, page) }
-    fn page_size(&self) -> u32 { PagedKvStoreQ8_0::page_size(self) }
-    fn n_layers(&self) -> u32 { PagedKvStoreQ8_0::n_layers(self) }
-    fn n_kv_heads(&self) -> u32 { PagedKvStoreQ8_0::n_kv_heads(self) }
-    fn head_dim(&self) -> u32 { PagedKvStoreQ8_0::head_dim(self) }
-    fn total_pages(&self) -> u32 { PagedKvStoreQ8_0::total_pages(self) }
+    fn zero_page(&mut self, page: PageId) -> Option<()> {
+        PagedKvStoreQ8_0::zero_page(self, page)
+    }
+    fn page_size(&self) -> u32 {
+        PagedKvStoreQ8_0::page_size(self)
+    }
+    fn n_layers(&self) -> u32 {
+        PagedKvStoreQ8_0::n_layers(self)
+    }
+    fn n_kv_heads(&self) -> u32 {
+        PagedKvStoreQ8_0::n_kv_heads(self)
+    }
+    fn head_dim(&self) -> u32 {
+        PagedKvStoreQ8_0::head_dim(self)
+    }
+    fn total_pages(&self) -> u32 {
+        PagedKvStoreQ8_0::total_pages(self)
+    }
 }
 
 impl PagedKvStoreOps for PagedKvStoreF16 {
-    fn write_token(&mut self, pages: &[PageId], layer: u32, pos: u32, k: &[f32], v: &[f32]) -> Option<()> {
+    fn write_token(
+        &mut self,
+        pages: &[PageId],
+        layer: u32,
+        pos: u32,
+        k: &[f32],
+        v: &[f32],
+    ) -> Option<()> {
         PagedKvStoreF16::write_token(self, pages, layer, pos, k, v)
     }
-    fn gather_layer(&self, pages: &[PageId], layer: u32, kv_len: u32, k_out: &mut [f32], v_out: &mut [f32]) -> Option<()> {
+    fn gather_layer(
+        &self,
+        pages: &[PageId],
+        layer: u32,
+        kv_len: u32,
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+    ) -> Option<()> {
         PagedKvStoreF16::gather_layer(self, pages, layer, kv_len, k_out, v_out)
     }
-    fn zero_page(&mut self, page: PageId) -> Option<()> { PagedKvStoreF16::zero_page(self, page) }
-    fn page_size(&self) -> u32 { PagedKvStoreF16::page_size(self) }
-    fn n_layers(&self) -> u32 { PagedKvStoreF16::n_layers(self) }
-    fn n_kv_heads(&self) -> u32 { PagedKvStoreF16::n_kv_heads(self) }
-    fn head_dim(&self) -> u32 { PagedKvStoreF16::head_dim(self) }
-    fn total_pages(&self) -> u32 { PagedKvStoreF16::total_pages(self) }
+    fn zero_page(&mut self, page: PageId) -> Option<()> {
+        PagedKvStoreF16::zero_page(self, page)
+    }
+    fn page_size(&self) -> u32 {
+        PagedKvStoreF16::page_size(self)
+    }
+    fn n_layers(&self) -> u32 {
+        PagedKvStoreF16::n_layers(self)
+    }
+    fn n_kv_heads(&self) -> u32 {
+        PagedKvStoreF16::n_kv_heads(self)
+    }
+    fn head_dim(&self) -> u32 {
+        PagedKvStoreF16::head_dim(self)
+    }
+    fn total_pages(&self) -> u32 {
+        PagedKvStoreF16::total_pages(self)
+    }
 }
 
 // ============================================================
@@ -516,11 +590,11 @@ pub struct PagedKvStoreQ8_0 {
     page_size: u32,
     head_dim: u32,
     /// Precomputed strides (in bytes).
-    bytes_per_row: usize,       // head_dim + 4
-    head_stride: usize,         // page_size * bytes_per_row
-    kv_stride: usize,           // n_kv_heads * head_stride
-    layer_stride: usize,        // 2 * kv_stride
-    page_stride: usize,         // n_layers * layer_stride
+    bytes_per_row: usize, // head_dim + 4
+    head_stride: usize,  // page_size * bytes_per_row
+    kv_stride: usize,    // n_kv_heads * head_stride
+    layer_stride: usize, // 2 * kv_stride
+    page_stride: usize,  // n_layers * layer_stride
 }
 
 impl PagedKvStoreQ8_0 {
@@ -536,9 +610,7 @@ impl PagedKvStoreQ8_0 {
         page_size: u32,
         head_dim: u32,
     ) -> Option<Self> {
-        if total_pages == 0 || n_layers == 0 || n_kv_heads == 0
-            || page_size == 0 || head_dim == 0
-        {
+        if total_pages == 0 || n_layers == 0 || n_kv_heads == 0 || page_size == 0 || head_dim == 0 {
             return None;
         }
         let bytes_per_row = (head_dim as usize).checked_add(4)?;
@@ -562,12 +634,24 @@ impl PagedKvStoreQ8_0 {
         })
     }
 
-    pub fn total_pages(&self) -> u32 { self.total_pages }
-    pub fn n_layers(&self) -> u32 { self.n_layers }
-    pub fn n_kv_heads(&self) -> u32 { self.n_kv_heads }
-    pub fn page_size(&self) -> u32 { self.page_size }
-    pub fn head_dim(&self) -> u32 { self.head_dim }
-    pub fn page_stride(&self) -> usize { self.page_stride }
+    pub fn total_pages(&self) -> u32 {
+        self.total_pages
+    }
+    pub fn n_layers(&self) -> u32 {
+        self.n_layers
+    }
+    pub fn n_kv_heads(&self) -> u32 {
+        self.n_kv_heads
+    }
+    pub fn page_size(&self) -> u32 {
+        self.page_size
+    }
+    pub fn head_dim(&self) -> u32 {
+        self.head_dim
+    }
+    pub fn page_stride(&self) -> usize {
+        self.page_stride
+    }
 
     #[inline]
     fn cell_offset(
@@ -604,7 +688,9 @@ impl PagedKvStoreQ8_0 {
         let mut max_abs = 0f32;
         for &x in src_row {
             let a = x.abs();
-            if a > max_abs { max_abs = a; }
+            if a > max_abs {
+                max_abs = a;
+            }
         }
         let hd = self.head_dim as usize;
         let q_bytes = &mut self.data[off..off + hd];
@@ -615,7 +701,9 @@ impl PagedKvStoreQ8_0 {
             (s, 1.0 / s)
         };
         if max_abs == 0.0 {
-            for q in q_bytes.iter_mut() { *q = 0; }
+            for q in q_bytes.iter_mut() {
+                *q = 0;
+            }
         } else {
             for (q, &x) in q_bytes.iter_mut().zip(src_row.iter()) {
                 let r = (x * inv).round().clamp(-128.0, 127.0) as i8;
@@ -633,7 +721,8 @@ impl PagedKvStoreQ8_0 {
         let hd = self.head_dim as usize;
         debug_assert_eq!(dst.len(), hd);
         let scale_bytes: [u8; 4] = self.data[off + hd..off + hd + 4]
-            .try_into().expect("4-byte slice");
+            .try_into()
+            .expect("4-byte slice");
         let scale = f32::from_le_bytes(scale_bytes);
         for (i, d) in dst.iter_mut().enumerate() {
             let q = self.data[off + i] as i8;
@@ -705,9 +794,11 @@ impl PagedKvStoreQ8_0 {
                 let remaining = kv_len_us - pos_written;
                 let pos_in_this_page = remaining.min(page_size);
                 for p in 0..pos_in_this_page {
-                    let k_off = self.cell_offset(page, layer, 0, h, p as u32)
+                    let k_off = self
+                        .cell_offset(page, layer, 0, h, p as u32)
                         .expect("page/layer/head/pos in range");
-                    let v_off = self.cell_offset(page, layer, 1, h, p as u32)
+                    let v_off = self
+                        .cell_offset(page, layer, 1, h, p as u32)
                         .expect("page/layer/head/pos in range");
                     let dst_pos = out_head_base + (page_i * page_size + p) * hd;
                     self.dequantize_row_into(k_off, &mut k_out[dst_pos..dst_pos + hd]);
@@ -780,9 +871,7 @@ impl PagedKvStoreF16 {
         head_dim: u32,
         bf16: bool,
     ) -> Option<Self> {
-        if total_pages == 0 || n_layers == 0 || n_kv_heads == 0
-            || page_size == 0 || head_dim == 0
-        {
+        if total_pages == 0 || n_layers == 0 || n_kv_heads == 0 || page_size == 0 || head_dim == 0 {
             return None;
         }
         let bytes_per_row = (head_dim as usize).checked_mul(2)?;
@@ -807,13 +896,27 @@ impl PagedKvStoreF16 {
         })
     }
 
-    pub fn total_pages(&self) -> u32 { self.total_pages }
-    pub fn n_layers(&self) -> u32 { self.n_layers }
-    pub fn n_kv_heads(&self) -> u32 { self.n_kv_heads }
-    pub fn page_size(&self) -> u32 { self.page_size }
-    pub fn head_dim(&self) -> u32 { self.head_dim }
-    pub fn page_stride(&self) -> usize { self.page_stride }
-    pub fn is_bf16(&self) -> bool { self.bf16 }
+    pub fn total_pages(&self) -> u32 {
+        self.total_pages
+    }
+    pub fn n_layers(&self) -> u32 {
+        self.n_layers
+    }
+    pub fn n_kv_heads(&self) -> u32 {
+        self.n_kv_heads
+    }
+    pub fn page_size(&self) -> u32 {
+        self.page_size
+    }
+    pub fn head_dim(&self) -> u32 {
+        self.head_dim
+    }
+    pub fn page_stride(&self) -> usize {
+        self.page_stride
+    }
+    pub fn is_bf16(&self) -> bool {
+        self.bf16
+    }
 
     #[inline]
     fn cell_offset(
@@ -937,9 +1040,11 @@ impl PagedKvStoreF16 {
                 let remaining = kv_len_us - pos_written;
                 let pos_in_this_page = remaining.min(page_size);
                 for p in 0..pos_in_this_page {
-                    let k_off = self.cell_offset(page, layer, 0, h, p as u32)
+                    let k_off = self
+                        .cell_offset(page, layer, 0, h, p as u32)
                         .expect("page/layer/head/pos in range");
-                    let v_off = self.cell_offset(page, layer, 1, h, p as u32)
+                    let v_off = self
+                        .cell_offset(page, layer, 1, h, p as u32)
                         .expect("page/layer/head/pos in range");
                     let dst_pos = out_head_base + (page_i * page_size + p) * hd;
                     self.decode_row_into(k_off, &mut k_out[dst_pos..dst_pos + hd]);
@@ -1011,12 +1116,17 @@ impl PagedKvStoreTQ {
         head_dim: u32,
         bits: u8,
     ) -> Option<Self> {
-        if total_pages == 0 || n_layers == 0 || n_kv_heads == 0
-            || page_size == 0 || head_dim == 0 || !matches!(bits, 1 | 2 | 4 | 8)
+        if total_pages == 0
+            || n_layers == 0
+            || n_kv_heads == 0
+            || page_size == 0
+            || head_dim == 0
+            || !matches!(bits, 1 | 2 | 4 | 8)
         {
             return None;
         }
-        let packed_bytes = rustllama_kernels_cpu::turboquant::bytes_per_block(head_dim as usize, bits);
+        let packed_bytes =
+            rustllama_kernels_cpu::turboquant::bytes_per_block(head_dim as usize, bits);
         let bytes_per_row = packed_bytes.checked_add(4)?;
         let head_stride = (page_size as usize).checked_mul(bytes_per_row)?;
         let kv_stride = (n_kv_heads as usize).checked_mul(head_stride)?;
@@ -1025,23 +1135,55 @@ impl PagedKvStoreTQ {
         let total_bytes = (total_pages as usize).checked_mul(page_stride)?;
         Some(Self {
             data: vec![0u8; total_bytes],
-            total_pages, n_layers, n_kv_heads, page_size, head_dim, bits,
-            bytes_per_row, packed_bytes,
-            head_stride, kv_stride, layer_stride, page_stride,
+            total_pages,
+            n_layers,
+            n_kv_heads,
+            page_size,
+            head_dim,
+            bits,
+            bytes_per_row,
+            packed_bytes,
+            head_stride,
+            kv_stride,
+            layer_stride,
+            page_stride,
         })
     }
 
-    pub fn bits(&self) -> u8 { self.bits }
-    pub fn total_pages(&self) -> u32 { self.total_pages }
-    pub fn n_layers(&self) -> u32 { self.n_layers }
-    pub fn n_kv_heads(&self) -> u32 { self.n_kv_heads }
-    pub fn page_size(&self) -> u32 { self.page_size }
-    pub fn head_dim(&self) -> u32 { self.head_dim }
+    pub fn bits(&self) -> u8 {
+        self.bits
+    }
+    pub fn total_pages(&self) -> u32 {
+        self.total_pages
+    }
+    pub fn n_layers(&self) -> u32 {
+        self.n_layers
+    }
+    pub fn n_kv_heads(&self) -> u32 {
+        self.n_kv_heads
+    }
+    pub fn page_size(&self) -> u32 {
+        self.page_size
+    }
+    pub fn head_dim(&self) -> u32 {
+        self.head_dim
+    }
 
     #[inline]
-    fn cell_offset(&self, page: PageId, layer: u32, kv_axis: u32, h: u32, pos_in_page: u32) -> Option<usize> {
-        if page.0 >= self.total_pages || layer >= self.n_layers || kv_axis >= 2
-            || h >= self.n_kv_heads || pos_in_page >= self.page_size {
+    fn cell_offset(
+        &self,
+        page: PageId,
+        layer: u32,
+        kv_axis: u32,
+        h: u32,
+        pos_in_page: u32,
+    ) -> Option<usize> {
+        if page.0 >= self.total_pages
+            || layer >= self.n_layers
+            || kv_axis >= 2
+            || h >= self.n_kv_heads
+            || pos_in_page >= self.page_size
+        {
             return None;
         }
         let off = (page.0 as usize) * self.page_stride
@@ -1053,11 +1195,18 @@ impl PagedKvStoreTQ {
     }
 
     pub fn write_token(
-        &mut self, pages: &[PageId], layer: u32, pos: u32, k: &[f32], v: &[f32],
+        &mut self,
+        pages: &[PageId],
+        layer: u32,
+        pos: u32,
+        k: &[f32],
+        v: &[f32],
     ) -> Option<()> {
         let hd = self.head_dim as usize;
         let need = (self.n_kv_heads as usize) * hd;
-        if k.len() != need || v.len() != need { return None; }
+        if k.len() != need || v.len() != need {
+            return None;
+        }
         let page_idx = (pos / self.page_size) as usize;
         let pos_in_page = pos % self.page_size;
         let page = *pages.get(page_idx)?;
@@ -1068,7 +1217,8 @@ impl PagedKvStoreTQ {
             let k_off = self.cell_offset(page, layer, 0, h, pos_in_page)?;
             row_scratch.copy_from_slice(&k[h_off_src..h_off_src + hd]);
             let scale = rustllama_kernels_cpu::turboquant::quantize_row(
-                &mut row_scratch, self.bits,
+                &mut row_scratch,
+                self.bits,
                 &mut self.data[k_off..k_off + self.packed_bytes],
             );
             self.data[k_off + self.packed_bytes..k_off + self.packed_bytes + 4]
@@ -1077,7 +1227,8 @@ impl PagedKvStoreTQ {
             let v_off = self.cell_offset(page, layer, 1, h, pos_in_page)?;
             row_scratch.copy_from_slice(&v[h_off_src..h_off_src + hd]);
             let scale = rustllama_kernels_cpu::turboquant::quantize_row(
-                &mut row_scratch, self.bits,
+                &mut row_scratch,
+                self.bits,
                 &mut self.data[v_off..v_off + self.packed_bytes],
             );
             self.data[v_off + self.packed_bytes..v_off + self.packed_bytes + 4]
@@ -1087,41 +1238,62 @@ impl PagedKvStoreTQ {
     }
 
     pub fn gather_layer(
-        &self, pages: &[PageId], layer: u32, kv_len: u32, k_out: &mut [f32], v_out: &mut [f32],
+        &self,
+        pages: &[PageId],
+        layer: u32,
+        kv_len: u32,
+        k_out: &mut [f32],
+        v_out: &mut [f32],
     ) -> Option<()> {
-        if layer >= self.n_layers { return None; }
+        if layer >= self.n_layers {
+            return None;
+        }
         let hd = self.head_dim as usize;
         let need = (self.n_kv_heads as usize) * (kv_len as usize) * hd;
-        if k_out.len() != need || v_out.len() != need { return None; }
+        if k_out.len() != need || v_out.len() != need {
+            return None;
+        }
         let pages_needed = (kv_len as usize).div_ceil(self.page_size as usize);
-        if pages.len() < pages_needed { return None; }
+        if pages.len() < pages_needed {
+            return None;
+        }
         let page_size = self.page_size as usize;
         let kv_len_us = kv_len as usize;
         for h in 0..self.n_kv_heads {
             let out_head_base = (h as usize) * kv_len_us * hd;
             let mut pos_written = 0usize;
             for (page_i, &page) in pages.iter().enumerate() {
-                if pos_written >= kv_len_us { break; }
+                if pos_written >= kv_len_us {
+                    break;
+                }
                 let remaining = kv_len_us - pos_written;
                 let pos_in_this_page = remaining.min(page_size);
                 for p in 0..pos_in_this_page {
-                    let k_off = self.cell_offset(page, layer, 0, h, p as u32)
+                    let k_off = self
+                        .cell_offset(page, layer, 0, h, p as u32)
                         .expect("page/layer/head/pos in range");
-                    let v_off = self.cell_offset(page, layer, 1, h, p as u32)
+                    let v_off = self
+                        .cell_offset(page, layer, 1, h, p as u32)
                         .expect("page/layer/head/pos in range");
                     let dst_pos = out_head_base + (page_i * page_size + p) * hd;
-                    let k_scale_bytes: [u8; 4] = self.data[k_off + self.packed_bytes..k_off + self.packed_bytes + 4]
-                        .try_into().expect("4-byte slice");
-                    let v_scale_bytes: [u8; 4] = self.data[v_off + self.packed_bytes..v_off + self.packed_bytes + 4]
-                        .try_into().expect("4-byte slice");
+                    let k_scale_bytes: [u8; 4] = self.data
+                        [k_off + self.packed_bytes..k_off + self.packed_bytes + 4]
+                        .try_into()
+                        .expect("4-byte slice");
+                    let v_scale_bytes: [u8; 4] = self.data
+                        [v_off + self.packed_bytes..v_off + self.packed_bytes + 4]
+                        .try_into()
+                        .expect("4-byte slice");
                     rustllama_kernels_cpu::turboquant::dequantize_row(
                         &self.data[k_off..k_off + self.packed_bytes],
-                        f32::from_le_bytes(k_scale_bytes), self.bits,
+                        f32::from_le_bytes(k_scale_bytes),
+                        self.bits,
                         &mut k_out[dst_pos..dst_pos + hd],
                     );
                     rustllama_kernels_cpu::turboquant::dequantize_row(
                         &self.data[v_off..v_off + self.packed_bytes],
-                        f32::from_le_bytes(v_scale_bytes), self.bits,
+                        f32::from_le_bytes(v_scale_bytes),
+                        self.bits,
                         &mut v_out[dst_pos..dst_pos + hd],
                     );
                 }
@@ -1132,27 +1304,57 @@ impl PagedKvStoreTQ {
     }
 
     pub fn zero_page(&mut self, page: PageId) -> Option<()> {
-        if page.0 >= self.total_pages { return None; }
+        if page.0 >= self.total_pages {
+            return None;
+        }
         let start = (page.0 as usize) * self.page_stride;
         let end = start + self.page_stride;
-        for v in &mut self.data[start..end] { *v = 0; }
+        for v in &mut self.data[start..end] {
+            *v = 0;
+        }
         Some(())
     }
 }
 
 impl PagedKvStoreOps for PagedKvStoreTQ {
-    fn write_token(&mut self, pages: &[PageId], layer: u32, pos: u32, k: &[f32], v: &[f32]) -> Option<()> {
+    fn write_token(
+        &mut self,
+        pages: &[PageId],
+        layer: u32,
+        pos: u32,
+        k: &[f32],
+        v: &[f32],
+    ) -> Option<()> {
         PagedKvStoreTQ::write_token(self, pages, layer, pos, k, v)
     }
-    fn gather_layer(&self, pages: &[PageId], layer: u32, kv_len: u32, k_out: &mut [f32], v_out: &mut [f32]) -> Option<()> {
+    fn gather_layer(
+        &self,
+        pages: &[PageId],
+        layer: u32,
+        kv_len: u32,
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+    ) -> Option<()> {
         PagedKvStoreTQ::gather_layer(self, pages, layer, kv_len, k_out, v_out)
     }
-    fn zero_page(&mut self, page: PageId) -> Option<()> { PagedKvStoreTQ::zero_page(self, page) }
-    fn page_size(&self) -> u32 { PagedKvStoreTQ::page_size(self) }
-    fn n_layers(&self) -> u32 { PagedKvStoreTQ::n_layers(self) }
-    fn n_kv_heads(&self) -> u32 { PagedKvStoreTQ::n_kv_heads(self) }
-    fn head_dim(&self) -> u32 { PagedKvStoreTQ::head_dim(self) }
-    fn total_pages(&self) -> u32 { PagedKvStoreTQ::total_pages(self) }
+    fn zero_page(&mut self, page: PageId) -> Option<()> {
+        PagedKvStoreTQ::zero_page(self, page)
+    }
+    fn page_size(&self) -> u32 {
+        PagedKvStoreTQ::page_size(self)
+    }
+    fn n_layers(&self) -> u32 {
+        PagedKvStoreTQ::n_layers(self)
+    }
+    fn n_kv_heads(&self) -> u32 {
+        PagedKvStoreTQ::n_kv_heads(self)
+    }
+    fn head_dim(&self) -> u32 {
+        PagedKvStoreTQ::head_dim(self)
+    }
+    fn total_pages(&self) -> u32 {
+        PagedKvStoreTQ::total_pages(self)
+    }
 }
 
 // ============================================================
@@ -1189,16 +1391,24 @@ impl PagedKvStoreNvfp4 {
     }
 
     pub fn new(
-        total_pages: u32, n_layers: u32, n_kv_heads: u32, page_size: u32, head_dim: u32,
+        total_pages: u32,
+        n_layers: u32,
+        n_kv_heads: u32,
+        page_size: u32,
+        head_dim: u32,
     ) -> Option<Self> {
-        if total_pages == 0 || n_layers == 0 || n_kv_heads == 0
-            || page_size == 0 || head_dim == 0
+        if total_pages == 0
+            || n_layers == 0
+            || n_kv_heads == 0
+            || page_size == 0
+            || head_dim == 0
             || (head_dim as usize) % rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_ELEMS != 0
         {
             return None;
         }
         let blocks_per_row = (head_dim as usize) / rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_ELEMS;
-        let bytes_per_row = blocks_per_row.checked_mul(rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_BYTES)?;
+        let bytes_per_row =
+            blocks_per_row.checked_mul(rustllama_kernels_cpu::nvfp4::NVFP4_BLOCK_BYTES)?;
         let head_stride = (page_size as usize).checked_mul(bytes_per_row)?;
         let kv_stride = (n_kv_heads as usize).checked_mul(head_stride)?;
         let layer_stride = kv_stride.checked_mul(2)?;
@@ -1206,22 +1416,50 @@ impl PagedKvStoreNvfp4 {
         let total_bytes = (total_pages as usize).checked_mul(page_stride)?;
         Some(Self {
             data: vec![0u8; total_bytes],
-            total_pages, n_layers, n_kv_heads, page_size, head_dim,
+            total_pages,
+            n_layers,
+            n_kv_heads,
+            page_size,
+            head_dim,
             bytes_per_row,
-            head_stride, kv_stride, layer_stride, page_stride,
+            head_stride,
+            kv_stride,
+            layer_stride,
+            page_stride,
         })
     }
 
-    pub fn total_pages(&self) -> u32 { self.total_pages }
-    pub fn n_layers(&self) -> u32 { self.n_layers }
-    pub fn n_kv_heads(&self) -> u32 { self.n_kv_heads }
-    pub fn page_size(&self) -> u32 { self.page_size }
-    pub fn head_dim(&self) -> u32 { self.head_dim }
+    pub fn total_pages(&self) -> u32 {
+        self.total_pages
+    }
+    pub fn n_layers(&self) -> u32 {
+        self.n_layers
+    }
+    pub fn n_kv_heads(&self) -> u32 {
+        self.n_kv_heads
+    }
+    pub fn page_size(&self) -> u32 {
+        self.page_size
+    }
+    pub fn head_dim(&self) -> u32 {
+        self.head_dim
+    }
 
     #[inline]
-    fn cell_offset(&self, page: PageId, layer: u32, kv_axis: u32, h: u32, pos_in_page: u32) -> Option<usize> {
-        if page.0 >= self.total_pages || layer >= self.n_layers || kv_axis >= 2
-            || h >= self.n_kv_heads || pos_in_page >= self.page_size {
+    fn cell_offset(
+        &self,
+        page: PageId,
+        layer: u32,
+        kv_axis: u32,
+        h: u32,
+        pos_in_page: u32,
+    ) -> Option<usize> {
+        if page.0 >= self.total_pages
+            || layer >= self.n_layers
+            || kv_axis >= 2
+            || h >= self.n_kv_heads
+            || pos_in_page >= self.page_size
+        {
             return None;
         }
         let off = (page.0 as usize) * self.page_stride
@@ -1261,11 +1499,18 @@ impl PagedKvStoreNvfp4 {
     }
 
     pub fn write_token(
-        &mut self, pages: &[PageId], layer: u32, pos: u32, k: &[f32], v: &[f32],
+        &mut self,
+        pages: &[PageId],
+        layer: u32,
+        pos: u32,
+        k: &[f32],
+        v: &[f32],
     ) -> Option<()> {
         let hd = self.head_dim as usize;
         let need = (self.n_kv_heads as usize) * hd;
-        if k.len() != need || v.len() != need { return None; }
+        if k.len() != need || v.len() != need {
+            return None;
+        }
         let page_idx = (pos / self.page_size) as usize;
         let pos_in_page = pos % self.page_size;
         let page = *pages.get(page_idx)?;
@@ -1280,27 +1525,42 @@ impl PagedKvStoreNvfp4 {
     }
 
     pub fn gather_layer(
-        &self, pages: &[PageId], layer: u32, kv_len: u32, k_out: &mut [f32], v_out: &mut [f32],
+        &self,
+        pages: &[PageId],
+        layer: u32,
+        kv_len: u32,
+        k_out: &mut [f32],
+        v_out: &mut [f32],
     ) -> Option<()> {
-        if layer >= self.n_layers { return None; }
+        if layer >= self.n_layers {
+            return None;
+        }
         let hd = self.head_dim as usize;
         let need = (self.n_kv_heads as usize) * (kv_len as usize) * hd;
-        if k_out.len() != need || v_out.len() != need { return None; }
+        if k_out.len() != need || v_out.len() != need {
+            return None;
+        }
         let pages_needed = (kv_len as usize).div_ceil(self.page_size as usize);
-        if pages.len() < pages_needed { return None; }
+        if pages.len() < pages_needed {
+            return None;
+        }
         let page_size = self.page_size as usize;
         let kv_len_us = kv_len as usize;
         for h in 0..self.n_kv_heads {
             let out_head_base = (h as usize) * kv_len_us * hd;
             let mut pos_written = 0usize;
             for (page_i, &page) in pages.iter().enumerate() {
-                if pos_written >= kv_len_us { break; }
+                if pos_written >= kv_len_us {
+                    break;
+                }
                 let remaining = kv_len_us - pos_written;
                 let pos_in_this_page = remaining.min(page_size);
                 for p in 0..pos_in_this_page {
-                    let k_off = self.cell_offset(page, layer, 0, h, p as u32)
+                    let k_off = self
+                        .cell_offset(page, layer, 0, h, p as u32)
                         .expect("page/layer/head/pos in range");
-                    let v_off = self.cell_offset(page, layer, 1, h, p as u32)
+                    let v_off = self
+                        .cell_offset(page, layer, 1, h, p as u32)
                         .expect("page/layer/head/pos in range");
                     let dst_pos = out_head_base + (page_i * page_size + p) * hd;
                     self.dequantize_row_into(k_off, &mut k_out[dst_pos..dst_pos + hd]);
@@ -1313,27 +1573,57 @@ impl PagedKvStoreNvfp4 {
     }
 
     pub fn zero_page(&mut self, page: PageId) -> Option<()> {
-        if page.0 >= self.total_pages { return None; }
+        if page.0 >= self.total_pages {
+            return None;
+        }
         let start = (page.0 as usize) * self.page_stride;
         let end = start + self.page_stride;
-        for v in &mut self.data[start..end] { *v = 0; }
+        for v in &mut self.data[start..end] {
+            *v = 0;
+        }
         Some(())
     }
 }
 
 impl PagedKvStoreOps for PagedKvStoreNvfp4 {
-    fn write_token(&mut self, pages: &[PageId], layer: u32, pos: u32, k: &[f32], v: &[f32]) -> Option<()> {
+    fn write_token(
+        &mut self,
+        pages: &[PageId],
+        layer: u32,
+        pos: u32,
+        k: &[f32],
+        v: &[f32],
+    ) -> Option<()> {
         PagedKvStoreNvfp4::write_token(self, pages, layer, pos, k, v)
     }
-    fn gather_layer(&self, pages: &[PageId], layer: u32, kv_len: u32, k_out: &mut [f32], v_out: &mut [f32]) -> Option<()> {
+    fn gather_layer(
+        &self,
+        pages: &[PageId],
+        layer: u32,
+        kv_len: u32,
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+    ) -> Option<()> {
         PagedKvStoreNvfp4::gather_layer(self, pages, layer, kv_len, k_out, v_out)
     }
-    fn zero_page(&mut self, page: PageId) -> Option<()> { PagedKvStoreNvfp4::zero_page(self, page) }
-    fn page_size(&self) -> u32 { PagedKvStoreNvfp4::page_size(self) }
-    fn n_layers(&self) -> u32 { PagedKvStoreNvfp4::n_layers(self) }
-    fn n_kv_heads(&self) -> u32 { PagedKvStoreNvfp4::n_kv_heads(self) }
-    fn head_dim(&self) -> u32 { PagedKvStoreNvfp4::head_dim(self) }
-    fn total_pages(&self) -> u32 { PagedKvStoreNvfp4::total_pages(self) }
+    fn zero_page(&mut self, page: PageId) -> Option<()> {
+        PagedKvStoreNvfp4::zero_page(self, page)
+    }
+    fn page_size(&self) -> u32 {
+        PagedKvStoreNvfp4::page_size(self)
+    }
+    fn n_layers(&self) -> u32 {
+        PagedKvStoreNvfp4::n_layers(self)
+    }
+    fn n_kv_heads(&self) -> u32 {
+        PagedKvStoreNvfp4::n_kv_heads(self)
+    }
+    fn head_dim(&self) -> u32 {
+        PagedKvStoreNvfp4::head_dim(self)
+    }
+    fn total_pages(&self) -> u32 {
+        PagedKvStoreNvfp4::total_pages(self)
+    }
 }
 
 // ============================================================
@@ -1388,12 +1678,19 @@ macro_rules! paged_kv_store_mxfp {
             }
 
             pub fn new(
-                total_pages: u32, n_layers: u32, n_kv_heads: u32, page_size: u32, head_dim: u32,
+                total_pages: u32,
+                n_layers: u32,
+                n_kv_heads: u32,
+                page_size: u32,
+                head_dim: u32,
             ) -> Option<Self> {
                 let blk_bytes: usize = $blk_bytes;
                 let blk_elems: usize = $blk_elems;
-                if total_pages == 0 || n_layers == 0 || n_kv_heads == 0
-                    || page_size == 0 || head_dim == 0
+                if total_pages == 0
+                    || n_layers == 0
+                    || n_kv_heads == 0
+                    || page_size == 0
+                    || head_dim == 0
                     || (head_dim as usize) % blk_elems != 0
                 {
                     return None;
@@ -1407,22 +1704,50 @@ macro_rules! paged_kv_store_mxfp {
                 let total_bytes = (total_pages as usize).checked_mul(page_stride)?;
                 Some(Self {
                     data: vec![0u8; total_bytes],
-                    total_pages, n_layers, n_kv_heads, page_size, head_dim,
+                    total_pages,
+                    n_layers,
+                    n_kv_heads,
+                    page_size,
+                    head_dim,
                     bytes_per_row,
-                    head_stride, kv_stride, layer_stride, page_stride,
+                    head_stride,
+                    kv_stride,
+                    layer_stride,
+                    page_stride,
                 })
             }
 
-            pub fn total_pages(&self) -> u32 { self.total_pages }
-            pub fn n_layers(&self) -> u32 { self.n_layers }
-            pub fn n_kv_heads(&self) -> u32 { self.n_kv_heads }
-            pub fn page_size(&self) -> u32 { self.page_size }
-            pub fn head_dim(&self) -> u32 { self.head_dim }
+            pub fn total_pages(&self) -> u32 {
+                self.total_pages
+            }
+            pub fn n_layers(&self) -> u32 {
+                self.n_layers
+            }
+            pub fn n_kv_heads(&self) -> u32 {
+                self.n_kv_heads
+            }
+            pub fn page_size(&self) -> u32 {
+                self.page_size
+            }
+            pub fn head_dim(&self) -> u32 {
+                self.head_dim
+            }
 
             #[inline]
-            fn cell_offset(&self, page: PageId, layer: u32, kv_axis: u32, h: u32, pos_in_page: u32) -> Option<usize> {
-                if page.0 >= self.total_pages || layer >= self.n_layers || kv_axis >= 2
-                    || h >= self.n_kv_heads || pos_in_page >= self.page_size {
+            fn cell_offset(
+                &self,
+                page: PageId,
+                layer: u32,
+                kv_axis: u32,
+                h: u32,
+                pos_in_page: u32,
+            ) -> Option<usize> {
+                if page.0 >= self.total_pages
+                    || layer >= self.n_layers
+                    || kv_axis >= 2
+                    || h >= self.n_kv_heads
+                    || pos_in_page >= self.page_size
+                {
                     return None;
                 }
                 let off = (page.0 as usize) * self.page_stride
@@ -1462,11 +1787,18 @@ macro_rules! paged_kv_store_mxfp {
             }
 
             pub fn write_token(
-                &mut self, pages: &[PageId], layer: u32, pos: u32, k: &[f32], v: &[f32],
+                &mut self,
+                pages: &[PageId],
+                layer: u32,
+                pos: u32,
+                k: &[f32],
+                v: &[f32],
             ) -> Option<()> {
                 let hd = self.head_dim as usize;
                 let need = (self.n_kv_heads as usize) * hd;
-                if k.len() != need || v.len() != need { return None; }
+                if k.len() != need || v.len() != need {
+                    return None;
+                }
                 let page_idx = (pos / self.page_size) as usize;
                 let pos_in_page = pos % self.page_size;
                 let page = *pages.get(page_idx)?;
@@ -1481,27 +1813,42 @@ macro_rules! paged_kv_store_mxfp {
             }
 
             pub fn gather_layer(
-                &self, pages: &[PageId], layer: u32, kv_len: u32, k_out: &mut [f32], v_out: &mut [f32],
+                &self,
+                pages: &[PageId],
+                layer: u32,
+                kv_len: u32,
+                k_out: &mut [f32],
+                v_out: &mut [f32],
             ) -> Option<()> {
-                if layer >= self.n_layers { return None; }
+                if layer >= self.n_layers {
+                    return None;
+                }
                 let hd = self.head_dim as usize;
                 let need = (self.n_kv_heads as usize) * (kv_len as usize) * hd;
-                if k_out.len() != need || v_out.len() != need { return None; }
+                if k_out.len() != need || v_out.len() != need {
+                    return None;
+                }
                 let pages_needed = (kv_len as usize).div_ceil(self.page_size as usize);
-                if pages.len() < pages_needed { return None; }
+                if pages.len() < pages_needed {
+                    return None;
+                }
                 let page_size = self.page_size as usize;
                 let kv_len_us = kv_len as usize;
                 for h in 0..self.n_kv_heads {
                     let out_head_base = (h as usize) * kv_len_us * hd;
                     let mut pos_written = 0usize;
                     for (page_i, &page) in pages.iter().enumerate() {
-                        if pos_written >= kv_len_us { break; }
+                        if pos_written >= kv_len_us {
+                            break;
+                        }
                         let remaining = kv_len_us - pos_written;
                         let pos_in_this_page = remaining.min(page_size);
                         for p in 0..pos_in_this_page {
-                            let k_off = self.cell_offset(page, layer, 0, h, p as u32)
+                            let k_off = self
+                                .cell_offset(page, layer, 0, h, p as u32)
                                 .expect("page/layer/head/pos in range");
-                            let v_off = self.cell_offset(page, layer, 1, h, p as u32)
+                            let v_off = self
+                                .cell_offset(page, layer, 1, h, p as u32)
                                 .expect("page/layer/head/pos in range");
                             let dst_pos = out_head_base + (page_i * page_size + p) * hd;
                             self.dequantize_row_into(k_off, &mut k_out[dst_pos..dst_pos + hd]);
@@ -1514,27 +1861,57 @@ macro_rules! paged_kv_store_mxfp {
             }
 
             pub fn zero_page(&mut self, page: PageId) -> Option<()> {
-                if page.0 >= self.total_pages { return None; }
+                if page.0 >= self.total_pages {
+                    return None;
+                }
                 let start = (page.0 as usize) * self.page_stride;
                 let end = start + self.page_stride;
-                for v in &mut self.data[start..end] { *v = 0; }
+                for v in &mut self.data[start..end] {
+                    *v = 0;
+                }
                 Some(())
             }
         }
 
         impl PagedKvStoreOps for $name {
-            fn write_token(&mut self, pages: &[PageId], layer: u32, pos: u32, k: &[f32], v: &[f32]) -> Option<()> {
+            fn write_token(
+                &mut self,
+                pages: &[PageId],
+                layer: u32,
+                pos: u32,
+                k: &[f32],
+                v: &[f32],
+            ) -> Option<()> {
                 $name::write_token(self, pages, layer, pos, k, v)
             }
-            fn gather_layer(&self, pages: &[PageId], layer: u32, kv_len: u32, k_out: &mut [f32], v_out: &mut [f32]) -> Option<()> {
+            fn gather_layer(
+                &self,
+                pages: &[PageId],
+                layer: u32,
+                kv_len: u32,
+                k_out: &mut [f32],
+                v_out: &mut [f32],
+            ) -> Option<()> {
                 $name::gather_layer(self, pages, layer, kv_len, k_out, v_out)
             }
-            fn zero_page(&mut self, page: PageId) -> Option<()> { $name::zero_page(self, page) }
-            fn page_size(&self) -> u32 { $name::page_size(self) }
-            fn n_layers(&self) -> u32 { $name::n_layers(self) }
-            fn n_kv_heads(&self) -> u32 { $name::n_kv_heads(self) }
-            fn head_dim(&self) -> u32 { $name::head_dim(self) }
-            fn total_pages(&self) -> u32 { $name::total_pages(self) }
+            fn zero_page(&mut self, page: PageId) -> Option<()> {
+                $name::zero_page(self, page)
+            }
+            fn page_size(&self) -> u32 {
+                $name::page_size(self)
+            }
+            fn n_layers(&self) -> u32 {
+                $name::n_layers(self)
+            }
+            fn n_kv_heads(&self) -> u32 {
+                $name::n_kv_heads(self)
+            }
+            fn head_dim(&self) -> u32 {
+                $name::head_dim(self)
+            }
+            fn total_pages(&self) -> u32 {
+                $name::total_pages(self)
+            }
         }
     };
 }
@@ -1784,7 +2161,9 @@ mod tests {
         let need = n_heads * 5 * hd;
         let mut k_out = vec![0f32; need];
         let mut v_out = vec![0f32; need];
-        assert!(s.gather_layer(&pages, 0, 5, &mut k_out, &mut v_out).is_none());
+        assert!(s
+            .gather_layer(&pages, 0, 5, &mut k_out, &mut v_out)
+            .is_none());
     }
 
     #[test]
@@ -1793,7 +2172,9 @@ mod tests {
         let pages = [PageId(0)];
         let mut k_out = vec![0f32; 3]; // grossly wrong
         let mut v_out = vec![0f32; 3];
-        assert!(s.gather_layer(&pages, 0, 1, &mut k_out, &mut v_out).is_none());
+        assert!(s
+            .gather_layer(&pages, 0, 1, &mut k_out, &mut v_out)
+            .is_none());
     }
 
     #[test]
@@ -1841,8 +2222,16 @@ mod tests {
         // Page 1's data cleared.
         for h in 0..n_heads as u32 {
             for pos in 0..s.page_size() {
-                assert!(s.k_row(PageId(1), 0, h, pos).unwrap().iter().all(|&v| v == 0.0));
-                assert!(s.v_row(PageId(1), 0, h, pos).unwrap().iter().all(|&v| v == 0.0));
+                assert!(s
+                    .k_row(PageId(1), 0, h, pos)
+                    .unwrap()
+                    .iter()
+                    .all(|&v| v == 0.0));
+                assert!(s
+                    .v_row(PageId(1), 0, h, pos)
+                    .unwrap()
+                    .iter()
+                    .all(|&v| v == 0.0));
             }
         }
     }

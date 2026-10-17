@@ -12,9 +12,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
-use rustllama_engine::{
-    ChatMessage, Engine, Metrics, SamplingParams, Token, TokenStream,
-};
+use rustllama_engine::{ChatMessage, Engine, Metrics, SamplingParams, Token, TokenStream};
 use rustllama_server::{router, AppState, MultiFlightPool, ServingModel};
 use tower::ServiceExt;
 
@@ -116,7 +114,11 @@ fn slow_stream(w: OverlapWitness) -> TokenStream {
 fn build_state(concurrency: usize) -> (AppState, OverlapWitness) {
     let witness = OverlapWitness::default();
     let engines: Vec<Arc<dyn Engine>> = (0..concurrency)
-        .map(|_| Arc::new(SlowEngine { witness: witness.clone() }) as Arc<dyn Engine>)
+        .map(|_| {
+            Arc::new(SlowEngine {
+                witness: witness.clone(),
+            }) as Arc<dyn Engine>
+        })
         .collect();
     let pool = MultiFlightPool {
         engines: engines.clone(),
@@ -168,10 +170,7 @@ async fn concurrency_two_runs_two_requests_in_parallel() {
     let app = router(state);
 
     let start = Instant::now();
-    let (a, b) = tokio::join!(
-        one_chat_request(app.clone()),
-        one_chat_request(app.clone()),
-    );
+    let (a, b) = tokio::join!(one_chat_request(app.clone()), one_chat_request(app.clone()),);
     let elapsed = start.elapsed();
 
     assert_eq!(a, StatusCode::OK, "request a should succeed");
@@ -205,10 +204,7 @@ async fn concurrency_one_serializes() {
     let (state, witness) = build_state(1);
     let app = router(state);
 
-    let (a, b) = tokio::join!(
-        one_chat_request(app.clone()),
-        one_chat_request(app.clone()),
-    );
+    let (a, b) = tokio::join!(one_chat_request(app.clone()), one_chat_request(app.clone()),);
     assert_eq!(a, StatusCode::OK);
     assert_eq!(b, StatusCode::OK);
 

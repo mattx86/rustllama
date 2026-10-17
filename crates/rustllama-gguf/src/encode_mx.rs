@@ -278,7 +278,10 @@ mod tests {
         dequant_mxfp8(&e8, &mut d8);
         let absmax = src.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
         // E4M3 elements: ~2^-3 relative step; error well under 5% of range.
-        assert!(max_abs_err(&src, &d8) < absmax * 0.05, "mxfp8 error too large");
+        assert!(
+            max_abs_err(&src, &d8) < absmax * 0.05,
+            "mxfp8 error too large"
+        );
     }
 
     #[test]
@@ -340,7 +343,11 @@ mod tests {
     fn mxfp_zero_block_round_trips_to_zero() {
         let src = vec![0.0f32; 32];
         for (enc_len, enc_fn, dec_fn) in [
-            (17usize, encode_mxfp4 as fn(&[f32], &mut [u8]), dequant_mxfp4 as fn(&[u8], &mut [f32])),
+            (
+                17usize,
+                encode_mxfp4 as fn(&[f32], &mut [u8]),
+                dequant_mxfp4 as fn(&[u8], &mut [f32]),
+            ),
             (25, encode_mxfp6, dequant_mxfp6),
             (33, encode_mxfp8, dequant_mxfp8),
         ] {
@@ -348,7 +355,10 @@ mod tests {
             enc_fn(&src, &mut enc);
             let mut dec = vec![1.0f32; 32];
             dec_fn(&enc, &mut dec);
-            assert!(dec.iter().all(|&x| x == 0.0), "zero block must decode to zero");
+            assert!(
+                dec.iter().all(|&x| x == 0.0),
+                "zero block must decode to zero"
+            );
         }
     }
 }

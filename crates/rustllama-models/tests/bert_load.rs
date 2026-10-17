@@ -31,7 +31,10 @@ fn synth_bert_loads_with_correct_dims_and_tensor_refs() {
     assert_eq!(model.cfg.n_heads, params.n_heads as usize);
     assert_eq!(model.cfg.d_model, params.d_model as usize);
     assert_eq!(model.cfg.d_ff, params.d_ff as usize);
-    assert_eq!(model.cfg.head_dim, (params.d_model / params.n_heads) as usize);
+    assert_eq!(
+        model.cfg.head_dim,
+        (params.d_model / params.n_heads) as usize
+    );
     assert_eq!(model.cfg.vocab_size, params.vocab as usize);
     assert_eq!(model.cfg.ctx_train, params.ctx as usize);
     assert_eq!(model.cfg.n_token_types, params.n_token_types as usize);
@@ -224,7 +227,10 @@ fn bert_load_binds_classifier_head_when_present() {
         .as_ref()
         .expect("classifier head must be bound when synth includes cls.weight");
     assert_eq!(head.n_labels, 1, "single-label BGE-reranker shape");
-    assert!(head.bias.is_some(), "synth emits both cls.weight and cls.bias");
+    assert!(
+        head.bias.is_some(),
+        "synth emits both cls.weight and cls.bias"
+    );
     let _ = std::fs::remove_file(&tmp);
 }
 

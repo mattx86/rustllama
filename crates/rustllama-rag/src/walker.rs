@@ -327,8 +327,7 @@ mod tests {
         std::fs::write(dir.path().join("Dockerfile"), "FROM scratch\n").unwrap();
         std::fs::write(dir.path().join("Makefile"), "all:\n\ttrue\n").unwrap();
         std::fs::write(dir.path().join("randomfile"), "nope\n").unwrap();
-        let files: Vec<SourceFile> =
-            WorkspaceWalker::new(dir.path()).unwrap().files().collect();
+        let files: Vec<SourceFile> = WorkspaceWalker::new(dir.path()).unwrap().files().collect();
         let names: Vec<String> = files
             .iter()
             .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
@@ -352,16 +351,11 @@ mod tests {
         let tgt = dir.path().join("target").join("debug");
         std::fs::create_dir_all(&tgt).unwrap();
         std::fs::write(tgt.join("foo.rs"), "// build artifact").unwrap();
-        let files: Vec<SourceFile> =
-            WorkspaceWalker::new(dir.path()).unwrap().files().collect();
+        let files: Vec<SourceFile> = WorkspaceWalker::new(dir.path()).unwrap().files().collect();
         // Only `foo.rs` at root should appear.
         assert_eq!(files.len(), 1);
         assert_eq!(
-            files[0]
-                .path
-                .file_name()
-                .unwrap()
-                .to_string_lossy(),
+            files[0].path.file_name().unwrap().to_string_lossy(),
             "foo.rs"
         );
     }
@@ -374,8 +368,7 @@ mod tests {
         std::fs::write(dir.path().join(".gitignore"), "secret.rs\n").unwrap();
         std::fs::write(dir.path().join("public.rs"), "fn pub_() {}").unwrap();
         std::fs::write(dir.path().join("secret.rs"), "fn secret() {}").unwrap();
-        let files: Vec<SourceFile> =
-            WorkspaceWalker::new(dir.path()).unwrap().files().collect();
+        let files: Vec<SourceFile> = WorkspaceWalker::new(dir.path()).unwrap().files().collect();
         let names: Vec<String> = files
             .iter()
             .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())

@@ -26,8 +26,7 @@ pub(crate) const E2M1_CODEBOOK: [f32; 16] = [
 /// folding the extra `0.5` into the block scale (`scale * 0.5`), which is
 /// exact (`0.5` is a power of two). Shared by the MXFP4 / NVFP4 NEON kernels.
 #[cfg(target_arch = "aarch64")]
-pub(crate) const E2M1_X2_I8: [i8; 16] =
-    [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+pub(crate) const E2M1_X2_I8: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
 pub const MXFP4_BLOCK_ELEMS: usize = 32;
 pub const MXFP4_BLOCK_BYTES: usize = 17;
@@ -93,7 +92,11 @@ pub(crate) fn e4m3_to_f32(b: u8) -> f32 {
 /// scalar at runtime; all three are numerically equivalent (only the FMA
 /// reduction order differs — the E2M1 codebook decode is exact).
 pub fn matvec_mxfp4_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
-    assert_eq!(k % MXFP4_BLOCK_ELEMS, 0, "mxfp4 matvec requires k % 32 == 0");
+    assert_eq!(
+        k % MXFP4_BLOCK_ELEMS,
+        0,
+        "mxfp4 matvec requires k % 32 == 0"
+    );
     let bpr = k / MXFP4_BLOCK_ELEMS;
     assert_eq!(w_bytes.len(), m * bpr * MXFP4_BLOCK_BYTES);
     assert_eq!(x.len(), k);
@@ -130,7 +133,13 @@ pub fn matvec_mxfp4_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize
 /// NEON baseline; same tolerance contract as the AVX2 path.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn matvec_mxfp4_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
+unsafe fn matvec_mxfp4_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
     use crate::s8x16_to_f32x4x4;
     use std::arch::aarch64::*;
     let bpr = k / MXFP4_BLOCK_ELEMS;
@@ -151,7 +160,11 @@ unsafe fn matvec_mxfp4_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], 
             let xb = x.as_ptr().add(b * MXFP4_BLOCK_ELEMS);
             for c in 0..4 {
                 acc[c] = vfmaq_f32(acc[c], vmulq_f32(sv, e_lo[c]), vld1q_f32(xb.add(c * 4)));
-                acc[c] = vfmaq_f32(acc[c], vmulq_f32(sv, e_hi[c]), vld1q_f32(xb.add(16 + c * 4)));
+                acc[c] = vfmaq_f32(
+                    acc[c],
+                    vmulq_f32(sv, e_hi[c]),
+                    vld1q_f32(xb.add(16 + c * 4)),
+                );
             }
         }
         let s = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
@@ -185,7 +198,11 @@ fn matvec_mxfp4_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: us
 /// are a little-endian bitstream of 32 six-bit codes. Dispatches to
 /// AVX-512 / AVX2 / scalar at runtime (equivalent up to FMA order).
 pub fn matvec_mxfp6_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
-    assert_eq!(k % MXFP6_BLOCK_ELEMS, 0, "mxfp6 matvec requires k % 32 == 0");
+    assert_eq!(
+        k % MXFP6_BLOCK_ELEMS,
+        0,
+        "mxfp6 matvec requires k % 32 == 0"
+    );
     let bpr = k / MXFP6_BLOCK_ELEMS;
     assert_eq!(w_bytes.len(), m * bpr * MXFP6_BLOCK_BYTES);
     assert_eq!(x.len(), k);
@@ -250,7 +267,13 @@ fn matvec_mxfp6_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: us
 /// NEON baseline; same tolerance contract as the AVX2 path.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn matvec_mxfp6_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
+unsafe fn matvec_mxfp6_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
     use std::arch::aarch64::*;
     let bpr = k / MXFP6_BLOCK_ELEMS;
     let cb = e3m2_codebook();
@@ -267,8 +290,11 @@ unsafe fn matvec_mxfp6_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], 
             let vp = vals.as_ptr();
             for c in 0..4 {
                 acc[c] = vfmaq_f32(acc[c], vld1q_f32(vp.add(c * 4)), vld1q_f32(xb.add(c * 4)));
-                acc[c] =
-                    vfmaq_f32(acc[c], vld1q_f32(vp.add(16 + c * 4)), vld1q_f32(xb.add(16 + c * 4)));
+                acc[c] = vfmaq_f32(
+                    acc[c],
+                    vld1q_f32(vp.add(16 + c * 4)),
+                    vld1q_f32(xb.add(16 + c * 4)),
+                );
             }
         }
         let s = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
@@ -280,7 +306,11 @@ unsafe fn matvec_mxfp6_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], 
 /// scale byte. Dispatches to AVX-512 / AVX2 / scalar at runtime
 /// (equivalent up to FMA order; the E4M3 codebook decode is exact).
 pub fn matvec_mxfp8_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
-    assert_eq!(k % MXFP8_BLOCK_ELEMS, 0, "mxfp8 matvec requires k % 32 == 0");
+    assert_eq!(
+        k % MXFP8_BLOCK_ELEMS,
+        0,
+        "mxfp8 matvec requires k % 32 == 0"
+    );
     let bpr = k / MXFP8_BLOCK_ELEMS;
     assert_eq!(w_bytes.len(), m * bpr * MXFP8_BLOCK_BYTES);
     assert_eq!(x.len(), k);
@@ -332,7 +362,13 @@ fn matvec_mxfp8_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: us
 /// scale folded per lane. NEON baseline; same tolerance contract as AVX2.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn matvec_mxfp8_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
+unsafe fn matvec_mxfp8_w_f32_a_neon(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
     use std::arch::aarch64::*;
     let bpr = k / MXFP8_BLOCK_ELEMS;
     let cb = e4m3_codebook();
@@ -427,7 +463,13 @@ fn e4m3_codebook() -> [f32; 256] {
 /// interleave the even/odd code streams back to element order, scale, FMA.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
-unsafe fn matvec_mxfp4_w_f32_a_avx2(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
+unsafe fn matvec_mxfp4_w_f32_a_avx2(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
     use std::arch::x86_64::*;
     let bpr = k / MXFP4_BLOCK_ELEMS;
     let cb = E2M1_CODEBOOK.as_ptr();
@@ -457,9 +499,16 @@ unsafe fn matvec_mxfp4_w_f32_a_avx2(w_bytes: &[u8], x: &[f32], out: &mut [f32], 
                 let codes_lo8 = _mm256_permute2f128_ps::<0x20>(ul, uh);
                 let codes_hi8 = _mm256_permute2f128_ps::<0x31>(ul, uh);
                 let x_ptr = x.as_ptr().add(x_base);
-                acc0 = _mm256_fmadd_ps(_mm256_mul_ps(codes_lo8, scale), _mm256_loadu_ps(x_ptr), acc0);
-                acc1 =
-                    _mm256_fmadd_ps(_mm256_mul_ps(codes_hi8, scale), _mm256_loadu_ps(x_ptr.add(8)), acc1);
+                acc0 = _mm256_fmadd_ps(
+                    _mm256_mul_ps(codes_lo8, scale),
+                    _mm256_loadu_ps(x_ptr),
+                    acc0,
+                );
+                acc1 = _mm256_fmadd_ps(
+                    _mm256_mul_ps(codes_hi8, scale),
+                    _mm256_loadu_ps(x_ptr.add(8)),
+                    acc1,
+                );
             }
         }
         out[i] = hsum256_ps(_mm256_add_ps(acc0, acc1));
@@ -474,7 +523,13 @@ unsafe fn matvec_mxfp4_w_f32_a_avx2(w_bytes: &[u8], x: &[f32], out: &mut [f32], 
 /// 16-wide FMAs.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,avx512f")]
-unsafe fn matvec_mxfp4_w_f32_a_avx512(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
+unsafe fn matvec_mxfp4_w_f32_a_avx512(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
     use std::arch::x86_64::*;
     let bpr = k / MXFP4_BLOCK_ELEMS;
     let cb = _mm512_loadu_ps(E2M1_CODEBOOK.as_ptr());
@@ -502,7 +557,11 @@ unsafe fn matvec_mxfp4_w_f32_a_avx512(w_bytes: &[u8], x: &[f32], out: &mut [f32]
             let codes_hi = _mm512_permutex2var_ps(lo_codes, idx_high, hi_codes);
             let x_ptr = x.as_ptr().add(b * MXFP4_BLOCK_ELEMS);
             acc0 = _mm512_fmadd_ps(_mm512_mul_ps(codes_lo, scale), _mm512_loadu_ps(x_ptr), acc0);
-            acc1 = _mm512_fmadd_ps(_mm512_mul_ps(codes_hi, scale), _mm512_loadu_ps(x_ptr.add(16)), acc1);
+            acc1 = _mm512_fmadd_ps(
+                _mm512_mul_ps(codes_hi, scale),
+                _mm512_loadu_ps(x_ptr.add(16)),
+                acc1,
+            );
         }
         out[i] = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
     }
@@ -515,7 +574,12 @@ unsafe fn matvec_mxfp4_w_f32_a_avx512(w_bytes: &[u8], x: &[f32], out: &mut [f32]
 /// subsequent multiply-accumulate.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline]
-fn decode_mxfp6_block(codes: &[u8], cb: &[f32; 64], scale: f32, vals: &mut [f32; MXFP6_BLOCK_ELEMS]) {
+fn decode_mxfp6_block(
+    codes: &[u8],
+    cb: &[f32; 64],
+    scale: f32,
+    vals: &mut [f32; MXFP6_BLOCK_ELEMS],
+) {
     for (j, v) in vals.iter_mut().enumerate() {
         let bitpos = j * 6;
         let byte_idx = bitpos / 8;
@@ -535,7 +599,13 @@ fn decode_mxfp6_block(codes: &[u8], cb: &[f32; 64], scale: f32, vals: &mut [f32;
 /// 32-wide scratch, then four 8-lane FMAs against the activations.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
-unsafe fn matvec_mxfp6_w_f32_a_avx2(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
+unsafe fn matvec_mxfp6_w_f32_a_avx2(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
     use std::arch::x86_64::*;
     let bpr = k / MXFP6_BLOCK_ELEMS;
     let cb = e3m2_codebook();
@@ -552,9 +622,21 @@ unsafe fn matvec_mxfp6_w_f32_a_avx2(w_bytes: &[u8], x: &[f32], out: &mut [f32], 
             let x_ptr = x.as_ptr().add(b * MXFP6_BLOCK_ELEMS);
             let vp = vals.as_ptr();
             acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(vp), _mm256_loadu_ps(x_ptr), acc0);
-            acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(vp.add(8)), _mm256_loadu_ps(x_ptr.add(8)), acc1);
-            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(vp.add(16)), _mm256_loadu_ps(x_ptr.add(16)), acc0);
-            acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(vp.add(24)), _mm256_loadu_ps(x_ptr.add(24)), acc1);
+            acc1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(vp.add(8)),
+                _mm256_loadu_ps(x_ptr.add(8)),
+                acc1,
+            );
+            acc0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(vp.add(16)),
+                _mm256_loadu_ps(x_ptr.add(16)),
+                acc0,
+            );
+            acc1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(vp.add(24)),
+                _mm256_loadu_ps(x_ptr.add(24)),
+                acc1,
+            );
         }
         out[i] = hsum256_ps(_mm256_add_ps(acc0, acc1));
     }
@@ -564,7 +646,13 @@ unsafe fn matvec_mxfp6_w_f32_a_avx2(w_bytes: &[u8], x: &[f32], out: &mut [f32], 
 /// the AVX2 path; the accumulate is two 16-lane FMAs.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,avx512f")]
-unsafe fn matvec_mxfp6_w_f32_a_avx512(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
+unsafe fn matvec_mxfp6_w_f32_a_avx512(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
     use std::arch::x86_64::*;
     let bpr = k / MXFP6_BLOCK_ELEMS;
     let cb = e3m2_codebook();
@@ -581,7 +669,11 @@ unsafe fn matvec_mxfp6_w_f32_a_avx512(w_bytes: &[u8], x: &[f32], out: &mut [f32]
             let x_ptr = x.as_ptr().add(b * MXFP6_BLOCK_ELEMS);
             let vp = vals.as_ptr();
             acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(vp), _mm512_loadu_ps(x_ptr), acc0);
-            acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(vp.add(16)), _mm512_loadu_ps(x_ptr.add(16)), acc1);
+            acc1 = _mm512_fmadd_ps(
+                _mm512_loadu_ps(vp.add(16)),
+                _mm512_loadu_ps(x_ptr.add(16)),
+                acc1,
+            );
         }
         out[i] = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
     }
@@ -593,7 +685,13 @@ unsafe fn matvec_mxfp6_w_f32_a_avx512(w_bytes: &[u8], x: &[f32], out: &mut [f32]
 /// relax the FMA dependency chain.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
-unsafe fn matvec_mxfp8_w_f32_a_avx2(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
+unsafe fn matvec_mxfp8_w_f32_a_avx2(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
     use std::arch::x86_64::*;
     let bpr = k / MXFP8_BLOCK_ELEMS;
     let cb = e4m3_codebook();
@@ -630,7 +728,13 @@ unsafe fn matvec_mxfp8_w_f32_a_avx2(w_bytes: &[u8], x: &[f32], out: &mut [f32], 
 /// the AVX2 `(base, offsets)`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,avx512f")]
-unsafe fn matvec_mxfp8_w_f32_a_avx512(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
+unsafe fn matvec_mxfp8_w_f32_a_avx512(
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
     use std::arch::x86_64::*;
     let bpr = k / MXFP8_BLOCK_ELEMS;
     let cb = e4m3_codebook();
@@ -690,7 +794,12 @@ mod tests {
         matvec_mxfp4_w_f32_a(&blk, &x, &mut out, 1, 32);
         let dec = decode_mxfp4(&blk);
         let ref_dot: f32 = dec.iter().zip(&x).map(|(w, a)| w * a).sum();
-        assert!((out[0] - ref_dot).abs() < 1e-3, "got {} want {}", out[0], ref_dot);
+        assert!(
+            (out[0] - ref_dot).abs() < 1e-3,
+            "got {} want {}",
+            out[0],
+            ref_dot
+        );
     }
 
     #[test]
@@ -722,11 +831,20 @@ mod tests {
             let byte_idx = bitpos / 8;
             let bit_off = bitpos % 8;
             let lo = blk[byte_idx] as u16;
-            let hi = if byte_idx + 1 < 24 { blk[byte_idx + 1] as u16 } else { 0 };
+            let hi = if byte_idx + 1 < 24 {
+                blk[byte_idx + 1] as u16
+            } else {
+                0
+            };
             let code = (((lo | (hi << 8)) >> bit_off) & 0x3F) as u8;
             ref_dot += e3m2_to_f32(code) * x[j];
         }
-        assert!((out[0] - ref_dot).abs() < 1e-4, "got {} want {}", out[0], ref_dot);
+        assert!(
+            (out[0] - ref_dot).abs() < 1e-4,
+            "got {} want {}",
+            out[0],
+            ref_dot
+        );
     }
 
     #[test]

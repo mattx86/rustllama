@@ -76,10 +76,7 @@ pub struct RerankUsage {
     pub total_tokens: u32,
 }
 
-pub async fn rerank(
-    State(state): State<AppState>,
-    Json(req): Json<RerankRequest>,
-) -> Response {
+pub async fn rerank(State(state): State<AppState>, Json(req): Json<RerankRequest>) -> Response {
     if req.query.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -158,8 +155,7 @@ pub async fn rerank(
 
     // Sort by score desc, preserving original index for the result
     // entries. `top_n` truncates after sorting.
-    let mut ranked: Vec<(usize, f32)> =
-        scores.iter().enumerate().map(|(i, s)| (i, *s)).collect();
+    let mut ranked: Vec<(usize, f32)> = scores.iter().enumerate().map(|(i, s)| (i, *s)).collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let cap = req.top_n.unwrap_or(ranked.len()).min(ranked.len());
     let results: Vec<RerankResult> = ranked
@@ -179,12 +175,17 @@ pub async fn rerank(
         .collect();
 
     Json(RerankResponse {
-        id: format!("rerank-{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)),
+        id: format!(
+            "rerank-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        ),
         results,
-        model: req.model.unwrap_or_else(|| "rustllama-reranker".to_string()),
+        model: req
+            .model
+            .unwrap_or_else(|| "rustllama-reranker".to_string()),
         usage: RerankUsage { total_tokens },
     })
     .into_response()

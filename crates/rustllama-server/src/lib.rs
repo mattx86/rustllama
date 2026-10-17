@@ -274,7 +274,8 @@ impl ServingModel {
             return self;
         };
         let mut engines: Vec<Arc<dyn Engine>> = Vec::with_capacity(concurrency);
-        let mut cpu_engines: Vec<Arc<rustllama_engine::CpuEngine>> = Vec::with_capacity(concurrency);
+        let mut cpu_engines: Vec<Arc<rustllama_engine::CpuEngine>> =
+            Vec::with_capacity(concurrency);
         // The first pool entry IS the original engine; subsequent
         // entries are fresh forks. This preserves prefix-cache state
         // for the very first request after a model load.
@@ -378,9 +379,7 @@ impl ServingModel {
     /// decremented and the scheduler slot is completed (same RAII
     /// guarantees as a fully-acquired permit).
     pub fn try_admit(&self) -> Result<RequestPermit, BackpressureError> {
-        self.try_admit_with_priority(
-            rustllama_engine::batch_scheduler::Priority::DEFAULT,
-        )
+        self.try_admit_with_priority(rustllama_engine::batch_scheduler::Priority::DEFAULT)
     }
 
     /// E3.2: try_admit with an explicit priority. HTTP handlers
@@ -593,9 +592,7 @@ impl Drop for EngineHandle {
         // a race where a waiter notices the freed slot before the
         // scheduler's bookkeeping reflects the completion.
         self._permit.take();
-        if let (Some(s), Some(id)) =
-            (self.scheduler.take(), self.request_id.take())
-        {
+        if let (Some(s), Some(id)) = (self.scheduler.take(), self.request_id.take()) {
             s.complete(id);
         }
         self.pending.fetch_sub(1, Ordering::AcqRel);
@@ -683,9 +680,8 @@ pub struct AppState {
     /// inner `RagIndex` atomically. Wrapped in `Arc<RwLock<…>>` so
     /// concurrent `/v1/rag/query` callers share the reader lock
     /// while a reindex holds the writer for the swap only.
-    pub rag_index: Arc<
-        tokio::sync::RwLock<Option<Arc<tokio::sync::RwLock<rustllama_rag::RagIndex>>>>,
-    >,
+    pub rag_index:
+        Arc<tokio::sync::RwLock<Option<Arc<tokio::sync::RwLock<rustllama_rag::RagIndex>>>>>,
     /// Bearer-token auth state. When `Some`, the router attaches
     /// a middleware that requires `Authorization: Bearer <key>` on
     /// every request except `/healthz` and same-host loopback
@@ -1459,9 +1455,9 @@ pub fn router(state: AppState) -> Router {
 /// principle-of-least-privilege deployments. Localhost-only servers
 /// don't need this — same-origin requests bypass CORS.
 pub fn router_with_cors(state: AppState, cors_origins: &[String]) -> Router {
+    use axum::http::HeaderValue;
     use axum::middleware;
     use tower_http::cors::{Any, CorsLayer};
-    use axum::http::HeaderValue;
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/metrics", get(metrics))
@@ -1624,10 +1620,7 @@ pub fn router_with_cors(state: AppState, cors_origins: &[String]) -> Router {
         // FTS5 search across all stored message contents. Registered
         // before `/:id` so axum's path matcher doesn't try to parse
         // "search" as an i64.
-        .route(
-            "/api/conversations/search",
-            get(history::search_handler),
-        )
+        .route("/api/conversations/search", get(history::search_handler))
         .route(
             "/api/conversations/:id",
             get(history::get_handler)
@@ -2185,15 +2178,8 @@ struct LoadModelResponse {
     loaded_at: u64,
 }
 
-async fn load_model(
-    State(state): State<AppState>,
-    Json(req): Json<LoadModelRequest>,
-) -> Response {
-    let provided = (
-        req.path.is_some(),
-        req.hub.is_some(),
-        req.name.is_some(),
-    );
+async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequest>) -> Response {
+    let provided = (req.path.is_some(), req.hub.is_some(), req.name.is_some());
     let path: std::path::PathBuf = match provided {
         (true, false, false) => req.path.unwrap(),
         (false, true, false) => {
@@ -2952,11 +2938,7 @@ async fn inspect_gguf(Json(req): Json<InspectGgufRequest>) -> Response {
     // shared helper would mean threading state, errors, and the cache
     // dir through it — the duplication is contained and clearer
     // inline.
-    let provided = (
-        req.path.is_some(),
-        req.hub.is_some(),
-        req.name.is_some(),
-    );
+    let provided = (req.path.is_some(), req.hub.is_some(), req.name.is_some());
     let path: std::path::PathBuf = match provided {
         (true, false, false) => req.path.unwrap(),
         (false, true, false) => {
@@ -3019,8 +3001,8 @@ async fn inspect_gguf(Json(req): Json<InspectGgufRequest>) -> Response {
     // Open + parse on a blocking pool: opening mmaps the file and the
     // tensor-info table can be hundreds of KB to walk on a 70B model.
     let include_tensors = req.include_tensors;
-    let join = tokio::task::spawn_blocking(move || inspect_gguf_blocking(&path, include_tensors))
-        .await;
+    let join =
+        tokio::task::spawn_blocking(move || inspect_gguf_blocking(&path, include_tensors)).await;
     match join {
         Ok(Ok(resp)) => Json(resp).into_response(),
         Ok(Err((status, msg))) => (status, msg).into_response(),
@@ -3407,21 +3389,18 @@ async fn tune_placement(
         .as_ref()
         .and_then(|p| rustllama_config::load(p.as_ref()).ok())
         .unwrap_or_default();
-    let model_path = match resolve_tune_model_path(
-        req.model_path.as_deref(),
-        req.model_name.as_deref(),
-    ) {
-        Ok(p) => p,
-        Err((status, msg)) => return (status, msg).into_response(),
-    };
+    let model_path =
+        match resolve_tune_model_path(req.model_path.as_deref(), req.model_name.as_deref()) {
+            Ok(p) => p,
+            Err((status, msg)) => return (status, msg).into_response(),
+        };
 
     // Run the whole sweep on a blocking-pool thread — measurement
     // is heavy and pure CPU/GPU work, no point holding a tokio
     // worker for minutes.
-    let join = tokio::task::spawn_blocking(move || {
-        run_placement_sweep_blocking(&model_path, &req, &cfg)
-    })
-    .await;
+    let join =
+        tokio::task::spawn_blocking(move || run_placement_sweep_blocking(&model_path, &req, &cfg))
+            .await;
     match join {
         Ok(Ok(resp)) => Json(resp).into_response(),
         Ok(Err((status, msg))) => (status, msg).into_response(),
@@ -3434,9 +3413,7 @@ fn run_placement_sweep_blocking(
     req: &TunePlacementRequest,
     cfg: &rustllama_config::Config,
 ) -> std::result::Result<TunePlacementResponse, (StatusCode, String)> {
-    use rustllama_engine::measurement::{
-        measure_placement_candidates, MeasurementConfig,
-    };
+    use rustllama_engine::measurement::{measure_placement_candidates, MeasurementConfig};
     use rustllama_tuner::placement::{candidate_placements, DEFAULT_SWEEP_STEP};
 
     // Step 1: derive ModelDims + quant from the GGUF — mirrors the
@@ -3590,21 +3567,18 @@ async fn tune_batch_size(
         .as_ref()
         .and_then(|p| rustllama_config::load(p.as_ref()).ok())
         .unwrap_or_default();
-    let model_path = match resolve_tune_model_path(
-        req.model_path.as_deref(),
-        req.model_name.as_deref(),
-    ) {
-        Ok(p) => p,
-        Err((status, msg)) => return (status, msg).into_response(),
-    };
+    let model_path =
+        match resolve_tune_model_path(req.model_path.as_deref(), req.model_name.as_deref()) {
+            Ok(p) => p,
+            Err((status, msg)) => return (status, msg).into_response(),
+        };
     if req.candidates.is_empty() {
         return (StatusCode::BAD_REQUEST, "candidates must be non-empty").into_response();
     }
 
-    let join = tokio::task::spawn_blocking(move || {
-        run_batch_size_sweep_blocking(&model_path, &req, &cfg)
-    })
-    .await;
+    let join =
+        tokio::task::spawn_blocking(move || run_batch_size_sweep_blocking(&model_path, &req, &cfg))
+            .await;
     match join {
         Ok(Ok(resp)) => Json(resp).into_response(),
         Ok(Err((status, msg))) => (status, msg).into_response(),
@@ -3617,9 +3591,7 @@ fn run_batch_size_sweep_blocking(
     req: &TuneBatchSizeRequest,
     cfg: &rustllama_config::Config,
 ) -> std::result::Result<TuneBatchSizeResponse, (StatusCode, String)> {
-    use rustllama_engine::measurement::{
-        measure_batch_size_candidates, MeasurementConfig,
-    };
+    use rustllama_engine::measurement::{measure_batch_size_candidates, MeasurementConfig};
 
     let (k, v) = cfg.inference.resolved_kv_dtypes();
     if k != v {
@@ -3827,10 +3799,10 @@ fn read_dims_and_quant_from_gguf_for_tune(
             .or_else(|| gguf.metadata_get(k))
             .and_then(MetadataValue::as_u32)
     };
-    let n_layers = key("block_count")
-        .ok_or_else(|| format!("GGUF missing `{arch}.block_count`"))?;
-    let d_model = key("embedding_length")
-        .ok_or_else(|| format!("GGUF missing `{arch}.embedding_length`"))?;
+    let n_layers =
+        key("block_count").ok_or_else(|| format!("GGUF missing `{arch}.block_count`"))?;
+    let d_model =
+        key("embedding_length").ok_or_else(|| format!("GGUF missing `{arch}.embedding_length`"))?;
     let d_ff = key("feed_forward_length")
         .ok_or_else(|| format!("GGUF missing `{arch}.feed_forward_length`"))?;
     let n_heads = key("attention.head_count")
@@ -3853,9 +3825,16 @@ fn read_dims_and_quant_from_gguf_for_tune(
     // describe top-K routing and DeepSeek-style always-active shared
     // experts respectively.
     let n_experts = key("expert_count").unwrap_or(0);
-    let n_experts_used = if n_experts >= 2 { key("expert_used_count").unwrap_or(1) } else { 0 };
-    let n_experts_shared =
-        if n_experts >= 2 { key("expert_shared_count").unwrap_or(0) } else { 0 };
+    let n_experts_used = if n_experts >= 2 {
+        key("expert_used_count").unwrap_or(1)
+    } else {
+        0
+    };
+    let n_experts_shared = if n_experts >= 2 {
+        key("expert_shared_count").unwrap_or(0)
+    } else {
+        0
+    };
 
     let mut bytes_by: Vec<(GgmlType, u64)> = Vec::new();
     for t in gguf.tensors() {
@@ -4193,10 +4172,7 @@ struct UnloadResponse {
     unloaded: String,
 }
 
-async fn unload_model(
-    State(state): State<AppState>,
-    Json(req): Json<UnloadRequest>,
-) -> Response {
+async fn unload_model(State(state): State<AppState>, Json(req): Json<UnloadRequest>) -> Response {
     match state.unload(&req.model).await {
         Ok(Some(removed)) => {
             // The model is already out of the registry; freeing the engine
@@ -4239,8 +4215,7 @@ async fn set_default_model(
             // Persist to config.toml so the default survives restart
             // (best-effort; the live default is already set).
             let persisted = state.persist_default_model(&req.model).await;
-            Json(serde_json::json!({"default": req.model, "persisted": persisted}))
-                .into_response()
+            Json(serde_json::json!({"default": req.model, "persisted": persisted})).into_response()
         }
         Err(e) => (StatusCode::NOT_FOUND, e).into_response(),
     }
@@ -4255,10 +4230,7 @@ struct CancelRequest {
     id: String,
 }
 
-async fn cancel_request(
-    State(state): State<AppState>,
-    Json(req): Json<CancelRequest>,
-) -> Response {
+async fn cancel_request(State(state): State<AppState>, Json(req): Json<CancelRequest>) -> Response {
     if state.fire_cancel(&req.id) {
         Json(serde_json::json!({ "cancelled": req.id })).into_response()
     } else {
@@ -4303,7 +4275,11 @@ async fn healthz(State(state): State<AppState>) -> Json<Health> {
         .map(|s| s.model_id)
         .unwrap_or_default();
     Json(Health {
-        status: if state.is_shutting_down() { "draining" } else { "ok" },
+        status: if state.is_shutting_down() {
+            "draining"
+        } else {
+            "ok"
+        },
         model_id,
         version: state.version.clone(),
         // Real process uptime, computed the same way as `/v1/metrics`
@@ -4638,19 +4614,17 @@ async fn metrics(State(state): State<AppState>) -> Json<MetricsSnapshot> {
     let ema_tok_s = serving.cpu_engine.as_ref().and_then(|cpu| cpu.ema_tok_s());
     // Pull the live KV dtype from the engine's cache. Pretty-printed
     // so the GUI doesn't have to know about the `Tq(N)` debug form.
-    let kv_dtype: Option<String> = serving.cpu_engine.as_ref().map(|cpu| {
-        match cpu.kv_dtype() {
-            rustllama_engine::KvDtype::F32 => "f32".to_string(),
-            rustllama_engine::KvDtype::F16 => "f16".to_string(),
-            rustllama_engine::KvDtype::Bf16 => "bf16".to_string(),
-            rustllama_engine::KvDtype::Q8_0 => "q8_0".to_string(),
-            rustllama_engine::KvDtype::Tq(bits) => format!("tq{bits}"),
-            rustllama_engine::KvDtype::Nvfp4 => "nvfp4".to_string(),
-            rustllama_engine::KvDtype::Q4_0 => "q4_0".to_string(),
-            rustllama_engine::KvDtype::Mxfp4 => "mxfp4".to_string(),
-            rustllama_engine::KvDtype::Mxfp6 => "mxfp6".to_string(),
-            rustllama_engine::KvDtype::Mxfp8 => "mxfp8".to_string(),
-        }
+    let kv_dtype: Option<String> = serving.cpu_engine.as_ref().map(|cpu| match cpu.kv_dtype() {
+        rustllama_engine::KvDtype::F32 => "f32".to_string(),
+        rustllama_engine::KvDtype::F16 => "f16".to_string(),
+        rustllama_engine::KvDtype::Bf16 => "bf16".to_string(),
+        rustllama_engine::KvDtype::Q8_0 => "q8_0".to_string(),
+        rustllama_engine::KvDtype::Tq(bits) => format!("tq{bits}"),
+        rustllama_engine::KvDtype::Nvfp4 => "nvfp4".to_string(),
+        rustllama_engine::KvDtype::Q4_0 => "q4_0".to_string(),
+        rustllama_engine::KvDtype::Mxfp4 => "mxfp4".to_string(),
+        rustllama_engine::KvDtype::Mxfp6 => "mxfp6".to_string(),
+        rustllama_engine::KvDtype::Mxfp8 => "mxfp8".to_string(),
     });
     let mem = rustllama_runtime::memory_info();
     let cpu = rustllama_runtime::cpu_info();
@@ -4767,11 +4741,21 @@ fn host_simd_features() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = Vec::new();
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx") { v.push("avx"); }
-        if std::arch::is_x86_feature_detected!("avx2") { v.push("avx2"); }
-        if std::arch::is_x86_feature_detected!("fma") { v.push("fma"); }
-        if std::arch::is_x86_feature_detected!("f16c") { v.push("f16c"); }
-        if std::arch::is_x86_feature_detected!("avx512f") { v.push("avx512f"); }
+        if std::arch::is_x86_feature_detected!("avx") {
+            v.push("avx");
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            v.push("avx2");
+        }
+        if std::arch::is_x86_feature_detected!("fma") {
+            v.push("fma");
+        }
+        if std::arch::is_x86_feature_detected!("f16c") {
+            v.push("f16c");
+        }
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            v.push("avx512f");
+        }
     }
     v
 }
@@ -4929,9 +4913,10 @@ fn gpus_probe() -> Vec<GpuMetric> {
     // system-wide used bytes; derive free = total - used. Same single-GPU
     // gate as the utilization fallback (unambiguous attribution).
     if out.len() == 1 && out[0].vram_free_bytes.is_none() {
-        if let (Some(total), Some(used)) =
-            (out[0].vram_total_bytes, rustllama_runtime::gpu_mem_used_bytes())
-        {
+        if let (Some(total), Some(used)) = (
+            out[0].vram_total_bytes,
+            rustllama_runtime::gpu_mem_used_bytes(),
+        ) {
             out[0].vram_free_bytes = Some(total.saturating_sub(used));
         }
     }
@@ -4997,9 +4982,9 @@ fn sysman_busy_pct_per_device() -> Vec<Option<f32>> {
     for (i, cur) in samples.iter().enumerate() {
         let prev = last.get(i).and_then(|o| *o);
         let util = match (cur, prev) {
-            (Some((active, ts)), Some((la, lt))) if *ts > lt && *active >= la => Some(
-                (((*active - la) as f64 / (*ts - lt) as f64) * 100.0).clamp(0.0, 100.0) as f32,
-            ),
+            (Some((active, ts)), Some((la, lt))) if *ts > lt && *active >= la => {
+                Some((((*active - la) as f64 / (*ts - lt) as f64) * 100.0).clamp(0.0, 100.0) as f32)
+            }
             _ => None,
         };
         out.push(util);
@@ -5120,7 +5105,10 @@ async fn put_config(
             .into_response();
     };
     if let Err(e) = rustllama_config::validate(&new_cfg) {
-        return (StatusCode::UNPROCESSABLE_ENTITY, format!("invalid config: {e}"))
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("invalid config: {e}"),
+        )
             .into_response();
     }
     let old_cfg = rustllama_config::load(path).unwrap_or_default();
@@ -5193,7 +5181,11 @@ async fn apply_config_profile(
     };
     let mut new_cfg = old_cfg.clone();
     if !new_cfg.apply_profile(&req.name) {
-        let available: Vec<String> = old_cfg.profile_names().iter().map(|s| s.to_string()).collect();
+        let available: Vec<String> = old_cfg
+            .profile_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         return (
             StatusCode::NOT_FOUND,
             format!(
@@ -5808,8 +5800,8 @@ fn probe_backends() -> BackendsCapability {
     } else {
         None
     };
-    let preference = std::env::var("RUSTLLAMA_SYCL_BACKEND")
-        .unwrap_or_else(|_| "level_zero".to_string());
+    let preference =
+        std::env::var("RUSTLLAMA_SYCL_BACKEND").unwrap_or_else(|_| "level_zero".to_string());
     let l0_import_eligible = backend == Some("level_zero");
     let sycl = SyclBackend {
         available: device_count > 0,
@@ -6097,9 +6089,7 @@ async fn list_crash_logs() -> Response {
     .into_response()
 }
 
-async fn read_crash_log(
-    axum::extract::Path(name): axum::extract::Path<String>,
-) -> Response {
+async fn read_crash_log(axum::extract::Path(name): axum::extract::Path<String>) -> Response {
     if !is_valid_crash_log_name(&name) {
         return (StatusCode::BAD_REQUEST, "invalid crash log name").into_response();
     }
@@ -6118,13 +6108,18 @@ async fn read_crash_log(
     match std::fs::read_to_string(&path) {
         Ok(body) => (
             StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
             body,
         )
             .into_response(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (StatusCode::NOT_FOUND, format!("crash log not found: {name}")).into_response()
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            format!("crash log not found: {name}"),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("read crash log {name}: {e}"),
@@ -6133,9 +6128,7 @@ async fn read_crash_log(
     }
 }
 
-async fn delete_crash_log(
-    axum::extract::Path(name): axum::extract::Path<String>,
-) -> Response {
+async fn delete_crash_log(axum::extract::Path(name): axum::extract::Path<String>) -> Response {
     if !is_valid_crash_log_name(&name) {
         return (StatusCode::BAD_REQUEST, "invalid crash log name").into_response();
     }
@@ -6206,11 +6199,7 @@ async fn tokenize_handler(
     let tokens = match tokenizer.encode(&req.content, add_bos) {
         Ok(t) => t,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("encode: {e}"),
-            )
-                .into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")).into_response()
         }
     };
     let count = tokens.len() as u32;
@@ -6594,9 +6583,12 @@ pub async fn run_with_cors(
     // auth middleware can recognize loopback connections and bypass
     // the bearer check for them. Required for the LAN-bind use case
     // (auth enforced for remote callers, GUI's own fetches stay free).
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal(state))
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(state))
+    .await?;
     Ok(())
 }
 
@@ -6644,7 +6636,8 @@ mod tests {
         // immediate succession.
         let b = RateLimitBucket::new(60);
         for i in 0..60 {
-            b.try_admit().unwrap_or_else(|r| panic!("admit {i} failed, retry_after={r}"));
+            b.try_admit()
+                .unwrap_or_else(|r| panic!("admit {i} failed, retry_after={r}"));
         }
     }
 
@@ -6689,7 +6682,6 @@ mod tests {
             auth.try_admit_rate_limited().unwrap();
         }
     }
-
 
     /// Each name in the SENSITIVE list masks the value, regardless
     /// of case. The audit log relies on this — adding a name to

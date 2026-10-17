@@ -122,10 +122,7 @@ pub struct RagHit {
 const DEFAULT_K: u32 = 5;
 const MAX_K: u32 = 50;
 
-pub async fn index(
-    State(state): State<AppState>,
-    Json(req): Json<RagIndexRequest>,
-) -> Response {
+pub async fn index(State(state): State<AppState>, Json(req): Json<RagIndexRequest>) -> Response {
     // Embedding model must be configured; the index has no semantics
     // without one.
     let bundle = match get_embedding_bundle(&state) {
@@ -192,7 +189,9 @@ pub async fn index(
         // Initialize an empty index so subsequent /query returns
         // empty hits rather than a 409 "no index built".
         let mut slot = state.rag_index.write().await;
-        *slot = Some(Arc::new(tokio::sync::RwLock::new(RagIndex::new(embedding_dim))));
+        *slot = Some(Arc::new(tokio::sync::RwLock::new(RagIndex::new(
+            embedding_dim,
+        ))));
         return Json(RagIndexResponse {
             object: "rag.index",
             files_indexed,
@@ -268,10 +267,7 @@ pub async fn index(
     .into_response()
 }
 
-pub async fn query(
-    State(state): State<AppState>,
-    Json(req): Json<RagQueryRequest>,
-) -> Response {
+pub async fn query(State(state): State<AppState>, Json(req): Json<RagQueryRequest>) -> Response {
     let k = req.k.unwrap_or(DEFAULT_K);
     if k == 0 {
         return (
@@ -356,10 +352,7 @@ pub async fn query(
     .into_response()
 }
 
-pub async fn update(
-    State(state): State<AppState>,
-    Json(req): Json<RagUpdateRequest>,
-) -> Response {
+pub async fn update(State(state): State<AppState>, Json(req): Json<RagUpdateRequest>) -> Response {
     if req.paths.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -636,10 +629,7 @@ pub struct RagLoadResponse {
     pub embedding_dim: u32,
 }
 
-pub async fn save(
-    State(state): State<AppState>,
-    Json(req): Json<RagSaveRequest>,
-) -> Response {
+pub async fn save(State(state): State<AppState>, Json(req): Json<RagSaveRequest>) -> Response {
     // Need a built index to save; 409 mirrors /query's "no index" path.
     let index_handle = {
         let slot = state.rag_index.read().await;
@@ -700,10 +690,7 @@ pub async fn save(
     }
 }
 
-pub async fn load(
-    State(state): State<AppState>,
-    Json(req): Json<RagLoadRequest>,
-) -> Response {
+pub async fn load(State(state): State<AppState>, Json(req): Json<RagLoadRequest>) -> Response {
     let target = req.path.clone();
     let target_for_resp = req.path.clone();
 
@@ -721,9 +708,7 @@ pub async fn load(
                 | rustllama_rag::IndexError::BadMagic
                 | rustllama_rag::IndexError::UnsupportedVersion { .. }
                 | rustllama_rag::IndexError::CorruptHeader(_) => StatusCode::BAD_REQUEST,
-                rustllama_rag::IndexError::WrongDimension { .. } => {
-                    StatusCode::BAD_REQUEST
-                }
+                rustllama_rag::IndexError::WrongDimension { .. } => StatusCode::BAD_REQUEST,
             };
             return (
                 status,

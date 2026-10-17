@@ -58,10 +58,7 @@ impl RagWatcher {
     /// windows (<100ms) defeat the purpose; very long windows (>5s)
     /// make the watcher feel unresponsive. The default 1s is right
     /// for editor save cycles.
-    pub fn with_debounce(
-        root: impl AsRef<Path>,
-        debounce: Duration,
-    ) -> Result<Self, WatcherError> {
+    pub fn with_debounce(root: impl AsRef<Path>, debounce: Duration) -> Result<Self, WatcherError> {
         let root_path = root.as_ref().to_path_buf();
         if !root_path.exists() {
             return Err(WatcherError::RootMissing(root_path));
@@ -78,30 +75,26 @@ impl RagWatcher {
         // (write vs rename vs remove), just that the file needs re-
         // indexing. Removed files arrive here too; the caller should
         // probe the path's existence after dequeue.
-        let mut debouncer = new_debouncer(
-            debounce,
-            None,
-            move |result: DebounceEventResult| {
-                if let Ok(events) = result {
-                    let mut paths: HashSet<PathBuf> = HashSet::new();
-                    for ev in events {
-                        for p in &ev.event.paths {
-                            paths.insert(p.clone());
-                        }
-                    }
-                    if !paths.is_empty() {
-                        // Sender dropped means the consumer side exited;
-                        // ignore the send error and let the debouncer
-                        // continue running until its `Drop` cleans up.
-                        let _ = tx.send(paths);
+        let mut debouncer = new_debouncer(debounce, None, move |result: DebounceEventResult| {
+            if let Ok(events) = result {
+                let mut paths: HashSet<PathBuf> = HashSet::new();
+                for ev in events {
+                    for p in &ev.event.paths {
+                        paths.insert(p.clone());
                     }
                 }
-                // notify errors get dropped on the floor here — the
-                // caller can re-create the watcher if it sees no events
-                // arriving. Adding a sidechannel for errors costs more
-                // surface area than it gains for v1.
-            },
-        )
+                if !paths.is_empty() {
+                    // Sender dropped means the consumer side exited;
+                    // ignore the send error and let the debouncer
+                    // continue running until its `Drop` cleans up.
+                    let _ = tx.send(paths);
+                }
+            }
+            // notify errors get dropped on the floor here — the
+            // caller can re-create the watcher if it sees no events
+            // arriving. Adding a sidechannel for errors costs more
+            // surface area than it gains for v1.
+        })
         .map_err(|e| WatcherError::Notify(e.to_string()))?;
 
         debouncer
@@ -190,11 +183,7 @@ mod tests {
         // come back through the receiver within the debounce window.
         // Uses a very short debounce so the test runs quickly.
         let dir = tempfile::tempdir().unwrap();
-        let watcher = RagWatcher::with_debounce(
-            dir.path(),
-            Duration::from_millis(100),
-        )
-        .unwrap();
+        let watcher = RagWatcher::with_debounce(dir.path(), Duration::from_millis(100)).unwrap();
 
         let target = dir.path().join("hello.rs");
         std::fs::write(&target, b"fn main() {}").unwrap();
@@ -207,9 +196,10 @@ mod tests {
         while Instant::now() < deadline {
             match watcher.recv_timeout(Duration::from_millis(200)) {
                 Ok(paths) => {
-                    if paths.iter().any(|p| {
-                        p.file_name().and_then(|s| s.to_str()) == Some("hello.rs")
-                    }) {
+                    if paths
+                        .iter()
+                        .any(|p| p.file_name().and_then(|s| s.to_str()) == Some("hello.rs"))
+                    {
                         saw_target = true;
                         break;
                     }

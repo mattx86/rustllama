@@ -7,7 +7,7 @@
 //   cargo run -p rustllama-gguf --example compare_experts --release -- \
 //       <reference.gguf> <iq1s.gguf> <iq2xxs.gguf>
 use rustllama_gguf::dequant;
-use rustllama_gguf::{Gguf, GgmlType};
+use rustllama_gguf::{GgmlType, Gguf};
 
 fn dq(g: &Gguf, name: &str) -> Option<Vec<f32>> {
     let info = g.tensor(name)?;
@@ -40,7 +40,11 @@ fn compare(label: &str, a: &[f32], r: &[f32]) {
         nr += y * y;
         se += (x - y) * (x - y);
     }
-    let cos = if na > 0.0 && nr > 0.0 { dot / (na.sqrt() * nr.sqrt()) } else { 0.0 };
+    let cos = if na > 0.0 && nr > 0.0 {
+        dot / (na.sqrt() * nr.sqrt())
+    } else {
+        0.0
+    };
     let rms_err = (se / n as f64).sqrt();
     let rms_ref = (nr / n as f64).sqrt();
     let rms_cand = (na / n as f64).sqrt();
@@ -67,8 +71,15 @@ fn main() {
     ];
     println!("cos near +1 => faithful reconstruction; cos near 0 => garbage (encoder bug)\n");
     for name in names {
-        let Some(rref) = dq(&gref, name) else { println!("{name}: ref missing"); continue };
-        println!("{name}  (ref dtype {:?}, n={})", gref.tensor(name).unwrap().dtype, rref.len());
+        let Some(rref) = dq(&gref, name) else {
+            println!("{name}: ref missing");
+            continue;
+        };
+        println!(
+            "{name}  (ref dtype {:?}, n={})",
+            gref.tensor(name).unwrap().dtype,
+            rref.len()
+        );
         if let Some(a1) = dq(&g1, name) {
             compare("IQ1_S", &a1, &rref);
         }

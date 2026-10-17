@@ -1,4 +1,4 @@
-﻿//! Integration tests for the Anthropic Messages adapter (`POST /v1/messages`).
+//! Integration tests for the Anthropic Messages adapter (`POST /v1/messages`).
 //!
 //! Uses `MockEngine` so the tests verify request/response shape + SSE
 //! event flow without needing a real model. Tool-call shape coverage
@@ -41,9 +41,8 @@ async fn post_json(uri: &str, body: serde_json::Value) -> (StatusCode, serde_jso
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-    let body = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_else(|_| {
-        serde_json::Value::String(String::from_utf8_lossy(&bytes).to_string())
-    });
+    let body = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).to_string()));
     (status, body)
 }
 
@@ -97,7 +96,10 @@ async fn messages_non_streaming_returns_anthropic_shaped_response() {
     // stop_reason is one of the standard values.
     let stop_reason = body["stop_reason"].as_str().expect("stop_reason");
     assert!(
-        matches!(stop_reason, "end_turn" | "max_tokens" | "stop_sequence" | "tool_use"),
+        matches!(
+            stop_reason,
+            "end_turn" | "max_tokens" | "stop_sequence" | "tool_use"
+        ),
         "unexpected stop_reason: {stop_reason}"
     );
     // usage block has the two required counts.
@@ -270,8 +272,7 @@ async fn messages_non_streaming_surfaces_usage_extension_fields_with_real_engine
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-    let body: serde_json::Value =
-        serde_json::from_slice(&bytes).expect("response is JSON");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("response is JSON");
     let usage = &body["usage"];
     assert!(usage["input_tokens"].is_number());
     assert!(usage["output_tokens"].is_number());
@@ -323,14 +324,16 @@ async fn messages_streaming_surfaces_usage_extension_fields_with_real_engine() {
             // Next non-empty line is the matching `data: {...}`.
             for data_line in lines.by_ref() {
                 if let Some(payload) = data_line.strip_prefix("data: ") {
-                    let v: serde_json::Value =
-                        serde_json::from_str(payload).expect("delta JSON");
+                    let v: serde_json::Value = serde_json::from_str(payload).expect("delta JSON");
                     let usage = &v["usage"];
                     assert!(
                         usage["prefill_ms"].is_number(),
                         "stream prefill_ms missing: {v}"
                     );
-                    assert!(usage["decode_ms"].is_number(), "stream decode_ms missing: {v}");
+                    assert!(
+                        usage["decode_ms"].is_number(),
+                        "stream decode_ms missing: {v}"
+                    );
                     assert!(
                         usage["cache_hit_tokens"].is_number(),
                         "stream cache_hit_tokens missing: {v}"
@@ -386,7 +389,10 @@ async fn messages_streaming_emits_full_event_sequence() {
         .collect();
 
     assert!(
-        events.first().map(|e| *e == "message_start").unwrap_or(false),
+        events
+            .first()
+            .map(|e| *e == "message_start")
+            .unwrap_or(false),
         "first event should be message_start, got: {events:?}"
     );
     assert!(

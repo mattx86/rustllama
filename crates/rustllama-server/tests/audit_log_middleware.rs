@@ -58,11 +58,7 @@ async fn get(app: axum::Router, path: &str) -> (StatusCode, Vec<u8>) {
     (status, bytes.to_vec())
 }
 
-async fn get_with_auth(
-    app: axum::Router,
-    path: &str,
-    auth: &str,
-) -> (StatusCode, Vec<u8>) {
+async fn get_with_auth(app: axum::Router, path: &str, auth: &str) -> (StatusCode, Vec<u8>) {
     let req = Request::builder()
         .method("GET")
         .uri(path)
@@ -102,7 +98,10 @@ async fn audit_middleware_writes_jsonl_per_request() {
     assert_eq!(e["path"], "/healthz");
     assert_eq!(e["status"], 200);
     assert!(e["ts_ms"].as_u64().is_some(), "ts_ms is a u64: {e}");
-    assert!(e["latency_ms"].as_u64().is_some(), "latency_ms is a u64: {e}");
+    assert!(
+        e["latency_ms"].as_u64().is_some(),
+        "latency_ms is a u64: {e}"
+    );
     // Default for an empty query string is the empty string — NOT
     // null — so consumers can rely on the type being stable.
     assert_eq!(e["query"], "");
@@ -125,10 +124,7 @@ async fn audit_middleware_redacts_api_key_query_param() {
     let lines = read_audit_lines(&path);
     assert_eq!(lines.len(), 1);
     let q = lines[0]["query"].as_str().unwrap();
-    assert!(
-        q.contains("api_key=***"),
-        "redacted form must appear: {q}"
-    );
+    assert!(q.contains("api_key=***"), "redacted form must appear: {q}");
     assert!(
         !q.contains(secret),
         "raw key must NOT appear in audit log: {q}"

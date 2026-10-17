@@ -23,7 +23,12 @@ fn synth_path(tag: &str) -> std::path::PathBuf {
 
 /// Run the given token sequence from a fresh cache, returning each step's
 /// full logit vector. `naive` picks the naive vs absorbed decode.
-fn run_sequence(model: &LlamaModel, cfg: &LlamaConfig, tokens: &[i32], naive: bool) -> Vec<Vec<f32>> {
+fn run_sequence(
+    model: &LlamaModel,
+    cfg: &LlamaConfig,
+    tokens: &[i32],
+    naive: bool,
+) -> Vec<Vec<f32>> {
     let mut kv = KvCache::new_with_dtype(cfg, cfg.ctx_train, KvDtype::F32);
     assert!(kv.mla.is_some(), "MLA model must build an MLA KV cache");
     let mut out = Vec::new();
@@ -42,7 +47,10 @@ fn run_sequence(model: &LlamaModel, cfg: &LlamaConfig, tokens: &[i32], naive: bo
 fn assert_all_finite(steps: &[Vec<f32>], label: &str) {
     for (s, logits) in steps.iter().enumerate() {
         for (i, v) in logits.iter().enumerate() {
-            assert!(v.is_finite(), "{label}: step {s} logit[{i}] = {v} not finite");
+            assert!(
+                v.is_finite(),
+                "{label}: step {s} logit[{i}] = {v} not finite"
+            );
         }
     }
 }
@@ -56,7 +64,10 @@ fn load_run_and_check_parity(params: &SynthMla, tag: &str) {
     let cfg = LlamaConfig::from_gguf(&gguf).expect("parse MLA config");
 
     // (2) MLA config parsed.
-    let mla = cfg.mla.as_ref().expect("cfg.mla must be Some for a deepseek2/MLA GGUF");
+    let mla = cfg
+        .mla
+        .as_ref()
+        .expect("cfg.mla must be Some for a deepseek2/MLA GGUF");
     assert_eq!(mla.kv_lora_rank as u32, params.kv_lora_rank);
     assert_eq!(mla.qk_rope_head_dim as u32, params.qk_rope_head_dim);
     assert_eq!(mla.v_head_dim as u32, params.v_head_dim);

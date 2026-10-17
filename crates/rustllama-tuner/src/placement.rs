@@ -243,8 +243,7 @@ pub fn embedding_vram_bytes(dims: ModelDims, quant: WeightQuant) -> u64 {
 /// layers — the alternative (per-layer dtype-juggling) is messy
 /// and the savings are small at v1 context sizes.
 pub fn kv_cache_vram_bytes(dims: ModelDims, max_ctx: u32) -> u64 {
-    let per_layer =
-        2u64 * dims.n_kv_heads as u64 * max_ctx as u64 * dims.head_dim as u64 * 2;
+    let per_layer = 2u64 * dims.n_kv_heads as u64 * max_ctx as u64 * dims.head_dim as u64 * 2;
     per_layer * dims.n_layers as u64
 }
 
@@ -307,7 +306,11 @@ pub fn candidate_placements(
         .filter_map(|n_gpu| {
             let blocks_on_gpu = n_gpu.min(dims.n_layers) as u64;
             let weights_cost = blocks_on_gpu * block
-                + if n_gpu > dims.n_layers { lm_head + embed } else { 0 };
+                + if n_gpu > dims.n_layers {
+                    lm_head + embed
+                } else {
+                    0
+                };
             // KV cache always device-resident regardless of which
             // layers are on GPU — see `kv_cache_vram_bytes`.
             let total = weights_cost + kv;
@@ -398,14 +401,7 @@ mod tests {
     #[test]
     fn candidate_placements_empty_when_budget_zero() {
         let dims = llama2_7b_dims();
-        let plans = candidate_placements(
-            dims,
-            WeightQuant::Q4_K_M,
-            0,
-            0,
-            2048,
-            DEFAULT_SWEEP_STEP,
-        );
+        let plans = candidate_placements(dims, WeightQuant::Q4_K_M, 0, 0, 2048, DEFAULT_SWEEP_STEP);
         // Even 0 GPU layers carries the KV cache cost, so a zero
         // budget rejects every candidate.
         assert!(plans.is_empty(), "expected empty plans, got {plans:?}");
@@ -486,7 +482,10 @@ mod tests {
         assert!(!plans.is_empty(), "Iris-Xe budget should fit some plans");
         // Sorted descending.
         for w in plans.windows(2) {
-            assert!(w[0].n_gpu_layers > w[1].n_gpu_layers, "not descending: {plans:?}");
+            assert!(
+                w[0].n_gpu_layers > w[1].n_gpu_layers,
+                "not descending: {plans:?}"
+            );
         }
         // n=0 always fits (just the KV cache).
         let last = plans.last().unwrap();
@@ -525,8 +524,7 @@ mod tests {
     fn block_weights_grows_with_expert_count() {
         let mixtral = mixtral_8x7b_dims();
         // A "dense-shaped" reference using mixtral's same per-expert FFN size.
-        let dense_ref =
-            ModelDims::dense(32, 4096, 14336, 32, 8, 128, 32000);
+        let dense_ref = ModelDims::dense(32, 4096, 14336, 32, 8, 128, 32000);
         let moe = mixtral.block_weights();
         let dense = dense_ref.block_weights();
         // 8 experts → FFN portion is ~8× dense; the projection

@@ -72,7 +72,11 @@ fn accumulate(m: &mut f32, l: &mut f32, acc: &mut [f32], s: f32, v_row: &[f32]) 
     let m_new = m.max(s);
     // `exp(m_old − m_new)` rescales the accumulators onto the new max. When the
     // state is still empty (`m_old = −∞`) the rescale is 0 (nothing to carry).
-    let rescale = if m.is_finite() { (*m - m_new).exp() } else { 0.0 };
+    let rescale = if m.is_finite() {
+        (*m - m_new).exp()
+    } else {
+        0.0
+    };
     let p = (s - m_new).exp();
     *l = *l * rescale + p;
     for d in 0..acc.len() {
@@ -96,8 +100,16 @@ fn merge_into(
     out: &mut [f32],
 ) -> (f32, f32) {
     let m_g = m_a.max(m_b);
-    let e_a = if m_a.is_finite() { (m_a - m_g).exp() } else { 0.0 };
-    let e_b = if m_b.is_finite() { (m_b - m_g).exp() } else { 0.0 };
+    let e_a = if m_a.is_finite() {
+        (m_a - m_g).exp()
+    } else {
+        0.0
+    };
+    let e_b = if m_b.is_finite() {
+        (m_b - m_g).exp()
+    } else {
+        0.0
+    };
     let l_g = l_a * e_a + l_b * e_b;
     for d in 0..out.len() {
         out[d] = acc_a[d] * e_a + acc_b[d] * e_b;
@@ -125,7 +137,13 @@ impl FlashPartial {
         // Temp copy of `self.acc` so `merge_into` can write back in place.
         let a = self.acc.clone();
         let (m_g, l_g) = merge_into(
-            self.m, self.l, &a, other.m, other.l, &other.acc, &mut self.acc,
+            self.m,
+            self.l,
+            &a,
+            other.m,
+            other.l,
+            &other.acc,
+            &mut self.acc,
         );
         self.m = m_g;
         self.l = l_g;
@@ -415,11 +433,27 @@ mod tests {
             let full_naive = naive_attn_one_head(&q, &k, &v, head_dim, kv_len, scale);
             let mut full_flash = vec![0.0f32; head_dim];
             gqa_attention_flash_decode(
-                &q, &k, &v, &mut full_flash, 1, 1, head_dim, kv_len.max(1), kv_len,
+                &q,
+                &k,
+                &v,
+                &mut full_flash,
+                1,
+                1,
+                head_dim,
+                kv_len.max(1),
+                kv_len,
             );
 
             // Cascade: partial(A) merged with partial(B).
-            let a = flash_partial_f32(&q, &k[..split * head_dim], &v[..split * head_dim], head_dim, split, scale, 0.0);
+            let a = flash_partial_f32(
+                &q,
+                &k[..split * head_dim],
+                &v[..split * head_dim],
+                head_dim,
+                split,
+                scale,
+                0.0,
+            );
             let b = flash_partial_f32(
                 &q,
                 &k[split * head_dim..],
@@ -480,7 +514,15 @@ mod tests {
                 &q, &k, &v, &mut full, head_dim, kv_len, scale, 0, softcap,
             );
 
-            let a = flash_partial_f32(&q, &k[..split * head_dim], &v[..split * head_dim], head_dim, split, scale, softcap);
+            let a = flash_partial_f32(
+                &q,
+                &k[..split * head_dim],
+                &v[..split * head_dim],
+                head_dim,
+                split,
+                scale,
+                softcap,
+            );
             let b = flash_partial_f32(
                 &q,
                 &k[split * head_dim..],
@@ -564,8 +606,17 @@ mod tests {
 
         let mut cascade_out = vec![0.0f32; n_seq * n_heads * head_dim];
         cascade_attention_f32(
-            &prefix_k, &prefix_v, prefix_len, &queries, &suffixes, &mut cascade_out, n_seq,
-            n_heads, n_kv_heads, head_dim, softcap,
+            &prefix_k,
+            &prefix_v,
+            prefix_len,
+            &queries,
+            &suffixes,
+            &mut cascade_out,
+            n_seq,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            softcap,
         );
 
         // Per-sequence reference: concat prefix ++ suffix_s into one tight cache.
@@ -612,7 +663,15 @@ mod tests {
                 }
             } else {
                 gqa_attention_flash_decode(
-                    q_s, &k_full, &v_full, &mut ref_out, n_heads, n_kv_heads, head_dim, kv_len, kv_len,
+                    q_s,
+                    &k_full,
+                    &v_full,
+                    &mut ref_out,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    kv_len,
+                    kv_len,
                 );
             }
             let cas_s = &cascade_out[s * n_heads * head_dim..(s + 1) * n_heads * head_dim];
@@ -692,7 +751,11 @@ mod tests {
                 suffix_v.push(rng.vec(n_kv_heads * suffix_len * head_dim));
             }
             let suffixes: Vec<CascadeSuffix> = (0..n_seq)
-                .map(|s| CascadeSuffix { k: &suffix_k[s], v: &suffix_v[s], len: suffix_len })
+                .map(|s| CascadeSuffix {
+                    k: &suffix_k[s],
+                    v: &suffix_v[s],
+                    len: suffix_len,
+                })
                 .collect();
             let mut cas_out = vec![0.0f32; n_seq * n_heads * head_dim];
 
@@ -700,8 +763,17 @@ mod tests {
             let t0 = Instant::now();
             for _ in 0..reps {
                 cascade_attention_f32(
-                    &prefix_k, &prefix_v, prefix_len, &queries, &suffixes, &mut cas_out,
-                    n_seq, n_heads, n_kv_heads, head_dim, 0.0,
+                    &prefix_k,
+                    &prefix_v,
+                    prefix_len,
+                    &queries,
+                    &suffixes,
+                    &mut cas_out,
+                    n_seq,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    0.0,
                 );
             }
             let cas_t = t0.elapsed().as_secs_f64() / reps as f64;
@@ -737,7 +809,8 @@ mod tests {
                     let q_s = &queries[s * n_heads * head_dim..(s + 1) * n_heads * head_dim];
                     let o_s = &mut base_out[s * n_heads * head_dim..(s + 1) * n_heads * head_dim];
                     gqa_attention_flash_decode(
-                        q_s, &full_k[s], &full_v[s], o_s, n_heads, n_kv_heads, head_dim, kv_len, kv_len,
+                        q_s, &full_k[s], &full_v[s], o_s, n_heads, n_kv_heads, head_dim, kv_len,
+                        kv_len,
                     );
                 }
             }

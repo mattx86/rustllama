@@ -33,8 +33,8 @@ fn forward_one_on_mixtral_shape_produces_finite_logits() {
     );
     let gguf = Gguf::open(&path).expect("open");
     let cfg = LlamaConfig::from_gguf(&gguf).expect("config");
-    let model = LlamaModel::load_allow_moe(&gguf)
-        .expect("phase 2-B: MoE load_allow_moe must succeed");
+    let model =
+        LlamaModel::load_allow_moe(&gguf).expect("phase 2-B: MoE load_allow_moe must succeed");
     assert!(
         model.weights.is_moe(),
         "model must report is_moe after load_allow_moe on a MoE GGUF"
@@ -386,7 +386,9 @@ fn forward_one_paged_f32_moe_matches_contiguous_forward_one() {
     .expect("paged store");
     let mut table = PageTable::new(pages_needed, page_size);
     let mut paged = PagedKvCache::new_for(&store);
-    paged.ensure_capacity(&mut table, n_prompt as u32).expect("capacity");
+    paged
+        .ensure_capacity(&mut table, n_prompt as u32)
+        .expect("capacity");
     let mut paged_logits = vec![0f32; cfg.vocab_size];
     for (i, &t) in tokens.iter().enumerate() {
         model.forward_one_paged_f32(t, i as u32, &mut paged, &mut store, &mut paged_logits);
@@ -454,7 +456,9 @@ fn forward_decode_paged_batched_f32_moe_matches_serial_paged() {
         .expect("ref store");
         let mut table = PageTable::new(pages_per_cache, page_size);
         let mut cache = PagedKvCache::new_for(&store);
-        cache.ensure_capacity(&mut table, total_capacity).expect("capacity");
+        cache
+            .ensure_capacity(&mut table, total_capacity)
+            .expect("capacity");
         for (i, &t) in prompt.iter().enumerate() {
             let mut tmp = vec![0f32; cfg.vocab_size];
             model.forward_one_paged_f32(t, i as u32, &mut cache, &mut store, &mut tmp);
@@ -494,8 +498,12 @@ fn forward_decode_paged_batched_f32_moe_matches_serial_paged() {
     .unwrap();
     let mut cache_a = PagedKvCache::new_for(&geom_store);
     let mut cache_b = PagedKvCache::new_for(&geom_store);
-    cache_a.ensure_capacity_shared(&shared, total_capacity).expect("a");
-    cache_b.ensure_capacity_shared(&shared, total_capacity).expect("b");
+    cache_a
+        .ensure_capacity_shared(&shared, total_capacity)
+        .expect("a");
+    cache_b
+        .ensure_capacity_shared(&shared, total_capacity)
+        .expect("b");
 
     // Prefill both slots through the shared store.
     for (prompt, cache) in [(&prompt_a, &mut cache_a), (&prompt_b, &mut cache_b)] {
@@ -692,7 +700,10 @@ fn forward_ragged_paged_f32_mixed_matches_sequential_prefill_then_decode() {
     }
 
     let max_err = |x: &[f32], y: &[f32]| -> f32 {
-        x.iter().zip(y).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max)
+        x.iter()
+            .zip(y)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
     };
     let err_b = max_err(&ref_b_logits, &rag_b_logits);
     let err_a = max_err(&ref_a_logits, &rag_a_logits);
@@ -737,13 +748,21 @@ fn forward_ragged_paged_f32_all_decode_matches_batched_decode() {
 
     let build_world = || {
         let store = PagedKvStore::new(
-            total_pages, cfg.n_layers as u32, cfg.n_kv_heads as u32, page_size, cfg.head_dim as u32,
+            total_pages,
+            cfg.n_layers as u32,
+            cfg.n_kv_heads as u32,
+            page_size,
+            cfg.head_dim as u32,
         )
         .expect("store");
         let table = PageTable::new(total_pages, page_size);
         let shared = SharedPagedKv::new(store, table);
         let geom = PagedKvStore::new(
-            total_pages, cfg.n_layers as u32, cfg.n_kv_heads as u32, page_size, cfg.head_dim as u32,
+            total_pages,
+            cfg.n_layers as u32,
+            cfg.n_kv_heads as u32,
+            page_size,
+            cfg.head_dim as u32,
         )
         .unwrap();
         let mut cache_a = PagedKvCache::new_for(&geom);
@@ -762,8 +781,18 @@ fn forward_ragged_paged_f32_all_decode_matches_batched_decode() {
     let mut dec_b_logits = vec![0f32; cfg.vocab_size];
     {
         let mut slots = vec![
-            DecodeSlot { token_id: prompt_a[n - 1], pos: n as u32, cache: &mut dec_a, logits_out: &mut dec_a_logits },
-            DecodeSlot { token_id: prompt_b[n - 1], pos: n as u32, cache: &mut dec_b, logits_out: &mut dec_b_logits },
+            DecodeSlot {
+                token_id: prompt_a[n - 1],
+                pos: n as u32,
+                cache: &mut dec_a,
+                logits_out: &mut dec_a_logits,
+            },
+            DecodeSlot {
+                token_id: prompt_b[n - 1],
+                pos: n as u32,
+                cache: &mut dec_b,
+                logits_out: &mut dec_b_logits,
+            },
         ];
         model.forward_decode_paged_batched_f32(&mut slots, &dec_shared);
     }
@@ -774,17 +803,36 @@ fn forward_ragged_paged_f32_all_decode_matches_batched_decode() {
     {
         let tokens = vec![prompt_a[n - 1], prompt_b[n - 1]];
         let mut slots = vec![
-            RaggedSlot { n_query: 1, start_pos: n as u32, cache: &mut rag_a, logits_out: rag_a_logits.as_mut_slice() },
-            RaggedSlot { n_query: 1, start_pos: n as u32, cache: &mut rag_b, logits_out: rag_b_logits.as_mut_slice() },
+            RaggedSlot {
+                n_query: 1,
+                start_pos: n as u32,
+                cache: &mut rag_a,
+                logits_out: rag_a_logits.as_mut_slice(),
+            },
+            RaggedSlot {
+                n_query: 1,
+                start_pos: n as u32,
+                cache: &mut rag_b,
+                logits_out: rag_b_logits.as_mut_slice(),
+            },
         ];
         model.forward_ragged_paged_f32(&tokens, &mut slots, &rag_shared, None);
     }
 
     let max_err = |x: &[f32], y: &[f32]| -> f32 {
-        x.iter().zip(y).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max)
+        x.iter()
+            .zip(y)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
     };
-    assert!(max_err(&dec_a_logits, &rag_a_logits) < 1e-5, "all-decode ragged slot A != batched decode");
-    assert!(max_err(&dec_b_logits, &rag_b_logits) < 1e-5, "all-decode ragged slot B != batched decode");
+    assert!(
+        max_err(&dec_a_logits, &rag_a_logits) < 1e-5,
+        "all-decode ragged slot A != batched decode"
+    );
+    assert!(
+        max_err(&dec_b_logits, &rag_b_logits) < 1e-5,
+        "all-decode ragged slot B != batched decode"
+    );
     let _ = std::fs::remove_file(&path);
 }
 

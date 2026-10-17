@@ -11,10 +11,12 @@
 // Handles only the dtypes present in test_v8 (F32 / IQ1_S / IQ2_XXS);
 // anything else is skipped.
 use rustllama_gguf::dequant;
-use rustllama_gguf::{Gguf, GgmlType};
+use rustllama_gguf::{GgmlType, Gguf};
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: scan_finite <model.gguf>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: scan_finite <model.gguf>");
     let gguf = Gguf::open(&path).expect("open gguf");
     let infos: Vec<_> = gguf
         .tensors()
@@ -32,7 +34,9 @@ fn main() {
     let mut iq1s_max = f32::NEG_INFINITY;
 
     for (name, dtype, n) in &infos {
-        let Some(bytes) = gguf.tensor_bytes(name) else { continue };
+        let Some(bytes) = gguf.tensor_bytes(name) else {
+            continue;
+        };
         let mut out = vec![0f32; *n];
         let handled = match dtype {
             GgmlType::F32 => {
@@ -41,30 +45,55 @@ fn main() {
                 }
                 true
             }
-            GgmlType::IQ1_S => { dequant::dequant_iq1_s(bytes, &mut out); true }
-            GgmlType::IQ2_XXS => { dequant::dequant_iq2_xxs(bytes, &mut out); true }
+            GgmlType::IQ1_S => {
+                dequant::dequant_iq1_s(bytes, &mut out);
+                true
+            }
+            GgmlType::IQ2_XXS => {
+                dequant::dequant_iq2_xxs(bytes, &mut out);
+                true
+            }
             _ => false,
         };
-        if !handled { continue; }
+        if !handled {
+            continue;
+        }
         scanned += 1;
         let mut nan = 0usize;
         let mut inf = 0usize;
         let mut tmin = f32::INFINITY;
         let mut tmax = f32::NEG_INFINITY;
         for &v in &out {
-            if v.is_nan() { nan += 1; }
-            else if v.is_infinite() { inf += 1; }
-            else { if v < tmin { tmin = v; } if v > tmax { tmax = v; } }
+            if v.is_nan() {
+                nan += 1;
+            } else if v.is_infinite() {
+                inf += 1;
+            } else {
+                if v < tmin {
+                    tmin = v;
+                }
+                if v > tmax {
+                    tmax = v;
+                }
+            }
         }
         if nan > 0 || inf > 0 {
             bad += 1;
             println!("  BAD  {name:48} {dtype:?}  nan={nan} inf={inf} (n={n})");
         } else {
-            if tmin < g_min { g_min = tmin; }
-            if tmax > g_max { g_max = tmax; }
+            if tmin < g_min {
+                g_min = tmin;
+            }
+            if tmax > g_max {
+                g_max = tmax;
+            }
             if matches!(dtype, GgmlType::IQ1_S) {
-                if tmin < iq1s_min { iq1s_min = tmin; }
-                if tmax > iq1s_max { iq1s_max = tmax; }
+                if tmin < iq1s_min {
+                    iq1s_min = tmin;
+                }
+                if tmax > iq1s_max {
+                    iq1s_max = tmax;
+                }
             }
             if std::env::var("VERBOSE").is_ok() {
                 println!("  ok   {name:48} {dtype:?}  min={tmin:+.4e} max={tmax:+.4e}");

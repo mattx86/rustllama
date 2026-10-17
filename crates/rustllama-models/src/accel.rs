@@ -259,7 +259,9 @@ fn try_matvec_gate_up_fused_cuda(
     let Ok(mut guard) = cache.lock() else {
         return false;
     };
-    guard.matvec_gate_up_fused(kind, g_key, g_bytes, u_key, u_bytes, x, gate_out, up_out, m, k)
+    guard.matvec_gate_up_fused(
+        kind, g_key, g_bytes, u_key, u_bytes, x, gate_out, up_out, m, k,
+    )
 }
 
 /// Batched (`n`-row) packed matvec via the native CUDA backend.
@@ -348,8 +350,9 @@ unsafe fn try_gemm_q4k_f32_batched_dev_resident(
     };
     // SAFETY: caller guarantees `w_ptr_dev` is a live device buffer of
     // `>= w_nbytes` bytes on this cache's (default) device for the call.
-    let ok =
-        unsafe { guard.gemm_packed_batched_q4k_f32_dev_resident(w_ptr_dev, w_nbytes, x, out, m, k, n) };
+    let ok = unsafe {
+        guard.gemm_packed_batched_q4k_f32_dev_resident(w_ptr_dev, w_nbytes, x, out, m, k, n)
+    };
     if ok {
         note_moe_dev_resident_hit();
     }
@@ -560,10 +563,12 @@ fn moe_gate_up_fused_enabled(dtype: Dtype) -> bool {
         Some(name) => {
             kernel_verdict(&format!(
                 "{}{}",
-                rustllama_tuner::VERDICT_FUSED_GATE_UP_PREFIX, name
+                rustllama_tuner::VERDICT_FUSED_GATE_UP_PREFIX,
+                name
             )) && kernel_verdict(&format!(
                 "{}{}",
-                rustllama_tuner::VERDICT_MOE_GATE_UP_COHERENT_PREFIX, name
+                rustllama_tuner::VERDICT_MOE_GATE_UP_COHERENT_PREFIX,
+                name
             ))
         }
         None => false,
@@ -597,7 +602,11 @@ fn mixed_precision_matvec_enabled(dtype: Dtype) -> bool {
         return false;
     }
     match dtype_probe_name(dtype) {
-        Some(name) => kernel_verdict(&format!("{}{}", rustllama_tuner::VERDICT_MATVEC_F16IN_PREFIX, name)),
+        Some(name) => kernel_verdict(&format!(
+            "{}{}",
+            rustllama_tuner::VERDICT_MATVEC_F16IN_PREFIX,
+            name
+        )),
         None => false,
     }
 }
@@ -777,8 +786,12 @@ unsafe fn try_gemm_fp4_tc_batched_dev_resident(
     k: usize,
     n: usize,
 ) -> bool {
-    let Some(cache) = cuda_cache() else { return false };
-    let Ok(mut guard) = cache.lock() else { return false };
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
     // SAFETY: see module note above.
     let ok = unsafe { guard.gemm_fp4_tc_dev_resident(kind, w_ptr_dev, w_nbytes, x, out, m, k, n) };
     if ok {
@@ -797,8 +810,12 @@ unsafe fn try_gemm_mxfp8_tc_batched_dev_resident(
     k: usize,
     n: usize,
 ) -> bool {
-    let Some(cache) = cuda_cache() else { return false };
-    let Ok(mut guard) = cache.lock() else { return false };
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
     // SAFETY: see module note above.
     let ok = unsafe { guard.gemm_mxfp8_tc_dev_resident(w_ptr_dev, w_nbytes, x, out, m, k, n) };
     if ok {
@@ -817,8 +834,12 @@ unsafe fn try_gemm_mxfp6_tc_batched_dev_resident(
     k: usize,
     n: usize,
 ) -> bool {
-    let Some(cache) = cuda_cache() else { return false };
-    let Ok(mut guard) = cache.lock() else { return false };
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
     // SAFETY: see module note above.
     let ok = unsafe { guard.gemm_mxfp6_tc_dev_resident(w_ptr_dev, w_nbytes, x, out, m, k, n) };
     if ok {
@@ -837,8 +858,12 @@ unsafe fn try_gemm_fp8_wgmma_batched_dev_resident(
     k: usize,
     n: usize,
 ) -> bool {
-    let Some(cache) = cuda_cache() else { return false };
-    let Ok(mut guard) = cache.lock() else { return false };
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
     // SAFETY: see module note above.
     let ok = unsafe {
         guard.gemm_fp8_wgmma_dev_resident(w_ptr_dev, w_nbytes, x, out, m, k, n, hopper_tc_tma())
@@ -873,9 +898,7 @@ fn xmx_enabled() -> bool {
 /// path. Cached once (process-wide).
 fn q4k_gemm_f32_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
-    *EN.get_or_init(|| {
-        kernel_verdict(rustllama_tuner::VERDICT_GEMM_Q4K_F32) && cuda_active()
-    })
+    *EN.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_GEMM_Q4K_F32) && cuda_active())
 }
 
 /// **AUTOMATIC** — no env var: the Q4_K int8 tensor-core GEMM (W8A8, LOSSY) is on
@@ -885,9 +908,7 @@ fn q4k_gemm_f32_enabled() -> bool {
 /// dispatched FIRST; otherwise the bit-exact f32 GEMM runs. Fail-closed; cached.
 fn q4k_w8a8_tc_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
-    *EN.get_or_init(|| {
-        kernel_verdict(rustllama_tuner::VERDICT_GEMM_Q4K_W8A8_TC) && cuda_active()
-    })
+    *EN.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_GEMM_Q4K_W8A8_TC) && cuda_active())
 }
 
 /// **AUTOMATIC** — no env var: the Q4_K W4A8 DECODE matvec (int8 activations,
@@ -899,9 +920,7 @@ fn q4k_w8a8_tc_enabled() -> bool {
 /// [`q4k_w8a8_tc_enabled`].
 fn q4k_w4a8_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
-    *EN.get_or_init(|| {
-        kernel_verdict(rustllama_tuner::VERDICT_MATVEC_Q4K_W4A8) && cuda_active()
-    })
+    *EN.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_MATVEC_Q4K_W4A8) && cuda_active())
 }
 
 /// Single-row Q4_K W4A8 decode matvec via the native CUDA backend (int8
@@ -930,7 +949,14 @@ fn try_matvec_q4k_w4a8_cuda(
 /// device isn't XMX-capable, the dtype isn't dequantizable to f32, or the
 /// kernel reports unavailable/exception — so the caller falls straight through
 /// to the proven packed/scalar SYCL/CPU ladder with `out` untouched.
-fn try_gemm_xmx_batched(w: &Tensor, x: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) -> bool {
+fn try_gemm_xmx_batched(
+    w: &Tensor,
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
     USM_ATTN.with(|cell| {
         let mut slot = cell.borrow_mut();
         let Some(ctx) = slot.as_mut() else {
@@ -1120,14 +1146,18 @@ impl NpuDequantCache {
             return; // one weight bigger than the whole cap → don't thrash.
         }
         if let Some(old) = self.map.remove(&ptr) {
-            self.bytes = self.bytes.saturating_sub(old.0.len() * std::mem::size_of::<f32>());
+            self.bytes = self
+                .bytes
+                .saturating_sub(old.0.len() * std::mem::size_of::<f32>());
         }
         while self.bytes + wb > self.cap_bytes {
             let Some(victim) = self.map.iter().min_by_key(|(_, e)| e.1).map(|(&k, _)| k) else {
                 break;
             };
             if let Some(old) = self.map.remove(&victim) {
-                self.bytes = self.bytes.saturating_sub(old.0.len() * std::mem::size_of::<f32>());
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(old.0.len() * std::mem::size_of::<f32>());
             }
         }
         self.clock += 1;
@@ -1199,7 +1229,14 @@ fn npu_dequant_weight(w: &Tensor, total: usize) -> Option<std::sync::Arc<Vec<f32
 /// AMD Ryzen AI NPU GEMM `out[n,m] = x[n,k]·w[m,k]ᵀ` via ONNX Runtime + VitisAI.
 /// The AMD analog of [`try_npu_gemm_f32`] (dequant → whole-graph GEMM, verdict-
 /// gated). `false` on any miss → caller falls through to the CPU/GPU ladder.
-fn try_amd_npu_gemm_f32(w: &Tensor, x: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) -> bool {
+fn try_amd_npu_gemm_f32(
+    w: &Tensor,
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
     if !amd_npu_offload_enabled()
         || n < NPU_GEMM_MIN_BATCH
         || m == 0
@@ -1384,7 +1421,9 @@ fn try_matvec_gate_up_fused_mlx(
     let Ok(mut guard) = cache.lock() else {
         return false;
     };
-    guard.matvec_gate_up_fused(kind, g_key, g_bytes, u_key, u_bytes, x, gate_out, up_out, m, k)
+    guard.matvec_gate_up_fused(
+        kind, g_key, g_bytes, u_key, u_bytes, x, gate_out, up_out, m, k,
+    )
 }
 
 /// Batched (`n`-row) packed matvec via the native MLX backend. Mirror of
@@ -1464,11 +1503,11 @@ pub struct MultiGpuPlan {
 }
 
 impl MultiGpuPlan {
-    pub fn new(
-        by_name: HashMap<String, DeviceTarget>,
-        attn_device: Option<DeviceTarget>,
-    ) -> Self {
-        Self { by_name, attn_device }
+    pub fn new(by_name: HashMap<String, DeviceTarget>, attn_device: Option<DeviceTarget>) -> Self {
+        Self {
+            by_name,
+            attn_device,
+        }
     }
     /// The GPU a weight is assigned to, or `None` for the CPU tier.
     /// `_layer_idx` is accepted for future per-layer fallbacks; today the
@@ -1509,8 +1548,7 @@ static MULTI_GPU_PLAN: std::sync::RwLock<Option<std::sync::Arc<MultiGpuPlan>>> =
 /// path reads THIS first; a single relaxed-acquire atomic load returning
 /// `false` (the default, and the single-GPU/CPU box) means the dispatcher never
 /// touches the lock and runs exactly today's code.
-static MULTI_GPU_ACTIVE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static MULTI_GPU_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Install (or clear) the multi-GPU device-assignment plan process-wide.
 /// Called by the engine at model load: `Some(plan)` after the heat planner
@@ -1969,7 +2007,6 @@ impl ForwardScratch {
         resize_zero(&mut self.paged_k_slab, need);
         resize_zero(&mut self.paged_v_slab, need);
     }
-
 }
 
 fn resize_zero(v: &mut Vec<f32>, n: usize) {
@@ -2195,7 +2232,9 @@ pub fn tensor_forced_to_cpu(tensor_name: &str) -> bool {
     }
     CPU_FORCE_PATTERNS.with(|c| {
         let patterns = c.borrow();
-        patterns.iter().any(|p| !p.is_empty() && tensor_name.contains(p.as_str()))
+        patterns
+            .iter()
+            .any(|p| !p.is_empty() && tensor_name.contains(p.as_str()))
     })
 }
 
@@ -2205,8 +2244,7 @@ pub fn tensor_forced_to_cpu(tensor_name: &str) -> bool {
 /// on a live engine and `[inference].moe_placement = "auto"` can
 /// resolve from the tuner cache at load.
 fn moe_experts_cpu_cell() -> &'static std::sync::atomic::AtomicBool {
-    static ENABLED: std::sync::OnceLock<std::sync::atomic::AtomicBool> =
-        std::sync::OnceLock::new();
+    static ENABLED: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
     ENABLED.get_or_init(|| {
         std::sync::atomic::AtomicBool::new(
             std::env::var("RUSTLLAMA_MOE_EXPERTS_CPU")
@@ -2587,14 +2625,36 @@ pub fn try_delta_net_chunk_prefill(
     // validated. The host-copy wrapper uploads/runs/downloads internally.
     if cuda_active() {
         return ck::delta_net_chunk_f32(
-            q, k, v, g, beta, state, out, n_heads, seq_len, head_qk_dim, head_v_dim, chunk_len,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            state,
+            out,
+            n_heads,
+            seq_len,
+            head_qk_dim,
+            head_v_dim,
+            chunk_len,
         )
         .is_ok();
     }
     // Apple MLX (unified memory) — write-blind, Mac-validated.
     if mlx_active() {
         return mk::delta_net_chunk_f32(
-            q, k, v, g, beta, state, out, n_heads, seq_len, head_qk_dim, head_v_dim, chunk_len,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            state,
+            out,
+            n_heads,
+            seq_len,
+            head_qk_dim,
+            head_v_dim,
+            chunk_len,
         )
         .is_ok();
     }
@@ -3326,8 +3386,7 @@ impl ExpertPinCache {
 /// Process-global pin cache (see the module comment above for why
 /// this is not per-thread).
 fn expert_pins() -> &'static std::sync::Mutex<ExpertPinCache> {
-    static PINS: std::sync::OnceLock<std::sync::Mutex<ExpertPinCache>> =
-        std::sync::OnceLock::new();
+    static PINS: std::sync::OnceLock<std::sync::Mutex<ExpertPinCache>> = std::sync::OnceLock::new();
     PINS.get_or_init(|| std::sync::Mutex::new(ExpertPinCache::new()))
 }
 
@@ -3521,8 +3580,7 @@ pub fn synthetic_run() -> bool {
 /// through the base dispatch recording hook exactly once. Replaces the old
 /// `set_var("RUSTLLAMA_MOE_GATE_UP_FUSED"/…, "0")` now that the gates read
 /// verdicts, not env vars.
-static FUSIONS_DISABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static FUSIONS_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Force all P5b GPU fusions OFF (see [`FUSIONS_DISABLED`]). Used by the imatrix
 /// recording path. Re-exported as `rustllama_engine::set_fusions_disabled`.
@@ -4147,7 +4205,8 @@ fn expert_ranges() -> &'static std::sync::RwLock<ExpertRangeMap> {
 /// per tensor); consumed by [`note_prefill_layer`] — prefill touches
 /// (nearly) every expert of a layer, so the layer-ahead readahead
 /// streams the whole pool in three coalesced ranges.
-fn layer_pool_ranges() -> &'static std::sync::RwLock<std::collections::HashMap<u32, ExpertRangeTriple>> {
+fn layer_pool_ranges(
+) -> &'static std::sync::RwLock<std::collections::HashMap<u32, ExpertRangeTriple>> {
     static POOLS: std::sync::OnceLock<
         std::sync::RwLock<std::collections::HashMap<u32, ExpertRangeTriple>>,
     > = std::sync::OnceLock::new();
@@ -4180,7 +4239,11 @@ pub fn register_layer_experts(layer: u32, gate: &[Tensor], up: &[Tensor], down: 
             all_backed = false;
             continue;
         };
-        let triple = [(g.0 as usize, g.1), (u.0 as usize, u.1), (d.0 as usize, d.1)];
+        let triple = [
+            (g.0 as usize, g.1),
+            (u.0 as usize, u.1),
+            (d.0 as usize, d.1),
+        ];
         map.insert(ExpertKey::new(layer, e as u32), triple);
         spill_metas.push((
             g.0 as usize,
@@ -4316,7 +4379,10 @@ pub fn expert_registry_clear() {
         .expect("dense-range lock")
         .clear();
     expert_ranges().write().expect("expert-range lock").clear();
-    layer_pool_ranges().write().expect("layer-pool lock").clear();
+    layer_pool_ranges()
+        .write()
+        .expect("layer-pool lock")
+        .clear();
     // The per-part spill meta is captured unconditionally at register, so
     // clear it here too (not only on the enable-gated spill_store_reset) —
     // otherwise stale gate-addr → (dtype, n_elems) entries from a prior model
@@ -4463,11 +4529,12 @@ fn expert_prefetch_tx() -> &'static std::sync::mpsc::SyncSender<PrefetchReq> {
                             let mut regions: Vec<(usize, usize)> =
                                 Vec::with_capacity(keys.len() * 3);
                             {
-                                let ranges_map =
-                                    expert_ranges().read().expect("expert-range lock");
+                                let ranges_map = expert_ranges().read().expect("expert-range lock");
                                 let pins = expert_pins().lock().expect("expert-pin lock");
                                 for k in keys {
-                                    let Some(r) = ranges_map.get(&k) else { continue };
+                                    let Some(r) = ranges_map.get(&k) else {
+                                        continue;
+                                    };
                                     if pins.resident.contains_key(&r[0].0) {
                                         continue; // pinned ⇒ already resident
                                     }
@@ -4749,8 +4816,7 @@ pub fn try_rope_f32(
         let Some(stream) = slot.as_mut() else {
             return false;
         };
-        let mut qk_bits: Vec<u16> =
-            qk.iter().map(|v| f16::from_f32(*v).to_bits()).collect();
+        let mut qk_bits: Vec<u16> = qk.iter().map(|v| f16::from_f32(*v).to_bits()).collect();
         let freq_bits: Vec<u16> = inv_freq[..half]
             .iter()
             .map(|v| f16::from_f32(*v).to_bits())
@@ -4974,10 +5040,7 @@ mod tests {
     fn spill_store_dtype_rule_is_near_lossless() {
         // High-precision sources re-encode to Q8_0 (block-aligned); already
         // block-quantized sources spill native (None); odd geometry → native.
-        assert_eq!(
-            spill_store_dtype_for(Dtype::F16, 256),
-            Some(Dtype::Q8_0Raw)
-        );
+        assert_eq!(spill_store_dtype_for(Dtype::F16, 256), Some(Dtype::Q8_0Raw));
         assert_eq!(spill_store_dtype_for(Dtype::F32, 64), Some(Dtype::Q8_0Raw));
         assert_eq!(spill_store_dtype_for(Dtype::Q4_KRaw, 256), None);
         assert_eq!(spill_store_dtype_for(Dtype::Q8_0Raw, 256), None);
@@ -5118,17 +5181,26 @@ mod tests {
         // less than the full /factor of linear, and strictly nonzero).
         let n = rope_inv_freq_table_scaled(head_dim, theta, Some(&mk(RopeScalingKind::Ntk)));
         assert_eq!(n.len(), base.len());
-        assert!((n[0] - base[0]).abs() < 1e-6, "ntk leaves the j=0 freq ≈ unchanged");
+        assert!(
+            (n[0] - base[0]).abs() < 1e-6,
+            "ntk leaves the j=0 freq ≈ unchanged"
+        );
         assert!(n.iter().all(|&v| v > 0.0));
         // YaRN: per-dim freqs bounded between full interpolation (base/factor)
         // and full extrapolation (base); mscale grows as (1 + 0.1·ln factor).
         let yarn = mk(RopeScalingKind::Yarn);
         let yt = rope_inv_freq_table_scaled(head_dim, theta, Some(&yarn));
         for (&v, &b) in yt.iter().zip(base.iter()) {
-            assert!(v >= b / 4.0 - 1e-6 && v <= b + 1e-6, "yarn freq {v} in band");
+            assert!(
+                v >= b / 4.0 - 1e-6 && v <= b + 1e-6,
+                "yarn freq {v} in band"
+            );
         }
         let m = rope_yarn_mscale(Some(&yarn));
-        assert!((m - (1.0 + 0.1 * 4.0f32.ln())).abs() < 1e-6 && m > 1.0, "yarn mscale");
+        assert!(
+            (m - (1.0 + 0.1 * 4.0f32.ln())).abs() < 1e-6 && m > 1.0,
+            "yarn mscale"
+        );
     }
 
     #[test]
@@ -5276,8 +5348,16 @@ mod tests {
             }
             n_gpu_layers()
         });
-        assert_eq!(a.join().unwrap(), 2, "thread A's TLS must not see B's write");
-        assert_eq!(b.join().unwrap(), 999, "thread B's TLS must not see A's write");
+        assert_eq!(
+            a.join().unwrap(),
+            2,
+            "thread A's TLS must not see B's write"
+        );
+        assert_eq!(
+            b.join().unwrap(),
+            999,
+            "thread B's TLS must not see A's write"
+        );
     }
 
     /// `tensor_forced_to_cpu` is substring-based: `"ffn"` matches
@@ -5806,16 +5886,14 @@ impl UsmAttnContext {
             ctx.v_caches.push(v);
         }
         ctx.q_scratch = Some(unsafe {
-            std::mem::transmute::<
-                sk::SyclSharedBuffer<'_, u16>,
-                sk::SyclSharedBuffer<'static, u16>,
-            >(sk::SyclSharedBuffer::alloc(&ctx.stream, q_len).ok()?)
+            std::mem::transmute::<sk::SyclSharedBuffer<'_, u16>, sk::SyclSharedBuffer<'static, u16>>(
+                sk::SyclSharedBuffer::alloc(&ctx.stream, q_len).ok()?,
+            )
         });
         ctx.out_scratch = Some(unsafe {
-            std::mem::transmute::<
-                sk::SyclSharedBuffer<'_, u16>,
-                sk::SyclSharedBuffer<'static, u16>,
-            >(sk::SyclSharedBuffer::alloc(&ctx.stream, q_len).ok()?)
+            std::mem::transmute::<sk::SyclSharedBuffer<'_, u16>, sk::SyclSharedBuffer<'static, u16>>(
+                sk::SyclSharedBuffer::alloc(&ctx.stream, q_len).ok()?,
+            )
         });
         // Zero the K/V caches so any unwritten positions don't
         // leak garbage into the attention output (the kernel
@@ -5878,10 +5956,9 @@ impl UsmAttnContext {
                 // `UsmAttnContext::drop` clears the cache before the
                 // stream is destroyed.
                 let dbuf = unsafe {
-                    std::mem::transmute::<
-                        sk::SyclDeviceBuffer<'_>,
-                        sk::SyclDeviceBuffer<'static>,
-                    >(dbuf)
+                    std::mem::transmute::<sk::SyclDeviceBuffer<'_>, sk::SyclDeviceBuffer<'static>>(
+                        dbuf,
+                    )
                 };
                 self.packed_weight_cache
                     .insert(key, PackedWeightBuf::Device(dbuf));
@@ -5954,17 +6031,14 @@ impl UsmAttnContext {
         // SAFETY: '_-to-'static transmute pattern — Drop on
         // UsmAttnContext clears the cache before dropping the stream.
         let mut buf = unsafe {
-            std::mem::transmute::<
-                sk::SyclSharedBuffer<'_, u8>,
-                sk::SyclSharedBuffer<'static, u8>,
-            >(buf)
+            std::mem::transmute::<sk::SyclSharedBuffer<'_, u8>, sk::SyclSharedBuffer<'static, u8>>(
+                buf,
+            )
         };
         buf.as_mut_slice()[..expected_bytes].copy_from_slice(&src[..expected_bytes]);
         self.packed_weight_cache
             .insert(key, PackedWeightBuf::Shared(buf));
-        self.packed_weight_usm_bytes = self
-            .packed_weight_usm_bytes
-            .saturating_add(expected_bytes);
+        self.packed_weight_usm_bytes = self.packed_weight_usm_bytes.saturating_add(expected_bytes);
         static FIRST_USM_UPLOAD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         FIRST_USM_UPLOAD.get_or_init(|| {
             tracing::info!(
@@ -6234,7 +6308,9 @@ pub fn first_enabled_sycl_device_index() -> Option<u32> {
     let mut views_by_name: std::collections::HashMap<String, Vec<u32>> =
         std::collections::HashMap::new();
     for i in 0..n {
-        let Ok(info) = sk::device_info(i) else { continue };
+        let Ok(info) = sk::device_info(i) else {
+            continue;
+        };
         views_by_name
             .entry(info.name.clone())
             .or_insert_with(|| {
@@ -6590,8 +6666,7 @@ fn probe_l0_anon_mapping() {
         if mapping.is_null() {
             return None;
         }
-        let r =
-            unsafe { sk::try_import_win32_handle_as_usm_raw(&ctx.stream, mapping, size) };
+        let r = unsafe { sk::try_import_win32_handle_as_usm_raw(&ctx.stream, mapping, size) };
         if let Ok(ptr) = &r {
             unsafe { sk::release_imported_usm_raw(&ctx.stream, *ptr) };
         }
@@ -6621,12 +6696,7 @@ fn probe_l0_file_backed_mapping() {
         let prefix: Vec<u16> = "rsl\0".encode_utf16().collect();
         let mut tmp_file = [0u16; 260];
         let n = unsafe {
-            GetTempFileNameW(
-                tmp_dir.as_ptr(),
-                prefix.as_ptr(),
-                0,
-                tmp_file.as_mut_ptr(),
-            )
+            GetTempFileNameW(tmp_dir.as_ptr(), prefix.as_ptr(), 0, tmp_file.as_mut_ptr())
         };
         if n == 0 {
             tracing::warn!("L0 file-backed probe: GetTempFileNameW failed");
@@ -6664,8 +6734,7 @@ fn probe_l0_file_backed_mapping() {
             unsafe { CloseHandle(file) };
             return None;
         }
-        let r =
-            unsafe { sk::try_import_win32_handle_as_usm_raw(&ctx.stream, mapping, size) };
+        let r = unsafe { sk::try_import_win32_handle_as_usm_raw(&ctx.stream, mapping, size) };
         if let Ok(ptr) = &r {
             unsafe { sk::release_imported_usm_raw(&ctx.stream, *ptr) };
         }
@@ -6730,7 +6799,10 @@ fn report_l0_probe(variant: &str, result: Option<sk::Result<*mut std::ffi::c_voi
             tracing::warn!(variant, error = %e, "L0 import probe: unexpected error");
         }
         None => {
-            tracing::debug!(variant, "L0 import probe: skipped (no context or setup failure)");
+            tracing::debug!(
+                variant,
+                "L0 import probe: skipped (no context or setup failure)"
+            );
         }
     }
 }
@@ -6871,7 +6943,9 @@ fn log_untuned_shape_once(kernel: &'static str, m: usize, k: usize) {
     };
     if is_new {
         tracing::debug!(
-            kernel, m, k,
+            kernel,
+            m,
+            k,
             "{kernel} matvec shape (M={m},K={k}) has no tuned LWS; using kernel default. \
              Run `rustllama tune` to record the winner for this device."
         );
@@ -7053,12 +7127,8 @@ pub fn prepare_usm_context(
         // K/V cache total: 2 (K+V) * n_layers * n_kv_heads * max_ctx
         // * head_dim * 2 bytes (f16). Match the size SyclSharedBuffer
         // allocates inside UsmAttnContext::try_new.
-        let kv_total_bytes = 2u64
-            * n_layers as u64
-            * n_kv_heads as u64
-            * max_ctx as u64
-            * head_dim as u64
-            * 2;
+        let kv_total_bytes =
+            2u64 * n_layers as u64 * n_kv_heads as u64 * max_ctx as u64 * head_dim as u64 * 2;
         tracing::info!(
             kv_cache_mib = kv_total_bytes / (1024 * 1024),
             "USM attention context built — K/V caches committed to USM-shared memory"
@@ -7212,7 +7282,9 @@ fn fa_v3_env_default() -> bool {
     static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *C.get_or_init(|| {
         std::env::var("RUSTLLAMA_FA_V3")
-            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")))
+            .map(|v| {
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
             .unwrap_or(true)
     })
 }
@@ -7221,7 +7293,9 @@ fn fa_v2_env_default() -> bool {
     static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *C.get_or_init(|| {
         std::env::var("RUSTLLAMA_FA_V2")
-            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")))
+            .map(|v| {
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
             .unwrap_or(true)
     })
 }
@@ -7408,10 +7482,8 @@ pub fn try_flash_attn_decode_usm_f32(
         let q_buf = ctx.q_scratch.as_ref().expect("q scratch");
         let k_buf = &ctx.k_caches[layer_idx];
         let v_buf = &ctx.v_caches[layer_idx];
-        let out_buf_ptr = ctx
-            .out_scratch
-            .as_mut()
-            .expect("out scratch") as *mut sk::SyclSharedBuffer<u16>;
+        let out_buf_ptr =
+            ctx.out_scratch.as_mut().expect("out scratch") as *mut sk::SyclSharedBuffer<u16>;
         // SAFETY: `out_buf_ptr` is taken via raw pointer to avoid
         // a borrow-checker conflict with the other shared
         // borrows of ctx; it points to a live field of the ctx
@@ -7447,20 +7519,21 @@ pub fn try_flash_attn_decode_usm_f32(
         let v3_tile = fa_v3_tile_for(kv_len);
         let v3_ok = want_v3
             && sk::flash_attn_decode_v3_usm(
-                stream, q_buf, k_buf, v_buf, out_buf,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap, v3_tile,
+                stream, q_buf, k_buf, v_buf, out_buf, n_heads, n_kv_heads, head_dim, max_ctx,
+                kv_len, window, softcap, v3_tile,
             )
             .is_ok();
-        let v2_ok = !v3_ok && want_v2
+        let v2_ok = !v3_ok
+            && want_v2
             && sk::flash_attn_decode_v2_usm(
-                stream, q_buf, k_buf, v_buf, out_buf,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
+                stream, q_buf, k_buf, v_buf, out_buf, n_heads, n_kv_heads, head_dim, max_ctx,
+                kv_len, window, softcap,
             )
             .is_ok();
         if !v3_ok && !v2_ok {
             if sk::flash_attn_decode_usm(
-                stream, q_buf, k_buf, v_buf, out_buf,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
+                stream, q_buf, k_buf, v_buf, out_buf, n_heads, n_kv_heads, head_dim, max_ctx,
+                kv_len, window, softcap,
             )
             .is_err()
             {
@@ -7527,15 +7600,9 @@ impl QuantKv {
             QuantKv::Q8_0 => head_dim,
             QuantKv::Nvfp4 => (head_dim / nvfp4::NVFP4_BLOCK_ELEMS) * nvfp4::NVFP4_BLOCK_BYTES,
             QuantKv::Tq { bits } => turboquant::bytes_per_block(head_dim, bits),
-            QuantKv::Mxfp4 => {
-                (head_dim / mxfp::MXFP4_BLOCK_ELEMS) * mxfp::MXFP4_BLOCK_BYTES
-            }
-            QuantKv::Mxfp6 => {
-                (head_dim / mxfp::MXFP6_BLOCK_ELEMS) * mxfp::MXFP6_BLOCK_BYTES
-            }
-            QuantKv::Mxfp8 => {
-                (head_dim / mxfp::MXFP8_BLOCK_ELEMS) * mxfp::MXFP8_BLOCK_BYTES
-            }
+            QuantKv::Mxfp4 => (head_dim / mxfp::MXFP4_BLOCK_ELEMS) * mxfp::MXFP4_BLOCK_BYTES,
+            QuantKv::Mxfp6 => (head_dim / mxfp::MXFP6_BLOCK_ELEMS) * mxfp::MXFP6_BLOCK_BYTES,
+            QuantKv::Mxfp8 => (head_dim / mxfp::MXFP8_BLOCK_ELEMS) * mxfp::MXFP8_BLOCK_BYTES,
         }
     }
 
@@ -7567,10 +7634,9 @@ fn ensure_u8_exact(
             // uses — the UsmAttnContext Drop frees these before the
             // stream goes.
             *slot = Some(unsafe {
-                std::mem::transmute::<
-                    sk::SyclSharedBuffer<'_, u8>,
-                    sk::SyclSharedBuffer<'static, u8>,
-                >(buf)
+                std::mem::transmute::<sk::SyclSharedBuffer<'_, u8>, sk::SyclSharedBuffer<'static, u8>>(
+                    buf,
+                )
             });
             true
         }
@@ -7736,29 +7802,48 @@ fn try_flash_attn_decode_usm_quant(
             QuantKv::Q4_0 => {
                 use rustllama_kernels_cpu::q4_0_kv;
                 {
-                    let kb = ctx.q_k_packed[layer_idx].as_mut().expect("k mirror").as_mut_slice();
+                    let kb = ctx.q_k_packed[layer_idx]
+                        .as_mut()
+                        .expect("k mirror")
+                        .as_mut_slice();
                     for h in 0..n_kv {
                         let p = (h * mc + posu) * bytes_per_row;
-                        q4_0_kv::quantize_row(&k_row[h * hd..(h + 1) * hd], &mut kb[p..p + bytes_per_row]);
+                        q4_0_kv::quantize_row(
+                            &k_row[h * hd..(h + 1) * hd],
+                            &mut kb[p..p + bytes_per_row],
+                        );
                     }
                 }
                 {
-                    let vb = ctx.q_v_packed[layer_idx].as_mut().expect("v mirror").as_mut_slice();
+                    let vb = ctx.q_v_packed[layer_idx]
+                        .as_mut()
+                        .expect("v mirror")
+                        .as_mut_slice();
                     for h in 0..n_kv {
                         let p = (h * mc + posu) * bytes_per_row;
-                        q4_0_kv::quantize_row(&v_row[h * hd..(h + 1) * hd], &mut vb[p..p + bytes_per_row]);
+                        q4_0_kv::quantize_row(
+                            &v_row[h * hd..(h + 1) * hd],
+                            &mut vb[p..p + bytes_per_row],
+                        );
                     }
                 }
             }
             QuantKv::Q8_0 => {
                 {
-                    let kb = ctx.q_k_packed[layer_idx].as_mut().expect("k mirror").as_mut_slice();
+                    let kb = ctx.q_k_packed[layer_idx]
+                        .as_mut()
+                        .expect("k mirror")
+                        .as_mut_slice();
                     // The mirror stores i8; reinterpret the USM bytes as
                     // i8 for the quantizer (identical bit layout — the
                     // kernel reads them back as i8 internally).
-                    let kb_i8: &mut [i8] =
-                        unsafe { std::slice::from_raw_parts_mut(kb.as_mut_ptr() as *mut i8, kb.len()) };
-                    let ks = ctx.q_k_scales[layer_idx].as_mut().expect("k scales").as_mut_slice();
+                    let kb_i8: &mut [i8] = unsafe {
+                        std::slice::from_raw_parts_mut(kb.as_mut_ptr() as *mut i8, kb.len())
+                    };
+                    let ks = ctx.q_k_scales[layer_idx]
+                        .as_mut()
+                        .expect("k scales")
+                        .as_mut_slice();
                     for h in 0..n_kv {
                         let row_idx = h * mc + posu;
                         let dst = row_idx * hd;
@@ -7769,10 +7854,17 @@ fn try_flash_attn_decode_usm_quant(
                     }
                 }
                 {
-                    let vb = ctx.q_v_packed[layer_idx].as_mut().expect("v mirror").as_mut_slice();
-                    let vb_i8: &mut [i8] =
-                        unsafe { std::slice::from_raw_parts_mut(vb.as_mut_ptr() as *mut i8, vb.len()) };
-                    let vs = ctx.q_v_scales[layer_idx].as_mut().expect("v scales").as_mut_slice();
+                    let vb = ctx.q_v_packed[layer_idx]
+                        .as_mut()
+                        .expect("v mirror")
+                        .as_mut_slice();
+                    let vb_i8: &mut [i8] = unsafe {
+                        std::slice::from_raw_parts_mut(vb.as_mut_ptr() as *mut i8, vb.len())
+                    };
+                    let vs = ctx.q_v_scales[layer_idx]
+                        .as_mut()
+                        .expect("v scales")
+                        .as_mut_slice();
                     for h in 0..n_kv {
                         let row_idx = h * mc + posu;
                         let dst = row_idx * hd;
@@ -7787,7 +7879,10 @@ fn try_flash_attn_decode_usm_quant(
                 use rustllama_kernels_cpu::nvfp4;
                 let blocks_per_row = hd / nvfp4::NVFP4_BLOCK_ELEMS;
                 {
-                    let kb = ctx.q_k_packed[layer_idx].as_mut().expect("k mirror").as_mut_slice();
+                    let kb = ctx.q_k_packed[layer_idx]
+                        .as_mut()
+                        .expect("k mirror")
+                        .as_mut_slice();
                     for h in 0..n_kv {
                         let p = (h * mc + posu) * bytes_per_row;
                         for b in 0..blocks_per_row {
@@ -7801,7 +7896,10 @@ fn try_flash_attn_decode_usm_quant(
                     }
                 }
                 {
-                    let vb = ctx.q_v_packed[layer_idx].as_mut().expect("v mirror").as_mut_slice();
+                    let vb = ctx.q_v_packed[layer_idx]
+                        .as_mut()
+                        .expect("v mirror")
+                        .as_mut_slice();
                     for h in 0..n_kv {
                         let p = (h * mc + posu) * bytes_per_row;
                         for b in 0..blocks_per_row {
@@ -7821,23 +7919,43 @@ fn try_flash_attn_decode_usm_quant(
                 // into scratch first (matches the engine host path).
                 let mut tq_row = vec![0f32; hd];
                 {
-                    let kb = ctx.q_k_packed[layer_idx].as_mut().expect("k mirror").as_mut_slice();
-                    let ks = ctx.q_k_scales[layer_idx].as_mut().expect("k scales").as_mut_slice();
+                    let kb = ctx.q_k_packed[layer_idx]
+                        .as_mut()
+                        .expect("k mirror")
+                        .as_mut_slice();
+                    let ks = ctx.q_k_scales[layer_idx]
+                        .as_mut()
+                        .expect("k scales")
+                        .as_mut_slice();
                     for h in 0..n_kv {
                         let row_idx = h * mc + posu;
                         let p = row_idx * bytes_per_row;
                         tq_row.copy_from_slice(&k_row[h * hd..(h + 1) * hd]);
-                        ks[row_idx] = turboquant::quantize_row(&mut tq_row, bits, &mut kb[p..p + bytes_per_row]);
+                        ks[row_idx] = turboquant::quantize_row(
+                            &mut tq_row,
+                            bits,
+                            &mut kb[p..p + bytes_per_row],
+                        );
                     }
                 }
                 {
-                    let vb = ctx.q_v_packed[layer_idx].as_mut().expect("v mirror").as_mut_slice();
-                    let vs = ctx.q_v_scales[layer_idx].as_mut().expect("v scales").as_mut_slice();
+                    let vb = ctx.q_v_packed[layer_idx]
+                        .as_mut()
+                        .expect("v mirror")
+                        .as_mut_slice();
+                    let vs = ctx.q_v_scales[layer_idx]
+                        .as_mut()
+                        .expect("v scales")
+                        .as_mut_slice();
                     for h in 0..n_kv {
                         let row_idx = h * mc + posu;
                         let p = row_idx * bytes_per_row;
                         tq_row.copy_from_slice(&v_row[h * hd..(h + 1) * hd]);
-                        vs[row_idx] = turboquant::quantize_row(&mut tq_row, bits, &mut vb[p..p + bytes_per_row]);
+                        vs[row_idx] = turboquant::quantize_row(
+                            &mut tq_row,
+                            bits,
+                            &mut vb[p..p + bytes_per_row],
+                        );
                     }
                 }
             }
@@ -7853,7 +7971,10 @@ fn try_flash_attn_decode_usm_quant(
                 };
                 let blocks_per_row = hd / 32;
                 {
-                    let kb = ctx.q_k_packed[layer_idx].as_mut().expect("k mirror").as_mut_slice();
+                    let kb = ctx.q_k_packed[layer_idx]
+                        .as_mut()
+                        .expect("k mirror")
+                        .as_mut_slice();
                     for h in 0..n_kv {
                         let p = (h * mc + posu) * bytes_per_row;
                         for b in 0..blocks_per_row {
@@ -7864,7 +7985,10 @@ fn try_flash_attn_decode_usm_quant(
                     }
                 }
                 {
-                    let vb = ctx.q_v_packed[layer_idx].as_mut().expect("v mirror").as_mut_slice();
+                    let vb = ctx.q_v_packed[layer_idx]
+                        .as_mut()
+                        .expect("v mirror")
+                        .as_mut_slice();
                     for h in 0..n_kv {
                         let p = (h * mc + posu) * bytes_per_row;
                         for b in 0..blocks_per_row {
@@ -7885,7 +8009,11 @@ fn try_flash_attn_decode_usm_quant(
 
         // Write Q into the f32 q-scratch.
         {
-            let qs = ctx.q_scratch_f32.as_mut().expect("q scratch").as_mut_slice();
+            let qs = ctx
+                .q_scratch_f32
+                .as_mut()
+                .expect("q scratch")
+                .as_mut_slice();
             qs[..q_len].copy_from_slice(q);
         }
 
@@ -7910,32 +8038,107 @@ fn try_flash_attn_decode_usm_quant(
         let ok = unsafe {
             match fmt {
                 QuantKv::Q4_0 => sk::flash_attn_decode_q4_0_usm_raw(
-                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
+                    &*stream_raw,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len,
+                    window,
+                    softcap,
                 ),
                 QuantKv::Q8_0 => sk::flash_attn_decode_q8_0_usm_raw(
-                    &*stream_raw, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
+                    &*stream_raw,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    ks_ptr,
+                    vs_ptr,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len,
+                    window,
+                    softcap,
                 ),
                 QuantKv::Nvfp4 => sk::flash_attn_decode_nvfp4_usm_raw(
-                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
+                    &*stream_raw,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len,
+                    window,
+                    softcap,
                 ),
                 QuantKv::Tq { bits } => sk::flash_attn_decode_tq_usm_raw(
-                    &*stream_raw, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
+                    &*stream_raw,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    ks_ptr,
+                    vs_ptr,
+                    bits as u32,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len,
+                    window,
+                    softcap,
                 ),
                 QuantKv::Mxfp4 => sk::flash_attn_decode_mxfp4_usm_raw(
-                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
+                    &*stream_raw,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len,
+                    window,
+                    softcap,
                 ),
                 QuantKv::Mxfp6 => sk::flash_attn_decode_mxfp6_usm_raw(
-                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
+                    &*stream_raw,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len,
+                    window,
+                    softcap,
                 ),
                 QuantKv::Mxfp8 => sk::flash_attn_decode_mxfp8_usm_raw(
-                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
+                    &*stream_raw,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len,
+                    window,
+                    softcap,
                 ),
             }
         }
@@ -7970,8 +8173,20 @@ pub fn try_flash_attn_decode_usm_q4_0(
     softcap: f32,
 ) -> bool {
     try_flash_attn_decode_usm_quant(
-        QuantKv::Q4_0, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+        QuantKv::Q4_0,
+        q,
+        k_row,
+        v_row,
+        out,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
+        window,
+        softcap,
     )
 }
 
@@ -7993,8 +8208,20 @@ pub fn try_flash_attn_decode_usm_q8_0(
     softcap: f32,
 ) -> bool {
     try_flash_attn_decode_usm_quant(
-        QuantKv::Q8_0, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+        QuantKv::Q8_0,
+        q,
+        k_row,
+        v_row,
+        out,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
+        window,
+        softcap,
     )
 }
 
@@ -8016,8 +8243,20 @@ pub fn try_flash_attn_decode_usm_nvfp4(
     softcap: f32,
 ) -> bool {
     try_flash_attn_decode_usm_quant(
-        QuantKv::Nvfp4, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+        QuantKv::Nvfp4,
+        q,
+        k_row,
+        v_row,
+        out,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
+        window,
+        softcap,
     )
 }
 
@@ -8040,8 +8279,20 @@ pub fn try_flash_attn_decode_usm_tq(
     softcap: f32,
 ) -> bool {
     try_flash_attn_decode_usm_quant(
-        QuantKv::Tq { bits }, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+        QuantKv::Tq { bits },
+        q,
+        k_row,
+        v_row,
+        out,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
+        window,
+        softcap,
     )
 }
 
@@ -8278,10 +8529,7 @@ fn ensure_cuda_dev(
             // of the owning context), which is declared last and so
             // outlives every buffer via declaration-order field drop.
             *slot = Some(unsafe {
-                std::mem::transmute::<
-                    ck::CudaDeviceBuffer<'_>,
-                    ck::CudaDeviceBuffer<'static>,
-                >(b)
+                std::mem::transmute::<ck::CudaDeviceBuffer<'_>, ck::CudaDeviceBuffer<'static>>(b)
             });
             true
         }
@@ -8417,9 +8665,8 @@ fn cuda_upload_staged_row(
             Some(s) => s,
             None => return false,
         };
-        let sb: &[u8] = unsafe {
-            std::slice::from_raw_parts(stage_scales.as_ptr() as *const u8, n_kv * 4)
-        };
+        let sb: &[u8] =
+            unsafe { std::slice::from_raw_parts(stage_scales.as_ptr() as *const u8, n_kv * 4) };
         for h in 0..n_kv {
             let off = (h * mc + pos) * 4;
             if sm.copy_from_host_at(off, &sb[h * 4..(h + 1) * 4]).is_err() {
@@ -8460,7 +8707,13 @@ pub fn try_flash_attn_decode_cuda_f32(
     if !cuda_active() || !gpu_active_for_current_layer() {
         return false;
     }
-    let cfg = CudaAttnConfig { n_layers, n_heads, n_kv_heads, head_dim, max_ctx };
+    let cfg = CudaAttnConfig {
+        n_layers,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+    };
     let hd = head_dim as usize;
     let n_kv = n_kv_heads as usize;
     let mc = max_ctx as usize;
@@ -8529,9 +8782,8 @@ pub fn try_flash_attn_decode_cuda_f32(
         // identical to `k_row`/`v_row`, so those rows upload straight in —
         // no host staging, no shadow, no full re-upload.
         {
-            let k_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(k_row.as_ptr() as *const u8, kv_row_len * 4)
-            };
+            let k_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(k_row.as_ptr() as *const u8, kv_row_len * 4) };
             let kmir = ctx.dev_k_mirror[layer_idx].as_mut().unwrap();
             for h in 0..n_kv {
                 let off = (h * mc + posu) * row_bytes;
@@ -8544,9 +8796,8 @@ pub fn try_flash_attn_decode_cuda_f32(
             }
         }
         {
-            let v_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(v_row.as_ptr() as *const u8, kv_row_len * 4)
-            };
+            let v_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(v_row.as_ptr() as *const u8, kv_row_len * 4) };
             let vmir = ctx.dev_v_mirror[layer_idx].as_mut().unwrap();
             for h in 0..n_kv {
                 let off = (h * mc + posu) * row_bytes;
@@ -8586,9 +8837,18 @@ pub fn try_flash_attn_decode_cuda_f32(
         // the read-back doesn't race the kernel.
         let launched = unsafe {
             ck::flash_attn_decode_f32(
-                stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                n_heads as usize, n_kv, hd, mc, kv_len as usize,
-                window as i32, softcap,
+                stream,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                out_ptr,
+                n_heads as usize,
+                n_kv,
+                hd,
+                mc,
+                kv_len as usize,
+                window as i32,
+                softcap,
             )
         }
         .is_ok();
@@ -8599,7 +8859,11 @@ pub fn try_flash_attn_decode_cuda_f32(
         // Read the result back into the caller's f32 buffer.
         let out_bytes: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, q_bytes) };
-        ctx.dev_out.as_ref().unwrap().copy_to_host(out_bytes).is_ok()
+        ctx.dev_out
+            .as_ref()
+            .unwrap()
+            .copy_to_host(out_bytes)
+            .is_ok()
     })
 }
 
@@ -9281,10 +9545,18 @@ pub fn try_decode_attn_block_sycl_f32(
         // Sequential (not a tuple) because each borrows `ctx` mutably to upload;
         // the returned `*const u8` points at the STABLE USM allocation, not into
         // the cache map, so a later insert's rehash can't invalidate it.
-        let Some(wq_ptr) = resolve_block_weight_usm(ctx, w_q) else { return (false, false) };
-        let Some(wk_ptr) = resolve_block_weight_usm(ctx, w_k) else { return (false, false) };
-        let Some(wv_ptr) = resolve_block_weight_usm(ctx, w_v) else { return (false, false) };
-        let Some(wo_ptr) = resolve_block_weight_usm(ctx, w_o) else { return (false, false) };
+        let Some(wq_ptr) = resolve_block_weight_usm(ctx, w_q) else {
+            return (false, false);
+        };
+        let Some(wk_ptr) = resolve_block_weight_usm(ctx, w_k) else {
+            return (false, false);
+        };
+        let Some(wv_ptr) = resolve_block_weight_usm(ctx, w_v) else {
+            return (false, false);
+        };
+        let Some(wo_ptr) = resolve_block_weight_usm(ctx, w_o) else {
+            return (false, false);
+        };
         // Resolve the dense-FFN weights the same way (only when the format gate
         // above accepted them). SEQUENTIAL `let`s (not one tuple expression) so
         // each reborrows `ctx` in turn — the returned USM pointer is a raw ptr
@@ -9300,9 +9572,12 @@ pub fn try_decode_attn_block_sycl_f32(
             let rd = resolve_block_weight_usm(ctx, wd_t);
             if let (Some(wg), Some(wu), Some(wd)) = (rg, ru, rd) {
                 Some((
-                    wg as *const std::ffi::c_void, kg,
-                    wu as *const std::ffi::c_void, ku,
-                    wd as *const std::ffi::c_void, kd,
+                    wg as *const std::ffi::c_void,
+                    kg,
+                    wu as *const std::ffi::c_void,
+                    ku,
+                    wd as *const std::ffi::c_void,
+                    kd,
                     d_ff as u32,
                 ))
             } else {
@@ -9324,10 +9599,14 @@ pub fn try_decode_attn_block_sycl_f32(
         let res = unsafe {
             sk::decode_attn_block_usm_raw(
                 &*stream_raw,
-                wq_ptr as *const std::ffi::c_void, kq,
-                wk_ptr as *const std::ffi::c_void, kk,
-                wv_ptr as *const std::ffi::c_void, kv_c,
-                wo_ptr as *const std::ffi::c_void, ko,
+                wq_ptr as *const std::ffi::c_void,
+                kq,
+                wk_ptr as *const std::ffi::c_void,
+                kk,
+                wv_ptr as *const std::ffi::c_void,
+                kv_c,
+                wo_ptr as *const std::ffi::c_void,
+                ko,
                 dense_ffn_raw,
                 attn_norm.as_ptr(),
                 post_norm.as_ptr(),
@@ -9460,8 +9739,9 @@ fn resolve_block_weight_mlx(
     // mirrors tell (`ensure_mlx_dev`): the buffer borrows `ctx.stream`, declared
     // LAST in `MlxAttnContext`, so declaration-order field drop frees every
     // `block_weights` entry while the stream is still alive.
-    let buf: mk::MlxDeviceBuffer<'static> =
-        unsafe { std::mem::transmute::<mk::MlxDeviceBuffer<'_>, mk::MlxDeviceBuffer<'static>>(buf) };
+    let buf: mk::MlxDeviceBuffer<'static> = unsafe {
+        std::mem::transmute::<mk::MlxDeviceBuffer<'_>, mk::MlxDeviceBuffer<'static>>(buf)
+    };
     let ptr = buf.as_ptr();
     ctx.block_weights.insert(key, buf);
     Some(ptr)
@@ -9650,10 +9930,18 @@ pub fn try_decode_attn_block_mlx_f32(
         // Resolve the four weights to device pointers (cached per-block upload).
         // Sequential (not a tuple) because each borrows `ctx` mutably to upload;
         // the returned `*const c_void` points at the STABLE device allocation.
-        let Some(wq_ptr) = resolve_block_weight_mlx(ctx, w_q) else { return (false, false) };
-        let Some(wk_ptr) = resolve_block_weight_mlx(ctx, w_k) else { return (false, false) };
-        let Some(wv_ptr) = resolve_block_weight_mlx(ctx, w_v) else { return (false, false) };
-        let Some(wo_ptr) = resolve_block_weight_mlx(ctx, w_o) else { return (false, false) };
+        let Some(wq_ptr) = resolve_block_weight_mlx(ctx, w_q) else {
+            return (false, false);
+        };
+        let Some(wk_ptr) = resolve_block_weight_mlx(ctx, w_k) else {
+            return (false, false);
+        };
+        let Some(wv_ptr) = resolve_block_weight_mlx(ctx, w_v) else {
+            return (false, false);
+        };
+        let Some(wo_ptr) = resolve_block_weight_mlx(ctx, w_o) else {
+            return (false, false);
+        };
         // Resolve the dense-FFN weights the same way (only when the format gate
         // accepted them). SEQUENTIAL `let`s so each reborrows `ctx` in turn (the
         // returned device pointer is a raw ptr that does not hold the borrow). A
@@ -9687,10 +9975,14 @@ pub fn try_decode_attn_block_mlx_f32(
         let res = unsafe {
             mk::decode_attn_block_f32(
                 &*stream_raw,
-                wq_ptr, kq,
-                wk_ptr, kk,
-                wv_ptr, kv_c,
-                wo_ptr, ko,
+                wq_ptr,
+                kq,
+                wk_ptr,
+                kk,
+                wv_ptr,
+                kv_c,
+                wo_ptr,
+                ko,
                 dense_ffn_raw,
                 attn_norm.as_ptr(),
                 post_norm.as_ptr(),
@@ -9802,7 +10094,13 @@ pub fn cuda_decode_seed_kv_f32(
     if !cuda_active() || !gpu_active_for_current_layer() {
         return false;
     }
-    let cfg = CudaAttnConfig { n_layers, n_heads, n_kv_heads, head_dim, max_ctx };
+    let cfg = CudaAttnConfig {
+        n_layers,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+    };
     let hd = head_dim as usize;
     let n_kv = n_kv_heads as usize;
     let mc = max_ctx as usize;
@@ -9920,7 +10218,13 @@ fn cuda_decode_seed_kv_quant(
     if !cuda_active() || !gpu_active_for_current_layer() {
         return false;
     }
-    let cfg = CudaAttnConfig { n_layers, n_heads, n_kv_heads, head_dim, max_ctx };
+    let cfg = CudaAttnConfig {
+        n_layers,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+    };
     let hd = head_dim as usize;
     let n_kv = n_kv_heads as usize;
     let mc = max_ctx as usize;
@@ -9983,8 +10287,15 @@ fn cuda_decode_seed_kv_quant(
             return false;
         }
         if has_scales
-            && (!ensure_cuda_dev(&mut ctx.dev_qk_scales[layer_idx], &ctx.stream, scales_len * 4)
-                || !ensure_cuda_dev(&mut ctx.dev_qv_scales[layer_idx], &ctx.stream, scales_len * 4))
+            && (!ensure_cuda_dev(
+                &mut ctx.dev_qk_scales[layer_idx],
+                &ctx.stream,
+                scales_len * 4,
+            ) || !ensure_cuda_dev(
+                &mut ctx.dev_qv_scales[layer_idx],
+                &ctx.stream,
+                scales_len * 4,
+            ))
         {
             return false;
         }
@@ -10053,8 +10364,18 @@ pub fn cuda_decode_seed_kv_q8_0(
     n_layers: u32,
 ) -> bool {
     cuda_decode_seed_kv_quant(
-        QuantKv::Q8_0, k_q, v_q, Some(k_scales), Some(v_scales), layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        QuantKv::Q8_0,
+        k_q,
+        v_q,
+        Some(k_scales),
+        Some(v_scales),
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
     )
 }
 
@@ -10073,8 +10394,18 @@ pub fn cuda_decode_seed_kv_q4_0(
     n_layers: u32,
 ) -> bool {
     cuda_decode_seed_kv_quant(
-        QuantKv::Q4_0, k_q, v_q, None, None, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        QuantKv::Q4_0,
+        k_q,
+        v_q,
+        None,
+        None,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
     )
 }
 
@@ -10082,12 +10413,29 @@ pub fn cuda_decode_seed_kv_q4_0(
 /// [`cuda_decode_seed_kv_quant`].
 #[allow(clippy::too_many_arguments)]
 pub fn cuda_decode_seed_kv_nvfp4(
-    k_packed: &[u8], v_packed: &[u8], layer_idx: usize, pos: u32,
-    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+    k_packed: &[u8],
+    v_packed: &[u8],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
 ) -> bool {
     cuda_decode_seed_kv_quant(
-        QuantKv::Nvfp4, k_packed, v_packed, None, None, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        QuantKv::Nvfp4,
+        k_packed,
+        v_packed,
+        None,
+        None,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
     )
 }
 
@@ -10095,12 +10443,29 @@ pub fn cuda_decode_seed_kv_nvfp4(
 /// [`cuda_decode_seed_kv_quant`].
 #[allow(clippy::too_many_arguments)]
 pub fn cuda_decode_seed_kv_mxfp4(
-    k_packed: &[u8], v_packed: &[u8], layer_idx: usize, pos: u32,
-    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+    k_packed: &[u8],
+    v_packed: &[u8],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
 ) -> bool {
     cuda_decode_seed_kv_quant(
-        QuantKv::Mxfp4, k_packed, v_packed, None, None, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        QuantKv::Mxfp4,
+        k_packed,
+        v_packed,
+        None,
+        None,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
     )
 }
 
@@ -10108,12 +10473,29 @@ pub fn cuda_decode_seed_kv_mxfp4(
 /// [`cuda_decode_seed_kv_quant`].
 #[allow(clippy::too_many_arguments)]
 pub fn cuda_decode_seed_kv_mxfp6(
-    k_packed: &[u8], v_packed: &[u8], layer_idx: usize, pos: u32,
-    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+    k_packed: &[u8],
+    v_packed: &[u8],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
 ) -> bool {
     cuda_decode_seed_kv_quant(
-        QuantKv::Mxfp6, k_packed, v_packed, None, None, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        QuantKv::Mxfp6,
+        k_packed,
+        v_packed,
+        None,
+        None,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
     )
 }
 
@@ -10121,12 +10503,29 @@ pub fn cuda_decode_seed_kv_mxfp6(
 /// [`cuda_decode_seed_kv_quant`].
 #[allow(clippy::too_many_arguments)]
 pub fn cuda_decode_seed_kv_mxfp8(
-    k_packed: &[u8], v_packed: &[u8], layer_idx: usize, pos: u32,
-    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+    k_packed: &[u8],
+    v_packed: &[u8],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
 ) -> bool {
     cuda_decode_seed_kv_quant(
-        QuantKv::Mxfp8, k_packed, v_packed, None, None, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        QuantKv::Mxfp8,
+        k_packed,
+        v_packed,
+        None,
+        None,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
     )
 }
 
@@ -10135,14 +10534,31 @@ pub fn cuda_decode_seed_kv_mxfp8(
 #[allow(clippy::too_many_arguments)]
 pub fn cuda_decode_seed_kv_tq(
     bits: u8,
-    k_packed: &[u8], v_packed: &[u8],
-    k_scales: &[f32], v_scales: &[f32],
-    layer_idx: usize, pos: u32,
-    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+    k_packed: &[u8],
+    v_packed: &[u8],
+    k_scales: &[f32],
+    v_scales: &[f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
 ) -> bool {
     cuda_decode_seed_kv_quant(
-        QuantKv::Tq { bits }, k_packed, v_packed, Some(k_scales), Some(v_scales),
-        layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        QuantKv::Tq { bits },
+        k_packed,
+        v_packed,
+        Some(k_scales),
+        Some(v_scales),
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
     )
 }
 
@@ -10356,7 +10772,10 @@ fn usm_decode_seed_kv_quant(
         // Head-major layout ⇒ a head's missing rows are contiguous: one slice
         // copy per kv-head, packed bytes then per-row scales.
         {
-            let kb = ctx.q_k_packed[layer_idx].as_mut().expect("k mirror").as_mut_slice();
+            let kb = ctx.q_k_packed[layer_idx]
+                .as_mut()
+                .expect("k mirror")
+                .as_mut_slice();
             for h in 0..n_kv {
                 let off = (h * mc + valid) * bytes_per_row;
                 let len = nrows * bytes_per_row;
@@ -10364,7 +10783,10 @@ fn usm_decode_seed_kv_quant(
             }
         }
         {
-            let vb = ctx.q_v_packed[layer_idx].as_mut().expect("v mirror").as_mut_slice();
+            let vb = ctx.q_v_packed[layer_idx]
+                .as_mut()
+                .expect("v mirror")
+                .as_mut_slice();
             for h in 0..n_kv {
                 let off = (h * mc + valid) * bytes_per_row;
                 let len = nrows * bytes_per_row;
@@ -10375,14 +10797,20 @@ fn usm_decode_seed_kv_quant(
             let ks = k_scales.unwrap();
             let vs = v_scales.unwrap();
             {
-                let kscale = ctx.q_k_scales[layer_idx].as_mut().expect("k scales").as_mut_slice();
+                let kscale = ctx.q_k_scales[layer_idx]
+                    .as_mut()
+                    .expect("k scales")
+                    .as_mut_slice();
                 for h in 0..n_kv {
                     let off = h * mc + valid;
                     kscale[off..off + nrows].copy_from_slice(&ks[off..off + nrows]);
                 }
             }
             {
-                let vscale = ctx.q_v_scales[layer_idx].as_mut().expect("v scales").as_mut_slice();
+                let vscale = ctx.q_v_scales[layer_idx]
+                    .as_mut()
+                    .expect("v scales")
+                    .as_mut_slice();
                 for h in 0..n_kv {
                     let off = h * mc + valid;
                     vscale[off..off + nrows].copy_from_slice(&vs[off..off + nrows]);
@@ -10411,7 +10839,13 @@ pub fn mlx_decode_seed_kv_f32(
     if !mlx_active() || !gpu_active_for_current_layer() {
         return false;
     }
-    let cfg = MlxAttnConfig { n_layers, n_heads, n_kv_heads, head_dim, max_ctx };
+    let cfg = MlxAttnConfig {
+        n_layers,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+    };
     let hd = head_dim as usize;
     let n_kv = n_kv_heads as usize;
     let mc = max_ctx as usize;
@@ -10514,7 +10948,13 @@ fn mlx_decode_seed_kv_quant(
     if !mlx_active() || !gpu_active_for_current_layer() {
         return false;
     }
-    let cfg = MlxAttnConfig { n_layers, n_heads, n_kv_heads, head_dim, max_ctx };
+    let cfg = MlxAttnConfig {
+        n_layers,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+    };
     let hd = head_dim as usize;
     let n_kv = n_kv_heads as usize;
     let mc = max_ctx as usize;
@@ -10573,8 +11013,15 @@ fn mlx_decode_seed_kv_quant(
             return false;
         }
         if has_scales
-            && (!ensure_mlx_dev(&mut ctx.dev_qk_scales[layer_idx], &ctx.stream, scales_len * 4)
-                || !ensure_mlx_dev(&mut ctx.dev_qv_scales[layer_idx], &ctx.stream, scales_len * 4))
+            && (!ensure_mlx_dev(
+                &mut ctx.dev_qk_scales[layer_idx],
+                &ctx.stream,
+                scales_len * 4,
+            ) || !ensure_mlx_dev(
+                &mut ctx.dev_qv_scales[layer_idx],
+                &ctx.stream,
+                scales_len * 4,
+            ))
         {
             return false;
         }
@@ -10644,9 +11091,13 @@ pub fn decode_seed_kv_f32(
     max_ctx: u32,
     n_layers: u32,
 ) -> bool {
-    cuda_decode_seed_kv_f32(k, v, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers)
-        || mlx_decode_seed_kv_f32(k, v, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers)
-        || usm_decode_seed_kv_f32(k, v, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers)
+    cuda_decode_seed_kv_f32(
+        k, v, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    ) || mlx_decode_seed_kv_f32(
+        k, v, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    ) || usm_decode_seed_kv_f32(
+        k, v, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+    )
 }
 
 /// Quantized-KV decode seed across backends (fmt-taking shared body).
@@ -10665,80 +11116,191 @@ fn decode_seed_kv_quant(
     max_ctx: u32,
     n_layers: u32,
 ) -> bool {
-    cuda_decode_seed_kv_quant(fmt, k_packed, v_packed, k_scales, v_scales, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers)
-        || mlx_decode_seed_kv_quant(fmt, k_packed, v_packed, k_scales, v_scales, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers)
-        || usm_decode_seed_kv_quant(fmt, k_packed, v_packed, k_scales, v_scales, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers)
+    cuda_decode_seed_kv_quant(
+        fmt, k_packed, v_packed, k_scales, v_scales, layer_idx, pos, n_heads, n_kv_heads, head_dim,
+        max_ctx, n_layers,
+    ) || mlx_decode_seed_kv_quant(
+        fmt, k_packed, v_packed, k_scales, v_scales, layer_idx, pos, n_heads, n_kv_heads, head_dim,
+        max_ctx, n_layers,
+    ) || usm_decode_seed_kv_quant(
+        fmt, k_packed, v_packed, k_scales, v_scales, layer_idx, pos, n_heads, n_kv_heads, head_dim,
+        max_ctx, n_layers,
+    )
 }
 
 /// Q8_0 decode seed across backends. See [`decode_seed_kv_quant`].
 #[allow(clippy::too_many_arguments)]
 pub fn decode_seed_kv_q8_0(
-    k_q: &[u8], v_q: &[u8], k_scales: &[f32], v_scales: &[f32], layer_idx: usize, pos: u32,
-    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+    k_q: &[u8],
+    v_q: &[u8],
+    k_scales: &[f32],
+    v_scales: &[f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
 ) -> bool {
     decode_seed_kv_quant(
-        QuantKv::Q8_0, k_q, v_q, Some(k_scales), Some(v_scales), layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        QuantKv::Q8_0,
+        k_q,
+        v_q,
+        Some(k_scales),
+        Some(v_scales),
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
     )
 }
 
 /// Q4_0 decode seed across backends. See [`decode_seed_kv_quant`].
 #[allow(clippy::too_many_arguments)]
 pub fn decode_seed_kv_q4_0(
-    k_q: &[u8], v_q: &[u8], layer_idx: usize, pos: u32,
-    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+    k_q: &[u8],
+    v_q: &[u8],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
 ) -> bool {
     decode_seed_kv_quant(
-        QuantKv::Q4_0, k_q, v_q, None, None, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        QuantKv::Q4_0,
+        k_q,
+        v_q,
+        None,
+        None,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
     )
 }
 
 /// NVFP4 decode seed across backends. See [`decode_seed_kv_quant`].
 #[allow(clippy::too_many_arguments)]
 pub fn decode_seed_kv_nvfp4(
-    k_packed: &[u8], v_packed: &[u8], layer_idx: usize, pos: u32,
-    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+    k_packed: &[u8],
+    v_packed: &[u8],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
 ) -> bool {
     decode_seed_kv_quant(
-        QuantKv::Nvfp4, k_packed, v_packed, None, None, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        QuantKv::Nvfp4,
+        k_packed,
+        v_packed,
+        None,
+        None,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
     )
 }
 
 /// MXFP4 decode seed across backends. See [`decode_seed_kv_quant`].
 #[allow(clippy::too_many_arguments)]
 pub fn decode_seed_kv_mxfp4(
-    k_packed: &[u8], v_packed: &[u8], layer_idx: usize, pos: u32,
-    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+    k_packed: &[u8],
+    v_packed: &[u8],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
 ) -> bool {
     decode_seed_kv_quant(
-        QuantKv::Mxfp4, k_packed, v_packed, None, None, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        QuantKv::Mxfp4,
+        k_packed,
+        v_packed,
+        None,
+        None,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
     )
 }
 
 /// MXFP6 decode seed across backends. See [`decode_seed_kv_quant`].
 #[allow(clippy::too_many_arguments)]
 pub fn decode_seed_kv_mxfp6(
-    k_packed: &[u8], v_packed: &[u8], layer_idx: usize, pos: u32,
-    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+    k_packed: &[u8],
+    v_packed: &[u8],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
 ) -> bool {
     decode_seed_kv_quant(
-        QuantKv::Mxfp6, k_packed, v_packed, None, None, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        QuantKv::Mxfp6,
+        k_packed,
+        v_packed,
+        None,
+        None,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
     )
 }
 
 /// MXFP8 decode seed across backends. See [`decode_seed_kv_quant`].
 #[allow(clippy::too_many_arguments)]
 pub fn decode_seed_kv_mxfp8(
-    k_packed: &[u8], v_packed: &[u8], layer_idx: usize, pos: u32,
-    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+    k_packed: &[u8],
+    v_packed: &[u8],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
 ) -> bool {
     decode_seed_kv_quant(
-        QuantKv::Mxfp8, k_packed, v_packed, None, None, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        QuantKv::Mxfp8,
+        k_packed,
+        v_packed,
+        None,
+        None,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
     )
 }
 
@@ -10746,13 +11308,31 @@ pub fn decode_seed_kv_mxfp8(
 #[allow(clippy::too_many_arguments)]
 pub fn decode_seed_kv_tq(
     bits: u8,
-    k_packed: &[u8], v_packed: &[u8], k_scales: &[f32], v_scales: &[f32],
-    layer_idx: usize, pos: u32,
-    n_heads: u32, n_kv_heads: u32, head_dim: u32, max_ctx: u32, n_layers: u32,
+    k_packed: &[u8],
+    v_packed: &[u8],
+    k_scales: &[f32],
+    v_scales: &[f32],
+    layer_idx: usize,
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    n_layers: u32,
 ) -> bool {
     decode_seed_kv_quant(
-        QuantKv::Tq { bits }, k_packed, v_packed, Some(k_scales), Some(v_scales),
-        layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        QuantKv::Tq { bits },
+        k_packed,
+        v_packed,
+        Some(k_scales),
+        Some(v_scales),
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
     )
 }
 
@@ -10787,7 +11367,13 @@ fn try_flash_attn_decode_cuda_quant(
     if !cuda_active() || !gpu_active_for_current_layer() {
         return false;
     }
-    let cfg = CudaAttnConfig { n_layers, n_heads, n_kv_heads, head_dim, max_ctx };
+    let cfg = CudaAttnConfig {
+        n_layers,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+    };
     let hd = head_dim as usize;
     let n_kv = n_kv_heads as usize;
     let mc = max_ctx as usize;
@@ -10875,8 +11461,15 @@ fn try_flash_attn_decode_cuda_quant(
             return false;
         }
         if has_scales
-            && (!ensure_cuda_dev(&mut ctx.dev_qk_scales[layer_idx], &ctx.stream, scales_len * 4)
-                || !ensure_cuda_dev(&mut ctx.dev_qv_scales[layer_idx], &ctx.stream, scales_len * 4))
+            && (!ensure_cuda_dev(
+                &mut ctx.dev_qk_scales[layer_idx],
+                &ctx.stream,
+                scales_len * 4,
+            ) || !ensure_cuda_dev(
+                &mut ctx.dev_qv_scales[layer_idx],
+                &ctx.stream,
+                scales_len * 4,
+            ))
         {
             return false;
         }
@@ -10901,26 +11494,46 @@ fn try_flash_attn_decode_cuda_quant(
         // (→ CPU) on any H2D error BEFORE the valid range is extended, so a
         // half-written row is never marked valid.
         cuda_quantize_row_into_stage(
-            fmt, k_row, &mut ctx.stage_row, &mut ctx.stage_scales, n_kv, hd, bytes_per_row,
+            fmt,
+            k_row,
+            &mut ctx.stage_row,
+            &mut ctx.stage_scales,
+            n_kv,
+            hd,
+            bytes_per_row,
         );
         if !cuda_upload_staged_row(
             ctx.dev_qk_mirror[layer_idx].as_mut().unwrap(),
             ctx.dev_qk_scales[layer_idx].as_mut(),
             &ctx.stage_row,
             &ctx.stage_scales,
-            n_kv, mc, posu, bytes_per_row, has_scales,
+            n_kv,
+            mc,
+            posu,
+            bytes_per_row,
+            has_scales,
         ) {
             return false;
         }
         cuda_quantize_row_into_stage(
-            fmt, v_row, &mut ctx.stage_row, &mut ctx.stage_scales, n_kv, hd, bytes_per_row,
+            fmt,
+            v_row,
+            &mut ctx.stage_row,
+            &mut ctx.stage_scales,
+            n_kv,
+            hd,
+            bytes_per_row,
         );
         if !cuda_upload_staged_row(
             ctx.dev_qv_mirror[layer_idx].as_mut().unwrap(),
             ctx.dev_qv_scales[layer_idx].as_mut(),
             &ctx.stage_row,
             &ctx.stage_scales,
-            n_kv, mc, posu, bytes_per_row, has_scales,
+            n_kv,
+            mc,
+            posu,
+            bytes_per_row,
+            has_scales,
         ) {
             return false;
         }
@@ -10963,39 +11576,107 @@ fn try_flash_attn_decode_cuda_quant(
         let launched = unsafe {
             match fmt {
                 QuantKv::Q4_0 => ck::flash_attn_decode_q4_0(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads as usize,
+                    n_kv,
+                    hd,
+                    mc,
+                    kv_len as usize,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Q8_0 => ck::flash_attn_decode_q8_0(
-                    stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, out_ptr,
-                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    ks_ptr,
+                    vs_ptr,
+                    out_ptr,
+                    n_heads as usize,
+                    n_kv,
+                    hd,
+                    mc,
+                    kv_len as usize,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Nvfp4 => ck::flash_attn_decode_nvfp4(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads as usize,
+                    n_kv,
+                    hd,
+                    mc,
+                    kv_len as usize,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Tq { bits } => ck::flash_attn_decode_tq(
-                    stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
-                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    ks_ptr,
+                    vs_ptr,
+                    bits as u32,
+                    out_ptr,
+                    n_heads as usize,
+                    n_kv,
+                    hd,
+                    mc,
+                    kv_len as usize,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Mxfp4 => ck::flash_attn_decode_mxfp4(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads as usize,
+                    n_kv,
+                    hd,
+                    mc,
+                    kv_len as usize,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Mxfp6 => ck::flash_attn_decode_mxfp6(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads as usize,
+                    n_kv,
+                    hd,
+                    mc,
+                    kv_len as usize,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Mxfp8 => ck::flash_attn_decode_mxfp8(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads as usize,
+                    n_kv,
+                    hd,
+                    mc,
+                    kv_len as usize,
+                    window as i32,
+                    softcap,
                 ),
             }
         }
@@ -11007,7 +11688,11 @@ fn try_flash_attn_decode_cuda_quant(
         // Read the f32 result back into the caller's buffer.
         let out_bytes: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, q_bytes) };
-        ctx.dev_out.as_ref().unwrap().copy_to_host(out_bytes).is_ok()
+        ctx.dev_out
+            .as_ref()
+            .unwrap()
+            .copy_to_host(out_bytes)
+            .is_ok()
     })
 }
 
@@ -11030,8 +11715,20 @@ pub fn try_flash_attn_decode_cuda_q4_0(
     softcap: f32,
 ) -> bool {
     try_flash_attn_decode_cuda_quant(
-        QuantKv::Q4_0, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+        QuantKv::Q4_0,
+        q,
+        k_row,
+        v_row,
+        out,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
+        window,
+        softcap,
     )
 }
 
@@ -11053,8 +11750,20 @@ pub fn try_flash_attn_decode_cuda_q8_0(
     softcap: f32,
 ) -> bool {
     try_flash_attn_decode_cuda_quant(
-        QuantKv::Q8_0, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+        QuantKv::Q8_0,
+        q,
+        k_row,
+        v_row,
+        out,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
+        window,
+        softcap,
     )
 }
 
@@ -11076,8 +11785,20 @@ pub fn try_flash_attn_decode_cuda_nvfp4(
     softcap: f32,
 ) -> bool {
     try_flash_attn_decode_cuda_quant(
-        QuantKv::Nvfp4, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+        QuantKv::Nvfp4,
+        q,
+        k_row,
+        v_row,
+        out,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
+        window,
+        softcap,
     )
 }
 
@@ -11100,8 +11821,20 @@ pub fn try_flash_attn_decode_cuda_tq(
     softcap: f32,
 ) -> bool {
     try_flash_attn_decode_cuda_quant(
-        QuantKv::Tq { bits }, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+        QuantKv::Tq { bits },
+        q,
+        k_row,
+        v_row,
+        out,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
+        window,
+        softcap,
     )
 }
 
@@ -11269,10 +12002,7 @@ fn ensure_mlx_dev(
             // field of the owning context), which is declared last and so
             // outlives every buffer via declaration-order field drop.
             *slot = Some(unsafe {
-                std::mem::transmute::<
-                    mk::MlxDeviceBuffer<'_>,
-                    mk::MlxDeviceBuffer<'static>,
-                >(b)
+                std::mem::transmute::<mk::MlxDeviceBuffer<'_>, mk::MlxDeviceBuffer<'static>>(b)
             });
             true
         }
@@ -11313,9 +12043,8 @@ fn mlx_upload_staged_row(
             Some(s) => s,
             None => return false,
         };
-        let sb: &[u8] = unsafe {
-            std::slice::from_raw_parts(stage_scales.as_ptr() as *const u8, n_kv * 4)
-        };
+        let sb: &[u8] =
+            unsafe { std::slice::from_raw_parts(stage_scales.as_ptr() as *const u8, n_kv * 4) };
         for h in 0..n_kv {
             let off = (h * mc + pos) * 4;
             if sm.copy_from_host_at(off, &sb[h * 4..(h + 1) * 4]).is_err() {
@@ -11349,7 +12078,13 @@ pub fn try_flash_attn_decode_mlx_f32(
     if !mlx_active() || !gpu_active_for_current_layer() {
         return false;
     }
-    let cfg = MlxAttnConfig { n_layers, n_heads, n_kv_heads, head_dim, max_ctx };
+    let cfg = MlxAttnConfig {
+        n_layers,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+    };
     let hd = head_dim as usize;
     let n_kv = n_kv_heads as usize;
     let mc = max_ctx as usize;
@@ -11414,9 +12149,8 @@ pub fn try_flash_attn_decode_mlx_f32(
         // Write ONLY the new K/V row into the resident mirror at `pos`, one
         // kv-head at a time (head-major ⇒ heads are `max_ctx*head_dim` apart).
         {
-            let k_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(k_row.as_ptr() as *const u8, kv_row_len * 4)
-            };
+            let k_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(k_row.as_ptr() as *const u8, kv_row_len * 4) };
             let kmir = ctx.dev_k_mirror[layer_idx].as_mut().unwrap();
             for h in 0..n_kv {
                 let off = (h * mc + posu) * row_bytes;
@@ -11429,9 +12163,8 @@ pub fn try_flash_attn_decode_mlx_f32(
             }
         }
         {
-            let v_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(v_row.as_ptr() as *const u8, kv_row_len * 4)
-            };
+            let v_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(v_row.as_ptr() as *const u8, kv_row_len * 4) };
             let vmir = ctx.dev_v_mirror[layer_idx].as_mut().unwrap();
             for h in 0..n_kv {
                 let off = (h * mc + posu) * row_bytes;
@@ -11469,9 +12202,18 @@ pub fn try_flash_attn_decode_mlx_f32(
         // the read-back doesn't race the kernel.
         let launched = unsafe {
             mk::flash_attn_decode_f32(
-                stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                n_heads as usize, n_kv, hd, mc, kv_len as usize,
-                window as i32, softcap,
+                stream,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                out_ptr,
+                n_heads as usize,
+                n_kv,
+                hd,
+                mc,
+                kv_len as usize,
+                window as i32,
+                softcap,
             )
         }
         .is_ok();
@@ -11482,7 +12224,11 @@ pub fn try_flash_attn_decode_mlx_f32(
         // Read the result back into the caller's f32 buffer.
         let out_bytes: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, q_bytes) };
-        ctx.dev_out.as_ref().unwrap().copy_to_host(out_bytes).is_ok()
+        ctx.dev_out
+            .as_ref()
+            .unwrap()
+            .copy_to_host(out_bytes)
+            .is_ok()
     })
 }
 
@@ -11512,7 +12258,13 @@ fn try_flash_attn_decode_mlx_quant(
     if !mlx_active() || !gpu_active_for_current_layer() {
         return false;
     }
-    let cfg = MlxAttnConfig { n_layers, n_heads, n_kv_heads, head_dim, max_ctx };
+    let cfg = MlxAttnConfig {
+        n_layers,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+    };
     let hd = head_dim as usize;
     let n_kv = n_kv_heads as usize;
     let mc = max_ctx as usize;
@@ -11597,8 +12349,15 @@ fn try_flash_attn_decode_mlx_quant(
             return false;
         }
         if has_scales
-            && (!ensure_mlx_dev(&mut ctx.dev_qk_scales[layer_idx], &ctx.stream, scales_len * 4)
-                || !ensure_mlx_dev(&mut ctx.dev_qv_scales[layer_idx], &ctx.stream, scales_len * 4))
+            && (!ensure_mlx_dev(
+                &mut ctx.dev_qk_scales[layer_idx],
+                &ctx.stream,
+                scales_len * 4,
+            ) || !ensure_mlx_dev(
+                &mut ctx.dev_qv_scales[layer_idx],
+                &ctx.stream,
+                scales_len * 4,
+            ))
         {
             return false;
         }
@@ -11619,26 +12378,46 @@ fn try_flash_attn_decode_mlx_quant(
         // per call. `mlx_upload_staged_row` returns false (→ CPU) on any H2D
         // error BEFORE the valid range is extended.
         cuda_quantize_row_into_stage(
-            fmt, k_row, &mut ctx.stage_row, &mut ctx.stage_scales, n_kv, hd, bytes_per_row,
+            fmt,
+            k_row,
+            &mut ctx.stage_row,
+            &mut ctx.stage_scales,
+            n_kv,
+            hd,
+            bytes_per_row,
         );
         if !mlx_upload_staged_row(
             ctx.dev_qk_mirror[layer_idx].as_mut().unwrap(),
             ctx.dev_qk_scales[layer_idx].as_mut(),
             &ctx.stage_row,
             &ctx.stage_scales,
-            n_kv, mc, posu, bytes_per_row, has_scales,
+            n_kv,
+            mc,
+            posu,
+            bytes_per_row,
+            has_scales,
         ) {
             return false;
         }
         cuda_quantize_row_into_stage(
-            fmt, v_row, &mut ctx.stage_row, &mut ctx.stage_scales, n_kv, hd, bytes_per_row,
+            fmt,
+            v_row,
+            &mut ctx.stage_row,
+            &mut ctx.stage_scales,
+            n_kv,
+            hd,
+            bytes_per_row,
         );
         if !mlx_upload_staged_row(
             ctx.dev_qv_mirror[layer_idx].as_mut().unwrap(),
             ctx.dev_qv_scales[layer_idx].as_mut(),
             &ctx.stage_row,
             &ctx.stage_scales,
-            n_kv, mc, posu, bytes_per_row, has_scales,
+            n_kv,
+            mc,
+            posu,
+            bytes_per_row,
+            has_scales,
         ) {
             return false;
         }
@@ -11677,39 +12456,107 @@ fn try_flash_attn_decode_mlx_quant(
         let launched = unsafe {
             match fmt {
                 QuantKv::Q4_0 => mk::flash_attn_decode_q4_0(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads as usize,
+                    n_kv,
+                    hd,
+                    mc,
+                    kv_len as usize,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Q8_0 => mk::flash_attn_decode_q8_0(
-                    stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, out_ptr,
-                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    ks_ptr,
+                    vs_ptr,
+                    out_ptr,
+                    n_heads as usize,
+                    n_kv,
+                    hd,
+                    mc,
+                    kv_len as usize,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Nvfp4 => mk::flash_attn_decode_nvfp4(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads as usize,
+                    n_kv,
+                    hd,
+                    mc,
+                    kv_len as usize,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Tq { bits } => mk::flash_attn_decode_tq(
-                    stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
-                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    ks_ptr,
+                    vs_ptr,
+                    bits as u32,
+                    out_ptr,
+                    n_heads as usize,
+                    n_kv,
+                    hd,
+                    mc,
+                    kv_len as usize,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Mxfp4 => mk::flash_attn_decode_mxfp4(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads as usize,
+                    n_kv,
+                    hd,
+                    mc,
+                    kv_len as usize,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Mxfp6 => mk::flash_attn_decode_mxfp6(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads as usize,
+                    n_kv,
+                    hd,
+                    mc,
+                    kv_len as usize,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Mxfp8 => mk::flash_attn_decode_mxfp8(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads as usize, n_kv, hd, mc, kv_len as usize,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads as usize,
+                    n_kv,
+                    hd,
+                    mc,
+                    kv_len as usize,
+                    window as i32,
+                    softcap,
                 ),
             }
         }
@@ -11721,7 +12568,11 @@ fn try_flash_attn_decode_mlx_quant(
         // Read the f32 result back into the caller's buffer.
         let out_bytes: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, q_bytes) };
-        ctx.dev_out.as_ref().unwrap().copy_to_host(out_bytes).is_ok()
+        ctx.dev_out
+            .as_ref()
+            .unwrap()
+            .copy_to_host(out_bytes)
+            .is_ok()
     })
 }
 
@@ -11744,8 +12595,20 @@ pub fn try_flash_attn_decode_mlx_q4_0(
     softcap: f32,
 ) -> bool {
     try_flash_attn_decode_mlx_quant(
-        QuantKv::Q4_0, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+        QuantKv::Q4_0,
+        q,
+        k_row,
+        v_row,
+        out,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
+        window,
+        softcap,
     )
 }
 
@@ -11767,8 +12630,20 @@ pub fn try_flash_attn_decode_mlx_q8_0(
     softcap: f32,
 ) -> bool {
     try_flash_attn_decode_mlx_quant(
-        QuantKv::Q8_0, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+        QuantKv::Q8_0,
+        q,
+        k_row,
+        v_row,
+        out,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
+        window,
+        softcap,
     )
 }
 
@@ -11790,8 +12665,20 @@ pub fn try_flash_attn_decode_mlx_nvfp4(
     softcap: f32,
 ) -> bool {
     try_flash_attn_decode_mlx_quant(
-        QuantKv::Nvfp4, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+        QuantKv::Nvfp4,
+        q,
+        k_row,
+        v_row,
+        out,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
+        window,
+        softcap,
     )
 }
 
@@ -11814,8 +12701,20 @@ pub fn try_flash_attn_decode_mlx_tq(
     softcap: f32,
 ) -> bool {
     try_flash_attn_decode_mlx_quant(
-        QuantKv::Tq { bits }, q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+        QuantKv::Tq { bits },
+        q,
+        k_row,
+        v_row,
+        out,
+        layer_idx,
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        n_layers,
+        window,
+        softcap,
     )
 }
 
@@ -11862,23 +12761,23 @@ pub fn try_flash_attn_decode_gpu_f32(
 ) -> bool {
     if cuda_active()
         && try_flash_attn_decode_cuda_f32(
-            q, k_row, v_row, out, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+            q, k_row, v_row, out, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            window, softcap,
         )
     {
         return true;
     }
     if mlx_active()
         && try_flash_attn_decode_mlx_f32(
-            q, k_row, v_row, out, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+            q, k_row, v_row, out, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            window, softcap,
         )
     {
         return true;
     }
     try_flash_attn_decode_usm_f32(
-        q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+        q, k_row, v_row, out, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        window, softcap,
     )
 }
 
@@ -11903,23 +12802,23 @@ pub fn try_flash_attn_decode_gpu_q4_0(
 ) -> bool {
     if cuda_active()
         && try_flash_attn_decode_cuda_q4_0(
-            q, k_row, v_row, out, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+            q, k_row, v_row, out, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            window, softcap,
         )
     {
         return true;
     }
     if mlx_active()
         && try_flash_attn_decode_mlx_q4_0(
-            q, k_row, v_row, out, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+            q, k_row, v_row, out, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            window, softcap,
         )
     {
         return true;
     }
     try_flash_attn_decode_usm_q4_0(
-        q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+        q, k_row, v_row, out, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        window, softcap,
     )
 }
 
@@ -11944,23 +12843,23 @@ pub fn try_flash_attn_decode_gpu_q8_0(
 ) -> bool {
     if cuda_active()
         && try_flash_attn_decode_cuda_q8_0(
-            q, k_row, v_row, out, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+            q, k_row, v_row, out, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            window, softcap,
         )
     {
         return true;
     }
     if mlx_active()
         && try_flash_attn_decode_mlx_q8_0(
-            q, k_row, v_row, out, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+            q, k_row, v_row, out, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            window, softcap,
         )
     {
         return true;
     }
     try_flash_attn_decode_usm_q8_0(
-        q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+        q, k_row, v_row, out, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        window, softcap,
     )
 }
 
@@ -11985,23 +12884,23 @@ pub fn try_flash_attn_decode_gpu_nvfp4(
 ) -> bool {
     if cuda_active()
         && try_flash_attn_decode_cuda_nvfp4(
-            q, k_row, v_row, out, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+            q, k_row, v_row, out, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            window, softcap,
         )
     {
         return true;
     }
     if mlx_active()
         && try_flash_attn_decode_mlx_nvfp4(
-            q, k_row, v_row, out, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+            q, k_row, v_row, out, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+            window, softcap,
         )
     {
         return true;
     }
     try_flash_attn_decode_usm_nvfp4(
-        q, k_row, v_row, out, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+        q, k_row, v_row, out, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx, n_layers,
+        window, softcap,
     )
 }
 
@@ -12030,23 +12929,23 @@ macro_rules! mxfp_decode_gpu_combinator {
         ) -> bool {
             if cuda_active()
                 && try_flash_attn_decode_cuda_quant(
-                    $kv, q, k_row, v_row, out, layer_idx, pos,
-                    n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+                    $kv, q, k_row, v_row, out, layer_idx, pos, n_heads, n_kv_heads, head_dim,
+                    max_ctx, n_layers, window, softcap,
                 )
             {
                 return true;
             }
             if mlx_active()
                 && try_flash_attn_decode_mlx_quant(
-                    $kv, q, k_row, v_row, out, layer_idx, pos,
-                    n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+                    $kv, q, k_row, v_row, out, layer_idx, pos, n_heads, n_kv_heads, head_dim,
+                    max_ctx, n_layers, window, softcap,
                 )
             {
                 return true;
             }
             try_flash_attn_decode_usm_quant(
-                $kv, q, k_row, v_row, out, layer_idx, pos,
-                n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+                $kv, q, k_row, v_row, out, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx,
+                n_layers, window, softcap,
             )
         }
     };
@@ -12077,23 +12976,23 @@ pub fn try_flash_attn_decode_gpu_tq(
 ) -> bool {
     if cuda_active()
         && try_flash_attn_decode_cuda_tq(
-            q, k_row, v_row, out, bits, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+            q, k_row, v_row, out, bits, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx,
+            n_layers, window, softcap,
         )
     {
         return true;
     }
     if mlx_active()
         && try_flash_attn_decode_mlx_tq(
-            q, k_row, v_row, out, bits, layer_idx, pos,
-            n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+            q, k_row, v_row, out, bits, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx,
+            n_layers, window, softcap,
         )
     {
         return true;
     }
     try_flash_attn_decode_usm_tq(
-        q, k_row, v_row, out, bits, layer_idx, pos,
-        n_heads, n_kv_heads, head_dim, max_ctx, n_layers, window, softcap,
+        q, k_row, v_row, out, bits, layer_idx, pos, n_heads, n_kv_heads, head_dim, max_ctx,
+        n_layers, window, softcap,
     )
 }
 
@@ -12206,13 +13105,7 @@ fn ensure_scratch_f32(
 /// `true` if the GPU produced output (in `y`); `false` to fall
 /// back to CPU. Mirrors [`try_rmsnorm_f32`] but bypasses the
 /// per-call alloc+memcpy envelope by reusing USM scratch.
-pub fn try_rmsnorm_usm_f32(
-    x: &[f32],
-    w: &[f32],
-    y: &mut [f32],
-    d: usize,
-    eps: f32,
-) -> bool {
+pub fn try_rmsnorm_usm_f32(x: &[f32], w: &[f32], y: &mut [f32], d: usize, eps: f32) -> bool {
     if !usm_attn_enabled() || !gpu_active_for_current_layer() {
         return false;
     }
@@ -12846,8 +13739,7 @@ fn packed_kind_disabled(kind: PackedMatvecKind) -> bool {
     let skips = PACKED_KIND_SKIPS[kind as usize].fetch_add(1, Ordering::Relaxed) + 1;
     if skips >= PACKED_KIND_RETRY_AFTER {
         PACKED_KIND_SKIPS[kind as usize].store(0, Ordering::Relaxed);
-        PACKED_KIND_FAILS[kind as usize]
-            .store(PACKED_KIND_DISABLE_AFTER - 1, Ordering::Relaxed);
+        PACKED_KIND_FAILS[kind as usize].store(PACKED_KIND_DISABLE_AFTER - 1, Ordering::Relaxed);
         return false;
     }
     true
@@ -13253,10 +14145,13 @@ pub fn try_matvec_tensor_usm_f32(
     // directly. `weight_key` falls back to the host-pointer key when
     // storage is `CpuOwned`, preserving the cached-upload behavior for
     // tensors that didn't preload.
-    let preloaded_usm: Option<*const u8> = w
-        .storage
-        .sycl_usm_ptr()
-        .or_else(|| if sycl_dev_resident { w.storage.device_ptr() } else { None });
+    let preloaded_usm: Option<*const u8> = w.storage.sycl_usm_ptr().or_else(|| {
+        if sycl_dev_resident {
+            w.storage.device_ptr()
+        } else {
+            None
+        }
+    });
     let weight_key = w_bytes.as_ptr() as usize;
     USM_ATTN.with(|cell| {
         let mut slot = cell.borrow_mut();
@@ -13511,67 +14406,133 @@ pub fn try_matvec_tensor_usm_f32(
             // lws=0), so PREFILL reaches the GPU too — no CPU-prefill fallback.
             PackedMatvecKind::Q4_0 => unsafe {
                 sk::matvec_q4_0_packed_f32_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::Q5_0 => unsafe {
                 sk::matvec_q5_0_packed_f32_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::Q4_1 => unsafe {
                 sk::matvec_q4_1_packed_f32_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::Q5_1 => unsafe {
                 sk::matvec_q5_1_packed_f32_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::Q2_K => unsafe {
                 sk::matvec_q2_k_packed_f32_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::Q3_K => unsafe {
                 sk::matvec_q3_k_packed_f32_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::Q8_K => unsafe {
                 sk::matvec_q8_k_packed_f32_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::PQ2_0 => unsafe {
                 sk::matvec_pq2_0_packed_f32_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::Mxfp4 => unsafe {
                 sk::matvec_mxfp4_packed_f32_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::Mxfp6 => unsafe {
                 sk::matvec_mxfp6_packed_f32_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::Mxfp8 => unsafe {
                 sk::matvec_mxfp8_packed_f32_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr, m as u32, k as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    0,
                 )
             }
             .is_ok(),
@@ -13746,11 +14707,7 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
     if !gpu_active_for_current_layer() && !(gate_sycl_dev && up_sycl_dev) {
         return false;
     }
-    if m == 0 || k == 0
-        || x.len() != k
-        || gate_out.len() != m
-        || up_out.len() != m
-    {
+    if m == 0 || k == 0 || x.len() != k || gate_out.len() != m || up_out.len() != m {
         return false;
     }
     if w_gate.dtype != w_up.dtype {
@@ -13806,14 +14763,20 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
     // Resident USM pointer per weight: preloaded `SyclUsm`, or a promoted
     // `Device(Sycl)` expert (its `device_ptr` is a USM pointer). Either skips
     // the host→device cache upload.
-    let g_preloaded: Option<*const u8> = w_gate
-        .storage
-        .sycl_usm_ptr()
-        .or_else(|| if gate_sycl_dev { w_gate.storage.device_ptr() } else { None });
-    let u_preloaded: Option<*const u8> = w_up
-        .storage
-        .sycl_usm_ptr()
-        .or_else(|| if up_sycl_dev { w_up.storage.device_ptr() } else { None });
+    let g_preloaded: Option<*const u8> = w_gate.storage.sycl_usm_ptr().or_else(|| {
+        if gate_sycl_dev {
+            w_gate.storage.device_ptr()
+        } else {
+            None
+        }
+    });
+    let u_preloaded: Option<*const u8> = w_up.storage.sycl_usm_ptr().or_else(|| {
+        if up_sycl_dev {
+            w_up.storage.device_ptr()
+        } else {
+            None
+        }
+    });
     let g_key = g_bytes.as_ptr() as usize;
     let u_key = u_bytes.as_ptr() as usize;
     // File-backed (GGUF mmap) weights are safe to discard after the USM
@@ -13869,10 +14832,14 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_Q4K_PACKED_USM, m, k);
                 sk::matvec_q4_k_gate_up_fused_usm_raw(
                     &*stream_raw,
-                    g_ptr, u_ptr,
+                    g_ptr,
+                    u_ptr,
                     x_ptr,
-                    gate_ptr, up_ptr,
-                    m as u32, k as u32, lws,
+                    gate_ptr,
+                    up_ptr,
+                    m as u32,
+                    k as u32,
+                    lws,
                 )
             }
             .is_ok(),
@@ -13880,10 +14847,14 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_Q8_0_PACKED_USM, m, k);
                 sk::matvec_q8_0_gate_up_fused_usm_raw(
                     &*stream_raw,
-                    g_ptr, u_ptr,
+                    g_ptr,
+                    u_ptr,
                     x_ptr,
-                    gate_ptr, up_ptr,
-                    m as u32, k as u32, lws,
+                    gate_ptr,
+                    up_ptr,
+                    m as u32,
+                    k as u32,
+                    lws,
                 )
             }
             .is_ok(),
@@ -13891,10 +14862,14 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_Q5K_PACKED_USM, m, k);
                 sk::matvec_q5_k_gate_up_fused_usm_raw(
                     &*stream_raw,
-                    g_ptr, u_ptr,
+                    g_ptr,
+                    u_ptr,
                     x_ptr,
-                    gate_ptr, up_ptr,
-                    m as u32, k as u32, lws,
+                    gate_ptr,
+                    up_ptr,
+                    m as u32,
+                    k as u32,
+                    lws,
                 )
             }
             .is_ok(),
@@ -13902,10 +14877,14 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_Q6K_PACKED_USM, m, k);
                 sk::matvec_q6_k_gate_up_fused_usm_raw(
                     &*stream_raw,
-                    g_ptr, u_ptr,
+                    g_ptr,
+                    u_ptr,
                     x_ptr,
-                    gate_ptr, up_ptr,
-                    m as u32, k as u32, lws,
+                    gate_ptr,
+                    up_ptr,
+                    m as u32,
+                    k as u32,
+                    lws,
                 )
             }
             .is_ok(),
@@ -13913,10 +14892,14 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_IQ4_NL_PACKED_USM, m, k);
                 sk::matvec_iq4_nl_gate_up_fused_usm_raw(
                     &*stream_raw,
-                    g_ptr, u_ptr,
+                    g_ptr,
+                    u_ptr,
                     x_ptr,
-                    gate_ptr, up_ptr,
-                    m as u32, k as u32, lws,
+                    gate_ptr,
+                    up_ptr,
+                    m as u32,
+                    k as u32,
+                    lws,
                 )
             }
             .is_ok(),
@@ -13924,10 +14907,14 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_IQ4_XS_PACKED_USM, m, k);
                 sk::matvec_iq4_xs_gate_up_fused_usm_raw(
                     &*stream_raw,
-                    g_ptr, u_ptr,
+                    g_ptr,
+                    u_ptr,
                     x_ptr,
-                    gate_ptr, up_ptr,
-                    m as u32, k as u32, lws,
+                    gate_ptr,
+                    up_ptr,
+                    m as u32,
+                    k as u32,
+                    lws,
                 )
             }
             .is_ok(),
@@ -13935,10 +14922,14 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_IQ1_S_PACKED_USM, m, k);
                 sk::matvec_iq1_s_gate_up_fused_usm_raw(
                     &*stream_raw,
-                    g_ptr, u_ptr,
+                    g_ptr,
+                    u_ptr,
                     x_ptr,
-                    gate_ptr, up_ptr,
-                    m as u32, k as u32, lws,
+                    gate_ptr,
+                    up_ptr,
+                    m as u32,
+                    k as u32,
+                    lws,
                 )
             }
             .is_ok(),
@@ -13946,10 +14937,14 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_IQ2_XXS_PACKED_USM, m, k);
                 sk::matvec_iq2_xxs_gate_up_fused_usm_raw(
                     &*stream_raw,
-                    g_ptr, u_ptr,
+                    g_ptr,
+                    u_ptr,
                     x_ptr,
-                    gate_ptr, up_ptr,
-                    m as u32, k as u32, lws,
+                    gate_ptr,
+                    up_ptr,
+                    m as u32,
+                    k as u32,
+                    lws,
                 )
             }
             .is_ok(),
@@ -13957,10 +14952,14 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_IQ1_M_PACKED_USM, m, k);
                 sk::matvec_iq1_m_gate_up_fused_usm_raw(
                     &*stream_raw,
-                    g_ptr, u_ptr,
+                    g_ptr,
+                    u_ptr,
                     x_ptr,
-                    gate_ptr, up_ptr,
-                    m as u32, k as u32, lws,
+                    gate_ptr,
+                    up_ptr,
+                    m as u32,
+                    k as u32,
+                    lws,
                 )
             }
             .is_ok(),
@@ -13968,10 +14967,14 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_IQ2_XS_PACKED_USM, m, k);
                 sk::matvec_iq2_xs_gate_up_fused_usm_raw(
                     &*stream_raw,
-                    g_ptr, u_ptr,
+                    g_ptr,
+                    u_ptr,
                     x_ptr,
-                    gate_ptr, up_ptr,
-                    m as u32, k as u32, lws,
+                    gate_ptr,
+                    up_ptr,
+                    m as u32,
+                    k as u32,
+                    lws,
                 )
             }
             .is_ok(),
@@ -13979,10 +14982,14 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_IQ2_S_PACKED_USM, m, k);
                 sk::matvec_iq2_s_gate_up_fused_usm_raw(
                     &*stream_raw,
-                    g_ptr, u_ptr,
+                    g_ptr,
+                    u_ptr,
                     x_ptr,
-                    gate_ptr, up_ptr,
-                    m as u32, k as u32, lws,
+                    gate_ptr,
+                    up_ptr,
+                    m as u32,
+                    k as u32,
+                    lws,
                 )
             }
             .is_ok(),
@@ -13990,10 +14997,14 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_IQ3_XXS_PACKED_USM, m, k);
                 sk::matvec_iq3_xxs_gate_up_fused_usm_raw(
                     &*stream_raw,
-                    g_ptr, u_ptr,
+                    g_ptr,
+                    u_ptr,
                     x_ptr,
-                    gate_ptr, up_ptr,
-                    m as u32, k as u32, lws,
+                    gate_ptr,
+                    up_ptr,
+                    m as u32,
+                    k as u32,
+                    lws,
                 )
             }
             .is_ok(),
@@ -14001,10 +15012,14 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_IQ3_S_PACKED_USM, m, k);
                 sk::matvec_iq3_s_gate_up_fused_usm_raw(
                     &*stream_raw,
-                    g_ptr, u_ptr,
+                    g_ptr,
+                    u_ptr,
                     x_ptr,
-                    gate_ptr, up_ptr,
-                    m as u32, k as u32, lws,
+                    gate_ptr,
+                    up_ptr,
+                    m as u32,
+                    k as u32,
+                    lws,
                 )
             }
             .is_ok(),
@@ -14017,10 +15032,14 @@ pub fn try_matvec_tensor_gate_up_fused_usm_f32(
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_PTQ1_0_PACKED_USM, m, k);
                 sk::matvec_ptq1_0_gate_up_fused_usm_raw(
                     &*stream_raw,
-                    g_ptr, u_ptr,
+                    g_ptr,
+                    u_ptr,
                     x_ptr,
-                    gate_ptr, up_ptr,
-                    m as u32, k as u32, lws,
+                    gate_ptr,
+                    up_ptr,
+                    m as u32,
+                    k as u32,
+                    lws,
                 )
             }
             .is_ok(),
@@ -14094,7 +15113,8 @@ pub fn try_matvec_out_proj_add_rmsnorm_usm_f32(
     if !gpu_active_for_current_layer() {
         return false;
     }
-    if m == 0 || k == 0
+    if m == 0
+        || k == 0
         || attn.len() != k
         || hidden.len() != m
         || w_norm.len() < m
@@ -14215,19 +15235,58 @@ pub fn try_matvec_out_proj_add_rmsnorm_usm_f32(
             };
         }
         let ok_matvec = match kind {
-            PackedMatvecKind::Q8_0 => h6_matvec!(sk::matvec_q8_0_packed_f32_usm_raw, rustllama_tuner::KERNEL_Q8_0_PACKED_USM),
-            PackedMatvecKind::Q4_K => h6_matvec!(sk::matvec_q4_k_packed_f32_usm_raw, rustllama_tuner::KERNEL_Q4K_PACKED_USM),
-            PackedMatvecKind::Q5_K => h6_matvec!(sk::matvec_q5_k_packed_f32_usm_raw, rustllama_tuner::KERNEL_Q5K_PACKED_USM),
-            PackedMatvecKind::Q6_K => h6_matvec!(sk::matvec_q6_k_packed_f32_usm_raw, rustllama_tuner::KERNEL_Q6K_PACKED_USM),
-            PackedMatvecKind::IQ4_NL => h6_matvec!(sk::matvec_iq4_nl_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ4_NL_PACKED_USM),
-            PackedMatvecKind::IQ4_XS => h6_matvec!(sk::matvec_iq4_xs_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ4_XS_PACKED_USM),
-            PackedMatvecKind::IQ1_S => h6_matvec!(sk::matvec_iq1_s_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ1_S_PACKED_USM),
-            PackedMatvecKind::IQ1_M => h6_matvec!(sk::matvec_iq1_m_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ1_M_PACKED_USM),
-            PackedMatvecKind::IQ2_XXS => h6_matvec!(sk::matvec_iq2_xxs_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ2_XXS_PACKED_USM),
-            PackedMatvecKind::IQ2_XS => h6_matvec!(sk::matvec_iq2_xs_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ2_XS_PACKED_USM),
-            PackedMatvecKind::IQ2_S => h6_matvec!(sk::matvec_iq2_s_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ2_S_PACKED_USM),
-            PackedMatvecKind::IQ3_XXS => h6_matvec!(sk::matvec_iq3_xxs_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ3_XXS_PACKED_USM),
-            PackedMatvecKind::IQ3_S => h6_matvec!(sk::matvec_iq3_s_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ3_S_PACKED_USM),
+            PackedMatvecKind::Q8_0 => h6_matvec!(
+                sk::matvec_q8_0_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_Q8_0_PACKED_USM
+            ),
+            PackedMatvecKind::Q4_K => h6_matvec!(
+                sk::matvec_q4_k_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_Q4K_PACKED_USM
+            ),
+            PackedMatvecKind::Q5_K => h6_matvec!(
+                sk::matvec_q5_k_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_Q5K_PACKED_USM
+            ),
+            PackedMatvecKind::Q6_K => h6_matvec!(
+                sk::matvec_q6_k_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_Q6K_PACKED_USM
+            ),
+            PackedMatvecKind::IQ4_NL => h6_matvec!(
+                sk::matvec_iq4_nl_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_IQ4_NL_PACKED_USM
+            ),
+            PackedMatvecKind::IQ4_XS => h6_matvec!(
+                sk::matvec_iq4_xs_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_IQ4_XS_PACKED_USM
+            ),
+            PackedMatvecKind::IQ1_S => h6_matvec!(
+                sk::matvec_iq1_s_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_IQ1_S_PACKED_USM
+            ),
+            PackedMatvecKind::IQ1_M => h6_matvec!(
+                sk::matvec_iq1_m_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_IQ1_M_PACKED_USM
+            ),
+            PackedMatvecKind::IQ2_XXS => h6_matvec!(
+                sk::matvec_iq2_xxs_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_IQ2_XXS_PACKED_USM
+            ),
+            PackedMatvecKind::IQ2_XS => h6_matvec!(
+                sk::matvec_iq2_xs_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_IQ2_XS_PACKED_USM
+            ),
+            PackedMatvecKind::IQ2_S => h6_matvec!(
+                sk::matvec_iq2_s_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_IQ2_S_PACKED_USM
+            ),
+            PackedMatvecKind::IQ3_XXS => h6_matvec!(
+                sk::matvec_iq3_xxs_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_IQ3_XXS_PACKED_USM
+            ),
+            PackedMatvecKind::IQ3_S => h6_matvec!(
+                sk::matvec_iq3_s_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_IQ3_S_PACKED_USM
+            ),
             // PTQ1_0 stage-1 matvec — mirrors the Q8_0/Q4_K arms (packed
             // matvec into `dot`, then the SHARED stage-2
             // `add_rmsnorm_f32_usm` below). We deliberately route through
@@ -14237,7 +15296,10 @@ pub fn try_matvec_out_proj_add_rmsnorm_usm_f32(
             // the 1-workgroup fused `matvec_X_add_rmsnorm_usm` topology
             // produced gibberish on Q4_K. The packed matvec keeps PTQ1_0
             // on that proven two-stage path.
-            PackedMatvecKind::PTQ1_0 => h6_matvec!(sk::matvec_ptq1_0_packed_f32_usm_raw, rustllama_tuner::KERNEL_PTQ1_0_PACKED_USM),
+            PackedMatvecKind::PTQ1_0 => h6_matvec!(
+                sk::matvec_ptq1_0_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_PTQ1_0_PACKED_USM
+            ),
             // The 8 CPU-parity packed formats have no H6 arm — signal
             // miss so the caller takes the unfused ladder.
             _ => return false,
@@ -14387,22 +15449,64 @@ pub fn try_matvec_tensor_f16in_usm_f32(
             };
         }
         let ok = match kind {
-            PackedMatvecKind::Q8_0 => h8_call!(sk::matvec_q8_0_f16in_packed_f32_usm_raw, rustllama_tuner::KERNEL_Q8_0_PACKED_USM),
-            PackedMatvecKind::Q4_K => h8_call!(sk::matvec_q4_k_f16in_packed_f32_usm_raw, rustllama_tuner::KERNEL_Q4K_PACKED_USM),
-            PackedMatvecKind::Q5_K => h8_call!(sk::matvec_q5_k_f16in_packed_f32_usm_raw, rustllama_tuner::KERNEL_Q5K_PACKED_USM),
-            PackedMatvecKind::Q6_K => h8_call!(sk::matvec_q6_k_f16in_packed_f32_usm_raw, rustllama_tuner::KERNEL_Q6K_PACKED_USM),
-            PackedMatvecKind::IQ4_NL => h8_call!(sk::matvec_iq4_nl_f16in_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ4_NL_PACKED_USM),
-            PackedMatvecKind::IQ4_XS => h8_call!(sk::matvec_iq4_xs_f16in_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ4_XS_PACKED_USM),
-            PackedMatvecKind::IQ1_S => h8_call!(sk::matvec_iq1_s_f16in_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ1_S_PACKED_USM),
-            PackedMatvecKind::IQ1_M => h8_call!(sk::matvec_iq1_m_f16in_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ1_M_PACKED_USM),
-            PackedMatvecKind::IQ2_XXS => h8_call!(sk::matvec_iq2_xxs_f16in_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ2_XXS_PACKED_USM),
-            PackedMatvecKind::IQ2_XS => h8_call!(sk::matvec_iq2_xs_f16in_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ2_XS_PACKED_USM),
-            PackedMatvecKind::IQ2_S => h8_call!(sk::matvec_iq2_s_f16in_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ2_S_PACKED_USM),
-            PackedMatvecKind::IQ3_XXS => h8_call!(sk::matvec_iq3_xxs_f16in_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ3_XXS_PACKED_USM),
-            PackedMatvecKind::IQ3_S => h8_call!(sk::matvec_iq3_s_f16in_packed_f32_usm_raw, rustllama_tuner::KERNEL_IQ3_S_PACKED_USM),
+            PackedMatvecKind::Q8_0 => h8_call!(
+                sk::matvec_q8_0_f16in_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_Q8_0_PACKED_USM
+            ),
+            PackedMatvecKind::Q4_K => h8_call!(
+                sk::matvec_q4_k_f16in_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_Q4K_PACKED_USM
+            ),
+            PackedMatvecKind::Q5_K => h8_call!(
+                sk::matvec_q5_k_f16in_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_Q5K_PACKED_USM
+            ),
+            PackedMatvecKind::Q6_K => h8_call!(
+                sk::matvec_q6_k_f16in_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_Q6K_PACKED_USM
+            ),
+            PackedMatvecKind::IQ4_NL => h8_call!(
+                sk::matvec_iq4_nl_f16in_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_IQ4_NL_PACKED_USM
+            ),
+            PackedMatvecKind::IQ4_XS => h8_call!(
+                sk::matvec_iq4_xs_f16in_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_IQ4_XS_PACKED_USM
+            ),
+            PackedMatvecKind::IQ1_S => h8_call!(
+                sk::matvec_iq1_s_f16in_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_IQ1_S_PACKED_USM
+            ),
+            PackedMatvecKind::IQ1_M => h8_call!(
+                sk::matvec_iq1_m_f16in_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_IQ1_M_PACKED_USM
+            ),
+            PackedMatvecKind::IQ2_XXS => h8_call!(
+                sk::matvec_iq2_xxs_f16in_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_IQ2_XXS_PACKED_USM
+            ),
+            PackedMatvecKind::IQ2_XS => h8_call!(
+                sk::matvec_iq2_xs_f16in_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_IQ2_XS_PACKED_USM
+            ),
+            PackedMatvecKind::IQ2_S => h8_call!(
+                sk::matvec_iq2_s_f16in_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_IQ2_S_PACKED_USM
+            ),
+            PackedMatvecKind::IQ3_XXS => h8_call!(
+                sk::matvec_iq3_xxs_f16in_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_IQ3_XXS_PACKED_USM
+            ),
+            PackedMatvecKind::IQ3_S => h8_call!(
+                sk::matvec_iq3_s_f16in_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_IQ3_S_PACKED_USM
+            ),
             // PTQ1_0 f16-in packed matvec — mirrors the Q8_0/Q4_K arms
             // (same guards, same tuner-const LWS source).
-            PackedMatvecKind::PTQ1_0 => h8_call!(sk::matvec_ptq1_0_f16in_packed_f32_usm_raw, rustllama_tuner::KERNEL_PTQ1_0_PACKED_USM),
+            PackedMatvecKind::PTQ1_0 => h8_call!(
+                sk::matvec_ptq1_0_f16in_packed_f32_usm_raw,
+                rustllama_tuner::KERNEL_PTQ1_0_PACKED_USM
+            ),
             // The 8 CPU-parity packed formats have no f16-in H8 kernel —
             // miss to the F32-in path.
             _ => return false,
@@ -14471,9 +15575,7 @@ pub fn try_matvec_tensor_f16in_usm_f32(
 /// practice this is automatic because the engine's `UsmAttnContext`
 /// owns both, and the context's `Drop` runs the cache + stream
 /// teardown in the right order.
-pub fn upload_bytes_to_usm(
-    bytes: &[u8],
-) -> Option<rustllama_tensor::Storage> {
+pub fn upload_bytes_to_usm(bytes: &[u8]) -> Option<rustllama_tensor::Storage> {
     if !usm_attn_enabled() || bytes.is_empty() {
         return None;
     }
@@ -14514,9 +15616,8 @@ pub fn upload_bytes_to_usm(
         });
         // SAFETY: `raw` is non-null (checked above) and points to a
         // `n`-byte USM allocation; the closure frees exactly that.
-        let storage = unsafe {
-            rustllama_tensor::Storage::sycl_usm_from_raw(raw as *mut u8, n, free_fn)
-        };
+        let storage =
+            unsafe { rustllama_tensor::Storage::sycl_usm_from_raw(raw as *mut u8, n, free_fn) };
         Some(storage)
     })
 }
@@ -14893,13 +15994,7 @@ fn embed_cache_fits_budget(table_bytes_len: usize) -> bool {
     (table_bytes_len as u64) <= bytes_cap
 }
 
-pub fn try_matvec_f16_usm_f32(
-    w: &Tensor,
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) -> bool {
+pub fn try_matvec_f16_usm_f32(w: &Tensor, x: &[f32], out: &mut [f32], m: usize, k: usize) -> bool {
     use half::f16;
 
     if !usm_attn_enabled() {
@@ -15132,7 +16227,9 @@ pub fn try_matvec_tensor_batched_usm_f32(
                         && n >= 16
                         && k % 256 == 0
                         && unsafe {
-                            try_gemm_q4k_w8a8_tc_batched_dev_resident(dptr, w_nbytes, x, out, m, k, n)
+                            try_gemm_q4k_w8a8_tc_batched_dev_resident(
+                                dptr, w_nbytes, x, out, m, k, n,
+                            )
                         }
                     {
                         return true;
@@ -15493,17 +16590,18 @@ pub fn try_matvec_tensor_batched_usm_f32(
     // weights skip the per-call cache lookup + upload — the kernel
     // reads the USM pointer directly. A promoted `Device(Sycl)` expert's
     // `device_ptr` is a USM pointer too, so it takes the same fast path.
-    let preloaded_usm: Option<*const u8> = w
-        .storage
-        .sycl_usm_ptr()
-        .or_else(|| if sycl_dev_resident { w.storage.device_ptr() } else { None });
+    let preloaded_usm: Option<*const u8> = w.storage.sycl_usm_ptr().or_else(|| {
+        if sycl_dev_resident {
+            w.storage.device_ptr()
+        } else {
+            None
+        }
+    });
     let weight_key = w_bytes.as_ptr() as usize;
     USM_ATTN.with(|cell| {
         let mut slot = cell.borrow_mut();
         let Some(ctx) = slot.as_mut() else {
-            log_matvec_batched_skip_once(
-                "USM_ATTN slot is None (prepare_usm_context failed)",
-            );
+            log_matvec_batched_skip_once("USM_ATTN slot is None (prepare_usm_context failed)");
             return false;
         };
         // Activation + output scratch sized to N*K and N*M. Grows
@@ -15662,64 +16760,112 @@ pub fn try_matvec_tensor_batched_usm_f32(
             PackedMatvecKind::PTQ1_0 => unsafe {
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_PTQ1_0_PACKED_USM, m, k);
                 sk::matvec_ptq1_0_packed_f32_batched_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr,
-                    m as u32, k as u32, n as u32, lws,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    lws,
                 )
             }
             .is_ok(),
             PackedMatvecKind::IQ1_S => unsafe {
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_IQ1_S_PACKED_USM, m, k);
                 sk::matvec_iq1_s_packed_f32_batched_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr,
-                    m as u32, k as u32, n as u32, lws,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    lws,
                 )
             }
             .is_ok(),
             PackedMatvecKind::IQ2_XXS => unsafe {
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_IQ2_XXS_PACKED_USM, m, k);
                 sk::matvec_iq2_xxs_packed_f32_batched_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr,
-                    m as u32, k as u32, n as u32, lws,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    lws,
                 )
             }
             .is_ok(),
             PackedMatvecKind::IQ1_M => unsafe {
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_IQ1_M_PACKED_USM, m, k);
                 sk::matvec_iq1_m_packed_f32_batched_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr,
-                    m as u32, k as u32, n as u32, lws,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    lws,
                 )
             }
             .is_ok(),
             PackedMatvecKind::IQ2_XS => unsafe {
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_IQ2_XS_PACKED_USM, m, k);
                 sk::matvec_iq2_xs_packed_f32_batched_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr,
-                    m as u32, k as u32, n as u32, lws,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    lws,
                 )
             }
             .is_ok(),
             PackedMatvecKind::IQ2_S => unsafe {
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_IQ2_S_PACKED_USM, m, k);
                 sk::matvec_iq2_s_packed_f32_batched_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr,
-                    m as u32, k as u32, n as u32, lws,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    lws,
                 )
             }
             .is_ok(),
             PackedMatvecKind::IQ3_XXS => unsafe {
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_IQ3_XXS_PACKED_USM, m, k);
                 sk::matvec_iq3_xxs_packed_f32_batched_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr,
-                    m as u32, k as u32, n as u32, lws,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    lws,
                 )
             }
             .is_ok(),
             PackedMatvecKind::IQ3_S => unsafe {
                 let lws = tuned_lws_for(rustllama_tuner::KERNEL_IQ3_S_PACKED_USM, m, k);
                 sk::matvec_iq3_s_packed_f32_batched_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr,
-                    m as u32, k as u32, n as u32, lws,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    lws,
                 )
             }
             .is_ok(),
@@ -15731,71 +16877,131 @@ pub fn try_matvec_tensor_batched_usm_f32(
             // packed format — the GPU-decode / CPU-prefill asymmetry is closed.
             PackedMatvecKind::Q5_0 => unsafe {
                 sk::matvec_q5_0_packed_f32_batched_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr,
-                    m as u32, k as u32, n as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::Q4_1 => unsafe {
                 sk::matvec_q4_1_packed_f32_batched_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr,
-                    m as u32, k as u32, n as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::Q5_1 => unsafe {
                 sk::matvec_q5_1_packed_f32_batched_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr,
-                    m as u32, k as u32, n as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::Q2_K => unsafe {
                 sk::matvec_q2_k_packed_f32_batched_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr,
-                    m as u32, k as u32, n as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::Q3_K => unsafe {
                 sk::matvec_q3_k_packed_f32_batched_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr,
-                    m as u32, k as u32, n as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::Q8_K => unsafe {
                 sk::matvec_q8_k_packed_f32_batched_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr,
-                    m as u32, k as u32, n as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::PQ2_0 => unsafe {
                 sk::matvec_pq2_0_packed_f32_batched_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr,
-                    m as u32, k as u32, n as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::Mxfp4 => unsafe {
                 sk::matvec_mxfp4_packed_f32_batched_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr,
-                    m as u32, k as u32, n as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::Mxfp6 => unsafe {
                 sk::matvec_mxfp6_packed_f32_batched_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr,
-                    m as u32, k as u32, n as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    0,
                 )
             }
             .is_ok(),
             PackedMatvecKind::Mxfp8 => unsafe {
                 sk::matvec_mxfp8_packed_f32_batched_usm_raw(
-                    &*stream_raw, w_ptr, x_ptr, out_ptr,
-                    m as u32, k as u32, n as u32, 0,
+                    &*stream_raw,
+                    w_ptr,
+                    x_ptr,
+                    out_ptr,
+                    m as u32,
+                    k as u32,
+                    n as u32,
+                    0,
                 )
             }
             .is_ok(),
@@ -15901,12 +17107,9 @@ pub fn try_flash_attn_prefill_usm_f32(
         }
         // Re-upload Q / K / V on every call. K/V residency across
         // calls is a follow-up optimization (see fn doc).
-        ctx.prefill_q_f32.as_mut().unwrap().as_mut_slice()[..need_q]
-            .copy_from_slice(q);
-        ctx.prefill_k_f32.as_mut().unwrap().as_mut_slice()[..need_kv]
-            .copy_from_slice(k_cache);
-        ctx.prefill_v_f32.as_mut().unwrap().as_mut_slice()[..need_kv]
-            .copy_from_slice(v_cache);
+        ctx.prefill_q_f32.as_mut().unwrap().as_mut_slice()[..need_q].copy_from_slice(q);
+        ctx.prefill_k_f32.as_mut().unwrap().as_mut_slice()[..need_kv].copy_from_slice(k_cache);
+        ctx.prefill_v_f32.as_mut().unwrap().as_mut_slice()[..need_kv].copy_from_slice(v_cache);
         let stream_raw: *const sk::SyclStream = &ctx.stream;
         let q_ptr = ctx.prefill_q_f32.as_ref().unwrap().as_ptr();
         let k_ptr = ctx.prefill_k_f32.as_ref().unwrap().as_ptr();
@@ -15924,30 +17127,58 @@ pub fn try_flash_attn_prefill_usm_f32(
         let v3_ok = want_v3
             && unsafe {
                 sk::flash_attn_prefill_v3_usm_raw(
-                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads as u32, n_kv_heads as u32,
-                    head_dim as u32, max_ctx as u32,
-                    kv_len_base as u32, n_new as u32, window, softcap,
+                    &*stream_raw,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    max_ctx as u32,
+                    kv_len_base as u32,
+                    n_new as u32,
+                    window,
+                    softcap,
                 )
             }
             .is_ok();
-        let v2_ok = !v3_ok && want_v2
+        let v2_ok = !v3_ok
+            && want_v2
             && unsafe {
                 sk::flash_attn_prefill_v2_usm_raw(
-                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads as u32, n_kv_heads as u32,
-                    head_dim as u32, max_ctx as u32,
-                    kv_len_base as u32, n_new as u32, window, softcap,
+                    &*stream_raw,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    max_ctx as u32,
+                    kv_len_base as u32,
+                    n_new as u32,
+                    window,
+                    softcap,
                 )
             }
             .is_ok();
         if !v3_ok && !v2_ok {
             let result = unsafe {
                 sk::flash_attn_prefill_usm_raw(
-                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads as u32, n_kv_heads as u32,
-                    head_dim as u32, max_ctx as u32,
-                    kv_len_base as u32, n_new as u32, window, softcap,
+                    &*stream_raw,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    max_ctx as u32,
+                    kv_len_base as u32,
+                    n_new as u32,
+                    window,
+                    softcap,
                 )
             };
             if result.is_err() {
@@ -15955,11 +17186,8 @@ pub fn try_flash_attn_prefill_usm_f32(
                 return false;
             }
         }
-        out.copy_from_slice(
-            &ctx.prefill_out_f32.as_ref().unwrap().as_slice()[..need_out],
-        );
-        static FIRST_PREFILL_DISPATCH: std::sync::OnceLock<()> =
-            std::sync::OnceLock::new();
+        out.copy_from_slice(&ctx.prefill_out_f32.as_ref().unwrap().as_slice()[..need_out]);
+        static FIRST_PREFILL_DISPATCH: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         FIRST_PREFILL_DISPATCH.get_or_init(|| {
             tracing::info!(
                 n_new,
@@ -16134,39 +17362,114 @@ fn try_flash_attn_prefill_usm_quant(
         let ok = unsafe {
             match fmt {
                 QuantKv::Q4_0 => sk::flash_attn_prefill_q4_0_usm_raw(
-                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads as u32, n_kv_heads as u32, head_dim as u32,
-                    max_ctx as u32, kv_len_base as u32, n_new as u32, window, softcap,
+                    &*stream_raw,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    max_ctx as u32,
+                    kv_len_base as u32,
+                    n_new as u32,
+                    window,
+                    softcap,
                 ),
                 QuantKv::Q8_0 => sk::flash_attn_prefill_q8_0_usm_raw(
-                    &*stream_raw, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, out_ptr,
-                    n_heads as u32, n_kv_heads as u32, head_dim as u32,
-                    max_ctx as u32, kv_len_base as u32, n_new as u32, window, softcap,
+                    &*stream_raw,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    ks_ptr,
+                    vs_ptr,
+                    out_ptr,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    max_ctx as u32,
+                    kv_len_base as u32,
+                    n_new as u32,
+                    window,
+                    softcap,
                 ),
                 QuantKv::Nvfp4 => sk::flash_attn_prefill_nvfp4_usm_raw(
-                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads as u32, n_kv_heads as u32, head_dim as u32,
-                    max_ctx as u32, kv_len_base as u32, n_new as u32, window, softcap,
+                    &*stream_raw,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    max_ctx as u32,
+                    kv_len_base as u32,
+                    n_new as u32,
+                    window,
+                    softcap,
                 ),
                 QuantKv::Tq { bits } => sk::flash_attn_prefill_tq_usm_raw(
-                    &*stream_raw, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
-                    n_heads as u32, n_kv_heads as u32, head_dim as u32,
-                    max_ctx as u32, kv_len_base as u32, n_new as u32, window, softcap,
+                    &*stream_raw,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    ks_ptr,
+                    vs_ptr,
+                    bits as u32,
+                    out_ptr,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    max_ctx as u32,
+                    kv_len_base as u32,
+                    n_new as u32,
+                    window,
+                    softcap,
                 ),
                 QuantKv::Mxfp4 => sk::flash_attn_prefill_mxfp4_usm_raw(
-                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads as u32, n_kv_heads as u32, head_dim as u32,
-                    max_ctx as u32, kv_len_base as u32, n_new as u32, window, softcap,
+                    &*stream_raw,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    max_ctx as u32,
+                    kv_len_base as u32,
+                    n_new as u32,
+                    window,
+                    softcap,
                 ),
                 QuantKv::Mxfp6 => sk::flash_attn_prefill_mxfp6_usm_raw(
-                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads as u32, n_kv_heads as u32, head_dim as u32,
-                    max_ctx as u32, kv_len_base as u32, n_new as u32, window, softcap,
+                    &*stream_raw,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    max_ctx as u32,
+                    kv_len_base as u32,
+                    n_new as u32,
+                    window,
+                    softcap,
                 ),
                 QuantKv::Mxfp8 => sk::flash_attn_prefill_mxfp8_usm_raw(
-                    &*stream_raw, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads as u32, n_kv_heads as u32, head_dim as u32,
-                    max_ctx as u32, kv_len_base as u32, n_new as u32, window, softcap,
+                    &*stream_raw,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    max_ctx as u32,
+                    kv_len_base as u32,
+                    n_new as u32,
+                    window,
+                    softcap,
                 ),
             }
         }
@@ -16249,20 +17552,38 @@ pub fn try_flash_attn_prefill_cuda_f32(
         {
             let s: &[u8] =
                 unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, mirror_bytes) };
-            if ctx.dev_prefill_k.as_mut().unwrap().copy_from_host(s).is_err() {
+            if ctx
+                .dev_prefill_k
+                .as_mut()
+                .unwrap()
+                .copy_from_host(s)
+                .is_err()
+            {
                 return false;
             }
         }
         {
             let s: &[u8] =
                 unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, mirror_bytes) };
-            if ctx.dev_prefill_v.as_mut().unwrap().copy_from_host(s).is_err() {
+            if ctx
+                .dev_prefill_v
+                .as_mut()
+                .unwrap()
+                .copy_from_host(s)
+                .is_err()
+            {
                 return false;
             }
         }
         {
             let s: &[u8] = unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u8, q_bytes) };
-            if ctx.dev_prefill_q.as_mut().unwrap().copy_from_host(s).is_err() {
+            if ctx
+                .dev_prefill_q
+                .as_mut()
+                .unwrap()
+                .copy_from_host(s)
+                .is_err()
+            {
                 return false;
             }
         }
@@ -16275,9 +17596,19 @@ pub fn try_flash_attn_prefill_cuda_f32(
         // synchronizes before returning so the read-back doesn't race.
         let launched = unsafe {
             ck::flash_attn_prefill_f32(
-                stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-                window as i32, softcap,
+                stream,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                out_ptr,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx,
+                kv_len_base,
+                n_new,
+                window as i32,
+                softcap,
             )
         }
         .is_ok();
@@ -16286,7 +17617,11 @@ pub fn try_flash_attn_prefill_cuda_f32(
         }
         let out_b: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out_bytes) };
-        ctx.dev_prefill_out.as_ref().unwrap().copy_to_host(out_b).is_ok()
+        ctx.dev_prefill_out
+            .as_ref()
+            .unwrap()
+            .copy_to_host(out_b)
+            .is_ok()
     })
 }
 
@@ -16385,10 +17720,22 @@ fn try_flash_attn_prefill_cuda_quant(
         // Upload the packed slab (+ scales) + Q verbatim. `k_packed` etc.
         // are caller-owned slices (not `ctx` fields), so there is no
         // aliasing with the device buffers they copy into.
-        if ctx.dev_prefill_k.as_mut().unwrap().copy_from_host(k_packed).is_err() {
+        if ctx
+            .dev_prefill_k
+            .as_mut()
+            .unwrap()
+            .copy_from_host(k_packed)
+            .is_err()
+        {
             return false;
         }
-        if ctx.dev_prefill_v.as_mut().unwrap().copy_from_host(v_packed).is_err() {
+        if ctx
+            .dev_prefill_v
+            .as_mut()
+            .unwrap()
+            .copy_from_host(v_packed)
+            .is_err()
+        {
             return false;
         }
         if has_scales {
@@ -16396,7 +17743,13 @@ fn try_flash_attn_prefill_cuda_quant(
                 let s: &[u8] = unsafe {
                     std::slice::from_raw_parts(k_scales.as_ptr() as *const u8, scales_bytes)
                 };
-                if ctx.dev_prefill_k_scales.as_mut().unwrap().copy_from_host(s).is_err() {
+                if ctx
+                    .dev_prefill_k_scales
+                    .as_mut()
+                    .unwrap()
+                    .copy_from_host(s)
+                    .is_err()
+                {
                     return false;
                 }
             }
@@ -16404,14 +17757,26 @@ fn try_flash_attn_prefill_cuda_quant(
                 let s: &[u8] = unsafe {
                     std::slice::from_raw_parts(v_scales.as_ptr() as *const u8, scales_bytes)
                 };
-                if ctx.dev_prefill_v_scales.as_mut().unwrap().copy_from_host(s).is_err() {
+                if ctx
+                    .dev_prefill_v_scales
+                    .as_mut()
+                    .unwrap()
+                    .copy_from_host(s)
+                    .is_err()
+                {
                     return false;
                 }
             }
         }
         {
             let s: &[u8] = unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u8, q_bytes) };
-            if ctx.dev_prefill_q.as_mut().unwrap().copy_from_host(s).is_err() {
+            if ctx
+                .dev_prefill_q
+                .as_mut()
+                .unwrap()
+                .copy_from_host(s)
+                .is_err()
+            {
                 return false;
             }
         }
@@ -16433,39 +17798,114 @@ fn try_flash_attn_prefill_cuda_quant(
         let launched = unsafe {
             match fmt {
                 QuantKv::Q4_0 => ck::flash_attn_prefill_q4_0(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Q8_0 => ck::flash_attn_prefill_q8_0(
-                    stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    ks_ptr,
+                    vs_ptr,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Nvfp4 => ck::flash_attn_prefill_nvfp4(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Tq { bits } => ck::flash_attn_prefill_tq(
-                    stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    ks_ptr,
+                    vs_ptr,
+                    bits as u32,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Mxfp4 => ck::flash_attn_prefill_mxfp4(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Mxfp6 => ck::flash_attn_prefill_mxfp6(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Mxfp8 => ck::flash_attn_prefill_mxfp8(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window as i32,
+                    softcap,
                 ),
             }
         }
@@ -16475,7 +17915,11 @@ fn try_flash_attn_prefill_cuda_quant(
         }
         let out_b: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out_bytes) };
-        ctx.dev_prefill_out.as_ref().unwrap().copy_to_host(out_b).is_ok()
+        ctx.dev_prefill_out
+            .as_ref()
+            .unwrap()
+            .copy_to_host(out_b)
+            .is_ok()
     })
 }
 
@@ -16543,20 +17987,38 @@ pub fn try_flash_attn_prefill_mlx_f32(
         {
             let s: &[u8] =
                 unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, mirror_bytes) };
-            if ctx.dev_prefill_k.as_mut().unwrap().copy_from_host(s).is_err() {
+            if ctx
+                .dev_prefill_k
+                .as_mut()
+                .unwrap()
+                .copy_from_host(s)
+                .is_err()
+            {
                 return false;
             }
         }
         {
             let s: &[u8] =
                 unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, mirror_bytes) };
-            if ctx.dev_prefill_v.as_mut().unwrap().copy_from_host(s).is_err() {
+            if ctx
+                .dev_prefill_v
+                .as_mut()
+                .unwrap()
+                .copy_from_host(s)
+                .is_err()
+            {
                 return false;
             }
         }
         {
             let s: &[u8] = unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u8, q_bytes) };
-            if ctx.dev_prefill_q.as_mut().unwrap().copy_from_host(s).is_err() {
+            if ctx
+                .dev_prefill_q
+                .as_mut()
+                .unwrap()
+                .copy_from_host(s)
+                .is_err()
+            {
                 return false;
             }
         }
@@ -16569,9 +18031,19 @@ pub fn try_flash_attn_prefill_mlx_f32(
         // synchronizes before returning so the read-back doesn't race.
         let launched = unsafe {
             mk::flash_attn_prefill_f32(
-                stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-                window as i32, softcap,
+                stream,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                out_ptr,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx,
+                kv_len_base,
+                n_new,
+                window as i32,
+                softcap,
             )
         }
         .is_ok();
@@ -16580,7 +18052,11 @@ pub fn try_flash_attn_prefill_mlx_f32(
         }
         let out_b: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out_bytes) };
-        ctx.dev_prefill_out.as_ref().unwrap().copy_to_host(out_b).is_ok()
+        ctx.dev_prefill_out
+            .as_ref()
+            .unwrap()
+            .copy_to_host(out_b)
+            .is_ok()
     })
 }
 
@@ -16678,10 +18154,22 @@ fn try_flash_attn_prefill_mlx_quant(
         // Upload the packed slab (+ scales) + Q verbatim. `k_packed` etc. are
         // caller-owned slices (not `ctx` fields), so there is no aliasing
         // with the device buffers they copy into.
-        if ctx.dev_prefill_k.as_mut().unwrap().copy_from_host(k_packed).is_err() {
+        if ctx
+            .dev_prefill_k
+            .as_mut()
+            .unwrap()
+            .copy_from_host(k_packed)
+            .is_err()
+        {
             return false;
         }
-        if ctx.dev_prefill_v.as_mut().unwrap().copy_from_host(v_packed).is_err() {
+        if ctx
+            .dev_prefill_v
+            .as_mut()
+            .unwrap()
+            .copy_from_host(v_packed)
+            .is_err()
+        {
             return false;
         }
         if has_scales {
@@ -16689,7 +18177,13 @@ fn try_flash_attn_prefill_mlx_quant(
                 let s: &[u8] = unsafe {
                     std::slice::from_raw_parts(k_scales.as_ptr() as *const u8, scales_bytes)
                 };
-                if ctx.dev_prefill_k_scales.as_mut().unwrap().copy_from_host(s).is_err() {
+                if ctx
+                    .dev_prefill_k_scales
+                    .as_mut()
+                    .unwrap()
+                    .copy_from_host(s)
+                    .is_err()
+                {
                     return false;
                 }
             }
@@ -16697,14 +18191,26 @@ fn try_flash_attn_prefill_mlx_quant(
                 let s: &[u8] = unsafe {
                     std::slice::from_raw_parts(v_scales.as_ptr() as *const u8, scales_bytes)
                 };
-                if ctx.dev_prefill_v_scales.as_mut().unwrap().copy_from_host(s).is_err() {
+                if ctx
+                    .dev_prefill_v_scales
+                    .as_mut()
+                    .unwrap()
+                    .copy_from_host(s)
+                    .is_err()
+                {
                     return false;
                 }
             }
         }
         {
             let s: &[u8] = unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u8, q_bytes) };
-            if ctx.dev_prefill_q.as_mut().unwrap().copy_from_host(s).is_err() {
+            if ctx
+                .dev_prefill_q
+                .as_mut()
+                .unwrap()
+                .copy_from_host(s)
+                .is_err()
+            {
                 return false;
             }
         }
@@ -16726,39 +18232,114 @@ fn try_flash_attn_prefill_mlx_quant(
         let launched = unsafe {
             match fmt {
                 QuantKv::Q4_0 => mk::flash_attn_prefill_q4_0(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Q8_0 => mk::flash_attn_prefill_q8_0(
-                    stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    ks_ptr,
+                    vs_ptr,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Nvfp4 => mk::flash_attn_prefill_nvfp4(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Tq { bits } => mk::flash_attn_prefill_tq(
-                    stream, q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, bits as u32, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    ks_ptr,
+                    vs_ptr,
+                    bits as u32,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Mxfp4 => mk::flash_attn_prefill_mxfp4(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Mxfp6 => mk::flash_attn_prefill_mxfp6(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window as i32,
+                    softcap,
                 ),
                 QuantKv::Mxfp8 => mk::flash_attn_prefill_mxfp8(
-                    stream, q_ptr, k_ptr, v_ptr, out_ptr,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-                    window as i32, softcap,
+                    stream,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    out_ptr,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window as i32,
+                    softcap,
                 ),
             }
         }
@@ -16768,7 +18349,11 @@ fn try_flash_attn_prefill_mlx_quant(
         }
         let out_b: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out_bytes) };
-        ctx.dev_prefill_out.as_ref().unwrap().copy_to_host(out_b).is_ok()
+        ctx.dev_prefill_out
+            .as_ref()
+            .unwrap()
+            .copy_to_host(out_b)
+            .is_ok()
     })
 }
 
@@ -16802,23 +18387,53 @@ pub fn try_flash_attn_prefill_gpu_f32(
 ) -> bool {
     if cuda_active()
         && try_flash_attn_prefill_cuda_f32(
-            q, k, v, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-            window, softcap,
+            q,
+            k,
+            v,
+            out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            window,
+            softcap,
         )
     {
         return true;
     }
     if mlx_active()
         && try_flash_attn_prefill_mlx_f32(
-            q, k, v, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-            window, softcap,
+            q,
+            k,
+            v,
+            out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            window,
+            softcap,
         )
     {
         return true;
     }
     try_flash_attn_prefill_usm_f32(
-        q, k, v, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-        window, softcap,
+        q,
+        k,
+        v,
+        out,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        window,
+        softcap,
     )
 }
 
@@ -16842,23 +18457,62 @@ pub fn try_flash_attn_prefill_gpu_q4_0(
 ) -> bool {
     if cuda_active()
         && try_flash_attn_prefill_cuda_quant(
-            QuantKv::Q4_0, q, k_packed, v_packed, &[], &[], out,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
+            QuantKv::Q4_0,
+            q,
+            k_packed,
+            v_packed,
+            &[],
+            &[],
+            out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            window,
+            softcap,
         )
     {
         return true;
     }
     if mlx_active()
         && try_flash_attn_prefill_mlx_quant(
-            QuantKv::Q4_0, q, k_packed, v_packed, &[], &[], out,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
+            QuantKv::Q4_0,
+            q,
+            k_packed,
+            v_packed,
+            &[],
+            &[],
+            out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            window,
+            softcap,
         )
     {
         return true;
     }
     try_flash_attn_prefill_usm_quant(
-        QuantKv::Q4_0, q, k_packed, v_packed, &[], &[], out,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
+        QuantKv::Q4_0,
+        q,
+        k_packed,
+        v_packed,
+        &[],
+        &[],
+        out,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        window,
+        softcap,
     )
 }
 
@@ -16890,23 +18544,62 @@ pub fn try_flash_attn_prefill_gpu_q8_0(
         unsafe { std::slice::from_raw_parts(v_q.as_ptr() as *const u8, v_q.len()) };
     if cuda_active()
         && try_flash_attn_prefill_cuda_quant(
-            QuantKv::Q8_0, q, k_bytes, v_bytes, k_scales, v_scales, out,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
+            QuantKv::Q8_0,
+            q,
+            k_bytes,
+            v_bytes,
+            k_scales,
+            v_scales,
+            out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            window,
+            softcap,
         )
     {
         return true;
     }
     if mlx_active()
         && try_flash_attn_prefill_mlx_quant(
-            QuantKv::Q8_0, q, k_bytes, v_bytes, k_scales, v_scales, out,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
+            QuantKv::Q8_0,
+            q,
+            k_bytes,
+            v_bytes,
+            k_scales,
+            v_scales,
+            out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            window,
+            softcap,
         )
     {
         return true;
     }
     try_flash_attn_prefill_usm_quant(
-        QuantKv::Q8_0, q, k_bytes, v_bytes, k_scales, v_scales, out,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
+        QuantKv::Q8_0,
+        q,
+        k_bytes,
+        v_bytes,
+        k_scales,
+        v_scales,
+        out,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        window,
+        softcap,
     )
 }
 
@@ -16930,23 +18623,62 @@ pub fn try_flash_attn_prefill_gpu_nvfp4(
 ) -> bool {
     if cuda_active()
         && try_flash_attn_prefill_cuda_quant(
-            QuantKv::Nvfp4, q, k_packed, v_packed, &[], &[], out,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
+            QuantKv::Nvfp4,
+            q,
+            k_packed,
+            v_packed,
+            &[],
+            &[],
+            out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            window,
+            softcap,
         )
     {
         return true;
     }
     if mlx_active()
         && try_flash_attn_prefill_mlx_quant(
-            QuantKv::Nvfp4, q, k_packed, v_packed, &[], &[], out,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
+            QuantKv::Nvfp4,
+            q,
+            k_packed,
+            v_packed,
+            &[],
+            &[],
+            out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            window,
+            softcap,
         )
     {
         return true;
     }
     try_flash_attn_prefill_usm_quant(
-        QuantKv::Nvfp4, q, k_packed, v_packed, &[], &[], out,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
+        QuantKv::Nvfp4,
+        q,
+        k_packed,
+        v_packed,
+        &[],
+        &[],
+        out,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        window,
+        softcap,
     )
 }
 
@@ -16972,23 +18704,62 @@ macro_rules! mxfp_prefill_gpu_combinator {
         ) -> bool {
             if cuda_active()
                 && try_flash_attn_prefill_cuda_quant(
-                    $kv, q, k_packed, v_packed, &[], &[], out,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
+                    $kv,
+                    q,
+                    k_packed,
+                    v_packed,
+                    &[],
+                    &[],
+                    out,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window,
+                    softcap,
                 )
             {
                 return true;
             }
             if mlx_active()
                 && try_flash_attn_prefill_mlx_quant(
-                    $kv, q, k_packed, v_packed, &[], &[], out,
-                    n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
+                    $kv,
+                    q,
+                    k_packed,
+                    v_packed,
+                    &[],
+                    &[],
+                    out,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
+                    window,
+                    softcap,
                 )
             {
                 return true;
             }
             try_flash_attn_prefill_usm_quant(
-                $kv, q, k_packed, v_packed, &[], &[], out,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
+                $kv,
+                q,
+                k_packed,
+                v_packed,
+                &[],
+                &[],
+                out,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx,
+                kv_len_base,
+                n_new,
+                window,
+                softcap,
             )
         }
     };
@@ -17020,23 +18791,62 @@ pub fn try_flash_attn_prefill_gpu_tq(
 ) -> bool {
     if cuda_active()
         && try_flash_attn_prefill_cuda_quant(
-            QuantKv::Tq { bits }, q, k_packed, v_packed, k_scales, v_scales, out,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
+            QuantKv::Tq { bits },
+            q,
+            k_packed,
+            v_packed,
+            k_scales,
+            v_scales,
+            out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            window,
+            softcap,
         )
     {
         return true;
     }
     if mlx_active()
         && try_flash_attn_prefill_mlx_quant(
-            QuantKv::Tq { bits }, q, k_packed, v_packed, k_scales, v_scales, out,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
+            QuantKv::Tq { bits },
+            q,
+            k_packed,
+            v_packed,
+            k_scales,
+            v_scales,
+            out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            window,
+            softcap,
         )
     {
         return true;
     }
     try_flash_attn_prefill_usm_quant(
-        QuantKv::Tq { bits }, q, k_packed, v_packed, k_scales, v_scales, out,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap,
+        QuantKv::Tq { bits },
+        q,
+        k_packed,
+        v_packed,
+        k_scales,
+        v_scales,
+        out,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        window,
+        softcap,
     )
 }
 
@@ -17162,8 +18972,7 @@ fn log_matvec_batched_skip_once(reason: &str) {
 /// reports "GPU% spiked but Shared GPU memory stayed flat".
 /// MoE tiered-expert device-resident dispatch counter: how many matvecs ran
 /// against a promoted (device-resident) expert weight this process.
-static MOE_DEV_RESIDENT_HITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static MOE_DEV_RESIDENT_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Record one device-resident expert matvec (the promoted-expert fast path).
 /// Cheap (one relaxed add); the FIRST hit also logs once, so a MoE model run

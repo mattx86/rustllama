@@ -228,8 +228,8 @@ fn host_has_dedicated_vram(fallback_device_index: u32) -> bool {
     if rustllama_models::accel::mlx_active() {
         return false;
     }
-    let idx = rustllama_models::accel::first_enabled_sycl_device_index()
-        .unwrap_or(fallback_device_index);
+    let idx =
+        rustllama_models::accel::first_enabled_sycl_device_index().unwrap_or(fallback_device_index);
     match rustllama_kernels_sycl::device_info(idx) {
         Ok(info) => !info.is_integrated,
         // No queryable SYCL device (all disabled, stub build, query fail) ⇒
@@ -308,8 +308,7 @@ fn auto_n_gpu_layers_inner(
             };
         }
     };
-    let after_safety =
-        ((raw_budget as f64) * opts.safety_factor).floor() as u64;
+    let after_safety = ((raw_budget as f64) * opts.safety_factor).floor() as u64;
     let effective_budget = after_safety.saturating_sub(opts.reserve_bytes);
 
     if effective_budget == 0 {
@@ -337,8 +336,7 @@ fn auto_n_gpu_layers_inner(
     // rest spill to CPU. When an NPU is present its capacity slots between GPU
     // and CPU per `tier_order`, extending this to a true per-layer placement.
     let per_layer = per_layer_weight_bytes(weights, &opts.cpu_force_patterns);
-    let assignment =
-        rustllama_runtime::tier::spillover_assign(&per_layer, &[effective_budget, 0]);
+    let assignment = rustllama_runtime::tier::spillover_assign(&per_layer, &[effective_budget, 0]);
     let cutoff = assignment.iter().take_while(|&&t| t == 0).count() as u32;
     let cumulative: u64 = per_layer.iter().take(cutoff as usize).sum();
 
@@ -410,10 +408,7 @@ fn mlx_vram_budget() -> Option<(u64, String)> {
 /// `Tensor`, so they're never USM-uploaded — the GPU dispatch
 /// helpers consume the CPU view directly. They contribute zero
 /// bytes here.
-pub fn per_layer_weight_bytes(
-    weights: &LlamaWeights,
-    cpu_force_patterns: &[String],
-) -> Vec<u64> {
+pub fn per_layer_weight_bytes(weights: &LlamaWeights, cpu_force_patterns: &[String]) -> Vec<u64> {
     let count_tensor = |t: &Tensor| -> u64 {
         if cpu_force_patterns
             .iter()
@@ -429,9 +424,7 @@ pub fn per_layer_weight_bytes(
         }
         t.dtype.byte_size(t.element_count())
     };
-    let count_opt = |t: &Option<Tensor>| -> u64 {
-        t.as_ref().map(count_tensor).unwrap_or(0)
-    };
+    let count_opt = |t: &Option<Tensor>| -> u64 { t.as_ref().map(count_tensor).unwrap_or(0) };
     // Bytes of a hybrid layer's FFN (routed-expert MoE or dense SwiGLU).
     let ffn_bytes = |ffn: &HybridFfn| -> u64 {
         match ffn {
@@ -453,9 +446,11 @@ pub fn per_layer_weight_bytes(
                     + count_opt(w_up_shared)
                     + count_opt(w_down_shared)
             }
-            HybridFfn::Dense { w_gate, w_up, w_down } => {
-                count_tensor(w_gate) + count_tensor(w_up) + count_tensor(w_down)
-            }
+            HybridFfn::Dense {
+                w_gate,
+                w_up,
+                w_down,
+            } => count_tensor(w_gate) + count_tensor(w_up) + count_tensor(w_down),
         }
     };
 
@@ -573,7 +568,9 @@ mod tests {
                 w_k: mk_tensor(&format!("blk.{layer}.attn_k.weight"), 100, Dtype::F32),
                 w_v: mk_tensor(&format!("blk.{layer}.attn_v.weight"), 100, Dtype::F32),
                 w_o: mk_tensor(&format!("blk.{layer}.attn_output.weight"), 100, Dtype::F32),
-                b_q: None, b_k: None, b_v: None,
+                b_q: None,
+                b_k: None,
+                b_v: None,
                 ffn_norm: vec![],
                 w_gate: mk_tensor(&format!("blk.{layer}.ffn_gate.weight"), 200, Dtype::F32),
                 w_up: mk_tensor(&format!("blk.{layer}.ffn_up.weight"), 200, Dtype::F32),
@@ -609,7 +606,9 @@ mod tests {
             w_k: mk_tensor("blk.0.attn_k.weight", 100, Dtype::F32),
             w_v: mk_tensor("blk.0.attn_v.weight", 100, Dtype::F32),
             w_o: mk_tensor("blk.0.attn_output.weight", 100, Dtype::F32),
-            b_q: None, b_k: None, b_v: None,
+            b_q: None,
+            b_k: None,
+            b_v: None,
             ffn_norm: vec![],
             w_gate: mk_tensor("blk.0.ffn_gate.weight", 200, Dtype::F32),
             w_up: mk_tensor("blk.0.ffn_up.weight", 200, Dtype::F32),
@@ -647,7 +646,9 @@ mod tests {
             w_k: mk_tensor("w_k", 1, Dtype::F32),
             w_v: mk_tensor("w_v", 1, Dtype::F32),
             w_o: mk_tensor("w_o", 1, Dtype::F32),
-            b_q: None, b_k: None, b_v: None,
+            b_q: None,
+            b_k: None,
+            b_v: None,
             ffn_norm: vec![],
             w_gate: mk_tensor("w_gate", 1, Dtype::F32),
             w_up: mk_tensor("w_up", 1, Dtype::F32),

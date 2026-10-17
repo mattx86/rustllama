@@ -129,9 +129,16 @@ impl Tokenizer {
             .or_else(|| read_string_opt(gguf, "tokenizer.ggml.chat_template"));
 
         let inner = match model.as_str() {
-            "gpt2" => {
-                build_bpe_byte_level(&tokens, gguf, &token_types, bos, eos, pad, unk, pre.as_deref())?
-            }
+            "gpt2" => build_bpe_byte_level(
+                &tokens,
+                gguf,
+                &token_types,
+                bos,
+                eos,
+                pad,
+                unk,
+                pre.as_deref(),
+            )?,
             "llama" => build_unigram_spm(
                 &tokens,
                 gguf,
@@ -272,12 +279,7 @@ impl Tokenizer {
     /// because the BERT forward path inside `rustllama-models`
     /// receives them implicitly (positions in the input slice
     /// before/after the first SEP map to type 0/1).
-    pub fn encode_pair(
-        &self,
-        a: &str,
-        b: &str,
-        add_special_tokens: bool,
-    ) -> Result<Vec<u32>> {
+    pub fn encode_pair(&self, a: &str, b: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
         let enc = self
             .inner
             .encode((a, b), add_special_tokens)
@@ -300,11 +302,7 @@ impl Tokenizer {
     /// the split point `<|` is always immediately followed by a special
     /// token, which BPE cannot fuse with surrounding text, so splitting
     /// there is byte-safe.
-    pub fn encode_streaming(
-        &self,
-        text: &str,
-        add_special_tokens: bool,
-    ) -> Result<TokenStream> {
+    pub fn encode_streaming(&self, text: &str, add_special_tokens: bool) -> Result<TokenStream> {
         let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u32>>>();
 
         // The split-at-`<|` fast path only reproduces a single `encode`
@@ -1006,15 +1004,15 @@ fn push_added(added: &mut Vec<Value>, id: u32, content: &str, special: bool) {
 /// the DEFAULT path below (byte-identical to pre-M3 behaviour).
 // Retained for reference; gpt-2 models take the DEFAULT regex path, so this is unused.
 #[allow(dead_code)]
-const RE_GPT2: &str =
-    r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
+const RE_GPT2: &str = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
 /// Llama-3 (`llama-bpe`); `smaug-bpe` shares it. Case-insensitive
 /// contractions, letters allow one leading non-alnum, digits grouped 1-3.
 const RE_LLAMA3: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 /// Qwen2 — as Llama-3 but digits are split ONE at a time (`\p{N}`).
 const RE_QWEN2: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 /// Falcon — GPT-2 with a leading punctuation/symbol class.
-const RE_FALCON: &str = r"[\p{P}$+<=>^~|`]+|'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
+const RE_FALCON: &str =
+    r"[\p{P}$+<=>^~|`]+|'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
 /// GPT-4o / o200k_base. Splits case runs and groups digits 1-3.
 const RE_GPT4O: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
@@ -1272,8 +1270,14 @@ mod tests {
         // the exact historical single-ByteLevel pre-tokenizer — so existing
         // GGUF models tokenize byte-for-byte as before.
         assert_eq!(bpe_pretokenizer_json(None), default_bytelevel_json());
-        assert_eq!(bpe_pretokenizer_json(Some("gpt-2")), default_bytelevel_json());
-        assert_eq!(bpe_pretokenizer_json(Some("gpt2")), default_bytelevel_json());
+        assert_eq!(
+            bpe_pretokenizer_json(Some("gpt-2")),
+            default_bytelevel_json()
+        );
+        assert_eq!(
+            bpe_pretokenizer_json(Some("gpt2")),
+            default_bytelevel_json()
+        );
         assert_eq!(
             bpe_pretokenizer_json(Some("some-future-family")),
             default_bytelevel_json()
@@ -1341,8 +1345,7 @@ mod tests {
                 "merges": [["9", "9"], ["99", "9"], ["999", "9"]],
             }
         });
-        HfTokenizer::from_bytes(serde_json::to_vec(&tj).unwrap())
-            .expect("tiny digit BPE loads")
+        HfTokenizer::from_bytes(serde_json::to_vec(&tj).unwrap()).expect("tiny digit BPE loads")
     }
 
     #[test]
@@ -1355,21 +1358,33 @@ mod tests {
         // DEFAULT / gpt-2: GPT-2 `\p{N}+` → one pre-token "9999". Greedy BPE
         // merges the two rank-0 9+9 pairs first → ["99","99"] = [1, 1].
         assert_eq!(
-            tiny_digit_bpe(None).encode("9999", false).unwrap().get_ids(),
+            tiny_digit_bpe(None)
+                .encode("9999", false)
+                .unwrap()
+                .get_ids(),
             &[1, 1]
         );
         assert_eq!(
-            tiny_digit_bpe(Some("gpt-2")).encode("9999", false).unwrap().get_ids(),
+            tiny_digit_bpe(Some("gpt-2"))
+                .encode("9999", false)
+                .unwrap()
+                .get_ids(),
             &[1, 1]
         );
         // Llama-3 `\p{N}{1,3}` → "999" + "9" (greedy groups of ≤3) → [2, 0].
         assert_eq!(
-            tiny_digit_bpe(Some("llama3")).encode("9999", false).unwrap().get_ids(),
+            tiny_digit_bpe(Some("llama3"))
+                .encode("9999", false)
+                .unwrap()
+                .get_ids(),
             &[2, 0]
         );
         // Qwen2 `\p{N}` → every digit split → four separate "9" tokens.
         assert_eq!(
-            tiny_digit_bpe(Some("qwen2")).encode("9999", false).unwrap().get_ids(),
+            tiny_digit_bpe(Some("qwen2"))
+                .encode("9999", false)
+                .unwrap()
+                .get_ids(),
             &[0, 0, 0, 0]
         );
     }
@@ -1390,7 +1405,14 @@ mod tests {
         // add_space_prefix = true (default): a leading ▁ is prepended, so
         // "hi" encodes as the "▁hi" piece (id 2).
         let tok_true = build_unigram_spm_from_parts(
-            &tokens, &scores, &Some(types.clone()), None, None, None, Some(0), true,
+            &tokens,
+            &scores,
+            &Some(types.clone()),
+            None,
+            None,
+            None,
+            Some(0),
+            true,
         )
         .unwrap();
         assert_eq!(tok_true.encode("hi", false).unwrap().get_ids(), &[2]);
@@ -1398,7 +1420,14 @@ mod tests {
         // add_space_prefix = false: no leading ▁, so "hi" encodes as the
         // bare "hi" piece (id 3).
         let tok_false = build_unigram_spm_from_parts(
-            &tokens, &scores, &Some(types), None, None, None, Some(0), false,
+            &tokens,
+            &scores,
+            &Some(types),
+            None,
+            None,
+            None,
+            Some(0),
+            false,
         )
         .unwrap();
         assert_eq!(tok_false.encode("hi", false).unwrap().get_ids(), &[3]);
@@ -1518,8 +1547,14 @@ mod tests {
         let out3 = render_chat_template_with_specials(
             template,
             &[
-                ChatMessage { role: "system", content: "be terse" },
-                ChatMessage { role: "user", content: "hi" },
+                ChatMessage {
+                    role: "system",
+                    content: "be terse",
+                },
+                ChatMessage {
+                    role: "user",
+                    content: "hi",
+                },
             ],
             false,
             None,
@@ -1617,8 +1652,7 @@ mod tests {
     /// in-vocab text.
     #[test]
     fn unigram_without_byte_tokens_round_trips_ascii() {
-        let tokens: Vec<String> =
-            vec!["<unk>".into(), "\u{2581}".into(), "\u{2581}hi".into()];
+        let tokens: Vec<String> = vec!["<unk>".into(), "\u{2581}".into(), "\u{2581}hi".into()];
         let types: Vec<i32> = vec![2, 1, 1];
         let scores: Vec<f32> = vec![0.0, -1.0, -0.5];
         let tok = build_unigram_spm_from_parts(

@@ -42,10 +42,8 @@ fn paged_batch_single_slot_matches_cpu_engine_greedy() {
     use rustllama_models::llama_arch::KvDtype;
     let tmp = write_gguf("m1-vs-cpu");
 
-    let mut cpu = CpuEngine::load_with_options_and_layout(
-        &tmp, 32, true, KvDtype::F32, "paged",
-    )
-    .expect("cpu engine load");
+    let mut cpu = CpuEngine::load_with_options_and_layout(&tmp, 32, true, KvDtype::F32, "paged")
+        .expect("cpu engine load");
     cpu.set_prefix_cache(false);
 
     let batch = PagedBatchEngine::load(&tmp, 32, 1).expect("batch engine load");
@@ -416,12 +414,15 @@ async fn paged_batch_ragged_unbounded_budget_matches_small_finite() {
     drop(unbounded);
 
     // Budget 2 < prompt len ⇒ the ragged path chunks the prefill over ticks.
-    let finite =
-        PagedBatchEngine::load_with_batched_tokens(&tmp, 32, 1, 2).expect("finite load");
+    let finite = PagedBatchEngine::load_with_batched_tokens(&tmp, 32, 1, 2).expect("finite load");
     let out_finite = run_one(&finite, prompt.clone(), n_tokens).await;
     drop(finite);
 
-    assert_eq!(out_unbounded.len(), n_tokens as usize, "unbounded token count");
+    assert_eq!(
+        out_unbounded.len(),
+        n_tokens as usize,
+        "unbounded token count"
+    );
     assert_eq!(
         out_unbounded, out_finite,
         "unbounded (usize::MAX) budget diverged from a small finite budget: \
@@ -496,7 +497,10 @@ async fn paged_batch_engine_satisfies_engine_trait() {
     // through a real tokenizer is exercised by the server-level
     // integration in 3.7g.
     let result = engine.tokenize("text");
-    assert!(result.is_ok(), "tokenize() trait dispatch must reach the tokenizer");
+    assert!(
+        result.is_ok(),
+        "tokenize() trait dispatch must reach the tokenizer"
+    );
 
     // chat() / generate() through the trait would also dispatch
     // here, but submit_text_streaming bails on the synth
@@ -529,9 +533,7 @@ async fn paged_batch_streaming_reuses_driver_across_sequential_submits() {
     let tmp = write_gguf("sequential");
     let batch = PagedBatchEngine::load(&tmp, 32, 1).expect("load");
     for prompt in [vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9]] {
-        let mut s = batch
-            .submit_streaming(prompt, greedy(2))
-            .expect("submit");
+        let mut s = batch.submit_streaming(prompt, greedy(2)).expect("submit");
         let mut count = 0;
         while let Some(item) = s.next().await {
             let _ = item.expect("token");
@@ -565,7 +567,9 @@ async fn paged_batch_last_request_stats_populates_after_completion() {
 
     // Run one request to completion.
     let prompt: Vec<i32> = vec![1, 2, 3, 4];
-    let mut stream = batch.submit_streaming(prompt.clone(), greedy(3)).expect("submit");
+    let mut stream = batch
+        .submit_streaming(prompt.clone(), greedy(3))
+        .expect("submit");
     let mut tokens = 0;
     while let Some(item) = stream.next().await {
         let _ = item.expect("ok");
@@ -594,7 +598,10 @@ async fn paged_batch_last_request_stats_populates_after_completion() {
     assert_eq!(stats.tokens_prefilled, prompt.len() as u32);
     assert!(stats.prefill_ms >= 0.0, "prefill_ms is non-negative");
     assert!(stats.decode_ms >= 0.0, "decode_ms is non-negative");
-    assert_eq!(stats.cache_hit_tokens, 0, "paged path has no prefix cache yet");
+    assert_eq!(
+        stats.cache_hit_tokens, 0,
+        "paged path has no prefix cache yet"
+    );
     assert!(!stats.tool_call_limit_hit);
     let _ = std::fs::remove_file(&tmp);
 }
@@ -722,10 +729,8 @@ async fn paged_batch_active_slot_count_reflects_in_flight_requests() {
 fn paged_batch_rejects_batch_exceeding_max_slots() {
     let tmp = write_gguf("overflow");
     let batch = PagedBatchEngine::load(&tmp, 32, 1).expect("load");
-    let result = batch.generate_batched_token_ids(vec![
-        (vec![1, 2], greedy(1)),
-        (vec![3, 4], greedy(1)),
-    ]);
+    let result =
+        batch.generate_batched_token_ids(vec![(vec![1, 2], greedy(1)), (vec![3, 4], greedy(1))]);
     let msg = match result {
         Ok(_) => panic!("overflowing batch must fail"),
         Err(e) => e.to_string(),
@@ -761,9 +766,8 @@ fn paged_batch_grammar_matches_cpu_engine() {
     let prompt: Vec<i32> = vec![5, 1, 4, 2, 3, 6];
 
     // Contiguous reference on the SAME paged KV layout the engines share.
-    let mut cpu =
-        CpuEngine::load_with_options_and_layout(&tmp, 32, true, KvDtype::F32, "paged")
-            .expect("cpu engine load");
+    let mut cpu = CpuEngine::load_with_options_and_layout(&tmp, 32, true, KvDtype::F32, "paged")
+        .expect("cpu engine load");
     cpu.set_prefix_cache(false);
     let cpu_plain: Vec<i32> = cpu
         .generate_token_ids(&prompt, 4, &greedy(4))
@@ -815,7 +819,11 @@ fn paged_batch_string_stop_terminates_generation() {
         .into_iter()
         .next()
         .unwrap();
-    assert_eq!(full.len(), 4, "baseline must generate max_tokens (first token is not EOS)");
+    assert_eq!(
+        full.len(),
+        4,
+        "baseline must generate max_tokens (first token is not EOS)"
+    );
     let tok0 = full[0] as u32;
     let s0 = no_stop
         .tokenizer()
@@ -864,7 +872,9 @@ async fn paged_batch_streaming_string_stop_terminates() {
     // Baseline streaming run (no stop) to capture the first token's text.
     let eng = PagedBatchEngine::load(&tmp, 32, 1).expect("load");
     let mut full: Vec<i32> = Vec::new();
-    let mut s = eng.submit_streaming(prompt.clone(), greedy(4)).expect("submit");
+    let mut s = eng
+        .submit_streaming(prompt.clone(), greedy(4))
+        .expect("submit");
     while let Some(item) = s.next().await {
         full.push(item.expect("tok").id as i32);
     }
@@ -882,7 +892,9 @@ async fn paged_batch_streaming_string_stop_terminates() {
         ..greedy(4)
     };
     let mut stopped: Vec<i32> = Vec::new();
-    let mut s2 = eng.submit_streaming(prompt.clone(), stop_sampling).expect("submit stop");
+    let mut s2 = eng
+        .submit_streaming(prompt.clone(), stop_sampling)
+        .expect("submit stop");
     while let Some(item) = s2.next().await {
         stopped.push(item.expect("tok").id as i32);
     }
@@ -939,8 +951,14 @@ async fn paged_batch_deadline_cancels_with_timeout_and_flips_flag() {
             }
         }
     }
-    assert!(saw_timeout, "past-deadline request must end with a timeout terminal");
-    assert_eq!(tokens, 0, "a request already past its deadline streams no tokens");
+    assert!(
+        saw_timeout,
+        "past-deadline request must end with a timeout terminal"
+    );
+    assert_eq!(
+        tokens, 0,
+        "a request already past its deadline streams no tokens"
+    );
     assert!(
         flag.load(Ordering::Acquire),
         "the deadline must flip the request's cancel flag"
@@ -980,7 +998,11 @@ async fn paged_batch_preempted_request_resumes_byte_identical() {
         out
     };
     drop(ref_engine);
-    assert_eq!(ref_a.len(), a_tokens as usize, "reference ran to max_tokens");
+    assert_eq!(
+        ref_a.len(),
+        a_tokens as usize,
+        "reference ran to max_tokens"
+    );
 
     // Contention engine: 1-page pool, 2 slots. A holding the single page means
     // admitting B cannot find free pages → B preempts the lower-priority A.
@@ -1102,10 +1124,9 @@ fn paged_hybrid_single_slot_matches_cpu_engine_greedy() {
     use rustllama_models::llama_arch::KvDtype;
     let tmp = write_hybrid_gguf("m1-vs-cpu");
 
-    let mut cpu = CpuEngine::load_with_options_and_layout(
-        &tmp, 64, true, KvDtype::F32, "contiguous",
-    )
-    .expect("cpu engine load (hybrid)");
+    let mut cpu =
+        CpuEngine::load_with_options_and_layout(&tmp, 64, true, KvDtype::F32, "contiguous")
+            .expect("cpu engine load (hybrid)");
     cpu.set_prefix_cache(false);
 
     let batch = PagedBatchEngine::load(&tmp, 64, 1).expect("paged hybrid load");

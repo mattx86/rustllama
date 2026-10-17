@@ -15,9 +15,13 @@ fn main() {
     let mut s = 0x12345u64;
     let mut src = vec![0f32; n];
     for v in src.iter_mut() {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u1 = ((s >> 11) as u32 & 0x00FF_FFFF) as f32 / (1u32 << 24) as f32;
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u2 = ((s >> 11) as u32 & 0x00FF_FFFF) as f32 / (1u32 << 24) as f32;
         // Box-Muller
         let mag = (-2.0 * u1.ln().max(-37.0)).sqrt();
@@ -26,9 +30,11 @@ fn main() {
     let src_pos = src.iter().filter(|v| **v > 0.0).count();
     let src_neg = src.iter().filter(|v| **v < 0.0).count();
     let src_rms = (src.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / n as f64).sqrt();
-    println!("source: rms={src_rms:.3e}, +ve={src_pos}/{n} ({:.1}%), -ve={src_neg}/{n} ({:.1}%)",
+    println!(
+        "source: rms={src_rms:.3e}, +ve={src_pos}/{n} ({:.1}%), -ve={src_neg}/{n} ({:.1}%)",
         100.0 * src_pos as f32 / n as f32,
-        100.0 * src_neg as f32 / n as f32);
+        100.0 * src_neg as f32 / n as f32
+    );
 
     let mut enc = vec![0u8; N_BLOCKS * BLOCK_IQ1_S_BYTES];
     encode_iq1_s(&src, &mut enc);
@@ -49,11 +55,20 @@ fn main() {
     for b in 0..N_BLOCKS {
         let block = &dec[b * QK_K..(b + 1) * QK_K];
         let mean: f32 = block.iter().sum::<f32>() / QK_K as f32;
-        if mean < 0.0 { neg_block_count += 1; } else if mean > 0.0 { pos_block_count += 1; }
+        if mean < 0.0 {
+            neg_block_count += 1;
+        } else if mean > 0.0 {
+            pos_block_count += 1;
+        }
     }
     println!("per-block mean: {neg_block_count}/{N_BLOCKS} negative-mean, {pos_block_count}/{N_BLOCKS} positive-mean");
 
     // Reconstruction MSE
-    let mse: f64 = src.iter().zip(dec.iter()).map(|(a, b)| ((*a as f64) - (*b as f64)).powi(2)).sum::<f64>() / n as f64;
+    let mse: f64 = src
+        .iter()
+        .zip(dec.iter())
+        .map(|(a, b)| ((*a as f64) - (*b as f64)).powi(2))
+        .sum::<f64>()
+        / n as f64;
     println!("MSE = {mse:.3e} (RMSE = {:.3e})", mse.sqrt());
 }

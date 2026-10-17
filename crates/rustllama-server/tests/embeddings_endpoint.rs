@@ -118,12 +118,7 @@ path = "C:/models/some-bert-model.gguf"
 async fn embeddings_rejects_empty_input_with_400() {
     let (state, cfg) = build_state("empty-batch", "[server]\nport = 11434\n");
     let app = router(state);
-    let (status, body) = post_json(
-        app,
-        "/v1/embeddings",
-        serde_json::json!({ "input": [] }),
-    )
-    .await;
+    let (status, body) = post_json(app, "/v1/embeddings", serde_json::json!({ "input": [] })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let body_str = String::from_utf8_lossy(&body);
     assert!(
@@ -169,11 +164,11 @@ async fn embeddings_accepts_both_single_and_batch_input_shapes() {
 /// endpoint + lazy-load + response shape.
 #[tokio::test]
 async fn embeddings_returns_real_vectors_for_pretokenized_input() {
+    use rustllama_engine::MockEngine;
     use rustllama_gguf::synth::{write_synthetic_bert_gguf, SynthBert};
     use rustllama_server::AppState;
-    use std::sync::Arc;
-    use rustllama_engine::MockEngine;
     use rustllama_server::ServingModel;
+    use std::sync::Arc;
 
     let model_path = std::env::temp_dir().join("rustllama-embeddings-real-bert.gguf");
     let synth = SynthBert::default();
@@ -256,11 +251,11 @@ path = "{}"
 /// matching input order, each carrying its own d_model vector.
 #[tokio::test]
 async fn embeddings_batch_pretokenized_returns_per_input_vectors() {
+    use rustllama_engine::MockEngine;
     use rustllama_gguf::synth::{write_synthetic_bert_gguf, SynthBert};
     use rustllama_server::AppState;
-    use std::sync::Arc;
-    use rustllama_engine::MockEngine;
     use rustllama_server::ServingModel;
+    use std::sync::Arc;
 
     let model_path = std::env::temp_dir().join("rustllama-embeddings-batch-bert.gguf");
     let synth = SynthBert::default();
@@ -293,12 +288,8 @@ async fn embeddings_batch_pretokenized_returns_per_input_vectors() {
     let app = router(state);
 
     let batch = vec![vec![1i32, 2, 3], vec![4, 5, 6, 7], vec![8]];
-    let (status, body) = post_json(
-        app,
-        "/v1/embeddings",
-        serde_json::json!({ "input": batch }),
-    )
-    .await;
+    let (status, body) =
+        post_json(app, "/v1/embeddings", serde_json::json!({ "input": batch })).await;
     assert_eq!(status, StatusCode::OK);
     let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
     let data = v["data"].as_array().unwrap();
@@ -325,11 +316,11 @@ async fn embeddings_batch_pretokenized_returns_per_input_vectors() {
 /// rely on.
 #[tokio::test]
 async fn embeddings_text_input_returns_real_vectors() {
+    use rustllama_engine::MockEngine;
     use rustllama_gguf::synth::{write_synthetic_bert_gguf, SynthBert};
     use rustllama_server::AppState;
-    use std::sync::Arc;
-    use rustllama_engine::MockEngine;
     use rustllama_server::ServingModel;
+    use std::sync::Arc;
 
     let model_path = std::env::temp_dir().join("rustllama-embeddings-text-bert.gguf");
     let synth = SynthBert::default();
@@ -386,7 +377,9 @@ async fn embeddings_text_input_returns_real_vectors() {
         assert!(f.is_finite(), "embedding[{i}] = {f} is not finite");
     }
     // Total tokens for "hello world" with [CLS] / [SEP] wrap = 4.
-    let total = v["usage"]["total_tokens"].as_u64().expect("total_tokens u64");
+    let total = v["usage"]["total_tokens"]
+        .as_u64()
+        .expect("total_tokens u64");
     assert!(
         total >= 3,
         "expected at least [CLS] + word + [SEP] = 3 tokens, got {total}"
@@ -399,11 +392,11 @@ async fn embeddings_text_input_returns_real_vectors() {
 /// Batch of text inputs → 200 with per-input vectors.
 #[tokio::test]
 async fn embeddings_batch_text_returns_per_input_vectors() {
+    use rustllama_engine::MockEngine;
     use rustllama_gguf::synth::{write_synthetic_bert_gguf, SynthBert};
     use rustllama_server::AppState;
-    use std::sync::Arc;
-    use rustllama_engine::MockEngine;
     use rustllama_server::ServingModel;
+    use std::sync::Arc;
 
     let model_path = std::env::temp_dir().join("rustllama-embeddings-batchtext-bert.gguf");
     let synth = SynthBert::default();
@@ -461,11 +454,11 @@ async fn embeddings_batch_text_returns_per_input_vectors() {
 /// failed without re-running the whole batch.
 #[tokio::test]
 async fn embeddings_forward_error_surfaces_input_index() {
+    use rustllama_engine::MockEngine;
     use rustllama_gguf::synth::{write_synthetic_bert_gguf, SynthBert};
     use rustllama_server::AppState;
-    use std::sync::Arc;
-    use rustllama_engine::MockEngine;
     use rustllama_server::ServingModel;
+    use std::sync::Arc;
 
     let model_path = std::env::temp_dir().join("rustllama-embeddings-err-bert.gguf");
     let synth = SynthBert::default();
@@ -499,12 +492,8 @@ async fn embeddings_forward_error_surfaces_input_index() {
     // Second entry has a token id beyond synth vocab (32) →
     // TokenOutOfVocab → 400 with input_index = 1.
     let batch = vec![vec![1i32, 2], vec![1, 999]];
-    let (status, body) = post_json(
-        app,
-        "/v1/embeddings",
-        serde_json::json!({ "input": batch }),
-    )
-    .await;
+    let (status, body) =
+        post_json(app, "/v1/embeddings", serde_json::json!({ "input": batch })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
     assert_eq!(
@@ -649,7 +638,9 @@ async fn ollama_modern_embed_single_returns_batched_shape() {
     // Metadata fields the Ollama clients (langchain, etc.) read.
     assert!(v["total_duration"].is_u64());
     assert!(v["load_duration"].is_u64());
-    let count = v["prompt_eval_count"].as_u64().expect("prompt_eval_count u64");
+    let count = v["prompt_eval_count"]
+        .as_u64()
+        .expect("prompt_eval_count u64");
     assert!(count >= 3, "[CLS] + tokens + [SEP] ≥ 3 tokens, got {count}");
     let _ = std::fs::remove_file(&model_path);
     let _ = std::fs::remove_file(&cfg_path);
@@ -688,30 +679,15 @@ async fn ollama_modern_embed_batch_returns_per_input_vectors() {
 async fn ollama_embed_rejects_empty_input_with_400() {
     let (state, model_path, cfg_path) = build_state_with_synth_bert("empty-input");
     let app = router(state.clone());
-    let (status, _) = post_json(
-        app,
-        "/api/embed",
-        serde_json::json!({ "input": "" }),
-    )
-    .await;
+    let (status, _) = post_json(app, "/api/embed", serde_json::json!({ "input": "" })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     let app = router(state.clone());
-    let (status, _) = post_json(
-        app,
-        "/api/embed",
-        serde_json::json!({ "input": [] }),
-    )
-    .await;
+    let (status, _) = post_json(app, "/api/embed", serde_json::json!({ "input": [] })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     let app = router(state);
-    let (status, _) = post_json(
-        app,
-        "/api/embeddings",
-        serde_json::json!({ "prompt": "" }),
-    )
-    .await;
+    let (status, _) = post_json(app, "/api/embeddings", serde_json::json!({ "prompt": "" })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     let _ = std::fs::remove_file(&model_path);
@@ -749,8 +725,7 @@ async fn v1_models_advertises_embedding_capability_when_slot_enabled() {
     // Pre-load: dimensions is null (the field is skipped via
     // skip_serializing_if when None, so it's just absent).
     assert!(
-        embed_entry.get("dimensions").is_none()
-            || embed_entry["dimensions"].is_null(),
+        embed_entry.get("dimensions").is_none() || embed_entry["dimensions"].is_null(),
         "dimensions must be absent before first embed call: {embed_entry}"
     );
 

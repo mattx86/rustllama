@@ -104,12 +104,20 @@ mod tests {
 
     fn signs_pattern(n: usize) -> Vec<f32> {
         (0..n)
-            .map(|i| if (i * 2654435761usize) & 0x10 == 0 { 1.0 } else { -1.0 })
+            .map(|i| {
+                if (i * 2654435761usize) & 0x10 == 0 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            })
             .collect()
     }
 
     fn x_pattern(n: usize) -> Vec<f32> {
-        (0..n).map(|i| ((i * 37 + 11) % 61) as f32 * 0.05 - 1.4).collect()
+        (0..n)
+            .map(|i| ((i * 37 + 11) % 61) as f32 * 0.05 - 1.4)
+            .collect()
     }
 
     /// Dense reference: `R[r][c] = parity(r & c) ? -s : +s` scaled by
@@ -124,7 +132,11 @@ mod tests {
             for r in 0..block {
                 let mut acc = 0f64;
                 for c in 0..block {
-                    let h = if (r & c).count_ones() % 2 == 1 { -1.0 } else { 1.0 };
+                    let h = if (r & c).count_ones() % 2 == 1 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
                     acc += h * (signs[o + c] as f64) * (x[o + c] as f64);
                 }
                 out[o + r] = (acc * inv_sqrt) as f32;
@@ -203,13 +215,23 @@ mod tests {
         let chunk = 64usize;
         let n = chunk * 4; // one 256-wide "head" = 4 chunks
         let q = x_pattern(n);
-        let k: Vec<f32> = (0..n).map(|i| ((i * 53 + 7) % 97) as f32 * 0.03 - 1.2).collect();
-        let dot_before: f64 = q.iter().zip(&k).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+        let k: Vec<f32> = (0..n)
+            .map(|i| ((i * 53 + 7) % 97) as f32 * 0.03 - 1.2)
+            .collect();
+        let dot_before: f64 = q
+            .iter()
+            .zip(&k)
+            .map(|(a, b)| (*a as f64) * (*b as f64))
+            .sum();
         let mut qw = q.clone();
         let mut kw = k.clone();
         whiten_chunks_inplace(&mut qw, chunk);
         whiten_chunks_inplace(&mut kw, chunk);
-        let dot_after: f64 = qw.iter().zip(&kw).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
+        let dot_after: f64 = qw
+            .iter()
+            .zip(&kw)
+            .map(|(a, b)| (*a as f64) * (*b as f64))
+            .sum();
         assert!(
             (dot_before - dot_after).abs() < 1e-2 * dot_before.abs().max(1.0),
             "dot changed: {dot_before} vs {dot_after}"

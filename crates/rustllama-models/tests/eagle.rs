@@ -51,11 +51,20 @@ fn eagle_head_loads_from_companion_gguf() {
     assert_eq!(head.fc.out_dim(), d, "fusion out = d_model");
     assert_eq!(head.fc.in_dim(), 2 * d, "fusion in = 2·d_model");
     assert!(head.fc_bias.is_some(), "synth head emits fc.bias");
-    assert!(head.embed_norm.is_some() && head.hidden_norm.is_some(), "pre-fusion norms");
+    assert!(
+        head.embed_norm.is_some() && head.hidden_norm.is_some(),
+        "pre-fusion norms"
+    );
     assert_eq!(head.block.attn_norm.len(), d, "block attn_norm = d_model");
     // Default synth head ties to the base LM head / embedding.
-    assert!(head.lm_head.is_none(), "default head ties to the base output");
-    assert!(head.token_embd.is_none(), "default head reuses the base embedding");
+    assert!(
+        head.lm_head.is_none(),
+        "default head ties to the base output"
+    );
+    assert!(
+        head.token_embd.is_none(),
+        "default head reuses the base embedding"
+    );
 
     let _ = std::fs::remove_file(&head_path);
     let _ = std::fs::remove_file(&base_path);

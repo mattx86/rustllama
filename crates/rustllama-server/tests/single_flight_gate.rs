@@ -1,4 +1,4 @@
-﻿//! Regression test for the v1 single-flight contract: concurrent
+//! Regression test for the v1 single-flight contract: concurrent
 //! requests against the same model serialize on the per-model
 //! `Semaphore::new(1)` gate. If somebody bumps the permit count past
 //! 1 without first fixing the KV-cache race, this test fails by
@@ -13,9 +13,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
-use rustllama_engine::{
-    ChatMessage, Engine, Metrics, SamplingParams, Token, TokenStream,
-};
+use rustllama_engine::{ChatMessage, Engine, Metrics, SamplingParams, Token, TokenStream};
 use rustllama_server::{router, AppState, ServingModel};
 use tower::ServiceExt;
 
@@ -156,10 +154,7 @@ async fn two_concurrent_requests_against_same_model_serialize() {
     // serialize (total elapsed ≈ 2 × one_elapsed). If somebody removed
     // the gate, the two would overlap and total elapsed ≈ one_elapsed.
     let two_start = Instant::now();
-    let (a, b) = tokio::join!(
-        one_chat_request(app.clone()),
-        one_chat_request(app.clone()),
-    );
+    let (a, b) = tokio::join!(one_chat_request(app.clone()), one_chat_request(app.clone()),);
     assert_eq!(a, StatusCode::OK);
     assert_eq!(b, StatusCode::OK);
     let two_elapsed = two_start.elapsed();

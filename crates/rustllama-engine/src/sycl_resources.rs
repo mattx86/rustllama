@@ -64,9 +64,9 @@ pub enum SyclResourcesError {
 impl From<sk::SyclError> for SyclResourcesError {
     fn from(e: sk::SyclError) -> Self {
         match e {
-            sk::SyclError::Unavailable => SyclResourcesError::Unavailable(
-                "kernels-sycl crate in mock mode".into(),
-            ),
+            sk::SyclError::Unavailable => {
+                SyclResourcesError::Unavailable("kernels-sycl crate in mock mode".into())
+            }
             sk::SyclError::NoSuchDevice(i) => SyclResourcesError::NoSuchDevice(i),
             sk::SyclError::InvalidShape(s) => SyclResourcesError::InvalidShape(s),
             // FFI-caught C++ exception — surface as InvalidShape so
@@ -111,24 +111,18 @@ impl<T: Copy> UsmRawBuffer<T> {
     /// free this via `imp::usm_free(&stream, ...)` BEFORE dropping
     /// the stream. The struct's `Drop` impl handles this; outside
     /// `SyclEngineResources` no one creates `UsmRawBuffer` directly.
-    fn alloc(
-        stream: &sk::SyclStream,
-        len: usize,
-        what: &str,
-    ) -> Result<Self, SyclResourcesError> {
-        let n_bytes = len
-            .checked_mul(std::mem::size_of::<T>())
-            .ok_or_else(|| SyclResourcesError::InvalidShape(format!(
+    fn alloc(stream: &sk::SyclStream, len: usize, what: &str) -> Result<Self, SyclResourcesError> {
+        let n_bytes = len.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
+            SyclResourcesError::InvalidShape(format!(
                 "{what}: len*size overflow ({len} * {})",
                 std::mem::size_of::<T>(),
-            )))?;
+            ))
+        })?;
         let raw = sk::usm_alloc_shared(stream, n_bytes);
         let ptr = NonNull::new(raw as *mut T).ok_or_else(|| {
             // Distinguish mock-mode from real alloc failure.
             if matches!(sk::device_count(), Err(sk::SyclError::Unavailable)) {
-                SyclResourcesError::Unavailable(
-                    "kernels-sycl crate in mock mode".into(),
-                )
+                SyclResourcesError::Unavailable("kernels-sycl crate in mock mode".into())
             } else {
                 SyclResourcesError::AllocFailed {
                     what: what.to_string(),
@@ -316,14 +310,12 @@ impl SyclEngineResources {
             };
             kv_cache.push(UsmKvLayer { k, v });
         }
-        let q_scratch =
-            UsmRawBuffer::<u16>::alloc(&stream, q_len, "q_scratch").map_err(|e| {
-                // K/V buffers in kv_cache must be freed before
-                // stream — manual drop here.
-                e
-            })?;
-        let out_scratch =
-            UsmRawBuffer::<u16>::alloc(&stream, out_len, "out_scratch")?;
+        let q_scratch = UsmRawBuffer::<u16>::alloc(&stream, q_len, "q_scratch").map_err(|e| {
+            // K/V buffers in kv_cache must be freed before
+            // stream — manual drop here.
+            e
+        })?;
+        let out_scratch = UsmRawBuffer::<u16>::alloc(&stream, out_len, "out_scratch")?;
         Ok(Self {
             kv_cache,
             q_scratch,
@@ -563,12 +555,11 @@ mod tests {
         let n_kv_heads = 4;
         let head_dim = 64;
         let max_ctx = 128;
-        let mut r = match SyclEngineResources::new(
-            0, n_layers, n_heads, n_kv_heads, head_dim, max_ctx,
-        ) {
-            Ok(r) => r,
-            Err(e) => panic!("alloc failed: {e}"),
-        };
+        let mut r =
+            match SyclEngineResources::new(0, n_layers, n_heads, n_kv_heads, head_dim, max_ctx) {
+                Ok(r) => r,
+                Err(e) => panic!("alloc failed: {e}"),
+            };
         assert_eq!(r.n_layers(), n_layers);
         let kv_layer_len = n_kv_heads * max_ctx * head_dim;
         let q_len = n_heads * head_dim;

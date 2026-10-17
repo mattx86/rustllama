@@ -181,10 +181,7 @@ pub fn dequantize_row(packed: &[u8], scale: f32, bits: u8, out: &mut [f32]) {
             wht_inverse_inplace(out);
             return;
         }
-        if bits == 8
-            && is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma")
-        {
+        if bits == 8 && is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: runtime feature detection above. The kernel
             // writes exactly `out.len()` f32 values; tail handling
             // covers any `n` not a multiple of 8.
@@ -289,9 +286,9 @@ pub fn bytes_per_block(n: usize, bits: u8) -> usize {
 fn max_level_for(bits: u8) -> u8 {
     match bits {
         1 => 1,
-        2 => 1,           // codes ∈ {-1, 0, 0, 1} effectively (3 levels)
-        4 => 7,           // codes ∈ [-7, 7]; one slot unused
-        8 => 127,         // codes ∈ [-127, 127]; matches Q8_0's range
+        2 => 1,   // codes ∈ {-1, 0, 0, 1} effectively (3 levels)
+        4 => 7,   // codes ∈ [-7, 7]; one slot unused
+        8 => 127, // codes ∈ [-127, 127]; matches Q8_0's range
         _ => unreachable!("tq bits already validated upstream"),
     }
 }
@@ -522,14 +519,22 @@ pub fn gqa_attention_one_step_tq_capped_windowed(
     assert_eq!(k_scales.len(), n_kv_heads * max_ctx);
     assert_eq!(v_scales.len(), n_kv_heads * max_ctx);
     assert!(kv_len <= max_ctx);
-    assert_eq!(n_heads % n_kv_heads, 0, "GQA requires n_heads divisible by n_kv_heads");
+    assert_eq!(
+        n_heads % n_kv_heads,
+        0,
+        "GQA requires n_heads divisible by n_kv_heads"
+    );
 
     let n_gqa = n_heads / n_kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
     // Sliding-window lower bound: the query attends only `[start, kv_len)`.
     // `start == 0` (window 0 / ≥ kv_len) is full attention, bit-identical to the
     // pre-SWA kernel; `scores` collapses to `win = kv_len` entries.
-    let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+    let start = if window > 0 {
+        kv_len.saturating_sub(window)
+    } else {
+        0
+    };
     let start = start.min(kv_len);
     let win = kv_len - start;
     let mut scores = vec![0.0f32; win];
@@ -669,7 +674,11 @@ pub fn gqa_attention_flash_decode_tq_capped_windowed(
     assert_eq!(k_scales.len(), n_kv_heads * max_ctx);
     assert_eq!(v_scales.len(), n_kv_heads * max_ctx);
     assert!(kv_len <= max_ctx);
-    assert_eq!(n_heads % n_kv_heads, 0, "GQA requires n_heads divisible by n_kv_heads");
+    assert_eq!(
+        n_heads % n_kv_heads,
+        0,
+        "GQA requires n_heads divisible by n_kv_heads"
+    );
     if kv_len == 0 {
         for v in out.iter_mut() {
             *v = 0.0;
@@ -680,7 +689,11 @@ pub fn gqa_attention_flash_decode_tq_capped_windowed(
     let n_gqa = n_heads / n_kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
     // Decode window lower bound (0 ⇒ full attention).
-    let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+    let start = if window > 0 {
+        kv_len.saturating_sub(window)
+    } else {
+        0
+    };
 
     // Per-kv-head dequant scratch — same as the standard kernel.
     // We re-dequantize per kv_h but reuse across n_gqa Q heads,
@@ -716,7 +729,15 @@ pub fn gqa_attention_flash_decode_tq_capped_windowed(
             let q_h = &q[h * head_dim..(h + 1) * head_dim];
             let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
             online_softmax_attn_f32_scratch_capped_windowed(
-                q_h, &k_h_scratch, &v_h_scratch, out_h, head_dim, kv_len, scale, start, softcap,
+                q_h,
+                &k_h_scratch,
+                &v_h_scratch,
+                out_h,
+                head_dim,
+                kv_len,
+                scale,
+                start,
+                softcap,
             );
         }
     }
@@ -753,8 +774,21 @@ pub fn gqa_attention_flash_prefill_tq(
     // Thin wrapper: full-causal, no soft-cap. BIT-IDENTICAL to the pre-window
     // kernel.
     gqa_attention_flash_prefill_tq_capped_windowed(
-        q, k_packed, k_scales, v_packed, v_scales, bits, out, n_heads, n_kv_heads, head_dim,
-        max_ctx, kv_len_base, n_new, 0, 0.0,
+        q,
+        k_packed,
+        k_scales,
+        v_packed,
+        v_scales,
+        bits,
+        out,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        0,
+        0.0,
     );
 }
 
@@ -791,7 +825,11 @@ pub fn gqa_attention_flash_prefill_tq_capped_windowed(
     assert_eq!(k_scales.len(), n_kv_heads * max_ctx);
     assert_eq!(v_scales.len(), n_kv_heads * max_ctx);
     assert!(kv_len_base + n_new <= max_ctx);
-    assert_eq!(n_heads % n_kv_heads, 0, "GQA requires n_heads divisible by n_kv_heads");
+    assert_eq!(
+        n_heads % n_kv_heads,
+        0,
+        "GQA requires n_heads divisible by n_kv_heads"
+    );
     if n_new == 0 {
         return;
     }
@@ -831,7 +869,11 @@ pub fn gqa_attention_flash_prefill_tq_capped_windowed(
             let h = kv_h * n_gqa + qh_off;
             for i in 0..n_new {
                 let kv_len_i = kv_len_base + i + 1;
-                let start_i = if window > 0 { kv_len_i.saturating_sub(window) } else { 0 };
+                let start_i = if window > 0 {
+                    kv_len_i.saturating_sub(window)
+                } else {
+                    0
+                };
                 let q_off = (i * n_heads + h) * head_dim;
                 let q_h = &q[q_off..q_off + head_dim];
                 let out_off = (i * n_heads + h) * head_dim;
@@ -933,7 +975,11 @@ pub(crate) fn online_softmax_attn_f32_scratch_capped_windowed(
             s = softcap * (s / softcap).tanh();
         }
         let m_new = m.max(s);
-        let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+        let rescale = if m.is_finite() {
+            (m - m_new).exp()
+        } else {
+            0.0
+        };
         let p = (s - m_new).exp();
         l = l * rescale + p;
         let v_row = &v_scratch[t * head_dim..(t + 1) * head_dim];
@@ -970,7 +1016,11 @@ fn online_softmax_attn_f32_scratch_scalar(
         }
         s *= scale;
         let m_new = m.max(s);
-        let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+        let rescale = if m.is_finite() {
+            (m - m_new).exp()
+        } else {
+            0.0
+        };
         let p = (s - m_new).exp();
         l = l * rescale + p;
         let v_row = &v_scratch[t * head_dim..(t + 1) * head_dim];
@@ -1030,7 +1080,11 @@ unsafe fn online_softmax_attn_f32_scratch_avx512(
         }
         s *= scale;
         let m_new = m.max(s);
-        let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+        let rescale = if m.is_finite() {
+            (m - m_new).exp()
+        } else {
+            0.0
+        };
         let p = (s - m_new).exp();
         l = l * rescale + p;
         let v_row = &v_scratch[t * head_dim..(t + 1) * head_dim];
@@ -1105,10 +1159,7 @@ unsafe fn online_softmax_attn_f32_scratch_avx2(
             acc = _mm256_fmadd_ps(qv, kv, acc);
             d += 8;
         }
-        let mut sum128 = _mm_add_ps(
-            _mm256_castps256_ps128(acc),
-            _mm256_extractf128_ps(acc, 1),
-        );
+        let mut sum128 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
         sum128 = _mm_hadd_ps(sum128, sum128);
         sum128 = _mm_hadd_ps(sum128, sum128);
         let mut s = _mm_cvtss_f32(sum128);
@@ -1118,7 +1169,11 @@ unsafe fn online_softmax_attn_f32_scratch_avx2(
         }
         s *= scale;
         let m_new = m.max(s);
-        let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+        let rescale = if m.is_finite() {
+            (m - m_new).exp()
+        } else {
+            0.0
+        };
         let p = (s - m_new).exp();
         l = l * rescale + p;
         let v_row = &v_scratch[t * head_dim..(t + 1) * head_dim];
@@ -1207,19 +1262,13 @@ mod tests {
                 let mut k_row: Vec<f32> = (0..head_dim)
                     .map(|d| ((kv_h * 7 + t * 3 + d) % 13) as f32 * 0.1 - 0.6)
                     .collect();
-                k_scales[row_idx] = quantize_row(
-                    &mut k_row,
-                    bits,
-                    &mut k_packed[off..off + bytes_per_row],
-                );
+                k_scales[row_idx] =
+                    quantize_row(&mut k_row, bits, &mut k_packed[off..off + bytes_per_row]);
                 let mut v_row: Vec<f32> = (0..head_dim)
                     .map(|d| ((kv_h * 5 + t * 2 + d) % 11) as f32 * 0.15 - 0.7)
                     .collect();
-                v_scales[row_idx] = quantize_row(
-                    &mut v_row,
-                    bits,
-                    &mut v_packed[off..off + bytes_per_row],
-                );
+                v_scales[row_idx] =
+                    quantize_row(&mut v_row, bits, &mut v_packed[off..off + bytes_per_row]);
             }
         }
         // Synthetic Q for all n_new positions.
@@ -1228,10 +1277,19 @@ mod tests {
             .collect();
         let mut out_prefill = vec![0f32; n_new * n_heads * head_dim];
         gqa_attention_flash_prefill_tq(
-            &q, &k_packed, &k_scales, &v_packed, &v_scales,
-            bits, &mut out_prefill,
-            n_heads, n_kv_heads, head_dim, max_ctx,
-            kv_len_base, n_new,
+            &q,
+            &k_packed,
+            &k_scales,
+            &v_packed,
+            &v_scales,
+            bits,
+            &mut out_prefill,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
         );
         // Reference: call the TQ flash-decode kernel once per
         // new position with kv_len = kv_len_base + i + 1 (causal).
@@ -1242,9 +1300,8 @@ mod tests {
             let out_slice =
                 &mut out_reference[i * n_heads * head_dim..(i + 1) * n_heads * head_dim];
             gqa_attention_flash_decode_tq(
-                q_slice, &k_packed, &k_scales, &v_packed, &v_scales,
-                bits, out_slice,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_len_i,
+                q_slice, &k_packed, &k_scales, &v_packed, &v_scales, bits, out_slice, n_heads,
+                n_kv_heads, head_dim, max_ctx, kv_len_i,
             );
         }
         let mut max_err = 0f32;
@@ -1302,14 +1359,32 @@ mod tests {
         let mut out_standard = vec![0f32; n_heads * head_dim];
         let mut out_flash = vec![0f32; n_heads * head_dim];
         gqa_attention_one_step_tq(
-            &q, &k_packed, &k_scales, &v_packed, &v_scales,
-            bits, &mut out_standard,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            &q,
+            &k_packed,
+            &k_scales,
+            &v_packed,
+            &v_scales,
+            bits,
+            &mut out_standard,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
         );
         gqa_attention_flash_decode_tq(
-            &q, &k_packed, &k_scales, &v_packed, &v_scales,
-            bits, &mut out_flash,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            &q,
+            &k_packed,
+            &k_scales,
+            &v_packed,
+            &v_scales,
+            bits,
+            &mut out_flash,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
         );
         let mut max_err = 0f32;
         for (a, b) in out_standard.iter().zip(out_flash.iter()) {
@@ -1375,8 +1450,8 @@ mod tests {
         // tq8 has 8 bits per coefficient → 256 levels → quantization
         // error should be well under 1% of the row's max-abs.
         let row = vec![
-            0.5f32, -1.2, 3.7, -0.1, 2.0, -2.5, 0.05, 4.4,
-            -3.3, 1.1, 0.9, -0.4, 1.8, -1.7, 2.2, -0.05,
+            0.5f32, -1.2, 3.7, -0.1, 2.0, -2.5, 0.05, 4.4, -3.3, 1.1, 0.9, -0.4, 1.8, -1.7, 2.2,
+            -0.05,
         ];
         let n = row.len();
         let mut work = row.clone();
@@ -1400,8 +1475,8 @@ mod tests {
         // tq4 has 4 bits → 15 levels (after symmetric clamp) → error
         // up to roughly max_abs / 14 per coefficient on average.
         let row = vec![
-            1.0f32, -0.5, 2.0, 0.25, -1.5, 3.0, -2.2, 0.8,
-            1.7, -0.3, 2.5, -1.1, 0.6, -2.8, 0.0, 1.4,
+            1.0f32, -0.5, 2.0, 0.25, -1.5, 3.0, -2.2, 0.8, 1.7, -0.3, 2.5, -1.1, 0.6, -2.8, 0.0,
+            1.4,
         ];
         let n = row.len();
         let mut work = row.clone();
@@ -1430,8 +1505,8 @@ mod tests {
         // of the entries — this is the weakest correctness claim that
         // still demonstrates the rotation didn't destroy the signal.
         let row = vec![
-            0.5f32, -1.2, 3.7, -0.1, 2.0, -2.5, 0.05, 4.4,
-            -3.3, 1.1, 0.9, -0.4, 1.8, -1.7, 2.2, -0.05,
+            0.5f32, -1.2, 3.7, -0.1, 2.0, -2.5, 0.05, 4.4, -3.3, 1.1, 0.9, -0.4, 1.8, -1.7, 2.2,
+            -0.05,
         ];
         let n = row.len();
         let mut work = row.clone();
@@ -1493,10 +1568,9 @@ mod tests {
         // (none here since 32 % 8 == 0) match. WHT also requires a
         // power-of-2 length.
         let row = vec![
-            0.5f32, -1.2, 3.7, -0.1, 2.0, -2.5, 0.05, 4.4,
-            -3.3, 1.1, 0.9, -0.4, 1.8, -1.7, 2.2, -0.05,
-            0.0, 5.5, -6.6, 7.7, -0.001, 2.0, -2.0, 3.0,
-            1.0, -1.0, 2.5, -3.5, 0.2, 4.1, -5.0, 6.0,
+            0.5f32, -1.2, 3.7, -0.1, 2.0, -2.5, 0.05, 4.4, -3.3, 1.1, 0.9, -0.4, 1.8, -1.7, 2.2,
+            -0.05, 0.0, 5.5, -6.6, 7.7, -0.001, 2.0, -2.0, 3.0, 1.0, -1.0, 2.5, -3.5, 0.2, 4.1,
+            -5.0, 6.0,
         ];
         let n = row.len();
         let mut work = row.clone();
@@ -1614,7 +1688,11 @@ mod tests {
         let bytes_per_row = bytes_per_block(head_dim, bits);
         let n_gqa = n_heads / n_kv_heads;
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+        let start = if window > 0 {
+            kv_len.saturating_sub(window)
+        } else {
+            0
+        };
         let mut kf = vec![0f32; n_kv_heads * kv_len * head_dim];
         let mut vf = vec![0f32; n_kv_heads * kv_len * head_dim];
         for kv_h in 0..n_kv_heads {
@@ -1622,8 +1700,18 @@ mod tests {
                 let row_idx = kv_h * max_ctx + t;
                 let p = row_idx * bytes_per_row;
                 let o = (kv_h * kv_len + t) * head_dim;
-                dequantize_row(&k_packed[p..p + bytes_per_row], k_scales[row_idx], bits, &mut kf[o..o + head_dim]);
-                dequantize_row(&v_packed[p..p + bytes_per_row], v_scales[row_idx], bits, &mut vf[o..o + head_dim]);
+                dequantize_row(
+                    &k_packed[p..p + bytes_per_row],
+                    k_scales[row_idx],
+                    bits,
+                    &mut kf[o..o + head_dim],
+                );
+                dequantize_row(
+                    &v_packed[p..p + bytes_per_row],
+                    v_scales[row_idx],
+                    bits,
+                    &mut vf[o..o + head_dim],
+                );
             }
         }
         for h in 0..n_heads {
@@ -1674,32 +1762,91 @@ mod tests {
         let bits = 4u8;
         let kv_len = 20;
         let (kp, ks, vp, vs) = build_tq_cache(n_kv_heads, head_dim, max_ctx, kv_len, bits);
-        let q: Vec<f32> = (0..n_heads * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.12).collect();
+        let q: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.12)
+            .collect();
 
         // Decode.
         let mut base = vec![0f32; n_heads * head_dim];
         let mut cw = vec![0f32; n_heads * head_dim];
-        gqa_attention_flash_decode_tq(&q, &kp, &ks, &vp, &vs, bits, &mut base, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
-        gqa_attention_flash_decode_tq_capped_windowed(&q, &kp, &ks, &vp, &vs, bits, &mut cw, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0);
+        gqa_attention_flash_decode_tq(
+            &q, &kp, &ks, &vp, &vs, bits, &mut base, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        );
+        gqa_attention_flash_decode_tq_capped_windowed(
+            &q, &kp, &ks, &vp, &vs, bits, &mut cw, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            0, 0.0,
+        );
         assert_eq!(base, cw, "flash-decode tq passthrough not bit-identical");
 
         // One-step (3-pass).
         let mut base_os = vec![0f32; n_heads * head_dim];
         let mut cw_os = vec![0f32; n_heads * head_dim];
-        gqa_attention_one_step_tq(&q, &kp, &ks, &vp, &vs, bits, &mut base_os, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
-        gqa_attention_one_step_tq_capped_windowed(&q, &kp, &ks, &vp, &vs, bits, &mut cw_os, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0);
+        gqa_attention_one_step_tq(
+            &q,
+            &kp,
+            &ks,
+            &vp,
+            &vs,
+            bits,
+            &mut base_os,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
+        );
+        gqa_attention_one_step_tq_capped_windowed(
+            &q, &kp, &ks, &vp, &vs, bits, &mut cw_os, n_heads, n_kv_heads, head_dim, max_ctx,
+            kv_len, 0, 0.0,
+        );
         assert_eq!(base_os, cw_os, "one-step tq passthrough not bit-identical");
 
         // Prefill.
         let kv_len_base = 8;
         let n_new = 6;
-        let (kp2, ks2, vp2, vs2) = build_tq_cache(n_kv_heads, head_dim, max_ctx, kv_len_base + n_new, bits);
-        let qp: Vec<f32> = (0..n_new * n_heads * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.12).collect();
+        let (kp2, ks2, vp2, vs2) =
+            build_tq_cache(n_kv_heads, head_dim, max_ctx, kv_len_base + n_new, bits);
+        let qp: Vec<f32> = (0..n_new * n_heads * head_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.12)
+            .collect();
         let mut base_pf = vec![0f32; n_new * n_heads * head_dim];
         let mut cw_pf = vec![0f32; n_new * n_heads * head_dim];
-        gqa_attention_flash_prefill_tq(&qp, &kp2, &ks2, &vp2, &vs2, bits, &mut base_pf, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new);
-        gqa_attention_flash_prefill_tq_capped_windowed(&qp, &kp2, &ks2, &vp2, &vs2, bits, &mut cw_pf, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, 0, 0.0);
-        assert_eq!(base_pf, cw_pf, "flash-prefill tq passthrough not bit-identical");
+        gqa_attention_flash_prefill_tq(
+            &qp,
+            &kp2,
+            &ks2,
+            &vp2,
+            &vs2,
+            bits,
+            &mut base_pf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+        );
+        gqa_attention_flash_prefill_tq_capped_windowed(
+            &qp,
+            &kp2,
+            &ks2,
+            &vp2,
+            &vs2,
+            bits,
+            &mut cw_pf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            0,
+            0.0,
+        );
+        assert_eq!(
+            base_pf, cw_pf,
+            "flash-prefill tq passthrough not bit-identical"
+        );
     }
 
     #[test]
@@ -1711,16 +1858,27 @@ mod tests {
         let bits = 4u8;
         let kv_len = 5;
         let (kp, ks, vp, vs) = build_tq_cache(n_kv_heads, head_dim, max_ctx, kv_len, bits);
-        let q: Vec<f32> = (0..n_heads * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.12).collect();
+        let q: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.12)
+            .collect();
 
         // (b) windowed: window=2, kv_len=5 — both the flash-decode and the
         // 3-pass one_step must match the naive windowed reference.
         let mut naive = vec![0f32; n_heads * head_dim];
-        naive_tq_decode_ref(&q, &kp, &ks, &vp, &vs, bits, &mut naive, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 2, 0.0);
+        naive_tq_decode_ref(
+            &q, &kp, &ks, &vp, &vs, bits, &mut naive, n_heads, n_kv_heads, head_dim, max_ctx,
+            kv_len, 2, 0.0,
+        );
         let mut flash = vec![0f32; n_heads * head_dim];
-        gqa_attention_flash_decode_tq_capped_windowed(&q, &kp, &ks, &vp, &vs, bits, &mut flash, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 2, 0.0);
+        gqa_attention_flash_decode_tq_capped_windowed(
+            &q, &kp, &ks, &vp, &vs, bits, &mut flash, n_heads, n_kv_heads, head_dim, max_ctx,
+            kv_len, 2, 0.0,
+        );
         let mut os = vec![0f32; n_heads * head_dim];
-        gqa_attention_one_step_tq_capped_windowed(&q, &kp, &ks, &vp, &vs, bits, &mut os, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 2, 0.0);
+        gqa_attention_one_step_tq_capped_windowed(
+            &q, &kp, &ks, &vp, &vs, bits, &mut os, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            2, 0.0,
+        );
         for ((f, o), n) in flash.iter().zip(os.iter()).zip(naive.iter()) {
             assert!((f - n).abs() < 1e-5, "windowed flash {f} vs naive {n}");
             assert!((o - n).abs() < 1e-5, "windowed one_step {o} vs naive {n}");
@@ -1728,11 +1886,44 @@ mod tests {
 
         // (c) soft-cap: softcap=50.0, full window.
         let mut naive_sc = vec![0f32; n_heads * head_dim];
-        naive_tq_decode_ref(&q, &kp, &ks, &vp, &vs, bits, &mut naive_sc, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 50.0);
+        naive_tq_decode_ref(
+            &q,
+            &kp,
+            &ks,
+            &vp,
+            &vs,
+            bits,
+            &mut naive_sc,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
+            0,
+            50.0,
+        );
         let mut flash_sc = vec![0f32; n_heads * head_dim];
-        gqa_attention_flash_decode_tq_capped_windowed(&q, &kp, &ks, &vp, &vs, bits, &mut flash_sc, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 50.0);
+        gqa_attention_flash_decode_tq_capped_windowed(
+            &q,
+            &kp,
+            &ks,
+            &vp,
+            &vs,
+            bits,
+            &mut flash_sc,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
+            0,
+            50.0,
+        );
         let mut os_sc = vec![0f32; n_heads * head_dim];
-        gqa_attention_one_step_tq_capped_windowed(&q, &kp, &ks, &vp, &vs, bits, &mut os_sc, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 50.0);
+        gqa_attention_one_step_tq_capped_windowed(
+            &q, &kp, &ks, &vp, &vs, bits, &mut os_sc, n_heads, n_kv_heads, head_dim, max_ctx,
+            kv_len, 0, 50.0,
+        );
         for ((f, o), n) in flash_sc.iter().zip(os_sc.iter()).zip(naive_sc.iter()) {
             assert!((f - n).abs() < 1e-5, "softcap flash {f} vs naive {n}");
             assert!((o - n).abs() < 1e-5, "softcap one_step {o} vs naive {n}");
@@ -1755,14 +1946,35 @@ mod tests {
         let softcap = 30.0;
         let total = kv_len_base + n_new;
         let (kp, ks, vp, vs) = build_tq_cache(n_kv_heads, head_dim, max_ctx, total, bits);
-        let q: Vec<f32> = (0..n_new * n_heads * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.12).collect();
+        let q: Vec<f32> = (0..n_new * n_heads * head_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.12)
+            .collect();
         let mut prefill = vec![0f32; n_new * n_heads * head_dim];
-        gqa_attention_flash_prefill_tq_capped_windowed(&q, &kp, &ks, &vp, &vs, bits, &mut prefill, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window, softcap);
+        gqa_attention_flash_prefill_tq_capped_windowed(
+            &q,
+            &kp,
+            &ks,
+            &vp,
+            &vs,
+            bits,
+            &mut prefill,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            window,
+            softcap,
+        );
         for i in 0..n_new {
             let kv_len_i = kv_len_base + i + 1;
             let q_i = &q[i * n_heads * head_dim..(i + 1) * n_heads * head_dim];
             let mut step = vec![0f32; n_heads * head_dim];
-            gqa_attention_flash_decode_tq_capped_windowed(q_i, &kp, &ks, &vp, &vs, bits, &mut step, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_i, window, softcap);
+            gqa_attention_flash_decode_tq_capped_windowed(
+                q_i, &kp, &ks, &vp, &vs, bits, &mut step, n_heads, n_kv_heads, head_dim, max_ctx,
+                kv_len_i, window, softcap,
+            );
             let got = &prefill[i * n_heads * head_dim..(i + 1) * n_heads * head_dim];
             for (g, s) in got.iter().zip(step.iter()) {
                 assert!((g - s).abs() < 1e-5, "capped prefill row {i}: {g} vs {s}");

@@ -108,8 +108,7 @@ async fn cancellation_mid_prefill_stops_within_a_few_forwards() {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    let tmp =
-        std::env::temp_dir().join("rustllama-chunked-prefill-cancel-timing.gguf");
+    let tmp = std::env::temp_dir().join("rustllama-chunked-prefill-cancel-timing.gguf");
     let params = SynthLlama::default();
     write_synthetic_llama_gguf(&tmp, &params);
     let mut engine = CpuEngine::load_with_tokenizer(&tmp, 32).expect("load");
@@ -152,12 +151,8 @@ async fn cancellation_mid_prefill_stops_within_a_few_forwards() {
 
     let cancel_start = Instant::now();
     tokio::task::spawn_blocking(move || {
-        let _ = cancel_engine.generate_token_ids_streaming(
-            &cancel_prompt,
-            &cancel_sampling,
-            None,
-            &tx,
-        );
+        let _ =
+            cancel_engine.generate_token_ids_streaming(&cancel_prompt, &cancel_sampling, None, &tx);
     })
     .await
     .unwrap();
@@ -206,7 +201,8 @@ async fn cancellation_mid_prefill_preserves_partial_cache() {
     // cancel. The blocking call to `generate_token_ids_streaming` will
     // notice `tx.is_closed()` and bail mid-prefill — but only after the
     // first chunk completes, since we poll between forward calls.
-    let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<rustllama_engine::Token, String>>(1);
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<std::result::Result<rustllama_engine::Token, String>>(1);
     drop(rx);
 
     let sampling = greedy(4);

@@ -162,14 +162,21 @@ async fn tune_batch_size_returns_full_envelope_on_synth_model() {
         "candidates is always an array (may have failed entries inline)"
     );
     let candidates = v["candidates"].as_array().unwrap();
-    assert_eq!(candidates.len(), 2, "one report row per requested candidate");
+    assert_eq!(
+        candidates.len(),
+        2,
+        "one report row per requested candidate"
+    );
     for c in candidates {
         assert!(c["batch_size"].as_u64().is_some(), "row has batch_size");
         assert!(c["warmup_ms"].as_f64().is_some(), "row has warmup_ms");
         // median_tps / max_tps / error are all nullable — at least
         // one of (median_tps, error) is populated per row.
         let has_result = c["median_tps"].as_f64().is_some() || c["error"].is_string();
-        assert!(has_result, "every row carries either a measurement or an error: {c}");
+        assert!(
+            has_result,
+            "every row carries either a measurement or an error: {c}"
+        );
     }
     // cache_path is null on mock-mode hosts (no SYCL → no
     // fingerprint → can't write the device-keyed file). Either

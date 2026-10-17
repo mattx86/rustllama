@@ -48,10 +48,18 @@ fn synth_mla_emits_deepseek2_metadata_and_tensors() {
 
     // KV path tensors + shapes. GGUF dims are `[in, out]`.
     let kv_a = g.tensor("blk.0.attn_kv_a_mqa.weight").expect("kv_a_mqa");
-    assert_eq!(kv_a.dims, vec![32, 16 + 8], "attn_kv_a_mqa = [d_model, kvr+rope]");
+    assert_eq!(
+        kv_a.dims,
+        vec![32, 16 + 8],
+        "attn_kv_a_mqa = [d_model, kvr+rope]"
+    );
     let kv_b = g.tensor("blk.0.attn_kv_b.weight").expect("kv_b");
     // out = n_heads*(qk_nope + v) = 2*(8+8) = 32.
-    assert_eq!(kv_b.dims, vec![16, 32], "attn_kv_b = [kvr, n_heads*(nope+v)]");
+    assert_eq!(
+        kv_b.dims,
+        vec![16, 32],
+        "attn_kv_b = [kvr, n_heads*(nope+v)]"
+    );
     assert!(g.tensor("blk.0.attn_kv_a_norm.weight").is_some());
     assert!(g.tensor("blk.0.attn_output.weight").is_some());
 
@@ -67,7 +75,10 @@ fn synth_mla_direct_q_variant_omits_low_rank_q() {
     };
     write_synthetic_deepseek_mla_gguf(&path, &p);
     let g = Gguf::open(&path).expect("open");
-    assert!(g.tensor("blk.0.attn_q.weight").is_some(), "direct Q present");
+    assert!(
+        g.tensor("blk.0.attn_q.weight").is_some(),
+        "direct Q present"
+    );
     assert!(g.tensor("blk.0.attn_q_a.weight").is_none(), "no low-rank Q");
     assert!(g.metadata_get("deepseek2.attention.q_lora_rank").is_none());
     let _ = std::fs::remove_file(&path);
@@ -90,9 +101,18 @@ fn synth_mla_moe_variant_emits_expert_tensors_after_dense_prefix() {
     let g = Gguf::open(&path).expect("open");
     assert_eq!(u32_meta(&g, "deepseek2.expert_count"), Some(4));
     // Layer 0 is dense (first_k_dense_replace), layers 1-2 are MoE.
-    assert!(g.tensor("blk.0.ffn_gate.weight").is_some(), "layer 0 dense FFN");
+    assert!(
+        g.tensor("blk.0.ffn_gate.weight").is_some(),
+        "layer 0 dense FFN"
+    );
     assert!(g.tensor("blk.0.ffn_gate_exps.weight").is_none());
-    assert!(g.tensor("blk.1.ffn_gate_exps.weight").is_some(), "layer 1 MoE FFN");
-    assert!(g.tensor("blk.1.ffn_gate_shexp.weight").is_some(), "shared expert");
+    assert!(
+        g.tensor("blk.1.ffn_gate_exps.weight").is_some(),
+        "layer 1 MoE FFN"
+    );
+    assert!(
+        g.tensor("blk.1.ffn_gate_shexp.weight").is_some(),
+        "shared expert"
+    );
     let _ = std::fs::remove_file(&path);
 }

@@ -185,9 +185,7 @@ fn prefix_cache_disabled_pool_zero_capacity() {
         ..SamplingParams::default()
     };
     let prompt = [3i32, 5, 7, 9, 11, 13, 15, 17, 19];
-    let _ = engine
-        .generate_token_ids(&prompt, 4, &greedy)
-        .expect("gen");
+    let _ = engine.generate_token_ids(&prompt, 4, &greedy).expect("gen");
     assert_eq!(
         engine.prefix_cache_snapshot_count(),
         0,
@@ -218,7 +216,10 @@ fn last_request_stats_populated_after_generate() {
     let _ = engine.generate_token_ids(&prompt, 3, &greedy).expect("gen");
 
     let s = engine.last_request_stats();
-    assert!(s.tokens_generated > 0, "must record at least 1 decode forward");
+    assert!(
+        s.tokens_generated > 0,
+        "must record at least 1 decode forward"
+    );
     assert!(s.decode_ms >= 0.0);
     assert!(s.prefill_ms >= 0.0);
     // First run: cache empty → all prompt tokens (except the held-back
@@ -227,7 +228,9 @@ fn last_request_stats_populated_after_generate() {
     assert_eq!(s.tokens_prefilled, (prompt.len() - 1) as u32);
 
     // Second run with the same prompt should hit the prefix cache.
-    let _ = engine.generate_token_ids(&prompt, 3, &greedy).expect("gen 2");
+    let _ = engine
+        .generate_token_ids(&prompt, 3, &greedy)
+        .expect("gen 2");
     let s2 = engine.last_request_stats();
     assert!(
         s2.cache_hit_tokens > 0,
@@ -442,7 +445,8 @@ fn four_beams_run_and_rank() {
             "beams must be ranked by adjusted score"
         );
         assert_ne!(
-            beams[i - 1].tokens, beams[i].tokens,
+            beams[i - 1].tokens,
+            beams[i].tokens,
             "returned beams must be distinct"
         );
     }

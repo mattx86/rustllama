@@ -31,7 +31,11 @@ const BLOCK_Q8_0_BYTES: usize = 34;
 /// stays symmetric around zero). Reference: `ggml_quantize_q8_0`
 /// in ggml-quants.c.
 pub fn encode_q8_0(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK, 0, "encode_q8_0: src.len() must be multiple of 32");
+    assert_eq!(
+        src.len() % QK,
+        0,
+        "encode_q8_0: src.len() must be multiple of 32"
+    );
     let n_blocks = src.len() / QK;
     assert_eq!(
         dst.len(),
@@ -72,7 +76,11 @@ const BLOCK_Q8_1_BYTES: usize = 36;
 /// activations don't have to recompute it. Reference: ggml-quants.c
 /// `block_q8_1` write path.
 pub fn encode_q8_1(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK, 0, "encode_q8_1: src.len() must be multiple of 32");
+    assert_eq!(
+        src.len() % QK,
+        0,
+        "encode_q8_1: src.len() must be multiple of 32"
+    );
     let n_blocks = src.len() / QK;
     assert_eq!(
         dst.len(),
@@ -120,7 +128,11 @@ const BLOCK_Q4_0_BYTES: usize = 18;
 /// is `qs[j]` low nibble → output position `j`, high nibble →
 /// position `j + 16`. Reference: ggml-quants.c `quantize_row_q4_0`.
 pub fn encode_q4_0(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK, 0, "encode_q4_0: src.len() must be multiple of 32");
+    assert_eq!(
+        src.len() % QK,
+        0,
+        "encode_q4_0: src.len() must be multiple of 32"
+    );
     let n_blocks = src.len() / QK;
     assert_eq!(
         dst.len(),
@@ -166,7 +178,11 @@ const BLOCK_Q4_1_BYTES: usize = 20;
 /// `q[i] = round((x[i] - m) / d) ∈ [0, 15]`. Reference:
 /// ggml-quants.c `quantize_row_q4_1`.
 pub fn encode_q4_1(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK, 0, "encode_q4_1: src.len() must be multiple of 32");
+    assert_eq!(
+        src.len() % QK,
+        0,
+        "encode_q4_1: src.len() must be multiple of 32"
+    );
     let n_blocks = src.len() / QK;
     assert_eq!(
         dst.len(),
@@ -216,7 +232,11 @@ const BLOCK_Q5_0_BYTES: usize = 22;
 /// `j+16` holds the 5th bit of output `j+16`. Reference:
 /// ggml-quants.c `quantize_row_q5_0`.
 pub fn encode_q5_0(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK, 0, "encode_q5_0: src.len() must be multiple of 32");
+    assert_eq!(
+        src.len() % QK,
+        0,
+        "encode_q5_0: src.len() must be multiple of 32"
+    );
     let n_blocks = src.len() / QK;
     assert_eq!(
         dst.len(),
@@ -269,7 +289,11 @@ const BLOCK_Q5_1_BYTES: usize = 24;
 /// `q[i] = round((x[i] - m) / d) ∈ [0, 31]`. Same qh-bit packing
 /// as Q5_0. Reference: ggml-quants.c `quantize_row_q5_1`.
 pub fn encode_q5_1(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK, 0, "encode_q5_1: src.len() must be multiple of 32");
+    assert_eq!(
+        src.len() % QK,
+        0,
+        "encode_q5_1: src.len() must be multiple of 32"
+    );
     let n_blocks = src.len() / QK;
     assert_eq!(
         dst.len(),
@@ -410,8 +434,7 @@ mod tests {
             );
             // s should equal d * sum(qs) — read both back and verify.
             let d = f16::from_le_bytes([q81[q81_off], q81[q81_off + 1]]).to_f32();
-            let s_stored =
-                f16::from_le_bytes([q81[q81_off + 2], q81[q81_off + 3]]).to_f32();
+            let s_stored = f16::from_le_bytes([q81[q81_off + 2], q81[q81_off + 3]]).to_f32();
             let mut sum: i32 = 0;
             for i in 0..QK {
                 sum += (q81[q81_off + 4 + i] as i8) as i32;

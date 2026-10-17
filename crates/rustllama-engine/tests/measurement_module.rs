@@ -43,13 +43,18 @@ fn placement_report_has_one_candidate_entry_per_input() {
         },
     );
     let candidates = vec![
-        PlacementPlan { n_gpu_layers: 0, overrides: Vec::new() },
-        PlacementPlan { n_gpu_layers: 2, overrides: Vec::new() },
+        PlacementPlan {
+            n_gpu_layers: 0,
+            overrides: Vec::new(),
+        },
+        PlacementPlan {
+            n_gpu_layers: 2,
+            overrides: Vec::new(),
+        },
     ];
-    let report = measure_placement_candidates(
-        &tmp, &candidates, 64, 4, 4, 2, &default_measurement_cfg(),
-    )
-    .expect("measurement must not error on synth model");
+    let report =
+        measure_placement_candidates(&tmp, &candidates, 64, 4, 4, 2, &default_measurement_cfg())
+            .expect("measurement must not error on synth model");
 
     assert_eq!(
         report.candidates.len(),
@@ -62,8 +67,7 @@ fn placement_report_has_one_candidate_entry_per_input() {
     if report.winner.is_some() {
         assert!(report.winner_tps > 0.0);
         let winner_n = report.winner.unwrap();
-        let n_gpu_in_candidates: Vec<u32> =
-            candidates.iter().map(|p| p.n_gpu_layers).collect();
+        let n_gpu_in_candidates: Vec<u32> = candidates.iter().map(|p| p.n_gpu_layers).collect();
         assert!(
             n_gpu_in_candidates.contains(&winner_n),
             "winner must be one of the candidates"
@@ -76,9 +80,8 @@ fn placement_report_has_one_candidate_entry_per_input() {
 fn placement_empty_candidates_returns_no_winner() {
     let tmp = std::env::temp_dir().join("rustllama-engine-meas-placement-empty.gguf");
     write_synthetic_llama_gguf(&tmp, &SynthLlama::default());
-    let report =
-        measure_placement_candidates(&tmp, &[], 64, 4, 4, 1, &default_measurement_cfg())
-            .expect("empty candidates must not error");
+    let report = measure_placement_candidates(&tmp, &[], 64, 4, 4, 1, &default_measurement_cfg())
+        .expect("empty candidates must not error");
     assert!(report.winner.is_none());
     assert_eq!(report.winner_tps, 0.0);
     assert!(report.candidates.is_empty());
@@ -103,8 +106,9 @@ fn batch_size_report_has_one_candidate_entry_per_input() {
         },
     );
     let candidates = vec![16usize, 32, 64];
-    let report = measure_batch_size_candidates(&tmp, &candidates, 64, 2, &default_measurement_cfg())
-        .expect("measurement must not error on synth model");
+    let report =
+        measure_batch_size_candidates(&tmp, &candidates, 64, 2, &default_measurement_cfg())
+            .expect("measurement must not error on synth model");
 
     assert_eq!(report.candidates.len(), candidates.len());
     if let Some(b) = report.winner {
@@ -134,8 +138,9 @@ fn batch_size_single_candidate_is_the_winner() {
 fn successful_candidates_have_no_error_field() {
     let tmp = std::env::temp_dir().join("rustllama-engine-meas-no-errors.gguf");
     write_synthetic_llama_gguf(&tmp, &SynthLlama::default());
-    let report = measure_batch_size_candidates(&tmp, &[16usize, 32], 16, 1, &default_measurement_cfg())
-        .expect("must succeed");
+    let report =
+        measure_batch_size_candidates(&tmp, &[16usize, 32], 16, 1, &default_measurement_cfg())
+            .expect("must succeed");
     for c in &report.candidates {
         if c.median_tps.is_some() {
             assert!(

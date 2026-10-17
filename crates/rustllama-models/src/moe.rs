@@ -173,7 +173,14 @@ pub fn route_topk(
 ) -> RoutedExperts {
     let mut expert_logits = vec![0f32; n_experts];
     let mut picks: Vec<(usize, f32)> = Vec::with_capacity(top_k);
-    route_topk_into(hidden, router, n_experts, top_k, &mut expert_logits, &mut picks);
+    route_topk_into(
+        hidden,
+        router,
+        n_experts,
+        top_k,
+        &mut expert_logits,
+        &mut picks,
+    );
     RoutedExperts { picks }
 }
 
@@ -352,9 +359,8 @@ pub fn route_topk_into_spec(
         let top_max = picks.first().map(|p| p.1).unwrap_or(0.0);
         let top_sum: f32 = picks.iter().map(|(_, w)| *w).sum();
         let renorm_factor = if top_sum > 0.0 { 1.0 / top_sum } else { 0.0 };
-        let hidden_rms = (hidden.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()
-            / hidden.len() as f64)
-            .sqrt();
+        let hidden_rms =
+            (hidden.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / hidden.len() as f64).sqrt();
         eprintln!(
             "  router: hidden_rms={:.3e} top_max={:.4} top_sum={:.4} renorm_factor={:.2}× picks=[{}]",
             hidden_rms,
@@ -467,7 +473,11 @@ fn spill_part_to_tensor(part: crate::accel::SpilledPart, orig: &Tensor) -> Optio
             if values.len() as u64 != orig.element_count() {
                 return None;
             }
-            Some(Tensor::from_vec_f32(orig.name.clone(), orig.shape.clone(), values))
+            Some(Tensor::from_vec_f32(
+                orig.name.clone(),
+                orig.shape.clone(),
+                values,
+            ))
         }
     }
 }
@@ -587,94 +597,96 @@ pub fn moe_ffn_one_into(
         // Routed experts done on-device. Fall through to the shared-expert
         // block, which accumulates into `out` exactly as in the CPU path.
     } else {
-    // q★ co-execution (tuner-resolved): with a nonzero split on a
-    // GPU-active layer, part of the picks dispatch to the GPU while
-    // the rest run CPU-concurrently. Pointless when experts are
-    // pinned to CPU anyway (the split would race two CPU branches
-    // over the same cores the inner matvecs already parallelize).
-    let split = crate::accel::moe_gpu_split_permille();
-    if split > 0
-        && picks.len() >= 2
-        && !crate::accel::moe_experts_cpu_enabled()
-        && crate::accel::gpu_active_for_current_layer()
-    {
-        moe_ffn_routed_split_exec(
-            hidden,
-            &block.gate_per_expert,
-            &block.up_per_expert,
-            &block.down_per_expert,
-            picks,
-            d_model,
-            d_ff,
-            out,
-            gate_buf,
-            up_buf,
-            ff_buf,
-            down_buf,
-            split,
-        );
-    } else {
-        for (expert_idx, weight) in picks.iter() {
-            // Per-expert views are pre-computed at load time
-            // (`LlamaWeights::from_gguf` MoE branch) and share storage
-            // with the parent 3D tensor via Storage::CpuOwnedSlice.
-            let w_gate_e = &block.gate_per_expert[*expert_idx];
-            let w_up_e = &block.up_per_expert[*expert_idx];
-            let w_down_e = &block.down_per_expert[*expert_idx];
+        // q★ co-execution (tuner-resolved): with a nonzero split on a
+        // GPU-active layer, part of the picks dispatch to the GPU while
+        // the rest run CPU-concurrently. Pointless when experts are
+        // pinned to CPU anyway (the split would race two CPU branches
+        // over the same cores the inner matvecs already parallelize).
+        let split = crate::accel::moe_gpu_split_permille();
+        if split > 0
+            && picks.len() >= 2
+            && !crate::accel::moe_experts_cpu_enabled()
+            && crate::accel::gpu_active_for_current_layer()
+        {
+            moe_ffn_routed_split_exec(
+                hidden,
+                &block.gate_per_expert,
+                &block.up_per_expert,
+                &block.down_per_expert,
+                picks,
+                d_model,
+                d_ff,
+                out,
+                gate_buf,
+                up_buf,
+                ff_buf,
+                down_buf,
+                split,
+            );
+        } else {
+            for (expert_idx, weight) in picks.iter() {
+                // Per-expert views are pre-computed at load time
+                // (`LlamaWeights::from_gguf` MoE branch) and share storage
+                // with the parent 3D tensor via Storage::CpuOwnedSlice.
+                let w_gate_e = &block.gate_per_expert[*expert_idx];
+                let w_up_e = &block.up_per_expert[*expert_idx];
+                let w_down_e = &block.down_per_expert[*expert_idx];
 
-            // Residency-aware spill gate: sample the pin cache BEFORE the
-            // touch below pins this expert (→ makes it resident). A hot
-            // (resident) expert keeps its pages RAM-locked, so serving it
-            // from the spill store would be pure overhead — reconstruct
-            // only on a true residency MISS. Default-OFF no-op.
-            let spill_miss = crate::accel::moe_spill_enabled()
-                && !crate::accel::expert_resident_by_gate(w_gate_e);
+                // Residency-aware spill gate: sample the pin cache BEFORE the
+                // touch below pins this expert (→ makes it resident). A hot
+                // (resident) expert keeps its pages RAM-locked, so serving it
+                // from the spill store would be pure overhead — reconstruct
+                // only on a true residency MISS. Default-OFF no-op.
+                let spill_miss = crate::accel::moe_spill_enabled()
+                    && !crate::accel::expert_resident_by_gate(w_gate_e);
 
-            // MoE LRU expert-pin cache: VirtualLock this hot expert's
-            // weight pages in RAM (when the cache is active + weights are
-            // zero-copy file-backed) so they stop re-faulting from disk.
-            // No-op when RUSTLLAMA_MOE_EXPERT_CACHE_MB=0. Released after
-            // the matvecs so eviction can reclaim it once cold.
-            let pin = crate::accel::expert_pin_touch(*expert_idx, w_gate_e, w_up_e, w_down_e);
+                // MoE LRU expert-pin cache: VirtualLock this hot expert's
+                // weight pages in RAM (when the cache is active + weights are
+                // zero-copy file-backed) so they stop re-faulting from disk.
+                // No-op when RUSTLLAMA_MOE_EXPERT_CACHE_MB=0. Released after
+                // the matvecs so eviction can reclaim it once cold.
+                let pin = crate::accel::expert_pin_touch(*expert_idx, w_gate_e, w_up_e, w_down_e);
 
-            // MoE disk-spill read-redirect (feature #5, opt-in). Default-
-            // OFF: `moe_spill_enabled()` is false → this whole block is
-            // skipped and the mmap path below runs byte-identically. When
-            // armed, an evicted+spilled expert (residency miss) is served
-            // from the secondary store instead of re-faulting its GGUF
-            // pages; a resident expert uses its hot mmap pages.
-            let spilled = if spill_miss {
-                moe_spill_redirect_expert(w_gate_e, w_up_e, w_down_e)
-            } else {
-                None
-            };
-            if let Some((sg, su, sd)) = spilled.as_ref() {
-                // Reconstructed tensors are freshly-allocated CPU buffers
-                // whose address changes per token; routing them through
-                // the USM dispatch (host-pointer-keyed weight cache) could
-                // serve a stale upload, so run the CPU kernels directly.
-                k::matvec_tensor(sg, hidden, gate_buf, d_ff, d_model);
-                k::matvec_tensor(su, hidden, up_buf, d_ff, d_model);
-                k::silu_mul_f32(gate_buf, up_buf, ff_buf);
-                k::matvec_tensor(sd, ff_buf, down_buf, d_model, d_ff);
-            } else {
-                // H4: fused gate+up matvec when the dtype has a fused
-                // kernel (currently Q4_K, Q8_0); otherwise falls back to
-                // two dispatches inside the helper. Saves one Level-Zero
-                // dispatch + activation re-load per expert.
-                crate::llama_arch::matvec_tensor_gate_up_fused_dispatch(
-                    w_gate_e, w_up_e, hidden, gate_buf, up_buf, d_ff, d_model,
-                );
-                k::silu_mul_f32(gate_buf, up_buf, ff_buf);
-                crate::llama_arch::matvec_tensor_dispatch(w_down_e, ff_buf, down_buf, d_model, d_ff);
+                // MoE disk-spill read-redirect (feature #5, opt-in). Default-
+                // OFF: `moe_spill_enabled()` is false → this whole block is
+                // skipped and the mmap path below runs byte-identically. When
+                // armed, an evicted+spilled expert (residency miss) is served
+                // from the secondary store instead of re-faulting its GGUF
+                // pages; a resident expert uses its hot mmap pages.
+                let spilled = if spill_miss {
+                    moe_spill_redirect_expert(w_gate_e, w_up_e, w_down_e)
+                } else {
+                    None
+                };
+                if let Some((sg, su, sd)) = spilled.as_ref() {
+                    // Reconstructed tensors are freshly-allocated CPU buffers
+                    // whose address changes per token; routing them through
+                    // the USM dispatch (host-pointer-keyed weight cache) could
+                    // serve a stale upload, so run the CPU kernels directly.
+                    k::matvec_tensor(sg, hidden, gate_buf, d_ff, d_model);
+                    k::matvec_tensor(su, hidden, up_buf, d_ff, d_model);
+                    k::silu_mul_f32(gate_buf, up_buf, ff_buf);
+                    k::matvec_tensor(sd, ff_buf, down_buf, d_model, d_ff);
+                } else {
+                    // H4: fused gate+up matvec when the dtype has a fused
+                    // kernel (currently Q4_K, Q8_0); otherwise falls back to
+                    // two dispatches inside the helper. Saves one Level-Zero
+                    // dispatch + activation re-load per expert.
+                    crate::llama_arch::matvec_tensor_gate_up_fused_dispatch(
+                        w_gate_e, w_up_e, hidden, gate_buf, up_buf, d_ff, d_model,
+                    );
+                    k::silu_mul_f32(gate_buf, up_buf, ff_buf);
+                    crate::llama_arch::matvec_tensor_dispatch(
+                        w_down_e, ff_buf, down_buf, d_model, d_ff,
+                    );
+                }
+
+                for j in 0..d_model {
+                    out[j] += weight * down_buf[j];
+                }
+                crate::accel::expert_pin_release(pin);
             }
-
-            for j in 0..d_model {
-                out[j] += weight * down_buf[j];
-            }
-            crate::accel::expert_pin_release(pin);
         }
-    }
     } // end grouped-FFN fallback (per-expert / split path)
 
     // Shared expert. DeepSeek-V3 runs it always-on at the routed-
@@ -733,7 +745,13 @@ pub fn moe_ffn_one_into(
             let mut su = vec![0.0f32; shared_d_ff];
             let mut sf = vec![0.0f32; shared_d_ff];
             crate::llama_arch::matvec_tensor_gate_up_fused_dispatch(
-                w_g, w_u, hidden, &mut sg, &mut su, shared_d_ff, d_model,
+                w_g,
+                w_u,
+                hidden,
+                &mut sg,
+                &mut su,
+                shared_d_ff,
+                d_model,
             );
             k::silu_mul_f32(&sg, &su, &mut sf);
             crate::llama_arch::matvec_tensor_dispatch(w_d, &sf, down_buf, d_model, shared_d_ff);
@@ -792,7 +810,16 @@ pub fn moe_ffn_one_into_parts(
     // D4+M4: hybrid MoE routing honours the arch's RouterSpec. Hybrid
     // GGUFs carry no routed bias (`exp_probs_b` is DeepSeek-V3 only), so
     // the bias is `None` here.
-    route_topk_into_spec(hidden, router, n_experts, top_k, spec, None, expert_logits, picks);
+    route_topk_into_spec(
+        hidden,
+        router,
+        n_experts,
+        top_k,
+        spec,
+        None,
+        expert_logits,
+        picks,
+    );
     // Readahead hint — see moe_ffn_one_into.
     crate::accel::note_routed_experts(picks);
 
@@ -852,7 +879,9 @@ pub fn moe_ffn_one_into_parts(
                     w_gate_e, w_up_e, hidden, gate_buf, up_buf, d_ff, d_model,
                 );
                 k::silu_mul_f32(gate_buf, up_buf, ff_buf);
-                crate::llama_arch::matvec_tensor_dispatch(w_down_e, ff_buf, down_buf, d_model, d_ff);
+                crate::llama_arch::matvec_tensor_dispatch(
+                    w_down_e, ff_buf, down_buf, d_model, d_ff,
+                );
             }
 
             for j in 0..d_model {
@@ -866,9 +895,8 @@ pub fn moe_ffn_one_into_parts(
     // so we can isolate routed-expert magnitude from shared-expert
     // magnitude. Critical for diagnosing the layer-3 MoE explosion.
     if debug_moe_split_enabled() {
-        let routed_rms = (out.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()
-            / out.len() as f64)
-            .sqrt();
+        let routed_rms =
+            (out.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / out.len() as f64).sqrt();
         let routed_min = out.iter().cloned().fold(f32::INFINITY, f32::min);
         let routed_max = out.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         eprintln!(
@@ -931,7 +959,13 @@ pub fn moe_ffn_one_into_parts(
                 let mut su = vec![0.0f32; shared_d_ff];
                 let mut sf = vec![0.0f32; shared_d_ff];
                 crate::llama_arch::matvec_tensor_gate_up_fused_dispatch(
-                    w_g, w_u, hidden, &mut sg, &mut su, shared_d_ff, d_model,
+                    w_g,
+                    w_u,
+                    hidden,
+                    &mut sg,
+                    &mut su,
+                    shared_d_ff,
+                    d_model,
                 );
                 k::silu_mul_f32(&sg, &su, &mut sf);
                 crate::llama_arch::matvec_tensor_dispatch(w_d, &sf, down_buf, d_model, shared_d_ff);
@@ -1042,10 +1076,20 @@ pub fn moe_ffn_chunk_into_parts(
                 .copy_from_slice(&hidden_rows[t * d_model..(t + 1) * d_model]);
         }
         crate::llama_arch::matvec_tensor_batched_dispatch(
-            w_gate_e, &x_gather[..g * d_model], &mut gate_rows[..g * d_ff], d_ff, d_model, g,
+            w_gate_e,
+            &x_gather[..g * d_model],
+            &mut gate_rows[..g * d_ff],
+            d_ff,
+            d_model,
+            g,
         );
         crate::llama_arch::matvec_tensor_batched_dispatch(
-            w_up_e, &x_gather[..g * d_model], &mut up_rows[..g * d_ff], d_ff, d_model, g,
+            w_up_e,
+            &x_gather[..g * d_model],
+            &mut up_rows[..g * d_ff],
+            d_ff,
+            d_model,
+            g,
         );
         for i in 0..g {
             k::silu_mul_f32(
@@ -1055,7 +1099,12 @@ pub fn moe_ffn_chunk_into_parts(
             );
         }
         crate::llama_arch::matvec_tensor_batched_dispatch(
-            w_down_e, &ff_rows[..g * d_ff], &mut down_rows[..g * d_model], d_model, d_ff, g,
+            w_down_e,
+            &ff_rows[..g * d_ff],
+            &mut down_rows[..g * d_model],
+            d_model,
+            d_ff,
+            g,
         );
         for (i, (t, w)) in assigned.iter().enumerate() {
             let dst = &mut out_rows[t * d_model..(t + 1) * d_model];
@@ -1086,10 +1135,20 @@ pub fn moe_ffn_chunk_into_parts(
         let mut sh_ff = vec![0.0f32; n_tokens * shared_d_ff];
         let mut sh_down = vec![0.0f32; n_tokens * d_model];
         crate::llama_arch::matvec_tensor_batched_dispatch(
-            w_g, hidden_rows, &mut sh_gate, shared_d_ff, d_model, n_tokens,
+            w_g,
+            hidden_rows,
+            &mut sh_gate,
+            shared_d_ff,
+            d_model,
+            n_tokens,
         );
         crate::llama_arch::matvec_tensor_batched_dispatch(
-            w_u, hidden_rows, &mut sh_up, shared_d_ff, d_model, n_tokens,
+            w_u,
+            hidden_rows,
+            &mut sh_up,
+            shared_d_ff,
+            d_model,
+            n_tokens,
         );
         for i in 0..n_tokens {
             k::silu_mul_f32(
@@ -1099,12 +1158,23 @@ pub fn moe_ffn_chunk_into_parts(
             );
         }
         crate::llama_arch::matvec_tensor_batched_dispatch(
-            w_d, &sh_ff, &mut sh_down, d_model, shared_d_ff, n_tokens,
+            w_d,
+            &sh_ff,
+            &mut sh_down,
+            d_model,
+            shared_d_ff,
+            n_tokens,
         );
         for t in 0..n_tokens {
             let shared_weight = if let Some(sr) = shared_router {
                 let mut s = [0.0f32; 1];
-                k::matvec_tensor(sr, &hidden_rows[t * d_model..(t + 1) * d_model], &mut s, 1, d_model);
+                k::matvec_tensor(
+                    sr,
+                    &hidden_rows[t * d_model..(t + 1) * d_model],
+                    &mut s,
+                    1,
+                    d_model,
+                );
                 // Numerically stable sigmoid (same branch as the
                 // per-token path).
                 if s[0] >= 0.0 {
@@ -1192,7 +1262,9 @@ fn moe_ffn_routed_split_exec(
                     w_gate_e, w_up_e, hidden, gate_buf, up_buf, d_ff, d_model,
                 );
                 k::silu_mul_f32(gate_buf, up_buf, ff_buf);
-                crate::llama_arch::matvec_tensor_dispatch(w_down_e, ff_buf, down_buf, d_model, d_ff);
+                crate::llama_arch::matvec_tensor_dispatch(
+                    w_down_e, ff_buf, down_buf, d_model, d_ff,
+                );
                 for j in 0..d_model {
                     out[j] += weight * down_buf[j];
                 }
@@ -1334,8 +1406,19 @@ mod tests {
         let mut ff_buf = vec![0.0f32; d_ff];
         let mut down_buf = vec![0.0f32; d_model];
         moe_ffn_routed_split_exec(
-            &hidden, &gates, &ups, &downs, &picks, d_model, d_ff, &mut out, &mut gate_buf,
-            &mut up_buf, &mut ff_buf, &mut down_buf, 334,
+            &hidden,
+            &gates,
+            &ups,
+            &downs,
+            &picks,
+            d_model,
+            d_ff,
+            &mut out,
+            &mut gate_buf,
+            &mut up_buf,
+            &mut ff_buf,
+            &mut down_buf,
+            334,
         );
 
         for j in 0..d_model {
@@ -1378,7 +1461,9 @@ mod tests {
         let sh_up = mk(10, d_ff, d_model, "shu");
         let sh_down = mk(11, d_model, d_ff, "shd");
         let sh_router = tensor_f16_from_rowmajor(
-            &(0..d_model).map(|i| (i as f32) * 0.03 - 0.1).collect::<Vec<_>>(),
+            &(0..d_model)
+                .map(|i| (i as f32) * 0.03 - 0.1)
+                .collect::<Vec<_>>(),
             1,
             d_model,
             "shr",
@@ -1460,8 +1545,8 @@ mod tests {
     #[test]
     fn split_exec_gpu_set_sizing_clamps() {
         for (len, split, expect_gpu) in [
-            (2usize, 1u32, 1usize),   // rounds to 0 → clamped up
-            (2, 999, 1),              // rounds to 2 → clamped down
+            (2usize, 1u32, 1usize), // rounds to 0 → clamped up
+            (2, 999, 1),            // rounds to 2 → clamped down
             (8, 250, 2),
             (8, 500, 4),
             (3, 334, 1),
@@ -1600,13 +1685,24 @@ mod tests {
         // qwen2moe: norm_topk=false → the top-K weights stay the raw
         // softmax probabilities (they do NOT sum to 1).
         let logits = vec![1.0, 3.0, 2.0, 0.0];
-        let spec = RouterSpec { norm_topk: false, ..Default::default() };
+        let spec = RouterSpec {
+            norm_topk: false,
+            ..Default::default()
+        };
         let picks = run_spec(&logits, 2, &spec, None);
         // softmax([1,3,2,0]) ≈ [0.0871, 0.6439, 0.2369, 0.0321]; top-2 = 1,2.
         assert_eq!(picks[0].0, 1);
         assert_eq!(picks[1].0, 2);
-        assert!((picks[0].1 - 0.6439).abs() < 1e-3, "raw prob, got {}", picks[0].1);
-        assert!((picks[1].1 - 0.2369).abs() < 1e-3, "raw prob, got {}", picks[1].1);
+        assert!(
+            (picks[0].1 - 0.6439).abs() < 1e-3,
+            "raw prob, got {}",
+            picks[0].1
+        );
+        assert!(
+            (picks[1].1 - 0.2369).abs() < 1e-3,
+            "raw prob, got {}",
+            picks[1].1
+        );
         let sum: f32 = picks.iter().map(|(_, w)| *w).sum();
         assert!((sum - 0.8808).abs() < 1e-3, "no-renorm sum < 1, got {sum}");
     }
@@ -1624,20 +1720,35 @@ mod tests {
         // sigmoid ≈ [0.7311, 0.9526, 0.8808, 0.5]; top-2 = 1, 2.
         assert_eq!(picks[0].0, 1);
         assert_eq!(picks[1].0, 2);
-        assert!((picks[0].1 - 0.9526).abs() < 1e-3, "sigmoid weight, got {}", picks[0].1);
-        assert!((picks[1].1 - 0.8808).abs() < 1e-3, "sigmoid weight, got {}", picks[1].1);
+        assert!(
+            (picks[0].1 - 0.9526).abs() < 1e-3,
+            "sigmoid weight, got {}",
+            picks[0].1
+        );
+        assert!(
+            (picks[1].1 - 0.8808).abs() < 1e-3,
+            "sigmoid weight, got {}",
+            picks[1].1
+        );
     }
 
     #[test]
     fn spec_weights_scale_multiplies_final_weights() {
         // routed_scaling_factor: renormalized weights × 2.5 → sum 2.5.
         let logits = vec![1.0, 3.0, 2.0, 0.0];
-        let spec = RouterSpec { weights_scale: 2.5, ..Default::default() };
+        let spec = RouterSpec {
+            weights_scale: 2.5,
+            ..Default::default()
+        };
         let picks = run_spec(&logits, 2, &spec, None);
         let sum: f32 = picks.iter().map(|(_, w)| *w).sum();
         assert!((sum - 2.5).abs() < 1e-3, "sum == weights_scale, got {sum}");
         // w0 = (0.6439/0.8808) * 2.5 ≈ 1.8276.
-        assert!((picks[0].1 - 1.8276).abs() < 2e-3, "scaled weight, got {}", picks[0].1);
+        assert!(
+            (picks[0].1 - 1.8276).abs() < 2e-3,
+            "scaled weight, got {}",
+            picks[0].1
+        );
     }
 
     #[test]
@@ -1648,7 +1759,10 @@ mod tests {
         // Without bias, top-1 would be expert 1 (highest logit). The bias
         // on expert 0 flips the selection to expert 0.
         let bias = vec![10.0, 0.0, 0.0, 0.0];
-        let spec = RouterSpec { norm_topk: false, ..Default::default() };
+        let spec = RouterSpec {
+            norm_topk: false,
+            ..Default::default()
+        };
         let picks = run_spec(&logits, 1, &spec, Some(&bias));
         // softmax([0,1,0,0]) ≈ [0.1749, 0.4753, 0.1749, 0.1749].
         assert_eq!(picks[0].0, 0, "bias flips the selection to expert 0");
@@ -1677,7 +1791,10 @@ mod tests {
         // expert 3's 0.0871) is EXCLUDED because its group lost.
         let idxs: Vec<usize> = picks.iter().map(|p| p.0).collect();
         assert_eq!(idxs, vec![2, 3], "only the kept group's experts selected");
-        assert!(!idxs.contains(&1), "a higher-score expert in a dropped group is excluded");
+        assert!(
+            !idxs.contains(&1),
+            "a higher-score expert in a dropped group is excluded"
+        );
     }
 
     // ----- expert_view ----------------------------------------------------
@@ -1692,8 +1809,7 @@ mod tests {
         let n_experts = 2usize;
         let d_out = 8usize;
         let d_in = 256usize;
-        let bytes_per_expert =
-            Dtype::Q4_KRaw.byte_size((d_out * d_in) as u64) as usize;
+        let bytes_per_expert = Dtype::Q4_KRaw.byte_size((d_out * d_in) as u64) as usize;
         assert_eq!(bytes_per_expert, 1152);
 
         // Build bytes where expert 0's first byte is 0x42, expert
@@ -1733,8 +1849,7 @@ mod tests {
         let n_experts = 4usize;
         let d_out = 4usize;
         let d_in = 256usize;
-        let bytes_per_expert =
-            Dtype::IQ4_XSRaw.byte_size((d_out * d_in) as u64) as usize;
+        let bytes_per_expert = Dtype::IQ4_XSRaw.byte_size((d_out * d_in) as u64) as usize;
         assert_eq!(bytes_per_expert, 544);
         let mut bytes = vec![0u8; n_experts * bytes_per_expert];
         for (e, marker) in [(0, 0x11u8), (1, 0x22), (2, 0x33), (3, 0x44)] {
@@ -1935,9 +2050,13 @@ mod tests {
         let gate0: Vec<f32> = (0..d_ff * d_model).map(|i| 0.01 * i as f32).collect();
         let gate1: Vec<f32> = (0..d_ff * d_model).map(|i| 0.02 * i as f32 + 0.1).collect();
         let up0: Vec<f32> = (0..d_ff * d_model).map(|i| 0.005 * i as f32).collect();
-        let up1: Vec<f32> = (0..d_ff * d_model).map(|i| 0.015 * i as f32 + 0.05).collect();
+        let up1: Vec<f32> = (0..d_ff * d_model)
+            .map(|i| 0.015 * i as f32 + 0.05)
+            .collect();
         let down0: Vec<f32> = (0..d_model * d_ff).map(|i| 0.001 * i as f32).collect();
-        let down1: Vec<f32> = (0..d_model * d_ff).map(|i| 0.003 * i as f32 + 0.02).collect();
+        let down1: Vec<f32> = (0..d_model * d_ff)
+            .map(|i| 0.003 * i as f32 + 0.02)
+            .collect();
         let block = build_synth_moe_block(
             d_model,
             d_ff,
@@ -2021,9 +2140,8 @@ mod tests {
             router_vals[1 * d_model + j] = 0.7;
             router_vals[3 * d_model + j] = 0.3;
         }
-        let per_expert = |seed: f32, n: usize| -> Vec<f32> {
-            (0..n).map(|i| seed + i as f32 * 0.01).collect()
-        };
+        let per_expert =
+            |seed: f32, n: usize| -> Vec<f32> { (0..n).map(|i| seed + i as f32 * 0.01).collect() };
         let block = build_synth_moe_block(
             d_model,
             d_ff,
@@ -2189,15 +2307,39 @@ mod tests {
         let gate_shared = vec![0.5, 0.5, 0.5, 0.5];
         let up_shared = vec![1.0, 1.0, 1.0, 1.0];
         let down_shared = vec![0.5, 0.5, 0.5, 0.5];
-        block.w_gate_shared = Some(tensor_f16_from_rowmajor(&gate_shared, d_ff, d_model, "g_sh"));
+        block.w_gate_shared = Some(tensor_f16_from_rowmajor(
+            &gate_shared,
+            d_ff,
+            d_model,
+            "g_sh",
+        ));
         block.w_up_shared = Some(tensor_f16_from_rowmajor(&up_shared, d_ff, d_model, "u_sh"));
-        block.w_down_shared = Some(tensor_f16_from_rowmajor(&down_shared, d_model, d_ff, "d_sh"));
+        block.w_down_shared = Some(tensor_f16_from_rowmajor(
+            &down_shared,
+            d_model,
+            d_ff,
+            "d_sh",
+        ));
 
         let hidden = vec![0.5, 0.5];
         let got = moe_ffn_one(&hidden, &block, d_model, d_ff, n_experts, 1);
 
-        let ref_routed = ref_swiglu(&hidden, &gate_picked, &up_picked, &down_picked, d_model, d_ff);
-        let ref_shared = ref_swiglu(&hidden, &gate_shared, &up_shared, &down_shared, d_model, d_ff);
+        let ref_routed = ref_swiglu(
+            &hidden,
+            &gate_picked,
+            &up_picked,
+            &down_picked,
+            d_model,
+            d_ff,
+        );
+        let ref_shared = ref_swiglu(
+            &hidden,
+            &gate_shared,
+            &up_shared,
+            &down_shared,
+            d_model,
+            d_ff,
+        );
         for i in 0..d_model {
             let expected = ref_routed[i] + ref_shared[i];
             assert!(

@@ -84,9 +84,7 @@ pub enum WriteError {
     UnknownTensor(String),
     #[error("finish_header called twice")]
     DoubleFinishHeader,
-    #[error(
-        "finish called before all declared tensors were written ({written} of {declared})"
-    )]
+    #[error("finish called before all declared tensors were written ({written} of {declared})")]
     UnwrittenTensors { written: usize, declared: usize },
     #[error("alignment must be a positive power of two, got {0}")]
     BadAlignment(u64),
@@ -171,11 +169,7 @@ impl<W: Write + Seek> GgufWriter<W> {
 
     /// Append a metadata key/value. Keys must be unique; duplicates
     /// are rejected.
-    pub fn add_metadata(
-        &mut self,
-        key: impl Into<String>,
-        value: MetadataValue,
-    ) -> Result<()> {
+    pub fn add_metadata(&mut self, key: impl Into<String>, value: MetadataValue) -> Result<()> {
         if self.state != State::Declaring {
             return Err(WriteError::MetadataAfterHeader);
         }
@@ -453,11 +447,7 @@ impl GgufMmapWriter {
     }
 
     /// Append a metadata key/value.
-    pub fn add_metadata(
-        &mut self,
-        key: impl Into<String>,
-        value: MetadataValue,
-    ) -> Result<()> {
+    pub fn add_metadata(&mut self, key: impl Into<String>, value: MetadataValue) -> Result<()> {
         if self.state != State::Declaring {
             return Err(WriteError::MetadataAfterHeader);
         }
@@ -818,10 +808,7 @@ fn write_metadata_value(buf: &mut Vec<u8>, value: &MetadataValue) {
             // Empty arrays default to U8 inner type (matches the
             // common llama.cpp convention; parser tolerates any
             // type id on an empty array).
-            let inner = items
-                .first()
-                .map(metadata_value_type_id)
-                .unwrap_or(META_U8);
+            let inner = items.first().map(metadata_value_type_id).unwrap_or(META_U8);
             write_u32(buf, inner);
             write_u64(buf, items.len() as u64);
             for item in items {
@@ -852,10 +839,7 @@ fn write_metadata_value_unwrapped(buf: &mut Vec<u8>, value: &MetadataValue) {
         // type tag + count). Rare in practice but the read path
         // supports them, so the write path must too for round-trip.
         MetadataValue::Array(items) => {
-            let inner = items
-                .first()
-                .map(metadata_value_type_id)
-                .unwrap_or(META_U8);
+            let inner = items.first().map(metadata_value_type_id).unwrap_or(META_U8);
             write_u32(buf, inner);
             write_u64(buf, items.len() as u64);
             for item in items {
@@ -910,12 +894,8 @@ mod tests {
             .unwrap();
 
         let f32_bytes2 = vec![0u8; 16 * 4];
-        w.declare_tensor(
-            "blk.0.attn_norm.weight",
-            vec![16],
-            GgmlType::F32,
-        )
-        .unwrap();
+        w.declare_tensor("blk.0.attn_norm.weight", vec![16], GgmlType::F32)
+            .unwrap();
 
         w.finish_header().unwrap();
         w.write_tensor_data("output_norm.weight", &f32_bytes)
@@ -934,10 +914,7 @@ mod tests {
         assert_eq!(g.tensors().len(), 2);
         assert_eq!(g.metadata().len(), 3);
         assert_eq!(g.architecture(), Some("llama"));
-        assert_eq!(
-            g.tensor("output_norm.weight").unwrap().dims,
-            vec![8u64]
-        );
+        assert_eq!(g.tensor("output_norm.weight").unwrap().dims, vec![8u64]);
         assert_eq!(
             g.tensor("blk.0.attn_norm.weight").unwrap().dtype,
             GgmlType::F32
@@ -949,9 +926,7 @@ mod tests {
     #[test]
     fn declare_tensor_rejects_empty_dims() {
         let mut w = GgufWriter::new(Cursor::new(Vec::new()));
-        let err = w
-            .declare_tensor("bad", vec![], GgmlType::F32)
-            .unwrap_err();
+        let err = w.declare_tensor("bad", vec![], GgmlType::F32).unwrap_err();
         assert!(matches!(err, WriteError::EmptyDims { .. }));
     }
 
@@ -968,9 +943,7 @@ mod tests {
     fn declare_tensor_rejects_duplicate_name() {
         let mut w = GgufWriter::new(Cursor::new(Vec::new()));
         w.declare_tensor("dup", vec![4], GgmlType::F32).unwrap();
-        let err = w
-            .declare_tensor("dup", vec![8], GgmlType::F32)
-            .unwrap_err();
+        let err = w.declare_tensor("dup", vec![8], GgmlType::F32).unwrap_err();
         assert!(matches!(err, WriteError::DuplicateTensor(_)));
     }
 
@@ -978,9 +951,7 @@ mod tests {
     fn add_metadata_rejects_duplicate_key() {
         let mut w = GgufWriter::new(Cursor::new(Vec::new()));
         w.add_metadata("key", MetadataValue::U32(1)).unwrap();
-        let err = w
-            .add_metadata("key", MetadataValue::U32(2))
-            .unwrap_err();
+        let err = w.add_metadata("key", MetadataValue::U32(2)).unwrap_err();
         assert!(matches!(err, WriteError::DuplicateMetadata(_)));
     }
 
@@ -1051,8 +1022,7 @@ mod tests {
         w.write_tensor_data("t", &[0u8; 16]).unwrap();
         let cursor = w.finish().unwrap();
         let bytes = cursor.into_inner();
-        let tmp =
-            std::env::temp_dir().join("rustllama_gguf_writer_alignment.gguf");
+        let tmp = std::env::temp_dir().join("rustllama_gguf_writer_alignment.gguf");
         std::fs::write(&tmp, &bytes).unwrap();
         let g = Gguf::open(&tmp).unwrap();
         assert_eq!(g.alignment(), 64);
@@ -1086,10 +1056,12 @@ mod tests {
         .unwrap();
         w.add_metadata("llama.block_count", MetadataValue::U32(2))
             .unwrap();
-        w.declare_tensor("a.weight", vec![8], GgmlType::F32).unwrap();
+        w.declare_tensor("a.weight", vec![8], GgmlType::F32)
+            .unwrap();
         // 256-element Q4_K-sized region (144 bytes) — exercises the
         // alignment-padded layout.
-        w.declare_tensor("b.weight", vec![256], GgmlType::Q4_K).unwrap();
+        w.declare_tensor("b.weight", vec![256], GgmlType::Q4_K)
+            .unwrap();
         w.finish_header().unwrap();
 
         // Fill tensor a directly via the zero-copy API.
@@ -1137,7 +1109,8 @@ mod tests {
         let tmp = std::env::temp_dir().join("rustllama_gguf_mmap_double.gguf");
         let _ = std::fs::remove_file(&tmp);
         let mut w = GgufMmapWriter::create(&tmp).unwrap();
-        w.declare_tensor("t.weight", vec![4], GgmlType::F32).unwrap();
+        w.declare_tensor("t.weight", vec![4], GgmlType::F32)
+            .unwrap();
         w.finish_header().unwrap();
         let _first = w.tensor_region_mut("t.weight").unwrap();
         let err = w.tensor_region_mut("t.weight").unwrap_err();
@@ -1154,8 +1127,10 @@ mod tests {
         let tmp = std::env::temp_dir().join("rustllama_gguf_mmap_unwritten.gguf");
         let _ = std::fs::remove_file(&tmp);
         let mut w = GgufMmapWriter::create(&tmp).unwrap();
-        w.declare_tensor("a.weight", vec![4], GgmlType::F32).unwrap();
-        w.declare_tensor("b.weight", vec![4], GgmlType::F32).unwrap();
+        w.declare_tensor("a.weight", vec![4], GgmlType::F32)
+            .unwrap();
+        w.declare_tensor("b.weight", vec![4], GgmlType::F32)
+            .unwrap();
         w.finish_header().unwrap();
         let region_a = w.tensor_region_mut("a.weight").unwrap();
         for byte in region_a.iter_mut() {
@@ -1233,17 +1208,19 @@ mod tests {
         // Q8_0 block = 34 bytes per 32 weights. 64 weights → 2 blocks → 68 bytes.
         let t3_q80: Vec<u8> = (0..68).map(|i: u32| (i & 0xFF) as u8).collect();
 
-        w.declare_tensor("a.weight", vec![32], GgmlType::F32).unwrap();
-        w.declare_tensor("b.weight", vec![64], GgmlType::F16).unwrap();
-        w.declare_tensor("c.weight", vec![64], GgmlType::Q8_0).unwrap();
+        w.declare_tensor("a.weight", vec![32], GgmlType::F32)
+            .unwrap();
+        w.declare_tensor("b.weight", vec![64], GgmlType::F16)
+            .unwrap();
+        w.declare_tensor("c.weight", vec![64], GgmlType::Q8_0)
+            .unwrap();
         w.finish_header().unwrap();
         w.write_tensor_data("a.weight", &t1_f32).unwrap();
         w.write_tensor_data("b.weight", &t2_f16).unwrap();
         w.write_tensor_data("c.weight", &t3_q80).unwrap();
         let bytes = w.finish().unwrap().into_inner();
 
-        let tmp =
-            std::env::temp_dir().join("rustllama_gguf_writer_multi.gguf");
+        let tmp = std::env::temp_dir().join("rustllama_gguf_writer_multi.gguf");
         std::fs::write(&tmp, &bytes).unwrap();
         let g = Gguf::open(&tmp).unwrap();
         assert_eq!(g.tensors().len(), 3);

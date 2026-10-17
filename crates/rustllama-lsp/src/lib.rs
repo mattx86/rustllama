@@ -110,8 +110,7 @@ pub struct Session {
 
 impl Session {
     pub fn new(config: LspConfig) -> Result<Self> {
-        let client = rustllama_client::Client::new(&config.base_url)
-            .map_err(LspError::Client)?;
+        let client = rustllama_client::Client::new(&config.base_url).map_err(LspError::Client)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -159,13 +158,16 @@ impl Session {
         match method {
             "initialize" => {
                 self.initialized = true;
-                Some(response(id, json!({
-                    "capabilities": server_capabilities(),
-                    "serverInfo": {
-                        "name": "rustllama-lsp",
-                        "version": env!("CARGO_PKG_VERSION"),
-                    },
-                })))
+                Some(response(
+                    id,
+                    json!({
+                        "capabilities": server_capabilities(),
+                        "serverInfo": {
+                            "name": "rustllama-lsp",
+                            "version": env!("CARGO_PKG_VERSION"),
+                        },
+                    }),
+                ))
             }
             "initialized" => None, // notification, no response
             "shutdown" => {
@@ -185,12 +187,8 @@ impl Session {
                 self.did_close(&params);
                 None
             }
-            "textDocument/inlineCompletion" => {
-                Some(self.inline_completion(id, &params))
-            }
-            "textDocument/completion" => {
-                Some(self.completion(id, &params))
-            }
+            "textDocument/inlineCompletion" => Some(self.inline_completion(id, &params)),
+            "textDocument/completion" => Some(self.completion(id, &params)),
             // Unhandled — return empty success for requests, ignore notifications.
             other => {
                 if id.is_some() {
@@ -208,22 +206,33 @@ impl Session {
     }
 
     fn did_open(&mut self, params: &Value) {
-        let Some(td) = params.get("textDocument") else { return };
-        let Some(uri) = td.get("uri").and_then(|u| u.as_str()) else { return };
+        let Some(td) = params.get("textDocument") else {
+            return;
+        };
+        let Some(uri) = td.get("uri").and_then(|u| u.as_str()) else {
+            return;
+        };
         let text = td
             .get("text")
             .and_then(|t| t.as_str())
             .unwrap_or("")
             .to_string();
         let version = td.get("version").and_then(|v| v.as_i64()).unwrap_or(0);
-        self.docs.insert(uri.to_string(), Document { text, version });
+        self.docs
+            .insert(uri.to_string(), Document { text, version });
     }
 
     fn did_change(&mut self, params: &Value) {
-        let Some(td) = params.get("textDocument") else { return };
-        let Some(uri) = td.get("uri").and_then(|u| u.as_str()) else { return };
+        let Some(td) = params.get("textDocument") else {
+            return;
+        };
+        let Some(uri) = td.get("uri").and_then(|u| u.as_str()) else {
+            return;
+        };
         let new_version = td.get("version").and_then(|v| v.as_i64()).unwrap_or(0);
-        let Some(doc) = self.docs.get_mut(uri) else { return };
+        let Some(doc) = self.docs.get_mut(uri) else {
+            return;
+        };
         doc.version = new_version;
         let Some(changes) = params.get("contentChanges").and_then(|c| c.as_array()) else {
             return;
@@ -241,8 +250,12 @@ impl Session {
                     let Some(text) = change.get("text").and_then(|t| t.as_str()) else {
                         continue;
                     };
-                    let Some(start) = parse_position(range.get("start")) else { continue };
-                    let Some(end) = parse_position(range.get("end")) else { continue };
+                    let Some(start) = parse_position(range.get("start")) else {
+                        continue;
+                    };
+                    let Some(end) = parse_position(range.get("end")) else {
+                        continue;
+                    };
                     text::apply_incremental_edit(&mut doc.text, start, end, text);
                 }
             }
@@ -250,8 +263,12 @@ impl Session {
     }
 
     fn did_close(&mut self, params: &Value) {
-        let Some(td) = params.get("textDocument") else { return };
-        let Some(uri) = td.get("uri").and_then(|u| u.as_str()) else { return };
+        let Some(td) = params.get("textDocument") else {
+            return;
+        };
+        let Some(uri) = td.get("uri").and_then(|u| u.as_str()) else {
+            return;
+        };
         self.docs.remove(uri);
     }
 
@@ -263,11 +280,14 @@ impl Session {
             Ok(completion) => {
                 // textDocument/inlineCompletion response shape (LSP 3.18):
                 //   { items: [{ insertText: "...", filterText?: "..." }] }
-                response(id, json!({
-                    "items": [{
-                        "insertText": completion,
-                    }]
-                }))
+                response(
+                    id,
+                    json!({
+                        "items": [{
+                            "insertText": completion,
+                        }]
+                    }),
+                )
             }
             Err(e) => {
                 tracing::warn!(error = %e, "FIM completion failed");
@@ -286,20 +306,19 @@ impl Session {
                 // Use kind=15 ("Snippet") so editors don't mangle the text
                 // by applying their own filter heuristics. The label is
                 // the completion's first line (so the menu remains readable).
-                let label = completion
-                    .lines()
-                    .next()
-                    .unwrap_or(&completion)
-                    .to_string();
-                response(id, json!({
-                    "isIncomplete": false,
-                    "items": [{
-                        "label": label,
-                        "kind": 15,
-                        "insertText": completion,
-                        "detail": "rustllama",
-                    }]
-                }))
+                let label = completion.lines().next().unwrap_or(&completion).to_string();
+                response(
+                    id,
+                    json!({
+                        "isIncomplete": false,
+                        "items": [{
+                            "label": label,
+                            "kind": 15,
+                            "insertText": completion,
+                            "detail": "rustllama",
+                        }]
+                    }),
+                )
             }
             Err(e) => {
                 tracing::warn!(error = %e, "FIM completion failed");
@@ -318,10 +337,8 @@ impl Session {
         let doc = self.docs.get(uri)?;
         let cursor = text::position_to_byte_offset(&doc.text, position)?;
         let (full_prefix, full_suffix) = doc.text.split_at(cursor);
-        let prefix =
-            text::truncate_prefix(full_prefix, self.config.max_prefix_bytes).to_string();
-        let suffix =
-            text::truncate_suffix(full_suffix, self.config.max_suffix_bytes).to_string();
+        let prefix = text::truncate_prefix(full_prefix, self.config.max_prefix_bytes).to_string();
+        let suffix = text::truncate_suffix(full_suffix, self.config.max_suffix_bytes).to_string();
         Some((prefix, suffix))
     }
 
@@ -340,10 +357,15 @@ impl Session {
             seed: None,
             stream: false,
         };
-        let resp = self.runtime.block_on(async move {
-            client.completions(&req).await
-        })?;
-        let text = resp.choices.into_iter().next().map(|c| c.text).unwrap_or_default();
+        let resp = self
+            .runtime
+            .block_on(async move { client.completions(&req).await })?;
+        let text = resp
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.text)
+            .unwrap_or_default();
         Ok(text)
     }
 }

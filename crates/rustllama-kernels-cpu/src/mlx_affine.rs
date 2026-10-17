@@ -86,8 +86,12 @@ pub fn read_bits_le(packed: &[u8], bit_pos: usize, bits: u32) -> u32 {
         let bit_in_byte = (abs % 8) as u32;
         let avail = 8 - bit_in_byte; // bits left in this byte
         let take = avail.min(bits - got); // how many we consume here
-        // Low `take` bits of the byte, starting at `bit_in_byte`.
-        let mask = if take == 32 { u32::MAX } else { (1u32 << take) - 1 };
+                                          // Low `take` bits of the byte, starting at `bit_in_byte`.
+        let mask = if take == 32 {
+            u32::MAX
+        } else {
+            (1u32 << take) - 1
+        };
         let chunk = ((packed[byte_idx] as u32) >> bit_in_byte) & mask;
         val |= chunk << got;
         got += take;
@@ -110,7 +114,10 @@ pub fn read_bits_le(packed: &[u8], bit_pos: usize, bits: u32) -> u32 {
 #[inline]
 pub fn write_bits_le(out: &mut [u8], index: usize, bits: u32, value: u32) {
     debug_assert!(bits <= 32);
-    debug_assert!(bits == 32 || value < (1u32 << bits), "value {value} exceeds {bits} bits");
+    debug_assert!(
+        bits == 32 || value < (1u32 << bits),
+        "value {value} exceeds {bits} bits"
+    );
     let bit_pos = index * bits as usize;
     let mut got: u32 = 0;
     while got < bits {
@@ -119,7 +126,11 @@ pub fn write_bits_le(out: &mut [u8], index: usize, bits: u32, value: u32) {
         let bit_in_byte = (abs % 8) as u32;
         let avail = 8 - bit_in_byte; // bits free in this byte
         let take = avail.min(bits - got); // how many we deposit here
-        let mask = if take == 32 { u32::MAX } else { (1u32 << take) - 1 };
+        let mask = if take == 32 {
+            u32::MAX
+        } else {
+            (1u32 << take) - 1
+        };
         // Low `take` bits of the remaining value, shifted to sit at
         // `bit_in_byte`. `take <= 8` always (a byte holds <= 8 free
         // bits), so the cast to u8 never truncates real data.
@@ -228,7 +239,10 @@ pub fn dequantize_mlx_affine(
     out: &mut [f32],
 ) {
     let n = out.len();
-    assert!(group_size > 0 && n % group_size == 0, "n {n} not a multiple of group_size {group_size}");
+    assert!(
+        group_size > 0 && n % group_size == 0,
+        "n {n} not a multiple of group_size {group_size}"
+    );
     let n_groups = n / group_size;
     assert_eq!(scales.len(), n_groups, "scales len");
     assert_eq!(biases.len(), n_groups, "biases len");
@@ -268,7 +282,10 @@ pub fn matvec_mlx_affine_w_f32_a(
     m: usize,
     k: usize,
 ) {
-    assert!(group_size > 0 && k % group_size == 0, "k {k} not a multiple of group_size {group_size}");
+    assert!(
+        group_size > 0 && k % group_size == 0,
+        "k {k} not a multiple of group_size {group_size}"
+    );
     let groups_per_row = k / group_size;
     assert_eq!(x.len(), k, "x len");
     assert_eq!(out.len(), m, "out len");
@@ -450,14 +467,22 @@ pub fn matvec_mlx_affine_blob_w_f32_a(
     m: usize,
     k: usize,
 ) {
-    let view = MlxAffineBlobView::parse(bytes)
-        .expect("matvec_mlx_affine_blob: malformed MLX affine blob");
+    let view =
+        MlxAffineBlobView::parse(bytes).expect("matvec_mlx_affine_blob: malformed MLX affine blob");
     assert_eq!(view.rows, m, "mlx blob rows vs m");
     assert_eq!(view.cols, k, "mlx blob cols vs k");
     let scales = decode_f16_sidecar(view.scales_f16);
     let biases = decode_f16_sidecar(view.biases_f16);
     matvec_mlx_affine_w_f32_a(
-        view.packed, &scales, &biases, view.group_size, view.bits, x, out, m, k,
+        view.packed,
+        &scales,
+        &biases,
+        view.group_size,
+        view.bits,
+        x,
+        out,
+        m,
+        k,
     );
 }
 
@@ -489,21 +514,23 @@ pub fn matvec_mlx_affine_blob_w_f32_a_parallel(
     let gpr = view.groups_per_row(); // groups per output row
     let row_pbytes = k * view.bits as usize / 8; // packed bytes per row (byte-aligned)
     let chunk_rows = chunk_rows.max(1);
-    out.par_chunks_mut(chunk_rows).enumerate().for_each(|(ci, oc)| {
-        let r0 = ci * chunk_rows;
-        let nr = oc.len();
-        matvec_mlx_affine_w_f32_a(
-            &view.packed[r0 * row_pbytes..(r0 + nr) * row_pbytes],
-            &scales[r0 * gpr..(r0 + nr) * gpr],
-            &biases[r0 * gpr..(r0 + nr) * gpr],
-            view.group_size,
-            view.bits,
-            x,
-            oc,
-            nr,
-            k,
-        );
-    });
+    out.par_chunks_mut(chunk_rows)
+        .enumerate()
+        .for_each(|(ci, oc)| {
+            let r0 = ci * chunk_rows;
+            let nr = oc.len();
+            matvec_mlx_affine_w_f32_a(
+                &view.packed[r0 * row_pbytes..(r0 + nr) * row_pbytes],
+                &scales[r0 * gpr..(r0 + nr) * gpr],
+                &biases[r0 * gpr..(r0 + nr) * gpr],
+                view.group_size,
+                view.bits,
+                x,
+                oc,
+                nr,
+                k,
+            );
+        });
 }
 
 /// Embedding row-gather from a packed MLX-affine blob: dequantize only
@@ -548,7 +575,10 @@ mod tests {
         let mut out = vec![0u8; total_bits / 8];
         let mut bit_pos = 0usize;
         for &q in qs {
-            debug_assert!(bits == 32 || q < (1u32 << bits), "q {q} exceeds {bits} bits");
+            debug_assert!(
+                bits == 32 || q < (1u32 << bits),
+                "q {q} exceeds {bits} bits"
+            );
             let mut got = 0u32;
             while got < bits {
                 let abs = bit_pos + got as usize;
@@ -610,7 +640,11 @@ mod tests {
         for i in 0..n {
             let g = i / group_size;
             let want = scales[g] * qs[i] as f32 + biases[g];
-            assert!((out[i] - want).abs() < 1e-6, "i={i} got {} want {want}", out[i]);
+            assert!(
+                (out[i] - want).abs() < 1e-6,
+                "i={i} got {} want {want}",
+                out[i]
+            );
         }
     }
 
@@ -628,7 +662,9 @@ mod tests {
         for &bits in &[2u32, 3, 4, 5, 6, 8] {
             let maxv = 1u32 << bits;
             // 64 elements → byte-aligned for every width (64*bits % 8 == 0).
-            let vals: Vec<u32> = (0..64).map(|i| (i as u32).wrapping_mul(2246822519) % maxv).collect();
+            let vals: Vec<u32> = (0..64)
+                .map(|i| (i as u32).wrapping_mul(2246822519) % maxv)
+                .collect();
             let mut packed = vec![0u8; 64 * bits as usize / 8];
             for (i, &v) in vals.iter().enumerate() {
                 write_bits_le(&mut packed, i, bits, v);
@@ -648,8 +684,7 @@ mod tests {
             for &bits in &[2u32, 3, 4, 5, 6, 8] {
                 let n = group_size * 5; // 5 groups
                 let weights: Vec<f32> = (0..n).map(pseudo_f32).collect();
-                let (packed, scales, biases) =
-                    quantize_mlx_affine(&weights, group_size, bits);
+                let (packed, scales, biases) = quantize_mlx_affine(&weights, group_size, bits);
 
                 // Packed length is padded to a multiple of 4 (u32 words).
                 assert_eq!(packed.len() % 4, 0, "packed not word-padded");
@@ -660,9 +695,7 @@ mod tests {
                 assert_eq!(biases.len(), n / group_size);
 
                 let mut recon = vec![0f32; n];
-                dequantize_mlx_affine(
-                    &packed, &scales, &biases, group_size, bits, &mut recon,
-                );
+                dequantize_mlx_affine(&packed, &scales, &biases, group_size, bits, &mut recon);
                 for i in 0..n {
                     let g = i / group_size;
                     let tol = scales[g] * 0.5 + 1e-4;
@@ -702,8 +735,7 @@ mod tests {
             let weights: Vec<f32> = (0..n).map(pseudo_f32).collect();
             let x: Vec<f32> = (0..k).map(|c| (c as f32) * 0.003 - 0.4).collect();
 
-            let (packed, scales, biases) =
-                quantize_mlx_affine(&weights, group_size, bits);
+            let (packed, scales, biases) = quantize_mlx_affine(&weights, group_size, bits);
 
             // Naive f32 reference on the ORIGINAL weights.
             let mut want = vec![0f32; m];
@@ -739,14 +771,23 @@ mod tests {
     #[test]
     fn matvec_matches_dequant_then_dot() {
         // Exercise several (group_size, bits) shapes, a couple rows each.
-        for &(group_size, bits) in &[(32usize, 4u32), (64, 3), (32, 8), (32, 6), (128, 5), (32, 2)] {
+        for &(group_size, bits) in &[
+            (32usize, 4u32),
+            (64, 3),
+            (32, 8),
+            (32, 6),
+            (128, 5),
+            (32, 2),
+        ] {
             let m = 3usize;
             let k = group_size * 2; // 2 groups per row
             let groups_per_row = k / group_size;
             let n = m * k;
             let maxv = 1u32 << bits;
             // Deterministic pseudo-random-ish codes.
-            let qs: Vec<u32> = (0..n).map(|i| (i as u32).wrapping_mul(2654435761) % maxv).collect();
+            let qs: Vec<u32> = (0..n)
+                .map(|i| (i as u32).wrapping_mul(2654435761) % maxv)
+                .collect();
             let packed = pack_bits_le(&qs, bits);
             let scales: Vec<f32> = (0..m * groups_per_row)
                 .map(|g| 0.1 + (g as f32) * 0.05)
@@ -815,13 +856,27 @@ mod tests {
             // Reference: the blob stores the sidecar as f16, so decode it
             // back to f32 and run the reference kernel on THOSE values —
             // identical inputs to the blob path.
-            let scales_f16: Vec<f32> =
-                q.scales.iter().map(|&s| f16::from_f32(s).to_f32()).collect();
-            let biases_f16: Vec<f32> =
-                q.biases.iter().map(|&b| f16::from_f32(b).to_f32()).collect();
+            let scales_f16: Vec<f32> = q
+                .scales
+                .iter()
+                .map(|&s| f16::from_f32(s).to_f32())
+                .collect();
+            let biases_f16: Vec<f32> = q
+                .biases
+                .iter()
+                .map(|&b| f16::from_f32(b).to_f32())
+                .collect();
             let mut want = vec![0f32; m];
             matvec_mlx_affine_w_f32_a(
-                &q.packed, &scales_f16, &biases_f16, group_size, bits, &x, &mut want, m, k,
+                &q.packed,
+                &scales_f16,
+                &biases_f16,
+                group_size,
+                bits,
+                &x,
+                &mut want,
+                m,
+                k,
             );
 
             let mut got = vec![0f32; m];
@@ -861,10 +916,25 @@ mod tests {
 
         // Reference: full-table dequant on the SAME f16-rounded sidecar
         // the blob stores, so the gather must match bit-for-bit.
-        let scales_f16: Vec<f32> = q.scales.iter().map(|&s| f16::from_f32(s).to_f32()).collect();
-        let biases_f16: Vec<f32> = q.biases.iter().map(|&b| f16::from_f32(b).to_f32()).collect();
+        let scales_f16: Vec<f32> = q
+            .scales
+            .iter()
+            .map(|&s| f16::from_f32(s).to_f32())
+            .collect();
+        let biases_f16: Vec<f32> = q
+            .biases
+            .iter()
+            .map(|&b| f16::from_f32(b).to_f32())
+            .collect();
         let mut full = vec![0f32; n];
-        dequantize_mlx_affine(&q.packed, &scales_f16, &biases_f16, group_size, bits, &mut full);
+        dequantize_mlx_affine(
+            &q.packed,
+            &scales_f16,
+            &biases_f16,
+            group_size,
+            bits,
+            &mut full,
+        );
 
         let ids = [0i32, 5, 19, 5, 12];
         let mut looked = vec![0f32; ids.len() * d];
@@ -892,13 +962,29 @@ mod tests {
 
             let mut out_scalar = vec![0f32; m];
             matvec_mlx_affine_w_f32_a_scalar(
-                &packed, &scales, &biases, group_size, bits, &x, &mut out_scalar, m, k,
+                &packed,
+                &scales,
+                &biases,
+                group_size,
+                bits,
+                &x,
+                &mut out_scalar,
+                m,
+                k,
             );
             let mut out_neon = vec![0f32; m];
             // SAFETY: NEON is baseline on aarch64.
             unsafe {
                 matvec_mlx_affine_w_f32_a_neon(
-                    &packed, &scales, &biases, group_size, bits, &x, &mut out_neon, m, k,
+                    &packed,
+                    &scales,
+                    &biases,
+                    group_size,
+                    bits,
+                    &x,
+                    &mut out_neon,
+                    m,
+                    k,
                 );
             }
             for i in 0..m {

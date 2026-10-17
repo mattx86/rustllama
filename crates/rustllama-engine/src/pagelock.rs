@@ -39,25 +39,23 @@ pub fn lock_ram_budget() -> LockBudget {
     // T3: the directive comes from the typed `LoadOptions` (via the accel
     // override cell) when the engine set it, else the legacy
     // `RUSTLLAMA_LOCK_RAM_MB` env var (back-compat). Still parsed once.
-    *CELL.get_or_init(
-        || match rustllama_models::accel::lock_ram_mb_directive() {
-            Some(v) => {
-                let v = v.trim();
-                if v.eq_ignore_ascii_case("auto") {
-                    LockBudget::Auto
-                } else if v.is_empty() {
-                    LockBudget::Off
-                } else {
-                    match v.parse::<u64>() {
-                        Ok(0) => LockBudget::Off,
-                        Ok(mb) => LockBudget::Bytes(mb.saturating_mul(1024 * 1024)),
-                        Err(_) => LockBudget::Off,
-                    }
+    *CELL.get_or_init(|| match rustllama_models::accel::lock_ram_mb_directive() {
+        Some(v) => {
+            let v = v.trim();
+            if v.eq_ignore_ascii_case("auto") {
+                LockBudget::Auto
+            } else if v.is_empty() {
+                LockBudget::Off
+            } else {
+                match v.parse::<u64>() {
+                    Ok(0) => LockBudget::Off,
+                    Ok(mb) => LockBudget::Bytes(mb.saturating_mul(1024 * 1024)),
+                    Err(_) => LockBudget::Off,
                 }
             }
-            None => LockBudget::Off,
-        },
-    )
+        }
+        None => LockBudget::Off,
+    })
 }
 
 /// Clamp a requested lock size (bytes) to what the POSIX `RLIMIT_MEMLOCK`
@@ -166,7 +164,7 @@ mod sys {
         let cap = total_phys / 100 * 90;
         let min_ws = (intended_bytes.saturating_add(headroom)).min(cap);
         let max_ws = total_phys; // OS caps in practice; generous max avoids trimming.
-        // SAFETY: pseudo-handle from GetCurrentProcess is always valid.
+                                 // SAFETY: pseudo-handle from GetCurrentProcess is always valid.
         let ok: BOOL = unsafe {
             SetProcessWorkingSetSizeEx(
                 GetCurrentProcess(),
@@ -214,12 +212,7 @@ mod sys {
             .collect();
         // SAFETY: entries point at live mapped ranges; count matches.
         unsafe {
-            let _ = PrefetchVirtualMemory(
-                GetCurrentProcess(),
-                entries.len(),
-                entries.as_ptr(),
-                0,
-            );
+            let _ = PrefetchVirtualMemory(GetCurrentProcess(), entries.len(), entries.as_ptr(), 0);
         }
     }
 
@@ -342,8 +335,7 @@ static WS_FLOOR_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// Bytes the pagelock tier intends to lock (stamped by
 /// [`lock_model_into_ram`]); the expert-cache budget is added on top
 /// at refresh time, so the two consumers share one floor.
-static PAGELOCK_INTENDED_BYTES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static PAGELOCK_INTENDED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Physical memory status: `(total, available)` bytes. `None` on
 /// non-Windows targets or API failure. Public so the memory-budget

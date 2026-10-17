@@ -7,7 +7,7 @@
 //! → LM head plumbing is byte-coherent end-to-end.
 
 use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama, SynthWeightDtype};
-use rustllama_gguf::{Gguf, GgmlType};
+use rustllama_gguf::{GgmlType, Gguf};
 use rustllama_models::llama_arch::{KvCache, LlamaModel};
 
 #[test]
@@ -149,8 +149,7 @@ fn batched_prefill_matches_serial_forward_one() {
     // forward_prefill router. The direct call avoids racing with
     // parallel tests that also touch the env var.
     let mut kv_batched = KvCache::new(&model.cfg, 32);
-    let logits_batched =
-        model.forward_prefill_batched_f32(&tokens, 0, &mut kv_batched);
+    let logits_batched = model.forward_prefill_batched_f32(&tokens, 0, &mut kv_batched);
 
     assert_eq!(logits_batched.len(), logits_serial.len());
     let mut max_err = 0f32;
@@ -204,8 +203,7 @@ fn batched_prefill_nvfp4_matches_serial_forward_one() {
     }
 
     let mut kv_batched = KvCache::new_with_dtype(&model.cfg, 32, KvDtype::Nvfp4);
-    let logits_batched =
-        model.forward_prefill_batched_nvfp4(&tokens, 0, &mut kv_batched);
+    let logits_batched = model.forward_prefill_batched_nvfp4(&tokens, 0, &mut kv_batched);
 
     assert_eq!(logits_batched.len(), logits_serial.len());
     let mut max_err = 0f32;
@@ -247,8 +245,7 @@ fn batched_prefill_q8_0_matches_serial_forward_one() {
     }
 
     let mut kv_batched = KvCache::new_with_dtype(&model.cfg, 32, KvDtype::Q8_0);
-    let logits_batched =
-        model.forward_prefill_batched_q8_0(&tokens, 0, &mut kv_batched);
+    let logits_batched = model.forward_prefill_batched_q8_0(&tokens, 0, &mut kv_batched);
 
     assert_eq!(logits_batched.len(), logits_serial.len());
     let mut max_err = 0f32;

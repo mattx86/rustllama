@@ -1772,16 +1772,15 @@ impl ConfigHandle {
                                 .map(|e| e.to_string())
                                 .collect::<Vec<_>>()
                                 .join("; ");
-                            let _ = handle.tx.send(ConfigDelta::ParseError(format!(
-                                "watcher: {msg}"
-                            )));
+                            let _ = handle
+                                .tx
+                                .send(ConfigDelta::ParseError(format!("watcher: {msg}")));
                             continue;
                         }
                     };
                     if !events.iter().any(|e| {
                         e.event.paths.iter().any(|p| {
-                            p == &watched_path
-                                || p.file_name() == watched_path.file_name()
+                            p == &watched_path || p.file_name() == watched_path.file_name()
                         })
                     }) {
                         continue;

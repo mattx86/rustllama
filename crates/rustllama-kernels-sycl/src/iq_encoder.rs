@@ -25,28 +25,26 @@
 
 use std::cell::RefCell;
 
-use rustllama_gguf::iq_gpu::{
-    Iq4EltGridFormat, Iq4EltPairedPick, Iq8EltDeltaPick, Iq8EltGridFormat, Iq8EltSignedPick,
-    IqGpuEncoder, IqGpuError,
-};
 use rustllama_gguf::encode_iq_vec::{
     iq1s_grid_f32_table, iq2s_grid_f32_table, iq2s_grid_norm_sq_table, iq2xs_grid_f32_table,
     iq2xs_grid_norm_sq_table, iq2xxs_grid_f32_table, iq2xxs_grid_norm_sq_table,
-    iq3s_grid_f32_table, iq3s_grid_norm_sq_table, iq3xxs_grid_f32_table,
-    iq3xxs_grid_norm_sq_table, kmask_iq2xs_table, ksigns_iq2xs_reverse_table,
+    iq3s_grid_f32_table, iq3s_grid_norm_sq_table, iq3xxs_grid_f32_table, iq3xxs_grid_norm_sq_table,
+    kmask_iq2xs_table, ksigns_iq2xs_reverse_table,
+};
+use rustllama_gguf::iq_gpu::{
+    Iq4EltGridFormat, Iq4EltPairedPick, Iq8EltDeltaPick, Iq8EltGridFormat, Iq8EltSignedPick,
+    IqGpuEncoder, IqGpuError,
 };
 
 use crate::{
     create_stream, iq_search_4elt_paired_signed_raw, iq_search_8elt_delta_iq1s_all3_raw,
     iq_search_8elt_delta_iq1s_all3_w_raw, iq_search_8elt_delta_iq1s_raw, iq_search_8elt_signed_raw,
-    usm_alloc_shared, usm_free,
-    SyclStream,
+    usm_alloc_shared, usm_free, SyclStream,
 };
 
 const IQ1S_GRID_F32_COUNT: usize = 2048 * 8;
 const KSIGNS_REV_COUNT: usize = 256;
 const KMASK_IQ2XS_COUNT: usize = 8;
-
 
 /// Per-IQ2/IQ3-format USM resources: grid + norm-sq table,
 /// uploaded lazily on first use of that format. The encoder
@@ -262,7 +260,12 @@ impl SyclIqEncoder {
             return Ok(());
         }
         if !pool.out_grid2_idx_usm.is_null() {
-            unsafe { usm_free(&self.stream, pool.out_grid2_idx_usm as *mut std::ffi::c_void) };
+            unsafe {
+                usm_free(
+                    &self.stream,
+                    pool.out_grid2_idx_usm as *mut std::ffi::c_void,
+                )
+            };
             pool.out_grid2_idx_usm = std::ptr::null_mut();
         }
         let bytes = n_chunks * std::mem::size_of::<u16>();
@@ -348,7 +351,10 @@ impl SyclIqEncoder {
         if !pool.out_grid_idx_usm.is_null() {
             unsafe {
                 usm_free(&self.stream, pool.out_grid_idx_usm as *mut std::ffi::c_void);
-                usm_free(&self.stream, pool.out_signed_score_usm as *mut std::ffi::c_void);
+                usm_free(
+                    &self.stream,
+                    pool.out_signed_score_usm as *mut std::ffi::c_void,
+                );
                 usm_free(&self.stream, pool.out_norm_sq_usm as *mut std::ffi::c_void);
             }
         }
@@ -393,12 +399,30 @@ impl SyclIqEncoder {
         }
         if !pool.out_grid_idx_pos_usm.is_null() {
             unsafe {
-                usm_free(&self.stream, pool.out_grid_idx_pos_usm as *mut std::ffi::c_void);
-                usm_free(&self.stream, pool.out_signed_score_pos_usm as *mut std::ffi::c_void);
-                usm_free(&self.stream, pool.out_norm_sq_pos_usm as *mut std::ffi::c_void);
-                usm_free(&self.stream, pool.out_grid_idx_neg_usm as *mut std::ffi::c_void);
-                usm_free(&self.stream, pool.out_signed_score_neg_usm as *mut std::ffi::c_void);
-                usm_free(&self.stream, pool.out_norm_sq_neg_usm as *mut std::ffi::c_void);
+                usm_free(
+                    &self.stream,
+                    pool.out_grid_idx_pos_usm as *mut std::ffi::c_void,
+                );
+                usm_free(
+                    &self.stream,
+                    pool.out_signed_score_pos_usm as *mut std::ffi::c_void,
+                );
+                usm_free(
+                    &self.stream,
+                    pool.out_norm_sq_pos_usm as *mut std::ffi::c_void,
+                );
+                usm_free(
+                    &self.stream,
+                    pool.out_grid_idx_neg_usm as *mut std::ffi::c_void,
+                );
+                usm_free(
+                    &self.stream,
+                    pool.out_signed_score_neg_usm as *mut std::ffi::c_void,
+                );
+                usm_free(
+                    &self.stream,
+                    pool.out_norm_sq_neg_usm as *mut std::ffi::c_void,
+                );
             }
         }
         let idx_bytes = n_chunks * std::mem::size_of::<u16>();
@@ -409,14 +433,25 @@ impl SyclIqEncoder {
         let p_idx_n = usm_alloc_shared(&self.stream, idx_bytes) as *mut u16;
         let p_score_n = usm_alloc_shared(&self.stream, f32_bytes) as *mut f32;
         let p_norm_n = usm_alloc_shared(&self.stream, f32_bytes) as *mut f32;
-        if p_idx_p.is_null() || p_score_p.is_null() || p_norm_p.is_null()
-            || p_idx_n.is_null() || p_score_n.is_null() || p_norm_n.is_null()
+        if p_idx_p.is_null()
+            || p_score_p.is_null()
+            || p_norm_p.is_null()
+            || p_idx_n.is_null()
+            || p_score_n.is_null()
+            || p_norm_n.is_null()
         {
             // Free any that succeeded.
-            for p in [p_idx_p as *mut std::ffi::c_void, p_score_p as *mut std::ffi::c_void,
-                      p_norm_p as *mut std::ffi::c_void, p_idx_n as *mut std::ffi::c_void,
-                      p_score_n as *mut std::ffi::c_void, p_norm_n as *mut std::ffi::c_void] {
-                if !p.is_null() { unsafe { usm_free(&self.stream, p) }; }
+            for p in [
+                p_idx_p as *mut std::ffi::c_void,
+                p_score_p as *mut std::ffi::c_void,
+                p_norm_p as *mut std::ffi::c_void,
+                p_idx_n as *mut std::ffi::c_void,
+                p_score_n as *mut std::ffi::c_void,
+                p_norm_n as *mut std::ffi::c_void,
+            ] {
+                if !p.is_null() {
+                    unsafe { usm_free(&self.stream, p) };
+                }
             }
             pool.out_grid_idx_pos_usm = std::ptr::null_mut();
             pool.out_signed_score_pos_usm = std::ptr::null_mut();
@@ -518,7 +553,9 @@ impl IqGpuEncoder for SyclIqEncoder {
                 n_chunks: n,
             });
         }
-        if n == 0 { return Ok(()); }
+        if n == 0 {
+            return Ok(());
+        }
         let mut pool = self.pool.borrow_mut();
         self.ensure_targets_capacity(&mut pool, need_targets)?;
         self.ensure_output_capacity(&mut pool, n)?;
@@ -532,9 +569,15 @@ impl IqGpuEncoder for SyclIqEncoder {
                 pool.targets_usm,
                 delta,
                 self.iq1s_grid_usm,
-                pool.out_grid_idx_usm, pool.out_signed_score_usm, pool.out_norm_sq_usm,
-                pool.out_grid_idx_pos_usm, pool.out_signed_score_pos_usm, pool.out_norm_sq_pos_usm,
-                pool.out_grid_idx_neg_usm, pool.out_signed_score_neg_usm, pool.out_norm_sq_neg_usm,
+                pool.out_grid_idx_usm,
+                pool.out_signed_score_usm,
+                pool.out_norm_sq_usm,
+                pool.out_grid_idx_pos_usm,
+                pool.out_signed_score_pos_usm,
+                pool.out_norm_sq_pos_usm,
+                pool.out_grid_idx_neg_usm,
+                pool.out_signed_score_neg_usm,
+                pool.out_norm_sq_neg_usm,
                 n as u32,
             )
         };
@@ -581,7 +624,9 @@ impl IqGpuEncoder for SyclIqEncoder {
                 n_chunks: n,
             });
         }
-        if n == 0 { return Ok(()); }
+        if n == 0 {
+            return Ok(());
+        }
         let mut pool = self.pool.borrow_mut();
         self.ensure_targets_capacity(&mut pool, need_targets)?;
         self.ensure_weights_capacity(&mut pool, need_targets)?;
@@ -598,9 +643,15 @@ impl IqGpuEncoder for SyclIqEncoder {
                 pool.weights_usm,
                 delta,
                 self.iq1s_grid_usm,
-                pool.out_grid_idx_usm, pool.out_signed_score_usm, pool.out_norm_sq_usm,
-                pool.out_grid_idx_pos_usm, pool.out_signed_score_pos_usm, pool.out_norm_sq_pos_usm,
-                pool.out_grid_idx_neg_usm, pool.out_signed_score_neg_usm, pool.out_norm_sq_neg_usm,
+                pool.out_grid_idx_usm,
+                pool.out_signed_score_usm,
+                pool.out_norm_sq_usm,
+                pool.out_grid_idx_pos_usm,
+                pool.out_signed_score_pos_usm,
+                pool.out_norm_sq_pos_usm,
+                pool.out_grid_idx_neg_usm,
+                pool.out_signed_score_neg_usm,
+                pool.out_norm_sq_neg_usm,
                 n as u32,
             )
         };
@@ -664,19 +715,31 @@ impl IqGpuEncoder for SyclIqEncoder {
                 let grid = iq2xxs_grid_f32_table();
                 let norm = iq2xxs_grid_norm_sq_table();
                 self.ensure_iq2_format(&mut pool.iq2xxs, grid, &norm)?;
-                (pool.iq2xxs.grid_usm, pool.iq2xxs.grid_norm_usm, pool.iq2xxs.n_grid)
+                (
+                    pool.iq2xxs.grid_usm,
+                    pool.iq2xxs.grid_norm_usm,
+                    pool.iq2xxs.n_grid,
+                )
             }
             Iq8EltGridFormat::Iq2Xs => {
                 let grid = iq2xs_grid_f32_table();
                 let norm = iq2xs_grid_norm_sq_table();
                 self.ensure_iq2_format(&mut pool.iq2xs, grid, &norm)?;
-                (pool.iq2xs.grid_usm, pool.iq2xs.grid_norm_usm, pool.iq2xs.n_grid)
+                (
+                    pool.iq2xs.grid_usm,
+                    pool.iq2xs.grid_norm_usm,
+                    pool.iq2xs.n_grid,
+                )
             }
             Iq8EltGridFormat::Iq2S => {
                 let grid = iq2s_grid_f32_table();
                 let norm = iq2s_grid_norm_sq_table();
                 self.ensure_iq2_format(&mut pool.iq2s, grid, &norm)?;
-                (pool.iq2s.grid_usm, pool.iq2s.grid_norm_usm, pool.iq2s.n_grid)
+                (
+                    pool.iq2s.grid_usm,
+                    pool.iq2s.grid_norm_usm,
+                    pool.iq2s.n_grid,
+                )
             }
         };
 
@@ -746,13 +809,21 @@ impl IqGpuEncoder for SyclIqEncoder {
                 let grid = iq3xxs_grid_f32_table();
                 let norm = iq3xxs_grid_norm_sq_table();
                 self.ensure_iq3_format(&mut pool.iq3xxs, grid, &norm)?;
-                (pool.iq3xxs.grid_usm, pool.iq3xxs.grid_norm_usm, pool.iq3xxs.n_grid)
+                (
+                    pool.iq3xxs.grid_usm,
+                    pool.iq3xxs.grid_norm_usm,
+                    pool.iq3xxs.n_grid,
+                )
             }
             Iq4EltGridFormat::Iq3S => {
                 let grid = iq3s_grid_f32_table();
                 let norm = iq3s_grid_norm_sq_table();
                 self.ensure_iq3_format(&mut pool.iq3s, grid, &norm)?;
-                (pool.iq3s.grid_usm, pool.iq3s.grid_norm_usm, pool.iq3s.n_grid)
+                (
+                    pool.iq3s.grid_usm,
+                    pool.iq3s.grid_norm_usm,
+                    pool.iq3s.n_grid,
+                )
             }
         };
 
@@ -847,7 +918,8 @@ impl IqGpuEncoder for SyclIqEncoder {
                 src_usm.as_ptr(),
                 dst_usm.as_mut_ptr(),
                 n_blocks as u32,
-            ).map_err(|_| IqGpuError::Unavailable)?;
+            )
+            .map_err(|_| IqGpuError::Unavailable)?;
         }
         dst_bytes.copy_from_slice(dst_usm.as_slice());
         Ok(())
@@ -881,7 +953,8 @@ impl IqGpuEncoder for SyclIqEncoder {
                 src_usm.as_ptr(),
                 dst_usm.as_mut_ptr(),
                 n_blocks as u32,
-            ).map_err(|_| IqGpuError::Unavailable)?;
+            )
+            .map_err(|_| IqGpuError::Unavailable)?;
         }
         dst_bytes.copy_from_slice(dst_usm.as_slice());
         Ok(())
@@ -914,7 +987,8 @@ impl IqGpuEncoder for SyclIqEncoder {
                 src_usm.as_ptr(),
                 dst_usm.as_mut_ptr(),
                 n_blocks as u32,
-            ).map_err(|_| IqGpuError::Unavailable)?;
+            )
+            .map_err(|_| IqGpuError::Unavailable)?;
         }
         dst_bytes.copy_from_slice(dst_usm.as_slice());
         Ok(())
@@ -947,7 +1021,8 @@ impl IqGpuEncoder for SyclIqEncoder {
                 src_usm.as_ptr(),
                 dst_usm.as_mut_ptr(),
                 n_blocks as u32,
-            ).map_err(|_| IqGpuError::Unavailable)?;
+            )
+            .map_err(|_| IqGpuError::Unavailable)?;
         }
         dst_bytes.copy_from_slice(dst_usm.as_slice());
         Ok(())
@@ -962,7 +1037,10 @@ impl Drop for SyclIqEncoder {
                 usm_free(&self.stream, pool.out_grid_idx_usm as *mut std::ffi::c_void);
             }
             if !pool.out_signed_score_usm.is_null() {
-                usm_free(&self.stream, pool.out_signed_score_usm as *mut std::ffi::c_void);
+                usm_free(
+                    &self.stream,
+                    pool.out_signed_score_usm as *mut std::ffi::c_void,
+                );
             }
             if !pool.out_norm_sq_usm.is_null() {
                 usm_free(&self.stream, pool.out_norm_sq_usm as *mut std::ffi::c_void);
@@ -971,7 +1049,10 @@ impl Drop for SyclIqEncoder {
                 usm_free(&self.stream, pool.out_sign_idx_usm as *mut std::ffi::c_void);
             }
             if !pool.out_grid2_idx_usm.is_null() {
-                usm_free(&self.stream, pool.out_grid2_idx_usm as *mut std::ffi::c_void);
+                usm_free(
+                    &self.stream,
+                    pool.out_grid2_idx_usm as *mut std::ffi::c_void,
+                );
             }
             for p in [
                 pool.out_grid_idx_pos_usm as *mut std::ffi::c_void,
@@ -981,7 +1062,9 @@ impl Drop for SyclIqEncoder {
                 pool.out_signed_score_neg_usm as *mut std::ffi::c_void,
                 pool.out_norm_sq_neg_usm as *mut std::ffi::c_void,
             ] {
-                if !p.is_null() { usm_free(&self.stream, p); }
+                if !p.is_null() {
+                    usm_free(&self.stream, p);
+                }
             }
             if !pool.targets_usm.is_null() {
                 usm_free(&self.stream, pool.targets_usm as *mut std::ffi::c_void);
@@ -1054,7 +1137,10 @@ mod tests {
         use std::time::Instant;
         let encoder = match SyclIqEncoder::new(0) {
             Ok(e) => e,
-            Err(e) => { println!("no SYCL device: {:?}", e); return; }
+            Err(e) => {
+                println!("no SYCL device: {:?}", e);
+                return;
+            }
         };
         // 4096 super-blocks = 1 MiB elements — same scale as one
         // matrix of one expert (256 experts × this = full expert
@@ -1179,11 +1265,10 @@ mod tests {
             // — see docstring above.
             let mut out_cpu_scalar = vec![out_gpu[0]; out_gpu.len()];
             for i in 0..n_chunks {
-                out_cpu_scalar[i] =
-                    rustllama_gguf::encode_iq_vec::search_chunk_8_scalar_for_format(
-                        &targets[i * 8..(i + 1) * 8],
-                        format,
-                    );
+                out_cpu_scalar[i] = rustllama_gguf::encode_iq_vec::search_chunk_8_scalar_for_format(
+                    &targets[i * 8..(i + 1) * 8],
+                    format,
+                );
             }
             for (i, (g, c)) in out_gpu.iter().zip(out_cpu_scalar.iter()).enumerate() {
                 assert_eq!(
@@ -1240,11 +1325,10 @@ mod tests {
             // GPU's FP semantics.)
             let mut out_cpu = vec![out_gpu[0]; out_gpu.len()];
             for i in 0..n_chunks {
-                out_cpu[i] =
-                    rustllama_gguf::encode_iq_vec::search_chunk_iq3_scalar_for_format(
-                        &targets[i * 8..(i + 1) * 8],
-                        format,
-                    );
+                out_cpu[i] = rustllama_gguf::encode_iq_vec::search_chunk_iq3_scalar_for_format(
+                    &targets[i * 8..(i + 1) * 8],
+                    format,
+                );
             }
             for (i, (g, c)) in out_gpu.iter().zip(out_cpu.iter()).enumerate() {
                 assert_eq!(

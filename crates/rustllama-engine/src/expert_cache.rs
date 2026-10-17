@@ -156,8 +156,7 @@ impl UsageLearner {
 
     /// Experts ranked hottest-first from the prior-session baseline.
     pub fn ranked_keys(&self) -> Vec<ExpertKey> {
-        let mut rows: Vec<(ExpertKey, f64)> =
-            self.baseline.iter().map(|(k, v)| (*k, *v)).collect();
+        let mut rows: Vec<(ExpertKey, f64)> = self.baseline.iter().map(|(k, v)| (*k, *v)).collect();
         rows.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -186,11 +185,8 @@ impl UsageLearner {
     /// file. Call [`Self::flush`] first so the session tally is
     /// current.
     pub fn merged_ranked_keys(&self) -> Vec<ExpertKey> {
-        let mut merged: HashMap<ExpertKey, f64> = self
-            .baseline
-            .iter()
-            .map(|(k, v)| (*k, v * DECAY))
-            .collect();
+        let mut merged: HashMap<ExpertKey, f64> =
+            self.baseline.iter().map(|(k, v)| (*k, v * DECAY)).collect();
         for (k, n) in &self.session {
             *merged.entry(*k).or_insert(0.0) += *n as f64;
         }
@@ -231,11 +227,8 @@ impl UsageLearner {
         // Written ranking = decayed prior + this session so far. The
         // formula is stable under repeated flushes within one session
         // (baseline and session are never mutated by the write).
-        let mut merged: HashMap<ExpertKey, f64> = self
-            .baseline
-            .iter()
-            .map(|(k, v)| (*k, v * DECAY))
-            .collect();
+        let mut merged: HashMap<ExpertKey, f64> =
+            self.baseline.iter().map(|(k, v)| (*k, v * DECAY)).collect();
         for (k, n) in &self.session {
             *merged.entry(*k).or_insert(0.0) += *n as f64;
         }

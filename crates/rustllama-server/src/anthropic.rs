@@ -264,7 +264,12 @@ fn content_block_to_text(b: TextBlock) -> String {
     match b.kind.as_str() {
         "text" => b.text,
         "image" => {
-            let media = if !b.source.as_ref().map(|s| s.media_type.is_empty()).unwrap_or(true) {
+            let media = if !b
+                .source
+                .as_ref()
+                .map(|s| s.media_type.is_empty())
+                .unwrap_or(true)
+            {
                 b.source.as_ref().unwrap().media_type.clone()
             } else {
                 "unknown".to_string()
@@ -415,18 +420,14 @@ impl AnthropicUsage {
         // the REAL per-request creation count (newly-prefilled, now-cached
         // tokens); without one, keep the legacy 0 so unmarked requests are
         // unchanged.
-        self.cache_creation_input_tokens =
-            Some(if cache_control { s.tokens_prefilled } else { 0 });
+        self.cache_creation_input_tokens = Some(if cache_control { s.tokens_prefilled } else { 0 });
         self
     }
 }
 
 // ----- handler --------------------------------------------------------------
 
-pub async fn messages(
-    State(state): State<AppState>,
-    Json(req): Json<MessagesRequest>,
-) -> Response {
+pub async fn messages(State(state): State<AppState>, Json(req): Json<MessagesRequest>) -> Response {
     // Destructure once so the borrow checker doesn't have to reason about
     // partial moves vs. borrows across the `system` / `messages` /
     // `build_sampling` boundary.
@@ -516,11 +517,7 @@ pub async fn messages(
                         content: &m.content,
                     })
                     .collect();
-                match tokenizer.render_chat_with_tools(
-                    &tok_msgs,
-                    true,
-                    tools_openai.as_ref(),
-                ) {
+                match tokenizer.render_chat_with_tools(&tok_msgs, true, tools_openai.as_ref()) {
                     Ok(p) => Some(p),
                     Err(e) => {
                         return (
@@ -683,7 +680,10 @@ pub(crate) fn decide_anthropic_stop(
     content: &str,
 ) -> (&'static str, Option<String>) {
     if hit_cancel {
-        return ("stop_sequence", Some(ANTHROPIC_CANCELLED_SENTINEL.to_string()));
+        return (
+            "stop_sequence",
+            Some(ANTHROPIC_CANCELLED_SENTINEL.to_string()),
+        );
     }
     if tool_call_limit_hit {
         return (
@@ -1258,11 +1258,7 @@ impl BlockEmitter {
 
     /// Dispatch a [`crate::chat::StreamEvent`]. Pairs of `ToolCallHeader`
     /// + `ToolCallArgs` are buffered into a single `emit_tool_use` call.
-    fn handle(
-        &mut self,
-        ev: crate::chat::StreamEvent,
-        hit_tool_use: &mut bool,
-    ) -> Vec<Event> {
+    fn handle(&mut self, ev: crate::chat::StreamEvent, hit_tool_use: &mut bool) -> Vec<Event> {
         use crate::chat::StreamEvent as SE;
         match ev {
             SE::Content(s) => self.emit_text(&s),
@@ -1538,11 +1534,7 @@ mod tests {
     fn block_emitter_text_after_tool_use_opens_new_text_block() {
         let mut em = BlockEmitter::new();
         let mut events = Vec::new();
-        events.extend(em.emit_tool_use(
-            "call_1".into(),
-            "f".into(),
-            "{}".into(),
-        ));
+        events.extend(em.emit_tool_use("call_1".into(), "f".into(), "{}".into()));
         events.extend(em.emit_text("more text"));
         events.extend(em.close_current());
 
@@ -1588,30 +1580,23 @@ mod tests {
     #[test]
     fn block_emitter_shards_long_tool_use_args() {
         // 100-byte ASCII args → at least 3 deltas with target=32.
-        let long_args = format!(
-            r#"{{"city":"{}","unit":"celsius"}}"#,
-            "A".repeat(70)
-        );
+        let long_args = format!(r#"{{"city":"{}","unit":"celsius"}}"#, "A".repeat(70));
         assert!(long_args.len() > 96);
         let mut em = BlockEmitter::new();
-        let events = em.emit_tool_use(
-            "call_long".into(),
-            "get_weather".into(),
-            long_args.clone(),
-        );
+        let events = em.emit_tool_use("call_long".into(), "get_weather".into(), long_args.clone());
         let names = event_names(&events);
         // Expected: 1× content_block_start, N× content_block_delta,
         // 1× content_block_stop.
-        let n_deltas = names
-            .iter()
-            .filter(|n| *n == "content_block_delta")
-            .count();
+        let n_deltas = names.iter().filter(|n| *n == "content_block_delta").count();
         assert!(
             n_deltas >= 3,
             "expected ≥3 input_json_delta shards for {}-byte args, got {n_deltas}: {names:?}",
             long_args.len()
         );
-        assert_eq!(names.first().map(String::as_str), Some("content_block_start"));
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("content_block_start")
+        );
         assert_eq!(names.last().map(String::as_str), Some("content_block_stop"));
     }
 
@@ -1772,16 +1757,14 @@ mod tests {
 
     #[test]
     fn stop_decision_end_turn_when_nothing_special_happened() {
-        let (reason, seq) =
-            decide_anthropic_stop(false, false, false, false, 5, 32, &[], "");
+        let (reason, seq) = decide_anthropic_stop(false, false, false, false, 5, 32, &[], "");
         assert_eq!(reason, "end_turn");
         assert!(seq.is_none(), "no stop_sequence on natural end_turn");
     }
 
     #[test]
     fn stop_decision_max_tokens_when_output_hits_cap() {
-        let (reason, seq) =
-            decide_anthropic_stop(false, false, false, false, 32, 32, &[], "");
+        let (reason, seq) = decide_anthropic_stop(false, false, false, false, 32, 32, &[], "");
         assert_eq!(reason, "max_tokens");
         assert!(seq.is_none());
     }
@@ -1807,8 +1790,7 @@ mod tests {
 
     #[test]
     fn stop_decision_tool_use_no_sentinel_for_normal_tool_call() {
-        let (reason, seq) =
-            decide_anthropic_stop(false, false, true, false, 5, 32, &[], "");
+        let (reason, seq) = decide_anthropic_stop(false, false, true, false, 5, 32, &[], "");
         assert_eq!(reason, "tool_use");
         assert!(
             seq.is_none(),
@@ -1823,9 +1805,7 @@ mod tests {
         // the standard "tool_use" (Anthropic enum has no dedicated
         // value) but surfaces __tool_call_iteration_limit__ on
         // stop_sequence so callers can tell capped from normal stops.
-        let (reason, seq) = decide_anthropic_stop(
-            false, true, true, false, 5, 32, &[], "",
-        );
+        let (reason, seq) = decide_anthropic_stop(false, true, true, false, 5, 32, &[], "");
         assert_eq!(reason, "tool_use");
         assert_eq!(
             seq.as_deref(),
@@ -1838,9 +1818,7 @@ mod tests {
     fn stop_decision_tool_call_limit_fires_even_without_explicit_tool_use_event() {
         // The cap can fire on the FIRST attempted tool open (no
         // hit_tool_use event observed yet). The flag alone is enough.
-        let (reason, seq) = decide_anthropic_stop(
-            false, true, false, false, 5, 32, &[], "",
-        );
+        let (reason, seq) = decide_anthropic_stop(false, true, false, false, 5, 32, &[], "");
         assert_eq!(reason, "tool_use");
         assert_eq!(seq.as_deref(), Some(ANTHROPIC_TOOL_CALL_LIMIT_SENTINEL));
     }
@@ -1851,9 +1829,8 @@ mod tests {
         // and max_tokens — the operator aborted, so the response should
         // reflect that, not whatever else was happening.
         let stops = vec!["<|END|>".to_string()];
-        let (reason, seq) = decide_anthropic_stop(
-            true, true, true, true, 32, 32, &stops, "hello<|END|>",
-        );
+        let (reason, seq) =
+            decide_anthropic_stop(true, true, true, true, 32, 32, &stops, "hello<|END|>");
         assert_eq!(reason, "stop_sequence");
         assert_eq!(seq.as_deref(), Some(ANTHROPIC_CANCELLED_SENTINEL));
     }
@@ -1863,16 +1840,7 @@ mod tests {
         // When tool_call_limit_hit is true, the limit-cap branch wins
         // over a coincidental stop-sequence match in the buffered text.
         let stops = vec!["</s>".to_string()];
-        let (reason, seq) = decide_anthropic_stop(
-            false,
-            true,
-            true,
-            true,
-            5,
-            32,
-            &stops,
-            "hi</s>",
-        );
+        let (reason, seq) = decide_anthropic_stop(false, true, true, true, 5, 32, &stops, "hi</s>");
         assert_eq!(reason, "tool_use");
         assert_eq!(seq.as_deref(), Some(ANTHROPIC_TOOL_CALL_LIMIT_SENTINEL));
     }

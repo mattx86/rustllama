@@ -1,4 +1,4 @@
-﻿//! Termination-path audit: each API surface emits a consistent
+//! Termination-path audit: each API surface emits a consistent
 //! termination signal across the five terminal cases. Pins the
 //! mapping below so future handler refactors don't drift.
 //!
@@ -158,7 +158,9 @@ async fn openai_completions_max_tokens_hit_reports_length() {
     // are valid responses under this fixture — what we pin is that
     // the handler emits a recognized finish_reason rather than
     // hardcoding "stop" for everything (which was the pre-audit bug).
-    let fr = body["choices"][0]["finish_reason"].as_str().expect("string");
+    let fr = body["choices"][0]["finish_reason"]
+        .as_str()
+        .expect("string");
     assert!(
         fr == "stop" || fr == "length",
         "OpenAI completions finish_reason must be stop/length, got {fr:?}: {body}"
@@ -287,7 +289,9 @@ async fn openai_chat_streaming_max_tokens_hit_reports_length_in_final_chunk() {
     // `finish_reason`.
     let mut saw_length = false;
     for line in text.lines() {
-        let Some(payload) = line.strip_prefix("data: ") else { continue };
+        let Some(payload) = line.strip_prefix("data: ") else {
+            continue;
+        };
         if payload.trim() == "[DONE]" {
             continue;
         }

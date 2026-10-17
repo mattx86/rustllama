@@ -23,9 +23,13 @@ fn run<E: Fn(&[f32], &mut [u8]), D: Fn(&[u8], &mut [f32])>(
     let mut s = 0x12345u64;
     let mut src = vec![0f32; n];
     for v in src.iter_mut() {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u1 = ((s >> 11) as u32 & 0x00FF_FFFF) as f32 / (1u32 << 24) as f32;
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u2 = ((s >> 11) as u32 & 0x00FF_FFFF) as f32 / (1u32 << 24) as f32;
         let mag = (-2.0 * u1.ln().max(-37.0)).sqrt();
         *v = mag * (2.0 * std::f32::consts::PI * u2).cos() * 0.02;

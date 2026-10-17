@@ -128,8 +128,16 @@ pub fn detect_nvidia() -> Option<NvidiaInfo> {
             cu_mem(&mut mem, dev);
             let mut major: c_int = 0;
             let mut minor: c_int = 0;
-            cu_attr(&mut major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev);
-            cu_attr(&mut minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);
+            cu_attr(
+                &mut major,
+                CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                dev,
+            );
+            cu_attr(
+                &mut minor,
+                CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                dev,
+            );
             gpus.push(NvidiaGpu {
                 index: i as u32,
                 name,
@@ -247,8 +255,7 @@ unsafe fn nvidia_free_vram_inner(lib: &libloading::Library, device_index: u32) -
         .ok()?;
     // Best-effort: save/restore the thread's current context so this probe
     // leaves no CUDA thread state behind. Missing on very old drivers → skip.
-    let cu_getcur: Option<libloading::Symbol<CuCtxGetCurrent>> =
-        lib.get(b"cuCtxGetCurrent\0").ok();
+    let cu_getcur: Option<libloading::Symbol<CuCtxGetCurrent>> = lib.get(b"cuCtxGetCurrent\0").ok();
 
     let mut dev: c_int = 0;
     if cu_get(&mut dev, device_index as c_int) != CUDA_SUCCESS {

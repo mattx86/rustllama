@@ -196,7 +196,11 @@ fn collect_tensors(weights: &LlamaWeights) -> Vec<TensorInfo> {
                     out.push(info_of(t));
                 }
             }
-            HybridFfn::Dense { w_gate, w_up, w_down } => {
+            HybridFfn::Dense {
+                w_gate,
+                w_up,
+                w_down,
+            } => {
                 out.push(info_of(w_gate));
                 out.push(info_of(w_up));
                 out.push(info_of(w_down));
@@ -339,11 +343,7 @@ impl HeatPlan {
 ///
 /// `tiers` must be non-empty. Returns a [`HeatPlan`]; check `placement_error`
 /// before applying.
-pub fn plan_from_tiers(
-    weights: &LlamaWeights,
-    tiers: &[Tier],
-    cpu_allowed: bool,
-) -> HeatPlan {
+pub fn plan_from_tiers(weights: &LlamaWeights, tiers: &[Tier], cpu_allowed: bool) -> HeatPlan {
     let mut tensors = collect_tensors(weights);
     // Hottest first; within a heat class, largest first (pack big hot tensors
     // onto the fast tier before small ones).
@@ -532,7 +532,10 @@ fn build_tiers(
         let free = rustllama_runtime::gpu_detect::nvidia_free_vram_bytes(i)
             .unwrap_or(info.total_mem_bytes);
         catalog.push(GpuCatalogEntry {
-            target: DeviceTarget { backend: GpuBackend::Cuda, device_index: i },
+            target: DeviceTarget {
+                backend: GpuBackend::Cuda,
+                device_index: i,
+            },
             perf_score: perf,
             free_vram_bytes: free,
             total_vram_bytes: info.total_mem_bytes,
@@ -558,7 +561,10 @@ fn build_tiers(
                 // "VRAM" is a shared-RAM aperture anyway).
                 let _ = &slug; // consumed above by the perf lookup
                 catalog.push(GpuCatalogEntry {
-                    target: DeviceTarget { backend: GpuBackend::Sycl, device_index: idx },
+                    target: DeviceTarget {
+                        backend: GpuBackend::Sycl,
+                        device_index: idx,
+                    },
                     perf_score: perf,
                     free_vram_bytes: info.vram_bytes,
                     total_vram_bytes: info.vram_bytes,
@@ -753,8 +759,8 @@ fn host_has_dedicated_vram(fallback_device_index: u32) -> bool {
     if rustllama_models::accel::cuda_active() {
         return true;
     }
-    let idx = rustllama_models::accel::first_enabled_sycl_device_index()
-        .unwrap_or(fallback_device_index);
+    let idx =
+        rustllama_models::accel::first_enabled_sycl_device_index().unwrap_or(fallback_device_index);
     match rustllama_kernels_sycl::device_info(idx) {
         Ok(info) => !info.is_integrated,
         Err(_) => false,
@@ -776,7 +782,10 @@ mod tests {
     }
     fn gpu_tier(idx: u32, perf: f32, budget: u64) -> Tier {
         Tier {
-            kind: TierKind::Gpu(DeviceTarget { backend: GpuBackend::Cuda, device_index: idx }),
+            kind: TierKind::Gpu(DeviceTarget {
+                backend: GpuBackend::Cuda,
+                device_index: idx,
+            }),
             perf_score: perf,
             budget_bytes: budget,
             total_bytes: budget,
@@ -796,7 +805,10 @@ mod tests {
         assert_eq!(classify_heat("output.weight"), Heat::LmHead);
         assert_eq!(classify_heat("blk.3.attn_output.weight"), Heat::Hot);
         assert_eq!(classify_heat("token_embd.weight"), Heat::Embedding);
-        assert_eq!(classify_heat("blk.7.ffn_gate_exps.weight"), Heat::RoutedExpert);
+        assert_eq!(
+            classify_heat("blk.7.ffn_gate_exps.weight"),
+            Heat::RoutedExpert
+        );
         assert_eq!(classify_heat("blk.7.ffn_gate.weight"), Heat::Hot);
         assert_eq!(classify_heat("blk.2.ffn_gate_inp.weight"), Heat::Hot);
     }
@@ -855,7 +867,10 @@ mod tests {
         ];
         let plan = plan_from_tiers(&w, &tiers, true);
         // Attn (Hot) must be on the CPU (fastest), so attn_device is None.
-        assert_eq!(plan.assignments.get("blk.0.attn_q.weight"), Some(&TierKind::Cpu));
+        assert_eq!(
+            plan.assignments.get("blk.0.attn_q.weight"),
+            Some(&TierKind::Cpu)
+        );
         assert!(plan.attn_device.is_none());
         assert!(plan.placement_error.is_none());
     }
@@ -867,10 +882,7 @@ mod tests {
         let w = dense_weights();
         // F32 bytes: attn tensors = 40 each, ffn = 80 each, embd/head = 400.
         // Budget 400 fits exactly one 400-byte tensor (embd or head).
-        let tiers = vec![
-            gpu_tier(0, 100.0, 400),
-            cpu_tier(10.0, 1 << 30),
-        ];
+        let tiers = vec![gpu_tier(0, 100.0, 400), cpu_tier(10.0, 1 << 30)];
         let plan = plan_from_tiers(&w, &tiers, true);
         let gpu_bytes = plan.gpu_resident_bytes;
         assert!(gpu_bytes > 0 && gpu_bytes <= 400, "gpu got {gpu_bytes}");
@@ -892,7 +904,10 @@ mod tests {
         let w = dense_weights();
         let tiers = vec![gpu_tier(0, 100.0, 1 << 30), cpu_tier(10.0, 1 << 30)];
         let plan = plan_from_tiers(&w, &tiers, true);
-        assert_eq!(plan.cpu_resident_bytes, 0, "all weights should fit the fast GPU");
+        assert_eq!(
+            plan.cpu_resident_bytes, 0,
+            "all weights should fit the fast GPU"
+        );
         assert!(plan.attn_device.is_some(), "attention is on the GPU");
         assert_eq!(plan.distinct_gpu_count, 1);
     }
@@ -902,8 +917,8 @@ mod tests {
         // Two GPUs; the faster one (idx 1) fills first with the hottest.
         let w = dense_weights();
         let tiers = vec![
-            gpu_tier(0, 20.0, 400),  // slower, small
-            gpu_tier(1, 90.0, 400),  // faster, small
+            gpu_tier(0, 20.0, 400), // slower, small
+            gpu_tier(1, 90.0, 400), // faster, small
             cpu_tier(5.0, 1 << 30),
         ];
         let plan = plan_from_tiers(&w, &tiers, true);
@@ -913,7 +928,10 @@ mod tests {
         let attn_q = plan.assignments.get("blk.0.attn_q.weight").copied();
         assert_eq!(
             attn_q,
-            Some(TierKind::Gpu(DeviceTarget { backend: GpuBackend::Cuda, device_index: 1 })),
+            Some(TierKind::Gpu(DeviceTarget {
+                backend: GpuBackend::Cuda,
+                device_index: 1
+            })),
             "hottest attn tensor should be on the faster GPU (idx 1)"
         );
         assert_eq!(plan.attn_device.unwrap().device_index, 1);

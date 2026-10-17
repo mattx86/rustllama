@@ -67,9 +67,10 @@ pub fn begin() {
 pub fn record(name: &str, x: &[f32]) {
     let key = parent_name(name);
     let mut map = data().lock().unwrap();
-    let acc = map
-        .entry(key.to_string())
-        .or_insert_with(|| Accum { sumsq: vec![0.0; x.len()], samples: 0 });
+    let acc = map.entry(key.to_string()).or_insert_with(|| Accum {
+        sumsq: vec![0.0; x.len()],
+        samples: 0,
+    });
     if acc.sumsq.len() != x.len() {
         return;
     }
@@ -101,8 +102,14 @@ mod tests {
 
     #[test]
     fn parent_name_strips_expert_suffix() {
-        assert_eq!(parent_name("blk.0.ffn_gate_exps.weight.e7"), "blk.0.ffn_gate_exps.weight");
-        assert_eq!(parent_name("blk.12.ffn_down_exps.weight.e255"), "blk.12.ffn_down_exps.weight");
+        assert_eq!(
+            parent_name("blk.0.ffn_gate_exps.weight.e7"),
+            "blk.0.ffn_gate_exps.weight"
+        );
+        assert_eq!(
+            parent_name("blk.12.ffn_down_exps.weight.e255"),
+            "blk.12.ffn_down_exps.weight"
+        );
         // Non-expert names untouched.
         assert_eq!(parent_name("blk.0.attn_q.weight"), "blk.0.attn_q.weight");
         // `.e` not followed by digits is not an expert suffix.

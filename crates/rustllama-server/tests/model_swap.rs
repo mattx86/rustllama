@@ -1,4 +1,4 @@
-﻿//! Integration tests for the hot-model-swap surface:
+//! Integration tests for the hot-model-swap surface:
 //!   - `POST /v1/models/load` with an inline path
 //!   - `POST /v1/models/default` to promote a loaded model
 //!   - `POST /v1/models/unload` to remove one
@@ -44,8 +44,7 @@ async fn json_get(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Val
         .unwrap();
     let status = resp.status();
     let bytes = to_bytes(resp.into_body(), 8192).await.unwrap();
-    let body: serde_json::Value =
-        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, body)
 }
 
@@ -68,8 +67,7 @@ async fn json_post(
         .unwrap();
     let status = resp.status();
     let bytes = to_bytes(resp.into_body(), 8192).await.unwrap();
-    let body: serde_json::Value =
-        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, body)
 }
 
@@ -236,11 +234,7 @@ async fn warm_pool_evicts_lru_when_capacity_exceeded() {
     // Cap the pool at 3 with model "m0" as default. Insert m1, m2, m3
     // → at that point we're at 4 → eviction kicks in. The LRU non-
     // default entry must be evicted; m0 (default) is pinned.
-    let state = rustllama_server::AppState::with_max_loaded(
-        fresh_serving("m0"),
-        "test".into(),
-        3,
-    );
+    let state = rustllama_server::AppState::with_max_loaded(fresh_serving("m0"), "test".into(), 3);
 
     state.upsert(fresh_serving("m1")).await;
     state.upsert(fresh_serving("m2")).await;
@@ -249,12 +243,8 @@ async fn warm_pool_evicts_lru_when_capacity_exceeded() {
     // Insert m3 → pool now 4, cap 3 → LRU non-default (m2) gets evicted.
     state.upsert(fresh_serving("m3")).await;
 
-    let list: std::collections::HashSet<String> = state
-        .list()
-        .await
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect();
+    let list: std::collections::HashSet<String> =
+        state.list().await.into_iter().map(|(id, _)| id).collect();
     assert!(list.contains("m0"), "default must survive");
     assert!(list.contains("m1"), "recently touched must survive");
     assert!(list.contains("m3"), "newly inserted must survive");
@@ -267,23 +257,15 @@ async fn warm_pool_never_evicts_default_even_when_default_is_lru() {
     // m0 is default. After upserts of m1/m2 we resolve m1 and m2 but
     // never touch m0 again. With cap=2, adding m3 should evict the
     // older of m1/m2, NOT m0.
-    let state = rustllama_server::AppState::with_max_loaded(
-        fresh_serving("m0"),
-        "test".into(),
-        2,
-    );
+    let state = rustllama_server::AppState::with_max_loaded(fresh_serving("m0"), "test".into(), 2);
     state.upsert(fresh_serving("m1")).await;
     // Cap=2 means inserting m1 already evicts something — m0 is
     // pinned, so nothing else to evict, len stays at 2.
     // Touch m1.
     let _ = state.resolve(Some("m1")).await;
     state.upsert(fresh_serving("m2")).await;
-    let list: std::collections::HashSet<String> = state
-        .list()
-        .await
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect();
+    let list: std::collections::HashSet<String> =
+        state.list().await.into_iter().map(|(id, _)| id).collect();
     assert!(list.contains("m0"), "default must survive at the cap");
     assert!(list.contains("m2"), "newly inserted must survive");
     assert_eq!(list.len(), 2);
@@ -291,11 +273,7 @@ async fn warm_pool_never_evicts_default_even_when_default_is_lru() {
 
 #[tokio::test]
 async fn warm_pool_zero_cap_disables_eviction() {
-    let state = rustllama_server::AppState::with_max_loaded(
-        fresh_serving("m0"),
-        "test".into(),
-        0,
-    );
+    let state = rustllama_server::AppState::with_max_loaded(fresh_serving("m0"), "test".into(), 0);
     for i in 1..10 {
         state.upsert(fresh_serving(&format!("m{i}"))).await;
     }
@@ -305,11 +283,7 @@ async fn warm_pool_zero_cap_disables_eviction() {
 
 #[tokio::test]
 async fn warm_pool_shrinking_cap_triggers_immediate_eviction() {
-    let state = rustllama_server::AppState::with_max_loaded(
-        fresh_serving("m0"),
-        "test".into(),
-        5,
-    );
+    let state = rustllama_server::AppState::with_max_loaded(fresh_serving("m0"), "test".into(), 5);
     for i in 1..5 {
         state.upsert(fresh_serving(&format!("m{i}"))).await;
     }
@@ -320,12 +294,8 @@ async fn warm_pool_shrinking_cap_triggers_immediate_eviction() {
     // Shrink the cap to 3 — m2 and m4 (the LRUs after touching m1/m3)
     // should be evicted; m0 (default), m1, m3 survive.
     state.set_max_loaded(3).await;
-    let list: std::collections::HashSet<String> = state
-        .list()
-        .await
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect();
+    let list: std::collections::HashSet<String> =
+        state.list().await.into_iter().map(|(id, _)| id).collect();
     assert_eq!(list.len(), 3);
     assert!(list.contains("m0"));
     assert!(list.contains("m1"));

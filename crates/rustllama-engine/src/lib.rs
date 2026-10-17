@@ -15,27 +15,27 @@ use serde::{Deserialize, Serialize};
 
 pub mod batch_scheduler;
 pub mod beam;
-pub mod inference;
 pub mod expert_cache;
 pub mod gbnf;
 pub mod grammar;
+pub mod inference;
 pub mod kv_backend;
 pub mod kv_persist;
 pub mod load_options;
 pub mod measurement;
 pub mod memory_budget;
 pub mod multi_gpu;
-pub mod pagelock;
 pub mod paged_batch;
-pub mod prefix_cache;
+pub mod pagelock;
 pub mod placement_auto;
+pub mod prefix_cache;
 pub mod sampler_gpu;
 pub mod sampling;
 pub mod speculative;
 pub mod sycl_accel;
-pub mod tuner_apply;
 pub mod sycl_resources;
 pub mod tool_grammar;
+pub mod tuner_apply;
 
 pub use beam::{BeamHypothesis, BeamParams};
 pub use inference::{CpuEngine, CpuEngineError};
@@ -44,26 +44,26 @@ pub use load_options::{LoadOptions, LoadOptionsInput};
 // (which don't depend on `rustllama-models` directly) can drive them at the
 // few non-`promote_memory` sites (calibration tooling, serve/HTTP cache
 // winners, the kv-dtype sweep) instead of a process-global `set_var`.
-pub use rustllama_models::accel::{
-    set_hybrid_kv_any, set_prefill_batched_hybrid, set_ssm_prefill_chunked, set_zerocopy_weights,
-};
+pub use rustllama_models::accel::moe_dev_resident_hits;
 /// P19: install the adaptive per-kv_len-bucket flash-attn-v3 KV_TILE winners so
 /// the CLI/server (no direct `rustllama-models` dep) can apply the tuner-cache
 /// winners at load. Forwards to `accel::set_flash_v3_kv_tiles`.
 pub use rustllama_models::accel::set_flash_v3_kv_tiles;
-pub use rustllama_models::accel::moe_dev_resident_hits;
-pub use rustllama_models::accel::set_synthetic_run;
 /// P5b: force the default-off GPU fusions OFF (imatrix recording needs every
 /// tensor to route through the base `matvec_tensor_dispatch` hook).
 pub use rustllama_models::accel::set_fusions_disabled;
-pub use rustllama_models::accel::{sycl_tier_self_check, SyclTierCheck};
+pub use rustllama_models::accel::set_synthetic_run;
 pub use rustllama_models::accel::{amd_npu_perf_probe, npu_perf_probe};
+pub use rustllama_models::accel::{
+    set_hybrid_kv_any, set_prefill_batched_hybrid, set_ssm_prefill_chunked, set_zerocopy_weights,
+};
+pub use rustllama_models::accel::{sycl_tier_self_check, SyclTierCheck};
 pub use rustllama_models::imatrix_collect;
 pub use rustllama_models::kv_bias;
 pub use rustllama_models::llama_arch::kv_whitening_active_for;
-pub use rustllama_models::vision_arch::PlaceholderMode;
 pub use rustllama_models::llama_arch::KvDtype;
-pub use sycl_accel::{SyclAccelerator, SyclAccelError};
+pub use rustllama_models::vision_arch::PlaceholderMode;
+pub use sycl_accel::{SyclAccelError, SyclAccelerator};
 pub use sycl_resources::{SyclEngineResources, SyclResourcesError, UsmRawBuffer};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -548,7 +548,8 @@ impl CumulativeStats {
             return;
         }
         self.total_spec_rounds.fetch_add(1, Ordering::Relaxed);
-        self.total_spec_drafted.fetch_add(drafted, Ordering::Relaxed);
+        self.total_spec_drafted
+            .fetch_add(drafted, Ordering::Relaxed);
         self.total_spec_accepted
             .fetch_add(accepted.min(drafted), Ordering::Relaxed);
     }
@@ -894,13 +895,11 @@ mod vision_tests {
     /// (the gate looks at `is_empty`, not the presence of the field).
     #[test]
     fn reject_if_has_images_passes_when_images_vec_is_empty() {
-        let msgs = [
-            ChatMessage {
-                role: "user".into(),
-                content: "hi".into(),
-                images: Vec::new(),
-            },
-        ];
+        let msgs = [ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            images: Vec::new(),
+        }];
         assert!(reject_if_has_images(&msgs).is_ok());
     }
 
@@ -982,7 +981,13 @@ mod vision_tests {
 mod cumulative_stats_tests {
     use super::*;
 
-    fn req(prefill_ms: f64, decode_ms: f64, prefilled: u32, hits: u32, generated: u32) -> RequestStats {
+    fn req(
+        prefill_ms: f64,
+        decode_ms: f64,
+        prefilled: u32,
+        hits: u32,
+        generated: u32,
+    ) -> RequestStats {
         RequestStats {
             prefill_ms,
             decode_ms,

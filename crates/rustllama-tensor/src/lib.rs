@@ -44,9 +44,9 @@ impl Device {
             return Ok(Self::Cpu);
         }
         if let Some(rest) = s.strip_prefix("sycl:").or_else(|| s.strip_prefix("SYCL:")) {
-            let idx: u32 = rest.parse().map_err(|_| {
-                format!("device `{s}`: invalid SYCL index after `sycl:`")
-            })?;
+            let idx: u32 = rest
+                .parse()
+                .map_err(|_| format!("device `{s}`: invalid SYCL index after `sycl:`"))?;
             return Ok(Self::Sycl(idx));
         }
         Err(format!(
@@ -911,7 +911,9 @@ impl Storage {
         len: usize,
         free_fn: Box<dyn FnOnce(*mut u8) + Send + Sync>,
     ) -> Self {
-        Self::SyclUsm(Arc::new(SyclUsmAllocation::new_with_free(ptr, len, free_fn)))
+        Self::SyclUsm(Arc::new(SyclUsmAllocation::new_with_free(
+            ptr, len, free_fn,
+        )))
     }
 
     /// Wrap an externally-allocated, backend-tagged device pointer + free
@@ -1283,7 +1285,11 @@ impl Tensor {
                     dtype: target,
                     strides: contiguous_strides(&info.dims),
                     shape: info.dims.clone(),
-                    storage: Storage::MmapBorrowed { backing, offset, len },
+                    storage: Storage::MmapBorrowed {
+                        backing,
+                        offset,
+                        len,
+                    },
                     name: name.to_string(),
                     // GGUF `ne` dims copied verbatim → shape is [in, out].
                     dim_order: DimOrder::GgmlNe,
@@ -1910,8 +1916,7 @@ mod tests {
                 ptr,
                 len,
                 Box::new(move |p| {
-                    free_count_capture
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    free_count_capture.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(p, len)) };
                 }),
             )

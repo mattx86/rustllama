@@ -327,9 +327,9 @@ impl GbnfParser {
             }
             let mut base = stack.clone();
             base.pop(); // consume the char-set position
-            // Push the continuation only if more of THIS alternate remains.
-            // `End` ends the rule; `Alt` ends this alternate — either way the
-            // frame is done and we return to the caller's continuation below.
+                        // Push the continuation only if more of THIS alternate remains.
+                        // `End` ends the rule; `Alt` ends this alternate — either way the
+                        // frame is done and we return to the caller's continuation below.
             if !matches!(
                 self.grammar.rules[rule as usize][after],
                 Element::End | Element::Alt
@@ -497,9 +497,7 @@ impl<'a> Parser<'a> {
         let name = self.parse_name()?;
         self.skip_inline_space();
         if !self.consume_str("::=") {
-            return Err(GbnfError::Parse(format!(
-                "rule `{name}` missing `::=`"
-            )));
+            return Err(GbnfError::Parse(format!("rule `{name}` missing `::=`")));
         }
         let id = self.rule_id(&name);
         let body = self.parse_alternates()?;
@@ -629,7 +627,9 @@ impl<'a> Parser<'a> {
             }
             Some(b'{') => {
                 let (min, max) = self.parse_repeat_range()?;
-                Ok(vec![Element::RuleRef(self.make_bounded_rule(term, min, max))])
+                Ok(vec![Element::RuleRef(
+                    self.make_bounded_rule(term, min, max),
+                )])
             }
             _ => Ok(term),
         }
@@ -1006,7 +1006,12 @@ fn is_postfix(c: Option<u8>) -> bool {
 fn split_last_atom(term: Vec<Element>) -> (Vec<Element>, Vec<Element>) {
     let start = term
         .iter()
-        .rposition(|e| matches!(e, Element::Char(_) | Element::CharNot(_) | Element::RuleRef(_)))
+        .rposition(|e| {
+            matches!(
+                e,
+                Element::Char(_) | Element::CharNot(_) | Element::RuleRef(_)
+            )
+        })
         .unwrap_or(0);
     let head = term[..start].to_vec();
     let last = term[start..].to_vec();
@@ -1112,10 +1117,8 @@ mod tests {
 
     #[test]
     fn comments_and_whitespace() {
-        let g = CompiledGbnf::compile(
-            "# a greeting grammar\nroot ::= \"hi\"  # trailing\n",
-        )
-        .unwrap();
+        let g =
+            CompiledGbnf::compile("# a greeting grammar\nroot ::= \"hi\"  # trailing\n").unwrap();
         let mut p = GbnfParser::new(g);
         assert_ne!(feed(&mut p, "hi"), Step::Reject);
         assert!(p.can_terminate_now());

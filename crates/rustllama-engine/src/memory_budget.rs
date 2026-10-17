@@ -106,7 +106,9 @@ pub fn plan(f: &MemoryFacts) -> MemoryPlan {
         // committed too — reserve it so the expert cache, which is ALSO
         // pinned, can't be sized onto RAM the loader is about to lock.
         .saturating_add(f.locked_bytes);
-    let spendable = f.avail_phys.saturating_sub(reserve.saturating_add(committed));
+    let spendable = f
+        .avail_phys
+        .saturating_sub(reserve.saturating_add(committed));
     let mut expert = (spendable / EXPERT_SHARE_DEN).saturating_mul(EXPERT_SHARE_NUM);
     expert = expert.min(f.expert_pool_bytes);
     if f.explicit_cap_bytes > 0 {
@@ -195,7 +197,10 @@ mod tests {
         assert!(with.expert_cache_bytes < without.expert_cache_bytes);
         // locked_bytes == 0 is byte-identical to omitting the field (the
         // `lock_ram_mb` unset/off guard).
-        let zero = plan(&MemoryFacts { locked_bytes: 0, ..base_facts() });
+        let zero = plan(&MemoryFacts {
+            locked_bytes: 0,
+            ..base_facts()
+        });
         assert_eq!(zero, without);
         // Locking more than the box can hold saturates spendable to 0 and
         // flags exhaustion rather than underflowing.
@@ -215,7 +220,11 @@ mod tests {
         // spendable = 5 GB − 2 GB − ~1.36 GB ≈ 1.65 GB; expert = 3/4 of that.
         assert!(!p.exhausted);
         assert!(p.expert_cache_bytes > GB, "got {}", p.expert_cache_bytes);
-        assert!(p.expert_cache_bytes < 2 * GB, "got {}", p.expert_cache_bytes);
+        assert!(
+            p.expert_cache_bytes < 2 * GB,
+            "got {}",
+            p.expert_cache_bytes
+        );
         // Never exceeds what remains after reserve + projections.
         assert!(p.expert_cache_bytes <= p.spendable_bytes);
     }

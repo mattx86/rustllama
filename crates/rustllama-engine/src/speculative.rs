@@ -181,10 +181,7 @@ pub fn accept_reject(
 /// function is that limit computed exactly, making greedy
 /// speculative output equal to classic greedy TOKEN FOR TOKEN by
 /// construction rather than with high probability.
-pub fn accept_reject_greedy(
-    drafts: &[DraftToken],
-    target_probs: &[&[f32]],
-) -> SpeculationOutcome {
+pub fn accept_reject_greedy(drafts: &[DraftToken], target_probs: &[&[f32]]) -> SpeculationOutcome {
     assert_eq!(
         target_probs.len(),
         drafts.len() + 1,
@@ -539,10 +536,7 @@ fn multinomial(probs: &[f32], rng: &mut Rng) -> u32 {
         }
     }
     // Fall back: return the last non-zero index.
-    (probs
-        .iter()
-        .rposition(|p| *p > 0.0)
-        .unwrap_or(0)) as u32
+    (probs.iter().rposition(|p| *p > 0.0).unwrap_or(0)) as u32
 }
 
 fn argmax(probs: &[f32]) -> u32 {
@@ -626,7 +620,12 @@ mod tests {
         let p1 = vec![0.0, 0.0, 1.0, 0.0, 0.0];
         let p2 = vec![0.0, 0.0, 0.0, 1.0, 0.0];
         let p_bonus = vec![0.0, 0.0, 0.0, 0.0, 1.0];
-        let target = [p0.as_slice(), p1.as_slice(), p2.as_slice(), p_bonus.as_slice()];
+        let target = [
+            p0.as_slice(),
+            p1.as_slice(),
+            p2.as_slice(),
+            p_bonus.as_slice(),
+        ];
 
         let mut rng = mk_rng(0xC0FFEE);
         let out = accept_reject(&drafts, &target, &mut rng);
@@ -642,10 +641,7 @@ mod tests {
     /// so leaving typical acceptance OFF preserves the pre-P10a behavior.
     #[test]
     fn dispatch_rejection_is_byte_identical_to_accept_reject() {
-        let drafts = vec![
-            DraftToken { id: 1, q: 0.5 },
-            DraftToken { id: 2, q: 0.5 },
-        ];
+        let drafts = vec![DraftToken { id: 1, q: 0.5 }, DraftToken { id: 2, q: 0.5 }];
         let p0 = vec![0.05, 0.9, 0.05, 0.0, 0.0];
         let p1 = vec![0.5, 0.0, 0.0, 0.5, 0.0];
         let p2 = vec![0.25, 0.25, 0.25, 0.25, 0.0];
@@ -689,7 +685,12 @@ mod tests {
         let p1 = vec![0.0, 0.0, 1.0, 0.0, 0.0];
         let p2 = vec![0.0, 0.0, 0.0, 1.0, 0.0];
         let p_bonus = vec![0.0, 0.0, 0.0, 0.0, 1.0];
-        let target = [p0.as_slice(), p1.as_slice(), p2.as_slice(), p_bonus.as_slice()];
+        let target = [
+            p0.as_slice(),
+            p1.as_slice(),
+            p2.as_slice(),
+            p_bonus.as_slice(),
+        ];
         let mut rng = mk_rng(0xC0FFEE);
         let out = accept_reject_typical(&drafts, &target, 0.09, 0.3, &mut rng);
         assert_eq!(out.accepted, vec![1, 2, 3]);
@@ -710,10 +711,19 @@ mod tests {
         let p1 = vec![0.6, 0.39, 0.01, 0.0, 0.0]; // token2 (p=0.01) → reject
         let p2 = vec![0.25, 0.25, 0.25, 0.25, 0.0];
         let p_bonus = vec![1.0, 0.0, 0.0, 0.0, 0.0];
-        let target = [p0.as_slice(), p1.as_slice(), p2.as_slice(), p_bonus.as_slice()];
+        let target = [
+            p0.as_slice(),
+            p1.as_slice(),
+            p2.as_slice(),
+            p_bonus.as_slice(),
+        ];
         let mut rng = mk_rng(7);
         let out = accept_reject_typical(&drafts, &target, 0.09, 0.3, &mut rng);
-        assert_eq!(out.accepted, vec![1], "only draft[0] clears the typical bar");
+        assert_eq!(
+            out.accepted,
+            vec![1],
+            "only draft[0] clears the typical bar"
+        );
         // Replacement is sampled from p1 (support {0, 1, 2}).
         assert!(matches!(out.replacement, 0 | 1 | 2));
     }
@@ -744,7 +754,11 @@ mod tests {
         let target = [row.as_slice(), bonus.as_slice()];
         let mut rng = mk_rng(1);
         let out = accept_reject_typical(&drafts, &target, 0.09, 0.3, &mut rng);
-        assert_eq!(out.accepted, vec![0], "flat target lowers the bar below epsilon");
+        assert_eq!(
+            out.accepted,
+            vec![0],
+            "flat target lowers the bar below epsilon"
+        );
     }
 
     /// On a peaked (low-entropy) target the bar saturates at `epsilon`, so a
@@ -757,7 +771,10 @@ mod tests {
         let target = [p0.as_slice(), p_bonus.as_slice()];
         let mut rng = mk_rng(1);
         let out = accept_reject_typical(&drafts, &target, 0.09, 0.3, &mut rng);
-        assert!(out.accepted.is_empty(), "0.02 < epsilon on a peaked target → reject");
+        assert!(
+            out.accepted.is_empty(),
+            "0.02 < epsilon on a peaked target → reject"
+        );
     }
 
     #[test]
@@ -776,7 +793,10 @@ mod tests {
         let mut rng = mk_rng(42);
         let out = accept_reject(&drafts, &target, &mut rng);
         assert!(out.accepted.is_empty(), "must reject the disagreeing draft");
-        assert!(out.replacement != 1, "residual must pick something other than the rejected draft");
+        assert!(
+            out.replacement != 1,
+            "residual must pick something other than the rejected draft"
+        );
         // The replacement must come from {2, 3, 4} since p0 puts
         // zero mass on indices 0 and 1.
         assert!(matches!(out.replacement, 2 | 3 | 4));
@@ -822,10 +842,7 @@ mod tests {
         // Two runs with the same RNG seed + same inputs must produce
         // the same SpeculationOutcome. Pins the spec-decoding
         // path against seed-leak regressions.
-        let drafts = vec![
-            DraftToken { id: 1, q: 0.4 },
-            DraftToken { id: 2, q: 0.6 },
-        ];
+        let drafts = vec![DraftToken { id: 1, q: 0.4 }, DraftToken { id: 2, q: 0.6 }];
         let p0 = vec![0.0, 0.5, 0.3, 0.2];
         let p1 = vec![0.1, 0.0, 0.4, 0.5];
         let p_bonus = vec![0.25, 0.25, 0.25, 0.25];
@@ -909,10 +926,16 @@ mod tests {
             let lin = accept_reject(&drafts, &target, &mut r_lin);
             let tree = tree_accept_reject(&nodes, target_root, &target_next, &mut r_tree);
             assert_eq!(lin.accepted, tree.accepted, "chain accepted at seed {seed}");
-            assert_eq!(lin.replacement, tree.replacement, "chain replacement at seed {seed}");
+            assert_eq!(
+                lin.replacement, tree.replacement,
+                "chain replacement at seed {seed}"
+            );
             // For a chain, each accepted token IS its own node index.
             let expect_nodes: Vec<usize> = (0..tree.accepted.len()).collect();
-            assert_eq!(tree.accepted_nodes, expect_nodes, "chain node indices at seed {seed}");
+            assert_eq!(
+                tree.accepted_nodes, expect_nodes,
+                "chain node indices at seed {seed}"
+            );
         }
     }
 
@@ -947,12 +970,24 @@ mod tests {
         // Root children: node0=id1 (NOT argmax), node1=id2 (argmax). Then
         // node1's child node2=id5 (argmax of target_next[1]). node2 is a leaf.
         let nodes = vec![
-            TreeNode { id: 1, q: 0.5, parent: None },
-            TreeNode { id: 2, q: 0.5, parent: None },
-            TreeNode { id: 5, q: 0.5, parent: Some(1) },
+            TreeNode {
+                id: 1,
+                q: 0.5,
+                parent: None,
+            },
+            TreeNode {
+                id: 2,
+                q: 0.5,
+                parent: None,
+            },
+            TreeNode {
+                id: 5,
+                q: 0.5,
+                parent: Some(1),
+            },
         ];
         let target_root = [0.1f32, 0.2, 0.7, 0.0, 0.0, 0.0]; // argmax = 2 → node1
-        // target_next indexed by node: [node0, node1, node2].
+                                                             // target_next indexed by node: [node0, node1, node2].
         let tn0 = [1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0]; // unused (node0 not taken)
         let tn1 = [0.0f32, 0.0, 0.0, 0.0, 0.0, 1.0]; // argmax = 5 → node2
         let tn2 = [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // leaf bonus → argmax = 3
@@ -971,8 +1006,16 @@ mod tests {
         // both always reject (ratio 0). Residual = target_root with 1,2 struck
         // (already zero) → support {0, 3} → replacement ∈ {0, 3}, never 1 or 2.
         let nodes = vec![
-            TreeNode { id: 1, q: 0.9, parent: None },
-            TreeNode { id: 2, q: 0.9, parent: None },
+            TreeNode {
+                id: 1,
+                q: 0.9,
+                parent: None,
+            },
+            TreeNode {
+                id: 2,
+                q: 0.9,
+                parent: None,
+            },
         ];
         let target_root = [0.5f32, 0.0, 0.0, 0.5];
         let tn = [1.0f32, 0.0, 0.0, 0.0];
@@ -980,7 +1023,10 @@ mod tests {
         for seed in 0u64..64 {
             let mut rng = mk_rng(seed);
             let out = tree_accept_reject(&nodes, &target_root, &target_next, &mut rng);
-            assert!(out.accepted.is_empty(), "both siblings must reject at seed {seed}");
+            assert!(
+                out.accepted.is_empty(),
+                "both siblings must reject at seed {seed}"
+            );
             assert!(
                 matches!(out.replacement, 0 | 3),
                 "replacement from residual support {{0,3}}, got {} at seed {seed}",
@@ -1334,7 +1380,9 @@ pub struct MtpDrafter {
 
 impl Default for MtpDrafter {
     fn default() -> Self {
-        Self { mode: MtpSampleMode::Argmax }
+        Self {
+            mode: MtpSampleMode::Argmax,
+        }
     }
 }
 
@@ -1443,7 +1491,11 @@ pub fn build_mtp_tree(
     // Accumulated penalty history for the main path: `recent` plus the main
     // token chosen at each level so far. Only materialized when penalizing
     // (default penalties never touch it → byte-identical fast path).
-    let mut ctx: Vec<u32> = if penalize { recent.to_vec() } else { Vec::new() };
+    let mut ctx: Vec<u32> = if penalize {
+        recent.to_vec()
+    } else {
+        Vec::new()
+    };
     for (d, logits) in head_logits.iter().enumerate() {
         if logits.is_empty() {
             break;
@@ -1457,9 +1509,7 @@ pub fn build_mtp_tree(
             // drafter stops proposing the loop the sampler would reject anyway
             // (pinned by `mtp_tree_strong_repeat_demotes_seen_token`).
             let mut penalized = logits.clone();
-            crate::sampling::apply_all_penalties(
-                &mut penalized, &ctx, repeat, frequency, presence,
-            );
+            crate::sampling::apply_all_penalties(&mut penalized, &ctx, repeat, frequency, presence);
             top_k_softmax(&penalized, w)
         } else {
             top_k_softmax(logits, w)
@@ -1469,7 +1519,11 @@ pub fn build_mtp_tree(
         }
         let level_start = nodes.len();
         for (id, q) in topk {
-            nodes.push(TreeNode { id, q, parent: main_parent });
+            nodes.push(TreeNode {
+                id,
+                q,
+                parent: main_parent,
+            });
         }
         // The argmax (after penalties) candidate is pushed first, so the main
         // node is `level_start`. Extend the main-path context by it for the next
@@ -1506,7 +1560,11 @@ fn top_k_softmax(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
         return Vec::new();
     }
     let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let denom: f32 = logits.iter().map(|&v| (v - max_val).exp()).sum::<f32>().max(1e-30);
+    let denom: f32 = logits
+        .iter()
+        .map(|&v| (v - max_val).exp())
+        .sum::<f32>()
+        .max(1e-30);
     let inv = 1.0 / denom;
     let kk = k.min(logits.len());
     // Small k over a big vocab → a k-pass selection beats a full sort.
@@ -1525,7 +1583,10 @@ fn top_k_softmax(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
             break;
         }
         used[best] = true;
-        out.push((best as u32, ((best_v - max_val).exp() * inv).clamp(1e-30, 1.0)));
+        out.push((
+            best as u32,
+            ((best_v - max_val).exp() * inv).clamp(1e-30, 1.0),
+        ));
     }
     out
 }
@@ -1544,9 +1605,9 @@ mod mtp_drafter_tests {
     fn argmax_picks_max_logit_per_head() {
         let d = MtpDrafter::default();
         let heads = vec![
-            vec![0.0, 1.0, 0.5, -1.0],          // argmax = 1
-            vec![3.0, -2.0, 5.0, 4.9, 0.0],     // argmax = 2
-            vec![-1.0, -2.0, -3.0, -4.0],       // argmax = 0
+            vec![0.0, 1.0, 0.5, -1.0],      // argmax = 1
+            vec![3.0, -2.0, 5.0, 4.9, 0.0], // argmax = 2
+            vec![-1.0, -2.0, -3.0, -4.0],   // argmax = 0
         ];
         let drafts = d.propose(&heads);
         assert_eq!(drafts.len(), 3);
@@ -1608,7 +1669,11 @@ mod mtp_drafter_tests {
         for (d, (node, draft)) in nodes.iter().zip(chain.iter()).enumerate() {
             assert_eq!(node.id, draft.id, "level {d} id");
             assert!((node.q - draft.q).abs() < 1e-6, "level {d} q");
-            assert_eq!(node.parent, if d == 0 { None } else { Some(d - 1) }, "level {d} parent");
+            assert_eq!(
+                node.parent,
+                if d == 0 { None } else { Some(d - 1) },
+                "level {d} parent"
+            );
         }
         assert_eq!(tree_depths(&nodes), vec![0, 1, 2]);
     }
@@ -1668,7 +1733,11 @@ mod mtp_drafter_tests {
         }
         // And it is genuinely the pre-penalty tree (argmax-first caterpillar).
         assert_eq!(baseline[0].id, 1, "level-0 argmax");
-        assert_eq!(baseline[2].parent, Some(0), "level-1 hangs off the main node");
+        assert_eq!(
+            baseline[2].parent,
+            Some(0),
+            "level-1 hangs off the main node"
+        );
     }
 
     /// A strong repetition penalty on an already-seen token demotes it from the
@@ -1683,7 +1752,10 @@ mod mtp_drafter_tests {
         let heads = vec![vec![0.0f32, 2.0, 1.5, -1.0]];
         // No penalty: argmax token 1 is drafted (and it's the only node at w=1).
         let plain = build_mtp_tree(&heads, &[1], &[], 1.0, 0.0, 0.0);
-        assert_eq!(plain[0].id, 1, "without penalties the argmax (1) is drafted");
+        assert_eq!(
+            plain[0].id, 1,
+            "without penalties the argmax (1) is drafted"
+        );
 
         // Token 1 was recently generated; a strong repeat penalty (4.0) divides
         // its +2.0 logit to 0.5, dropping it below token 2's untouched 1.5. With
@@ -1691,14 +1763,23 @@ mod mtp_drafter_tests {
         let seen = [1u32];
         let penalized = build_mtp_tree(&heads, &[1], &seen, 4.0, 0.0, 0.0);
         assert_eq!(penalized.len(), 1);
-        assert_ne!(penalized[0].id, 1, "the seen token must be demoted out of the draft");
-        assert_eq!(penalized[0].id, 2, "the drafter picks the next-best unseen token");
+        assert_ne!(
+            penalized[0].id, 1,
+            "the seen token must be demoted out of the draft"
+        );
+        assert_eq!(
+            penalized[0].id, 2,
+            "the drafter picks the next-best unseen token"
+        );
 
         // At width 2 the seen token may still appear as a non-main sibling, but it
         // must NOT be the main (first/argmax) node — that governs the accepted
         // path, and demoting it there is the point.
         let w2 = build_mtp_tree(&heads, &[2], &seen, 4.0, 0.0, 0.0);
-        assert_eq!(w2[0].id, 2, "penalized argmax (main node) is the unseen token");
+        assert_eq!(
+            w2[0].id, 2,
+            "penalized argmax (main node) is the unseen token"
+        );
     }
 
     #[test]
@@ -1806,12 +1887,12 @@ mod ngram_tests {
         // 100) and at index 5..7 (followed by 200). The newest
         // earlier match wins, so we draft 200 first.
         let hist = vec![
-            10, 20, // X Y    (earlier-match-A)
+            10, 20,  // X Y    (earlier-match-A)
             100, // follow-A
             30, 40, //  filler
-            10, 20, // X Y    (earlier-match-B, newer)
+            10, 20,  // X Y    (earlier-match-B, newer)
             200, // follow-B
-            50, // filler
+            50,  // filler
             10, 20, // X Y    (query)
         ];
         let d = NgramDrafter::new(NgramDrafterConfig {

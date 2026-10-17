@@ -36,8 +36,7 @@ fn read_usize(s: &serde_json::Value, key: &str) -> usize {
     s.get(key)
         .unwrap_or_else(|| panic!("shapes.{key} missing"))
         .as_u64()
-        .unwrap_or_else(|| panic!("shapes.{key} not u64"))
-        as usize
+        .unwrap_or_else(|| panic!("shapes.{key} not u64")) as usize
 }
 
 #[test]
@@ -122,8 +121,10 @@ fn moe_ffn_one_into_parts_matches_python_reference() {
 
     let hidden = read_floats(v.get("hidden").expect("hidden"));
     let expected_gated = read_floats(v.get("expected_out_gated").expect("expected_out_gated"));
-    let expected_always_on =
-        read_floats(v.get("expected_out_always_on").expect("expected_out_always_on"));
+    let expected_always_on = read_floats(
+        v.get("expected_out_always_on")
+            .expect("expected_out_always_on"),
+    );
 
     // Scratch buffers (caller-managed in the production path).
     let mut gate_buf = vec![0f32; d_ff];
@@ -136,27 +137,53 @@ fn moe_ffn_one_into_parts_matches_python_reference() {
     // 1. With router-gated shared expert (qwen35moe convention).
     let mut out_gated = vec![0f32; d_model];
     moe_ffn_one_into_parts(
-        &hidden, &router, &RouterSpec::default(),
-        &gate_per_expert, &up_per_expert, &down_per_expert,
-        Some(&w_gate_shared), Some(&w_up_shared), Some(&w_down_shared),
+        &hidden,
+        &router,
+        &RouterSpec::default(),
+        &gate_per_expert,
+        &up_per_expert,
+        &down_per_expert,
+        Some(&w_gate_shared),
+        Some(&w_up_shared),
+        Some(&w_down_shared),
         Some(&shared_router_tensor),
-        d_model, d_ff, n_experts, top_k,
+        d_model,
+        d_ff,
+        n_experts,
+        top_k,
         &mut out_gated,
-        &mut gate_buf, &mut up_buf, &mut ff_buf, &mut down_buf,
-        &mut expert_logits, &mut picks,
+        &mut gate_buf,
+        &mut up_buf,
+        &mut ff_buf,
+        &mut down_buf,
+        &mut expert_logits,
+        &mut picks,
     );
 
     // 2. With always-on shared expert (DeepSeek-V3 convention).
     let mut out_always_on = vec![0f32; d_model];
     moe_ffn_one_into_parts(
-        &hidden, &router, &RouterSpec::default(),
-        &gate_per_expert, &up_per_expert, &down_per_expert,
-        Some(&w_gate_shared), Some(&w_up_shared), Some(&w_down_shared),
+        &hidden,
+        &router,
+        &RouterSpec::default(),
+        &gate_per_expert,
+        &up_per_expert,
+        &down_per_expert,
+        Some(&w_gate_shared),
+        Some(&w_up_shared),
+        Some(&w_down_shared),
         None, // shared_router absent → always-on
-        d_model, d_ff, n_experts, top_k,
+        d_model,
+        d_ff,
+        n_experts,
+        top_k,
         &mut out_always_on,
-        &mut gate_buf, &mut up_buf, &mut ff_buf, &mut down_buf,
-        &mut expert_logits, &mut picks,
+        &mut gate_buf,
+        &mut up_buf,
+        &mut ff_buf,
+        &mut down_buf,
+        &mut expert_logits,
+        &mut picks,
     );
 
     // Tolerance 1e-5: per-expert SwiGLU FFNs sum to O(0.1) outputs;
@@ -179,11 +206,28 @@ fn moe_ffn_one_into_parts_matches_python_reference() {
         let pass = max_abs < TOL;
         println!(
             "{label}: len={} max_abs={:.2e} (idx {}, got={:.6e} exp={:.6e}) tol={:.2e} pass={}",
-            got.len(), max_abs, argmax, got[argmax], exp[argmax], TOL, pass
+            got.len(),
+            max_abs,
+            argmax,
+            got[argmax],
+            exp[argmax],
+            TOL,
+            pass
         );
-        assert!(pass, "{label}: max abs error {max_abs} exceeded tolerance {TOL}");
+        assert!(
+            pass,
+            "{label}: max abs error {max_abs} exceeded tolerance {TOL}"
+        );
     };
 
-    cmp(&out_gated, &expected_gated, "out_gated (qwen35moe shared-router)");
-    cmp(&out_always_on, &expected_always_on, "out_always_on (DeepSeek-V3 always-on shared)");
+    cmp(
+        &out_gated,
+        &expected_gated,
+        "out_gated (qwen35moe shared-router)",
+    );
+    cmp(
+        &out_always_on,
+        &expected_always_on,
+        "out_always_on (DeepSeek-V3 always-on shared)",
+    );
 }

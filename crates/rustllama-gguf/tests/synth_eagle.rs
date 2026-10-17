@@ -49,13 +49,34 @@ fn synth_eagle_emits_adapter_metadata_and_tensors() {
     assert!(g.tensor("eagle.hnorm.weight").is_some());
 
     // Decoder block shapes (ggml ne = [in, out]).
-    assert_eq!(g.tensor("eagle.attn_q.weight").unwrap().dims, vec![d_model, d_q]);
-    assert_eq!(g.tensor("eagle.attn_k.weight").unwrap().dims, vec![d_model, d_kv]);
-    assert_eq!(g.tensor("eagle.attn_v.weight").unwrap().dims, vec![d_model, d_kv]);
-    assert_eq!(g.tensor("eagle.attn_output.weight").unwrap().dims, vec![d_q, d_model]);
-    assert_eq!(g.tensor("eagle.ffn_gate.weight").unwrap().dims, vec![d_model, d_ff]);
-    assert_eq!(g.tensor("eagle.ffn_up.weight").unwrap().dims, vec![d_model, d_ff]);
-    assert_eq!(g.tensor("eagle.ffn_down.weight").unwrap().dims, vec![d_ff, d_model]);
+    assert_eq!(
+        g.tensor("eagle.attn_q.weight").unwrap().dims,
+        vec![d_model, d_q]
+    );
+    assert_eq!(
+        g.tensor("eagle.attn_k.weight").unwrap().dims,
+        vec![d_model, d_kv]
+    );
+    assert_eq!(
+        g.tensor("eagle.attn_v.weight").unwrap().dims,
+        vec![d_model, d_kv]
+    );
+    assert_eq!(
+        g.tensor("eagle.attn_output.weight").unwrap().dims,
+        vec![d_q, d_model]
+    );
+    assert_eq!(
+        g.tensor("eagle.ffn_gate.weight").unwrap().dims,
+        vec![d_model, d_ff]
+    );
+    assert_eq!(
+        g.tensor("eagle.ffn_up.weight").unwrap().dims,
+        vec![d_model, d_ff]
+    );
+    assert_eq!(
+        g.tensor("eagle.ffn_down.weight").unwrap().dims,
+        vec![d_ff, d_model]
+    );
 
     // Tied by default: no own LM head / embedding.
     assert!(g.tensor("eagle.output.weight").is_none());
@@ -80,7 +101,13 @@ fn synth_eagle_own_lm_head_emits_output_and_embedding() {
     let d_model = base.d_model as u64;
     let vocab = base.vocab as u64;
     assert!(g.tensor("eagle.output_norm.weight").is_some());
-    assert_eq!(g.tensor("eagle.output.weight").unwrap().dims, vec![d_model, vocab]);
-    assert_eq!(g.tensor("eagle.token_embd.weight").unwrap().dims, vec![d_model, vocab]);
+    assert_eq!(
+        g.tensor("eagle.output.weight").unwrap().dims,
+        vec![d_model, vocab]
+    );
+    assert_eq!(
+        g.tensor("eagle.token_embd.weight").unwrap().dims,
+        vec![d_model, vocab]
+    );
     let _ = std::fs::remove_file(&path);
 }

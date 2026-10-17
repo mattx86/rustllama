@@ -305,15 +305,29 @@ impl IqGpuEncoder for CpuFallbackEncoder {
         let n = out_abs.len();
         if targets.len() != n * 8 || out_pos.len() != n || out_neg.len() != n {
             return Err(IqGpuError::BadInputSize {
-                got: targets.len(), expected: n * 8, n_chunks: n,
+                got: targets.len(),
+                expected: n * 8,
+                n_chunks: n,
             });
         }
         for i in 0..n {
             let chunk = &targets[i * 8..(i + 1) * 8];
             let (a, p, ng) = encode_iq_vec::best_iq1s_grid_all3(chunk, delta);
-            out_abs[i] = Iq8EltDeltaPick { grid_idx: a.grid_idx, signed_score: a.signed_score, norm_sq: a.norm_sq };
-            out_pos[i] = Iq8EltDeltaPick { grid_idx: p.grid_idx, signed_score: p.signed_score, norm_sq: p.norm_sq };
-            out_neg[i] = Iq8EltDeltaPick { grid_idx: ng.grid_idx, signed_score: ng.signed_score, norm_sq: ng.norm_sq };
+            out_abs[i] = Iq8EltDeltaPick {
+                grid_idx: a.grid_idx,
+                signed_score: a.signed_score,
+                norm_sq: a.norm_sq,
+            };
+            out_pos[i] = Iq8EltDeltaPick {
+                grid_idx: p.grid_idx,
+                signed_score: p.signed_score,
+                norm_sq: p.norm_sq,
+            };
+            out_neg[i] = Iq8EltDeltaPick {
+                grid_idx: ng.grid_idx,
+                signed_score: ng.signed_score,
+                norm_sq: ng.norm_sq,
+            };
         }
         Ok(())
     }

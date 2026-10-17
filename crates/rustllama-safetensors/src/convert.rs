@@ -25,9 +25,7 @@ use half::f16;
 use safetensors::tensor::TensorView;
 use safetensors::{Dtype as StDtype, SafeTensors};
 
-use crate::dequant::{
-    dequant_awq_int4_to_f16, dequant_gptq_int4_to_f16, DequantError,
-};
+use crate::dequant::{dequant_awq_int4_to_f16, dequant_gptq_int4_to_f16, DequantError};
 use crate::name_map::{map_hf_to_gguf, HfTensorKind};
 
 /// A converted tensor ready to hand to the model loader: the GGUF
@@ -141,22 +139,15 @@ pub enum ConvertError {
          GPTQ stores g_idx as int32"
     )]
     WrongGIdxDtype { gguf_name: String, dtype: StDtype },
-    #[error(
-        "group `{gguf_name}` qweight is {dims} dimensions; expected 2"
-    )]
+    #[error("group `{gguf_name}` qweight is {dims} dimensions; expected 2")]
     BadQweightRank { gguf_name: String, dims: usize },
-    #[error(
-        "group `{gguf_name}` scales is {dims} dimensions; expected 2"
-    )]
+    #[error("group `{gguf_name}` scales is {dims} dimensions; expected 2")]
     BadScalesRank { gguf_name: String, dims: usize },
     #[error(
         "plain tensor `{gguf_name}` has unsupported dtype {dtype:?}; \
          supported: F32, F16, BF16"
     )]
-    UnsupportedPlainDtype {
-        gguf_name: String,
-        dtype: StDtype,
-    },
+    UnsupportedPlainDtype { gguf_name: String, dtype: StDtype },
 }
 
 /// Convert a safetensors file's contents to a `Vec<ConvertedTensor>`
@@ -179,7 +170,9 @@ pub fn convert_safetensors_to_gguf_tensors(
         let Some(mapped) = map_hf_to_gguf(&hf_name) else {
             continue;
         };
-        let entry = groups.entry(mapped.gguf_name.clone()).or_insert_with(Group::new);
+        let entry = groups
+            .entry(mapped.gguf_name.clone())
+            .or_insert_with(Group::new);
         entry.add(mapped.kind, view);
     }
 
@@ -235,10 +228,7 @@ impl<'a> Group<'a> {
     }
 }
 
-fn convert_group(
-    gguf_name: &str,
-    group: Group<'_>,
-) -> Result<ConvertedTensor, ConvertError> {
+fn convert_group(gguf_name: &str, group: Group<'_>) -> Result<ConvertedTensor, ConvertError> {
     let [q, s, z, g, p] = group.counts();
     // Quant trio: all three required core tensors present, no plain.
     let is_quant = q == 1 && s == 1 && z == 1 && p == 0;
@@ -265,10 +255,7 @@ fn convert_group(
     convert_quant_trio(gguf_name, qweight, scales, qzeros, g_idx_view)
 }
 
-fn convert_plain(
-    gguf_name: &str,
-    view: TensorView<'_>,
-) -> Result<ConvertedTensor, ConvertError> {
+fn convert_plain(gguf_name: &str, view: TensorView<'_>) -> Result<ConvertedTensor, ConvertError> {
     let shape: Vec<u64> = view.shape().iter().map(|&d| d as u64).collect();
     match view.dtype() {
         StDtype::F32 => Ok(ConvertedTensor {
@@ -405,12 +392,10 @@ fn convert_quant_trio(
             // Scales shape is [n_groups, out_features].
             let n_groups = scales.shape()[0];
             if n_groups == 0 || in_f % n_groups != 0 {
-                return Err(ConvertError::Dequant(
-                    DequantError::GroupSizeMisaligned {
-                        group_size: 0,
-                        in_features: in_f,
-                    },
-                ));
+                return Err(ConvertError::Dequant(DequantError::GroupSizeMisaligned {
+                    group_size: 0,
+                    in_features: in_f,
+                }));
             }
             let group_size = in_f / n_groups;
             let buf = dequant_awq_int4_to_f16(
@@ -455,10 +440,7 @@ fn convert_quant_trio(
             transposed[j * in_features + i] = dequant[i * out_features + j];
         }
     }
-    let bytes: Vec<u8> = transposed
-        .iter()
-        .flat_map(|h| h.to_le_bytes())
-        .collect();
+    let bytes: Vec<u8> = transposed.iter().flat_map(|h| h.to_le_bytes()).collect();
     Ok(ConvertedTensor {
         gguf_name: gguf_name.into(),
         shape: vec![out_features as u64, in_features as u64],
@@ -509,26 +491,16 @@ mod tests {
         let norm_bytes = f16_bytes(&norm);
 
         let mut map: BTreeMap<String, TensorView<'_>> = BTreeMap::new();
-        let qw_view = TensorView::new(StDtype::I32, vec![in_f, out_packs], &qw_bytes)
-            .expect("qweight view");
-        let sc_view = TensorView::new(StDtype::F16, vec![n_groups, out_f], &sc_bytes)
-            .expect("scales view");
+        let qw_view =
+            TensorView::new(StDtype::I32, vec![in_f, out_packs], &qw_bytes).expect("qweight view");
+        let sc_view =
+            TensorView::new(StDtype::F16, vec![n_groups, out_f], &sc_bytes).expect("scales view");
         let qz_view = TensorView::new(StDtype::I32, vec![n_groups, out_packs], &qz_bytes)
             .expect("qzeros view");
-        let norm_view = TensorView::new(StDtype::F16, vec![out_f], &norm_bytes)
-            .expect("norm view");
-        map.insert(
-            "model.layers.0.self_attn.q_proj.qweight".into(),
-            qw_view,
-        );
-        map.insert(
-            "model.layers.0.self_attn.q_proj.scales".into(),
-            sc_view,
-        );
-        map.insert(
-            "model.layers.0.self_attn.q_proj.qzeros".into(),
-            qz_view,
-        );
+        let norm_view = TensorView::new(StDtype::F16, vec![out_f], &norm_bytes).expect("norm view");
+        map.insert("model.layers.0.self_attn.q_proj.qweight".into(), qw_view);
+        map.insert("model.layers.0.self_attn.q_proj.scales".into(), sc_view);
+        map.insert("model.layers.0.self_attn.q_proj.qzeros".into(), qz_view);
         map.insert("model.layers.0.input_layernorm.weight".into(), norm_view);
         safetensors::serialize(&map, &None).expect("serialize")
     }
@@ -543,8 +515,10 @@ mod tests {
         // Expect two output tensors, in BTreeMap order:
         //   "blk.0.attn_norm.weight" (Plain, f16)
         //   "blk.0.attn_q.weight"    (dequanted, f16, [out_f, in_f])
-        let by_name: BTreeMap<String, ConvertedTensor> =
-            tensors.iter().map(|t| (t.gguf_name.clone(), t.clone())).collect();
+        let by_name: BTreeMap<String, ConvertedTensor> = tensors
+            .iter()
+            .map(|t| (t.gguf_name.clone(), t.clone()))
+            .collect();
         let q = by_name.get("blk.0.attn_q.weight").expect("q dequanted");
         assert_eq!(q.dtype, ConvertedDtype::F16);
         assert_eq!(q.shape, vec![out_f as u64, in_f as u64]);
@@ -600,24 +574,15 @@ mod tests {
         let qz_bytes = i32_bytes(&qz);
 
         let mut map: BTreeMap<String, TensorView<'_>> = BTreeMap::new();
-        let qw_view = TensorView::new(StDtype::I32, vec![in_f, out_packs], &qw_bytes)
-            .expect("qw view");
-        let sc_view = TensorView::new(StDtype::F16, vec![n_groups, out_f], &sc_bytes)
-            .expect("sc view");
-        let qz_view = TensorView::new(StDtype::I32, vec![n_groups, out_packs], &qz_bytes)
-            .expect("qz view");
-        map.insert(
-            "model.layers.0.self_attn.q_proj.qweight".into(),
-            qw_view,
-        );
-        map.insert(
-            "model.layers.0.self_attn.q_proj.scales".into(),
-            sc_view,
-        );
-        map.insert(
-            "model.layers.0.self_attn.q_proj.qzeros".into(),
-            qz_view,
-        );
+        let qw_view =
+            TensorView::new(StDtype::I32, vec![in_f, out_packs], &qw_bytes).expect("qw view");
+        let sc_view =
+            TensorView::new(StDtype::F16, vec![n_groups, out_f], &sc_bytes).expect("sc view");
+        let qz_view =
+            TensorView::new(StDtype::I32, vec![n_groups, out_packs], &qz_bytes).expect("qz view");
+        map.insert("model.layers.0.self_attn.q_proj.qweight".into(), qw_view);
+        map.insert("model.layers.0.self_attn.q_proj.scales".into(), sc_view);
+        map.insert("model.layers.0.self_attn.q_proj.qzeros".into(), qz_view);
         let blob = safetensors::serialize(&map, &None).unwrap();
         let tensors = convert_safetensors_to_gguf_tensors(&blob).unwrap();
         let q = tensors
@@ -671,26 +636,15 @@ mod tests {
         let gi_bytes = i32_bytes(&gi);
 
         let mut map: BTreeMap<String, TensorView<'_>> = BTreeMap::new();
-        let qw_view = TensorView::new(StDtype::I32, vec![in_packs, out_f], &qw_bytes)
-            .expect("qw view");
-        let sc_view = TensorView::new(StDtype::F16, vec![1, out_f], &sc_bytes)
-            .expect("sc view");
-        let qz_view = TensorView::new(StDtype::I32, vec![1, out_packs], &qz_bytes)
-            .expect("qz view");
-        let gi_view = TensorView::new(StDtype::I32, vec![in_f], &gi_bytes)
-            .expect("g_idx view");
-        map.insert(
-            "model.layers.0.self_attn.k_proj.qweight".into(),
-            qw_view,
-        );
-        map.insert(
-            "model.layers.0.self_attn.k_proj.scales".into(),
-            sc_view,
-        );
-        map.insert(
-            "model.layers.0.self_attn.k_proj.qzeros".into(),
-            qz_view,
-        );
+        let qw_view =
+            TensorView::new(StDtype::I32, vec![in_packs, out_f], &qw_bytes).expect("qw view");
+        let sc_view = TensorView::new(StDtype::F16, vec![1, out_f], &sc_bytes).expect("sc view");
+        let qz_view =
+            TensorView::new(StDtype::I32, vec![1, out_packs], &qz_bytes).expect("qz view");
+        let gi_view = TensorView::new(StDtype::I32, vec![in_f], &gi_bytes).expect("g_idx view");
+        map.insert("model.layers.0.self_attn.k_proj.qweight".into(), qw_view);
+        map.insert("model.layers.0.self_attn.k_proj.scales".into(), sc_view);
+        map.insert("model.layers.0.self_attn.k_proj.qzeros".into(), qz_view);
         map.insert("model.layers.0.self_attn.k_proj.g_idx".into(), gi_view);
         let blob = safetensors::serialize(&map, &None).unwrap();
         let tensors = convert_safetensors_to_gguf_tensors(&blob).unwrap();
@@ -733,12 +687,8 @@ mod tests {
             map.insert(name, view);
         }
         let plain_view =
-            TensorView::new(StDtype::F16, vec![in_f, out_f], &plain_bytes)
-                .expect("plain view");
-        map.insert(
-            "model.layers.0.self_attn.q_proj.weight".into(),
-            plain_view,
-        );
+            TensorView::new(StDtype::F16, vec![in_f, out_f], &plain_bytes).expect("plain view");
+        map.insert("model.layers.0.self_attn.q_proj.weight".into(), plain_view);
         let merged = safetensors::serialize(&map, &None).unwrap();
         let err = convert_safetensors_to_gguf_tensors(&merged).unwrap_err();
         match err {
@@ -761,18 +711,10 @@ mod tests {
         let sc: Vec<f16> = vec![f16::from_f32(1.0); n_groups * out_f];
         let sc_bytes = f16_bytes(&sc);
         let mut map: BTreeMap<String, TensorView<'_>> = BTreeMap::new();
-        let qw_view = TensorView::new(StDtype::I32, vec![in_f, out_packs], &qw_bytes)
-            .unwrap();
-        let sc_view = TensorView::new(StDtype::F16, vec![n_groups, out_f], &sc_bytes)
-            .unwrap();
-        map.insert(
-            "model.layers.0.self_attn.q_proj.qweight".into(),
-            qw_view,
-        );
-        map.insert(
-            "model.layers.0.self_attn.q_proj.scales".into(),
-            sc_view,
-        );
+        let qw_view = TensorView::new(StDtype::I32, vec![in_f, out_packs], &qw_bytes).unwrap();
+        let sc_view = TensorView::new(StDtype::F16, vec![n_groups, out_f], &sc_bytes).unwrap();
+        map.insert("model.layers.0.self_attn.q_proj.qweight".into(), qw_view);
+        map.insert("model.layers.0.self_attn.q_proj.scales".into(), sc_view);
         let blob = safetensors::serialize(&map, &None).unwrap();
         let err = convert_safetensors_to_gguf_tensors(&blob).unwrap_err();
         match err {
@@ -803,28 +745,19 @@ mod tests {
         let qz_bytes = i32_bytes(&qz);
         let mut map: BTreeMap<String, TensorView<'_>> = BTreeMap::new();
         // Use F16 dtype despite name being qweight — should be I32.
-        let qw_view = TensorView::new(StDtype::F16, vec![in_f, out_packs * 2], &qw_bytes)
-            .unwrap();
-        let sc_view = TensorView::new(StDtype::F16, vec![n_groups, out_f], &sc_bytes)
-            .unwrap();
-        let qz_view = TensorView::new(StDtype::I32, vec![n_groups, out_packs], &qz_bytes)
-            .unwrap();
-        map.insert(
-            "model.layers.0.self_attn.q_proj.qweight".into(),
-            qw_view,
-        );
-        map.insert(
-            "model.layers.0.self_attn.q_proj.scales".into(),
-            sc_view,
-        );
-        map.insert(
-            "model.layers.0.self_attn.q_proj.qzeros".into(),
-            qz_view,
-        );
+        let qw_view = TensorView::new(StDtype::F16, vec![in_f, out_packs * 2], &qw_bytes).unwrap();
+        let sc_view = TensorView::new(StDtype::F16, vec![n_groups, out_f], &sc_bytes).unwrap();
+        let qz_view = TensorView::new(StDtype::I32, vec![n_groups, out_packs], &qz_bytes).unwrap();
+        map.insert("model.layers.0.self_attn.q_proj.qweight".into(), qw_view);
+        map.insert("model.layers.0.self_attn.q_proj.scales".into(), sc_view);
+        map.insert("model.layers.0.self_attn.q_proj.qzeros".into(), qz_view);
         let blob = safetensors::serialize(&map, &None).unwrap();
         let err = convert_safetensors_to_gguf_tensors(&blob).unwrap_err();
         match err {
-            ConvertError::WrongQweightDtype { dtype: StDtype::F16, .. } => {}
+            ConvertError::WrongQweightDtype {
+                dtype: StDtype::F16,
+                ..
+            } => {}
             other => panic!("expected WrongQweightDtype, got {other:?}"),
         }
     }
@@ -840,8 +773,7 @@ mod tests {
         // Plus one recognized tensor so we don't get an empty output.
         let norm: Vec<f16> = vec![f16::from_f32(1.0); 4];
         let norm_bytes = f16_bytes(&norm);
-        let norm_view = TensorView::new(StDtype::F16, vec![4usize], &norm_bytes)
-            .unwrap();
+        let norm_view = TensorView::new(StDtype::F16, vec![4usize], &norm_bytes).unwrap();
         map.insert("model.norm.weight".into(), norm_view);
         let blob = safetensors::serialize(&map, &None).unwrap();
         let tensors = convert_safetensors_to_gguf_tensors(&blob).unwrap();
@@ -855,8 +787,10 @@ mod tests {
         // load path converts cleanly.
         let n = 8usize;
         // bf16 of 1.0 = 0x3F80 (sign 0, exp 127, mantissa 0)
-        let bf_bytes: Vec<u8> =
-            std::iter::repeat([0x80u8, 0x3Fu8]).take(n).flatten().collect();
+        let bf_bytes: Vec<u8> = std::iter::repeat([0x80u8, 0x3Fu8])
+            .take(n)
+            .flatten()
+            .collect();
         let mut map: BTreeMap<String, TensorView<'_>> = BTreeMap::new();
         let view = TensorView::new(StDtype::BF16, vec![n], &bf_bytes).unwrap();
         map.insert("model.norm.weight".into(), view);

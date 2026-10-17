@@ -257,7 +257,9 @@ fn build_sycl_stub(out_path: &std::path::Path, target_os: &str, target_arch: &st
                 panic!("rustllama-kernels-sycl build.rs: failed to invoke C compiler {cc:?} for the macOS SYCL stub: {e}")
             });
         if !status.success() {
-            panic!("rustllama-kernels-sycl build.rs: {cc} failed to build the no-op SYCL stub .dylib");
+            panic!(
+                "rustllama-kernels-sycl build.rs: {cc} failed to build the no-op SYCL stub .dylib"
+            );
         }
         println!("cargo:rustc-link-search=native={}", out_path.display());
         println!("cargo:rustc-link-lib=dylib=rsl_kernels");
@@ -760,9 +762,7 @@ fn emit_u32_array(out: &mut String, name: &str, expected: usize, values: &[u32])
 
 fn emit_u8_array(out: &mut String, name: &str, expected: usize, values: &[u8]) {
     assert_eq!(values.len(), expected);
-    out.push_str(&format!(
-        "constexpr std::uint8_t {name}[{expected}] = {{\n"
-    ));
+    out.push_str(&format!("constexpr std::uint8_t {name}[{expected}] = {{\n"));
     for (i, v) in values.iter().enumerate() {
         if i % 16 == 0 {
             out.push_str("    ");

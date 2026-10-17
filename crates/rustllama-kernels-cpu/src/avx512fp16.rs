@@ -56,7 +56,8 @@ fn gemm_f16_accum_ref(w: &[f16], x: &[f32], c: &mut [f32], m: usize, n: usize, k
         for j in 0..n {
             let mut acc = f16::from_f32(0.0);
             for p in 0..k {
-                let prod = f16::from_f32(w[i * k + p].to_f32() * f16::from_f32(x[p * n + j]).to_f32());
+                let prod =
+                    f16::from_f32(w[i * k + p].to_f32() * f16::from_f32(x[p * n + j]).to_f32());
                 acc = f16::from_f32(acc.to_f32() + prod.to_f32());
             }
             c[i * n + j] = acc.to_f32();
@@ -78,7 +79,14 @@ unsafe fn reduce_ph_bits_to_f32(acc_bits: __m512i) -> f32 {
 /// AVX-512-FP16 GEMM (native f16 FMA, f16 accumulation). `xt` is the f16-packed
 /// transpose (`xt[n*k + p]` bits = f16(x[p*n + n_idx])).
 #[target_feature(enable = "avx512f,avx512bw,avx512fp16")]
-unsafe fn gemm_f16_avx512_inner(w: &[f16], xt: &[u16], c: &mut [f32], m: usize, n: usize, k: usize) {
+unsafe fn gemm_f16_avx512_inner(
+    w: &[f16],
+    xt: &[u16],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) {
     let k32 = k - (k % 32);
     for i in 0..m {
         let wrow = &w[i * k..i * k + k];
@@ -126,8 +134,12 @@ pub fn avx512fp16_gemm_usable() -> bool {
             return false;
         }
         let (m, n, k) = (6usize, 5usize, 40usize);
-        let w: Vec<f16> = (0..m * k).map(|i| f16::from_f32(((i % 97) as f32 - 48.0) * 0.03)).collect();
-        let x: Vec<f32> = (0..k * n).map(|i| ((i % 89) as f32 - 44.0) * 0.02).collect();
+        let w: Vec<f16> = (0..m * k)
+            .map(|i| f16::from_f32(((i % 97) as f32 - 48.0) * 0.03))
+            .collect();
+        let x: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 89) as f32 - 44.0) * 0.02)
+            .collect();
         let mut got = vec![0f32; m * n];
         let mut want = vec![0f32; m * n];
         gemm_f16_accum_ref(&w, &x, &mut want, m, n, k);
@@ -149,6 +161,9 @@ mod tests {
             eprintln!("avx512fp16: not supported on this host — SKIP");
             return;
         }
-        assert!(avx512fp16_gemm_usable(), "AVX-512-FP16 present but self-check failed");
+        assert!(
+            avx512fp16_gemm_usable(),
+            "AVX-512-FP16 present but self-check failed"
+        );
     }
 }

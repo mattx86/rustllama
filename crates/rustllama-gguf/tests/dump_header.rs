@@ -17,8 +17,8 @@ use rustllama_gguf::Gguf;
 #[test]
 #[ignore = "diagnostic — needs RUSTLLAMA_DUMP_GGUF pointing at a real file"]
 fn dump_gguf_header() {
-    let path = std::env::var("RUSTLLAMA_DUMP_GGUF")
-        .expect("set RUSTLLAMA_DUMP_GGUF to the .gguf to dump");
+    let path =
+        std::env::var("RUSTLLAMA_DUMP_GGUF").expect("set RUSTLLAMA_DUMP_GGUF to the .gguf to dump");
     let g = Gguf::open(&path).expect("parse gguf");
 
     println!("== metadata ({} keys) ==", g.metadata().len());
@@ -33,15 +33,17 @@ fn dump_gguf_header() {
     }
 
     println!("== tensors ({}) ==", g.tensors().len());
-    let mut by_dtype: std::collections::BTreeMap<&'static str, (usize, u64)> =
-        Default::default();
+    let mut by_dtype: std::collections::BTreeMap<&'static str, (usize, u64)> = Default::default();
     for t in g.tensors() {
         let e = by_dtype.entry(t.dtype.as_str()).or_default();
         e.0 += 1;
         e.1 += t.byte_size;
     }
     for (dt, (count, bytes)) in &by_dtype {
-        println!("  {dt}: {count} tensors, {:.2} MiB", *bytes as f64 / (1024.0 * 1024.0));
+        println!(
+            "  {dt}: {count} tensors, {:.2} MiB",
+            *bytes as f64 / (1024.0 * 1024.0)
+        );
     }
     println!("== first/last blocks + non-block tensors ==");
     for t in g.tensors() {

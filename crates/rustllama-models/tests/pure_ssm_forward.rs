@@ -42,7 +42,10 @@ fn pure_ssm_loads_as_all_ssm_hybrid() {
     let gguf = Gguf::open(&path).expect("open pure-ssm gguf");
     let model = LlamaModel::load(&gguf).expect("pure-ssm hybrid loads");
 
-    assert!(model.weights.is_hybrid(), "pure-SSM model must detect as hybrid");
+    assert!(
+        model.weights.is_hybrid(),
+        "pure-SSM model must detect as hybrid"
+    );
     let layers = model
         .weights
         .hybrid_layers

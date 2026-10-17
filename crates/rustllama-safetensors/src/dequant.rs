@@ -75,23 +75,26 @@ pub enum DequantError {
         out_features: usize,
         lanes_per_pack: usize,
     },
-    #[error(
-        "g_idx length {got} doesn't match expected in_features={in_features}"
-    )]
+    #[error("g_idx length {got} doesn't match expected in_features={in_features}")]
     GIdxShape { got: usize, in_features: usize },
     #[error(
         "g_idx[{idx}] = {value} but only {n_groups} groups exist; \
          corrupt GPTQ file"
     )]
-    GIdxOutOfRange { idx: usize, value: i32, n_groups: usize },
+    GIdxOutOfRange {
+        idx: usize,
+        value: i32,
+        n_groups: usize,
+    },
     #[error("out_features={out_features} is not a multiple of 8 (4-bit lanes per int32)")]
     OutFeaturesNotPacked { out_features: usize },
     #[error("in_features={in_features} is not a multiple of 8 (GPTQ packs along in_features)")]
     InFeaturesNotPacked { in_features: usize },
-    #[error(
-        "group_size {group_size} does not divide in_features {in_features}"
-    )]
-    GroupSizeMisaligned { group_size: usize, in_features: usize },
+    #[error("group_size {group_size} does not divide in_features {in_features}")]
+    GroupSizeMisaligned {
+        group_size: usize,
+        in_features: usize,
+    },
 }
 
 /// AWQ INT4 → FP16 dequantization.
@@ -339,11 +342,7 @@ mod tests {
     /// lands in output column `AWQ_PACK_ORDER[k]`, and `scale_col` is
     /// indexed by that output column. Returns the row in output-column
     /// order (matching the dequant output layout).
-    fn awq_reference_row_chunk(
-        w_int4: [u8; 8],
-        z_int4: [u8; 8],
-        scale_col: [f32; 8],
-    ) -> [f16; 8] {
+    fn awq_reference_row_chunk(w_int4: [u8; 8], z_int4: [u8; 8], scale_col: [f32; 8]) -> [f16; 8] {
         let mut out = [f16::ZERO; 8];
         for k in 0..8 {
             let j = AWQ_PACK_ORDER[k];
@@ -366,20 +365,10 @@ mod tests {
         let qz_packed = pack_int4_lane([3; 8]);
         // Scales: 0.5 for each output column.
         let scales = vec![f16::from_f32(0.5); 8];
-        let got = dequant_awq_int4_to_f16(
-            &[qw_packed],
-            &scales,
-            &[qz_packed],
-            in_f,
-            out_f,
-            group_size,
-        )
-        .unwrap();
-        let exp = awq_reference_row_chunk(
-            [0, 1, 2, 3, 4, 5, 6, 7],
-            [3; 8],
-            [0.5; 8],
-        );
+        let got =
+            dequant_awq_int4_to_f16(&[qw_packed], &scales, &[qz_packed], in_f, out_f, group_size)
+                .unwrap();
+        let exp = awq_reference_row_chunk([0, 1, 2, 3, 4, 5, 6, 7], [3; 8], [0.5; 8]);
         for k in 0..8 {
             assert_eq!(
                 got[k].to_bits(),
@@ -404,18 +393,14 @@ mod tests {
             .map(|r| pack_int4_lane([r, r + 1, r + 2, r + 3, r + 4, r + 5, r + 6, r + 7]))
             .collect();
         // qzeros: 2 groups, 1 pack each. Group g zeros are all g+1.
-        let qzeros = vec![
-            pack_int4_lane([1; 8]),
-            pack_int4_lane([2; 8]),
-        ];
+        let qzeros = vec![pack_int4_lane([1; 8]), pack_int4_lane([2; 8])];
         // scales: 2 groups × 8 outs. Group g has scale g+1 across all outs.
         let scales: Vec<f16> = (0..2u32)
             .flat_map(|g| std::iter::repeat(f16::from_f32((g + 1) as f32)).take(8))
             .collect();
 
         let got =
-            dequant_awq_int4_to_f16(&qweight, &scales, &qzeros, in_f, out_f, group_size)
-                .unwrap();
+            dequant_awq_int4_to_f16(&qweight, &scales, &qzeros, in_f, out_f, group_size).unwrap();
         // Reference: nibble `k` of row `r` carries value `r + k`, which
         // lands in output column `AWQ_PACK_ORDER[k]`. Row `r` belongs to
         // group `r / group_size`, whose zero is `g + 1` and scale is
@@ -511,11 +496,7 @@ mod tests {
 
     /// Reference GPTQ dequant for `(i, j)` — single cell, used to
     /// hand-verify the formula in tests.
-    fn gptq_reference_cell(
-        w_int4: u8,
-        z_int4: u8,
-        scale: f32,
-    ) -> f16 {
+    fn gptq_reference_cell(w_int4: u8, z_int4: u8, scale: f32) -> f16 {
         let val = (w_int4 as i32 - (z_int4 as i32 + 1)) as f32 * scale;
         f16::from_f32(val)
     }
@@ -537,10 +518,8 @@ mod tests {
         let scales = vec![f16::from_f32(0.5); 8];
         let g_idx = vec![0i32; 8];
 
-        let got = dequant_gptq_int4_to_f16(
-            &qweight, &scales, &qzeros, &g_idx, in_f, out_f,
-        )
-        .unwrap();
+        let got =
+            dequant_gptq_int4_to_f16(&qweight, &scales, &qzeros, &g_idx, in_f, out_f).unwrap();
         assert_eq!(got.len(), in_f * out_f);
         // For each (i, j): w_int4 = (j + i) since qweight col j has
         // lanes [j, j+1, ..., j+7]; z_int4 = 2; scale = 0.5
@@ -572,8 +551,9 @@ mod tests {
         let in_packs = in_f / 8;
         // qweight: every cell has int4 value = 5. Pack columns of
         // [5; 8] — same nibble in every lane.
-        let qweight: Vec<i32> =
-            (0..in_packs * out_f).map(|_| pack_int4_lane([5; 8])).collect();
+        let qweight: Vec<i32> = (0..in_packs * out_f)
+            .map(|_| pack_int4_lane([5; 8]))
+            .collect();
         // qzeros: group 0 zeros = 1, group 1 zeros = 4. After +1
         // they become 2 and 5.
         let qzeros = vec![pack_int4_lane([1; 8]), pack_int4_lane([4; 8])];
@@ -585,10 +565,8 @@ mod tests {
         let mut g_idx = vec![1i32; 8];
         g_idx.extend(std::iter::repeat(0i32).take(8));
 
-        let got = dequant_gptq_int4_to_f16(
-            &qweight, &scales, &qzeros, &g_idx, in_f, out_f,
-        )
-        .unwrap();
+        let got =
+            dequant_gptq_int4_to_f16(&qweight, &scales, &qzeros, &g_idx, in_f, out_f).unwrap();
         // Rows 0..8 (g=1): (5 - (4+1)) * 0.5 = 0.0
         for i in 0..8 {
             for j in 0..out_f {
@@ -622,12 +600,14 @@ mod tests {
         let scales = vec![f16::from_f32(1.0); out_f];
         let mut g_idx = vec![0i32; in_f];
         g_idx[2] = 5; // out of range
-        let err = dequant_gptq_int4_to_f16(
-            &qweight, &scales, &qzeros, &g_idx, in_f, out_f,
-        )
-        .unwrap_err();
+        let err =
+            dequant_gptq_int4_to_f16(&qweight, &scales, &qzeros, &g_idx, in_f, out_f).unwrap_err();
         match err {
-            DequantError::GIdxOutOfRange { idx: 2, value: 5, n_groups: 1 } => {}
+            DequantError::GIdxOutOfRange {
+                idx: 2,
+                value: 5,
+                n_groups: 1,
+            } => {}
             other => panic!("expected GIdxOutOfRange, got {other:?}"),
         }
     }
@@ -640,12 +620,13 @@ mod tests {
         let qzeros = vec![pack_int4_lane([0; 8])];
         let scales = vec![f16::from_f32(1.0); out_f];
         let g_idx = vec![0i32; 4]; // wrong size — should be in_f=8
-        let err = dequant_gptq_int4_to_f16(
-            &qweight, &scales, &qzeros, &g_idx, in_f, out_f,
-        )
-        .unwrap_err();
+        let err =
+            dequant_gptq_int4_to_f16(&qweight, &scales, &qzeros, &g_idx, in_f, out_f).unwrap_err();
         match err {
-            DequantError::GIdxShape { got: 4, in_features: 8 } => {}
+            DequantError::GIdxShape {
+                got: 4,
+                in_features: 8,
+            } => {}
             other => panic!("expected GIdxShape, got {other:?}"),
         }
     }

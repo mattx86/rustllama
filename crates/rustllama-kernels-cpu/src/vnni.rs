@@ -155,7 +155,14 @@ unsafe fn hsum_i32x8(v: __m256i) -> i32 {
 /// `pub(crate)`: also the parity reference for the AMX int8 prefill GEMM (one row
 /// per token), since both share the per-block accumulation order (f32 add per
 /// block) → the AMX tile result matches this to within int rounding.
-pub(crate) fn matvec_q8_0_w8a8_scalar(w_bytes: &[u8], xq: &[i8], xscales: &[f32], out: &mut [f32], m: usize, k: usize) {
+pub(crate) fn matvec_q8_0_w8a8_scalar(
+    w_bytes: &[u8],
+    xq: &[i8],
+    xscales: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
     let blocks_per_row = k / QK;
     for i in 0..m {
         let row_start = i * blocks_per_row * BLOCK_BYTES;
@@ -208,14 +215,28 @@ unsafe fn dpbusd_row<DP: Fn(__m256i, __m256i, __m256i) -> __m256i>(
 }
 
 #[target_feature(enable = "avx,avx2,avxvnni")]
-unsafe fn matvec_q8_0_w8a8_avxvnni(w_bytes: &[u8], xq: &[i8], xscales: &[f32], out: &mut [f32], m: usize, k: usize) {
+unsafe fn matvec_q8_0_w8a8_avxvnni(
+    w_bytes: &[u8],
+    xq: &[i8],
+    xscales: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
     dpbusd_row(w_bytes, xq, xscales, out, m, k, |s, a, b| {
         _mm256_dpbusd_avx_epi32(s, a, b)
     });
 }
 
 #[target_feature(enable = "avx,avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
-unsafe fn matvec_q8_0_w8a8_avx512vnni(w_bytes: &[u8], xq: &[i8], xscales: &[f32], out: &mut [f32], m: usize, k: usize) {
+unsafe fn matvec_q8_0_w8a8_avx512vnni(
+    w_bytes: &[u8],
+    xq: &[i8],
+    xscales: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
     dpbusd_row(w_bytes, xq, xscales, out, m, k, |s, a, b| {
         _mm256_dpbusd_epi32(s, a, b)
     });
@@ -224,7 +245,14 @@ unsafe fn matvec_q8_0_w8a8_avx512vnni(w_bytes: &[u8], xq: &[i8], xscales: &[f32]
 /// `vpdpbssd` kernel (signed×signed) — the activation i8 is dotted directly, no
 /// bias correction. WRITE-BLIND (AVX-VNNI-INT8 is newer than the author's box).
 #[target_feature(enable = "avx,avx2,avxvnniint8")]
-unsafe fn matvec_q8_0_w8a8_avxvnniint8(w_bytes: &[u8], xq: &[i8], xscales: &[f32], out: &mut [f32], m: usize, k: usize) {
+unsafe fn matvec_q8_0_w8a8_avxvnniint8(
+    w_bytes: &[u8],
+    xq: &[i8],
+    xscales: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
     let blocks_per_row = k / QK;
     for i in 0..m {
         let row_start = i * blocks_per_row * BLOCK_BYTES;
@@ -242,7 +270,14 @@ unsafe fn matvec_q8_0_w8a8_avxvnniint8(w_bytes: &[u8], xq: &[i8], xscales: &[f32
 }
 
 /// Run the active VNNI kernel on the pre-quantized i8 activation.
-unsafe fn run_vnni_kernel(w_bytes: &[u8], xq: &[i8], xscales: &[f32], out: &mut [f32], m: usize, k: usize) {
+unsafe fn run_vnni_kernel(
+    w_bytes: &[u8],
+    xq: &[i8],
+    xscales: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
     match vnni_kind() {
         VnniKind::Avx256Int8 => matvec_q8_0_w8a8_avxvnniint8(w_bytes, xq, xscales, out, m, k),
         VnniKind::Avx512 => matvec_q8_0_w8a8_avx512vnni(w_bytes, xq, xscales, out, m, k),

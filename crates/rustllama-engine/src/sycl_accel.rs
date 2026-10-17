@@ -76,19 +76,22 @@ impl SyclAccelerator {
     /// the runtime is real but the index doesn't exist.
     pub fn try_new(device_index: u32) -> Result<Self> {
         match sk::create_stream(device_index) {
-            Ok(stream) => Ok(Self { stream, device_index }),
-            Err(SyclError::Unavailable) => {
-                Err(SyclAccelError::Unavailable("kernels-sycl in mock mode".into()))
-            }
+            Ok(stream) => Ok(Self {
+                stream,
+                device_index,
+            }),
+            Err(SyclError::Unavailable) => Err(SyclAccelError::Unavailable(
+                "kernels-sycl in mock mode".into(),
+            )),
             Err(SyclError::NoSuchDevice(i)) => Err(SyclAccelError::NoSuchDevice(i)),
             Err(SyclError::InvalidShape(s)) => Err(SyclAccelError::InvalidShape(s)),
             Err(SyclError::Runtime(s)) => Err(SyclAccelError::InvalidShape(s)),
             // create_stream doesn't produce this variant — it comes
             // out of the L0 import API, which doesn't flow through
             // here. Cover for exhaustiveness.
-            Err(SyclError::L0ImportUnsupported(code)) => {
-                Err(SyclAccelError::InvalidShape(format!("unexpected L0 import error {code}")))
-            }
+            Err(SyclError::L0ImportUnsupported(code)) => Err(SyclAccelError::InvalidShape(
+                format!("unexpected L0 import error {code}"),
+            )),
         }
     }
 
@@ -118,12 +121,25 @@ impl SyclAccelerator {
                 y.len()
             )));
         }
-        let x_bits: Vec<u16> = x[..total].iter().map(|v| f16::from_f32(*v).to_bits()).collect();
-        let w_bits: Vec<u16> =
-            w[..d as usize].iter().map(|v| f16::from_f32(*v).to_bits()).collect();
+        let x_bits: Vec<u16> = x[..total]
+            .iter()
+            .map(|v| f16::from_f32(*v).to_bits())
+            .collect();
+        let w_bits: Vec<u16> = w[..d as usize]
+            .iter()
+            .map(|v| f16::from_f32(*v).to_bits())
+            .collect();
         let mut y_bits = vec![0u16; total];
-        sk::rmsnorm(&mut self.stream, &x_bits, &w_bits, &mut y_bits, n_rows, d, eps)
-            .map_err(map_sycl_err)?;
+        sk::rmsnorm(
+            &mut self.stream,
+            &x_bits,
+            &w_bits,
+            &mut y_bits,
+            n_rows,
+            d,
+            eps,
+        )
+        .map_err(map_sycl_err)?;
         for (i, bits) in y_bits.iter().enumerate() {
             y[i] = f16::from_bits(*bits).to_f32();
         }
@@ -155,8 +171,7 @@ impl SyclAccelerator {
                 ids.len()
             )));
         }
-        let table_bits: Vec<u16> =
-            table.iter().map(|v| f16::from_f32(*v).to_bits()).collect();
+        let table_bits: Vec<u16> = table.iter().map(|v| f16::from_f32(*v).to_bits()).collect();
         let mut out_bits = vec![0u16; ids.len() * d_us];
         sk::embedding_lookup(&mut self.stream, &table_bits, ids, &mut out_bits, d)
             .map_err(map_sycl_err)?;
@@ -168,12 +183,7 @@ impl SyclAccelerator {
 
     /// SwiGLU activation `out[i] = silu(x[i]) * y[i]`. f32-facing
     /// wrapper. Used in the FFN's gate × up product.
-    pub fn silu_mul_f32(
-        &mut self,
-        x: &[f32],
-        y: &[f32],
-        out: &mut [f32],
-    ) -> Result<()> {
+    pub fn silu_mul_f32(&mut self, x: &[f32], y: &[f32], out: &mut [f32]) -> Result<()> {
         if x.len() != y.len() || out.len() < x.len() {
             return Err(SyclAccelError::InvalidShape(format!(
                 "silu_mul: x={}, y={}, out={}",
@@ -185,8 +195,7 @@ impl SyclAccelerator {
         let x_bits: Vec<u16> = x.iter().map(|v| f16::from_f32(*v).to_bits()).collect();
         let y_bits: Vec<u16> = y.iter().map(|v| f16::from_f32(*v).to_bits()).collect();
         let mut out_bits = vec![0u16; x.len()];
-        sk::silu_mul(&mut self.stream, &x_bits, &y_bits, &mut out_bits)
-            .map_err(map_sycl_err)?;
+        sk::silu_mul(&mut self.stream, &x_bits, &y_bits, &mut out_bits).map_err(map_sycl_err)?;
         for (i, bits) in out_bits.iter().enumerate() {
             out[i] = f16::from_bits(*bits).to_f32();
         }
@@ -230,8 +239,15 @@ impl SyclAccelerator {
             .iter()
             .map(|v| f16::from_f32(*v).to_bits())
             .collect();
-        sk::rope(&mut self.stream, &mut qk_bits, n_heads, head_dim, pos, &freq_bits)
-            .map_err(map_sycl_err)?;
+        sk::rope(
+            &mut self.stream,
+            &mut qk_bits,
+            n_heads,
+            head_dim,
+            pos,
+            &freq_bits,
+        )
+        .map_err(map_sycl_err)?;
         for (i, bits) in qk_bits.iter().enumerate() {
             qk[i] = f16::from_bits(*bits).to_f32();
         }
@@ -250,8 +266,7 @@ impl SyclAccelerator {
         kv_len: u32,
         scale: f32,
     ) -> Result<()> {
-        let total =
-            (n_heads as usize) * (seq as usize) * (kv_len as usize);
+        let total = (n_heads as usize) * (seq as usize) * (kv_len as usize);
         if scores.len() < total {
             return Err(SyclAccelError::InvalidShape(format!(
                 "softmax_attn: scores={}, need n_heads*seq*kv_len={total}",
@@ -327,18 +342,13 @@ impl SyclAccelerator {
     /// pure-Rust reference and reports the max absolute error.
     /// Returns `Ok(max_abs_err)` if within `tolerance`, else
     /// `ParityFailed`. Used by `xtask doctor --kernels`.
-    pub fn parity_check_rmsnorm(
-        &mut self,
-        n_rows: u32,
-        d: u32,
-        tolerance: f32,
-    ) -> Result<f32> {
+    pub fn parity_check_rmsnorm(&mut self, n_rows: u32, d: u32, tolerance: f32) -> Result<f32> {
         // Deterministic synthetic input so the check is reproducible.
         let total = (n_rows as usize) * (d as usize);
-        let x: Vec<f32> = (0..total)
-            .map(|i| ((i % 31) as f32 - 15.0) * 0.1)
+        let x: Vec<f32> = (0..total).map(|i| ((i % 31) as f32 - 15.0) * 0.1).collect();
+        let w: Vec<f32> = (0..d as usize)
+            .map(|i| 1.0 + (i as f32 / d as f32) * 0.5)
             .collect();
-        let w: Vec<f32> = (0..d as usize).map(|i| 1.0 + (i as f32 / d as f32) * 0.5).collect();
         let mut y_gpu = vec![0f32; total];
         self.rmsnorm_f32(&x, &w, &mut y_gpu, n_rows, d, 1e-5)?;
         // CPU reference: full f32 RMS, then f16 round-trip per element
@@ -377,12 +387,7 @@ impl SyclAccelerator {
 
     /// Parity smoke check for embedding_lookup. Generates a synthetic
     /// `[vocab, d]` f32 table and queries a handful of ids against it.
-    pub fn parity_check_embedding(
-        &mut self,
-        vocab: usize,
-        d: u32,
-        tolerance: f32,
-    ) -> Result<f32> {
+    pub fn parity_check_embedding(&mut self, vocab: usize, d: u32, tolerance: f32) -> Result<f32> {
         let d_us = d as usize;
         let table: Vec<f32> = (0..vocab * d_us)
             .map(|i| ((i as f32).sin() * 2.0).cos())
@@ -541,14 +546,7 @@ impl SyclAccelerator {
         }
         let scale = 1.0f32 / (kv_len as f32).sqrt();
         let mut scores_gpu = scores_initial.clone();
-        self.softmax_attn_f32(
-            &mut scores_gpu,
-            Some(&mask),
-            n_heads,
-            seq,
-            kv_len,
-            scale,
-        )?;
+        self.softmax_attn_f32(&mut scores_gpu, Some(&mask), n_heads, seq, kv_len, scale)?;
         // CPU reference: per (head, query) row, scale + add mask + softmax.
         let mut scores_cpu = scores_initial.clone();
         let n_h = n_heads as usize;
@@ -601,13 +599,7 @@ impl SyclAccelerator {
 
     /// Parity smoke for F16 GEMM. Small `[M, N] = [M, K] @ [K, N]`
     /// with deterministic inputs; compares to a CPU GEMM reference.
-    pub fn parity_check_gemm(
-        &mut self,
-        m: u32,
-        n: u32,
-        k: u32,
-        tolerance: f32,
-    ) -> Result<f32> {
+    pub fn parity_check_gemm(&mut self, m: u32, n: u32, k: u32, tolerance: f32) -> Result<f32> {
         let m_us = m as usize;
         let n_us = n as usize;
         let k_us = k as usize;
@@ -651,9 +643,7 @@ impl SyclAccelerator {
 
 fn map_sycl_err(e: SyclError) -> SyclAccelError {
     match e {
-        SyclError::Unavailable => {
-            SyclAccelError::Unavailable("kernel call in mock mode".into())
-        }
+        SyclError::Unavailable => SyclAccelError::Unavailable("kernel call in mock mode".into()),
         SyclError::NoSuchDevice(i) => SyclAccelError::NoSuchDevice(i),
         SyclError::InvalidShape(s) => SyclAccelError::InvalidShape(s),
         // FFI-caught C++ exception. Engine treats this as a kernel

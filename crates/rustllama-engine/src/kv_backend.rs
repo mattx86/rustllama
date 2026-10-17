@@ -163,7 +163,11 @@ impl KvBackend {
         kv_dtype: KvDtype,
     ) -> Result<Self, KvBackendError> {
         Self::from_inference_config_with_page_size(
-            layout, model_cfg, ctx_size, kv_dtype, DEFAULT_PAGE_SIZE,
+            layout,
+            model_cfg,
+            ctx_size,
+            kv_dtype,
+            DEFAULT_PAGE_SIZE,
         )
     }
 
@@ -206,13 +210,17 @@ impl KvBackend {
         page_size: u32,
         keep: Option<&[bool]>,
     ) -> Result<Self, KvBackendError> {
-        let page_size = if page_size == 0 { DEFAULT_PAGE_SIZE } else { page_size };
+        let page_size = if page_size == 0 {
+            DEFAULT_PAGE_SIZE
+        } else {
+            page_size
+        };
         match layout {
             "contiguous" => {
                 let kv = match keep {
-                    Some(mask) => KvCache::new_with_dtype_sparse(
-                        model_cfg, ctx_size as usize, kv_dtype, mask,
-                    ),
+                    Some(mask) => {
+                        KvCache::new_with_dtype_sparse(model_cfg, ctx_size as usize, kv_dtype, mask)
+                    }
                     None => KvCache::new_with_dtype(model_cfg, ctx_size as usize, kv_dtype),
                 };
                 Ok(KvBackend::Contiguous(kv))
@@ -231,7 +239,11 @@ impl KvBackend {
                         )
                         .ok_or(KvBackendError::PagedStoreShape)?;
                         let cache = PagedKvCache::new_for_with_cfg(&store, model_cfg);
-                        Ok(KvBackend::Paged { cache, store, table })
+                        Ok(KvBackend::Paged {
+                            cache,
+                            store,
+                            table,
+                        })
                     }
                     KvDtype::Q8_0 => {
                         let store = rustllama_models::paged_kv_store::PagedKvStoreQ8_0::new(
@@ -243,7 +255,11 @@ impl KvBackend {
                         )
                         .ok_or(KvBackendError::PagedStoreShape)?;
                         let cache = PagedKvCache::new_for_q8_0(&store);
-                        Ok(KvBackend::PagedQ8_0 { cache, store, table })
+                        Ok(KvBackend::PagedQ8_0 {
+                            cache,
+                            store,
+                            table,
+                        })
                     }
                     KvDtype::Tq(bits) => {
                         let store = rustllama_models::paged_kv_store::PagedKvStoreTQ::new(
@@ -256,7 +272,11 @@ impl KvBackend {
                         )
                         .ok_or(KvBackendError::PagedStoreShape)?;
                         let cache = PagedKvCache::new_with_page_size(store.page_size());
-                        Ok(KvBackend::PagedTQ { cache, store, table })
+                        Ok(KvBackend::PagedTQ {
+                            cache,
+                            store,
+                            table,
+                        })
                     }
                     KvDtype::Nvfp4 => {
                         let store = rustllama_models::paged_kv_store::PagedKvStoreNvfp4::new(
@@ -268,7 +288,11 @@ impl KvBackend {
                         )
                         .ok_or(KvBackendError::PagedStoreShape)?;
                         let cache = PagedKvCache::new_with_page_size(store.page_size());
-                        Ok(KvBackend::PagedNvfp4 { cache, store, table })
+                        Ok(KvBackend::PagedNvfp4 {
+                            cache,
+                            store,
+                            table,
+                        })
                     }
                     // Paged Q4_0 is a documented non-goal (v1): the
                     // Q4_0 KV path is contiguous-only, same staging
@@ -292,7 +316,11 @@ impl KvBackend {
                         )
                         .ok_or(KvBackendError::PagedStoreShape)?;
                         let cache = PagedKvCache::new_with_page_size(store.page_size());
-                        Ok(KvBackend::PagedMxfp4 { cache, store, table })
+                        Ok(KvBackend::PagedMxfp4 {
+                            cache,
+                            store,
+                            table,
+                        })
                     }
                     KvDtype::Mxfp6 => {
                         let store = rustllama_models::paged_kv_store::PagedKvStoreMxfp6::new(
@@ -304,7 +332,11 @@ impl KvBackend {
                         )
                         .ok_or(KvBackendError::PagedStoreShape)?;
                         let cache = PagedKvCache::new_with_page_size(store.page_size());
-                        Ok(KvBackend::PagedMxfp6 { cache, store, table })
+                        Ok(KvBackend::PagedMxfp6 {
+                            cache,
+                            store,
+                            table,
+                        })
                     }
                     KvDtype::Mxfp8 => {
                         let store = rustllama_models::paged_kv_store::PagedKvStoreMxfp8::new(
@@ -316,7 +348,11 @@ impl KvBackend {
                         )
                         .ok_or(KvBackendError::PagedStoreShape)?;
                         let cache = PagedKvCache::new_with_page_size(store.page_size());
-                        Ok(KvBackend::PagedMxfp8 { cache, store, table })
+                        Ok(KvBackend::PagedMxfp8 {
+                            cache,
+                            store,
+                            table,
+                        })
                     }
                     // M6: half-precision paged store (f16 / bf16). Two
                     // bytes per element; `gather_layer` widens to f32 so
@@ -333,7 +369,11 @@ impl KvBackend {
                         )
                         .ok_or(KvBackendError::PagedStoreShape)?;
                         let cache = PagedKvCache::new_with_page_size(store.page_size());
-                        Ok(KvBackend::PagedF16 { cache, store, table })
+                        Ok(KvBackend::PagedF16 {
+                            cache,
+                            store,
+                            table,
+                        })
                     }
                 }
             }
@@ -408,7 +448,11 @@ impl KvBackend {
             KvBackend::PagedMxfp6 { .. } => KvDtype::Mxfp6,
             KvBackend::PagedMxfp8 { .. } => KvDtype::Mxfp8,
             KvBackend::PagedF16 { store, .. } => {
-                if store.is_bf16() { KvDtype::Bf16 } else { KvDtype::F16 }
+                if store.is_bf16() {
+                    KvDtype::Bf16
+                } else {
+                    KvDtype::F16
+                }
             }
         }
     }
@@ -445,9 +489,7 @@ impl KvBackend {
             | KvBackend::PagedMxfp4 { table, .. }
             | KvBackend::PagedMxfp6 { table, .. }
             | KvBackend::PagedMxfp8 { table, .. }
-            | KvBackend::PagedF16 { table, .. } => {
-                Some((table.total(), table.free_count() as u32))
-            }
+            | KvBackend::PagedF16 { table, .. } => Some((table.total(), table.free_count() as u32)),
         }
     }
 }
@@ -495,8 +537,8 @@ mod tests {
     #[test]
     fn from_config_paged_builds_paged_backend() {
         let cfg = synth_cfg();
-        let b = KvBackend::from_inference_config("paged", &cfg, 32, KvDtype::F32)
-            .expect("build paged");
+        let b =
+            KvBackend::from_inference_config("paged", &cfg, 32, KvDtype::F32).expect("build paged");
         assert!(b.is_paged());
         assert!(!b.is_contiguous());
         assert_eq!(b.seq_len(), 0);
@@ -522,8 +564,14 @@ mod tests {
         let err = KvBackend::from_inference_config("memory-mapped", &cfg, 32, KvDtype::F32)
             .expect_err("unknown layout must fail");
         let msg = err.to_string();
-        assert!(msg.contains("memory-mapped"), "msg names the bad value: {msg}");
-        assert!(msg.contains("contiguous"), "msg lists the valid options: {msg}");
+        assert!(
+            msg.contains("memory-mapped"),
+            "msg names the bad value: {msg}"
+        );
+        assert!(
+            msg.contains("contiguous"),
+            "msg lists the valid options: {msg}"
+        );
         assert!(msg.contains("paged"), "msg lists paged option: {msg}");
     }
 
@@ -533,8 +581,8 @@ mod tests {
         // cache + then reset must return them. Catches a leak
         // bug in the reset/release wire-up.
         let cfg = synth_cfg();
-        let mut b = KvBackend::from_inference_config("paged", &cfg, 32, KvDtype::F32)
-            .expect("paged");
+        let mut b =
+            KvBackend::from_inference_config("paged", &cfg, 32, KvDtype::F32).expect("paged");
         // Capacity at ctx_size=32, page_size=16 → 2 pages.
         if let KvBackend::Paged { cache, table, .. } = &mut b {
             cache.ensure_capacity(table, 24).expect("alloc 2 pages");

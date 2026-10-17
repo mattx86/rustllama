@@ -79,8 +79,7 @@ async fn loading_moe_gguf_with_shared_experts_succeeds() {
     // DeepSeek-V3 shape: routed experts + 1 shared. Shared-expert
     // tensors flow through the load path and the forward pass adds
     // them unconditionally on top of the routed contribution.
-    let model_path =
-        std::env::temp_dir().join("rustllama-load-moe-phase2c-deepseek.gguf");
+    let model_path = std::env::temp_dir().join("rustllama-load-moe-phase2c-deepseek.gguf");
     write_synthetic_llama_gguf(
         &model_path,
         &SynthLlama {

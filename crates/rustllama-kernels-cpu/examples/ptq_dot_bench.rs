@@ -26,7 +26,11 @@ fn gen_ptq1_0(m: usize, k: usize, seed: u32) -> Vec<u8> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let seconds: f64 = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(20.0);
-    let mode = args.get(2).map(|s| s.as_str()).unwrap_or("fast").to_string();
+    let mode = args
+        .get(2)
+        .map(|s| s.as_str())
+        .unwrap_or("fast")
+        .to_string();
     if mode == "fast" {
         // The public entry reads the env lever.
         std::env::set_var("RUSTLLAMA_TERNARY_FASTDOT", "1");
@@ -64,10 +68,7 @@ fn main() {
         iters += 1;
     }
     let elapsed = start.elapsed().as_secs_f64();
-    let ma_per_iter: f64 = shapes
-        .iter()
-        .map(|&(m, k)| (m * k * n_rows) as f64)
-        .sum();
+    let ma_per_iter: f64 = shapes.iter().map(|&(m, k)| (m * k * n_rows) as f64).sum();
     let total_ma = ma_per_iter * iters as f64;
     println!(
         "mode={mode} iters={iters} elapsed={elapsed:.1}s throughput={:.1} G mul-adds/s (checksum {checksum:.3})",

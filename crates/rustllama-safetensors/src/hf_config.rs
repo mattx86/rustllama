@@ -192,12 +192,11 @@ pub fn parse_hf_config(json: &str) -> Result<LlamaConfig, HfConfigError> {
         .architectures
         .first()
         .ok_or(HfConfigError::MissingArch)?;
-    let arch = normalize_arch(arch_raw)
-        .ok_or_else(|| HfConfigError::UnsupportedArch(arch_raw.clone()))?;
+    let arch =
+        normalize_arch(arch_raw).ok_or_else(|| HfConfigError::UnsupportedArch(arch_raw.clone()))?;
 
     let n_heads = raw.num_attention_heads as usize;
-    let n_kv_heads =
-        raw.num_key_value_heads.unwrap_or(raw.num_attention_heads) as usize;
+    let n_kv_heads = raw.num_key_value_heads.unwrap_or(raw.num_attention_heads) as usize;
     let d_model = raw.hidden_size as usize;
     let head_dim = raw
         .head_dim
@@ -237,8 +236,7 @@ pub fn parse_hf_config(json: &str) -> Result<LlamaConfig, HfConfigError> {
     // Mixtral carries no `moe_intermediate_size`; its experts use
     // `intermediate_size`, so fall back to it.
     let d_ff = if moe.is_some() {
-        raw.moe_intermediate_size
-            .unwrap_or(raw.intermediate_size) as usize
+        raw.moe_intermediate_size.unwrap_or(raw.intermediate_size) as usize
     } else {
         raw.intermediate_size as usize
     };
@@ -266,8 +264,8 @@ pub fn parse_hf_config(json: &str) -> Result<LlamaConfig, HfConfigError> {
         eos_token_id: eos_id,
         tie_word_embeddings: raw.tie_word_embeddings,
         n_mtp_heads: 0,
-        moe, // MoE now parsed from HF config (MLX MoE load path)
-        hybrid: None, // HF configs don't yet carry SSM keys for our hybrid path
+        moe,            // MoE now parsed from HF config (MLX MoE load path)
+        hybrid: None,   // HF configs don't yet carry SSM keys for our hybrid path
         hadamard: None, // Prism rotation metadata is GGUF-only
         // I3: RoPE scaling + Gemma2 logit soft-caps + sliding window now parse
         // from the HF config (were always `Default` before).
@@ -315,11 +313,7 @@ fn normalize_arch(raw: &str) -> Option<String> {
     // Suffixes ordered by length (longest first) so the strip never
     // leaves residue. e.g. `Qwen2VLForConditionalGeneration` → unsupported
     // (returns None), `Qwen2ForCausalLM` → "qwen2".
-    const SUFFIXES: &[&str] = &[
-        "ForCausalLM",
-        "ForConditionalGeneration",
-        "LMHeadModel",
-    ];
+    const SUFFIXES: &[&str] = &["ForCausalLM", "ForConditionalGeneration", "LMHeadModel"];
     for suffix in SUFFIXES {
         if let Some(stem) = raw.strip_suffix(suffix) {
             if stem.is_empty() {
@@ -475,8 +469,7 @@ mod tests {
             "vocab_size": 32
         }"#;
         match parse_hf_config(json) {
-            Err(HfConfigError::UnsupportedArch(ref s))
-                if s == "FrobnicatorClassifier" => {}
+            Err(HfConfigError::UnsupportedArch(ref s)) if s == "FrobnicatorClassifier" => {}
             other => panic!("expected UnsupportedArch, got {other:?}"),
         }
     }

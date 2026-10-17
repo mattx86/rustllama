@@ -102,18 +102,14 @@ pub struct MlxAffineQuant {
 /// fails loudly instead of decoding garbage.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MlxAffineError {
-    #[error(
-        "mlx affine `{name}`: unsupported bits {bits} (want one of 2,3,4,5,6,8)"
-    )]
+    #[error("mlx affine `{name}`: unsupported bits {bits} (want one of 2,3,4,5,6,8)")]
     UnsupportedBits { name: String, bits: u32 },
     #[error(
         "mlx affine `{name}`: unsupported group_size {group_size} \
          (want one of 32,64,128)"
     )]
     UnsupportedGroupSize { name: String, group_size: usize },
-    #[error(
-        "mlx affine `{name}`: shape {shape:?} is not 2-D [out_features, in_features]"
-    )]
+    #[error("mlx affine `{name}`: shape {shape:?} is not 2-D [out_features, in_features]")]
     NotMatrix { name: String, shape: Vec<u64> },
     #[error(
         "mlx affine `{name}`: in_features {in_features} not a multiple of \
@@ -256,9 +252,8 @@ impl MlxAffineQuant {
     /// geometry.
     pub fn to_blob(&self) -> Vec<u8> {
         let n_groups = self.n_groups() as usize;
-        let mut blob = Vec::with_capacity(
-            MLX_AFFINE_BLOB_HEADER_BYTES + self.packed.len() + n_groups * 2 * 2,
-        );
+        let mut blob =
+            Vec::with_capacity(MLX_AFFINE_BLOB_HEADER_BYTES + self.packed.len() + n_groups * 2 * 2);
         blob.extend_from_slice(&(self.group_size as u32).to_le_bytes());
         blob.extend_from_slice(&self.bits.to_le_bytes());
         blob.extend_from_slice(&(self.out_features() as u32).to_le_bytes());
@@ -402,7 +397,14 @@ mod tests {
 
     #[test]
     fn valid_geometry_passes() {
-        for &(bits, gs) in &[(2u32, 32usize), (3, 64), (4, 64), (5, 32), (6, 128), (8, 32)] {
+        for &(bits, gs) in &[
+            (2u32, 32usize),
+            (3, 64),
+            (4, 64),
+            (5, 32),
+            (6, 128),
+            (8, 32),
+        ] {
             let q = mk(bits, gs, [4, (gs * 3) as u64]);
             assert_eq!(q.validate(), Ok(()), "bits={bits} gs={gs}");
         }
@@ -412,7 +414,10 @@ mod tests {
     fn rejects_bad_geometry() {
         let mut q = mk(4, 64, [8, 128]);
         q.bits = 7;
-        assert!(matches!(q.validate(), Err(MlxAffineError::UnsupportedBits { .. })));
+        assert!(matches!(
+            q.validate(),
+            Err(MlxAffineError::UnsupportedBits { .. })
+        ));
 
         let mut q = mk(4, 64, [8, 128]);
         q.group_size = 48;
@@ -423,11 +428,20 @@ mod tests {
 
         let mut q = mk(4, 64, [8, 128]);
         q.scales.push(9.0); // wrong length
-        assert!(matches!(q.validate(), Err(MlxAffineError::GroupBufLen { which: "scales", .. })));
+        assert!(matches!(
+            q.validate(),
+            Err(MlxAffineError::GroupBufLen {
+                which: "scales",
+                ..
+            })
+        ));
 
         let mut q = mk(4, 64, [8, 128]);
         q.packed = vec![0u8; 3].into(); // wrong packed length
-        assert!(matches!(q.validate(), Err(MlxAffineError::PackedLen { .. })));
+        assert!(matches!(
+            q.validate(),
+            Err(MlxAffineError::PackedLen { .. })
+        ));
     }
 
     #[test]
@@ -438,7 +452,9 @@ mod tests {
         let shape = [3u64, 128];
         let n = (shape[0] * shape[1]) as usize; // 384
         let n_groups = n / gs; // 6
-        let packed: Vec<u8> = (0..n * bits as usize / 8).map(|i| (i as u8).wrapping_mul(31)).collect();
+        let packed: Vec<u8> = (0..n * bits as usize / 8)
+            .map(|i| (i as u8).wrapping_mul(31))
+            .collect();
         let scales: Vec<f32> = (0..n_groups).map(|g| 0.1 + g as f32 * 0.05).collect();
         let biases: Vec<f32> = (0..n_groups).map(|g| -0.3 + g as f32 * 0.02).collect();
         let q = MlxAffineQuant {

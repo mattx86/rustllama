@@ -196,8 +196,7 @@ async fn inspect_dense_gguf_omits_moe_fields() {
 /// without re-parsing the GGUF.
 #[tokio::test]
 async fn inspect_moe_gguf_surfaces_expert_counts() {
-    let tmp =
-        std::env::temp_dir().join("rustllama-inspect-moe-experts.gguf");
+    let tmp = std::env::temp_dir().join("rustllama-inspect-moe-experts.gguf");
     write_synthetic_llama_gguf(
         &tmp,
         &SynthLlama {
@@ -238,8 +237,7 @@ async fn inspect_moe_gguf_surfaces_expert_counts() {
 /// DeepSeek-V3-style shared-expert MoE GGUF: `n_experts_shared` > 0.
 #[tokio::test]
 async fn inspect_deepseek_shape_shows_shared_expert_count() {
-    let tmp =
-        std::env::temp_dir().join("rustllama-inspect-moe-shared.gguf");
+    let tmp = std::env::temp_dir().join("rustllama-inspect-moe-shared.gguf");
     write_synthetic_llama_gguf(
         &tmp,
         &SynthLlama {

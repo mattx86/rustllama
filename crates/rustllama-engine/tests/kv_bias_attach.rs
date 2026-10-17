@@ -61,7 +61,10 @@ fn zero_bias_attach_is_greedy_identity() {
     let e = CpuEngine::load_with_options(&model, 32, false, KvDtype::Q4_0).expect("load2");
     // Auto-discovery: sidecar sits beside the model.
     let attached = e.attach_kv_bias(None).expect("attach");
-    assert!(attached, "sidecar beside the model must auto-attach on q4_0 KV");
+    assert!(
+        attached,
+        "sidecar beside the model must auto-attach on q4_0 KV"
+    );
     let with_bias = e.generate_token_ids(&prompt, 4, &greedy(4)).expect("gen2");
 
     assert_eq!(
@@ -103,7 +106,10 @@ fn basis_mismatch_is_refused() {
 fn no_sidecar_auto_mode_is_quiet_noop() {
     let (model, _synth) = synth_64("no-sidecar");
     let e = CpuEngine::load_with_options(&model, 32, false, KvDtype::Q4_0).expect("load");
-    assert!(!e.attach_kv_bias(None).expect("attach"), "no sidecar → Ok(false)");
+    assert!(
+        !e.attach_kv_bias(None).expect("attach"),
+        "no sidecar → Ok(false)"
+    );
     let _ = std::fs::remove_file(&model);
 }
 
@@ -122,7 +128,10 @@ fn non_q4_0_cache_with_explicit_path_errors() {
         .expect("save sidecar");
     let e = CpuEngine::load_with_options(&model, 32, false, KvDtype::F32).expect("load");
     // Auto mode: quiet skip on non-Q4_0.
-    assert!(!e.attach_kv_bias(None).expect("auto"), "auto + f32 KV → quiet skip");
+    assert!(
+        !e.attach_kv_bias(None).expect("auto"),
+        "auto + f32 KV → quiet skip"
+    );
     // Explicit: hard error.
     e.attach_kv_bias(Some(&sidecar))
         .expect_err("explicit kv_bias_path + non-q4_0 cache must error");

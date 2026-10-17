@@ -63,9 +63,9 @@ use std::sync::OnceLock;
 /// follow-up land without touching the cache struct.
 #[allow(dead_code)]
 struct Iq1sGridCache {
-    grid_f32: Vec<f32>,    // 2048 × 8 = 16384 f32 entries
-    grid_norm: Vec<f32>,   // 2048 entries — |g|² per grid
-    grid_l2: Vec<f32>,     // 2048 entries — |g| (sqrt of grid_norm)
+    grid_f32: Vec<f32>,  // 2048 × 8 = 16384 f32 entries
+    grid_norm: Vec<f32>, // 2048 entries — |g|² per grid
+    grid_l2: Vec<f32>,   // 2048 entries — |g| (sqrt of grid_norm)
     /// Indices sorted by |g|² descending. Not yet consumed.
     sort_by_norm_desc: Vec<u16>,
 }
@@ -221,9 +221,7 @@ fn search_chunk_8(
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: runtime feature detection above.
-            return unsafe {
-                search_chunk_8_avx2(target, grid_f32, n_grid, grid_norm_sq_table)
-            };
+            return unsafe { search_chunk_8_avx2(target, grid_f32, n_grid, grid_norm_sq_table) };
         }
     }
     search_chunk_8_scalar(target, grid_f32, n_grid, grid_norm_sq_table)
@@ -662,7 +660,11 @@ const BLOCK_IQ2_XXS_BYTES: usize = 66;
 /// 4-bit sub-block scale in bits 28..31. Sub-block scale formula:
 /// `db = d * (0.5 + scale_nibble) * 0.25`.
 pub fn encode_iq2_xxs(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK_K, 0, "encode_iq2_xxs: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_iq2_xxs: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -798,10 +800,7 @@ pub fn encode_iq2_xxs_with_encoder(
 }
 
 /// IQ2_XXS per-block bit-packer. See [`bit_pack_iq2_xs_from_picks`].
-pub fn bit_pack_iq2_xxs_from_picks(
-    picks: &[crate::iq_gpu::Iq8EltSignedPick],
-    dst: &mut [u8],
-) {
+pub fn bit_pack_iq2_xxs_from_picks(picks: &[crate::iq_gpu::Iq8EltSignedPick], dst: &mut [u8]) {
     use rayon::prelude::*;
     dst.par_chunks_mut(BLOCK_IQ2_XXS_BYTES)
         .enumerate()
@@ -878,7 +877,11 @@ fn iq2xs_grid_bytes() -> &'static [u8] {
 /// high for chunks 2/3); sub-scale formula `db = d * (0.5 +
 /// nibble) * 0.25`.
 pub fn encode_iq2_xs(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK_K, 0, "encode_iq2_xs: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_iq2_xs: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -1030,10 +1033,7 @@ pub fn encode_iq2_xs_with_encoder(
 /// after a *cross-tensor* coalesced GPU dispatch — one big encoder
 /// call covers N tensors' chunks, then per-tensor bit-pack splits
 /// the picks back.
-pub fn bit_pack_iq2_xs_from_picks(
-    picks: &[crate::iq_gpu::Iq8EltSignedPick],
-    dst: &mut [u8],
-) {
+pub fn bit_pack_iq2_xs_from_picks(picks: &[crate::iq_gpu::Iq8EltSignedPick], dst: &mut [u8]) {
     use rayon::prelude::*;
     dst.par_chunks_mut(BLOCK_IQ2_XS_BYTES)
         .enumerate()
@@ -1133,7 +1133,11 @@ fn iq2s_grid_bytes() -> &'static [u8] {
 /// format. We keep the parity logic anyway — the resulting masks
 /// are a strict subset of the format's representable set.
 pub fn encode_iq2_s(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK_K, 0, "encode_iq2_s: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_iq2_s: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -1288,10 +1292,7 @@ pub fn encode_iq2_s_with_encoder(
 }
 
 /// IQ2_S per-block bit-packer. See [`bit_pack_iq2_xs_from_picks`].
-pub fn bit_pack_iq2_s_from_picks(
-    picks: &[crate::iq_gpu::Iq8EltSignedPick],
-    dst: &mut [u8],
-) {
+pub fn bit_pack_iq2_s_from_picks(picks: &[crate::iq_gpu::Iq8EltSignedPick], dst: &mut [u8]) {
     use rayon::prelude::*;
     dst.par_chunks_mut(BLOCK_IQ2_S_BYTES)
         .enumerate()
@@ -1389,7 +1390,11 @@ const BLOCK_IQ3_XXS_BYTES: usize = 98;
 /// 4-bit sub-block scale in bits 28..31. Sub-block scale formula:
 /// `db = d * (0.5 + scale_nibble) * 0.5`.
 pub fn encode_iq3_xxs(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK_K, 0, "encode_iq3_xxs: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_iq3_xxs: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -1592,7 +1597,11 @@ fn iq3s_grid_bytes() -> &'static [u8] {
 /// two-per-byte into `scales[4]`. Sub-scale formula:
 /// `db = d * (1 + 2 * x)` with `x ∈ [0, 15]` → db ∈ `d * [1, 31]`.
 pub fn encode_iq3_s(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK_K, 0, "encode_iq3_s: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_iq3_s: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -2197,10 +2206,7 @@ fn best_iq1s_grid_for_chunk(target: &[f32], delta: f32) -> ChunkPickIq1 {
 /// the d<0 super-block-sign branch: with negative d_super, dl_used ≤ 0,
 /// so we want the grid pick to have signed_score ≤ 0 too — and the
 /// minimizer of signed_score gives the lowest L2 error under dl ≤ 0.
-pub(crate) fn best_iq1s_grid_for_chunk_negative_scalar(
-    target: &[f32],
-    delta: f32,
-) -> ChunkPickIq1 {
+pub(crate) fn best_iq1s_grid_for_chunk_negative_scalar(target: &[f32], delta: f32) -> ChunkPickIq1 {
     let cache = iq1s_grid_cache();
     let mut best = ChunkPickIq1 {
         grid_idx: 0,
@@ -2238,10 +2244,7 @@ pub(crate) fn best_iq1s_grid_for_chunk_negative_scalar(
 /// by `+3 * signed² / norm`). Picking the max-positive-score grid entry
 /// per chunk yields a guaranteed `dl ≥ 0` reconstruction that lower-bounds
 /// the L2 error.
-pub(crate) fn best_iq1s_grid_for_chunk_positive_scalar(
-    target: &[f32],
-    delta: f32,
-) -> ChunkPickIq1 {
+pub(crate) fn best_iq1s_grid_for_chunk_positive_scalar(target: &[f32], delta: f32) -> ChunkPickIq1 {
     let cache = iq1s_grid_cache();
     let mut best = ChunkPickIq1 {
         grid_idx: 0,
@@ -2274,10 +2277,7 @@ pub(crate) fn best_iq1s_grid_for_chunk_positive_scalar(
 /// Scalar reference. Used by the parity test + as fallback on
 /// non-x86_64 hosts. Reads the precomputed f32 grid (built once via
 /// [`iq1s_grid_cache`]).
-pub(crate) fn best_iq1s_grid_for_chunk_scalar(
-    target: &[f32],
-    delta: f32,
-) -> ChunkPickIq1 {
+pub(crate) fn best_iq1s_grid_for_chunk_scalar(target: &[f32], delta: f32) -> ChunkPickIq1 {
     let cache = iq1s_grid_cache();
     let mut best = ChunkPickIq1 {
         grid_idx: 0,
@@ -2325,10 +2325,7 @@ pub(crate) fn best_iq1s_grid_for_chunk_scalar(
 /// candidate: ~6 cycles vs ~25 in scalar.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
-unsafe fn best_iq1s_grid_for_chunk_avx2(
-    target: &[f32],
-    delta: f32,
-) -> ChunkPickIq1 {
+unsafe fn best_iq1s_grid_for_chunk_avx2(target: &[f32], delta: f32) -> ChunkPickIq1 {
     use std::arch::x86_64::*;
     debug_assert_eq!(target.len(), 8);
     let cache = iq1s_grid_cache();
@@ -2389,7 +2386,10 @@ pub(crate) fn best_iq1s_grid_all3_both_deltas(
     }
     let dp = -1.0 + IQ1S_DELTA;
     let dn = -1.0 - IQ1S_DELTA;
-    [best_iq1s_grid_all3(target, dp), best_iq1s_grid_all3(target, dn)]
+    [
+        best_iq1s_grid_all3(target, dp),
+        best_iq1s_grid_all3(target, dn),
+    ]
 }
 
 /// imatrix-weighted scalar variant of [`best_iq1s_grid_all3`]: one
@@ -2406,7 +2406,11 @@ fn best_iq1s_grid_all3_scalar_w(
     debug_assert_eq!(target.len(), 8);
     debug_assert_eq!(w.len(), 8);
     let cache = iq1s_grid_cache();
-    let z = ChunkPickIq1 { grid_idx: 0, signed_score: 0.0, norm_sq: 1.0 };
+    let z = ChunkPickIq1 {
+        grid_idx: 0,
+        signed_score: 0.0,
+        norm_sq: 1.0,
+    };
     let (mut best_abs, mut best_pos, mut best_neg) = (z, z, z);
     let mut best_s2n = -1f32;
     let mut best_p = f32::NEG_INFINITY;
@@ -2421,7 +2425,11 @@ fn best_iq1s_grid_all3_scalar_w(
             norm += w[j] * gpd * gpd;
         }
         if norm > 0.0 {
-            let pick = ChunkPickIq1 { grid_idx: idx as u16, signed_score: dot, norm_sq: norm };
+            let pick = ChunkPickIq1 {
+                grid_idx: idx as u16,
+                signed_score: dot,
+                norm_sq: norm,
+            };
             let s2n = dot * dot / norm;
             if s2n > best_s2n {
                 best_s2n = s2n;
@@ -2476,9 +2484,17 @@ unsafe fn best_iq1s_grid_all3_both_deltas_avx2(
     let delta_p_v = _mm256_set1_ps(-1.0 + IQ1S_DELTA);
     let delta_n_v = _mm256_set1_ps(-1.0 - IQ1S_DELTA);
 
-    let init = ChunkPickIq1 { grid_idx: 0, signed_score: 0.0, norm_sq: 1.0 };
-    let mut best_abs_p = init; let mut best_pos_p = init; let mut best_neg_p = init;
-    let mut best_abs_n = init; let mut best_pos_n = init; let mut best_neg_n = init;
+    let init = ChunkPickIq1 {
+        grid_idx: 0,
+        signed_score: 0.0,
+        norm_sq: 1.0,
+    };
+    let mut best_abs_p = init;
+    let mut best_pos_p = init;
+    let mut best_neg_p = init;
+    let mut best_abs_n = init;
+    let mut best_pos_n = init;
+    let mut best_neg_n = init;
     let mut best_abs_p_s2divn = -1f32;
     let mut best_pos_p_signed = f32::NEG_INFINITY;
     let mut best_neg_p_signed = f32::INFINITY;
@@ -2504,34 +2520,61 @@ unsafe fn best_iq1s_grid_all3_both_deltas_avx2(
             let s2_div_n = dot_p * dot_p / norm_p;
             if s2_div_n > best_abs_p_s2divn {
                 best_abs_p_s2divn = s2_div_n;
-                best_abs_p = ChunkPickIq1 { grid_idx: idx_u16, signed_score: dot_p, norm_sq: norm_p };
+                best_abs_p = ChunkPickIq1 {
+                    grid_idx: idx_u16,
+                    signed_score: dot_p,
+                    norm_sq: norm_p,
+                };
             }
             if dot_p > best_pos_p_signed {
                 best_pos_p_signed = dot_p;
-                best_pos_p = ChunkPickIq1 { grid_idx: idx_u16, signed_score: dot_p, norm_sq: norm_p };
+                best_pos_p = ChunkPickIq1 {
+                    grid_idx: idx_u16,
+                    signed_score: dot_p,
+                    norm_sq: norm_p,
+                };
             }
             if dot_p < best_neg_p_signed {
                 best_neg_p_signed = dot_p;
-                best_neg_p = ChunkPickIq1 { grid_idx: idx_u16, signed_score: dot_p, norm_sq: norm_p };
+                best_neg_p = ChunkPickIq1 {
+                    grid_idx: idx_u16,
+                    signed_score: dot_p,
+                    norm_sq: norm_p,
+                };
             }
         }
         if norm_n > 0.0 {
             let s2_div_n = dot_n * dot_n / norm_n;
             if s2_div_n > best_abs_n_s2divn {
                 best_abs_n_s2divn = s2_div_n;
-                best_abs_n = ChunkPickIq1 { grid_idx: idx_u16, signed_score: dot_n, norm_sq: norm_n };
+                best_abs_n = ChunkPickIq1 {
+                    grid_idx: idx_u16,
+                    signed_score: dot_n,
+                    norm_sq: norm_n,
+                };
             }
             if dot_n > best_pos_n_signed {
                 best_pos_n_signed = dot_n;
-                best_pos_n = ChunkPickIq1 { grid_idx: idx_u16, signed_score: dot_n, norm_sq: norm_n };
+                best_pos_n = ChunkPickIq1 {
+                    grid_idx: idx_u16,
+                    signed_score: dot_n,
+                    norm_sq: norm_n,
+                };
             }
             if dot_n < best_neg_n_signed {
                 best_neg_n_signed = dot_n;
-                best_neg_n = ChunkPickIq1 { grid_idx: idx_u16, signed_score: dot_n, norm_sq: norm_n };
+                best_neg_n = ChunkPickIq1 {
+                    grid_idx: idx_u16,
+                    signed_score: dot_n,
+                    norm_sq: norm_n,
+                };
             }
         }
     }
-    [(best_abs_p, best_pos_p, best_neg_p), (best_abs_n, best_pos_n, best_neg_n)]
+    [
+        (best_abs_p, best_pos_p, best_neg_p),
+        (best_abs_n, best_pos_n, best_neg_n),
+    ]
 }
 
 /// Sibling of [`best_iq1s_grid_all3_both_deltas`] for the GPU-encoder
@@ -2551,7 +2594,10 @@ pub(crate) fn best_iq1s_grid_pos_neg_both_deltas(
     }
     let dp = -1.0 + IQ1S_DELTA;
     let dn = -1.0 - IQ1S_DELTA;
-    [best_iq1s_grid_pos_neg(target, dp), best_iq1s_grid_pos_neg(target, dn)]
+    [
+        best_iq1s_grid_pos_neg(target, dp),
+        best_iq1s_grid_pos_neg(target, dn),
+    ]
 }
 
 #[allow(dead_code)] // sibling of the retained IQ1_S GPU-encoder-path helper above.
@@ -2566,9 +2612,15 @@ unsafe fn best_iq1s_grid_pos_neg_both_deltas_avx2(
     let target_v = unsafe { _mm256_loadu_ps(target.as_ptr()) };
     let delta_p_v = _mm256_set1_ps(-1.0 + IQ1S_DELTA);
     let delta_n_v = _mm256_set1_ps(-1.0 - IQ1S_DELTA);
-    let init = ChunkPickIq1 { grid_idx: 0, signed_score: 0.0, norm_sq: 1.0 };
-    let mut best_pos_p = init; let mut best_neg_p = init;
-    let mut best_pos_n = init; let mut best_neg_n = init;
+    let init = ChunkPickIq1 {
+        grid_idx: 0,
+        signed_score: 0.0,
+        norm_sq: 1.0,
+    };
+    let mut best_pos_p = init;
+    let mut best_neg_p = init;
+    let mut best_pos_n = init;
+    let mut best_neg_n = init;
     let mut best_pos_p_signed = f32::NEG_INFINITY;
     let mut best_neg_p_signed = f32::INFINITY;
     let mut best_pos_n_signed = f32::NEG_INFINITY;
@@ -2589,21 +2641,37 @@ unsafe fn best_iq1s_grid_pos_neg_both_deltas_avx2(
         if norm_p > 0.0 {
             if dot_p > best_pos_p_signed {
                 best_pos_p_signed = dot_p;
-                best_pos_p = ChunkPickIq1 { grid_idx: idx_u16, signed_score: dot_p, norm_sq: norm_p };
+                best_pos_p = ChunkPickIq1 {
+                    grid_idx: idx_u16,
+                    signed_score: dot_p,
+                    norm_sq: norm_p,
+                };
             }
             if dot_p < best_neg_p_signed {
                 best_neg_p_signed = dot_p;
-                best_neg_p = ChunkPickIq1 { grid_idx: idx_u16, signed_score: dot_p, norm_sq: norm_p };
+                best_neg_p = ChunkPickIq1 {
+                    grid_idx: idx_u16,
+                    signed_score: dot_p,
+                    norm_sq: norm_p,
+                };
             }
         }
         if norm_n > 0.0 {
             if dot_n > best_pos_n_signed {
                 best_pos_n_signed = dot_n;
-                best_pos_n = ChunkPickIq1 { grid_idx: idx_u16, signed_score: dot_n, norm_sq: norm_n };
+                best_pos_n = ChunkPickIq1 {
+                    grid_idx: idx_u16,
+                    signed_score: dot_n,
+                    norm_sq: norm_n,
+                };
             }
             if dot_n < best_neg_n_signed {
                 best_neg_n_signed = dot_n;
-                best_neg_n = ChunkPickIq1 { grid_idx: idx_u16, signed_score: dot_n, norm_sq: norm_n };
+                best_neg_n = ChunkPickIq1 {
+                    grid_idx: idx_u16,
+                    signed_score: dot_n,
+                    norm_sq: norm_n,
+                };
             }
         }
     }
@@ -2616,10 +2684,7 @@ unsafe fn best_iq1s_grid_pos_neg_both_deltas_avx2(
 /// per-chunk cost of `all3`.
 // IQ1_S GPU-encoder-path helper (RUSTLLAMA_IQ_GPU); retained, not yet wired into a caller.
 #[allow(dead_code)]
-pub(crate) fn best_iq1s_grid_pos_neg(
-    target: &[f32],
-    delta: f32,
-) -> (ChunkPickIq1, ChunkPickIq1) {
+pub(crate) fn best_iq1s_grid_pos_neg(target: &[f32], delta: f32) -> (ChunkPickIq1, ChunkPickIq1) {
     debug_assert_eq!(target.len(), 8);
     #[cfg(target_arch = "x86_64")]
     {
@@ -2638,18 +2703,23 @@ pub(crate) fn best_iq1s_grid_pos_neg(
 #[allow(dead_code)] // sibling of the retained IQ1_S GPU-encoder-path helper above.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
-unsafe fn best_iq1s_grid_pos_neg_avx2(
-    target: &[f32],
-    delta: f32,
-) -> (ChunkPickIq1, ChunkPickIq1) {
+unsafe fn best_iq1s_grid_pos_neg_avx2(target: &[f32], delta: f32) -> (ChunkPickIq1, ChunkPickIq1) {
     use std::arch::x86_64::*;
     debug_assert_eq!(target.len(), 8);
     let cache = iq1s_grid_cache();
     let grid_ptr = cache.grid_f32.as_ptr();
     let target_v = unsafe { _mm256_loadu_ps(target.as_ptr()) };
     let delta_v = _mm256_set1_ps(delta);
-    let mut best_pos = ChunkPickIq1 { grid_idx: 0, signed_score: 0.0, norm_sq: 1.0 };
-    let mut best_neg = ChunkPickIq1 { grid_idx: 0, signed_score: 0.0, norm_sq: 1.0 };
+    let mut best_pos = ChunkPickIq1 {
+        grid_idx: 0,
+        signed_score: 0.0,
+        norm_sq: 1.0,
+    };
+    let mut best_neg = ChunkPickIq1 {
+        grid_idx: 0,
+        signed_score: 0.0,
+        norm_sq: 1.0,
+    };
     let mut best_pos_signed = f32::NEG_INFINITY;
     let mut best_neg_signed = f32::INFINITY;
     for idx in 0..2048 {
@@ -2662,11 +2732,19 @@ unsafe fn best_iq1s_grid_pos_neg_avx2(
         if norm > 0.0 {
             if dot > best_pos_signed {
                 best_pos_signed = dot;
-                best_pos = ChunkPickIq1 { grid_idx: idx as u16, signed_score: dot, norm_sq: norm };
+                best_pos = ChunkPickIq1 {
+                    grid_idx: idx as u16,
+                    signed_score: dot,
+                    norm_sq: norm,
+                };
             }
             if dot < best_neg_signed {
                 best_neg_signed = dot;
-                best_neg = ChunkPickIq1 { grid_idx: idx as u16, signed_score: dot, norm_sq: norm };
+                best_neg = ChunkPickIq1 {
+                    grid_idx: idx as u16,
+                    signed_score: dot,
+                    norm_sq: norm,
+                };
             }
         }
     }
@@ -2711,9 +2789,21 @@ unsafe fn best_iq1s_grid_all3_avx2(
     let target_v = unsafe { _mm256_loadu_ps(target.as_ptr()) };
     let delta_v = _mm256_set1_ps(delta);
 
-    let mut best_abs = ChunkPickIq1 { grid_idx: 0, signed_score: 0.0, norm_sq: 1.0 };
-    let mut best_pos = ChunkPickIq1 { grid_idx: 0, signed_score: 0.0, norm_sq: 1.0 };
-    let mut best_neg = ChunkPickIq1 { grid_idx: 0, signed_score: 0.0, norm_sq: 1.0 };
+    let mut best_abs = ChunkPickIq1 {
+        grid_idx: 0,
+        signed_score: 0.0,
+        norm_sq: 1.0,
+    };
+    let mut best_pos = ChunkPickIq1 {
+        grid_idx: 0,
+        signed_score: 0.0,
+        norm_sq: 1.0,
+    };
+    let mut best_neg = ChunkPickIq1 {
+        grid_idx: 0,
+        signed_score: 0.0,
+        norm_sq: 1.0,
+    };
     let mut best_abs_s2divn = -1f32;
     let mut best_pos_signed = f32::NEG_INFINITY;
     let mut best_neg_signed = f32::INFINITY;
@@ -2729,15 +2819,27 @@ unsafe fn best_iq1s_grid_all3_avx2(
             let s2_div_n = dot * dot / norm;
             if s2_div_n > best_abs_s2divn {
                 best_abs_s2divn = s2_div_n;
-                best_abs = ChunkPickIq1 { grid_idx: idx as u16, signed_score: dot, norm_sq: norm };
+                best_abs = ChunkPickIq1 {
+                    grid_idx: idx as u16,
+                    signed_score: dot,
+                    norm_sq: norm,
+                };
             }
             if dot > best_pos_signed {
                 best_pos_signed = dot;
-                best_pos = ChunkPickIq1 { grid_idx: idx as u16, signed_score: dot, norm_sq: norm };
+                best_pos = ChunkPickIq1 {
+                    grid_idx: idx as u16,
+                    signed_score: dot,
+                    norm_sq: norm,
+                };
             }
             if dot < best_neg_signed {
                 best_neg_signed = dot;
-                best_neg = ChunkPickIq1 { grid_idx: idx as u16, signed_score: dot, norm_sq: norm };
+                best_neg = ChunkPickIq1 {
+                    grid_idx: idx as u16,
+                    signed_score: dot,
+                    norm_sq: norm,
+                };
             }
         }
     }
@@ -2768,9 +2870,21 @@ unsafe fn best_iq1s_grid_all3_avx2_w(
     // Pre-fold the importance into target so the dot is one mul.
     let wt_v = _mm256_mul_ps(w_v, target_v);
 
-    let mut best_abs = ChunkPickIq1 { grid_idx: 0, signed_score: 0.0, norm_sq: 1.0 };
-    let mut best_pos = ChunkPickIq1 { grid_idx: 0, signed_score: 0.0, norm_sq: 1.0 };
-    let mut best_neg = ChunkPickIq1 { grid_idx: 0, signed_score: 0.0, norm_sq: 1.0 };
+    let mut best_abs = ChunkPickIq1 {
+        grid_idx: 0,
+        signed_score: 0.0,
+        norm_sq: 1.0,
+    };
+    let mut best_pos = ChunkPickIq1 {
+        grid_idx: 0,
+        signed_score: 0.0,
+        norm_sq: 1.0,
+    };
+    let mut best_neg = ChunkPickIq1 {
+        grid_idx: 0,
+        signed_score: 0.0,
+        norm_sq: 1.0,
+    };
     let mut best_abs_s2divn = -1f32;
     let mut best_pos_signed = f32::NEG_INFINITY;
     let mut best_neg_signed = f32::INFINITY;
@@ -2788,15 +2902,27 @@ unsafe fn best_iq1s_grid_all3_avx2_w(
             let s2_div_n = dot * dot / norm;
             if s2_div_n > best_abs_s2divn {
                 best_abs_s2divn = s2_div_n;
-                best_abs = ChunkPickIq1 { grid_idx: idx as u16, signed_score: dot, norm_sq: norm };
+                best_abs = ChunkPickIq1 {
+                    grid_idx: idx as u16,
+                    signed_score: dot,
+                    norm_sq: norm,
+                };
             }
             if dot > best_pos_signed {
                 best_pos_signed = dot;
-                best_pos = ChunkPickIq1 { grid_idx: idx as u16, signed_score: dot, norm_sq: norm };
+                best_pos = ChunkPickIq1 {
+                    grid_idx: idx as u16,
+                    signed_score: dot,
+                    norm_sq: norm,
+                };
             }
             if dot < best_neg_signed {
                 best_neg_signed = dot;
-                best_neg = ChunkPickIq1 { grid_idx: idx as u16, signed_score: dot, norm_sq: norm };
+                best_neg = ChunkPickIq1 {
+                    grid_idx: idx as u16,
+                    signed_score: dot,
+                    norm_sq: norm,
+                };
             }
         }
     }
@@ -2843,7 +2969,11 @@ pub fn encode_iq1_s(src: &[f32], dst: &mut [u8]) {
 /// `None` reproduces the uniform-weight encode exactly (and keeps the
 /// AVX2 fast path). The imatrix path is scalar-only.
 pub fn encode_iq1_s_imatrix(src: &[f32], dst: &mut [u8], imatrix: Option<&[f32]>) {
-    assert_eq!(src.len() % QK_K, 0, "encode_iq1_s: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_iq1_s: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -2860,278 +2990,320 @@ pub fn encode_iq1_s_imatrix(src: &[f32], dst: &mut [u8], imatrix: Option<&[f32]>
     dst.par_chunks_mut(BLOCK_IQ1_S_BYTES)
         .enumerate()
         .for_each(|(b, dst_block)| {
-        let xs = &src[b * QK_K..(b + 1) * QK_K];
-        // imatrix slice for this 256-col block (None = uniform).
-        let w_block = imatrix.map(|w| &w[b * QK_K..(b + 1) * QK_K]);
-        let off = 0; // dst_block is already the per-block slice
-        let _ = off; // suppress unused warning
+            let xs = &src[b * QK_K..(b + 1) * QK_K];
+            // imatrix slice for this 256-col block (None = uniform).
+            let w_block = imatrix.map(|w| &w[b * QK_K..(b + 1) * QK_K]);
+            let off = 0; // dst_block is already the per-block slice
+            let _ = off; // suppress unused warning
 
-        // Per-sub-block: try BOTH d_super signs and pick whichever
-        // gives lower total L2 error across the super-block. The
-        // unsigned-d_super-only encoder produces -38% bias on
-        // zero-mean Gaussian sources (diagnosed via the
-        // `iq1_s_bias_diagnostic` test) because IQ1_S's representable
-        // range with d>0 is heavily negative-biased
-        // ((grid+delta) ∈ [-2.125, +0.125]). Allowing d<0 makes the
-        // range [-0.125, +2.125] available so positive-mean
-        // super-blocks can be fit without sign-flipping every
-        // sub-block's dl.
-        //
-        // Per sub-block we record the BEST picks under the d>0
-        // assumption (dl_used ≥ 0) AND under d<0 (dl_used ≤ 0),
-        // then pick the super-block-wide sign that minimizes total
-        // L2 error.
-        #[derive(Default, Clone, Copy)]
-        struct SubBlockChoice {
-            picks: [ChunkPickIq1; 4],
-            delta_neg: bool,
-            dl_used: f32, // signed
-            error: f64,
-        }
-        let mut sub_pos: [SubBlockChoice; N_SUB_BLOCKS] = Default::default();
-        let mut sub_neg: [SubBlockChoice; N_SUB_BLOCKS] = Default::default();
-        // Tracking arrays needed by the super-block tail.
-        let mut sub_picks: [[ChunkPickIq1; 4]; N_SUB_BLOCKS] = Default::default();
-        let mut sub_delta_neg: [bool; N_SUB_BLOCKS] = [false; N_SUB_BLOCKS];
-        let mut sub_dl_abs = [0f32; N_SUB_BLOCKS]; // |dl| post-sign decision
+            // Per-sub-block: try BOTH d_super signs and pick whichever
+            // gives lower total L2 error across the super-block. The
+            // unsigned-d_super-only encoder produces -38% bias on
+            // zero-mean Gaussian sources (diagnosed via the
+            // `iq1_s_bias_diagnostic` test) because IQ1_S's representable
+            // range with d>0 is heavily negative-biased
+            // ((grid+delta) ∈ [-2.125, +0.125]). Allowing d<0 makes the
+            // range [-0.125, +2.125] available so positive-mean
+            // super-blocks can be fit without sign-flipping every
+            // sub-block's dl.
+            //
+            // Per sub-block we record the BEST picks under the d>0
+            // assumption (dl_used ≥ 0) AND under d<0 (dl_used ≤ 0),
+            // then pick the super-block-wide sign that minimizes total
+            // L2 error.
+            #[derive(Default, Clone, Copy)]
+            struct SubBlockChoice {
+                picks: [ChunkPickIq1; 4],
+                delta_neg: bool,
+                dl_used: f32, // signed
+                error: f64,
+            }
+            let mut sub_pos: [SubBlockChoice; N_SUB_BLOCKS] = Default::default();
+            let mut sub_neg: [SubBlockChoice; N_SUB_BLOCKS] = Default::default();
+            // Tracking arrays needed by the super-block tail.
+            let mut sub_picks: [[ChunkPickIq1; 4]; N_SUB_BLOCKS] = Default::default();
+            let mut sub_delta_neg: [bool; N_SUB_BLOCKS] = [false; N_SUB_BLOCKS];
+            let mut sub_dl_abs = [0f32; N_SUB_BLOCKS]; // |dl| post-sign decision
 
-        // #6: scan the super-block once for uniform sign. If all values
-        // are ≥ 0 or all ≤ 0, only one d_super sign is meaningful — skip
-        // the dl-of-wrong-sign candidate evaluations per sub-block.
-        // Common for embedding rows + biases; rare for MoE expert weights
-        // (which are balanced).
-        let (mut any_pos, mut any_neg) = (false, false);
-        for &v in xs {
-            if v > 0.0 { any_pos = true; }
-            else if v < 0.0 { any_neg = true; }
-            if any_pos && any_neg { break; }
-        }
-        let only_dl_pos = any_pos && !any_neg;
-        let only_dl_neg = !any_pos && any_neg;
+            // #6: scan the super-block once for uniform sign. If all values
+            // are ≥ 0 or all ≤ 0, only one d_super sign is meaningful — skip
+            // the dl-of-wrong-sign candidate evaluations per sub-block.
+            // Common for embedding rows + biases; rare for MoE expert weights
+            // (which are balanced).
+            let (mut any_pos, mut any_neg) = (false, false);
+            for &v in xs {
+                if v > 0.0 {
+                    any_pos = true;
+                } else if v < 0.0 {
+                    any_neg = true;
+                }
+                if any_pos && any_neg {
+                    break;
+                }
+            }
+            let only_dl_pos = any_pos && !any_neg;
+            let only_dl_neg = !any_pos && any_neg;
 
-        for ib32 in 0..N_SUB_BLOCKS {
-            // For each (delta, strategy) pair we score by ACTUAL L2 error
-            // under the dl ≥ 0 constraint:
-            //   error_used = ||t||² - 2*dl_used*signed_total + dl_used²*norm_total
-            // with dl_used = max(0, signed_total/norm_total). Strategy A
-            // (max-|score|) can drive signed_total < 0, in which case
-            // dl_used = 0 and the sub-block contributes nothing better
-            // than zero-reconstruction. Strategy B (max-positive-score)
-            // guarantees signed_total ≥ 0, trading reach for direction.
-            // We pick whichever wins.
-            let xs_chunk = |l: usize| &xs[ib32 * 32 + l * 8..ib32 * 32 + l * 8 + 8];
-            // imatrix slice for chunk l of this sub-block (8 weights).
-            let w_chunk = |l: usize| {
-                w_block.map(|wb| &wb[ib32 * 32 + l * 8..ib32 * 32 + l * 8 + 8])
-            };
-            // Weighted target norm: Σ wⱼ·tⱼ² (unweighted Σ tⱼ² when None).
-            // Keeps the sub-block error formula
-            //   err = ‖t‖²_w − 2·dl·signed_total + dl²·norm_total
-            // consistent, since signed_total / norm_total below are the
-            // sums of the (weighted) chunk dot / norm.
-            let mut t_norm_sq = 0f64;
-            for l in 0..4 {
-                let c = xs_chunk(l);
-                match w_chunk(l) {
-                    Some(wc) => {
-                        for j in 0..8 {
-                            t_norm_sq += (wc[j] as f64) * (c[j] as f64) * (c[j] as f64);
+            for ib32 in 0..N_SUB_BLOCKS {
+                // For each (delta, strategy) pair we score by ACTUAL L2 error
+                // under the dl ≥ 0 constraint:
+                //   error_used = ||t||² - 2*dl_used*signed_total + dl_used²*norm_total
+                // with dl_used = max(0, signed_total/norm_total). Strategy A
+                // (max-|score|) can drive signed_total < 0, in which case
+                // dl_used = 0 and the sub-block contributes nothing better
+                // than zero-reconstruction. Strategy B (max-positive-score)
+                // guarantees signed_total ≥ 0, trading reach for direction.
+                // We pick whichever wins.
+                let xs_chunk = |l: usize| &xs[ib32 * 32 + l * 8..ib32 * 32 + l * 8 + 8];
+                // imatrix slice for chunk l of this sub-block (8 weights).
+                let w_chunk =
+                    |l: usize| w_block.map(|wb| &wb[ib32 * 32 + l * 8..ib32 * 32 + l * 8 + 8]);
+                // Weighted target norm: Σ wⱼ·tⱼ² (unweighted Σ tⱼ² when None).
+                // Keeps the sub-block error formula
+                //   err = ‖t‖²_w − 2·dl·signed_total + dl²·norm_total
+                // consistent, since signed_total / norm_total below are the
+                // sums of the (weighted) chunk dot / norm.
+                let mut t_norm_sq = 0f64;
+                for l in 0..4 {
+                    let c = xs_chunk(l);
+                    match w_chunk(l) {
+                        Some(wc) => {
+                            for j in 0..8 {
+                                t_norm_sq += (wc[j] as f64) * (c[j] as f64) * (c[j] as f64);
+                            }
                         }
-                    }
-                    None => {
-                        for &v in c {
-                            t_norm_sq += (v as f64) * (v as f64);
+                        None => {
+                            for &v in c {
+                                t_norm_sq += (v as f64) * (v as f64);
+                            }
                         }
                     }
                 }
-            }
-            // Find the best (delta_neg, picks) for BOTH a positive
-            // dl_used AND a negative dl_used. We'll pick the super-
-            // block sign later.
-            let mut bp = SubBlockChoice {
-                error: t_norm_sq + 1.0,
-                ..Default::default()
-            };
-            let mut bn = SubBlockChoice {
-                error: t_norm_sq + 1.0,
-                ..Default::default()
-            };
-            // #2: One AVX2 sweep per chunk handles BOTH deltas. Halves
-            // the per-chunk grid sweeps vs the previous "one per delta"
-            // pattern. The hoisted loop computes all 4 chunks × 2 deltas
-            // before the candidate-evaluation loop below.
-            let chunks_both = match w_block {
-                // imatrix path: scalar weighted sweep (no AVX2).
-                Some(_) => [
-                    best_iq1s_grid_all3_both_deltas_w(xs_chunk(0), w_chunk(0).unwrap()),
-                    best_iq1s_grid_all3_both_deltas_w(xs_chunk(1), w_chunk(1).unwrap()),
-                    best_iq1s_grid_all3_both_deltas_w(xs_chunk(2), w_chunk(2).unwrap()),
-                    best_iq1s_grid_all3_both_deltas_w(xs_chunk(3), w_chunk(3).unwrap()),
-                ],
-                // uniform path: unchanged (AVX2 fast path preserved).
-                None => [
-                    best_iq1s_grid_all3_both_deltas(xs_chunk(0)),
-                    best_iq1s_grid_all3_both_deltas(xs_chunk(1)),
-                    best_iq1s_grid_all3_both_deltas(xs_chunk(2)),
-                    best_iq1s_grid_all3_both_deltas(xs_chunk(3)),
-                ],
-            };
-            for (delta_idx, delta_neg) in [false, true].iter().enumerate() {
-                let delta_neg = *delta_neg;
-                let max_abs: [ChunkPickIq1; 4] = [
-                    chunks_both[0][delta_idx].0, chunks_both[1][delta_idx].0,
-                    chunks_both[2][delta_idx].0, chunks_both[3][delta_idx].0,
-                ];
-                let max_pos: [ChunkPickIq1; 4] = [
-                    chunks_both[0][delta_idx].1, chunks_both[1][delta_idx].1,
-                    chunks_both[2][delta_idx].1, chunks_both[3][delta_idx].1,
-                ];
-                let max_neg: [ChunkPickIq1; 4] = [
-                    chunks_both[0][delta_idx].2, chunks_both[1][delta_idx].2,
-                    chunks_both[2][delta_idx].2, chunks_both[3][delta_idx].2,
-                ];
-                // #1: Skip dead (pick, dl_sign) combinations.
-                // - max_pos has signed_total ≥ 0 by construction, so
-                //   min(0, signed/norm) = 0 (zero contribution to bn).
-                // - max_neg has signed_total ≤ 0, so max(0, signed/norm) = 0
-                //   (zero contribution to bp).
-                // So we test (max_abs, both dl signs), (max_pos, dl_pos only),
-                // and (max_neg, dl_neg only) — 4 candidates per delta = 8 per
-                // sub-block, vs 12 before.
-                let sums = |picks: &[ChunkPickIq1; 4]| -> (f32, f32) {
-                    let mut s = 0f32; let mut n = 0f32;
-                    for l in 0..4 { s += picks[l].signed_score; n += picks[l].norm_sq; }
-                    (s, n)
+                // Find the best (delta_neg, picks) for BOTH a positive
+                // dl_used AND a negative dl_used. We'll pick the super-
+                // block sign later.
+                let mut bp = SubBlockChoice {
+                    error: t_norm_sq + 1.0,
+                    ..Default::default()
                 };
-                // #4: manually-inlined `consider` (no closure).
-                // #6: skip bn-updates when only_dl_pos, bp-updates when only_dl_neg.
-                let (s_abs, n_abs) = sums(&max_abs);
-                if n_abs > 0.0 {
+                let mut bn = SubBlockChoice {
+                    error: t_norm_sq + 1.0,
+                    ..Default::default()
+                };
+                // #2: One AVX2 sweep per chunk handles BOTH deltas. Halves
+                // the per-chunk grid sweeps vs the previous "one per delta"
+                // pattern. The hoisted loop computes all 4 chunks × 2 deltas
+                // before the candidate-evaluation loop below.
+                let chunks_both = match w_block {
+                    // imatrix path: scalar weighted sweep (no AVX2).
+                    Some(_) => [
+                        best_iq1s_grid_all3_both_deltas_w(xs_chunk(0), w_chunk(0).unwrap()),
+                        best_iq1s_grid_all3_both_deltas_w(xs_chunk(1), w_chunk(1).unwrap()),
+                        best_iq1s_grid_all3_both_deltas_w(xs_chunk(2), w_chunk(2).unwrap()),
+                        best_iq1s_grid_all3_both_deltas_w(xs_chunk(3), w_chunk(3).unwrap()),
+                    ],
+                    // uniform path: unchanged (AVX2 fast path preserved).
+                    None => [
+                        best_iq1s_grid_all3_both_deltas(xs_chunk(0)),
+                        best_iq1s_grid_all3_both_deltas(xs_chunk(1)),
+                        best_iq1s_grid_all3_both_deltas(xs_chunk(2)),
+                        best_iq1s_grid_all3_both_deltas(xs_chunk(3)),
+                    ],
+                };
+                for (delta_idx, delta_neg) in [false, true].iter().enumerate() {
+                    let delta_neg = *delta_neg;
+                    let max_abs: [ChunkPickIq1; 4] = [
+                        chunks_both[0][delta_idx].0,
+                        chunks_both[1][delta_idx].0,
+                        chunks_both[2][delta_idx].0,
+                        chunks_both[3][delta_idx].0,
+                    ];
+                    let max_pos: [ChunkPickIq1; 4] = [
+                        chunks_both[0][delta_idx].1,
+                        chunks_both[1][delta_idx].1,
+                        chunks_both[2][delta_idx].1,
+                        chunks_both[3][delta_idx].1,
+                    ];
+                    let max_neg: [ChunkPickIq1; 4] = [
+                        chunks_both[0][delta_idx].2,
+                        chunks_both[1][delta_idx].2,
+                        chunks_both[2][delta_idx].2,
+                        chunks_both[3][delta_idx].2,
+                    ];
+                    // #1: Skip dead (pick, dl_sign) combinations.
+                    // - max_pos has signed_total ≥ 0 by construction, so
+                    //   min(0, signed/norm) = 0 (zero contribution to bn).
+                    // - max_neg has signed_total ≤ 0, so max(0, signed/norm) = 0
+                    //   (zero contribution to bp).
+                    // So we test (max_abs, both dl signs), (max_pos, dl_pos only),
+                    // and (max_neg, dl_neg only) — 4 candidates per delta = 8 per
+                    // sub-block, vs 12 before.
+                    let sums = |picks: &[ChunkPickIq1; 4]| -> (f32, f32) {
+                        let mut s = 0f32;
+                        let mut n = 0f32;
+                        for l in 0..4 {
+                            s += picks[l].signed_score;
+                            n += picks[l].norm_sq;
+                        }
+                        (s, n)
+                    };
+                    // #4: manually-inlined `consider` (no closure).
+                    // #6: skip bn-updates when only_dl_pos, bp-updates when only_dl_neg.
+                    let (s_abs, n_abs) = sums(&max_abs);
+                    if n_abs > 0.0 {
+                        if !only_dl_neg {
+                            let dl_p = (s_abs / n_abs).max(0.0);
+                            let err = t_norm_sq - 2.0 * (dl_p as f64) * (s_abs as f64)
+                                + (dl_p as f64) * (dl_p as f64) * (n_abs as f64);
+                            if err < bp.error {
+                                bp = SubBlockChoice {
+                                    picks: max_abs,
+                                    delta_neg,
+                                    dl_used: dl_p,
+                                    error: err,
+                                };
+                            }
+                        }
+                        if !only_dl_pos {
+                            let dl_n = (s_abs / n_abs).min(0.0);
+                            let err = t_norm_sq - 2.0 * (dl_n as f64) * (s_abs as f64)
+                                + (dl_n as f64) * (dl_n as f64) * (n_abs as f64);
+                            if err < bn.error {
+                                bn = SubBlockChoice {
+                                    picks: max_abs,
+                                    delta_neg,
+                                    dl_used: dl_n,
+                                    error: err,
+                                };
+                            }
+                        }
+                    }
                     if !only_dl_neg {
-                        let dl_p = (s_abs / n_abs).max(0.0);
-                        let err = t_norm_sq - 2.0 * (dl_p as f64) * (s_abs as f64)
-                            + (dl_p as f64) * (dl_p as f64) * (n_abs as f64);
-                        if err < bp.error {
-                            bp = SubBlockChoice { picks: max_abs, delta_neg, dl_used: dl_p, error: err };
+                        let (s_pos, n_pos) = sums(&max_pos);
+                        if n_pos > 0.0 {
+                            let dl_p = (s_pos / n_pos).max(0.0);
+                            let err = t_norm_sq - 2.0 * (dl_p as f64) * (s_pos as f64)
+                                + (dl_p as f64) * (dl_p as f64) * (n_pos as f64);
+                            if err < bp.error {
+                                bp = SubBlockChoice {
+                                    picks: max_pos,
+                                    delta_neg,
+                                    dl_used: dl_p,
+                                    error: err,
+                                };
+                            }
                         }
                     }
                     if !only_dl_pos {
-                        let dl_n = (s_abs / n_abs).min(0.0);
-                        let err = t_norm_sq - 2.0 * (dl_n as f64) * (s_abs as f64)
-                            + (dl_n as f64) * (dl_n as f64) * (n_abs as f64);
-                        if err < bn.error {
-                            bn = SubBlockChoice { picks: max_abs, delta_neg, dl_used: dl_n, error: err };
+                        let (s_neg, n_neg) = sums(&max_neg);
+                        if n_neg > 0.0 {
+                            let dl_n = (s_neg / n_neg).min(0.0);
+                            let err = t_norm_sq - 2.0 * (dl_n as f64) * (s_neg as f64)
+                                + (dl_n as f64) * (dl_n as f64) * (n_neg as f64);
+                            if err < bn.error {
+                                bn = SubBlockChoice {
+                                    picks: max_neg,
+                                    delta_neg,
+                                    dl_used: dl_n,
+                                    error: err,
+                                };
+                            }
                         }
                     }
                 }
-                if !only_dl_neg {
-                    let (s_pos, n_pos) = sums(&max_pos);
-                    if n_pos > 0.0 {
-                        let dl_p = (s_pos / n_pos).max(0.0);
-                        let err = t_norm_sq - 2.0 * (dl_p as f64) * (s_pos as f64)
-                            + (dl_p as f64) * (dl_p as f64) * (n_pos as f64);
-                        if err < bp.error {
-                            bp = SubBlockChoice { picks: max_pos, delta_neg, dl_used: dl_p, error: err };
-                        }
-                    }
-                }
-                if !only_dl_pos {
-                    let (s_neg, n_neg) = sums(&max_neg);
-                    if n_neg > 0.0 {
-                        let dl_n = (s_neg / n_neg).min(0.0);
-                        let err = t_norm_sq - 2.0 * (dl_n as f64) * (s_neg as f64)
-                            + (dl_n as f64) * (dl_n as f64) * (n_neg as f64);
-                        if err < bn.error {
-                            bn = SubBlockChoice { picks: max_neg, delta_neg, dl_used: dl_n, error: err };
-                        }
-                    }
-                }
+                sub_pos[ib32] = bp;
+                sub_neg[ib32] = bn;
             }
-            sub_pos[ib32] = bp;
-            sub_neg[ib32] = bn;
-        }
 
-        // Choose super-block d_super sign by alternating across super-blocks
-        // when the source is near zero-mean. Reason: IQ1_S's (grid+delta)
-        // range is heavily asymmetric per d-sign — d>0 gives output range
-        // ~[-1.875*|d|, +0.125*|d|], d<0 gives ~[-0.125*|d|, +1.875*|d|].
-        // Picking d>0 for ALL super-blocks of a zero-mean source produces
-        // a uniform -38% mean bias (every super-block's dequant is shifted
-        // negative). The fix: alternate sign across super-blocks of a
-        // tensor that has near-zero source mean per-super-block. We
-        // alternate using `b % 2` so the bias averages out across the
-        // tensor. For super-blocks where one sign is meaningfully better
-        // (>10% lower error), use that sign instead.
-        // #6 short-circuit: when source is uniformly signed, only one
-        // d_super sign is meaningful; skip the comparison.
-        let d_super_negative = if only_dl_pos {
-            false
-        } else if only_dl_neg {
-            true
-        } else {
-            let total_pos: f64 = sub_pos.iter().map(|s| s.error).sum();
-            let total_neg: f64 = sub_neg.iter().map(|s| s.error).sum();
-            if (total_pos - total_neg).abs() < 0.10 * total_pos.max(total_neg) {
-                // Near-tie: alternate by super-block index so the per-tensor
-                // mean bias cancels across alternating super-blocks.
-                b % 2 == 1
+            // Choose super-block d_super sign by alternating across super-blocks
+            // when the source is near zero-mean. Reason: IQ1_S's (grid+delta)
+            // range is heavily asymmetric per d-sign — d>0 gives output range
+            // ~[-1.875*|d|, +0.125*|d|], d<0 gives ~[-0.125*|d|, +1.875*|d|].
+            // Picking d>0 for ALL super-blocks of a zero-mean source produces
+            // a uniform -38% mean bias (every super-block's dequant is shifted
+            // negative). The fix: alternate sign across super-blocks of a
+            // tensor that has near-zero source mean per-super-block. We
+            // alternate using `b % 2` so the bias averages out across the
+            // tensor. For super-blocks where one sign is meaningfully better
+            // (>10% lower error), use that sign instead.
+            // #6 short-circuit: when source is uniformly signed, only one
+            // d_super sign is meaningful; skip the comparison.
+            let d_super_negative = if only_dl_pos {
+                false
+            } else if only_dl_neg {
+                true
             } else {
-                total_neg < total_pos
-            }
-        };
-        for ib32 in 0..N_SUB_BLOCKS {
-            let chosen = if d_super_negative {
-                &sub_neg[ib32]
-            } else {
-                &sub_pos[ib32]
+                let total_pos: f64 = sub_pos.iter().map(|s| s.error).sum();
+                let total_neg: f64 = sub_neg.iter().map(|s| s.error).sum();
+                if (total_pos - total_neg).abs() < 0.10 * total_pos.max(total_neg) {
+                    // Near-tie: alternate by super-block index so the per-tensor
+                    // mean bias cancels across alternating super-blocks.
+                    b % 2 == 1
+                } else {
+                    total_neg < total_pos
+                }
             };
-            sub_picks[ib32] = chosen.picks;
-            sub_delta_neg[ib32] = chosen.delta_neg;
-            sub_dl_abs[ib32] = chosen.dl_used.abs();
-        }
-
-        // Super-block d: dl_max = |d| * 15 (s=7). |d| = dl_max / 15.
-        let dl_max = sub_dl_abs.iter().cloned().fold(0f32, f32::max);
-        let d_super_abs = if dl_max > 0.0 { dl_max / 15.0 } else { 0.0 };
-        let d_super = if d_super_negative { -d_super_abs } else { d_super_abs };
-        let id_super = if d_super_abs != 0.0 { 1.0 / d_super_abs } else { 0.0 };
-
-        // 3-bit scale per sub-block: solve `|dl| = |d| * (2s + 1)` for s.
-        let mut sub_scale_s = [0u16; N_SUB_BLOCKS];
-        for ib32 in 0..N_SUB_BLOCKS {
-            let s = (sub_dl_abs[ib32] * id_super - 1.0) * 0.5;
-            sub_scale_s[ib32] = s.round().clamp(0.0, 7.0) as u16;
-        }
-
-        // Layout (matches dequant_iq1_s):
-        //   off + 0..2     : d (f16)
-        //   off + 2..34    : qs (low 8 bits of grid index, 4 per ib32)
-        //   off + 34..50   : qh as 8 × u16
-        let d_bits = f16::from_f32(d_super).to_bits();
-        dst_block[0] = (d_bits & 0xFF) as u8;
-        dst_block[1] = ((d_bits >> 8) & 0xFF) as u8;
-        let qs_off = 2;
-        let qh_off = 2 + 32;
-        for ib32 in 0..N_SUB_BLOCKS {
-            // qh layout per dequant:
-            //   `dl = d * (2 * ((qh >> 12) & 7) + 1)` — scale in bits 12..14
-            //   `delta_neg = qh & 0x8000` — bit 15
-            //   `idx_high = (qh >> (3*l)) & 7` — bits 0..2 for l=0, 3..5 for l=1, 6..8 for l=2, 9..11 for l=3
-            let mut qh: u16 = 0;
-            qh |= (sub_scale_s[ib32] & 0x7) << 12;
-            if sub_delta_neg[ib32] {
-                qh |= 0x8000;
+            for ib32 in 0..N_SUB_BLOCKS {
+                let chosen = if d_super_negative {
+                    &sub_neg[ib32]
+                } else {
+                    &sub_pos[ib32]
+                };
+                sub_picks[ib32] = chosen.picks;
+                sub_delta_neg[ib32] = chosen.delta_neg;
+                sub_dl_abs[ib32] = chosen.dl_used.abs();
             }
-            for l in 0..4 {
-                let p = sub_picks[ib32][l];
-                dst_block[qs_off + 4 * ib32 + l] = (p.grid_idx & 0xFF) as u8;
-                let hi = (p.grid_idx >> 8) & 0x7;
-                qh |= hi << (3 * l);
+
+            // Super-block d: dl_max = |d| * 15 (s=7). |d| = dl_max / 15.
+            let dl_max = sub_dl_abs.iter().cloned().fold(0f32, f32::max);
+            let d_super_abs = if dl_max > 0.0 { dl_max / 15.0 } else { 0.0 };
+            let d_super = if d_super_negative {
+                -d_super_abs
+            } else {
+                d_super_abs
+            };
+            let id_super = if d_super_abs != 0.0 {
+                1.0 / d_super_abs
+            } else {
+                0.0
+            };
+
+            // 3-bit scale per sub-block: solve `|dl| = |d| * (2s + 1)` for s.
+            let mut sub_scale_s = [0u16; N_SUB_BLOCKS];
+            for ib32 in 0..N_SUB_BLOCKS {
+                let s = (sub_dl_abs[ib32] * id_super - 1.0) * 0.5;
+                sub_scale_s[ib32] = s.round().clamp(0.0, 7.0) as u16;
             }
-            dst_block[qh_off + 2 * ib32] = (qh & 0xFF) as u8;
-            dst_block[qh_off + 2 * ib32 + 1] = ((qh >> 8) & 0xFF) as u8;
-        }
-    });
+
+            // Layout (matches dequant_iq1_s):
+            //   off + 0..2     : d (f16)
+            //   off + 2..34    : qs (low 8 bits of grid index, 4 per ib32)
+            //   off + 34..50   : qh as 8 × u16
+            let d_bits = f16::from_f32(d_super).to_bits();
+            dst_block[0] = (d_bits & 0xFF) as u8;
+            dst_block[1] = ((d_bits >> 8) & 0xFF) as u8;
+            let qs_off = 2;
+            let qh_off = 2 + 32;
+            for ib32 in 0..N_SUB_BLOCKS {
+                // qh layout per dequant:
+                //   `dl = d * (2 * ((qh >> 12) & 7) + 1)` — scale in bits 12..14
+                //   `delta_neg = qh & 0x8000` — bit 15
+                //   `idx_high = (qh >> (3*l)) & 7` — bits 0..2 for l=0, 3..5 for l=1, 6..8 for l=2, 9..11 for l=3
+                let mut qh: u16 = 0;
+                qh |= (sub_scale_s[ib32] & 0x7) << 12;
+                if sub_delta_neg[ib32] {
+                    qh |= 0x8000;
+                }
+                for l in 0..4 {
+                    let p = sub_picks[ib32][l];
+                    dst_block[qs_off + 4 * ib32 + l] = (p.grid_idx & 0xFF) as u8;
+                    let hi = (p.grid_idx >> 8) & 0x7;
+                    qh |= hi << (3 * l);
+                }
+                dst_block[qh_off + 2 * ib32] = (qh & 0xFF) as u8;
+                dst_block[qh_off + 2 * ib32 + 1] = ((qh >> 8) & 0xFF) as u8;
+            }
+        });
 }
 
 /// Batched IQ1_S encoder that dispatches the per-chunk grid search
@@ -3218,10 +3390,22 @@ pub fn encode_iq1_s_with_encoder(
     let delta_neg = -1.0 - IQ1S_DELTA;
 
     let gpu_ok_pos = encoder
-        .iq_8elt_delta_batched_all3(src, delta_pos, &mut picks_abs_p, &mut picks_pos_p, &mut picks_neg_p)
+        .iq_8elt_delta_batched_all3(
+            src,
+            delta_pos,
+            &mut picks_abs_p,
+            &mut picks_pos_p,
+            &mut picks_neg_p,
+        )
         .is_ok();
     let gpu_ok_neg = encoder
-        .iq_8elt_delta_batched_all3(src, delta_neg, &mut picks_abs_n, &mut picks_pos_n, &mut picks_neg_n)
+        .iq_8elt_delta_batched_all3(
+            src,
+            delta_neg,
+            &mut picks_abs_n,
+            &mut picks_pos_n,
+            &mut picks_neg_n,
+        )
         .is_ok();
 
     if !gpu_ok_pos || !gpu_ok_neg {
@@ -3255,9 +3439,14 @@ pub fn encode_iq1_s_with_encoder(
             // #6: detect uniformly-signed super-block; skip the wrong-sign branch.
             let (mut any_pos, mut any_neg) = (false, false);
             for &v in xs_block {
-                if v > 0.0 { any_pos = true; }
-                else if v < 0.0 { any_neg = true; }
-                if any_pos && any_neg { break; }
+                if v > 0.0 {
+                    any_pos = true;
+                } else if v < 0.0 {
+                    any_neg = true;
+                }
+                if any_pos && any_neg {
+                    break;
+                }
             }
             let only_dl_pos = any_pos && !any_neg;
             let only_dl_neg = !any_pos && any_neg;
@@ -3282,7 +3471,9 @@ pub fn encode_iq1_s_with_encoder(
                 for (delta_idx, delta_neg) in [false, true].iter().enumerate() {
                     let delta_neg = *delta_neg;
                     let (picks_abs_arr, picks_pos_arr, picks_neg_arr): (
-                        &Vec<Iq8EltDeltaPick>, &Vec<Iq8EltDeltaPick>, &Vec<Iq8EltDeltaPick>,
+                        &Vec<Iq8EltDeltaPick>,
+                        &Vec<Iq8EltDeltaPick>,
+                        &Vec<Iq8EltDeltaPick>,
                     ) = if delta_idx == 0 {
                         (&picks_abs_p, &picks_pos_p, &picks_neg_p)
                     } else {
@@ -3296,14 +3487,30 @@ pub fn encode_iq1_s_with_encoder(
                         let a = &picks_abs_arr[global];
                         let p = &picks_pos_arr[global];
                         let nv = &picks_neg_arr[global];
-                        max_abs[l] = ChunkPickIq1 { grid_idx: a.grid_idx, signed_score: a.signed_score, norm_sq: a.norm_sq };
-                        max_pos[l] = ChunkPickIq1 { grid_idx: p.grid_idx, signed_score: p.signed_score, norm_sq: p.norm_sq };
-                        max_neg[l] = ChunkPickIq1 { grid_idx: nv.grid_idx, signed_score: nv.signed_score, norm_sq: nv.norm_sq };
+                        max_abs[l] = ChunkPickIq1 {
+                            grid_idx: a.grid_idx,
+                            signed_score: a.signed_score,
+                            norm_sq: a.norm_sq,
+                        };
+                        max_pos[l] = ChunkPickIq1 {
+                            grid_idx: p.grid_idx,
+                            signed_score: p.signed_score,
+                            norm_sq: p.norm_sq,
+                        };
+                        max_neg[l] = ChunkPickIq1 {
+                            grid_idx: nv.grid_idx,
+                            signed_score: nv.signed_score,
+                            norm_sq: nv.norm_sq,
+                        };
                     }
                     // #1+#4+#6: skip dead candidates, manually inline, gate by sign.
                     let sums = |picks: &[ChunkPickIq1; 4]| -> (f32, f32) {
-                        let mut s = 0f32; let mut n = 0f32;
-                        for l in 0..4 { s += picks[l].signed_score; n += picks[l].norm_sq; }
+                        let mut s = 0f32;
+                        let mut n = 0f32;
+                        for l in 0..4 {
+                            s += picks[l].signed_score;
+                            n += picks[l].norm_sq;
+                        }
                         (s, n)
                     };
                     let (s_abs, n_abs) = sums(&max_abs);
@@ -3313,7 +3520,12 @@ pub fn encode_iq1_s_with_encoder(
                             let err = t_norm_sq - 2.0 * (dl_p as f64) * (s_abs as f64)
                                 + (dl_p as f64) * (dl_p as f64) * (n_abs as f64);
                             if err < bp.error {
-                                bp = SubBlockChoice { picks: max_abs, delta_neg, dl_used: dl_p, error: err };
+                                bp = SubBlockChoice {
+                                    picks: max_abs,
+                                    delta_neg,
+                                    dl_used: dl_p,
+                                    error: err,
+                                };
                             }
                         }
                         if !only_dl_pos {
@@ -3321,7 +3533,12 @@ pub fn encode_iq1_s_with_encoder(
                             let err = t_norm_sq - 2.0 * (dl_n as f64) * (s_abs as f64)
                                 + (dl_n as f64) * (dl_n as f64) * (n_abs as f64);
                             if err < bn.error {
-                                bn = SubBlockChoice { picks: max_abs, delta_neg, dl_used: dl_n, error: err };
+                                bn = SubBlockChoice {
+                                    picks: max_abs,
+                                    delta_neg,
+                                    dl_used: dl_n,
+                                    error: err,
+                                };
                             }
                         }
                     }
@@ -3332,7 +3549,12 @@ pub fn encode_iq1_s_with_encoder(
                             let err = t_norm_sq - 2.0 * (dl_p as f64) * (s_pos as f64)
                                 + (dl_p as f64) * (dl_p as f64) * (n_pos as f64);
                             if err < bp.error {
-                                bp = SubBlockChoice { picks: max_pos, delta_neg, dl_used: dl_p, error: err };
+                                bp = SubBlockChoice {
+                                    picks: max_pos,
+                                    delta_neg,
+                                    dl_used: dl_p,
+                                    error: err,
+                                };
                             }
                         }
                     }
@@ -3343,7 +3565,12 @@ pub fn encode_iq1_s_with_encoder(
                             let err = t_norm_sq - 2.0 * (dl_n as f64) * (s_neg as f64)
                                 + (dl_n as f64) * (dl_n as f64) * (n_neg as f64);
                             if err < bn.error {
-                                bn = SubBlockChoice { picks: max_neg, delta_neg, dl_used: dl_n, error: err };
+                                bn = SubBlockChoice {
+                                    picks: max_neg,
+                                    delta_neg,
+                                    dl_used: dl_n,
+                                    error: err,
+                                };
                             }
                         }
                     }
@@ -3380,8 +3607,16 @@ pub fn encode_iq1_s_with_encoder(
 
             let dl_max = sub_dl_abs.iter().cloned().fold(0f32, f32::max);
             let d_super_abs = if dl_max > 0.0 { dl_max / 15.0 } else { 0.0 };
-            let d_super = if d_super_negative { -d_super_abs } else { d_super_abs };
-            let id_super = if d_super_abs != 0.0 { 1.0 / d_super_abs } else { 0.0 };
+            let d_super = if d_super_negative {
+                -d_super_abs
+            } else {
+                d_super_abs
+            };
+            let id_super = if d_super_abs != 0.0 {
+                1.0 / d_super_abs
+            } else {
+                0.0
+            };
 
             let mut sub_scale_s = [0u16; N_SUB_BLOCKS];
             for ib32 in 0..N_SUB_BLOCKS {
@@ -3476,10 +3711,24 @@ pub fn encode_iq1_s_with_encoder_imatrix(
     let delta_neg = -1.0 - IQ1S_DELTA;
 
     let gpu_ok_pos = encoder
-        .iq_8elt_delta_batched_all3_w(src, w, delta_pos, &mut picks_abs_p, &mut picks_pos_p, &mut picks_neg_p)
+        .iq_8elt_delta_batched_all3_w(
+            src,
+            w,
+            delta_pos,
+            &mut picks_abs_p,
+            &mut picks_pos_p,
+            &mut picks_neg_p,
+        )
         .is_ok();
     let gpu_ok_neg = encoder
-        .iq_8elt_delta_batched_all3_w(src, w, delta_neg, &mut picks_abs_n, &mut picks_pos_n, &mut picks_neg_n)
+        .iq_8elt_delta_batched_all3_w(
+            src,
+            w,
+            delta_neg,
+            &mut picks_abs_n,
+            &mut picks_pos_n,
+            &mut picks_neg_n,
+        )
         .is_ok();
 
     if !gpu_ok_pos || !gpu_ok_neg {
@@ -3509,9 +3758,14 @@ pub fn encode_iq1_s_with_encoder_imatrix(
             let w_block = &w[b * QK_K..(b + 1) * QK_K];
             let (mut any_pos, mut any_neg) = (false, false);
             for &v in xs_block {
-                if v > 0.0 { any_pos = true; }
-                else if v < 0.0 { any_neg = true; }
-                if any_pos && any_neg { break; }
+                if v > 0.0 {
+                    any_pos = true;
+                } else if v < 0.0 {
+                    any_neg = true;
+                }
+                if any_pos && any_neg {
+                    break;
+                }
             }
             let only_dl_pos = any_pos && !any_neg;
             let only_dl_neg = !any_pos && any_neg;
@@ -3537,7 +3791,9 @@ pub fn encode_iq1_s_with_encoder_imatrix(
                 for (delta_idx, delta_neg) in [false, true].iter().enumerate() {
                     let delta_neg = *delta_neg;
                     let (picks_abs_arr, picks_pos_arr, picks_neg_arr): (
-                        &Vec<Iq8EltDeltaPick>, &Vec<Iq8EltDeltaPick>, &Vec<Iq8EltDeltaPick>,
+                        &Vec<Iq8EltDeltaPick>,
+                        &Vec<Iq8EltDeltaPick>,
+                        &Vec<Iq8EltDeltaPick>,
                     ) = if delta_idx == 0 {
                         (&picks_abs_p, &picks_pos_p, &picks_neg_p)
                     } else {
@@ -3551,13 +3807,29 @@ pub fn encode_iq1_s_with_encoder_imatrix(
                         let a = &picks_abs_arr[global];
                         let p = &picks_pos_arr[global];
                         let nv = &picks_neg_arr[global];
-                        max_abs[l] = ChunkPickIq1 { grid_idx: a.grid_idx, signed_score: a.signed_score, norm_sq: a.norm_sq };
-                        max_pos[l] = ChunkPickIq1 { grid_idx: p.grid_idx, signed_score: p.signed_score, norm_sq: p.norm_sq };
-                        max_neg[l] = ChunkPickIq1 { grid_idx: nv.grid_idx, signed_score: nv.signed_score, norm_sq: nv.norm_sq };
+                        max_abs[l] = ChunkPickIq1 {
+                            grid_idx: a.grid_idx,
+                            signed_score: a.signed_score,
+                            norm_sq: a.norm_sq,
+                        };
+                        max_pos[l] = ChunkPickIq1 {
+                            grid_idx: p.grid_idx,
+                            signed_score: p.signed_score,
+                            norm_sq: p.norm_sq,
+                        };
+                        max_neg[l] = ChunkPickIq1 {
+                            grid_idx: nv.grid_idx,
+                            signed_score: nv.signed_score,
+                            norm_sq: nv.norm_sq,
+                        };
                     }
                     let sums = |picks: &[ChunkPickIq1; 4]| -> (f32, f32) {
-                        let mut s = 0f32; let mut n = 0f32;
-                        for l in 0..4 { s += picks[l].signed_score; n += picks[l].norm_sq; }
+                        let mut s = 0f32;
+                        let mut n = 0f32;
+                        for l in 0..4 {
+                            s += picks[l].signed_score;
+                            n += picks[l].norm_sq;
+                        }
                         (s, n)
                     };
                     let (s_abs, n_abs) = sums(&max_abs);
@@ -3567,7 +3839,12 @@ pub fn encode_iq1_s_with_encoder_imatrix(
                             let err = t_norm_sq - 2.0 * (dl_p as f64) * (s_abs as f64)
                                 + (dl_p as f64) * (dl_p as f64) * (n_abs as f64);
                             if err < bp.error {
-                                bp = SubBlockChoice { picks: max_abs, delta_neg, dl_used: dl_p, error: err };
+                                bp = SubBlockChoice {
+                                    picks: max_abs,
+                                    delta_neg,
+                                    dl_used: dl_p,
+                                    error: err,
+                                };
                             }
                         }
                         if !only_dl_pos {
@@ -3575,7 +3852,12 @@ pub fn encode_iq1_s_with_encoder_imatrix(
                             let err = t_norm_sq - 2.0 * (dl_n as f64) * (s_abs as f64)
                                 + (dl_n as f64) * (dl_n as f64) * (n_abs as f64);
                             if err < bn.error {
-                                bn = SubBlockChoice { picks: max_abs, delta_neg, dl_used: dl_n, error: err };
+                                bn = SubBlockChoice {
+                                    picks: max_abs,
+                                    delta_neg,
+                                    dl_used: dl_n,
+                                    error: err,
+                                };
                             }
                         }
                     }
@@ -3586,7 +3868,12 @@ pub fn encode_iq1_s_with_encoder_imatrix(
                             let err = t_norm_sq - 2.0 * (dl_p as f64) * (s_pos as f64)
                                 + (dl_p as f64) * (dl_p as f64) * (n_pos as f64);
                             if err < bp.error {
-                                bp = SubBlockChoice { picks: max_pos, delta_neg, dl_used: dl_p, error: err };
+                                bp = SubBlockChoice {
+                                    picks: max_pos,
+                                    delta_neg,
+                                    dl_used: dl_p,
+                                    error: err,
+                                };
                             }
                         }
                     }
@@ -3597,7 +3884,12 @@ pub fn encode_iq1_s_with_encoder_imatrix(
                             let err = t_norm_sq - 2.0 * (dl_n as f64) * (s_neg as f64)
                                 + (dl_n as f64) * (dl_n as f64) * (n_neg as f64);
                             if err < bn.error {
-                                bn = SubBlockChoice { picks: max_neg, delta_neg, dl_used: dl_n, error: err };
+                                bn = SubBlockChoice {
+                                    picks: max_neg,
+                                    delta_neg,
+                                    dl_used: dl_n,
+                                    error: err,
+                                };
                             }
                         }
                     }
@@ -3632,8 +3924,16 @@ pub fn encode_iq1_s_with_encoder_imatrix(
 
             let dl_max = sub_dl_abs.iter().cloned().fold(0f32, f32::max);
             let d_super_abs = if dl_max > 0.0 { dl_max / 15.0 } else { 0.0 };
-            let d_super = if d_super_negative { -d_super_abs } else { d_super_abs };
-            let id_super = if d_super_abs != 0.0 { 1.0 / d_super_abs } else { 0.0 };
+            let d_super = if d_super_negative {
+                -d_super_abs
+            } else {
+                d_super_abs
+            };
+            let id_super = if d_super_abs != 0.0 {
+                1.0 / d_super_abs
+            } else {
+                0.0
+            };
 
             let mut sub_scale_s = [0u16; N_SUB_BLOCKS];
             for ib32 in 0..N_SUB_BLOCKS {
@@ -3687,7 +3987,11 @@ const BLOCK_IQ1_M_BYTES: usize = 56;
 /// the two dl values per ib32 from the two chunk pairs that share
 /// them.
 pub fn encode_iq1_m(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK_K, 0, "encode_iq1_m: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_iq1_m: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -4155,10 +4459,7 @@ mod tests {
                 max_err < 0.5,
                 "iq2_xs n_blocks={n_blocks}: max_err={max_err} rmse={rmse}"
             );
-            assert!(
-                rmse < 0.15,
-                "iq2_xs n_blocks={n_blocks}: rmse={rmse}"
-            );
+            assert!(rmse < 0.15, "iq2_xs n_blocks={n_blocks}: rmse={rmse}");
         }
     }
 
@@ -4211,10 +4512,7 @@ mod tests {
             // family. Quality is comparable to IQ2_XS in practice
             // for the v1 search; the bigger codebook pays off more
             // with the joint-search refinement (v1.x follow-up).
-            assert!(
-                rmse < 0.16,
-                "iq2_s n_blocks={n_blocks}: rmse={rmse}"
-            );
+            assert!(rmse < 0.16, "iq2_s n_blocks={n_blocks}: rmse={rmse}");
         }
     }
 
@@ -4270,10 +4568,7 @@ mod tests {
             // joint search — RMSE is ~0.14 vs ~0.10 for IQ2_XXS's
             // joint 8-elt search. Bound reflects v1 quality;
             // upgrading to joint search is a quality follow-up.
-            assert!(
-                rmse < 0.16,
-                "iq3_xxs n_blocks={n_blocks}: rmse={rmse}"
-            );
+            assert!(rmse < 0.16, "iq3_xxs n_blocks={n_blocks}: rmse={rmse}");
         }
     }
 
@@ -4322,10 +4617,7 @@ mod tests {
                 max_err < 0.5,
                 "iq3_s n_blocks={n_blocks}: max_err={max_err} rmse={rmse}"
             );
-            assert!(
-                rmse < 0.16,
-                "iq3_s n_blocks={n_blocks}: rmse={rmse}"
-            );
+            assert!(rmse < 0.16, "iq3_s n_blocks={n_blocks}: rmse={rmse}");
         }
     }
 
@@ -4368,8 +4660,7 @@ mod tests {
             [0.01_f32, -0.01, 0.01, -0.01],
         ];
         for target in &test_targets {
-            let (s_g, s_m, s_score, s_norm) =
-                best_grid_4_scalar(target, grid_f32, 256, &grid_norm);
+            let (s_g, s_m, s_score, s_norm) = best_grid_4_scalar(target, grid_f32, 256, &grid_norm);
             let (v_g, v_m, v_score, v_norm) =
                 unsafe { best_grid_4_sse41(target, grid_f32, 256, &grid_norm) };
             assert_eq!(s_g, v_g, "grid mismatch for target={target:?}");
@@ -4493,14 +4784,8 @@ mod tests {
         // Looser bound than IQ2 family — 1.5 bpw + the per-sub-block
         // delta-scalar reconstruction is fundamentally less
         // precise. Pin a sanity ceiling.
-        assert!(
-            max_err < 1.0,
-            "iq1_s: max_err={max_err} rmse={rmse}"
-        );
-        assert!(
-            rmse < 0.4,
-            "iq1_s: rmse={rmse}"
-        );
+        assert!(max_err < 1.0, "iq1_s: max_err={max_err} rmse={rmse}");
+        assert!(rmse < 0.4, "iq1_s: rmse={rmse}");
     }
 
     #[test]
@@ -4585,7 +4870,9 @@ mod tests {
         dequant::dequant_iq1_s(&enc_u, &mut dec_u);
         dequant::dequant_iq1_s(&enc_w, &mut dec_w);
         let werr = |dec: &[f32]| -> f64 {
-            (0..n).map(|i| (w[i] as f64) * ((dec[i] - src[i]) as f64).powi(2)).sum()
+            (0..n)
+                .map(|i| (w[i] as f64) * ((dec[i] - src[i]) as f64).powi(2))
+                .sum()
         };
         let eu = werr(&dec_u);
         let ew = werr(&dec_w);
@@ -4616,14 +4903,8 @@ mod tests {
         // IQ1_M (1.75 bpw) gets per-8-weight delta granularity vs.
         // IQ1_S's per-32-weight. Tighter than IQ1_S in practice
         // but bound stays loose given the analytical search.
-        assert!(
-            max_err < 1.0,
-            "iq1_m: max_err={max_err} rmse={rmse}"
-        );
-        assert!(
-            rmse < 0.35,
-            "iq1_m: rmse={rmse}"
-        );
+        assert!(max_err < 1.0, "iq1_m: max_err={max_err} rmse={rmse}");
+        assert!(rmse < 0.35, "iq1_m: rmse={rmse}");
     }
 
     #[test]
@@ -4637,7 +4918,9 @@ mod tests {
         let mut seed = 42u64;
         let src: Vec<f32> = (0..n_blocks * QK_K)
             .map(|_| {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((seed >> 32) as i32 as f32 / i32::MAX as f32) * 0.05
             })
             .collect();
@@ -4647,11 +4930,17 @@ mod tests {
         let dt = t.elapsed();
         println!(
             "encode_iq1_s({} blocks = {} elements): {:.2} ms = {:.0} ns/element = {:.0} blocks/sec",
-            n_blocks, src.len(), dt.as_secs_f64() * 1000.0,
+            n_blocks,
+            src.len(),
+            dt.as_secs_f64() * 1000.0,
             dt.as_nanos() as f64 / src.len() as f64,
             n_blocks as f64 / dt.as_secs_f64()
         );
-        assert!(dt.as_secs() < 30, "encode took {:.1} s — should be sub-second", dt.as_secs_f64());
+        assert!(
+            dt.as_secs() < 30,
+            "encode took {:.1} s — should be sub-second",
+            dt.as_secs_f64()
+        );
     }
 
     #[test]
@@ -4660,10 +4949,14 @@ mod tests {
         fn stats(name: &str, v: &[f32]) -> (f64, f64) {
             let sum: f64 = v.iter().map(|x| *x as f64).sum();
             let mean = sum / v.len() as f64;
-            let var: f64 = v.iter().map(|x| (*x as f64 - mean).powi(2)).sum::<f64>() / v.len() as f64;
+            let var: f64 =
+                v.iter().map(|x| (*x as f64 - mean).powi(2)).sum::<f64>() / v.len() as f64;
             let mn = v.iter().fold(f32::INFINITY, |a, &b| a.min(b));
             let mx = v.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-            println!("  {name:24} mean={mean:+.5e} rms={:+.5e} min={mn:+.5e} max={mx:+.5e}", var.sqrt());
+            println!(
+                "  {name:24} mean={mean:+.5e} rms={:+.5e} min={mn:+.5e} max={mx:+.5e}",
+                var.sqrt()
+            );
             (mean, var.sqrt())
         }
         fn test_case(name: &str, src: Vec<f32>) {
@@ -4675,15 +4968,22 @@ mod tests {
             println!("== {name} ==");
             let (src_mean, _) = stats("src", &src);
             let (deq_mean, _) = stats("dequant", &deq);
-            let diff: Vec<f32> = src.iter().zip(deq.iter()).map(|(a,b)| a - b).collect();
+            let diff: Vec<f32> = src.iter().zip(deq.iter()).map(|(a, b)| a - b).collect();
             stats("diff (src - dq)", &diff);
-            println!("  bias = {:+.3e} ({:+.1}% of src rms)", deq_mean - src_mean,
-                100.0 * (deq_mean - src_mean) / (src.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / src.len() as f64).sqrt());
+            println!(
+                "  bias = {:+.3e} ({:+.1}% of src rms)",
+                deq_mean - src_mean,
+                100.0 * (deq_mean - src_mean)
+                    / (src.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / src.len() as f64)
+                        .sqrt()
+            );
         }
         // Pseudo-random gaussian via simple LCG
         let mut seed = 42u64;
         let mut next = || -> f32 {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 32) as i32 as f32 / i32::MAX as f32) * 0.1
         };
         // 8 super-blocks (2048 elements) — closer to real tensor size

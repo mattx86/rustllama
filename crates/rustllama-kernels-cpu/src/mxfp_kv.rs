@@ -99,7 +99,14 @@ pub fn quantize_block_mxfp4(elems: &[f32], out: &mut [u8]) {
     assert_eq!(out.len(), MXFP4_BLOCK_BYTES);
     let absmax = elems.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
     let sb = block_scale_byte(absmax, E2M1_MAX_EXP);
-    let inv = { let s = e8m0_to_f32(sb); if s != 0.0 { 1.0 / s } else { 0.0 } };
+    let inv = {
+        let s = e8m0_to_f32(sb);
+        if s != 0.0 {
+            1.0 / s
+        } else {
+            0.0
+        }
+    };
     for j in 0..16 {
         let lo = quant_e2m1_nibble(elems[j * 2] * inv);
         let hi = quant_e2m1_nibble(elems[j * 2 + 1] * inv);
@@ -114,7 +121,14 @@ pub fn quantize_block_mxfp6(elems: &[f32], out: &mut [u8]) {
     assert_eq!(out.len(), MXFP6_BLOCK_BYTES);
     let absmax = elems.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
     let sb = block_scale_byte(absmax, E3M2_MAX_EXP);
-    let inv = { let s = e8m0_to_f32(sb); if s != 0.0 { 1.0 / s } else { 0.0 } };
+    let inv = {
+        let s = e8m0_to_f32(sb);
+        if s != 0.0 {
+            1.0 / s
+        } else {
+            0.0
+        }
+    };
     for b in out[..MXFP6_CODE_BYTES].iter_mut() {
         *b = 0;
     }
@@ -141,7 +155,14 @@ pub fn quantize_block_mxfp8(elems: &[f32], out: &mut [u8]) {
     assert_eq!(out.len(), MXFP8_BLOCK_BYTES);
     let absmax = elems.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
     let sb = block_scale_byte(absmax, E4M3_MAX_EXP);
-    let inv = { let s = e8m0_to_f32(sb); if s != 0.0 { 1.0 / s } else { 0.0 } };
+    let inv = {
+        let s = e8m0_to_f32(sb);
+        if s != 0.0 {
+            1.0 / s
+        } else {
+            0.0
+        }
+    };
     for j in 0..32 {
         out[j] = quant_e4m3_byte(elems[j] * inv);
     }
@@ -234,7 +255,11 @@ fn flash_decode_generic(
     assert_eq!(k_packed.len(), n_kv_heads * max_ctx * bytes_per_row);
     assert_eq!(v_packed.len(), n_kv_heads * max_ctx * bytes_per_row);
     assert!(kv_len <= max_ctx);
-    assert_eq!(n_heads % n_kv_heads, 0, "GQA requires n_heads divisible by n_kv_heads");
+    assert_eq!(
+        n_heads % n_kv_heads,
+        0,
+        "GQA requires n_heads divisible by n_kv_heads"
+    );
     if kv_len == 0 {
         out.iter_mut().for_each(|v| *v = 0.0);
         return;
@@ -242,7 +267,11 @@ fn flash_decode_generic(
     let n_gqa = n_heads / n_kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
     // Decode window lower bound (0 ⇒ full attention).
-    let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+    let start = if window > 0 {
+        kv_len.saturating_sub(window)
+    } else {
+        0
+    };
     DECODE_SCRATCH.with(|cell| {
         let (k_all, v_all) = &mut *cell.borrow_mut();
         let need = n_kv_heads * kv_len * head_dim;
@@ -310,7 +339,11 @@ fn flash_prefill_generic(
     assert_eq!(k_packed.len(), n_kv_heads * max_ctx * bytes_per_row);
     assert_eq!(v_packed.len(), n_kv_heads * max_ctx * bytes_per_row);
     assert!(kv_len_base + n_new <= max_ctx);
-    assert_eq!(n_heads % n_kv_heads, 0, "GQA requires n_heads divisible by n_kv_heads");
+    assert_eq!(
+        n_heads % n_kv_heads,
+        0,
+        "GQA requires n_heads divisible by n_kv_heads"
+    );
     if n_new == 0 {
         return;
     }
@@ -347,7 +380,11 @@ fn flash_prefill_generic(
                 let h = idx % n_heads;
                 let kv_h = h / n_gqa;
                 let kv_len_i = kv_len_base + i + 1;
-                let start_i = if window > 0 { kv_len_i.saturating_sub(window) } else { 0 };
+                let start_i = if window > 0 {
+                    kv_len_i.saturating_sub(window)
+                } else {
+                    0
+                };
                 let q_h = &q[idx * head_dim..(idx + 1) * head_dim];
                 let base = kv_h * total_positions * head_dim;
                 crate::turboquant::online_softmax_attn_f32_scratch_capped_windowed(
@@ -382,8 +419,19 @@ macro_rules! mxfp_kv_flash {
         ) {
             let bytes_per_row = (head_dim / 32) * $bpb;
             flash_decode_generic(
-                q, k_packed, v_packed, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                bytes_per_row, $deq, 0, 0.0,
+                q,
+                k_packed,
+                v_packed,
+                out,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx,
+                kv_len,
+                bytes_per_row,
+                $deq,
+                0,
+                0.0,
             );
         }
         /// Sliding-window + Gemma2 soft-cap FlashAttention decode for this MXFP
@@ -408,8 +456,19 @@ macro_rules! mxfp_kv_flash {
         ) {
             let bytes_per_row = (head_dim / 32) * $bpb;
             flash_decode_generic(
-                q, k_packed, v_packed, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-                bytes_per_row, $deq, window, softcap,
+                q,
+                k_packed,
+                v_packed,
+                out,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx,
+                kv_len,
+                bytes_per_row,
+                $deq,
+                window,
+                softcap,
             );
         }
         /// FlashAttention prefill for this MXFP KV format.
@@ -428,8 +487,20 @@ macro_rules! mxfp_kv_flash {
         ) {
             let bytes_per_row = (head_dim / 32) * $bpb;
             flash_prefill_generic(
-                q, k_packed, v_packed, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base,
-                n_new, bytes_per_row, $deq, 0, 0.0,
+                q,
+                k_packed,
+                v_packed,
+                out,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx,
+                kv_len_base,
+                n_new,
+                bytes_per_row,
+                $deq,
+                0,
+                0.0,
             );
         }
         /// Sliding-window + Gemma2 soft-cap FlashAttention prefill for this MXFP
@@ -455,8 +526,20 @@ macro_rules! mxfp_kv_flash {
         ) {
             let bytes_per_row = (head_dim / 32) * $bpb;
             flash_prefill_generic(
-                q, k_packed, v_packed, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base,
-                n_new, bytes_per_row, $deq, window, softcap,
+                q,
+                k_packed,
+                v_packed,
+                out,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx,
+                kv_len_base,
+                n_new,
+                bytes_per_row,
+                $deq,
+                window,
+                softcap,
             );
         }
     };
@@ -555,12 +638,24 @@ mod tests {
         let mut kd = vec![0f32; kv_len * head_dim];
         let mut vd = vec![0f32; kv_len * head_dim];
         for t in 0..kv_len {
-            dequantize_row_mxfp4(&kp[t * bpr..t * bpr + bpr], &mut kd[t * head_dim..(t + 1) * head_dim]);
-            dequantize_row_mxfp4(&vp[t * bpr..t * bpr + bpr], &mut vd[t * head_dim..(t + 1) * head_dim]);
+            dequantize_row_mxfp4(
+                &kp[t * bpr..t * bpr + bpr],
+                &mut kd[t * head_dim..(t + 1) * head_dim],
+            );
+            dequantize_row_mxfp4(
+                &vp[t * bpr..t * bpr + bpr],
+                &mut vd[t * head_dim..(t + 1) * head_dim],
+            );
         }
         let want = naive_attn(&q, &kd, &vd, head_dim, kv_len);
-        let err = out.iter().zip(&want).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
-        assert!(err < 1e-4, "mxfp4 flash decode vs naive-on-dequant err={err}");
+        let err = out
+            .iter()
+            .zip(&want)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            err < 1e-4,
+            "mxfp4 flash decode vs naive-on-dequant err={err}"
+        );
     }
 
     #[test]
@@ -572,7 +667,10 @@ mod tests {
         let mut dec = vec![0f32; 32];
         dequantize_row_mxfp8(&blk, &mut dec);
         let absmax = elems.iter().fold(0f32, |m, &x| m.max(x.abs()));
-        let err = elems.iter().zip(&dec).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        let err = elems
+            .iter()
+            .zip(&dec)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
         assert!(err < absmax * 0.05, "mxfp8 kv block err={err}");
     }
 
@@ -584,23 +682,53 @@ mod tests {
         let kv_len_base = 0usize;
         let total = kv_len_base + n_new;
         let bpr = (head_dim / 32) * MXFP6_BLOCK_BYTES;
-        let kvf: Vec<f32> = (0..total * head_dim).map(|i| ((i % 17) as f32) * 0.05 - 0.4).collect();
+        let kvf: Vec<f32> = (0..total * head_dim)
+            .map(|i| ((i % 17) as f32) * 0.05 - 0.4)
+            .collect();
         let mut kp = vec![0u8; max_ctx * bpr];
         let mut vp = vec![0u8; max_ctx * bpr];
         for t in 0..total {
-            quantize_block_mxfp6(&kvf[t * head_dim..t * head_dim + 32], &mut kp[t * bpr..t * bpr + MXFP6_BLOCK_BYTES]);
-            quantize_block_mxfp6(&kvf[t * head_dim..t * head_dim + 32], &mut vp[t * bpr..t * bpr + MXFP6_BLOCK_BYTES]);
+            quantize_block_mxfp6(
+                &kvf[t * head_dim..t * head_dim + 32],
+                &mut kp[t * bpr..t * bpr + MXFP6_BLOCK_BYTES],
+            );
+            quantize_block_mxfp6(
+                &kvf[t * head_dim..t * head_dim + 32],
+                &mut vp[t * bpr..t * bpr + MXFP6_BLOCK_BYTES],
+            );
         }
-        let q: Vec<f32> = (0..n_new * head_dim).map(|i| (i as f32).cos() * 0.15).collect();
+        let q: Vec<f32> = (0..n_new * head_dim)
+            .map(|i| (i as f32).cos() * 0.15)
+            .collect();
         let mut out = vec![0f32; n_new * head_dim];
-        gqa_attention_flash_prefill_mxfp6(&q, &kp, &vp, &mut out, 1, 1, head_dim, max_ctx, kv_len_base, n_new);
+        gqa_attention_flash_prefill_mxfp6(
+            &q,
+            &kp,
+            &vp,
+            &mut out,
+            1,
+            1,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+        );
         // Reference per query i attends to [0, i+1).
         let mut kd = vec![0f32; total * head_dim];
         for t in 0..total {
-            dequantize_row_mxfp6(&kp[t * bpr..t * bpr + bpr], &mut kd[t * head_dim..(t + 1) * head_dim]);
+            dequantize_row_mxfp6(
+                &kp[t * bpr..t * bpr + bpr],
+                &mut kd[t * head_dim..(t + 1) * head_dim],
+            );
         }
         for i in 0..n_new {
-            let want = naive_attn(&q[i * head_dim..(i + 1) * head_dim], &kd, &kd, head_dim, i + 1);
+            let want = naive_attn(
+                &q[i * head_dim..(i + 1) * head_dim],
+                &kd,
+                &kd,
+                head_dim,
+                i + 1,
+            );
             let err = out[i * head_dim..(i + 1) * head_dim]
                 .iter()
                 .zip(&want)
@@ -652,10 +780,18 @@ mod tests {
     }
 
     /// Quantize deterministic single-kv-head MXFP4 K/V for `positions` slots.
-    fn build_mxfp4_cache(head_dim: usize, max_ctx: usize, positions: usize) -> (Vec<u8>, Vec<u8>, Vec<f32>, Vec<f32>) {
+    fn build_mxfp4_cache(
+        head_dim: usize,
+        max_ctx: usize,
+        positions: usize,
+    ) -> (Vec<u8>, Vec<u8>, Vec<f32>, Vec<f32>) {
         let bpr = (head_dim / 32) * MXFP4_BLOCK_BYTES;
-        let kf: Vec<f32> = (0..positions * head_dim).map(|i| ((i * 7) % 23) as f32 * 0.03 - 0.3).collect();
-        let vf: Vec<f32> = (0..positions * head_dim).map(|i| ((i * 5) % 19) as f32 * 0.04 - 0.35).collect();
+        let kf: Vec<f32> = (0..positions * head_dim)
+            .map(|i| ((i * 7) % 23) as f32 * 0.03 - 0.3)
+            .collect();
+        let vf: Vec<f32> = (0..positions * head_dim)
+            .map(|i| ((i * 5) % 19) as f32 * 0.04 - 0.35)
+            .collect();
         let mut kp = vec![0u8; max_ctx * bpr];
         let mut vp = vec![0u8; max_ctx * bpr];
         for t in 0..positions {
@@ -670,8 +806,14 @@ mod tests {
         let mut kd = vec![0f32; positions * head_dim];
         let mut vd = vec![0f32; positions * head_dim];
         for t in 0..positions {
-            dequantize_row_mxfp4(&kp[t * bpr..t * bpr + bpr], &mut kd[t * head_dim..(t + 1) * head_dim]);
-            dequantize_row_mxfp4(&vp[t * bpr..t * bpr + bpr], &mut vd[t * head_dim..(t + 1) * head_dim]);
+            dequantize_row_mxfp4(
+                &kp[t * bpr..t * bpr + bpr],
+                &mut kd[t * head_dim..(t + 1) * head_dim],
+            );
+            dequantize_row_mxfp4(
+                &vp[t * bpr..t * bpr + bpr],
+                &mut vd[t * head_dim..(t + 1) * head_dim],
+            );
         }
         (kp, vp, kd, vd)
     }
@@ -689,23 +831,56 @@ mod tests {
         let mut base = vec![0f32; head_dim];
         let mut cw = vec![0f32; head_dim];
         gqa_attention_flash_decode_mxfp4(&q, &kp, &vp, &mut base, 1, 1, head_dim, max_ctx, kv_len);
-        gqa_attention_flash_decode_mxfp4_capped_windowed(&q, &kp, &vp, &mut cw, 1, 1, head_dim, max_ctx, kv_len, 0, 0.0);
+        gqa_attention_flash_decode_mxfp4_capped_windowed(
+            &q, &kp, &vp, &mut cw, 1, 1, head_dim, max_ctx, kv_len, 0, 0.0,
+        );
         assert_eq!(base, cw, "mxfp4 decode passthrough not bit-identical");
 
         // Prefill passthrough.
         let kv_len_base = 2;
         let n_new = 5;
         let (kp2, vp2, _, _) = build_mxfp4_cache(head_dim, max_ctx, kv_len_base + n_new);
-        let qp: Vec<f32> = (0..n_new * head_dim).map(|i| (i as f32).cos() * 0.15).collect();
+        let qp: Vec<f32> = (0..n_new * head_dim)
+            .map(|i| (i as f32).cos() * 0.15)
+            .collect();
         let mut base_pf = vec![0f32; n_new * head_dim];
         let mut cw_pf = vec![0f32; n_new * head_dim];
-        gqa_attention_flash_prefill_mxfp4(&qp, &kp2, &vp2, &mut base_pf, 1, 1, head_dim, max_ctx, kv_len_base, n_new);
-        gqa_attention_flash_prefill_mxfp4_capped_windowed(&qp, &kp2, &vp2, &mut cw_pf, 1, 1, head_dim, max_ctx, kv_len_base, n_new, 0, 0.0);
-        assert_eq!(base_pf, cw_pf, "mxfp4 prefill passthrough not bit-identical");
+        gqa_attention_flash_prefill_mxfp4(
+            &qp,
+            &kp2,
+            &vp2,
+            &mut base_pf,
+            1,
+            1,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+        );
+        gqa_attention_flash_prefill_mxfp4_capped_windowed(
+            &qp,
+            &kp2,
+            &vp2,
+            &mut cw_pf,
+            1,
+            1,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            0,
+            0.0,
+        );
+        assert_eq!(
+            base_pf, cw_pf,
+            "mxfp4 prefill passthrough not bit-identical"
+        );
 
         // mxfp8 decode passthrough (second macro arm).
         let bpr8 = (head_dim / 32) * MXFP8_BLOCK_BYTES;
-        let kvf: Vec<f32> = (0..kv_len * head_dim).map(|i| ((i * 3) % 29) as f32 * 0.02 - 0.3).collect();
+        let kvf: Vec<f32> = (0..kv_len * head_dim)
+            .map(|i| ((i * 3) % 29) as f32 * 0.02 - 0.3)
+            .collect();
         let mut kp8 = vec![0u8; max_ctx * bpr8];
         let mut vp8 = vec![0u8; max_ctx * bpr8];
         for t in 0..kv_len {
@@ -718,8 +893,12 @@ mod tests {
         }
         let mut base8 = vec![0f32; head_dim];
         let mut cw8 = vec![0f32; head_dim];
-        gqa_attention_flash_decode_mxfp8(&q, &kp8, &vp8, &mut base8, 1, 1, head_dim, max_ctx, kv_len);
-        gqa_attention_flash_decode_mxfp8_capped_windowed(&q, &kp8, &vp8, &mut cw8, 1, 1, head_dim, max_ctx, kv_len, 0, 0.0);
+        gqa_attention_flash_decode_mxfp8(
+            &q, &kp8, &vp8, &mut base8, 1, 1, head_dim, max_ctx, kv_len,
+        );
+        gqa_attention_flash_decode_mxfp8_capped_windowed(
+            &q, &kp8, &vp8, &mut cw8, 1, 1, head_dim, max_ctx, kv_len, 0, 0.0,
+        );
         assert_eq!(base8, cw8, "mxfp8 decode passthrough not bit-identical");
     }
 
@@ -733,16 +912,36 @@ mod tests {
 
         // (b) windowed: window=2, kv_len=5 ⇒ start = 3.
         let mut got = vec![0f32; head_dim];
-        gqa_attention_flash_decode_mxfp4_capped_windowed(&q, &kp, &vp, &mut got, 1, 1, head_dim, max_ctx, kv_len, 2, 0.0);
+        gqa_attention_flash_decode_mxfp4_capped_windowed(
+            &q, &kp, &vp, &mut got, 1, 1, head_dim, max_ctx, kv_len, 2, 0.0,
+        );
         let want = naive_attn_cw(&q, &kd, &vd, head_dim, kv_len, 3, 0.0);
-        let err = got.iter().zip(&want).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        let err = got
+            .iter()
+            .zip(&want)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
         assert!(err < 1e-4, "mxfp4 windowed err={err}");
 
         // (c) soft-cap: softcap=50.0, full window (start=0).
         let mut got_sc = vec![0f32; head_dim];
-        gqa_attention_flash_decode_mxfp4_capped_windowed(&q, &kp, &vp, &mut got_sc, 1, 1, head_dim, max_ctx, kv_len, 0, 50.0);
+        gqa_attention_flash_decode_mxfp4_capped_windowed(
+            &q,
+            &kp,
+            &vp,
+            &mut got_sc,
+            1,
+            1,
+            head_dim,
+            max_ctx,
+            kv_len,
+            0,
+            50.0,
+        );
         let want_sc = naive_attn_cw(&q, &kd, &vd, head_dim, kv_len, 0, 50.0);
-        let err_sc = got_sc.iter().zip(&want_sc).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        let err_sc = got_sc
+            .iter()
+            .zip(&want_sc)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
         assert!(err_sc < 1e-4, "mxfp4 softcap err={err_sc}");
     }
 }

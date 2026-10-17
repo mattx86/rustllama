@@ -37,9 +37,7 @@ fn main() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Sysman load failed: {e:?}");
-            eprintln!(
-                "  expected on non-Intel hosts or when oneAPI's L0 loader isn't installed"
-            );
+            eprintln!("  expected on non-Intel hosts or when oneAPI's L0 loader isn't installed");
             return;
         }
     };
@@ -87,7 +85,10 @@ fn main() {
             return;
         }
     };
-    eprintln!("t=0:  energy = {:>14} µJ, timestamp = {:>12} µs", e0.energy_uj, e0.timestamp_us);
+    eprintln!(
+        "t=0:  energy = {:>14} µJ, timestamp = {:>12} µs",
+        e0.energy_uj, e0.timestamp_us
+    );
 
     // Burn ~1 second. CPU spinning to make sure SOMETHING draws
     // power; the GPU may or may not be active depending on driver
@@ -114,7 +115,10 @@ fn main() {
             return;
         }
     };
-    eprintln!("t=1s: energy = {:>14} µJ, timestamp = {:>12} µs", e1.energy_uj, e1.timestamp_us);
+    eprintln!(
+        "t=1s: energy = {:>14} µJ, timestamp = {:>12} µs",
+        e1.energy_uj, e1.timestamp_us
+    );
 
     let de_uj = e1.energy_uj.saturating_sub(e0.energy_uj) as f64;
     let dt_us = e1.timestamp_us.saturating_sub(e0.timestamp_us) as f64;

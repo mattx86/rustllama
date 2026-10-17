@@ -24,7 +24,10 @@ fn main() {
     let inc = manifest.join("include");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     println!("cargo:rerun-if-changed={}", src.display());
-    println!("cargo:rerun-if-changed={}", inc.join("rsl_cuda.h").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        inc.join("rsl_cuda.h").display()
+    );
     // Blackwell SM12x tensor-core kernels (included by rsl_cuda.cu).
     println!(
         "cargo:rerun-if-changed={}",
@@ -80,8 +83,7 @@ fn main() {
     // gencode flags for the requested SM architectures.
     // Ampere → Hopper by default (Turing sm_75 also fine on CUDA 12/13).
     // Add Blackwell (100;120) via RUSTLLAMA_CUDA_ARCHS on CUDA 12.8+/13.
-    let archs = std::env::var("RUSTLLAMA_CUDA_ARCHS")
-        .unwrap_or_else(|_| "80;86;89;90".to_string());
+    let archs = std::env::var("RUSTLLAMA_CUDA_ARCHS").unwrap_or_else(|_| "80;86;89;90".to_string());
     let arch_list: Vec<&str> = archs.split(';').filter(|s| !s.is_empty()).collect();
     let mut cmd = Command::new(&nvcc);
     cmd.arg("-c").arg(&src);
@@ -105,7 +107,10 @@ fn main() {
     // mixed list (e.g. "90;121a") the non-Blackwell passes take the fallback.
     let blackwell_tc = arch_list.iter().any(|a| {
         let suffixed = a.ends_with('a') || a.ends_with('f');
-        suffixed && arch_major_of(a).map(|m| (120..=129).contains(&m)).unwrap_or(false)
+        suffixed
+            && arch_major_of(a)
+                .map(|m| (120..=129).contains(&m))
+                .unwrap_or(false)
     });
     if blackwell_tc {
         cmd.arg("-DRSL_BLACKWELL_TC=1");
@@ -145,7 +150,11 @@ fn main() {
     if !windows {
         cmd.arg("--compiler-options").arg("-fPIC");
     }
-    let obj = out.join(if windows { "rsl_cuda.obj" } else { "rsl_cuda.o" });
+    let obj = out.join(if windows {
+        "rsl_cuda.obj"
+    } else {
+        "rsl_cuda.o"
+    });
     cmd.arg("-o").arg(&obj);
 
     let status = cmd.status().unwrap_or_else(|e| {
@@ -158,7 +167,11 @@ fn main() {
 
     // Archive the object into a static lib cargo can link.
     let ar = if windows { "lib" } else { "ar" };
-    let lib = out.join(if windows { "rsl_cuda.lib" } else { "librsl_cuda.a" });
+    let lib = out.join(if windows {
+        "rsl_cuda.lib"
+    } else {
+        "librsl_cuda.a"
+    });
     let ar_status = if windows {
         Command::new(ar)
             .arg(format!("/OUT:{}", lib.display()))
@@ -168,7 +181,11 @@ fn main() {
         Command::new(ar).arg("crs").arg(&lib).arg(&obj).status()
     };
     let ok = ar_status.map(|s| s.success()).unwrap_or(false);
-    assert!(ok, "failed to archive rsl_cuda object into {}", lib.display());
+    assert!(
+        ok,
+        "failed to archive rsl_cuda object into {}",
+        lib.display()
+    );
 
     println!("cargo:rustc-link-search=native={}", out.display());
     // whole-archive so nvcc's fatbin registration ctors survive the link.
@@ -308,7 +325,11 @@ fn build_cuda_stub(manifest: &std::path::Path, out: &std::path::Path) {
     // arch, matching what rustc emits (Rust says `aarch64`, clang says
     // `arm64`; `x86_64` is spelled the same).
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let clang_arch = if target_arch == "aarch64" { "arm64" } else { "x86_64" };
+    let clang_arch = if target_arch == "aarch64" {
+        "arm64"
+    } else {
+        "x86_64"
+    };
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     let ar = std::env::var("AR").unwrap_or_else(|_| "ar".to_string());
 
@@ -450,11 +471,13 @@ fn cuda_lib_dir() -> Option<PathBuf> {
 ///   * `KMASK_IQ2XS_CUDA[8]`   (u8,  from `dequant::KMASK_IQ2XS`)
 fn generate_iq_grids_cuda_inl(out_path: &std::path::Path) {
     let iq1_src = std::path::Path::new("../rustllama-gguf/src/iq1_grid.rs");
-    let iq1_text = std::fs::read_to_string(iq1_src)
-        .unwrap_or_else(|e| panic!("rustllama-kernels-cuda build.rs: failed to read {iq1_src:?}: {e}"));
+    let iq1_text = std::fs::read_to_string(iq1_src).unwrap_or_else(|e| {
+        panic!("rustllama-kernels-cuda build.rs: failed to read {iq1_src:?}: {e}")
+    });
     let dequant_src = std::path::Path::new("../rustllama-gguf/src/dequant.rs");
-    let dequant_text = std::fs::read_to_string(dequant_src)
-        .unwrap_or_else(|e| panic!("rustllama-kernels-cuda build.rs: failed to read {dequant_src:?}: {e}"));
+    let dequant_text = std::fs::read_to_string(dequant_src).unwrap_or_else(|e| {
+        panic!("rustllama-kernels-cuda build.rs: failed to read {dequant_src:?}: {e}")
+    });
 
     // IQ1S_GRID: `0x<hex>u64` literals, 2048 entries.
     let iq1s_grid = extract_suffixed_hex_u64s(&iq1_text);
@@ -507,7 +530,9 @@ fn extract_suffixed_hex_u64s(src: &str) -> Vec<u64> {
         let mut rest = line;
         while let Some(start) = rest.find("0x") {
             rest = &rest[start + 2..];
-            let end = rest.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(rest.len());
+            let end = rest
+                .find(|c: char| !c.is_ascii_hexdigit())
+                .unwrap_or(rest.len());
             if end == 0 {
                 continue;
             }
@@ -531,14 +556,21 @@ fn parse_const_array_hex_u64(src: &str, name: &str, expected: usize) -> Vec<u64>
     let mut rest = body.as_str();
     while let Some(start) = rest.find("0x") {
         rest = &rest[start + 2..];
-        let end = rest.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(rest.len());
         if end == 0 {
             continue;
         }
         out.push(u64::from_str_radix(&rest[..end], 16).expect("hex u64"));
         rest = &rest[end..];
     }
-    assert_eq!(out.len(), expected, "{name}: expected {expected} entries, found {}", out.len());
+    assert_eq!(
+        out.len(),
+        expected,
+        "{name}: expected {expected} entries, found {}",
+        out.len()
+    );
     out
 }
 
@@ -550,14 +582,21 @@ fn parse_const_array_hex_u32(src: &str, name: &str, expected: usize) -> Vec<u32>
     let mut rest = body.as_str();
     while let Some(start) = rest.find("0x") {
         rest = &rest[start + 2..];
-        let end = rest.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(rest.len());
         if end == 0 {
             continue;
         }
         out.push(u32::from_str_radix(&rest[..end], 16).expect("hex u32"));
         rest = &rest[end..];
     }
-    assert_eq!(out.len(), expected, "{name}: expected {expected} entries, found {}", out.len());
+    assert_eq!(
+        out.len(),
+        expected,
+        "{name}: expected {expected} entries, found {}",
+        out.len()
+    );
     out
 }
 
@@ -577,7 +616,12 @@ fn parse_const_array_dec_u8(src: &str, name: &str, expected: usize) -> Vec<u8> {
         .filter(|t| !t.is_empty())
         .map(|t| t.parse::<u32>().expect("dec u8") as u8)
         .collect();
-    assert_eq!(out.len(), expected, "{name}: expected {expected} entries, found {}", out.len());
+    assert_eq!(
+        out.len(),
+        expected,
+        "{name}: expected {expected} entries, found {}",
+        out.len()
+    );
     out
 }
 
@@ -606,7 +650,9 @@ fn extract_const_array_body(src: &str, name: &str) -> Option<String> {
 
 fn emit_u64_array(out: &mut String, name: &str, expected: usize, values: &[u64]) {
     assert_eq!(values.len(), expected);
-    out.push_str(&format!("__device__ const std::uint64_t {name}[{expected}] = {{\n"));
+    out.push_str(&format!(
+        "__device__ const std::uint64_t {name}[{expected}] = {{\n"
+    ));
     for (i, v) in values.iter().enumerate() {
         if i % 4 == 0 {
             out.push_str("    ");
@@ -626,7 +672,9 @@ fn emit_u64_array(out: &mut String, name: &str, expected: usize, values: &[u64])
 
 fn emit_u32_array(out: &mut String, name: &str, expected: usize, values: &[u32]) {
     assert_eq!(values.len(), expected);
-    out.push_str(&format!("__device__ const std::uint32_t {name}[{expected}] = {{\n"));
+    out.push_str(&format!(
+        "__device__ const std::uint32_t {name}[{expected}] = {{\n"
+    ));
     for (i, v) in values.iter().enumerate() {
         if i % 8 == 0 {
             out.push_str("    ");
@@ -646,7 +694,9 @@ fn emit_u32_array(out: &mut String, name: &str, expected: usize, values: &[u32])
 
 fn emit_u8_array(out: &mut String, name: &str, expected: usize, values: &[u8]) {
     assert_eq!(values.len(), expected);
-    out.push_str(&format!("__device__ const std::uint8_t {name}[{expected}] = {{\n"));
+    out.push_str(&format!(
+        "__device__ const std::uint8_t {name}[{expected}] = {{\n"
+    ));
     for (i, v) in values.iter().enumerate() {
         if i % 16 == 0 {
             out.push_str("    ");

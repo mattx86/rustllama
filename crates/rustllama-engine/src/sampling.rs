@@ -103,9 +103,7 @@ unsafe fn argmax_avx512f(logits: &[f32]) -> u32 {
 
     let mut max_v = _mm512_set1_ps(f32::NEG_INFINITY);
     let mut idx_v = _mm512_setzero_si512();
-    let mut counter = _mm512_setr_epi32(
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-    );
+    let mut counter = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
     let incr = _mm512_set1_epi32(16);
     let ptr = logits.as_ptr();
 
@@ -223,7 +221,8 @@ impl Sampler {
         // `sampler:gpu` (banked by `tune --validate-kernels` only where the GPU
         // chain matched the CPU sampler AND was faster), replacing the removed
         // `RUSTLLAMA_SAMPLER_GPU` env gate. Fail-closed: no verdict ⇒ CPU sampler.
-        let gpu_enabled = rustllama_models::accel::verdict_enabled(rustllama_tuner::VERDICT_SAMPLER_GPU);
+        let gpu_enabled =
+            rustllama_models::accel::verdict_enabled(rustllama_tuner::VERDICT_SAMPLER_GPU);
         Self {
             params,
             rng,
@@ -539,7 +538,11 @@ impl Sampler {
             // distribution; read the chosen probability directly.
             // `1e-30` guards `log2(0)` when grammar fallback or
             // numerical underflow puts the chosen probability at 0.
-            let p = logits.get(chosen as usize).copied().unwrap_or(0.0).max(1e-30);
+            let p = logits
+                .get(chosen as usize)
+                .copied()
+                .unwrap_or(0.0)
+                .max(1e-30);
             let observed_surprise = -p.log2();
             self.mirostat_mu -=
                 self.params.mirostat_eta * (observed_surprise - self.params.mirostat_tau);
@@ -974,7 +977,9 @@ fn apply_xtc(probs: &mut [f32], probability: f32, threshold: f32, rng: &mut Rng)
     // lowest-probability one among them and drops the rest; tokens below
     // threshold are untouched. Need ≥ 2 above threshold for XTC to do
     // anything (otherwise there is no "top choice" to exclude).
-    let mut above: Vec<usize> = (0..probs.len()).filter(|&i| probs[i] >= threshold).collect();
+    let mut above: Vec<usize> = (0..probs.len())
+        .filter(|&i| probs[i] >= threshold)
+        .collect();
     if above.len() < 2 {
         return;
     }
@@ -1210,10 +1215,14 @@ fn apply_typical_p(probs: &mut [f32], p: f32) {
     let mut front_size = 64usize.min(n);
     let cutoff = loop {
         idx.select_nth_unstable_by(front_size - 1, |&a, &b| {
-            typ[a].partial_cmp(&typ[b]).unwrap_or(std::cmp::Ordering::Equal)
+            typ[a]
+                .partial_cmp(&typ[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         idx[..front_size].sort_unstable_by(|&a, &b| {
-            typ[a].partial_cmp(&typ[b]).unwrap_or(std::cmp::Ordering::Equal)
+            typ[a]
+                .partial_cmp(&typ[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         let mut cum = 0.0f32;
         let mut found: Option<usize> = None;
@@ -1653,7 +1662,10 @@ mod tests {
         // top-k normalizes; renormalized [0.444, 0.333, 0.222, 0].
         apply_top_p(&mut probs, 0.6);
         let nonzero = probs.iter().filter(|p| **p > 0.0).count();
-        assert_eq!(nonzero, 2, "top_k=3 then top_p=0.6 should leave 2: {probs:?}");
+        assert_eq!(
+            nonzero, 2,
+            "top_k=3 then top_p=0.6 should leave 2: {probs:?}"
+        );
         let sum: f32 = probs.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5);
     }
@@ -2064,9 +2076,10 @@ mod tests {
                 .filter(|(i, _)| got[*i] > 0.0)
                 .map(|(_, &v)| v)
                 .collect();
-            if let Some(&min_kept) = kept.iter().min_by(|a, b| {
-                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-            }) {
+            if let Some(&min_kept) = kept
+                .iter()
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            {
                 for (i, &v) in probs.iter().enumerate() {
                     if got[i] == 0.0 {
                         assert!(
@@ -2268,10 +2281,7 @@ mod tests {
                 // happen for p=0.9 on a softmax-from-random-logits
                 // distribution, but if it does, probs are unchanged —
                 // matches the documented contract.
-                assert_eq!(
-                    gpu, probs,
-                    "fallback signal must leave probs untouched"
-                );
+                assert_eq!(gpu, probs, "fallback signal must leave probs untouched");
             }
             Err(_) => {} // Mock / unavailable; skip.
         }
@@ -2582,7 +2592,11 @@ mod tests {
         let mut s = Sampler::new(params);
         s.gpu_enabled = false;
         let mut logits = vec![1.0f32, 5.0, 3.0, 2.0];
-        assert_eq!(s.sample(&mut logits, &[]), 2, "ban on argmax elects token 2");
+        assert_eq!(
+            s.sample(&mut logits, &[]),
+            2,
+            "ban on argmax elects token 2"
+        );
     }
 
     #[test]
@@ -2639,9 +2653,7 @@ mod tests {
             std::collections::HashMap::new();
         for e in 0..n - 1 {
             let mut lmatch = 0usize;
-            while e >= lmatch
-                && lmatch < rep_limit
-                && recent[e - lmatch] == recent[n - 1 - lmatch]
+            while e >= lmatch && lmatch < rep_limit && recent[e - lmatch] == recent[n - 1 - lmatch]
             {
                 lmatch += 1;
             }
@@ -2785,7 +2797,10 @@ mod tests {
         let mut rng = Rng::from_seed(12345);
         apply_xtc(&mut probs, 0.01, 0.1, &mut rng);
         // Overwhelmingly likely the draw exceeded 0.01 → no change.
-        assert_eq!(probs, before, "coin-flip above probability leaves probs untouched");
+        assert_eq!(
+            probs, before,
+            "coin-flip above probability leaves probs untouched"
+        );
     }
 
     // ----- dynatemp --------------------------------------------------------
@@ -2850,7 +2865,10 @@ mod tests {
             a.push(s1.sample(&mut base.clone(), &recent));
             b.push(s2.sample(&mut base.clone(), &recent));
         }
-        assert_eq!(a, b, "all P13 samplers enabled must stay seed-deterministic");
+        assert_eq!(
+            a, b,
+            "all P13 samplers enabled must stay seed-deterministic"
+        );
     }
 
     /// F1 scaffold: GPU fused temp+softmax kernel. Same dispatch

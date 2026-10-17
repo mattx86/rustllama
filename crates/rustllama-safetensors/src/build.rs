@@ -91,8 +91,10 @@ pub fn build_llama_model_from_safetensors(
     // Build a name → ConvertedTensor map so we can extract each
     // tensor by name and surface a clear MissingTensor error when
     // a required slot isn't present.
-    let mut by_name: HashMap<String, ConvertedTensor> =
-        tensors.into_iter().map(|t| (t.gguf_name.clone(), t)).collect();
+    let mut by_name: HashMap<String, ConvertedTensor> = tensors
+        .into_iter()
+        .map(|t| (t.gguf_name.clone(), t))
+        .collect();
 
     // MoE checkpoints (Qwen2-MoE / Qwen3-MoE / OLMoE / Mixtral) take a
     // separate assembly path: the engine's MLX transcoder stacks each
@@ -766,11 +768,11 @@ mod tests {
         let out_packs = out_features / 8;
         let n_groups = in_features / group_size;
         // Constant weight pattern: int4 lane 1 → after (1 - 0) * 0.5 = 0.5
-        let qw: Vec<i32> =
-            (0..in_features * out_packs).map(|_| pack8([1; 8])).collect();
+        let qw: Vec<i32> = (0..in_features * out_packs)
+            .map(|_| pack8([1; 8]))
+            .collect();
         let sc: Vec<f16> = vec![f16::from_f32(0.5); n_groups * out_features];
-        let qz: Vec<i32> =
-            (0..n_groups * out_packs).map(|_| pack8([0; 8])).collect();
+        let qz: Vec<i32> = (0..n_groups * out_packs).map(|_| pack8([0; 8])).collect();
         (i32_bytes(&qw), f16_bytes(&sc), i32_bytes(&qz))
     }
 
@@ -784,23 +786,17 @@ mod tests {
         let n_heads = 2usize;
         let head_dim = 8usize;
         let group_size = 16; // 1 group
-        // Linear shapes the loader expects (out, in):
-        //   q/k/v/o: 16x16  gate/up: 32x16  down: 16x32
-        // AWQ stores them transposed (in, out/8) on disk; the converter
-        // transposes back to (out, in) which is what we just stated.
-        let (qw_qproj, sc_qproj, qz_qproj) =
-            awq_linear_bytes(d_model, d_model, group_size);
-        let (qw_kproj, sc_kproj, qz_kproj) =
-            awq_linear_bytes(d_model, d_model, group_size);
-        let (qw_vproj, sc_vproj, qz_vproj) =
-            awq_linear_bytes(d_model, d_model, group_size);
-        let (qw_oproj, sc_oproj, qz_oproj) =
-            awq_linear_bytes(d_model, d_model, group_size);
-        let (qw_gate, sc_gate, qz_gate) =
-            awq_linear_bytes(d_model, d_ff, group_size);
+                             // Linear shapes the loader expects (out, in):
+                             //   q/k/v/o: 16x16  gate/up: 32x16  down: 16x32
+                             // AWQ stores them transposed (in, out/8) on disk; the converter
+                             // transposes back to (out, in) which is what we just stated.
+        let (qw_qproj, sc_qproj, qz_qproj) = awq_linear_bytes(d_model, d_model, group_size);
+        let (qw_kproj, sc_kproj, qz_kproj) = awq_linear_bytes(d_model, d_model, group_size);
+        let (qw_vproj, sc_vproj, qz_vproj) = awq_linear_bytes(d_model, d_model, group_size);
+        let (qw_oproj, sc_oproj, qz_oproj) = awq_linear_bytes(d_model, d_model, group_size);
+        let (qw_gate, sc_gate, qz_gate) = awq_linear_bytes(d_model, d_ff, group_size);
         let (qw_up, sc_up, qz_up) = awq_linear_bytes(d_model, d_ff, group_size);
-        let (qw_down, sc_down, qz_down) =
-            awq_linear_bytes(d_ff, d_model, group_size);
+        let (qw_down, sc_down, qz_down) = awq_linear_bytes(d_ff, d_model, group_size);
         let token_embd_data: Vec<f16> = vec![f16::from_f32(0.1); vocab * d_model];
         let token_embd_bytes = f16_bytes(&token_embd_data);
         let attn_norm: Vec<f16> = vec![f16::from_f32(1.0); d_model];
@@ -824,8 +820,7 @@ mod tests {
         ] {
             map.insert(
                 format!("model.layers.0.self_attn.{proj}.qweight"),
-                TensorView::new(StDtype::I32, vec![d_model, out_packs_model], qw)
-                    .unwrap(),
+                TensorView::new(StDtype::I32, vec![d_model, out_packs_model], qw).unwrap(),
             );
             map.insert(
                 format!("model.layers.0.self_attn.{proj}.scales"),
@@ -843,8 +838,7 @@ mod tests {
         ] {
             map.insert(
                 format!("model.layers.0.mlp.{proj}.qweight"),
-                TensorView::new(StDtype::I32, vec![d_model, out_packs_ff], qw)
-                    .unwrap(),
+                TensorView::new(StDtype::I32, vec![d_model, out_packs_ff], qw).unwrap(),
             );
             map.insert(
                 format!("model.layers.0.mlp.{proj}.scales"),
@@ -858,13 +852,11 @@ mod tests {
         // down (in=d_ff, out=d_model)
         map.insert(
             "model.layers.0.mlp.down_proj.qweight".into(),
-            TensorView::new(StDtype::I32, vec![d_ff, out_packs_model], &qw_down)
-                .unwrap(),
+            TensorView::new(StDtype::I32, vec![d_ff, out_packs_model], &qw_down).unwrap(),
         );
         map.insert(
             "model.layers.0.mlp.down_proj.scales".into(),
-            TensorView::new(StDtype::F16, vec![d_ff / group_size, d_model], &sc_down)
-                .unwrap(),
+            TensorView::new(StDtype::F16, vec![d_ff / group_size, d_model], &sc_down).unwrap(),
         );
         map.insert(
             "model.layers.0.mlp.down_proj.qzeros".into(),
@@ -878,13 +870,11 @@ mod tests {
         // Norms + embeddings.
         map.insert(
             "model.embed_tokens.weight".into(),
-            TensorView::new(StDtype::F16, vec![vocab, d_model], &token_embd_bytes)
-                .unwrap(),
+            TensorView::new(StDtype::F16, vec![vocab, d_model], &token_embd_bytes).unwrap(),
         );
         map.insert(
             "model.layers.0.input_layernorm.weight".into(),
-            TensorView::new(StDtype::F16, vec![d_model], &attn_norm_bytes)
-                .unwrap(),
+            TensorView::new(StDtype::F16, vec![d_model], &attn_norm_bytes).unwrap(),
         );
         map.insert(
             "model.layers.0.post_attention_layernorm.weight".into(),
@@ -896,8 +886,7 @@ mod tests {
         );
         map.insert(
             "lm_head.weight".into(),
-            TensorView::new(StDtype::F16, vec![vocab, d_model], &lm_head_bytes)
-                .unwrap(),
+            TensorView::new(StDtype::F16, vec![vocab, d_model], &lm_head_bytes).unwrap(),
         );
         let blob = safetensors::serialize(&map, &None).expect("serialize");
 
@@ -925,8 +914,7 @@ mod tests {
         let (cfg_json, blob) = build_minimal_awq_safetensors();
         let cfg = parse_hf_config(&cfg_json).unwrap();
         let tensors = convert_safetensors_to_gguf_tensors(&blob).unwrap();
-        let model =
-            build_llama_model_from_safetensors(&cfg, tensors).expect("build");
+        let model = build_llama_model_from_safetensors(&cfg, tensors).expect("build");
 
         // Architecture sanity checks.
         assert_eq!(model.cfg.n_layers, 1);
@@ -1052,7 +1040,9 @@ mod tests {
         let head_dim = 8usize; // d_q = d_kv = 16 = d_model
 
         let f16_bytes = |v: &[f32]| -> Vec<u8> {
-            v.iter().flat_map(|x| f16::from_f32(*x).to_le_bytes()).collect()
+            v.iter()
+                .flat_map(|x| f16::from_f32(*x).to_le_bytes())
+                .collect()
         };
         let mut ts: Vec<ConvertedTensor> = Vec::new();
         let push_f16 = |ts: &mut Vec<ConvertedTensor>, name: &str, shape: Vec<u64>, n: usize| {
@@ -1064,22 +1054,67 @@ mod tests {
                 bytes: f16_bytes(&vals),
             });
         };
-        push_f16(&mut ts, "token_embd.weight", vec![vocab as u64, d_model as u64], vocab * d_model);
+        push_f16(
+            &mut ts,
+            "token_embd.weight",
+            vec![vocab as u64, d_model as u64],
+            vocab * d_model,
+        );
         push_f16(&mut ts, "output_norm.weight", vec![d_model as u64], d_model);
-        push_f16(&mut ts, "output.weight", vec![vocab as u64, d_model as u64], vocab * d_model);
+        push_f16(
+            &mut ts,
+            "output.weight",
+            vec![vocab as u64, d_model as u64],
+            vocab * d_model,
+        );
         for i in 0..1usize {
             let p = format!("blk.{i}");
-            push_f16(&mut ts, &format!("{p}.attn_norm.weight"), vec![d_model as u64], d_model);
-            push_f16(&mut ts, &format!("{p}.ffn_norm.weight"), vec![d_model as u64], d_model);
+            push_f16(
+                &mut ts,
+                &format!("{p}.attn_norm.weight"),
+                vec![d_model as u64],
+                d_model,
+            );
+            push_f16(
+                &mut ts,
+                &format!("{p}.ffn_norm.weight"),
+                vec![d_model as u64],
+                d_model,
+            );
             for proj in ["attn_q", "attn_k", "attn_v", "attn_output"] {
-                push_f16(&mut ts, &format!("{p}.{proj}.weight"), vec![d_model as u64, d_model as u64], d_model * d_model);
+                push_f16(
+                    &mut ts,
+                    &format!("{p}.{proj}.weight"),
+                    vec![d_model as u64, d_model as u64],
+                    d_model * d_model,
+                );
             }
             // Router [n_experts, d_model].
-            push_f16(&mut ts, &format!("{p}.ffn_gate_inp.weight"), vec![n_experts as u64, d_model as u64], n_experts * d_model);
+            push_f16(
+                &mut ts,
+                &format!("{p}.ffn_gate_inp.weight"),
+                vec![n_experts as u64, d_model as u64],
+                n_experts * d_model,
+            );
             // Stacked experts: gate/up [n, d_ff, d_model], down [n, d_model, d_ff].
-            push_f16(&mut ts, &format!("{p}.ffn_gate_exps.weight"), vec![n_experts as u64, d_ff as u64, d_model as u64], n_experts * d_ff * d_model);
-            push_f16(&mut ts, &format!("{p}.ffn_up_exps.weight"), vec![n_experts as u64, d_ff as u64, d_model as u64], n_experts * d_ff * d_model);
-            push_f16(&mut ts, &format!("{p}.ffn_down_exps.weight"), vec![n_experts as u64, d_model as u64, d_ff as u64], n_experts * d_model * d_ff);
+            push_f16(
+                &mut ts,
+                &format!("{p}.ffn_gate_exps.weight"),
+                vec![n_experts as u64, d_ff as u64, d_model as u64],
+                n_experts * d_ff * d_model,
+            );
+            push_f16(
+                &mut ts,
+                &format!("{p}.ffn_up_exps.weight"),
+                vec![n_experts as u64, d_ff as u64, d_model as u64],
+                n_experts * d_ff * d_model,
+            );
+            push_f16(
+                &mut ts,
+                &format!("{p}.ffn_down_exps.weight"),
+                vec![n_experts as u64, d_model as u64, d_ff as u64],
+                n_experts * d_model * d_ff,
+            );
         }
 
         let cfg_json = format!(
@@ -1092,19 +1127,39 @@ mod tests {
         );
         let cfg = parse_hf_config(&cfg_json).unwrap();
         assert_eq!(cfg.d_ff, d_ff, "MoE d_ff must be the per-expert width");
-        assert!(matches!(cfg.moe, Some(MoeConfig { n_experts: 2, n_experts_used: 2, .. })));
+        assert!(matches!(
+            cfg.moe,
+            Some(MoeConfig {
+                n_experts: 2,
+                n_experts_used: 2,
+                ..
+            })
+        ));
 
         let model = build_llama_model_from_safetensors(&cfg, ts).expect("MoE build");
         assert!(model.weights.blocks.is_empty());
-        let mbs = model.weights.moe_blocks.as_ref().expect("moe_blocks populated");
+        let mbs = model
+            .weights
+            .moe_blocks
+            .as_ref()
+            .expect("moe_blocks populated");
         assert_eq!(mbs.len(), 1);
         let mb = &mbs[0];
         assert_eq!(mb.gate_per_expert.len(), n_experts);
         assert_eq!(mb.down_per_expert.len(), n_experts);
         // Per-expert views carry the sliced [d_out, d_in] shape.
-        assert_eq!(mb.gate_per_expert[0].shape, vec![d_ff as u64, d_model as u64]);
-        assert_eq!(mb.down_per_expert[1].shape, vec![d_model as u64, d_ff as u64]);
-        assert!(mb.w_gate_shared.is_none(), "no shared expert in this fixture");
+        assert_eq!(
+            mb.gate_per_expert[0].shape,
+            vec![d_ff as u64, d_model as u64]
+        );
+        assert_eq!(
+            mb.down_per_expert[1].shape,
+            vec![d_model as u64, d_ff as u64]
+        );
+        assert!(
+            mb.w_gate_shared.is_none(),
+            "no shared expert in this fixture"
+        );
         assert!(mb.shared_router.is_none());
     }
 
@@ -1116,8 +1171,7 @@ mod tests {
         cfg.tie_word_embeddings = true;
         let mut tensors = convert_safetensors_to_gguf_tensors(&blob).unwrap();
         tensors.retain(|t| t.gguf_name != "output.weight");
-        let model =
-            build_llama_model_from_safetensors(&cfg, tensors).expect("build");
+        let model = build_llama_model_from_safetensors(&cfg, tensors).expect("build");
         assert!(model.weights.output.is_none());
         assert_eq!(model.cfg.tie_word_embeddings, true);
     }
@@ -1140,11 +1194,7 @@ mod tests {
 
     #[test]
     fn f16_norm_round_trip_to_vec_f32() {
-        let h = vec![
-            f16::from_f32(0.5),
-            f16::from_f32(1.0),
-            f16::from_f32(-2.5),
-        ];
+        let h = vec![f16::from_f32(0.5), f16::from_f32(1.0), f16::from_f32(-2.5)];
         let bytes = f16_bytes(&h);
         let ct = ConvertedTensor {
             gguf_name: "scratch".into(),

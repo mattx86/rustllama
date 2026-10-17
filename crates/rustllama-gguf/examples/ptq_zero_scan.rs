@@ -14,8 +14,8 @@
 //! within the 128-block zero across most blocks → structured column
 //! sparsity). Usage: ptq_zero_scan <gguf-path>
 
-use rustllama_gguf::Gguf;
 use rustllama_gguf::GgmlType;
+use rustllama_gguf::Gguf;
 
 const BLOCK_BYTES: usize = 28;
 const QS_BYTES: usize = 24;
@@ -52,7 +52,9 @@ fn decode_block(blk: &[u8], out: &mut [i8; QK]) {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: ptq_zero_scan <gguf>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: ptq_zero_scan <gguf>");
     let g = Gguf::open(&path).expect("open gguf");
 
     let mut g_neg = 0u64;

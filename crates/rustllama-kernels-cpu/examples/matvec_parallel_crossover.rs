@@ -70,9 +70,7 @@ fn main() {
         let speedup = serial_us / parallel_us.max(1.0);
         // Marker: where parallel first overtakes serial.
         let marker = if speedup >= 1.05 { "  ←" } else { "" };
-        println!(
-            "{m:>5} | {serial_us:>11.1} | {parallel_us:>13.1} | {speedup:>5.2}x{marker}"
-        );
+        println!("{m:>5} | {serial_us:>11.1} | {parallel_us:>13.1} | {speedup:>5.2}x{marker}");
 
         // Quick correctness check: both paths must produce the same
         // output (within fp tolerance — both use the same SIMD inner
@@ -90,7 +88,5 @@ fn main() {
 
     println!();
     println!("crossover = first row marked ←");
-    println!(
-        "wire the gate at that M into the dispatcher: below → serial, above → parallel"
-    );
+    println!("wire the gate at that M into the dispatcher: below → serial, above → parallel");
 }

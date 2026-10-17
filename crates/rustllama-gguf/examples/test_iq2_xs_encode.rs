@@ -11,7 +11,9 @@
 use rustllama_gguf::{dequant, encode_iq_vec, Gguf};
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: test_iq2_xs_encode PATH");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: test_iq2_xs_encode PATH");
     let g = Gguf::open(&path).expect("open gguf");
     let info = g
         .tensor("token_embd.weight")
@@ -72,10 +74,12 @@ fn main() {
         encode_iq_vec::encode_iq2_xs(&row_f32, &mut iq2xs_dst);
 
         let dst_nonzero = iq2xs_dst.iter().filter(|b| **b != 0).count();
-        let dst_first8: Vec<String> = iq2xs_dst.iter().take(8).map(|b| format!("{b:02x}")).collect();
-        println!(
-            "  token {token_id}:"
-        );
+        let dst_first8: Vec<String> = iq2xs_dst
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        println!("  token {token_id}:");
         println!(
             "    Q2_K → f32: rms={f32_rms:.4e} nonzero={f32_nonzero}/{d_model} first4={f32_first4:?}"
         );

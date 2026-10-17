@@ -96,11 +96,16 @@ unsafe fn enumerate_inner() -> Result<Vec<NpuInfo>, String> {
     }
 
     let mut out = Vec::new();
-    let mut devs = OvAvailableDevices { devices: ptr::null_mut(), size: 0 };
+    let mut devs = OvAvailableDevices {
+        devices: ptr::null_mut(),
+        size: 0,
+    };
     let st = ov_get_devices(core, &mut devs);
     if st != OV_OK {
         ov_core_free(core);
-        return Err(format!("ov_core_get_available_devices failed (status {st})"));
+        return Err(format!(
+            "ov_core_get_available_devices failed (status {st})"
+        ));
     }
     if !devs.devices.is_null() {
         let names = std::slice::from_raw_parts(devs.devices, devs.size);

@@ -47,7 +47,10 @@ fn fused_decode_serving_model_shape() {
         "concurrency() reports 1 when multi is None — fused-decode \
          shares one engine across the gate's permits"
     );
-    assert!(serving.multi.is_none(), "fused_decode must not build a fork pool");
+    assert!(
+        serving.multi.is_none(),
+        "fused_decode must not build a fork pool"
+    );
     assert!(
         serving.cpu_engine.is_none(),
         "PagedBatchEngine is not a CpuEngine — cpu_engine stays None"
@@ -89,10 +92,9 @@ async fn fused_decode_serving_model_admits_two_concurrent_handles() {
     // waiting on the gate.
     let s1 = Arc::clone(&serving);
     let s2 = Arc::clone(&serving);
-    let (h1, h2) = tokio::join!(
-        async move { s1.try_acquire().await },
-        async move { s2.try_acquire().await },
-    );
+    let (h1, h2) = tokio::join!(async move { s1.try_acquire().await }, async move {
+        s2.try_acquire().await
+    },);
     let h1 = h1.expect("first acquire");
     let h2 = h2.expect("second acquire");
     // Both handles point at the SAME underlying engine Arc — that's

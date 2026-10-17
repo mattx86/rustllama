@@ -254,9 +254,7 @@ pub fn measure_placement_candidates(
                 warmup_ms,
                 median_tps: None,
                 max_tps: None,
-                error: Some(
-                    last_err.unwrap_or_else(|| "every measurement run failed".into()),
-                ),
+                error: Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
                 watts,
                 tokens_per_joule,
             });
@@ -333,7 +331,9 @@ impl SysmanProbe {
     /// expose a power domain on this device.
     fn sample_energy(&self) -> Option<(u64, u64)> {
         let reading = self.sysman.probe(self.device);
-        reading.energy_counter.map(|c| (c.energy_uj, c.timestamp_us))
+        reading
+            .energy_counter
+            .map(|c| (c.energy_uj, c.timestamp_us))
     }
 }
 
@@ -501,7 +501,11 @@ pub fn measure_per_device_perf(
     // multi-CUDA-GPU host records additional per-device entries (write-blind).
     measure_extra_cuda_gpus(&mut scores, &mut tiers);
 
-    Ok(PerDevicePerfReport { load_ms, scores, tiers })
+    Ok(PerDevicePerfReport {
+        load_ms,
+        scores,
+        tiers,
+    })
 }
 
 /// The slug + label of the GPU the engine actually dispatches to (CUDA
@@ -711,8 +715,9 @@ impl KvDtypeMeasurementReport {
             if let Some(toks) = c.decode_tokens.as_deref() {
                 let take = match reference {
                     None => true,
-                    Some((dt, _)) => c.kv_dtype.approx_bits_per_element()
-                        > dt.approx_bits_per_element(),
+                    Some((dt, _)) => {
+                        c.kv_dtype.approx_bits_per_element() > dt.approx_bits_per_element()
+                    }
                 };
                 if take {
                     reference = Some((c.kv_dtype, toks));
@@ -724,7 +729,9 @@ impl KvDtypeMeasurementReport {
         // Rank eligible candidates: (bits_per_element ASC, tps DESC).
         let mut eligible: Vec<(KvDtype, f32, f64)> = Vec::new();
         for c in &self.candidates {
-            let Some(toks) = c.decode_tokens.as_deref() else { continue };
+            let Some(toks) = c.decode_tokens.as_deref() else {
+                continue;
+            };
             let Some(med) = c.median_tps else { continue };
             // Agreement vs reference (across the shorter of the two).
             let agree = top1_agreement(toks, ref_toks);
@@ -856,7 +863,12 @@ fn top1_agreement(a: &[u32], b: &[u32]) -> f32 {
     if n == 0 {
         return 0.0;
     }
-    let matches: usize = a.iter().zip(b.iter()).take(n).filter(|(x, y)| x == y).count();
+    let matches: usize = a
+        .iter()
+        .zip(b.iter())
+        .take(n)
+        .filter(|(x, y)| x == y)
+        .count();
     matches as f32 / n as f32
 }
 
@@ -954,9 +966,7 @@ pub fn measure_kv_dtype_candidates(
                 warmup_ms,
                 median_tps: None,
                 max_tps: None,
-                error: Some(
-                    last_err.unwrap_or_else(|| "every measurement run failed".into()),
-                ),
+                error: Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
                 decode_tokens: decode_tokens_seq,
             });
             continue;
@@ -1079,9 +1089,7 @@ pub fn measure_flash_attention_candidates(
                 warmup_ms,
                 median_tps: None,
                 max_tps: None,
-                error: Some(
-                    last_err.unwrap_or_else(|| "every measurement run failed".into()),
-                ),
+                error: Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
             });
             continue;
         }
@@ -1155,8 +1163,13 @@ pub fn measure_kv_layout_candidates(
 
     for layout in candidates {
         let load_start = std::time::Instant::now();
-        let load_result =
-            CpuEngine::load_with_options_and_layout(model_path, ctx_size, true, cfg.kv_dtype, layout);
+        let load_result = CpuEngine::load_with_options_and_layout(
+            model_path,
+            ctx_size,
+            true,
+            cfg.kv_dtype,
+            layout,
+        );
         total_load_ms += load_start.elapsed().as_secs_f64() * 1000.0;
         let mut cpu = match load_result {
             Ok(c) => c,
@@ -1216,9 +1229,7 @@ pub fn measure_kv_layout_candidates(
                 warmup_ms,
                 median_tps: None,
                 max_tps: None,
-                error: Some(
-                    last_err.unwrap_or_else(|| "every measurement run failed".into()),
-                ),
+                error: Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
             });
             continue;
         }
@@ -1372,7 +1383,11 @@ pub fn measure_batching_candidates(
                 cpu.set_n_gpu_layers(cfg.n_gpu_layers);
                 let vocab = cpu.vocab_size() as i32;
                 let warmup_t = std::time::Instant::now();
-                let _ = cpu.generate_token_ids(&make_prompt(vocab, -1), decode_tokens, &sampling(decode_tokens));
+                let _ = cpu.generate_token_ids(
+                    &make_prompt(vocab, -1),
+                    decode_tokens,
+                    &sampling(decode_tokens),
+                );
                 let warmup_ms = warmup_t.elapsed().as_secs_f64() * 1000.0;
                 let mut runs: Vec<f64> = Vec::new();
                 let mut last_err: Option<String> = None;
@@ -1572,9 +1587,7 @@ pub fn measure_batch_size_candidates(
                 warmup_ms,
                 median_tps: None,
                 max_tps: None,
-                error: Some(
-                    last_err.unwrap_or_else(|| "every measurement run failed".into()),
-                ),
+                error: Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
             });
             continue;
         }
@@ -1687,7 +1700,8 @@ pub fn measure_flash_kv_min_candidates(
     };
 
     let saved_env = std::env::var_os("RUSTLLAMA_FLASH_KV_LEN_MIN");
-    let mut report_candidates: Vec<FlashKvMinCandidateResult> = Vec::with_capacity(candidates.len());
+    let mut report_candidates: Vec<FlashKvMinCandidateResult> =
+        Vec::with_capacity(candidates.len());
     let mut best_tps = 0.0f64;
     let mut best_kv_min: Option<u32> = None;
 
@@ -1719,9 +1733,7 @@ pub fn measure_flash_kv_min_candidates(
                 warmup_ms,
                 median_tps: None,
                 max_tps: None,
-                error: Some(
-                    last_err.unwrap_or_else(|| "every measurement run failed".into()),
-                ),
+                error: Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
             });
             continue;
         }
@@ -1833,7 +1845,8 @@ pub fn measure_prefix_snapshots_candidates(
         ..SamplingParams::default()
     };
 
-    let mut report_candidates: Vec<PrefixSnapshotsCandidateResult> = Vec::with_capacity(candidates.len());
+    let mut report_candidates: Vec<PrefixSnapshotsCandidateResult> =
+        Vec::with_capacity(candidates.len());
     let mut best_tps = 0.0f64;
     let mut best_depth: Option<u32> = None;
 
@@ -1875,9 +1888,7 @@ pub fn measure_prefix_snapshots_candidates(
                 warmup_ms,
                 median_tps: None,
                 max_tps: None,
-                error: Some(
-                    last_err.unwrap_or_else(|| "every measurement run failed".into()),
-                ),
+                error: Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
             });
             continue;
         }
@@ -1946,7 +1957,8 @@ pub fn measure_kv_page_size_candidates(
     repeats: u32,
     cfg: &MeasurementConfig,
 ) -> crate::Result<KvPageSizeMeasurementReport> {
-    let mut report_candidates: Vec<KvPageSizeCandidateResult> = Vec::with_capacity(candidates.len());
+    let mut report_candidates: Vec<KvPageSizeCandidateResult> =
+        Vec::with_capacity(candidates.len());
     let mut best_tps = 0.0f64;
     let mut best_page: Option<u32> = None;
     let mut total_load_ms = 0.0f64;
@@ -1954,7 +1966,12 @@ pub fn measure_kv_page_size_candidates(
     for &page_size in candidates {
         let load_start = std::time::Instant::now();
         let load_result = CpuEngine::load_with_options_layout_and_page_size(
-            model_path, ctx_size, true, cfg.kv_dtype, &cfg.kv_cache_layout, page_size,
+            model_path,
+            ctx_size,
+            true,
+            cfg.kv_dtype,
+            &cfg.kv_cache_layout,
+            page_size,
         );
         total_load_ms += load_start.elapsed().as_secs_f64() * 1000.0;
         let mut cpu = match load_result {
@@ -2015,9 +2032,7 @@ pub fn measure_kv_page_size_candidates(
                 warmup_ms,
                 median_tps: None,
                 max_tps: None,
-                error: Some(
-                    last_err.unwrap_or_else(|| "every measurement run failed".into()),
-                ),
+                error: Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
             });
             continue;
         }
@@ -2117,7 +2132,8 @@ pub fn measure_flash_v3_kv_tile_candidates(
     };
 
     let saved_env = std::env::var_os("RUSTLLAMA_FLASH_V3_KV_TILE");
-    let mut report_candidates: Vec<FlashV3KvTileCandidateResult> = Vec::with_capacity(candidates.len());
+    let mut report_candidates: Vec<FlashV3KvTileCandidateResult> =
+        Vec::with_capacity(candidates.len());
     let mut best_tps = 0.0f64;
     let mut best_tile: Option<u32> = None;
 
@@ -2146,9 +2162,7 @@ pub fn measure_flash_v3_kv_tile_candidates(
                 warmup_ms,
                 median_tps: None,
                 max_tps: None,
-                error: Some(
-                    last_err.unwrap_or_else(|| "every measurement run failed".into()),
-                ),
+                error: Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
             });
             continue;
         }
@@ -2347,7 +2361,11 @@ pub fn measure_moe_placement_candidates(
             max_tps: Some(max),
             error: None,
         });
-        if best.as_ref().map(|(_, _, _, t)| median > *t).unwrap_or(true) {
+        if best
+            .as_ref()
+            .map(|(_, _, _, t)| median > *t)
+            .unwrap_or(true)
+        {
             best = Some((label.to_string(), *experts_cpu, *split, median));
         }
     }
@@ -2363,7 +2381,11 @@ pub fn measure_moe_placement_candidates(
             if label != "uniform" && tps < baseline_tps * MOE_PLACEMENT_MIN_WIN {
                 Some((("uniform".to_string(), 0), baseline_tps))
             } else {
-                let placement = if experts_cpu { "experts_cpu" } else { "uniform" };
+                let placement = if experts_cpu {
+                    "experts_cpu"
+                } else {
+                    "uniform"
+                };
                 Some(((placement.to_string(), split), tps))
             }
         }
@@ -2596,15 +2618,15 @@ pub fn measure_speculative_mtp(
         let mut last_err: Option<String> = None;
         for _ in 0..repeats {
             cpu.clear_prefix_cache();
-            let mut stream = match cpu
-                .speculate_mtp_stream_from_ids(prompt_ids.clone(), sampling.clone(), None)
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(e.to_string());
-                    continue;
-                }
-            };
+            let mut stream =
+                match cpu.speculate_mtp_stream_from_ids(prompt_ids.clone(), sampling.clone(), None)
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        last_err = Some(e.to_string());
+                        continue;
+                    }
+                };
             let drained = futures::executor::block_on(async {
                 let mut generated = 0usize;
                 let mut t_first: Option<std::time::Instant> = None;
@@ -2782,7 +2804,9 @@ pub fn measure_tree_widths(
     // `measure_speculative_mtp`'s `bench_mtp`, parameterized on the widths and
     // additionally sampling the engine's cumulative speculation counters to
     // derive this candidate's accept rate (drafted → accepted).
-    let bench_widths = |cpu: &mut CpuEngine, widths: &[u32]| -> (Option<f64>, Option<f64>, Option<String>) {
+    let bench_widths = |cpu: &mut CpuEngine,
+                        widths: &[u32]|
+     -> (Option<f64>, Option<f64>, Option<String>) {
         let tw = Some(widths.to_vec());
         // Untimed warmup drain.
         cpu.clear_prefix_cache();
@@ -2879,7 +2903,8 @@ pub fn measure_tree_widths(
         (Some(median), accept, None)
     };
 
-    let mut results: Vec<rustllama_tuner::TreeWidthMeasurement> = Vec::with_capacity(candidates.len());
+    let mut results: Vec<rustllama_tuner::TreeWidthMeasurement> =
+        Vec::with_capacity(candidates.len());
     let mut first_err: Option<String> = None;
     for widths in candidates {
         let (tok_s, accept, err) = bench_widths(&mut cpu, widths);
@@ -3124,13 +3149,19 @@ pub fn measure_flash_attn_bench(
     // `repeats` timed runs. Mirrors `measure_ssm_prefill_chunked`.
     let bench_prefill = |cpu: &mut CpuEngine| -> Option<f64> {
         cpu.clear_prefix_cache();
-        if cpu.generate_token_ids(&prompt_ids, 1, &prefill_sampling).is_err() {
+        if cpu
+            .generate_token_ids(&prompt_ids, 1, &prefill_sampling)
+            .is_err()
+        {
             return None;
         }
         let mut runs = Vec::with_capacity(repeats);
         for _ in 0..repeats {
             cpu.clear_prefix_cache();
-            if cpu.generate_token_ids(&prompt_ids, 1, &prefill_sampling).is_ok() {
+            if cpu
+                .generate_token_ids(&prompt_ids, 1, &prefill_sampling)
+                .is_ok()
+            {
                 let stats = cpu.last_request_stats();
                 let prefilled = stats.tokens_prefilled.max(prompt_tokens);
                 if stats.prefill_ms > 0.0 && prefilled > 0 {
@@ -3144,8 +3175,13 @@ pub fn measure_flash_attn_bench(
         // untimed warmup, then the shared decode-tok/s collector.
         cpu.clear_prefix_cache();
         let _ = cpu.generate_token_ids(&prompt_ids, decode_tokens, &decode_sampling);
-        let (runs, _) =
-            collect_decode_tok_s(cpu, &prompt_ids, decode_tokens, repeats as u32, &decode_sampling);
+        let (runs, _) = collect_decode_tok_s(
+            cpu,
+            &prompt_ids,
+            decode_tokens,
+            repeats as u32,
+            &decode_sampling,
+        );
         median(runs)
     };
 
@@ -3925,7 +3961,10 @@ pub fn measure_cacheblend_ratio(
     .map_err(|e| format!("load failed: {e}"))?;
     let model = cpu.model_arc();
     if model.weights.is_hybrid() {
-        return Ok(CacheblendMeasurement { chosen_ratio: 0.0, per_ratio_cos: Vec::new() });
+        return Ok(CacheblendMeasurement {
+            chosen_ratio: 0.0,
+            per_ratio_cos: Vec::new(),
+        });
     }
     let vocab = model.cfg.vocab_size as u64;
     if vocab < 2 {
@@ -3997,7 +4036,10 @@ pub fn measure_cacheblend_ratio(
                 &assembled,
                 &placements,
                 suffix_start,
-                CacheBlendConfig { recompute_ratio: ratio, selection_layer: 1 },
+                CacheBlendConfig {
+                    recompute_ratio: ratio,
+                    selection_layer: 1,
+                },
                 &mut kv_cb,
             );
             sums[ri] += cosine(&cb_logits, &ref_logits);
@@ -4008,7 +4050,16 @@ pub fn measure_cacheblend_ratio(
     let per_ratio_cos: Vec<(f32, f32)> = candidates
         .iter()
         .enumerate()
-        .map(|(ri, &r)| (r, if counted > 0 { sums[ri] / counted as f32 } else { 0.0 }))
+        .map(|(ri, &r)| {
+            (
+                r,
+                if counted > 0 {
+                    sums[ri] / counted as f32
+                } else {
+                    0.0
+                },
+            )
+        })
         .collect();
     // Smallest ratio that cleared the coherence bar.
     let chosen = per_ratio_cos
@@ -4017,7 +4068,10 @@ pub fn measure_cacheblend_ratio(
         .map(|(r, _)| *r)
         .fold(f32::INFINITY, f32::min);
     let chosen_ratio = if chosen.is_finite() { chosen } else { 0.0 };
-    Ok(CacheblendMeasurement { chosen_ratio, per_ratio_cos })
+    Ok(CacheblendMeasurement {
+        chosen_ratio,
+        per_ratio_cos,
+    })
 }
 
 #[cfg(test)]
@@ -4277,8 +4331,15 @@ mod f14_per_device_tests {
         scores.insert("cpu-slug".into(), 7.5);
         let mut tiers: Vec<PerDeviceTierResult> = Vec::new();
         measure_extra_cuda_gpus(&mut scores, &mut tiers);
-        assert_eq!(scores.len(), 1, "no extra-GPU entries added on a single-GPU host");
+        assert_eq!(
+            scores.len(),
+            1,
+            "no extra-GPU entries added on a single-GPU host"
+        );
         assert_eq!(scores.get("cpu-slug"), Some(&7.5));
-        assert!(tiers.is_empty(), "no extra-GPU tiers added on a single-GPU host");
+        assert!(
+            tiers.is_empty(),
+            "no extra-GPU tiers added on a single-GPU host"
+        );
     }
 }

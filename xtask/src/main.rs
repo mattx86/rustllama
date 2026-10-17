@@ -409,9 +409,7 @@ fn stage_redist(out: Option<PathBuf>, allow_missing: bool) -> Result<()> {
             .len();
         std::fs::copy(&src, &dst)
             .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
-        println!(
-            "  ok       {pattern:<32} -> {actual_name} ({size} bytes)",
-        );
+        println!("  ok       {pattern:<32} -> {actual_name} ({size} bytes)",);
         manifest_rows.push((actual_name.to_string(), src, size));
         found += 1;
     }
@@ -506,7 +504,10 @@ fn stage_npu_runtime(out_dir: &std::path::Path) -> Result<()> {
         .filter(|p| p.exists())
     {
         Some(xrt) => {
-            let cand = [xrt.join("bin").join("xrt_coreutil.dll"), xrt.join("xrt_coreutil.dll")];
+            let cand = [
+                xrt.join("bin").join("xrt_coreutil.dll"),
+                xrt.join("xrt_coreutil.dll"),
+            ];
             match cand.iter().find(|p| p.exists()) {
                 Some(src) => {
                     let dst = out_dir.join("xrt_coreutil.dll");
@@ -514,7 +515,9 @@ fn stage_npu_runtime(out_dir: &std::path::Path) -> Result<()> {
                         .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
                     println!("  ok       xrt_coreutil.dll (AMD NPU)");
                 }
-                None => println!("  WARNING: XILINX_XRT set but xrt_coreutil.dll not found under it."),
+                None => {
+                    println!("  WARNING: XILINX_XRT set but xrt_coreutil.dll not found under it.")
+                }
             }
         }
         None => {
@@ -649,11 +652,7 @@ mod tests {
         sorted.sort();
         let original_len = sorted.len();
         sorted.dedup();
-        assert_eq!(
-            sorted.len(),
-            original_len,
-            "manifest has duplicate entries"
-        );
+        assert_eq!(sorted.len(), original_len, "manifest has duplicate entries");
     }
 
     /// `find_redist_dll` locates files under `<group>/latest/bin/`

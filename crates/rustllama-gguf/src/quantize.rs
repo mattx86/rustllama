@@ -24,10 +24,10 @@ use std::io::{Seek, Write};
 
 use rayon::prelude::*;
 
-use crate::{dequant, encode, encode_iq, encode_iq_vec, encode_k, encode_mx, encode_t};
 use crate::recipe::{resolve_first_match, RecipeRule};
-use crate::{Gguf, GgmlType, MetadataValue};
 use crate::write::{GgufMmapWriter, GgufWriter, WriteError};
+use crate::{dequant, encode, encode_iq, encode_iq_vec, encode_k, encode_mx, encode_t};
+use crate::{GgmlType, Gguf, MetadataValue};
 
 thread_local! {
     static F32_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
@@ -179,10 +179,7 @@ pub fn is_quantizable_tensor(_name: &str, src_dtype: GgmlType, _n_elements: u64)
         return false;
     }
     // F32 / F16 / BF16 source: quantizable.
-    matches!(
-        src_dtype,
-        GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16
-    )
+    matches!(src_dtype, GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16)
 }
 
 /// True when `name` belongs to a multi-token-prediction (MTP /
@@ -322,10 +319,7 @@ pub fn quantize_gguf<W: Write + Seek>(
         // the "FP8 non-chunked branch" comment block above.
         let fp8_scale = if target == GgmlType::Fp8 && target != t.dtype {
             let scale = resolve_fp8_scale(src, &t.name, t.dtype, n as usize)?;
-            dst.add_metadata(
-                format!("{}.fp8_scale", t.name),
-                MetadataValue::F32(scale),
-            )?;
+            dst.add_metadata(format!("{}.fp8_scale", t.name), MetadataValue::F32(scale))?;
             Some(scale)
         } else {
             None
@@ -411,8 +405,7 @@ pub fn quantize_gguf<W: Write + Seek>(
             // par_chunks_mut yields chunks of exactly this size,
             // except the last (which is smaller if total_n isn't a
             // multiple of CHUNK_WEIGHTS).
-            let chunk_target_bytes =
-                r.target_dtype.byte_size(chunk_cap as u64) as usize;
+            let chunk_target_bytes = r.target_dtype.byte_size(chunk_cap as u64) as usize;
             let src_dtype = r.src_dtype;
             let target_dtype = r.target_dtype;
             let tensor_name = r.name.clone();
@@ -424,20 +417,15 @@ pub fn quantize_gguf<W: Write + Seek>(
                     let start_weights = i * chunk_cap;
                     let end_weights = (start_weights + chunk_cap).min(total_n);
                     let n_this = end_weights - start_weights;
-                    let src_lo =
-                        src_dtype.byte_size(start_weights as u64) as usize;
-                    let src_hi =
-                        src_dtype.byte_size(end_weights as u64) as usize;
+                    let src_lo = src_dtype.byte_size(start_weights as u64) as usize;
+                    let src_hi = src_dtype.byte_size(end_weights as u64) as usize;
                     with_f32_scratch(n_this, |local_f32| {
-                        dequant_to_f32(
-                            src_dtype,
-                            &src_bytes[src_lo..src_hi],
-                            local_f32,
-                        )
-                        .map_err(|()| QuantizeError::UnsupportedSourceDtype {
-                            name: tensor_name.clone(),
-                            src: src_dtype,
-                        })?;
+                        dequant_to_f32(src_dtype, &src_bytes[src_lo..src_hi], local_f32).map_err(
+                            |()| QuantizeError::UnsupportedSourceDtype {
+                                name: tensor_name.clone(),
+                                src: src_dtype,
+                            },
+                        )?;
                         encode_from_f32(target_dtype, local_f32, out_chunk);
                         Ok(())
                     })
@@ -550,10 +538,7 @@ pub fn quantize_gguf_to_path_with_imatrix<P: AsRef<std::path::Path>>(
         // the "FP8 non-chunked branch" comment block above.
         let fp8_scale = if target == GgmlType::Fp8 && target != t.dtype {
             let scale = resolve_fp8_scale(src, &t.name, t.dtype, n as usize)?;
-            dst.add_metadata(
-                format!("{}.fp8_scale", t.name),
-                MetadataValue::F32(scale),
-            )?;
+            dst.add_metadata(format!("{}.fp8_scale", t.name), MetadataValue::F32(scale))?;
             Some(scale)
         } else {
             None
@@ -614,8 +599,7 @@ pub fn quantize_gguf_to_path_with_imatrix<P: AsRef<std::path::Path>>(
             const CHUNK_WEIGHTS: usize = 256 * 1024;
             let total_n = r.n_elements as usize;
             let chunk_cap = CHUNK_WEIGHTS.min(total_n);
-            let chunk_target_bytes =
-                r.target_dtype.byte_size(chunk_cap as u64) as usize;
+            let chunk_target_bytes = r.target_dtype.byte_size(chunk_cap as u64) as usize;
             let src_dtype = r.src_dtype;
             let target_dtype = r.target_dtype;
             let tensor_name = r.name.clone();
@@ -625,9 +609,9 @@ pub fn quantize_gguf_to_path_with_imatrix<P: AsRef<std::path::Path>>(
             // — otherwise fall back to uniform (defensive against a
             // stale/mismatched imatrix).
             let n_in = r.dims.first().copied().unwrap_or(0) as usize;
-            let col_imp: Option<&[f32]> = imatrix.and_then(|im| im.get(&r.name)).filter(|c| {
-                n_in > 0 && c.len() == n_in && total_n % n_in == 0
-            });
+            let col_imp: Option<&[f32]> = imatrix
+                .and_then(|im| im.get(&r.name))
+                .filter(|c| n_in > 0 && c.len() == n_in && total_n % n_in == 0);
             let result: Result<(), QuantizeError> = region
                 .par_chunks_mut(chunk_target_bytes)
                 .enumerate()
@@ -635,10 +619,8 @@ pub fn quantize_gguf_to_path_with_imatrix<P: AsRef<std::path::Path>>(
                     let start_weights = i * chunk_cap;
                     let end_weights = (start_weights + chunk_cap).min(total_n);
                     let n_this = end_weights - start_weights;
-                    let src_lo =
-                        src_dtype.byte_size(start_weights as u64) as usize;
-                    let src_hi =
-                        src_dtype.byte_size(end_weights as u64) as usize;
+                    let src_lo = src_dtype.byte_size(start_weights as u64) as usize;
+                    let src_hi = src_dtype.byte_size(end_weights as u64) as usize;
                     // imatrix path uses a LOCAL f32 buffer, not the
                     // thread-local `with_f32_scratch`: the importance-
                     // weighted encoders (IQ1_S, IQ2_XXS) parallelize
@@ -661,27 +643,28 @@ pub fn quantize_gguf_to_path_with_imatrix<P: AsRef<std::path::Path>>(
                         // chunk's flat weight indices: w[j] = c[(start+j) % n_in].
                         let w_chunk: Vec<f32> =
                             (0..n_this).map(|j| c[(start_weights + j) % n_in]).collect();
-                        encode_from_f32_imatrix(target_dtype, &local_f32, out_chunk, Some(&w_chunk));
+                        encode_from_f32_imatrix(
+                            target_dtype,
+                            &local_f32,
+                            out_chunk,
+                            Some(&w_chunk),
+                        );
                         return Ok(());
                     }
                     with_f32_scratch(n_this, |local_f32| {
-                        dequant_to_f32(
-                            src_dtype,
-                            &src_bytes[src_lo..src_hi],
-                            local_f32,
-                        )
-                        .map_err(|()| QuantizeError::UnsupportedSourceDtype {
-                            name: tensor_name.clone(),
-                            src: src_dtype,
-                        })?;
+                        dequant_to_f32(src_dtype, &src_bytes[src_lo..src_hi], local_f32).map_err(
+                            |()| QuantizeError::UnsupportedSourceDtype {
+                                name: tensor_name.clone(),
+                                src: src_dtype,
+                            },
+                        )?;
                         match col_imp {
                             Some(c) => {
                                 // Broadcast the per-column importance across
                                 // this chunk's flat weight indices:
                                 // w[j] = c[(start_weights + j) % n_in].
-                                let w_chunk: Vec<f32> = (0..n_this)
-                                    .map(|j| c[(start_weights + j) % n_in])
-                                    .collect();
+                                let w_chunk: Vec<f32> =
+                                    (0..n_this).map(|j| c[(start_weights + j) % n_in]).collect();
                                 encode_from_f32_imatrix(
                                     target_dtype,
                                     local_f32,
@@ -792,10 +775,7 @@ pub fn quantize_gguf_to_path_with_encoder_imatrix<P: AsRef<std::path::Path>>(
         // the "FP8 non-chunked branch" comment block above.
         let fp8_scale = if target == GgmlType::Fp8 && target != t.dtype {
             let scale = resolve_fp8_scale(src, &t.name, t.dtype, n as usize)?;
-            dst.add_metadata(
-                format!("{}.fp8_scale", t.name),
-                MetadataValue::F32(scale),
-            )?;
+            dst.add_metadata(format!("{}.fp8_scale", t.name), MetadataValue::F32(scale))?;
             Some(scale)
         } else {
             None
@@ -900,22 +880,21 @@ pub fn quantize_gguf_to_path_with_encoder_imatrix<P: AsRef<std::path::Path>>(
                         .and_then(|im| im.get(&r.name))
                         .filter(|c| n_in > 0 && c.len() == n_in && total_n % n_in == 0)
                         .map(|c| (0..total_n).map(|j| c[j % n_in]).collect());
-                    let (f32_buf, gpu_dequant_src_bytes) = if gpu_dequant
-                        && is_kquant_source(r.src_dtype)
-                    {
-                        // Defer the dequant to the consumer thread —
-                        // it owns the encoder's SYCL queue.
-                        (Vec::new(), Some(src_bytes))
-                    } else {
-                        let mut buf = vec![0.0_f32; r.n_elements as usize];
-                        dequant_to_f32(r.src_dtype, src_bytes, &mut buf).map_err(|()| {
-                            QuantizeError::UnsupportedSourceDtype {
-                                name: r.name.clone(),
-                                src: r.src_dtype,
-                            }
-                        })?;
-                        (buf, None)
-                    };
+                    let (f32_buf, gpu_dequant_src_bytes) =
+                        if gpu_dequant && is_kquant_source(r.src_dtype) {
+                            // Defer the dequant to the consumer thread —
+                            // it owns the encoder's SYCL queue.
+                            (Vec::new(), Some(src_bytes))
+                        } else {
+                            let mut buf = vec![0.0_f32; r.n_elements as usize];
+                            dequant_to_f32(r.src_dtype, src_bytes, &mut buf).map_err(|()| {
+                                QuantizeError::UnsupportedSourceDtype {
+                                    name: r.name.clone(),
+                                    src: r.src_dtype,
+                                }
+                            })?;
+                            (buf, None)
+                        };
                     if tx
                         .send(DequantedTensor {
                             r,
@@ -1014,12 +993,12 @@ pub fn quantize_gguf_to_path_with_encoder_imatrix<P: AsRef<std::path::Path>>(
                         .try_dequant_kquant_to_f32(d.r.src_dtype, src_bytes, &mut d.f32_buf)
                         .is_err()
                     {
-                        dequant_to_f32(d.r.src_dtype, src_bytes, &mut d.f32_buf).map_err(
-                            |()| QuantizeError::UnsupportedSourceDtype {
+                        dequant_to_f32(d.r.src_dtype, src_bytes, &mut d.f32_buf).map_err(|()| {
+                            QuantizeError::UnsupportedSourceDtype {
                                 name: d.r.name.clone(),
                                 src: d.r.src_dtype,
-                            },
-                        )?;
+                            }
+                        })?;
                     }
                 }
                 let this_fmt = match d.r.target_dtype {
@@ -1067,7 +1046,10 @@ pub fn quantize_gguf_to_path_with_encoder_imatrix<P: AsRef<std::path::Path>>(
                         // encoder (no GPU-weighted K-quant path yet).
                         (GgmlType::Q2_K | GgmlType::Q4_K | GgmlType::Q5_K, Some(w)) => {
                             encode_from_f32_imatrix(
-                                d.r.target_dtype, &d.f32_buf, d.region, Some(w),
+                                d.r.target_dtype,
+                                &d.f32_buf,
+                                d.region,
+                                Some(w),
                             );
                         }
                         // Uniform (no imatrix) or dtype without a
@@ -1437,12 +1419,7 @@ pub fn dequant_tensor_to_f32(src_dtype: GgmlType, src_bytes: &[u8], out: &mut [f
 /// to their `*_imatrix` encoders and falls back to the uniform
 /// [`encode_from_f32`] for everything else. With `w = None` it is
 /// exactly [`encode_from_f32`].
-fn encode_from_f32_imatrix(
-    target_dtype: GgmlType,
-    src: &[f32],
-    dst: &mut [u8],
-    w: Option<&[f32]>,
-) {
+fn encode_from_f32_imatrix(target_dtype: GgmlType, src: &[f32], dst: &mut [u8], w: Option<&[f32]>) {
     match (target_dtype, w) {
         (GgmlType::Q2_K, Some(_)) => encode_k::encode_q2_k_imatrix(src, dst, w),
         (GgmlType::Q4_K, Some(_)) => encode_k::encode_q4_k_imatrix(src, dst, w),
@@ -1526,10 +1503,7 @@ fn encode_from_f32(target_dtype: GgmlType, src: &[f32], dst: &mut [u8]) {
         // Hadamard-rotated quantization pipeline, out of scope).
         // Mxfp4Ggml (upstream id 39) is an INPUT-only dtype: we repack it
         // to our Mxfp4 on load and only ever PRODUCE id 1025, never 39.
-        GgmlType::Nvfp4
-        | GgmlType::Mxfp4Ggml
-        | GgmlType::PQ2_0
-        | GgmlType::PTQ1_0 => unreachable!(
+        GgmlType::Nvfp4 | GgmlType::Mxfp4Ggml | GgmlType::PQ2_0 | GgmlType::PTQ1_0 => unreachable!(
             "encode_from_f32: encoder for {target_dtype:?} not implemented via the \
              per-chunk path — encoder_supported() should have rejected this earlier"
         ),
@@ -1577,11 +1551,7 @@ fn fp8_tensor_scale(absmax: f32) -> f32 {
 /// `byte_size(start)` is always exact at a chunk boundary. Returns
 /// `Err(())` when the source dtype has no dequant routine (the caller
 /// maps that to `UnsupportedSourceDtype`).
-fn fp8_source_absmax(
-    src_dtype: GgmlType,
-    src_bytes: &[u8],
-    n_elements: usize,
-) -> Result<f32, ()> {
+fn fp8_source_absmax(src_dtype: GgmlType, src_bytes: &[u8], n_elements: usize) -> Result<f32, ()> {
     const CHUNK_WEIGHTS: usize = 256 * 1024;
     let mut absmax = 0.0f32;
     let mut start = 0usize;
@@ -1935,11 +1905,20 @@ mod tests {
         // Build source GGUF.
         let mut src_w = GgufWriter::new(Cursor::new(Vec::<u8>::new()));
         src_w
-            .add_metadata("general.architecture", MetadataValue::String("llama".into()))
+            .add_metadata(
+                "general.architecture",
+                MetadataValue::String("llama".into()),
+            )
             .unwrap();
-        src_w.declare_tensor("a.weight", vec![n_small as u64], GgmlType::F32).unwrap();
-        src_w.declare_tensor("b.weight", vec![n_medium as u64], GgmlType::F32).unwrap();
-        src_w.declare_tensor("c.weight", vec![n_large as u64], GgmlType::F32).unwrap();
+        src_w
+            .declare_tensor("a.weight", vec![n_small as u64], GgmlType::F32)
+            .unwrap();
+        src_w
+            .declare_tensor("b.weight", vec![n_medium as u64], GgmlType::F32)
+            .unwrap();
+        src_w
+            .declare_tensor("c.weight", vec![n_large as u64], GgmlType::F32)
+            .unwrap();
         src_w.finish_header().unwrap();
         let bytes_a: Vec<u8> = row_a.iter().flat_map(|v| v.to_le_bytes()).collect();
         let bytes_b: Vec<u8> = row_b.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -1962,8 +1941,7 @@ mod tests {
         // Path 2: mmap writer (new quantize_gguf_to_path).
         let tmp_mmap = std::env::temp_dir().join("rustllama_quantize_mmap_dst.gguf");
         let _ = std::fs::remove_file(&tmp_mmap);
-        let mmap_stats =
-            quantize_gguf_to_path(&src, &tmp_mmap, &plan).unwrap();
+        let mmap_stats = quantize_gguf_to_path(&src, &tmp_mmap, &plan).unwrap();
         let mmap_bytes = std::fs::read(&tmp_mmap).unwrap();
 
         assert_eq!(mem_stats.tensors_total, mmap_stats.tensors_total);
@@ -2018,9 +1996,14 @@ mod tests {
 
         let mut src_w = GgufWriter::new(Cursor::new(Vec::<u8>::new()));
         src_w
-            .add_metadata("general.architecture", MetadataValue::String("llama".into()))
+            .add_metadata(
+                "general.architecture",
+                MetadataValue::String("llama".into()),
+            )
             .unwrap();
-        src_w.declare_tensor("w.weight", vec![n as u64], GgmlType::F32).unwrap();
+        src_w
+            .declare_tensor("w.weight", vec![n as u64], GgmlType::F32)
+            .unwrap();
         src_w.finish_header().unwrap();
         let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
         src_w.write_tensor_data("w.weight", &bytes).unwrap();
@@ -2079,9 +2062,14 @@ mod tests {
 
         let mut src_w = GgufWriter::new(Cursor::new(Vec::<u8>::new()));
         src_w
-            .add_metadata("general.architecture", MetadataValue::String("llama".into()))
+            .add_metadata(
+                "general.architecture",
+                MetadataValue::String("llama".into()),
+            )
             .unwrap();
-        src_w.declare_tensor("w.weight", vec![n as u64], GgmlType::F32).unwrap();
+        src_w
+            .declare_tensor("w.weight", vec![n as u64], GgmlType::F32)
+            .unwrap();
         src_w.finish_header().unwrap();
         let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
         src_w.write_tensor_data("w.weight", &bytes).unwrap();
@@ -2150,9 +2138,7 @@ mod tests {
 
         // Build source GGUF.
         let mut src_w = GgufWriter::new(Cursor::new(Vec::<u8>::new()));
-        src_w
-            .add_metadata("k", MetadataValue::U32(0))
-            .unwrap();
+        src_w.add_metadata("k", MetadataValue::U32(0)).unwrap();
         src_w
             .declare_tensor("big.weight", vec![n as u64], GgmlType::F32)
             .unwrap();
@@ -2193,10 +2179,7 @@ mod tests {
         // Q4_K with iterative scale-search on uniformly-distributed
         // [-2, 2) → max error well within `2 * amp / 15 ≈ 0.27`.
         // Loose bound 0.6 to absorb FP rounding in the f16 scale.
-        assert!(
-            max_err < 0.6,
-            "chunked Q4_K round-trip max_err={max_err}"
-        );
+        assert!(max_err < 0.6, "chunked Q4_K round-trip max_err={max_err}");
 
         let _ = std::fs::remove_file(&tmp_src);
         let _ = std::fs::remove_file(&tmp_dst);
@@ -2264,9 +2247,7 @@ mod tests {
     #[test]
     fn pipeline_passes_through_misaligned_tensor() {
         let mut src_buf = GgufWriter::new(Cursor::new(Vec::<u8>::new()));
-        src_buf
-            .add_metadata("a", MetadataValue::U32(1))
-            .unwrap();
+        src_buf.add_metadata("a", MetadataValue::U32(1)).unwrap();
         // 32 elements: real-world case is `blk.N.ssm_a` (Mamba head
         // count). Doesn't divide Q4_K's 256-block size, but should
         // gracefully pass through at F32 (the source dtype).
@@ -2327,7 +2308,10 @@ mod tests {
             // `mtp` must be a leading namespace, not a substring.
             "blk.0.mtp_gate.weight",
         ] {
-            assert!(!is_mtp_head_tensor(name), "{name} should NOT classify as MTP");
+            assert!(
+                !is_mtp_head_tensor(name),
+                "{name} should NOT classify as MTP"
+            );
         }
     }
 
@@ -2375,7 +2359,10 @@ mod tests {
             "blk.40.nextn.eh_proj.weight",
             GgmlType::Q4_K
         ));
-        assert!(mtp_head_below_8bpw("mtp.0.ffn_down.weight", GgmlType::IQ1_S));
+        assert!(mtp_head_below_8bpw(
+            "mtp.0.ffn_down.weight",
+            GgmlType::IQ1_S
+        ));
         // MTP head kept at >= 8 bits → quiet.
         assert!(!mtp_head_below_8bpw(
             "blk.40.nextn.eh_proj.weight",

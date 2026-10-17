@@ -14,7 +14,12 @@ fn main() {
                 // rope.dimension_sections values inline.
                 let preview: Vec<String> = a.iter().take(8).map(|v| format!("{v:?}")).collect();
                 let suffix = if a.len() > 8 { ", …" } else { "" };
-                format!("array (len {}) = [{}{}]", a.len(), preview.join(", "), suffix)
+                format!(
+                    "array (len {}) = [{}{}]",
+                    a.len(),
+                    preview.join(", "),
+                    suffix
+                )
             }
             other => format!("{:?}", other),
         };

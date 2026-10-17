@@ -84,8 +84,7 @@ fn build_awq_dir(tag: &str, with_tokenizer: bool) -> PathBuf {
     ] {
         map.insert(
             format!("model.layers.0.self_attn.{proj}.qweight"),
-            TensorView::new(StDtype::I32, vec![d_model, out_packs_model], qw)
-                .unwrap(),
+            TensorView::new(StDtype::I32, vec![d_model, out_packs_model], qw).unwrap(),
         );
         map.insert(
             format!("model.layers.0.self_attn.{proj}.scales"),
@@ -102,8 +101,7 @@ fn build_awq_dir(tag: &str, with_tokenizer: bool) -> PathBuf {
     ] {
         map.insert(
             format!("model.layers.0.mlp.{proj}.qweight"),
-            TensorView::new(StDtype::I32, vec![d_model, out_packs_ff], qw)
-                .unwrap(),
+            TensorView::new(StDtype::I32, vec![d_model, out_packs_ff], qw).unwrap(),
         );
         map.insert(
             format!("model.layers.0.mlp.{proj}.scales"),
@@ -116,8 +114,7 @@ fn build_awq_dir(tag: &str, with_tokenizer: bool) -> PathBuf {
     }
     map.insert(
         "model.layers.0.mlp.down_proj.qweight".into(),
-        TensorView::new(StDtype::I32, vec![d_ff, out_packs_model], &qw_d)
-            .unwrap(),
+        TensorView::new(StDtype::I32, vec![d_ff, out_packs_model], &qw_d).unwrap(),
     );
     map.insert(
         "model.layers.0.mlp.down_proj.scales".into(),
@@ -271,8 +268,7 @@ fn load_safetensors_loads_without_tokenizer_with_warning() {
     // the model loads and forward_one still works.
     let dir = build_awq_dir("no-tokenizer", false);
     let st_path = dir.join("model.safetensors");
-    let engine =
-        CpuEngine::load_safetensors(&st_path, 64).expect("load without tokenizer");
+    let engine = CpuEngine::load_safetensors(&st_path, 64).expect("load without tokenizer");
     // Architecture sanity confirms the load worked end-to-end even
     // without the tokenizer file present.
     assert_eq!(engine.llama_config().n_layers, 1);
@@ -362,7 +358,9 @@ fn build_mlx_dir(tag: &str) -> PathBuf {
     }
     // A full-precision 1-D f16 tensor (norm).
     fn full_f16(name: &str, n: usize) -> MlxWriteTensor {
-        let bytes: Vec<u8> = (0..n).flat_map(|_| f16::from_f32(1.0).to_le_bytes()).collect();
+        let bytes: Vec<u8> = (0..n)
+            .flat_map(|_| f16::from_f32(1.0).to_le_bytes())
+            .collect();
         MlxWriteTensor::Full {
             name: name.to_string(),
             dtype: MlxFullDtype::F16,
@@ -372,10 +370,34 @@ fn build_mlx_dir(tag: &str) -> PathBuf {
     }
 
     let tensors = vec![
-        quant("model.layers.0.self_attn.q_proj", d_model, d_model, group, bits),
-        quant("model.layers.0.self_attn.k_proj", d_model, d_model, group, bits),
-        quant("model.layers.0.self_attn.v_proj", d_model, d_model, group, bits),
-        quant("model.layers.0.self_attn.o_proj", d_model, d_model, group, bits),
+        quant(
+            "model.layers.0.self_attn.q_proj",
+            d_model,
+            d_model,
+            group,
+            bits,
+        ),
+        quant(
+            "model.layers.0.self_attn.k_proj",
+            d_model,
+            d_model,
+            group,
+            bits,
+        ),
+        quant(
+            "model.layers.0.self_attn.v_proj",
+            d_model,
+            d_model,
+            group,
+            bits,
+        ),
+        quant(
+            "model.layers.0.self_attn.o_proj",
+            d_model,
+            d_model,
+            group,
+            bits,
+        ),
         quant("model.layers.0.mlp.gate_proj", d_ff, d_model, group, bits),
         quant("model.layers.0.mlp.up_proj", d_ff, d_model, group, bits),
         quant("model.layers.0.mlp.down_proj", d_model, d_ff, group, bits),
@@ -388,7 +410,10 @@ fn build_mlx_dir(tag: &str) -> PathBuf {
     ];
 
     let mut extra = serde_json::Map::new();
-    extra.insert("architectures".into(), serde_json::json!(["LlamaForCausalLM"]));
+    extra.insert(
+        "architectures".into(),
+        serde_json::json!(["LlamaForCausalLM"]),
+    );
     extra.insert("hidden_size".into(), serde_json::json!(d_model));
     extra.insert("intermediate_size".into(), serde_json::json!(d_ff));
     extra.insert("num_hidden_layers".into(), serde_json::json!(1));
@@ -425,7 +450,10 @@ fn load_auto_loads_mlx_directory_and_runs_forward() {
         .expect("mlx forward runs");
     assert_eq!(out.len(), 4, "should emit exactly n_new tokens");
     for &t in &out {
-        assert!((t as usize) < engine.vocab_size(), "token {t} out of vocab range");
+        assert!(
+            (t as usize) < engine.vocab_size(),
+            "token {t} out of vocab range"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -472,8 +500,8 @@ fn load_mlx_direct_entry_loads_with_packed_affine_weights() {
     // decode it and confirm the group scales are finite and not all zero
     // (all-zero scales would dequant the whole tensor to zero).
     if blk.w_q.dtype == Dtype::MlxAffineRaw {
-        let view = rustllama_tensor::MlxAffineBlobView::parse(&bytes)
-            .expect("MlxAffineRaw blob parses");
+        let view =
+            rustllama_tensor::MlxAffineBlobView::parse(&bytes).expect("MlxAffineRaw blob parses");
         assert_eq!((view.rows, view.cols), (64, 64));
         let scales: Vec<f32> = view
             .scales_f16

@@ -46,9 +46,12 @@ fn build_synthetic_source(label: &str) -> (PathBuf, Vec<f32>, Vec<f32>) {
         MetadataValue::String("llama".into()),
     )
     .unwrap();
-    w.add_metadata("llama.block_count", MetadataValue::U32(2)).unwrap();
-    w.declare_tensor("a.weight", vec![256], GgmlType::F32).unwrap();
-    w.declare_tensor("b.weight", vec![256], GgmlType::F32).unwrap();
+    w.add_metadata("llama.block_count", MetadataValue::U32(2))
+        .unwrap();
+    w.declare_tensor("a.weight", vec![256], GgmlType::F32)
+        .unwrap();
+    w.declare_tensor("b.weight", vec![256], GgmlType::F32)
+        .unwrap();
     w.finish_header().unwrap();
     let bytes_a: Vec<u8> = row_a.iter().flat_map(|v| v.to_le_bytes()).collect();
     let bytes_b: Vec<u8> = row_b.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -130,8 +133,9 @@ fn tolerance_smooth(target: GgmlType) -> f32 {
         GgmlType::Q8_0 | GgmlType::Q8_K => 0.05,
         GgmlType::Q6_K => 0.2,
         GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q5_K => 0.25,
-        GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q4_K | GgmlType::IQ4_NL
-        | GgmlType::IQ4_XS => 0.6,
+        GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q4_K | GgmlType::IQ4_NL | GgmlType::IQ4_XS => {
+            0.6
+        }
         GgmlType::Q3_K => 1.5,
         GgmlType::Q2_K => 2.0,
         // IQ vector-grid quants: codebook + sign-mask + 4-bit
@@ -276,12 +280,10 @@ fn apex_i_quality_assigns_correct_per_tensor_dtypes() {
         MetadataValue::String("llama".into()),
     )
     .unwrap();
-    w.add_metadata(
-        "llama.block_count",
-        MetadataValue::U32(n_layers as u32),
-    )
-    .unwrap();
-    w.declare_tensor("output.weight", vec![256], GgmlType::F32).unwrap();
+    w.add_metadata("llama.block_count", MetadataValue::U32(n_layers as u32))
+        .unwrap();
+    w.declare_tensor("output.weight", vec![256], GgmlType::F32)
+        .unwrap();
     for i in 0..n_layers {
         w.declare_tensor(format!("blk.{i}.attn_q.weight"), vec![256], GgmlType::F32)
             .unwrap();
@@ -303,10 +305,14 @@ fn apex_i_quality_assigns_correct_per_tensor_dtypes() {
     w.finish_header().unwrap();
     w.write_tensor_data("output.weight", &zero).unwrap();
     for i in 0..n_layers {
-        w.write_tensor_data(&format!("blk.{i}.attn_q.weight"), &zero).unwrap();
-        w.write_tensor_data(&format!("blk.{i}.attn_v.weight"), &zero).unwrap();
-        w.write_tensor_data(&format!("blk.{i}.ffn_gate_exps.weight"), &zero).unwrap();
-        w.write_tensor_data(&format!("blk.{i}.ffn_gate_shexp.weight"), &zero).unwrap();
+        w.write_tensor_data(&format!("blk.{i}.attn_q.weight"), &zero)
+            .unwrap();
+        w.write_tensor_data(&format!("blk.{i}.attn_v.weight"), &zero)
+            .unwrap();
+        w.write_tensor_data(&format!("blk.{i}.ffn_gate_exps.weight"), &zero)
+            .unwrap();
+        w.write_tensor_data(&format!("blk.{i}.ffn_gate_shexp.weight"), &zero)
+            .unwrap();
     }
     let bytes = w.finish().unwrap().into_inner();
     std::fs::write(&tmp_src, &bytes).unwrap();
@@ -421,7 +427,10 @@ fn parity_vs_llama_cpp_when_available() {
         );
         // Sanity: both should be within Q4_K's tolerance to source.
         assert!(max_rust_err < 0.6, "{tensor}: rustllama Q4_K err too large");
-        assert!(max_llama_err < 0.6, "{tensor}: llama.cpp Q4_K err too large");
+        assert!(
+            max_llama_err < 0.6,
+            "{tensor}: llama.cpp Q4_K err too large"
+        );
         // Cross-implementation diff: looser, accommodates iterative
         // vs analytical scale-finder divergence.
         assert!(max_xover < 0.8, "{tensor}: cross-impl diff too large");
@@ -435,7 +444,12 @@ fn parity_vs_llama_cpp_when_available() {
 fn which_llama_quantize() -> Option<PathBuf> {
     // Common names. `llama-quantize` is the convention in modern
     // llama.cpp; older builds shipped as plain `quantize`.
-    for candidate in ["llama-quantize", "llama-quantize.exe", "quantize", "quantize.exe"] {
+    for candidate in [
+        "llama-quantize",
+        "llama-quantize.exe",
+        "quantize",
+        "quantize.exe",
+    ] {
         if let Ok(path) = which::which(candidate) {
             return Some(path);
         }

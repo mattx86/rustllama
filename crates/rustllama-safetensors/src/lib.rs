@@ -43,17 +43,14 @@ pub mod mlx;
 pub mod name_map;
 pub use build::{build_llama_model_from_safetensors, BuildError};
 pub use convert::{
-    convert_safetensors_to_gguf_tensors, ConvertError, ConvertedDtype,
-    ConvertedTensor,
+    convert_safetensors_to_gguf_tensors, ConvertError, ConvertedDtype, ConvertedTensor,
 };
-pub use dequant::{
-    dequant_awq_int4_to_f16, dequant_gptq_int4_to_f16, DequantError,
-};
+pub use dequant::{dequant_awq_int4_to_f16, dequant_gptq_int4_to_f16, DequantError};
 pub use hf_config::{parse_hf_config, HfConfigError};
 pub use mlx::{
-    is_mlx_dir, is_mlx_model, load_mlx_dir, load_mlx_from_bytes, write_mlx_dir,
-    MlxError, MlxFullDtype, MlxFullTensor, MlxLayerQuant, MlxMicroQuant,
-    MlxModel, MlxQuantConfig, MlxQuantMode, MlxWriteError, MlxWriteTensor,
+    is_mlx_dir, is_mlx_model, load_mlx_dir, load_mlx_from_bytes, write_mlx_dir, MlxError,
+    MlxFullDtype, MlxFullTensor, MlxLayerQuant, MlxMicroQuant, MlxModel, MlxQuantConfig,
+    MlxQuantMode, MlxWriteError, MlxWriteTensor,
 };
 pub use name_map::{map_gguf_to_hf, map_hf_to_gguf, HfTensor, HfTensorKind};
 
@@ -137,9 +134,7 @@ pub fn detect_format(path: &Path) -> Result<SafetensorsFormat, SafetensorsError>
 
 /// Slice-level variant of [`detect_format`] for tests that mint a
 /// safetensors header in memory without writing it to disk.
-pub fn detect_format_from_bytes(
-    bytes: &[u8],
-) -> Result<SafetensorsFormat, SafetensorsError> {
+pub fn detect_format_from_bytes(bytes: &[u8]) -> Result<SafetensorsFormat, SafetensorsError> {
     let st = SafeTensors::deserialize(bytes)?;
     let names: Vec<&str> = st.names().into_iter().map(|s| s.as_str()).collect();
 
@@ -191,8 +186,7 @@ mod tests {
         let one_fp16 = vec![0u8, 0u8];
         let mut tensors: BTreeMap<String, TensorView<'_>> = BTreeMap::new();
         for name in names {
-            let view = TensorView::new(Dtype::F16, vec![1usize], &one_fp16)
-                .expect("tensor view");
+            let view = TensorView::new(Dtype::F16, vec![1usize], &one_fp16).expect("tensor view");
             tensors.insert((*name).to_string(), view);
         }
         safetensors::serialize(&tensors, &None).expect("serialize")

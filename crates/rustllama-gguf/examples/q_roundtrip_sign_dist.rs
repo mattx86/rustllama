@@ -17,9 +17,13 @@ fn run<E: Fn(&[f32], &mut [u8]), D: Fn(&[u8], &mut [f32])>(
     let mut s = 0x12345u64;
     let mut src = vec![0f32; n];
     for v in src.iter_mut() {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u1 = ((s >> 11) as u32 & 0x00FF_FFFF) as f32 / (1u32 << 24) as f32;
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u2 = ((s >> 11) as u32 & 0x00FF_FFFF) as f32 / (1u32 << 24) as f32;
         let mag = (-2.0 * u1.ln().max(-37.0)).sqrt();
         *v = mag * (2.0 * std::f32::consts::PI * u2).cos() * 0.02;
@@ -41,11 +45,22 @@ fn run<E: Fn(&[f32], &mut [u8]), D: Fn(&[u8], &mut [f32])>(
     for b in 0..N_BLOCKS {
         let block = &dec[b * QK_K..(b + 1) * QK_K];
         let mean: f32 = block.iter().sum::<f32>() / QK_K as f32;
-        if mean < 0.0 { neg_block += 1; } else if mean > 0.0 { pos_block += 1; }
+        if mean < 0.0 {
+            neg_block += 1;
+        } else if mean > 0.0 {
+            pos_block += 1;
+        }
     }
     println!(
         "{:6} +ve={} ({:.1}%) -ve={} ({:.1}%) blocks: {}+/{}- RMSE={:.3e}",
-        name, pos, 100.0 * pos as f32 / n as f32, neg, 100.0 * neg as f32 / n as f32, pos_block, neg_block, mse.sqrt()
+        name,
+        pos,
+        100.0 * pos as f32 / n as f32,
+        neg,
+        100.0 * neg as f32 / n as f32,
+        pos_block,
+        neg_block,
+        mse.sqrt()
     );
 }
 

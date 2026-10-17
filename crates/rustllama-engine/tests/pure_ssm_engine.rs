@@ -50,10 +50,9 @@ fn write_pure_ssm(tag: &str, n_layers: u32) -> std::path::PathBuf {
 fn cpu_engine_loads_and_runs_pure_ssm() {
     let tmp = write_pure_ssm("run", 4);
 
-    let mut cpu = CpuEngine::load_with_options_and_layout(
-        &tmp, 64, true, KvDtype::F32, "contiguous",
-    )
-    .expect("pure-SSM model must load via CpuEngine (hybrid forward, zero attention)");
+    let mut cpu =
+        CpuEngine::load_with_options_and_layout(&tmp, 64, true, KvDtype::F32, "contiguous")
+            .expect("pure-SSM model must load via CpuEngine (hybrid forward, zero attention)");
     cpu.set_prefix_cache(false);
 
     // F10 default-off: lookahead spec is None on a freshly loaded engine.
@@ -86,10 +85,9 @@ fn cpu_engine_loads_and_runs_pure_ssm() {
 #[test]
 fn lookahead_knob_round_trips() {
     let tmp = write_pure_ssm("knob", 2);
-    let mut cpu = CpuEngine::load_with_options_and_layout(
-        &tmp, 64, true, KvDtype::F32, "contiguous",
-    )
-    .expect("load");
+    let mut cpu =
+        CpuEngine::load_with_options_and_layout(&tmp, 64, true, KvDtype::F32, "contiguous")
+            .expect("load");
     assert!(cpu.lookahead_speculative().is_none());
     cpu.set_lookahead_speculative(Some(LookaheadDrafterConfig {
         ngram: 3,

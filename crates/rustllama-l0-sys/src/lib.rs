@@ -239,10 +239,8 @@ pub type ZesDeviceEnumPowerDomainsFn = unsafe extern "C" fn(
 ) -> ZeResult;
 
 /// `ze_result_t zesPowerGetEnergyCounter(zes_pwr_handle_t, zes_power_energy_counter_t*)`.
-pub type ZesPowerGetEnergyCounterFn = unsafe extern "C" fn(
-    pwr: ZesPwrHandle,
-    p_counter: *mut ZesPowerEnergyCounter,
-) -> ZeResult;
+pub type ZesPowerGetEnergyCounterFn =
+    unsafe extern "C" fn(pwr: ZesPwrHandle, p_counter: *mut ZesPowerEnergyCounter) -> ZeResult;
 
 /// `zes_freq_state_t` — current frequency-domain state. The Sysman
 /// spec defines this as a versioned struct (`stype` + `pNext`); we
@@ -277,10 +275,8 @@ pub type ZesDeviceEnumFrequencyDomainsFn = unsafe extern "C" fn(
 ) -> ZeResult;
 
 /// `ze_result_t zesFrequencyGetState(zes_freq_handle_t, zes_freq_state_t*)`.
-pub type ZesFrequencyGetStateFn = unsafe extern "C" fn(
-    freq: ZesFreqHandle,
-    p_state: *mut ZesFreqState,
-) -> ZeResult;
+pub type ZesFrequencyGetStateFn =
+    unsafe extern "C" fn(freq: ZesFreqHandle, p_state: *mut ZesFreqState) -> ZeResult;
 
 /// `zes_engine_handle_t` — handle to one engine group (compute,
 /// render/3D, copy, media, or an "all engines" aggregate).
@@ -309,10 +305,8 @@ pub type ZesDeviceEnumEngineGroupsFn = unsafe extern "C" fn(
 ) -> ZeResult;
 
 /// `ze_result_t zesEngineGetActivity(zes_engine_handle_t, zes_engine_stats_t*)`.
-pub type ZesEngineGetActivityFn = unsafe extern "C" fn(
-    engine: ZesEngineHandle,
-    p_stats: *mut ZesEngineStats,
-) -> ZeResult;
+pub type ZesEngineGetActivityFn =
+    unsafe extern "C" fn(engine: ZesEngineHandle, p_stats: *mut ZesEngineStats) -> ZeResult;
 
 // ============================================================
 // LevelZero — dynamic loader handle
@@ -615,11 +609,7 @@ impl Sysman {
             )?
         };
         let zes_memory_get_state = unsafe {
-            load_sym::<ZesMemoryGetStateFn>(
-                &lib,
-                b"zesMemoryGetState\0",
-                "zesMemoryGetState",
-            )?
+            load_sym::<ZesMemoryGetStateFn>(&lib, b"zesMemoryGetState\0", "zesMemoryGetState")?
         };
         // Optional entry points — try to load, log on miss but don't fail.
         let zes_device_enum_temperature_sensors = unsafe {
@@ -738,15 +728,10 @@ impl Sysman {
         // SAFETY: enum-style two-call idiom; first call queries count
         // with null handles array.
         let r = unsafe {
-            (self.zes_device_enum_memory_modules)(
-                sys_device,
-                &mut mem_count,
-                std::ptr::null_mut(),
-            )
+            (self.zes_device_enum_memory_modules)(sys_device, &mut mem_count, std::ptr::null_mut())
         };
         if r == ZE_RESULT_SUCCESS && mem_count > 0 {
-            let mut handles =
-                vec![ZesMemHandle(std::ptr::null_mut()); mem_count as usize];
+            let mut handles = vec![ZesMemHandle(std::ptr::null_mut()); mem_count as usize];
             let r = unsafe {
                 (self.zes_device_enum_memory_modules)(
                     sys_device,
@@ -763,9 +748,7 @@ impl Sysman {
                         stype: ZES_STRUCTURE_TYPE_MEM_STATE,
                         ..Default::default()
                     };
-                    let r = unsafe {
-                        (self.zes_memory_get_state)(*h, &mut state as *mut _)
-                    };
+                    let r = unsafe { (self.zes_memory_get_state)(*h, &mut state as *mut _) };
                     if r == ZE_RESULT_SUCCESS {
                         total = total.saturating_add(state.size);
                         free = free.saturating_add(state.free);
@@ -787,8 +770,7 @@ impl Sysman {
             let mut temp_count: u32 = 0;
             let r = unsafe { enum_temp(sys_device, &mut temp_count, std::ptr::null_mut()) };
             if r == ZE_RESULT_SUCCESS && temp_count > 0 {
-                let mut handles =
-                    vec![ZesTempHandle(std::ptr::null_mut()); temp_count as usize];
+                let mut handles = vec![ZesTempHandle(std::ptr::null_mut()); temp_count as usize];
                 let r = unsafe { enum_temp(sys_device, &mut temp_count, handles.as_mut_ptr()) };
                 if r == ZE_RESULT_SUCCESS {
                     let mut max_c: Option<f64> = None;
@@ -812,8 +794,7 @@ impl Sysman {
             let mut pwr_count: u32 = 0;
             let r = unsafe { enum_pwr(sys_device, &mut pwr_count, std::ptr::null_mut()) };
             if r == ZE_RESULT_SUCCESS && pwr_count > 0 {
-                let mut handles =
-                    vec![ZesPwrHandle(std::ptr::null_mut()); pwr_count as usize];
+                let mut handles = vec![ZesPwrHandle(std::ptr::null_mut()); pwr_count as usize];
                 let r = unsafe { enum_pwr(sys_device, &mut pwr_count, handles.as_mut_ptr()) };
                 if r == ZE_RESULT_SUCCESS && !handles.is_empty() {
                     // Sum across power domains (package + cores +
@@ -824,8 +805,7 @@ impl Sysman {
                     let mut any = false;
                     for h in &handles {
                         let mut counter = ZesPowerEnergyCounter::default();
-                        let r =
-                            unsafe { get_energy(*h, &mut counter as *mut _) };
+                        let r = unsafe { get_energy(*h, &mut counter as *mut _) };
                         if r == ZE_RESULT_SUCCESS {
                             total_e = total_e.saturating_add(counter.energy_uj);
                             max_ts = max_ts.max(counter.timestamp_us);
@@ -850,8 +830,7 @@ impl Sysman {
             let mut freq_count: u32 = 0;
             let r = unsafe { enum_freq(sys_device, &mut freq_count, std::ptr::null_mut()) };
             if r == ZE_RESULT_SUCCESS && freq_count > 0 {
-                let mut handles =
-                    vec![ZesFreqHandle(std::ptr::null_mut()); freq_count as usize];
+                let mut handles = vec![ZesFreqHandle(std::ptr::null_mut()); freq_count as usize];
                 let r = unsafe { enum_freq(sys_device, &mut freq_count, handles.as_mut_ptr()) };
                 if r == ZE_RESULT_SUCCESS && !handles.is_empty() {
                     // Pick the first frequency domain. On Intel iGPU
@@ -863,8 +842,7 @@ impl Sysman {
                         stype: ZES_STRUCTURE_TYPE_FREQ_STATE,
                         ..Default::default()
                     };
-                    let r =
-                        unsafe { get_freq(handles[0], &mut state as *mut _) };
+                    let r = unsafe { get_freq(handles[0], &mut state as *mut _) };
                     if r == ZE_RESULT_SUCCESS && state.actual.is_finite() && state.actual >= 0.0 {
                         reading.gpu_freq_mhz = Some(state.actual);
                     }
@@ -880,8 +858,7 @@ impl Sysman {
             let mut eng_count: u32 = 0;
             let r = unsafe { enum_eng(sys_device, &mut eng_count, std::ptr::null_mut()) };
             if r == ZE_RESULT_SUCCESS && eng_count > 0 {
-                let mut handles =
-                    vec![ZesEngineHandle(std::ptr::null_mut()); eng_count as usize];
+                let mut handles = vec![ZesEngineHandle(std::ptr::null_mut()); eng_count as usize];
                 let r = unsafe { enum_eng(sys_device, &mut eng_count, handles.as_mut_ptr()) };
                 if r == ZE_RESULT_SUCCESS {
                     // Sum busy time across all engine groups; take the

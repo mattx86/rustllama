@@ -1,4 +1,4 @@
-﻿//! End-to-end tests that `POST /v1/cancel` aborts in-flight streaming
+//! End-to-end tests that `POST /v1/cancel` aborts in-flight streaming
 //! requests on every streaming endpoint (chat, completions, anthropic
 //! messages, ollama chat, ollama generate).
 //!
@@ -14,9 +14,7 @@ use std::time::Duration;
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
 use futures::StreamExt;
-use rustllama_engine::{
-    ChatMessage, Engine, Metrics, SamplingParams, Token, TokenStream,
-};
+use rustllama_engine::{ChatMessage, Engine, Metrics, SamplingParams, Token, TokenStream};
 use rustllama_server::{router, AppState, ServingModel};
 use tower::ServiceExt;
 
@@ -91,11 +89,7 @@ fn build_state() -> AppState {
 /// Boilerplate: drive a streaming request to completion concurrently with a
 /// cancel POST, return the full body text. Returns the captured request id
 /// (from the `X-Rustllama-Request-Id` header) for assertion.
-async fn run_with_cancel(
-    method: &str,
-    uri: &str,
-    body: serde_json::Value,
-) -> (String, String) {
+async fn run_with_cancel(method: &str, uri: &str, body: serde_json::Value) -> (String, String) {
     let state = build_state();
     let app = router(state.clone());
 
@@ -215,8 +209,7 @@ async fn cancel_aborts_ollama_chat_stream() {
     .await;
     // Last NDJSON line should carry done_reason: "cancelled".
     let last_line = text.lines().filter(|l| !l.is_empty()).last().unwrap_or("");
-    let last_json: serde_json::Value =
-        serde_json::from_str(last_line).expect("last line is JSON");
+    let last_json: serde_json::Value = serde_json::from_str(last_line).expect("last line is JSON");
     assert_eq!(
         last_json["done_reason"], "cancelled",
         "expected done_reason=cancelled, got: {last_line}"
@@ -238,8 +231,7 @@ async fn cancel_aborts_ollama_generate_stream() {
     )
     .await;
     let last_line = text.lines().filter(|l| !l.is_empty()).last().unwrap_or("");
-    let last_json: serde_json::Value =
-        serde_json::from_str(last_line).expect("last line is JSON");
+    let last_json: serde_json::Value = serde_json::from_str(last_line).expect("last line is JSON");
     assert_eq!(
         last_json["done_reason"], "cancelled",
         "expected done_reason=cancelled, got: {last_line}"

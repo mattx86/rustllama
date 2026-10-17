@@ -257,9 +257,18 @@ mod tests {
     #[test]
     fn attention_proj_names_round_trip() {
         for (hf, gguf) in [
-            ("model.layers.0.self_attn.q_proj.weight", "blk.0.attn_q.weight"),
-            ("model.layers.0.self_attn.k_proj.weight", "blk.0.attn_k.weight"),
-            ("model.layers.0.self_attn.v_proj.weight", "blk.0.attn_v.weight"),
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                "blk.0.attn_q.weight",
+            ),
+            (
+                "model.layers.0.self_attn.k_proj.weight",
+                "blk.0.attn_k.weight",
+            ),
+            (
+                "model.layers.0.self_attn.v_proj.weight",
+                "blk.0.attn_v.weight",
+            ),
             (
                 "model.layers.0.self_attn.o_proj.weight",
                 "blk.0.attn_output.weight",
@@ -274,9 +283,15 @@ mod tests {
     #[test]
     fn mlp_proj_names_map() {
         for (hf, gguf) in [
-            ("model.layers.5.mlp.gate_proj.weight", "blk.5.ffn_gate.weight"),
+            (
+                "model.layers.5.mlp.gate_proj.weight",
+                "blk.5.ffn_gate.weight",
+            ),
             ("model.layers.5.mlp.up_proj.weight", "blk.5.ffn_up.weight"),
-            ("model.layers.5.mlp.down_proj.weight", "blk.5.ffn_down.weight"),
+            (
+                "model.layers.5.mlp.down_proj.weight",
+                "blk.5.ffn_down.weight",
+            ),
         ] {
             assert_eq!(map_hf_to_gguf(hf).unwrap().gguf_name, gguf, "hf={hf}");
         }
@@ -329,10 +344,7 @@ mod tests {
     fn rotary_emb_inv_freq_is_skipped() {
         // RoPE inv_freq is derived from rope_theta + head_dim at
         // engine init; we don't read or convert it.
-        assert!(map_hf_to_gguf(
-            "model.layers.0.self_attn.rotary_emb.inv_freq"
-        )
-        .is_none());
+        assert!(map_hf_to_gguf("model.layers.0.self_attn.rotary_emb.inv_freq").is_none());
     }
 
     #[test]
@@ -384,15 +396,39 @@ mod tests {
             ("token_embd.weight", "model.embed_tokens.weight"),
             ("output_norm.weight", "model.norm.weight"),
             ("output.weight", "lm_head.weight"),
-            ("blk.0.attn_q.weight", "model.layers.0.self_attn.q_proj.weight"),
-            ("blk.0.attn_k.weight", "model.layers.0.self_attn.k_proj.weight"),
-            ("blk.0.attn_v.weight", "model.layers.0.self_attn.v_proj.weight"),
-            ("blk.0.attn_output.weight", "model.layers.0.self_attn.o_proj.weight"),
-            ("blk.3.ffn_gate.weight", "model.layers.3.mlp.gate_proj.weight"),
+            (
+                "blk.0.attn_q.weight",
+                "model.layers.0.self_attn.q_proj.weight",
+            ),
+            (
+                "blk.0.attn_k.weight",
+                "model.layers.0.self_attn.k_proj.weight",
+            ),
+            (
+                "blk.0.attn_v.weight",
+                "model.layers.0.self_attn.v_proj.weight",
+            ),
+            (
+                "blk.0.attn_output.weight",
+                "model.layers.0.self_attn.o_proj.weight",
+            ),
+            (
+                "blk.3.ffn_gate.weight",
+                "model.layers.3.mlp.gate_proj.weight",
+            ),
             ("blk.3.ffn_up.weight", "model.layers.3.mlp.up_proj.weight"),
-            ("blk.3.ffn_down.weight", "model.layers.3.mlp.down_proj.weight"),
-            ("blk.7.attn_norm.weight", "model.layers.7.input_layernorm.weight"),
-            ("blk.7.ffn_norm.weight", "model.layers.7.post_attention_layernorm.weight"),
+            (
+                "blk.3.ffn_down.weight",
+                "model.layers.3.mlp.down_proj.weight",
+            ),
+            (
+                "blk.7.attn_norm.weight",
+                "model.layers.7.input_layernorm.weight",
+            ),
+            (
+                "blk.7.ffn_norm.weight",
+                "model.layers.7.post_attention_layernorm.weight",
+            ),
             // Qwen2 Q/K/V biases keep the `.bias` suffix.
             ("blk.2.attn_q.bias", "model.layers.2.self_attn.q_proj.bias"),
             ("blk.2.attn_k.bias", "model.layers.2.self_attn.k_proj.bias"),
@@ -420,7 +456,11 @@ mod tests {
             "model.layers.7.self_attn.q_proj.bias",
         ] {
             let gguf = map_hf_to_gguf(hf).unwrap().gguf_name;
-            assert_eq!(map_gguf_to_hf(&gguf).as_deref(), Some(hf), "round-trip hf={hf}");
+            assert_eq!(
+                map_gguf_to_hf(&gguf).as_deref(),
+                Some(hf),
+                "round-trip hf={hf}"
+            );
         }
     }
 

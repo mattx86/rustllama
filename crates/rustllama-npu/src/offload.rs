@@ -102,8 +102,7 @@ type FnShapeFree = unsafe extern "C" fn(*mut OvShape) -> OvStatus;
 type FnTensorCreate = unsafe extern "C" fn(c_int, OvShape, *mut *mut OvTensor) -> OvStatus;
 type FnTensorData = unsafe extern "C" fn(*const OvTensor, *mut *mut c_void) -> OvStatus;
 type FnTensorFree = unsafe extern "C" fn(*mut OvTensor);
-type FnSetInput =
-    unsafe extern "C" fn(*mut OvInferRequest, usize, *const OvTensor) -> OvStatus;
+type FnSetInput = unsafe extern "C" fn(*mut OvInferRequest, usize, *const OvTensor) -> OvStatus;
 type FnGetOutput =
     unsafe extern "C" fn(*const OvInferRequest, usize, *mut *mut OvTensor) -> OvStatus;
 type FnInfer = unsafe extern "C" fn(*mut OvInferRequest) -> OvStatus;
@@ -180,7 +179,12 @@ impl NpuExecutor {
         if core_create(&mut core) != OV_OK || core.is_null() {
             return None;
         }
-        let exec = NpuExecutor { _lib: lib, api, core, matmul_cache: Mutex::new(HashMap::new()) };
+        let exec = NpuExecutor {
+            _lib: lib,
+            api,
+            core,
+            matmul_cache: Mutex::new(HashMap::new()),
+        };
         if !exec.has_npu() {
             return None; // Core created but no NPU device → inert.
         }
@@ -189,7 +193,10 @@ impl NpuExecutor {
 
     /// True if OpenVINO reports an `"NPU"` device.
     unsafe fn has_npu(&self) -> bool {
-        let mut devs = OvAvailableDevices { devices: ptr::null_mut(), size: 0 };
+        let mut devs = OvAvailableDevices {
+            devices: ptr::null_mut(),
+            size: 0,
+        };
         if (self.api.get_devices)(self.core, &mut devs) != OV_OK || devs.devices.is_null() {
             return false;
         }
@@ -211,7 +218,14 @@ impl NpuExecutor {
 
     /// Row-major `C[m,n] = A[m,k] · B[k,n]`, all f32, computed on the NPU.
     /// `None` on any failure (caller falls back to CPU/GPU). Thread-safe.
-    pub fn matmul_f32(&self, a: &[f32], m: usize, k: usize, b: &[f32], n: usize) -> Option<Vec<f32>> {
+    pub fn matmul_f32(
+        &self,
+        a: &[f32],
+        m: usize,
+        k: usize,
+        b: &[f32],
+        n: usize,
+    ) -> Option<Vec<f32>> {
         if a.len() != m * k || b.len() != k * n || m == 0 || k == 0 || n == 0 {
             return None;
         }
@@ -221,7 +235,14 @@ impl NpuExecutor {
     /// `out[n,m] = X[n,k] · W[m,k]ᵀ` (OpenVINO `transpose_b=true`), the layout
     /// `rustllama-models`' batched matvec dispatch uses (weight stored `m×k`,
     /// activations `n×k`, output `n×m`). `None` on any failure. Thread-safe.
-    pub fn matmul_xwt_f32(&self, x: &[f32], n: usize, k: usize, w: &[f32], m: usize) -> Option<Vec<f32>> {
+    pub fn matmul_xwt_f32(
+        &self,
+        x: &[f32],
+        n: usize,
+        k: usize,
+        w: &[f32],
+        m: usize,
+    ) -> Option<Vec<f32>> {
         if x.len() != n * k || w.len() != m * k || m == 0 || k == 0 || n == 0 {
             return None;
         }
@@ -275,7 +296,11 @@ impl NpuExecutor {
             let ok = (self.api.set_input)(req, 0, ta) == OV_OK
                 && (self.api.set_input)(req, 1, tb) == OV_OK
                 && (self.api.infer)(req) == OV_OK;
-            let result = if ok { self.read_output(req, m_bucket * out_cols) } else { None };
+            let result = if ok {
+                self.read_output(req, m_bucket * out_cols)
+            } else {
+                None
+            };
             (self.api.tensor_free)(ta);
             (self.api.tensor_free)(tb);
             result
@@ -364,12 +389,22 @@ impl NpuExecutor {
     /// Allocate an input tensor of `dims` and copy `data` into it.
     unsafe fn make_input(&self, dims: &[usize], data: &[f32]) -> Option<*mut OvTensor> {
         let dims64: Vec<i64> = dims.iter().map(|&d| d as i64).collect();
-        let mut shape = OvShape { rank: 0, dims: ptr::null_mut() };
+        let mut shape = OvShape {
+            rank: 0,
+            dims: ptr::null_mut(),
+        };
         if (self.api.shape_create)(dims64.len() as i64, dims64.as_ptr(), &mut shape) != OV_OK {
             return None;
         }
         let mut t: *mut OvTensor = ptr::null_mut();
-        let st = (self.api.tensor_create)(OV_F32, OvShape { rank: shape.rank, dims: shape.dims }, &mut t);
+        let st = (self.api.tensor_create)(
+            OV_F32,
+            OvShape {
+                rank: shape.rank,
+                dims: shape.dims,
+            },
+            &mut t,
+        );
         // tensor_create copies the shape contents; free our shape buffer.
         (self.api.shape_free)(&mut shape);
         if st != OV_OK || t.is_null() {
@@ -469,7 +504,10 @@ fn matmul_ir(ar: usize, ac: usize, br: usize, bc: usize, transpose_b: bool) -> S
 }
 
 /// Look up one symbol; `None` (not panic) if absent.
-unsafe fn sym<'a, T>(lib: &'a libloading::Library, name: &[u8]) -> Option<libloading::Symbol<'a, T>> {
+unsafe fn sym<'a, T>(
+    lib: &'a libloading::Library,
+    name: &[u8],
+) -> Option<libloading::Symbol<'a, T>> {
     lib.get(name).ok()
 }
 
@@ -480,21 +518,35 @@ use crate::NpuParity;
 /// failure). Thresholds mirror the GPU parity harness (cos ≥ 0.9999, max_rel
 /// small) — the NPU does f32 so only FMA/reassociation differences are expected.
 pub(crate) fn matmul_parity() -> NpuParity {
-    let skip = NpuParity { supported: false, cos: 0.0, max_rel: 0.0, pass: false };
+    let skip = NpuParity {
+        supported: false,
+        cos: 0.0,
+        max_rel: 0.0,
+        pass: false,
+    };
     let Some(exec) = NpuExecutor::new() else {
         return skip;
     };
     // Small, deterministic pseudo-random inputs (no rng dep).
     let (m, k, n) = (3usize, 5usize, 4usize);
-    let a: Vec<f32> = (0..m * k).map(|i| (((i * 2654435761) >> 8) as f32 % 17.0) - 8.0).collect();
-    let b: Vec<f32> = (0..k * n).map(|i| (((i * 40503) >> 4) as f32 % 13.0) - 6.0).collect();
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| (((i * 2654435761) >> 8) as f32 % 17.0) - 8.0)
+        .collect();
+    let b: Vec<f32> = (0..k * n)
+        .map(|i| (((i * 40503) >> 4) as f32 % 13.0) - 6.0)
+        .collect();
 
     let Some(got) = exec.matmul_f32(&a, m, k, &b, n) else {
         // An NPU is present but the offload FAILED (bad IR / compile / infer).
         // Surface it as a correctness failure, not a clean SKIP, so the
         // write-blind path gets investigated on hardware rather than silently
         // looking "unsupported".
-        return NpuParity { supported: true, cos: 0.0, max_rel: f64::INFINITY, pass: false };
+        return NpuParity {
+            supported: true,
+            cos: 0.0,
+            max_rel: f64::INFINITY,
+            pass: false,
+        };
     };
     // CPU reference.
     let mut want = vec![0f32; m * n];
@@ -516,9 +568,18 @@ pub(crate) fn matmul_parity() -> NpuParity {
         let denom = y.abs().max(1e-6);
         max_rel = max_rel.max((x - y).abs() / denom);
     }
-    let cos = if na > 0.0 && nb > 0.0 { dot / (na.sqrt() * nb.sqrt()) } else { 0.0 };
+    let cos = if na > 0.0 && nb > 0.0 {
+        dot / (na.sqrt() * nb.sqrt())
+    } else {
+        0.0
+    };
     let pass = cos >= 0.9999 && max_rel <= 1e-2;
-    NpuParity { supported: true, cos, max_rel, pass }
+    NpuParity {
+        supported: true,
+        cos,
+        max_rel,
+        pass,
+    }
 }
 
 #[cfg(test)]

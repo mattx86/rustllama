@@ -190,11 +190,7 @@ pub async fn completions(
     let n_choices = req.n.unwrap_or(1).max(1);
     let best_of = req.best_of.unwrap_or(n_choices);
     if best_of < n_choices {
-        return (
-            StatusCode::BAD_REQUEST,
-            "best_of must be >= n".to_string(),
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, "best_of must be >= n".to_string()).into_response();
     }
     let n_candidates = n_choices.max(best_of);
     if n_candidates > 1 && req.stream {
@@ -225,7 +221,10 @@ pub async fn completions(
         Err(be) => return be.into_response(),
     };
     let mut sampling = build_sampling(&req);
-    let model = req.model.clone().unwrap_or_else(|| serving.model_id.clone());
+    let model = req
+        .model
+        .clone()
+        .unwrap_or_else(|| serving.model_id.clone());
 
     let shared_cpu = match serving.cpu_engine.as_ref() {
         Some(e) => e.clone(),
@@ -276,11 +275,7 @@ pub async fn completions(
     let prompt_ids: Vec<u32> = if doc_chunks.is_empty() {
         query_ids.clone()
     } else {
-        let mut v: Vec<u32> = doc_chunks
-            .iter()
-            .flatten()
-            .map(|&t| t as u32)
-            .collect();
+        let mut v: Vec<u32> = doc_chunks.iter().flatten().map(|&t| t as u32).collect();
         v.extend_from_slice(&query_ids);
         v
     };
@@ -323,8 +318,7 @@ pub async fn completions(
     if req.stream {
         let id = request_id();
         let cancel_guard = state.register_cancel(&id);
-        let fingerprint =
-            crate::system_fingerprint(&state.version, &model, kv_dtype_label(&cpu));
+        let fingerprint = crate::system_fingerprint(&state.version, &model, kv_dtype_label(&cpu));
         return completions_stream(
             cpu,
             prompt_ids,
@@ -390,8 +384,7 @@ pub async fn completions(
             })
             .collect();
         let stats = cpu.last_request_stats();
-        let fingerprint =
-            crate::system_fingerprint(&state.version, &model, kv_dtype_label(&cpu));
+        let fingerprint = crate::system_fingerprint(&state.version, &model, kv_dtype_label(&cpu));
         return Json(CompletionResponse {
             id: request_id(),
             object: "text_completion",
@@ -460,17 +453,14 @@ pub async fn completions(
             })
             .collect();
         let stats = cpu.last_request_stats();
-        let fingerprint =
-            crate::system_fingerprint(&state.version, &model, kv_dtype_label(&cpu));
+        let fingerprint = crate::system_fingerprint(&state.version, &model, kv_dtype_label(&cpu));
         return Json(CompletionResponse {
             id: request_id(),
             object: "text_completion",
             created: unix_ts(),
             model,
             choices,
-            usage: Some(
-                Usage::new(prompt_tokens, total_completion_tokens).with_stats(&stats),
-            ),
+            usage: Some(Usage::new(prompt_tokens, total_completion_tokens).with_stats(&stats)),
             system_fingerprint: fingerprint,
         })
         .into_response();
@@ -526,7 +516,9 @@ pub async fn completions(
         .await;
         let text = match res {
             Ok(Ok(t)) => t,
-            Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Ok(Err(e)) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
         let completion_tokens = cpu
@@ -554,7 +546,9 @@ pub async fn completions(
         .await;
         let pairs = match res {
             Ok(Ok(p)) => p,
-            Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Ok(Err(e)) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
 
@@ -660,15 +654,16 @@ pub async fn completions(
                 // the endpoint's exact tokenization (no BOS; FIM specials) is
                 // what the target verifies. Takes precedence over MTP/n-gram.
                 let (draft, k) = spec_draft.expect("spec_mode==Draft implies spec_draft");
-                let prompt_ids_i32: Vec<i32> =
-                    prompt_ids.iter().map(|&v| v as i32).collect();
-                let mut st = match cpu
-                    .speculate_draft_stream_from_ids(prompt_ids_i32, draft, k, sampling.clone())
-                {
+                let prompt_ids_i32: Vec<i32> = prompt_ids.iter().map(|&v| v as i32).collect();
+                let mut st = match cpu.speculate_draft_stream_from_ids(
+                    prompt_ids_i32,
+                    draft,
+                    k,
+                    sampling.clone(),
+                ) {
                     Ok(st) => st,
                     Err(e) => {
-                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-                            .into_response()
+                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
                     }
                 };
                 use futures::StreamExt;
@@ -692,17 +687,16 @@ pub async fn completions(
             CompletionSpecMode::Mtp => {
                 // MTP / NextN self-speculative path — same draining shape as
                 // the n-gram arm, but drafts come from the model's NextN head.
-                let prompt_ids_i32: Vec<i32> =
-                    prompt_ids.iter().map(|&v| v as i32).collect();
-                let mut st = match cpu
-                    .speculate_mtp_stream_from_ids(prompt_ids_i32, sampling.clone(), None)
-                {
-                    Ok(st) => st,
-                    Err(e) => {
-                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-                            .into_response()
-                    }
-                };
+                let prompt_ids_i32: Vec<i32> = prompt_ids.iter().map(|&v| v as i32).collect();
+                let mut st =
+                    match cpu.speculate_mtp_stream_from_ids(prompt_ids_i32, sampling.clone(), None)
+                    {
+                        Ok(st) => st,
+                        Err(e) => {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                                .into_response()
+                        }
+                    };
                 use futures::StreamExt;
                 let mut text = String::new();
                 while let Some(item) = st.next().await {
@@ -728,17 +722,16 @@ pub async fn completions(
                 // runtime. Stop strings are honored inside the stream
                 // (engine-side), same as the classic `generate_*` methods.
                 let ng = spec_ngram.expect("spec_mode==Ngram implies spec_ngram");
-                let prompt_ids_i32: Vec<i32> =
-                    prompt_ids.iter().map(|&v| v as i32).collect();
-                let mut st = match cpu
-                    .speculate_ngram_stream_from_ids(prompt_ids_i32, ng, sampling.clone())
-                {
-                    Ok(st) => st,
-                    Err(e) => {
-                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-                            .into_response()
-                    }
-                };
+                let prompt_ids_i32: Vec<i32> = prompt_ids.iter().map(|&v| v as i32).collect();
+                let mut st =
+                    match cpu.speculate_ngram_stream_from_ids(prompt_ids_i32, ng, sampling.clone())
+                    {
+                        Ok(st) => st,
+                        Err(e) => {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                                .into_response()
+                        }
+                    };
                 use futures::StreamExt;
                 let mut text = String::new();
                 while let Some(item) = st.next().await {
@@ -769,12 +762,10 @@ pub async fn completions(
                 let text = match result {
                     Ok(Ok(t)) => t,
                     Ok(Err(e)) => {
-                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-                            .into_response()
+                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
                     }
                     Err(e) => {
-                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-                            .into_response()
+                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
                     }
                 };
 
@@ -797,8 +788,7 @@ pub async fn completions(
     let echo_prefix = prompt_echo_override.unwrap_or(prompt_for_echo);
     let full_text = format!("{}{}", echo_prefix, text);
     let stats = cpu.last_request_stats();
-    let fingerprint =
-        crate::system_fingerprint(&state.version, &model, kv_dtype_label(&cpu));
+    let fingerprint = crate::system_fingerprint(&state.version, &model, kv_dtype_label(&cpu));
     Json(CompletionResponse {
         id: request_id(),
         object: "text_completion",
@@ -836,9 +826,7 @@ fn build_prompt_ids(
                  Use a coding-specific model (Qwen2.5-Coder, DeepSeek-Coder, StarCoder, ...)"
                     .to_string()
             })?;
-            let prefix_ids = tokenizer
-                .encode(prompt, false)
-                .map_err(|e| e.to_string())?;
+            let prefix_ids = tokenizer.encode(prompt, false).map_err(|e| e.to_string())?;
             let suffix_ids = tokenizer
                 .encode(suffix_text, false)
                 .map_err(|e| e.to_string())?;
@@ -926,9 +914,7 @@ fn build_sampling(req: &CompletionRequest) -> SamplingParams {
     // text was already validated (clean 400) at the request boundary; here it is
     // compiled by the engine when the sampler builds its mask.
     if let Some(g) = req.grammar.as_ref().filter(|g| !g.trim().is_empty()) {
-        s.grammar = Some(rustllama_engine::GrammarKind::Gbnf {
-            grammar: g.clone(),
-        });
+        s.grammar = Some(rustllama_engine::GrammarKind::Gbnf { grammar: g.clone() });
     }
     s
 }
@@ -1056,7 +1042,9 @@ fn generate_beam_completions(
         .map_err(|e| e.to_string())?;
     let mut out = Vec::with_capacity(beams.len());
     for b in &beams {
-        let text = tokenizer.decode(&b.tokens, true).map_err(|e| e.to_string())?;
+        let text = tokenizer
+            .decode(&b.tokens, true)
+            .map_err(|e| e.to_string())?;
         out.push(BeamCompletion {
             text,
             completion_tokens: b.tokens.len() as u32,
@@ -1516,7 +1504,10 @@ mod tests {
         assert_eq!(&got[1..1 + prefix_ids.len()], prefix_ids.as_slice());
         let off = 1 + prefix_ids.len();
         assert_eq!(got[off], fim.suffix);
-        assert_eq!(&got[off + 1..off + 1 + suffix_ids.len()], suffix_ids.as_slice());
+        assert_eq!(
+            &got[off + 1..off + 1 + suffix_ids.len()],
+            suffix_ids.as_slice()
+        );
         assert_eq!(got[off + 1 + suffix_ids.len()], fim.middle);
         assert_eq!(got.len(), prefix_ids.len() + suffix_ids.len() + 3);
         let _ = std::fs::remove_file(&path);
@@ -1544,7 +1535,10 @@ mod tests {
         let req: CompletionRequest =
             serde_json::from_value(value).expect("CompletionRequest parses");
         assert_eq!(req.n, None, "absent n must be None (handler defaults to 1)");
-        assert_eq!(req.best_of, None, "absent best_of must be None (defaults to n)");
+        assert_eq!(
+            req.best_of, None,
+            "absent best_of must be None (defaults to n)"
+        );
     }
 
     #[test]
@@ -1570,7 +1564,10 @@ mod tests {
         let value = serde_json::json!({ "prompt": "hi", "max_tokens": 4 });
         let req: CompletionRequest =
             serde_json::from_value(value).expect("CompletionRequest parses");
-        assert_eq!(req.num_beams, None, "absent num_beams must be None (defaults to 1)");
+        assert_eq!(
+            req.num_beams, None,
+            "absent num_beams must be None (defaults to 1)"
+        );
         assert_eq!(req.length_penalty, None);
         assert_eq!(req.early_stopping, None);
     }

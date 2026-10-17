@@ -58,7 +58,11 @@ const BLOCK_TQ2_0_BYTES: usize = 66;
 /// shift position; reconstruction subtracts 1 to recover
 /// `{-1, 0, +1}`.
 pub fn encode_tq2_0(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK_K, 0, "encode_tq2_0: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_tq2_0: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -109,7 +113,11 @@ const BLOCK_TQ1_0_BYTES: usize = 54;
 /// trit (`v *= 3`) before scaling so its digits land in the top 4
 /// positions, matching `quantize_row_tq1_0_ref`.
 pub fn encode_tq1_0(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK_K, 0, "encode_tq1_0: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_tq1_0: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -264,14 +272,14 @@ mod tests {
         src[0] = amp; // trit 2
         src[64] = -amp; // trit 0
         src[96] = amp; // trit 2
-        // src[32], src[128] stay 0.0 ⇒ trit 1.
+                       // src[32], src[128] stay 0.0 ⇒ trit 1.
 
         // qh[0] packs output elements {240, 244, 248, 252}, MSB = 240.
         // Trits [0, 2, 1, 2] ⇒ -amp, +amp, 0, +amp.
         src[240] = -amp; // trit 0
         src[244] = amp; // trit 2
         src[252] = amp; // trit 2
-        // src[248] stays 0.0 ⇒ trit 1.
+                        // src[248] stays 0.0 ⇒ trit 1.
 
         let mut enc = vec![0u8; BLOCK_TQ1_0_BYTES];
         encode_tq1_0(&src, &mut enc);

@@ -242,7 +242,10 @@ fn softmax_argmax(scores: &[f32]) -> (Vec<f32>, usize) {
     let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
-    let probs: Vec<f32> = exps.iter().map(|e| if sum > 0.0 { e / sum } else { 0.0 }).collect();
+    let probs: Vec<f32> = exps
+        .iter()
+        .map(|e| if sum > 0.0 { e / sum } else { 0.0 })
+        .collect();
     let best = probs
         .iter()
         .enumerate()
@@ -366,9 +369,7 @@ async fn run_decision(
                     .into_response())
             }
             Err(e) => {
-                return Err(
-                    (StatusCode::BAD_REQUEST, format!("encode option: {e}")).into_response(),
-                )
+                return Err((StatusCode::BAD_REQUEST, format!("encode option: {e}")).into_response())
             }
         }
     }
@@ -391,11 +392,18 @@ async fn run_decision(
     let scores = tokio::task::spawn_blocking(move || cpu.score_continuations(&ctx, &opts))
         .await
         .map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("decision task panicked: {e}"))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("decision task panicked: {e}"),
+            )
                 .into_response()
         })?
         .map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("scoring failed: {e}")).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("scoring failed: {e}"),
+            )
+                .into_response()
         })?;
     drop(permit);
 
@@ -470,7 +478,8 @@ async fn resolve_context_text(
                 tokenizer
                     .render_chat_messages_json(&json_msgs, true, Some(t))
                     .map_err(|e| {
-                        (StatusCode::BAD_REQUEST, format!("chat render failed: {e}")).into_response()
+                        (StatusCode::BAD_REQUEST, format!("chat render failed: {e}"))
+                            .into_response()
                     })
             }
             None => {
@@ -499,7 +508,10 @@ pub async fn choice(State(state): State<AppState>, Json(req): Json<DecideRequest
     let options = match req.options.clone() {
         Some(o) if !o.is_empty() => o,
         _ => {
-            return (StatusCode::BAD_REQUEST, "`options` is required for /decide/choice")
+            return (
+                StatusCode::BAD_REQUEST,
+                "`options` is required for /decide/choice",
+            )
                 .into_response()
         }
     };
@@ -507,7 +519,10 @@ pub async fn choice(State(state): State<AppState>, Json(req): Json<DecideRequest
         Ok(o) => {
             let (entropy, margin, effective_options) = uncertainty_signals(&o.probs);
             let best_prob = o.probs.get(o.best).copied().unwrap_or(0.0);
-            let declined = req.abstain_below.map(|thr| best_prob < thr).unwrap_or(false);
+            let declined = req
+                .abstain_below
+                .map(|thr| best_prob < thr)
+                .unwrap_or(false);
             // Split-conformal prediction set: only when `coverage` requested and
             // a fitted quantile exists for it. Smallest set whose members meet
             // the `1 − q` calibrated-probability bar.
@@ -554,7 +569,10 @@ pub async fn score(State(state): State<AppState>, Json(req): Json<DecideRequest>
     let levels = match req.levels.clone() {
         Some(l) if !l.is_empty() => l,
         _ => {
-            return (StatusCode::BAD_REQUEST, "`levels` is required for /decide/score")
+            return (
+                StatusCode::BAD_REQUEST,
+                "`levels` is required for /decide/score",
+            )
                 .into_response()
         }
     };
@@ -563,8 +581,10 @@ pub async fn score(State(state): State<AppState>, Json(req): Json<DecideRequest>
             let probs = &o.probs;
             // Expected value: if every level parses as a number, weight by
             // that; otherwise weight by the level's index on the scale.
-            let numeric: Option<Vec<f32>> =
-                levels.iter().map(|l| l.trim().parse::<f32>().ok()).collect();
+            let numeric: Option<Vec<f32>> = levels
+                .iter()
+                .map(|l| l.trim().parse::<f32>().ok())
+                .collect();
             let expected: f32 = match &numeric {
                 Some(nums) => probs.iter().zip(nums).map(|(p, n)| p * n).sum(),
                 None => probs.iter().enumerate().map(|(i, p)| p * i as f32).sum(),
@@ -580,11 +600,13 @@ pub async fn score(State(state): State<AppState>, Json(req): Json<DecideRequest>
                         .map(|(p, n)| *p * (*n - expected).powi(2))
                         .sum();
                     let stddev = variance.max(0.0).sqrt();
-                    let mut pairs: Vec<(f32, f32)> =
-                        nums.iter().zip(probs.iter()).map(|(&n, &p)| (n, p)).collect();
-                    pairs.sort_by(|a, b| {
-                        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    let mut pairs: Vec<(f32, f32)> = nums
+                        .iter()
+                        .zip(probs.iter())
+                        .map(|(&n, &p)| (n, p))
+                        .collect();
+                    pairs
+                        .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
                     let quantile = |q: f32| -> f32 {
                         let mut cum = 0.0f32;
                         let mut last = pairs.first().map(|p| p.0).unwrap_or(0.0);
@@ -603,7 +625,10 @@ pub async fn score(State(state): State<AppState>, Json(req): Json<DecideRequest>
             };
             let (entropy, margin, effective_options) = uncertainty_signals(probs);
             let best_prob = probs.get(o.best).copied().unwrap_or(0.0);
-            let declined = req.abstain_below.map(|thr| best_prob < thr).unwrap_or(false);
+            let declined = req
+                .abstain_below
+                .map(|thr| best_prob < thr)
+                .unwrap_or(false);
             Json(ScoreResponse {
                 value: levels[o.best].clone(),
                 index: o.best,
@@ -627,7 +652,10 @@ pub async fn score(State(state): State<AppState>, Json(req): Json<DecideRequest>
 
 // ----- /v1/decide/boolean ----------------------------------------------------
 
-pub async fn boolean(State(state): State<AppState>, Json(mut req): Json<DecideRequest>) -> Response {
+pub async fn boolean(
+    State(state): State<AppState>,
+    Json(mut req): Json<DecideRequest>,
+) -> Response {
     // Fold the yes/no question into the context so the options are scored as
     // its answer, then score a shared single-token-ish affirmative/negative
     // pair (leading space suits byte-level BPE continuations).
@@ -645,7 +673,10 @@ pub async fn boolean(State(state): State<AppState>, Json(mut req): Json<DecideRe
             let p_yes = o.probs.first().copied().unwrap_or(0.0);
             let confidence = p_yes.max(1.0 - p_yes);
             let (entropy, margin, effective_options) = uncertainty_signals(&o.probs);
-            let declined = req.abstain_below.map(|thr| confidence < thr).unwrap_or(false);
+            let declined = req
+                .abstain_below
+                .map(|thr| confidence < thr)
+                .unwrap_or(false);
             Json(BooleanResponse {
                 value: p_yes >= 0.5,
                 probability: p_yes,
@@ -668,7 +699,10 @@ pub async fn rank(State(state): State<AppState>, Json(req): Json<DecideRequest>)
     let options = match req.options.clone() {
         Some(o) if !o.is_empty() => o,
         _ => {
-            return (StatusCode::BAD_REQUEST, "`options` is required for /decide/rank")
+            return (
+                StatusCode::BAD_REQUEST,
+                "`options` is required for /decide/rank",
+            )
                 .into_response()
         }
     };
@@ -676,7 +710,10 @@ pub async fn rank(State(state): State<AppState>, Json(req): Json<DecideRequest>)
         Ok(o) => {
             let (entropy, margin, effective_options) = uncertainty_signals(&o.probs);
             let best_prob = o.probs.get(o.best).copied().unwrap_or(0.0);
-            let declined = req.abstain_below.map(|thr| best_prob < thr).unwrap_or(false);
+            let declined = req
+                .abstain_below
+                .map(|thr| best_prob < thr)
+                .unwrap_or(false);
             let mut ranking: Vec<RankItem> = options
                 .iter()
                 .enumerate()
@@ -712,7 +749,10 @@ pub async fn labels(State(state): State<AppState>, Json(req): Json<DecideRequest
     let labels = match req.labels.clone() {
         Some(l) if !l.is_empty() => l,
         _ => {
-            return (StatusCode::BAD_REQUEST, "`labels` is required for /decide/labels")
+            return (
+                StatusCode::BAD_REQUEST,
+                "`labels` is required for /decide/labels",
+            )
                 .into_response()
         }
     };
@@ -737,7 +777,10 @@ pub async fn labels(State(state): State<AppState>, Json(req): Json<DecideRequest
                 let p_yes = o.probs.first().copied().unwrap_or(0.0);
                 let confidence = p_yes.max(1.0 - p_yes);
                 let (entropy, margin, effective_options) = uncertainty_signals(&o.probs);
-                let declined = req.abstain_below.map(|thr| confidence < thr).unwrap_or(false);
+                let declined = req
+                    .abstain_below
+                    .map(|thr| confidence < thr)
+                    .unwrap_or(false);
                 results.push(LabelResult {
                     label: label.clone(),
                     value: p_yes >= 0.5,
@@ -818,7 +861,10 @@ pub async fn tool(State(state): State<AppState>, Json(req): Json<DecideRequest>)
     let tools = match req.tools.as_ref() {
         Some(t) => t.clone(),
         None => {
-            return (StatusCode::BAD_REQUEST, "`tools` is required for /decide/tool")
+            return (
+                StatusCode::BAD_REQUEST,
+                "`tools` is required for /decide/tool",
+            )
                 .into_response()
         }
     };
@@ -844,16 +890,13 @@ pub async fn tool(State(state): State<AppState>, Json(req): Json<DecideRequest>)
     // form — mirrors the multi-format handling the chat tool path does. Falls
     // back to a neutral JSON opener that fits every format when the template
     // is unrecognized / absent.
-    let template = state
-        .resolve(req.model.as_deref())
-        .await
-        .and_then(|s| {
-            s.cpu_engine
-                .as_ref()
-                .and_then(|c| c.tokenizer())
-                .and_then(|t| t.chat_template())
-                .map(|t| t.to_string())
-        });
+    let template = state.resolve(req.model.as_deref()).await.and_then(|s| {
+        s.cpu_engine
+            .as_ref()
+            .and_then(|c| c.tokenizer())
+            .and_then(|t| t.chat_template())
+            .map(|t| t.to_string())
+    });
     let opener = tool_call_opener(template.as_deref());
     // Render the prompt with the tools exposed, then fold the derived opener
     // so each option scores just the tool NAME (the discriminating suffix),
@@ -1030,7 +1073,10 @@ pub async fn sequence_score(
     let (total, per_token) = match res {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("scoring failed: {e}"))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("scoring failed: {e}"),
+            )
                 .into_response()
         }
         Err(e) => {

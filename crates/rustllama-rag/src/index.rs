@@ -88,11 +88,7 @@ impl RagIndex {
     /// Normalizes the embedding in place to L2 unit length so
     /// search reduces to a dot product. Returns
     /// `Err(WrongDimension)` if `embedding.len() != embedding_dim`.
-    pub fn add(
-        &mut self,
-        chunk: ChunkSpec,
-        embedding: Vec<f32>,
-    ) -> Result<(), IndexError> {
+    pub fn add(&mut self, chunk: ChunkSpec, embedding: Vec<f32>) -> Result<(), IndexError> {
         if embedding.len() != self.embedding_dim {
             return Err(IndexError::WrongDimension {
                 expected: self.embedding_dim,
@@ -184,18 +180,25 @@ impl RagIndex {
         let f = std::fs::File::create(path).map_err(IndexError::Io)?;
         let mut w = std::io::BufWriter::new(f);
         w.write_all(RAG_INDEX_MAGIC).map_err(IndexError::Io)?;
-        w.write_all(&RAG_INDEX_VERSION.to_le_bytes()).map_err(IndexError::Io)?;
-        w.write_all(&(self.embedding_dim as u32).to_le_bytes()).map_err(IndexError::Io)?;
-        w.write_all(&(self.chunks.len() as u64).to_le_bytes()).map_err(IndexError::Io)?;
+        w.write_all(&RAG_INDEX_VERSION.to_le_bytes())
+            .map_err(IndexError::Io)?;
+        w.write_all(&(self.embedding_dim as u32).to_le_bytes())
+            .map_err(IndexError::Io)?;
+        w.write_all(&(self.chunks.len() as u64).to_le_bytes())
+            .map_err(IndexError::Io)?;
         for c in &self.chunks {
             let path_str = c.source_path.to_string_lossy();
             let path_bytes = path_str.as_bytes();
-            w.write_all(&(path_bytes.len() as u32).to_le_bytes()).map_err(IndexError::Io)?;
+            w.write_all(&(path_bytes.len() as u32).to_le_bytes())
+                .map_err(IndexError::Io)?;
             w.write_all(path_bytes).map_err(IndexError::Io)?;
-            w.write_all(&(c.line_start as u32).to_le_bytes()).map_err(IndexError::Io)?;
-            w.write_all(&(c.line_end as u32).to_le_bytes()).map_err(IndexError::Io)?;
+            w.write_all(&(c.line_start as u32).to_le_bytes())
+                .map_err(IndexError::Io)?;
+            w.write_all(&(c.line_end as u32).to_le_bytes())
+                .map_err(IndexError::Io)?;
             let text_bytes = c.text.as_bytes();
-            w.write_all(&(text_bytes.len() as u32).to_le_bytes()).map_err(IndexError::Io)?;
+            w.write_all(&(text_bytes.len() as u32).to_le_bytes())
+                .map_err(IndexError::Io)?;
             w.write_all(text_bytes).map_err(IndexError::Io)?;
             // f32 LE — bytemuck would do the cast for free but a small
             // loop avoids the dep here. Embedding vector length is
@@ -237,17 +240,15 @@ impl RagIndex {
             let path_len = read_u32_le(&mut r)? as usize;
             let mut path_buf = vec![0u8; path_len];
             r.read_exact(&mut path_buf).map_err(IndexError::Io)?;
-            let path_str = String::from_utf8(path_buf).map_err(|_| {
-                IndexError::CorruptHeader("chunk source_path is not valid UTF-8")
-            })?;
+            let path_str = String::from_utf8(path_buf)
+                .map_err(|_| IndexError::CorruptHeader("chunk source_path is not valid UTF-8"))?;
             let line_start = read_u32_le(&mut r)? as usize;
             let line_end = read_u32_le(&mut r)? as usize;
             let text_len = read_u32_le(&mut r)? as usize;
             let mut text_buf = vec![0u8; text_len];
             r.read_exact(&mut text_buf).map_err(IndexError::Io)?;
-            let text = String::from_utf8(text_buf).map_err(|_| {
-                IndexError::CorruptHeader("chunk text is not valid UTF-8")
-            })?;
+            let text = String::from_utf8(text_buf)
+                .map_err(|_| IndexError::CorruptHeader("chunk text is not valid UTF-8"))?;
             let mut embedding = vec![0f32; embedding_dim];
             let mut emb_bytes = vec![0u8; embedding_dim * 4];
             r.read_exact(&mut emb_bytes).map_err(IndexError::Io)?;
@@ -272,11 +273,7 @@ impl RagIndex {
     /// Top-`k` nearest-neighbor search. Returns at most `k` hits
     /// ordered by descending cosine similarity. Empty index returns
     /// an empty Vec.
-    pub fn search(
-        &self,
-        query: &[f32],
-        k: usize,
-    ) -> Result<Vec<SearchResult>, IndexError> {
+    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>, IndexError> {
         if query.len() != self.embedding_dim {
             return Err(IndexError::WrongDimension {
                 expected: self.embedding_dim,
@@ -298,9 +295,7 @@ impl RagIndex {
             .map(|(i, c)| (dot(&q_norm, &c.embedding), i))
             .collect();
         // Sort descending by score.
-        scored.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         Ok(scored
             .into_iter()
             .take(k)
@@ -314,9 +309,7 @@ impl RagIndex {
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
-    #[error(
-        "embedding dimension mismatch: index expects {expected} but got {got}"
-    )]
+    #[error("embedding dimension mismatch: index expects {expected} but got {got}")]
     WrongDimension { expected: usize, got: usize },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -386,7 +379,10 @@ mod tests {
             .add(chunk("a.rs", "hi"), vec![1.0, 0.0])
             .expect_err("should reject");
         match err {
-            IndexError::WrongDimension { expected: 4, got: 2 } => {}
+            IndexError::WrongDimension {
+                expected: 4,
+                got: 2,
+            } => {}
             other => panic!("expected WrongDimension, got {other:?}"),
         }
     }
@@ -396,7 +392,10 @@ mod tests {
         let idx = RagIndex::new(4);
         let err = idx.search(&[1.0, 0.0], 1).expect_err("should reject");
         match err {
-            IndexError::WrongDimension { expected: 4, got: 2 } => {}
+            IndexError::WrongDimension {
+                expected: 4,
+                got: 2,
+            } => {}
             other => panic!("expected WrongDimension, got {other:?}"),
         }
     }
@@ -405,9 +404,12 @@ mod tests {
     fn search_orders_by_cosine_descending() {
         let mut idx = RagIndex::new(3);
         // Three chunks with very different embeddings.
-        idx.add(chunk("a.rs", "axis-x"), vec![1.0, 0.0, 0.0]).unwrap();
-        idx.add(chunk("b.rs", "axis-y"), vec![0.0, 1.0, 0.0]).unwrap();
-        idx.add(chunk("c.rs", "axis-z"), vec![0.0, 0.0, 1.0]).unwrap();
+        idx.add(chunk("a.rs", "axis-x"), vec![1.0, 0.0, 0.0])
+            .unwrap();
+        idx.add(chunk("b.rs", "axis-y"), vec![0.0, 1.0, 0.0])
+            .unwrap();
+        idx.add(chunk("c.rs", "axis-z"), vec![0.0, 0.0, 1.0])
+            .unwrap();
         // Query points toward x — closest is a.rs.
         let hits = idx.search(&[1.0, 0.1, 0.0], 3).unwrap();
         assert_eq!(hits.len(), 3);
@@ -503,9 +505,12 @@ mod tests {
         let path = dir.path().join("rag.idx");
 
         let mut idx = RagIndex::new(3);
-        idx.add(chunk("src/a.rs", "alpha"), vec![1.0, 0.0, 0.0]).unwrap();
-        idx.add(chunk("src/b.rs", "beta"), vec![0.0, 1.0, 0.0]).unwrap();
-        idx.add(chunk("src/c.rs", "gamma"), vec![0.0, 0.0, 1.0]).unwrap();
+        idx.add(chunk("src/a.rs", "alpha"), vec![1.0, 0.0, 0.0])
+            .unwrap();
+        idx.add(chunk("src/b.rs", "beta"), vec![0.0, 1.0, 0.0])
+            .unwrap();
+        idx.add(chunk("src/c.rs", "gamma"), vec![0.0, 0.0, 1.0])
+            .unwrap();
         idx.save(&path).expect("save should succeed");
 
         let loaded = RagIndex::load(&path).expect("load should succeed");
@@ -547,7 +552,10 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes()); // chunk_count
         std::fs::write(&path, &bytes).unwrap();
         match RagIndex::load(&path).expect_err("should reject") {
-            IndexError::UnsupportedVersion { got: 999, supported: 1 } => {}
+            IndexError::UnsupportedVersion {
+                got: 999,
+                supported: 1,
+            } => {}
             other => panic!("expected UnsupportedVersion, got {other:?}"),
         }
     }

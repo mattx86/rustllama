@@ -43,8 +43,7 @@ fn read_shape(s: &serde_json::Value, key: &str) -> usize {
     s.get(key)
         .unwrap_or_else(|| panic!("shapes.{key} missing"))
         .as_u64()
-        .unwrap_or_else(|| panic!("shapes.{key} not u64"))
-        as usize
+        .unwrap_or_else(|| panic!("shapes.{key} not u64")) as usize
 }
 
 #[test]
@@ -61,8 +60,7 @@ fn deltanet_layer_forward_matches_python_reference() {
         );
     }
     let f = File::open(&path).expect("open fixture");
-    let v: serde_json::Value =
-        serde_json::from_reader(BufReader::new(f)).expect("parse fixture");
+    let v: serde_json::Value = serde_json::from_reader(BufReader::new(f)).expect("parse fixture");
 
     let shapes = v.get("shapes").expect("shapes");
     let d_model = read_shape(shapes, "d_model");
@@ -99,20 +97,52 @@ fn deltanet_layer_forward_matches_python_reference() {
 
     let mut out_a = vec![0.0f32; d_model];
     delta_net_layer_forward_f32(
-        &hidden_a, &w_qkv, &w_gate, &w_conv1d, &w_alpha, &w_beta,
-        &a_log, &dt_bias, &ssm_norm, &w_out,
-        &mut conv_state, &mut rec_state, &mut out_a,
-        d_model, ssm_inner, n_qk_heads, n_v_heads,
-        head_qk_dim, head_v_dim, conv_kernel, rms_eps,
+        &hidden_a,
+        &w_qkv,
+        &w_gate,
+        &w_conv1d,
+        &w_alpha,
+        &w_beta,
+        &a_log,
+        &dt_bias,
+        &ssm_norm,
+        &w_out,
+        &mut conv_state,
+        &mut rec_state,
+        &mut out_a,
+        d_model,
+        ssm_inner,
+        n_qk_heads,
+        n_v_heads,
+        head_qk_dim,
+        head_v_dim,
+        conv_kernel,
+        rms_eps,
     );
 
     let mut out_b = vec![0.0f32; d_model];
     delta_net_layer_forward_f32(
-        &hidden_b, &w_qkv, &w_gate, &w_conv1d, &w_alpha, &w_beta,
-        &a_log, &dt_bias, &ssm_norm, &w_out,
-        &mut conv_state, &mut rec_state, &mut out_b,
-        d_model, ssm_inner, n_qk_heads, n_v_heads,
-        head_qk_dim, head_v_dim, conv_kernel, rms_eps,
+        &hidden_b,
+        &w_qkv,
+        &w_gate,
+        &w_conv1d,
+        &w_alpha,
+        &w_beta,
+        &a_log,
+        &dt_bias,
+        &ssm_norm,
+        &w_out,
+        &mut conv_state,
+        &mut rec_state,
+        &mut out_b,
+        d_model,
+        ssm_inner,
+        n_qk_heads,
+        n_v_heads,
+        head_qk_dim,
+        head_v_dim,
+        conv_kernel,
+        rms_eps,
     );
 
     // Tolerance: 5e-4 absolute. The reference uses double-precision
@@ -143,9 +173,16 @@ fn deltanet_layer_forward_matches_python_reference() {
             "{label}: len={} max_abs={:.2e} (idx {}, got={:.6e} exp={:.6e}) mean_abs={:.2e} tol={:.2e} pass={}",
             got.len(), max_abs, argmax, got[argmax], exp[argmax], mean_abs, TOL, pass
         );
-        assert!(pass, "{label}: max abs error {max_abs} exceeded tolerance {TOL}");
+        assert!(
+            pass,
+            "{label}: max abs error {max_abs} exceeded tolerance {TOL}"
+        );
     };
 
     cmp(&out_a, &expected_a, "out_a (first token)");
-    cmp(&out_b, &expected_b, "out_b (second token, post-state-carry)");
+    cmp(
+        &out_b,
+        &expected_b,
+        "out_b (second token, post-state-carry)",
+    );
 }

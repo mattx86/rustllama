@@ -36,7 +36,9 @@ pub struct Imatrix {
 
 impl Imatrix {
     pub fn new() -> Self {
-        Self { map: HashMap::new() }
+        Self {
+            map: HashMap::new(),
+        }
     }
 
     /// Importance vector for `name`, or `None` if absent. Length is
@@ -93,7 +95,10 @@ impl Imatrix {
             let mut name_bytes = vec![0u8; name_len];
             cur.read_exact(&mut name_bytes)?;
             let name = String::from_utf8(name_bytes).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("imatrix: bad utf8 name: {e}"))
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("imatrix: bad utf8 name: {e}"),
+                )
             })?;
             let n_cols = read_u32(&mut cur)? as usize;
             let mut vals = Vec::with_capacity(n_cols.min(1 << 16));
@@ -155,7 +160,10 @@ mod tests {
         im.save(&path).unwrap();
         let loaded = Imatrix::load(&path).unwrap();
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded.get("blk.0.ffn_gate_exps.weight"), Some(&[1.0, 2.5, 0.0, -3.0][..]));
+        assert_eq!(
+            loaded.get("blk.0.ffn_gate_exps.weight"),
+            Some(&[1.0, 2.5, 0.0, -3.0][..])
+        );
         assert_eq!(loaded.get("blk.0.attn_q.weight").unwrap().len(), 8);
         assert_eq!(loaded.get("missing"), None);
         let _ = std::fs::remove_file(&path);

@@ -115,8 +115,7 @@ impl SamplerGpuContext {
         let stream = sk::create_stream(device_index).map_err(|e| {
             SamplerGpuError::KernelFailed(format!("create_stream({device_index}) failed: {e}"))
         })?;
-        let rng_state_usm =
-            sk::usm_alloc_shared(&stream, std::mem::size_of::<u64>()) as *mut u64;
+        let rng_state_usm = sk::usm_alloc_shared(&stream, std::mem::size_of::<u64>()) as *mut u64;
         if rng_state_usm.is_null() {
             return Err(SamplerGpuError::Unavailable);
         }
@@ -128,7 +127,8 @@ impl SamplerGpuContext {
             return Err(SamplerGpuError::Unavailable);
         }
         // H1: top-p fallback signal slot.
-        let top_p_fallback_usm = sk::usm_alloc_shared(&stream, std::mem::size_of::<i32>()) as *mut i32;
+        let top_p_fallback_usm =
+            sk::usm_alloc_shared(&stream, std::mem::size_of::<i32>()) as *mut i32;
         if top_p_fallback_usm.is_null() {
             unsafe {
                 sk::usm_free(&stream, rng_state_usm as *mut std::ffi::c_void);
@@ -280,13 +280,8 @@ impl SamplerGpuContext {
         // Stochastic path: temp+softmax → optional top-k → multinomial.
         let inv_t = 1.0 / params.temperature;
         unsafe {
-            sk::sampler_temp_softmax_usm_raw(
-                &self.stream,
-                self.logits_usm,
-                vocab as u32,
-                inv_t,
-            )
-            .map_err(|e| SamplerGpuError::KernelFailed(format!("temp_softmax: {e}")))?;
+            sk::sampler_temp_softmax_usm_raw(&self.stream, self.logits_usm, vocab as u32, inv_t)
+                .map_err(|e| SamplerGpuError::KernelFailed(format!("temp_softmax: {e}")))?;
         }
         if params.top_k > 0 && (params.top_k as usize) < vocab {
             // top_k <= MAX_TOP_K_GPU is locked in by is_supported().
@@ -317,7 +312,8 @@ impl SamplerGpuContext {
                 .map_err(|e| SamplerGpuError::KernelFailed(format!("top_p: {e}")))?;
                 if *self.top_p_fallback_usm != 0 {
                     return Err(SamplerGpuError::InvalidShape(
-                        "top_p exceeded GPU kernel's scan budget — caller should retry on CPU".to_string(),
+                        "top_p exceeded GPU kernel's scan budget — caller should retry on CPU"
+                            .to_string(),
                     ));
                 }
             }
@@ -359,7 +355,10 @@ impl Drop for SamplerGpuContext {
                 sk::usm_free(&self.stream, self.out_idx_usm as *mut std::ffi::c_void);
             }
             if !self.top_p_fallback_usm.is_null() {
-                sk::usm_free(&self.stream, self.top_p_fallback_usm as *mut std::ffi::c_void);
+                sk::usm_free(
+                    &self.stream,
+                    self.top_p_fallback_usm as *mut std::ffi::c_void,
+                );
             }
         }
         // self.stream Drop runs after this returns.

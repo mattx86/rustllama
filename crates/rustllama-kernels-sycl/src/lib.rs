@@ -104,7 +104,6 @@ impl KQuantFormat {
     }
 }
 
-
 mod imp {
     use super::*;
     use std::os::raw::c_int;
@@ -126,10 +125,7 @@ mod imp {
             capacity: c_int,
         ) -> c_int;
 
-        pub(super) fn rsl_get_last_error_message(
-            buf: *mut std::os::raw::c_char,
-            capacity: c_int,
-        );
+        pub(super) fn rsl_get_last_error_message(buf: *mut std::os::raw::c_char, capacity: c_int);
 
         pub(super) fn rsl_sycl_device_info(
             device_index: c_int,
@@ -434,7 +430,7 @@ mod imp {
             n_kv_heads: c_int,
             head_dim: c_int,
             max_ctx: c_int,
-            kv_len: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            kv_len: c_int, // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
             window: c_int,
             softcap: f32,
         ) -> c_int;
@@ -449,7 +445,7 @@ mod imp {
             head_dim: c_int,
             max_ctx: c_int,
             kv_len_base: c_int,
-            n_new: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            n_new: c_int, // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
             window: c_int,
             softcap: f32,
         ) -> c_int;
@@ -463,7 +459,7 @@ mod imp {
             n_kv_heads: c_int,
             head_dim: c_int,
             max_ctx: c_int,
-            kv_len: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            kv_len: c_int, // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
             window: c_int,
             softcap: f32,
         ) -> c_int;
@@ -478,7 +474,7 @@ mod imp {
             head_dim: c_int,
             max_ctx: c_int,
             kv_len_base: c_int,
-            n_new: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            n_new: c_int, // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
             window: c_int,
             softcap: f32,
         ) -> c_int;
@@ -496,7 +492,7 @@ mod imp {
             n_kv_heads: c_int,
             head_dim: c_int,
             max_ctx: c_int,
-            kv_len: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            kv_len: c_int, // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
             window: c_int,
             softcap: f32,
         ) -> c_int;
@@ -511,7 +507,7 @@ mod imp {
             head_dim: c_int,
             max_ctx: c_int,
             kv_len_base: c_int,
-            n_new: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            n_new: c_int, // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
             window: c_int,
             softcap: f32,
         ) -> c_int;
@@ -525,7 +521,7 @@ mod imp {
             n_kv_heads: c_int,
             head_dim: c_int,
             max_ctx: c_int,
-            kv_len: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            kv_len: c_int, // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
             window: c_int,
             softcap: f32,
         ) -> c_int;
@@ -540,7 +536,7 @@ mod imp {
             head_dim: c_int,
             max_ctx: c_int,
             kv_len_base: c_int,
-            n_new: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            n_new: c_int, // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
             window: c_int,
             softcap: f32,
         ) -> c_int;
@@ -554,7 +550,7 @@ mod imp {
             n_kv_heads: c_int,
             head_dim: c_int,
             max_ctx: c_int,
-            kv_len: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            kv_len: c_int, // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
             window: c_int,
             softcap: f32,
         ) -> c_int;
@@ -569,7 +565,7 @@ mod imp {
             head_dim: c_int,
             max_ctx: c_int,
             kv_len_base: c_int,
-            n_new: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            n_new: c_int, // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
             window: c_int,
             softcap: f32,
         ) -> c_int;
@@ -586,7 +582,7 @@ mod imp {
             n_kv_heads: c_int,
             head_dim: c_int,
             max_ctx: c_int,
-            kv_len: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            kv_len: c_int, // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
             window: c_int,
             softcap: f32,
         ) -> c_int;
@@ -604,7 +600,7 @@ mod imp {
             head_dim: c_int,
             max_ctx: c_int,
             kv_len_base: c_int,
-            n_new: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            n_new: c_int, // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
             window: c_int,
             softcap: f32,
         ) -> c_int;
@@ -621,7 +617,7 @@ mod imp {
             n_kv_heads: c_int,
             head_dim: c_int,
             max_ctx: c_int,
-            kv_len: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            kv_len: c_int, // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
             window: c_int,
             softcap: f32,
         ) -> c_int;
@@ -638,7 +634,7 @@ mod imp {
             head_dim: c_int,
             max_ctx: c_int,
             kv_len_base: c_int,
-            n_new: c_int,            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            n_new: c_int, // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
             window: c_int,
             softcap: f32,
         ) -> c_int;
@@ -740,39 +736,105 @@ mod imp {
         // K-quant Q2_K/Q3_K/Q8_K block 256, PrismML PQ2_0 block 128). Same
         // signature shape as the other packed matvecs.
         pub(super) fn rsl_matvec_q4_0_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         // OCP Microscaling packed matvecs (block 32; 17/25/33 bytes/block).
         pub(super) fn rsl_matvec_mxfp4_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_mxfp6_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_mxfp8_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_q5_0_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_q4_1_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_q5_1_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_q2_k_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_q3_k_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_q8_k_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_pq2_0_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
 
         pub(super) fn rsl_matvec_iq1_s_packed_f32_usm(
             s: *mut rsl_stream,
@@ -1088,44 +1150,104 @@ mod imp {
         );
 
         pub(super) fn rsl_matvec_q5_0_packed_f32_batched_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            n: c_int,
+            lws: c_int,
         );
         pub(super) fn rsl_matvec_q4_1_packed_f32_batched_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            n: c_int,
+            lws: c_int,
         );
         pub(super) fn rsl_matvec_q5_1_packed_f32_batched_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            n: c_int,
+            lws: c_int,
         );
         pub(super) fn rsl_matvec_q2_k_packed_f32_batched_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            n: c_int,
+            lws: c_int,
         );
         pub(super) fn rsl_matvec_q3_k_packed_f32_batched_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            n: c_int,
+            lws: c_int,
         );
         pub(super) fn rsl_matvec_q8_k_packed_f32_batched_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            n: c_int,
+            lws: c_int,
         );
         pub(super) fn rsl_matvec_pq2_0_packed_f32_batched_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            n: c_int,
+            lws: c_int,
         );
         pub(super) fn rsl_matvec_mxfp4_packed_f32_batched_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            n: c_int,
+            lws: c_int,
         );
         pub(super) fn rsl_matvec_mxfp6_packed_f32_batched_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            n: c_int,
+            lws: c_int,
         );
         pub(super) fn rsl_matvec_mxfp8_packed_f32_batched_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: c_int, k: c_int, n: c_int, lws: c_int,
+            s: *mut rsl_stream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            n: c_int,
+            lws: c_int,
         );
 
         pub(super) fn rsl_matvec_iq4_nl_packed_f32_batched_usm(
@@ -1190,10 +1312,7 @@ mod imp {
             out_dev_ptr: *mut *mut std::ffi::c_void,
         ) -> c_int;
 
-        pub(super) fn rsl_release_imported_usm(
-            s: *mut rsl_stream,
-            dev_ptr: *mut std::ffi::c_void,
-        );
+        pub(super) fn rsl_release_imported_usm(s: *mut rsl_stream, dev_ptr: *mut std::ffi::c_void);
 
         pub(super) fn rsl_try_alloc_host_baseline(
             s: *mut rsl_stream,
@@ -1436,103 +1555,291 @@ mod imp {
             lws: c_int,
         );
         pub(super) fn rsl_matvec_q8_0_add_rmsnorm_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            attn_usm: *const f32, hidden_usm: *mut f32, w_norm_usm: *const f32,
-            y_norm_usm: *mut f32, m: c_int, k: c_int, eps: f32, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            attn_usm: *const f32,
+            hidden_usm: *mut f32,
+            w_norm_usm: *const f32,
+            y_norm_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            eps: f32,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_q5_k_add_rmsnorm_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            attn_usm: *const f32, hidden_usm: *mut f32, w_norm_usm: *const f32,
-            y_norm_usm: *mut f32, m: c_int, k: c_int, eps: f32, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            attn_usm: *const f32,
+            hidden_usm: *mut f32,
+            w_norm_usm: *const f32,
+            y_norm_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            eps: f32,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_q6_k_add_rmsnorm_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            attn_usm: *const f32, hidden_usm: *mut f32, w_norm_usm: *const f32,
-            y_norm_usm: *mut f32, m: c_int, k: c_int, eps: f32, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            attn_usm: *const f32,
+            hidden_usm: *mut f32,
+            w_norm_usm: *const f32,
+            y_norm_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            eps: f32,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_iq4_nl_add_rmsnorm_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            attn_usm: *const f32, hidden_usm: *mut f32, w_norm_usm: *const f32,
-            y_norm_usm: *mut f32, m: c_int, k: c_int, eps: f32, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            attn_usm: *const f32,
+            hidden_usm: *mut f32,
+            w_norm_usm: *const f32,
+            y_norm_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            eps: f32,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_iq4_xs_add_rmsnorm_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            attn_usm: *const f32, hidden_usm: *mut f32, w_norm_usm: *const f32,
-            y_norm_usm: *mut f32, m: c_int, k: c_int, eps: f32, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            attn_usm: *const f32,
+            hidden_usm: *mut f32,
+            w_norm_usm: *const f32,
+            y_norm_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            eps: f32,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_iq1_s_add_rmsnorm_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            attn_usm: *const f32, hidden_usm: *mut f32, w_norm_usm: *const f32,
-            y_norm_usm: *mut f32, m: c_int, k: c_int, eps: f32, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            attn_usm: *const f32,
+            hidden_usm: *mut f32,
+            w_norm_usm: *const f32,
+            y_norm_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            eps: f32,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_iq1_m_add_rmsnorm_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            attn_usm: *const f32, hidden_usm: *mut f32, w_norm_usm: *const f32,
-            y_norm_usm: *mut f32, m: c_int, k: c_int, eps: f32, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            attn_usm: *const f32,
+            hidden_usm: *mut f32,
+            w_norm_usm: *const f32,
+            y_norm_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            eps: f32,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_iq2_xxs_add_rmsnorm_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            attn_usm: *const f32, hidden_usm: *mut f32, w_norm_usm: *const f32,
-            y_norm_usm: *mut f32, m: c_int, k: c_int, eps: f32, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            attn_usm: *const f32,
+            hidden_usm: *mut f32,
+            w_norm_usm: *const f32,
+            y_norm_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            eps: f32,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_iq2_xs_add_rmsnorm_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            attn_usm: *const f32, hidden_usm: *mut f32, w_norm_usm: *const f32,
-            y_norm_usm: *mut f32, m: c_int, k: c_int, eps: f32, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            attn_usm: *const f32,
+            hidden_usm: *mut f32,
+            w_norm_usm: *const f32,
+            y_norm_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            eps: f32,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_iq2_s_add_rmsnorm_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            attn_usm: *const f32, hidden_usm: *mut f32, w_norm_usm: *const f32,
-            y_norm_usm: *mut f32, m: c_int, k: c_int, eps: f32, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            attn_usm: *const f32,
+            hidden_usm: *mut f32,
+            w_norm_usm: *const f32,
+            y_norm_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            eps: f32,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_iq3_xxs_add_rmsnorm_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            attn_usm: *const f32, hidden_usm: *mut f32, w_norm_usm: *const f32,
-            y_norm_usm: *mut f32, m: c_int, k: c_int, eps: f32, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            attn_usm: *const f32,
+            hidden_usm: *mut f32,
+            w_norm_usm: *const f32,
+            y_norm_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            eps: f32,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_iq3_s_add_rmsnorm_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            attn_usm: *const f32, hidden_usm: *mut f32, w_norm_usm: *const f32,
-            y_norm_usm: *mut f32, m: c_int, k: c_int, eps: f32, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            attn_usm: *const f32,
+            hidden_usm: *mut f32,
+            w_norm_usm: *const f32,
+            y_norm_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            eps: f32,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_ptq1_0_add_rmsnorm_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            attn_usm: *const f32, hidden_usm: *mut f32, w_norm_usm: *const f32,
-            y_norm_usm: *mut f32, m: c_int, k: c_int, eps: f32, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            attn_usm: *const f32,
+            hidden_usm: *mut f32,
+            w_norm_usm: *const f32,
+            y_norm_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            eps: f32,
+            lws: c_int,
+        );
 
         // H8: F16-input mixed-precision matvec. `x_f16` is the
         // activation vector as F16 bits; weights + output stay packed
         // / F32. Per packed-quant dtype.
         pub(super) fn rsl_matvec_q8_0_f16in_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            x_f16: *const u16, out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            x_f16: *const u16,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_q4_k_f16in_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            x_f16: *const u16, out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            x_f16: *const u16,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_q5_k_f16in_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            x_f16: *const u16, out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            x_f16: *const u16,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_q6_k_f16in_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            x_f16: *const u16, out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            x_f16: *const u16,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_iq4_nl_f16in_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            x_f16: *const u16, out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            x_f16: *const u16,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_iq4_xs_f16in_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            x_f16: *const u16, out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            x_f16: *const u16,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_iq1_s_f16in_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            x_f16: *const u16, out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            x_f16: *const u16,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_iq1_m_f16in_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            x_f16: *const u16, out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            x_f16: *const u16,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_iq2_xxs_f16in_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            x_f16: *const u16, out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            x_f16: *const u16,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_iq2_xs_f16in_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            x_f16: *const u16, out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            x_f16: *const u16,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_iq2_s_f16in_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            x_f16: *const u16, out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            x_f16: *const u16,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_iq3_xxs_f16in_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            x_f16: *const u16, out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            x_f16: *const u16,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_iq3_s_f16in_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            x_f16: *const u16, out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            x_f16: *const u16,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
         pub(super) fn rsl_matvec_ptq1_0_f16in_packed_f32_usm(
-            s: *mut rsl_stream, w_bytes_usm: *const std::ffi::c_void,
-            x_f16: *const u16, out_usm: *mut f32, m: c_int, k: c_int, lws: c_int);
+            s: *mut rsl_stream,
+            w_bytes_usm: *const std::ffi::c_void,
+            x_f16: *const u16,
+            out_usm: *mut f32,
+            m: c_int,
+            k: c_int,
+            lws: c_int,
+        );
 
         // G2: KV-cache Q8_0 quantize-on-store. Strided write into the
         // KV cache layout `[n_kv_heads × max_ctx × head_dim]` from a
@@ -1617,13 +1924,7 @@ mod imp {
             scale: f32,
         );
 
-        fn rsl_silu_mul(
-            s: *mut rsl_stream,
-            x: *const u16,
-            y: *const u16,
-            out: *mut u16,
-            n: c_int,
-        );
+        fn rsl_silu_mul(s: *mut rsl_stream, x: *const u16, y: *const u16, out: *mut u16, n: c_int);
 
         fn rsl_embedding_lookup(
             s: *mut rsl_stream,
@@ -1838,11 +2139,9 @@ mod imp {
                 buf.len() as c_int,
             );
         }
-        let msg = unsafe {
-            std::ffi::CStr::from_ptr(buf.as_ptr() as *const std::os::raw::c_char)
-        }
-        .to_string_lossy()
-        .into_owned();
+        let msg = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const std::os::raw::c_char) }
+            .to_string_lossy()
+            .into_owned();
         // A DEVICE_LOST is terminal: the SYCL context is gone and every
         // subsequent GPU call will fail. Latch a process-global flag so the
         // dispatch layer can stop trying the GPU entirely (no re-probe) and
@@ -1899,16 +2198,14 @@ mod imp {
         }
         // CStr → String. The C side guarantees a NUL terminator
         // within `*_capacity` bytes.
-        let name = unsafe {
-            std::ffi::CStr::from_ptr(name_buf.as_ptr() as *const std::os::raw::c_char)
-        }
-        .to_string_lossy()
-        .into_owned();
-        let driver_version = unsafe {
-            std::ffi::CStr::from_ptr(driver_buf.as_ptr() as *const std::os::raw::c_char)
-        }
-        .to_string_lossy()
-        .into_owned();
+        let name =
+            unsafe { std::ffi::CStr::from_ptr(name_buf.as_ptr() as *const std::os::raw::c_char) }
+                .to_string_lossy()
+                .into_owned();
+        let driver_version =
+            unsafe { std::ffi::CStr::from_ptr(driver_buf.as_ptr() as *const std::os::raw::c_char) }
+                .to_string_lossy()
+                .into_owned();
         Ok(DeviceInfo {
             name,
             driver_version,
@@ -2065,10 +2362,7 @@ mod imp {
     /// throws — callers treat NULL as "device tier unavailable, fall
     /// back to shared". The returned pointer is NOT host-readable;
     /// only pass it into kernels. Free with [`usm_free`].
-    pub fn usm_alloc_device_from_host(
-        stream: &SyclStream,
-        src: &[u8],
-    ) -> *mut std::ffi::c_void {
+    pub fn usm_alloc_device_from_host(stream: &SyclStream, src: &[u8]) -> *mut std::ffi::c_void {
         if src.is_empty() {
             return std::ptr::null_mut();
         }
@@ -2404,10 +2698,19 @@ mod imp {
         }
         unsafe {
             rsl_flash_attn_decode_v3_usm(
-                stream.raw, q_usm, k_usm, v_usm, out_usm,
-                n_heads as c_int, n_kv_heads as c_int,
-                head_dim as c_int, max_ctx as c_int, kv_len as c_int,
-                window as c_int, softcap, tile_size as c_int,
+                stream.raw,
+                q_usm,
+                k_usm,
+                v_usm,
+                out_usm,
+                n_heads as c_int,
+                n_kv_heads as c_int,
+                head_dim as c_int,
+                max_ctx as c_int,
+                kv_len as c_int,
+                window as c_int,
+                softcap,
+                tile_size as c_int,
             );
         }
         consume_error()
@@ -2447,11 +2750,19 @@ mod imp {
         }
         unsafe {
             rsl_flash_attn_prefill_v3_usm(
-                stream.raw, q_usm, k_cache_usm, v_cache_usm, out_usm,
-                n_heads as c_int, n_kv_heads as c_int,
-                head_dim as c_int, max_ctx as c_int,
-                kv_len_base as c_int, n_new as c_int,
-                window as c_int, softcap,
+                stream.raw,
+                q_usm,
+                k_cache_usm,
+                v_cache_usm,
+                out_usm,
+                n_heads as c_int,
+                n_kv_heads as c_int,
+                head_dim as c_int,
+                max_ctx as c_int,
+                kv_len_base as c_int,
+                n_new as c_int,
+                window as c_int,
+                softcap,
             );
         }
         consume_error()
@@ -2583,9 +2894,16 @@ mod imp {
         // responsibility. We just forward to the C ABI.
         let rc = unsafe {
             rsl_flash_attn_decode_q4_0_usm(
-                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
-                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
-                max_ctx as c_int, kv_len as c_int,
+                stream.raw,
+                q_usm,
+                k_packed_usm,
+                v_packed_usm,
+                out_usm,
+                n_heads as c_int,
+                n_kv_heads as c_int,
+                head_dim as c_int,
+                max_ctx as c_int,
+                kv_len as c_int,
                 window as c_int,
                 softcap,
             )
@@ -2631,9 +2949,17 @@ mod imp {
         // SAFETY: as above.
         let rc = unsafe {
             rsl_flash_attn_prefill_q4_0_usm(
-                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
-                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
-                max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
+                stream.raw,
+                q_usm,
+                k_packed_usm,
+                v_packed_usm,
+                out_usm,
+                n_heads as c_int,
+                n_kv_heads as c_int,
+                head_dim as c_int,
+                max_ctx as c_int,
+                kv_len_base as c_int,
+                n_new as c_int,
                 window as c_int,
                 softcap,
             )
@@ -2673,9 +2999,16 @@ mod imp {
         // SAFETY: as above.
         let rc = unsafe {
             rsl_flash_attn_decode_nvfp4_usm(
-                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
-                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
-                max_ctx as c_int, kv_len as c_int,
+                stream.raw,
+                q_usm,
+                k_packed_usm,
+                v_packed_usm,
+                out_usm,
+                n_heads as c_int,
+                n_kv_heads as c_int,
+                head_dim as c_int,
+                max_ctx as c_int,
+                kv_len as c_int,
                 window as c_int,
                 softcap,
             )
@@ -2721,9 +3054,17 @@ mod imp {
         // SAFETY: as above.
         let rc = unsafe {
             rsl_flash_attn_prefill_nvfp4_usm(
-                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
-                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
-                max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
+                stream.raw,
+                q_usm,
+                k_packed_usm,
+                v_packed_usm,
+                out_usm,
+                n_heads as c_int,
+                n_kv_heads as c_int,
+                head_dim as c_int,
+                max_ctx as c_int,
+                kv_len_base as c_int,
+                n_new as c_int,
                 window as c_int,
                 softcap,
             )
@@ -2767,9 +3108,16 @@ mod imp {
         // SAFETY: as above.
         let rc = unsafe {
             rsl_flash_attn_decode_mxfp4_usm(
-                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
-                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
-                max_ctx as c_int, kv_len as c_int,
+                stream.raw,
+                q_usm,
+                k_packed_usm,
+                v_packed_usm,
+                out_usm,
+                n_heads as c_int,
+                n_kv_heads as c_int,
+                head_dim as c_int,
+                max_ctx as c_int,
+                kv_len as c_int,
                 window as c_int,
                 softcap,
             )
@@ -2815,9 +3163,17 @@ mod imp {
         // SAFETY: as above.
         let rc = unsafe {
             rsl_flash_attn_prefill_mxfp4_usm(
-                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
-                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
-                max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
+                stream.raw,
+                q_usm,
+                k_packed_usm,
+                v_packed_usm,
+                out_usm,
+                n_heads as c_int,
+                n_kv_heads as c_int,
+                head_dim as c_int,
+                max_ctx as c_int,
+                kv_len_base as c_int,
+                n_new as c_int,
                 window as c_int,
                 softcap,
             )
@@ -2857,9 +3213,16 @@ mod imp {
         // SAFETY: as above.
         let rc = unsafe {
             rsl_flash_attn_decode_mxfp6_usm(
-                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
-                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
-                max_ctx as c_int, kv_len as c_int,
+                stream.raw,
+                q_usm,
+                k_packed_usm,
+                v_packed_usm,
+                out_usm,
+                n_heads as c_int,
+                n_kv_heads as c_int,
+                head_dim as c_int,
+                max_ctx as c_int,
+                kv_len as c_int,
                 window as c_int,
                 softcap,
             )
@@ -2905,9 +3268,17 @@ mod imp {
         // SAFETY: as above.
         let rc = unsafe {
             rsl_flash_attn_prefill_mxfp6_usm(
-                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
-                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
-                max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
+                stream.raw,
+                q_usm,
+                k_packed_usm,
+                v_packed_usm,
+                out_usm,
+                n_heads as c_int,
+                n_kv_heads as c_int,
+                head_dim as c_int,
+                max_ctx as c_int,
+                kv_len_base as c_int,
+                n_new as c_int,
                 window as c_int,
                 softcap,
             )
@@ -2947,9 +3318,16 @@ mod imp {
         // SAFETY: as above.
         let rc = unsafe {
             rsl_flash_attn_decode_mxfp8_usm(
-                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
-                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
-                max_ctx as c_int, kv_len as c_int,
+                stream.raw,
+                q_usm,
+                k_packed_usm,
+                v_packed_usm,
+                out_usm,
+                n_heads as c_int,
+                n_kv_heads as c_int,
+                head_dim as c_int,
+                max_ctx as c_int,
+                kv_len as c_int,
                 window as c_int,
                 softcap,
             )
@@ -2995,9 +3373,17 @@ mod imp {
         // SAFETY: as above.
         let rc = unsafe {
             rsl_flash_attn_prefill_mxfp8_usm(
-                stream.raw, q_usm, k_packed_usm, v_packed_usm, out_usm,
-                n_heads as c_int, n_kv_heads as c_int, head_dim as c_int,
-                max_ctx as c_int, kv_len_base as c_int, n_new as c_int,
+                stream.raw,
+                q_usm,
+                k_packed_usm,
+                v_packed_usm,
+                out_usm,
+                n_heads as c_int,
+                n_kv_heads as c_int,
+                head_dim as c_int,
+                max_ctx as c_int,
+                kv_len_base as c_int,
+                n_new as c_int,
                 window as c_int,
                 softcap,
             )
@@ -3040,9 +3426,18 @@ mod imp {
         // SAFETY: as above.
         let rc = unsafe {
             rsl_flash_attn_decode_tq_usm(
-                stream.raw, q_usm, k_packed_usm, v_packed_usm, k_scales_usm,
-                v_scales_usm, bits as c_int, out_usm, n_heads as c_int,
-                n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
+                stream.raw,
+                q_usm,
+                k_packed_usm,
+                v_packed_usm,
+                k_scales_usm,
+                v_scales_usm,
+                bits as c_int,
+                out_usm,
+                n_heads as c_int,
+                n_kv_heads as c_int,
+                head_dim as c_int,
+                max_ctx as c_int,
                 kv_len as c_int,
                 window as c_int,
                 softcap,
@@ -3092,10 +3487,20 @@ mod imp {
         // SAFETY: as above.
         let rc = unsafe {
             rsl_flash_attn_prefill_tq_usm(
-                stream.raw, q_usm, k_packed_usm, v_packed_usm, k_scales_usm,
-                v_scales_usm, bits as c_int, out_usm, n_heads as c_int,
-                n_kv_heads as c_int, head_dim as c_int, max_ctx as c_int,
-                kv_len_base as c_int, n_new as c_int,
+                stream.raw,
+                q_usm,
+                k_packed_usm,
+                v_packed_usm,
+                k_scales_usm,
+                v_scales_usm,
+                bits as c_int,
+                out_usm,
+                n_heads as c_int,
+                n_kv_heads as c_int,
+                head_dim as c_int,
+                max_ctx as c_int,
+                kv_len_base as c_int,
+                n_new as c_int,
                 window as c_int,
                 softcap,
             )
@@ -3137,9 +3542,18 @@ mod imp {
         // SAFETY: as above.
         let rc = unsafe {
             rsl_flash_attn_decode_q8_0_usm(
-                stream.raw, q_usm, k_packed_usm, v_packed_usm, k_scales_usm,
-                v_scales_usm, out_usm, n_heads as c_int, n_kv_heads as c_int,
-                head_dim as c_int, max_ctx as c_int, kv_len as c_int,
+                stream.raw,
+                q_usm,
+                k_packed_usm,
+                v_packed_usm,
+                k_scales_usm,
+                v_scales_usm,
+                out_usm,
+                n_heads as c_int,
+                n_kv_heads as c_int,
+                head_dim as c_int,
+                max_ctx as c_int,
+                kv_len as c_int,
                 window as c_int,
                 softcap,
             )
@@ -3187,9 +3601,18 @@ mod imp {
         // SAFETY: as above.
         let rc = unsafe {
             rsl_flash_attn_prefill_q8_0_usm(
-                stream.raw, q_usm, k_packed_usm, v_packed_usm, k_scales_usm,
-                v_scales_usm, out_usm, n_heads as c_int, n_kv_heads as c_int,
-                head_dim as c_int, max_ctx as c_int, kv_len_base as c_int,
+                stream.raw,
+                q_usm,
+                k_packed_usm,
+                v_packed_usm,
+                k_scales_usm,
+                v_scales_usm,
+                out_usm,
+                n_heads as c_int,
+                n_kv_heads as c_int,
+                head_dim as c_int,
+                max_ctx as c_int,
+                kv_len_base as c_int,
                 n_new as c_int,
                 window as c_int,
                 softcap,
@@ -3584,39 +4007,104 @@ mod imp {
     macro_rules! packed_matvec_real_wrapper {
         ($name:ident, $ffi:ident, $align:expr) => {
             pub fn $name(
-                stream: &SyclStream, w_bytes_usm: *const u8, x_usm: *const f32,
-                out_usm: *mut f32, m: u32, k: u32, lws: u32,
+                stream: &SyclStream,
+                w_bytes_usm: *const u8,
+                x_usm: *const f32,
+                out_usm: *mut f32,
+                m: u32,
+                k: u32,
+                lws: u32,
             ) -> Result<()> {
                 if m == 0 || k == 0 {
                     return Err(SyclError::InvalidShape(format!(
-                        concat!(stringify!($name), ": zero dim (M={}, K={})"), m, k)));
+                        concat!(stringify!($name), ": zero dim (M={}, K={})"),
+                        m, k
+                    )));
                 }
                 if k % $align != 0 {
                     return Err(SyclError::InvalidShape(format!(
-                        concat!(stringify!($name), ": K must be a multiple of ", stringify!($align), ", got {}"), k)));
+                        concat!(
+                            stringify!($name),
+                            ": K must be a multiple of ",
+                            stringify!($align),
+                            ", got {}"
+                        ),
+                        k
+                    )));
                 }
                 // SAFETY: caller owns the USM pointers + ensures they
                 // outlive the call. The kernel `.wait()`s before returning.
                 unsafe {
-                    $ffi(stream.raw, w_bytes_usm, x_usm, out_usm,
-                         m as c_int, k as c_int, lws as c_int);
+                    $ffi(
+                        stream.raw,
+                        w_bytes_usm,
+                        x_usm,
+                        out_usm,
+                        m as c_int,
+                        k as c_int,
+                        lws as c_int,
+                    );
                 }
                 consume_error()
             }
         };
     }
-    packed_matvec_real_wrapper!(matvec_q4_0_packed_f32_usm, rsl_matvec_q4_0_packed_f32_usm, 32);
+    packed_matvec_real_wrapper!(
+        matvec_q4_0_packed_f32_usm,
+        rsl_matvec_q4_0_packed_f32_usm,
+        32
+    );
     // OCP Microscaling (MX) — block 32, one E8M0 power-of-two scale/block.
-    packed_matvec_real_wrapper!(matvec_mxfp4_packed_f32_usm, rsl_matvec_mxfp4_packed_f32_usm, 32);
-    packed_matvec_real_wrapper!(matvec_mxfp6_packed_f32_usm, rsl_matvec_mxfp6_packed_f32_usm, 32);
-    packed_matvec_real_wrapper!(matvec_mxfp8_packed_f32_usm, rsl_matvec_mxfp8_packed_f32_usm, 32);
-    packed_matvec_real_wrapper!(matvec_q5_0_packed_f32_usm, rsl_matvec_q5_0_packed_f32_usm, 32);
-    packed_matvec_real_wrapper!(matvec_q4_1_packed_f32_usm, rsl_matvec_q4_1_packed_f32_usm, 32);
-    packed_matvec_real_wrapper!(matvec_q5_1_packed_f32_usm, rsl_matvec_q5_1_packed_f32_usm, 32);
-    packed_matvec_real_wrapper!(matvec_q2_k_packed_f32_usm, rsl_matvec_q2_k_packed_f32_usm, 256);
-    packed_matvec_real_wrapper!(matvec_q3_k_packed_f32_usm, rsl_matvec_q3_k_packed_f32_usm, 256);
-    packed_matvec_real_wrapper!(matvec_q8_k_packed_f32_usm, rsl_matvec_q8_k_packed_f32_usm, 256);
-    packed_matvec_real_wrapper!(matvec_pq2_0_packed_f32_usm, rsl_matvec_pq2_0_packed_f32_usm, 128);
+    packed_matvec_real_wrapper!(
+        matvec_mxfp4_packed_f32_usm,
+        rsl_matvec_mxfp4_packed_f32_usm,
+        32
+    );
+    packed_matvec_real_wrapper!(
+        matvec_mxfp6_packed_f32_usm,
+        rsl_matvec_mxfp6_packed_f32_usm,
+        32
+    );
+    packed_matvec_real_wrapper!(
+        matvec_mxfp8_packed_f32_usm,
+        rsl_matvec_mxfp8_packed_f32_usm,
+        32
+    );
+    packed_matvec_real_wrapper!(
+        matvec_q5_0_packed_f32_usm,
+        rsl_matvec_q5_0_packed_f32_usm,
+        32
+    );
+    packed_matvec_real_wrapper!(
+        matvec_q4_1_packed_f32_usm,
+        rsl_matvec_q4_1_packed_f32_usm,
+        32
+    );
+    packed_matvec_real_wrapper!(
+        matvec_q5_1_packed_f32_usm,
+        rsl_matvec_q5_1_packed_f32_usm,
+        32
+    );
+    packed_matvec_real_wrapper!(
+        matvec_q2_k_packed_f32_usm,
+        rsl_matvec_q2_k_packed_f32_usm,
+        256
+    );
+    packed_matvec_real_wrapper!(
+        matvec_q3_k_packed_f32_usm,
+        rsl_matvec_q3_k_packed_f32_usm,
+        256
+    );
+    packed_matvec_real_wrapper!(
+        matvec_q8_k_packed_f32_usm,
+        rsl_matvec_q8_k_packed_f32_usm,
+        256
+    );
+    packed_matvec_real_wrapper!(
+        matvec_pq2_0_packed_f32_usm,
+        rsl_matvec_pq2_0_packed_f32_usm,
+        128
+    );
 
     pub fn matvec_iq1_s_packed_f32_usm(
         stream: &SyclStream,
@@ -3892,8 +4380,14 @@ mod imp {
         }
         unsafe {
             rsl_matvec_iq1_s_packed_f32_batched_usm(
-                stream.raw, w_bytes_usm, x_usm, out_usm,
-                m as c_int, k as c_int, n as c_int, lws as c_int,
+                stream.raw,
+                w_bytes_usm,
+                x_usm,
+                out_usm,
+                m as c_int,
+                k as c_int,
+                n as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -3921,8 +4415,14 @@ mod imp {
         }
         unsafe {
             rsl_matvec_iq1_m_packed_f32_batched_usm(
-                stream.raw, w_bytes_usm, x_usm, out_usm,
-                m as c_int, k as c_int, n as c_int, lws as c_int,
+                stream.raw,
+                w_bytes_usm,
+                x_usm,
+                out_usm,
+                m as c_int,
+                k as c_int,
+                n as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -3950,8 +4450,14 @@ mod imp {
         }
         unsafe {
             rsl_matvec_iq2_xxs_packed_f32_batched_usm(
-                stream.raw, w_bytes_usm, x_usm, out_usm,
-                m as c_int, k as c_int, n as c_int, lws as c_int,
+                stream.raw,
+                w_bytes_usm,
+                x_usm,
+                out_usm,
+                m as c_int,
+                k as c_int,
+                n as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -3979,8 +4485,14 @@ mod imp {
         }
         unsafe {
             rsl_matvec_iq2_xs_packed_f32_batched_usm(
-                stream.raw, w_bytes_usm, x_usm, out_usm,
-                m as c_int, k as c_int, n as c_int, lws as c_int,
+                stream.raw,
+                w_bytes_usm,
+                x_usm,
+                out_usm,
+                m as c_int,
+                k as c_int,
+                n as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -4008,8 +4520,14 @@ mod imp {
         }
         unsafe {
             rsl_matvec_iq2_s_packed_f32_batched_usm(
-                stream.raw, w_bytes_usm, x_usm, out_usm,
-                m as c_int, k as c_int, n as c_int, lws as c_int,
+                stream.raw,
+                w_bytes_usm,
+                x_usm,
+                out_usm,
+                m as c_int,
+                k as c_int,
+                n as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -4037,8 +4555,14 @@ mod imp {
         }
         unsafe {
             rsl_matvec_iq3_xxs_packed_f32_batched_usm(
-                stream.raw, w_bytes_usm, x_usm, out_usm,
-                m as c_int, k as c_int, n as c_int, lws as c_int,
+                stream.raw,
+                w_bytes_usm,
+                x_usm,
+                out_usm,
+                m as c_int,
+                k as c_int,
+                n as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -4066,8 +4590,14 @@ mod imp {
         }
         unsafe {
             rsl_matvec_iq3_s_packed_f32_batched_usm(
-                stream.raw, w_bytes_usm, x_usm, out_usm,
-                m as c_int, k as c_int, n as c_int, lws as c_int,
+                stream.raw,
+                w_bytes_usm,
+                x_usm,
+                out_usm,
+                m as c_int,
+                k as c_int,
+                n as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -4198,9 +4728,15 @@ mod imp {
                 targets,
                 delta,
                 grid_f32,
-                out_grid_idx_abs, out_signed_score_abs, out_norm_sq_abs,
-                out_grid_idx_pos, out_signed_score_pos, out_norm_sq_pos,
-                out_grid_idx_neg, out_signed_score_neg, out_norm_sq_neg,
+                out_grid_idx_abs,
+                out_signed_score_abs,
+                out_norm_sq_abs,
+                out_grid_idx_pos,
+                out_signed_score_pos,
+                out_norm_sq_pos,
+                out_grid_idx_neg,
+                out_signed_score_neg,
+                out_norm_sq_neg,
                 n_chunks as c_int,
             );
         }
@@ -4235,9 +4771,15 @@ mod imp {
                 weights,
                 delta,
                 grid_f32,
-                out_grid_idx_abs, out_signed_score_abs, out_norm_sq_abs,
-                out_grid_idx_pos, out_signed_score_pos, out_norm_sq_pos,
-                out_grid_idx_neg, out_signed_score_neg, out_norm_sq_neg,
+                out_grid_idx_abs,
+                out_signed_score_abs,
+                out_norm_sq_abs,
+                out_grid_idx_pos,
+                out_signed_score_pos,
+                out_norm_sq_pos,
+                out_grid_idx_neg,
+                out_signed_score_neg,
+                out_norm_sq_neg,
                 n_chunks as c_int,
             );
         }
@@ -4402,13 +4944,7 @@ mod imp {
         // across the call; kernel writes in-place + sets fallback
         // flag. `.wait()`s.
         unsafe {
-            rsl_sampler_top_p_usm(
-                stream.raw,
-                probs_usm,
-                vocab as c_int,
-                p,
-                needs_fallback_usm,
-            );
+            rsl_sampler_top_p_usm(stream.raw, probs_usm, vocab as c_int, p, needs_fallback_usm);
         }
         consume_error()
     }
@@ -4608,8 +5144,12 @@ mod imp {
                 }
                 if k % $kmod != 0 {
                     return Err(SyclError::InvalidShape(format!(
-                        concat!(stringify!($name), ": K must be a multiple of ",
-                                stringify!($kmod), ", got {}"),
+                        concat!(
+                            stringify!($name),
+                            ": K must be a multiple of ",
+                            stringify!($kmod),
+                            ", got {}"
+                        ),
                         k
                     )));
                 }
@@ -4617,8 +5157,14 @@ mod imp {
                 // across the call; kernel waits before returning.
                 unsafe {
                     $ffi(
-                        stream.raw, w_bytes_usm, x_usm, out_usm,
-                        m as c_int, k as c_int, n as c_int, lws as c_int,
+                        stream.raw,
+                        w_bytes_usm,
+                        x_usm,
+                        out_usm,
+                        m as c_int,
+                        k as c_int,
+                        n as c_int,
+                        lws as c_int,
                     );
                 }
                 consume_error()
@@ -4626,26 +5172,56 @@ mod imp {
         };
     }
 
-    batched_matvec_imp!(matvec_q5_0_packed_f32_batched_usm,
-                        rsl_matvec_q5_0_packed_f32_batched_usm, 32);
-    batched_matvec_imp!(matvec_q4_1_packed_f32_batched_usm,
-                        rsl_matvec_q4_1_packed_f32_batched_usm, 32);
-    batched_matvec_imp!(matvec_q5_1_packed_f32_batched_usm,
-                        rsl_matvec_q5_1_packed_f32_batched_usm, 32);
-    batched_matvec_imp!(matvec_q2_k_packed_f32_batched_usm,
-                        rsl_matvec_q2_k_packed_f32_batched_usm, 256);
-    batched_matvec_imp!(matvec_q3_k_packed_f32_batched_usm,
-                        rsl_matvec_q3_k_packed_f32_batched_usm, 256);
-    batched_matvec_imp!(matvec_q8_k_packed_f32_batched_usm,
-                        rsl_matvec_q8_k_packed_f32_batched_usm, 256);
-    batched_matvec_imp!(matvec_pq2_0_packed_f32_batched_usm,
-                        rsl_matvec_pq2_0_packed_f32_batched_usm, 128);
-    batched_matvec_imp!(matvec_mxfp4_packed_f32_batched_usm,
-                        rsl_matvec_mxfp4_packed_f32_batched_usm, 32);
-    batched_matvec_imp!(matvec_mxfp6_packed_f32_batched_usm,
-                        rsl_matvec_mxfp6_packed_f32_batched_usm, 32);
-    batched_matvec_imp!(matvec_mxfp8_packed_f32_batched_usm,
-                        rsl_matvec_mxfp8_packed_f32_batched_usm, 32);
+    batched_matvec_imp!(
+        matvec_q5_0_packed_f32_batched_usm,
+        rsl_matvec_q5_0_packed_f32_batched_usm,
+        32
+    );
+    batched_matvec_imp!(
+        matvec_q4_1_packed_f32_batched_usm,
+        rsl_matvec_q4_1_packed_f32_batched_usm,
+        32
+    );
+    batched_matvec_imp!(
+        matvec_q5_1_packed_f32_batched_usm,
+        rsl_matvec_q5_1_packed_f32_batched_usm,
+        32
+    );
+    batched_matvec_imp!(
+        matvec_q2_k_packed_f32_batched_usm,
+        rsl_matvec_q2_k_packed_f32_batched_usm,
+        256
+    );
+    batched_matvec_imp!(
+        matvec_q3_k_packed_f32_batched_usm,
+        rsl_matvec_q3_k_packed_f32_batched_usm,
+        256
+    );
+    batched_matvec_imp!(
+        matvec_q8_k_packed_f32_batched_usm,
+        rsl_matvec_q8_k_packed_f32_batched_usm,
+        256
+    );
+    batched_matvec_imp!(
+        matvec_pq2_0_packed_f32_batched_usm,
+        rsl_matvec_pq2_0_packed_f32_batched_usm,
+        128
+    );
+    batched_matvec_imp!(
+        matvec_mxfp4_packed_f32_batched_usm,
+        rsl_matvec_mxfp4_packed_f32_batched_usm,
+        32
+    );
+    batched_matvec_imp!(
+        matvec_mxfp6_packed_f32_batched_usm,
+        rsl_matvec_mxfp6_packed_f32_batched_usm,
+        32
+    );
+    batched_matvec_imp!(
+        matvec_mxfp8_packed_f32_batched_usm,
+        rsl_matvec_mxfp8_packed_f32_batched_usm,
+        32
+    );
 
     pub fn matvec_iq4_nl_packed_f32_batched_usm(
         stream: &SyclStream,
@@ -4960,9 +5536,15 @@ mod imp {
         }
         unsafe {
             rsl_kv_quantize_q8_0_store_usm(
-                stream.raw, src_usm, q_dst_usm, scales_dst_usm,
-                n_new as c_int, n_kv_heads as c_int, head_dim as c_int,
-                max_ctx as c_int, kv_len_base as c_int,
+                stream.raw,
+                src_usm,
+                q_dst_usm,
+                scales_dst_usm,
+                n_new as c_int,
+                n_kv_heads as c_int,
+                head_dim as c_int,
+                max_ctx as c_int,
+                kv_len_base as c_int,
             );
         }
         consume_error()
@@ -4977,7 +5559,9 @@ mod imp {
         n_blocks: u32,
     ) -> Result<()> {
         if n_blocks == 0 {
-            return Err(SyclError::InvalidShape("encode_q6_k_blocks_usm: n_blocks == 0".into()));
+            return Err(SyclError::InvalidShape(
+                "encode_q6_k_blocks_usm: n_blocks == 0".into(),
+            ));
         }
         unsafe {
             rsl_encode_q6_k_blocks_usm(stream.raw, src_usm, dst_usm, n_blocks as c_int);
@@ -4994,7 +5578,9 @@ mod imp {
         n_blocks: u32,
     ) -> Result<()> {
         if n_blocks == 0 {
-            return Err(SyclError::InvalidShape("encode_q3_k_blocks_usm: n_blocks == 0".into()));
+            return Err(SyclError::InvalidShape(
+                "encode_q3_k_blocks_usm: n_blocks == 0".into(),
+            ));
         }
         unsafe {
             rsl_encode_q3_k_blocks_usm(stream.raw, src_usm, dst_usm, n_blocks as c_int);
@@ -5012,7 +5598,9 @@ mod imp {
         n_blocks: u32,
     ) -> Result<()> {
         if n_blocks == 0 {
-            return Err(SyclError::InvalidShape("encode_q4_k_blocks_usm: n_blocks == 0".into()));
+            return Err(SyclError::InvalidShape(
+                "encode_q4_k_blocks_usm: n_blocks == 0".into(),
+            ));
         }
         unsafe {
             rsl_encode_q4_k_blocks_usm(stream.raw, src_usm, dst_usm, n_blocks as c_int);
@@ -5030,7 +5618,9 @@ mod imp {
         n_blocks: u32,
     ) -> Result<()> {
         if n_blocks == 0 {
-            return Err(SyclError::InvalidShape("encode_q5_k_blocks_usm: n_blocks == 0".into()));
+            return Err(SyclError::InvalidShape(
+                "encode_q5_k_blocks_usm: n_blocks == 0".into(),
+            ));
         }
         unsafe {
             rsl_encode_q5_k_blocks_usm(stream.raw, src_usm, dst_usm, n_blocks as c_int);
@@ -5068,8 +5658,12 @@ mod imp {
                 stream.raw,
                 gate_w_bytes_usm as *const std::ffi::c_void,
                 up_w_bytes_usm as *const std::ffi::c_void,
-                x_usm, gate_out_usm, up_out_usm,
-                m as c_int, k as c_int, lws as c_int,
+                x_usm,
+                gate_out_usm,
+                up_out_usm,
+                m as c_int,
+                k as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -5102,8 +5696,12 @@ mod imp {
                 stream.raw,
                 gate_w_bytes_usm as *const std::ffi::c_void,
                 up_w_bytes_usm as *const std::ffi::c_void,
-                x_usm, gate_out_usm, up_out_usm,
-                m as c_int, k as c_int, lws as c_int,
+                x_usm,
+                gate_out_usm,
+                up_out_usm,
+                m as c_int,
+                k as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -5136,8 +5734,12 @@ mod imp {
                 stream.raw,
                 gate_w_bytes_usm as *const std::ffi::c_void,
                 up_w_bytes_usm as *const std::ffi::c_void,
-                x_usm, gate_out_usm, up_out_usm,
-                m as c_int, k as c_int, lws as c_int,
+                x_usm,
+                gate_out_usm,
+                up_out_usm,
+                m as c_int,
+                k as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -5170,8 +5772,12 @@ mod imp {
                 stream.raw,
                 gate_w_bytes_usm as *const std::ffi::c_void,
                 up_w_bytes_usm as *const std::ffi::c_void,
-                x_usm, gate_out_usm, up_out_usm,
-                m as c_int, k as c_int, lws as c_int,
+                x_usm,
+                gate_out_usm,
+                up_out_usm,
+                m as c_int,
+                k as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -5204,8 +5810,12 @@ mod imp {
                 stream.raw,
                 gate_w_bytes_usm as *const std::ffi::c_void,
                 up_w_bytes_usm as *const std::ffi::c_void,
-                x_usm, gate_out_usm, up_out_usm,
-                m as c_int, k as c_int, lws as c_int,
+                x_usm,
+                gate_out_usm,
+                up_out_usm,
+                m as c_int,
+                k as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -5238,8 +5848,12 @@ mod imp {
                 stream.raw,
                 gate_w_bytes_usm as *const std::ffi::c_void,
                 up_w_bytes_usm as *const std::ffi::c_void,
-                x_usm, gate_out_usm, up_out_usm,
-                m as c_int, k as c_int, lws as c_int,
+                x_usm,
+                gate_out_usm,
+                up_out_usm,
+                m as c_int,
+                k as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -5272,8 +5886,12 @@ mod imp {
                 stream.raw,
                 gate_w_bytes_usm as *const std::ffi::c_void,
                 up_w_bytes_usm as *const std::ffi::c_void,
-                x_usm, gate_out_usm, up_out_usm,
-                m as c_int, k as c_int, lws as c_int,
+                x_usm,
+                gate_out_usm,
+                up_out_usm,
+                m as c_int,
+                k as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -5306,8 +5924,12 @@ mod imp {
                 stream.raw,
                 gate_w_bytes_usm as *const std::ffi::c_void,
                 up_w_bytes_usm as *const std::ffi::c_void,
-                x_usm, gate_out_usm, up_out_usm,
-                m as c_int, k as c_int, lws as c_int,
+                x_usm,
+                gate_out_usm,
+                up_out_usm,
+                m as c_int,
+                k as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -5340,8 +5962,12 @@ mod imp {
                 stream.raw,
                 gate_w_bytes_usm as *const std::ffi::c_void,
                 up_w_bytes_usm as *const std::ffi::c_void,
-                x_usm, gate_out_usm, up_out_usm,
-                m as c_int, k as c_int, lws as c_int,
+                x_usm,
+                gate_out_usm,
+                up_out_usm,
+                m as c_int,
+                k as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -5374,8 +6000,12 @@ mod imp {
                 stream.raw,
                 gate_w_bytes_usm as *const std::ffi::c_void,
                 up_w_bytes_usm as *const std::ffi::c_void,
-                x_usm, gate_out_usm, up_out_usm,
-                m as c_int, k as c_int, lws as c_int,
+                x_usm,
+                gate_out_usm,
+                up_out_usm,
+                m as c_int,
+                k as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -5408,8 +6038,12 @@ mod imp {
                 stream.raw,
                 gate_w_bytes_usm as *const std::ffi::c_void,
                 up_w_bytes_usm as *const std::ffi::c_void,
-                x_usm, gate_out_usm, up_out_usm,
-                m as c_int, k as c_int, lws as c_int,
+                x_usm,
+                gate_out_usm,
+                up_out_usm,
+                m as c_int,
+                k as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -5442,8 +6076,12 @@ mod imp {
                 stream.raw,
                 gate_w_bytes_usm as *const std::ffi::c_void,
                 up_w_bytes_usm as *const std::ffi::c_void,
-                x_usm, gate_out_usm, up_out_usm,
-                m as c_int, k as c_int, lws as c_int,
+                x_usm,
+                gate_out_usm,
+                up_out_usm,
+                m as c_int,
+                k as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -5476,8 +6114,12 @@ mod imp {
                 stream.raw,
                 gate_w_bytes_usm as *const std::ffi::c_void,
                 up_w_bytes_usm as *const std::ffi::c_void,
-                x_usm, gate_out_usm, up_out_usm,
-                m as c_int, k as c_int, lws as c_int,
+                x_usm,
+                gate_out_usm,
+                up_out_usm,
+                m as c_int,
+                k as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -5510,8 +6152,12 @@ mod imp {
                 stream.raw,
                 gate_w_bytes_usm as *const std::ffi::c_void,
                 up_w_bytes_usm as *const std::ffi::c_void,
-                x_usm, gate_out_usm, up_out_usm,
-                m as c_int, k as c_int, lws as c_int,
+                x_usm,
+                gate_out_usm,
+                up_out_usm,
+                m as c_int,
+                k as c_int,
+                lws as c_int,
             );
         }
         consume_error()
@@ -5547,8 +6193,13 @@ mod imp {
             rsl_matvec_q4_k_add_rmsnorm_usm(
                 stream.raw,
                 w_bytes_usm as *const std::ffi::c_void,
-                attn_usm, hidden_usm, w_norm_usm, y_norm_usm,
-                m as c_int, k as c_int, eps,
+                attn_usm,
+                hidden_usm,
+                w_norm_usm,
+                y_norm_usm,
+                m as c_int,
+                k as c_int,
+                eps,
                 lws as c_int,
             );
         }
@@ -5561,82 +6212,233 @@ mod imp {
         ($name:ident, $ffi:ident, $align:expr) => {
             #[allow(clippy::too_many_arguments)]
             pub fn $name(
-                stream: &SyclStream, w_bytes_usm: *const u8, attn_usm: *const f32,
-                hidden_usm: *mut f32, w_norm_usm: *const f32, y_norm_usm: *mut f32,
-                m: u32, k: u32, eps: f32, lws: u32,
+                stream: &SyclStream,
+                w_bytes_usm: *const u8,
+                attn_usm: *const f32,
+                hidden_usm: *mut f32,
+                w_norm_usm: *const f32,
+                y_norm_usm: *mut f32,
+                m: u32,
+                k: u32,
+                eps: f32,
+                lws: u32,
             ) -> Result<()> {
                 if m == 0 || k == 0 {
                     return Err(SyclError::InvalidShape(format!(
-                        concat!(stringify!($name), ": zero dim (M={}, K={})"), m, k)));
+                        concat!(stringify!($name), ": zero dim (M={}, K={})"),
+                        m, k
+                    )));
                 }
                 if k % $align != 0 {
                     return Err(SyclError::InvalidShape(format!(
-                        concat!(stringify!($name), ": K must be a multiple of ", stringify!($align), ", got {}"), k)));
+                        concat!(
+                            stringify!($name),
+                            ": K must be a multiple of ",
+                            stringify!($align),
+                            ", got {}"
+                        ),
+                        k
+                    )));
                 }
                 unsafe {
                     $ffi(
                         stream.raw,
                         w_bytes_usm as *const std::ffi::c_void,
-                        attn_usm, hidden_usm, w_norm_usm, y_norm_usm,
-                        m as c_int, k as c_int, eps, lws as c_int,
+                        attn_usm,
+                        hidden_usm,
+                        w_norm_usm,
+                        y_norm_usm,
+                        m as c_int,
+                        k as c_int,
+                        eps,
+                        lws as c_int,
                     );
                 }
                 consume_error()
             }
         };
     }
-    h6_real_wrapper!(matvec_q8_0_add_rmsnorm_usm, rsl_matvec_q8_0_add_rmsnorm_usm, 32);
-    h6_real_wrapper!(matvec_q5_k_add_rmsnorm_usm, rsl_matvec_q5_k_add_rmsnorm_usm, 256);
-    h6_real_wrapper!(matvec_q6_k_add_rmsnorm_usm, rsl_matvec_q6_k_add_rmsnorm_usm, 256);
-    h6_real_wrapper!(matvec_iq4_nl_add_rmsnorm_usm, rsl_matvec_iq4_nl_add_rmsnorm_usm, 32);
-    h6_real_wrapper!(matvec_iq4_xs_add_rmsnorm_usm, rsl_matvec_iq4_xs_add_rmsnorm_usm, 256);
-    h6_real_wrapper!(matvec_iq1_s_add_rmsnorm_usm, rsl_matvec_iq1_s_add_rmsnorm_usm, 256);
-    h6_real_wrapper!(matvec_iq1_m_add_rmsnorm_usm, rsl_matvec_iq1_m_add_rmsnorm_usm, 256);
-    h6_real_wrapper!(matvec_iq2_xxs_add_rmsnorm_usm, rsl_matvec_iq2_xxs_add_rmsnorm_usm, 256);
-    h6_real_wrapper!(matvec_iq2_xs_add_rmsnorm_usm, rsl_matvec_iq2_xs_add_rmsnorm_usm, 256);
-    h6_real_wrapper!(matvec_iq2_s_add_rmsnorm_usm, rsl_matvec_iq2_s_add_rmsnorm_usm, 256);
-    h6_real_wrapper!(matvec_iq3_xxs_add_rmsnorm_usm, rsl_matvec_iq3_xxs_add_rmsnorm_usm, 256);
-    h6_real_wrapper!(matvec_iq3_s_add_rmsnorm_usm, rsl_matvec_iq3_s_add_rmsnorm_usm, 256);
-    h6_real_wrapper!(matvec_ptq1_0_add_rmsnorm_usm, rsl_matvec_ptq1_0_add_rmsnorm_usm, 128);
+    h6_real_wrapper!(
+        matvec_q8_0_add_rmsnorm_usm,
+        rsl_matvec_q8_0_add_rmsnorm_usm,
+        32
+    );
+    h6_real_wrapper!(
+        matvec_q5_k_add_rmsnorm_usm,
+        rsl_matvec_q5_k_add_rmsnorm_usm,
+        256
+    );
+    h6_real_wrapper!(
+        matvec_q6_k_add_rmsnorm_usm,
+        rsl_matvec_q6_k_add_rmsnorm_usm,
+        256
+    );
+    h6_real_wrapper!(
+        matvec_iq4_nl_add_rmsnorm_usm,
+        rsl_matvec_iq4_nl_add_rmsnorm_usm,
+        32
+    );
+    h6_real_wrapper!(
+        matvec_iq4_xs_add_rmsnorm_usm,
+        rsl_matvec_iq4_xs_add_rmsnorm_usm,
+        256
+    );
+    h6_real_wrapper!(
+        matvec_iq1_s_add_rmsnorm_usm,
+        rsl_matvec_iq1_s_add_rmsnorm_usm,
+        256
+    );
+    h6_real_wrapper!(
+        matvec_iq1_m_add_rmsnorm_usm,
+        rsl_matvec_iq1_m_add_rmsnorm_usm,
+        256
+    );
+    h6_real_wrapper!(
+        matvec_iq2_xxs_add_rmsnorm_usm,
+        rsl_matvec_iq2_xxs_add_rmsnorm_usm,
+        256
+    );
+    h6_real_wrapper!(
+        matvec_iq2_xs_add_rmsnorm_usm,
+        rsl_matvec_iq2_xs_add_rmsnorm_usm,
+        256
+    );
+    h6_real_wrapper!(
+        matvec_iq2_s_add_rmsnorm_usm,
+        rsl_matvec_iq2_s_add_rmsnorm_usm,
+        256
+    );
+    h6_real_wrapper!(
+        matvec_iq3_xxs_add_rmsnorm_usm,
+        rsl_matvec_iq3_xxs_add_rmsnorm_usm,
+        256
+    );
+    h6_real_wrapper!(
+        matvec_iq3_s_add_rmsnorm_usm,
+        rsl_matvec_iq3_s_add_rmsnorm_usm,
+        256
+    );
+    h6_real_wrapper!(
+        matvec_ptq1_0_add_rmsnorm_usm,
+        rsl_matvec_ptq1_0_add_rmsnorm_usm,
+        128
+    );
 
     // H8: F16-input matvec safe wrappers — identical shape, only the
     // FFI symbol + K-alignment differ.
     macro_rules! h8_real_wrapper {
         ($name:ident, $ffi:ident, $align:expr) => {
             pub fn $name(
-                stream: &SyclStream, w_bytes_usm: *const u8, x_f16: *const u16,
-                out_usm: *mut f32, m: u32, k: u32, lws: u32,
+                stream: &SyclStream,
+                w_bytes_usm: *const u8,
+                x_f16: *const u16,
+                out_usm: *mut f32,
+                m: u32,
+                k: u32,
+                lws: u32,
             ) -> Result<()> {
                 if m == 0 || k == 0 {
                     return Err(SyclError::InvalidShape(format!(
-                        concat!(stringify!($name), ": zero dim (M={}, K={})"), m, k)));
+                        concat!(stringify!($name), ": zero dim (M={}, K={})"),
+                        m, k
+                    )));
                 }
                 if k % $align != 0 {
                     return Err(SyclError::InvalidShape(format!(
-                        concat!(stringify!($name), ": K must be a multiple of ", stringify!($align), ", got {}"), k)));
+                        concat!(
+                            stringify!($name),
+                            ": K must be a multiple of ",
+                            stringify!($align),
+                            ", got {}"
+                        ),
+                        k
+                    )));
                 }
                 unsafe {
-                    $ffi(stream.raw, w_bytes_usm as *const std::ffi::c_void,
-                         x_f16, out_usm, m as c_int, k as c_int, lws as c_int);
+                    $ffi(
+                        stream.raw,
+                        w_bytes_usm as *const std::ffi::c_void,
+                        x_f16,
+                        out_usm,
+                        m as c_int,
+                        k as c_int,
+                        lws as c_int,
+                    );
                 }
                 consume_error()
             }
         };
     }
-    h8_real_wrapper!(matvec_q8_0_f16in_packed_f32_usm, rsl_matvec_q8_0_f16in_packed_f32_usm, 32);
-    h8_real_wrapper!(matvec_q4_k_f16in_packed_f32_usm, rsl_matvec_q4_k_f16in_packed_f32_usm, 256);
-    h8_real_wrapper!(matvec_q5_k_f16in_packed_f32_usm, rsl_matvec_q5_k_f16in_packed_f32_usm, 256);
-    h8_real_wrapper!(matvec_q6_k_f16in_packed_f32_usm, rsl_matvec_q6_k_f16in_packed_f32_usm, 256);
-    h8_real_wrapper!(matvec_iq4_nl_f16in_packed_f32_usm, rsl_matvec_iq4_nl_f16in_packed_f32_usm, 32);
-    h8_real_wrapper!(matvec_iq4_xs_f16in_packed_f32_usm, rsl_matvec_iq4_xs_f16in_packed_f32_usm, 256);
-    h8_real_wrapper!(matvec_iq1_s_f16in_packed_f32_usm, rsl_matvec_iq1_s_f16in_packed_f32_usm, 256);
-    h8_real_wrapper!(matvec_iq1_m_f16in_packed_f32_usm, rsl_matvec_iq1_m_f16in_packed_f32_usm, 256);
-    h8_real_wrapper!(matvec_iq2_xxs_f16in_packed_f32_usm, rsl_matvec_iq2_xxs_f16in_packed_f32_usm, 256);
-    h8_real_wrapper!(matvec_iq2_xs_f16in_packed_f32_usm, rsl_matvec_iq2_xs_f16in_packed_f32_usm, 256);
-    h8_real_wrapper!(matvec_iq2_s_f16in_packed_f32_usm, rsl_matvec_iq2_s_f16in_packed_f32_usm, 256);
-    h8_real_wrapper!(matvec_iq3_xxs_f16in_packed_f32_usm, rsl_matvec_iq3_xxs_f16in_packed_f32_usm, 256);
-    h8_real_wrapper!(matvec_iq3_s_f16in_packed_f32_usm, rsl_matvec_iq3_s_f16in_packed_f32_usm, 256);
-    h8_real_wrapper!(matvec_ptq1_0_f16in_packed_f32_usm, rsl_matvec_ptq1_0_f16in_packed_f32_usm, 128);
+    h8_real_wrapper!(
+        matvec_q8_0_f16in_packed_f32_usm,
+        rsl_matvec_q8_0_f16in_packed_f32_usm,
+        32
+    );
+    h8_real_wrapper!(
+        matvec_q4_k_f16in_packed_f32_usm,
+        rsl_matvec_q4_k_f16in_packed_f32_usm,
+        256
+    );
+    h8_real_wrapper!(
+        matvec_q5_k_f16in_packed_f32_usm,
+        rsl_matvec_q5_k_f16in_packed_f32_usm,
+        256
+    );
+    h8_real_wrapper!(
+        matvec_q6_k_f16in_packed_f32_usm,
+        rsl_matvec_q6_k_f16in_packed_f32_usm,
+        256
+    );
+    h8_real_wrapper!(
+        matvec_iq4_nl_f16in_packed_f32_usm,
+        rsl_matvec_iq4_nl_f16in_packed_f32_usm,
+        32
+    );
+    h8_real_wrapper!(
+        matvec_iq4_xs_f16in_packed_f32_usm,
+        rsl_matvec_iq4_xs_f16in_packed_f32_usm,
+        256
+    );
+    h8_real_wrapper!(
+        matvec_iq1_s_f16in_packed_f32_usm,
+        rsl_matvec_iq1_s_f16in_packed_f32_usm,
+        256
+    );
+    h8_real_wrapper!(
+        matvec_iq1_m_f16in_packed_f32_usm,
+        rsl_matvec_iq1_m_f16in_packed_f32_usm,
+        256
+    );
+    h8_real_wrapper!(
+        matvec_iq2_xxs_f16in_packed_f32_usm,
+        rsl_matvec_iq2_xxs_f16in_packed_f32_usm,
+        256
+    );
+    h8_real_wrapper!(
+        matvec_iq2_xs_f16in_packed_f32_usm,
+        rsl_matvec_iq2_xs_f16in_packed_f32_usm,
+        256
+    );
+    h8_real_wrapper!(
+        matvec_iq2_s_f16in_packed_f32_usm,
+        rsl_matvec_iq2_s_f16in_packed_f32_usm,
+        256
+    );
+    h8_real_wrapper!(
+        matvec_iq3_xxs_f16in_packed_f32_usm,
+        rsl_matvec_iq3_xxs_f16in_packed_f32_usm,
+        256
+    );
+    h8_real_wrapper!(
+        matvec_iq3_s_f16in_packed_f32_usm,
+        rsl_matvec_iq3_s_f16in_packed_f32_usm,
+        256
+    );
+    h8_real_wrapper!(
+        matvec_ptq1_0_f16in_packed_f32_usm,
+        rsl_matvec_ptq1_0_f16in_packed_f32_usm,
+        128
+    );
 
     /// G5: K-quant → F32 dequant (USM-in / USM-out). `format` selects
     /// the kernel; `bytes_usm` must point to `n_blocks * block_size`
@@ -5815,8 +6617,7 @@ mod imp {
         kv_len: u32,
         scale: f32,
     ) -> Result<()> {
-        let total =
-            (n_heads as usize) * (seq as usize) * (kv_len as usize);
+        let total = (n_heads as usize) * (seq as usize) * (kv_len as usize);
         if scores.len() < total {
             return Err(SyclError::InvalidShape(format!(
                 "scores too small: have {}, need n_heads*seq*kv_len = {total}",
@@ -5847,12 +6648,7 @@ mod imp {
         consume_error()
     }
 
-    pub fn silu_mul(
-        stream: &mut SyclStream,
-        x: &[u16],
-        y: &[u16],
-        out: &mut [u16],
-    ) -> Result<()> {
+    pub fn silu_mul(stream: &mut SyclStream, x: &[u16], y: &[u16], out: &mut [u16]) -> Result<()> {
         let n = x.len();
         if y.len() != n {
             return Err(SyclError::InvalidShape(format!(
@@ -5879,11 +6675,7 @@ mod imp {
         consume_error()
     }
 
-    pub fn dequant_nvfp4(
-        stream: &mut SyclStream,
-        w_nvfp4: &[u8],
-        out: &mut [u16],
-    ) -> Result<()> {
+    pub fn dequant_nvfp4(stream: &mut SyclStream, w_nvfp4: &[u8], out: &mut [u16]) -> Result<()> {
         const BLOCK_BYTES: usize = 9;
         const BLOCK_ELEMS: usize = 16;
         if w_nvfp4.is_empty() {
@@ -6186,9 +6978,8 @@ pub unsafe fn flash_attn_decode_usm_raw(
         )));
     }
     imp::flash_attn_decode_usm(
-        stream, q_usm, k_usm, v_usm, out_usm,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-        0, 0.0, // raw variant is full-attention/no-softcap (kept for callers)
+        stream, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0,
+        0.0, // raw variant is full-attention/no-softcap (kept for callers)
     )
 }
 
@@ -6276,18 +7067,31 @@ pub unsafe fn decode_attn_block_usm_raw(
     let mut ffn_ran: std::os::raw::c_int = 0;
     let ran = imp::rsl_decode_attn_block_usm(
         stream.raw,
-        wq_usm, kq as std::os::raw::c_int,
-        wk_usm, kk as std::os::raw::c_int,
-        wv_usm, kv_kind as std::os::raw::c_int,
-        wo_usm, ko as std::os::raw::c_int,
-        wg, kg as std::os::raw::c_int,
-        wu, ku as std::os::raw::c_int,
-        wd, kd as std::os::raw::c_int,
+        wq_usm,
+        kq as std::os::raw::c_int,
+        wk_usm,
+        kk as std::os::raw::c_int,
+        wv_usm,
+        kv_kind as std::os::raw::c_int,
+        wo_usm,
+        ko as std::os::raw::c_int,
+        wg,
+        kg as std::os::raw::c_int,
+        wu,
+        ku as std::os::raw::c_int,
+        wd,
+        kd as std::os::raw::c_int,
         d_ff as std::os::raw::c_int,
         &mut ffn_ran as *mut std::os::raw::c_int,
-        attn_norm, ffn_norm, inv_freq,
-        hidden, h_norm2, k_row, v_row,
-        k_mirror, v_mirror,
+        attn_norm,
+        ffn_norm,
+        inv_freq,
+        hidden,
+        h_norm2,
+        k_row,
+        v_row,
+        k_mirror,
+        v_mirror,
         n_heads as std::os::raw::c_int,
         n_kv_heads as std::os::raw::c_int,
         head_dim as std::os::raw::c_int,
@@ -6544,8 +7348,13 @@ macro_rules! packed_matvec_raw_wrapper {
         /// the dtype's packed layout, `x_usm` ≥ K f32, `out_usm` ≥ M f32,
         /// all on the same `stream`; the kernel `.wait()`s before return.
         pub unsafe fn $raw(
-            stream: &SyclStream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: u32, k: u32, lws: u32,
+            stream: &SyclStream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: u32,
+            k: u32,
+            lws: u32,
         ) -> Result<()> {
             imp::$imp(stream, w_bytes_usm, x_usm, out_usm, m, k, lws)
         }
@@ -6921,9 +7730,15 @@ pub unsafe fn iq_search_8elt_delta_iq1s_all3_raw(
         targets,
         delta,
         grid_f32,
-        out_grid_idx_abs, out_signed_score_abs, out_norm_sq_abs,
-        out_grid_idx_pos, out_signed_score_pos, out_norm_sq_pos,
-        out_grid_idx_neg, out_signed_score_neg, out_norm_sq_neg,
+        out_grid_idx_abs,
+        out_signed_score_abs,
+        out_norm_sq_abs,
+        out_grid_idx_pos,
+        out_signed_score_pos,
+        out_norm_sq_pos,
+        out_grid_idx_neg,
+        out_signed_score_neg,
+        out_norm_sq_neg,
         n_chunks,
     )
 }
@@ -6957,9 +7772,15 @@ pub unsafe fn iq_search_8elt_delta_iq1s_all3_w_raw(
         weights,
         delta,
         grid_f32,
-        out_grid_idx_abs, out_signed_score_abs, out_norm_sq_abs,
-        out_grid_idx_pos, out_signed_score_pos, out_norm_sq_pos,
-        out_grid_idx_neg, out_signed_score_neg, out_norm_sq_neg,
+        out_grid_idx_abs,
+        out_signed_score_abs,
+        out_norm_sq_abs,
+        out_grid_idx_pos,
+        out_signed_score_pos,
+        out_norm_sq_pos,
+        out_grid_idx_neg,
+        out_signed_score_neg,
+        out_norm_sq_neg,
         n_chunks,
     )
 }
@@ -7202,11 +8023,7 @@ pub const MAX_TOP_P_GPU: u32 = 1024;
 /// succeeded, `Ok(false)` if the kernel signaled CPU fallback is
 /// needed (probs left untouched by GPU; caller runs CPU
 /// `apply_top_p`). `Err` for USM alloc / SYCL failures.
-pub fn sampler_top_p_host(
-    stream: &SyclStream,
-    probs: &mut [f32],
-    p: f32,
-) -> Result<bool> {
+pub fn sampler_top_p_host(stream: &SyclStream, probs: &mut [f32], p: f32) -> Result<bool> {
     let vocab = probs.len();
     if vocab == 0 {
         return Err(SyclError::InvalidShape(
@@ -7345,14 +8162,7 @@ pub unsafe fn sampler_penalty_usm_raw(
     presence: f32,
 ) -> Result<()> {
     imp::sampler_penalty_usm(
-        stream,
-        logits_usm,
-        vocab,
-        recent_usm,
-        recent_n,
-        repeat,
-        frequency,
-        presence,
+        stream, logits_usm, vocab, recent_usm, recent_n, repeat, frequency, presence,
     )
 }
 
@@ -7702,33 +8512,59 @@ macro_rules! batched_matvec_raw_wrapper {
         /// All three USM pointers are live on `stream` for the full extents
         /// above and outlive the call.
         pub unsafe fn $raw(
-            stream: &SyclStream, w_bytes_usm: *const u8, x_usm: *const f32,
-            out_usm: *mut f32, m: u32, k: u32, n: u32, lws: u32,
+            stream: &SyclStream,
+            w_bytes_usm: *const u8,
+            x_usm: *const f32,
+            out_usm: *mut f32,
+            m: u32,
+            k: u32,
+            n: u32,
+            lws: u32,
         ) -> Result<()> {
             imp::$imp(stream, w_bytes_usm, x_usm, out_usm, m, k, n, lws)
         }
     };
 }
-batched_matvec_raw_wrapper!(matvec_q5_0_packed_f32_batched_usm_raw,
-                            matvec_q5_0_packed_f32_batched_usm);
-batched_matvec_raw_wrapper!(matvec_q4_1_packed_f32_batched_usm_raw,
-                            matvec_q4_1_packed_f32_batched_usm);
-batched_matvec_raw_wrapper!(matvec_q5_1_packed_f32_batched_usm_raw,
-                            matvec_q5_1_packed_f32_batched_usm);
-batched_matvec_raw_wrapper!(matvec_q2_k_packed_f32_batched_usm_raw,
-                            matvec_q2_k_packed_f32_batched_usm);
-batched_matvec_raw_wrapper!(matvec_q3_k_packed_f32_batched_usm_raw,
-                            matvec_q3_k_packed_f32_batched_usm);
-batched_matvec_raw_wrapper!(matvec_q8_k_packed_f32_batched_usm_raw,
-                            matvec_q8_k_packed_f32_batched_usm);
-batched_matvec_raw_wrapper!(matvec_pq2_0_packed_f32_batched_usm_raw,
-                            matvec_pq2_0_packed_f32_batched_usm);
-batched_matvec_raw_wrapper!(matvec_mxfp4_packed_f32_batched_usm_raw,
-                            matvec_mxfp4_packed_f32_batched_usm);
-batched_matvec_raw_wrapper!(matvec_mxfp6_packed_f32_batched_usm_raw,
-                            matvec_mxfp6_packed_f32_batched_usm);
-batched_matvec_raw_wrapper!(matvec_mxfp8_packed_f32_batched_usm_raw,
-                            matvec_mxfp8_packed_f32_batched_usm);
+batched_matvec_raw_wrapper!(
+    matvec_q5_0_packed_f32_batched_usm_raw,
+    matvec_q5_0_packed_f32_batched_usm
+);
+batched_matvec_raw_wrapper!(
+    matvec_q4_1_packed_f32_batched_usm_raw,
+    matvec_q4_1_packed_f32_batched_usm
+);
+batched_matvec_raw_wrapper!(
+    matvec_q5_1_packed_f32_batched_usm_raw,
+    matvec_q5_1_packed_f32_batched_usm
+);
+batched_matvec_raw_wrapper!(
+    matvec_q2_k_packed_f32_batched_usm_raw,
+    matvec_q2_k_packed_f32_batched_usm
+);
+batched_matvec_raw_wrapper!(
+    matvec_q3_k_packed_f32_batched_usm_raw,
+    matvec_q3_k_packed_f32_batched_usm
+);
+batched_matvec_raw_wrapper!(
+    matvec_q8_k_packed_f32_batched_usm_raw,
+    matvec_q8_k_packed_f32_batched_usm
+);
+batched_matvec_raw_wrapper!(
+    matvec_pq2_0_packed_f32_batched_usm_raw,
+    matvec_pq2_0_packed_f32_batched_usm
+);
+batched_matvec_raw_wrapper!(
+    matvec_mxfp4_packed_f32_batched_usm_raw,
+    matvec_mxfp4_packed_f32_batched_usm
+);
+batched_matvec_raw_wrapper!(
+    matvec_mxfp6_packed_f32_batched_usm_raw,
+    matvec_mxfp6_packed_f32_batched_usm
+);
+batched_matvec_raw_wrapper!(
+    matvec_mxfp8_packed_f32_batched_usm_raw,
+    matvec_mxfp8_packed_f32_batched_usm
+);
 
 /// Raw-pointer variant of the batched USM IQ4_XS packed matvec.
 /// Same per-cell math as `matvec_iq4_xs_packed_f32_usm_raw`,
@@ -8081,10 +8917,7 @@ impl<'s, T: Copy> Drop for SyclSharedBuffer<'s, T> {
         // stream; we own it exclusively (we hold `&mut SyclStream`
         // and `&mut self`).
         unsafe {
-            imp::usm_free(
-                self.stream,
-                self.ptr.as_ptr() as *mut std::ffi::c_void,
-            );
+            imp::usm_free(self.stream, self.ptr.as_ptr() as *mut std::ffi::c_void);
         }
     }
 }
@@ -8144,10 +8977,7 @@ impl Drop for SyclDeviceBuffer<'_> {
         // this stream; `sycl::free` is tier-agnostic so `usm_free` frees
         // device allocations too. We own it exclusively.
         unsafe {
-            imp::usm_free(
-                self.stream,
-                self.ptr.as_ptr() as *mut std::ffi::c_void,
-            );
+            imp::usm_free(self.stream, self.ptr.as_ptr() as *mut std::ffi::c_void);
         }
     }
 }
@@ -8187,7 +9017,15 @@ pub fn rmsnorm_usm(
             w.len()
         )));
     }
-    imp::rmsnorm_usm(stream, x.as_ptr(), w.as_ptr(), y.as_mut_ptr(), n_rows, d, eps)
+    imp::rmsnorm_usm(
+        stream,
+        x.as_ptr(),
+        w.as_ptr(),
+        y.as_mut_ptr(),
+        n_rows,
+        d,
+        eps,
+    )
 }
 
 /// Fused USM-resident RMSNorm + residual add. See
@@ -8384,8 +9222,19 @@ pub unsafe fn delta_net_chunk_f32_usm_raw(
     chunk_len: u32,
 ) -> Result<()> {
     imp::delta_net_chunk_f32_usm(
-        stream, q, k, v, g, beta, state, out, n_heads, seq_len, head_qk_dim,
-        head_v_dim, chunk_len,
+        stream,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        out,
+        n_heads,
+        seq_len,
+        head_qk_dim,
+        head_v_dim,
+        chunk_len,
     )
 }
 
@@ -8528,8 +9377,19 @@ pub fn flash_attn_decode_v3_usm(
         ));
     }
     imp::flash_attn_decode_v3_usm(
-        stream, q.as_ptr(), k.as_ptr(), v.as_ptr(), out.as_mut_ptr(),
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap, tile_size,
+        stream,
+        q.as_ptr(),
+        k.as_ptr(),
+        v.as_ptr(),
+        out.as_mut_ptr(),
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len,
+        window,
+        softcap,
+        tile_size,
     )
 }
 
@@ -8567,10 +9427,9 @@ pub unsafe fn flash_attn_decode_v3_usm_raw(
         )));
     }
     imp::flash_attn_decode_v3_usm(
-        stream, q_usm, k_usm, v_usm, out_usm,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-        0, 0.0, // raw variant is full-attention/no-softcap
-        0,      // P19: tile_size 0 ⇒ built-in env + kv_len heuristic
+        stream, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0,
+        0.0, // raw variant is full-attention/no-softcap
+        0,   // P19: tile_size 0 ⇒ built-in env + kv_len heuristic
     )
 }
 
@@ -8717,7 +9576,8 @@ pub fn flash_attn_prefill_usm(
         max_ctx,
         kv_len_base,
         n_new,
-        0, 0.0, // safe wrapper is full-causal/no-softcap
+        0,
+        0.0, // safe wrapper is full-causal/no-softcap
     )
 }
 
@@ -8753,15 +9613,26 @@ pub fn flash_attn_prefill_v3_usm(
     }
     let need_q = (n_new as usize) * (n_heads as usize) * (head_dim as usize);
     let need_kv = (n_kv_heads as usize) * (max_ctx as usize) * (head_dim as usize);
-    if q.len() < need_q || out.len() < need_q || k_cache.len() < need_kv || v_cache.len() < need_kv {
+    if q.len() < need_q || out.len() < need_q || k_cache.len() < need_kv || v_cache.len() < need_kv
+    {
         return Err(SyclError::InvalidShape(
             "flash_attn_prefill_v3_usm: buffer too small for shape".into(),
         ));
     }
     imp::flash_attn_prefill_v3_usm(
-        stream, q.as_ptr(), k_cache.as_ptr(), v_cache.as_ptr(), out.as_mut_ptr(),
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-        0, 0.0, // safe wrapper is full-causal/no-softcap
+        stream,
+        q.as_ptr(),
+        k_cache.as_ptr(),
+        v_cache.as_ptr(),
+        out.as_mut_ptr(),
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        0,
+        0.0, // safe wrapper is full-causal/no-softcap
     )
 }
 
@@ -8801,9 +9672,19 @@ pub unsafe fn flash_attn_prefill_v3_usm_raw(
         )));
     }
     imp::flash_attn_prefill_v3_usm(
-        stream, q_usm, k_cache_usm, v_cache_usm, out_usm,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-        window, softcap,
+        stream,
+        q_usm,
+        k_cache_usm,
+        v_cache_usm,
+        out_usm,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        window,
+        softcap,
     )
 }
 
@@ -8841,7 +9722,8 @@ pub fn flash_attn_prefill_v2_usm(
     }
     let need_q = (n_new as usize) * (n_heads as usize) * (head_dim as usize);
     let need_kv = (n_kv_heads as usize) * (max_ctx as usize) * (head_dim as usize);
-    if q.len() < need_q || out.len() < need_q || k_cache.len() < need_kv || v_cache.len() < need_kv {
+    if q.len() < need_q || out.len() < need_q || k_cache.len() < need_kv || v_cache.len() < need_kv
+    {
         return Err(SyclError::InvalidShape(
             "flash_attn_prefill_v2_usm: buffer too small for shape".into(),
         ));
@@ -8858,7 +9740,8 @@ pub fn flash_attn_prefill_v2_usm(
         max_ctx,
         kv_len_base,
         n_new,
-        0, 0.0, // safe wrapper is full-causal/no-softcap
+        0,
+        0.0, // safe wrapper is full-causal/no-softcap
     )
 }
 
@@ -8955,9 +9838,18 @@ pub unsafe fn flash_attn_decode_q4_0_usm_raw(
     softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_decode_q4_0_usm(
-        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-        window, softcap,
+        stream,
+        q_usm,
+        k_packed_usm,
+        v_packed_usm,
+        out_usm,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len,
+        window,
+        softcap,
     )
 }
 
@@ -8985,9 +9877,19 @@ pub unsafe fn flash_attn_prefill_q4_0_usm_raw(
     softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_prefill_q4_0_usm(
-        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-        window, softcap,
+        stream,
+        q_usm,
+        k_packed_usm,
+        v_packed_usm,
+        out_usm,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        window,
+        softcap,
     )
 }
 
@@ -9013,9 +9915,18 @@ pub unsafe fn flash_attn_decode_nvfp4_usm_raw(
     softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_decode_nvfp4_usm(
-        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-        window, softcap,
+        stream,
+        q_usm,
+        k_packed_usm,
+        v_packed_usm,
+        out_usm,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len,
+        window,
+        softcap,
     )
 }
 
@@ -9042,9 +9953,19 @@ pub unsafe fn flash_attn_prefill_nvfp4_usm_raw(
     softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_prefill_nvfp4_usm(
-        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-        window, softcap,
+        stream,
+        q_usm,
+        k_packed_usm,
+        v_packed_usm,
+        out_usm,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        window,
+        softcap,
     )
 }
 
@@ -9070,9 +9991,18 @@ pub unsafe fn flash_attn_decode_mxfp4_usm_raw(
     softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_decode_mxfp4_usm(
-        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-        window, softcap,
+        stream,
+        q_usm,
+        k_packed_usm,
+        v_packed_usm,
+        out_usm,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len,
+        window,
+        softcap,
     )
 }
 
@@ -9099,9 +10029,19 @@ pub unsafe fn flash_attn_prefill_mxfp4_usm_raw(
     softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_prefill_mxfp4_usm(
-        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-        window, softcap,
+        stream,
+        q_usm,
+        k_packed_usm,
+        v_packed_usm,
+        out_usm,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        window,
+        softcap,
     )
 }
 
@@ -9127,9 +10067,18 @@ pub unsafe fn flash_attn_decode_mxfp6_usm_raw(
     softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_decode_mxfp6_usm(
-        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-        window, softcap,
+        stream,
+        q_usm,
+        k_packed_usm,
+        v_packed_usm,
+        out_usm,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len,
+        window,
+        softcap,
     )
 }
 
@@ -9156,9 +10105,19 @@ pub unsafe fn flash_attn_prefill_mxfp6_usm_raw(
     softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_prefill_mxfp6_usm(
-        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-        window, softcap,
+        stream,
+        q_usm,
+        k_packed_usm,
+        v_packed_usm,
+        out_usm,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        window,
+        softcap,
     )
 }
 
@@ -9184,9 +10143,18 @@ pub unsafe fn flash_attn_decode_mxfp8_usm_raw(
     softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_decode_mxfp8_usm(
-        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-        window, softcap,
+        stream,
+        q_usm,
+        k_packed_usm,
+        v_packed_usm,
+        out_usm,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len,
+        window,
+        softcap,
     )
 }
 
@@ -9213,9 +10181,19 @@ pub unsafe fn flash_attn_prefill_mxfp8_usm_raw(
     softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_prefill_mxfp8_usm(
-        stream, q_usm, k_packed_usm, v_packed_usm, out_usm,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-        window, softcap,
+        stream,
+        q_usm,
+        k_packed_usm,
+        v_packed_usm,
+        out_usm,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        window,
+        softcap,
     )
 }
 
@@ -9246,9 +10224,21 @@ pub unsafe fn flash_attn_decode_tq_usm_raw(
     softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_decode_tq_usm(
-        stream, q_usm, k_packed_usm, v_packed_usm, k_scales_usm, v_scales_usm,
-        bits, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-        window, softcap,
+        stream,
+        q_usm,
+        k_packed_usm,
+        v_packed_usm,
+        k_scales_usm,
+        v_scales_usm,
+        bits,
+        out_usm,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len,
+        window,
+        softcap,
     )
 }
 
@@ -9278,9 +10268,22 @@ pub unsafe fn flash_attn_prefill_tq_usm_raw(
     softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_prefill_tq_usm(
-        stream, q_usm, k_packed_usm, v_packed_usm, k_scales_usm, v_scales_usm,
-        bits, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-        window, softcap,
+        stream,
+        q_usm,
+        k_packed_usm,
+        v_packed_usm,
+        k_scales_usm,
+        v_scales_usm,
+        bits,
+        out_usm,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        window,
+        softcap,
     )
 }
 
@@ -9311,9 +10314,20 @@ pub unsafe fn flash_attn_decode_q8_0_usm_raw(
     softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_decode_q8_0_usm(
-        stream, q_usm, k_packed_usm, v_packed_usm, k_scales_usm, v_scales_usm,
-        out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-        window, softcap,
+        stream,
+        q_usm,
+        k_packed_usm,
+        v_packed_usm,
+        k_scales_usm,
+        v_scales_usm,
+        out_usm,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len,
+        window,
+        softcap,
     )
 }
 
@@ -9342,9 +10356,21 @@ pub unsafe fn flash_attn_prefill_q8_0_usm_raw(
     softcap: f32,
 ) -> Result<()> {
     imp::flash_attn_prefill_q8_0_usm(
-        stream, q_usm, k_packed_usm, v_packed_usm, k_scales_usm, v_scales_usm,
-        out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-        window, softcap,
+        stream,
+        q_usm,
+        k_packed_usm,
+        v_packed_usm,
+        k_scales_usm,
+        v_scales_usm,
+        out_usm,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        window,
+        softcap,
     )
 }
 
@@ -9386,9 +10412,8 @@ pub unsafe fn flash_attn_decode_v2_usm_raw(
         )));
     }
     imp::flash_attn_decode_v2_usm(
-        stream, q_usm, k_usm, v_usm, out_usm,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
-        0, 0.0, // raw variant is full-attention/no-softcap
+        stream, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0,
+        0.0, // raw variant is full-attention/no-softcap
     )
 }
 
@@ -9426,9 +10451,19 @@ pub unsafe fn flash_attn_prefill_v2_usm_raw(
         )));
     }
     imp::flash_attn_prefill_v2_usm(
-        stream, q_usm, k_cache_usm, v_cache_usm, out_usm,
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
-        window, softcap,
+        stream,
+        q_usm,
+        k_cache_usm,
+        v_cache_usm,
+        out_usm,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        window,
+        softcap,
     )
 }
 
@@ -9481,7 +10516,9 @@ pub fn gemm_f16_usm(
         a.as_ptr(),
         b.as_ptr(),
         c.as_mut_ptr(),
-        m, n, k,
+        m,
+        n,
+        k,
         k, // lda = K (row-major A[M,K])
         n, // ldb = N (row-major B[K,N])
         n, // ldc = N (row-major C[M,N])
@@ -10090,10 +11127,7 @@ pub unsafe fn try_import_win32_handle_as_usm_raw(
 /// `dev_ptr` must be a pointer previously returned by
 /// [`try_import_win32_handle_as_usm_raw`] on this same stream,
 /// or null. Double-free is UB (the L0 spec doesn't validate).
-pub unsafe fn release_imported_usm_raw(
-    stream: &SyclStream,
-    dev_ptr: *mut std::ffi::c_void,
-) {
+pub unsafe fn release_imported_usm_raw(stream: &SyclStream, dev_ptr: *mut std::ffi::c_void) {
     imp::release_imported_usm(stream, dev_ptr)
 }
 
@@ -10209,8 +11243,15 @@ pub unsafe fn kv_quantize_q8_0_store_usm_raw(
     kv_len_base: u32,
 ) -> Result<()> {
     imp::kv_quantize_q8_0_store_usm(
-        stream, src_usm, q_dst_usm, scales_dst_usm,
-        n_new, n_kv_heads, head_dim, max_ctx, kv_len_base,
+        stream,
+        src_usm,
+        q_dst_usm,
+        scales_dst_usm,
+        n_new,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
     )
 }
 
@@ -10292,8 +11333,15 @@ pub unsafe fn matvec_q4_k_gate_up_fused_usm_raw(
     lws: u32,
 ) -> Result<()> {
     imp::matvec_q4_k_gate_up_fused_usm(
-        stream, gate_w_bytes_usm, up_w_bytes_usm,
-        x_usm, gate_out_usm, up_out_usm, m, k, lws,
+        stream,
+        gate_w_bytes_usm,
+        up_w_bytes_usm,
+        x_usm,
+        gate_out_usm,
+        up_out_usm,
+        m,
+        k,
+        lws,
     )
 }
 
@@ -10317,8 +11365,15 @@ pub unsafe fn matvec_q8_0_gate_up_fused_usm_raw(
     lws: u32,
 ) -> Result<()> {
     imp::matvec_q8_0_gate_up_fused_usm(
-        stream, gate_w_bytes_usm, up_w_bytes_usm,
-        x_usm, gate_out_usm, up_out_usm, m, k, lws,
+        stream,
+        gate_w_bytes_usm,
+        up_w_bytes_usm,
+        x_usm,
+        gate_out_usm,
+        up_out_usm,
+        m,
+        k,
+        lws,
     )
 }
 
@@ -10341,8 +11396,15 @@ pub unsafe fn matvec_q5_k_gate_up_fused_usm_raw(
     lws: u32,
 ) -> Result<()> {
     imp::matvec_q5_k_gate_up_fused_usm(
-        stream, gate_w_bytes_usm, up_w_bytes_usm,
-        x_usm, gate_out_usm, up_out_usm, m, k, lws,
+        stream,
+        gate_w_bytes_usm,
+        up_w_bytes_usm,
+        x_usm,
+        gate_out_usm,
+        up_out_usm,
+        m,
+        k,
+        lws,
     )
 }
 
@@ -10365,8 +11427,15 @@ pub unsafe fn matvec_q6_k_gate_up_fused_usm_raw(
     lws: u32,
 ) -> Result<()> {
     imp::matvec_q6_k_gate_up_fused_usm(
-        stream, gate_w_bytes_usm, up_w_bytes_usm,
-        x_usm, gate_out_usm, up_out_usm, m, k, lws,
+        stream,
+        gate_w_bytes_usm,
+        up_w_bytes_usm,
+        x_usm,
+        gate_out_usm,
+        up_out_usm,
+        m,
+        k,
+        lws,
     )
 }
 
@@ -10389,8 +11458,15 @@ pub unsafe fn matvec_iq4_nl_gate_up_fused_usm_raw(
     lws: u32,
 ) -> Result<()> {
     imp::matvec_iq4_nl_gate_up_fused_usm(
-        stream, gate_w_bytes_usm, up_w_bytes_usm,
-        x_usm, gate_out_usm, up_out_usm, m, k, lws,
+        stream,
+        gate_w_bytes_usm,
+        up_w_bytes_usm,
+        x_usm,
+        gate_out_usm,
+        up_out_usm,
+        m,
+        k,
+        lws,
     )
 }
 
@@ -10413,8 +11489,15 @@ pub unsafe fn matvec_iq4_xs_gate_up_fused_usm_raw(
     lws: u32,
 ) -> Result<()> {
     imp::matvec_iq4_xs_gate_up_fused_usm(
-        stream, gate_w_bytes_usm, up_w_bytes_usm,
-        x_usm, gate_out_usm, up_out_usm, m, k, lws,
+        stream,
+        gate_w_bytes_usm,
+        up_w_bytes_usm,
+        x_usm,
+        gate_out_usm,
+        up_out_usm,
+        m,
+        k,
+        lws,
     )
 }
 
@@ -10437,8 +11520,15 @@ pub unsafe fn matvec_iq1_s_gate_up_fused_usm_raw(
     lws: u32,
 ) -> Result<()> {
     imp::matvec_iq1_s_gate_up_fused_usm(
-        stream, gate_w_bytes_usm, up_w_bytes_usm,
-        x_usm, gate_out_usm, up_out_usm, m, k, lws,
+        stream,
+        gate_w_bytes_usm,
+        up_w_bytes_usm,
+        x_usm,
+        gate_out_usm,
+        up_out_usm,
+        m,
+        k,
+        lws,
     )
 }
 
@@ -10461,8 +11551,15 @@ pub unsafe fn matvec_iq2_xxs_gate_up_fused_usm_raw(
     lws: u32,
 ) -> Result<()> {
     imp::matvec_iq2_xxs_gate_up_fused_usm(
-        stream, gate_w_bytes_usm, up_w_bytes_usm,
-        x_usm, gate_out_usm, up_out_usm, m, k, lws,
+        stream,
+        gate_w_bytes_usm,
+        up_w_bytes_usm,
+        x_usm,
+        gate_out_usm,
+        up_out_usm,
+        m,
+        k,
+        lws,
     )
 }
 
@@ -10485,8 +11582,15 @@ pub unsafe fn matvec_iq1_m_gate_up_fused_usm_raw(
     lws: u32,
 ) -> Result<()> {
     imp::matvec_iq1_m_gate_up_fused_usm(
-        stream, gate_w_bytes_usm, up_w_bytes_usm,
-        x_usm, gate_out_usm, up_out_usm, m, k, lws,
+        stream,
+        gate_w_bytes_usm,
+        up_w_bytes_usm,
+        x_usm,
+        gate_out_usm,
+        up_out_usm,
+        m,
+        k,
+        lws,
     )
 }
 
@@ -10509,8 +11613,15 @@ pub unsafe fn matvec_iq2_xs_gate_up_fused_usm_raw(
     lws: u32,
 ) -> Result<()> {
     imp::matvec_iq2_xs_gate_up_fused_usm(
-        stream, gate_w_bytes_usm, up_w_bytes_usm,
-        x_usm, gate_out_usm, up_out_usm, m, k, lws,
+        stream,
+        gate_w_bytes_usm,
+        up_w_bytes_usm,
+        x_usm,
+        gate_out_usm,
+        up_out_usm,
+        m,
+        k,
+        lws,
     )
 }
 
@@ -10533,8 +11644,15 @@ pub unsafe fn matvec_iq2_s_gate_up_fused_usm_raw(
     lws: u32,
 ) -> Result<()> {
     imp::matvec_iq2_s_gate_up_fused_usm(
-        stream, gate_w_bytes_usm, up_w_bytes_usm,
-        x_usm, gate_out_usm, up_out_usm, m, k, lws,
+        stream,
+        gate_w_bytes_usm,
+        up_w_bytes_usm,
+        x_usm,
+        gate_out_usm,
+        up_out_usm,
+        m,
+        k,
+        lws,
     )
 }
 
@@ -10557,8 +11675,15 @@ pub unsafe fn matvec_iq3_xxs_gate_up_fused_usm_raw(
     lws: u32,
 ) -> Result<()> {
     imp::matvec_iq3_xxs_gate_up_fused_usm(
-        stream, gate_w_bytes_usm, up_w_bytes_usm,
-        x_usm, gate_out_usm, up_out_usm, m, k, lws,
+        stream,
+        gate_w_bytes_usm,
+        up_w_bytes_usm,
+        x_usm,
+        gate_out_usm,
+        up_out_usm,
+        m,
+        k,
+        lws,
     )
 }
 
@@ -10581,8 +11706,15 @@ pub unsafe fn matvec_iq3_s_gate_up_fused_usm_raw(
     lws: u32,
 ) -> Result<()> {
     imp::matvec_iq3_s_gate_up_fused_usm(
-        stream, gate_w_bytes_usm, up_w_bytes_usm,
-        x_usm, gate_out_usm, up_out_usm, m, k, lws,
+        stream,
+        gate_w_bytes_usm,
+        up_w_bytes_usm,
+        x_usm,
+        gate_out_usm,
+        up_out_usm,
+        m,
+        k,
+        lws,
     )
 }
 
@@ -10606,8 +11738,15 @@ pub unsafe fn matvec_ptq1_0_gate_up_fused_usm_raw(
     lws: u32,
 ) -> Result<()> {
     imp::matvec_ptq1_0_gate_up_fused_usm(
-        stream, gate_w_bytes_usm, up_w_bytes_usm,
-        x_usm, gate_out_usm, up_out_usm, m, k, lws,
+        stream,
+        gate_w_bytes_usm,
+        up_w_bytes_usm,
+        x_usm,
+        gate_out_usm,
+        up_out_usm,
+        m,
+        k,
+        lws,
     )
 }
 
@@ -10632,8 +11771,16 @@ pub unsafe fn matvec_q4_k_add_rmsnorm_usm_raw(
     lws: u32,
 ) -> Result<()> {
     imp::matvec_q4_k_add_rmsnorm_usm(
-        stream, w_bytes_usm, attn_usm, hidden_usm, w_norm_usm, y_norm_usm,
-        m, k, eps, lws,
+        stream,
+        w_bytes_usm,
+        attn_usm,
+        hidden_usm,
+        w_norm_usm,
+        y_norm_usm,
+        m,
+        k,
+        eps,
+        lws,
     )
 }
 
@@ -10647,27 +11794,75 @@ macro_rules! h6_raw_wrapper {
         /// See [`matvec_q4_k_add_rmsnorm_usm_raw`].
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn $raw(
-            stream: &SyclStream, w_bytes_usm: *const u8, attn_usm: *const f32,
-            hidden_usm: *mut f32, w_norm_usm: *const f32, y_norm_usm: *mut f32,
-            m: u32, k: u32, eps: f32, lws: u32,
+            stream: &SyclStream,
+            w_bytes_usm: *const u8,
+            attn_usm: *const f32,
+            hidden_usm: *mut f32,
+            w_norm_usm: *const f32,
+            y_norm_usm: *mut f32,
+            m: u32,
+            k: u32,
+            eps: f32,
+            lws: u32,
         ) -> Result<()> {
-            imp::$imp(stream, w_bytes_usm, attn_usm, hidden_usm, w_norm_usm, y_norm_usm, m, k, eps, lws)
+            imp::$imp(
+                stream,
+                w_bytes_usm,
+                attn_usm,
+                hidden_usm,
+                w_norm_usm,
+                y_norm_usm,
+                m,
+                k,
+                eps,
+                lws,
+            )
         }
     };
 }
 h6_raw_wrapper!(matvec_q8_0_add_rmsnorm_usm_raw, matvec_q8_0_add_rmsnorm_usm);
 h6_raw_wrapper!(matvec_q5_k_add_rmsnorm_usm_raw, matvec_q5_k_add_rmsnorm_usm);
 h6_raw_wrapper!(matvec_q6_k_add_rmsnorm_usm_raw, matvec_q6_k_add_rmsnorm_usm);
-h6_raw_wrapper!(matvec_iq4_nl_add_rmsnorm_usm_raw, matvec_iq4_nl_add_rmsnorm_usm);
-h6_raw_wrapper!(matvec_iq4_xs_add_rmsnorm_usm_raw, matvec_iq4_xs_add_rmsnorm_usm);
-h6_raw_wrapper!(matvec_iq1_s_add_rmsnorm_usm_raw, matvec_iq1_s_add_rmsnorm_usm);
-h6_raw_wrapper!(matvec_iq1_m_add_rmsnorm_usm_raw, matvec_iq1_m_add_rmsnorm_usm);
-h6_raw_wrapper!(matvec_iq2_xxs_add_rmsnorm_usm_raw, matvec_iq2_xxs_add_rmsnorm_usm);
-h6_raw_wrapper!(matvec_iq2_xs_add_rmsnorm_usm_raw, matvec_iq2_xs_add_rmsnorm_usm);
-h6_raw_wrapper!(matvec_iq2_s_add_rmsnorm_usm_raw, matvec_iq2_s_add_rmsnorm_usm);
-h6_raw_wrapper!(matvec_iq3_xxs_add_rmsnorm_usm_raw, matvec_iq3_xxs_add_rmsnorm_usm);
-h6_raw_wrapper!(matvec_iq3_s_add_rmsnorm_usm_raw, matvec_iq3_s_add_rmsnorm_usm);
-h6_raw_wrapper!(matvec_ptq1_0_add_rmsnorm_usm_raw, matvec_ptq1_0_add_rmsnorm_usm);
+h6_raw_wrapper!(
+    matvec_iq4_nl_add_rmsnorm_usm_raw,
+    matvec_iq4_nl_add_rmsnorm_usm
+);
+h6_raw_wrapper!(
+    matvec_iq4_xs_add_rmsnorm_usm_raw,
+    matvec_iq4_xs_add_rmsnorm_usm
+);
+h6_raw_wrapper!(
+    matvec_iq1_s_add_rmsnorm_usm_raw,
+    matvec_iq1_s_add_rmsnorm_usm
+);
+h6_raw_wrapper!(
+    matvec_iq1_m_add_rmsnorm_usm_raw,
+    matvec_iq1_m_add_rmsnorm_usm
+);
+h6_raw_wrapper!(
+    matvec_iq2_xxs_add_rmsnorm_usm_raw,
+    matvec_iq2_xxs_add_rmsnorm_usm
+);
+h6_raw_wrapper!(
+    matvec_iq2_xs_add_rmsnorm_usm_raw,
+    matvec_iq2_xs_add_rmsnorm_usm
+);
+h6_raw_wrapper!(
+    matvec_iq2_s_add_rmsnorm_usm_raw,
+    matvec_iq2_s_add_rmsnorm_usm
+);
+h6_raw_wrapper!(
+    matvec_iq3_xxs_add_rmsnorm_usm_raw,
+    matvec_iq3_xxs_add_rmsnorm_usm
+);
+h6_raw_wrapper!(
+    matvec_iq3_s_add_rmsnorm_usm_raw,
+    matvec_iq3_s_add_rmsnorm_usm
+);
+h6_raw_wrapper!(
+    matvec_ptq1_0_add_rmsnorm_usm_raw,
+    matvec_ptq1_0_add_rmsnorm_usm
+);
 
 /// H8: F16-input matvec raw-pointer entries. `x_f16` is the F16-bit
 /// activation vector (≥ K u16); `w_bytes_usm` packed weights; output
@@ -10677,27 +11872,74 @@ macro_rules! h8_raw_wrapper {
         /// # Safety
         /// See [`matvec_q4_k_f16in_packed_f32_usm_raw`].
         pub unsafe fn $raw(
-            stream: &SyclStream, w_bytes_usm: *const u8, x_f16: *const u16,
-            out_usm: *mut f32, m: u32, k: u32, lws: u32,
+            stream: &SyclStream,
+            w_bytes_usm: *const u8,
+            x_f16: *const u16,
+            out_usm: *mut f32,
+            m: u32,
+            k: u32,
+            lws: u32,
         ) -> Result<()> {
             imp::$imp(stream, w_bytes_usm, x_f16, out_usm, m, k, lws)
         }
     };
 }
-h8_raw_wrapper!(matvec_q8_0_f16in_packed_f32_usm_raw, matvec_q8_0_f16in_packed_f32_usm);
-h8_raw_wrapper!(matvec_q4_k_f16in_packed_f32_usm_raw, matvec_q4_k_f16in_packed_f32_usm);
-h8_raw_wrapper!(matvec_q5_k_f16in_packed_f32_usm_raw, matvec_q5_k_f16in_packed_f32_usm);
-h8_raw_wrapper!(matvec_q6_k_f16in_packed_f32_usm_raw, matvec_q6_k_f16in_packed_f32_usm);
-h8_raw_wrapper!(matvec_iq4_nl_f16in_packed_f32_usm_raw, matvec_iq4_nl_f16in_packed_f32_usm);
-h8_raw_wrapper!(matvec_iq4_xs_f16in_packed_f32_usm_raw, matvec_iq4_xs_f16in_packed_f32_usm);
-h8_raw_wrapper!(matvec_iq1_s_f16in_packed_f32_usm_raw, matvec_iq1_s_f16in_packed_f32_usm);
-h8_raw_wrapper!(matvec_iq1_m_f16in_packed_f32_usm_raw, matvec_iq1_m_f16in_packed_f32_usm);
-h8_raw_wrapper!(matvec_iq2_xxs_f16in_packed_f32_usm_raw, matvec_iq2_xxs_f16in_packed_f32_usm);
-h8_raw_wrapper!(matvec_iq2_xs_f16in_packed_f32_usm_raw, matvec_iq2_xs_f16in_packed_f32_usm);
-h8_raw_wrapper!(matvec_iq2_s_f16in_packed_f32_usm_raw, matvec_iq2_s_f16in_packed_f32_usm);
-h8_raw_wrapper!(matvec_iq3_xxs_f16in_packed_f32_usm_raw, matvec_iq3_xxs_f16in_packed_f32_usm);
-h8_raw_wrapper!(matvec_iq3_s_f16in_packed_f32_usm_raw, matvec_iq3_s_f16in_packed_f32_usm);
-h8_raw_wrapper!(matvec_ptq1_0_f16in_packed_f32_usm_raw, matvec_ptq1_0_f16in_packed_f32_usm);
+h8_raw_wrapper!(
+    matvec_q8_0_f16in_packed_f32_usm_raw,
+    matvec_q8_0_f16in_packed_f32_usm
+);
+h8_raw_wrapper!(
+    matvec_q4_k_f16in_packed_f32_usm_raw,
+    matvec_q4_k_f16in_packed_f32_usm
+);
+h8_raw_wrapper!(
+    matvec_q5_k_f16in_packed_f32_usm_raw,
+    matvec_q5_k_f16in_packed_f32_usm
+);
+h8_raw_wrapper!(
+    matvec_q6_k_f16in_packed_f32_usm_raw,
+    matvec_q6_k_f16in_packed_f32_usm
+);
+h8_raw_wrapper!(
+    matvec_iq4_nl_f16in_packed_f32_usm_raw,
+    matvec_iq4_nl_f16in_packed_f32_usm
+);
+h8_raw_wrapper!(
+    matvec_iq4_xs_f16in_packed_f32_usm_raw,
+    matvec_iq4_xs_f16in_packed_f32_usm
+);
+h8_raw_wrapper!(
+    matvec_iq1_s_f16in_packed_f32_usm_raw,
+    matvec_iq1_s_f16in_packed_f32_usm
+);
+h8_raw_wrapper!(
+    matvec_iq1_m_f16in_packed_f32_usm_raw,
+    matvec_iq1_m_f16in_packed_f32_usm
+);
+h8_raw_wrapper!(
+    matvec_iq2_xxs_f16in_packed_f32_usm_raw,
+    matvec_iq2_xxs_f16in_packed_f32_usm
+);
+h8_raw_wrapper!(
+    matvec_iq2_xs_f16in_packed_f32_usm_raw,
+    matvec_iq2_xs_f16in_packed_f32_usm
+);
+h8_raw_wrapper!(
+    matvec_iq2_s_f16in_packed_f32_usm_raw,
+    matvec_iq2_s_f16in_packed_f32_usm
+);
+h8_raw_wrapper!(
+    matvec_iq3_xxs_f16in_packed_f32_usm_raw,
+    matvec_iq3_xxs_f16in_packed_f32_usm
+);
+h8_raw_wrapper!(
+    matvec_iq3_s_f16in_packed_f32_usm_raw,
+    matvec_iq3_s_f16in_packed_f32_usm
+);
+h8_raw_wrapper!(
+    matvec_ptq1_0_f16in_packed_f32_usm_raw,
+    matvec_ptq1_0_f16in_packed_f32_usm
+);
 
 /// USM-resident embedding gather. `table` is the embedding matrix
 /// `[V, d]` in USM; `ids` is a host-side slice (typically very
@@ -10715,7 +11957,9 @@ pub fn embedding_lookup_usm(
     d: u32,
 ) -> Result<()> {
     if d == 0 {
-        return Err(SyclError::InvalidShape("embedding_lookup_usm: d == 0".into()));
+        return Err(SyclError::InvalidShape(
+            "embedding_lookup_usm: d == 0".into(),
+        ));
     }
     let n_ids = ids.len();
     let need_out = n_ids * (d as usize);
@@ -10947,12 +12191,7 @@ pub fn softmax_attn(
 /// SwiGLU activation: `out[i] = silu(x[i]) * y[i]` where
 /// `silu(v) = v / (1 + exp(-v))`. `x`, `y`, `out` all `[n]`-shaped
 /// with the same length.
-pub fn silu_mul(
-    stream: &mut SyclStream,
-    x: &[u16],
-    y: &[u16],
-    out: &mut [u16],
-) -> Result<()> {
+pub fn silu_mul(stream: &mut SyclStream, x: &[u16], y: &[u16], out: &mut [u16]) -> Result<()> {
     imp::silu_mul(stream, x, y, out)
 }
 
@@ -10978,11 +12217,7 @@ pub fn embedding_lookup(
 /// When no SYCL device is present, returns [`SyclError::Unavailable`]; in `sycl` mode
 /// dispatches one work-item per block to the kernel in
 /// `cpp/rsl_kernels.cpp`.
-pub fn dequant_nvfp4(
-    stream: &mut SyclStream,
-    w_nvfp4: &[u8],
-    out: &mut [u16],
-) -> Result<()> {
+pub fn dequant_nvfp4(stream: &mut SyclStream, w_nvfp4: &[u8], out: &mut [u16]) -> Result<()> {
     imp::dequant_nvfp4(stream, w_nvfp4, out)
 }
 
@@ -11145,8 +12380,7 @@ mod tests {
             let m: u32 = 8;
             let k: u32 = 64; // 2 blocks per row
             let w_q = SyclSharedBuffer::<i8>::alloc(stream, (m * k) as usize)?;
-            let w_scales =
-                SyclSharedBuffer::<f32>::alloc(stream, (m * (k / 32)) as usize)?;
+            let w_scales = SyclSharedBuffer::<f32>::alloc(stream, (m * (k / 32)) as usize)?;
             let x = SyclSharedBuffer::<f32>::alloc(stream, k as usize)?;
             let mut out = SyclSharedBuffer::<f32>::alloc(stream, m as usize)?;
             matvec_q8_0_f32_usm(stream, &w_q, &w_scales, &x, &mut out, m, k)
@@ -11380,8 +12614,7 @@ mod tests {
         for dst in c_buf.as_mut_slice().iter_mut() {
             *dst = 0;
         }
-        gemm_f16_usm(&stream, &a_buf, &b_buf, &mut c_buf, m, n, k)
-            .expect("gemm_f16_usm");
+        gemm_f16_usm(&stream, &a_buf, &b_buf, &mut c_buf, m, n, k).expect("gemm_f16_usm");
         // CPU reference: row-major matmul with f16 round-trip
         // matching the kernel's storage precision.
         let mut c_ref = vec![0f32; (m * n) as usize];
@@ -11406,7 +12639,10 @@ mod tests {
             }
         }
         eprintln!("usm_gemm_f16 parity: max_abs_err = {max_err:.6}");
-        assert!(max_err < 1e-2, "USM gemm vs CPU max_abs_err {max_err} > 1e-2");
+        assert!(
+            max_err < 1e-2,
+            "USM gemm vs CPU max_abs_err {max_err} > 1e-2"
+        );
     }
 
     /// Real-SYCL parity: USM Q8_0 weight × F32 activation matvec
@@ -11565,10 +12801,9 @@ mod tests {
             let mut acc = 0f32;
             for b in 0..blocks_per_row {
                 let block_off = row * bytes_per_row + b * 34;
-                let scale = f16::from_le_bytes([
-                    w_bytes_host[block_off],
-                    w_bytes_host[block_off + 1],
-                ]).to_f32();
+                let scale =
+                    f16::from_le_bytes([w_bytes_host[block_off], w_bytes_host[block_off + 1]])
+                        .to_f32();
                 let qs = &w_bytes_host[block_off + 2..block_off + 2 + 32];
                 let x_chunk = &x_host[b * 32..(b + 1) * 32];
                 let mut block_dot = 0f32;
@@ -11717,11 +12952,9 @@ mod tests {
             let mut acc = 0f32;
             for sb in 0..super_blocks_per_row {
                 let off = row * bytes_per_row + sb * 144;
-                let d = f16::from_le_bytes([w_bytes_host[off], w_bytes_host[off + 1]])
-                    .to_f32();
+                let d = f16::from_le_bytes([w_bytes_host[off], w_bytes_host[off + 1]]).to_f32();
                 let dmin =
-                    f16::from_le_bytes([w_bytes_host[off + 2], w_bytes_host[off + 3]])
-                        .to_f32();
+                    f16::from_le_bytes([w_bytes_host[off + 2], w_bytes_host[off + 3]]).to_f32();
                 let (sc, mn) = unpack_q4k(&w_bytes_host[off + 4..off + 16]);
                 let qs = &w_bytes_host[off + 16..off + 16 + 128];
                 let x_block = &x_host[sb * 256..(sb + 1) * 256];
@@ -11786,8 +13019,7 @@ mod tests {
         // Deterministic pseudo-random byte pattern. Doesn't need to
         // decode to anything sensible — we only care that all LWS
         // variants reach the same `acc` value for each output row.
-        let w_bytes_host: Vec<u8> =
-            (0..bytes).map(|i| ((i * 31 + 7) & 0xff) as u8).collect();
+        let w_bytes_host: Vec<u8> = (0..bytes).map(|i| ((i * 31 + 7) & 0xff) as u8).collect();
         let x_host: Vec<f32> = (0..k as usize)
             .map(|i| (((i % 17) as f32) - 8.0) * 0.05)
             .collect();
@@ -11854,7 +13086,13 @@ mod tests {
             k: usize,
             // Each dispatcher takes the same arg shape.
             run: unsafe fn(
-                &SyclStream, *const u8, *const f32, *mut f32, u32, u32, u32,
+                &SyclStream,
+                *const u8,
+                *const f32,
+                *mut f32,
+                u32,
+                u32,
+                u32,
             ) -> Result<()>,
         }
         let probes: &[Probe] = &[
@@ -11882,12 +13120,8 @@ mod tests {
             let m: u32 = 100;
             let k = probe.k;
             let bytes = m as usize * (probe.row_bytes)(k);
-            let w_bytes: Vec<u8> = (0..bytes)
-                .map(|i| ((i * 31 + 7) & 0xff) as u8)
-                .collect();
-            let x_host: Vec<f32> = (0..k)
-                .map(|i| (((i % 17) as f32) - 8.0) * 0.05)
-                .collect();
+            let w_bytes: Vec<u8> = (0..bytes).map(|i| ((i * 31 + 7) & 0xff) as u8).collect();
+            let x_host: Vec<f32> = (0..k).map(|i| (((i % 17) as f32) - 8.0) * 0.05).collect();
             let mut w_buf = SyclSharedBuffer::<u8>::alloc(&stream, bytes).expect("w alloc");
             let mut x_buf = SyclSharedBuffer::<f32>::alloc(&stream, k).expect("x alloc");
             w_buf.as_mut_slice().copy_from_slice(&w_bytes);
@@ -11959,7 +13193,14 @@ mod tests {
             row_bytes: fn(usize) -> usize,
             k: usize,
             run: unsafe fn(
-                &SyclStream, *const u8, *const f32, *mut f32, u32, u32, u32, u32,
+                &SyclStream,
+                *const u8,
+                *const f32,
+                *mut f32,
+                u32,
+                u32,
+                u32,
+                u32,
             ) -> Result<()>,
         }
         let probes: &[Probe] = &[
@@ -11994,9 +13235,7 @@ mod tests {
             let n: u32 = 4;
             let k = probe.k;
             let bytes = m as usize * (probe.row_bytes)(k);
-            let w_bytes: Vec<u8> = (0..bytes)
-                .map(|i| ((i * 31 + 7) & 0xff) as u8)
-                .collect();
+            let w_bytes: Vec<u8> = (0..bytes).map(|i| ((i * 31 + 7) & 0xff) as u8).collect();
             // Distinct x_n per row to make every batched output a
             // unique signal — if a stale-buffer reuse bug slipped in
             // we'd see identical outputs across rows.
@@ -12011,9 +13250,8 @@ mod tests {
 
             let mut reference: Option<Vec<f32>> = None;
             for lws in candidates {
-                let mut out_buf =
-                    SyclSharedBuffer::<f32>::alloc(&stream, n as usize * m as usize)
-                        .expect("out alloc");
+                let mut out_buf = SyclSharedBuffer::<f32>::alloc(&stream, n as usize * m as usize)
+                    .expect("out alloc");
                 for dst in out_buf.as_mut_slice().iter_mut() {
                     *dst = 0.0;
                 }
@@ -12165,11 +13403,9 @@ mod tests {
             let mut acc = 0f32;
             for sb in 0..super_blocks_per_row {
                 let off = row * bytes_per_row + sb * 176;
-                let d = f16::from_le_bytes([w_bytes_host[off], w_bytes_host[off + 1]])
-                    .to_f32();
+                let d = f16::from_le_bytes([w_bytes_host[off], w_bytes_host[off + 1]]).to_f32();
                 let dmin =
-                    f16::from_le_bytes([w_bytes_host[off + 2], w_bytes_host[off + 3]])
-                        .to_f32();
+                    f16::from_le_bytes([w_bytes_host[off + 2], w_bytes_host[off + 3]]).to_f32();
                 let (sc, mn) = unpack_q4k(&w_bytes_host[off + 4..off + 16]);
                 let qh = &w_bytes_host[off + 16..off + 48];
                 let qs = &w_bytes_host[off + 48..off + 48 + 128];
@@ -12187,10 +13423,8 @@ mod tests {
                     for l in 0..32 {
                         let q = q_chunk[l];
                         let qhb = qh[l];
-                        let lo = (q & 0x0F) as u32
-                            | (((qhb >> bit_lo) & 1) as u32) << 4;
-                        let hi = (q >> 4) as u32
-                            | (((qhb >> bit_hi) & 1) as u32) << 4;
+                        let lo = (q & 0x0F) as u32 | (((qhb >> bit_lo) & 1) as u32) << 4;
+                        let hi = (q >> 4) as u32 | (((qhb >> bit_hi) & 1) as u32) << 4;
                         acc += (d_lo * lo as f32 - m_lo) * x_lo[l];
                         acc += (d_hi * hi as f32 - m_hi) * x_hi[l];
                     }
@@ -12290,8 +13524,8 @@ mod tests {
                 let ql = &w_bytes_host[off..off + 128];
                 let qh = &w_bytes_host[off + 128..off + 128 + 64];
                 let scales = &w_bytes_host[off + 192..off + 192 + 16];
-                let d = f16::from_le_bytes([w_bytes_host[off + 208], w_bytes_host[off + 209]])
-                    .to_f32();
+                let d =
+                    f16::from_le_bytes([w_bytes_host[off + 208], w_bytes_host[off + 209]]).to_f32();
                 let x_block = &x_host[sb * 256..(sb + 1) * 256];
                 for n in 0..2usize {
                     for l in 0..32usize {
@@ -12374,8 +13608,15 @@ mod tests {
             *dst = f16::from_f32(initial[i]).to_bits();
         }
         // GPU rope.
-        rope_usm(&stream, &mut qk_buf, n_heads as u32, head_dim as u32, pos, &inv_freq_buf)
-            .expect("rope_usm");
+        rope_usm(
+            &stream,
+            &mut qk_buf,
+            n_heads as u32,
+            head_dim as u32,
+            pos,
+            &inv_freq_buf,
+        )
+        .expect("rope_usm");
         // CPU reference (f16-round-tripped on input + output to
         // match the GPU's f16 storage).
         let mut qk_cpu: Vec<f32> = initial.iter().map(|v| f16::from_f32(*v).to_f32()).collect();
@@ -12406,7 +13647,10 @@ mod tests {
             }
         }
         eprintln!("usm_rope parity: max_abs_err = {max_err:.6}");
-        assert!(max_err < 1e-2, "USM rope vs CPU max_abs_err {max_err} > 1e-2");
+        assert!(
+            max_err < 1e-2,
+            "USM rope vs CPU max_abs_err {max_err} > 1e-2"
+        );
     }
 
     /// Real-SYCL parity: USM silu_mul matches the CPU reference.
@@ -12450,7 +13694,10 @@ mod tests {
             }
         }
         eprintln!("usm_silu_mul parity: max_abs_err = {max_err:.6}");
-        assert!(max_err < 5e-3, "USM silu_mul vs CPU max_abs_err {max_err} > 5e-3");
+        assert!(
+            max_err < 5e-3,
+            "USM silu_mul vs CPU max_abs_err {max_err} > 5e-3"
+        );
     }
 
     /// Real-SYCL parity: USM embedding_lookup gathers correct rows.
@@ -12495,7 +13742,10 @@ mod tests {
         }
         eprintln!("usm_embedding parity: max_abs_err = {max_err:.6}");
         // Embedding is a pure memcpy through f16 — should be exact.
-        assert!(max_err < 1e-4, "USM embedding vs CPU max_abs_err {max_err} > 1e-4");
+        assert!(
+            max_err < 1e-4,
+            "USM embedding vs CPU max_abs_err {max_err} > 1e-4"
+        );
     }
 
     /// Real-SYCL parity check: USM flash-attention decode kernel
@@ -12549,9 +13799,20 @@ mod tests {
         }
         // Run the kernel through the safe wrapper.
         flash_attn_decode_usm(
-            &stream, &q_buf, &k_buf, &v_buf, &mut out_buf,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0,
-        ).expect("flash_attn_decode_usm");
+            &stream,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &mut out_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
+            0,
+            0.0,
+        )
+        .expect("flash_attn_decode_usm");
         // Read back results.
         // Build f32 CPU inputs (mirroring f16 round-trip storage).
         let mut q_f32 = vec![0f32; q_len];
@@ -12577,7 +13838,9 @@ mod tests {
             let kv_h = h / n_gqa;
             let q_h = &q_f32[h * head_dim as usize..(h + 1) * head_dim as usize];
             let out_h = &mut out_cpu[h * head_dim as usize..(h + 1) * head_dim as usize];
-            for v in out_h.iter_mut() { *v = 0.0; }
+            for v in out_h.iter_mut() {
+                *v = 0.0;
+            }
             let mut m = f32::NEG_INFINITY;
             let mut l = 0.0f32;
             for t in 0..kv_len as usize {
@@ -12588,7 +13851,11 @@ mod tests {
                 }
                 sd *= scale;
                 let m_new = m.max(sd);
-                let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+                let rescale = if m.is_finite() {
+                    (m - m_new).exp()
+                } else {
+                    0.0
+                };
                 let p = (sd - m_new).exp();
                 l = l * rescale + p;
                 let v_base = (kv_h * max_ctx as usize + t) * head_dim as usize;
@@ -12598,7 +13865,9 @@ mod tests {
                 m = m_new;
             }
             let inv_l = if l > 0.0 { 1.0 / l } else { 0.0 };
-            for v in out_h.iter_mut() { *v *= inv_l; }
+            for v in out_h.iter_mut() {
+                *v *= inv_l;
+            }
         }
         // Compare GPU outputs (read back from USM) to CPU reference.
         let mut max_err = 0f32;
@@ -12617,7 +13886,10 @@ mod tests {
         // plus f16 round-trip slack on the per-t accumulation.
         // Bump a bit since softmax involves exp which compounds
         // rounding error at long kv_len.
-        assert!(max_err < 5e-3, "USM flash vs CPU max_abs_err {max_err} > 5e-3");
+        assert!(
+            max_err < 5e-3,
+            "USM flash vs CPU max_abs_err {max_err} > 5e-3"
+        );
     }
 
     /// Real-SYCL parity: USM FlashAttention prefill (f32) matches an
@@ -12644,8 +13916,8 @@ mod tests {
         let n_kv_heads = 2u32;
         let head_dim = 16u32;
         let max_ctx = 64u32;
-        let kv_len_base = 8u32;   // 8 cached positions
-        let n_new = 5u32;         // 5 new prompt tokens
+        let kv_len_base = 8u32; // 8 cached positions
+        let n_new = 5u32; // 5 new prompt tokens
         let q_len = (n_new * n_heads * head_dim) as usize;
         let kv_buf_len = (n_kv_heads * max_ctx * head_dim) as usize;
         let out_len = q_len;
@@ -12677,8 +13949,17 @@ mod tests {
             *dst = 0.0;
         }
         flash_attn_prefill_usm(
-            &stream, &q_buf, &k_buf, &v_buf, &mut out_buf,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            &stream,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &mut out_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
         )
         .expect("flash_attn_prefill_usm");
 
@@ -12713,7 +13994,11 @@ mod tests {
                     }
                     s *= scale;
                     let m_new = m.max(s);
-                    let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+                    let rescale = if m.is_finite() {
+                        (m - m_new).exp()
+                    } else {
+                        0.0
+                    };
                     let p = (s - m_new).exp();
                     l = l * rescale + p;
                     for d in 0..head_dim as usize {
@@ -12743,7 +14028,10 @@ mod tests {
         // Same tolerance band as decode parity test: f32 softmax
         // compounding + sycl::exp vs libm::exp drift over kv_len_for_q
         // positions, no f16 round-trip loss in this path.
-        assert!(max_err < 1e-4, "USM prefill vs CPU max_abs_err {max_err} > 1e-4");
+        assert!(
+            max_err < 1e-4,
+            "USM prefill vs CPU max_abs_err {max_err} > 1e-4"
+        );
     }
 
     /// P-7: FA-v2 decode parity vs the same CPU reference the v1
@@ -12791,8 +14079,18 @@ mod tests {
             *dst = 0;
         }
         flash_attn_decode_v2_usm(
-            &stream, &q_buf, &k_buf, &v_buf, &mut out_buf,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0,
+            &stream,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &mut out_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
+            0,
+            0.0,
         )
         .expect("flash_attn_decode_v2_usm");
 
@@ -12817,7 +14115,9 @@ mod tests {
             let kv_h = h / n_gqa;
             let q_h = &q_f32[h * head_dim as usize..(h + 1) * head_dim as usize];
             let out_h = &mut out_cpu[h * head_dim as usize..(h + 1) * head_dim as usize];
-            for v in out_h.iter_mut() { *v = 0.0; }
+            for v in out_h.iter_mut() {
+                *v = 0.0;
+            }
             let mut m = f32::NEG_INFINITY;
             let mut l = 0.0f32;
             for t in 0..kv_len as usize {
@@ -12828,7 +14128,11 @@ mod tests {
                 }
                 sd *= scale;
                 let m_new = m.max(sd);
-                let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+                let rescale = if m.is_finite() {
+                    (m - m_new).exp()
+                } else {
+                    0.0
+                };
                 let p = (sd - m_new).exp();
                 l = l * rescale + p;
                 let v_base = (kv_h * max_ctx as usize + t) * head_dim as usize;
@@ -12838,14 +14142,18 @@ mod tests {
                 m = m_new;
             }
             let inv_l = if l > 0.0 { 1.0 / l } else { 0.0 };
-            for v in out_h.iter_mut() { *v *= inv_l; }
+            for v in out_h.iter_mut() {
+                *v *= inv_l;
+            }
         }
         let mut max_err = 0f32;
         for (i, &bits) in out_buf.as_slice().iter().enumerate() {
             let got = f16::from_bits(bits).to_f32();
             let want = f16::from_f32(out_cpu[i]).to_f32();
             let err = (got - want).abs();
-            if err > max_err { max_err = err; }
+            if err > max_err {
+                max_err = err;
+            }
         }
         eprintln!("usm_flash_attn_decode_v2 parity: max_abs_err = {max_err:.6}");
         // Same tolerance band as v1 — the algorithmic change is in
@@ -12870,7 +14178,7 @@ mod tests {
         let head_dim = 16u32;
         let max_ctx = 128u32;
         // Use kv_len that spans multiple SLM tiles (KV_TILE=32).
-        let kv_len = 80u32;  // 3 tiles: full(0..32), full(32..64), partial(64..80)
+        let kv_len = 80u32; // 3 tiles: full(0..32), full(32..64), partial(64..80)
         let q_len = (n_heads * head_dim) as usize;
         let kv_buf_len = (n_kv_heads * max_ctx * head_dim) as usize;
         let out_len = q_len;
@@ -12891,10 +14199,22 @@ mod tests {
         for (i, dst) in v_buf.as_mut_slice().iter_mut().enumerate() {
             *dst = f16::from_f32(((i % 31) as f32 - 15.0) * 0.09).to_bits();
         }
-        for dst in out_buf.as_mut_slice().iter_mut() { *dst = 0; }
+        for dst in out_buf.as_mut_slice().iter_mut() {
+            *dst = 0;
+        }
         flash_attn_decode_v3_usm(
-            &stream, &q_buf, &k_buf, &v_buf, &mut out_buf,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0,
+            &stream,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &mut out_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
+            0,
+            0.0,
             0, // P19: tile_size 0 ⇒ built-in heuristic
         )
         .expect("flash_attn_decode_v3_usm");
@@ -12919,7 +14239,9 @@ mod tests {
             let kv_h = h / n_gqa;
             let q_h = &q_f32[h * head_dim as usize..(h + 1) * head_dim as usize];
             let out_h = &mut out_cpu[h * head_dim as usize..(h + 1) * head_dim as usize];
-            for v in out_h.iter_mut() { *v = 0.0; }
+            for v in out_h.iter_mut() {
+                *v = 0.0;
+            }
             let mut m = f32::NEG_INFINITY;
             let mut l = 0.0f32;
             for t in 0..kv_len as usize {
@@ -12930,7 +14252,11 @@ mod tests {
                 }
                 sd *= scale;
                 let m_new = m.max(sd);
-                let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+                let rescale = if m.is_finite() {
+                    (m - m_new).exp()
+                } else {
+                    0.0
+                };
                 let p = (sd - m_new).exp();
                 l = l * rescale + p;
                 let v_base = (kv_h * max_ctx as usize + t) * head_dim as usize;
@@ -12940,14 +14266,18 @@ mod tests {
                 m = m_new;
             }
             let inv_l = if l > 0.0 { 1.0 / l } else { 0.0 };
-            for v in out_h.iter_mut() { *v *= inv_l; }
+            for v in out_h.iter_mut() {
+                *v *= inv_l;
+            }
         }
         let mut max_err = 0f32;
         for (i, &bits) in out_buf.as_slice().iter().enumerate() {
             let got = f16::from_bits(bits).to_f32();
             let want = f16::from_f32(out_cpu[i]).to_f32();
             let err = (got - want).abs();
-            if err > max_err { max_err = err; }
+            if err > max_err {
+                max_err = err;
+            }
         }
         eprintln!("usm_flash_attn_decode_v3 parity (kv_len={kv_len}, multi-tile): max_abs_err = {max_err:.6}");
         assert!(max_err < 5e-3, "FA-v3 vs CPU max_abs_err {max_err} > 5e-3");
@@ -12988,10 +14318,21 @@ mod tests {
         for (i, dst) in v_buf.as_mut_slice().iter_mut().enumerate() {
             *dst = ((i % 31) as f32 - 15.0) * 0.09;
         }
-        for dst in out_buf.as_mut_slice().iter_mut() { *dst = 0.0; }
+        for dst in out_buf.as_mut_slice().iter_mut() {
+            *dst = 0.0;
+        }
         flash_attn_prefill_v3_usm(
-            &stream, &q_buf, &k_buf, &v_buf, &mut out_buf,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            &stream,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &mut out_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
         )
         .expect("flash_attn_prefill_v3_usm");
 
@@ -13014,7 +14355,11 @@ mod tests {
                     }
                     sd *= scale;
                     let m_new = m.max(sd);
-                    let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+                    let rescale = if m.is_finite() {
+                        (m - m_new).exp()
+                    } else {
+                        0.0
+                    };
                     let p = (sd - m_new).exp();
                     l = l * rescale + p;
                     for d in 0..head_dim as usize {
@@ -13032,13 +14377,18 @@ mod tests {
         let mut max_err = 0f32;
         for (i, &got) in out_buf.as_slice().iter().enumerate() {
             let err = (got - out_cpu[i]).abs();
-            if err > max_err { max_err = err; }
+            if err > max_err {
+                max_err = err;
+            }
         }
         eprintln!(
             "usm_flash_attn_prefill_v3 parity (n_new={n_new}, kv_len_base={kv_len_base}, multi-tile): \
              max_abs_err = {max_err:.6}"
         );
-        assert!(max_err < 1e-4, "FA-v3 prefill vs CPU max_abs_err {max_err} > 1e-4");
+        assert!(
+            max_err < 1e-4,
+            "FA-v3 prefill vs CPU max_abs_err {max_err} > 1e-4"
+        );
     }
 
     /// P-7: shape-rejection check that doesn't need a real GPU.
@@ -13077,14 +14427,18 @@ mod tests {
                     std::ptr::null(),
                     std::ptr::null(),
                     std::ptr::null_mut(),
-                    4, 2, bad_dim, 64, 32,
+                    4,
+                    2,
+                    bad_dim,
+                    64,
+                    32,
                 )
             };
             match r {
                 Err(SyclError::InvalidShape(_)) => {}
-                other => panic!(
-                    "v2 must reject head_dim={bad_dim} with InvalidShape; got {other:?}"
-                ),
+                other => {
+                    panic!("v2 must reject head_dim={bad_dim} with InvalidShape; got {other:?}")
+                }
             }
         }
     }
@@ -13099,7 +14453,7 @@ mod tests {
         };
         let n_heads = 4u32;
         let n_kv_heads = 2u32;
-        let head_dim = 16u32;       // multiple of 16 → v2-eligible
+        let head_dim = 16u32; // multiple of 16 → v2-eligible
         let max_ctx = 64u32;
         let kv_len_base = 8u32;
         let n_new = 5u32;
@@ -13127,8 +14481,17 @@ mod tests {
             *dst = 0.0;
         }
         flash_attn_prefill_v2_usm(
-            &stream, &q_buf, &k_buf, &v_buf, &mut out_buf,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            &stream,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &mut out_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
         )
         .expect("flash_attn_prefill_v2_usm");
 
@@ -13152,7 +14515,11 @@ mod tests {
                     }
                     sd *= scale;
                     let m_new = m.max(sd);
-                    let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+                    let rescale = if m.is_finite() {
+                        (m - m_new).exp()
+                    } else {
+                        0.0
+                    };
                     let p = (sd - m_new).exp();
                     l = l * rescale + p;
                     for d in 0..head_dim as usize {
@@ -13170,13 +14537,18 @@ mod tests {
         let mut max_err = 0f32;
         for (i, &got) in out_buf.as_slice().iter().enumerate() {
             let err = (got - out_cpu[i]).abs();
-            if err > max_err { max_err = err; }
+            if err > max_err {
+                max_err = err;
+            }
         }
         eprintln!(
             "usm_flash_attn_prefill_v2 parity (n_new={n_new}, kv_len_base={kv_len_base}): \
              max_abs_err = {max_err:.6}"
         );
-        assert!(max_err < 1e-4, "FA-v2 prefill vs CPU max_abs_err {max_err} > 1e-4");
+        assert!(
+            max_err < 1e-4,
+            "FA-v2 prefill vs CPU max_abs_err {max_err} > 1e-4"
+        );
     }
 
     /// Compile-time check: `SyclSharedBuffer` is callable with the
@@ -13186,10 +14558,7 @@ mod tests {
     /// it end-to-end when a real SYCL device is present.
     #[test]
     fn sycl_shared_buffer_compile_check() {
-        fn _alloc_signature<'s>(
-            s: &'s SyclStream,
-            n: usize,
-        ) -> Result<SyclSharedBuffer<'s, u16>> {
+        fn _alloc_signature<'s>(s: &'s SyclStream, n: usize) -> Result<SyclSharedBuffer<'s, u16>> {
             SyclSharedBuffer::<u16>::alloc(s, n)
         }
         fn _rmsnorm_usm_signature(
@@ -13245,8 +14614,16 @@ mod tests {
             *dst = 0;
         }
         // Safe wrapper call — three distinct buffers + the stream.
-        rmsnorm_usm(&stream, &x_buf, &w_buf, &mut y_buf, n_rows as u32, d as u32, eps)
-            .expect("rmsnorm_usm");
+        rmsnorm_usm(
+            &stream,
+            &x_buf,
+            &w_buf,
+            &mut y_buf,
+            n_rows as u32,
+            d as u32,
+            eps,
+        )
+        .expect("rmsnorm_usm");
         // CPU reference matching the parity_check_rmsnorm helper.
         let mut max_err = 0f32;
         for r in 0..n_rows {
@@ -13269,7 +14646,10 @@ mod tests {
             }
         }
         eprintln!("usm_rmsnorm parity: max_abs_err = {max_err:.6}");
-        assert!(max_err < 1e-2, "USM rmsnorm vs CPU max_abs_err {max_err} > 1e-2");
+        assert!(
+            max_err < 1e-2,
+            "USM rmsnorm vs CPU max_abs_err {max_err} > 1e-2"
+        );
     }
 
     #[test]
@@ -13338,9 +14718,8 @@ mod tests {
         fn _typecheck_dequant() -> fn(&mut SyclStream, &[u8], &mut [u16]) -> Result<()> {
             dequant_nvfp4
         }
-        fn _typecheck_matvec()
-            -> fn(&mut SyclStream, &[u8], &[u16], &mut [u16], u32, u32) -> Result<()>
-        {
+        fn _typecheck_matvec(
+        ) -> fn(&mut SyclStream, &[u8], &[u16], &mut [u16], u32, u32) -> Result<()> {
             matvec_nvfp4_f16
         }
         let _ = _typecheck_dequant();
@@ -13368,7 +14747,14 @@ mod tests {
     /// Mirrors the SYCL kernel exactly so any divergence is a real bug
     /// rather than an algorithmic disagreement.
     #[allow(dead_code)]
-    fn rmsnorm_reference_f32(x: &[f32], w: &[f32], y: &mut [f32], n_rows: usize, d: usize, eps: f32) {
+    fn rmsnorm_reference_f32(
+        x: &[f32],
+        w: &[f32],
+        y: &mut [f32],
+        n_rows: usize,
+        d: usize,
+        eps: f32,
+    ) {
         for r in 0..n_rows {
             let base = r * d;
             let mut sum_sq = 0.0f32;
@@ -13385,7 +14771,9 @@ mod tests {
 
     #[allow(dead_code)]
     fn f32_slice_to_f16_bits(src: &[f32]) -> Vec<u16> {
-        src.iter().map(|v| half::f16::from_f32(*v).to_bits()).collect()
+        src.iter()
+            .map(|v| half::f16::from_f32(*v).to_bits())
+            .collect()
     }
 
     #[allow(dead_code)]
@@ -13456,7 +14844,14 @@ mod tests {
             .map(|b| f16_bits_to_f32(*b))
             .collect::<Vec<_>>();
         let mut y_ref = vec![0f32; (n_rows * d) as usize];
-        rmsnorm_reference_f32(&x_round, &w_round, &mut y_ref, n_rows as usize, d as usize, eps);
+        rmsnorm_reference_f32(
+            &x_round,
+            &w_round,
+            &mut y_ref,
+            n_rows as usize,
+            d as usize,
+            eps,
+        );
 
         let mut y_gpu_bits = vec![0u16; (n_rows * d) as usize];
         rmsnorm(&mut stream, &x_f16, &w_f16, &mut y_gpu_bits, n_rows, d, eps)
@@ -13494,10 +14889,9 @@ mod tests {
         for chunk in w_bytes.chunks_mut(BLOCK_BYTES) {
             s_state = s_state.wrapping_mul(1664525).wrapping_add(1013904223);
             // d ∈ [-0.5, 0.5] half-range.
-            let d_bits = half::f16::from_f32(
-                ((s_state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0,
-            )
-            .to_bits();
+            let d_bits =
+                half::f16::from_f32(((s_state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0)
+                    .to_bits();
             chunk[0] = (d_bits & 0xFF) as u8;
             chunk[1] = ((d_bits >> 8) & 0xFF) as u8;
             for b in chunk[2..18].iter_mut() {
@@ -13526,14 +14920,7 @@ mod tests {
         // Dispatch.
         unsafe {
             matvec_iq4_nl_packed_f32_batched_usm_raw(
-                &stream,
-                w_usm,
-                x_usm,
-                out_usm,
-                m as u32,
-                k as u32,
-                n as u32,
-                16,
+                &stream, w_usm, x_usm, out_usm, m as u32, k as u32, n as u32, 16,
             )
             .expect("iq4_nl batched matvec dispatch");
         }
@@ -13591,10 +14978,9 @@ mod tests {
         let mut s_state: u32 = 13;
         for chunk in w_bytes.chunks_mut(BLOCK_BYTES) {
             s_state = s_state.wrapping_mul(1664525).wrapping_add(1013904223);
-            let d_bits = half::f16::from_f32(
-                ((s_state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0,
-            )
-            .to_bits();
+            let d_bits =
+                half::f16::from_f32(((s_state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0)
+                    .to_bits();
             chunk[0] = (d_bits & 0xFF) as u8;
             chunk[1] = ((d_bits >> 8) & 0xFF) as u8;
             for b in chunk[2..136].iter_mut() {
@@ -13621,14 +15007,7 @@ mod tests {
         }
         unsafe {
             matvec_iq4_xs_packed_f32_batched_usm_raw(
-                &stream,
-                w_usm,
-                x_usm,
-                out_usm,
-                m as u32,
-                k as u32,
-                n as u32,
-                16,
+                &stream, w_usm, x_usm, out_usm, m as u32, k as u32, n as u32, 16,
             )
             .expect("iq4_xs batched matvec dispatch");
         }
@@ -13687,10 +15066,9 @@ mod tests {
         let mut s_state: u32 = 41;
         for chunk in w_bytes.chunks_mut(BLOCK_BYTES) {
             s_state = s_state.wrapping_mul(1664525).wrapping_add(1013904223);
-            let d_bits = half::f16::from_f32(
-                ((s_state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0,
-            )
-            .to_bits();
+            let d_bits =
+                half::f16::from_f32(((s_state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0)
+                    .to_bits();
             chunk[0] = (d_bits & 0xFF) as u8;
             chunk[1] = ((d_bits >> 8) & 0xFF) as u8;
             for b in chunk[2..50].iter_mut() {
@@ -13716,16 +15094,8 @@ mod tests {
             }
         }
         unsafe {
-            matvec_iq1_s_packed_f32_usm_raw(
-                &stream,
-                w_usm,
-                x_usm,
-                out_usm,
-                m as u32,
-                k as u32,
-                16,
-            )
-            .expect("iq1_s matvec dispatch");
+            matvec_iq1_s_packed_f32_usm_raw(&stream, w_usm, x_usm, out_usm, m as u32, k as u32, 16)
+                .expect("iq1_s matvec dispatch");
         }
         let mut out_gpu = vec![0f32; m];
         unsafe {
@@ -13768,10 +15138,9 @@ mod tests {
         let mut s_state: u32 = 41;
         for chunk in w_bytes.chunks_mut(BLOCK_BYTES) {
             s_state = s_state.wrapping_mul(1664525).wrapping_add(1013904223);
-            let d_bits = half::f16::from_f32(
-                ((s_state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0,
-            )
-            .to_bits();
+            let d_bits =
+                half::f16::from_f32(((s_state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0)
+                    .to_bits();
             chunk[0] = (d_bits & 0xFF) as u8;
             chunk[1] = ((d_bits >> 8) & 0xFF) as u8;
             for b in chunk[2..50].iter_mut() {
@@ -13798,8 +15167,7 @@ mod tests {
         }
         unsafe {
             matvec_iq1_s_packed_f32_batched_usm_raw(
-                &stream, w_usm, x_usm, out_usm,
-                m as u32, k as u32, n as u32, 16,
+                &stream, w_usm, x_usm, out_usm, m as u32, k as u32, n as u32, 16,
             )
             .expect("iq1_s batched matvec dispatch");
         }
@@ -13814,7 +15182,11 @@ mod tests {
         for ni in 0..n {
             let mut row_out = vec![0f32; m];
             rustllama_kernels_cpu::matvec_iq1_s_w_f32_a(
-                &w_bytes, &x[ni * k..(ni + 1) * k], &mut row_out, m, k,
+                &w_bytes,
+                &x[ni * k..(ni + 1) * k],
+                &mut row_out,
+                m,
+                k,
             );
             for mi in 0..m {
                 out_cpu[ni * m + mi] = row_out[mi];
@@ -13846,7 +15218,16 @@ mod tests {
         format_name: &str,
         block_bytes: usize,
         seed: u32,
-        gpu_dispatch: unsafe fn(&SyclStream, *const u8, *const f32, *mut f32, u32, u32, u32, u32) -> Result<()>,
+        gpu_dispatch: unsafe fn(
+            &SyclStream,
+            *const u8,
+            *const f32,
+            *mut f32,
+            u32,
+            u32,
+            u32,
+            u32,
+        ) -> Result<()>,
         cpu_ref: fn(&[u8], &[f32], &mut [f32], usize, usize),
     ) {
         let stream = match create_stream(0) {
@@ -13860,10 +15241,9 @@ mod tests {
         let mut s_state: u32 = seed;
         for chunk in w_bytes.chunks_mut(block_bytes) {
             s_state = s_state.wrapping_mul(1664525).wrapping_add(1013904223);
-            let d_bits = half::f16::from_f32(
-                ((s_state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0,
-            )
-            .to_bits();
+            let d_bits =
+                half::f16::from_f32(((s_state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0)
+                    .to_bits();
             chunk[0] = (d_bits & 0xFF) as u8;
             chunk[1] = ((d_bits >> 8) & 0xFF) as u8;
             for b in chunk[2..].iter_mut() {
@@ -13889,8 +15269,10 @@ mod tests {
             }
         }
         unsafe {
-            gpu_dispatch(&stream, w_usm, x_usm, out_usm, m as u32, k as u32, n as u32, 16)
-                .unwrap_or_else(|e| panic!("{format_name} batched dispatch failed: {e:?}"));
+            gpu_dispatch(
+                &stream, w_usm, x_usm, out_usm, m as u32, k as u32, n as u32, 16,
+            )
+            .unwrap_or_else(|e| panic!("{format_name} batched dispatch failed: {e:?}"));
         }
         let mut out_gpu = vec![0f32; n * m];
         unsafe {
@@ -13942,10 +15324,9 @@ mod tests {
         let mut s_state: u32 = 47;
         for chunk in w_bytes.chunks_mut(BLOCK_BYTES) {
             s_state = s_state.wrapping_mul(1664525).wrapping_add(1013904223);
-            let d_bits = half::f16::from_f32(
-                ((s_state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0,
-            )
-            .to_bits();
+            let d_bits =
+                half::f16::from_f32(((s_state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0)
+                    .to_bits();
             chunk[0] = (d_bits & 0xFF) as u8;
             chunk[1] = ((d_bits >> 8) & 0xFF) as u8;
             for b in chunk[2..].iter_mut() {
@@ -13966,12 +15347,13 @@ mod tests {
         unsafe {
             std::ptr::copy_nonoverlapping(w_bytes.as_ptr(), w_usm, w_bytes.len());
             std::ptr::copy_nonoverlapping(x.as_ptr(), x_usm, k);
-            for i in 0..m { *out_usm.add(i) = 0.0; }
+            for i in 0..m {
+                *out_usm.add(i) = 0.0;
+            }
         }
         unsafe {
-            matvec_iq1_s_packed_f32_usm_raw(
-                &stream, w_usm, x_usm, out_usm, m as u32, k as u32, 16,
-            ).expect("iq1_s single-row dispatch");
+            matvec_iq1_s_packed_f32_usm_raw(&stream, w_usm, x_usm, out_usm, m as u32, k as u32, 16)
+                .expect("iq1_s single-row dispatch");
         }
         let mut out_gpu = vec![0f32; m];
         unsafe {
@@ -13982,7 +15364,9 @@ mod tests {
         let mut max_err = 0f32;
         for (g, c) in out_gpu.iter().zip(out_cpu.iter()) {
             let e = (g - c).abs();
-            if e > max_err { max_err = e; }
+            if e > max_err {
+                max_err = e;
+            }
         }
         println!("iq1_s single-row with iq1_m seeds: max_err vs CPU AVX2 = {max_err}");
         unsafe {
@@ -13997,7 +15381,11 @@ mod tests {
     /// dispatch — gives us a "no FMA, scalar mul+add" baseline to
     /// compare against GPU and CPU runtime separately.
     fn iq1_m_matvec_scalar_reference(
-        w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize,
+        w_bytes: &[u8],
+        x: &[f32],
+        out: &mut [f32],
+        m: usize,
+        k: usize,
     ) {
         use rustllama_gguf::dequant::IQ1S_DELTA;
         use rustllama_gguf::iq1_grid::IQ1S_GRID;
@@ -14016,8 +15404,10 @@ mod tests {
                 for ii in 0..4 {
                     sc[ii] = u16::from_le_bytes([scales_bytes[ii * 2], scales_bytes[ii * 2 + 1]]);
                 }
-                let d_bits: u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0)
-                    | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
+                let d_bits: u16 = (sc[0] >> 12)
+                    | ((sc[1] >> 8) & 0x00F0)
+                    | ((sc[2] >> 4) & 0x0F00)
+                    | (sc[3] & 0xF000);
                 let d = half::f16::from_bits(d_bits).to_f32();
                 let x_block = &x[b * QK_K..(b + 1) * QK_K];
                 let mut x_off = 0usize;
@@ -14029,7 +15419,13 @@ mod tests {
                     let dl2 = d * (2.0 * ((s_word >> shift1) & 0x7) as f32 + 1.0);
                     let qh0 = qh[ib * 2];
                     let qh1 = qh[ib * 2 + 1];
-                    let delta = |b: bool| if b { -1.0 - IQ1S_DELTA } else { -1.0 + IQ1S_DELTA };
+                    let delta = |b: bool| {
+                        if b {
+                            -1.0 - IQ1S_DELTA
+                        } else {
+                            -1.0 + IQ1S_DELTA
+                        }
+                    };
                     let qs_chunk = &qs[ib * 4..ib * 4 + 4];
                     let idx_l = [
                         qs_chunk[0] as usize | (((qh0 & 0x07) as usize) << 8),
@@ -14039,8 +15435,10 @@ mod tests {
                     ];
                     let dl_l = [dl1, dl1, dl2, dl2];
                     let delta_l = [
-                        delta(qh0 & 0x08 != 0), delta(qh0 & 0x80 != 0),
-                        delta(qh1 & 0x08 != 0), delta(qh1 & 0x80 != 0),
+                        delta(qh0 & 0x08 != 0),
+                        delta(qh0 & 0x80 != 0),
+                        delta(qh1 & 0x08 != 0),
+                        delta(qh1 & 0x80 != 0),
                     ];
                     for l in 0..4 {
                         let grid = IQ1S_GRID[idx_l[l]].to_le_bytes();
@@ -14075,9 +15473,9 @@ mod tests {
         let mut s_state: u32 = 47;
         for chunk in w_bytes.chunks_mut(BLOCK_BYTES) {
             s_state = s_state.wrapping_mul(1664525).wrapping_add(1013904223);
-            let d_bits = half::f16::from_f32(
-                ((s_state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0,
-            ).to_bits();
+            let d_bits =
+                half::f16::from_f32(((s_state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0)
+                    .to_bits();
             chunk[0] = (d_bits & 0xFF) as u8;
             chunk[1] = ((d_bits >> 8) & 0xFF) as u8;
             for b in chunk[2..].iter_mut() {
@@ -14098,10 +15496,11 @@ mod tests {
         unsafe {
             std::ptr::copy_nonoverlapping(w_bytes.as_ptr(), w_usm, w_bytes.len());
             std::ptr::copy_nonoverlapping(x.as_ptr(), x_usm, k);
-            for i in 0..m { *out_usm.add(i) = 0.0; }
-            matvec_iq1_m_packed_f32_usm_raw(
-                &stream, w_usm, x_usm, out_usm, m as u32, k as u32, 16,
-            ).expect("dispatch");
+            for i in 0..m {
+                *out_usm.add(i) = 0.0;
+            }
+            matvec_iq1_m_packed_f32_usm_raw(&stream, w_usm, x_usm, out_usm, m as u32, k as u32, 16)
+                .expect("dispatch");
         }
         let mut out_gpu = vec![0f32; m];
         unsafe {
@@ -14153,10 +15552,9 @@ mod tests {
         let mut s_state: u32 = 47;
         for chunk in w_bytes.chunks_mut(BLOCK_BYTES) {
             s_state = s_state.wrapping_mul(1664525).wrapping_add(1013904223);
-            let d_bits = half::f16::from_f32(
-                ((s_state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0,
-            )
-            .to_bits();
+            let d_bits =
+                half::f16::from_f32(((s_state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0)
+                    .to_bits();
             chunk[0] = (d_bits & 0xFF) as u8;
             chunk[1] = ((d_bits >> 8) & 0xFF) as u8;
             for b in chunk[2..].iter_mut() {
@@ -14177,12 +15575,13 @@ mod tests {
         unsafe {
             std::ptr::copy_nonoverlapping(w_bytes.as_ptr(), w_usm, w_bytes.len());
             std::ptr::copy_nonoverlapping(x.as_ptr(), x_usm, k);
-            for i in 0..m { *out_usm.add(i) = 0.0; }
+            for i in 0..m {
+                *out_usm.add(i) = 0.0;
+            }
         }
         unsafe {
-            matvec_iq1_m_packed_f32_usm_raw(
-                &stream, w_usm, x_usm, out_usm, m as u32, k as u32, 16,
-            ).expect("iq1_m single-row dispatch");
+            matvec_iq1_m_packed_f32_usm_raw(&stream, w_usm, x_usm, out_usm, m as u32, k as u32, 16)
+                .expect("iq1_m single-row dispatch");
         }
         let mut out_gpu = vec![0f32; m];
         unsafe {
@@ -14193,7 +15592,9 @@ mod tests {
         let mut max_err = 0f32;
         for (g, c) in out_gpu.iter().zip(out_cpu.iter()) {
             let e = (g - c).abs();
-            if e > max_err { max_err = e; }
+            if e > max_err {
+                max_err = e;
+            }
         }
         // Report what we see; assert generously so we get the actual delta.
         println!("iq1_m single-row max_err vs CPU AVX2: {max_err}");
@@ -14236,10 +15637,9 @@ mod tests {
         let mut s_state: u32 = 47;
         for chunk in w_bytes.chunks_mut(BLOCK_BYTES) {
             s_state = s_state.wrapping_mul(1664525).wrapping_add(1013904223);
-            let d_bits = half::f16::from_f32(
-                ((s_state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0,
-            )
-            .to_bits();
+            let d_bits =
+                half::f16::from_f32(((s_state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0)
+                    .to_bits();
             chunk[0] = (d_bits & 0xFF) as u8;
             chunk[1] = ((d_bits >> 8) & 0xFF) as u8;
             for b in chunk[2..].iter_mut() {
@@ -14266,8 +15666,7 @@ mod tests {
         }
         unsafe {
             matvec_iq1_m_packed_f32_batched_usm_raw(
-                &stream, w_usm, x_usm, out_usm,
-                m as u32, k as u32, n as u32, 16,
+                &stream, w_usm, x_usm, out_usm, m as u32, k as u32, n as u32, 16,
             )
             .expect("iq1_m batched dispatch");
         }
@@ -14279,7 +15678,11 @@ mod tests {
         for ni in 0..n {
             let mut row_out = vec![0f32; m];
             rustllama_kernels_cpu::matvec_iq1_m_w_f32_a(
-                &w_bytes, &x[ni * k..(ni + 1) * k], &mut row_out, m, k,
+                &w_bytes,
+                &x[ni * k..(ni + 1) * k],
+                &mut row_out,
+                m,
+                k,
             );
             for mi in 0..m {
                 out_cpu[ni * m + mi] = row_out[mi];
@@ -14306,7 +15709,9 @@ mod tests {
     #[test]
     fn sycl_iq2_xxs_batched_matvec_matches_cpu() {
         check_iq_batched_matches_cpu(
-            "iq2_xxs", 66, 53,
+            "iq2_xxs",
+            66,
+            53,
             matvec_iq2_xxs_packed_f32_batched_usm_raw,
             rustllama_kernels_cpu::matvec_iq2_xxs_w_f32_a,
         );
@@ -14315,7 +15720,9 @@ mod tests {
     #[test]
     fn sycl_iq2_xs_batched_matvec_matches_cpu() {
         check_iq_batched_matches_cpu(
-            "iq2_xs", 74, 59,
+            "iq2_xs",
+            74,
+            59,
             matvec_iq2_xs_packed_f32_batched_usm_raw,
             rustllama_kernels_cpu::matvec_iq2_xs_w_f32_a,
         );
@@ -14324,7 +15731,9 @@ mod tests {
     #[test]
     fn sycl_iq2_s_batched_matvec_matches_cpu() {
         check_iq_batched_matches_cpu(
-            "iq2_s", 82, 61,
+            "iq2_s",
+            82,
+            61,
             matvec_iq2_s_packed_f32_batched_usm_raw,
             rustllama_kernels_cpu::matvec_iq2_s_w_f32_a,
         );
@@ -14333,7 +15742,9 @@ mod tests {
     #[test]
     fn sycl_iq3_xxs_batched_matvec_matches_cpu() {
         check_iq_batched_matches_cpu(
-            "iq3_xxs", 98, 67,
+            "iq3_xxs",
+            98,
+            67,
             matvec_iq3_xxs_packed_f32_batched_usm_raw,
             rustllama_kernels_cpu::matvec_iq3_xxs_w_f32_a,
         );
@@ -14342,7 +15753,9 @@ mod tests {
     #[test]
     fn sycl_iq3_s_batched_matvec_matches_cpu() {
         check_iq_batched_matches_cpu(
-            "iq3_s", 110, 71,
+            "iq3_s",
+            110,
+            71,
             matvec_iq3_s_packed_f32_batched_usm_raw,
             rustllama_kernels_cpu::matvec_iq3_s_w_f32_a,
         );
@@ -14363,10 +15776,8 @@ mod tests {
                 *b = (s >> 24) as u8;
             }
             s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            let d_bits = half::f16::from_f32(
-                ((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0,
-            )
-            .to_bits();
+            let d_bits =
+                half::f16::from_f32(((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1.0).to_bits();
             chunk[26] = (d_bits & 0xFF) as u8;
             chunk[27] = ((d_bits >> 8) & 0xFF) as u8;
         }
@@ -14514,7 +15925,12 @@ mod tests {
                     *out_usm.add(i) = f32::NAN;
                 }
                 hadamard_forward_usm_raw(
-                    &stream, x_usm, signs_usm, out_usm, n as u32, block as u32,
+                    &stream,
+                    x_usm,
+                    signs_usm,
+                    out_usm,
+                    n as u32,
+                    block as u32,
                 )
                 .unwrap_or_else(|e| panic!("hadamard dispatch failed (block={block}): {e:?}"));
                 let mut max_err = 0f32;

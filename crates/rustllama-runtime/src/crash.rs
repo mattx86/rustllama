@@ -94,7 +94,11 @@ fn write_crash_log(
     writeln!(file, "subcommand: {tag}")?;
     writeln!(file, "pid:        {pid}")?;
     writeln!(file, "timestamp:  epoch-{secs}")?;
-    writeln!(file, "argv:       {:?}", std::env::args().collect::<Vec<_>>())?;
+    writeln!(
+        file,
+        "argv:       {:?}",
+        std::env::args().collect::<Vec<_>>()
+    )?;
     writeln!(file, "host_os:    {}", std::env::consts::OS)?;
     writeln!(file, "host_arch:  {}", std::env::consts::ARCH)?;
     writeln!(file)?;

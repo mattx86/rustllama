@@ -36,7 +36,11 @@ fn build_state_tagged(tag: &str) -> (AppState, std::path::PathBuf) {
     (AppState::new(serving, "0.0.0-test".into()), tmp)
 }
 
-async fn post_json(app: axum::Router, path: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+async fn post_json(
+    app: axum::Router,
+    path: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
     let req = Request::builder()
         .method("POST")
         .uri(path)

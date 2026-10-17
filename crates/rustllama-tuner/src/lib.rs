@@ -1419,7 +1419,10 @@ mod tests {
     fn moe_gate_up_coherence_verdict_roundtrips() {
         assert_eq!(VERDICT_FUSED_GATE_UP_PREFIX, "fused:");
         assert_eq!(VERDICT_MOE_GATE_UP_COHERENT_PREFIX, "moe:gate_up_coherent:");
-        assert_ne!(VERDICT_FUSED_GATE_UP_PREFIX, VERDICT_MOE_GATE_UP_COHERENT_PREFIX);
+        assert_ne!(
+            VERDICT_FUSED_GATE_UP_PREFIX,
+            VERDICT_MOE_GATE_UP_COHERENT_PREFIX
+        );
         let mut t = TuningResult::empty("fp".into(), DeviceFingerprint::default());
         let key = format!("{VERDICT_MOE_GATE_UP_COHERENT_PREFIX}iq2_xxs");
         // Absent ⇒ unset (the dispatch gate treats this as OFF).
@@ -1445,7 +1448,11 @@ mod tests {
             VERDICT_FUSED_DOWN_RESIDUAL,
             VERDICT_FUSED_OUT_PROJ_NORM,
         ] {
-            assert_eq!(verdict_for(&t, k), None, "{k} must be unset on a fresh cache");
+            assert_eq!(
+                verdict_for(&t, k),
+                None,
+                "{k} must be unset on a fresh cache"
+            );
         }
         // P19: per-bucket FA tile winners default to None (byte-identical).
         assert!(t.flash_v3_kv_tile_by_bucket.is_none());
@@ -1562,10 +1569,26 @@ mod tests {
         // The picker's whole job: return the candidate with the highest measured
         // effective decode tok/s. `[4, 2]` is fastest here, so it wins outright.
         let cands = vec![
-            TreeWidthMeasurement { widths: vec![2], tok_s: Some(10.0), accept: Some(0.5) },
-            TreeWidthMeasurement { widths: vec![2, 2], tok_s: Some(12.0), accept: Some(0.6) },
-            TreeWidthMeasurement { widths: vec![4, 2], tok_s: Some(15.0), accept: Some(0.55) },
-            TreeWidthMeasurement { widths: vec![2, 2, 2, 2], tok_s: Some(11.0), accept: Some(0.7) },
+            TreeWidthMeasurement {
+                widths: vec![2],
+                tok_s: Some(10.0),
+                accept: Some(0.5),
+            },
+            TreeWidthMeasurement {
+                widths: vec![2, 2],
+                tok_s: Some(12.0),
+                accept: Some(0.6),
+            },
+            TreeWidthMeasurement {
+                widths: vec![4, 2],
+                tok_s: Some(15.0),
+                accept: Some(0.55),
+            },
+            TreeWidthMeasurement {
+                widths: vec![2, 2, 2, 2],
+                tok_s: Some(11.0),
+                accept: Some(0.7),
+            },
         ];
         assert_eq!(pick_tree_widths(&cands), Some(vec![4, 2]));
     }
@@ -1576,14 +1599,30 @@ mod tests {
         // otherwise be "first". With every candidate failed the picker yields
         // None (caller keeps the config default).
         let cands = vec![
-            TreeWidthMeasurement { widths: vec![2], tok_s: None, accept: None },
-            TreeWidthMeasurement { widths: vec![2, 2], tok_s: Some(9.5), accept: Some(0.4) },
+            TreeWidthMeasurement {
+                widths: vec![2],
+                tok_s: None,
+                accept: None,
+            },
+            TreeWidthMeasurement {
+                widths: vec![2, 2],
+                tok_s: Some(9.5),
+                accept: Some(0.4),
+            },
         ];
         assert_eq!(pick_tree_widths(&cands), Some(vec![2, 2]));
 
         let all_failed = vec![
-            TreeWidthMeasurement { widths: vec![2], tok_s: None, accept: None },
-            TreeWidthMeasurement { widths: vec![4, 2], tok_s: None, accept: None },
+            TreeWidthMeasurement {
+                widths: vec![2],
+                tok_s: None,
+                accept: None,
+            },
+            TreeWidthMeasurement {
+                widths: vec![4, 2],
+                tok_s: None,
+                accept: None,
+            },
         ];
         assert_eq!(pick_tree_widths(&all_failed), None);
         assert_eq!(pick_tree_widths(&[]), None);
@@ -1596,23 +1635,47 @@ mod tests {
         // (sum 8) despite appearing later — a hand-checkable, order-independent
         // outcome.
         let cands = vec![
-            TreeWidthMeasurement { widths: vec![4, 2, 2], tok_s: Some(13.0), accept: Some(0.6) },
-            TreeWidthMeasurement { widths: vec![2, 2], tok_s: Some(13.0), accept: Some(0.5) },
+            TreeWidthMeasurement {
+                widths: vec![4, 2, 2],
+                tok_s: Some(13.0),
+                accept: Some(0.6),
+            },
+            TreeWidthMeasurement {
+                widths: vec![2, 2],
+                tok_s: Some(13.0),
+                accept: Some(0.5),
+            },
         ];
         assert_eq!(pick_tree_widths(&cands), Some(vec![2, 2]));
 
         // Equal tok/s AND equal node sum → the EARLIER candidate wins (stable).
         let equal_size = vec![
-            TreeWidthMeasurement { widths: vec![3, 1], tok_s: Some(7.0), accept: Some(0.3) },
-            TreeWidthMeasurement { widths: vec![2, 2], tok_s: Some(7.0), accept: Some(0.9) },
+            TreeWidthMeasurement {
+                widths: vec![3, 1],
+                tok_s: Some(7.0),
+                accept: Some(0.3),
+            },
+            TreeWidthMeasurement {
+                widths: vec![2, 2],
+                tok_s: Some(7.0),
+                accept: Some(0.9),
+            },
         ];
         assert_eq!(pick_tree_widths(&equal_size), Some(vec![3, 1]));
 
         // A strictly faster (beyond-eps) candidate wins regardless of its size,
         // so the tie-break never overrides a real speed difference.
         let real_diff = vec![
-            TreeWidthMeasurement { widths: vec![2], tok_s: Some(10.0), accept: Some(0.5) },
-            TreeWidthMeasurement { widths: vec![4, 4, 2], tok_s: Some(20.0), accept: Some(0.8) },
+            TreeWidthMeasurement {
+                widths: vec![2],
+                tok_s: Some(10.0),
+                accept: Some(0.5),
+            },
+            TreeWidthMeasurement {
+                widths: vec![4, 4, 2],
+                tok_s: Some(20.0),
+                accept: Some(0.8),
+            },
         ];
         assert_eq!(pick_tree_widths(&real_diff), Some(vec![4, 4, 2]));
     }
@@ -1621,15 +1684,24 @@ mod tests {
 
     #[test]
     fn optimize_for_parse_roundtrips() {
-        assert_eq!(OptimizeFor::parse("throughput"), Some(OptimizeFor::Throughput));
+        assert_eq!(
+            OptimizeFor::parse("throughput"),
+            Some(OptimizeFor::Throughput)
+        );
         assert_eq!(OptimizeFor::parse("TPS"), Some(OptimizeFor::Throughput));
         assert_eq!(OptimizeFor::parse("watts"), Some(OptimizeFor::Watts));
         assert_eq!(OptimizeFor::parse("Energy"), Some(OptimizeFor::Watts));
         assert_eq!(OptimizeFor::parse("nonsense"), None);
         // default is Throughput; canonical strings round-trip.
         assert_eq!(OptimizeFor::default(), OptimizeFor::Throughput);
-        assert_eq!(OptimizeFor::parse(OptimizeFor::Throughput.as_str()), Some(OptimizeFor::Throughput));
-        assert_eq!(OptimizeFor::parse(OptimizeFor::Watts.as_str()), Some(OptimizeFor::Watts));
+        assert_eq!(
+            OptimizeFor::parse(OptimizeFor::Throughput.as_str()),
+            Some(OptimizeFor::Throughput)
+        );
+        assert_eq!(
+            OptimizeFor::parse(OptimizeFor::Watts.as_str()),
+            Some(OptimizeFor::Watts)
+        );
     }
 
     /// Throughput objective: the picker returns the value with the highest
@@ -1637,12 +1709,31 @@ mod tests {
     #[test]
     fn pick_perf_knob_throughput_maximizes_tps() {
         let cands = vec![
-            PerfCandidate { value: 64, tok_s: Some(10.0), tokens_per_joule: Some(5.0) },
-            PerfCandidate { value: 128, tok_s: Some(12.0), tokens_per_joule: Some(4.0) },
-            PerfCandidate { value: 256, tok_s: Some(15.0), tokens_per_joule: Some(3.0) },
-            PerfCandidate { value: 512, tok_s: Some(11.0), tokens_per_joule: Some(2.0) },
+            PerfCandidate {
+                value: 64,
+                tok_s: Some(10.0),
+                tokens_per_joule: Some(5.0),
+            },
+            PerfCandidate {
+                value: 128,
+                tok_s: Some(12.0),
+                tokens_per_joule: Some(4.0),
+            },
+            PerfCandidate {
+                value: 256,
+                tok_s: Some(15.0),
+                tokens_per_joule: Some(3.0),
+            },
+            PerfCandidate {
+                value: 512,
+                tok_s: Some(11.0),
+                tokens_per_joule: Some(2.0),
+            },
         ];
-        assert_eq!(pick_perf_knob(&cands, OptimizeFor::Throughput, 256), Some(256));
+        assert_eq!(
+            pick_perf_knob(&cands, OptimizeFor::Throughput, 256),
+            Some(256)
+        );
     }
 
     /// Watts objective picks a DIFFERENT winner than throughput on the same
@@ -1650,12 +1741,27 @@ mod tests {
     #[test]
     fn pick_perf_knob_watts_picks_per_joule_winner() {
         let cands = vec![
-            PerfCandidate { value: 64, tok_s: Some(10.0), tokens_per_joule: Some(5.0) },
-            PerfCandidate { value: 128, tok_s: Some(12.0), tokens_per_joule: Some(4.0) },
-            PerfCandidate { value: 256, tok_s: Some(15.0), tokens_per_joule: Some(3.0) },
+            PerfCandidate {
+                value: 64,
+                tok_s: Some(10.0),
+                tokens_per_joule: Some(5.0),
+            },
+            PerfCandidate {
+                value: 128,
+                tok_s: Some(12.0),
+                tokens_per_joule: Some(4.0),
+            },
+            PerfCandidate {
+                value: 256,
+                tok_s: Some(15.0),
+                tokens_per_joule: Some(3.0),
+            },
         ];
         // Throughput → 256 (15 tok/s); Watts → 64 (5 tok/J).
-        assert_eq!(pick_perf_knob(&cands, OptimizeFor::Throughput, 256), Some(256));
+        assert_eq!(
+            pick_perf_knob(&cands, OptimizeFor::Throughput, 256),
+            Some(256)
+        );
         assert_eq!(pick_perf_knob(&cands, OptimizeFor::Watts, 256), Some(64));
     }
 
@@ -1664,10 +1770,21 @@ mod tests {
     #[test]
     fn pick_perf_knob_winner_overrides_default() {
         let cands = vec![
-            PerfCandidate { value: 256, tok_s: Some(10.0), tokens_per_joule: None }, // default
-            PerfCandidate { value: 1024, tok_s: Some(18.0), tokens_per_joule: None },
+            PerfCandidate {
+                value: 256,
+                tok_s: Some(10.0),
+                tokens_per_joule: None,
+            }, // default
+            PerfCandidate {
+                value: 1024,
+                tok_s: Some(18.0),
+                tokens_per_joule: None,
+            },
         ];
-        assert_eq!(pick_perf_knob(&cands, OptimizeFor::Throughput, 256), Some(1024));
+        assert_eq!(
+            pick_perf_knob(&cands, OptimizeFor::Throughput, 256),
+            Some(1024)
+        );
     }
 
     /// Absent winner → None, so the caller keeps the historical constant
@@ -1678,28 +1795,65 @@ mod tests {
         // No measurement at all → None (caller uses the hard-coded default).
         assert_eq!(pick_perf_knob(&[], OptimizeFor::Throughput, 256), None);
         let all_failed = vec![
-            PerfCandidate { value: 64, tok_s: None, tokens_per_joule: None },
-            PerfCandidate { value: 256, tok_s: None, tokens_per_joule: None },
+            PerfCandidate {
+                value: 64,
+                tok_s: None,
+                tokens_per_joule: None,
+            },
+            PerfCandidate {
+                value: 256,
+                tok_s: None,
+                tokens_per_joule: None,
+            },
         ];
-        assert_eq!(pick_perf_knob(&all_failed, OptimizeFor::Throughput, 256), None);
+        assert_eq!(
+            pick_perf_knob(&all_failed, OptimizeFor::Throughput, 256),
+            None
+        );
 
         // Dead heat (all within the 0.5% relative epsilon): the DEFAULT value is
         // preferred even though it appears last, so the pick == default ⇒
         // byte-identical. 100.0 vs 100.2 vs 100.1 are all within eps.
         let dead_heat = vec![
-            PerfCandidate { value: 64, tok_s: Some(100.2), tokens_per_joule: None },
-            PerfCandidate { value: 128, tok_s: Some(100.1), tokens_per_joule: None },
-            PerfCandidate { value: 256, tok_s: Some(100.0), tokens_per_joule: None },
+            PerfCandidate {
+                value: 64,
+                tok_s: Some(100.2),
+                tokens_per_joule: None,
+            },
+            PerfCandidate {
+                value: 128,
+                tok_s: Some(100.1),
+                tokens_per_joule: None,
+            },
+            PerfCandidate {
+                value: 256,
+                tok_s: Some(100.0),
+                tokens_per_joule: None,
+            },
         ];
-        assert_eq!(pick_perf_knob(&dead_heat, OptimizeFor::Throughput, 256), Some(256));
+        assert_eq!(
+            pick_perf_knob(&dead_heat, OptimizeFor::Throughput, 256),
+            Some(256)
+        );
 
         // Dead heat with NO candidate equal to the default → the CLOSEST to the
         // default wins (128 is nearer 200 than 64 is).
         let no_default = vec![
-            PerfCandidate { value: 64, tok_s: Some(100.2), tokens_per_joule: None },
-            PerfCandidate { value: 128, tok_s: Some(100.0), tokens_per_joule: None },
+            PerfCandidate {
+                value: 64,
+                tok_s: Some(100.2),
+                tokens_per_joule: None,
+            },
+            PerfCandidate {
+                value: 128,
+                tok_s: Some(100.0),
+                tokens_per_joule: None,
+            },
         ];
-        assert_eq!(pick_perf_knob(&no_default, OptimizeFor::Throughput, 200), Some(128));
+        assert_eq!(
+            pick_perf_knob(&no_default, OptimizeFor::Throughput, 200),
+            Some(128)
+        );
     }
 
     /// The three P16 numeric winners persist across a TOML round-trip, and old

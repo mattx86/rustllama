@@ -1,4 +1,4 @@
-﻿//! Backpressure regression: when more requests pile up against a model
+//! Backpressure regression: when more requests pile up against a model
 //! than `max_pending_per_model` allows, the next request is rejected
 //! with `503 Service Unavailable + Retry-After: 2` and a body that
 //! names the busy model. Well-behaved clients use Retry-After to back
@@ -9,9 +9,7 @@ use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
-use rustllama_engine::{
-    ChatMessage, Engine, Metrics, SamplingParams, Token, TokenStream,
-};
+use rustllama_engine::{ChatMessage, Engine, Metrics, SamplingParams, Token, TokenStream};
 use rustllama_server::{router, AppState, ServingModel};
 use tower::ServiceExt;
 
@@ -124,8 +122,14 @@ async fn exceeding_max_pending_returns_503_with_retry_after() {
         .iter()
         .filter(|s| **s == StatusCode::SERVICE_UNAVAILABLE)
         .count();
-    assert_eq!(ok_count, 1, "expected exactly 1 OK, got statuses {statuses:?}");
-    assert_eq!(busy_count, 1, "expected exactly 1 503, got statuses {statuses:?}");
+    assert_eq!(
+        ok_count, 1,
+        "expected exactly 1 OK, got statuses {statuses:?}"
+    );
+    assert_eq!(
+        busy_count, 1,
+        "expected exactly 1 503, got statuses {statuses:?}"
+    );
 
     // Find the 503 response and inspect its shape.
     let (_, headers, body) = if r1.0 == StatusCode::SERVICE_UNAVAILABLE {
@@ -158,9 +162,7 @@ async fn pending_counter_returns_to_zero_after_backpressure_503() {
     // Give a beat for any background drops to settle.
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
-        serving
-            .pending
-            .load(std::sync::atomic::Ordering::Acquire),
+        serving.pending.load(std::sync::atomic::Ordering::Acquire),
         0,
         "pending counter leaked after backpressure burst"
     );

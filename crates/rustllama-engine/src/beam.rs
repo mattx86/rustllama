@@ -311,7 +311,10 @@ mod tests {
         // length_penalty = 1.0 → per-token mean → B (-0.9) beats A (-1.0).
         let a1 = length_adjusted_score(a.0, a.1, 1.0);
         let b1 = length_adjusted_score(b.0, b.1, 1.0);
-        assert!(b1 > a1, "lp=1 should flip to the longer beam with better mean");
+        assert!(
+            b1 > a1,
+            "lp=1 should flip to the longer beam with better mean"
+        );
     }
 
     #[test]
@@ -377,9 +380,21 @@ mod tests {
         // the continuing slot. An EOS ranked below num_beams is dropped.
         //   (0, EOS=0, -0.1), (1, 5, -0.3), (1, EOS=0, -2.0)
         let cands = vec![
-            BeamCandidate { parent: 0, token: 0, cum_logprob: -0.1 },
-            BeamCandidate { parent: 1, token: 5, cum_logprob: -0.3 },
-            BeamCandidate { parent: 1, token: 0, cum_logprob: -2.0 },
+            BeamCandidate {
+                parent: 0,
+                token: 0,
+                cum_logprob: -0.1,
+            },
+            BeamCandidate {
+                parent: 1,
+                token: 5,
+                cum_logprob: -0.3,
+            },
+            BeamCandidate {
+                parent: 1,
+                token: 0,
+                cum_logprob: -2.0,
+            },
         ];
         let sel = select_step(&cands, 2, Some(0));
         // EOS at rank 0 retires; token 5 continues; we now have 1 continuing.
@@ -419,8 +434,8 @@ mod tests {
         // finished score beats the best attainable running score.
         let mut pool = BeamPool::new(1, 1.0);
         pool.add(vec![1, 2], -1.0); // score -0.5
-        // A live beam with cum -0.2 at len 1 could reach -0.2 → still better
-        // than -0.5, so NOT done.
+                                    // A live beam with cum -0.2 at len 1 could reach -0.2 → still better
+                                    // than -0.5, so NOT done.
         assert!(!pool.is_done(false, -0.2, 1));
         // A live beam with cum -2.0 at len 1 attains only -2.0 < -0.5 → done.
         assert!(pool.is_done(false, -2.0, 1));

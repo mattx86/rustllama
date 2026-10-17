@@ -29,13 +29,13 @@ pub mod encode_iq_vec;
 #[cfg(feature = "encoder")]
 pub mod encode_k;
 #[cfg(feature = "encoder")]
-pub mod iq_gpu;
+pub mod encode_mx;
 #[cfg(feature = "encoder")]
 pub mod encode_t;
-#[cfg(feature = "encoder")]
-pub mod encode_mx;
 pub mod imatrix;
 pub mod iq1_grid;
+#[cfg(feature = "encoder")]
+pub mod iq_gpu;
 mod parse;
 #[cfg(feature = "encoder")]
 pub mod quantize;

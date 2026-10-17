@@ -55,8 +55,7 @@ async fn get_json(app: axum::Router, path: &str) -> (StatusCode, Vec<u8>) {
 /// "no audit log on disk yet" hint.
 #[tokio::test]
 async fn tail_returns_empty_envelope_when_no_file_exists() {
-    let audit_log = std::env::temp_dir()
-        .join("rustllama-audit-tail-no-file-must-not-exist.jsonl");
+    let audit_log = std::env::temp_dir().join("rustllama-audit-tail-no-file-must-not-exist.jsonl");
     let _ = std::fs::remove_file(&audit_log);
     let cfg_toml = format!(
         r#"
@@ -114,7 +113,10 @@ audit_log_path = "{}"
     assert_eq!(entries[1]["path"], "/d");
     assert_eq!(entries[2]["path"], "/c");
     assert!(
-        v["path"].as_str().unwrap().contains("rustllama-audit-tail-populated"),
+        v["path"]
+            .as_str()
+            .unwrap()
+            .contains("rustllama-audit-tail-populated"),
         "path field carries the resolved file path"
     );
 
@@ -188,9 +190,15 @@ audit_log_path = "{}"
     assert_eq!(status, StatusCode::OK, "malformed lines must not 5xx");
     let v: serde_json::Value = serde_json::from_slice(&resp_body).expect("json");
     // Three valid lines, two malformed → total_entries = 3.
-    assert_eq!(v["total_entries"], 3, "malformed lines skipped, valid counted");
+    assert_eq!(
+        v["total_entries"], 3,
+        "malformed lines skipped, valid counted"
+    );
     let entries = v["entries"].as_array().unwrap();
-    let paths: Vec<&str> = entries.iter().map(|e| e["path"].as_str().unwrap()).collect();
+    let paths: Vec<&str> = entries
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
     assert_eq!(paths, vec!["/ok3", "/ok2", "/ok1"]);
 
     let _ = std::fs::remove_file(&audit_log);

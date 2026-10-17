@@ -31,7 +31,7 @@
 
 use std::path::Path;
 
-use rustllama_gguf::{Gguf, GgmlType, MetadataValue};
+use rustllama_gguf::{GgmlType, Gguf, MetadataValue};
 
 /// Loaded, validated bias data. Attached to the KV cache by the
 /// engine; consumed by the Q4_0 KV write arms.
@@ -69,8 +69,8 @@ impl KvBiasData {
         head_dim: usize,
         n_kv_heads: usize,
     ) -> Result<Self, String> {
-        let gguf = Gguf::open(path)
-            .map_err(|e| format!("kv-bias sidecar {}: {e}", path.display()))?;
+        let gguf =
+            Gguf::open(path).map_err(|e| format!("kv-bias sidecar {}: {e}", path.display()))?;
 
         let k_rot = match gguf.metadata_get("kv_mean_center.k_rot") {
             Some(MetadataValue::Bool(b)) => Some(*b),
@@ -88,7 +88,9 @@ impl KvBiasData {
         let mut n_centered = 0usize;
         for li in 0..n_layers {
             let name = format!("kv_bar.blk.{li}.k");
-            let Some(info) = gguf.tensor(&name) else { continue };
+            let Some(info) = gguf.tensor(&name) else {
+                continue;
+            };
             if info.dtype != GgmlType::F32 {
                 return Err(format!(
                     "kv-bias tensor {name} must be F32 (got {})",

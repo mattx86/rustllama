@@ -11,7 +11,9 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use egui::{Align, Align2, Color32, FontId, Layout, Margin, Rect, RichText, Rounding, Sense, Stroke};
+use egui::{
+    Align, Align2, Color32, FontId, Layout, Margin, Rect, RichText, Rounding, Sense, Stroke,
+};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use futures::StreamExt;
 use rustllama_client::{
@@ -424,7 +426,10 @@ enum UiMsg {
     /// The saved-conversation list (list / post-mutation refresh).
     Conversations(Vec<ConversationSummary>),
     /// A conversation's messages loaded for the transcript (select-to-load).
-    ConversationLoaded { id: i64, messages: Vec<StoredMessage> },
+    ConversationLoaded {
+        id: i64,
+        messages: Vec<StoredMessage>,
+    },
     /// A save (create-if-needed + append) persisted `appended` new messages
     /// to conversation `id`.
     HistorySaved { id: i64, appended: usize },
@@ -450,7 +455,10 @@ enum Action {
     CancelDelete,
     HfPickRepo(String),
     HfBack,
-    HfPickFile { repo: String, file: String },
+    HfPickFile {
+        repo: String,
+        file: String,
+    },
     Pull(String),
     // --- Status / Settings (Phase 4) ---
     /// Refresh the Status dashboard's tuning summary + recommendations.
@@ -977,7 +985,10 @@ impl GuiApp {
         self.rt.spawn(async move {
             match client.get_config_raw().await {
                 Ok(env) => {
-                    let config = env.get("config").cloned().unwrap_or(serde_json::Value::Null);
+                    let config = env
+                        .get("config")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
                     let config_path = env
                         .get("config_path")
                         .and_then(|p| p.as_str())
@@ -1146,10 +1157,7 @@ impl GuiApp {
                     let _ = tx.send(UiMsg::ModelActionDone);
                 }
                 Err(e) => {
-                    let _ = tx.send(UiMsg::ModelsError(format!(
-                        "load {}: {e}",
-                        path.display()
-                    )));
+                    let _ = tx.send(UiMsg::ModelsError(format!("load {}: {e}", path.display())));
                 }
             }
             ctx.request_repaint();
@@ -1411,7 +1419,10 @@ impl GuiApp {
                         let uri = format!(
                             "data:{};base64,{}",
                             mime_from_path(&path),
-                            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
+                            base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                &bytes
+                            )
                         );
                         let name = path
                             .file_name()
@@ -1787,8 +1798,10 @@ impl GuiApp {
         if self.pending_images.is_empty() {
             self.transcript.push(Turn::user(text));
         } else {
-            let imgs: Vec<String> =
-                std::mem::take(&mut self.pending_images).into_iter().map(|p| p.uri).collect();
+            let imgs: Vec<String> = std::mem::take(&mut self.pending_images)
+                .into_iter()
+                .map(|p| p.uri)
+                .collect();
             self.transcript.push(Turn::user_with_images(text, imgs));
         }
         self.stream_current();
@@ -1997,7 +2010,11 @@ impl GuiApp {
             UiMsg::Models(m) => {
                 // Keep the current selection if it survived the refresh; else
                 // fall back to the first available model.
-                if self.selected_model.as_ref().map_or(true, |s| !m.contains(s)) {
+                if self
+                    .selected_model
+                    .as_ref()
+                    .map_or(true, |s| !m.contains(s))
+                {
                     self.selected_model = m.first().cloned();
                 }
                 self.models = m;
@@ -2332,7 +2349,10 @@ impl GuiApp {
     /// EMA tok/s (falls back to the per-request value pre-warm-up) so the line
     /// doesn't jitter between cold and warm requests.
     fn push_metric_samples(&mut self, m: &MetricsSnapshot) {
-        push_capped(&mut self.tok_series, m.ema_tok_s.or(m.last_tok_s).unwrap_or(0.0));
+        push_capped(
+            &mut self.tok_series,
+            m.ema_tok_s.or(m.last_tok_s).unwrap_or(0.0),
+        );
         push_capped(&mut self.ctx_series, m.ctx_used as f64);
         push_capped(&mut self.pending_series, m.pending as f64);
     }
@@ -2473,19 +2493,43 @@ impl eframe::App for GuiApp {
                     actions.push(Action::SwitchView(View::Chat));
                 }
                 ui.add_space(3.0);
-                if nav_item(ui, NavIcon::Models, "Models", self.view == View::Models, true) {
+                if nav_item(
+                    ui,
+                    NavIcon::Models,
+                    "Models",
+                    self.view == View::Models,
+                    true,
+                ) {
                     actions.push(Action::SwitchView(View::Models));
                 }
                 ui.add_space(3.0);
-                if nav_item(ui, NavIcon::Decide, "Decide", self.view == View::Decide, true) {
+                if nav_item(
+                    ui,
+                    NavIcon::Decide,
+                    "Decide",
+                    self.view == View::Decide,
+                    true,
+                ) {
                     actions.push(Action::SwitchView(View::Decide));
                 }
                 ui.add_space(3.0);
-                if nav_item(ui, NavIcon::Status, "Status", self.view == View::Status, true) {
+                if nav_item(
+                    ui,
+                    NavIcon::Status,
+                    "Status",
+                    self.view == View::Status,
+                    true,
+                ) {
                     actions.push(Action::SwitchView(View::Status));
                 }
                 ui.add_space(3.0);
-                if nav_item(ui, NavIcon::Quantize, "Quantize", self.view == View::Quantize, true) {
+                if nav_item(
+                    ui,
+                    NavIcon::Quantize,
+                    "Quantize",
+                    self.view == View::Quantize,
+                    true,
+                ) {
                     actions.push(Action::SwitchView(View::Quantize));
                 }
                 ui.add_space(3.0);
@@ -2549,7 +2593,9 @@ impl eframe::App for GuiApp {
                             actions.push(Action::CancelDelete);
                         }
                         if ui
-                            .add(egui::Button::new(RichText::new("Delete").color(TEXT)).fill(DANGER))
+                            .add(
+                                egui::Button::new(RichText::new("Delete").color(TEXT)).fill(DANGER),
+                            )
                             .clicked()
                         {
                             actions.push(Action::ConfirmDelete(name.clone()));
@@ -2870,8 +2916,7 @@ impl GuiApp {
                                 );
                             }
                             for c in &convs {
-                                let (load, delete) =
-                                    conversation_row(ui, c, current == Some(c.id));
+                                let (load, delete) = conversation_row(ui, c, current == Some(c.id));
                                 if load {
                                     hist_load = Some(c.id);
                                 }
@@ -2961,7 +3006,11 @@ impl GuiApp {
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     if history_present {
-                        let label = if history_shown { "☰ History" } else { "☰ History ›" };
+                        let label = if history_shown {
+                            "☰ History"
+                        } else {
+                            "☰ History ›"
+                        };
                         if ui
                             .selectable_label(history_shown, label)
                             .on_hover_text("Show / hide the conversation-history sidebar")
@@ -3034,16 +3083,20 @@ impl GuiApp {
                         );
                     })
                     .response
-                    .on_hover_text("Temperature / top_p / top_k / repeat_penalty / max_tokens / seed");
+                    .on_hover_text(
+                        "Temperature / top_p / top_k / repeat_penalty / max_tokens / seed",
+                    );
 
-                    ui.checkbox(&mut self.auto_tools, "Auto-run tools").on_hover_text(
-                        "When on, proposed tool calls are accepted without asking. This chat \
+                    ui.checkbox(&mut self.auto_tools, "Auto-run tools")
+                        .on_hover_text(
+                            "When on, proposed tool calls are accepted without asking. This chat \
                          never executes tools — it only gates the confirm prompt.",
-                    );
-                    ui.checkbox(&mut self.clarify, "Clarifying questions").on_hover_text(
-                        "When on, the model can pause and ask a clarifying question with \
+                        );
+                    ui.checkbox(&mut self.clarify, "Clarifying questions")
+                        .on_hover_text(
+                            "When on, the model can pause and ask a clarifying question with \
                          selectable options instead of guessing.",
-                    );
+                        );
 
                     if ui
                         .add_enabled(has_assistant && !streaming, egui::Button::new("Regenerate"))
@@ -3053,7 +3106,10 @@ impl GuiApp {
                         do_regen = true;
                     }
                     if ui
-                        .add_enabled(!transcript_empty && !streaming, egui::Button::new("Export MD"))
+                        .add_enabled(
+                            !transcript_empty && !streaming,
+                            egui::Button::new("Export MD"),
+                        )
                         .on_hover_text("Save the transcript as Markdown (Ctrl+E)")
                         .clicked()
                     {
@@ -3266,7 +3322,10 @@ impl GuiApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if self.streaming {
                             if ui
-                                .add(egui::Button::new(RichText::new("Stop").color(TEXT)).fill(DANGER))
+                                .add(
+                                    egui::Button::new(RichText::new("Stop").color(TEXT))
+                                        .fill(DANGER),
+                                )
                                 .on_hover_text("Stop generating (Esc)")
                                 .clicked()
                             {
@@ -3275,9 +3334,11 @@ impl GuiApp {
                             ui.spinner();
                             ui.label(RichText::new("generating…").color(MUTED).small());
                         } else {
-                            let can_send =
-                                !self.input.trim().is_empty() || has_pending_imgs;
-                            if ui.add_enabled(can_send, egui::Button::new("Send")).clicked() {
+                            let can_send = !self.input.trim().is_empty() || has_pending_imgs;
+                            if ui
+                                .add_enabled(can_send, egui::Button::new("Send"))
+                                .clicked()
+                            {
                                 do_send = true;
                             }
                         }
@@ -3604,31 +3665,25 @@ impl GuiApp {
                                 let is_busy = busy.as_deref() == Some(m.id.as_str());
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(&m.id).monospace().color(TEXT));
-                                    ui.with_layout(
-                                        Layout::right_to_left(Align::Center),
-                                        |ui| {
-                                            if is_busy {
-                                                ui.spinner();
-                                            }
-                                            if ui
-                                                .add_enabled(!is_busy, egui::Button::new("Unload"))
-                                                .clicked()
-                                            {
-                                                actions.push(Action::UnloadModel(m.id.clone()));
-                                            }
-                                            if m.is_default {
-                                                pill(ui, "default", HEALTH_OK);
-                                            } else if ui
-                                                .add_enabled(
-                                                    !is_busy,
-                                                    egui::Button::new("Set default"),
-                                                )
-                                                .clicked()
-                                            {
-                                                actions.push(Action::SetDefault(m.id.clone()));
-                                            }
-                                        },
-                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if is_busy {
+                                            ui.spinner();
+                                        }
+                                        if ui
+                                            .add_enabled(!is_busy, egui::Button::new("Unload"))
+                                            .clicked()
+                                        {
+                                            actions.push(Action::UnloadModel(m.id.clone()));
+                                        }
+                                        if m.is_default {
+                                            pill(ui, "default", HEALTH_OK);
+                                        } else if ui
+                                            .add_enabled(!is_busy, egui::Button::new("Set default"))
+                                            .clicked()
+                                        {
+                                            actions.push(Action::SetDefault(m.id.clone()));
+                                        }
+                                    });
                                 });
                                 ui.add_space(2.0);
                             }
@@ -3638,9 +3693,7 @@ impl GuiApp {
 
                         // --- Pull from HuggingFace ---
                         card(ui, |ui| {
-                            ui.label(
-                                RichText::new("Pull from HuggingFace").strong().color(TEXT),
-                            );
+                            ui.label(RichText::new("Pull from HuggingFace").strong().color(TEXT));
                             ui.add_space(4.0);
                             ui.label(
                                 RichText::new("Format: owner/repo:filename.gguf")
@@ -3781,7 +3834,11 @@ impl GuiApp {
                             }
                             if let Some(s) = &self.pull_status {
                                 ui.add_space(4.0);
-                                let col = if s.starts_with("error") { DANGER } else { MUTED };
+                                let col = if s.starts_with("error") {
+                                    DANGER
+                                } else {
+                                    MUTED
+                                };
                                 ui.label(RichText::new(s).color(col).monospace().small());
                             }
                         });
@@ -3845,7 +3902,11 @@ impl GuiApp {
         let pend = self.pending_series.clone();
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(BG).inner_margin(Margin::same(16.0)))
+            .frame(
+                egui::Frame::default()
+                    .fill(BG)
+                    .inner_margin(Margin::same(16.0)),
+            )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -3903,9 +3964,7 @@ impl GuiApp {
                         // --- Backends ---
                         card(ui, |ui| {
                             ui.label(RichText::new("Backends").strong().color(TEXT));
-                            ui.label(
-                                RichText::new("compute dispatch paths").color(MUTED).small(),
-                            );
+                            ui.label(RichText::new("compute dispatch paths").color(MUTED).small());
                             ui.add_space(8.0);
                             match &caps {
                                 Some(c) => render_backends(ui, &c.backends),
@@ -3922,7 +3981,9 @@ impl GuiApp {
                         card(ui, |ui| {
                             ui.label(RichText::new("Compute inventory").strong().color(TEXT));
                             ui.label(
-                                RichText::new("every GPU + the CPU tier").color(MUTED).small(),
+                                RichText::new("every GPU + the CPU tier")
+                                    .color(MUTED)
+                                    .small(),
                             );
                             ui.add_space(8.0);
                             if let Some(m) = &metrics {
@@ -3942,8 +4003,9 @@ impl GuiApp {
                                         g.utilization_pct,
                                     );
                                 }
-                                let ram_used = (m.ram_total_bytes > 0)
-                                    .then(|| m.ram_total_bytes.saturating_sub(m.ram_available_bytes));
+                                let ram_used = (m.ram_total_bytes > 0).then(|| {
+                                    m.ram_total_bytes.saturating_sub(m.ram_available_bytes)
+                                });
                                 inventory_row(
                                     ui,
                                     "CPU",
@@ -3980,8 +4042,13 @@ impl GuiApp {
                                         .map(|t| format!("{t:.1}"))
                                         .unwrap_or_else(|| "—".into());
                                     sparkline(
-                                        ui, "spark_tok", "Tokens / second", &tok_v, &tok,
-                                        HEALTH_OK, None,
+                                        ui,
+                                        "spark_tok",
+                                        "Tokens / second",
+                                        &tok_v,
+                                        &tok,
+                                        HEALTH_OK,
+                                        None,
                                     );
                                     ui.add_space(12.0);
                                     sparkline(
@@ -4068,7 +4135,11 @@ impl GuiApp {
                                             "none — run rustllama tune"
                                         },
                                     );
-                                    kv_row(ui, "Last tuned", t.last_tuned.as_deref().unwrap_or("—"));
+                                    kv_row(
+                                        ui,
+                                        "Last tuned",
+                                        t.last_tuned.as_deref().unwrap_or("—"),
+                                    );
                                     kv_row(
                                         ui,
                                         "Tuned kernel shapes",
@@ -4089,8 +4160,13 @@ impl GuiApp {
                                     winner_row(
                                         ui,
                                         "Flash-attn winner",
-                                        t.flash_attention
-                                            .map(|b| if b { "on".into() } else { "off".into() }),
+                                        t.flash_attention.map(|b| {
+                                            if b {
+                                                "on".into()
+                                            } else {
+                                                "off".into()
+                                            }
+                                        }),
                                         t.auto_apply_flash_attention,
                                     );
                                     winner_row(
@@ -4201,7 +4277,8 @@ impl GuiApp {
                                         )
                                         .clicked()
                                     {
-                                        actions.push(Action::TuneModel(self.tune_sel_model.clone()));
+                                        actions
+                                            .push(Action::TuneModel(self.tune_sel_model.clone()));
                                     }
                                     if tune_running {
                                         ui.spinner();
@@ -4234,7 +4311,11 @@ impl GuiApp {
                                 }
                                 if let Some(s) = &tune_status {
                                     ui.add_space(6.0);
-                                    let col = if s.starts_with("error") { DANGER } else { HEALTH_OK };
+                                    let col = if s.starts_with("error") {
+                                        DANGER
+                                    } else {
+                                        HEALTH_OK
+                                    };
                                     ui.label(RichText::new(s).color(col).small());
                                 }
                             }
@@ -4633,7 +4714,11 @@ impl GuiApp {
         let error = self.q_error.clone();
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(BG).inner_margin(Margin::same(16.0)))
+            .frame(
+                egui::Frame::default()
+                    .fill(BG)
+                    .inner_margin(Margin::same(16.0)),
+            )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -4771,7 +4856,11 @@ impl GuiApp {
                                         })
                                         .color(TEXT),
                                     )
-                                    .fill(if running { ELEVATED2 } else { HEALTH_OK }),
+                                    .fill(if running {
+                                        ELEVATED2
+                                    } else {
+                                        HEALTH_OK
+                                    }),
                                 )
                                 .clicked()
                             {
@@ -5109,12 +5198,10 @@ fn cached_row(ui: &mut egui::Ui, m: &TagsModel, is_busy: bool, actions: &mut Vec
                     if is_busy {
                         ui.add_space(4.0);
                         ui.label(
-                            RichText::new(
-                                "Loading… large GGUFs (10+ GB) can take 30–90 s.",
-                            )
-                            .color(MUTED)
-                            .italics()
-                            .small(),
+                            RichText::new("Loading… large GGUFs (10+ GB) can take 30–90 s.")
+                                .color(MUTED)
+                                .italics()
+                                .small(),
                         );
                     }
                 });
@@ -5148,10 +5235,8 @@ fn cached_row(ui: &mut egui::Ui, m: &TagsModel, is_busy: bool, actions: &mut Vec
 /// One HF search result row (repo id + downloads/likes). Returns `true` when
 /// clicked (to expand into its files).
 fn hf_result_row(ui: &mut egui::Ui, m: &HfModel) -> bool {
-    let resp = ui.add(
-        egui::Label::new(RichText::new(&m.id).color(TEXT).small())
-            .sense(Sense::click()),
-    );
+    let resp =
+        ui.add(egui::Label::new(RichText::new(&m.id).color(TEXT).small()).sense(Sense::click()));
     ui.label(
         RichText::new(format!("↓ {} · ♥ {}", m.downloads, m.likes))
             .color(MUTED)
@@ -5164,8 +5249,7 @@ fn hf_result_row(ui: &mut egui::Ui, m: &HfModel) -> bool {
 /// One HF file row (filename + size). Returns `true` when clicked.
 fn hf_file_row(ui: &mut egui::Ui, f: &HfFile) -> bool {
     let resp = ui.add(
-        egui::Label::new(RichText::new(&f.rfilename).color(TEXT).small())
-            .sense(Sense::click()),
+        egui::Label::new(RichText::new(&f.rfilename).color(TEXT).small()).sense(Sense::click()),
     );
     ui.label(RichText::new(human_bytes(f.size)).color(MUTED).small());
     resp.clicked()
@@ -5218,7 +5302,12 @@ fn render_status_bar(
                         .utilization_pct
                         .map(|u| format!("{u:.0}%"))
                         .unwrap_or_else(|| "n/a".into());
-                    status_meter(ui, &format!("GPU{}", g.index), (util / 100.0) as f32, &util_txt);
+                    status_meter(
+                        ui,
+                        &format!("GPU{}", g.index),
+                        (util / 100.0) as f32,
+                        &util_txt,
+                    );
                     if let (Some(t), Some(f)) = (g.vram_total_bytes, g.vram_free_bytes) {
                         if t > 0 {
                             let used = t.saturating_sub(f);
@@ -5316,8 +5405,10 @@ fn nav_item(ui: &mut egui::Ui, icon: NavIcon, label: &str, active: bool, enabled
     } else {
         MUTED
     };
-    let icon_rect =
-        Rect::from_center_size(egui::pos2(rect.left() + 24.0, rect.center().y), egui::vec2(18.0, 18.0));
+    let icon_rect = Rect::from_center_size(
+        egui::pos2(rect.left() + 24.0, rect.center().y),
+        egui::vec2(18.0, 18.0),
+    );
     draw_nav_icon(ui.painter(), icon_rect, icon, color);
     ui.painter().text(
         egui::pos2(rect.left() + 42.0, rect.center().y),
@@ -5335,10 +5426,7 @@ fn draw_nav_icon(painter: &egui::Painter, rect: Rect, icon: NavIcon, color: Colo
     match icon {
         NavIcon::Chat => {
             // Speech bubble: rounded rect + a small tail.
-            let body = Rect::from_min_max(
-                rect.min,
-                egui::pos2(rect.max.x, rect.max.y - 3.0),
-            );
+            let body = Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.max.y - 3.0));
             painter.rect_stroke(body, Rounding::same(4.0), s);
             painter.line_segment(
                 [
@@ -5378,7 +5466,10 @@ fn draw_nav_icon(painter: &egui::Painter, rect: Rect, icon: NavIcon, color: Colo
                 painter.line_segment([egui::pos2(x, base), egui::pos2(x, top)], s);
             }
             painter.line_segment(
-                [egui::pos2(rect.left(), base), egui::pos2(rect.right(), base)],
+                [
+                    egui::pos2(rect.left(), base),
+                    egui::pos2(rect.right(), base),
+                ],
                 s,
             );
         }
@@ -5424,10 +5515,7 @@ fn draw_nav_icon(painter: &egui::Painter, rect: Rect, icon: NavIcon, color: Colo
             // A "compress" glyph: two arrows pointing toward a middle bar.
             let c = rect.center();
             let w = rect.width() * 0.34;
-            painter.line_segment(
-                [egui::pos2(c.x - w, c.y), egui::pos2(c.x + w, c.y)],
-                s,
-            );
+            painter.line_segment([egui::pos2(c.x - w, c.y), egui::pos2(c.x + w, c.y)], s);
             // Top arrow pointing down to the bar.
             let ty = rect.top() + 1.0;
             painter.line_segment([egui::pos2(c.x, ty), egui::pos2(c.x, c.y - 3.0)], s);
@@ -5492,8 +5580,9 @@ fn display_name(name: &str) -> &str {
 
 /// The KV-dtype option lists (mirror Settings.tsx). `_OPT` prepends `""`
 /// (rendered "— inherit —") for the optional per-channel K/V overrides.
-const KV_DTYPES: [&str; 10] =
-    ["f32", "f16", "bf16", "q8_0", "q4_0", "tq1", "tq2", "tq4", "tq8", "nvfp4"];
+const KV_DTYPES: [&str; 10] = [
+    "f32", "f16", "bf16", "q8_0", "q4_0", "tq1", "tq2", "tq4", "tq8", "nvfp4",
+];
 const KV_DTYPES_OPT: [&str; 11] = [
     "", "f32", "f16", "bf16", "q8_0", "q4_0", "tq1", "tq2", "tq4", "tq8", "nvfp4",
 ];
@@ -5626,7 +5715,12 @@ fn apply_draft_to_config(cfg: &mut serde_json::Value, d: &SettingsDraft) {
         .map(|s| Value::String(s.to_string()))
         .collect();
 
-    set_path(cfg, "server", "bind_addr", Value::String(d.bind_addr.clone()));
+    set_path(
+        cfg,
+        "server",
+        "bind_addr",
+        Value::String(d.bind_addr.clone()),
+    );
     if let Ok(p) = d.port.trim().parse::<u16>() {
         set_path(cfg, "server", "port", Value::from(p));
     }
@@ -5767,7 +5861,11 @@ fn render_backends(ui: &mut egui::Ui, b: &rustllama_client::Backends) {
     ui.label(
         RichText::new(format!(
             "rayon matvec: {}",
-            if b.cpu.parallel_matvec { "on (M≥256)" } else { "off" }
+            if b.cpu.parallel_matvec {
+                "on (M≥256)"
+            } else {
+                "off"
+            }
         ))
         .color(MUTED)
         .small(),
@@ -5896,7 +5994,10 @@ fn sparkline(
                 .enumerate()
                 .map(|(i, &y)| [i as f64, y])
                 .collect();
-            let line = egui_plot::Line::new(points).color(color).width(1.5).fill(0.0);
+            let line = egui_plot::Line::new(points)
+                .color(color)
+                .width(1.5)
+                .fill(0.0);
             let mut plot = egui_plot::Plot::new(id.to_string())
                 .height(40.0)
                 .width(180.0)
@@ -5932,12 +6033,7 @@ fn section_badge(ui: &mut egui::Ui, kind: &str) {
 
 /// A collapsible Settings section (default-open), its hot-apply `tag` shown as
 /// a badge at the top of the body.
-fn collapsing_section(
-    ui: &mut egui::Ui,
-    title: &str,
-    tag: &str,
-    add: impl FnOnce(&mut egui::Ui),
-) {
+fn collapsing_section(ui: &mut egui::Ui, title: &str, tag: &str, add: impl FnOnce(&mut egui::Ui)) {
     egui::CollapsingHeader::new(RichText::new(title).strong().color(TEXT))
         .id_salt(("settings_sec", title))
         .default_open(true)
@@ -6016,7 +6112,11 @@ fn form_combo(
         })
         .show_ui(ui, |ui| {
             for opt in options {
-                let disp = if opt.is_empty() { "— inherit —" } else { opt };
+                let disp = if opt.is_empty() {
+                    "— inherit —"
+                } else {
+                    opt
+                };
                 ui.selectable_value(value, opt.to_string(), disp);
             }
         });
@@ -6081,9 +6181,11 @@ fn settings_profiles_section(
                 });
                 if dirty {
                     ui.label(
-                        RichText::new("Discard or save your current edits before applying a profile.")
-                            .color(WARN)
-                            .small(),
+                        RichText::new(
+                            "Discard or save your current edits before applying a profile.",
+                        )
+                        .color(WARN)
+                        .small(),
                     );
                 }
             }
@@ -6128,9 +6230,18 @@ const QUANT_TARGETS: &[(&str, &str)] = &[
 /// APEX mixed-precision tiers (mirrors Quantize.tsx's `APEX_TIERS`). `""` = none.
 const APEX_TIERS: &[(&str, &str)] = &[
     ("", "(none) — uniform target across all tensors"),
-    ("i-quality", "I-Quality — routed Q4_K/Q6_K, shared Q8_0, attn Q6_K"),
-    ("quality", "Quality — routed Q3_K/Q5_K, shared Q8_0, attn Q6_K"),
-    ("balanced", "Balanced — routed Q3_K/Q4_K, shared Q6_K, attn Q5_K"),
+    (
+        "i-quality",
+        "I-Quality — routed Q4_K/Q6_K, shared Q8_0, attn Q6_K",
+    ),
+    (
+        "quality",
+        "Quality — routed Q3_K/Q5_K, shared Q8_0, attn Q6_K",
+    ),
+    (
+        "balanced",
+        "Balanced — routed Q3_K/Q4_K, shared Q6_K, attn Q5_K",
+    ),
     ("mini", "Mini — routed Q2_K/Q4_K, shared Q5_K, attn Q5_K"),
     ("nano", "Nano — routed Q2_K, shared Q4_K, attn Q4_K"),
 ];
@@ -6194,12 +6305,7 @@ fn string_list_editor(ui: &mut egui::Ui, items: &mut Vec<String>, noun: &str) {
 
 /// Render a Decide result: winner header + a "calibrated"/"raw" badge, then a
 /// probability bar per option with the winner highlighted (mirrors Decide.tsx).
-fn render_decide_result(
-    ui: &mut egui::Ui,
-    r: &DecideResult,
-    tab: DecideTab,
-    labels: &[String],
-) {
+fn render_decide_result(ui: &mut egui::Ui, r: &DecideResult, tab: DecideTab, labels: &[String]) {
     // Header line + calibration badge.
     ui.horizontal(|ui| {
         let header = match tab {
@@ -6217,7 +6323,11 @@ fn render_decide_result(
         ui.label(RichText::new(header).strong().color(TEXT).size(15.0));
         if tab == DecideTab::Score {
             if let Some(sc) = r.score {
-                ui.label(RichText::new(format!("expected {sc:.2}")).color(MUTED).small());
+                ui.label(
+                    RichText::new(format!("expected {sc:.2}"))
+                        .color(MUTED)
+                        .small(),
+                );
             }
         }
         if r.calibrated {
@@ -6250,7 +6360,11 @@ fn render_decide_result(
     let winner = bars
         .iter()
         .enumerate()
-        .max_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| {
+            a.1 .1
+                .partial_cmp(&b.1 .1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .map(|(i, _)| i);
     for (i, (label, p)) in bars.iter().enumerate() {
         let p = *p;
@@ -6261,8 +6375,10 @@ fn render_decide_result(
                 .small();
             ui.add_sized([130.0, 16.0], egui::Label::new(cap).truncate());
             // Bar trough + fill.
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(ui.available_width() - 60.0, 12.0), Sense::hover());
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width() - 60.0, 12.0),
+                Sense::hover(),
+            );
             let rounding = Rounding::same(6.0);
             ui.painter().rect_filled(rect, rounding, FIELD_BG);
             let f = p.clamp(0.0, 1.0);
@@ -6327,7 +6443,9 @@ fn conversation_row(ui: &mut egui::Ui, c: &ConversationSummary, active: bool) ->
                 };
                 let resp = ui.add(
                     egui::Label::new(
-                        RichText::new(title).color(if active { TEXT } else { MUTED }).small(),
+                        RichText::new(title)
+                            .color(if active { TEXT } else { MUTED })
+                            .small(),
                     )
                     .truncate()
                     .sense(Sense::click()),
@@ -6350,13 +6468,7 @@ fn conversation_row(ui: &mut egui::Ui, c: &ConversationSummary, active: bool) ->
 }
 
 /// A staged-image chip in the composer: name + size + a remove (✕) button.
-fn image_chip(
-    ui: &mut egui::Ui,
-    name: &str,
-    bytes: u64,
-    remove: &mut Option<usize>,
-    idx: usize,
-) {
+fn image_chip(ui: &mut egui::Ui, name: &str, bytes: u64, remove: &mut Option<usize>, idx: usize) {
     egui::Frame::none()
         .fill(ELEVATED2)
         .rounding(Rounding::same(6.0))
@@ -6416,10 +6528,7 @@ fn mime_from_path(path: &std::path::Path) -> &'static str {
 /// Suggest an output path beside the source, tagged with the target dtype
 /// (e.g. `model.gguf` + `q4_k` → `model.Q4_K.gguf`).
 fn suggest_quant_output(src: &std::path::Path, target: &str) -> String {
-    let stem = src
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("model");
+    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
     let out = src.with_file_name(format!("{stem}.{}.gguf", target.to_uppercase()));
     out.display().to_string()
 }
@@ -6453,8 +6562,8 @@ fn run_quantize_job(
     let mut plan = QuantizePlan::uniform(target_dtype);
     let n_layers = infer_n_layers(&src);
     if let Some(tier_name) = apex.filter(|t| !t.is_empty()) {
-        let tier = ApexTier::parse(tier_name)
-            .ok_or_else(|| format!("unknown APEX tier {tier_name:?}"))?;
+        let tier =
+            ApexTier::parse(tier_name).ok_or_else(|| format!("unknown APEX tier {tier_name:?}"))?;
         plan.add_rules(build_apex_rules(tier, n_layers));
     }
     if let Some(path) = recipe.filter(|p| !p.is_empty()) {
@@ -6471,8 +6580,7 @@ fn run_quantize_job(
     }
 
     let start = std::time::Instant::now();
-    let stats =
-        quantize_gguf_to_path(&src, output, &plan).map_err(|e| format!("pipeline: {e}"))?;
+    let stats = quantize_gguf_to_path(&src, output, &plan).map_err(|e| format!("pipeline: {e}"))?;
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     Ok(QuantizeSummary {

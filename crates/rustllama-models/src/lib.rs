@@ -6,16 +6,16 @@
 use rustllama_tensor::{Device, Tensor};
 
 pub mod accel;
+pub mod apc;
 pub mod bert_arch;
+pub mod cacheblend;
 pub mod imatrix_collect;
 pub mod kv_bias;
+pub mod kv_cold_tier;
+pub mod kv_disk_tier;
 pub mod llama_arch;
 pub mod llama_config;
 pub mod lora;
-pub mod apc;
-pub mod cacheblend;
-pub mod kv_cold_tier;
-pub mod kv_disk_tier;
 pub mod mamba_arch;
 pub mod moe;
 pub mod page_table;
@@ -119,8 +119,21 @@ mod tests {
         // `Llama`. Pinning each entry so a regression in the match
         // arm gets caught without having to grep the source.
         for arch in [
-            "llama", "mistral", "mistral3", "qwen2", "qwen2.5", "qwen2_5", "qwen3", "qwen35",
-            "qwen3_5", "qwen3next", "qwen3_next", "deepseek", "deepseek2", "phi3", "yi",
+            "llama",
+            "mistral",
+            "mistral3",
+            "qwen2",
+            "qwen2.5",
+            "qwen2_5",
+            "qwen3",
+            "qwen35",
+            "qwen3_5",
+            "qwen3next",
+            "qwen3_next",
+            "deepseek",
+            "deepseek2",
+            "phi3",
+            "yi",
         ] {
             assert_eq!(
                 ModelArch::from_gguf(Some(arch)),

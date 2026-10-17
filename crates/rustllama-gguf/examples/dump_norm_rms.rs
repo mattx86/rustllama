@@ -3,7 +3,7 @@
 //! mis-aligned tensor offsets during load).
 //!
 //! Usage: cargo run --release -p rustllama-gguf --example dump_norm_rms -- /path/to/model.gguf
-use rustllama_gguf::{Gguf, GgmlType};
+use rustllama_gguf::{GgmlType, Gguf};
 
 fn rms_f32_bytes(bytes: &[u8]) -> f64 {
     let n = bytes.len() / 4;

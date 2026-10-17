@@ -231,28 +231,18 @@ impl VisionConfig {
         let n_layers = key("block_count")
             .ok_or(VisionConfigError::MissingKey("clip.vision.block_count"))?
             as usize;
-        let n_heads = key("attention.head_count")
-            .ok_or(VisionConfigError::MissingKey(
-                "clip.vision.attention.head_count",
-            ))?
-            as usize;
-        let d_model = key("embedding_length")
-            .ok_or(VisionConfigError::MissingKey("clip.vision.embedding_length"))?
-            as usize;
-        let d_ff = key("feed_forward_length")
-            .ok_or(VisionConfigError::MissingKey(
-                "clip.vision.feed_forward_length",
-            ))?
-            as usize;
+        let n_heads = key("attention.head_count").ok_or(VisionConfigError::MissingKey(
+            "clip.vision.attention.head_count",
+        ))? as usize;
+        let d_model = key("embedding_length").ok_or(VisionConfigError::MissingKey(
+            "clip.vision.embedding_length",
+        ))? as usize;
+        let d_ff = key("feed_forward_length").ok_or(VisionConfigError::MissingKey(
+            "clip.vision.feed_forward_length",
+        ))? as usize;
         let head_dim = key("attention.key_length")
             .map(|v| v as usize)
-            .unwrap_or_else(|| {
-                if n_heads > 0 {
-                    d_model / n_heads
-                } else {
-                    0
-                }
-            });
+            .unwrap_or_else(|| if n_heads > 0 { d_model / n_heads } else { 0 });
         let layer_norm_eps = key_f32("attention.layer_norm_epsilon").unwrap_or(1e-6);
 
         let projector_type = match gguf
@@ -358,9 +348,7 @@ impl VisionConfig {
 pub enum VisionConfigError {
     #[error("GGUF has no `general.architecture` metadata")]
     MissingArchitecture,
-    #[error(
-        "GGUF architecture is `{0}`, not `clip` or `siglip` — pass an mmproj GGUF"
-    )]
+    #[error("GGUF architecture is `{0}`, not `clip` or `siglip` — pass an mmproj GGUF")]
     WrongArchitecture(String),
     #[error("`clip.has_vision_encoder = false` — this is a text-only CLIP GGUF")]
     NoVisionEncoder,
@@ -665,9 +653,10 @@ impl VisionModel {
         let fc1_bias = to_f32_opt(optional("mm.0.bias")?)?;
         let (fc2, fc2_bias) = match cfg.projector_type {
             ProjectorType::Linear => (None, None),
-            ProjectorType::Mlp | ProjectorType::LdpV2 | ProjectorType::Qwen3VlMerger => {
-                (Some(required("mm.2.weight")?), to_f32_opt(optional("mm.2.bias")?)?)
-            }
+            ProjectorType::Mlp | ProjectorType::LdpV2 | ProjectorType::Qwen3VlMerger => (
+                Some(required("mm.2.weight")?),
+                to_f32_opt(optional("mm.2.bias")?)?,
+            ),
         };
         // Projector dims from ELEMENT COUNTS — immune to the GGUF
         // dim-order split between real files (`[in, out]`) and the
@@ -846,7 +835,12 @@ impl VisionModel {
             if let Some(pe1) = &self.patch_embd_1 {
                 let mut conv2 = vec![0f32; num_patches * d];
                 crate::llama_arch::matvec_tensor_batched_dispatch(
-                    pe1, patch_rows, &mut conv2, d, patch_dim, num_patches,
+                    pe1,
+                    patch_rows,
+                    &mut conv2,
+                    d,
+                    patch_dim,
+                    num_patches,
                 );
                 for (a, b) in embd_out.iter_mut().zip(conv2.iter()) {
                     *a += *b;
@@ -928,13 +922,28 @@ impl VisionModel {
             // Q / K / V projections — batched across all tokens
             // (V-7: one weight sweep per projection per block).
             crate::llama_arch::matvec_tensor_batched_dispatch(
-                &blk.attn_q, &x_norm, &mut q, d, d, n_tokens,
+                &blk.attn_q,
+                &x_norm,
+                &mut q,
+                d,
+                d,
+                n_tokens,
             );
             crate::llama_arch::matvec_tensor_batched_dispatch(
-                &blk.attn_k, &x_norm, &mut k_buf, d, d, n_tokens,
+                &blk.attn_k,
+                &x_norm,
+                &mut k_buf,
+                d,
+                d,
+                n_tokens,
             );
             crate::llama_arch::matvec_tensor_batched_dispatch(
-                &blk.attn_v, &x_norm, &mut v, d, d, n_tokens,
+                &blk.attn_v,
+                &x_norm,
+                &mut v,
+                d,
+                d,
+                n_tokens,
             );
             for i in 0..n_tokens {
                 if let Some(b) = &blk.attn_q_bias {
@@ -971,7 +980,12 @@ impl VisionModel {
 
             // O projection (batched) + bias + residual.
             crate::llama_arch::matvec_tensor_batched_dispatch(
-                &blk.attn_output, &attn_out, &mut o_proj, d, d, n_tokens,
+                &blk.attn_output,
+                &attn_out,
+                &mut o_proj,
+                d,
+                d,
+                n_tokens,
             );
             for i in 0..n_tokens {
                 if let Some(b) = &blk.attn_output_bias {
@@ -992,7 +1006,12 @@ impl VisionModel {
 
             // FFN: batched up → GELU → batched down, then residual.
             crate::llama_arch::matvec_tensor_batched_dispatch(
-                &blk.ffn_up, &x_norm, &mut ff, d_ff, d, n_tokens,
+                &blk.ffn_up,
+                &x_norm,
+                &mut ff,
+                d_ff,
+                d,
+                n_tokens,
             );
             for i in 0..n_tokens {
                 if let Some(b) = &blk.ffn_up_bias {
@@ -1003,7 +1022,12 @@ impl VisionModel {
                 *vv = gelu_tanh_approx(*vv);
             }
             crate::llama_arch::matvec_tensor_batched_dispatch(
-                &blk.ffn_down, &ff, &mut ff_down, d, d_ff, n_tokens,
+                &blk.ffn_down,
+                &ff,
+                &mut ff_down,
+                d,
+                d_ff,
+                n_tokens,
             );
             for i in 0..n_tokens {
                 if let Some(b) = &blk.ffn_down_bias {
@@ -1117,10 +1141,7 @@ impl VisionModel {
     /// wrapper around [`preprocess_image`] that consults this model's
     /// config — useful when the server / CLI has a `VisionModel`
     /// already in hand.
-    pub fn preprocess_image(
-        &self,
-        image_bytes: &[u8],
-    ) -> Result<Vec<f32>, PreprocessError> {
+    pub fn preprocess_image(&self, image_bytes: &[u8]) -> Result<Vec<f32>, PreprocessError> {
         preprocess_image(image_bytes, &self.cfg)
     }
 
@@ -1129,10 +1150,7 @@ impl VisionModel {
     /// `[n_tokens, d_text]` flat buffer ready to splice into the text
     /// decoder's input stream. The most common entry point for VLM
     /// HTTP handlers.
-    pub fn forward_image_bytes(
-        &self,
-        image_bytes: &[u8],
-    ) -> Result<Vec<f32>, VlmPipelineError> {
+    pub fn forward_image_bytes(&self, image_bytes: &[u8]) -> Result<Vec<f32>, VlmPipelineError> {
         let patches = self.preprocess_image(image_bytes)?;
         Ok(self.forward_image_with_projection(&patches)?)
     }
@@ -1160,8 +1178,8 @@ pub fn preprocess_image(
     image_bytes: &[u8],
     cfg: &VisionConfig,
 ) -> Result<Vec<f32>, PreprocessError> {
-    let img = image::load_from_memory(image_bytes)
-        .map_err(|e| PreprocessError::Decode(e.to_string()))?;
+    let img =
+        image::load_from_memory(image_bytes).map_err(|e| PreprocessError::Decode(e.to_string()))?;
     let image_size = cfg.image_size as u32;
     // Filter choice per family: the Qwen-VL reference pipeline uses
     // BICUBIC (fork clip.cpp `RESIZE_ALGO_BICUBIC` for QWEN3VL →
@@ -1560,8 +1578,7 @@ pub fn prepare_vlm_inputs_with_mode(
             }
             // Split each image's feature buffer into per-patch rows.
             let total_patches: usize = patches_per_image.iter().sum();
-            let mut features_flat: Vec<Vec<f32>> =
-                Vec::with_capacity(total_patches);
+            let mut features_flat: Vec<Vec<f32>> = Vec::with_capacity(total_patches);
             for feat in features_per_image {
                 let n_patches = feat.len() / d_text;
                 for p in 0..n_patches {
@@ -1598,7 +1615,11 @@ pub enum SpliceError {
         "image_features[{idx}] has {got} f32 entries — not a multiple \
          of d_text={d_text}; expected `[num_patches, d_text]` row-major"
     )]
-    WrongImageShape { idx: usize, got: usize, d_text: usize },
+    WrongImageShape {
+        idx: usize,
+        got: usize,
+        d_text: usize,
+    },
     #[error(
         "image_positions has {n_positions} entries but image_features \
          has {n_features}; every placeholder position in the prompt \
@@ -1709,11 +1730,7 @@ pub fn splice_image_embeddings(
     // duplicates would map two images to the same placeholder.
     for (idx, &pos) in image_positions.iter().enumerate() {
         if pos >= text_len {
-            return Err(SpliceError::PositionOutOfRange {
-                idx,
-                pos,
-                text_len,
-            });
+            return Err(SpliceError::PositionOutOfRange { idx, pos, text_len });
         }
         if idx > 0 {
             let prev = image_positions[idx - 1];
@@ -1762,12 +1779,11 @@ fn tensor_from_info(
         .tensor_bytes(name)
         .expect("tensor_bytes for known-present info");
     let storage = Storage::CpuOwned(bytes.to_vec().into());
-    let dtype = ggml_type_to_dtype(info.dtype).ok_or_else(|| {
-        VisionLoadError::UnsupportedTensorDtype {
+    let dtype =
+        ggml_type_to_dtype(info.dtype).ok_or_else(|| VisionLoadError::UnsupportedTensorDtype {
             name: name.to_string(),
             dtype: info.dtype.as_str(),
-        }
-    })?;
+        })?;
     let shape: Vec<u64> = info.dims.clone();
     let strides = contiguous_strides_for(&shape);
     Ok(Tensor {
@@ -2037,16 +2053,25 @@ mod tests {
         let tmp = std::env::temp_dir().join("rustllama-vision-qwen3vl-split.gguf");
         write_synthetic_qwen3vl_mmproj_gguf(&tmp, false);
         let gguf = Gguf::open(&tmp).unwrap();
-        let fused_bytes = gguf.tensor_bytes("v.blk.0.attn_qkv.weight").unwrap().to_vec();
+        let fused_bytes = gguf
+            .tensor_bytes("v.blk.0.attn_qkv.weight")
+            .unwrap()
+            .to_vec();
         let model = VisionModel::load(&gguf).unwrap();
         let third = fused_bytes.len() / 3;
         let b0 = &model.blocks[0];
-        assert_eq!(rustllama_tensor::as_bytes(&b0.attn_q), &fused_bytes[..third]);
+        assert_eq!(
+            rustllama_tensor::as_bytes(&b0.attn_q),
+            &fused_bytes[..third]
+        );
         assert_eq!(
             rustllama_tensor::as_bytes(&b0.attn_k),
             &fused_bytes[third..2 * third]
         );
-        assert_eq!(rustllama_tensor::as_bytes(&b0.attn_v), &fused_bytes[2 * third..]);
+        assert_eq!(
+            rustllama_tensor::as_bytes(&b0.attn_v),
+            &fused_bytes[2 * third..]
+        );
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -2065,9 +2090,16 @@ mod tests {
             .collect();
         let hidden = model.forward_image(&patches).expect("tower forward");
         assert_eq!(hidden.len(), 16 * 64);
-        assert!(hidden.iter().all(|v| v.is_finite()), "non-finite tower output");
+        assert!(
+            hidden.iter().all(|v| v.is_finite()),
+            "non-finite tower output"
+        );
         let projected = model.project_image(&hidden).expect("projector");
-        assert_eq!(projected.len(), 4 * 96, "16 patches / 2x2 merge → 4 tokens of d_text=96");
+        assert_eq!(
+            projected.len(),
+            4 * 96,
+            "16 patches / 2x2 merge → 4 tokens of d_text=96"
+        );
         assert!(projected.iter().all(|v| v.is_finite()));
         // Determinism.
         let hidden2 = model.forward_image(&patches).expect("tower forward 2");
@@ -2178,7 +2210,10 @@ mod tests {
 
         // Multi-frame extent: a 2×1×3 grid advances by max(2,1,3)=3.
         let two = mrope_positions(
-            &[MropeSegment::Image { t: 2, h: 1, w: 3 }, MropeSegment::Text(1)],
+            &[
+                MropeSegment::Image { t: 2, h: 1, w: 3 },
+                MropeSegment::Text(1),
+            ],
             0,
         );
         // Last emitted (image) triple is the final frame/row/col = [1,0,2];
@@ -2395,14 +2430,15 @@ mod tests {
         let gguf = Gguf::open(&tmp).unwrap();
         let model = VisionModel::load(&gguf).unwrap();
         let num_patches = model.cfg.num_patches();
-        let patch_dim =
-            model.cfg.n_channels * model.cfg.patch_size * model.cfg.patch_size;
+        let patch_dim = model.cfg.n_channels * model.cfg.patch_size * model.cfg.patch_size;
         // Synthetic patches — small deterministic values around zero
         // (real preprocessor normalizes to ~N(0,1)).
         let patches: Vec<f32> = (0..num_patches * patch_dim)
             .map(|i| ((i % 256) as f32 - 128.0) * 0.003)
             .collect();
-        let out = model.forward_image(&patches).expect("forward should succeed");
+        let out = model
+            .forward_image(&patches)
+            .expect("forward should succeed");
 
         let n_tokens = num_patches + 1; // synth has class token
         let d = model.cfg.d_model;
@@ -2485,14 +2521,12 @@ mod tests {
     /// shape matches `n_tokens × d_text`.
     #[test]
     fn forward_image_with_projection_chains_both_stages() {
-        let tmp =
-            std::env::temp_dir().join("rustllama-vision-fwd-proj-chain.gguf");
+        let tmp = std::env::temp_dir().join("rustllama-vision-fwd-proj-chain.gguf");
         write_synthetic_clip_mmproj_gguf(&tmp);
         let gguf = Gguf::open(&tmp).unwrap();
         let model = VisionModel::load(&gguf).unwrap();
         let num_patches = model.cfg.num_patches();
-        let patch_dim =
-            model.cfg.n_channels * model.cfg.patch_size * model.cfg.patch_size;
+        let patch_dim = model.cfg.n_channels * model.cfg.patch_size * model.cfg.patch_size;
         let patches: Vec<f32> = (0..num_patches * patch_dim)
             .map(|i| ((i % 200) as f32 - 100.0) * 0.005)
             .collect();
@@ -2594,8 +2628,7 @@ mod tests {
     /// Garbage bytes → `Decode` error, not a panic.
     #[test]
     fn preprocess_image_rejects_garbage_bytes() {
-        let tmp =
-            std::env::temp_dir().join("rustllama-vision-preproc-garbage.gguf");
+        let tmp = std::env::temp_dir().join("rustllama-vision-preproc-garbage.gguf");
         write_synthetic_clip_mmproj_gguf(&tmp);
         let gguf = Gguf::open(&tmp).unwrap();
         let model = VisionModel::load(&gguf).unwrap();
@@ -2612,8 +2645,7 @@ mod tests {
     /// `[n_tokens, d_text]` finite values.
     #[test]
     fn forward_image_bytes_runs_full_pipeline_on_png() {
-        let tmp =
-            std::env::temp_dir().join("rustllama-vision-pipeline-png.gguf");
+        let tmp = std::env::temp_dir().join("rustllama-vision-pipeline-png.gguf");
         write_synthetic_clip_mmproj_gguf(&tmp);
         let gguf = Gguf::open(&tmp).unwrap();
         let model = VisionModel::load(&gguf).unwrap();
@@ -2644,7 +2676,10 @@ mod tests {
         }
         let mut bytes = Vec::new();
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
             .expect("encode test PNG");
         bytes
     }
@@ -2657,7 +2692,10 @@ mod tests {
         let img = image::RgbImage::from_pixel(size, size, pixel);
         let mut bytes = Vec::new();
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
             .expect("encode uniform PNG");
         bytes
     }
@@ -2673,8 +2711,7 @@ mod tests {
         let gguf = Gguf::open(&tmp).unwrap();
         let model = VisionModel::load(&gguf).unwrap();
         let num_patches = model.cfg.num_patches();
-        let patch_dim =
-            model.cfg.n_channels * model.cfg.patch_size * model.cfg.patch_size;
+        let patch_dim = model.cfg.n_channels * model.cfg.patch_size * model.cfg.patch_size;
         let patches: Vec<f32> = (0..num_patches * patch_dim)
             .map(|i| (i as f32) * 0.0001)
             .collect();
@@ -2686,10 +2723,22 @@ mod tests {
 
     #[test]
     fn projector_type_from_metadata_str_recognizes_common_variants() {
-        assert_eq!(ProjectorType::from_metadata_str("linear").unwrap(), ProjectorType::Linear);
-        assert_eq!(ProjectorType::from_metadata_str("mlp").unwrap(), ProjectorType::Mlp);
-        assert_eq!(ProjectorType::from_metadata_str("mlp2x_gelu").unwrap(), ProjectorType::Mlp);
-        assert_eq!(ProjectorType::from_metadata_str("ldp_v2").unwrap(), ProjectorType::LdpV2);
+        assert_eq!(
+            ProjectorType::from_metadata_str("linear").unwrap(),
+            ProjectorType::Linear
+        );
+        assert_eq!(
+            ProjectorType::from_metadata_str("mlp").unwrap(),
+            ProjectorType::Mlp
+        );
+        assert_eq!(
+            ProjectorType::from_metadata_str("mlp2x_gelu").unwrap(),
+            ProjectorType::Mlp
+        );
+        assert_eq!(
+            ProjectorType::from_metadata_str("ldp_v2").unwrap(),
+            ProjectorType::LdpV2
+        );
         assert_eq!(
             ProjectorType::from_metadata_str("qwen3vl_merger").unwrap(),
             ProjectorType::Qwen3VlMerger
@@ -2750,8 +2799,7 @@ mod tests {
         let d = 4;
         let text = fake_text_embeds(5, d);
         let img = fake_image_features(0, 3, d);
-        let out =
-            splice_image_embeddings(&text, &[2], &[img.as_slice()], d).unwrap();
+        let out = splice_image_embeddings(&text, &[2], &[img.as_slice()], d).unwrap();
         assert_eq!(out.len(), 7 * d);
         // Row 0 == text token 0 (values [0, 1, 2, 3]).
         assert_eq!(&out[0..d], &[0.0, 1.0, 2.0, 3.0]);
@@ -2774,13 +2822,8 @@ mod tests {
         let text = fake_text_embeds(6, d);
         let img0 = fake_image_features(0, 2, d);
         let img1 = fake_image_features(1, 3, d);
-        let out = splice_image_embeddings(
-            &text,
-            &[1, 4],
-            &[img0.as_slice(), img1.as_slice()],
-            d,
-        )
-        .unwrap();
+        let out = splice_image_embeddings(&text, &[1, 4], &[img0.as_slice(), img1.as_slice()], d)
+            .unwrap();
         // text_len=6, placeholders=2, total patches=5 -> seq=9
         assert_eq!(out.len(), 9 * d);
         // Layout: [t0, img0_p0, img0_p1, t2, t3, img1_p0, img1_p1, img1_p2, t5]
@@ -2907,12 +2950,7 @@ mod tests {
         let text = fake_text_embeds(5, d);
         let img0 = fake_image_features(0, 1, d);
         let img1 = fake_image_features(1, 1, d);
-        match splice_image_embeddings(
-            &text,
-            &[2, 2],
-            &[img0.as_slice(), img1.as_slice()],
-            d,
-        ) {
+        match splice_image_embeddings(&text, &[2, 2], &[img0.as_slice(), img1.as_slice()], d) {
             Err(SpliceError::PositionsNotSorted { idx: 1, a: 2, b: 2 }) => {}
             other => panic!("expected PositionsNotSorted (duplicate), got {other:?}"),
         }
@@ -3126,10 +3164,7 @@ mod tests {
             &payloads,
             PlaceholderMode::OnePerPatch,
         ) {
-            Err(VlmInputBuildError::PlaceholderPatchRunMismatch {
-                found,
-                expected,
-            }) => {
+            Err(VlmInputBuildError::PlaceholderPatchRunMismatch { found, expected }) => {
                 assert_eq!(found, vec![100]);
                 assert_eq!(expected, vec![577]);
             }
@@ -3205,10 +3240,7 @@ mod tests {
             &payloads,
             PlaceholderMode::OnePerPatch,
         ) {
-            Err(VlmInputBuildError::PlaceholderPatchRunMismatch {
-                found,
-                expected,
-            }) => {
+            Err(VlmInputBuildError::PlaceholderPatchRunMismatch { found, expected }) => {
                 assert_eq!(found, vec![290, 287]);
                 assert_eq!(expected, vec![577]);
             }
@@ -3250,18 +3282,13 @@ mod tests {
         let img_id: u32 = 4242;
         // 5-token prompt with the placeholder at index 2.
         let tokens = [10u32, 11, img_id, 12, 13];
-        let inputs =
-            prepare_vlm_inputs(&model, &tokens, img_id, &[img.as_slice()]).unwrap();
+        let inputs = prepare_vlm_inputs(&model, &tokens, img_id, &[img.as_slice()]).unwrap();
         // Fake text embeddings: row t == [t*10 + k] for k in 0..d_text.
         let text = fake_text_embeds(tokens.len(), inputs.d_text);
         let feat_slices = inputs.feature_slices();
-        let spliced = splice_image_embeddings(
-            &text,
-            &inputs.positions,
-            &feat_slices,
-            inputs.d_text,
-        )
-        .expect("splice should accept prepare_vlm_inputs output");
+        let spliced =
+            splice_image_embeddings(&text, &inputs.positions, &feat_slices, inputs.d_text)
+                .expect("splice should accept prepare_vlm_inputs output");
         // Output length: text_len - 1 + num_image_tokens
         let num_image_tokens = inputs.features[0].len() / inputs.d_text;
         let expected_len = (tokens.len() - 1 + num_image_tokens) * inputs.d_text;
@@ -3318,10 +3345,7 @@ mod tests {
         );
         // Last row is text token 3 (placeholder at pos 2 dropped).
         let tail = (2 + n_image_tokens) * d_text;
-        assert_eq!(
-            &out[tail..tail + d_text],
-            &text[3 * d_text..4 * d_text]
-        );
+        assert_eq!(&out[tail..tail + d_text], &text[3 * d_text..4 * d_text]);
         let _ = std::fs::remove_file(&tmp);
     }
 }

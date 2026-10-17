@@ -129,7 +129,11 @@ pub fn gemm_model(ar: usize, ac: usize, br: usize, bc: usize, transpose_b: bool)
     put_string(&mut node, 3, "rsl_gemm");
     put_string(&mut node, 4, "Gemm");
     put_msg(&mut node, 5, &attr_int("transA", 0));
-    put_msg(&mut node, 5, &attr_int("transB", if transpose_b { 1 } else { 0 }));
+    put_msg(
+        &mut node,
+        5,
+        &attr_int("transB", if transpose_b { 1 } else { 0 }),
+    );
     put_msg(&mut node, 5, &attr_float("alpha", 1.0));
     put_msg(&mut node, 5, &attr_float("beta", 0.0));
 
@@ -291,6 +295,9 @@ mod tests {
     #[test]
     fn gemm_model_plain_vs_transposed_differ() {
         // transpose_b flips the output columns (bc vs br) → different bytes.
-        assert_ne!(gemm_model(4, 16, 16, 8, false), gemm_model(4, 16, 8, 16, true));
+        assert_ne!(
+            gemm_model(4, 16, 16, 8, false),
+            gemm_model(4, 16, 8, 16, true)
+        );
     }
 }

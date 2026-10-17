@@ -148,7 +148,8 @@ impl LoadOptions {
                 }
             }
         };
-        let prefill_batched = env_truthy("RUSTLLAMA_PREFILL_BATCHED").unwrap_or(input.prefill_batched);
+        let prefill_batched =
+            env_truthy("RUSTLLAMA_PREFILL_BATCHED").unwrap_or(input.prefill_batched);
         let prefill_batched_hybrid =
             env_truthy("RUSTLLAMA_PREFILL_BATCHED_HYBRID").unwrap_or(input.prefill_batched_hybrid);
         let memory_budget = match std::env::var("RUSTLLAMA_MEMORY_BUDGET") {
@@ -164,8 +165,8 @@ impl LoadOptions {
         };
         // `SSM_PREFILL_CHUNKED` / `HYBRID_KV_ANY` legacy gate = PRESENT (any
         // value, even `"0"`). So env present ⇒ on, else the config value.
-        let ssm_prefill_chunked =
-            std::env::var_os("RUSTLLAMA_SSM_PREFILL_CHUNKED").is_some() || input.ssm_prefill_chunked;
+        let ssm_prefill_chunked = std::env::var_os("RUSTLLAMA_SSM_PREFILL_CHUNKED").is_some()
+            || input.ssm_prefill_chunked;
         let hybrid_kv_any =
             std::env::var_os("RUSTLLAMA_HYBRID_KV_ANY").is_some() || input.hybrid_kv_any;
         let kv_persist_mb = std::env::var("RUSTLLAMA_KV_PERSIST_MB")

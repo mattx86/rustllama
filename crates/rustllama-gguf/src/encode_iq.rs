@@ -59,7 +59,11 @@ const QK_NL: usize = 32;
 /// after rescaling lands roughly within the codebook range and the
 /// nearest-neighbor lookup recovers `x[i]` to within half a step.
 pub fn encode_iq4_nl(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK_NL, 0, "encode_iq4_nl: src.len() must be multiple of 32");
+    assert_eq!(
+        src.len() % QK_NL,
+        0,
+        "encode_iq4_nl: src.len() must be multiple of 32"
+    );
     let n_blocks = src.len() / QK_NL;
     assert_eq!(
         dst.len(),
@@ -115,7 +119,11 @@ const BLOCK_IQ4_XS_BYTES: usize = 136;
 /// `(lo_nibble | (hi_2bits << 4))` ∈ `[0, 63]` (then bias-shifted
 /// `-32` on decode); plus 16 bytes of 4-bit codebook indices.
 pub fn encode_iq4_xs(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK_K, 0, "encode_iq4_xs: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_iq4_xs: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -156,7 +164,11 @@ pub fn encode_iq4_xs(src: &[f32], dst: &mut [u8]) {
         let signed_max = sub_scales
             .iter()
             .fold(0f32, |acc, &s| if s.abs() > acc.abs() { s } else { acc });
-        let iscale = if signed_max != 0.0 { -32.0 / signed_max } else { 0.0 };
+        let iscale = if signed_max != 0.0 {
+            -32.0 / signed_max
+        } else {
+            0.0
+        };
         let d_super = if iscale != 0.0 { 1.0 / iscale } else { 0.0 };
 
         let mut scales_q = [0i8; N_SUB_BLOCKS_IQ4XS];

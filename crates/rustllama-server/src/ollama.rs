@@ -120,7 +120,9 @@ pub async fn ps(State(state): State<AppState>) -> Json<PsOut> {
     let entries = state.list().await;
     let mut models = Vec::with_capacity(entries.len());
     for (id, _is_default) in &entries {
-        let Some(serving) = state.resolve(Some(id)).await else { continue };
+        let Some(serving) = state.resolve(Some(id)).await else {
+            continue;
+        };
         let Some(cpu) = serving.cpu_engine.as_ref() else {
             // Mock engines don't carry a config; skip rather than
             // emit a 0-byte stub that would confuse `ollama ps`.
@@ -130,7 +132,9 @@ pub async fn ps(State(state): State<AppState>) -> Json<PsOut> {
         let family = arch_family(cfg);
         // GGUF on-disk size as the resident-size proxy. Refines to
         // RAM/VRAM split once Sysman lands.
-        let size = std::fs::metadata(cpu.source_path()).map(|m| m.len()).unwrap_or(0);
+        let size = std::fs::metadata(cpu.source_path())
+            .map(|m| m.len())
+            .unwrap_or(0);
         models.push(PsModel {
             name: id.clone(),
             model: id.clone(),
@@ -194,7 +198,9 @@ pub async fn tags(State(state): State<AppState>) -> Json<TagsOut> {
     // One entry per loaded model. Iterate the registry (not just the
     // default) so multi-model deployments show up correctly here.
     for (id, _is_default) in &entries {
-        let Some(serving) = state.resolve(Some(id)).await else { continue };
+        let Some(serving) = state.resolve(Some(id)).await else {
+            continue;
+        };
         if let Some(cpu) = serving.cpu_engine.as_ref() {
             let cfg = cpu.config();
             let family = arch_family(cfg);
@@ -476,10 +482,7 @@ fn llama_ftype_name(v: u32) -> &'static str {
 /// n_shared * 3 * d * d_ff` on MoE models and `3 * d * d_ff` on
 /// dense. See [`compute_param_count`] for the testable core. Rounds
 /// to the nearest 0.1B for display.
-fn estimate_params_from_metadata(
-    gguf: &rustllama_gguf::Gguf,
-    arch: &str,
-) -> String {
+fn estimate_params_from_metadata(gguf: &rustllama_gguf::Gguf, arch: &str) -> String {
     let get_u32 = |key: &str| match gguf.metadata_get(key) {
         Some(rustllama_gguf::MetadataValue::U32(v)) => Some(*v as u64),
         Some(rustllama_gguf::MetadataValue::I32(v)) => Some(*v as u64),
@@ -598,8 +601,7 @@ fn build_parameters_block(cpu: &rustllama_engine::CpuEngine) -> String {
             if !eos.is_empty() {
                 // JSON-encode so embedded quotes / whitespace survive
                 // round-tripping through Ollama Modelfile parsers.
-                let escaped = serde_json::to_string(&eos)
-                    .unwrap_or_else(|_| String::from("\"\""));
+                let escaped = serde_json::to_string(&eos).unwrap_or_else(|_| String::from("\"\""));
                 lines.push(format!("stop {escaped}"));
             }
         }
@@ -706,10 +708,7 @@ pub async fn show(State(state): State<AppState>, Json(req): Json<ShowRequest>) -
     if let Some(moe) = cfg.moe.as_ref() {
         let arch_key = cfg.arch.as_str();
         if let Some(obj) = model_info.as_object_mut() {
-            obj.insert(
-                format!("{arch_key}.expert_count"),
-                json!(moe.n_experts),
-            );
+            obj.insert(format!("{arch_key}.expert_count"), json!(moe.n_experts));
             obj.insert(
                 format!("{arch_key}.expert_used_count"),
                 json!(moe.n_experts_used),
@@ -828,10 +827,7 @@ pub async fn embeddings_legacy(
 /// Response: `{ "model", "embeddings": [[f32; d_model]; N],
 ///              "total_duration", "load_duration",
 ///              "prompt_eval_count" }`
-pub async fn embed(
-    State(state): State<AppState>,
-    Json(req): Json<OllamaEmbedRequest>,
-) -> Response {
+pub async fn embed(State(state): State<AppState>, Json(req): Json<OllamaEmbedRequest>) -> Response {
     let started = std::time::Instant::now();
     let bundle = match crate::embeddings::get_embedding_bundle(&state) {
         Ok(b) => b,
@@ -1034,7 +1030,10 @@ pub async fn chat(State(state): State<AppState>, Json(req): Json<OllamaChatReque
             sampling.grammar = Some(g);
         }
     }
-    let model_id = req.model.clone().unwrap_or_else(|| serving.model_id.clone());
+    let model_id = req
+        .model
+        .clone()
+        .unwrap_or_else(|| serving.model_id.clone());
     let msgs: Vec<ChatMessage> = req
         .messages
         .into_iter()
@@ -1111,7 +1110,10 @@ async fn ollama_chat_with_tools(
     req: OllamaChatRequest,
 ) -> Response {
     let tools_value = req.tools.clone().unwrap_or(Value::Null);
-    let model_id = req.model.clone().unwrap_or_else(|| serving.model_id.clone());
+    let model_id = req
+        .model
+        .clone()
+        .unwrap_or_else(|| serving.model_id.clone());
 
     let Some(shared_cpu) = serving.cpu_engine.as_ref().cloned() else {
         return (
@@ -1244,7 +1246,10 @@ async fn ollama_chat_with_tools(
     let has_calls = tool_calls.is_some();
     if let Some(calls) = tool_calls {
         if let Some(obj) = message.as_object_mut() {
-            obj.insert("tool_calls".into(), Value::Array(ollama_tool_calls_json(&calls)));
+            obj.insert(
+                "tool_calls".into(),
+                Value::Array(ollama_tool_calls_json(&calls)),
+            );
         }
     }
 
@@ -1398,8 +1403,8 @@ fn ollama_tool_stream_chunks(
                 // Ollama's `arguments` is a JSON object, not the OpenAI
                 // stringified form — parse it back (falling back to the raw
                 // string on non-JSON payloads).
-                let args_val: Value = serde_json::from_str(&args)
-                    .unwrap_or_else(|_| Value::String(args.clone()));
+                let args_val: Value =
+                    serde_json::from_str(&args).unwrap_or_else(|_| Value::String(args.clone()));
                 *any_tool_call = true;
                 out.push(json!({
                     "model": model_id,
@@ -1649,7 +1654,10 @@ pub async fn generate(
             sampling.grammar = Some(g);
         }
     }
-    let model_id = req.model.clone().unwrap_or_else(|| serving.model_id.clone());
+    let model_id = req
+        .model
+        .clone()
+        .unwrap_or_else(|| serving.model_id.clone());
 
     // Two-phase admission: chat-template detection + msgs build +
     // token-count happen against `serving.cpu_engine` (Arc-shared
@@ -1718,14 +1726,18 @@ pub async fn generate(
         PreparedGenerate::Chat { msgs, count } => {
             let stream = match handle.engine.chat(&msgs, &sampling) {
                 Ok(s) => s,
-                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
             };
             (stream, count)
         }
         PreparedGenerate::Raw { count } => {
             let stream = match handle.engine.generate(&req.prompt, &sampling) {
                 Ok(s) => s,
-                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
             };
             (stream, count)
         }
@@ -2287,10 +2299,10 @@ fn estimate_parameter_size(cfg: &rustllama_models::llama_config::LlamaConfig) ->
     let kvh = cfg.n_kv_heads as u64;
     let hd = cfg.head_dim as u64;
     let attn = 4 * d * d                // q/k/v/o proj (approx)
-        - 2 * d * (d - kvh * hd);       // GQA savings
-    // MoE FFN: n_experts routed copies + n_shared always-active copies
-    // + the tiny router (d * n_experts). Without this branch, Mixtral
-    // shows up as ~7B instead of ~47B.
+        - 2 * d * (d - kvh * hd); // GQA savings
+                                  // MoE FFN: n_experts routed copies + n_shared always-active copies
+                                  // + the tiny router (d * n_experts). Without this branch, Mixtral
+                                  // shows up as ~7B instead of ~47B.
     let ffn = match cfg.moe.as_ref() {
         Some(m) if m.n_experts >= 2 => {
             let ne = m.n_experts as u64;
@@ -2341,8 +2353,7 @@ mod tests {
     #[test]
     fn typical_p_threads_into_sampling_params_for_ollama() {
         let value = serde_json::json!({ "typical_p": 0.75 });
-        let opts: OllamaOptions =
-            serde_json::from_value(value).expect("OllamaOptions parses");
+        let opts: OllamaOptions = serde_json::from_value(value).expect("OllamaOptions parses");
         let sampling = sampling_from_options(Some(&opts));
         assert!((sampling.typical_p - 0.75).abs() < 1e-6);
     }
@@ -2356,8 +2367,7 @@ mod tests {
             "mirostat_tau": 4.5,
             "mirostat_eta": 0.15,
         });
-        let opts: OllamaOptions =
-            serde_json::from_value(value).expect("OllamaOptions parses");
+        let opts: OllamaOptions = serde_json::from_value(value).expect("OllamaOptions parses");
         let sampling = sampling_from_options(Some(&opts));
         assert_eq!(sampling.mirostat, 2);
         assert!((sampling.mirostat_tau - 4.5).abs() < 1e-6);
@@ -2377,8 +2387,7 @@ mod tests {
             "dynatemp_range": 0.5,
             "dynatemp_exponent": 1.1,
         });
-        let opts: OllamaOptions =
-            serde_json::from_value(value).expect("OllamaOptions parses");
+        let opts: OllamaOptions = serde_json::from_value(value).expect("OllamaOptions parses");
         let s = sampling_from_options(Some(&opts));
         assert!((s.min_p - 0.04).abs() < 1e-6);
         assert!((s.dry_multiplier - 0.9).abs() < 1e-6);
@@ -2625,14 +2634,20 @@ mod tests {
         // First fixture: vocab 256 (smaller file).
         write_synthetic_llama_gguf(
             &tmp,
-            &SynthLlama { vocab: 256, ..SynthLlama::default() },
+            &SynthLlama {
+                vocab: 256,
+                ..SynthLlama::default()
+            },
         );
         let size_small = std::fs::metadata(&tmp).unwrap().len();
         let _ = peek_gguf_metadata_cached(&tmp);
         // Overwrite with a much-larger fixture.
         write_synthetic_llama_gguf(
             &tmp,
-            &SynthLlama { vocab: 4096, ..SynthLlama::default() },
+            &SynthLlama {
+                vocab: 4096,
+                ..SynthLlama::default()
+            },
         );
         let size_big = std::fs::metadata(&tmp).unwrap().len();
         assert!(

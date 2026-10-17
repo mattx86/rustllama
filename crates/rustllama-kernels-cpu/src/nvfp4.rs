@@ -137,9 +137,7 @@ pub fn f32_to_e4m3(x: f32) -> u8 {
     let mantissa = (f32_mant >> 20) as u8 & 0x07;
     let dropped = f32_mant & ((1 << 20) - 1);
     let half_bit = 1u32 << 19;
-    let rounded_mant = if dropped > half_bit
-        || (dropped == half_bit && (mantissa & 1) == 1)
-    {
+    let rounded_mant = if dropped > half_bit || (dropped == half_bit && (mantissa & 1) == 1) {
         mantissa.wrapping_add(1)
     } else {
         mantissa
@@ -301,14 +299,12 @@ pub fn dequantize_matrix(rows: usize, n: usize, packed: &[u8], out: &mut [f32]) 
 /// `k` must be a multiple of 16 (the NVFP4 block size). Asserts
 /// catch misuse during prefill where the prompt's `d_model` lines
 /// up with the weight matrix's K dimension.
-pub fn matvec_nvfp4_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
-    assert_eq!(k % NVFP4_BLOCK_ELEMS, 0, "nvfp4 matvec requires k % 16 == 0");
+pub fn matvec_nvfp4_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
+    assert_eq!(
+        k % NVFP4_BLOCK_ELEMS,
+        0,
+        "nvfp4 matvec requires k % 16 == 0"
+    );
     let blocks_per_row = k / NVFP4_BLOCK_ELEMS;
     assert_eq!(w_bytes.len(), m * blocks_per_row * NVFP4_BLOCK_BYTES);
     assert_eq!(x.len(), k);
@@ -363,7 +359,7 @@ unsafe fn matvec_nvfp4_w_f32_a_neon(
             let b8 = vld1_u8(w_bytes.as_ptr().add(off)); // 8 code bytes → 16 codes
             let lo = vqtbl1_s8(codebook, vand_u8(b8, mask_lo)); // 8 lo-nibble values
             let hi = vqtbl1_s8(codebook, vshr_n_u8::<4>(b8)); // 8 hi-nibble values
-            // Interleave to element order (e[2j]=lo[j], e[2j+1]=hi[j]).
+                                                              // Interleave to element order (e[2j]=lo[j], e[2j+1]=hi[j]).
             let e = vcombine_s8(vzip1_s8(lo, hi), vzip2_s8(lo, hi));
             let ef = s8x16_to_f32x4x4(e);
             let xb = x.as_ptr().add(b * NVFP4_BLOCK_ELEMS);
@@ -376,13 +372,7 @@ unsafe fn matvec_nvfp4_w_f32_a_neon(
     }
 }
 
-fn matvec_nvfp4_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_nvfp4_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     let blocks_per_row = k / NVFP4_BLOCK_ELEMS;
     for i in 0..m {
         let row_start = i * blocks_per_row * NVFP4_BLOCK_BYTES;
@@ -480,10 +470,7 @@ unsafe fn matvec_nvfp4_w_f32_a_avx2(
 
         // Horizontal sum: acc0 + acc1 → 8 lanes → scalar.
         let acc = _mm256_add_ps(acc0, acc1);
-        let mut sum128 = _mm_add_ps(
-            _mm256_castps256_ps128(acc),
-            _mm256_extractf128_ps(acc, 1),
-        );
+        let mut sum128 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
         sum128 = _mm_hadd_ps(sum128, sum128);
         sum128 = _mm_hadd_ps(sum128, sum128);
         out[i] = _mm_cvtss_f32(sum128);
@@ -548,7 +535,11 @@ pub fn gqa_attention_flash_decode_nvfp4_capped_windowed(
     window: usize,
     softcap: f32,
 ) {
-    assert_eq!(head_dim % NVFP4_BLOCK_ELEMS, 0, "head_dim must be a multiple of 16");
+    assert_eq!(
+        head_dim % NVFP4_BLOCK_ELEMS,
+        0,
+        "head_dim must be a multiple of 16"
+    );
     let blocks_per_row = head_dim / NVFP4_BLOCK_ELEMS;
     let bytes_per_row = blocks_per_row * NVFP4_BLOCK_BYTES;
     assert_eq!(q.len(), n_heads * head_dim);
@@ -556,7 +547,11 @@ pub fn gqa_attention_flash_decode_nvfp4_capped_windowed(
     assert_eq!(k_packed.len(), n_kv_heads * max_ctx * bytes_per_row);
     assert_eq!(v_packed.len(), n_kv_heads * max_ctx * bytes_per_row);
     assert!(kv_len <= max_ctx);
-    assert_eq!(n_heads % n_kv_heads, 0, "GQA requires n_heads divisible by n_kv_heads");
+    assert_eq!(
+        n_heads % n_kv_heads,
+        0,
+        "GQA requires n_heads divisible by n_kv_heads"
+    );
     if kv_len == 0 {
         for v in out.iter_mut() {
             *v = 0.0;
@@ -567,7 +562,11 @@ pub fn gqa_attention_flash_decode_nvfp4_capped_windowed(
     let n_gqa = n_heads / n_kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
     // Decode window lower bound (0 ⇒ full attention).
-    let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+    let start = if window > 0 {
+        kv_len.saturating_sub(window)
+    } else {
+        0
+    };
 
     // Per-kv-head dequant scratch — sized `kv_len × head_dim`
     // instead of the full `max_ctx × head_dim`. Re-used across the
@@ -604,7 +603,15 @@ pub fn gqa_attention_flash_decode_nvfp4_capped_windowed(
             let q_h = &q[h * head_dim..(h + 1) * head_dim];
             let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
             crate::turboquant::online_softmax_attn_f32_scratch_capped_windowed(
-                q_h, &k_h_scratch, &v_h_scratch, out_h, head_dim, kv_len, scale, start, softcap,
+                q_h,
+                &k_h_scratch,
+                &v_h_scratch,
+                out_h,
+                head_dim,
+                kv_len,
+                scale,
+                start,
+                softcap,
             );
         }
     }
@@ -637,7 +644,17 @@ pub fn gqa_attention_flash_prefill_nvfp4(
     // Thin wrapper: full-causal, no soft-cap. BIT-IDENTICAL to the pre-window
     // kernel.
     gqa_attention_flash_prefill_nvfp4_capped_windowed(
-        q, k_packed, v_packed, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, 0,
+        q,
+        k_packed,
+        v_packed,
+        out,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        0,
         0.0,
     );
 }
@@ -664,7 +681,11 @@ pub fn gqa_attention_flash_prefill_nvfp4_capped_windowed(
     window: usize,
     softcap: f32,
 ) {
-    assert_eq!(head_dim % NVFP4_BLOCK_ELEMS, 0, "head_dim must be a multiple of 16");
+    assert_eq!(
+        head_dim % NVFP4_BLOCK_ELEMS,
+        0,
+        "head_dim must be a multiple of 16"
+    );
     let blocks_per_row = head_dim / NVFP4_BLOCK_ELEMS;
     let bytes_per_row = blocks_per_row * NVFP4_BLOCK_BYTES;
     assert_eq!(q.len(), n_new * n_heads * head_dim);
@@ -672,7 +693,11 @@ pub fn gqa_attention_flash_prefill_nvfp4_capped_windowed(
     assert_eq!(k_packed.len(), n_kv_heads * max_ctx * bytes_per_row);
     assert_eq!(v_packed.len(), n_kv_heads * max_ctx * bytes_per_row);
     assert!(kv_len_base + n_new <= max_ctx);
-    assert_eq!(n_heads % n_kv_heads, 0, "GQA requires n_heads divisible by n_kv_heads");
+    assert_eq!(
+        n_heads % n_kv_heads,
+        0,
+        "GQA requires n_heads divisible by n_kv_heads"
+    );
     if n_new == 0 {
         return;
     }
@@ -712,7 +737,11 @@ pub fn gqa_attention_flash_prefill_nvfp4_capped_windowed(
             let h = kv_h * n_gqa + qh_off;
             for i in 0..n_new {
                 let kv_len_i = kv_len_base + i + 1;
-                let start_i = if window > 0 { kv_len_i.saturating_sub(window) } else { 0 };
+                let start_i = if window > 0 {
+                    kv_len_i.saturating_sub(window)
+                } else {
+                    0
+                };
                 let q_off = (i * n_heads + h) * head_dim;
                 let q_h = &q[q_off..q_off + head_dim];
                 let out_off = (i * n_heads + h) * head_dim;
@@ -786,9 +815,16 @@ mod tests {
             .collect();
         let mut out_prefill = vec![0f32; n_new * n_heads * head_dim];
         gqa_attention_flash_prefill_nvfp4(
-            &q, &k_packed, &v_packed, &mut out_prefill,
-            n_heads, n_kv_heads, head_dim, max_ctx,
-            kv_len_base, n_new,
+            &q,
+            &k_packed,
+            &v_packed,
+            &mut out_prefill,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
         );
         let mut out_reference = vec![0f32; n_new * n_heads * head_dim];
         for i in 0..n_new {
@@ -797,8 +833,8 @@ mod tests {
             let out_slice =
                 &mut out_reference[i * n_heads * head_dim..(i + 1) * n_heads * head_dim];
             gqa_attention_flash_decode_nvfp4(
-                q_slice, &k_packed, &v_packed, out_slice,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_len_i,
+                q_slice, &k_packed, &v_packed, out_slice, n_heads, n_kv_heads, head_dim, max_ctx,
+                kv_len_i,
             );
         }
         let mut max_err = 0f32;
@@ -883,12 +919,26 @@ mod tests {
         let mut out_standard = vec![0f32; n_heads * head_dim];
         let mut out_flash = vec![0f32; n_heads * head_dim];
         crate::gqa_attention_one_step(
-            &q, &k_f32, &v_f32, &mut out_standard,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            &q,
+            &k_f32,
+            &v_f32,
+            &mut out_standard,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
         );
         gqa_attention_flash_decode_nvfp4(
-            &q, &k_packed, &v_packed, &mut out_flash,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            &q,
+            &k_packed,
+            &v_packed,
+            &mut out_flash,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
         );
         let mut max_err = 0f32;
         for (a, b) in out_standard.iter().zip(out_flash.iter()) {
@@ -915,9 +965,7 @@ mod tests {
     fn e4m3_round_trips_common_values() {
         // Spot-check round-trip for values that should land exactly
         // on representable E4M3 codes.
-        for &expected in &[
-            1.0, 2.0, 4.0, 0.5, 0.25, 128.0, 256.0, -1.0, -2.0, -0.5,
-        ] {
+        for &expected in &[1.0, 2.0, 4.0, 0.5, 0.25, 128.0, 256.0, -1.0, -2.0, -0.5] {
             let byte = f32_to_e4m3(expected);
             let decoded = e4m3_to_f32(byte);
             assert!(
@@ -946,7 +994,10 @@ mod tests {
         let byte = f32_to_e4m3(big);
         let decoded = e4m3_to_f32(byte);
         assert!(decoded.is_finite(), "saturated decode must be finite");
-        assert!(decoded > 100.0, "saturated decode should be near max: {decoded}");
+        assert!(
+            decoded > 100.0,
+            "saturated decode should be near max: {decoded}"
+        );
         // Same for the negative side.
         let byte_neg = f32_to_e4m3(-big);
         let decoded_neg = e4m3_to_f32(byte_neg);
@@ -960,8 +1011,7 @@ mod tests {
         // For E2M1 the worst gap is between 4.0 and 6.0 (= 2.0), so
         // worst-case error per element is scale × 1.0 (half the gap).
         let elems: [f32; 16] = [
-            0.1, -0.7, 1.2, -1.5, 2.3, -2.7, 3.4, -3.9,
-            4.2, -4.5, 5.0, -5.4, 5.9, 0.0, -0.05, 6.0,
+            0.1, -0.7, 1.2, -1.5, 2.3, -2.7, 3.4, -3.9, 4.2, -4.5, 5.0, -5.4, 5.9, 0.0, -0.05, 6.0,
         ];
         let mut packed = [0u8; NVFP4_BLOCK_BYTES];
         quantize_block(&elems, &mut packed);
@@ -1056,7 +1106,12 @@ mod tests {
             for i in 0..m {
                 let abs = (scalar_out[i] - neon_out[i]).abs();
                 let rel = abs / scalar_out[i].abs().max(1e-6);
-                assert!(abs < 1e-4 || rel < 1e-5, "row {i}: neon {} vs scalar {}", neon_out[i], scalar_out[i]);
+                assert!(
+                    abs < 1e-4 || rel < 1e-5,
+                    "row {i}: neon {} vs scalar {}",
+                    neon_out[i],
+                    scalar_out[i]
+                );
             }
         }
     }
@@ -1145,7 +1200,11 @@ mod tests {
         let bytes_per_row = blocks_per_row * NVFP4_BLOCK_BYTES;
         let n_gqa = n_heads / n_kv_heads;
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+        let start = if window > 0 {
+            kv_len.saturating_sub(window)
+        } else {
+            0
+        };
         let mut kf = vec![0f32; n_kv_heads * kv_len * head_dim];
         let mut vf = vec![0f32; n_kv_heads * kv_len * head_dim];
         for kv_h in 0..n_kv_heads {
@@ -1155,8 +1214,14 @@ mod tests {
                 for b in 0..blocks_per_row {
                     let src = p_off + b * NVFP4_BLOCK_BYTES;
                     let dk = o + b * NVFP4_BLOCK_ELEMS;
-                    dequantize_block(&k_packed[src..src + NVFP4_BLOCK_BYTES], &mut kf[dk..dk + NVFP4_BLOCK_ELEMS]);
-                    dequantize_block(&v_packed[src..src + NVFP4_BLOCK_BYTES], &mut vf[dk..dk + NVFP4_BLOCK_ELEMS]);
+                    dequantize_block(
+                        &k_packed[src..src + NVFP4_BLOCK_BYTES],
+                        &mut kf[dk..dk + NVFP4_BLOCK_ELEMS],
+                    );
+                    dequantize_block(
+                        &v_packed[src..src + NVFP4_BLOCK_BYTES],
+                        &mut vf[dk..dk + NVFP4_BLOCK_ELEMS],
+                    );
                 }
             }
         }
@@ -1205,13 +1270,19 @@ mod tests {
         let kv_len = 20;
         let kp = synth_nvfp4_cache(n_kv_heads, head_dim, max_ctx, kv_len, 1);
         let vp = synth_nvfp4_cache(n_kv_heads, head_dim, max_ctx, kv_len, 2);
-        let q: Vec<f32> = (0..n_heads * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.12).collect();
+        let q: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.12)
+            .collect();
 
         // Decode passthrough.
         let mut base = vec![0f32; n_heads * head_dim];
         let mut cw = vec![0f32; n_heads * head_dim];
-        gqa_attention_flash_decode_nvfp4(&q, &kp, &vp, &mut base, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
-        gqa_attention_flash_decode_nvfp4_capped_windowed(&q, &kp, &vp, &mut cw, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0);
+        gqa_attention_flash_decode_nvfp4(
+            &q, &kp, &vp, &mut base, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        );
+        gqa_attention_flash_decode_nvfp4_capped_windowed(
+            &q, &kp, &vp, &mut cw, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0,
+        );
         assert_eq!(base, cw, "nvfp4 flash-decode passthrough not bit-identical");
 
         // Prefill passthrough.
@@ -1220,12 +1291,41 @@ mod tests {
         let total = kv_len_base + n_new;
         let kp2 = synth_nvfp4_cache(n_kv_heads, head_dim, max_ctx, total, 3);
         let vp2 = synth_nvfp4_cache(n_kv_heads, head_dim, max_ctx, total, 4);
-        let qp: Vec<f32> = (0..n_new * n_heads * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.12).collect();
+        let qp: Vec<f32> = (0..n_new * n_heads * head_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.12)
+            .collect();
         let mut base_pf = vec![0f32; n_new * n_heads * head_dim];
         let mut cw_pf = vec![0f32; n_new * n_heads * head_dim];
-        gqa_attention_flash_prefill_nvfp4(&qp, &kp2, &vp2, &mut base_pf, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new);
-        gqa_attention_flash_prefill_nvfp4_capped_windowed(&qp, &kp2, &vp2, &mut cw_pf, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, 0, 0.0);
-        assert_eq!(base_pf, cw_pf, "nvfp4 flash-prefill passthrough not bit-identical");
+        gqa_attention_flash_prefill_nvfp4(
+            &qp,
+            &kp2,
+            &vp2,
+            &mut base_pf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+        );
+        gqa_attention_flash_prefill_nvfp4_capped_windowed(
+            &qp,
+            &kp2,
+            &vp2,
+            &mut cw_pf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            0,
+            0.0,
+        );
+        assert_eq!(
+            base_pf, cw_pf,
+            "nvfp4 flash-prefill passthrough not bit-identical"
+        );
     }
 
     #[test]
@@ -1237,22 +1337,52 @@ mod tests {
         let kv_len = 5;
         let kp = synth_nvfp4_cache(n_kv_heads, head_dim, max_ctx, kv_len, 1);
         let vp = synth_nvfp4_cache(n_kv_heads, head_dim, max_ctx, kv_len, 2);
-        let q: Vec<f32> = (0..n_heads * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.12).collect();
+        let q: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.12)
+            .collect();
 
         // (b) windowed: window=2, kv_len=5.
         let mut naive = vec![0f32; n_heads * head_dim];
-        naive_nvfp4_decode_ref(&q, &kp, &vp, &mut naive, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 2, 0.0);
+        naive_nvfp4_decode_ref(
+            &q, &kp, &vp, &mut naive, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 2, 0.0,
+        );
         let mut got = vec![0f32; n_heads * head_dim];
-        gqa_attention_flash_decode_nvfp4_capped_windowed(&q, &kp, &vp, &mut got, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 2, 0.0);
+        gqa_attention_flash_decode_nvfp4_capped_windowed(
+            &q, &kp, &vp, &mut got, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 2, 0.0,
+        );
         for (g, n) in got.iter().zip(naive.iter()) {
             assert!((g - n).abs() < 1e-5, "nvfp4 windowed {g} vs naive {n}");
         }
 
         // (c) soft-cap: softcap=50.0, full window.
         let mut naive_sc = vec![0f32; n_heads * head_dim];
-        naive_nvfp4_decode_ref(&q, &kp, &vp, &mut naive_sc, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 50.0);
+        naive_nvfp4_decode_ref(
+            &q,
+            &kp,
+            &vp,
+            &mut naive_sc,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
+            0,
+            50.0,
+        );
         let mut got_sc = vec![0f32; n_heads * head_dim];
-        gqa_attention_flash_decode_nvfp4_capped_windowed(&q, &kp, &vp, &mut got_sc, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 50.0);
+        gqa_attention_flash_decode_nvfp4_capped_windowed(
+            &q,
+            &kp,
+            &vp,
+            &mut got_sc,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
+            0,
+            50.0,
+        );
         for (g, n) in got_sc.iter().zip(naive_sc.iter()) {
             assert!((g - n).abs() < 1e-5, "nvfp4 softcap {g} vs naive {n}");
         }

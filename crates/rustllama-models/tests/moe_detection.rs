@@ -7,9 +7,7 @@
 //! sliced from the 3-D parent at load, and dense models stay on the
 //! dense `blocks` path.
 
-use rustllama_gguf::synth::{
-    write_synthetic_llama_gguf, SynthHybrid, SynthLlama, SynthMoe,
-};
+use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthHybrid, SynthLlama, SynthMoe};
 use rustllama_gguf::Gguf;
 use rustllama_models::llama_arch::LlamaWeights;
 use rustllama_models::llama_config::LlamaConfig;
@@ -116,7 +114,10 @@ fn dense_gguf_has_no_hybrid_config() {
     write_synthetic_llama_gguf(&path, &SynthLlama::default());
     let gguf = Gguf::open(&path).expect("open dense gguf");
     let cfg = LlamaConfig::from_gguf(&gguf).expect("dense gguf parses");
-    assert!(cfg.hybrid.is_none(), "dense GGUF must not carry hybrid config");
+    assert!(
+        cfg.hybrid.is_none(),
+        "dense GGUF must not carry hybrid config"
+    );
     let _ = std::fs::remove_file(&path);
 }
 
@@ -225,7 +226,10 @@ fn moe_weights_from_gguf_succeeds_and_binds_router_plus_expert_tensors() {
     let _ = &blk0.w_gate_exps;
     let _ = &blk0.w_up_exps;
     let _ = &blk0.w_down_exps;
-    assert!(blk0.w_gate_shared.is_none(), "non-shared MoE: gate_shared absent");
+    assert!(
+        blk0.w_gate_shared.is_none(),
+        "non-shared MoE: gate_shared absent"
+    );
     assert!(blk0.w_up_shared.is_none());
     assert!(blk0.w_down_shared.is_none());
 
@@ -308,6 +312,9 @@ fn dense_weights_from_gguf_has_no_moe_blocks() {
     let weights = LlamaWeights::from_gguf(&gguf, &cfg).expect("dense binds");
     assert!(!weights.is_moe(), "dense model must not report is_moe");
     assert!(weights.moe_blocks.is_none());
-    assert!(!weights.blocks.is_empty(), "dense `blocks` must be populated");
+    assert!(
+        !weights.blocks.is_empty(),
+        "dense `blocks` must be populated"
+    );
     let _ = std::fs::remove_file(&path);
 }

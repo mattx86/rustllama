@@ -148,12 +148,9 @@ fn push_line(raw: &str) {
             if let Some((frac, name)) = rest.split_once(':') {
                 if let Some((label, total)) = frac.trim().split_once('/') {
                     let label = label.trim();
-                    let digits: String =
-                        label.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    let digits: String = label.chars().take_while(|c| c.is_ascii_digit()).collect();
                     let is_substage = !digits.is_empty() && digits.len() != label.len();
-                    if let (Ok(n), Ok(t)) =
-                        (digits.parse::<u32>(), total.trim().parse::<u32>())
-                    {
+                    if let (Ok(n), Ok(t)) = (digits.parse::<u32>(), total.trim().parse::<u32>()) {
                         g.stage_idx = n;
                         g.stage_total = t.max(1);
                         g.stage_name = name.trim().to_string();
@@ -224,8 +221,8 @@ pub fn run_autotune_blocking(
     let stage_total = if scope == TuneScope::Placement { 1 } else { 10 };
     begin(&model_id, stage_total);
 
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("cannot locate current executable: {e}"))?;
+    let exe =
+        std::env::current_exe().map_err(|e| format!("cannot locate current executable: {e}"))?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("tune");
     match scope {
@@ -483,7 +480,9 @@ fn run_validate_kernels_blocking(console: bool) {
         }
     };
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("tune").arg("--validate-kernels").env("NO_COLOR", "1");
+    cmd.arg("tune")
+        .arg("--validate-kernels")
+        .env("NO_COLOR", "1");
     if !console {
         cmd.stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());

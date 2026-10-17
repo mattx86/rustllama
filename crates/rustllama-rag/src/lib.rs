@@ -72,9 +72,7 @@ pub fn chunk_with_mode(
     mode: ChunkingMode,
 ) -> Vec<ChunkSpec> {
     match mode {
-        ChunkingMode::Lines => {
-            chunk_text(source_path, contents, chunk_lines, overlap_lines)
-        }
+        ChunkingMode::Lines => chunk_text(source_path, contents, chunk_lines, overlap_lines),
         ChunkingMode::TreeSitter | ChunkingMode::Auto => {
             #[cfg(feature = "tree-sitter")]
             {

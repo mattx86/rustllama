@@ -235,7 +235,9 @@ pub async fn embeddings(
         // No per-request model field today (we only serve the
         // configured one); echo a stable label so clients pinning
         // model id in their RAG metadata get a consistent value.
-        model: req.model.unwrap_or_else(|| "rustllama-embeddings".to_string()),
+        model: req
+            .model
+            .unwrap_or_else(|| "rustllama-embeddings".to_string()),
         usage: EmbeddingsUsage {
             prompt_tokens: total_tokens,
             total_tokens,
@@ -421,8 +423,7 @@ fn encode_le_f32_base64(vec: &[f32]) -> String {
 /// Standard-alphabet base64 encode (`A-Za-z0-9+/`) with `=` padding.
 /// Returns ASCII so a `String` is safe to construct directly.
 fn base64_standard_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::with_capacity((bytes.len() + 2) / 3 * 4);
     let mut i = 0;
     while i + 3 <= bytes.len() {
@@ -465,13 +466,12 @@ fn l2_normalize_inplace(vec: &mut [f32]) {
     }
 }
 
-fn resolve_embedding_path(cfg: &rustllama_config::Config) -> std::result::Result<std::path::PathBuf, String> {
+fn resolve_embedding_path(
+    cfg: &rustllama_config::Config,
+) -> std::result::Result<std::path::PathBuf, String> {
     if let Some(p) = cfg.embeddings.path.as_ref() {
         if !p.exists() {
-            return Err(format!(
-                "[embeddings].path does not exist: {}",
-                p.display()
-            ));
+            return Err(format!("[embeddings].path does not exist: {}", p.display()));
         }
         return Ok(p.clone());
     }

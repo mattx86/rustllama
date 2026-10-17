@@ -38,7 +38,11 @@ const BLOCK_Q8_K_BYTES: usize = 292;
 /// precomputes per-16-weight sub-block sums (used by the K-quant
 /// matmul path to avoid recomputing during inner-loop dot products).
 pub fn encode_q8_k(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK_K, 0, "encode_q8_k: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_q8_k: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -98,7 +102,11 @@ pub fn encode_q6_k_with_encoder(
     dst: &mut [u8],
     encoder: &dyn crate::iq_gpu::IqGpuEncoder,
 ) {
-    assert_eq!(src.len() % QK_K, 0, "encode_q6_k_with_encoder: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_q6_k_with_encoder: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -112,7 +120,11 @@ pub fn encode_q6_k_with_encoder(
 }
 
 pub fn encode_q6_k(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK_K, 0, "encode_q6_k: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_q6_k: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -144,9 +156,10 @@ pub fn encode_q6_k(src: &[f32], dst: &mut [u8]) {
         // sub-scale signs consistent with the negated /-32 above.
         let max_abs_scale = sub_scales.iter().fold(0f32, |a, &s| a.max(s.abs()));
         let iscale = if max_abs_scale > 0.0 {
-            -128.0 / sub_scales
-                .iter()
-                .fold(0f32, |acc, &s| if s.abs() > acc.abs() { s } else { acc })
+            -128.0
+                / sub_scales
+                    .iter()
+                    .fold(0f32, |acc, &s| if s.abs() > acc.abs() { s } else { acc })
         } else {
             0.0
         };
@@ -196,10 +209,8 @@ pub fn encode_q6_k(src: &[f32], dst: &mut [u8]) {
                 let q2 = (q_signed[n * 128 + 32 + l] + 32) as u32;
                 let q3 = (q_signed[n * 128 + 64 + l] + 32) as u32;
                 let q4 = (q_signed[n * 128 + 96 + l] + 32) as u32;
-                dst[ql_off + 64 * n + l] =
-                    ((q1 & 0x0F) | ((q3 & 0x0F) << 4)) as u8;
-                dst[ql_off + 64 * n + l + 32] =
-                    ((q2 & 0x0F) | ((q4 & 0x0F) << 4)) as u8;
+                dst[ql_off + 64 * n + l] = ((q1 & 0x0F) | ((q3 & 0x0F) << 4)) as u8;
+                dst[ql_off + 64 * n + l + 32] = ((q2 & 0x0F) | ((q4 & 0x0F) << 4)) as u8;
                 let qh_byte = ((q1 >> 4) & 0x03)
                     | (((q2 >> 4) & 0x03) << 2)
                     | (((q3 >> 4) & 0x03) << 4)
@@ -303,7 +314,9 @@ fn make_qkx2_quants_asym<const NMAX: u32>(
         let mut l_try = vec![0u8; n];
         // Requantize against the perturbed inverse scale.
         for i in 0..n {
-            let q = ((xs[i] + min_used) * inv_scale_try).round().clamp(0.0, nmax_f) as u8;
+            let q = ((xs[i] + min_used) * inv_scale_try)
+                .round()
+                .clamp(0.0, nmax_f) as u8;
             l_try[i] = q;
         }
         // Refit (d, min) by weighted least-squares against this
@@ -414,10 +427,7 @@ fn refit_d_min(xs: &[f32], l: &[u8], w: Option<&[f32]>) -> (f32, f32) {
 /// point for ~0.05–0.15 perplexity improvement at the same bpw.
 // Fallback asymmetric sub-block quantizer; retained for non-K_K formats, no live caller.
 #[allow(dead_code)]
-fn quant_sub_block_asym<const NMAX: u32>(
-    xs: &[f32],
-    out_q: &mut [u8],
-) -> (f32, f32) {
+fn quant_sub_block_asym<const NMAX: u32>(xs: &[f32], out_q: &mut [u8]) -> (f32, f32) {
     let n = xs.len();
     debug_assert_eq!(out_q.len(), n);
     let mut mn = f32::INFINITY;
@@ -504,7 +514,11 @@ pub fn encode_q4_k_with_encoder(
     dst: &mut [u8],
     encoder: &dyn crate::iq_gpu::IqGpuEncoder,
 ) {
-    assert_eq!(src.len() % QK_K, 0, "encode_q4_k_with_encoder: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_q4_k_with_encoder: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -527,7 +541,11 @@ pub fn encode_q4_k(src: &[f32], dst: &mut [u8]) {
 /// error by it so high-importance columns are reconstructed more
 /// faithfully. `None` reproduces the uniform-weight encode exactly.
 pub fn encode_q4_k_imatrix(src: &[f32], dst: &mut [u8], imatrix: Option<&[f32]>) {
-    assert_eq!(src.len() % QK_K, 0, "encode_q4_k: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_q4_k: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -560,7 +578,11 @@ pub fn encode_q4_k_imatrix(src: &[f32], dst: &mut [u8], imatrix: Option<&[f32]>)
         let d_super = max_d / 63.0;
         let dmin_super = max_m / 63.0;
         let id_super = if d_super > 0.0 { 1.0 / d_super } else { 0.0 };
-        let im_super = if dmin_super > 0.0 { 1.0 / dmin_super } else { 0.0 };
+        let im_super = if dmin_super > 0.0 {
+            1.0 / dmin_super
+        } else {
+            0.0
+        };
 
         let mut sc = [0u8; 8];
         let mut mn = [0u8; 8];
@@ -613,7 +635,11 @@ pub fn encode_q5_k_with_encoder(
     dst: &mut [u8],
     encoder: &dyn crate::iq_gpu::IqGpuEncoder,
 ) {
-    assert_eq!(src.len() % QK_K, 0, "encode_q5_k_with_encoder: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_q5_k_with_encoder: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -632,7 +658,11 @@ pub fn encode_q5_k(src: &[f32], dst: &mut [u8]) {
 
 /// Importance-matrix-aware Q5_K encoder. See [`encode_q4_k_imatrix`].
 pub fn encode_q5_k_imatrix(src: &[f32], dst: &mut [u8], imatrix: Option<&[f32]>) {
-    assert_eq!(src.len() % QK_K, 0, "encode_q5_k: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_q5_k: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -663,7 +693,11 @@ pub fn encode_q5_k_imatrix(src: &[f32], dst: &mut [u8], imatrix: Option<&[f32]>)
         let d_super = max_d / 63.0;
         let dmin_super = max_m / 63.0;
         let id_super = if d_super > 0.0 { 1.0 / d_super } else { 0.0 };
-        let im_super = if dmin_super > 0.0 { 1.0 / dmin_super } else { 0.0 };
+        let im_super = if dmin_super > 0.0 {
+            1.0 / dmin_super
+        } else {
+            0.0
+        };
 
         let mut sc = [0u8; 8];
         let mut mn = [0u8; 8];
@@ -793,7 +827,11 @@ pub fn encode_q3_k_with_encoder(
     dst: &mut [u8],
     encoder: &dyn crate::iq_gpu::IqGpuEncoder,
 ) {
-    assert_eq!(src.len() % QK_K, 0, "encode_q3_k_with_encoder: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_q3_k_with_encoder: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -807,7 +845,11 @@ pub fn encode_q3_k_with_encoder(
 }
 
 pub fn encode_q3_k(src: &[f32], dst: &mut [u8]) {
-    assert_eq!(src.len() % QK_K, 0, "encode_q3_k: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_q3_k: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -839,7 +881,11 @@ pub fn encode_q3_k(src: &[f32], dst: &mut [u8]) {
         let signed_max = sub_scales
             .iter()
             .fold(0f32, |acc, &s| if s.abs() > acc.abs() { s } else { acc });
-        let iscale = if signed_max != 0.0 { -32.0 / signed_max } else { 0.0 };
+        let iscale = if signed_max != 0.0 {
+            -32.0 / signed_max
+        } else {
+            0.0
+        };
         let d_super = if iscale != 0.0 { 1.0 / iscale } else { 0.0 };
 
         let mut scales_q = [0i8; N_SUB_BLOCKS_16];
@@ -968,7 +1014,11 @@ pub fn encode_q2_k(src: &[f32], dst: &mut [u8]) {
 
 /// Importance-matrix-aware Q2_K encoder. See [`encode_q4_k_imatrix`].
 pub fn encode_q2_k_imatrix(src: &[f32], dst: &mut [u8], imatrix: Option<&[f32]>) {
-    assert_eq!(src.len() % QK_K, 0, "encode_q2_k: src.len() must be multiple of 256");
+    assert_eq!(
+        src.len() % QK_K,
+        0,
+        "encode_q2_k: src.len() must be multiple of 256"
+    );
     let n_blocks = src.len() / QK_K;
     assert_eq!(
         dst.len(),
@@ -1001,7 +1051,11 @@ pub fn encode_q2_k_imatrix(src: &[f32], dst: &mut [u8], imatrix: Option<&[f32]>)
         let d_super = max_d / 15.0;
         let dmin_super = max_m / 15.0;
         let id_super = if d_super > 0.0 { 1.0 / d_super } else { 0.0 };
-        let im_super = if dmin_super > 0.0 { 1.0 / dmin_super } else { 0.0 };
+        let im_super = if dmin_super > 0.0 {
+            1.0 / dmin_super
+        } else {
+            0.0
+        };
 
         let mut scales = [0u8; 16];
         for k in 0..N_SUB_BLOCKS_16 {
@@ -1253,11 +1307,17 @@ mod tests {
         let n = 2 * QK_K;
         let src = make_row(n, 4.0, 99);
         let ones = vec![1.0f32; n];
-        let (mut a, mut b) = (vec![0u8; 2 * BLOCK_Q5_K_BYTES], vec![0u8; 2 * BLOCK_Q5_K_BYTES]);
+        let (mut a, mut b) = (
+            vec![0u8; 2 * BLOCK_Q5_K_BYTES],
+            vec![0u8; 2 * BLOCK_Q5_K_BYTES],
+        );
         encode_q5_k(&src, &mut a);
         encode_q5_k_imatrix(&src, &mut b, Some(&ones));
         assert_eq!(a, b, "Q5_K uniform-weight imatrix must match unweighted");
-        let (mut a, mut b) = (vec![0u8; 2 * BLOCK_Q2_K_BYTES], vec![0u8; 2 * BLOCK_Q2_K_BYTES]);
+        let (mut a, mut b) = (
+            vec![0u8; 2 * BLOCK_Q2_K_BYTES],
+            vec![0u8; 2 * BLOCK_Q2_K_BYTES],
+        );
         encode_q2_k(&src, &mut a);
         encode_q2_k_imatrix(&src, &mut b, Some(&ones));
         assert_eq!(a, b, "Q2_K uniform-weight imatrix must match unweighted");
@@ -1287,7 +1347,9 @@ mod tests {
         dequant::dequant_q4_k(&enc_u, &mut dec_u);
         dequant::dequant_q4_k(&enc_w, &mut dec_w);
         let werr = |dec: &[f32]| -> f64 {
-            (0..n).map(|i| (w[i] as f64) * ((dec[i] - src[i]) as f64).powi(2)).sum()
+            (0..n)
+                .map(|i| (w[i] as f64) * ((dec[i] - src[i]) as f64).powi(2))
+                .sum()
         };
         let eu = werr(&dec_u);
         let ew = werr(&dec_w);

@@ -390,7 +390,16 @@ pub fn delta_rule_step_f32(
 ) {
     let mut v_tilde = vec![0.0f32; head_v_dim];
     delta_rule_step_f32_with_scratch(
-        q, k, v, g, beta, state, out, head_qk_dim, head_v_dim, &mut v_tilde,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        out,
+        head_qk_dim,
+        head_v_dim,
+        &mut v_tilde,
     );
 }
 
@@ -430,7 +439,16 @@ pub fn delta_rule_step_f32_with_scratch(
             // SAFETY: runtime feature detection above; lengths asserted.
             unsafe {
                 delta_rule_step_f32_with_scratch_avx512(
-                    q, k, v, g, beta, state, out, head_qk_dim, head_v_dim, v_tilde,
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    state,
+                    out,
+                    head_qk_dim,
+                    head_v_dim,
+                    v_tilde,
                 )
             };
             return;
@@ -439,7 +457,16 @@ pub fn delta_rule_step_f32_with_scratch(
             // SAFETY: runtime feature detection above; lengths asserted.
             unsafe {
                 delta_rule_step_f32_with_scratch_avx2(
-                    q, k, v, g, beta, state, out, head_qk_dim, head_v_dim, v_tilde,
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    state,
+                    out,
+                    head_qk_dim,
+                    head_v_dim,
+                    v_tilde,
                 )
             };
             return;
@@ -454,14 +481,32 @@ pub fn delta_rule_step_f32_with_scratch(
         // SAFETY: NEON is always available on aarch64; lengths asserted above.
         unsafe {
             delta_rule_step_f32_with_scratch_neon(
-                q, k, v, g, beta, state, out, head_qk_dim, head_v_dim, v_tilde,
+                q,
+                k,
+                v,
+                g,
+                beta,
+                state,
+                out,
+                head_qk_dim,
+                head_v_dim,
+                v_tilde,
             )
         };
         return;
     }
     #[cfg(not(target_arch = "aarch64"))]
     delta_rule_step_f32_with_scratch_scalar(
-        q, k, v, g, beta, state, out, head_qk_dim, head_v_dim, v_tilde,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        out,
+        head_qk_dim,
+        head_v_dim,
+        v_tilde,
     );
 }
 
@@ -985,12 +1030,7 @@ unsafe fn delta_rule_step_f32_with_scratch_neon(
 /// already exist). Operates on a single head's vector.
 ///
 /// `norm_weight` is the learned per-channel scale (length `head_v_dim`).
-pub fn gated_rmsnorm_f32_inplace(
-    x: &mut [f32],
-    gate: &[f32],
-    norm_weight: &[f32],
-    eps: f32,
-) {
+pub fn gated_rmsnorm_f32_inplace(x: &mut [f32], gate: &[f32], norm_weight: &[f32], eps: f32) {
     let mut scratch = vec![0.0f32; x.len()];
     gated_rmsnorm_f32_scratch(x, gate, norm_weight, eps, &mut scratch);
 }
@@ -1194,16 +1234,32 @@ pub fn delta_net_layer_forward_f32(
 ) {
     assert_eq!(hidden_in.len(), d_model);
     assert_eq!(out.len(), d_model);
-    assert_eq!(n_qk_heads * head_qk_dim, d_model, "QK head dims must sum to d_model");
-    assert_eq!(n_v_heads * head_v_dim, ssm_inner, "V head dims must sum to ssm_inner");
+    assert_eq!(
+        n_qk_heads * head_qk_dim,
+        d_model,
+        "QK head dims must sum to d_model"
+    );
+    assert_eq!(
+        n_v_heads * head_v_dim,
+        ssm_inner,
+        "V head dims must sum to ssm_inner"
+    );
     assert_eq!(ssm_a_log.len(), n_v_heads);
     assert_eq!(ssm_dt_bias.len(), n_v_heads);
     assert_eq!(ssm_norm_weight.len(), head_v_dim);
-    assert_eq!(n_v_heads % n_qk_heads, 0, "V heads must be a multiple of QK heads (GQA grouping)");
+    assert_eq!(
+        n_v_heads % n_qk_heads,
+        0,
+        "V heads must be a multiple of QK heads (GQA grouping)"
+    );
     let v_per_qk = n_v_heads / n_qk_heads;
 
     let qkv_dim = 2 * ssm_inner; // q (d_model) + k (d_model) + v (ssm_inner)
-    assert_eq!(d_model + d_model + ssm_inner, qkv_dim, "qkv dim layout mismatch");
+    assert_eq!(
+        d_model + d_model + ssm_inner,
+        qkv_dim,
+        "qkv dim layout mismatch"
+    );
     assert_eq!(w_attn_qkv.len(), qkv_dim * d_model);
     assert_eq!(w_attn_gate.len(), ssm_inner * d_model);
     assert_eq!(w_ssm_conv1d.len(), conv_kernel * qkv_dim);
@@ -1414,15 +1470,15 @@ pub fn ssm_chunk_current() -> usize {
 /// they can be built in parallel. Row-major throughout; `qk`/`vd` are
 /// `head_qk_dim`/`head_v_dim`. See the module-level derivation for the math.
 struct ChunkPlan {
-    start: usize,          // first (global) token index of this chunk
-    len: usize,            // L, tokens in this chunk
-    u_local: Vec<f32>,     // [L*vd]  (I+T)^{-1} diag(β) V
-    w: Vec<f32>,           // [L*qk]  (I+T)^{-1} P,  P_t = -β_t Γ_t k_t
+    start: usize,            // first (global) token index of this chunk
+    len: usize,              // L, tokens in this chunk
+    u_local: Vec<f32>,       // [L*vd]  (I+T)^{-1} diag(β) V
+    w: Vec<f32>,             // [L*qk]  (I+T)^{-1} P,  P_t = -β_t Γ_t k_t
     o_intra_local: Vec<f32>, // [L*vd]  B · U_local
-    bw: Vec<f32>,          // [L*qk]  B · W
-    qg: Vec<f32>,          // [L*qk]  Q̂_t = Γ_t q_t   (for the inter-chunk output)
-    kd: Vec<f32>,          // [L*qk]  K̂_r = exp(cg_{L-1}-cg_r) k_r (state carry)
-    last_decay: f32,       // Γ_{L-1} = exp(cg_{L-1})
+    bw: Vec<f32>,            // [L*qk]  B · W
+    qg: Vec<f32>,            // [L*qk]  Q̂_t = Γ_t q_t   (for the inter-chunk output)
+    kd: Vec<f32>,            // [L*qk]  K̂_r = exp(cg_{L-1}-cg_r) k_r (state carry)
+    last_decay: f32,         // Γ_{L-1} = exp(cg_{L-1})
 }
 
 /// Build one chunk's [`ChunkPlan`] (the parallel, `S_in`-independent work).
@@ -1628,7 +1684,11 @@ pub fn delta_rule_prefill_chunked_with_chunk(
         return;
     }
 
-    let l0 = if chunk_len == 0 { SSM_CHUNK_DEFAULT } else { chunk_len };
+    let l0 = if chunk_len == 0 {
+        SSM_CHUNK_DEFAULT
+    } else {
+        chunk_len
+    };
 
     // Exact per-token fallback: chunk length 1, or a trivially short
     // sequence. Guarantees decode and `RUSTLLAMA_SSM_CHUNK=1` are bitwise
@@ -1773,16 +1833,8 @@ mod tests {
         // matches the GGUF `ssm_conv1d.weight` layout (ne=[kernel,channels]).
         // c=0: k=0,1,2 → 0.5, 0.25, 0.1
         // c=1: k=0,1,2 → 1.0, 2.0, 3.0
-        let weight: Vec<f32> = vec![
-            0.5, 0.25, 0.1,
-            1.0, 2.0, 3.0,
-        ];
-        let inputs = [
-            [1.0_f32, 1.0_f32],
-            [2.0, 2.0],
-            [3.0, 3.0],
-            [4.0, 4.0],
-        ];
+        let weight: Vec<f32> = vec![0.5, 0.25, 0.1, 1.0, 2.0, 3.0];
+        let inputs = [[1.0_f32, 1.0_f32], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]];
         let mut state = vec![0.0f32; (kernel - 1) * channels];
         let mut last_out = vec![0.0f32; channels];
         for x in &inputs {
@@ -1920,8 +1972,14 @@ mod tests {
             &mut conv_state,
             &mut rec_state,
             &mut out_a,
-            d_model, ssm_inner, n_qk_heads, n_v_heads,
-            head_qk_dim, head_v_dim, conv_kernel, eps,
+            d_model,
+            ssm_inner,
+            n_qk_heads,
+            n_v_heads,
+            head_qk_dim,
+            head_v_dim,
+            conv_kernel,
+            eps,
         );
 
         // State should now reflect the first token's contribution.
@@ -1953,10 +2011,20 @@ mod tests {
             &mut conv_state,
             &mut rec_state,
             &mut out_b,
-            d_model, ssm_inner, n_qk_heads, n_v_heads,
-            head_qk_dim, head_v_dim, conv_kernel, eps,
+            d_model,
+            ssm_inner,
+            n_qk_heads,
+            n_v_heads,
+            head_qk_dim,
+            head_v_dim,
+            conv_kernel,
+            eps,
         );
-        let diff: f32 = out_a.iter().zip(out_b.iter()).map(|(a, b)| (a - b).abs()).sum();
+        let diff: f32 = out_a
+            .iter()
+            .zip(out_b.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
         assert!(diff > 0.0, "output should change between distinct inputs");
     }
 
@@ -1973,11 +2041,31 @@ mod tests {
         let mut state = vec![0.0f32; 1];
         let mut out = vec![0.0f32; 1];
         // Pass 1: v_tilde = (1 - 0*1)*1 = 1. S = 0 + 1*1 = 1. Out = 1*1 = 1.
-        delta_rule_step_f32(&[1.0], &k, &v, 0.0, 1.0, &mut state, &mut out, head_qk, head_v);
+        delta_rule_step_f32(
+            &[1.0],
+            &k,
+            &v,
+            0.0,
+            1.0,
+            &mut state,
+            &mut out,
+            head_qk,
+            head_v,
+        );
         assert!((out[0] - 1.0).abs() < 1e-5);
         // Pass 2: prior S=1. v_tilde = (1 - 1*1)*1 = 0. S = 1 + 0 = 1.
         // Out = 1 * 1 = 1 (unchanged — the rule has "learned" v|k).
-        delta_rule_step_f32(&[1.0], &k, &v, 0.0, 1.0, &mut state, &mut out, head_qk, head_v);
+        delta_rule_step_f32(
+            &[1.0],
+            &k,
+            &v,
+            0.0,
+            1.0,
+            &mut state,
+            &mut out,
+            head_qk,
+            head_v,
+        );
         assert!((out[0] - 1.0).abs() < 1e-5);
         assert!((state[0] - 1.0).abs() < 1e-5);
     }
@@ -2000,7 +2088,15 @@ mod tests {
     /// carried) for dims that both hit and miss the SIMD lane width.
     #[test]
     fn delta_rule_simd_matches_scalar() {
-        for &(qd, vd) in &[(1usize, 1usize), (3, 5), (8, 8), (7, 9), (16, 16), (128, 128), (17, 131)] {
+        for &(qd, vd) in &[
+            (1usize, 1usize),
+            (3, 5),
+            (8, 8),
+            (7, 9),
+            (16, 16),
+            (128, 128),
+            (17, 131),
+        ] {
             let mut st_ref = vec![0.0f32; qd * vd];
             let mut st_simd = vec![0.0f32; qd * vd];
             let mut vt_ref = vec![0.0f32; vd];
@@ -2015,16 +2111,35 @@ mod tests {
                 let g = rvec(1, base + 4)[0]; // log-decay in [-0.5, 0)
                 let beta = 0.5 + 0.5 * rvec(1, base + 5)[0].abs();
                 delta_rule_step_f32_with_scratch_scalar(
-                    &q, &k, &v, g, beta, &mut st_ref, &mut out_ref, qd, vd, &mut vt_ref,
+                    &q,
+                    &k,
+                    &v,
+                    g,
+                    beta,
+                    &mut st_ref,
+                    &mut out_ref,
+                    qd,
+                    vd,
+                    &mut vt_ref,
                 );
                 delta_rule_step_f32_with_scratch(
-                    &q, &k, &v, g, beta, &mut st_simd, &mut out_simd, qd, vd, &mut vt_simd,
+                    &q,
+                    &k,
+                    &v,
+                    g,
+                    beta,
+                    &mut st_simd,
+                    &mut out_simd,
+                    qd,
+                    vd,
+                    &mut vt_simd,
                 );
                 for j in 0..vd {
                     assert!(
                         (out_ref[j] - out_simd[j]).abs() < 1e-4,
                         "out mismatch qd={qd} vd={vd} t={t} j={j}: ref={} simd={}",
-                        out_ref[j], out_simd[j]
+                        out_ref[j],
+                        out_simd[j]
                     );
                 }
                 for (a, b) in st_ref.iter().zip(st_simd.iter()) {
@@ -2056,7 +2171,16 @@ mod tests {
                 let g = rvec(1, base + 4)[0];
                 let beta = 0.7;
                 delta_rule_step_f32_with_scratch_scalar(
-                    &q, &k, &v, g, beta, &mut st_ref, &mut o_ref, qd, vd, &mut vt,
+                    &q,
+                    &k,
+                    &v,
+                    g,
+                    beta,
+                    &mut st_ref,
+                    &mut o_ref,
+                    qd,
+                    vd,
+                    &mut vt,
                 );
                 unsafe {
                     delta_rule_step_f32_with_scratch_avx2(
@@ -2064,7 +2188,10 @@ mod tests {
                     );
                 }
                 for j in 0..vd {
-                    assert!((o_ref[j] - o_s[j]).abs() < 1e-4, "avx2 out qd={qd} vd={vd} j={j}");
+                    assert!(
+                        (o_ref[j] - o_s[j]).abs() < 1e-4,
+                        "avx2 out qd={qd} vd={vd} j={j}"
+                    );
                 }
             }
         }
@@ -2091,7 +2218,16 @@ mod tests {
                 let g = rvec(1, base + 4)[0];
                 let beta = 0.4;
                 delta_rule_step_f32_with_scratch_scalar(
-                    &q, &k, &v, g, beta, &mut st_ref, &mut o_ref, qd, vd, &mut vt,
+                    &q,
+                    &k,
+                    &v,
+                    g,
+                    beta,
+                    &mut st_ref,
+                    &mut o_ref,
+                    qd,
+                    vd,
+                    &mut vt,
                 );
                 unsafe {
                     delta_rule_step_f32_with_scratch_avx512(
@@ -2099,7 +2235,10 @@ mod tests {
                     );
                 }
                 for j in 0..vd {
-                    assert!((o_ref[j] - o_s[j]).abs() < 1e-4, "avx512 out qd={qd} vd={vd} j={j}");
+                    assert!(
+                        (o_ref[j] - o_s[j]).abs() < 1e-4,
+                        "avx512 out qd={qd} vd={vd} j={j}"
+                    );
                 }
                 for (a, b) in st_ref.iter().zip(st_s.iter()) {
                     assert!((a - b).abs() < 1e-4, "avx512 state qd={qd} vd={vd}");
@@ -2131,7 +2270,16 @@ mod tests {
                 let g = rvec(1, base + 4)[0];
                 let beta = 0.6;
                 delta_rule_step_f32_with_scratch_scalar(
-                    &q, &k, &v, g, beta, &mut st_ref, &mut o_ref, qd, vd, &mut vt,
+                    &q,
+                    &k,
+                    &v,
+                    g,
+                    beta,
+                    &mut st_ref,
+                    &mut o_ref,
+                    qd,
+                    vd,
+                    &mut vt,
                 );
                 // SAFETY: NEON is baseline on aarch64; lengths match above.
                 unsafe {
@@ -2140,7 +2288,10 @@ mod tests {
                     );
                 }
                 for j in 0..vd {
-                    assert!((o_ref[j] - o_s[j]).abs() < 1e-4, "neon out qd={qd} vd={vd} j={j}");
+                    assert!(
+                        (o_ref[j] - o_s[j]).abs() < 1e-4,
+                        "neon out qd={qd} vd={vd} j={j}"
+                    );
                 }
                 for (a, b) in st_ref.iter().zip(st_s.iter()) {
                     assert!((a - b).abs() < 1e-4, "neon state qd={qd} vd={vd}");
@@ -2163,7 +2314,10 @@ mod tests {
             unsafe { l2norm_f32_inplace_neon(&mut a, 1e-6) };
             l2norm_f32_inplace_scalar(&mut b, 1e-6);
             for (i, (av, bv)) in a.iter().zip(b.iter()).enumerate() {
-                assert!((av - bv).abs() < 1e-5, "l2norm neon d={d} i={i}: neon={av} scalar={bv}");
+                assert!(
+                    (av - bv).abs() < 1e-5,
+                    "l2norm neon d={d} i={i}: neon={av} scalar={bv}"
+                );
             }
         }
     }
@@ -2177,7 +2331,10 @@ mod tests {
             l2norm_f32_inplace(&mut a, 1e-6);
             l2norm_f32_inplace_scalar(&mut b, 1e-6);
             for (i, (av, bv)) in a.iter().zip(b.iter()).enumerate() {
-                assert!((av - bv).abs() < 1e-5, "l2norm d={d} i={i}: simd={av} scalar={bv}");
+                assert!(
+                    (av - bv).abs() < 1e-5,
+                    "l2norm d={d} i={i}: simd={av} scalar={bv}"
+                );
             }
         }
     }
@@ -2193,7 +2350,10 @@ mod tests {
             silu_f32_inplace_scalar(&mut b);
             for (i, (av, bv)) in a.iter().zip(b.iter()).enumerate() {
                 // expf-approx budget (matches the crate's silu_mul test).
-                assert!((av - bv).abs() < 1e-3, "silu d={d} i={i}: simd={av} scalar={bv}");
+                assert!(
+                    (av - bv).abs() < 1e-3,
+                    "silu d={d} i={i}: simd={av} scalar={bv}"
+                );
             }
         }
     }
@@ -2213,7 +2373,10 @@ mod tests {
             let mut b = vec![0.0f32; d];
             gated_silu_mul_scalar(&mut b, &tmp, &gate);
             for (i, (av, bv)) in a.iter().zip(b.iter()).enumerate() {
-                assert!((av - bv).abs() < 1e-3, "gated_rmsnorm d={d} i={i}: simd={av} scalar={bv}");
+                assert!(
+                    (av - bv).abs() < 1e-3,
+                    "gated_rmsnorm d={d} i={i}: simd={av} scalar={bv}"
+                );
             }
         }
     }
@@ -2322,8 +2485,14 @@ mod tests {
             l2norm_f32_inplace(&mut q[t * qk..(t + 1) * qk], 1e-6);
             l2norm_f32_inplace(&mut k[t * qk..(t + 1) * qk], 1e-6);
         }
-        let g: Vec<f32> = rvec(t_len, 42345).iter().map(|x| -0.1 - 0.2 * x.abs()).collect();
-        let beta: Vec<f32> = rvec(t_len, 52345).iter().map(|x| 0.2 + 0.6 * x.abs()).collect();
+        let g: Vec<f32> = rvec(t_len, 42345)
+            .iter()
+            .map(|x| -0.1 - 0.2 * x.abs())
+            .collect();
+        let beta: Vec<f32> = rvec(t_len, 52345)
+            .iter()
+            .map(|x| 0.2 + 0.6 * x.abs())
+            .collect();
 
         // Dispatched per-token reference.
         let mut st_ref = vec![0.0f32; qk * vd];

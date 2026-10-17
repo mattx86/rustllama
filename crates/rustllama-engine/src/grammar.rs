@@ -118,7 +118,9 @@ impl Schema {
                 }),
             },
             Some("integer") => Schema::Number { integer_only: true },
-            Some("number") => Schema::Number { integer_only: false },
+            Some("number") => Schema::Number {
+                integer_only: false,
+            },
             Some("boolean") => Schema::Boolean,
             Some("null") => Schema::Null,
             Some("object") => {
@@ -297,15 +299,13 @@ impl CommentStyle {
         let l = language.trim().to_ascii_lowercase();
         match l.as_str() {
             // C-family
-            "c" | "cpp" | "c++" | "cxx" | "rust" | "rs" | "javascript"
-            | "js" | "typescript" | "ts" | "java" | "go" | "golang"
-            | "swift" | "kotlin" | "kt" | "csharp" | "cs" | "scala"
-            | "dart" | "php" | "objc" | "objective-c" => Self::CFamily,
+            "c" | "cpp" | "c++" | "cxx" | "rust" | "rs" | "javascript" | "js" | "typescript"
+            | "ts" | "java" | "go" | "golang" | "swift" | "kotlin" | "kt" | "csharp" | "cs"
+            | "scala" | "dart" | "php" | "objc" | "objective-c" => Self::CFamily,
             // Hash-only
-            "python" | "py" | "ruby" | "rb" | "bash" | "sh" | "zsh"
-            | "fish" | "shell" | "perl" | "pl" | "r" | "elixir" | "ex"
-            | "yaml" | "yml" | "toml" | "makefile" | "make" | "dockerfile"
-            | "ini" | "conf" | "config" | "nix" => Self::Hash,
+            "python" | "py" | "ruby" | "rb" | "bash" | "sh" | "zsh" | "fish" | "shell" | "perl"
+            | "pl" | "r" | "elixir" | "ex" | "yaml" | "yml" | "toml" | "makefile" | "make"
+            | "dockerfile" | "ini" | "conf" | "config" | "nix" => Self::Hash,
             // Default — recognize neither.
             _ => Self::None,
         }
@@ -316,17 +316,13 @@ impl CommentStyle {
             Self::None => false,
             Self::CFamily => b == b'/' && prev == Some(b'/'),
             Self::Hash => b == b'#',
-            Self::HashAndCFamily => {
-                b == b'#' || (b == b'/' && prev == Some(b'/'))
-            }
+            Self::HashAndCFamily => b == b'#' || (b == b'/' && prev == Some(b'/')),
         }
     }
 
     fn block_comment_starter(self, b: u8, prev: Option<u8>) -> bool {
         match self {
-            Self::CFamily | Self::HashAndCFamily => {
-                b == b'*' && prev == Some(b'/')
-            }
+            Self::CFamily | Self::HashAndCFamily => b == b'*' && prev == Some(b'/'),
             _ => false,
         }
     }
@@ -470,9 +466,7 @@ impl CodeGrammarParser {
         // Line comments are terminable (the `\n` would close it
         // eventually; an early stop on a balanced state is fine
         // since the model emitted EOS deliberately).
-        self.stack.is_empty()
-            && self.in_string.is_none()
-            && !self.in_block_comment
+        self.stack.is_empty() && self.in_string.is_none() && !self.in_block_comment
     }
 }
 
@@ -940,12 +934,15 @@ impl JsonSchemaParser {
             }
         }
         // Are we at an object-close position? If so, check required keys.
-        if b == b'}' && matches!(json_state, State::ExpectCommaOrClose | State::ExpectFirstKeyOrClose) {
+        if b == b'}'
+            && matches!(
+                json_state,
+                State::ExpectCommaOrClose | State::ExpectFirstKeyOrClose
+            )
+        {
             if let Some(frame) = self.frames.last() {
                 if let Schema::Object { required, .. } = &frame.schema {
-                    let missing = required
-                        .iter()
-                        .any(|k| !frame.keys_seen.contains(k));
+                    let missing = required.iter().any(|k| !frame.keys_seen.contains(k));
                     if missing {
                         return Some(true);
                     }
@@ -955,10 +952,7 @@ impl JsonSchemaParser {
         // Are we at a key position? If so, the schema's properties
         // dictate which keys are allowed (when additionalProperties
         // is false).
-        if matches!(
-            json_state,
-            State::ExpectFirstKeyOrClose | State::ExpectKey
-        ) {
+        if matches!(json_state, State::ExpectFirstKeyOrClose | State::ExpectKey) {
             if b == b'"' {
                 // Accept — we'll constrain on the key bytes below.
                 return None;
@@ -1194,7 +1188,11 @@ impl JsonParser {
         }
         matches!(
             self.state,
-            State::InNumber { saw_digit: true, last_was_e: false, .. }
+            State::InNumber {
+                saw_digit: true,
+                last_was_e: false,
+                ..
+            }
         )
     }
 
@@ -1742,7 +1740,10 @@ mod tests {
         let mut sampler_unconstrained = Sampler::new(SamplingParams::default());
         let mut logits_copy = vec![1.0f32, 1.0, 100.0, 1.0];
         let id_bad = sampler_unconstrained.sample(&mut logits_copy, &[]);
-        assert_eq!(id_bad, 2, "control: unconstrained sampler should pick `garbage`");
+        assert_eq!(
+            id_bad, 2,
+            "control: unconstrained sampler should pick `garbage`"
+        );
     }
 
     fn schema_accepts(schema: Schema, s: &str) -> bool {
@@ -1822,7 +1823,9 @@ mod tests {
 
     #[test]
     fn schema_top_level_number_rejects_string() {
-        let schema = Schema::Number { integer_only: false };
+        let schema = Schema::Number {
+            integer_only: false,
+        };
         assert!(!schema_accepts(schema, r#""hello""#));
     }
 
@@ -1855,7 +1858,15 @@ mod tests {
     #[test]
     fn schema_mask_rejects_wrong_value_start_token() {
         // Schema: { type: object, properties: {age: {type: number}}, required: [age] }
-        let schema = obj_schema(&[("age", Schema::Number { integer_only: false })], &["age"]);
+        let schema = obj_schema(
+            &[(
+                "age",
+                Schema::Number {
+                    integer_only: false,
+                },
+            )],
+            &["age"],
+        );
         // After `{"age":`, a `"` (start of string) should be rejected
         // because the value must be a number.
         let mut p = JsonSchemaParser::new(schema);
@@ -1877,7 +1888,9 @@ mod tests {
         let schema = Schema::Object {
             properties: [(
                 "age".to_string(),
-                Schema::Number { integer_only: false },
+                Schema::Number {
+                    integer_only: false,
+                },
             )]
             .into_iter()
             .collect(),
@@ -1919,12 +1932,9 @@ mod tests {
     #[test]
     fn schema_strict_mode_rejects_unknown_keys() {
         let schema = Schema::Object {
-            properties: [(
-                "a".to_string(),
-                Schema::String { enum_values: None },
-            )]
-            .into_iter()
-            .collect(),
+            properties: [("a".to_string(), Schema::String { enum_values: None })]
+                .into_iter()
+                .collect(),
             required: ["a".to_string()].into_iter().collect(),
             additional: false,
         };
@@ -2115,7 +2125,10 @@ mod tests {
             step_str(&mut p, "fn f() {\n    // ( unmatched in comment\n}"),
             Step::Accept
         ));
-        assert!(p.can_terminate_now(), "comment-protected `(` shouldn't leave stack non-empty");
+        assert!(
+            p.can_terminate_now(),
+            "comment-protected `(` shouldn't leave stack non-empty"
+        );
     }
 
     #[test]
@@ -2207,7 +2220,11 @@ mod tests {
 
     fn step_regex(p: &mut super::RegexGrammarParser, s: &str) {
         for &b in s.as_bytes() {
-            assert_eq!(p.step(b), Step::Accept, "byte {b:?} rejected on input {s:?}");
+            assert_eq!(
+                p.step(b),
+                Step::Accept,
+                "byte {b:?} rejected on input {s:?}"
+            );
         }
     }
 
@@ -2223,7 +2240,10 @@ mod tests {
     fn regex_accepts_matching_input_and_terminates_at_match() {
         // Pattern: US phone numbers like `123-456-7890`.
         let mut p = super::RegexGrammarParser::new(r"^\d{3}-\d{3}-\d{4}$").unwrap();
-        assert!(!p.can_terminate_now(), "empty input is not a complete match");
+        assert!(
+            !p.can_terminate_now(),
+            "empty input is not a complete match"
+        );
         step_regex(&mut p, "415-555-0100");
         assert!(p.can_terminate_now(), "valid phone is a complete match");
     }
@@ -2256,14 +2276,13 @@ mod tests {
     #[test]
     fn regex_grammar_mask_rejects_token_with_wrong_first_byte() {
         // Pattern: must start with digit, vocab: 0 = "5x", 1 = "5", 2 = "ab".
-        let mask =
-            super::GrammarMask::new_regex(r"^\d+$", 3, None, |id| match id {
-                0 => b"5x".to_vec(),
-                1 => b"5".to_vec(),
-                2 => b"ab".to_vec(),
-                _ => Vec::new(),
-            })
-            .unwrap();
+        let mask = super::GrammarMask::new_regex(r"^\d+$", 3, None, |id| match id {
+            0 => b"5x".to_vec(),
+            1 => b"5".to_vec(),
+            2 => b"ab".to_vec(),
+            _ => Vec::new(),
+        })
+        .unwrap();
         assert!(!mask.accepts(0), "5x has trailing non-digit → reject");
         assert!(mask.accepts(1), "5 is a digit → accept");
         assert!(!mask.accepts(2), "ab → reject");
@@ -2280,7 +2299,10 @@ mod tests {
         // ParserKind via GrammarMask to exercise the path.
         let _ = p;
         let mask = super::GrammarMask::new_regex(r"^\d+$", 1, None, |_| Vec::new()).unwrap();
-        assert!(!mask.is_done(), "regex grammar must never report is_done=true");
+        assert!(
+            !mask.is_done(),
+            "regex grammar must never report is_done=true"
+        );
     }
 
     /// P15 anchor: a GBNF grammar compiled into the existing mask machinery
@@ -2323,17 +2345,21 @@ mod tests {
         // No `root` rule.
         assert!(super::GrammarMask::new_gbnf("foo ::= \"x\"", 1, None, |_| Vec::new()).is_err());
         // Undefined rule reference.
-        assert!(super::GrammarMask::new_gbnf("root ::= undefined_rule", 1, None, |_| {
-            Vec::new()
-        })
-        .is_err());
+        assert!(
+            super::GrammarMask::new_gbnf("root ::= undefined_rule", 1, None, |_| { Vec::new() })
+                .is_err()
+        );
     }
 
     /// P15: GBNF is stream-shaped (a rule may accept an unbounded suffix), so
     /// `is_done` is always false — EOS is governed by `can_terminate_now`.
     #[test]
     fn gbnf_is_done_always_false() {
-        let mask = super::GrammarMask::new_gbnf("root ::= [a-z]+", 1, None, |_| Vec::new()).unwrap();
-        assert!(!mask.is_done(), "GBNF grammar must never report is_done=true");
+        let mask =
+            super::GrammarMask::new_gbnf("root ::= [a-z]+", 1, None, |_| Vec::new()).unwrap();
+        assert!(
+            !mask.is_done(),
+            "GBNF grammar must never report is_done=true"
+        );
     }
 }

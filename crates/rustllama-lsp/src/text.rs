@@ -133,7 +133,7 @@ mod tests {
         let text = "ab😀cd";
         assert_eq!(position_to_byte_offset(text, pos(0, 0)), Some(0));
         assert_eq!(position_to_byte_offset(text, pos(0, 2)), Some(2)); // after "ab"
-        // The emoji counts as 2 UTF-16 units; cursor at char 4 is after it.
+                                                                       // The emoji counts as 2 UTF-16 units; cursor at char 4 is after it.
         assert_eq!(position_to_byte_offset(text, pos(0, 4)), Some(6)); // after "ab😀"
         assert_eq!(position_to_byte_offset(text, pos(0, 5)), Some(7));
     }

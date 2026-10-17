@@ -83,7 +83,10 @@ pub struct CacheBlendConfig {
 
 impl Default for CacheBlendConfig {
     fn default() -> Self {
-        Self { recompute_ratio: 0.15, selection_layer: 1 }
+        Self {
+            recompute_ratio: 0.15,
+            selection_layer: 1,
+        }
     }
 }
 
@@ -178,12 +181,19 @@ impl ChunkKvCache {
         self.cur_bytes += bytes;
         self.map.insert(
             hash,
-            ChunkEntry { snapshot, bytes, last_used: self.clock },
+            ChunkEntry {
+                snapshot,
+                bytes,
+                last_used: self.clock,
+            },
         );
     }
 
     fn lru_key(&self) -> Option<u64> {
-        self.map.iter().min_by_key(|(_, e)| e.last_used).map(|(&k, _)| k)
+        self.map
+            .iter()
+            .min_by_key(|(_, e)| e.last_used)
+            .map(|(&k, _)| k)
     }
 
     pub fn len(&self) -> usize {
@@ -208,7 +218,12 @@ mod tests {
     use super::*;
     use crate::llama_arch::{KvBuf, KvDtype, KvLayer};
 
-    fn mk_snap(n_layers: usize, n_kv_heads: usize, head_dim: usize, prefix_len: usize) -> Arc<KvSnapshot> {
+    fn mk_snap(
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        prefix_len: usize,
+    ) -> Arc<KvSnapshot> {
         let per = n_kv_heads * prefix_len * head_dim;
         let layers = (0..n_layers)
             .map(|li| KvLayer::F32 {
@@ -227,8 +242,14 @@ mod tests {
 
     #[test]
     fn content_hash_is_order_sensitive() {
-        assert_eq!(chunk_content_hash(&[1, 2, 3]), chunk_content_hash(&[1, 2, 3]));
-        assert_ne!(chunk_content_hash(&[1, 2, 3]), chunk_content_hash(&[3, 2, 1]));
+        assert_eq!(
+            chunk_content_hash(&[1, 2, 3]),
+            chunk_content_hash(&[1, 2, 3])
+        );
+        assert_ne!(
+            chunk_content_hash(&[1, 2, 3]),
+            chunk_content_hash(&[3, 2, 1])
+        );
         assert_ne!(chunk_content_hash(&[1, 2, 3]), chunk_content_hash(&[1, 2]));
     }
 

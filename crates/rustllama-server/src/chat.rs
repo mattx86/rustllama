@@ -488,7 +488,6 @@ pub struct ChatResponse {
     pub system_fingerprint: String,
 }
 
-
 #[derive(Debug, Serialize)]
 pub struct ChatChoice {
     pub index: u32,
@@ -865,7 +864,10 @@ async fn chat_with_tools(state: AppState, req: ChatRequest) -> Response {
     };
 
     let mut sampling = build_sampling(&req);
-    let model_id = req.model.clone().unwrap_or_else(|| serving.model_id.clone());
+    let model_id = req
+        .model
+        .clone()
+        .unwrap_or_else(|| serving.model_id.clone());
     let tool_choice = parse_tool_choice(&req.tool_choice);
 
     // Normalize tools array — accept either `tools: [...]` (new) or
@@ -942,11 +944,9 @@ async fn chat_with_tools(state: AppState, req: ChatRequest) -> Response {
         .map(|ids| ids.len() as u32)
         .unwrap_or(0);
     // E2-ingress: clamp the generation budget to the context window.
-    if let Some((code, msg)) = crate::clamp_max_tokens_to_ctx(
-        &mut sampling,
-        prompt_tokens as usize,
-        shared_cpu.max_ctx(),
-    ) {
+    if let Some((code, msg)) =
+        crate::clamp_max_tokens_to_ctx(&mut sampling, prompt_tokens as usize, shared_cpu.max_ctx())
+    {
         return (code, msg).into_response();
     }
 
@@ -1036,11 +1036,7 @@ async fn chat_with_tools(state: AppState, req: ChatRequest) -> Response {
         None
     };
 
-    let fingerprint = crate::system_fingerprint(
-        &state.version,
-        &model_id,
-        kv_dtype_label(&cpu),
-    );
+    let fingerprint = crate::system_fingerprint(&state.version, &model_id, kv_dtype_label(&cpu));
     Json(ChatResponse {
         id: request_id(),
         object: "chat.completion",
@@ -1174,11 +1170,9 @@ async fn chat_stream_with_tools(state: AppState, req: ChatRequest) -> Response {
         .map(|ids| ids.len() as u32)
         .unwrap_or(0);
     // E2-ingress: clamp the generation budget to the context window.
-    if let Some((code, msg)) = crate::clamp_max_tokens_to_ctx(
-        &mut sampling,
-        prompt_tokens as usize,
-        shared_cpu.max_ctx(),
-    ) {
+    if let Some((code, msg)) =
+        crate::clamp_max_tokens_to_ctx(&mut sampling, prompt_tokens as usize, shared_cpu.max_ctx())
+    {
         return (code, msg).into_response();
     }
 
@@ -1667,11 +1661,7 @@ impl StreamingToolCallParser {
                         let index = self.next_call_index;
                         match parse_streaming_tool_call_body(&body, index) {
                             Some((id, name, args)) => {
-                                events.push(StreamEvent::ToolCallHeader {
-                                    index,
-                                    id,
-                                    name,
-                                });
+                                events.push(StreamEvent::ToolCallHeader { index, id, name });
                                 events.push(StreamEvent::ToolCallArgs { index, args });
                                 self.next_call_index += 1;
                             }
@@ -1716,11 +1706,17 @@ impl StreamingToolCallParser {
                 // reuse the non-streaming recovery so `<|python_tag|>` /
                 // `[TOOL_CALLS]` parse identically to the blocking path.
                 let full = format!("{}{}", self.alt_marker, self.buf);
-                events.extend(recover_streaming_tool_calls(&full, &mut self.next_call_index));
+                events.extend(recover_streaming_tool_calls(
+                    &full,
+                    &mut self.next_call_index,
+                ));
             }
             ParserState::MaybeJson => {
                 let full = std::mem::take(&mut self.buf);
-                events.extend(recover_streaming_tool_calls(&full, &mut self.next_call_index));
+                events.extend(recover_streaming_tool_calls(
+                    &full,
+                    &mut self.next_call_index,
+                ));
             }
         }
         events
@@ -2096,12 +2092,8 @@ pub(crate) fn parse_diff_blocks(raw: &str) -> Option<Vec<DiffBlock>> {
             None => break,
         };
 
-        let search = raw[after_open..sep_at]
-            .trim_end_matches('\n')
-            .to_string();
-        let replace = raw[after_sep..close_at]
-            .trim_end_matches('\n')
-            .to_string();
+        let search = raw[after_open..sep_at].trim_end_matches('\n').to_string();
+        let replace = raw[after_sep..close_at].trim_end_matches('\n').to_string();
 
         out.push(DiffBlock {
             file,
@@ -2356,9 +2348,7 @@ fn build_sampling(req: &ChatRequest) -> SamplingParams {
                 // `validate_response_format` rejects malformed
                 // patterns with a 400 before we reach here.
                 if let Some(p) = fmt.pattern.as_ref().filter(|p| !p.is_empty()) {
-                    s.grammar = Some(rustllama_engine::GrammarKind::Regex {
-                        pattern: p.clone(),
-                    });
+                    s.grammar = Some(rustllama_engine::GrammarKind::Regex { pattern: p.clone() });
                 }
             }
             "gbnf" => {
@@ -2367,9 +2357,7 @@ fn build_sampling(req: &ChatRequest) -> SamplingParams {
                 // "no grammar" (the boundary validator rejects a MALFORMED one
                 // with a 400 before we reach here).
                 if let Some(g) = fmt.grammar.as_ref().filter(|g| !g.trim().is_empty()) {
-                    s.grammar = Some(rustllama_engine::GrammarKind::Gbnf {
-                        grammar: g.clone(),
-                    });
+                    s.grammar = Some(rustllama_engine::GrammarKind::Gbnf { grammar: g.clone() });
                 }
             }
             _ => {}
@@ -2379,9 +2367,7 @@ fn build_sampling(req: &ChatRequest) -> SamplingParams {
     // too. `response_format` is more specific, so it wins when both are set.
     if s.grammar.is_none() {
         if let Some(g) = req.grammar.as_ref().filter(|g| !g.trim().is_empty()) {
-            s.grammar = Some(rustllama_engine::GrammarKind::Gbnf {
-                grammar: g.clone(),
-            });
+            s.grammar = Some(rustllama_engine::GrammarKind::Gbnf { grammar: g.clone() });
         }
     }
     s
@@ -2764,8 +2750,11 @@ async fn chat_blocking(state: AppState, req: ChatRequest) -> Response {
                 Ok(t) => {
                     if want_logprobs {
                         if let Some(lp) = t.logprobs.as_ref() {
-                            logprob_tokens
-                                .push(make_token_logprob_out(&t.text, lp, cpu.as_deref()));
+                            logprob_tokens.push(make_token_logprob_out(
+                                &t.text,
+                                lp,
+                                cpu.as_deref(),
+                            ));
                         }
                     }
                     content.push_str(&t.text);
@@ -3248,12 +3237,12 @@ fn token_logprob_chunk_json(
 mod tests {
     use super::{
         apply_response_format, build_sampling, chunk_json, chunk_json_with_fp,
-        parse_ask_user_args, with_reserved_ask_user_tool, ASK_USER_TOOL_NAME,
         chunk_text_delta_into, extract_tool_schemas, longest_suffix_that_is_prefix_of,
-        make_token_logprob_out, openai_content_block_to_text, parse_tool_call_body,
-        parse_tool_calls, parse_tool_choice, token_logprob_chunk_json, wire_messages_to_engine,
-        wire_messages_to_json, ChatMessageWire, ChatRequest, OpenAiContent, OpenAiContentBlock,
-        ResponseFormat, StreamEvent, StreamingToolCallParser, ToolChoice,
+        make_token_logprob_out, openai_content_block_to_text, parse_ask_user_args,
+        parse_tool_call_body, parse_tool_calls, parse_tool_choice, token_logprob_chunk_json,
+        wire_messages_to_engine, wire_messages_to_json, with_reserved_ask_user_tool,
+        ChatMessageWire, ChatRequest, OpenAiContent, OpenAiContentBlock, ResponseFormat,
+        StreamEvent, StreamingToolCallParser, ToolChoice, ASK_USER_TOOL_NAME,
     };
     use axum::http::StatusCode;
     use rustllama_engine::{TokenLogprobs, TopLogprob};
@@ -3289,7 +3278,10 @@ mod tests {
     fn seed_field_threads_into_sampling_params_for_chat() {
         let req = chat_request_with_seed(Some(42));
         let sampling = build_sampling(&req);
-        assert_eq!(sampling.seed, 42, "OpenAI chat seed must reach SamplingParams");
+        assert_eq!(
+            sampling.seed, 42,
+            "OpenAI chat seed must reach SamplingParams"
+        );
     }
 
     #[test]
@@ -3658,7 +3650,9 @@ mod tests {
         assert_eq!(m.images[0], raw);
         // Placeholder still in content so a vision-aware engine can find
         // the splice position.
-        assert!(m.content.starts_with("describe: [image: data:image/png;base64,"));
+        assert!(m
+            .content
+            .starts_with("describe: [image: data:image/png;base64,"));
     }
 
     #[test]
@@ -3774,8 +3768,14 @@ mod tests {
         let lp = TokenLogprobs {
             logprob: -0.1234,
             top: vec![
-                TopLogprob { id: 7, logprob: -0.1234 },
-                TopLogprob { id: 11, logprob: -2.5 },
+                TopLogprob {
+                    id: 7,
+                    logprob: -0.1234,
+                },
+                TopLogprob {
+                    id: 11,
+                    logprob: -2.5,
+                },
             ],
         };
         // No tokenizer wired (cpu = None) → alt tokens render as `"<7>"` etc.
@@ -3797,7 +3797,10 @@ mod tests {
         // first Content event per token.
         let lp = TokenLogprobs {
             logprob: -0.5,
-            top: vec![TopLogprob { id: 42, logprob: -0.5 }],
+            top: vec![TopLogprob {
+                id: 42,
+                logprob: -0.5,
+            }],
         };
         let lp_json = token_logprob_chunk_json(" world", &lp, None);
         let chunk = chunk_json(
@@ -3887,16 +3890,22 @@ mod tests {
         ];
         for &(text, fp) in cases {
             let want = chunk_json_with_fp(
-                "chatcmpl-test", 42, "qwen2.5-coder",
-                json!({"content": text}), None, None, fp,
+                "chatcmpl-test",
+                42,
+                "qwen2.5-coder",
+                json!({"content": text}),
+                None,
+                None,
+                fp,
             );
             let mut buf = String::with_capacity(256);
-            chunk_text_delta_into(
-                &mut buf, "chatcmpl-test", 42, "qwen2.5-coder", text, fp,
-            );
+            chunk_text_delta_into(&mut buf, "chatcmpl-test", 42, "qwen2.5-coder", text, fp);
             let got: Value = serde_json::from_str(&buf)
                 .unwrap_or_else(|e| panic!("manual JSON did not parse ({e}): {buf}"));
-            assert_eq!(got, want, "chunk parity mismatch for text={text:?} fp={fp:?}");
+            assert_eq!(
+                got, want,
+                "chunk parity mismatch for text={text:?} fp={fp:?}"
+            );
         }
     }
 
@@ -3905,21 +3914,12 @@ mod tests {
         // The empty-string convention means "skip the field" — useful
         // so the `chunk_json` test wrapper can stay in tests without
         // forcing every test to thread a fingerprint through.
-        let chunk = chunk_json_with_fp(
-            "id",
-            1,
-            "m",
-            json!({}),
-            Some("stop"),
-            None,
-            "",
-        );
+        let chunk = chunk_json_with_fp("id", 1, "m", json!({}), Some("stop"), None, "");
         assert!(
             chunk.get("system_fingerprint").is_none(),
             "empty fp must omit the field: {chunk}"
         );
     }
-
 
     #[test]
     fn extract_tool_schemas_pulls_name_and_parameters() {
@@ -4013,9 +4013,8 @@ mod tests {
 
     #[test]
     fn parse_ask_user_args_extracts_prompt_and_options() {
-        let (prompt, options) = parse_ask_user_args(
-            r#"{"prompt":"Which file?","options":["main.rs","lib.rs"]}"#,
-        );
+        let (prompt, options) =
+            parse_ask_user_args(r#"{"prompt":"Which file?","options":["main.rs","lib.rs"]}"#);
         assert_eq!(prompt, "Which file?");
         assert_eq!(options, ["main.rs", "lib.rs"]);
     }
@@ -4133,7 +4132,6 @@ mod tests {
         assert_eq!(out[0].role, "user");
     }
 
-
     #[test]
     fn parses_single_qwen_style_tool_call() {
         let raw = r#"<tool_call>
@@ -4188,7 +4186,10 @@ Now the other.
         assert_eq!(longest_suffix_that_is_prefix_of("hi<too", "<tool_call>"), 4);
         // "<tool_call>" is the full marker — but we never hold back the
         // entire marker (the caller has already found and consumed it).
-        assert_eq!(longest_suffix_that_is_prefix_of("<tool_call", "<tool_call>"), 10);
+        assert_eq!(
+            longest_suffix_that_is_prefix_of("<tool_call", "<tool_call>"),
+            10
+        );
     }
 
     #[test]
@@ -4356,8 +4357,7 @@ Now the other.
     fn parser_arguments_string_form_passes_through() {
         // arguments may be a JSON-encoded string rather than an object.
         let mut p = StreamingToolCallParser::new();
-        let evs =
-            p.feed(r#"<tool_call>{"name":"x","arguments":"{\"a\":1}"}</tool_call>"#);
+        let evs = p.feed(r#"<tool_call>{"name":"x","arguments":"{\"a\":1}"}</tool_call>"#);
         let args: Vec<String> = evs
             .iter()
             .filter_map(|e| match e {
@@ -4373,10 +4373,8 @@ Now the other.
         // OpenAI clients sometimes send `arguments` as an escaped string.
         // We should accept either nested object or pre-stringified.
         let raw = r#"<tool_call>{"name": "x", "arguments": "{\"a\":1}"}</tool_call>"#;
-        let call = parse_tool_call_body(
-            r#"{"name": "x", "arguments": "{\"a\":1}"}"#,
-        )
-        .expect("parse");
+        let call =
+            parse_tool_call_body(r#"{"name": "x", "arguments": "{\"a\":1}"}"#).expect("parse");
         assert_eq!(call.function.name, "x");
         assert_eq!(call.function.arguments, "{\"a\":1}");
         let _ = raw;
@@ -4387,8 +4385,9 @@ Now the other.
     #[test]
     fn parse_tool_call_body_accepts_parameters_field() {
         // Llama-3.1 emits `parameters` rather than `arguments`.
-        let call = parse_tool_call_body(r#"{"name": "get_weather", "parameters": {"city": "Paris"}}"#)
-            .expect("parse");
+        let call =
+            parse_tool_call_body(r#"{"name": "get_weather", "parameters": {"city": "Paris"}}"#)
+                .expect("parse");
         assert_eq!(call.function.name, "get_weather");
         assert!(call.function.arguments.contains("Paris"));
     }
@@ -4396,10 +4395,8 @@ Now the other.
     #[test]
     fn parse_tool_call_body_unwraps_function_wrapper() {
         // Some clients nest the call under a `function` key.
-        let call = parse_tool_call_body(
-            r#"{"function": {"name": "f", "arguments": {"a": 1}}}"#,
-        )
-        .expect("parse");
+        let call = parse_tool_call_body(r#"{"function": {"name": "f", "arguments": {"a": 1}}}"#)
+            .expect("parse");
         assert_eq!(call.function.name, "f");
         assert!(call.function.arguments.contains("\"a\""));
     }
@@ -4439,7 +4436,8 @@ Now the other.
     #[test]
     fn parses_bare_json_array_of_tool_calls() {
         // The entire output is a JSON array of tool-call objects.
-        let raw = r#"[{"name": "f1", "arguments": {"a": 1}}, {"name": "f2", "arguments": {"b": 2}}]"#;
+        let raw =
+            r#"[{"name": "f1", "arguments": {"a": 1}}, {"name": "f2", "arguments": {"b": 2}}]"#;
         let (content, calls) = parse_tool_calls(raw);
         assert!(content.is_none());
         let calls = calls.expect("expected tool_calls");
@@ -4486,14 +4484,22 @@ Now the other.
         assert_eq!(parse_tool_choice(&Some(json!("auto"))), ToolChoice::Auto);
         assert_eq!(parse_tool_choice(&Some(Value::Null)), ToolChoice::Auto);
         assert_eq!(parse_tool_choice(&Some(json!("none"))), ToolChoice::None);
-        assert_eq!(parse_tool_choice(&Some(json!("required"))), ToolChoice::Required);
         assert_eq!(
-            parse_tool_choice(&Some(json!({"type": "function", "function": {"name": "get_weather"}}))),
+            parse_tool_choice(&Some(json!("required"))),
+            ToolChoice::Required
+        );
+        assert_eq!(
+            parse_tool_choice(&Some(
+                json!({"type": "function", "function": {"name": "get_weather"}})
+            )),
             ToolChoice::Function("get_weather".to_string())
         );
         // Unknown / malformed → Auto.
         assert_eq!(parse_tool_choice(&Some(json!("banana"))), ToolChoice::Auto);
-        assert_eq!(parse_tool_choice(&Some(json!({"type": "function"}))), ToolChoice::Auto);
+        assert_eq!(
+            parse_tool_choice(&Some(json!({"type": "function"}))),
+            ToolChoice::Auto
+        );
     }
 
     #[test]
@@ -4766,9 +4772,7 @@ Now the other.
         let cancel_guard = crate::CancelGuard {
             id: "test-id".into(),
             flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            cancellations: Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            cancellations: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         let sse = super::build_sse_stream(
@@ -4777,12 +4781,12 @@ Now the other.
             "test-model".into(),
             tok_stream,
             permit,
-            None, // cpu
-            42,   // prompt_tokens
+            None,  // cpu
+            42,    // prompt_tokens
             false, // include_usage
             true,  // diff_mode
             cancel_guard,
-            256,  // max_tokens — high enough to avoid the length-cap branch
+            256,           // max_tokens — high enough to avoid the length-cap branch
             String::new(), // system_fingerprint — empty omits the field
         );
         let events: Vec<_> = sse.collect().await;

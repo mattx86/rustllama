@@ -78,9 +78,7 @@ async fn fused_decode_http_two_concurrent_chat_requests_both_succeed() {
         return;
     }
     let Some(path) = model_path("qwen2.5-coder-0.5b-instruct-q4_k_m.gguf") else {
-        eprintln!(
-            "skipped (run `cargo xtask fetch-test-model qwen2.5-coder-0.5b-q4_k_m` first)"
-        );
+        eprintln!("skipped (run `cargo xtask fetch-test-model qwen2.5-coder-0.5b-q4_k_m` first)");
         return;
     };
 

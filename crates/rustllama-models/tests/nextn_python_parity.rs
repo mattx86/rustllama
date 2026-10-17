@@ -99,7 +99,15 @@ fn nextn_compose_logits_matches_python_reference() {
     }
     println!(
         "nextn_logits: len={} max_abs={:.2e} (idx {}, got={:.6e} exp={:.6e}) tol={:.2e}",
-        logits.len(), max_abs, argmax, logits[argmax], expected_logits[argmax], TOL
+        logits.len(),
+        max_abs,
+        argmax,
+        logits[argmax],
+        expected_logits[argmax],
+        TOL
     );
-    assert!(max_abs < TOL, "max abs error {max_abs} exceeded tolerance {TOL}");
+    assert!(
+        max_abs < TOL,
+        "max abs error {max_abs} exceeded tolerance {TOL}"
+    );
 }

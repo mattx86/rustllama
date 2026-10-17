@@ -160,9 +160,8 @@ impl HistoryStore {
     /// chronological order.
     pub fn get_conversation(&self, id: i64) -> Result<Option<Conversation>> {
         let conn = self.conn.lock().expect("history conn lock");
-        let mut head = conn.prepare(
-            "SELECT id, title, created_at, updated_at FROM conversations WHERE id = ?1",
-        )?;
+        let mut head = conn
+            .prepare("SELECT id, title, created_at, updated_at FROM conversations WHERE id = ?1")?;
         let summary: Option<ConversationSummary> = head
             .query_row(params![id], |r| {
                 Ok(ConversationSummary {
@@ -208,12 +207,7 @@ impl HistoryStore {
     /// Append a message to a conversation and bump its `updated_at`.
     /// The bump matters for the sidebar's "newest first" ordering — a
     /// long-running thread that gets a fresh reply hops to the top.
-    pub fn append_message(
-        &self,
-        conversation_id: i64,
-        role: &str,
-        content: &str,
-    ) -> Result<i64> {
+    pub fn append_message(&self, conversation_id: i64, role: &str, content: &str) -> Result<i64> {
         let now = unix_secs();
         let conn = self.conn.lock().expect("history conn lock");
         conn.execute(
@@ -231,10 +225,7 @@ impl HistoryStore {
     /// Delete a conversation and all its messages.
     pub fn delete_conversation(&self, id: i64) -> Result<bool> {
         let conn = self.conn.lock().expect("history conn lock");
-        let affected = conn.execute(
-            "DELETE FROM conversations WHERE id = ?1",
-            params![id],
-        )?;
+        let affected = conn.execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
         Ok(affected > 0)
     }
 
@@ -259,14 +250,11 @@ fn backfill_fts_if_needed(conn: &Connection) -> Result<()> {
     if messages_count == 0 {
         return Ok(());
     }
-    let fts_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))?;
+    let fts_count: i64 = conn.query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))?;
     if fts_count < messages_count {
         // The FTS5 'rebuild' command repopulates from the external
         // content table. Safe to run repeatedly.
-        conn.execute_batch(
-            "INSERT INTO messages_fts(messages_fts) VALUES ('rebuild');",
-        )?;
+        conn.execute_batch("INSERT INTO messages_fts(messages_fts) VALUES ('rebuild');")?;
         tracing::info!(
             messages = messages_count,
             previously_indexed = fts_count,
@@ -420,20 +408,17 @@ fn default_search_limit() -> u32 {
 pub type SharedHistory = Arc<HistoryStore>;
 
 fn store(state: &AppState) -> std::result::Result<SharedHistory, axum::response::Response> {
-    state
-        .history
-        .clone()
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_IMPLEMENTED,
-                Json(serde_json::json!({
-                    "error": "history feature not enabled",
-                    "detail": "rebuild the server with `--features history` to enable \
-                               conversation persistence (sqlite-backed).",
-                })),
-            )
-                .into_response()
-        })
+    state.history.clone().ok_or_else(|| {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": "history feature not enabled",
+                "detail": "rebuild the server with `--features history` to enable \
+                           conversation persistence (sqlite-backed).",
+            })),
+        )
+            .into_response()
+    })
 }
 
 pub async fn list_handler(State(state): State<AppState>) -> axum::response::Response {
@@ -594,8 +579,7 @@ pub async fn rename_handler(
         Err(resp) => return resp,
     };
     match s.rename(id, &req.title) {
-        Ok(true) => Json(serde_json::json!({ "renamed": id, "title": req.title }))
-            .into_response(),
+        Ok(true) => Json(serde_json::json!({ "renamed": id, "title": req.title })).into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "conversation not found", "id": id })),
@@ -675,7 +659,13 @@ pub async fn export_handler(
         .summary
         .title
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let stem = if stem.is_empty() {
         format!("conversation-{id}")
@@ -755,7 +745,8 @@ mod tests {
         assert!(id > 0);
 
         s.append_message(id, "user", "hi").expect("append user");
-        s.append_message(id, "assistant", "hi back").expect("append asst");
+        s.append_message(id, "assistant", "hi back")
+            .expect("append asst");
 
         let list = s.list_conversations().expect("list");
         assert_eq!(list.len(), 1);
@@ -812,10 +803,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         s.append_message(a, "user", "wait").unwrap();
         let list = s.list_conversations().unwrap();
-        assert_eq!(
-            list[0].id, a,
-            "appending to A should bump it to the front"
-        );
+        assert_eq!(list[0].id, a, "appending to A should bump it to the front");
     }
 
     #[test]

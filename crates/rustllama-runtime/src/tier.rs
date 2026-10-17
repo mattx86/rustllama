@@ -109,7 +109,10 @@ mod tests {
 
     #[test]
     fn default_order_is_gpu_npu_cpu() {
-        assert_eq!(default_tier_order(), vec![TierKind::GpuMetal, TierKind::Npu, TierKind::Cpu]);
+        assert_eq!(
+            default_tier_order(),
+            vec![TierKind::GpuMetal, TierKind::Npu, TierKind::Cpu]
+        );
     }
 
     /// Two-tier case must match the GPU-fill-then-CPU cutoff the engine's

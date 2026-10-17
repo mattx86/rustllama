@@ -37,8 +37,7 @@ fn q8_0_kv_matches_f32_on_synthetic_llama_greedy() {
     // continuations on this small model.
     let path = synth_gguf("parity");
     let engine_f32 = CpuEngine::load(&path, 32).expect("load f32");
-    let engine_q8 =
-        CpuEngine::load_with_options(&path, 32, false, KvDtype::Q8_0).expect("load q8");
+    let engine_q8 = CpuEngine::load_with_options(&path, 32, false, KvDtype::Q8_0).expect("load q8");
 
     let prompt: Vec<i32> = (0..10).collect();
     let out_f32 = engine_f32
@@ -60,8 +59,7 @@ fn q8_0_kv_matches_f32_on_synthetic_llama_greedy() {
 #[test]
 fn q8_0_kv_remains_deterministic_across_runs() {
     let path = synth_gguf("determ");
-    let engine = CpuEngine::load_with_options(&path, 32, false, KvDtype::Q8_0)
-        .expect("load q8");
+    let engine = CpuEngine::load_with_options(&path, 32, false, KvDtype::Q8_0).expect("load q8");
     let prompt = [3i32, 5, 7, 11, 13, 17];
 
     let a = engine
@@ -85,13 +83,16 @@ fn q8_0_kv_uses_fewer_bytes_than_f32_after_reset() {
     // state without panicking.
     let path = synth_gguf("size");
     let f32_engine = CpuEngine::load(&path, 32).expect("load f32");
-    let q8_engine =
-        CpuEngine::load_with_options(&path, 32, false, KvDtype::Q8_0).expect("load q8");
+    let q8_engine = CpuEngine::load_with_options(&path, 32, false, KvDtype::Q8_0).expect("load q8");
 
     // Touch enough tokens to populate the cache for several positions.
     let prompt: Vec<i32> = (0..8).collect();
-    let _ = f32_engine.generate_token_ids(&prompt, 3, &greedy(3)).unwrap();
-    let _ = q8_engine.generate_token_ids(&prompt, 3, &greedy(3)).unwrap();
+    let _ = f32_engine
+        .generate_token_ids(&prompt, 3, &greedy(3))
+        .unwrap();
+    let _ = q8_engine
+        .generate_token_ids(&prompt, 3, &greedy(3))
+        .unwrap();
 
     // Storage byte counts come from the layer arrays. We can only
     // observe shape, not bytes, via the public API — but the layer

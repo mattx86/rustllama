@@ -12,9 +12,7 @@
 
 use std::sync::Arc;
 
-use rustllama_gguf::synth::{
-    write_synthetic_lora_adapter_gguf, SynthLlama, SynthLoraAdapter,
-};
+use rustllama_gguf::synth::{write_synthetic_lora_adapter_gguf, SynthLlama, SynthLoraAdapter};
 use rustllama_gguf::Gguf;
 use rustllama_models::llama_arch::{KvCache, LlamaModel};
 use rustllama_models::lora::{self, LoraAdapter, LoraFactors, MergeOutcome};
@@ -62,7 +60,10 @@ fn logits_decode_lora(
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 
 // ----------------------------------------------------------------------
@@ -117,7 +118,11 @@ fn p1_merge_math_bit_exact_f32_base() {
         MergeOutcome::Merged
     );
     let got = rustllama_tensor::as_slice_f32(&t);
-    assert_eq!(got, &expected[..], "merged weight must be bit-exact to hand reference");
+    assert_eq!(
+        got,
+        &expected[..],
+        "merged weight must be bit-exact to hand reference"
+    );
     // Merged tensor is a row-major F32 `[out, in]` weight.
     assert_eq!(t.dim_order, DimOrder::RowMajor);
     assert_eq!(t.out_dim(), out);
@@ -205,7 +210,10 @@ fn p1_merged_equals_hand_and_differs_from_base() {
     // Library merge.
     let mut merged = LlamaModel::load(&base_gguf).expect("load for merge");
     let stats = merged.weights.merge_lora(&adapter);
-    assert_eq!(stats.merged, 14, "all 7 dense projections × 2 layers merged");
+    assert_eq!(
+        stats.merged, 14,
+        "all 7 dense projections × 2 layers merged"
+    );
     assert_eq!(stats.skipped_quant, 0);
     assert_eq!(stats.shape_mismatch, 0);
     let logits_merged = logits_decode(&merged, 3);
@@ -355,7 +363,10 @@ fn p3_registry_and_per_request_selection() {
 
     // Selecting by name reproduces the single-adapter result.
     let sel_a = logits_decode_lora(&model, 4, reg.get("lora-a").as_ref());
-    assert_eq!(sel_a, ref_a, "selecting adapter X ≡ the single-adapter X result");
+    assert_eq!(
+        sel_a, ref_a,
+        "selecting adapter X ≡ the single-adapter X result"
+    );
 
     // Two concurrent requests, different adapters, each matches its reference.
     let m2 = Arc::clone(&model);
@@ -366,8 +377,14 @@ fn p3_registry_and_per_request_selection() {
     let hb = std::thread::spawn(move || logits_decode_lora(&m3, 4, Some(&b2)));
     let got_a = ha.join().expect("thread a");
     let got_b = hb.join().expect("thread b");
-    assert_eq!(got_a, ref_a, "concurrent adapter A ≡ its single-adapter reference");
-    assert_eq!(got_b, ref_b, "concurrent adapter B ≡ its single-adapter reference");
+    assert_eq!(
+        got_a, ref_a,
+        "concurrent adapter A ≡ its single-adapter reference"
+    );
+    assert_eq!(
+        got_b, ref_b,
+        "concurrent adapter B ≡ its single-adapter reference"
+    );
 
     for p in [&base_path, &pa, &pb] {
         let _ = std::fs::remove_file(p);

@@ -42,7 +42,9 @@ async fn empty_origin_list_does_not_attach_cors_headers() {
     let resp = app.oneshot(req).await.unwrap();
     // No CORS layer → no Allow-Origin header on the response.
     assert!(
-        resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+        resp.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none(),
         "no CORS configured → no Access-Control-Allow-Origin header"
     );
 }

@@ -67,7 +67,10 @@ impl CheckpointClock {
     /// the first checkpoint can't fire until a full interval has elapsed since
     /// engine construction.
     pub fn new(interval: std::time::Duration, now: std::time::Instant) -> Self {
-        Self { interval, last: now }
+        Self {
+            interval,
+            last: now,
+        }
     }
 
     /// `true` iff periodic checkpointing is enabled AND at least `interval` has
@@ -178,11 +181,7 @@ fn push_snapshot(buf: &mut Vec<u8>, snap: &PrefixSnapshot) -> bool {
     true
 }
 
-fn read_snapshot(
-    r: &mut Reader<'_>,
-    n_kv_heads: usize,
-    head_dim: usize,
-) -> Option<PrefixSnapshot> {
+fn read_snapshot(r: &mut Reader<'_>, n_kv_heads: usize, head_dim: usize) -> Option<PrefixSnapshot> {
     let record_start = r.off;
     let ids_len = r.u32()? as usize;
     let mut ids = Vec::with_capacity(ids_len.min(1 << 20));

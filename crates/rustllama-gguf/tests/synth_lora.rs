@@ -36,7 +36,8 @@ fn synth_lora_emits_adapter_metadata_and_factor_pairs() {
     assert_eq!(str_meta(&g, "general.type"), Some("adapter"));
     assert_eq!(str_meta(&g, "adapter.type"), Some("lora"));
     assert_eq!(
-        g.metadata_get("adapter.lora.alpha").and_then(|v| v.as_f32()),
+        g.metadata_get("adapter.lora.alpha")
+            .and_then(|v| v.as_f32()),
         Some(16.0)
     );
 

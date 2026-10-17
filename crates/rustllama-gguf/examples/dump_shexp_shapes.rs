@@ -2,7 +2,9 @@
 use rustllama_gguf::Gguf;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: dump_shexp_shapes PATH");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: dump_shexp_shapes PATH");
     let g = Gguf::open(&path).expect("open gguf");
     for name in [
         "blk.0.ffn_gate_inp.weight",

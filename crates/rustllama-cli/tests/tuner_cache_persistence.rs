@@ -88,8 +88,7 @@ fn batch_size_winner_persists_to_cache() {
     let _ = std::fs::remove_dir_all(&dir);
     let device = synth_device();
 
-    let path =
-        persist_batch_size_winner_to(&dir, KEY, &device, 512).expect("persist must succeed");
+    let path = persist_batch_size_winner_to(&dir, KEY, &device, 512).expect("persist must succeed");
     assert!(
         path.exists(),
         "cache file should exist at {}",

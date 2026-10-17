@@ -1,4 +1,4 @@
-﻿//! Graceful shutdown behavior:
+//! Graceful shutdown behavior:
 //!   1. `AppState::begin_shutdown` flips the drain flag.
 //!   2. New requests get `503 Service Unavailable` + `Retry-After: 5`.
 //!   3. `/healthz` keeps working and reports `draining: true`.
@@ -214,9 +214,7 @@ async fn pending_counter_returns_to_zero_after_request_completes() {
     // backpressure to fire after enough successful requests.
     let state = build_state();
     let serving = state.current().await;
-    let initial = serving
-        .pending
-        .load(std::sync::atomic::Ordering::Acquire);
+    let initial = serving.pending.load(std::sync::atomic::Ordering::Acquire);
     assert_eq!(initial, 0, "pending must start at 0");
 
     let app = router(state.clone());
@@ -239,9 +237,7 @@ async fn pending_counter_returns_to_zero_after_request_completes() {
     // pending counter.
     let serving = state.current().await;
     assert_eq!(
-        serving
-            .pending
-            .load(std::sync::atomic::Ordering::Acquire),
+        serving.pending.load(std::sync::atomic::Ordering::Acquire),
         0,
         "pending counter leaked after successful request"
     );
@@ -274,9 +270,7 @@ async fn pending_counter_returns_to_zero_after_503_drain() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
-        serving
-            .pending
-            .load(std::sync::atomic::Ordering::Acquire),
+        serving.pending.load(std::sync::atomic::Ordering::Acquire),
         0,
         "drain 503 must not increment pending"
     );

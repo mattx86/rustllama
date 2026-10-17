@@ -97,12 +97,9 @@ const ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: c_int = 1;
 const ORT_API_VERSION_REQ: u32 = 11;
 
 // ---- FFI fn-pointer types ----
-type FnCreateEnv =
-    unsafe extern "C" fn(c_int, *const c_char, *mut *mut OrtEnv) -> *mut OrtStatus;
-type FnCreateSessionOptions =
-    unsafe extern "C" fn(*mut *mut OrtSessionOptions) -> *mut OrtStatus;
-type FnSetGraphOpt =
-    unsafe extern "C" fn(*mut OrtSessionOptions, c_int) -> *mut OrtStatus;
+type FnCreateEnv = unsafe extern "C" fn(c_int, *const c_char, *mut *mut OrtEnv) -> *mut OrtStatus;
+type FnCreateSessionOptions = unsafe extern "C" fn(*mut *mut OrtSessionOptions) -> *mut OrtStatus;
+type FnSetGraphOpt = unsafe extern "C" fn(*mut OrtSessionOptions, c_int) -> *mut OrtStatus;
 type FnCreateSessionFromArray = unsafe extern "C" fn(
     *const OrtEnv,
     *const c_void,
@@ -206,9 +203,13 @@ impl AmdNpuExecutor {
     unsafe fn new_inner() -> Option<AmdNpuExecutor> {
         // dlopen ORT (exe-relative candidates then bare name, like the other
         // bundled runtimes).
-        let cands: Vec<std::path::PathBuf> =
-            ORT_LIBS.iter().flat_map(|n| crate::bundled_lib_candidates(n)).collect();
-        let lib = cands.into_iter().find_map(|c| libloading::Library::new(&c).ok())?;
+        let cands: Vec<std::path::PathBuf> = ORT_LIBS
+            .iter()
+            .flat_map(|n| crate::bundled_lib_candidates(n))
+            .collect();
+        let lib = cands
+            .into_iter()
+            .find_map(|c| libloading::Library::new(&c).ok())?;
 
         // OrtGetApiBase() -> *const OrtApiBase -> GetApi(version) -> OrtApi array.
         let get_api_base: libloading::Symbol<unsafe extern "C" fn() -> *const OrtApiBase> =
@@ -267,12 +268,25 @@ impl AmdNpuExecutor {
             return None;
         }
 
-        Some(AmdNpuExecutor { _lib: lib, api, env, mem_info, sessions: Mutex::new(HashMap::new()) })
+        Some(AmdNpuExecutor {
+            _lib: lib,
+            api,
+            env,
+            mem_info,
+            sessions: Mutex::new(HashMap::new()),
+        })
     }
 
     /// `out[n,m] = X[n,k] · W[m,k]ᵀ`, all f32, on the AMD NPU. `None` on any
     /// failure (caller falls back). Mirrors the OpenVINO `matmul_xwt_f32`.
-    pub fn matmul_xwt_f32(&self, x: &[f32], n: usize, k: usize, w: &[f32], m: usize) -> Option<Vec<f32>> {
+    pub fn matmul_xwt_f32(
+        &self,
+        x: &[f32],
+        n: usize,
+        k: usize,
+        w: &[f32],
+        m: usize,
+    ) -> Option<Vec<f32>> {
         if x.len() != n * k || w.len() != m * k || m == 0 || k == 0 || n == 0 {
             return None;
         }
@@ -280,7 +294,14 @@ impl AmdNpuExecutor {
     }
 
     /// Row-major `C[m,n] = A[m,k] · B[k,n]`, all f32 (parity-probe entry).
-    pub fn matmul_f32(&self, a: &[f32], m: usize, k: usize, b: &[f32], n: usize) -> Option<Vec<f32>> {
+    pub fn matmul_f32(
+        &self,
+        a: &[f32],
+        m: usize,
+        k: usize,
+        b: &[f32],
+        n: usize,
+    ) -> Option<Vec<f32>> {
         if a.len() != m * k || b.len() != k * n || m == 0 || k == 0 || n == 0 {
             return None;
         }
@@ -514,18 +535,32 @@ use crate::NpuParity;
 /// random problem. `supported == false` when no AMD NPU / ORT + VitisAI EP is
 /// present (a SKIP). Thresholds mirror the GPU/Intel parity harness.
 pub(crate) fn matmul_parity() -> NpuParity {
-    let skip = NpuParity { supported: false, cos: 0.0, max_rel: 0.0, pass: false };
+    let skip = NpuParity {
+        supported: false,
+        cos: 0.0,
+        max_rel: 0.0,
+        pass: false,
+    };
     let Some(exec) = AmdNpuExecutor::new() else {
         return skip;
     };
     let (m, k, n) = (3usize, 5usize, 4usize);
-    let a: Vec<f32> = (0..m * k).map(|i| (((i * 2654435761) >> 8) as f32 % 17.0) - 8.0).collect();
-    let b: Vec<f32> = (0..k * n).map(|i| (((i * 40503) >> 4) as f32 % 13.0) - 6.0).collect();
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| (((i * 2654435761) >> 8) as f32 % 17.0) - 8.0)
+        .collect();
+    let b: Vec<f32> = (0..k * n)
+        .map(|i| (((i * 40503) >> 4) as f32 % 13.0) - 6.0)
+        .collect();
 
     let Some(got) = exec.matmul_f32(&a, m, k, &b, n) else {
         // NPU present but the offload FAILED (bad model / session / infer) →
         // surface as a correctness failure so it gets investigated on hardware.
-        return NpuParity { supported: true, cos: 0.0, max_rel: f64::INFINITY, pass: false };
+        return NpuParity {
+            supported: true,
+            cos: 0.0,
+            max_rel: f64::INFINITY,
+            pass: false,
+        };
     };
     let mut want = vec![0f32; m * n];
     for r in 0..m {
@@ -546,7 +581,16 @@ pub(crate) fn matmul_parity() -> NpuParity {
         let denom = y.abs().max(1e-6);
         max_rel = max_rel.max((x - y).abs() / denom);
     }
-    let cos = if na > 0.0 && nb > 0.0 { dot / (na.sqrt() * nb.sqrt()) } else { 0.0 };
+    let cos = if na > 0.0 && nb > 0.0 {
+        dot / (na.sqrt() * nb.sqrt())
+    } else {
+        0.0
+    };
     let pass = cos >= 0.9999 && max_rel <= 1e-2;
-    NpuParity { supported: true, cos, max_rel, pass }
+    NpuParity {
+        supported: true,
+        cos,
+        max_rel,
+        pass,
+    }
 }

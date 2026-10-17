@@ -1,13 +1,11 @@
-﻿//! Verifies `GET /v1/metrics` returns the expected JSON shape and
+//! Verifies `GET /v1/metrics` returns the expected JSON shape and
 //! reflects the current default model.
 
 use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
-use rustllama_engine::{
-    ChatMessage, Engine, Metrics, SamplingParams, Token, TokenStream,
-};
+use rustllama_engine::{ChatMessage, Engine, Metrics, SamplingParams, Token, TokenStream};
 use rustllama_server::{router, AppState, ServingModel};
 use tower::ServiceExt;
 
@@ -164,16 +162,10 @@ async fn metrics_endpoint_surfaces_cumulative_stats_when_engine_tracks_them() {
         ) -> rustllama_engine::Result<TokenStream> {
             unimplemented!()
         }
-        fn generate(
-            &self,
-            _: &str,
-            _: &SamplingParams,
-        ) -> rustllama_engine::Result<TokenStream> {
+        fn generate(&self, _: &str, _: &SamplingParams) -> rustllama_engine::Result<TokenStream> {
             unimplemented!()
         }
-        fn cumulative_stats_snapshot(
-            &self,
-        ) -> Option<rustllama_engine::CumulativeStatsSnapshot> {
+        fn cumulative_stats_snapshot(&self) -> Option<rustllama_engine::CumulativeStatsSnapshot> {
             Some(rustllama_engine::CumulativeStatsSnapshot {
                 total_requests: 7,
                 total_tokens_prefilled: 100,
@@ -265,11 +257,7 @@ async fn metrics_endpoint_surfaces_paged_fields_from_engine() {
         ) -> rustllama_engine::Result<TokenStream> {
             unimplemented!()
         }
-        fn generate(
-            &self,
-            _: &str,
-            _: &SamplingParams,
-        ) -> rustllama_engine::Result<TokenStream> {
+        fn generate(&self, _: &str, _: &SamplingParams) -> rustllama_engine::Result<TokenStream> {
             unimplemented!()
         }
     }

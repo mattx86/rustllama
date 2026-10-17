@@ -107,7 +107,8 @@ async fn get_with_peer(
         builder = builder.header(header::AUTHORIZATION, v);
     }
     let mut req = builder.body(Body::empty()).unwrap();
-    req.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(peer));
     app.oneshot(req).await.unwrap().status()
 }
 
@@ -121,7 +122,11 @@ async fn loopback_bypass_toggles_with_require_auth_loopback() {
     let remote: SocketAddr = "192.168.1.50:52002".parse().unwrap();
 
     // Default (bypass ON): loopback peer, no token → 200.
-    let app = router(build_state_with_auth_loopback("lb-default", "sk-test", false));
+    let app = router(build_state_with_auth_loopback(
+        "lb-default",
+        "sk-test",
+        false,
+    ));
     assert_eq!(
         get_with_peer(app, "/v1/models", loopback, None).await,
         StatusCode::OK,
@@ -129,7 +134,11 @@ async fn loopback_bypass_toggles_with_require_auth_loopback() {
     );
 
     // require_auth_loopback = true: loopback peer, no token → 401.
-    let app = router(build_state_with_auth_loopback("lb-require", "sk-test", true));
+    let app = router(build_state_with_auth_loopback(
+        "lb-require",
+        "sk-test",
+        true,
+    ));
     assert_eq!(
         get_with_peer(app, "/v1/models", loopback, None).await,
         StatusCode::UNAUTHORIZED,
@@ -145,7 +154,11 @@ async fn loopback_bypass_toggles_with_require_auth_loopback() {
     );
 
     // Remote peer, no token → 401 regardless of the toggle.
-    let app = router(build_state_with_auth_loopback("lb-remote", "sk-test", false));
+    let app = router(build_state_with_auth_loopback(
+        "lb-remote",
+        "sk-test",
+        false,
+    ));
     assert_eq!(
         get_with_peer(app, "/v1/models", remote, None).await,
         StatusCode::UNAUTHORIZED,
@@ -175,10 +188,9 @@ async fn missing_authorization_header_returns_401_with_www_authenticate() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     let app = router(build_state_with_auth("missing-header-2", "sk-test"));
-    let (_, www_auth) =
-        get_with_header(app, "/v1/models", "  ").await; // header present but empty after trim → still wrong
-    // Even a blank header should 401 — verify www_authenticate is
-    // present so RFC-compliant clients know what scheme to use.
+    let (_, www_auth) = get_with_header(app, "/v1/models", "  ").await; // header present but empty after trim → still wrong
+                                                                        // Even a blank header should 401 — verify www_authenticate is
+                                                                        // present so RFC-compliant clients know what scheme to use.
     let _ = www_auth; // The empty-header path takes split_once → bare path → empty token → ct_eq fails → 401.
 
     let app = router(build_state_with_auth("missing-header-3", "sk-test"));
@@ -199,7 +211,9 @@ async fn wrong_token_same_length_returns_401() {
     let (status, www_auth) = get_with_header(app, "/v1/models", bad).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(
-        www_auth.iter().any(|v| v.to_str().unwrap_or("") == "Bearer"),
+        www_auth
+            .iter()
+            .any(|v| v.to_str().unwrap_or("") == "Bearer"),
         "401 should carry WWW-Authenticate: Bearer"
     );
 }

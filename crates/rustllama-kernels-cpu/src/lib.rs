@@ -30,12 +30,12 @@
 
 pub mod cascade;
 pub mod delta_net;
+pub mod hadamard;
 pub mod mlx_affine;
 pub mod mxfp;
 pub mod mxfp_kv;
 pub mod numa;
 pub mod nvfp4;
-pub mod hadamard;
 pub mod q4_0_kv;
 pub mod turboquant;
 
@@ -162,7 +162,12 @@ pub fn matvec_tensor(w: &Tensor, x: &[f32], out: &mut [f32], m: usize, k: usize)
             let n_threads = rayon::current_num_threads().max(1);
             let chunk_rows = ((m + 4 * n_threads - 1) / (4 * n_threads)).max(64).min(m);
             mlx_affine::matvec_mlx_affine_blob_w_f32_a_parallel(
-                as_bytes(w), x, out, m, k, chunk_rows,
+                as_bytes(w),
+                x,
+                out,
+                m,
+                k,
+                chunk_rows,
             );
         } else {
             mlx_affine::matvec_mlx_affine_blob_w_f32_a(as_bytes(w), x, out, m, k);
@@ -219,7 +224,13 @@ pub fn matvec_tensor(w: &Tensor, x: &[f32], out: &mut [f32], m: usize, k: usize)
                 .for_each(|(ci, oc)| {
                     let r0 = ci * chunk_rows;
                     let nr = oc.len();
-                    serial_fn(&w_bytes[r0 * row_bytes..(r0 + nr) * row_bytes], x, oc, nr, k);
+                    serial_fn(
+                        &w_bytes[r0 * row_bytes..(r0 + nr) * row_bytes],
+                        x,
+                        oc,
+                        nr,
+                        k,
+                    );
                 });
             return;
         }
@@ -380,7 +391,9 @@ mod matvec_parallel_parity {
         let w: Vec<f32> = (0..M * k)
             .map(|i| ((i * 37 + 11) % 251) as f32 * 0.013 - 1.6)
             .collect();
-        let x: Vec<f32> = (0..k).map(|i| ((i * 53 + 7) % 97) as f32 * 0.021 - 1.0).collect();
+        let x: Vec<f32> = (0..k)
+            .map(|i| ((i * 53 + 7) % 97) as f32 * 0.021 - 1.0)
+            .collect();
         let mut par = vec![0.0f32; M];
         let mut ser = vec![0.0f32; M];
         matvec_f32(&w, &x, &mut par, M, k);
@@ -405,7 +418,9 @@ mod matvec_parallel_parity {
             }
         }
         let w = quant_tensor(Dtype::Q8_0Raw, bytes, k);
-        let x: Vec<f32> = (0..k).map(|i| ((i * 29 + 3) % 83) as f32 * 0.017 - 0.7).collect();
+        let x: Vec<f32> = (0..k)
+            .map(|i| ((i * 29 + 3) % 83) as f32 * 0.017 - 0.7)
+            .collect();
         let mut par = vec![0.0f32; M];
         let mut ser = vec![0.0f32; M];
         matvec_tensor(&w, &x, &mut par, M, k);
@@ -429,7 +444,9 @@ mod matvec_parallel_parity {
             }
         }
         let w = quant_tensor(Dtype::PQ2_0Raw, bytes, k);
-        let x: Vec<f32> = (0..k).map(|i| ((i * 31 + 7) % 97) as f32 * 0.015 - 0.7).collect();
+        let x: Vec<f32> = (0..k)
+            .map(|i| ((i * 31 + 7) % 97) as f32 * 0.015 - 0.7)
+            .collect();
         let mut par = vec![0.0f32; M];
         let mut ser = vec![0.0f32; M];
         matvec_tensor(&w, &x, &mut par, M, k);
@@ -453,7 +470,9 @@ mod matvec_parallel_parity {
             blk[26..28].copy_from_slice(&d.to_le_bytes());
         }
         let w = quant_tensor(Dtype::PTQ1_0Raw, bytes, k);
-        let x: Vec<f32> = (0..k).map(|i| ((i * 43 + 5) % 89) as f32 * 0.017 - 0.8).collect();
+        let x: Vec<f32> = (0..k)
+            .map(|i| ((i * 43 + 5) % 89) as f32 * 0.017 - 0.8)
+            .collect();
         let mut par = vec![0.0f32; M];
         let mut ser = vec![0.0f32; M];
         matvec_tensor(&w, &x, &mut par, M, k);
@@ -530,14 +549,22 @@ mod matvec_parallel_parity {
                 let d = half::f16::from_f32(0.003 + 0.0015 * (bi % 6) as f32);
                 blk[26..28].copy_from_slice(&d.to_le_bytes());
             }
-            let x: Vec<f32> = (0..k).map(|i| ((i * 31 + 5) % 89) as f32 * 0.012 - 0.5).collect();
+            let x: Vec<f32> = (0..k)
+                .map(|i| ((i * 31 + 5) % 89) as f32 * 0.012 - 0.5)
+                .collect();
             let mut reference = vec![0.0f32; m];
             matvec_ptq1_0_w_f32_a(&bytes, &x, &mut reference, m, k);
             let mut fast = vec![0.0f32; m];
             matvec_ptq1_0_w_f32_a_fast(&bytes, &x, &mut fast, m, k);
-            let scale = reference.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-3);
+            let scale = reference
+                .iter()
+                .fold(0f32, |a, &v| a.max(v.abs()))
+                .max(1e-3);
             for (i, (&r, &f)) in reference.iter().zip(fast.iter()).enumerate() {
-                assert!((r - f).abs() <= 1e-3 * scale, "row-fast m={m} k={k} row {i}: ref={r} fast={f}");
+                assert!(
+                    (r - f).abs() <= 1e-3 * scale,
+                    "row-fast m={m} k={k} row {i}: ref={r} fast={f}"
+                );
             }
             let mut fast2 = vec![0.0f32; m];
             matvec_ptq1_0_w_f32_a_fast(&bytes, &x, &mut fast2, m, k);
@@ -554,9 +581,9 @@ mod matvec_parallel_parity {
             (9, 512, 7),
             (2, 128, 3),
             (5, 256, 13),
-            (3, 128, 4),   // one 3-row fastfold group, one quad
-            (7, 256, 9),   // 3+3+1 rows; quads + tail
-            (6, 384, 8),   // two 3-row groups; quads only
+            (3, 128, 4), // one 3-row fastfold group, one quad
+            (7, 256, 9), // 3+3+1 rows; quads + tail
+            (6, 384, 8), // two 3-row groups; quads only
         ] {
             let row_bytes = (k / 128) * 28;
             let mut bytes = vec![0u8; m * row_bytes];
@@ -572,12 +599,16 @@ mod matvec_parallel_parity {
                 .collect();
             let mut reference = vec![0.0f32; n_rows * m];
             matvec_ptq1_0_w_f32_a_batched_with_mode(
-                &bytes, &xs, &mut reference, m, k, n_rows, false,
+                &bytes,
+                &xs,
+                &mut reference,
+                m,
+                k,
+                n_rows,
+                false,
             );
             let mut fast = vec![0.0f32; n_rows * m];
-            matvec_ptq1_0_w_f32_a_batched_with_mode(
-                &bytes, &xs, &mut fast, m, k, n_rows, true,
-            );
+            matvec_ptq1_0_w_f32_a_batched_with_mode(&bytes, &xs, &mut fast, m, k, n_rows, true);
             let scale = reference
                 .iter()
                 .fold(0f32, |a, &v| a.max(v.abs()))
@@ -589,9 +620,7 @@ mod matvec_parallel_parity {
                 );
             }
             let mut fast2 = vec![0.0f32; n_rows * m];
-            matvec_ptq1_0_w_f32_a_batched_with_mode(
-                &bytes, &xs, &mut fast2, m, k, n_rows, true,
-            );
+            matvec_ptq1_0_w_f32_a_batched_with_mode(&bytes, &xs, &mut fast2, m, k, n_rows, true);
             assert_bits_eq(&fast, &fast2);
         }
     }
@@ -614,7 +643,9 @@ mod matvec_parallel_parity {
             blk[208..210].copy_from_slice(&d.to_le_bytes());
         }
         let w = quant_tensor(Dtype::Q6_KRaw, bytes, k);
-        let x: Vec<f32> = (0..k).map(|i| ((i * 41 + 13) % 89) as f32 * 0.019 - 0.8).collect();
+        let x: Vec<f32> = (0..k)
+            .map(|i| ((i * 41 + 13) % 89) as f32 * 0.019 - 0.8)
+            .collect();
         let mut par = vec![0.0f32; M];
         let mut ser = vec![0.0f32; M];
         matvec_tensor(&w, &x, &mut par, M, k);
@@ -644,7 +675,9 @@ mod prism_ternary_parity {
     }
 
     fn gen_x(k: usize) -> Vec<f32> {
-        (0..k).map(|i| ((i * 29 + 13) % 101) as f32 * 0.019 - 0.9).collect()
+        (0..k)
+            .map(|i| ((i * 29 + 13) % 101) as f32 * 0.019 - 0.9)
+            .collect()
     }
 
     /// matvec == dequant-to-f32 then f32 matvec, for both codecs.
@@ -781,7 +814,12 @@ mod prism_ternary_parity {
         let mut mv = vec![0f32; 1];
         matvec_ptq1_0_w_f32_a(&blk, &x, &mut mv, 1, QK);
         let dot: f32 = src.iter().zip(&x).map(|(a, b)| a * b).sum();
-        assert!((mv[0] - dot).abs() < 1e-4, "matvec {} vs dot {}", mv[0], dot);
+        assert!(
+            (mv[0] - dot).abs() < 1e-4,
+            "matvec {} vs dot {}",
+            mv[0],
+            dot
+        );
     }
 
     /// Golden PQ2_0: hand-pack one block covering all four codes
@@ -818,13 +856,7 @@ mod prism_ternary_parity {
 ///   weight = d * (code - 1); code 3 (+2d) is part of the codec.
 ///
 /// Requires `k % 128 == 0`.
-pub fn matvec_pq2_0_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_pq2_0_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 34;
     const QK: usize = 128;
     debug_assert_eq!(k % QK, 0, "PQ2_0 matvec requires k % 128 == 0");
@@ -867,13 +899,7 @@ pub fn matvec_pq2_0_w_f32_a(
 /// Element order and extraction mirror `dequant_ptq1_0` exactly.
 ///
 /// Requires `k % 128 == 0`.
-pub fn matvec_ptq1_0_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_ptq1_0_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -929,13 +955,7 @@ std::thread_local! {
 /// tolerance-gated vs `matvec_ptq1_0_w_f32_a`, not bitwise (which is
 /// why it is gated, and why the bitwise batched tests still compare
 /// against the untouched reference kernel).
-pub fn matvec_ptq1_0_w_f32_a_fast(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_ptq1_0_w_f32_a_fast(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -952,9 +972,8 @@ pub fn matvec_ptq1_0_w_f32_a_fast(
                         dvals,
                     );
                     // SAFETY: avx2+fma verified above.
-                    out[i] = unsafe {
-                        ptq1_0_row_dot_i8_avx2_fast(trits, dvals, x, blocks_per_row)
-                    };
+                    out[i] =
+                        unsafe { ptq1_0_row_dot_i8_avx2_fast(trits, dvals, x, blocks_per_row) };
                 }
             });
             return;
@@ -977,8 +996,7 @@ pub fn matvec_ptq1_0_w_f32_a_fast(
                     dvals,
                 );
                 // SAFETY: NEON is always available on aarch64.
-                out[i] =
-                    unsafe { ptq1_0_row_dot_i8_neon_fast(trits, dvals, x, blocks_per_row) };
+                out[i] = unsafe { ptq1_0_row_dot_i8_neon_fast(trits, dvals, x, blocks_per_row) };
             }
         });
         return;
@@ -1147,11 +1165,15 @@ pub(crate) fn matvec_ptq1_0_w_f32_a_batched_with_mode(
                         // SAFETY: avx2+fma verified via use_avx2.
                         unsafe {
                             ptq1_0_rows2_dot_i8_avx2_t3_fast(
-                                &scr.trits[0], &scr.dvals[0],
-                                &scr.trits[1], &scr.dvals[1],
+                                &scr.trits[0],
+                                &scr.dvals[0],
+                                &scr.trits[1],
+                                &scr.dvals[1],
                                 &xs[t * k..(t + 3) * k],
-                                &mut oa, &mut ob,
-                                blocks_per_row, k,
+                                &mut oa,
+                                &mut ob,
+                                blocks_per_row,
+                                k,
                             );
                         }
                         left[t..t + 3].copy_from_slice(&oa);
@@ -1163,10 +1185,16 @@ pub(crate) fn matvec_ptq1_0_w_f32_a_batched_with_mode(
                         // SAFETY: avx2+fma verified via use_avx2.
                         unsafe {
                             left[t] = ptq1_0_row_dot_i8_avx2_fast(
-                                &scr.trits[0], &scr.dvals[0], x, blocks_per_row,
+                                &scr.trits[0],
+                                &scr.dvals[0],
+                                x,
+                                blocks_per_row,
                             );
                             right[t] = ptq1_0_row_dot_i8_avx2_fast(
-                                &scr.trits[1], &scr.dvals[1], x, blocks_per_row,
+                                &scr.trits[1],
+                                &scr.dvals[1],
+                                x,
+                                blocks_per_row,
                             );
                         }
                         t += 1;
@@ -1188,10 +1216,12 @@ pub(crate) fn matvec_ptq1_0_w_f32_a_batched_with_mode(
                         // SAFETY: avx2+fma verified via use_avx2.
                         unsafe {
                             ptq1_0_row_dot_i8_avx2_t6_fast(
-                                &scr.trits[0], &scr.dvals[0],
+                                &scr.trits[0],
+                                &scr.dvals[0],
                                 &xs[t * k..(t + 6) * k],
                                 &mut o6,
-                                blocks_per_row, k,
+                                blocks_per_row,
+                                k,
                             );
                         }
                         row_out[t..t + 6].copy_from_slice(&o6);
@@ -1202,7 +1232,10 @@ pub(crate) fn matvec_ptq1_0_w_f32_a_batched_with_mode(
                         // SAFETY: avx2+fma verified via use_avx2.
                         unsafe {
                             row_out[t] = ptq1_0_row_dot_i8_avx2_fast(
-                                &scr.trits[0], &scr.dvals[0], x, blocks_per_row,
+                                &scr.trits[0],
+                                &scr.dvals[0],
+                                x,
+                                blocks_per_row,
                             );
                         }
                         t += 1;
@@ -1292,10 +1325,16 @@ pub(crate) fn matvec_ptq1_0_w_f32_a_batched_with_mode(
                     while t < n_rows {
                         let x = &xs[t * k..(t + 1) * k];
                         left[t] = ptq1_0_row_dot_decoded_i8(
-                            &scr.trits[0], &scr.dvals[0], x, blocks_per_row,
+                            &scr.trits[0],
+                            &scr.dvals[0],
+                            x,
+                            blocks_per_row,
                         );
                         right[t] = ptq1_0_row_dot_decoded_i8(
-                            &scr.trits[1], &scr.dvals[1], x, blocks_per_row,
+                            &scr.trits[1],
+                            &scr.dvals[1],
+                            x,
+                            blocks_per_row,
                         );
                         t += 1;
                     }
@@ -1344,19 +1383,28 @@ pub(crate) fn matvec_ptq1_0_w_f32_a_batched_with_mode(
                             // SAFETY: NEON is always available on aarch64.
                             unsafe {
                                 ptq1_0_row_dot_i8_neon_fast(
-                                    &scr.trits[0], &scr.dvals[0], x, blocks_per_row,
+                                    &scr.trits[0],
+                                    &scr.dvals[0],
+                                    x,
+                                    blocks_per_row,
                                 )
                             }
                         } else {
                             ptq1_0_row_dot_decoded_i8(
-                                &scr.trits[0], &scr.dvals[0], x, blocks_per_row,
+                                &scr.trits[0],
+                                &scr.dvals[0],
+                                x,
+                                blocks_per_row,
                             )
                         };
                     }
                     #[cfg(not(target_arch = "aarch64"))]
                     {
                         row_out[t] = ptq1_0_row_dot_decoded_i8(
-                            &scr.trits[0], &scr.dvals[0], x, blocks_per_row,
+                            &scr.trits[0],
+                            &scr.dvals[0],
+                            x,
+                            blocks_per_row,
                         );
                     }
                     t += 1;
@@ -1372,12 +1420,9 @@ pub(crate) fn matvec_ptq1_0_w_f32_a_batched_with_mode(
             out_t
                 .par_chunks_mut(chunk_rows * n_rows)
                 .enumerate()
-                .for_each_init(
-                    PtqRowScratch::default,
-                    |scr, (ci, rows_out)| {
-                        body(ci * chunk_rows, rows_out, scr);
-                    },
-                );
+                .for_each_init(PtqRowScratch::default, |scr, (ci, rows_out)| {
+                    body(ci * chunk_rows, rows_out, scr);
+                });
         } else {
             let mut scr = PtqRowScratch::default();
             body(0, out_t, &mut scr);
@@ -1431,10 +1476,26 @@ unsafe fn ptq1_0_row_dot_i8_avx2_fast(
         let mut vs = [_mm256_setzero_ps(); 4];
         for q in 0..4 {
             let base = q * 32;
-            vs[q] = _mm256_fmadd_ps(load_trits8_ps(tb.add(base)), _mm256_loadu_ps(xb.add(base)), vs[q]);
-            vs[q] = _mm256_fmadd_ps(load_trits8_ps(tb.add(base + 8)), _mm256_loadu_ps(xb.add(base + 8)), vs[q]);
-            vs[q] = _mm256_fmadd_ps(load_trits8_ps(tb.add(base + 16)), _mm256_loadu_ps(xb.add(base + 16)), vs[q]);
-            vs[q] = _mm256_fmadd_ps(load_trits8_ps(tb.add(base + 24)), _mm256_loadu_ps(xb.add(base + 24)), vs[q]);
+            vs[q] = _mm256_fmadd_ps(
+                load_trits8_ps(tb.add(base)),
+                _mm256_loadu_ps(xb.add(base)),
+                vs[q],
+            );
+            vs[q] = _mm256_fmadd_ps(
+                load_trits8_ps(tb.add(base + 8)),
+                _mm256_loadu_ps(xb.add(base + 8)),
+                vs[q],
+            );
+            vs[q] = _mm256_fmadd_ps(
+                load_trits8_ps(tb.add(base + 16)),
+                _mm256_loadu_ps(xb.add(base + 16)),
+                vs[q],
+            );
+            vs[q] = _mm256_fmadd_ps(
+                load_trits8_ps(tb.add(base + 24)),
+                _mm256_loadu_ps(xb.add(base + 24)),
+                vs[q],
+            );
         }
         let vsum = _mm256_add_ps(_mm256_add_ps(vs[0], vs[1]), _mm256_add_ps(vs[2], vs[3]));
         vt[b & 3] = _mm256_fmadd_ps(_mm256_set1_ps(dvals[b]), vsum, vt[b & 3]);
@@ -1838,10 +1899,7 @@ unsafe fn decode_ptq1_0_row_trits_i8_avx2(
             );
             let lo = _mm256_castsi256_si128(trit16);
             let hi = _mm256_extracti128_si256::<1>(trit16);
-            _mm_storeu_si128(
-                tb.add(n * 16) as *mut __m128i,
-                _mm_packs_epi16(lo, hi),
-            );
+            _mm_storeu_si128(tb.add(n * 16) as *mut __m128i, _mm_packs_epi16(lo, hi));
         }
         // Chunk 2: qs[16..24], 5 stages x 8 trits -> elements 80..120.
         let c2 = _mm_cvtepu8_epi16(_mm_loadl_epi64(qs.add(16) as *const __m128i));
@@ -1878,19 +1936,12 @@ unsafe fn decode_ptq1_0_row_trits_i8_avx2(
 /// single-kernel FP accumulation exactly (the i8 trits convert to
 /// the identical -1.0/0.0/+1.0 f32 values in-register).
 #[inline]
-fn ptq1_0_row_dot_decoded_i8(
-    trits: &[i8],
-    dvals: &[f32],
-    x: &[f32],
-    blocks_per_row: usize,
-) -> f32 {
+fn ptq1_0_row_dot_decoded_i8(trits: &[i8], dvals: &[f32], x: &[f32], blocks_per_row: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: runtime feature detection above.
-            return unsafe {
-                ptq1_0_row_dot_decoded_i8_avx2(trits, dvals, x, blocks_per_row)
-            };
+            return unsafe { ptq1_0_row_dot_decoded_i8_avx2(trits, dvals, x, blocks_per_row) };
         }
     }
     ptq1_0_row_dot_decoded_i8_scalar(trits, dvals, x, blocks_per_row)
@@ -2161,9 +2212,7 @@ unsafe fn matvec_ptq1_0_w_f32_a_avx2(
             // Widen the 8 bytes into the low 8 u16 lanes; the high 8
             // lanes are zeros, whose trit decodes to 0−1 = −1, so they
             // must NOT touch the accumulator — use the 8-wide half only.
-            let c2 = _mm256_cvtepu8_epi16(_mm_loadl_epi64(
-                qs.as_ptr().add(16) as *const __m128i
-            ));
+            let c2 = _mm256_cvtepu8_epi16(_mm_loadl_epi64(qs.as_ptr().add(16) as *const __m128i));
             for n in 0..5 {
                 let scaled = _mm256_and_si256(
                     _mm256_mullo_epi16(c2, _mm256_set1_epi16(POW3[n] as i16)),
@@ -2175,11 +2224,7 @@ unsafe fn matvec_ptq1_0_w_f32_a_avx2(
                 );
                 let lo_i32 = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(trit16));
                 let lo_f = _mm256_cvtepi32_ps(lo_i32);
-                vacc = _mm256_fmadd_ps(
-                    lo_f,
-                    _mm256_loadu_ps(xb.as_ptr().add(80 + n * 8)),
-                    vacc,
-                );
+                vacc = _mm256_fmadd_ps(lo_f, _mm256_loadu_ps(xb.as_ptr().add(80 + n * 8)), vacc);
             }
 
             // Horizontal sum of the SIMD accumulator.
@@ -2206,13 +2251,7 @@ unsafe fn matvec_ptq1_0_w_f32_a_avx2(
     }
 }
 
-fn matvec_ptq1_0_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_ptq1_0_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 28;
     const QK: usize = 128;
     const QS_BYTES: usize = 24;
@@ -2286,7 +2325,9 @@ fn matvec_ptq1_0_w_f32_a_scalar(
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
-unsafe fn u8x8_to_f32x4x2(v: std::arch::aarch64::uint8x8_t) -> [std::arch::aarch64::float32x4_t; 2] {
+unsafe fn u8x8_to_f32x4x2(
+    v: std::arch::aarch64::uint8x8_t,
+) -> [std::arch::aarch64::float32x4_t; 2] {
     use std::arch::aarch64::*;
     let w16 = vmovl_u8(v);
     [
@@ -2751,10 +2792,26 @@ unsafe fn matvec_iq1_m_w_f32_a_neon(
                 };
                 let qs_chunk = &qs[ib * 4..ib * 4 + 4];
                 let lanes = [
-                    (dl1, delta(qh0 & 0x08 != 0), qs_chunk[0] as usize | (((qh0 & 0x07) as usize) << 8)),
-                    (dl1, delta(qh0 & 0x80 != 0), qs_chunk[1] as usize | ((((qh0 >> 4) & 0x07) as usize) << 8)),
-                    (dl2, delta(qh1 & 0x08 != 0), qs_chunk[2] as usize | (((qh1 & 0x07) as usize) << 8)),
-                    (dl2, delta(qh1 & 0x80 != 0), qs_chunk[3] as usize | ((((qh1 >> 4) & 0x07) as usize) << 8)),
+                    (
+                        dl1,
+                        delta(qh0 & 0x08 != 0),
+                        qs_chunk[0] as usize | (((qh0 & 0x07) as usize) << 8),
+                    ),
+                    (
+                        dl1,
+                        delta(qh0 & 0x80 != 0),
+                        qs_chunk[1] as usize | ((((qh0 >> 4) & 0x07) as usize) << 8),
+                    ),
+                    (
+                        dl2,
+                        delta(qh1 & 0x08 != 0),
+                        qs_chunk[2] as usize | (((qh1 & 0x07) as usize) << 8),
+                    ),
+                    (
+                        dl2,
+                        delta(qh1 & 0x80 != 0),
+                        qs_chunk[3] as usize | ((((qh1 >> 4) & 0x07) as usize) << 8),
+                    ),
                 ];
                 for (l, (dl, delta_val, idx)) in lanes.iter().copied().enumerate() {
                     let grid = IQ1S_GRID[idx].to_le_bytes();
@@ -2779,13 +2836,7 @@ unsafe fn matvec_iq1_m_w_f32_a_neon(
 ///   { d: f16, qs: [u8; 64], qh: [u8; 8], signs: [u8; 32], scales: [u8; 4] }
 ///
 /// Requires `k % 256 == 0`.
-pub fn matvec_iq3_s_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_iq3_s_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 110;
     const QK_K: usize = 256;
     debug_assert_eq!(k % QK_K, 0, "IQ3_S matvec requires k % 256 == 0");
@@ -2817,13 +2868,7 @@ pub fn matvec_iq3_s_w_f32_a(
     matvec_iq3_s_w_f32_a_scalar(w_bytes, x, out, m, k);
 }
 
-fn matvec_iq3_s_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_iq3_s_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use rustllama_gguf::dequant::{IQ3S_GRID, KMASK_IQ2XS};
     const BLOCK_BYTES: usize = 110;
     const QK_K: usize = 256;
@@ -2866,8 +2911,16 @@ fn matvec_iq3_s_w_f32_a_scalar(
                     let x_lo = &x_block[x_off1 + l * 8..x_off1 + l * 8 + 4];
                     let x_hi = &x_block[x_off1 + l * 8 + 4..x_off1 + l * 8 + 8];
                     for j in 0..4 {
-                        let s_lo = if sign_byte & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
-                        let s_hi = if sign_byte & KMASK_IQ2XS[j + 4] != 0 { -1.0 } else { 1.0 };
+                        let s_lo = if sign_byte & KMASK_IQ2XS[j] != 0 {
+                            -1.0
+                        } else {
+                            1.0
+                        };
+                        let s_hi = if sign_byte & KMASK_IQ2XS[j + 4] != 0 {
+                            -1.0
+                        } else {
+                            1.0
+                        };
                         acc += db1 * (g1[j] as f32) * s_lo * x_lo[j];
                         acc += db1 * (g2[j] as f32) * s_hi * x_hi[j];
                     }
@@ -2886,8 +2939,16 @@ fn matvec_iq3_s_w_f32_a_scalar(
                     let x_lo = &x_block[x_off2 + l * 8..x_off2 + l * 8 + 4];
                     let x_hi = &x_block[x_off2 + l * 8 + 4..x_off2 + l * 8 + 8];
                     for j in 0..4 {
-                        let s_lo = if sign_byte & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
-                        let s_hi = if sign_byte & KMASK_IQ2XS[j + 4] != 0 { -1.0 } else { 1.0 };
+                        let s_lo = if sign_byte & KMASK_IQ2XS[j] != 0 {
+                            -1.0
+                        } else {
+                            1.0
+                        };
+                        let s_hi = if sign_byte & KMASK_IQ2XS[j + 4] != 0 {
+                            -1.0
+                        } else {
+                            1.0
+                        };
                         acc += db2 * (g1[j] as f32) * s_lo * x_lo[j];
                         acc += db2 * (g2[j] as f32) * s_hi * x_hi[j];
                     }
@@ -3149,13 +3210,7 @@ unsafe fn matvec_iq3_s_w_f32_a_avx2(
 /// Dispatches AVX-512 → scalar.
 ///
 /// Requires `k % 256 == 0`.
-pub fn matvec_iq2_xxs_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_iq2_xxs_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 66;
     const QK_K: usize = 256;
     debug_assert_eq!(k % QK_K, 0, "IQ2_XXS matvec requires k % 256 == 0");
@@ -3187,13 +3242,7 @@ pub fn matvec_iq2_xxs_w_f32_a(
     matvec_iq2_xxs_w_f32_a_scalar(w_bytes, x, out, m, k);
 }
 
-fn matvec_iq2_xxs_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_iq2_xxs_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use rustllama_gguf::dequant::{IQ2XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
     const BLOCK_BYTES: usize = 66;
     const QK_K: usize = 256;
@@ -3231,7 +3280,11 @@ fn matvec_iq2_xxs_w_f32_a_scalar(
                     let signs = KSIGNS_IQ2XS[((aux1 >> (7 * l)) & 127) as usize];
                     let x_off = ib32 * 32 + l * 8;
                     for j in 0..8 {
-                        let s = if signs & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                        let s = if signs & KMASK_IQ2XS[j] != 0 {
+                            -1.0
+                        } else {
+                            1.0
+                        };
                         acc += db * (grid[j] as f32) * s * x_block[x_off + j];
                     }
                 }
@@ -3252,13 +3305,7 @@ fn matvec_iq2_xxs_w_f32_a_scalar(
 /// indices (low 28 bits).
 ///
 /// Requires `k % 256 == 0`.
-pub fn matvec_iq3_xxs_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_iq3_xxs_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 98;
     const QK_K: usize = 256;
     debug_assert_eq!(k % QK_K, 0, "IQ3_XXS matvec requires k % 256 == 0");
@@ -3290,13 +3337,7 @@ pub fn matvec_iq3_xxs_w_f32_a(
     matvec_iq3_xxs_w_f32_a_scalar(w_bytes, x, out, m, k);
 }
 
-fn matvec_iq3_xxs_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_iq3_xxs_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use rustllama_gguf::dequant::{IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
     const BLOCK_BYTES: usize = 98;
     const QK_K: usize = 256;
@@ -3333,8 +3374,16 @@ fn matvec_iq3_xxs_w_f32_a_scalar(
                     let signs = KSIGNS_IQ2XS[((aux32 >> (7 * l)) & 127) as usize];
                     let x_off = ib32 * 32 + l * 8;
                     for j in 0..4 {
-                        let s_lo = if signs & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
-                        let s_hi = if signs & KMASK_IQ2XS[j + 4] != 0 { -1.0 } else { 1.0 };
+                        let s_lo = if signs & KMASK_IQ2XS[j] != 0 {
+                            -1.0
+                        } else {
+                            1.0
+                        };
+                        let s_hi = if signs & KMASK_IQ2XS[j + 4] != 0 {
+                            -1.0
+                        } else {
+                            1.0
+                        };
                         acc += db * (grid1[j] as f32) * s_lo * x_block[x_off + j];
                         acc += db * (grid2[j] as f32) * s_hi * x_block[x_off + j + 4];
                     }
@@ -3393,8 +3442,14 @@ unsafe fn matvec_iq3_xxs_w_f32_a_avx512(
 
                 let g = &qs_grid[8 * ib32..8 * ib32 + 8];
                 let idx_v = _mm256_set_epi32(
-                    g[7] as i32, g[6] as i32, g[5] as i32, g[4] as i32,
-                    g[3] as i32, g[2] as i32, g[1] as i32, g[0] as i32,
+                    g[7] as i32,
+                    g[6] as i32,
+                    g[5] as i32,
+                    g[4] as i32,
+                    g[3] as i32,
+                    g[2] as i32,
+                    g[1] as i32,
+                    g[0] as i32,
                 );
                 let s0 = KSIGNS_IQ2XS[(aux32 & 127) as usize] as u16;
                 let s1 = KSIGNS_IQ2XS[((aux32 >> 7) & 127) as usize] as u16;
@@ -3492,8 +3547,14 @@ unsafe fn matvec_iq3_xxs_w_f32_a_avx2(
                 let db = d * (0.5 + (aux32 >> 28) as f32) * 0.5;
                 let g = &qs_grid[8 * ib32..8 * ib32 + 8];
                 let idx_v = _mm256_set_epi32(
-                    g[7] as i32, g[6] as i32, g[5] as i32, g[4] as i32,
-                    g[3] as i32, g[2] as i32, g[1] as i32, g[0] as i32,
+                    g[7] as i32,
+                    g[6] as i32,
+                    g[5] as i32,
+                    g[4] as i32,
+                    g[3] as i32,
+                    g[2] as i32,
+                    g[1] as i32,
+                    g[0] as i32,
                 );
                 let sb = [
                     KSIGNS_IQ2XS[(aux32 & 127) as usize] as i32,
@@ -3750,13 +3811,7 @@ unsafe fn matvec_iq2_xxs_w_f32_a_avx2(
 /// Sub-block decode is described in [`rustllama_gguf::dequant::dequant_iq2_xs`].
 ///
 /// Requires `k % 256 == 0`.
-pub fn matvec_iq2_xs_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_iq2_xs_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 74;
     const QK_K: usize = 256;
     debug_assert_eq!(k % QK_K, 0, "IQ2_XS matvec requires k % 256 == 0");
@@ -3788,13 +3843,7 @@ pub fn matvec_iq2_xs_w_f32_a(
     matvec_iq2_xs_w_f32_a_scalar(w_bytes, x, out, m, k);
 }
 
-fn matvec_iq2_xs_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_iq2_xs_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use rustllama_gguf::dequant::{IQ2XS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
     const BLOCK_BYTES: usize = 74;
     const QK_K: usize = 256;
@@ -3825,7 +3874,11 @@ fn matvec_iq2_xs_w_f32_a_scalar(
                     let db = if l < 2 { db_lo } else { db_hi };
                     let x_off = ib32 * 32 + l * 8;
                     for j in 0..8 {
-                        let s = if signs & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                        let s = if signs & KMASK_IQ2XS[j] != 0 {
+                            -1.0
+                        } else {
+                            1.0
+                        };
                         acc += db * (grid[j] as f32) * s * x_block[x_off + j];
                     }
                 }
@@ -3903,10 +3956,8 @@ unsafe fn matvec_iq2_xs_w_f32_a_avx512(
                 let grid_lo_s = _mm512_mask_sub_epi32(grid_lo, mask_lo, zero, grid_lo);
                 let grid_hi_s = _mm512_mask_sub_epi32(grid_hi, mask_hi, zero, grid_hi);
 
-                let term_lo =
-                    _mm512_mul_ps(_mm512_cvtepi32_ps(grid_lo_s), _mm512_set1_ps(db_lo));
-                let term_hi =
-                    _mm512_mul_ps(_mm512_cvtepi32_ps(grid_hi_s), _mm512_set1_ps(db_hi));
+                let term_lo = _mm512_mul_ps(_mm512_cvtepi32_ps(grid_lo_s), _mm512_set1_ps(db_lo));
+                let term_hi = _mm512_mul_ps(_mm512_cvtepi32_ps(grid_hi_s), _mm512_set1_ps(db_hi));
 
                 let x_v_lo = _mm512_loadu_ps(xptr.add(ib32 * 32));
                 let x_v_hi = _mm512_loadu_ps(xptr.add(ib32 * 32 + 16));
@@ -4051,13 +4102,7 @@ unsafe fn matvec_iq2_xs_w_f32_a_avx2(
 /// FMAs against the matching 32 elements of x.
 ///
 /// Requires `k % 256 == 0`.
-pub fn matvec_iq1_s_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_iq1_s_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 50;
     const QK_K: usize = 256;
     debug_assert_eq!(k % QK_K, 0, "IQ1_S matvec requires k % 256 == 0");
@@ -4091,13 +4136,7 @@ pub fn matvec_iq1_s_w_f32_a(
     matvec_iq1_s_w_f32_a_scalar(w_bytes, x, out, m, k);
 }
 
-fn matvec_iq1_s_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_iq1_s_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use rustllama_gguf::dequant::IQ1S_DELTA;
     use rustllama_gguf::iq1_grid::IQ1S_GRID;
     const BLOCK_BYTES: usize = 50;
@@ -4123,8 +4162,7 @@ fn matvec_iq1_s_w_f32_a_scalar(
                     -1.0 + IQ1S_DELTA
                 };
                 for l in 0..4 {
-                    let idx = qs[4 * ib32 + l] as usize
-                        | ((((qh >> (3 * l)) & 7) as usize) << 8);
+                    let idx = qs[4 * ib32 + l] as usize | ((((qh >> (3 * l)) & 7) as usize) << 8);
                     let grid = IQ1S_GRID[idx].to_le_bytes();
                     for j in 0..8 {
                         let g = grid[j] as i8 as f32;
@@ -4323,13 +4361,7 @@ unsafe fn matvec_iq1_s_w_f32_a_avx2(
 /// it's reassembled from the top nibbles of the 4 packed scale words).
 ///
 /// Requires `k % 256 == 0`.
-pub fn matvec_iq1_m_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_iq1_m_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 56;
     const QK_K: usize = 256;
     debug_assert_eq!(k % QK_K, 0, "IQ1_M matvec requires k % 256 == 0");
@@ -4361,13 +4393,7 @@ pub fn matvec_iq1_m_w_f32_a(
     matvec_iq1_m_w_f32_a_scalar(w_bytes, x, out, m, k);
 }
 
-fn matvec_iq1_m_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_iq1_m_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use rustllama_gguf::dequant::IQ1S_DELTA;
     use rustllama_gguf::iq1_grid::IQ1S_GRID;
     const BLOCK_BYTES: usize = 56;
@@ -4534,16 +4560,40 @@ unsafe fn matvec_iq1_m_w_f32_a_avx512(
                 let dl_lo = _mm512_set1_ps(dl1);
                 let dl_hi = _mm512_set1_ps(dl2);
                 let dl_delta_lo = _mm512_setr_ps(
-                    dl1 * d0, dl1 * d0, dl1 * d0, dl1 * d0,
-                    dl1 * d0, dl1 * d0, dl1 * d0, dl1 * d0,
-                    dl1 * d1, dl1 * d1, dl1 * d1, dl1 * d1,
-                    dl1 * d1, dl1 * d1, dl1 * d1, dl1 * d1,
+                    dl1 * d0,
+                    dl1 * d0,
+                    dl1 * d0,
+                    dl1 * d0,
+                    dl1 * d0,
+                    dl1 * d0,
+                    dl1 * d0,
+                    dl1 * d0,
+                    dl1 * d1,
+                    dl1 * d1,
+                    dl1 * d1,
+                    dl1 * d1,
+                    dl1 * d1,
+                    dl1 * d1,
+                    dl1 * d1,
+                    dl1 * d1,
                 );
                 let dl_delta_hi = _mm512_setr_ps(
-                    dl2 * d2, dl2 * d2, dl2 * d2, dl2 * d2,
-                    dl2 * d2, dl2 * d2, dl2 * d2, dl2 * d2,
-                    dl2 * d3, dl2 * d3, dl2 * d3, dl2 * d3,
-                    dl2 * d3, dl2 * d3, dl2 * d3, dl2 * d3,
+                    dl2 * d2,
+                    dl2 * d2,
+                    dl2 * d2,
+                    dl2 * d2,
+                    dl2 * d2,
+                    dl2 * d2,
+                    dl2 * d2,
+                    dl2 * d2,
+                    dl2 * d3,
+                    dl2 * d3,
+                    dl2 * d3,
+                    dl2 * d3,
+                    dl2 * d3,
+                    dl2 * d3,
+                    dl2 * d3,
+                    dl2 * d3,
                 );
                 let val_lo = _mm512_fmadd_ps(dl_lo, grid_lo_f, dl_delta_lo);
                 let val_hi = _mm512_fmadd_ps(dl_hi, grid_hi_f, dl_delta_hi);
@@ -4701,13 +4751,7 @@ pub fn embed_lookup_iq1_m(table_bytes: &[u8], ids: &[i32], out: &mut [f32], d: u
     }
 }
 
-pub fn matvec_iq2_s_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_iq2_s_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 82;
     const QK_K: usize = 256;
     debug_assert_eq!(k % QK_K, 0, "IQ2_S matvec requires k % 256 == 0");
@@ -4739,13 +4783,7 @@ pub fn matvec_iq2_s_w_f32_a(
     matvec_iq2_s_w_f32_a_scalar(w_bytes, x, out, m, k);
 }
 
-fn matvec_iq2_s_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_iq2_s_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use rustllama_gguf::dequant::{IQ2S_GRID, KMASK_IQ2XS};
     const BLOCK_BYTES: usize = 82;
     const QK_K: usize = 256;
@@ -4780,7 +4818,11 @@ fn matvec_iq2_s_w_f32_a_scalar(
                     let db = if l < 2 { db_lo } else { db_hi };
                     let x_off = ib32 * 32 + l * 8;
                     for j in 0..8 {
-                        let s = if sign_byte & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                        let s = if sign_byte & KMASK_IQ2XS[j] != 0 {
+                            -1.0
+                        } else {
+                            1.0
+                        };
                         acc += db * (grid[j] as f32) * s * x_block[x_off + j];
                     }
                 }
@@ -4874,10 +4916,8 @@ unsafe fn matvec_iq2_s_w_f32_a_avx512(
                 let grid_lo_s = _mm512_mask_sub_epi32(grid_lo, mask_lo, zero, grid_lo);
                 let grid_hi_s = _mm512_mask_sub_epi32(grid_hi, mask_hi, zero, grid_hi);
 
-                let term_lo =
-                    _mm512_mul_ps(_mm512_cvtepi32_ps(grid_lo_s), _mm512_set1_ps(db_lo));
-                let term_hi =
-                    _mm512_mul_ps(_mm512_cvtepi32_ps(grid_hi_s), _mm512_set1_ps(db_hi));
+                let term_lo = _mm512_mul_ps(_mm512_cvtepi32_ps(grid_lo_s), _mm512_set1_ps(db_lo));
+                let term_hi = _mm512_mul_ps(_mm512_cvtepi32_ps(grid_hi_s), _mm512_set1_ps(db_hi));
 
                 let x_v_lo = _mm512_loadu_ps(xptr.add(ib32 * 32));
                 let x_v_hi = _mm512_loadu_ps(xptr.add(ib32 * 32 + 16));
@@ -5017,13 +5057,7 @@ unsafe fn matvec_iq2_s_w_f32_a_avx2(
 /// (matches ggml's `dequantize_row_q6_K` layout).
 ///
 /// Requires `k % 256 == 0`.
-pub fn matvec_q6_k_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_q6_k_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 210;
     const QK_K: usize = 256;
     debug_assert_eq!(k % QK_K, 0, "Q6_K matvec requires k % 256 == 0");
@@ -5097,13 +5131,7 @@ unsafe fn build_q6k_strand_neon(
 /// AVX2 path.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn matvec_q6_k_w_f32_a_neon(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_q6_k_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::aarch64::*;
     const BLOCK_BYTES: usize = 210;
     const QK_K: usize = 256;
@@ -5291,13 +5319,7 @@ unsafe fn matvec_q6_k_w_f32_a_avx512(
     }
 }
 
-fn matvec_q6_k_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_q6_k_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 210;
     const QK_K: usize = 256;
     let blocks_per_row = k / QK_K;
@@ -5345,13 +5367,7 @@ fn matvec_q6_k_w_f32_a_scalar(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
-unsafe fn matvec_q6_k_w_f32_a_avx2(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_q6_k_w_f32_a_avx2(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::x86_64::*;
     const BLOCK_BYTES: usize = 210;
     const QK_K: usize = 256;
@@ -5389,7 +5405,7 @@ unsafe fn matvec_q6_k_w_f32_a_avx2(
         let qh_lane = _mm256_cvtepu8_epi32(_mm_loadl_epi64(qh_ptr as *const __m128i));
         let qh_bits = _mm256_and_si256(_mm256_srl_epi32(qh_lane, shift), bit_mask);
         let qh_top = _mm256_slli_epi32(qh_bits, 4); // promote bits 0-1 → bits 4-5
-        // Combine + recenter: (nibble | (qh<<4)) - 32
+                                                    // Combine + recenter: (nibble | (qh<<4)) - 32
         _mm256_sub_epi32(_mm256_or_si256(ql_nibble, qh_top), offset_32)
     }
 
@@ -5405,8 +5421,7 @@ unsafe fn matvec_q6_k_w_f32_a_avx2(
             let ql_ptr = w_bytes.as_ptr().add(off);
             let qh_ptr = w_bytes.as_ptr().add(off + 128);
             let scales_ptr = w_bytes.as_ptr().add(off + 192) as *const i8;
-            let d_bits =
-                u16::from_le_bytes([w_bytes[off + 208], w_bytes[off + 209]]);
+            let d_bits = u16::from_le_bytes([w_bytes[off + 208], w_bytes[off + 209]]);
             let d_scalar = f16::from_bits(d_bits).to_f32();
             let xptr = x.as_ptr().add(b * QK_K);
 
@@ -5425,10 +5440,10 @@ unsafe fn matvec_q6_k_w_f32_a_avx2(
                 //   q3: ql high nibble at offset 0, qh shift 4,  x at offset 64
                 //   q4: ql high nibble at offset 32, qh shift 6, x at offset 96
                 let strand_specs: [(usize, bool, i32, usize, usize); 4] = [
-                    (0, false, 0, 0, 0),  // q1
+                    (0, false, 0, 0, 0),   // q1
                     (32, false, 2, 32, 1), // q2
-                    (0, true, 4, 64, 2),  // q3
-                    (32, true, 6, 96, 3), // q4
+                    (0, true, 4, 64, 2),   // q3
+                    (32, true, 6, 96, 3),  // q4
                 ];
 
                 for (strand_idx, &(ql_off, hi, shift_v, x_off, scale_offset)) in
@@ -5446,10 +5461,10 @@ unsafe fn matvec_q6_k_w_f32_a_avx2(
 
                     // 4 SIMD lanes worth (32 outputs total) per strand.
                     let lane_specs = [
-                        (0usize, d_sa),  // l = 0..8
-                        (8, d_sa),       // l = 8..16
-                        (16, d_sb),      // l = 16..24
-                        (24, d_sb),      // l = 24..32
+                        (0usize, d_sa), // l = 0..8
+                        (8, d_sa),      // l = 8..16
+                        (16, d_sb),     // l = 16..24
+                        (24, d_sb),     // l = 24..32
                     ];
 
                     let acc_base = strand_idx * 4;
@@ -5465,7 +5480,8 @@ unsafe fn matvec_q6_k_w_f32_a_avx2(
                         );
                         let dq = _mm256_mul_ps(d_s, _mm256_cvtepi32_ps(q));
                         let xv = _mm256_loadu_ps(x_base.add(x_off + l_offset));
-                        acc[acc_base + lane_idx] = _mm256_fmadd_ps(dq, xv, acc[acc_base + lane_idx]);
+                        acc[acc_base + lane_idx] =
+                            _mm256_fmadd_ps(dq, xv, acc[acc_base + lane_idx]);
                     }
                 }
             }
@@ -5476,8 +5492,7 @@ unsafe fn matvec_q6_k_w_f32_a_avx2(
         for v in &acc[1..] {
             sum = _mm256_add_ps(sum, *v);
         }
-        let mut sum128 =
-            _mm_add_ps(_mm256_castps256_ps128(sum), _mm256_extractf128_ps(sum, 1));
+        let mut sum128 = _mm_add_ps(_mm256_castps256_ps128(sum), _mm256_extractf128_ps(sum, 1));
         sum128 = _mm_hadd_ps(sum128, sum128);
         sum128 = _mm_hadd_ps(sum128, sum128);
         out[i] = _mm_cvtss_f32(sum128);
@@ -5503,13 +5518,7 @@ pub const KVALUES_IQ4XS: [i8; 16] = [
 /// packed two-per-byte). Dequant: `value = d * sub_scale * kvalues[idx]`.
 ///
 /// Requires `k % 256 == 0` (one full super-block per chunk).
-pub fn matvec_iq4_xs_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_iq4_xs_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 136;
     const QK_K: usize = 256;
     debug_assert_eq!(k % QK_K, 0, "IQ4_XS matvec requires k % 256 == 0");
@@ -5737,8 +5746,7 @@ unsafe fn matvec_iq4_xs_w_f32_a_avx2(
         }
 
         let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
-        let mut sum128 =
-            _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+        let mut sum128 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
         sum128 = _mm_hadd_ps(sum128, sum128);
         sum128 = _mm_hadd_ps(sum128, sum128);
         out[i] = _mm_cvtss_f32(sum128);
@@ -5846,13 +5854,7 @@ unsafe fn matvec_iq4_xs_w_f32_a_avx512(
     }
 }
 
-fn matvec_iq4_xs_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_iq4_xs_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 136;
     const QK_K: usize = 256;
     let blocks_per_row = k / QK_K;
@@ -5862,8 +5864,7 @@ fn matvec_iq4_xs_w_f32_a_scalar(
         for b in 0..blocks_per_row {
             let off = row_start + b * BLOCK_BYTES;
             let d = f16::from_le_bytes([w_bytes[off], w_bytes[off + 1]]).to_f32();
-            let scales_h =
-                u16::from_le_bytes([w_bytes[off + 2], w_bytes[off + 3]]);
+            let scales_h = u16::from_le_bytes([w_bytes[off + 2], w_bytes[off + 3]]);
             let scales_l = &w_bytes[off + 4..off + 8];
             let qs = &w_bytes[off + 8..off + 8 + 128];
             let x_block = &x[b * QK_K..(b + 1) * QK_K];
@@ -5904,13 +5905,7 @@ fn matvec_iq4_xs_w_f32_a_scalar(
 /// per-block scale, no sub-block hierarchy.
 ///
 /// Requires `k % 32 == 0`.
-pub fn matvec_iq4_nl_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_iq4_nl_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 18;
     const QK: usize = 32;
     debug_assert_eq!(k % QK, 0, "IQ4_NL matvec requires k % 32 == 0");
@@ -5988,13 +5983,7 @@ unsafe fn matvec_iq4_nl_w_f32_a_neon(
     }
 }
 
-fn matvec_iq4_nl_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_iq4_nl_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 18;
     const QK: usize = 32;
     let blocks_per_row = k / QK;
@@ -6033,10 +6022,22 @@ unsafe fn matvec_iq4_nl_w_f32_a_avx2(
     let blocks_per_row = k / QK;
 
     let codebook = _mm_setr_epi8(
-        KVALUES_IQ4XS[0], KVALUES_IQ4XS[1], KVALUES_IQ4XS[2], KVALUES_IQ4XS[3],
-        KVALUES_IQ4XS[4], KVALUES_IQ4XS[5], KVALUES_IQ4XS[6], KVALUES_IQ4XS[7],
-        KVALUES_IQ4XS[8], KVALUES_IQ4XS[9], KVALUES_IQ4XS[10], KVALUES_IQ4XS[11],
-        KVALUES_IQ4XS[12], KVALUES_IQ4XS[13], KVALUES_IQ4XS[14], KVALUES_IQ4XS[15],
+        KVALUES_IQ4XS[0],
+        KVALUES_IQ4XS[1],
+        KVALUES_IQ4XS[2],
+        KVALUES_IQ4XS[3],
+        KVALUES_IQ4XS[4],
+        KVALUES_IQ4XS[5],
+        KVALUES_IQ4XS[6],
+        KVALUES_IQ4XS[7],
+        KVALUES_IQ4XS[8],
+        KVALUES_IQ4XS[9],
+        KVALUES_IQ4XS[10],
+        KVALUES_IQ4XS[11],
+        KVALUES_IQ4XS[12],
+        KVALUES_IQ4XS[13],
+        KVALUES_IQ4XS[14],
+        KVALUES_IQ4XS[15],
     );
     let mask_low = _mm_set1_epi8(0x0F);
 
@@ -6062,14 +6063,10 @@ unsafe fn matvec_iq4_nl_w_f32_a_avx2(
             // 16 i8 codebook values → 2 × 8-wide f32 each via sign-extend.
             let lo_upper = _mm_srli_si128(lo_vals_i8, 8);
             let hi_upper = _mm_srli_si128(hi_vals_i8, 8);
-            let lo_first = _mm256_mul_ps(
-                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo_vals_i8)), d);
-            let lo_second = _mm256_mul_ps(
-                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo_upper)), d);
-            let hi_first = _mm256_mul_ps(
-                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi_vals_i8)), d);
-            let hi_second = _mm256_mul_ps(
-                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi_upper)), d);
+            let lo_first = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo_vals_i8)), d);
+            let lo_second = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo_upper)), d);
+            let hi_first = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi_vals_i8)), d);
+            let hi_second = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi_upper)), d);
 
             let x_ptr = x.as_ptr().add(b * QK);
             let x0 = _mm256_loadu_ps(x_ptr);
@@ -6106,14 +6103,22 @@ unsafe fn matvec_iq4_nl_w_f32_a_avx512(
     let blocks_per_row = k / QK;
 
     let codebook = _mm512_setr_epi32(
-        KVALUES_IQ4XS[0] as i32, KVALUES_IQ4XS[1] as i32,
-        KVALUES_IQ4XS[2] as i32, KVALUES_IQ4XS[3] as i32,
-        KVALUES_IQ4XS[4] as i32, KVALUES_IQ4XS[5] as i32,
-        KVALUES_IQ4XS[6] as i32, KVALUES_IQ4XS[7] as i32,
-        KVALUES_IQ4XS[8] as i32, KVALUES_IQ4XS[9] as i32,
-        KVALUES_IQ4XS[10] as i32, KVALUES_IQ4XS[11] as i32,
-        KVALUES_IQ4XS[12] as i32, KVALUES_IQ4XS[13] as i32,
-        KVALUES_IQ4XS[14] as i32, KVALUES_IQ4XS[15] as i32,
+        KVALUES_IQ4XS[0] as i32,
+        KVALUES_IQ4XS[1] as i32,
+        KVALUES_IQ4XS[2] as i32,
+        KVALUES_IQ4XS[3] as i32,
+        KVALUES_IQ4XS[4] as i32,
+        KVALUES_IQ4XS[5] as i32,
+        KVALUES_IQ4XS[6] as i32,
+        KVALUES_IQ4XS[7] as i32,
+        KVALUES_IQ4XS[8] as i32,
+        KVALUES_IQ4XS[9] as i32,
+        KVALUES_IQ4XS[10] as i32,
+        KVALUES_IQ4XS[11] as i32,
+        KVALUES_IQ4XS[12] as i32,
+        KVALUES_IQ4XS[13] as i32,
+        KVALUES_IQ4XS[14] as i32,
+        KVALUES_IQ4XS[15] as i32,
     );
     let nibble_mask = _mm512_set1_epi32(0x0F);
 
@@ -6134,9 +6139,13 @@ unsafe fn matvec_iq4_nl_w_f32_a_avx512(
             let hi_idx = _mm512_and_si512(_mm512_srli_epi32(q_wide, 4), nibble_mask);
 
             let lo_vals = _mm512_mul_ps(
-                _mm512_cvtepi32_ps(_mm512_permutexvar_epi32(lo_idx, codebook)), d);
+                _mm512_cvtepi32_ps(_mm512_permutexvar_epi32(lo_idx, codebook)),
+                d,
+            );
             let hi_vals = _mm512_mul_ps(
-                _mm512_cvtepi32_ps(_mm512_permutexvar_epi32(hi_idx, codebook)), d);
+                _mm512_cvtepi32_ps(_mm512_permutexvar_epi32(hi_idx, codebook)),
+                d,
+            );
 
             let x_ptr = x.as_ptr().add(b * QK);
             let x_lo = _mm512_loadu_ps(x_ptr);
@@ -6158,13 +6167,7 @@ unsafe fn matvec_iq4_nl_w_f32_a_avx512(
 /// `0..32` (within one group of 64 outputs), the 5th bit of the low/high
 /// half comes from `qh[l]`'s bit position `group*2` / `group*2+1`. The
 /// 4 groups all read the same 32 `qh` bytes but at different bit offsets.
-pub fn matvec_q5_k_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_q5_k_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 176;
     const QK_K: usize = 256;
     debug_assert_eq!(k % QK_K, 0, "Q5_K matvec requires k % 256 == 0");
@@ -6205,13 +6208,7 @@ pub fn matvec_q5_k_w_f32_a(
 /// unsigned widen. NEON baseline; same tolerance contract as the AVX2 path.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn matvec_q5_k_w_f32_a_neon(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_q5_k_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::aarch64::*;
     const BLOCK_BYTES: usize = 176;
     const QK_K: usize = 256;
@@ -6286,10 +6283,7 @@ unsafe fn matvec_q5_k_w_f32_a_avx512(
     // Same nibble-split as Q4_K but with the 5th bit pulled in from qh.
     // Each 16-q-byte half yields (lo, hi) ZMM i32x16 lanes of bare nibbles.
     #[inline(always)]
-    unsafe fn unpack_16_q_bytes_avx512(
-        qs_ptr: *const u8,
-        mask: __m512i,
-    ) -> (__m512i, __m512i) {
+    unsafe fn unpack_16_q_bytes_avx512(qs_ptr: *const u8, mask: __m512i) -> (__m512i, __m512i) {
         let raw = _mm_loadu_si128(qs_ptr as *const __m128i);
         let widened = _mm512_cvtepu8_epi32(raw);
         let lo = _mm512_and_si512(widened, mask);
@@ -6378,13 +6372,7 @@ unsafe fn matvec_q5_k_w_f32_a_avx512(
     }
 }
 
-fn matvec_q5_k_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_q5_k_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 176;
     const QK_K: usize = 256;
     let blocks_per_row = k / QK_K;
@@ -6430,13 +6418,7 @@ fn matvec_q5_k_w_f32_a_scalar(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
-unsafe fn matvec_q5_k_w_f32_a_avx2(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_q5_k_w_f32_a_avx2(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::x86_64::*;
     const BLOCK_BYTES: usize = 176;
     const QK_K: usize = 256;
@@ -6450,8 +6432,14 @@ unsafe fn matvec_q5_k_w_f32_a_avx2(
         qs_ptr: *const u8,
         mask: __m256i,
     ) -> (
-        __m256i, __m256i, __m256i, __m256i,
-        __m256i, __m256i, __m256i, __m256i,
+        __m256i,
+        __m256i,
+        __m256i,
+        __m256i,
+        __m256i,
+        __m256i,
+        __m256i,
+        __m256i,
     ) {
         let l07 = _mm256_and_si256(
             _mm256_cvtepu8_epi32(_mm_loadl_epi64(qs_ptr as *const __m128i)),
@@ -6598,8 +6586,10 @@ unsafe fn matvec_q5_k_w_f32_a_avx2(
         let s45 = _mm256_add_ps(acc[4], acc[5]);
         let s67 = _mm256_add_ps(acc[6], acc[7]);
         let total = _mm256_add_ps(_mm256_add_ps(s01, s23), _mm256_add_ps(s45, s67));
-        let mut sum128 =
-            _mm_add_ps(_mm256_castps256_ps128(total), _mm256_extractf128_ps(total, 1));
+        let mut sum128 = _mm_add_ps(
+            _mm256_castps256_ps128(total),
+            _mm256_extractf128_ps(total, 1),
+        );
         sum128 = _mm_hadd_ps(sum128, sum128);
         sum128 = _mm_hadd_ps(sum128, sum128);
         out[i] = _mm_cvtss_f32(sum128);
@@ -6619,13 +6609,7 @@ unsafe fn matvec_q5_k_w_f32_a_avx2(
 /// per 256-weight super-block.
 ///
 /// Requires `k % 256 == 0`.
-pub fn matvec_q2_k_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_q2_k_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 84;
     const QK_K: usize = 256;
     debug_assert_eq!(k % QK_K, 0, "Q2_K matvec requires k % 256 == 0");
@@ -6666,13 +6650,7 @@ pub fn matvec_q2_k_w_f32_a(
 /// contract as the AVX2 path.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn matvec_q2_k_w_f32_a_neon(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_q2_k_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::aarch64::*;
     const BLOCK_BYTES: usize = 84;
     const QK_K: usize = 256;
@@ -6709,7 +6687,8 @@ unsafe fn matvec_q2_k_w_f32_a_neon(
                     let sc_b = scales[is];
                     let dl_b = d * (sc_b & 0xF) as f32;
                     let ml_b = vdupq_n_f32(dmin * (sc_b >> 4) as f32);
-                    let qb16 = u8x16_to_f32x4x4(vandq_u8(vshlq_u8(vld1q_u8(qc.add(16)), neg), three));
+                    let qb16 =
+                        u8x16_to_f32x4x4(vandq_u8(vshlq_u8(vld1q_u8(qc.add(16)), neg), three));
                     for c in 0..4 {
                         let xv = vld1q_f32(xb.add(x_off + c * 4));
                         acc[c] = vfmaq_f32(acc[c], vsubq_f32(vmulq_n_f32(qb16[c], dl_b), ml_b), xv);
@@ -6724,13 +6703,7 @@ unsafe fn matvec_q2_k_w_f32_a_neon(
     }
 }
 
-fn matvec_q2_k_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_q2_k_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 84;
     const QK_K: usize = 256;
     let blocks_per_row = k / QK_K;
@@ -6888,13 +6861,7 @@ unsafe fn matvec_q2_k_w_f32_a_avx512(
 /// stride. Same `fmsub(dl, q, ml)` recipe as the AVX-512 path.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
-unsafe fn matvec_q2_k_w_f32_a_avx2(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_q2_k_w_f32_a_avx2(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::x86_64::*;
     const BLOCK_BYTES: usize = 84;
     const QK_K: usize = 256;
@@ -7051,13 +7018,7 @@ pub fn embed_lookup_q2_k(table_bytes: &[u8], ids: &[i32], out: &mut [f32], d: us
 /// Sub-block decode is described in [`rustllama_gguf::dequant::dequant_q3_k`].
 ///
 /// Requires `k % 256 == 0`.
-pub fn matvec_q3_k_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_q3_k_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 110;
     const QK_K: usize = 256;
     debug_assert_eq!(k % QK_K, 0, "Q3_K matvec requires k % 256 == 0");
@@ -7099,13 +7060,7 @@ pub fn matvec_q3_k_w_f32_a(
 /// tolerance contract as the AVX2 path.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn matvec_q3_k_w_f32_a_neon(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_q3_k_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::aarch64::*;
     const BLOCK_BYTES: usize = 110;
     const QK_K: usize = 256;
@@ -7180,13 +7135,7 @@ unsafe fn matvec_q3_k_w_f32_a_neon(
     }
 }
 
-fn matvec_q3_k_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_q3_k_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 110;
     const QK_K: usize = 256;
     const KMASK1: u32 = 0x03030303;
@@ -7361,20 +7310,20 @@ unsafe fn matvec_q3_k_w_f32_a_avx512(
 
                         let term = match j {
                             0 => lane_512::<0>(
-                                qs_ptr, hmask_ptr, xptr, q_byte_off, h_byte_off,
-                                x_off, dl, m_bit_v, three, four, zero,
+                                qs_ptr, hmask_ptr, xptr, q_byte_off, h_byte_off, x_off, dl,
+                                m_bit_v, three, four, zero,
                             ),
                             1 => lane_512::<2>(
-                                qs_ptr, hmask_ptr, xptr, q_byte_off, h_byte_off,
-                                x_off, dl, m_bit_v, three, four, zero,
+                                qs_ptr, hmask_ptr, xptr, q_byte_off, h_byte_off, x_off, dl,
+                                m_bit_v, three, four, zero,
                             ),
                             2 => lane_512::<4>(
-                                qs_ptr, hmask_ptr, xptr, q_byte_off, h_byte_off,
-                                x_off, dl, m_bit_v, three, four, zero,
+                                qs_ptr, hmask_ptr, xptr, q_byte_off, h_byte_off, x_off, dl,
+                                m_bit_v, three, four, zero,
                             ),
                             _ => lane_512::<6>(
-                                qs_ptr, hmask_ptr, xptr, q_byte_off, h_byte_off,
-                                x_off, dl, m_bit_v, three, four, zero,
+                                qs_ptr, hmask_ptr, xptr, q_byte_off, h_byte_off, x_off, dl,
+                                m_bit_v, three, four, zero,
                             ),
                         };
                         // Four-way round-robin keeps independent FMA chains
@@ -7405,13 +7354,7 @@ unsafe fn matvec_q3_k_w_f32_a_avx512(
 /// build the correction vector.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
-unsafe fn matvec_q3_k_w_f32_a_avx2(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_q3_k_w_f32_a_avx2(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::x86_64::*;
     const BLOCK_BYTES: usize = 110;
     const QK_K: usize = 256;
@@ -7496,24 +7439,56 @@ unsafe fn matvec_q3_k_w_f32_a_avx2(
                         for sub in 0..2 {
                             let term = match j {
                                 0 => lane_256::<0>(
-                                    qs_ptr, hmask_ptr, xptr, q_byte_off + sub * 8,
-                                    h_byte_off + sub * 8, x_off, dl, m_bit_v,
-                                    three, four, zero_i,
+                                    qs_ptr,
+                                    hmask_ptr,
+                                    xptr,
+                                    q_byte_off + sub * 8,
+                                    h_byte_off + sub * 8,
+                                    x_off,
+                                    dl,
+                                    m_bit_v,
+                                    three,
+                                    four,
+                                    zero_i,
                                 ),
                                 1 => lane_256::<2>(
-                                    qs_ptr, hmask_ptr, xptr, q_byte_off + sub * 8,
-                                    h_byte_off + sub * 8, x_off, dl, m_bit_v,
-                                    three, four, zero_i,
+                                    qs_ptr,
+                                    hmask_ptr,
+                                    xptr,
+                                    q_byte_off + sub * 8,
+                                    h_byte_off + sub * 8,
+                                    x_off,
+                                    dl,
+                                    m_bit_v,
+                                    three,
+                                    four,
+                                    zero_i,
                                 ),
                                 2 => lane_256::<4>(
-                                    qs_ptr, hmask_ptr, xptr, q_byte_off + sub * 8,
-                                    h_byte_off + sub * 8, x_off, dl, m_bit_v,
-                                    three, four, zero_i,
+                                    qs_ptr,
+                                    hmask_ptr,
+                                    xptr,
+                                    q_byte_off + sub * 8,
+                                    h_byte_off + sub * 8,
+                                    x_off,
+                                    dl,
+                                    m_bit_v,
+                                    three,
+                                    four,
+                                    zero_i,
                                 ),
                                 _ => lane_256::<6>(
-                                    qs_ptr, hmask_ptr, xptr, q_byte_off + sub * 8,
-                                    h_byte_off + sub * 8, x_off, dl, m_bit_v,
-                                    three, four, zero_i,
+                                    qs_ptr,
+                                    hmask_ptr,
+                                    xptr,
+                                    q_byte_off + sub * 8,
+                                    h_byte_off + sub * 8,
+                                    x_off,
+                                    dl,
+                                    m_bit_v,
+                                    three,
+                                    four,
+                                    zero_i,
                                 ),
                             };
                             let slot = (j * 4 + half * 2 + sub) & 7;
@@ -7545,13 +7520,7 @@ unsafe fn matvec_q3_k_w_f32_a_avx2(
 }
 
 /// Requires `k % 256 == 0` (i.e., k aligned to one full super-block).
-pub fn matvec_q4_k_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_q4_k_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 144;
     const QK_K: usize = 256;
     debug_assert_eq!(k % QK_K, 0, "Q4_K matvec requires k % 256 == 0");
@@ -7604,10 +7573,7 @@ unsafe fn matvec_q4_k_w_f32_a_avx512(
     // unpacked q values matched against 16 x values. Compare to AVX2:
     // 8 YMM lanes of 8. Same data, half the lane count.
     #[inline(always)]
-    unsafe fn unpack_16_q_bytes_avx512(
-        qs_ptr: *const u8,
-        mask: __m512i,
-    ) -> (__m512i, __m512i) {
+    unsafe fn unpack_16_q_bytes_avx512(qs_ptr: *const u8, mask: __m512i) -> (__m512i, __m512i) {
         let raw = _mm_loadu_si128(qs_ptr as *const __m128i);
         let widened = _mm512_cvtepu8_epi32(raw);
         let lo = _mm512_and_si512(widened, mask);
@@ -7690,13 +7656,7 @@ fn unpack_q4k_scales(scales: &[u8]) -> ([u8; 8], [u8; 8]) {
     (sc, mn)
 }
 
-fn matvec_q4_k_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_q4_k_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 144;
     const QK_K: usize = 256;
     let blocks_per_row = k / QK_K;
@@ -7758,13 +7718,7 @@ pub(crate) unsafe fn u8x16_to_f32x4x4(
 /// NEON baseline; tolerance contract like the AVX2 path.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn matvec_q4_k_w_f32_a_neon(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_q4_k_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::aarch64::*;
     const BLOCK_BYTES: usize = 144;
     const QK_K: usize = 256;
@@ -7815,13 +7769,7 @@ unsafe fn matvec_q4_k_w_f32_a_neon(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
-unsafe fn matvec_q4_k_w_f32_a_avx2(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_q4_k_w_f32_a_avx2(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::x86_64::*;
     const BLOCK_BYTES: usize = 144;
     const QK_K: usize = 256;
@@ -7838,11 +7786,19 @@ unsafe fn matvec_q4_k_w_f32_a_avx2(
         qs_ptr: *const u8,
         mask: __m256i,
     ) -> (
-        __m256i, __m256i, __m256i, __m256i,
-        __m256i, __m256i, __m256i, __m256i,
+        __m256i,
+        __m256i,
+        __m256i,
+        __m256i,
+        __m256i,
+        __m256i,
+        __m256i,
+        __m256i,
     ) {
-        let low_07 =
-            _mm256_and_si256(_mm256_cvtepu8_epi32(_mm_loadl_epi64(qs_ptr as *const __m128i)), mask);
+        let low_07 = _mm256_and_si256(
+            _mm256_cvtepu8_epi32(_mm_loadl_epi64(qs_ptr as *const __m128i)),
+            mask,
+        );
         let low_815 = _mm256_and_si256(
             _mm256_cvtepu8_epi32(_mm_loadl_epi64(qs_ptr.add(8) as *const __m128i)),
             mask,
@@ -7856,7 +7812,10 @@ unsafe fn matvec_q4_k_w_f32_a_avx2(
             mask,
         );
         let hi_07 = _mm256_and_si256(
-            _mm256_srli_epi32(_mm256_cvtepu8_epi32(_mm_loadl_epi64(qs_ptr as *const __m128i)), 4),
+            _mm256_srli_epi32(
+                _mm256_cvtepu8_epi32(_mm_loadl_epi64(qs_ptr as *const __m128i)),
+                4,
+            ),
             mask,
         );
         let hi_815 = _mm256_and_si256(
@@ -7881,8 +7840,7 @@ unsafe fn matvec_q4_k_w_f32_a_avx2(
             mask,
         );
         (
-            low_07, low_815, low_1623, low_2431,
-            hi_07, hi_815, hi_1623, hi_2431,
+            low_07, low_815, low_1623, low_2431, hi_07, hi_815, hi_1623, hi_2431,
         )
     }
 
@@ -7953,8 +7911,10 @@ unsafe fn matvec_q4_k_w_f32_a_avx2(
         let s0123 = _mm256_add_ps(s01, s23);
         let s4567 = _mm256_add_ps(s45, s67);
         let total = _mm256_add_ps(s0123, s4567);
-        let mut sum128 =
-            _mm_add_ps(_mm256_castps256_ps128(total), _mm256_extractf128_ps(total, 1));
+        let mut sum128 = _mm_add_ps(
+            _mm256_castps256_ps128(total),
+            _mm256_extractf128_ps(total, 1),
+        );
         sum128 = _mm_hadd_ps(sum128, sum128);
         sum128 = _mm_hadd_ps(sum128, sum128);
         out[i] = _mm_cvtss_f32(sum128);
@@ -8122,8 +8082,7 @@ fn embed_lookup_iq4_nl_scalar(table_bytes: &[u8], ids: &[i32], out: &mut [f32], 
         let dst = &mut out[i * d..(i + 1) * d];
         for b in 0..blocks_per_row {
             let off = row_start + b * BLOCK_BYTES;
-            let d_scale =
-                f16::from_le_bytes([table_bytes[off], table_bytes[off + 1]]).to_f32();
+            let d_scale = f16::from_le_bytes([table_bytes[off], table_bytes[off + 1]]).to_f32();
             let qs = &table_bytes[off + 2..off + 18];
             let dst_chunk = &mut dst[b * QK..(b + 1) * QK];
             for j in 0..16 {
@@ -8147,10 +8106,22 @@ unsafe fn embed_lookup_iq4_nl_avx2(table_bytes: &[u8], ids: &[i32], out: &mut [f
     let row_bytes = blocks_per_row * BLOCK_BYTES;
 
     let codebook = _mm_setr_epi8(
-        KVALUES_IQ4XS[0], KVALUES_IQ4XS[1], KVALUES_IQ4XS[2], KVALUES_IQ4XS[3],
-        KVALUES_IQ4XS[4], KVALUES_IQ4XS[5], KVALUES_IQ4XS[6], KVALUES_IQ4XS[7],
-        KVALUES_IQ4XS[8], KVALUES_IQ4XS[9], KVALUES_IQ4XS[10], KVALUES_IQ4XS[11],
-        KVALUES_IQ4XS[12], KVALUES_IQ4XS[13], KVALUES_IQ4XS[14], KVALUES_IQ4XS[15],
+        KVALUES_IQ4XS[0],
+        KVALUES_IQ4XS[1],
+        KVALUES_IQ4XS[2],
+        KVALUES_IQ4XS[3],
+        KVALUES_IQ4XS[4],
+        KVALUES_IQ4XS[5],
+        KVALUES_IQ4XS[6],
+        KVALUES_IQ4XS[7],
+        KVALUES_IQ4XS[8],
+        KVALUES_IQ4XS[9],
+        KVALUES_IQ4XS[10],
+        KVALUES_IQ4XS[11],
+        KVALUES_IQ4XS[12],
+        KVALUES_IQ4XS[13],
+        KVALUES_IQ4XS[14],
+        KVALUES_IQ4XS[15],
     );
     let mask_low = _mm_set1_epi8(0x0F);
 
@@ -8194,12 +8165,7 @@ unsafe fn embed_lookup_iq4_nl_avx2(table_bytes: &[u8], ids: &[i32], out: &mut [f
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,avx512f")]
-unsafe fn embed_lookup_iq4_nl_avx512(
-    table_bytes: &[u8],
-    ids: &[i32],
-    out: &mut [f32],
-    d: usize,
-) {
+unsafe fn embed_lookup_iq4_nl_avx512(table_bytes: &[u8], ids: &[i32], out: &mut [f32], d: usize) {
     use std::arch::x86_64::*;
     const BLOCK_BYTES: usize = 18;
     const QK: usize = 32;
@@ -8207,14 +8173,22 @@ unsafe fn embed_lookup_iq4_nl_avx512(
     let row_bytes = blocks_per_row * BLOCK_BYTES;
 
     let codebook = _mm512_setr_epi32(
-        KVALUES_IQ4XS[0] as i32, KVALUES_IQ4XS[1] as i32,
-        KVALUES_IQ4XS[2] as i32, KVALUES_IQ4XS[3] as i32,
-        KVALUES_IQ4XS[4] as i32, KVALUES_IQ4XS[5] as i32,
-        KVALUES_IQ4XS[6] as i32, KVALUES_IQ4XS[7] as i32,
-        KVALUES_IQ4XS[8] as i32, KVALUES_IQ4XS[9] as i32,
-        KVALUES_IQ4XS[10] as i32, KVALUES_IQ4XS[11] as i32,
-        KVALUES_IQ4XS[12] as i32, KVALUES_IQ4XS[13] as i32,
-        KVALUES_IQ4XS[14] as i32, KVALUES_IQ4XS[15] as i32,
+        KVALUES_IQ4XS[0] as i32,
+        KVALUES_IQ4XS[1] as i32,
+        KVALUES_IQ4XS[2] as i32,
+        KVALUES_IQ4XS[3] as i32,
+        KVALUES_IQ4XS[4] as i32,
+        KVALUES_IQ4XS[5] as i32,
+        KVALUES_IQ4XS[6] as i32,
+        KVALUES_IQ4XS[7] as i32,
+        KVALUES_IQ4XS[8] as i32,
+        KVALUES_IQ4XS[9] as i32,
+        KVALUES_IQ4XS[10] as i32,
+        KVALUES_IQ4XS[11] as i32,
+        KVALUES_IQ4XS[12] as i32,
+        KVALUES_IQ4XS[13] as i32,
+        KVALUES_IQ4XS[14] as i32,
+        KVALUES_IQ4XS[15] as i32,
     );
     let nibble_mask = _mm512_set1_epi32(0x0F);
 
@@ -8280,10 +8254,8 @@ fn embed_lookup_iq4_xs_scalar(table_bytes: &[u8], ids: &[i32], out: &mut [f32], 
         let dst = &mut out[i * d..(i + 1) * d];
         for b in 0..blocks_per_row {
             let off = row_start + b * BLOCK_BYTES;
-            let d_scale =
-                f16::from_le_bytes([table_bytes[off], table_bytes[off + 1]]).to_f32();
-            let scales_h =
-                u16::from_le_bytes([table_bytes[off + 2], table_bytes[off + 3]]);
+            let d_scale = f16::from_le_bytes([table_bytes[off], table_bytes[off + 1]]).to_f32();
+            let scales_h = u16::from_le_bytes([table_bytes[off + 2], table_bytes[off + 3]]);
             let scales_l = &table_bytes[off + 4..off + 8];
             let qs = &table_bytes[off + 8..off + 8 + 128];
             let dst_block = &mut dst[b * QK_K..(b + 1) * QK_K];
@@ -8320,10 +8292,22 @@ unsafe fn embed_lookup_iq4_xs_avx2(table_bytes: &[u8], ids: &[i32], out: &mut [f
     let row_bytes = blocks_per_row * BLOCK_BYTES;
 
     let codebook = _mm_setr_epi8(
-        KVALUES_IQ4XS[0], KVALUES_IQ4XS[1], KVALUES_IQ4XS[2], KVALUES_IQ4XS[3],
-        KVALUES_IQ4XS[4], KVALUES_IQ4XS[5], KVALUES_IQ4XS[6], KVALUES_IQ4XS[7],
-        KVALUES_IQ4XS[8], KVALUES_IQ4XS[9], KVALUES_IQ4XS[10], KVALUES_IQ4XS[11],
-        KVALUES_IQ4XS[12], KVALUES_IQ4XS[13], KVALUES_IQ4XS[14], KVALUES_IQ4XS[15],
+        KVALUES_IQ4XS[0],
+        KVALUES_IQ4XS[1],
+        KVALUES_IQ4XS[2],
+        KVALUES_IQ4XS[3],
+        KVALUES_IQ4XS[4],
+        KVALUES_IQ4XS[5],
+        KVALUES_IQ4XS[6],
+        KVALUES_IQ4XS[7],
+        KVALUES_IQ4XS[8],
+        KVALUES_IQ4XS[9],
+        KVALUES_IQ4XS[10],
+        KVALUES_IQ4XS[11],
+        KVALUES_IQ4XS[12],
+        KVALUES_IQ4XS[13],
+        KVALUES_IQ4XS[14],
+        KVALUES_IQ4XS[15],
     );
     let mask_low = _mm_set1_epi8(0x0F);
 
@@ -8336,8 +8320,10 @@ unsafe fn embed_lookup_iq4_xs_avx2(table_bytes: &[u8], ids: &[i32], out: &mut [f
             let d_scale = f16::from_bits(d_bits).to_f32();
             let scales_h = u16::from_le_bytes([table_bytes[off + 2], table_bytes[off + 3]]);
             let scales_l = [
-                table_bytes[off + 4], table_bytes[off + 5],
-                table_bytes[off + 6], table_bytes[off + 7],
+                table_bytes[off + 4],
+                table_bytes[off + 5],
+                table_bytes[off + 6],
+                table_bytes[off + 7],
             ];
             let dst_block = &mut dst[b * QK_K..(b + 1) * QK_K];
             for ib in 0..8 {
@@ -8359,22 +8345,14 @@ unsafe fn embed_lookup_iq4_xs_avx2(table_bytes: &[u8], ids: &[i32], out: &mut [f
 
                 let lo_upper = _mm_srli_si128(lo_vals_i8, 8);
                 let hi_upper = _mm_srli_si128(hi_vals_i8, 8);
-                let lo_first = _mm256_mul_ps(
-                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo_vals_i8)),
-                    sub_d,
-                );
-                let lo_second = _mm256_mul_ps(
-                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo_upper)),
-                    sub_d,
-                );
-                let hi_first = _mm256_mul_ps(
-                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi_vals_i8)),
-                    sub_d,
-                );
-                let hi_second = _mm256_mul_ps(
-                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi_upper)),
-                    sub_d,
-                );
+                let lo_first =
+                    _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo_vals_i8)), sub_d);
+                let lo_second =
+                    _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo_upper)), sub_d);
+                let hi_first =
+                    _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi_vals_i8)), sub_d);
+                let hi_second =
+                    _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi_upper)), sub_d);
 
                 let dst_ptr = dst_block.as_mut_ptr().add(ib * 32);
                 _mm256_storeu_ps(dst_ptr, lo_first);
@@ -8388,12 +8366,7 @@ unsafe fn embed_lookup_iq4_xs_avx2(table_bytes: &[u8], ids: &[i32], out: &mut [f
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,avx512f")]
-unsafe fn embed_lookup_iq4_xs_avx512(
-    table_bytes: &[u8],
-    ids: &[i32],
-    out: &mut [f32],
-    d: usize,
-) {
+unsafe fn embed_lookup_iq4_xs_avx512(table_bytes: &[u8], ids: &[i32], out: &mut [f32], d: usize) {
     use std::arch::x86_64::*;
     const BLOCK_BYTES: usize = 136;
     const QK_K: usize = 256;
@@ -8401,14 +8374,22 @@ unsafe fn embed_lookup_iq4_xs_avx512(
     let row_bytes = blocks_per_row * BLOCK_BYTES;
 
     let codebook = _mm512_setr_epi32(
-        KVALUES_IQ4XS[0] as i32, KVALUES_IQ4XS[1] as i32,
-        KVALUES_IQ4XS[2] as i32, KVALUES_IQ4XS[3] as i32,
-        KVALUES_IQ4XS[4] as i32, KVALUES_IQ4XS[5] as i32,
-        KVALUES_IQ4XS[6] as i32, KVALUES_IQ4XS[7] as i32,
-        KVALUES_IQ4XS[8] as i32, KVALUES_IQ4XS[9] as i32,
-        KVALUES_IQ4XS[10] as i32, KVALUES_IQ4XS[11] as i32,
-        KVALUES_IQ4XS[12] as i32, KVALUES_IQ4XS[13] as i32,
-        KVALUES_IQ4XS[14] as i32, KVALUES_IQ4XS[15] as i32,
+        KVALUES_IQ4XS[0] as i32,
+        KVALUES_IQ4XS[1] as i32,
+        KVALUES_IQ4XS[2] as i32,
+        KVALUES_IQ4XS[3] as i32,
+        KVALUES_IQ4XS[4] as i32,
+        KVALUES_IQ4XS[5] as i32,
+        KVALUES_IQ4XS[6] as i32,
+        KVALUES_IQ4XS[7] as i32,
+        KVALUES_IQ4XS[8] as i32,
+        KVALUES_IQ4XS[9] as i32,
+        KVALUES_IQ4XS[10] as i32,
+        KVALUES_IQ4XS[11] as i32,
+        KVALUES_IQ4XS[12] as i32,
+        KVALUES_IQ4XS[13] as i32,
+        KVALUES_IQ4XS[14] as i32,
+        KVALUES_IQ4XS[15] as i32,
     );
     let nibble_mask = _mm512_set1_epi32(0x0F);
 
@@ -8421,8 +8402,10 @@ unsafe fn embed_lookup_iq4_xs_avx512(
             let d_scale = f16::from_bits(d_bits).to_f32();
             let scales_h = u16::from_le_bytes([table_bytes[off + 2], table_bytes[off + 3]]);
             let scales_l = [
-                table_bytes[off + 4], table_bytes[off + 5],
-                table_bytes[off + 6], table_bytes[off + 7],
+                table_bytes[off + 4],
+                table_bytes[off + 5],
+                table_bytes[off + 6],
+                table_bytes[off + 7],
             ];
             let dst_block = &mut dst[b * QK_K..(b + 1) * QK_K];
             for ib in 0..8 {
@@ -8538,9 +8521,12 @@ unsafe fn embed_lookup_q4_k_avx2(table_bytes: &[u8], ids: &[i32], out: &mut [f32
                 // 32 q-bytes → 4 × 8-lane nibble vectors (8 lanes ×
                 // 4 = 32 outputs for low nibbles, similarly for high).
                 let qs_lo32 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(group_qs as *const __m128i));
-                let qs_lo32_b = _mm256_cvtepu8_epi32(_mm_loadl_epi64(group_qs.add(8) as *const __m128i));
-                let qs_lo32_c = _mm256_cvtepu8_epi32(_mm_loadl_epi64(group_qs.add(16) as *const __m128i));
-                let qs_lo32_d = _mm256_cvtepu8_epi32(_mm_loadl_epi64(group_qs.add(24) as *const __m128i));
+                let qs_lo32_b =
+                    _mm256_cvtepu8_epi32(_mm_loadl_epi64(group_qs.add(8) as *const __m128i));
+                let qs_lo32_c =
+                    _mm256_cvtepu8_epi32(_mm_loadl_epi64(group_qs.add(16) as *const __m128i));
+                let qs_lo32_d =
+                    _mm256_cvtepu8_epi32(_mm_loadl_epi64(group_qs.add(24) as *const __m128i));
 
                 let lo_a = _mm256_and_si256(qs_lo32, mask_low_nibble);
                 let lo_b = _mm256_and_si256(qs_lo32_b, mask_low_nibble);
@@ -8587,8 +8573,7 @@ fn embed_lookup_q4_k_scalar(table_bytes: &[u8], ids: &[i32], out: &mut [f32], d:
         for b in 0..blocks_per_row {
             let off = row_start + b * BLOCK_BYTES;
             let d_scale = f16::from_le_bytes([table_bytes[off], table_bytes[off + 1]]).to_f32();
-            let dmin =
-                f16::from_le_bytes([table_bytes[off + 2], table_bytes[off + 3]]).to_f32();
+            let dmin = f16::from_le_bytes([table_bytes[off + 2], table_bytes[off + 3]]).to_f32();
             let (sc, mn) = unpack_q4k_scales(&table_bytes[off + 4..off + 16]);
             let qs = &table_bytes[off + 16..off + 16 + 128];
             let dst_block = &mut dst[b * QK_K..(b + 1) * QK_K];
@@ -8621,10 +8606,7 @@ unsafe fn embed_lookup_q4_k_avx512(table_bytes: &[u8], ids: &[i32], out: &mut [f
 
     // Unpack 16 q-bytes → (lo_nibbles, hi_nibbles) as ZMM i32x16 lanes.
     #[inline(always)]
-    unsafe fn unpack_16_q_bytes_avx512(
-        qs_ptr: *const u8,
-        mask: __m512i,
-    ) -> (__m512i, __m512i) {
+    unsafe fn unpack_16_q_bytes_avx512(qs_ptr: *const u8, mask: __m512i) -> (__m512i, __m512i) {
         let raw = _mm_loadu_si128(qs_ptr as *const __m128i);
         let widened = _mm512_cvtepu8_epi32(raw);
         let lo = _mm512_and_si512(widened, mask);
@@ -8655,8 +8637,7 @@ unsafe fn embed_lookup_q4_k_avx512(table_bytes: &[u8], ids: &[i32], out: &mut [f
                 // Two 16-byte halves of the 32-byte q chunk → 4 ZMM lanes
                 // (2 low + 2 high) of 16 nibbles each.
                 let (lo_a, hi_a) = unpack_16_q_bytes_avx512(group_qs, mask_low_nibble);
-                let (lo_b, hi_b) =
-                    unpack_16_q_bytes_avx512(group_qs.add(16), mask_low_nibble);
+                let (lo_b, hi_b) = unpack_16_q_bytes_avx512(group_qs.add(16), mask_low_nibble);
 
                 // d * q - m for each nibble lane.
                 let lo_a_f = _mm512_fmsub_ps(_mm512_cvtepi32_ps(lo_a), d_lo_v, m_lo_v);
@@ -8710,8 +8691,7 @@ fn embed_lookup_q5_k_scalar(table_bytes: &[u8], ids: &[i32], out: &mut [f32], d:
         for b in 0..blocks_per_row {
             let off = row_start + b * BLOCK_BYTES;
             let d_scale = f16::from_le_bytes([table_bytes[off], table_bytes[off + 1]]).to_f32();
-            let dmin =
-                f16::from_le_bytes([table_bytes[off + 2], table_bytes[off + 3]]).to_f32();
+            let dmin = f16::from_le_bytes([table_bytes[off + 2], table_bytes[off + 3]]).to_f32();
             let (sc, mn) = unpack_q4k_scales(&table_bytes[off + 4..off + 16]);
             let qh = &table_bytes[off + 16..off + 48];
             let qs = &table_bytes[off + 48..off + 48 + 128];
@@ -8754,11 +8734,7 @@ unsafe fn embed_lookup_q5_k_avx2(table_bytes: &[u8], ids: &[i32], out: &mut [f32
     let one = _mm256_set1_epi32(1);
 
     #[inline(always)]
-    unsafe fn qh_high_bits(
-        qh_ptr: *const u8,
-        shift_count: __m128i,
-        one: __m256i,
-    ) -> __m256i {
+    unsafe fn qh_high_bits(qh_ptr: *const u8, shift_count: __m128i, one: __m256i) -> __m256i {
         let qh_lane = _mm256_cvtepu8_epi32(_mm_loadl_epi64(qh_ptr as *const __m128i));
         let shifted = _mm256_srl_epi32(qh_lane, shift_count);
         let bit = _mm256_and_si256(shifted, one);
@@ -8791,8 +8767,10 @@ unsafe fn embed_lookup_q5_k_avx2(table_bytes: &[u8], ids: &[i32], out: &mut [f32
                 // 4 × 8-lane nibble vectors per half (low + high).
                 let qs_a = _mm256_cvtepu8_epi32(_mm_loadl_epi64(group_qs as *const __m128i));
                 let qs_b = _mm256_cvtepu8_epi32(_mm_loadl_epi64(group_qs.add(8) as *const __m128i));
-                let qs_c = _mm256_cvtepu8_epi32(_mm_loadl_epi64(group_qs.add(16) as *const __m128i));
-                let qs_d = _mm256_cvtepu8_epi32(_mm_loadl_epi64(group_qs.add(24) as *const __m128i));
+                let qs_c =
+                    _mm256_cvtepu8_epi32(_mm_loadl_epi64(group_qs.add(16) as *const __m128i));
+                let qs_d =
+                    _mm256_cvtepu8_epi32(_mm_loadl_epi64(group_qs.add(24) as *const __m128i));
 
                 let lo_a = _mm256_and_si256(qs_a, mask_low_nibble);
                 let lo_b = _mm256_and_si256(qs_b, mask_low_nibble);
@@ -9024,8 +9002,7 @@ fn embed_lookup_q5_0_scalar(table_bytes: &[u8], ids: &[i32], out: &mut [f32], d:
         let dst = &mut out[i * d..(i + 1) * d];
         for b in 0..blocks_per_row {
             let off = row_start + b * BLOCK_BYTES;
-            let scale =
-                f16::from_le_bytes([table_bytes[off], table_bytes[off + 1]]).to_f32();
+            let scale = f16::from_le_bytes([table_bytes[off], table_bytes[off + 1]]).to_f32();
             let qh = u32::from_le_bytes([
                 table_bytes[off + 2],
                 table_bytes[off + 3],
@@ -9081,8 +9058,10 @@ unsafe fn embed_lookup_q5_0_avx2(table_bytes: &[u8], ids: &[i32], out: &mut [f32
             let scale_bits = u16::from_le_bytes([table_bytes[off], table_bytes[off + 1]]);
             let scale = _mm256_set1_ps(f16::from_bits(scale_bits).to_f32());
             let qh_u32 = u32::from_le_bytes([
-                table_bytes[off + 2], table_bytes[off + 3],
-                table_bytes[off + 4], table_bytes[off + 5],
+                table_bytes[off + 2],
+                table_bytes[off + 3],
+                table_bytes[off + 4],
+                table_bytes[off + 5],
             ]);
             let qh_vec = _mm256_set1_epi32(qh_u32 as i32);
             let qs_ptr = table_bytes.as_ptr().add(off + 6);
@@ -9097,19 +9076,33 @@ unsafe fn embed_lookup_q5_0_avx2(table_bytes: &[u8], ids: &[i32], out: &mut [f32
 
             // 5-bit signed: (nibble | (qh_bit << 4)) - 16.
             let q0 = _mm256_sub_epi32(
-                _mm256_or_si256(lo_07, high_bits(qh_vec, shifts_0_7, one)), sixteen);
+                _mm256_or_si256(lo_07, high_bits(qh_vec, shifts_0_7, one)),
+                sixteen,
+            );
             let q1 = _mm256_sub_epi32(
-                _mm256_or_si256(lo_815, high_bits(qh_vec, shifts_8_15, one)), sixteen);
+                _mm256_or_si256(lo_815, high_bits(qh_vec, shifts_8_15, one)),
+                sixteen,
+            );
             let q2 = _mm256_sub_epi32(
-                _mm256_or_si256(hi_07, high_bits(qh_vec, shifts_16_23, one)), sixteen);
+                _mm256_or_si256(hi_07, high_bits(qh_vec, shifts_16_23, one)),
+                sixteen,
+            );
             let q3 = _mm256_sub_epi32(
-                _mm256_or_si256(hi_815, high_bits(qh_vec, shifts_24_31, one)), sixteen);
+                _mm256_or_si256(hi_815, high_bits(qh_vec, shifts_24_31, one)),
+                sixteen,
+            );
 
             let dst_ptr = dst.as_mut_ptr().add(b * QK);
             _mm256_storeu_ps(dst_ptr, _mm256_mul_ps(scale, _mm256_cvtepi32_ps(q0)));
             _mm256_storeu_ps(dst_ptr.add(8), _mm256_mul_ps(scale, _mm256_cvtepi32_ps(q1)));
-            _mm256_storeu_ps(dst_ptr.add(16), _mm256_mul_ps(scale, _mm256_cvtepi32_ps(q2)));
-            _mm256_storeu_ps(dst_ptr.add(24), _mm256_mul_ps(scale, _mm256_cvtepi32_ps(q3)));
+            _mm256_storeu_ps(
+                dst_ptr.add(16),
+                _mm256_mul_ps(scale, _mm256_cvtepi32_ps(q2)),
+            );
+            _mm256_storeu_ps(
+                dst_ptr.add(24),
+                _mm256_mul_ps(scale, _mm256_cvtepi32_ps(q3)),
+            );
         }
     }
 }
@@ -9146,8 +9139,10 @@ unsafe fn embed_lookup_q5_0_avx512(table_bytes: &[u8], ids: &[i32], out: &mut [f
             let scale_bits = u16::from_le_bytes([table_bytes[off], table_bytes[off + 1]]);
             let scale = _mm512_set1_ps(f16::from_bits(scale_bits).to_f32());
             let qh_u32 = u32::from_le_bytes([
-                table_bytes[off + 2], table_bytes[off + 3],
-                table_bytes[off + 4], table_bytes[off + 5],
+                table_bytes[off + 2],
+                table_bytes[off + 3],
+                table_bytes[off + 4],
+                table_bytes[off + 5],
             ]);
             let qh_vec = _mm512_set1_epi32(qh_u32 as i32);
 
@@ -9168,7 +9163,10 @@ unsafe fn embed_lookup_q5_0_avx512(table_bytes: &[u8], ids: &[i32], out: &mut [f
 
             let dst_ptr = dst.as_mut_ptr().add(b * QK);
             _mm512_storeu_ps(dst_ptr, _mm512_mul_ps(scale, _mm512_cvtepi32_ps(q_lo)));
-            _mm512_storeu_ps(dst_ptr.add(16), _mm512_mul_ps(scale, _mm512_cvtepi32_ps(q_hi)));
+            _mm512_storeu_ps(
+                dst_ptr.add(16),
+                _mm512_mul_ps(scale, _mm512_cvtepi32_ps(q_hi)),
+            );
         }
     }
 }
@@ -9183,13 +9181,7 @@ unsafe fn embed_lookup_q5_0_avx512(table_bytes: &[u8], ids: &[i32], out: &mut [f
 /// Dispatches AVX-512 → AVX2 → scalar.
 ///
 /// Assumes `k % 32 == 0` (matches real-world Linear weights).
-pub fn matvec_q4_0_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_q4_0_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 18;
     const QK: usize = 32;
     debug_assert_eq!(k % QK, 0);
@@ -9232,13 +9224,7 @@ pub fn matvec_q4_0_w_f32_a(
 /// vector summation) — same tolerance contract as the AVX2 path.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn matvec_q4_0_w_f32_a_neon(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_q4_0_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::aarch64::*;
     const BLOCK_BYTES: usize = 18;
     const QK: usize = 32;
@@ -9272,13 +9258,7 @@ unsafe fn matvec_q4_0_w_f32_a_neon(
     }
 }
 
-fn matvec_q4_0_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_q4_0_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 18;
     const QK: usize = 32;
     let blocks_per_row = k / QK;
@@ -9337,8 +9317,7 @@ unsafe fn matvec_q4_0_w_f32_a_avx512(
             let qs_raw = _mm_loadu_si128(qs_ptr as *const __m128i);
             let qs_lane = _mm512_cvtepu8_epi32(qs_raw);
             let lo_nibbles = _mm512_and_si512(qs_lane, mask_low_nibble);
-            let hi_nibbles =
-                _mm512_and_si512(_mm512_srli_epi32(qs_lane, 4), mask_low_nibble);
+            let hi_nibbles = _mm512_and_si512(_mm512_srli_epi32(qs_lane, 4), mask_low_nibble);
 
             let q_lo = _mm512_sub_epi32(lo_nibbles, eight);
             let q_hi = _mm512_sub_epi32(hi_nibbles, eight);
@@ -9361,13 +9340,7 @@ unsafe fn matvec_q4_0_w_f32_a_avx512(
 /// two YMM ops per block. Same recipe as the AVX-512 path scaled down.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
-unsafe fn matvec_q4_0_w_f32_a_avx2(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_q4_0_w_f32_a_avx2(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::x86_64::*;
     const BLOCK_BYTES: usize = 18;
     const QK: usize = 32;
@@ -9399,11 +9372,9 @@ unsafe fn matvec_q4_0_w_f32_a_avx2(
             let hi_widened = _mm256_cvtepu8_epi32(hi_half);
 
             let lo_lo = _mm256_and_si256(lo_widened, mask_low_nibble);
-            let lo_hi =
-                _mm256_and_si256(_mm256_srli_epi32(lo_widened, 4), mask_low_nibble);
+            let lo_hi = _mm256_and_si256(_mm256_srli_epi32(lo_widened, 4), mask_low_nibble);
             let hi_lo = _mm256_and_si256(hi_widened, mask_low_nibble);
-            let hi_hi =
-                _mm256_and_si256(_mm256_srli_epi32(hi_widened, 4), mask_low_nibble);
+            let hi_hi = _mm256_and_si256(_mm256_srli_epi32(hi_widened, 4), mask_low_nibble);
 
             let q_lo_lo = _mm256_sub_epi32(lo_lo, eight);
             let q_lo_hi = _mm256_sub_epi32(lo_hi, eight);
@@ -9464,13 +9435,7 @@ pub fn embed_lookup_q4_0(table_bytes: &[u8], ids: &[i32], out: &mut [f32], d: us
 /// buffer. Halves memory bandwidth vs F16 storage (≈65% reduction).
 ///
 /// Assumes `k % 32 == 0` (matches real-world Linear weights).
-pub fn matvec_q5_0_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_q5_0_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 22;
     const QK: usize = 32;
     debug_assert_eq!(k % QK, 0, "Q5_0 matvec requires k % 32 == 0");
@@ -9531,13 +9496,7 @@ unsafe fn q5_bit_expand_neon(lo_byte: u8, hi_byte: u8, val: u8) -> std::arch::aa
 /// baseline; same tolerance contract as the AVX2 path.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn matvec_q5_0_w_f32_a_neon(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_q5_0_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::aarch64::*;
     const BLOCK_BYTES: usize = 22;
     const QK: usize = 32;
@@ -9599,9 +9558,7 @@ unsafe fn matvec_q5_0_w_f32_a_avx512(
     // by each lane's count, lets us extract the 5th-bit table for
     // outputs 0..16 (low half) and 16..32 (high half) in one shot per
     // half.
-    let shifts_0_15 = _mm512_setr_epi32(
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-    );
+    let shifts_0_15 = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
     let shifts_16_31 = _mm512_setr_epi32(
         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
     );
@@ -9668,13 +9625,7 @@ unsafe fn matvec_q5_0_w_f32_a_avx512(
     }
 }
 
-fn matvec_q5_0_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_q5_0_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 22;
     const QK: usize = 32;
     let blocks_per_row = k / QK;
@@ -9707,13 +9658,7 @@ fn matvec_q5_0_w_f32_a_scalar(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
-unsafe fn matvec_q5_0_w_f32_a_avx2(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_q5_0_w_f32_a_avx2(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::x86_64::*;
     const BLOCK_BYTES: usize = 22;
     const QK: usize = 32;
@@ -9742,10 +9687,7 @@ unsafe fn matvec_q5_0_w_f32_a_avx2(
     // Unpack 16 bytes of qs into two 256-bit vectors of i32: low nibbles
     // (16 lanes split 8/8) and high nibbles (same).
     #[inline(always)]
-    unsafe fn unpack_qs(
-        qs_ptr: *const u8,
-        mask: __m256i,
-    ) -> (__m256i, __m256i, __m256i, __m256i) {
+    unsafe fn unpack_qs(qs_ptr: *const u8, mask: __m256i) -> (__m256i, __m256i, __m256i, __m256i) {
         // qs_lo: bytes 0..8, qs_hi: bytes 8..16
         let qs_lo8 = _mm_loadl_epi64(qs_ptr as *const __m128i);
         let qs_hi8 = _mm_loadl_epi64(qs_ptr.add(8) as *const __m128i);
@@ -9845,13 +9787,7 @@ unsafe fn matvec_q5_0_w_f32_a_avx2(
 /// Dispatches AVX-512 → AVX2 → scalar.
 ///
 /// Assumes `k % 32 == 0` (matches real-world Linear weights).
-pub fn matvec_q4_1_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m_rows: usize,
-    k: usize,
-) {
+pub fn matvec_q4_1_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m_rows: usize, k: usize) {
     const BLOCK_BYTES: usize = 20;
     const QK: usize = 32;
     debug_assert_eq!(k % QK, 0);
@@ -9930,13 +9866,7 @@ unsafe fn matvec_q4_1_w_f32_a_neon(
     }
 }
 
-fn matvec_q4_1_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m_rows: usize,
-    k: usize,
-) {
+fn matvec_q4_1_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m_rows: usize, k: usize) {
     const BLOCK_BYTES: usize = 20;
     const QK: usize = 32;
     let blocks_per_row = k / QK;
@@ -9991,8 +9921,7 @@ unsafe fn matvec_q4_1_w_f32_a_avx512(
             let qs_raw = _mm_loadu_si128(qs_ptr as *const __m128i);
             let qs_lane = _mm512_cvtepu8_epi32(qs_raw);
             let lo_nibbles = _mm512_and_si512(qs_lane, mask_low_nibble);
-            let hi_nibbles =
-                _mm512_and_si512(_mm512_srli_epi32(qs_lane, 4), mask_low_nibble);
+            let hi_nibbles = _mm512_and_si512(_mm512_srli_epi32(qs_lane, 4), mask_low_nibble);
 
             // dq = d * q + m (one fmadd; q is unsigned, no subtract).
             let dq_lo = _mm512_fmadd_ps(d, _mm512_cvtepi32_ps(lo_nibbles), m_vec);
@@ -10048,11 +9977,9 @@ unsafe fn matvec_q4_1_w_f32_a_avx2(
             let hi_widened = _mm256_cvtepu8_epi32(hi_half);
 
             let lo_lo = _mm256_and_si256(lo_widened, mask_low_nibble);
-            let lo_hi =
-                _mm256_and_si256(_mm256_srli_epi32(lo_widened, 4), mask_low_nibble);
+            let lo_hi = _mm256_and_si256(_mm256_srli_epi32(lo_widened, 4), mask_low_nibble);
             let hi_lo = _mm256_and_si256(hi_widened, mask_low_nibble);
-            let hi_hi =
-                _mm256_and_si256(_mm256_srli_epi32(hi_widened, 4), mask_low_nibble);
+            let hi_hi = _mm256_and_si256(_mm256_srli_epi32(hi_widened, 4), mask_low_nibble);
 
             let dq0 = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(lo_lo), m_vec);
             let dq1 = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(hi_lo), m_vec);
@@ -10107,13 +10034,7 @@ pub fn embed_lookup_q4_1(table_bytes: &[u8], ids: &[i32], out: &mut [f32], d: us
 /// Dispatches AVX-512 → AVX2 → scalar.
 ///
 /// Assumes `k % 32 == 0`.
-pub fn matvec_q5_1_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m_rows: usize,
-    k: usize,
-) {
+pub fn matvec_q5_1_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m_rows: usize, k: usize) {
     const BLOCK_BYTES: usize = 24;
     const QK: usize = 32;
     debug_assert_eq!(k % QK, 0, "Q5_1 matvec requires k % 32 == 0");
@@ -10202,13 +10123,7 @@ unsafe fn matvec_q5_1_w_f32_a_neon(
     }
 }
 
-fn matvec_q5_1_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m_rows: usize,
-    k: usize,
-) {
+fn matvec_q5_1_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m_rows: usize, k: usize) {
     const BLOCK_BYTES: usize = 24;
     const QK: usize = 32;
     let blocks_per_row = k / QK;
@@ -10258,9 +10173,7 @@ unsafe fn matvec_q5_1_w_f32_a_avx512(
     // shifted by each lane's count, gives us the 5th-bit table for
     // outputs 0..16 (low half) and 16..32 (high half) in one shot per
     // half. Same recipe as the Q5_0 AVX-512 path.
-    let shifts_0_15 = _mm512_setr_epi32(
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-    );
+    let shifts_0_15 = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
     let shifts_16_31 = _mm512_setr_epi32(
         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
     );
@@ -10299,8 +10212,7 @@ unsafe fn matvec_q5_1_w_f32_a_avx512(
             let qs_raw = _mm_loadu_si128(qs_ptr as *const __m128i);
             let qs_lane = _mm512_cvtepu8_epi32(qs_raw);
             let lo_nibbles = _mm512_and_si512(qs_lane, mask_low_nibble);
-            let hi_nibbles =
-                _mm512_and_si512(_mm512_srli_epi32(qs_lane, 4), mask_low_nibble);
+            let hi_nibbles = _mm512_and_si512(_mm512_srli_epi32(qs_lane, 4), mask_low_nibble);
 
             // Unsigned 5-bit value: nibble | (high_bit << 4). No subtract.
             let q_lo = _mm512_or_si512(lo_nibbles, high_bits(qh_vec, shifts_0_15, one));
@@ -10350,10 +10262,7 @@ unsafe fn matvec_q5_1_w_f32_a_avx2(
     }
 
     #[inline(always)]
-    unsafe fn unpack_qs(
-        qs_ptr: *const u8,
-        mask: __m256i,
-    ) -> (__m256i, __m256i, __m256i, __m256i) {
+    unsafe fn unpack_qs(qs_ptr: *const u8, mask: __m256i) -> (__m256i, __m256i, __m256i, __m256i) {
         use std::arch::x86_64::*;
         let qs_lo8 = _mm_loadl_epi64(qs_ptr as *const __m128i);
         let qs_hi8 = _mm_loadl_epi64(qs_ptr.add(8) as *const __m128i);
@@ -10417,8 +10326,7 @@ unsafe fn matvec_q5_1_w_f32_a_avx2(
         }
 
         let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
-        let mut sum128 =
-            _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+        let mut sum128 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
         sum128 = _mm_hadd_ps(sum128, sum128);
         sum128 = _mm_hadd_ps(sum128, sum128);
         out[i] = _mm_cvtss_f32(sum128);
@@ -10472,8 +10380,7 @@ fn embed_lookup_q8_0_scalar(table_bytes: &[u8], ids: &[i32], out: &mut [f32], d:
         let dst = &mut out[i * d..(i + 1) * d];
         for b in 0..blocks_per_row {
             let off = row_start + b * BLOCK_BYTES;
-            let scale =
-                f16::from_le_bytes([table_bytes[off], table_bytes[off + 1]]).to_f32();
+            let scale = f16::from_le_bytes([table_bytes[off], table_bytes[off + 1]]).to_f32();
             let qs = &table_bytes[off + 2..off + 2 + QK];
             let dst_chunk = &mut dst[b * QK..(b + 1) * QK];
             for (d_out, q) in dst_chunk.iter_mut().zip(qs.iter()) {
@@ -10504,13 +10411,13 @@ unsafe fn embed_lookup_q8_0_avx2(table_bytes: &[u8], ids: &[i32], out: &mut [f32
                 qs_ptr as *const __m128i,
             )));
             let q1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
-                qs_ptr.add(8) as *const __m128i,
+                qs_ptr.add(8) as *const __m128i
             )));
             let q2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
-                qs_ptr.add(16) as *const __m128i,
+                qs_ptr.add(16) as *const __m128i
             )));
             let q3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
-                qs_ptr.add(24) as *const __m128i,
+                qs_ptr.add(24) as *const __m128i
             )));
             let dst_ptr = dst.as_mut_ptr().add(b * QK);
             _mm256_storeu_ps(dst_ptr, _mm256_mul_ps(scale, q0));
@@ -10542,7 +10449,7 @@ unsafe fn embed_lookup_q8_0_avx512(table_bytes: &[u8], ids: &[i32], out: &mut [f
                 qs_ptr as *const __m128i,
             )));
             let q1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
-                qs_ptr.add(16) as *const __m128i,
+                qs_ptr.add(16) as *const __m128i
             )));
             let dst_ptr = dst.as_mut_ptr().add(b * QK);
             _mm512_storeu_ps(dst_ptr, _mm512_mul_ps(scale, q0));
@@ -10558,13 +10465,7 @@ unsafe fn embed_lookup_q8_0_avx512(table_bytes: &[u8], ids: &[i32], out: &mut [f
 ///
 /// Assumes `k % 32 == 0`. Production LM heads and Linear weights satisfy
 /// this in practice; if it doesn't, we'd need a tail handler.
-pub fn matvec_q8_0_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_q8_0_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 34;
     const QK: usize = 32;
     debug_assert_eq!(k % QK, 0, "Q8_0 matvec requires k % 32 == 0");
@@ -10663,8 +10564,7 @@ fn matvec_q8_0_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usi
         let mut acc = 0.0f32;
         for b in 0..blocks_per_row {
             let block_off = row_start + b * BLOCK_BYTES;
-            let d =
-                f16::from_le_bytes([w_bytes[block_off], w_bytes[block_off + 1]]).to_f32();
+            let d = f16::from_le_bytes([w_bytes[block_off], w_bytes[block_off + 1]]).to_f32();
             let qs = &w_bytes[block_off + 2..block_off + 2 + QK];
             let x_chunk = &x[b * QK..(b + 1) * QK];
             for (q, xv) in qs.iter().zip(x_chunk.iter()) {
@@ -10684,13 +10584,7 @@ fn matvec_q8_0_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usi
 /// summation) — same tolerance contract as the AVX2 path.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn matvec_q8_0_w_f32_a_neon(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_q8_0_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::aarch64::*;
     const BLOCK_BYTES: usize = 34;
     const QK: usize = 32;
@@ -10727,13 +10621,7 @@ unsafe fn matvec_q8_0_w_f32_a_neon(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
-unsafe fn matvec_q8_0_w_f32_a_avx2(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_q8_0_w_f32_a_avx2(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::x86_64::*;
     const BLOCK_BYTES: usize = 34;
     const QK: usize = 32;
@@ -10759,10 +10647,18 @@ unsafe fn matvec_q8_0_w_f32_a_avx2(
             let qs_ptr = w_bytes.as_ptr().add(block_off + 2) as *const i8;
             // _mm_loadl_epi64 loads 8 bytes; _mm256_cvtepi8_epi32 sign-extends
             // 8 i8 → 8 i32; then convert to f32.
-            let q0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(qs_ptr as *const __m128i)));
-            let q1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(qs_ptr.add(8) as *const __m128i)));
-            let q2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(qs_ptr.add(16) as *const __m128i)));
-            let q3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(qs_ptr.add(24) as *const __m128i)));
+            let q0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                qs_ptr as *const __m128i,
+            )));
+            let q1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                qs_ptr.add(8) as *const __m128i
+            )));
+            let q2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                qs_ptr.add(16) as *const __m128i
+            )));
+            let q3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                qs_ptr.add(24) as *const __m128i
+            )));
 
             // Load 32 input activations.
             let xptr = x.as_ptr().add(b * QK);
@@ -10804,13 +10700,7 @@ unsafe fn matvec_q8_0_w_f32_a_avx2(
 /// Dispatches AVX-512 → AVX2 → scalar.
 ///
 /// Requires `k % 256 == 0`.
-pub fn matvec_q8_k_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_q8_k_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 292;
     const QK_K: usize = 256;
     debug_assert_eq!(k % QK_K, 0, "Q8_K matvec requires k % 256 == 0");
@@ -10849,13 +10739,7 @@ pub fn matvec_q8_k_w_f32_a(
 /// row. NEON baseline; same tolerance contract as the AVX2 path.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn matvec_q8_k_w_f32_a_neon(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_q8_k_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::aarch64::*;
     const BLOCK_BYTES: usize = 292;
     const QK_K: usize = 256;
@@ -10893,13 +10777,7 @@ unsafe fn matvec_q8_k_w_f32_a_neon(
     }
 }
 
-fn matvec_q8_k_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_q8_k_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     const BLOCK_BYTES: usize = 292;
     const QK_K: usize = 256;
     let blocks_per_row = k / QK_K;
@@ -10976,13 +10854,7 @@ unsafe fn matvec_q8_k_w_f32_a_avx512(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
-unsafe fn matvec_q8_k_w_f32_a_avx2(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_q8_k_w_f32_a_avx2(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::x86_64::*;
     const BLOCK_BYTES: usize = 292;
     const QK_K: usize = 256;
@@ -11108,7 +10980,9 @@ pub fn install_thread_pool(threads: usize) {
             .build_global()
         {
             Ok(()) => tracing::info!(threads, "CPU thread pool sized via rayon"),
-            Err(e) => tracing::debug!(error = %e, "rayon pool already built; threads setting ignored"),
+            Err(e) => {
+                tracing::debug!(error = %e, "rayon pool already built; threads setting ignored")
+            }
         }
     });
 }
@@ -11187,11 +11061,7 @@ pub fn install_thread_pool_pinned(enabled_cpus: Vec<u32>, threads: usize) {
 /// **byte-identical** to the historical path. The caller gates this on
 /// `[inference].numa_aware`, so it is only reached when the operator opted in
 /// AND the host is genuinely multi-node.
-pub fn install_thread_pool_numa(
-    enabled_cpus: Vec<u32>,
-    threads: usize,
-    topo: &numa::NumaTopology,
-) {
+pub fn install_thread_pool_numa(enabled_cpus: Vec<u32>, threads: usize, topo: &numa::NumaTopology) {
     if !topo.is_multi_node() || enabled_cpus.is_empty() {
         // Single-node / degenerate: historical pinned path, no reordering.
         install_thread_pool_pinned(enabled_cpus, threads);
@@ -11245,13 +11115,7 @@ fn pin_current_thread_to_cpu(cpu: u32) {
     set[word] = 1u64 << (cpu % 64);
     // SAFETY: `set` is a valid 128-byte buffer matching cpu_set_t's size;
     // sched_setaffinity only reads it. libc is linked by the Rust std.
-    let rc = unsafe {
-        sched_setaffinity(
-            0,
-            std::mem::size_of::<[u64; 16]>(),
-            set.as_ptr(),
-        )
-    };
+    let rc = unsafe { sched_setaffinity(0, std::mem::size_of::<[u64; 16]>(), set.as_ptr()) };
     if rc != 0 {
         tracing::debug!(cpu, "sched_setaffinity failed; worker left unpinned");
     }
@@ -11274,13 +11138,7 @@ fn pin_current_thread_to_cpu(_cpu: u32) {
 /// loop as the serial path. `chunk_rows` is heuristic: 32 rows
 /// per chunk keeps work-stealing latency low without producing
 /// tiny tasks.
-pub fn matvec_f16_w_f32_a_parallel(
-    w: &[f16],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_f16_w_f32_a_parallel(w: &[f16], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use rayon::iter::{IndexedParallelIterator, ParallelIterator};
     use rayon::slice::ParallelSliceMut;
     debug_assert_eq!(w.len(), m * k);
@@ -11297,16 +11155,18 @@ pub fn matvec_f16_w_f32_a_parallel(
     // crossover drops to M≈1024.
     let n_threads = rayon::current_num_threads().max(1);
     let chunk_rows = ((m + 4 * n_threads - 1) / (4 * n_threads)).max(64).min(m);
-    out.par_chunks_mut(chunk_rows).enumerate().for_each(|(chunk_idx, out_chunk)| {
-        let row_start = chunk_idx * chunk_rows;
-        let row_end = (row_start + out_chunk.len()).min(m);
-        let w_chunk = &w[row_start * k..row_end * k];
-        let n_rows = out_chunk.len();
-        // Each chunk uses the serial path. Calling the auto-
-        // dispatcher would recurse into rayon and starve the work-
-        // steal queue.
-        matvec_f16_w_f32_a_serial(w_chunk, x, out_chunk, n_rows, k);
-    });
+    out.par_chunks_mut(chunk_rows)
+        .enumerate()
+        .for_each(|(chunk_idx, out_chunk)| {
+            let row_start = chunk_idx * chunk_rows;
+            let row_end = (row_start + out_chunk.len()).min(m);
+            let w_chunk = &w[row_start * k..row_end * k];
+            let n_rows = out_chunk.len();
+            // Each chunk uses the serial path. Calling the auto-
+            // dispatcher would recurse into rayon and starve the work-
+            // steal queue.
+            matvec_f16_w_f32_a_serial(w_chunk, x, out_chunk, n_rows, k);
+        });
 }
 
 pub fn matvec_f16_w_f32_a(w: &[f16], x: &[f32], out: &mut [f32], m: usize, k: usize) {
@@ -11455,13 +11315,7 @@ unsafe fn matvec_f16_w_f32_a_neon(w: &[f16], x: &[f32], out: &mut [f32], m: usiz
 /// Serial F16 matvec — the original SIMD-only path. The public
 /// [`matvec_f16_w_f32_a`] auto-dispatcher picks this for small M;
 /// callers that always want the serial path call this directly.
-pub fn matvec_f16_w_f32_a_serial(
-    w: &[f16],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_f16_w_f32_a_serial(w: &[f16], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(w.len(), m * k);
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(out.len(), m);
@@ -11612,13 +11466,7 @@ unsafe fn matvec_f16_w_f32_a_avx2(w: &[f16], x: &[f32], out: &mut [f32], m: usiz
 /// On x86_64 with AVX-512 → AVX2 + FMA → scalar fallback. The widening
 /// step (`u16 → i32 → shl 16 → reinterpret as f32`) is two instructions
 /// on AVX-512 (`vpmovzxwd` + `vpslld`) and the same on AVX2.
-pub fn matvec_bf16_w_f32_a(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+pub fn matvec_bf16_w_f32_a(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(w_bytes.len(), m * k * 2);
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(out.len(), m);
@@ -11653,13 +11501,7 @@ pub fn matvec_bf16_w_f32_a(
 /// scalar tail. NEON baseline; same tolerance contract as the AVX2 path.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn matvec_bf16_w_f32_a_neon(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_bf16_w_f32_a_neon(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::aarch64::*;
     let k_main = k & !15;
     let k_main4 = k & !3;
@@ -11697,13 +11539,7 @@ unsafe fn matvec_bf16_w_f32_a_neon(
     }
 }
 
-fn matvec_bf16_w_f32_a_scalar(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+fn matvec_bf16_w_f32_a_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     for i in 0..m {
         let row_off = i * k * 2;
         let mut acc = 0.0f32;
@@ -11787,13 +11623,7 @@ unsafe fn matvec_bf16_w_f32_a_avx512(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
-unsafe fn matvec_bf16_w_f32_a_avx2(
-    w_bytes: &[u8],
-    x: &[f32],
-    out: &mut [f32],
-    m: usize,
-    k: usize,
-) {
+unsafe fn matvec_bf16_w_f32_a_avx2(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
     use std::arch::x86_64::*;
     let k_main_16 = k & !15;
     let k_main_8 = k & !7;
@@ -11833,8 +11663,7 @@ unsafe fn matvec_bf16_w_f32_a_avx2(
         }
 
         let acc = _mm256_add_ps(acc0, acc1);
-        let mut sum128 =
-            _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+        let mut sum128 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
         sum128 = _mm_hadd_ps(sum128, sum128);
         sum128 = _mm_hadd_ps(sum128, sum128);
         let mut sum = _mm_cvtss_f32(sum128);
@@ -12610,7 +12439,13 @@ pub fn rope_inplace_neox_sectioned(
     let mut stack_cs = [0.0f32; 2 * STACK_MAX_HALF];
     let heap_cs: Vec<f32>;
     let cs: &[f32] = if half <= STACK_MAX_HALF {
-        fill_sectioned_cs(&mut stack_cs[..2 * half], head_dim, sections, positions, theta);
+        fill_sectioned_cs(
+            &mut stack_cs[..2 * half],
+            head_dim,
+            sections,
+            positions,
+            theta,
+        );
         &stack_cs[..2 * half]
     } else {
         let mut v = vec![0f32; 2 * half];
@@ -13825,7 +13660,11 @@ pub fn gqa_attention_one_step_windowed(
     kv_len: usize,
     window: usize,
 ) {
-    let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+    let start = if window > 0 {
+        kv_len.saturating_sub(window)
+    } else {
+        0
+    };
     if start == 0 {
         gqa_attention_one_step(
             q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
@@ -13866,7 +13705,11 @@ pub fn gqa_attention_one_step_capped_windowed(
         );
         return;
     }
-    let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+    let start = if window > 0 {
+        kv_len.saturating_sub(window)
+    } else {
+        0
+    };
     gqa_attention_one_step_scalar(
         q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, start, softcap,
     );
@@ -14170,7 +14013,11 @@ pub fn gqa_attention_flash_decode_windowed(
     kv_len: usize,
     window: usize,
 ) {
-    let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+    let start = if window > 0 {
+        kv_len.saturating_sub(window)
+    } else {
+        0
+    };
     if start == 0 {
         gqa_attention_flash_decode(
             q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
@@ -14207,7 +14054,11 @@ pub fn gqa_attention_flash_decode_capped_windowed(
         );
         return;
     }
-    let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+    let start = if window > 0 {
+        kv_len.saturating_sub(window)
+    } else {
+        0
+    };
     gqa_attention_flash_decode_scalar(
         q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, start, softcap,
     );
@@ -14269,8 +14120,16 @@ pub fn gqa_attention_flash_prefill(
             // SAFETY: runtime feature detection above.
             unsafe {
                 gqa_attention_flash_prefill_avx512(
-                    q, k_cache, v_cache, out, n_heads, n_kv_heads,
-                    head_dim, max_ctx, kv_len_base, n_new,
+                    q,
+                    k_cache,
+                    v_cache,
+                    out,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
                 );
             }
             return;
@@ -14279,16 +14138,34 @@ pub fn gqa_attention_flash_prefill(
             // SAFETY: runtime feature detection above.
             unsafe {
                 gqa_attention_flash_prefill_avx2(
-                    q, k_cache, v_cache, out, n_heads, n_kv_heads,
-                    head_dim, max_ctx, kv_len_base, n_new,
+                    q,
+                    k_cache,
+                    v_cache,
+                    out,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
                 );
             }
             return;
         }
     }
     gqa_attention_flash_prefill_scalar(
-        q, k_cache, v_cache, out, n_heads, n_kv_heads,
-        head_dim, max_ctx, kv_len_base, n_new, 0, 0.0,
+        q,
+        k_cache,
+        v_cache,
+        out,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        0,
+        0.0,
     );
 }
 
@@ -14312,13 +14189,32 @@ pub fn gqa_attention_flash_prefill_windowed(
 ) {
     if window == 0 {
         gqa_attention_flash_prefill(
-            q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
         );
         return;
     }
     gqa_attention_flash_prefill_scalar(
-        q, k_cache, v_cache, out, n_heads, n_kv_heads,
-        head_dim, max_ctx, kv_len_base, n_new, window, 0.0,
+        q,
+        k_cache,
+        v_cache,
+        out,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        window,
+        0.0,
     );
 }
 
@@ -14344,14 +14240,33 @@ pub fn gqa_attention_flash_prefill_capped_windowed(
 ) {
     if softcap <= 0.0 {
         gqa_attention_flash_prefill_windowed(
-            q, k_cache, v_cache, out, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
             window,
         );
         return;
     }
     gqa_attention_flash_prefill_scalar(
-        q, k_cache, v_cache, out, n_heads, n_kv_heads,
-        head_dim, max_ctx, kv_len_base, n_new, window, softcap,
+        q,
+        k_cache,
+        v_cache,
+        out,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
+        window,
+        softcap,
     );
 }
 
@@ -14450,8 +14365,11 @@ fn gqa_attention_flash_prefill_scalar(
                     }
                     let m_old = m_state[q_pos];
                     let m_new = m_old.max(s);
-                    let rescale =
-                        if m_old.is_finite() { (m_old - m_new).exp() } else { 0.0 };
+                    let rescale = if m_old.is_finite() {
+                        (m_old - m_new).exp()
+                    } else {
+                        0.0
+                    };
                     let p = (s - m_new).exp();
                     l_state[q_pos] = l_state[q_pos] * rescale + p;
                     let out_off = (q_pos * n_heads + h) * head_dim;
@@ -14580,7 +14498,11 @@ pub fn gqa_attention_tree_prefill(
                     s *= scale;
                     let m_old = m_state[q_pos];
                     let m_new = m_old.max(s);
-                    let rescale = if m_old.is_finite() { (m_old - m_new).exp() } else { 0.0 };
+                    let rescale = if m_old.is_finite() {
+                        (m_old - m_new).exp()
+                    } else {
+                        0.0
+                    };
                     let p = (s - m_new).exp();
                     l_state[q_pos] = l_state[q_pos] * rescale + p;
                     let out_off = (q_pos * n_heads + h) * head_dim;
@@ -14675,10 +14597,8 @@ unsafe fn gqa_attention_flash_prefill_avx2(
                         acc = _mm256_fmadd_ps(qv, kv, acc);
                         d += 8;
                     }
-                    let mut sum128 = _mm_add_ps(
-                        _mm256_castps256_ps128(acc),
-                        _mm256_extractf128_ps(acc, 1),
-                    );
+                    let mut sum128 =
+                        _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
                     sum128 = _mm_hadd_ps(sum128, sum128);
                     sum128 = _mm_hadd_ps(sum128, sum128);
                     let mut s = _mm_cvtss_f32(sum128);
@@ -14690,8 +14610,11 @@ unsafe fn gqa_attention_flash_prefill_avx2(
                     // Scalar online-softmax state update.
                     let m_old = m_state[q_pos];
                     let m_new = m_old.max(s);
-                    let rescale =
-                        if m_old.is_finite() { (m_old - m_new).exp() } else { 0.0 };
+                    let rescale = if m_old.is_finite() {
+                        (m_old - m_new).exp()
+                    } else {
+                        0.0
+                    };
                     let p = (s - m_new).exp();
                     l_state[q_pos] = l_state[q_pos] * rescale + p;
                     // V accumulation, vectorized: out[q_pos] = out[q_pos] * rescale + p * v_row.
@@ -14812,8 +14735,11 @@ unsafe fn gqa_attention_flash_prefill_avx512(
                     s *= scale;
                     let m_old = m_state[q_pos];
                     let m_new = m_old.max(s);
-                    let rescale =
-                        if m_old.is_finite() { (m_old - m_new).exp() } else { 0.0 };
+                    let rescale = if m_old.is_finite() {
+                        (m_old - m_new).exp()
+                    } else {
+                        0.0
+                    };
                     let p = (s - m_new).exp();
                     l_state[q_pos] = l_state[q_pos] * rescale + p;
                     let out_off = (q_pos * n_heads + h) * head_dim;
@@ -14908,7 +14834,11 @@ pub(crate) fn gqa_attention_flash_decode_scalar(
             }
             // Update running max + rescale prior accumulations.
             let m_new = m.max(s);
-            let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+            let rescale = if m.is_finite() {
+                (m - m_new).exp()
+            } else {
+                0.0
+            };
             let p = (s - m_new).exp();
             l = l * rescale + p;
             let v_off = (kv_h * max_ctx + t) * head_dim;
@@ -14977,7 +14907,11 @@ unsafe fn gqa_attention_flash_decode_neon(
             s *= scale;
             // Online-softmax update + rescale of the running accumulator.
             let m_new = m.max(s);
-            let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+            let rescale = if m.is_finite() {
+                (m - m_new).exp()
+            } else {
+                0.0
+            };
             let p = (s - m_new).exp();
             l = l * rescale + p;
             let v_off = (kv_h * max_ctx + t) * head_dim;
@@ -15077,7 +15011,11 @@ unsafe fn gqa_attention_flash_decode_avx512(
             s *= scale;
             // Online softmax state update.
             let m_new = m.max(s);
-            let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+            let rescale = if m.is_finite() {
+                (m - m_new).exp()
+            } else {
+                0.0
+            };
             let p = (s - m_new).exp();
             l = l * rescale + p;
             // V accumulation: out_h = out_h * rescale + p * v_row.
@@ -15176,10 +15114,7 @@ unsafe fn gqa_attention_flash_decode_avx2(
             }
             // Horizontal sum of the AVX-2 vector. Two hadd_ps +
             // extractf128 + add_ss reduces 8 floats to scalar.
-            let mut sum128 = _mm_add_ps(
-                _mm256_castps256_ps128(acc),
-                _mm256_extractf128_ps(acc, 1),
-            );
+            let mut sum128 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
             sum128 = _mm_hadd_ps(sum128, sum128);
             sum128 = _mm_hadd_ps(sum128, sum128);
             let mut s = _mm_cvtss_f32(sum128);
@@ -15191,7 +15126,11 @@ unsafe fn gqa_attention_flash_decode_avx2(
             s *= scale;
             // Online softmax state update.
             let m_new = m.max(s);
-            let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+            let rescale = if m.is_finite() {
+                (m - m_new).exp()
+            } else {
+                0.0
+            };
             let p = (s - m_new).exp();
             l = l * rescale + p;
             // V accumulation: out_h = out_h * rescale + p * v_row.
@@ -15266,8 +15205,7 @@ unsafe fn gqa_attention_one_step_avx2(
                 acc = _mm256_fmadd_ps(qv, kv, acc);
                 d += 8;
             }
-            let mut sum128 =
-                _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+            let mut sum128 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
             sum128 = _mm_hadd_ps(sum128, sum128);
             sum128 = _mm_hadd_ps(sum128, sum128);
             let mut acc_scalar = _mm_cvtss_f32(sum128);
@@ -15348,8 +15286,8 @@ pub fn gqa_attention_one_step_q8_0(
             // SAFETY: runtime feature detection.
             unsafe {
                 gqa_attention_one_step_q8_0_avx512(
-                    q, k_q, k_scales, v_q, v_scales, out, n_heads, n_kv_heads, head_dim,
-                    max_ctx, kv_len,
+                    q, k_q, k_scales, v_q, v_scales, out, n_heads, n_kv_heads, head_dim, max_ctx,
+                    kv_len,
                 );
             }
             return;
@@ -15358,8 +15296,8 @@ pub fn gqa_attention_one_step_q8_0(
             // SAFETY: runtime feature detection.
             unsafe {
                 gqa_attention_one_step_q8_0_avx2(
-                    q, k_q, k_scales, v_q, v_scales, out, n_heads, n_kv_heads, head_dim,
-                    max_ctx, kv_len,
+                    q, k_q, k_scales, v_q, v_scales, out, n_heads, n_kv_heads, head_dim, max_ctx,
+                    kv_len,
                 );
             }
             return;
@@ -15558,7 +15496,11 @@ pub fn gqa_attention_one_step_q8_0_capped_windowed(
         );
         return;
     }
-    let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+    let start = if window > 0 {
+        kv_len.saturating_sub(window)
+    } else {
+        0
+    };
     let start = start.min(kv_len);
     let win = kv_len - start;
     let n_gqa = n_heads / n_kv_heads;
@@ -15647,8 +15589,8 @@ pub fn gqa_attention_flash_decode_q8_0(
             // SAFETY: runtime feature detection above.
             unsafe {
                 gqa_attention_flash_decode_q8_0_avx512(
-                    q, k_q, k_scales, v_q, v_scales, out, n_heads, n_kv_heads, head_dim,
-                    max_ctx, kv_len,
+                    q, k_q, k_scales, v_q, v_scales, out, n_heads, n_kv_heads, head_dim, max_ctx,
+                    kv_len,
                 );
             }
             return;
@@ -15657,8 +15599,8 @@ pub fn gqa_attention_flash_decode_q8_0(
             // SAFETY: runtime feature detection above.
             unsafe {
                 gqa_attention_flash_decode_q8_0_avx2(
-                    q, k_q, k_scales, v_q, v_scales, out, n_heads, n_kv_heads, head_dim,
-                    max_ctx, kv_len,
+                    q, k_q, k_scales, v_q, v_scales, out, n_heads, n_kv_heads, head_dim, max_ctx,
+                    kv_len,
                 );
             }
             return;
@@ -15709,7 +15651,11 @@ fn gqa_attention_flash_decode_q8_0_scalar(
             s *= k_row_scale * scale;
             // Online softmax state update.
             let m_new = m.max(s);
-            let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+            let rescale = if m.is_finite() {
+                (m - m_new).exp()
+            } else {
+                0.0
+            };
             let p = (s - m_new).exp();
             l = l * rescale + p;
             let v_off = row_idx * head_dim;
@@ -15772,7 +15718,11 @@ pub fn gqa_attention_flash_decode_q8_0_capped_windowed(
         );
         return;
     }
-    let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+    let start = if window > 0 {
+        kv_len.saturating_sub(window)
+    } else {
+        0
+    };
     let n_gqa = n_heads / n_kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
     for h in 0..n_heads {
@@ -15799,7 +15749,11 @@ pub fn gqa_attention_flash_decode_q8_0_capped_windowed(
                 s = softcap * (s / softcap).tanh();
             }
             let m_new = m.max(s);
-            let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+            let rescale = if m.is_finite() {
+                (m - m_new).exp()
+            } else {
+                0.0
+            };
             let p = (s - m_new).exp();
             l = l * rescale + p;
             let v_off = row_idx * head_dim;
@@ -15865,8 +15819,18 @@ pub fn gqa_attention_flash_prefill_q8_0(
             // SAFETY: runtime feature detection above.
             unsafe {
                 gqa_attention_flash_prefill_q8_0_avx512(
-                    q, k_q, k_scales, v_q, v_scales, out, n_heads, n_kv_heads,
-                    head_dim, max_ctx, kv_len_base, n_new,
+                    q,
+                    k_q,
+                    k_scales,
+                    v_q,
+                    v_scales,
+                    out,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
                 );
             }
             return;
@@ -15875,16 +15839,36 @@ pub fn gqa_attention_flash_prefill_q8_0(
             // SAFETY: runtime feature detection above.
             unsafe {
                 gqa_attention_flash_prefill_q8_0_avx2(
-                    q, k_q, k_scales, v_q, v_scales, out, n_heads, n_kv_heads,
-                    head_dim, max_ctx, kv_len_base, n_new,
+                    q,
+                    k_q,
+                    k_scales,
+                    v_q,
+                    v_scales,
+                    out,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_len_base,
+                    n_new,
                 );
             }
             return;
         }
     }
     gqa_attention_flash_prefill_q8_0_scalar(
-        q, k_q, k_scales, v_q, v_scales, out, n_heads, n_kv_heads,
-        head_dim, max_ctx, kv_len_base, n_new,
+        q,
+        k_q,
+        k_scales,
+        v_q,
+        v_scales,
+        out,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_ctx,
+        kv_len_base,
+        n_new,
     );
 }
 
@@ -15929,7 +15913,11 @@ fn gqa_attention_flash_prefill_q8_0_scalar(
                 }
                 s *= k_row_scale * scale;
                 let m_new = m.max(s);
-                let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+                let rescale = if m.is_finite() {
+                    (m - m_new).exp()
+                } else {
+                    0.0
+                };
                 let p = (s - m_new).exp();
                 l = l * rescale + p;
                 let v_off = row_idx * head_dim;
@@ -15987,8 +15975,18 @@ pub fn gqa_attention_flash_prefill_q8_0_capped_windowed(
     // Full-causal, no cap ⇒ the SIMD-dispatched base kernel, bit-identical.
     if window == 0 && softcap <= 0.0 {
         gqa_attention_flash_prefill_q8_0(
-            q, k_q, k_scales, v_q, v_scales, out, n_heads, n_kv_heads, head_dim, max_ctx,
-            kv_len_base, n_new,
+            q,
+            k_q,
+            k_scales,
+            v_q,
+            v_scales,
+            out,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
         );
         return;
     }
@@ -15996,7 +15994,11 @@ pub fn gqa_attention_flash_prefill_q8_0_capped_windowed(
     let scale = 1.0 / (head_dim as f32).sqrt();
     for i in 0..n_new {
         let kv_len_i = kv_len_base + i + 1;
-        let start_i = if window > 0 { kv_len_i.saturating_sub(window) } else { 0 };
+        let start_i = if window > 0 {
+            kv_len_i.saturating_sub(window)
+        } else {
+            0
+        };
         let q_base = i * n_heads * head_dim;
         let out_base = i * n_heads * head_dim;
         for h in 0..n_heads {
@@ -16022,7 +16024,11 @@ pub fn gqa_attention_flash_prefill_q8_0_capped_windowed(
                     s = softcap * (s / softcap).tanh();
                 }
                 let m_new = m.max(s);
-                let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+                let rescale = if m.is_finite() {
+                    (m - m_new).exp()
+                } else {
+                    0.0
+                };
                 let p = (s - m_new).exp();
                 l = l * rescale + p;
                 let v_off = row_idx * head_dim;
@@ -16111,10 +16117,8 @@ unsafe fn gqa_attention_flash_prefill_q8_0_avx2(
                     acc = _mm256_fmadd_ps(qv, kv, acc);
                     d += 8;
                 }
-                let mut sum128 = _mm_add_ps(
-                    _mm256_castps256_ps128(acc),
-                    _mm256_extractf128_ps(acc, 1),
-                );
+                let mut sum128 =
+                    _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
                 sum128 = _mm_hadd_ps(sum128, sum128);
                 sum128 = _mm_hadd_ps(sum128, sum128);
                 let mut s = _mm_cvtss_f32(sum128);
@@ -16124,7 +16128,11 @@ unsafe fn gqa_attention_flash_prefill_q8_0_avx2(
                 }
                 s *= k_row_scale * scale;
                 let m_new = m.max(s);
-                let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+                let rescale = if m.is_finite() {
+                    (m - m_new).exp()
+                } else {
+                    0.0
+                };
                 let p = (s - m_new).exp();
                 l = l * rescale + p;
                 let v_off = row_idx * head_dim;
@@ -16235,7 +16243,11 @@ unsafe fn gqa_attention_flash_prefill_q8_0_avx512(
                 }
                 s *= k_row_scale * scale;
                 let m_new = m.max(s);
-                let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+                let rescale = if m.is_finite() {
+                    (m - m_new).exp()
+                } else {
+                    0.0
+                };
                 let p = (s - m_new).exp();
                 l = l * rescale + p;
                 let v_off = row_idx * head_dim;
@@ -16343,7 +16355,11 @@ unsafe fn gqa_attention_flash_decode_q8_0_avx512(
             }
             s *= k_row_scale * scale;
             let m_new = m.max(s);
-            let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+            let rescale = if m.is_finite() {
+                (m - m_new).exp()
+            } else {
+                0.0
+            };
             let p = (s - m_new).exp();
             l = l * rescale + p;
             let v_off = row_idx * head_dim;
@@ -16445,10 +16461,7 @@ unsafe fn gqa_attention_flash_decode_q8_0_avx2(
                 acc = _mm256_fmadd_ps(qv, kv, acc);
                 d += 8;
             }
-            let mut sum128 = _mm_add_ps(
-                _mm256_castps256_ps128(acc),
-                _mm256_extractf128_ps(acc, 1),
-            );
+            let mut sum128 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
             sum128 = _mm_hadd_ps(sum128, sum128);
             sum128 = _mm_hadd_ps(sum128, sum128);
             let mut s = _mm_cvtss_f32(sum128);
@@ -16459,7 +16472,11 @@ unsafe fn gqa_attention_flash_decode_q8_0_avx2(
             s *= k_row_scale * scale;
             // Online softmax state update.
             let m_new = m.max(s);
-            let rescale = if m.is_finite() { (m - m_new).exp() } else { 0.0 };
+            let rescale = if m.is_finite() {
+                (m - m_new).exp()
+            } else {
+                0.0
+            };
             let p = (s - m_new).exp();
             l = l * rescale + p;
             // V accumulation, vectorized: out_h = out_h*rescale + p_eff*v_row.
@@ -16550,8 +16567,7 @@ unsafe fn gqa_attention_one_step_q8_0_avx2(
                 d += 8;
             }
             // Horizontal reduce.
-            let mut sum128 =
-                _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+            let mut sum128 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
             sum128 = _mm_hadd_ps(sum128, sum128);
             sum128 = _mm_hadd_ps(sum128, sum128);
             let mut acc_scalar = _mm_cvtss_f32(sum128);
@@ -16712,7 +16728,9 @@ mod tests {
             |j| (63 - (j * 5) % 63) as u8,
             |j| ((j * 13 + j * j) % 63) as u8,
         ];
-        for (sc_pat, mn_pat) in patterns.iter().flat_map(|s| patterns.iter().map(move |m| (s, m)))
+        for (sc_pat, mn_pat) in patterns
+            .iter()
+            .flat_map(|s| patterns.iter().map(move |m| (s, m)))
         {
             let mut sc = [0u8; 8];
             let mut mn = [0u8; 8];
@@ -16751,12 +16769,26 @@ mod tests {
         let mut out_standard = vec![0f32; n_heads * head_dim];
         let mut out_flash = vec![0f32; n_heads * head_dim];
         gqa_attention_one_step(
-            &q, &k_cache, &v_cache, &mut out_standard,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            &q,
+            &k_cache,
+            &v_cache,
+            &mut out_standard,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
         );
         gqa_attention_flash_decode(
-            &q, &k_cache, &v_cache, &mut out_flash,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            &q,
+            &k_cache,
+            &v_cache,
+            &mut out_flash,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
         );
         let mut max_err = 0f32;
         for (a, b) in out_standard.iter().zip(out_flash.iter()) {
@@ -16819,12 +16851,30 @@ mod tests {
         let mut out_standard = vec![0f32; n_heads * head_dim];
         let mut out_flash = vec![0f32; n_heads * head_dim];
         gqa_attention_one_step_q8_0(
-            &q, &k_q, &k_scales, &v_q, &v_scales, &mut out_standard,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            &q,
+            &k_q,
+            &k_scales,
+            &v_q,
+            &v_scales,
+            &mut out_standard,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
         );
         gqa_attention_flash_decode_q8_0(
-            &q, &k_q, &k_scales, &v_q, &v_scales, &mut out_flash,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            &q,
+            &k_q,
+            &k_scales,
+            &v_q,
+            &v_scales,
+            &mut out_flash,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
         );
         let mut max_err = 0f32;
         for (a, b) in out_standard.iter().zip(out_flash.iter()) {
@@ -16900,7 +16950,11 @@ mod tests {
     ) {
         let n_gqa = n_heads / n_kv_heads;
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let start = if window > 0 { kv_len.saturating_sub(window) } else { 0 };
+        let start = if window > 0 {
+            kv_len.saturating_sub(window)
+        } else {
+            0
+        };
         for h in 0..n_heads {
             let kv_h = h / n_gqa;
             let q_h = &q[h * head_dim..(h + 1) * head_dim];
@@ -16948,33 +17002,94 @@ mod tests {
         let head_dim = 16;
         let max_ctx = 64;
         let kv_len = 20;
-        let (k_q, k_scales, v_q, v_scales) = q8_0_build_cache(n_kv_heads, head_dim, max_ctx, kv_len);
-        let q: Vec<f32> = (0..n_heads * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.12).collect();
+        let (k_q, k_scales, v_q, v_scales) =
+            q8_0_build_cache(n_kv_heads, head_dim, max_ctx, kv_len);
+        let q: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.12)
+            .collect();
 
         // Decode passthrough.
         let mut base = vec![0f32; n_heads * head_dim];
         let mut cw = vec![0f32; n_heads * head_dim];
-        gqa_attention_flash_decode_q8_0(&q, &k_q, &k_scales, &v_q, &v_scales, &mut base, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
-        gqa_attention_flash_decode_q8_0_capped_windowed(&q, &k_q, &k_scales, &v_q, &v_scales, &mut cw, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0);
+        gqa_attention_flash_decode_q8_0(
+            &q, &k_q, &k_scales, &v_q, &v_scales, &mut base, n_heads, n_kv_heads, head_dim,
+            max_ctx, kv_len,
+        );
+        gqa_attention_flash_decode_q8_0_capped_windowed(
+            &q, &k_q, &k_scales, &v_q, &v_scales, &mut cw, n_heads, n_kv_heads, head_dim, max_ctx,
+            kv_len, 0, 0.0,
+        );
         assert_eq!(base, cw, "q8_0 flash-decode passthrough not bit-identical");
 
         // One-step passthrough.
         let mut base_os = vec![0f32; n_heads * head_dim];
         let mut cw_os = vec![0f32; n_heads * head_dim];
-        gqa_attention_one_step_q8_0(&q, &k_q, &k_scales, &v_q, &v_scales, &mut base_os, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
-        gqa_attention_one_step_q8_0_capped_windowed(&q, &k_q, &k_scales, &v_q, &v_scales, &mut cw_os, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0);
-        assert_eq!(base_os, cw_os, "q8_0 one-step passthrough not bit-identical");
+        gqa_attention_one_step_q8_0(
+            &q,
+            &k_q,
+            &k_scales,
+            &v_q,
+            &v_scales,
+            &mut base_os,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
+        );
+        gqa_attention_one_step_q8_0_capped_windowed(
+            &q, &k_q, &k_scales, &v_q, &v_scales, &mut cw_os, n_heads, n_kv_heads, head_dim,
+            max_ctx, kv_len, 0, 0.0,
+        );
+        assert_eq!(
+            base_os, cw_os,
+            "q8_0 one-step passthrough not bit-identical"
+        );
 
         // Prefill passthrough.
         let kv_len_base = 8;
         let n_new = 6;
-        let (k_q2, k_scales2, v_q2, v_scales2) = q8_0_build_cache(n_kv_heads, head_dim, max_ctx, kv_len_base + n_new);
-        let qp: Vec<f32> = (0..n_new * n_heads * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.12).collect();
+        let (k_q2, k_scales2, v_q2, v_scales2) =
+            q8_0_build_cache(n_kv_heads, head_dim, max_ctx, kv_len_base + n_new);
+        let qp: Vec<f32> = (0..n_new * n_heads * head_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.12)
+            .collect();
         let mut base_pf = vec![0f32; n_new * n_heads * head_dim];
         let mut cw_pf = vec![0f32; n_new * n_heads * head_dim];
-        gqa_attention_flash_prefill_q8_0(&qp, &k_q2, &k_scales2, &v_q2, &v_scales2, &mut base_pf, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new);
-        gqa_attention_flash_prefill_q8_0_capped_windowed(&qp, &k_q2, &k_scales2, &v_q2, &v_scales2, &mut cw_pf, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, 0, 0.0);
-        assert_eq!(base_pf, cw_pf, "q8_0 flash-prefill passthrough not bit-identical");
+        gqa_attention_flash_prefill_q8_0(
+            &qp,
+            &k_q2,
+            &k_scales2,
+            &v_q2,
+            &v_scales2,
+            &mut base_pf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+        );
+        gqa_attention_flash_prefill_q8_0_capped_windowed(
+            &qp,
+            &k_q2,
+            &k_scales2,
+            &v_q2,
+            &v_scales2,
+            &mut cw_pf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            0,
+            0.0,
+        );
+        assert_eq!(
+            base_pf, cw_pf,
+            "q8_0 flash-prefill passthrough not bit-identical"
+        );
     }
 
     #[test]
@@ -16984,31 +17099,80 @@ mod tests {
         let head_dim = 16;
         let max_ctx = 64;
         let kv_len = 5;
-        let (k_q, k_scales, v_q, v_scales) = q8_0_build_cache(n_kv_heads, head_dim, max_ctx, kv_len);
-        let q: Vec<f32> = (0..n_heads * head_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.12).collect();
+        let (k_q, k_scales, v_q, v_scales) =
+            q8_0_build_cache(n_kv_heads, head_dim, max_ctx, kv_len);
+        let q: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.12)
+            .collect();
 
         // (b) windowed: window=2, kv_len=5 — flash-decode AND one_step match naive.
         let mut naive = vec![0f32; n_heads * head_dim];
-        naive_q8_0_decode_ref(&q, &k_q, &k_scales, &v_q, &v_scales, &mut naive, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 2, 0.0);
+        naive_q8_0_decode_ref(
+            &q, &k_q, &k_scales, &v_q, &v_scales, &mut naive, n_heads, n_kv_heads, head_dim,
+            max_ctx, kv_len, 2, 0.0,
+        );
         let mut flash = vec![0f32; n_heads * head_dim];
-        gqa_attention_flash_decode_q8_0_capped_windowed(&q, &k_q, &k_scales, &v_q, &v_scales, &mut flash, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 2, 0.0);
+        gqa_attention_flash_decode_q8_0_capped_windowed(
+            &q, &k_q, &k_scales, &v_q, &v_scales, &mut flash, n_heads, n_kv_heads, head_dim,
+            max_ctx, kv_len, 2, 0.0,
+        );
         let mut os = vec![0f32; n_heads * head_dim];
-        gqa_attention_one_step_q8_0_capped_windowed(&q, &k_q, &k_scales, &v_q, &v_scales, &mut os, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 2, 0.0);
+        gqa_attention_one_step_q8_0_capped_windowed(
+            &q, &k_q, &k_scales, &v_q, &v_scales, &mut os, n_heads, n_kv_heads, head_dim, max_ctx,
+            kv_len, 2, 0.0,
+        );
         for ((f, o), n) in flash.iter().zip(os.iter()).zip(naive.iter()) {
             assert!((f - n).abs() < 1e-5, "q8_0 windowed flash {f} vs naive {n}");
-            assert!((o - n).abs() < 1e-5, "q8_0 windowed one_step {o} vs naive {n}");
+            assert!(
+                (o - n).abs() < 1e-5,
+                "q8_0 windowed one_step {o} vs naive {n}"
+            );
         }
 
         // (c) soft-cap: softcap=50.0, full window.
         let mut naive_sc = vec![0f32; n_heads * head_dim];
-        naive_q8_0_decode_ref(&q, &k_q, &k_scales, &v_q, &v_scales, &mut naive_sc, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 50.0);
+        naive_q8_0_decode_ref(
+            &q,
+            &k_q,
+            &k_scales,
+            &v_q,
+            &v_scales,
+            &mut naive_sc,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
+            0,
+            50.0,
+        );
         let mut flash_sc = vec![0f32; n_heads * head_dim];
-        gqa_attention_flash_decode_q8_0_capped_windowed(&q, &k_q, &k_scales, &v_q, &v_scales, &mut flash_sc, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 50.0);
+        gqa_attention_flash_decode_q8_0_capped_windowed(
+            &q,
+            &k_q,
+            &k_scales,
+            &v_q,
+            &v_scales,
+            &mut flash_sc,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
+            0,
+            50.0,
+        );
         let mut os_sc = vec![0f32; n_heads * head_dim];
-        gqa_attention_one_step_q8_0_capped_windowed(&q, &k_q, &k_scales, &v_q, &v_scales, &mut os_sc, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 50.0);
+        gqa_attention_one_step_q8_0_capped_windowed(
+            &q, &k_q, &k_scales, &v_q, &v_scales, &mut os_sc, n_heads, n_kv_heads, head_dim,
+            max_ctx, kv_len, 0, 50.0,
+        );
         for ((f, o), n) in flash_sc.iter().zip(os_sc.iter()).zip(naive_sc.iter()) {
             assert!((f - n).abs() < 1e-5, "q8_0 softcap flash {f} vs naive {n}");
-            assert!((o - n).abs() < 1e-5, "q8_0 softcap one_step {o} vs naive {n}");
+            assert!(
+                (o - n).abs() < 1e-5,
+                "q8_0 softcap one_step {o} vs naive {n}"
+            );
         }
     }
 
@@ -17057,9 +17221,18 @@ mod tests {
             .collect();
         let mut out_prefill = vec![0f32; n_new * n_heads * head_dim];
         gqa_attention_flash_prefill_q8_0(
-            &q, &k_q, &k_scales, &v_q, &v_scales, &mut out_prefill,
-            n_heads, n_kv_heads, head_dim, max_ctx,
-            kv_len_base, n_new,
+            &q,
+            &k_q,
+            &k_scales,
+            &v_q,
+            &v_scales,
+            &mut out_prefill,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
         );
         let mut out_reference = vec![0f32; n_new * n_heads * head_dim];
         for i in 0..n_new {
@@ -17068,8 +17241,8 @@ mod tests {
             let out_slice =
                 &mut out_reference[i * n_heads * head_dim..(i + 1) * n_heads * head_dim];
             gqa_attention_flash_decode_q8_0(
-                q_slice, &k_q, &k_scales, &v_q, &v_scales, out_slice,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_len_i,
+                q_slice, &k_q, &k_scales, &v_q, &v_scales, out_slice, n_heads, n_kv_heads,
+                head_dim, max_ctx, kv_len_i,
             );
         }
         let mut max_err = 0f32;
@@ -17096,8 +17269,8 @@ mod tests {
         let head_dim = 16;
         let max_ctx = 64;
         let kv_len_base = 8; // some history already cached
-        let n_new = 12;     // a small prefill batch
-        // Pre-fill K/V cache for positions [0, kv_len_base + n_new).
+        let n_new = 12; // a small prefill batch
+                        // Pre-fill K/V cache for positions [0, kv_len_base + n_new).
         let total_positions = kv_len_base + n_new;
         let k_cache: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
             .map(|i| ((i % 29) as f32 - 14.0) * 0.07)
@@ -17112,9 +17285,16 @@ mod tests {
         // Run the batched prefill kernel.
         let mut out_prefill = vec![0f32; n_new * n_heads * head_dim];
         gqa_attention_flash_prefill(
-            &q, &k_cache, &v_cache, &mut out_prefill,
-            n_heads, n_kv_heads, head_dim, max_ctx,
-            kv_len_base, n_new,
+            &q,
+            &k_cache,
+            &v_cache,
+            &mut out_prefill,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
         );
         // Reference: call flash-decode once per new position with
         // kv_len = kv_len_base + i + 1 (causal).
@@ -17122,11 +17302,11 @@ mod tests {
         for i in 0..n_new {
             let kv_len_i = kv_len_base + i + 1;
             let q_slice = &q[i * n_heads * head_dim..(i + 1) * n_heads * head_dim];
-            let out_slice = &mut out_reference
-                [i * n_heads * head_dim..(i + 1) * n_heads * head_dim];
+            let out_slice =
+                &mut out_reference[i * n_heads * head_dim..(i + 1) * n_heads * head_dim];
             gqa_attention_flash_decode(
-                q_slice, &k_cache, &v_cache, out_slice,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_len_i,
+                q_slice, &k_cache, &v_cache, out_slice, n_heads, n_kv_heads, head_dim, max_ctx,
+                kv_len_i,
             );
         }
         let _ = total_positions; // documented intent only.
@@ -17148,10 +17328,7 @@ mod tests {
         // n_new = 0 should leave the (empty) output untouched
         // and not divide-by-zero anywhere.
         let mut out = vec![];
-        gqa_attention_flash_prefill(
-            &[], &[0f32; 4], &[0f32; 4], &mut out,
-            2, 2, 1, 2, 0, 0,
-        );
+        gqa_attention_flash_prefill(&[], &[0f32; 4], &[0f32; 4], &mut out, 2, 2, 1, 2, 0, 0);
         assert!(out.is_empty());
     }
 
@@ -17187,17 +17364,31 @@ mod tests {
             let causal_kv_len = kv_len_base + q_pos + 1;
             let mut out_one = vec![0f32; n_heads * head_dim];
             gqa_attention_flash_decode(
-                q_one, &k_cache, &v_cache, &mut out_one,
-                n_heads, n_kv_heads, head_dim, max_ctx, causal_kv_len,
+                q_one,
+                &k_cache,
+                &v_cache,
+                &mut out_one,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx,
+                causal_kv_len,
             );
-            out_reference[q_off..q_off + n_heads * head_dim]
-                .copy_from_slice(&out_one);
+            out_reference[q_off..q_off + n_heads * head_dim].copy_from_slice(&out_one);
         }
         // Batched prefill.
         let mut out_batched = vec![0f32; n_new * n_heads * head_dim];
         gqa_attention_flash_prefill(
-            &q, &k_cache, &v_cache, &mut out_batched,
-            n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            &q,
+            &k_cache,
+            &v_cache,
+            &mut out_batched,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
         );
         let mut max_err = 0f32;
         for (a, b) in out_reference.iter().zip(out_batched.iter()) {
@@ -17226,8 +17417,7 @@ mod tests {
         let v_cache = vec![0f32; n_kv_heads * max_ctx * head_dim];
         let mut out: Vec<f32> = vec![];
         gqa_attention_flash_prefill(
-            &q, &k_cache, &v_cache, &mut out,
-            n_heads, n_kv_heads, head_dim, max_ctx,
+            &q, &k_cache, &v_cache, &mut out, n_heads, n_kv_heads, head_dim, max_ctx,
             /*kv_len_base*/ 0, /*n_new*/ 0,
         );
         // No assertion needed — the test passes if no panic.
@@ -17238,9 +17428,7 @@ mod tests {
         // kv_len=0 is reachable on the very first prefill chunk;
         // it must zero `out` rather than divide-by-zero.
         let mut out = vec![999.0f32; 8];
-        gqa_attention_flash_decode(
-            &[0f32; 8], &[], &[], &mut out, 2, 2, 4, 0, 0,
-        );
+        gqa_attention_flash_decode(&[0f32; 8], &[], &[], &mut out, 2, 2, 4, 0, 0);
         assert_eq!(out, vec![0f32; 8]);
     }
 
@@ -17385,7 +17573,10 @@ mod tests {
         let mut b = base.clone();
         rope_inplace_neox(&mut a, n_heads, head_dim, 9, theta);
         rope_inplace_neox_sectioned(&mut b, n_heads, head_dim, &[2, 2], &[9, 9], theta);
-        assert_eq!(a, b, "equal positions degenerate to 1-D regardless of section split");
+        assert_eq!(
+            a, b,
+            "equal positions degenerate to 1-D regardless of section split"
+        );
 
         // Distinct per-section positions must differ from any single-pos RoPE.
         let mut c = base.clone();
@@ -17396,7 +17587,10 @@ mod tests {
         // Norm is still preserved (rotation is orthogonal per pair).
         let n_in: f32 = base.iter().map(|v| v * v).sum();
         let n_out: f32 = c.iter().map(|v| v * v).sum();
-        assert!((n_in - n_out).abs() < 1e-3, "sectioned rotation must preserve norm");
+        assert!(
+            (n_in - n_out).abs() < 1e-3,
+            "sectioned rotation must preserve norm"
+        );
     }
 
     #[test]
@@ -17545,8 +17739,10 @@ mod tests {
             t_f16.as_secs_f64() / t_q8.as_secs_f64()
         );
         // Both should sum to roughly the same thing.
-        assert!((s_f16 - s_q8).abs() / s_f16.abs().max(1e-4) < 1e-2,
-            "F16 sum {s_f16} vs Q8_0 sum {s_q8}");
+        assert!(
+            (s_f16 - s_q8).abs() / s_f16.abs().max(1e-4) < 1e-2,
+            "F16 sum {s_f16} vs Q8_0 sum {s_q8}"
+        );
     }
 
     #[test]
@@ -17713,10 +17909,7 @@ mod tests {
             for (i, (a, b)) in out_scalar.iter().zip(out_avx2.iter()).enumerate() {
                 let abs = (a - b).abs();
                 let rel = abs / a.abs().max(1e-6);
-                assert!(
-                    abs < 1e-3 || rel < 1e-5,
-                    "row {i}: scalar={a} avx2={b}"
-                );
+                assert!(abs < 1e-3 || rel < 1e-5, "row {i}: scalar={a} avx2={b}");
             }
         }
         if is_x86_feature_detected!("avx512f") {
@@ -17725,10 +17918,7 @@ mod tests {
             for (i, (a, b)) in out_scalar.iter().zip(out_avx512.iter()).enumerate() {
                 let abs = (a - b).abs();
                 let rel = abs / a.abs().max(1e-6);
-                assert!(
-                    abs < 1e-3 || rel < 1e-5,
-                    "row {i}: scalar={a} avx512={b}"
-                );
+                assert!(abs < 1e-3 || rel < 1e-5, "row {i}: scalar={a} avx512={b}");
             }
         }
     }
@@ -17754,7 +17944,10 @@ mod tests {
             let mut out_avx512 = vec![0f32; ids.len() * d];
             unsafe { embed_lookup_iq4_nl_avx512(&table, &ids, &mut out_avx512, d) };
             for (i, (a, b)) in out_scalar.iter().zip(out_avx512.iter()).enumerate() {
-                assert!((a - b).abs() < 1e-5, "avx512 idx {i}: scalar={a} avx512={b}");
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "avx512 idx {i}: scalar={a} avx512={b}"
+                );
             }
         }
     }
@@ -17824,10 +18017,7 @@ mod tests {
             for (i, (a, b)) in out_scalar.iter().zip(out_avx2.iter()).enumerate() {
                 let abs = (a - b).abs();
                 let rel = abs / a.abs().max(1e-6);
-                assert!(
-                    abs < 1e-3 || rel < 1e-5,
-                    "row {i}: scalar={a} avx2={b}"
-                );
+                assert!(abs < 1e-3 || rel < 1e-5, "row {i}: scalar={a} avx2={b}");
             }
         }
         if is_x86_feature_detected!("avx512f") {
@@ -17836,10 +18026,7 @@ mod tests {
             for (i, (a, b)) in out_scalar.iter().zip(out_avx512.iter()).enumerate() {
                 let abs = (a - b).abs();
                 let rel = abs / a.abs().max(1e-6);
-                assert!(
-                    abs < 1e-3 || rel < 1e-5,
-                    "row {i}: scalar={a} avx512={b}"
-                );
+                assert!(abs < 1e-3 || rel < 1e-5, "row {i}: scalar={a} avx512={b}");
             }
         }
     }
@@ -17862,7 +18049,10 @@ mod tests {
             rustllama_gguf::dequant::dequant_iq3_s(row, &mut ref_row);
             let got = &out[slot * d..(slot + 1) * d];
             for (j, (a, b)) in got.iter().zip(ref_row.iter()).enumerate() {
-                assert!((a - b).abs() < 1e-6, "id {id} slot {slot} elem {j}: {a} vs {b}");
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "id {id} slot {slot} elem {j}: {a} vs {b}"
+                );
             }
         }
     }
@@ -18093,7 +18283,10 @@ mod tests {
             rustllama_gguf::dequant::dequant_iq2_xxs(row, &mut ref_row);
             let got = &out[slot * d..(slot + 1) * d];
             for (j, (a, b)) in got.iter().zip(ref_row.iter()).enumerate() {
-                assert!((a - b).abs() < 1e-6, "id {id} slot {slot} elem {j}: {a} vs {b}");
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "id {id} slot {slot} elem {j}: {a} vs {b}"
+                );
             }
         }
     }
@@ -18195,7 +18388,10 @@ mod tests {
             rustllama_gguf::dequant::dequant_bf16(row, &mut ref_row);
             let got = &out[slot * d..(slot + 1) * d];
             for (j, (a, b)) in got.iter().zip(ref_row.iter()).enumerate() {
-                assert!((a - b).abs() < 1e-6, "id {id} slot {slot} elem {j}: {a} vs {b}");
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "id {id} slot {slot} elem {j}: {a} vs {b}"
+                );
             }
         }
     }
@@ -18319,7 +18515,10 @@ mod tests {
             rustllama_gguf::dequant::dequant_iq1_s(row, &mut ref_row);
             let got = &out[slot * d..(slot + 1) * d];
             for (j, (a, b)) in got.iter().zip(ref_row.iter()).enumerate() {
-                assert!((a - b).abs() < 1e-6, "id {id} slot {slot} elem {j}: {a} vs {b}");
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "id {id} slot {slot} elem {j}: {a} vs {b}"
+                );
             }
         }
     }
@@ -18437,7 +18636,10 @@ mod tests {
             rustllama_gguf::dequant::dequant_iq1_m(row, &mut ref_row);
             let got = &out[slot * d..(slot + 1) * d];
             for (j, (a, b)) in got.iter().zip(ref_row.iter()).enumerate() {
-                assert!((a - b).abs() < 1e-6, "id {id} slot {slot} elem {j}: {a} vs {b}");
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "id {id} slot {slot} elem {j}: {a} vs {b}"
+                );
             }
         }
     }
@@ -18545,7 +18747,10 @@ mod tests {
             rustllama_gguf::dequant::dequant_q8_k(row, &mut ref_row);
             let got = &out[slot * d..(slot + 1) * d];
             for (j, (a, b)) in got.iter().zip(ref_row.iter()).enumerate() {
-                assert!((a - b).abs() < 1e-6, "id {id} slot {slot} elem {j}: {a} vs {b}");
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "id {id} slot {slot} elem {j}: {a} vs {b}"
+                );
             }
         }
     }
@@ -18569,12 +18774,10 @@ mod tests {
             }
             s = s.wrapping_mul(1664525).wrapping_add(1013904223);
             let d_val = ((s >> 24) as f32 / 256.0) * 0.05 + 0.001;
-            bytes[off + 80..off + 82]
-                .copy_from_slice(&f16::from_f32(d_val).to_le_bytes());
+            bytes[off + 80..off + 82].copy_from_slice(&f16::from_f32(d_val).to_le_bytes());
             s = s.wrapping_mul(1664525).wrapping_add(1013904223);
             let dmin_val = ((s >> 24) as f32 / 256.0) * 0.05;
-            bytes[off + 82..off + 84]
-                .copy_from_slice(&f16::from_f32(dmin_val).to_le_bytes());
+            bytes[off + 82..off + 84].copy_from_slice(&f16::from_f32(dmin_val).to_le_bytes());
         }
         bytes
     }
@@ -18657,7 +18860,10 @@ mod tests {
             rustllama_gguf::dequant::dequant_q2_k(row, &mut ref_row);
             let got = &out[slot * d..(slot + 1) * d];
             for (j, (a, b)) in got.iter().zip(ref_row.iter()).enumerate() {
-                assert!((a - b).abs() < 1e-6, "id {id} slot {slot} elem {j}: {a} vs {b}");
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "id {id} slot {slot} elem {j}: {a} vs {b}"
+                );
             }
         }
     }
@@ -18729,10 +18935,7 @@ mod tests {
             for (i, (a, b)) in out_scalar.iter().zip(out_avx2.iter()).enumerate() {
                 let abs = (a - b).abs();
                 let rel = abs / a.abs().max(1e-6);
-                assert!(
-                    abs < 1e-3 || rel < 1e-5,
-                    "row {i}: scalar={a} avx2={b}"
-                );
+                assert!(abs < 1e-3 || rel < 1e-5, "row {i}: scalar={a} avx2={b}");
             }
         }
         if is_x86_feature_detected!("avx512f") {
@@ -18741,10 +18944,7 @@ mod tests {
             for (i, (a, b)) in out_scalar.iter().zip(out_avx512.iter()).enumerate() {
                 let abs = (a - b).abs();
                 let rel = abs / a.abs().max(1e-6);
-                assert!(
-                    abs < 1e-3 || rel < 1e-5,
-                    "row {i}: scalar={a} avx512={b}"
-                );
+                assert!(abs < 1e-3 || rel < 1e-5, "row {i}: scalar={a} avx512={b}");
             }
         }
     }
@@ -18767,7 +18967,10 @@ mod tests {
             rustllama_gguf::dequant::dequant_q3_k(row, &mut ref_row);
             let got = &out[slot * d..(slot + 1) * d];
             for (j, (a, b)) in got.iter().zip(ref_row.iter()).enumerate() {
-                assert!((a - b).abs() < 1e-6, "id {id} slot {slot} elem {j}: {a} vs {b}");
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "id {id} slot {slot} elem {j}: {a} vs {b}"
+                );
             }
         }
     }
@@ -18848,7 +19051,10 @@ mod tests {
                 for (i, (a, b)) in out_scalar.iter().zip(out_avx512.iter()).enumerate() {
                     let abs = (a - b).abs();
                     let rel = abs / a.abs().max(1e-6);
-                    assert!(abs < 1e-3 || rel < 1e-5, "iq2_xxs avx512 row {i}: {a} vs {b}");
+                    assert!(
+                        abs < 1e-3 || rel < 1e-5,
+                        "iq2_xxs avx512 row {i}: {a} vs {b}"
+                    );
                 }
             }
         }
@@ -18872,7 +19078,10 @@ mod tests {
                 for (i, (a, b)) in out_scalar.iter().zip(out_avx512.iter()).enumerate() {
                     let abs = (a - b).abs();
                     let rel = abs / a.abs().max(1e-6);
-                    assert!(abs < 1e-3 || rel < 1e-5, "iq2_xs avx512 row {i}: {a} vs {b}");
+                    assert!(
+                        abs < 1e-3 || rel < 1e-5,
+                        "iq2_xs avx512 row {i}: {a} vs {b}"
+                    );
                 }
             }
         }
@@ -18920,7 +19129,10 @@ mod tests {
             rustllama_gguf::dequant::dequant_iq2_s(row, &mut ref_row);
             let got = &out[slot * d..(slot + 1) * d];
             for (j, (a, b)) in got.iter().zip(ref_row.iter()).enumerate() {
-                assert!((a - b).abs() < 1e-6, "id {id} slot {slot} elem {j}: {a} vs {b}");
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "id {id} slot {slot} elem {j}: {a} vs {b}"
+                );
             }
         }
     }
@@ -18943,7 +19155,10 @@ mod tests {
             rustllama_gguf::dequant::dequant_iq2_xs(row, &mut ref_row);
             let got = &out[slot * d..(slot + 1) * d];
             for (j, (a, b)) in got.iter().zip(ref_row.iter()).enumerate() {
-                assert!((a - b).abs() < 1e-6, "id {id} slot {slot} elem {j}: {a} vs {b}");
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "id {id} slot {slot} elem {j}: {a} vs {b}"
+                );
             }
         }
     }
@@ -19100,10 +19315,7 @@ mod tests {
         embed_lookup_iq4_xs_scalar(&table, &ids, &mut out_scalar, d);
         unsafe { embed_lookup_iq4_xs_avx2(&table, &ids, &mut out_avx2, d) };
         for (i, (a, b)) in out_scalar.iter().zip(out_avx2.iter()).enumerate() {
-            assert!(
-                (a - b).abs() < 1e-5,
-                "idx {i}: scalar={a} avx2={b}"
-            );
+            assert!((a - b).abs() < 1e-5, "idx {i}: scalar={a} avx2={b}");
         }
     }
 
@@ -19124,10 +19336,7 @@ mod tests {
         embed_lookup_iq4_xs_scalar(&table, &ids, &mut out_scalar, d);
         unsafe { embed_lookup_iq4_xs_avx512(&table, &ids, &mut out_avx512, d) };
         for (i, (a, b)) in out_scalar.iter().zip(out_avx512.iter()).enumerate() {
-            assert!(
-                (a - b).abs() < 1e-5,
-                "idx {i}: scalar={a} avx512={b}"
-            );
+            assert!((a - b).abs() < 1e-5, "idx {i}: scalar={a} avx512={b}");
         }
     }
 
@@ -19166,7 +19375,10 @@ mod tests {
             let mut out_avx512 = vec![0f32; ids.len() * d];
             unsafe { embed_lookup_q8_0_avx512(&table, &ids, &mut out_avx512, d) };
             for (i, (a, b)) in out_scalar.iter().zip(out_avx512.iter()).enumerate() {
-                assert!((a - b).abs() < 1e-5, "avx512 idx {i}: scalar={a} avx512={b}");
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "avx512 idx {i}: scalar={a} avx512={b}"
+                );
             }
         }
     }
@@ -19206,7 +19418,10 @@ mod tests {
             let mut out_avx512 = vec![0f32; ids.len() * d];
             unsafe { embed_lookup_q5_0_avx512(&table, &ids, &mut out_avx512, d) };
             for (i, (a, b)) in out_scalar.iter().zip(out_avx512.iter()).enumerate() {
-                assert!((a - b).abs() < 1e-5, "avx512 idx {i}: scalar={a} avx512={b}");
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "avx512 idx {i}: scalar={a} avx512={b}"
+                );
             }
         }
     }
@@ -19233,7 +19448,10 @@ mod tests {
             let mut out_avx512 = vec![0f32; ids.len() * d];
             unsafe { embed_lookup_q5_k_avx512(&table, &ids, &mut out_avx512, d) };
             for (i, (a, b)) in out_scalar.iter().zip(out_avx512.iter()).enumerate() {
-                assert!((a - b).abs() < 1e-5, "avx512 idx {i}: scalar={a} avx512={b}");
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "avx512 idx {i}: scalar={a} avx512={b}"
+                );
             }
         }
     }
@@ -19255,10 +19473,7 @@ mod tests {
         embed_lookup_q4_k_scalar(&table, &ids, &mut out_scalar, d);
         unsafe { embed_lookup_q4_k_avx2(&table, &ids, &mut out_avx2, d) };
         for (i, (a, b)) in out_scalar.iter().zip(out_avx2.iter()).enumerate() {
-            assert!(
-                (a - b).abs() < 1e-5,
-                "idx {i}: scalar={a} avx2={b}"
-            );
+            assert!((a - b).abs() < 1e-5, "idx {i}: scalar={a} avx2={b}");
         }
     }
 
@@ -19448,10 +19663,7 @@ mod tests {
             for (i, (a, b)) in out_scalar.iter().zip(out_avx2.iter()).enumerate() {
                 let abs = (a - b).abs();
                 let rel = abs / a.abs().max(1e-6);
-                assert!(
-                    abs < 1e-3 || rel < 1e-5,
-                    "row {i}: scalar={a} avx2={b}"
-                );
+                assert!(abs < 1e-3 || rel < 1e-5, "row {i}: scalar={a} avx2={b}");
             }
         }
         if is_x86_feature_detected!("avx512f") {
@@ -19460,10 +19672,7 @@ mod tests {
             for (i, (a, b)) in out_scalar.iter().zip(out_avx512.iter()).enumerate() {
                 let abs = (a - b).abs();
                 let rel = abs / a.abs().max(1e-6);
-                assert!(
-                    abs < 1e-3 || rel < 1e-5,
-                    "row {i}: scalar={a} avx512={b}"
-                );
+                assert!(abs < 1e-3 || rel < 1e-5, "row {i}: scalar={a} avx512={b}");
             }
         }
     }
@@ -19558,10 +19767,7 @@ mod tests {
             for (i, (a, b)) in out_scalar.iter().zip(out_avx2.iter()).enumerate() {
                 let abs = (a - b).abs();
                 let rel = abs / a.abs().max(1e-6);
-                assert!(
-                    abs < 1e-3 || rel < 1e-5,
-                    "row {i}: scalar={a} avx2={b}"
-                );
+                assert!(abs < 1e-3 || rel < 1e-5, "row {i}: scalar={a} avx2={b}");
             }
         }
         if is_x86_feature_detected!("avx512f") {
@@ -19570,10 +19776,7 @@ mod tests {
             for (i, (a, b)) in out_scalar.iter().zip(out_avx512.iter()).enumerate() {
                 let abs = (a - b).abs();
                 let rel = abs / a.abs().max(1e-6);
-                assert!(
-                    abs < 1e-3 || rel < 1e-5,
-                    "row {i}: scalar={a} avx512={b}"
-                );
+                assert!(abs < 1e-3 || rel < 1e-5, "row {i}: scalar={a} avx512={b}");
             }
         }
     }
@@ -19727,10 +19930,7 @@ mod tests {
             for (i, (a, b)) in out_scalar.iter().zip(out_avx2.iter()).enumerate() {
                 let abs = (a - b).abs();
                 let rel = abs / a.abs().max(1e-6);
-                assert!(
-                    abs < 1e-3 || rel < 1e-5,
-                    "row {i}: scalar={a} avx2={b}"
-                );
+                assert!(abs < 1e-3 || rel < 1e-5, "row {i}: scalar={a} avx2={b}");
             }
         }
         if is_x86_feature_detected!("avx512f") {
@@ -19739,10 +19939,7 @@ mod tests {
             for (i, (a, b)) in out_scalar.iter().zip(out_avx512.iter()).enumerate() {
                 let abs = (a - b).abs();
                 let rel = abs / a.abs().max(1e-6);
-                assert!(
-                    abs < 1e-3 || rel < 1e-5,
-                    "row {i}: scalar={a} avx512={b}"
-                );
+                assert!(abs < 1e-3 || rel < 1e-5, "row {i}: scalar={a} avx512={b}");
             }
         }
     }
@@ -19892,21 +20089,36 @@ mod tests {
             k_scales[t] = ks;
             v_scales[t] = vs;
             for d in 0..head_dim {
-                k_q[t * head_dim + d] =
-                    (kr[d] / ks).round().clamp(-128.0, 127.0) as i8;
-                v_q[t * head_dim + d] =
-                    (vr[d] / vs).round().clamp(-128.0, 127.0) as i8;
+                k_q[t * head_dim + d] = (kr[d] / ks).round().clamp(-128.0, 127.0) as i8;
+                v_q[t * head_dim + d] = (vr[d] / vs).round().clamp(-128.0, 127.0) as i8;
             }
         }
 
         let mut out_f32 = vec![0.0f32; n_heads * head_dim];
         let mut out_q8 = vec![0.0f32; n_heads * head_dim];
         gqa_attention_one_step(
-            &q, &k_f32, &v_f32, &mut out_f32, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+            &q,
+            &k_f32,
+            &v_f32,
+            &mut out_f32,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
         );
         gqa_attention_one_step_q8_0_scalar(
-            &q, &k_q, &k_scales, &v_q, &v_scales, &mut out_q8, n_heads, n_kv_heads, head_dim,
-            max_ctx, kv_len,
+            &q,
+            &k_q,
+            &k_scales,
+            &v_q,
+            &v_scales,
+            &mut out_q8,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
         );
 
         // With per-row absmax quant on 16-dim rows, per-element rounding
@@ -20115,23 +20327,51 @@ mod tests {
         let kv_len_base = 3usize; // committed prefix
         let n_new = 5usize; // tree nodes
         let mut s = 0x7EE_12345_u32;
-        let q: Vec<f32> = (0..n_new * n_heads * head_dim).map(|_| lcg(&mut s)).collect();
-        let k_cache: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
-        let v_cache: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let q: Vec<f32> = (0..n_new * n_heads * head_dim)
+            .map(|_| lcg(&mut s))
+            .collect();
+        let k_cache: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+            .map(|_| lcg(&mut s))
+            .collect();
+        let v_cache: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+            .map(|_| lcg(&mut s))
+            .collect();
         let mut out_causal = vec![0f32; n_new * n_heads * head_dim];
         let mut out_tree = vec![0f32; n_new * n_heads * head_dim];
         gqa_attention_flash_prefill_scalar(
-            &q, &k_cache, &v_cache, &mut out_causal, n_heads, n_kv_heads, head_dim,
-            max_ctx, kv_len_base, n_new, 0, 0.0,
+            &q,
+            &k_cache,
+            &v_cache,
+            &mut out_causal,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            0,
+            0.0,
         );
         let chain: Vec<i32> = (0..n_new as i32).map(|i| i - 1).collect(); // parent[0] = -1
         gqa_attention_tree_prefill(
-            &q, &k_cache, &v_cache, &mut out_tree, n_heads, n_kv_heads, head_dim,
-            max_ctx, kv_len_base, n_new, &chain,
+            &q,
+            &k_cache,
+            &v_cache,
+            &mut out_tree,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            &chain,
         );
         let cb: Vec<u32> = out_causal.iter().map(|v| v.to_bits()).collect();
         let tb: Vec<u32> = out_tree.iter().map(|v| v.to_bits()).collect();
-        assert_eq!(cb, tb, "chain-tree attention must be bit-identical to causal");
+        assert_eq!(
+            cb, tb,
+            "chain-tree attention must be bit-identical to causal"
+        );
     }
 
     /// Two root-level siblings (no committed prefix) each attend only
@@ -20150,14 +20390,17 @@ mod tests {
         let mut out = vec![0f32; n_new * head_dim];
         let parent = [-1i32, -1]; // two independent root candidates
         gqa_attention_tree_prefill(
-            &q, &k_cache, &v_cache, &mut out, n_heads, n_kv_heads, head_dim,
-            max_ctx, 0, n_new, &parent,
+            &q, &k_cache, &v_cache, &mut out, n_heads, n_kv_heads, head_dim, max_ctx, 0, n_new,
+            &parent,
         );
         for node in 0..n_new {
             for d in 0..head_dim {
                 let got = out[node * head_dim + d];
                 let want = v_cache[node * head_dim + d];
-                assert!((got - want).abs() < 1e-6, "node {node} dim {d}: {got} != {want}");
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "node {node} dim {d}: {got} != {want}"
+                );
             }
         }
     }
@@ -20174,13 +20417,19 @@ mod tests {
         let n_new = 3usize; // node0=root, node1=child(0), node2=child(0)
         let parent = [-1i32, 0, 0];
         let mut s = 0xBEE5_u32;
-        let q: Vec<f32> = (0..n_new * n_heads * head_dim).map(|_| lcg(&mut s)).collect();
-        let k_cache: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
-        let mut v_a: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let q: Vec<f32> = (0..n_new * n_heads * head_dim)
+            .map(|_| lcg(&mut s))
+            .collect();
+        let k_cache: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+            .map(|_| lcg(&mut s))
+            .collect();
+        let mut v_a: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+            .map(|_| lcg(&mut s))
+            .collect();
         let mut out_a = vec![0f32; n_new * n_heads * head_dim];
         gqa_attention_tree_prefill(
-            &q, &k_cache, &v_a, &mut out_a, n_heads, n_kv_heads, head_dim,
-            max_ctx, 0, n_new, &parent,
+            &q, &k_cache, &v_a, &mut out_a, n_heads, n_kv_heads, head_dim, max_ctx, 0, n_new,
+            &parent,
         );
         // Perturb node 2's V (cache slot 2) and recompute.
         for d in 0..head_dim {
@@ -20188,8 +20437,8 @@ mod tests {
         }
         let mut out_b = vec![0f32; n_new * n_heads * head_dim];
         gqa_attention_tree_prefill(
-            &q, &k_cache, &v_a, &mut out_b, n_heads, n_kv_heads, head_dim,
-            max_ctx, 0, n_new, &parent,
+            &q, &k_cache, &v_a, &mut out_b, n_heads, n_kv_heads, head_dim, max_ctx, 0, n_new,
+            &parent,
         );
         // Node 0 (attends {0}) and node 1 (attends {0,1}) must be unchanged;
         // node 2 (attends {0,2}) must change.
@@ -20221,10 +20470,16 @@ mod tests {
         let kv_len = 9usize;
         let mut s = 0x5A5Au32;
         let q: Vec<f32> = (0..n_heads * head_dim).map(|_| lcg(&mut s)).collect();
-        let k: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
-        let v: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let k: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+            .map(|_| lcg(&mut s))
+            .collect();
+        let v: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+            .map(|_| lcg(&mut s))
+            .collect();
         let mut full = vec![0f32; n_heads * head_dim];
-        gqa_attention_one_step(&q, &k, &v, &mut full, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
+        gqa_attention_one_step(
+            &q, &k, &v, &mut full, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        );
         let fb: Vec<u32> = full.iter().map(|x| x.to_bits()).collect();
         for &window in &[0usize, kv_len, kv_len + 5] {
             let mut w = vec![0f32; n_heads * head_dim];
@@ -20232,7 +20487,10 @@ mod tests {
                 &q, &k, &v, &mut w, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window,
             );
             let wb: Vec<u32> = w.iter().map(|x| x.to_bits()).collect();
-            assert_eq!(fb, wb, "window {window} (0 or >= kv_len) must equal full decode");
+            assert_eq!(
+                fb, wb,
+                "window {window} (0 or >= kv_len) must equal full decode"
+            );
         }
     }
 
@@ -20249,8 +20507,12 @@ mod tests {
         let start = kv_len - window; // 4 → attend only [4,6)
         let mut s = 0x1234u32;
         let q: Vec<f32> = (0..n_heads * head_dim).map(|_| lcg(&mut s)).collect();
-        let mut k: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
-        let mut v: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let mut k: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+            .map(|_| lcg(&mut s))
+            .collect();
+        let mut v: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+            .map(|_| lcg(&mut s))
+            .collect();
         let mut out_a = vec![0f32; n_heads * head_dim];
         gqa_attention_one_step_windowed(
             &q, &k, &v, &mut out_a, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window,
@@ -20258,10 +20520,22 @@ mod tests {
         // Also flash-decode agrees with one-step under the window.
         let mut out_fd = vec![0f32; n_heads * head_dim];
         gqa_attention_flash_decode_windowed(
-            &q, &k, &v, &mut out_fd, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window,
+            &q,
+            &k,
+            &v,
+            &mut out_fd,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
+            window,
         );
         for i in 0..n_heads * head_dim {
-            assert!((out_a[i] - out_fd[i]).abs() < 1e-5, "one_step vs flash_decode SWA at {i}");
+            assert!(
+                (out_a[i] - out_fd[i]).abs() < 1e-5,
+                "one_step vs flash_decode SWA at {i}"
+            );
         }
         // Perturb the EXCLUDED positions [0, start); windowed output must not move.
         for h in 0..n_kv_heads {
@@ -20293,17 +20567,44 @@ mod tests {
         let kv_len_base = 2usize;
         let n_new = 5usize;
         let mut s = 0x9E37u32;
-        let q: Vec<f32> = (0..n_new * n_heads * head_dim).map(|_| lcg(&mut s)).collect();
-        let mut k: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
-        let mut v: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let q: Vec<f32> = (0..n_new * n_heads * head_dim)
+            .map(|_| lcg(&mut s))
+            .collect();
+        let mut k: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+            .map(|_| lcg(&mut s))
+            .collect();
+        let mut v: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+            .map(|_| lcg(&mut s))
+            .collect();
         // Large window ≡ full causal (bit-exact vs the scalar reference).
         let mut full = vec![0f32; n_new * n_heads * head_dim];
         gqa_attention_flash_prefill_scalar(
-            &q, &k, &v, &mut full, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, 0, 0.0,
+            &q,
+            &k,
+            &v,
+            &mut full,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            0,
+            0.0,
         );
         let mut big = vec![0f32; n_new * n_heads * head_dim];
         gqa_attention_flash_prefill_windowed(
-            &q, &k, &v, &mut big, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, max_ctx,
+            &q,
+            &k,
+            &v,
+            &mut big,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            max_ctx,
         );
         let fb: Vec<u32> = full.iter().map(|x| x.to_bits()).collect();
         let bb: Vec<u32> = big.iter().map(|x| x.to_bits()).collect();
@@ -20313,7 +20614,17 @@ mod tests {
         let window = 2usize;
         let mut out_a = vec![0f32; n_new * n_heads * head_dim];
         gqa_attention_flash_prefill_windowed(
-            &q, &k, &v, &mut out_a, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window,
+            &q,
+            &k,
+            &v,
+            &mut out_a,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            window,
         );
         // Last query P = kv_len_base + (n_new-1); its window is [P-1, P]. Perturb
         // the committed prefix (positions 0..kv_len_base), which it can't see.
@@ -20327,7 +20638,17 @@ mod tests {
         }
         let mut out_b = vec![0f32; n_new * n_heads * head_dim];
         gqa_attention_flash_prefill_windowed(
-            &q, &k, &v, &mut out_b, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, window,
+            &q,
+            &k,
+            &v,
+            &mut out_b,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            window,
         );
         let last = (n_new - 1) * n_heads * head_dim;
         for i in 0..n_heads * head_dim {
@@ -20370,7 +20691,11 @@ mod tests {
                     acc += qh[d] * k[koff + d];
                 }
                 let s = acc * scale;
-                scores[t] = if softcap > 0.0 { softcap * (s / softcap).tanh() } else { s };
+                scores[t] = if softcap > 0.0 {
+                    softcap * (s / softcap).tanh()
+                } else {
+                    s
+                };
             }
             let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let mut sum = 0f32;
@@ -20403,15 +20728,31 @@ mod tests {
         let kv_len = 9usize;
         let mut s = 0xBEEFu32;
         let q: Vec<f32> = (0..n_heads * head_dim).map(|_| lcg(&mut s)).collect();
-        let k: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
-        let v: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let k: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+            .map(|_| lcg(&mut s))
+            .collect();
+        let v: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+            .map(|_| lcg(&mut s))
+            .collect();
 
         // Decode: one-step.
         let mut base = vec![0f32; n_heads * head_dim];
-        gqa_attention_one_step(&q, &k, &v, &mut base, n_heads, n_kv_heads, head_dim, max_ctx, kv_len);
+        gqa_attention_one_step(
+            &q, &k, &v, &mut base, n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
+        );
         let mut capped0 = vec![0f32; n_heads * head_dim];
         gqa_attention_one_step_capped_windowed(
-            &q, &k, &v, &mut capped0, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0,
+            &q,
+            &k,
+            &v,
+            &mut capped0,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
+            0,
+            0.0,
         );
         let bb: Vec<u32> = base.iter().map(|x| x.to_bits()).collect();
         let cb: Vec<u32> = capped0.iter().map(|x| x.to_bits()).collect();
@@ -20424,7 +20765,17 @@ mod tests {
         );
         let mut cappedf = vec![0f32; n_heads * head_dim];
         gqa_attention_flash_decode_capped_windowed(
-            &q, &k, &v, &mut cappedf, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0,
+            &q,
+            &k,
+            &v,
+            &mut cappedf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
+            0,
+            0.0,
         );
         let bfb: Vec<u32> = basef.iter().map(|x| x.to_bits()).collect();
         let cfb: Vec<u32> = cappedf.iter().map(|x| x.to_bits()).collect();
@@ -20433,14 +20784,35 @@ mod tests {
         // Prefill.
         let kv_len_base = 2usize;
         let n_new = 5usize;
-        let qp: Vec<f32> = (0..n_new * n_heads * head_dim).map(|_| lcg(&mut s)).collect();
+        let qp: Vec<f32> = (0..n_new * n_heads * head_dim)
+            .map(|_| lcg(&mut s))
+            .collect();
         let mut basep = vec![0f32; n_new * n_heads * head_dim];
         gqa_attention_flash_prefill(
-            &qp, &k, &v, &mut basep, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new,
+            &qp,
+            &k,
+            &v,
+            &mut basep,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
         );
         let mut cappedp = vec![0f32; n_new * n_heads * head_dim];
         gqa_attention_flash_prefill_capped_windowed(
-            &qp, &k, &v, &mut cappedp, n_heads, n_kv_heads, head_dim, max_ctx, kv_len_base, n_new, 0,
+            &qp,
+            &k,
+            &v,
+            &mut cappedp,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len_base,
+            n_new,
+            0,
             0.0,
         );
         let bpb: Vec<u32> = basep.iter().map(|x| x.to_bits()).collect();
@@ -20457,7 +20829,10 @@ mod tests {
         let c = 50.0f32;
         // s=100, c=50 → 50·tanh(2) = 50·0.96403 ≈ 48.20 (stays below the cap c).
         let big = c * (100.0f32 / c).tanh();
-        assert!((big - 48.201_378).abs() < 1e-3, "s=100,c=50 → ~48.20, got {big}");
+        assert!(
+            (big - 48.201_378).abs() < 1e-3,
+            "s=100,c=50 → ~48.20, got {big}"
+        );
         assert!(big < 50.0, "must stay below the cap c");
         let small = 0.5f32;
         let capped_small = c * (small / c).tanh();
@@ -20496,7 +20871,9 @@ mod tests {
                 k[t * head_dim + d] = val; // n_kv_heads == 1 ⇒ row offset is t·head_dim
             }
         }
-        let v: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let v: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+            .map(|_| lcg(&mut s))
+            .collect();
 
         let reference = naive_attention_capped(
             &q, &k, &v, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, softcap,
@@ -20510,7 +20887,10 @@ mod tests {
             .zip(uncapped.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert!(max_delta > 1e-3, "cap must change the output for large scores (Δ={max_delta})");
+        assert!(
+            max_delta > 1e-3,
+            "cap must change the output for large scores (Δ={max_delta})"
+        );
 
         // Both decode kernels match the independent capped reference.
         let mut os = vec![0f32; n_heads * head_dim];
@@ -20553,8 +20933,12 @@ mod tests {
         let mut s = 0x7A11u32;
         // K/V cover positions [0, L]; Q is the single new query.
         let q: Vec<f32> = (0..n_heads * head_dim).map(|_| 5.0 * lcg(&mut s)).collect();
-        let k: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| 5.0 * lcg(&mut s)).collect();
-        let v: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim).map(|_| lcg(&mut s)).collect();
+        let k: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+            .map(|_| 5.0 * lcg(&mut s))
+            .collect();
+        let v: Vec<f32> = (0..n_kv_heads * max_ctx * head_dim)
+            .map(|_| lcg(&mut s))
+            .collect();
 
         // Decode: query attends [0, kv_len).
         let mut dec = vec![0f32; n_heads * head_dim];
@@ -20679,7 +21063,8 @@ mod tests {
         // block. Q6_K stores d at offset 208–209.
         for b in 0..n_rows * blocks_per_row {
             let off = b * block_bytes;
-            let f = (((b as u32).wrapping_mul(0x9E3779B9) >> 16) as f32 / u16::MAX as f32) * 0.05 + 0.001;
+            let f = (((b as u32).wrapping_mul(0x9E3779B9) >> 16) as f32 / u16::MAX as f32) * 0.05
+                + 0.001;
             let fbytes = half::f16::from_f32(f).to_le_bytes();
             if block_bytes == 210 {
                 bytes[off + 208] = fbytes[0];
@@ -20688,7 +21073,8 @@ mod tests {
                 bytes[off] = fbytes[0];
                 bytes[off + 1] = fbytes[1];
                 let m = (((b as u32).wrapping_mul(0x85EBCA6B) >> 16) as f32 / u16::MAX as f32)
-                    * 0.02 + 0.0005;
+                    * 0.02
+                    + 0.0005;
                 let mbytes = half::f16::from_f32(m).to_le_bytes();
                 bytes[off + 2] = mbytes[0];
                 bytes[off + 3] = mbytes[1];
@@ -20790,7 +21176,7 @@ mod tests {
         const QK: usize = 32;
         let m = 4usize;
         let k = 128usize; // 4 blocks per row
-        // Build a random Q8_0 table with reasonable scales.
+                          // Build a random Q8_0 table with reasonable scales.
         let mut w = vec![0u8; m * (k / QK) * BLOCK_BYTES];
         let mut s = 0xDEADBEEFu32;
         for b in 0..(m * (k / QK)) {
@@ -20880,10 +21266,7 @@ mod tests {
             // d*q - m where d, q, m are exact f32 — but reorderings in
             // SIMD FMA mean the result can differ from scalar by ~1
             // ULP. 1e-5 absolute is generous and catches real bugs.
-            assert!(
-                (a - b).abs() < 1e-5,
-                "idx {i}: scalar={a} avx512={b}"
-            );
+            assert!((a - b).abs() < 1e-5, "idx {i}: scalar={a} avx512={b}");
         }
     }
 
@@ -20904,10 +21287,7 @@ mod tests {
         embed_lookup_f32(&full_f32, &ids, &mut out_ref, d);
 
         for (i, (a, b)) in out_fused.iter().zip(out_ref.iter()).enumerate() {
-            assert!(
-                (a - b).abs() < 1e-5,
-                "idx {i}: fused={a} ref={b}"
-            );
+            assert!((a - b).abs() < 1e-5, "idx {i}: fused={a} ref={b}");
         }
     }
 
@@ -20928,10 +21308,7 @@ mod tests {
         embed_lookup_f32(&full_f32, &ids, &mut out_ref, d);
 
         for (i, (a, b)) in out_fused.iter().zip(out_ref.iter()).enumerate() {
-            assert!(
-                (a - b).abs() < 1e-5,
-                "idx {i}: fused={a} ref={b}"
-            );
+            assert!((a - b).abs() < 1e-5, "idx {i}: fused={a} ref={b}");
         }
     }
 
@@ -20952,10 +21329,7 @@ mod tests {
         embed_lookup_f32(&full_f32, &ids, &mut out_ref, d);
 
         for (i, (a, b)) in out_fused.iter().zip(out_ref.iter()).enumerate() {
-            assert!(
-                (a - b).abs() < 1e-5,
-                "idx {i}: fused={a} ref={b}"
-            );
+            assert!((a - b).abs() < 1e-5, "idx {i}: fused={a} ref={b}");
         }
     }
 
@@ -20986,7 +21360,9 @@ mod tests {
 
     #[test]
     fn softmax_simd_parity_with_scalar() {
-        for &n in &[1usize, 3, 7, 8, 15, 16, 17, 31, 32, 33, 127, 128, 129, 1024, 4097] {
+        for &n in &[
+            1usize, 3, 7, 8, 15, 16, 17, 31, 32, 33, 127, 128, 129, 1024, 4097,
+        ] {
             let input = rand_vec(n, n as u32);
             let mut a = input.clone();
             softmax_f32_inplace(&mut a);
@@ -21015,13 +21391,7 @@ mod tests {
     /// (`matvec_iq4_nl_w_f32_a_scalar`), which pins the SYCL
     /// arithmetic against the same correctness contract even
     /// without GPU hardware to execute the device kernel.
-    fn iq4_nl_sycl_port_scalar(
-        w_bytes: &[u8],
-        x: &[f32],
-        out: &mut [f32],
-        m: usize,
-        k: usize,
-    ) {
+    fn iq4_nl_sycl_port_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
         const BLOCK_BYTES: usize = 18;
         const QK: usize = 32;
         let blocks_per_row = k / QK;
@@ -21048,13 +21418,7 @@ mod tests {
 
     /// F4: Rust re-port of the SYCL IQ4_XS kernel arithmetic. Same
     /// rationale as `iq4_nl_sycl_port_scalar`.
-    fn iq4_xs_sycl_port_scalar(
-        w_bytes: &[u8],
-        x: &[f32],
-        out: &mut [f32],
-        m: usize,
-        k: usize,
-    ) {
+    fn iq4_xs_sycl_port_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
         const BLOCK_BYTES: usize = 136;
         const QK_K: usize = 256;
         let blocks_per_row = k / QK_K;
@@ -21179,13 +21543,7 @@ mod tests {
     /// against the existing scalar reference
     /// `matvec_iq2_xxs_w_f32_a_scalar` so the SYCL arithmetic is
     /// validated without GPU hardware.
-    fn iq2_xxs_sycl_port_scalar(
-        w_bytes: &[u8],
-        x: &[f32],
-        out: &mut [f32],
-        m: usize,
-        k: usize,
-    ) {
+    fn iq2_xxs_sycl_port_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
         use rustllama_gguf::dequant::{IQ2XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
         const BLOCK_BYTES: usize = 66;
         const QK_K: usize = 256;
@@ -21217,7 +21575,11 @@ mod tests {
                         let x_off = x_base + ib32 * 32 + l * 8;
                         for j in 0..8 {
                             let gi = ((grid_bits >> (j * 8)) & 0xFF) as u8;
-                            let s = if signs & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                            let s = if signs & KMASK_IQ2XS[j] != 0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
                             acc += db * (gi as f32) * s * x[x_off + j];
                         }
                     }
@@ -21269,13 +21631,7 @@ mod tests {
     /// reassembly from packed nibbles, same dl1/dl2 sub-block
     /// scales, same per-lane delta-sign flip, same 11-bit grid
     /// index reconstruction).
-    fn iq1_m_sycl_port_scalar(
-        w_bytes: &[u8],
-        x: &[f32],
-        out: &mut [f32],
-        m: usize,
-        k: usize,
-    ) {
+    fn iq1_m_sycl_port_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
         use rustllama_gguf::dequant::IQ1S_DELTA;
         use rustllama_gguf::iq1_grid::IQ1S_GRID;
         const BLOCK_BYTES: usize = 56;
@@ -21311,16 +21667,34 @@ mod tests {
                     let qh0 = w_bytes[qh_off + ib * 2];
                     let qh1 = w_bytes[qh_off + ib * 2 + 1];
                     let delta_l = [
-                        if qh0 & 0x08 != 0 { -1.0 - IQ1S_DELTA } else { -1.0 + IQ1S_DELTA },
-                        if qh0 & 0x80 != 0 { -1.0 - IQ1S_DELTA } else { -1.0 + IQ1S_DELTA },
-                        if qh1 & 0x08 != 0 { -1.0 - IQ1S_DELTA } else { -1.0 + IQ1S_DELTA },
-                        if qh1 & 0x80 != 0 { -1.0 - IQ1S_DELTA } else { -1.0 + IQ1S_DELTA },
+                        if qh0 & 0x08 != 0 {
+                            -1.0 - IQ1S_DELTA
+                        } else {
+                            -1.0 + IQ1S_DELTA
+                        },
+                        if qh0 & 0x80 != 0 {
+                            -1.0 - IQ1S_DELTA
+                        } else {
+                            -1.0 + IQ1S_DELTA
+                        },
+                        if qh1 & 0x08 != 0 {
+                            -1.0 - IQ1S_DELTA
+                        } else {
+                            -1.0 + IQ1S_DELTA
+                        },
+                        if qh1 & 0x80 != 0 {
+                            -1.0 - IQ1S_DELTA
+                        } else {
+                            -1.0 + IQ1S_DELTA
+                        },
                     ];
                     let idx_l = [
                         w_bytes[qs_off + ib * 4] as usize | (((qh0 & 0x07) as usize) << 8),
-                        w_bytes[qs_off + ib * 4 + 1] as usize | ((((qh0 >> 4) & 0x07) as usize) << 8),
+                        w_bytes[qs_off + ib * 4 + 1] as usize
+                            | ((((qh0 >> 4) & 0x07) as usize) << 8),
                         w_bytes[qs_off + ib * 4 + 2] as usize | (((qh1 & 0x07) as usize) << 8),
-                        w_bytes[qs_off + ib * 4 + 3] as usize | ((((qh1 >> 4) & 0x07) as usize) << 8),
+                        w_bytes[qs_off + ib * 4 + 3] as usize
+                            | ((((qh1 >> 4) & 0x07) as usize) << 8),
                     ];
                     let dl_l = [dl1, dl1, dl2, dl2];
                     for l in 0..4 {
@@ -21397,13 +21771,7 @@ mod tests {
     /// byte-for-byte (same per-u16 word load order, same 9-bit
     /// grid index extraction + 7-bit sign-table index, same
     /// db_lo / db_hi nibble unpack, same per-lane FMA).
-    fn iq2_xs_sycl_port_scalar(
-        w_bytes: &[u8],
-        x: &[f32],
-        out: &mut [f32],
-        m: usize,
-        k: usize,
-    ) {
+    fn iq2_xs_sycl_port_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
         use rustllama_gguf::dequant::{IQ2XS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
         const BLOCK_BYTES: usize = 74;
         const QK_K: usize = 256;
@@ -21435,7 +21803,11 @@ mod tests {
                         let x_off = x_base + ib32 * 32 + l * 8;
                         for j in 0..8 {
                             let gi = ((grid_bits >> (j * 8)) & 0xFF) as u8;
-                            let s = if signs & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                            let s = if signs & KMASK_IQ2XS[j] != 0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
                             acc += db * (gi as f32) * s * x[x_off + j];
                         }
                     }
@@ -21502,13 +21874,7 @@ mod tests {
     /// byte-for-byte (same qs_lo/signs/qh/scales split, same
     /// 10-bit grid index reconstruction from qs_lo + qh, same
     /// inline sign-mask, same db_lo/db_hi nibble unpack).
-    fn iq2_s_sycl_port_scalar(
-        w_bytes: &[u8],
-        x: &[f32],
-        out: &mut [f32],
-        m: usize,
-        k: usize,
-    ) {
+    fn iq2_s_sycl_port_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
         use rustllama_gguf::dequant::{IQ2S_GRID, KMASK_IQ2XS};
         const BLOCK_BYTES: usize = 82;
         const QK_K: usize = 256;
@@ -21541,7 +21907,11 @@ mod tests {
                         let x_off = x_base + ib32 * 32 + l * 8;
                         for j in 0..8 {
                             let gi = ((grid_bits >> (j * 8)) & 0xFF) as u8;
-                            let s = if sign_byte & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                            let s = if sign_byte & KMASK_IQ2XS[j] != 0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
                             acc += db * (gi as f32) * s * x[x_off + j];
                         }
                     }
@@ -21598,13 +21968,7 @@ mod tests {
     /// scale extraction `db = d * (0.5 + (aux32 >> 28)) * 0.5`,
     /// same dual-grid lookup per 8-weight chunk, same KSIGNS
     /// nibble-split for low/high halves).
-    fn iq3_xxs_sycl_port_scalar(
-        w_bytes: &[u8],
-        x: &[f32],
-        out: &mut [f32],
-        m: usize,
-        k: usize,
-    ) {
+    fn iq3_xxs_sycl_port_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
         use rustllama_gguf::dequant::{IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
         const BLOCK_BYTES: usize = 98;
         const QK_K: usize = 256;
@@ -21638,8 +22002,16 @@ mod tests {
                         for j in 0..4 {
                             let g1 = ((grid1_bits >> (j * 8)) & 0xFF) as u8;
                             let g2 = ((grid2_bits >> (j * 8)) & 0xFF) as u8;
-                            let s_lo = if signs & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
-                            let s_hi = if signs & KMASK_IQ2XS[j + 4] != 0 { -1.0 } else { 1.0 };
+                            let s_lo = if signs & KMASK_IQ2XS[j] != 0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            let s_hi = if signs & KMASK_IQ2XS[j + 4] != 0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
                             acc += db * (g1 as f32) * s_lo * x[x_off + j];
                             acc += db * (g2 as f32) * s_hi * x[x_off + j + 4];
                         }
@@ -21696,13 +22068,7 @@ mod tests {
     /// ib32 >> 1) rather than the CPU reference's nested pair-of-
     /// ib32 walker — they produce the same per-chunk operations
     /// in the same FMA order because the byte offsets line up.
-    fn iq3_s_sycl_port_scalar(
-        w_bytes: &[u8],
-        x: &[f32],
-        out: &mut [f32],
-        m: usize,
-        k: usize,
-    ) {
+    fn iq3_s_sycl_port_scalar(w_bytes: &[u8], x: &[f32], out: &mut [f32], m: usize, k: usize) {
         use rustllama_gguf::dequant::{IQ3S_GRID, KMASK_IQ2XS};
         const BLOCK_BYTES: usize = 110;
         const QK_K: usize = 256;
@@ -21744,8 +22110,16 @@ mod tests {
                         for j in 0..4 {
                             let g1 = ((grid1_bits >> (j * 8)) & 0xFF) as u8;
                             let g2 = ((grid2_bits >> (j * 8)) & 0xFF) as u8;
-                            let s_lo = if sign_byte & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
-                            let s_hi = if sign_byte & KMASK_IQ2XS[j + 4] != 0 { -1.0 } else { 1.0 };
+                            let s_lo = if sign_byte & KMASK_IQ2XS[j] != 0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            let s_hi = if sign_byte & KMASK_IQ2XS[j + 4] != 0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
                             acc += db * (g1 as f32) * s_lo * x[x_off + j];
                             acc += db * (g2 as f32) * s_hi * x[x_off + j + 4];
                         }
@@ -21966,9 +22340,14 @@ mod tests {
 
     #[test]
     fn rope_simd_parity_with_scalar() {
-        for &(n_heads, head_dim) in
-            &[(1usize, 64usize), (4, 64), (8, 128), (32, 128), (1, 32), (2, 256)]
-        {
+        for &(n_heads, head_dim) in &[
+            (1usize, 64usize),
+            (4, 64),
+            (8, 128),
+            (32, 128),
+            (1, 32),
+            (2, 256),
+        ] {
             let x = rand_vec(n_heads * head_dim, (n_heads * head_dim) as u32);
             let mut a = x.clone();
             rope_inplace_neox(&mut a, n_heads, head_dim, 17, 10000.0);
@@ -22002,9 +22381,14 @@ mod tests {
         // table the base theta produces — this is what lets a rope-scaled model
         // at the unscaled frequencies (and every non-scaled model routed through
         // the shared `rope_inplace` helper) reproduce the old output exactly.
-        for &(n_heads, head_dim) in
-            &[(1usize, 64usize), (4, 64), (8, 128), (32, 128), (1, 32), (2, 256)]
-        {
+        for &(n_heads, head_dim) in &[
+            (1usize, 64usize),
+            (4, 64),
+            (8, 128),
+            (32, 128),
+            (1, 32),
+            (2, 256),
+        ] {
             let theta = 10000.0f32;
             let half = head_dim / 2;
             // Build the table exactly as `accel::rope_inv_freq_table` does.

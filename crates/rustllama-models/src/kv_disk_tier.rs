@@ -94,7 +94,13 @@ impl KvDiskTier {
             return;
         }
         self.clock += 1;
-        self.map.insert(hash.0, DiskEntry { slot, last_used: self.clock });
+        self.map.insert(
+            hash.0,
+            DiskEntry {
+                slot,
+                last_used: self.clock,
+            },
+        );
     }
 
     /// Read a block's bytes back by hash, bumping its LRU stamp. `None` = miss
@@ -136,7 +142,10 @@ impl KvDiskTier {
     }
 
     fn lru_key(&self) -> Option<u64> {
-        self.map.iter().min_by_key(|(_, e)| e.last_used).map(|(&k, _)| k)
+        self.map
+            .iter()
+            .min_by_key(|(_, e)| e.last_used)
+            .map(|(&k, _)| k)
     }
 
     pub fn len(&self) -> usize {
@@ -158,7 +167,10 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("rustllama-kvdisk-{name}-{}.bin", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "rustllama-kvdisk-{name}-{}.bin",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -184,7 +196,7 @@ mod tests {
     fn lru_evicts_slot_under_cap() {
         let p = tmp("lru");
         let slot_elems = 2; // 8 bytes/slot
-        // Cap = 16 bytes = 2 slots.
+                            // Cap = 16 bytes = 2 slots.
         let mut t = KvDiskTier::new(&p, slot_elems, 16).expect("tier");
         t.demote(BlockHash(1), &[1.0, 1.0]);
         t.demote(BlockHash(2), &[2.0, 2.0]);
@@ -194,7 +206,10 @@ mod tests {
         assert_eq!(t.len(), 2);
         assert!(t.contains(BlockHash(1)));
         assert!(!t.contains(BlockHash(2)));
-        assert_eq!(t.promote(BlockHash(3)).as_deref(), Some([3.0f32, 3.0].as_slice()));
+        assert_eq!(
+            t.promote(BlockHash(3)).as_deref(),
+            Some([3.0f32, 3.0].as_slice())
+        );
         let _ = std::fs::remove_file(&p);
     }
 }

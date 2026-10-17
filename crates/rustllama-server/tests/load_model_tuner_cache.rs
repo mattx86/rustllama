@@ -133,8 +133,7 @@ auto_apply_batch_size = false
 /// field, not falling through to a cache lookup that might exist.
 #[tokio::test]
 async fn load_model_request_batch_size_wins_over_cache_and_config() {
-    let model = std::env::temp_dir()
-        .join("rustllama-load-tuner-request-wins.gguf");
+    let model = std::env::temp_dir().join("rustllama-load-tuner-request-wins.gguf");
     write_synthetic_llama_gguf(&model, &SynthLlama::default());
 
     let (state, cfg) = build_state_with_config(

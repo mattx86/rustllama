@@ -430,7 +430,10 @@ pub enum Command {
         kv_dtype: bool,
         /// KV-dtype candidates (comma-separated). Default covers every
         /// v1-supported value. Honored only with `--kv-dtype`.
-        #[arg(long, default_value = "f32,f16,bf16,q8_0,q4_0,tq1,tq2,tq4,tq8,nvfp4,mxfp4,mxfp6,mxfp8")]
+        #[arg(
+            long,
+            default_value = "f32,f16,bf16,q8_0,q4_0,tq1,tq2,tq4,tq8,nvfp4,mxfp4,mxfp6,mxfp8"
+        )]
         kv_dtype_candidates: String,
         /// Flash-attention on/off sweep. Reuses one loaded engine
         /// (flash is a hot toggle). Writes the winner under
@@ -2009,7 +2012,11 @@ fn cmd_quantize(
                 Ok(encoder) => {
                     println!("quantize: IQ GPU encoder enabled (experimental — needs hardware validation)");
                     rustllama_gguf::quantize::quantize_gguf_to_path_with_encoder(
-                        &src, output, &plan, &encoder, gpu_dequant,
+                        &src,
+                        output,
+                        &plan,
+                        &encoder,
+                        gpu_dequant,
                     )
                     .map_err(|e| anyhow::anyhow!("quantize pipeline failed: {e}"))?
                 }
@@ -2342,7 +2349,8 @@ fn cmd_tune_moe_placement(
 fn promote_cpu_tier_env_from_config(inference: &rustllama_config::InferenceConfig) {
     // CPU disable-list: read by the thread-pool affinity pinning + the
     // tuner's CPU-config-aware fingerprint (mirror of the GPU disable-list).
-    if !inference.disabled_cpus.is_empty() && std::env::var_os("RUSTLLAMA_DISABLED_CPUS").is_none() {
+    if !inference.disabled_cpus.is_empty() && std::env::var_os("RUSTLLAMA_DISABLED_CPUS").is_none()
+    {
         let list = inference
             .disabled_cpus
             .iter()
@@ -2401,7 +2409,8 @@ fn promote_memory_env_from_config(
         std::env::set_var("RUSTLLAMA_DISABLED_GPUS", &list);
         tracing::info!(disabled_gpus = %list, "GPU disable-list applied from config");
     }
-    if !inference.disabled_npus.is_empty() && std::env::var_os("RUSTLLAMA_DISABLED_NPUS").is_none() {
+    if !inference.disabled_npus.is_empty() && std::env::var_os("RUSTLLAMA_DISABLED_NPUS").is_none()
+    {
         let list = inference
             .disabled_npus
             .iter()
@@ -2474,10 +2483,15 @@ fn promote_memory_env_from_config(
     });
     opts.apply();
     if opts.moe_expert_cache_mb > 0 {
-        tracing::info!(budget_mb = opts.moe_expert_cache_mb, "moe_expert_cache_mb: expert-pin cache enabled");
+        tracing::info!(
+            budget_mb = opts.moe_expert_cache_mb,
+            "moe_expert_cache_mb: expert-pin cache enabled"
+        );
     }
     if opts.prefill_batched {
-        tracing::info!("prefill_batched: chunked prefill routes through the batched flash-prefill path");
+        tracing::info!(
+            "prefill_batched: chunked prefill routes through the batched flash-prefill path"
+        );
     }
     if opts.ssm_prefill_chunked {
         tracing::info!("ssm_prefill_chunked: chunked-parallel SSM (DeltaNet) prefill path enabled");
@@ -2741,7 +2755,10 @@ fn fit_conformal_quantiles(
 /// Decision-calibration (a stage of `tune --all`): load the model, score
 /// each labeled decision item via `score_continuations`, fit the decision-
 /// probability temperature, and persist it per-model in the tuner cache.
-fn cmd_decision_calibrate(config_path: &std::path::Path, model: Option<String>) -> anyhow::Result<()> {
+fn cmd_decision_calibrate(
+    config_path: &std::path::Path,
+    model: Option<String>,
+) -> anyhow::Result<()> {
     use rustllama_engine::CpuEngine;
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
@@ -3833,9 +3850,7 @@ async fn serve(
     // computed once, injected into tools requests so the model picks the
     // right shell dialect. Mirror `[server].tool_environment_hint` into
     // the server's process-global toggle (default true).
-    rustllama_server::env_hint::set_tool_environment_hint_enabled(
-        cfg.server.tool_environment_hint,
-    );
+    rustllama_server::env_hint::set_tool_environment_hint_enabled(cfg.server.tool_environment_hint);
     // P9: continuous batching (the fused-decode `PagedBatchEngine`) is the
     // DEFAULT now, perf-gated so it never regresses the single user. The paged
     // engine reached feature parity with the contiguous `CpuEngine` (prefix
@@ -4092,7 +4107,9 @@ async fn serve(
                     flash_v3_kv_tile_by_bucket_from_cache(cfg.tuning.auto_apply_flash_v3_kv_tile)
                 {
                     tracing::info!(
-                        short = b[0], mid = b[1], long = b[2],
+                        short = b[0],
+                        mid = b[1],
+                        long = b[2],
                         "tuner cache: applied flash_v3_kv_tile_by_bucket winners"
                     );
                     rustllama_engine::set_flash_v3_kv_tiles(b[0], b[1], b[2]);
@@ -4214,9 +4231,8 @@ async fn serve(
                     model = %path.display(),
                     "loading model directory via load_auto (MLX / safetensors)"
                 );
-                CpuEngine::load_auto(path, max_ctx).map_err(|e| {
-                    anyhow::anyhow!("failed to load model {}: {e}", path.display())
-                })?
+                CpuEngine::load_auto(path, max_ctx)
+                    .map_err(|e| anyhow::anyhow!("failed to load model {}: {e}", path.display()))?
             } else {
                 CpuEngine::load_with_options_layout_page_size_and_lora(
                     path,
@@ -4227,9 +4243,7 @@ async fn serve(
                     applied_page_size,
                     startup_lora,
                 )
-                .map_err(|e| {
-                    anyhow::anyhow!("failed to load model {}: {e}", path.display())
-                })?
+                .map_err(|e| anyhow::anyhow!("failed to load model {}: {e}", path.display()))?
             };
             // K-cache mean-centering bias sidecar (explicit path
             // from config, else auto-discovery beside the model).
@@ -4298,13 +4312,10 @@ async fn serve(
             // X1+D5: collect the speculative / CacheBlend winners and apply
             // them through the ONE `TunerWinners::apply_to` (shared with the
             // HTTP model-load path) rather than scattered `cpu.set_*` calls.
-            let mut spec_draft_winner: Option<(
-                std::sync::Arc<dyn rustllama_engine::Engine>,
-                u32,
-            )> = None;
-            let mut spec_ngram_winner: Option<
-                rustllama_engine::speculative::NgramDrafterConfig,
-            > = None;
+            let mut spec_draft_winner: Option<(std::sync::Arc<dyn rustllama_engine::Engine>, u32)> =
+                None;
+            let mut spec_ngram_winner: Option<rustllama_engine::speculative::NgramDrafterConfig> =
+                None;
             // F10 — lookahead (Jacobi n-gram-pool) spec winner (takes dispatch
             // precedence over plain n-gram). Off unless the config enables it.
             let spec_lookahead_winner: Option<
@@ -4407,9 +4418,11 @@ async fn serve(
             // CacheBlend recompute ratio for RAG `documents` requests. Tuner
             // winner (gated by auto_apply_cacheblend) overrides the config
             // fallback; a tuned 0.0 means the model was too sensitive → off.
-            let applied_cacheblend =
-                cacheblend_ratio_from_cache_or_default(cfg.tuning.auto_apply_cacheblend, &model_key)
-                    .unwrap_or(cfg.inference.cacheblend_recompute_ratio);
+            let applied_cacheblend = cacheblend_ratio_from_cache_or_default(
+                cfg.tuning.auto_apply_cacheblend,
+                &model_key,
+            )
+            .unwrap_or(cfg.inference.cacheblend_recompute_ratio);
             if applied_cacheblend > 0.0 {
                 tracing::info!(
                     ratio = applied_cacheblend,
@@ -4716,7 +4729,10 @@ async fn serve(
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
         let numa_topo = numa_opt_in.then(rustllama_kernels_cpu::numa::detect);
-        let numa_multi = numa_topo.as_ref().map(|t| t.is_multi_node()).unwrap_or(false);
+        let numa_multi = numa_topo
+            .as_ref()
+            .map(|t| t.is_multi_node())
+            .unwrap_or(false);
         if disabled.is_empty() && !numa_multi {
             rustllama_kernels_cpu::install_thread_pool(cfg.inference.threads as usize);
         } else {
@@ -6486,7 +6502,9 @@ pub fn persist_per_device_perf(
 /// on non-GPU hosts: every probe SKIPs → no verdict → nothing persisted.
 fn cmd_tune_validate_kernels() -> anyhow::Result<()> {
     println!("rustllama tune --validate-kernels");
-    println!("  running GPU/NPU kernel parity probes (CUDA tensor-core GEMM, SYCL XMX, NPU MatMul)…");
+    println!(
+        "  running GPU/NPU kernel parity probes (CUDA tensor-core GEMM, SYCL XMX, NPU MatMul)…"
+    );
     println!();
 
     let mut verdicts: Vec<(String, Option<bool>)> = Vec::new();
@@ -6609,8 +6627,8 @@ fn cmd_tune_dev_attn(
         optimize_for: rustllama_tuner::OptimizeFor::Throughput,
     };
 
-    let report =
-        measure_dev_attn(&model_path, &m_cfg, repeats.max(3) as usize).map_err(|e| anyhow::anyhow!(e))?;
+    let report = measure_dev_attn(&model_path, &m_cfg, repeats.max(3) as usize)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     match (report.capable, report.off_tps, report.on_tps, report.winner) {
         (true, Some(off), Some(on), Some(win)) => {
@@ -6652,7 +6670,11 @@ fn cmd_tune_dev_attn(
                 let on = report.on_tps.unwrap_or(0.0);
                 println!(
                     "  graph attn     = {graph:.2} tok/s  ({:+.1}% vs eager dev)",
-                    if on > 0.0 { (graph / on - 1.0) * 100.0 } else { 0.0 }
+                    if on > 0.0 {
+                        (graph / on - 1.0) * 100.0
+                    } else {
+                        0.0
+                    }
                 );
                 let gname = rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK_CUDA_GRAPH;
                 persist_kernel_verdicts(&[(gname.to_string(), gwin)])?;
@@ -6841,7 +6863,10 @@ fn cmd_tune_moe_vram_margin(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    println!("  decode_tokens = {decode_tokens}, repeats = {}", repeats.max(2));
+    println!(
+        "  decode_tokens = {decode_tokens}, repeats = {}",
+        repeats.max(2)
+    );
     println!();
 
     let report = measure_moe_vram_margin_candidates(
@@ -6858,7 +6883,10 @@ fn cmd_tune_moe_vram_margin(
     for (m, tps) in &report.candidates {
         match tps {
             Some(t) => println!("  margin {:.2} GiB → {t:.2} tok/s", *m as f64 / GIB as f64),
-            None => println!("  margin {:.2} GiB → (no measurement)", *m as f64 / GIB as f64),
+            None => println!(
+                "  margin {:.2} GiB → (no measurement)",
+                *m as f64 / GIB as f64
+            ),
         }
     }
     if !report.capable {
@@ -7367,10 +7395,12 @@ fn cmd_tune_tree_widths(
     }
 
     let fmt_tps = |t: Option<f64>| {
-        t.map(|v| format!("{v:.2} tps")).unwrap_or_else(|| "—".to_string())
+        t.map(|v| format!("{v:.2} tps"))
+            .unwrap_or_else(|| "—".to_string())
     };
     let fmt_acc = |a: Option<f64>| {
-        a.map(|v| format!("{:.0}%", v * 100.0)).unwrap_or_else(|| "—".to_string())
+        a.map(|v| format!("{:.0}%", v * 100.0))
+            .unwrap_or_else(|| "—".to_string())
     };
     println!("  {:>14}  {:>12}  {:>8}", "widths", "decode tps", "accept");
     for c in &report.candidates {
@@ -7509,10 +7539,12 @@ fn perf_knob_measurement_cfg(
 /// Print one numeric perf-knob sweep's candidate table.
 fn print_perf_candidates(candidates: &[rustllama_tuner::PerfCandidate], metric_label: &str) {
     let fmt = |t: Option<f64>| {
-        t.map(|v| format!("{v:.2} tps")).unwrap_or_else(|| "—".to_string())
+        t.map(|v| format!("{v:.2} tps"))
+            .unwrap_or_else(|| "—".to_string())
     };
     let fmt_j = |t: Option<f64>| {
-        t.map(|v| format!("{v:.2} tok/J")).unwrap_or_else(|| "—".to_string())
+        t.map(|v| format!("{v:.2} tok/J"))
+            .unwrap_or_else(|| "—".to_string())
     };
     println!("  {:>12}  {:>14}  {:>14}", "value", metric_label, "energy");
     for c in candidates {
@@ -7542,7 +7574,8 @@ fn cmd_tune_parallel_matvec_crossover(
     if repeats == 0 {
         anyhow::bail!("--perf-knob-repeats must be >= 1");
     }
-    let candidates = parse_u64_candidates(candidates_csv, "--parallel-matvec-crossover-candidates")?;
+    let candidates =
+        parse_u64_candidates(candidates_csv, "--parallel-matvec-crossover-candidates")?;
     let m_cfg = perf_knob_measurement_cfg(&cfg)?;
 
     println!("rustllama tune --parallel-matvec-crossover");
@@ -7668,8 +7701,14 @@ fn cmd_tune_ssm_chunk(
         return Ok(());
     }
 
-    let report = measure_ssm_chunk(&model_path, &m_cfg, &candidates, repeats as usize, prompt_tokens)
-        .map_err(|e| anyhow::anyhow!("ssm-chunk measurement failed: {e}"))?;
+    let report = measure_ssm_chunk(
+        &model_path,
+        &m_cfg,
+        &candidates,
+        repeats as usize,
+        prompt_tokens,
+    )
+    .map_err(|e| anyhow::anyhow!("ssm-chunk measurement failed: {e}"))?;
     print_perf_candidates(&report.candidates, "prefill tps");
     if let Some(err) = report.error.as_ref() {
         println!("  note: {err}");
@@ -8034,9 +8073,16 @@ fn cmd_tune_flash_v3_kv_tile(
     // run — the FA-v3 tok/s bench — at the bucket's representative context.
     let mid_win = report.winner.unwrap_or(32);
     let sweep_at = |ptoks: u32| -> Option<u32> {
-        let ctx = (ptoks as usize + decode_tokens as usize + 8).max(cfg.inference.ctx_size as usize);
+        let ctx =
+            (ptoks as usize + decode_tokens as usize + 8).max(cfg.inference.ctx_size as usize);
         match measure_flash_v3_kv_tile_candidates(
-            &model_path, &candidates, ctx, ptoks, decode_tokens, repeats, &m_cfg,
+            &model_path,
+            &candidates,
+            ctx,
+            ptoks,
+            decode_tokens,
+            repeats,
+            &m_cfg,
         ) {
             Ok(r) => r.winner,
             Err(e) => {
@@ -8105,10 +8151,7 @@ fn cmd_tune_flash_bench(
         Some(t) => format!("{t:>8.2} tps"),
         None => format!("{:>8}", "n/a"),
     };
-    println!(
-        "  {:>5}  {:>12}  {:>14}",
-        "gen", "prefill", "flash-decode"
-    );
+    println!("  {:>5}  {:>12}  {:>14}", "gen", "prefill", "flash-decode");
     println!(
         "  {:>5}  {:>12}  {:>14}",
         "v3",
@@ -8446,7 +8489,9 @@ fn cmd_tune_batching(
                 tracing::warn!(error = %e, "failed to persist batching winner");
             }
         }
-        None => println!("  → neither engine completed a run; leaving the batching default (paged)"),
+        None => {
+            println!("  → neither engine completed a run; leaving the batching default (paged)")
+        }
     }
     Ok(())
 }
@@ -8749,7 +8794,10 @@ fn cmd_tune_all(
         .as_ref()
         .map(|t| t.matvec_min_flops.is_some())
         .unwrap_or(false);
-    let has_ssm_chunk = cached.as_ref().map(|t| t.ssm_chunk.is_some()).unwrap_or(false);
+    let has_ssm_chunk = cached
+        .as_ref()
+        .map(|t| t.ssm_chunk.is_some())
+        .unwrap_or(false);
 
     let skip = |populated: bool| skip_cached && !force && populated;
 
@@ -9163,8 +9211,7 @@ fn cmd_tune_all(
         thorough,
         "10 (chunked SSM prefill)",
         &[],
-    )
-    {
+    ) {
         tracing::warn!(error = %e, "stage 10 (chunked SSM prefill) failed; continuing");
     }
 
@@ -9265,8 +9312,8 @@ pub fn persist_kv_dtype_winner_to(
 ) -> anyhow::Result<std::path::PathBuf> {
     use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
     std::fs::create_dir_all(cache_dir)?;
-    let mut tuning =
-        load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
+    let mut tuning = load_cache(cache_dir, key)?
+        .unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
     tuning.kv_dtype = Some(kv_dtype.to_string());
     tuning.last_tuned = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9295,8 +9342,8 @@ pub fn persist_flash_attention_winner_to(
 ) -> anyhow::Result<std::path::PathBuf> {
     use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
     std::fs::create_dir_all(cache_dir)?;
-    let mut tuning =
-        load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
+    let mut tuning = load_cache(cache_dir, key)?
+        .unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
     tuning.flash_attention = Some(flash);
     tuning.last_tuned = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9325,8 +9372,8 @@ pub fn persist_speculative_mtp_winner_to(
 ) -> anyhow::Result<std::path::PathBuf> {
     use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
     std::fs::create_dir_all(cache_dir)?;
-    let mut tuning =
-        load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
+    let mut tuning = load_cache(cache_dir, key)?
+        .unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
     tuning.speculative_mtp = Some(v);
     tuning.last_tuned = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9358,8 +9405,8 @@ pub fn persist_tree_widths_winner_to(
 ) -> anyhow::Result<std::path::PathBuf> {
     use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
     std::fs::create_dir_all(cache_dir)?;
-    let mut tuning =
-        load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
+    let mut tuning = load_cache(cache_dir, key)?
+        .unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
     tuning.winner_tree_widths = Some(widths.to_vec());
     tuning.last_tuned = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9388,8 +9435,8 @@ pub fn persist_ssm_prefill_chunked_winner_to(
 ) -> anyhow::Result<std::path::PathBuf> {
     use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
     std::fs::create_dir_all(cache_dir)?;
-    let mut tuning =
-        load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
+    let mut tuning = load_cache(cache_dir, key)?
+        .unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
     tuning.ssm_prefill_chunked = Some(v);
     tuning.last_tuned = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9404,7 +9451,9 @@ pub fn persist_ssm_prefill_chunked_winner_to(
 
 pub fn persist_parallel_matvec_crossover_winner(v: u32) -> anyhow::Result<()> {
     let Some(cache_dir) = rustllama_tuner::default_cache_dir() else {
-        tracing::warn!("no tuner cache dir resolvable; skipping parallel_matvec_crossover persistence");
+        tracing::warn!(
+            "no tuner cache dir resolvable; skipping parallel_matvec_crossover persistence"
+        );
         return Ok(());
     };
     let (key, device) = rustllama_tuner::cache_context();
@@ -9418,7 +9467,10 @@ pub fn persist_parallel_matvec_crossover_winner(v: u32) -> anyhow::Result<()> {
         .ok()
         .map(|d| format!("{}", d.as_secs()));
     save_cache(&cache_dir, &tuning)?;
-    println!("saved parallel_matvec_crossover winner to {}", cache_path_for(&cache_dir, &key).display());
+    println!(
+        "saved parallel_matvec_crossover winner to {}",
+        cache_path_for(&cache_dir, &key).display()
+    );
     Ok(())
 }
 
@@ -9438,7 +9490,10 @@ pub fn persist_matvec_min_flops_winner(v: u64) -> anyhow::Result<()> {
         .ok()
         .map(|d| format!("{}", d.as_secs()));
     save_cache(&cache_dir, &tuning)?;
-    println!("saved matvec_min_flops winner to {}", cache_path_for(&cache_dir, &key).display());
+    println!(
+        "saved matvec_min_flops winner to {}",
+        cache_path_for(&cache_dir, &key).display()
+    );
     Ok(())
 }
 
@@ -9458,16 +9513,17 @@ pub fn persist_ssm_chunk_winner(v: u32) -> anyhow::Result<()> {
         .ok()
         .map(|d| format!("{}", d.as_secs()));
     save_cache(&cache_dir, &tuning)?;
-    println!("saved ssm_chunk winner to {}", cache_path_for(&cache_dir, &key).display());
+    println!(
+        "saved ssm_chunk winner to {}",
+        cache_path_for(&cache_dir, &key).display()
+    );
     Ok(())
 }
 
 /// P16 read-back: the three numeric perf-knob winners from the tuner cache,
 /// gated by `[tuning].auto_apply_perf_knobs`. `None` when off / no cache / no
 /// winner → the engine keeps the kernel's historical default (byte-identical).
-pub fn perf_knob_winners_from_cache(
-    auto_apply: bool,
-) -> (Option<u32>, Option<u64>, Option<u32>) {
+pub fn perf_knob_winners_from_cache(auto_apply: bool) -> (Option<u32>, Option<u64>, Option<u32>) {
     if !auto_apply {
         return (None, None, None);
     }
@@ -9476,11 +9532,7 @@ pub fn perf_knob_winners_from_cache(
     };
     let key = rustllama_tuner::system_fingerprint();
     match rustllama_tuner::load_cache(&cache_dir, &key) {
-        Ok(Some(t)) => (
-            t.parallel_matvec_crossover,
-            t.matvec_min_flops,
-            t.ssm_chunk,
-        ),
+        Ok(Some(t)) => (t.parallel_matvec_crossover, t.matvec_min_flops, t.ssm_chunk),
         _ => (None, None, None),
     }
 }
@@ -9504,8 +9556,8 @@ pub fn persist_kv_cache_layout_winner_to(
 ) -> anyhow::Result<std::path::PathBuf> {
     use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
     std::fs::create_dir_all(cache_dir)?;
-    let mut tuning =
-        load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
+    let mut tuning = load_cache(cache_dir, key)?
+        .unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
     tuning.kv_cache_layout = Some(layout.to_string());
     tuning.last_tuned = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9537,8 +9589,8 @@ pub fn persist_batching_winner_to(
 ) -> anyhow::Result<std::path::PathBuf> {
     use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
     std::fs::create_dir_all(cache_dir)?;
-    let mut tuning =
-        load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
+    let mut tuning = load_cache(cache_dir, key)?
+        .unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
     tuning.batching_engine = Some(engine.to_string());
     tuning.last_tuned = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9589,8 +9641,8 @@ pub fn persist_flash_kv_min_winner_to(
 ) -> anyhow::Result<std::path::PathBuf> {
     use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
     std::fs::create_dir_all(cache_dir)?;
-    let mut tuning =
-        load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
+    let mut tuning = load_cache(cache_dir, key)?
+        .unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
     tuning.flash_kv_min = Some(kv_min);
     tuning.last_tuned = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9624,8 +9676,8 @@ pub fn persist_prefix_snapshots_winner_to(
 ) -> anyhow::Result<std::path::PathBuf> {
     use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
     std::fs::create_dir_all(cache_dir)?;
-    let mut tuning =
-        load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
+    let mut tuning = load_cache(cache_dir, key)?
+        .unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
     tuning.prefix_cache_max_snapshots = Some(depth);
     tuning.last_tuned = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9704,8 +9756,8 @@ pub fn persist_kv_page_size_winner_to(
 ) -> anyhow::Result<std::path::PathBuf> {
     use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
     std::fs::create_dir_all(cache_dir)?;
-    let mut tuning =
-        load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
+    let mut tuning = load_cache(cache_dir, key)?
+        .unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
     tuning.kv_page_size = Some(page_size);
     tuning.last_tuned = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9743,7 +9795,8 @@ pub fn persist_moe_placement_winner(placement: &str, split_permille: u32) -> any
         return Ok(());
     };
     let (key, device) = rustllama_tuner::cache_context();
-    let path = persist_moe_placement_winner_to(&cache_dir, &key, &device, placement, split_permille)?;
+    let path =
+        persist_moe_placement_winner_to(&cache_dir, &key, &device, placement, split_permille)?;
     println!("saved moe_placement winner to {}", path.display());
     Ok(())
 }
@@ -9757,8 +9810,8 @@ pub fn persist_moe_placement_winner_to(
 ) -> anyhow::Result<std::path::PathBuf> {
     use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
     std::fs::create_dir_all(cache_dir)?;
-    let mut tuning =
-        load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
+    let mut tuning = load_cache(cache_dir, key)?
+        .unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
     tuning.moe_placement = Some(placement.to_string());
     tuning.moe_gpu_split_permille = Some(split_permille);
     tuning.last_tuned = std::time::SystemTime::now()
@@ -9814,8 +9867,8 @@ pub fn persist_flash_v3_kv_tile_winner_to(
 ) -> anyhow::Result<std::path::PathBuf> {
     use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
     std::fs::create_dir_all(cache_dir)?;
-    let mut tuning =
-        load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
+    let mut tuning = load_cache(cache_dir, key)?
+        .unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
     tuning.flash_v3_kv_tile = Some(kv_tile);
     tuning.last_tuned = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9852,7 +9905,9 @@ pub fn flash_v3_kv_tile_from_cache_or_default_to(
 /// `flash_v3_kv_tile` for back-compat with the env-var apply path.
 pub fn persist_flash_v3_kv_tile_by_bucket(buckets: [u32; 3]) -> anyhow::Result<()> {
     let Some(cache_dir) = rustllama_tuner::default_cache_dir() else {
-        tracing::warn!("no tuner cache dir resolvable; skipping flash_v3_kv_tile bucket persistence");
+        tracing::warn!(
+            "no tuner cache dir resolvable; skipping flash_v3_kv_tile bucket persistence"
+        );
         return Ok(());
     };
     let (key, device) = rustllama_tuner::cache_context();
@@ -9910,10 +9965,7 @@ pub fn kv_dtype_from_cache_or_default(auto_apply: bool) -> Option<String> {
     kv_dtype_from_cache_or_default_to(&cache_dir, &key)
 }
 
-pub fn kv_dtype_from_cache_or_default_to(
-    cache_dir: &std::path::Path,
-    key: &str,
-) -> Option<String> {
+pub fn kv_dtype_from_cache_or_default_to(cache_dir: &std::path::Path, key: &str) -> Option<String> {
     rustllama_tuner::load_cache(cache_dir, key)
         .ok()
         .flatten()
@@ -10070,8 +10122,8 @@ pub fn persist_placement_winner_to(
 ) -> anyhow::Result<std::path::PathBuf> {
     use rustllama_tuner::{cache_path_for, load_cache, save_cache, PlacementPlan, TuningResult};
     std::fs::create_dir_all(cache_dir)?;
-    let mut tuning =
-        load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
+    let mut tuning = load_cache(cache_dir, key)?
+        .unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
     tuning.placement.insert(
         model_key.to_string(),
         PlacementPlan {
@@ -10115,8 +10167,8 @@ pub fn persist_batch_size_winner_to(
 ) -> anyhow::Result<std::path::PathBuf> {
     use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
     std::fs::create_dir_all(cache_dir)?;
-    let mut tuning =
-        load_cache(cache_dir, key)?.unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
+    let mut tuning = load_cache(cache_dir, key)?
+        .unwrap_or_else(|| TuningResult::empty(key.to_string(), device.clone()));
     tuning.batch_size = Some(batch_size);
     tuning.last_tuned = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -10337,7 +10389,10 @@ pub fn cmd_tuning_show(config_path: &std::path::Path) -> anyhow::Result<()> {
     // P16: numeric perf-knob axis winners + the objective they were ranked by.
     // "(none)" = no winner cached → the engine keeps the kernel's historical
     // default (byte-identical): crossover 256, min_flops 0, chunk 64.
-    println!("perf-knob winners (objective = {}):", cfg.tuning.optimize_for);
+    println!(
+        "perf-knob winners (objective = {}):",
+        cfg.tuning.optimize_for
+    );
     match tuning.parallel_matvec_crossover {
         Some(v) => println!("  parallel_matvec_crossover = {v}"),
         None => println!(
@@ -10359,7 +10414,10 @@ pub fn cmd_tuning_show(config_path: &std::path::Path) -> anyhow::Result<()> {
              `rustllama tune --ssm-chunk`)"
         ),
     }
-    println!("  auto_apply_perf_knobs     = {}", cfg.tuning.auto_apply_perf_knobs);
+    println!(
+        "  auto_apply_perf_knobs     = {}",
+        cfg.tuning.auto_apply_perf_knobs
+    );
     println!();
     // P9: the single-stream batching A/B winner + how the serve path resolves
     // the continuous-batching default. `batching_engine` is set by
@@ -10369,7 +10427,11 @@ pub fn cmd_tuning_show(config_path: &std::path::Path) -> anyhow::Result<()> {
     match tuning.batching_engine.as_deref() {
         Some(e) => println!(
             "  batching_engine   = {e}  (single-stream {} is faster/parity here)",
-            if e == "contiguous" { "contiguous" } else { "paged (CB)" }
+            if e == "contiguous" {
+                "contiguous"
+            } else {
+                "paged (CB)"
+            }
         ),
         None => println!(
             "  batching_engine   = (none — run `rustllama tune --batching`; serve uses the \
@@ -10414,9 +10476,7 @@ pub fn cmd_tuning_show(config_path: &std::path::Path) -> anyhow::Result<()> {
     println!("flash-attn-v3 KV_TILE winners:");
     match tuning.flash_v3_kv_tile {
         Some(t) => println!("  flash_v3_kv_tile  = {t} (global / env-applied)"),
-        None => println!(
-            "  flash_v3_kv_tile  = (none — run `rustllama tune --flash-v3-kv-tile`)"
-        ),
+        None => println!("  flash_v3_kv_tile  = (none — run `rustllama tune --flash-v3-kv-tile`)"),
     }
     match tuning.flash_v3_kv_tile_by_bucket.as_ref() {
         Some(b) if b.len() == 3 => println!(
@@ -10442,7 +10502,10 @@ pub fn cmd_tuning_show(config_path: &std::path::Path) -> anyhow::Result<()> {
     } else if tuning.kernel_build_id == cur_build {
         format!("{} (current)", tuning.kernel_build_id)
     } else {
-        format!("{} (STALE vs current {cur_build} — will re-validate)", tuning.kernel_build_id)
+        format!(
+            "{} (STALE vs current {cur_build} — will re-validate)",
+            tuning.kernel_build_id
+        )
     };
     println!("  kernel_build_id   = {stamped}");
     if tuning.kernel_verdicts.is_empty() {
@@ -10452,7 +10515,10 @@ pub fn cmd_tuning_show(config_path: &std::path::Path) -> anyhow::Result<()> {
         keys.sort();
         for k in keys {
             let v = tuning.kernel_verdicts[k];
-            println!("  {k:<32} {}", if v { "ON  (pass)" } else { "off (fail-closed)" });
+            println!(
+                "  {k:<32} {}",
+                if v { "ON  (pass)" } else { "off (fail-closed)" }
+            );
         }
     }
     Ok(())
@@ -10683,8 +10749,7 @@ fn bench(
     use rustllama_engine::{CpuEngine, SamplingParams};
 
     let cfg = rustllama_config::load_with_profile(config_path, profile)?;
-    let model_path =
-        effective_model_path(model_override.map(str::to_string), &cfg, config_path)?;
+    let model_path = effective_model_path(model_override.map(str::to_string), &cfg, config_path)?;
     let ctx_size = ctx_size_override.unwrap_or(cfg.inference.ctx_size as usize);
     // Override-or-config K/V dtype. When K and V differ in config,
     // bench uses K's dtype (matches engine storage which couples
@@ -12494,10 +12559,8 @@ async fn chat_repl(
                         | Err(rustyline::error::ReadlineError::Eof) => break,
                         Err(e) => return Err(e.into()),
                     };
-                    let approved = matches!(
-                        ans.trim().to_ascii_lowercase().as_str(),
-                        "y" | "yes" | "a"
-                    );
+                    let approved =
+                        matches!(ans.trim().to_ascii_lowercase().as_str(), "y" | "yes" | "a");
                     if approved {
                         // The REPL has no tool executor, so "approve" just
                         // acknowledges — nothing runs.
@@ -12507,8 +12570,7 @@ async fn chat_repl(
                     // Deny: ask the model to answer directly, then re-issue.
                     messages.push(ChatMessage {
                         role: "user".into(),
-                        content: "Please don't run that tool — answer directly instead."
-                            .into(),
+                        content: "Please don't run that tool — answer directly instead.".into(),
                     });
                 }
             }
@@ -12912,7 +12974,9 @@ async fn drive_chat_stream(
                 let _ = std::io::stdout().flush();
                 content.push_str(&t);
             }
-            Ok(ChatEvent::AskUser { prompt, options, .. }) => {
+            Ok(ChatEvent::AskUser {
+                prompt, options, ..
+            }) => {
                 // Echo the question inline (it isn't content); the caller
                 // prints the numbered options and reads a selection.
                 print!("{prompt}");

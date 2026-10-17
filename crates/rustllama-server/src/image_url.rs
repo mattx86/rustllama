@@ -56,7 +56,9 @@ pub enum ImageUrlError {
     Base64(#[from] base64::DecodeError),
     /// A remote URL was provided. v1 doesn't fetch (SSRF / egress
     /// policy concerns); clients must inline the image as a data URI.
-    #[error("remote image URLs ({0}://...) are not supported in v1; inline the image as a data: URI")]
+    #[error(
+        "remote image URLs ({0}://...) are not supported in v1; inline the image as a data: URI"
+    )]
     RemoteUrlNotSupported(String),
     /// A `file://` URL was provided.
     #[error("file:// URLs are not supported; inline the image as a data: URI")]
@@ -115,7 +117,10 @@ fn decode_data_uri(rest: &str) -> Result<Vec<u8>, ImageUrlError> {
             ))
         }
     };
-    if !rest_params.split(';').any(|p| p.eq_ignore_ascii_case("base64")) {
+    if !rest_params
+        .split(';')
+        .any(|p| p.eq_ignore_ascii_case("base64"))
+    {
         return Err(ImageUrlError::MalformedDataUri(
             "missing ;base64 terminator",
         ));
@@ -261,7 +266,9 @@ mod tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode(b"data");
         let url = format!("data:application/pdf;base64,{encoded}");
         let err = decode_image_url(&url).unwrap_err();
-        assert!(matches!(err, ImageUrlError::UnsupportedMediaType(ref s) if s == "application/pdf"));
+        assert!(
+            matches!(err, ImageUrlError::UnsupportedMediaType(ref s) if s == "application/pdf")
+        );
     }
 
     #[test]

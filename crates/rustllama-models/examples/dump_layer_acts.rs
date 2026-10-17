@@ -31,16 +31,15 @@ fn write_f32_bin(path: &PathBuf, data: &[f32]) {
 
 fn main() {
     let mut args = env::args().skip(1);
-    let path = args.next().expect("usage: dump_layer_acts <gguf> <token_id> <out_dir>");
+    let path = args
+        .next()
+        .expect("usage: dump_layer_acts <gguf> <token_id> <out_dir>");
     let token_id: i32 = args
         .next()
         .expect("token_id")
         .parse()
         .expect("token_id u32");
-    let out_dir: PathBuf = args
-        .next()
-        .expect("out_dir")
-        .into();
+    let out_dir: PathBuf = args.next().expect("out_dir").into();
     fs::create_dir_all(&out_dir).expect("create out_dir");
 
     // Tell the forward to dump per-layer hidden states. The forward
@@ -58,18 +57,14 @@ fn main() {
         cfg.vocab_size, cfg.moe
     );
 
-    let mut kv = KvCache::new_with_dtype(
-        &cfg,
-        1,
-        rustllama_models::llama_arch::KvDtype::F32,
-    );
+    let mut kv = KvCache::new_with_dtype(&cfg, 1, rustllama_models::llama_arch::KvDtype::F32);
     let hybrid_layers: &[HybridLayer] = model
         .weights
         .hybrid_layers
         .as_ref()
         .expect("model is not hybrid — this tool only diagnoses qwen35moe");
-    let mut dn = DeltaNetCache::new_for_hybrid(&cfg, hybrid_layers)
-        .expect("DeltaNetCache for hybrid");
+    let mut dn =
+        DeltaNetCache::new_for_hybrid(&cfg, hybrid_layers).expect("DeltaNetCache for hybrid");
 
     let mut logits = vec![0.0f32; cfg.vocab_size];
     println!("running forward at pos=0 for token_id={token_id}...");

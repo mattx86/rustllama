@@ -73,8 +73,7 @@ fn build_state_pointing_at_embedding_only_gguf(
     tag: &str,
 ) -> (AppState, std::path::PathBuf, std::path::PathBuf) {
     use rustllama_gguf::synth::{write_synthetic_bert_gguf, SynthBert};
-    let model_path =
-        std::env::temp_dir().join(format!("rustllama-rerank-{tag}-embed-only.gguf"));
+    let model_path = std::env::temp_dir().join(format!("rustllama-rerank-{tag}-embed-only.gguf"));
     write_synthetic_bert_gguf(&model_path, &SynthBert::default());
     let cfg_path = std::env::temp_dir().join(format!("rustllama-rerank-{tag}-cfg.toml"));
     std::fs::write(
@@ -161,8 +160,7 @@ async fn rerank_rejects_embedding_only_gguf_with_500() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     let body_str = String::from_utf8_lossy(&body);
     assert!(
-        body_str.contains("has no `cls.weight`")
-            || body_str.contains("this is an embedding model"),
+        body_str.contains("has no `cls.weight`") || body_str.contains("this is an embedding model"),
         "500 body must explain why the GGUF is wrong-typed: {body_str}"
     );
     let _ = std::fs::remove_file(&model_path);
@@ -218,12 +216,17 @@ async fn rerank_returns_results_sorted_by_score() {
     // wrapped with [CLS] / [SEP] / [SEP], so at minimum 4 *
     // (1 + 1 + 1 + 1 + 1) = 20 tokens.
     let total_tokens = v["usage"]["total_tokens"].as_u64().expect("total_tokens");
-    assert!(total_tokens >= 4, "expected at least 4 tokens, got {total_tokens}");
+    assert!(
+        total_tokens >= 4,
+        "expected at least 4 tokens, got {total_tokens}"
+    );
 
     // Default: documents not echoed.
     for r in results {
-        assert!(r.get("document").is_none() || r["document"].is_null(),
-                "default response must not include document text: {r}");
+        assert!(
+            r.get("document").is_none() || r["document"].is_null(),
+            "default response must not include document text: {r}"
+        );
     }
 
     let _ = std::fs::remove_file(&model_path);
@@ -345,8 +348,7 @@ async fn v1_models_advertises_reranker_capability_when_slot_enabled() {
 
 #[tokio::test]
 async fn v1_models_reports_n_labels_after_first_rerank_load() {
-    let (state, model_path, cfg_path) =
-        build_state_with_synth_reranker("v1-models-n-labels", 3);
+    let (state, model_path, cfg_path) = build_state_with_synth_reranker("v1-models-n-labels", 3);
 
     // Force lazy-load via a /v1/rerank call.
     let app = router(state.clone());

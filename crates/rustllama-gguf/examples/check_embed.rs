@@ -20,9 +20,17 @@ fn main() {
     println!("file: {path}");
     println!("  shape: {:?}", info.dims);
     println!("  dtype: {:?}", info.dtype);
-    println!("  bytes: {} ({:.2} MiB)", bytes.len(), bytes.len() as f64 / (1024.0 * 1024.0));
+    println!(
+        "  bytes: {} ({:.2} MiB)",
+        bytes.len(),
+        bytes.len() as f64 / (1024.0 * 1024.0)
+    );
     let nonzero = bytes.iter().filter(|b| **b != 0).count();
-    println!("  nonzero bytes: {nonzero} of {} ({:.4}%)", bytes.len(), 100.0 * nonzero as f64 / bytes.len() as f64);
+    println!(
+        "  nonzero bytes: {nonzero} of {} ({:.4}%)",
+        bytes.len(),
+        100.0 * nonzero as f64 / bytes.len() as f64
+    );
     // Sample first 32 bytes + bytes around several token-row offsets.
     let n = info.dims.iter().product::<u64>() as usize;
     let dim_total = if info.dims.len() == 2 {
@@ -32,7 +40,15 @@ fn main() {
     };
     let row_bytes = bytes.len() / dim_total.max(1);
     println!("  row_bytes (assuming [vocab, d] row-major): {row_bytes}");
-    for off in [0usize, row_bytes, row_bytes * 5834, row_bytes * (dim_total / 2), bytes.len().saturating_sub(16)].iter() {
+    for off in [
+        0usize,
+        row_bytes,
+        row_bytes * 5834,
+        row_bytes * (dim_total / 2),
+        bytes.len().saturating_sub(16),
+    ]
+    .iter()
+    {
         if let Some(slice) = bytes.get(*off..*off + 16) {
             let nz = slice.iter().filter(|b| **b != 0).count();
             let hex: Vec<String> = slice.iter().take(16).map(|b| format!("{b:02x}")).collect();

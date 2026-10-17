@@ -12,8 +12,8 @@
 //! Uses the synth-llama fixture so the test doesn't pay model
 //! download / inference cost.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};

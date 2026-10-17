@@ -401,11 +401,7 @@ impl Default for MoeConfig {
 /// every per-expert slice offset overflow its backing (`Storage::slice` panic).
 /// Returns `None` when the tensor is absent or the count doesn't divide evenly
 /// — never forces a wrong width (the caller then falls back to the dense key).
-fn derive_expert_ff_from_gate_exps(
-    gguf: &Gguf,
-    n_experts: usize,
-    d_model: usize,
-) -> Option<usize> {
+fn derive_expert_ff_from_gate_exps(gguf: &Gguf, n_experts: usize, d_model: usize) -> Option<usize> {
     if n_experts == 0 || d_model == 0 {
         return None;
     }
@@ -502,8 +498,7 @@ impl LlamaConfig {
 
         let moe = match u32_optional(gguf, &key("expert_count")) {
             Some(n) if n > 0 => {
-                let n_experts_used =
-                    u32_optional(gguf, &key("expert_used_count")).unwrap_or(1);
+                let n_experts_used = u32_optional(gguf, &key("expert_used_count")).unwrap_or(1);
                 // C4: validate the routing shape at LOAD, not deep in the hot
                 // path. `route_topk_into` indexes `n_experts_used` of the
                 // `n_experts` experts; `used > total` reads past the expert
@@ -532,18 +527,15 @@ impl LlamaConfig {
                 let gating_sigmoid =
                     u32_optional(gguf, &key("expert_gating_func")).unwrap_or(1) == 2;
                 let norm_topk_default = arch != "qwen2moe";
-                let norm_topk = bool_optional(gguf, &key("expert_weights_norm"))
-                    .unwrap_or(norm_topk_default);
-                let weights_scale =
-                    f32_optional(gguf, &key("expert_weights_scale")).unwrap_or(1.0);
+                let norm_topk =
+                    bool_optional(gguf, &key("expert_weights_norm")).unwrap_or(norm_topk_default);
+                let weights_scale = f32_optional(gguf, &key("expert_weights_scale")).unwrap_or(1.0);
                 let n_group = u32_optional(gguf, &key("expert_group_count")).unwrap_or(0);
-                let topk_group =
-                    u32_optional(gguf, &key("expert_group_used_count")).unwrap_or(0);
+                let topk_group = u32_optional(gguf, &key("expert_group_used_count")).unwrap_or(0);
                 Some(MoeConfig {
                     n_experts: n,
                     n_experts_used,
-                    n_experts_shared: u32_optional(gguf, &key("expert_shared_count"))
-                        .unwrap_or(0),
+                    n_experts_shared: u32_optional(gguf, &key("expert_shared_count")).unwrap_or(0),
                     gating_sigmoid,
                     norm_topk,
                     weights_scale,
@@ -576,8 +568,7 @@ impl LlamaConfig {
                     gguf,
                     &key("expert_shared_feed_forward_length"),
                 ),
-                nextn_predict_layers: u32_optional(gguf, &key("nextn_predict_layers"))
-                    .unwrap_or(0),
+                nextn_predict_layers: u32_optional(gguf, &key("nextn_predict_layers")).unwrap_or(0),
             }),
             _ => None,
         };
@@ -615,7 +606,9 @@ impl LlamaConfig {
                     .filter(|&per_head| per_head > v_head_dim)
                     .map(|per_head| per_head - v_head_dim);
                 let qk_nope_head_dim = qk_nope_from_tensor
-                    .or_else(|| u32_optional(gguf, &key("attention.key_length")).map(|v| v as usize))
+                    .or_else(|| {
+                        u32_optional(gguf, &key("attention.key_length")).map(|v| v as usize)
+                    })
                     .unwrap_or(head_dim);
                 // q_lora_rank is optional: absent / 0 ⇒ Q is a direct
                 // `attn_q.weight` projection (DeepSeek-V2-Lite).
@@ -654,9 +647,8 @@ impl LlamaConfig {
         // M5: multimodal RoPE dimension sections `[t, h, w]` (Qwen2-VL /
         // Qwen2.5-VL). Absent on text-only models → `None` (plain 1-D RoPE).
         // ggml pads the array to 4 with a trailing 0; strip trailing zeros.
-        let rope_dimension_sections =
-            u32_array_optional(gguf, &key("rope.dimension_sections"))
-                .and_then(|v| normalize_rope_sections(&v));
+        let rope_dimension_sections = u32_array_optional(gguf, &key("rope.dimension_sections"))
+            .and_then(|v| normalize_rope_sections(&v));
 
         let cfg = Self {
             arch,
@@ -694,9 +686,19 @@ impl LlamaConfig {
         eprintln!(
             "[CFG DUMP] arch={} n_layers={} d_model={} n_heads={} n_kv_heads={} \
              head_dim={} rope_dim={} rope_theta={} d_ff={} vocab={} moe={:?} mla={:?} hybrid={:?}",
-            cfg.arch, cfg.n_layers, cfg.d_model, cfg.n_heads, cfg.n_kv_heads,
-            cfg.head_dim, cfg.rope_dim, cfg.rope_theta, cfg.d_ff, cfg.vocab_size,
-            cfg.moe, cfg.mla, cfg.hybrid,
+            cfg.arch,
+            cfg.n_layers,
+            cfg.d_model,
+            cfg.n_heads,
+            cfg.n_kv_heads,
+            cfg.head_dim,
+            cfg.rope_dim,
+            cfg.rope_theta,
+            cfg.d_ff,
+            cfg.vocab_size,
+            cfg.moe,
+            cfg.mla,
+            cfg.hybrid,
         );
         Ok(cfg)
     }
@@ -751,15 +753,21 @@ fn parse_hadamard(gguf: &Gguf) -> Result<Option<HadamardConfig>, ConfigError> {
     };
     let bad = |msg: String| ConfigError::Invalid(msg);
     if version != 1 {
-        return Err(bad(format!("unsupported prism.hadamard.version: {version}")));
+        return Err(bad(format!(
+            "unsupported prism.hadamard.version: {version}"
+        )));
     }
     let block_size = u32_required(gguf, "prism.hadamard.block_size")? as usize;
     if block_size < 2 || !block_size.is_power_of_two() {
-        return Err(bad(format!("invalid prism.hadamard.block_size: {block_size}")));
+        return Err(bad(format!(
+            "invalid prism.hadamard.block_size: {block_size}"
+        )));
     }
     let transform = str_required(gguf, "prism.hadamard.transform")?;
     if transform != "normalized-sylvester-walsh-hadamard" {
-        return Err(bad(format!("unsupported prism.hadamard.transform: {transform}")));
+        return Err(bad(format!(
+            "unsupported prism.hadamard.transform: {transform}"
+        )));
     }
     let axis = str_required(gguf, "prism.hadamard.axis")?;
     if axis != "input-last-dimension" {
@@ -767,7 +775,9 @@ fn parse_hadamard(gguf: &Gguf) -> Result<Option<HadamardConfig>, ConfigError> {
     }
     let sign_mode = str_required(gguf, "prism.hadamard.sign_mode")?;
     if sign_mode != "identity" && sign_mode != "explicit" {
-        return Err(bad(format!("unsupported prism.hadamard.sign_mode: {sign_mode}")));
+        return Err(bad(format!(
+            "unsupported prism.hadamard.sign_mode: {sign_mode}"
+        )));
     }
 
     let weight_names = str_array(gguf, "prism.hadamard.weight_names")?;
@@ -786,7 +796,9 @@ fn parse_hadamard(gguf: &Gguf) -> Result<Option<HadamardConfig>, ConfigError> {
             )));
         }
         if !seen.insert(name.clone()) {
-            return Err(bad(format!("duplicate prism.hadamard.weight_names entry: {name}")));
+            return Err(bad(format!(
+                "duplicate prism.hadamard.weight_names entry: {name}"
+            )));
         }
     }
     // C2: gate/up foldedness must be PAIRED. The fused gate+up dispatch
@@ -862,7 +874,10 @@ fn parse_hadamard(gguf: &Gguf) -> Result<Option<HadamardConfig>, ConfigError> {
                     }
                 }
             }
-            if signs_by_width.insert(w, std::sync::Arc::new(signs)).is_some() {
+            if signs_by_width
+                .insert(w, std::sync::Arc::new(signs))
+                .is_some()
+            {
                 return Err(bad(format!("duplicate prism.hadamard sign width: {w}")));
             }
             off += w;
@@ -1054,13 +1069,19 @@ mod tests {
             Some(vec![16, 24, 24])
         );
         // Already-tight 3-element form is preserved verbatim.
-        assert_eq!(normalize_rope_sections(&[16, 24, 24]), Some(vec![16, 24, 24]));
+        assert_eq!(
+            normalize_rope_sections(&[16, 24, 24]),
+            Some(vec![16, 24, 24])
+        );
         // Multiple trailing zeros all stripped.
         assert_eq!(normalize_rope_sections(&[8, 8, 0, 0]), Some(vec![8, 8]));
         // Empty / all-zero → None.
         assert_eq!(normalize_rope_sections(&[]), None);
         assert_eq!(normalize_rope_sections(&[0, 0, 0, 0]), None);
         // Interior zero is NOT stripped (only the trailing run is).
-        assert_eq!(normalize_rope_sections(&[16, 0, 24, 0]), Some(vec![16, 0, 24]));
+        assert_eq!(
+            normalize_rope_sections(&[16, 0, 24, 0]),
+            Some(vec![16, 0, 24])
+        );
     }
 }

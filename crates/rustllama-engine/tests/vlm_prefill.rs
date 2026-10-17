@@ -73,8 +73,7 @@ fn make_test_png(seed: u8) -> Vec<u8> {
 fn build_vlm_engine(tag: &str) -> (CpuEngine, u32, std::path::PathBuf, std::path::PathBuf) {
     let text_path = write_matched_text_gguf(tag);
     let mmproj_path = write_test_mmproj(tag);
-    let mut engine =
-        CpuEngine::load_with_tokenizer(&text_path, 2048).expect("text load");
+    let mut engine = CpuEngine::load_with_tokenizer(&text_path, 2048).expect("text load");
     let mmproj_gguf = Gguf::open(&mmproj_path).expect("open mmproj");
     let vision = VisionModel::load(&mmproj_gguf).expect("load vision");
     // Token id 7 — in-range for the synth llama's 32-vocab.
@@ -96,8 +95,9 @@ fn vlm_prefill_with_no_images_matches_text_only_forward_prefill() {
 
     // Direct forward_prefill on the model.
     let mut kv_a = KvCache::new(cfg, max_ctx);
-    let logits_a =
-        engine.__model_for_test().forward_prefill(&prompt, 0, &mut kv_a);
+    let logits_a = engine
+        .__model_for_test()
+        .forward_prefill(&prompt, 0, &mut kv_a);
 
     // vlm_prefill_ids with no images (no placeholders -> no-op splice).
     let mut kv_b = KvCache::new(cfg, max_ctx);
@@ -143,8 +143,7 @@ fn vlm_prefill_with_image_advances_kv_by_spliced_length() {
     // Expected seq_len after prefill: 3 text + 577 image = 580.
     let expected_seq = (prompt.len() - 1) + 577;
     assert_eq!(
-        kv.seq_len,
-        expected_seq,
+        kv.seq_len, expected_seq,
         "KV cache should have advanced by spliced length"
     );
 
@@ -196,7 +195,10 @@ fn vlm_prefill_paged_matches_contiguous_with_image() {
         splice_image_embeddings(&text_embeds, &vlm_inputs.positions, &feat_slices, d_model)
             .expect("splice");
     let seq_len = spliced.len() / d_model;
-    assert!(seq_len > prompt.len(), "image splice should expand the sequence");
+    assert!(
+        seq_len > prompt.len(),
+        "image splice should expand the sequence"
+    );
 
     // Contiguous VLM forward.
     let mut kv = KvCache::new(&cfg, engine.max_ctx());
@@ -323,9 +325,7 @@ async fn engine_chat_routes_image_bearing_message_to_vlm_path() {
     }
     if let Some(msg) = error_kind {
         assert!(
-            msg.contains("vlm")
-                || msg.contains("placeholder")
-                || msg.contains("image"),
+            msg.contains("vlm") || msg.contains("placeholder") || msg.contains("image"),
             "VLM-routed error should reference the VLM path: {msg}"
         );
     }

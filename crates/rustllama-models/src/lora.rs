@@ -87,7 +87,11 @@ impl LoraFactors {
     /// (row-major `[out, in]`: `base[r*in + c]`). Summation order (k ascending)
     /// matches the hand-applied reference so the merge is bit-reproducible.
     pub fn add_delta_into(&self, base: &mut [f32]) {
-        debug_assert_eq!(base.len(), self.out_dim * self.in_dim, "lora merge: base size");
+        debug_assert_eq!(
+            base.len(),
+            self.out_dim * self.in_dim,
+            "lora merge: base size"
+        );
         for r in 0..self.out_dim {
             let brow = &self.b[r * self.rank..(r + 1) * self.rank];
             for c in 0..self.in_dim {
@@ -154,7 +158,9 @@ impl LoraAdapter {
             .metadata_get("general.architecture")
             .and_then(|v| v.as_string())
             .map(|s| s.to_string());
-        let alpha = g.metadata_get("adapter.lora.alpha").and_then(|v| v.as_f32());
+        let alpha = g
+            .metadata_get("adapter.lora.alpha")
+            .and_then(|v| v.as_f32());
 
         let mut factors = HashMap::new();
         for ti in g.tensors() {

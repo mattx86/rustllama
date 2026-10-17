@@ -236,7 +236,12 @@ fn iq_parse_const_array_hex_u64(src: &str, name: &str, expected: usize) -> Vec<u
         out.push(u64::from_str_radix(&rest[..end], 16).expect("hex u64"));
         rest = &rest[end..];
     }
-    assert_eq!(out.len(), expected, "{name}: expected {expected}, found {}", out.len());
+    assert_eq!(
+        out.len(),
+        expected,
+        "{name}: expected {expected}, found {}",
+        out.len()
+    );
     out
 }
 
@@ -256,7 +261,12 @@ fn iq_parse_const_array_hex_u32(src: &str, name: &str, expected: usize) -> Vec<u
         out.push(u32::from_str_radix(&rest[..end], 16).expect("hex u32"));
         rest = &rest[end..];
     }
-    assert_eq!(out.len(), expected, "{name}: expected {expected}, found {}", out.len());
+    assert_eq!(
+        out.len(),
+        expected,
+        "{name}: expected {expected}, found {}",
+        out.len()
+    );
     out
 }
 
@@ -273,7 +283,12 @@ fn iq_parse_const_array_dec_u8(src: &str, name: &str, expected: usize) -> Vec<u8
         .filter(|t| !t.is_empty())
         .map(|t| t.parse::<u32>().expect("dec u8") as u8)
         .collect();
-    assert_eq!(out.len(), expected, "{name}: expected {expected}, found {}", out.len());
+    assert_eq!(
+        out.len(),
+        expected,
+        "{name}: expected {expected}, found {}",
+        out.len()
+    );
     out
 }
 
@@ -302,7 +317,10 @@ fn iq_emit_u32_array(out: &mut String, name: &str, values: &[u32]) {
 }
 
 fn iq_emit_u8_array(out: &mut String, name: &str, values: &[u8]) {
-    out.push_str(&format!("constant uchar {name}[{}] = {{\n    ", values.len()));
+    out.push_str(&format!(
+        "constant uchar {name}[{}] = {{\n    ",
+        values.len()
+    ));
     for (i, v) in values.iter().enumerate() {
         out.push_str(&format!("{},", v));
         if i % 16 == 15 {
@@ -511,15 +529,18 @@ fn build_metallib_header(out_path: &std::path::Path) {
 /// Metal compiler is part of Xcode proper, so a missing/failed invocation
 /// usually means only the Command Line Tools are installed.
 fn run_xcrun(args: &[&str]) {
-    let status = Command::new("xcrun").args(args).status().unwrap_or_else(|e| {
-        panic!(
-            "rustllama-kernels-mlx: failed to invoke `xcrun {}`: {e}. The Metal \
+    let status = Command::new("xcrun")
+        .args(args)
+        .status()
+        .unwrap_or_else(|e| {
+            panic!(
+                "rustllama-kernels-mlx: failed to invoke `xcrun {}`: {e}. The Metal \
              shader compiler ships with full Xcode (not the Command Line Tools \
              alone) — install Xcode and run `sudo xcode-select -s \
              /Applications/Xcode.app`.",
-            args.join(" ")
-        )
-    });
+                args.join(" ")
+            )
+        });
     if !status.success() {
         panic!(
             "rustllama-kernels-mlx: `xcrun {}` failed. Ensure full Xcode + the \

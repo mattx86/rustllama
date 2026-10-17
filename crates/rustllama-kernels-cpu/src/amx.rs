@@ -190,7 +190,14 @@ fn pack_a(w: &[f16], a_buf: &mut [u16; TM * TK], m: usize, k: usize, mb: usize, 
 /// holds the interleaved pair (x[kb+2kk][n], x[kb+2kk+1][n]) for n in the
 /// N-block. Zero-pads the N and K remainders (an odd K zeros the trailing
 /// element of the last pair).
-fn pack_b_vnni(x: &[f32], b_buf: &mut [u16; (TK / 2) * (2 * TN)], n: usize, k: usize, kb: usize, nb: usize) {
+fn pack_b_vnni(
+    x: &[f32],
+    b_buf: &mut [u16; (TK / 2) * (2 * TN)],
+    n: usize,
+    k: usize,
+    kb: usize,
+    nb: usize,
+) {
     b_buf.fill(0);
     let ncols = (n - nb).min(TN);
     let kcols = (k - kb).min(TK);
@@ -379,7 +386,14 @@ fn pack_a_i8(a: &[i8], a_buf: &mut [i8; TM * TK_I8], m: usize, k: usize, mb: usi
 
 /// Pack a VNNI int8 B-tile from `b[K,N]` (row-major) at block (kb, nb): row `kk`
 /// holds, per output column n, the 4 consecutive K-values b[kb+4kk+{0..4}][n].
-fn pack_b_i8_vnni(b: &[i8], b_buf: &mut [i8; (TK_I8 / 4) * (4 * TN)], n: usize, k: usize, kb: usize, nb: usize) {
+fn pack_b_i8_vnni(
+    b: &[i8],
+    b_buf: &mut [i8; (TK_I8 / 4) * (4 * TN)],
+    n: usize,
+    k: usize,
+    kb: usize,
+    nb: usize,
+) {
     b_buf.fill(0);
     let ncols = (n - nb).min(TN);
     let kcols = (k - kb).min(TK_I8);
@@ -490,8 +504,12 @@ pub fn amx_i8_gemm_usable() -> bool {
         }
         // Probe crossing M/N/K tiles (M=20, N=20, K=130 → tiles + remainders).
         let (m, n, k) = (20usize, 20usize, 130usize);
-        let a: Vec<i8> = (0..m * k).map(|i| (((i as i64 * 2_654_435_761) % 255) - 127) as i8).collect();
-        let b: Vec<i8> = (0..k * n).map(|i| (((i as i64 * 40_503) % 255) - 127) as i8).collect();
+        let a: Vec<i8> = (0..m * k)
+            .map(|i| (((i as i64 * 2_654_435_761) % 255) - 127) as i8)
+            .collect();
+        let b: Vec<i8> = (0..k * n)
+            .map(|i| (((i as i64 * 40_503) % 255) - 127) as i8)
+            .collect();
         let mut got = vec![0i32; m * n];
         let mut want = vec![0i32; m * n];
         gemm_i8_ref(&a, &b, &mut want, m, n, k);
@@ -691,7 +709,9 @@ mod tests {
         }
         // Re-run a fresh parity check at a different shape to confirm.
         let (m, n, k) = (33usize, 17usize, 64usize);
-        let w: Vec<f16> = (0..m * k).map(|i| f16::from_f32(((i % 7) as f32 - 3.0) * 0.1)).collect();
+        let w: Vec<f16> = (0..m * k)
+            .map(|i| f16::from_f32(((i % 7) as f32 - 3.0) * 0.1))
+            .collect();
         let x: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32 - 2.0) * 0.05).collect();
         let mut got = vec![0f32; m * n];
         let mut want = vec![0f32; m * n];
@@ -727,7 +747,9 @@ mod tests {
     #[test]
     fn amx_q8_0_w8a8_prefill_matches_scalar_or_skips() {
         if !amx_q8_0_prefill_usable() {
-            eprintln!("amx-int8 Q8_0 prefill: not usable on this host (expected off AMX-INT8 hw) — SKIP");
+            eprintln!(
+                "amx-int8 Q8_0 prefill: not usable on this host (expected off AMX-INT8 hw) — SKIP"
+            );
             return;
         }
         // Fresh shapes crossing tiles + M/N/K remainders (k multiple of 32).

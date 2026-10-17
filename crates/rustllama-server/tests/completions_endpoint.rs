@@ -83,7 +83,12 @@ async fn completions_plain_returns_text_completion_shape() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "body={}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body={}",
+        String::from_utf8_lossy(&body)
+    );
     let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
     assert_eq!(v["object"], "text_completion");
     assert!(v["id"].is_string());
@@ -98,7 +103,9 @@ async fn completions_plain_returns_text_completion_shape() {
     assert!(v["usage"]["completion_tokens"].as_u64().is_some());
     // OpenAI-compat: system_fingerprint matches the `fp_<12hex>`
     // shape and is the same as /v1/chat/completions emits.
-    let fp = v["system_fingerprint"].as_str().expect("system_fingerprint string");
+    let fp = v["system_fingerprint"]
+        .as_str()
+        .expect("system_fingerprint string");
     assert!(
         fp.starts_with("fp_") && fp.len() == 15,
         "fingerprint must be fp_<12hex>: got {fp:?}"
@@ -127,7 +134,12 @@ async fn completions_fim_succeeds_when_model_has_fim_tokens() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "body={}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body={}",
+        String::from_utf8_lossy(&body)
+    );
     let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
     assert_eq!(v["object"], "text_completion");
     let choices = v["choices"].as_array().expect("choices array");
@@ -264,11 +276,18 @@ async fn completions_echo_with_logprobs_prepends_prompt_logprobs() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "body={}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body={}",
+        String::from_utf8_lossy(&body)
+    );
     let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
     let lp = &v["choices"][0]["logprobs"];
     let tokens = lp["tokens"].as_array().expect("tokens array");
-    let token_logprobs = lp["token_logprobs"].as_array().expect("token_logprobs array");
+    let token_logprobs = lp["token_logprobs"]
+        .as_array()
+        .expect("token_logprobs array");
     let top_logprobs = lp["top_logprobs"].as_array().expect("top_logprobs array");
     let text_offset = lp["text_offset"].as_array().expect("text_offset array");
     // All four parallel arrays must agree in length.
@@ -295,7 +314,10 @@ async fn completions_echo_with_logprobs_prepends_prompt_logprobs() {
     // text_offset is monotonically non-decreasing into the echoed text.
     let offs: Vec<u64> = text_offset.iter().map(|o| o.as_u64().unwrap()).collect();
     assert_eq!(offs[0], 0, "first token begins at offset 0");
-    assert!(offs.windows(2).all(|w| w[1] >= w[0]), "offsets non-decreasing");
+    assert!(
+        offs.windows(2).all(|w| w[1] >= w[0]),
+        "offsets non-decreasing"
+    );
     let _ = std::fs::remove_file(&tmp);
 }
 
@@ -321,10 +343,17 @@ async fn completions_logprobs_without_echo_has_no_prompt_entries() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "body={}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body={}",
+        String::from_utf8_lossy(&body)
+    );
     let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
     let lp = &v["choices"][0]["logprobs"];
-    let token_logprobs = lp["token_logprobs"].as_array().expect("token_logprobs array");
+    let token_logprobs = lp["token_logprobs"]
+        .as_array()
+        .expect("token_logprobs array");
     assert!(!token_logprobs.is_empty(), "completion produced logprobs");
     assert!(
         token_logprobs.iter().all(|x| x.is_number()),
@@ -352,7 +381,12 @@ async fn completions_echo_without_logprobs_unchanged() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "body={}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body={}",
+        String::from_utf8_lossy(&body)
+    );
     let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
     assert!(
         v["choices"][0]["logprobs"].is_null(),
@@ -410,7 +444,12 @@ async fn completions_valid_gbnf_grammar_reaches_engine() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "body={}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body={}",
+        String::from_utf8_lossy(&body)
+    );
     let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
     assert_eq!(v["object"], "text_completion");
     let _ = std::fs::remove_file(&tmp);

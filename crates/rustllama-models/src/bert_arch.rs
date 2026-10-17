@@ -142,8 +142,7 @@ impl BertConfig {
         let layer_norm_eps =
             f32_optional(gguf, &key("attention.layer_norm_epsilon")).unwrap_or(1e-12);
         let ctx_train = u32_optional(gguf, &key("context_length")).unwrap_or(512) as usize;
-        let n_token_types =
-            u32_optional(gguf, &key("token_types_count")).unwrap_or(2) as usize;
+        let n_token_types = u32_optional(gguf, &key("token_types_count")).unwrap_or(2) as usize;
 
         let vocab_size = match gguf.metadata_get("tokenizer.ggml.tokens") {
             Some(MetadataValue::Array(v)) => v.len(),
@@ -273,7 +272,8 @@ impl BertModel {
             Ok(tensor_from_info(gguf, info, name))
         };
         let optional = |name: &str| -> Option<Tensor> {
-            gguf.tensor(name).map(|info| tensor_from_info(gguf, info, name))
+            gguf.tensor(name)
+                .map(|info| tensor_from_info(gguf, info, name))
         };
 
         let token_embd = required("token_embd.weight")?;
@@ -313,9 +313,7 @@ impl BertModel {
         // NoClassifierHead.
         let classifier_head = optional("cls.weight")
             .map(|w| (w, optional("cls.bias")))
-            .or_else(|| {
-                optional("classifier.weight").map(|w| (w, optional("classifier.bias")))
-            })
+            .or_else(|| optional("classifier.weight").map(|w| (w, optional("classifier.bias"))))
             .map(|(weight, bias)| {
                 // Weight shape is `[d_model, n_labels]` — derive
                 // n_labels from the second dim (or fall back to 1
@@ -507,15 +505,7 @@ impl BertModel {
             // Bidirectional attention (no causal mask — the whole
             // point of BERT). Per-head, per-query-position softmax
             // over all key positions; accumulates V to attn_out.
-            bidirectional_attention(
-                &q,
-                &k_buf,
-                &v,
-                &mut attn_out,
-                n,
-                n_heads,
-                head_dim,
-            );
+            bidirectional_attention(&q, &k_buf, &v, &mut attn_out, n, n_heads, head_dim);
 
             // Output projection + bias.
             for i in 0..n {
@@ -668,8 +658,7 @@ pub(crate) fn bidirectional_attention(
             for (ki, score) in scores.iter_mut().enumerate() {
                 let mut dot = 0f32;
                 for d_idx in 0..head_dim {
-                    dot += q[qi * d + head_off + d_idx]
-                        * k[ki * d + head_off + d_idx];
+                    dot += q[qi * d + head_off + d_idx] * k[ki * d + head_off + d_idx];
                 }
                 *score = dot * scale;
             }
@@ -693,11 +682,7 @@ mod k_softmax {
     pub use rustllama_kernels_cpu::softmax_f32_inplace;
 }
 
-fn tensor_from_info(
-    gguf: &Gguf,
-    info: &rustllama_gguf::TensorInfo,
-    name: &str,
-) -> Tensor {
+fn tensor_from_info(gguf: &Gguf, info: &rustllama_gguf::TensorInfo, name: &str) -> Tensor {
     // Copy GGUF mmap bytes into an `Arc<[u8]>` for `Storage::CpuOwned`
     // (the only storage variant rustllama-tensor exposes today).
     // Llama loader does the same — the mmap → owned copy doubles

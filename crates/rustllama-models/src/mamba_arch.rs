@@ -115,8 +115,7 @@ impl MambaConfig {
         let get_u32 = |key: &str| -> Option<u32> { meta_u32(gguf, key) };
         let get_f32 = |key: &str| -> Option<f32> { meta_f32(gguf, key) };
         let d_model = get_u32(&format!("{arch}.embedding_length"))
-            .ok_or(MambaError::MissingMetadata("embedding_length"))?
-            as usize;
+            .ok_or(MambaError::MissingMetadata("embedding_length"))? as usize;
         let n_layers = get_u32(&format!("{arch}.block_count"))
             .ok_or(MambaError::MissingMetadata("block_count"))? as usize;
         let vocab_size = get_u32(&format!("{arch}.vocab_size"))
@@ -238,7 +237,9 @@ pub struct MambaCache {
 impl MambaCache {
     pub fn new(cfg: &MambaConfig) -> Self {
         Self {
-            layers: (0..cfg.n_layers).map(|_| MambaLayerCache::new(cfg)).collect(),
+            layers: (0..cfg.n_layers)
+                .map(|_| MambaLayerCache::new(cfg))
+                .collect(),
         }
     }
 
@@ -466,11 +467,7 @@ fn load_tensor_f32(gguf: &Gguf, name: &str) -> Result<Vec<f32>, MambaError> {
     Ok(out)
 }
 
-fn check_shape(
-    name: &str,
-    got: &[u64],
-    expected: &[u64],
-) -> Result<(), MambaError> {
+fn check_shape(name: &str, got: &[u64], expected: &[u64]) -> Result<(), MambaError> {
     if got == expected {
         Ok(())
     } else {
@@ -489,8 +486,9 @@ impl MambaModel {
     /// [`MambaError::MissingMetadata`] when the GGUF isn't Mamba-
     /// shaped.
     pub fn load(gguf: &Gguf) -> Result<Self, MambaError> {
-        let arch = MambaConfig::detect(gguf)
-            .ok_or(MambaError::MissingMetadata("general.architecture (not Mamba)"))?;
+        let arch = MambaConfig::detect(gguf).ok_or(MambaError::MissingMetadata(
+            "general.architecture (not Mamba)",
+        ))?;
         let cfg = MambaConfig::from_gguf(gguf, &arch)?;
 
         // GGUF tensor name prefix differs per arch family; the
@@ -600,12 +598,7 @@ impl MambaModel {
     /// [`crate::llama_arch::LlamaModel::forward_one`]'s contract so
     /// the engine's generation loop can dispatch on architecture
     /// without re-doing the sampling glue.
-    pub fn forward_one(
-        &self,
-        token_id: i32,
-        cache: &mut MambaCache,
-        logits_out: &mut [f32],
-    ) {
+    pub fn forward_one(&self, token_id: i32, cache: &mut MambaCache, logits_out: &mut [f32]) {
         let cfg = &self.cfg;
         let d_model = cfg.d_model;
         let d_inner = cfg.d_inner;

@@ -76,7 +76,10 @@ fn build_host_environment_hint() -> String {
             if powershell {
                 present.push("powershell.exe");
             }
-            parts.push(format!("PowerShell preferred ({} present)", present.join("/")));
+            parts.push(format!(
+                "PowerShell preferred ({} present)",
+                present.join("/")
+            ));
         } else {
             parts.push("PowerShell preferred".to_string());
         }
