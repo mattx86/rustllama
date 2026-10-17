@@ -17,10 +17,16 @@
 //!
 //! v1 scope: the planner drives the **expert-cache budget** (the knob
 //! with the widest damage range) and reports the projection it used.
-//! Driving the pagelock tier and KV pool sizing from the same plan is
-//! follow-up work — pagelock already self-clamps against available
-//! RAM *minus the expert budget* (see `pagelock.rs`), so the two
-//! never jointly overcommit.
+//!
+//! M7: the plan now also RESERVES the pagelock tier's soon-to-be-pinned
+//! RAM (`MemoryFacts::locked_bytes`, from
+//! [`crate::pagelock::projected_lock_bytes`]), CROSS-PLATFORM. Both the
+//! locked weights and the expert cache are unswappable once pinned, so
+//! the expert budget must be sized against RAM that excludes what the
+//! loader is about to lock — closing the direction the Windows pagelock
+//! self-clamp (available RAM *minus the expert budget*) didn't cover.
+//! `locked_bytes == 0` (lock off) keeps the plan byte-identical.
+//! KV pool sizing from the same plan remains follow-up work.
 
 /// Inputs to [`plan`]. All byte counts; gather them *after* model +
 /// KV construction so they're measured, not estimated.
@@ -47,6 +53,17 @@ pub struct MemoryFacts {
     /// the pool grew AFTER the expert budget was granted, on RAM the
     /// planner had already given away.
     pub pool_reserve_bytes: u64,
+    /// M7: bytes the pagelock tier is about to `mlock`/`VirtualLock` into
+    /// RAM (`RUSTLLAMA_LOCK_RAM_MB`). Locked pages are UNSWAPPABLE — the OS
+    /// cannot reclaim them under pressure — so they are committed RAM the
+    /// expert-cache budget must reserve, exactly like the KV/scratch
+    /// projections above, or the two independently "fit" and the box
+    /// thrashes once both are pinned. `0` when `lock_ram_mb` is unset/off
+    /// → the plan is byte-identical to before this field existed. Now
+    /// accounted CROSS-PLATFORM (Windows `VirtualLock` + POSIX `mlock`
+    /// alike), where the Windows build previously reserved locked RAM only
+    /// on the pagelock side.
+    pub locked_bytes: u64,
     /// Explicit `moe_expert_cache_mb` in bytes; in auto mode a
     /// non-zero value acts as a *cap* on the computed budget.
     pub explicit_cap_bytes: u64,
@@ -84,7 +101,11 @@ pub fn plan(f: &MemoryFacts) -> MemoryPlan {
         .kv_bytes
         .saturating_add(f.dn_bytes)
         .saturating_add(f.scratch_bytes)
-        .saturating_add(f.pool_reserve_bytes);
+        .saturating_add(f.pool_reserve_bytes)
+        // M7: the pagelock tier's soon-to-be-pinned (unswappable) RAM is
+        // committed too — reserve it so the expert cache, which is ALSO
+        // pinned, can't be sized onto RAM the loader is about to lock.
+        .saturating_add(f.locked_bytes);
     let spendable = f.avail_phys.saturating_sub(reserve.saturating_add(committed));
     let mut expert = (spendable / EXPERT_SHARE_DEN).saturating_mul(EXPERT_SHARE_NUM);
     expert = expert.min(f.expert_pool_bytes);
@@ -141,6 +162,7 @@ mod tests {
             scratch_bytes: 300 * 1024 * 1024,
             expert_pool_bytes: 8 * GB,
             pool_reserve_bytes: 0,
+            locked_bytes: 0,
             explicit_cap_bytes: 0,
         }
     }
@@ -154,6 +176,35 @@ mod tests {
         });
         assert!(with.spendable_bytes + GB == without.spendable_bytes);
         assert!(with.expert_cache_bytes < without.expert_cache_bytes);
+    }
+
+    /// M7: locked (soon-to-be-pinned) RAM is reserved exactly like the KV /
+    /// scratch / pool projections, so the expert cache is sized against RAM
+    /// that is NOT about to be `mlock`/`VirtualLock`'d. Host-agnostic — this
+    /// is the clamp-math test for the cross-platform planner change.
+    #[test]
+    fn locked_bytes_reserved_like_other_commitments() {
+        let without = plan(&base_facts());
+        let with = plan(&MemoryFacts {
+            locked_bytes: GB,
+            ..base_facts()
+        });
+        // A GiB of locked RAM removes exactly a GiB of spendable headroom...
+        assert_eq!(with.spendable_bytes + GB, without.spendable_bytes);
+        // ...and therefore shrinks the expert-cache grant.
+        assert!(with.expert_cache_bytes < without.expert_cache_bytes);
+        // locked_bytes == 0 is byte-identical to omitting the field (the
+        // `lock_ram_mb` unset/off guard).
+        let zero = plan(&MemoryFacts { locked_bytes: 0, ..base_facts() });
+        assert_eq!(zero, without);
+        // Locking more than the box can hold saturates spendable to 0 and
+        // flags exhaustion rather than underflowing.
+        let huge = plan(&MemoryFacts {
+            locked_bytes: 1_000 * GB,
+            ..base_facts()
+        });
+        assert_eq!(huge.expert_cache_bytes, 0);
+        assert!(huge.exhausted);
     }
 
     #[test]

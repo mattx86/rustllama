@@ -4251,6 +4251,7 @@ dependencies = [
  "futures",
  "half",
  "image",
+ "libc",
  "minijinja",
  "regex-automata",
  "rustllama-gguf",

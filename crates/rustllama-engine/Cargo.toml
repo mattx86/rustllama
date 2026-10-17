@@ -95,6 +95,13 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemInformation",
 ] }
 
+# POSIX memory-residency (M7): `mlock`/`munlock` the hot weight tiers into
+# RAM + a `getrlimit(RLIMIT_MEMLOCK)` ceiling check, the non-Windows twin of
+# the VirtualLock path above. Permissive (MIT/Apache-2.0); already a dep of
+# rustllama-kernels-sycl at the same major version.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 bytemuck.workspace = true
 half.workspace = true

@@ -1633,6 +1633,11 @@ impl CpuEngine {
                     ),
                     expert_pool_bytes: rustllama_models::accel::expert_registry_total_bytes(),
                     pool_reserve_bytes: DEFAULT_PREFIX_CACHE_MAX_SNAPSHOTS as u64 * per_anchor,
+                    // M7: RAM the pagelock tier is about to pin (`lock_ram_mb`).
+                    // Reserve it CROSS-PLATFORM so the pinned expert cache isn't
+                    // sized onto RAM the loader is about to lock. `0` when
+                    // locking is off ⇒ byte-identical plan.
+                    locked_bytes: crate::pagelock::projected_lock_bytes(&model),
                     explicit_cap_bytes,
                 };
                 let plan = crate::memory_budget::plan(&facts);
@@ -1651,6 +1656,7 @@ impl CpuEngine {
                         kv_mb = facts.kv_bytes / (1024 * 1024),
                         scratch_mb = facts.scratch_bytes / (1024 * 1024),
                         reserve_mb = plan.reserve_bytes / (1024 * 1024),
+                        locked_mb = facts.locked_bytes / (1024 * 1024),
                         expert_pool_mb = facts.expert_pool_bytes / (1024 * 1024),
                         expert_cache_mb = plan.expert_cache_bytes / (1024 * 1024),
                         "memory_budget=auto: expert-cache budget planned from measured RAM"

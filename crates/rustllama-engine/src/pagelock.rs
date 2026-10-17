@@ -1,13 +1,20 @@
-//! Windows memory-residency: VirtualLock the model's hot weight tiers
-//! into the process working set so the OS can't page them to the
-//! pagefile, then PrefetchVirtualMemory them in as one coalesced read.
+//! Memory-residency: pin the model's hot weight tiers into RAM so the OS
+//! can't page them to the pagefile/swap.
+//!
+//! - **Windows:** `VirtualLock` into the process working set (after raising
+//!   the working-set minimum with `SetProcessWorkingSetSizeEx`), then
+//!   `PrefetchVirtualMemory` the ranges in as one coalesced read.
+//! - **POSIX (M7):** `mlock`/`munlock` the same tier-ordered ranges, capped
+//!   by the `RLIMIT_MEMLOCK` soft limit — when the limit is below the
+//!   request we lock what the limit allows and `warn!` the shortfall rather
+//!   than failing the load (fail-soft, matching the Windows path).
 //!
 //! Gated by `RUSTLLAMA_LOCK_RAM_MB` (default OFF). `auto` locks the
-//! always-hot Tier-0 set within available RAM; an explicit MB value
-//! caps the budget. Cold MoE routed-expert blobs (Tier 2) are normally
-//! left pageable so the OS can still relieve pressure.
+//! always-hot Tier-0 set within available RAM / the memlock limit; an
+//! explicit MB value caps the budget. Cold MoE routed-expert blobs (Tier 2)
+//! are normally left pageable so the OS can still relieve pressure.
 //!
-//! On non-Windows targets the whole surface is a no-op.
+//! On a target that is neither Windows nor Unix the whole surface is a no-op.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -51,6 +58,63 @@ pub fn lock_ram_budget() -> LockBudget {
             None => LockBudget::Off,
         },
     )
+}
+
+/// Clamp a requested lock size (bytes) to what the POSIX `RLIMIT_MEMLOCK`
+/// soft limit permits, after reserving bytes already spoken for (the MoE
+/// expert-pin cache locks through the SAME per-process limit, so the two
+/// budgets must not independently "fit"). Returns `(granted, shortfall)`:
+/// `granted` is how many bytes may be locked and `shortfall = requested -
+/// granted` (0 when the full request fits under the limit).
+/// `rlimit_cur == u64::MAX` models `RLIM_INFINITY` (unlimited — typical for
+/// root or a container with no memlock cap) and never clamps.
+///
+/// Pure + host-agnostic so the clamp math is unit-tested on any platform
+/// (the `mlock` behaviour itself is validated on the Linux pod). Only the
+/// `#[cfg(unix)]` lock path consumes it in a non-test build.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn clamp_to_memlock_limit(requested: u64, rlimit_cur: u64, reserved: u64) -> (u64, u64) {
+    if rlimit_cur == u64::MAX {
+        return (requested, 0);
+    }
+    let headroom = rlimit_cur.saturating_sub(reserved);
+    let granted = requested.min(headroom);
+    (granted, requested - granted)
+}
+
+/// Project how many bytes the pagelock tier will pin for this model under the
+/// current `RUSTLLAMA_LOCK_RAM_MB` directive, WITHOUT locking anything.
+///
+/// The cross-platform memory-budget planner ([`crate::memory_budget`])
+/// reserves this so the (also-pinned) MoE expert cache is never sized onto
+/// RAM the loader is about to lock — the same accounting the Windows path got
+/// only from the pagelock side before M7. `0` when locking is off
+/// (`LockBudget::Off`) → the planner is byte-identical to before this hook.
+///
+/// Platform-agnostic (no OS calls — it walks the model's lock targets, which
+/// `lock_model_into_ram` does too): `Auto` projects the Tier-0 always-hot
+/// set; an explicit `Bytes(n)` projects `min(n, total lockable)`. The actual
+/// lock later clamps this against available RAM / the `RLIMIT_MEMLOCK` limit,
+/// so this is an UPPER bound on what gets pinned — the safe side to reserve.
+pub fn projected_lock_bytes(model: &LlamaModel) -> u64 {
+    let budget_kind = lock_ram_budget();
+    if budget_kind == LockBudget::Off {
+        return 0;
+    }
+    let mut targets = model.collect_lock_targets();
+    let mut seen = std::collections::HashSet::new();
+    targets.retain(|t| t.addr != 0 && t.len != 0 && seen.insert(t.addr));
+    let tier0_total: u64 = targets
+        .iter()
+        .filter(|t| t.tier == 0)
+        .map(|t| t.len as u64)
+        .sum();
+    let all_total: u64 = targets.iter().map(|t| t.len as u64).sum();
+    match budget_kind {
+        LockBudget::Off => 0,
+        LockBudget::Auto => tier0_total,
+        LockBudget::Bytes(n) => n.min(all_total),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +258,83 @@ mod sys {
     }
 }
 
+// ---------------------------------------------------------------------------
+// POSIX implementation (M7) — Linux / macOS
+// ---------------------------------------------------------------------------
+#[cfg(unix)]
+mod sys_unix {
+    /// `RLIMIT_MEMLOCK` soft limit in bytes — the per-process ceiling on how
+    /// much locked (unswappable) memory `mlock` will grant. `None` on
+    /// `getrlimit` failure; `Some(u64::MAX)` for `RLIM_INFINITY` (unlimited).
+    pub fn memlock_limit() -> Option<u64> {
+        // SAFETY: zero-initialized POD out-param; getrlimit fills it from a
+        // constant resource id. rc==0 means the fields are valid.
+        let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl) };
+        if rc != 0 {
+            return None;
+        }
+        if rl.rlim_cur == libc::RLIM_INFINITY {
+            Some(u64::MAX)
+        } else {
+            Some(rl.rlim_cur as u64)
+        }
+    }
+
+    /// `mlock` a single range. No-op (returns false) on null/zero; returns
+    /// false (fail-soft) when the kernel refuses (e.g. `ENOMEM`/`EPERM`).
+    pub fn lock_range(addr: usize, len: usize) -> bool {
+        if addr == 0 || len == 0 {
+            return false;
+        }
+        // SAFETY: addr/len describe a live, CPU-resident weight buffer owned
+        // by the model for the registry's lifetime.
+        let rc = unsafe { libc::mlock(addr as *const libc::c_void, len) };
+        rc == 0
+    }
+
+    /// `munlock` a single range (best-effort, errors ignored).
+    pub fn unlock_range(addr: usize, len: usize) {
+        if addr == 0 || len == 0 {
+            return;
+        }
+        // SAFETY: same range previously mlock'd; munlock is always safe.
+        unsafe {
+            let _ = libc::munlock(addr as *const libc::c_void, len);
+        }
+    }
+
+    /// Physical memory `(total, available)` bytes via `sysconf`, so the
+    /// cross-platform memory-budget planner runs on POSIX too (previously it
+    /// only ran on Windows, where `GlobalMemoryStatusEx` is available).
+    /// Linux (and most SVR4) expose `_SC_PHYS_PAGES` / `_SC_AVPHYS_PAGES`;
+    /// macOS does NOT define them in `libc` (its free-RAM query is the
+    /// `vm_statistics64` Mach call), so this returns `None` there and the
+    /// planner stays off on macOS — a documented follow-up, not a regression
+    /// (macOS keeps today's behavior). `None` on any `sysconf` failure.
+    #[cfg(target_os = "linux")]
+    pub fn mem_status() -> Option<(u64, u64)> {
+        // SAFETY: sysconf takes a constant resource id, no pointers.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let phys = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+        let avail = unsafe { libc::sysconf(libc::_SC_AVPHYS_PAGES) };
+        if page <= 0 || phys <= 0 {
+            return None;
+        }
+        let total = (phys as u64).saturating_mul(page as u64);
+        let free = if avail > 0 {
+            (avail as u64).saturating_mul(page as u64)
+        } else {
+            0
+        };
+        Some((total, free))
+    }
+    #[cfg(not(target_os = "linux"))]
+    pub fn mem_status() -> Option<(u64, u64)> {
+        None
+    }
+}
+
 /// Highest working-set floor (bytes intended for VirtualLock) granted
 /// so far. Raise-only: shrinking the min while pages are locked would
 /// make later `VirtualLock` calls fail, so refreshes only ever grow it.
@@ -212,7 +353,15 @@ pub fn memory_status() -> Option<(u64, u64)> {
     {
         sys::mem_status()
     }
-    #[cfg(not(windows))]
+    // M7 (cross-platform planner): now that `lock_ram_mb` pins RAM on POSIX
+    // too, the memory-budget planner must run there to reserve it. Linux
+    // reports via `sysconf`; other POSIX (macOS) returns `None` (planner
+    // stays off there — documented follow-up).
+    #[cfg(unix)]
+    {
+        sys_unix::mem_status()
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         None
     }
@@ -274,7 +423,15 @@ impl LockRegistry {
     pub fn verify_locked(&self) -> (u64, u64) {
         sys::count_locked(&self.regions)
     }
-    #[cfg(not(windows))]
+    /// POSIX has no per-page "is this locked?" query (`mincore` reports
+    /// residency, not the locked state), so report the retained — i.e.
+    /// successfully `mlock`'d — region count as both locked and probed.
+    #[cfg(all(unix, not(windows)))]
+    pub fn verify_locked(&self) -> (u64, u64) {
+        let n = self.regions.len() as u64;
+        (n, n)
+    }
+    #[cfg(not(any(windows, unix)))]
     pub fn verify_locked(&self) -> (u64, u64) {
         (0, 0)
     }
@@ -290,6 +447,20 @@ impl Drop for LockRegistry {
             regions = self.regions.len(),
             locked_mb = self.locked_bytes / (1024 * 1024),
             "pagelock: released VirtualLock ranges on engine drop"
+        );
+    }
+}
+
+#[cfg(all(unix, not(windows)))]
+impl Drop for LockRegistry {
+    fn drop(&mut self) {
+        for &(addr, len) in &self.regions {
+            sys_unix::unlock_range(addr, len);
+        }
+        tracing::info!(
+            regions = self.regions.len(),
+            locked_mb = self.locked_bytes / (1024 * 1024),
+            "pagelock: released mlock ranges on engine drop"
         );
     }
 }
@@ -440,7 +611,152 @@ pub fn lock_model_into_ram(model: Arc<LlamaModel>) -> Option<LockRegistry> {
     })
 }
 
-#[cfg(not(windows))]
+/// POSIX page-lock (M7): `mlock` the model's hot weight tiers into RAM per
+/// `RUSTLLAMA_LOCK_RAM_MB`, capped by the `RLIMIT_MEMLOCK` soft limit. On a
+/// limit below the request we lock what the limit allows and `warn!` the
+/// shortfall instead of failing the load (fail-soft). `None` when disabled
+/// or when nothing could be locked.
+#[cfg(all(unix, not(windows)))]
+pub fn lock_model_into_ram(model: Arc<LlamaModel>) -> Option<LockRegistry> {
+    let budget_kind = lock_ram_budget();
+    if budget_kind == LockBudget::Off {
+        // POSIX has no working-set-floor analogue to raise for the MoE
+        // expert-pin cache; `mlock` draws straight from the memlock limit,
+        // so with pagelock itself off there is nothing to do here.
+        return None;
+    }
+
+    // Enumerate targets, dedup by backing address, sort by tier so the
+    // greedy budget fills always-hot ranges before cold expert blobs.
+    let mut targets = model.collect_lock_targets();
+    targets.sort_by_key(|t| t.tier);
+    let mut seen = std::collections::HashSet::new();
+    targets.retain(|t| t.addr != 0 && t.len != 0 && seen.insert(t.addr));
+
+    let tier0_total: u64 = targets
+        .iter()
+        .filter(|t| t.tier == 0)
+        .map(|t| t.len as u64)
+        .sum();
+    let all_total: u64 = targets.iter().map(|t| t.len as u64).sum();
+
+    // Bytes the pagelock tier would like to lock before the RLIMIT clamp.
+    let requested: u64 = match budget_kind {
+        LockBudget::Off => return None,
+        LockBudget::Auto => tier0_total,
+        LockBudget::Bytes(n) => n.min(all_total),
+    };
+
+    // The MoE expert-pin cache `mlock`s through the SAME per-process limit
+    // later in the load, so treat its budget as already spoken for.
+    let expert_reserve = rustllama_models::accel::moe_expert_cache_max_bytes();
+    let rlimit_cur = sys_unix::memlock_limit().unwrap_or(u64::MAX);
+    let (granted, shortfall) = clamp_to_memlock_limit(requested, rlimit_cur, expert_reserve);
+    let mb = |b: u64| b / (1024 * 1024);
+    if shortfall > 0 {
+        tracing::warn!(
+            requested_mb = mb(requested),
+            granted_mb = mb(granted),
+            shortfall_mb = mb(shortfall),
+            rlimit_memlock_mb = if rlimit_cur == u64::MAX {
+                u64::MAX
+            } else {
+                mb(rlimit_cur)
+            },
+            expert_reserve_mb = mb(expert_reserve),
+            "pagelock: RLIMIT_MEMLOCK below request — locking what the limit \
+             allows (raise with `ulimit -l` / systemd `LimitMEMLOCK=`)"
+        );
+    }
+    if granted == 0 {
+        tracing::warn!(
+            requested_mb = mb(requested),
+            "pagelock: no memlock headroom (RLIMIT_MEMLOCK exhausted); skipping"
+        );
+        return None;
+    }
+
+    // Greedily lock tier-ordered targets up to the (capped) budget.
+    let mut intended: u64 = 0;
+    let mut to_lock: Vec<(usize, usize)> = Vec::new();
+    for t in &targets {
+        let len = t.len as u64;
+        if intended + len > granted {
+            continue; // skip oversized; keep filling smaller later targets
+        }
+        intended += len;
+        to_lock.push((t.addr, t.len));
+    }
+
+    let mut regions: Vec<(usize, usize)> = Vec::with_capacity(to_lock.len());
+    let mut locked_bytes: u64 = 0;
+    let mut failed = 0usize;
+    for (addr, len) in to_lock {
+        if sys_unix::lock_range(addr, len) {
+            regions.push((addr, len));
+            locked_bytes += len as u64;
+        } else {
+            failed += 1;
+        }
+    }
+
+    if regions.is_empty() {
+        tracing::warn!(
+            failed,
+            "pagelock: mlock locked 0 ranges (all mlock calls failed); not retaining registry"
+        );
+        return None;
+    }
+
+    tracing::info!(
+        requested_mb = mb(requested),
+        tier0_mb = mb(tier0_total),
+        granted_mb = mb(granted),
+        locked_mb = mb(locked_bytes),
+        regions = regions.len(),
+        failed,
+        "pagelock: mlock'd hot weight tiers into RAM"
+    );
+
+    Some(LockRegistry {
+        regions,
+        locked_bytes,
+        _model: model,
+    })
+}
+
+#[cfg(not(any(windows, unix)))]
 pub fn lock_model_into_ram(_model: Arc<LlamaModel>) -> Option<LockRegistry> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_to_memlock_limit;
+
+    // M7: the RLIMIT_MEMLOCK clamp math is host-agnostic, so it runs on any
+    // platform (including the Windows dev box) even though `mlock` itself is
+    // only exercised on the Linux pod.
+    #[test]
+    fn memlock_clamp_math() {
+        // Full request fits comfortably under the limit → no shortfall.
+        assert_eq!(clamp_to_memlock_limit(1000, 4000, 0), (1000, 0));
+        // Request exceeds the limit → lock what's allowed, report the rest.
+        assert_eq!(clamp_to_memlock_limit(5000, 4000, 0), (4000, 1000));
+        // Reserved bytes (the expert-pin cache) eat into the headroom first.
+        assert_eq!(clamp_to_memlock_limit(3000, 4000, 1500), (2500, 500));
+        // Reserved alone exceeds the limit → nothing granted, full shortfall.
+        assert_eq!(clamp_to_memlock_limit(3000, 1000, 2000), (0, 3000));
+        // Exactly at the limit is not a shortfall.
+        assert_eq!(clamp_to_memlock_limit(4000, 4000, 0), (4000, 0));
+        // RLIM_INFINITY (modeled as u64::MAX) never clamps, reserve ignored.
+        assert_eq!(
+            clamp_to_memlock_limit(u64::MAX, u64::MAX, 123),
+            (u64::MAX, 0)
+        );
+        // Saturating headroom: reserved > limit clamps to 0 (no underflow).
+        assert_eq!(clamp_to_memlock_limit(10, 5, 9), (0, 10));
+        // Reserved leaves a sliver of headroom below the request.
+        assert_eq!(clamp_to_memlock_limit(10, 5, 4), (1, 9));
+    }
 }

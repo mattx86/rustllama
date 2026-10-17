@@ -12482,6 +12482,95 @@ pub fn rope_inplace_neox_invfreq(
     rope_apply_cs(x, n_heads, head_dim, half, cs);
 }
 
+/// Multimodal / M-RoPE sectioned NeoX RoPE (Qwen2-VL / Qwen2.5-VL TEXT
+/// model). `sections` gives the number of dim-PAIRS assigned to each
+/// positional axis (e.g. Qwen2-VL `[16, 24, 24]` over `head_dim/2 = 64`
+/// pairs = temporal / height / width); `positions` is the token's position
+/// along each axis (`positions[s]` drives section `s`). Dim-pair `i` rotates
+/// by `positions[section_of(i)]` at the SAME global frequency
+/// `1 / theta^(2i/head_dim)` as [`rope_inplace_neox`] — the NeoX frequency
+/// ramp is continuous across sections, NOT restarted per section (matching HF
+/// Qwen2-VL `apply_multimodal_rotary_pos_emb`; this differs from the vision
+/// tower's per-section-restarted ramp in `vision_mrope_inplace`).
+///
+/// **Degenerate case = byte-identical to 1-D RoPE.** When every entry of
+/// `positions` is equal — the TEXT-token case, where the `(t,h,w)` triple
+/// collapses to one scalar position — this produces bit-for-bit the same
+/// output as `rope_inplace_neox(x, n_heads, head_dim, positions[0], theta)`,
+/// because each pair's `(cos,sin)` is computed from the identical
+/// `pos * freq`. That is the M5 text-byte-identical regression guard.
+///
+/// Pairs past the summed section coverage reuse the LAST section's position
+/// (defensive; real Qwen2-VL sections sum to exactly `head_dim/2`). Requires
+/// `positions` non-empty.
+pub fn rope_inplace_neox_sectioned(
+    x: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    sections: &[u32],
+    positions: &[u32],
+    theta: f32,
+) {
+    debug_assert_eq!(x.len(), n_heads * head_dim);
+    debug_assert_eq!(head_dim % 2, 0);
+    debug_assert!(!positions.is_empty(), "sectioned RoPE needs >=1 position");
+    let half = head_dim / 2;
+    const STACK_MAX_HALF: usize = 128;
+    let mut stack_cs = [0.0f32; 2 * STACK_MAX_HALF];
+    let heap_cs: Vec<f32>;
+    let cs: &[f32] = if half <= STACK_MAX_HALF {
+        fill_sectioned_cs(&mut stack_cs[..2 * half], head_dim, sections, positions, theta);
+        &stack_cs[..2 * half]
+    } else {
+        let mut v = vec![0f32; 2 * half];
+        fill_sectioned_cs(&mut v, head_dim, sections, positions, theta);
+        heap_cs = v;
+        &heap_cs[..]
+    };
+    rope_apply_cs(x, n_heads, head_dim, half, cs);
+}
+
+/// Fill the interleaved `[cos0,sin0,cos1,sin1,…]` slab (`len == 2*(head_dim/2)`)
+/// for sectioned RoPE. Pair `i`'s position is the one belonging to the
+/// section `i` falls in (walking cumulative section widths, clamped to the
+/// last section once coverage is exhausted); its frequency is the global
+/// `1/theta^(2i/head_dim)` (NeoX, un-restarted). The `freq`/`p` expressions
+/// match [`rope_inplace_neox`] exactly so the all-equal-position case is
+/// bit-identical.
+fn fill_sectioned_cs(
+    cs: &mut [f32],
+    head_dim: usize,
+    sections: &[u32],
+    positions: &[u32],
+    theta: f32,
+) {
+    let half = head_dim / 2;
+    debug_assert_eq!(cs.len(), 2 * half);
+    let last_pos = *positions.last().expect("positions non-empty") as f32;
+    let mut cum: usize = 0; // summed width of sections strictly before sec_idx
+    let mut sec_idx: usize = 0;
+    for i in 0..half {
+        // Advance into the next section once i passes this section's span,
+        // but never past the last available position.
+        while sec_idx < sections.len()
+            && sec_idx + 1 < positions.len()
+            && i >= cum + sections[sec_idx] as usize
+        {
+            cum += sections[sec_idx] as usize;
+            sec_idx += 1;
+        }
+        let pos = if sec_idx < positions.len() {
+            positions[sec_idx] as f32
+        } else {
+            last_pos
+        };
+        let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
+        let p = pos * freq;
+        cs[2 * i] = p.cos();
+        cs[2 * i + 1] = p.sin();
+    }
+}
+
 /// P1 context-shift: rotate every row of `x` by a SIGNED position delta
 /// `shift` (NeoX half-split), reusing the same inv-freq + rotate machinery
 /// as [`rope_inplace_neox`]. A row originally RoPE'd for absolute position
@@ -17153,6 +17242,70 @@ mod tests {
         for (a, b) in z.iter().zip(before.iter()) {
             assert!((a - b).abs() < 1e-6, "zero shift must be a no-op");
         }
+    }
+
+    /// M5 ANCHOR (kernel level, text-byte-identical): sectioned M-RoPE with
+    /// all three sections at the SAME position (the text-token case) is
+    /// BIT-for-BIT the current 1-D RoPE. This is the critical regression
+    /// guard — a VLM's text tokens must rotate exactly as before.
+    #[test]
+    fn mrope_sectioned_all_equal_positions_is_bit_identical_to_1d() {
+        let head_dim = 128usize; // half=64 → Qwen2-VL [16,24,24]
+        let n_heads = 4usize;
+        let theta = 10000.0f32;
+        let sections = [16u32, 24, 24];
+        let base: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| (i as f32 * 0.0191).cos() * 1.3 - 0.21)
+            .collect();
+        for &pos in &[0u32, 1, 7, 42, 1000, 65535] {
+            let mut a = base.clone();
+            let mut b = base.clone();
+            rope_inplace_neox(&mut a, n_heads, head_dim, pos, theta);
+            rope_inplace_neox_sectioned(
+                &mut b,
+                n_heads,
+                head_dim,
+                &sections,
+                &[pos, pos, pos],
+                theta,
+            );
+            assert_eq!(
+                a, b,
+                "sectioned M-RoPE with equal (t,h,w)={pos} must be bit-identical to 1-D RoPE"
+            );
+        }
+    }
+
+    /// M5: a smaller head_dim and a single-position/empty-section input also
+    /// degenerate to 1-D RoPE (defensive paths), and distinct section
+    /// positions genuinely rotate pairs by different angles (so it is not a
+    /// no-op on real image tokens).
+    #[test]
+    fn mrope_sectioned_degenerate_and_distinct() {
+        let head_dim = 8usize; // half=4
+        let n_heads = 2usize;
+        let theta = 10000.0f32;
+        let base: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| (i as f32 * 0.37).sin())
+            .collect();
+
+        // Single-position + section list that over/under-covers: still 1-D.
+        let mut a = base.clone();
+        let mut b = base.clone();
+        rope_inplace_neox(&mut a, n_heads, head_dim, 9, theta);
+        rope_inplace_neox_sectioned(&mut b, n_heads, head_dim, &[2, 2], &[9, 9], theta);
+        assert_eq!(a, b, "equal positions degenerate to 1-D regardless of section split");
+
+        // Distinct per-section positions must differ from any single-pos RoPE.
+        let mut c = base.clone();
+        rope_inplace_neox_sectioned(&mut c, n_heads, head_dim, &[2, 2], &[3, 11], theta);
+        let mut d = base.clone();
+        rope_inplace_neox(&mut d, n_heads, head_dim, 3, theta);
+        assert_ne!(c, d, "distinct section positions must rotate differently");
+        // Norm is still preserved (rotation is orthogonal per pair).
+        let n_in: f32 = base.iter().map(|v| v * v).sum();
+        let n_out: f32 = c.iter().map(|v| v * v).sum();
+        assert!((n_in - n_out).abs() < 1e-3, "sectioned rotation must preserve norm");
     }
 
     #[test]

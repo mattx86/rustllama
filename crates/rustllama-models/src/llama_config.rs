@@ -112,6 +112,18 @@ pub struct LlamaConfig {
     /// Gemma2/gpt-oss alternation where one global (full-attention) layer recurs
     /// every `p` layers; the rest are SWA. See [`Self::is_swa_layer`].
     pub sliding_window_pattern: Option<u32>,
+    /// M5: multimodal RoPE (M-RoPE) dimension sections
+    /// (`{arch}.rope.dimension_sections`), Qwen2-VL / Qwen2.5-VL. The number
+    /// of head-dim PAIRS assigned to each positional axis `[t, h, w]`
+    /// (temporal / height / width), e.g. `[16, 24, 24]` for a 128-wide head
+    /// (`head_dim/2 = 64` pairs). `None` on every text-only / non-mRoPE model
+    /// → RoPE stays plain 1-D. Trailing zero sections (ggml pads the array to
+    /// 4) are stripped at parse. When present, the TEXT model applies
+    /// [`rustllama_kernels_cpu::rope_inplace_neox_sectioned`]: each token
+    /// carries a 3-D `(t,h,w)` position, text tokens use `(p,p,p)` (byte-
+    /// identical to 1-D RoPE), image tokens use their patch-grid coordinates,
+    /// and the text position after an image jumps to `max(grid)+1`.
+    pub rope_dimension_sections: Option<Vec<u32>>,
 }
 
 impl LlamaConfig {
@@ -641,6 +653,12 @@ impl LlamaConfig {
         // Layer alternation pattern (Gemma2/gpt-oss); absent ⇒ all-SWA (Mistral).
         let sliding_window_pattern =
             u32_optional(gguf, &key("attention.sliding_window_pattern")).filter(|&p| p > 0);
+        // M5: multimodal RoPE dimension sections `[t, h, w]` (Qwen2-VL /
+        // Qwen2.5-VL). Absent on text-only models → `None` (plain 1-D RoPE).
+        // ggml pads the array to 4 with a trailing 0; strip trailing zeros.
+        let rope_dimension_sections =
+            u32_array_optional(gguf, &key("rope.dimension_sections"))
+                .and_then(|v| normalize_rope_sections(&v));
 
         let cfg = Self {
             arch,
@@ -671,6 +689,7 @@ impl LlamaConfig {
             attention_scale,
             sliding_window,
             sliding_window_pattern,
+            rope_dimension_sections,
         };
         // Diagnostic: print key config values at load time so hybrid
         // model bugs can be quickly localized to a wrong-loaded constant.
@@ -916,6 +935,47 @@ fn i32_array(gguf: &Gguf, key: &str) -> Result<Vec<i32>, ConfigError> {
     }
 }
 
+/// Read a numeric array metadata value as `Vec<u32>`. Accepts the integer
+/// element types a GGUF array can hold (U32/I32/U64/I64, non-negative and in
+/// range). `None` when the key is absent or not an array; an element of the
+/// wrong type is skipped (defensive — a malformed section array degrades to a
+/// shorter one rather than failing the whole load). Used by M5 for
+/// `{arch}.rope.dimension_sections`.
+fn u32_array_optional(gguf: &Gguf, key: &str) -> Option<Vec<u32>> {
+    match gguf.metadata_get(key)? {
+        MetadataValue::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(|v| match v {
+                    MetadataValue::U32(x) => Some(*x),
+                    MetadataValue::I32(x) if *x >= 0 => Some(*x as u32),
+                    MetadataValue::U64(x) if *x <= u32::MAX as u64 => Some(*x as u32),
+                    MetadataValue::I64(x) if *x >= 0 && *x <= u32::MAX as i64 => Some(*x as u32),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// M5: normalize a raw `rope.dimension_sections` array into the active axis
+/// widths. ggml stores 4 entries `[t, h, w, e]` with the unused tail padded
+/// to `0`; strip trailing zeros. Returns `None` when the array is empty or
+/// all-zero (treat as "no M-RoPE" → plain 1-D RoPE). Pure, so the parse
+/// contract is unit-tested host-agnostically.
+fn normalize_rope_sections(raw: &[u32]) -> Option<Vec<u32>> {
+    let mut end = raw.len();
+    while end > 0 && raw[end - 1] == 0 {
+        end -= 1;
+    }
+    if end == 0 {
+        None
+    } else {
+        Some(raw[..end].to_vec())
+    }
+}
+
 fn bool_optional(gguf: &Gguf, key: &str) -> Option<bool> {
     match gguf.metadata_get(key)? {
         MetadataValue::Bool(b) => Some(*b),
@@ -979,4 +1039,30 @@ fn parse_rope_scaling(gguf: &Gguf, arch: &str) -> Option<RopeScaling> {
         low_freq_factor: f32_optional(gguf, &key("rope.scaling.low_freq_factor")).unwrap_or(1.0),
         high_freq_factor: f32_optional(gguf, &key("rope.scaling.high_freq_factor")).unwrap_or(4.0),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_rope_sections;
+
+    /// M5: the `rope.dimension_sections` parse contract. ggml pads the array
+    /// to 4 with trailing zeros; those are stripped, and an empty / all-zero
+    /// array degrades to `None` (no M-RoPE → plain 1-D RoPE).
+    #[test]
+    fn rope_dimension_sections_normalization() {
+        // Qwen2-VL / Qwen2.5-VL: [t, h, w, 0] → [t, h, w].
+        assert_eq!(
+            normalize_rope_sections(&[16, 24, 24, 0]),
+            Some(vec![16, 24, 24])
+        );
+        // Already-tight 3-element form is preserved verbatim.
+        assert_eq!(normalize_rope_sections(&[16, 24, 24]), Some(vec![16, 24, 24]));
+        // Multiple trailing zeros all stripped.
+        assert_eq!(normalize_rope_sections(&[8, 8, 0, 0]), Some(vec![8, 8]));
+        // Empty / all-zero → None.
+        assert_eq!(normalize_rope_sections(&[]), None);
+        assert_eq!(normalize_rope_sections(&[0, 0, 0, 0]), None);
+        // Interior zero is NOT stripped (only the trailing run is).
+        assert_eq!(normalize_rope_sections(&[16, 0, 24, 0]), Some(vec![16, 0, 24]));
+    }
 }

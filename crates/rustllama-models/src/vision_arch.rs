@@ -1837,6 +1837,67 @@ fn vision_mrope_inplace(v: &mut [f32], pos_y: u32, pos_x: u32) {
     }
 }
 
+/// M5: one positional segment of a Qwen2-VL / Qwen2.5-VL prompt, for the
+/// TEXT model's multimodal RoPE (M-RoPE) position assignment. A tokenized
+/// VLM prompt is a sequence of these: text runs interleaved with image
+/// placeholder runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MropeSegment {
+    /// A run of `len` plain text tokens.
+    Text(usize),
+    /// One image's patch grid AFTER the spatial merge: `t` temporal frames
+    /// (1 for a still image), `h` rows, `w` columns. Emits `t*h*w` image
+    /// tokens — the projected feature-row count the splice inserts.
+    Image { t: u32, h: u32, w: u32 },
+}
+
+/// M5: compute the per-token 3-D `(t, h, w)` M-RoPE positions for a
+/// Qwen2-VL / Qwen2.5-VL TEXT-model sequence, following HF
+/// `Qwen2VLModel.get_rope_index`:
+///
+/// - **Text** tokens get `(p, p, p)` for a scalar `p` that increments by 1
+///   per token — so [`rustllama_kernels_cpu::rope_inplace_neox_sectioned`]
+///   over them is byte-identical to 1-D RoPE.
+/// - **Image** tokens, for the patch at frame `tt`, row `hh`, col `ww`, get
+///   `(st + tt, st + hh, st + ww)` where `st` is the running position at the
+///   image's start; the grid is laid out frame-major, then row-major, then
+///   column (the patch-token order the vision pipeline emits).
+/// - After an image the running position JUMPS to `st + max(t, h, w)` — the
+///   next text token's position is `max(all 3-D positions the image used)
+///   + 1`, NOT `st + t*h*w` (the flat token count). This is the position
+///   bookkeeping the text model was missing (`llama_arch.rs` Phase 5 note).
+///
+/// `start_pos` seeds the running position (0 for a fresh sequence). Returns
+/// one `[t, h, w]` triple per emitted token, in sequence order; its length is
+/// `Σ text_len + Σ (t*h*w)` over the segments.
+pub fn mrope_positions(segments: &[MropeSegment], start_pos: u32) -> Vec<[u32; 3]> {
+    let mut out: Vec<[u32; 3]> = Vec::new();
+    let mut st = start_pos;
+    for seg in segments {
+        match *seg {
+            MropeSegment::Text(len) => {
+                for i in 0..len {
+                    let p = st + i as u32;
+                    out.push([p, p, p]);
+                }
+                st += len as u32;
+            }
+            MropeSegment::Image { t, h, w } => {
+                for tt in 0..t {
+                    for hh in 0..h {
+                        for ww in 0..w {
+                            out.push([st + tt, st + hh, st + ww]);
+                        }
+                    }
+                }
+                // Next text position = max 3-D position the image used + 1.
+                st += t.max(h).max(w);
+            }
+        }
+    }
+    out
+}
+
 /// Split a fused `attn_qkv` tensor into (Q, K, V) by byte-range row
 /// slices. Fused layout is `[q_all_heads | k_all_heads | v_all_heads]`
 /// along the OUTPUT axis (fork views at offsets 0 / n_embd / 2·n_embd),
@@ -2069,6 +2130,86 @@ mod tests {
         let mut v2 = base.clone();
         vision_mrope_inplace(&mut v2, 7, 3);
         assert_ne!(v1, v2, "y and x positions must rotate different sections");
+    }
+
+    /// M5 ANCHOR (image-then-text positions): on a `text → image → text`
+    /// layout the TEXT model's M-RoPE assigns the documented 3-D grid
+    /// positions to the image tokens and `max(grid)+1` to the text token
+    /// that follows. The position vector is fully deterministic — no model
+    /// coherence needed (real Qwen2-VL-2B coherence is validate-on-HW).
+    #[test]
+    fn mrope_positions_image_then_text() {
+        use super::{mrope_positions, MropeSegment};
+
+        // 2 text tokens, then a 1×2×2 image grid (t=1 frame, 2 rows, 2 cols
+        // ⇒ 4 image tokens), then 1 trailing text token.
+        let segs = [
+            MropeSegment::Text(2),
+            MropeSegment::Image { t: 1, h: 2, w: 2 },
+            MropeSegment::Text(1),
+        ];
+        let pos = mrope_positions(&segs, 0);
+
+        // Text(2) at positions 0,1 → (p,p,p).
+        // Image frame 0: (row,col) grid offset by st=2, laid out row-major:
+        //   (0,0)->[2,2,2] (0,1)->[2,2,3] (1,0)->[2,3,2] (1,1)->[2,3,3]
+        // max 3-D position used = 3 → next text pos = 4.
+        // Trailing Text(1) → [4,4,4].
+        assert_eq!(
+            pos,
+            vec![
+                [0, 0, 0],
+                [1, 1, 1],
+                [2, 2, 2],
+                [2, 2, 3],
+                [2, 3, 2],
+                [2, 3, 3],
+                [4, 4, 4],
+            ],
+            "image tokens take (t,h,w) grid positions; the following text \
+             token jumps to max(grid)+1, not the flat token count"
+        );
+
+        // A pure text run (no image) must be the plain incrementing 1-D
+        // positions broadcast across all 3 axes — the degenerate case that
+        // keeps sectioned RoPE byte-identical to 1-D RoPE.
+        let text_only = mrope_positions(&[MropeSegment::Text(4)], 5);
+        assert_eq!(text_only, vec![[5, 5, 5], [6, 6, 6], [7, 7, 7], [8, 8, 8]]);
+
+        // Multi-frame extent: a 2×1×3 grid advances by max(2,1,3)=3.
+        let two = mrope_positions(
+            &[MropeSegment::Image { t: 2, h: 1, w: 3 }, MropeSegment::Text(1)],
+            0,
+        );
+        // Last emitted (image) triple is the final frame/row/col = [1,0,2];
+        // trailing text token is at max(2,1,3)=3.
+        assert_eq!(two.last(), Some(&[3, 3, 3]));
+        assert_eq!(two.len(), 2 * 1 * 3 + 1);
+    }
+
+    /// M5 ANCHOR (text-byte-identical, models-crate view): a text token's
+    /// `(p,p,p)` M-RoPE position drives the sectioned kernel to BIT-for-BIT
+    /// the current 1-D RoPE across a Qwen2-VL `[16,24,24]` head. Pairs the
+    /// kernel-crate guard with the position helper that feeds it, so the
+    /// end-to-end "text tokens are unchanged" contract is pinned here too.
+    #[test]
+    fn mrope_text_token_rope_is_bit_identical_to_1d() {
+        let head_dim = 128usize;
+        let n_heads = 4usize;
+        let theta = 10000.0f32;
+        let sections = [16u32, 24, 24];
+        let base: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| (i as f32 * 0.013).sin() * 0.9 + 0.1)
+            .collect();
+        for p in [0u32, 3, 50, 4096] {
+            let triple = super::mrope_positions(&[super::MropeSegment::Text(1)], p)[0];
+            assert_eq!(triple, [p, p, p]);
+            let mut a = base.clone();
+            let mut b = base.clone();
+            k::rope_inplace_neox(&mut a, n_heads, head_dim, p, theta);
+            k::rope_inplace_neox_sectioned(&mut b, n_heads, head_dim, &sections, &triple, theta);
+            assert_eq!(a, b, "text-token M-RoPE at pos {p} must equal 1-D RoPE");
+        }
     }
 
     /// Diagnostic: load a REAL mmproj GGUF named by RUSTLLAMA_REAL_MMPROJ.

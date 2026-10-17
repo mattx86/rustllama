@@ -16,6 +16,19 @@
 //! conservative `0` (all CPU) and the caller logs a warning. A
 //! more aggressive fallback (return `u32::MAX` = all GPU) would
 //! be silently wrong on memory-constrained boxes.
+//!
+//! M7 note (locked RAM): this planner budgets **device VRAM** (the GPU-
+//! layer cutoff), a quantity orthogonal to the host-RAM the pagelock tier
+//! pins (`lock_ram_mb`). Locked RAM is therefore reserved in the
+//! **host-RAM** planner ([`crate::memory_budget`], via
+//! `pagelock::projected_lock_bytes`), not here — on a DISCRETE-VRAM GPU
+//! the two pools are separate, so the GPU-layer cutoff needn't subtract
+//! locked host RAM. The one place they coincide is a UNIFIED-memory GPU
+//! (Apple Metal / integrated Iris Xe), where "VRAM" is the shared host
+//! pool and locked weights do compete with GPU residency; folding
+//! `projected_lock_bytes` into the unified-memory budget is a precise
+//! follow-up (documented so it can be redirected if the behavior is wanted
+//! sooner).
 
 use rustllama_models::llama_arch::{HybridFfn, HybridLayer, LlamaWeights};
 use rustllama_tensor::Tensor;
