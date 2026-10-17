@@ -496,6 +496,181 @@ pub fn amx_i8_gemm_usable() -> bool {
     })
 }
 
+// ============================================================
+// AMX-INT8 W8A8 Q8_0 PREFILL GEMM — wires the int8 tile primitive above into the
+// batched (prefill) matvec→GEMM path (`matvec_tensor_batched`). Q8_0's weight IS
+// int8 (losslessly: 32 i8 quants + one f16 block scale per 32-block), so "W8" is
+// EXACT; the activation is quantized to int8 per 32-block (the SAME scheme as the
+// VNNI decode path, `vnni::quantize_activation_i8`), so the only loss is the
+// activation quant — hence LOSSY, OPT-IN (reuses `vnni::set_vnni_w8a8`, the
+// existing W8A8 switch) and additionally self-check-gated. WRITE-BLIND (no
+// AMX-INT8 on the author's box): off AMX the self-check returns false and the
+// caller runs the AVX/scalar per-row matvec — BYTE-IDENTICAL. Validated on an AMX
+// host by the parity test below + the opt-in A/B.
+//
+// A Q8_0 block's int8 dot is 32-wide; AMX-INT8's K-tile is 64, so each block is
+// zero-padded into the low 32 K-lanes. Per-BLOCK (not per-64-K-tile) accumulation
+// is required because the scale `d[row]·xscale[token]` varies per k-block — the
+// int32 tile dot is scaled block-by-block into an f32 accumulator, exactly the
+// order `vnni::matvec_q8_0_w8a8_scalar` sums, so the two agree to int rounding
+// (the self-check grades against it).
+// ============================================================
+
+/// AMX-INT8 W8A8 Q8_0 prefill GEMM: `out[t*m + i] = Σ_b d[i,b]·xscale[t,b]·(Σ_j
+/// wq[i,b,j]·xq[t,b,j])` over 32-blocks `b`, output rows `i in 0..m`, token rows
+/// `t in 0..n_rows`. `w_bytes` is Q8_0-packed `[m × (k/32) × 34]`; `xq`/`xscales`
+/// are the pre-quantized activation (`[n_rows × k]` i8 + `[n_rows × k/32]` f32
+/// per-block scale) from [`crate::vnni::quantize_activation_i8`]. `out` is
+/// `[n_rows × m]` f32 (row-major per token — the layout the per-row matvec writes).
+///
+/// SAFETY: caller confirmed [`amx_q8_0_prefill_usable`] on THIS thread (AMX-INT8
+/// present + OS-permitted + self-checked); shapes satisfy `k % 32 == 0`,
+/// `w_bytes.len() == m*(k/32)*34`, `xq.len() == n_rows*k`,
+/// `xscales.len() == n_rows*(k/32)`, `out.len() == n_rows*m`.
+pub unsafe fn gemm_q8_0_w8a8_amx(
+    w_bytes: &[u8],
+    xq: &[i8],
+    xscales: &[f32],
+    out: &mut [f32],
+    m: usize,
+    n_rows: usize,
+    k: usize,
+) {
+    use std::arch::asm;
+    const QK: usize = 32;
+    const BLOCK_BYTES: usize = 34;
+    let blocks = k / QK;
+
+    let cfg = TileConfig::new();
+    // SAFETY: 64-byte aligned payload; ldtilecfg reads 64 bytes.
+    asm!("ldtilecfg [{c}]", c = in(reg) &cfg as *const TileConfig, options(nostack, readonly, preserves_flags));
+
+    // tmm1 = weight A tile (16 rows × 64 i8, block padded 32→64), tmm2 = VNNI
+    // activation B tile, tmm0 = the int32 C accumulator tile.
+    let mut a_buf = [0i8; TM * TK_I8];
+    let mut b_buf = [0i8; (TK_I8 / 4) * (4 * TN)];
+    let mut c_buf = [0i32; TM * TN];
+    let stride: usize = 64;
+
+    let mut mb = 0;
+    while mb < m {
+        let mrows = (m - mb).min(TM);
+        let mut nb = 0;
+        while nb < n_rows {
+            let ncols = (n_rows - nb).min(TN);
+            // f32 accumulators for this (≤16 weight rows × ≤16 tokens) output block.
+            let mut acc = [0f32; TM * TN];
+            for b in 0..blocks {
+                // Weight A tile: rows mb..mb+mrows, this block's 32 i8 quants into
+                // the low 32 K-lanes (plain row-major), 32..64 left zero.
+                a_buf.fill(0);
+                for i in 0..mrows {
+                    let off = (mb + i) * blocks * BLOCK_BYTES + b * BLOCK_BYTES + 2;
+                    let dst = &mut a_buf[i * TK_I8..];
+                    for j in 0..QK {
+                        dst[j] = w_bytes[off + j] as i8;
+                    }
+                }
+                // Activation B tile (VNNI): token cols nb..nb+ncols, this block's
+                // 32 i8 (4 consecutive K per VNNI row; kk in 0..8 valid, rest zero).
+                b_buf.fill(0);
+                for kk in 0..(TK_I8 / 4) {
+                    let row = &mut b_buf[kk * (4 * TN)..];
+                    for jcol in 0..ncols {
+                        for r in 0..4 {
+                            let ki = 4 * kk + r;
+                            if ki < QK {
+                                row[jcol * 4 + r] = xq[(nb + jcol) * k + b * QK + ki];
+                            }
+                        }
+                    }
+                }
+                asm!("tilezero tmm0", options(nostack, preserves_flags));
+                amx_block_mul_i8(a_buf.as_ptr(), b_buf.as_ptr());
+                asm!(
+                    "tilestored [{c} + {s}], tmm0",
+                    c = in(reg) c_buf.as_mut_ptr(),
+                    s = in(reg) stride,
+                    options(nostack)
+                );
+                // Scale this block's int32 dots by d[row]·xscale[token] into the
+                // f32 accumulator (per-block, matching the scalar reference order).
+                for i in 0..mrows {
+                    let off = (mb + i) * blocks * BLOCK_BYTES + b * BLOCK_BYTES;
+                    let d = f16::from_le_bytes([w_bytes[off], w_bytes[off + 1]]).to_f32();
+                    for t in 0..ncols {
+                        let p = c_buf[i * TN + t];
+                        acc[i * TN + t] += d * xscales[(nb + t) * blocks + b] * p as f32;
+                    }
+                }
+            }
+            // Scatter the valid sub-block to the per-token output rows.
+            for i in 0..mrows {
+                for t in 0..ncols {
+                    out[(nb + t) * m + (mb + i)] = acc[i * TN + t];
+                }
+            }
+            nb += TN;
+        }
+        mb += TM;
+    }
+    asm!("tilerelease", options(nostack, preserves_flags));
+}
+
+/// Whether the AMX-INT8 W8A8 Q8_0 prefill GEMM is usable — cached. True only when
+/// the CPU has AMX-INT8, the OS granted tile permission, AND the kernel reproduces
+/// the scalar W8A8 reference ([`crate::vnni::matvec_q8_0_w8a8_scalar`]) on a probe
+/// (same activation quant → a mismatch is a wrong tile encoding, fail closed). Any
+/// failure / non-AMX CPU returns false and NO tile instruction runs afterward.
+pub fn amx_q8_0_prefill_usable() -> bool {
+    static USABLE: OnceLock<bool> = OnceLock::new();
+    *USABLE.get_or_init(|| {
+        if !amx_int8_supported() || !request_amx_tiledata() {
+            return false;
+        }
+        // Probe crossing M/N/K tiles + remainders: m=20, n_rows=20, k=128 (4
+        // blocks → 2×2 row/token tiles, 4 per-block tile ops with M/N remainders).
+        let (m, n_rows, k) = (20usize, 20usize, 128usize);
+        let blocks = k / 32;
+        let w = crate::vnni::synth_q8_0(m, k, 2_654_435_761);
+        let mut xq = vec![0i8; n_rows * k];
+        let mut xscales = vec![0f32; n_rows * blocks];
+        for t in 0..n_rows {
+            let x: Vec<f32> = (0..k)
+                .map(|j| ((((t * k + j) as i64 * 40_503) % 211) as f32 - 105.0) * 0.01)
+                .collect();
+            crate::vnni::quantize_activation_i8(
+                &x,
+                k,
+                &mut xq[t * k..(t + 1) * k],
+                &mut xscales[t * blocks..(t + 1) * blocks],
+            );
+        }
+        let mut got = vec![0f32; n_rows * m];
+        // SAFETY: AMX-INT8 present + permitted above; shapes match.
+        unsafe { gemm_q8_0_w8a8_amx(&w, &xq, &xscales, &mut got, m, n_rows, k) };
+        for t in 0..n_rows {
+            let mut want = vec![0f32; m];
+            crate::vnni::matvec_q8_0_w8a8_scalar(
+                &w,
+                &xq[t * k..(t + 1) * k],
+                &xscales[t * blocks..(t + 1) * blocks],
+                &mut want,
+                m,
+                k,
+            );
+            for i in 0..m {
+                let g = got[t * m + i];
+                let denom = want[i].abs().max(1e-4);
+                if (g - want[i]).abs() / denom > 0.02 {
+                    return false;
+                }
+            }
+        }
+        true
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,5 +713,56 @@ mod tests {
         gemm_i8_ref(&a, &b, &mut want, m, n, k);
         unsafe { gemm_i8_amx(&a, &b, &mut got, m, n, k) };
         assert_eq!(got, want, "AMX-INT8 GEMM != scalar int8 reference");
+    }
+
+    /// The AMX W8A8 Q8_0 prefill GEMM must reproduce the scalar W8A8 reference
+    /// (one row per token) within int rounding. On a non-AMX-INT8 host the
+    /// self-check returns false (no tile runs) and this SKIPs — matching the
+    /// write-blind, fail-closed-to-AVX contract. On an AMX host it must pass.
+    #[test]
+    fn amx_q8_0_w8a8_prefill_matches_scalar_or_skips() {
+        if !amx_q8_0_prefill_usable() {
+            eprintln!("amx-int8 Q8_0 prefill: not usable on this host (expected off AMX-INT8 hw) — SKIP");
+            return;
+        }
+        // Fresh shapes crossing tiles + M/N/K remainders (k multiple of 32).
+        let (m, n_rows, k) = (37usize, 23usize, 160usize);
+        let blocks = k / 32;
+        let w = crate::vnni::synth_q8_0(m, k, 99_173);
+        let mut xq = vec![0i8; n_rows * k];
+        let mut xscales = vec![0f32; n_rows * blocks];
+        for t in 0..n_rows {
+            let x: Vec<f32> = (0..k)
+                .map(|j| ((((t * 7 + j * 3 + 1) % 97) as f32) - 48.0) * 0.02)
+                .collect();
+            crate::vnni::quantize_activation_i8(
+                &x,
+                k,
+                &mut xq[t * k..(t + 1) * k],
+                &mut xscales[t * blocks..(t + 1) * blocks],
+            );
+        }
+        let mut got = vec![0f32; n_rows * m];
+        unsafe { gemm_q8_0_w8a8_amx(&w, &xq, &xscales, &mut got, m, n_rows, k) };
+        for t in 0..n_rows {
+            let mut want = vec![0f32; m];
+            crate::vnni::matvec_q8_0_w8a8_scalar(
+                &w,
+                &xq[t * k..(t + 1) * k],
+                &xscales[t * blocks..(t + 1) * blocks],
+                &mut want,
+                m,
+                k,
+            );
+            for i in 0..m {
+                let g = got[t * m + i];
+                let denom = want[i].abs().max(1e-4);
+                assert!(
+                    (g - want[i]).abs() / denom <= 0.02,
+                    "amx q8_0 prefill t={t} row={i}: {g} vs ref {}",
+                    want[i]
+                );
+            }
+        }
     }
 }

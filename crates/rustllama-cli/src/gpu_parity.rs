@@ -6157,6 +6157,195 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
         }
     }
 
+    // ---- P7: WHOLE-LAYER CUDA-graph capture (attention + dense SwiGLU FFN) ----
+    // The attention-only graph is validated above; this drives the `dense_ffn =
+    // Some(..)` arm of `decode_attn_block_f32_graph` so the ENTIRE decode layer —
+    // attention block AND the SwiGLU FFN (gate/up → silu_mul → down → residual) —
+    // is captured into ONE cudaGraph and replayed, graded vs a CPU reference that
+    // computes the identical attention+FFN chain. This is the only coverage of
+    // the FFN-INSIDE-the-graph path. Verdict name = the correctness anchor
+    // `layer:dev_resident_cuda_graph`. WRITE-BLIND (no NVIDIA GPU here) —
+    // validated on-device via `--cuda-parity`. Looser bar than the attention-only
+    // probe (cos>0.99, rel<0.15) because the FFN adds three more device matvecs +
+    // a silu_mul reduce on top of the attention chain.
+    {
+        let name = rustllama_tuner::VERDICT_LAYER_DEV_RESIDENT_CUDA_GRAPH;
+        const HEAD_DIM: usize = 128;
+        const N_HEADS: usize = 8;
+        const N_KV: usize = 2;
+        const D_MODEL: usize = 1024;
+        const D_FF: usize = 256; // Q4_K `down` has k=D_FF → must be a multiple of 256
+        const MAX_CTX: usize = 64;
+        const POS: usize = 5;
+        const EPS: f32 = 1e-5;
+        const THETA: f32 = 10000.0;
+        let d_q = N_HEADS * HEAD_DIM;
+        let d_kv = N_KV * HEAD_DIM;
+        let half = HEAD_DIM / 2;
+        let kv_len = POS + 1;
+
+        let layout = LAYOUTS.iter().find(|l| l.name == "q4_k").expect("q4_k layout");
+        let cpu_mv = cpu_matvec_for("q4_k");
+        let wq = gen_quant_bytes(layout, d_q, D_MODEL, 0x1A1A);
+        let wk = gen_quant_bytes(layout, d_kv, D_MODEL, 0x2B2B);
+        let wv = gen_quant_bytes(layout, d_kv, D_MODEL, 0x3C3C);
+        let wo = gen_quant_bytes(layout, D_MODEL, d_q, 0x4D4D);
+        // Dense FFN weights: gate/up [D_FF × D_MODEL], down [D_MODEL × D_FF].
+        let wg = gen_quant_bytes(layout, D_FF, D_MODEL, 0x5E5E);
+        let wu = gen_quant_bytes(layout, D_FF, D_MODEL, 0x6F6F);
+        let wd = gen_quant_bytes(layout, D_MODEL, D_FF, 0x7070);
+
+        let mut rng = XorShift(0x5EED_1B0B);
+        let hidden0: Vec<f32> = (0..D_MODEL).map(|_| rng.f32_pm(0.6)).collect();
+        let attn_norm: Vec<f32> = (0..D_MODEL).map(|_| 0.5 + rng.f32_pm(0.2)).collect();
+        let ffn_norm: Vec<f32> = (0..D_MODEL).map(|_| 0.5 + rng.f32_pm(0.2)).collect();
+        let inv_freq: Vec<f32> = (0..half)
+            .map(|j| 1.0f32 / THETA.powf(2.0 * j as f32 / HEAD_DIM as f32))
+            .collect();
+        let hist_elems = N_KV * MAX_CTX * HEAD_DIM;
+        let mut kcache = vec![0f32; hist_elems];
+        let mut vcache = vec![0f32; hist_elems];
+        for h in 0..N_KV {
+            for t in 0..POS {
+                for dd in 0..HEAD_DIM {
+                    let idx = (h * MAX_CTX + t) * HEAD_DIM + dd;
+                    kcache[idx] = rng.f32_pm(0.6);
+                    vcache[idx] = rng.f32_pm(0.6);
+                }
+            }
+        }
+
+        // ---- CPU reference: attention block + SwiGLU FFN + residual ----
+        let rope = |qk: &mut [f32], nh: usize| {
+            for hh in 0..nh {
+                let base = hh * HEAD_DIM;
+                for j in 0..half {
+                    let angle = POS as f32 * inv_freq[j];
+                    let (s, c) = angle.sin_cos();
+                    let x0 = qk[base + j];
+                    let x1 = qk[base + j + half];
+                    qk[base + j] = x0 * c - x1 * s;
+                    qk[base + j + half] = x0 * s + x1 * c;
+                }
+            }
+        };
+        let mut hnorm = vec![0f32; D_MODEL];
+        k::rmsnorm_f32_row(&hidden0, &attn_norm, &mut hnorm, EPS);
+        let mut q_ref = vec![0f32; d_q];
+        let mut k_ref = vec![0f32; d_kv];
+        let mut v_ref = vec![0f32; d_kv];
+        cpu_mv(&wq, &hnorm, &mut q_ref, d_q, D_MODEL);
+        cpu_mv(&wk, &hnorm, &mut k_ref, d_kv, D_MODEL);
+        cpu_mv(&wv, &hnorm, &mut v_ref, d_kv, D_MODEL);
+        rope(&mut q_ref, N_HEADS);
+        rope(&mut k_ref, N_KV);
+        let mut ref_k = kcache.clone();
+        let mut ref_v = vcache.clone();
+        for h in 0..N_KV {
+            for dd in 0..HEAD_DIM {
+                let idx = (h * MAX_CTX + POS) * HEAD_DIM + dd;
+                ref_k[idx] = k_ref[h * HEAD_DIM + dd];
+                ref_v[idx] = v_ref[h * HEAD_DIM + dd];
+            }
+        }
+        let mut attn_ref = vec![0f32; d_q];
+        k::gqa_attention_one_step_capped_windowed(
+            &q_ref, &ref_k, &ref_v, &mut attn_ref, N_HEADS, N_KV, HEAD_DIM, MAX_CTX, kv_len, 0, 0.0,
+        );
+        let mut o_ref = vec![0f32; D_MODEL];
+        cpu_mv(&wo, &attn_ref, &mut o_ref, D_MODEL, d_q);
+        let mut hidden1 = hidden0.clone();
+        for i in 0..D_MODEL {
+            hidden1[i] += o_ref[i];
+        }
+        let mut hnorm2_ref = vec![0f32; D_MODEL];
+        k::rmsnorm_f32_row(&hidden1, &ffn_norm, &mut hnorm2_ref, EPS);
+        // SwiGLU FFN from the post-attn norm, then residual add.
+        let mut gate_ref = vec![0f32; D_FF];
+        let mut up_ref = vec![0f32; D_FF];
+        cpu_mv(&wg, &hnorm2_ref, &mut gate_ref, D_FF, D_MODEL);
+        cpu_mv(&wu, &hnorm2_ref, &mut up_ref, D_FF, D_MODEL);
+        let mut act_ref = vec![0f32; D_FF];
+        k::silu_mul_f32(&gate_ref, &up_ref, &mut act_ref);
+        let mut ffn_out_ref = vec![0f32; D_MODEL];
+        cpu_mv(&wd, &act_ref, &mut ffn_out_ref, D_MODEL, D_FF);
+        let mut hidden_final = hidden1.clone();
+        for i in 0..D_MODEL {
+            hidden_final[i] += ffn_out_ref[i];
+        }
+
+        match ck::CudaMatvecCache::new(0, 16 << 20) {
+            None => {
+                cu_emit(name, "KERNEL_ERR", "cache-create-failed");
+                *counts.entry("KERNEL_ERR").or_default() += 1;
+            }
+            Some(mut cache) => {
+                let mut hidden_dev = hidden0.clone();
+                let mut hnorm2_dev = vec![0f32; D_MODEL];
+                let mut k_row = vec![0f32; d_kv];
+                let mut v_row = vec![0f32; d_kv];
+                // SAFETY: host buffers sized to dims; weight slices live for the
+                // call; cache owns the stream + mirror. n_layers=1, layer 0,
+                // passthrough window/softcap, dense FFN captured in the graph.
+                let ok = unsafe {
+                    cache.seed_attn_mirror_f32(0, &kcache, &vcache, POS, N_KV, HEAD_DIM, MAX_CTX, 1)
+                        && cache.decode_attn_block_f32_graph(
+                            (ck::CudaPackedKind::Q4_K, wq.as_ptr() as usize, &wq),
+                            (ck::CudaPackedKind::Q4_K, wk.as_ptr() as usize, &wk),
+                            (ck::CudaPackedKind::Q4_K, wv.as_ptr() as usize, &wv),
+                            (ck::CudaPackedKind::Q4_K, wo.as_ptr() as usize, &wo),
+                            &attn_norm,
+                            &ffn_norm,
+                            None,
+                            None,
+                            &inv_freq,
+                            &mut hidden_dev,
+                            &mut hnorm2_dev,
+                            &mut k_row,
+                            &mut v_row,
+                            N_HEADS,
+                            N_KV,
+                            HEAD_DIM,
+                            D_MODEL,
+                            POS,
+                            MAX_CTX,
+                            1,
+                            0,
+                            EPS,
+                            0,
+                            0.0,
+                            Some((
+                                (ck::CudaPackedKind::Q4_K, wg.as_ptr() as usize, wg.as_slice()),
+                                (ck::CudaPackedKind::Q4_K, wu.as_ptr() as usize, wu.as_slice()),
+                                (ck::CudaPackedKind::Q4_K, wd.as_ptr() as usize, wd.as_slice()),
+                                D_FF,
+                            )),
+                            true,
+                            true,
+                        )
+                };
+                if !ok {
+                    cu_emit(name, "SKIP", "whole-layer-graph-declined");
+                    *counts.entry("SKIP").or_default() += 1;
+                } else {
+                    // Grade the residual hidden DELTA (so the shared input can't
+                    // mask an FFN miscompute) + the post-attn norm jointly.
+                    let mut gpu: Vec<f32> =
+                        hidden_dev.iter().zip(&hidden0).map(|(h, h0)| h - h0).collect();
+                    gpu.extend_from_slice(&hnorm2_dev);
+                    let mut cpu: Vec<f32> =
+                        hidden_final.iter().zip(&hidden0).map(|(h, h0)| h - h0).collect();
+                    cpu.extend_from_slice(&hnorm2_ref);
+                    let (cos, max_rel) = compare(&gpu, &cpu);
+                    let key: &'static str =
+                        if cos > 0.99 && max_rel < 0.15 { "OK" } else { "MISCOMPUTE" };
+                    *counts.entry(key).or_default() += 1;
+                    cu_emit(name, key, &format!("cos={cos:.6} max_rel={max_rel:.4} (attn+ffn)"));
+                }
+            }
+        }
+    }
+
     println!();
     let summary: Vec<String> = counts.iter().map(|(k, v)| format!("{k}={v}")).collect();
     println!("summary: {}", summary.join("  "));

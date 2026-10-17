@@ -225,6 +225,45 @@ pub fn matvec_tensor_batched(
         matvec_ptq1_0_w_f32_a_batched(w_bytes, xs, out, m, k, n_rows);
         return;
     }
+    // AMX-INT8 W8A8 Q8_0 prefill GEMM: the batched (prefill) matvec→GEMM for
+    // Q8_0 weights on Sapphire-Rapids+ Xeon. OPT-IN (the shared lossy-W8A8 switch
+    // `vnni::set_vnni_w8a8`, default OFF → the per-row path below runs,
+    // byte-identical) AND self-check-gated (`amx::amx_q8_0_prefill_usable` —
+    // false off AMX-INT8 hardware, incl. this dev box, so inert here). Confined
+    // to a prefill-shaped GEMM (≥16 tokens × ≥16 rows, k a multiple of 32) where
+    // the tile setup + activation-quant pays off; decode (n_rows<16) and non-Q8_0
+    // keep the lossless per-row matvec. Q8_0's weight is already int8 (exact);
+    // only the activation is quantized (lossy), hence the opt-in. WRITE-BLIND:
+    // validated on an AMX host by the parity test + the opt-in A/B.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if w.dtype == Dtype::Q8_0Raw
+            && n_rows >= 16
+            && m >= 16
+            && k >= 64
+            && k % 32 == 0
+            && vnni::vnni_w8a8_enabled()
+            && amx::amx_q8_0_prefill_usable()
+        {
+            let w_bytes = as_bytes(w);
+            let blocks = k / 32;
+            let mut xq = vec![0i8; n_rows * k];
+            let mut xscales = vec![0f32; n_rows * blocks];
+            for t in 0..n_rows {
+                vnni::quantize_activation_i8(
+                    &xs[t * k..(t + 1) * k],
+                    k,
+                    &mut xq[t * k..(t + 1) * k],
+                    &mut xscales[t * blocks..(t + 1) * blocks],
+                );
+            }
+            // SAFETY: amx_q8_0_prefill_usable() confirmed AMX-INT8 present +
+            // OS-permitted + self-checked on this host; shapes satisfy the
+            // contract (k%32==0 gated, buffers sized above).
+            unsafe { amx::gemm_q8_0_w8a8_amx(w_bytes, &xq, &xscales, out, m, n_rows, k) };
+            return;
+        }
+    }
     for t in 0..n_rows {
         matvec_tensor(
             w,

@@ -93,8 +93,9 @@ fn vnni_kind() -> VnniKind {
 }
 
 /// Synthesize a valid Q8_0 weight (m rows × k, row-major 32-blocks: f16 scale +
-/// 32 i8) for the self-check / tests — no gguf-encoder dependency.
-fn synth_q8_0(m: usize, k: usize, seed: i64) -> Vec<u8> {
+/// 32 i8) for the self-check / tests — no gguf-encoder dependency. `pub(crate)`
+/// so the AMX int8 prefill self-check / test reuses the same synth path.
+pub(crate) fn synth_q8_0(m: usize, k: usize, seed: i64) -> Vec<u8> {
     let bpr = k / QK;
     let mut w = vec![0u8; m * bpr * BLOCK_BYTES];
     for r in 0..m {
@@ -115,7 +116,12 @@ fn synth_q8_0(m: usize, k: usize, seed: i64) -> Vec<u8> {
 
 /// Quantize the f32 activation to signed int8 per 32-block (symmetric, scale =
 /// absmax/127), done ONCE per matvec and reused across every output row.
-fn quantize_activation_i8(x: &[f32], k: usize, xq: &mut [i8], xscales: &mut [f32]) {
+///
+/// `pub(crate)` so the AMX int8 prefill GEMM ([`crate::amx::gemm_q8_0_w8a8_amx`])
+/// quantizes activations with the IDENTICAL per-block scheme — a shared quant means
+/// the AMX kernel grades bit-for-bit against [`matvec_q8_0_w8a8_scalar`], isolating
+/// tile-encoding correctness from the (shared) activation-quant loss.
+pub(crate) fn quantize_activation_i8(x: &[f32], k: usize, xq: &mut [i8], xscales: &mut [f32]) {
     let blocks = k / QK;
     for b in 0..blocks {
         let chunk = &x[b * QK..(b + 1) * QK];
@@ -141,7 +147,10 @@ unsafe fn hsum_i32x8(v: __m256i) -> i32 {
 
 /// Scalar int8 reference: `Σ xq·wq` per block, scaled by `d·x_scale`. The exact
 /// value every VNNI form computes, so a match validates the vectorized kernel.
-fn matvec_q8_0_w8a8_scalar(w_bytes: &[u8], xq: &[i8], xscales: &[f32], out: &mut [f32], m: usize, k: usize) {
+/// `pub(crate)`: also the parity reference for the AMX int8 prefill GEMM (one row
+/// per token), since both share the per-block accumulation order (f32 add per
+/// block) → the AMX tile result matches this to within int rounding.
+pub(crate) fn matvec_q8_0_w8a8_scalar(w_bytes: &[u8], xq: &[i8], xscales: &[f32], out: &mut [f32], m: usize, k: usize) {
     let blocks_per_row = k / QK;
     for i in 0..m {
         let row_start = i * blocks_per_row * BLOCK_BYTES;

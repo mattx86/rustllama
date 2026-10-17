@@ -1710,8 +1710,15 @@ impl CpuEngine {
         // CPU bytes, so an over-large budget degrades to "slower", never a crash
         // or a wrong answer. Validated on-device (RTX 2000 Ada, Qwen3-30B-A3B);
         // inert on unified-memory GPUs (promotion to managed is a no-op there).
-        // SYCL/MLX device-tier auto-enable is a follow-up (needs their
-        // free-VRAM query; the `auto` projection is CUDA-only today).
+        // SYCL/MLX device-tier (P20): the `auto` projection + enablement now
+        // covers a DEDICATED SYCL GPU too (Intel Arc/PVC), using
+        // `sycl_dedicated_vram_bytes()` as the total-VRAM proxy (SYCL has no free
+        // query; promotion happens before the weight upload so ~all VRAM is free).
+        // MLX (Apple unified memory) and integrated iGPUs (Iris Xe) have NO
+        // dedicated VRAM to promote into, so the projection yields `None` → budget
+        // 0 → no promotion (inert by construction, not a forced no-op). CUDA is
+        // unchanged (managed memory). The budget formula itself is the shared,
+        // unit-tested `project_moe_tier_budget_bytes` below.
         // AUTO — NO ENV VAR. Tier target VRAM: CUDA free VRAM, else a DEDICATED
         // SYCL GPU (Intel Arc/PVC — `None` on integrated Iris Xe where USM
         // promotion is a host-backed no-op, and on a box with no usable GPU).
@@ -1765,10 +1772,11 @@ impl CpuEngine {
                 let margin = rustllama_models::accel::moe_vram_margin_override()
                     .or_else(|| Self::moe_vram_margin_tuned(&model_id))
                     .unwrap_or(heuristic_margin);
-                avail
-                    .saturating_sub(non_expert_b)
-                    .saturating_sub(margin)
-                    .min(expert_b)
+                // Shared, unit-tested budget projection (P20). `Some(avail)` + a
+                // MoE model here → the same `avail − non_expert − margin` capped
+                // at expert bytes as before (byte-identical); the `None` /
+                // non-MoE arms (budget 0, inert) are exercised by the unit tests.
+                project_moe_tier_budget_bytes(Some(avail), true, expert_b, non_expert_b, margin)
             };
             if vram_expert_bytes > 0 {
                 // Usage ranking (hottest-first) from the persisted per-model
@@ -10093,9 +10101,38 @@ fn forward_one_with_mtp_drafts_via_backend(
     Ok((main_logits, drafts))
 }
 
+/// MoE tiered-expert VRAM-budget projection (P20) — the pure, unit-tested core of
+/// the `auto` device-tier promotion. `tier_avail` is the device's VRAM proxy:
+/// `Some(free_vram)` on CUDA, `Some(total_vram)` on a dedicated SYCL GPU
+/// (Arc/PVC), or `None` off the tier — an integrated iGPU (Iris Xe), Apple MLX
+/// unified memory, or no usable GPU, where there is no dedicated VRAM to promote
+/// into. Returns the bytes of experts to promote: `0` unless this is a MoE model
+/// on a tier-capable device, else `avail − non_expert_weights − margin`, saturating
+/// to 0 and capped at `expert_bytes`. The `None`/non-MoE/over-margin cases all
+/// yield 0 → no promotion (inert, so an over-estimate or an unsupported device
+/// degrades to "run on CPU/host", never OOM or wrong output).
+fn project_moe_tier_budget_bytes(
+    tier_avail: Option<u64>,
+    is_moe: bool,
+    expert_bytes: u64,
+    non_expert_bytes: u64,
+    margin: u64,
+) -> u64 {
+    match tier_avail {
+        Some(avail) if is_moe => avail
+            .saturating_sub(non_expert_bytes)
+            .saturating_sub(margin)
+            .min(expert_bytes),
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{compute_lcp, update_ema_tok_s, RequestStats, TOK_S_EMA_ALPHA};
+    use super::{
+        compute_lcp, project_moe_tier_budget_bytes, update_ema_tok_s, RequestStats,
+        TOK_S_EMA_ALPHA,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn make_stats(decode_ms: f64, n: u32) -> RequestStats {
@@ -10112,6 +10149,72 @@ mod tests {
     fn ema_value(slot: &AtomicU64) -> Option<f64> {
         let v = f64::from_bits(slot.load(Ordering::Relaxed));
         if v.is_nan() { None } else { Some(v) }
+    }
+
+    // ---- P20: MoE tiered-expert VRAM-budget projection ----
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// CUDA-like: plenty of free VRAM, a MoE model → promote `avail − non_expert −
+    /// margin`, capped at the expert bytes. 16 GiB free, 2 GiB non-expert, 1.5 GiB
+    /// margin, 20 GiB of experts → 12.5 GiB (budget < expert total, not capped).
+    #[test]
+    fn moe_tier_budget_cuda_like_positive() {
+        let avail = 16 * GIB;
+        let got = project_moe_tier_budget_bytes(
+            Some(avail),
+            true,
+            20 * GIB,            // expert_bytes
+            2 * GIB,             // non_expert_bytes
+            3 * GIB / 2,         // margin
+        );
+        assert_eq!(got, 16 * GIB - 2 * GIB - 3 * GIB / 2);
+        assert!(got > 0);
+    }
+
+    /// Dedicated-SYCL-like: same positive projection path (the fn is backend
+    /// agnostic — `Some(total_vram)` behaves exactly like CUDA's `Some(free)`).
+    /// Here the expert total is the binding cap (budget would exceed it).
+    #[test]
+    fn moe_tier_budget_dedicated_sycl_capped_at_experts() {
+        let avail = 24 * GIB;
+        let got = project_moe_tier_budget_bytes(
+            Some(avail),
+            true,
+            6 * GIB,  // expert_bytes — the cap
+            2 * GIB,
+            1 * GIB,
+        );
+        assert_eq!(got, 6 * GIB, "budget must cap at total expert bytes");
+        assert!(got > 0);
+    }
+
+    /// Unified / MLX / integrated / no-GPU: `tier_avail = None` → budget 0, no
+    /// promotion (the tier is inert by construction, not forced off).
+    #[test]
+    fn moe_tier_budget_unified_or_mlx_is_zero() {
+        assert_eq!(
+            project_moe_tier_budget_bytes(None, true, 20 * GIB, 2 * GIB, GIB),
+            0
+        );
+    }
+
+    /// Non-MoE model on a tier-capable device → budget 0 (nothing to promote).
+    #[test]
+    fn moe_tier_budget_non_moe_is_zero() {
+        assert_eq!(
+            project_moe_tier_budget_bytes(Some(16 * GIB), false, 0, 2 * GIB, GIB),
+            0
+        );
+    }
+
+    /// Over-reserved margin (non_expert + margin exceed avail) saturates to 0 —
+    /// no promotion rather than an underflow/huge budget.
+    #[test]
+    fn moe_tier_budget_over_margin_saturates_zero() {
+        assert_eq!(
+            project_moe_tier_budget_bytes(Some(2 * GIB), true, 20 * GIB, 3 * GIB, GIB),
+            0
+        );
     }
 
     #[test]

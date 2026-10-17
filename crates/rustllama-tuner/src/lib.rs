@@ -247,6 +247,19 @@ pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK_SYCL: &str = "attn:dev_resident_block_
 /// PERF-only verdict. Read by `accel::dev_attn_cuda_graph_enabled`; at dispatch
 /// the graph path is preferred over the eager CUDA block when ON (f32-KV-only).
 pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK_CUDA_GRAPH: &str = "attn:dev_resident_block_cuda_graph";
+/// P7: CORRECTNESS anchor for the WHOLE-LAYER CUDA-graph capture — the decode
+/// attention block AND the dense SwiGLU FFN (gate/up→silu→down→residual) captured
+/// into ONE `cudaGraph` and replayed as a single launch per layer (the
+/// `dense_ffn = Some(..)` arm of `CudaMatvecCache::decode_attn_block_f32_graph`,
+/// dispatched from `accel::try_decode_attn_block_cuda_graph_f32`). The attention-
+/// only graph is covered by [`VERDICT_ATTN_DEV_RESIDENT_BLOCK_CUDA_GRAPH`]; this
+/// name is the `doctor --cuda-parity layer:dev_resident_cuda_graph` probe that
+/// additionally grades the FFN-in-graph end to end vs a CPU attention+SwiGLU
+/// reference. The PERF gate stays the eager-vs-graph `attn:...cuda_graph` verdict
+/// (the FFN rides the same captured chain / dev-attn A/B), so this is a correctness
+/// anchor, not a separate dispatch gate — the graph path is already fail-soft to
+/// the eager block on any capture/launch error.
+pub const VERDICT_LAYER_DEV_RESIDENT_CUDA_GRAPH: &str = "layer:dev_resident_cuda_graph";
 /// Apple-Metal/MLX twin of [`VERDICT_ATTN_DEV_RESIDENT_BLOCK`] (Feature 1c) —
 /// the #2 on-device activation-residency DECODE attention block encoded into ONE
 /// Metal command buffer with ONE compute encoder (rmsnorm→qkv→rope→KV-mirror
