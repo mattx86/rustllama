@@ -149,8 +149,9 @@ __device__ __forceinline__ void rsl_hop_wgmma_mxf8_e4m3(
 // were INTRODUCED on Hopper (sm_90) and carry over byte-for-byte to Blackwell;
 // these mirror the identical wrappers in rsl_blackwell.cuh (which are compiled
 // only for __CUDA_ARCH__ >= 1200, hence re-declared here under the Hopper gate
-// rather than shared). Single-buffered copy -> wait -> compute; the
-// double-buffered overlap that actually hides the latency is a perf follow-up.
+// rather than shared). The TMA GEMM below (rsl_hop_gemm_mxfp8_tma_kernel) uses a
+// DOUBLE-BUFFERED (ping-pong) pipeline — two of these mbarriers, next-tile copy
+// issued before the current-tile wait — so the copy overlaps the wgmma (F15).
 // GH200-VALIDATE: the mbarrier phase/transaction-count semantics and bulk-copy
 // alignment are assumed-from-docs.
 // ---------------------------------------------------------------------------
@@ -302,7 +303,8 @@ __global__ void rsl_hop_gemm_mxfp8_kernel(
 // in with cp.async.bulk + an mbarrier (one bulk copy per token row = 32
 // contiguous f32 = 128 B) instead of a per-thread global-load loop, then
 // quantized to E4M3 in shared memory. Reuses the Hopper-born TMA machinery
-// (identical to rsl_blackwell.cuh). Single-buffered. GH200-VALIDATE.
+// (identical to rsl_blackwell.cuh). DOUBLE-BUFFERED (ping-pong) so the next
+// K-tile's copy overlaps the current tile's wgmma compute (F15). GH200-VALIDATE.
 // ===========================================================================
 __global__ void rsl_hop_gemm_mxfp8_tma_kernel(
     const unsigned char* __restrict__ w, const float* __restrict__ x,
@@ -316,32 +318,76 @@ __global__ void rsl_hop_gemm_mxfp8_tma_kernel(
 #ifdef RSL_HOP_DEVICE_TC
     __shared__ alignas(128) unsigned char as[64 * 32];
     __shared__ alignas(128) unsigned char bs[16 * 32];
-    __shared__ alignas(16) float xs[16][32];    // f32 activation staging (TMA dst)
+    // DOUBLE-BUFFERED (ping-pong) f32 activation staging (F15). The next K-tile's
+    // TMA bulk copy is issued into the OTHER buffer BEFORE we block on the current
+    // tile, so the cp.async.bulk of tile N+1 overlaps the wgmma compute of tile N
+    // — the standard Hopper pipelined-GEMM pattern that actually hides the copy
+    // latency the single-buffered version paid serially. Two smem buffers + two
+    // mbarriers (one per buffer); each buffer's phase parity flips once per
+    // completed copy. The MATH is byte-identical to the single-buffered kernel:
+    // identical global f32 loads, identical quant/wgmma/fold — only the
+    // copy↔compute overlap differs. GH200-VALIDATE: overlap is a perf change; the
+    // numbers remain the single-buffer numbers, so the existing --cuda-parity
+    // Hopper FP8 probe is the (unchanged) correctness arbiter.
+    __shared__ alignas(16) float xs[2][16][32];  // ping-pong f32 activation (TMA dst)
     __shared__ float ascale[16];
-    __shared__ alignas(8) unsigned long long mbar;
-    unsigned mb = (unsigned)__cvta_generic_to_shared(&mbar);
-    if (tid == 0) rsl_hop_mbar_init(mb, 1);
+    __shared__ alignas(8) unsigned long long mbar[2];
+    unsigned mb0 = (unsigned)__cvta_generic_to_shared(&mbar[0]);
+    unsigned mb1 = (unsigned)__cvta_generic_to_shared(&mbar[1]);
+    if (tid == 0) { rsl_hop_mbar_init(mb0, 1); rsl_hop_mbar_init(mb1, 1); }
     __syncthreads();
     float c[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    int phase = 0;
 
-    for (int k0 = 0; k0 < K; k0 += 32) {
-        const int kb = k0 >> 5;
-        int valid = N - n0; if (valid > 16) valid = 16; if (valid < 0) valid = 0;
-        // Bulk-copy `valid` token rows (32 f32 = 128 B each) into xs via TMA.
-        if (tid == 0) {
-            rsl_hop_mbar_expect(mb, valid * 32 * (int)sizeof(float));
-            for (int r = 0; r < valid; ++r) {
-                unsigned dst = (unsigned)__cvta_generic_to_shared(&xs[r][0]);
-                rsl_hop_bulk_g2s(dst, &x[(long long)(n0 + r) * K + k0], 32 * (int)sizeof(float), mb);
+    const int nstages = K >> 5;                   // K % 32 == 0 (launcher-checked)
+    int valid = N - n0; if (valid > 16) valid = 16; if (valid < 0) valid = 0;
+
+    // Prologue: kick off the TMA copy for K-stage 0 into buffer 0 so the first
+    // loop iteration's wait finds it already in flight.
+    if (tid == 0) {
+        rsl_hop_mbar_expect(mb0, valid * 32 * (int)sizeof(float));
+        for (int r = 0; r < valid; ++r) {
+            unsigned dst = (unsigned)__cvta_generic_to_shared(&xs[0][r][0]);
+            rsl_hop_bulk_g2s(dst, &x[(long long)(n0 + r) * K + 0], 32 * (int)sizeof(float), mb0);
+        }
+    }
+    // Zero the edge rows not covered by a bulk copy so quant is defined.
+    for (int idx = tid; idx < (16 - valid) * 32; idx += 128) {
+        int r = valid + (idx >> 5);
+        xs[0][r][idx & 31] = 0.f;
+    }
+    // Per-buffer mbarrier phase parity (flips once each time that buffer's tile
+    // copy completes; a given buffer is reused every 2 stages, so its parity
+    // alternates 0,1,0,1…).
+    int phase[2] = {0, 0};
+
+    for (int ks = 0; ks < nstages; ++ks) {
+        const int cur = ks & 1;
+        const int k0 = ks << 5;
+        const int kb = ks;
+
+        // Prefetch the NEXT K-stage into the OTHER buffer so its copy overlaps
+        // THIS stage's compute. The previous use of that buffer (2 stages back,
+        // i.e. stage ks-1) finished reading it before stage ks-1's trailing
+        // __syncthreads(), so overwriting it now is hazard-free.
+        if (ks + 1 < nstages) {
+            const int nxt = (ks + 1) & 1;
+            const int k0n = (ks + 1) << 5;
+            const unsigned mbn = nxt ? mb1 : mb0;
+            if (tid == 0) {
+                rsl_hop_mbar_expect(mbn, valid * 32 * (int)sizeof(float));
+                for (int r = 0; r < valid; ++r) {
+                    unsigned dst = (unsigned)__cvta_generic_to_shared(&xs[nxt][r][0]);
+                    rsl_hop_bulk_g2s(dst, &x[(long long)(n0 + r) * K + k0n], 32 * (int)sizeof(float), mbn);
+                }
+            }
+            for (int idx = tid; idx < (16 - valid) * 32; idx += 128) {
+                int r = valid + (idx >> 5);
+                xs[nxt][r][idx & 31] = 0.f;
             }
         }
-        // Zero the edge rows not covered by a bulk copy so quant is defined.
-        for (int idx = tid; idx < (16 - valid) * 32; idx += 128) {
-            int r = valid + (idx >> 5);
-            xs[r][idx & 31] = 0.f;
-        }
-        rsl_hop_mbar_wait(mb, phase); phase ^= 1;
+
+        // Block until THIS tile's bulk copy has landed, then flip its parity.
+        rsl_hop_mbar_wait(cur ? mb1 : mb0, phase[cur]); phase[cur] ^= 1;
         __syncthreads();
 
         // Stage weights (direct global->smem, same as the non-TMA kernel).
@@ -352,13 +398,13 @@ __global__ void rsl_hop_gemm_mxfp8_tma_kernel(
         // Per-token activation block scale from the TMA-staged f32 tile.
         if (tid < 16) {
             float mx = 0.f;
-            for (int t = 0; t < 32; ++t) mx = fmaxf(mx, fabsf(xs[tid][t]));
+            for (int t = 0; t < 32; ++t) mx = fmaxf(mx, fabsf(xs[cur][tid][t]));
             ascale[tid] = (mx > 0.f) ? mx / 448.0f : 1.0f;
         }
         __syncthreads();
         for (int i = tid; i < 16 * 32; i += 128) {
             int r = i >> 5, col = i & 31;
-            bs[i] = rslbw::rsl_f32_to_e4m3(xs[r][col] / ascale[r]);
+            bs[i] = rslbw::rsl_f32_to_e4m3(xs[cur][r][col] / ascale[r]);
         }
         __syncthreads();
 

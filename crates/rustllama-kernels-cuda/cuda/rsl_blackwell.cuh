@@ -656,10 +656,17 @@ __global__ void rsl_bw_gemm_mxfp6_kernel(const unsigned char* __restrict__ w, co
 // 256 B) + mbarrier. No CUtensorMap / driver API needed (that would be the
 // 2D-strided tensor variant). All mbarrier / cp.async.bulk PTX confirmed to
 // assemble for sm_120a. Single-buffered (copy -> wait -> compute); the
-// double-buffered overlap that actually hides the copy latency is the perf
-// follow-up. SPARK-VALIDATE: the mbarrier phase/transaction-count semantics
-// and the bulk-copy alignment are assumed-from-docs. Dispatch-gated behind a
-// separate opt-in; parity validates it == the scalar reference.
+// double-buffered overlap that actually hides the copy latency is a separate
+// perf follow-up (done for Hopper in rsl_hopper.cuh, F15).
+// F16 — mbarrier arrive/wait validation: the producer/consumer handshake is now
+// explicit and hardened in the kernel below — single-producer `arrive.expect_tx`
+// (count 1), a drift-proof transaction-byte count (static_asserted against the
+// staging tile), and a `try_wait.parity` spin loop with an explicitly tracked
+// phase parity so the consumer always blocks on the phase in flight. This
+// hardens the SYNC, not the math (the numbers are unchanged). SPARK-VALIDATE:
+// the mbarrier phase/transaction-count semantics remain assumed-from-docs — the
+// Spark `--cuda-parity` probe (vs the scalar reference) is the correctness
+// arbiter. Dispatch-gated behind a separate opt-in.
 // ===========================================================================
 #ifdef RSL_BW_DEVICE_TC
 __device__ __forceinline__ void rsl_bw_mbar_init(unsigned mbar, int count) {
@@ -689,22 +696,48 @@ __global__ void rsl_bw_gemm_nvfp4_tma_kernel(
 #ifdef RSL_BW_DEVICE_TC
     __shared__ alignas(16) float xs[8][64];
     __shared__ alignas(8) unsigned long long mbar;
+    // F16 — mbarrier arrive/wait validation. Compile-time guards that the TMA
+    // transaction-byte accounting below can never drift from the staging tile:
+    // one bulk copy per token row is exactly one 64-f32 (256 B) smem row, and the
+    // whole tile is 8 such rows. If a future tile-shape edit changes either, the
+    // `expect_tx` byte count (which gates mbarrier phase completion) would silently
+    // disagree with the bytes the cp.async.bulk ops deliver — these static_asserts
+    // make that a build error, not a GH200/Spark MISCOMPUTE.
+    static_assert(sizeof(xs[0]) == 64 * sizeof(float), "TMA row must be 64 f32 (256 B)");
+    static_assert(sizeof(xs) == 8 * 64 * sizeof(float), "TMA tile must be 8x64 f32");
     unsigned mb = (unsigned)__cvta_generic_to_shared(&mbar);
+    // Single-producer handshake: init the arrival count to 1 (only `lane 0` arms
+    // the barrier each stage, via `arrive.expect_tx`). The phase completes when
+    // BOTH that one arrival lands AND exactly `tx_bytes` of cp.async.bulk payload
+    // arrive (`...mbarrier::complete_tx::bytes`). All lanes then consume the same
+    // completed phase through the try_wait.parity spin loop below.
     if (lane == 0) rsl_bw_mbar_init(mb, 1);
     __syncwarp();
     float c[4] = {0, 0, 0, 0}; const int rA0 = m0 + g, rA1 = m0 + g + 8;
+    // Expected mbarrier phase PARITY for the NEXT completion. Starts 0 (the init
+    // phase); each completed phase flips the hardware parity, so we flip our
+    // tracker in lockstep after every wait — the "correct phase bits" the consumer
+    // must pass to try_wait.parity so it blocks on the phase actually in flight
+    // (never a stale already-completed one, never the next not-yet-armed one).
     int phase = 0;
     for (int k0 = 0; k0 < K; k0 += 64) {
         int valid = N - n0; if (valid > 8) valid = 8; if (valid < 0) valid = 0;
+        // Bytes this stage's bulk copies will deliver == what `expect_tx` arms the
+        // barrier's transaction count with (single source of truth: `valid` rows ×
+        // 256 B). Both derive from this one value so they cannot desynchronize.
+        const int tx_bytes = valid * (int)sizeof(xs[0]);
         if (lane == 0) {
-            rsl_bw_mbar_expect(mb, valid * 64 * (int)sizeof(float));
+            rsl_bw_mbar_expect(mb, tx_bytes);
             for (int r = 0; r < valid; ++r) {
                 unsigned dst = (unsigned)__cvta_generic_to_shared(&xs[r][0]);
-                rsl_bw_bulk_g2s(dst, &x[(long long)(n0 + r) * K + k0], 64 * (int)sizeof(float), mb);
+                rsl_bw_bulk_g2s(dst, &x[(long long)(n0 + r) * K + k0], (int)sizeof(xs[0]), mb);
             }
         }
         // Zero the edge rows not covered by a bulk copy so B quant is defined.
         for (int idx = lane; idx < (8 - valid) * 64; idx += 32) { int r = valid + (idx >> 6); xs[r][idx & 63] = 0.f; }
+        // ACQUIRE: block until this stage's copy has completed the current phase
+        // (try_wait.parity spin loop inside), making the async-proxy bulk-copy
+        // writes visible, THEN flip the parity tracker for the next stage.
         rsl_bw_mbar_wait(mb, phase); phase ^= 1;
         __syncwarp();
         unsigned a[4];

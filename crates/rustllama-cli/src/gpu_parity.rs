@@ -476,6 +476,14 @@ fn probe_names() -> Vec<String> {
     // the device is XMX-capable AND the DLL was built -DRSL_SYCL_XMX; on Iris
     // Xe (Xe-LP) it reports SKIP. Last so it banks after the matvec families.
     v.push("xmx:gemm".to_string());
+    // F17 — IQ1_S GPU quant-ENCODER parity. The opt-in `RUSTLLAMA_IQ_GPU=1`
+    // quantizer's 8-element delta grid search (`SyclIqEncoder`) vs the CPU
+    // reference encoder on identical target blocks. Validates the GPU quantizer,
+    // not a forward kernel; SKIPs cleanly when the `encoder` feature is off (slim
+    // server build). No dispatch verdict reads it (the quantize path tries the
+    // GPU encoder and falls back to CPU on error), so it's excluded from the
+    // banked verdicts in `collect_sycl_verdicts`.
+    v.push("encoder:iq1_s".to_string());
     v
 }
 
@@ -805,6 +813,8 @@ pub fn run_probe(name: &str) -> anyhow::Result<()> {
         "xmx" => probe_xmx(&stream, name, started),
         // P17: GPU DeltaNet chunked-prefill recurrence.
         "ssm" => probe_delta_net(&stream, name, rest, started),
+        // F17: IQ1_S GPU quant-encoder vs CPU reference.
+        "encoder" => probe_iq_encoder(&stream, name, rest, started),
         _ => anyhow::bail!("unknown probe kind {kind}"),
     }
     Ok(())
@@ -898,6 +908,100 @@ fn int8_act_roundtrip(x: &[f32]) -> Vec<f32> {
         }
     }
     xr
+}
+
+/// F17 — IQ1_S SYCL GPU-ENCODER parity probe. Grades the GPU 8-element delta
+/// grid search (`SyclIqEncoder::iq_8elt_delta_batched` — the opt-in
+/// `RUSTLLAMA_IQ_GPU=1` quantizer behind the CLI `encoder` feature) against the
+/// CPU reference encoder (`CpuFallbackEncoder`, the AVX2/scalar
+/// `best_iq1s_grid_for_chunk`) on identical target blocks. Both maximize the SAME
+/// objective — `dot²/norm` over the 2048-entry IQ1_S grid (`grid point + delta`)
+/// — so a correct GPU search reaches each chunk's optimum. Graded on that
+/// objective (the quant-optimality criterion, robust to a legitimate lowest-lane
+/// tie-break picking an equally-good grid index) with the exact grid-index match
+/// rate reported as detail. Validatable HERE on Iris Xe.
+///
+/// SKIPs when the `encoder` feature is off (slim server build) or no SYCL encoder
+/// can be constructed. This proves the GPU quantizer ≡ the CPU quantizer; it is
+/// NOT a forward-path kernel and banks no dispatch verdict.
+#[cfg(feature = "encoder")]
+fn probe_iq_encoder(_stream: &sk::SyclStream, name: &str, rest: &str, started: Instant) {
+    use rustllama_gguf::iq_gpu::{CpuFallbackEncoder, Iq8EltDeltaPick, IqGpuEncoder};
+    if rest != "iq1_s" {
+        emit(name, "SKIP", "unknown-encoder-probe");
+        return;
+    }
+    // The GPU encoder owns its own SYCL queue + the uploaded IQ1_S grid; build it
+    // on device 0 (the same device `_stream` enumerated). A construction failure
+    // (no Intel SYCL device, USM upload refused) is a clean SKIP.
+    let gpu_enc = match sk::iq_encoder::SyclIqEncoder::new(0) {
+        Ok(e) => e,
+        Err(e) => {
+            emit(name, "SKIP", &format!("no-gpu-encoder ({e})"));
+            return;
+        }
+    };
+    let cpu_enc = CpuFallbackEncoder;
+
+    const N: usize = 256; // chunks per delta
+    // IQ1_M uses ±delta sub-block scaling; include a zero and an IQ1_S-style
+    // positive delta so the sweep exercises the sign of the grid offset.
+    let deltas = [-0.0625f32, 0.0, 0.125];
+    let zero = Iq8EltDeltaPick { grid_idx: 0, signed_score: 0.0, norm_sq: 0.0 };
+    let mut obj_gpu: Vec<f32> = Vec::with_capacity(N * deltas.len());
+    let mut obj_cpu: Vec<f32> = Vec::with_capacity(N * deltas.len());
+    let mut idx_match = 0usize;
+    let mut total = 0usize;
+    for (di, &delta) in deltas.iter().enumerate() {
+        let targets = gen_x(N * 8, 0xA1C0 ^ ((di as u32).wrapping_mul(2654435761) | 1));
+        let mut g = vec![zero; N];
+        let mut c = vec![zero; N];
+        if let Err(e) = gpu_enc.iq_8elt_delta_batched(&targets, delta, &mut g) {
+            emit(
+                name,
+                "KERNEL_ERR",
+                &format!("gpu encode failed: {e} ms={}", started.elapsed().as_millis()),
+            );
+            return;
+        }
+        if cpu_enc.iq_8elt_delta_batched(&targets, delta, &mut c).is_err() {
+            emit(name, "KERNEL_ERR", "cpu reference encode failed");
+            return;
+        }
+        for i in 0..N {
+            let og = if g[i].norm_sq > 0.0 {
+                g[i].signed_score * g[i].signed_score / g[i].norm_sq
+            } else {
+                0.0
+            };
+            let oc = if c[i].norm_sq > 0.0 {
+                c[i].signed_score * c[i].signed_score / c[i].norm_sq
+            } else {
+                0.0
+            };
+            obj_gpu.push(og);
+            obj_cpu.push(oc);
+            if g[i].grid_idx == c[i].grid_idx {
+                idx_match += 1;
+            }
+            total += 1;
+        }
+    }
+    let (cos, max_rel) = compare(&obj_gpu, &obj_cpu);
+    let ok = cos > 0.9999 && max_rel < 2e-3;
+    let ms = started.elapsed().as_millis();
+    emit(
+        name,
+        if ok { "OK" } else { "MISCOMPUTE" },
+        &format!("idx_match={idx_match}/{total} cos={cos:.6} max_rel={max_rel:.5} ms={ms}"),
+    );
+}
+
+/// `encoder` feature off (slim server build): the GPU IQ encoder isn't compiled
+/// in, so the probe SKIPs cleanly.
+#[cfg(not(feature = "encoder"))]
+fn probe_iq_encoder(_stream: &sk::SyclStream, name: &str, _rest: &str, _started: Instant) {
+    emit(name, "SKIP", "no-encoder-feature");
 }
 
 /// XMX/DPAS bf16 tensor-core GEMM probe. SKIP unless the device is XMX-capable
@@ -3537,7 +3641,10 @@ pub fn collect_sycl_verdicts() -> anyhow::Result<Vec<(String, Option<bool>)>> {
     let rows = run_parent_rows()?;
     Ok(rows
         .into_iter()
-        .filter(|(name, _, _)| name != "xmx:gemm")
+        // `xmx:gemm` is banked by the dedicated in-process `collect_xmx_verdict`.
+        // `encoder:iq1_s` (F17) is a quantize-time GPU-encoder parity diagnostic
+        // that no forward dispatch gate reads, so it banks no verdict either.
+        .filter(|(name, _, _)| name != "xmx:gemm" && name != "encoder:iq1_s")
         .map(|(name, status, _detail)| {
             let v = match status.as_str() {
                 "CRASH" | "HANG" => Some(false),
