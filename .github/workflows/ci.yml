@@ -33,15 +33,18 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo check (toolchain-free crates)
         run: cargo check ${{ env.FREE_CRATES }}
-      # Clippy runs informationally (does not fail CI). The free crates still
-      # carry ~386 lints, the bulk of them `clippy::needless_range_loop` and
-      # manual bit-ops in the bit-exact SIMD / quant kernels (kernels-cpu,
-      # gguf) where the indexed form is deliberate and rewriting it would risk
-      # the parity guarantees. Turn this into a gate (`-- -D warnings`) once the
-      # numeric crates are either cleaned up or carry crate-level `#![allow]`s
-      # for the intentional lint families.
-      - name: cargo clippy (toolchain-free crates)
-        run: cargo clippy --all-targets ${{ env.FREE_CRATES }}
+      # Clippy is a HARD GATE (`-- -D warnings`): the toolchain-free crates must be
+      # warning-clean. The deliberate bit-exact lint families in the SIMD / quant
+      # kernels — `needless_range_loop`, `identity_op`, `manual_div_ceil` /
+      # `manual_is_multiple_of`, `unusual_byte_groupings`, the explicit `unsafe`
+      # blocks kept for edition-2024 forward-compat, the post-MSRV AVX-512-FP16
+      # intrinsics, flat kernel ABIs, etc. — are allowed in-source with module-scoped
+      # `#![allow]`s (kernels-cpu + the gguf quant/encode modules + tensor), each with
+      # a `// deliberate:` / `// clippy:` rationale comment; everything else was fixed
+      # idiomatically. Do NOT add a blanket crate-level allow to clear a new lint —
+      # fix it, or scope an allow to the specific module/item with a rationale.
+      - name: cargo clippy (toolchain-free crates, hard gate)
+        run: cargo clippy --all-targets ${{ env.FREE_CRATES }} -- -D warnings
       # `--tests` runs the integration suites under each crate's tests/ dir
       # (e.g. gguf's 4 + tokenizer's 6 + the pretokenizer fixtures) alongside
       # the lib unit tests, which plain `--lib` skipped.

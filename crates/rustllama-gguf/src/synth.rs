@@ -1,3 +1,9 @@
+// deliberate: unusual_byte_groupings — hex/bit literals grouped to match the GGUF
+// on-disk field layout rather than by 4s; vec_init_then_push — the synthetic-GGUF
+// builders here intentionally use a `Vec::new()` + sequential-push tensor-list builder
+// (clearer with the interleaved layout comments).
+#![allow(clippy::unusual_byte_groupings, clippy::vec_init_then_push)]
+
 //! Synthetic GGUF builder for tests.
 //!
 //! Gated behind feature `synth`. Used by integration tests in
@@ -829,6 +835,7 @@ pub fn write_synthetic_llama_gguf(path: &Path, params: &SynthLlama) {
 ///     `attn_q_b` when `q_lora_rank` is `Some`, else a single `attn_q`),
 ///     the KV path (`attn_kv_a_mqa`+`attn_kv_a_norm`+`attn_kv_b`),
 ///     `attn_output`, and a dense or MoE FFN.
+///
 /// GGUF dims are column-major `[in, out]` — the same convention the
 /// Llama writer uses — so the loader's `out_dim`/`in_dim` resolve
 /// correctly. Weight values are deterministic small RNG (coherence isn't
@@ -1908,6 +1915,7 @@ pub fn write_synthetic_clip_mmproj_gguf(path: &Path) {
 ///   - 2-D tensors use the REAL GGUF dim order `[in, out]` (ne0
 ///     fastest) — the classic fixture writes `[out, in]`, which
 ///     masked a dim-order bug once already.
+///
 /// Geometry: image 32, patch 8 → 4×4 = 16 patches → 4 merged tokens;
 /// d_model 64, 4 heads (d_head 16), ffn 128, 2 layers, d_text 96.
 pub fn write_synthetic_qwen3vl_mmproj_gguf(path: &Path, deepstack_true: bool) {

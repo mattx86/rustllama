@@ -1,3 +1,7 @@
+// deliberate: needless_range_loop — explicit position/head indexing in the online-
+// softmax merge; too_many_arguments — flat kernel/test entry-point signatures.
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+
 //! Cascade / shared-prefix attention (P3).
 //!
 //! When `N` sequences share a common prompt PREFIX — the APC case: one system

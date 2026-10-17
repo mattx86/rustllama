@@ -1,3 +1,7 @@
+// deliberate: scratch diagnostic example with dense pre-existing formatting;
+// chunks_exact_to_as_chunks / possible_missing_else are left as written here.
+#![allow(clippy::chunks_exact_to_as_chunks, clippy::possible_missing_else)]
+
 // Throwaway diagnostic: dequantize each tensor in a GGUF and report
 // any NaN/Inf, plus min/max. Distinguishes "encoder produced invalid
 // (non-finite) blocks" from "finite but too-lossy" on a re-quanted

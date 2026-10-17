@@ -1,3 +1,7 @@
+// deliberate: needless_range_loop — explicit block/element indexing that spells out the
+// ggml `block_q4_0` nibble layout in the bit-exact quantize/dequantize + flash paths.
+#![allow(clippy::needless_range_loop)]
+
 //! Q4_0 KV-cache blocks — exact ggml `block_q4_0` layout: 18 bytes
 //! per 32 elements, a little-endian f16 scale embedded in the first
 //! two bytes of every block.
@@ -233,7 +237,7 @@ std::thread_local! {
     /// bounded (~32 MB at 4K ctx for the 27B) and amortized to zero
     /// allocations.
     static DECODE_SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
-        std::cell::RefCell::new((Vec::new(), Vec::new()));
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
 /// Multi-query FlashAttention prefill for Q4_0 KV. Query `i` attends

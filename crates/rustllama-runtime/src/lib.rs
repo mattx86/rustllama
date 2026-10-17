@@ -135,6 +135,9 @@ pub fn resolve_paths() -> Paths {
 /// Install a custom path map. Called by the binary if it wants to
 /// override detection (e.g., a test, or a one-off invocation that
 /// passes `--portable`). Idempotent: only the first call sticks.
+// clippy: result_large_err — the Err intentionally hands the caller back the `Paths`
+// they tried to set; this is a cold set-once-at-startup path, not a hot one.
+#[allow(clippy::result_large_err)]
 pub fn set_paths(p: Paths) -> std::result::Result<(), Paths> {
     PATHS.set(p)
 }
@@ -214,8 +217,7 @@ impl Drop for ServerLock {
 /// runtime dir + `server.lock` and takes a NON-blocking advisory exclusive
 /// lock on it:
 ///   - `Ok(Some(guard))` — acquired; hold the guard for the server's lifetime.
-///   - `Ok(None)`        — another live process already holds it (a server is
-///                         already running against this runtime dir).
+///   - `Ok(None)`        — another live process already holds it (a server is already running against this runtime dir).
 ///   - `Err(_)`          — filesystem error creating/opening the lock file.
 pub fn acquire_server_lock() -> Result<Option<ServerLock>> {
     let dir = runtime_dir()?;
@@ -225,6 +227,7 @@ pub fn acquire_server_lock() -> Result<Option<ServerLock>> {
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(&path)?;
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(ServerLock { file, path })),

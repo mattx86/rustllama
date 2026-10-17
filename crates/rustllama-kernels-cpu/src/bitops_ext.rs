@@ -1,3 +1,8 @@
+// deliberate: needless_range_loop — explicit lane/bit indexing in these bit-ops
+// primitives; unused_unsafe — explicit `unsafe` blocks kept inside the
+// `#[target_feature]` unsafe fns for edition-2024 `unsafe_op_in_unsafe_fn` forward-compat.
+#![allow(clippy::needless_range_loop, unused_unsafe)]
+
 //! Speculative bit-manipulation CPU extensions (VPOPCNTDQ / GFNI / VBMI2).
 //!
 //! These have **no current consumer** in the GGUF formats this runtime uses —

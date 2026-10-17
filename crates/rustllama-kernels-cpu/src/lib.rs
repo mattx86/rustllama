@@ -8,6 +8,26 @@
 //! All kernels are naive scalar loops. SIMD (AVX2 / AVX-512) and the SYCL
 //! GPU equivalents come in later phases; correctness first.
 
+// clippy/deliberate: these lint families are load-bearing in the bit-exact SIMD +
+// quant kernels that make up this module. needless_range_loop / identity_op /
+// unusual_byte_groupings — explicit lane/block indexing and bit/offset arithmetic
+// that spell out the memory & packed-format layout; manual_div_ceil /
+// manual_is_multiple_of — explicit block-size math kept inline; excessive_precision —
+// exact numeric constants (e.g. the 355/512 ln2-high Cephes term) written in full on
+// purpose; too_many_arguments / type_complexity — flat kernel entry-point ABIs.
+// Rewriting any of these to the idiomatic form would obscure the layout/intent and
+// risk the parity guarantees, so they are allowed here rather than fixed.
+#![allow(
+    clippy::needless_range_loop,
+    clippy::identity_op,
+    clippy::unusual_byte_groupings,
+    clippy::manual_div_ceil,
+    clippy::manual_is_multiple_of,
+    clippy::excessive_precision,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+
 pub mod cascade;
 pub mod delta_net;
 pub mod mlx_affine;
@@ -865,32 +885,34 @@ pub fn matvec_ptq1_0_w_f32_a(
     matvec_ptq1_0_w_f32_a_scalar(w_bytes, x, out, m, k);
 }
 
-/// Batched PTQ1_0 matvec over `n_rows` activation rows:
-/// `out[t][i] = W[i] · xs[t]` with `xs` row-major `[n_rows, k]` and
-/// `out` row-major `[n_rows, m]`.
-///
-/// This is the CPU prefill kernel the per-token fallback lacked: the
-/// per-token loop re-streamed every weight byte AND re-ran the trit
-/// extraction once per token. Here each weight row is decoded ONCE
-/// into an f32 trit buffer (±1.0/0.0 — exactly representable, decoded
-/// in the same element order the single-row kernels walk), then all
-/// `n_rows` dot products replay the single kernel's exact FP
-/// accumulation grouping against that buffer. Extraction cost and
-/// weight DRAM traffic drop by ~n_rows×.
-///
-/// BITWISE CONTRACT: `out[t]` equals `matvec_ptq1_0_w_f32_a(w, xs[t],
-/// ..)` exactly, per element. The extraction is integer-side, so
-/// hoisting it cannot change FP results; the replay preserves the
-/// AVX2 kernel's lane grouping (five 16-lane stages as lo/hi fmadd
-/// pairs, five 8-lane stages, the same horizontal-sum shuffle order,
-/// eight scalar tail adds, then `acc += d·sum` per block) and the
-/// scalar kernel's sequential order on the non-AVX2 path. Pinned by
-/// `ptq1_0_batched_bit_identical_to_single_calls`.
-///
-/// Parallelism: rayon over weight-row chunks (same crossover lever as
-/// [`matvec_tensor`]). Workers write a transposed `[m, n_rows]`
-/// scratch (disjoint per-row chunks), scattered to the caller's
-/// `[n_rows, m]` layout in one serial pass at the end.
+// NOTE: plain `//` (not `///`) because this block precedes a `thread_local!` macro,
+// which cannot carry a doc attribute.
+// Batched PTQ1_0 matvec over `n_rows` activation rows:
+// `out[t][i] = W[i] · xs[t]` with `xs` row-major `[n_rows, k]` and
+// `out` row-major `[n_rows, m]`.
+//
+// This is the CPU prefill kernel the per-token fallback lacked: the
+// per-token loop re-streamed every weight byte AND re-ran the trit
+// extraction once per token. Here each weight row is decoded ONCE
+// into an f32 trit buffer (±1.0/0.0 — exactly representable, decoded
+// in the same element order the single-row kernels walk), then all
+// `n_rows` dot products replay the single kernel's exact FP
+// accumulation grouping against that buffer. Extraction cost and
+// weight DRAM traffic drop by ~n_rows×.
+//
+// BITWISE CONTRACT: `out[t]` equals `matvec_ptq1_0_w_f32_a(w, xs[t],
+// ..)` exactly, per element. The extraction is integer-side, so
+// hoisting it cannot change FP results; the replay preserves the
+// AVX2 kernel's lane grouping (five 16-lane stages as lo/hi fmadd
+// pairs, five 8-lane stages, the same horizontal-sum shuffle order,
+// eight scalar tail adds, then `acc += d·sum` per block) and the
+// scalar kernel's sequential order on the non-AVX2 path. Pinned by
+// `ptq1_0_batched_bit_identical_to_single_calls`.
+//
+// Parallelism: rayon over weight-row chunks (same crossover lever as
+// [`matvec_tensor`]). Workers write a transposed `[m, n_rows]`
+// scratch (disjoint per-row chunks), scattered to the caller's
+// `[n_rows, m]` layout in one serial pass at the end.
 std::thread_local! {
     /// Per-thread single-row decode scratch for the fast decode
     /// matvec (grow-only i8 trits + f32 scales).
@@ -11155,8 +11177,8 @@ pub fn install_thread_pool_pinned(enabled_cpus: Vec<u32>, threads: usize) {
     });
 }
 
-/// NUMA-aware variant of [`install_thread_pool_pinned`] (F11). When `topo` has
-/// >= 2 nodes, the enabled CPUs are reordered node-grouped (via
+/// NUMA-aware variant of [`install_thread_pool_pinned`] (F11). When `topo` has two
+/// or more nodes, the enabled CPUs are reordered node-grouped (via
 /// [`numa::order_cpus_by_node`]) so consecutive rayon workers share a node and
 /// touch node-local memory; the pool install itself reuses
 /// [`install_thread_pool_pinned`] (only WHICH enabled CPU each worker pins to
@@ -17234,7 +17256,7 @@ mod tests {
     #[test]
     fn gemm_f16_matches_f32() {
         // W = [[1, 2, 3], [4, 5, 6]], x = [1, 1, 1] -> y = [6, 15]
-        let w_f32 = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let w_f32 = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let w_f16: Vec<f16> = w_f32.iter().map(|v| f16::from_f32(*v)).collect();
         let x = vec![1.0f32, 1.0, 1.0];
         let mut y = vec![0.0f32; 2];
@@ -17939,8 +17961,8 @@ mod tests {
 
     /// Build random IQ3_XXS bytes (98 per 256-weight super-block).
     /// 8-bit grid indices land in the full 0..=255 range covered by
-    /// [`rustllama_gguf::dequant::IQ3XXS_GRID`]; the 7-bit sign indices
-    /// + 4-bit scale come from random u32 words in the scales+signs
+    /// [`rustllama_gguf::dequant::IQ3XXS_GRID`]; the 7-bit sign indices +
+    /// 4-bit scale come from random u32 words in the scales+signs
     /// region.
     fn random_iq3_xxs_table(n_rows: usize, d: usize, seed: u32) -> Vec<u8> {
         const BLOCK_BYTES: usize = 98;

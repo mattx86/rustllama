@@ -1,3 +1,7 @@
+// rustc, deliberate: unused_unsafe — explicit `unsafe` blocks kept inside the
+// `#[target_feature]` unsafe fns for edition-2024 `unsafe_op_in_unsafe_fn` forward-compat.
+#![allow(unused_unsafe)]
+
 //! AVX-512-BF16 GEMM — the AMD / older-Intel prefill-GEMM accelerator, the
 //! SIMD companion to the AMX tile path (`amx.rs`). AMD has no AMX, so on
 //! Zen 4/5 (and Intel server/HEDT without AMX) AVX-512-BF16's `vdpbf16ps` is

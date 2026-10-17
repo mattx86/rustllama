@@ -1,3 +1,8 @@
+// rustc/clippy, deliberate: unused_unsafe — explicit `unsafe` blocks kept inside the
+// `#[target_feature]` unsafe fns for edition-2024 `unsafe_op_in_unsafe_fn` forward-compat;
+// manual_memcpy — the AMX tile-layout byte copy is written out element-wise on purpose.
+#![allow(unused_unsafe, clippy::manual_memcpy)]
+
 //! Intel AMX (Advanced Matrix Extensions) bf16 tile GEMM — an optional fast
 //! path for the F16·F32 prefill GEMM (`gemm_f16_w_f32_a`) on Sapphire Rapids+
 //! server CPUs.

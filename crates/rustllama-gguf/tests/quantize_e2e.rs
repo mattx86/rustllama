@@ -37,7 +37,7 @@ fn build_synthetic_source(label: &str) -> (PathBuf, Vec<f32>, Vec<f32>) {
     // Row B: spiky-ish pattern. Tests that per-block scale tracking
     // doesn't collapse on uneven distributions.
     let row_b: Vec<f32> = (0..256)
-        .map(|i| ((i as f32 * 0.37).sin() * 1.5 + (i as f32 * 0.09).cos() * 0.4))
+        .map(|i| (i as f32 * 0.37).sin() * 1.5 + (i as f32 * 0.09).cos() * 0.4)
         .collect();
 
     let mut w = GgufWriter::new(Cursor::new(Vec::<u8>::new()));
@@ -255,8 +255,8 @@ fn end_to_end_requantize_every_supported_target() {
     }
 }
 
-/// APEX I-Quality on a synthetic source — verifies the rule list
-/// + plan integration actually produces the expected per-tensor
+/// APEX I-Quality on a synthetic source — verifies the rule list +
+/// plan integration actually produces the expected per-tensor
 /// dtypes. Uses an 8-layer "model" where each layer has 4 tensors:
 /// `blk.{i}.attn_q.weight`, `blk.{i}.attn_v.weight`,
 /// `blk.{i}.ffn_gate_exps.weight` (routed), `blk.{i}.ffn_gate_shexp.weight`

@@ -1,3 +1,14 @@
+// deliberate: needless_range_loop / manual_is_multiple_of — explicit group/block
+// indexing and divisibility checks in this affine-quant decode + matvec;
+// neg_cmp_op_on_partial_ord — the `!(a < b)` float compare is kept as written for its
+// NaN-handling; chunks_exact_to_as_chunks — explicit fixed-size chunk iteration.
+#![allow(
+    clippy::needless_range_loop,
+    clippy::manual_is_multiple_of,
+    clippy::neg_cmp_op_on_partial_ord,
+    clippy::chunks_exact_to_as_chunks
+)]
+
 //! Apple **MLX affine** quantized-weight CPU reference: dequant + fused
 //! quant matvec.
 //!

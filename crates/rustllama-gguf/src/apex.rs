@@ -132,7 +132,7 @@ pub fn build_apex_rules(tier: ApexTier, n_layers: usize) -> Vec<RecipeRule> {
     }
 
     let edge_lo: usize = 5.min(n_layers);
-    let edge_hi: usize = if n_layers >= 5 { n_layers - 5 } else { 0 };
+    let edge_hi: usize = n_layers.saturating_sub(5);
 
     // Per-tier dtype assignments. Tuples are
     // (attention, shared_expert, routed_edge, routed_middle).

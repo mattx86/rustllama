@@ -28,7 +28,7 @@ fn synth_pure_ssm_emits_ssm_tensors_on_every_layer_and_no_attention() {
     // head_dim | d_model (32/8 = 4 qk-heads), so the hybrid forward's shape
     // asserts all hold. `pure_ssm` sets full_attention_interval = n_layers + 1.
     let params = SynthLlama {
-        n_layers: n_layers as u32,
+        n_layers,
         n_heads: 4,
         n_kv_heads: 2,
         head_dim: 8,

@@ -11,7 +11,7 @@ fn main() {
     let mut total_bytes: u64 = 0;
     let mut total_count: u64 = 0;
     for info in g.tensors() {
-        let bytes = info.byte_size as u64;
+        let bytes = info.byte_size;
         total_bytes += bytes;
         total_count += 1;
         let canonical = canonicalize(&info.name);

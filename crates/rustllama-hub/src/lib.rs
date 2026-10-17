@@ -112,6 +112,7 @@ pub async fn hf_gguf_files(repo_id: &str) -> Result<Vec<HfFile>> {
 ///     KV cache for this model (without it, quant KV is coerced to f32).
 ///   - `*mmproj*.gguf`      — the vision projector for a multimodal model
 ///     (without it a pulled vision model can't see).
+///
 /// Case-insensitive; the main file itself is never returned. A plain
 /// single-GGUF repo yields an empty list. (imatrix / tokenizer / config are
 /// deliberately excluded — imatrix is a quantize-time input, and a GGUF already

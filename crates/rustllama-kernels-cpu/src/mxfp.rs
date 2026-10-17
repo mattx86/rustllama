@@ -1,3 +1,7 @@
+// deliberate: needless_range_loop — explicit element/block indexing that spells out the
+// MX packed-format layout in the bit-exact decode + matvec.
+#![allow(clippy::needless_range_loop)]
+
 //! OCP Microscaling (MX) weight matvec kernels: MXFP4 / MXFP6 / MXFP8.
 //!
 //! Each format packs 32 weights per block sharing one 8-bit E8M0
@@ -838,7 +842,7 @@ mod tests {
         let mut w = vec![0u8; m * bpr * MXFP6_BLOCK_BYTES];
         for blk in w.chunks_mut(MXFP6_BLOCK_BYTES) {
             for j in 0..MXFP6_BLOCK_ELEMS {
-                let code = (lcg(state) & 0x3F) as u32; // 6-bit E3M2 code
+                let code = lcg(state) & 0x3F; // 6-bit E3M2 code
                 let bitpos = j * 6;
                 let byte_idx = bitpos / 8;
                 let bit_off = bitpos % 8;

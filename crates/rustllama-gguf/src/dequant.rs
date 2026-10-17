@@ -1,3 +1,12 @@
+// deliberate: needless_range_loop / identity_op / manual_div_ceil — explicit
+// element/block indexing and bit/offset arithmetic that spell out each GGUF quant
+// block layout in these bit-exact decoders; rewriting risks the parity guarantees.
+#![allow(
+    clippy::needless_range_loop,
+    clippy::identity_op,
+    clippy::manual_div_ceil
+)]
+
 //! Pure-Rust quantization decoders.
 //!
 //! Phase 0 ships reference (non-SIMD) implementations of F16, Q8_0, Q4_K, Q5_K
@@ -745,6 +754,7 @@ pub fn dequant_mxfp4_ggml(bytes: &[u8], out: &mut [f32]) {
 /// paired adjacently). For output element `k`:
 ///   - upstream code = `qs_in[k] & 0x0F` for `k < 16`, else `qs_in[k-16] >> 4`
 ///   - our slot = low nibble of `qs_out[k/2]` for even `k`, else high nibble
+///
 /// so we recover each element's 4-bit code from the upstream position and
 /// re-deposit it at our position. The scale byte copies across verbatim
 /// (both are OCP-standard E8M0).

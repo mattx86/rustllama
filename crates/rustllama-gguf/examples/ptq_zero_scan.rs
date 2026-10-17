@@ -1,3 +1,7 @@
+// deliberate: needless_range_loop — explicit block/trit indexing mirroring the PTQ1_0
+// packed layout while scanning.
+#![allow(clippy::needless_range_loop)]
+
 //! Scan a PTQ1_0 (Bonsai ternary) GGUF and report the zero
 //! distribution — the data grounding for "can dense-ternary behave
 //! like MoE" (structured sparsity we could skip).

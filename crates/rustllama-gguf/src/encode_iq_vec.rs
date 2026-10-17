@@ -1,3 +1,8 @@
+// deliberate: needless_range_loop — explicit grid/chunk indexing in these bit-exact IQ
+// encoders; unused_unsafe — explicit `unsafe` blocks kept inside the `#[target_feature]`
+// AVX2 fns for edition-2024 `unsafe_op_in_unsafe_fn` forward-compat.
+#![allow(clippy::needless_range_loop, unused_unsafe)]
+
 //! Vector-grid IQ encoders (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
 //! IQ1_S, IQ1_M).
 //!
@@ -126,7 +131,7 @@ fn ksigns_iq2xs_reverse() -> &'static [u8; 256] {
 /// scale for this chunk is `signed_score / grid_norm_sq`. The
 /// per-sub-block scale chooser aggregates across chunks.
 #[derive(Debug, Clone, Copy, Default)]
-struct ChunkPick {
+pub(crate) struct ChunkPick {
     grid_idx: u16,
     sign_idx: u8,
     /// `target · signed_grid`. Always non-negative under the
@@ -149,6 +154,8 @@ struct ChunkPick {
 /// Scalar reference used by tests + non-x86_64 hosts. The hot
 /// path takes `target` + `grid_f32` (precomputed) via
 /// [`pick_sign_mask_8_f32`] which is SIMD-friendly.
+// Scalar reference + non-x86 helper, retained alongside the SIMD path; no live caller.
+#[allow(dead_code)]
 fn pick_sign_mask_8(target: &[f32], grid: &[i8]) -> (u8, f32) {
     debug_assert_eq!(target.len(), 8);
     debug_assert_eq!(grid.len(), 8);
@@ -2530,6 +2537,8 @@ unsafe fn best_iq1s_grid_all3_both_deltas_avx2(
 /// Sibling of [`best_iq1s_grid_all3_both_deltas`] for the GPU-encoder
 /// path: max-|score| arrives from GPU. Single AVX2 pass over the grid,
 /// returns `[(max-pos, max-neg) for delta_pos, (max-pos, max-neg) for delta_neg]`.
+// IQ1_S GPU-encoder-path helper (RUSTLLAMA_IQ_GPU); retained, not yet wired into a caller.
+#[allow(dead_code)]
 pub(crate) fn best_iq1s_grid_pos_neg_both_deltas(
     target: &[f32],
 ) -> [(ChunkPickIq1, ChunkPickIq1); 2] {
@@ -2545,6 +2554,7 @@ pub(crate) fn best_iq1s_grid_pos_neg_both_deltas(
     [best_iq1s_grid_pos_neg(target, dp), best_iq1s_grid_pos_neg(target, dn)]
 }
 
+#[allow(dead_code)] // sibling of the retained IQ1_S GPU-encoder-path helper above.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
 unsafe fn best_iq1s_grid_pos_neg_both_deltas_avx2(
@@ -2604,6 +2614,8 @@ unsafe fn best_iq1s_grid_pos_neg_both_deltas_avx2(
 /// already arrives from the GPU's batched kernel, so we only need max-positive
 /// and max-negative. Single AVX2 sweep, two best-trackers — roughly half the
 /// per-chunk cost of `all3`.
+// IQ1_S GPU-encoder-path helper (RUSTLLAMA_IQ_GPU); retained, not yet wired into a caller.
+#[allow(dead_code)]
 pub(crate) fn best_iq1s_grid_pos_neg(
     target: &[f32],
     delta: f32,
@@ -2623,6 +2635,7 @@ pub(crate) fn best_iq1s_grid_pos_neg(
     (p, n)
 }
 
+#[allow(dead_code)] // sibling of the retained IQ1_S GPU-encoder-path helper above.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
 unsafe fn best_iq1s_grid_pos_neg_avx2(
@@ -2816,6 +2829,7 @@ unsafe fn horizontal_sum_avx2(v: std::arch::x86_64::__m256) -> f32 {
 ///     reconstruction L2 energy.
 ///   - Pick the delta with the higher total energy.
 ///   - Compute the natural dl = Σ signed_score / Σ norm_sq.
+///
 /// Then derive the super-block d so each sub-block's `dl = d * (2s + 1)`,
 /// `s ∈ [0, 7]` → d range `[1, 15]`.
 pub fn encode_iq1_s(src: &[f32], dst: &mut [u8]) {
@@ -2836,7 +2850,7 @@ pub fn encode_iq1_s_imatrix(src: &[f32], dst: &mut [u8], imatrix: Option<&[f32]>
         n_blocks * BLOCK_IQ1_S_BYTES,
         "encode_iq1_s: dst.len() must be n_blocks * 50"
     );
-    debug_assert!(imatrix.map_or(true, |w| w.len() == src.len()));
+    debug_assert!(imatrix.is_none_or(|w| w.len() == src.len()));
 
     // Parallelize across blocks via rayon. The 3-strategy encoder is
     // ~5x slower than the original single-strategy path; a full-model

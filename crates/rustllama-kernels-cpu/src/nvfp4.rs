@@ -1,3 +1,7 @@
+// deliberate: needless_range_loop — explicit element/block indexing that spells out the
+// NVFP4 packed-format layout in the bit-exact decode + matvec.
+#![allow(clippy::needless_range_loop)]
+
 //! NVFP4: 4-bit floating-point quantization (E2M1) with shared FP8
 //! (E4M3) scale per 16-element block.
 //!

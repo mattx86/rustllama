@@ -1186,8 +1186,7 @@ mod tests {
             .collect();
         w.add_metadata("tokenizer.ggml.tokens", MetadataValue::Array(tokens))
             .unwrap();
-        let ids: Vec<MetadataValue> =
-            (0..4).map(|i| MetadataValue::I32(i)).collect();
+        let ids: Vec<MetadataValue> = (0..4).map(MetadataValue::I32).collect();
         w.add_metadata("tokenizer.ggml.token_type", MetadataValue::Array(ids))
             .unwrap();
         w.declare_tensor("t", vec![1], GgmlType::F32).unwrap();

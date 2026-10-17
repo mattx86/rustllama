@@ -102,6 +102,7 @@ impl Tokenizer {
     ///   1. read `tokenizer.ggml.model` to choose the model family
     ///   2. assemble a `tokenizer.json`-shaped JSON document
     ///   3. let `tokenizers::Tokenizer::from_bytes` parse it
+    ///
     /// This avoids depending on internals of the `tokenizers` crate and
     /// gives us robust GPT2 byte-level behavior for free.
     pub fn from_gguf(gguf: &Gguf) -> Result<Self> {
@@ -923,7 +924,7 @@ fn build_unigram_spm_from_parts(
     // unencodable.
     let has_byte_tokens = token_types
         .as_ref()
-        .map(|tt| tt.iter().any(|&t| t == 6))
+        .map(|tt| tt.contains(&6))
         .unwrap_or(false);
 
     let mut model = serde_json::Map::new();
@@ -1003,6 +1004,8 @@ fn push_added(added: &mut Vec<Value>, id: u32, content: &str, special: bool) {
 /// GPT-2 / original byte-level BPE. Identical to the regex HF's
 /// `ByteLevel{use_regex:true}` applies internally, so `gpt-2` models take
 /// the DEFAULT path below (byte-identical to pre-M3 behaviour).
+// Retained for reference; gpt-2 models take the DEFAULT regex path, so this is unused.
+#[allow(dead_code)]
 const RE_GPT2: &str =
     r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
 /// Llama-3 (`llama-bpe`); `smaug-bpe` shares it. Case-insensitive
@@ -1069,6 +1072,7 @@ fn bpe_pretokenizer_json(pre: Option<&str>) -> Value {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_bpe_byte_level(
     tokens: &[String],
     gguf: &Gguf,
@@ -1083,9 +1087,7 @@ fn build_bpe_byte_level(
     let merges: Vec<Value> = merges_raw
         .iter()
         .filter_map(|m| {
-            let mut parts = m.splitn(2, ' ');
-            let a = parts.next()?;
-            let b = parts.next()?;
+            let (a, b) = m.split_once(' ')?;
             Some(json!([a, b]))
         })
         .collect();
@@ -1339,7 +1341,7 @@ mod tests {
                 "merges": [["9", "9"], ["99", "9"], ["999", "9"]],
             }
         });
-        HfTokenizer::from_bytes(&serde_json::to_vec(&tj).unwrap())
+        HfTokenizer::from_bytes(serde_json::to_vec(&tj).unwrap())
             .expect("tiny digit BPE loads")
     }
 

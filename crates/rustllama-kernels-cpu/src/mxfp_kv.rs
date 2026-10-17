@@ -1,3 +1,7 @@
+// deliberate: needless_range_loop — explicit block/element indexing that spells out the
+// MX KV-block layout in the bit-exact quantize/dequantize + flash paths.
+#![allow(clippy::needless_range_loop)]
+
 //! OCP Microscaling (MX) KV-cache blocks + flash attention.
 //!
 //! MXFP4/6/8 as KV-cache quant formats: 32 elements per block sharing

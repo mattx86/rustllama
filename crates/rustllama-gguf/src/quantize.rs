@@ -1,3 +1,7 @@
+// deliberate: manual_is_multiple_of — explicit `total_n % n_in == 0` block-divisibility
+// guards (guarded by `n_in > 0`) kept as written in the requant shape checks.
+#![allow(clippy::manual_is_multiple_of)]
+
 //! Re-quantization pipeline.
 //!
 //! Drives a source [`Gguf`] through a per-tensor encode → write

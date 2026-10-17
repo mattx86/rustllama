@@ -1,3 +1,7 @@
+// deliberate: manual_div_ceil — the ternary scale-encode formula (`(v*256+242)/243`,
+// 243 = 3^5) is written out explicitly; it is the exact quant-scale math, not a plain ceil.
+#![allow(clippy::manual_div_ceil)]
+
 //! Ternary quant encoders (TQ1_0, TQ2_0).
 //!
 //! Per-weight values: `{-d, 0, +d}`. The encoder picks a per-block

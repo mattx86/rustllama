@@ -1,3 +1,7 @@
+// deliberate: needless_range_loop / identity_op — explicit sub-block indexing and
+// offset arithmetic that spell out the K-quant block layout in these bit-exact encoders.
+#![allow(clippy::needless_range_loop, clippy::identity_op)]
+
 //! K-quant encoders.
 //!
 //! 256-weight super-blocks with sub-block scale hierarchies. Each
@@ -239,7 +243,7 @@ fn make_qkx2_quants_asym<const NMAX: u32>(
     w: Option<&[f32]>,
 ) -> (f32, f32) {
     debug_assert_eq!(xs.len(), out_q.len());
-    debug_assert!(w.map_or(true, |w| w.len() == xs.len()));
+    debug_assert!(w.is_none_or(|w| w.len() == xs.len()));
     let n = xs.len();
     let nmax_f = NMAX as f32;
 
@@ -277,10 +281,7 @@ fn make_qkx2_quants_asym<const NMAX: u32>(
     // Initial quantization.
     let mut id = 1.0 / d;
     let mut best_l: Vec<u8> = (0..n)
-        .map(|i| {
-            let q = ((xs[i] + min_used) * id).round().clamp(0.0, nmax_f) as u8;
-            q
-        })
+        .map(|i| ((xs[i] + min_used) * id).round().clamp(0.0, nmax_f) as u8)
         .collect();
     let mut best_d = d;
     let mut best_min = min_used;
@@ -411,6 +412,8 @@ fn refit_d_min(xs: &[f32], l: &[u8], w: Option<&[f32]>) -> (f32, f32) {
 /// encoders (Q2_K, Q4_K, Q5_K) now call
 /// [`make_qkx2_quants_asym`] which iterates around this starting
 /// point for ~0.05–0.15 perplexity improvement at the same bpw.
+// Fallback asymmetric sub-block quantizer; retained for non-K_K formats, no live caller.
+#[allow(dead_code)]
 fn quant_sub_block_asym<const NMAX: u32>(
     xs: &[f32],
     out_q: &mut [u8],
@@ -531,7 +534,7 @@ pub fn encode_q4_k_imatrix(src: &[f32], dst: &mut [u8], imatrix: Option<&[f32]>)
         n_blocks * BLOCK_Q4_K_BYTES,
         "encode_q4_k: dst.len() must be n_blocks * 144"
     );
-    debug_assert!(imatrix.map_or(true, |w| w.len() == src.len()));
+    debug_assert!(imatrix.is_none_or(|w| w.len() == src.len()));
     for b in 0..n_blocks {
         let xs = &src[b * QK_K..(b + 1) * QK_K];
         let off = b * BLOCK_Q4_K_BYTES;
@@ -636,7 +639,7 @@ pub fn encode_q5_k_imatrix(src: &[f32], dst: &mut [u8], imatrix: Option<&[f32]>)
         n_blocks * BLOCK_Q5_K_BYTES,
         "encode_q5_k: dst.len() must be n_blocks * 176"
     );
-    debug_assert!(imatrix.map_or(true, |w| w.len() == src.len()));
+    debug_assert!(imatrix.is_none_or(|w| w.len() == src.len()));
     for b in 0..n_blocks {
         let xs = &src[b * QK_K..(b + 1) * QK_K];
         let off = b * BLOCK_Q5_K_BYTES;
@@ -972,7 +975,7 @@ pub fn encode_q2_k_imatrix(src: &[f32], dst: &mut [u8], imatrix: Option<&[f32]>)
         n_blocks * BLOCK_Q2_K_BYTES,
         "encode_q2_k: dst.len() must be n_blocks * 84"
     );
-    debug_assert!(imatrix.map_or(true, |w| w.len() == src.len()));
+    debug_assert!(imatrix.is_none_or(|w| w.len() == src.len()));
     for b in 0..n_blocks {
         let xs = &src[b * QK_K..(b + 1) * QK_K];
         let off = b * BLOCK_Q2_K_BYTES;

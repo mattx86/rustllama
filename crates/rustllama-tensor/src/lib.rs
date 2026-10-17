@@ -1,3 +1,7 @@
+// deliberate: unused_unsafe — explicit `unsafe` blocks kept around raw-pointer FFI/USM
+// construction for edition-2024 `unsafe_op_in_unsafe_fn` forward-compat.
+#![allow(unused_unsafe)]
+
 //! Tensor and device abstractions.
 //!
 //! Phase 1 ships a real CPU storage backend (`Storage::CpuOwned`) holding
@@ -291,8 +295,8 @@ pub enum Dtype {
     PQ2_0Raw,
     /// PTQ1_0 (PrismML Bonsai) with raw GGUF block bytes preserved.
     /// 28 bytes per 128 weights (1.75 bpw): 24 base-3 ceiling-packed
-    /// qs bytes (5 trits each, staged {32,16,8} → 16+8 for 24 bytes)
-    /// + 2 qh bytes (4 trits each) + f16 scale. Decode via the
+    /// qs bytes (5 trits each, staged {32,16,8} → 16+8 for 24 bytes) +
+    /// 2 qh bytes (4 trits each) + f16 scale. Decode via the
     /// wrapping-multiply digit extraction. The densest weight format
     /// rustllama executes; a 27B model fits in ~5.9 GB.
     PTQ1_0Raw,
@@ -435,7 +439,7 @@ impl Dtype {
     pub fn byte_size(self, n_elements: u64) -> u64 {
         fn blocks(n: u64, block: u64) -> u64 {
             assert!(
-                n % block == 0,
+                n.is_multiple_of(block),
                 "element count {n} not divisible by block size {block} \
                  — block-quantized tensors must have aligned shapes"
             );
@@ -613,7 +617,9 @@ impl SyclUsmAllocation {
     /// kernel crate) construct this via [`Storage::sycl_usm_from_raw`]
     /// instead of directly to keep the FFI surface narrow.
     ///
-    /// SAFETY: `ptr` must be a USM allocation of `len` bytes, the
+    /// # Safety
+    ///
+    /// `ptr` must be a USM allocation of `len` bytes, the
     /// closure must free exactly that pointer on exactly the right
     /// stream, and the closure must remain valid for `'static` (which
     /// is automatic since `Box<dyn FnOnce + Send + Sync + 'static>`).
@@ -706,7 +712,11 @@ unsafe impl Send for DeviceAllocation {}
 unsafe impl Sync for DeviceAllocation {}
 
 impl DeviceAllocation {
-    /// Wrap a raw device pointer + its free callback. SAFETY: `ptr` is a live
+    /// Wrap a raw device pointer + its free callback.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` is a live
     /// allocation of `len` bytes on `backend`/`device_id`; `free_fn` frees
     /// exactly that pointer on exactly the right stream once, on last-Arc drop;
     /// `cpu_readable` is true ONLY if the host can dereference `ptr` (USM /
@@ -891,7 +901,11 @@ impl Storage {
     }
 
     /// Wrap an externally-allocated USM pointer + free callback as
-    /// a Storage variant. SAFETY: see [`SyclUsmAllocation::new_with_free`].
+    /// a Storage variant.
+    ///
+    /// # Safety
+    ///
+    /// See [`SyclUsmAllocation::new_with_free`].
     pub unsafe fn sycl_usm_from_raw(
         ptr: *mut u8,
         len: usize,
@@ -905,7 +919,9 @@ impl Storage {
     /// [`Self::sycl_usm_from_raw`], used by the MoE tiered-expert engine to
     /// promote an expert into device memory (CUDA managed / MLX unified / SYCL).
     ///
-    /// SAFETY: see [`DeviceAllocation::new_with_free`] — `ptr` is a live
+    /// # Safety
+    ///
+    /// See [`DeviceAllocation::new_with_free`] — `ptr` is a live
     /// `len`-byte allocation on `backend`/`device_id`, freed exactly once by
     /// `free_fn` on the owning stream, and `cpu_readable` is accurate.
     #[allow(clippy::too_many_arguments)]
@@ -1866,9 +1882,7 @@ mod tests {
                 len,
                 Box::new(move |p| {
                     *freed_capture.lock().unwrap() = true;
-                    let _ = unsafe {
-                        Box::from_raw(std::slice::from_raw_parts_mut(p, len) as *mut [u8])
-                    };
+                    let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(p, len)) };
                 }),
             )
         };
@@ -1898,9 +1912,7 @@ mod tests {
                 Box::new(move |p| {
                     free_count_capture
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let _ = unsafe {
-                        Box::from_raw(std::slice::from_raw_parts_mut(p, len) as *mut [u8])
-                    };
+                    let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(p, len)) };
                 }),
             )
         };
@@ -1970,9 +1982,7 @@ mod tests {
                 ptr,
                 len,
                 Box::new(move |p| {
-                    let _ = unsafe {
-                        Box::from_raw(std::slice::from_raw_parts_mut(p, len) as *mut [u8])
-                    };
+                    let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(p, len)) };
                 }),
             )
         };

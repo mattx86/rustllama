@@ -1,3 +1,8 @@
+// deliberate: needless_range_loop — explicit lane/block indexing in the int8 dot kernels;
+// unused_unsafe — explicit `unsafe` blocks kept inside the `#[target_feature]` unsafe fns
+// for edition-2024 `unsafe_op_in_unsafe_fn` forward-compat.
+#![allow(clippy::needless_range_loop, unused_unsafe)]
+
 //! VNNI int8 (W8A8) matvec for Q8_0 weights — an Intel+AMD CPU extension.
 //!
 //! Q8_0 weights are already int8, so a VNNI dot-product instruction accumulates

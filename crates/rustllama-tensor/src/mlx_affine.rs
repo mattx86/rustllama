@@ -1,3 +1,7 @@
+// deliberate: manual_is_multiple_of — explicit group-size divisibility checks (guarded
+// by `group_size > 0`) kept as written in this affine-quant representation.
+#![allow(clippy::manual_is_multiple_of)]
+
 //! Apple **MLX affine** quantized-weight representation.
 //!
 //! MLX (`ml-explore/mlx`) is Apple's array framework; `mlx-lm` ships LLM

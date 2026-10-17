@@ -18,8 +18,7 @@
 //! - `AttributeProto { name=1:string, f=2:float, i=3:int64, type=20:int64 }`
 //! - `ValueInfoProto { name=1:string, type=2:msg }`
 //! - `TypeProto { tensor_type=1:msg }`, `Tensor { elem_type=1:int32,
-//!    shape=2:msg }`, `TensorShapeProto { dim=1:repeated msg }`,
-//!    `Dimension { dim_value=1:int64 }`
+//!    shape=2:msg }`, `TensorShapeProto { dim=1:repeated msg }`, `Dimension { dim_value=1:int64 }`
 //!
 //! We emit a `Gemm` node (not `MatMul`) because Gemm carries `transB`, which
 //! expresses the `out[n,m] = x[n,k]·w[m,k]ᵀ` weight layout the models crate uses

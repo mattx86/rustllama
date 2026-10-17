@@ -1,3 +1,15 @@
+// deliberate: incompatible_msrv — this path uses the AVX-512-FP16 intrinsics
+// (`__m512h`, `_mm512_fmadd_ph`, …) that stabilized after the declared MSRV; it is
+// runtime-feature-gated and self-check-gated, so it only executes on capable CPUs with
+// a new-enough compiler. unused_unsafe — explicit `unsafe` blocks kept for edition-2024
+// `unsafe_op_in_unsafe_fn` forward-compat; missing_transmute_annotations — the intrinsic
+// register transmutes read clearly from context here.
+#![allow(
+    clippy::incompatible_msrv,
+    unused_unsafe,
+    clippy::missing_transmute_annotations
+)]
+
 //! AVX-512-FP16 native-f16 GEMM — a completeness CPU-extension path.
 //!
 //! CAVEAT (why it is not wired into the hot path): the throughput win of

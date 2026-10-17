@@ -1,3 +1,7 @@
+// deliberate: too_many_arguments — flat kernel entry-point signatures (per-head state,
+// projections, dims) kept explicit rather than bundled into a struct.
+#![allow(clippy::too_many_arguments)]
+
 //! Gated DeltaNet forward kernels for the `qwen35moe` hybrid arch
 //! (and other future models using the same convention).
 //!

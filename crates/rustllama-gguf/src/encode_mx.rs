@@ -1,3 +1,7 @@
+// deliberate: needless_range_loop — explicit element/block indexing that spells out the
+// MX packed-format layout in these bit-exact encoders.
+#![allow(clippy::needless_range_loop)]
+
 //! OCP Microscaling (MX) weight encoders: f32 → MXFP4 / MXFP6 / MXFP8.
 //!
 //! Each format quantizes a 32-element block to a shared 8-bit E8M0
