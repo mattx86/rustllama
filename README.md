@@ -26,8 +26,7 @@ where it matches the CPU reference (no env vars, fail-closed).
 | Xcode command-line tools   | 15+                 | Metal kernels (`rustllama-kernels-mlx`, `xcrun metal`) — **macOS only** |
 
 The GUI is a native **egui/eframe** desktop app (`crates/rustllama-gui`) — it
-has **no JS frontend**, so no Node.js / pnpm is required. (The legacy Vite/React
-tree at `app/ui/` is unused by the current build and slated for removal.)
+has **no JS frontend**, so no Node.js / pnpm is required.
 
 The compute kernels are **real-only** — there are no `mock`/`sycl`/`cuda`
 cargo features; the backends are always compiled in and startup detection
@@ -160,7 +159,6 @@ Notes:
 ```
 crates/                Library crates (engine + supporting layers, incl. rustllama-gui)
 app/desktop/           The shipped binary (CLI + GUI dispatcher)
-app/ui/                Legacy Vite + React frontend (unused; from the old Tauri GUI)
 xtask/                 Dev tasks (doctor, fetch-test-model, build)
 docs/                  Architecture, quant-format reference, redist manifest
 ```

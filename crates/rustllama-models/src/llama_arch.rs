@@ -892,35 +892,6 @@ pub enum LlamaLoadError {
     /// safe behavior — mirrors the reference implementation.
     #[error("prism.hadamard: {0}")]
     Hadamard(String),
-    /// MoE (mixture-of-experts) GGUFs are detected at load time but
-    /// the forward pass isn't implemented yet. Surfaced before the
-    /// loader tries to bind dense FFN tensors that don't exist on
-    /// MoE models — without this, users get a confusing "missing
-    /// `ffn_gate.weight`" error instead of a clear "MoE not yet
-    /// supported" diagnostic.
-    #[error(
-        "MoE (mixture-of-experts) architecture `{arch}` detected \
-         ({n_experts} experts, top-{n_experts_used} routed{shared_msg}). \
-         MoE forward pass is a follow-up — use a dense Llama-family \
-         GGUF (Qwen2.5-Coder, DeepSeek-Coder-V2, Mistral, Phi-3) for now."
-    )]
-    UnsupportedMoe {
-        arch: String,
-        n_experts: u32,
-        n_experts_used: u32,
-        /// Pre-formatted ", N shared" suffix (or empty for non-shared
-        /// MoE variants). Inlined here so the `thiserror`-derived
-        /// `Display` impl stays declarative.
-        shared_msg: String,
-    },
-    #[error(
-        "model loaded but forward pass not yet implemented: hybrid \
-         attention+SSM architecture `{arch}` (Mamba-style state-space \
-         layers + full-attention every {interval}th layer). Phase 2 \
-         of the qwen35moe roadmap bound all tensors; Phase 3 implements \
-         the SSM forward kernel. See docs/qwen35moe-roadmap.md."
-    )]
-    UnsupportedHybridForward { arch: String, interval: u32 },
     /// A hybrid (attention + SSM/DeltaNet) model whose DeltaNet head
     /// geometry can't be derived consistently from its tensor shapes
     /// (e.g. `ssm_inner_size` not divisible by the v-head count, a zero
@@ -1128,9 +1099,9 @@ pub struct LlamaMoeBlockWeights {
 ///      scan parameterized by `alpha` (B-projection), `beta`
 ///      (C-projection), and the learned decay `ssm_a`.
 ///
-/// Phase 2 (this file) binds the tensors. Phase 3 wires the
-/// forward pass; until then `forward_*` returns
-/// `LlamaLoadError::UnsupportedHybridForward`.
+/// The loader binds the tensors; hybrid models run their forward
+/// pass through `forward_one_hybrid` (full-attention layers + the
+/// DeltaNet/SSM recurrence), not the dense forward path.
 /// Per-layer FFN of a hybrid model. Qwen3.6-family hybrids
 /// (`qwen35moe`) carry a routed-expert MoE FFN on every layer;
 /// Qwen3.8-family hybrids (Bonsai 2 / dense `qwen35` files without
@@ -1574,9 +1545,8 @@ impl LlamaWeights {
     /// `true` when this model's transformer blocks are MoE-shaped
     /// (router + expert tensors loaded). `false` for dense models.
     /// Forward-pass entry points consult this to decide between the
-    /// dense forward and the MoE forward (the latter currently
-    /// errors with `UnsupportedMoe` pending phase-2-B routing
-    /// math).
+    /// dense forward and the MoE forward (routed-expert gating +
+    /// per-expert FFN).
     pub fn is_hybrid(&self) -> bool {
         self.hybrid_layers.is_some()
     }
@@ -6956,17 +6926,16 @@ impl LlamaModel {
             return;
         }
         let cfg = &self.cfg;
-        // Phase 2 of the qwen35moe roadmap binds hybrid tensors but
-        // does not implement the SSM forward kernel; bail with a
-        // clean panic message instead of silently producing garbage
-        // by routing through the dense forward path. Phase 3 lifts
-        // this guard.
+        // Hybrid (attention + SSM/DeltaNet) models run through
+        // `forward_one_hybrid`, not this dense path. Guard against a
+        // mis-dispatch: routing a hybrid here would run ZERO SSM layers
+        // and silently emit garbage, so fail loudly instead.
         assert!(
             !self.weights.is_hybrid(),
-            "hybrid attention+SSM forward (arch `{}`) not yet implemented \
-             — Phase 3 of the qwen35moe roadmap (see docs/qwen35moe-roadmap.md). \
-             Phase 2 binds all tensors; the model loaded successfully but \
-             cannot inference yet.",
+            "hybrid attention+SSM model (arch `{}`) reached the dense \
+             forward path — hybrids must route through the hybrid forward \
+             (`forward_one_hybrid` / `forward_prefill_hybrid_impl`). \
+             This is a dispatch bug.",
             cfg.arch
         );
         assert_eq!(embed_row.len(), cfg.d_model, "embed_row must be d_model long");
@@ -7095,15 +7064,15 @@ impl LlamaModel {
         }
         let cfg = &self.cfg;
         // Guard the dense forward against a mis-dispatched hybrid model
-        // (mirrors `forward_one_from_embed`): a hybrid model routed here
-        // would run ZERO layers and emit gibberish instead of failing
-        // loudly. Phase 3 of the qwen35moe roadmap lifts this.
+        // (mirrors `forward_one_from_embed`): hybrids run through
+        // `forward_one_hybrid`; routed here they would run ZERO layers
+        // and emit gibberish instead of failing loudly.
         assert!(
             !self.weights.is_hybrid(),
-            "hybrid attention+SSM forward (arch `{}`) not yet implemented \
-             — Phase 3 of the qwen35moe roadmap (see docs/qwen35moe-roadmap.md). \
-             Phase 2 binds all tensors; the model loaded successfully but \
-             cannot inference yet.",
+            "hybrid attention+SSM model (arch `{}`) reached the dense \
+             forward path — hybrids must route through the hybrid forward \
+             (`forward_one_hybrid` / `forward_prefill_hybrid_impl`). \
+             This is a dispatch bug.",
             cfg.arch
         );
         assert_eq!(logits_out.len(), cfg.vocab_size);
@@ -13936,14 +13905,13 @@ impl LlamaModel {
         // (mirrors `forward_one_from_embed`): hybrid models have their
         // own `forward_prefill_hybrid_impl`, and routing one through the
         // dense path here would run ZERO layers and emit gibberish
-        // instead of failing loudly. Phase 3 of the qwen35moe roadmap
-        // lifts this.
+        // instead of failing loudly.
         assert!(
             !self.weights.is_hybrid(),
-            "hybrid attention+SSM forward (arch `{}`) not yet implemented \
-             — Phase 3 of the qwen35moe roadmap (see docs/qwen35moe-roadmap.md). \
-             Phase 2 binds all tensors; the model loaded successfully but \
-             cannot inference yet.",
+            "hybrid attention+SSM model (arch `{}`) reached the dense \
+             forward path — hybrids must route through the hybrid forward \
+             (`forward_one_hybrid` / `forward_prefill_hybrid_impl`). \
+             This is a dispatch bug.",
             self.cfg.arch
         );
         // Opt-in batched path. Uses the new multi-query flash-prefill

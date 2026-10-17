@@ -6,7 +6,7 @@ REM CUDA-for-ARM; NO Intel oneAPI (SYCL is x86_64-only → kernels-sycl
 REM builds a no-op stub, so the binary runs on CPU + native CUDA).
 REM
 REM   scripts\build-linux-arm64-gpu-docker.bat            headless (server)
-REM   scripts\build-linux-arm64-gpu-docker.bat --gui      + Tauri GUI (arm64 webkit)
+REM   scripts\build-linux-arm64-gpu-docker.bat --gui      + native egui GUI (arm64)
 REM
 REM On an x86 host this uses buildx + QEMU to emulate aarch64 (SLOW — the
 REM whole workspace compiles under emulation). On a native ARM host it runs

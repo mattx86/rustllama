@@ -48,11 +48,10 @@ pub struct Config {
     /// ```
     #[serde(default)]
     pub system_prompts: Vec<SystemPrompt>,
-    /// Embedding-model configuration. v1.1 foundation surface — the
-    /// `/v1/embeddings` endpoint reads this to decide whether to
-    /// 501 with "no embedding model configured" or "configured but
-    /// not yet implemented" (BERT-family loader lands in a
-    /// follow-up turn). Both fields empty = embeddings disabled.
+    /// Embedding-model configuration. The `/v1/embeddings` endpoint reads
+    /// this to lazy-load a BERT-family GGUF (cached after first use) and
+    /// serve sentence embeddings; unconfigured (both fields empty) ⇒
+    /// embeddings disabled and the endpoint 501s.
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
     /// Reranker-model configuration. Backs `POST /v1/rerank` —
@@ -65,9 +64,9 @@ pub struct Config {
 }
 
 /// Embedding-model configuration. Mirrors `[model]` for chat
-/// models — mutually exclusive `path` / `hub` selectors. Loading
-/// is not yet implemented; the `/v1/embeddings` endpoint reads
-/// these to surface meaningful 501s.
+/// models — mutually exclusive `path` / `hub` selectors. The
+/// `/v1/embeddings` endpoint lazy-loads the configured GGUF (a
+/// BERT-family encoder) and caches it after the first request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct EmbeddingsConfig {
@@ -1524,14 +1523,12 @@ fn apply_env_overrides(cfg: &mut Config) {
 pub fn load_with_profile(path: &Path, profile: Option<&str>) -> Result<Config> {
     let mut cfg = load(path)?;
     if let Some(name) = profile {
-        if !name.is_empty() {
-            if !cfg.apply_profile(name) {
-                tracing::warn!(
-                    profile = name,
-                    available = ?cfg.profile_names(),
-                    "unknown profile name — leaving base config as-is"
-                );
-            }
+        if !name.is_empty() && !cfg.apply_profile(name) {
+            tracing::warn!(
+                profile = name,
+                available = ?cfg.profile_names(),
+                "unknown profile name — leaving base config as-is"
+            );
         }
     }
     Ok(cfg)
@@ -1547,13 +1544,10 @@ pub fn save(path: &Path, cfg: &Config) -> Result<()> {
 }
 
 pub fn validate(cfg: &Config) -> Result<()> {
-    match (cfg.model.path.as_ref(), cfg.model.hub.as_ref()) {
-        (Some(_), Some(_)) => {
-            return Err(ConfigError::Validation(
-                "[model] specify exactly one of `path` or `hub`, not both".into(),
-            ))
-        }
-        _ => {}
+    if let (Some(_), Some(_)) = (cfg.model.path.as_ref(), cfg.model.hub.as_ref()) {
+        return Err(ConfigError::Validation(
+            "[model] specify exactly one of `path` or `hub`, not both".into(),
+        ));
     }
     // `[embeddings]` and `[reranker]` mirror `[model]`'s mutually-exclusive
     // `path` / `hub` selectors — enforce the same rule so a config that sets

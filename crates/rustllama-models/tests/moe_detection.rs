@@ -1,16 +1,17 @@
-//! MoE phase-1 contract: detect MoE GGUFs at load time and surface a
-//! clear `LlamaLoadError::UnsupportedMoe` error instead of the cryptic
-//! "missing `ffn_gate.weight`" you'd otherwise see when the dense FFN
-//! load path runs against a MoE model.
-//!
-//! Phase 2 will land tensor binding + forward pass for MoE; this
-//! turn's contract is just: detect + reject cleanly.
+//! MoE (mixture-of-experts) load-path tests. MoE GGUFs are detected at
+//! load time, bind their router + expert tensors, and run the MoE
+//! forward pass through the regular `LlamaModel::load` entry point
+//! (phase 2-C landed full support). These tests pin the detection +
+//! tensor-binding contract: the config's `moe` field populates,
+//! `is_moe()` reflects the binding, per-expert tensor handles are
+//! sliced from the 3-D parent at load, and dense models stay on the
+//! dense `blocks` path.
 
 use rustllama_gguf::synth::{
     write_synthetic_llama_gguf, SynthHybrid, SynthLlama, SynthMoe,
 };
 use rustllama_gguf::Gguf;
-use rustllama_models::llama_arch::{LlamaLoadError, LlamaWeights};
+use rustllama_models::llama_arch::LlamaWeights;
 use rustllama_models::llama_config::LlamaConfig;
 
 fn synth_path(tag: &str) -> std::path::PathBuf {
@@ -169,26 +170,6 @@ fn moe_gguf_load_succeeds_phase_2c() {
         .expect("phase 2-C: MoE must load through the public entry point");
     assert!(model.weights.is_moe(), "loaded model must report is_moe");
     let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn unsupported_moe_error_variant_still_displays_for_future_use() {
-    // Phase 2-C removed the active `LlamaModel::load` rejection
-    // but the `LlamaLoadError::UnsupportedMoe` variant stays —
-    // future MoE-architecture variants we don't support can use
-    // the same error shape. Construct one directly and verify
-    // the Display format clients pattern-match on still works.
-    let err = LlamaLoadError::UnsupportedMoe {
-        arch: "future_moe_v2".into(),
-        n_experts: 64,
-        n_experts_used: 8,
-        shared_msg: ", 2 shared".into(),
-    };
-    let msg = err.to_string();
-    assert!(msg.contains("MoE"));
-    assert!(msg.contains("64 experts"));
-    assert!(msg.contains("top-8"));
-    assert!(msg.contains("2 shared"));
 }
 
 // ---- Phase 2-A: tensor binding succeeds via LlamaWeights::from_gguf ---------

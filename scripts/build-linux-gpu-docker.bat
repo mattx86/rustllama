@@ -6,13 +6,13 @@ REM GPU image (CUDA nvcc + Intel oneAPI icx), from Windows. Passes its
 REM arguments straight to scripts/build.sh, e.g.:
 REM
 REM   scripts\build-linux-gpu-docker.bat            headless, SYCL + CUDA
-REM   scripts\build-linux-gpu-docker.bat --gui      + Tauri desktop GUI
+REM   scripts\build-linux-gpu-docker.bat --gui      + native egui desktop GUI
 REM
 REM NOTE: this COMPILES both GPU backends; running them needs the physical
 REM GPU (an NVIDIA driver for CUDA, an Intel GPU + Level Zero for SYCL),
 REM which a Docker container on a non-GPU host does not have. Source is
-REM mounted read-write (tauri_build) and the GPU build artifacts use their
-REM own /target volume, separate from the CPU build's.
+REM mounted read-write and the GPU build artifacts use their own /target
+REM volume, separate from the CPU build's.
 
 set "BASE=rustllama-build-linux"
 set "IMG=rustllama-build-gpu"

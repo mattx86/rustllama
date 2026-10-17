@@ -15,7 +15,7 @@ REM
 REM GUI is the default artifact so a single binary serves the desktop GUI
 REM OR the CLI/server. The GUI is native egui/eframe (crates/rustllama-gui)
 REM — NOT Tauri/webkit — so there is NO JS frontend to prebuild (no pnpm, no
-REM app/ui). On Windows it links only winit + the OS OpenGL stack.
+REM JS build). On Windows it links only winit + the OS OpenGL stack.
 REM
 REM Because all backends are built in, this REQUIRES both GPU toolchains:
 REM Intel oneAPI (icx) and the CUDA Toolkit (nvcc, `winget install

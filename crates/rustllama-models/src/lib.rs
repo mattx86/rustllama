@@ -41,7 +41,9 @@ pub enum ModelArch {
     /// runs full attention instead — correct but ~2-4× slower at
     /// long contexts. The fused SWA forward pass is a v1.x follow-up.
     Llama,
-    /// MoE variants — placeholder for v2.
+    /// MoE (mixture-of-experts) Llama-family variants (Mixtral,
+    /// Qwen2/3-MoE, DeepSeek-V3-style). Routed-expert gating + per-expert
+    /// FFN; loaded and run through the same `LlamaModel` path as dense.
     LlamaMoe,
     Unknown(String),
 }

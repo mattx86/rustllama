@@ -360,8 +360,7 @@ fn update_ema_tok_s(slot: &std::sync::atomic::AtomicU64, stats: &RequestStats) {
     slot.store(next.to_bits(), Ordering::Relaxed);
 }
 
-/// If `RUSTLLAMA_SYCL_DISPATCH=1` (or the older alias
-/// `RUSTLLAMA_SYCL_RMSNORM=1`) is set, install a SYCL stream on the
+/// If `RUSTLLAMA_SYCL_DISPATCH=1` is set, install a SYCL stream on the
 /// current thread so the forward pass routes its SYCL-aware ops
 /// through the GPU (with CPU fallback per-call on `Unavailable` /
 /// shape rejection). Currently RMSNorm and SwiGLU consult the TLS
@@ -380,7 +379,7 @@ fn install_sycl_dispatch_if_requested() -> Option<rustllama_models::accel::SyclS
             .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
             .unwrap_or(false)
     };
-    if explicit_off("RUSTLLAMA_SYCL_DISPATCH") || explicit_off("RUSTLLAMA_SYCL_RMSNORM") {
+    if explicit_off("RUSTLLAMA_SYCL_DISPATCH") {
         tracing::info!("SYCL dispatch disabled via env var; CPU path only");
         return None;
     }
@@ -1360,9 +1359,9 @@ impl CpuEngine {
             tracing::warn!(
                 arch = %model.cfg.arch,
                 n_layers = model.cfg.n_layers,
-                "hybrid attention+DeltaNet model loaded — Phase 3.7b harness \
-                 will execute the forward but output is NOT validated against \
-                 reference. See docs/qwen35moe-roadmap.md Phases 4-8."
+                "hybrid attention+DeltaNet model loaded — the forward pass \
+                 executes (F32, decode-first) but its output has not yet been \
+                 validated against a reference implementation."
             );
         }
         let ctx = max_ctx.min(model.cfg.ctx_train.max(max_ctx));
@@ -10354,12 +10353,12 @@ fn forward_one_via_backend_hybrid(
             | KvBackend::PagedMxfp6 { .. }
             | KvBackend::PagedMxfp8 { .. }
             | KvBackend::PagedF16 { .. } => {
-                // Hybrid models don't yet route through the paged
-                // backend — Phase 3.7b only supports contiguous KV.
+                // Hybrid models don't route through the paged backend —
+                // the hybrid forward only supports contiguous KV.
                 panic!(
-                    "hybrid model + paged KV backend not yet supported — \
+                    "hybrid model + paged KV backend not supported — \
                      use [inference].kv_cache_layout = \"contiguous\" for \
-                     hybrid models (see docs/qwen35moe-roadmap.md)"
+                     hybrid models"
                 );
             }
         }

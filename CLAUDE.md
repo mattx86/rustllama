@@ -47,7 +47,6 @@ crates/                         (21-crate Cargo workspace)
   rustllama-cli                 the `rustllama` binary — all subcommands
 app/
   desktop/                      the `rustllama` binary — CLI/GUI dispatcher; embeds the server + native egui GUI
-  ui/                           legacy React frontend (pnpm) — unused by the native egui GUI; slated for removal
 scripts/                        build + release wrappers (see below)
 docs/                           architecture.md, quant-formats.md, sycl-offload.md, ...
 xtask/                          workspace automation

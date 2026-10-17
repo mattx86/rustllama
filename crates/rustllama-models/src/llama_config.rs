@@ -39,11 +39,9 @@ pub struct LlamaConfig {
     /// FFN tensors (`ffn_gate.weight`/`ffn_up.weight`/`ffn_down.weight`)
     /// and MoE expert tensors (`ffn_gate_inp.weight` router +
     /// `ffn_gate_exps.weight`/`ffn_up_exps.weight`/`ffn_down_exps.weight`).
-    /// MoE forward pass is a follow-up turn — load succeeds for
-    /// inspection (`/v1/models` / GGUF inspector) but the engine
-    /// fails fast with `LlamaLoadError::UnsupportedMoe` at first
-    /// inference attempt so users get a clear "MoE not yet
-    /// implemented" message rather than a cryptic shape mismatch.
+    /// MoE models load and run through the regular `LlamaModel::load`
+    /// entry point: routed-expert gating + per-expert FFN (optionally
+    /// with shared experts) execute the forward pass directly.
     pub moe: Option<MoeConfig>,
     /// Multi-head Latent Attention (MLA) configuration for
     /// DeepSeek-V2/V3 (`deepseek2` arch). `Some` when the GGUF declares

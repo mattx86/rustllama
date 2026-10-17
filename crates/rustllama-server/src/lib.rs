@@ -4412,9 +4412,9 @@ struct MetricsSnapshot {
     #[serde(default)]
     paged_free_pages: u32,
     /// Active slots in a fused-decode engine. `0` on `CpuEngine`
-    /// (single-flight per engine; concurrency via forks); usable
-    /// only on `PagedBatchEngine`. V1 placeholder always reports
-    /// `0` — driver-thread shared-counter wire-up is a follow-up.
+    /// (single-flight per engine; concurrency via forks); on
+    /// `PagedBatchEngine` this is the live in-flight-slot count read
+    /// from the driver thread (surfaced on the GUI Status page).
     #[serde(default)]
     paged_active_slots: u32,
     /// Cumulative-since-startup counters from the engine. `None`

@@ -695,9 +695,9 @@ impl Sysman {
         // hard error.
         if init_code != ZE_RESULT_SUCCESS {
             if init_code == ZE_RESULT_ERROR_UNSUPPORTED_FEATURE {
-                return Err(L0Error::Unavailable(format!(
-                    "zesInit returned UNSUPPORTED_FEATURE (driver doesn't expose Sysman)"
-                )));
+                return Err(L0Error::Unavailable(
+                    "zesInit returned UNSUPPORTED_FEATURE (driver doesn't expose Sysman)".into(),
+                ));
             }
             return Err(L0Error::Call {
                 call: "zesInit",

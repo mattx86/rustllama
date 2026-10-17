@@ -60,7 +60,7 @@ impl MultimodalMessage {
     /// The server accepts both shapes (see `rustllama-server`'s
     /// `OpenAiContent` untagged enum); the image blocks lead so a
     /// vision-aware engine splices projected features before the prompt text,
-    /// matching the web client (`app/ui/src/api.ts` `streamChat`).
+    /// matching the web client (`the retired web client's api.ts` `streamChat`).
     pub fn to_json(&self) -> serde_json::Value {
         if self.images.is_empty() {
             serde_json::json!({ "role": self.role, "content": self.content })
@@ -92,7 +92,7 @@ pub struct ChatRequest {
     pub repeat_penalty: Option<f32>,
     /// Fixed RNG seed for reproducible sampling. `None` → the server picks a
     /// fresh seed each request. Mirrors the web client's `seed` field (see
-    /// `app/ui/src/api.ts` `streamChat`), which the native GUI's sampling
+    /// `the retired web client's api.ts` `streamChat`), which the native GUI's sampling
     /// panel now sets too.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
@@ -324,7 +324,7 @@ pub struct LoadModelParams {
 
 // --- Model-management + status wire types (Ollama /api/* + /v1/metrics) ----
 // Consumed by the native GUI's Models view + status bar. Field sets mirror the
-// web UI's `api.ts` (see `app/ui/src/api.ts`); every field is lenient
+// web UI's `api.ts` (see `the retired web client's api.ts`); every field is lenient
 // (`#[serde(default)]`) so a slimmer/older server response still deserializes.
 
 /// One cached GGUF on disk, from `GET /api/tags` (`{ models: [...] }`).
@@ -476,7 +476,7 @@ pub struct PullProgress {
 // context budget for the token counter when `/v1/metrics.ctx_size` is 0). The
 // full `Config` is much larger; we pin only these fields and leave the rest
 // unread. Every field is `#[serde(default)]` so a slimmer/older server body
-// still deserializes. Mirrors `app/ui/src/api.ts` `ConfigEnvelope`/`AppConfig`.
+// still deserializes. Mirrors `the retired web client's api.ts` `ConfigEnvelope`/`AppConfig`.
 
 /// The `{ config, config_path, hot_apply }` envelope `GET /v1/config` returns.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -506,7 +506,7 @@ pub struct InferenceConfig {
 /// One `[[system_prompts]]` entry. The chat prepends the chosen prompt's
 /// `body` as a leading `role:"system"` message; `default_for_model` auto-picks
 /// it when the named model is the active one. The server serializes the text
-/// under `body` (matches `app/ui`'s `SystemPrompt.body`); `content` is accepted
+/// under `body` (matches the retired web client's `SystemPrompt.body`); `content` is accepted
 /// as an alias in case a future server renames it.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SystemPrompt {
@@ -534,7 +534,7 @@ pub struct TokenizeResult {
 // --- Phase-4 Settings/Status wire types (config write, capabilities, tuner) --
 // Consumed by the native GUI's Settings + Status views. As with the types
 // above, every field is `#[serde(default)]` so a slimmer / older server body
-// still deserializes. Mirrors `app/ui/src/api.ts`
+// still deserializes. Mirrors `the retired web client's api.ts`
 // (Capabilities / BackendsSnapshot / TuningSummary / TuneProgress).
 
 /// `GET /v1/capabilities` (the subset the Status "Backends" panel reads): the
@@ -769,7 +769,7 @@ pub enum ChatEvent {
 }
 
 // --- Typed decisions (/v1/decide/*) ----------------------------------------
-// Consumed by the native GUI's Decide view. Mirrors `app/ui/src/api.ts`
+// Consumed by the native GUI's Decide view. Mirrors `the retired web client's api.ts`
 // `DecideResult`. Lenient (`#[serde(default)]`) so the choice / score /
 // boolean response shapes — which differ in which fields are present — all
 // deserialize into this one struct.

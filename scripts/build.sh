@@ -14,7 +14,7 @@
 # GUI is the default artifact so users can launch the desktop GUI OR use
 # the CLI/server from the same binary. The GUI is native egui/eframe
 # (crates/rustllama-gui) — NOT Tauri/webkit — so there is NO JS frontend to
-# prebuild (no pnpm, no app/ui/dist). It links a small OpenGL + windowing
+# prebuild (no pnpm, no JS build). It links a small OpenGL + windowing
 # graph instead: mesa GL/EGL, X11 + Wayland client libs, libxkbcommon,
 # fontconfig/freetype, and D-Bus (rfd file dialogs) — all present in the
 # build image.

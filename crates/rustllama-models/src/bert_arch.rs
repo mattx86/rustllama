@@ -1,8 +1,7 @@
-//! BERT-family architecture parsing + loading. v1.1 foundation:
-//! this module reads BERT GGUF metadata + extracts tensor references
-//! into a typed [`BertWeights`]. The forward pass + pooling are a
-//! follow-up turn; [`BertModel::forward_embed`] today returns
-//! `NotImplemented` so the loader contract is testable end-to-end.
+//! BERT-family architecture parsing + loading. This module reads BERT
+//! GGUF metadata, binds tensors into a typed [`BertWeights`], and runs
+//! the encoder forward pass + pooling ([`BertModel::forward_embed`]) to
+//! produce sentence embeddings for the `/v1/embeddings` endpoint.
 //!
 //! BERT differs from the Llama family in ways that matter for the
 //! architecture parsing:
