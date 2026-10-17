@@ -570,6 +570,27 @@ pub struct InferenceConfig {
     /// verify compute on a miss. Ignored when `speculative_ngram = false`.
     #[serde(default = "default_ngram_n_draft")]
     pub ngram_n_draft: u32,
+    /// F10 — lookahead / Jacobi decoding. Default `false`. When `true`,
+    /// grammar-free requests route through the lookahead (n-gram-pool)
+    /// speculative driver: an n-gram pool harvested from the realized
+    /// history is walked for a Jacobi window of guess tokens, verified in
+    /// one batched forward per round via the SAME accept/reject the n-gram
+    /// path uses (so greedy output is token-for-token identical to classic
+    /// greedy). The chained pool-walk reaches deeper than the single-match
+    /// n-gram drafter on loops / structured output. Takes precedence over
+    /// `speculative_ngram` (`… > MTP > lookahead > n-gram`); the spec
+    /// autotune can pick among them per model. Same raw-softmax caveat.
+    #[serde(default)]
+    pub speculative_lookahead: bool,
+    /// N-gram order of the lookahead pool (keys on the trailing
+    /// `lookahead_ngram - 1` tokens). Default 3. Ignored when
+    /// `speculative_lookahead = false`.
+    #[serde(default = "default_lookahead_ngram")]
+    pub lookahead_ngram: u32,
+    /// Jacobi window: max guess tokens the lookahead drafter proposes per
+    /// round. Default 5. Ignored when `speculative_lookahead = false`.
+    #[serde(default = "default_lookahead_window")]
+    pub lookahead_window: u32,
     /// Optional draft model GGUF for two-model speculative decoding.
     /// The draft must share the target's tokenizer EXACTLY (vocab
     /// size + special ids — verified at load, refused otherwise).
@@ -832,6 +853,14 @@ fn default_ngram_n_draft() -> u32 {
     4
 }
 
+fn default_lookahead_ngram() -> u32 {
+    3
+}
+
+fn default_lookahead_window() -> u32 {
+    5
+}
+
 impl InferenceConfig {
     /// Resolve the per-channel K and V dtype strings. `k_dtype` /
     /// `v_dtype` override `kv_dtype` when explicitly set; otherwise
@@ -1005,6 +1034,9 @@ impl Default for InferenceConfig {
             speculative_draft_k: default_speculative_draft_k(),
             ngram_n_match: 3,
             ngram_n_draft: 4,
+            speculative_lookahead: false,
+            lookahead_ngram: 3,
+            lookahead_window: 5,
             moe_expert_cache_mb: 0,
             zerocopy_weights: false,
             lock_ram_mb: default_lock_ram_mb(),

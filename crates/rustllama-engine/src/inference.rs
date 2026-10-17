@@ -21,7 +21,7 @@ use crate::prefix_cache::PrefixCachePool;
 use crate::sampling::{compute_logprobs, Rng, Sampler};
 use crate::speculative::{
     accept_reject, accept_reject_dispatch, accept_reject_greedy, AcceptMode, DraftToken,
-    MtpDrafter, NgramDrafter, NgramDrafterConfig,
+    LookaheadDrafter, LookaheadDrafterConfig, MtpDrafter, NgramDrafter, NgramDrafterConfig,
 };
 use crate::{
     ChatMessage, Engine, GrammarKind, Metrics, RequestStats, Result as EngineResult,
@@ -93,6 +93,20 @@ pub struct CpuEngine {
     /// a pure win on repetitive / code-like outputs and a no-op (one
     /// token per round, same as classic decode) when nothing matches.
     ngram_spec: Option<NgramDrafterConfig>,
+    /// F10 — lookahead / Jacobi decoding. When `Some`, grammar-free text
+    /// generation routes through the lookahead (n-gram-pool) speculative
+    /// driver ([`Self::speculate_lookahead_stream_from_ids`]) instead of
+    /// the classic single-token path. `None` (default) keeps classic
+    /// decode, so leaving it off is byte-identical. Set at load time from
+    /// `[inference].speculative_lookahead` via
+    /// [`Self::set_lookahead_speculative`]; forks inherit the parent's
+    /// setting. Like the n-gram drafter it needs no second model — it
+    /// harvests an n-gram pool from the realized history and walks it for a
+    /// Jacobi window of guess tokens — but the chained pool-walk reaches
+    /// deeper on loops / structured output. Placed just ABOVE `ngram_spec`
+    /// in dispatch precedence (`eagle > tree > MTP > lookahead > n-gram`),
+    /// so the spec autotune can pick lookahead over plain n-gram per model.
+    lookahead_spec: Option<LookaheadDrafterConfig>,
     /// When `Some((draft, k))`, grammar-free text generation routes
     /// through [`Engine::speculate`] with the paired draft engine and
     /// `k` candidates per round. Takes precedence over `ngram_spec`.
@@ -1254,24 +1268,57 @@ impl CpuEngine {
             );
         }
         let gguf = Gguf::open(path)?;
-        // Detect Mamba / SSM checkpoints up front. The forward
-        // path is implemented in `rustllama-models::mamba_arch`
-        // but the engine's `CpuEngine` is transformer-shaped (KV
-        // cache, attention-style dispatch); a dedicated
-        // `MambaEngine` lives behind a follow-up turn. For now we
-        // load and exercise via the lib's `MambaModel::forward_one`
-        // tests, but refuse `CpuEngine::load` so the user gets a
-        // clear "load via library API, not via CpuEngine" message
-        // rather than a silent KV-cache mismatch.
+        // F9 — pure Mamba / SSM routing.
+        //
+        // A PURE-recurrent model (all SSM layers, NO attention) that uses the
+        // DeltaNet/gated-delta-rule tensor layout the hybrid forward already
+        // runs (`attn_qkv` / `ssm_conv1d` / `ssm_alpha` / `ssm_beta` / `ssm_a`
+        // / `ssm_norm` / `ssm_out`, selected by `full_attention_interval`) is
+        // just [`LlamaModel::forward_one_hybrid`] with zero full-attention
+        // layers — it loads + runs through the hybrid path below (its KV cache
+        // is all zero-length placeholders; the recurrent `DeltaNetCache` IS the
+        // cache). Those models are NOT `MambaConfig::detect`-matched (that keys
+        // on the `mamba`/`mamba2`/`jamba`/`falcon-mamba` arch names), so they
+        // already fall straight through to `LlamaModel::load`.
+        //
+        // What `MambaConfig::detect` DOES catch is a CANONICAL Mamba-1/2
+        // checkpoint: the selective-scan recurrence (`in_proj`/`x_proj`/
+        // `dt_proj`/`A_log`/`D`/`conv1d`/`out_proj`, `s ← exp(dt·A)·s + dt·B·x`,
+        // SiLU(z) gate). `forward_one_hybrid` does NOT implement that scan — a
+        // different parameterization AND a different tensor set — so routing a
+        // canonical Mamba checkpoint through it would silently produce WRONG
+        // output. Refuse those precisely (fail-closed) and point at the correct,
+        // tested CPU forward in the library (`MambaModel::forward_one`). The one
+        // exception: a `mamba`-named GGUF that ALSO declares the hybrid DeltaNet
+        // layout (`full_attention_interval` + `blk.0.ssm_conv1d.weight`) is the
+        // supported recurrence under a mamba-ish arch name — let it through to
+        // the hybrid path rather than refuse.
         if let Some(arch) = rustllama_models::mamba_arch::MambaConfig::detect(&gguf) {
-            return Err(CpuEngineError::Other(format!(
-                "Mamba / SSM architecture detected ({arch}); CPU forward pass \
-                 implemented in `rustllama_models::mamba_arch::MambaModel`, but \
-                 not yet wired into `CpuEngine` (which assumes a KV-cache-based \
-                 transformer). The library forward pass works — call \
-                 `MambaModel::load` + `forward_one` directly, or wait for the \
-                 follow-up turn that adds `MambaEngine`."
-            )));
+            let hybrid_delta_layout = gguf
+                .metadata_get(&format!("{arch}.full_attention_interval"))
+                .is_some()
+                && gguf.tensor("blk.0.ssm_conv1d.weight").is_some();
+            if !hybrid_delta_layout {
+                return Err(CpuEngineError::Other(format!(
+                    "canonical Mamba / SSM selective-scan architecture detected \
+                     ({arch}): the hybrid forward (`forward_one_hybrid`) \
+                     implements the gated-delta-rule recurrence \
+                     (attn_qkv/ssm_conv1d/ssm_alpha/ssm_beta), NOT Mamba's \
+                     selective scan (in_proj/x_proj/dt_proj/A_log/D). Refusing \
+                     rather than producing wrong output. The correct CPU forward \
+                     IS implemented — call \
+                     `rustllama_models::mamba_arch::MambaModel::load` + \
+                     `forward_one` via the library API; a dedicated selective-scan \
+                     engine that wires it into `CpuEngine`'s generation loop is \
+                     the follow-up."
+                )));
+            }
+            tracing::info!(
+                arch = %arch,
+                "Mamba-named GGUF carries the hybrid DeltaNet layout \
+                 (full_attention_interval + ssm_conv1d) — routing through the \
+                 pure-SSM hybrid forward (F9)"
+            );
         }
         let mut model = LlamaModel::load(&gguf)?;
         // P11: merge a LoRA adapter at load (Phase 1). F32/F16 base
@@ -1890,6 +1937,7 @@ impl CpuEngine {
             image_token_id: None,
             placeholder_mode: None,
             ngram_spec: None,
+            lookahead_spec: None,
             draft_spec: None,
             mtp_spec: false,
             tree_spec: None,
@@ -2524,6 +2572,7 @@ impl CpuEngine {
             image_token_id: None,
             placeholder_mode: None,
             ngram_spec: None,
+            lookahead_spec: None,
             draft_spec: None,
             mtp_spec: false,
             tree_spec: None,
@@ -2689,6 +2738,7 @@ impl CpuEngine {
             image_token_id: None,
             placeholder_mode: None,
             ngram_spec: None,
+            lookahead_spec: None,
             draft_spec: None,
             mtp_spec: false,
             tree_spec: None,
@@ -3684,6 +3734,22 @@ impl CpuEngine {
         self.ngram_spec
     }
 
+    /// F10 — enable / disable lookahead (Jacobi n-gram-pool) speculative
+    /// decoding for this engine's text-generation path. `None` (default)
+    /// keeps the classic single-token decode (byte-identical). When `Some`,
+    /// grammar-free `chat` / `generate` route through
+    /// [`Self::speculate_lookahead_stream_from_ids`], which harvests an
+    /// n-gram pool from the realized history and walks it for a Jacobi
+    /// window of guess tokens, verified in one batched forward per round via
+    /// the SAME accept/reject the n-gram path uses. No second model required.
+    pub fn set_lookahead_speculative(&mut self, cfg: Option<LookaheadDrafterConfig>) {
+        self.lookahead_spec = cfg;
+    }
+
+    pub fn lookahead_speculative(&self) -> Option<LookaheadDrafterConfig> {
+        self.lookahead_spec
+    }
+
     /// Enable / disable MTP / NextN self-speculative decoding for this
     /// engine's text-generation path. `false` (default) keeps the
     /// classic single-token decode. When `true` AND the loaded model is
@@ -4177,6 +4243,7 @@ impl CpuEngine {
             placeholder_mode: self.placeholder_mode,
             // Forks inherit the parent's speculative setting (Copy).
             ngram_spec: self.ngram_spec,
+            lookahead_spec: self.lookahead_spec,
             draft_spec: self.draft_spec.clone(),
             // MTP self-speculation is a plain Copy bool; forks inherit it.
             mtp_spec: self.mtp_spec,
@@ -7579,6 +7646,14 @@ impl Engine for CpuEngine {
             }
             mtp_fallback_log_once();
         }
+        // F10 — lookahead (Jacobi n-gram-pool) spec: just above plain n-gram
+        // (`… > MTP > lookahead > n-gram`). Grammar-free only, same raw-softmax
+        // caveat as the other spec paths.
+        if let Some(cfg) = self.lookahead_spec {
+            if s.grammar.is_none() && allow_spec {
+                return self.speculate_lookahead_stream(prompt, cfg, s.clone());
+            }
+        }
         if let Some(cfg) = self.ngram_spec {
             if s.grammar.is_none() && allow_spec {
                 return self.speculate_ngram_stream(prompt, cfg, s.clone());
@@ -7609,6 +7684,12 @@ impl Engine for CpuEngine {
                 return self.speculate_mtp_stream(prompt.to_string(), s.clone(), None);
             }
             mtp_fallback_log_once();
+        }
+        // F10 — lookahead spec, just above plain n-gram (see `generate_stream`).
+        if let Some(cfg) = self.lookahead_spec {
+            if s.grammar.is_none() && allow_spec {
+                return self.speculate_lookahead_stream(prompt.to_string(), cfg, s.clone());
+            }
         }
         if let Some(cfg) = self.ngram_spec {
             if s.grammar.is_none() && allow_spec {
@@ -8235,6 +8316,222 @@ impl CpuEngine {
                 }
                 // Extend history with the committed tokens so the next
                 // round's drafter + verify see the full prefix.
+                current_prompt_ids.extend(committed.iter().map(|&id| id as i32));
+            }
+        };
+        Ok(Box::pin(stream))
+    }
+
+    /// F10 — text entry for lookahead (Jacobi n-gram-pool) speculation.
+    /// Tokenizes `prompt` (BOS policy) and forwards to
+    /// [`Self::speculate_lookahead_stream_from_ids`]. Mirrors
+    /// [`Self::speculate_ngram_stream`].
+    pub fn speculate_lookahead_stream(
+        &self,
+        prompt: String,
+        cfg: LookaheadDrafterConfig,
+        s: SamplingParams,
+    ) -> EngineResult<TokenStream> {
+        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
+            crate::EngineError::Unimplemented("speculate_lookahead requires a tokenizer")
+        })?;
+        let add_bos = tokenizer.add_bos_token();
+        let initial_prompt_ids: Vec<i32> = tokenizer
+            .encode(&prompt, add_bos)?
+            .into_iter()
+            .map(|t| t as i32)
+            .collect();
+        self.speculate_lookahead_stream_from_ids(initial_prompt_ids, cfg, s)
+    }
+
+    /// F10 — ID-level lookahead / Jacobi speculative-decode driver.
+    ///
+    /// Structurally identical to [`Self::speculate_ngram_stream_from_ids`]
+    /// (same async stream, per-round verify on the persistent SYCL worker,
+    /// same stop / EOS / max-token / stats handling) and REUSES the exact
+    /// same verify + accept primitive ([`verify_and_commit_speculation`] →
+    /// [`crate::speculative::accept_reject`]). The only difference is the
+    /// drafter: a [`LookaheadDrafter`] harvests an n-gram pool from the
+    /// running history and walks it for a Jacobi window of guess tokens
+    /// (vs. the n-gram drafter's single-match literal run). Because the
+    /// verify/accept is shared, greedy decode is token-for-token identical
+    /// to classic greedy — lookahead only ever accepts more per round.
+    ///
+    /// Same raw-softmax sampling caveat as the n-gram path (callers route
+    /// here only for grammar-free requests).
+    pub fn speculate_lookahead_stream_from_ids(
+        &self,
+        initial_prompt_ids: Vec<i32>,
+        cfg: LookaheadDrafterConfig,
+        s: SamplingParams,
+    ) -> EngineResult<TokenStream> {
+        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
+            crate::EngineError::Unimplemented("speculate_lookahead requires a tokenizer")
+        })?;
+        if initial_prompt_ids.is_empty() {
+            let stream = async_stream::stream! {
+                if false { yield Ok(Token { id: 0, text: String::new(), logprobs: None }); }
+            };
+            return Ok(Box::pin(stream));
+        }
+
+        let drafter = LookaheadDrafter::new(cfg);
+        // The Jacobi window bounds the committed-token overshoot per round.
+        let candidate_cap = cfg.window.max(1);
+        let seed = s.seed;
+        let max_tokens = s.max_tokens as usize;
+        let model_eos = self.model.cfg.eos_token_id;
+        let stop_strings = s.stop.clone();
+        let greedy_spec = s.temperature <= 0.0;
+        let typical = if s.spec_typical_accept {
+            Some((s.spec_typical_epsilon, s.spec_typical_delta))
+        } else {
+            None
+        };
+        let repeat_pen = s.repeat_penalty;
+        let freq_pen = s.frequency_penalty;
+        let pres_pen = s.presence_penalty;
+
+        let model = self.model.clone();
+        let state = self.state.clone();
+        let prefix_cache = self.prefix_cache;
+        let prefill_chunk_size = self.prefill_chunk_size;
+        let max_ctx = self.max_ctx;
+        let cumulative_stats = self.cumulative_stats.clone();
+        let last_stats = self.last_stats.clone();
+        let ema_tok_s_bits = Arc::clone(&self.ema_tok_s_bits);
+        let worker = self.sycl_worker.submitter();
+        let flash_attention = self.flash_attention;
+        let n_gpu_layers = self.n_gpu_layers;
+        let cpu_force_patterns = self.cpu_force_patterns.clone();
+
+        let stream = async_stream::stream! {
+            let mut rng_slot = Some(Rng::from_seed(seed));
+            let mut current_prompt_ids: Vec<i32> = initial_prompt_ids;
+            let mut total_emitted: usize = 0;
+            let mut emitted_text = String::new();
+            let mut utf8 = Utf8Stream::default();
+            let decode_start = std::time::Instant::now();
+
+            // Install this request's dispatch state on the worker thread +
+            // ensure the USM context exists (mirrors the n-gram driver so a
+            // GPU host doesn't fall to 100% CPU dispatch). Idempotent.
+            {
+                let model_install = model.clone();
+                let flash = flash_attention;
+                let ngl = n_gpu_layers;
+                let cpu_force = cpu_force_patterns.clone();
+                let _ = worker
+                    .run_blocking(move || {
+                        rustllama_models::accel::set_flash_attention(flash);
+                        rustllama_models::accel::set_n_gpu_layers(ngl);
+                        rustllama_models::accel::set_cpu_force_patterns(cpu_force);
+                        let cfg = &model_install.cfg;
+                        let head_dim = if cfg.head_dim > 0 {
+                            cfg.head_dim
+                        } else {
+                            cfg.d_model / cfg.n_heads.max(1)
+                        };
+                        let _ = rustllama_models::accel::prepare_usm_context(
+                            cfg.n_layers as u32,
+                            cfg.n_heads as u32,
+                            cfg.n_kv_heads as u32,
+                            head_dim as u32,
+                            max_ctx as u32,
+                        );
+                    })
+                    .await;
+            }
+
+            loop {
+                if total_emitted >= max_tokens {
+                    return;
+                }
+                let remaining = max_tokens.saturating_sub(total_emitted);
+
+                // ---- Step 1: lookahead drafter proposes a Jacobi guess ----
+                let hist_u32: Vec<u32> =
+                    current_prompt_ids.iter().map(|&t| t as u32).collect();
+                let mut drafts = drafter.propose(&hist_u32);
+                let round_cap = candidate_cap.min(remaining.saturating_sub(1));
+                if drafts.len() > round_cap {
+                    drafts.truncate(round_cap);
+                }
+                // ---- Step 2+3: verify + accept + COMMIT (shared primitive) ----
+                let prompt_ids_for_verify = current_prompt_ids.clone();
+                let drafts_for_verify = drafts.clone();
+                let model_c = model.clone();
+                let state_c = state.clone();
+                let mut rng_c = rng_slot.take().expect("rng slot");
+                let joined = worker
+                    .run_blocking(move || {
+                        let out = verify_and_commit_speculation(
+                            model_c, state_c, prefix_cache, prefill_chunk_size, max_ctx,
+                            &prompt_ids_for_verify, &drafts_for_verify, greedy_spec,
+                            typical, &mut rng_c, repeat_pen, freq_pen, pres_pen,
+                        );
+                        (out, rng_c)
+                    })
+                    .await;
+                let outcome = match joined {
+                    Ok((Ok(o), r)) => {
+                        rng_slot = Some(r);
+                        o
+                    }
+                    Ok((Err(e), r)) => {
+                        rng_slot = Some(r);
+                        let _ = &rng_slot;
+                        yield Err(crate::EngineError::Engine(format!(
+                            "verify_speculation (lookahead): {e}"
+                        )));
+                        return;
+                    }
+                    Err(recv_err) => {
+                        yield Err(crate::EngineError::Engine(format!(
+                            "verify worker recv: {recv_err}"
+                        )));
+                        return;
+                    }
+                };
+                cumulative_stats
+                    .add_speculation(drafts.len() as u64, outcome.accepted.len() as u64);
+                let mut committed: Vec<u32> = outcome.accepted;
+                committed.push(outcome.replacement);
+
+                // ---- Step 4: emit committed; check stop/EOS/max ----
+                for &id in &committed {
+                    let text = utf8.next_text(id, |ids| {
+                        tokenizer.decode(ids, true).unwrap_or_default()
+                    });
+                    emitted_text.push_str(&text);
+                    let hit_stop = stop_strings
+                        .iter()
+                        .any(|st| !st.is_empty() && emitted_text.contains(st.as_str()));
+                    yield Ok(Token { id, text, logprobs: None });
+                    total_emitted += 1;
+                    {
+                        let elapsed_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+                        let s = RequestStats {
+                            prefill_ms: 0.0,
+                            decode_ms: elapsed_ms,
+                            tokens_prefilled: 0,
+                            cache_hit_tokens: 0,
+                            tokens_generated: total_emitted as u32,
+                            tool_call_limit_hit: false,
+                        };
+                        update_ema_tok_s(&ema_tok_s_bits, &s);
+                        *last_stats.lock().expect("last_stats") = s;
+                    }
+                    if hit_stop {
+                        return;
+                    }
+                    if Some(id) == model_eos {
+                        return;
+                    }
+                    if total_emitted >= max_tokens {
+                        return;
+                    }
+                }
                 current_prompt_ids.extend(committed.iter().map(|&id| id as i32));
             }
         };

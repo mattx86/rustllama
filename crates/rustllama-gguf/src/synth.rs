@@ -330,6 +330,32 @@ pub struct SynthHybrid {
     pub nextn_predict_layers: u32,
 }
 
+impl SynthHybrid {
+    /// F9 — a PURE-SSM hybrid (zero full-attention layers). Setting
+    /// `full_attention_interval` one past the last layer makes `(i+1) %
+    /// interval` never 0, so no layer is stamped full-attention and no layer
+    /// emits `attn_q.weight`; the writer emits the SSM/DeltaNet tensor set on
+    /// EVERY layer. The resulting GGUF loads + runs through
+    /// [`crate`]'s hybrid forward (`forward_one_hybrid`) with an all-
+    /// placeholder KV cache — the recurrent DeltaNet state is the only cache,
+    /// i.e. a pure Mamba/SSM model expressed as the hybrid forward with zero
+    /// attention. Pair with a `SynthLlama` whose `head_dim` divides both
+    /// `ssm_inner_size` and `d_model` (e.g. the F8/F9 fixture shape d_model=32,
+    /// head_dim=8, ssm_inner_size=32).
+    pub fn pure_ssm(n_layers: u32, ssm_inner_size: u32) -> Self {
+        Self {
+            full_attention_interval: n_layers + 1,
+            ssm_state_size: 8,
+            ssm_conv_kernel: 4,
+            ssm_group_count: 1,
+            ssm_time_step_rank: 2,
+            ssm_inner_size,
+            shared_expert_feed_forward_length: None,
+            nextn_predict_layers: 0,
+        }
+    }
+}
+
 impl Default for SynthLlama {
     fn default() -> Self {
         Self {

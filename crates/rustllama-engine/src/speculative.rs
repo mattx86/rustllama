@@ -1148,6 +1148,154 @@ impl NgramDrafter {
 }
 
 // ============================================================
+// F10 — Lookahead / Jacobi decoding (n-gram-pool drafter)
+// ============================================================
+//
+// Lookahead decoding (Fu et al., 2024, "Break the Sequential Dependency
+// of LLM Inference Using Lookahead Decoding") is a draft-model-FREE
+// speculative method. It maintains an n-gram POOL harvested from the
+// realized generation history and, each step, walks the pool from the
+// trailing context to assemble a Jacobi window of guess tokens. The
+// target verifies the whole guess in ONE batched forward via the SAME
+// accept/reject the rest of the stack uses ([`accept_reject`] /
+// [`accept_reject_greedy`]), so — like every drafter here — it only ever
+// SPEEDS UP decode and never changes the committed tokens (the
+// chain-parity guarantee: greedy-with-lookahead ≡ plain greedy, pinned
+// by `lookahead_chain_parity_greedy`).
+//
+// Relation to [`NgramDrafter`]: the n-gram drafter proposes the literal
+// run that followed a SINGLE earlier match of the trailing window. The
+// lookahead pool instead maps every `(ngram - 1)`-length key to the
+// recency-ordered set of tokens that followed it, and the proposal
+// CHAINS pool lookups — propose `t1` for the current key, shift the key
+// by `t1`, propose `t2`, … — stitching a guess across DIFFERENT
+// historical continuations. That pool-walk is the Jacobi window and is
+// what gives lookahead its reach on loops / structured output.
+//
+// DETERMINISM: newest-observed-wins at every hop, a `BTreeMap`-backed
+// pool (hasher-seed-independent order), and no RNG — so it is
+// seed-reproducible by construction, exactly like the rest of the spec
+// stack. The drafter is STATELESS over the full history (the history IS
+// the realized output), so it is a drop-in for `NgramDrafter::propose`
+// and the engine driver reuses the n-gram driver's verify/commit path.
+
+/// Configuration knobs for [`LookaheadDrafter`].
+#[derive(Debug, Clone, Copy)]
+pub struct LookaheadDrafterConfig {
+    /// N-gram order of the pool. The pool keys on the trailing
+    /// `ngram - 1` tokens; the value is the token(s) observed to follow
+    /// that key. Must be `>= 2` (a 1-gram has an empty key → no lookup).
+    /// Default `3`.
+    pub ngram: usize,
+    /// Jacobi window: the maximum guess length proposed per round. The
+    /// pool-walk stops here even if the chain could continue. Default `5`
+    /// — a touch longer than the n-gram drafter's `n_draft` since the
+    /// chained walk tends to accept deeper on repetitive output.
+    pub window: usize,
+    /// Draft probability attached to each proposed token for the
+    /// `p / q` acceptance ratio in [`accept_reject`]. Same role + default
+    /// as [`NgramDrafterConfig::q`]: `0.5` accepts confidently when the
+    /// target agrees and rejects cleanly when it does not.
+    pub q: f32,
+}
+
+impl Default for LookaheadDrafterConfig {
+    fn default() -> Self {
+        Self {
+            ngram: 3,
+            window: 5,
+            q: 0.5,
+        }
+    }
+}
+
+/// Lookahead / Jacobi n-gram-pool drafter (see the module section above).
+///
+/// Build the pool from the running token history and walk it from the
+/// trailing `(ngram - 1)`-token key, chaining lookups to assemble up to
+/// `window` guess tokens. Returns an empty `Vec` when the history is too
+/// short or no pool entry matches the trailing key — the caller then
+/// degrades to a single-token decode (K=0 ⇒ `accept_reject` returns the
+/// lone bonus), exactly like [`NgramDrafter`].
+#[derive(Debug, Clone)]
+pub struct LookaheadDrafter {
+    cfg: LookaheadDrafterConfig,
+}
+
+impl LookaheadDrafter {
+    pub fn new(cfg: LookaheadDrafterConfig) -> Self {
+        Self { cfg }
+    }
+
+    pub fn with_defaults() -> Self {
+        Self::new(LookaheadDrafterConfig::default())
+    }
+
+    pub fn config(&self) -> LookaheadDrafterConfig {
+        self.cfg
+    }
+
+    /// Propose up to `window` speculative tokens by harvesting an n-gram
+    /// pool from `hist` and walking it from the trailing context.
+    ///
+    /// Stateless over the full history (the pool is rebuilt each call —
+    /// microsecond-scale for ≤ 32K-token histories, the same cost class as
+    /// [`NgramDrafter`]'s backward scan), which keeps it deterministic and
+    /// seed-independent. A real suffix-automaton pool index is a perf
+    /// follow-up; the linear build is invisible against decode.
+    pub fn propose(&self, hist: &[u32]) -> Vec<DraftToken> {
+        use std::collections::{BTreeMap, BTreeSet};
+        let n = self.cfg.ngram;
+        let window = self.cfg.window;
+        if n < 2 || window == 0 {
+            return Vec::new();
+        }
+        let k = n - 1; // pool key length
+        if hist.len() <= k {
+            return Vec::new();
+        }
+        // Pool: key (k tokens) → recency-ordered next tokens (newest LAST,
+        // de-duplicated). `BTreeMap` makes the build order independent of any
+        // hasher seed, so the walk is bit-reproducible across runs/platforms.
+        let mut pool: BTreeMap<Vec<u32>, Vec<u32>> = BTreeMap::new();
+        for i in 0..hist.len() - k {
+            let key = hist[i..i + k].to_vec();
+            let next = hist[i + k];
+            let v = pool.entry(key).or_default();
+            // Newest-wins + dedup: an already-seen continuation moves to the
+            // back so `last()` always yields the most-recent observation.
+            if let Some(pos) = v.iter().position(|&t| t == next) {
+                v.remove(pos);
+            }
+            v.push(next);
+        }
+        // Walk from the trailing k-token key, chaining pool lookups. A
+        // `visited` guard stops a pure loop: once a key repeats, the walk
+        // adds no new information and the verify would reject the overrun
+        // anyway, so the window cap is never wasted spinning on a cycle.
+        let mut key: Vec<u32> = hist[hist.len() - k..].to_vec();
+        let mut out: Vec<DraftToken> = Vec::with_capacity(window);
+        let mut visited: BTreeSet<Vec<u32>> = BTreeSet::new();
+        while out.len() < window {
+            if !visited.insert(key.clone()) {
+                break;
+            }
+            let Some(next) = pool.get(&key).and_then(|v| v.last().copied()) else {
+                break;
+            };
+            out.push(DraftToken {
+                id: next,
+                q: self.cfg.q,
+            });
+            // Shift the key: drop the oldest token, append the proposed one.
+            key.remove(0);
+            key.push(next);
+        }
+        out
+    }
+}
+
+// ============================================================
 // E4 phase 4c: MtpDrafter — DeepSeek-V3-style multi-token
 // prediction as a drafter.
 // ============================================================
@@ -1732,5 +1880,150 @@ mod ngram_tests {
         assert_eq!(outcome.accepted.len(), drafts.len());
         assert_eq!(outcome.accepted, vec![drafts[0].id, drafts[1].id]);
         assert_eq!(outcome.replacement, 7);
+    }
+}
+
+#[cfg(test)]
+mod lookahead_tests {
+    use super::*;
+
+    /// Tokens of a lookahead proposal, for value comparison (`DraftToken`
+    /// is `Copy` but not `PartialEq`).
+    fn ids(drafts: &[DraftToken]) -> Vec<u32> {
+        drafts.iter().map(|d| d.id).collect()
+    }
+
+    #[test]
+    fn short_or_empty_history_yields_no_draft() {
+        let d = LookaheadDrafter::with_defaults(); // ngram=3 → key len 2
+        assert!(d.propose(&[]).is_empty());
+        assert!(d.propose(&[1]).is_empty());
+        // len == key length → still nothing to key on.
+        assert!(d.propose(&[1, 2]).is_empty());
+    }
+
+    /// Engagement: a clearly repetitive history makes the pool-walk chain a
+    /// multi-token guess. History "1 2 3 1 2 3 1 2" ends on key [1,2]; the
+    /// pool gives [1,2]→3, [2,3]→1, [3,1]→2, so the walk yields 3,1,2 and
+    /// then stops when key [1,2] recurs (the cycle guard).
+    #[test]
+    fn proposes_chained_guess_on_repetitive_history() {
+        let hist: Vec<u32> = vec![1, 2, 3, 1, 2, 3, 1, 2];
+        let d = LookaheadDrafter::with_defaults();
+        let drafts = d.propose(&hist);
+        assert!(
+            !drafts.is_empty(),
+            "lookahead must engage on a repetitive history"
+        );
+        assert_eq!(ids(&drafts), vec![3, 1, 2], "chained pool-walk guess");
+    }
+
+    /// The `window` cap bounds the guess length even when the chain could
+    /// continue (here a long ascending run never cycles).
+    #[test]
+    fn window_caps_guess_length() {
+        // 0..20 then re-seed the trailing key so a continuation exists.
+        let mut hist: Vec<u32> = (0..20u32).collect();
+        hist.extend_from_slice(&[5, 6]); // trailing key [5,6] → next is 7
+        let d = LookaheadDrafter::new(LookaheadDrafterConfig {
+            ngram: 3,
+            window: 3,
+            q: 0.5,
+        });
+        let drafts = d.propose(&hist);
+        assert!(drafts.len() <= 3, "window=3 caps the guess");
+    }
+
+    /// Determinism / seed-reproducibility: same history ⇒ identical proposal
+    /// (ids and `q`), no RNG involved.
+    #[test]
+    fn is_deterministic() {
+        let hist: Vec<u32> = vec![1, 2, 3, 1, 2, 3, 4, 5, 1, 2, 3, 1, 2];
+        let d = LookaheadDrafter::with_defaults();
+        let a = d.propose(&hist);
+        let b = d.propose(&hist);
+        assert_eq!(ids(&a), ids(&b));
+        let qa: Vec<u32> = a.iter().map(|t| t.q.to_bits()).collect();
+        let qb: Vec<u32> = b.iter().map(|t| t.q.to_bits()).collect();
+        assert_eq!(qa, qb);
+    }
+
+    /// THE F10 correctness anchor — chain parity under greedy verify:
+    /// whatever lookahead proposes, [`accept_reject_greedy`] commits EXACTLY
+    /// the target's argmax tokens, so greedy-with-lookahead is token-for-token
+    /// identical to plain greedy (speculation only ever speeds up). We craft a
+    /// target whose argmax continuation diverges from the drafts partway, and
+    /// assert the committed tokens are a PREFIX of the plain greedy sequence.
+    #[test]
+    fn lookahead_chain_parity_greedy() {
+        let hist: Vec<u32> = vec![1, 2, 3, 1, 2, 3, 1, 2];
+        let d = LookaheadDrafter::with_defaults();
+        let drafts = d.propose(&hist); // [3, 1, 2]
+        assert!(!drafts.is_empty());
+
+        let vocab = 8usize;
+        // The "true" greedy continuation of the target. The first two match
+        // the drafts (accept), the third diverges (reject → replacement).
+        let argmax_seq = [3u32, 1, 0, 4];
+        let mut tp: Vec<Vec<f32>> = Vec::with_capacity(drafts.len() + 1);
+        for i in 0..=drafts.len() {
+            let mut v = vec![0.1f32; vocab];
+            v[argmax_seq[i] as usize] = 0.9;
+            tp.push(v);
+        }
+        let refs: Vec<&[f32]> = tp.iter().map(|v| v.as_slice()).collect();
+
+        let out = accept_reject_greedy(&drafts, &refs);
+        let committed: Vec<u32> = out
+            .accepted
+            .iter()
+            .copied()
+            .chain(std::iter::once(out.replacement))
+            .collect();
+        // Plain (non-speculative) greedy over the same target distributions.
+        let plain: Vec<u32> = refs.iter().map(|r| argmax(r)).collect();
+        assert_eq!(
+            committed[..],
+            plain[..committed.len()],
+            "lookahead committed tokens must be a prefix of plain greedy"
+        );
+        // Concretely: draft[0]=3 & draft[1]=1 match argmax → accepted; draft[2]=2
+        // vs argmax 0 → reject with replacement 0.
+        assert_eq!(out.accepted, vec![3, 1]);
+        assert_eq!(out.replacement, 0);
+    }
+
+    /// A/B — acceptance on a repetitive prompt: when the target CONTINUES the
+    /// repetition (its argmax equals the pool guess), every lookahead draft is
+    /// ACCEPTED in one batched verify (the speedup), vs. a single-token commit
+    /// without a drafter.
+    #[test]
+    fn lookahead_accepts_full_guess_on_matching_target() {
+        let hist: Vec<u32> = vec![1, 2, 3, 1, 2, 3, 1, 2];
+        let d = LookaheadDrafter::with_defaults();
+        let drafts = d.propose(&hist); // [3, 1, 2]
+        assert_eq!(ids(&drafts), vec![3, 1, 2]);
+
+        let vocab = 8usize;
+        let mut tp: Vec<Vec<f32>> = Vec::with_capacity(drafts.len() + 1);
+        for di in &drafts {
+            let mut v = vec![0.0f32; vocab];
+            v[di.id as usize] = 1.0; // target argmax == the guess
+            tp.push(v);
+        }
+        let mut bonus = vec![0.0f32; vocab];
+        bonus[3] = 1.0; // continues the loop
+        tp.push(bonus);
+        let refs: Vec<&[f32]> = tp.iter().map(|v| v.as_slice()).collect();
+
+        let mut rng = Rng::from_seed(1);
+        let out = accept_reject(&drafts, &refs, &mut rng);
+        assert_eq!(
+            out.accepted.len(),
+            drafts.len(),
+            "all lookahead guesses accepted on a matching target"
+        );
+        assert_eq!(out.accepted, vec![3, 1, 2]);
+        assert_eq!(out.replacement, 3, "bonus token continues the loop");
     }
 }

@@ -4304,6 +4304,25 @@ async fn serve(
             let mut spec_ngram_winner: Option<
                 rustllama_engine::speculative::NgramDrafterConfig,
             > = None;
+            // F10 — lookahead (Jacobi n-gram-pool) spec winner (takes dispatch
+            // precedence over plain n-gram). Off unless the config enables it.
+            let spec_lookahead_winner: Option<
+                rustllama_engine::speculative::LookaheadDrafterConfig,
+            > = if cfg.inference.speculative_lookahead {
+                tracing::info!(
+                    ngram = cfg.inference.lookahead_ngram,
+                    window = cfg.inference.lookahead_window,
+                    "lookahead / Jacobi speculative decoding enabled (raw-softmax \
+                     sampling; grammar requests fall back to the classic sampler)"
+                );
+                Some(rustllama_engine::speculative::LookaheadDrafterConfig {
+                    ngram: cfg.inference.lookahead_ngram as usize,
+                    window: cfg.inference.lookahead_window as usize,
+                    ..Default::default()
+                })
+            } else {
+                None
+            };
             if let Some(draft_path) = cfg.inference.speculative_draft_path.as_deref() {
                 // Two-model speculative decoding. The draft loads
                 // with F32 KV (it's small; exactness helps
@@ -4414,6 +4433,7 @@ async fn serve(
             rustllama_engine::tuner_apply::TunerWinners {
                 draft: spec_draft_winner,
                 ngram: spec_ngram_winner,
+                lookahead: spec_lookahead_winner,
                 mtp: applied_mtp,
                 tree_widths: spec_tree_winner,
                 cacheblend_ratio: Some(applied_cacheblend),
@@ -10744,6 +10764,16 @@ fn bench(
             n_draft: cfg.inference.ngram_n_draft as usize,
             ..Default::default()
         }));
+    }
+    // F10 — lookahead (Jacobi n-gram-pool) spec (takes precedence over n-gram).
+    if cfg.inference.speculative_lookahead {
+        cpu.set_lookahead_speculative(Some(
+            rustllama_engine::speculative::LookaheadDrafterConfig {
+                ngram: cfg.inference.lookahead_ngram as usize,
+                window: cfg.inference.lookahead_window as usize,
+                ..Default::default()
+            },
+        ));
     }
     // MTP / NextN self-speculation (hybrid + NextN-head models only).
     cpu.set_mtp_speculative(cfg.inference.speculative_mtp);

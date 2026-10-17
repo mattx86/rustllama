@@ -2762,6 +2762,17 @@ async fn load_model(
     // `TunerWinners::apply_to`, so an HTTP-loaded model matches a CLI-served
     // one. (Draft-model spec is CLI-serve-only — the HTTP load never loads a
     // second model — so `draft` stays `None` here.)
+    let lookahead_winner = if cfg_for_tuning.inference.speculative_lookahead {
+        // F10 — lookahead (Jacobi n-gram-pool) spec on the HTTP load path, kept
+        // in sync with the CLI serve path (X1+D5: both go through TunerWinners).
+        Some(rustllama_engine::speculative::LookaheadDrafterConfig {
+            ngram: cfg_for_tuning.inference.lookahead_ngram as usize,
+            window: cfg_for_tuning.inference.lookahead_window as usize,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
     let ngram_winner = if cfg_for_tuning.inference.speculative_ngram {
         Some(rustllama_engine::speculative::NgramDrafterConfig {
             n_match: cfg_for_tuning.inference.ngram_n_match as usize,
@@ -2780,6 +2791,7 @@ async fn load_model(
     rustllama_engine::tuner_apply::TunerWinners {
         draft: None,
         ngram: ngram_winner,
+        lookahead: lookahead_winner,
         mtp: applied_mtp,
         tree_widths,
         cacheblend_ratio: Some(cacheblend_ratio),

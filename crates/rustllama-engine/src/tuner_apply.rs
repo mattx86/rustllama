@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use crate::speculative::NgramDrafterConfig;
+use crate::speculative::{LookaheadDrafterConfig, NgramDrafterConfig};
 use crate::{CpuEngine, Engine};
 
 /// The resolved autotuner (+ config) winners that get pushed onto a freshly
@@ -32,6 +32,9 @@ pub struct TunerWinners {
     pub draft: Option<(Arc<dyn Engine>, u32)>,
     /// N-gram speculative drafter config. `None` ⇒ off.
     pub ngram: Option<NgramDrafterConfig>,
+    /// F10 — lookahead (Jacobi n-gram-pool) drafter config. `None` ⇒ off.
+    /// Takes dispatch precedence over `ngram` when both are set.
+    pub lookahead: Option<LookaheadDrafterConfig>,
     /// MTP / NextN self-speculation on/off (a no-op on models without an MTP
     /// head, so always applied). Resolved from the `speculative_mtp` winner.
     pub mtp: bool,
@@ -52,6 +55,9 @@ impl TunerWinners {
         }
         if let Some(ngram) = &self.ngram {
             cpu.set_ngram_speculative(Some(ngram.clone()));
+        }
+        if let Some(lookahead) = &self.lookahead {
+            cpu.set_lookahead_speculative(Some(*lookahead));
         }
         cpu.set_mtp_speculative(self.mtp);
         if let Some(widths) = &self.tree_widths {
