@@ -44,6 +44,48 @@ pub fn kv_persist_cap_bytes() -> u64 {
     rustllama_models::accel::kv_persist_mb().saturating_mul(1024 * 1024)
 }
 
+/// `RUSTLLAMA_KV_PERSIST_INTERVAL_SECS` — F12 periodic-checkpoint cadence.
+/// `0`/unset disables periodic checkpointing (save-on-drop only, the historical
+/// behavior). Read per request boundary (not hot-path).
+pub fn kv_persist_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(rustllama_models::accel::kv_persist_interval_secs())
+}
+
+/// Elapsed-time gate for F12 periodic checkpointing. Pure + deterministic
+/// (`Instant` injected) so the "should I checkpoint now?" decision is unit-
+/// testable without a real clock. A zero `interval` means the feature is off:
+/// [`Self::should_checkpoint`] always returns `false`, keeping save-on-drop as
+/// the only write (byte-identical to pre-F12).
+#[derive(Debug)]
+pub struct CheckpointClock {
+    interval: std::time::Duration,
+    last: std::time::Instant,
+}
+
+impl CheckpointClock {
+    /// Build a clock for `interval` (0 = feature off), anchored at `now` — so
+    /// the first checkpoint can't fire until a full interval has elapsed since
+    /// engine construction.
+    pub fn new(interval: std::time::Duration, now: std::time::Instant) -> Self {
+        Self { interval, last: now }
+    }
+
+    /// `true` iff periodic checkpointing is enabled AND at least `interval` has
+    /// elapsed since the last fire; records `now` as the new baseline when it
+    /// returns `true` (so the next window measures from this checkpoint).
+    pub fn should_checkpoint(&mut self, now: std::time::Instant) -> bool {
+        if self.interval.is_zero() {
+            return false;
+        }
+        if now.duration_since(self.last) >= self.interval {
+            self.last = now;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 fn push_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
@@ -473,6 +515,57 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         // Most-recently-used first: entry [2;8] was inserted last.
         assert_eq!(loaded[0].ids, vec![2; 8]);
+        let _ = std::fs::remove_file(rlkv_path(&model));
+    }
+
+    #[test]
+    fn checkpoint_clock_off_never_fires() {
+        // interval 0 ⇒ feature off ⇒ save-on-drop only (byte-identical to pre-F12).
+        let t0 = std::time::Instant::now();
+        let mut clk = CheckpointClock::new(std::time::Duration::ZERO, t0);
+        assert!(!clk.should_checkpoint(t0));
+        assert!(!clk.should_checkpoint(t0 + std::time::Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn checkpoint_clock_fires_once_per_interval() {
+        let t0 = std::time::Instant::now();
+        let secs = std::time::Duration::from_secs;
+        let mut clk = CheckpointClock::new(secs(10), t0);
+        // Before a full interval: no.
+        assert!(!clk.should_checkpoint(t0 + secs(5)));
+        // At the interval boundary: fire, and reset the window.
+        assert!(clk.should_checkpoint(t0 + secs(10)));
+        // Immediately after firing: not yet.
+        assert!(!clk.should_checkpoint(t0 + secs(15)));
+        // A full interval past the LAST fire (t0+10): fire again.
+        assert!(clk.should_checkpoint(t0 + secs(20)));
+    }
+
+    #[test]
+    fn checkpoint_round_trips_mid_session() {
+        // F12 anchor: a checkpoint written "mid-generation" reloads to the EXACT
+        // KV state. A checkpoint is just a `save_pool` of the live pool at a
+        // request boundary, so saving a partially-grown session + reloading must
+        // reproduce the snapshot byte-for-byte.
+        let model = tmp_model("m_ckpt.gguf");
+        let c = cfg();
+        let mut live = KvCache::new_with_dtype(&c, 16, KvDtype::F32);
+        let mut pool = PrefixCachePool::new(4);
+        fill_kv(&mut live, 7, 3.0);
+        pool.snapshot_and_insert(vec![10, 11, 12, 13, 14, 15, 16], &live);
+        // "Mid-session checkpoint": write now, before the engine would drop.
+        let n = save_pool(&model, &pool, 2, 2, 4, 64 * 1024 * 1024).unwrap();
+        assert_eq!(n, 1);
+        let loaded = load_pool(&model, 2, 2, 4).expect("reload the checkpoint");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].ids, vec![10, 11, 12, 13, 14, 15, 16]);
+        assert_eq!(loaded[0].kv.prefix_len, 7);
+        // Exact KV tensors survive (layer 0 K[0] == base 3.0 from fill_kv).
+        let KvLayer::F32 { k, .. } = &loaded[0].kv.layers[0] else {
+            panic!("expected F32 KV layer");
+        };
+        assert_eq!(k[0], 3.0, "checkpoint must restore the exact KV state");
         let _ = std::fs::remove_file(rlkv_path(&model));
     }
 

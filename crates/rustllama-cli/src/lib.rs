@@ -2456,6 +2456,7 @@ fn promote_memory_env_from_config(
         memory_budget: inference.memory_budget.clone(),
         ssm_prefill_chunked,
         kv_persist_mb: inference.kv_persist_mb,
+        kv_persist_interval_secs: inference.kv_persist_interval_secs,
         moe_expert_cache_mb: inference.moe_expert_cache_mb,
         moe_experts_cpu: experts_cpu,
         moe_gpu_split_permille: gpu_split,
@@ -4705,7 +4706,18 @@ async fn serve(
             .copied()
             .chain(rustllama_runtime::disabled_cpu_indices())
             .collect();
-        if disabled.is_empty() {
+        // F11: NUMA-aware placement is opt-in (config `numa_aware` OR
+        // `RUSTLLAMA_NUMA_AWARE=1`) AND only engages when the host is genuinely
+        // multi-node. On a single-node host (every laptop/desktop, incl. this
+        // box) `numa_multi` is false and the paths below are byte-identical to
+        // before.
+        let numa_opt_in = cfg.inference.numa_aware
+            || std::env::var("RUSTLLAMA_NUMA_AWARE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+        let numa_topo = numa_opt_in.then(rustllama_kernels_cpu::numa::detect);
+        let numa_multi = numa_topo.as_ref().map(|t| t.is_multi_node()).unwrap_or(false);
+        if disabled.is_empty() && !numa_multi {
             rustllama_kernels_cpu::install_thread_pool(cfg.inference.threads as usize);
         } else {
             let total = std::thread::available_parallelism()
@@ -4720,10 +4732,20 @@ async fn serve(
                 total_cores = total,
                 "CPU affinity: pinning rayon workers to enabled logical processors"
             );
-            rustllama_kernels_cpu::install_thread_pool_pinned(
-                enabled,
-                cfg.inference.threads as usize,
-            );
+            if numa_multi {
+                // Node-grouped pinning (reorder only — never drops a worker).
+                let topo = numa_topo.as_ref().unwrap();
+                rustllama_kernels_cpu::install_thread_pool_numa(
+                    enabled,
+                    cfg.inference.threads as usize,
+                    topo,
+                );
+            } else {
+                rustllama_kernels_cpu::install_thread_pool_pinned(
+                    enabled,
+                    cfg.inference.threads as usize,
+                );
+            }
         }
     }
 

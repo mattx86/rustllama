@@ -278,6 +278,7 @@ pub fn run_autotune_blocking(
             memory_budget: inf.memory_budget.clone(),
             ssm_prefill_chunked: inf.ssm_prefill_chunked,
             kv_persist_mb: inf.kv_persist_mb,
+            kv_persist_interval_secs: inf.kv_persist_interval_secs,
             moe_expert_cache_mb: inf.moe_expert_cache_mb,
             moe_experts_cpu: false,
             moe_gpu_split_permille: 0,

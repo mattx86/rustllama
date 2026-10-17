@@ -24,12 +24,17 @@
 //!     Lets multimodal SDK callers (Claude Code with image attachments)
 //!     hit our text-only models without crashing. Real VLM support is
 //!     a v1.x item.
-//!   - `cache_control` annotations are accepted on text blocks and
-//!     surfaced via `cache_read_input_tokens` in the usage block,
-//!     but the per-block `ephemeral` marker is informational — the
-//!     engine uses implicit LCP prefix caching for every prefill,
-//!     not per-marker hard boundaries. `cache_creation_input_tokens`
-//!     always reports 0 until per-marker caching lands.
+//!   - `cache_control` (F13): `{"type":"ephemeral"}` markers on system /
+//!     message / tool blocks are honored by mapping the request to the
+//!     engine's prefix-cache (APC) boundary. The engine already caches every
+//!     prefill's prompt prefix implicitly (LCP), so a marked prefix is always
+//!     covered; the marker switches the usage block from the legacy stubbed
+//!     `cache_creation_input_tokens: 0` to the REAL per-request creation count
+//!     (the engine's `tokens_prefilled` — prompt tokens freshly prefilled and
+//!     written into the prefix cache this request). `cache_read_input_tokens`
+//!     is the real APC hit count (`cache_hit_tokens`) with or without a
+//!     marker. Without a marker, `cache_creation_input_tokens` stays `0`
+//!     (byte-identical to before).
 //!   - Extended thinking annotations.
 //!   - `tool_result` content blocks in the request: parsed as plain text;
 //!     Anthropic's full tool-result loop requires a richer message shape
@@ -107,6 +112,16 @@ impl SystemPrompt {
                 .map(|b| b.text)
                 .collect::<Vec<_>>()
                 .join("\n"),
+        }
+    }
+
+    /// F13: `true` if any system text block carries a `cache_control` marker
+    /// (Claude Code / Claude Desktop annotate the stable system prompt this
+    /// way to delimit the cacheable prefix).
+    fn has_cache_control(&self) -> bool {
+        match self {
+            SystemPrompt::Plain(_) => false,
+            SystemPrompt::Blocks(blocks) => blocks.iter().any(|b| b.cache_control.is_some()),
         }
     }
 }
@@ -212,6 +227,26 @@ impl ContentField {
                 .join(""),
         }
     }
+
+    /// F13: `true` if any content block carries a `cache_control` marker
+    /// (clients annotate a long context block — e.g. a codebase dump — to mark
+    /// it as the cacheable prefix).
+    fn has_cache_control(&self) -> bool {
+        match self {
+            ContentField::Plain(_) => false,
+            ContentField::Blocks(blocks) => blocks.iter().any(|b| b.cache_control.is_some()),
+        }
+    }
+}
+
+/// F13: `true` if the Anthropic `tools` array marks any tool definition with a
+/// `cache_control` breakpoint (the tool-definitions cache boundary that Claude
+/// Code sets on large tool schemas).
+fn tools_have_cache_control(tools: &Value) -> bool {
+    tools
+        .as_array()
+        .map(|arr| arr.iter().any(|t| t.get("cache_control").is_some()))
+        .unwrap_or(false)
 }
 
 /// Render one content block as plain text. Text blocks pass through;
@@ -303,13 +338,13 @@ pub struct AnthropicUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<u32>,
     /// **Anthropic-native**: prompt tokens that populated the cache
-    /// during this request. Reported as `0` today — our engine caches
-    /// prefixes implicitly on every successful generation, so
-    /// attributing a specific number to "creation due to the client's
-    /// cache_control marker" would be misleading. Honoring the
-    /// per-block `ephemeral` marker as a hard cache boundary is a
-    /// follow-up; once that lands this field will report the real
-    /// per-marker creation count.
+    /// during this request. F13: when the client marked an explicit
+    /// `cache_control` boundary, this is the REAL per-request creation
+    /// count — the engine's `tokens_prefilled` (prompt tokens freshly
+    /// prefilled and written into the prefix cache by `commit_snapshot`).
+    /// Without a marker it stays `0` (unchanged from before), since the
+    /// unmarked request made no explicit caching request to attribute a
+    /// creation count to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u32>,
     /// **Extension** (rustllama-only): wall-clock ms the engine spent
@@ -344,17 +379,44 @@ impl AnthropicUsage {
     /// the Anthropic-native `cache_read_input_tokens` /
     /// `cache_creation_input_tokens` so Anthropic SDK consumers can
     /// verify their cache_control annotations are paying off.
-    pub fn with_stats(mut self, s: &rustllama_engine::RequestStats) -> Self {
+    ///
+    /// `cache_control` is `true` when the request carried at least one
+    /// `{"type":"ephemeral"}` marker (F13). The marker switches on the
+    /// Anthropic-semantics split of the REAL APC accounting:
+    ///   - `cache_read_input_tokens` = the engine's `cache_hit_tokens`
+    ///     (prompt tokens served from the prefix cache this request), and
+    ///   - `cache_creation_input_tokens` = the engine's `tokens_prefilled`
+    ///     (prompt tokens freshly prefilled and now written into the prefix
+    ///     cache by `commit_snapshot`).
+    /// On the 2nd identical request the whole marked prefix is an APC hit, so
+    /// read == the prefix and creation == 0 — exactly what Anthropic SDK
+    /// clients expect. WITHOUT a marker, `cache_creation` stays `0`
+    /// (byte-identical to the pre-F13 behavior); `cache_read` has always been
+    /// the real `cache_hit_tokens`.
+    pub fn with_stats(self, s: &rustllama_engine::RequestStats) -> Self {
+        self.with_stats_cache_control(s, false)
+    }
+
+    /// [`Self::with_stats`] with the explicit F13 cache-control flag. See its
+    /// docs for the read/creation mapping.
+    pub fn with_stats_cache_control(
+        mut self,
+        s: &rustllama_engine::RequestStats,
+        cache_control: bool,
+    ) -> Self {
         self.prefill_ms = Some(s.prefill_ms);
         self.decode_ms = Some(s.decode_ms);
         self.cache_hit_tokens = Some(s.cache_hit_tokens);
         self.tokens_prefilled = Some(s.tokens_prefilled);
-        // Anthropic-native mirror of the engine's cache_hit_tokens.
-        // Same number, different name — gives Anthropic SDK
-        // consumers the field they're looking for.
+        // Anthropic-native mirror of the engine's cache_hit_tokens (always the
+        // real reused-prefix count — this is the APC hit boundary).
         self.cache_read_input_tokens = Some(s.cache_hit_tokens);
-        // Always 0 until per-marker cache boundaries land.
-        self.cache_creation_input_tokens = Some(0);
+        // F13: honor the explicit cache_control boundary. With a marker, report
+        // the REAL per-request creation count (newly-prefilled, now-cached
+        // tokens); without one, keep the legacy 0 so unmarked requests are
+        // unchanged.
+        self.cache_creation_input_tokens =
+            Some(if cache_control { s.tokens_prefilled } else { 0 });
         self
     }
 }
@@ -381,6 +443,20 @@ pub async fn messages(
         tools: req_tools,
         ..
     } = req;
+
+    // F13: did the client mark an explicit cache_control boundary anywhere
+    // (system block, message content block, or tool definition)? Computed
+    // before the fields are consumed below. When set, the usage block reports
+    // the REAL cache-creation count instead of the legacy stubbed 0.
+    let has_cache_control = req_system
+        .as_ref()
+        .map(|s| s.has_cache_control())
+        .unwrap_or(false)
+        || req_messages.iter().any(|m| m.content.has_cache_control())
+        || req_tools
+            .as_ref()
+            .map(tools_have_cache_control)
+            .unwrap_or(false);
 
     let sampling = build_sampling(SamplingInputs {
         temperature,
@@ -498,6 +574,7 @@ pub async fn messages(
             input_tokens,
             pre_rendered_prompt,
             cancel_guard,
+            has_cache_control,
         )
         .await
     } else {
@@ -509,6 +586,7 @@ pub async fn messages(
             id,
             input_tokens,
             pre_rendered_prompt,
+            has_cache_control,
         )
         .await
     }
@@ -637,6 +715,7 @@ async fn messages_blocking(
     id: String,
     input_tokens: u32,
     pre_rendered_prompt: Option<String>,
+    has_cache_control: bool,
 ) -> Response {
     let handle = match serving.try_acquire().await {
         Ok(p) => p,
@@ -751,7 +830,7 @@ async fn messages_blocking(
         ..Default::default()
     };
     let usage = match handle.cpu_engine.as_ref() {
-        Some(cpu) => usage.with_stats(&cpu.last_request_stats()),
+        Some(cpu) => usage.with_stats_cache_control(&cpu.last_request_stats(), has_cache_control),
         None => usage,
     };
 
@@ -769,6 +848,7 @@ async fn messages_blocking(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn messages_stream(
     serving: ServingModel,
     msgs: Vec<ChatMessage>,
@@ -778,6 +858,7 @@ async fn messages_stream(
     input_tokens: u32,
     pre_rendered_prompt: Option<String>,
     cancel_guard: crate::CancelGuard,
+    has_cache_control: bool,
 ) -> Response {
     let handle = match serving.try_acquire().await {
         Ok(p) => p,
@@ -811,6 +892,7 @@ async fn messages_stream(
         has_tools,
         cancel_guard,
         cpu_engine_for_stats,
+        has_cache_control,
     );
     (
         [("x-rustllama-request-id", id_for_header.as_str())],
@@ -844,6 +926,7 @@ fn build_anthropic_sse(
     has_tools: bool,
     cancel_guard: crate::CancelGuard,
     cpu_engine: Option<std::sync::Arc<rustllama_engine::CpuEngine>>,
+    has_cache_control: bool,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
         let cancel_flag = cancel_guard.flag.clone();
@@ -972,6 +1055,19 @@ fn build_anthropic_sse(
             usage_payload.insert("decode_ms".into(), json!(s.decode_ms));
             usage_payload.insert("cache_hit_tokens".into(), json!(s.cache_hit_tokens));
             usage_payload.insert("tokens_prefilled".into(), json!(s.tokens_prefilled));
+            // F13: Anthropic-native cache accounting on the streaming surface,
+            // matching the non-stream `with_stats_cache_control` mapping.
+            // cache_read = real APC hit count; cache_creation = real newly-
+            // prefilled count only when the client marked a cache_control
+            // boundary (else 0, unchanged from before).
+            usage_payload.insert(
+                "cache_read_input_tokens".into(),
+                json!(s.cache_hit_tokens),
+            );
+            usage_payload.insert(
+                "cache_creation_input_tokens".into(),
+                json!(if has_cache_control { s.tokens_prefilled } else { 0 }),
+            );
         }
         let msg_delta = json!({
             "type": "message_delta",
@@ -1250,6 +1346,83 @@ fn unix_ts() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- F13: cache_control boundary → real APC usage counts --------------
+
+    #[test]
+    fn cache_control_maps_real_apc_counts() {
+        // Engine's real APC accounting for a request: 20 prompt tokens reused
+        // from the prefix cache, 12 freshly prefilled (and now cached).
+        let stats = rustllama_engine::RequestStats {
+            cache_hit_tokens: 20,
+            tokens_prefilled: 12,
+            ..Default::default()
+        };
+        // WITH the marker: read = real APC hit, creation = real newly-prefilled.
+        let u = AnthropicUsage::default().with_stats_cache_control(&stats, true);
+        assert_eq!(u.cache_read_input_tokens, Some(20));
+        assert_eq!(u.cache_creation_input_tokens, Some(12));
+        // WITHOUT the marker: read still the real hit count, creation stays the
+        // legacy stubbed 0 (byte-identical to pre-F13).
+        let u0 = AnthropicUsage::default().with_stats_cache_control(&stats, false);
+        assert_eq!(u0.cache_read_input_tokens, Some(20));
+        assert_eq!(u0.cache_creation_input_tokens, Some(0));
+        // The plain `with_stats` alias is the no-marker path.
+        let u1 = AnthropicUsage::default().with_stats(&stats);
+        assert_eq!(u1.cache_creation_input_tokens, Some(0));
+    }
+
+    #[test]
+    fn second_identical_request_reports_real_cache_read() {
+        // F13 anchor: on the 2nd identical request the whole marked prefix is an
+        // APC hit (high `cache_hit_tokens`, ~0 freshly prefilled), so the usage
+        // reports the real reused count as cache_read and 0 creation.
+        let second = rustllama_engine::RequestStats {
+            cache_hit_tokens: 32,
+            tokens_prefilled: 0,
+            ..Default::default()
+        };
+        let u = AnthropicUsage::default().with_stats_cache_control(&second, true);
+        assert_eq!(
+            u.cache_read_input_tokens,
+            Some(32),
+            "2nd identical request reports the real APC hit count as cache_read"
+        );
+        assert_eq!(u.cache_creation_input_tokens, Some(0));
+    }
+
+    #[test]
+    fn cache_control_detection_across_system_message_and_tools() {
+        // System block marker.
+        let sys = SystemPrompt::Blocks(vec![TextBlock {
+            kind: "text".into(),
+            text: "sys".into(),
+            source: None,
+            image_url: None,
+            cache_control: Some(CacheControl {
+                kind: "ephemeral".into(),
+            }),
+        }]);
+        assert!(sys.has_cache_control());
+        assert!(!SystemPrompt::Plain("sys".into()).has_cache_control());
+        // Message content-block marker.
+        let content = ContentField::Blocks(vec![TextBlock {
+            kind: "text".into(),
+            text: "ctx".into(),
+            source: None,
+            image_url: None,
+            cache_control: Some(CacheControl {
+                kind: "ephemeral".into(),
+            }),
+        }]);
+        assert!(content.has_cache_control());
+        assert!(!ContentField::Plain("hi".into()).has_cache_control());
+        // Tool-definitions marker.
+        let tools = serde_json::json!([{ "name": "t", "cache_control": {"type": "ephemeral"} }]);
+        assert!(tools_have_cache_control(&tools));
+        let tools_plain = serde_json::json!([{ "name": "t" }]);
+        assert!(!tools_have_cache_control(&tools_plain));
+    }
 
     /// Extract just the `event: ...` line of each Event so the test
     /// asserts the SEQUENCE of event types without coupling to JSON

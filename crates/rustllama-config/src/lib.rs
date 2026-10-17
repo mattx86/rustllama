@@ -367,6 +367,16 @@ pub struct InferenceConfig {
     /// (comma-separated) and the `serve --disabled-cpus <CSV>` flag.
     #[serde(default)]
     pub disabled_cpus: Vec<u32>,
+    /// NUMA-aware CPU placement (F11). `false` (the default) keeps the single
+    /// global rayon pool — **byte-identical** to the historical behavior. When
+    /// `true` AND the host has >= 2 NUMA nodes, the rayon workers are pinned
+    /// node-grouped so consecutive workers share a node and touch node-local
+    /// memory (and the node-local slab allocator becomes available to the
+    /// weight/KV loaders). On a single-node host (every laptop/desktop, incl.
+    /// this dev box) the flag is inert — detection reports one node and the pool
+    /// install is unchanged. Also settable via `RUSTLLAMA_NUMA_AWARE=1`.
+    #[serde(default)]
+    pub numa_aware: bool,
     /// NPU indices (0-based, in the NPU enumeration order) to ignore entirely —
     /// excluded from placement + the device inventory, the NPU analog of
     /// `disabled_gpus`. Empty (the default) = use every enumerated NPU. Also
@@ -670,6 +680,16 @@ pub struct InferenceConfig {
     /// wins).
     #[serde(default)]
     pub kv_persist_mb: u64,
+    /// F12 — periodic KV-checkpoint cadence (seconds). `0` (default) keeps the
+    /// historical behavior: the `<gguf>.rlkv` sidecar is written only on
+    /// graceful shutdown (so a `kill -9` loses the whole session). A non-zero
+    /// value makes the engine ALSO re-write the sidecar at request boundaries
+    /// once this many seconds have elapsed since the last write, so a hard kill
+    /// mid-session loses at most the last interval instead of the whole
+    /// conversation. No effect unless `kv_persist_mb > 0`. Promoted to
+    /// `RUSTLLAMA_KV_PERSIST_INTERVAL_SECS` at startup (a user-set env var wins).
+    #[serde(default)]
+    pub kv_persist_interval_secs: u64,
     /// CacheBlend — vLLM-style NON-prefix KV reuse for RAG. The fraction of
     /// retrieved-chunk tokens to recompute when blending cached chunk KV into a
     /// new context (`0.0`, default, disables CacheBlend → normal prefill). A
@@ -998,6 +1018,9 @@ impl Default for InferenceConfig {
             // CPU-only placement. Both false is a validation error.
             gpu_enabled: true,
             disabled_cpus: Vec::new(),
+            // NUMA-aware placement off by default (single global pool, the
+            // historical byte-identical behavior).
+            numa_aware: false,
             // NPUs: enabled as a tier by default, none disabled (inert until an
             // npu-* backend + NPU hardware are present).
             disabled_npus: Vec::new(),
@@ -1049,6 +1072,7 @@ impl Default for InferenceConfig {
             // which passed 2026-09-20).
             prefill_batched_hybrid: true,
             kv_persist_mb: 0,
+            kv_persist_interval_secs: 0,
             cacheblend_recompute_ratio: 0.0,
             // P9: default 2048 — the ragged driver chunks long-prompt prefill
             // for TTFT fairness under continuous batching (output-identical to

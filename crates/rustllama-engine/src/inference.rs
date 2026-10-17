@@ -283,6 +283,12 @@ pub struct CpuEngine {
     /// `[inference].cacheblend_recompute_ratio` fallback, via
     /// [`Self::set_cacheblend`]. Forks inherit it (plain `Copy`).
     cacheblend: Option<rustllama_models::cacheblend::CacheBlendConfig>,
+    /// F12 — periodic KV-checkpoint clock. Gates how often the warm-restart
+    /// sidecar is re-written mid-session (every `kv_persist_interval_secs`). A
+    /// zero interval (the default) leaves it inert → save-on-drop only, exactly
+    /// the pre-F12 behavior. Only the sidecar-owning engine
+    /// (`kv_persist_owner`) ever fires it; forks carry an inert clock.
+    checkpoint_clock: Mutex<crate::kv_persist::CheckpointClock>,
 }
 
 impl Drop for CpuEngine {
@@ -1948,6 +1954,10 @@ impl CpuEngine {
             expert_usage,
             kv_persist_owner: true,
             cacheblend: None,
+            checkpoint_clock: Mutex::new(crate::kv_persist::CheckpointClock::new(
+                crate::kv_persist::kv_persist_interval(),
+                std::time::Instant::now(),
+            )),
         };
         if let Ok(mut st) = engine.state.lock() {
             st.pool.set_max_bytes(pool_byte_cap);
@@ -2061,7 +2071,8 @@ impl CpuEngine {
     }
 
     /// Warm-restart save — see [`Self::load_kv_persist`]. Called from
-    /// [`Drop`] on the owning engine.
+    /// [`Drop`] on the owning engine. Locks `state` itself (Drop holds no
+    /// lock), then delegates to the lock-free [`Self::write_kv_persist_sidecar`].
     fn save_kv_persist(&self) {
         if !self.kv_persist_owner {
             return;
@@ -2073,11 +2084,62 @@ impl CpuEngine {
         let Ok(state) = self.state.lock() else {
             return;
         };
-        let KvBackend::Contiguous(kv) = &state.kv_backend else {
+        if let Some(n) = self.write_kv_persist_sidecar(&state, cap) {
+            if n > 0 {
+                tracing::info!(
+                    snapshots = n,
+                    "kv persist: session snapshots saved for warm restart"
+                );
+            }
+        }
+    }
+
+    /// F12 — periodic mid-session checkpoint. Re-writes the warm-restart sidecar
+    /// from the live pool once `kv_persist_interval_secs` has elapsed, so a hard
+    /// kill loses at most the last interval instead of the whole conversation.
+    ///
+    /// Takes the ALREADY-LOCKED `state` (called from the generation path right
+    /// after `commit_snapshot`, so the pool already carries this request's full
+    /// sequence) and never re-locks `self.state` — re-locking the held guard
+    /// would deadlock. No-op unless this engine owns the sidecar AND the clock
+    /// fires; the clock is inert when `kv_persist_interval_secs == 0`, so the
+    /// default path is byte-identical to pre-F12.
+    fn maybe_checkpoint_kv_persist(&self, state: &EngineState) {
+        if !self.kv_persist_owner {
             return;
+        }
+        let cap = crate::kv_persist::kv_persist_cap_bytes();
+        if cap == 0 {
+            return;
+        }
+        // Cheap clock gate before touching the backend.
+        {
+            let Ok(mut clk) = self.checkpoint_clock.lock() else {
+                return;
+            };
+            if !clk.should_checkpoint(std::time::Instant::now()) {
+                return;
+            }
+        }
+        if let Some(n) = self.write_kv_persist_sidecar(state, cap) {
+            tracing::debug!(
+                snapshots = n,
+                "kv persist: periodic checkpoint written (F12)"
+            );
+        }
+    }
+
+    /// Serialize the current prefix pool to `<model>.rlkv`. Lock-free: the
+    /// caller provides the locked `state`. Returns `Some(n)` snapshots written
+    /// on a successful save path (the contiguous-F32 case), `None` when the
+    /// backend can't be persisted (non-contiguous / non-uniform-F32). Shared by
+    /// the Drop save and the F12 periodic checkpoint.
+    fn write_kv_persist_sidecar(&self, state: &EngineState, cap: u64) -> Option<usize> {
+        let KvBackend::Contiguous(kv) = &state.kv_backend else {
+            return None;
         };
         if !kv.is_uniform_f32() {
-            return;
+            return None;
         }
         match crate::kv_persist::save_pool(
             &self.source_path,
@@ -2087,15 +2149,10 @@ impl CpuEngine {
             kv.head_dim,
             cap,
         ) {
-            Ok(n) if n > 0 => {
-                tracing::info!(
-                    snapshots = n,
-                    "kv persist: session snapshots saved for warm restart"
-                );
-            }
-            Ok(_) => {}
+            Ok(n) => Some(n),
             Err(e) => {
                 tracing::debug!(error = %e, "kv persist save failed (non-fatal)");
+                Some(0)
             }
         }
     }
@@ -2585,6 +2642,10 @@ impl CpuEngine {
             expert_usage: None,
             kv_persist_owner: false,
             cacheblend: None,
+            checkpoint_clock: Mutex::new(crate::kv_persist::CheckpointClock::new(
+                crate::kv_persist::kv_persist_interval(),
+                std::time::Instant::now(),
+            )),
         })
     }
 
@@ -2751,6 +2812,10 @@ impl CpuEngine {
             expert_usage: None,
             kv_persist_owner: false,
             cacheblend: None,
+            checkpoint_clock: Mutex::new(crate::kv_persist::CheckpointClock::new(
+                crate::kv_persist::kv_persist_interval(),
+                std::time::Instant::now(),
+            )),
         })
     }
 
@@ -4265,6 +4330,10 @@ impl CpuEngine {
             kv_persist_owner: false,
             // Forks inherit the parent's tuned CacheBlend ratio (plain Copy).
             cacheblend: self.cacheblend,
+            checkpoint_clock: Mutex::new(crate::kv_persist::CheckpointClock::new(
+                crate::kv_persist::kv_persist_interval(),
+                std::time::Instant::now(),
+            )),
         }
     }
 
@@ -4857,6 +4926,11 @@ impl CpuEngine {
         let mut snapshot = prompt_u32;
         snapshot.extend(out.iter().copied());
         state.commit_snapshot(snapshot);
+        // F12: periodic warm-restart checkpoint (inert unless
+        // `kv_persist_interval_secs > 0` and the clock has elapsed). The pool
+        // now carries this request's full sequence, so the checkpoint preserves
+        // the live session. Uses the held `state` — never re-locks.
+        self.maybe_checkpoint_kv_persist(&state);
 
         Ok(out)
     }
@@ -5431,6 +5505,11 @@ impl CpuEngine {
         let mut snapshot = prompt_u32;
         snapshot.extend(new_ids);
         state.commit_snapshot(snapshot);
+        // F12: periodic warm-restart checkpoint (inert unless
+        // `kv_persist_interval_secs > 0` and the clock has elapsed). The pool
+        // now carries this request's full sequence, so the checkpoint preserves
+        // the live session. Uses the held `state` — never re-locks.
+        self.maybe_checkpoint_kv_persist(&state);
 
         Ok(out)
     }
@@ -5825,6 +5904,11 @@ impl CpuEngine {
         let mut snapshot = prompt_u32;
         snapshot.extend(generated);
         state.commit_snapshot(snapshot);
+        // F12: periodic warm-restart checkpoint (inert unless
+        // `kv_persist_interval_secs > 0` and the clock has elapsed). The pool
+        // now carries this request's full sequence, so the checkpoint preserves
+        // the live session. Uses the held `state` — never re-locks.
+        self.maybe_checkpoint_kv_persist(&state);
 
         Ok(())
     }

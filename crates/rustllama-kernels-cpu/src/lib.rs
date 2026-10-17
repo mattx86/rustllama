@@ -13,6 +13,7 @@ pub mod delta_net;
 pub mod mlx_affine;
 pub mod mxfp;
 pub mod mxfp_kv;
+pub mod numa;
 pub mod nvfp4;
 pub mod hadamard;
 pub mod q4_0_kv;
@@ -11152,6 +11153,35 @@ pub fn install_thread_pool_pinned(enabled_cpus: Vec<u32>, threads: usize) {
             }
         }
     });
+}
+
+/// NUMA-aware variant of [`install_thread_pool_pinned`] (F11). When `topo` has
+/// >= 2 nodes, the enabled CPUs are reordered node-grouped (via
+/// [`numa::order_cpus_by_node`]) so consecutive rayon workers share a node and
+/// touch node-local memory; the pool install itself reuses
+/// [`install_thread_pool_pinned`] (only WHICH enabled CPU each worker pins to
+/// changes). With < 2 nodes (every single-socket host, incl. this dev box) it
+/// delegates to [`install_thread_pool_pinned`] with the CPUs unchanged —
+/// **byte-identical** to the historical path. The caller gates this on
+/// `[inference].numa_aware`, so it is only reached when the operator opted in
+/// AND the host is genuinely multi-node.
+pub fn install_thread_pool_numa(
+    enabled_cpus: Vec<u32>,
+    threads: usize,
+    topo: &numa::NumaTopology,
+) {
+    if !topo.is_multi_node() || enabled_cpus.is_empty() {
+        // Single-node / degenerate: historical pinned path, no reordering.
+        install_thread_pool_pinned(enabled_cpus, threads);
+        return;
+    }
+    let ordered = numa::order_cpus_by_node(&enabled_cpus, topo);
+    tracing::info!(
+        nodes = topo.node_count(),
+        enabled = ordered.len(),
+        "NUMA-aware CPU placement: pinning rayon workers node-grouped"
+    );
+    install_thread_pool_pinned(ordered, threads);
 }
 
 /// Best-effort: pin the CALLING thread to a single logical processor.

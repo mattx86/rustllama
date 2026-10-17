@@ -2436,6 +2436,32 @@ pub fn set_kv_persist_mb(mb: u64) {
     kv_persist_mb_cell().store(mb, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `RUSTLLAMA_KV_PERSIST_INTERVAL_SECS` — F12 periodic-checkpoint cadence
+/// (seconds). `0` (default) keeps the historical behavior: the warm-restart
+/// sidecar is written only on graceful engine drop. A non-zero value makes the
+/// engine also re-write the sidecar at request boundaries once this many
+/// seconds have elapsed since the last write, so a hard kill mid-session keeps
+/// all but the last interval of KV. Read at request boundaries (not hot-path).
+fn kv_persist_interval_secs_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static C: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        std::sync::atomic::AtomicU64::new(
+            std::env::var("RUSTLLAMA_KV_PERSIST_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0),
+        )
+    })
+}
+
+pub fn kv_persist_interval_secs() -> u64 {
+    kv_persist_interval_secs_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_kv_persist_interval_secs(secs: u64) {
+    kv_persist_interval_secs_cell().store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// `RUSTLLAMA_LOCK_RAM_MB` — RAM-lock budget directive (`"auto"` | MB |
 /// unset). Stored as the raw string; the engine's `pagelock` parses it.
 /// Returns the engine-set override if present, else the legacy env var.

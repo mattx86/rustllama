@@ -494,6 +494,13 @@ pub fn measure_per_device_perf(
         }
     }
 
+    // --- F14: extra (non-active) CUDA GPUs ---
+    // Inert on a single-GPU / non-CUDA host (incl. this box): `scores`/`tiers`
+    // are left exactly as the active-tier + CPU-tier blocks above produced them,
+    // so the report is byte-identical to the single-device path. Only a genuine
+    // multi-CUDA-GPU host records additional per-device entries (write-blind).
+    measure_extra_cuda_gpus(&mut scores, &mut tiers);
+
     Ok(PerDevicePerfReport { load_ms, scores, tiers })
 }
 
@@ -514,17 +521,138 @@ fn active_gpu_slug() -> Option<(String, String)> {
     Some((slug, format!("SYCL device {idx} ({})", info.name)))
 }
 
-/// SCAFFOLD placeholder for measuring a NON-active GPU on a multi-GPU host.
-/// Returns `None` today: end-to-end decode on an arbitrary device needs
-/// per-device dispatch selection the engine does not yet expose. The
-/// combined-build owner wires this (e.g. a synthetic per-device matvec via
-/// `CudaMatvecCache::new(idx, budget)` / `SyclAccel::try_new(idx)`, or an
-/// engine device-select seam) and records the result under
-/// `rustllama_tuner::{cuda,sycl}_gpu_key`. Kept as an explicit seam so the
-/// call site + intent are discoverable rather than silently absent.
-#[allow(dead_code)]
-fn measure_extra_gpu_stub(_device_index: u32) -> Option<f32> {
-    None
+/// F14 — real per-device micro-bench for a NON-active GPU. Runs a
+/// representative packed (Q8_0) matvec on CUDA device `device_index` and returns
+/// its throughput in **matvecs/sec** (median of `reps` timed runs, after a
+/// warmup). This replaces the former `measure_extra_gpu_stub`: a secondary GPU
+/// now gets a real measured number instead of being silently excluded.
+///
+/// Returns `None` when no such CUDA device exists, the per-device cache can't be
+/// created, or a run fails — so on a **non-CUDA or single-GPU host this is inert**
+/// (`CudaMatvecCache::new` yields `None` off-NVIDIA, and `device_count()` is 0/1),
+/// and the single-device measurement path is byte-identical to before. The
+/// multi-GPU numbers themselves are WRITE-BLIND (no second GPU on this box);
+/// the structure is exercised by the unit tests + the inert single-GPU path.
+///
+/// Why a micro-bench rather than full decode: end-to-end decode on an arbitrary
+/// device needs a per-device dispatch seam the engine doesn't expose (the active
+/// SYCL/CUDA device is fixed at load). A per-device `CudaMatvecCache` DOES let us
+/// time real device work in isolation, which [`scale_extra_gpu_tps`] converts
+/// into a decode-tok/s-equivalent score by anchoring to the active GPU's
+/// measured end-to-end tps.
+fn measure_matvec_throughput_cuda(device_index: u32, reps: u32) -> Option<f64> {
+    use rustllama_kernels_cuda::{CudaMatvecCache, CudaPackedKind};
+    // Representative decode-ish projection shape (square 4096×4096 Q8_0).
+    const M: usize = 4096;
+    const K: usize = 4096;
+    let kind = CudaPackedKind::Q8_0;
+    let row_bytes = kind.row_bytes(K);
+    // Budget enough to resident-cache the one synthetic weight on the device.
+    let budget = M * row_bytes + (1 << 20);
+    let mut cache = CudaMatvecCache::new(device_index, budget)?;
+    // Shape-valid synthetic weight (contents arbitrary — this is a timing
+    // bench, not a correctness probe) + input / output scratch.
+    let w = vec![0u8; M * row_bytes];
+    let x = vec![1.0f32; K];
+    let mut out = vec![0.0f32; M];
+    let weight_key = w.as_ptr() as usize;
+    // Warmup: JIT + weight upload + first device touch (not timed).
+    if !cache.matvec_packed(kind, weight_key, &w, &x, &mut out, M, K) {
+        return None;
+    }
+    let mut rates: Vec<f64> = Vec::with_capacity(reps.max(1) as usize);
+    for _ in 0..reps.max(1) {
+        let t = std::time::Instant::now();
+        if !cache.matvec_packed(kind, weight_key, &w, &x, &mut out, M, K) {
+            return None;
+        }
+        let secs = t.elapsed().as_secs_f64();
+        if secs > 0.0 {
+            rates.push(1.0 / secs); // matvecs/sec
+        }
+    }
+    if rates.is_empty() {
+        return None;
+    }
+    rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    Some(rates[rates.len() / 2])
+}
+
+/// F14 — convert an extra GPU's raw micro-bench throughput into a
+/// decode-tok/s-equivalent score by scaling the ACTIVE GPU's measured
+/// end-to-end decode tps by the throughput ratio. This keeps every per-device
+/// score in the SAME unit (decode tok/s) so the heat planner can rank a
+/// secondary GPU directly against the active one and the CPU. `None` when any
+/// input is non-positive (no valid ratio to form). Pure — unit-tested without a
+/// GPU.
+fn scale_extra_gpu_tps(active_decode_tps: f64, active_mv: f64, extra_mv: f64) -> Option<f32> {
+    if active_decode_tps <= 0.0 || active_mv <= 0.0 || extra_mv <= 0.0 {
+        return None;
+    }
+    Some((active_decode_tps * (extra_mv / active_mv)) as f32)
+}
+
+/// F14 — measure each non-active CUDA GPU and fold a decode-tok/s-equivalent
+/// score into `scores` + `tiers`. No-op unless a CUDA GPU is active AND the host
+/// has >= 2 CUDA devices AND the active tier already recorded a decode tps to
+/// anchor the scaling — so on a single-GPU / non-CUDA host (incl. this box) this
+/// leaves `scores`/`tiers` untouched and the report is byte-identical to the
+/// single-device path. The active device is index 0 (matching
+/// [`active_gpu_slug`]); extras are `1..device_count()`.
+fn measure_extra_cuda_gpus(
+    scores: &mut std::collections::HashMap<String, f32>,
+    tiers: &mut Vec<PerDeviceTierResult>,
+) {
+    if !rustllama_models::accel::cuda_active() {
+        return;
+    }
+    let count = rustllama_kernels_cuda::device_count();
+    if count < 2 {
+        return;
+    }
+    // Anchor on the active CUDA device's already-measured end-to-end decode tps.
+    let Some((active_slug, _)) = active_gpu_slug() else {
+        return;
+    };
+    let Some(active_tps) = scores.get(&active_slug).copied() else {
+        return;
+    };
+    const REPS: u32 = 5;
+    let Some(active_mv) = measure_matvec_throughput_cuda(0, REPS) else {
+        return;
+    };
+    for idx in 1..count {
+        let Ok(info) = rustllama_kernels_cuda::device_info(idx) else {
+            continue;
+        };
+        let slug = rustllama_tuner::cuda_gpu_key(&info);
+        let label = format!("CUDA device {idx} ({})", info.name);
+        match measure_matvec_throughput_cuda(idx, REPS) {
+            Some(extra_mv) => match scale_extra_gpu_tps(active_tps as f64, active_mv, extra_mv) {
+                Some(tps) => {
+                    scores.insert(slug.clone(), tps);
+                    tiers.push(PerDeviceTierResult {
+                        slug,
+                        label,
+                        median_tps: Some(tps as f64),
+                        error: None,
+                    });
+                }
+                None => tiers.push(PerDeviceTierResult {
+                    slug,
+                    label,
+                    median_tps: None,
+                    error: Some("extra-GPU scaling produced no score".into()),
+                }),
+            },
+            None => tiers.push(PerDeviceTierResult {
+                slug,
+                label,
+                median_tps: None,
+                error: Some("extra-GPU micro-bench failed".into()),
+            }),
+        }
+    }
 }
 
 /// Per-candidate result from a KV-dtype sweep. `median_tps` is
@@ -4113,5 +4241,44 @@ mod kv_coherence_tests {
             report.pick_speed_first_if_fits(0.90, 1_000_000_000, |dt| kv_bytes_est(dt, base)),
             Some(KvDtype::F32)
         );
+    }
+}
+
+#[cfg(test)]
+mod f14_per_device_tests {
+    use super::*;
+
+    #[test]
+    fn scale_extra_gpu_tps_anchors_to_active_decode() {
+        // Active GPU decodes at 25 tok/s and micro-benches at 1000 matvecs/s.
+        // An extra GPU that micro-benches at 2000 is ~2× → ~50 tok/s-equivalent.
+        assert_eq!(scale_extra_gpu_tps(25.0, 1000.0, 2000.0), Some(50.0));
+        // A slower extra GPU (500) → ~12.5 tok/s-equivalent.
+        assert_eq!(scale_extra_gpu_tps(25.0, 1000.0, 500.0), Some(12.5));
+        // Non-positive inputs form no ratio.
+        assert_eq!(scale_extra_gpu_tps(0.0, 1000.0, 2000.0), None);
+        assert_eq!(scale_extra_gpu_tps(25.0, 0.0, 2000.0), None);
+        assert_eq!(scale_extra_gpu_tps(25.0, 1000.0, 0.0), None);
+    }
+
+    #[test]
+    fn extra_gpu_measurement_is_inert_without_cuda() {
+        // On this (non-CUDA) box the per-device micro-bench can't build a cache,
+        // so it returns None — the inert / byte-identical fallback the active
+        // single-device path relies on.
+        assert_eq!(measure_matvec_throughput_cuda(0, 2), None);
+    }
+
+    #[test]
+    fn measure_extra_cuda_gpus_leaves_report_unchanged_on_single_gpu() {
+        // F14 byte-identical guard: with no active CUDA GPU (or < 2 devices), the
+        // extra-GPU pass must not touch `scores`/`tiers`.
+        let mut scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        scores.insert("cpu-slug".into(), 7.5);
+        let mut tiers: Vec<PerDeviceTierResult> = Vec::new();
+        measure_extra_cuda_gpus(&mut scores, &mut tiers);
+        assert_eq!(scores.len(), 1, "no extra-GPU entries added on a single-GPU host");
+        assert_eq!(scores.get("cpu-slug"), Some(&7.5));
+        assert!(tiers.is_empty(), "no extra-GPU tiers added on a single-GPU host");
     }
 }

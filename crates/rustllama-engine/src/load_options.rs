@@ -46,6 +46,8 @@ pub struct LoadOptionsInput {
     pub memory_budget: String,
     pub ssm_prefill_chunked: bool,
     pub kv_persist_mb: u64,
+    /// F12 periodic KV-checkpoint cadence (seconds); `0` = off (drop-only save).
+    pub kv_persist_interval_secs: u64,
     pub moe_expert_cache_mb: u64,
     /// Already resolved from the tuner cache by the caller.
     pub moe_experts_cpu: bool,
@@ -93,6 +95,8 @@ pub struct LoadOptions {
     pub memory_budget: Option<String>,
     pub ssm_prefill_chunked: bool,
     pub kv_persist_mb: u64,
+    /// F12 periodic KV-checkpoint cadence (seconds); `0` = off.
+    pub kv_persist_interval_secs: u64,
     pub moe_expert_cache_mb: u64,
     pub moe_experts_cpu: bool,
     pub moe_gpu_split_permille: u32,
@@ -168,6 +172,10 @@ impl LoadOptions {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(input.kv_persist_mb);
+        let kv_persist_interval_secs = std::env::var("RUSTLLAMA_KV_PERSIST_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(input.kv_persist_interval_secs);
         let moe_expert_cache_mb = std::env::var("RUSTLLAMA_MOE_EXPERT_CACHE_MB")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -244,6 +252,7 @@ impl LoadOptions {
             memory_budget,
             ssm_prefill_chunked,
             kv_persist_mb,
+            kv_persist_interval_secs,
             moe_expert_cache_mb,
             moe_experts_cpu,
             moe_gpu_split_permille,
@@ -275,6 +284,7 @@ impl LoadOptions {
         accel::set_ssm_prefill_chunked(self.ssm_prefill_chunked);
         accel::set_hybrid_kv_any(self.hybrid_kv_any);
         accel::set_kv_persist_mb(self.kv_persist_mb);
+        accel::set_kv_persist_interval_secs(self.kv_persist_interval_secs);
         accel::set_moe_experts_cpu(self.moe_experts_cpu);
         accel::set_moe_gpu_split_permille(self.moe_gpu_split_permille);
         if self.moe_expert_cache_mb > 0 {
@@ -340,6 +350,12 @@ impl LoadOptions {
         }
         if self.kv_persist_mb > 0 {
             out.push(("RUSTLLAMA_KV_PERSIST_MB", self.kv_persist_mb.to_string()));
+        }
+        if self.kv_persist_interval_secs > 0 {
+            out.push((
+                "RUSTLLAMA_KV_PERSIST_INTERVAL_SECS",
+                self.kv_persist_interval_secs.to_string(),
+            ));
         }
         if self.moe_expert_cache_mb > 0 {
             out.push((
