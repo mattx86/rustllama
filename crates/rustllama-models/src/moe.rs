@@ -779,6 +779,13 @@ pub fn moe_ffn_one_into_parts(
     hidden: &[f32],
     router: &Tensor,
     spec: &RouterSpec,
+    // M1-tail: DeepSeek-V3 routed-expert selection bias (`exp_probs_b`, aka
+    // `e_score_correction_bias`). Added to the router scores for expert
+    // SELECTION only — it ranks which experts win, and is NOT added to the
+    // routing WEIGHTS that scale the chosen experts' outputs. `None` for
+    // DeepSeek-V2-Lite / qwen35moe / any arch without the tensor, which
+    // reproduces the pre-M1-tail behaviour byte-for-byte.
+    exp_probs_b: Option<&[f32]>,
     gate_per_expert: &[Tensor],
     up_per_expert: &[Tensor],
     down_per_expert: &[Tensor],
@@ -807,16 +814,17 @@ pub fn moe_ffn_one_into_parts(
     for v in out.iter_mut() {
         *v = 0.0;
     }
-    // D4+M4: hybrid MoE routing honours the arch's RouterSpec. Hybrid
-    // GGUFs carry no routed bias (`exp_probs_b` is DeepSeek-V3 only), so
-    // the bias is `None` here.
+    // D4+M4: hybrid MoE routing honours the arch's RouterSpec. M1-tail:
+    // the routed selection bias is now threaded in by the caller — the MLA
+    // forward (DeepSeek-V3) passes `blk.N.exp_probs_b`; qwen35moe / V2-Lite
+    // carry no such tensor and pass `None`, so their routing is unchanged.
     route_topk_into_spec(
         hidden,
         router,
         n_experts,
         top_k,
         spec,
-        None,
+        exp_probs_b,
         expert_logits,
         picks,
     );
@@ -1487,6 +1495,7 @@ mod tests {
                 &hidden_rows[t * d_model..(t + 1) * d_model],
                 &router,
                 &RouterSpec::default(),
+                None, // exp_probs_b: no routed bias in this fixture
                 &gates,
                 &ups,
                 &downs,
@@ -1770,6 +1779,109 @@ mod tests {
             (picks[0].1 - 0.1749).abs() < 1e-3,
             "weight is expert 0's own score (not 10.17, not 0.4753), got {}",
             picks[0].1
+        );
+    }
+
+    /// M1-tail ANCHOR: the routed selection bias (`exp_probs_b`) is now
+    /// threaded through `moe_ffn_one_into_parts` — the FFN helper the MLA
+    /// (DeepSeek-V3) forward calls. With an identity router (logits ==
+    /// hidden), a hand-picked bias flips which expert is SELECTED (and thus
+    /// which expert's FFN output lands in `out`), while the stored routing
+    /// WEIGHT stays each selected expert's own UN-biased softmax score.
+    /// `None` reproduces the pre-tail selection exactly (V2-Lite / qwen35moe).
+    #[test]
+    fn parts_exp_probs_b_shifts_selection_not_weight() {
+        let n_experts = 4usize;
+        let d_model = 4usize; // == n_experts for the identity router
+        let d_ff = 2usize;
+        let top_k = 1usize;
+        // Distinct per-expert weights so a different pick ⇒ a different `out`.
+        let mk = |e: usize, rows: usize, cols: usize, tag: &str| {
+            let vals: Vec<f32> = (0..rows * cols)
+                .map(|i| ((e * 31 + i * 7) % 13) as f32 * 0.05 - 0.3)
+                .collect();
+            tensor_f16_from_rowmajor(&vals, rows, cols, &format!("{tag}.e{e}"))
+        };
+        let router = identity_router(n_experts);
+        let gates: Vec<Tensor> = (0..n_experts).map(|e| mk(e, d_ff, d_model, "g")).collect();
+        let ups: Vec<Tensor> = (0..n_experts).map(|e| mk(e, d_ff, d_model, "u")).collect();
+        let downs: Vec<Tensor> = (0..n_experts).map(|e| mk(e, d_model, d_ff, "d")).collect();
+        // logits == hidden (identity router). Raw top-1 = expert 1 (score 2).
+        let hidden = vec![0.0f32, 2.0, 0.0, 1.0];
+        // Raw-softmax weights (norm_topk=false) so the stored weight is the
+        // expert's own score, not a renormalized 1.0.
+        let spec = RouterSpec {
+            norm_topk: false,
+            ..Default::default()
+        };
+
+        let run = |bias: Option<&[f32]>| -> (Vec<(usize, f32)>, Vec<f32>) {
+            let mut out = vec![0.0f32; d_model];
+            let mut gate_buf = vec![0.0f32; d_ff];
+            let mut up_buf = vec![0.0f32; d_ff];
+            let mut ff_buf = vec![0.0f32; d_ff];
+            let mut down_buf = vec![0.0f32; d_model];
+            let mut el = vec![0.0f32; n_experts];
+            let mut picks: Vec<(usize, f32)> = Vec::with_capacity(top_k);
+            moe_ffn_one_into_parts(
+                &hidden,
+                &router,
+                &spec,
+                bias,
+                &gates,
+                &ups,
+                &downs,
+                None,
+                None,
+                None,
+                None,
+                d_model,
+                d_ff,
+                n_experts,
+                top_k,
+                &mut out,
+                &mut gate_buf,
+                &mut up_buf,
+                &mut ff_buf,
+                &mut down_buf,
+                &mut el,
+                &mut picks,
+            );
+            (picks, out)
+        };
+
+        // softmax([0,2,0,1]) ≈ [0.0826, 0.6104, 0.0826, 0.2245].
+        let (picks_none, out_none) = run(None);
+        assert_eq!(picks_none[0].0, 1, "no bias ⇒ raw top-1 is expert 1");
+        assert!(
+            (picks_none[0].1 - 0.6104).abs() < 1e-3,
+            "no bias ⇒ expert 1's own softmax weight, got {}",
+            picks_none[0].1
+        );
+
+        // A large bias on expert 3 flips the SELECTION to expert 3.
+        let bias = [0.0f32, 0.0, 0.0, 10.0];
+        let (picks_biased, out_biased) = run(Some(&bias));
+        assert_eq!(
+            picks_biased[0].0, 3,
+            "exp_probs_b must flip selection to expert 3"
+        );
+        // ...but the stored weight is expert 3's UN-biased score (0.2245),
+        // NOT softmax of the biased score (which would be ~1.0).
+        assert!(
+            (picks_biased[0].1 - 0.2245).abs() < 1e-3,
+            "weight is the un-biased score of the selected expert, got {}",
+            picks_biased[0].1
+        );
+        // A different expert ran ⇒ a different FFN output.
+        let max_diff = out_none
+            .iter()
+            .zip(out_biased.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "biased selection must change the FFN output, max|Δ|={max_diff}"
         );
     }
 

@@ -1421,6 +1421,14 @@ pub struct VlmPrefillInputs {
     /// .d_text()` — surfaced here so the caller doesn't need a second
     /// borrow into `model.projector` to call [`splice_image_embeddings`].
     pub d_text: usize,
+    /// M5-tail: per-image post-merge patch grid `[t, h, w]` (temporal
+    /// frames × rows × cols), one entry per attached image in payload
+    /// order. The text model's multimodal RoPE (Qwen2-VL / Qwen2.5-VL)
+    /// gives each image token its 3-D grid coordinate and advances the
+    /// text position after an image by `max(t, h, w)` — NOT the flat token
+    /// count. This pipeline resizes to a square `image_size`, so the grid
+    /// is `[1, g, g]` with `g = √num_tokens`. Empty on a text-only request.
+    pub grid_thw: Vec<[u32; 3]>,
 }
 
 impl VlmPrefillInputs {
@@ -1428,6 +1436,73 @@ impl VlmPrefillInputs {
     /// [`splice_image_embeddings`], which takes `&[&[f32]]`.
     pub fn feature_slices(&self) -> Vec<&[f32]> {
         self.features.iter().map(|v| v.as_slice()).collect()
+    }
+
+    /// M5-tail: per-token multimodal-RoPE 3-D `[t, h, w]` positions for the
+    /// SPLICED sequence (`seq_len` tokens, running position seeded at
+    /// `start_pos`), using the real per-image patch grids in [`grid_thw`].
+    ///
+    /// Defined for the **OnePerPatch** convention (Qwen2-VL / Qwen2.5-VL),
+    /// where the splice is 1:1 so `seq_len == prompt_tokens.len()` and each
+    /// image occupies a consecutive run of `t*h*w` placeholder positions
+    /// (recorded in [`positions`]). Text tokens get `(p, p, p)` (bit-
+    /// identical to 1-D RoPE); image tokens get their patch-grid coords; the
+    /// text position after an image jumps to `max(grid) + 1`. The segment
+    /// layout is reconstructed from the (strictly-ascending) placeholder
+    /// positions and [`grid_thw`], then fed to [`mrope_positions`].
+    ///
+    /// Returns `None` when the placeholder runs don't partition into the
+    /// per-image grids (prompt / grid mismatch) so the caller can fall back
+    /// to scalar positions rather than mis-rotate. The returned vector has
+    /// length `seq_len`.
+    pub fn mrope_positions_for_sequence(
+        &self,
+        seq_len: usize,
+        start_pos: u32,
+    ) -> Option<Vec<[u32; 3]>> {
+        let mut segments: Vec<MropeSegment> = Vec::new();
+        let mut cursor = 0usize; // next unconsumed sequence index
+        let mut img = 0usize; // next image / grid
+        let mut pi = 0usize; // index into self.positions
+        while pi < self.positions.len() {
+            let run_start = self.positions[pi];
+            if run_start < cursor {
+                return None; // non-ascending / overlapping placeholder runs
+            }
+            if run_start > cursor {
+                segments.push(MropeSegment::Text(run_start - cursor));
+            }
+            // Measure the consecutive placeholder run starting at `pi`.
+            let mut run_len = 1usize;
+            while pi + run_len < self.positions.len()
+                && self.positions[pi + run_len] == run_start + run_len
+            {
+                run_len += 1;
+            }
+            let grid = *self.grid_thw.get(img)?;
+            let expect = (grid[0] as usize) * (grid[1] as usize) * (grid[2] as usize);
+            if expect != run_len {
+                return None; // this image's grid doesn't fill its placeholder run
+            }
+            segments.push(MropeSegment::Image {
+                t: grid[0],
+                h: grid[1],
+                w: grid[2],
+            });
+            cursor = run_start + run_len;
+            pi += run_len;
+            img += 1;
+        }
+        if cursor > seq_len {
+            return None;
+        }
+        if cursor < seq_len {
+            segments.push(MropeSegment::Text(seq_len - cursor));
+        }
+        if img != self.grid_thw.len() {
+            return None; // not every image was consumed by a placeholder run
+        }
+        Some(mrope_positions(&segments, start_pos))
     }
 }
 
@@ -1529,6 +1604,26 @@ pub fn prepare_vlm_inputs_with_mode(
         features_per_image.push(feat);
     }
 
+    // M5-tail: derive each image's post-merge patch grid `[t, h, w]` for the
+    // text model's multimodal RoPE, BEFORE `features_per_image` is consumed
+    // by the mode match below. This pipeline resizes every image to a square
+    // `image_size`, so the merged grid is square: one temporal frame and
+    // `g = √num_tokens` rows == cols. A token count that isn't a perfect
+    // square (no projector here produces one) degrades to `[1, 1, n]` so the
+    // running position still advances safely.
+    let grid_thw: Vec<[u32; 3]> = features_per_image
+        .iter()
+        .map(|feat| {
+            let n = if d_text > 0 { feat.len() / d_text } else { 0 };
+            let g = (n as f64).sqrt() as usize;
+            if g > 0 && g * g == n {
+                [1, g as u32, g as u32]
+            } else {
+                [1, 1, n as u32]
+            }
+        })
+        .collect();
+
     match mode {
         PlaceholderMode::OnePerImage => {
             if positions.len() != image_payloads.len() {
@@ -1542,6 +1637,7 @@ pub fn prepare_vlm_inputs_with_mode(
                 positions,
                 features: features_per_image,
                 d_text,
+                grid_thw,
             })
         }
         PlaceholderMode::OnePerPatch => {
@@ -1594,6 +1690,7 @@ pub fn prepare_vlm_inputs_with_mode(
                 positions,
                 features: features_flat,
                 d_text,
+                grid_thw,
             })
         }
     }
@@ -2220,6 +2317,68 @@ mod tests {
         // trailing text token is at max(2,1,3)=3.
         assert_eq!(two.last(), Some(&[3, 3, 3]));
         assert_eq!(two.len(), 2 * 1 * 3 + 1);
+    }
+
+    /// M5-tail ANCHOR: the REAL per-image grid (`VlmPrefillInputs::grid_thw`)
+    /// now drives the 3-D position assignment end-to-end. Rebuilds the
+    /// text/image segment layout from the placeholder positions + the grid,
+    /// and checks the (t,h,w)-grid rule: image tokens take their patch-grid
+    /// coords and the following text position jumps to `max(grid)+1` (not the
+    /// flat 4-token count). The grid is threaded, not a placeholder t=1/flat
+    /// assumption. A text-only `VlmPrefillInputs` (no grids) stays 1-D.
+    #[test]
+    fn grid_thw_drives_mrope_positions_for_sequence() {
+        use super::VlmPrefillInputs;
+
+        // OnePerPatch layout: 2 text tokens, then a 1×2×2 image (4 image-pad
+        // placeholders at seq positions 2,3,4,5), then 1 trailing text token.
+        // seq_len = 7 (the splice is 1:1 in OnePerPatch).
+        let inputs = VlmPrefillInputs {
+            positions: vec![2, 3, 4, 5],
+            features: vec![vec![0.0; 4]], // one image, 4 patch rows (d_text=1)
+            d_text: 1,
+            grid_thw: vec![[1, 2, 2]],
+        };
+        let pos = inputs
+            .mrope_positions_for_sequence(7, 0)
+            .expect("placeholder runs must partition into the per-image grid");
+        assert_eq!(
+            pos,
+            vec![
+                [0, 0, 0],
+                [1, 1, 1],
+                [2, 2, 2],
+                [2, 2, 3],
+                [2, 3, 2],
+                [2, 3, 3],
+                [4, 4, 4], // text AFTER the image = max(grid)+1 = 3+1, NOT 2+4
+            ],
+            "the real grid_thw must place image tokens at their (t,h,w) coords \
+             and jump the trailing text position to max(grid)+1"
+        );
+
+        // A grid that does not fill its placeholder run ⇒ None (caller falls
+        // back to scalar positions rather than mis-rotating).
+        let bad = VlmPrefillInputs {
+            positions: vec![2, 3, 4, 5],
+            features: vec![vec![0.0; 4]],
+            d_text: 1,
+            grid_thw: vec![[1, 1, 2]], // only 2 tokens, but the run is 4 long
+        };
+        assert!(bad.mrope_positions_for_sequence(7, 0).is_none());
+
+        // Text-only request (no images / grids): plain incrementing 1-D
+        // positions broadcast across all three axes.
+        let text_only = VlmPrefillInputs {
+            positions: vec![],
+            features: vec![],
+            d_text: 1,
+            grid_thw: vec![],
+        };
+        let tp = text_only
+            .mrope_positions_for_sequence(3, 0)
+            .expect("text-only sequence has a trivial partition");
+        assert_eq!(tp, vec![[0, 0, 0], [1, 1, 1], [2, 2, 2]]);
     }
 
     /// M5 ANCHOR (text-byte-identical, models-crate view): a text token's

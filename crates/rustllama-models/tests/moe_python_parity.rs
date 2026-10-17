@@ -140,6 +140,7 @@ fn moe_ffn_one_into_parts_matches_python_reference() {
         &hidden,
         &router,
         &RouterSpec::default(),
+        None, // exp_probs_b: no DeepSeek-V3 routed bias in this fixture
         &gate_per_expert,
         &up_per_expert,
         &down_per_expert,
@@ -166,6 +167,7 @@ fn moe_ffn_one_into_parts_matches_python_reference() {
         &hidden,
         &router,
         &RouterSpec::default(),
+        None, // exp_probs_b: no DeepSeek-V3 routed bias in this fixture
         &gate_per_expert,
         &up_per_expert,
         &down_per_expert,

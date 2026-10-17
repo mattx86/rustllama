@@ -1170,6 +1170,13 @@ pub enum HybridFfn {
         gate_per_expert: Vec<Tensor>,
         up_per_expert: Vec<Tensor>,
         down_per_expert: Vec<Tensor>,
+        /// M1-tail: DeepSeek-V3 routed-expert selection bias
+        /// (`blk.N.exp_probs_b`, aka `e_score_correction_bias`). Added to
+        /// router scores for expert SELECTION only (never to the routing
+        /// weights). `[n_experts]` long when present. `None` on
+        /// DeepSeek-V2-Lite (no such tensor) and on qwen35moe hybrids, so
+        /// those paths route byte-identically to before.
+        exp_probs_b: Option<Vec<f32>>,
     },
     /// Plain dense SwiGLU: `down( silu(gate(x)) * up(x) )` at
     /// `cfg.d_ff` (17408 on Bonsai-2-27B). No expert cache, no
@@ -2343,6 +2350,10 @@ fn load_hybrid_layers(
                 gate_per_expert,
                 up_per_expert,
                 down_per_expert,
+                // M1-tail: qwen35moe hybrids carry no routed selection bias
+                // (`exp_probs_b` is DeepSeek-V3 only) ⇒ `None`, so routing is
+                // byte-identical.
+                exp_probs_b: None,
             }
         } else {
             HybridFfn::Dense {
@@ -2494,6 +2505,15 @@ fn load_mla_layers(
                 gate_per_expert,
                 up_per_expert,
                 down_per_expert,
+                // M1-tail: DeepSeek-V3 routed-expert selection bias. Mirrors
+                // the dense MoE loader's spellings; only kept when it is the
+                // `[n_experts]` vector the router indexes (a same-named tensor
+                // of another shape is rejected). Absent on DeepSeek-V2-Lite ⇒
+                // `None` ⇒ the MLA MoE FFN routes exactly as before.
+                exp_probs_b: load_optional_norm(gguf, &format!("{prefix}.exp_probs_b.bias"))
+                    .or_else(|| load_optional_norm(gguf, &format!("{prefix}.exp_probs_b.weight")))
+                    .or_else(|| load_optional_norm(gguf, &format!("{prefix}.ffn_gate_inp.bias")))
+                    .filter(|v| v.len() == n_experts),
             }
         } else {
             HybridFfn::Dense {
@@ -7327,7 +7347,27 @@ impl LlamaModel {
         kv: &mut KvCache,
         logits_out: &mut [f32],
     ) {
-        // M1: MLA path (see `forward_one`).
+        self.forward_one_from_embed_mrope(embed_row, pos, None, kv, logits_out);
+    }
+
+    /// M5-tail: [`forward_one_from_embed`] with an explicit multimodal-RoPE
+    /// 3-D `[t, h, w]` position for THIS token. When `mrope_pos` is `Some`
+    /// AND the model carries `rope.dimension_sections` (Qwen2-VL /
+    /// Qwen2.5-VL), the attention RoPE uses the sectioned `(t,h,w)` rotation;
+    /// the scalar `pos` still drives the KV-cache slot + causal window (the
+    /// PHYSICAL token order — mRoPE compresses rotation positions, not cache
+    /// slots). For a text-only / non-sectioned model, or `mrope_pos == None`,
+    /// this is byte-identical to [`forward_one_from_embed`].
+    pub fn forward_one_from_embed_mrope(
+        &self,
+        embed_row: &[f32],
+        pos: u32,
+        mrope_pos: Option<[u32; 3]>,
+        kv: &mut KvCache,
+        logits_out: &mut [f32],
+    ) {
+        // M1: MLA path (see `forward_one`). MLA archs (DeepSeek) are not the
+        // mRoPE VLM family, so the sectioned 3-D position does not apply.
         if self.weights.is_mla() {
             self.forward_one_mla_impl(EmbedInput::Embed(embed_row), pos, kv, logits_out, true);
             return;
@@ -7379,6 +7419,7 @@ impl LlamaModel {
                 self.forward_one_with_scratch_inner(
                     EmbedInput::Embed(embed_row),
                     pos,
+                    mrope_pos,
                     kv,
                     logits_out,
                     scratch,
@@ -7419,6 +7460,50 @@ impl LlamaModel {
             let row = &embeds[i * d..(i + 1) * d];
             let pos = start_pos + i as u32;
             self.forward_one_from_embed(row, pos, kv, &mut logits);
+        }
+        logits
+    }
+
+    /// M5-tail: multimodal-RoPE serial prefill over a `[seq_len, d_model]`
+    /// spliced embedding buffer (the Qwen2-VL / Qwen2.5-VL vision splice).
+    ///
+    /// Identical to [`forward_prefill_from_embeds`] except each token `i`
+    /// also carries its 3-D `[t, h, w]` M-RoPE position (`mrope_positions[i]`,
+    /// one per token, from
+    /// [`VlmPrefillInputs::mrope_positions_for_sequence`]). The scalar
+    /// cache/causal position stays the PHYSICAL `start_pos + i` (mRoPE
+    /// compresses rotation positions, not cache slots); the 3-D triple drives
+    /// only the attention RoPE, and only when the model carries
+    /// `rope.dimension_sections` — so for a model without sections this is
+    /// byte-identical to [`forward_prefill_from_embeds`].
+    pub fn forward_prefill_from_embeds_mrope(
+        &self,
+        embeds: &[f32],
+        start_pos: u32,
+        mrope_positions: &[[u32; 3]],
+        kv: &mut KvCache,
+    ) -> Vec<f32> {
+        let cfg = &self.cfg;
+        let d = cfg.d_model;
+        assert_eq!(
+            embeds.len() % d,
+            0,
+            "embeds.len()={} not a multiple of d_model={}",
+            embeds.len(),
+            d
+        );
+        let n_new = embeds.len() / d;
+        assert_eq!(
+            mrope_positions.len(),
+            n_new,
+            "mrope_positions ({}) must have one [t,h,w] per spliced token ({n_new})",
+            mrope_positions.len()
+        );
+        let mut logits = vec![0.0f32; cfg.vocab_size];
+        for i in 0..n_new {
+            let row = &embeds[i * d..(i + 1) * d];
+            let pos = start_pos + i as u32;
+            self.forward_one_from_embed_mrope(row, pos, Some(mrope_positions[i]), kv, &mut logits);
         }
         logits
     }
@@ -7541,6 +7626,7 @@ impl LlamaModel {
                 self.forward_one_with_scratch_inner(
                     EmbedInput::Token(token_id),
                     pos,
+                    None, // scalar-pos token forward — no multimodal RoPE
                     kv,
                     logits_out,
                     scratch,
@@ -7786,11 +7872,15 @@ impl LlamaModel {
                     w_up_shared,
                     w_down_shared,
                     shared_router,
+                    exp_probs_b,
                     ..
                 } => crate::moe::moe_ffn_one_into_parts(
                     &h_norm,
                     router,
                     &crate::moe::router_spec_for(cfg),
+                    // M1-tail: DeepSeek-V3's routed selection bias now steers
+                    // which experts win in the MLA MoE FFN (was dropped here).
+                    exp_probs_b.as_deref(),
                     gate_per_expert,
                     up_per_expert,
                     down_per_expert,
@@ -8589,6 +8679,7 @@ impl LlamaModel {
                             &tmp_d,
                             router,
                             &crate::moe::router_spec_for(cfg),
+                            None, // M1-tail: qwen35moe hybrids carry no routed bias
                             gate_per_expert,
                             up_per_expert,
                             down_per_expert,
@@ -9283,6 +9374,7 @@ impl LlamaModel {
                             &tmp_d,
                             router,
                             &crate::moe::router_spec_for(cfg),
+                            None, // M1-tail: qwen35moe hybrids carry no routed bias
                             gate_per_expert,
                             up_per_expert,
                             down_per_expert,
@@ -11223,6 +11315,7 @@ impl LlamaModel {
                 self.forward_one_with_scratch_inner(
                     EmbedInput::Token(token_id),
                     pos,
+                    None, // scalar-pos token forward — no multimodal RoPE
                     kv,
                     main_logits_out,
                     scratch,
@@ -11487,6 +11580,7 @@ impl LlamaModel {
                 self.forward_one_with_scratch_inner(
                     EmbedInput::Token(token_id),
                     pos,
+                    None, // scalar-pos token forward — no multimodal RoPE
                     kv,
                     main_logits_out,
                     scratch,
@@ -11772,6 +11866,7 @@ impl LlamaModel {
         &self,
         input: EmbedInput<'_>,
         pos: u32,
+        mrope_pos: Option<[u32; 3]>,
         kv: &mut KvCache,
         logits_out: &mut [f32],
         scratch: &mut crate::accel::ForwardScratch,
@@ -12227,7 +12322,48 @@ impl LlamaModel {
                 // Interleaved layout has no SYCL kernel today (the GPU
                 // kernel ships only the neox/half-split convention), so
                 // that path stays CPU-only.
-                if self.cfg.rope_scaling.is_some() {
+                if let (Some(sections), Some(triple)) =
+                    (self.cfg.rope_dimension_sections.as_deref(), mrope_pos)
+                {
+                    // M5-tail: multimodal sectioned RoPE (Qwen2-VL / Qwen2.5-VL).
+                    // The per-token 3-D (t,h,w) position drives a sectioned NeoX
+                    // rotation: head-dim pairs split across the [t,h,w] axes by
+                    // `sections`. Image tokens carry their patch-grid coords;
+                    // text tokens carry (p,p,p), which `rope_inplace_neox_
+                    // sectioned` makes BIT-identical to 1-D RoPE. CPU-only like
+                    // the rope_scaling detour below (the GPU rope kernels are
+                    // scalar-pos) — RoPE is a tiny slice of forward compute, so
+                    // the detour is negligible. Gated on BOTH sections present
+                    // (VLM only) AND a 3-D position supplied (the VLM mRoPE
+                    // prefill path), so every non-VLM / text-only forward — and
+                    // every scalar-`pos` caller — is byte-identical.
+                    k::rope_inplace_neox_sectioned(
+                        &mut q_buf,
+                        n_heads,
+                        head_dim,
+                        sections,
+                        &triple,
+                        cfg.rope_theta,
+                    );
+                    k::rope_inplace_neox_sectioned(
+                        &mut k_buf,
+                        n_kv_heads,
+                        head_dim,
+                        sections,
+                        &triple,
+                        cfg.rope_theta,
+                    );
+                    // Match `rope_inplace`'s YaRN post-scale (no-op at 1.0, which
+                    // is the mRoPE-VLM case) so the two paths stay consistent.
+                    if self.yarn_mscale != 1.0 {
+                        for x in q_buf.iter_mut() {
+                            *x *= self.yarn_mscale;
+                        }
+                        for x in k_buf.iter_mut() {
+                            *x *= self.yarn_mscale;
+                        }
+                    }
+                } else if self.cfg.rope_scaling.is_some() {
                     // Context-extension scaling (YaRN/NTK/linear): drive RoPE from
                     // the precomputed scaled table on the CPU path. Correctness
                     // first — the GPU rope ladder below is scalar-theta only (the
