@@ -1250,6 +1250,67 @@ extern "C" int rsl_mlx_silu_mul_f32(rsl_mlx_stream *s, const float *x,
     (void)s;(void)x;(void)y;(void)out;(void)n; RSL_MLX_STUB_KERNEL
 #endif
 }
+// P6-fusions (write-blind mirror of the SYCL rsl_rmsnorm_matvec_f32_usm).
+extern "C" int rsl_mlx_rmsnorm_matvec_f32(rsl_mlx_stream *s, const float *x,
+    const float *wnorm, const float *wmat, float *y, int n_rows, int k, int m,
+    float eps) {
+#if RSL_MLX_HAVE_METAL
+    if (!s || !x || !wnorm || !wmat || !y || n_rows <= 0 || k <= 0 || m <= 0) return -1;
+    size_t ox = 0, own = 0, owm = 0, oy = 0;
+    id<MTLBuffer> bx  = mlx_resolve(x, &ox);
+    id<MTLBuffer> bwn = mlx_resolve(wnorm, &own);
+    id<MTLBuffer> bwm = mlx_resolve(wmat, &owm);
+    id<MTLBuffer> by  = mlx_resolve(y, &oy);
+    if (bx == nil || bwn == nil || bwm == nil || by == nil) { g_rsl_mlx_errors++; return -1; }
+    int kk = k, mm = m, nr = n_rows;
+    float ee = eps;
+    const unsigned long long total = (unsigned long long)n_rows * (unsigned long long)m;
+    const NSUInteger tg = 256;
+    MTLSize grid = MTLSizeMake((NSUInteger)((total + tg - 1) / tg), 1, 1);
+    MTLSize tpg = MTLSizeMake(tg, 1, 1);
+    return mlx_run(s, @"rsl_mlx_rmsnorm_matvec_f32_kernel", grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bx  offset:ox  atIndex:0];
+        [enc setBuffer:bwn offset:own atIndex:1];
+        [enc setBuffer:bwm offset:owm atIndex:2];
+        [enc setBuffer:by  offset:oy  atIndex:3];
+        [enc setBytes:&kk length:sizeof(int) atIndex:4];
+        [enc setBytes:&mm length:sizeof(int) atIndex:5];
+        [enc setBytes:&ee length:sizeof(float) atIndex:6];
+        [enc setBytes:&nr length:sizeof(int) atIndex:7];
+    });
+#else
+    (void)s;(void)x;(void)wnorm;(void)wmat;(void)y;(void)n_rows;(void)k;(void)m;(void)eps; RSL_MLX_STUB_KERNEL
+#endif
+}
+// P6-fusions (write-blind mirror of the SYCL rsl_down_residual_f32_usm).
+extern "C" int rsl_mlx_down_residual_f32(rsl_mlx_stream *s, const float *ff,
+    const float *wmat, const float *resid, float *y, int n_rows, int k, int m) {
+#if RSL_MLX_HAVE_METAL
+    if (!s || !ff || !wmat || !resid || !y || n_rows <= 0 || k <= 0 || m <= 0) return -1;
+    size_t of = 0, owm = 0, orr = 0, oy = 0;
+    id<MTLBuffer> bf  = mlx_resolve(ff, &of);
+    id<MTLBuffer> bwm = mlx_resolve(wmat, &owm);
+    id<MTLBuffer> br  = mlx_resolve(resid, &orr);
+    id<MTLBuffer> by  = mlx_resolve(y, &oy);
+    if (bf == nil || bwm == nil || br == nil || by == nil) { g_rsl_mlx_errors++; return -1; }
+    int kk = k, mm = m, nr = n_rows;
+    const unsigned long long total = (unsigned long long)n_rows * (unsigned long long)m;
+    const NSUInteger tg = 256;
+    MTLSize grid = MTLSizeMake((NSUInteger)((total + tg - 1) / tg), 1, 1);
+    MTLSize tpg = MTLSizeMake(tg, 1, 1);
+    return mlx_run(s, @"rsl_mlx_down_residual_f32_kernel", grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bf  offset:of  atIndex:0];
+        [enc setBuffer:bwm offset:owm atIndex:1];
+        [enc setBuffer:br  offset:orr atIndex:2];
+        [enc setBuffer:by  offset:oy  atIndex:3];
+        [enc setBytes:&kk length:sizeof(int) atIndex:4];
+        [enc setBytes:&mm length:sizeof(int) atIndex:5];
+        [enc setBytes:&nr length:sizeof(int) atIndex:6];
+    });
+#else
+    (void)s;(void)ff;(void)wmat;(void)resid;(void)y;(void)n_rows;(void)k;(void)m; RSL_MLX_STUB_KERNEL
+#endif
+}
 extern "C" int rsl_mlx_embedding_lookup_f32(rsl_mlx_stream *s, const float *table,
     const int *ids, float *out, int n_ids, int d) {
 #if RSL_MLX_HAVE_METAL

@@ -250,6 +250,33 @@ mod imp {
             chunk_len: c_int,
         );
 
+        // P6-fusions: RMSNorm-of-input fused into the following matvec (f32
+        // weight). See the Rust wrapper `rmsnorm_matvec_f32_usm_raw`.
+        pub(super) fn rsl_rmsnorm_matvec_f32_usm(
+            s: *mut rsl_stream,
+            x_usm: *const f32,
+            wnorm_usm: *const f32,
+            wmat_usm: *const f32,
+            y_usm: *mut f32,
+            n_rows: c_int,
+            k: c_int,
+            m: c_int,
+            eps: f32,
+        );
+
+        // P6-fusions: FFN down-projection fused with residual add (f32 weight).
+        // See the Rust wrapper `down_residual_f32_usm_raw`.
+        pub(super) fn rsl_down_residual_f32_usm(
+            s: *mut rsl_stream,
+            ff_usm: *const f32,
+            wmat_usm: *const f32,
+            resid_usm: *const f32,
+            y_usm: *mut f32,
+            n_rows: c_int,
+            k: c_int,
+            m: c_int,
+        );
+
         pub(super) fn rsl_flash_attn_decode_usm(
             s: *mut rsl_stream,
             q_usm: *const u16,
@@ -340,6 +367,9 @@ mod imp {
             kv_len: c_int,
             window: c_int,
             softcap: f32,
+            // P19: explicit per-kv_len-bucket KV_TILE (16/32/64); 0 ⇒ the
+            // built-in env + kv_len heuristic (byte-identical pre-P19).
+            tile_size: c_int,
         );
 
         pub(super) fn rsl_flash_attn_prefill_usm(
@@ -2243,6 +2273,64 @@ mod imp {
         consume_error()
     }
 
+    /// P6-fusions: RMSNorm-of-input fused into the following matvec (f32 weight).
+    /// See the raw wrapper `rmsnorm_matvec_f32_usm_raw` + the C++ kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_matvec_f32_usm(
+        stream: &SyclStream,
+        x_usm: *const f32,
+        wnorm_usm: *const f32,
+        wmat_usm: *const f32,
+        y_usm: *mut f32,
+        n_rows: u32,
+        k: u32,
+        m: u32,
+        eps: f32,
+    ) -> Result<()> {
+        unsafe {
+            rsl_rmsnorm_matvec_f32_usm(
+                stream.raw,
+                x_usm,
+                wnorm_usm,
+                wmat_usm,
+                y_usm,
+                n_rows as c_int,
+                k as c_int,
+                m as c_int,
+                eps,
+            );
+        }
+        consume_error()
+    }
+
+    /// P6-fusions: FFN down-projection fused with the residual add (f32 weight).
+    /// See the raw wrapper `down_residual_f32_usm_raw` + the C++ kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn down_residual_f32_usm(
+        stream: &SyclStream,
+        ff_usm: *const f32,
+        wmat_usm: *const f32,
+        resid_usm: *const f32,
+        y_usm: *mut f32,
+        n_rows: u32,
+        k: u32,
+        m: u32,
+    ) -> Result<()> {
+        unsafe {
+            rsl_down_residual_f32_usm(
+                stream.raw,
+                ff_usm,
+                wmat_usm,
+                resid_usm,
+                y_usm,
+                n_rows as c_int,
+                k as c_int,
+                m as c_int,
+            );
+        }
+        consume_error()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn flash_attn_decode_usm(
         stream: &SyclStream,
@@ -2301,6 +2389,8 @@ mod imp {
         kv_len: u32,
         window: u32,
         softcap: f32,
+        // P19: per-kv_len-bucket KV_TILE (16/32/64); 0 ⇒ built-in heuristic.
+        tile_size: u32,
     ) -> Result<()> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(SyclError::InvalidShape(format!(
@@ -2317,7 +2407,7 @@ mod imp {
                 stream.raw, q_usm, k_usm, v_usm, out_usm,
                 n_heads as c_int, n_kv_heads as c_int,
                 head_dim as c_int, max_ctx as c_int, kv_len as c_int,
-                window as c_int, softcap,
+                window as c_int, softcap, tile_size as c_int,
             );
         }
         consume_error()
@@ -8210,6 +8300,52 @@ pub unsafe fn rmsnorm_f32_usm_raw(
     imp::rmsnorm_f32_usm(stream, x, w, y, n_rows, d, eps)
 }
 
+/// P6-fusions: RMSNorm-of-input fused into the following matvec. One dispatch
+/// computes `y[r,o] = Σ_i (x[r,i]·rms_scale(x_row)·wnorm[i]) · wmat[o,i]` for an
+/// f32 weight `wmat` (`[m,k]`, out-major). Folds the attention-/FFN-input
+/// RMSNorm into its matvec with no host round-trip of the normalized activation.
+/// Bit-tolerant (f32, ~1e-4) vs CPU `rmsnorm_f32_row` then `matvec_f32`.
+///
+/// # Safety
+/// `x` sized ≥ `n_rows*k`; `wnorm` ≥ `k`; `wmat` ≥ `m*k`; `y` ≥ `n_rows*m`; all
+/// USM on `stream`; the kernel `.wait()`s before returning.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn rmsnorm_matvec_f32_usm_raw(
+    stream: &SyclStream,
+    x: *const f32,
+    wnorm: *const f32,
+    wmat: *const f32,
+    y: *mut f32,
+    n_rows: u32,
+    k: u32,
+    m: u32,
+    eps: f32,
+) -> Result<()> {
+    imp::rmsnorm_matvec_f32_usm(stream, x, wnorm, wmat, y, n_rows, k, m, eps)
+}
+
+/// P6-fusions: FFN down-projection fused with the residual add. One dispatch
+/// computes `y[r,o] = resid[r,o] + Σ_i ff[r,i]·wmat[o,i]` for an f32 down weight
+/// `wmat` (`[m,k]`, out-major). Bit-tolerant (f32, ~1e-4) vs CPU `matvec_f32`
+/// then `add_inplace_f32`.
+///
+/// # Safety
+/// `ff` sized ≥ `n_rows*k`; `wmat` ≥ `m*k`; `resid`/`y` ≥ `n_rows*m`; all USM on
+/// `stream`; the kernel `.wait()`s before returning.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn down_residual_f32_usm_raw(
+    stream: &SyclStream,
+    ff: *const f32,
+    wmat: *const f32,
+    resid: *const f32,
+    y: *mut f32,
+    n_rows: u32,
+    k: u32,
+    m: u32,
+) -> Result<()> {
+    imp::down_residual_f32_usm(stream, ff, wmat, resid, y, n_rows, k, m)
+}
+
 /// P17: Gated-DeltaNet chunked-prefill recurrence on the GPU — the hybrid-model
 /// (Qwen3.5 / Ornith) tok/s ceiling. A direct port of the CPU reference
 /// `rustllama_kernels_cpu::delta_net::delta_rule_prefill_chunked_with_chunk`,
@@ -8365,6 +8501,9 @@ pub fn flash_attn_decode_v3_usm(
     kv_len: u32,
     window: u32,
     softcap: f32,
+    // P19: explicit per-kv_len-bucket KV_TILE (16/32/64); 0 ⇒ the kernel's
+    // built-in env + kv_len heuristic (byte-identical pre-P19).
+    tile_size: u32,
 ) -> Result<()> {
     if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
         return Err(SyclError::InvalidShape(format!(
@@ -8390,7 +8529,7 @@ pub fn flash_attn_decode_v3_usm(
     }
     imp::flash_attn_decode_v3_usm(
         stream, q.as_ptr(), k.as_ptr(), v.as_ptr(), out.as_mut_ptr(),
-        n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
+        n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap, tile_size,
     )
 }
 
@@ -8431,6 +8570,7 @@ pub unsafe fn flash_attn_decode_v3_usm_raw(
         stream, q_usm, k_usm, v_usm, out_usm,
         n_heads, n_kv_heads, head_dim, max_ctx, kv_len,
         0, 0.0, // raw variant is full-attention/no-softcap
+        0,      // P19: tile_size 0 ⇒ built-in env + kv_len heuristic
     )
 }
 
@@ -12755,6 +12895,7 @@ mod tests {
         flash_attn_decode_v3_usm(
             &stream, &q_buf, &k_buf, &v_buf, &mut out_buf,
             n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0, 0.0,
+            0, // P19: tile_size 0 ⇒ built-in heuristic
         )
         .expect("flash_attn_decode_v3_usm");
 

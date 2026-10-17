@@ -269,6 +269,9 @@ void rsl_flash_attn_decode_v2_usm(rsl_stream* s,
  * positions; reduces USM bandwidth pressure and gives a more
  * predictable memory access pattern than v2's per-WI USM gathers.
  * Numerically equivalent to v2 / v1 / CPU. */
+/* P19: `tile_size` selects the KV_TILE (16/32/64) per the dispatch's
+ * per-kv_len-bucket tuned winner; 0 ⇒ the kernel's built-in env +
+ * kv_len heuristic (byte-identical pre-P19). */
 void rsl_flash_attn_decode_v3_usm(rsl_stream* s,
                                   const uint16_t* q_usm,
                                   const uint16_t* k_usm,
@@ -276,7 +279,7 @@ void rsl_flash_attn_decode_v3_usm(rsl_stream* s,
                                   uint16_t* out_usm,
                                   int n_heads, int n_kv_heads,
                                   int head_dim, int max_ctx, int kv_len,
-                                  int window, float softcap);
+                                  int window, float softcap, int tile_size);
 
 /* USM-resident FlashAttention prefill — F32 variant.
  *
@@ -1242,6 +1245,20 @@ void rsl_add_rmsnorm_f32_usm(rsl_stream* s,
                              float* hidden_usm, const float* branch_usm,
                              const float* w_usm, float* y_norm_usm,
                              int n_rows, int d, float eps);
+
+/* P6-fusions: RMSNorm-of-input fused into the following matvec (f32 weight,
+ * [m,k] out-major): y[r,o] = Σ_i (x[r,i]·rms_scale(x_row)·wnorm[i])·wmat[o,i]. */
+void rsl_rmsnorm_matvec_f32_usm(rsl_stream* s,
+                                const float* x_usm, const float* wnorm_usm,
+                                const float* wmat_usm, float* y_usm,
+                                int n_rows, int k, int m, float eps);
+
+/* P6-fusions: FFN down-projection fused with residual add (f32 weight [m,k]
+ * out-major): y[r,o] = resid[r,o] + Σ_i ff[r,i]·wmat[o,i]. */
+void rsl_down_residual_f32_usm(rsl_stream* s,
+                               const float* ff_usm, const float* wmat_usm,
+                               const float* resid_usm, float* y_usm,
+                               int n_rows, int k, int m);
 
 /* IQ1_S codebook search, all-three-deltas variant + imatrix-weighted
  * companion. Each writes the (abs, pos, neg) winner triple per chunk. */

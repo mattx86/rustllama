@@ -2913,6 +2913,152 @@ pub fn measure_ssm_prefill_chunked(
     })
 }
 
+/// P19: criterion-free FlashAttention bench. Reported numbers for the FA-v3 and
+/// FA-v2 generations: PREFILL tok/s and FLASH-DECODE tok/s. `None` when every
+/// run for that cell failed.
+#[derive(Debug, Clone, Default)]
+pub struct FlashAttnBenchReport {
+    pub prompt_tokens: u32,
+    pub decode_tokens: u32,
+    pub v3_prefill_tps: Option<f64>,
+    pub v3_decode_tps: Option<f64>,
+    pub v2_prefill_tps: Option<f64>,
+    pub v2_decode_tps: Option<f64>,
+    pub error: Option<String>,
+}
+
+/// P19: criterion-free FlashAttention bench. Loads the model ONCE and, for each
+/// FA generation (FA-v3 then FA-v2), measures PREFILL tok/s (`max_tokens = 1` →
+/// `prefill_ms`, exercising the FA prefill kernels) and FLASH-DECODE tok/s
+/// (`decode_tokens` → `decode_ms`, the FA decode kernels). Reuses the same
+/// `collect_decode_tok_s` + prefill-metric timing as the tuner sweeps — no
+/// criterion. The FA generation is forced per arm via the accel override
+/// ([`rustllama_models::accel::set_fa_v3`] / `set_fa_v2`), since the env-latched
+/// defaults can't be toggled in-process; both overrides are restored to the env
+/// default (`None`) on exit so nothing leaks to the rest of the process. On a
+/// CPU-only host or a model below the flash threshold both arms measure the same
+/// path (a harmless near-tie) — the numbers still report.
+pub fn measure_flash_attn_bench(
+    model_path: &std::path::Path,
+    prompt_tokens: u32,
+    decode_tokens: u32,
+    repeats: usize,
+    cfg: &MeasurementConfig,
+) -> Result<FlashAttnBenchReport, String> {
+    let ctx_size = (prompt_tokens as usize + decode_tokens as usize + 8).max(64);
+    let mut cpu = CpuEngine::load_with_options_and_layout(
+        model_path,
+        ctx_size,
+        true,
+        cfg.kv_dtype,
+        &cfg.kv_cache_layout,
+    )
+    .map_err(|e| format!("load failed: {e}"))?;
+    cpu.set_prefix_cache(false);
+    cpu.set_flash_attention(true); // force the FA path for the bench
+    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+
+    let vocab = cpu.vocab_size() as i32;
+    let prompt_ids: Vec<i32> = (0..prompt_tokens as i32)
+        .map(|i| 1 + (i % vocab.max(2).saturating_sub(1)))
+        .collect();
+    let decode_sampling = SamplingParams {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        typical_p: 1.0,
+        repeat_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        seed: 0,
+        max_tokens: decode_tokens,
+        stop: Vec::new(),
+        ..SamplingParams::default()
+    };
+    let prefill_sampling = SamplingParams {
+        max_tokens: 1,
+        ..decode_sampling.clone()
+    };
+
+    let median = |mut runs: Vec<f64>| -> Option<f64> {
+        if runs.is_empty() {
+            return None;
+        }
+        runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        Some(if runs.len() % 2 == 1 {
+            runs[runs.len() / 2]
+        } else {
+            (runs[runs.len() / 2 - 1] + runs[runs.len() / 2]) / 2.0
+        })
+    };
+
+    // Median prefill tok/s (max_tokens=1 → prefill_ms), one untimed warmup +
+    // `repeats` timed runs. Mirrors `measure_ssm_prefill_chunked`.
+    let bench_prefill = |cpu: &mut CpuEngine| -> Option<f64> {
+        cpu.clear_prefix_cache();
+        if cpu.generate_token_ids(&prompt_ids, 1, &prefill_sampling).is_err() {
+            return None;
+        }
+        let mut runs = Vec::with_capacity(repeats);
+        for _ in 0..repeats {
+            cpu.clear_prefix_cache();
+            if cpu.generate_token_ids(&prompt_ids, 1, &prefill_sampling).is_ok() {
+                let stats = cpu.last_request_stats();
+                let prefilled = stats.tokens_prefilled.max(prompt_tokens);
+                if stats.prefill_ms > 0.0 && prefilled > 0 {
+                    runs.push((prefilled as f64) / (stats.prefill_ms / 1000.0));
+                }
+            }
+        }
+        median(runs)
+    };
+    let bench_decode = |cpu: &mut CpuEngine| -> Option<f64> {
+        // untimed warmup, then the shared decode-tok/s collector.
+        cpu.clear_prefix_cache();
+        let _ = cpu.generate_token_ids(&prompt_ids, decode_tokens, &decode_sampling);
+        let (runs, _) =
+            collect_decode_tok_s(cpu, &prompt_ids, decode_tokens, repeats as u32, &decode_sampling);
+        median(runs)
+    };
+
+    // FA-v3 arm: force v3 on, v2 off (so the decode dispatch tries v3 first and
+    // never falls through to v2).
+    rustllama_models::accel::set_fa_v3(Some(true));
+    rustllama_models::accel::set_fa_v2(Some(false));
+    let v3_prefill_tps = bench_prefill(&mut cpu);
+    let v3_decode_tps = bench_decode(&mut cpu);
+
+    // FA-v2 arm: force v3 off, v2 on.
+    rustllama_models::accel::set_fa_v3(Some(false));
+    rustllama_models::accel::set_fa_v2(Some(true));
+    let v2_prefill_tps = bench_prefill(&mut cpu);
+    let v2_decode_tps = bench_decode(&mut cpu);
+
+    // Restore the env defaults — nothing leaks to the rest of the process.
+    rustllama_models::accel::set_fa_v3(None);
+    rustllama_models::accel::set_fa_v2(None);
+
+    let error = if v3_prefill_tps.is_none()
+        && v3_decode_tps.is_none()
+        && v2_prefill_tps.is_none()
+        && v2_decode_tps.is_none()
+    {
+        Some("every FlashAttention bench run failed".to_string())
+    } else {
+        None
+    };
+
+    Ok(FlashAttnBenchReport {
+        prompt_tokens,
+        decode_tokens,
+        v3_prefill_tps,
+        v3_decode_tps,
+        v2_prefill_tps,
+        v2_decode_tps,
+        error,
+    })
+}
+
 // ============================================================
 // P16: numeric perf-knob sweeps (parallel_matvec_crossover / matvec_min_flops /
 // ssm_chunk). Each loads the model ONCE and, for each candidate value, applies

@@ -47,6 +47,10 @@ pub use load_options::{LoadOptions, LoadOptionsInput};
 pub use rustllama_models::accel::{
     set_hybrid_kv_any, set_prefill_batched_hybrid, set_ssm_prefill_chunked, set_zerocopy_weights,
 };
+/// P19: install the adaptive per-kv_len-bucket flash-attn-v3 KV_TILE winners so
+/// the CLI/server (no direct `rustllama-models` dep) can apply the tuner-cache
+/// winners at load. Forwards to `accel::set_flash_v3_kv_tiles`.
+pub use rustllama_models::accel::set_flash_v3_kv_tiles;
 pub use rustllama_models::accel::moe_dev_resident_hits;
 pub use rustllama_models::accel::set_synthetic_run;
 /// P5b: force the default-off GPU fusions OFF (imatrix recording needs every

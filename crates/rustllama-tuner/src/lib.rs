@@ -331,6 +331,43 @@ pub const VERDICT_DEQUANT_GPU: &str = "dequant:gpu";
 /// stays byte-identical on the CPU path. No env gate.
 pub const VERDICT_SSM_DELTA_NET: &str = "ssm:delta_net";
 
+// --- P6-fusions: the three forward-path fusion verdicts ----------------
+//
+// Each is a PARITY verdict: `tune --validate-kernels` grades the fused SYCL
+// path against the two-op CPU reference (bit-tolerant f32, ~1e-4) and banks a
+// pass/fail. The dispatch gate reads it (fail-closed: absent / `false` ⇒ OFF),
+// so the forward uses the existing separate ops BYTE-IDENTICAL until a device
+// proves the fusion correct. No env gate — same discipline as the tensor-core
+// keys above. The SYCL `collect_sycl_verdicts` probe banks the verdict on
+// Level-Zero/OpenCL hosts — the only path that is BOTH validatable here AND
+// consumed by the (SYCL-USM-only) forward fusion dispatch. The CUDA/MLX kernel
+// mirrors (`rsl_cuda_{rmsnorm_matvec,down_residual}_f32` in `rsl_cuda.cu`,
+// `rsl_mlx_*` in `rsl_mlx.mm`/`.metal`) are ported WRITE-BLIND as device-pointer
+// twins of the existing `add_rmsnorm_f32` / `silu_mul_f32` fusion family — ready
+// for a device-resident CUDA/MLX forward to adopt (and for a future
+// `--cuda-parity` / `--metal-parity` probe once that forward lands); they do not
+// bank these verdicts today.
+
+/// P6: RMSNorm-of-the-input fused into the immediately-following matvec
+/// (`y = matvec(W, rmsnorm(x)·w_norm)`) — the attention-input / FFN-input norm
+/// folded into its matvec in one SYCL USM dispatch, no host round-trip of the
+/// normalized activation. Backs `accel::rmsnorm_matvec_fused_enabled`; graded by
+/// the `fused:rmsnorm_matvec` probe vs CPU `rmsnorm_f32_row` then `matvec_f32`.
+pub const VERDICT_FUSED_RMSNORM_MATVEC: &str = "fused:rmsnorm_matvec";
+/// P6: FFN down-projection fused with the residual add
+/// (`out = residual + matvec(W_down, ff)`) in one SYCL USM dispatch. Backs
+/// `accel::down_residual_fused_enabled`; graded by the `fused:down_residual`
+/// probe vs CPU `matvec_f32` then `add_inplace_f32`.
+pub const VERDICT_FUSED_DOWN_RESIDUAL: &str = "fused:down_residual";
+/// P6: attention output-projection + residual-add + post-attn RMSNorm fused
+/// (`y_norm = rmsnorm(hidden + matvec(W_o, attn))·w_norm`). Re-introduces the
+/// gate P5b deleted (`RUSTLLAMA_FUSED_OUT_PROJ_NORM`) as a verdict. Backs
+/// `accel::fused_out_proj_norm_enabled` (and the already-wired
+/// `try_matvec_out_proj_add_rmsnorm_usm_f32` chained dispatcher); graded by the
+/// `fused:out_proj_norm` probe — the exact chained kernels (packed matvec →
+/// `add_rmsnorm_f32`) vs CPU `matvec` then `add` then `rmsnorm_f32_row`.
+pub const VERDICT_FUSED_OUT_PROJ_NORM: &str = "fused:out_proj_norm";
+
 /// Read the on-device verdict for a kernel probe name, if one has been
 /// recorded. `None` = never validated (or the probe SKIPped because the
 /// device lacks the capability) — callers treat that as "off".
@@ -559,6 +596,17 @@ pub struct TuningResult {
     /// `None` = no entry; kernel uses the built-in default (32).
     #[serde(default)]
     pub flash_v3_kv_tile: Option<u32>,
+    /// P19: ADAPTIVE per-`kv_len`-bucket `KV_TILE` winners for the SYCL flash-
+    /// attn-v3 decode kernel — `[short, mid, long]` (buckets `kv_len < 512`,
+    /// `512..4096`, `>= 4096`), each 16/32/64. From `tune --flash-v3-kv-tile`,
+    /// which now sweeps the candidate set at a SHORT and a LONG context and keeps
+    /// the fastest tile per bucket (the single global `flash_v3_kv_tile` above is
+    /// still written for back-compat / the mid bucket). Surfaced to the kernel
+    /// via the explicit `tile_size` param (`accel::set_flash_v3_kv_tiles` +
+    /// `fa_v3_tile_for`), NOT the env var. `None` (serde default → old caches
+    /// load) ⇒ the kernel keeps its built-in env+kv_len heuristic, byte-identical.
+    #[serde(default)]
+    pub flash_v3_kv_tile_by_bucket: Option<Vec<u32>>,
     /// Winning MoE placement mode from `rustllama tune
     /// --moe-placement` — `"uniform"` (experts follow the layer's
     /// device) or `"experts_cpu"` (routed experts + router pinned to
@@ -726,6 +774,7 @@ impl TuningResult {
             prefix_cache_max_snapshots: None,
             kv_page_size: None,
             flash_v3_kv_tile: None,
+            flash_v3_kv_tile_by_bucket: None,
             moe_placement: None,
             moe_gpu_split_permille: None,
             speculative_mtp: None,
@@ -1366,6 +1415,30 @@ mod tests {
         assert_eq!(verdict_for(&t, &key), Some(true));
         set_verdict(&mut t, &key, false);
         assert_eq!(verdict_for(&t, &key), Some(false));
+    }
+
+    /// P6-fusions + P19: the three fusion verdict keys are stable strings, a
+    /// fresh cache has them UNSET (fail-closed OFF — the forward stays
+    /// byte-identical), and the new per-bucket FA-tile field defaults to `None`
+    /// (so the kernel keeps its built-in heuristic, byte-identical pre-P19).
+    #[test]
+    fn p6_fusion_verdicts_and_fa_bucket_defaults() {
+        assert_eq!(VERDICT_FUSED_RMSNORM_MATVEC, "fused:rmsnorm_matvec");
+        assert_eq!(VERDICT_FUSED_DOWN_RESIDUAL, "fused:down_residual");
+        assert_eq!(VERDICT_FUSED_OUT_PROJ_NORM, "fused:out_proj_norm");
+        let mut t = TuningResult::empty("fp".into(), DeviceFingerprint::default());
+        for k in [
+            VERDICT_FUSED_RMSNORM_MATVEC,
+            VERDICT_FUSED_DOWN_RESIDUAL,
+            VERDICT_FUSED_OUT_PROJ_NORM,
+        ] {
+            assert_eq!(verdict_for(&t, k), None, "{k} must be unset on a fresh cache");
+        }
+        // P19: per-bucket FA tile winners default to None (byte-identical).
+        assert!(t.flash_v3_kv_tile_by_bucket.is_none());
+        // Round-trips through the verdict helpers like the others.
+        set_verdict(&mut t, VERDICT_FUSED_OUT_PROJ_NORM, true);
+        assert_eq!(verdict_for(&t, VERDICT_FUSED_OUT_PROJ_NORM), Some(true));
     }
 
     #[test]

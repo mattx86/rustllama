@@ -4550,6 +4550,46 @@ pub fn flash_attention_enabled() -> bool {
     FLASH_ATTENTION.with(|f| f.get())
 }
 
+// P19 — per-`kv_len`-bucket tuned KV_TILE winners for the SYCL flash-attn-v3
+// decode kernel: `[short (<512), mid (512..4096), long (>=4096)]`. `0` = no
+// tuned winner for that bucket → the kernel falls back to its built-in
+// env+kv_len heuristic (byte-identical pre-P19). Set once at model load from the
+// tuner cache (`TuningResult::flash_v3_kv_tile_by_bucket`) via
+// [`set_flash_v3_kv_tiles`]; read per flash-decode call via [`fa_v3_tile_for`].
+// Globals (not thread-local): the winner is a per-(system, model) constant
+// shared across all generate threads.
+static FLASH_V3_TILE_SHORT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static FLASH_V3_TILE_MID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static FLASH_V3_TILE_LONG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// P19: install the per-`kv_len`-bucket flash-v3 KV_TILE winners (`[short, mid,
+/// long]`, each 0/16/32/64). Called at model load from
+/// `TuningResult::flash_v3_kv_tile_by_bucket`. A `0` or out-of-set value leaves
+/// that bucket on the kernel's built-in heuristic (so the default is
+/// byte-identical to pre-P19).
+pub fn set_flash_v3_kv_tiles(short: u32, mid: u32, long: u32) {
+    use std::sync::atomic::Ordering;
+    let norm = |v: u32| if matches!(v, 16 | 32 | 64) { v } else { 0 };
+    FLASH_V3_TILE_SHORT.store(norm(short), Ordering::Relaxed);
+    FLASH_V3_TILE_MID.store(norm(mid), Ordering::Relaxed);
+    FLASH_V3_TILE_LONG.store(norm(long), Ordering::Relaxed);
+}
+
+/// P19: the tuned KV_TILE for this `kv_len`'s bucket, or `0` when untuned (→ the
+/// kernel's built-in env+kv_len heuristic). Buckets match the kernel's
+/// empirical crossover points (`<512`, `512..4096`, `>=4096`).
+pub fn fa_v3_tile_for(kv_len: u32) -> u32 {
+    use std::sync::atomic::Ordering;
+    let a = if kv_len < 512 {
+        &FLASH_V3_TILE_SHORT
+    } else if kv_len >= 4096 {
+        &FLASH_V3_TILE_LONG
+    } else {
+        &FLASH_V3_TILE_MID
+    };
+    a.load(Ordering::Relaxed)
+}
+
 /// RAII guard: installs a SYCL stream on the current thread on
 /// construction and clears it on drop. Returns `None` if the SYCL
 /// crate is in mock mode or no device is visible — callers then
@@ -7133,7 +7173,16 @@ fn usm_attn_enabled() -> bool {
 /// flash-attention dispatch — the previous per-call `env_on`
 /// closures took the env lock twice per attention call. A/B levers:
 /// set before the first forward.
-fn fa_v3_enabled() -> bool {
+// P19 (bench): optional per-process override of the FA-v2 / FA-v3 enable so the
+// criterion-free `tune --flash-bench` can force a single FA generation and time
+// it in-process (the env defaults are OnceLock-latched, so they can't be toggled
+// after first read). Tri-state: 0 = unset → env default (BYTE-IDENTICAL to the
+// pre-P19 behavior), 1 = forced on, 2 = forced off. Default 0, so nothing changes
+// unless the bench installs an override via [`set_fa_v3`] / [`set_fa_v2`].
+static FA_V3_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static FA_V2_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn fa_v3_env_default() -> bool {
     static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *C.get_or_init(|| {
         std::env::var("RUSTLLAMA_FA_V3")
@@ -7142,13 +7191,55 @@ fn fa_v3_enabled() -> bool {
     })
 }
 
-fn fa_v2_enabled() -> bool {
+fn fa_v2_env_default() -> bool {
     static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *C.get_or_init(|| {
         std::env::var("RUSTLLAMA_FA_V2")
             .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")))
             .unwrap_or(true)
     })
+}
+
+fn fa_v3_enabled() -> bool {
+    match FA_V3_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => fa_v3_env_default(),
+    }
+}
+
+fn fa_v2_enabled() -> bool {
+    match FA_V2_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => fa_v2_env_default(),
+    }
+}
+
+/// P19 (bench): install/clear the FA-v3 enable override. `None` restores the env
+/// default (byte-identical). Used only by `tune --flash-bench` to time each FA
+/// generation in one process; production paths never call it.
+pub fn set_fa_v3(on: Option<bool>) {
+    FA_V3_OVERRIDE.store(
+        match on {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// P19 (bench): install/clear the FA-v2 enable override. See [`set_fa_v3`].
+pub fn set_fa_v2(on: Option<bool>) {
+    FA_V2_OVERRIDE.store(
+        match on {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Try to run F32 KV flash-attention decode on the USM-resident
@@ -7300,16 +7391,14 @@ pub fn try_flash_attn_decode_usm_f32(
         // borrows of ctx; it points to a live field of the ctx
         // which outlives this call.
         let out_buf: &mut sk::SyclSharedBuffer<u16> = unsafe { &mut *out_buf_ptr };
-        // H11 (deferred): adaptive flash-attn V3 KV tile sizing.
-        // Today the V3 kernel reads `RUSTLLAMA_FLASH_V3_KV_TILE`
-        // env var once and uses that tile (16/32/64) for the
-        // lifetime. Per-call adaptive sizing (small tile for
-        // kv_len < 512, large for kv_len > 4096) would require
-        // adding an explicit `tile_size: u32` parameter to
-        // `rsl_flash_attn_decode_v3_usm` and three kernel variants
-        // (already templated, so just dispatch needs extension).
-        // Sized as ~4-6 hours of cross-cutting kernel + FFI work.
-        // Tracked as Tier H follow-up.
+        // P19 (DONE — was the H11 Tier-H follow-up): adaptive flash-attn V3 KV
+        // tile sizing. The V3 kernel now takes an explicit `tile_size` param
+        // (16/32/64, or 0 ⇒ its built-in env+kv_len heuristic). `tune
+        // --flash-v3-kv-tile` sweeps the candidates at a short + a long context
+        // and banks a winner PER kv_len BUCKET into
+        // `TuningResult::flash_v3_kv_tile_by_bucket`; the engine-load path feeds
+        // those to `set_flash_v3_kv_tiles`, and `fa_v3_tile_for(kv_len)` (below)
+        // returns the bucket's winner (0 when untuned → byte-identical).
         //
         // FlashAttention dispatch chain: v3 → v2 → v1.
         //   - v3 (SLM K/V tiling + sub-group cooperation): default for
@@ -7327,10 +7416,13 @@ pub fn try_flash_attn_decode_usm_f32(
         // the env vars.
         let want_v3 = fa_v3_enabled();
         let want_v2 = fa_v2_enabled();
+        // P19: pass the per-kv_len-bucket tuned KV_TILE (0 ⇒ the kernel's
+        // built-in env+heuristic, byte-identical pre-P19).
+        let v3_tile = fa_v3_tile_for(kv_len);
         let v3_ok = want_v3
             && sk::flash_attn_decode_v3_usm(
                 stream, q_buf, k_buf, v_buf, out_buf,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap,
+                n_heads, n_kv_heads, head_dim, max_ctx, kv_len, window, softcap, v3_tile,
             )
             .is_ok();
         let v2_ok = !v3_ok && want_v2
@@ -12307,6 +12399,166 @@ pub fn try_silu_mul_usm_f32(x: &[f32], y: &[f32], out: &mut [f32]) -> bool {
     })
 }
 
+/// P6-fusions: whether the RMSNorm-of-input + matvec fusion
+/// (`fused:rmsnorm_matvec`) is verdict-enabled on this device. Fail-closed:
+/// absent / `false` ⇒ OFF, so the forward keeps the separate rmsnorm + matvec
+/// BYTE-IDENTICAL. Banked by the SYCL `fused:rmsnorm_matvec` parity probe (vs
+/// CPU `rmsnorm_f32_row` then `matvec_f32`). No env gate.
+pub fn rmsnorm_matvec_fused_enabled() -> bool {
+    kernel_verdict(rustllama_tuner::VERDICT_FUSED_RMSNORM_MATVEC)
+}
+
+/// P6-fusions: whether the FFN down-projection + residual-add fusion
+/// (`fused:down_residual`) is verdict-enabled on this device. Fail-closed.
+/// Banked by the SYCL `fused:down_residual` parity probe (vs CPU `matvec_f32`
+/// then `add_inplace_f32`). No env gate.
+pub fn down_residual_fused_enabled() -> bool {
+    kernel_verdict(rustllama_tuner::VERDICT_FUSED_DOWN_RESIDUAL)
+}
+
+/// P6-fusions: fused RMSNorm(input)+matvec dispatch for an f32 weight. Computes
+/// `y[r,o] = Σ_i (x[r,i]·rms_scale(x_row)·w_norm[i]) · w_mat[o,i]` on the USM
+/// stream in one kernel — no host round-trip of the normalized activation.
+/// `x` is `[n_rows,k]`, `w_norm` is `[k]`, `w_mat` is `[m,k]` (out-major, f32),
+/// `y` is `[n_rows,m]`. Returns `true` on GPU success; `false` (verdict off,
+/// no USM context, layer CPU-resident, shape mismatch, or kernel miss) ⇒ the
+/// caller runs the separate `rmsnorm` + `matvec` ops, BYTE-IDENTICAL. The
+/// `fused:rmsnorm_matvec` verdict (fail-closed) is the only enable.
+#[allow(clippy::too_many_arguments)]
+pub fn try_rmsnorm_matvec_usm_f32(
+    x: &[f32],
+    w_norm: &[f32],
+    w_mat: &[f32],
+    y: &mut [f32],
+    n_rows: usize,
+    k: usize,
+    m: usize,
+    eps: f32,
+) -> bool {
+    if !rmsnorm_matvec_fused_enabled() || !usm_attn_enabled() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    if n_rows == 0
+        || k == 0
+        || m == 0
+        || x.len() != n_rows * k
+        || w_norm.len() < k
+        || w_mat.len() != m * k
+        || y.len() != n_rows * m
+    {
+        return false;
+    }
+    USM_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(ctx) = slot.as_mut() else {
+            return false;
+        };
+        let stream = &ctx.stream;
+        let (Ok(mut xb), Ok(mut wnb), Ok(mut wmb), Ok(mut yb)) = (
+            sk::SyclSharedBuffer::<f32>::alloc(stream, n_rows * k),
+            sk::SyclSharedBuffer::<f32>::alloc(stream, k),
+            sk::SyclSharedBuffer::<f32>::alloc(stream, m * k),
+            sk::SyclSharedBuffer::<f32>::alloc(stream, n_rows * m),
+        ) else {
+            return false;
+        };
+        xb.as_mut_slice().copy_from_slice(x);
+        wnb.as_mut_slice().copy_from_slice(&w_norm[..k]);
+        wmb.as_mut_slice().copy_from_slice(w_mat);
+        yb.as_mut_slice().fill(0.0);
+        // SAFETY: four USM allocations on `stream`, sized exactly to the kernel's
+        // derived extents; the kernel `.wait()`s before returning.
+        let ok = unsafe {
+            sk::rmsnorm_matvec_f32_usm_raw(
+                stream,
+                xb.as_ptr(),
+                wnb.as_ptr(),
+                wmb.as_ptr(),
+                yb.as_mut_ptr(),
+                n_rows as u32,
+                k as u32,
+                m as u32,
+                eps,
+            )
+        }
+        .is_ok();
+        if !ok {
+            return false;
+        }
+        y.copy_from_slice(&yb.as_slice()[..n_rows * m]);
+        true
+    })
+}
+
+/// P6-fusions: fused FFN down-projection + residual-add dispatch for an f32
+/// weight. Computes `y[r,o] = resid[r,o] + Σ_i ff[r,i]·w_mat[o,i]` in one USM
+/// kernel — no host round-trip of the matvec output. `ff` is `[n_rows,k]`,
+/// `w_mat` is `[m,k]` (out-major, f32), `resid`/`y` are `[n_rows,m]`. Same
+/// fail-closed fall-back contract as [`try_rmsnorm_matvec_usm_f32`]; the
+/// `fused:down_residual` verdict is the only enable.
+#[allow(clippy::too_many_arguments)]
+pub fn try_matvec_down_residual_usm_f32(
+    ff: &[f32],
+    w_mat: &[f32],
+    resid: &[f32],
+    y: &mut [f32],
+    n_rows: usize,
+    k: usize,
+    m: usize,
+) -> bool {
+    if !down_residual_fused_enabled() || !usm_attn_enabled() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    if n_rows == 0
+        || k == 0
+        || m == 0
+        || ff.len() != n_rows * k
+        || w_mat.len() != m * k
+        || resid.len() != n_rows * m
+        || y.len() != n_rows * m
+    {
+        return false;
+    }
+    USM_ATTN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(ctx) = slot.as_mut() else {
+            return false;
+        };
+        let stream = &ctx.stream;
+        let (Ok(mut ffb), Ok(mut wmb), Ok(mut rb), Ok(mut yb)) = (
+            sk::SyclSharedBuffer::<f32>::alloc(stream, n_rows * k),
+            sk::SyclSharedBuffer::<f32>::alloc(stream, m * k),
+            sk::SyclSharedBuffer::<f32>::alloc(stream, n_rows * m),
+            sk::SyclSharedBuffer::<f32>::alloc(stream, n_rows * m),
+        ) else {
+            return false;
+        };
+        ffb.as_mut_slice().copy_from_slice(ff);
+        wmb.as_mut_slice().copy_from_slice(w_mat);
+        rb.as_mut_slice().copy_from_slice(resid);
+        yb.as_mut_slice().fill(0.0);
+        // SAFETY: four USM allocations on `stream`, sized exactly; kernel waits.
+        let ok = unsafe {
+            sk::down_residual_f32_usm_raw(
+                stream,
+                ffb.as_ptr(),
+                wmb.as_ptr(),
+                rb.as_ptr(),
+                yb.as_mut_ptr(),
+                n_rows as u32,
+                k as u32,
+                m as u32,
+            )
+        }
+        .is_ok();
+        if !ok {
+            return false;
+        }
+        y.copy_from_slice(&yb.as_slice()[..n_rows * m]);
+        true
+    })
+}
+
 /// USM-resident half-split RoPE applied in-place on `qk`.
 /// `qk.len() == n_heads * head_dim`. `head_dim` must be even.
 /// `rope_theta` is the base used to build the cached inv-freq
@@ -12693,17 +12945,19 @@ impl PackedMatvecKind {
     }
 }
 
-/// P5b — whether the full attn-output-proj + residual + post-attn-norm fusion is
-/// enabled. Returns `false` (OFF) unconditionally: the fusion is a two-kernel
-/// chain orchestrated in `accel` (not a single kernel), so there is no clean
-/// single-kernel parity probe to verdict-gate it, and the two parts
-/// (`matvec:<dtype>` + `fused:add_rmsnorm_f32`) are already parity-covered. The
-/// removed `RUSTLLAMA_FUSED_OUT_PROJ_NORM` env gate was default-off, so this is
-/// behavior-identical. The fusion RETURNS under P6 with its own composite verdict
-/// (`fused:out_proj_norm`) once a probe for the chained path lands — until then,
-/// fail-closed OFF (no env gate).
+/// P6 — whether the full attn-output-proj + residual + post-attn-norm fusion is
+/// enabled. The fusion is a two-kernel chain orchestrated in `accel` (packed
+/// matvec → `add_rmsnorm_f32`, see [`try_matvec_out_proj_add_rmsnorm_usm_f32`]);
+/// P6 re-introduces the gate P5b removed (`RUSTLLAMA_FUSED_OUT_PROJ_NORM`, which
+/// was default-off) as the `fused:out_proj_norm` VERDICT — the `probe_out_proj_norm`
+/// parity probe runs the EXACT chained kernels vs the CPU
+/// (matvec → add → rmsnorm) reference and `tune --validate-kernels` banks a
+/// pass/fail. Fail-closed: absent / `false` ⇒ OFF, so the forward keeps the
+/// separate out-proj matvec + the unfused add_rmsnorm ladder BYTE-IDENTICAL
+/// until a device proves the chained path correct. No env gate. Also gated by
+/// `usm_attn_enabled()` so a host without the USM path never engages it.
 fn fused_out_proj_norm_enabled() -> bool {
-    false
+    kernel_verdict(rustllama_tuner::VERDICT_FUSED_OUT_PROJ_NORM)
 }
 
 /// USM-resident weight matvec dispatch with per-dtype routing. The

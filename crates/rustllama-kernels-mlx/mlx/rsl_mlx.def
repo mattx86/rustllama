@@ -115,6 +115,8 @@ EXPORTS
     rsl_mlx_add_rmsnorm_f32
     rsl_mlx_rope_f32
     rsl_mlx_silu_mul_f32
+    rsl_mlx_rmsnorm_matvec_f32
+    rsl_mlx_down_residual_f32
     rsl_mlx_embedding_lookup_f32
     rsl_mlx_flash_attn_decode_f32
     rsl_mlx_flash_attn_prefill_f32

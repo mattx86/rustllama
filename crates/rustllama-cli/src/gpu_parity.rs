@@ -422,6 +422,14 @@ fn probe_names() -> Vec<String> {
     v.push("fused:add_rmsnorm_f32".to_string());
     v.push("fused:rmsnorm_f32".to_string());
     v.push("fused:silu_mul_f32".to_string());
+    // P6-fusions: the three forward-path fusions graded vs their two-op CPU
+    // references (bit-tolerant f32). `rmsnorm_matvec` / `down_residual` are the
+    // new single f32 kernels; `out_proj_norm` is the EXACT chained path the
+    // `try_matvec_out_proj_add_rmsnorm_usm_f32` dispatcher runs (packed q4_k
+    // matvec → add_rmsnorm_f32). Banked before the matvec families.
+    v.push("fused:rmsnorm_matvec".to_string());
+    v.push("fused:down_residual".to_string());
+    v.push("fused:out_proj_norm".to_string());
     // P17: GPU Gated-DeltaNet chunked-prefill recurrence (the hybrid-model tok/s
     // ceiling) vs the CPU chunked reference. f32 end to end; banked before the
     // matvec families like the other small f32 USM kernels.
@@ -1457,6 +1465,224 @@ fn probe_delta_net(stream: &sk::SyclStream, name: &str, _rest: &str, started: In
     }
 }
 
+/// P6-fusions: parity for the fused RMSNorm(input)+matvec f32 kernel
+/// (`rsl_rmsnorm_matvec_f32_usm`) vs CPU `rmsnorm_f32_row` then `matvec_f32`,
+/// per row. Bit-tolerant (f32, ~1e-4).
+fn probe_rmsnorm_matvec(stream: &sk::SyclStream, name: &str, started: Instant) {
+    const N: usize = 2; // rows
+    const K: usize = 256; // input dim
+    const M: usize = 128; // output dim
+    const EPS: f32 = 1e-5;
+    let x = gen_x(N * K, 81);
+    let wnorm = gen_x(K, 82);
+    let wmat = gen_x(M * K, 83);
+    let mut cpu = vec![0f32; N * M];
+    for r in 0..N {
+        let mut xn = vec![0f32; K];
+        k::rmsnorm_f32_row(&x[r * K..(r + 1) * K], &wnorm, &mut xn, EPS);
+        k::matvec_f32(&wmat, &xn, &mut cpu[r * M..(r + 1) * M], M, K);
+    }
+    let bufs = (
+        sk::SyclSharedBuffer::<f32>::alloc(stream, N * K),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, K),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, M * K),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, N * M),
+    );
+    let (mut xb, mut wnb, mut wmb, mut yb) = match bufs {
+        (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+        _ => {
+            emit(name, "KERNEL_ERR", "usm-alloc-failed");
+            return;
+        }
+    };
+    xb.as_mut_slice().copy_from_slice(&x);
+    wnb.as_mut_slice().copy_from_slice(&wnorm);
+    wmb.as_mut_slice().copy_from_slice(&wmat);
+    yb.as_mut_slice().fill(f32::NAN);
+    // SAFETY: four USM allocations on `stream`, sized above; kernel waits.
+    let res = unsafe {
+        sk::rmsnorm_matvec_f32_usm_raw(
+            stream,
+            xb.as_ptr(),
+            wnb.as_ptr(),
+            wmb.as_ptr(),
+            yb.as_mut_ptr(),
+            N as u32,
+            K as u32,
+            M as u32,
+            EPS,
+        )
+    };
+    let ms = started.elapsed().as_millis();
+    match res {
+        Err(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
+        Ok(()) => {
+            let (cos, max_rel) = compare(yb.as_slice(), &cpu);
+            let verdict = if cos > 0.9999 && max_rel < 0.01 {
+                "OK"
+            } else {
+                "MISCOMPUTE"
+            };
+            emit(name, verdict, &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"));
+        }
+    }
+}
+
+/// P6-fusions: parity for the fused FFN down-proj + residual-add f32 kernel
+/// (`rsl_down_residual_f32_usm`) vs CPU `matvec_f32` then `add_inplace_f32`,
+/// per row. Bit-tolerant (f32, ~1e-4).
+fn probe_down_residual(stream: &sk::SyclStream, name: &str, started: Instant) {
+    const N: usize = 2;
+    const K: usize = 256;
+    const M: usize = 128;
+    let ff = gen_x(N * K, 84);
+    let wmat = gen_x(M * K, 85);
+    let resid = gen_x(N * M, 86);
+    let mut cpu = resid.clone();
+    for r in 0..N {
+        let mut dot = vec![0f32; M];
+        k::matvec_f32(&wmat, &ff[r * K..(r + 1) * K], &mut dot, M, K);
+        k::add_inplace_f32(&mut cpu[r * M..(r + 1) * M], &dot);
+    }
+    let bufs = (
+        sk::SyclSharedBuffer::<f32>::alloc(stream, N * K),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, M * K),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, N * M),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, N * M),
+    );
+    let (mut ffb, mut wmb, mut rb, mut yb) = match bufs {
+        (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+        _ => {
+            emit(name, "KERNEL_ERR", "usm-alloc-failed");
+            return;
+        }
+    };
+    ffb.as_mut_slice().copy_from_slice(&ff);
+    wmb.as_mut_slice().copy_from_slice(&wmat);
+    rb.as_mut_slice().copy_from_slice(&resid);
+    yb.as_mut_slice().fill(f32::NAN);
+    // SAFETY: four USM allocations on `stream`, sized above; kernel waits.
+    let res = unsafe {
+        sk::down_residual_f32_usm_raw(
+            stream,
+            ffb.as_ptr(),
+            wmb.as_ptr(),
+            rb.as_ptr(),
+            yb.as_mut_ptr(),
+            N as u32,
+            K as u32,
+            M as u32,
+        )
+    };
+    let ms = started.elapsed().as_millis();
+    match res {
+        Err(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
+        Ok(()) => {
+            let (cos, max_rel) = compare(yb.as_slice(), &cpu);
+            let verdict = if cos > 0.9999 && max_rel < 0.01 {
+                "OK"
+            } else {
+                "MISCOMPUTE"
+            };
+            emit(name, verdict, &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"));
+        }
+    }
+}
+
+/// P6-fusions: parity for the out-proj + residual + post-attn-norm fusion. Runs
+/// the EXACT chained kernels the `try_matvec_out_proj_add_rmsnorm_usm_f32`
+/// dispatcher uses — a packed Q4_K matvec (`matvec_q4_k_packed_f32_usm`) into a
+/// dot buffer, then `add_rmsnorm_f32_usm` (`hidden += dot`; `y = rmsnorm(hidden)
+/// · w_norm`) — vs the CPU reference (Q4_K matvec, `add_inplace_f32`,
+/// `rmsnorm_f32_row`). Grades BOTH the normalized output AND the written-back
+/// residual. This is the composite verdict the P5b gate was waiting on.
+fn probe_out_proj_norm(stream: &sk::SyclStream, name: &str, started: Instant) {
+    const M: usize = 256; // d_model (out), %256 for Q4_K
+    const K: usize = 256; // attn dim (in), %256 for Q4_K
+    const EPS: f32 = 1e-5;
+    let Some(layout) = LAYOUTS.iter().find(|l| l.name == "q4_k") else {
+        emit(name, "SKIP", "no-q4_k-layout");
+        return;
+    };
+    let attn = gen_x(K, 87);
+    let cpu_mv = cpu_matvec_for("q4_k");
+    let Some((wbytes, cpu_dot)) = coh_gen_finite(layout, cpu_mv, M, K, &attn, 0x0F6F0001) else {
+        emit(name, "SKIP", "no-finite-reference");
+        return;
+    };
+    let hidden = gen_x(M, 88);
+    let wnorm = gen_x(M, 89);
+    // CPU reference: hidden += dot; y = rmsnorm(hidden) * wnorm.
+    let mut cpu_hidden = hidden.clone();
+    k::add_inplace_f32(&mut cpu_hidden, &cpu_dot);
+    let mut cpu_y = vec![0f32; M];
+    k::rmsnorm_f32_row(&cpu_hidden, &wnorm, &mut cpu_y, EPS);
+    // GPU chained path.
+    let bufs = (
+        sk::SyclSharedBuffer::<u8>::alloc(stream, wbytes.len()),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, K),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, M),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, M),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, M),
+        sk::SyclSharedBuffer::<f32>::alloc(stream, M),
+    );
+    let (mut wb, mut ab, mut dotb, mut hb, mut wnb, mut yb) = match bufs {
+        (Ok(a), Ok(b), Ok(c), Ok(d), Ok(e), Ok(f)) => (a, b, c, d, e, f),
+        _ => {
+            emit(name, "KERNEL_ERR", "usm-alloc-failed");
+            return;
+        }
+    };
+    wb.as_mut_slice().copy_from_slice(&wbytes);
+    ab.as_mut_slice().copy_from_slice(&attn);
+    hb.as_mut_slice().copy_from_slice(&hidden);
+    wnb.as_mut_slice().copy_from_slice(&wnorm);
+    dotb.as_mut_slice().fill(f32::NAN);
+    yb.as_mut_slice().fill(f32::NAN);
+    // Stage 1: packed Q4_K matvec → dot. SAFETY: USM allocations on `stream`.
+    let r1 = unsafe {
+        sk::matvec_q4_k_packed_f32_usm_raw(
+            stream,
+            wb.as_ptr(),
+            ab.as_ptr(),
+            dotb.as_mut_ptr(),
+            M as u32,
+            K as u32,
+            0,
+        )
+    };
+    if let Err(e) = r1 {
+        emit(name, "KERNEL_ERR", &format!("matvec {e}"));
+        return;
+    }
+    // Stage 2: F32 add+rmsnorm (1 row of width M). SAFETY: as above.
+    let r2 = sk::add_rmsnorm_f32_usm_raw(
+        stream,
+        hb.as_mut_ptr(),
+        dotb.as_ptr(),
+        wnb.as_ptr(),
+        yb.as_mut_ptr(),
+        1,
+        M as u32,
+        EPS,
+    );
+    let ms = started.elapsed().as_millis();
+    match r2 {
+        Err(e) => emit(name, "KERNEL_ERR", &format!("add_rmsnorm {e} ms={ms}")),
+        Ok(()) => {
+            let (cy, ry) = compare(yb.as_slice(), &cpu_y);
+            let (ch, rh) = compare(hb.as_slice(), &cpu_hidden);
+            let (cos, max_rel) = (cy.min(ch), ry.max(rh));
+            let verdict = if cos > 0.999 && max_rel < 0.02 {
+                "OK"
+            } else {
+                "MISCOMPUTE"
+            };
+            emit(name, verdict, &format!("cos={cos:.6} max_rel={max_rel:.4} ms={ms}"));
+        }
+    }
+}
+
 fn probe_fused(stream: &sk::SyclStream, name: &str, dtype: &str, started: Instant) {
     // B1/F2: the F32 residual/norm/activation fusions are not dtype-keyed
     // gate/up matvecs — dispatch them before the LAYOUTS lookup (which would
@@ -1465,6 +1691,10 @@ fn probe_fused(stream: &sk::SyclStream, name: &str, dtype: &str, started: Instan
         "add_rmsnorm_f32" => return probe_add_rmsnorm_f32(stream, name, started),
         "rmsnorm_f32" => return probe_rmsnorm_f32(stream, name, started),
         "silu_mul_f32" => return probe_silu_mul_f32(stream, name, started),
+        // P6-fusions.
+        "rmsnorm_matvec" => return probe_rmsnorm_matvec(stream, name, started),
+        "down_residual" => return probe_down_residual(stream, name, started),
+        "out_proj_norm" => return probe_out_proj_norm(stream, name, started),
         _ => {}
     }
     let layout = LAYOUTS.iter().find(|l| l.name == dtype).expect("layout");
@@ -2386,6 +2616,7 @@ fn probe_attn(stream: &sk::SyclStream, name: &str, variant: &str, started: Insta
                     stream, &qb, &kb, &vb, &mut ob,
                     AT_HEADS as u32, AT_KV_HEADS as u32, AT_HEAD_DIM as u32,
                     AT_MAX_CTX as u32, AT_KV_LEN as u32, window, softcap,
+                    0, // P19: tile_size 0 ⇒ the kernel's built-in heuristic
                 ),
                 _ => {
                     emit(name, "SKIP", "unknown-variant");

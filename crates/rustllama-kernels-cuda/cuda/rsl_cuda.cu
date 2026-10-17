@@ -2722,6 +2722,77 @@ extern "C" int rsl_cuda_silu_mul_f32(rsl_cuda_stream *s, const float *x,
     return rsl_cuda_check("rsl_cuda_silu_mul_f32");
 }
 
+// P6-fusions (write-blind mirror of the SYCL rsl_rmsnorm_matvec_f32_usm):
+// RMSNorm-of-input fused into the following matvec. One thread per (row,output);
+// recomputes the row RMS per output (extra O(k), same order as the dot) — the
+// straightforward device port of the SYCL kernel. `wmat` is [m,k] out-major.
+//   y[r,o] = Σ_i (x[r,i]·rms_scale(x_row)·wnorm[i]) · wmat[o,i]
+// Graded vs CPU `rmsnorm_f32_row` then `matvec_f32` by `doctor --cuda-parity`.
+__global__ void rmsnorm_matvec_f32_kernel(const float *x, const float *wnorm,
+                                          const float *wmat, float *y,
+                                          int n_rows, int k, int m, float eps) {
+    long long gid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)n_rows * m;
+    if (gid >= total) return;
+    int row = (int)(gid / m);
+    int o = (int)(gid % m);
+    const float *xr = x + (size_t)row * k;
+    float ss = 0.f;
+    for (int i = 0; i < k; ++i) { float v = xr[i]; ss += v * v; }
+    float scale = rsqrtf(ss / (float)k + eps);
+    const float *wr = wmat + (size_t)o * k;
+    float dot = 0.f;
+    for (int i = 0; i < k; ++i) dot += (xr[i] * scale * wnorm[i]) * wr[i];
+    y[gid] = dot;
+}
+
+extern "C" int rsl_cuda_rmsnorm_matvec_f32(rsl_cuda_stream *s, const float *x,
+                                           const float *wnorm, const float *wmat,
+                                           float *y, int n_rows, int k, int m,
+                                           float eps) {
+    if (!s || !x || !wnorm || !wmat || !y || n_rows <= 0 || k <= 0 || m <= 0)
+        return -1;
+    cudaSetDevice(s->device);
+    long long total = (long long)n_rows * m;
+    int t = 256, b = (int)((total + t - 1) / t);
+    rmsnorm_matvec_f32_kernel<<<b, t, 0, s->stream>>>(x, wnorm, wmat, y, n_rows,
+                                                      k, m, eps);
+    return rsl_cuda_check("rsl_cuda_rmsnorm_matvec_f32");
+}
+
+// P6-fusions (write-blind mirror of the SYCL rsl_down_residual_f32_usm): FFN
+// down-projection fused with the residual add. One thread per (row,output).
+// `wmat` is [m,k] out-major.
+//   y[r,o] = resid[r,o] + Σ_i ff[r,i] · wmat[o,i]
+// Graded vs CPU `matvec_f32` then `add_inplace_f32` by `doctor --cuda-parity`.
+__global__ void down_residual_f32_kernel(const float *ff, const float *wmat,
+                                         const float *resid, float *y,
+                                         int n_rows, int k, int m) {
+    long long gid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)n_rows * m;
+    if (gid >= total) return;
+    int row = (int)(gid / m);
+    int o = (int)(gid % m);
+    const float *fr = ff + (size_t)row * k;
+    const float *wr = wmat + (size_t)o * k;
+    float dot = 0.f;
+    for (int i = 0; i < k; ++i) dot += fr[i] * wr[i];
+    y[gid] = resid[gid] + dot;
+}
+
+extern "C" int rsl_cuda_down_residual_f32(rsl_cuda_stream *s, const float *ff,
+                                          const float *wmat, const float *resid,
+                                          float *y, int n_rows, int k, int m) {
+    if (!s || !ff || !wmat || !resid || !y || n_rows <= 0 || k <= 0 || m <= 0)
+        return -1;
+    cudaSetDevice(s->device);
+    long long total = (long long)n_rows * m;
+    int t = 256, b = (int)((total + t - 1) / t);
+    down_residual_f32_kernel<<<b, t, 0, s->stream>>>(ff, wmat, resid, y, n_rows,
+                                                     k, m);
+    return rsl_cuda_check("rsl_cuda_down_residual_f32");
+}
+
 // Plain element-wise residual add: hidden[i] += branch[i]. Device f32, in place.
 // (The fused add_rmsnorm does add+norm; the FFN residual needs just the add,
 // since the following op is the NEXT layer's attn-norm, not this layer's.)

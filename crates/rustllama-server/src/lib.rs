@@ -2422,6 +2422,14 @@ async fn load_model(
             std::env::set_var("RUSTLLAMA_FLASH_V3_KV_TILE", t.to_string());
             tracing::info!(model = %model_key, applied = t, "load_model: applied flash_v3_kv_tile winner (env)");
         }
+        // P19: ADAPTIVE per-kv_len-bucket winners go via the kernel `tile_size`
+        // param (accel globals), NOT the env var — applied alongside the
+        // single-value env above (mirrors the `serve` startup path). A user-set
+        // env still wins (this whole block is env-gated). None ⇒ kernel heuristic.
+        if let Some(b) = tuner_cached_flash_v3_kv_tile_by_bucket() {
+            rustllama_engine::set_flash_v3_kv_tiles(b[0], b[1], b[2]);
+            tracing::info!(model = %model_key, short = b[0], mid = b[1], long = b[2], "load_model: applied flash_v3_kv_tile_by_bucket winners");
+        }
     }
     if cfg_for_tuning.tuning.auto_apply_flash_kv_min
         && std::env::var_os("RUSTLLAMA_FLASH_KV_LEN_MIN").is_none()
@@ -3993,6 +4001,21 @@ fn tuner_cached_flash_v3_kv_tile() -> Option<u32> {
     let key = rustllama_tuner::system_fingerprint();
     let tuning = rustllama_tuner::load_cache(&cache_dir, &key).ok()??;
     tuning.flash_v3_kv_tile
+}
+
+/// P19: cached ADAPTIVE per-kv_len-bucket flash-v3 KV_TILE winners `[short, mid,
+/// long]`. Applied via the `tile_size` kernel param (not the env var), so the
+/// single-value env apply above and this per-bucket apply coexist.
+fn tuner_cached_flash_v3_kv_tile_by_bucket() -> Option<[u32; 3]> {
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    let tuning = rustllama_tuner::load_cache(&cache_dir, &key).ok()??;
+    let v = tuning.flash_v3_kv_tile_by_bucket?;
+    if v.len() == 3 {
+        Some([v[0], v[1], v[2]])
+    } else {
+        None
+    }
 }
 
 /// Cached flash-attention `KV_LEN_MIN` winner (env-transported to the kernel).

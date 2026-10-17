@@ -262,6 +262,28 @@ extern "C" {
         out: *mut f32,
         n: c_int,
     ) -> c_int;
+    // P6-fusions (write-blind mirrors of the SYCL fused f32 kernels).
+    fn rsl_mlx_rmsnorm_matvec_f32(
+        s: *mut RslMlxStreamRaw,
+        x: *const f32,
+        wnorm: *const f32,
+        wmat: *const f32,
+        y: *mut f32,
+        n_rows: c_int,
+        k: c_int,
+        m: c_int,
+        eps: f32,
+    ) -> c_int;
+    fn rsl_mlx_down_residual_f32(
+        s: *mut RslMlxStreamRaw,
+        ff: *const f32,
+        wmat: *const f32,
+        resid: *const f32,
+        y: *mut f32,
+        n_rows: c_int,
+        k: c_int,
+        m: c_int,
+    ) -> c_int;
     fn rsl_mlx_embedding_lookup_f32(
         s: *mut RslMlxStreamRaw,
         table: *const f32,
@@ -1317,6 +1339,75 @@ pub unsafe fn silu_mul_f32(
     n: usize,
 ) -> Result<(), MlxError> {
     let rc = rsl_mlx_silu_mul_f32(stream.raw(), x, y, out, n as c_int);
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(MlxError::Kernel(rc))
+    }
+}
+
+/// P6-fusions (write-blind mirror): RMSNorm-of-input fused into the following
+/// matvec. `y[r,o] = Σ_i (x[r,i]·rms_scale(x_row)·wnorm[i])·wmat[o,i]`, `wmat`
+/// `[m,k]` out-major.
+///
+/// SAFETY: `x` (≥`n_rows*k`), `wnorm` (≥`k`), `wmat` (≥`m*k`), `y` (≥`n_rows*m`)
+/// are device pointers on `stream`; the wrapper synchronizes before returning.
+#[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+pub unsafe fn rmsnorm_matvec_f32(
+    stream: &MlxStream,
+    x: *const f32,
+    wnorm: *const f32,
+    wmat: *const f32,
+    y: *mut f32,
+    n_rows: usize,
+    k: usize,
+    m: usize,
+    eps: f32,
+) -> Result<(), MlxError> {
+    let rc = rsl_mlx_rmsnorm_matvec_f32(
+        stream.raw(),
+        x,
+        wnorm,
+        wmat,
+        y,
+        n_rows as c_int,
+        k as c_int,
+        m as c_int,
+        eps,
+    );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(MlxError::Kernel(rc))
+    }
+}
+
+/// P6-fusions (write-blind mirror): FFN down-proj fused with residual add.
+/// `y[r,o] = resid[r,o] + Σ_i ff[r,i]·wmat[o,i]`, `wmat` `[m,k]` out-major.
+///
+/// SAFETY: `ff` (≥`n_rows*k`), `wmat` (≥`m*k`), `resid`/`y` (≥`n_rows*m`) are
+/// device pointers on `stream`; the wrapper synchronizes before returning.
+#[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+pub unsafe fn down_residual_f32(
+    stream: &MlxStream,
+    ff: *const f32,
+    wmat: *const f32,
+    resid: *const f32,
+    y: *mut f32,
+    n_rows: usize,
+    k: usize,
+    m: usize,
+) -> Result<(), MlxError> {
+    let rc = rsl_mlx_down_residual_f32(
+        stream.raw(),
+        ff,
+        wmat,
+        resid,
+        y,
+        n_rows as c_int,
+        k as c_int,
+        m as c_int,
+    );
     if rc == 0 {
         Ok(())
     } else {

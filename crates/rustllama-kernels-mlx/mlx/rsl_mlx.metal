@@ -219,6 +219,61 @@ kernel void rsl_mlx_silu_mul_f32_kernel(
     out[i] = silu * y[i];
 }
 
+// P6-fusions (write-blind mirror of the SYCL rsl_rmsnorm_matvec_f32_usm):
+// RMSNorm-of-input fused into the following matvec. One work-item per
+// (row,output); recomputes the row RMS per output (extra O(k), same order as
+// the dot). `wmat` is [m,k] out-major.
+//   y[r,o] = Σ_i (x[r,i]·rms_scale(x_row)·wnorm[i]) · wmat[o,i]
+kernel void rsl_mlx_rmsnorm_matvec_f32_kernel(
+    device const float *x     [[buffer(0)]],
+    device const float *wnorm [[buffer(1)]],
+    device const float *wmat  [[buffer(2)]],
+    device       float *y     [[buffer(3)]],
+    constant int   &k         [[buffer(4)]],
+    constant int   &m         [[buffer(5)]],
+    constant float &eps       [[buffer(6)]],
+    constant int   &n_rows    [[buffer(7)]],
+    uint gid                  [[thread_position_in_grid]])
+{
+    const int total = n_rows * m;
+    if ((int)gid >= total) return;
+    const int row = (int)gid / m;
+    const int o   = (int)gid % m;
+    const int xbase = row * k;
+    float ss = 0.0f;
+    for (int i = 0; i < k; ++i) { const float v = x[xbase + i]; ss += v * v; }
+    const float scale = rsqrt(ss / (float)k + eps);
+    const int wbase = o * k;
+    float dot = 0.0f;
+    for (int i = 0; i < k; ++i)
+        dot += (x[xbase + i] * scale * wnorm[i]) * wmat[wbase + i];
+    y[(int)gid] = dot;
+}
+
+// P6-fusions (write-blind mirror of the SYCL rsl_down_residual_f32_usm): FFN
+// down-projection fused with the residual add. One work-item per (row,output).
+// `wmat` is [m,k] out-major.  y[r,o] = resid[r,o] + Σ_i ff[r,i]·wmat[o,i]
+kernel void rsl_mlx_down_residual_f32_kernel(
+    device const float *ff    [[buffer(0)]],
+    device const float *wmat  [[buffer(1)]],
+    device const float *resid [[buffer(2)]],
+    device       float *y     [[buffer(3)]],
+    constant int   &k         [[buffer(4)]],
+    constant int   &m         [[buffer(5)]],
+    constant int   &n_rows    [[buffer(6)]],
+    uint gid                  [[thread_position_in_grid]])
+{
+    const int total = n_rows * m;
+    if ((int)gid >= total) return;
+    const int row = (int)gid / m;
+    const int o   = (int)gid % m;
+    const int fbase = row * k;
+    const int wbase = o * k;
+    float dot = 0.0f;
+    for (int i = 0; i < k; ++i) dot += ff[fbase + i] * wmat[wbase + i];
+    y[(int)gid] = resid[(int)gid] + dot;
+}
+
 // Elementwise residual add: dst[i] += src[i]. The Metal twin of the CUDA block's
 // `add_f32` / the SYCL `rsl_add_f32_nowait` — used by the device-resident decode
 // block's fused dense FFN leg to fold `ffn_out` back into `hidden`. Flat grid,

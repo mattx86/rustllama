@@ -1491,7 +1491,7 @@ void rsl_flash_attn_decode_v3_usm(rsl_stream* s,
                                   uint16_t* out_usm,
                                   int n_heads, int n_kv_heads,
                                   int head_dim, int max_ctx, int kv_len,
-                                  int window, float softcap) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_v3_usm", {
+                                  int window, float softcap, int tile_size) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_v3_usm", {
     if (s == nullptr || q_usm == nullptr || k_usm == nullptr || v_usm == nullptr || out_usm == nullptr) return;
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_ctx <= 0) return;
     if (kv_len <= 0) {
@@ -1509,24 +1509,31 @@ void rsl_flash_attn_decode_v3_usm(rsl_stream* s,
     if (dim_per_lane > MAX_DIM_PER_LANE) return;
 
     auto& q_queue = s->q;
-    // H11: adaptive KV_TILE selection based on kv_len. Smaller
-    // tiles (16) reduce SLM pressure for short context; larger
-    // tiles (64) amortize the per-tile load/barrier overhead for
-    // long context. Crossover points empirical on Iris Xe — tune
-    // via the `RUSTLLAMA_FLASH_V3_KV_TILE` env var if needed (set
-    // explicit 16/32/64 to override; absent or 0 uses the heuristic).
-    const char* env_tile = std::getenv("RUSTLLAMA_FLASH_V3_KV_TILE");
+    // H11 / P19: adaptive KV_TILE selection. Smaller tiles (16) reduce SLM
+    // pressure for short context; larger tiles (64) amortize the per-tile
+    // load/barrier overhead for long context. Crossover points empirical on
+    // Iris Xe. P19 adds the explicit `tile_size` param: the dispatch
+    // (`accel::fa_v3_tile_for`) passes the per-`kv_len`-bucket TUNED winner
+    // (16/32/64) from `tune --flash-v3-kv-tile`, which OVERRIDES the env + the
+    // built-in kv_len heuristic. `tile_size == 0` (no tuned winner — the serde
+    // default) falls through to EXACTLY the historical env+heuristic path, so
+    // the default is byte-identical to before P19.
     int effective_tile = 32;
-    if (env_tile) {
-        int v = std::atoi(env_tile);
-        if (v == 16 || v == 32 || v == 64) {
-            effective_tile = v;
-        } else if (v == 0 || v == -1) {
-            // Auto mode — fall through to kv_len heuristic.
+    if (tile_size == 16 || tile_size == 32 || tile_size == 64) {
+        effective_tile = tile_size;
+    } else {
+        const char* env_tile = std::getenv("RUSTLLAMA_FLASH_V3_KV_TILE");
+        if (env_tile) {
+            int v = std::atoi(env_tile);
+            if (v == 16 || v == 32 || v == 64) {
+                effective_tile = v;
+            } else if (v == 0 || v == -1) {
+                // Auto mode — fall through to kv_len heuristic.
+                effective_tile = (kv_len < 512) ? 16 : ((kv_len >= 4096) ? 64 : 32);
+            }
+        } else {
             effective_tile = (kv_len < 512) ? 16 : ((kv_len >= 4096) ? 64 : 32);
         }
-    } else {
-        effective_tile = (kv_len < 512) ? 16 : ((kv_len >= 4096) ? 64 : 32);
     }
     // Dispatch on (dim_per_lane, KV_TILE) — 3 × 3 = 9 explicit arms.
     switch (dim_per_lane) {
@@ -12381,6 +12388,89 @@ void rsl_add_rmsnorm_f32_usm(rsl_stream* s,
             for (int i = 0; i < d; ++i) {
                 y_norm_usm[base + i] = hidden_usm[base + i] * scale * w_usm[i];
             }
+        });
+    }).wait();
+})
+
+// P6-fusions: RMSNorm-of-the-input fused into the immediately-following matvec.
+// One dispatch computes, for an f32 weight `wmat_usm` (`[m rows, k cols]`,
+// out-major so row `o` is `wmat_usm[o*k .. o*k+k]`):
+//   scale   = 1 / sqrt(mean(x_row²) + eps)              (per input row)
+//   y[r, o] = Σ_i (x[r, i]·scale·wnorm[i]) · wmat[o, i]  (normed matvec)
+// Folds the attention-input / FFN-input RMSNorm into its matvec with no host
+// round-trip of the normalized activation. One work-item per (row, output); the
+// row RMS is recomputed per output (an extra O(k), same order as the dot) so
+// the kernel stays SINGLE-PASS + MULTI-workgroup — the proven-good topology, NOT
+// the 1-workgroup SLM design that regressed Q4_K (see the H6 rewrite note).
+// Bit-tolerant vs CPU `rmsnorm_f32_row` then `matvec_f32` (f32, ~1e-4).
+void rsl_rmsnorm_matvec_f32_usm(rsl_stream* s,
+                                const float* x_usm, const float* wnorm_usm,
+                                const float* wmat_usm, float* y_usm,
+                                int n_rows, int k, int m, float eps)
+    RSL_FFI_BODY_VOID("rsl_rmsnorm_matvec_f32_usm", {
+    if (s == nullptr || x_usm == nullptr || wnorm_usm == nullptr
+        || wmat_usm == nullptr || y_usm == nullptr) return;
+    if (n_rows <= 0 || k <= 0 || m <= 0) return;
+    auto& q = s->q;
+    const std::size_t total = static_cast<std::size_t>(n_rows) * static_cast<std::size_t>(m);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(static_cast<int>(total))),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+            const std::size_t gid = it.get_global_id(0);
+            if (gid >= total) return;
+            const int row = static_cast<int>(gid / static_cast<std::size_t>(m));
+            const int o = static_cast<int>(gid % static_cast<std::size_t>(m));
+            const int xbase = row * k;
+            float sum_sq = 0.0f;
+            for (int i = 0; i < k; ++i) {
+                const float v = x_usm[xbase + i];
+                sum_sq += v * v;
+            }
+            const float scale = 1.0f / sycl::sqrt(sum_sq / static_cast<float>(k) + eps);
+            const int wbase = o * k;
+            float dot = 0.0f;
+            for (int i = 0; i < k; ++i) {
+                dot += (x_usm[xbase + i] * scale * wnorm_usm[i]) * wmat_usm[wbase + i];
+            }
+            y_usm[gid] = dot;
+        });
+    }).wait();
+})
+
+// P6-fusions: FFN down-projection fused with the residual add. One dispatch
+// computes, for an f32 down weight `wmat_usm` (`[m rows, k cols]`, out-major):
+//   y[r, o] = residual[r, o] + Σ_i ff[r, i] · wmat[o, i]
+// Folds the down matvec + the residual-add into one pass, no host round-trip of
+// the matvec output. One work-item per (row, output). Multi-workgroup. Bit-
+// tolerant vs CPU `matvec_f32` then `add_inplace_f32` (f32, ~1e-4).
+void rsl_down_residual_f32_usm(rsl_stream* s,
+                               const float* ff_usm, const float* wmat_usm,
+                               const float* resid_usm, float* y_usm,
+                               int n_rows, int k, int m)
+    RSL_FFI_BODY_VOID("rsl_down_residual_f32_usm", {
+    if (s == nullptr || ff_usm == nullptr || wmat_usm == nullptr
+        || resid_usm == nullptr || y_usm == nullptr) return;
+    if (n_rows <= 0 || k <= 0 || m <= 0) return;
+    auto& q = s->q;
+    const std::size_t total = static_cast<std::size_t>(n_rows) * static_cast<std::size_t>(m);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(static_cast<int>(total))),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+            const std::size_t gid = it.get_global_id(0);
+            if (gid >= total) return;
+            const int row = static_cast<int>(gid / static_cast<std::size_t>(m));
+            const int o = static_cast<int>(gid % static_cast<std::size_t>(m));
+            const int fbase = row * k;
+            const int wbase = o * k;
+            float dot = 0.0f;
+            for (int i = 0; i < k; ++i) {
+                dot += ff_usm[fbase + i] * wmat_usm[wbase + i];
+            }
+            y_usm[gid] = resid_usm[gid] + dot;
         });
     }).wait();
 })

@@ -477,6 +477,12 @@ pub enum Command {
         flash_v3_kv_tile: bool,
         #[arg(long, default_value = "16,32,64")]
         flash_v3_kv_tile_candidates: String,
+        /// P19: criterion-free FlashAttention bench. Reports PREFILL tok/s +
+        /// FLASH-DECODE tok/s for the FA-v3 and FA-v2 generations (reuses
+        /// `measurement.rs` timing). Does not persist anything — a reporting
+        /// aid for the FA-v3 KV-tile stage; pair with `--flash-v3-kv-tile`.
+        #[arg(long)]
+        flash_bench: bool,
         /// MoE placement + q★ co-execution sweep: A/B `uniform`,
         /// `experts_cpu`, and CPU/GPU expert-split candidates by
         /// measured decode tok/s (MoE models only). A non-uniform
@@ -1351,6 +1357,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             kv_page_size_candidates,
             flash_v3_kv_tile,
             flash_v3_kv_tile_candidates,
+            flash_bench,
             moe_placement,
             speculative_mtp,
             speculative_mtp_repeats,
@@ -1454,6 +1461,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 prefix_snapshots,
                 kv_page_size,
                 flash_v3_kv_tile,
+                flash_bench,
                 moe_placement,
                 speculative_mtp,
                 tree_widths,
@@ -1478,6 +1486,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     "tune: --placement / --batch-size / --threads / --kv-dtype / \
                      --flash-attention / --kv-layout / --flash-kv-min / \
                      --prefix-snapshots / --kv-page-size / --flash-v3-kv-tile / \
+                     --flash-bench / \
                      --moe-placement / --speculative-mtp / --tree-widths / \
                      --ssm-prefill-chunked / --parallel-matvec-crossover / \
                      --matvec-min-flops / --ssm-chunk / \
@@ -1593,6 +1602,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     &config_path,
                     model,
                     &flash_v3_kv_tile_candidates,
+                    prompt_tokens,
+                    decode_tokens,
+                    repeats,
+                );
+            }
+            if flash_bench {
+                return cmd_tune_flash_bench(
+                    &config_path,
+                    model,
                     prompt_tokens,
                     decode_tokens,
                     repeats,
@@ -4060,6 +4078,23 @@ async fn serve(
                 {
                     tracing::info!(applied = t, "tuner cache: applied flash_v3_kv_tile winner");
                     std::env::set_var("RUSTLLAMA_FLASH_V3_KV_TILE", t.to_string());
+                }
+            }
+            // P19: the ADAPTIVE per-kv_len-bucket KV_TILE winners are read via
+            // the accel globals (NOT the env var — the env carries one value;
+            // the per-bucket tiles are passed to the kernel as the `tile_size`
+            // param). `fa_v3_tile_for(kv_len)` returns the bucket's tile at
+            // dispatch; `[0,0,0]` / no cache ⇒ the kernel's built-in heuristic,
+            // byte-identical. A user-set env var still wins (tile_size 0 ⇒ env).
+            if std::env::var_os("RUSTLLAMA_FLASH_V3_KV_TILE").is_none() {
+                if let Some(b) =
+                    flash_v3_kv_tile_by_bucket_from_cache(cfg.tuning.auto_apply_flash_v3_kv_tile)
+                {
+                    tracing::info!(
+                        short = b[0], mid = b[1], long = b[2],
+                        "tuner cache: applied flash_v3_kv_tile_by_bucket winners"
+                    );
+                    rustllama_engine::set_flash_v3_kv_tiles(b[0], b[1], b[2]);
                 }
             }
             // Promote the typed `[inference].flash_attention_kv_min` to the
@@ -7948,6 +7983,106 @@ fn cmd_tune_flash_v3_kv_tile(
         }
         None => println!("  → no candidate completed; falling back to kernel default (32)"),
     }
+
+    // P19: ADAPTIVE per-kv_len-bucket sweep. The sweep above measured the
+    // configured (mid) context; re-run the SAME bench at a SHORT and a LONG
+    // context so the dispatch (`accel::fa_v3_tile_for`) can pick the best
+    // KV_TILE per kv_len bucket (the kernel's crossover points are <512 /
+    // 512..4096 / >=4096). Each is one more `measure_flash_v3_kv_tile_candidates`
+    // run — the FA-v3 tok/s bench — at the bucket's representative context.
+    let mid_win = report.winner.unwrap_or(32);
+    let sweep_at = |ptoks: u32| -> Option<u32> {
+        let ctx = (ptoks as usize + decode_tokens as usize + 8).max(cfg.inference.ctx_size as usize);
+        match measure_flash_v3_kv_tile_candidates(
+            &model_path, &candidates, ctx, ptoks, decode_tokens, repeats, &m_cfg,
+        ) {
+            Ok(r) => r.winner,
+            Err(e) => {
+                tracing::warn!(error = %e, prompt = ptoks, "flash-v3 bucket sweep failed");
+                None
+            }
+        }
+    };
+    println!();
+    println!("  adaptive per-kv_len-bucket sweep (short=64, long=4096 prompt tokens)…");
+    let short_win = sweep_at(64).unwrap_or(mid_win);
+    let long_win = sweep_at(4096).unwrap_or(mid_win);
+    println!(
+        "  → adaptive winners: short(<512)={short_win}  mid(512..4096)={mid_win}  long(>=4096)={long_win}"
+    );
+    if let Err(e) = persist_flash_v3_kv_tile_by_bucket([short_win, mid_win, long_win]) {
+        tracing::warn!(error = %e, "failed to persist flash_v3_kv_tile_by_bucket");
+    }
+    Ok(())
+}
+
+/// P19: criterion-free FlashAttention bench. Reports PREFILL tok/s +
+/// FLASH-DECODE tok/s for the FA-v3 and FA-v2 generations (reuses
+/// `measurement.rs` timing — no criterion). A reporting aid for the FA-v3
+/// KV-tile stage; persists nothing.
+fn cmd_tune_flash_bench(
+    config_path: &std::path::Path,
+    model_override: Option<String>,
+    prompt_tokens: u32,
+    decode_tokens: u32,
+    repeats: u32,
+) -> anyhow::Result<()> {
+    use rustllama_engine::measurement::{measure_flash_attn_bench, MeasurementConfig};
+
+    let cfg = rustllama_config::load(config_path).unwrap_or_default();
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
+    if repeats == 0 {
+        anyhow::bail!("--flash-v3-kv-tile-repeats must be >= 1");
+    }
+    let (k, _) = cfg.inference.resolved_kv_dtypes();
+    let m_cfg = MeasurementConfig {
+        kv_dtype: parse_kv_dtype(k)?,
+        kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
+        flash_attention: cfg.inference.flash_attention,
+        n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
+    };
+
+    println!("rustllama tune --flash-bench");
+    println!("  model         = {}", model_path.display());
+    println!("  prompt_tokens = {prompt_tokens}");
+    println!("  decode_tokens = {decode_tokens}");
+    println!("  repeats       = {repeats} (median per cell)");
+    println!();
+
+    let report = measure_flash_attn_bench(
+        &model_path,
+        prompt_tokens,
+        decode_tokens,
+        repeats as usize,
+        &m_cfg,
+    )
+    .map_err(|e| anyhow::anyhow!("flash bench failed: {e}"))?;
+
+    let fmt = |v: Option<f64>| match v {
+        Some(t) => format!("{t:>8.2} tps"),
+        None => format!("{:>8}", "n/a"),
+    };
+    println!(
+        "  {:>5}  {:>12}  {:>14}",
+        "gen", "prefill", "flash-decode"
+    );
+    println!(
+        "  {:>5}  {:>12}  {:>14}",
+        "v3",
+        fmt(report.v3_prefill_tps),
+        fmt(report.v3_decode_tps)
+    );
+    println!(
+        "  {:>5}  {:>12}  {:>14}",
+        "v2",
+        fmt(report.v2_prefill_tps),
+        fmt(report.v2_decode_tps)
+    );
+    if let Some(e) = report.error.as_ref() {
+        println!();
+        println!("  note: {e}");
+    }
     Ok(())
 }
 
@@ -9670,6 +9805,56 @@ pub fn flash_v3_kv_tile_from_cache_or_default_to(
         .and_then(|t| t.flash_v3_kv_tile)
 }
 
+/// P19: persist the ADAPTIVE per-`kv_len`-bucket flash-v3 KV_TILE winners
+/// `[short, mid, long]`. Also writes `mid` to the single global
+/// `flash_v3_kv_tile` for back-compat with the env-var apply path.
+pub fn persist_flash_v3_kv_tile_by_bucket(buckets: [u32; 3]) -> anyhow::Result<()> {
+    let Some(cache_dir) = rustllama_tuner::default_cache_dir() else {
+        tracing::warn!("no tuner cache dir resolvable; skipping flash_v3_kv_tile bucket persistence");
+        return Ok(());
+    };
+    let (key, device) = rustllama_tuner::cache_context();
+    use rustllama_tuner::{cache_path_for, load_cache, save_cache, TuningResult};
+    std::fs::create_dir_all(&cache_dir)?;
+    let mut tuning = load_cache(&cache_dir, &key)?
+        .unwrap_or_else(|| TuningResult::empty(key.clone(), device.clone()));
+    tuning.flash_v3_kv_tile = Some(buckets[1]);
+    tuning.flash_v3_kv_tile_by_bucket = Some(buckets.to_vec());
+    tuning.last_tuned = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| format!("{}", d.as_secs()));
+    save_cache(&cache_dir, &tuning)?;
+    println!(
+        "saved flash_v3_kv_tile_by_bucket [short={}, mid={}, long={}] to {}",
+        buckets[0],
+        buckets[1],
+        buckets[2],
+        cache_path_for(&cache_dir, &key).display()
+    );
+    Ok(())
+}
+
+/// P19: consumer-side hook for the adaptive per-bucket KV_TILE winners. Returns
+/// `[short, mid, long]` when auto-apply is on AND a cache entry exists; else
+/// `None` so the kernel keeps its built-in heuristic (byte-identical).
+pub fn flash_v3_kv_tile_by_bucket_from_cache(auto_apply: bool) -> Option<[u32; 3]> {
+    if !auto_apply {
+        return None;
+    }
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    let v = rustllama_tuner::load_cache(&cache_dir, &key)
+        .ok()
+        .flatten()
+        .and_then(|t| t.flash_v3_kv_tile_by_bucket)?;
+    if v.len() == 3 {
+        Some([v[0], v[1], v[2]])
+    } else {
+        None
+    }
+}
+
 /// Consumer-side hook for kv_dtype: look up the cached winner and
 /// return it as a config-string when auto-apply is on AND a cache
 /// entry exists. Otherwise returns `None` so the caller falls back
@@ -10179,6 +10364,25 @@ pub fn cmd_tuning_show(config_path: &std::path::Path) -> anyhow::Result<()> {
         "  lock_usm          = {}  budget = {} MB",
         cfg.inference.lock_usm, cfg.inference.lock_usm_mb
     );
+    println!();
+    // P19: flash-attn-v3 KV_TILE winners — the single global (env-applied) + the
+    // ADAPTIVE per-kv_len-bucket winners (applied via the kernel's `tile_size`
+    // param, read by `accel::fa_v3_tile_for`). "(none)" ⇒ the kernel keeps its
+    // built-in env+kv_len heuristic (byte-identical). From `tune --flash-v3-kv-tile`.
+    println!("flash-attn-v3 KV_TILE winners:");
+    match tuning.flash_v3_kv_tile {
+        Some(t) => println!("  flash_v3_kv_tile  = {t} (global / env-applied)"),
+        None => println!(
+            "  flash_v3_kv_tile  = (none — run `rustllama tune --flash-v3-kv-tile`)"
+        ),
+    }
+    match tuning.flash_v3_kv_tile_by_bucket.as_ref() {
+        Some(b) if b.len() == 3 => println!(
+            "  per-kv_len-bucket = short(<512)={}  mid(512..4096)={}  long(>=4096)={}",
+            b[0], b[1], b[2]
+        ),
+        _ => println!("  per-kv_len-bucket = (none — adaptive; byte-identical default)"),
+    }
     println!();
     // On-device GPU-kernel verdicts (populated by `tune --validate-kernels`).
     // These are the auto-enable decisions the dispatch layer reads: `true` =

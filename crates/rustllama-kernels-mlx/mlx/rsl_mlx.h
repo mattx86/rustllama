@@ -193,6 +193,18 @@ int rsl_mlx_rope_f32(rsl_mlx_stream *s, float *qk, int n_heads, int head_dim,
 int rsl_mlx_silu_mul_f32(rsl_mlx_stream *s, const float *x, const float *y,
                          float *out, int n);
 
+/* P6-fusions: RMSNorm-of-input fused into the following matvec (f32 weight
+ * [m,k] out-major): y[r,o] = Σ_i (x[r,i]·rms_scale(x_row)·wnorm[i])·wmat[o,i]. */
+int rsl_mlx_rmsnorm_matvec_f32(rsl_mlx_stream *s, const float *x,
+                               const float *wnorm, const float *wmat, float *y,
+                               int n_rows, int k, int m, float eps);
+
+/* P6-fusions: FFN down-proj fused with residual add (f32 weight [m,k]
+ * out-major): y[r,o] = resid[r,o] + Σ_i ff[r,i]·wmat[o,i]. */
+int rsl_mlx_down_residual_f32(rsl_mlx_stream *s, const float *ff,
+                              const float *wmat, const float *resid, float *y,
+                              int n_rows, int k, int m);
+
 /* out[i,:] = table[ids[i],:] (d elems); ids[i] < 0 -> zero row. `ids` is a
  * DEVICE pointer. */
 int rsl_mlx_embedding_lookup_f32(rsl_mlx_stream *s, const float *table,

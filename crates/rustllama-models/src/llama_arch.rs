@@ -12062,6 +12062,13 @@ impl LlamaModel {
             // Skipped entirely when the device block already ran the dense FFN
             // (#2 Phase 1): `hidden` then already carries the FFN residual.
             if !device_dense_ffn {
+                // P6-fusions: set when the dense FFN below fuses the down-proj
+                // + residual-add into one USM dispatch (f32 down weight only,
+                // `fused:down_residual` verdict on). When set, `ffn_out` already
+                // holds `hidden + W_down·ffn_buf`, so the separate residual add
+                // below is replaced by adopting it — byte-identical to the two
+                // ops when the verdict is off/absent.
+                let mut down_residual_fused = false;
                 if let Some(moe) = moe_cfg.as_ref() {
                     let mb = &self.weights.moe_blocks.as_ref().unwrap()[layer_idx];
                     crate::moe::moe_ffn_one_into(
@@ -12089,7 +12096,28 @@ impl LlamaModel {
                     {
                         k::silu_mul_f32(&gate_buf, &up_buf, &mut ffn_buf);
                     }
-                    matvec_tensor_dispatch(&dense_block.w_down, &ffn_buf, &mut ffn_out, d, d_ff);
+                    // P6-fusions: FFN down-proj + residual-add in one USM
+                    // dispatch (f32 down weight only; fail-closed via the
+                    // `fused:down_residual` verdict → byte-identical fallback to
+                    // the separate down matvec + `add_inplace_f32` below). On
+                    // success `ffn_out` = `hidden + W_down·ffn_buf`.
+                    let w_down = &dense_block.w_down;
+                    if !skip_ffn_enabled()
+                        && w_down.dtype == Dtype::F32
+                        && crate::accel::try_matvec_down_residual_usm_f32(
+                            &ffn_buf,
+                            rustllama_tensor::as_slice_f32(w_down),
+                            &hidden,
+                            &mut ffn_out,
+                            1,
+                            d_ff,
+                            d,
+                        )
+                    {
+                        down_residual_fused = true;
+                    } else {
+                        matvec_tensor_dispatch(w_down, &ffn_buf, &mut ffn_out, d, d_ff);
+                    }
                 }
 
                 debug::ffn_stats(
@@ -12103,7 +12131,14 @@ impl LlamaModel {
                 );
 
                 if !skip_ffn_enabled() {
-                    k::add_inplace_f32(&mut hidden, &ffn_out);
+                    if down_residual_fused {
+                        // `ffn_out` already carries `hidden + W_down·ffn_buf`
+                        // (the P6 down+residual fusion), so adopt it as the new
+                        // hidden instead of re-adding — same result, one op.
+                        hidden.copy_from_slice(&ffn_out);
+                    } else {
+                        k::add_inplace_f32(&mut hidden, &ffn_out);
+                    }
                 }
             }
 
@@ -12121,34 +12156,54 @@ impl LlamaModel {
         // `final_norm` is already pre-sized + zeroed from the
         // ForwardScratch take at the top of this function; we
         // overwrite it fully in the rmsnorm call below.
-        // USM → host-pointer SYCL → CPU dispatch ladder.
-        if !crate::accel::try_rmsnorm_usm_f32(
-            &hidden,
-            &self.weights.output_norm,
-            &mut final_norm,
-            d,
-            cfg.rms_eps,
-        ) && !crate::accel::try_rmsnorm_f32(
-            &hidden,
-            &self.weights.output_norm,
-            &mut final_norm,
-            d,
-            cfg.rms_eps,
-        ) {
-            k::rmsnorm_f32_row(
-                &hidden,
-                &self.weights.output_norm,
-                &mut final_norm,
-                cfg.rms_eps,
-            );
-        }
-
         let lm_head = self
             .weights
             .output
             .as_ref()
             .unwrap_or(&self.weights.token_embd);
-        matvec_tensor_dispatch(lm_head, &final_norm, logits_out, cfg.vocab_size, d);
+        // P6-fusions: fold the final RMSNorm into the LM-head matvec in one USM
+        // dispatch (f32 LM-head weight only; fail-closed via the
+        // `fused:rmsnorm_matvec` verdict). On success `logits_out` holds
+        // `matvec(lm_head, rmsnorm(hidden)·output_norm)` directly and BOTH the
+        // separate rmsnorm ladder + the matvec are skipped — BYTE-IDENTICAL
+        // fallback to those two ops when the verdict is off/absent (or the
+        // LM-head weight is not f32, the common quantized case).
+        let rmsnorm_matvec_fused = lm_head.dtype == Dtype::F32
+            && self.weights.output_norm.len() >= d
+            && crate::accel::try_rmsnorm_matvec_usm_f32(
+                &hidden,
+                &self.weights.output_norm,
+                rustllama_tensor::as_slice_f32(lm_head),
+                logits_out,
+                1,
+                d,
+                cfg.vocab_size,
+                cfg.rms_eps,
+            );
+        if !rmsnorm_matvec_fused {
+            // USM → host-pointer SYCL → CPU dispatch ladder.
+            if !crate::accel::try_rmsnorm_usm_f32(
+                &hidden,
+                &self.weights.output_norm,
+                &mut final_norm,
+                d,
+                cfg.rms_eps,
+            ) && !crate::accel::try_rmsnorm_f32(
+                &hidden,
+                &self.weights.output_norm,
+                &mut final_norm,
+                d,
+                cfg.rms_eps,
+            ) {
+                k::rmsnorm_f32_row(
+                    &hidden,
+                    &self.weights.output_norm,
+                    &mut final_norm,
+                    cfg.rms_eps,
+                );
+            }
+            matvec_tensor_dispatch(lm_head, &final_norm, logits_out, cfg.vocab_size, d);
+        }
         self.finalize_logits(logits_out);
 
         kv.seq_len = kv.seq_len.max(cur_pos + 1);
