@@ -14,8 +14,12 @@ use std::sync::Arc;
 
 use rustllama_gguf::synth::{write_synthetic_lora_adapter_gguf, SynthLlama, SynthLoraAdapter};
 use rustllama_gguf::Gguf;
-use rustllama_models::llama_arch::{KvCache, LlamaModel};
-use rustllama_models::lora::{self, LoraAdapter, LoraFactors, MergeOutcome};
+use rustllama_models::llama_arch::{DecodeSlot, KvCache, LlamaModel, RaggedSlot};
+use rustllama_models::lora::{self, LoraAdapter, LoraFactors, MergeOutcome, RowAdapters};
+use rustllama_models::page_table::PageTable;
+use rustllama_models::paged_kv_cache::PagedKvCache;
+use rustllama_models::paged_kv_store::PagedKvStore;
+use rustllama_models::shared_paged_kv::SharedPagedKv;
 use rustllama_tensor::{DimOrder, Tensor};
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -387,6 +391,273 @@ fn p3_registry_and_per_request_selection() {
     );
 
     for p in [&base_path, &pa, &pb] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+// ----------------------------------------------------------------------
+// P3 (Layer 1) — per-ROW adapters in the batched / ragged forward
+// ----------------------------------------------------------------------
+
+/// Build base + two distinct adapters, returning the model + the two resident
+/// adapter handles (and the fixture paths, for cleanup).
+fn base_and_two_adapters(
+    tag: &str,
+) -> (
+    Arc<LlamaModel>,
+    Arc<LoraAdapter>,
+    Arc<LoraAdapter>,
+    Vec<std::path::PathBuf>,
+) {
+    let base_path = tmp(&format!("row-base-{tag}"));
+    rustllama_gguf::synth::write_synthetic_llama_gguf(&base_path, &SynthLlama::default());
+    let pa = tmp(&format!("row-a-{tag}"));
+    let pb = tmp(&format!("row-b-{tag}"));
+    for (p, seed) in [(&pa, 0xA11Cu64), (&pb, 0xB22C)] {
+        write_synthetic_lora_adapter_gguf(
+            p,
+            &SynthLoraAdapter {
+                base: SynthLlama::default(),
+                rank: 8,
+                alpha: 16.0,
+                seed,
+            },
+        );
+    }
+    let model = Arc::new(LlamaModel::load(&Gguf::open(&base_path).expect("base")).expect("load"));
+    let ad_a = Arc::new(LoraAdapter::from_gguf(&Gguf::open(&pa).unwrap(), "lora-a").unwrap());
+    let ad_b = Arc::new(LoraAdapter::from_gguf(&Gguf::open(&pb).unwrap(), "lora-b").unwrap());
+    (model, ad_a, ad_b, vec![base_path, pa, pb])
+}
+
+/// One-token paged KV cache with capacity for a single decode at pos 0.
+fn fresh_paged_cache(shared: &SharedPagedKv, geom: &PagedKvStore) -> PagedKvCache {
+    let mut c = PagedKvCache::new_for(geom);
+    c.ensure_capacity_shared(shared, 1).expect("cap");
+    c
+}
+
+fn rel_tol(reference: &[f32]) -> f32 {
+    1e-2 * (1.0 + reference.iter().map(|v| v.abs()).fold(0.0, f32::max))
+}
+
+#[test]
+fn p3_batched_decode_per_row_adapters() {
+    let (model, ad_a, ad_b, paths) = base_and_two_adapters("dec");
+
+    // Single-adapter references via the contiguous (single-active) path.
+    let (tok_a, tok_b) = (4i32, 9i32);
+    let ref_a = logits_decode_lora(&model, tok_a, Some(&ad_a));
+    let ref_b = logits_decode_lora(&model, tok_b, Some(&ad_b));
+    let ref_base_b = logits_decode(&model, tok_b);
+    assert!(
+        max_abs_diff(&ref_a, &ref_b) > 1e-4,
+        "distinct adapters must give distinct references"
+    );
+
+    // Paged pool: this test builds 6 single-token caches (2 for case 1, 4 for
+    // case 2), each pinning one page — size the pool to cover them all.
+    let page_size = 4u32;
+    let total_pages = 8u32;
+    let mk_store = || {
+        PagedKvStore::new(
+            total_pages,
+            model.cfg.n_layers as u32,
+            model.cfg.n_kv_heads as u32,
+            page_size,
+            model.cfg.head_dim as u32,
+        )
+        .expect("store")
+    };
+    let shared = SharedPagedKv::new(mk_store(), PageTable::new(total_pages, page_size));
+    let geom = mk_store();
+
+    // ---- Case 1: row 0 → adapter A, row 1 → adapter B ----
+    let mut cache_a = fresh_paged_cache(&shared, &geom);
+    let mut cache_b = fresh_paged_cache(&shared, &geom);
+    let mut got_a = vec![0f32; model.cfg.vocab_size];
+    let mut got_b = vec![0f32; model.cfg.vocab_size];
+    {
+        let table = Arc::new(RowAdapters::new(vec![Some(ad_a.clone()), Some(ad_b.clone())]));
+        let _scope = lora::scope_row_adapters(Some(table));
+        let mut slots = vec![
+            DecodeSlot {
+                token_id: tok_a,
+                pos: 0,
+                cache: &mut cache_a,
+                logits_out: &mut got_a,
+            },
+            DecodeSlot {
+                token_id: tok_b,
+                pos: 0,
+                cache: &mut cache_b,
+                logits_out: &mut got_b,
+            },
+        ];
+        model.forward_decode_paged_batched_cascade_f32(&mut slots, &shared, None);
+    }
+    assert!(
+        max_abs_diff(&got_a, &ref_a) <= rel_tol(&ref_a),
+        "row 0 must equal adapter A applied alone (diff {}, tol {})",
+        max_abs_diff(&got_a, &ref_a),
+        rel_tol(&ref_a)
+    );
+    assert!(
+        max_abs_diff(&got_b, &ref_b) <= rel_tol(&ref_b),
+        "row 1 must equal adapter B applied alone (diff {}, tol {})",
+        max_abs_diff(&got_b, &ref_b),
+        rel_tol(&ref_b)
+    );
+
+    // ---- Case 2: row 0 → NONE (base), row 1 → adapter B. Row 0 must be
+    // byte-identical to the batched decode with no row table at all. ----
+    let mut c0 = fresh_paged_cache(&shared, &geom);
+    let mut c1 = fresh_paged_cache(&shared, &geom);
+    let mut none_base = vec![0f32; model.cfg.vocab_size];
+    let mut none_b = vec![0f32; model.cfg.vocab_size];
+    {
+        let mut slots = vec![
+            DecodeSlot {
+                token_id: tok_a,
+                pos: 0,
+                cache: &mut c0,
+                logits_out: &mut none_base,
+            },
+            DecodeSlot {
+                token_id: tok_b,
+                pos: 0,
+                cache: &mut c1,
+                logits_out: &mut none_b,
+            },
+        ];
+        // NO row table scoped → fully byte-identical base batched decode.
+        model.forward_decode_paged_batched_cascade_f32(&mut slots, &shared, None);
+    }
+    let mut c0b = fresh_paged_cache(&shared, &geom);
+    let mut c1b = fresh_paged_cache(&shared, &geom);
+    let mut mixed_0 = vec![0f32; model.cfg.vocab_size];
+    let mut mixed_1 = vec![0f32; model.cfg.vocab_size];
+    {
+        let table = Arc::new(RowAdapters::new(vec![None, Some(ad_b.clone())]));
+        let _scope = lora::scope_row_adapters(Some(table));
+        let mut slots = vec![
+            DecodeSlot {
+                token_id: tok_a,
+                pos: 0,
+                cache: &mut c0b,
+                logits_out: &mut mixed_0,
+            },
+            DecodeSlot {
+                token_id: tok_b,
+                pos: 0,
+                cache: &mut c1b,
+                logits_out: &mut mixed_1,
+            },
+        ];
+        model.forward_decode_paged_batched_cascade_f32(&mut slots, &shared, None);
+    }
+    assert_eq!(
+        mixed_0, none_base,
+        "a row with NO adapter must be byte-identical to the base batched decode"
+    );
+    assert!(
+        max_abs_diff(&mixed_1, &ref_b) <= rel_tol(&ref_b),
+        "the adapted row in a mixed batch must still match adapter B alone"
+    );
+    // And the adapted row differs from the base for that same token.
+    assert!(
+        max_abs_diff(&mixed_1, &ref_base_b) > 1e-4,
+        "the adapted row must differ from the base for its token"
+    );
+
+    for p in &paths {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
+fn p3_ragged_per_row_and_lm_head_remap() {
+    // A ragged tick mixing a PREFILL chunk (no logits → skips the LM head) and
+    // a DECODE row that names an adapter. Exercises both the per-row delta in
+    // the layer matvecs AND the LM-head remap (logit rows are a SUBSET of the
+    // concatenated rows, in their own order).
+    let (model, ad_a, ad_b, paths) = base_and_two_adapters("rag");
+
+    let page_size = 4u32;
+    let total_pages = 8u32;
+    let mk_store = || {
+        PagedKvStore::new(
+            total_pages,
+            model.cfg.n_layers as u32,
+            model.cfg.n_kv_heads as u32,
+            page_size,
+            model.cfg.head_dim as u32,
+        )
+        .expect("store")
+    };
+    let shared = SharedPagedKv::new(mk_store(), PageTable::new(total_pages, page_size));
+    let geom = mk_store();
+
+    // Slot 0: a 3-token prefill chunk at pos 0 (no logits). Slot 1: a decode
+    // row at pos 0 using adapter B. Concatenated rows: [p0,p1,p2, d0]; only the
+    // decode row (concatenated index 3) wants logits.
+    let prefill: [i32; 3] = [2, 5, 1];
+    let dec_tok = 9i32;
+
+    let mut cache_pref = PagedKvCache::new_for(&geom);
+    cache_pref
+        .ensure_capacity_shared(&shared, prefill.len() as u32)
+        .expect("prefill cap");
+    let mut cache_dec = PagedKvCache::new_for(&geom);
+    cache_dec.ensure_capacity_shared(&shared, 1).expect("dec cap");
+
+    let mut no_logits: Vec<f32> = Vec::new();
+    let mut got_dec = vec![0f32; model.cfg.vocab_size];
+    let tokens: Vec<i32> = prefill.iter().copied().chain([dec_tok]).collect();
+    {
+        // Row table in CONCATENATED order: the prefill slot occupies rows 0..3
+        // (adapter A), the decode slot is row 3 (adapter B).
+        let table = Arc::new(RowAdapters::new(vec![
+            Some(ad_a.clone()),
+            Some(ad_a.clone()),
+            Some(ad_a.clone()),
+            Some(ad_b.clone()),
+        ]));
+        let _scope = lora::scope_row_adapters(Some(table));
+        let mut slots = vec![
+            RaggedSlot {
+                n_query: prefill.len(),
+                start_pos: 0,
+                cache: &mut cache_pref,
+                logits_out: no_logits.as_mut_slice(),
+            },
+            RaggedSlot {
+                n_query: 1,
+                start_pos: 0,
+                cache: &mut cache_dec,
+                logits_out: got_dec.as_mut_slice(),
+            },
+        ];
+        model.forward_ragged_paged_cascade_f32(&tokens, &mut slots, &shared, None, None);
+    }
+
+    // Reference: the decode row alone with adapter B via the contiguous path.
+    let ref_b = logits_decode_lora(&model, dec_tok, Some(&ad_b));
+    assert!(
+        max_abs_diff(&got_dec, &ref_b) <= rel_tol(&ref_b),
+        "the ragged decode row (LM head remapped to adapter B) must match \
+         adapter B applied alone (diff {}, tol {})",
+        max_abs_diff(&got_dec, &ref_b),
+        rel_tol(&ref_b)
+    );
+    // And it must differ from the un-adapted base for that token.
+    let ref_base = logits_decode(&model, dec_tok);
+    assert!(
+        max_abs_diff(&got_dec, &ref_base) > 1e-4,
+        "the adapted ragged row must differ from the base"
+    );
+
+    for p in &paths {
         let _ = std::fs::remove_file(p);
     }
 }

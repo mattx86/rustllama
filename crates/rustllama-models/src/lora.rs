@@ -23,13 +23,21 @@
 //! is byte-identical when no adapter is active — the hook is a single
 //! `thread_local` borrow + `Option` check before it touches `out`.
 //!
-//! **Phase 3 — multi-LoRA** ([`LoraRegistry`] + [`set_active_lora`]): hold N
-//! adapters resident keyed by name; a request/slot selects one (or `None` =
-//! base) by setting the thread-active adapter immediately before its forward.
-//! The dispatch reads the thread-active factors, so concurrent threads (one
-//! per slot) can each run a different adapter in the same tick.
+//! **Phase 3 — multi-LoRA** ([`LoraRegistry`] + [`set_active_lora`] /
+//! [`RowAdapters`]): hold N adapters resident keyed by name. Two selection
+//! modes feed the SAME [`apply_delta`] dispatch hook:
+//!   - **single-active** ([`ACTIVE_LORA`] via [`scope_active_lora`]): one
+//!     adapter for the whole forward — the contiguous per-request path, where
+//!     one request = one thread = one adapter.
+//!   - **per-row** ([`ROW_ADAPTERS`] via [`scope_row_adapters`]): a table
+//!     mapping each concatenated row to its adapter — the batched / ragged
+//!     path, where ONE fused forward serves several slots that each named a
+//!     different (or no) adapter. The batched matvec dispatch drives
+//!     [`set_current_lora_row`] per row so row `r`'s delta is
+//!     `ROW_ADAPTERS[r]`.
+//! Either mode `None` ⇒ the base dispatch is byte-identical.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -346,8 +354,24 @@ pub fn merge_tensor_in_place(adapter: &LoraAdapter, t: &mut Tensor) -> MergeOutc
 
 thread_local! {
     /// The thread's active adapter (`None` = base). Set per request / per slot
-    /// immediately before the forward and restored after.
+    /// immediately before the forward and restored after. Used by the
+    /// single-active (contiguous) path: ONE adapter for the whole forward.
     static ACTIVE_LORA: RefCell<Option<Arc<LoraAdapter>>> = const { RefCell::new(None) };
+
+    /// P11 Phase 3 — the thread's active PER-ROW adapter table (`None` = no
+    /// per-row selection). Set by the engine around a batched / ragged forward
+    /// where different rows (slots) carry different adapters; read by the
+    /// batched matvec dispatch, which drives `CURRENT_ROW` per row so the delta
+    /// for row `r` is `ROW_ADAPTERS[r]`. Mutually exclusive with `ACTIVE_LORA`
+    /// in practice (the contiguous path sets the latter, the batched path the
+    /// former); when both are set the row table takes precedence. `None` ⇒ the
+    /// batched dispatch is byte-identical to the pre-LoRA path.
+    static ROW_ADAPTERS: RefCell<Option<Arc<RowAdapters>>> = const { RefCell::new(None) };
+
+    /// The concatenated-row index the batched dispatch is currently applying.
+    /// Only read when `ROW_ADAPTERS` is `Some`; the batched per-row loop sets
+    /// it immediately before each single-row `matvec_tensor_dispatch`.
+    static CURRENT_ROW: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Set the thread's active LoRA adapter, returning the previous value so the
@@ -374,12 +398,35 @@ pub fn lora_adapts(name: &str) -> bool {
     })
 }
 
-/// Phase 2 delta-apply: add `s·B·(A·x)` into `out` for the thread-active
-/// adapter's factors on `name`. No-op (and does not touch `out`) when no
-/// adapter is active or `name` isn't adapted — keeps the base dispatch
-/// byte-identical.
+/// Phase 2 / 3 delta-apply: add `s·B·(A·x)` into `out` for the active adapter's
+/// factors on `name`. No-op (and does not touch `out`) when no adapter is active
+/// or `name` isn't adapted — keeps the base dispatch byte-identical.
+///
+/// Selection precedence: when a PER-ROW adapter table is active (`ROW_ADAPTERS`,
+/// the batched / ragged path), the delta comes from `ROW_ADAPTERS[CURRENT_ROW]`
+/// — the batched dispatch sets `CURRENT_ROW` before each row's single-row
+/// matvec. Otherwise the single thread-active `ACTIVE_LORA` adapter is used (the
+/// contiguous per-request path). The two are mutually exclusive by construction;
+/// the row table wins if both are somehow set.
 #[inline]
 pub fn apply_delta(name: &str, x: &[f32], out: &mut [f32]) {
+    // Per-row table (batched / ragged forward) takes precedence.
+    let had_row_table = ROW_ADAPTERS.with(|c| {
+        let g = c.borrow();
+        let Some(table) = g.as_ref() else {
+            return false;
+        };
+        let row = CURRENT_ROW.with(|r| r.get());
+        if let Some(a) = table.get(row) {
+            if let Some(f) = a.factors.get(name) {
+                f.apply_delta(x, out);
+            }
+        }
+        true
+    });
+    if had_row_table {
+        return;
+    }
     ACTIVE_LORA.with(|c| {
         let g = c.borrow();
         let Some(a) = g.as_ref() else {
@@ -405,6 +452,92 @@ impl Drop for LoraScope {
 #[must_use = "dropping the guard immediately restores the previous adapter"]
 pub fn scope_active_lora(a: Option<Arc<LoraAdapter>>) -> LoraScope {
     LoraScope(set_active_lora(a))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 — per-row (per-slot) adapter selection in the batched / ragged forward
+// ---------------------------------------------------------------------------
+
+/// A per-row adapter selection for ONE batched / ragged forward: `per_row[r]`
+/// is the adapter to apply at concatenated row `r` (`None` = base). The engine
+/// builds one of these per tick (expanding each slot's adapter across the rows
+/// it contributes) and scopes it via [`scope_row_adapters`]; the batched matvec
+/// dispatch then applies `per_row[r]`'s delta at row `r`.
+#[derive(Debug, Default, Clone)]
+pub struct RowAdapters {
+    per_row: Vec<Option<Arc<LoraAdapter>>>,
+}
+
+impl RowAdapters {
+    pub fn new(per_row: Vec<Option<Arc<LoraAdapter>>>) -> Self {
+        Self { per_row }
+    }
+    /// The adapter for concatenated row `row`, if any (out-of-range ⇒ `None`).
+    #[inline]
+    pub fn get(&self, row: usize) -> Option<Arc<LoraAdapter>> {
+        self.per_row.get(row).and_then(|a| a.clone())
+    }
+    /// `true` iff ANY row's adapter adapts the base tensor `name`. The batched
+    /// dispatch uses this to decide whether to force the per-row single-row path
+    /// (so the delta is applied row-by-row) for this tensor.
+    #[inline]
+    pub fn adapts_any(&self, name: &str) -> bool {
+        self.per_row
+            .iter()
+            .any(|a| a.as_ref().is_some_and(|ad| ad.factors.contains_key(name)))
+    }
+    /// `true` iff no row carries an adapter (every entry `None`). Lets a caller
+    /// skip scoping entirely when the batch has no LoRA (byte-identical path).
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.per_row.iter().all(|a| a.is_none())
+    }
+    pub fn len(&self) -> usize {
+        self.per_row.len()
+    }
+}
+
+/// Set the thread's active per-row adapter table, returning the previous value.
+pub fn set_row_adapters(t: Option<Arc<RowAdapters>>) -> Option<Arc<RowAdapters>> {
+    ROW_ADAPTERS.with(|c| c.replace(t))
+}
+
+/// The thread's active per-row adapter table, if any.
+pub fn active_row_adapters() -> Option<Arc<RowAdapters>> {
+    ROW_ADAPTERS.with(|c| c.borrow().clone())
+}
+
+/// `true` iff a per-row table is active AND some row's adapter adapts `name`.
+/// The batched matvec dispatch ORs this with [`lora_adapts`] to decide whether
+/// to route `name` through the per-row single-row path.
+#[inline]
+pub fn row_lora_adapts(name: &str) -> bool {
+    ROW_ADAPTERS.with(|c| c.borrow().as_ref().is_some_and(|t| t.adapts_any(name)))
+}
+
+/// Set the concatenated-row index the batched dispatch is about to apply. Read
+/// by [`apply_delta`] only when a per-row table is active; a no-op cost
+/// otherwise (one `Cell` store).
+#[inline]
+pub fn set_current_lora_row(row: usize) {
+    CURRENT_ROW.with(|c| c.set(row));
+}
+
+/// RAII guard restoring the previously active per-row table on drop.
+pub struct RowLoraScope(Option<Arc<RowAdapters>>);
+
+impl Drop for RowLoraScope {
+    fn drop(&mut self) {
+        set_row_adapters(self.0.take());
+    }
+}
+
+/// Make `t` the thread-active per-row adapter table for the lifetime of the
+/// returned guard. `None` (or an all-`None` table) selects the un-adapted base
+/// for every row — byte-identical to the pre-LoRA batched path.
+#[must_use = "dropping the guard immediately restores the previous per-row table"]
+pub fn scope_row_adapters(t: Option<Arc<RowAdapters>>) -> RowLoraScope {
+    RowLoraScope(set_row_adapters(t))
 }
 
 /// Phase 3: a set of named adapters held resident for per-request selection.

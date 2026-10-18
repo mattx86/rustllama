@@ -164,12 +164,15 @@ pub(crate) fn matvec_tensor_batched_dispatch(
         m_dim,
         k_dim,
     );
-    // P11 (LoRA): when the thread-active adapter adapts THIS tensor, bypass
-    // the batched USM + PTQ1_0 fast paths (which don't run the per-row LoRA
-    // hook) so every row funnels through the single-row `matvec_tensor_dispatch`
-    // — the delta then lands exactly once per row. Non-adapted tensors (and the
-    // no-LoRA case) keep the fast paths, so default behavior is byte-identical.
-    let lora_adapted = crate::lora::lora_adapts(&w.name);
+    // P11 (LoRA): when an adapter adapts THIS tensor — EITHER the single
+    // thread-active adapter (contiguous path) OR some row's adapter in the
+    // active per-row table (batched / ragged path) — bypass the batched USM +
+    // PTQ1_0 fast paths (which don't run the per-row LoRA hook) so every row
+    // funnels through the single-row `matvec_tensor_dispatch`. The delta then
+    // lands exactly once per row, from `ACTIVE_LORA` or `ROW_ADAPTERS[row]` as
+    // selected in `apply_delta`. Non-adapted tensors (and the no-LoRA case)
+    // keep the fast paths, so default behavior is byte-identical.
+    let lora_adapted = crate::lora::lora_adapts(&w.name) || crate::lora::row_lora_adapts(&w.name);
     if !lora_adapted
         && crate::accel::try_matvec_tensor_batched_usm_f32(w, x, out, m_dim, k_dim, n_rows)
     {
@@ -191,8 +194,15 @@ pub(crate) fn matvec_tensor_batched_dispatch(
     }
     // Fallback: per-row dispatch via the single-row hook, which
     // tries single-row USM then CPU. Identical to the pre-batched
-    // behavior.
+    // behavior. P11: when a LoRA selection is active, set the current row
+    // index before each single-row dispatch so `apply_delta` picks this row's
+    // adapter from the per-row table (a no-op `Cell` store for the single-
+    // active path, where the row index is never read). Gated on `lora_adapted`
+    // so the no-LoRA CPU-fallback path pays nothing.
     for i in 0..n_rows {
+        if lora_adapted {
+            crate::lora::set_current_lora_row(i);
+        }
         let x_row = &x[i * k_dim..(i + 1) * k_dim];
         let out_row = &mut out[i * m_dim..(i + 1) * m_dim];
         matvec_tensor_dispatch(w, x_row, out_row, m_dim, k_dim);
@@ -272,11 +282,14 @@ pub(crate) fn matvec_tensor_gate_up_fused_dispatch(
     // (Apple), then the SYCL USM path. Each is inert off its backend
     // (`cuda_active`/`mlx_active`/USM-ctx checks) and returns false on a miss,
     // falling through to the two-matvec base path below.
-    // P11 (LoRA): if either projection is adapted by the thread-active
-    // adapter, force the two-matvec base path so each `matvec_tensor_dispatch`
-    // applies its own delta exactly once (the fused kernels bypass that hook).
-    let lora_adapted =
-        crate::lora::lora_adapts(&w_gate.name) || crate::lora::lora_adapts(&w_up.name);
+    // P11 (LoRA): if either projection is adapted — by the single thread-active
+    // adapter OR some row's adapter in the active per-row table — force the
+    // two-matvec base path so each `matvec_tensor_dispatch` applies its own
+    // delta exactly once (the fused kernels bypass that hook).
+    let lora_adapted = crate::lora::lora_adapts(&w_gate.name)
+        || crate::lora::lora_adapts(&w_up.name)
+        || crate::lora::row_lora_adapts(&w_gate.name)
+        || crate::lora::row_lora_adapts(&w_up.name);
     if !lora_adapted
         && !crate::imatrix_collect::is_collecting()
         && (crate::accel::try_matvec_tensor_gate_up_fused_cuda_f32(
@@ -14708,7 +14721,20 @@ impl LlamaModel {
             );
         }
         let mut logits_all = vec![0f32; n_logit * vocab];
+        // P11 (LoRA): the LM head runs over a SUBSET of rows (`logit_rows`) in
+        // their own order, not the concatenated row order the per-row adapter
+        // table is indexed by. Remap the table to logit-row order for this one
+        // batched dispatch (row `p` uses the adapter at concatenated row
+        // `logit_rows[p].1`). `None` (no row table active) ⇒ no scope ⇒
+        // byte-identical. The guard restores the concatenated table on drop.
+        let _lm_lora = crate::lora::active_row_adapters().map(|t| {
+            let sub: Vec<_> = logit_rows.iter().map(|&(_, row)| t.get(row)).collect();
+            crate::lora::scope_row_adapters(Some(std::sync::Arc::new(
+                crate::lora::RowAdapters::new(sub),
+            )))
+        });
         matvec_tensor_batched_dispatch(lm_head, &final_norm, &mut logits_all, vocab, d, n_logit);
+        drop(_lm_lora);
         self.finalize_logits(&mut logits_all);
         for (p, &(slot_i, _)) in logit_rows.iter().enumerate() {
             slots[slot_i]
