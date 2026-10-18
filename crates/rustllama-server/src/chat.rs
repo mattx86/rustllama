@@ -18,7 +18,9 @@ use rustllama_engine::{ChatMessage, SamplingParams};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::{lora_not_found, model_not_found, AppState, ReqSchedule, ServingModel, StreamOptions, Usage};
+use crate::{
+    lora_not_found, model_not_found, AppState, ReqSchedule, ServingModel, StreamOptions, Usage,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
@@ -2795,7 +2797,10 @@ async fn chat_blocking(state: AppState, req: ChatRequest, sched: ReqSchedule) ->
     for idx in 0..n_choices {
         let mut sampling_i = sampling.clone();
         sampling_i.seed = base_seed.wrapping_add(idx as u64);
-        let mut stream = match handle.engine.chat_scheduled(&msgs, &sampling_i, submit_opts.clone()) {
+        let mut stream = match handle
+            .engine
+            .chat_scheduled(&msgs, &sampling_i, submit_opts.clone())
+        {
             Ok(s) => s,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };

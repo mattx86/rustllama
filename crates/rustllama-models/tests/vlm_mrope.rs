@@ -45,7 +45,9 @@ fn mrope_forward_wires_sectioned_rope_and_keeps_text_byte_identical() {
     // embedding rows — the forward doesn't care whether they came from the
     // vision splice or the embed table.
     let n = 4usize;
-    let ids: Vec<i32> = (0..n as i32).map(|i| i % model.cfg.vocab_size as i32).collect();
+    let ids: Vec<i32> = (0..n as i32)
+        .map(|i| i % model.cfg.vocab_size as i32)
+        .collect();
     let embeds = model.embed_tokens(&ids);
     assert_eq!(embeds.len(), n * d);
 

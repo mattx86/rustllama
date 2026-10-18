@@ -1068,13 +1068,14 @@ pub async fn chat(
     // P14-http: thread priority + deadline into the paged driver (no-op on the
     // CpuEngine). Default headers ⇒ `SubmitOpts::default()` ⇒ identical to the
     // prior `engine.chat` call.
-    let tok_stream = match handle
-        .engine
-        .chat_scheduled(&msgs, &sampling, sched.to_submit_opts(None))
-    {
-        Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
+    let tok_stream =
+        match handle
+            .engine
+            .chat_scheduled(&msgs, &sampling, sched.to_submit_opts(None))
+        {
+            Ok(s) => s,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
 
     if req.stream {
         // E1: process-unique id (see `crate::new_request_id`).
@@ -1754,7 +1755,9 @@ pub async fn generate(
             (stream, count)
         }
         PreparedGenerate::Raw { count } => {
-            let stream = match handle.engine.generate_scheduled(&req.prompt, &sampling, submit_opts)
+            let stream = match handle
+                .engine
+                .generate_scheduled(&req.prompt, &sampling, submit_opts)
             {
                 Ok(s) => s,
                 Err(e) => {

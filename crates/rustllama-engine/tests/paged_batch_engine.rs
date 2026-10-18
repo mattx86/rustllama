@@ -1299,7 +1299,10 @@ fn paged_batch_cascade_engages_on_shared_prefix() {
     assert_eq!(outs.len(), 2);
     assert!(!outs[0].is_empty(), "slot A produced tokens");
     assert!(!outs[1].is_empty(), "slot B produced tokens");
-    assert!(outs[0].len() <= 3 && outs[1].len() <= 3, "capped at max_tokens");
+    assert!(
+        outs[0].len() <= 3 && outs[1].len() <= 3,
+        "capped at max_tokens"
+    );
     assert!(
         batch.cascade_engagements_for_tests() >= 1,
         "two slots sharing a 16-token page-aligned prefix must engage the cascade decode path \
@@ -1338,8 +1341,14 @@ fn paged_batch_cascade_not_engaged_is_byte_identical() {
     let outs = batch
         .generate_batched_token_ids(vec![(pa, greedy(3)), (pb, greedy(3))])
         .expect("generate");
-    assert_eq!(outs[0], ref_a, "slot A not byte-identical to single-slot ref");
-    assert_eq!(outs[1], ref_b, "slot B not byte-identical to single-slot ref");
+    assert_eq!(
+        outs[0], ref_a,
+        "slot A not byte-identical to single-slot ref"
+    );
+    assert_eq!(
+        outs[1], ref_b,
+        "slot B not byte-identical to single-slot ref"
+    );
     assert_eq!(
         batch.cascade_engagements_for_tests(),
         0,
@@ -1523,7 +1532,10 @@ fn paged_batch_per_slot_lora_each_matches_single_slot_reference() {
 
     // Unknown adapter name fails the request — never a silent base serve.
     let err = batch.generate_batched_token_ids(vec![(p_a.clone(), samp(Some("ghost")))]);
-    assert!(err.is_err(), "unknown adapter must fail, not serve the base");
+    assert!(
+        err.is_err(),
+        "unknown adapter must fail, not serve the base"
+    );
 
     for p in [&tmp, &ad_a, &ad_b] {
         let _ = std::fs::remove_file(p);

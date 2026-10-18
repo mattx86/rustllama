@@ -120,9 +120,7 @@ impl RecordingEngine {
             .store(opts.deadline.is_some(), Ordering::Release);
         // Mirror the driver: an already-elapsed deadline ⇒ immediate timeout
         // terminal, no tokens. Otherwise stream a few tokens.
-        let expired = opts
-            .deadline
-            .is_some_and(|d| Instant::now() >= d);
+        let expired = opts.deadline.is_some_and(|d| Instant::now() >= d);
         if expired {
             let s = async_stream::stream! {
                 yield Err(EngineError::DeadlineExceeded);
@@ -158,7 +156,11 @@ impl Engine for RecordingEngine {
     fn tokenize(&self, text: &str) -> rustllama_engine::Result<Vec<u32>> {
         Ok(text.bytes().map(|b| b as u32).collect())
     }
-    fn chat(&self, msgs: &[ChatMessage], s: &SamplingParams) -> rustllama_engine::Result<TokenStream> {
+    fn chat(
+        &self,
+        msgs: &[ChatMessage],
+        s: &SamplingParams,
+    ) -> rustllama_engine::Result<TokenStream> {
         // Default (no-opts) path delegates to chat_scheduled with default opts —
         // so even a client that never sends headers is recorded as DEFAULT.
         self.chat_scheduled(msgs, s, SubmitOpts::default())
@@ -295,5 +297,8 @@ async fn already_expired_deadline_time_limits_the_stream() {
         !body.contains("t0") && !body.contains("t3"),
         "an already-expired request must not stream the normal tokens: {body}"
     );
-    assert!(body.contains("[DONE]"), "stream still terminates cleanly: {body}");
+    assert!(
+        body.contains("[DONE]"),
+        "stream still terminates cleanly: {body}"
+    );
 }

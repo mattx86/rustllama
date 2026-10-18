@@ -5660,7 +5660,10 @@ impl LlamaModel {
     /// shell is a bug (the engine routes Mamba models to the selective scan
     /// before any such call); it exists only so the Llama-shaped accessors and
     /// KV sizing return the right numbers.
-    pub fn mamba_shell(cfg: &crate::mamba_arch::MambaConfig, eos_token_id: Option<u32>) -> LlamaModel {
+    pub fn mamba_shell(
+        cfg: &crate::mamba_arch::MambaConfig,
+        eos_token_id: Option<u32>,
+    ) -> LlamaModel {
         let lcfg = LlamaConfig {
             arch: "mamba".to_string(),
             n_layers: cfg.n_layers,
@@ -6039,7 +6042,14 @@ fn cascade_decode_attention_group(
     let mut prefix_k = vec![0f32; n_kv_heads * prefix_len * head_dim];
     let mut prefix_v = vec![0f32; n_kv_heads * prefix_len * head_dim];
     caches[0]
-        .gather_layer_range_shared(shared, layer, 0, prefix_len as u32, &mut prefix_k, &mut prefix_v)
+        .gather_layer_range_shared(
+            shared,
+            layer,
+            0,
+            prefix_len as u32,
+            &mut prefix_k,
+            &mut prefix_v,
+        )
         .expect("cascade prefix gather in range");
     // Each sequence's private suffix [prefix_len, kv_len).
     let mut suffix_k: Vec<Vec<f32>> = Vec::with_capacity(n_seq);

@@ -827,7 +827,9 @@ impl PagedKvCache {
             !self.evict_engaged(),
             "gather_layer_range_shared assumes no eviction (batched paged pool)"
         );
-        shared.with_store(|store| store.gather_layer_range(&self.pages, layer, start, end, k_out, v_out))
+        shared.with_store(|store| {
+            store.gather_layer_range(&self.pages, layer, start, end, k_out, v_out)
+        })
     }
 
     /// P12b paged beam: raise the `seq_len` watermark to `n` after a raw

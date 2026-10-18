@@ -57,7 +57,8 @@ fn fixtures(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
 fn build_state(base: &std::path::Path, adapter: Option<&std::path::Path>) -> AppState {
     let cpu = CpuEngine::load_with_tokenizer(base, 64).expect("load engine");
     if let Some(ad) = adapter {
-        cpu.attach_lora_adapter("tune-a", ad).expect("attach adapter");
+        cpu.attach_lora_adapter("tune-a", ad)
+            .expect("attach adapter");
     }
     let cpu = Arc::new(cpu);
     let serving = ServingModel {
@@ -139,14 +140,23 @@ async fn lora_explicit_field_selects_adapter_and_changes_output() {
     let state = build_state(&base, Some(&adapter));
 
     // Base (no selection).
-    let (s0, base_v) = post_json(router(state.clone()), "/v1/completions", req_body("lora-test", None)).await;
+    let (s0, base_v) = post_json(
+        router(state.clone()),
+        "/v1/completions",
+        req_body("lora-test", None),
+    )
+    .await;
     assert_eq!(s0, StatusCode::OK, "base: {base_v}");
     let base_lp = logprobs_of(&base_v);
     assert!(!base_lp.is_empty(), "base produced logprobs: {base_v}");
 
     // Adapter selected via the explicit `lora` field.
-    let (s1, lora_v) =
-        post_json(router(state.clone()), "/v1/completions", req_body("lora-test", Some("tune-a"))).await;
+    let (s1, lora_v) = post_json(
+        router(state.clone()),
+        "/v1/completions",
+        req_body("lora-test", Some("tune-a")),
+    )
+    .await;
     assert_eq!(s1, StatusCode::OK, "lora: {lora_v}");
     assert_ne!(
         base_lp,
@@ -155,14 +165,30 @@ async fn lora_explicit_field_selects_adapter_and_changes_output() {
     );
 
     // Base is unchanged on a repeat (no leaked selection).
-    let (_, base_again) =
-        post_json(router(state.clone()), "/v1/completions", req_body("lora-test", None)).await;
-    assert_eq!(base_lp, logprobs_of(&base_again), "base must stay unchanged");
+    let (_, base_again) = post_json(
+        router(state.clone()),
+        "/v1/completions",
+        req_body("lora-test", None),
+    )
+    .await;
+    assert_eq!(
+        base_lp,
+        logprobs_of(&base_again),
+        "base must stay unchanged"
+    );
 
     // Unknown adapter name ⇒ 404 (never a silent base serve).
-    let (s2, err_v) =
-        post_json(router(state.clone()), "/v1/completions", req_body("lora-test", Some("ghost"))).await;
-    assert_eq!(s2, StatusCode::NOT_FOUND, "unknown adapter must 404: {err_v}");
+    let (s2, err_v) = post_json(
+        router(state.clone()),
+        "/v1/completions",
+        req_body("lora-test", Some("ghost")),
+    )
+    .await;
+    assert_eq!(
+        s2,
+        StatusCode::NOT_FOUND,
+        "unknown adapter must 404: {err_v}"
+    );
 
     for p in [&base, &adapter] {
         let _ = std::fs::remove_file(p);
@@ -175,7 +201,12 @@ async fn lora_model_suffix_convention_selects_adapter() {
     let state = build_state(&base, Some(&adapter));
 
     let base_lp = {
-        let (s, v) = post_json(router(state.clone()), "/v1/completions", req_body("lora-test", None)).await;
+        let (s, v) = post_json(
+            router(state.clone()),
+            "/v1/completions",
+            req_body("lora-test", None),
+        )
+        .await;
         assert_eq!(s, StatusCode::OK);
         logprobs_of(&v)
     };
@@ -246,10 +277,18 @@ async fn lora_load_and_list_endpoints() {
     assert_eq!(names, vec!["tune-a".to_string()]);
 
     // And a request can now select it (distribution differs from base).
-    let (_, base_v) =
-        post_json(router(state.clone()), "/v1/completions", req_body("lora-test", None)).await;
-    let (s, lora_v) =
-        post_json(router(state.clone()), "/v1/completions", req_body("lora-test", Some("tune-a"))).await;
+    let (_, base_v) = post_json(
+        router(state.clone()),
+        "/v1/completions",
+        req_body("lora-test", None),
+    )
+    .await;
+    let (s, lora_v) = post_json(
+        router(state.clone()),
+        "/v1/completions",
+        req_body("lora-test", Some("tune-a")),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
     assert_ne!(
         logprobs_of(&base_v),

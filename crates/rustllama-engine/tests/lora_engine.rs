@@ -60,8 +60,18 @@ fn cpu_engine_resident_lora_per_request_selection() {
 
     let engine = CpuEngine::load(&base, 32).expect("load engine");
     assert_eq!(engine.lora_adapter_names().len(), 0);
-    assert!(engine.attach_lora_adapter("tune-a", &ad_a).expect("attach a") > 0);
-    assert!(engine.attach_lora_adapter("tune-b", &ad_b).expect("attach b") > 0);
+    assert!(
+        engine
+            .attach_lora_adapter("tune-a", &ad_a)
+            .expect("attach a")
+            > 0
+    );
+    assert!(
+        engine
+            .attach_lora_adapter("tune-b", &ad_b)
+            .expect("attach b")
+            > 0
+    );
     assert!(engine.has_lora_adapter("tune-a"));
     assert!(engine.has_lora_adapter("tune-b"));
     assert!(!engine.has_lora_adapter("ghost"));
@@ -116,18 +126,27 @@ fn cpu_engine_resident_lora_per_request_selection() {
     let b_out2 = engine
         .generate_token_ids(&prompt, 6, &greedy(6, Some("tune-b")))
         .expect("lora-b gen 2");
-    assert_eq!(b_out, b_out2, "per-request selection is deterministic for B too");
+    assert_eq!(
+        b_out, b_out2,
+        "per-request selection is deterministic for B too"
+    );
 
     // The base is still byte-identical AFTER adapted requests (the scope is
     // restored each time — no leaked thread-active adapter).
     let base_again = engine
         .generate_token_ids(&prompt, 6, &greedy(6, None))
         .expect("base gen again");
-    assert_eq!(base_out, base_again, "base must stay byte-identical after adapted runs");
+    assert_eq!(
+        base_out, base_again,
+        "base must stay byte-identical after adapted runs"
+    );
 
     // An unknown adapter name fails the request (never a silent base serve).
     let err = engine.generate_token_ids(&prompt, 6, &greedy(6, Some("ghost")));
-    assert!(err.is_err(), "unknown adapter must fail, not serve the base");
+    assert!(
+        err.is_err(),
+        "unknown adapter must fail, not serve the base"
+    );
 
     for p in [&base, &ad_a, &ad_b] {
         let _ = std::fs::remove_file(p);

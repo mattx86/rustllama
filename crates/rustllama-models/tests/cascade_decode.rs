@@ -78,7 +78,8 @@ fn cascade_decode_matches_per_slot_within_tolerance() {
         let mut c = PagedKvCache::new_for(&geom);
         shared.with_table_mut(|t| t.add_ref(&shared_pages));
         c.pin_shared_prefix(shared_pages.clone(), prefix_len as u32);
-        c.ensure_capacity_shared(&shared, total_capacity).expect("cap");
+        c.ensure_capacity_shared(&shared, total_capacity)
+            .expect("cap");
         shared.with_store_mut(|st| {
             for (j, &t) in suffix.iter().enumerate() {
                 let pos = prefix_len + j;

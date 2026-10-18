@@ -1038,7 +1038,8 @@ const RE_DEEPSEEK_CJK: &str = "[\u{4e00}-\u{9fa5}\u{800}-\u{4e00}\u{ac00}-\u{d7f
 /// whitespace split. The long letter class is the upstream enumeration of
 /// "cased letters excluding the CJK runs handled by RE_DEEPSEEK_CJK".
 const RE_DEEPSEEK_LLM_LETTERS: &str = "\\s?[A-Za-z\u{b5}\u{c0}-\u{d6}\u{d8}-\u{f6}\u{f8}-\u{1ba}\u{1bc}-\u{1bf}\u{1c4}-\u{293}\u{295}-\u{2af}\u{370}-\u{373}\u{376}\u{377}\u{37b}-\u{37d}\u{37f}\u{386}\u{388}-\u{38a}\u{38c}\u{38e}-\u{3a1}\u{3a3}-\u{3f5}\u{3f7}-\u{481}\u{48a}-\u{52f}\u{531}-\u{556}\u{10a0}-\u{10c5}\u{13a0}-\u{13f5}\u{13f8}-\u{13fd}\u{1c90}-\u{1cba}\u{1cbd}-\u{1cbf}\u{1d00}-\u{1d2b}\u{1d6b}-\u{1d77}\u{1d79}-\u{1d9a}\u{1e00}-\u{1f15}\u{1f18}-\u{1f1d}\u{1f20}-\u{1f45}\u{1f48}-\u{1f4d}\u{1f50}-\u{1f57}\u{1f59}\u{1f5b}\u{1f5d}\u{1f5f}-\u{1f7d}\u{1f80}-\u{1fb4}\u{1fb6}-\u{1fbc}\u{1fbe}\u{1fc2}-\u{1fc4}\u{1fc6}-\u{1fcc}\u{1fd0}-\u{1fd3}\u{1fd6}-\u{1fdb}\u{1fe0}-\u{1fec}\u{1ff2}-\u{1ff4}\u{1ff6}-\u{1ffc}\u{2102}\u{2107}\u{210a}-\u{2113}\u{2115}\u{2119}-\u{211d}\u{2124}\u{2126}\u{2128}\u{212a}-\u{212d}\u{212f}-\u{2134}\u{2139}\u{213c}-\u{213f}\u{2145}-\u{2149}\u{214e}\u{2183}\u{2184}\u{2c00}-\u{2c7b}\u{2c7e}-\u{2ce4}\u{2ceb}-\u{2cee}\u{2cf2}\u{2cf3}\u{a640}-\u{a66d}\u{a680}-\u{a69b}\u{a722}-\u{a76f}\u{a771}-\u{a787}\u{a78b}-\u{a78e}\u{ab70}-\u{abbf}\u{fb00}-\u{fb06}\u{fb13}-\u{fb17}\u{ff21}-\u{ff3a}\u{ff41}-\u{ff5a}\u{10400}-\u{1044f}\u{104b0}-\u{104d3}\u{104d8}-\u{104fb}\u{10c80}-\u{10cb2}\u{10cc0}-\u{10cf2}\u{118a0}-\u{118df}\u{1e900}-\u{1e943}]+";
-const RE_DEEPSEEK_LLM_PUNCT: &str = "\\s?[!-/:-~\u{ff01}-\u{ff0f}\u{ff1a}-\u{ff5e}\u{2018}-\u{201f}\u{3000}-\u{3002}]+";
+const RE_DEEPSEEK_LLM_PUNCT: &str =
+    "\\s?[!-/:-~\u{ff01}-\u{ff0f}\u{ff1a}-\u{ff5e}\u{2018}-\u{201f}\u{3000}-\u{3002}]+";
 const RE_DEEPSEEK_TRAILING_WS: &str = "\\s+$";
 /// DeepSeek-V3 (`deepseek-ai/DeepSeek-V3`, also used by R1): 1-3 digit groups,
 /// then a Hiragana/Katakana/CJK run, then a GPT-4-style main regex. V3's
@@ -1540,12 +1541,20 @@ mod tests {
     fn m3_tail_pretokenizer_digit_grouping() {
         // deepseek-coder/llm + command-r + starcoder (Digits stage) and tekken
         // (`\p{N}`, one digit at a time) all split every digit → four "9"s.
-        for fam in ["deepseek-coder", "deepseek-llm", "command-r", "starcoder", "tekken"] {
+        for fam in [
+            "deepseek-coder",
+            "deepseek-llm",
+            "command-r",
+            "starcoder",
+            "tekken",
+        ] {
             let enc = tiny_digit_bpe(Some(fam)).encode("9999", false).unwrap();
             assert_eq!(enc.get_ids(), &[0, 0, 0, 0], "{fam}");
         }
         // DeepSeek-V3 groups digits 1-3 (`\p{N}{1,3}`, like Llama-3) → "999" + "9".
-        let enc = tiny_digit_bpe(Some("deepseek-v3")).encode("9999", false).unwrap();
+        let enc = tiny_digit_bpe(Some("deepseek-v3"))
+            .encode("9999", false)
+            .unwrap();
         assert_eq!(enc.get_ids(), &[2, 0]);
     }
 

@@ -891,11 +891,7 @@ impl PagedBatchEngine {
     /// under `name`. Mirrors [`crate::CpuEngine::attach_lora_adapter`]: the
     /// adapter is held as low-rank deltas and selected PER SLOT via
     /// [`SamplingParams::lora_adapter`]. Returns the adapted-tensor count.
-    pub fn attach_lora_adapter(
-        &self,
-        name: &str,
-        path: &Path,
-    ) -> Result<usize, CpuEngineError> {
+    pub fn attach_lora_adapter(&self, name: &str, path: &Path) -> Result<usize, CpuEngineError> {
         let g = Gguf::open(path)?;
         let adapter = rustllama_models::lora::LoraAdapter::from_gguf(&g, name)
             .map_err(|e| CpuEngineError::Other(format!("LoRA adapter load failed: {e}")))?;
@@ -1234,8 +1230,7 @@ impl PagedBatchEngine {
                     // P11: each hybrid slot decodes independently through the
                     // contiguous hybrid forward, so scope its own adapter
                     // (single-active) for this step. `None` ⇒ base.
-                    let _lora =
-                        rustllama_models::lora::scope_active_lora(slots[i].adapter.clone());
+                    let _lora = rustllama_models::lora::scope_active_lora(slots[i].adapter.clone());
                     let hyb = slots[i]
                         .hybrid
                         .as_mut()
@@ -1264,7 +1259,10 @@ impl PagedBatchEngine {
                 // the `DecodeSlot` vec built below). All-None ⇒ no scope ⇒
                 // byte-identical to the pre-LoRA batched decode.
                 let row_adapters: Vec<Option<Arc<rustllama_models::lora::LoraAdapter>>> =
-                    active_indices.iter().map(|&i| slots[i].adapter.clone()).collect();
+                    active_indices
+                        .iter()
+                        .map(|&i| slots[i].adapter.clone())
+                        .collect();
                 // P3: group active slots that share a page-aligned APC prefix
                 // so the batched decode computes the shared-prefix attention
                 // once (cascade). Members index into `decode_slots` (built below

@@ -113,7 +113,10 @@ fn cpu_engine_loads_and_runs_canonical_mamba() {
     let out1 = cpu
         .generate_token_ids(&prompt, 5, &greedy(5))
         .expect("canonical Mamba greedy generate");
-    assert!(!out1.is_empty(), "canonical Mamba decode produced no tokens");
+    assert!(
+        !out1.is_empty(),
+        "canonical Mamba decode produced no tokens"
+    );
     assert!(
         out1.iter().all(|&t| (t as usize) < cpu.vocab_size()),
         "token id out of vocab range"

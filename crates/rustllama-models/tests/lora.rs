@@ -478,7 +478,10 @@ fn p3_batched_decode_per_row_adapters() {
     let mut got_a = vec![0f32; model.cfg.vocab_size];
     let mut got_b = vec![0f32; model.cfg.vocab_size];
     {
-        let table = Arc::new(RowAdapters::new(vec![Some(ad_a.clone()), Some(ad_b.clone())]));
+        let table = Arc::new(RowAdapters::new(vec![
+            Some(ad_a.clone()),
+            Some(ad_b.clone()),
+        ]));
         let _scope = lora::scope_row_adapters(Some(table));
         let mut slots = vec![
             DecodeSlot {
@@ -609,7 +612,9 @@ fn p3_ragged_per_row_and_lm_head_remap() {
         .ensure_capacity_shared(&shared, prefill.len() as u32)
         .expect("prefill cap");
     let mut cache_dec = PagedKvCache::new_for(&geom);
-    cache_dec.ensure_capacity_shared(&shared, 1).expect("dec cap");
+    cache_dec
+        .ensure_capacity_shared(&shared, 1)
+        .expect("dec cap");
 
     let mut no_logits: Vec<f32> = Vec::new();
     let mut got_dec = vec![0f32; model.cfg.vocab_size];

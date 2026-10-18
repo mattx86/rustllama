@@ -3731,11 +3731,12 @@ impl CpuEngine {
                 .as_ref()
                 .and_then(|_| vlm_inputs.mrope_positions_for_sequence(seq_len, start_pos))
             {
-                Some(mrope) => {
-                    self.model
-                        .forward_prefill_from_embeds_mrope(&spliced, start_pos, &mrope, kv)
-                }
-                None => self.model.forward_prefill_from_embeds(&spliced, start_pos, kv),
+                Some(mrope) => self
+                    .model
+                    .forward_prefill_from_embeds_mrope(&spliced, start_pos, &mrope, kv),
+                None => self
+                    .model
+                    .forward_prefill_from_embeds(&spliced, start_pos, kv),
             },
         )
     }
@@ -4447,7 +4448,11 @@ impl CpuEngine {
             .write()
             .map_err(|_| CpuEngineError::Other("LoRA registry lock poisoned".into()))?;
         reg.insert(adapter);
-        tracing::info!(adapter = name, adapted_tensors = n, "LoRA adapter attached (P11 resident)");
+        tracing::info!(
+            adapter = name,
+            adapted_tensors = n,
+            "LoRA adapter attached (P11 resident)"
+        );
         Ok(n)
     }
 
@@ -6075,13 +6080,8 @@ impl CpuEngine {
         // F9-tail — canonical Mamba/SSM models stream through the selective-scan
         // forward (the `model` field is a transformer shell, never executed).
         if let Some(mm) = self.mamba.clone() {
-            return self.generate_token_ids_streaming_mamba(
-                &mm,
-                prompt_ids,
-                sampling,
-                logprobs_k,
-                tx,
-            );
+            return self
+                .generate_token_ids_streaming_mamba(&mm, prompt_ids, sampling, logprobs_k, tx);
         }
         let _sycl_guard = install_sycl_dispatch_if_requested();
         rustllama_models::accel::set_flash_attention(self.flash_attention);
