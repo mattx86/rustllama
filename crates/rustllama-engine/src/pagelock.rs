@@ -301,10 +301,10 @@ mod sys_unix {
     /// cross-platform memory-budget planner runs on POSIX too (previously it
     /// only ran on Windows, where `GlobalMemoryStatusEx` is available).
     /// Linux (and most SVR4) expose `_SC_PHYS_PAGES` / `_SC_AVPHYS_PAGES`;
-    /// macOS does NOT define them in `libc` (its free-RAM query is the
-    /// `vm_statistics64` Mach call), so this returns `None` there and the
-    /// planner stays off on macOS — a documented follow-up, not a regression
-    /// (macOS keeps today's behavior). `None` on any `sysconf` failure.
+    /// macOS does NOT define them in `libc` (its queries are `sysctl`
+    /// `hw.memsize` + the `vm_statistics64` Mach call), so it has its OWN arm
+    /// below (M7-mac-mem) rather than this `sysconf` path. `None` on any
+    /// `sysconf` failure.
     #[cfg(target_os = "linux")]
     pub fn mem_status() -> Option<(u64, u64)> {
         // SAFETY: sysconf takes a constant resource id, no pointers.
@@ -322,7 +322,92 @@ mod sys_unix {
         };
         Some((total, free))
     }
-    #[cfg(not(target_os = "linux"))]
+
+    /// Physical memory `(total, available)` bytes on macOS (M7-mac-mem).
+    /// macOS does not implement `_SC_PHYS_PAGES` / `_SC_AVPHYS_PAGES`, so the
+    /// Linux `sysconf` arm above cannot serve it; this uses the native
+    /// BSD/Mach queries instead, so the cross-platform memory-budget +
+    /// pagelock planner runs on Apple hosts too (both now `mlock` RAM there):
+    ///   * TOTAL  — `sysctl(CTL_HW, HW_MEMSIZE)`, the documented 64-bit count
+    ///     of installed physical RAM (the legacy `HW_PHYSMEM` is a 32-bit int
+    ///     that wraps above 2 GiB, so it is deliberately NOT used).
+    ///   * AVAIL  — `host_statistics64(HOST_VM_INFO64)` → `vm_statistics64`,
+    ///     with `(free + inactive)` pages × page size the readily-reclaimable
+    ///     RAM, the macOS analogue of Linux's `_SC_AVPHYS_PAGES`. Inactive
+    ///     pages are clean / file-backed and reclaimed on demand; speculative
+    ///     and purgeable pages are deliberately NOT counted, keeping the
+    ///     figure conservative (the planner must never OVER-estimate free RAM).
+    /// Fail-soft, like the Linux arm: a failing `sysctl` → `None`; a failing
+    /// Mach call → `Some((total, 0))` (total known, free unknown → the planner
+    /// treats the box as tight rather than guessing, matching how the Linux
+    /// arm reports `0` when `_SC_AVPHYS_PAGES` is unavailable).
+    ///
+    /// WRITE-BLIND: this arm is `cfg`'d out on Windows / Linux, so it is NOT
+    /// exercised in CI here — correctness is by review (libc symbols + Mach
+    /// ABI) and on-device confirmation on a Mac. The Windows / Linux arms are
+    /// untouched and stay byte-identical.
+    #[cfg(target_os = "macos")]
+    pub fn mem_status() -> Option<(u64, u64)> {
+        // --- total physical RAM: sysctl hw.memsize (64-bit) ---
+        let mut mib: [libc::c_int; 2] = [libc::CTL_HW, libc::HW_MEMSIZE];
+        let mut total: u64 = 0;
+        let mut total_len = std::mem::size_of::<u64>();
+        // SAFETY: `mib` is a valid 2-element MIB; `total` / `total_len` are a
+        // correctly-sized out-buffer and its length. `newp` is null (read
+        // only), so sysctl only writes `total`.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                &mut total as *mut u64 as *mut libc::c_void,
+                &mut total_len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 || total == 0 {
+            return None;
+        }
+
+        // --- available RAM: host_statistics64(HOST_VM_INFO64) page counts ---
+        // SAFETY: sysconf takes a constant resource id, no pointers.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page <= 0 {
+            // Total is still useful; report free as unknown (0) — see above.
+            return Some((total, 0));
+        }
+        let mut vm: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+        // Element count of the out-struct in `integer_t` units — the canonical
+        // value of `HOST_VM_INFO64_COUNT`, computed here so we do not depend on
+        // libc exposing that particular constant.
+        let mut count = (std::mem::size_of::<libc::vm_statistics64>()
+            / std::mem::size_of::<libc::integer_t>())
+            as libc::mach_msg_type_number_t;
+        // SAFETY: `mach_host_self()` yields a valid host port; `vm` is a zeroed,
+        // correctly-sized out-struct and `count` its element count (matching
+        // the HOST_VM_INFO64 flavor above).
+        let kr = unsafe {
+            libc::host_statistics64(
+                libc::mach_host_self(),
+                libc::HOST_VM_INFO64,
+                &mut vm as *mut libc::vm_statistics64 as libc::host_info64_t,
+                &mut count,
+            )
+        };
+        if kr != libc::KERN_SUCCESS {
+            return Some((total, 0));
+        }
+        let page = page as u64;
+        let avail = (vm.free_count as u64)
+            .saturating_add(vm.inactive_count as u64)
+            .saturating_mul(page);
+        Some((total, avail))
+    }
+
+    /// Other POSIX (e.g. the BSDs): no portable page-count query wired yet →
+    /// `None`, so the planner stays off there (today's behavior), exactly as
+    /// before this macOS arm was added.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub fn mem_status() -> Option<(u64, u64)> {
         None
     }
@@ -337,9 +422,9 @@ static WS_FLOOR_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// at refresh time, so the two consumers share one floor.
 static PAGELOCK_INTENDED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Physical memory status: `(total, available)` bytes. `None` on
-/// non-Windows targets or API failure. Public so the memory-budget
-/// planner shares the same source of truth as the lock logic.
+/// Physical memory status: `(total, available)` bytes. `None` on API
+/// failure or an unsupported target. Public so the memory-budget planner
+/// shares the same source of truth as the lock logic.
 pub fn memory_status() -> Option<(u64, u64)> {
     #[cfg(windows)]
     {
@@ -347,8 +432,9 @@ pub fn memory_status() -> Option<(u64, u64)> {
     }
     // M7 (cross-platform planner): now that `lock_ram_mb` pins RAM on POSIX
     // too, the memory-budget planner must run there to reserve it. Linux
-    // reports via `sysconf`; other POSIX (macOS) returns `None` (planner
-    // stays off there — documented follow-up).
+    // reports via `sysconf`; macOS via `sysctl` + `host_statistics64`
+    // (M7-mac-mem, below); any other POSIX returns `None` (planner stays off
+    // there).
     #[cfg(unix)]
     {
         sys_unix::mem_status()
