@@ -3205,16 +3205,32 @@ async fn doctor(config_path: &std::path::Path, sycl_smoke: bool) -> anyhow::Resu
 
     println!();
     println!("toolchains:");
-    let oneapi = std::env::var("ONEAPI_ROOT")
-        .ok()
-        .filter(|p| std::path::Path::new(p).exists())
-        .or_else(|| {
-            let p = "C:\\Program Files (x86)\\Intel\\oneAPI";
-            std::path::Path::new(p).exists().then(|| p.to_string())
-        });
-    match oneapi {
-        Some(p) => println!("  oneAPI   = found at {p}"),
-        None => println!("  oneAPI   = NOT FOUND (install Base Toolkit 2025.0+ for GPU build)"),
+    // Diagnostic only. The default install root is platform-specific: Windows
+    // ships under Program Files (x86); Linux defaults to /opt/intel/oneapi
+    // (matching `rustllama-kernels-sycl/build.rs`); macOS has no oneAPI (SYCL
+    // compiles to an inert stub there), so the probe is skipped entirely.
+    #[cfg(target_os = "macos")]
+    {
+        println!("  oneAPI   = n/a (no oneAPI on macOS; SYCL is an inert stub)");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        #[cfg(windows)]
+        let default_root = "C:\\Program Files (x86)\\Intel\\oneAPI";
+        #[cfg(not(windows))]
+        let default_root = "/opt/intel/oneapi";
+        let oneapi = std::env::var("ONEAPI_ROOT")
+            .ok()
+            .filter(|p| std::path::Path::new(p).exists())
+            .or_else(|| {
+                std::path::Path::new(default_root)
+                    .exists()
+                    .then(|| default_root.to_string())
+            });
+        match oneapi {
+            Some(p) => println!("  oneAPI   = found at {p}"),
+            None => println!("  oneAPI   = NOT FOUND (install Base Toolkit 2025.0+ for GPU build)"),
+        }
     }
 
     println!();

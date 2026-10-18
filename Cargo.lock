@@ -4397,6 +4397,7 @@ dependencies = [
  "bytemuck",
  "half",
  "image",
+ "libc",
  "rayon",
  "rustllama-gguf",
  "rustllama-kernels-cpu",

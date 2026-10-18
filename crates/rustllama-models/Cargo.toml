@@ -67,6 +67,15 @@ rustllama-npu = { path = "../rustllama-npu" }
 # tightly coupled to `VisionConfig` (patch_size + n_channels + image_size).
 image.workspace = true
 
+# POSIX available-RAM query for the adaptive USM gate (`avail_phys_bytes`):
+# Linux reads `/proc/meminfo` and falls back to `libc::sysinfo`; macOS uses
+# the `host_statistics64(HOST_VM_INFO64)` Mach call (the same symbols/ABI the
+# engine's `pagelock.rs` already uses). The Windows arm is a raw
+# `extern "system"` GlobalMemoryStatusEx and needs no libc. Permissive
+# (MIT/Apache-2.0); already a dep of engine + kernels-sycl at this major.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 bytemuck.workspace = true
 half.workspace = true

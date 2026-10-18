@@ -5889,11 +5889,26 @@ fn preferred_backend_view(views: &[u32]) -> u32 {
     opencl.or_else(|| views.first().copied()).unwrap_or(0)
 }
 
-/// Available physical RAM (bytes) — `GlobalMemoryStatusEx().ullAvailPhys`
-/// on Windows, `u64::MAX` on other platforms (signal: "no limit known,
-/// assume room"). Used by the adaptive USM gate to decide whether the
+/// Available physical RAM (bytes), per-platform:
+///   * Windows — `GlobalMemoryStatusEx().ullAvailPhys` (raw `extern "system"`,
+///     no libc).
+///   * Linux — `/proc/meminfo` `MemAvailable:` (kernel's own reclaimable-RAM
+///     estimate), falling back to `libc::sysinfo().freeram * mem_unit` when
+///     `/proc` is unreadable.
+///   * macOS — `host_statistics64(HOST_VM_INFO64)` → `(free + inactive)` pages
+///     × page size, mirroring the engine's verified `pagelock.rs` `mem_status`
+///     (same symbols / Mach ABI).
+///   * Any other target — `u64::MAX`.
+/// Any query failure returns `u64::MAX` (signal: "no limit known, assume
+/// room" — matching the Windows arm, so a failed probe never accidentally
+/// enforces the gate). Used by the adaptive USM gate to decide whether the
 /// model fits in RAM with comfortable headroom (skip the cap) or not
-/// (enforce it). Cheap — one Win32 call, only on first matvec touch.
+/// (enforce it). Cheap — one OS query, only on first matvec touch.
+///
+/// WRITE-BLIND: the Linux + macOS arms are `cfg`'d out on this Windows dev
+/// box, so they are NOT compiled/exercised in CI here — correctness is by
+/// review (the macOS arm mirrors the already-verified `pagelock.rs`) and
+/// on-device confirmation. The Windows arm is untouched / byte-identical.
 #[cfg(windows)]
 fn avail_phys_bytes() -> u64 {
     #[repr(C)]
@@ -5920,7 +5935,81 @@ fn avail_phys_bytes() -> u64 {
     }
     s.ull_avail_phys
 }
-#[cfg(not(windows))]
+
+/// Linux: the kernel's `MemAvailable:` estimate from `/proc/meminfo` (it
+/// already accounts for reclaimable page-cache / slab, so it is a better
+/// "what a new allocation can actually get" figure than free+cached). Falls
+/// back to `sysinfo().freeram` when `/proc` is not mounted (containers).
+#[cfg(target_os = "linux")]
+fn avail_phys_bytes() -> u64 {
+    // `/proc/meminfo` line is `MemAvailable:   <kB> kB`.
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+        for line in meminfo.lines() {
+            if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                if let Some(kb) = rest.split_whitespace().next() {
+                    if let Ok(kb) = kb.parse::<u64>() {
+                        return kb.saturating_mul(1024);
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: sysinfo(2). `freeram` is in units of `mem_unit` bytes.
+    // SAFETY: zeroed, correctly-sized out-struct; sysinfo writes it fully.
+    let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sysinfo(&mut info) } != 0 {
+        return u64::MAX; // failed → assume room, don't enforce the gate
+    }
+    let unit = if info.mem_unit == 0 {
+        1u64
+    } else {
+        info.mem_unit as u64
+    };
+    (info.freeram as u64).saturating_mul(unit)
+}
+
+/// macOS: readily-reclaimable RAM = `(free + inactive)` pages × page size via
+/// `host_statistics64(HOST_VM_INFO64)`, mirroring the engine's verified
+/// `pagelock.rs` `mem_status` (M7-mac-mem) — same symbols / Mach ABI. Any
+/// query failure → `u64::MAX` (assume room), matching the Windows arm's
+/// fail-soft rather than `pagelock.rs`'s "tight" default (this gate only
+/// decides whether to CAP, so over-estimating free RAM just skips the cap).
+#[cfg(target_os = "macos")]
+fn avail_phys_bytes() -> u64 {
+    // SAFETY: sysconf takes a constant resource id, no pointers.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page <= 0 {
+        return u64::MAX;
+    }
+    let mut vm: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    // Element count of the out-struct in `integer_t` units — the canonical
+    // value of `HOST_VM_INFO64_COUNT`, computed here so we do not depend on
+    // libc exposing that particular constant.
+    let mut count = (std::mem::size_of::<libc::vm_statistics64>()
+        / std::mem::size_of::<libc::integer_t>())
+        as libc::mach_msg_type_number_t;
+    // SAFETY: `mach_host_self()` yields a valid host port; `vm` is a zeroed,
+    // correctly-sized out-struct and `count` its element count (matching the
+    // HOST_VM_INFO64 flavor above).
+    let kr = unsafe {
+        libc::host_statistics64(
+            libc::mach_host_self(),
+            libc::HOST_VM_INFO64,
+            &mut vm as *mut libc::vm_statistics64 as libc::host_info64_t,
+            &mut count,
+        )
+    };
+    if kr != libc::KERN_SUCCESS {
+        return u64::MAX;
+    }
+    (vm.free_count as u64)
+        .saturating_add(vm.inactive_count as u64)
+        .saturating_mul(page as u64)
+}
+
+/// Any other target (the BSDs, etc.): no portable query wired → `u64::MAX`
+/// (no limit known, assume room), exactly as before.
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn avail_phys_bytes() -> u64 {
     u64::MAX
 }
