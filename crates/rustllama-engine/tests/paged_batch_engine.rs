@@ -11,7 +11,10 @@
 use rustllama_engine::batch_scheduler::Priority;
 use rustllama_engine::paged_batch::PagedBatchEngine;
 use rustllama_engine::{BeamParams, CpuEngine, EngineError, SamplingParams, SubmitOpts};
-use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthHybrid, SynthLlama, SynthMoe};
+use rustllama_gguf::synth::{
+    write_synthetic_llama_gguf, write_synthetic_lora_adapter_gguf, SynthHybrid, SynthLlama,
+    SynthLoraAdapter, SynthMoe,
+};
 
 fn write_gguf(tag: &str) -> std::path::PathBuf {
     let tmp = std::env::temp_dir().join(format!("rustllama-paged-batch-{tag}.gguf"));
@@ -1432,4 +1435,97 @@ fn paged_beam_returns_ranked_hypotheses() {
         );
     }
     let _ = std::fs::remove_file(&tmp);
+}
+
+// ----------------------------------------------------------------------
+// P11 Phase 3 — per-SLOT resident LoRA in the fused batch
+// ----------------------------------------------------------------------
+
+fn lora_adapter_file(tag: &str, seed: u64) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("rustllama-paged-lora-{tag}.gguf"));
+    // Strong adapter (large alpha) so the greedy argmax observably shifts.
+    write_synthetic_lora_adapter_gguf(
+        &p,
+        &SynthLoraAdapter {
+            base: SynthLlama::default(),
+            rank: 8,
+            alpha: 400.0,
+            seed,
+        },
+    );
+    p
+}
+
+/// A batch mixing adapter A, adapter B, and no-adapter must serve each slot with
+/// its own selection: every slot's output matches the SAME request run alone,
+/// and a no-adapter slot matches the base. Proves the per-slot adapter table the
+/// fused decode scopes routes each row to the right (or no) adapter.
+#[test]
+fn paged_batch_per_slot_lora_each_matches_single_slot_reference() {
+    let tmp = write_gguf("lora-perslot");
+    let ad_a = lora_adapter_file("perslot-a", 0xA11CE);
+    let ad_b = lora_adapter_file("perslot-b", 0xB0B);
+
+    let batch = PagedBatchEngine::load(&tmp, 32, 3).expect("batch engine load");
+    assert_eq!(batch.lora_adapter_names().len(), 0);
+    assert!(batch.attach_lora_adapter("ta", &ad_a).expect("attach a") > 0);
+    assert!(batch.attach_lora_adapter("tb", &ad_b).expect("attach b") > 0);
+    assert!(batch.has_lora_adapter("ta"));
+    assert!(batch.has_lora_adapter("tb"));
+    assert!(!batch.has_lora_adapter("ghost"));
+
+    let p_a: Vec<i32> = vec![5, 1, 4, 2, 3];
+    let p_b: Vec<i32> = vec![8, 0, 7, 6, 1];
+    let p_c: Vec<i32> = vec![2, 9, 3, 4, 5];
+    let samp = |ad: Option<&str>| SamplingParams {
+        lora_adapter: ad.map(|s| s.to_string()),
+        ..greedy(4)
+    };
+    let one = |engine: &PagedBatchEngine, p: &[i32], ad: Option<&str>| -> Vec<i32> {
+        engine
+            .generate_batched_token_ids(vec![(p.to_vec(), samp(ad))])
+            .expect("single-slot generate")
+            .remove(0)
+    };
+
+    // Single-slot references (each request alone).
+    let ref_a = one(&batch, &p_a, Some("ta"));
+    let ref_b = one(&batch, &p_b, Some("tb"));
+    let ref_c = one(&batch, &p_c, None);
+    // Base of p_a (no adapter) to prove the adapter actually changes the output.
+    let base_a = one(&batch, &p_a, None);
+    assert_ne!(
+        ref_a, base_a,
+        "selecting adapter A must change the output on the same prompt"
+    );
+
+    // Mixed batch: A, B, none served together in one fused decode loop.
+    let mixed = batch
+        .generate_batched_token_ids(vec![
+            (p_a.clone(), samp(Some("ta"))),
+            (p_b.clone(), samp(Some("tb"))),
+            (p_c.clone(), samp(None)),
+        ])
+        .expect("mixed batch generate");
+    assert_eq!(mixed.len(), 3);
+    assert_eq!(
+        mixed[0], ref_a,
+        "slot 0 (adapter A) must match its single-slot reference"
+    );
+    assert_eq!(
+        mixed[1], ref_b,
+        "slot 1 (adapter B) must match its single-slot reference"
+    );
+    assert_eq!(
+        mixed[2], ref_c,
+        "slot 2 (no adapter) must match the base reference (byte-identical)"
+    );
+
+    // Unknown adapter name fails the request — never a silent base serve.
+    let err = batch.generate_batched_token_ids(vec![(p_a.clone(), samp(Some("ghost")))]);
+    assert!(err.is_err(), "unknown adapter must fail, not serve the base");
+
+    for p in [&tmp, &ad_a, &ad_b] {
+        let _ = std::fs::remove_file(p);
+    }
 }

@@ -253,6 +253,19 @@ pub struct SamplingParams {
     /// default is 0.3.
     #[serde(default = "default_spec_typical_delta")]
     pub spec_typical_delta: f32,
+    /// P11 (multi-LoRA): the name of a resident LoRA adapter to apply for this
+    /// request. `None` (default) = the un-adapted base model, which keeps every
+    /// forward byte-identical to the pre-LoRA path. When `Some(name)`, the
+    /// engine resolves `name` against its resident [`crate::lora`] registry and
+    /// applies that adapter's low-rank delta around the base matvecs
+    /// (per-request on `CpuEngine`, per-slot on `PagedBatchEngine`). An unknown
+    /// name is rejected by the server (4xx) before the request reaches the
+    /// engine; a name the engine can't resolve fails the request rather than
+    /// silently serving the base. Not part of the sampler state — it selects
+    /// WEIGHTS, so it is carried here only because this struct already threads
+    /// per-request options through every generation path.
+    #[serde(default)]
+    pub lora_adapter: Option<String>,
 }
 
 fn default_mirostat_tau() -> f32 {
@@ -401,6 +414,7 @@ impl Default for SamplingParams {
             spec_typical_accept: false,
             spec_typical_epsilon: default_spec_typical_epsilon(),
             spec_typical_delta: default_spec_typical_delta(),
+            lora_adapter: None,
         }
     }
 }
@@ -845,6 +859,29 @@ pub trait Engine: Send + Sync {
     /// [`CumulativeStats`] snapshot.
     fn cumulative_stats_snapshot(&self) -> Option<CumulativeStatsSnapshot> {
         None
+    }
+
+    /// P11 — attach (load, UNMERGED) a resident LoRA adapter under `name`,
+    /// returning its adapted-tensor count. A later request selects it via
+    /// [`SamplingParams::lora_adapter`]. Default: unsupported (every engine
+    /// without a resident registry — `MockEngine`, test fixtures). `CpuEngine`
+    /// and `PagedBatchEngine` override it.
+    fn attach_lora_adapter(&self, _name: &str, _path: &std::path::Path) -> Result<usize> {
+        Err(EngineError::Unimplemented(
+            "this engine does not support LoRA adapters",
+        ))
+    }
+
+    /// P11 — names of the resident LoRA adapters (empty when unsupported).
+    fn lora_adapter_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// P11 — whether a resident adapter named `name` exists. The server checks
+    /// this to reject an unknown adapter selection with a clean 4xx before
+    /// generation (never a silent base serve).
+    fn has_lora_adapter(&self, _name: &str) -> bool {
+        false
     }
 }
 

@@ -298,6 +298,19 @@ pub struct CpuEngine {
     /// the pre-F12 behavior. Only the sidecar-owning engine
     /// (`kv_persist_owner`) ever fires it; forks carry an inert clock.
     checkpoint_clock: Mutex<crate::kv_persist::CheckpointClock>,
+    /// P11 Phase 2/3 — resident multi-LoRA adapter registry. Adapters are
+    /// attached UNMERGED (held as low-rank deltas) via
+    /// [`Self::attach_lora_adapter`] and selected per request through
+    /// [`SamplingParams::lora_adapter`]; the selected adapter's delta is applied
+    /// around the base matvecs by scoping [`rustllama_models::lora::ACTIVE_LORA`]
+    /// for the request's forwards (see [`Self::lora_adapter_for`] +
+    /// `drive_generation`). Empty (the default) ⇒ no adapters resident ⇒ every
+    /// request is byte-identical to the pre-LoRA path.
+    ///
+    /// `Arc<RwLock<..>>` so `fork_for_concurrent_use` clones SHARE one registry
+    /// (an adapter attached at runtime is visible to every fork) and per-request
+    /// lookups (reads) don't contend with the rare attach (write).
+    lora: Arc<std::sync::RwLock<rustllama_models::lora::LoraRegistry>>,
 }
 
 impl Drop for CpuEngine {
@@ -499,6 +512,12 @@ struct DriveGenJob {
     flash_attention: bool,
     n_gpu_layers: u32,
     cpu_force_patterns: Vec<String>,
+    /// P11 — the resident LoRA adapter selected for this request (resolved from
+    /// `sampling.lora_adapter` against the engine's registry in `spawn_stream`),
+    /// or `None` for the un-adapted base. `drive_generation` scopes it as the
+    /// thread-active adapter for the whole generation on the worker thread, so
+    /// `None` keeps the streaming path byte-identical.
+    lora_adapter: Option<Arc<rustllama_models::lora::LoraAdapter>>,
 }
 
 /// Captured arguments for a USM weight pre-upload dispatched through
@@ -653,6 +672,7 @@ fn run_worker(rx: std::sync::mpsc::Receiver<SyclWorkItem>) {
                     flash_attention,
                     n_gpu_layers,
                     cpu_force_patterns,
+                    lora_adapter,
                 } = job;
                 if let Err(e) = drive_generation(
                     model,
@@ -671,6 +691,7 @@ fn run_worker(rx: std::sync::mpsc::Receiver<SyclWorkItem>) {
                     flash_attention,
                     n_gpu_layers,
                     cpu_force_patterns,
+                    lora_adapter,
                 ) {
                     let _ = response_tx.blocking_send(Err(e));
                 }
@@ -1976,6 +1997,9 @@ impl CpuEngine {
                 crate::kv_persist::kv_persist_interval(),
                 std::time::Instant::now(),
             )),
+            lora: Arc::new(std::sync::RwLock::new(
+                rustllama_models::lora::LoraRegistry::new(),
+            )),
         };
         if let Ok(mut st) = engine.state.lock() {
             st.pool.set_max_bytes(pool_byte_cap);
@@ -2660,6 +2684,9 @@ impl CpuEngine {
                 crate::kv_persist::kv_persist_interval(),
                 std::time::Instant::now(),
             )),
+            lora: Arc::new(std::sync::RwLock::new(
+                rustllama_models::lora::LoraRegistry::new(),
+            )),
         })
     }
 
@@ -2825,6 +2852,9 @@ impl CpuEngine {
             checkpoint_clock: Mutex::new(crate::kv_persist::CheckpointClock::new(
                 crate::kv_persist::kv_persist_interval(),
                 std::time::Instant::now(),
+            )),
+            lora: Arc::new(std::sync::RwLock::new(
+                rustllama_models::lora::LoraRegistry::new(),
             )),
         })
     }
@@ -4389,7 +4419,73 @@ impl CpuEngine {
                 crate::kv_persist::kv_persist_interval(),
                 std::time::Instant::now(),
             )),
+            // Forks SHARE the resident LoRA registry (an adapter attached at
+            // runtime is visible to every concurrent fork).
+            lora: Arc::clone(&self.lora),
         }
+    }
+
+    // ----- P11 Phase 2/3: resident multi-LoRA adapters -----
+
+    /// Attach (load, UNMERGED) a LoRA adapter GGUF into the resident registry
+    /// under `name`. The adapter's low-rank factors are parsed and held as
+    /// deltas; the base weights are untouched. A later request selects it via
+    /// [`SamplingParams::lora_adapter`] = `Some(name)`. Re-attaching a name
+    /// replaces it. Returns the number of adapted base tensors.
+    ///
+    /// This is the engine twin of the Phase-1 merge-at-load path
+    /// ([`Self::load_with_options_layout_page_size_and_lora`]): there the
+    /// adapter is folded once into the weights; here it stays separate so N
+    /// adapters can be swapped per request without reloading the model.
+    pub fn attach_lora_adapter(&self, name: &str, path: &std::path::Path) -> Result<usize> {
+        let g = Gguf::open(path)?;
+        let adapter = rustllama_models::lora::LoraAdapter::from_gguf(&g, name)
+            .map_err(|e| CpuEngineError::Other(format!("LoRA adapter load failed: {e}")))?;
+        let n = adapter.len();
+        let mut reg = self
+            .lora
+            .write()
+            .map_err(|_| CpuEngineError::Other("LoRA registry lock poisoned".into()))?;
+        reg.insert(adapter);
+        tracing::info!(adapter = name, adapted_tensors = n, "LoRA adapter attached (P11 resident)");
+        Ok(n)
+    }
+
+    /// Names of the adapters currently resident (registration order is not
+    /// guaranteed — this is a set).
+    pub fn lora_adapter_names(&self) -> Vec<String> {
+        self.lora
+            .read()
+            .map(|r| r.names().map(|s| s.to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// `true` iff an adapter named `name` is resident.
+    pub fn has_lora_adapter(&self, name: &str) -> bool {
+        self.lora.read().map(|r| r.contains(name)).unwrap_or(false)
+    }
+
+    /// Resolve the per-request adapter selection in `sampling` against the
+    /// resident registry. `None` selection ⇒ `Ok(None)` (base, byte-identical).
+    /// A selected name that is NOT resident is an error — generation fails
+    /// rather than silently serving the base.
+    fn lora_adapter_for(
+        &self,
+        sampling: &SamplingParams,
+    ) -> Result<Option<std::sync::Arc<rustllama_models::lora::LoraAdapter>>> {
+        let Some(name) = sampling.lora_adapter.as_deref() else {
+            return Ok(None);
+        };
+        if name.is_empty() {
+            return Ok(None);
+        }
+        let reg = self
+            .lora
+            .read()
+            .map_err(|_| CpuEngineError::Other("LoRA registry lock poisoned".into()))?;
+        reg.get(name).map(Some).ok_or_else(|| {
+            CpuEngineError::Other(format!("unknown LoRA adapter `{name}` (not resident)"))
+        })
     }
 
     /// Toggle FlashAttention-decode for the F32 KV path. Propagates
@@ -4917,6 +5013,11 @@ impl CpuEngine {
         n_new: u32,
         sampling: &SamplingParams,
     ) -> Result<Vec<u32>> {
+        // P11: scope the per-request LoRA selection for the whole call (this
+        // path runs the forwards INLINE on the calling thread, so a scope here
+        // covers prefill + every decode step). `None` ⇒ base, byte-identical.
+        let _lora_scope =
+            rustllama_models::lora::scope_active_lora(self.lora_adapter_for(sampling)?);
         // F9-tail — canonical Mamba/SSM models decode through the selective-scan
         // forward, not the transformer backend (the `model` field is a shell).
         if let Some(mm) = self.mamba.clone() {
@@ -4949,9 +5050,14 @@ impl CpuEngine {
         // pool; restores pool data into the live cache if a different
         // conversation thread shared a longer prefix than the current one.
         let prompt_max = prompt_ids.len().saturating_sub(1);
+        // P11: the prompt-prefix cache is keyed on token content, NOT on the
+        // adapter, so an adapted request must not reuse/populate it with KV from
+        // a different selection. Disable prefix reuse when an adapter is active;
+        // `None` ⇒ `&& true` ⇒ byte-identical to the base path.
+        let prefix_cache = self.prefix_cache && sampling.lora_adapter.is_none();
         let effective = state.prepare_prefix_reuse(
             &prompt_u32,
-            self.prefix_cache,
+            prefix_cache,
             PREFIX_REUSE_MIN_TOKENS,
             prompt_max,
         );
@@ -5521,6 +5627,9 @@ impl CpuEngine {
         sampling: &SamplingParams,
         k: usize,
     ) -> Result<Vec<(u32, crate::TokenLogprobs)>> {
+        // P11: scope the per-request LoRA selection for this inline call.
+        let _lora_scope =
+            rustllama_models::lora::scope_active_lora(self.lora_adapter_for(sampling)?);
         let _sycl_guard = install_sycl_dispatch_if_requested();
         rustllama_models::accel::set_flash_attention(self.flash_attention);
         rustllama_models::accel::set_n_gpu_layers(self.n_gpu_layers);
@@ -5545,9 +5654,14 @@ impl CpuEngine {
         let prompt_u32: Vec<u32> = prompt_ids.iter().map(|&t| t as u32).collect();
 
         let prompt_max = prompt_ids.len().saturating_sub(1);
+        // P11: the prompt-prefix cache is keyed on token content, NOT on the
+        // adapter, so an adapted request must not reuse/populate it with KV from
+        // a different selection. Disable prefix reuse when an adapter is active;
+        // `None` ⇒ `&& true` ⇒ byte-identical to the base path.
+        let prefix_cache = self.prefix_cache && sampling.lora_adapter.is_none();
         let effective = state.prepare_prefix_reuse(
             &prompt_u32,
-            self.prefix_cache,
+            prefix_cache,
             PREFIX_REUSE_MIN_TOKENS,
             prompt_max,
         );
@@ -5955,6 +6069,9 @@ impl CpuEngine {
         logprobs_k: Option<usize>,
         tx: &tokio::sync::mpsc::Sender<std::result::Result<crate::Token, String>>,
     ) -> Result<()> {
+        // P11: scope the per-request LoRA selection for this inline call.
+        let _lora_scope =
+            rustllama_models::lora::scope_active_lora(self.lora_adapter_for(sampling)?);
         // F9-tail — canonical Mamba/SSM models stream through the selective-scan
         // forward (the `model` field is a transformer shell, never executed).
         if let Some(mm) = self.mamba.clone() {
@@ -5994,9 +6111,14 @@ impl CpuEngine {
         let prompt_u32: Vec<u32> = prompt_ids.iter().map(|&t| t as u32).collect();
 
         let prompt_max = prompt_ids.len().saturating_sub(1);
+        // P11: the prompt-prefix cache is keyed on token content, NOT on the
+        // adapter, so an adapted request must not reuse/populate it with KV from
+        // a different selection. Disable prefix reuse when an adapter is active;
+        // `None` ⇒ `&& true` ⇒ byte-identical to the base path.
+        let prefix_cache = self.prefix_cache && sampling.lora_adapter.is_none();
         let effective = state.prepare_prefix_reuse(
             &prompt_u32,
-            self.prefix_cache,
+            prefix_cache,
             PREFIX_REUSE_MIN_TOKENS,
             prompt_max,
         );
@@ -7969,6 +8091,19 @@ impl Engine for CpuEngine {
         Some(self.cumulative_request_stats())
     }
 
+    // P11 — resident multi-LoRA (trait surface for the server's `Arc<dyn
+    // Engine>`; delegates to the inherent methods, mapping the error type).
+    fn attach_lora_adapter(&self, name: &str, path: &std::path::Path) -> EngineResult<usize> {
+        CpuEngine::attach_lora_adapter(self, name, path)
+            .map_err(|e| crate::EngineError::Engine(e.to_string()))
+    }
+    fn lora_adapter_names(&self) -> Vec<String> {
+        CpuEngine::lora_adapter_names(self)
+    }
+    fn has_lora_adapter(&self, name: &str) -> bool {
+        CpuEngine::has_lora_adapter(self, name)
+    }
+
     fn tokenize(&self, text: &str) -> EngineResult<Vec<u32>> {
         let tokenizer = self
             .tokenizer
@@ -8056,7 +8191,12 @@ impl Engine for CpuEngine {
         // n-gram path.
         // P2: a contiguous SWA ring cache can't serve the batched/compacting
         // speculative verify — fall back to classic single-token decode.
-        let allow_spec = !self.swa_ring_decode();
+        // P11: an adapted request also skips every speculative path — those run
+        // through `RunOnWorker` closures that don't carry the LoRA scope, so
+        // routing them to the LoRA-aware `spawn_stream` keeps the adapter
+        // applied (a resident adapter beats the spec throughput win here, and no
+        // request is ever silently served the base).
+        let allow_spec = !self.swa_ring_decode() && s.lora_adapter.is_none();
         if let Some((draft, k)) = self.draft_spec.as_ref() {
             if s.grammar.is_none() && allow_spec {
                 return self.speculate(&prompt, draft.clone(), *k, s);
@@ -8111,7 +8251,9 @@ impl Engine for CpuEngine {
         // spawn path so the call still produces a Stream rather than panic.
         // MTP / NextN self-speculation takes precedence over n-gram; a
         // no-op fall-through on non-MTP models. Grammar-free only.
-        let allow_spec = !self.swa_ring_decode();
+        // P11: an adapted request skips spec (see `chat`) → LoRA-aware
+        // `spawn_stream` instead, so the adapter is never silently dropped.
+        let allow_spec = !self.swa_ring_decode() && s.lora_adapter.is_none();
         // P10b — EAGLE head first (`eagle > MTP > n-gram > none`).
         if let Some(head) = self.eagle_head.clone() {
             if s.grammar.is_none() && allow_spec && self.model_supports_eagle() {
@@ -9480,6 +9622,13 @@ impl CpuEngine {
         let (tx, rx) = tokio::sync::mpsc::channel::<EngineResult<Token>>(4);
         let last_stats = self.last_stats.clone();
 
+        // P11: resolve the per-request LoRA selection now (on the submitting
+        // thread, which holds the registry). An unknown name fails the request
+        // instead of silently serving the base.
+        let lora_adapter = self
+            .lora_adapter_for(&sampling)
+            .map_err(|e| crate::EngineError::Engine(e.to_string()))?;
+
         self.sycl_worker.submit_generation(DriveGenJob {
             model,
             state,
@@ -9497,6 +9646,7 @@ impl CpuEngine {
             flash_attention: self.flash_attention,
             n_gpu_layers: self.n_gpu_layers,
             cpu_force_patterns: self.cpu_force_patterns.clone(),
+            lora_adapter,
         });
 
         let stream = async_stream::stream! {
@@ -9570,7 +9720,18 @@ fn drive_generation(
     flash_attention: bool,
     n_gpu_layers: u32,
     cpu_force_patterns: Vec<String>,
+    lora_adapter: Option<Arc<rustllama_models::lora::LoraAdapter>>,
 ) -> EngineResult<()> {
+    // P11: scope the selected LoRA adapter as the thread-active adapter for the
+    // whole generation on THIS worker thread. `None` restores/keeps the base
+    // (byte-identical). Set before any forward and restored on drop (incl. an
+    // early return / `?`), so a selected adapter is applied to prefill + every
+    // decode step and the next request on this worker starts clean.
+    let adapter_active = lora_adapter.is_some();
+    let _lora_scope = rustllama_models::lora::scope_active_lora(lora_adapter);
+    // P11: the prompt-prefix cache is content-keyed, not adapter-keyed — an
+    // adapted request must not reuse/populate it. `None` ⇒ unchanged.
+    let prefix_cache = prefix_cache && !adapter_active;
     // Install the per-thread SYCL stream + flash-attention flag for
     // the duration of this generation. This is the *streaming*
     // codepath used by `Engine::chat` and `Engine::generate` (the

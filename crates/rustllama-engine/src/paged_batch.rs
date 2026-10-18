@@ -308,6 +308,12 @@ struct SlotState {
     /// `None` for a slot whose model carries no draft head (spec never engages)
     /// and for greedy spec (deterministic, no draws).
     spec_rng: Option<crate::sampling::Rng>,
+    /// P11 — the resident LoRA adapter selected for THIS slot's request
+    /// (resolved from `sampling.lora_adapter` at admission). `None` = base. The
+    /// ragged / batched-decode tick expands this across the slot's row(s) into
+    /// the per-row adapter table it scopes around the fused forward, so a batch
+    /// mixing adapters A, B, and none serves each slot with its own.
+    adapter: Option<Arc<rustllama_models::lora::LoraAdapter>>,
 }
 
 impl SlotState {
@@ -436,6 +442,16 @@ pub struct PagedBatchEngine {
     /// shared-prefix cascade attention actually ran. Read by tests to confirm
     /// the driver wiring engages.
     cascade_engagements: Arc<std::sync::atomic::AtomicUsize>,
+    /// P11 Phase 2/3 — resident multi-LoRA adapter registry (the paged twin of
+    /// `CpuEngine::lora`). Adapters are attached UNMERGED and selected PER SLOT
+    /// via [`SamplingParams::lora_adapter`]: the ragged / batched-decode tick
+    /// builds a per-row adapter table (slot → adapter) and scopes it via
+    /// [`rustllama_models::lora::scope_row_adapters`], so one fused forward can
+    /// serve several slots that each named a different (or no) adapter. Shared
+    /// (`Arc`) with the driver thread via [`DriverContext::lora`] so admission
+    /// can resolve a request's adapter name. Empty (the default) ⇒ byte-
+    /// identical to the pre-LoRA path.
+    lora: Arc<std::sync::RwLock<rustllama_models::lora::LoraRegistry>>,
 }
 
 impl PagedBatchEngine {
@@ -770,6 +786,11 @@ impl PagedBatchEngine {
         } else {
             (None, None)
         };
+        // P11: one resident LoRA registry, shared by the engine handle and the
+        // driver thread (so admission can resolve a request's adapter name).
+        let lora = Arc::new(std::sync::RwLock::new(
+            rustllama_models::lora::LoraRegistry::new(),
+        ));
         let driver_ctx = DriverContext {
             model: Arc::clone(&model),
             tokenizer: tokenizer.clone(),
@@ -782,6 +803,7 @@ impl PagedBatchEngine {
             last_stats: Arc::clone(&last_stats),
             preemptions: Arc::clone(&preemptions),
             cascade_engagements: Arc::clone(&cascade_engagements),
+            lora: Arc::clone(&lora),
             // Per-tick prompt-prefill token budget for the single ragged
             // driver path (T1). Every tick routes through the RAGGED mixed
             // forward (`forward_ragged_paged_f32`): one fused pass over the
@@ -855,11 +877,74 @@ impl PagedBatchEngine {
             last_stats,
             preemptions,
             cascade_engagements,
+            lora,
         })
     }
 
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    // ----- P11 Phase 2/3: resident multi-LoRA adapters (paged twin) -----
+
+    /// Attach (load, UNMERGED) a LoRA adapter GGUF into the resident registry
+    /// under `name`. Mirrors [`crate::CpuEngine::attach_lora_adapter`]: the
+    /// adapter is held as low-rank deltas and selected PER SLOT via
+    /// [`SamplingParams::lora_adapter`]. Returns the adapted-tensor count.
+    pub fn attach_lora_adapter(
+        &self,
+        name: &str,
+        path: &Path,
+    ) -> Result<usize, CpuEngineError> {
+        let g = Gguf::open(path)?;
+        let adapter = rustllama_models::lora::LoraAdapter::from_gguf(&g, name)
+            .map_err(|e| CpuEngineError::Other(format!("LoRA adapter load failed: {e}")))?;
+        let n = adapter.len();
+        let mut reg = self
+            .lora
+            .write()
+            .map_err(|_| CpuEngineError::Other("LoRA registry lock poisoned".into()))?;
+        reg.insert(adapter);
+        tracing::info!(
+            adapter = name,
+            adapted_tensors = n,
+            "LoRA adapter attached (P11 resident, paged engine)"
+        );
+        Ok(n)
+    }
+
+    /// Names of the resident adapters.
+    pub fn lora_adapter_names(&self) -> Vec<String> {
+        self.lora
+            .read()
+            .map(|r| r.names().map(|s| s.to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// `true` iff an adapter named `name` is resident.
+    pub fn has_lora_adapter(&self, name: &str) -> bool {
+        self.lora.read().map(|r| r.contains(name)).unwrap_or(false)
+    }
+
+    /// Resolve `sampling.lora_adapter` against the resident registry. `None`
+    /// selection ⇒ `Ok(None)`; a named-but-absent adapter ⇒ error (fail-closed,
+    /// never a silent base serve).
+    fn resolve_lora(
+        lora: &std::sync::RwLock<rustllama_models::lora::LoraRegistry>,
+        sampling: &SamplingParams,
+    ) -> Result<Option<Arc<rustllama_models::lora::LoraAdapter>>, CpuEngineError> {
+        let Some(name) = sampling.lora_adapter.as_deref() else {
+            return Ok(None);
+        };
+        if name.is_empty() {
+            return Ok(None);
+        }
+        let reg = lora
+            .read()
+            .map_err(|_| CpuEngineError::Other("LoRA registry lock poisoned".into()))?;
+        reg.get(name).map(Some).ok_or_else(|| {
+            CpuEngineError::Other(format!("unknown LoRA adapter `{name}` (not resident)"))
+        })
     }
 
     /// P3 (test-only): number of cascade groups engaged since load (sync
@@ -975,12 +1060,16 @@ impl PagedBatchEngine {
                     max_ctx: self.max_ctx,
                 });
             }
+            // P11: resolve this request's LoRA selection (fail-closed on an
+            // unknown name) so the slot carries its adapter into the decode
+            // tick. `None` ⇒ base.
+            let adapter = Self::resolve_lora(&self.lora, &sampling)?;
             // F8: a HYBRID model's slot carries its own contiguous KV +
             // DeltaNet state (no shared pool, no cross-request prefix share),
             // prefilled through the contiguous hybrid forward — bit-identical
             // to `CpuEngine`. Build it and move to the next request.
             if self.model.weights.is_hybrid() {
-                let state = build_hybrid_slot_state(
+                let mut state = build_hybrid_slot_state(
                     &self.model,
                     self.tokenizer.as_ref(),
                     self.max_ctx,
@@ -990,6 +1079,7 @@ impl PagedBatchEngine {
                     0,
                 )
                 .map_err(|e| CpuEngineError::Other(format!("hybrid slot build: {e}")))?;
+                state.adapter = adapter;
                 slots.push(state);
                 continue;
             }
@@ -1011,24 +1101,33 @@ impl PagedBatchEngine {
             // serially; later slots can share whole pages with
             // earlier ones when their prompts overlap.
             let page_size_usz = self.page_size as usize;
+            let prompt_u32: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
             // Live-slot LCP (this batch's earlier slots) + vLLM APC
             // (content-addressed, across all prior requests). Keep the longer.
-            let (live_pages, live_lcp) =
-                pick_shared_prefix_from_slots(&prompt, &slots, page_size_usz);
-            let prompt_u32: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
-            let chain = rustllama_models::apc::block_hash_chain(&prompt_u32, page_size_usz);
-            let apc_pages = self.shared.apc_acquire_prefix(&chain);
-            let apc_lcp = apc_pages.len() * page_size_usz;
-            let (shared_pages, shared_lcp) = if apc_lcp > 0 && apc_lcp >= live_lcp {
-                (apc_pages, apc_lcp)
+            // P11: an ADAPTED slot skips prefix sharing entirely (the shared
+            // index is content-keyed, not adapter-keyed) — recompute under its
+            // own adapter and keep its KV out of the index (empty chain ⇒ no
+            // register below). Base slots are unchanged (byte-identical).
+            let (shared_pages, shared_lcp, chain) = if adapter.is_some() {
+                (Vec::new(), 0usize, Vec::new())
             } else {
-                if !apc_pages.is_empty() {
-                    self.shared.with_table_mut(|t| t.free(&apc_pages));
-                }
-                if !live_pages.is_empty() {
-                    self.shared.with_table_mut(|t| t.add_ref(&live_pages));
-                }
-                (live_pages, live_lcp)
+                let (live_pages, live_lcp) =
+                    pick_shared_prefix_from_slots(&prompt, &slots, page_size_usz);
+                let chain = rustllama_models::apc::block_hash_chain(&prompt_u32, page_size_usz);
+                let apc_pages = self.shared.apc_acquire_prefix(&chain);
+                let apc_lcp = apc_pages.len() * page_size_usz;
+                let (sp, sl) = if apc_lcp > 0 && apc_lcp >= live_lcp {
+                    (apc_pages, apc_lcp)
+                } else {
+                    if !apc_pages.is_empty() {
+                        self.shared.with_table_mut(|t| t.free(&apc_pages));
+                    }
+                    if !live_pages.is_empty() {
+                        self.shared.with_table_mut(|t| t.add_ref(&live_pages));
+                    }
+                    (live_pages, live_lcp)
+                };
+                (sp, sl, chain)
             };
             if !shared_pages.is_empty() {
                 cache.pin_shared_prefix(shared_pages, shared_lcp as u32);
@@ -1050,6 +1149,9 @@ impl PagedBatchEngine {
             let prefill_start = std::time::Instant::now();
             if shared_lcp < prompt.len() {
                 let suffix: &[i32] = &prompt[shared_lcp..];
+                // P11: this slot's prompt prefills alone, so the single-active
+                // adapter scope is the right selection (one slot = one adapter).
+                let _lora = rustllama_models::lora::scope_active_lora(adapter.clone());
                 self.shared.with_store_mut(|store| {
                     let _ = self.model.forward_prefill_paged_f32(
                         suffix,
@@ -1101,6 +1203,7 @@ impl PagedBatchEngine {
                 skip_emit: 0,
                 emitted_to_client: 0,
                 spec_rng: None,
+                adapter,
             });
         }
 
@@ -1128,6 +1231,11 @@ impl PagedBatchEngine {
                 for &i in &active_indices {
                     let next_input = slots[i].next_input;
                     let next_pos = slots[i].next_pos;
+                    // P11: each hybrid slot decodes independently through the
+                    // contiguous hybrid forward, so scope its own adapter
+                    // (single-active) for this step. `None` ⇒ base.
+                    let _lora =
+                        rustllama_models::lora::scope_active_lora(slots[i].adapter.clone());
                     let hyb = slots[i]
                         .hybrid
                         .as_mut()
@@ -1151,6 +1259,12 @@ impl PagedBatchEngine {
                     .collect();
                 let next_positions: Vec<u32> =
                     active_indices.iter().map(|&i| slots[i].next_pos).collect();
+                // P11: per-row (per-slot) adapter selection for this batched
+                // decode — row k is `active_indices[k]`'s slot (same order as
+                // the `DecodeSlot` vec built below). All-None ⇒ no scope ⇒
+                // byte-identical to the pre-LoRA batched decode.
+                let row_adapters: Vec<Option<Arc<rustllama_models::lora::LoraAdapter>>> =
+                    active_indices.iter().map(|&i| slots[i].adapter.clone()).collect();
                 // P3: group active slots that share a page-aligned APC prefix
                 // so the batched decode computes the shared-prefix attention
                 // once (cascade). Members index into `decode_slots` (built below
@@ -1193,11 +1307,21 @@ impl PagedBatchEngine {
                 } else {
                     Some(groups.as_slice())
                 };
+                // P11: scope the per-slot adapter table for this fused decode
+                // (only when some slot carries an adapter — else byte-identical).
+                let _lora = if row_adapters.iter().any(|a| a.is_some()) {
+                    Some(rustllama_models::lora::scope_row_adapters(Some(Arc::new(
+                        rustllama_models::lora::RowAdapters::new(row_adapters),
+                    ))))
+                } else {
+                    None
+                };
                 self.model.forward_decode_paged_batched_cascade_f32(
                     &mut decode_slots,
                     &self.shared,
                     cascade_opt,
                 );
+                drop(_lora);
                 // Release the borrows before sampling — we need
                 // `&mut slots` again.
                 drop(decode_slots);
@@ -1631,6 +1755,19 @@ impl Engine for PagedBatchEngine {
         self.last_stats.lock().ok().and_then(|g| g.clone())
     }
 
+    // P11 — resident multi-LoRA (trait surface; delegates to the inherent
+    // methods, mapping the error type).
+    fn attach_lora_adapter(&self, name: &str, path: &Path) -> EngineResult<usize> {
+        PagedBatchEngine::attach_lora_adapter(self, name, path)
+            .map_err(|e| EngineError::Engine(e.to_string()))
+    }
+    fn lora_adapter_names(&self) -> Vec<String> {
+        PagedBatchEngine::lora_adapter_names(self)
+    }
+    fn has_lora_adapter(&self, name: &str) -> bool {
+        PagedBatchEngine::has_lora_adapter(self, name)
+    }
+
     fn metrics(&self) -> Metrics {
         // Paged-pool state from SharedPagedKv; active-slot count
         // from the driver thread's shared atomic.
@@ -1834,6 +1971,11 @@ struct DriverContext {
     /// synchronous sampler, exactly as before). See [`emit_worker`] and
     /// [`DriverContext::emit_stream_token`].
     emit_tx: Option<std::sync::mpsc::Sender<EmitMsg>>,
+    /// P11 — resident LoRA registry (shared `Arc` with the engine). Admission
+    /// resolves a request's `sampling.lora_adapter` name against it into the
+    /// slot's [`SlotState::adapter`]; the ragged tick then builds a per-row
+    /// table from the active slots' adapters.
+    lora: Arc<std::sync::RwLock<rustllama_models::lora::LoraRegistry>>,
 }
 
 /// P4s: one unit of pipelined stream output — detokenize `id` and send it on
@@ -2380,6 +2522,9 @@ fn build_hybrid_slot_state(
         skip_emit,
         emitted_to_client: skip_emit,
         spec_rng: None,
+        // The hybrid caller (`admit_request` / sync batch) sets this from the
+        // resolved per-request adapter after building.
+        adapter: None,
     })
 }
 
@@ -2420,11 +2565,18 @@ fn admit_request(
         )));
     }
 
+    // P11: resolve this request's LoRA selection against the resident registry
+    // (fail-closed on an unknown name). Stored on the slot; the ragged /
+    // batched-decode tick expands it into the per-row adapter table. `None` ⇒
+    // base, byte-identical.
+    let adapter = PagedBatchEngine::resolve_lora(&ctx.lora, sampling)
+        .map_err(|e| EngineError::Engine(e.to_string()))?;
+
     // F8: HYBRID (DeltaNet/SSM) models bypass the paged pool entirely —
     // per-slot contiguous KV + DeltaNet state, prefilled + decoded through the
     // contiguous hybrid forward. No shared-prefix / APC / page allocation.
     if ctx.model.weights.is_hybrid() {
-        return build_hybrid_slot_state(
+        let mut state = build_hybrid_slot_state(
             &ctx.model,
             ctx.tokenizer.as_ref(),
             ctx.max_ctx,
@@ -2432,7 +2584,9 @@ fn admit_request(
             sampling,
             eos,
             skip_emit,
-        );
+        )?;
+        state.adapter = adapter;
+        return Ok(state);
     }
 
     let geom_store = PagedKvStore::new(
@@ -2463,6 +2617,7 @@ fn admit_request(
     // pages.len() * page_size`. Round LCP down so partial-page
     // sharing isn't needed (it would force a copy of one page).
     let page_size = ctx.page_size as usize;
+    let prompt_u32: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
     // Two sources of shared prefix, both page-aligned:
     //  (1) live-slot LCP — share with a currently-active donor's pages.
     //  (2) vLLM APC — content-addressed reuse across ALL prior requests,
@@ -2470,25 +2625,38 @@ fn admit_request(
     //      physically reused (`PageTable::reacquire` revives their retained KV).
     // The APC lookup acquires ref-held pages up front; we keep whichever source
     // reuses more, releasing the other's refs.
-    let (live_pages, live_lcp) = pick_shared_prefix(prompt, active, page_size);
-    let prompt_u32: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
-    let chain = rustllama_models::apc::block_hash_chain(&prompt_u32, page_size);
-    let apc_pages = ctx.shared.apc_acquire_prefix(&chain);
-    let apc_lcp = apc_pages.len() * page_size;
-
-    let (shared_pages, shared_lcp) = if apc_lcp > 0 && apc_lcp >= live_lcp {
-        // APC wins — its pages are already ref-held by apc_acquire_prefix.
-        (apc_pages, apc_lcp)
+    //
+    // P11: an ADAPTED request (a resident LoRA selected) does NOT participate in
+    // cross-request KV prefix sharing. The APC / live-slot index is keyed on
+    // token CONTENT, not on the adapter, so reusing KV that was computed under a
+    // different (or no) adapter would be a wrong-answer bug. Such a request
+    // recomputes its whole prompt under its own adapter AND keeps that KV out of
+    // the shared index — an empty block-hash chain makes every downstream
+    // `!chain.is_empty()` register (at admit and on prefill-job drain) a no-op,
+    // so adapted KV never leaks into a later base (or differently-adapted)
+    // request. Base requests (no adapter) are unchanged — byte-identical.
+    let (shared_pages, shared_lcp, chain) = if adapter.is_some() {
+        (Vec::new(), 0usize, Vec::new())
     } else {
-        // Live-slot wins (or no APC hit): drop the speculative APC refs and
-        // add_ref the live donor's pages (the historical path's semantics).
-        if !apc_pages.is_empty() {
-            ctx.shared.with_table_mut(|t| t.free(&apc_pages));
-        }
-        if !live_pages.is_empty() {
-            ctx.shared.with_table_mut(|t| t.add_ref(&live_pages));
-        }
-        (live_pages, live_lcp)
+        let (live_pages, live_lcp) = pick_shared_prefix(prompt, active, page_size);
+        let chain = rustllama_models::apc::block_hash_chain(&prompt_u32, page_size);
+        let apc_pages = ctx.shared.apc_acquire_prefix(&chain);
+        let apc_lcp = apc_pages.len() * page_size;
+        let (sp, sl) = if apc_lcp > 0 && apc_lcp >= live_lcp {
+            // APC wins — its pages are already ref-held by apc_acquire_prefix.
+            (apc_pages, apc_lcp)
+        } else {
+            // Live-slot wins (or no APC hit): drop the speculative APC refs and
+            // add_ref the live donor's pages (the historical path's semantics).
+            if !apc_pages.is_empty() {
+                ctx.shared.with_table_mut(|t| t.free(&apc_pages));
+            }
+            if !live_pages.is_empty() {
+                ctx.shared.with_table_mut(|t| t.add_ref(&live_pages));
+            }
+            (live_pages, live_lcp)
+        };
+        (sp, sl, chain)
     };
     if !shared_pages.is_empty() {
         cache.pin_shared_prefix(shared_pages, shared_lcp as u32);
@@ -2552,6 +2720,7 @@ fn admit_request(
             skip_emit,
             emitted_to_client: skip_emit,
             spec_rng: None,
+            adapter,
         });
     }
 
@@ -2604,6 +2773,7 @@ fn admit_request(
         skip_emit,
         emitted_to_client: skip_emit,
         spec_rng: None,
+        adapter,
     })
 }
 
@@ -2885,6 +3055,16 @@ fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
     // slot participates at most once, so the `Option::take` trick hands out one
     // `&mut PagedKvCache` per slot; `logits_store.iter_mut()` gives each row its
     // own `&mut [f32]`.
+    // P11: build the per-row adapter table in CONCATENATED row order — each
+    // plan entry contributes `n_query` rows, all carrying that slot's adapter.
+    // Built here (immutable `active` read) before the `iter_mut` borrow below.
+    // All-None ⇒ no scope ⇒ byte-identical to the pre-LoRA ragged tick.
+    let row_adapters: Vec<Option<Arc<rustllama_models::lora::LoraAdapter>>> = plan
+        .iter()
+        .flat_map(|&(i, _kind, n_query, _start_pos)| {
+            std::iter::repeat_n(active[i].state.adapter.clone(), n_query)
+        })
+        .collect();
     let mut cache_refs: Vec<Option<&mut PagedKvCache>> = active
         .iter_mut()
         .map(|s| Some(&mut s.state.cache))
@@ -2908,6 +3088,15 @@ fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
         Some(cascade_groups.as_slice())
     };
     let tick_start = std::time::Instant::now();
+    // P11: scope the per-row adapter table for this ragged tick (only when some
+    // slot named an adapter — else no scope, byte-identical).
+    let _lora = if row_adapters.iter().any(|a| a.is_some()) {
+        Some(rustllama_models::lora::scope_row_adapters(Some(Arc::new(
+            rustllama_models::lora::RowAdapters::new(row_adapters),
+        ))))
+    } else {
+        None
+    };
     ctx.model.forward_ragged_paged_cascade_f32(
         &tokens,
         &mut ragged,
@@ -2915,6 +3104,7 @@ fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
         None,
         cascade_opt,
     );
+    drop(_lora);
     let tick_ms = tick_start.elapsed().as_secs_f64() * 1000.0;
     // Release the borrows held through the forward before touching `active`.
     drop(ragged);
@@ -3105,6 +3295,9 @@ fn run_hybrid_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
         let tick_start = std::time::Instant::now();
         let next_input = slot.state.next_input;
         let next_pos = slot.state.next_pos;
+        // P11: scope this slot's adapter (single-active) for its independent
+        // hybrid forward. `None` ⇒ base.
+        let _lora = rustllama_models::lora::scope_active_lora(slot.state.adapter.clone());
         {
             let hyb = slot
                 .state
