@@ -90,8 +90,6 @@ enum NavIcon {
     Status,
     Quantize,
     Settings,
-    #[allow(dead_code)]
-    Placeholder,
 }
 
 /// One committed message in the transcript. `role` is the OpenAI role string
@@ -5538,9 +5536,6 @@ fn draw_nav_icon(painter: &egui::Painter, rect: Rect, icon: NavIcon, color: Colo
                 [egui::pos2(c.x + 3.0, c.y + 6.0), egui::pos2(c.x, c.y + 3.0)],
                 s,
             );
-        }
-        NavIcon::Placeholder => {
-            painter.rect_stroke(rect.shrink(2.0), Rounding::same(3.0), s);
         }
     }
 }

@@ -6790,7 +6790,7 @@ impl LlamaModel {
         let w = &self.weights;
         let mut out: Vec<LockTarget> = Vec::new();
 
-        let mut push_tensor = |out: &mut Vec<LockTarget>, tier: u8, name: &str, t: &Tensor| {
+        let push_tensor = |out: &mut Vec<LockTarget>, tier: u8, name: &str, t: &Tensor| {
             if let Some((ptr, len)) = t.storage.cpu_backing_ptr_len() {
                 out.push(LockTarget {
                     tier,
@@ -6847,15 +6847,15 @@ impl LlamaModel {
         // Shared closure for the MoE FFN tiers (shared experts = Tier 1,
         // routed-expert parents = Tier 2; per-expert views are skipped —
         // they alias the parents already pushed at Tier 2).
-        let mut push_moe_ffn = |out: &mut Vec<LockTarget>,
-                                pfx: &str,
-                                router: &Tensor,
-                                gate_exps: &Tensor,
-                                up_exps: &Tensor,
-                                down_exps: &Tensor,
-                                gate_shared: &Option<Tensor>,
-                                up_shared: &Option<Tensor>,
-                                down_shared: &Option<Tensor>| {
+        let push_moe_ffn = |out: &mut Vec<LockTarget>,
+                            pfx: &str,
+                            router: &Tensor,
+                            gate_exps: &Tensor,
+                            up_exps: &Tensor,
+                            down_exps: &Tensor,
+                            gate_shared: &Option<Tensor>,
+                            up_shared: &Option<Tensor>,
+                            down_shared: &Option<Tensor>| {
             push_tensor(out, 0, &format!("{pfx}.router"), router);
             if let Some(t) = gate_shared {
                 push_tensor(out, 1, &format!("{pfx}.w_gate_shared"), t);

@@ -1,11 +1,16 @@
 //! Vision-tower (CLIP / SigLIP / Qwen2-VL-style ViT) architecture
-//! parsing + loading. Phase V-0 scaffolding: this module defines the
+//! parsing + loading + forward pass. This module defines the
 //! [`VisionConfig`] struct that mirrors [`crate::bert_arch::BertConfig`]
 //! plus the vision-specific fields (image_size, patch_size, n_channels),
 //! reads the `clip.*` / `clip.vision.*` GGUF metadata keys used by the
-//! ecosystem's mmproj GGUFs, and stubs [`VisionModel`] with a
-//! `forward_image` that returns `NotImplemented`. The forward pass +
-//! image preprocessor land in phases V-1 / V-3.
+//! ecosystem's mmproj GGUFs, and implements [`VisionModel`] — load +
+//! the real ViT forward + projector (`forward_image_bytes`) + the
+//! placeholder-splice helpers the engine chains into a VLM prefill. The
+//! image preprocessor (decode / resize / patch-flatten) lives alongside.
+//! This is LIVE: the server decodes `image_url` / Anthropic `image`
+//! blocks and the engine splices the projected patch features into the
+//! text stream (`forward_prefill_from_embeds`, incl. the sectioned-mRoPE
+//! `*_mrope` path) at each image placeholder.
 //!
 //! How vision-language models ship:
 //!
@@ -21,9 +26,9 @@
 //!     a multimodal `general.architecture` like `"qwen2vl"`. Tensors
 //!     are namespaced under `v.<...>` (vision) vs `<base>.<...>` (text).
 //!
-//! Phase V-0 only handles the **mmproj GGUF** half (two-file path) —
-//! the text-decoder side already works via the existing Llama loader.
-//! Single-file VLMs are a phase V-5 follow-up.
+//! This handles the **mmproj GGUF** half (two-file path) — the
+//! text-decoder side works via the existing Llama loader. Single-file
+//! VLMs (both towers in one GGUF) are a follow-up.
 //!
 //! GGUF metadata key conventions (the llama.cpp `clip.cpp` convention
 //! that the ecosystem standardized on):
@@ -454,9 +459,9 @@ impl ProjectorWeights {
     }
 }
 
-/// Loaded vision-tower weights + projector. Phase V-1a: tensor
-/// bindings land; the `forward_image` entry is still
-/// `NotImplemented` (phase V-1b will wire it).
+/// Loaded vision-tower weights + projector. The ViT forward
+/// (`forward_image` / `forward_image_bytes`) and projector are
+/// implemented; the engine splices their output into the text stream.
 #[derive(Debug)]
 pub struct VisionModel {
     pub cfg: VisionConfig,

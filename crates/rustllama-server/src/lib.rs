@@ -34,10 +34,8 @@ mod embeddings;
 pub mod env_hint;
 #[cfg(feature = "history")]
 pub mod history;
-// V-5 wires this into chat.rs; until then the decoder lives standalone
-// with full unit-test coverage (`image_url::tests`). Suppress the
-// dead-code warning for the V-4 commit — V-5 adds the use site.
-#[allow(dead_code)]
+// The data-URI / image_url decoder, now live via `chat.rs`
+// (`decode_image_url` + `ImageUrlError` on the OpenAI multimodal path).
 mod image_url;
 mod ollama;
 mod rag;

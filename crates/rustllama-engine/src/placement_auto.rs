@@ -543,7 +543,7 @@ pub fn per_layer_weight_bytes(weights: &LlamaWeights, cpu_force_patterns: &[Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustllama_tensor::{Dtype, Shape};
+    use rustllama_tensor::Dtype;
 
     fn mk_tensor(name: &str, n_elements: u64, dtype: Dtype) -> Tensor {
         // Minimal tensor with the right name + dtype + element count;

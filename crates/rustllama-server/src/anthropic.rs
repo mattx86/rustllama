@@ -398,6 +398,11 @@ impl AnthropicUsage {
     /// clients expect. WITHOUT a marker, `cache_creation` stays `0`
     /// (byte-identical to the pre-F13 behavior); `cache_read` has always been
     /// the real `cache_hit_tokens`.
+    // Deliberate public alias of `with_stats_cache_control(s, false)`, kept for
+    // surface symmetry with the OpenAI `Usage::with_stats`; the real serve path
+    // calls `with_stats_cache_control` directly (with the F13 flag), so the only
+    // caller is the unit test below — hence no production use site.
+    #[allow(dead_code)]
     pub fn with_stats(self, s: &rustllama_engine::RequestStats) -> Self {
         self.with_stats_cache_control(s, false)
     }
