@@ -263,6 +263,48 @@ impl Tokenizer {
         None
     }
 
+    /// Resolve the model's "end-of-generation" / end-of-turn token ids by
+    /// looking up the well-known control-token strings the chat families use
+    /// to close a turn. Returned in addition to `eos_token_id` so the decode
+    /// loops can stop on ANY of them, not just the single configured EOS.
+    ///
+    /// Why this exists: many chat models carry more than one terminal token.
+    /// Qwen3, for instance, closes an assistant turn with `<|im_end|>`
+    /// (151645) but ALSO lists `<|endoftext|>` (151643) as a stop token; a
+    /// GGUF's `tokenizer.ggml.eos_token_id` records only one of them, so a
+    /// model that emits the other would otherwise run on past its turn. We
+    /// resolve the token *strings* (not hardcoded ids) via the vocab, so this
+    /// is model-agnostic: a string absent from the vocab simply resolves to
+    /// `None` and is skipped. Only unambiguous end-of-turn / end-of-sequence
+    /// control tokens are listed — never content-bearing tokens.
+    ///
+    /// NOTE: these are the tokenizer's *special* control tokens; a visible
+    /// detok with `skip_special_tokens = true` already drops them from the
+    /// rendered text, so stopping on them never leaks their literal form.
+    pub fn eog_token_ids(&self) -> Vec<u32> {
+        // Covers ChatML/Qwen (`<|im_end|>`, `<|endoftext|>`), Llama-3
+        // (`<|eot_id|>`, `<|eom_id|>`), Gemma (`<end_of_turn>`), Phi-3
+        // (`<|end|>`), and the SentencePiece families (`</s>`).
+        const EOG_STRINGS: &[&str] = &[
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<|eot_id|>",
+            "<|eom_id|>",
+            "<end_of_turn>",
+            "<|end|>",
+            "</s>",
+        ];
+        let mut ids = Vec::new();
+        for s in EOG_STRINGS {
+            if let Some(id) = self.token_to_id(s) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    }
+
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
         let enc = self
             .inner
@@ -1838,5 +1880,67 @@ mod tests {
         let enc = tok.encode("hi", false).expect("encode");
         let decoded = tok.decode(enc.get_ids(), false).expect("decode");
         assert_eq!(decoded, "hi");
+    }
+
+    /// FIX B: `eog_token_ids` resolves EVERY end-of-turn / EOS control token
+    /// the model carries (not just the one configured `eos_token_id`), and
+    /// never returns an id for a content-bearing token. Here the vocab carries
+    /// the ChatML pair `<|im_end|>` + `<|endoftext|>` (Qwen3's two terminals),
+    /// so both resolve; the plain word "hi" does not.
+    #[test]
+    fn eog_token_ids_resolves_all_end_of_turn_tokens() {
+        let mut vocab = serde_json::Map::new();
+        vocab.insert("hi".to_string(), json!(0));
+        vocab.insert("<|im_end|>".to_string(), json!(1));
+        vocab.insert("<|endoftext|>".to_string(), json!(2));
+        let tj = json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            // The two terminals are registered as special added tokens, as a
+            // GGUF→tokenizer build marks CONTROL (type 3) tokens.
+            "added_tokens": [
+                {"id": 1, "content": "<|im_end|>", "special": true,
+                 "single_word": false, "lstrip": false, "rstrip": false,
+                 "normalized": false},
+                {"id": 2, "content": "<|endoftext|>", "special": true,
+                 "single_word": false, "lstrip": false, "rstrip": false,
+                 "normalized": false},
+            ],
+            "normalizer": null,
+            "pre_tokenizer": bpe_pretokenizer_json(None),
+            "post_processor": null,
+            "decoder": {"type": "ByteLevel", "add_prefix_space": false,
+                        "trim_offsets": true, "use_regex": true},
+            "model": {"type": "BPE", "dropout": null, "unk_token": null,
+                      "continuing_subword_prefix": null, "end_of_word_suffix": null,
+                      "fuse_unk": false, "byte_fallback": false,
+                      "ignore_merges": false, "vocab": vocab, "merges": []}
+        });
+        let inner =
+            HfTokenizer::from_bytes(serde_json::to_vec(&tj).unwrap()).expect("eog BPE loads");
+        let tok = Tokenizer {
+            inner,
+            bos_token_id: None,
+            // GGUF recorded only ONE of the two terminals as the EOS.
+            eos_token_id: Some(1),
+            add_bos: false,
+            add_eos: false,
+            chat_template: None,
+            byte_level_streaming: true,
+        };
+
+        let mut eog = tok.eog_token_ids();
+        eog.sort_unstable();
+        assert_eq!(eog, vec![1, 2], "both ChatML terminals must resolve");
+        assert!(
+            !eog.contains(&0),
+            "a content-bearing token must never be an EOG stop"
+        );
+
+        // And the visible detok drops them (skip_special_tokens = true), so
+        // stopping on either never leaks its literal form into the output.
+        assert_eq!(tok.decode(&[1], true).unwrap(), "");
+        assert_eq!(tok.decode(&[2], true).unwrap(), "");
     }
 }
