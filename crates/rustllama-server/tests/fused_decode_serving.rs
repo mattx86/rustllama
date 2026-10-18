@@ -3,7 +3,8 @@
 //! Item 3.7g landed `ServingModel::new_fused_decode_paged`, a
 //! constructor that holds a single `PagedBatchEngine` as the
 //! `Arc<dyn Engine>` instead of a per-fork `MultiFlightPool`.
-//! These tests verify the shape (gate sized to concurrency,
+//! These tests verify the shape (gate sized to
+//! `max_pending.max(concurrency)` after the P14-http loosening,
 //! `multi` is `None`, scheduler is multi-flight) and that
 //! `try_acquire` hands out admission permits correctly under
 //! concurrent load.
@@ -60,12 +61,20 @@ fn fused_decode_serving_model_shape() {
     // engine-layer test; here we just confirm the dispatch reaches
     // the trait impl).
     assert_eq!(serving.engine.n_ctx(), 32);
-    // The semaphore exposes `concurrency` permits — verifiable by
-    // trying to acquire two without blocking.
+    // P14-http: the paged gate is now LOOSENED to `max_pending.max(concurrency)`
+    // (NOT `concurrency`). Rationale: the paged engine has one driver thread
+    // with its own priority-ordered admission heap + per-request deadlines. If
+    // the gate only let `concurrency` requests through, the overflow would queue
+    // FIFO at the gate and the driver's heap would never see >1 waiter — so
+    // `X-RustLlama-Priority` could not reorder anything. Sizing the gate to the
+    // backpressure cap lets every admitted request reach the driver, where the
+    // slot pool enforces the real `concurrency` limit and the heap orders the
+    // rest. (Was `== 2` before the loosening.)
     assert_eq!(
         serving.gate.available_permits(),
-        2,
-        "gate must expose `concurrency` permits"
+        DEFAULT_MAX_PENDING_PER_MODEL.max(2),
+        "paged gate must expose max_pending.max(concurrency) permits (loosened \
+         so the driver's priority heap sees all admitted requests)"
     );
     let _ = std::fs::remove_file(&tmp);
 }
@@ -108,11 +117,16 @@ async fn fused_decode_serving_model_admits_two_concurrent_handles() {
     // Engine indices are both 0 — there's no pool to round-robin.
     assert_eq!(h1.engine_idx, 0);
     assert_eq!(h2.engine_idx, 0);
-    // Gate is exhausted while both handles live.
-    assert_eq!(serving.gate.available_permits(), 0);
+    // P14-http: the gate is now sized to `max_pending.max(concurrency)` (= 4
+    // here), so two live handles leave `permits - 2` free rather than 0 — the
+    // loosening lets more than `concurrency` requests reach the paged driver's
+    // priority heap concurrently (the driver's slot pool, not the gate, caps
+    // real concurrency). (Was `0` / `2` before the loosening.)
+    let total = DEFAULT_MAX_PENDING_PER_MODEL.max(2);
+    assert_eq!(serving.gate.available_permits(), total - 2);
     drop(h1);
     drop(h2);
     // Permits return on guard drop.
-    assert_eq!(serving.gate.available_permits(), 2);
+    assert_eq!(serving.gate.available_permits(), total);
     let _ = std::fs::remove_file(&tmp);
 }

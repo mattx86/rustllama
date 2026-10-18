@@ -8,7 +8,7 @@
 use std::convert::Infallible;
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -18,7 +18,7 @@ use rustllama_engine::{ChatMessage, SamplingParams};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::{model_not_found, AppState, StreamOptions, Usage};
+use crate::{model_not_found, AppState, ReqSchedule, StreamOptions, Usage};
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
@@ -546,8 +546,12 @@ pub struct TopLogprobOut {
 
 pub async fn chat_completions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(mut req): Json<ChatRequest>,
 ) -> Response {
+    // P14-http: parse the optional priority / deadline scheduling headers once.
+    // Default (no headers) is byte-identical to the pre-P14-http path.
+    let sched = ReqSchedule::from_headers(&headers);
     // Validate response_format up front. Currently this only gates
     // on `type=regex` patterns (other shapes are accepted as-is and
     // unsupported keywords just pass through to the grammar
@@ -645,15 +649,15 @@ pub async fn chat_completions(
             req.messages = maybe_inject_env_hint(req.messages);
         }
         if req.stream {
-            return chat_stream_with_tools(state, req).await;
+            return chat_stream_with_tools(state, req, sched).await;
         }
-        return chat_with_tools(state, req).await;
+        return chat_with_tools(state, req, sched).await;
     }
 
     if req.stream {
-        chat_stream(state, req).await
+        chat_stream(state, req, sched).await
     } else {
-        chat_blocking(state, req).await
+        chat_blocking(state, req, sched).await
     }
 }
 
@@ -830,7 +834,7 @@ fn wire_messages_to_json(messages: &[ChatMessageWire]) -> Vec<Value> {
         .collect()
 }
 
-async fn chat_with_tools(state: AppState, req: ChatRequest) -> Response {
+async fn chat_with_tools(state: AppState, req: ChatRequest, sched: ReqSchedule) -> Response {
     let Some(serving) = state.resolve(req.model.as_deref()).await else {
         return model_not_found(req.model.as_deref());
     };
@@ -838,7 +842,10 @@ async fn chat_with_tools(state: AppState, req: ChatRequest) -> Response {
     // prompt-token count all happen against the Arc-shared CPU engine
     // BEFORE the gate wait, so the work overlaps the current
     // request's decode on queued arrivals.
-    let permit = match serving.try_admit() {
+    // P14-http: the tools path is CpuEngine-only (it 503s on the paged engine),
+    // so the driver deadline/heap never apply here; thread only the admission
+    // priority into the server scheduler slot.
+    let permit = match serving.try_admit_with_priority(sched.priority()) {
         Ok(p) => p,
         Err(be) => return be.into_response(),
     };
@@ -1062,13 +1069,14 @@ async fn chat_with_tools(state: AppState, req: ChatRequest) -> Response {
 /// Streaming variant of `chat_with_tools` — pre-renders the prompt with the
 /// chat template's `tools` branch, drives a token stream, and emits OpenAI-
 /// compatible `tool_calls` deltas as `<tool_call>` blocks complete.
-async fn chat_stream_with_tools(state: AppState, req: ChatRequest) -> Response {
+async fn chat_stream_with_tools(state: AppState, req: ChatRequest, sched: ReqSchedule) -> Response {
     let Some(serving) = state.resolve(req.model.as_deref()).await else {
         return model_not_found(req.model.as_deref());
     };
     // Two-phase admission — tokenization + chat-template render with
     // tools all happen pre-gate against the Arc-shared CPU engine.
-    let permit = match serving.try_admit() {
+    // P14-http: CpuEngine-only path — priority only (see `chat_with_tools`).
+    let permit = match serving.try_admit_with_priority(sched.priority()) {
         Ok(p) => p,
         Err(be) => return be.into_response(),
     };
@@ -2604,7 +2612,7 @@ fn request_id() -> String {
     crate::new_request_id("chatcmpl")
 }
 
-async fn chat_blocking(state: AppState, req: ChatRequest) -> Response {
+async fn chat_blocking(state: AppState, req: ChatRequest, sched: ReqSchedule) -> Response {
     let Some(serving) = state.resolve(req.model.as_deref()).await else {
         return model_not_found(req.model.as_deref());
     };
@@ -2612,7 +2620,8 @@ async fn chat_blocking(state: AppState, req: ChatRequest) -> Response {
     // The prompt-token count runs against the Arc-shared CPU engine
     // BEFORE the gate wait so it overlaps the current request's
     // decode on queued arrivals.
-    let permit = match serving.try_admit() {
+    // P14-http: carry the parsed admission priority into the scheduler slot.
+    let permit = match serving.try_admit_with_priority(sched.priority()) {
         Ok(p) => p,
         Err(be) => return be.into_response(),
     };
@@ -2732,12 +2741,16 @@ async fn chat_blocking(state: AppState, req: ChatRequest) -> Response {
     // finish_reason / logprobs / diffs.
     let n_choices = req.n.unwrap_or(1).max(1);
     let base_seed = sampling.seed;
+    // P14-http: one wall-clock budget shared across the n choices (deadline is
+    // resolved to an absolute Instant here, once). Byte-identical to the plain
+    // `chat` submit when no deadline/priority header was sent.
+    let submit_opts = sched.to_submit_opts(None);
     let mut choices: Vec<ChatChoice> = Vec::with_capacity(n_choices as usize);
     let mut total_completion_tokens = 0u32;
     for idx in 0..n_choices {
         let mut sampling_i = sampling.clone();
         sampling_i.seed = base_seed.wrapping_add(idx as u64);
-        let mut stream = match handle.engine.chat(&msgs, &sampling_i) {
+        let mut stream = match handle.engine.chat_scheduled(&msgs, &sampling_i, submit_opts.clone()) {
             Ok(s) => s,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
@@ -2862,7 +2875,7 @@ fn make_token_logprob_out(
     }
 }
 
-async fn chat_stream(state: AppState, req: ChatRequest) -> Response {
+async fn chat_stream(state: AppState, req: ChatRequest, sched: ReqSchedule) -> Response {
     let Some(serving) = state.resolve(req.model.as_deref()).await else {
         return model_not_found(req.model.as_deref());
     };
@@ -2873,7 +2886,9 @@ async fn chat_stream(state: AppState, req: ChatRequest) -> Response {
     // CPU engine — that work overlaps the gate wait for queued
     // requests, reducing observed TTFT by ~tokenize_ms when a prior
     // request is still decoding.
-    let permit = match serving.try_admit() {
+    // P14-http: the parsed admission priority drives the scheduler slot (and,
+    // on the paged engine, the driver's heap via the SubmitOpts below).
+    let permit = match serving.try_admit_with_priority(sched.priority()) {
         Ok(p) => p,
         Err(be) => return be.into_response(),
     };
@@ -2924,7 +2939,13 @@ async fn chat_stream(state: AppState, req: ChatRequest) -> Response {
     // Kick off the engine BEFORE moving into the stream — that way we can
     // return an HTTP error synchronously if the engine refuses (e.g., no
     // tokenizer loaded) instead of producing a half-empty SSE stream.
-    let tok_stream = match handle.engine.chat(&msgs, &sampling) {
+    // P14-http: thread the parsed priority + deadline into the paged driver.
+    // The request's cancel flag rides along so a deadline also trips the
+    // cancel-watch loop below (the driver additionally sends a
+    // `DeadlineExceeded` stream terminal). On the CpuEngine the opts are a
+    // no-op (`chat_scheduled` defaults to `chat`) — byte-identical.
+    let submit_opts = sched.to_submit_opts(Some(cancel_guard.flag.clone()));
+    let tok_stream = match handle.engine.chat_scheduled(&msgs, &sampling, submit_opts) {
         Ok(s) => s,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };

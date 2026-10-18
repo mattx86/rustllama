@@ -201,6 +201,95 @@ pub struct MultiFlightPool {
 /// `[server].max_pending_per_model`.
 pub const DEFAULT_MAX_PENDING_PER_MODEL: usize = 4;
 
+/// P14-http: per-request scheduling directives parsed from the optional
+/// `X-RustLlama-Priority` / `X-RustLlama-Deadline-Ms` request headers. The
+/// chat / completions / ollama handlers thread this into the server scheduler's
+/// slot priority (via [`ServingModel::try_admit_with_priority`]) AND the paged
+/// engine's admission heap + deadline enforcement (via
+/// [`rustllama_engine::SubmitOpts`] passed to `Engine::chat_scheduled` /
+/// `generate_scheduled`).
+///
+/// The all-default value (`Priority::DEFAULT`, no deadline) reproduces the
+/// pre-P14-http behavior EXACTLY: `priority()` is what `try_admit()` already
+/// passed, and `to_submit_opts(None)` equals `SubmitOpts::default()`. A request
+/// that sends neither header is therefore byte-identical to before.
+#[derive(Clone, Copy, Debug)]
+pub struct ReqSchedule {
+    priority: rustllama_engine::batch_scheduler::Priority,
+    /// Relative deadline captured at parse time; resolved to an absolute
+    /// `Instant` (now + this) at `to_submit_opts()`, i.e. the engine-submit
+    /// site, so the budget covers the gate wait too.
+    deadline: Option<std::time::Duration>,
+}
+
+impl Default for ReqSchedule {
+    fn default() -> Self {
+        Self {
+            priority: rustllama_engine::batch_scheduler::Priority::DEFAULT,
+            deadline: None,
+        }
+    }
+}
+
+impl ReqSchedule {
+    /// Header the client sets to raise/lower admission priority
+    /// (`low`/`default`/`high` or a numeric `0..=255`). Case-insensitive match
+    /// is handled by `Priority::parse`; axum lowercases header names.
+    pub const PRIORITY_HEADER: &'static str = "x-rustllama-priority";
+    /// Header the client sets to bound a request's wall-clock budget. Value is
+    /// whole milliseconds from the moment the server parses it.
+    pub const DEADLINE_MS_HEADER: &'static str = "x-rustllama-deadline-ms";
+
+    /// Parse the two optional headers. Unrecognized / malformed values fall
+    /// through to the default (scheduling hints are advisory — never a 400), so
+    /// a client that sends garbage is still served at DEFAULT priority with no
+    /// deadline. A deadline of `0` ms is kept as `Some(ZERO)` so an already-
+    /// expired request is cancelled immediately by the driver.
+    pub fn from_headers(headers: &axum::http::HeaderMap) -> Self {
+        let priority = headers
+            .get(Self::PRIORITY_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(rustllama_engine::batch_scheduler::Priority::parse)
+            .unwrap_or(rustllama_engine::batch_scheduler::Priority::DEFAULT);
+        let deadline = headers
+            .get(Self::DEADLINE_MS_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(std::time::Duration::from_millis);
+        Self { priority, deadline }
+    }
+
+    /// The admission priority (feeds both the server scheduler slot and the
+    /// paged driver's heap).
+    pub fn priority(&self) -> rustllama_engine::batch_scheduler::Priority {
+        self.priority
+    }
+
+    /// `true` when neither header changed anything from the default — the
+    /// byte-identical default path.
+    pub fn is_default(&self) -> bool {
+        self.priority == rustllama_engine::batch_scheduler::Priority::DEFAULT
+            && self.deadline.is_none()
+    }
+
+    /// Build the engine [`rustllama_engine::SubmitOpts`] for this request,
+    /// resolving the relative deadline to an absolute `Instant` at the submit
+    /// site. `cancel_flag` is the request's `CancelGuard.flag` when available
+    /// (so a deadline also trips the server's cancel-watch loop); `None` is
+    /// fine — the driver still ends the stream with a `DeadlineExceeded`
+    /// terminal.
+    pub fn to_submit_opts(
+        &self,
+        cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> rustllama_engine::SubmitOpts {
+        rustllama_engine::SubmitOpts {
+            priority: self.priority,
+            deadline: self.deadline.map(|d| std::time::Instant::now() + d),
+            cancel_flag,
+        }
+    }
+}
+
 impl ServingModel {
     /// Build a fresh single-flight gate. v1 contract: **one in-flight
     /// generation per model**. Concurrent requests against the same
@@ -315,12 +404,24 @@ impl ServingModel {
     /// pass per tick.
     ///
     /// Selected by the loader when `[server].fused_decode = true`
-    /// + `[inference].kv_cache_layout = "paged"`. The
-    /// admission gate (`Semaphore::new(concurrency)`) gives
-    /// request-level backpressure semantics consistent with the
-    /// per-fork path — once `concurrency` requests hold permits,
-    /// the next admission waits or fails fast at
-    /// `max_pending_per_model`.
+    /// + `[inference].kv_cache_layout = "paged"`.
+    ///
+    /// P14-http gate loosening: UNLIKE the per-fork multi-flight path (whose
+    /// gate MUST stay at `concurrency` because each fork owns one non-`Sync` KV
+    /// cache that cannot take a second concurrent forward), the paged engine
+    /// has ONE driver thread that owns all slot state and admits from its own
+    /// priority-ordered heap. If the server gate only let `concurrency`
+    /// requests through, the driver would fill its slots and the OVERFLOW would
+    /// queue FIFO at the server gate — so the driver's priority heap would never
+    /// see more than one waiter and `X-RustLlama-Priority` could not reorder
+    /// anything. So we size the paged gate to `max_pending` (which already caps
+    /// in-flight + queued via `try_admit`): every backpressure-admitted request
+    /// reaches the driver immediately, the driver's slot pool enforces the real
+    /// `concurrency` limit, and its heap orders the rest by priority + enforces
+    /// per-request deadlines. The gate is effectively a no-op counter here (it
+    /// never blocks, because `pending <= max_pending == permits`); backpressure
+    /// is still the `max_pending_per_model` 503. `max_pending.max(concurrency)`
+    /// guards the degenerate `max_pending < concurrency` config.
     ///
     /// `cpu_engine` is set to `None` — `PagedBatchEngine` is not
     /// a `CpuEngine`. Features that reach into `cpu_engine`
@@ -334,11 +435,16 @@ impl ServingModel {
         concurrency: usize,
     ) -> Self {
         let concurrency = concurrency.max(1);
+        // Loosen the gate so all admitted requests reach the paged driver's
+        // priority heap (see the doc-comment above). The scheduler stays sized
+        // to `concurrency` — for the paged path it is pure backpressure
+        // accounting; the real admission ordering is the driver's heap.
+        let gate_permits = max_pending.max(concurrency);
         Self {
             engine: paged as Arc<dyn Engine>,
             cpu_engine: None,
             model_id,
-            gate: Self::new_gate_for_concurrency(concurrency),
+            gate: Self::new_gate_for_concurrency(gate_permits),
             scheduler: Self::new_scheduler_for_concurrency(concurrency),
             pending: Arc::new(AtomicUsize::new(0)),
             max_pending,
@@ -362,6 +468,17 @@ impl ServingModel {
     /// should use the split form so the work overlaps the wait.
     pub async fn try_acquire(&self) -> Result<EngineHandle, BackpressureError> {
         self.try_admit()?.acquire_gate().await
+    }
+
+    /// P14-http: [`Self::try_acquire`] with an explicit admission priority (from
+    /// the `X-RustLlama-Priority` header). Used by the ollama handlers, which
+    /// don't split admit/gate. `Priority::DEFAULT` is identical to
+    /// [`Self::try_acquire`].
+    pub async fn try_acquire_with_priority(
+        &self,
+        priority: rustllama_engine::batch_scheduler::Priority,
+    ) -> Result<EngineHandle, BackpressureError> {
+        self.try_admit_with_priority(priority)?.acquire_gate().await
     }
 
     /// Backpressure-only admission: increment `pending`, check the

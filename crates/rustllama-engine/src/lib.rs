@@ -749,6 +749,38 @@ pub trait Engine: Send + Sync {
     fn chat(&self, msgs: &[ChatMessage], s: &SamplingParams) -> Result<TokenStream>;
     fn generate(&self, prompt: &str, s: &SamplingParams) -> Result<TokenStream>;
 
+    /// P14-http: like [`Self::chat`] but carries per-request scheduling
+    /// [`SubmitOpts`] (admission `priority` + optional `deadline`) from the HTTP
+    /// layer down to the continuous-batching admission heap. The DEFAULT impl
+    /// IGNORES `opts` and defers to [`Self::chat`], so every engine that does
+    /// not own a priority-ordered driver (`CpuEngine`, `MockEngine`, the test
+    /// fixtures) is byte-identical to the plain `chat` path — the opts only have
+    /// an effect on [`crate::paged_batch::PagedBatchEngine`], which overrides
+    /// this to thread them into its driver's heap + deadline enforcement.
+    fn chat_scheduled(
+        &self,
+        msgs: &[ChatMessage],
+        s: &SamplingParams,
+        opts: SubmitOpts,
+    ) -> Result<TokenStream> {
+        let _ = opts;
+        self.chat(msgs, s)
+    }
+
+    /// P14-http: [`Self::generate`] counterpart of [`Self::chat_scheduled`].
+    /// DEFAULT impl ignores `opts` and defers to [`Self::generate`] (byte-
+    /// identical); overridden by the paged engine to carry the opts to its
+    /// admission heap.
+    fn generate_scheduled(
+        &self,
+        prompt: &str,
+        s: &SamplingParams,
+        opts: SubmitOpts,
+    ) -> Result<TokenStream> {
+        let _ = opts;
+        self.generate(prompt, s)
+    }
+
     /// Whether this engine consumes image bytes attached to a
     /// [`ChatMessage::images`]. Default `false`: text-only engines
     /// (the v1 default) reject image-bearing requests with

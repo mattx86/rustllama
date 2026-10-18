@@ -46,7 +46,7 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::stream::Stream;
@@ -55,7 +55,7 @@ use rustllama_engine::{ChatMessage, SamplingParams};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::AppState;
+use crate::{AppState, ReqSchedule};
 
 // ----- /api/version ----------------------------------------------------------
 
@@ -993,7 +993,13 @@ fn default_true() -> bool {
     true
 }
 
-pub async fn chat(State(state): State<AppState>, Json(req): Json<OllamaChatRequest>) -> Response {
+pub async fn chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<OllamaChatRequest>,
+) -> Response {
+    // P14-http: parse the optional priority / deadline headers once.
+    let sched = ReqSchedule::from_headers(&headers);
     // Vision (`messages[].images`) is not supported — we have no VLM. Reject
     // with a 400 (matching the module header) rather than letting serde drop
     // the field and silently answering text-only.
@@ -1020,7 +1026,7 @@ pub async fn chat(State(state): State<AppState>, Json(req): Json<OllamaChatReque
     // tool_calls array in the message, so a single non-streamed response
     // is the right shape.
     if req.tools.as_ref().map(|t| !t.is_null()).unwrap_or(false) {
-        return ollama_chat_with_tools(state, serving, req).await;
+        return ollama_chat_with_tools(state, serving, req, sched).await;
     }
     let mut sampling = sampling_from_options(req.options.as_ref());
     // Native `format` structured output (JSON mode / schema). No tools on this
@@ -1054,12 +1060,18 @@ pub async fn chat(State(state): State<AppState>, Json(req): Json<OllamaChatReque
         }
     }
 
-    let handle = match serving.try_acquire().await {
+    let handle = match serving.try_acquire_with_priority(sched.priority()).await {
         Ok(p) => p,
         Err(be) => return be.into_response(),
     };
     let started = Instant::now();
-    let tok_stream = match handle.engine.chat(&msgs, &sampling) {
+    // P14-http: thread priority + deadline into the paged driver (no-op on the
+    // CpuEngine). Default headers ⇒ `SubmitOpts::default()` ⇒ identical to the
+    // prior `engine.chat` call.
+    let tok_stream = match handle
+        .engine
+        .chat_scheduled(&msgs, &sampling, sched.to_submit_opts(None))
+    {
         Ok(s) => s,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -1108,6 +1120,7 @@ async fn ollama_chat_with_tools(
     state: AppState,
     serving: crate::ServingModel,
     req: OllamaChatRequest,
+    sched: ReqSchedule,
 ) -> Response {
     let tools_value = req.tools.clone().unwrap_or(Value::Null);
     let model_id = req
@@ -1180,7 +1193,9 @@ async fn ollama_chat_with_tools(
         return (code, Json(json!({ "error": msg }))).into_response();
     }
 
-    let handle = match serving.try_acquire().await {
+    // P14-http: ollama tools path is CpuEngine-only; carry the admission
+    // priority into the scheduler slot (deadline/heap are paged-only).
+    let handle = match serving.try_acquire_with_priority(sched.priority()).await {
         Ok(p) => p,
         Err(be) => return be.into_response(),
     };
@@ -1642,8 +1657,11 @@ pub struct OllamaGenerateRequest {
 
 pub async fn generate(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<OllamaGenerateRequest>,
 ) -> Response {
+    // P14-http: parse the optional priority / deadline headers once.
+    let sched = ReqSchedule::from_headers(&headers);
     let Some(serving) = state.resolve(req.model.as_deref()).await else {
         return ollama_model_not_found(req.model.as_deref());
     };
@@ -1664,7 +1682,7 @@ pub async fn generate(
     // tokenizer) BEFORE the gate wait so a queued request overlaps
     // its tokenization with the prior request's decode.
     let started = Instant::now();
-    let pregate_permit = match serving.try_admit() {
+    let pregate_permit = match serving.try_admit_with_priority(sched.priority()) {
         Ok(p) => p,
         Err(be) => return be.into_response(),
     };
@@ -1722,9 +1740,12 @@ pub async fn generate(
         Ok(h) => h,
         Err(be) => return be.into_response(),
     };
+    // P14-http: one SubmitOpts for whichever engine path we take (no-op on the
+    // CpuEngine; carries priority + deadline into the paged driver).
+    let submit_opts = sched.to_submit_opts(None);
     let (tok_stream, prompt_eval_count) = match prepared {
         PreparedGenerate::Chat { msgs, count } => {
-            let stream = match handle.engine.chat(&msgs, &sampling) {
+            let stream = match handle.engine.chat_scheduled(&msgs, &sampling, submit_opts) {
                 Ok(s) => s,
                 Err(e) => {
                     return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
@@ -1733,7 +1754,8 @@ pub async fn generate(
             (stream, count)
         }
         PreparedGenerate::Raw { count } => {
-            let stream = match handle.engine.generate(&req.prompt, &sampling) {
+            let stream = match handle.engine.generate_scheduled(&req.prompt, &sampling, submit_opts)
+            {
                 Ok(s) => s,
                 Err(e) => {
                     return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()

@@ -12,13 +12,13 @@
 //! special tokens, supplying `suffix` returns 400.
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use rustllama_engine::{SamplingParams, Token};
 use serde::{Deserialize, Serialize};
 
-use crate::{model_not_found, AppState, Usage};
+use crate::{model_not_found, AppState, ReqSchedule, Usage};
 
 #[derive(Debug, Deserialize)]
 pub struct CompletionRequest {
@@ -162,8 +162,15 @@ pub struct LogprobsOut {
 
 pub async fn completions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CompletionRequest>,
 ) -> Response {
+    // P14-http: the completions endpoint is CpuEngine-only (it 503s on the
+    // paged engine and drives generation directly off `shared_cpu`), so the
+    // paged driver's deadline/heap don't apply here; carry only the admission
+    // priority into the server scheduler slot. Default (no header) is
+    // byte-identical to before.
+    let sched = ReqSchedule::from_headers(&headers);
     let Some(serving) = state.resolve(req.model.as_deref()).await else {
         return model_not_found(req.model.as_deref());
     };
@@ -216,7 +223,7 @@ pub async fn completions(
     // prompt-token count all happen against the Arc-shared CPU engine
     // BEFORE the gate wait, so the work overlaps any in-flight
     // request's decode.
-    let pregate_permit = match serving.try_admit() {
+    let pregate_permit = match serving.try_admit_with_priority(sched.priority()) {
         Ok(p) => p,
         Err(be) => return be.into_response(),
     };

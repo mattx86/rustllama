@@ -1669,6 +1669,24 @@ impl Engine for PagedBatchEngine {
     }
 
     fn chat(&self, msgs: &[ChatMessage], s: &SamplingParams) -> EngineResult<TokenStream> {
+        // Byte-identical to the pre-P14-http path: DEFAULT priority, no deadline.
+        self.chat_scheduled(msgs, s, SubmitOpts::default())
+    }
+
+    fn generate(&self, prompt: &str, s: &SamplingParams) -> EngineResult<TokenStream> {
+        self.generate_scheduled(prompt, s, SubmitOpts::default())
+    }
+
+    /// P14-http: render the chat prompt, then submit WITH the HTTP-supplied
+    /// scheduling opts so the driver's priority heap + per-request deadline
+    /// actually order/bound this request. `SubmitOpts::default()` (the `chat`
+    /// delegate above) reproduces the original FIFO, no-deadline behavior.
+    fn chat_scheduled(
+        &self,
+        msgs: &[ChatMessage],
+        s: &SamplingParams,
+        opts: SubmitOpts,
+    ) -> EngineResult<TokenStream> {
         let tokenizer = self
             .tokenizer
             .as_ref()
@@ -1683,11 +1701,18 @@ impl Engine for PagedBatchEngine {
                 .collect();
             tokenizer.render_chat(&tok_msgs, true)?
         };
-        self.submit_text_streaming(&prompt, s.clone())
+        self.submit_text_streaming_with_opts(&prompt, s.clone(), opts)
     }
 
-    fn generate(&self, prompt: &str, s: &SamplingParams) -> EngineResult<TokenStream> {
-        self.submit_text_streaming(prompt, s.clone())
+    /// P14-http: [`Self::generate`] with HTTP-supplied scheduling opts threaded
+    /// into the driver's admission heap + deadline enforcement.
+    fn generate_scheduled(
+        &self,
+        prompt: &str,
+        s: &SamplingParams,
+        opts: SubmitOpts,
+    ) -> EngineResult<TokenStream> {
+        self.submit_text_streaming_with_opts(prompt, s.clone(), opts)
     }
 }
 
