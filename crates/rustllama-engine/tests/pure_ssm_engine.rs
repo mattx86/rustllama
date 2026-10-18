@@ -10,7 +10,9 @@
 
 use rustllama_engine::speculative::LookaheadDrafterConfig;
 use rustllama_engine::{CpuEngine, SamplingParams};
-use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthHybrid, SynthLlama};
+use rustllama_gguf::synth::{
+    write_synthetic_llama_gguf, write_synthetic_mamba_gguf, SynthHybrid, SynthLlama, SynthMamba,
+};
 use rustllama_models::llama_arch::KvDtype;
 
 fn greedy(n: u32) -> SamplingParams {
@@ -76,6 +78,56 @@ fn cpu_engine_loads_and_runs_pure_ssm() {
         .generate_token_ids(&prompt, 5, &greedy(5))
         .expect("pure-SSM greedy generate (repeat)");
     assert_eq!(out1, out2, "pure-SSM greedy decode is not deterministic");
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+fn write_canonical_mamba(tag: &str, n_layers: u32) -> std::path::PathBuf {
+    let tmp = std::env::temp_dir().join(format!("rustllama-canon-mamba-eng-{tag}.gguf"));
+    write_synthetic_mamba_gguf(
+        &tmp,
+        &SynthMamba {
+            n_layers,
+            ..SynthMamba::default()
+        },
+    );
+    tmp
+}
+
+/// F9-tail anchor: a CANONICAL Mamba/SSM GGUF (arch `mamba`, the selective-scan
+/// recurrence — NOT the DeltaNet hybrid layout) LOADS through `CpuEngine` (it is
+/// no longer refused) and greedily decodes to a finite, deterministic, in-vocab
+/// token sequence through the wired `mamba_arch::MambaModel` selective scan.
+#[test]
+fn cpu_engine_loads_and_runs_canonical_mamba() {
+    let tmp = write_canonical_mamba("run", 3);
+
+    let mut cpu =
+        CpuEngine::load_with_options_and_layout(&tmp, 64, true, KvDtype::F32, "contiguous").expect(
+            "canonical Mamba model must load via CpuEngine (selective-scan engine wired, \
+             not refused)",
+        );
+    cpu.set_prefix_cache(false);
+
+    let prompt: Vec<i32> = vec![3, 1, 4, 1, 5, 9];
+    let out1 = cpu
+        .generate_token_ids(&prompt, 5, &greedy(5))
+        .expect("canonical Mamba greedy generate");
+    assert!(!out1.is_empty(), "canonical Mamba decode produced no tokens");
+    assert!(
+        out1.iter().all(|&t| (t as usize) < cpu.vocab_size()),
+        "token id out of vocab range"
+    );
+
+    // Determinism: a second identical greedy run must match token-for-token
+    // (a fresh selective-scan cache per call starts from zero state).
+    let out2 = cpu
+        .generate_token_ids(&prompt, 5, &greedy(5))
+        .expect("canonical Mamba greedy generate (repeat)");
+    assert_eq!(
+        out1, out2,
+        "canonical Mamba greedy decode is not deterministic"
+    );
 
     let _ = std::fs::remove_file(&tmp);
 }

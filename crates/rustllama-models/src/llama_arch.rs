@@ -5634,6 +5634,63 @@ pub fn rope_tables_from_cfg(cfg: &LlamaConfig) -> (Vec<f32>, f32) {
     )
 }
 
+impl LlamaModel {
+    /// F9-tail — build a minimal transformer SHELL (`cfg` + EMPTY weights) for
+    /// a CANONICAL Mamba/SSM model, so a `CpuEngine` can carry it in its
+    /// `LlamaModel` slot while dispatching the actual forward to the
+    /// selective-scan [`crate::mamba_arch::MambaModel`]. The cfg mirrors the
+    /// SSM dims the engine's transformer-shaped accessors read (vocab /
+    /// n_layers / d_model / eos / rms_eps); a single attention head of width
+    /// `d_model` keeps the `n_heads · head_dim == d_model` invariant while the
+    /// vestigial KV cache the engine still allocates stays a few KB. The
+    /// weights are EMPTY and NEVER executed — any transformer forward on this
+    /// shell is a bug (the engine routes Mamba models to the selective scan
+    /// before any such call); it exists only so the Llama-shaped accessors and
+    /// KV sizing return the right numbers.
+    pub fn mamba_shell(cfg: &crate::mamba_arch::MambaConfig, eos_token_id: Option<u32>) -> LlamaModel {
+        let lcfg = LlamaConfig {
+            arch: "mamba".to_string(),
+            n_layers: cfg.n_layers,
+            n_heads: 1,
+            n_kv_heads: 1,
+            d_model: cfg.d_model,
+            d_ff: cfg.d_inner,
+            head_dim: cfg.d_model,
+            rope_dim: cfg.d_model,
+            rope_theta: 10_000.0,
+            rms_eps: cfg.eps,
+            vocab_size: cfg.vocab_size,
+            ctx_train: 1 << 20,
+            bos_token_id: None,
+            eos_token_id,
+            tie_word_embeddings: true,
+            ..LlamaConfig::default()
+        };
+        let weights = LlamaWeights {
+            token_embd: Tensor::zeros_cpu(
+                Dtype::F32,
+                vec![cfg.d_model as u64, cfg.vocab_size as u64],
+            ),
+            blocks: Vec::new(),
+            moe_blocks: None,
+            hybrid_layers: None,
+            mla_blocks: None,
+            output_norm: vec![0.0; cfg.d_model],
+            output: None,
+            mtp_heads: None,
+            nextn_head: None,
+            hadamard: None,
+        };
+        let (rope_inv_freq, yarn_mscale) = rope_tables_from_cfg(&lcfg);
+        LlamaModel {
+            cfg: lcfg,
+            weights,
+            rope_inv_freq,
+            yarn_mscale,
+        }
+    }
+}
+
 /// Tree-attention descriptor threaded into the batched F32 forward for
 /// speculative TREE verification (Feature 4). Borrowed views over the caller's
 /// per-node arrays; `depths[i]` = node `i`'s tree depth (its RoPE position is

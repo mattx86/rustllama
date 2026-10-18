@@ -828,6 +828,166 @@ pub fn write_synthetic_llama_gguf(path: &Path, params: &SynthLlama) {
     file.flush().unwrap();
 }
 
+/// Hyperparameters for a synthetic CANONICAL Mamba-1 GGUF (arch `mamba`) —
+/// the selective-scan recurrence (`ssm_in`/`ssm_conv1d`/`ssm_x`/`ssm_dt`/
+/// `ssm_a`/`ssm_d`/`ssm_out`, `s ← exp(dt·A)·s + dt·B·x`), NOT the DeltaNet
+/// hybrid layout. Drives the tested `mamba_arch::MambaModel` CPU forward now
+/// wired into `CpuEngine` (F9-tail). Weight values are small deterministic
+/// RNG — enough for a finite, deterministic, in-vocab decode, not a match to
+/// any external (HF) reference.
+#[derive(Debug, Clone)]
+pub struct SynthMamba {
+    pub n_layers: u32,
+    pub d_model: u32,
+    pub vocab: u32,
+    /// SSM state dim per channel (`mamba.ssm.state_size`).
+    pub d_state: u32,
+    /// Conv1d kernel width (`mamba.ssm.conv_kernel`).
+    pub d_conv: u32,
+    /// Inner expansion (`mamba.ssm.inner_size`); canonical Mamba uses 2·d_model.
+    pub d_inner: u32,
+    /// dt low-rank projection rank (`mamba.ssm.time_step_rank`).
+    pub dt_rank: u32,
+    pub seed: u64,
+}
+
+impl Default for SynthMamba {
+    fn default() -> Self {
+        Self {
+            n_layers: 2,
+            d_model: 32,
+            vocab: 32,
+            d_state: 8,
+            d_conv: 4,
+            d_inner: 64,
+            dt_rank: 2,
+            seed: 0x5A3B_12CD,
+        }
+    }
+}
+
+/// Write a synthetic canonical Mamba-1 GGUF (arch `mamba`) to `path`. Emits
+/// the `mamba.*` + `mamba.ssm.*` metadata `MambaConfig::from_gguf` reads and
+/// the per-layer selective-scan tensor set `MambaModel::load` binds, plus a
+/// gpt2 tokenizer so `CpuEngine` loads with tokenization. All weights are F32
+/// (the loader also accepts F16 / quantized, but F32 keeps the fixture exact).
+pub fn write_synthetic_mamba_gguf(path: &Path, p: &SynthMamba) {
+    let SynthMamba {
+        n_layers,
+        d_model,
+        vocab,
+        d_state,
+        d_conv,
+        d_inner,
+        dt_rank,
+        seed,
+    } = *p;
+
+    let mut m = MetaBuilder::new();
+    m.string("general.architecture", "mamba");
+    m.u32("mamba.block_count", n_layers);
+    m.u32("mamba.embedding_length", d_model);
+    m.u32("mamba.vocab_size", vocab);
+    m.u32("mamba.ssm.state_size", d_state);
+    m.u32("mamba.ssm.conv_kernel", d_conv);
+    m.u32("mamba.ssm.inner_size", d_inner);
+    m.u32("mamba.ssm.time_step_rank", dt_rank);
+    m.f32("mamba.attention.layer_norm_rms_epsilon", 1e-5);
+    m.u32("mamba.context_length", 131072);
+
+    // gpt2 tokenizer so `Tokenizer::from_gguf` + the `CpuEngine` load succeed.
+    let vocab_tokens: Vec<String> = (0..vocab).map(|i| format!("<tok_{i}>")).collect();
+    m.array_strings("tokenizer.ggml.tokens", &vocab_tokens);
+    m.string("tokenizer.ggml.model", "gpt2");
+    m.array_strings("tokenizer.ggml.merges", &[]);
+    m.u32("tokenizer.ggml.bos_token_id", 1);
+    m.u32("tokenizer.ggml.eos_token_id", 2);
+
+    let d_model = d_model as usize;
+    let d_state = d_state as usize;
+    let d_conv = d_conv as usize;
+    let d_inner = d_inner as usize;
+    let dt_rank = dt_rank as usize;
+    let vocab = vocab as usize;
+
+    let mut tensors = Vec::new();
+    // token_embd.weight — `MambaModel::load`'s check_shape requires [d_model, vocab].
+    tensors.push(TensorSpec::f32(
+        "token_embd.weight",
+        vec![d_model as u64, vocab as u64],
+        random_f32(d_model * vocab, seed.wrapping_add(1)),
+    ));
+    tensors.push(TensorSpec::f32(
+        "output_norm.weight",
+        vec![d_model as u64],
+        random_f32(d_model, seed.wrapping_add(2)),
+    ));
+    // output.weight omitted -> tied to token_embd.
+    for i in 0..n_layers as u64 {
+        let p = format!("blk.{i}");
+        let sd = seed.wrapping_add(1000 + i * 50);
+        tensors.push(TensorSpec::f32(
+            &format!("{p}.attn_norm.weight"),
+            vec![d_model as u64],
+            random_f32(d_model, sd),
+        ));
+        // ssm_in (in_proj): [d_model] -> [2*d_inner]  (count 2*d_inner*d_model).
+        tensors.push(TensorSpec::f32(
+            &format!("{p}.ssm_in.weight"),
+            vec![d_model as u64, (2 * d_inner) as u64],
+            random_f32(2 * d_inner * d_model, sd.wrapping_add(1)),
+        ));
+        // ssm_conv1d.weight: per-channel d_conv taps (count d_inner*d_conv).
+        tensors.push(TensorSpec::f32(
+            &format!("{p}.ssm_conv1d.weight"),
+            vec![d_conv as u64, d_inner as u64],
+            random_f32(d_inner * d_conv, sd.wrapping_add(2)),
+        ));
+        tensors.push(TensorSpec::f32(
+            &format!("{p}.ssm_conv1d.bias"),
+            vec![d_inner as u64],
+            random_f32(d_inner, sd.wrapping_add(3)),
+        ));
+        // ssm_x (x_proj): [d_inner] -> [dt_rank + 2*d_state].
+        tensors.push(TensorSpec::f32(
+            &format!("{p}.ssm_x.weight"),
+            vec![d_inner as u64, (dt_rank + 2 * d_state) as u64],
+            random_f32((dt_rank + 2 * d_state) * d_inner, sd.wrapping_add(4)),
+        ));
+        // ssm_dt (dt_proj): [dt_rank] -> [d_inner].
+        tensors.push(TensorSpec::f32(
+            &format!("{p}.ssm_dt.weight"),
+            vec![dt_rank as u64, d_inner as u64],
+            random_f32(d_inner * dt_rank, sd.wrapping_add(5)),
+        ));
+        tensors.push(TensorSpec::f32(
+            &format!("{p}.ssm_dt.bias"),
+            vec![d_inner as u64],
+            random_f32(d_inner, sd.wrapping_add(6)),
+        ));
+        // ssm_a (A_log): [d_state, d_inner]  (A = -exp(a_log) in the forward).
+        tensors.push(TensorSpec::f32(
+            &format!("{p}.ssm_a"),
+            vec![d_inner as u64, d_state as u64],
+            random_f32(d_state * d_inner, sd.wrapping_add(7)),
+        ));
+        // ssm_d: per-channel skip connection [d_inner].
+        tensors.push(TensorSpec::f32(
+            &format!("{p}.ssm_d"),
+            vec![d_inner as u64],
+            random_f32(d_inner, sd.wrapping_add(8)),
+        ));
+        // ssm_out (out_proj): [d_inner] -> [d_model].
+        tensors.push(TensorSpec::f32(
+            &format!("{p}.ssm_out.weight"),
+            vec![d_inner as u64, d_model as u64],
+            random_f32(d_model * d_inner, sd.wrapping_add(9)),
+        ));
+    }
+
+    write_gguf_file(path, m, &tensors);
+}
+
 /// Write a synthetic DeepSeek-V2/V3-style MLA GGUF (`deepseek2` arch) to
 /// `path`. Emits the full Multi-head Latent Attention tensor set so a
 /// loadable fixture drives the REAL `forward_one_mla`:

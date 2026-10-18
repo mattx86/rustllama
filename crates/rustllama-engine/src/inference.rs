@@ -51,6 +51,16 @@ pub type Result<T> = std::result::Result<T, CpuEngineError>;
 /// shared state into a `spawn_blocking` task.
 pub struct CpuEngine {
     model: Arc<LlamaModel>,
+    /// F9-tail — a CANONICAL Mamba/SSM selective-scan model (arch
+    /// `mamba`/`mamba2`/`jamba`/`falcon-mamba`: the `in_proj`/`x_proj`/
+    /// `dt_proj`/`A_log`/`D`/`conv1d` recurrence, NOT the DeltaNet hybrid
+    /// layout). `Some` when the loaded GGUF is canonical Mamba: the `model`
+    /// field then holds a minimal transformer SHELL (correct cfg, empty
+    /// weights, never executed — see [`LlamaModel::mamba_shell`]) and
+    /// generation dispatches the forward to this selective-scan model
+    /// ([`rustllama_models::mamba_arch::MambaModel`]). `None` (the default) on
+    /// every transformer / hybrid model, so those paths are byte-identical.
+    mamba: Option<Arc<rustllama_models::mamba_arch::MambaModel>>,
     tokenizer: Option<Arc<Tokenizer>>,
     state: Arc<Mutex<EngineState>>,
     /// Dedicated SYCL worker thread. All streaming generation and
@@ -1281,59 +1291,62 @@ impl CpuEngine {
             );
         }
         let gguf = Gguf::open(path)?;
-        // F9 — pure Mamba / SSM routing.
+        // F9 / F9-tail — Mamba / SSM routing.
         //
-        // A PURE-recurrent model (all SSM layers, NO attention) that uses the
-        // DeltaNet/gated-delta-rule tensor layout the hybrid forward already
-        // runs (`attn_qkv` / `ssm_conv1d` / `ssm_alpha` / `ssm_beta` / `ssm_a`
-        // / `ssm_norm` / `ssm_out`, selected by `full_attention_interval`) is
-        // just [`LlamaModel::forward_one_hybrid`] with zero full-attention
-        // layers — it loads + runs through the hybrid path below (its KV cache
-        // is all zero-length placeholders; the recurrent `DeltaNetCache` IS the
-        // cache). Those models are NOT `MambaConfig::detect`-matched (that keys
-        // on the `mamba`/`mamba2`/`jamba`/`falcon-mamba` arch names), so they
-        // already fall straight through to `LlamaModel::load`.
-        //
-        // What `MambaConfig::detect` DOES catch is a CANONICAL Mamba-1/2
-        // checkpoint: the selective-scan recurrence (`in_proj`/`x_proj`/
-        // `dt_proj`/`A_log`/`D`/`conv1d`/`out_proj`, `s ← exp(dt·A)·s + dt·B·x`,
-        // SiLU(z) gate). `forward_one_hybrid` does NOT implement that scan — a
-        // different parameterization AND a different tensor set — so routing a
-        // canonical Mamba checkpoint through it would silently produce WRONG
-        // output. Refuse those precisely (fail-closed) and point at the correct,
-        // tested CPU forward in the library (`MambaModel::forward_one`). The one
-        // exception: a `mamba`-named GGUF that ALSO declares the hybrid DeltaNet
-        // layout (`full_attention_interval` + `blk.0.ssm_conv1d.weight`) is the
-        // supported recurrence under a mamba-ish arch name — let it through to
-        // the hybrid path rather than refuse.
+        // A `mamba`/`mamba2`/`jamba`/`falcon-mamba` GGUF that ALSO carries the
+        // hybrid DeltaNet layout (`full_attention_interval` + `ssm_conv1d`) is a
+        // gated-delta-rule recurrence the hybrid forward already runs (F9) — let
+        // it fall straight through to `LlamaModel::load`. A CANONICAL Mamba-1/2
+        // checkpoint (the `in_proj`/`x_proj`/`dt_proj`/`A_log`/`D`/`conv1d`
+        // selective scan, `s ← exp(dt·A)·s + dt·B·x`, SiLU(z) gate) is NOT that
+        // forward — a different parameterization AND tensor set — so F9-tail now
+        // WIRES its tested CPU forward (`mamba_arch::MambaModel`) into the engine
+        // instead of refusing. The engine carries the `MambaModel` in `mamba` and
+        // a minimal transformer SHELL in `model` (correct cfg, empty weights,
+        // never executed); `generate_token_ids` dispatches to the scan.
+        let mut mamba_model: Option<Arc<rustllama_models::mamba_arch::MambaModel>> = None;
         if let Some(arch) = rustllama_models::mamba_arch::MambaConfig::detect(&gguf) {
             let hybrid_delta_layout = gguf
                 .metadata_get(&format!("{arch}.full_attention_interval"))
                 .is_some()
                 && gguf.tensor("blk.0.ssm_conv1d.weight").is_some();
-            if !hybrid_delta_layout {
-                return Err(CpuEngineError::Other(format!(
-                    "canonical Mamba / SSM selective-scan architecture detected \
-                     ({arch}): the hybrid forward (`forward_one_hybrid`) \
-                     implements the gated-delta-rule recurrence \
-                     (attn_qkv/ssm_conv1d/ssm_alpha/ssm_beta), NOT Mamba's \
-                     selective scan (in_proj/x_proj/dt_proj/A_log/D). Refusing \
-                     rather than producing wrong output. The correct CPU forward \
-                     IS implemented — call \
-                     `rustllama_models::mamba_arch::MambaModel::load` + \
-                     `forward_one` via the library API; a dedicated selective-scan \
-                     engine that wires it into `CpuEngine`'s generation loop is \
-                     the follow-up."
-                )));
+            if hybrid_delta_layout {
+                tracing::info!(
+                    arch = %arch,
+                    "Mamba-named GGUF carries the hybrid DeltaNet layout \
+                     (full_attention_interval + ssm_conv1d) — routing through the \
+                     pure-SSM hybrid forward (F9)"
+                );
+            } else {
+                let mm = rustllama_models::mamba_arch::MambaModel::load(&gguf).map_err(|e| {
+                    CpuEngineError::Other(format!("canonical Mamba / SSM load failed: {e}"))
+                })?;
+                tracing::info!(
+                    arch = %arch,
+                    n_layers = mm.cfg.n_layers,
+                    d_model = mm.cfg.d_model,
+                    d_inner = mm.cfg.d_inner,
+                    vocab = mm.cfg.vocab_size,
+                    "canonical Mamba / SSM selective-scan model loaded — wired into \
+                     CpuEngine's generation loop (F9-tail)"
+                );
+                mamba_model = Some(Arc::new(mm));
             }
-            tracing::info!(
-                arch = %arch,
-                "Mamba-named GGUF carries the hybrid DeltaNet layout \
-                 (full_attention_interval + ssm_conv1d) — routing through the \
-                 pure-SSM hybrid forward (F9)"
-            );
         }
-        let mut model = LlamaModel::load(&gguf)?;
+        let mut model = if let Some(mm) = mamba_model.as_ref() {
+            // Minimal transformer shell so the engine's `LlamaModel`-shaped
+            // accessors (vocab / n_layers / eos / KV sizing) read the right
+            // dims; the forward never runs on it (see `generate_token_ids_mamba`).
+            let eos = match gguf.metadata_get("tokenizer.ggml.eos_token_id") {
+                Some(rustllama_gguf::MetadataValue::U32(v)) => Some(*v),
+                Some(rustllama_gguf::MetadataValue::U64(v)) => Some(*v as u32),
+                Some(rustllama_gguf::MetadataValue::I32(v)) if *v >= 0 => Some(*v as u32),
+                _ => None,
+            };
+            rustllama_models::llama_arch::LlamaModel::mamba_shell(&mm.cfg, eos)
+        } else {
+            LlamaModel::load(&gguf)?
+        };
         // P11: merge a LoRA adapter at load (Phase 1). F32/F16 base
         // projections get `W += (alpha/rank)·B·A`; quantized bases are left
         // packed (reported as skipped) for the Phase-2 delta path. A missing
@@ -1955,6 +1968,7 @@ impl CpuEngine {
             image_wrapper: None,
             vision_feature_memo: Arc::new(Mutex::new(None)),
             lock_registry,
+            mamba: mamba_model,
             expert_usage,
             kv_persist_owner: true,
             cacheblend: None,
@@ -2635,6 +2649,8 @@ impl CpuEngine {
             image_wrapper: None,
             vision_feature_memo: Arc::new(Mutex::new(None)),
             lock_registry,
+            // Safetensors VLM path is never a canonical Mamba model.
+            mamba: None,
             // Safetensors weights are owned-heap (nothing mmap-backed
             // to pin), so the expert learning cache never applies.
             expert_usage: None,
@@ -2799,6 +2815,8 @@ impl CpuEngine {
             image_wrapper: None,
             vision_feature_memo: Arc::new(Mutex::new(None)),
             lock_registry,
+            // Packed MLX-affine VLM path is never a canonical Mamba model.
+            mamba: None,
             // Packed MLX-affine weights are owned-heap blobs (nothing
             // mmap-backed to pin), so the expert learning cache never applies.
             expert_usage: None,
@@ -4350,6 +4368,8 @@ impl CpuEngine {
             tree_spec: self.tree_spec.clone(),
             // P10b — forks inherit the parent's EAGLE head (Arc-shared).
             eagle_head: self.eagle_head.clone(),
+            // F9-tail — forks inherit the parent's canonical-Mamba model (Arc-shared).
+            mamba: self.mamba.clone(),
             image_wrapper: self.image_wrapper.clone(),
             vision_feature_memo: Arc::clone(&self.vision_feature_memo),
             // Forks share the parent's locked ranges: they use the same
@@ -4838,12 +4858,70 @@ impl CpuEngine {
         );
     }
 
+    /// F9-tail — canonical Mamba/SSM selective-scan generation. For a Mamba
+    /// model the engine's `model` field is a transformer SHELL; the real
+    /// forward is the tested [`rustllama_models::mamba_arch::MambaModel`]
+    /// `forward_sequence` / `forward_one` selective scan over a per-request
+    /// `MambaCache` (the recurrent "KV"). The shared `Sampler` + grammar glue
+    /// is identical to the transformer decode loop, so greedy decode is
+    /// deterministic + in-vocab. A fresh cache per call makes repeated greedy
+    /// runs bit-identical (cross-request recurrent reuse / prefix cache is a
+    /// follow-up — correctness first).
+    fn generate_token_ids_mamba(
+        &self,
+        mm: &rustllama_models::mamba_arch::MambaModel,
+        prompt_ids: &[i32],
+        n_new: u32,
+        sampling: &SamplingParams,
+    ) -> Result<Vec<u32>> {
+        if prompt_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let total_required = prompt_ids.len() + n_new as usize;
+        if total_required > self.max_ctx {
+            return Err(CpuEngineError::PromptTooLong {
+                prompt_len: prompt_ids.len(),
+                max_ctx: self.max_ctx,
+            });
+        }
+        let vocab = mm.cfg.vocab_size;
+        let mut logits = vec![0f32; vocab];
+        let mut cache = rustllama_models::mamba_arch::MambaCache::new(&mm.cfg);
+        let mut history: Vec<u32> = prompt_ids.iter().map(|&t| t as u32).collect();
+        // Prefill: fold the whole prompt through the recurrence; the last
+        // token leaves the next-token logits in `logits`.
+        mm.forward_sequence(prompt_ids, &mut cache, &mut logits);
+
+        let mut sampler = Sampler::new(sampling.clone());
+        let mut grammar = self.build_grammar(sampling);
+        let eos = self.model.cfg.eos_token_id;
+        let mut out = Vec::with_capacity(n_new as usize);
+        for _ in 0..n_new {
+            let next_tok = sampler.sample_with_grammar(&mut logits, &history, grammar.as_ref());
+            if let Some(g) = grammar.as_mut() {
+                g.advance(next_tok);
+            }
+            out.push(next_tok);
+            history.push(next_tok);
+            if Some(next_tok) == eos {
+                break;
+            }
+            mm.forward_one(next_tok as i32, &mut cache, &mut logits);
+        }
+        Ok(out)
+    }
+
     pub fn generate_token_ids(
         &self,
         prompt_ids: &[i32],
         n_new: u32,
         sampling: &SamplingParams,
     ) -> Result<Vec<u32>> {
+        // F9-tail — canonical Mamba/SSM models decode through the selective-scan
+        // forward, not the transformer backend (the `model` field is a shell).
+        if let Some(mm) = self.mamba.clone() {
+            return self.generate_token_ids_mamba(&mm, prompt_ids, n_new, sampling);
+        }
         let _sycl_guard = install_sycl_dispatch_if_requested();
         rustllama_models::accel::set_flash_attention(self.flash_attention);
         rustllama_models::accel::set_n_gpu_layers(self.n_gpu_layers);
@@ -5800,6 +5878,76 @@ impl CpuEngine {
         .map_err(|e| CpuEngineError::Other(format!("generate task panicked: {e}")))?
     }
 
+    /// F9-tail — streaming counterpart of [`Self::generate_token_ids_mamba`]
+    /// so a canonical Mamba/SSM model is also SERVED (the `serve` / chat paths
+    /// stream through `generate_token_ids_streaming`). Same selective-scan
+    /// forward + shared sampler/grammar glue; emits each decoded token into
+    /// `tx` with incremental detokenization, identical to the transformer
+    /// streaming loop below.
+    fn generate_token_ids_streaming_mamba(
+        &self,
+        mm: &rustllama_models::mamba_arch::MambaModel,
+        prompt_ids: &[i32],
+        sampling: &SamplingParams,
+        logprobs_k: Option<usize>,
+        tx: &tokio::sync::mpsc::Sender<std::result::Result<crate::Token, String>>,
+    ) -> Result<()> {
+        let tokenizer = self
+            .tokenizer
+            .as_deref()
+            .ok_or(CpuEngineError::NoTokenizer("generate_token_ids_streaming"))?;
+        if prompt_ids.is_empty() {
+            return Ok(());
+        }
+        let total_required = prompt_ids.len() + sampling.max_tokens as usize;
+        if total_required > self.max_ctx {
+            return Err(CpuEngineError::PromptTooLong {
+                prompt_len: prompt_ids.len(),
+                max_ctx: self.max_ctx,
+            });
+        }
+        let vocab = mm.cfg.vocab_size;
+        let mut logits = vec![0f32; vocab];
+        let mut cache = rustllama_models::mamba_arch::MambaCache::new(&mm.cfg);
+        let mut history: Vec<u32> = prompt_ids.iter().map(|&t| t as u32).collect();
+        mm.forward_sequence(prompt_ids, &mut cache, &mut logits);
+
+        let mut sampler = Sampler::new(sampling.clone());
+        let mut grammar = self.build_grammar(sampling);
+        let eos = self.model.cfg.eos_token_id;
+        for _ in 0..sampling.max_tokens {
+            if tx.is_closed() {
+                break;
+            }
+            let raw_logits: Option<Vec<f32>> = logprobs_k.map(|_| logits.clone());
+            let next_tok = sampler.sample_with_grammar(&mut logits, &history, grammar.as_ref());
+            if let Some(g) = grammar.as_mut() {
+                g.advance(next_tok);
+            }
+            let token_lp = match (logprobs_k, raw_logits) {
+                (Some(k), Some(raw)) => Some(compute_logprobs(&raw, next_tok, k)),
+                _ => None,
+            };
+            history.push(next_tok);
+            let text = tokenizer.decode_single(next_tok, true).unwrap_or_default();
+            if tx
+                .blocking_send(Ok(crate::Token {
+                    id: next_tok,
+                    text,
+                    logprobs: token_lp,
+                }))
+                .is_err()
+            {
+                break;
+            }
+            if Some(next_tok) == eos {
+                break;
+            }
+            mm.forward_one(next_tok as i32, &mut cache, &mut logits);
+        }
+        Ok(())
+    }
+
     pub fn generate_token_ids_streaming(
         &self,
         prompt_ids: &[i32],
@@ -5807,6 +5955,17 @@ impl CpuEngine {
         logprobs_k: Option<usize>,
         tx: &tokio::sync::mpsc::Sender<std::result::Result<crate::Token, String>>,
     ) -> Result<()> {
+        // F9-tail — canonical Mamba/SSM models stream through the selective-scan
+        // forward (the `model` field is a transformer shell, never executed).
+        if let Some(mm) = self.mamba.clone() {
+            return self.generate_token_ids_streaming_mamba(
+                &mm,
+                prompt_ids,
+                sampling,
+                logprobs_k,
+                tx,
+            );
+        }
         let _sycl_guard = install_sycl_dispatch_if_requested();
         rustllama_models::accel::set_flash_attention(self.flash_attention);
         rustllama_models::accel::set_n_gpu_layers(self.n_gpu_layers);
