@@ -18,7 +18,7 @@ use axum::Json;
 use rustllama_engine::{SamplingParams, Token};
 use serde::{Deserialize, Serialize};
 
-use crate::{model_not_found, AppState, ReqSchedule, Usage};
+use crate::{lora_not_found, model_not_found, AppState, ReqSchedule, Usage};
 
 #[derive(Debug, Deserialize)]
 pub struct CompletionRequest {
@@ -115,6 +115,13 @@ pub struct CompletionRequest {
     /// [`rustllama_engine::GrammarKind::Gbnf`].
     #[serde(default)]
     pub grammar: Option<String>,
+    /// P11 (multi-LoRA) — name of a resident LoRA adapter to apply for this
+    /// request (rustllama extension; the OpenAI `model: "<base>:<adapter>"`
+    /// convention is also accepted and resolved to the same selection). `None`
+    /// = the un-adapted base. An unknown name is a 4xx before generation. See
+    /// [`rustllama_engine::SamplingParams::lora_adapter`].
+    #[serde(default)]
+    pub lora: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,7 +178,11 @@ pub async fn completions(
     // priority into the server scheduler slot. Default (no header) is
     // byte-identical to before.
     let sched = ReqSchedule::from_headers(&headers);
-    let Some(serving) = state.resolve(req.model.as_deref()).await else {
+    // P11: resolve the model honoring the `model: "<base>:<adapter>"` LoRA
+    // convention; `model_adapter` is the adapter peeled from the model string
+    // (if any). The explicit `lora` field (set in `build_sampling`) takes
+    // precedence over it.
+    let Some((serving, model_adapter)) = state.resolve_with_lora(req.model.as_deref()).await else {
         return model_not_found(req.model.as_deref());
     };
     // P15: validate a supplied GBNF `grammar` up front so a malformed grammar
@@ -228,6 +239,18 @@ pub async fn completions(
         Err(be) => return be.into_response(),
     };
     let mut sampling = build_sampling(&req);
+    // P11: explicit `lora` field (already set by `build_sampling`) wins; else
+    // fall back to the `model:adapter` convention. Then validate the final
+    // selection against the resolved engine — an unknown adapter is a clean 404,
+    // never a silent base serve.
+    if sampling.lora_adapter.is_none() {
+        sampling.lora_adapter = model_adapter;
+    }
+    if let Some(name) = sampling.lora_adapter.as_deref() {
+        if !serving.engine.has_lora_adapter(name) {
+            return lora_not_found(name);
+        }
+    }
     let model = req
         .model
         .clone()
@@ -922,6 +945,12 @@ fn build_sampling(req: &CompletionRequest) -> SamplingParams {
     // compiled by the engine when the sampler builds its mask.
     if let Some(g) = req.grammar.as_ref().filter(|g| !g.trim().is_empty()) {
         s.grammar = Some(rustllama_engine::GrammarKind::Gbnf { grammar: g.clone() });
+    }
+    // P11: explicit `lora` field selects a resident adapter for this request.
+    // The `model: "<base>:<adapter>"` convention is layered on top by the
+    // handler (which sets this when the field is absent). Empty ⇒ base.
+    if let Some(a) = req.lora.as_ref().filter(|a| !a.trim().is_empty()) {
+        s.lora_adapter = Some(a.clone());
     }
     s
 }

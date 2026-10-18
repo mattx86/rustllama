@@ -18,7 +18,7 @@ use rustllama_engine::{ChatMessage, SamplingParams};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::{model_not_found, AppState, ReqSchedule, StreamOptions, Usage};
+use crate::{lora_not_found, model_not_found, AppState, ReqSchedule, ServingModel, StreamOptions, Usage};
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
@@ -153,6 +153,12 @@ pub struct ChatRequest {
     /// [`rustllama_engine::GrammarKind::Gbnf`].
     #[serde(default)]
     pub grammar: Option<String>,
+    /// P11 (multi-LoRA) — name of a resident LoRA adapter to apply for this
+    /// request (rustllama extension; the OpenAI `model: "<base>:<adapter>"`
+    /// convention is also accepted). `None` = the un-adapted base. An unknown
+    /// name is a 4xx before generation (never a silent base serve).
+    #[serde(default)]
+    pub lora: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -835,7 +841,8 @@ fn wire_messages_to_json(messages: &[ChatMessageWire]) -> Vec<Value> {
 }
 
 async fn chat_with_tools(state: AppState, req: ChatRequest, sched: ReqSchedule) -> Response {
-    let Some(serving) = state.resolve(req.model.as_deref()).await else {
+    let Some((serving, lora_model_adapter)) = state.resolve_with_lora(req.model.as_deref()).await
+    else {
         return model_not_found(req.model.as_deref());
     };
     // Two-phase admission: tokenizer access + chat-template render +
@@ -871,6 +878,9 @@ async fn chat_with_tools(state: AppState, req: ChatRequest, sched: ReqSchedule) 
     };
 
     let mut sampling = build_sampling(&req);
+    if let Some(resp) = finalize_lora(&mut sampling, &serving, lora_model_adapter) {
+        return resp;
+    }
     let model_id = req
         .model
         .clone()
@@ -1070,7 +1080,8 @@ async fn chat_with_tools(state: AppState, req: ChatRequest, sched: ReqSchedule) 
 /// chat template's `tools` branch, drives a token stream, and emits OpenAI-
 /// compatible `tool_calls` deltas as `<tool_call>` blocks complete.
 async fn chat_stream_with_tools(state: AppState, req: ChatRequest, sched: ReqSchedule) -> Response {
-    let Some(serving) = state.resolve(req.model.as_deref()).await else {
+    let Some((serving, lora_model_adapter)) = state.resolve_with_lora(req.model.as_deref()).await
+    else {
         return model_not_found(req.model.as_deref());
     };
     // Two-phase admission — tokenization + chat-template render with
@@ -1143,6 +1154,9 @@ async fn chat_stream_with_tools(state: AppState, req: ChatRequest, sched: ReqSch
     };
 
     let mut sampling = build_sampling(&req);
+    if let Some(resp) = finalize_lora(&mut sampling, &serving, lora_model_adapter) {
+        return resp;
+    }
     // Engage the tool-call stream grammar when concrete per-tool
     // schemas are available. The grammar guarantees that any
     // `<tool_call>...</tool_call>` block contains well-formed JSON
@@ -2378,7 +2392,34 @@ fn build_sampling(req: &ChatRequest) -> SamplingParams {
             s.grammar = Some(rustllama_engine::GrammarKind::Gbnf { grammar: g.clone() });
         }
     }
+    // P11: explicit `lora` field selects a resident adapter (the `model:adapter`
+    // convention is layered on by the handler when this is absent). Empty ⇒ base.
+    if let Some(a) = req.lora.as_ref().filter(|a| !a.trim().is_empty()) {
+        s.lora_adapter = Some(a.clone());
+    }
     s
+}
+
+/// P11 (chat) — finalize + validate the per-request LoRA selection on
+/// `sampling`: the explicit `lora` field (already set by `build_sampling`) wins;
+/// otherwise the adapter peeled from the `model: "<base>:<adapter>"` string
+/// (`model_adapter`) is used. Returns a 404 [`Response`] when a named adapter is
+/// not resident on `serving` (never a silent base serve); `None` means the
+/// selection is valid (base or a resident adapter) and generation may proceed.
+fn finalize_lora(
+    sampling: &mut SamplingParams,
+    serving: &ServingModel,
+    model_adapter: Option<String>,
+) -> Option<Response> {
+    if sampling.lora_adapter.is_none() {
+        sampling.lora_adapter = model_adapter;
+    }
+    if let Some(name) = sampling.lora_adapter.as_deref() {
+        if !serving.engine.has_lora_adapter(name) {
+            return Some(lora_not_found(name));
+        }
+    }
+    None
 }
 
 /// Validate the request's `response_format` at the boundary. Returns
@@ -2613,7 +2654,8 @@ fn request_id() -> String {
 }
 
 async fn chat_blocking(state: AppState, req: ChatRequest, sched: ReqSchedule) -> Response {
-    let Some(serving) = state.resolve(req.model.as_deref()).await else {
+    let Some((serving, lora_model_adapter)) = state.resolve_with_lora(req.model.as_deref()).await
+    else {
         return model_not_found(req.model.as_deref());
     };
     // Two-phase admission — see `chat_stream` for the rationale.
@@ -2626,6 +2668,9 @@ async fn chat_blocking(state: AppState, req: ChatRequest, sched: ReqSchedule) ->
         Err(be) => return be.into_response(),
     };
     let mut sampling = build_sampling(&req);
+    if let Some(resp) = finalize_lora(&mut sampling, &serving, lora_model_adapter) {
+        return resp;
+    }
     let model = req.model.unwrap_or_else(|| serving.model_id.clone());
     let want_logprobs = sampling.logprobs.is_some();
     let msgs: Vec<ChatMessage> = match wire_messages_to_engine(req.messages) {
@@ -2876,7 +2921,8 @@ fn make_token_logprob_out(
 }
 
 async fn chat_stream(state: AppState, req: ChatRequest, sched: ReqSchedule) -> Response {
-    let Some(serving) = state.resolve(req.model.as_deref()).await else {
+    let Some((serving, lora_model_adapter)) = state.resolve_with_lora(req.model.as_deref()).await
+    else {
         return model_not_found(req.model.as_deref());
     };
     // Two-phase admission: try_admit() runs the backpressure check
@@ -2893,6 +2939,9 @@ async fn chat_stream(state: AppState, req: ChatRequest, sched: ReqSchedule) -> R
         Err(be) => return be.into_response(),
     };
     let mut sampling = build_sampling(&req);
+    if let Some(resp) = finalize_lora(&mut sampling, &serving, lora_model_adapter) {
+        return resp;
+    }
     let model = req.model.unwrap_or_else(|| serving.model_id.clone());
     let id = request_id();
     let cancel_guard = state.register_cancel(&id);

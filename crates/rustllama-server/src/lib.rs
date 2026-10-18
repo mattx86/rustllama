@@ -1138,6 +1138,88 @@ pub fn model_not_found(requested: Option<&str>) -> Response {
     )
 }
 
+/// P11 — a named LoRA adapter is not resident on the resolved model. A clean
+/// 404 so a client that selected an unknown adapter sees the error rather than
+/// being silently served the un-adapted base.
+pub fn lora_not_found(name: &str) -> Response {
+    openai_error(
+        StatusCode::NOT_FOUND,
+        format!(
+            "LoRA adapter '{name}' is not loaded on this model. \
+             Load it via POST /v1/lora/load (see GET /v1/lora for resident adapters)."
+        ),
+        "invalid_request_error",
+        Some("lora_adapter_not_found"),
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct LoadLoraRequest {
+    /// Registry name to register the adapter under — the selector a later
+    /// request names via the `lora` field or the `model: "<base>:<name>"`
+    /// convention.
+    name: String,
+    /// Filesystem path to the adapter GGUF (`adapter.type = "lora"`).
+    path: String,
+    /// Which loaded model to attach the adapter to. `None` = the default model.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// P11 — `POST /v1/lora/load`: attach a resident LoRA adapter (UNMERGED) to a
+/// loaded model's engine. Mirrors `POST /v1/models/load`'s shape. The adapter
+/// stays separate from the base weights and is selected per request.
+async fn load_lora_adapter(
+    State(state): State<AppState>,
+    Json(req): Json<LoadLoraRequest>,
+) -> Response {
+    let Some(serving) = state.resolve(req.model.as_deref()).await else {
+        return model_not_found(req.model.as_deref());
+    };
+    let path = std::path::PathBuf::from(&req.path);
+    match serving.engine.attach_lora_adapter(&req.name, &path) {
+        Ok(n) => Json(serde_json::json!({
+            "object": "lora.adapter",
+            "name": req.name,
+            "adapted_tensors": n,
+            "model": serving.model_id,
+        }))
+        .into_response(),
+        Err(e) => openai_error(
+            StatusCode::BAD_REQUEST,
+            format!("LoRA adapter load failed: {e}"),
+            "invalid_request_error",
+            Some("lora_load_failed"),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ListLoraQuery {
+    /// Which loaded model's resident adapters to list. `None` = default model.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// P11 — `GET /v1/lora[?model=<id>]`: list the resident adapter names on a
+/// loaded model's engine.
+async fn list_lora_adapters(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ListLoraQuery>,
+) -> Response {
+    let Some(serving) = state.resolve(q.model.as_deref()).await else {
+        return model_not_found(q.model.as_deref());
+    };
+    let mut names = serving.engine.lora_adapter_names();
+    names.sort();
+    Json(serde_json::json!({
+        "object": "list",
+        "model": serving.model_id,
+        "data": names,
+    }))
+    .into_response()
+}
+
 impl AppState {
     /// Elastic expert-cache budget (roadmap Phase 3): hot-apply a new
     /// `moe_expert_cache_mb` to every loaded CPU-engine model at a
@@ -1377,6 +1459,31 @@ impl AppState {
         Some(model)
     }
 
+    /// P11 — resolve a request's `model` string into a serving model plus an
+    /// optional LoRA adapter selection via the OpenAI `"<base>:<adapter>"`
+    /// convention. The WHOLE string is tried as a model name first, so a real
+    /// model named with a `:` still resolves; only on a miss is the string split
+    /// at the LAST `:` into `(base, adapter)` — and that is accepted ONLY when
+    /// `base` resolves AND has `adapter` resident. A `base:adapter` where the
+    /// base is known but the adapter is not returns `None`, so the caller 404s
+    /// on the combined string (never a silent base serve). The explicit request
+    /// `lora` field (handled by the caller) takes precedence over this.
+    pub async fn resolve_with_lora(
+        &self,
+        model_id: Option<&str>,
+    ) -> Option<(ServingModel, Option<String>)> {
+        if let Some(sm) = self.resolve(model_id).await {
+            return Some((sm, None));
+        }
+        let (base, adapter) = model_id?.rsplit_once(':')?;
+        let sm = self.resolve(Some(base)).await?;
+        if sm.engine.has_lora_adapter(adapter) {
+            Some((sm, Some(adapter.to_string())))
+        } else {
+            None
+        }
+    }
+
     /// Convenience: snapshot of the current default model. Kept for
     /// handlers that don't accept a `model` field (healthz, /api/tags).
     /// Bumps the model's `last_used` stamp like [`Self::resolve`].
@@ -1584,6 +1691,10 @@ pub fn router_with_cors(state: AppState, cors_origins: &[String]) -> Router {
         .route("/v1/models/load", post(load_model))
         .route("/v1/models/unload", post(unload_model))
         .route("/v1/models/:id", get(get_model))
+        // P11 — resident LoRA adapters: list + attach (load UNMERGED). Mirrors
+        // the model load/list endpoints' shape.
+        .route("/v1/lora", get(list_lora_adapters))
+        .route("/v1/lora/load", post(load_lora_adapter))
         // Read-only metadata probe for a cached GGUF (loaded or not).
         // The GUI Models page hits this when the user clicks "Inspect"
         // on a cached row to see arch / size / dtype histogram without
