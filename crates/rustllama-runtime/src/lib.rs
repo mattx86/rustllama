@@ -463,7 +463,7 @@ pub fn cpu_info() -> CpuInfo {
 /// Windows too. For a single-GPU host this is that GPU's utilization;
 /// multi-GPU per-adapter attribution (via the counter's LUID) is a
 /// follow-up. Blocks ~120 ms for the two-sample rate. `None` on any PDH
-/// failure. Non-Windows always returns `None`.
+/// failure. Linux/macOS always returns `None`.
 #[cfg(windows)]
 pub fn gpu_busy_pct() -> Option<f32> {
     use windows_sys::Win32::System::Performance::{
@@ -572,7 +572,7 @@ pub fn gpu_busy_pct() -> Option<f32> {
 /// suffices (unlike the rate-based utilization counter). For a single-GPU
 /// host this is that GPU's memory; multi-GPU per-adapter attribution (via
 /// the counter's LUID) is a follow-up. `None` on any PDH failure.
-/// Non-Windows always returns `None`.
+/// Linux/macOS always returns `None`.
 #[cfg(windows)]
 pub fn gpu_mem_used_bytes() -> Option<u64> {
     use windows_sys::Win32::System::Performance::{

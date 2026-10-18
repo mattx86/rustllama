@@ -27,15 +27,16 @@
 //!   - `<CUDA_PATH>\bin`                      — cudart / nvcc runtime
 //!     (NVIDIA hosts; harmless no-op where absent)
 //!
-//! Non-Windows is a no-op: the ELF loader reads `LD_LIBRARY_PATH` only
-//! at exec time, so an in-process prepend has no effect — Linux GPU
-//! path resolution is handled via rpath / dlopen (Milestone 2).
+//! Linux/macOS is a no-op: their dynamic loaders read the library search
+//! env (`LD_LIBRARY_PATH` on Linux, `DYLD_*` on macOS) only at exec time,
+//! so an in-process prepend has no effect — GPU path resolution there is
+//! handled via rpath / dlopen (Milestone 2).
 
 use std::sync::OnceLock;
 
 /// Idempotently prepend the autodetected GPU-runtime directories to the
 /// process `PATH` (Windows). Safe to call from every entry point; the
-/// work runs once. No-op on non-Windows and when no toolkit is found.
+/// work runs once. No-op on Linux/macOS and when no toolkit is found.
 pub fn ensure_gpu_dll_search_paths() {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {

@@ -3022,7 +3022,7 @@ using rsl_zeMemFree_fn = rsl_ze_result_t (*)(
 // Process-singleton loader for the two L0 entry points we use. The
 // constructor runs once (via the meyers-singleton pattern in a
 // `static` local) and resolves `zeMemAllocHost` + `zeMemFree` from
-// `ze_loader.dll`. On non-Windows or when the DLL / symbols are
+// `ze_loader.dll`. On Linux/macOS or when the DLL / symbols are
 // missing, `available` stays false and every subsequent
 // `rsl_try_import_*` call returns the "L0 unavailable" code.
 struct L0ImportLoader {

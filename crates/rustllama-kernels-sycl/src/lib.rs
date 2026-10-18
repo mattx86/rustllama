@@ -1962,7 +1962,7 @@ mod imp {
     /// `rustllama_runtime::ensure_gpu_dll_search_paths` has prepended the
     /// oneAPI dirs to the search path) and cache the result; a failure is
     /// reported to callers as "no device" so the engine falls back to CPU
-    /// cleanly. Non-Windows builds link the shared object normally and
+    /// cleanly. Linux/macOS builds link the shared object normally and
     /// have nothing to probe (a missing `.so` fails at exec).
     #[cfg(windows)]
     fn sycl_runtime_loadable() -> bool {
@@ -8673,7 +8673,7 @@ pub struct SyclSharedBuffer<'s, T: Copy> {
     /// Windows memory-residency: set once [`Self::pin`] VirtualLocks the
     /// allocation into the working set so the OS can't page this USM
     /// region (which on an iGPU is host RAM) to the pagefile. `Drop`
-    /// VirtualUnlocks when set. Always `false` on non-Windows / unpinned.
+    /// VirtualUnlocks when set. Always `false` on Linux/macOS / unpinned.
     locked_bytes: usize,
 }
 
@@ -8845,7 +8845,7 @@ impl<'s, T: Copy> SyclSharedBuffer<'s, T> {
     /// Windows: VirtualLock this allocation into the working set so the
     /// OS can't page it to the pagefile (USM-shared is host RAM on an
     /// iGPU). Self-gated by `RUSTLLAMA_LOCK_USM` + `RUSTLLAMA_LOCK_USM_MB`
-    /// budget; a no-op when disabled, over budget, or on non-Windows.
+    /// budget; a no-op when disabled, over budget, or on Linux/macOS.
     /// Idempotent. Returns true if the allocation is now pinned.
     pub fn pin(&mut self) -> bool {
         #[cfg(windows)]

@@ -265,10 +265,11 @@ pub struct CpuEngine {
     /// latest image; the KV prefix cache handles deeper reuse for
     /// non-hybrid models.
     vision_feature_memo: Arc<Mutex<Option<(u64, Vec<Vec<f32>>)>>>,
-    /// Windows memory-residency: VirtualLock'd hot-weight ranges that
-    /// keep the model resident in RAM (off the pagefile). `Some` when
+    /// RAM-residency: hot-weight ranges locked into RAM (off the
+    /// pagefile/swap) via `VirtualLock` on Windows and `mlock` on
+    /// Linux/macOS (the POSIX path added in M7). `Some` when
     /// `RUSTLLAMA_LOCK_RAM_MB` is set and at least one range was locked;
-    /// `None` otherwise (disabled, non-Windows, or nothing lockable).
+    /// `None` otherwise (disabled or nothing lockable).
     /// `Arc`-shared so `fork_for_concurrent_use` clones inherit the same
     /// locks (the forked engines share the parent's `Arc<LlamaModel>`,
     /// so the pages are already pinned) and the ranges unlock only when
@@ -1683,7 +1684,7 @@ impl CpuEngine {
             let _ = zc_borrowed_tensors;
             tracing::info!(
                 model_id = %model_id,
-                "released GGUF mmap after load (non-Windows: OS reclaims unmapped pages lazily)"
+                "released GGUF mmap after load (Linux/macOS: OS reclaims unmapped pages lazily)"
             );
         }
 

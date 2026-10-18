@@ -1211,8 +1211,8 @@ pub struct ServerConfig {
     pub rate_limit_per_minute: u32,
     /// Process memory cap in MiB, enforced via the Windows Job Object
     /// sandbox. The OS kills the process if its working set exceeds
-    /// this. `0` (default) disables the cap; on non-Windows targets
-    /// the field is accepted but ignored.
+    /// this. `0` (default) disables the cap; on Linux/macOS the field
+    /// is accepted but ignored.
     ///
     /// Defends against a malformed GGUF triggering a runaway
     /// allocation. 32 GiB is the recommended default for production;

@@ -24,10 +24,10 @@
 //! self-attached job, and the Windows kernel cleans up on process
 //! exit anyway. The leak is one HANDLE per process, ~16 bytes.
 //!
-//! On non-Windows targets (Linux, macOS — which we don't ship today
-//! but the workspace builds on for `cargo check`), this module is a
-//! no-op that always returns `Ok`. A Linux equivalent using cgroups
-//! v2 + `prctl(PR_SET_PDEATHSIG)` would be a follow-up.
+//! On Linux and macOS (which we don't ship a sandbox for today but the
+//! workspace builds on for `cargo check`), this module is a no-op that
+//! always returns `Ok`. A Linux equivalent using cgroups v2 +
+//! `prctl(PR_SET_PDEATHSIG)` would be a follow-up.
 
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
@@ -70,7 +70,7 @@ impl Default for SandboxConfig {
 
 /// Attach the current process to a Job Object with the configured
 /// limits. Idempotent: calling twice is a no-op (the global handle
-/// holds the first call's job). Returns Ok on non-Windows targets.
+/// holds the first call's job). Returns Ok on Linux/macOS.
 ///
 /// Typical call site: `cli::serve` and `app::main` (GUI) at startup,
 /// after argv parsing but before the engine loads. The job's
@@ -83,7 +83,7 @@ pub fn install(cfg: SandboxConfig) -> Result<(), SandboxError> {
     #[cfg(not(windows))]
     {
         let _ = cfg;
-        // Non-Windows: pretend it worked. Linux cgroup + macOS sandbox
+        // Linux/macOS: pretend it worked. Linux cgroup + macOS sandbox
         // equivalents are a follow-up; the v1 target is Windows-only.
         Ok(())
     }

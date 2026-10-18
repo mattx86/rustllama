@@ -543,10 +543,11 @@ impl Drop for LockRegistry {
     }
 }
 
-/// Lock the model's hot weight tiers into RAM per `RUSTLLAMA_LOCK_RAM_MB`.
-/// Returns `Some(registry)` when any range was locked (caller stores it
-/// on the engine so it unlocks on drop), `None` when disabled, on a
-/// non-Windows target, or when nothing could be locked.
+/// Windows page-lock: `VirtualLock` the model's hot weight tiers into the
+/// process working set per `RUSTLLAMA_LOCK_RAM_MB` (Linux/macOS have their own
+/// `mlock` twin below). Returns `Some(registry)` when any range was locked
+/// (caller stores it on the engine so it unlocks on drop), `None` when disabled
+/// or when nothing could be locked.
 #[cfg(windows)]
 pub fn lock_model_into_ram(model: Arc<LlamaModel>) -> Option<LockRegistry> {
     let budget_kind = lock_ram_budget();

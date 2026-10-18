@@ -319,7 +319,7 @@ fn build_cuda_stub(manifest: &std::path::Path, out: &std::path::Path) {
     std::fs::write(&stub_c, &c).expect("write rsl_cuda_stub.c");
 
     // Compile the no-op TU, then archive it. macOS `cc` is clang and `ar`
-    // supports `crs`, matching the non-Windows archiving of the real path.
+    // supports `crs`, matching the Linux/macOS archiving of the real path.
     // `-arch arm64|x86_64` lets a cross-arch build (`cargo build --target
     // {aarch64,x86_64}-apple-darwin`) compile the stub for the requested Mac
     // arch, matching what rustc emits (Rust says `aarch64`, clang says

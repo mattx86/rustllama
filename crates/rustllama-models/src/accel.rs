@@ -3297,7 +3297,7 @@ pub fn try_moe_ffn_grouped_dev_resident(
 
 /// Raw `VirtualLock`/`VirtualUnlock` for the expert-pin cache. The
 /// models crate has no `windows-sys` dep, so we declare the two calls
-/// inline (matching the kernels-sycl `usm_pin` pattern). Non-Windows
+/// inline (matching the kernels-sycl `usm_pin` pattern). Linux/macOS
 /// is a no-op (returns "not locked").
 #[cfg(windows)]
 mod expert_mem_lock {
@@ -4441,7 +4441,7 @@ pub fn expert_prepin(ranked: &[ExpertKey], max_bytes: u64) -> (usize, u64) {
 
 /// Advisory `PrefetchVirtualMemory` for the readahead thread. The
 /// models crate has no `windows-sys` dep, so the two calls are
-/// declared inline (same pattern as `expert_mem_lock`). Non-Windows
+/// declared inline (same pattern as `expert_mem_lock`). Linux/macOS
 /// is a no-op.
 #[cfg(windows)]
 mod expert_prefetch_sys {
@@ -6158,7 +6158,7 @@ pub fn mark_packed_weights_preloaded() {
 ///       primitive or to skip the import path entirely
 ///
 /// Idempotent: only runs once per process. Safe to call on
-/// non-Windows or with no USM context — both early-return.
+/// Linux/macOS or with no USM context — both early-return.
 pub fn probe_l0_import_once() {
     static PROBED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     PROBED.get_or_init(|| {
@@ -6178,7 +6178,7 @@ pub fn probe_l0_import_once() {
         #[cfg(not(target_os = "windows"))]
         {
             tracing::debug!(
-                "L0 import probe skipped: non-Windows target (Win32 file mapping path)"
+                "L0 import probe skipped: Linux/macOS target (Win32 file mapping path)"
             );
         }
     });
