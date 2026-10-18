@@ -987,6 +987,12 @@ pub struct OllamaOptions {
     /// Dynamic-temperature (dynatemp). `0` range disables.
     pub dynatemp_range: Option<f32>,
     pub dynatemp_exponent: Option<f32>,
+    /// P11 (Ollama LoRA) — select a resident LoRA adapter by registry name.
+    /// This is the `options`-object slot (the natural carrier for Ollama
+    /// sampler params), matching the OpenAI `lora` field name. The
+    /// `model: "<base>:<adapter>"` convention is the other accepted selector;
+    /// this explicit field wins when both are present. Empty / absent ⇒ base.
+    pub lora: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -1017,7 +1023,12 @@ pub async fn chat(
         )
             .into_response();
     }
-    let Some(serving) = state.resolve(req.model.as_deref()).await else {
+    // P11 (Ollama LoRA): resolve supports the `model: "<base>:<adapter>"`
+    // convention (via `resolve_with_lora`); `lora_model_adapter` is the adapter
+    // peeled from that string, finalized below (the explicit `options.lora`
+    // field wins over it).
+    let Some((serving, lora_model_adapter)) = state.resolve_with_lora(req.model.as_deref()).await
+    else {
         return ollama_model_not_found(req.model.as_deref());
     };
     // Tools present → dedicated non-streaming tool path: render the tools
@@ -1026,9 +1037,15 @@ pub async fn chat(
     // tool_calls array in the message, so a single non-streamed response
     // is the right shape.
     if req.tools.as_ref().map(|t| !t.is_null()).unwrap_or(false) {
-        return ollama_chat_with_tools(state, serving, req, sched).await;
+        return ollama_chat_with_tools(state, serving, req, sched, lora_model_adapter).await;
     }
     let mut sampling = sampling_from_options(req.options.as_ref());
+    // P11 (Ollama LoRA): validate the per-request adapter selection (explicit
+    // `options.lora` or the `model:adapter` convention). A named-but-unresident
+    // adapter 404s here instead of silently serving the base.
+    if let Some(resp) = finalize_lora_ollama(&mut sampling, &serving, lora_model_adapter) {
+        return resp;
+    }
     // Native `format` structured output (JSON mode / schema). No tools on this
     // path, so the format grammar always applies when present.
     if sampling.grammar.is_none() {
@@ -1122,6 +1139,7 @@ async fn ollama_chat_with_tools(
     serving: crate::ServingModel,
     req: OllamaChatRequest,
     sched: ReqSchedule,
+    lora_model_adapter: Option<String>,
 ) -> Response {
     let tools_value = req.tools.clone().unwrap_or(Value::Null);
     let model_id = req
@@ -1163,6 +1181,12 @@ async fn ollama_chat_with_tools(
     // Engage the tool-call grammar (Ollama has no `tool_choice`, so no
     // min-completed floor).
     let mut sampling = sampling_from_options(req.options.as_ref());
+    // P11 (Ollama LoRA): validate the selection on the tools path too — the
+    // explicit `options.lora` field or the `model:adapter` convention. Unknown
+    // adapter 404s instead of serving the base.
+    if let Some(resp) = finalize_lora_ollama(&mut sampling, &serving, lora_model_adapter) {
+        return resp;
+    }
     if sampling.grammar.is_none() {
         let schemas = crate::chat::extract_tool_schemas(&tools_value);
         if !schemas.is_empty() {
@@ -1663,10 +1687,18 @@ pub async fn generate(
 ) -> Response {
     // P14-http: parse the optional priority / deadline headers once.
     let sched = ReqSchedule::from_headers(&headers);
-    let Some(serving) = state.resolve(req.model.as_deref()).await else {
+    // P11 (Ollama LoRA): `resolve_with_lora` supports the `model:adapter`
+    // convention; `lora_model_adapter` is finalized below.
+    let Some((serving, lora_model_adapter)) = state.resolve_with_lora(req.model.as_deref()).await
+    else {
         return ollama_model_not_found(req.model.as_deref());
     };
     let mut sampling = sampling_from_options(req.options.as_ref());
+    // P11 (Ollama LoRA): validate the per-request adapter selection; unknown ⇒
+    // 404 (never a silent base serve).
+    if let Some(resp) = finalize_lora_ollama(&mut sampling, &serving, lora_model_adapter) {
+        return resp;
+    }
     // Native `format` structured output (JSON mode / schema).
     if sampling.grammar.is_none() {
         if let Some(g) = grammar_from_ollama_format(req.format.as_ref()) {
@@ -2005,7 +2037,55 @@ fn sampling_from_options(opts: Option<&OllamaOptions>) -> SamplingParams {
     if let Some(de) = o.dynatemp_exponent {
         s.dynatemp_exponent = de;
     }
+    // P11 (Ollama LoRA): the explicit `options.lora` selector. Non-empty ⇒
+    // request a resident adapter by name (validated by `finalize_lora_ollama`,
+    // which 404s on an unknown one — never a silent base serve). Empty/absent
+    // leaves `lora_adapter = None` (base, byte-identical).
+    if let Some(a) = o.lora.as_ref().filter(|a| !a.trim().is_empty()) {
+        s.lora_adapter = Some(a.clone());
+    }
     s
+}
+
+/// P11 (Ollama) — a named LoRA adapter is not resident on the resolved model.
+/// Ollama's error shape (flat `{"error": ...}`, 404), so an Ollama client that
+/// selected an unknown adapter sees the error rather than being silently served
+/// the un-adapted base. The Ollama analogue of [`crate::lora_not_found`].
+fn ollama_lora_not_found(name: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": format!(
+                "LoRA adapter '{name}' is not loaded on this model; load it via \
+                 POST /v1/lora/load (GET /v1/lora lists resident adapters)"
+            )
+        })),
+    )
+        .into_response()
+}
+
+/// P11 (Ollama) — finalize + validate the per-request LoRA selection on
+/// `sampling`, mirroring `chat::finalize_lora` but with Ollama's error shape.
+/// The explicit `options.lora` field (already set on `sampling` by
+/// `sampling_from_options`) wins; otherwise the adapter peeled from the
+/// `model: "<base>:<adapter>"` string (`model_adapter`, from
+/// `resolve_with_lora`) is used. Returns an Ollama-shaped 404 when a named
+/// adapter is not resident; `None` means the selection is valid (base or a
+/// resident adapter) and generation may proceed.
+fn finalize_lora_ollama(
+    sampling: &mut SamplingParams,
+    serving: &crate::ServingModel,
+    model_adapter: Option<String>,
+) -> Option<Response> {
+    if sampling.lora_adapter.is_none() {
+        sampling.lora_adapter = model_adapter;
+    }
+    if let Some(name) = sampling.lora_adapter.as_deref() {
+        if !serving.engine.has_lora_adapter(name) {
+            return Some(ollama_lora_not_found(name));
+        }
+    }
+    None
 }
 
 /// Map Ollama's native `format` field to a sampling grammar, reusing the

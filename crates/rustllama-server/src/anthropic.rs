@@ -459,7 +459,7 @@ pub async fn messages(State(state): State<AppState>, Json(req): Json<MessagesReq
             .map(tools_have_cache_control)
             .unwrap_or(false);
 
-    let sampling = build_sampling(SamplingInputs {
+    let mut sampling = build_sampling(SamplingInputs {
         temperature,
         top_p,
         top_k,
@@ -485,9 +485,24 @@ pub async fn messages(State(state): State<AppState>, Json(req): Json<MessagesReq
         msgs.push(ChatMessage::text(m.role, m.content.into_text()));
     }
 
-    let Some(serving) = state.resolve(req_model.as_deref()).await else {
+    // P11 (Anthropic LoRA): the `model: "<base>:<adapter>"` convention is the
+    // only natural adapter carrier on /v1/messages (there is no `lora` field).
+    // `resolve_with_lora` returns the adapter ONLY when it is resident — an
+    // unknown `base:adapter` resolves to None here → a clean `model_not_found`
+    // 404 (the same error envelope this adapter already uses), never a silent
+    // base serve.
+    let Some((serving, lora_model_adapter)) = state.resolve_with_lora(req_model.as_deref()).await
+    else {
         return model_not_found(req_model.as_deref());
     };
+    // Defense in depth, mirroring `chat::finalize_lora`: re-validate residency
+    // before scoping (a 404 on an unknown adapter rather than a base serve).
+    if let Some(name) = lora_model_adapter.as_deref() {
+        if !serving.engine.has_lora_adapter(name) {
+            return crate::lora_not_found(name);
+        }
+    }
+    sampling.lora_adapter = lora_model_adapter;
     let model = req_model.unwrap_or_else(|| serving.model_id.clone());
     let id = format!("msg_{:032x}", unix_ts() as u128);
 

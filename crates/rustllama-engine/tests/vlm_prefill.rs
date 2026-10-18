@@ -399,6 +399,113 @@ fn parallel_vision_pipeline_with_two_images_matches_sequential_prefill() {
     let _ = std::fs::remove_file(&mmproj_path);
 }
 
+/// P11 (VLM LoRA wiring) — a VLM chat request RESOLVES its per-request LoRA
+/// selection against the registry and SCOPES it for the generation, instead of
+/// silently serving the un-adapted base (the bug this fixes: `chat_vlm_stream`
+/// built the generation but never resolved/scoped `sampling.lora_adapter`).
+///
+/// Observed asymmetry pins the fix:
+///   - a VLM request naming an UNKNOWN adapter FAILS the request — proving the
+///     VLM path now consults the adapter registry (pre-fix it ignored the
+///     field entirely and served the base);
+///   - a VLM request naming a RESIDENT adapter is ACCEPTED (resolved + scoped)
+///     — no unknown-adapter / VisionNotSupported error;
+///   - a base VLM request (no adapter) is still accepted.
+///
+/// WRITE-BLIND for a full output-difference e2e: the synth GPT-2 BPE tokenizer
+/// renders the chat template to zero token ids, so `drive_vlm_generation`
+/// returns before any forward runs (same property the routing test above
+/// relies on). The adapter DELTA math is pinned bit-level in the models-crate
+/// `lora` tests + the text-path `lora_engine.rs`; here the VLM-layer claim is
+/// that NAME → resolved-against-registry + scoped (or a clean failure).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vlm_chat_resolves_and_scopes_lora_adapter() {
+    use futures::StreamExt;
+    use rustllama_engine::{ChatMessage, Engine, SamplingParams};
+    use rustllama_gguf::synth::{write_synthetic_lora_adapter_gguf, SynthLoraAdapter};
+
+    let (engine, _img_id, text_path, mmproj_path) = build_vlm_engine("vlm-lora");
+
+    // Attach one resident adapter. Its forward-time tensor shapes are irrelevant
+    // to THIS test (the empty synth prompt returns before any forward), so the
+    // default-shaped synth adapter is fine — `attach_lora_adapter` only loads +
+    // registers it (shape matching happens at apply time, which never runs).
+    let adapter = std::env::temp_dir().join("rustllama-vlm-prefill-lora-ad.gguf");
+    write_synthetic_lora_adapter_gguf(
+        &adapter,
+        &SynthLoraAdapter {
+            base: SynthLlama::default(),
+            rank: 8,
+            alpha: 32.0,
+            seed: 0xC0FFEE,
+        },
+    );
+    assert!(
+        engine
+            .attach_lora_adapter("tune-a", &adapter)
+            .expect("attach")
+            > 0,
+        "adapter must register at least one tensor"
+    );
+    assert!(engine.has_lora_adapter("tune-a"));
+    assert!(!engine.has_lora_adapter("ghost"));
+
+    let img_msg = || ChatMessage {
+        role: "user".into(),
+        content: "describe this".into(),
+        images: vec![make_test_png(21)],
+    };
+    let sampling = |lora: Option<&str>| SamplingParams {
+        temperature: 0.0,
+        top_p: 0.0,
+        top_k: 0,
+        max_tokens: 4,
+        lora_adapter: lora.map(|s| s.to_string()),
+        ..Default::default()
+    };
+
+    // (a) THE BUG FIX: a VLM request naming an UNKNOWN adapter must FAIL fast —
+    // `chat_vlm_stream` resolves `lora_adapter_for` before spawning, so an
+    // unknown name errors here instead of being ignored and serving the base.
+    let m = img_msg();
+    let unknown = engine.chat(std::slice::from_ref(&m), &sampling(Some("ghost")));
+    assert!(
+        unknown.is_err(),
+        "VLM + unknown adapter must fail the request, never silently serve the base"
+    );
+
+    // (b) a VLM request naming a RESIDENT adapter is accepted (resolved +
+    // scoped): the call succeeds and the stream drains without an
+    // unknown-adapter / VisionNotSupported error.
+    let m = img_msg();
+    let mut stream = engine
+        .chat(std::slice::from_ref(&m), &sampling(Some("tune-a")))
+        .expect("VLM + resident adapter must be accepted");
+    while let Some(item) = stream.next().await {
+        if let Err(e) = item {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("does not support image inputs"),
+                "resident-adapter VLM request must not hit the vision reject: {msg}"
+            );
+            assert!(
+                !msg.to_lowercase().contains("unknown lora"),
+                "a resident adapter must not be reported unknown: {msg}"
+            );
+        }
+    }
+
+    // (c) a base VLM request (no adapter) is still accepted (byte-identical path).
+    let m = img_msg();
+    let _ = engine
+        .chat(std::slice::from_ref(&m), &sampling(None))
+        .expect("base VLM request must still be accepted");
+
+    for p in [&text_path, &mmproj_path, &adapter] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 #[test]
 fn vlm_prefill_errors_when_no_vision_loaded() {
     // Text-only engine should refuse vlm_prefill_ids loudly rather

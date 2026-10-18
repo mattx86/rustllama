@@ -9564,6 +9564,16 @@ impl CpuEngine {
         let model_eos = model.cfg.eos_token_id;
         let feature_memo = Arc::clone(&self.vision_feature_memo);
 
+        // P11 (VLM): resolve the per-request LoRA selection NOW, on the
+        // submitting thread (which holds the registry), exactly like
+        // `spawn_stream`. An unknown adapter fails the request here instead of
+        // the VLM path silently serving the un-adapted base. `None` ⇒ base
+        // (byte-identical). The resolved adapter is scoped inside
+        // `drive_vlm_generation` for the whole generation.
+        let lora_adapter = self
+            .lora_adapter_for(&sampling)
+            .map_err(|e| crate::EngineError::Engine(e.to_string()))?;
+
         tokio::task::spawn_blocking(move || {
             let result = drive_vlm_generation(
                 model,
@@ -9578,6 +9588,7 @@ impl CpuEngine {
                 images,
                 sampling,
                 feature_memo,
+                lora_adapter,
                 &tx,
             );
             if let Err(e) = result {
@@ -10354,7 +10365,6 @@ fn vlm_mrope_positions(
 ///   case in v1 is "describe / explain this image"; tool-calling
 ///   on image requests is a follow-up.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn drive_vlm_generation(
     model: Arc<LlamaModel>,
     state: Arc<Mutex<EngineState>>,
@@ -10368,6 +10378,7 @@ fn drive_vlm_generation(
     images: Vec<Vec<u8>>,
     sampling: SamplingParams,
     feature_memo: Arc<Mutex<Option<(u64, Vec<Vec<f32>>)>>>,
+    lora_adapter: Option<Arc<rustllama_models::lora::LoraAdapter>>,
     tx: &tokio::sync::mpsc::Sender<EngineResult<Token>>,
 ) -> EngineResult<()> {
     use rustllama_models::vision_arch::PlaceholderMode;
@@ -10380,6 +10391,17 @@ fn drive_vlm_generation(
     let image_token_id = image_token_id
         .ok_or_else(|| crate::EngineError::Engine("vlm chat: image_token_id not set".into()))?;
     let placeholder_mode = placeholder_mode.unwrap_or(PlaceholderMode::OnePerImage);
+
+    // P11 (VLM): scope the selected LoRA adapter as the thread-active adapter
+    // for the WHOLE VLM generation (prefill-from-embeds + every decode step) on
+    // this spawn_blocking thread. The VLM path uses the contiguous forward, so
+    // the per-request thread-local `ACTIVE_LORA` applies cleanly — mirroring how
+    // the text `DriveGenJob` scopes it. `None` restores/keeps the base
+    // (byte-identical). Restored on drop (incl. an early `?`), so the next task
+    // on this pool thread starts clean. The guard must outlive every forward,
+    // so it is bound here at the top and held for the function body.
+    let adapter_active = lora_adapter.is_some();
+    let _lora_scope = rustllama_models::lora::scope_active_lora(lora_adapter);
 
     rustllama_models::accel::set_flash_attention(true);
 
@@ -10430,7 +10452,12 @@ fn drive_vlm_generation(
     // vision-feature memo still skips the ViT, so only the cheap text-model
     // prefill repeats).
     let is_mrope = model.cfg.rope_dimension_sections.is_some();
-    let vlm_prefix_cache_ok = !is_hybrid && !is_mrope;
+    // P11: the VLM prefix pool is content-keyed (image_hash + prompt ids), NOT
+    // adapter-keyed, so an adapted request must neither reuse nor populate it —
+    // skip BOTH the lookup and the post-gen insertion when a LoRA adapter is
+    // active (mirrors the text path's `prefix_cache && !adapter_active`). `None`
+    // adapter ⇒ unchanged / byte-identical.
+    let vlm_prefix_cache_ok = !is_hybrid && !is_mrope && !adapter_active;
 
     // P-1 lookup: try a full-prefix match in the pool for this
     // image_hash. On hit we restore the cached KV state and skip
