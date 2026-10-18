@@ -623,6 +623,65 @@ fn compare(gpu: &[f32], cpu: &[f32]) -> (f64, f64) {
     (cos, max_rel)
 }
 
+/// Absolute-error floor for the whole-layer / whole-block CUDA-graph grade.
+/// Sits comfortably ABOVE the f32 device parallel-reduce noise floor (a few
+/// 1e-4 per reduced element) and well BELOW any real kernel error, so a true
+/// bug still fails while a near-zero-reference artifact passes.
+const GRAPH_ALLCLOSE_ABS_TOL: f64 = 5e-3;
+
+/// numpy-`allclose`-style grade for a WHOLE-LAYER / whole-BLOCK output
+/// (attention + FFN) whose reference legitimately contains near-zero elements.
+///
+/// `compare()`'s bare `max_rel = max |g-c| / (|c| + 1e-3)` is a FALSE-POSITIVE
+/// trap for these probes: one element with reference ≈ 0 and a ~1e-3 device-
+/// reduce difference yields `rel ≈ 1e-3 / 1e-3 ≈ 0.999` even though `cos = 1.0`
+/// proves the output is correct — exactly the `max_rel=0.9990` MISCOMPUTE seen
+/// on real NVIDIA HW. Instead each element is graded with an absolute floor:
+/// it is within tolerance iff `|g-c| <= abs_tol + rel_tol*|c|` (the numpy
+/// `allclose` predicate). A genuine kernel bug still fails — a direction change
+/// drops `cos`, and a large absolute error exceeds `abs_tol + rel_tol*|c|`.
+///
+/// Returns `(cos, every_within, worst_abs, worst_tol_frac)`:
+///   - `cos` — cosine similarity (the caller still applies the per-probe bar),
+///   - `every_within` — true iff EVERY element satisfies the allclose predicate,
+///   - `worst_abs` — the largest `|g-c|` (a reportable absolute error),
+///   - `worst_tol_frac` — the largest `|g-c| / (abs_tol + rel_tol*|c|)`: the
+///     fraction of each element's tolerance budget actually used (`> 1.0` ⇒ out
+///     of tolerance). `abs_tol > 0`, so the denominator is never zero.
+///
+/// Does NOT touch the shared [`compare`] used by every other probe.
+fn allclose_grade(gpu: &[f32], cpu: &[f32], abs_tol: f64, rel_tol: f64) -> (f64, bool, f64, f64) {
+    let mut dot = 0f64;
+    let mut ng = 0f64;
+    let mut nc = 0f64;
+    let mut worst_abs = 0f64;
+    let mut worst_tol_frac = 0f64;
+    let mut every_within = true;
+    for (&g, &c) in gpu.iter().zip(cpu.iter()) {
+        let (g, c) = (g as f64, c as f64);
+        dot += g * c;
+        ng += g * g;
+        nc += c * c;
+        let abs = (g - c).abs();
+        worst_abs = worst_abs.max(abs);
+        let allowed = abs_tol + rel_tol * c.abs();
+        if abs > allowed {
+            every_within = false;
+        }
+        worst_tol_frac = worst_tol_frac.max(abs / allowed);
+    }
+    let cos = if ng == 0.0 || nc == 0.0 {
+        if ng == nc {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        dot / (ng.sqrt() * nc.sqrt())
+    };
+    (cos, every_within, worst_abs, worst_tol_frac)
+}
+
 // --- Probe-result recording (for `tune --validate-kernels`) -----------
 //
 // Both emit() (SYCL) and cu_emit() (CUDA) funnel every probe's verdict
@@ -7097,7 +7156,13 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                 *counts.entry("KERNEL_ERR").or_default() += 1;
             }
             Some(mut cache) => {
-                let (mut worst_cos, mut worst_rel) = (1.0f64, 0.0f64);
+                // numpy-allclose accumulators across the 3 cases: worst cos, the
+                // AND of per-case within-tolerance, and the worst abs / tol-used
+                // for the detail string (see `allclose_grade`).
+                let mut worst_cos = 1.0f64;
+                let mut worst_abs = 0.0f64;
+                let mut worst_tol_frac = 0.0f64;
+                let mut all_within = true;
                 // None = all ran OK; Some(reason) = a SKIP condition broke the loop.
                 let mut skip: Option<&'static str> = None;
                 for (window, softcap) in cases {
@@ -7190,9 +7255,15 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                         .map(|(h, h0)| h - h0)
                         .collect();
                     cpu.extend_from_slice(&hnorm2_ref);
-                    let (cos, max_rel) = compare(&gpu, &cpu);
+                    // numpy-allclose grade (near-zero elements ⇒ bare max_rel
+                    // false-positives). Keep the cos bar + rel_tol=0.10; add the
+                    // 5e-3 absolute floor.
+                    let (cos, within, wabs, wfrac) =
+                        allclose_grade(&gpu, &cpu, GRAPH_ALLCLOSE_ABS_TOL, 0.10);
                     worst_cos = worst_cos.min(cos);
-                    worst_rel = worst_rel.max(max_rel);
+                    worst_abs = worst_abs.max(wabs);
+                    worst_tol_frac = worst_tol_frac.max(wfrac);
+                    all_within &= within;
                 }
                 match skip {
                     Some(reason) => {
@@ -7200,7 +7271,7 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                         *counts.entry("SKIP").or_default() += 1;
                     }
                     None => {
-                        let key: &'static str = if worst_cos > 0.995 && worst_rel < 0.10 {
+                        let key: &'static str = if worst_cos > 0.995 && all_within {
                             "OK"
                         } else {
                             "MISCOMPUTE"
@@ -7210,8 +7281,8 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                             name,
                             key,
                             &format!(
-                                "cos={worst_cos:.6} max_rel={worst_rel:.4} \
-                                 (pass+swa{GRAPH_DEV_WINDOW}+cap50)"
+                                "cos={worst_cos:.6} worst_abs={worst_abs:.5} \
+                                 tol_used={worst_tol_frac:.3} (pass+swa{GRAPH_DEV_WINDOW}+cap50)"
                             ),
                         );
                     }
@@ -7430,8 +7501,13 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                         .map(|(h, h0)| h - h0)
                         .collect();
                     cpu.extend_from_slice(&hnorm2_ref);
-                    let (cos, max_rel) = compare(&gpu, &cpu);
-                    let key: &'static str = if cos > 0.99 && max_rel < 0.15 {
+                    // numpy-allclose grade: a whole-layer output has near-zero
+                    // elements, so bare `max_rel` false-positives (cos=1.0 but
+                    // one ref≈0 element reads rel≈0.999). Keep the cos bar +
+                    // rel_tol=0.15; add the 5e-3 absolute floor.
+                    let (cos, within, worst_abs, tol_frac) =
+                        allclose_grade(&gpu, &cpu, GRAPH_ALLCLOSE_ABS_TOL, 0.15);
+                    let key: &'static str = if cos > 0.99 && within {
                         "OK"
                     } else {
                         "MISCOMPUTE"
@@ -7440,7 +7516,9 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                     cu_emit(
                         name,
                         key,
-                        &format!("cos={cos:.6} max_rel={max_rel:.4} (attn+ffn)"),
+                        &format!(
+                            "cos={cos:.6} worst_abs={worst_abs:.5} tol_used={tol_frac:.3} (attn+ffn)"
+                        ),
                     );
                 }
             }
@@ -9445,4 +9523,62 @@ pub fn run_npu_parity() -> anyhow::Result<()> {
         println!("\nsummary: SKIP (no NPU offload available on this host)");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{allclose_grade, GRAPH_ALLCLOSE_ABS_TOL};
+
+    /// The artifact that triggered the fix: a whole-layer output identical
+    /// except one element where the reference is ≈ 0 and the device differs by
+    /// ~1e-3 (an f32 reduce-order noise). `compare()`'s bare `max_rel` reads
+    /// ≈ 0.999 here (1e-3 / 1e-3) — a FALSE MISCOMPUTE — but allclose PASSES it
+    /// because |g-c| ≤ abs_tol, and cos stays ≈ 1.0.
+    #[test]
+    fn allclose_passes_near_zero_reference_reduce_noise() {
+        let cpu = [1.0f32, -2.0, 0.5, 1e-6];
+        let gpu = [1.0f32, -2.0, 0.5, 1.0e-3];
+        let (cos, within, worst_abs, _frac) =
+            allclose_grade(&gpu, &cpu, GRAPH_ALLCLOSE_ABS_TOL, 0.15);
+        assert!(
+            within,
+            "near-zero-reference reduce noise must be within tolerance"
+        );
+        assert!(cos > 0.99, "cos must stay high (output is correct): {cos}");
+        assert!(worst_abs < GRAPH_ALLCLOSE_ABS_TOL, "worst_abs={worst_abs}");
+
+        // Cross-check: the OLD bare-max_rel grade would FALSE-POSITIVE here.
+        let (_c, old_max_rel) = super::compare(&gpu, &cpu);
+        assert!(
+            old_max_rel > 0.15,
+            "sanity: the old max_rel grade would (wrongly) fail this: {old_max_rel}"
+        );
+    }
+
+    /// A genuine element error (ref = 1.0, gpu = 1.3) exceeds `abs_tol +
+    /// rel_tol*|c|` and must FAIL — allclose is not a blanket pass.
+    #[test]
+    fn allclose_fails_real_element_error() {
+        let cpu = [1.0f32, 2.0, 3.0];
+        let gpu = [1.3f32, 2.0, 3.0];
+        // Whole-layer tolerance (rel_tol = 0.15): allowed = 5e-3 + 0.15 = 0.155,
+        // and 0.3 > 0.155 → out of tolerance.
+        let (_cos, within, worst_abs, tol_frac) =
+            allclose_grade(&gpu, &cpu, GRAPH_ALLCLOSE_ABS_TOL, 0.15);
+        assert!(!within, "a 30% element error must be out of tolerance");
+        assert!((worst_abs - 0.3).abs() < 1e-6, "worst_abs={worst_abs}");
+        assert!(tol_frac > 1.0, "tol budget must be exceeded: {tol_frac}");
+    }
+
+    /// Identical vectors pass with cos = 1.0 and zero error.
+    #[test]
+    fn allclose_passes_identical() {
+        let v = [0.0f32, 1.0, -3.5, 42.0];
+        let (cos, within, worst_abs, tol_frac) =
+            allclose_grade(&v, &v, GRAPH_ALLCLOSE_ABS_TOL, 0.10);
+        assert!(within);
+        assert!((cos - 1.0).abs() < 1e-12, "cos={cos}");
+        assert_eq!(worst_abs, 0.0);
+        assert_eq!(tol_frac, 0.0);
+    }
 }
