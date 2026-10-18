@@ -1016,58 +1016,126 @@ const RE_FALCON: &str =
 /// GPT-4o / o200k_base. Splits case runs and groups digits 1-3.
 const RE_GPT4O: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-/// Map a `tokenizer.ggml.pre` family key to its byte-level BPE split regex.
-/// `None` means "use the DEFAULT single-ByteLevel path" — returned for an
-/// absent key, for `gpt-2` (whose regex IS the ByteLevel default), and for
-/// any family we don't yet carry an exact regex for (so an unrecognized
-/// `pre` degrades to today's behaviour instead of a wrong split).
-fn bpe_family_regex(pre: Option<&str>) -> Option<&'static str> {
-    match pre? {
-        "llama3" | "llama-bpe" | "smaug-bpe" => Some(RE_LLAMA3),
-        "qwen2" => Some(RE_QWEN2),
-        "falcon" | "falcon3" => Some(RE_FALCON),
-        "gpt-4o" | "gpt4o" => Some(RE_GPT4O),
-        // gpt-2 (== ByteLevel default) + families without a verified exact
-        // regex (deepseek-*, command-r, tekken, jina-*, starcoder, …) fall
-        // to DEFAULT: byte-identical to pre-M3 for gpt-2, and never a
-        // mis-split for the rest (they get today's behaviour until their
-        // exact regex is added + HW-validated).
-        _ => None,
-    }
+/// Per-family byte-level BPE pre-tokenizer regexes, reproduced VERBATIM from
+/// each family's own public HuggingFace `tokenizer.json` `pre_tokenizer`
+/// Split patterns — public model DATA, not `llama.cpp` source. They differ
+/// from the plain GPT-2 regex mostly in how digits, whitespace and CJK runs
+/// are grouped, so reading `tokenizer.ggml.pre` is what makes each GGUF
+/// tokenize bit-for-bit like its HF `tokenizer.json`.
+///
+/// DeepSeek-Coder (`deepseek-ai/deepseek-coder-6.7b-base`): newline, then
+/// (ws?)letters / (ws?)punct / CJK runs, then individual digits.
+const RE_DEEPSEEK_NEWLINE: &str = "[\r\n]";
+const RE_DEEPSEEK_LETTERS: &str = "\\s?\\p{L}+";
+const RE_DEEPSEEK_PUNCT: &str = "\\s?\\p{P}+";
+/// CJK / Hangul run; shared by deepseek-coder and deepseek-llm (identical in
+/// both tokenizer.json files). The `\u{800}-\u{4e00}` sub-range is as
+/// published upstream (it is a superset of the CJK block that follows).
+const RE_DEEPSEEK_CJK: &str = "[\u{4e00}-\u{9fa5}\u{800}-\u{4e00}\u{ac00}-\u{d7ff}]+";
+/// DeepSeek-LLM (`deepseek-ai/deepseek-llm-7b-base`): as Coder, but with
+/// explicit cased-letter (Latin/Greek/Cyrillic/… incl. supplementary-plane
+/// cased blocks) and fullwidth/CJK-punctuation classes plus a trailing-
+/// whitespace split. The long letter class is the upstream enumeration of
+/// "cased letters excluding the CJK runs handled by RE_DEEPSEEK_CJK".
+const RE_DEEPSEEK_LLM_LETTERS: &str = "\\s?[A-Za-z\u{b5}\u{c0}-\u{d6}\u{d8}-\u{f6}\u{f8}-\u{1ba}\u{1bc}-\u{1bf}\u{1c4}-\u{293}\u{295}-\u{2af}\u{370}-\u{373}\u{376}\u{377}\u{37b}-\u{37d}\u{37f}\u{386}\u{388}-\u{38a}\u{38c}\u{38e}-\u{3a1}\u{3a3}-\u{3f5}\u{3f7}-\u{481}\u{48a}-\u{52f}\u{531}-\u{556}\u{10a0}-\u{10c5}\u{13a0}-\u{13f5}\u{13f8}-\u{13fd}\u{1c90}-\u{1cba}\u{1cbd}-\u{1cbf}\u{1d00}-\u{1d2b}\u{1d6b}-\u{1d77}\u{1d79}-\u{1d9a}\u{1e00}-\u{1f15}\u{1f18}-\u{1f1d}\u{1f20}-\u{1f45}\u{1f48}-\u{1f4d}\u{1f50}-\u{1f57}\u{1f59}\u{1f5b}\u{1f5d}\u{1f5f}-\u{1f7d}\u{1f80}-\u{1fb4}\u{1fb6}-\u{1fbc}\u{1fbe}\u{1fc2}-\u{1fc4}\u{1fc6}-\u{1fcc}\u{1fd0}-\u{1fd3}\u{1fd6}-\u{1fdb}\u{1fe0}-\u{1fec}\u{1ff2}-\u{1ff4}\u{1ff6}-\u{1ffc}\u{2102}\u{2107}\u{210a}-\u{2113}\u{2115}\u{2119}-\u{211d}\u{2124}\u{2126}\u{2128}\u{212a}-\u{212d}\u{212f}-\u{2134}\u{2139}\u{213c}-\u{213f}\u{2145}-\u{2149}\u{214e}\u{2183}\u{2184}\u{2c00}-\u{2c7b}\u{2c7e}-\u{2ce4}\u{2ceb}-\u{2cee}\u{2cf2}\u{2cf3}\u{a640}-\u{a66d}\u{a680}-\u{a69b}\u{a722}-\u{a76f}\u{a771}-\u{a787}\u{a78b}-\u{a78e}\u{ab70}-\u{abbf}\u{fb00}-\u{fb06}\u{fb13}-\u{fb17}\u{ff21}-\u{ff3a}\u{ff41}-\u{ff5a}\u{10400}-\u{1044f}\u{104b0}-\u{104d3}\u{104d8}-\u{104fb}\u{10c80}-\u{10cb2}\u{10cc0}-\u{10cf2}\u{118a0}-\u{118df}\u{1e900}-\u{1e943}]+";
+const RE_DEEPSEEK_LLM_PUNCT: &str = "\\s?[!-/:-~\u{ff01}-\u{ff0f}\u{ff1a}-\u{ff5e}\u{2018}-\u{201f}\u{3000}-\u{3002}]+";
+const RE_DEEPSEEK_TRAILING_WS: &str = "\\s+$";
+/// DeepSeek-V3 (`deepseek-ai/DeepSeek-V3`, also used by R1): 1-3 digit groups,
+/// then a Hiragana/Katakana/CJK run, then a GPT-4-style main regex. V3's
+/// tokenizer.json has NO separate Digits stage (digits are the first Split).
+const RE_DEEPSEEK_V3_DIGITS: &str = "\\p{N}{1,3}";
+const RE_DEEPSEEK_V3_CJK: &str = "[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+";
+const RE_DEEPSEEK_V3_MAIN: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
+/// Tekken (Mistral Nemo / `mistralai/Mistral-Nemo-Base-2407`): the o200k-style
+/// cased-run regex, but splitting digits ONE at a time (`\p{N}`) and without
+/// the apostrophe-contraction groups.
+const RE_TEKKEN: &str = "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
+/// A byte-level BPE `Split{regex, Isolated}` pre-tokenizer stage.
+fn split_stage(regex: &str) -> Value {
+    json!({
+        "type": "Split",
+        "pattern": { "Regex": regex },
+        "behavior": "Isolated",
+        "invert": false
+    })
 }
 
-/// Build the byte-level BPE `pre_tokenizer` JSON for a `pre` family.
-/// Default (no family regex) = today's single `ByteLevel{use_regex:true}`
-/// so existing models are untouched. A known family gets
-/// `Sequence[Split{regex, Isolated}, ByteLevel{use_regex:false}]`: the
-/// Split does the family's regex chunking, then ByteLevel byte-maps each
-/// chunk without re-splitting.
+/// The `Digits{individual_digits:true}` stage — splits every digit into its
+/// own pre-token (deepseek, command-r, starcoder pre-split digits this way).
+fn digits_stage() -> Value {
+    json!({ "type": "Digits", "individual_digits": true })
+}
+
+/// The terminal `ByteLevel` stage. `use_regex=false` when earlier Split
+/// stages already did all the chunking (the byte map must NOT re-split);
+/// `use_regex=true` when ByteLevel itself applies the GPT-2 split (families
+/// whose only pre-stage is digit splitting, e.g. command-r / starcoder) and
+/// for the historical default below.
+fn byte_level_stage(use_regex: bool) -> Value {
+    json!({
+        "type": "ByteLevel",
+        "add_prefix_space": false,
+        "trim_offsets": true,
+        "use_regex": use_regex
+    })
+}
+
+/// Build the byte-level BPE `pre_tokenizer` JSON for a `tokenizer.ggml.pre`
+/// family. Each known family is the EXACT stage sequence from its public HF
+/// `tokenizer.json` (`Sequence[<Split/Digits stages…>, ByteLevel]`). An
+/// absent key, `gpt-2` (whose regex IS the ByteLevel default) and any family
+/// we do not carry all return the historical single `ByteLevel{use_regex:true}`
+/// — byte-identical to pre-M3, so existing / unrecognized models are never
+/// mis-split.
 fn bpe_pretokenizer_json(pre: Option<&str>) -> Value {
-    match bpe_family_regex(pre) {
-        None => json!({
-            "type": "ByteLevel",
-            "add_prefix_space": false,
-            "trim_offsets": true,
-            "use_regex": true
-        }),
-        Some(regex) => json!({
-            "type": "Sequence",
-            "pretokenizers": [
-                {
-                    "type": "Split",
-                    "pattern": { "Regex": regex },
-                    "behavior": "Isolated",
-                    "invert": false
-                },
-                {
-                    "type": "ByteLevel",
-                    "add_prefix_space": false,
-                    "trim_offsets": true,
-                    "use_regex": false
-                }
-            ]
-        }),
-    }
+    let stages: Vec<Value> = match pre {
+        // --- M3: single-Split families (one family regex, then byte map) ---
+        Some("llama3" | "llama-bpe" | "smaug-bpe") => {
+            vec![split_stage(RE_LLAMA3), byte_level_stage(false)]
+        }
+        Some("qwen2") => vec![split_stage(RE_QWEN2), byte_level_stage(false)],
+        Some("falcon" | "falcon3") => vec![split_stage(RE_FALCON), byte_level_stage(false)],
+        Some("gpt-4o" | "gpt4o") => vec![split_stage(RE_GPT4O), byte_level_stage(false)],
+        // --- M3-tail: Mistral tekken — one Split, then byte map ---
+        Some("tekken") => vec![split_stage(RE_TEKKEN), byte_level_stage(false)],
+        // --- M3-tail: digit-split then GPT-2 ByteLevel (ByteLevel re-applies
+        // its own regex, so use_regex:true). command-r + starcoder/2 share
+        // this exact 2-stage pre-tokenizer in their tokenizer.json. ---
+        Some("command-r" | "starcoder" | "starcoder2") => {
+            vec![digits_stage(), byte_level_stage(true)]
+        }
+        // --- M3-tail: DeepSeek-Coder multi-Split sequence ---
+        Some("deepseek-coder") => vec![
+            split_stage(RE_DEEPSEEK_NEWLINE),
+            split_stage(RE_DEEPSEEK_LETTERS),
+            split_stage(RE_DEEPSEEK_PUNCT),
+            split_stage(RE_DEEPSEEK_CJK),
+            digits_stage(),
+            byte_level_stage(false),
+        ],
+        // --- M3-tail: DeepSeek-LLM multi-Split sequence ---
+        Some("deepseek-llm") => vec![
+            split_stage(RE_DEEPSEEK_NEWLINE),
+            split_stage(RE_DEEPSEEK_LLM_LETTERS),
+            split_stage(RE_DEEPSEEK_LLM_PUNCT),
+            split_stage(RE_DEEPSEEK_TRAILING_WS),
+            split_stage(RE_DEEPSEEK_CJK),
+            digits_stage(),
+            byte_level_stage(false),
+        ],
+        // --- M3-tail: DeepSeek-V3 (digits in the first Split, NO Digits stage) ---
+        Some("deepseek-v3") => vec![
+            split_stage(RE_DEEPSEEK_V3_DIGITS),
+            split_stage(RE_DEEPSEEK_V3_CJK),
+            split_stage(RE_DEEPSEEK_V3_MAIN),
+            byte_level_stage(false),
+        ],
+        // gpt-2 (== ByteLevel default) + any family we do not carry → the
+        // historical single ByteLevel path (byte-identical to pre-M3).
+        _ => return byte_level_stage(true),
+    };
+    json!({ "type": "Sequence", "pretokenizers": stages })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1387,6 +1455,98 @@ mod tests {
                 .get_ids(),
             &[0, 0, 0, 0]
         );
+    }
+
+    /// M3-tail: each newly-wired `tokenizer.ggml.pre` family emits the EXACT
+    /// multi-stage pre-tokenizer its public HF `tokenizer.json` defines
+    /// (verbatim Split/Digits stages + a terminal ByteLevel). Anchors the
+    /// clean-room reproduction — a drift in any stage, regex, or the
+    /// ByteLevel `use_regex` flag trips here.
+    #[test]
+    fn m3_tail_families_emit_expected_pretokenizer_stages() {
+        let stages = |pre: &str| -> Vec<Value> {
+            let pt = bpe_pretokenizer_json(Some(pre));
+            assert_eq!(pt["type"], json!("Sequence"), "{pre} must be a Sequence");
+            pt["pretokenizers"].as_array().unwrap().clone()
+        };
+
+        // deepseek-coder: [\r\n] | ws?\p{L}+ | ws?\p{P}+ | CJK, then individual
+        // Digits, then a ByteLevel that must NOT re-split (use_regex:false).
+        let c = stages("deepseek-coder");
+        assert_eq!(c.len(), 6);
+        assert_eq!(c[0]["type"], json!("Split"));
+        assert_eq!(c[0]["behavior"], json!("Isolated"));
+        assert_eq!(c[0]["pattern"]["Regex"], json!(RE_DEEPSEEK_NEWLINE));
+        assert_eq!(c[1]["pattern"]["Regex"], json!(RE_DEEPSEEK_LETTERS));
+        assert_eq!(c[2]["pattern"]["Regex"], json!(RE_DEEPSEEK_PUNCT));
+        assert_eq!(c[3]["pattern"]["Regex"], json!(RE_DEEPSEEK_CJK));
+        assert_eq!(c[4]["type"], json!("Digits"));
+        assert_eq!(c[4]["individual_digits"], json!(true));
+        assert_eq!(c[5]["type"], json!("ByteLevel"));
+        assert_eq!(c[5]["use_regex"], json!(false));
+
+        // deepseek-llm: 7 stages — adds the explicit cased-letter + fullwidth-
+        // punct classes and a trailing-whitespace split; shares the CJK class.
+        let l = stages("deepseek-llm");
+        assert_eq!(l.len(), 7);
+        assert_eq!(l[0]["pattern"]["Regex"], json!(RE_DEEPSEEK_NEWLINE));
+        assert_eq!(l[1]["pattern"]["Regex"], json!(RE_DEEPSEEK_LLM_LETTERS));
+        assert_eq!(l[2]["pattern"]["Regex"], json!(RE_DEEPSEEK_LLM_PUNCT));
+        assert_eq!(l[3]["pattern"]["Regex"], json!(RE_DEEPSEEK_TRAILING_WS));
+        assert_eq!(l[4]["pattern"]["Regex"], json!(RE_DEEPSEEK_CJK));
+        assert_eq!(l[5]["type"], json!("Digits"));
+        assert_eq!(l[6]["use_regex"], json!(false));
+
+        // deepseek-v3: digits(1-3) | CJK | GPT-4-style main, then ByteLevel —
+        // and crucially NO separate Digits stage (digits are the first Split).
+        let v = stages("deepseek-v3");
+        assert_eq!(v.len(), 4);
+        assert_eq!(v[0]["pattern"]["Regex"], json!(RE_DEEPSEEK_V3_DIGITS));
+        assert_eq!(v[1]["pattern"]["Regex"], json!(RE_DEEPSEEK_V3_CJK));
+        assert_eq!(v[2]["pattern"]["Regex"], json!(RE_DEEPSEEK_V3_MAIN));
+        assert_eq!(v[3]["type"], json!("ByteLevel"));
+        assert_eq!(v[3]["use_regex"], json!(false));
+        assert!(v.iter().all(|s| s["type"] != json!("Digits")));
+
+        // tekken: a single Split, then a ByteLevel that must not re-split.
+        let t = stages("tekken");
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0]["pattern"]["Regex"], json!(RE_TEKKEN));
+        assert_eq!(t[1]["use_regex"], json!(false));
+
+        // command-r / starcoder / starcoder2: individual Digits, then a GPT-2
+        // ByteLevel that DOES re-split (use_regex:true) — their whole
+        // tokenizer.json pre-tokenizer.
+        for fam in ["command-r", "starcoder", "starcoder2"] {
+            let s = stages(fam);
+            assert_eq!(s.len(), 2, "{fam}");
+            assert_eq!(s[0]["type"], json!("Digits"), "{fam}");
+            assert_eq!(s[0]["individual_digits"], json!(true), "{fam}");
+            assert_eq!(s[1]["type"], json!("ByteLevel"), "{fam}");
+            assert_eq!(s[1]["use_regex"], json!(true), "{fam}");
+        }
+        assert_eq!(
+            bpe_pretokenizer_json(Some("starcoder")),
+            bpe_pretokenizer_json(Some("starcoder2"))
+        );
+    }
+
+    /// M3-tail: the newly-wired families group digits exactly as their
+    /// tokenizer.json dictates — which also proves every new family's full
+    /// pre-tokenizer (incl. deepseek-llm's 223-char supplementary-plane letter
+    /// class) actually COMPILES under the `tokenizers` onig engine: a
+    /// malformed regex would fail the load inside `tiny_digit_bpe`.
+    #[test]
+    fn m3_tail_pretokenizer_digit_grouping() {
+        // deepseek-coder/llm + command-r + starcoder (Digits stage) and tekken
+        // (`\p{N}`, one digit at a time) all split every digit → four "9"s.
+        for fam in ["deepseek-coder", "deepseek-llm", "command-r", "starcoder", "tekken"] {
+            let enc = tiny_digit_bpe(Some(fam)).encode("9999", false).unwrap();
+            assert_eq!(enc.get_ids(), &[0, 0, 0, 0], "{fam}");
+        }
+        // DeepSeek-V3 groups digits 1-3 (`\p{N}{1,3}`, like Llama-3) → "999" + "9".
+        let enc = tiny_digit_bpe(Some("deepseek-v3")).encode("9999", false).unwrap();
+        assert_eq!(enc.get_ids(), &[2, 0]);
     }
 
     #[test]
