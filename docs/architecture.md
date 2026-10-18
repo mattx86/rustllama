@@ -14,12 +14,13 @@ project evolves.
 │ rustllama-engine                                             │
 │   generation loop, sampling, KV cache, chat templates,       │
 │   hybrid CPU/GPU placement policy                            │
+│   paged batch, beam, LoRA, cascade, priority/deadline        │
 └──┬───────────────────────────────────┬──────────────────────┘
    │                                   │
 ┌──┴──────────────────┐    ┌───────────┴───────────────────────┐
 │ rustllama-tensor    │    │ rustllama-models                  │
-│  Tensor, Device,    │    │  llama_arch (Llama / Qwen2 /      │
-│  Dtype, Storage     │    │   DeepSeek / Mistral / Phi3)      │
+│  Tensor, Device,    │    │  llama_arch: Llama/Qwen2/VLM/     │
+│  Dtype, Storage     │    │  Mamba/DeepSeek/Mistral/Phi3      │
 └──┬─────────────┬────┘    └───────────────────────────────────┘
    │             │
 ┌──┴──┐    ┌─────┴──────────────────────────────────────────────┐
@@ -46,6 +47,17 @@ The kernel layer (`rustllama-kernels-sycl`, `rustllama-kernels-cuda`,
 where its toolchain is absent (SYCL off aarch64/macOS, CUDA off macOS, MLX off
 Apple hardware), so the single binary builds everywhere and startup detection
 picks what to run. Future Vulkan / ROCm backends will sit beside these.
+
+**Model + engine surface.** `rustllama-models` covers dense + MoE transformers
+(Llama / Qwen2 / DeepSeek / Mistral / Phi3 families), **vision-language models**
+(Qwen2-VL / Qwen2.5-VL, loaded via a paired `[model].mmproj` GGUF and served
+through a sectioned-position **mRoPE** forward), and canonical **Mamba / SSM**
+selective-scan models (`mamba` / `mamba2` / `jamba` / `falcon-mamba`, CPU
+forward). Above it, `rustllama-engine` adds a paged continuous-batching engine,
+deterministic **beam search** (`num_beams > 1`), **multi-LoRA** adapters
+(merge-at-load via `--lora` / `[model].lora`, or resident via the LoRA
+endpoints), shared-prefix **cascade attention**, and **priority / deadline**
+request scheduling.
 
 **Backend / arch notes.** SYCL is **x86_64-only** (Intel oneAPI has no
 aarch64 build); on aarch64 `rustllama-kernels-sycl` compiles a no-op stub,
@@ -86,7 +98,7 @@ reported as a single device, and dispatch prefers Level Zero.
    `serve --ip/--port` or `[server]`). Optional `Authorization: Bearer <token>`
    auth — off unless a key is set (`serve --api-key`, `RUSTLLAMA_API_KEY`, or
    `[server].api_key`); loopback is exempt unless `require_auth_loopback`.
-7. **Single binary.** Subcommands: `serve` (`--model`/`--ip`/`--port`),
+7. **Single binary.** Subcommands: `serve` (`--model`/`--ip`/`--port`/`--lora`/`--eagle-head`),
    `chat` (line REPL or `--tui`; `--resume`, plus `chat list/show/export/
    delete/search` for saved history), `gui`, `generate`, `embed`,
    `model` (a group: `list`/`pull`/`rm`/`use`/`inspect`/`load`/`unload`/

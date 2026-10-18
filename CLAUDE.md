@@ -18,12 +18,12 @@ quantization tooling.
 - License: **MIT OR Apache-2.0**, © 2026 Matt Smith (`LICENSE-MIT`,
   `LICENSE-APACHE`). Application workspace — every crate is `publish = false`.
 - Status: experimental / pre-1.0 (`version = 0.1.1`). Edition 2021,
-  `rust-version = 1.83`.
+  `rust-version = 1.89`.
 
 ## Repo layout
 
 ```
-crates/                         (21-crate Cargo workspace)
+crates/                         (22-crate Cargo workspace)
   rustllama-tensor              tensor types / dtype defs
   rustllama-gguf                GGUF read/write, quant encode/decode (26 formats)
   rustllama-safetensors         AWQ/GPTQ safetensors load path
@@ -33,6 +33,7 @@ crates/                         (21-crate Cargo workspace)
   rustllama-kernels-cuda        native CUDA kernels (nvcc; inert off-NVIDIA; Blackwell/Hopper TC)
   rustllama-kernels-mlx         Metal/MLX kernels (xcrun metal + ObjC++; inert off Apple)
   rustllama-l0-sys              Level-Zero Sysman FFI (power/energy telemetry)
+  rustllama-npu                 Intel OpenVINO / AMD XRT NPU compute offload (dlopen'd, default-on)
   rustllama-models              model archs, forward pass, device dispatch (accel.rs)
   rustllama-tuner               device fingerprint + autotune cache
   rustllama-engine              generation loop, sampling, KV cache, placement
@@ -77,12 +78,15 @@ mangles long batch strings):
 | Check a **toolchain-free** crate (no env needed) | `cargo check -p rustllama-runtime` |
 
 The **9 toolchain-free crates** (no transitive `kernels-sycl`/`kernels-cuda`
-dep) can be built/checked/tested with plain cargo, and are the only ones CI
-compiles: `rustllama-config`, `-tensor`, `-tokenizer`, `-gguf`,
-`-kernels-cpu`, `-l0-sys`, `-runtime`, `-hub`, `-npu`. Everything else (models,
-engine, server, cli, tuner, app, and the crates that pull them) needs the GPU
-toolchains and is validated on a dev box with both installed + the
-`scripts/Dockerfile.linux-gpu` image. Source of truth: `.github/workflows/ci.yml`.
+dep) can be built/checked/tested with plain cargo, and are what CI's
+`cargo-check` job builds/tests on a plain Windows runner: `rustllama-config`,
+`-tensor`, `-tokenizer`, `-gguf`, `-kernels-cpu`, `-l0-sys`, `-runtime`,
+`-hub`, `-npu`. Everything else (models, engine, server, cli, tuner, app, and
+the crates that pull them) needs the GPU toolchains; CI now also validates these
+via the `gpu-tests` Docker job (`continue-on-error`, builds
+`scripts/Dockerfile.linux-gpu` and tests models/engine/server/tuner/cli inside
+it), and they're built on a dev box with both toolchains installed. Source of
+truth: `.github/workflows/ci.yml`.
 
 **Reading build results:** PowerShell `... | Tee-Object | Select-Object` masks
 cargo's exit code — don't trust `$LASTEXITCODE` through a pipe. Redirect to a
@@ -159,7 +163,10 @@ commands in the chat REPL/TUI mirror this verb set):
 
 - `serve` — start the HTTP server. `--model <gguf>` (repeatable; first = default),
   `--ip`, `--port`, `--api-key <token>` (requires `Authorization: Bearer`; flag >
-  `RUSTLLAMA_API_KEY` > `[server].api_key`). Auto-tunes each model on first load.
+  `RUSTLLAMA_API_KEY` > `[server].api_key`). `--lora <gguf>` merges a LoRA adapter
+  into the FIRST (default) startup model at load (overrides `[model].lora`);
+  `--eagle-head <gguf>` attaches an EAGLE draft head to it (overrides
+  `[model].eagle_head`). Auto-tunes each model on first load.
 - `chat` — interactive REPL, or full-screen `--tui`. `--resume <id|name>`,
   `--model`, `--system`, `--base-url`/`--ip`/`--port`. History subcommands:
   `chat list|show|export|delete|search`.
@@ -200,18 +207,42 @@ commands in the chat REPL/TUI mirror this verb set):
 
 ## Config & server
 
-- `config.toml` sections: `[model]`, `[inference]` (n_gpu_layers, ctx_size,
+- `config.toml` sections: `[model]` (path/hub, chat_template, `mmproj`, `lora`,
+  `eagle_head`), `[inference]` (n_gpu_layers, ctx_size,
   batch_size, kv_dtype/k_dtype/v_dtype, flash_attention, speculative_ngram,
   moe_placement, lock_ram_mb, `[inference.placement]`), `[server]`
   (bind_addr, **port 11434** default, api_key, require_auth_loopback,
-  max_loaded_models), `[ui]`,
+  max_loaded_models, `concurrency`, `max_pending_per_model`), `[ui]`,
   `[tuning]` (auto_apply_* flags, opportunistic_refine),
   `[embeddings]`, `[reranker]`.
+- **VLM / vision:** set `[model].mmproj` to a paired vision-tower (mmproj) GGUF
+  to enable image inputs on `/v1/chat/completions` (OpenAI `image_url` content
+  blocks) and `chat --image`; the loader verifies projector/decoder dims and
+  refuses a mismatched pair. Qwen2-VL / Qwen2.5-VL use a **sectioned-position
+  (mRoPE)** serve path (`forward_*_mrope` in `llama_arch.rs`: the 3-D `[t,h,w]`
+  rotation compresses rotation positions, not KV slots).
 - The server speaks the **OpenAI** API (`/v1/chat/completions`, `/v1/completions`,
   `/v1/embeddings`, `/v1/models`), the **Anthropic Messages** API
   (`/v1/messages`, for Claude Code), and the **Ollama** API (`/api/*`), plus
   `/healthz`, `/v1/capabilities`, `/v1/tuning_summary`, and model
   load/default/unload endpoints. Server tracing goes to **stdout**, not stderr.
+- **Multi-LoRA (P11):** resident adapters attach at runtime via
+  `POST /v1/lora/load` (UNMERGED) and list via `GET /v1/lora[?model=<id>]`. A
+  request selects an adapter either with the explicit `lora` field or the
+  `model: "base:adapter"` convention (a `base:adapter` where `base` resolves and
+  `adapter` is resident). The startup-model `--lora` / `[model].lora` path is the
+  separate merge-at-load (Phase-1) route.
+- **Request scheduling (P14):** `X-RustLlama-Priority` and
+  `X-RustLlama-Deadline-Ms` request headers reorder/deadline waiters in the
+  per-model submit queue; depth is capped by `[server].max_pending_per_model`
+  (over-depth ⇒ `503` + `Retry-After: 2`) and parallelism by
+  `[server].concurrency` (continuous-batching slot count on the paged engine).
+- **Decode modes:** beyond the speculative paths, `num_beams > 1` on a chat /
+  completions request runs a deterministic multi-hypothesis **beam search**
+  (non-streaming, no tools — refused with those); the CPU kernels carry a
+  shared-prefix **cascade attention** path for batched sequences. Canonical
+  **Mamba / SSM** models (`mamba` / `mamba2` / `jamba` / `falcon-mamba`) load and
+  serve through the `CpuEngine` selective-scan forward (F9).
 - The GUI embeds the server in-process; it sets `RUSTLLAMA_GUI_EMBEDDED=1` so
   the embedded start skips the blocking first-load autotune (that autotune runs
   as a separate subprocess with a progress modal instead).
@@ -243,7 +274,14 @@ without the user clearing any cache.
 
 ## Testing & validation
 
-- `cargo test --lib -p <crate>` for the 9 toolchain-free crates (what CI runs).
+- `cargo test --tests --lib -p <crate>` for the 9 toolchain-free crates (what
+  CI's `cargo-check` job runs — the `--tests` half pulls in each crate's `tests/`
+  integration suites, e.g. gguf's + tokenizer's, alongside the lib unit tests).
+- CI (`.github/workflows/ci.yml`) also enforces, on the 9 free crates:
+  `cargo fmt --all -- --check` (all crates), `cargo clippy --all-targets … -- -D
+  warnings` as a **hard gate**, plus the `gpu-tests` Docker job
+  (`continue-on-error`) that builds `scripts/Dockerfile.linux-gpu` and tests the
+  GPU-toolchain crates (models/engine/server/tuner/cli) inside it.
 - Kernel correctness: `rustllama doctor --sycl-parity` (SYCL, per-probe
   subprocessed) / `--cuda-parity` (CUDA, in-process) / `--metal-parity` (Metal,
   in-process) — every GPU kernel family vs its CPU reference on identical

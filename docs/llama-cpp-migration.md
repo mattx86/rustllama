@@ -29,6 +29,7 @@ to override the planner.
 | llama.cpp | What it does | rustllama equivalent |
 |---|---|---|
 | `-m, --model FILE` | pick the model | `[model].path` (or a hub ref), `rustllama serve --model FILE` (repeatable; first = default), or `rustllama model pull` + `model use` |
+| `--lora FILE` | apply a LoRA adapter | `[model].lora` / `rustllama serve --lora FILE` (merged into the default model at load), or attach at runtime via `POST /v1/lora/load` and select per request with the `lora` field or `model: "base:adapter"` (`GET /v1/lora` lists resident adapters) |
 | `-c, --ctx-size N` | context window (`n_ctx`) | `[inference].ctx_size` (default **8192**) |
 | `-ngl, --n-gpu-layers N` | layers to offload to GPU | `[inference].n_gpu_layers` (**999 = auto** placement; a number overrides the planner) |
 | `-fa, --flash-attn` | fused flash-attention kernel | `[inference].flash_attention` (default **on**, autotuned; `[inference].flash_attention_kv_min` sets the KV-length break-even) |
@@ -121,6 +122,12 @@ rustllama generate "write a haiku about llamas" \
 
 rustllama's sampler is a superset of the temp/top-k/top-p stack: it also has
 `typical_p`, OpenAI-style `frequency_penalty` / `presence_penalty`, and
-**Mirostat v1/v2**. The one notable gap vs llama.cpp is **min-p**. See
+**Mirostat v1/v2**. The one notable gap vs llama.cpp is **min-p**.
+
+rustllama also exposes a couple of knobs llama.cpp has no flag for: request-level
+**scheduling** via the `X-RustLlama-Priority` and `X-RustLlama-Deadline-Ms`
+headers (reorder / deadline waiters in the per-model submit queue), and
+deterministic **beam search** via a `num_beams` request field (non-streaming,
+no tools). See
 [editor-integrations.md](editor-integrations.md) for pointing coding tools
 (Continue, Aider, OpenCode, Cursor, Cline/Roo, Claude Code) at a running server.

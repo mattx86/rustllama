@@ -20,7 +20,7 @@ where it matches the CPU reference (no env vars, fail-closed).
 
 | Tool                       | Version             | Required for                                 |
 | -------------------------- | ------------------- | -------------------------------------------- |
-| Rust                       | 1.83+ (stable)      | everything                                   |
+| Rust                       | 1.89+ (stable)      | everything                                   |
 | Intel oneAPI Base Toolkit  | 2025.0+             | SYCL kernels (`rustllama-kernels-sycl`, icx/icpx) — **x86_64 only** |
 | NVIDIA CUDA Toolkit        | 13.x                | CUDA kernels (`rustllama-kernels-cuda`, nvcc; also targets aarch64) |
 | Xcode command-line tools   | 15+                 | Metal kernels (`rustllama-kernels-mlx`, `xcrun metal`) — **macOS only** |
