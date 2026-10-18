@@ -635,17 +635,30 @@ impl PagedBatchEngine {
                     .into(),
             ));
         }
-        // F6-A: fail-closed VLM guard (P9 default-on prereq). A vision/mmproj model
-        // has no image-embed row source in the ragged paged forward yet (F6-B adds
-        // it), so serving one here would silently drop every image → text-only,
-        // mis-served output. VLM-ness in rustllama is normally signalled by a
-        // SEPARATE mmproj companion GGUF (the text decoder carries no vision
-        // tensors), which this load site does not see — so the PRIMARY guard lives
-        // where the mmproj IS known: the serve load path forces the contiguous
-        // `CpuEngine` (which `attach_mmproj`s) whenever `[model].mmproj` is set
-        // (cli `serve`). This block is the defense-in-depth half: it catches a
-        // COMBINED single-file VLM GGUF (vision tensors / `clip.*` metadata in the
-        // same file) that would otherwise slip past the mmproj check.
+        // F6-A: fail-closed VLM guard (P9 default-on prereq). The guard STAYS
+        // even though F6-B landed the models-side image-embed row source
+        // (`LlamaModel::forward_ragged_paged_f32`'s `embed_rows` arg +
+        // `forward_prefill_paged_from_embeds_f32`, parity-anchored against the
+        // contiguous VLM forward in `vlm_prefill.rs`). Wiring that source into a
+        // LIVE paged serve would still need three pieces this engine does not
+        // have: (1) a vision tower in `PagedBatchEngine` (its `chat` ignores
+        // `ChatMessage::images` entirely and there is no `attach_mmproj` here),
+        // (2) per-slot embed-row plumbing through the continuous-batching driver's
+        // admission + ragged prefill tick (today `run_ragged_tick` calls
+        // `forward_ragged_paged_f32(.., None)`), and (3) a loader for a COMBINED
+        // single-file VLM GGUF — the ONLY VLM form that can reach this load site
+        // (the common two-file VLM is a text decoder + a SEPARATE mmproj, and the
+        // serve path forces that case onto the contiguous `CpuEngine` via the
+        // `[model].mmproj` check, where `attach_mmproj` lives). No code anywhere
+        // loads vision tensors from a combined file, so the combined case has no
+        // working vision path on ANY backend and cannot be exercised/verified
+        // on-box. Relaxing the guard now would make a combined-file VLM load here
+        // and serve TEXT-ONLY (silently dropping every image) — the exact
+        // mis-served output this guard prevents. So fail closed until the full
+        // paged image path lands + can be verified. This block is the
+        // defense-in-depth half (the PRIMARY guard is the serve-path mmproj
+        // check); it catches a combined single-file VLM GGUF (vision tensors /
+        // `clip.*` metadata in the same file) that would otherwise slip past.
         if gguf_has_vision_indicator(&gguf) {
             return Err(CpuEngineError::Other(
                 "continuous batching (fused_decode) does not support vision / \

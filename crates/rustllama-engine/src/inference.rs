@@ -3667,9 +3667,29 @@ impl CpuEngine {
             splice_image_embeddings(&text_embeds, &vlm_inputs.positions, &feat_slices, d_model)
                 .map_err(|e| CpuEngineError::Other(format!("vlm splice: {e}")))?;
         // Final transformer prefill over the spliced embedding sequence.
-        Ok(self
-            .model
-            .forward_prefill_from_embeds(&spliced, start_pos, kv))
+        // M5-engine-wire: for a Qwen2-VL / Qwen2.5-VL model (rope.dimension_
+        // sections set, 1:1 OnePerPatch splice) drive the sectioned 3-D mRoPE
+        // prefill so image-then-text positions rotate correctly. Otherwise —
+        // a non-sectioned model, or a layout whose placeholder runs don't
+        // partition into the per-image grids — fall back to the scalar entry
+        // (byte-identical). The grid rule lives in the models surface
+        // (`VlmPrefillInputs::mrope_positions_for_sequence`), not here.
+        let seq_len = spliced.len() / d_model;
+        Ok(
+            match self
+                .model
+                .cfg
+                .rope_dimension_sections
+                .as_ref()
+                .and_then(|_| vlm_inputs.mrope_positions_for_sequence(seq_len, start_pos))
+            {
+                Some(mrope) => {
+                    self.model
+                        .forward_prefill_from_embeds_mrope(&spliced, start_pos, &mrope, kv)
+                }
+                None => self.model.forward_prefill_from_embeds(&spliced, start_pos, kv),
+            },
+        )
     }
 
     /// Eagerly pre-upload every packed-quant weight tensor to USM at
@@ -9920,6 +9940,58 @@ fn compute_lcp(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
+/// M5-engine-wire: build the per-token 3-D multimodal-RoPE `[t, h, w]`
+/// positions for a SPLICED VLM sequence, or `None` when the model isn't an
+/// mRoPE VLM (`rope.dimension_sections` unset) or the placeholder runs don't
+/// partition into the per-image grids — in which case the caller falls back to
+/// the scalar entry (byte-identical 1-D RoPE).
+///
+/// `placeholder_positions` are the image-placeholder indices in the SPLICED
+/// token space. The sectioned-mRoPE family (Qwen2-VL / Qwen2.5-VL) uses the
+/// 1:1 `OnePerPatch` splice, so these equal the prompt placeholder positions
+/// and `seq_len == prompt_tokens.len()`. `per_image_features` are the vision
+/// pipeline's per-image `[num_patches, d_text]` buffers; their patch counts
+/// give each image's square post-merge grid `[1, g, g]` (`g = √num_patches`) —
+/// the SAME derivation
+/// [`rustllama_models::vision_arch::prepare_vlm_inputs_with_mode`] uses, mirrored
+/// here because `drive_vlm_generation` builds its splice inline (overlapping the
+/// ViT with tokenization) rather than through `prepare_vlm_inputs`. The actual
+/// position math is delegated to the models surface
+/// ([`rustllama_models::vision_arch::VlmPrefillInputs::mrope_positions_for_sequence`])
+/// so the engine never re-implements the grid rule.
+fn vlm_mrope_positions(
+    rope_dimension_sections: Option<&[u32]>,
+    placeholder_positions: &[usize],
+    per_image_features: &[Vec<f32>],
+    d_text: usize,
+    seq_len: usize,
+) -> Option<Vec<[u32; 3]>> {
+    // Non-mRoPE model → scalar path (the models forward is byte-identical
+    // anyway, but gate here so the engine doesn't pay the position build).
+    if rope_dimension_sections.is_none() {
+        return None;
+    }
+    let grid_thw: Vec<[u32; 3]> = per_image_features
+        .iter()
+        .map(|feat| {
+            let n = if d_text > 0 { feat.len() / d_text } else { 0 };
+            let g = (n as f64).sqrt() as usize;
+            if g > 0 && g * g == n {
+                [1, g as u32, g as u32]
+            } else {
+                [1, 1, n as u32]
+            }
+        })
+        .collect();
+    let vlm = rustllama_models::vision_arch::VlmPrefillInputs {
+        positions: placeholder_positions.to_vec(),
+        features: Vec::new(),
+        d_text,
+        grid_thw,
+    };
+    vlm.mrope_positions_for_sequence(seq_len, 0)
+}
+
 /// Dispatch a single-token forward through whichever KV backend the
 /// engine currently holds. Same shape as `model.forward_one(...)`
 /// but routes through `forward_one_paged_f32` when the backend is
@@ -10028,7 +10100,17 @@ fn drive_vlm_generation(
     // the post-generation insertion when hybrid — fresh prefill every
     // image turn (the V-7 vision-feature memo softens the cost).
     let is_hybrid = model.weights.is_hybrid();
-    let vlm_prefix_cache_ok = !is_hybrid;
+    // M5-engine-wire: a Qwen2-VL / Qwen2.5-VL (sectioned mRoPE) model
+    // COMPRESSES rotation positions wherever images appear, so the KV-cache
+    // length diverges from the running mRoPE position. The prefix snapshot
+    // records only the KV length (not the compressed mRoPE position), so a
+    // suffix-only re-prefill can't continue the sectioned rotation correctly.
+    // Treat mRoPE like hybrid: skip BOTH the prefix lookup and the post-gen
+    // insertion → always a fresh, position-correct prefill (the V-7
+    // vision-feature memo still skips the ViT, so only the cheap text-model
+    // prefill repeats).
+    let is_mrope = model.cfg.rope_dimension_sections.is_some();
+    let vlm_prefix_cache_ok = !is_hybrid && !is_mrope;
 
     // P-1 lookup: try a full-prefix match in the pool for this
     // image_hash. On hit we restore the cached KV state and skip
@@ -10063,7 +10145,9 @@ fn drive_vlm_generation(
         }
     };
 
-    let (mut logits, next_pos, prefix_token_count, prefix_kv_len) = if let Some(idx) = cache_hit {
+    let (mut logits, next_pos, prefix_token_count, prefix_kv_len, mrope_next) = if let Some(idx) =
+        cache_hit
+    {
         // Cache hit — restore KV state from the snapshot and
         // re-prefill only the suffix tokens.
         let snap = pool.touch(idx).clone();
@@ -10100,6 +10184,9 @@ fn drive_vlm_generation(
                 prefix_kv_len as u32,
                 prefix_token_count,
                 prefix_kv_len,
+                // mRoPE disables the prefix cache (vlm_prefix_cache_ok), so a
+                // cache hit only ever happens on a non-mRoPE model → scalar.
+                None,
             )
         } else {
             // (hybrid never reaches here — vlm_prefix_cache_ok
@@ -10115,6 +10202,7 @@ fn drive_vlm_generation(
                 next_pos,
                 prefix_token_count,
                 prefix_kv_len + suffix.len(),
+                None,
             )
         }
     } else {
@@ -10290,6 +10378,7 @@ fn drive_vlm_generation(
             d_text,
         )
         .map_err(|e| crate::EngineError::Engine(format!("vlm splice: {e}")))?;
+        let mut mrope_next: Option<u32> = None;
         let logits = if is_hybrid {
             let dn = delta_net_cache.as_mut().ok_or_else(|| {
                 crate::EngineError::Engine(
@@ -10297,10 +10386,37 @@ fn drive_vlm_generation(
                 )
             })?;
             model.forward_prefill_hybrid_from_embeds(&spliced, 0, kv, dn)
+        } else if let Some(mrope) = vlm_mrope_positions(
+            model.cfg.rope_dimension_sections.as_deref(),
+            &positions,
+            &features,
+            d_text,
+            spliced_len,
+        ) {
+            // M5-engine-wire: Qwen2-VL / Qwen2.5-VL multimodal sectioned RoPE.
+            // Each spliced token carries its 3-D (t,h,w) position (image tokens
+            // = patch-grid coords, text = (p,p,p)); the KV slot stays the
+            // physical position. Decode then continues at (max 3-D position
+            // used) + 1, advancing uniformly per step.
+            mrope_next = Some(
+                mrope
+                    .iter()
+                    .map(|p| p[0].max(p[1]).max(p[2]))
+                    .max()
+                    .unwrap_or(0)
+                    + 1,
+            );
+            model.forward_prefill_from_embeds_mrope(&spliced, 0, &mrope, kv)
         } else {
             model.forward_prefill_from_embeds(&spliced, 0, kv)
         };
-        (logits, spliced_len as u32, prompt_ids.len(), spliced_len)
+        (
+            logits,
+            spliced_len as u32,
+            prompt_ids.len(),
+            spliced_len,
+            mrope_next,
+        )
     };
 
     let _ = prefix_token_count; // structured here for readability + future logging
@@ -10311,6 +10427,12 @@ fn drive_vlm_generation(
     let mut sampler = Sampler::new(sampling.clone());
     let mut history: Vec<u32> = prompt_u32;
     let mut next_pos = next_pos;
+    // M5-engine-wire: the running mRoPE rotation position for decode
+    // (`Some` only for a sectioned mRoPE prefill that produced 3-D
+    // positions). It advances uniformly and INDEPENDENTLY of `next_pos`
+    // (the physical KV slot), because mRoPE compresses rotation positions
+    // where images appeared.
+    let mut mrope_pos = mrope_next;
     let mut spliced_len_for_snapshot = prefix_kv_len;
     for _ in 0..sampling.max_tokens {
         if tx.is_closed() {
@@ -10352,6 +10474,16 @@ fn drive_vlm_generation(
                 )
             })?;
             model.forward_one_hybrid(next_tok as i32, next_pos, kv, dn, &mut logits);
+        } else if let Some(m) = mrope_pos {
+            // M5-engine-wire: sectioned-mRoPE decode. The rotation position
+            // advances uniformly (text after an image continues at
+            // max(grid)+1, +1 per step); the KV slot / causal pos stays the
+            // physical `next_pos`. `forward_one` has no 3-D entry, so embed
+            // the token and route through `forward_one_from_embed_mrope`
+            // (primal == raw rows on these dense non-Hadamard VLM decoders).
+            let embed = model.embed_tokens_primal(&[next_tok as i32]);
+            model.forward_one_from_embed_mrope(&embed, next_pos, Some([m, m, m]), kv, &mut logits);
+            mrope_pos = Some(m + 1);
         } else {
             model.forward_one(next_tok as i32, next_pos, kv, &mut logits);
         }
@@ -10712,7 +10844,8 @@ fn project_moe_tier_budget_bytes(
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_lcp, project_moe_tier_budget_bytes, update_ema_tok_s, RequestStats, TOK_S_EMA_ALPHA,
+        compute_lcp, project_moe_tier_budget_bytes, update_ema_tok_s, vlm_mrope_positions,
+        RequestStats, TOK_S_EMA_ALPHA,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -10734,6 +10867,82 @@ mod tests {
         } else {
             Some(v)
         }
+    }
+
+    // ---- M5-engine-wire: the engine's VLM mRoPE position builder ----
+
+    /// Non-mRoPE model (`rope.dimension_sections` unset) ⇒ the engine's
+    /// position builder returns `None`, so `drive_vlm_generation` /
+    /// `vlm_prefill_ids` fall back to the scalar forward (byte-identical
+    /// 1-D RoPE). This is the default-preservation half of Tail 1.
+    #[test]
+    fn vlm_mrope_positions_none_without_sections() {
+        // d_text = 2, one image of 4 patches (→ square 1x2x2 grid).
+        let feats = vec![vec![0.0f32; 4 * 2]];
+        assert!(
+            vlm_mrope_positions(None, &[1, 2, 3, 4], &feats, 2, 7).is_none(),
+            "a model without rope.dimension_sections must take the scalar path"
+        );
+    }
+
+    /// mRoPE model ⇒ the engine hands the forward per-token 3-D positions
+    /// that follow the HF `get_rope_index` grid rule: text tokens get
+    /// (p,p,p); an image's patches get their (t,h,w) grid coords based at
+    /// the image-start position; and the text AFTER an image resumes at
+    /// `max(image 3-D positions) + 1` (NOT the flat patch count). This is
+    /// the position-correctness half of Tail 1 — the engine supplies the
+    /// grid-ruled positions the sectioned kernel consumes.
+    #[test]
+    fn vlm_mrope_positions_follows_grid_rule_image_then_text() {
+        // Prompt layout: 1 text token, then a 4-patch image at placeholder
+        // positions [1,2,3,4] (OnePerPatch is 1:1), then 2 trailing text
+        // tokens → spliced seq_len = 7. d_text = 2, so the one image's
+        // 4 patches give a square grid [1, 2, 2].
+        let d_text = 2;
+        let feats = vec![vec![0.0f32; 4 * d_text]];
+        let positions = [1usize, 2, 3, 4];
+        let mrope = vlm_mrope_positions(Some(&[1, 1, 1]), &positions, &feats, d_text, 7)
+            .expect("an mRoPE model with a partitioning layout must build positions");
+
+        // Expected per-token triples (segments: Text(1), Image{1,2,2}, Text(2)
+        // seeded at 0): text before, the frame-major/row-major/col image grid
+        // based at the image-start position 1, then text resuming at 3.
+        let expected: Vec<[u32; 3]> = vec![
+            [0, 0, 0], // text token 0
+            [1, 1, 1], // image patch (hh=0, ww=0)
+            [1, 1, 2], // image patch (hh=0, ww=1)
+            [1, 2, 1], // image patch (hh=1, ww=0)
+            [1, 2, 2], // image patch (hh=1, ww=1)
+            [3, 3, 3], // text resumes at max(image)+1 == 3 (NOT 1 + 4 patches)
+            [4, 4, 4],
+        ];
+        assert_eq!(mrope, expected, "mRoPE positions must follow the grid rule");
+
+        // The decode seed `drive_vlm_generation` computes = max component + 1.
+        let decode_next = mrope
+            .iter()
+            .map(|p| p[0].max(p[1]).max(p[2]))
+            .max()
+            .unwrap()
+            + 1;
+        assert_eq!(
+            decode_next, 5,
+            "decode must continue uniformly at max(3-D position)+1"
+        );
+    }
+
+    /// A placeholder layout that doesn't partition into the per-image grids
+    /// (here: 4 placeholders but a 9-patch image) ⇒ `None`, so the engine
+    /// degrades to scalar rather than mis-rotating.
+    #[test]
+    fn vlm_mrope_positions_none_on_grid_mismatch() {
+        let d_text = 2;
+        let feats = vec![vec![0.0f32; 9 * d_text]]; // 9 patches (3x3)
+        let positions = [1usize, 2, 3, 4]; // only 4 placeholder slots
+        assert!(
+            vlm_mrope_positions(Some(&[1, 1, 1]), &positions, &feats, d_text, 7).is_none(),
+            "a grid/placeholder-run mismatch must fall back to scalar (None)"
+        );
     }
 
     // ---- P20: MoE tiered-expert VRAM-budget projection ----
