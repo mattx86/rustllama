@@ -10,7 +10,7 @@
 
 use rustllama_engine::batch_scheduler::Priority;
 use rustllama_engine::paged_batch::PagedBatchEngine;
-use rustllama_engine::{CpuEngine, EngineError, SamplingParams, SubmitOpts};
+use rustllama_engine::{BeamParams, CpuEngine, EngineError, SamplingParams, SubmitOpts};
 use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthHybrid, SynthLlama, SynthMoe};
 
 fn write_gguf(tag: &str) -> std::path::PathBuf {
@@ -1260,5 +1260,176 @@ async fn paged_hybrid_streaming_two_concurrent_submits_each_matches_reference() 
         out_b, ref_b,
         "streaming hybrid slot B diverged from reference: stream={out_b:?} ref={ref_b:?}",
     );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// ============================================================
+// P3 — cascade (shared-prefix) decode driver wiring
+// ============================================================
+
+/// P3 driver wiring: two slots whose prompts share a page-aligned (>= one
+/// page = 16-token) APC prefix must ENGAGE the cascade decode path — the
+/// shared prefix is attended once and merged per slot instead of each slot
+/// re-attending it. Proves the driver groups the slots and routes the batched
+/// decode through `forward_decode_paged_batched_cascade_f32`. The numeric
+/// equivalence of that path to the per-slot path (within the merge's ~1e-6
+/// tolerance) is pinned at the model layer by
+/// `cascade_decode_matches_per_slot_within_tolerance`; here we pin that the
+/// wiring fires and still produces a full, coherent (finite, max_tokens-long)
+/// output per slot.
+#[test]
+fn paged_batch_cascade_engages_on_shared_prefix() {
+    let tmp = write_gguf("cascade-engage");
+    // max_ctx 48 ⇒ 3 pages/slot at page_size 16; prompt (18) + max_tokens (3) fits.
+    let batch = PagedBatchEngine::load(&tmp, 48, 2).expect("load");
+    // 16-token identical prefix (one full page) then a distinct 2-token tail.
+    // Token ids stay < the synth vocab (32).
+    let prefix: Vec<i32> = (1..=16).collect();
+    let mut pa = prefix.clone();
+    pa.extend([17, 18]);
+    let mut pb = prefix.clone();
+    pb.extend([19, 20]);
+
+    let outs = batch
+        .generate_batched_token_ids(vec![(pa, greedy(3)), (pb, greedy(3))])
+        .expect("cascade generate");
+    assert_eq!(outs.len(), 2);
+    assert!(!outs[0].is_empty(), "slot A produced tokens");
+    assert!(!outs[1].is_empty(), "slot B produced tokens");
+    assert!(outs[0].len() <= 3 && outs[1].len() <= 3, "capped at max_tokens");
+    assert!(
+        batch.cascade_engagements_for_tests() >= 1,
+        "two slots sharing a 16-token page-aligned prefix must engage the cascade decode path \
+         (engagements={})",
+        batch.cascade_engagements_for_tests()
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// P3 gate: when NO group can form — disjoint prompts (no shared page) and a
+/// single slot — the cascade path never engages and the output is
+/// BYTE-IDENTICAL to the per-slot single-slot references. Guards the
+/// "defaults byte-identical when the feature isn't engaged" contract.
+#[test]
+fn paged_batch_cascade_not_engaged_is_byte_identical() {
+    let tmp = write_gguf("cascade-noengage");
+    let pa: Vec<i32> = vec![5, 1, 4, 2, 3];
+    let pb: Vec<i32> = vec![8, 0, 7, 6, 1]; // disjoint first token ⇒ no shared page
+
+    let ref_a = PagedBatchEngine::load(&tmp, 32, 1)
+        .unwrap()
+        .generate_batched_token_ids(vec![(pa.clone(), greedy(3))])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let ref_b = PagedBatchEngine::load(&tmp, 32, 1)
+        .unwrap()
+        .generate_batched_token_ids(vec![(pb.clone(), greedy(3))])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let batch = PagedBatchEngine::load(&tmp, 32, 2).expect("load");
+    let outs = batch
+        .generate_batched_token_ids(vec![(pa, greedy(3)), (pb, greedy(3))])
+        .expect("generate");
+    assert_eq!(outs[0], ref_a, "slot A not byte-identical to single-slot ref");
+    assert_eq!(outs[1], ref_b, "slot B not byte-identical to single-slot ref");
+    assert_eq!(
+        batch.cascade_engagements_for_tests(),
+        0,
+        "disjoint prompts must NOT engage the cascade path"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// ============================================================
+// P12b — beam search on the paged engine
+// ============================================================
+
+/// P12b parity anchor: `num_beams == 1` beam search on the paged engine is
+/// BYTE-IDENTICAL to greedy on the paged engine. The seed + each single-beam
+/// fork run the SAME dense prefill + single-slot batched decode the sync greedy
+/// path uses, and the lone surviving beam always takes the argmax candidate.
+#[test]
+fn paged_beam_num_beams_one_matches_greedy() {
+    let tmp = write_gguf("beam-greedy");
+    let batch = PagedBatchEngine::load(&tmp, 32, 1).expect("load");
+    let prompt: Vec<i32> = vec![5, 1, 4, 2, 3];
+    let n = 4u32;
+
+    let greedy_out = batch
+        .generate_batched_token_ids(vec![(prompt.clone(), greedy(n))])
+        .expect("greedy")
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let bp = BeamParams {
+        num_beams: 1,
+        length_penalty: 1.0,
+        early_stopping: false,
+        num_return: 1,
+    };
+    let beams = batch
+        .generate_beam_token_ids(&prompt, n, &bp)
+        .expect("beam");
+    assert_eq!(beams.len(), 1, "num_beams=1 returns one hypothesis");
+    let beam_toks: Vec<i32> = beams[0].tokens.iter().map(|&t| t as i32).collect();
+    assert_eq!(
+        beam_toks, greedy_out,
+        "num_beams=1 beam must be byte-identical to greedy: beam={beam_toks:?} greedy={greedy_out:?}"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// P12b: num_beams > 1 returns multiple distinct hypotheses, ranked by the
+/// length-penalty-adjusted score (best first). Reuses `beam.rs`'s pool, so this
+/// pins that the paged driver feeds it correctly (per-beam KV forked over the
+/// shared prompt prefix) and that the ranking contract holds.
+#[test]
+fn paged_beam_returns_ranked_hypotheses() {
+    use rustllama_engine::beam::length_adjusted_score;
+    let tmp = write_gguf("beam-ranked");
+    let batch = PagedBatchEngine::load(&tmp, 64, 1).expect("load");
+    let prompt: Vec<i32> = vec![3, 1, 4, 1, 5, 9, 2, 6];
+    let lp = 1.0f32;
+    let bp = BeamParams {
+        num_beams: 3,
+        length_penalty: lp,
+        early_stopping: false,
+        num_return: 3,
+    };
+    let beams = batch
+        .generate_beam_token_ids(&prompt, 4, &bp)
+        .expect("beam");
+    assert!(!beams.is_empty(), "beam search returned no hypotheses");
+    assert!(beams.len() <= 3, "at most num_beams hypotheses");
+    assert!(
+        beams.len() >= 2,
+        "num_beams=3 (no early EOS expected) should keep multiple hypotheses, got {}",
+        beams.len()
+    );
+    // Ranked descending by the length-penalty-adjusted score, and each stored
+    // score equals the formula applied to its (cum_logprob, len).
+    for b in &beams {
+        let expect = length_adjusted_score(b.cum_logprob, b.tokens.len(), lp);
+        assert!(
+            (b.score - expect).abs() < 1e-4,
+            "beam score {} != length_adjusted_score {expect}",
+            b.score
+        );
+        assert!(!b.tokens.is_empty(), "a returned beam has no tokens");
+    }
+    for w in beams.windows(2) {
+        assert!(
+            w[0].score >= w[1].score,
+            "beams must be ranked by score (descending): {} then {}",
+            w[0].score,
+            w[1].score
+        );
+    }
     let _ = std::fs::remove_file(&tmp);
 }

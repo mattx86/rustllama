@@ -5919,6 +5919,90 @@ pub struct RaggedSlot<'a> {
     pub logits_out: &'a mut [f32],
 }
 
+/// P3 cascade / shared-prefix decode: a group of DECODE slots (indices into the
+/// `slots` slice handed to [`LlamaModel::forward_decode_paged_batched_cascade_f32`]
+/// / [`LlamaModel::forward_ragged_paged_cascade_f32`]) that share a page-aligned
+/// APC prefix of `prefix_len` tokens. The cascade decode path computes the
+/// shared-prefix attention ONCE and merges each slot's suffix via the
+/// online-softmax merge in [`rustllama_kernels_cpu::cascade`], instead of every
+/// slot re-attending the shared prefix independently — numerically equivalent
+/// (~1e-6) to the per-slot path. The paged driver (`PagedBatchEngine`) builds
+/// these each tick from the slots' shared pages; `None` / an empty slice ⇒ the
+/// byte-identical per-slot path. Engaged only on full-attention layers
+/// (`swa_window == 0`) since the cascade kernel has no windowed variant.
+#[derive(Clone, Debug)]
+pub struct CascadeGroup {
+    /// Page-aligned shared prefix length, in tokens (same for every member).
+    pub prefix_len: usize,
+    /// Member slot indices into the forward's `slots` slice. Must all be
+    /// decode rows (`n_query == 1`) sharing the prefix pages.
+    pub members: Vec<usize>,
+}
+
+/// P3 cascade: compute decode-row attention for one [`CascadeGroup`] and write
+/// each member's `[n_heads, head_dim]` attention output into `out`
+/// (`[n_seq, n_heads, head_dim]`, member order). Gathers the shared prefix K/V
+/// ONCE from `caches[0]` (identical physical pages across the group) and each
+/// sequence's suffix `[prefix_len, kv_len)` separately, then runs the batched
+/// online-softmax cascade merge. `queries` is `[n_seq, n_heads, head_dim]` in
+/// member order; `softcap > 0` applies the Gemma2 attention-logit cap.
+#[allow(clippy::too_many_arguments)]
+fn cascade_decode_attention_group(
+    shared: &crate::shared_paged_kv::SharedPagedKv,
+    layer: u32,
+    prefix_len: usize,
+    caches: &[&crate::paged_kv_cache::PagedKvCache],
+    kv_lens: &[usize],
+    queries: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    softcap: f32,
+) {
+    let n_seq = caches.len();
+    debug_assert_eq!(kv_lens.len(), n_seq);
+    debug_assert_eq!(queries.len(), n_seq * n_heads * head_dim);
+    debug_assert_eq!(out.len(), n_seq * n_heads * head_dim);
+    // Shared prefix K/V, gathered ONCE (the P3 memory win: one buffer instead
+    // of n_seq copies streamed independently).
+    let mut prefix_k = vec![0f32; n_kv_heads * prefix_len * head_dim];
+    let mut prefix_v = vec![0f32; n_kv_heads * prefix_len * head_dim];
+    caches[0]
+        .gather_layer_range_shared(shared, layer, 0, prefix_len as u32, &mut prefix_k, &mut prefix_v)
+        .expect("cascade prefix gather in range");
+    // Each sequence's private suffix [prefix_len, kv_len).
+    let mut suffix_k: Vec<Vec<f32>> = Vec::with_capacity(n_seq);
+    let mut suffix_v: Vec<Vec<f32>> = Vec::with_capacity(n_seq);
+    for (s, &c) in caches.iter().enumerate() {
+        let suf = kv_lens[s] - prefix_len;
+        let mut sk = vec![0f32; n_kv_heads * suf * head_dim];
+        let mut sv = vec![0f32; n_kv_heads * suf * head_dim];
+        c.gather_layer_range_shared(
+            shared,
+            layer,
+            prefix_len as u32,
+            kv_lens[s] as u32,
+            &mut sk,
+            &mut sv,
+        )
+        .expect("cascade suffix gather in range");
+        suffix_k.push(sk);
+        suffix_v.push(sv);
+    }
+    let suffixes: Vec<rustllama_kernels_cpu::cascade::CascadeSuffix> = (0..n_seq)
+        .map(|s| rustllama_kernels_cpu::cascade::CascadeSuffix {
+            k: &suffix_k[s],
+            v: &suffix_v[s],
+            len: kv_lens[s] - prefix_len,
+        })
+        .collect();
+    rustllama_kernels_cpu::cascade::cascade_attention_f32(
+        &prefix_k, &prefix_v, prefix_len, queries, &suffixes, out, n_seq, n_heads, n_kv_heads,
+        head_dim, softcap,
+    );
+}
+
 // ============================================================
 // T2: BatchedKv — one generic batched-prefill body over the KV dtype.
 // ============================================================
@@ -13578,6 +13662,21 @@ impl LlamaModel {
         slots: &mut [crate::llama_arch::DecodeSlot<'_>],
         shared: &crate::shared_paged_kv::SharedPagedKv,
     ) {
+        self.forward_decode_paged_batched_cascade_f32(slots, shared, None)
+    }
+
+    /// P3 cascade-aware variant of [`Self::forward_decode_paged_batched_f32`].
+    /// `cascade` groups decode slots that share a page-aligned APC prefix; each
+    /// engaged group computes the shared-prefix attention once and merges per
+    /// slot (full-attention layers only), numerically equivalent (~1e-6) to the
+    /// per-slot path. `None` / an empty slice is byte-identical to the plain
+    /// batched decode.
+    pub fn forward_decode_paged_batched_cascade_f32(
+        &self,
+        slots: &mut [crate::llama_arch::DecodeSlot<'_>],
+        shared: &crate::shared_paged_kv::SharedPagedKv,
+        cascade: Option<&[CascadeGroup]>,
+    ) {
         let m = slots.len();
         if m == 0 {
             return;
@@ -13754,17 +13853,84 @@ impl LlamaModel {
             // (non-SWA, non-softcap) model.
             let swa_win = cfg.swa_window(layer_idx);
             let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
+            // Pass 1: write every slot's new K/V row for this layer. Split from
+            // the attention pass so the P3 cascade can gather a shared prefix
+            // AFTER all slots have written (a slot only writes its OWN pages, so
+            // this reordering is byte-identical to the interleaved loop).
             for (i, slot) in slots.iter_mut().enumerate() {
-                let kv_len = slot.pos as usize + 1;
                 let k_row = &k_buf[i * d_kv..(i + 1) * d_kv];
                 let v_row = &v_buf[i * d_kv..(i + 1) * d_kv];
                 slot.cache
                     .write_token_shared(shared, layer_idx as u32, slot.pos, k_row, v_row)
                     .expect("paged write_token_shared: pos < capacity (asserted above)");
-                // Slice the scratch to this slot's kv_len (the
-                // gather only writes that prefix; later slots may
-                // have a different kv_len but we always size to max
-                // so the buffer fits all).
+            }
+
+            // Pass 2a: P3 cascade — for a group of >=2 slots sharing a
+            // page-aligned APC prefix, compute the shared-prefix attention ONCE
+            // and merge each slot's suffix (full-attention layers only; the
+            // cascade kernel has no windowed variant). Numerically equivalent
+            // (online-softmax merge, ~1e-6) to the per-slot path below.
+            let mut handled = vec![false; m];
+            if swa_win == 0 {
+                if let Some(groups) = cascade {
+                    for g in groups {
+                        if g.prefix_len == 0 || g.members.len() < 2 {
+                            continue;
+                        }
+                        // Every member is a decode row (kv_len = pos + 1); skip
+                        // the group if any member can't host the shared prefix
+                        // or was already handled.
+                        if g.members.iter().any(|&mi| {
+                            mi >= m || handled[mi] || (slots[mi].pos as usize + 1) < g.prefix_len
+                        }) {
+                            continue;
+                        }
+                        let nm = g.members.len();
+                        let caches: Vec<&crate::paged_kv_cache::PagedKvCache> =
+                            g.members.iter().map(|&mi| &*slots[mi].cache).collect();
+                        let kv_lens: Vec<usize> = g
+                            .members
+                            .iter()
+                            .map(|&mi| slots[mi].pos as usize + 1)
+                            .collect();
+                        let mut queries = vec![0f32; nm * d_q];
+                        for (gi, &mi) in g.members.iter().enumerate() {
+                            queries[gi * d_q..(gi + 1) * d_q]
+                                .copy_from_slice(&q_buf[mi * d_q..(mi + 1) * d_q]);
+                        }
+                        let mut group_out = vec![0f32; nm * d_q];
+                        cascade_decode_attention_group(
+                            shared,
+                            layer_idx as u32,
+                            g.prefix_len,
+                            &caches,
+                            &kv_lens,
+                            &queries,
+                            &mut group_out,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            softcap,
+                        );
+                        for (gi, &mi) in g.members.iter().enumerate() {
+                            attn_out[mi * d_q..(mi + 1) * d_q]
+                                .copy_from_slice(&group_out[gi * d_q..(gi + 1) * d_q]);
+                            handled[mi] = true;
+                        }
+                    }
+                }
+            }
+
+            // Pass 2b: per-slot gather + attention for every slot NOT handled by
+            // a cascade group (byte-identical to the pre-P3 path).
+            let flash_min = flash_kv_len_min();
+            for (i, slot) in slots.iter().enumerate() {
+                if handled[i] {
+                    continue;
+                }
+                let kv_len = slot.pos as usize + 1;
+                // Slice the scratch to this slot's kv_len (the gather only writes
+                // that prefix; the buffer is sized to the max kv_len so it fits).
                 let slab_used = n_kv_heads * kv_len * head_dim;
                 let k_slice = &mut k_slab[..slab_used];
                 let v_slice = &mut v_slab[..slab_used];
@@ -13774,7 +13940,6 @@ impl LlamaModel {
                 // Match the single-slot path's flash-vs-standard
                 // threshold so per-slot logits are bit-identical to
                 // `forward_one_paged_f32`.
-                let flash_min = flash_kv_len_min();
                 let q_row = &q_buf[i * d_q..(i + 1) * d_q];
                 let out_row = &mut attn_out[i * d_q..(i + 1) * d_q];
                 if crate::accel::flash_attention_enabled() && kv_len >= flash_min {
@@ -14006,6 +14171,23 @@ impl LlamaModel {
         shared: &crate::shared_paged_kv::SharedPagedKv,
         embed_rows: Option<&[f32]>,
     ) {
+        self.forward_ragged_paged_cascade_f32(tokens, slots, shared, embed_rows, None)
+    }
+
+    /// P3 cascade-aware variant of [`Self::forward_ragged_paged_f32`] — the
+    /// paged driver's decode tick. `cascade` groups DECODE rows (`n_query == 1`)
+    /// that share a page-aligned APC prefix so the shared-prefix attention is
+    /// computed once and merged per slot (full-attention layers only). Prefill
+    /// chunks always take the per-slot path. `None` / empty ⇒ byte-identical to
+    /// the plain ragged forward.
+    pub fn forward_ragged_paged_cascade_f32(
+        &self,
+        tokens: &[i32],
+        slots: &mut [crate::llama_arch::RaggedSlot<'_>],
+        shared: &crate::shared_paged_kv::SharedPagedKv,
+        embed_rows: Option<&[f32]>,
+        cascade: Option<&[CascadeGroup]>,
+    ) {
         let n_slots = slots.len();
         if n_slots == 0 {
             return;
@@ -14208,10 +14390,12 @@ impl LlamaModel {
             // history for the layer, run the slot-kind-appropriate attention.
             let swa_win = cfg.swa_window(layer_idx);
             let softcap = cfg.attn_logit_softcapping.unwrap_or(0.0);
+            // Pass 1: write every slot's new K/V rows for this layer (split from
+            // the attention pass so the P3 cascade can gather a shared prefix
+            // after all writes — each slot writes only its OWN pages, so this is
+            // byte-identical to the interleaved loop).
             for (i, s) in slots.iter_mut().enumerate() {
                 let base = row_off[i];
-                let kv_len = s.start_pos as usize + s.n_query;
-                // Write each of this slot's new tokens' K/V rows.
                 for j in 0..s.n_query {
                     let r = base + j;
                     let pos = s.start_pos + j as u32;
@@ -14221,6 +14405,73 @@ impl LlamaModel {
                         .write_token_shared(shared, layer_idx as u32, pos, k_row, v_row)
                         .expect("ragged write_token_shared: pos < capacity (asserted above)");
                 }
+            }
+
+            // Pass 2a: P3 cascade over DECODE rows (n_query == 1) sharing a
+            // page-aligned APC prefix (full-attention layers only). Same
+            // numeric-equivalence + gating as the batched decoder; prefill
+            // chunks always take the per-slot path in pass 2b.
+            let mut handled = vec![false; n_slots];
+            if swa_win == 0 {
+                if let Some(groups) = cascade {
+                    for g in groups {
+                        if g.prefix_len == 0 || g.members.len() < 2 {
+                            continue;
+                        }
+                        if g.members.iter().any(|&mi| {
+                            mi >= n_slots
+                                || slots[mi].n_query != 1
+                                || handled[mi]
+                                || (slots[mi].start_pos as usize + 1) < g.prefix_len
+                        }) {
+                            continue;
+                        }
+                        let nm = g.members.len();
+                        let caches: Vec<&crate::paged_kv_cache::PagedKvCache> =
+                            g.members.iter().map(|&mi| &*slots[mi].cache).collect();
+                        let kv_lens: Vec<usize> = g
+                            .members
+                            .iter()
+                            .map(|&mi| slots[mi].start_pos as usize + 1)
+                            .collect();
+                        let mut queries = vec![0f32; nm * d_q];
+                        for (gi, &mi) in g.members.iter().enumerate() {
+                            let base = row_off[mi];
+                            queries[gi * d_q..(gi + 1) * d_q]
+                                .copy_from_slice(&q_buf[base * d_q..(base + 1) * d_q]);
+                        }
+                        let mut group_out = vec![0f32; nm * d_q];
+                        cascade_decode_attention_group(
+                            shared,
+                            layer_idx as u32,
+                            g.prefix_len,
+                            &caches,
+                            &kv_lens,
+                            &queries,
+                            &mut group_out,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            softcap,
+                        );
+                        for (gi, &mi) in g.members.iter().enumerate() {
+                            let base = row_off[mi];
+                            attn_out[base * d_q..(base + 1) * d_q]
+                                .copy_from_slice(&group_out[gi * d_q..(gi + 1) * d_q]);
+                            handled[mi] = true;
+                        }
+                    }
+                }
+            }
+
+            // Pass 2b: per-slot gather + attention for the rest (prefill chunks +
+            // non-grouped decode rows), byte-identical to the pre-P3 path.
+            for (i, s) in slots.iter().enumerate() {
+                if handled[i] {
+                    continue;
+                }
+                let base = row_off[i];
+                let kv_len = s.start_pos as usize + s.n_query;
                 // Gather `[0, kv_len)` into the shared slab prefix.
                 let slab_used = n_kv_heads * kv_len * head_dim;
                 let k_slice = &mut k_slab[..slab_used];

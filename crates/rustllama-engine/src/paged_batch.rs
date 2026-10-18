@@ -47,8 +47,10 @@ use std::time::Instant;
 
 use futures::Stream;
 use rustllama_gguf::Gguf;
-use rustllama_models::llama_arch::{DecodeSlot, DeltaNetCache, KvCache, KvDtype, LlamaModel};
-use rustllama_models::page_table::PageTable;
+use rustllama_models::llama_arch::{
+    CascadeGroup, DecodeSlot, DeltaNetCache, KvCache, KvDtype, LlamaModel,
+};
+use rustllama_models::page_table::{PageId, PageTable};
 use rustllama_models::paged_kv_cache::PagedKvCache;
 use rustllama_models::paged_kv_store::PagedKvStore;
 use rustllama_models::shared_paged_kv::SharedPagedKv;
@@ -428,6 +430,12 @@ pub struct PagedBatchEngine {
     /// with the driver thread; read by tests to confirm the recompute-
     /// preemption path actually fired under page exhaustion.
     preemptions: Arc<std::sync::atomic::AtomicUsize>,
+    /// P3: cumulative count of cascade groups the engine has engaged (sync
+    /// batched path + driver ragged tick). A group forms only when >=2 slots
+    /// share a page-aligned APC prefix, so a non-zero count means the
+    /// shared-prefix cascade attention actually ran. Read by tests to confirm
+    /// the driver wiring engages.
+    cascade_engagements: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl PagedBatchEngine {
@@ -744,6 +752,7 @@ impl PagedBatchEngine {
         let last_stats: Arc<std::sync::Mutex<Option<RequestStats>>> =
             Arc::new(std::sync::Mutex::new(None));
         let preemptions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cascade_engagements = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         // P4s: optionally spawn the background emit worker. When on, the decode
         // tick hands each streamed token's detok + send to this worker so it
         // overlaps the next tick's forward; when off, the driver does the detok
@@ -772,6 +781,7 @@ impl PagedBatchEngine {
             active_slot_count: Arc::clone(&active_slot_count),
             last_stats: Arc::clone(&last_stats),
             preemptions: Arc::clone(&preemptions),
+            cascade_engagements: Arc::clone(&cascade_engagements),
             // Per-tick prompt-prefill token budget for the single ragged
             // driver path (T1). Every tick routes through the RAGGED mixed
             // forward (`forward_ragged_paged_f32`): one fused pass over the
@@ -844,11 +854,21 @@ impl PagedBatchEngine {
             active_slot_count,
             last_stats,
             preemptions,
+            cascade_engagements,
         })
     }
 
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    /// P3 (test-only): number of cascade groups engaged since load (sync
+    /// batched path + driver ragged tick). Non-zero ⇒ the shared-prefix cascade
+    /// attention actually ran for >=2 slots sharing a page-aligned prefix.
+    #[doc(hidden)]
+    pub fn cascade_engagements_for_tests(&self) -> usize {
+        self.cascade_engagements
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// F5 (test-only): number of recompute preemptions the driver has performed
@@ -1131,6 +1151,22 @@ impl PagedBatchEngine {
                     .collect();
                 let next_positions: Vec<u32> =
                     active_indices.iter().map(|&i| slots[i].next_pos).collect();
+                // P3: group active slots that share a page-aligned APC prefix
+                // so the batched decode computes the shared-prefix attention
+                // once (cascade). Members index into `decode_slots` (built below
+                // in active_indices order). Computed BEFORE the mutable borrows
+                // (reads `slots[i].cache.pages()` immutably).
+                let cascade_entries: Vec<(usize, Vec<PageId>)> = active_indices
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &i)| (k, slots[i].cache.pages().to_vec()))
+                    .collect();
+                let groups = build_cascade_groups(&cascade_entries, self.page_size as usize);
+                if !groups.is_empty() {
+                    self.cascade_engagements
+                        .fetch_add(groups.len(), std::sync::atomic::Ordering::Release);
+                }
+
                 // Build DecodeSlot vec with disjoint borrows on the
                 // active slots' caches + logits. The `Option::take`
                 // trick gives us by-index disjoint borrows safely
@@ -1152,8 +1188,16 @@ impl PagedBatchEngine {
                     });
                 }
 
-                self.model
-                    .forward_decode_paged_batched_f32(&mut decode_slots, &self.shared);
+                let cascade_opt = if groups.is_empty() {
+                    None
+                } else {
+                    Some(groups.as_slice())
+                };
+                self.model.forward_decode_paged_batched_cascade_f32(
+                    &mut decode_slots,
+                    &self.shared,
+                    cascade_opt,
+                );
                 // Release the borrows before sampling — we need
                 // `&mut slots` again.
                 drop(decode_slots);
@@ -1334,6 +1378,252 @@ impl PagedBatchEngine {
         }
         self.submit_streaming_with_opts(token_ids, sampling, opts)
     }
+
+    /// P12b — beam search on the paged engine. Mirrors
+    /// [`crate::inference::CpuEngine::generate_beam_token_ids`] (same pure
+    /// bookkeeping from [`crate::beam`] — candidate build, HF selection,
+    /// length-penalty pool), but forks each beam's KV on the PAGED store: the
+    /// page-aligned PROMPT PREFIX is SHARED across all beams via pinned paged
+    /// pages (the APC fork — no copy), and only each beam's divergent suffix is
+    /// copied into the child's own pages on a fork
+    /// ([`rustllama_models::paged_kv_store::PagedKvStore::copy_positions_between`]).
+    ///
+    /// Determinism: no sampling. `num_beams == 1` is BYTE-IDENTICAL to greedy on
+    /// the paged engine — the seed + each fork run the SAME dense prefill
+    /// (`forward_prefill_paged_f32`) + single-slot batched decode
+    /// (`forward_decode_paged_batched_f32`) the sync greedy path uses, and the
+    /// single surviving beam always takes the argmax candidate (lowest-id tie-
+    /// break, like greedy). Runs on a DEDICATED local paged pool, so it never
+    /// contends with the driver's live pool.
+    ///
+    /// Scope (mirrors the contiguous beam's refusals): plain DENSE transformer
+    /// only. Hybrid (recurrent state isn't page-addressable), MoE
+    /// (`forward_prefill_paged_f32` is dense-only), and sliding-window /
+    /// attention-logit soft-cap models are refused with a clear error.
+    pub fn generate_beam_token_ids(
+        &self,
+        prompt_ids: &[i32],
+        n_new: u32,
+        beam: &crate::beam::BeamParams,
+    ) -> EngineResult<Vec<crate::beam::BeamHypothesis>> {
+        use crate::beam::{build_sorted_candidates, select_step, BeamPool};
+        use crate::inference::top_k_by_logit;
+
+        let num_beams = beam.num_beams.max(1);
+        if prompt_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.model.weights.is_hybrid() {
+            return Err(EngineError::Engine(
+                "beam search is not supported for hybrid (DeltaNet/SSM) models on the paged \
+                 engine (recurrent state is not page-addressable)"
+                    .into(),
+            ));
+        }
+        if self.model.cfg.moe.is_some() {
+            return Err(EngineError::Engine(
+                "beam search is not supported for MoE models on the paged engine \
+                 (the paged prefill forward is dense-only)"
+                    .into(),
+            ));
+        }
+        if self.model.cfg.sliding_window.is_some()
+            || self.model.cfg.attn_logit_softcapping.is_some()
+        {
+            return Err(EngineError::Engine(
+                "beam search is not supported for sliding-window / attention-logit-softcap \
+                 models on the paged engine"
+                    .into(),
+            ));
+        }
+        let prompt_len = prompt_ids.len();
+        // +1 position for the greedy "re-forward the last prompt token" convention
+        // the sync decode uses (so num_beams==1 lines up with it exactly).
+        let total_required = prompt_len + n_new as usize + 1;
+        if total_required > self.max_ctx {
+            return Err(EngineError::Engine(format!(
+                "beam: prompt {prompt_len} + max_new {n_new} exceeds max_ctx {}",
+                self.max_ctx
+            )));
+        }
+
+        let vocab = self.model.cfg.vocab_size;
+        let eos = self.model.cfg.eos_token_id;
+        let length_penalty = beam.length_penalty;
+        // 2*num_beams candidates per beam guarantees num_beams non-EOS survivors
+        // (the HuggingFace convention), capped at the vocab.
+        let cand_k = (2 * num_beams).min(vocab).max(1);
+
+        let page_size = self.page_size;
+        let cap = total_required as u32;
+        let pages_per = cap.div_ceil(page_size).max(1);
+        // Local pool: base donor + up to ~2*num_beams live caches (a step's
+        // forked children coexist with their parents before the parents are
+        // released). Over-provision slightly.
+        let total_pages = pages_per
+            .saturating_mul(2 * num_beams as u32 + 2)
+            .max(pages_per + 1);
+        let n_layers = self.model.cfg.n_layers as u32;
+        let n_kv_heads = self.model.cfg.n_kv_heads as u32;
+        let head_dim = self.model.cfg.head_dim as u32;
+        let store = PagedKvStore::new(total_pages, n_layers, n_kv_heads, page_size, head_dim)
+            .ok_or_else(|| EngineError::Engine("beam: paged store geometry".into()))?;
+        let table = PageTable::new(total_pages, page_size);
+        let bshared = SharedPagedKv::new(store, table);
+        let geom_store = PagedKvStore::new(total_pages, n_layers, n_kv_heads, page_size, head_dim)
+            .ok_or_else(|| EngineError::Engine("beam: geom store geometry".into()))?;
+
+        // Base donor: prefill the whole prompt ONCE (dense). Holds [0, prompt_len).
+        let mut base = PagedKvCache::new_for(&geom_store);
+        base.ensure_capacity_shared(&bshared, cap)
+            .map_err(|s| EngineError::Engine(format!("beam base capacity short by {s} pages")))?;
+        bshared.with_store_mut(|st| {
+            let _ = self
+                .model
+                .forward_prefill_paged_f32(prompt_ids, 0, &mut base, st);
+        });
+        let shared_prefix_len = (prompt_len as u32 / page_size) * page_size;
+        let n_shared_pages = (shared_prefix_len / page_size) as usize;
+        let shared_prefix_pages: Vec<PageId> = base.pages()[..n_shared_pages].to_vec();
+
+        // Fork a fresh child cache that SHARES the prompt prefix pages and gets
+        // its own copy of the parent's divergent suffix [shared_prefix_len,
+        // parent.seq_len).
+        let fork = |parent: &PagedKvCache| -> EngineResult<PagedKvCache> {
+            let mut child = PagedKvCache::new_for(&geom_store);
+            if !shared_prefix_pages.is_empty() {
+                bshared.with_table_mut(|t| t.add_ref(&shared_prefix_pages));
+                child.pin_shared_prefix(shared_prefix_pages.clone(), shared_prefix_len);
+            }
+            child
+                .ensure_capacity_shared(&bshared, cap)
+                .map_err(|s| EngineError::Engine(format!("beam fork capacity short by {s}")))?;
+            let end = parent.seq_len();
+            bshared.with_store_mut(|st| {
+                st.copy_positions_between(
+                    parent.pages(),
+                    child.pages(),
+                    shared_prefix_len as usize,
+                    end as usize,
+                )
+            });
+            child.set_seq_len_grown(end);
+            Ok(child)
+        };
+
+        // One single-slot batched decode: forward `token` at `pos` on `cache`
+        // (writes its K/V), returning next-token logits. Same forward the sync
+        // greedy path uses, so num_beams==1 is byte-identical to greedy.
+        let decode = |cache: &mut PagedKvCache, token: i32, pos: u32, logits: &mut [f32]| {
+            let mut slots = vec![DecodeSlot {
+                token_id: token,
+                pos,
+                cache,
+                logits_out: logits,
+            }];
+            self.model
+                .forward_decode_paged_batched_f32(&mut slots, &bshared);
+        };
+
+        struct LiveBeam {
+            tokens: Vec<u32>,
+            cum_logprob: f32,
+            cache: PagedKvCache,
+            topk: Vec<(u32, f32)>,
+        }
+
+        // Seed beam: fork the prompt KV, forward the last prompt token to get
+        // the first-token distribution.
+        let mut seed_cache = fork(&base)?;
+        let mut first_logits = vec![0f32; vocab];
+        decode(
+            &mut seed_cache,
+            prompt_ids[prompt_len - 1],
+            prompt_len as u32,
+            &mut first_logits,
+        );
+        let mut active: Vec<LiveBeam> = vec![LiveBeam {
+            tokens: Vec::new(),
+            cum_logprob: 0.0,
+            cache: seed_cache,
+            topk: top_k_by_logit(&first_logits, cand_k),
+        }];
+        let mut pool = BeamPool::new(num_beams, length_penalty);
+
+        for _step in 0..n_new {
+            // 1) Build + sort candidates across all live beams, then select.
+            let cands = {
+                let per_beam: Vec<(f32, &[(u32, f32)])> = active
+                    .iter()
+                    .map(|b| (b.cum_logprob, b.topk.as_slice()))
+                    .collect();
+                build_sorted_candidates(&per_beam)
+            };
+            let sel = select_step(&cands, num_beams, eos);
+
+            // 2) Retire EOS-finishers (store tokens incl. the EOS, matching greedy).
+            for f in &sel.finished {
+                let mut toks = active[f.parent].tokens.clone();
+                toks.push(f.token);
+                pool.add(toks, f.cum_logprob);
+            }
+            if sel.continuing.is_empty() {
+                break;
+            }
+
+            // 3) Materialize each surviving beam: fork the parent's KV, forward
+            //    the new token, recompute its candidate set.
+            let mut next: Vec<LiveBeam> = Vec::with_capacity(sel.continuing.len());
+            for c in &sel.continuing {
+                let new_pos = active[c.parent].cache.seq_len();
+                let mut child = fork(&active[c.parent].cache)?;
+                let mut logits = vec![0f32; vocab];
+                decode(&mut child, c.token as i32, new_pos, &mut logits);
+                let mut toks = active[c.parent].tokens.clone();
+                toks.push(c.token);
+                next.push(LiveBeam {
+                    tokens: toks,
+                    cum_logprob: c.cum_logprob,
+                    cache: child,
+                    topk: top_k_by_logit(&logits, cand_k),
+                });
+            }
+            // Release the old generation's caches (decrement shared-prefix refs
+            // + free each beam's own suffix pages) now that children are forked.
+            for b in active.drain(..) {
+                let mut cc = b.cache;
+                cc.release_shared(&bshared);
+            }
+            active = next;
+
+            // 4) Context-window guard — every live beam is the same length.
+            let cur_total = prompt_len + active[0].tokens.len();
+            if cur_total + 1 >= self.max_ctx {
+                break;
+            }
+            // 5) Early-stopping / unbeatable-bound done check.
+            let best_running = active
+                .iter()
+                .map(|b| b.cum_logprob)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let cur_len = active[0].tokens.len();
+            if pool.is_done(beam.early_stopping, best_running, cur_len) {
+                break;
+            }
+        }
+
+        // Finalize: any still-live beams become finished hypotheses (no EOS).
+        for b in active.drain(..) {
+            let mut cc = b.cache;
+            pool.add(b.tokens, b.cum_logprob);
+            cc.release_shared(&bshared);
+        }
+        base.release_shared(&bshared);
+
+        let mut ranked = pool.into_ranked();
+        ranked.truncate(beam.k());
+        Ok(ranked)
+    }
 }
 
 impl Engine for PagedBatchEngine {
@@ -1501,6 +1791,9 @@ struct DriverContext {
     /// F5: count of slots the driver has preempted (for observability + tests).
     /// Bumped in [`preempt_slot`].
     preemptions: Arc<std::sync::atomic::AtomicUsize>,
+    /// P3: count of cascade groups engaged in the ragged decode tick (shared
+    /// with the engine's `cascade_engagements`, read by tests).
+    cascade_engagements: Arc<std::sync::atomic::AtomicUsize>,
     /// Per-tick prompt-prefill token budget for the single ragged driver path
     /// (`RUSTLLAMA_MAX_BATCHED_TOKENS` / `[inference].max_num_batched_tokens`).
     /// Already resolved: `0` was mapped to `usize::MAX` (unbounded — whole
@@ -2360,6 +2653,69 @@ fn pick_shared_prefix_from_slots(
     (best_pages, best_lcp)
 }
 
+/// P3 driver wiring: group decode slots that share a page-aligned APC prefix so
+/// the ragged / batched forward can compute the shared-prefix attention ONCE
+/// and merge per slot (the cascade path). `entries` is `(forward_slot_index,
+/// pages)` for each DECODE-ready slot this tick — `forward_slot_index` is the
+/// index into the `slots`/`ragged` slice the forward receives.
+///
+/// Buckets by the first shared page id, then within a bucket takes the LONGEST
+/// common page-prefix (>=1 whole page). Returns one [`CascadeGroup`] per bucket
+/// with >=2 members and a non-trivial (>= `page_size`) shared prefix; buckets
+/// that don't share a whole first page yield nothing (so those slots take the
+/// byte-identical per-slot path). The shared pages being IDENTICAL `PageId`s
+/// guarantees identical prefix K/V content (the engine's `pin_shared_prefix` /
+/// APC acquire pinned the same physical pages), which is exactly the cascade
+/// kernel's `cascade == per-sequence` precondition.
+fn build_cascade_groups(entries: &[(usize, Vec<PageId>)], page_size: usize) -> Vec<CascadeGroup> {
+    use std::collections::HashMap;
+    if page_size == 0 || entries.len() < 2 {
+        return Vec::new();
+    }
+    // Bucket entry indices by the first page id.
+    let mut buckets: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (ei, (_slot, pages)) in entries.iter().enumerate() {
+        if let Some(first) = pages.first() {
+            buckets.entry(first.0).or_default().push(ei);
+        }
+    }
+    let mut groups = Vec::new();
+    for (_first, bucket) in buckets {
+        if bucket.len() < 2 {
+            continue;
+        }
+        // Longest common page-prefix across the bucket.
+        let min_pages = bucket
+            .iter()
+            .map(|&ei| entries[ei].1.len())
+            .min()
+            .unwrap_or(0);
+        let mut cp = 0usize;
+        'outer: for p in 0..min_pages {
+            let page0 = entries[bucket[0]].1[p];
+            for &ei in &bucket[1..] {
+                if entries[ei].1[p] != page0 {
+                    break 'outer;
+                }
+            }
+            cp = p + 1;
+        }
+        if cp == 0 {
+            continue;
+        }
+        let prefix_len = cp * page_size;
+        if prefix_len < page_size {
+            continue;
+        }
+        let members: Vec<usize> = bucket.iter().map(|&ei| entries[ei].0).collect();
+        groups.push(CascadeGroup {
+            prefix_len,
+            members,
+        });
+    }
+    groups
+}
+
 /// Which way a slot participates in a ragged tick (Feature 3b).
 #[derive(Clone, Copy)]
 enum RaggedKind {
@@ -2472,6 +2828,24 @@ fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
         return;
     }
 
+    // P3: group DECODE rows that share a page-aligned APC prefix so the ragged
+    // forward computes the shared-prefix attention once (cascade). Member index
+    // == plan index == ragged-slot index. Computed BEFORE the mutable cache
+    // borrows below.
+    let cascade_entries: Vec<(usize, Vec<PageId>)> = plan
+        .iter()
+        .enumerate()
+        .filter_map(|(p, (ai, kind, _, _))| match kind {
+            RaggedKind::Decode => Some((p, active[*ai].state.cache.pages().to_vec())),
+            _ => None,
+        })
+        .collect();
+    let cascade_groups = build_cascade_groups(&cascade_entries, ctx.page_size as usize);
+    if !cascade_groups.is_empty() {
+        ctx.cascade_engagements
+            .fetch_add(cascade_groups.len(), std::sync::atomic::Ordering::Release);
+    }
+
     // Per-decode-row logits buffers (prefill chunks discard logits → empty
     // slice, which the forward reads as "skip the LM head for this slot").
     let mut logits_store: Vec<Vec<f32>> = plan
@@ -2503,9 +2877,19 @@ fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
         });
     }
 
+    let cascade_opt = if cascade_groups.is_empty() {
+        None
+    } else {
+        Some(cascade_groups.as_slice())
+    };
     let tick_start = std::time::Instant::now();
-    ctx.model
-        .forward_ragged_paged_f32(&tokens, &mut ragged, &ctx.shared, None);
+    ctx.model.forward_ragged_paged_cascade_f32(
+        &tokens,
+        &mut ragged,
+        &ctx.shared,
+        None,
+        cascade_opt,
+    );
     let tick_ms = tick_start.elapsed().as_secs_f64() * 1000.0;
     // Release the borrows held through the forward before touching `active`.
     drop(ragged);

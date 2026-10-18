@@ -10574,7 +10574,7 @@ fn sort_desc_logit_then_idx(v: &mut [(u32, f32)]) {
 /// `(token, logprob)` where `logprob = logit - log_sum_exp(logits)`.
 /// Deterministic. The top element is always the argmax token, so a single
 /// beam's top candidate equals greedy's pick.
-fn top_k_by_logit(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
+pub(crate) fn top_k_by_logit(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
     let k = k.min(logits.len()).max(1);
     let lse = rustllama_kernels_cpu::log_sum_exp_f32(logits);
     // Single-pass top-k by logit: maintain a length-k running buffer sorted

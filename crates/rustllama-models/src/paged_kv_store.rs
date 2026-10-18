@@ -333,6 +333,108 @@ impl PagedKvStore {
         Some(())
     }
 
+    /// P3 cascade: like [`Self::gather_layer`] but gathers only the ABSOLUTE
+    /// position range `[start, end)` into a TIGHT `[n_kv_heads, end-start,
+    /// head_dim]` slab. The shared-prefix (cascade) decode path uses it to
+    /// gather a shared prompt prefix ONCE (`[0, prefix_len)`) and each
+    /// sequence's private suffix (`[prefix_len, kv_len)`) separately, so the
+    /// prefix K/V lives in one buffer instead of `n_seq` copies.
+    ///
+    /// Assumes NO eviction (the paged continuous-batching pool never evicts —
+    /// `ensure_capacity_shared` routes through the plain allocator), so absolute
+    /// position `p` lives in `pages[p / page_size]` at in-page offset `p %
+    /// page_size`. Returns `None` on a geometry / length mismatch.
+    pub fn gather_layer_range(
+        &self,
+        pages: &[PageId],
+        layer: u32,
+        start: u32,
+        end: u32,
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+    ) -> Option<()> {
+        if layer >= self.n_layers || end < start {
+            return None;
+        }
+        let len = (end - start) as usize;
+        let hd = self.head_dim as usize;
+        let need = (self.n_kv_heads as usize) * len * hd;
+        if k_out.len() != need || v_out.len() != need {
+            return None;
+        }
+        if len == 0 {
+            return Some(());
+        }
+        let ps = self.page_size as usize;
+        let pages_needed = (end as usize).div_ceil(ps);
+        if pages.len() < pages_needed {
+            return None;
+        }
+        for h in 0..self.n_kv_heads {
+            let out_head_base = (h as usize) * len * hd;
+            let mut pos = start as usize;
+            let mut out_pos = 0usize;
+            while pos < end as usize {
+                let page = pages[pos / ps];
+                let in_page = pos % ps;
+                // Positions [in_page, in_page + strip) are contiguous for this
+                // head within the page; copy them in one strip.
+                let strip = (ps - in_page).min(end as usize - pos);
+                let k_src = self.cell_offset(page, layer, 0, h, in_page as u32)?;
+                let v_src = self.cell_offset(page, layer, 1, h, in_page as u32)?;
+                let copy = strip * hd;
+                let dst = out_head_base + out_pos * hd;
+                k_out[dst..dst + copy].copy_from_slice(&self.data[k_src..k_src + copy]);
+                v_out[dst..dst + copy].copy_from_slice(&self.data[v_src..v_src + copy]);
+                pos += strip;
+                out_pos += strip;
+            }
+        }
+        Some(())
+    }
+
+    /// P12b paged beam: copy KV rows for ABSOLUTE positions `[start, end)`
+    /// across every layer and head from `src_pages` to `dst_pages` (both laid
+    /// out with this store's geometry). The beam fork uses it to clone a parent
+    /// beam's divergent suffix into a child's freshly-allocated pages while the
+    /// shared prompt prefix stays SHARED (never copied). Assumes no eviction
+    /// (absolute pos → `pages[pos / page_size]`). Reads each row into a short
+    /// temp first so a `src == dst` page aliasing move stays safe.
+    pub fn copy_positions_between(
+        &mut self,
+        src_pages: &[PageId],
+        dst_pages: &[PageId],
+        start: usize,
+        end: usize,
+    ) {
+        let ps = self.page_size as usize;
+        let hd = self.head_dim as usize;
+        let mut tmp = vec![0f32; hd];
+        for layer in 0..self.n_layers {
+            for pos in start..end {
+                let (Some(&sp), Some(&dp)) = (src_pages.get(pos / ps), dst_pages.get(pos / ps))
+                else {
+                    debug_assert!(false, "copy_positions_between: pos {pos} out of page range");
+                    continue;
+                };
+                let sin = (pos % ps) as u32;
+                let din = (pos % ps) as u32;
+                for h in 0..self.n_kv_heads {
+                    for kv in 0..2u32 {
+                        let so = self
+                            .cell_offset(sp, layer, kv, h, sin)
+                            .expect("copy_positions_between: src cell in range");
+                        tmp.copy_from_slice(&self.data[so..so + hd]);
+                        let do_ = self
+                            .cell_offset(dp, layer, kv, h, din)
+                            .expect("copy_positions_between: dst cell in range");
+                        self.data[do_..do_ + hd].copy_from_slice(&tmp);
+                    }
+                }
+            }
+        }
+    }
+
     /// F7 tree-spec commit: move a speculative tree's ACCEPTED-path K/V rows
     /// into contiguous committed positions. After a paged tree verify wrote
     /// every node's K/V at absolute position `base + node_index`, the accepted

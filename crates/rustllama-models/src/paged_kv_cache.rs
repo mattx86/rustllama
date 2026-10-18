@@ -807,6 +807,40 @@ impl PagedKvCache {
     pub fn release_shared(&mut self, shared: &crate::shared_paged_kv::SharedPagedKv) {
         shared.with_table_mut(|table| self.release(table));
     }
+
+    /// P3 cascade: shared-store POSITION-RANGE gather — gathers only the
+    /// absolute range `[start, end)` into a tight `[n_kv_heads, end-start,
+    /// head_dim]` slab (see [`crate::paged_kv_store::PagedKvStore::gather_layer_range`]).
+    /// The shared-prefix decode path gathers the shared prefix once + each
+    /// sequence's suffix separately. The batched paged pool never engages
+    /// eviction, so this reads absolute positions directly.
+    pub fn gather_layer_range_shared(
+        &self,
+        shared: &crate::shared_paged_kv::SharedPagedKv,
+        layer: u32,
+        start: u32,
+        end: u32,
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+    ) -> Option<()> {
+        debug_assert!(
+            !self.evict_engaged(),
+            "gather_layer_range_shared assumes no eviction (batched paged pool)"
+        );
+        shared.with_store(|store| store.gather_layer_range(&self.pages, layer, start, end, k_out, v_out))
+    }
+
+    /// P12b paged beam: raise the `seq_len` watermark to `n` after a raw
+    /// cross-cache KV copy ([`crate::paged_kv_store::PagedKvStore::copy_positions_between`])
+    /// populated positions `[0, n)` WITHOUT going through `write_token`. Only
+    /// grows the watermark (a shrink is [`Self::set_seq_len_for_rollback`]); the
+    /// beam fork uses it so a freshly-forked child's `gather_layer` sees the
+    /// cloned suffix.
+    pub fn set_seq_len_grown(&mut self, n: u32) {
+        if n > self.seq_len {
+            self.seq_len = n;
+        }
+    }
 }
 
 #[cfg(test)]
