@@ -177,6 +177,89 @@ fn no_head_is_byte_identical() {
     let _ = std::fs::remove_file(&head);
 }
 
+/// P10b-tail — the `#[ignore]`d REAL-head coherence hook. Runs ONLY when
+/// `RUSTLLAMA_REAL_EAGLE_BASE` (a real base model GGUF) and
+/// `RUSTLLAMA_REAL_EAGLE_HEAD` (a matching trained EAGLE draft-head GGUF) are
+/// BOTH set. No such head exists for a supported base on-box, so the test is
+/// `#[ignore]` (never runs in normal CI) and early-returns cleanly when the env
+/// vars are unset — model-blind until a real head exists.
+///
+/// EAGLE's tree-verify is lossless under greedy acceptance: a wrong draft is
+/// rejected and replaced by the target argmax, so the committed tokens MUST
+/// equal the base model's plain greedy continuation token-for-token. This hook
+/// loads the real base + head, runs a CHAIN-shaped EAGLE stream (widths all 1,
+/// the degenerate linear case), and asserts the accepted prefix equals a
+/// non-speculative greedy run on the same base — real-head COHERENCE, on HW.
+///
+/// Run on a box that has a real head with, e.g.:
+///   RUSTLLAMA_REAL_EAGLE_BASE=/models/base.gguf \
+///   RUSTLLAMA_REAL_EAGLE_HEAD=/models/eagle-head.gguf \
+///   cargo test -p rustllama-engine --test eagle -- --ignored --exact \
+///     eagle_real_head_matches_base_greedy
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RUSTLLAMA_REAL_EAGLE_BASE + RUSTLLAMA_REAL_EAGLE_HEAD pointing at a real base + trained EAGLE head (none on-box)"]
+async fn eagle_real_head_matches_base_greedy() {
+    let (base_path, head_path) = match (
+        std::env::var_os("RUSTLLAMA_REAL_EAGLE_BASE"),
+        std::env::var_os("RUSTLLAMA_REAL_EAGLE_HEAD"),
+    ) {
+        (Some(b), Some(h)) => (std::path::PathBuf::from(b), std::path::PathBuf::from(h)),
+        _ => {
+            eprintln!(
+                "skipping eagle_real_head_matches_base_greedy: set RUSTLLAMA_REAL_EAGLE_BASE and \
+                 RUSTLLAMA_REAL_EAGLE_HEAD to run the real-head coherence hook"
+            );
+            return;
+        }
+    };
+
+    let mut cpu = CpuEngine::load_with_options(&base_path, 2048, true, KvDtype::F32)
+        .expect("load real base model");
+    cpu.attach_eagle_head(&head_path)
+        .expect("attach real EAGLE head (must match the base config)");
+    assert!(
+        cpu.eagle_speculative(),
+        "real base + real head ⇒ EAGLE engaged"
+    );
+    // Chain tree (width 1 at every depth) is the degenerate linear case: EAGLE
+    // must reduce EXACTLY to greedy decode on the base.
+    cpu.set_tree_speculative(Some(vec![1, 1, 1, 1]));
+
+    // Tokenize a short prompt with the base's own tokenizer.
+    let prompt_ids: Vec<i32> = {
+        let tok = cpu.tokenizer().expect("base model carries a tokenizer");
+        tok.encode("The quick brown fox", tok.add_bos_token())
+            .expect("encode prompt")
+            .into_iter()
+            .map(|v| v as i32)
+            .collect()
+    };
+    assert!(!prompt_ids.is_empty(), "prompt tokenized to zero tokens");
+
+    let n = 32u32;
+    let head_arc = cpu.eagle_head().expect("eagle head present");
+    let mut stream = cpu
+        .speculate_eagle_stream_from_ids(prompt_ids.clone(), greedy(n), head_arc)
+        .expect("eagle stream");
+    let mut eagle_ids: Vec<u32> = Vec::new();
+    while let Some(item) = stream.next().await {
+        eagle_ids.push(item.expect("eagle stream token").id);
+    }
+    assert!(!eagle_ids.is_empty(), "real-head EAGLE produced no tokens");
+
+    let plain = cpu
+        .generate_token_ids(&prompt_ids, n, &greedy(n))
+        .expect("plain greedy on the base");
+    let common = eagle_ids.len().min(plain.len());
+    assert!(common > 0, "no accepted/greedy overlap to compare");
+    assert_eq!(
+        &eagle_ids[..common],
+        &plain[..common],
+        "real EAGLE head: the accepted tokens must equal the base's plain greedy \
+         continuation token-for-token (the tree-verify is lossless under greedy)"
+    );
+}
+
 /// A malformed companion (not tagged `adapter.type = "eagle"`) is rejected at
 /// attach — the fail-closed contract (a bad head fails the load loudly rather
 /// than silently degrading decode).
