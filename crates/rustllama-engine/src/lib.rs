@@ -861,6 +861,30 @@ pub trait Engine: Send + Sync {
         None
     }
 
+    /// Tool-calling support — an OWNED handle to this engine's tokenizer,
+    /// or `None` when the engine has no tokenizer (the test [`MockEngine`],
+    /// or a model loaded without one). The server's tool/function-calling
+    /// handlers render the chat prompt + build the tool-call grammar
+    /// SERVER-SIDE, which needs the tokenizer BEFORE the per-model gate
+    /// `.await`; returning an owned `Arc` (not a borrow) lets the handler
+    /// hold it across that await without a borrow-vs-await clash. Both
+    /// [`CpuEngine`] and [`crate::paged_batch::PagedBatchEngine`] override
+    /// this — the tools path then runs identically on either engine, since
+    /// the tool-call grammar is applied per-slot in both drivers.
+    fn tokenizer_arc(&self) -> Option<std::sync::Arc<rustllama_tokenizer::Tokenizer>> {
+        None
+    }
+
+    /// Tool-calling support — the engine's context window in tokens, used
+    /// by the server to clamp the generation budget on the tools path (the
+    /// generic counterpart of the inherent `max_ctx()` accessors on the
+    /// concrete engines). The default derives it from the required
+    /// [`Self::n_ctx`] so every engine has a sane value; `CpuEngine` /
+    /// `PagedBatchEngine` override to return their stored `max_ctx` directly.
+    fn max_ctx(&self) -> usize {
+        self.n_ctx() as usize
+    }
+
     /// P11 — attach (load, UNMERGED) a resident LoRA adapter under `name`,
     /// returning its adapted-tensor count. A later request selects it via
     /// [`SamplingParams::lora_adapter`]. Default: unsupported (every engine

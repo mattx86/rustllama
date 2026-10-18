@@ -1753,6 +1753,18 @@ impl Engine for PagedBatchEngine {
         self.last_stats.lock().ok().and_then(|g| g.clone())
     }
 
+    // Tool-calling support — expose the real tokenizer + context window
+    // generically so the server's tools handlers work off `&dyn Engine`.
+    // This is what lets tool/function-calling run on the paged engine:
+    // the handlers render the prompt + build the tool-call grammar from
+    // these, and the grammar is applied per-slot by `build_paged_grammar`.
+    fn tokenizer_arc(&self) -> Option<Arc<Tokenizer>> {
+        self.tokenizer.clone()
+    }
+    fn max_ctx(&self) -> usize {
+        self.max_ctx
+    }
+
     // P11 — resident multi-LoRA (trait surface; delegates to the inherent
     // methods, mapping the error type).
     fn attach_lora_adapter(&self, name: &str, path: &Path) -> EngineResult<usize> {

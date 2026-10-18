@@ -8091,6 +8091,16 @@ impl Engine for CpuEngine {
         Some(self.cumulative_request_stats())
     }
 
+    // Tool-calling support — expose the real tokenizer + context window
+    // generically so the server's tools handlers work off `&dyn Engine`
+    // (not the concrete `CpuEngine`). Owned `Arc` clone is cheap.
+    fn tokenizer_arc(&self) -> Option<Arc<Tokenizer>> {
+        self.tokenizer.clone()
+    }
+    fn max_ctx(&self) -> usize {
+        self.max_ctx
+    }
+
     // P11 — resident multi-LoRA (trait surface for the server's `Arc<dyn
     // Engine>`; delegates to the inherent methods, mapping the error type).
     fn attach_lora_adapter(&self, name: &str, path: &std::path::Path) -> EngineResult<usize> {

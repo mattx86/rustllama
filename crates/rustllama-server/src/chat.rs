@@ -848,32 +848,27 @@ async fn chat_with_tools(state: AppState, req: ChatRequest, sched: ReqSchedule) 
         return model_not_found(req.model.as_deref());
     };
     // Two-phase admission: tokenizer access + chat-template render +
-    // prompt-token count all happen against the Arc-shared CPU engine
+    // prompt-token count all happen against the Arc-shared engine
     // BEFORE the gate wait, so the work overlaps the current
     // request's decode on queued arrivals.
-    // P14-http: the tools path is CpuEngine-only (it 503s on the paged engine),
-    // so the driver deadline/heap never apply here; thread only the admission
-    // priority into the server scheduler slot.
+    // P14-http: thread the admission priority into the server scheduler
+    // slot. The paged engine additionally honors a driver deadline/heap,
+    // but the generation itself is driven generically via `handle.engine`.
     let permit = match serving.try_admit_with_priority(sched.priority()) {
         Ok(p) => p,
         Err(be) => return be.into_response(),
     };
-    let shared_cpu = match serving.cpu_engine.as_ref() {
-        Some(e) => e.clone(),
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "tools/functions requires a real engine (not the MockEngine)",
-            )
-                .into_response();
-        }
-    };
-    let tokenizer = match shared_cpu.tokenizer() {
+    // Source the tokenizer + context window generically off `&dyn Engine`
+    // so tool-calling works on EITHER backend (CpuEngine or the continuous-
+    // batching paged engine — both build the tool-call grammar per-slot).
+    // The only genuinely-unsupported case is an engine with no tokenizer
+    // (the test MockEngine / a model loaded without one).
+    let tokenizer = match serving.engine.tokenizer_arc() {
         Some(t) => t,
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "tools/functions requires a model with a tokenizer",
+                "tool-calling requires a loaded model",
             )
                 .into_response();
         }
@@ -963,9 +958,11 @@ async fn chat_with_tools(state: AppState, req: ChatRequest, sched: ReqSchedule) 
         .map(|ids| ids.len() as u32)
         .unwrap_or(0);
     // E2-ingress: clamp the generation budget to the context window.
-    if let Some((code, msg)) =
-        crate::clamp_max_tokens_to_ctx(&mut sampling, prompt_tokens as usize, shared_cpu.max_ctx())
-    {
+    if let Some((code, msg)) = crate::clamp_max_tokens_to_ctx(
+        &mut sampling,
+        prompt_tokens as usize,
+        serving.engine.max_ctx(),
+    ) {
         return (code, msg).into_response();
     }
 
@@ -983,16 +980,11 @@ async fn chat_with_tools(state: AppState, req: ChatRequest, sched: ReqSchedule) 
         Ok(h) => h,
         Err(be) => return be.into_response(),
     };
-    let cpu = match handle.cpu_engine.as_ref() {
-        Some(e) => e.clone(),
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "tools/functions requires a real engine (not the MockEngine)",
-            )
-                .into_response();
-        }
-    };
+    // Generation is driven generically (`handle.engine` — both CpuEngine and
+    // the paged engine impl it); the typed `cpu_engine` handle is `None` when
+    // the model is served by the paged engine, so logprob alt-token decode +
+    // kv-dtype label degrade gracefully to `None` there rather than 503-ing.
+    let cpu = handle.cpu_engine.as_deref();
     let mut tok_stream = match handle.engine.generate(&prompt, &sampling) {
         Ok(s) => s,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -1005,7 +997,7 @@ async fn chat_with_tools(state: AppState, req: ChatRequest, sched: ReqSchedule) 
             Ok(t) => {
                 if want_logprobs {
                     if let Some(lp) = t.logprobs.as_ref() {
-                        logprob_tokens.push(make_token_logprob_out(&t.text, lp, Some(&cpu)));
+                        logprob_tokens.push(make_token_logprob_out(&t.text, lp, cpu));
                     }
                 }
                 raw.push_str(&t.text);
@@ -1015,8 +1007,13 @@ async fn chat_with_tools(state: AppState, req: ChatRequest, sched: ReqSchedule) 
         }
     }
 
-    // Capture per-request stats while the gate permit is still held.
-    let stats = cpu.last_request_stats();
+    // Capture per-request stats while the gate permit is still held. Sourced
+    // generically so the paged engine's stats surface too; `CpuEngine`'s
+    // snapshot is `Some(last_request_stats())` — byte-identical to before.
+    let stats = handle
+        .engine
+        .last_request_stats_snapshot()
+        .unwrap_or_default();
 
     // Parse model output: anything inside `<tool_call>{...}</tool_call>`
     // (plus the Llama-3 `<|python_tag|>`, Mistral `[TOOL_CALLS]`, and
@@ -1055,7 +1052,11 @@ async fn chat_with_tools(state: AppState, req: ChatRequest, sched: ReqSchedule) 
         None
     };
 
-    let fingerprint = crate::system_fingerprint(&state.version, &model_id, kv_dtype_label(&cpu));
+    let fingerprint = crate::system_fingerprint(
+        &state.version,
+        &model_id,
+        cpu.map(kv_dtype_label).unwrap_or(""),
+    );
     Json(ChatResponse {
         id: request_id(),
         object: "chat.completion",
@@ -1087,28 +1088,22 @@ async fn chat_stream_with_tools(state: AppState, req: ChatRequest, sched: ReqSch
         return model_not_found(req.model.as_deref());
     };
     // Two-phase admission — tokenization + chat-template render with
-    // tools all happen pre-gate against the Arc-shared CPU engine.
-    // P14-http: CpuEngine-only path — priority only (see `chat_with_tools`).
+    // tools all happen pre-gate against the Arc-shared engine.
+    // P14-http: thread the admission priority into the scheduler slot; the
+    // generation below is driven generically via `handle.engine`.
     let permit = match serving.try_admit_with_priority(sched.priority()) {
         Ok(p) => p,
         Err(be) => return be.into_response(),
     };
-    let shared_cpu = match serving.cpu_engine.as_ref() {
-        Some(e) => e.clone(),
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "tools/functions requires a real engine (not the MockEngine)",
-            )
-                .into_response();
-        }
-    };
-    let tokenizer = match shared_cpu.tokenizer() {
+    // Tokenizer + context window sourced generically so tool-calling works on
+    // the paged engine too (see `chat_with_tools`). The only unsupported case
+    // is an engine with no tokenizer (the test MockEngine / no model loaded).
+    let tokenizer = match serving.engine.tokenizer_arc() {
         Some(t) => t,
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "tools/functions requires a model with a tokenizer",
+                "tool-calling requires a loaded model",
             )
                 .into_response();
         }
@@ -1194,9 +1189,11 @@ async fn chat_stream_with_tools(state: AppState, req: ChatRequest, sched: ReqSch
         .map(|ids| ids.len() as u32)
         .unwrap_or(0);
     // E2-ingress: clamp the generation budget to the context window.
-    if let Some((code, msg)) =
-        crate::clamp_max_tokens_to_ctx(&mut sampling, prompt_tokens as usize, shared_cpu.max_ctx())
-    {
+    if let Some((code, msg)) = crate::clamp_max_tokens_to_ctx(
+        &mut sampling,
+        prompt_tokens as usize,
+        serving.engine.max_ctx(),
+    ) {
         return (code, msg).into_response();
     }
 
@@ -1211,9 +1208,11 @@ async fn chat_stream_with_tools(state: AppState, req: ChatRequest, sched: ReqSch
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    // The cpu_engine passed downstream is used for `last_request_stats`
-    // — that lives on the per-request fork in multi-flight, so it
-    // must come from the handle (not from serving).
+    // The typed cpu_engine passed downstream now only drives logprob
+    // alt-token decode + the kv-dtype fingerprint label (per-request stats
+    // are read generically off `handle.engine` inside the SSE builders). It
+    // comes from the handle (the per-request fork in multi-flight), and is
+    // `None` when the model is served by the paged engine.
     let cpu_for_stats = handle.cpu_engine.clone();
     let id_for_header = id.clone();
     let fingerprint = crate::system_fingerprint(
@@ -1458,7 +1457,10 @@ fn build_sse_stream_with_tools(
         // point; 3 and 4 were set during the parser-flush pass. Apply 5 and
         // 6 here on top of the default "stop" — but never over `ask_user`,
         // which is a clean, user-actionable terminus.
-        let stats = cpu.as_deref().map(|c| c.last_request_stats());
+        // Stats are read generically off the gate handle's engine so the
+        // paged engine's stats surface too; for `CpuEngine` the snapshot is
+        // `Some(last_request_stats())` — byte-identical to the prior path.
+        let stats = permit.engine.last_request_stats_snapshot();
         if !ask_user_seen && stats.as_ref().map(|s| s.tool_call_limit_hit).unwrap_or(false) {
             finish_reason = "tool_call_iteration_limit";
         } else if finish_reason == "stop" && completion_tokens >= max_tokens {

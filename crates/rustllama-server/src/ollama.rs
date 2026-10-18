@@ -1147,17 +1147,14 @@ async fn ollama_chat_with_tools(
         .clone()
         .unwrap_or_else(|| serving.model_id.clone());
 
-    let Some(shared_cpu) = serving.cpu_engine.as_ref().cloned() else {
+    // Source the tokenizer + context window generically off `&dyn Engine`
+    // so tool-calling works on the paged engine too (the tool-call grammar
+    // runs per-slot on either backend). The only unsupported case is an
+    // engine with no tokenizer (the test MockEngine / no model loaded).
+    let Some(tokenizer) = serving.engine.tokenizer_arc() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "tools require a real engine (not the MockEngine)" })),
-        )
-            .into_response();
-    };
-    let Some(tokenizer) = shared_cpu.tokenizer() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "tools require a model with a tokenizer" })),
+            Json(json!({ "error": "tool-calling requires a loaded model" })),
         )
             .into_response();
     };
@@ -1213,7 +1210,7 @@ async fn ollama_chat_with_tools(
     if let Some((code, msg)) = crate::clamp_max_tokens_to_ctx(
         &mut sampling,
         prompt_eval_count as usize,
-        shared_cpu.max_ctx(),
+        serving.engine.max_ctx(),
     ) {
         return (code, Json(json!({ "error": msg }))).into_response();
     }

@@ -527,8 +527,12 @@ pub async fn messages(State(state): State<AppState>, Json(req): Json<MessagesReq
         msgs = inject_anthropic_env_hint(msgs);
     }
 
+    // Source the tokenizer generically off `&dyn Engine` so the tools path
+    // works on the paged engine too (the tool-call grammar runs per-slot on
+    // either backend). The only unsupported case is an engine with no
+    // tokenizer (the test MockEngine / no model loaded).
     let pre_rendered_prompt = if has_tools {
-        match serving.cpu_engine.as_ref().and_then(|e| e.tokenizer()) {
+        match serving.engine.tokenizer_arc() {
             Some(tokenizer) => {
                 let tok_msgs: Vec<rustllama_tokenizer::ChatMessage<'_>> = msgs
                     .iter()
@@ -551,7 +555,7 @@ pub async fn messages(State(state): State<AppState>, Json(req): Json<MessagesReq
             None => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "tools require a model with a tokenizer",
+                    "tool-calling requires a loaded model",
                 )
                     .into_response();
             }
@@ -566,10 +570,11 @@ pub async fn messages(State(state): State<AppState>, Json(req): Json<MessagesReq
     // messages. Computed here — after the render — so the reported count is
     // never the pre-tools message count.
     let input_tokens = match pre_rendered_prompt.as_ref() {
+        // Tools path: the pre-rendered prompt is counted with the generic
+        // tokenizer (works on either backend).
         Some(prompt) => serving
-            .cpu_engine
-            .as_ref()
-            .and_then(|e| e.tokenizer())
+            .engine
+            .tokenizer_arc()
             .and_then(|t| t.encode(prompt, t.add_bos_token()).ok())
             .map(|ids| ids.len() as u32)
             .unwrap_or(0),
@@ -824,9 +829,9 @@ async fn messages_blocking(
     // `__tool_call_iteration_limit__` sentinel on `stop_sequence`. Same
     // pattern as the OpenAI path uses with `finish_reason: "tool_call_iteration_limit"`.
     let tool_call_limit_hit = handle
-        .cpu_engine
-        .as_ref()
-        .map(|c| c.last_request_stats().tool_call_limit_hit)
+        .engine
+        .last_request_stats_snapshot()
+        .map(|s| s.tool_call_limit_hit)
         .unwrap_or(false);
 
     let (stop_reason, stop_sequence_out) = decide_anthropic_stop(
@@ -840,17 +845,18 @@ async fn messages_blocking(
         &content,
     );
 
-    // Populate the rustllama extension fields on `usage` when a real
-    // engine is present. With only the MockEngine (e.g. tests + clients
-    // hitting the harness without loading a model), the extension
-    // fields stay `None` and the response shape stays minimal.
+    // Populate the rustllama extension fields on `usage` from the per-request
+    // stats, sourced generically off the gate handle's engine (so the paged
+    // engine's stats surface too). With only the MockEngine (e.g. tests +
+    // clients hitting the harness without loading a model) the snapshot is
+    // `None` and the extension fields stay absent, keeping the shape minimal.
     let usage = AnthropicUsage {
         input_tokens,
         output_tokens,
         ..Default::default()
     };
-    let usage = match handle.cpu_engine.as_ref() {
-        Some(cpu) => usage.with_stats_cache_control(&cpu.last_request_stats(), has_cache_control),
+    let usage = match handle.engine.last_request_stats_snapshot() {
+        Some(stats) => usage.with_stats_cache_control(&stats, has_cache_control),
         None => usage,
     };
 
@@ -895,11 +901,11 @@ async fn messages_stream(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    // Keep a clone of the per-request fork so the SSE builder can
-    // query `last_request_stats().tool_call_limit_hit` at the end of
-    // the stream. Must be the handle's cpu_engine, not `serving`'s —
-    // in multi-flight, `serving.cpu_engine` is a different fork.
-    let cpu_engine_for_stats = handle.cpu_engine.clone();
+    // The SSE builder reads `last_request_stats().tool_call_limit_hit` +
+    // the usage extension stats at the end of the stream generically off
+    // the gate handle's engine (`permit.engine` inside the builder), which
+    // is the per-request fork in multi-flight — so no separate cpu handle
+    // needs threading, and the paged engine's stats surface too.
     let id_for_header = id.clone();
     let event_stream = build_anthropic_sse(
         id,
@@ -911,7 +917,6 @@ async fn messages_stream(
         sampling.stop.clone(),
         has_tools,
         cancel_guard,
-        cpu_engine_for_stats,
         has_cache_control,
     );
     (
@@ -945,7 +950,6 @@ fn build_anthropic_sse(
     stops: Vec<String>,
     has_tools: bool,
     cancel_guard: crate::CancelGuard,
-    cpu_engine: Option<std::sync::Arc<rustllama_engine::CpuEngine>>,
     has_cache_control: bool,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
@@ -1043,9 +1047,10 @@ fn build_anthropic_sse(
         // consumers.
         // Fetch the request stats ONCE so the limit-hit decision and
         // the usage extension fields both read a consistent snapshot.
-        let stats = cpu_engine
-            .as_ref()
-            .map(|c| c.last_request_stats());
+        // Sourced generically off the gate handle's engine so the paged
+        // engine's stats surface too; for `CpuEngine` the snapshot is
+        // `Some(last_request_stats())` — byte-identical to before.
+        let stats = permit.engine.last_request_stats_snapshot();
         let tool_call_limit_hit = stats
             .as_ref()
             .map(|s| s.tool_call_limit_hit)
