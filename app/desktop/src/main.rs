@@ -227,6 +227,13 @@ fn run_gui() -> anyhow::Result<()> {
                                 no_gpu: false,
                                 disabled_cpus: None,
                                 vram_only: false,
+                                // No CLI LoRA / EAGLE-head overrides: the
+                                // embedded server honors `[model].lora` /
+                                // `[model].eagle_head` from config load (the
+                                // serve path only overrides these when the CLI
+                                // flag is `Some`).
+                                lora: None,
+                                eagle_head: None,
                             },
                         };
                         if let Err(e) = rustllama_cli::run(serve).await {
