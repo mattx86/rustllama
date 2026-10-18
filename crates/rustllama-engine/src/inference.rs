@@ -4774,6 +4774,15 @@ impl CpuEngine {
     /// Returns `None` when no grammar was requested. Returns `None` and
     /// logs a warning if a grammar was requested but the engine has no
     /// tokenizer (so we can't pre-decode the vocab).
+    /// The set of token ids that terminate generation for this model —
+    /// `eos_token_id` plus every end-of-turn / EOS control token the tokenizer
+    /// carries (see [`build_stop_token_ids`]). Resolved once per generation
+    /// call (a handful of vocab lookups), then tested per sampled token. For a
+    /// model with a single terminal this is `{eos_token_id}` ⇒ unchanged.
+    fn stop_token_ids(&self) -> std::collections::HashSet<u32> {
+        build_stop_token_ids(self.model.cfg.eos_token_id, self.tokenizer.as_deref())
+    }
+
     fn build_grammar(&self, sampling: &SamplingParams) -> Option<GrammarMask> {
         let kind = sampling.grammar.as_ref()?;
         let tokenizer = match self.tokenizer.as_deref() {
@@ -4995,7 +5004,7 @@ impl CpuEngine {
 
         let mut sampler = Sampler::new(sampling.clone());
         let mut grammar = self.build_grammar(sampling);
-        let eos = self.model.cfg.eos_token_id;
+        let stop_ids = self.stop_token_ids();
         let mut out = Vec::with_capacity(n_new as usize);
         for _ in 0..n_new {
             let next_tok = sampler.sample_with_grammar(&mut logits, &history, grammar.as_ref());
@@ -5004,7 +5013,7 @@ impl CpuEngine {
             }
             out.push(next_tok);
             history.push(next_tok);
-            if Some(next_tok) == eos {
+            if stop_ids.contains(&next_tok) {
                 break;
             }
             mm.forward_one(next_tok as i32, &mut cache, &mut logits);
@@ -5086,6 +5095,7 @@ impl CpuEngine {
 
         let mut sampler = Sampler::new(sampling.clone());
         let mut grammar = self.build_grammar(sampling);
+        let stop_ids = self.stop_token_ids();
         let mut next_input = last[0];
         let mut next_pos = prefill.len() as u32;
         let mut out = Vec::with_capacity(n_new as usize);
@@ -5121,10 +5131,10 @@ impl CpuEngine {
             out.push(next_tok);
             history.push(next_tok);
 
-            if let Some(eos) = self.model.cfg.eos_token_id {
-                if next_tok == eos {
-                    break;
-                }
+            // Stop on ANY end-of-generation token (eos + the model's other
+            // end-of-turn terminals), not just the single configured eos.
+            if stop_ids.contains(&next_tok) {
+                break;
             }
 
             next_input = next_tok as i32;
@@ -5249,7 +5259,10 @@ impl CpuEngine {
         state.reset();
 
         let vocab = self.model.cfg.vocab_size;
-        let eos = self.model.cfg.eos_token_id;
+        // Stop set for beam termination: eos + the model's other end-of-turn
+        // terminals (see `build_stop_token_ids`). A hypothesis whose next token
+        // is any of these retires to the finished pool.
+        let stop_ids = self.stop_token_ids();
         let length_penalty = beam.length_penalty;
         // Candidate breadth per beam: 2*num_beams guarantees num_beams non-EOS
         // survivors (HuggingFace convention), capped at the vocab.
@@ -5325,7 +5338,7 @@ impl CpuEngine {
                     .collect();
                 build_sorted_candidates(&per_beam)
             };
-            let sel = select_step(&cands, num_beams, eos);
+            let sel = select_step(&cands, num_beams, &stop_ids);
 
             // 2) Retire EOS-finishers to the pool. The stored tokens include
             //    the EOS token to match greedy (which emits EOS before stopping).
@@ -5547,6 +5560,7 @@ impl CpuEngine {
 
         let mut sampler = Sampler::new(sampling.clone());
         let mut grammar = self.build_grammar(sampling);
+        let stop_ids = self.stop_token_ids();
         // The full prompt occupies positions [0, len); the first sampled token
         // lands at `len`.
         let mut next_pos = prompt_ids.len() as u32;
@@ -5564,10 +5578,9 @@ impl CpuEngine {
             }
             out.push(next_tok);
             history.push(next_tok);
-            if let Some(eos) = self.model.cfg.eos_token_id {
-                if next_tok == eos {
-                    break;
-                }
+            // Stop on ANY end-of-generation token (see `stop_token_ids`).
+            if stop_ids.contains(&next_tok) {
+                break;
             }
             if (next_pos as usize) >= self.max_ctx {
                 break;
@@ -5689,6 +5702,7 @@ impl CpuEngine {
 
         let mut sampler = Sampler::new(sampling.clone());
         let mut grammar = self.build_grammar(sampling);
+        let stop_ids = self.stop_token_ids();
         let mut next_input = last[0];
         let mut next_pos = prefill.len() as u32;
         let mut out: Vec<(u32, crate::TokenLogprobs)> = Vec::with_capacity(n_new as usize);
@@ -5727,10 +5741,9 @@ impl CpuEngine {
             new_ids.push(next_tok);
             history.push(next_tok);
 
-            if let Some(eos) = self.model.cfg.eos_token_id {
-                if next_tok == eos {
-                    break;
-                }
+            // Stop on ANY end-of-generation token (see `stop_token_ids`).
+            if stop_ids.contains(&next_tok) {
+                break;
             }
 
             next_input = next_tok as i32;
@@ -6033,7 +6046,12 @@ impl CpuEngine {
 
         let mut sampler = Sampler::new(sampling.clone());
         let mut grammar = self.build_grammar(sampling);
-        let eos = self.model.cfg.eos_token_id;
+        let stop_ids = self.stop_token_ids();
+        // UTF-8-safe incremental detok: a multi-byte char (e.g. an emoji) that
+        // byte-level BPE splits across two tokens must be reassembled, not
+        // emitted as `��` per fragment. `decode(ids, true)` also strips the
+        // tokenizer's special/control tokens from the visible text.
+        let mut utf8 = Utf8Stream::default();
         for _ in 0..sampling.max_tokens {
             if tx.is_closed() {
                 break;
@@ -6048,7 +6066,9 @@ impl CpuEngine {
                 _ => None,
             };
             history.push(next_tok);
-            let text = tokenizer.decode_single(next_tok, true).unwrap_or_default();
+            let text = utf8.next_text(next_tok, |ids| {
+                tokenizer.decode(ids, true).unwrap_or_default()
+            });
             if tx
                 .blocking_send(Ok(crate::Token {
                     id: next_tok,
@@ -6059,10 +6079,20 @@ impl CpuEngine {
             {
                 break;
             }
-            if Some(next_tok) == eos {
+            // Stop on ANY end-of-generation token (see `stop_token_ids`).
+            if stop_ids.contains(&next_tok) {
                 break;
             }
             mm.forward_one(next_tok as i32, &mut cache, &mut logits);
+        }
+        // Flush any buffered partial multi-byte tail (truncated mid-char).
+        let tail = utf8.flush(|ids| tokenizer.decode(ids, true).unwrap_or_default());
+        if !tail.is_empty() {
+            let _ = tx.blocking_send(Ok(crate::Token {
+                id: 0,
+                text: tail,
+                logprobs: None,
+            }));
         }
         Ok(())
     }
@@ -6147,6 +6177,10 @@ impl CpuEngine {
 
         let mut sampler = Sampler::new(sampling.clone());
         let mut grammar = self.build_grammar(sampling);
+        let stop_ids = self.stop_token_ids();
+        // UTF-8-safe incremental detok (buffers a multi-byte char that
+        // byte-level BPE split across token boundaries + skips special tokens).
+        let mut utf8 = Utf8Stream::default();
         let mut next_input = last[0];
         let mut next_pos = prefill.len() as u32;
         let mut generated: Vec<u32> = Vec::with_capacity(sampling.max_tokens as usize);
@@ -6192,11 +6226,15 @@ impl CpuEngine {
             generated.push(next_tok);
             history.push(next_tok);
 
-            // Decode this token's text incrementally. Detokenizing only
-            // the new id (not the full so-far sequence) matches what
-            // OpenAI streaming clients expect: each delta carries the
-            // exact bytes that should be appended to the running output.
-            let text = tokenizer.decode_single(next_tok, true).unwrap_or_default();
+            // Decode this token's text incrementally. The incremental detok
+            // decodes the running id list and emits only the newly-completed
+            // suffix (holding back a multi-byte char still split across the
+            // token boundary), so each OpenAI streaming delta carries exactly
+            // the bytes to append — never a `�` fragment. `decode(ids, true)`
+            // also drops the tokenizer's special/control tokens.
+            let text = utf8.next_text(next_tok, |ids| {
+                tokenizer.decode(ids, true).unwrap_or_default()
+            });
 
             if tx
                 .blocking_send(Ok(crate::Token {
@@ -6209,10 +6247,9 @@ impl CpuEngine {
                 break;
             }
 
-            if let Some(eos) = self.model.cfg.eos_token_id {
-                if next_tok == eos {
-                    break;
-                }
+            // Stop on ANY end-of-generation token (see `stop_token_ids`).
+            if stop_ids.contains(&next_tok) {
+                break;
             }
 
             next_input = next_tok as i32;
@@ -6220,6 +6257,16 @@ impl CpuEngine {
             if (next_pos as usize) >= self.max_ctx {
                 break;
             }
+        }
+
+        // Flush any buffered partial multi-byte tail (truncated mid-char).
+        let tail = utf8.flush(|ids| tokenizer.decode(ids, true).unwrap_or_default());
+        if !tail.is_empty() {
+            let _ = tx.blocking_send(Ok(crate::Token {
+                id: 0,
+                text: tail,
+                logprobs: None,
+            }));
         }
 
         let tool_call_limit_hit = grammar
@@ -8414,7 +8461,9 @@ impl CpuEngine {
         let candidate_cap = k as usize;
         let seed = s.seed;
         let max_tokens = s.max_tokens as usize;
-        let model_eos = self.model.cfg.eos_token_id;
+        // Stop on ANY end-of-generation token (eos + the model's other
+        // end-of-turn terminals), resolved once and moved into the stream.
+        let stop_ids = build_stop_token_ids(self.model.cfg.eos_token_id, self.tokenizer.as_deref());
         let stop_strings = s.stop.clone();
         let greedy_spec = s.temperature <= 0.0;
         // P10a: resolve the opt-in typical-acceptance knob once; `None`
@@ -8628,8 +8677,9 @@ impl CpuEngine {
                     if hit_stop {
                         return;
                     }
-                    // EOS in committed tail ends speculation immediately.
-                    if Some(id) == model_eos {
+                    // Any end-of-generation token in the committed tail ends
+                    // speculation immediately (see `build_stop_token_ids`).
+                    if stop_ids.contains(&id) {
                         return;
                     }
                     if total_emitted >= max_tokens {
@@ -8723,7 +8773,9 @@ impl CpuEngine {
         let candidate_cap = cfg.n_draft.max(1);
         let seed = s.seed;
         let max_tokens = s.max_tokens as usize;
-        let model_eos = self.model.cfg.eos_token_id;
+        // Stop on ANY end-of-generation token (eos + the model's other
+        // end-of-turn terminals), resolved once and moved into the stream.
+        let stop_ids = build_stop_token_ids(self.model.cfg.eos_token_id, self.tokenizer.as_deref());
         let stop_strings = s.stop.clone();
         let greedy_spec = s.temperature <= 0.0;
         // P10a: opt-in typical acceptance; `None` keeps the default Chen et
@@ -8903,7 +8955,8 @@ impl CpuEngine {
                     if hit_stop {
                         return;
                     }
-                    if Some(id) == model_eos {
+                    // Any end-of-generation token (see `build_stop_token_ids`).
+                    if stop_ids.contains(&id) {
                         return;
                     }
                     if total_emitted >= max_tokens {
@@ -8976,7 +9029,9 @@ impl CpuEngine {
         let candidate_cap = cfg.window.max(1);
         let seed = s.seed;
         let max_tokens = s.max_tokens as usize;
-        let model_eos = self.model.cfg.eos_token_id;
+        // Stop on ANY end-of-generation token (eos + the model's other
+        // end-of-turn terminals), resolved once and moved into the stream.
+        let stop_ids = build_stop_token_ids(self.model.cfg.eos_token_id, self.tokenizer.as_deref());
         let stop_strings = s.stop.clone();
         let greedy_spec = s.temperature <= 0.0;
         let typical = if s.spec_typical_accept {
@@ -9121,7 +9176,8 @@ impl CpuEngine {
                     if hit_stop {
                         return;
                     }
-                    if Some(id) == model_eos {
+                    // Any end-of-generation token (see `build_stop_token_ids`).
+                    if stop_ids.contains(&id) {
                         return;
                     }
                     if total_emitted >= max_tokens {
@@ -9257,7 +9313,9 @@ impl CpuEngine {
 
         let seed = s.seed;
         let max_tokens = s.max_tokens as usize;
-        let model_eos = self.model.cfg.eos_token_id;
+        // Stop on ANY end-of-generation token (eos + the model's other
+        // end-of-turn terminals), resolved once and moved into the stream.
+        let stop_ids = build_stop_token_ids(self.model.cfg.eos_token_id, self.tokenizer.as_deref());
         let stop_strings = s.stop.clone();
         let greedy_spec = s.temperature <= 0.0;
         // Sampling penalties applied to the target logits before each
@@ -9511,7 +9569,8 @@ impl CpuEngine {
                     if hit_stop {
                         return;
                     }
-                    if Some(id) == model_eos {
+                    // Any end-of-generation token (see `build_stop_token_ids`).
+                    if stop_ids.contains(&id) {
                         return;
                     }
                     if total_emitted >= max_tokens {
@@ -9694,7 +9753,7 @@ impl CpuEngine {
 /// decode is append-only during generation, so a previously-emitted byte
 /// length stays a valid char boundary of the longer decode.
 #[derive(Default)]
-struct Utf8Stream {
+pub(crate) struct Utf8Stream {
     ids: Vec<u32>,
     printed: usize,
 }
@@ -9703,7 +9762,7 @@ impl Utf8Stream {
     /// Push a token id and return the text now safe to emit (empty while a
     /// multi-byte character is still incomplete). `decode` maps the running
     /// id list to its full surface string.
-    fn next_text<F: FnOnce(&[u32]) -> String>(&mut self, id: u32, decode: F) -> String {
+    pub(crate) fn next_text<F: FnOnce(&[u32]) -> String>(&mut self, id: u32, decode: F) -> String {
         self.ids.push(id);
         let full = decode(&self.ids);
         // Trailing replacement char ⇒ last character is still incomplete.
@@ -9721,6 +9780,58 @@ impl Utf8Stream {
             String::new()
         }
     }
+
+    /// Flush any buffered-but-unemitted tail at end of generation. During the
+    /// stream a trailing incomplete multi-byte character is held back (see
+    /// [`Self::next_text`]) in the hope the next token completes it; if the
+    /// stream ENDS while one is still pending — e.g. generation was truncated
+    /// at `max_tokens` mid-emoji — this emits whatever VALID text remains past
+    /// the last-emitted boundary. A genuinely-incomplete trailing character
+    /// (the full decode still ends in `U+FFFD`) is NOT emitted — we never
+    /// surface a replacement char for bytes the model never finished. Empty in
+    /// the common case where the last real token already completed its
+    /// character. Call once, after the decode loop breaks.
+    pub(crate) fn flush<F: FnOnce(&[u32]) -> String>(&mut self, decode: F) -> String {
+        let full = decode(&self.ids);
+        // Still mid-character ⇒ nothing valid to flush (don't emit `�`).
+        if full.ends_with('\u{FFFD}') {
+            return String::new();
+        }
+        if self.printed <= full.len() && full.is_char_boundary(self.printed) {
+            let out = full[self.printed..].to_string();
+            self.printed = full.len();
+            out
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// Build the set of token ids that END generation for this model: the single
+/// configured `eos_token_id` PLUS every end-of-turn / EOS control token the
+/// tokenizer resolves ([`Tokenizer::eog_token_ids`]). Chat models routinely
+/// carry more than one terminal (Qwen3: `<|im_end|>` AND `<|endoftext|>`),
+/// but a GGUF's `tokenizer.ggml.eos_token_id` records only one — so decoding
+/// against the single id alone lets the model run past its turn when it emits
+/// the other. The decode loops break on ANY id in this set.
+///
+/// Degenerate case (no extra terminals resolved, which is every synthetic /
+/// non-chat model) ⇒ the set is exactly `{eos_token_id}`, so behavior is
+/// byte-identical to the pre-stop-set path.
+pub(crate) fn build_stop_token_ids(
+    eos: Option<u32>,
+    tokenizer: Option<&Tokenizer>,
+) -> std::collections::HashSet<u32> {
+    let mut set = std::collections::HashSet::new();
+    if let Some(e) = eos {
+        set.insert(e);
+    }
+    if let Some(t) = tokenizer {
+        for id in t.eog_token_ids() {
+            set.insert(id);
+        }
+    }
+    set
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10070,6 +10181,9 @@ fn drive_generation(
     let mut next_input = prompt_ids[prefill_pos];
     let mut next_pos = prefill_pos as u32;
     let stop_strings = sampling.stop.clone();
+    // Stop on ANY end-of-generation token (eos + the model's other end-of-turn
+    // terminals), not just the single configured eos (see `build_stop_token_ids`).
+    let stop_ids = build_stop_token_ids(model_eos, Some(tokenizer.as_ref()));
     let logprobs_k = sampling.logprobs.map(|k| k as usize);
 
     // Buffer the emitted-but-not-yet-checked-for-stop text so we can match
@@ -10205,10 +10319,8 @@ fn drive_generation(
             break;
         }
 
-        if let Some(eos) = model_eos {
-            if next_tok == eos {
-                break;
-            }
+        if stop_ids.contains(&next_tok) {
+            break;
         }
 
         next_input = next_tok as i32;
@@ -10221,6 +10333,17 @@ fn drive_generation(
                 break;
             }
         }
+    }
+
+    // Flush any buffered partial multi-byte tail (generation truncated
+    // mid-char); queued like a normal token so it drains in order below.
+    let tail = utf8.flush(|ids| tokenizer.decode(ids, true).unwrap_or_default());
+    if !tail.is_empty() {
+        pending.push_back(Token {
+            id: 0,
+            text: tail,
+            logprobs: None,
+        });
     }
 
     if trace_perf {
@@ -10782,6 +10905,11 @@ fn drive_vlm_generation(
     // length of positions; the next forward_one runs at the live
     // seq_len position.
     let mut sampler = Sampler::new(sampling.clone());
+    // Stop on ANY end-of-generation token (see `build_stop_token_ids`).
+    let stop_ids = build_stop_token_ids(model_eos, Some(tokenizer.as_ref()));
+    // UTF-8-safe incremental detok (buffers a multi-byte char that byte-level
+    // BPE split across token boundaries + skips special tokens).
+    let mut utf8 = Utf8Stream::default();
     let mut history: Vec<u32> = prompt_u32;
     let mut next_pos = next_pos;
     // M5-engine-wire: the running mRoPE rotation position for decode
@@ -10796,17 +10924,17 @@ fn drive_vlm_generation(
             break;
         }
         let next_tok = sampler.sample_with_grammar(&mut logits, &history, None);
-        // EOS gate: stop without emitting the EOS token itself —
+        // EOS gate: stop without emitting the end-of-generation token itself —
         // matches the text-only chat path's behavior.
-        if let Some(eos) = model_eos {
-            if next_tok == eos {
-                break;
-            }
+        if stop_ids.contains(&next_tok) {
+            break;
         }
         history.push(next_tok);
-        let text = tokenizer
-            .decode_single(next_tok, true)
-            .unwrap_or_else(|_| format!("<{next_tok}>"));
+        let text = utf8.next_text(next_tok, |ids| {
+            tokenizer
+                .decode(ids, true)
+                .unwrap_or_else(|_| format!("<{next_tok}>"))
+        });
         // Best-effort send — if the consumer dropped we stop the loop
         // on the next is_closed() check.
         if tx
@@ -10849,6 +10977,16 @@ fn drive_vlm_generation(
         if (next_pos as usize) >= max_ctx {
             break;
         }
+    }
+
+    // Flush any buffered partial multi-byte tail (truncated mid-char).
+    let tail = utf8.flush(|ids| tokenizer.decode(ids, true).unwrap_or_default());
+    if !tail.is_empty() {
+        let _ = tx.blocking_send(Ok(Token {
+            id: 0,
+            text: tail,
+            logprobs: None,
+        }));
     }
 
     // P-1: snapshot the post-generation state into the prefix pool
@@ -11202,9 +11340,94 @@ fn project_moe_tier_budget_bytes(
 mod tests {
     use super::{
         compute_lcp, project_moe_tier_budget_bytes, update_ema_tok_s, vlm_mrope_positions,
-        RequestStats, TOK_S_EMA_ALPHA,
+        RequestStats, Utf8Stream, TOK_S_EMA_ALPHA,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// FIX C: a 4-byte emoji (😊 = F0 9F 98 8A) that byte-level BPE splits
+    /// across two tokens must reassemble to the single emoji — never a `�`
+    /// fragment — and plain ASCII must stream byte-identically per token. The
+    /// `decode` closure here mimics the HF detok: the running id list decodes
+    /// as a whole, and an incomplete trailing char shows up as `U+FFFD`.
+    #[test]
+    fn utf8_stream_reassembles_split_emoji_and_streams_ascii_byte_identical() {
+        // ids: 1,2 = the two halves of "😊"; 3,4 = "hi". The decoded surface of
+        // a running prefix; a prefix ending mid-emoji carries a trailing FFFD.
+        let decode = |ids: &[u32]| -> String {
+            let mut s = String::new();
+            let mut i = 0;
+            while i < ids.len() {
+                match ids[i] {
+                    1 if i + 1 < ids.len() && ids[i + 1] == 2 => {
+                        s.push('😊');
+                        i += 2;
+                        continue;
+                    }
+                    1 => {
+                        // First half alone ⇒ incomplete char ⇒ replacement.
+                        s.push('\u{FFFD}');
+                    }
+                    3 => s.push('h'),
+                    4 => s.push('i'),
+                    _ => {}
+                }
+                i += 1;
+            }
+            s
+        };
+
+        let mut st = Utf8Stream::default();
+        // First half: held back (would be `�`), emits nothing.
+        assert_eq!(st.next_text(1, decode), "");
+        // Second half completes the emoji → emitted whole, no `�`.
+        assert_eq!(st.next_text(2, decode), "😊");
+        // Plain ASCII streams one char per token, byte-identical.
+        assert_eq!(st.next_text(3, decode), "h");
+        assert_eq!(st.next_text(4, decode), "i");
+        // Nothing buffered ⇒ flush is empty.
+        assert_eq!(st.flush(decode), "");
+    }
+
+    /// FIX C: the split emoji is the LAST content before the stream ends — the
+    /// completing token still emits it, and the end-of-stream flush adds
+    /// nothing (it was already delivered). A stream that ends while a char is
+    /// genuinely incomplete flushes nothing (never a `�`).
+    #[test]
+    fn utf8_stream_emoji_last_before_end_and_incomplete_tail() {
+        let decode = |ids: &[u32]| -> String {
+            let mut s = String::new();
+            let mut i = 0;
+            while i < ids.len() {
+                match ids[i] {
+                    1 if i + 1 < ids.len() && ids[i + 1] == 2 => {
+                        s.push('😊');
+                        i += 2;
+                        continue;
+                    }
+                    1 => s.push('\u{FFFD}'),
+                    _ => {}
+                }
+                i += 1;
+            }
+            s
+        };
+
+        // Emoji completes on the last token before the stream ends.
+        let mut st = Utf8Stream::default();
+        assert_eq!(st.next_text(1, decode), "");
+        assert_eq!(st.next_text(2, decode), "😊");
+        assert_eq!(st.flush(decode), "", "already delivered, nothing to flush");
+
+        // Stream ends with only the first half present (genuinely incomplete):
+        // the delta was held, and flush must NOT emit a `�`.
+        let mut st2 = Utf8Stream::default();
+        assert_eq!(st2.next_text(1, decode), "");
+        assert_eq!(
+            st2.flush(decode),
+            "",
+            "incomplete tail is not surfaced as �"
+        );
+    }
 
     fn make_stats(decode_ms: f64, n: u32) -> RequestStats {
         RequestStats {

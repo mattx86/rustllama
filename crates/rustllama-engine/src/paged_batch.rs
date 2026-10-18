@@ -58,7 +58,7 @@ use rustllama_tokenizer::{ChatMessage as TokChat, Tokenizer};
 
 use crate::batch_scheduler::Priority;
 use crate::grammar::GrammarMask;
-use crate::inference::CpuEngineError;
+use crate::inference::{build_stop_token_ids, CpuEngineError, Utf8Stream};
 use crate::sampling::Sampler;
 use crate::{
     ChatMessage, Engine, EngineError, GrammarKind, Metrics, RequestStats, Result as EngineResult,
@@ -146,6 +146,22 @@ fn build_paged_grammar(
     }
 }
 
+/// Resolve this model's full end-of-generation stop set for the paged slots:
+/// the configured `eos_token_id` plus the tokenizer's other end-of-turn / EOS
+/// control terminals ([`build_stop_token_ids`]), cast to `i32` to match the
+/// slot's sampled-token comparisons. `Arc`-shared across the model's slots (it
+/// is identical for every slot). Mirrors `CpuEngine::stop_token_ids`.
+fn paged_stop_ids(
+    model: &LlamaModel,
+    tokenizer: Option<&Arc<Tokenizer>>,
+) -> Arc<std::collections::HashSet<i32>> {
+    let set = build_stop_token_ids(model.cfg.eos_token_id, tokenizer.map(|t| t.as_ref()))
+        .into_iter()
+        .map(|id| id as i32)
+        .collect();
+    Arc::new(set)
+}
+
 /// V1 page size for the shared paged pool. Matches
 /// [`crate::kv_backend::DEFAULT_PAGE_SIZE`] so the two paged
 /// engines (single-slot via `KvBackend::Paged` + multi-slot via
@@ -215,7 +231,19 @@ struct HybridSlotState {
 /// indexed by slot position in the active set.
 struct SlotState {
     sampling: SamplingParams,
-    eos: Option<i32>,
+    /// Every token id that ENDS generation for this model: the configured
+    /// `eos_token_id` plus the tokenizer's other end-of-turn / EOS control
+    /// terminals (see `build_stop_token_ids`). `Arc`-shared across a model's
+    /// slots. The decode tick ends the slot on ANY of them — a chat model that
+    /// emits `<|endoftext|>` where the GGUF only records `<|im_end|>` (or vice
+    /// versa) no longer runs past its turn.
+    stop_ids: Arc<std::collections::HashSet<i32>>,
+    /// UTF-8-safe incremental detokenizer for this slot's streamed output.
+    /// Decodes the running id list with `skip_special_tokens = true` and emits
+    /// only the newly-completed suffix, so a multi-byte char byte-level BPE
+    /// split across tokens is reassembled (never a `�` fragment) and control
+    /// tokens never leak into the visible text.
+    utf8: Utf8Stream,
     cache: PagedKvCache,
     /// F8: `Some` for a HYBRID model's slot (per-slot contiguous KV +
     /// DeltaNet recurrent state; the paged `cache` above stays an empty
@@ -390,6 +418,9 @@ struct DriverSlot {
 pub struct PagedBatchEngine {
     model: Arc<LlamaModel>,
     tokenizer: Option<Arc<Tokenizer>>,
+    /// Model-wide end-of-generation stop set (see `paged_stop_ids`), cloned
+    /// into each slot the sync batched path builds.
+    stop_ids: Arc<std::collections::HashSet<i32>>,
     shared: SharedPagedKv,
     max_ctx: usize,
     max_slots: u32,
@@ -777,10 +808,9 @@ impl PagedBatchEngine {
         // end, after draining any queued tokens.
         let (emit_tx, emit_worker_handle) = if overlap_emit {
             let (tx, rx) = std::sync::mpsc::channel::<EmitMsg>();
-            let tok = tokenizer.clone();
             let handle = std::thread::Builder::new()
                 .name("rustllama-paged-batch-emit".to_string())
-                .spawn(move || emit_worker(tok, rx))
+                .spawn(move || emit_worker(rx))
                 .map_err(|e| CpuEngineError::Other(format!("emit worker spawn: {e}")))?;
             (Some(tx), Some(handle))
         } else {
@@ -791,9 +821,13 @@ impl PagedBatchEngine {
         let lora = Arc::new(std::sync::RwLock::new(
             rustllama_models::lora::LoraRegistry::new(),
         ));
+        // Model-wide end-of-generation stop set — shared by the driver (ragged
+        // path) and the engine handle (sync batched path), cloned into each slot.
+        let stop_ids = paged_stop_ids(&model, tokenizer.as_ref());
         let driver_ctx = DriverContext {
             model: Arc::clone(&model),
             tokenizer: tokenizer.clone(),
+            stop_ids: Arc::clone(&stop_ids),
             shared: shared.clone(),
             max_ctx: ctx,
             max_slots,
@@ -865,6 +899,7 @@ impl PagedBatchEngine {
         Ok(Self {
             model,
             tokenizer,
+            stop_ids,
             shared,
             max_ctx: ctx,
             max_slots,
@@ -1002,8 +1037,9 @@ impl PagedBatchEngine {
     ///     store lock (no inter-request batching for prefill yet).
     ///   - Decode steps after all prefills complete run as **one
     ///     fused call per tick** covering every still-active slot.
-    ///   - Stop conditions: per-request `max_tokens`, the model's EOS
-    ///     token, cache capacity, OR a client string stop sequence
+    ///   - Stop conditions: per-request `max_tokens`, ANY of the model's
+    ///     end-of-generation tokens (`build_stop_token_ids`), cache capacity,
+    ///     OR a client string stop sequence
     ///     (`sampling.stop`). P9 brought the paged engine to feature
     ///     parity with [`crate::inference::CpuEngine`]: `sampling.grammar`
     ///     (structured output / tool grammar) is applied per slot via
@@ -1033,7 +1069,6 @@ impl PagedBatchEngine {
         // the shared store lock) so the decode loop starts with
         // every slot already at `pos = prompt.len()`.
         let mut slots: Vec<SlotState> = Vec::with_capacity(m);
-        let eos = self.model.cfg.eos_token_id.map(|e| e as i32);
         for (prompt, sampling) in requests.into_iter() {
             let prompt: Vec<i32> = prompt;
             let sampling: SamplingParams = sampling;
@@ -1071,7 +1106,7 @@ impl PagedBatchEngine {
                     self.max_ctx,
                     &prompt,
                     &sampling,
-                    eos,
+                    Arc::clone(&self.stop_ids),
                     0,
                 )
                 .map_err(|e| CpuEngineError::Other(format!("hybrid slot build: {e}")))?;
@@ -1176,7 +1211,8 @@ impl PagedBatchEngine {
             let history: Vec<u32> = prompt_u32;
             slots.push(SlotState {
                 sampling,
-                eos,
+                stop_ids: Arc::clone(&self.stop_ids),
+                utf8: Utf8Stream::default(),
                 cache,
                 // Dense/MoE sync-batch slot: the paged `cache` is the real KV
                 // store (hybrid gets its own path below).
@@ -1375,12 +1411,10 @@ impl PagedBatchEngine {
                         .iter()
                         .any(|s| !s.is_empty() && buf.contains(s.as_str()))
                 };
-                // Stop conditions: max_tokens, EOS, capacity, or a string stop.
+                // Stop conditions: max_tokens, any end-of-generation token,
+                // capacity, or a string stop.
                 let hit_max = slots[i].n_emitted >= slots[i].sampling.max_tokens;
-                let hit_eos = slots[i]
-                    .eos
-                    .map(|eos| (next_tok as i32) == eos)
-                    .unwrap_or(false);
+                let hit_eos = slots[i].stop_ids.contains(&(next_tok as i32));
                 // Also stop if pos has reached the cache's capacity
                 // (can't write any more tokens). Should not happen
                 // when total_capacity was sized to prompt + max_tokens,
@@ -1570,7 +1604,10 @@ impl PagedBatchEngine {
         }
 
         let vocab = self.model.cfg.vocab_size;
-        let eos = self.model.cfg.eos_token_id;
+        // Stop set for beam termination: eos + the model's other end-of-turn
+        // terminals (see `build_stop_token_ids`). A hypothesis whose next token
+        // is any of these retires to the finished pool.
+        let stop_ids = build_stop_token_ids(self.model.cfg.eos_token_id, self.tokenizer.as_deref());
         let length_penalty = beam.length_penalty;
         // 2*num_beams candidates per beam guarantees num_beams non-EOS survivors
         // (the HuggingFace convention), capped at the vocab.
@@ -1681,7 +1718,7 @@ impl PagedBatchEngine {
                     .collect();
                 build_sorted_candidates(&per_beam)
             };
-            let sel = select_step(&cands, num_beams, eos);
+            let sel = select_step(&cands, num_beams, &stop_ids);
 
             // 2) Retire EOS-finishers (store tokens incl. the EOS, matching greedy).
             for f in &sel.finished {
@@ -1939,8 +1976,12 @@ pub(crate) fn resolve_max_batched_tokens(config_val: usize) -> usize {
 /// Inputs the driver thread captures by value when spawning.
 struct DriverContext {
     model: Arc<LlamaModel>,
-    #[allow(dead_code)] // Reserved for chat templating in the paged driver.
+    /// Used on the driver thread to detokenize each slot's streamed output
+    /// (via the slot's incremental `Utf8Stream`, `skip_special_tokens = true`).
     tokenizer: Option<Arc<Tokenizer>>,
+    /// Model-wide end-of-generation stop set (see `paged_stop_ids`), cloned
+    /// into each admitted slot's `SlotState::stop_ids`.
+    stop_ids: Arc<std::collections::HashSet<i32>>,
     shared: SharedPagedKv,
     max_ctx: usize,
     max_slots: u32,
@@ -1997,53 +2038,60 @@ struct DriverContext {
 struct EmitMsg {
     out: tokio::sync::mpsc::Sender<EngineResult<Token>>,
     id: u32,
+    /// Already-detokenized, UTF-8-safe delta text for this token. The detok
+    /// runs on the driver thread (it needs the slot's per-slot incremental
+    /// [`Utf8Stream`] state), so the worker just forwards it.
+    text: String,
 }
 
-/// P4s background emit worker: detokenize each queued token and send it to its
-/// slot's response channel. Runs concurrently with the driver's forward pass,
-/// hiding the (small) detok + send latency behind the (large) model compute.
+/// P4s background emit worker: send each queued (already-detokenized) token to
+/// its slot's response channel. Runs concurrently with the driver's forward
+/// pass, hiding the (small) send latency behind the (large) model compute.
 ///
-/// Purity / correctness: this does ONLY `decode(&[id]) + send`. It never
-/// touches slot state, sampling, grammar, or stop logic — all of which stay
-/// synchronous on the driver thread — so it cannot change WHICH tokens are
-/// produced or their order. `decode(&[id], false)` is a pure function of the
-/// id (a single-id detok, no streaming state), identical to the inline call it
-/// replaces. The worker exits when the `emit_tx` in [`DriverContext`] drops
-/// (driver loop end), after draining any queued tokens.
-fn emit_worker(tokenizer: Option<Arc<Tokenizer>>, rx: std::sync::mpsc::Receiver<EmitMsg>) {
+/// Purity / correctness: this does ONLY `send` — the driver thread already
+/// detokenized the delta through the slot's incremental [`Utf8Stream`] (which
+/// skips special tokens and reassembles multi-byte chars split across token
+/// boundaries) in generation order, so the worker cannot change WHICH tokens
+/// are produced, their text, or their order. The worker exits when the
+/// `emit_tx` in [`DriverContext`] drops (driver loop end), after draining any
+/// queued tokens.
+fn emit_worker(rx: std::sync::mpsc::Receiver<EmitMsg>) {
     while let Ok(msg) = rx.recv() {
-        let text = match &tokenizer {
-            Some(t) => t.decode(&[msg.id], false).unwrap_or_default(),
-            None => String::new(),
-        };
         // A failed send means the client disconnected; the driver's
         // `response_tx.is_closed()` check catches that next tick and ends the
         // slot, so we just drop the token here (the client is gone).
         let _ = msg.out.blocking_send(Ok(Token {
             id: msg.id,
-            text,
+            text: msg.text,
             logprobs: None,
         }));
     }
 }
 
 impl DriverContext {
-    /// P4s: emit one decode token to a slot's client channel. When the emit
-    /// pipeline is enabled (`emit_tx` set) the detok + send run on the
-    /// background [`emit_worker`] (overlapping the next tick's forward),
-    /// enqueued in generation order; otherwise they run inline (the serial,
-    /// byte-identical path).
+    /// P4s: emit one decode token (with its already-computed, UTF-8-safe delta
+    /// `text`) to a slot's client channel. When the emit pipeline is enabled
+    /// (`emit_tx` set) the send runs on the background [`emit_worker`]
+    /// (overlapping the next tick's forward), enqueued in generation order;
+    /// otherwise it runs inline (the serial, byte-identical path).
+    ///
+    /// The detok itself is done by the CALLER through the slot's incremental
+    /// [`Utf8Stream`] (which needs per-slot state the shared FIFO worker can't
+    /// hold) — that skips the tokenizer's special/control tokens from the
+    /// visible text and reassembles a multi-byte char byte-level BPE split
+    /// across the token boundary, so no `<|im_end|>` or `�` reaches the client.
     ///
     /// Returns `true` when the token was handed off and `false` ONLY on an
     /// inline send failure (client disconnected) — so the serial caller ends
     /// the slot exactly as before. In the pipelined case a disconnect is caught
     /// one tick later by the driver's `response_tx.is_closed()` check, so this
-    /// always returns `true` there; the deferred detok/send never affects which
+    /// always returns `true` there; the deferred send never affects which
     /// tokens a live client observes or their order.
     fn emit_stream_token(
         &self,
         out: &tokio::sync::mpsc::Sender<EngineResult<Token>>,
         id: u32,
+        text: String,
     ) -> bool {
         match &self.emit_tx {
             Some(tx) => {
@@ -2052,21 +2100,17 @@ impl DriverContext {
                 let _ = tx.send(EmitMsg {
                     out: out.clone(),
                     id,
+                    text,
                 });
                 true
             }
-            None => {
-                let text = match &self.tokenizer {
-                    Some(t) => t.decode(&[id], false).unwrap_or_default(),
-                    None => String::new(),
-                };
-                out.blocking_send(Ok(Token {
+            None => out
+                .blocking_send(Ok(Token {
                     id,
                     text,
                     logprobs: None,
                 }))
-                .is_ok()
-            }
+                .is_ok(),
         }
     }
 }
@@ -2227,7 +2271,6 @@ fn driver_loop(
     let mut pending: BinaryHeap<PendingEntry> = BinaryHeap::new();
     let mut next_seq: u64 = 0;
     let vocab = ctx.model.cfg.vocab_size;
-    let eos = ctx.model.cfg.eos_token_id.map(|e| e as i32);
     let page_size = ctx.page_size as usize;
 
     loop {
@@ -2320,14 +2363,7 @@ fn driver_loop(
                 pending.push(PendingEntry(req));
                 break;
             }
-            match admit_request(
-                &ctx,
-                &req.prompt,
-                &req.sampling,
-                eos,
-                &active,
-                req.skip_emit,
-            ) {
+            match admit_request(&ctx, &req.prompt, &req.sampling, &active, req.skip_emit) {
                 Ok(state) => {
                     active.push(DriverSlot {
                         state,
@@ -2460,7 +2496,7 @@ fn build_hybrid_slot_state(
     max_ctx: usize,
     prompt: &[i32],
     sampling: &SamplingParams,
-    eos: Option<i32>,
+    stop_ids: Arc<std::collections::HashSet<i32>>,
     skip_emit: u32,
 ) -> EngineResult<SlotState> {
     debug_assert!(!prompt.is_empty(), "build_hybrid_slot_state: empty prompt");
@@ -2510,7 +2546,8 @@ fn build_hybrid_slot_state(
 
     Ok(SlotState {
         sampling: sampling.clone(),
-        eos,
+        stop_ids,
+        utf8: Utf8Stream::default(),
         cache,
         hybrid: Some(HybridSlotState { kv, dn, capacity }),
         sampler,
@@ -2551,7 +2588,6 @@ fn admit_request(
     ctx: &DriverContext,
     prompt: &[i32],
     sampling: &SamplingParams,
-    eos: Option<i32>,
     active: &[DriverSlot],
     skip_emit: u32,
 ) -> EngineResult<SlotState> {
@@ -2592,7 +2628,7 @@ fn admit_request(
             ctx.max_ctx,
             prompt,
             sampling,
-            eos,
+            Arc::clone(&ctx.stop_ids),
             skip_emit,
         )?;
         state.adapter = adapter;
@@ -2702,7 +2738,8 @@ fn admit_request(
         let stop_strings = sampling.stop.clone();
         return Ok(SlotState {
             sampling: sampling.clone(),
-            eos,
+            stop_ids: Arc::clone(&ctx.stop_ids),
+            utf8: Utf8Stream::default(),
             cache,
             hybrid: None,
             sampler,
@@ -2763,7 +2800,8 @@ fn admit_request(
     let history: Vec<u32> = prompt_u32;
     Ok(SlotState {
         sampling: sampling.clone(),
-        eos,
+        stop_ids: Arc::clone(&ctx.stop_ids),
+        utf8: Utf8Stream::default(),
         cache,
         hybrid: None,
         sampler,
@@ -3241,32 +3279,56 @@ fn commit_decode_token(ctx: &DriverContext, slot: &mut DriverSlot, logits: &mut 
             .any(|s| !s.is_empty() && buf.contains(s.as_str()))
     };
 
+    // UTF-8-safe incremental detok on the DRIVER thread (the emit worker is a
+    // shared FIFO and can't hold per-slot stream state). `decode(ids, true)`
+    // strips the tokenizer's special/control tokens (no `<|im_end|>` leak) and
+    // reassembles a multi-byte char byte-level BPE split across the boundary
+    // (no `�`). Advance the stream for EVERY committed token — including an F5
+    // preempt-replay's suppressed tokens — so the byte cursor stays identical
+    // to an uninterrupted run; only SEND when not replaying.
+    let streaming = slot.state.skip_emit == 0;
+    let out_text = slot.state.utf8.next_text(next_tok, |ids| {
+        ctx.tokenizer
+            .as_ref()
+            .map(|t| t.decode(ids, true).unwrap_or_default())
+            .unwrap_or_default()
+    });
     // F5 recompute-preemption replay: a resumed slot regenerates its already-
     // streamed tokens bit-for-bit (deterministic greedy / seeded forward) but
     // must NOT re-stream them — suppress the send while `skip_emit` counts down.
-    if slot.state.skip_emit > 0 {
-        slot.state.skip_emit -= 1;
-    } else {
-        // P4s: detok + send either inline (serial) or via the background emit
-        // worker (overlaps the next forward). Both produce the identical
-        // token/text on the client's channel; only an inline send FAILURE (the
-        // serial path) ends the slot here — the pipelined path relies on the
-        // `is_closed()` check at the top of the next tick.
-        if !ctx.emit_stream_token(&slot.response_tx, next_tok) {
+    if streaming {
+        // P4s: send either inline (serial) or via the background emit worker
+        // (overlaps the next forward). Both put the identical token/text on the
+        // client's channel; only an inline send FAILURE (the serial path) ends
+        // the slot here — the pipelined path relies on the `is_closed()` check
+        // at the top of the next tick.
+        if !ctx.emit_stream_token(&slot.response_tx, next_tok, out_text) {
             slot.state.done = true;
             return;
         }
         slot.state.emitted_to_client += 1;
+    } else {
+        slot.state.skip_emit -= 1;
     }
     let hit_max = slot.state.n_emitted >= slot.state.sampling.max_tokens;
-    let hit_eos = slot
-        .state
-        .eos
-        .map(|e| (next_tok as i32) == e)
-        .unwrap_or(false);
+    // End the slot on ANY end-of-generation token (see `build_stop_token_ids`).
+    let hit_eos = slot.state.stop_ids.contains(&(next_tok as i32));
     let hit_cap = slot.state.next_pos >= slot.state.effective_capacity_tokens();
     if hit_max || hit_eos || hit_cap || hit_stop {
         slot.state.done = true;
+        // Flush any buffered partial multi-byte tail (truncated mid-char) —
+        // only when actually streaming (not during an F5 replay).
+        if streaming {
+            let tail = slot.state.utf8.flush(|ids| {
+                ctx.tokenizer
+                    .as_ref()
+                    .map(|t| t.decode(ids, true).unwrap_or_default())
+                    .unwrap_or_default()
+            });
+            if !tail.is_empty() {
+                let _ = ctx.emit_stream_token(&slot.response_tx, 0, tail);
+            }
+        }
     }
 }
 
@@ -3511,23 +3573,46 @@ fn run_spec_round_for_slot(ctx: &DriverContext, slot: &mut DriverSlot, vocab: us
                 .any(|s| !s.is_empty() && buf.contains(s.as_str()))
         };
 
+        // UTF-8-safe incremental detok on the driver thread (same per-slot
+        // stream as the plain decode row): strips special tokens + reassembles
+        // split multi-byte chars. Advance for every committed token; only SEND
+        // when not replaying.
+        let streaming = slot.state.skip_emit == 0;
+        let out_text = slot.state.utf8.next_text(id, |ids| {
+            ctx.tokenizer
+                .as_ref()
+                .map(|t| t.decode(ids, true).unwrap_or_default())
+                .unwrap_or_default()
+        });
         // F5 replay: suppress streaming regenerated tokens while skip_emit > 0.
-        if slot.state.skip_emit > 0 {
-            slot.state.skip_emit -= 1;
-        } else {
+        if streaming {
             // P4s: same inline-or-pipelined emit as the plain decode row.
-            if !ctx.emit_stream_token(&slot.response_tx, id) {
+            if !ctx.emit_stream_token(&slot.response_tx, id, out_text) {
                 slot.state.done = true;
                 return;
             }
             slot.state.emitted_to_client += 1;
+        } else {
+            slot.state.skip_emit -= 1;
         }
 
         let hit_max = slot.state.n_emitted >= max_tokens;
-        let hit_eos = slot.state.eos.map(|e| (id as i32) == e).unwrap_or(false);
+        // End the slot on ANY end-of-generation token (see `build_stop_token_ids`).
+        let hit_eos = slot.state.stop_ids.contains(&(id as i32));
         let hit_cap = slot.state.next_pos >= slot.state.cache.capacity_tokens();
         if hit_max || hit_eos || hit_cap || hit_stop {
             slot.state.done = true;
+            if streaming {
+                let tail = slot.state.utf8.flush(|ids| {
+                    ctx.tokenizer
+                        .as_ref()
+                        .map(|t| t.decode(ids, true).unwrap_or_default())
+                        .unwrap_or_default()
+                });
+                if !tail.is_empty() {
+                    let _ = ctx.emit_stream_token(&slot.response_tx, 0, tail);
+                }
+            }
             return;
         }
     }

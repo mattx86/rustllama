@@ -135,15 +135,17 @@ pub struct StepSelection {
 
 /// HuggingFace-faithful per-step selection over the sorted candidates.
 ///
-/// Scans candidates in rank order. A non-EOS candidate becomes a continuing
-/// beam. An EOS candidate is retired to `finished` *only if its rank is within
-/// the top `num_beams`* (an EOS ranked below that can't out-score the kept
-/// continuations, so HF drops it). The scan stops once `num_beams` continuing
-/// beams have been collected.
+/// Scans candidates in rank order. A non-terminal candidate becomes a
+/// continuing beam. A candidate whose token ENDS generation (any id in `stop`
+/// — the configured `eos_token_id` plus the model's other end-of-turn
+/// terminals, see `build_stop_token_ids`) is retired to `finished` *only if its
+/// rank is within the top `num_beams`* (a terminal ranked below that can't
+/// out-score the kept continuations, so HF drops it). The scan stops once
+/// `num_beams` continuing beams have been collected.
 pub fn select_step(
     candidates: &[BeamCandidate],
     num_beams: usize,
-    eos: Option<u32>,
+    stop: &std::collections::HashSet<u32>,
 ) -> StepSelection {
     let mut continuing: Vec<BeamCandidate> = Vec::with_capacity(num_beams);
     let mut finished: Vec<BeamCandidate> = Vec::new();
@@ -151,11 +153,11 @@ pub fn select_step(
         if continuing.len() == num_beams {
             break;
         }
-        if eos == Some(c.token) {
+        if stop.contains(&c.token) {
             if rank < num_beams {
                 finished.push(*c);
             }
-            // An EOS ranked below the top num_beams is discarded (HF rule).
+            // A terminal ranked below the top num_beams is discarded (HF rule).
         } else {
             continuing.push(*c);
         }
@@ -363,7 +365,7 @@ mod tests {
         assert_eq!(cands[2].token, 2);
         assert_eq!(cands[3].token, 4);
 
-        let sel = select_step(&cands, 2, Some(99));
+        let sel = select_step(&cands, 2, &std::collections::HashSet::from([99u32]));
         assert_eq!(sel.continuing.len(), 2);
         assert_eq!(sel.continuing[0].token, 1);
         assert_eq!(sel.continuing[0].parent, 0);
@@ -396,8 +398,8 @@ mod tests {
                 cum_logprob: -2.0,
             },
         ];
-        let sel = select_step(&cands, 2, Some(0));
-        // EOS at rank 0 retires; token 5 continues; we now have 1 continuing.
+        let sel = select_step(&cands, 2, &std::collections::HashSet::from([0u32]));
+        // A terminal at rank 0 retires; token 5 continues; we now have 1 continuing.
         // The rank-2 EOS is beyond num_beams and is discarded.
         assert_eq!(sel.finished.len(), 1);
         assert_eq!(sel.finished[0].parent, 0);
