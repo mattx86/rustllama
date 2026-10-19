@@ -4080,12 +4080,28 @@ async fn serve(
             // batched-decode path; a positive budget turns on the ragged mixed
             // prefill+decode forward. `RUSTLLAMA_MAX_BATCHED_TOKENS` still wins
             // (env-over-config) — resolved inside the engine.
+            // #1: honor the EXPLICIT placement config on the paged driver — the
+            // `[inference].n_gpu_layers` override (AUTO/999 ⇒ all-GPU `u32::MAX`;
+            // the MEASURED auto-heat placement is contiguous-engine-only) and the
+            // `[inference].placement.overrides` CPU-force patterns. These install
+            // on the driver thread at `driver_loop` start.
+            let paged_n_gpu_layers = cfg.inference.n_gpu_layers_override().unwrap_or(u32::MAX);
+            let paged_cpu_force: Vec<String> = cfg
+                .inference
+                .placement
+                .overrides
+                .iter()
+                .filter(|o| o.device.eq_ignore_ascii_case("cpu"))
+                .map(|o| o.pattern.clone())
+                .collect();
             let paged = PagedBatchEngine::load_with_batched_tokens_and_lora(
                 path,
                 max_ctx,
                 concurrency as u32,
                 cfg.inference.max_num_batched_tokens as usize,
                 startup_lora.filter(|_| !path.is_dir()),
+                paged_n_gpu_layers,
+                paged_cpu_force,
             )
             .map_err(|e| {
                 anyhow::anyhow!("failed to load fused-decode model {}: {e}", path.display())
