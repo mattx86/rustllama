@@ -1290,11 +1290,23 @@ fn ui(f: &mut Frame, app: &mut App) {
         app.scroll = max_scroll;
         app.follow = app.scroll == max_scroll; // re-pin if we hit bottom
     }
+    // Belt-and-braces: the branches above already keep `scroll` in range, but
+    // an explicit clamp guarantees it is always a valid offset (never past the
+    // content) regardless of how it was last mutated by a key event.
+    app.scroll = app.scroll.min(max_scroll);
 
-    let transcript = Paragraph::new(Text::from(lines))
-        .block(transcript_block)
-        .scroll((app.scroll, 0));
-    f.render_widget(transcript, chunks[2]);
+    // Render the bordered Block and the scrolled transcript as TWO widgets, not
+    // one `Paragraph::block(..).scroll(..)`. The Block owns the full `chunks[2]`
+    // (its border ring); the Paragraph is clipped to the Block's `inner` area
+    // and never sees the border cells at all. Drawn together in one pass, the
+    // scrolled content can paint over the frame — on a narrow/odd terminal (an
+    // XShell→SSH session) that shows as the box border vanishing and glyphs
+    // smearing along the edge as the user scrolls. Clipping the paragraph to
+    // `inner` makes that structurally impossible: the border stays solid and no
+    // scrolled cell can bleed past the frame.
+    f.render_widget(transcript_block, chunks[2]);
+    let transcript = Paragraph::new(Text::from(lines)).scroll((app.scroll, 0));
+    f.render_widget(transcript, inner);
 
     // --- input box ---
     let title = if app.streaming {
@@ -1438,6 +1450,239 @@ mod tests {
         assert_eq!(
             wrap_text("a\n\nb", 10),
             vec!["a".to_string(), String::new(), "b".to_string()]
+        );
+    }
+
+    /// A minimal `App` for driving the real `ui(f, &mut app)` under a
+    /// `TestBackend`. Fields match the `event_loop` defaults; stats start
+    /// cleared so an idle footer is deterministic.
+    fn test_app() -> App {
+        App {
+            system: None,
+            turns: Vec::new(),
+            input: String::new(),
+            scroll: 0,
+            follow: true,
+            streaming: false,
+            model_label: "test-model".into(),
+            model_id: "test-model".into(),
+            server_url: "http://127.0.0.1:11434".into(),
+            status: "ready".into(),
+            temperature: 0.7,
+            max_tokens: 512,
+            top_p: 0.95,
+            top_k: 40,
+            repeat_penalty: 1.1,
+            should_quit: false,
+            auto_tools: false,
+            clarify_enabled: true,
+            pending_question: None,
+            pending_tools: None,
+            stats_timer: None,
+            pending_usage: None,
+            last_stats: None,
+            ctx_size: 8192,
+        }
+    }
+
+    /// Emulate SSE token deltas: a few characters at a time, never splitting a
+    /// `char` — so a multi-byte glyph (the trailing emoji) always arrives whole
+    /// in one delta, exactly as a real tokenizer emits it.
+    fn chunk_tokens(s: &str) -> Vec<String> {
+        let chars: Vec<char> = s.chars().collect();
+        chars.chunks(3).map(|c| c.iter().collect()).collect()
+    }
+
+    /// GOAL 1 — the decisive app-bug-vs-terminal test.
+    ///
+    /// Drive the REAL render function `ui(f, &mut app)` under a ratatui
+    /// `TestBackend`, simulating the streaming loop: push a user turn + an
+    /// empty assistant placeholder, then append the reply TOKEN-BY-TOKEN
+    /// (`terminal.draw` after each delta, exactly like `event_loop`). The reply
+    /// is a multi-paragraph answer with a fenced code block and a trailing
+    /// emoji — the shape that desyncs a width-naive renderer. After the final
+    /// frame, the on-screen buffer (`backend().buffer()`, which accumulates
+    /// ratatui's per-frame DIFFS — so any ghost / stale cell would survive in
+    /// it) MUST equal a single-shot render of the same full content.
+    ///
+    /// If this ever fails, the corruption is APP-side (the auto-follow
+    /// `scroll`/`max_scroll` recompute as the line count grows, the
+    /// `Paragraph::scroll` interaction, or a widget not clearing its area) and
+    /// the fix belongs here. If it passes (as it does), the app render is
+    /// byte-for-cell correct and the on-terminal ghosting an XShell→SSH user
+    /// sees is TERMINAL / TRANSPORT-side (redraw-volume + SSH), which the
+    /// redraw coalescing in `event_loop` is what addresses.
+    #[test]
+    fn streaming_render_equals_single_shot_render() {
+        use ratatui::backend::TestBackend;
+
+        let reply = "Here is a short explanation of the idea.\n\n\
+                     It takes two paragraphs, and then a fenced code block:\n\n\
+                     ```\n\
+                     console.log(\"hello, world — from inside a fenced code block\");\n\
+                     ```\n\n\
+                     That is all. Thanks for reading 😊";
+
+        // A small terminal so the reply exceeds the viewport — this exercises
+        // the auto-follow scroll / `max_scroll` recompute every frame as the
+        // line count grows, and forces the code line to wrap.
+        let (w, h) = (50u16, 16u16);
+
+        // --- render incrementally, one frame per token, like the loop ---
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut app = test_app();
+        app.turns.push(Turn {
+            role: "user".into(),
+            content: "explain the idea".into(),
+        });
+        app.turns.push(Turn {
+            role: "assistant".into(),
+            content: String::new(),
+        });
+        app.streaming = true;
+        app.follow = true;
+        term.draw(|f| ui(f, &mut app)).unwrap(); // first paint (empty assistant)
+        for tok in chunk_tokens(reply) {
+            if let Some(a) = app.last_assistant_mut() {
+                a.content.push_str(&tok);
+            }
+            term.draw(|f| ui(f, &mut app)).unwrap();
+        }
+        app.streaming = false;
+        term.draw(|f| ui(f, &mut app)).unwrap(); // final paint, stream done
+        let streamed = term.backend().buffer().clone();
+
+        // --- render the same full content in a single shot ---
+        let mut term2 = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut app2 = test_app();
+        app2.turns.push(Turn {
+            role: "user".into(),
+            content: "explain the idea".into(),
+        });
+        app2.turns.push(Turn {
+            role: "assistant".into(),
+            content: reply.to_string(),
+        });
+        app2.streaming = false;
+        app2.follow = true;
+        term2.draw(|f| ui(f, &mut app2)).unwrap();
+        let single = term2.backend().buffer().clone();
+
+        assert_eq!(
+            streamed, single,
+            "incremental-stream buffer differs from the single-shot render — \
+             app-side streaming corruption"
+        );
+    }
+
+    /// A tall transcript (content far exceeds the viewport) for the scroll test.
+    fn tall_app() -> App {
+        let mut a = test_app();
+        for i in 0..12 {
+            a.turns.push(Turn {
+                role: "user".into(),
+                content: format!(
+                    "question number {i} with enough words to wrap across the narrow pane"
+                ),
+            });
+            a.turns.push(Turn {
+                role: "assistant".into(),
+                content: format!(
+                    "answer number {i}: here is a multi-line reply.\n\
+                     second line of the answer.\nthird line with a tail 😊"
+                ),
+            });
+        }
+        a.streaming = false;
+        a
+    }
+
+    /// The transcript pane's rect, laid out exactly as `ui` does (the third
+    /// slot: status bar, stats footer, transcript, input box).
+    fn transcript_rect(w: u16, h: u16) -> Rect {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(3),
+                Constraint::Length(3),
+            ])
+            .split(Rect::new(0, 0, w, h))[2]
+    }
+
+    fn is_box_glyph(sym: &str) -> bool {
+        // A space here would mean the border VANISHED at that cell — the exact
+        // bug under test — so it is NOT accepted.
+        matches!(
+            sym,
+            "│" | "─" | "┌" | "┐" | "└" | "┘" | "├" | "┤" | "┬" | "┴" | "┼"
+        )
+    }
+
+    /// The border ring of the transcript block must be box-drawing glyphs only
+    /// — no transcript text bled onto it. (The top row carries the " transcript "
+    /// title, so it's exempt; the left/right columns and the bottom row are the
+    /// edges a scrolled paragraph could smear into.)
+    fn assert_border_intact(buf: &ratatui::buffer::Buffer, w: u16, h: u16) {
+        let t = transcript_rect(w, h);
+        for y in t.top()..t.bottom() {
+            let l = buf[(t.left(), y)].symbol().to_string();
+            let r = buf[(t.right() - 1, y)].symbol().to_string();
+            assert!(is_box_glyph(&l), "left border overwritten at y={y}: {l:?}");
+            assert!(is_box_glyph(&r), "right border overwritten at y={y}: {r:?}");
+        }
+        for x in t.left()..t.right() {
+            let b = buf[(x, t.bottom() - 1)].symbol().to_string();
+            assert!(
+                is_box_glyph(&b),
+                "bottom border overwritten at x={x}: {b:?}"
+            );
+        }
+    }
+
+    /// GOAL 1 — manual-scroll / border-integrity regression.
+    ///
+    /// The reported XShell→SSH symptom is the transcript's BOX BORDER vanishing
+    /// and glyphs SMEARING as the user scrolls (not only during streaming).
+    /// Drive the real `ui` through a sequence of scroll offsets — top, middle,
+    /// PAST the end (over-max), and back up — on ONE `TestBackend` (so a stale
+    /// cell from a prior offset would survive into the buffer). At every offset
+    /// the block border must stay intact, and the final buffer must equal a
+    /// FRESH single-shot render at that offset (no smear / stale cells).
+    ///
+    /// With the transcript rendered as a Block clipped-to-`inner` Paragraph
+    /// (not `Paragraph::block(..).scroll(..)`), scrolled content can never
+    /// touch the border, so this holds.
+    #[test]
+    fn manual_scroll_keeps_border_and_leaves_no_smear() {
+        use ratatui::backend::TestBackend;
+        let (w, h) = (40u16, 12u16);
+
+        // Visit several offsets in sequence on one terminal.
+        let offsets = [0u16, 6, 100, 3];
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut app = tall_app();
+        for &off in &offsets {
+            app.follow = false;
+            app.scroll = off;
+            term.draw(|f| ui(f, &mut app)).unwrap();
+            assert_border_intact(term.backend().buffer(), w, h);
+        }
+
+        // The last offset we rendered (3) with no follow — a fresh render at the
+        // same state must match cell-for-cell (any smear left by the earlier
+        // offsets, including the over-max bottom pin, would show up as a diff).
+        let mut fresh = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut app2 = tall_app();
+        app2.follow = false;
+        app2.scroll = 3;
+        fresh.draw(|f| ui(f, &mut app2)).unwrap();
+
+        assert_eq!(
+            term.backend().buffer(),
+            fresh.backend().buffer(),
+            "scrolling through offsets left stale / smeared cells vs a fresh render"
         );
     }
 }
