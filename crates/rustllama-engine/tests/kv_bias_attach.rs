@@ -6,7 +6,7 @@
 //! making quality claims. Basis-mismatch refusal mirrors the fork.
 
 use rustllama_engine::kv_bias::KvBiasData;
-use rustllama_engine::{CpuEngine, KvDtype, SamplingParams};
+use rustllama_engine::{ContiguousEngine, KvDtype, SamplingParams};
 use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
 
 fn greedy(n: u32) -> SamplingParams {
@@ -39,7 +39,8 @@ fn zero_bias_attach_is_greedy_identity() {
     let prompt: Vec<i32> = (0..8).collect();
 
     let baseline = {
-        let e = CpuEngine::load_with_options(&model, 32, false, KvDtype::Q4_0).expect("load");
+        let e =
+            ContiguousEngine::load_with_options(&model, 32, false, KvDtype::Q4_0).expect("load");
         e.generate_token_ids(&prompt, 4, &greedy(4)).expect("gen")
     };
 
@@ -58,7 +59,7 @@ fn zero_bias_attach_is_greedy_identity() {
     bias.save_with_geometry(&sidecar, synth.head_dim as usize, synth.n_kv_heads as usize)
         .expect("save sidecar");
 
-    let e = CpuEngine::load_with_options(&model, 32, false, KvDtype::Q4_0).expect("load2");
+    let e = ContiguousEngine::load_with_options(&model, 32, false, KvDtype::Q4_0).expect("load2");
     // Auto-discovery: sidecar sits beside the model.
     let attached = e.attach_kv_bias(None).expect("attach");
     assert!(
@@ -92,7 +93,7 @@ fn basis_mismatch_is_refused() {
     bias.save_with_geometry(&sidecar, synth.head_dim as usize, synth.n_kv_heads as usize)
         .expect("save sidecar");
 
-    let e = CpuEngine::load_with_options(&model, 32, false, KvDtype::Q4_0).expect("load");
+    let e = ContiguousEngine::load_with_options(&model, 32, false, KvDtype::Q4_0).expect("load");
     let err = e
         .attach_kv_bias(Some(&sidecar))
         .expect_err("mismatched basis must refuse to attach");
@@ -105,7 +106,7 @@ fn basis_mismatch_is_refused() {
 #[test]
 fn no_sidecar_auto_mode_is_quiet_noop() {
     let (model, _synth) = synth_64("no-sidecar");
-    let e = CpuEngine::load_with_options(&model, 32, false, KvDtype::Q4_0).expect("load");
+    let e = ContiguousEngine::load_with_options(&model, 32, false, KvDtype::Q4_0).expect("load");
     assert!(
         !e.attach_kv_bias(None).expect("attach"),
         "no sidecar → Ok(false)"
@@ -126,7 +127,7 @@ fn non_q4_0_cache_with_explicit_path_errors() {
     let sidecar = model.with_extension("kvbias.gguf");
     bias.save_with_geometry(&sidecar, synth.head_dim as usize, synth.n_kv_heads as usize)
         .expect("save sidecar");
-    let e = CpuEngine::load_with_options(&model, 32, false, KvDtype::F32).expect("load");
+    let e = ContiguousEngine::load_with_options(&model, 32, false, KvDtype::F32).expect("load");
     // Auto mode: quiet skip on non-Q4_0.
     assert!(
         !e.attach_kv_bias(None).expect("auto"),

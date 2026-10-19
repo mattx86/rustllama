@@ -1,4 +1,4 @@
-//! F9 — `CpuEngine` loads + runs a PURE Mamba/SSM model (all recurrent
+//! F9 — `ContiguousEngine` loads + runs a PURE Mamba/SSM model (all recurrent
 //! layers, zero attention) through the hybrid forward (`forward_one_hybrid`
 //! with no full-attention layers); the recurrent `DeltaNetCache` is the only
 //! cache. Before F9 the engine refused pure-SSM checkpoints ("no MambaEngine
@@ -9,7 +9,7 @@
 //! is OFF unless explicitly set, so leaving it off is byte-identical.
 
 use rustllama_engine::speculative::LookaheadDrafterConfig;
-use rustllama_engine::{CpuEngine, SamplingParams};
+use rustllama_engine::{ContiguousEngine, SamplingParams};
 use rustllama_gguf::synth::{
     write_synthetic_llama_gguf, write_synthetic_mamba_gguf, SynthHybrid, SynthLlama, SynthMamba,
 };
@@ -46,15 +46,17 @@ fn write_pure_ssm(tag: &str, n_layers: u32) -> std::path::PathBuf {
     tmp
 }
 
-/// F9 anchor: `CpuEngine` loads a pure-SSM model (NOT refused) and decodes it
+/// F9 anchor: `ContiguousEngine` loads a pure-SSM model (NOT refused) and decodes it
 /// to a finite, deterministic token sequence through `forward_one_hybrid`.
 #[test]
 fn cpu_engine_loads_and_runs_pure_ssm() {
     let tmp = write_pure_ssm("run", 4);
 
     let mut cpu =
-        CpuEngine::load_with_options_and_layout(&tmp, 64, true, KvDtype::F32, "contiguous")
-            .expect("pure-SSM model must load via CpuEngine (hybrid forward, zero attention)");
+        ContiguousEngine::load_with_options_and_layout(&tmp, 64, true, KvDtype::F32, "contiguous")
+            .expect(
+                "pure-SSM model must load via ContiguousEngine (hybrid forward, zero attention)",
+            );
     cpu.set_prefix_cache(false);
 
     // F10 default-off: lookahead spec is None on a freshly loaded engine.
@@ -95,7 +97,7 @@ fn write_canonical_mamba(tag: &str, n_layers: u32) -> std::path::PathBuf {
 }
 
 /// F9-tail anchor: a CANONICAL Mamba/SSM GGUF (arch `mamba`, the selective-scan
-/// recurrence — NOT the DeltaNet hybrid layout) LOADS through `CpuEngine` (it is
+/// recurrence — NOT the DeltaNet hybrid layout) LOADS through `ContiguousEngine` (it is
 /// no longer refused) and greedily decodes to a finite, deterministic, in-vocab
 /// token sequence through the wired `mamba_arch::MambaModel` selective scan.
 #[test]
@@ -103,8 +105,9 @@ fn cpu_engine_loads_and_runs_canonical_mamba() {
     let tmp = write_canonical_mamba("run", 3);
 
     let mut cpu =
-        CpuEngine::load_with_options_and_layout(&tmp, 64, true, KvDtype::F32, "contiguous").expect(
-            "canonical Mamba model must load via CpuEngine (selective-scan engine wired, \
+        ContiguousEngine::load_with_options_and_layout(&tmp, 64, true, KvDtype::F32, "contiguous")
+            .expect(
+            "canonical Mamba model must load via ContiguousEngine (selective-scan engine wired, \
              not refused)",
         );
     cpu.set_prefix_cache(false);
@@ -141,7 +144,7 @@ fn cpu_engine_loads_and_runs_canonical_mamba() {
 fn lookahead_knob_round_trips() {
     let tmp = write_pure_ssm("knob", 2);
     let mut cpu =
-        CpuEngine::load_with_options_and_layout(&tmp, 64, true, KvDtype::F32, "contiguous")
+        ContiguousEngine::load_with_options_and_layout(&tmp, 64, true, KvDtype::F32, "contiguous")
             .expect("load");
     assert!(cpu.lookahead_speculative().is_none());
     cpu.set_lookahead_speculative(Some(LookaheadDrafterConfig {

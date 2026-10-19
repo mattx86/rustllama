@@ -832,7 +832,7 @@ pub fn write_synthetic_llama_gguf(path: &Path, params: &SynthLlama) {
 /// the selective-scan recurrence (`ssm_in`/`ssm_conv1d`/`ssm_x`/`ssm_dt`/
 /// `ssm_a`/`ssm_d`/`ssm_out`, `s ← exp(dt·A)·s + dt·B·x`), NOT the DeltaNet
 /// hybrid layout. Drives the tested `mamba_arch::MambaModel` CPU forward now
-/// wired into `CpuEngine` (F9-tail). Weight values are small deterministic
+/// wired into `ContiguousEngine` (F9-tail). Weight values are small deterministic
 /// RNG — enough for a finite, deterministic, in-vocab decode, not a match to
 /// any external (HF) reference.
 #[derive(Debug, Clone)]
@@ -869,7 +869,7 @@ impl Default for SynthMamba {
 /// Write a synthetic canonical Mamba-1 GGUF (arch `mamba`) to `path`. Emits
 /// the `mamba.*` + `mamba.ssm.*` metadata `MambaConfig::from_gguf` reads and
 /// the per-layer selective-scan tensor set `MambaModel::load` binds, plus a
-/// gpt2 tokenizer so `CpuEngine` loads with tokenization. All weights are F32
+/// gpt2 tokenizer so `ContiguousEngine` loads with tokenization. All weights are F32
 /// (the loader also accepts F16 / quantized, but F32 keeps the fixture exact).
 pub fn write_synthetic_mamba_gguf(path: &Path, p: &SynthMamba) {
     let SynthMamba {
@@ -895,7 +895,7 @@ pub fn write_synthetic_mamba_gguf(path: &Path, p: &SynthMamba) {
     m.f32("mamba.attention.layer_norm_rms_epsilon", 1e-5);
     m.u32("mamba.context_length", 131072);
 
-    // gpt2 tokenizer so `Tokenizer::from_gguf` + the `CpuEngine` load succeed.
+    // gpt2 tokenizer so `Tokenizer::from_gguf` + the `ContiguousEngine` load succeed.
     let vocab_tokens: Vec<String> = (0..vocab).map(|i| format!("<tok_{i}>")).collect();
     m.array_strings("tokenizer.ggml.tokens", &vocab_tokens);
     m.string("tokenizer.ggml.model", "gpt2");

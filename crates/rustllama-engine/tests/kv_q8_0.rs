@@ -8,7 +8,7 @@
 //! to match exactly under greedy decoding; if they diverge, the chosen
 //! token must still come from the F32 path's top-K candidates.
 
-use rustllama_engine::{CpuEngine, KvDtype, SamplingParams};
+use rustllama_engine::{ContiguousEngine, KvDtype, SamplingParams};
 use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
 
 fn synth_gguf(tag: &str) -> std::path::PathBuf {
@@ -36,8 +36,9 @@ fn q8_0_kv_matches_f32_on_synthetic_llama_greedy() {
     // KV-cache dtype. Greedy + same prompt should land on identical
     // continuations on this small model.
     let path = synth_gguf("parity");
-    let engine_f32 = CpuEngine::load(&path, 32).expect("load f32");
-    let engine_q8 = CpuEngine::load_with_options(&path, 32, false, KvDtype::Q8_0).expect("load q8");
+    let engine_f32 = ContiguousEngine::load(&path, 32).expect("load f32");
+    let engine_q8 =
+        ContiguousEngine::load_with_options(&path, 32, false, KvDtype::Q8_0).expect("load q8");
 
     let prompt: Vec<i32> = (0..10).collect();
     let out_f32 = engine_f32
@@ -59,7 +60,8 @@ fn q8_0_kv_matches_f32_on_synthetic_llama_greedy() {
 #[test]
 fn q8_0_kv_remains_deterministic_across_runs() {
     let path = synth_gguf("determ");
-    let engine = CpuEngine::load_with_options(&path, 32, false, KvDtype::Q8_0).expect("load q8");
+    let engine =
+        ContiguousEngine::load_with_options(&path, 32, false, KvDtype::Q8_0).expect("load q8");
     let prompt = [3i32, 5, 7, 11, 13, 17];
 
     let a = engine
@@ -82,8 +84,9 @@ fn q8_0_kv_uses_fewer_bytes_than_f32_after_reset() {
     // at the same context size and that they reach the same generation
     // state without panicking.
     let path = synth_gguf("size");
-    let f32_engine = CpuEngine::load(&path, 32).expect("load f32");
-    let q8_engine = CpuEngine::load_with_options(&path, 32, false, KvDtype::Q8_0).expect("load q8");
+    let f32_engine = ContiguousEngine::load(&path, 32).expect("load f32");
+    let q8_engine =
+        ContiguousEngine::load_with_options(&path, 32, false, KvDtype::Q8_0).expect("load q8");
 
     // Touch enough tokens to populate the cache for several positions.
     let prompt: Vec<i32> = (0..8).collect();

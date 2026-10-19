@@ -19,10 +19,10 @@
 //!   - `POST /v1/score`          — sequence log-likelihood / perplexity of an
 //!     `input` string or `messages`.
 //!
-//! The decision primitives reduce to [`CpuEngine::score_continuations`], which
+//! The decision primitives reduce to [`ContiguousEngine::score_continuations`], which
 //! teacher-forces each option as a continuation of the context and
 //! snapshot/restores the KV + DeltaNet state so the live serving model is
-//! never mutated. `/v1/score` uses the sibling [`CpuEngine::sequence_logprob`].
+//! never mutated. `/v1/score` uses the sibling [`ContiguousEngine::sequence_logprob`].
 //!
 //! Every response carries uncertainty signals — `entropy` (nats), `margin`
 //! (top1 − top2 probability) and `effective_options` (`exp(entropy)`, the

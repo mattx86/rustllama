@@ -186,7 +186,7 @@ async fn capabilities_fim_unavailable_on_mock_engine() {
 
 #[tokio::test]
 async fn capabilities_fim_available_on_chat_model_with_fim_markers() {
-    use rustllama_engine::CpuEngine;
+    use rustllama_engine::ContiguousEngine;
     use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
 
     let model_path = std::env::temp_dir().join("rustllama-caps-fim-on.gguf");
@@ -200,7 +200,7 @@ async fn capabilities_fim_available_on_chat_model_with_fim_markers() {
             ..SynthLlama::default()
         },
     );
-    let cpu = Arc::new(CpuEngine::load_with_tokenizer(&model_path, 64).expect("load"));
+    let cpu = Arc::new(ContiguousEngine::load_with_tokenizer(&model_path, 64).expect("load"));
     let serving = ServingModel {
         engine: cpu.clone() as Arc<dyn rustllama_engine::Engine>,
         cpu_engine: Some(cpu),
@@ -242,7 +242,7 @@ async fn capabilities_moe_supported_true_on_default_state() {
 
 #[tokio::test]
 async fn capabilities_moe_active_counts_populated_for_mixtral_shape_model() {
-    use rustllama_engine::CpuEngine;
+    use rustllama_engine::ContiguousEngine;
     use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama, SynthMoe};
 
     let model_path = std::env::temp_dir().join("rustllama-caps-moe-mixtral.gguf");
@@ -257,7 +257,7 @@ async fn capabilities_moe_active_counts_populated_for_mixtral_shape_model() {
             ..SynthLlama::default()
         },
     );
-    let cpu = Arc::new(CpuEngine::load_with_tokenizer(&model_path, 64).expect("load"));
+    let cpu = Arc::new(ContiguousEngine::load_with_tokenizer(&model_path, 64).expect("load"));
     let serving = ServingModel {
         engine: cpu.clone() as Arc<dyn rustllama_engine::Engine>,
         cpu_engine: Some(cpu),
@@ -286,7 +286,7 @@ async fn capabilities_moe_active_counts_populated_for_mixtral_shape_model() {
 
 #[tokio::test]
 async fn capabilities_moe_active_shared_populated_for_deepseek_shape_model() {
-    use rustllama_engine::CpuEngine;
+    use rustllama_engine::ContiguousEngine;
     use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama, SynthMoe};
 
     let model_path = std::env::temp_dir().join("rustllama-caps-moe-deepseek.gguf");
@@ -301,7 +301,7 @@ async fn capabilities_moe_active_shared_populated_for_deepseek_shape_model() {
             ..SynthLlama::default()
         },
     );
-    let cpu = Arc::new(CpuEngine::load_with_tokenizer(&model_path, 64).expect("load"));
+    let cpu = Arc::new(ContiguousEngine::load_with_tokenizer(&model_path, 64).expect("load"));
     let serving = ServingModel {
         engine: cpu.clone() as Arc<dyn rustllama_engine::Engine>,
         cpu_engine: Some(cpu),
@@ -321,12 +321,12 @@ async fn capabilities_moe_active_shared_populated_for_deepseek_shape_model() {
 
 #[tokio::test]
 async fn capabilities_moe_active_counts_absent_for_dense_model() {
-    use rustllama_engine::CpuEngine;
+    use rustllama_engine::ContiguousEngine;
     use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
 
     let model_path = std::env::temp_dir().join("rustllama-caps-moe-dense.gguf");
     write_synthetic_llama_gguf(&model_path, &SynthLlama::default());
-    let cpu = Arc::new(CpuEngine::load_with_tokenizer(&model_path, 64).expect("load"));
+    let cpu = Arc::new(ContiguousEngine::load_with_tokenizer(&model_path, 64).expect("load"));
     let serving = ServingModel {
         engine: cpu.clone() as Arc<dyn rustllama_engine::Engine>,
         cpu_engine: Some(cpu),
@@ -358,7 +358,7 @@ async fn capabilities_moe_active_counts_absent_for_dense_model() {
 
 #[tokio::test]
 async fn capabilities_fim_unavailable_on_chat_model_without_fim_markers() {
-    use rustllama_engine::CpuEngine;
+    use rustllama_engine::ContiguousEngine;
     use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
 
     let model_path = std::env::temp_dir().join("rustllama-caps-fim-off.gguf");
@@ -369,7 +369,7 @@ async fn capabilities_fim_unavailable_on_chat_model_without_fim_markers() {
             ..SynthLlama::default()
         },
     );
-    let cpu = Arc::new(CpuEngine::load_with_tokenizer(&model_path, 64).expect("load"));
+    let cpu = Arc::new(ContiguousEngine::load_with_tokenizer(&model_path, 64).expect("load"));
     let serving = ServingModel {
         engine: cpu.clone() as Arc<dyn rustllama_engine::Engine>,
         cpu_engine: Some(cpu),

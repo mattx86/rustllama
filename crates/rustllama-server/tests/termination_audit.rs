@@ -105,11 +105,11 @@ async fn openai_chat_natural_stop_reports_stop() {
 }
 
 fn build_state_with_real_cpu_engine(tag: &str) -> (AppState, std::path::PathBuf) {
-    use rustllama_engine::CpuEngine;
+    use rustllama_engine::ContiguousEngine;
     use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
     let tmp = std::env::temp_dir().join(format!("rustllama-termaudit-{tag}.gguf"));
     write_synthetic_llama_gguf(&tmp, &SynthLlama::default());
-    let cpu = CpuEngine::load_with_tokenizer(&tmp, 16).expect("load cpu");
+    let cpu = ContiguousEngine::load_with_tokenizer(&tmp, 16).expect("load cpu");
     let model_id = cpu.model_id().to_string();
     let cpu = Arc::new(cpu);
     let serving = ServingModel {
@@ -128,9 +128,9 @@ fn build_state_with_real_cpu_engine(tag: &str) -> (AppState, std::path::PathBuf)
 
 #[tokio::test]
 async fn openai_completions_max_tokens_hit_reports_length() {
-    // The completions endpoint requires a real CpuEngine (it relies
+    // The completions endpoint requires a real ContiguousEngine (it relies
     // on the tokenizer to encode the prompt + count tokens); the
-    // mock-engine harness gets a 503 from the handler's CpuEngine
+    // mock-engine harness gets a 503 from the handler's ContiguousEngine
     // probe. Stand up a synth-GGUF-backed engine for this one test.
     let (state, tmp) = build_state_with_real_cpu_engine("completions");
     let app = router(state);

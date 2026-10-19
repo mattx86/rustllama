@@ -576,7 +576,7 @@ pub struct TuningResult {
     /// P9: single-stream serving-engine winner from `tune --batching` —
     /// `"paged"` (the continuous-batching `PagedBatchEngine` is
     /// parity-or-faster for the single-user case, so default-on is safe)
-    /// or `"contiguous"` (the contiguous `CpuEngine` is measurably faster
+    /// or `"contiguous"` (the contiguous `ContiguousEngine` is measurably faster
     /// single-stream, so the serve path falls back to it). `None` =
     /// untuned; the serve path then uses the default-on batching engine.
     /// Consumed when `[server].fused_decode` is unset +

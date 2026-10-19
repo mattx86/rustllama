@@ -131,7 +131,7 @@ pub fn system_fingerprint(version: &str, model_id: &str, kv_dtype: &str) -> Stri
 /// [`AppState::resolve`] / [`AppState::current`] as a cheap-clone bundle
 /// of `Arc`s so handlers can hold a stable view across an entire request
 /// even if a load/unload lands mid-request. In-flight generations keep
-/// their snapshot's `Arc<CpuEngine>` alive past an unload; the eviction
+/// their snapshot's `Arc<ContiguousEngine>` alive past an unload; the eviction
 /// only affects future requests.
 ///
 /// Each model owns its own single-flight gate. With multi-model loaded,
@@ -141,7 +141,7 @@ pub fn system_fingerprint(version: &str, model_id: &str, kv_dtype: &str) -> Stri
 #[derive(Clone)]
 pub struct ServingModel {
     pub engine: Arc<dyn Engine>,
-    pub cpu_engine: Option<Arc<rustllama_engine::CpuEngine>>,
+    pub cpu_engine: Option<Arc<rustllama_engine::ContiguousEngine>>,
     pub model_id: String,
     pub gate: Arc<Semaphore>,
     /// Per-model scheduler. A [`SingleFlightScheduler`] by default (matches the
@@ -171,7 +171,7 @@ pub struct ServingModel {
     /// case the gate is a `Semaphore::new(concurrency)` and `try_acquire`
     /// hands out an [`EngineHandle`] whose `engine` field points to a
     /// per-request engine from the pool. Each pool entry is a
-    /// [`rustllama_engine::CpuEngine::fork_for_concurrent_use`] fork —
+    /// [`rustllama_engine::ContiguousEngine::fork_for_concurrent_use`] fork —
     /// shared model weights via `Arc`, independent KV cache.
     #[doc(hidden)]
     pub multi: Option<MultiFlightPool>,
@@ -185,7 +185,7 @@ pub struct ServingModel {
 #[derive(Clone)]
 pub struct MultiFlightPool {
     pub engines: Vec<Arc<dyn Engine>>,
-    pub cpu_engines: Vec<Arc<rustllama_engine::CpuEngine>>,
+    pub cpu_engines: Vec<Arc<rustllama_engine::ContiguousEngine>>,
     /// Shared round-robin counter. `Arc`-cloned across `ServingModel`
     /// clones so concurrent `resolve()` calls see the same monotonic
     /// pick sequence.
@@ -361,7 +361,7 @@ impl ServingModel {
             return self;
         };
         let mut engines: Vec<Arc<dyn Engine>> = Vec::with_capacity(concurrency);
-        let mut cpu_engines: Vec<Arc<rustllama_engine::CpuEngine>> =
+        let mut cpu_engines: Vec<Arc<rustllama_engine::ContiguousEngine>> =
             Vec::with_capacity(concurrency);
         // The first pool entry IS the original engine; subsequent
         // entries are fresh forks. This preserves prefix-cache state
@@ -370,7 +370,7 @@ impl ServingModel {
         cpu_engines.push(cpu.clone());
         for _ in 1..concurrency {
             let fork = cpu.fork_for_concurrent_use();
-            let fork_arc: Arc<rustllama_engine::CpuEngine> = Arc::new(fork);
+            let fork_arc: Arc<rustllama_engine::ContiguousEngine> = Arc::new(fork);
             cpu_engines.push(fork_arc.clone());
             engines.push(fork_arc as Arc<dyn Engine>);
         }
@@ -422,7 +422,7 @@ impl ServingModel {
     /// guards the degenerate `max_pending < concurrency` config.
     ///
     /// `cpu_engine` is set to `None` — `PagedBatchEngine` is not
-    /// a `CpuEngine`. Features that reach into `cpu_engine`
+    /// a `ContiguousEngine`. Features that reach into `cpu_engine`
     /// directly (USM warmup, prefix-cache config, raw fork) are
     /// unavailable on this path; the V1 trade-off is documented
     /// in the `fused_decode` config docstring.
@@ -558,7 +558,7 @@ pub struct RequestPermit {
     pending: Arc<AtomicUsize>,
     scheduler: SharedScheduler,
     engine: Arc<dyn Engine>,
-    cpu_engine: Option<Arc<rustllama_engine::CpuEngine>>,
+    cpu_engine: Option<Arc<rustllama_engine::ContiguousEngine>>,
     multi: Option<MultiFlightPool>,
     request_id: RequestId,
     consumed: bool,
@@ -570,7 +570,7 @@ impl RequestPermit {
     /// `serving.cpu_engine` directly — pre-gate work is identical
     /// across all forks in the multi-flight pool because the
     /// tokenizer is `Arc`-shared.
-    pub fn shared_cpu_engine(&self) -> Option<&Arc<rustllama_engine::CpuEngine>> {
+    pub fn shared_cpu_engine(&self) -> Option<&Arc<rustllama_engine::ContiguousEngine>> {
         self.cpu_engine.as_ref()
     }
 
@@ -681,7 +681,7 @@ pub struct EngineHandle {
     pub engine: Arc<dyn Engine>,
     /// Same shape, typed for the CPU engine. `None` when the model
     /// was loaded as a mock engine (test fixtures).
-    pub cpu_engine: Option<Arc<rustllama_engine::CpuEngine>>,
+    pub cpu_engine: Option<Arc<rustllama_engine::ContiguousEngine>>,
     /// Index of the chosen engine within the multi-flight pool, `0`
     /// in single-flight. Surfaced for diagnostics / tests.
     pub engine_idx: usize,
@@ -720,7 +720,7 @@ impl Drop for EngineHandle {
 /// `max_loaded` bounds the warm pool size. When `upsert` would push the
 /// registry over the cap, the entry with the smallest `last_used` stamp
 /// is evicted — except the current default, which is never evicted by
-/// the LRU. An in-flight request holds its own `Arc<CpuEngine>` clone,
+/// the LRU. An in-flight request holds its own `Arc<ContiguousEngine>` clone,
 /// so an evicted model still finishes serving requests that already
 /// picked it up before being dropped from the registry.
 struct Registry {
@@ -1588,7 +1588,7 @@ impl AppState {
     /// Persist `model_id` as the on-disk default by writing its GGUF
     /// path to `[model].path` in config.toml, so the choice survives a
     /// restart. Best-effort: returns `false` (and logs) when there's
-    /// no config path, the model isn't a file-backed CpuEngine, or the
+    /// no config path, the model isn't a file-backed ContiguousEngine, or the
     /// write fails — the in-memory default (set via [`Self::set_default`])
     /// is independent and already took. This closes the gap where
     /// `POST /v1/models/default` only changed the live default and
@@ -2494,25 +2494,24 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
         }
     }
 
-    // Model-card-driven ctx_size: when the caller didn't pin a
-    // value, respect what the model was trained for, capped at the
-    // historical 8192 default so a 1M-ctx model doesn't allocate
-    // 1M of KV cache by surprise. A 4096-ctx model gets 4096
-    // (saves memory); a 32K-ctx model still caps at 8192 (user
-    // opts in to higher by passing ctx_size explicitly).
-    const DEFAULT_CTX_CAP: usize = 8192;
+    // Model-card-driven ctx_size: an explicit non-zero `ctx_size` is honored
+    // as-is; otherwise (unset, or the `0` AUTO sentinel) derive the window from
+    // what the model was trained for, capped by the engine's auto resolver
+    // (`rustllama_engine::auto_ctx_from_train`, ceiling 32768) so a 128K/1M-ctx
+    // model doesn't allocate a giant KV cache by surprise. A sub-cap model gets
+    // exactly its trained window (saves memory). Resolving HERE — not only in
+    // the engine, which also backstops a `0` — keeps the pre-flight RAM check
+    // and the log line below working against the real window.
     let max_ctx = match req.ctx_size {
-        Some(v) => v,
-        None => {
-            let inferred = peek_gguf_ctx_train(&path)
-                .map(|n| n as usize)
-                .unwrap_or(DEFAULT_CTX_CAP);
-            let resolved = inferred.min(DEFAULT_CTX_CAP);
+        Some(v) if v != 0 => v,
+        _ => {
+            let ctx_train = peek_gguf_ctx_train(&path).unwrap_or(0);
+            let resolved = rustllama_engine::auto_ctx_from_train(ctx_train) as usize;
             tracing::info!(
                 model_path = %path.display(),
-                inferred_ctx_train = inferred,
+                inferred_ctx_train = ctx_train,
                 resolved_ctx_size = resolved,
-                "ctx_size unset — derived from model metadata"
+                "ctx_size AUTO — derived from model metadata"
             );
             resolved
         }
@@ -2758,12 +2757,12 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
             .unwrap_or(false);
     let load_result = if use_load_auto {
         tokio::task::spawn_blocking(move || {
-            rustllama_engine::CpuEngine::load_auto(&load_path, max_ctx)
+            rustllama_engine::ContiguousEngine::load_auto(&load_path, max_ctx)
         })
         .await
     } else {
         tokio::task::spawn_blocking(move || {
-            rustllama_engine::CpuEngine::load_with_options_layout_and_page_size(
+            rustllama_engine::ContiguousEngine::load_with_options_layout_and_page_size(
                 &load_path,
                 max_ctx,
                 true,
@@ -4244,11 +4243,13 @@ fn tuner_cached_flash_kv_min() -> Option<u32> {
 }
 
 /// Peek at a GGUF file's `<arch>.context_length` metadata without
-/// loading the model. Used by `load_model` to pick a sensible
-/// default `ctx_size` from what the model was actually trained for.
-/// Returns `None` on file open / parse failures so the caller falls
-/// back to the legacy 8192 default.
-fn peek_gguf_ctx_train(path: &std::path::Path) -> Option<u32> {
+/// loading the model. Used by `load_model` (and the CLI serve-startup /
+/// placement / bench paths via `rustllama_server::peek_gguf_ctx_train`) to
+/// resolve the AUTO `ctx_size` sentinel: pick a sensible context window from
+/// what the model was actually trained for. Returns `None` on file open /
+/// parse failures so the caller falls back to the 8192 default (see
+/// `rustllama_engine::auto_ctx_from_train`).
+pub fn peek_gguf_ctx_train(path: &std::path::Path) -> Option<u32> {
     use rustllama_gguf::{Gguf, MetadataValue};
     let gguf = Gguf::open(path).ok()?;
     let arch = gguf.architecture()?.to_string();
@@ -4566,7 +4567,7 @@ struct MetricsSnapshot {
     uptime_s: u64,
     /// Per-model concurrency. `1` for single-flight, `>1` when the
     /// operator set `[server].concurrency > 1` and the model is a
-    /// real CpuEngine (mocks stay single-flight regardless).
+    /// real ContiguousEngine (mocks stay single-flight regardless).
     concurrency: u32,
     /// KV-cache dtype as a config string: `"f32"`, `"q8_0"`, `"tq1"`,
     /// `"tq2"`, `"tq4"`, `"tq8"`, `"q4_0"`, or `"nvfp4"`. `null` for mock
@@ -4603,7 +4604,7 @@ struct MetricsSnapshot {
     /// Paged-KV pool total page count. `0` on engines using the
     /// contiguous KV layout (the default) — the GUI Status page
     /// hides its "Paged KV pool" panel in that case. Non-zero only
-    /// when `[inference].kv_cache_layout = "paged"` (CpuEngine
+    /// when `[inference].kv_cache_layout = "paged"` (ContiguousEngine
     /// paged backend) or when the engine is a `PagedBatchEngine`
     /// (the fused-decode CB path).
     #[serde(default)]
@@ -4613,7 +4614,7 @@ struct MetricsSnapshot {
     /// back on slot completion.
     #[serde(default)]
     paged_free_pages: u32,
-    /// Active slots in a fused-decode engine. `0` on `CpuEngine`
+    /// Active slots in a fused-decode engine. `0` on `ContiguousEngine`
     /// (single-flight per engine; concurrency via forks); on
     /// `PagedBatchEngine` this is the live in-flight-slot count read
     /// from the driver thread (surfaced on the GUI Status page).
@@ -4818,7 +4819,7 @@ async fn metrics(State(state): State<AppState>) -> Json<MetricsSnapshot> {
     let engine_metrics = serving.engine.metrics();
     let pending = serving.pending.load(Ordering::Acquire) as u32;
     // Per-request stats from the trait method — same shape on
-    // every backend: `CpuEngine` returns its inherent value;
+    // every backend: `ContiguousEngine` returns its inherent value;
     // `PagedBatchEngine` reads its driver-thread mutex; mock
     // engines return `None`. The contiguous-vs-paged distinction
     // is invisible at this layer.
@@ -5905,7 +5906,7 @@ async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesRespons
 
     // MoE capability: engine supports MoE inference. If the active
     // chat model is MoE, surface its expert counts so clients can
-    // render a "8 experts, top-2" badge. Probes the CpuEngine's
+    // render a "8 experts, top-2" badge. Probes the ContiguousEngine's
     // underlying LlamaModel config.
     let moe = {
         let probe = state.try_current().await.and_then(|serving| {
@@ -6410,7 +6411,7 @@ async fn tokenize_handler(
     let Some(cpu) = serving.cpu_engine.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "tokenize requires a real CpuEngine (not the MockEngine)",
+            "tokenize requires a real ContiguousEngine (not the MockEngine)",
         )
             .into_response();
     };
@@ -6470,7 +6471,7 @@ async fn detokenize_handler(
     let Some(cpu) = serving.cpu_engine.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "detokenize requires a real CpuEngine",
+            "detokenize requires a real ContiguousEngine",
         )
             .into_response();
     };

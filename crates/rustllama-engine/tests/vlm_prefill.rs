@@ -1,4 +1,4 @@
-//! Integration tests for `CpuEngine::vlm_prefill_ids` — the V-6b-3c
+//! Integration tests for `ContiguousEngine::vlm_prefill_ids` — the V-6b-3c
 //! assembly that chains prepare_vlm_inputs → embed_tokens → splice →
 //! forward_prefill_from_embeds into a single end-to-end prefill
 //! primitive.
@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use rustllama_engine::CpuEngine;
+use rustllama_engine::ContiguousEngine;
 use rustllama_gguf::synth::{
     write_synthetic_clip_mmproj_gguf, write_synthetic_llama_gguf, SynthLlama,
 };
@@ -66,14 +66,21 @@ fn make_test_png(seed: u8) -> Vec<u8> {
     out
 }
 
-/// Build a VLM-ready CpuEngine using the test install hook. Returns
+/// Build a VLM-ready ContiguousEngine using the test install hook. Returns
 /// the engine + the (somewhat arbitrary) image-placeholder token id
 /// used at construction. The id is picked to be inside the synth
 /// llama's 32-vocab range so embed_tokens lookups remain valid.
-fn build_vlm_engine(tag: &str) -> (CpuEngine, u32, std::path::PathBuf, std::path::PathBuf) {
+fn build_vlm_engine(
+    tag: &str,
+) -> (
+    ContiguousEngine,
+    u32,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
     let text_path = write_matched_text_gguf(tag);
     let mmproj_path = write_test_mmproj(tag);
-    let mut engine = CpuEngine::load_with_tokenizer(&text_path, 2048).expect("text load");
+    let mut engine = ContiguousEngine::load_with_tokenizer(&text_path, 2048).expect("text load");
     let mmproj_gguf = Gguf::open(&mmproj_path).expect("open mmproj");
     let vision = VisionModel::load(&mmproj_gguf).expect("load vision");
     // Token id 7 — in-range for the synth llama's 32-vocab.
@@ -243,7 +250,7 @@ fn vlm_prefill_paged_matches_contiguous_with_image() {
 fn vlm_prefill_rejects_placeholder_image_count_mismatch() {
     // Two placeholders in the prompt but only one image attached —
     // prepare_vlm_inputs should reject, and vlm_prefill_ids should
-    // surface it as a CpuEngineError::Other.
+    // surface it as a ContiguousEngineError::Other.
     let (engine, img_id, text_path, mmproj_path) = build_vlm_engine("mismatch");
     let cfg = engine.llama_config();
     let prompt: Vec<i32> = vec![img_id as i32, 1, img_id as i32, 2];
@@ -341,7 +348,7 @@ async fn engine_chat_rejects_image_bearing_message_without_vision() {
     use rustllama_engine::{ChatMessage, Engine, EngineError, SamplingParams};
 
     let text = write_matched_text_gguf("no-vision-chat");
-    let engine = CpuEngine::load_with_tokenizer(&text, 64).expect("text load");
+    let engine = ContiguousEngine::load_with_tokenizer(&text, 64).expect("text load");
     let msg = ChatMessage {
         role: "user".into(),
         content: "describe this".into(),
@@ -511,7 +518,7 @@ fn vlm_prefill_errors_when_no_vision_loaded() {
     // Text-only engine should refuse vlm_prefill_ids loudly rather
     // than running the splice path with `None` vision and panicking.
     let text = write_matched_text_gguf("no-vision");
-    let engine = CpuEngine::load_with_tokenizer(&text, 16).expect("text load");
+    let engine = ContiguousEngine::load_with_tokenizer(&text, 16).expect("text load");
     let cfg = engine.llama_config();
     let prompt: Vec<i32> = vec![1, 2, 3];
     let mut kv = KvCache::new(cfg, engine.max_ctx());

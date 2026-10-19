@@ -1,6 +1,6 @@
 //! Cross-request prompt-prefix KV cache.
 //!
-//! `CpuEngine` already reuses the live KV cache when the next prompt
+//! `ContiguousEngine` already reuses the live KV cache when the next prompt
 //! shares an LCP with the previous one — great for a single rolling
 //! conversation. This module extends that to multiple conversations:
 //! after generation finishes, the engine pushes a clipped snapshot of

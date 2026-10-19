@@ -1281,7 +1281,12 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(stats_line), chunks[1]);
 
     // --- transcript ---
-    let transcript_block = Block::default().borders(Borders::ALL).title(" transcript ");
+    // Only a TOP border (the ` transcript ` title line). The left/right columns
+    // and the bottom row are content, by design: the full box ring was dropped
+    // so the pane uses the whole width AND can never smear a scrolled glyph onto
+    // a side/bottom border (the XShell→SSH artifact). See the border-integrity
+    // regression test below.
+    let transcript_block = Block::default().borders(Borders::TOP).title(" transcript ");
     let inner = transcript_block.inner(chunks[2]);
     let content_w = inner.width.max(1) as usize;
     let view_h = inner.height.max(1);
@@ -1781,25 +1786,30 @@ mod tests {
         )
     }
 
-    /// The border ring of the transcript block must be box-drawing glyphs only
-    /// — no transcript text bled onto it. (The top row carries the " transcript "
-    /// title, so it's exempt; the left/right columns and the bottom row are the
-    /// edges a scrolled paragraph could smear into.)
+    /// The transcript block now draws only a TOP border (the ` transcript `
+    /// title line); the left/right columns and the bottom row are content, by
+    /// design (the box ring was dropped so the pane uses the full width and can
+    /// never smear a scrolled glyph onto a side/bottom border over XShell→SSH).
+    /// So the integrity check is now "the top line is intact": the title
+    /// renders and the line reaches the right edge (not overwritten by bled
+    /// content). The stronger no-smear guarantee is the fresh-render `assert_eq!`
+    /// in the caller.
     fn assert_border_intact(buf: &ratatui::buffer::Buffer, w: u16, h: u16) {
         let t = transcript_rect(w, h);
-        for y in t.top()..t.bottom() {
-            let l = buf[(t.left(), y)].symbol().to_string();
-            let r = buf[(t.right() - 1, y)].symbol().to_string();
-            assert!(is_box_glyph(&l), "left border overwritten at y={y}: {l:?}");
-            assert!(is_box_glyph(&r), "right border overwritten at y={y}: {r:?}");
-        }
+        let y = t.top();
+        let mut top_row = String::new();
         for x in t.left()..t.right() {
-            let b = buf[(x, t.bottom() - 1)].symbol().to_string();
-            assert!(
-                is_box_glyph(&b),
-                "bottom border overwritten at x={x}: {b:?}"
-            );
+            top_row.push_str(buf[(x, y)].symbol());
         }
+        assert!(
+            top_row.contains("transcript"),
+            "transcript title missing from top row: {top_row:?}"
+        );
+        let r = buf[(t.right() - 1, y)].symbol().to_string();
+        assert!(
+            is_box_glyph(&r),
+            "top border overwritten at right edge: {r:?}"
+        );
     }
 
     /// GOAL 1 — manual-scroll / border-integrity regression.

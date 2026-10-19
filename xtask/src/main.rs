@@ -153,7 +153,7 @@ fn doctor() -> Result<()> {
     println!("                 IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S,");
     println!("                 IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, NVFP4");
     println!("  KV dtypes:     F32, Q8_0, TurboQuant (1/2/4/8 bit), NVFP4");
-    println!("  serving paths: single-flight CpuEngine + paged-batch");
+    println!("  serving paths: single-flight ContiguousEngine + paged-batch");
     println!("                 continuous batching (PagedBatchEngine)");
     println!("  observability: prefix-cache hit-rate / cumulative stats /");
     println!("                 audit-log w/ credential masking /");

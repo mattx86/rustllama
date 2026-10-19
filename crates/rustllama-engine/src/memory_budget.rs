@@ -7,7 +7,7 @@
 //! an OS reserve — so the box never thrashes or OOMs because two
 //! budgets each "fit" on their own.
 //!
-//! The planner runs in `CpuEngine::load_inner` after the model and KV
+//! The planner runs in `ContiguousEngine::load_inner` after the model and KV
 //! backend exist (their true byte counts are known, not estimated)
 //! and before `lock_model_into_ram` / the expert-cache pre-pin (its
 //! output feeds both). It is only consulted when

@@ -167,7 +167,7 @@ async fn cancel_aborts_chat_stream() {
     );
 }
 
-// Note: `chat_stream_with_tools` requires a real `CpuEngine` (it calls the
+// Note: `chat_stream_with_tools` requires a real `ContiguousEngine` (it calls the
 // tokenizer's `render_chat_with_tools`), so it can't be reached through the
 // mock harness. Its cancel wiring is verified by code inspection +
 // `cancel_aborts_chat_stream` covering the shared `CancelGuard` path.

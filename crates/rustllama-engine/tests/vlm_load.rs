@@ -1,11 +1,11 @@
-//! Integration tests for `CpuEngine::load_with_mmproj` — the V-6b-2
+//! Integration tests for `ContiguousEngine::load_with_mmproj` — the V-6b-2
 //! load surface that pairs a text-decoder GGUF with a vision-tower
 //! (mmproj) GGUF. Focuses on the validation paths the load surface is
 //! responsible for: dimension pairing, missing mmproj file, malformed
 //! placeholder. Actual splice integration into the chat path is V-6b-3
 //! and lands with its own end-to-end test.
 
-use rustllama_engine::{CpuEngine, Engine};
+use rustllama_engine::{ContiguousEngine, Engine};
 use rustllama_gguf::synth::{
     write_synthetic_clip_mmproj_gguf, write_synthetic_llama_gguf, SynthLlama,
 };
@@ -50,7 +50,7 @@ fn write_test_mmproj(tag: &str) -> std::path::PathBuf {
 #[test]
 fn supports_vision_is_false_without_mmproj() {
     let text = write_default_text_gguf("plain");
-    let engine = CpuEngine::load_with_tokenizer(&text, 16).expect("plain load");
+    let engine = ContiguousEngine::load_with_tokenizer(&text, 16).expect("plain load");
     assert!(
         !engine.supports_vision(),
         "engine without mmproj must not claim vision support"
@@ -67,7 +67,7 @@ fn load_with_mmproj_rejects_d_text_d_model_mismatch() {
     // than letting inference run with silently-misshaped tensors.
     let text = write_default_text_gguf("mismatch");
     let mmproj = write_test_mmproj("mismatch");
-    let err = match CpuEngine::load_with_mmproj(&text, &mmproj, 16, "<image>") {
+    let err = match ContiguousEngine::load_with_mmproj(&text, &mmproj, 16, "<image>") {
         Ok(_) => panic!("d_model 64 vs d_text 96 must fail validation"),
         Err(e) => e,
     };
@@ -88,7 +88,7 @@ fn load_with_mmproj_errors_on_missing_mmproj_path() {
     let bogus = std::env::temp_dir().join("rustllama-does-not-exist-mmproj.gguf");
     // Make sure the path really is absent so the test isn't racy.
     let _ = std::fs::remove_file(&bogus);
-    let err = match CpuEngine::load_with_mmproj(&text, &bogus, 16, "<image>") {
+    let err = match ContiguousEngine::load_with_mmproj(&text, &bogus, 16, "<image>") {
         Ok(_) => panic!("missing mmproj file must error"),
         Err(e) => e,
     };
@@ -108,7 +108,7 @@ fn load_with_mmproj_rejects_multi_token_placeholder() {
     // surface for v1.
     let text = write_matched_text_gguf("multi-tok");
     let mmproj = write_test_mmproj("multi-tok");
-    let err = match CpuEngine::load_with_mmproj(&text, &mmproj, 16, "<image>") {
+    let err = match ContiguousEngine::load_with_mmproj(&text, &mmproj, 16, "<image>") {
         Ok(_) => panic!("multi-token placeholder must be rejected in v1"),
         Err(e) => e,
     };

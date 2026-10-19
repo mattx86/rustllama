@@ -1,6 +1,6 @@
 //! P11 Phase 3 — HTTP routing of per-request LoRA adapter selection.
 //!
-//! Anchors (via `/v1/completions` against a real `CpuEngine` + synth model):
+//! Anchors (via `/v1/completions` against a real `ContiguousEngine` + synth model):
 //!   - a request naming a resident adapter (explicit `lora` field OR the
 //!     `model: "<base>:<adapter>"` convention) is served WITH it — the output
 //!     distribution differs from the un-adapted base;
@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
-use rustllama_engine::CpuEngine;
+use rustllama_engine::ContiguousEngine;
 use rustllama_gguf::synth::{
     write_synthetic_llama_gguf, write_synthetic_lora_adapter_gguf, SynthLlama, SynthLoraAdapter,
 };
@@ -55,7 +55,7 @@ fn fixtures(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
 /// Build serving state. When `attach`, the adapter is attached to the engine
 /// under `tune-a` before the state is built (so a request can select it).
 fn build_state(base: &std::path::Path, adapter: Option<&std::path::Path>) -> AppState {
-    let cpu = CpuEngine::load_with_tokenizer(base, 64).expect("load engine");
+    let cpu = ContiguousEngine::load_with_tokenizer(base, 64).expect("load engine");
     if let Some(ad) = adapter {
         cpu.attach_lora_adapter("tune-a", ad)
             .expect("attach adapter");

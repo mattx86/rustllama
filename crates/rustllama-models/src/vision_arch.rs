@@ -1410,7 +1410,7 @@ pub enum PlaceholderMode {
 ///       -> input embeddings ready for the transformer body
 /// ```
 ///
-/// V-6b-1 builds this struct; V-6b-2 (CpuEngine integration) consumes
+/// V-6b-1 builds this struct; V-6b-2 (ContiguousEngine integration) consumes
 /// it. Tests at the V-6b-1 layer pin that the placeholder scan, image
 /// pipeline dispatch, and feature-buffer ordering are correct.
 #[derive(Debug)]

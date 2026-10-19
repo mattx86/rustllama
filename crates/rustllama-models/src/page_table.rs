@@ -7,7 +7,7 @@
 //! automatically prunes that page's stale block hash. This makes the
 //! "a reused page can never be reacquired under its old hash" invariant
 //! hold by construction for every caller (both the single-request
-//! `CpuEngine` and the continuous-batching pool), with no per-call-site
+//! `ContiguousEngine` and the continuous-batching pool), with no per-call-site
 //! pruning to forget.
 //!
 //! These were originally in `rustllama-engine::batch_scheduler` and

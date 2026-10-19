@@ -4,7 +4,7 @@
 //! event flow without needing a real model. Tool-call shape coverage
 //! (Anthropic `tools` → engine grammar → `tool_use` content blocks)
 //! is exercised indirectly by [`anthropic::messages`] + the chat module
-//! when a real CpuEngine is present; the cancel test in `cancel.rs`
+//! when a real ContiguousEngine is present; the cancel test in `cancel.rs`
 //! also goes through the same code path.
 
 use std::sync::Arc;
@@ -47,12 +47,12 @@ async fn post_json(uri: &str, body: serde_json::Value) -> (StatusCode, serde_jso
 }
 
 fn build_state_with_real_cpu_engine(tag: &str) -> (rustllama_server::AppState, std::path::PathBuf) {
-    use rustllama_engine::CpuEngine;
+    use rustllama_engine::ContiguousEngine;
     use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
 
     let tmp = std::env::temp_dir().join(format!("rustllama-anthropic-usage-{tag}.gguf"));
     write_synthetic_llama_gguf(&tmp, &SynthLlama::default());
-    let cpu = CpuEngine::load_with_tokenizer(&tmp, 16).expect("load cpu engine");
+    let cpu = ContiguousEngine::load_with_tokenizer(&tmp, 16).expect("load cpu engine");
     let model_id = cpu.model_id().to_string();
     let cpu = Arc::new(cpu);
     let serving = ServingModel {
@@ -252,7 +252,7 @@ async fn messages_non_streaming_omits_usage_extension_fields_under_mock_engine()
 
 #[tokio::test]
 async fn messages_non_streaming_surfaces_usage_extension_fields_with_real_engine() {
-    // With a real CpuEngine, the non-stream response must populate
+    // With a real ContiguousEngine, the non-stream response must populate
     // the rustllama extension fields (`prefill_ms`, `decode_ms`,
     // `cache_hit_tokens`, `tokens_prefilled`) on `usage` so editor
     // UIs that show TTFT have the data they need.
@@ -510,7 +510,7 @@ async fn cache_control_with_unknown_type_still_accepted() {
 
 #[tokio::test]
 async fn anthropic_usage_includes_cache_read_input_tokens_on_real_engine() {
-    // Real CpuEngine: the engine's RequestStats.cache_hit_tokens
+    // Real ContiguousEngine: the engine's RequestStats.cache_hit_tokens
     // flows into AnthropicUsage as cache_read_input_tokens under
     // the Anthropic-native field name. Even on a single request
     // (no prior cache state) the field MUST be present and

@@ -425,7 +425,7 @@ impl Scheduler for SingleFlightScheduler {
 /// one kernel call — needs the paged-attention SYCL/CPU kernels that
 /// land alongside `rustllama-kernels-sycl::rsl_paged_attention`. Until
 /// those ship, each slot runs on an independent
-/// [`crate::inference::CpuEngine::fork_for_concurrent_use`] handle and the
+/// [`crate::inference::ContiguousEngine::fork_for_concurrent_use`] handle and the
 /// per-slot generation loops run in parallel on CPU cores — real
 /// throughput gains without the fused kernel.
 pub struct MultiFlightScheduler {

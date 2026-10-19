@@ -215,6 +215,18 @@ commands in the chat REPL/TUI mirror this verb set):
   max_loaded_models, `concurrency`, `max_pending_per_model`), `[ui]`,
   `[tuning]` (auto_apply_* flags, opportunistic_refine),
   `[embeddings]`, `[reranker]`.
+- **Auto context size:** `[inference].ctx_size` defaults to `0` = **AUTO**
+  (`CTX_SIZE_AUTO`): at load the engine opens the model's own trained window
+  (GGUF `<arch>.context_length`), capped at `rustllama_engine::CTX_AUTO_CAP`
+  (32768) so a 128K/1M-ctx model doesn't reserve a giant KV cache by surprise;
+  a sub-cap model gets exactly its trained window. Any explicit non-zero value
+  is honored as-is (even above the trained length — relies on RoPE scaling).
+  Resolution is centralized: both engines backstop a `0` in their load path
+  (`auto_ctx_from_train`, reported via `n_ctx()` / `/v1/metrics.ctx_size`), and
+  the serve-startup / placement-sweep / `model bench` paths resolve it up front
+  (`resolve_config_ctx` → `peek_gguf_ctx_train`) so the KV-cost pricing + logs
+  use the real window. There is no `serve --ctx-size` flag — set the config key
+  (or a `--profile`).
 - **VLM / vision:** set `[model].mmproj` to a paired vision-tower (mmproj) GGUF
   to enable image inputs on `/v1/chat/completions` (OpenAI `image_url` content
   blocks) and `chat --image`; the loader verifies projector/decoder dims and
@@ -242,7 +254,7 @@ commands in the chat REPL/TUI mirror this verb set):
   (non-streaming, no tools — refused with those); the CPU kernels carry a
   shared-prefix **cascade attention** path for batched sequences. Canonical
   **Mamba / SSM** models (`mamba` / `mamba2` / `jamba` / `falcon-mamba`) load and
-  serve through the `CpuEngine` selective-scan forward (F9).
+  serve through the `ContiguousEngine` selective-scan forward (F9).
 - The GUI embeds the server in-process; it sets `RUSTLLAMA_GUI_EMBEDDED=1` so
   the embedded start skips the blocking first-load autotune (that autotune runs
   as a separate subprocess with a progress modal instead).

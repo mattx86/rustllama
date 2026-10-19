@@ -1,10 +1,10 @@
 //! CPU-only generation engine: pure-Rust Llama-family inference.
 //!
 //! Two API levels:
-//!   - low-level: [`CpuEngine::generate_token_ids`] takes/returns token IDs
+//!   - low-level: [`ContiguousEngine::generate_token_ids`] takes/returns token IDs
 //!     (used by tests and direct callers that already have a tokenizer).
 //!   - high-level: [`Engine::generate`] / [`Engine::chat`] take/return text;
-//!     requires a tokenizer (loaded via [`CpuEngine::load_with_tokenizer`]).
+//!     requires a tokenizer (loaded via [`ContiguousEngine::load_with_tokenizer`]).
 
 use std::path::Path;
 use std::pin::Pin;
@@ -29,7 +29,7 @@ use crate::{
 };
 
 #[derive(Debug, thiserror::Error)]
-pub enum CpuEngineError {
+pub enum ContiguousEngineError {
     #[error("gguf: {0}")]
     Gguf(#[from] rustllama_gguf::GgufError),
     #[error("model load: {0}")]
@@ -44,12 +44,12 @@ pub enum CpuEngineError {
     Other(String),
 }
 
-pub type Result<T> = std::result::Result<T, CpuEngineError>;
+pub type Result<T> = std::result::Result<T, ContiguousEngineError>;
 
 /// Owns a loaded model, an open mmap of the source GGUF, and a per-engine
 /// KV cache. Internal state is `Arc`-wrapped so streaming methods can move
 /// shared state into a `spawn_blocking` task.
-pub struct CpuEngine {
+pub struct ContiguousEngine {
     model: Arc<LlamaModel>,
     /// F9-tail — a CANONICAL Mamba/SSM selective-scan model (arch
     /// `mamba`/`mamba2`/`jamba`/`falcon-mamba`: the `in_proj`/`x_proj`/
@@ -233,7 +233,7 @@ pub struct CpuEngine {
     /// upgrade is a one-line swap on the accel side.
     cpu_force_patterns: Vec<String>,
     /// Optional vision tower (mmproj GGUF) loaded alongside the text
-    /// decoder via [`CpuEngine::load_with_mmproj`]. `None` for the
+    /// decoder via [`ContiguousEngine::load_with_mmproj`]. `None` for the
     /// usual text-only configuration; `Some(_)` enables
     /// [`Engine::supports_vision`] and unlocks the V-6b-3 splice
     /// path for image-bearing chat messages.
@@ -249,7 +249,7 @@ pub struct CpuEngine {
     /// or when the text tokenizer doesn't know the model's image
     /// placeholder — the latter is a load-time error rather than a
     /// silent fallback (V-6b-2 fails fast with
-    /// [`CpuEngineError::Other`]).
+    /// [`ContiguousEngineError::Other`]).
     image_token_id: Option<u32>,
     /// How the prompt's image-placeholder tokens map to vision-pipeline
     /// patch outputs. `OnePerImage` (LLaVA-1.5 style) is the default
@@ -321,7 +321,7 @@ pub struct CpuEngine {
     lora: Arc<std::sync::RwLock<rustllama_models::lora::LoraRegistry>>,
 }
 
-impl Drop for CpuEngine {
+impl Drop for ContiguousEngine {
     fn drop(&mut self) {
         // Final learning-cache flush: fold this session's routing
         // stats into the model's usage sidecar so the next load
@@ -437,7 +437,7 @@ fn install_sycl_dispatch_if_requested() -> Option<rustllama_models::accel::SyclS
 // Dedicated SYCL worker thread
 // ============================================================
 //
-// Every CpuEngine instance owns one dedicated OS thread that processes
+// Every ContiguousEngine instance owns one dedicated OS thread that processes
 // all streaming generation + USM warmup work. The thread installs a
 // SyclStreamGuard once at startup and keeps it alive for its entire
 // lifetime, so the per-thread USM weight cache + the SYCL queue
@@ -544,7 +544,7 @@ struct WarmupJob {
 }
 
 /// Handle to the dedicated worker thread. Created in
-/// `CpuEngine::load_inner`, shut down in `CpuEngine::Drop`.
+/// `ContiguousEngine::load_inner`, shut down in `ContiguousEngine::Drop`.
 ///
 /// `tx` is `std::sync::mpsc::Sender` (synchronous) because:
 ///   - submitters are sometimes inside `tokio::task::spawn_blocking`
@@ -1156,7 +1156,7 @@ impl ChromeTracer {
     }
 }
 
-impl CpuEngine {
+impl ContiguousEngine {
     /// Load a model from a GGUF, without a tokenizer. Only the token-ID API
     /// is available; calls to [`Engine::generate`] / [`Engine::chat`] error.
     pub fn load(path: &Path, max_ctx: usize) -> Result<Self> {
@@ -1348,7 +1348,7 @@ impl CpuEngine {
                 );
             } else {
                 let mm = rustllama_models::mamba_arch::MambaModel::load(&gguf).map_err(|e| {
-                    CpuEngineError::Other(format!("canonical Mamba / SSM load failed: {e}"))
+                    ContiguousEngineError::Other(format!("canonical Mamba / SSM load failed: {e}"))
                 })?;
                 tracing::info!(
                     arch = %arch,
@@ -1357,7 +1357,7 @@ impl CpuEngine {
                     d_inner = mm.cfg.d_inner,
                     vocab = mm.cfg.vocab_size,
                     "canonical Mamba / SSM selective-scan model loaded — wired into \
-                     CpuEngine's generation loop (F9-tail)"
+                     ContiguousEngine's generation loop (F9-tail)"
                 );
                 mamba_model = Some(Arc::new(mm));
             }
@@ -1384,7 +1384,7 @@ impl CpuEngine {
             let lgguf = Gguf::open(lora_path)?;
             let adapter = rustllama_models::lora::LoraAdapter::from_gguf(&lgguf, "default")
                 .map_err(|e| {
-                    CpuEngineError::Other(format!(
+                    ContiguousEngineError::Other(format!(
                         "LoRA adapter load failed ({}): {e}",
                         lora_path.display()
                     ))
@@ -1414,7 +1414,17 @@ impl CpuEngine {
                  validated against a reference implementation."
             );
         }
-        let ctx = max_ctx.min(model.cfg.ctx_train.max(max_ctx));
+        // Context window. `max_ctx == 0` is the `[inference].ctx_size` AUTO
+        // sentinel (see [`crate::auto_ctx_from_train`]): open the model's own
+        // trained window, capped. Any explicit value is honored as-is (the
+        // historic `min(max_ctx, ctx_train.max(max_ctx))` was a no-op clamp
+        // that always returned `max_ctx`, so this is byte-identical for an
+        // explicit ctx_size > 0).
+        let ctx = if max_ctx == 0 {
+            crate::auto_ctx_from_train(model.cfg.ctx_train as u32) as usize
+        } else {
+            max_ctx
+        };
         // Hybrid KV dtype. The hybrid full-attention forward now
         // implements EVERY KV dtype: F32 and Q4_0 have dedicated fast
         // arms (Q4_0 with whitening + kv-bias calibration), and Q8_0 /
@@ -1576,7 +1586,7 @@ impl CpuEngine {
             kv_page_size,
             kv_keep.as_deref(),
         )
-        .map_err(|e| CpuEngineError::Other(format!("kv_backend init: {e}")))?;
+        .map_err(|e| ContiguousEngineError::Other(format!("kv_backend init: {e}")))?;
 
         let tokenizer = if with_tokenizer {
             Some(Arc::new(Tokenizer::from_gguf(&gguf)?))
@@ -1636,7 +1646,7 @@ impl CpuEngine {
         // everything-copied configuration.
         //
         // Safety note for future maintainers: no public API on
-        // `CpuEngine` consults the GGUF after load. `LlamaModel` and
+        // `ContiguousEngine` consults the GGUF after load. `LlamaModel` and
         // `Tokenizer` both take `&Gguf` and produce fully owned
         // outputs (except zero-copy borrows, which keep the backing
         // alive via `Arc`).
@@ -2388,7 +2398,7 @@ impl CpuEngine {
         let engine = self;
         let mmproj_gguf = Gguf::open(mmproj_path)?;
         let vision = rustllama_models::vision_arch::VisionModel::load(&mmproj_gguf)
-            .map_err(|e| CpuEngineError::Other(format!("mmproj load: {e}")))?;
+            .map_err(|e| ContiguousEngineError::Other(format!("mmproj load: {e}")))?;
 
         // Pairing validation: projector.d_text must equal text decoder
         // d_model. A common foot-gun is to grab any LLaVA mmproj off
@@ -2398,7 +2408,7 @@ impl CpuEngine {
         let d_text_proj = vision.projector.d_text();
         let d_text_model = engine.model.cfg.d_model;
         if d_text_proj != d_text_model {
-            return Err(CpuEngineError::Other(format!(
+            return Err(ContiguousEngineError::Other(format!(
                 "mmproj projector output dim {d_text_proj} does not match text \
                  decoder d_model {d_text_model} — this mmproj GGUF was trained \
                  against a different text decoder; pair files from the same model"
@@ -2412,15 +2422,17 @@ impl CpuEngine {
         // differ only in how many runs of that id they expect in the
         // prompt.
         let tokenizer = engine.tokenizer.as_ref().ok_or_else(|| {
-            CpuEngineError::NoTokenizer("load_with_mmproj requires a tokenizer in the text GGUF")
+            ContiguousEngineError::NoTokenizer(
+                "load_with_mmproj requires a tokenizer in the text GGUF",
+            )
         })?;
         let ids = tokenizer.encode(image_placeholder, false).map_err(|e| {
-            CpuEngineError::Other(format!(
+            ContiguousEngineError::Other(format!(
                 "tokenize image placeholder '{image_placeholder}': {e}"
             ))
         })?;
         if ids.len() != 1 {
-            return Err(CpuEngineError::Other(format!(
+            return Err(ContiguousEngineError::Other(format!(
                 "image placeholder '{image_placeholder}' tokenizes to {} tokens; \
                  a single-token placeholder is required (Qwen2-VL uses \
                  `<|image_pad|>` repeated N times — that's a single token \
@@ -2498,7 +2510,7 @@ impl CpuEngine {
             if st.is_file() {
                 return Self::load_safetensors(&st, max_ctx);
             }
-            return Err(CpuEngineError::Other(format!(
+            return Err(ContiguousEngineError::Other(format!(
                 "model directory `{}` is neither an MLX affine checkpoint \
                  (a `quantization` block in config.json + `.scales`/`.biases` \
                  tensors) nor an AWQ/GPTQ export (no `model.safetensors`)",
@@ -2522,7 +2534,7 @@ impl CpuEngine {
                 }
                 Self::load_safetensors(path, max_ctx)
             }
-            _ => Err(CpuEngineError::Other(format!(
+            _ => Err(ContiguousEngineError::Other(format!(
                 "unrecognized model file extension for `{}`: rustllama v1 \
                  supports `.gguf` (GGUF), `.safetensors` (HuggingFace \
                  AWQ / GPTQ / fp16 checkpoints), and an MLX model directory \
@@ -2563,7 +2575,7 @@ impl CpuEngine {
     /// single-file release.
     pub fn load_safetensors(path: &Path, max_ctx: usize) -> Result<Self> {
         let parent = path.parent().ok_or_else(|| {
-            CpuEngineError::Other(format!(
+            ContiguousEngineError::Other(format!(
                 "safetensors path `{}` has no parent directory",
                 path.display()
             ))
@@ -2571,7 +2583,7 @@ impl CpuEngine {
         let config_path = parent.join("config.json");
         let tokenizer_path = parent.join("tokenizer.json");
         if !config_path.exists() {
-            return Err(CpuEngineError::Other(format!(
+            return Err(ContiguousEngineError::Other(format!(
                 "missing `config.json` next to `{}` — HuggingFace safetensors \
                  layouts require it for architecture metadata",
                 path.display()
@@ -2581,20 +2593,20 @@ impl CpuEngine {
         // Read + parse config.json. `parse_hf_config` does the
         // architecture-name normalization + field mapping.
         let config_json = std::fs::read_to_string(&config_path)
-            .map_err(|e| CpuEngineError::Other(format!("read config.json: {e}")))?;
+            .map_err(|e| ContiguousEngineError::Other(format!("read config.json: {e}")))?;
         let cfg = rustllama_safetensors::parse_hf_config(&config_json)
-            .map_err(|e| CpuEngineError::Other(format!("config.json: {e}")))?;
+            .map_err(|e| ContiguousEngineError::Other(format!("config.json: {e}")))?;
 
         // Read + parse the safetensors blob. v1 reads the full file
         // into memory (the converter walks every tensor anyway); a
         // future mmap-based pass can shave peak RSS for very large
         // models.
         let blob = std::fs::read(path)
-            .map_err(|e| CpuEngineError::Other(format!("read safetensors: {e}")))?;
+            .map_err(|e| ContiguousEngineError::Other(format!("read safetensors: {e}")))?;
         let converted = rustllama_safetensors::convert_safetensors_to_gguf_tensors(&blob)
-            .map_err(|e| CpuEngineError::Other(format!("safetensors convert: {e}")))?;
+            .map_err(|e| ContiguousEngineError::Other(format!("safetensors convert: {e}")))?;
         let model = rustllama_safetensors::build_llama_model_from_safetensors(&cfg, converted)
-            .map_err(|e| CpuEngineError::Other(format!("safetensors build: {e}")))?;
+            .map_err(|e| ContiguousEngineError::Other(format!("safetensors build: {e}")))?;
 
         // Tokenizer: optional. Most HF releases ship `tokenizer.json`;
         // a small subset use the older `tokenizer.model` (SentencePiece)
@@ -2602,7 +2614,7 @@ impl CpuEngine {
         // engine can still serve a non-chat workload (e.g. unit-tests).
         let tokenizer = if tokenizer_path.exists() {
             Some(Arc::new(Tokenizer::from_file(&tokenizer_path).map_err(
-                |e| CpuEngineError::Other(format!("tokenizer.json: {e}")),
+                |e| ContiguousEngineError::Other(format!("tokenizer.json: {e}")),
             )?))
         } else {
             tracing::warn!(
@@ -2619,7 +2631,7 @@ impl CpuEngine {
         let ctx = max_ctx.min(cfg.ctx_train.max(max_ctx));
         let kv_backend =
             KvBackend::from_inference_config("contiguous", &cfg, ctx as u32, KvDtype::F32)
-                .map_err(|e| CpuEngineError::Other(format!("kv_backend init: {e}")))?;
+                .map_err(|e| ContiguousEngineError::Other(format!("kv_backend init: {e}")))?;
 
         let model_id = path
             .file_stem()
@@ -2740,7 +2752,7 @@ impl CpuEngine {
         let config_path = dir.join("config.json");
         let tokenizer_path = dir.join("tokenizer.json");
         if !config_path.exists() {
-            return Err(CpuEngineError::Other(format!(
+            return Err(ContiguousEngineError::Other(format!(
                 "missing `config.json` in MLX model directory `{}` — mlx-lm \
                  layouts require it for architecture + quantization metadata",
                 dir.display()
@@ -2751,28 +2763,28 @@ impl CpuEngine {
         // `parse_hf_config`, shared with the AWQ path) and the MLX
         // `quantization` block (parsed inside `load_mlx_dir`).
         let config_json = std::fs::read_to_string(&config_path)
-            .map_err(|e| CpuEngineError::Other(format!("read config.json: {e}")))?;
+            .map_err(|e| ContiguousEngineError::Other(format!("read config.json: {e}")))?;
         let cfg = rustllama_safetensors::parse_hf_config(&config_json)
-            .map_err(|e| CpuEngineError::Other(format!("config.json: {e}")))?;
+            .map_err(|e| ContiguousEngineError::Other(format!("config.json: {e}")))?;
 
         // Read every shard, split into quantized affine weights + full
         // tensors, then dequant + remap to the GGUF-named ConvertedTensor
         // list the llama builder consumes.
         let mlx = rustllama_safetensors::load_mlx_dir(dir)
-            .map_err(|e| CpuEngineError::Other(format!("mlx safetensors load: {e}")))?;
+            .map_err(|e| ContiguousEngineError::Other(format!("mlx safetensors load: {e}")))?;
         let n_quant = mlx.quant.len();
         let n_micro = mlx.micro.len();
         let n_full = mlx.full.len();
         let converted = Self::mlx_model_to_converted(&mlx)?;
         let model = rustllama_safetensors::build_llama_model_from_safetensors(&cfg, converted)
-            .map_err(|e| CpuEngineError::Other(format!("mlx model build: {e}")))?;
+            .map_err(|e| ContiguousEngineError::Other(format!("mlx model build: {e}")))?;
 
         // Tokenizer: optional, same posture as `load_safetensors` — most
         // mlx-community releases ship `tokenizer.json`; warn (don't fail)
         // when it's absent so the model still loads for the token-ID API.
         let tokenizer = if tokenizer_path.exists() {
             Some(Arc::new(Tokenizer::from_file(&tokenizer_path).map_err(
-                |e| CpuEngineError::Other(format!("tokenizer.json: {e}")),
+                |e| ContiguousEngineError::Other(format!("tokenizer.json: {e}")),
             )?))
         } else {
             tracing::warn!(
@@ -2786,7 +2798,7 @@ impl CpuEngine {
         let ctx = max_ctx.min(cfg.ctx_train.max(max_ctx));
         let kv_backend =
             KvBackend::from_inference_config("contiguous", &cfg, ctx as u32, KvDtype::F32)
-                .map_err(|e| CpuEngineError::Other(format!("kv_backend init: {e}")))?;
+                .map_err(|e| ContiguousEngineError::Other(format!("kv_backend init: {e}")))?;
 
         let model_id = dir
             .file_name()
@@ -3014,7 +3026,7 @@ impl CpuEngine {
                 continue;
             };
             q.validate()
-                .map_err(|e| CpuEngineError::Other(format!("mlx weight `{module}`: {e}")))?;
+                .map_err(|e| ContiguousEngineError::Other(format!("mlx weight `{module}`: {e}")))?;
             let (dtype, bytes) = Self::mlx_quant_to_converted_bytes(q, force_native);
             match dtype {
                 ConvertedDtype::Q4_1Raw => n_q4_1 += 1,
@@ -3057,7 +3069,7 @@ impl CpuEngine {
         if !mlx.micro.is_empty() {
             #[cfg(not(feature = "encoder"))]
             {
-                return Err(CpuEngineError::Other(format!(
+                return Err(ContiguousEngineError::Other(format!(
                     "MLX non-affine (mxfp4/mxfp8/nvfp4) weights need the \
                      `encoder` feature to transcode to a GGUF block-quant; \
                      this slim build cannot load {} such weight(s)",
@@ -3079,7 +3091,7 @@ impl CpuEngine {
                         continue;
                     };
                     m.validate().map_err(|e| {
-                        CpuEngineError::Other(format!("mlx micro weight `{module}`: {e}"))
+                        ContiguousEngineError::Other(format!("mlx micro weight `{module}`: {e}"))
                     })?;
                     let (dtype, bytes) = Self::mlx_micro_to_converted_bytes(m)?;
                     match dtype {
@@ -3334,7 +3346,7 @@ impl CpuEngine {
             MlxQuantMode::Mxfp8 => rustllama_gguf::dequant::dequant_mxfp8(&blocks, &mut f32buf),
             MlxQuantMode::Nvfp4 => rustllama_gguf::dequant::dequant_nvfp4(&blocks, &mut f32buf),
             ref other => {
-                return Err(CpuEngineError::Other(format!(
+                return Err(ContiguousEngineError::Other(format!(
                     "mlx micro weight `{}`: non-micro mode {other:?} reached the \
                      micro transcoder",
                     m.name
@@ -3342,7 +3354,7 @@ impl CpuEngine {
             }
         }
         Self::transcode_f32_to_gguf(&f32buf, m.bits, m.in_features()).ok_or_else(|| {
-            CpuEngineError::Other(format!(
+            ContiguousEngineError::Other(format!(
                 "mlx micro weight `{}`: geometry (in_features {}, {} bits) has no \
                  faithful GGUF block-quant target",
                 m.name,
@@ -3479,7 +3491,7 @@ impl CpuEngine {
         let mut out: Vec<ConvertedTensor> = Vec::new();
         for (role, dtype, bytes, shape, module) in staged {
             if matches!(dtype, ConvertedDtype::MlxAffineRaw) {
-                return Err(CpuEngineError::Other(format!(
+                return Err(ContiguousEngineError::Other(format!(
                     "mlx MoE weight `{module}` did not transcode to a GGUF \
                      block-quant (kept native affine — odd bit-width or \
                      RUSTLLAMA_MLX_NATIVE set); MoE needs stackable uniform \
@@ -3541,7 +3553,7 @@ impl CpuEngine {
             let mut all_bytes: Vec<u8> = Vec::new();
             for (idx, (dt, b, sh)) in per_expert {
                 if idx != expect {
-                    return Err(CpuEngineError::Other(format!(
+                    return Err(ContiguousEngineError::Other(format!(
                         "mlx MoE layer {layer} proj {pc}: experts not a dense \
                          0..n index set (saw {idx}, expected {expect})"
                     )));
@@ -3551,7 +3563,7 @@ impl CpuEngine {
                     None => dtype = Some(dt),
                     Some(d) if d == dt => {}
                     Some(_) => {
-                        return Err(CpuEngineError::Other(format!(
+                        return Err(ContiguousEngineError::Other(format!(
                             "mlx MoE layer {layer} proj {pc}: experts transcoded \
                              to mixed dtypes — cannot stack"
                         )))
@@ -3587,7 +3599,7 @@ impl CpuEngine {
     fn mlx_moe_to_converted(
         _mlx: &rustllama_safetensors::MlxModel,
     ) -> Result<Vec<rustllama_safetensors::ConvertedTensor>> {
-        Err(CpuEngineError::Other(
+        Err(ContiguousEngineError::Other(
             "MLX MoE load requires the `encoder` feature to transcode + stack \
              experts into a GGUF block-quant; this slim build cannot load a \
              MoE MLX model"
@@ -3664,7 +3676,7 @@ impl CpuEngine {
     ///
     /// # Errors
     ///
-    /// - [`CpuEngineError::Other`] if no mmproj is loaded
+    /// - [`ContiguousEngineError::Other`] if no mmproj is loaded
     ///   (`load_with_mmproj` hasn't been called).
     /// - Pipeline / splice / shape errors are propagated through the
     ///   same channel with a descriptive message.
@@ -3687,7 +3699,7 @@ impl CpuEngine {
         };
 
         let vision = self.vision.as_ref().ok_or_else(|| {
-            CpuEngineError::Other(
+            ContiguousEngineError::Other(
                 "vlm_prefill_ids requires a vision tower loaded via \
                  load_with_mmproj"
                     .into(),
@@ -3698,7 +3710,7 @@ impl CpuEngine {
             // so this branch should be unreachable — keep it for
             // defense-in-depth so a future load surface that forgets to
             // wire image_token_id surfaces here cleanly.
-            CpuEngineError::Other("image_token_id missing despite vision loaded".into())
+            ContiguousEngineError::Other("image_token_id missing despite vision loaded".into())
         })?;
         let placeholder_mode = self
             .placeholder_mode
@@ -3716,7 +3728,7 @@ impl CpuEngine {
             image_payloads,
             placeholder_mode,
         )
-        .map_err(|e| CpuEngineError::Other(format!("vlm prefill: {e}")))?;
+        .map_err(|e| ContiguousEngineError::Other(format!("vlm prefill: {e}")))?;
 
         // Embed the text tokens (placeholder positions included — the
         // splice helper drops those rows at the splice index).
@@ -3727,7 +3739,7 @@ impl CpuEngine {
         let feat_slices = vlm_inputs.feature_slices();
         let spliced =
             splice_image_embeddings(&text_embeds, &vlm_inputs.positions, &feat_slices, d_model)
-                .map_err(|e| CpuEngineError::Other(format!("vlm splice: {e}")))?;
+                .map_err(|e| ContiguousEngineError::Other(format!("vlm splice: {e}")))?;
         // Final transformer prefill over the spliced embedding sequence.
         // M5-engine-wire: for a Qwen2-VL / Qwen2.5-VL model (rope.dimension_
         // sections set, 1:1 OnePerPatch splice) drive the sectioned 3-D mRoPE
@@ -4012,7 +4024,7 @@ impl CpuEngine {
     /// than silently degrading decode.
     pub fn attach_eagle_head(&mut self, path: &std::path::Path) -> Result<()> {
         let head = rustllama_models::llama_arch::EagleHead::from_path(path, &self.model.cfg)
-            .map_err(|e| CpuEngineError::Other(format!("eagle head load failed: {e}")))?;
+            .map_err(|e| ContiguousEngineError::Other(format!("eagle head load failed: {e}")))?;
         self.eagle_head = Some(Arc::new(head));
         Ok(())
     }
@@ -4082,18 +4094,18 @@ impl CpuEngine {
     /// (the target) and a prospective draft engine. Speculative
     /// accept/reject compares token IDS, so the two models must share
     /// a vocabulary exactly: same vocab size, same BOS/EOS ids.
-    pub fn draft_compatible_with(&self, draft: &CpuEngine) -> Result<()> {
+    pub fn draft_compatible_with(&self, draft: &ContiguousEngine) -> Result<()> {
         let t = &self.model.cfg;
         let d = &draft.model.cfg;
         if t.vocab_size != d.vocab_size {
-            return Err(CpuEngineError::Other(format!(
+            return Err(ContiguousEngineError::Other(format!(
                 "draft model vocab_size {} != target vocab_size {} — speculative \
                  decoding requires an identical tokenizer",
                 d.vocab_size, t.vocab_size
             )));
         }
         if t.bos_token_id != d.bos_token_id || t.eos_token_id != d.eos_token_id {
-            return Err(CpuEngineError::Other(format!(
+            return Err(ContiguousEngineError::Other(format!(
                 "draft model special tokens differ (bos {:?}/{:?}, eos {:?}/{:?}) — \
                  speculative decoding requires an identical tokenizer",
                 d.bos_token_id, t.bos_token_id, d.eos_token_id, t.eos_token_id
@@ -4206,13 +4218,13 @@ impl CpuEngine {
         let path = match explicit {
             Some(p) => {
                 if !p.exists() {
-                    return Err(CpuEngineError::Other(format!(
+                    return Err(ContiguousEngineError::Other(format!(
                         "kv_bias_path {} does not exist",
                         p.display()
                     )));
                 }
                 if !matches!(dtype, KvDtype::Q4_0) {
-                    return Err(CpuEngineError::Other(format!(
+                    return Err(ContiguousEngineError::Other(format!(
                         "kv_bias_path is set but the KV cache dtype is {dtype:?}; \
                          the K mean-centering bias applies to q4_0 KV only — set \
                          [inference].kv_dtype/k_dtype/v_dtype = \"q4_0\" or unset kv_bias_path"
@@ -4239,12 +4251,12 @@ impl CpuEngine {
             cfg.head_dim,
             cfg.n_kv_heads,
         )
-        .map_err(CpuEngineError::Other)?;
+        .map_err(ContiguousEngineError::Other)?;
 
         let whitening = rustllama_models::llama_arch::kv_whitening_active_for(dtype, cfg.head_dim);
         match bias.k_rot {
             Some(recorded) if recorded != whitening => {
-                return Err(CpuEngineError::Other(format!(
+                return Err(ContiguousEngineError::Other(format!(
                     "kv-bias sidecar {} was calibrated with whitening {}, but whitening \
                      is {} for this run — recalibrate with matching settings (or set \
                      RUSTLLAMA_KV_WHITEN consistently in both)",
@@ -4271,7 +4283,7 @@ impl CpuEngine {
                 kv.kv_bias = Some(std::sync::Arc::new(bias));
             }
             _ => {
-                return Err(CpuEngineError::Other(
+                return Err(ContiguousEngineError::Other(
                     "kv-bias requires the contiguous KV backend".to_string(),
                 ));
             }
@@ -4456,12 +4468,12 @@ impl CpuEngine {
     pub fn attach_lora_adapter(&self, name: &str, path: &std::path::Path) -> Result<usize> {
         let g = Gguf::open(path)?;
         let adapter = rustllama_models::lora::LoraAdapter::from_gguf(&g, name)
-            .map_err(|e| CpuEngineError::Other(format!("LoRA adapter load failed: {e}")))?;
+            .map_err(|e| ContiguousEngineError::Other(format!("LoRA adapter load failed: {e}")))?;
         let n = adapter.len();
         let mut reg = self
             .lora
             .write()
-            .map_err(|_| CpuEngineError::Other("LoRA registry lock poisoned".into()))?;
+            .map_err(|_| ContiguousEngineError::Other("LoRA registry lock poisoned".into()))?;
         reg.insert(adapter);
         tracing::info!(
             adapter = name,
@@ -4502,9 +4514,9 @@ impl CpuEngine {
         let reg = self
             .lora
             .read()
-            .map_err(|_| CpuEngineError::Other("LoRA registry lock poisoned".into()))?;
+            .map_err(|_| ContiguousEngineError::Other("LoRA registry lock poisoned".into()))?;
         reg.get(name).map(Some).ok_or_else(|| {
-            CpuEngineError::Other(format!("unknown LoRA adapter `{name}` (not resident)"))
+            ContiguousEngineError::Other(format!("unknown LoRA adapter `{name}` (not resident)"))
         })
     }
 
@@ -4549,7 +4561,7 @@ impl CpuEngine {
     ///
     /// Convenient wiring:
     /// ```ignore
-    /// let mut engine = CpuEngine::load_with_options(path, ctx, true, kv)?;
+    /// let mut engine = ContiguousEngine::load_with_options(path, ctx, true, kv)?;
     /// engine.set_cpu_force_patterns(cfg.placement.cpu_overrides());
     /// let d = engine.auto_place_layers(&Default::default());
     /// tracing::info!(
@@ -4899,7 +4911,7 @@ impl CpuEngine {
         let tokenizer = self
             .tokenizer
             .as_deref()
-            .ok_or(CpuEngineError::NoTokenizer("count_chat_prompt"))?;
+            .ok_or(ContiguousEngineError::NoTokenizer("count_chat_prompt"))?;
         let tok_msgs: Vec<TokChat<'_>> = msgs
             .iter()
             .map(|m| TokChat {
@@ -4921,7 +4933,7 @@ impl CpuEngine {
         let tokenizer = self
             .tokenizer
             .as_deref()
-            .ok_or(CpuEngineError::NoTokenizer("chat_prompt_ids"))?;
+            .ok_or(ContiguousEngineError::NoTokenizer("chat_prompt_ids"))?;
         let tok_msgs: Vec<TokChat<'_>> = msgs
             .iter()
             .map(|m| TokChat {
@@ -4941,7 +4953,7 @@ impl CpuEngine {
         let tokenizer = self
             .tokenizer
             .as_deref()
-            .ok_or(CpuEngineError::NoTokenizer("count_text_prompt"))?;
+            .ok_or(ContiguousEngineError::NoTokenizer("count_text_prompt"))?;
         let ids = tokenizer.encode(prompt, tokenizer.add_bos_token())?;
         Ok(ids.len() as u32)
     }
@@ -5004,7 +5016,7 @@ impl CpuEngine {
         }
         let total_required = prompt_ids.len() + n_new as usize;
         if total_required > self.max_ctx {
-            return Err(CpuEngineError::PromptTooLong {
+            return Err(ContiguousEngineError::PromptTooLong {
                 prompt_len: prompt_ids.len(),
                 max_ctx: self.max_ctx,
             });
@@ -5061,7 +5073,7 @@ impl CpuEngine {
 
         let total_required = prompt_ids.len() + n_new as usize;
         if total_required > self.max_ctx {
-            return Err(CpuEngineError::PromptTooLong {
+            return Err(ContiguousEngineError::PromptTooLong {
                 prompt_len: prompt_ids.len(),
                 max_ctx: self.max_ctx,
             });
@@ -5240,7 +5252,7 @@ impl CpuEngine {
         }
         let total_required = prompt_ids.len() + n_new as usize;
         if total_required > self.max_ctx {
-            return Err(CpuEngineError::PromptTooLong {
+            return Err(ContiguousEngineError::PromptTooLong {
                 prompt_len: prompt_ids.len(),
                 max_ctx: self.max_ctx,
             });
@@ -5254,7 +5266,7 @@ impl CpuEngine {
             let kv = match &state.kv_backend {
                 KvBackend::Contiguous(kv) => kv,
                 _ => {
-                    return Err(CpuEngineError::Other(
+                    return Err(ContiguousEngineError::Other(
                         "beam search requires the contiguous KV backend \
                          (set [inference].kv_cache_layout = \"contiguous\")"
                             .to_string(),
@@ -5262,7 +5274,7 @@ impl CpuEngine {
                 }
             };
             if self.model.weights.is_hybrid() || kv.mla.is_some() || kv.has_ring_layers() {
-                return Err(CpuEngineError::Other(
+                return Err(ContiguousEngineError::Other(
                     "beam search is not supported for hybrid / MLA / sliding-window \
                      models in this build"
                         .to_string(),
@@ -5518,7 +5530,7 @@ impl CpuEngine {
 
         let total_required = prompt_ids.len() + n_new as usize;
         if total_required > self.max_ctx {
-            return Err(CpuEngineError::PromptTooLong {
+            return Err(ContiguousEngineError::PromptTooLong {
                 prompt_len: prompt_ids.len(),
                 max_ctx: self.max_ctx,
             });
@@ -5672,7 +5684,7 @@ impl CpuEngine {
 
         let total_required = prompt_ids.len() + n_new as usize;
         if total_required > self.max_ctx {
-            return Err(CpuEngineError::PromptTooLong {
+            return Err(ContiguousEngineError::PromptTooLong {
                 prompt_len: prompt_ids.len(),
                 max_ctx: self.max_ctx,
             });
@@ -5829,7 +5841,7 @@ impl CpuEngine {
             return Ok(Vec::new());
         }
         if l > self.max_ctx {
-            return Err(CpuEngineError::PromptTooLong {
+            return Err(ContiguousEngineError::PromptTooLong {
                 prompt_len: l,
                 max_ctx: self.max_ctx,
             });
@@ -5906,7 +5918,7 @@ impl CpuEngine {
         let tokenizer = self
             .tokenizer
             .as_deref()
-            .ok_or(CpuEngineError::NoTokenizer("tokenize_chunks"))?;
+            .ok_or(ContiguousEngineError::NoTokenizer("tokenize_chunks"))?;
         let mut out: Vec<i32> = Vec::new();
         let mut first = true;
         for chunk in text_chunks {
@@ -5918,7 +5930,7 @@ impl CpuEngine {
             let ids = tokenizer.encode(&chunk, add_bos)?;
             for id in ids {
                 if id > i32::MAX as u32 {
-                    return Err(CpuEngineError::Other(format!(
+                    return Err(ContiguousEngineError::Other(format!(
                         "tokenizer produced id {id} outside i32 range"
                     )));
                 }
@@ -5964,12 +5976,13 @@ impl CpuEngine {
             let engine = self.clone();
             let tx_closed = tx.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
-                let tokenizer = engine
-                    .tokenizer
-                    .as_deref()
-                    .ok_or(CpuEngineError::NoTokenizer(
-                        "generate_text_chunks_streaming",
-                    ))?;
+                let tokenizer =
+                    engine
+                        .tokenizer
+                        .as_deref()
+                        .ok_or(ContiguousEngineError::NoTokenizer(
+                            "generate_text_chunks_streaming",
+                        ))?;
                 let mut first = true;
                 for chunk in text_chunks {
                     if tx_closed.is_closed() {
@@ -5981,7 +5994,7 @@ impl CpuEngine {
                     let mut as_i32 = Vec::with_capacity(ids.len());
                     for id in ids {
                         if id > i32::MAX as u32 {
-                            return Err(CpuEngineError::Other(format!(
+                            return Err(ContiguousEngineError::Other(format!(
                                 "tokenizer produced id {id} outside i32 range"
                             )));
                         }
@@ -6012,7 +6025,7 @@ impl CpuEngine {
         // Surface any tokenizer error from the producer task.
         producer
             .await
-            .map_err(|e| CpuEngineError::Other(format!("tokenize task panicked: {e}")))??;
+            .map_err(|e| ContiguousEngineError::Other(format!("tokenize task panicked: {e}")))??;
 
         // Hand the assembled ids to the existing streaming generate
         // path on a blocking thread so the engine's `state.lock`
@@ -6022,7 +6035,7 @@ impl CpuEngine {
             engine.generate_token_ids_streaming(&prompt_ids, &sampling, logprobs_k, &tx)
         })
         .await
-        .map_err(|e| CpuEngineError::Other(format!("generate task panicked: {e}")))?
+        .map_err(|e| ContiguousEngineError::Other(format!("generate task panicked: {e}")))?
     }
 
     /// F9-tail — streaming counterpart of [`Self::generate_token_ids_mamba`]
@@ -6042,13 +6055,15 @@ impl CpuEngine {
         let tokenizer = self
             .tokenizer
             .as_deref()
-            .ok_or(CpuEngineError::NoTokenizer("generate_token_ids_streaming"))?;
+            .ok_or(ContiguousEngineError::NoTokenizer(
+                "generate_token_ids_streaming",
+            ))?;
         if prompt_ids.is_empty() {
             return Ok(());
         }
         let total_required = prompt_ids.len() + sampling.max_tokens as usize;
         if total_required > self.max_ctx {
-            return Err(CpuEngineError::PromptTooLong {
+            return Err(ContiguousEngineError::PromptTooLong {
                 prompt_len: prompt_ids.len(),
                 max_ctx: self.max_ctx,
             });
@@ -6136,12 +6151,14 @@ impl CpuEngine {
         let tokenizer = self
             .tokenizer
             .as_deref()
-            .ok_or(CpuEngineError::NoTokenizer("generate_token_ids_streaming"))?;
+            .ok_or(ContiguousEngineError::NoTokenizer(
+                "generate_token_ids_streaming",
+            ))?;
         let mut state = self.state.lock().expect("state lock");
 
         let total_required = prompt_ids.len() + sampling.max_tokens as usize;
         if total_required > self.max_ctx {
-            return Err(CpuEngineError::PromptTooLong {
+            return Err(ContiguousEngineError::PromptTooLong {
                 prompt_len: prompt_ids.len(),
                 max_ctx: self.max_ctx,
             });
@@ -6317,7 +6334,7 @@ impl CpuEngine {
         let tokenizer = self
             .tokenizer
             .as_deref()
-            .ok_or(CpuEngineError::NoTokenizer("generate_text"))?;
+            .ok_or(ContiguousEngineError::NoTokenizer("generate_text"))?;
         let add_bos = tokenizer.add_bos_token();
         let ids = tokenizer
             .encode(prompt, add_bos)?
@@ -6341,7 +6358,7 @@ impl CpuEngine {
         let tokenizer = self
             .tokenizer
             .as_deref()
-            .ok_or(CpuEngineError::NoTokenizer("generate_text_from_ids"))?;
+            .ok_or(ContiguousEngineError::NoTokenizer("generate_text_from_ids"))?;
         let ids: Vec<i32> = prompt_ids.iter().map(|&v| v as i32).collect();
         let new_ids = self.generate_token_ids(&ids, sampling.max_tokens, sampling)?;
         let text = tokenizer.decode(&new_ids, true)?;
@@ -6361,7 +6378,9 @@ impl CpuEngine {
         let tokenizer = self
             .tokenizer
             .as_deref()
-            .ok_or(CpuEngineError::NoTokenizer("generate_text_cacheblend"))?;
+            .ok_or(ContiguousEngineError::NoTokenizer(
+                "generate_text_cacheblend",
+            ))?;
         let new_ids =
             self.generate_token_ids_cacheblend(chunks, suffix_ids, sampling.max_tokens, sampling)?;
         let text = tokenizer.decode(&new_ids, true)?;
@@ -6602,7 +6621,7 @@ pub(crate) fn softmax_to_vec(logits: &[f32]) -> Vec<f32> {
     out
 }
 
-/// Free-function backing for [`CpuEngine::verify_speculation`]. Takes the
+/// Free-function backing for [`ContiguousEngine::verify_speculation`]. Takes the
 /// cloned `Arc` handles directly so the caller can move them into a
 /// `spawn_blocking` task without holding `&self`.
 /// Which batched-speculation path to take in `verify_speculation_inner`.
@@ -6724,7 +6743,7 @@ fn spec_prefill_and_forward(
                 }
             }
             _ => {
-                return Err(CpuEngineError::Other(
+                return Err(ContiguousEngineError::Other(
                     "hybrid speculation requires the contiguous KV backend \
                      and a DeltaNet cache"
                         .to_string(),
@@ -6857,7 +6876,7 @@ fn verify_speculation_inner(
     }
     let k = candidates.len();
     if prompt_ids.len() + k > max_ctx {
-        return Err(CpuEngineError::PromptTooLong {
+        return Err(ContiguousEngineError::PromptTooLong {
             prompt_len: prompt_ids.len() + k,
             max_ctx,
         });
@@ -6865,7 +6884,7 @@ fn verify_speculation_inner(
     let mut state = state.lock().expect("state lock");
     // Snapshot to restore at the end so verification is a pure read of
     // the model — no commit, no `last_ids` bump. This is the probing
-    // surface (`CpuEngine::verify_speculation`, equivalence tests).
+    // surface (`ContiguousEngine::verify_speculation`, equivalence tests).
     // The speculation STREAMS do NOT use this: full restore every
     // round meant nothing retained the committed prefix, so each round
     // re-prefilled prompt+committed from a stale LCP — quadratic in
@@ -6907,13 +6926,13 @@ fn score_continuations_inner(
     options: &[Vec<u32>],
 ) -> Result<Vec<f32>> {
     if context_ids.is_empty() {
-        return Err(CpuEngineError::Other(
+        return Err(ContiguousEngineError::Other(
             "score_continuations: empty context".to_string(),
         ));
     }
     let max_opt = options.iter().map(|o| o.len()).max().unwrap_or(0);
     if context_ids.len() + max_opt > max_ctx {
-        return Err(CpuEngineError::PromptTooLong {
+        return Err(ContiguousEngineError::PromptTooLong {
             prompt_len: context_ids.len() + max_opt,
             max_ctx,
         });
@@ -6959,7 +6978,7 @@ fn score_continuations_inner(
     Ok(scores)
 }
 
-/// Free-function backing for [`CpuEngine::sequence_logprob`]. Scores the
+/// Free-function backing for [`ContiguousEngine::sequence_logprob`]. Scores the
 /// whole sequence `ids` under teacher forcing by treating `ids[0]` as a
 /// one-token context and `ids[1..]` as the continuation, reusing the same
 /// `spec_prefill_and_forward` raw-logits path as
@@ -6976,7 +6995,7 @@ fn sequence_logprob_inner(
         return Ok((0.0, Vec::new()));
     }
     if ids.len() > max_ctx {
-        return Err(CpuEngineError::PromptTooLong {
+        return Err(ContiguousEngineError::PromptTooLong {
             prompt_len: ids.len(),
             max_ctx,
         });
@@ -7055,13 +7074,13 @@ fn verify_and_commit_speculation(
     presence_penalty: f32,
 ) -> Result<crate::speculative::SpeculationOutcome> {
     if prompt_ids.is_empty() {
-        return Err(CpuEngineError::Other(
+        return Err(ContiguousEngineError::Other(
             "speculation round requires a non-empty prompt".to_string(),
         ));
     }
     let k = drafts.len();
     if prompt_ids.len() + k > max_ctx {
-        return Err(CpuEngineError::PromptTooLong {
+        return Err(ContiguousEngineError::PromptTooLong {
             prompt_len: prompt_ids.len() + k,
             max_ctx,
         });
@@ -7163,7 +7182,7 @@ fn verify_and_commit_speculation(
                     );
                 }
                 _ => {
-                    return Err(CpuEngineError::Other(
+                    return Err(ContiguousEngineError::Other(
                         "hybrid speculation requires the contiguous KV backend \
                          and a DeltaNet cache"
                             .to_string(),
@@ -7281,7 +7300,7 @@ fn mtp_round(
     let contiguous_ok =
         matches!(state.kv_backend, KvBackend::Contiguous(_)) && state.delta_net_cache.is_some();
     if !contiguous_ok {
-        return Err(CpuEngineError::Other(
+        return Err(ContiguousEngineError::Other(
             "MTP self-speculation requires the contiguous KV backend and a \
              DeltaNet cache (hybrid model)"
                 .to_string(),
@@ -7643,7 +7662,7 @@ fn tree_mtp_round(
     let base_pos = next_pos as usize;
 
     if !matches!(state.kv_backend, KvBackend::Contiguous(_)) {
-        return Err(CpuEngineError::Other(
+        return Err(ContiguousEngineError::Other(
             "tree speculation requires the contiguous KV backend".to_string(),
         ));
     }
@@ -7763,7 +7782,7 @@ fn tree_eagle_round(
     let base_pos = next_pos as usize;
 
     if !matches!(state.kv_backend, KvBackend::Contiguous(_)) {
-        return Err(CpuEngineError::Other(
+        return Err(ContiguousEngineError::Other(
             "EAGLE tree speculation requires the contiguous KV backend".to_string(),
         ));
     }
@@ -7894,7 +7913,7 @@ fn tree_mtp_round_hybrid(
     let contiguous_ok =
         matches!(state.kv_backend, KvBackend::Contiguous(_)) && state.delta_net_cache.is_some();
     if !contiguous_ok {
-        return Err(CpuEngineError::Other(
+        return Err(ContiguousEngineError::Other(
             "hybrid tree speculation requires the contiguous KV backend and a \
              DeltaNet cache"
                 .to_string(),
@@ -8084,7 +8103,7 @@ fn tree_mtp_round_hybrid(
 
 // ----- streaming Engine impl -----
 
-impl Engine for CpuEngine {
+impl Engine for ContiguousEngine {
     fn metrics(&self) -> Metrics {
         use std::sync::atomic::Ordering;
         // `try_lock`, never `lock`: the state mutex is held for the
@@ -8111,7 +8130,7 @@ impl Engine for CpuEngine {
                 self.metrics_cache.paged_free.load(Ordering::Relaxed),
             ),
         };
-        // CpuEngine is single-flight at the engine layer (concurrency
+        // ContiguousEngine is single-flight at the engine layer (concurrency
         // comes from forks). One "slot" is active iff the KV is
         // non-empty.
         let paged_active_slots = if context_used > 0 && paged_total_pages > 0 {
@@ -8155,7 +8174,7 @@ impl Engine for CpuEngine {
 
     // Tool-calling support — expose the real tokenizer + context window
     // generically so the server's tools handlers work off `&dyn Engine`
-    // (not the concrete `CpuEngine`). Owned `Arc` clone is cheap.
+    // (not the concrete `ContiguousEngine`). Owned `Arc` clone is cheap.
     fn tokenizer_arc(&self) -> Option<Arc<Tokenizer>> {
         self.tokenizer.clone()
     }
@@ -8166,14 +8185,14 @@ impl Engine for CpuEngine {
     // P11 — resident multi-LoRA (trait surface for the server's `Arc<dyn
     // Engine>`; delegates to the inherent methods, mapping the error type).
     fn attach_lora_adapter(&self, name: &str, path: &std::path::Path) -> EngineResult<usize> {
-        CpuEngine::attach_lora_adapter(self, name, path)
+        ContiguousEngine::attach_lora_adapter(self, name, path)
             .map_err(|e| crate::EngineError::Engine(e.to_string()))
     }
     fn lora_adapter_names(&self) -> Vec<String> {
-        CpuEngine::lora_adapter_names(self)
+        ContiguousEngine::lora_adapter_names(self)
     }
     fn has_lora_adapter(&self, name: &str) -> bool {
-        CpuEngine::has_lora_adapter(self, name)
+        ContiguousEngine::has_lora_adapter(self, name)
     }
     fn recommended_sampling(&self) -> Option<SamplingParams> {
         self.recommended_sampling.clone()
@@ -8422,7 +8441,7 @@ impl Engine for CpuEngine {
     }
 }
 
-impl CpuEngine {
+impl ContiguousEngine {
     /// ID-level entry for DRAFT-MODEL speculative decoding — the P10a
     /// `/v1/completions` route. The endpoint tokenizes its own prompt (no
     /// BOS; FIM specials for `suffix`), so re-encoding text through
@@ -9434,7 +9453,7 @@ impl CpuEngine {
                         || false,
                     );
                     if done < prefill.len() {
-                        return Err(CpuEngineError::Other(
+                        return Err(ContiguousEngineError::Other(
                             "mtp prefill did not complete".to_string(),
                         ));
                     }
@@ -10375,7 +10394,7 @@ fn drive_generation(
     chrome.flush();
 
     // Publish per-request stats so the server's response handler can
-    // pick them up via `CpuEngine::last_request_stats()` while it still
+    // pick them up via `ContiguousEngine::last_request_stats()` while it still
     // holds the per-model gate. Also fold this request's decode tok/s
     // into the engine-wide EMA so `/v1/metrics` returns a smoothed
     // throughput number instead of swinging by 5× between cold and
@@ -10485,7 +10504,7 @@ fn vlm_mrope_positions(
 /// grows on demand. We do the grow here (rather than at every
 /// per-token call site) so the engine's dispatch surface stays
 /// V-6b-3d streaming generation for image-bearing requests. Mirrors
-/// [`drive_generation`] but uses [`CpuEngine::vlm_prefill_ids`] for
+/// [`drive_generation`] but uses [`ContiguousEngine::vlm_prefill_ids`] for
 /// prefill and skips the chunked-prefill / tool-grammar / logprobs
 /// machinery (image prefill is a single shot per request).
 ///

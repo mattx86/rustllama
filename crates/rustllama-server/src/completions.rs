@@ -172,7 +172,7 @@ pub async fn completions(
     headers: HeaderMap,
     Json(req): Json<CompletionRequest>,
 ) -> Response {
-    // P14-http: the completions endpoint is CpuEngine-only (it 503s on the
+    // P14-http: the completions endpoint is ContiguousEngine-only (it 503s on the
     // paged engine and drives generation directly off `shared_cpu`), so the
     // paged driver's deadline/heap don't apply here; carry only the admission
     // priority into the server scheduler slot. Default (no header) is
@@ -448,7 +448,7 @@ pub async fn completions(
             generate_ranked_candidates(&cpu_m, &prompt_ids_m, &sampling_m, n_candidates)
         })
         .await;
-        // (`&cpu_m` deref-coerces `&Arc<CpuEngine>` → `&CpuEngine`.)
+        // (`&cpu_m` deref-coerces `&Arc<ContiguousEngine>` → `&ContiguousEngine`.)
         let mut cands = match gen {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -1032,7 +1032,7 @@ struct RankedCandidate {
 /// Runs on the classic logprobs sampler (no spec) so every candidate carries
 /// its cumulative chosen-token logprob for `best_of` ranking.
 fn generate_ranked_candidates(
-    cpu: &rustllama_engine::CpuEngine,
+    cpu: &rustllama_engine::ContiguousEngine,
     prompt_ids: &[u32],
     sampling: &SamplingParams,
     g: u32,
@@ -1080,7 +1080,7 @@ struct BeamCompletion {
 /// length-penalty-adjusted score. Maps the engine's "beam unsupported for this
 /// backend/model" error to a user-facing string the caller returns as a 400.
 fn generate_beam_completions(
-    cpu: &rustllama_engine::CpuEngine,
+    cpu: &rustllama_engine::ContiguousEngine,
     prompt_ids: &[u32],
     max_new: u32,
     params: &rustllama_engine::BeamParams,
@@ -1121,7 +1121,7 @@ fn request_id() -> String {
 /// `chat::kv_dtype_label`, kept local so completions doesn't depend
 /// on `chat`'s private helpers. Used as one of the inputs to
 /// `system_fingerprint`.
-fn kv_dtype_label(cpu: &rustllama_engine::CpuEngine) -> &'static str {
+fn kv_dtype_label(cpu: &rustllama_engine::ContiguousEngine) -> &'static str {
     match cpu.kv_dtype() {
         rustllama_engine::KvDtype::F32 => "f32",
         rustllama_engine::KvDtype::F16 => "f16",
@@ -1138,7 +1138,7 @@ fn kv_dtype_label(cpu: &rustllama_engine::CpuEngine) -> &'static str {
 
 #[allow(clippy::too_many_arguments)]
 async fn completions_stream(
-    cpu: std::sync::Arc<rustllama_engine::CpuEngine>,
+    cpu: std::sync::Arc<rustllama_engine::ContiguousEngine>,
     prompt_ids: Vec<u32>,
     sampling: SamplingParams,
     model: String,
@@ -1162,7 +1162,7 @@ async fn completions_stream(
 
     // Drive on a blocking task; stream tokens through mpsc.
     // Buffer is intentionally small so the engine stays in lockstep
-    // with the SSE consumer — see CpuEngine::generate_token_ids_streaming.
+    // with the SSE consumer — see ContiguousEngine::generate_token_ids_streaming.
     let (tx, mut rx) = mpsc::channel::<Result<Token, String>>(4);
     let cpu_inner = cpu.clone();
     let sampling_inner = sampling.clone();

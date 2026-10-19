@@ -289,7 +289,7 @@ pub struct InferenceConfig {
     /// GPU VRAM. Its default / unset value is the sentinel
     /// [`N_GPU_LAYERS_AUTO`] (`999`, "all"), which means **AUTO**:
     /// placement is decided by the mandatory first-load autotune + the
-    /// measured-perf heat planner (`CpuEngine::auto_place_heat`) — it
+    /// measured-perf heat planner (`ContiguousEngine::auto_place_heat`) — it
     /// fits the model + KV cache into GPU VRAM (all layers on GPU when
     /// they fit, else the largest hot prefix that fits with the coldest
     /// layers spilled to CPU/RAM), honoring `placement.overrides`.
@@ -301,6 +301,19 @@ pub struct InferenceConfig {
     /// [`InferenceConfig::n_gpu_layers_override`]. On SYCL/CUDA-
     /// unavailable hosts the planner falls back to all-CPU regardless.
     pub n_gpu_layers: u32,
+    /// Context window (max KV positions) each request is served at.
+    ///
+    /// [`CTX_SIZE_AUTO`] (`0`, the default) means **AUTO**: at load the
+    /// engine opens the model's own trained context length (GGUF
+    /// `<arch>.context_length`), capped at a sane ceiling (32768) so a
+    /// 128K/1M-context model doesn't reserve a giant KV cache by surprise.
+    /// A model trained for less than the cap gets exactly its trained
+    /// window (smaller ⇒ less KV memory). The resolved value is what
+    /// `/v1/metrics.ctx_size` and the engine's `n_ctx()` report.
+    ///
+    /// Any OTHER value pins the window explicitly and is honored as-is —
+    /// even above the model's trained length (relies on the model's RoPE
+    /// scaling to stay coherent past its training window).
     pub ctx_size: u32,
     pub batch_size: u32,
     pub threads: u32,
@@ -815,6 +828,12 @@ fn default_true() -> bool {
 /// other configured value is treated as an explicit user override.
 pub const N_GPU_LAYERS_AUTO: u32 = 999;
 
+/// Sentinel [`InferenceConfig::ctx_size`] value meaning **AUTO**: derive the
+/// context window from the model's trained `context_length` at load (capped to
+/// a sane ceiling by the engine). The zero-config default — see the
+/// [`InferenceConfig::ctx_size`] field doc.
+pub const CTX_SIZE_AUTO: u32 = 0;
+
 impl InferenceConfig {
     /// The explicit `n_gpu_layers` override, or `None` when the value is
     /// the [`N_GPU_LAYERS_AUTO`] sentinel (⇒ let the autotune + heat
@@ -1004,7 +1023,10 @@ impl Default for InferenceConfig {
             // coldest layers to CPU/RAM). Any OTHER value is an explicit
             // user override — see the field doc + `n_gpu_layers_override`.
             n_gpu_layers: N_GPU_LAYERS_AUTO,
-            ctx_size: 8192,
+            // AUTO: derive the context window from the model's trained
+            // `context_length` at load, capped to a sane ceiling. See
+            // [`CTX_SIZE_AUTO`] + the `ctx_size` field doc.
+            ctx_size: CTX_SIZE_AUTO,
             batch_size: 512,
             threads: 0,
             flash_attention: true,
@@ -1146,7 +1168,7 @@ pub struct ServerConfig {
     ///
     /// On the DEFAULT contiguous engine, `>1` instead activates the
     /// per-fork multi-flight pool — each fork owns an independent KV
-    /// cache via `CpuEngine::fork_for_concurrent_use`, so memory grows
+    /// cache via `ContiguousEngine::fork_for_concurrent_use`, so memory grows
     /// ~linearly with concurrency. To avoid a memory regression for the
     /// single user, the serve path only builds those forks when the
     /// operator EXPLICITLY set `fused_decode = false`; an UNSET value
@@ -1165,7 +1187,7 @@ pub struct ServerConfig {
     ///   - `Some(true)` — explicit OPT-IN to the paged batching engine.
     ///   - `Some(false)` — explicit contiguous (also enables per-fork
     ///     multi-flight when `concurrency > 1`).
-    ///   - `None` (absent, the default) — the CONTIGUOUS `CpuEngine`,
+    ///   - `None` (absent, the default) — the CONTIGUOUS `ContiguousEngine`,
     ///     single-flight.
     ///
     /// This reverses the old P9 default-on: the paged path does not drive
@@ -1249,7 +1271,7 @@ pub struct ServerConfig {
 impl ServerConfig {
     /// Which serve engine to use, resolved from [`Self::fused_decode`] alone.
     ///
-    /// The CONTIGUOUS `CpuEngine` is the DEFAULT; the paged `PagedBatchEngine`
+    /// The CONTIGUOUS `ContiguousEngine` is the DEFAULT; the paged `PagedBatchEngine`
     /// (continuous batching) is OPT-IN via an explicit `fused_decode = true`.
     /// This reverses the old P9 default-on: the paged path does not engage a
     /// GPU on the single-user decode path today, so it is no longer the
@@ -1288,7 +1310,7 @@ impl Default for ServerConfig {
             // `fused_decode = false`; an unset value stays single-flight
             // regardless (see `contiguous_multi_flight` + the serve path).
             concurrency: 4,
-            // Default: unset ⇒ the CONTIGUOUS CpuEngine. The paged batching
+            // Default: unset ⇒ the CONTIGUOUS ContiguousEngine. The paged batching
             // engine is OPT-IN via an explicit `Some(true)` (it does not drive
             // a GPU on the single-user decode path today). `Some(false)` is the
             // explicit contiguous opt-out (and enables multi-flight forks).
@@ -1376,7 +1398,7 @@ pub struct TuningConfig {
     /// P9: when `true` (default), the serve path consults the
     /// `tune --batching` winner (`TuningResult::batching_engine`) to
     /// decide between the continuous-batching `PagedBatchEngine` and the
-    /// contiguous `CpuEngine` for the single-user case — but ONLY when
+    /// contiguous `ContiguousEngine` for the single-user case — but ONLY when
     /// `[server].fused_decode` is left unset (an explicit `fused_decode`
     /// always wins). Off ⇒ the tuner never flips the engine; the
     /// default-on batching engine (or the explicit `fused_decode`) is

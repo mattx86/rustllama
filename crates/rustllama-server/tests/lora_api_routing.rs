@@ -4,7 +4,7 @@
 //! `lora_routing.rs`).
 //!
 //! These surfaces don't expose a per-token logprob array, so instead of
-//! comparing output distributions against a real `CpuEngine` (the technique
+//! comparing output distributions against a real `ContiguousEngine` (the technique
 //! `lora_routing.rs` uses), a `RecordingEngine` captures the
 //! `SamplingParams.lora_adapter` that reaches the engine. That directly proves
 //! the three contract points per surface:

@@ -1,6 +1,6 @@
 //! Generation engine.
 //!
-//! Production inference is served by [`CpuEngine`] (and the SYCL/CUDA
+//! Production inference is served by [`ContiguousEngine`] (and the SYCL/CUDA
 //! accelerated paths layered on top). [`MockEngine`] is a lightweight
 //! test-only fixture — a canned token stream that lets `rustllama-server`
 //! exercise its HTTP/API layer without loading a real model; it is never
@@ -38,7 +38,7 @@ pub mod tool_grammar;
 pub mod tuner_apply;
 
 pub use beam::{BeamHypothesis, BeamParams};
-pub use inference::{CpuEngine, CpuEngineError};
+pub use inference::{ContiguousEngine, ContiguousEngineError};
 pub use load_options::{LoadOptions, LoadOptionsInput};
 // T3: re-export the typed load-option setters/getters so the CLI + server
 // (which don't depend on `rustllama-models` directly) can drive them at the
@@ -258,7 +258,7 @@ pub struct SamplingParams {
     /// forward byte-identical to the pre-LoRA path. When `Some(name)`, the
     /// engine resolves `name` against its resident [`crate::lora`] registry and
     /// applies that adapter's low-rank delta around the base matvecs
-    /// (per-request on `CpuEngine`, per-slot on `PagedBatchEngine`). An unknown
+    /// (per-request on `ContiguousEngine`, per-slot on `PagedBatchEngine`). An unknown
     /// name is rejected by the server (4xx) before the request reaches the
     /// engine; a name the engine can't resolve fails the request rather than
     /// silently serving the base. Not part of the sampler state — it selects
@@ -445,6 +445,27 @@ pub fn recommended_sampling(arch: &str, model_path: &std::path::Path) -> Option<
         .or_else(|| recommended_sampling_for_arch(arch))
 }
 
+/// Sane ceiling for AUTO context-size resolution. A model trained for a huge
+/// window (128K / 1M) would otherwise reserve a giant KV cache by surprise on
+/// a zero-config load; cap the auto-derived window here. A user who wants more
+/// sets `[inference].ctx_size` explicitly (honored as-is, even above this).
+pub const CTX_AUTO_CAP: u32 = 32768;
+
+/// Resolve an AUTO context window from a model's trained `context_length`.
+///
+/// The load paths pass `max_ctx == 0` (the `[inference].ctx_size` AUTO
+/// sentinel) straight through to the engine, which calls this: open the
+/// model's own trained window, capped at [`CTX_AUTO_CAP`], falling back to
+/// 8192 when the model declares no usable `context_length` (`ctx_train == 0`).
+/// A model trained for LESS than the cap gets exactly its trained window
+/// (smaller ⇒ less KV memory). Callers that need the resolved value BEFORE a
+/// full engine load (the placement sweep's KV pricing) peek the GGUF
+/// `context_length` and call this directly.
+pub fn auto_ctx_from_train(ctx_train: u32) -> u32 {
+    let train = if ctx_train == 0 { 8192 } else { ctx_train };
+    train.min(CTX_AUTO_CAP)
+}
+
 /// Built-in per-architecture recommended sampling profile, keyed on the
 /// GGUF `general.architecture` string. Returns a full [`SamplingParams`]
 /// (the generic default with only the fields a published recommendation
@@ -565,7 +586,7 @@ pub struct Metrics {
     #[serde(default)]
     pub paged_free_pages: u32,
     /// Active slots in the engine's fused-decode loop. `0` on
-    /// `CpuEngine` (which is single-flight at the engine layer —
+    /// `ContiguousEngine` (which is single-flight at the engine layer —
     /// concurrency comes from forks); meaningful on
     /// `PagedBatchEngine` where the driver thread tracks
     /// in-flight slots.
@@ -574,7 +595,7 @@ pub struct Metrics {
 }
 
 /// Per-request performance + cache-hit stats, captured at the end of
-/// each generation. Read via [`crate::inference::CpuEngine::last_request_stats`]
+/// each generation. Read via [`crate::inference::ContiguousEngine::last_request_stats`]
 /// while the request's server-gate permit is still held — the
 /// serial-by-default Semaphore(1) per model means no other request
 /// can clobber the snapshot between handler reading it and writing it
@@ -791,7 +812,7 @@ pub enum EngineError {
     Model(#[from] rustllama_models::ModelError),
     #[error(
         "speculative decoding not supported on this Engine impl — \
-         use CpuEngine (or wait for a SYCL build with target-side \
+         use ContiguousEngine (or wait for a SYCL build with target-side \
          distribution extraction)"
     )]
     SpeculationUnsupported,
@@ -879,7 +900,7 @@ pub struct EngineConfig {
 }
 
 /// The engine surface that callers (server, CLI, GUI) talk to.
-/// Production implementor: `CpuEngine` (Rust scalar / SIMD, with the
+/// Production implementor: `ContiguousEngine` (Rust scalar / SIMD, with the
 /// SYCL + CUDA accelerated kernel paths layered on). [`MockEngine`] is a
 /// test-only fixture (see its docs).
 pub trait Engine: Send + Sync {
@@ -894,7 +915,7 @@ pub trait Engine: Send + Sync {
     /// [`SubmitOpts`] (admission `priority` + optional `deadline`) from the HTTP
     /// layer down to the continuous-batching admission heap. The DEFAULT impl
     /// IGNORES `opts` and defers to [`Self::chat`], so every engine that does
-    /// not own a priority-ordered driver (`CpuEngine`, `MockEngine`, the test
+    /// not own a priority-ordered driver (`ContiguousEngine`, `MockEngine`, the test
     /// fixtures) is byte-identical to the plain `chat` path — the opts only have
     /// an effect on [`crate::paged_batch::PagedBatchEngine`], which overrides
     /// this to thread them into its driver's heap + deadline enforcement.
@@ -941,7 +962,7 @@ pub trait Engine: Send + Sync {
     ///
     /// Default impl returns
     /// [`EngineError::SpeculationUnsupported`] — the trait method is
-    /// here so [`CpuEngine`] (and future GPU engines) can override it
+    /// here so [`ContiguousEngine`] (and future GPU engines) can override it
     /// without callers having to feature-detect.
     ///
     /// Returns a [`TokenStream`] that yields the committed tokens.
@@ -962,10 +983,10 @@ pub trait Engine: Send + Sync {
     /// `None` if no request has yet completed (or this engine
     /// doesn't track per-request stats — e.g. `MockEngine`).
     ///
-    /// Distinct name from `CpuEngine::last_request_stats` (which
+    /// Distinct name from `ContiguousEngine::last_request_stats` (which
     /// is an inherent method returning `RequestStats` directly)
     /// to avoid the inherent-vs-trait method-resolution clash —
-    /// callers with a typed `CpuEngine` use the inherent; callers
+    /// callers with a typed `ContiguousEngine` use the inherent; callers
     /// with `&dyn Engine` (the server's metrics handler) use this.
     ///
     /// Surfaces the `Last request: prefill X ms, decode Y ms,
@@ -982,7 +1003,7 @@ pub trait Engine: Send + Sync {
     /// `/metrics` so operators can see at a glance whether the
     /// prefix cache is paying off. Default returns `None` for
     /// engines that don't track aggregate counters (e.g.
-    /// `MockEngine`); `CpuEngine` overrides to return its live
+    /// `MockEngine`); `ContiguousEngine` overrides to return its live
     /// [`CumulativeStats`] snapshot.
     fn cumulative_stats_snapshot(&self) -> Option<CumulativeStatsSnapshot> {
         None
@@ -995,7 +1016,7 @@ pub trait Engine: Send + Sync {
     /// SERVER-SIDE, which needs the tokenizer BEFORE the per-model gate
     /// `.await`; returning an owned `Arc` (not a borrow) lets the handler
     /// hold it across that await without a borrow-vs-await clash. Both
-    /// [`CpuEngine`] and [`crate::paged_batch::PagedBatchEngine`] override
+    /// [`ContiguousEngine`] and [`crate::paged_batch::PagedBatchEngine`] override
     /// this — the tools path then runs identically on either engine, since
     /// the tool-call grammar is applied per-slot in both drivers.
     fn tokenizer_arc(&self) -> Option<std::sync::Arc<rustllama_tokenizer::Tokenizer>> {
@@ -1006,7 +1027,7 @@ pub trait Engine: Send + Sync {
     /// by the server to clamp the generation budget on the tools path (the
     /// generic counterpart of the inherent `max_ctx()` accessors on the
     /// concrete engines). The default derives it from the required
-    /// [`Self::n_ctx`] so every engine has a sane value; `CpuEngine` /
+    /// [`Self::n_ctx`] so every engine has a sane value; `ContiguousEngine` /
     /// `PagedBatchEngine` override to return their stored `max_ctx` directly.
     fn max_ctx(&self) -> usize {
         self.n_ctx() as usize
@@ -1015,7 +1036,7 @@ pub trait Engine: Send + Sync {
     /// P11 — attach (load, UNMERGED) a resident LoRA adapter under `name`,
     /// returning its adapted-tensor count. A later request selects it via
     /// [`SamplingParams::lora_adapter`]. Default: unsupported (every engine
-    /// without a resident registry — `MockEngine`, test fixtures). `CpuEngine`
+    /// without a resident registry — `MockEngine`, test fixtures). `ContiguousEngine`
     /// and `PagedBatchEngine` override it.
     fn attach_lora_adapter(&self, _name: &str, _path: &std::path::Path) -> Result<usize> {
         Err(EngineError::Unimplemented(
@@ -1041,7 +1062,7 @@ pub trait Engine: Send + Sync {
     /// as the BASE profile (request fields overlay on top, so an explicit
     /// request field always wins). Default `None` → the server keeps the
     /// generic [`SamplingParams::default`], so engines without a recommendation
-    /// (`MockEngine`, test fixtures) are byte-identical to before. `CpuEngine`
+    /// (`MockEngine`, test fixtures) are byte-identical to before. `ContiguousEngine`
     /// and [`crate::paged_batch::PagedBatchEngine`] override this to return the
     /// profile they computed at load.
     fn recommended_sampling(&self) -> Option<SamplingParams> {
@@ -1052,7 +1073,7 @@ pub trait Engine: Send + Sync {
 /// Test-only fixture engine. Returns the prompt back tokenized as ASCII
 /// bytes / a canned stream, so `rustllama-server`'s integration tests can
 /// verify HTTP/API wiring without loading a real model. Never serves real
-/// requests in production (that's [`CpuEngine`] and the GPU-accelerated
+/// requests in production (that's [`ContiguousEngine`] and the GPU-accelerated
 /// paths).
 pub struct MockEngine;
 

@@ -1,6 +1,6 @@
 //! Integration test for `measure_placement_candidates` — the dynamic
 //! half of `rustllama tune --placement --measure`. Drives a synth
-//! GGUF through the real CpuEngine path with varied `n_gpu_layers`
+//! GGUF through the real ContiguousEngine path with varied `n_gpu_layers`
 //! settings, verifies a winner is selected by measured tok/s.
 //!
 //! The synth model is tiny (default SynthLlama dims: 2 layers, 64-

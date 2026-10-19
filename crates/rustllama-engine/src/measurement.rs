@@ -17,7 +17,7 @@ use std::path::Path;
 
 use rustllama_tuner::{OptimizeFor, PerfCandidate, PlacementPlan};
 
-use crate::inference::CpuEngine;
+use crate::inference::ContiguousEngine;
 use crate::SamplingParams;
 use rustllama_models::llama_arch::KvDtype;
 
@@ -29,7 +29,7 @@ use rustllama_models::llama_arch::KvDtype;
 /// the caller keeps its own warmup + sort + median/max + result shaping (which
 /// differ between sweeps — simple vs even-averaged median, etc.).
 fn collect_decode_tok_s(
-    cpu: &mut CpuEngine,
+    cpu: &mut ContiguousEngine,
     prompt_ids: &[i32],
     decode_tokens: u32,
     repeats: u32,
@@ -119,7 +119,7 @@ pub struct BatchSizeMeasurementReport {
 pub struct MeasurementConfig {
     pub kv_dtype: KvDtype,
     /// String form of `[inference].kv_cache_layout` — passed verbatim
-    /// to `CpuEngine::load_with_options_and_layout`.
+    /// to `ContiguousEngine::load_with_options_and_layout`.
     pub kv_cache_layout: String,
     pub flash_attention: bool,
     /// Initial `n_gpu_layers` used for the batch-size sweep load.
@@ -149,7 +149,7 @@ pub fn measure_placement_candidates(
     cfg: &MeasurementConfig,
 ) -> crate::Result<PlacementMeasurementReport> {
     let load_start = std::time::Instant::now();
-    let mut cpu = CpuEngine::load_with_options_and_layout(
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
         model_path,
         ctx_size,
         true,
@@ -400,7 +400,7 @@ pub fn measure_per_device_perf(
     cfg: &MeasurementConfig,
 ) -> crate::Result<PerDevicePerfReport> {
     let load_start = std::time::Instant::now();
-    let mut cpu = CpuEngine::load_with_options_and_layout(
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
         model_path,
         ctx_size,
         true,
@@ -432,13 +432,13 @@ pub fn measure_per_device_perf(
 
     // Time `repeats` decode runs at the given layer cutoff; return the
     // median decode tok/s, or an error string if every run failed.
-    let bench = |cpu: &mut CpuEngine, n_gpu: u32| -> std::result::Result<f64, String> {
+    let bench = |cpu: &mut ContiguousEngine, n_gpu: u32| -> std::result::Result<f64, String> {
         cpu.set_n_gpu_layers(n_gpu);
         cpu.clear_prefix_cache();
         // One untimed warmup (JIT / USM upload / page-in).
         cpu.generate_token_ids(&prompt_ids, decode_tokens, &sampling)
             .map_err(|e| format!("warmup failed: {e}"))?;
-        // `cpu` is already `&mut CpuEngine` here (closure param) — reborrow.
+        // `cpu` is already `&mut ContiguousEngine` here (closure param) — reborrow.
         let (mut runs, last_err) =
             collect_decode_tok_s(cpu, &prompt_ids, decode_tokens, repeats, &sampling);
         if runs.is_empty() {
@@ -895,7 +895,7 @@ pub fn measure_kv_dtype_candidates(
 
     for &dt in candidates {
         let load_start = std::time::Instant::now();
-        let load_result = CpuEngine::load_with_options_and_layout(
+        let load_result = ContiguousEngine::load_with_options_and_layout(
             model_path,
             ctx_size,
             true,
@@ -1020,7 +1020,7 @@ pub struct FlashAttentionMeasurementReport {
 
 /// Sweep `flash_attention = true` vs `false`. Reuses one loaded
 /// engine — flash-attention is a hot toggle via
-/// [`CpuEngine::set_flash_attention`].
+/// [`ContiguousEngine::set_flash_attention`].
 pub fn measure_flash_attention_candidates(
     model_path: &Path,
     ctx_size: usize,
@@ -1030,7 +1030,7 @@ pub fn measure_flash_attention_candidates(
     cfg: &MeasurementConfig,
 ) -> crate::Result<FlashAttentionMeasurementReport> {
     let load_start = std::time::Instant::now();
-    let mut cpu = CpuEngine::load_with_options_and_layout(
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
         model_path,
         ctx_size,
         true,
@@ -1163,7 +1163,7 @@ pub fn measure_kv_layout_candidates(
 
     for layout in candidates {
         let load_start = std::time::Instant::now();
-        let load_result = CpuEngine::load_with_options_and_layout(
+        let load_result = ContiguousEngine::load_with_options_and_layout(
             model_path,
             ctx_size,
             true,
@@ -1268,7 +1268,7 @@ pub fn measure_kv_layout_candidates(
 #[derive(Debug, Clone)]
 pub struct BatchingEngineResult {
     /// `"paged"` (the continuous-batching `PagedBatchEngine`) or
-    /// `"contiguous"` (the single-stream `CpuEngine`).
+    /// `"contiguous"` (the single-stream `ContiguousEngine`).
     pub engine: String,
     pub warmup_ms: f64,
     pub median_tps: Option<f64>,
@@ -1297,7 +1297,7 @@ const BATCHING_PARITY_MARGIN: f64 = 0.97;
 
 /// P9 `tune --batching` A/B: measure SINGLE-STREAM (one request, no
 /// concurrency) prefill+decode throughput on the continuous-batching
-/// `PagedBatchEngine` vs the contiguous `CpuEngine`, and decide whether
+/// `PagedBatchEngine` vs the contiguous `ContiguousEngine`, and decide whether
 /// default-on continuous batching regresses the single-user case.
 ///
 /// Both engines run the SAME synthetic prompt (shifted per repeat so neither
@@ -1355,10 +1355,10 @@ pub fn measure_batching_candidates(
         (Some(median), Some(runs[runs.len() - 1]))
     };
 
-    // ---- Contiguous CpuEngine (the single-stream reference) ----
+    // ---- Contiguous ContiguousEngine (the single-stream reference) ----
     let contiguous_tps = {
         let load_start = std::time::Instant::now();
-        let loaded = CpuEngine::load_with_options_and_layout(
+        let loaded = ContiguousEngine::load_with_options_and_layout(
             model_path,
             ctx_size,
             true,
@@ -1513,7 +1513,7 @@ pub fn measure_batch_size_candidates(
     // Pick a context size that comfortably holds the synthetic
     // prompt + 1 decode token, regardless of what the user configured.
     let ctx_size = (prompt_tokens as usize + 8).max(64);
-    let mut cpu = CpuEngine::load_with_options_and_layout(
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
         model_path,
         ctx_size,
         true,
@@ -1668,7 +1668,7 @@ pub fn measure_flash_kv_min_candidates(
     cfg: &MeasurementConfig,
 ) -> crate::Result<FlashKvMinMeasurementReport> {
     let load_start = std::time::Instant::now();
-    let mut cpu = CpuEngine::load_with_options_and_layout(
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
         model_path,
         ctx_size,
         true,
@@ -1814,7 +1814,7 @@ pub fn measure_prefix_snapshots_candidates(
     cfg: &MeasurementConfig,
 ) -> crate::Result<PrefixSnapshotsMeasurementReport> {
     let load_start = std::time::Instant::now();
-    let mut cpu = CpuEngine::load_with_options_and_layout(
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
         model_path,
         ctx_size,
         true,
@@ -1942,7 +1942,7 @@ pub struct KvPageSizeMeasurementReport {
 
 /// Sweep `kv_page_size` across candidate token-counts-per-page.
 /// Reloads the engine per candidate via
-/// [`CpuEngine::load_with_options_layout_and_page_size`] — page size
+/// [`ContiguousEngine::load_with_options_layout_and_page_size`] — page size
 /// is structural (changes `PagedKvStore` geometry) so we can't
 /// mutate it on a loaded engine. Caller should run this only when
 /// `kv_cache_layout = "paged"` is in effect; on contiguous configs
@@ -1965,7 +1965,7 @@ pub fn measure_kv_page_size_candidates(
 
     for &page_size in candidates {
         let load_start = std::time::Instant::now();
-        let load_result = CpuEngine::load_with_options_layout_and_page_size(
+        let load_result = ContiguousEngine::load_with_options_layout_and_page_size(
             model_path,
             ctx_size,
             true,
@@ -2100,7 +2100,7 @@ pub fn measure_flash_v3_kv_tile_candidates(
     cfg: &MeasurementConfig,
 ) -> crate::Result<FlashV3KvTileMeasurementReport> {
     let load_start = std::time::Instant::now();
-    let mut cpu = CpuEngine::load_with_options_and_layout(
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
         model_path,
         ctx_size,
         true,
@@ -2255,7 +2255,7 @@ pub fn measure_moe_placement_candidates(
     use rustllama_models::accel;
 
     let load_start = std::time::Instant::now();
-    let mut cpu = CpuEngine::load_with_options_and_layout(
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
         model_path,
         ctx_size,
         true,
@@ -2455,11 +2455,11 @@ pub struct SsmPrefillChunkedReport {
 /// A/B MTP (NextN) self-speculative decode by measured DECODE tok/s.
 ///
 /// Loads the model ONCE (same load call the decode sweeps use). MTP
-/// self-speculation is a HOT toggle ([`CpuEngine::set_mtp_speculative`]),
+/// self-speculation is a HOT toggle ([`ContiguousEngine::set_mtp_speculative`]),
 /// so both arms run on that single loaded engine with NO reload between
 /// them.
 ///
-/// Capability gate: [`CpuEngine::mtp_speculative`] returns
+/// Capability gate: [`ContiguousEngine::mtp_speculative`] returns
 /// `mtp_spec && model_supports_mtp()` (hybrid + NextN head present), so
 /// enabling the flag and reading the effective getter back tells us
 /// whether the loaded model can actually use MTP — no reload required,
@@ -2500,7 +2500,7 @@ pub fn measure_speculative_mtp(
     const DECODE_TOKENS: u32 = 16;
     let ctx_size = (PROMPT_TOKENS as usize + DECODE_TOKENS as usize + 8).max(128);
 
-    let mut cpu = CpuEngine::load_with_options_and_layout(
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
         model_path,
         ctx_size,
         true,
@@ -2550,7 +2550,7 @@ pub fn measure_speculative_mtp(
     // One untimed warmup + `repeats` timed runs; returns `(None,
     // Some(err))` when every run failed. Mirrors the decode-metric pattern
     // used by `measure_placement_candidates` / `measure_per_device_perf`.
-    let bench = |cpu: &mut CpuEngine| -> (Option<f64>, Option<String>) {
+    let bench = |cpu: &mut ContiguousEngine| -> (Option<f64>, Option<String>) {
         cpu.clear_prefix_cache();
         if let Err(e) = cpu.generate_token_ids(&prompt_ids, DECODE_TOKENS, &sampling) {
             return (None, Some(format!("warmup failed: {e}")));
@@ -2593,7 +2593,7 @@ pub fn measure_speculative_mtp(
     // `futures::StreamExt` drain the engine's own streaming callers use).
     // Timing runs from the first yielded token to the last so prefill is
     // excluded — comparable to the OFF arm's decode-only tok/s.
-    let bench_mtp = |cpu: &mut CpuEngine| -> (Option<f64>, Option<String>) {
+    let bench_mtp = |cpu: &mut ContiguousEngine| -> (Option<f64>, Option<String>) {
         use futures::StreamExt;
         // Untimed warmup: drain one full stream.
         cpu.clear_prefix_cache();
@@ -2726,10 +2726,10 @@ pub struct TreeWidthsReport {
 /// `[inference].speculative_tree_widths`.
 ///
 /// Loads the model ONCE. Tree spec is driven directly by the `tree_widths`
-/// argument to [`CpuEngine::speculate_mtp_stream_from_ids`] (NOT a hot engine
+/// argument to [`ContiguousEngine::speculate_mtp_stream_from_ids`] (NOT a hot engine
 /// flag), so each candidate just drains that stream with its own width vector —
 /// no reload, no setter. The capability probe uses
-/// [`CpuEngine::set_tree_speculative`] + [`CpuEngine::tree_speculative`]: a model
+/// [`ContiguousEngine::set_tree_speculative`] + [`ContiguousEngine::tree_speculative`]: a model
 /// with no draft head reads back `false`, and we return `capable: false` with no
 /// measurements (the CLI SKIPs).
 ///
@@ -2755,7 +2755,7 @@ pub fn measure_tree_widths(
     const DECODE_TOKENS: u32 = 16;
     let ctx_size = (PROMPT_TOKENS as usize + DECODE_TOKENS as usize + 8).max(128);
 
-    let mut cpu = CpuEngine::load_with_options_and_layout(
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
         model_path,
         ctx_size,
         true,
@@ -2804,7 +2804,7 @@ pub fn measure_tree_widths(
     // `measure_speculative_mtp`'s `bench_mtp`, parameterized on the widths and
     // additionally sampling the engine's cumulative speculation counters to
     // derive this candidate's accept rate (drafted → accepted).
-    let bench_widths = |cpu: &mut CpuEngine,
+    let bench_widths = |cpu: &mut ContiguousEngine,
                         widths: &[u32]|
      -> (Option<f64>, Option<f64>, Option<String>) {
         let tw = Some(widths.to_vec());
@@ -2963,7 +2963,7 @@ pub fn measure_ssm_prefill_chunked(
     const PROMPT_TOKENS: u32 = 256;
     let ctx_size = (PROMPT_TOKENS as usize + 8).max(64);
 
-    let mut cpu = CpuEngine::load_with_options_and_layout(
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
         model_path,
         ctx_size,
         true,
@@ -2998,7 +2998,7 @@ pub fn measure_ssm_prefill_chunked(
     // warmup + `repeats` timed runs. Mirrors the prefill-metric pattern
     // in `measure_batch_size_candidates` (incl. the
     // `tokens_prefilled.max(prompt)` guard).
-    let bench = |cpu: &mut CpuEngine| -> (Option<f64>, Option<String>) {
+    let bench = |cpu: &mut ContiguousEngine| -> (Option<f64>, Option<String>) {
         cpu.clear_prefix_cache();
         if let Err(e) = cpu.generate_token_ids(&prompt_ids, 1, &sampling) {
             return (None, Some(format!("warmup failed: {e}")));
@@ -3099,7 +3099,7 @@ pub fn measure_flash_attn_bench(
     cfg: &MeasurementConfig,
 ) -> Result<FlashAttnBenchReport, String> {
     let ctx_size = (prompt_tokens as usize + decode_tokens as usize + 8).max(64);
-    let mut cpu = CpuEngine::load_with_options_and_layout(
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
         model_path,
         ctx_size,
         true,
@@ -3147,7 +3147,7 @@ pub fn measure_flash_attn_bench(
 
     // Median prefill tok/s (max_tokens=1 → prefill_ms), one untimed warmup +
     // `repeats` timed runs. Mirrors `measure_ssm_prefill_chunked`.
-    let bench_prefill = |cpu: &mut CpuEngine| -> Option<f64> {
+    let bench_prefill = |cpu: &mut ContiguousEngine| -> Option<f64> {
         cpu.clear_prefix_cache();
         if cpu
             .generate_token_ids(&prompt_ids, 1, &prefill_sampling)
@@ -3171,7 +3171,7 @@ pub fn measure_flash_attn_bench(
         }
         median(runs)
     };
-    let bench_decode = |cpu: &mut CpuEngine| -> Option<f64> {
+    let bench_decode = |cpu: &mut ContiguousEngine| -> Option<f64> {
         // untimed warmup, then the shared decode-tok/s collector.
         cpu.clear_prefix_cache();
         let _ = cpu.generate_token_ids(&prompt_ids, decode_tokens, &decode_sampling);
@@ -3259,7 +3259,7 @@ pub struct PerfKnobReport {
 /// placement sweep's Sysman energy sampling folded in so `optimize_for = watts`
 /// has a tokens-per-joule score to rank by.
 fn measure_one_knob_candidate(
-    cpu: &mut CpuEngine,
+    cpu: &mut ContiguousEngine,
     prompt_ids: &[i32],
     sampling: &SamplingParams,
     metric: KnobMetric,
@@ -3346,7 +3346,7 @@ fn measure_perf_knob_generic(
     restore_value: u64,
 ) -> Result<PerfKnobReport, String> {
     let ctx_size = (prompt_tokens as usize + decode_tokens as usize + 8).max(128);
-    let mut cpu = CpuEngine::load_with_options_and_layout(
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
         model_path,
         ctx_size,
         true,
@@ -3587,7 +3587,7 @@ pub fn measure_dev_attn(
     // Force f32 KV regardless of cfg.kv_dtype — the block is F32-KV-only, so the
     // A/B measures exactly the scenario where it can engage. (At serve time the
     // dispatch gate is f32-KV-only too, so a quant-KV winner leaves it dormant.)
-    let mut cpu = CpuEngine::load_with_options_and_layout(
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
         model_path,
         ctx_size,
         true,
@@ -3619,7 +3619,7 @@ pub fn measure_dev_attn(
 
     // One untimed warmup + `repeats` timed decode runs → median tok/s (the exact
     // decode-metric pattern the kv_dtype / MTP sweeps use).
-    let bench = |cpu: &mut CpuEngine| -> (Option<f64>, Option<String>) {
+    let bench = |cpu: &mut ContiguousEngine| -> (Option<f64>, Option<String>) {
         cpu.clear_prefix_cache();
         if let Err(e) = cpu.generate_token_ids(&prompt_ids, DECODE_TOKENS, &sampling) {
             return (None, Some(format!("warmup failed: {e}")));
@@ -3807,7 +3807,7 @@ pub fn measure_moe_vram_margin_candidates(
 
     for &margin in margins {
         accel::set_moe_vram_margin_override(Some(margin));
-        let mut cpu = match CpuEngine::load_with_options_and_layout(
+        let mut cpu = match ContiguousEngine::load_with_options_and_layout(
             model_path,
             ctx_size,
             true,
@@ -3951,7 +3951,7 @@ pub fn measure_cacheblend_ratio(
 
     // CacheBlend requires contiguous F32 KV — force it for the measurement
     // regardless of the model's tuned serve-time KV dtype.
-    let cpu = CpuEngine::load_with_options_and_layout(
+    let cpu = ContiguousEngine::load_with_options_and_layout(
         model_path,
         ctx_size,
         false,

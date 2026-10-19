@@ -10,7 +10,7 @@
 //! the text-level stream equivalence is exercised on real models in
 //! the release smoke.)
 
-use rustllama_engine::{CpuEngine, KvDtype, SamplingParams};
+use rustllama_engine::{ContiguousEngine, KvDtype, SamplingParams};
 use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
 
 fn greedy(n: u32) -> SamplingParams {
@@ -40,7 +40,7 @@ fn argmax(dist: &[f32]) -> u32 {
 /// speculative candidates: every batched distribution's argmax must
 /// equal the serially-decoded token at that position (the "all
 /// accepted" property that makes temp-0 speculation lossless).
-fn assert_verify_matches_serial(engine: &CpuEngine, prompt: &[i32], k: usize) {
+fn assert_verify_matches_serial(engine: &ContiguousEngine, prompt: &[i32], k: usize) {
     let serial = engine
         .generate_token_ids(prompt, (k + 1) as u32, &greedy((k + 1) as u32))
         .expect("serial greedy");
@@ -69,7 +69,7 @@ fn assert_verify_matches_serial(engine: &CpuEngine, prompt: &[i32], k: usize) {
 fn batched_verify_matches_serial_greedy_f32() {
     let tmp = std::env::temp_dir().join("rustllama-spec-verify-f32.gguf");
     write_synthetic_llama_gguf(&tmp, &SynthLlama::default());
-    let engine = CpuEngine::load_with_options(&tmp, 64, true, KvDtype::F32).expect("load");
+    let engine = ContiguousEngine::load_with_options(&tmp, 64, true, KvDtype::F32).expect("load");
     assert_verify_matches_serial(&engine, &[5, 9, 7, 5, 9, 7, 5], 4);
     let _ = std::fs::remove_file(&tmp);
 }
@@ -83,7 +83,7 @@ fn batched_verify_matches_serial_greedy_q4_0() {
     synth.head_dim = 64;
     synth.d_model = synth.n_heads * 64;
     write_synthetic_llama_gguf(&tmp, &synth);
-    let engine = CpuEngine::load_with_options(&tmp, 64, true, KvDtype::Q4_0).expect("load");
+    let engine = ContiguousEngine::load_with_options(&tmp, 64, true, KvDtype::Q4_0).expect("load");
     assert_verify_matches_serial(&engine, &[4, 11, 4, 11, 4, 11, 4], 4);
     let _ = std::fs::remove_file(&tmp);
 }
@@ -95,7 +95,7 @@ fn verify_is_state_neutral() {
     // DeltaNet snapshot/restore extends to recurrent state).
     let tmp = std::env::temp_dir().join("rustllama-spec-verify-neutral.gguf");
     write_synthetic_llama_gguf(&tmp, &SynthLlama::default());
-    let engine = CpuEngine::load_with_options(&tmp, 64, true, KvDtype::F32).expect("load");
+    let engine = ContiguousEngine::load_with_options(&tmp, 64, true, KvDtype::F32).expect("load");
     let prompt = [5i32, 9, 7, 5, 9];
     let a1 = engine.verify_speculation(&prompt, &[1, 2, 3]).expect("a1");
     let _ = engine.verify_speculation(&prompt, &[30, 29]).expect("mid");
@@ -112,7 +112,7 @@ fn verify_is_state_neutral() {
 /// pure-read verify restored everything, so every round re-prefilled
 /// prompt+committed from a stale LCP). The repetitive prompt makes
 /// the drafter fire so both the accept and reject commit arms run.
-async fn assert_ngram_stream_matches_plain(engine: &CpuEngine, prompt: &[i32], n: u32) {
+async fn assert_ngram_stream_matches_plain(engine: &ContiguousEngine, prompt: &[i32], n: u32) {
     use futures::StreamExt;
     use rustllama_engine::speculative::NgramDrafterConfig;
 
@@ -148,7 +148,7 @@ async fn assert_ngram_stream_matches_plain(engine: &CpuEngine, prompt: &[i32], n
 async fn ngram_stream_from_ids_matches_plain_greedy_f32() {
     let tmp = std::env::temp_dir().join("rustllama-spec-stream-f32.gguf");
     write_synthetic_llama_gguf(&tmp, &SynthLlama::default());
-    let engine = CpuEngine::load_with_options(&tmp, 64, true, KvDtype::F32).expect("load");
+    let engine = ContiguousEngine::load_with_options(&tmp, 64, true, KvDtype::F32).expect("load");
     assert_ngram_stream_matches_plain(&engine, &[5, 9, 7, 5, 9, 7, 5], 12).await;
     let _ = std::fs::remove_file(&tmp);
 }
@@ -160,7 +160,7 @@ async fn ngram_stream_from_ids_matches_plain_greedy_q4_0() {
     synth.head_dim = 64;
     synth.d_model = synth.n_heads * 64;
     write_synthetic_llama_gguf(&tmp, &synth);
-    let engine = CpuEngine::load_with_options(&tmp, 64, true, KvDtype::Q4_0).expect("load");
+    let engine = ContiguousEngine::load_with_options(&tmp, 64, true, KvDtype::Q4_0).expect("load");
     assert_ngram_stream_matches_plain(&engine, &[4, 11, 4, 11, 4, 11, 4], 12).await;
     let _ = std::fs::remove_file(&tmp);
 }

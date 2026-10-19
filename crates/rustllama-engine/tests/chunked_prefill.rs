@@ -2,14 +2,14 @@
 //! partial work is preserved in the prefix cache when the streaming path
 //! is cancelled mid-prefill.
 
-use rustllama_engine::{CpuEngine, SamplingParams};
+use rustllama_engine::{ContiguousEngine, SamplingParams};
 use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
 
-fn build_engine(tag: &str) -> (CpuEngine, std::path::PathBuf) {
+fn build_engine(tag: &str) -> (ContiguousEngine, std::path::PathBuf) {
     let tmp = std::env::temp_dir().join(format!("rustllama-chunked-prefill-{tag}.gguf"));
     let params = SynthLlama::default();
     write_synthetic_llama_gguf(&tmp, &params);
-    let engine = CpuEngine::load(&tmp, 32).expect("load engine");
+    let engine = ContiguousEngine::load(&tmp, 32).expect("load engine");
     (engine, tmp)
 }
 
@@ -111,7 +111,7 @@ async fn cancellation_mid_prefill_stops_within_a_few_forwards() {
     let tmp = std::env::temp_dir().join("rustllama-chunked-prefill-cancel-timing.gguf");
     let params = SynthLlama::default();
     write_synthetic_llama_gguf(&tmp, &params);
-    let mut engine = CpuEngine::load_with_tokenizer(&tmp, 32).expect("load");
+    let mut engine = ContiguousEngine::load_with_tokenizer(&tmp, 32).expect("load");
     // chunk_size=1 keeps the should_stop() poll cadence at one forward.
     engine.set_prefill_chunk_size(1);
     let engine = Arc::new(engine);
@@ -189,7 +189,7 @@ async fn cancellation_mid_prefill_preserves_partial_cache() {
     let tmp = std::env::temp_dir().join("rustllama-chunked-prefill-cancel-stream.gguf");
     let params = SynthLlama::default();
     write_synthetic_llama_gguf(&tmp, &params);
-    let mut engine = CpuEngine::load_with_tokenizer(&tmp, 32).expect("load with tokenizer");
+    let mut engine = ContiguousEngine::load_with_tokenizer(&tmp, 32).expect("load with tokenizer");
     // Tiny chunks → first chunk completes after just 2 forward passes,
     // then we drop the receiver so the next chunk's first
     // `should_stop()` poll catches it.

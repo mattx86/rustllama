@@ -859,7 +859,7 @@ async fn chat_with_tools(state: AppState, req: ChatRequest, sched: ReqSchedule) 
         Err(be) => return be.into_response(),
     };
     // Source the tokenizer + context window generically off `&dyn Engine`
-    // so tool-calling works on EITHER backend (CpuEngine or the continuous-
+    // so tool-calling works on EITHER backend (ContiguousEngine or the continuous-
     // batching paged engine — both build the tool-call grammar per-slot).
     // The only genuinely-unsupported case is an engine with no tokenizer
     // (the test MockEngine / a model loaded without one).
@@ -983,7 +983,7 @@ async fn chat_with_tools(state: AppState, req: ChatRequest, sched: ReqSchedule) 
         Ok(h) => h,
         Err(be) => return be.into_response(),
     };
-    // Generation is driven generically (`handle.engine` — both CpuEngine and
+    // Generation is driven generically (`handle.engine` — both ContiguousEngine and
     // the paged engine impl it); the typed `cpu_engine` handle is `None` when
     // the model is served by the paged engine, so logprob alt-token decode +
     // kv-dtype label degrade gracefully to `None` there rather than 503-ing.
@@ -1011,7 +1011,7 @@ async fn chat_with_tools(state: AppState, req: ChatRequest, sched: ReqSchedule) 
     }
 
     // Capture per-request stats while the gate permit is still held. Sourced
-    // generically so the paged engine's stats surface too; `CpuEngine`'s
+    // generically so the paged engine's stats surface too; `ContiguousEngine`'s
     // snapshot is `Some(last_request_stats())` — byte-identical to before.
     let stats = handle
         .engine
@@ -1281,7 +1281,7 @@ fn build_sse_stream_with_tools(
     prompt_tokens: u32,
     include_usage: bool,
     cancel_guard: crate::CancelGuard,
-    cpu: Option<std::sync::Arc<rustllama_engine::CpuEngine>>,
+    cpu: Option<std::sync::Arc<rustllama_engine::ContiguousEngine>>,
     max_tokens: u32,
     fingerprint: String,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
@@ -1464,7 +1464,7 @@ fn build_sse_stream_with_tools(
         // 6 here on top of the default "stop" — but never over `ask_user`,
         // which is a clean, user-actionable terminus.
         // Stats are read generically off the gate handle's engine so the
-        // paged engine's stats surface too; for `CpuEngine` the snapshot is
+        // paged engine's stats surface too; for `ContiguousEngine` the snapshot is
         // `Some(last_request_stats())` — byte-identical to the prior path.
         let stats = permit.engine.last_request_stats_snapshot();
         if !ask_user_seen && stats.as_ref().map(|s| s.tool_call_limit_hit).unwrap_or(false) {
@@ -2658,7 +2658,7 @@ fn unix_ts() -> u64 {
 /// one of the inputs to `system_fingerprint`. Matches the
 /// `/v1/metrics` `kv_dtype` field so consecutive responses + the
 /// metrics endpoint agree on the same string.
-fn kv_dtype_label(cpu: &rustllama_engine::CpuEngine) -> &'static str {
+fn kv_dtype_label(cpu: &rustllama_engine::ContiguousEngine) -> &'static str {
     match cpu.kv_dtype() {
         rustllama_engine::KvDtype::F32 => "f32",
         rustllama_engine::KvDtype::F16 => "f16",
@@ -2926,7 +2926,7 @@ async fn chat_blocking(state: AppState, req: ChatRequest, sched: ReqSchedule) ->
 fn make_token_logprob_out(
     chosen_text: &str,
     lp: &rustllama_engine::TokenLogprobs,
-    cpu: Option<&rustllama_engine::CpuEngine>,
+    cpu: Option<&rustllama_engine::ContiguousEngine>,
 ) -> TokenLogprobOut {
     let top: Vec<TopLogprobOut> = lp
         .top
@@ -3026,7 +3026,7 @@ async fn chat_stream(state: AppState, req: ChatRequest, sched: ReqSchedule) -> R
     // P14-http: thread the parsed priority + deadline into the paged driver.
     // The request's cancel flag rides along so a deadline also trips the
     // cancel-watch loop below (the driver additionally sends a
-    // `DeadlineExceeded` stream terminal). On the CpuEngine the opts are a
+    // `DeadlineExceeded` stream terminal). On the ContiguousEngine the opts are a
     // no-op (`chat_scheduled` defaults to `chat`) — byte-identical.
     let submit_opts = sched.to_submit_opts(Some(cancel_guard.flag.clone()));
     let tok_stream = match handle.engine.chat_scheduled(&msgs, &sampling, submit_opts) {
@@ -3068,7 +3068,7 @@ fn build_sse_stream(
     model: String,
     mut tok_stream: rustllama_engine::TokenStream,
     permit: crate::PermitGuard,
-    cpu: Option<std::sync::Arc<rustllama_engine::CpuEngine>>,
+    cpu: Option<std::sync::Arc<rustllama_engine::ContiguousEngine>>,
     prompt_tokens: u32,
     include_usage: bool,
     diff_mode: bool,
@@ -3310,7 +3310,7 @@ fn append_json_escaped(buf: &mut String, s: &str) {
 fn token_logprob_chunk_json(
     chosen_text: &str,
     lp: &rustllama_engine::TokenLogprobs,
-    cpu: Option<&rustllama_engine::CpuEngine>,
+    cpu: Option<&rustllama_engine::ContiguousEngine>,
 ) -> Value {
     let top: Vec<Value> = lp
         .top

@@ -10,7 +10,7 @@
 //! GENERICALLY via the `Engine` trait (`tokenizer_arc()` / `max_ctx()`), and
 //! generation already ran through the generic `handle.engine.generate(...)`.
 //! The paged engine's per-slot `build_paged_grammar` carries the tool-call
-//! grammar exactly like the `CpuEngine`, so nothing downstream had to change.
+//! grammar exactly like the `ContiguousEngine`, so nothing downstream had to change.
 //!
 //! What is validatable HERE (no GPU / real tokenizer needed):
 //!   - A tools request against a PAGED model is NOT rejected by the removed

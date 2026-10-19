@@ -96,7 +96,7 @@ async fn metrics_endpoint_returns_expected_shape() {
         rustllama_server::DEFAULT_MAX_PENDING_PER_MODEL
     );
     // No request has run yet so the `last_*` fields are absent (None
-    // — the engine has no CpuEngine attached in this mock setup).
+    // — the engine has no ContiguousEngine attached in this mock setup).
     assert!(v["last_tok_s"].is_null());
     assert!(v["last_prefill_ms"].is_null());
     assert!(v["last_decode_ms"].is_null());
@@ -106,7 +106,7 @@ async fn metrics_endpoint_returns_expected_shape() {
     assert!(v["uptime_s"].is_u64());
     // Concurrency: at least 1, even on the mock-engine path.
     assert!(v["concurrency"].as_u64().unwrap_or(0) >= 1);
-    // kv_dtype: mock engines have no CpuEngine attached so this is
+    // kv_dtype: mock engines have no ContiguousEngine attached so this is
     // null. Pinning that here so the GUI's "—" fallback is exercised.
     assert!(v["kv_dtype"].is_null());
     // Memory fields: present and nonzero (sysinfo on any reasonable
@@ -140,7 +140,7 @@ async fn metrics_endpoint_returns_expected_shape() {
 async fn metrics_endpoint_surfaces_cumulative_stats_when_engine_tracks_them() {
     // Engine impl that opts in to cumulative tracking by returning
     // a hand-crafted snapshot — exercises the JSON-serialization
-    // path without needing a real CpuEngine.
+    // path without needing a real ContiguousEngine.
     struct CumulativeMock;
     impl Engine for CumulativeMock {
         fn metrics(&self) -> Metrics {
@@ -226,7 +226,7 @@ async fn metrics_endpoint_surfaces_cumulative_stats_when_engine_tracks_them() {
 }
 
 /// When the engine reports nonzero paged_* values (a `PagedBatchEngine`
-/// or a `CpuEngine` with `kv_cache_layout = "paged"`), the
+/// or a `ContiguousEngine` with `kv_cache_layout = "paged"`), the
 /// /v1/metrics JSON surfaces them unchanged — the conversion in
 /// the handler is a verbatim pass-through.
 #[tokio::test]

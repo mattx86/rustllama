@@ -55,7 +55,7 @@ rustllama-tuner = { path = "../rustllama-tuner" }
 # npu-* backend + NPU hardware are present → usable_npus() empty).
 rustllama-npu = { path = "../rustllama-npu" }
 # A-3: AWQ / GPTQ safetensors load path. Used by
-# `CpuEngine::load_safetensors` to read HF-format checkpoints; the
+# `ContiguousEngine::load_safetensors` to read HF-format checkpoints; the
 # auto-dispatcher routes here on `.safetensors` paths.
 rustllama-safetensors = { path = "../rustllama-safetensors" }
 # SYCL kernel layer — real-only, always compiled, so building this crate

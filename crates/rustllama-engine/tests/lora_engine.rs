@@ -1,4 +1,4 @@
-//! P11 Phase 2/3 — engine-side resident multi-LoRA (CpuEngine).
+//! P11 Phase 2/3 — engine-side resident multi-LoRA (ContiguousEngine).
 //!
 //! Anchors:
 //!   - attaching an adapter but NOT selecting it is byte-identical to an engine
@@ -6,7 +6,7 @@
 //!   - selecting a resident adapter per request changes the output;
 //!   - an unknown adapter name fails the request (never a silent base serve).
 
-use rustllama_engine::{CpuEngine, SamplingParams};
+use rustllama_engine::{ContiguousEngine, SamplingParams};
 use rustllama_gguf::synth::{
     write_synthetic_llama_gguf, write_synthetic_lora_adapter_gguf, SynthLlama, SynthLoraAdapter,
 };
@@ -58,7 +58,7 @@ fn cpu_engine_resident_lora_per_request_selection() {
     write_adapter(&ad_a, 0xA11CE);
     write_adapter(&ad_b, 0xB0B);
 
-    let engine = CpuEngine::load(&base, 32).expect("load engine");
+    let engine = ContiguousEngine::load(&base, 32).expect("load engine");
     assert_eq!(engine.lora_adapter_names().len(), 0);
     assert!(
         engine
@@ -84,7 +84,7 @@ fn cpu_engine_resident_lora_per_request_selection() {
     let base_out = engine
         .generate_token_ids(&prompt, 6, &greedy(6, None))
         .expect("base gen");
-    let engine_plain = CpuEngine::load(&base, 32).expect("load plain");
+    let engine_plain = ContiguousEngine::load(&base, 32).expect("load plain");
     let plain_out = engine_plain
         .generate_token_ids(&prompt, 6, &greedy(6, None))
         .expect("plain gen");

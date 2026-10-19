@@ -1,7 +1,7 @@
-//! Integration: load tokenizer + CpuEngine from synthetic GGUF; exercise
+//! Integration: load tokenizer + ContiguousEngine from synthetic GGUF; exercise
 //! chat-template rendering through the engine's stack.
 
-use rustllama_engine::CpuEngine;
+use rustllama_engine::ContiguousEngine;
 use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama, SynthTokenizer};
 use rustllama_gguf::Gguf;
 use rustllama_tokenizer::{ChatMessage, Tokenizer};
@@ -58,7 +58,7 @@ fn cpu_engine_loads_with_tokenizer() {
     let path = synth_path("engine");
     write_synthetic_llama_gguf(&path, &SynthLlama::default());
 
-    let engine = CpuEngine::load_with_tokenizer(&path, 16).expect("load engine");
+    let engine = ContiguousEngine::load_with_tokenizer(&path, 16).expect("load engine");
     assert!(engine.tokenizer().is_some());
     assert_eq!(engine.vocab_size(), 32);
     assert_eq!(engine.model_id(), "rustllama-tok-engine");
@@ -169,7 +169,7 @@ fn engine_chat_stream_interleaved_prefill_is_deterministic() {
         .expect("rt");
     let load_path = path.clone();
     runtime.block_on(async move {
-        let engine = CpuEngine::load_with_tokenizer(&load_path, 16).expect("load engine");
+        let engine = ContiguousEngine::load_with_tokenizer(&load_path, 16).expect("load engine");
         let sampling = SamplingParams {
             temperature: 0.0,
             top_p: 0.0,
@@ -243,7 +243,7 @@ fn engine_chat_stream_does_not_panic() {
 
     let load_path = path.clone();
     runtime.block_on(async move {
-        let engine = CpuEngine::load_with_tokenizer(&load_path, 16).expect("load engine");
+        let engine = ContiguousEngine::load_with_tokenizer(&load_path, 16).expect("load engine");
         let sampling = SamplingParams {
             temperature: 0.0,
             top_p: 0.0,

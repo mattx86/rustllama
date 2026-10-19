@@ -14,19 +14,19 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use rustllama_engine::{CpuEngine, Engine, SamplingParams};
+use rustllama_engine::{ContiguousEngine, Engine, SamplingParams};
 use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
 
-fn build_engine_pair(tag: &str) -> (CpuEngine, Arc<dyn Engine>, std::path::PathBuf) {
+fn build_engine_pair(tag: &str) -> (ContiguousEngine, Arc<dyn Engine>, std::path::PathBuf) {
     let tmp = std::env::temp_dir().join(format!("rustllama-speculate-{tag}.gguf"));
     write_synthetic_llama_gguf(&tmp, &SynthLlama::default());
     // Both load the same GGUF; treat one as draft and one as target.
     // Real spec-decode pairs a small draft with a big target — here
     // they're the same model, which is the "all accept" degenerate
     // case the scaffold is calibrated for.
-    let target = CpuEngine::load_with_tokenizer(&tmp, 64).expect("load target");
+    let target = ContiguousEngine::load_with_tokenizer(&tmp, 64).expect("load target");
     let draft: Arc<dyn Engine> =
-        Arc::new(CpuEngine::load_with_tokenizer(&tmp, 64).expect("load draft"));
+        Arc::new(ContiguousEngine::load_with_tokenizer(&tmp, 64).expect("load draft"));
     (target, draft, tmp)
 }
 
@@ -149,7 +149,7 @@ fn verify_speculation_returns_kplus1_softmax_distributions() {
     // `verify_speculation` mid-conversation is safe.
     let tmp = std::env::temp_dir().join("rustllama-verify-spec.gguf");
     write_synthetic_llama_gguf(&tmp, &SynthLlama::default());
-    let engine = CpuEngine::load_with_tokenizer(&tmp, 64).expect("load engine");
+    let engine = ContiguousEngine::load_with_tokenizer(&tmp, 64).expect("load engine");
     let vocab = engine.vocab_size();
 
     // Use a fixed prompt + a couple of arbitrary candidate token ids
@@ -192,7 +192,7 @@ fn verify_speculation_does_not_mutate_engine_state() {
     // restored).
     let tmp = std::env::temp_dir().join("rustllama-verify-purity.gguf");
     write_synthetic_llama_gguf(&tmp, &SynthLlama::default());
-    let engine = CpuEngine::load_with_tokenizer(&tmp, 64).expect("load");
+    let engine = ContiguousEngine::load_with_tokenizer(&tmp, 64).expect("load");
 
     let sampling = SamplingParams {
         temperature: 0.0,

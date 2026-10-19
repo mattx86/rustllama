@@ -1,5 +1,5 @@
 //! X1+D5: one place that applies the autotuned speculative-decoding +
-//! CacheBlend winners to a loaded [`CpuEngine`].
+//! CacheBlend winners to a loaded [`ContiguousEngine`].
 //!
 //! Before this, the `serve` CLI load path and the HTTP model-load path each
 //! applied these winners with their own hand-rolled `cpu.set_*` calls — and
@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use crate::speculative::{LookaheadDrafterConfig, NgramDrafterConfig};
-use crate::{CpuEngine, Engine};
+use crate::{ContiguousEngine, Engine};
 
 /// The resolved autotuner (+ config) winners that get pushed onto a freshly
 /// loaded engine. Every field is the final value to apply — `None` / `false`
@@ -49,7 +49,7 @@ pub struct TunerWinners {
 impl TunerWinners {
     /// Push every resolved winner onto `cpu`. The ONE place the speculative /
     /// CacheBlend `set_*` toggles are called from — the anchor for X1+D5.
-    pub fn apply_to(&self, cpu: &mut CpuEngine) {
+    pub fn apply_to(&self, cpu: &mut ContiguousEngine) {
         if let Some((engine, k)) = &self.draft {
             cpu.set_draft_speculative(Some((engine.clone(), *k)));
         }

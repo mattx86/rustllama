@@ -1,7 +1,7 @@
 //! Integration tests for the Ollama-compatible HTTP surface.
 //!
 //! Uses `MockEngine` for the request/response shape checks. Endpoints
-//! that require a real CpuEngine (`/api/show` needs the GGUF config,
+//! that require a real ContiguousEngine (`/api/show` needs the GGUF config,
 //! `/api/pull` / `/api/delete` touch the cache directory) are covered
 //! at the smoke level + the cancel test suite exercises the streaming
 //! `/api/chat` and `/api/generate` paths.
@@ -189,16 +189,16 @@ async fn chat_unknown_model_returns_404() {
 #[tokio::test]
 async fn show_requires_real_engine_returns_503_on_mock() {
     // `/api/show` needs the GGUF config (architecture, hyperparams, …)
-    // which only `CpuEngine` exposes. The mock harness here doesn't
+    // which only `ContiguousEngine` exposes. The mock harness here doesn't
     // load a real engine, so the endpoint correctly degrades to 503.
     let (status, body) =
         post_text("/api/show", serde_json::json!({"model": "rustllama-mock"})).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
 }
 
-// ----- /api/show against a real CpuEngine -----------------------------------
+// ----- /api/show against a real ContiguousEngine -----------------------------------
 //
-// Loads a synthetic Llama GGUF into a real [`CpuEngine`] and posts to
+// Loads a synthetic Llama GGUF into a real [`ContiguousEngine`] and posts to
 // `/api/show`. Verifies every documented response field that editors
 // (Continue.dev, Cline, Cursor, Open WebUI) probe when they call this
 // endpoint to learn a model's architecture / chat template / parameter
@@ -206,14 +206,14 @@ async fn show_requires_real_engine_returns_503_on_mock() {
 // branch; this one asserts the positive shape.
 
 fn build_state_with_real_cpu_engine(tag: &str) -> (rustllama_server::AppState, std::path::PathBuf) {
-    use rustllama_engine::CpuEngine;
+    use rustllama_engine::ContiguousEngine;
     use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
 
     let tmp = std::env::temp_dir().join(format!("rustllama-ollama-show-{tag}.gguf"));
     write_synthetic_llama_gguf(&tmp, &SynthLlama::default());
     // `/api/show` surfaces the chat template embedded in the GGUF, so
     // load with a tokenizer (the bare `load` constructor skips it).
-    let cpu = CpuEngine::load_with_tokenizer(&tmp, 16).expect("load cpu engine");
+    let cpu = ContiguousEngine::load_with_tokenizer(&tmp, 16).expect("load cpu engine");
     let model_id = cpu.model_id().to_string();
     let cpu = Arc::new(cpu);
     let serving = ServingModel {
@@ -451,7 +451,7 @@ async fn ps_with_mock_engine_skips_models_without_real_cpu_engine() {
     // Mock-only entry has no cpu_engine, so it gets skipped.
     assert!(
         models.is_empty(),
-        "/api/ps must skip mock entries without a CpuEngine: {body}"
+        "/api/ps must skip mock entries without a ContiguousEngine: {body}"
     );
 }
 
@@ -541,7 +541,7 @@ async fn show_parameters_block_carries_num_ctx_and_stop() {
     let _ = std::fs::remove_file(&tmp);
 }
 
-/// Build state with a real CpuEngine loaded from a MoE synthetic
+/// Build state with a real ContiguousEngine loaded from a MoE synthetic
 /// GGUF. Same shape as `build_state_with_real_cpu_engine` — the only
 /// difference is the GGUF carries MoE expert metadata + tensors.
 fn build_state_with_moe_cpu_engine(
@@ -550,7 +550,7 @@ fn build_state_with_moe_cpu_engine(
     n_experts_used: u32,
     n_experts_shared: u32,
 ) -> (rustllama_server::AppState, std::path::PathBuf) {
-    use rustllama_engine::CpuEngine;
+    use rustllama_engine::ContiguousEngine;
     use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama, SynthMoe};
 
     let tmp = std::env::temp_dir().join(format!("rustllama-ollama-show-moe-{tag}.gguf"));
@@ -565,7 +565,7 @@ fn build_state_with_moe_cpu_engine(
             ..SynthLlama::default()
         },
     );
-    let cpu = CpuEngine::load_with_tokenizer(&tmp, 16).expect("load moe cpu engine");
+    let cpu = ContiguousEngine::load_with_tokenizer(&tmp, 16).expect("load moe cpu engine");
     let model_id = cpu.model_id().to_string();
     let cpu = Arc::new(cpu);
     let serving = ServingModel {

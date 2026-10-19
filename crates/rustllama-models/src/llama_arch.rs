@@ -5649,7 +5649,7 @@ pub fn rope_tables_from_cfg(cfg: &LlamaConfig) -> (Vec<f32>, f32) {
 
 impl LlamaModel {
     /// F9-tail — build a minimal transformer SHELL (`cfg` + EMPTY weights) for
-    /// a CANONICAL Mamba/SSM model, so a `CpuEngine` can carry it in its
+    /// a CANONICAL Mamba/SSM model, so a `ContiguousEngine` can carry it in its
     /// `LlamaModel` slot while dispatching the actual forward to the
     /// selective-scan [`crate::mamba_arch::MambaModel`]. The cfg mirrors the
     /// SSM dims the engine's transformer-shaped accessors read (vocab /
@@ -17554,7 +17554,7 @@ impl crate::Model for LlamaModel {
     ) -> crate::Result<()> {
         // The trait was the phase-0 placeholder shape; the real call surface
         // is `LlamaModel::forward_one` / `forward_prefill` above. We'll widen
-        // the trait in a follow-up once `CpuEngine` is wired.
+        // the trait in a follow-up once `ContiguousEngine` is wired.
         Ok(())
     }
 }

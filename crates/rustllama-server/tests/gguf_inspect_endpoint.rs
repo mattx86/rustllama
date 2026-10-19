@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
-use rustllama_engine::CpuEngine;
+use rustllama_engine::ContiguousEngine;
 use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama, SynthMoe};
 use rustllama_server::{router, AppState, ServingModel};
 use tower::ServiceExt;
@@ -25,7 +25,7 @@ use tower::ServiceExt;
 fn build_state(tag: &str) -> (AppState, std::path::PathBuf) {
     let tmp = std::env::temp_dir().join(format!("rustllama-inspect-{tag}.gguf"));
     write_synthetic_llama_gguf(&tmp, &SynthLlama::default());
-    let cpu = CpuEngine::load_with_tokenizer(&tmp, 64).expect("load engine");
+    let cpu = ContiguousEngine::load_with_tokenizer(&tmp, 64).expect("load engine");
     let cpu = Arc::new(cpu);
     let serving = ServingModel {
         engine: cpu.clone() as Arc<dyn rustllama_engine::Engine>,

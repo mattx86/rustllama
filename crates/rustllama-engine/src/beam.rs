@@ -18,7 +18,7 @@
 //! This module holds the *pure* beam bookkeeping — candidate construction,
 //! the HuggingFace-faithful selection rule, length-penalty scoring, and the
 //! finished-hypothesis pool. The engine driver
-//! ([`crate::inference::CpuEngine::generate_beam_token_ids`]) owns the KV
+//! ([`crate::inference::ContiguousEngine::generate_beam_token_ids`]) owns the KV
 //! fork/restore + forward passes and calls into these functions. Keeping the
 //! logic pure makes the ranking hand-verifiable in unit tests without a model.
 

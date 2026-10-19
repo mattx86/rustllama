@@ -178,7 +178,7 @@ async fn list_models_surfaces_moe_block_for_loaded_moe_model() {
     let body_str = String::from_utf8_lossy(&bytes);
     let v: serde_json::Value = serde_json::from_str(&body_str).expect("json");
     let data = v["data"].as_array().expect("data array");
-    // The CpuEngine resolves the model id from the GGUF filename
+    // The ContiguousEngine resolves the model id from the GGUF filename
     // stem, not the request's `model_id` field, so look up by
     // "has a moe block" rather than by id.
     let moe_entry = data

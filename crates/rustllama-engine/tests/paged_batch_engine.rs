@@ -10,7 +10,7 @@
 
 use rustllama_engine::batch_scheduler::Priority;
 use rustllama_engine::paged_batch::PagedBatchEngine;
-use rustllama_engine::{BeamParams, CpuEngine, EngineError, SamplingParams, SubmitOpts};
+use rustllama_engine::{BeamParams, ContiguousEngine, EngineError, SamplingParams, SubmitOpts};
 use rustllama_gguf::synth::{
     write_synthetic_llama_gguf, write_synthetic_lora_adapter_gguf, SynthHybrid, SynthLlama,
     SynthLoraAdapter, SynthMoe,
@@ -36,7 +36,7 @@ fn greedy(n: u32) -> SamplingParams {
     }
 }
 
-/// M=1 fused decode matches single-slot `CpuEngine` decode. Proves
+/// M=1 fused decode matches single-slot `ContiguousEngine` decode. Proves
 /// the engine wrapper isn't introducing spurious differences vs the
 /// existing single-flight code path. Greedy sampling, same prompt,
 /// same max_tokens — expects bit-identical token sequence.
@@ -45,8 +45,9 @@ fn paged_batch_single_slot_matches_cpu_engine_greedy() {
     use rustllama_models::llama_arch::KvDtype;
     let tmp = write_gguf("m1-vs-cpu");
 
-    let mut cpu = CpuEngine::load_with_options_and_layout(&tmp, 32, true, KvDtype::F32, "paged")
-        .expect("cpu engine load");
+    let mut cpu =
+        ContiguousEngine::load_with_options_and_layout(&tmp, 32, true, KvDtype::F32, "paged")
+            .expect("cpu engine load");
     cpu.set_prefix_cache(false);
 
     let batch = PagedBatchEngine::load(&tmp, 32, 1).expect("batch engine load");
@@ -64,7 +65,7 @@ fn paged_batch_single_slot_matches_cpu_engine_greedy() {
     let cpu_out_i32: Vec<i32> = cpu_out.iter().map(|&t| t as i32).collect();
     assert_eq!(
         cpu_out_i32, batch_out,
-        "paged_batch M=1 diverged from paged CpuEngine: cpu={cpu_out_i32:?} batch={batch_out:?}"
+        "paged_batch M=1 diverged from paged ContiguousEngine: cpu={cpu_out_i32:?} batch={batch_out:?}"
     );
     let _ = std::fs::remove_file(&tmp);
 }
@@ -461,7 +462,7 @@ async fn paged_batch_engine_drop_shuts_driver_thread_down() {
 
 /// PagedBatchEngine satisfies the `Engine` trait — can be held
 /// as `Arc<dyn Engine>` and exercised through `tokenize` /
-/// `generate` / `chat` exactly like `CpuEngine`. This is the
+/// `generate` / `chat` exactly like `ContiguousEngine`. This is the
 /// prerequisite for the server's `ServingModel` to route to it
 /// in 3.7g without any handler-side changes.
 ///
@@ -746,7 +747,7 @@ fn paged_batch_rejects_batch_exceeding_max_slots() {
 }
 
 /// P9 feature parity — GRAMMAR. A `PagedBatchEngine` run with a grammar must
-/// produce the SAME tokens as the contiguous (paged-layout) `CpuEngine` with
+/// produce the SAME tokens as the contiguous (paged-layout) `ContiguousEngine` with
 /// the same grammar — proving the paged driver applies the grammar mask
 /// identically (`sample_with_grammar` + `advance`), not silently dropping it.
 ///
@@ -769,8 +770,9 @@ fn paged_batch_grammar_matches_cpu_engine() {
     let prompt: Vec<i32> = vec![5, 1, 4, 2, 3, 6];
 
     // Contiguous reference on the SAME paged KV layout the engines share.
-    let mut cpu = CpuEngine::load_with_options_and_layout(&tmp, 32, true, KvDtype::F32, "paged")
-        .expect("cpu engine load");
+    let mut cpu =
+        ContiguousEngine::load_with_options_and_layout(&tmp, 32, true, KvDtype::F32, "paged")
+            .expect("cpu engine load");
     cpu.set_prefix_cache(false);
     let cpu_plain: Vec<i32> = cpu
         .generate_token_ids(&prompt, 4, &greedy(4))
@@ -808,7 +810,7 @@ fn paged_batch_grammar_matches_cpu_engine() {
 /// P9 feature parity — STRING STOPS. A `PagedBatchEngine` request whose
 /// `sampling.stop` contains the decoded text of the first emitted token must
 /// stop right after that token (the stop-completing token is still emitted,
-/// then the slot ends) — identical semantics to `CpuEngine::drive_generation`.
+/// then the slot ends) — identical semantics to `ContiguousEngine::drive_generation`.
 #[test]
 fn paged_batch_string_stop_terminates_generation() {
     let tmp = write_gguf("string-stop");
@@ -1080,7 +1082,7 @@ async fn paged_batch_preempted_request_resumes_byte_identical() {
 //
 // These anchors pin the F8 contract: a HYBRID (attention + DeltaNet/SSM)
 // model served through the PAGED continuous-batching engine produces the
-// SAME tokens as the CONTIGUOUS `CpuEngine`, and two concurrent hybrid slots
+// SAME tokens as the CONTIGUOUS `ContiguousEngine`, and two concurrent hybrid slots
 // keep their recurrent state independent. The synthetic hybrid GGUF is a
 // dense (non-MoE) qwen35moe-shaped toy: `full_attention_interval = 2` →
 // layers 1,3 are full-attention, layers 0,2 are DeltaNet/SSM; the writer
@@ -1118,7 +1120,7 @@ fn write_hybrid_gguf(tag: &str) -> std::path::PathBuf {
 }
 
 /// F8 anchor #1: a single paged-hybrid slot decodes BIT-IDENTICALLY to the
-/// contiguous `CpuEngine` on the same prompt + greedy decode. The paged slot
+/// contiguous `ContiguousEngine` on the same prompt + greedy decode. The paged slot
 /// carries its own contiguous KV + DeltaNet state and runs the SAME
 /// `forward_one_hybrid` the contiguous engine uses, so the token streams must
 /// match exactly. D1a having been relaxed is implicit in the load succeeding.
@@ -1128,7 +1130,7 @@ fn paged_hybrid_single_slot_matches_cpu_engine_greedy() {
     let tmp = write_hybrid_gguf("m1-vs-cpu");
 
     let mut cpu =
-        CpuEngine::load_with_options_and_layout(&tmp, 64, true, KvDtype::F32, "contiguous")
+        ContiguousEngine::load_with_options_and_layout(&tmp, 64, true, KvDtype::F32, "contiguous")
             .expect("cpu engine load (hybrid)");
     cpu.set_prefix_cache(false);
 
@@ -1147,7 +1149,7 @@ fn paged_hybrid_single_slot_matches_cpu_engine_greedy() {
     let cpu_i32: Vec<i32> = cpu_out.iter().map(|&t| t as i32).collect();
     assert_eq!(
         cpu_i32, batch_out,
-        "paged hybrid diverged from contiguous CpuEngine: cpu={cpu_i32:?} paged={batch_out:?}"
+        "paged hybrid diverged from contiguous ContiguousEngine: cpu={cpu_i32:?} paged={batch_out:?}"
     );
     let _ = std::fs::remove_file(&tmp);
 }

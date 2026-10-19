@@ -50,7 +50,7 @@
 //!   - `usage` extension fields (`prefill_ms`, `decode_ms`,
 //!     `cache_hit_tokens`, `tokens_prefilled`): surfaced on both the
 //!     non-stream response and the `message_delta` streaming event
-//!     when a `CpuEngine` is loaded. Marked `skip_serializing_if`
+//!     when a `ContiguousEngine` is loaded. Marked `skip_serializing_if`
 //!     so they stay absent under MockEngine and don't break strict
 //!     SDK consumers that haven't seen them before.
 
@@ -1055,7 +1055,7 @@ fn build_anthropic_sse(
         // Fetch the request stats ONCE so the limit-hit decision and
         // the usage extension fields both read a consistent snapshot.
         // Sourced generically off the gate handle's engine so the paged
-        // engine's stats surface too; for `CpuEngine` the snapshot is
+        // engine's stats surface too; for `ContiguousEngine` the snapshot is
         // `Some(last_request_stats())` — byte-identical to before.
         let stats = permit.engine.last_request_stats_snapshot();
         let tool_call_limit_hit = stats
@@ -1076,7 +1076,7 @@ fn build_anthropic_sse(
             .map(Value::String)
             .unwrap_or(Value::Null);
         // Build the usage payload, optionally extended with the
-        // rustllama performance metrics when a CpuEngine is present.
+        // rustllama performance metrics when a ContiguousEngine is present.
         // Anthropic-strict SDKs see the extension fields as unknowns
         // and tolerate them; tests in `tests/anthropic_messages.rs`
         // pin both shapes.

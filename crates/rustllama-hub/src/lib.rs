@@ -325,7 +325,7 @@ pub fn resolve_model_spec(spec: &str, cache_dir: &Path) -> Option<PathBuf> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedModel {
     /// Absolute path — a `.gguf` file, or an MLX model directory (the thing
-    /// `CpuEngine::load_auto` is handed).
+    /// `ContiguousEngine::load_auto` is handed).
     pub path: PathBuf,
     /// Resolvable identity: the GGUF's file stem, or the MLX dir's file name.
     pub name: String,

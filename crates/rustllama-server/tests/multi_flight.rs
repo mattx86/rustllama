@@ -107,7 +107,7 @@ fn slow_stream(w: OverlapWitness) -> TokenStream {
 
 /// Synthesize a ServingModel with `concurrency` mock engines in the
 /// multi-flight pool. We can't use the production `with_concurrency`
-/// path because it requires a real CpuEngine to call
+/// path because it requires a real ContiguousEngine to call
 /// `fork_for_concurrent_use`. Instead, we build the pool by hand
 /// with N distinct `SlowEngine` instances sharing the same witness
 /// — proving the round-robin path picks each pool entry.
@@ -122,7 +122,7 @@ fn build_state(concurrency: usize) -> (AppState, OverlapWitness) {
         .collect();
     let pool = MultiFlightPool {
         engines: engines.clone(),
-        cpu_engines: Vec::new(), // mock path — no CpuEngine forks
+        cpu_engines: Vec::new(), // mock path — no ContiguousEngine forks
         next: Arc::new(AtomicUsize::new(0)),
     };
     let serving = ServingModel {

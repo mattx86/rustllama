@@ -443,7 +443,7 @@ fn load_tensor_f32(gguf: &Gguf, name: &str) -> Result<Vec<f32>, MambaError> {
         // decoders (the same routines `rustllama-tensor`'s dense load
         // path uses), so quantized Mamba GGUFs (Q4_K / Q8_0 / …) can
         // load through the library loader instead of being rejected.
-        // NOTE: this only unblocks the LOADER — the CpuEngine
+        // NOTE: this only unblocks the LOADER — the ContiguousEngine
         // MambaEngine forward-pass wiring remains gated (out of scope),
         // so a quantized Mamba model loads but still can't inference yet.
         GgmlType::Q8_0 => rustllama_gguf::dequant::dequant_q8_0(bytes, &mut out),

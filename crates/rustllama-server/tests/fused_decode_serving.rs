@@ -54,7 +54,7 @@ fn fused_decode_serving_model_shape() {
     );
     assert!(
         serving.cpu_engine.is_none(),
-        "PagedBatchEngine is not a CpuEngine — cpu_engine stays None"
+        "PagedBatchEngine is not a ContiguousEngine — cpu_engine stays None"
     );
     // The Arc<dyn Engine> field points at the PagedBatchEngine.
     // Smoke-test via the trait method (already covered by the

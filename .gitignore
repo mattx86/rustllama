@@ -28,3 +28,6 @@ app/desktop/target
 
 # release artifacts (scripts/release-*.bat output)
 /release
+
+# transient build logs (scripts/_build*.bat redirected output)
+/build*.log

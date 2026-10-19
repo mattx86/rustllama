@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use rustllama_engine::{CpuEngine, SamplingParams};
+use rustllama_engine::{ContiguousEngine, SamplingParams};
 
 fn enabled() -> bool {
     std::env::var("RUSTLLAMA_RUN_GPU_TESTS").is_ok()
@@ -51,7 +51,7 @@ fn qwen_completes_capital_of_france_with_paris() {
         return;
     };
 
-    let engine = CpuEngine::load_with_tokenizer(&path, 256).expect("load engine");
+    let engine = ContiguousEngine::load_with_tokenizer(&path, 256).expect("load engine");
     let completion = engine
         .generate_text("The capital of France is", &greedy())
         .expect("generate");
@@ -74,7 +74,7 @@ fn tinyllama_completes_with_paris() {
         return;
     };
 
-    let engine = CpuEngine::load_with_tokenizer(&path, 256).expect("load engine");
+    let engine = ContiguousEngine::load_with_tokenizer(&path, 256).expect("load engine");
     let completion = engine
         .generate_text("The capital of France is", &greedy())
         .expect("generate");
@@ -100,7 +100,7 @@ fn prefix_cache_does_not_change_output() {
         return;
     };
 
-    let engine = CpuEngine::load_with_tokenizer(&path, 512).expect("load engine");
+    let engine = ContiguousEngine::load_with_tokenizer(&path, 512).expect("load engine");
     assert!(engine.prefix_cache_enabled(), "default should be on");
 
     let prompt = "The capital of France is";
@@ -129,8 +129,8 @@ fn prefix_cache_extended_prompt_matches_fresh_run() {
         return;
     };
 
-    let cached = CpuEngine::load_with_tokenizer(&path, 512).expect("load");
-    let fresh = CpuEngine::load_with_tokenizer(&path, 512).expect("load");
+    let cached = ContiguousEngine::load_with_tokenizer(&path, 512).expect("load");
+    let fresh = ContiguousEngine::load_with_tokenizer(&path, 512).expect("load");
 
     let prompt_a = "The capital of France is";
     let prompt_ab = "The capital of France is Paris. The capital of Germany is";
@@ -163,7 +163,7 @@ fn qwen_completes_simple_math() {
         return;
     };
 
-    let engine = CpuEngine::load_with_tokenizer(&path, 256).expect("load engine");
+    let engine = ContiguousEngine::load_with_tokenizer(&path, 256).expect("load engine");
     let completion = engine
         .generate_text(
             "1 + 1 = ",
@@ -210,7 +210,7 @@ fn same_seed_produces_identical_output() {
         eprintln!("skipped");
         return;
     };
-    let engine = CpuEngine::load_with_tokenizer(&path, 512).expect("load");
+    let engine = ContiguousEngine::load_with_tokenizer(&path, 512).expect("load");
     let prompt = "Once upon a time, in a faraway land,";
 
     let a = engine.generate_text(prompt, &sampled(42)).expect("gen a");
@@ -232,7 +232,7 @@ fn different_seeds_produce_different_output() {
         eprintln!("skipped");
         return;
     };
-    let engine = CpuEngine::load_with_tokenizer(&path, 512).expect("load");
+    let engine = ContiguousEngine::load_with_tokenizer(&path, 512).expect("load");
     let prompt = "Once upon a time, in a faraway land,";
 
     let a = engine.generate_text(prompt, &sampled(42)).expect("gen a");
@@ -269,7 +269,7 @@ fn streaming_chat_aborts_when_receiver_dropped() {
         return;
     };
 
-    let engine = CpuEngine::load_with_tokenizer(&path, 512).expect("load");
+    let engine = ContiguousEngine::load_with_tokenizer(&path, 512).expect("load");
     let prompt = "Count slowly:";
     let sampling = SamplingParams {
         max_tokens: 200,
@@ -337,7 +337,7 @@ fn same_seed_streaming_matches_blocking() {
         eprintln!("skipped");
         return;
     };
-    let engine = CpuEngine::load_with_tokenizer(&path, 512).expect("load");
+    let engine = ContiguousEngine::load_with_tokenizer(&path, 512).expect("load");
     let prompt = "Once upon a time, in a faraway land,";
 
     // Blocking variant uses generate_token_ids; the streaming Engine impl

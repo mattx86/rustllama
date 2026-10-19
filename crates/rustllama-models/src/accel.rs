@@ -2339,7 +2339,7 @@ pub fn set_moe_expert_cache_max_bytes(bytes: u64) {
 // T3: typed load-option knobs (replace the config→env `set_var` bridges).
 //
 // Each cell initializes ONCE from its legacy `RUSTLLAMA_*` env var — so a
-// bare `LlamaModel::load`, a unit test, or `doctor` with no `CpuEngine`
+// bare `LlamaModel::load`, a unit test, or `doctor` with no `ContiguousEngine`
 // still honors a user-set env var (back-compat) — and is then OVERRIDDEN by
 // the engine's `LoadOptions::apply` at load from the typed, env-wins-resolved
 // config value (the ONE place precedence lives is the CLI load path). Reads

@@ -620,7 +620,7 @@ pub enum Command {
         cacheblend: bool,
         /// Continuous-batching A/B: measure SINGLE-STREAM (one request, no
         /// concurrency) prefill+decode tok/s on the continuous-batching
-        /// `PagedBatchEngine` vs the contiguous `CpuEngine`, and persist the
+        /// `PagedBatchEngine` vs the contiguous `ContiguousEngine`, and persist the
         /// faster-for-single-stream engine under `batching_engine`. ADVISORY:
         /// the contiguous engine is the serve DEFAULT and the paged engine is
         /// opt-in via an explicit `[server].fused_decode = true`, so this A/B no
@@ -2340,7 +2340,7 @@ fn cmd_tune_moe_placement(
 /// var always wins (lets the tuner or a power user sweep a knob
 /// without rewriting config). Called by `serve` and `bench` before
 /// the engine loads — the accessors behind these vars cache on first
-/// read, so promotion must precede `CpuEngine::load*`.
+/// read, so promotion must precede `ContiguousEngine::load*`.
 /// Promote the compute-tier knobs (`disabled_cpus`, `cpu_enabled`,
 /// `gpu_enabled`, `vram_only`) into the env the runtime/engine/server read.
 /// The CPU
@@ -2511,7 +2511,7 @@ fn cmd_imatrix(
     max_tokens: u32,
     ctx_size: usize,
 ) -> anyhow::Result<()> {
-    use rustllama_engine::{imatrix_collect, CpuEngine, SamplingParams};
+    use rustllama_engine::{imatrix_collect, ContiguousEngine, SamplingParams};
     use rustllama_gguf::imatrix::Imatrix;
 
     // Disable the forward-pass fusions that COMBINE or BYPASS the base
@@ -2526,7 +2526,7 @@ fn cmd_imatrix(
     let ctx = ctx_size.max(1);
     let kv_dtype = parse_kv_dtype("f32")?;
     println!("imatrix: loading {model_path} (ctx {ctx})");
-    let mut cpu = CpuEngine::load_with_options_and_layout(
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
         std::path::Path::new(model_path),
         ctx,
         true, // with tokenizer (needed to tokenize the calibration text)
@@ -2760,7 +2760,7 @@ fn cmd_decision_calibrate(
     config_path: &std::path::Path,
     model: Option<String>,
 ) -> anyhow::Result<()> {
-    use rustllama_engine::CpuEngine;
+    use rustllama_engine::ContiguousEngine;
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
     let model_path: std::path::PathBuf = effective_model_path(model, &cfg, config_path)?;
@@ -2785,7 +2785,7 @@ fn cmd_decision_calibrate(
         model_path.display(),
         DECISION_CALIB_BUILTIN_ITEMS.len()
     );
-    let mut cpu = CpuEngine::load_with_options_and_layout(
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
         &model_path,
         2048,
         true,
@@ -2906,7 +2906,7 @@ fn cmd_kv_calibrate(
     output: Option<std::path::PathBuf>,
     ctx_size: usize,
 ) -> anyhow::Result<()> {
-    use rustllama_engine::{kv_bias, CpuEngine, SamplingParams};
+    use rustllama_engine::{kv_bias, ContiguousEngine, SamplingParams};
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
     let model_path = effective_model_path(
@@ -2952,7 +2952,7 @@ fn cmd_kv_calibrate(
         model_path.display(),
         prompt_texts.len()
     );
-    let mut cpu = CpuEngine::load_with_options_and_layout(
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
         &model_path,
         ctx,
         true,
@@ -3737,7 +3737,7 @@ async fn serve(
     profile: Option<&str>,
 ) -> anyhow::Result<()> {
     use rustllama_engine::paged_batch::PagedBatchEngine;
-    use rustllama_engine::{CpuEngine, Engine};
+    use rustllama_engine::{ContiguousEngine, Engine};
     use rustllama_server::{AppState, ServingModel};
     use std::net::SocketAddr;
 
@@ -3868,7 +3868,7 @@ async fn serve(
     // right shell dialect. Mirror `[server].tool_environment_hint` into
     // the server's process-global toggle (default true).
     rustllama_server::env_hint::set_tool_environment_hint_enabled(cfg.server.tool_environment_hint);
-    // Engine selection: the CONTIGUOUS `CpuEngine` is the DEFAULT; the paged
+    // Engine selection: the CONTIGUOUS `ContiguousEngine` is the DEFAULT; the paged
     // `PagedBatchEngine` (continuous batching) is OPT-IN via an explicit
     // `[server].fused_decode = true`. This reverses the old P9 default-on: the
     // paged path does not drive a GPU on the single-user decode path today (it
@@ -3908,7 +3908,7 @@ async fn serve(
     };
     // F6-A: fail-closed VLM guard (primary site). A vision/multimodal model is
     // served as a text-decoder GGUF + a separate `[model].mmproj` companion that
-    // only the contiguous `CpuEngine` knows how to `attach_mmproj`. The
+    // only the contiguous `ContiguousEngine` knows how to `attach_mmproj`. The
     // `PagedBatchEngine` has no image-embed row source yet (F6-B), so loading a
     // VLM there would silently drop every image → text-only output. The mmproj
     // companion is known HERE (not at `PagedBatchEngine::load`, which sees only
@@ -3916,7 +3916,7 @@ async fn serve(
     if use_fused_decode && cfg.model.mmproj.is_some() {
         tracing::warn!(
             "fused_decode requested but [model].mmproj (vision/VLM) is configured; \
-             falling back to the contiguous CpuEngine (continuous batching has no \
+             falling back to the contiguous ContiguousEngine (continuous batching has no \
              image-embed path yet). Unset [model].mmproj or disable fused_decode to \
              silence this."
         );
@@ -3943,7 +3943,7 @@ async fn serve(
     //     [`PagedBatchEngine`]. One shared paged KV pool + driver thread
     //     arbitrates fused multi-slot decode across up to `concurrency`
     //     HTTP requests.
-    //   - **CpuEngine + multi-flight** (the default; `fork_concurrency` > 1
+    //   - **ContiguousEngine + multi-flight** (the default; `fork_concurrency` > 1
     //     only on an explicit `fused_decode = false`, else single-flight):
     //     `fork_concurrency` independent forks via `with_concurrency`.
     // Startup model list. Explicit `--model` paths win over `[model].path`;
@@ -4018,7 +4018,7 @@ async fn serve(
                 "--lora / [model].lora ignored: LoRA merge is GGUF-only (this is a model directory)"
             );
         }
-        // P10b — the EAGLE head attaches on the contiguous-KV CpuEngine only.
+        // P10b — the EAGLE head attaches on the contiguous-KV ContiguousEngine only.
         // Warn (then skip) when the first model routes through the fused-decode
         // paged engine or is a model directory.
         if startup_eagle.is_some() && (use_fused_decode || path.is_dir()) {
@@ -4040,8 +4040,35 @@ async fn serve(
             })
             .await;
         }
+        // GPU-residency setup for BOTH engines (contiguous + paged). Must run
+        // BEFORE either engine's `LlamaModel::load` (it sets process env read at
+        // load): force `keep_quant_raw` on when a GPU is present so quantized
+        // tensors stay PACKED (the USM/CUDA pre-upload only covers `*Raw`
+        // tensors, and packed matvec is the fast GPU kernel). Without it, sub-L3
+        // tensors dequant to F16 — which has NO CUDA kind — and fall to the CPU
+        // ladder: that was the paged (fused-decode) engine's "GPU idle / CPU-
+        // bound ~15 tok/s" bug (the contiguous branch set this, the paged one
+        // never did). CPU-only serving keeps the config default (F16 is faster
+        // on CPU). `promote_memory_env_from_config` applies the typed
+        // `LoadOptions` (zerocopy / lock-ram / prefill-batched(_hybrid) /
+        // memory-budget / kv-persist / moe-* / ssm) to the accel cells for both.
+        {
+            let gpu_present = rustllama_kernels_sycl::device_count()
+                .map(|n| n > 0)
+                .unwrap_or(false)
+                || rustllama_kernels_cuda::device_count() > 0;
+            if cfg.inference.keep_quant_raw || gpu_present {
+                std::env::set_var("RUSTLLAMA_KEEP_QUANT_RAW", "1");
+                tracing::info!(
+                    gpu_present,
+                    "keep_quant_raw enabled: quantized tensors stay in raw GGUF form \
+                     (packed USM pre-upload + packed GPU matvec; skips F16 dequant)"
+                );
+            }
+            promote_memory_env_from_config(&cfg.inference, &cfg.tuning);
+        }
         let loaded_one: (ServingModel, String) = if use_fused_decode {
-            let max_ctx = cfg.inference.ctx_size as usize;
+            let max_ctx = resolve_config_ctx(cfg.inference.ctx_size, path) as usize;
             tracing::info!(
                 model = %path.display(),
                 max_ctx,
@@ -4073,35 +4100,11 @@ async fn serve(
             );
             (serving, model_id)
         } else {
-            let max_ctx = cfg.inference.ctx_size as usize;
+            let max_ctx = resolve_config_ctx(cfg.inference.ctx_size, path) as usize;
             tracing::info!(model = %path.display(), max_ctx, "loading CPU engine");
-            // Honor `[inference].keep_quant_raw` — AND force it on whenever a
-            // GPU is present, because the GPU path wants PACKED (Raw) weights:
-            // the USM pre-upload only covers `*Raw` tensors and packed USM
-            // matvec is the fast GPU kernel. Without this, sub-L3 tensors
-            // dequant to F16, skip the pre-upload, and run on CPU (the hybrid
-            // <1 tok/s regression — even after adding hybrid_layers to the
-            // pre-upload, F16-dequanted tensors wouldn't be covered). CPU-only
-            // serving keeps the config default (F16 is faster on CPU).
-            let gpu_present = rustllama_kernels_sycl::device_count()
-                .map(|n| n > 0)
-                .unwrap_or(false)
-                || rustllama_kernels_cuda::device_count() > 0;
-            if cfg.inference.keep_quant_raw || gpu_present {
-                std::env::set_var("RUSTLLAMA_KEEP_QUANT_RAW", "1");
-                tracing::info!(
-                    gpu_present,
-                    "keep_quant_raw enabled: quantized tensors stay in raw GGUF form \
-                     (packed USM pre-upload + packed GPU matvec; skips F16 dequant)"
-                );
-            }
-            // T3: `promote_memory_env_from_config` now applies the typed
-            // `LoadOptions` (zerocopy / lock-ram / prefill-batched(_hybrid) /
-            // memory-budget / kv-persist / moe-* / ssm) to the process-local
-            // accel cells — including the SSM chunked-prefill tuner-cache
-            // winner, folded into that call (its former `set_var` here is
-            // gone). The device-tier disable-lists it still promotes stay env.
-            promote_memory_env_from_config(&cfg.inference, &cfg.tuning);
+            // (keep_quant_raw + promote_memory_env were hoisted above the engine
+            // branch so the paged engine gets them too — see the block before
+            // `let loaded_one`.)
             // Export the autotuned flash-attn-v3 KV_TILE to the env var the
             // SYCL kernel reads at dispatch time. KEPT as env (justified): the
             // C++ kernel reads it via `std::getenv` (rsl_kernels.cpp), so it
@@ -4252,10 +4255,10 @@ async fn serve(
                     model = %path.display(),
                     "loading model directory via load_auto (MLX / safetensors)"
                 );
-                CpuEngine::load_auto(path, max_ctx)
+                ContiguousEngine::load_auto(path, max_ctx)
                     .map_err(|e| anyhow::anyhow!("failed to load model {}: {e}", path.display()))?
             } else {
-                CpuEngine::load_with_options_layout_page_size_and_lora(
+                ContiguousEngine::load_with_options_layout_page_size_and_lora(
                     path,
                     max_ctx,
                     true,
@@ -4363,7 +4366,7 @@ async fn serve(
                 // except the tokenizer — which is verified, not
                 // assumed: accept/reject compares token IDs.
                 let draft_path = std::path::Path::new(draft_path);
-                let draft = CpuEngine::load_with_options_and_layout(
+                let draft = ContiguousEngine::load_with_options_and_layout(
                     draft_path,
                     max_ctx,
                     true,
@@ -6050,7 +6053,8 @@ fn cmd_tune_placement(
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
     let model_path = effective_model_path(model_override, &cfg, config_path)?;
-    let max_ctx = placement_ctx_override.unwrap_or(cfg.inference.ctx_size);
+    let max_ctx = placement_ctx_override
+        .unwrap_or_else(|| resolve_config_ctx(cfg.inference.ctx_size, &model_path));
 
     // MLX / non-GGUF model directory: there is no GGUF tensor table to price a
     // VRAM-fit table from, and an MLX affine checkpoint loads + runs on CPU
@@ -6837,7 +6841,7 @@ fn cmd_tune_cacheblend(
     // Ascending candidates: pick the smallest coherent one.
     let candidates = [0.1f32, 0.15, 0.25, 0.4, 0.6];
     const COHERENCE_MIN_COS: f32 = 0.98;
-    let ctx_size = (cfg.inference.ctx_size as usize).max(256);
+    let ctx_size = (resolve_config_ctx(cfg.inference.ctx_size, &model_path) as usize).max(256);
 
     println!("rustllama tune --cacheblend");
     println!("  model      = {}", model_path.display());
@@ -7125,7 +7129,7 @@ fn cmd_tune_kv_dtype(
     // blow out host memory at the configured context. A budget of 0
     // (dims unreadable / RAM query failed) disables the gate and
     // honors the pure speed-first pick.
-    let deploy_ctx = cfg.inference.ctx_size.max(1);
+    let deploy_ctx = resolve_config_ctx(cfg.inference.ctx_size, &model_path).max(1);
     // f16-based KV cache size at the deployment context (0 if dims
     // couldn't be read → fit gate disabled below). The per-dtype
     // estimate scales this by bits/16.
@@ -8454,7 +8458,7 @@ fn cmd_tune_kv_layout(
 }
 
 /// P9 `tune --batching` A/B: measure single-stream prefill+decode tok/s on the
-/// continuous-batching `PagedBatchEngine` vs the contiguous `CpuEngine`, print
+/// continuous-batching `PagedBatchEngine` vs the contiguous `ContiguousEngine`, print
 /// the comparison, and persist the faster-for-single-stream engine under
 /// `batching_engine`. The serve path reads this (when `[server].fused_decode`
 /// is unset + `[tuning].auto_apply_batching`) to decide whether default-on
@@ -10788,11 +10792,12 @@ fn bench(
     decode_tokens: u32,
     repeats: u32,
 ) -> anyhow::Result<()> {
-    use rustllama_engine::{CpuEngine, SamplingParams};
+    use rustllama_engine::{ContiguousEngine, SamplingParams};
 
     let cfg = rustllama_config::load_with_profile(config_path, profile)?;
     let model_path = effective_model_path(model_override.map(str::to_string), &cfg, config_path)?;
-    let ctx_size = ctx_size_override.unwrap_or(cfg.inference.ctx_size as usize);
+    let ctx_size = ctx_size_override
+        .unwrap_or_else(|| resolve_config_ctx(cfg.inference.ctx_size, &model_path) as usize);
     // Override-or-config K/V dtype. When K and V differ in config,
     // bench uses K's dtype (matches engine storage which couples
     // K/V today) and warns. `--kv-dtype` overrides both.
@@ -10829,7 +10834,7 @@ fn bench(
     // must load the model under the same env the server would.
     promote_memory_env_from_config(&cfg.inference, &cfg.tuning);
     let load_start = std::time::Instant::now();
-    let mut cpu = CpuEngine::load_with_options_and_layout(
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
         &model_path,
         ctx_size,
         true,
@@ -11670,6 +11675,24 @@ fn effective_model_path(
             })?,
     };
     resolve_model_path(&spec)
+}
+
+/// Resolve `[inference].ctx_size` for a load / KV-sizing path.
+///
+/// An explicit non-zero value is honored as-is. The AUTO sentinel (`0`, the
+/// default) derives the window from the model's trained `context_length`
+/// (peeked cheaply from the GGUF), capped by the engine resolver
+/// (`rustllama_engine::auto_ctx_from_train`, ceiling 32768); a model with no
+/// readable window (e.g. an MLX directory) falls back to 8192. Used by the
+/// serve-startup load, the placement sweep's KV pricing, and `model bench` —
+/// the paths that need the resolved value WITHOUT a full engine load (the
+/// engine itself backstops a stray `0` the same way).
+fn resolve_config_ctx(config_ctx: u32, model_path: &std::path::Path) -> u32 {
+    if config_ctx != 0 {
+        return config_ctx;
+    }
+    let ctx_train = rustllama_server::peek_gguf_ctx_train(model_path).unwrap_or(0);
+    rustllama_engine::auto_ctx_from_train(ctx_train)
 }
 
 fn resolve_model_path(s: &str) -> anyhow::Result<PathBuf> {

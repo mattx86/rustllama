@@ -22,7 +22,7 @@
 //! exactly why the anchor leans on the verify/accept stack, not the draft.
 
 use futures::StreamExt;
-use rustllama_engine::{CpuEngine, KvDtype, SamplingParams};
+use rustllama_engine::{ContiguousEngine, KvDtype, SamplingParams};
 use rustllama_gguf::synth::{
     write_synthetic_eagle_head_gguf, write_synthetic_llama_gguf, SynthEagleHead, SynthLlama,
 };
@@ -69,7 +69,8 @@ fn write_base_and_head(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eagle_chain_matches_plain_greedy() {
     let (base, head) = write_base_and_head("chain");
-    let mut cpu = CpuEngine::load_with_options(&base, 64, true, KvDtype::F32).expect("load base");
+    let mut cpu =
+        ContiguousEngine::load_with_options(&base, 64, true, KvDtype::F32).expect("load base");
     cpu.attach_eagle_head(&head).expect("attach eagle head");
     assert!(
         cpu.eagle_speculative(),
@@ -111,7 +112,8 @@ async fn eagle_chain_matches_plain_greedy() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eagle_branching_tree_is_lossless_greedy() {
     let (base, head) = write_base_and_head("branch");
-    let mut cpu = CpuEngine::load_with_options(&base, 64, true, KvDtype::F32).expect("load base");
+    let mut cpu =
+        ContiguousEngine::load_with_options(&base, 64, true, KvDtype::F32).expect("load base");
     cpu.attach_eagle_head(&head).expect("attach eagle head");
     cpu.set_tree_speculative(Some(vec![2, 2, 2])); // caterpillar
 
@@ -149,7 +151,7 @@ fn no_head_is_byte_identical() {
     let n = 12u32;
 
     let plain_engine =
-        CpuEngine::load_with_options(&base, 64, true, KvDtype::F32).expect("load plain");
+        ContiguousEngine::load_with_options(&base, 64, true, KvDtype::F32).expect("load plain");
     assert!(
         plain_engine.eagle_head().is_none(),
         "fresh engine has no head"
@@ -160,7 +162,7 @@ fn no_head_is_byte_identical() {
         .expect("plain greedy");
 
     let mut eagle_engine =
-        CpuEngine::load_with_options(&base, 64, true, KvDtype::F32).expect("load w/ head");
+        ContiguousEngine::load_with_options(&base, 64, true, KvDtype::F32).expect("load w/ head");
     eagle_engine.attach_eagle_head(&head).expect("attach");
     assert!(eagle_engine.eagle_speculative(), "head ⇒ EAGLE available");
     // The classic decode path (generate_token_ids) does NOT route through any
@@ -213,7 +215,7 @@ async fn eagle_real_head_matches_base_greedy() {
         }
     };
 
-    let mut cpu = CpuEngine::load_with_options(&base_path, 2048, true, KvDtype::F32)
+    let mut cpu = ContiguousEngine::load_with_options(&base_path, 2048, true, KvDtype::F32)
         .expect("load real base model");
     cpu.attach_eagle_head(&head_path)
         .expect("attach real EAGLE head (must match the base config)");
@@ -268,7 +270,7 @@ fn non_eagle_companion_is_rejected() {
     let base = tmp("reject-base");
     write_synthetic_llama_gguf(&base, &SynthLlama::default());
     // A plain base GGUF is not an EAGLE head (no `adapter.type = "eagle"`).
-    let mut cpu = CpuEngine::load_with_options(&base, 64, true, KvDtype::F32).expect("load");
+    let mut cpu = ContiguousEngine::load_with_options(&base, 64, true, KvDtype::F32).expect("load");
     let err = cpu.attach_eagle_head(&base);
     assert!(err.is_err(), "a non-eagle GGUF must be rejected at attach");
     assert!(cpu.eagle_head().is_none(), "a failed attach leaves no head");

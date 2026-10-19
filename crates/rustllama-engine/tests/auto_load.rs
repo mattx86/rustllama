@@ -1,4 +1,4 @@
-//! Integration tests for `CpuEngine::load_auto` and the explicit
+//! Integration tests for `ContiguousEngine::load_auto` and the explicit
 //! `load_safetensors` constructor — A-3 of the AWQ/GPTQ arc.
 //!
 //! Builds synthetic safetensors directories on disk (config.json +
@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use bytemuck::cast_slice;
 use half::f16;
-use rustllama_engine::CpuEngine;
+use rustllama_engine::ContiguousEngine;
 use safetensors::tensor::TensorView;
 use safetensors::Dtype as StDtype;
 
@@ -198,7 +198,7 @@ fn build_awq_dir(tag: &str, with_tokenizer: bool) -> PathBuf {
 fn load_safetensors_loads_minimal_awq_directory() {
     let dir = build_awq_dir("safetensors", true);
     let st_path = dir.join("model.safetensors");
-    let engine = CpuEngine::load_safetensors(&st_path, 64).expect("safetensors load");
+    let engine = ContiguousEngine::load_safetensors(&st_path, 64).expect("safetensors load");
     // Architecture sanity.
     assert_eq!(engine.llama_config().n_layers, 1);
     assert_eq!(engine.llama_config().d_model, 16);
@@ -214,7 +214,7 @@ fn load_auto_routes_gguf_extension_to_gguf_path() {
     use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
     let p = std::env::temp_dir().join("rustllama-auto-route-gguf.gguf");
     write_synthetic_llama_gguf(&p, &SynthLlama::default());
-    let engine = CpuEngine::load_auto(&p, 16).expect("gguf load via auto");
+    let engine = ContiguousEngine::load_auto(&p, 16).expect("gguf load via auto");
     // Synth default has 32-token vocab.
     assert_eq!(engine.vocab_size(), 32);
     let _ = std::fs::remove_file(&p);
@@ -224,7 +224,7 @@ fn load_auto_routes_gguf_extension_to_gguf_path() {
 fn load_auto_routes_safetensors_extension_to_safetensors_path() {
     let dir = build_awq_dir("auto-st", true);
     let st_path = dir.join("model.safetensors");
-    let engine = CpuEngine::load_auto(&st_path, 64).expect("safetensors via auto");
+    let engine = ContiguousEngine::load_auto(&st_path, 64).expect("safetensors via auto");
     assert_eq!(engine.llama_config().n_layers, 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -233,7 +233,7 @@ fn load_auto_routes_safetensors_extension_to_safetensors_path() {
 fn load_auto_rejects_unknown_extension() {
     let p = std::env::temp_dir().join("rustllama-auto-bogus.pt");
     std::fs::write(&p, b"not a real checkpoint").unwrap();
-    let err = match CpuEngine::load_auto(&p, 16) {
+    let err = match ContiguousEngine::load_auto(&p, 16) {
         Ok(_) => panic!("must reject .pt extension"),
         Err(e) => e,
     };
@@ -250,7 +250,7 @@ fn load_safetensors_errors_when_config_json_is_missing() {
     let dir = build_awq_dir("no-config", true);
     let _ = std::fs::remove_file(dir.join("config.json"));
     let st_path = dir.join("model.safetensors");
-    let err = match CpuEngine::load_safetensors(&st_path, 64) {
+    let err = match ContiguousEngine::load_safetensors(&st_path, 64) {
         Ok(_) => panic!("must error without config.json"),
         Err(e) => e,
     };
@@ -268,7 +268,7 @@ fn load_safetensors_loads_without_tokenizer_with_warning() {
     // the model loads and forward_one still works.
     let dir = build_awq_dir("no-tokenizer", false);
     let st_path = dir.join("model.safetensors");
-    let engine = CpuEngine::load_safetensors(&st_path, 64).expect("load without tokenizer");
+    let engine = ContiguousEngine::load_safetensors(&st_path, 64).expect("load without tokenizer");
     // Architecture sanity confirms the load worked end-to-end even
     // without the tokenizer file present.
     assert_eq!(engine.llama_config().n_layers, 1);
@@ -283,7 +283,7 @@ fn load_safetensors_loads_without_tokenizer_with_warning() {
 fn loaded_safetensors_engine_holds_dequanted_weights() {
     let dir = build_awq_dir("dequant-sanity", false);
     let st_path = dir.join("model.safetensors");
-    let engine = CpuEngine::load_safetensors(&st_path, 64).expect("load");
+    let engine = ContiguousEngine::load_safetensors(&st_path, 64).expect("load");
     // Internal field access via the __model_for_test hook from V-6b.
     let model = engine.__model_for_test();
     let blk = &model.weights.blocks[0];
@@ -435,7 +435,7 @@ fn build_mlx_dir(tag: &str) -> PathBuf {
 fn load_auto_loads_mlx_directory_and_runs_forward() {
     let dir = build_mlx_dir("auto");
     // Route through the public auto-dispatcher exactly as `serve` does.
-    let engine = CpuEngine::load_auto(&dir, 64).expect("mlx load via load_auto");
+    let engine = ContiguousEngine::load_auto(&dir, 64).expect("mlx load via load_auto");
     assert_eq!(engine.llama_config().n_layers, 1);
     assert_eq!(engine.llama_config().d_model, 64);
     assert_eq!(engine.vocab_size(), 32);
@@ -476,7 +476,7 @@ fn load_mlx_direct_entry_loads_with_packed_affine_weights() {
     use rustllama_tensor::Dtype;
 
     let dir = build_mlx_dir("direct");
-    let engine = CpuEngine::load_mlx(&dir, 64).expect("load_mlx");
+    let engine = ContiguousEngine::load_mlx(&dir, 64).expect("load_mlx");
     let model = engine.__model_for_test();
     let blk = &model.weights.blocks[0];
     // Logical [out, in] = [d_model, d_model] = [64, 64], carried in
@@ -526,7 +526,7 @@ fn load_auto_routes_awq_directory_to_safetensors_fallback() {
     // must NOT be detected as MLX; load_auto falls back to its
     // `model.safetensors`. Pins the is_mlx_dir discriminator.
     let dir = build_awq_dir("auto-dir-awq", true);
-    let engine = CpuEngine::load_auto(&dir, 64).expect("awq dir via load_auto");
+    let engine = ContiguousEngine::load_auto(&dir, 64).expect("awq dir via load_auto");
     assert_eq!(engine.llama_config().n_layers, 1);
     assert_eq!(engine.llama_config().d_model, 16);
     let _ = std::fs::remove_dir_all(&dir);

@@ -13,7 +13,7 @@
 //! `kv_q8_0.rs`). The fully-fused dequant-in-attention path and SIMD
 //! variants land in a follow-up.
 
-use rustllama_engine::{CpuEngine, KvDtype, SamplingParams};
+use rustllama_engine::{ContiguousEngine, KvDtype, SamplingParams};
 use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
 
 fn synth_gguf(tag: &str) -> std::path::PathBuf {
@@ -40,7 +40,8 @@ fn tq8_kv_load_decode_and_determinism() {
     // tq8 (TurboQuant 8-bit) should run end-to-end without panics
     // and produce identical output on two back-to-back runs.
     let path = synth_gguf("tq8-determ");
-    let engine = CpuEngine::load_with_options(&path, 32, false, KvDtype::Tq(8)).expect("load tq8");
+    let engine =
+        ContiguousEngine::load_with_options(&path, 32, false, KvDtype::Tq(8)).expect("load tq8");
     let prompt: Vec<i32> = (0..8).collect();
     let a = engine
         .generate_token_ids(&prompt, 4, &greedy(4))
@@ -55,7 +56,8 @@ fn tq8_kv_load_decode_and_determinism() {
 #[test]
 fn tq4_kv_load_decode_and_determinism() {
     let path = synth_gguf("tq4-determ");
-    let engine = CpuEngine::load_with_options(&path, 32, false, KvDtype::Tq(4)).expect("load tq4");
+    let engine =
+        ContiguousEngine::load_with_options(&path, 32, false, KvDtype::Tq(4)).expect("load tq4");
     let prompt: Vec<i32> = (0..8).collect();
     let a = engine
         .generate_token_ids(&prompt, 4, &greedy(4))
@@ -72,7 +74,8 @@ fn tq2_kv_load_decode_does_not_panic() {
     // tq2 is the most aggressive (3 levels per element); we just
     // pin that it runs to completion.
     let path = synth_gguf("tq2-smoke");
-    let engine = CpuEngine::load_with_options(&path, 32, false, KvDtype::Tq(2)).expect("load tq2");
+    let engine =
+        ContiguousEngine::load_with_options(&path, 32, false, KvDtype::Tq(2)).expect("load tq2");
     let prompt: Vec<i32> = (0..8).collect();
     let out = engine
         .generate_token_ids(&prompt, 4, &greedy(4))
@@ -85,7 +88,8 @@ fn tq2_kv_load_decode_does_not_panic() {
 fn tq1_kv_load_decode_does_not_panic() {
     // tq1 is signed-binary. Same smoke check.
     let path = synth_gguf("tq1-smoke");
-    let engine = CpuEngine::load_with_options(&path, 32, false, KvDtype::Tq(1)).expect("load tq1");
+    let engine =
+        ContiguousEngine::load_with_options(&path, 32, false, KvDtype::Tq(1)).expect("load tq1");
     let prompt: Vec<i32> = (0..8).collect();
     let out = engine
         .generate_token_ids(&prompt, 4, &greedy(4))
@@ -100,7 +104,7 @@ fn nvfp4_kv_load_decode_and_determinism() {
     // has head_dim=32 which satisfies the constraint.
     let path = synth_gguf("nvfp4-determ");
     let engine =
-        CpuEngine::load_with_options(&path, 32, false, KvDtype::Nvfp4).expect("load nvfp4");
+        ContiguousEngine::load_with_options(&path, 32, false, KvDtype::Nvfp4).expect("load nvfp4");
     let prompt: Vec<i32> = (0..8).collect();
     let a = engine
         .generate_token_ids(&prompt, 4, &greedy(4))
@@ -118,7 +122,8 @@ fn q4_0_kv_load_decode_and_determinism() {
     // head_dim divisible by 32; the synth default head_dim=32
     // satisfies the constraint exactly.
     let path = synth_gguf("q4-0-determ");
-    let engine = CpuEngine::load_with_options(&path, 32, false, KvDtype::Q4_0).expect("load q4_0");
+    let engine =
+        ContiguousEngine::load_with_options(&path, 32, false, KvDtype::Q4_0).expect("load q4_0");
     let prompt: Vec<i32> = (0..8).collect();
     let a = engine
         .generate_token_ids(&prompt, 4, &greedy(4))
@@ -144,12 +149,14 @@ fn q4_0_kv_whitening_active_matches_f32_greedy() {
     write_synthetic_llama_gguf(&tmp, &synth);
 
     let prompt: Vec<i32> = (0..8).collect();
-    let q4 = CpuEngine::load_with_options(&tmp, 32, false, KvDtype::Q4_0).expect("load q4_0");
+    let q4 =
+        ContiguousEngine::load_with_options(&tmp, 32, false, KvDtype::Q4_0).expect("load q4_0");
     let a = q4.generate_token_ids(&prompt, 4, &greedy(4)).expect("a");
     let b = q4.generate_token_ids(&prompt, 4, &greedy(4)).expect("b");
     assert_eq!(a, b, "whitened Q4_0 KV must be deterministic");
 
-    let f32e = CpuEngine::load_with_options(&tmp, 32, false, KvDtype::F32).expect("load f32");
+    let f32e =
+        ContiguousEngine::load_with_options(&tmp, 32, false, KvDtype::F32).expect("load f32");
     let f = f32e.generate_token_ids(&prompt, 4, &greedy(4)).expect("f");
     assert_eq!(
         a, f,

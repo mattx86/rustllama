@@ -19,7 +19,7 @@
 //!   - `/api/pull` emits coarse-grained progress events (start / verifying /
 //!     success / error) rather than per-chunk byte counts. hf-hub doesn't
 //!     expose intermediate progress; per-byte streaming is a v1.x follow-up.
-//!   - `/api/show` requires a real CpuEngine; with a live engine it
+//!   - `/api/show` requires a real ContiguousEngine; with a live engine it
 //!     returns the full Ollama-shape body (architecture, dimensions,
 //!     chat template, parameter-size estimate). The mock-engine path
 //!     returns 503 since metadata isn't synthesizable from the engine
@@ -141,7 +141,7 @@ pub async fn ps(State(state): State<AppState>) -> Json<PsOut> {
             expires_at: "9999-12-31T23:59:59Z",
             size,
             // Best-effort: equals on-disk size when the engine
-            // placed everything on GPU. The CpuEngine carries the
+            // placed everything on GPU. The ContiguousEngine carries the
             // active `n_gpu_layers` setting; if it's less than
             // `n_layers`, we still report on-disk size since
             // figuring the exact CPU/GPU split per-tensor would
@@ -577,7 +577,7 @@ pub struct ShowOut {
 /// Editor clients (Continue.dev / Aider config panels) display this
 /// block verbatim. Empty string means "no advertisable defaults" —
 /// callers should treat that as "use client-side defaults".
-fn build_parameters_block(cpu: &rustllama_engine::CpuEngine) -> String {
+fn build_parameters_block(cpu: &rustllama_engine::ContiguousEngine) -> String {
     let mut lines: Vec<String> = Vec::new();
     let cfg = cpu.config();
     if cfg.ctx_train > 0 {
@@ -621,7 +621,7 @@ fn build_parameters_block(cpu: &rustllama_engine::CpuEngine) -> String {
 /// Editor clients display this as the model's "config" — populating it
 /// real lets users copy-paste the model into another Ollama instance.
 fn build_modelfile_block(
-    cpu: &rustllama_engine::CpuEngine,
+    cpu: &rustllama_engine::ContiguousEngine,
     serving_model_id: &str,
     chat_template: &str,
     parameters: &str,
@@ -1083,7 +1083,7 @@ pub async fn chat(
     };
     let started = Instant::now();
     // P14-http: thread priority + deadline into the paged driver (no-op on the
-    // CpuEngine). Default headers ⇒ `SubmitOpts::default()` ⇒ identical to the
+    // ContiguousEngine). Default headers ⇒ `SubmitOpts::default()` ⇒ identical to the
     // prior `engine.chat` call.
     let tok_stream =
         match handle
@@ -1215,7 +1215,7 @@ async fn ollama_chat_with_tools(
         return (code, Json(json!({ "error": msg }))).into_response();
     }
 
-    // P14-http: ollama tools path is CpuEngine-only; carry the admission
+    // P14-http: ollama tools path is ContiguousEngine-only; carry the admission
     // priority into the scheduler slot (deadline/heap are paged-only).
     let handle = match serving.try_acquire_with_priority(sched.priority()).await {
         Ok(p) => p,
@@ -1771,7 +1771,7 @@ pub async fn generate(
         Err(be) => return be.into_response(),
     };
     // P14-http: one SubmitOpts for whichever engine path we take (no-op on the
-    // CpuEngine; carries priority + deadline into the paged driver).
+    // ContiguousEngine; carries priority + deadline into the paged driver).
     let submit_opts = sched.to_submit_opts(None);
     let (tok_stream, prompt_eval_count) = match prepared {
         PreparedGenerate::Chat { msgs, count } => {

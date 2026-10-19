@@ -1,4 +1,4 @@
-//! Integration test for `CpuEngine` against a synthetic Llama GGUF.
+//! Integration test for `ContiguousEngine` against a synthetic Llama GGUF.
 //!
 //! Verifies that the prefill + decode + sampler path produces:
 //!   - deterministic greedy continuations
@@ -6,14 +6,14 @@
 //!   - sane in-bounds token ids
 //! Phase 1 acceptance for the engine layer.
 
-use rustllama_engine::{BeamParams, CpuEngine, SamplingParams};
+use rustllama_engine::{BeamParams, ContiguousEngine, SamplingParams};
 use rustllama_gguf::synth::{write_synthetic_llama_gguf, SynthLlama};
 
-fn build_engine(tag: &str) -> (CpuEngine, std::path::PathBuf) {
+fn build_engine(tag: &str) -> (ContiguousEngine, std::path::PathBuf) {
     let tmp = std::env::temp_dir().join(format!("rustllama-cpu-engine-{tag}.gguf"));
     let params = SynthLlama::default();
     write_synthetic_llama_gguf(&tmp, &params);
-    let engine = CpuEngine::load(&tmp, 16).expect("load engine");
+    let engine = ContiguousEngine::load(&tmp, 16).expect("load engine");
     (engine, tmp)
 }
 
@@ -89,7 +89,7 @@ fn prompt_too_long_is_rejected() {
     let err = engine.generate_token_ids(&prompt, 4, &p);
     assert!(matches!(
         err,
-        Err(rustllama_engine::CpuEngineError::PromptTooLong { .. })
+        Err(rustllama_engine::ContiguousEngineError::PromptTooLong { .. })
     ));
 
     let _ = std::fs::remove_file(&tmp);

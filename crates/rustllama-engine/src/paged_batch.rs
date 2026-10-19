@@ -1,8 +1,8 @@
 //! Continuous-batching engine over a shared paged KV pool.
 //!
-//! [`crate::inference::CpuEngine`] is the single-request workhorse:
+//! [`crate::inference::ContiguousEngine`] is the single-request workhorse:
 //! one model + one KV backend serving one generation at a time.
-//! The server's [`crate::inference::CpuEngine::fork_for_concurrent_use`]
+//! The server's [`crate::inference::ContiguousEngine::fork_for_concurrent_use`]
 //! gives M concurrent requests via M independent forks — real
 //! parallelism on the orchestration side but each fork issues its
 //! own kernel launches (M × launches per decode step).
@@ -30,7 +30,7 @@
 //! Async + scheduling surface:
 //!   - Async streaming entry (`submit_streaming` / SSE) so the server
 //!     routes admitted requests into this engine instead of per-fork
-//!     [`crate::inference::CpuEngine`]s when `[server].fused_decode = true`.
+//!     [`crate::inference::ContiguousEngine`]s when `[server].fused_decode = true`.
 //!   - P14: the driver thread admits from a priority-ordered heap
 //!     (`X-RustLlama-Priority` → [`crate::SubmitOpts::priority`]) rather than
 //!     FIFO, enforces per-request deadlines (flipping the request's cancel
@@ -58,7 +58,7 @@ use rustllama_tokenizer::{ChatMessage as TokChat, Tokenizer};
 
 use crate::batch_scheduler::Priority;
 use crate::grammar::GrammarMask;
-use crate::inference::{build_stop_token_ids, CpuEngineError, Utf8Stream};
+use crate::inference::{build_stop_token_ids, ContiguousEngineError, Utf8Stream};
 use crate::sampling::Sampler;
 use crate::{
     ChatMessage, Engine, EngineError, GrammarKind, Metrics, RequestStats, Result as EngineResult,
@@ -66,13 +66,13 @@ use crate::{
 };
 
 /// P9 feature parity: tool-call grammar recursion cap for the paged driver.
-/// Mirrors `CpuEngine`'s `DEFAULT_MAX_TOOL_ITERATIONS` (8) — the paged engine
+/// Mirrors `ContiguousEngine`'s `DEFAULT_MAX_TOOL_ITERATIONS` (8) — the paged engine
 /// has no per-request tool-iteration knob, so it uses the same default the
 /// contiguous engine starts from.
 const PAGED_MAX_TOOL_ITERATIONS: u32 = 8;
 
 /// P9 feature parity: build the per-request grammar mask for the paged driver,
-/// mirroring `CpuEngine::build_grammar`. Returns `None` when no grammar was
+/// mirroring `ContiguousEngine::build_grammar`. Returns `None` when no grammar was
 /// requested, or (fail-soft, like the contiguous path) when the engine has no
 /// tokenizer to pre-decode the vocab. Built once per request at admission —
 /// each slot owns its own advancing `GrammarMask`.
@@ -150,7 +150,7 @@ fn build_paged_grammar(
 /// the configured `eos_token_id` plus the tokenizer's other end-of-turn / EOS
 /// control terminals ([`build_stop_token_ids`]), cast to `i32` to match the
 /// slot's sampled-token comparisons. `Arc`-shared across the model's slots (it
-/// is identical for every slot). Mirrors `CpuEngine::stop_token_ids`.
+/// is identical for every slot). Mirrors `ContiguousEngine::stop_token_ids`.
 fn paged_stop_ids(
     model: &LlamaModel,
     tokenizer: Option<&Arc<Tokenizer>>,
@@ -175,7 +175,7 @@ pub const DEFAULT_PAGE_SIZE: u32 = 16;
 /// vision tensors) plus a separate `mmproj-*.gguf` holding the vision tower
 /// under `v.*` / `clip.*`. So this check does NOT fire on an ordinary two-file
 /// VLM's text half; the PRIMARY guard for that case is the serve load path,
-/// which forces the contiguous `CpuEngine` whenever a `[model].mmproj` companion
+/// which forces the contiguous `ContiguousEngine` whenever a `[model].mmproj` companion
 /// is configured. This helper is the defense-in-depth half: it catches a
 /// COMBINED single-file VLM GGUF — any `clip.*` / `*.vision.*` metadata key, a
 /// `clip` / `siglip` / vision architecture, or a vision-namespaced tensor
@@ -208,7 +208,7 @@ fn gguf_has_vision_indicator(gguf: &Gguf) -> bool {
 /// contiguous F32 KV cache (for the full-attention layers) + its OWN
 /// `DeltaNetCache` (for the SSM/recurrent layers) and is driven through the
 /// SAME `forward_prefill_hybrid` / `forward_one_hybrid` the contiguous
-/// `CpuEngine` uses — so a paged hybrid slot's output is BIT-IDENTICAL to
+/// `ContiguousEngine` uses — so a paged hybrid slot's output is BIT-IDENTICAL to
 /// the contiguous engine on the same prompt + sampling. Multiple hybrid
 /// slots interleave at the driver's tick granularity, each advancing its
 /// own `kv` + `dn` independently, so there is no cross-slot contamination
@@ -299,7 +299,7 @@ struct SlotState {
     /// (`response_format`, tool grammar), built from `sampling.grammar` at
     /// admission. `None` = unconstrained. The decode path samples via
     /// `Sampler::sample_with_grammar` + advances it per token, exactly like the
-    /// contiguous `CpuEngine` — so a grammar request behaves identically on the
+    /// contiguous `ContiguousEngine` — so a grammar request behaves identically on the
     /// batching engine.
     grammar: Option<GrammarMask>,
     /// P9 feature parity: client-supplied string stop sequences
@@ -307,7 +307,7 @@ struct SlotState {
     stop_strings: Vec<String>,
     /// P9 feature parity: the running detokenized output buffer used for
     /// string-stop matching. Accumulated via `decode_single(id, true)`
-    /// (matching `CpuEngine::drive_generation`), so a multi-token stop string
+    /// (matching `ContiguousEngine::drive_generation`), so a multi-token stop string
     /// spanning several tokens is caught. Only grown when `stop_strings` is
     /// non-empty (no detok cost otherwise).
     stop_buf: String,
@@ -426,7 +426,7 @@ pub struct PagedBatchEngine {
     max_slots: u32,
     page_size: u32,
     /// Stem of the GGUF file the engine was loaded from. Mirrors
-    /// `CpuEngine::model_id` so the server's `ServingModel` can
+    /// `ContiguousEngine::model_id` so the server's `ServingModel` can
     /// build its `model_id` field uniformly across backends.
     model_id: String,
     /// Per-MODEL recommended sampling profile, resolved once at load from a
@@ -481,7 +481,7 @@ pub struct PagedBatchEngine {
     /// the driver wiring engages.
     cascade_engagements: Arc<std::sync::atomic::AtomicUsize>,
     /// P11 Phase 2/3 — resident multi-LoRA adapter registry (the paged twin of
-    /// `CpuEngine::lora`). Adapters are attached UNMERGED and selected PER SLOT
+    /// `ContiguousEngine::lora`). Adapters are attached UNMERGED and selected PER SLOT
     /// via [`SamplingParams::lora_adapter`]: the ragged / batched-decode tick
     /// builds a per-row adapter table (slot → adapter) and scopes it via
     /// [`rustllama_models::lora::scope_row_adapters`], so one fused forward can
@@ -501,7 +501,11 @@ impl PagedBatchEngine {
     /// `max_slots` is a hard cap — `generate_batched_token_ids`
     /// rejects request batches larger than this. The server's
     /// scheduler will gate admission at this cap once 3.7e lands.
-    pub fn load(path: &Path, max_ctx: usize, max_slots: u32) -> Result<Self, CpuEngineError> {
+    pub fn load(
+        path: &Path,
+        max_ctx: usize,
+        max_slots: u32,
+    ) -> Result<Self, ContiguousEngineError> {
         // Config budget 0 ⇒ the ragged mixed path is OFF unless the
         // `RUSTLLAMA_MAX_BATCHED_TOKENS` env var opts in (env still honored for
         // back-compat; see `resolve_max_batched_tokens`).
@@ -520,7 +524,7 @@ impl PagedBatchEngine {
         max_ctx: usize,
         max_slots: u32,
         max_num_batched_tokens: usize,
-    ) -> Result<Self, CpuEngineError> {
+    ) -> Result<Self, ContiguousEngineError> {
         Self::load_inner(
             path,
             max_ctx,
@@ -542,7 +546,7 @@ impl PagedBatchEngine {
         max_slots: u32,
         max_num_batched_tokens: usize,
         lora: Option<&Path>,
-    ) -> Result<Self, CpuEngineError> {
+    ) -> Result<Self, ContiguousEngineError> {
         Self::load_inner(
             path,
             max_ctx,
@@ -561,7 +565,7 @@ impl PagedBatchEngine {
         path: &Path,
         max_ctx: usize,
         max_slots: u32,
-    ) -> Result<Self, CpuEngineError> {
+    ) -> Result<Self, ContiguousEngineError> {
         Self::load_inner(path, max_ctx, max_slots, false, 0, None, None, true)
     }
 
@@ -574,7 +578,7 @@ impl PagedBatchEngine {
         max_ctx: usize,
         max_slots: u32,
         overlap_emit: bool,
-    ) -> Result<Self, CpuEngineError> {
+    ) -> Result<Self, ContiguousEngineError> {
         Self::load_inner(path, max_ctx, max_slots, false, 0, None, None, overlap_emit)
     }
 
@@ -592,7 +596,7 @@ impl PagedBatchEngine {
         max_ctx: usize,
         max_slots: u32,
         total_pages: u32,
-    ) -> Result<Self, CpuEngineError> {
+    ) -> Result<Self, ContiguousEngineError> {
         Self::load_inner(
             path,
             max_ctx,
@@ -615,17 +619,17 @@ impl PagedBatchEngine {
         pool_pages_override: Option<u32>,
         lora: Option<&Path>,
         overlap_emit: bool,
-    ) -> Result<Self, CpuEngineError> {
+    ) -> Result<Self, ContiguousEngineError> {
         let max_slots = max_slots.max(1);
         let gguf = Gguf::open(path)?;
         let mut model = LlamaModel::load(&gguf)?;
-        // P11: merge a LoRA adapter at load (Phase 1); see the `CpuEngine`
+        // P11: merge a LoRA adapter at load (Phase 1); see the `ContiguousEngine`
         // twin in `inference.rs`.
         if let Some(lora_path) = lora {
             let lgguf = Gguf::open(lora_path)?;
             let adapter = rustllama_models::lora::LoraAdapter::from_gguf(&lgguf, "default")
                 .map_err(|e| {
-                    CpuEngineError::Other(format!(
+                    ContiguousEngineError::Other(format!(
                         "LoRA adapter load failed ({}): {e}",
                         lora_path.display()
                     ))
@@ -650,7 +654,7 @@ impl PagedBatchEngine {
         //     apply to it. Instead each hybrid slot carries its OWN contiguous
         //     F32 KV + its OWN `DeltaNetCache` and is driven through the SAME
         //     `forward_prefill_hybrid` / `forward_one_hybrid` the contiguous
-        //     `CpuEngine` uses (see [`HybridSlotState`], [`build_hybrid_slot_state`],
+        //     `ContiguousEngine` uses (see [`HybridSlotState`], [`build_hybrid_slot_state`],
         //     [`run_hybrid_tick`]) — BIT-IDENTICAL to contiguous, so it is
         //     correct to admit. The one hybrid sub-case still refused:
         //     SWA / attention-logit soft-cap, because the hybrid forward
@@ -673,7 +677,7 @@ impl PagedBatchEngine {
         if model.weights.is_hybrid()
             && (model.cfg.sliding_window.is_some() || model.cfg.attn_logit_softcapping.is_some())
         {
-            return Err(CpuEngineError::Other(
+            return Err(ContiguousEngineError::Other(
                 "continuous batching (fused_decode) does not support a HYBRID \
                  (DeltaNet/SSM) model that also uses sliding-window attention or \
                  attention-logit soft-capping (the hybrid forward has no \
@@ -687,9 +691,9 @@ impl PagedBatchEngine {
         // a decoupled rope key and runs its own `forward_one_mla` against the
         // contiguous MLA cache. There is no paged MLA forward yet, so serving
         // one here would run zero MLA layers. Refuse with a pointed message
-        // (mirrors the hybrid gate); the contiguous `CpuEngine` serves it.
+        // (mirrors the hybrid gate); the contiguous `ContiguousEngine` serves it.
         if model.weights.is_mla() {
-            return Err(CpuEngineError::Other(
+            return Err(ContiguousEngineError::Other(
                 "continuous batching (fused_decode) does not support MLA \
                  (DeepSeek-V2/V3) attention yet — its compressed-latent KV cache \
                  has no paged store; disable fused_decode to serve this model on \
@@ -710,7 +714,7 @@ impl PagedBatchEngine {
         // `forward_ragged_paged_f32(.., None)`), and (3) a loader for a COMBINED
         // single-file VLM GGUF — the ONLY VLM form that can reach this load site
         // (the common two-file VLM is a text decoder + a SEPARATE mmproj, and the
-        // serve path forces that case onto the contiguous `CpuEngine` via the
+        // serve path forces that case onto the contiguous `ContiguousEngine` via the
         // `[model].mmproj` check, where `attach_mmproj` lives). No code anywhere
         // loads vision tensors from a combined file, so the combined case has no
         // working vision path on ANY backend and cannot be exercised/verified
@@ -722,14 +726,32 @@ impl PagedBatchEngine {
         // check); it catches a combined single-file VLM GGUF (vision tensors /
         // `clip.*` metadata in the same file) that would otherwise slip past.
         if gguf_has_vision_indicator(&gguf) {
-            return Err(CpuEngineError::Other(
+            return Err(ContiguousEngineError::Other(
                 "continuous batching (fused_decode) does not support vision / \
                  multimodal (VLM) models yet; use the default engine for this model"
                     .into(),
             ));
         }
 
-        let ctx = max_ctx.min(model.cfg.ctx_train.max(max_ctx));
+        // Reset the device matvec / KV caches so a reload (the kv-dtype sweep,
+        // multi-model serve) doesn't reuse a stale HOST-ADDRESS-keyed buffer
+        // from a previously-loaded model — mirrors the ContiguousEngine load
+        // (inference.rs). Cheap no-op off-GPU. (The paged engine previously
+        // omitted this; the same class of bug was fixed for the contiguous
+        // engine in b22c987.)
+        rustllama_models::accel::reset_device_caches_for_new_model();
+
+        // Context window. `max_ctx == 0` is the `[inference].ctx_size` AUTO
+        // sentinel (see [`crate::auto_ctx_from_train`]): open the model's own
+        // trained window, capped — resolved HERE, before the page pool is
+        // sized from `ctx` (`pages_per_slot` below), so an AUTO load gets a
+        // real pool rather than a zero-page one. Any explicit value is honored
+        // as-is (the historic clamp was a no-op that always returned `max_ctx`).
+        let ctx = if max_ctx == 0 {
+            crate::auto_ctx_from_train(model.cfg.ctx_train as u32) as usize
+        } else {
+            max_ctx
+        };
         let tokenizer = if with_tokenizer {
             Some(Arc::new(Tokenizer::from_gguf(&gguf)?))
         } else {
@@ -744,7 +766,7 @@ impl PagedBatchEngine {
             Some(p) => p.max(1),
             None => pages_per_slot
                 .checked_mul(max_slots)
-                .ok_or_else(|| CpuEngineError::Other(format!(
+                .ok_or_else(|| ContiguousEngineError::Other(format!(
                     "paged batch pool overflow: pages_per_slot={pages_per_slot} * max_slots={max_slots}"
                 )))?,
         };
@@ -755,7 +777,9 @@ impl PagedBatchEngine {
             page_size,
             model.cfg.head_dim as u32,
         )
-        .ok_or_else(|| CpuEngineError::Other("paged store init: geometry has a zero dim".into()))?;
+        .ok_or_else(|| {
+            ContiguousEngineError::Other("paged store init: geometry has a zero dim".into())
+        })?;
         let table = PageTable::new(total_pages, page_size);
         let shared = SharedPagedKv::new(store, table);
         // LMCache: auto-size the CPU cold tier from free RAM (no env var). The
@@ -818,7 +842,7 @@ impl PagedBatchEngine {
             let handle = std::thread::Builder::new()
                 .name("rustllama-paged-batch-emit".to_string())
                 .spawn(move || emit_worker(rx))
-                .map_err(|e| CpuEngineError::Other(format!("emit worker spawn: {e}")))?;
+                .map_err(|e| ContiguousEngineError::Other(format!("emit worker spawn: {e}")))?;
             (Some(tx), Some(handle))
         } else {
             (None, None)
@@ -868,9 +892,9 @@ impl PagedBatchEngine {
         let driver_handle = std::thread::Builder::new()
             .name("rustllama-paged-batch-driver".to_string())
             .spawn(move || driver_loop(driver_ctx, request_rx))
-            .map_err(|e| CpuEngineError::Other(format!("driver thread spawn: {e}")))?;
+            .map_err(|e| ContiguousEngineError::Other(format!("driver thread spawn: {e}")))?;
 
-        // Post-load summary — mirrors `CpuEngine::load_inner`'s log
+        // Post-load summary — mirrors `ContiguousEngine::load_inner`'s log
         // line shape and adds the paged-specific knobs (max_slots,
         // page_size, total_pages) so ops triaging continuous-
         // batching deployments see the slot-pool geometry alongside
@@ -932,18 +956,22 @@ impl PagedBatchEngine {
     // ----- P11 Phase 2/3: resident multi-LoRA adapters (paged twin) -----
 
     /// Attach (load, UNMERGED) a LoRA adapter GGUF into the resident registry
-    /// under `name`. Mirrors [`crate::CpuEngine::attach_lora_adapter`]: the
+    /// under `name`. Mirrors [`crate::ContiguousEngine::attach_lora_adapter`]: the
     /// adapter is held as low-rank deltas and selected PER SLOT via
     /// [`SamplingParams::lora_adapter`]. Returns the adapted-tensor count.
-    pub fn attach_lora_adapter(&self, name: &str, path: &Path) -> Result<usize, CpuEngineError> {
+    pub fn attach_lora_adapter(
+        &self,
+        name: &str,
+        path: &Path,
+    ) -> Result<usize, ContiguousEngineError> {
         let g = Gguf::open(path)?;
         let adapter = rustllama_models::lora::LoraAdapter::from_gguf(&g, name)
-            .map_err(|e| CpuEngineError::Other(format!("LoRA adapter load failed: {e}")))?;
+            .map_err(|e| ContiguousEngineError::Other(format!("LoRA adapter load failed: {e}")))?;
         let n = adapter.len();
         let mut reg = self
             .lora
             .write()
-            .map_err(|_| CpuEngineError::Other("LoRA registry lock poisoned".into()))?;
+            .map_err(|_| ContiguousEngineError::Other("LoRA registry lock poisoned".into()))?;
         reg.insert(adapter);
         tracing::info!(
             adapter = name,
@@ -972,7 +1000,7 @@ impl PagedBatchEngine {
     fn resolve_lora(
         lora: &std::sync::RwLock<rustllama_models::lora::LoraRegistry>,
         sampling: &SamplingParams,
-    ) -> Result<Option<Arc<rustllama_models::lora::LoraAdapter>>, CpuEngineError> {
+    ) -> Result<Option<Arc<rustllama_models::lora::LoraAdapter>>, ContiguousEngineError> {
         let Some(name) = sampling.lora_adapter.as_deref() else {
             return Ok(None);
         };
@@ -981,9 +1009,9 @@ impl PagedBatchEngine {
         }
         let reg = lora
             .read()
-            .map_err(|_| CpuEngineError::Other("LoRA registry lock poisoned".into()))?;
+            .map_err(|_| ContiguousEngineError::Other("LoRA registry lock poisoned".into()))?;
         reg.get(name).map(Some).ok_or_else(|| {
-            CpuEngineError::Other(format!("unknown LoRA adapter `{name}` (not resident)"))
+            ContiguousEngineError::Other(format!("unknown LoRA adapter `{name}` (not resident)"))
         })
     }
 
@@ -1050,7 +1078,7 @@ impl PagedBatchEngine {
     ///     end-of-generation tokens (`build_stop_token_ids`), cache capacity,
     ///     OR a client string stop sequence
     ///     (`sampling.stop`). P9 brought the paged engine to feature
-    ///     parity with [`crate::inference::CpuEngine`]: `sampling.grammar`
+    ///     parity with [`crate::inference::ContiguousEngine`]: `sampling.grammar`
     ///     (structured output / tool grammar) is applied per slot via
     ///     [`Sampler::sample_with_grammar`], and string stops are matched
     ///     against the slot's running detok buffer — same semantics as the
@@ -1062,13 +1090,13 @@ impl PagedBatchEngine {
     pub fn generate_batched_token_ids(
         &self,
         requests: Vec<(Vec<i32>, SamplingParams)>,
-    ) -> Result<Vec<Vec<i32>>, CpuEngineError> {
+    ) -> Result<Vec<Vec<i32>>, ContiguousEngineError> {
         let m = requests.len();
         if m == 0 {
             return Ok(Vec::new());
         }
         if m as u32 > self.max_slots {
-            return Err(CpuEngineError::Other(format!(
+            return Err(ContiguousEngineError::Other(format!(
                 "request batch size {m} > max_slots {}",
                 self.max_slots
             )));
@@ -1082,7 +1110,7 @@ impl PagedBatchEngine {
             let prompt: Vec<i32> = prompt;
             let sampling: SamplingParams = sampling;
             if prompt.is_empty() {
-                return Err(CpuEngineError::Other(
+                return Err(ContiguousEngineError::Other(
                     "empty prompt in batch (every slot needs at least one prompt token)".into(),
                 ));
             }
@@ -1095,7 +1123,7 @@ impl PagedBatchEngine {
                 .checked_add(sampling.max_tokens as usize)
                 .unwrap_or(usize::MAX);
             if total_capacity > self.max_ctx {
-                return Err(CpuEngineError::PromptTooLong {
+                return Err(ContiguousEngineError::PromptTooLong {
                     prompt_len: prompt.len(),
                     max_ctx: self.max_ctx,
                 });
@@ -1107,7 +1135,7 @@ impl PagedBatchEngine {
             // F8: a HYBRID model's slot carries its own contiguous KV +
             // DeltaNet state (no shared pool, no cross-request prefix share),
             // prefilled through the contiguous hybrid forward — bit-identical
-            // to `CpuEngine`. Build it and move to the next request.
+            // to `ContiguousEngine`. Build it and move to the next request.
             if self.model.weights.is_hybrid() {
                 let mut state = build_hybrid_slot_state(
                     &self.model,
@@ -1118,7 +1146,7 @@ impl PagedBatchEngine {
                     Arc::clone(&self.stop_ids),
                     0,
                 )
-                .map_err(|e| CpuEngineError::Other(format!("hybrid slot build: {e}")))?;
+                .map_err(|e| ContiguousEngineError::Other(format!("hybrid slot build: {e}")))?;
                 state.adapter = adapter;
                 slots.push(state);
                 continue;
@@ -1169,6 +1197,16 @@ impl PagedBatchEngine {
                 };
                 (sp, sl, chain)
             };
+            // Cap the shared prefix at `prompt.len() - 1` so the last token is
+            // (re)prefilled into a PRIVATE page (see the ragged `admit_request`
+            // twin): the decode handoff re-forwards it at pos `len-1`, which must
+            // not write into a ref-shared donor page. Only fires on a full hit.
+            let (mut shared_pages, mut shared_lcp) = (shared_pages, shared_lcp);
+            while shared_lcp >= prompt.len() && !shared_pages.is_empty() {
+                let dropped = shared_pages.pop().expect("non-empty by loop guard");
+                self.shared.with_table_mut(|t| t.free(&[dropped]));
+                shared_lcp = shared_lcp.saturating_sub(page_size_usz);
+            }
             if !shared_pages.is_empty() {
                 cache.pin_shared_prefix(shared_pages, shared_lcp as u32);
             }
@@ -1179,7 +1217,7 @@ impl PagedBatchEngine {
                 // truncate.
                 .ensure_capacity_shared(&self.shared, total_capacity as u32)
                 .map_err(|short| {
-                    CpuEngineError::Other(format!(
+                    ContiguousEngineError::Other(format!(
                         "paged batch: pool short by {short} pages on slot prefill"
                     ))
                 })?;
@@ -1212,7 +1250,11 @@ impl PagedBatchEngine {
             }
             let last = *prompt.last().expect("non-empty prompt");
             let tokens_prefilled = prompt.len() as u32;
-            let next_pos = tokens_prefilled;
+            // Re-forward the last prompt token at `len-1`, not `len` (the
+            // inline prefill already wrote its K/V at `len-1`): feeding it at
+            // `len` would duplicate the key at the wrong RoPE position and shift
+            // every generated token +1 — mirrors the ragged + contiguous handoff.
+            let next_pos = tokens_prefilled - 1;
             let sampler = Sampler::new(sampling.clone());
             // P9 feature parity: grammar + string stops per slot.
             let grammar = build_paged_grammar(&self.model, self.tokenizer.as_ref(), &sampling);
@@ -1381,7 +1423,7 @@ impl PagedBatchEngine {
                 let logits = &mut step_logits[i];
                 let slot = &mut slots[i];
                 // P9: grammar-masked sample + grammar advance (feature parity
-                // with `CpuEngine::generate_token_ids`).
+                // with `ContiguousEngine::generate_token_ids`).
                 let next_tok = {
                     let SlotState {
                         sampler,
@@ -1401,7 +1443,7 @@ impl PagedBatchEngine {
                 slots[i].next_pos += 1;
                 slots[i].n_emitted += 1;
                 // P9 string-stop detection: accumulate the detok buffer exactly
-                // like the contiguous CpuEngine (`decode_single(id, true)`) and
+                // like the contiguous ContiguousEngine (`decode_single(id, true)`) and
                 // match. The stop-completing token is still emitted (it's in
                 // `outputs[i]`), then the slot stops — mirroring
                 // `drive_generation`.
@@ -1485,7 +1527,7 @@ impl PagedBatchEngine {
         let request_tx = self.request_tx.as_ref().ok_or_else(|| {
             EngineError::Engine("paged-batch engine has no driver (post-Drop)".into())
         })?;
-        // Channel capacity 4 matches `CpuEngine::spawn_stream` —
+        // Channel capacity 4 matches `ContiguousEngine::spawn_stream` —
         // keeps the engine ~one decode tick ahead of the SSE
         // consumer so a client disconnect drains fast.
         let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<EngineResult<Token>>(4);
@@ -1532,7 +1574,7 @@ impl PagedBatchEngine {
             EngineError::Unimplemented("submit_text_streaming requires a tokenizer")
         })?;
         // BOS handling defers to the tokenizer's per-model defaults
-        // (same as `CpuEngine::spawn_stream`'s tokenize call inside
+        // (same as `ContiguousEngine::spawn_stream`'s tokenize call inside
         // `drive_generation`).
         let token_ids_u32 = tokenizer.encode(prompt, tokenizer.add_bos_token())?;
         let token_ids: Vec<i32> = token_ids_u32.into_iter().map(|t| t as i32).collect();
@@ -1545,7 +1587,7 @@ impl PagedBatchEngine {
     }
 
     /// P12b — beam search on the paged engine. Mirrors
-    /// [`crate::inference::CpuEngine::generate_beam_token_ids`] (same pure
+    /// [`crate::inference::ContiguousEngine::generate_beam_token_ids`] (same pure
     /// bookkeeping from [`crate::beam`] — candidate build, HF selection,
     /// length-penalty pool), but forks each beam's KV on the PAGED store: the
     /// page-aligned PROMPT PREFIX is SHARED across all beams via pinned paged
@@ -2453,7 +2495,7 @@ fn driver_loop(
         // GUI Status page show the most-recently-completed
         // request's prefill + decode timing. If multiple slots
         // complete in the same retain pass, the last one wins
-        // (matches single-flight `CpuEngine` semantics where
+        // (matches single-flight `ContiguousEngine` semantics where
         // each completed request overwrites the slot).
         active.retain_mut(|slot| {
             if slot.state.done {
@@ -2488,7 +2530,7 @@ fn driver_loop(
 /// pool (the `cache` field is an empty placeholder whose page ops no-op).
 /// It carries its own contiguous F32 `KvCache` + its own `DeltaNetCache`,
 /// and is prefilled + decoded through the SAME `forward_one_hybrid` the
-/// contiguous `CpuEngine` uses — so the resulting token stream is
+/// contiguous `ContiguousEngine` uses — so the resulting token stream is
 /// BIT-IDENTICAL to the contiguous engine on the same prompt + sampling.
 ///
 /// Handoff convention mirrors the contiguous engine EXACTLY (so the streams
@@ -2716,6 +2758,21 @@ fn admit_request(
         };
         (sp, sl, chain)
     };
+    // Cap the shared prefix at `prompt.len() - 1` so the LAST prompt token is
+    // always (re)prefilled into a PRIVATE page: the first decode re-forwards it
+    // at pos `len-1` (see `next_pos` below — the contiguous/hybrid convention)
+    // and writes its K/V there, which must NOT land in a ref-shared donor page.
+    // Only triggers on a FULL-prompt cache hit (`shared_lcp == prompt.len()`,
+    // page-aligned); dropping one whole page releases its ref the same way the
+    // winner selection above does (`free`), and the final block re-registers in
+    // the APC when the private re-prefill completes. Without this cap a full hit
+    // fed the last token at the wrong position — the paged degeneration bug.
+    let (mut shared_pages, mut shared_lcp) = (shared_pages, shared_lcp);
+    while shared_lcp >= prompt.len() && !shared_pages.is_empty() {
+        let dropped = shared_pages.pop().expect("non-empty by loop guard");
+        ctx.shared.with_table_mut(|t| t.free(&[dropped]));
+        shared_lcp = shared_lcp.saturating_sub(page_size);
+    }
     if !shared_pages.is_empty() {
         cache.pin_shared_prefix(shared_pages, shared_lcp as u32);
     }
@@ -2756,7 +2813,15 @@ fn admit_request(
             hybrid: None,
             sampler,
             history: prompt_u32,
-            next_pos: tokens_prefilled, // finalized (unchanged) when prefill drains
+            // First decode re-forwards the LAST prompt token at pos `len-1`
+            // (NOT `len`): the suffix prefill already wrote K/V for [shared_lcp,
+            // len), so re-feeding `next_input` (= prompt[len-1]) at `len` would
+            // DUPLICATE that key at the wrong RoPE position and shift every
+            // generated token +1 — the run-on / language-mixing degeneration on
+            // the paged engine. `len-1` rewrites the same token's K/V
+            // idempotently into its private page and matches the contiguous +
+            // hybrid handoff. Finalized (unchanged) when the ragged prefill drains.
+            next_pos: tokens_prefilled - 1,
             next_input: last,
             n_emitted: 0,
             done: false,
@@ -3251,7 +3316,7 @@ fn run_ragged_tick(ctx: &DriverContext, active: &mut [DriverSlot], vocab: usize)
 /// paged `cache` and a hybrid slot's contiguous KV.
 fn commit_decode_token(ctx: &DriverContext, slot: &mut DriverSlot, logits: &mut [f32]) {
     // P9 feature parity: grammar-masked sample + grammar advance, identical to
-    // `CpuEngine::drive_generation`.
+    // `ContiguousEngine::drive_generation`.
     let next_tok = {
         let SlotState {
             sampler,
@@ -3271,7 +3336,7 @@ fn commit_decode_token(ctx: &DriverContext, slot: &mut DriverSlot, logits: &mut 
     slot.state.n_emitted += 1;
 
     // P9 string-stop detection: accumulate the detok buffer like the contiguous
-    // CpuEngine (`decode_single(id, true)`) and match, so a stop string
+    // ContiguousEngine (`decode_single(id, true)`) and match, so a stop string
     // spanning several tokens is caught. The stop-completing token is still
     // streamed (below), then the slot ends — mirroring `drive_generation`'s
     // "emit then break".
