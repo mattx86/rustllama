@@ -21,7 +21,10 @@
 
 /// Identifier for one fixed-size KV page. Indexes into the
 /// [`PageTable`]'s flat backing storage.
+// `repr(transparent)` so a `&[PageId]` block table reinterprets as `&[u32]`
+// zero-copy for the GPU paged flash-decode dispatch (Phase D).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct PageId(pub u32);
 
 /// Fixed-page allocator. `free` is a stack of `PageId`s — most-

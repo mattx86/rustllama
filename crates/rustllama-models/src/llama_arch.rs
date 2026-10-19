@@ -14009,6 +14009,32 @@ impl LlamaModel {
                     continue;
                 }
                 let kv_len = slot.pos as usize + 1;
+                // Phase D (GPU paged attention): the block-table flash-decode
+                // reads the device KV-pool mirror directly, so a hit SKIPS the
+                // host gather below. Inert / false off-CUDA or without the verdict
+                // => the gather + CPU attention path. `PageId` is
+                // repr(transparent), so `pages()` reinterprets as the `&[u32]`
+                // block table zero-copy.
+                {
+                    let pages = slot.cache.pages();
+                    let block_table: &[u32] = unsafe {
+                        std::slice::from_raw_parts(pages.as_ptr() as *const u32, pages.len())
+                    };
+                    if crate::accel::try_flash_attn_decode_paged_cuda_f32(
+                        &q_buf[i * d_q..(i + 1) * d_q],
+                        &mut attn_out[i * d_q..(i + 1) * d_q],
+                        block_table,
+                        layer_idx as u32,
+                        kv_len as u32,
+                        n_heads as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        swa_win as i32,
+                        softcap,
+                    ) {
+                        continue;
+                    }
+                }
                 // Slice the scratch to this slot's kv_len (the gather only writes
                 // that prefix; the buffer is sized to the max kv_len so it fits).
                 let slab_used = n_kv_heads * kv_len * head_dim;
@@ -14552,6 +14578,32 @@ impl LlamaModel {
                 }
                 let base = row_off[i];
                 let kv_len = s.start_pos as usize + s.n_query;
+                // Phase D (GPU paged attention): for a DECODE row (n_query == 1),
+                // try the block-table flash-decode against the device KV-pool
+                // mirror first — a hit SKIPS the host gather + CPU attention below.
+                // Inert / false off-CUDA or without the verdict => the gather +
+                // CPU path (prefill chunks, n_query > 1, always gather). `PageId`
+                // is repr(transparent) => zero-copy `&[u32]` block table.
+                if s.n_query == 1 {
+                    let pages = s.cache.pages();
+                    let block_table: &[u32] = unsafe {
+                        std::slice::from_raw_parts(pages.as_ptr() as *const u32, pages.len())
+                    };
+                    if crate::accel::try_flash_attn_decode_paged_cuda_f32(
+                        &q_buf[base * d_q..(base + 1) * d_q],
+                        &mut attn_out[base * d_q..(base + 1) * d_q],
+                        block_table,
+                        layer_idx as u32,
+                        kv_len as u32,
+                        n_heads as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        swa_win as i32,
+                        softcap,
+                    ) {
+                        continue;
+                    }
+                }
                 // Gather `[0, kv_len)` into the shared slab prefix.
                 let slab_used = n_kv_heads * kv_len * head_dim;
                 let k_slice = &mut k_slab[..slab_used];
@@ -14599,12 +14651,11 @@ impl LlamaModel {
                         );
                     }
                 } else {
-                    // DECODE ROW — gather + flash-decode / standard at the same
-                    // threshold the batched decoder uses, so this row is
-                    // bit-identical to its standalone decode. No GPU decode hook
-                    // here: like `forward_decode_paged_batched_f32`, the batched
-                    // paged path does not seed the device-resident KV mirror the
-                    // GPU decode kernel needs, so decode stays on the CPU slab.
+                    // DECODE ROW (CPU fallback) — gather + flash-decode / standard
+                    // at the same threshold the batched decoder uses, so this row
+                    // is bit-identical to its standalone decode. The GPU block-
+                    // table flash-decode was tried above (Phase D); this runs only
+                    // when it is off / unavailable (fail-closed).
                     let flash_min = flash_kv_len_min();
                     if crate::accel::flash_attention_enabled() && kv_len >= flash_min {
                         k::gqa_attention_flash_decode_capped_windowed(
