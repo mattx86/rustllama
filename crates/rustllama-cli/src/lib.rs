@@ -12014,6 +12014,51 @@ fn format_leaf(v: &toml::Value) -> String {
 
 // ----- chat REPL -----
 
+/// Format a REPL sampling knob for the `/help` listing: the explicitly-set
+/// value, or `"model default"` when unset (the request omits that field so the
+/// server's per-model recommended sampling applies).
+fn fmt_sampling_opt<T: std::fmt::Display>(v: Option<T>) -> String {
+    v.map(|x| x.to_string())
+        .unwrap_or_else(|| "model default".to_string())
+}
+
+/// Build a REPL chat request. The sampling fields pass through AS-IS: `None`
+/// means the user never set that knob via a `/temp` / `/top_p` / `/top_k` /
+/// `/repeat_penalty` command, so it is OMITTED from the wire request (serde
+/// `skip_serializing_if`) and the server applies its per-model recommended
+/// sampling (or generic default); `Some` is an explicit override that wins.
+/// `max_tokens` (a hard output cap) is always sent, and `allow_clarify` is the
+/// CLARIFY opt-in (`None` when off, so the request is wire-identical to the
+/// plain path). Shared by the main "user typed a message" path and
+/// `/regenerate` so both stay in lockstep.
+#[allow(clippy::too_many_arguments)]
+fn build_repl_request(
+    model: String,
+    messages: Vec<rustllama_client::ChatMessage>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<u32>,
+    max_tokens: u32,
+    repeat_penalty: Option<f32>,
+    clarify_enabled: bool,
+) -> rustllama_client::ChatRequest {
+    rustllama_client::ChatRequest {
+        model,
+        messages,
+        temperature,
+        top_p,
+        top_k,
+        max_tokens: Some(max_tokens),
+        repeat_penalty,
+        seed: None,
+        stream: true,
+        stream_options: Some(rustllama_client::StreamOptions {
+            include_usage: true,
+        }),
+        allow_clarify: clarify_enabled.then_some(true),
+    }
+}
+
 async fn chat_repl(
     config_path: &std::path::Path,
     system: Option<String>,
@@ -12021,7 +12066,7 @@ async fn chat_repl(
     base_url: Option<String>,
     initial: Vec<rustllama_client::ChatMessage>,
 ) -> anyhow::Result<()> {
-    use rustllama_client::{ChatMessage, ChatRequest, Client};
+    use rustllama_client::{ChatMessage, Client};
 
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
 
@@ -12085,13 +12130,17 @@ async fn chat_repl(
     // resolution (no model is literally named "default"); empty is the
     // sentinel for "use default" per the server's resolve() contract.
     let mut model_label = model.unwrap_or_default();
-    // Runtime-tweakable sampling. `/temp` and `/max_tokens` adjust these
-    // mid-session without restarting the REPL.
-    let mut temperature: f32 = 0.7;
+    // Runtime-tweakable sampling. `None` = the user has NOT set this field, so
+    // the request OMITS it (serde `skip_serializing_if`) and the server applies
+    // its per-model recommended sampling (or generic default). The `/temp`,
+    // `/top_p`, `/top_k`, `/repeat_penalty` commands flip the matching field to
+    // `Some`, which then overrides the recommendation. `max_tokens` is a hard
+    // output cap (not a sampling recommendation), so it is always sent.
+    let mut temperature: Option<f32> = None;
     let mut max_tokens: u32 = 512;
-    let mut top_p: f32 = 0.95;
-    let mut top_k: u32 = 40;
-    let mut repeat_penalty: f32 = 1.1;
+    let mut top_p: Option<f32> = None;
+    let mut top_k: Option<u32> = None;
+    let mut repeat_penalty: Option<f32> = None;
     // Auto-run tools: OFF prompts approve/deny on each proposed tool call;
     // ON accepts silently. Toggled with `/auto`. (The REPL never executes
     // tools — this only gates the confirmation prompt.)
@@ -12159,13 +12208,21 @@ async fn chat_repl(
                     println!("    /chat delete <name>  delete a saved session");
                     println!("  sampling / output:");
                     println!(
-                        "    /temp <0..2>       sampling temperature (current: {temperature})"
+                        "    /temp <0..2>       sampling temperature (current: {})",
+                        fmt_sampling_opt(temperature)
                     );
-                    println!("    /top_p <0..1>      nucleus-sampling cutoff (current: {top_p})");
                     println!(
-                        "    /top_k <0|N>       keep top-K tokens; 0 = full vocab (current: {top_k})"
+                        "    /top_p <0..1>      nucleus-sampling cutoff (current: {})",
+                        fmt_sampling_opt(top_p)
                     );
-                    println!("    /repeat_penalty <0.5..2.0>  discourage repeats; 1.0 = off (current: {repeat_penalty})");
+                    println!(
+                        "    /top_k <0|N>       keep top-K tokens; 0 = full vocab (current: {})",
+                        fmt_sampling_opt(top_k)
+                    );
+                    println!(
+                        "    /repeat_penalty <0.5..2.0>  discourage repeats; 1.0 = off (current: {})",
+                        fmt_sampling_opt(repeat_penalty)
+                    );
                     println!("    /max_tokens <n>    per-turn token cap (current: {max_tokens})");
                     println!(
                         "    /auto [on|off]     toggle auto-run of proposed tool calls (current: {})",
@@ -12212,23 +12269,16 @@ async fn chat_repl(
                         continue;
                     }
                     println!("[regenerating last turn]");
-                    let req = ChatRequest {
-                        model: model_label.clone(),
-                        messages: history_for_request(&messages),
-                        temperature: Some(temperature),
-                        top_p: Some(top_p),
-                        top_k: Some(top_k),
-                        max_tokens: Some(max_tokens),
-                        repeat_penalty: Some(repeat_penalty),
-                        seed: None,
-                        stream: true,
-                        stream_options: Some(rustllama_client::StreamOptions {
-                            include_usage: true,
-                        }),
-                        // `None` (not `Some(false)`) when off, so the OFF
-                        // request is wire-identical to the plain path.
-                        allow_clarify: clarify_enabled.then_some(true),
-                    };
+                    let req = build_repl_request(
+                        model_label.clone(),
+                        history_for_request(&messages),
+                        temperature,
+                        top_p,
+                        top_k,
+                        max_tokens,
+                        repeat_penalty,
+                        clarify_enabled,
+                    );
                     drive_chat_stream(&client, req, &mut messages, ctx_size).await?;
                     continue;
                 }
@@ -12367,8 +12417,8 @@ async fn chat_repl(
                 "temp" => {
                     match arg.parse::<f32>() {
                         Ok(t) if (0.0..=2.0).contains(&t) => {
-                            temperature = t;
-                            println!("[temperature = {temperature}]");
+                            temperature = Some(t);
+                            println!("[temperature = {t}]");
                         }
                         Ok(_) => println!("temperature out of range [0.0, 2.0]"),
                         Err(_) => println!("usage: /temp <0.0..2.0>"),
@@ -12420,8 +12470,8 @@ async fn chat_repl(
                 "top_p" => {
                     match arg.parse::<f32>() {
                         Ok(p) if (0.0..=1.0).contains(&p) => {
-                            top_p = p;
-                            println!("[top_p = {top_p}]");
+                            top_p = Some(p);
+                            println!("[top_p = {p}]");
                         }
                         Ok(_) => println!("top_p out of range [0.0, 1.0]"),
                         Err(_) => println!("usage: /top_p <0.0..1.0>"),
@@ -12431,10 +12481,10 @@ async fn chat_repl(
                 "top_k" => {
                     match arg.parse::<u32>() {
                         Ok(k) if k <= 1_000_000 => {
-                            top_k = k;
+                            top_k = Some(k);
                             println!(
-                                "[top_k = {top_k} ({})]",
-                                if top_k == 0 { "disabled" } else { "active" }
+                                "[top_k = {k} ({})]",
+                                if k == 0 { "disabled" } else { "active" }
                             );
                         }
                         Ok(_) => println!("top_k absurdly large"),
@@ -12445,8 +12495,8 @@ async fn chat_repl(
                 "repeat_penalty" => {
                     match arg.parse::<f32>() {
                         Ok(rp) if (0.5..=2.0).contains(&rp) => {
-                            repeat_penalty = rp;
-                            println!("[repeat_penalty = {repeat_penalty}]");
+                            repeat_penalty = Some(rp);
+                            println!("[repeat_penalty = {rp}]");
                         }
                         Ok(_) => println!("repeat_penalty out of range [0.5, 2.0]"),
                         Err(_) => println!("usage: /repeat_penalty <0.5..2.0>"),
@@ -12586,23 +12636,16 @@ async fn chat_repl(
         // option pick / tool-confirm) by appending a user turn and
         // re-issuing, until the model finishes normally.
         loop {
-            let req = ChatRequest {
-                model: model_label.clone(),
-                messages: history_for_request(&messages),
-                temperature: Some(temperature),
-                top_p: Some(top_p),
-                top_k: Some(top_k),
-                max_tokens: Some(max_tokens),
-                repeat_penalty: Some(repeat_penalty),
-                seed: None,
-                stream: true,
-                stream_options: Some(rustllama_client::StreamOptions {
-                    include_usage: true,
-                }),
-                // `None` (not `Some(false)`) when off, so the OFF request is
-                // wire-identical to the plain path (no `ask_user` tool).
-                allow_clarify: clarify_enabled.then_some(true),
-            };
+            let req = build_repl_request(
+                model_label.clone(),
+                history_for_request(&messages),
+                temperature,
+                top_p,
+                top_k,
+                max_tokens,
+                repeat_penalty,
+                clarify_enabled,
+            );
             match drive_chat_stream(&client, req, &mut messages, ctx_size).await? {
                 StreamOutcome::Normal => break,
                 StreamOutcome::AskUser { prompt, options } => {
@@ -13255,6 +13298,49 @@ mod tests {
         assert_eq!(out[0].content, "hi");
         assert_eq!(out[2].content, "again");
         assert_eq!(msgs[1].content, "chain of thought here</think>Hello!");
+    }
+
+    #[test]
+    fn repl_request_omits_unset_sampling_and_keeps_overrides() {
+        use rustllama_client::ChatMessage;
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+
+        // Fresh REPL state (no /temp etc.): every sampling field is omitted so
+        // the server applies its per-model recommendation; only the max_tokens
+        // hard cap is sent.
+        let req = build_repl_request("m".into(), msgs.clone(), None, None, None, 512, None, true);
+        assert_eq!(req.temperature, None);
+        assert_eq!(req.top_p, None);
+        assert_eq!(req.top_k, None);
+        assert_eq!(req.repeat_penalty, None);
+        assert_eq!(req.max_tokens, Some(512));
+        // The serialized wire form must NOT carry the unset knobs (serde
+        // `skip_serializing_if`), so the server never sees a client override.
+        let wire = serde_json::to_value(&req).unwrap();
+        assert!(wire.get("temperature").is_none());
+        assert!(wire.get("top_p").is_none());
+        assert!(wire.get("top_k").is_none());
+        assert!(wire.get("repeat_penalty").is_none());
+
+        // Explicit overrides (as the /temp, /top_k commands set) ARE sent;
+        // unset fields still omitted.
+        let req2 = build_repl_request("m".into(), msgs, Some(0.3), None, Some(50), 256, None, true);
+        assert_eq!(req2.temperature, Some(0.3));
+        assert_eq!(req2.top_k, Some(50));
+        assert_eq!(req2.top_p, None);
+        assert_eq!(req2.repeat_penalty, None);
+        let wire2 = serde_json::to_value(&req2).unwrap();
+        // f32→f64 widening isn't bit-exact, so assert presence + epsilon, not ==.
+        let t = wire2
+            .get("temperature")
+            .and_then(|v| v.as_f64())
+            .expect("temperature present");
+        assert!((t - 0.3).abs() < 1e-6);
+        assert_eq!(wire2.get("top_k").and_then(|v| v.as_u64()), Some(50));
+        assert!(wire2.get("top_p").is_none());
     }
 
     #[test]

@@ -82,12 +82,17 @@ struct App {
     model_id: String,
     server_url: String,
     status: String,
-    // sampling knobs (mirrors the REPL defaults + /commands)
-    temperature: f32,
+    // Sampling knobs. `None` = the user has NOT set this field, so the request
+    // OMITS it (serde `skip_serializing_if`) and the server applies its
+    // per-model recommended sampling (or its generic default). The `/temp`,
+    // `/top_p`, `/top_k`, `/repeat_penalty` commands flip the matching field to
+    // `Some`, which then overrides the recommendation. `max_tokens` is a hard
+    // output cap, not a sampling recommendation, so it is always sent.
+    temperature: Option<f32>,
     max_tokens: u32,
-    top_p: f32,
-    top_k: u32,
-    repeat_penalty: f32,
+    top_p: Option<f32>,
+    top_k: Option<u32>,
+    repeat_penalty: Option<f32>,
     should_quit: bool,
     /// Auto-run tools: when true, proposed tool calls are accepted silently;
     /// when false (default), they raise an approve/deny prompt. Toggled with
@@ -169,11 +174,14 @@ impl App {
         ChatRequest {
             model: self.model_label.clone(),
             messages: self.messages(),
-            temperature: Some(self.temperature),
-            top_p: Some(self.top_p),
-            top_k: Some(self.top_k),
+            // Send a sampling field ONLY when the user explicitly set it;
+            // otherwise pass `None` so it is omitted and the server applies its
+            // per-model recommendation. `max_tokens` is always sent (hard cap).
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
             max_tokens: Some(self.max_tokens),
-            repeat_penalty: Some(self.repeat_penalty),
+            repeat_penalty: self.repeat_penalty,
             seed: None,
             stream: true,
             stream_options: Some(rustllama_client::StreamOptions {
@@ -285,11 +293,11 @@ async fn event_loop<B: Backend>(
         model_id,
         server_url,
         status: "ready".into(),
-        temperature: 0.7,
+        temperature: None,
         max_tokens: 512,
-        top_p: 0.95,
-        top_k: 40,
-        repeat_penalty: 1.1,
+        top_p: None,
+        top_k: None,
+        repeat_penalty: None,
         should_quit: false,
         auto_tools: false,
         clarify_enabled: true,
@@ -810,7 +818,7 @@ fn handle_command(
         ),
         "top_k" => {
             if let Ok(v) = arg.parse() {
-                app.top_k = v;
+                app.top_k = Some(v);
                 app.status = format!("top_k = {v}");
             }
         }
@@ -1095,9 +1103,12 @@ fn handle_chat_command(app: &mut App, arg: &str) {
     }
 }
 
-fn set_f32(slot: &mut f32, arg: &str, status: &mut String, name: &str) {
+/// Parse `arg` as an f32 and record it as an EXPLICIT user override (`Some`)
+/// in `slot`. An unset slot stays `None`, so `request()` omits that field and
+/// the server applies its per-model recommendation.
+fn set_f32(slot: &mut Option<f32>, arg: &str, status: &mut String, name: &str) {
     if let Ok(v) = arg.parse() {
-        *slot = v;
+        *slot = Some(v);
         *status = format!("{name} = {v}");
     }
 }
@@ -1518,11 +1529,11 @@ mod tests {
             model_id: "test-model".into(),
             server_url: "http://127.0.0.1:11434".into(),
             status: "ready".into(),
-            temperature: 0.7,
+            temperature: None,
             max_tokens: 512,
-            top_p: 0.95,
-            top_k: 40,
-            repeat_penalty: 1.1,
+            top_p: None,
+            top_k: None,
+            repeat_penalty: None,
             should_quit: false,
             auto_tools: false,
             clarify_enabled: true,
@@ -1533,6 +1544,43 @@ mod tests {
             last_stats: None,
             ctx_size: 8192,
         }
+    }
+
+    /// A fresh `App` (the user has run no `/temp` etc.) must build a request
+    /// that OMITS every sampling field, so the server's per-model recommended
+    /// sampling applies. Setting one via the real `/command` path flips only
+    /// that field to `Some`; `max_tokens` (a hard cap) is always sent.
+    #[test]
+    fn fresh_request_omits_sampling_until_set() {
+        // `handle_command` needs a client + stream channel; the sampling
+        // `/commands` touch neither, so a never-used local client is fine
+        // (constructing a reqwest client does no I/O and needs no runtime).
+        let client = Arc::new(Client::new("http://127.0.0.1:11434").unwrap());
+        let (tx, _rx) = unbounded_channel::<StreamMsg>();
+
+        let mut app = test_app();
+        let req = app.request();
+        assert_eq!(req.temperature, None);
+        assert_eq!(req.top_p, None);
+        assert_eq!(req.top_k, None);
+        assert_eq!(req.repeat_penalty, None);
+        assert_eq!(req.max_tokens, Some(512)); // hard cap, always sent
+
+        // `/top_k 50` sets ONLY top_k; the rest stay omitted.
+        handle_command(&mut app, "top_k 50", &client, &tx);
+        let req = app.request();
+        assert_eq!(req.top_k, Some(50));
+        assert_eq!(req.temperature, None);
+        assert_eq!(req.top_p, None);
+        assert_eq!(req.repeat_penalty, None);
+
+        // `/temp 0.3` then also sets temperature, leaving the others as-is.
+        handle_command(&mut app, "temp 0.3", &client, &tx);
+        let req = app.request();
+        assert_eq!(req.temperature, Some(0.3));
+        assert_eq!(req.top_k, Some(50));
+        assert_eq!(req.top_p, None);
+        assert_eq!(req.repeat_penalty, None);
     }
 
     /// Emulate SSE token deltas: a few characters at a time, never splitting a
