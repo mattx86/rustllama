@@ -12022,6 +12022,29 @@ fn fmt_sampling_opt<T: std::fmt::Display>(v: Option<T>) -> String {
         .unwrap_or_else(|| "model default".to_string())
 }
 
+/// A generous, context-aware default for an interactive client's `max_tokens`.
+///
+/// The old flat `512` truncated every normal-length reply and, worse, starved
+/// a reasoning model's `<think>` block (Qwen3 can spend hundreds of tokens
+/// thinking before the answer even starts — a 512 cap cut off mid-thought and
+/// left an opaque "[thinking…]" with no answer). `max_tokens` is a HARD output
+/// cap, not a sampling recommendation, and the server already clamps it to
+/// `ctx_size - prompt`, so a large value is safe — it just means "generate
+/// until EOS / a stop sequence, up to what the context allows".
+///
+/// When the model's context length is known (the TUI / REPL fetch it from
+/// `/v1/metrics` at startup) we default to it; otherwise a generous `4096`
+/// fallback. Both are capped at `8192` so an unusually large context (e.g.
+/// 128k) doesn't make a single interactive reply able to eat the whole window.
+pub(crate) fn default_max_tokens(ctx_size: u32) -> u32 {
+    /// Fallback when the context length is unknown (metrics miss / no config).
+    const FALLBACK: u32 = 4096;
+    /// Ceiling so a huge context can't yield an absurd single-reply cap.
+    const CAP: u32 = 8192;
+    let base = if ctx_size > 0 { ctx_size } else { FALLBACK };
+    base.min(CAP)
+}
+
 /// Build a REPL chat request. The sampling fields pass through AS-IS: `None`
 /// means the user never set that knob via a `/temp` / `/top_p` / `/top_k` /
 /// `/repeat_penalty` command, so it is OMITTED from the wire request (serde
@@ -12135,9 +12158,10 @@ async fn chat_repl(
     // its per-model recommended sampling (or generic default). The `/temp`,
     // `/top_p`, `/top_k`, `/repeat_penalty` commands flip the matching field to
     // `Some`, which then overrides the recommendation. `max_tokens` is a hard
-    // output cap (not a sampling recommendation), so it is always sent.
+    // output cap (not a sampling recommendation), so it is always sent — seeded
+    // to a generous context-aware default (`/max_tokens <n>` overrides).
     let mut temperature: Option<f32> = None;
-    let mut max_tokens: u32 = 512;
+    let mut max_tokens: u32 = default_max_tokens(ctx_size);
     let mut top_p: Option<f32> = None;
     let mut top_k: Option<u32> = None;
     let mut repeat_penalty: Option<f32> = None;
@@ -13341,6 +13365,19 @@ mod tests {
         assert!((t - 0.3).abs() < 1e-6);
         assert_eq!(wire2.get("top_k").and_then(|v| v.as_u64()), Some(50));
         assert!(wire2.get("top_p").is_none());
+    }
+
+    #[test]
+    fn default_max_tokens_is_ctx_aware_and_never_512() {
+        // Known context → default IS that context (capped), never the old 512.
+        assert_eq!(default_max_tokens(2048), 2048);
+        assert_eq!(default_max_tokens(8192), 8192);
+        assert_ne!(default_max_tokens(8192), 512);
+        // A huge context is capped so a single reply can't eat the whole window.
+        assert_eq!(default_max_tokens(131_072), 8192);
+        // Unknown context (metrics miss / no config) → the generous fallback.
+        assert_eq!(default_max_tokens(0), 4096);
+        assert_ne!(default_max_tokens(0), 512);
     }
 
     #[test]

@@ -87,7 +87,8 @@ struct App {
     // per-model recommended sampling (or its generic default). The `/temp`,
     // `/top_p`, `/top_k`, `/repeat_penalty` commands flip the matching field to
     // `Some`, which then overrides the recommendation. `max_tokens` is a hard
-    // output cap, not a sampling recommendation, so it is always sent.
+    // output cap, not a sampling recommendation, so it is always sent — seeded
+    // to a generous context-aware default (`/max_tokens <n>` overrides).
     temperature: Option<f32>,
     max_tokens: u32,
     top_p: Option<f32>,
@@ -294,7 +295,10 @@ async fn event_loop<B: Backend>(
         server_url,
         status: "ready".into(),
         temperature: None,
-        max_tokens: 512,
+        // Generous, ctx-aware (the model's context length fetched above), so
+        // normal + long replies — and a reasoning model's `<think>` block —
+        // aren't truncated. `/max_tokens <n>` still overrides.
+        max_tokens: crate::default_max_tokens(ctx_size),
         top_p: None,
         top_k: None,
         repeat_penalty: None,
@@ -1530,7 +1534,8 @@ mod tests {
             server_url: "http://127.0.0.1:11434".into(),
             status: "ready".into(),
             temperature: None,
-            max_tokens: 512,
+            // Mirror the real `event_loop` default: the ctx-aware value, not 512.
+            max_tokens: crate::default_max_tokens(8192),
             top_p: None,
             top_k: None,
             repeat_penalty: None,
@@ -1564,7 +1569,9 @@ mod tests {
         assert_eq!(req.top_p, None);
         assert_eq!(req.top_k, None);
         assert_eq!(req.repeat_penalty, None);
-        assert_eq!(req.max_tokens, Some(512)); // hard cap, always sent
+        // Hard cap, always sent — the ctx-aware default (ctx 8192 → 8192), not 512.
+        assert_eq!(req.max_tokens, Some(crate::default_max_tokens(8192)));
+        assert_ne!(req.max_tokens, Some(512));
 
         // `/top_k 50` sets ONLY top_k; the rest stay omitted.
         handle_command(&mut app, "top_k 50", &client, &tx);
