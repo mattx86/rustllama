@@ -315,29 +315,74 @@ async fn event_loop<B: Backend>(
     // Persistent stream channel; each turn's task clones the sender.
     let (stream_tx, mut stream_rx) = unbounded_channel::<StreamMsg>();
 
+    // Streaming redraw coalescing. Painting one frame per streamed token floods
+    // a terminal, and over SSH that flood is exactly what tears / ghosts the
+    // transcript — the model output is fine, it's the UPDATE VOLUME the
+    // transport mishandles. So we DRAIN every token already queued into app
+    // state and repaint at most once per `REDRAW_MIN_INTERVAL`, while still
+    // painting PROMPTLY on anything the user needs to see at once: input edits,
+    // the first token of a reply, and every stream BOUNDARY (done / error /
+    // info / ask-user / tool-calls). A delta we throttle away sets
+    // `pending_redraw`, and a short timer then flushes it so even a stalled
+    // stream still shows its last tokens. This changes only HOW OFTEN we
+    // repaint, never what is displayed.
+    const REDRAW_MIN_INTERVAL: Duration = Duration::from_millis(40);
+    let mut last_draw = std::time::Instant::now();
+    let mut pending_redraw = false;
+
     // Initial paint.
     terminal.draw(|f| ui(f, &mut app))?;
 
     while !app.should_quit {
-        let mut dirty = false;
+        let since_draw = last_draw.elapsed();
+        // Time until the throttle window reopens (0 once we're past it).
+        let throttle_wait = REDRAW_MIN_INTERVAL.saturating_sub(since_draw);
+        let mut draw_now = false;
+
         tokio::select! {
             biased;
             Some(ev) = ev_rx.recv() => {
+                // Input / resize: repaint immediately so typing stays crisp.
                 if handle_event(&mut app, ev, &client, &stream_tx) {
-                    dirty = true;
+                    draw_now = true;
                 }
             }
             Some(msg) = stream_rx.recv() => {
+                // A boundary (done/error/info/ask/tools) must show at once, and
+                // so should the FIRST token of a reply (the empty assistant
+                // placeholder getting its first text).
+                let mut force = stream_msg_is_boundary(&msg)
+                    || (matches!(&msg, StreamMsg::Delta(_))
+                        && app
+                            .last_assistant_mut()
+                            .map(|a| a.content.is_empty())
+                            .unwrap_or(false));
                 apply_stream_msg(&mut app, msg);
-                dirty = true;
+                // Coalesce: fold in every token already waiting so one repaint
+                // covers them all instead of one-per-token.
+                while let Ok(m) = stream_rx.try_recv() {
+                    force |= stream_msg_is_boundary(&m);
+                    apply_stream_msg(&mut app, m);
+                }
+                if force || since_draw >= REDRAW_MIN_INTERVAL {
+                    draw_now = true;
+                } else {
+                    pending_redraw = true;
+                }
             }
-            // Fallback tick so a resize / late paint still refreshes.
+            // Throttle flush: a delta we skipped repaints once the window reopens.
+            _ = tokio::time::sleep(throttle_wait), if pending_redraw => {
+                draw_now = true;
+            }
+            // Fallback tick so a resize / late paint / live stats still refresh.
             _ = tokio::time::sleep(Duration::from_millis(120)) => {
-                dirty = true;
+                draw_now = true;
             }
         }
-        if dirty {
+        if draw_now {
             terminal.draw(|f| ui(f, &mut app))?;
+            last_draw = std::time::Instant::now();
+            pending_redraw = false;
         }
     }
 
@@ -594,6 +639,15 @@ fn apply_stream_msg(app: &mut App, msg: StreamMsg) {
             }
         }
     }
+}
+
+/// Whether a stream message is a BOUNDARY that must repaint at once rather
+/// than a plain token that can be coalesced with its neighbors. Everything
+/// that changes the transcript's structure or ends the stream is a boundary;
+/// only `Delta` (a token) and `Usage` (a silent counts stash, always trailed
+/// by a `Done`) are coalescable.
+fn stream_msg_is_boundary(msg: &StreamMsg) -> bool {
+    !matches!(msg, StreamMsg::Delta(_) | StreamMsg::Usage(_))
 }
 
 /// Drop a trailing empty assistant placeholder (the one a turn pushes before
