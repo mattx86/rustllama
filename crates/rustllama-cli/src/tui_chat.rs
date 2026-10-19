@@ -1119,38 +1119,70 @@ fn set_f32(slot: &mut Option<f32>, arg: &str, status: &mut String, name: &str) {
 
 // ---- rendering ----
 
-/// Strip chain-of-thought reasoning from an assistant message for DISPLAY.
-/// Reasoning models (Qwen3, …) stream a `<think>…</think>` scratchpad the user
-/// shouldn't see in the transcript. A COMPLETE span is removed; an UNCLOSED
-/// `<think>` (reasoning still streaming) collapses to a dim `[thinking…]` marker
-/// so the turn isn't blank mid-generation. Also handles the template-injected
-/// form where the completion starts mid-thought and only emits the closing tag
-/// (a `</think>` with no `<think>` before it → drop everything up to it). Models
-/// that emit no think tags are returned unchanged. Display-only; the stored
-/// content (and thus history) is untouched.
-fn strip_think(content: &str) -> String {
+/// An assistant message split into its chain-of-thought reasoning span and the
+/// final answer, for DISPLAY.
+struct ReasonSplit {
+    /// The reasoning text (the `<think>` scratchpad), to render dimmed. Empty
+    /// when the model emitted no reasoning.
+    reasoning: String,
+    /// The answer (reasoning stripped), to render normally. Empty while the
+    /// reasoning is still streaming (no `</think>` yet).
+    answer: String,
+    /// Whether a reasoning span was detected at all.
+    has_reasoning: bool,
+}
+
+/// Split an assistant message into `(reasoning, answer)` for DISPLAY.
+///
+/// Reasoning models (Qwen3, …) stream a `<think>…</think>` scratchpad. Rather
+/// than hide it behind a frozen `[thinking…]` marker (which looks identical
+/// whether the model is working or stuck), the TUI STREAMS the reasoning live
+/// in a dimmed style and renders the answer normally once `</think>` arrives —
+/// the same split the native GUI's "Reasoning" section makes.
+///
+///   - **Closed span** — a normal `<think>…</think>` pair OR Qwen3's
+///     prompt-opened form (the completion carries only the closing tag because
+///     the template opens `<think>` in the PROMPT): `reasoning` = the text up to
+///     `</think>` (any leading `<think>` removed), `answer` = the shared
+///     `strip_reasoning` cut (so the displayed answer matches what the OUTGOING
+///     history re-sends).
+///   - **Open span** — an `<think>` seen, no `</think>` yet (reasoning still
+///     streaming): `reasoning` = the text after `<think>`, `answer` = empty.
+///   - **No think tags** → `answer` = the content, `reasoning` empty.
+///
+/// Display-only; the stored content (and thus history) is untouched.
+fn split_reasoning(content: &str) -> ReasonSplit {
     const OPEN: &str = "<think>";
     const CLOSE: &str = "</think>";
-    // A CLOSED reasoning span — the prompt-opened leading `</think>` (Qwen3's
-    // template opens `<think>` in the PROMPT, so the completion carries only the
-    // close) OR a normal `<think>…</think>` pair — is removed by the shared
-    // stripper, which both UIs and the REPL use so the behavior matches.
-    if content.contains(CLOSE) {
-        return rustllama_client::strip_reasoning(content).to_string();
+    if let Some(ci) = content.find(CLOSE) {
+        // Closed: reasoning is everything before `</think>` (drop a leading
+        // `<think>` if present — prompt-opened Qwen3 has none). The answer uses
+        // the SAME shared cut the REPL/GUI/outgoing-history path uses.
+        let head = &content[..ci];
+        let reasoning = match head.rfind(OPEN) {
+            Some(oi) => &head[oi + OPEN.len()..],
+            None => head,
+        };
+        return ReasonSplit {
+            reasoning: reasoning.trim().to_string(),
+            answer: rustllama_client::strip_reasoning(content).to_string(),
+            has_reasoning: true,
+        };
     }
-    // An UNCLOSED `<think>` (reasoning still streaming, no close yet) → collapse
-    // to a dim `[thinking…]` marker so the turn isn't blank mid-generation.
-    if let Some(i) = content.find(OPEN) {
-        let head = content[..i].trim_end();
-        let mut out = head.to_string();
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str("[thinking…]");
-        return out;
+    if let Some(oi) = content.find(OPEN) {
+        // Open: reasoning still streaming, no close yet. Show it live (dimmed).
+        return ReasonSplit {
+            reasoning: content[oi + OPEN.len()..].trim_start().to_string(),
+            answer: String::new(),
+            has_reasoning: true,
+        };
     }
-    // No think tags at all → unchanged.
-    content.to_string()
+    // No think tags → render the whole content as the answer.
+    ReasonSplit {
+        reasoning: String::new(),
+        answer: content.to_string(),
+        has_reasoning: false,
+    }
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
@@ -1282,10 +1314,12 @@ fn ui(f: &mut Frame, app: &mut App) {
         } else {
             Style::default()
         };
-        // "Prefix: " then wrapped body; continuation lines indented.
-        // Assistant turns have their chain-of-thought `<think>…</think>` span
-        // hidden (reasoning models stream a scratchpad the user shouldn't see);
-        // everything else renders verbatim.
+        // "Prefix: " then wrapped body; continuation lines indented. Assistant
+        // turns split their chain-of-thought `<think>…</think>` span out: the
+        // reasoning streams LIVE in a dimmed (DarkGray) style — so a long / slow
+        // / stuck think phase shows as visible progress, not a frozen marker —
+        // and the answer renders normally once `</think>` arrives. Everything
+        // else renders verbatim in its role style.
         let head = format!("{prefix}: ");
         // DISPLAY width of the head, not its byte length: the info prefix "··"
         // is U+00B7 ×2 = 4 bytes / 2 columns, so `head.len()` over-indented and
@@ -1293,27 +1327,49 @@ fn ui(f: &mut Frame, app: &mut App) {
         // spaces (1 column each) so continuation lines align under the body.
         let head_w = UnicodeWidthStr::width(head.as_str());
         let indent = " ".repeat(head_w.min(content_w.saturating_sub(1)));
-        let body: std::borrow::Cow<str> = if t.role == "assistant" {
-            std::borrow::Cow::Owned(strip_think(&t.content))
-        } else {
-            std::borrow::Cow::Borrowed(t.content.as_str())
-        };
-        let wrapped = wrap_text(&body, content_w.saturating_sub(head_w).max(1));
-        if wrapped.is_empty() {
-            lines.push(Line::from(vec![Span::styled(head.clone(), style)]));
-        }
-        for (i, w) in wrapped.iter().enumerate() {
-            if i == 0 {
-                lines.push(Line::from(vec![
-                    Span::styled(head.clone(), style),
-                    Span::styled(w.clone(), body_style),
-                ]));
-            } else {
-                lines.push(Line::from(vec![
-                    Span::raw(indent.clone()),
-                    Span::styled(w.clone(), body_style),
-                ]));
+        let body_width = content_w.saturating_sub(head_w).max(1);
+
+        // Ordered, per-segment-styled body: assistant turns emit a dimmed
+        // reasoning segment (when present) then the normal answer; every other
+        // role is a single verbatim segment.
+        let segments: Vec<(String, Style)> = if t.role == "assistant" {
+            let split = split_reasoning(&t.content);
+            let mut segs: Vec<(String, Style)> = Vec::new();
+            if split.has_reasoning && !split.reasoning.is_empty() {
+                segs.push((split.reasoning, Style::default().fg(Color::DarkGray)));
             }
+            // The answer is empty while the reasoning is still streaming; it
+            // fills in once `</think>` arrives.
+            if !split.answer.is_empty() {
+                segs.push((split.answer, Style::default()));
+            }
+            segs
+        } else {
+            vec![(t.content.clone(), body_style)]
+        };
+
+        // Emit: the head leads the very first wrapped line; every later line is
+        // indented under the body. A turn with no body yet (the empty assistant
+        // placeholder while a reply is awaited) still shows its head.
+        let mut first_line = true;
+        for (text, seg_style) in &segments {
+            for w in wrap_text(text, body_width) {
+                if first_line {
+                    lines.push(Line::from(vec![
+                        Span::styled(head.clone(), style),
+                        Span::styled(w, *seg_style),
+                    ]));
+                    first_line = false;
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::raw(indent.clone()),
+                        Span::styled(w, *seg_style),
+                    ]));
+                }
+            }
+        }
+        if first_line {
+            lines.push(Line::from(vec![Span::styled(head.clone(), style)]));
         }
         lines.push(Line::from("")); // blank separator between turns
     }
@@ -1788,6 +1844,121 @@ mod tests {
             term.backend().buffer(),
             fresh.backend().buffer(),
             "scrolling through offsets left stale / smeared cells vs a fresh render"
+        );
+    }
+
+    /// Concatenate every cell symbol (row-major, a newline per row) so a
+    /// rendered-text substring check is easy.
+    fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        let area = *buf.area();
+        let mut s = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                s.push_str(buf[(x, y)].symbol());
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    /// The foreground color of the first cell whose symbol equals `needle`
+    /// (scanning row-major). Used to assert a span's style landed in the buffer.
+    fn first_cell_fg(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<Color> {
+        let area = *buf.area();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if buf[(x, y)].symbol() == needle {
+                    return Some(buf[(x, y)].fg);
+                }
+            }
+        }
+        None
+    }
+
+    /// FIX 3 — reasoning streams LIVE (dimmed), not a frozen "[thinking…]".
+    ///
+    /// While a `<think>` span is OPEN (streaming, no `</think>` yet) the real
+    /// `ui` must paint the reasoning text itself in a dimmed (DarkGray) style —
+    /// so the user sees progress token-by-token — rather than collapse it to a
+    /// static marker that hides whether the model is working or stuck.
+    #[test]
+    fn open_think_span_streams_dimmed_reasoning_not_a_marker() {
+        use ratatui::backend::TestBackend;
+        let (w, h) = (60u16, 16u16);
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut app = test_app();
+        app.turns.push(Turn {
+            role: "user".into(),
+            content: "hi".into(),
+        });
+        // An OPEN think span: the unique 'Z' leads the reasoning so its styled
+        // cell is easy to find; no closing tag yet (still streaming).
+        app.turns.push(Turn {
+            role: "assistant".into(),
+            content: "<think>Zebra reasoning underway".into(),
+        });
+        app.streaming = true;
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let text = buffer_text(buf);
+
+        // The reasoning TEXT is on screen (streamed live)…
+        assert!(
+            text.contains("Zebra reasoning underway"),
+            "reasoning text must stream live, got:\n{text}"
+        );
+        // …NOT hidden behind a frozen marker…
+        assert!(
+            !text.contains("[thinking"),
+            "must not show the old static [thinking…] marker"
+        );
+        // …and it is dimmed (DarkGray), visibly distinct from a normal answer.
+        assert_eq!(
+            first_cell_fg(buf, "Z"),
+            Some(Color::DarkGray),
+            "streaming reasoning must render dimmed (DarkGray)"
+        );
+    }
+
+    /// FIX 3 — once `</think>` arrives the answer renders normally and the
+    /// reasoning stays styled distinctly (dimmed) from it.
+    #[test]
+    fn closed_think_span_renders_answer_normal_reasoning_dimmed() {
+        use ratatui::backend::TestBackend;
+        let (w, h) = (60u16, 16u16);
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut app = test_app();
+        app.turns.push(Turn {
+            role: "user".into(),
+            content: "hi".into(),
+        });
+        // Closed span: 'Z' leads the reasoning, 'Q' leads the answer (both
+        // unique in the frame) so each segment's style is findable.
+        app.turns.push(Turn {
+            role: "assistant".into(),
+            content: "<think>Zebra reasoning underway</think>Qwik final answer".into(),
+        });
+        app.streaming = false;
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let text = buffer_text(buf);
+
+        // Both the reasoning and the answer are on screen.
+        assert!(text.contains("Zebra reasoning underway"), "reasoning kept");
+        assert!(text.contains("Qwik final answer"), "answer rendered");
+
+        let reasoning_fg = first_cell_fg(buf, "Z").expect("reasoning 'Z' present");
+        let answer_fg = first_cell_fg(buf, "Q").expect("answer 'Q' present");
+        // Reasoning dimmed; answer normal (buffer default fg = Reset); distinct.
+        assert_eq!(reasoning_fg, Color::DarkGray, "reasoning stays dimmed");
+        assert_eq!(
+            answer_fg,
+            Color::Reset,
+            "answer renders in the normal style"
+        );
+        assert_ne!(
+            reasoning_fg, answer_fg,
+            "reasoning must be styled distinctly from the answer"
         );
     }
 }
