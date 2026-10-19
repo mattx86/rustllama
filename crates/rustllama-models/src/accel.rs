@@ -3154,6 +3154,13 @@ pub fn reset_device_caches_for_new_model() {
 // ===========================================================================
 struct PagedKvDeviceMirror {
     slab: ck::CudaDeviceBuffer<'static>,
+    // Reusable per-decode scratch (Phase C): the uploaded query, the sequence's
+    // block table, and the attention output — lazily sized via `ensure_cuda_dev`
+    // so the dispatch doesn't re-allocate per call. Declared before `stream`
+    // (they borrow it) so field-drop order frees them before the stream.
+    dev_q: Option<ck::CudaDeviceBuffer<'static>>,
+    dev_block_table: Option<ck::CudaDeviceBuffer<'static>>,
+    dev_out: Option<ck::CudaDeviceBuffer<'static>>,
     // Geometry mirror of `PagedKvStore` (paged_kv_store.rs): identical strides,
     // so a host cell and its device cell share the same element offset.
     page_stride: usize,
@@ -3224,6 +3231,9 @@ pub fn paged_mirror_init(
     };
     let mirror = PagedKvDeviceMirror {
         slab,
+        dev_q: None,
+        dev_block_table: None,
+        dev_out: None,
         page_stride,
         layer_stride,
         kv_stride,
@@ -3308,6 +3318,130 @@ pub fn paged_mirror_reset() {
 fn f32_slice_as_bytes(s: &[f32]) -> &[u8] {
     // SAFETY: f32 is plain-old-data; reinterpret the slice's bytes read-only.
     unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
+}
+
+/// Verdict gate for the CUDA block-table paged flash-decode (Phase C). On only
+/// when CUDA is active AND `tune --validate-kernels` recorded a pass for
+/// `attn:paged_decode_cuda` on this machine+model. Cached (`OnceLock`);
+/// fail-closed (absent / false ⇒ the paged engine keeps the CPU gather path).
+fn dev_attn_paged_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cuda_active() && verdict_enabled(rustllama_tuner::VERDICT_ATTN_PAGED_DECODE_CUDA)
+    })
+}
+
+/// GPU paged attention (Phase C): run the block-table flash-decode for ONE
+/// decode query of ONE layer against the device pool mirror, writing `[n_heads,
+/// head_dim]` into `out`. Returns `false` (⇒ the caller keeps the CPU gather
+/// path, byte-identical) when the verdict is off / CUDA inactive / a DEVICE_LOST
+/// latched / no mirror present / a geometry mismatch / any alloc / upload /
+/// launch / readback error. `q`/`out` are host `[n_heads*head_dim]`;
+/// `block_table` is the sequence's physical page ids (`cache.pages()` as u32),
+/// covering `ceil(kv_len / page_size)` logical blocks. `window`/`softcap` match
+/// the CPU reference (0/0 = full causal, no cap).
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_paged_cuda_f32(
+    q: &[f32],
+    out: &mut [f32],
+    block_table: &[u32],
+    layer_idx: u32,
+    kv_len: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    window: i32,
+    softcap: f32,
+) -> bool {
+    if !dev_attn_paged_enabled() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    let nh = n_heads as usize;
+    let hd = head_dim as usize;
+    if nh == 0 || hd == 0 || n_kv_heads == 0 || q.len() != nh * hd || out.len() != nh * hd {
+        return false;
+    }
+    let Ok(mut g) = paged_mirror().lock() else {
+        return false;
+    };
+    let Some(m) = g.as_mut() else {
+        return false;
+    };
+    // Geometry must match the mirror the kernel indexes against.
+    if layer_idx >= m.n_layers
+        || hd != m.head_dim
+        || n_kv_heads != m.n_kv_heads
+        || n_heads % n_kv_heads != 0
+    {
+        return false;
+    }
+    let page_size = m.page_size as usize;
+    let num_blocks = (kv_len as usize).div_ceil(page_size.max(1));
+    if kv_len == 0 || block_table.len() < num_blocks {
+        return false;
+    }
+    // Reusable scratch (lazily grown): Q, block table (i32), output.
+    if !ensure_cuda_dev(&mut m.dev_q, &m.stream, nh * hd * 4)
+        || !ensure_cuda_dev(&mut m.dev_out, &m.stream, nh * hd * 4)
+        || !ensure_cuda_dev(&mut m.dev_block_table, &m.stream, num_blocks * 4)
+    {
+        return false;
+    }
+    // Upload Q.
+    if m.dev_q
+        .as_mut()
+        .unwrap()
+        .copy_from_host(f32_slice_as_bytes(q))
+        .is_err()
+    {
+        return false;
+    }
+    // Upload the block table (u32 page ids reinterpreted as i32 — same bytes).
+    let bt_bytes =
+        unsafe { std::slice::from_raw_parts(block_table.as_ptr() as *const u8, num_blocks * 4) };
+    if m.dev_block_table
+        .as_mut()
+        .unwrap()
+        .copy_from_host(bt_bytes)
+        .is_err()
+    {
+        return false;
+    }
+    // Gather raw device pointers (disjoint fields) and launch against the slab.
+    let n_layers = m.n_layers as usize;
+    let stream = &m.stream;
+    let q_ptr = m.dev_q.as_ref().unwrap().as_ptr() as *const f32;
+    let pool_ptr = m.slab.as_ptr() as *const f32;
+    let bt_ptr = m.dev_block_table.as_ref().unwrap().as_ptr() as *const i32;
+    let out_ptr = m.dev_out.as_mut().unwrap().as_mut_ptr() as *mut f32;
+    // SAFETY: all four are live device pointers on `stream`, sized for the
+    // shapes below; the wrapper synchronizes before returning, so the read-back
+    // does not race the kernel.
+    let launched = unsafe {
+        ck::flash_attn_decode_paged_f32(
+            stream,
+            q_ptr,
+            pool_ptr,
+            bt_ptr,
+            out_ptr,
+            nh,
+            n_kv_heads as usize,
+            hd,
+            layer_idx as usize,
+            n_layers,
+            page_size,
+            kv_len as usize,
+            window,
+            softcap,
+        )
+    };
+    if launched.is_err() {
+        return false;
+    }
+    // Read the attention output back into the caller's host buffer.
+    let out_bytes =
+        unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, nh * hd * 4) };
+    m.dev_out.as_ref().unwrap().copy_to_host(out_bytes).is_ok()
 }
 
 /// `--cuda-parity` verdict-cache name for the grouped FFN kernel of `kind`, or

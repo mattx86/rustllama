@@ -4279,6 +4279,14 @@ fn cu_upload_f32<'s>(stream: &'s ck::CudaStream, data: &[f32]) -> Option<ck::Cud
     ck::CudaDeviceBuffer::from_host(stream, bytes)
 }
 
+/// Upload an i32 slice into a fresh device buffer (bytes reinterpret).
+fn cu_upload_i32<'s>(stream: &'s ck::CudaStream, data: &[i32]) -> Option<ck::CudaDeviceBuffer<'s>> {
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+    };
+    ck::CudaDeviceBuffer::from_host(stream, bytes)
+}
+
 /// Download `n` f32 from a device buffer.
 fn cu_download_f32(buf: &ck::CudaDeviceBuffer<'_>, n: usize) -> Vec<f32> {
     let mut out = vec![0f32; n];
@@ -6026,6 +6034,122 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                         key,
                         &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"),
                     );
+                }
+            }
+        }
+
+        // attn:paged_decode_cuda (GPU paged attention, Phase C): the block-table
+        // flash-decode graded vs the SAME CPU reference, with a SCATTERED block
+        // table so the page indirection is genuinely exercised. The synthetic
+        // paged pool stores logical position t at page=block_table[t/page_size],
+        // in_page=t%page_size (the Phase A geometry), so a kernel that mis-maps
+        // blocks fails the verdict. WRITE-BLIND (no NVIDIA here) — validated on
+        // the pod.
+        {
+            let (n_heads, n_kv_heads, head_dim, kv_len) = (8usize, 2usize, 128usize, 40usize);
+            let (layer_idx, n_layers, page_size) = (1usize, 3usize, 16usize);
+            let max_ctx = kv_len; // CPU reference attends [0, kv_len)
+            let num_blocks = kv_len.div_ceil(page_size); // ceil(40/16) = 3
+            let total_pages = 8usize;
+            // Scattered logical-block -> physical-page map (distinct pages).
+            let block_table: Vec<i32> = (0..num_blocks)
+                .map(|i| ((i * 3 + 2) % total_pages) as i32)
+                .collect();
+            let q = gen_x(n_heads * head_dim, 61);
+            let kc = gen_x(n_kv_heads * max_ctx * head_dim, 63);
+            let vc = gen_x(n_kv_heads * max_ctx * head_dim, 67);
+            // Scatter (t, h) K/V into the physical page the block table points at.
+            let head_stride = page_size * head_dim;
+            let kv_stride = n_kv_heads * head_stride;
+            let layer_stride = 2 * kv_stride;
+            let page_stride = n_layers * layer_stride;
+            let mut pool = vec![0f32; total_pages * page_stride];
+            for t in 0..kv_len {
+                let page = block_table[t / page_size] as usize;
+                let in_page = t % page_size;
+                for h in 0..n_kv_heads {
+                    let src = (h * max_ctx + t) * head_dim;
+                    let base = page * page_stride
+                        + layer_idx * layer_stride
+                        + h * head_stride
+                        + in_page * head_dim;
+                    pool[base..base + head_dim].copy_from_slice(&kc[src..src + head_dim]);
+                    pool[base + kv_stride..base + kv_stride + head_dim]
+                        .copy_from_slice(&vc[src..src + head_dim]);
+                }
+            }
+            let dec_cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
+            if let (Some(qb), Some(poolb), Some(btb), Some(mut ob)) = (
+                cu_upload_f32(&stream, &q),
+                cu_upload_f32(&stream, &pool),
+                cu_upload_i32(&stream, &block_table),
+                ck::CudaDeviceBuffer::alloc(&stream, n_heads * head_dim * 4),
+            ) {
+                let (mut worst_cos, mut worst_rel) = (1.0f64, 0.0f64);
+                let mut err: Option<String> = None;
+                for (window, softcap) in dec_cases {
+                    let mut cpu = vec![0f32; n_heads * head_dim];
+                    k::gqa_attention_flash_decode_capped_windowed(
+                        &q,
+                        &kc,
+                        &vc,
+                        &mut cpu,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_ctx,
+                        kv_len,
+                        window as usize,
+                        softcap,
+                    );
+                    // SAFETY: q/out [n_heads*head_dim] device f32; pool = the slab;
+                    // block_table = [num_blocks] i32 device.
+                    let res = unsafe {
+                        ck::flash_attn_decode_paged_f32(
+                            &stream,
+                            qb.as_ptr() as *const f32,
+                            poolb.as_ptr() as *const f32,
+                            btb.as_ptr() as *const i32,
+                            ob.as_mut_ptr() as *mut f32,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            layer_idx,
+                            n_layers,
+                            page_size,
+                            kv_len,
+                            window as i32,
+                            softcap,
+                        )
+                    };
+                    if let Err(e) = res {
+                        err = Some(format!("{e}"));
+                        break;
+                    }
+                    let (cos, max_rel) = compare(&cu_download_f32(&ob, n_heads * head_dim), &cpu);
+                    worst_cos = worst_cos.min(cos);
+                    worst_rel = worst_rel.max(max_rel);
+                }
+                match err {
+                    Some(e) => {
+                        cu_emit("attn:paged_decode_cuda", "KERNEL_ERR", &e);
+                        *counts.entry("KERNEL_ERR").or_default() += 1;
+                    }
+                    None => {
+                        let key: &'static str = if worst_cos > 0.999 && worst_rel < 0.02 {
+                            "OK"
+                        } else {
+                            "MISCOMPUTE"
+                        };
+                        *counts.entry(key).or_default() += 1;
+                        cu_emit(
+                            "attn:paged_decode_cuda",
+                            key,
+                            &format!(
+                                "cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"
+                            ),
+                        );
+                    }
                 }
             }
         }

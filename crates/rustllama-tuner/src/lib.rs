@@ -222,6 +222,12 @@ pub const VERDICT_MATVEC_Q4K_W4A8: &str = "matvec:q4_k_w4a8";
 /// configs where attention isn't the bottleneck, a win only on a dense model or
 /// a fully-fitting GPU). Read by `accel::dev_attn_enabled`; f32-KV-only at dispatch.
 pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK: &str = "attn:dev_resident_block";
+/// GPU paged attention (Phase C): the CUDA block-table flash-decode kernel
+/// (`flash_attn_decode_paged_f32`) graded vs the CPU gather + flash-decode
+/// reference over pass / SWA / soft-cap. Read by `accel::dev_attn_paged_enabled`;
+/// f32-KV-only at dispatch (the paged KV store is F32). Fail-closed: absent /
+/// `false` ⇒ the paged engine keeps the CPU gather attention path.
+pub const VERDICT_ATTN_PAGED_DECODE_CUDA: &str = "attn:paged_decode_cuda";
 /// SYCL (USM) twin of [`VERDICT_ATTN_DEV_RESIDENT_BLOCK`] — the #2 on-device
 /// activation-residency DECODE attention block run on the SYCL in-order queue
 /// (Feature 1a). Separate verdict because the win/loss profile is per-backend:
