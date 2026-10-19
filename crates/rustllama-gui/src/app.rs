@@ -1772,7 +1772,16 @@ impl GuiApp {
             .iter()
             .map(|t| MultimodalMessage {
                 role: t.role.clone(),
-                content: t.content.clone(),
+                // Strip a prior assistant turn's reasoning span before re-sending
+                // it as context — Qwen3 (and other reasoning models) expect only
+                // the final answer of earlier turns fed back, not the `<think>`
+                // scratchpad (feeding it back drifts the context). The stored
+                // transcript is untouched; this shapes only the OUTGOING history.
+                content: if t.role == "assistant" {
+                    rustllama_client::strip_reasoning(&t.content).to_string()
+                } else {
+                    t.content.clone()
+                },
                 images: t.images.clone(),
             })
             .collect();
@@ -5087,6 +5096,20 @@ fn render_assistant_card<H: std::hash::Hash>(
 /// after `<think>` is the partial reasoning and the answer is empty.
 fn split_thinking(content: &str) -> ThinkSplit {
     let Some((oi, olen)) = find_tag_ci(content, &["<think>", "<thinking>"]) else {
+        // No OPENING tag. Qwen3's chat template opens `<think>` in the PROMPT,
+        // so the completion frequently carries only the CLOSING tag — the whole
+        // prefix up to the first `</think>` is reasoning. Split it out (same cut
+        // the shared `rustllama_client::strip_reasoning` makes for the answer)
+        // so the trace collapses into the "Reasoning" section instead of leaking
+        // the reasoning + a bare `</think>` into the rendered answer.
+        if let Some((ci, clen)) = find_tag_ci(content, &["</think>", "</thinking>"]) {
+            return ThinkSplit {
+                thinking: content[..ci].trim().to_string(),
+                answer: content[ci + clen..].trim().to_string(),
+                has_thinking: true,
+                thinking_done: true,
+            };
+        }
         return ThinkSplit {
             thinking: String::new(),
             answer: content.to_string(),

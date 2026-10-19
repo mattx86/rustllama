@@ -145,9 +145,20 @@ impl App {
             // being generated (it has no content yet), so we send only
             // real history + the new user message.
             if t.role == "user" || (t.role == "assistant" && !t.content.is_empty()) {
+                // Strip a prior assistant turn's reasoning span before re-sending
+                // it as context: Qwen3 (and other reasoning models) expect only
+                // the final answer of earlier turns, not the `<think>` scratchpad
+                // — feeding the reasoning back drifts the context. Display-only
+                // elsewhere; here it shapes the OUTGOING history, not the stored
+                // transcript.
+                let content = if t.role == "assistant" {
+                    rustllama_client::strip_reasoning(&t.content).to_string()
+                } else {
+                    t.content.clone()
+                };
                 m.push(ChatMessage {
                     role: t.role.clone(),
-                    content: t.content.clone(),
+                    content,
                 });
             }
         }
@@ -1105,41 +1116,26 @@ fn set_f32(slot: &mut f32, arg: &str, status: &mut String, name: &str) {
 fn strip_think(content: &str) -> String {
     const OPEN: &str = "<think>";
     const CLOSE: &str = "</think>";
-    let mut rest = content;
-    // Implicit leading reasoning: a CLOSE before any OPEN means the opening tag
-    // was injected into the prompt, so the completion opened mid-thought — drop
-    // through the first CLOSE.
-    if let Some(c) = rest.find(CLOSE) {
-        let open_first = rest.find(OPEN).map(|o| o < c).unwrap_or(false);
-        if !open_first {
-            rest = &rest[c + CLOSE.len()..];
-        }
+    // A CLOSED reasoning span — the prompt-opened leading `</think>` (Qwen3's
+    // template opens `<think>` in the PROMPT, so the completion carries only the
+    // close) OR a normal `<think>…</think>` pair — is removed by the shared
+    // stripper, which both UIs and the REPL use so the behavior matches.
+    if content.contains(CLOSE) {
+        return rustllama_client::strip_reasoning(content).to_string();
     }
-    let mut out = String::with_capacity(rest.len());
-    loop {
-        match rest.find(OPEN) {
-            None => {
-                out.push_str(rest);
-                break;
-            }
-            Some(i) => {
-                out.push_str(&rest[..i]);
-                let after = &rest[i + OPEN.len()..];
-                match after.find(CLOSE) {
-                    Some(j) => rest = &after[j + CLOSE.len()..],
-                    None => {
-                        // Still reasoning (no close yet) → marker, stop.
-                        if !out.trim_end().is_empty() {
-                            out.push('\n');
-                        }
-                        out.push_str("[thinking…]");
-                        break;
-                    }
-                }
-            }
+    // An UNCLOSED `<think>` (reasoning still streaming, no close yet) → collapse
+    // to a dim `[thinking…]` marker so the turn isn't blank mid-generation.
+    if let Some(i) = content.find(OPEN) {
+        let head = content[..i].trim_end();
+        let mut out = head.to_string();
+        if !out.is_empty() {
+            out.push('\n');
         }
+        out.push_str("[thinking…]");
+        return out;
     }
-    out.trim_start().to_string()
+    // No think tags at all → unchanged.
+    content.to_string()
 }
 
 fn ui(f: &mut Frame, app: &mut App) {

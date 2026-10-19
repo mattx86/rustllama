@@ -12069,7 +12069,14 @@ async fn chat_repl(
     // context they're picking up from.
     if !initial.is_empty() {
         for m in &initial {
-            println!("\x1b[2m[{}]\x1b[0m {}", m.role, m.content);
+            // Display-strip a resumed assistant turn's reasoning span (the
+            // stored transcript keeps it; this is only the echo).
+            let shown = if m.role == "assistant" {
+                rustllama_client::strip_reasoning(&m.content)
+            } else {
+                m.content.as_str()
+            };
+            println!("\x1b[2m[{}]\x1b[0m {}", m.role, shown);
         }
         messages.extend(initial);
     }
@@ -12207,7 +12214,7 @@ async fn chat_repl(
                     println!("[regenerating last turn]");
                     let req = ChatRequest {
                         model: model_label.clone(),
-                        messages: messages.clone(),
+                        messages: history_for_request(&messages),
                         temperature: Some(temperature),
                         top_p: Some(top_p),
                         top_k: Some(top_k),
@@ -12581,7 +12588,7 @@ async fn chat_repl(
         loop {
             let req = ChatRequest {
                 model: model_label.clone(),
-                messages: messages.clone(),
+                messages: history_for_request(&messages),
                 temperature: Some(temperature),
                 top_p: Some(top_p),
                 top_k: Some(top_k),
@@ -13007,6 +13014,28 @@ enum StreamOutcome {
     ToolCalls(Vec<rustllama_client::ToolCall>),
 }
 
+/// Build the outgoing chat history for a request, stripping each PRIOR
+/// assistant turn's `<think>` reasoning span. Qwen3 (and other reasoning
+/// models) expect only the final answer of earlier turns fed back on the next
+/// turn — re-sending the `<think>` scratchpad drifts the context. The stored
+/// `messages` keep the raw content (so `/save` and the on-screen transcript are
+/// unaffected); this shapes only what goes on the wire.
+fn history_for_request(
+    messages: &[rustllama_client::ChatMessage],
+) -> Vec<rustllama_client::ChatMessage> {
+    messages
+        .iter()
+        .map(|m| rustllama_client::ChatMessage {
+            role: m.role.clone(),
+            content: if m.role == "assistant" {
+                rustllama_client::strip_reasoning(&m.content).to_string()
+            } else {
+                m.content.clone()
+            },
+        })
+        .collect()
+}
+
 async fn drive_chat_stream(
     client: &rustllama_client::Client,
     req: rustllama_client::ChatRequest,
@@ -13039,6 +13068,10 @@ async fn drive_chat_stream(
     };
 
     let mut content = String::new();
+    // Bytes of the reasoning-STRIPPED answer already printed live. The REPL
+    // hides a prompt-opened `<think>` reasoning span (Qwen3) that would
+    // otherwise leak a bare `</think>` into the terminal — see the Content arm.
+    let mut printed: usize = 0;
     let mut got_error = false;
     let mut last_usage: Option<rustllama_client::Usage> = None;
     // CLARIFY / tool-confirm signals — surfaced by the client just before
@@ -13052,9 +13085,26 @@ async fn drive_chat_stream(
                 // First token marks TTFT; every token bumps the decode count
                 // (the client-side fallback when the server omits `usage`).
                 timer.on_token();
-                print!("{t}");
-                let _ = std::io::stdout().flush();
                 content.push_str(&t);
+                // Reasoning-aware live print. A reasoning model (Qwen3) streams
+                // its `<think>` scratchpad FIRST — the chat template opened
+                // `<think>` in the PROMPT, so the completion carries only the
+                // closing `</think>`. Until that close arrives we can't tell
+                // reasoning from answer, so we HOLD output; once it closes,
+                // `strip_reasoning` yields the answer and we stream it (and
+                // everything after) live. A non-reasoning reply (no `</think>`)
+                // is flushed once the stream ends (post-loop) — a deliberate
+                // trade so a prompt-opened chain-of-thought is never shown here
+                // (the TUI/GUI re-render and hide it continuously). The stored
+                // `content` keeps the raw bytes for history/tool parsing.
+                if content.contains("</think>") {
+                    let visible = rustllama_client::strip_reasoning(&content);
+                    if visible.len() > printed {
+                        print!("{}", &visible[printed..]);
+                        let _ = std::io::stdout().flush();
+                        printed = visible.len();
+                    }
+                }
             }
             Ok(ChatEvent::AskUser {
                 prompt, options, ..
@@ -13085,6 +13135,17 @@ async fn drive_chat_stream(
                 got_error = true;
                 break;
             }
+        }
+    }
+    // Flush any answer not yet printed live: the tail after a reasoning span
+    // closed, OR — for a non-reasoning reply that never emitted `</think>` — the
+    // whole answer, which was held back so a prompt-opened reasoning span is
+    // never shown. `strip_reasoning` returns the content unchanged when there is
+    // no `</think>`, so a normal reply prints here in full.
+    if !got_error {
+        let visible = rustllama_client::strip_reasoning(&content);
+        if visible.len() > printed {
+            print!("{}", &visible[printed..]);
         }
     }
     println!();
@@ -13170,6 +13231,31 @@ fn summarize_tool_calls(calls: &[rustllama_client::ToolCall]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_for_request_strips_prior_assistant_reasoning() {
+        let msgs = vec![
+            rustllama_client::ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            },
+            rustllama_client::ChatMessage {
+                role: "assistant".into(),
+                content: "chain of thought here</think>Hello!".into(),
+            },
+            rustllama_client::ChatMessage {
+                role: "user".into(),
+                content: "again".into(),
+            },
+        ];
+        let out = history_for_request(&msgs);
+        // The prior assistant turn is re-sent WITHOUT its reasoning span.
+        assert_eq!(out[1].content, "Hello!");
+        // User turns are untouched, and the stored messages are not mutated.
+        assert_eq!(out[0].content, "hi");
+        assert_eq!(out[2].content, "again");
+        assert_eq!(msgs[1].content, "chain of thought here</think>Hello!");
+    }
 
     #[test]
     fn authority_host_brackets_ipv6_only() {

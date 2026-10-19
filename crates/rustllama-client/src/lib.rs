@@ -27,6 +27,32 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// Strip a chain-of-thought / reasoning span from an assistant message for
+/// DISPLAY, or before re-sending it as prior-turn context.
+///
+/// Reasoning models (Qwen3, DeepSeek-R1, …) emit a `<think>…</think>`
+/// scratchpad the user should not see and that the model does NOT expect fed
+/// back on the next turn. Qwen3's chat template OPENS `<think>` in the PROMPT,
+/// so the model's completion frequently carries only the CLOSING `</think>`
+/// (no opening tag) — in that case the whole prefix up to the close is
+/// reasoning. This returns the visible answer:
+///   - if the content contains `</think>`, everything up to and INCLUDING the
+///     first `</think>` is dropped (covers both the prompt-opened case and a
+///     normal `<think>…</think>` pair) and the remainder is left-trimmed;
+///   - with no `</think>`, the content is returned unchanged.
+///
+/// Returns a borrowed slice — no allocation. For DISPLAY / history only; the
+/// raw stored content (used for tool-call parsing) is never mutated. Shared by
+/// the CLI line REPL, the TUI transcript, and the native GUI chat render so all
+/// three hide reasoning identically.
+pub fn strip_reasoning(content: &str) -> &str {
+    const CLOSE: &str = "</think>";
+    match content.find(CLOSE) {
+        Some(i) => content[i + CLOSE.len()..].trim_start(),
+        None => content,
+    }
+}
+
 /// A chat message that may carry attached images as base64 `data:` URIs.
 ///
 /// Kept as a SEPARATE type from [`ChatMessage`] (rather than adding an `images`
@@ -1786,8 +1812,7 @@ where
             buf.extend_from_slice(&chunk);
 
             // Split on `\n\n` event boundaries.
-            loop {
-                let Some(pos) = find_event_boundary(&buf) else { break; };
+            while let Some(pos) = find_event_boundary(&buf) {
                 let event_bytes = buf.drain(..pos).collect::<Vec<u8>>();
                 // Drop the boundary marker (\n\n or \r\n\r\n).
                 drain_boundary(&mut buf);
@@ -2072,8 +2097,7 @@ where
                 }
             };
             buf.extend_from_slice(&chunk);
-            loop {
-                let Some(pos) = find_event_boundary(&buf) else { break; };
+            while let Some(pos) = find_event_boundary(&buf) {
                 let event_bytes = buf.drain(..pos).collect::<Vec<u8>>();
                 drain_boundary(&mut buf);
                 for event in decode_completion_event(&event_bytes) {
@@ -2143,6 +2167,30 @@ fn decode_completion_event(bytes: &[u8]) -> Vec<Result<CompletionEvent>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_reasoning_drops_implicit_prompt_opened_span() {
+        // Qwen3 opens <think> in the PROMPT, so the completion has only the
+        // closing tag: everything up to and including it is reasoning.
+        assert_eq!(
+            strip_reasoning("deep reasoning here</think>Final answer"),
+            "Final answer"
+        );
+    }
+
+    #[test]
+    fn strip_reasoning_handles_a_normal_pair() {
+        assert_eq!(strip_reasoning("<think>x</think>Y"), "Y");
+    }
+
+    #[test]
+    fn strip_reasoning_passes_through_without_close() {
+        assert_eq!(
+            strip_reasoning("just a plain answer"),
+            "just a plain answer"
+        );
+        assert_eq!(strip_reasoning(""), "");
+    }
 
     /// Basic throughput + context math: prefill = prompt/ttft, decode =
     /// completion/decode_wall, ctx% = used/size.
