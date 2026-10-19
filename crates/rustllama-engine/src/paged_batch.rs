@@ -814,6 +814,62 @@ impl PagedBatchEngine {
                 );
             }
         }
+        // MoE tiered-expert promotion (paged engine) — AUTO on CUDA / dedicated
+        // SYCL, mirroring the ContiguousEngine load (inference.rs). Promotes the
+        // hottest experts into GPU device (managed/USM) memory so a MoE model on
+        // the fused-decode engine runs them GPU-RESIDENT instead of re-uploading
+        // every decode step (the expert-thrash that otherwise pins the GPU near
+        // 0% — the paged load previously did NO promotion). Runs while `model` is
+        // still uniquely owned (before the `Arc`). Budget = free VRAM − the
+        // non-expert weights − a 1 GiB scratch/context floor (the paged KV pool
+        // is HOST RAM and attention runs on CPU, so there is NO device KV mirror
+        // to reserve for, unlike the contiguous engine), capped at total expert
+        // bytes. Safe-by-construction: managed memory oversubscribes to host-
+        // paged UVM, so an over-large budget degrades to "slower", never
+        // OOM/wrong-answer; `tier_avail == None` (off-GPU / unified / integrated)
+        // ⇒ budget 0 ⇒ inert, and a non-MoE model skips it. WRITE-BLIND (no
+        // NVIDIA on the dev box) — validated on the pod.
+        {
+            let tier_avail: Option<u64> = if rustllama_models::accel::cuda_active() {
+                Some(rustllama_runtime::gpu_detect::nvidia_free_vram_bytes(0).unwrap_or(0))
+            } else {
+                rustllama_models::accel::sycl_dedicated_vram_bytes()
+            };
+            if let Some(avail) = tier_avail {
+                if model.weights.is_moe() {
+                    let (expert_b, non_expert_b) = model.weights.vram_byte_breakdown();
+                    // 1 GiB scratch/context floor; an explicit tuner A/B override
+                    // wins. No KV-mirror term — paged KV is host-resident.
+                    let margin = rustllama_models::accel::moe_vram_margin_override()
+                        .unwrap_or(1024 * 1024 * 1024);
+                    let vram_expert_bytes = avail
+                        .saturating_sub(non_expert_b)
+                        .saturating_sub(margin)
+                        .min(expert_b);
+                    if vram_expert_bytes > 0 {
+                        // Hottest-first ranking from the persisted per-model usage
+                        // sidecar; cold start ⇒ empty ⇒ index order.
+                        let ranked = crate::expert_cache::UsageLearner::open(path)
+                            .map(|l| l.ranked_keys())
+                            .unwrap_or_default();
+                        let (experts, bytes) = model
+                            .weights
+                            .promote_experts_to_device(vram_expert_bytes, &ranked);
+                        if experts > 0 {
+                            rustllama_models::accel::set_moe_tier_active(true);
+                            tracing::info!(
+                                experts,
+                                promoted_mb = bytes / (1024 * 1024),
+                                budget_mb = vram_expert_bytes / (1024 * 1024),
+                                ranked = ranked.len(),
+                                "moe tiered-expert: promoted hottest experts to GPU \
+                                 device memory (paged engine)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let model = Arc::new(model);
         let model_id = path
             .file_stem()
@@ -1527,10 +1583,18 @@ impl PagedBatchEngine {
         let request_tx = self.request_tx.as_ref().ok_or_else(|| {
             EngineError::Engine("paged-batch engine has no driver (post-Drop)".into())
         })?;
-        // Channel capacity 4 matches `ContiguousEngine::spawn_stream` —
-        // keeps the engine ~one decode tick ahead of the SSE
-        // consumer so a client disconnect drains fast.
-        let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<EngineResult<Token>>(4);
+        // Channel capacity. Unlike `ContiguousEngine::spawn_stream` (cap 4,
+        // per-request isolated), the paged engine funnels EVERY slot's tokens
+        // through ONE shared FIFO `emit_worker` whose `blocking_send` stalls on a
+        // FULL channel — so a single slow / half-open SSE consumer that lets its
+        // channel fill would head-of-line-block delivery for ALL slots. A deep
+        // buffer means a consumer that reads at all never fills it within a
+        // normal generation, so the shared worker keeps flowing; a genuine
+        // disconnect is still caught capacity-independently by the driver's
+        // `response_tx.is_closed()` check each tick (buffered tokens then drop).
+        // (A fully non-blocking / per-slot emit is the complete fix — follow-up.)
+        let (response_tx, mut response_rx) =
+            tokio::sync::mpsc::channel::<EngineResult<Token>>(1024);
         request_tx
             .send(NewRequest {
                 prompt,
@@ -2326,6 +2390,19 @@ fn driver_loop(
     let mut next_seq: u64 = 0;
     let vocab = ctx.model.cfg.vocab_size;
     let page_size = ctx.page_size as usize;
+
+    // Placement init for THIS driver thread. It is a fresh `std::thread`, so the
+    // accel dispatch thread-locals start at their process defaults rather than
+    // whatever the loading thread set — the paged path previously left them
+    // unset here, silently ignoring placement. Set them explicitly to the paged
+    // engine's placement: an all-GPU layer cutoff (the matmuls run on CUDA/SYCL
+    // once `keep_quant_raw` keeps weights packed; attention is CPU by paged
+    // design) and no per-tensor CPU overrides. The MoE expert tier is carried by
+    // the process-global `moe_tier_active` set at load, so it still applies. A
+    // TUNED CPU/GPU layer split on the paged engine is a follow-up (it needs the
+    // measured placement plan threaded into `DriverContext`).
+    rustllama_models::accel::set_n_gpu_layers(u32::MAX);
+    rustllama_models::accel::set_cpu_force_patterns(Vec::new());
 
     loop {
         // ---- Drain newly-submitted requests into the priority heap ----
