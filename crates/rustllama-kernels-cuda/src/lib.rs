@@ -923,6 +923,24 @@ extern "C" {
         window: c_int,
         softcap: f32,
     ) -> c_int;
+    // GPU paged attention (Phase B): block-table flash-decode against the
+    // whole-pool device mirror. `block_table` = [ceil(kv_len/page_size)] i32.
+    fn rsl_cuda_flash_attn_decode_paged_f32(
+        s: *mut RslCudaStreamRaw,
+        q: *const f32,
+        kv_pool: *const f32,
+        block_table: *const c_int,
+        out: *mut f32,
+        n_heads: c_int,
+        n_kv_heads: c_int,
+        head_dim: c_int,
+        layer_idx: c_int,
+        n_layers: c_int,
+        page_size: c_int,
+        kv_len: c_int,
+        window: c_int,
+        softcap: f32,
+    ) -> c_int;
     fn rsl_cuda_flash_attn_prefill_f32(
         s: *mut RslCudaStreamRaw,
         q: *const f32,
@@ -2670,6 +2688,56 @@ pub unsafe fn flash_attn_decode_f32(
         n_kv_heads as c_int,
         head_dim as c_int,
         max_ctx as c_int,
+        kv_len as c_int,
+        window as c_int,
+        softcap,
+    );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Kernel(rc))
+    }
+}
+
+/// GPU paged attention (Phase B): block-table FlashAttention decode. Reads K/V
+/// from the whole-pool device mirror `kv_pool` via `block_table` (logical block
+/// -> physical page id) for ONE sequence at `layer_idx`. Matches the contiguous
+/// [`flash_attn_decode_f32`] numerics (same CPU reference), differing only in
+/// how a logical KV position maps to a device address.
+///
+/// SAFETY: `q`/`out` = `[n_heads, head_dim]`; `kv_pool` = the pool mirror slab;
+/// `block_table` = `[ceil(kv_len / page_size)]` i32 device ptr; `n_heads %
+/// n_kv_heads == 0`; `layer_idx < n_layers`.
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_decode_paged_f32(
+    stream: &CudaStream,
+    q: *const f32,
+    kv_pool: *const f32,
+    block_table: *const i32,
+    out: *mut f32,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    layer_idx: usize,
+    n_layers: usize,
+    page_size: usize,
+    kv_len: usize,
+    window: i32,
+    softcap: f32,
+) -> Result<(), CudaError> {
+    let rc = rsl_cuda_flash_attn_decode_paged_f32(
+        stream.raw(),
+        q,
+        kv_pool,
+        block_table as *const c_int,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        layer_idx as c_int,
+        n_layers as c_int,
+        page_size as c_int,
         kv_len as c_int,
         window as c_int,
         softcap,

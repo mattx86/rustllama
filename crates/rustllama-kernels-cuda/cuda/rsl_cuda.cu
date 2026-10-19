@@ -2992,6 +2992,138 @@ extern "C" int rsl_cuda_flash_attn_decode_f32(rsl_cuda_stream *s,
     return rsl_cuda_check("rsl_cuda_flash_attn_decode_f32");
 }
 
+// GPU paged attention (Phase B): block-table flash-decode. A COPY of
+// flash_attn_decode_f32_kernel with ONE semantic change — K/V are read from the
+// paged-pool device mirror (one whole-pool slab, byte-identical geometry to the
+// host PagedKvStore: off = page*page_stride + layer*layer_stride +
+// kv_axis*kv_stride + h*head_stride + pos_in_page*head_dim) via a per-sequence
+// block table (logical block -> physical page id), instead of a contiguous
+// [n_kv_heads, max_ctx, head_dim] cache. The qreg load, warp-split online
+// softmax, shared-mem merge, SWA `window` and Gemma2 `softcap` are IDENTICAL, so
+// the result matches the SAME CPU reference
+// (gqa_attention_flash_decode_capped_windowed) the contiguous kernel does.
+// Offsets are `long`: page*page_stride overflows int for a large pool.
+__global__ void flash_attn_decode_paged_f32_kernel(
+    const float *q, const float *kv_pool, const int *block_table, float *out,
+    int n_heads, int n_gqa, int head_dim, int layer_idx, int n_layers,
+    int n_kv_heads, int page_size, int kv_len, float scale, int window,
+    float softcap) {
+    extern __shared__ float smem[];
+    float *sh_acc = smem;                                   // [W * head_dim]
+    float *sh_m = sh_acc + RSL_FLASH_DECODE_W * head_dim;   // [W]
+    float *sh_l = sh_m + RSL_FLASH_DECODE_W;                // [W]
+
+    const int hh = blockIdx.x;            // one block per head
+    if (hh >= n_heads) return;
+    const int lane = threadIdx.x;         // 0..31
+    const int warp = threadIdx.y;         // 0..W-1
+    const int kv_h = hh / n_gqa;
+    const int q_off = hh * head_dim;
+
+    // Paged-pool strides (long: page*page_stride overflows int for a big pool).
+    const long head_stride = (long)page_size * head_dim;
+    const long kv_stride = (long)n_kv_heads * head_stride;       // kv_axis 1 = V
+    const long layer_stride = 2L * kv_stride;
+    const long page_stride = (long)n_layers * layer_stride;
+    const long layer_base = (long)layer_idx * layer_stride;
+
+    float qreg[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    float acc[(RSL_FLASH_MAX_HEAD_DIM + 31) / 32];
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32) {
+        qreg[seg] = q[q_off + d];
+        acc[seg] = 0.f;
+    }
+    float m = -INFINITY, l = 0.f;
+
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
+    for (int t = warp; t < kv_len; t += RSL_FLASH_DECODE_W) {
+        if (t < t_start) continue;  // SWA (warp-uniform)
+        // Block-table indirection: logical position t -> physical page slab base.
+        const int block = t / page_size;
+        const int in_page = t - block * page_size;
+        const int page = block_table[block];
+        const long k_off = (long)page * page_stride + layer_base +
+                           (long)kv_h * head_stride + (long)in_page * head_dim;
+        const long v_off = k_off + kv_stride;  // kv_axis 1 = V
+        float partial = 0.f;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            partial += qreg[seg] * kv_pool[k_off + d];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            partial += __shfl_down_sync(0xffffffffu, partial, off);
+        float s_dot = __shfl_sync(0xffffffffu, partial, 0) * scale;
+        if (softcap > 0.f) s_dot = softcap * tanhf(s_dot / softcap);
+        float m_new = fmaxf(m, s_dot);
+        float rescale = isfinite(m) ? expf(m - m_new) : 0.f;
+        float p = expf(s_dot - m_new);
+        l = l * rescale + p;
+        for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+            acc[seg] = acc[seg] * rescale + p * kv_pool[v_off + d];
+        m = m_new;
+    }
+
+    for (int seg = 0, d = lane; d < head_dim; ++seg, d += 32)
+        sh_acc[warp * head_dim + d] = acc[seg];
+    if (lane == 0) {
+        sh_m[warp] = m;
+        sh_l[warp] = l;
+    }
+    __syncthreads();
+
+    float m_g = -INFINITY;
+    #pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w) m_g = fmaxf(m_g, sh_m[w]);
+    float l_g = 0.f;
+    #pragma unroll
+    for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+        l_g += sh_l[w] * (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+    float inv_l = (l_g > 0.f) ? 1.f / l_g : 0.f;
+    const int tid = warp * 32 + lane;
+    const int nthreads = RSL_FLASH_DECODE_W * 32;
+    const int out_off = hh * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float o = 0.f;
+        #pragma unroll
+        for (int w = 0; w < RSL_FLASH_DECODE_W; ++w)
+            o += sh_acc[w * head_dim + d] *
+                 (isfinite(sh_m[w]) ? expf(sh_m[w] - m_g) : 0.f);
+        out[out_off + d] = o * inv_l;
+    }
+}
+
+// extern-C launcher for the block-table paged flash-decode. `kv_pool` is the
+// whole-pool device mirror; `block_table` is [num_blocks] (logical block ->
+// physical page id) for this sequence. `window`/`softcap` passthrough as above.
+extern "C" int rsl_cuda_flash_attn_decode_paged_f32(
+    rsl_cuda_stream *s, const float *q, const float *kv_pool,
+    const int *block_table, float *out, int n_heads, int n_kv_heads,
+    int head_dim, int layer_idx, int n_layers, int page_size, int kv_len,
+    int window, float softcap) {
+    if (!s || !q || !kv_pool || !block_table || !out) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || page_size <= 0 ||
+        n_layers <= 0 || layer_idx < 0 || layer_idx >= n_layers)
+        return -1;
+    if ((n_heads % n_kv_heads) != 0) return -1;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM) return -1;
+    cudaSetDevice(s->device);
+    if (kv_len <= 0) {
+        cudaMemsetAsync(out, 0, (size_t)n_heads * head_dim * sizeof(float),
+                        s->stream);
+        return rsl_cuda_check("rsl_cuda_flash_attn_decode_paged_f32");
+    }
+    int n_gqa = n_heads / n_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    dim3 block(32, RSL_FLASH_DECODE_W);
+    dim3 grid((unsigned)n_heads);
+    size_t shmem = (size_t)(RSL_FLASH_DECODE_W * head_dim +
+                            2 * RSL_FLASH_DECODE_W) *
+                   sizeof(float);
+    flash_attn_decode_paged_f32_kernel<<<grid, block, shmem, s->stream>>>(
+        q, kv_pool, block_table, out, n_heads, n_gqa, head_dim, layer_idx,
+        n_layers, n_kv_heads, page_size, kv_len, scale, window, softcap);
+    return rsl_cuda_check("rsl_cuda_flash_attn_decode_paged_f32");
+}
+
 // FlashAttention prefill, F32 (mirrors rsl_flash_attn_prefill_usm):
 //   q:   [n_new, n_heads, head_dim]  row-major
 //   k/v: [n_kv_heads, max_ctx, head_dim]
