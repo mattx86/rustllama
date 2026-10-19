@@ -419,6 +419,133 @@ impl Default for SamplingParams {
     }
 }
 
+/// Per-MODEL recommended sampling defaults, resolved once at model load.
+///
+/// Today `build_sampling` on the server starts from the generic
+/// [`SamplingParams::default`] (temp 0.7 / top_p 0.95 / top_k 40 /
+/// repeat 1.1) and overlays the request. For several model families that
+/// generic default is a poor fit — most visibly **Qwen3**, which
+/// published a non-thinking sampling recipe (top_p 0.8 / top_k 20 /
+/// presence 1.0 / repeat 1.0) precisely to curb the run-on repetition,
+/// emoji spam and English→Chinese code-switching the generic settings
+/// provoke. This resolves a per-model BASE profile the server uses instead
+/// of the bare default (the request still overlays on top, so an explicit
+/// request field always wins).
+///
+/// Priority:
+///   1. a `generation_config.json` sidecar next to the GGUF (authoritative
+///      — the model author's own published values),
+///   2. else the built-in per-architecture table ([`recommended_sampling_for_arch`]),
+///   3. else `None` → the caller keeps the generic [`SamplingParams::default`].
+///
+/// `arch` is the GGUF `general.architecture` string; `model_path` is the
+/// on-disk GGUF path (its parent directory is searched for the sidecar).
+pub fn recommended_sampling(arch: &str, model_path: &std::path::Path) -> Option<SamplingParams> {
+    recommended_sampling_from_generation_config(model_path)
+        .or_else(|| recommended_sampling_for_arch(arch))
+}
+
+/// Built-in per-architecture recommended sampling profile, keyed on the
+/// GGUF `general.architecture` string. Returns a full [`SamplingParams`]
+/// (the generic default with only the fields a published recommendation
+/// pins overridden), or `None` for an architecture we have no recommendation
+/// for (the caller then keeps the generic default — no behavior change).
+///
+/// Sources for the pinned values:
+///   - `qwen3` / `qwen3moe`: Qwen3's published **non-thinking** sampling rec
+///     (temp 0.7, top_p 0.8, top_k 20, presence_penalty 1.0, repeat 1.0) —
+///     the recipe Qwen ships specifically to curb repetition + language
+///     mixing on these models.
+///   - `qwen2` / `qwen2moe`: Qwen2/2.5's recommended temp 0.7, top_p 0.8,
+///     top_k 20, repetition 1.05.
+///   - `llama`: Llama 3.x Instruct's published defaults (temp 0.6, top_p 0.9).
+///     Conservative — leaves top_k / repeat at the generic default.
+///   - `gemma2` / `gemma3`: Gemma 2/3's HF `generation_config` defaults
+///     (temp 1.0, top_p 0.95, top_k 64).
+pub fn recommended_sampling_for_arch(arch: &str) -> Option<SamplingParams> {
+    let mut s = SamplingParams::default();
+    match arch.trim().to_ascii_lowercase().as_str() {
+        "qwen3" | "qwen3moe" => {
+            s.temperature = 0.7;
+            s.top_p = 0.8;
+            s.top_k = 20;
+            s.presence_penalty = 1.0;
+            s.repeat_penalty = 1.0;
+        }
+        "qwen2" | "qwen2moe" => {
+            s.temperature = 0.7;
+            s.top_p = 0.8;
+            s.top_k = 20;
+            s.repeat_penalty = 1.05;
+        }
+        "llama" => {
+            // Llama 3.x Instruct published rec. Applied to the `llama` arch
+            // broadly (llama.cpp labels Llama 2 + 3.x alike); kept light so
+            // it is a safe nudge on either.
+            s.temperature = 0.6;
+            s.top_p = 0.9;
+        }
+        "gemma2" | "gemma3" => {
+            s.temperature = 1.0;
+            s.top_p = 0.95;
+            s.top_k = 64;
+        }
+        _ => return None,
+    }
+    Some(s)
+}
+
+/// Read a `generation_config.json` sidecar from the GGUF's directory and,
+/// if it pins any sampling field, return a [`SamplingParams`] built from
+/// the generic default with those fields overridden. `None` when the file
+/// is absent / unreadable / unparseable, or carries no sampling fields (so
+/// the caller falls back to the per-arch table). Best-effort: a malformed
+/// sidecar never fails a load.
+pub fn recommended_sampling_from_generation_config(
+    model_path: &std::path::Path,
+) -> Option<SamplingParams> {
+    let dir = model_path.parent()?;
+    let text = std::fs::read_to_string(dir.join("generation_config.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    sampling_from_generation_config_value(&value)
+}
+
+/// Pure half of [`recommended_sampling_from_generation_config`]: map a parsed
+/// `generation_config.json` object onto a [`SamplingParams`]. Reads
+/// `temperature`, `top_p`, `top_k`, `repetition_penalty` (→ `repeat_penalty`),
+/// `presence_penalty` and `min_p` when present. Returns `None` if NONE of
+/// those keys are present (so the caller can fall back to the arch table).
+fn sampling_from_generation_config_value(value: &serde_json::Value) -> Option<SamplingParams> {
+    let obj = value.as_object()?;
+    let mut s = SamplingParams::default();
+    let mut any = false;
+    if let Some(t) = obj.get("temperature").and_then(|v| v.as_f64()) {
+        s.temperature = t as f32;
+        any = true;
+    }
+    if let Some(p) = obj.get("top_p").and_then(|v| v.as_f64()) {
+        s.top_p = p as f32;
+        any = true;
+    }
+    if let Some(k) = obj.get("top_k").and_then(|v| v.as_u64()) {
+        s.top_k = k as u32;
+        any = true;
+    }
+    if let Some(rp) = obj.get("repetition_penalty").and_then(|v| v.as_f64()) {
+        s.repeat_penalty = rp as f32;
+        any = true;
+    }
+    if let Some(pp) = obj.get("presence_penalty").and_then(|v| v.as_f64()) {
+        s.presence_penalty = pp as f32;
+        any = true;
+    }
+    if let Some(mp) = obj.get("min_p").and_then(|v| v.as_f64()) {
+        s.min_p = mp as f32;
+        any = true;
+    }
+    any.then_some(s)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Metrics {
     pub tokens_per_second: f32,
@@ -907,6 +1034,19 @@ pub trait Engine: Send + Sync {
     fn has_lora_adapter(&self, _name: &str) -> bool {
         false
     }
+
+    /// Per-MODEL recommended sampling defaults (see [`recommended_sampling`]),
+    /// resolved once at load from a `generation_config.json` sidecar or the
+    /// built-in per-architecture table. The server's `build_sampling` uses this
+    /// as the BASE profile (request fields overlay on top, so an explicit
+    /// request field always wins). Default `None` → the server keeps the
+    /// generic [`SamplingParams::default`], so engines without a recommendation
+    /// (`MockEngine`, test fixtures) are byte-identical to before. `CpuEngine`
+    /// and [`crate::paged_batch::PagedBatchEngine`] override this to return the
+    /// profile they computed at load.
+    fn recommended_sampling(&self) -> Option<SamplingParams> {
+        None
+    }
 }
 
 /// Test-only fixture engine. Returns the prompt back tokenized as ASCII
@@ -959,6 +1099,62 @@ fn mock_stream(s: String) -> Result<TokenStream> {
         }
     };
     Ok(Box::pin(stream))
+}
+
+#[cfg(test)]
+mod recommended_sampling_tests {
+    use super::*;
+
+    #[test]
+    fn qwen3_arch_pins_the_published_non_thinking_rec() {
+        let s = recommended_sampling_for_arch("qwen3").expect("qwen3 has a rec");
+        assert_eq!(s.top_k, 20);
+        assert!((s.top_p - 0.8).abs() < 1e-6);
+        assert!((s.temperature - 0.7).abs() < 1e-6);
+        assert!((s.presence_penalty - 1.0).abs() < 1e-6);
+        assert!((s.repeat_penalty - 1.0).abs() < 1e-6);
+        // The MoE variant and a mixed-case arch string resolve identically.
+        let moe = recommended_sampling_for_arch("Qwen3MoE").expect("qwen3moe has a rec");
+        assert_eq!(moe.top_k, 20);
+    }
+
+    #[test]
+    fn qwen2_arch_pins_its_rec() {
+        let s = recommended_sampling_for_arch("qwen2").expect("qwen2 has a rec");
+        assert_eq!(s.top_k, 20);
+        assert!((s.top_p - 0.8).abs() < 1e-6);
+        assert!((s.repeat_penalty - 1.05).abs() < 1e-6);
+    }
+
+    #[test]
+    fn unknown_arch_has_no_rec_so_caller_keeps_the_generic_default() {
+        assert!(recommended_sampling_for_arch("bert").is_none());
+        assert!(recommended_sampling_for_arch("some-future-arch").is_none());
+    }
+
+    #[test]
+    fn generation_config_sidecar_overrides_only_present_fields() {
+        let v = serde_json::json!({
+            "temperature": 0.5,
+            "top_p": 0.7,
+            "repetition_penalty": 1.3,
+            "do_sample": true
+        });
+        let s = sampling_from_generation_config_value(&v).expect("has sampling fields");
+        assert!((s.temperature - 0.5).abs() < 1e-6);
+        assert!((s.top_p - 0.7).abs() < 1e-6);
+        assert!((s.repeat_penalty - 1.3).abs() < 1e-6);
+        // Unspecified fields keep the generic default.
+        let d = SamplingParams::default();
+        assert_eq!(s.top_k, d.top_k);
+        assert_eq!(s.presence_penalty, d.presence_penalty);
+    }
+
+    #[test]
+    fn generation_config_without_sampling_fields_yields_none() {
+        let v = serde_json::json!({ "bos_token_id": 1, "eos_token_id": 2 });
+        assert!(sampling_from_generation_config_value(&v).is_none());
+    }
 }
 
 #[cfg(test)]

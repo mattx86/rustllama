@@ -238,7 +238,10 @@ pub async fn completions(
         Ok(p) => p,
         Err(be) => return be.into_response(),
     };
-    let mut sampling = build_sampling(&req);
+    let mut sampling = build_sampling_with_base(
+        &req,
+        serving.engine.recommended_sampling().unwrap_or_default(),
+    );
     // P11: explicit `lora` field (already set by `build_sampling`) wins; else
     // fall back to the `model:adapter` convention. Then validate the final
     // selection against the resolved engine — an unknown adapter is a clean 404,
@@ -871,8 +874,21 @@ fn build_prompt_ids(
     }
 }
 
+/// The generic-default sampling builder (base = [`SamplingParams::default`]).
+/// Production calls [`build_sampling_with_base`] with the model's recommended
+/// profile; this wrapper is retained for the sampling / seed-determinism tests.
+#[cfg(test)]
 fn build_sampling(req: &CompletionRequest) -> SamplingParams {
-    let mut s = SamplingParams::default();
+    build_sampling_with_base(req, SamplingParams::default())
+}
+
+/// Like [`build_sampling`] but starts from a per-MODEL `base` profile (the
+/// loaded model's [`rustllama_engine::Engine::recommended_sampling`], or the
+/// generic [`SamplingParams::default`]) instead of the bare default. Request
+/// fields overlay on top, so an explicit request field always wins. See the
+/// `chat` twin for the rationale.
+fn build_sampling_with_base(req: &CompletionRequest, base: SamplingParams) -> SamplingParams {
+    let mut s = base;
     if let Some(t) = req.temperature {
         s.temperature = t;
     }

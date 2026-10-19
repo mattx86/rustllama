@@ -78,6 +78,13 @@ pub struct CpuEngine {
     /// sidecar files (e.g., HF model-card JSON saved by `rustllama
     /// pull`) without re-walking the cache.
     source_path: std::path::PathBuf,
+    /// Per-MODEL recommended sampling profile, resolved ONCE at load from a
+    /// `generation_config.json` sidecar or the per-architecture table (see
+    /// [`crate::recommended_sampling`]). `None` when the model has no known
+    /// recommendation — the server then keeps the generic default. Surfaced
+    /// via [`Engine::recommended_sampling`] so `build_sampling` can use it as
+    /// the base profile. Forks inherit it.
+    recommended_sampling: Option<SamplingParams>,
     prefix_cache: bool,
     /// Number of tokens to forward per prefill chunk. Drives:
     ///   - Granularity of partial-prefix-cache snapshots: after every
@@ -1951,6 +1958,7 @@ impl CpuEngine {
                     .map(|d| d.approx_bytes() as u64)
                     .unwrap_or(0));
         let kv_dtype_cached = kv_backend.kv_dtype();
+        let recommended_sampling = crate::recommended_sampling(&model.cfg.arch, path);
         let engine = Self {
             model,
             tokenizer,
@@ -1966,6 +1974,7 @@ impl CpuEngine {
             max_ctx: ctx,
             model_id,
             source_path: path.to_path_buf(),
+            recommended_sampling,
             prefix_cache: true,
             prefill_chunk_size: DEFAULT_PREFILL_CHUNK,
             prefix_cache_max_snapshots: DEFAULT_PREFIX_CACHE_MAX_SNAPSHOTS,
@@ -2635,6 +2644,7 @@ impl CpuEngine {
         let model = Arc::new(model);
         let lock_registry = crate::pagelock::lock_model_into_ram(Arc::clone(&model)).map(Arc::new);
         let kv_dtype_cached = kv_backend.kv_dtype();
+        let recommended_sampling = crate::recommended_sampling(&model.cfg.arch, path);
         Ok(Self {
             model,
             tokenizer,
@@ -2650,6 +2660,7 @@ impl CpuEngine {
             max_ctx: ctx,
             model_id,
             source_path: path.to_path_buf(),
+            recommended_sampling,
             prefix_cache: true,
             prefill_chunk_size: DEFAULT_PREFILL_CHUNK,
             prefix_cache_max_snapshots: DEFAULT_PREFIX_CACHE_MAX_SNAPSHOTS,
@@ -2804,6 +2815,7 @@ impl CpuEngine {
         let model = Arc::new(model);
         let lock_registry = crate::pagelock::lock_model_into_ram(Arc::clone(&model)).map(Arc::new);
         let kv_dtype_cached = kv_backend.kv_dtype();
+        let recommended_sampling = crate::recommended_sampling(&model.cfg.arch, dir);
         Ok(Self {
             model,
             tokenizer,
@@ -2819,6 +2831,7 @@ impl CpuEngine {
             max_ctx: ctx,
             model_id,
             source_path: dir.to_path_buf(),
+            recommended_sampling,
             prefix_cache: true,
             prefill_chunk_size: DEFAULT_PREFILL_CHUNK,
             prefix_cache_max_snapshots: DEFAULT_PREFIX_CACHE_MAX_SNAPSHOTS,
@@ -4366,6 +4379,7 @@ impl CpuEngine {
             max_ctx: self.max_ctx,
             model_id: self.model_id.clone(),
             source_path: self.source_path.clone(),
+            recommended_sampling: self.recommended_sampling.clone(),
             prefix_cache: self.prefix_cache,
             prefill_chunk_size: self.prefill_chunk_size,
             prefix_cache_max_snapshots: self.prefix_cache_max_snapshots,
@@ -8160,6 +8174,9 @@ impl Engine for CpuEngine {
     }
     fn has_lora_adapter(&self, name: &str) -> bool {
         CpuEngine::has_lora_adapter(self, name)
+    }
+    fn recommended_sampling(&self) -> Option<SamplingParams> {
+        self.recommended_sampling.clone()
     }
 
     fn tokenize(&self, text: &str) -> EngineResult<Vec<u32>> {

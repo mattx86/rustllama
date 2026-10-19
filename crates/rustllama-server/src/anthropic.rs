@@ -464,14 +464,6 @@ pub async fn messages(State(state): State<AppState>, Json(req): Json<MessagesReq
             .map(tools_have_cache_control)
             .unwrap_or(false);
 
-    let mut sampling = build_sampling(SamplingInputs {
-        temperature,
-        top_p,
-        top_k,
-        max_tokens,
-        stops: stop_sequences,
-    });
-
     // Build the ChatMessage list. Anthropic's `system` is top-level; the
     // existing chat-template renderer expects it inline as a system
     // message (which most Jinja templates handle correctly).
@@ -507,6 +499,21 @@ pub async fn messages(State(state): State<AppState>, Json(req): Json<MessagesReq
             return crate::lora_not_found(name);
         }
     }
+    // Base the sampling on the resolved model's recommended profile (Qwen3's
+    // published non-thinking rec, etc.), then overlay the request fields — an
+    // explicit Anthropic field always wins. Resolved HERE (after `serving`) so
+    // the per-model base is available; `/v1/messages` sets no sampling fields
+    // beyond temperature/top_p/top_k, so the base's presence/repeat survive.
+    let mut sampling = build_sampling(
+        SamplingInputs {
+            temperature,
+            top_p,
+            top_k,
+            max_tokens,
+            stops: stop_sequences,
+        },
+        serving.engine.recommended_sampling().unwrap_or_default(),
+    );
     sampling.lora_adapter = lora_model_adapter;
     let model = req_model.unwrap_or_else(|| serving.model_id.clone());
     let id = format!("msg_{:032x}", unix_ts() as u128);
@@ -1314,8 +1321,8 @@ struct SamplingInputs {
     stops: Vec<String>,
 }
 
-fn build_sampling(inputs: SamplingInputs) -> SamplingParams {
-    let mut s = SamplingParams::default();
+fn build_sampling(inputs: SamplingInputs, base: SamplingParams) -> SamplingParams {
+    let mut s = base;
     if let Some(t) = inputs.temperature {
         s.temperature = t;
     }

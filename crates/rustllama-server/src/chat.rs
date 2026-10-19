@@ -874,7 +874,10 @@ async fn chat_with_tools(state: AppState, req: ChatRequest, sched: ReqSchedule) 
         }
     };
 
-    let mut sampling = build_sampling(&req);
+    let mut sampling = build_sampling_with_base(
+        &req,
+        serving.engine.recommended_sampling().unwrap_or_default(),
+    );
     if let Some(resp) = finalize_lora(&mut sampling, &serving, lora_model_adapter) {
         return resp;
     }
@@ -1150,7 +1153,10 @@ async fn chat_stream_with_tools(state: AppState, req: ChatRequest, sched: ReqSch
         }
     };
 
-    let mut sampling = build_sampling(&req);
+    let mut sampling = build_sampling_with_base(
+        &req,
+        serving.engine.recommended_sampling().unwrap_or_default(),
+    );
     if let Some(resp) = finalize_lora(&mut sampling, &serving, lora_model_adapter) {
         return resp;
     }
@@ -2249,8 +2255,24 @@ pub(crate) fn parse_openai_logit_bias(
         .collect()
 }
 
+/// The generic-default sampling builder (base = [`SamplingParams::default`]).
+/// Production handlers call [`build_sampling_with_base`] with the resolved
+/// model's recommended profile; this wrapper is retained for the sampling /
+/// seed-determinism tests, which pin the no-recommendation (generic) path.
+#[cfg(test)]
 fn build_sampling(req: &ChatRequest) -> SamplingParams {
-    let mut s = SamplingParams::default();
+    build_sampling_with_base(req, SamplingParams::default())
+}
+
+/// Like [`build_sampling`] but starts from a per-MODEL `base` profile (the
+/// loaded model's [`rustllama_engine::Engine::recommended_sampling`], or the
+/// generic [`SamplingParams::default`] when the model has no recommendation)
+/// instead of the bare default. Request fields overlay on top, so an explicit
+/// request field ALWAYS wins. A Qwen3 model (base = top_p 0.8 / top_k 20 /
+/// presence 1.0 / repeat 1.0) therefore gets those defaults for any field the
+/// request omits, while a request that sets e.g. `top_k` keeps its value.
+fn build_sampling_with_base(req: &ChatRequest, base: SamplingParams) -> SamplingParams {
+    let mut s = base;
     if let Some(t) = req.temperature {
         s.temperature = t;
     }
@@ -2671,7 +2693,10 @@ async fn chat_blocking(state: AppState, req: ChatRequest, sched: ReqSchedule) ->
         Ok(p) => p,
         Err(be) => return be.into_response(),
     };
-    let mut sampling = build_sampling(&req);
+    let mut sampling = build_sampling_with_base(
+        &req,
+        serving.engine.recommended_sampling().unwrap_or_default(),
+    );
     if let Some(resp) = finalize_lora(&mut sampling, &serving, lora_model_adapter) {
         return resp;
     }
@@ -2945,7 +2970,10 @@ async fn chat_stream(state: AppState, req: ChatRequest, sched: ReqSchedule) -> R
         Ok(p) => p,
         Err(be) => return be.into_response(),
     };
-    let mut sampling = build_sampling(&req);
+    let mut sampling = build_sampling_with_base(
+        &req,
+        serving.engine.recommended_sampling().unwrap_or_default(),
+    );
     if let Some(resp) = finalize_lora(&mut sampling, &serving, lora_model_adapter) {
         return resp;
     }
@@ -3313,13 +3341,14 @@ fn token_logprob_chunk_json(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_response_format, build_sampling, chunk_json, chunk_json_with_fp,
-        chunk_text_delta_into, extract_tool_schemas, longest_suffix_that_is_prefix_of,
-        make_token_logprob_out, openai_content_block_to_text, parse_ask_user_args,
-        parse_tool_call_body, parse_tool_calls, parse_tool_choice, token_logprob_chunk_json,
-        wire_messages_to_engine, wire_messages_to_json, with_reserved_ask_user_tool,
-        ChatMessageWire, ChatRequest, OpenAiContent, OpenAiContentBlock, ResponseFormat,
-        StreamEvent, StreamingToolCallParser, ToolChoice, ASK_USER_TOOL_NAME,
+        apply_response_format, build_sampling, build_sampling_with_base, chunk_json,
+        chunk_json_with_fp, chunk_text_delta_into, extract_tool_schemas,
+        longest_suffix_that_is_prefix_of, make_token_logprob_out, openai_content_block_to_text,
+        parse_ask_user_args, parse_tool_call_body, parse_tool_calls, parse_tool_choice,
+        token_logprob_chunk_json, wire_messages_to_engine, wire_messages_to_json,
+        with_reserved_ask_user_tool, ChatMessageWire, ChatRequest, OpenAiContent,
+        OpenAiContentBlock, ResponseFormat, StreamEvent, StreamingToolCallParser, ToolChoice,
+        ASK_USER_TOOL_NAME,
     };
     use axum::http::StatusCode;
     use rustllama_engine::{TokenLogprobs, TopLogprob};
@@ -3373,6 +3402,52 @@ mod tests {
             sampling.seed, default_seed,
             "absent seed must not override the SamplingParams default"
         );
+    }
+
+    #[test]
+    fn qwen3_model_base_supplies_recommended_defaults_when_request_omits_them() {
+        // A Qwen3-arch model's recommended profile becomes the BASE; a request
+        // with no sampling fields inherits top_k 20 / top_p 0.8 / presence 1.0 /
+        // repeat 1.0 automatically.
+        let req = chat_request_with_seed(None);
+        let base = rustllama_engine::recommended_sampling_for_arch("qwen3").expect("qwen3 rec");
+        let s = build_sampling_with_base(&req, base);
+        assert_eq!(s.top_k, 20);
+        assert!((s.top_p - 0.8).abs() < 1e-6);
+        assert!((s.presence_penalty - 1.0).abs() < 1e-6);
+        assert!((s.repeat_penalty - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn explicit_request_field_overrides_the_model_base() {
+        let value = serde_json::json!({
+            "model": "rustllama-mock",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 4,
+            "top_k": 100,
+        });
+        let req: ChatRequest = serde_json::from_value(value).expect("ChatRequest parses");
+        let base = rustllama_engine::recommended_sampling_for_arch("qwen3").expect("qwen3 rec");
+        let s = build_sampling_with_base(&req, base);
+        assert_eq!(
+            s.top_k, 100,
+            "an explicit request top_k wins over the model base"
+        );
+        // A field the request omitted still comes from the model base.
+        assert!((s.top_p - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn non_qwen_model_keeps_the_generic_default() {
+        // Unknown arch → no recommendation → the generic default is the base, so
+        // a request that omits sampling is byte-identical to the pre-change path.
+        let req = chat_request_with_seed(None);
+        let base = rustllama_engine::recommended_sampling_for_arch("bert").unwrap_or_default();
+        let s = build_sampling_with_base(&req, base);
+        let d = rustllama_engine::SamplingParams::default();
+        assert_eq!(s.top_k, d.top_k);
+        assert!((s.top_p - d.top_p).abs() < 1e-6);
+        assert!((s.repeat_penalty - d.repeat_penalty).abs() < 1e-6);
     }
 
     #[test]

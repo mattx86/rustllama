@@ -429,6 +429,13 @@ pub struct PagedBatchEngine {
     /// `CpuEngine::model_id` so the server's `ServingModel` can
     /// build its `model_id` field uniformly across backends.
     model_id: String,
+    /// Per-MODEL recommended sampling profile, resolved once at load from a
+    /// `generation_config.json` sidecar or the per-architecture table (see
+    /// [`crate::recommended_sampling`]). Surfaced via
+    /// [`crate::Engine::recommended_sampling`] so the server's `build_sampling`
+    /// uses it as the base profile on the paged backend too. `None` when the
+    /// model has no known recommendation.
+    recommended_sampling: Option<crate::SamplingParams>,
     /// Channel to the driver thread. `None` if the engine was
     /// loaded without a driver (the synchronous
     /// `generate_batched_token_ids` path stays callable without it
@@ -896,6 +903,7 @@ impl PagedBatchEngine {
             "model loaded — paged-batch driver thread spawned"
         );
 
+        let recommended_sampling = crate::recommended_sampling(&model.cfg.arch, path);
         Ok(Self {
             model,
             tokenizer,
@@ -905,6 +913,7 @@ impl PagedBatchEngine {
             max_slots,
             page_size,
             model_id,
+            recommended_sampling,
             request_tx: Some(request_tx),
             driver_handle: Some(driver_handle),
             emit_worker_handle,
@@ -1813,6 +1822,9 @@ impl Engine for PagedBatchEngine {
     }
     fn has_lora_adapter(&self, name: &str) -> bool {
         PagedBatchEngine::has_lora_adapter(self, name)
+    }
+    fn recommended_sampling(&self) -> Option<crate::SamplingParams> {
+        self.recommended_sampling.clone()
     }
 
     fn metrics(&self) -> Metrics {
