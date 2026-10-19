@@ -176,6 +176,188 @@ pub struct Usage {
     pub cache_hit_tokens: Option<u32>,
 }
 
+// --- Live inference stats (client-measured timing + server usage) ----------
+// Both chat frontends — the CLI TUI (`rustllama chat --tui`) and the native
+// egui GUI — are HTTP clients of the server, so they measure per-turn timing
+// identically: stamp the request-send instant, the first streamed token
+// (≈ time-to-first-token / end of prefill), and decode wall-time as tokens
+// arrive. Token COUNTS come from the server `usage` block (exact), with a
+// client-side delta tally as a fallback when a minimal server omits usage.
+// The bookkeeping lives here so the two UIs don't each re-implement it; the
+// pure `InferenceStats::compute` math is unit-tested below.
+
+/// A finished (or in-progress) turn's display stats, as plain numbers ready to
+/// format. Produced by [`InferenceStats::compute`] / [`StatsTimer::snapshot`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InferenceStats {
+    /// Time-to-first-token in seconds (request send → first content token);
+    /// `None` until the first token arrives. ≈ the prefill latency as the
+    /// client sees it (it also includes queue + network).
+    pub ttft_s: Option<f64>,
+    /// Prefill throughput ≈ `prompt_tokens / ttft_s`; `None` when TTFT or the
+    /// prompt count is unknown.
+    pub prefill_tok_s: Option<f64>,
+    /// Decode throughput = `completion_tokens / decode_wall_s`; `None` until
+    /// there is a measured decode interval and ≥1 completion token.
+    pub decode_tok_s: Option<f64>,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+    /// Context tokens in use (prompt + completion for the turn); equals
+    /// `total_tokens` when the server reported it.
+    pub ctx_used: u32,
+    /// The loaded model's context length (`/v1/metrics.ctx_size`); `0` = unknown.
+    pub ctx_size: u32,
+}
+
+impl InferenceStats {
+    /// Combine CLIENT-measured durations (seconds) with server token counts
+    /// into the derived throughput + context figures. Kept source-agnostic (it
+    /// takes bare durations + counts) so it is trivially unit-testable.
+    pub fn compute(
+        ttft_s: Option<f64>,
+        decode_s: Option<f64>,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        total_tokens: u32,
+        ctx_size: u32,
+    ) -> Self {
+        let prefill_tok_s = match ttft_s {
+            Some(t) if t > 0.0 && prompt_tokens > 0 => Some(prompt_tokens as f64 / t),
+            _ => None,
+        };
+        let decode_tok_s = match decode_s {
+            Some(d) if d > 0.0 && completion_tokens > 0 => Some(completion_tokens as f64 / d),
+            _ => None,
+        };
+        // Prefer the server's `total_tokens`; else derive prompt + completion.
+        let ctx_used = if total_tokens > 0 {
+            total_tokens
+        } else {
+            prompt_tokens.saturating_add(completion_tokens)
+        };
+        Self {
+            ttft_s,
+            prefill_tok_s,
+            decode_tok_s,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: ctx_used,
+            ctx_used,
+            ctx_size,
+        }
+    }
+
+    /// Context-window utilization percent (`ctx_used / ctx_size`), or `None`
+    /// when the context size is unknown.
+    pub fn ctx_pct(&self) -> Option<f64> {
+        (self.ctx_size > 0).then(|| 100.0 * self.ctx_used as f64 / self.ctx_size as f64)
+    }
+
+    /// A compact one-line summary for a status bar / footer, e.g.
+    /// `TTFT 0.42s · prefill 180 t/s · decode 42 t/s · ctx 512/4096 (12%) · 540 tok`.
+    /// Only the KNOWN pieces are included (an un-measured stat is omitted
+    /// rather than shown as `0`), so a mid-stream line still reads cleanly.
+    pub fn format_compact(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(t) = self.ttft_s {
+            parts.push(format!("TTFT {t:.2}s"));
+        }
+        if let Some(p) = self.prefill_tok_s {
+            parts.push(format!("prefill {p:.0} t/s"));
+        }
+        if let Some(d) = self.decode_tok_s {
+            parts.push(format!("decode {d:.1} t/s"));
+        }
+        // Context usage is only meaningful against a known window; without a
+        // ctx_size the raw count is already covered by the "N tok" piece below.
+        if let Some(pct) = self.ctx_pct() {
+            parts.push(format!(
+                "ctx {}/{} ({pct:.0}%)",
+                self.ctx_used, self.ctx_size
+            ));
+        }
+        if self.total_tokens > 0 {
+            parts.push(format!("{} tok", self.total_tokens));
+        }
+        parts.join(" · ")
+    }
+}
+
+/// Rolling, CLIENT-measured timing for one streamed chat turn. A frontend
+/// creates one with [`StatsTimer::start`] at request-send, calls
+/// [`StatsTimer::on_token`] for each streamed content delta (the first marks
+/// TTFT), and reads an [`InferenceStats`] via [`StatsTimer::snapshot`] — live
+/// during the stream (pass `usage: None`) and final at done (pass the server
+/// `usage`). Keeping the send / first-token / decode-wall bookkeeping here
+/// means the TUI and GUI don't each re-implement it.
+#[derive(Debug, Clone)]
+pub struct StatsTimer {
+    sent: std::time::Instant,
+    first_token: Option<std::time::Instant>,
+    /// Client-side content-delta tally — stands in as the decode count when a
+    /// minimal server returns no `usage` block. A delta is ≈ one token on the
+    /// rustllama server (it streams token-by-token), so this is an estimate.
+    content_tokens: u32,
+}
+
+impl Default for StatsTimer {
+    fn default() -> Self {
+        Self::start()
+    }
+}
+
+impl StatsTimer {
+    /// Begin timing: stamps the request-send instant.
+    pub fn start() -> Self {
+        Self {
+            sent: std::time::Instant::now(),
+            first_token: None,
+            content_tokens: 0,
+        }
+    }
+
+    /// Record a streamed content delta. The first call stamps the first-token
+    /// instant (TTFT); every call bumps the client-side fallback count.
+    pub fn on_token(&mut self) {
+        if self.first_token.is_none() {
+            self.first_token = Some(std::time::Instant::now());
+        }
+        self.content_tokens = self.content_tokens.saturating_add(1);
+    }
+
+    /// Seconds from request-send to the first token, or `None` if none arrived.
+    pub fn ttft_s(&self) -> Option<f64> {
+        self.first_token
+            .map(|t| t.duration_since(self.sent).as_secs_f64())
+    }
+
+    /// Seconds spent decoding so far (first token → now), or `None`
+    /// pre-first-token.
+    pub fn decode_s(&self) -> Option<f64> {
+        self.first_token.map(|t| t.elapsed().as_secs_f64())
+    }
+
+    /// A stats snapshot: this timer's measured durations + the token counts.
+    /// With `usage` set the server's EXACT counts are used; without it the
+    /// client-side delta tally stands in for the completion count (prompt /
+    /// total then unknown).
+    pub fn snapshot(&self, usage: Option<&Usage>, ctx_size: u32) -> InferenceStats {
+        let (prompt, completion, total) = match usage {
+            Some(u) => (u.prompt_tokens, u.completion_tokens, u.total_tokens),
+            None => (0, self.content_tokens, self.content_tokens),
+        };
+        InferenceStats::compute(
+            self.ttft_s(),
+            self.decode_s(),
+            prompt,
+            completion,
+            total,
+            ctx_size,
+        )
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChatMessageOut {
     pub role: String,
@@ -1961,6 +2143,91 @@ fn decode_completion_event(bytes: &[u8]) -> Vec<Result<CompletionEvent>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Basic throughput + context math: prefill = prompt/ttft, decode =
+    /// completion/decode_wall, ctx% = used/size.
+    #[test]
+    fn inference_stats_compute_basic() {
+        // 20 prompt tokens in 0.1 s → 200 t/s; 40 completion in 2 s → 20 t/s.
+        let s = InferenceStats::compute(Some(0.1), Some(2.0), 20, 40, 60, 4096);
+        assert_eq!(s.prompt_tokens, 20);
+        assert_eq!(s.completion_tokens, 40);
+        assert_eq!(s.total_tokens, 60);
+        assert_eq!(s.ctx_used, 60);
+        assert!((s.prefill_tok_s.unwrap() - 200.0).abs() < 1e-6);
+        assert!((s.decode_tok_s.unwrap() - 20.0).abs() < 1e-6);
+        assert!((s.ctx_pct().unwrap() - (100.0 * 60.0 / 4096.0)).abs() < 1e-6);
+    }
+
+    /// Unknowns degrade gracefully: no durations → `None` rates; no ctx_size →
+    /// `None` percent; no server total → total derived from prompt+completion;
+    /// a fully-empty stat formats to an empty string.
+    #[test]
+    fn inference_stats_handles_unknowns() {
+        let empty = InferenceStats::compute(None, None, 0, 0, 0, 0);
+        assert_eq!(empty.prefill_tok_s, None);
+        assert_eq!(empty.decode_tok_s, None);
+        assert_eq!(empty.ctx_pct(), None);
+        assert_eq!(empty.ctx_used, 0);
+        assert_eq!(empty.format_compact(), "");
+
+        // total derived from prompt+completion when the server omits it.
+        let s = InferenceStats::compute(Some(0.5), Some(1.0), 10, 5, 0, 100);
+        assert_eq!(s.total_tokens, 15);
+        assert_eq!(s.ctx_used, 15);
+        assert_eq!(s.ctx_pct(), Some(15.0));
+    }
+
+    /// The compact line includes every known stat in order; an un-measured one
+    /// is omitted rather than shown as zero.
+    #[test]
+    fn inference_stats_format_compact() {
+        // prefill 90/0.5 = 180 t/s; decode 40/2.0 = 20.0 t/s; ctx 130/1000 = 13%.
+        let s = InferenceStats::compute(Some(0.5), Some(2.0), 90, 40, 130, 1000);
+        assert_eq!(
+            s.format_compact(),
+            "TTFT 0.50s · prefill 180 t/s · decode 20.0 t/s · ctx 130/1000 (13%) · 130 tok"
+        );
+        // Mid-stream (no prefill/ctx size): only the measurable parts show.
+        let mid = InferenceStats::compute(Some(0.30), Some(1.0), 0, 12, 0, 0);
+        assert_eq!(
+            mid.format_compact(),
+            "TTFT 0.30s · decode 12.0 t/s · 12 tok"
+        );
+    }
+
+    /// The timer stamps TTFT on the first token, tallies deltas as a fallback
+    /// decode count, and prefers the server `usage` counts when present.
+    #[test]
+    fn stats_timer_counts_and_prefers_usage() {
+        let mut t = StatsTimer::start();
+        assert_eq!(t.ttft_s(), None);
+        t.on_token();
+        t.on_token();
+        assert!(t.ttft_s().is_some());
+        assert!(t.decode_s().is_some());
+
+        // No usage → the client-side delta tally stands in as completion count.
+        let live = t.snapshot(None, 100);
+        assert_eq!(live.completion_tokens, 2);
+
+        // With usage → the server's exact counts win.
+        let usage = Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            prefill_ms: None,
+            decode_ms: None,
+            tokens_prefilled: None,
+            cache_hit_tokens: None,
+        };
+        let fin = t.snapshot(Some(&usage), 100);
+        assert_eq!(fin.prompt_tokens, 10);
+        assert_eq!(fin.completion_tokens, 5);
+        assert_eq!(fin.total_tokens, 15);
+        assert_eq!(fin.ctx_used, 15);
+        assert_eq!(fin.ctx_pct(), Some(15.0));
+    }
 
     #[test]
     fn decode_role_chunk_does_not_emit_content() {
