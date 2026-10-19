@@ -12002,6 +12002,17 @@ async fn chat_repl(
         }
     }
 
+    // Loaded model's context length for the per-reply stats line's
+    // context-usage readout, fetched ONCE like the TUI does:
+    // `/v1/metrics.ctx_size` is the live value (engine `n_ctx()`), with the
+    // on-disk `[inference].ctx_size` as a fallback, else `0` (unknown → the
+    // stats line simply omits the context piece). Best-effort — a miss never
+    // blocks the chat.
+    let ctx_size: u32 = match client.metrics().await {
+        Ok(m) if m.ctx_size > 0 => m.ctx_size as u32,
+        _ => cfg.inference.ctx_size,
+    };
+
     let mut messages: Vec<ChatMessage> = Vec::new();
     if let Some(sys) = system {
         messages.push(ChatMessage {
@@ -12167,7 +12178,7 @@ async fn chat_repl(
                         // request is wire-identical to the plain path.
                         allow_clarify: clarify_enabled.then_some(true),
                     };
-                    drive_chat_stream(&client, req, &mut messages).await?;
+                    drive_chat_stream(&client, req, &mut messages, ctx_size).await?;
                     continue;
                 }
                 // `/model …` mirrors the `rustllama model` CLI verbs:
@@ -12541,7 +12552,7 @@ async fn chat_repl(
                 // wire-identical to the plain path (no `ask_user` tool).
                 allow_clarify: clarify_enabled.then_some(true),
             };
-            match drive_chat_stream(&client, req, &mut messages).await? {
+            match drive_chat_stream(&client, req, &mut messages, ctx_size).await? {
                 StreamOutcome::Normal => break,
                 StreamOutcome::AskUser { prompt, options } => {
                     // Record the question as an assistant turn so the
@@ -12956,10 +12967,18 @@ async fn drive_chat_stream(
     client: &rustllama_client::Client,
     req: rustllama_client::ChatRequest,
     messages: &mut Vec<rustllama_client::ChatMessage>,
+    ctx_size: u32,
 ) -> anyhow::Result<StreamOutcome> {
     use futures::StreamExt as _;
-    use rustllama_client::{ChatEvent, ChatMessage};
+    use rustllama_client::{ChatEvent, ChatMessage, StatsTimer};
     use std::io::Write as _;
+
+    // Client-side timing for the compact per-reply stats line. The clock starts
+    // at request-send (so TTFT ≈ the prefill latency the client sees, incl.
+    // queue + network), and each streamed token advances the decode wall-time.
+    // This is the SAME `StatsTimer`/`InferenceStats` helper the TUI and GUI
+    // use, so the plain line REPL prints the identical readout on any terminal.
+    let mut timer = StatsTimer::start();
 
     let mut stream = match client.chat_stream(req).await {
         Ok(s) => s,
@@ -12986,6 +13005,9 @@ async fn drive_chat_stream(
         match ev {
             Ok(ChatEvent::Start(_)) => {}
             Ok(ChatEvent::Content(t)) => {
+                // First token marks TTFT; every token bumps the decode count
+                // (the client-side fallback when the server omits `usage`).
+                timer.on_token();
                 print!("{t}");
                 let _ = std::io::stdout().flush();
                 content.push_str(&t);
@@ -13023,32 +13045,19 @@ async fn drive_chat_stream(
     }
     println!();
 
-    // Stats line — only when the server populated usage AND we
-    // didn't hit an error. Shows "completion tok @ wallms (tok/s)"
-    // so the user gets the same readout an editor would display.
+    // Compact per-reply stats — the SAME `InferenceStats` one-liner the TUI /
+    // GUI footer shows (e.g. `TTFT 0.74s · prefill 478 t/s · decode 17.8 t/s ·
+    // ctx 467/8192 (6%) · 467 tok`), printed dim after the reply. Combines the
+    // client-measured TTFT + decode wall-time with the server `usage` token
+    // counts and the model's context size. Shown only on a clean finish; a
+    // mid-reply error skips it. An all-unknown line (no server usage, no
+    // measured timing) formats empty and is suppressed.
     if !got_error {
-        if let Some(u) = last_usage.as_ref() {
-            let tok_s = match (u.decode_ms, u.completion_tokens) {
-                (Some(ms), n) if ms > 0.0 && n > 0 => Some(n as f64 / (ms / 1000.0)),
-                _ => None,
-            };
-            let mut parts: Vec<String> = Vec::new();
-            parts.push(format!("{} tok", u.completion_tokens));
-            if let Some(ms) = u.decode_ms {
-                parts.push(format!("{:.0}ms decode", ms));
-            }
-            if let Some(ms) = u.prefill_ms {
-                parts.push(format!("{:.0}ms prefill", ms));
-            }
-            if let Some(s) = tok_s {
-                parts.push(format!("{:.1} tok/s", s));
-            }
-            if let Some(hit) = u.cache_hit_tokens {
-                if hit > 0 {
-                    parts.push(format!("{hit} cache-hit"));
-                }
-            }
-            println!("\x1b[2m[{}]\x1b[0m", parts.join(", "));
+        let line = timer
+            .snapshot(last_usage.as_ref(), ctx_size)
+            .format_compact();
+        if !line.is_empty() {
+            println!("\x1b[2m[{line}]\x1b[0m");
         }
     }
 
