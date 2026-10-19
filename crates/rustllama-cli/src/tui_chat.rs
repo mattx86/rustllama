@@ -28,6 +28,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use rustllama_client::{ChatEvent, ChatMessage, ChatRequest, Client, ToolCall};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// One transcript turn.
 struct Turn {
@@ -1137,13 +1138,18 @@ fn ui(f: &mut Frame, app: &mut App) {
         // hidden (reasoning models stream a scratchpad the user shouldn't see);
         // everything else renders verbatim.
         let head = format!("{prefix}: ");
-        let indent = " ".repeat(head.len().min(content_w.saturating_sub(1)));
+        // DISPLAY width of the head, not its byte length: the info prefix "··"
+        // is U+00B7 ×2 = 4 bytes / 2 columns, so `head.len()` over-indented and
+        // over-subtracted by the byte/column gap. The indent is that many
+        // spaces (1 column each) so continuation lines align under the body.
+        let head_w = UnicodeWidthStr::width(head.as_str());
+        let indent = " ".repeat(head_w.min(content_w.saturating_sub(1)));
         let body: std::borrow::Cow<str> = if t.role == "assistant" {
             std::borrow::Cow::Owned(strip_think(&t.content))
         } else {
             std::borrow::Cow::Borrowed(t.content.as_str())
         };
-        let wrapped = wrap_text(&body, content_w.saturating_sub(head.len()).max(1));
+        let wrapped = wrap_text(&body, content_w.saturating_sub(head_w).max(1));
         if wrapped.is_empty() {
             lines.push(Line::from(vec![Span::styled(head.clone(), style)]));
         }
@@ -1232,8 +1238,18 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// Word-wrap `s` to `width` columns (ASCII-ish; splits over-long words).
-/// Preserves explicit newlines. Exact line count → exact scroll math.
+/// Word-wrap `s` to `width` DISPLAY columns, preserving explicit newlines and
+/// hard-splitting any single word wider than the line.
+///
+/// Width is measured with `unicode-width` — an emoji / CJK glyph is 2 cells, a
+/// combining mark 0 — NOT a char- or byte-count. That is the fix for the
+/// transcript-desync bug: the old `word.chars().count()` under-counted wide
+/// glyphs, so a line it thought fit `width` actually painted WIDER than `width`
+/// and ratatui (which renders each pre-wrapped `Line` to a fixed-width cell
+/// row) pushed the overflow onto the next row — characters "slid" onto the
+/// wrong line on a multibyte reply. Each returned segment now fits in `width`
+/// columns, so the manual pre-wrap matches what ratatui paints and the scroll
+/// line-count stays exact.
 fn wrap_text(s: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out = Vec::new();
@@ -1244,21 +1260,32 @@ fn wrap_text(s: &str, width: usize) -> Vec<String> {
         }
         let mut cur = String::new();
         for word in logical.split(' ') {
-            let wlen = word.chars().count();
+            let wlen = UnicodeWidthStr::width(word);
             if wlen > width {
-                // Flush current, then hard-split the long word.
+                // Flush the current line, then hard-split the over-long word by
+                // display columns so a wide glyph never straddles the boundary.
                 if !cur.is_empty() {
                     out.push(std::mem::take(&mut cur));
                 }
-                let mut chars: Vec<char> = word.chars().collect();
-                while chars.len() > width {
-                    out.push(chars[..width].iter().collect());
-                    chars.drain(..width);
+                let mut seg = String::new();
+                let mut seg_w = 0usize;
+                for ch in word.chars() {
+                    let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if seg_w + cw > width && !seg.is_empty() {
+                        out.push(std::mem::take(&mut seg));
+                        seg_w = 0;
+                    }
+                    seg.push(ch);
+                    seg_w += cw;
                 }
-                cur = chars.into_iter().collect();
+                cur = seg;
             } else if cur.is_empty() {
                 cur = word.to_string();
-            } else if cur.chars().count() + 1 + wlen <= width {
+            } else if UnicodeWidthStr::width(cur.as_str()) + 1 + wlen <= width {
+                // +1 for the joining space. `cur`'s width is recomputed rather
+                // than tracked so there is no dead-store bookkeeping on the
+                // hard-split path; `cur` is at most `width` cells, so this stays
+                // cheap for a transcript line.
                 cur.push(' ');
                 cur.push_str(word);
             } else {
@@ -1269,4 +1296,64 @@ fn wrap_text(s: &str, width: usize) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Baseline the wrapper relies on: `unicode-width` measures an emoji / CJK
+    /// glyph as 2 cells and ASCII as 1 (a char-count treats both as 1, which is
+    /// what desynced the terminal columns). Also: the info prefix "··" is two
+    /// U+00B7 — 2 columns but 4 bytes — so byte length is the wrong indent.
+    #[test]
+    fn display_width_counts_wide_glyphs_as_two() {
+        assert_eq!(UnicodeWidthStr::width("a"), 1);
+        assert_eq!(UnicodeWidthChar::width('a'), Some(1));
+        assert_eq!(UnicodeWidthStr::width("🦙"), 2); // llama emoji
+        assert_eq!(UnicodeWidthStr::width("世"), 2); // CJK
+        assert_eq!(UnicodeWidthStr::width("··"), 2); // info prefix, 2 cols…
+        assert_eq!("··".len(), 4); // …but 4 bytes
+    }
+
+    /// Every wrapped segment fits the target DISPLAY width — a run of width-2
+    /// glyphs wraps at half as many glyphs per line as a char-count would.
+    #[test]
+    fn wrap_text_breaks_on_display_width_not_char_count() {
+        // Eight llama emoji (one word, no spaces) = 16 columns. At width 8 that
+        // is 4 glyphs per line → two lines, each exactly 8 columns wide.
+        let wrapped = wrap_text("🦙🦙🦙🦙🦙🦙🦙🦙", 8);
+        assert_eq!(wrapped.len(), 2);
+        for line in &wrapped {
+            assert!(
+                UnicodeWidthStr::width(line.as_str()) <= 8,
+                "segment wider than the column: {line:?}"
+            );
+        }
+        assert_eq!(wrapped[0].chars().count(), 4); // 4 wide glyphs = 8 cols
+    }
+
+    /// Word-level wrapping respects display width: a wide word that would spill
+    /// past the column moves to the next line instead of overflowing it.
+    #[test]
+    fn wrap_text_wraps_words_by_width() {
+        // "hi" (2) + " " + "世界" (4) = 7 → fits width 7 on one line.
+        assert_eq!(wrap_text("hi 世界", 7), vec!["hi 世界".to_string()]);
+        // At width 4 the wide word can't join (2+1+4 = 7 > 4) → two lines.
+        let w = wrap_text("hi 世界", 4);
+        assert_eq!(w, vec!["hi".to_string(), "世界".to_string()]);
+        for line in &w {
+            assert!(UnicodeWidthStr::width(line.as_str()) <= 4);
+        }
+    }
+
+    /// Explicit newlines stay as separate logical lines — an exact line count
+    /// is what keeps the transcript scroll math right.
+    #[test]
+    fn wrap_text_preserves_newlines() {
+        assert_eq!(
+            wrap_text("a\n\nb", 10),
+            vec!["a".to_string(), String::new(), "b".to_string()]
+        );
+    }
 }
