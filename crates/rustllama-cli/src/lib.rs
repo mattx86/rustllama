@@ -5194,6 +5194,50 @@ async fn pull(hub_ref_str: &str) -> anyhow::Result<()> {
                     }
                 }
             }
+
+            // `generation_config.json` sidecar: the model author's published
+            // sampling recipe (temperature / top_p / top_k / repetition_penalty
+            // / presence_penalty / min_p). Fetched NEXT TO the GGUF so the engine
+            // can read it at load (`rustllama_engine::recommended_sampling`) and
+            // use it as the per-model sampling base — this is what gives e.g. a
+            // pulled Qwen3 its repetition/language-mixing-curbing defaults
+            // automatically. Prefer one in the GGUF's own repo directory, else
+            // the repo root. It is NOT a GGUF, so `companion_sidecars` (GGUF-only)
+            // never returns it — hence this separate, best-effort fetch.
+            let dir_prefix = hub_ref
+                .filename
+                .rsplit_once('/')
+                .map(|(d, _)| format!("{d}/"))
+                .unwrap_or_default();
+            let gen_cfg = files.iter().find(|f| {
+                f.rfilename == format!("{dir_prefix}generation_config.json")
+                    || f.rfilename == "generation_config.json"
+            });
+            if let Some(f) = gen_cfg {
+                let gpb = ProgressBar::new_spinner();
+                gpb.enable_steady_tick(Duration::from_millis(120));
+                gpb.set_style(
+                    ProgressStyle::default_spinner()
+                        .template("{spinner} {msg}")
+                        .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+                );
+                gpb.set_message("downloading generation_config.json");
+                let gen_ref = rustllama_hub::HubRef {
+                    owner: hub_ref.owner.clone(),
+                    repo: hub_ref.repo.clone(),
+                    filename: f.rfilename.clone(),
+                };
+                match rustllama_hub::download(&gen_ref, &cache_dir, Some(&gpb)).await {
+                    Ok(p) => {
+                        gpb.finish_and_clear();
+                        println!("✓ generation_config → {}", p.display());
+                    }
+                    Err(e) => {
+                        gpb.finish_and_clear();
+                        tracing::warn!(error = %e, "generation_config.json download failed (continuing)");
+                    }
+                }
+            }
         }
         Err(e) => {
             tracing::warn!(error = %e, "could not list repo files for companion sidecars (continuing)");
