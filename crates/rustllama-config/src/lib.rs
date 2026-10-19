@@ -1138,41 +1138,44 @@ pub struct ServerConfig {
     /// cap — the registry grows unbounded.
     pub max_loaded_models: u32,
     /// Number of concurrent generations a single model serves in
-    /// parallel. **Default `4`** (P9): with continuous batching on
-    /// (the default — see [`Self::fused_decode`]) this sizes the
-    /// `PagedBatchEngine`'s `max_slots` — up to 4 requests share ONE
+    /// parallel. **Default `4`.** On the OPT-IN paged engine
+    /// (`fused_decode = true` — see [`Self::fused_decode`]) this sizes
+    /// the `PagedBatchEngine`'s `max_slots` — up to 4 requests share ONE
     /// paged KV pool + one fused decode tick, so the slots are cheap
     /// (no per-request KV-cache duplication).
     ///
-    /// On the CONTIGUOUS fallback path (`fused_decode = false`), `>1`
-    /// instead activates the per-fork multi-flight pool — each fork owns
-    /// an independent KV cache via `CpuEngine::fork_for_concurrent_use`,
-    /// so memory grows ~linearly with concurrency. To avoid a memory
-    /// regression for the single user, the serve path only builds those
-    /// forks when the operator EXPLICITLY set `fused_decode = false`; an
-    /// automatic fallback (perf-gate / VLM guard) keeps the contiguous
-    /// pool single-flight regardless of this value (that path buys no
-    /// real request parallelism today anyway).
+    /// On the DEFAULT contiguous engine, `>1` instead activates the
+    /// per-fork multi-flight pool — each fork owns an independent KV
+    /// cache via `CpuEngine::fork_for_concurrent_use`, so memory grows
+    /// ~linearly with concurrency. To avoid a memory regression for the
+    /// single user, the serve path only builds those forks when the
+    /// operator EXPLICITLY set `fused_decode = false`; an UNSET value
+    /// (the default) keeps the contiguous pool single-flight regardless
+    /// of this value (that path buys no real request parallelism today
+    /// anyway). See [`Self::contiguous_multi_flight`].
     pub concurrency: u32,
     /// Continuous batching: use the fused multi-slot `PagedBatchEngine`
     /// (one shared paged KV pool + one driver thread batching every
     /// in-flight request into a single forward per decode tick) instead
     /// of the per-fork multi-flight contiguous pool.
     ///
-    /// **P9 default-ON, perf-gated.** This is an `Option<bool>` so the
-    /// serve path can tell an EXPLICIT choice from "not set":
-    ///   - `Some(true)` / `Some(false)` — the operator wrote the key:
-    ///     honored verbatim (explicit config WINS over the tuner).
-    ///   - `None` (absent, the default) — the batching engine is used
-    ///     UNLESS `tune --batching` measured the contiguous engine
-    ///     faster for the single-user case on this (system, model)
-    ///     (`TuningResult::batching_engine == "contiguous"` +
-    ///     `[tuning].auto_apply_batching`), in which case the serve path
-    ///     falls back to contiguous automatically. A fresh box with no
-    ///     tuner data uses the batching engine (correct by the D1/D1b
-    ///     paged gates); the first-load autotune then measures + may
-    ///     switch it. Precedence: explicit config > tuner winner > the
-    ///     default-on batching engine.
+    /// **Default: OFF (contiguous). The paged engine is OPT-IN.** This is
+    /// an `Option<bool>` so the serve path can tell an EXPLICIT choice
+    /// from "not set":
+    ///   - `Some(true)` — explicit OPT-IN to the paged batching engine.
+    ///   - `Some(false)` — explicit contiguous (also enables per-fork
+    ///     multi-flight when `concurrency > 1`).
+    ///   - `None` (absent, the default) — the CONTIGUOUS `CpuEngine`,
+    ///     single-flight.
+    ///
+    /// This reverses the old P9 default-on: the paged path does not drive
+    /// a GPU on the single-user decode path today (it decodes on CPU and
+    /// can degrade output on some models), so the contiguous engine — the
+    /// one that uses the GPU and is coherent — is the default and paged is
+    /// opt-in. `tune --batching` still MEASURES the single-stream A/B and
+    /// records a winner (shown in `config show`), but it no longer flips
+    /// serve to paged automatically — only an explicit `Some(true)` does.
+    /// See [`Self::use_paged_engine`] for the resolution.
     ///
     /// The `PagedBatchEngine` builds its own paged KV pool, so this flag
     /// alone is sufficient regardless of `[inference].kv_cache_layout`
@@ -1243,6 +1246,31 @@ pub struct ServerConfig {
     pub require_auth_loopback: bool,
 }
 
+impl ServerConfig {
+    /// Which serve engine to use, resolved from [`Self::fused_decode`] alone.
+    ///
+    /// The CONTIGUOUS `CpuEngine` is the DEFAULT; the paged `PagedBatchEngine`
+    /// (continuous batching) is OPT-IN via an explicit `fused_decode = true`.
+    /// This reverses the old P9 default-on: the paged path does not engage a
+    /// GPU on the single-user decode path today, so it is no longer the
+    /// automatic choice.
+    ///
+    ///   - `Some(true)`  → paged (explicit opt-in)         ⇒ `true`
+    ///   - `Some(false)` → contiguous (explicit opt-out)   ⇒ `false`
+    ///   - `None`        → contiguous (the safe default)    ⇒ `false`
+    pub fn use_paged_engine(&self) -> bool {
+        matches!(self.fused_decode, Some(true))
+    }
+
+    /// Whether the contiguous pool may build more than one fork (multi-flight,
+    /// one independent KV cache per fork). ONLY an EXPLICIT `fused_decode =
+    /// false` opts in; an UNSET value stays single-flight so the new contiguous
+    /// default never silently N×'s a single user's RAM via `concurrency` forks.
+    pub fn contiguous_multi_flight(&self) -> bool {
+        self.fused_decode == Some(false)
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -1252,16 +1280,18 @@ impl Default for ServerConfig {
             cors_origins: Vec::new(),
             max_pending_per_model: 4,
             max_loaded_models: 4,
-            // P9: default 4. With continuous batching on (the default),
-            // this is the PagedBatchEngine's max_slots — up to 4 requests
-            // share ONE paged KV pool + one fused decode tick, so slots
-            // are cheap (no per-request KV duplication). On an EXPLICIT
-            // contiguous fallback it sizes the per-fork pool; an automatic
-            // fallback stays single-flight regardless (see the serve path).
+            // Default 4. On the OPT-IN paged engine (`fused_decode = true`) this
+            // is the PagedBatchEngine's max_slots — up to 4 requests share ONE
+            // paged KV pool + one fused decode tick, so slots are cheap (no
+            // per-request KV duplication). On the DEFAULT contiguous engine it
+            // sizes the per-fork pool only when the operator EXPLICITLY set
+            // `fused_decode = false`; an unset value stays single-flight
+            // regardless (see `contiguous_multi_flight` + the serve path).
             concurrency: 4,
-            // P9: default-ON (None ⇒ batching engine unless the tuner's
-            // `tune --batching` winner says contiguous is faster for the
-            // single-user case). `Some(x)` = explicit operator override.
+            // Default: unset ⇒ the CONTIGUOUS CpuEngine. The paged batching
+            // engine is OPT-IN via an explicit `Some(true)` (it does not drive
+            // a GPU on the single-user decode path today). `Some(false)` is the
+            // explicit contiguous opt-out (and enables multi-flight forks).
             fused_decode: None,
             audit_log: false,
             audit_log_path: String::new(),
@@ -1843,6 +1873,38 @@ mod tests {
         let s = toml::to_string(&c).unwrap();
         let back: Config = toml::from_str(&s).unwrap();
         assert_eq!(c.server.port, back.server.port);
+    }
+
+    /// Serve engine resolution: the CONTIGUOUS engine is the DEFAULT; the paged
+    /// batching engine is OPT-IN via an explicit `fused_decode = true`.
+    ///   - `None` (the default)  → contiguous, single-flight
+    ///   - `Some(true)`          → paged
+    ///   - `Some(false)`         → contiguous, multi-flight allowed
+    #[test]
+    fn fused_decode_default_resolves_to_contiguous_single_flight() {
+        let mut s = ServerConfig::default();
+
+        // Unset (the default): contiguous + single-flight (never paged, so a
+        // 4-way `concurrency` default can't fork 4 contiguous copies).
+        assert_eq!(s.fused_decode, None);
+        assert!(!s.use_paged_engine(), "unset must be contiguous");
+        assert!(
+            !s.contiguous_multi_flight(),
+            "unset must stay single-flight"
+        );
+
+        // Explicit opt-in → paged.
+        s.fused_decode = Some(true);
+        assert!(s.use_paged_engine(), "Some(true) must be paged");
+        assert!(!s.contiguous_multi_flight());
+
+        // Explicit opt-out → contiguous, and multi-flight forks are allowed.
+        s.fused_decode = Some(false);
+        assert!(!s.use_paged_engine(), "Some(false) must be contiguous");
+        assert!(
+            s.contiguous_multi_flight(),
+            "explicit false opts into multi-flight forks"
+        );
     }
 
     /// P16: the new KV-evictor + USM-lock + optimize_for config keys default to

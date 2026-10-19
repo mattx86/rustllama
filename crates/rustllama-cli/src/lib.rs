@@ -618,14 +618,15 @@ pub enum Command {
         /// on. A `tune --all` sub-stage (Stage 2b). Dense F32-KV models only.
         #[arg(long)]
         cacheblend: bool,
-        /// P9 continuous-batching A/B: measure SINGLE-STREAM (one request, no
+        /// Continuous-batching A/B: measure SINGLE-STREAM (one request, no
         /// concurrency) prefill+decode tok/s on the continuous-batching
         /// `PagedBatchEngine` vs the contiguous `CpuEngine`, and persist the
-        /// faster-for-single-stream engine under `batching_engine`. This is the
-        /// guard for default-ON continuous batching: the serve path falls back
-        /// to contiguous when this A/B shows a single-stream regression (gated
-        /// by `[tuning].auto_apply_batching`; an explicit `[server].fused_decode`
-        /// always wins). A `tune --all` sub-stage (Stage 4b).
+        /// faster-for-single-stream engine under `batching_engine`. ADVISORY:
+        /// the contiguous engine is the serve DEFAULT and the paged engine is
+        /// opt-in via an explicit `[server].fused_decode = true`, so this A/B no
+        /// longer flips serve to paged automatically — it is surfaced in
+        /// `config show` as the measured recommendation. A `tune --all`
+        /// sub-stage (Stage 4b).
         #[arg(long)]
         batching: bool,
         /// **Comprehensive autotune**: run every sweep in coordinate-
@@ -3867,36 +3868,39 @@ async fn serve(
     // right shell dialect. Mirror `[server].tool_environment_hint` into
     // the server's process-global toggle (default true).
     rustllama_server::env_hint::set_tool_environment_hint_enabled(cfg.server.tool_environment_hint);
-    // P9: continuous batching (the fused-decode `PagedBatchEngine`) is the
-    // DEFAULT now, perf-gated so it never regresses the single user. The paged
-    // engine reached feature parity with the contiguous `CpuEngine` (prefix
-    // cache / APC, string stop-sequences, and grammar / structured output), so
-    // single-user chat gets the same behavior on either backend.
-    //
-    // Precedence: EXPLICIT `[server].fused_decode` > the `tune --batching`
-    // winner (when `[tuning].auto_apply_batching`) > the default-ON batching
-    // engine. A fresh box with no tuner data uses the batching engine (correct
-    // by the D1/D1b paged gates); the first-load autotune then runs the
-    // single-stream A/B and may flip this to contiguous for this (system, model).
+    // Engine selection: the CONTIGUOUS `CpuEngine` is the DEFAULT; the paged
+    // `PagedBatchEngine` (continuous batching) is OPT-IN via an explicit
+    // `[server].fused_decode = true`. This reverses the old P9 default-on: the
+    // paged path does not drive a GPU on the single-user decode path today (it
+    // decodes on CPU and can degrade output on some models), while the
+    // contiguous engine uses the GPU and is coherent — so it is the default and
+    // paged is opt-in. `tune --batching` still measures the single-stream A/B
+    // and records a winner (surfaced in `config show`), but it no longer flips
+    // serve to paged automatically — only an explicit `Some(true)` does.
+    // Resolution policy lives in `ServerConfig::use_paged_engine` /
+    // `contiguous_multi_flight` (unit-tested there); replicated here as the
+    // same one-liners over the copied `fused_decode` because `cfg.server` is
+    // already partially moved (bind_addr) and can't be borrowed as `&self`.
     let configured_fused: Option<bool> = cfg.server.fused_decode;
-    let (mut use_fused_decode, fused_source) = match configured_fused {
-        Some(explicit) => (explicit, "explicit [server].fused_decode"),
-        None => match batching_from_cache_or_default(cfg.tuning.auto_apply_batching) {
-            Some(w) => (w, "tune --batching winner"),
-            None => (true, "default-on (no tuner data)"),
-        },
+    let mut use_fused_decode = matches!(configured_fused, Some(true));
+    let fused_source = match configured_fused {
+        Some(true) => "explicit [server].fused_decode = true (paged, opt-in)",
+        Some(false) => "explicit [server].fused_decode = false (contiguous)",
+        None => "unset \u{21d2} contiguous default (paged is opt-in via fused_decode = true)",
     };
     tracing::info!(
         use_fused_decode,
         source = fused_source,
-        "continuous-batching engine selection (P9 perf-gated default-on)"
+        "serve engine selection (contiguous default; paged batching opt-in)"
     );
-    // Contiguous-fallback fork count. The per-fork multi-flight pool duplicates
-    // the KV cache per fork and (today) buys no real request parallelism, so we
-    // only build >1 fork when the operator EXPLICITLY asked for the contiguous
-    // engine (`fused_decode = false`). An AUTOMATIC fallback (perf-gate / VLM /
-    // layout guard below) keeps the contiguous engine single-flight so the
-    // default-on flip never silently 4×'s a single user's RAM.
+    // Contiguous fork count. The per-fork multi-flight pool duplicates the KV
+    // cache per fork and (today) buys no real request parallelism, so we only
+    // build >1 fork when the operator EXPLICITLY asked for the contiguous
+    // engine (`fused_decode = false`). An UNSET value (the contiguous default)
+    // stays single-flight so the default never silently 4×'s a single user's
+    // RAM via the `concurrency` default. Same policy as
+    // `ServerConfig::contiguous_multi_flight` (inlined — `cfg.server` is
+    // partially moved above, so the `&self` method can't be called here).
     let fork_concurrency = if configured_fused == Some(false) {
         concurrency
     } else {
@@ -3933,13 +3937,14 @@ async fn serve(
     // registry. No mock fallback — that was a footgun where every
     // chat emitted canned tokens against a "live"-looking server.
     //
-    // Two backends (P9: the batching engine is the perf-gated DEFAULT —
-    // `use_fused_decode` was resolved above):
-    //   - **Fused decode** (the default): load [`PagedBatchEngine`].
-    //     One shared paged KV pool + driver thread arbitrates fused
-    //     multi-slot decode across up to `concurrency` HTTP requests.
-    //   - **CpuEngine + multi-flight** (explicit `fused_decode = false`,
-    //     or an automatic fallback — VLM guard / `tune --batching` winner):
+    // Two backends (`use_fused_decode` was resolved above — contiguous is the
+    // DEFAULT, paged is opt-in via `fused_decode = true`):
+    //   - **Fused decode** (opt-in, `fused_decode = true`): load
+    //     [`PagedBatchEngine`]. One shared paged KV pool + driver thread
+    //     arbitrates fused multi-slot decode across up to `concurrency`
+    //     HTTP requests.
+    //   - **CpuEngine + multi-flight** (the default; `fork_concurrency` > 1
+    //     only on an explicit `fused_decode = false`, else single-flight):
     //     `fork_concurrency` independent forks via `with_concurrency`.
     // Startup model list. Explicit `--model` paths win over `[model].path`;
     // the FIRST entry becomes the server default (the rest are registered
@@ -9660,24 +9665,6 @@ pub fn persist_batching_winner_to(
     Ok(cache_path_for(cache_dir, key))
 }
 
-/// P9: read the `batching_engine` winner from the tuner cache for the current
-/// system fingerprint, mapping it to "use the batching (paged) engine?".
-/// `Some(true)` = paged winner (or parity), `Some(false)` = contiguous winner,
-/// `None` = no entry / auto-apply off / no cache (serve then uses the
-/// default-on batching engine). Mirrors `kv_cache_layout_from_cache_or_default`.
-pub fn batching_from_cache_or_default(auto_apply: bool) -> Option<bool> {
-    if !auto_apply {
-        return None;
-    }
-    let cache_dir = rustllama_tuner::default_cache_dir()?;
-    let key = rustllama_tuner::system_fingerprint();
-    rustllama_tuner::load_cache(&cache_dir, &key)
-        .ok()
-        .flatten()
-        .and_then(|t| t.batching_engine)
-        .map(|s| !s.eq_ignore_ascii_case("contiguous"))
-}
-
 // ============================================================
 // E2 autotuner candidates: flash_kv_min + prefix_cache_max_snapshots
 // ============================================================
@@ -10479,14 +10466,16 @@ pub fn cmd_tuning_show(config_path: &std::path::Path) -> anyhow::Result<()> {
         cfg.tuning.auto_apply_perf_knobs
     );
     println!();
-    // P9: the single-stream batching A/B winner + how the serve path resolves
-    // the continuous-batching default. `batching_engine` is set by
-    // `tune --batching`; the serve path consults it only when
-    // `[server].fused_decode` is unset (an explicit value always wins).
-    println!("batching (continuous-batching default guard):");
+    // The serve engine: CONTIGUOUS is the DEFAULT; the paged batching engine is
+    // OPT-IN via an explicit `[server].fused_decode = true`. `batching_engine`
+    // is the single-stream A/B winner MEASURED by `tune --batching` — now
+    // ADVISORY: serve no longer auto-applies it (only an explicit `Some(true)`
+    // selects paged).
+    println!("batching (serve engine; contiguous default, paged opt-in):");
     match tuning.batching_engine.as_deref() {
         Some(e) => println!(
-            "  batching_engine   = {e}  (single-stream {} is faster/parity here)",
+            "  batching_engine   = {e}  (tuner MEASURED single-stream {} faster/parity here; \
+             advisory — set fused_decode = true to use paged)",
             if e == "contiguous" {
                 "contiguous"
             } else {
@@ -10494,22 +10483,15 @@ pub fn cmd_tuning_show(config_path: &std::path::Path) -> anyhow::Result<()> {
             }
         ),
         None => println!(
-            "  batching_engine   = (none — run `rustllama tune --batching`; serve uses the \
-             default-on paged engine)"
+            "  batching_engine   = (none — run `rustllama tune --batching` to measure; serve \
+             defaults to the contiguous engine regardless)"
         ),
     }
     println!("  auto_apply_batching = {}", cfg.tuning.auto_apply_batching);
     let fused_src = match cfg.server.fused_decode {
-        Some(true) => "explicit config: ON".to_string(),
-        Some(false) => "explicit config: OFF".to_string(),
-        None => format!(
-            "unset ⇒ tuner winner else default-ON (effective: {})",
-            match batching_from_cache_or_default(cfg.tuning.auto_apply_batching) {
-                Some(true) => "paged (CB)",
-                Some(false) => "contiguous",
-                None => "paged (CB, no tuner data yet)",
-            }
-        ),
+        Some(true) => "explicit config: ON (paged, opt-in)".to_string(),
+        Some(false) => "explicit config: OFF (contiguous)".to_string(),
+        None => "unset ⇒ contiguous (default; paged is opt-in via fused_decode = true)".to_string(),
     };
     println!("  fused_decode      = {fused_src}");
     println!();
