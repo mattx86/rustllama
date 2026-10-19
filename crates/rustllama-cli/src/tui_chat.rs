@@ -26,7 +26,9 @@ use ratatui::crossterm::{
 };
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
-use rustllama_client::{ChatEvent, ChatMessage, ChatRequest, Client, ToolCall};
+use rustllama_client::{
+    ChatEvent, ChatMessage, ChatRequest, Client, InferenceStats, StatsTimer, ToolCall, Usage,
+};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -39,7 +41,10 @@ struct Turn {
 /// Messages the per-turn streaming task forwards to the render loop.
 enum StreamMsg {
     Delta(String),
-    Usage(String),
+    /// Final per-request token counts + timings from the server `usage` block
+    /// (requested via `stream_options.include_usage`). Combined with the
+    /// client-measured [`StatsTimer`] into the live stats footer.
+    Usage(Usage),
     Done,
     Err(String),
     /// An informational line to show as a transcript turn (e.g. the result
@@ -100,11 +105,30 @@ struct App {
     /// A pending tool-call approve/deny (auto-tools OFF). Holds the proposed
     /// calls; `y`/Enter approves, `n` denies.
     pending_tools: Option<Vec<ToolCall>>,
+    /// Live inference stats for the footer. `stats_timer` is the
+    /// client-measured timing for the IN-FLIGHT turn (TTFT / decode wall);
+    /// `pending_usage` stashes the server `usage` chunk (which arrives just
+    /// before Done); `last_stats` is the finished-turn snapshot shown when
+    /// idle. `ctx_size` is the loaded model's context length (from
+    /// `/v1/metrics`) for the context-usage readout — `0` when unknown.
+    stats_timer: Option<StatsTimer>,
+    pending_usage: Option<Usage>,
+    last_stats: Option<InferenceStats>,
+    ctx_size: u32,
 }
 
 impl App {
     fn last_assistant_mut(&mut self) -> Option<&mut Turn> {
         self.turns.iter_mut().rev().find(|t| t.role == "assistant")
+    }
+
+    /// Start client-side timing for a new streamed turn and clear the previous
+    /// turn's stats. Called from every stream-start site (send, clarify answer,
+    /// tool deny) so the TTFT clock starts at request-send.
+    fn begin_turn_stats(&mut self) {
+        self.stats_timer = Some(StatsTimer::start());
+        self.pending_usage = None;
+        self.last_stats = None;
     }
 
     /// Build the OpenAI-style message list from the transcript + system.
@@ -175,6 +199,16 @@ pub async fn run(
         ),
     };
 
+    // The loaded model's context length, for the stats footer's context-usage
+    // readout. `/v1/metrics.ctx_size` is the live value (engine `n_ctx()`);
+    // fall back to the on-disk `[inference].ctx_size`, else 0 (unknown → the
+    // footer just omits the context piece). Best-effort — a miss never blocks
+    // the chat.
+    let ctx_size: u32 = match client.metrics().await {
+        Ok(m) if m.ctx_size > 0 => m.ctx_size as u32,
+        _ => cfg.inference.ctx_size,
+    };
+
     // Terminal setup (alternate screen + raw mode).
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -190,6 +224,7 @@ pub async fn run(
         system,
         model,
         initial,
+        ctx_size,
     )
     .await;
 
@@ -200,6 +235,7 @@ pub async fn run(
     res
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn event_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     client: Arc<Client>,
@@ -208,6 +244,7 @@ async fn event_loop<B: Backend>(
     system: Option<String>,
     model: Option<String>,
     initial: Vec<ChatMessage>,
+    ctx_size: u32,
 ) -> Result<()> {
     // Seed a resumed transcript (`chat --resume`): a leading system
     // message fills the system slot when `--system` wasn't given; the
@@ -247,6 +284,10 @@ async fn event_loop<B: Backend>(
         clarify_enabled: true,
         pending_question: None,
         pending_tools: None,
+        stats_timer: None,
+        pending_usage: None,
+        last_stats: None,
+        ctx_size,
     };
 
     // Dedicated blocking input reader → channel, so the async loop never
@@ -427,6 +468,7 @@ fn handle_event(
                 role: "assistant".into(),
                 content: String::new(),
             });
+            app.begin_turn_stats();
             app.streaming = true;
             app.follow = true;
             app.status = "generating…".into();
@@ -470,21 +512,34 @@ fn handle_event(
 fn apply_stream_msg(app: &mut App, msg: StreamMsg) {
     match msg {
         StreamMsg::Delta(t) => {
+            // The first non-empty delta marks time-to-first-token; each delta
+            // bumps the client-side fallback decode count.
+            if let Some(timer) = app.stats_timer.as_mut() {
+                timer.on_token();
+            }
             if let Some(a) = app.last_assistant_mut() {
                 a.content.push_str(&t);
             }
         }
         StreamMsg::Usage(u) => {
-            app.status = u;
+            // Stash the server's exact token counts; finalized at Done (the
+            // usage chunk arrives just before it under include_usage).
+            app.pending_usage = Some(u);
         }
         StreamMsg::Done => {
             app.streaming = false;
+            // Freeze the finished-turn stats: client-measured TTFT/decode wall
+            // + the server usage counts + the model's context size.
+            if let Some(timer) = app.stats_timer.take() {
+                app.last_stats = Some(timer.snapshot(app.pending_usage.as_ref(), app.ctx_size));
+            }
             if app.status.starts_with("generating") {
                 app.status = "ready".into();
             }
         }
         StreamMsg::Err(e) => {
             app.streaming = false;
+            app.stats_timer = None;
             app.turns.push(Turn {
                 role: "error".into(),
                 content: e,
@@ -571,18 +626,9 @@ fn spawn_stream(client: Arc<Client>, req: ChatRequest, tx: UnboundedSender<Strea
                             let _ = tx.send(StreamMsg::Delta(t));
                         }
                         Ok(ChatEvent::Usage(u)) => {
-                            let decode_ms = u.decode_ms.unwrap_or(0.0);
-                            let tps = if decode_ms > 0.0 && u.completion_tokens > 0 {
-                                u.completion_tokens as f64 / (decode_ms / 1000.0)
-                            } else {
-                                0.0
-                            };
-                            let _ = tx.send(StreamMsg::Usage(format!(
-                                "{} tok in {:.1}s ({:.1} tok/s)",
-                                u.completion_tokens,
-                                decode_ms / 1000.0,
-                                tps
-                            )));
+                            // Forward the raw usage block; the render loop folds
+                            // it into the client-measured stats footer.
+                            let _ = tx.send(StreamMsg::Usage(u));
                         }
                         Ok(ChatEvent::AskUser {
                             prompt, options, ..
@@ -592,7 +638,14 @@ fn spawn_stream(client: Arc<Client>, req: ChatRequest, tx: UnboundedSender<Strea
                         Ok(ChatEvent::ToolCalls(calls)) => {
                             let _ = tx.send(StreamMsg::ToolCalls { calls });
                         }
-                        Ok(ChatEvent::Finish(_)) => break,
+                        // Do NOT break on Finish: under `include_usage` the
+                        // server emits the `usage` block in a SEPARATE final SSE
+                        // chunk that arrives AFTER Finish, so breaking here would
+                        // drop the token counts (and with them the context-usage
+                        // + prefill stats). Keep draining until the stream ends
+                        // naturally ([DONE]); `Done` is sent below. Mirrors the
+                        // GUI's streaming loop.
+                        Ok(ChatEvent::Finish(_)) => {}
                         Ok(ChatEvent::Start(_)) => {}
                         Ok(ChatEvent::Error(e)) => {
                             let _ = tx.send(StreamMsg::Err(e));
@@ -630,6 +683,7 @@ fn answer_pending_question(
         role: "assistant".into(),
         content: String::new(),
     });
+    app.begin_turn_stats();
     app.streaming = true;
     app.follow = true;
     app.status = "generating…".into();
@@ -647,6 +701,7 @@ fn deny_pending_tools(app: &mut App, client: &Arc<Client>, stream_tx: &Unbounded
         role: "assistant".into(),
         content: String::new(),
     });
+    app.begin_turn_stats();
     app.streaming = true;
     app.follow = true;
     app.status = "generating…".into();
@@ -1039,6 +1094,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // status bar
+            Constraint::Length(1), // stats footer
             Constraint::Min(3),    // transcript
             Constraint::Length(3), // input box
         ])
@@ -1099,9 +1155,37 @@ fn ui(f: &mut Frame, app: &mut App) {
     ]);
     f.render_widget(Paragraph::new(status), chunks[0]);
 
+    // --- stats footer ---
+    // Live during a stream (client-measured TTFT + decode so far), frozen to
+    // the last turn's full figures when idle. See `InferenceStats`.
+    let stats = if app.streaming {
+        app.stats_timer
+            .as_ref()
+            .map(|t| t.snapshot(app.pending_usage.as_ref(), app.ctx_size))
+    } else {
+        app.last_stats.clone()
+    };
+    let stats_text = stats.map(|s| s.format_compact()).unwrap_or_default();
+    let stats_line = Line::from(vec![
+        Span::styled(
+            " stats ",
+            Style::default().fg(Color::Black).bg(Color::DarkGray),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            if stats_text.is_empty() {
+                "—".to_string()
+            } else {
+                stats_text
+            },
+            Style::default().fg(Color::Gray),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(stats_line), chunks[1]);
+
     // --- transcript ---
     let transcript_block = Block::default().borders(Borders::ALL).title(" transcript ");
-    let inner = transcript_block.inner(chunks[1]);
+    let inner = transcript_block.inner(chunks[2]);
     let content_w = inner.width.max(1) as usize;
     let view_h = inner.height.max(1);
 
@@ -1210,7 +1294,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     let transcript = Paragraph::new(Text::from(lines))
         .block(transcript_block)
         .scroll((app.scroll, 0));
-    f.render_widget(transcript, chunks[1]);
+    f.render_widget(transcript, chunks[2]);
 
     // --- input box ---
     let title = if app.streaming {
@@ -1219,14 +1303,14 @@ fn ui(f: &mut Frame, app: &mut App) {
         " input "
     };
     let input_block = Block::default().borders(Borders::ALL).title(title);
-    let input_inner = input_block.inner(chunks[2]);
+    let input_inner = input_block.inner(chunks[3]);
     let prompt = "> ";
     let input = Paragraph::new(Line::from(vec![
         Span::styled(prompt, Style::default().fg(Color::DarkGray)),
         Span::raw(app.input.as_str()),
     ]))
     .block(input_block);
-    f.render_widget(input, chunks[2]);
+    f.render_widget(input, chunks[3]);
 
     // Cursor at the end of the input (only when not streaming).
     if !app.streaming {

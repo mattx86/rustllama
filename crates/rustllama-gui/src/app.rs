@@ -18,9 +18,9 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use futures::StreamExt;
 use rustllama_client::{
     Capabilities, ChatEvent, ChatMessage, ChatRequest, Client, ConversationSummary, DecideResult,
-    HfFile, HfModel, LoadModelParams, MetricsSnapshot, MultimodalMessage, StoredMessage,
-    StreamOptions, SystemPrompt, TagsModel, ToolCall, TuneProgress, TuningRecommendations,
-    TuningSummary, Usage,
+    HfFile, HfModel, InferenceStats, LoadModelParams, MetricsSnapshot, MultimodalMessage,
+    StatsTimer, StoredMessage, StreamOptions, SystemPrompt, TagsModel, ToolCall, TuneProgress,
+    TuningRecommendations, TuningSummary, Usage,
 };
 
 /// How many `/v1/metrics` samples the Status sparklines retain. At the ~1 Hz
@@ -543,6 +543,13 @@ pub struct GuiApp {
 
     // --- chat status line ---
     last_usage: Option<Usage>,
+    /// Live inference stats (TTFT / prefill / decode tok-s / context usage /
+    /// total tokens). `stats_timer` times the IN-FLIGHT turn (client-measured
+    /// send → first-token → decode wall); `last_stats` is the finished-turn
+    /// snapshot shown when idle. Token counts fold in from `last_usage`; the
+    /// context size from [`GuiApp::ctx_budget`].
+    stats_timer: Option<StatsTimer>,
+    last_stats: Option<InferenceStats>,
     status: Option<String>,
 
     // --- chat: system prompt (from /v1/config) ---
@@ -750,6 +757,8 @@ impl GuiApp {
             metrics_last_poll: None,
             metrics_inflight: false,
             last_usage: None,
+            stats_timer: None,
+            last_stats: None,
             status: None,
             system_prompts: Vec::new(),
             selected_prompt: String::new(),
@@ -1748,6 +1757,11 @@ impl GuiApp {
         }
         self.pending.clear();
         self.last_usage = None;
+        // Start the client-side timer: this instant is "request sent", so the
+        // first streamed token gives TTFT and decode wall-time accrues from
+        // there. Finalized at ChatDone with the server usage counts.
+        self.stats_timer = Some(StatsTimer::start());
+        self.last_stats = None;
         self.status = None;
         self.request_id = None;
         self.streaming = true;
@@ -1866,6 +1880,8 @@ impl GuiApp {
         self.pending_images.clear();
         self.streaming = false;
         self.last_usage = None;
+        self.last_stats = None;
+        self.stats_timer = None;
         self.status = None;
         self.pending_question = None;
         self.pending_tools = None;
@@ -1938,6 +1954,9 @@ impl GuiApp {
             self.transcript.push(Turn::assistant(text));
         }
         self.streaming = false;
+        // Drop the in-flight timer: the aborted turn gets no usage chunk, so
+        // leave `last_stats` showing the previous completed turn.
+        self.stats_timer = None;
     }
 
     /// Kick off an off-thread save-dialog + write for the transcript. `as_json`
@@ -2028,6 +2047,11 @@ impl GuiApp {
                 // Ignore stragglers that may land after a Stop aborted the task
                 // but before the channel drained.
                 if self.streaming {
+                    // First delta stamps TTFT; each delta bumps the client-side
+                    // fallback decode count.
+                    if let Some(timer) = self.stats_timer.as_mut() {
+                        timer.on_token();
+                    }
                     self.pending.push_str(&t);
                 }
             }
@@ -2038,6 +2062,12 @@ impl GuiApp {
                         self.transcript.push(Turn::assistant(text));
                     }
                     self.streaming = false;
+                    // Freeze the finished-turn stats: client-measured
+                    // TTFT/decode wall + server usage counts + context size.
+                    let ctx = self.ctx_budget().unwrap_or(0) as u32;
+                    if let Some(timer) = self.stats_timer.take() {
+                        self.last_stats = Some(timer.snapshot(usage.as_ref(), ctx));
+                    }
                     self.last_usage = usage;
                 }
                 self.request_id = None;
@@ -2052,6 +2082,7 @@ impl GuiApp {
                     self.transcript.push(Turn::assistant(text));
                 }
                 self.streaming = false;
+                self.stats_timer = None;
                 self.request_id = None;
                 self.chat_task = None;
                 tracing::warn!(target: "rustllama_gui", "chat error: {e}");
@@ -2317,6 +2348,7 @@ impl GuiApp {
                 self.pending_images.clear();
                 self.streaming = false;
                 self.last_usage = None;
+                self.last_stats = None;
                 self.status = None;
                 self.pending_question = None;
                 self.pending_tools = None;
@@ -2984,8 +3016,22 @@ impl GuiApp {
             });
 
         // Chat toolbar: New, Sampling popover, tool/clarify toggles, regen /
-        // export, shortcuts help, and the last-turn usage line.
-        let usage_line = self.last_usage.as_ref().map(format_usage);
+        // export, shortcuts help, and the live inference-stats line (TTFT /
+        // prefill / decode tok-s / context usage / total tokens). Live during a
+        // stream (client-measured TTFT + decode so far), frozen to the last
+        // turn's full figures when idle.
+        let stats_line = if self.streaming {
+            let ctx = self.ctx_budget().unwrap_or(0) as u32;
+            self.stats_timer
+                .as_ref()
+                .map(|t| t.snapshot(self.last_usage.as_ref(), ctx).format_compact())
+                .filter(|s| !s.is_empty())
+        } else {
+            self.last_stats
+                .as_ref()
+                .map(|s| s.format_compact())
+                .filter(|s| !s.is_empty())
+        };
         let transcript_empty = self.transcript.is_empty();
         let has_assistant = self.transcript.iter().any(|t| t.role == "assistant");
         let sampling_is_default = self.sampling.is_default();
@@ -3128,8 +3174,12 @@ impl GuiApp {
                         if ui.button("?").on_hover_text("Keyboard shortcuts").clicked() {
                             open_shortcuts = true;
                         }
-                        if let Some(line) = &usage_line {
-                            ui.label(RichText::new(line).color(MUTED).small());
+                        if let Some(line) = &stats_line {
+                            ui.label(RichText::new(line).color(MUTED).small())
+                                .on_hover_text(
+                                    "time-to-first-token · prefill tok/s · decode tok/s · \
+                                     context used/size · total tokens (this turn)",
+                                );
                         }
                     });
                 });
@@ -5100,19 +5150,6 @@ fn export_filename(ext: &str) -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("rustllama-chat-{secs}.{ext}")
-}
-
-/// Format the usage block into a one-liner: prompt/completion counts + a
-/// tok/s derived from the decode-time rustllama extension.
-fn format_usage(u: &Usage) -> String {
-    let tok_per_s = match u.decode_ms {
-        Some(ms) if ms > 0.0 => (u.completion_tokens as f64) / (ms / 1000.0),
-        _ => 0.0,
-    };
-    format!(
-        "{} prompt · {} completion · {:.1} tok/s",
-        u.prompt_tokens, u.completion_tokens, tok_per_s
-    )
 }
 
 /// A rounded elevated "card" container; runs `add` inside its padded body.
