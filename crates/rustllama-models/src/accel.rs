@@ -3129,7 +3129,185 @@ pub fn reset_device_caches_for_new_model() {
     clear_mlx_attn_context();
     clear_usm_attn_context();
     usm_attn_kv_epoch_bump();
+    paged_mirror_reset();
     set_moe_tier_active(false);
+}
+
+// ===========================================================================
+// GPU paged attention — Phase A: device-resident mirror of the paged KV pool.
+//
+// The paged KV store (`PagedKvStore.data`) is HOST RAM, so decode attention
+// today gathers it to a host slab and runs on CPU (`gather_layer_shared`). This
+// mirror is a CONTIGUOUS device slab with the EXACT same geometry as the host
+// pool (`total_pages * page_stride` f32s), so `page → byte offset =
+// page * page_stride * 4` is pure arithmetic and a shared (APC) prefix page is
+// one slab slot — no copy-on-write, since KV is read-only during attention and a
+// slot only ever writes its OWN freshly-allocated pages. The store's write path
+// (`write_token` / `write_page`) syncs each written row/page here via an offset
+// H2D copy — the same one-row H2D the contiguous decode mirror uses — so the
+// device bytes stay byte-identical to the host pool. A later block-table
+// flash-decode kernel (Phase B) reads directly from this slab.
+//
+// Fully INERT off-CUDA (the global stays `None`), so the host/SYCL path is
+// byte-unchanged on a non-NVIDIA box. WRITE-BLIND here (no NVIDIA on the dev
+// box) — validated on the pod.
+// ===========================================================================
+struct PagedKvDeviceMirror {
+    slab: ck::CudaDeviceBuffer<'static>,
+    // Geometry mirror of `PagedKvStore` (paged_kv_store.rs): identical strides,
+    // so a host cell and its device cell share the same element offset.
+    page_stride: usize,
+    layer_stride: usize,
+    kv_stride: usize,
+    head_stride: usize,
+    head_dim: usize,
+    n_kv_heads: u32,
+    page_size: u32,
+    n_layers: u32,
+    total_pages: u32,
+    // Owning stream declared LAST: declaration-order field drop frees `slab`
+    // (which borrows it) before the stream. Held only to keep it alive.
+    #[allow(dead_code)]
+    stream: ck::CudaStream,
+}
+
+// SAFETY: like `CudaMatvecCache`, the mirror's raw device pointers are only ever
+// touched under the `paged_mirror()` mutex (serialized access); the owned
+// `CudaStream` is itself `Send`, and the device pointers never alias host
+// memory — so moving the whole mirror across threads is sound.
+unsafe impl Send for PagedKvDeviceMirror {}
+
+fn paged_mirror() -> &'static Mutex<Option<PagedKvDeviceMirror>> {
+    static M: OnceLock<Mutex<Option<PagedKvDeviceMirror>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(None))
+}
+
+/// Allocate the device-resident paged-pool mirror (Phase A). Returns `false`
+/// (⇒ the caller keeps the CPU gather path) off-CUDA, on a degenerate geometry,
+/// or on alloc failure. The caller (the paged engine load) is expected to have
+/// already free-VRAM-checked the slab and decided the mirror fits. Replaces any
+/// prior mirror (so a reload re-sizes cleanly).
+pub fn paged_mirror_init(
+    total_pages: u32,
+    n_layers: u32,
+    n_kv_heads: u32,
+    page_size: u32,
+    head_dim: u32,
+) -> bool {
+    if !cuda_active() {
+        return false;
+    }
+    if total_pages == 0 || n_layers == 0 || n_kv_heads == 0 || page_size == 0 || head_dim == 0 {
+        return false;
+    }
+    let head_stride = (page_size as usize) * (head_dim as usize);
+    let kv_stride = (n_kv_heads as usize) * head_stride;
+    let layer_stride = 2usize * kv_stride;
+    let page_stride = (n_layers as usize) * layer_stride;
+    let Some(total_elems) = (total_pages as usize).checked_mul(page_stride) else {
+        return false;
+    };
+    let Some(n_bytes) = total_elems.checked_mul(std::mem::size_of::<f32>()) else {
+        return false;
+    };
+    let Some(stream) = ck::CudaStream::create(0) else {
+        return false;
+    };
+    let Some(buf) = ck::CudaDeviceBuffer::alloc(&stream, n_bytes) else {
+        return false;
+    };
+    // SAFETY: the `'_`→`'static` widening is the same lifetime lie
+    // `ensure_cuda_dev` tells — the buffer borrows `stream`, owned in the same
+    // struct and declared LAST, so it outlives the buffer via field-drop order.
+    let slab = unsafe {
+        std::mem::transmute::<ck::CudaDeviceBuffer<'_>, ck::CudaDeviceBuffer<'static>>(buf)
+    };
+    let mirror = PagedKvDeviceMirror {
+        slab,
+        page_stride,
+        layer_stride,
+        kv_stride,
+        head_stride,
+        head_dim: head_dim as usize,
+        n_kv_heads,
+        page_size,
+        n_layers,
+        total_pages,
+        stream,
+    };
+    match paged_mirror().lock() {
+        Ok(mut g) => {
+            *g = Some(mirror);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Sync one freshly-written `(K, V)` token row into the device mirror (Phase A).
+/// `k`/`v` are the full `n_kv_heads * head_dim` rows the store just wrote at
+/// `(page, layer, pos_in_page)`; this does the matching per-head offset H2D
+/// copies (byte-identical geometry to the host pool). INERT off-CUDA / when no
+/// mirror is present. Called from `PagedKvStore::write_token`.
+pub fn paged_mirror_write_token(layer: u32, page: u32, pos_in_page: u32, k: &[f32], v: &[f32]) {
+    let Ok(mut g) = paged_mirror().lock() else {
+        return;
+    };
+    let Some(m) = g.as_mut() else {
+        return;
+    };
+    if page >= m.total_pages || layer >= m.n_layers || pos_in_page >= m.page_size {
+        return;
+    }
+    let hd = m.head_dim;
+    let nkv = m.n_kv_heads as usize;
+    if k.len() != nkv * hd || v.len() != nkv * hd {
+        return;
+    }
+    let base = (page as usize) * m.page_stride + (layer as usize) * m.layer_stride;
+    let pos_off = (pos_in_page as usize) * hd;
+    for h in 0..nkv {
+        // kv_axis 0 = K, 1 = V (offset by `kv_stride`).
+        let k_off = base + h * m.head_stride + pos_off;
+        let v_off = base + m.kv_stride + h * m.head_stride + pos_off;
+        let _ = m
+            .slab
+            .copy_from_host_at(k_off * 4, f32_slice_as_bytes(&k[h * hd..h * hd + hd]));
+        let _ = m
+            .slab
+            .copy_from_host_at(v_off * 4, f32_slice_as_bytes(&v[h * hd..h * hd + hd]));
+    }
+}
+
+/// Sync a whole promoted page (cold-tier promote via `write_page`) into the
+/// mirror — `src` is exactly `page_stride` f32s. INERT off-CUDA / no mirror.
+pub fn paged_mirror_write_page(page: u32, src: &[f32]) {
+    let Ok(mut g) = paged_mirror().lock() else {
+        return;
+    };
+    let Some(m) = g.as_mut() else {
+        return;
+    };
+    if page >= m.total_pages || src.len() != m.page_stride {
+        return;
+    }
+    let off = (page as usize) * m.page_stride;
+    let _ = m.slab.copy_from_host_at(off * 4, f32_slice_as_bytes(src));
+}
+
+/// Drop the device mirror on model (re)load — mirrors the other
+/// `reset_device_caches_for_new_model` resets so a reload never reuses a slab
+/// sized/filled for the previous model.
+pub fn paged_mirror_reset() {
+    if let Ok(mut g) = paged_mirror().lock() {
+        *g = None;
+    }
+}
+
+#[inline]
+fn f32_slice_as_bytes(s: &[f32]) -> &[u8] {
+    // SAFETY: f32 is plain-old-data; reinterpret the slice's bytes read-only.
+    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
 }
 
 /// `--cuda-parity` verdict-cache name for the grouped FFN kernel of `kind`, or

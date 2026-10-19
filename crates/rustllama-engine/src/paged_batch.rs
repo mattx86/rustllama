@@ -913,6 +913,50 @@ impl PagedBatchEngine {
                 }
             }
         }
+        // GPU paged attention — Phase A: allocate the device-resident mirror of
+        // the paged KV pool IF a CUDA GPU is present and the slab (same size as
+        // the host pool) fits the free VRAM remaining after the MoE tier + model
+        // weights. The mirror is what a later block-table flash-decode kernel
+        // (Phase B) reads; without it, decode attention stays on the CPU gather
+        // path (byte-identical). Fail-closed: no CUDA / won't-fit / alloc failure
+        // ⇒ no mirror ⇒ CPU attention. The paged POOL itself is host RAM, so this
+        // is purely additive VRAM (host pool + device mirror). Reset on the next
+        // model load via `reset_device_caches_for_new_model`. WRITE-BLIND here
+        // (no NVIDIA on the dev box) — validated on the pod.
+        {
+            let page_stride = (model.cfg.n_layers as u64)
+                * 2
+                * (model.cfg.n_kv_heads as u64)
+                * (page_size as u64)
+                * (model.cfg.head_dim as u64);
+            let slab_bytes = (total_pages as u64) * page_stride * 4;
+            let free_vram = rustllama_runtime::gpu_detect::nvidia_free_vram_bytes(0).unwrap_or(0);
+            // 512 MiB headroom for the decode scratch + CUDA context.
+            let margin = 512 * 1024 * 1024u64;
+            if free_vram > 0 && slab_bytes.saturating_add(margin) <= free_vram {
+                if rustllama_models::accel::paged_mirror_init(
+                    total_pages,
+                    model.cfg.n_layers as u32,
+                    model.cfg.n_kv_heads as u32,
+                    page_size,
+                    model.cfg.head_dim as u32,
+                ) {
+                    tracing::info!(
+                        slab_mb = slab_bytes / (1024 * 1024),
+                        free_vram_mb = free_vram / (1024 * 1024),
+                        "gpu paged attention: device KV-pool mirror allocated (Phase A; \
+                         decode attention routes to GPU once the block-table kernel verdict passes)"
+                    );
+                }
+            } else {
+                tracing::debug!(
+                    slab_mb = slab_bytes / (1024 * 1024),
+                    free_vram_mb = free_vram / (1024 * 1024),
+                    "gpu paged attention: device KV-pool mirror skipped (no CUDA GPU or slab \
+                     won't fit free VRAM) — decode attention stays on the CPU gather path"
+                );
+            }
+        }
         let model = Arc::new(model);
         let model_id = path
             .file_stem()
