@@ -2196,6 +2196,43 @@ pub fn cuda_set_stream_window(k: u32) {
     }
 }
 
+/// AirLLM Phase 2 prefetch: asynchronously upload the NEXT layer's CUDA-packable
+/// weights into the streaming window on the cache's copy stream, overlapping the
+/// transfer with the CURRENT layer's compute. The forward loop calls this with
+/// `encode(layer+1)` and the next block's weight tensors; pair it with
+/// [`cuda_wait_prefetch`] at the top of the next layer. Owned-F16 / norm tensors
+/// (no `dtype_to_cuda_kind`) are skipped. No-op off streaming / off CUDA.
+pub fn cuda_prefetch_layer(tag: u32, tensors: &[&rustllama_tensor::Tensor]) {
+    let Some(cache) = cuda_cache() else {
+        return;
+    };
+    let mut specs: Vec<(usize, &[u8])> = Vec::with_capacity(tensors.len());
+    for t in tensors {
+        if tensor_forced_to_cpu(&t.name) || dtype_to_cuda_kind(t.dtype).is_none() {
+            continue;
+        }
+        let wb = as_bytes(t);
+        specs.push((wb.as_ptr() as usize, wb));
+    }
+    if specs.is_empty() {
+        return;
+    }
+    if let Ok(mut g) = cache.lock() {
+        g.prefetch_layer(tag, &specs);
+    }
+}
+
+/// AirLLM Phase 2: block until the copy stream's prefetch uploads are done, so
+/// the compute issued next only sees fully-uploaded weights. Called at the top of
+/// each layer under streaming. No-op off CUDA.
+pub fn cuda_wait_prefetch() {
+    if let Some(cache) = cuda_cache() {
+        if let Ok(g) = cache.lock() {
+            g.wait_prefetch();
+        }
+    }
+}
+
 /// Whether the GPU path is enabled for the layer that's currently
 /// being processed on this thread. Returns `true` when
 /// `current_layer_idx < n_gpu_layers`. The `try_*_usm_f32` dispatch

@@ -3808,6 +3808,12 @@ pub struct CudaMatvecCache {
     tick: u64,
     layer_keys: HashMap<u32, Vec<usize>>, // layer tag -> its resident weight keys
     layer_last_used: HashMap<u32, u64>,   // layer tag -> last-touched tick
+    // Phase 2: a second CUDA stream for PREFETCH — the next layer's weights
+    // upload here (async) while the current layer computes on `stream`. Declared
+    // before `stream` but after `weights` so prefetch buffers (in `weights`,
+    // allocated on this stream) free before it drops. `None` if a second stream
+    // couldn't be created (prefetch then degrades to the sync compute-path upload).
+    copy_stream: Option<CudaStream>,
     used_bytes: usize,
     budget_bytes: usize,
     stream: CudaStream,
@@ -3818,6 +3824,8 @@ impl CudaMatvecCache {
     /// cached weights (bytes). `None` when no such device / stream fails.
     pub fn new(device_index: u32, budget_bytes: usize) -> Option<Self> {
         let stream = CudaStream::create(device_index)?;
+        // Best-effort second stream for prefetch; None just disables overlap.
+        let copy_stream = CudaStream::create(device_index);
         Some(Self {
             weights: HashMap::new(),
             x_scratch: None,
@@ -3838,6 +3846,7 @@ impl CudaMatvecCache {
             tick: 0,
             layer_keys: HashMap::new(),
             layer_last_used: HashMap::new(),
+            copy_stream,
             used_bytes: 0,
             budget_bytes,
             stream,
@@ -3890,14 +3899,15 @@ impl CudaMatvecCache {
     /// guarantees a layer is never left half-resident. Returns false when no
     /// evictable layer remains (everything is the current layer) — the caller
     /// then declines and falls back to CPU.
-    fn evict_until_fits(&mut self, need: usize, keep_tag: u32) -> bool {
+    fn evict_until_fits(&mut self, need: usize, keep_a: u32, keep_b: u32) -> bool {
         while self.used_bytes + need > self.budget_bytes {
-            // Coldest evictable layer: lowest tick, excluding the one being
-            // admitted. (Phase 2 also excludes the prefetch target.)
+            // Coldest evictable layer: lowest tick, excluding the layer being
+            // admitted (`keep_a`) and, for prefetch, the one in flight on the
+            // copy stream (`keep_b`; pass `keep_a` again when there is none).
             let mut victim: Option<u32> = None;
             let mut victim_tick: u64 = u64::MAX;
             for (&t, &tick) in self.layer_last_used.iter() {
-                if t != keep_tag && tick < victim_tick {
+                if t != keep_a && t != keep_b && tick < victim_tick {
                     victim_tick = tick;
                     victim = Some(t);
                 }
@@ -3915,6 +3925,65 @@ impl CudaMatvecCache {
             self.layer_last_used.remove(&victim);
         }
         true
+    }
+
+    /// AirLLM Phase 2: asynchronously upload `weights` (the NEXT layer's
+    /// `(host_key, bytes)` set) into the streaming window on the COPY stream,
+    /// overlapping the H2D transfer with the CURRENT layer's compute on the main
+    /// stream. Pair with [`Self::wait_prefetch`] at the top of the next layer
+    /// before any compute reads these weights. Eviction protects BOTH the current
+    /// compute layer and this prefetch target. No-op when streaming is off or no
+    /// copy stream exists; any failure abandons the prefetch (the compute path's
+    /// synchronous `ensure_weight` fills the gap, so correctness is unaffected).
+    pub fn prefetch_layer(&mut self, prefetch_tag: u32, weights: &[(usize, &[u8])]) {
+        if self.stream_window_layers == 0 || self.copy_stream.is_none() {
+            return;
+        }
+        self.tick += 1;
+        self.layer_last_used.insert(prefetch_tag, self.tick);
+        let current = self.current_layer_tag;
+        for &(key, bytes) in weights {
+            if bytes.is_empty() {
+                continue;
+            }
+            if matches!(self.weights.get(&key), Some(b) if b.cap_bytes == bytes.len()) {
+                continue; // already resident
+            }
+            if let Some(b) = self.weights.remove(&key) {
+                self.used_bytes = self.used_bytes.saturating_sub(b.cap_bytes);
+                self.untrack_key(key);
+            }
+            if self.used_bytes + bytes.len() > self.budget_bytes
+                && !self.evict_until_fits(bytes.len(), current, prefetch_tag)
+            {
+                return; // window can't hold current + prefetch; compute will sync-upload
+            }
+            // Scope the copy-stream borrow to just the alloc so the subsequent
+            // `self.weights` mutation doesn't conflict (disjoint fields, but the
+            // alloc call borrows one and insert the other).
+            let buf = {
+                let copy = self.copy_stream.as_ref().unwrap();
+                RawDevBuf::alloc(copy, bytes.len())
+            };
+            let Some(mut buf) = buf else {
+                return;
+            };
+            if !buf.upload_at_async(0, bytes) {
+                return;
+            }
+            self.used_bytes += bytes.len();
+            self.weights.insert(key, buf);
+            self.layer_keys.entry(prefetch_tag).or_default().push(key);
+        }
+    }
+
+    /// AirLLM Phase 2: block the host until the copy stream's prefetch uploads
+    /// have completed, so the compute issued next (on the main stream) can only
+    /// observe fully-uploaded weights. Cheap no-op when there is no copy stream.
+    pub fn wait_prefetch(&self) {
+        if let Some(copy) = self.copy_stream.as_ref() {
+            stream_sync(copy);
+        }
     }
 
     /// Drop all cached weights (freeing their device buffers) and reset the
@@ -3994,7 +4063,7 @@ impl CudaMatvecCache {
             // CPU. Streaming: evict the coldest whole layer(s) — never the one
             // being admitted — to cycle the window; decline only if nothing is
             // evictable (everything is the current layer ⇒ window too small).
-            if self.stream_window_layers == 0 || !self.evict_until_fits(w_bytes.len(), tag) {
+            if self.stream_window_layers == 0 || !self.evict_until_fits(w_bytes.len(), tag, tag) {
                 return false;
             }
         }

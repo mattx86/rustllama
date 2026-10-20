@@ -12148,10 +12148,29 @@ impl LlamaModel {
             crate::accel::set_current_layer_idx(layer_idx as u32);
             // AirLLM streaming: tag the CUDA weight cache with this layer so its
             // bounded-window LRU groups + ages this layer's weights for
-            // whole-layer eviction. Gated on `stream_window() > 0` so the normal
-            // (non-streaming) path never takes the extra cache lock.
+            // whole-layer eviction, then drive the prefetch double-buffer. Gated
+            // on `stream_window() > 0` so the normal path never takes the extra
+            // cache lock.
             if crate::accel::stream_window() > 0 {
                 crate::accel::cuda_set_layer_tag(layer_idx as u32);
+                // Phase 2: wait for THIS layer's prefetch (issued last iteration)
+                // to land on the copy stream, then issue the NEXT layer's prefetch
+                // so its H2D overlaps this layer's compute. Dense blocks only
+                // (MoE experts stream per-token, Phase 5); the next block's QKV is
+                // fused or split, and `cuda_prefetch_layer` skips any non-packable
+                // / owned tensor.
+                crate::accel::cuda_wait_prefetch();
+                if layer_idx + 1 < n_layers_used {
+                    if let Some(nb) = self.weights.blocks.get(layer_idx + 1) {
+                        let mut ts: Vec<&Tensor> = vec![&nb.w_o, &nb.w_gate, &nb.w_up, &nb.w_down];
+                        if let Some(qkv) = &nb.w_qkv_fused {
+                            ts.push(qkv);
+                        } else {
+                            ts.extend([&nb.w_q, &nb.w_k, &nb.w_v]);
+                        }
+                        crate::accel::cuda_prefetch_layer((layer_idx + 1) as u32, &ts);
+                    }
+                }
             }
             // P2: is this an F32 SWA ring layer? A ring layer's slab is
             // `cap`-strided and ring-addressed (`pos % cap`), so the
