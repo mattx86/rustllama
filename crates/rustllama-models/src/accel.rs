@@ -2127,6 +2127,14 @@ thread_local! {
     /// weight device pointers that eviction dangles), and to fire readahead on
     /// the decode path.
     static STREAM_WINDOW: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+
+    /// Per-thread current streaming layer tag — the layer index, or
+    /// `encode_expert_tag(layer, expert)` for a MoE expert. Set by
+    /// `cuda_set_layer_tag` (which also tags the global CUDA cache) so the
+    /// per-thread SYCL/MLX weight caches — which live in this crate and can't be
+    /// reached by the CUDA cache's lock — read the SAME tag for their own
+    /// streaming LRU (whole-layer / per-expert eviction grouping).
+    static STREAM_LAYER_TAG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Engine-side setter for `[inference].n_gpu_layers`. Called once
@@ -2178,11 +2186,19 @@ pub fn stream_window() -> u32 {
 /// evicted — residency/perf, never the math — so it is safe lock-free of the
 /// matvec itself.
 pub fn cuda_set_layer_tag(tag: u32) {
+    // Mirror into the per-thread TLS so the SYCL/MLX caches read the same tag.
+    STREAM_LAYER_TAG.with(|c| c.set(tag));
     if let Some(cache) = cuda_cache() {
         if let Ok(mut g) = cache.lock() {
             g.set_layer_tag(tag);
         }
     }
+}
+
+/// Read the per-thread streaming layer tag (set by [`cuda_set_layer_tag`]). Used
+/// by the SYCL/MLX weight caches to group + age weights per layer / expert.
+pub fn stream_layer_tag() -> u32 {
+    STREAM_LAYER_TAG.with(|c| c.get())
 }
 
 /// Push the streaming window (and thus flip the cache's admission policy from
@@ -6431,6 +6447,14 @@ struct UsmAttnContext {
     ///                  from oversubscribing host memory).
     /// Resolved per-context (per-thread); cleared on engine teardown.
     effective_matvec_usm_budget: Option<usize>,
+    /// AirLLM streaming (SYCL mirror of the CUDA cache LRU): group resident
+    /// weight keys by layer tag for WHOLE-layer eviction, age them for the LRU,
+    /// and remember each key's `(bytes, is_device)` so an eviction decrements the
+    /// right tier counter. Empty/unused when streaming is off (byte-identical).
+    stream_layer_keys: HashMap<u32, Vec<usize>>,
+    stream_layer_last_used: HashMap<u32, u64>,
+    stream_key_meta: HashMap<usize, (usize, bool)>,
+    stream_tick: u64,
     /// Per-call activation scratch for Q8_0 packed matvec. Sized to
     /// the largest K seen so far; reused across calls. Same
     /// lazy-grow semantics as `rmsnorm_x`.
@@ -6619,6 +6643,10 @@ impl UsmAttnContext {
             packed_weight_device_bytes: 0,
             packed_weight_usm_bytes: 0,
             effective_matvec_usm_budget: None,
+            stream_layer_keys: HashMap::new(),
+            stream_layer_last_used: HashMap::new(),
+            stream_key_meta: HashMap::new(),
+            stream_tick: 0,
             matvec_x_f32: None,
             matvec_out_f32: None,
             matvec_out2_f32: None,
@@ -6728,6 +6756,64 @@ impl UsmAttnContext {
         Some(ctx)
     }
 
+    /// AirLLM streaming (SYCL): record that `key` (`bytes` long, in the device
+    /// or shared tier) was just admitted under layer `tag`, for whole-layer
+    /// eviction + LRU aging. No-op unless streaming.
+    fn stream_note_admit(&mut self, tag: u32, key: usize, bytes: usize, is_device: bool) {
+        self.stream_tick += 1;
+        self.stream_layer_last_used.insert(tag, self.stream_tick);
+        self.stream_layer_keys.entry(tag).or_default().push(key);
+        self.stream_key_meta.insert(key, (bytes, is_device));
+    }
+
+    /// AirLLM streaming (SYCL): evict the coldest whole layers (never `keep_tag`)
+    /// until the TARGET tier has room for `need` bytes under `budget`. `is_device`
+    /// selects the tier the admission targets; the other tier's bytes freed by an
+    /// evicted layer still count (a layer's weights can span both tiers). Returns
+    /// false if no evictable layer remains (window too small → caller declines,
+    /// falls to CPU). `budget == 0` = uncapped ⇒ nothing to do.
+    fn stream_evict(&mut self, keep_tag: u32, need: usize, budget: usize, is_device: bool) -> bool {
+        if budget == 0 {
+            return true;
+        }
+        loop {
+            let used = if is_device {
+                self.packed_weight_device_bytes
+            } else {
+                self.packed_weight_usm_bytes
+            };
+            if used.saturating_add(need) <= budget {
+                return true;
+            }
+            let mut victim: Option<u32> = None;
+            let mut victim_tick = u64::MAX;
+            for (&t, &tick) in self.stream_layer_last_used.iter() {
+                if t != keep_tag && tick < victim_tick {
+                    victim_tick = tick;
+                    victim = Some(t);
+                }
+            }
+            let Some(victim) = victim else {
+                return false;
+            };
+            if let Some(keys) = self.stream_layer_keys.remove(&victim) {
+                for k in keys {
+                    if let Some((bytes, was_device)) = self.stream_key_meta.remove(&k) {
+                        self.packed_weight_cache.remove(&k);
+                        if was_device {
+                            self.packed_weight_device_bytes =
+                                self.packed_weight_device_bytes.saturating_sub(bytes);
+                        } else {
+                            self.packed_weight_usm_bytes =
+                                self.packed_weight_usm_bytes.saturating_sub(bytes);
+                        }
+                    }
+                }
+            }
+            self.stream_layer_last_used.remove(&victim);
+        }
+    }
+
     /// Ensure weight tensor `key` (raw bytes `src`, `expected_bytes`
     /// long) is resident in the packed-USM weight cache. Returns:
     ///   - `true`  — already cached, or freshly uploaded; the caller
@@ -6747,8 +6833,19 @@ impl UsmAttnContext {
         src_is_file_backed: bool,
     ) -> bool {
         if self.packed_weight_cache.contains_key(&key) {
+            // Streaming: age this key's layer so the LRU keeps it hot.
+            if stream_window() > 0 {
+                let t = stream_layer_tag();
+                self.stream_tick += 1;
+                self.stream_layer_last_used.insert(t, self.stream_tick);
+            }
             return true;
         }
+        // AirLLM streaming (SYCL mirror): under a window, admissions EVICT the
+        // coldest whole layer to make room instead of declining (the LRU bounds
+        // residency), and we record each admit for whole-layer eviction.
+        let streaming = stream_window() > 0;
+        let stream_tag = stream_layer_tag();
         // Dedicated-VRAM (malloc_device) tier, tried first. On the
         // integrated Iris Xe this lands in the reserved VRAM aperture —
         // separate from the shared-LPDDR / system-RAM pool — so hot
@@ -6758,44 +6855,66 @@ impl UsmAttnContext {
         // on over-budget or an alloc/copy failure we fall through to the
         // shared tier below. Off by default (budget 0) until Phase 2.
         let dev_budget = device_vram_budget_bytes();
-        if dev_budget != 0
-            && self
+        if dev_budget != 0 {
+            // Streaming: cycle the window — evict cold device-tier layers to make
+            // room before the fit check, instead of spilling to the shared tier.
+            if streaming {
+                self.stream_evict(stream_tag, expected_bytes, dev_budget, true);
+            }
+            if self
                 .packed_weight_device_bytes
                 .saturating_add(expected_bytes)
                 <= dev_budget
-        {
-            if let Some(dbuf) =
-                sk::SyclDeviceBuffer::alloc_from_host(&self.stream, &src[..expected_bytes])
             {
-                // SAFETY: same '_-to-'static pattern as the shared tier —
-                // `UsmAttnContext::drop` clears the cache before the
-                // stream is destroyed.
-                let dbuf = unsafe {
-                    std::mem::transmute::<sk::SyclDeviceBuffer<'_>, sk::SyclDeviceBuffer<'static>>(
-                        dbuf,
-                    )
-                };
-                self.packed_weight_cache
-                    .insert(key, PackedWeightBuf::Device(dbuf));
-                self.packed_weight_device_bytes = self
-                    .packed_weight_device_bytes
-                    .saturating_add(expected_bytes);
-                static FIRST_DEVICE_UPLOAD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                FIRST_DEVICE_UPLOAD.get_or_init(|| {
-                    tracing::info!(
+                if let Some(dbuf) =
+                    sk::SyclDeviceBuffer::alloc_from_host(&self.stream, &src[..expected_bytes])
+                {
+                    // SAFETY: same '_-to-'static pattern as the shared tier —
+                    // `UsmAttnContext::drop` clears the cache before the
+                    // stream is destroyed.
+                    let dbuf = unsafe {
+                        std::mem::transmute::<sk::SyclDeviceBuffer<'_>, sk::SyclDeviceBuffer<'static>>(
+                            dbuf,
+                        )
+                    };
+                    self.packed_weight_cache
+                        .insert(key, PackedWeightBuf::Device(dbuf));
+                    self.packed_weight_device_bytes = self
+                        .packed_weight_device_bytes
+                        .saturating_add(expected_bytes);
+                    if streaming {
+                        // Inlined `stream_note_admit` via direct field access: a
+                        // `&mut self` method here would conflict with the
+                        // `&self.stream` borrow the `if let Some(dbuf) =
+                        // alloc_from_host(...)` temporary still holds; disjoint
+                        // field writes are fine.
+                        self.stream_tick += 1;
+                        self.stream_layer_last_used
+                            .insert(stream_tag, self.stream_tick);
+                        self.stream_layer_keys
+                            .entry(stream_tag)
+                            .or_default()
+                            .push(key);
+                        self.stream_key_meta.insert(key, (expected_bytes, true));
+                    }
+                    static FIRST_DEVICE_UPLOAD: std::sync::OnceLock<()> =
+                        std::sync::OnceLock::new();
+                    FIRST_DEVICE_UPLOAD.get_or_init(|| {
+                        tracing::info!(
                         bytes = expected_bytes,
                         "first packed-matvec DEVICE-VRAM weight upload — dedicated-VRAM tier live"
                     );
-                });
-                // The weight now lives in device VRAM; drop the redundant
-                // file-backed mmap pages to reclaim host RAM (the payoff
-                // of the device tier on a discrete GPU).
-                if src_is_file_backed && discard_mmap_enabled() {
-                    discard_mmap_pages(src.as_ptr(), expected_bytes);
+                    });
+                    // The weight now lives in device VRAM; drop the redundant
+                    // file-backed mmap pages to reclaim host RAM (the payoff
+                    // of the device tier on a discrete GPU).
+                    if src_is_file_backed && discard_mmap_enabled() {
+                        discard_mmap_pages(src.as_ptr(), expected_bytes);
+                    }
+                    return true;
                 }
-                return true;
+                // Device alloc/copy failed — fall through to the shared tier.
             }
-            // Device alloc/copy failed — fall through to the shared tier.
         }
         // Dynamic host-RAM safety floor for the shared-USM tier. On this
         // unified-memory iGPU shared USM *is* system LPDDR, so an
@@ -6804,7 +6923,9 @@ impl UsmAttnContext {
         // past that, spill this and subsequent weights to CPU-mmap. One
         // cheap GlobalMemoryStatusEx per *uncached* weight (~µs), and it
         // adapts as KV / activations grow. `floor == 0` disables it.
-        let floor = usm_ram_floor_bytes();
+        // Streaming bounds residency via the LRU, so the unbounded-growth RAM
+        // floor doesn't apply — bypass it (eviction manages host RAM instead).
+        let floor = if streaming { 0 } else { usm_ram_floor_bytes() };
         if floor != 0 {
             // With mmap-discard on, uploading a file-backed weight is
             // ~RAM-neutral (its USM copy replaces the discarded mmap
@@ -6836,6 +6957,11 @@ impl UsmAttnContext {
                 eff
             }
         };
+        // Streaming: evict cold shared-tier layers to make room before the
+        // budget check, cycling the window instead of declining to CPU.
+        if streaming {
+            self.stream_evict(stream_tag, expected_bytes, budget, false);
+        }
         if budget != 0 && self.packed_weight_usm_bytes.saturating_add(expected_bytes) > budget {
             log_usm_weight_budget_once();
             return false;
@@ -6854,6 +6980,9 @@ impl UsmAttnContext {
         self.packed_weight_cache
             .insert(key, PackedWeightBuf::Shared(buf));
         self.packed_weight_usm_bytes = self.packed_weight_usm_bytes.saturating_add(expected_bytes);
+        if streaming {
+            self.stream_note_admit(stream_tag, key, expected_bytes, false);
+        }
         static FIRST_USM_UPLOAD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         FIRST_USM_UPLOAD.get_or_init(|| {
             tracing::info!(
@@ -6941,6 +7070,11 @@ impl Drop for UsmAttnContext {
         self.packed_weight_device_bytes = 0;
         self.packed_weight_usm_bytes = 0;
         self.effective_matvec_usm_budget = None;
+        // Streaming residency bookkeeping is keyed to the cleared weight cache.
+        self.stream_layer_keys.clear();
+        self.stream_layer_last_used.clear();
+        self.stream_key_meta.clear();
+        self.stream_tick = 0;
         self.matvec_x_f32 = None;
         self.matvec_out_f32 = None;
         self.matvec_out2_f32 = None;
