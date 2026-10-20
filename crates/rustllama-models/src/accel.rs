@@ -9800,6 +9800,20 @@ fn dev_attn_cuda_graph_enabled() -> bool {
     *ON.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_ATTN_DEV_RESIDENT_BLOCK_CUDA_GRAPH))
 }
 
+/// Feature 1b WHOLE-LAYER gate: fuse the dense SwiGLU FFN *into* the captured
+/// CUDA graph only where the whole-layer parity probe passed
+/// (`layer:dev_resident_cuda_graph`) — a SEPARATE verdict from the attention-only
+/// graph (`attn:dev_resident_block_cuda_graph`, [`dev_attn_cuda_graph_enabled`]).
+/// Fail-closed: unmeasured / MISCOMPUTE ⇒ off, so the graph captures attention
+/// only and the caller runs the host FFN. The FFN-in-graph arm failed its probe
+/// on some NVIDIA HW (`cos=1.0` but one element past the allclose budget), so
+/// without this gate it would have ridden on the attention-only verdict and run
+/// unvalidated — this keeps it off until its own probe is green.
+fn dev_layer_cuda_graph_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_LAYER_DEV_RESIDENT_CUDA_GRAPH))
+}
+
 /// Run the WHOLE attention block for one decode token on the GPU, keeping the
 /// activation resident on device (#2) — `CudaMatvecCache::decode_attn_block_f32`
 /// behind the gate + weight/norm extraction + mirror seeding. On success `hidden`
@@ -10016,6 +10030,16 @@ pub fn try_decode_attn_block_cuda_graph_f32(
     if !dev_attn_cuda_graph_enabled() || !cuda_active() || has_qkv_bias {
         return (false, false);
     }
+    // Fail-closed on the whole-layer verdict: only fuse the dense FFN into the
+    // captured graph where `layer:dev_resident_cuda_graph` passed. Otherwise drop
+    // it to `None` → capture attention-only (the validated `attn:` arm) and let
+    // the caller run the host FFN (`ffn_ran=false`). This stops the unvalidated
+    // FFN-in-graph from running on the attention-only verdict alone.
+    let dense_ffn = if dev_layer_cuda_graph_enabled() {
+        dense_ffn
+    } else {
+        None
+    };
     let (Some(kq), Some(kk), Some(kv), Some(ko)) = (
         dtype_to_cuda_kind(w_q.dtype),
         dtype_to_cuda_kind(w_k.dtype),

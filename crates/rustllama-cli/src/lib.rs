@@ -5030,22 +5030,19 @@ async fn unload_model(
 // ----- pull -----
 
 async fn pull(hub_ref_str: &str) -> anyhow::Result<()> {
-    use indicatif::{ProgressBar, ProgressStyle};
-    use std::time::Duration;
+    use indicatif::ProgressBar;
 
     let hub_ref = rustllama_hub::HubRef::parse(hub_ref_str)?;
     let cache_dir = rustllama_hub::default_cache_dir()
         .ok_or_else(|| anyhow::anyhow!("could not resolve cache dir"))?;
     std::fs::create_dir_all(&cache_dir)?;
 
-    let pb = ProgressBar::new_spinner();
-    pb.enable_steady_tick(Duration::from_millis(120));
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner} {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-    );
-    pb.set_message(format!("downloading {}", hub_ref.filename));
+    // hf-hub draws its OWN byte-progress bar inside `download()` (its API is built
+    // with `.with_progress(true)` whenever we pass `Some`). A second indicatif bar
+    // here would fight it for the same stderr line — the spinner-vs-byte-bar
+    // flicker — so keep ours HIDDEN: pass `Some` only to switch hf-hub's bar ON,
+    // and still `finish`/`println!` below for the completion line.
+    let pb = ProgressBar::hidden();
 
     let dst = rustllama_hub::download(&hub_ref, &cache_dir, Some(&pb)).await?;
     pb.finish_and_clear();
@@ -5061,14 +5058,8 @@ async fn pull(hub_ref_str: &str) -> anyhow::Result<()> {
     match rustllama_hub::hf_repo_files(&hub_ref.repo_id()).await {
         Ok(files) => {
             for comp in rustllama_hub::companion_sidecars(&hub_ref.filename, &files) {
-                let cpb = ProgressBar::new_spinner();
-                cpb.enable_steady_tick(Duration::from_millis(120));
-                cpb.set_style(
-                    ProgressStyle::default_spinner()
-                        .template("{spinner} {msg}")
-                        .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-                );
-                cpb.set_message(format!("downloading companion {comp}"));
+                // Hidden — hf-hub draws the byte bar (see the main pull above).
+                let cpb = ProgressBar::hidden();
                 let comp_ref = rustllama_hub::HubRef {
                     owner: hub_ref.owner.clone(),
                     repo: hub_ref.repo.clone(),
@@ -5105,14 +5096,8 @@ async fn pull(hub_ref_str: &str) -> anyhow::Result<()> {
                     || f.rfilename == "generation_config.json"
             });
             if let Some(f) = gen_cfg {
-                let gpb = ProgressBar::new_spinner();
-                gpb.enable_steady_tick(Duration::from_millis(120));
-                gpb.set_style(
-                    ProgressStyle::default_spinner()
-                        .template("{spinner} {msg}")
-                        .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-                );
-                gpb.set_message("downloading generation_config.json");
+                // Hidden — hf-hub draws the byte bar (see the main pull above).
+                let gpb = ProgressBar::hidden();
                 let gen_ref = rustllama_hub::HubRef {
                     owner: hub_ref.owner.clone(),
                     repo: hub_ref.repo.clone(),

@@ -7954,19 +7954,44 @@ pub fn run_cuda_parity() -> anyhow::Result<()> {
                     // elements, so bare `max_rel` false-positives (cos=1.0 but
                     // one ref≈0 element reads rel≈0.999). Keep the cos bar +
                     // rel_tol=0.15; add the 5e-3 absolute floor.
+                    const GRAPH_REL_TOL: f64 = 0.15;
                     let (cos, within, worst_abs, tol_frac) =
-                        allclose_grade(&gpu, &cpu, GRAPH_ALLCLOSE_ABS_TOL, 0.15);
+                        allclose_grade(&gpu, &cpu, GRAPH_ALLCLOSE_ABS_TOL, GRAPH_REL_TOL);
                     let key: &'static str = if cos > 0.99 && within {
                         "OK"
                     } else {
                         "MISCOMPUTE"
                     };
                     *counts.entry(key).or_default() += 1;
+                    // Pinpoint the element that actually TRIPS the gate (worst
+                    // tol-fraction) — NOT necessarily the global-worst-abs element,
+                    // which may be a large-but-in-tolerance value. Its ref magnitude
+                    // + which half it sits in (residual delta [0,D_MODEL) vs post-
+                    // attn norm) disambiguates the MISCOMPUTE: a near-zero ref over
+                    // the 5e-3 floor ⇒ too-tight tolerance (loosen the floor); a
+                    // mid/large ref off by a real margin ⇒ a genuine FFN-in-graph
+                    // miscompute (graph-capture bug). Cheap, so always reported.
+                    let mut wi = 0usize;
+                    let mut wfrac = 0f64;
+                    for i in 0..gpu.len() {
+                        let allowed =
+                            GRAPH_ALLCLOSE_ABS_TOL + GRAPH_REL_TOL * (cpu[i] as f64).abs();
+                        let frac = (gpu[i] as f64 - cpu[i] as f64).abs() / allowed;
+                        if frac > wfrac {
+                            wfrac = frac;
+                            wi = i;
+                        }
+                    }
+                    let part = if wi < D_MODEL { "delta" } else { "norm" };
+                    let w_allowed = GRAPH_ALLCLOSE_ABS_TOL + GRAPH_REL_TOL * (cpu[wi] as f64).abs();
+                    let w_abs = (gpu[wi] as f64 - cpu[wi] as f64).abs();
                     cu_emit(
                         name,
                         key,
                         &format!(
-                            "cos={cos:.6} worst_abs={worst_abs:.5} tol_used={tol_frac:.3} (attn+ffn)"
+                            "cos={cos:.6} worst_abs={worst_abs:.5} tol_used={tol_frac:.3} (attn+ffn) \
+                             fail@{part}[{wi}] ref={:.4} gpu={:.4} abs={w_abs:.4} allowed={w_allowed:.4}",
+                            cpu[wi], gpu[wi]
                         ),
                     );
                 }
