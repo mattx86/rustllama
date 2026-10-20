@@ -450,6 +450,10 @@ fn probe_names() -> Vec<String> {
     // norm) as one in-order submit-chain, vs the CPU reference end to end. The one
     // orchestration probe that isn't covered by the per-op kernels above.
     v.push("attn:dev_resident_block_sycl".to_string());
+    // GPU paged attention (Phase E): the SYCL block-table flash-decode against a
+    // whole-pool USM mirror via a SCATTERED block table, graded vs the CPU gather
+    // + flash-decode reference. Backs `accel::dev_attn_paged_sycl_enabled`.
+    v.push("attn:paged_decode_sycl".to_string());
     // B1/F2: the F32-precision residual/norm/activation USM fusions vs their
     // CPU references. These keep the residual stream in f32 (no F16 round-trip),
     // which is the correctness fix B1 lands. Small elementwise kernels — safe to
@@ -2858,6 +2862,129 @@ fn probe_decode_block(stream: &sk::SyclStream, name: &str, started: Instant) {
     }
 }
 
+/// GPU paged attention (Phase E — SYCL): the block-table flash-decode graded vs
+/// the SAME CPU reference as the CUDA twin, with a SCATTERED block table so the
+/// page indirection is genuinely exercised. The synthetic paged pool stores
+/// logical position t at page=block_table[t/page_size], in_page=t%page_size (the
+/// Phase A/E geometry), so a kernel that mis-maps blocks fails the verdict. F32
+/// pool ⇒ BIT-EXACT; locally validatable on the Iris Xe.
+fn probe_attn_paged(stream: &sk::SyclStream, name: &str, started: Instant) {
+    let (n_heads, n_kv_heads, head_dim, kv_len) = (8usize, 2usize, 128usize, 40usize);
+    let (layer_idx, n_layers, page_size) = (1usize, 3usize, 16usize);
+    let max_ctx = kv_len; // CPU reference attends [0, kv_len)
+    let num_blocks = kv_len.div_ceil(page_size); // ceil(40/16) = 3
+    let total_pages = 8usize;
+    // Scattered logical-block -> physical-page map (distinct pages).
+    let block_table: Vec<i32> = (0..num_blocks)
+        .map(|i| ((i * 3 + 2) % total_pages) as i32)
+        .collect();
+    let q = gen_x(n_heads * head_dim, 61);
+    let kc = gen_x(n_kv_heads * max_ctx * head_dim, 63);
+    let vc = gen_x(n_kv_heads * max_ctx * head_dim, 67);
+    // Scatter (t, h) K/V into the physical page the block table points at,
+    // byte-identical to the host `PagedKvStore` geometry.
+    let head_stride = page_size * head_dim;
+    let kv_stride = n_kv_heads * head_stride;
+    let layer_stride = 2 * kv_stride;
+    let page_stride = n_layers * layer_stride;
+    let mut pool = vec![0f32; total_pages * page_stride];
+    for t in 0..kv_len {
+        let page = block_table[t / page_size] as usize;
+        let in_page = t % page_size;
+        for h in 0..n_kv_heads {
+            let src = (h * max_ctx + t) * head_dim;
+            let base = page * page_stride
+                + layer_idx * layer_stride
+                + h * head_stride
+                + in_page * head_dim;
+            pool[base..base + head_dim].copy_from_slice(&kc[src..src + head_dim]);
+            pool[base + kv_stride..base + kv_stride + head_dim]
+                .copy_from_slice(&vc[src..src + head_dim]);
+        }
+    }
+    // Allocate USM (host-mapped) and fill it.
+    let alloc = (|| -> sk::Result<_> {
+        let mut qb = sk::SyclSharedBuffer::<f32>::alloc(stream, q.len())?;
+        qb.as_mut_slice().copy_from_slice(&q);
+        let mut poolb = sk::SyclSharedBuffer::<f32>::alloc(stream, pool.len())?;
+        poolb.as_mut_slice().copy_from_slice(&pool);
+        let mut btb = sk::SyclSharedBuffer::<i32>::alloc(stream, block_table.len())?;
+        btb.as_mut_slice().copy_from_slice(&block_table);
+        let ob = sk::SyclSharedBuffer::<f32>::alloc(stream, n_heads * head_dim)?;
+        Ok((qb, poolb, btb, ob))
+    })();
+    let (qb, poolb, btb, mut ob) = match alloc {
+        Ok(t) => t,
+        Err(_) => {
+            emit(name, "KERNEL_ERR", "usm-alloc-failed");
+            return;
+        }
+    };
+    let dec_cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
+    let mut worst_cos = 1.0f64;
+    let mut worst_rel = 0.0f64;
+    let mut kernel_err: Option<String> = None;
+    for (window, softcap) in dec_cases {
+        let mut cpu = vec![0f32; n_heads * head_dim];
+        k::gqa_attention_flash_decode_capped_windowed(
+            &q,
+            &kc,
+            &vc,
+            &mut cpu,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx,
+            kv_len,
+            window as usize,
+            softcap,
+        );
+        // SAFETY: q/out [n_heads*head_dim] f32 USM; pool = the slab;
+        // block_table = [num_blocks] i32 USM — all live on `stream`.
+        let res = unsafe {
+            sk::flash_attn_decode_paged_usm(
+                stream,
+                qb.as_ptr(),
+                poolb.as_ptr(),
+                btb.as_ptr(),
+                ob.as_mut_ptr(),
+                n_heads as u32,
+                n_kv_heads as u32,
+                head_dim as u32,
+                layer_idx as u32,
+                n_layers as u32,
+                page_size as u32,
+                kv_len as u32,
+                window,
+                softcap,
+            )
+        };
+        if let Err(e) = res {
+            kernel_err = Some(format!("{e}"));
+            break;
+        }
+        let (cos, max_rel) = compare(ob.as_slice(), &cpu);
+        worst_cos = worst_cos.min(cos);
+        worst_rel = worst_rel.max(max_rel);
+    }
+    let ms = started.elapsed().as_millis();
+    match kernel_err {
+        Some(e) => emit(name, "KERNEL_ERR", &format!("{e} ms={ms}")),
+        None => {
+            let verdict = if worst_cos > 0.999 && worst_rel < 0.02 {
+                "OK"
+            } else {
+                "MISCOMPUTE"
+            };
+            emit(
+                name,
+                verdict,
+                &format!("cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50) ms={ms}"),
+            );
+        }
+    }
+}
+
 fn probe_attn(stream: &sk::SyclStream, name: &str, variant: &str, started: Instant) {
     // Quant-KV variants (decode_mxfp4 … prefill_nvfp4) run the F32-Q /
     // packed-K/V flash kernels and grade against the full-precision CPU
@@ -2867,6 +2994,10 @@ fn probe_attn(stream: &sk::SyclStream, name: &str, variant: &str, started: Insta
     // its own probe (routed before the block-format check, which would miss it).
     if variant == "dev_resident_block_sycl" {
         probe_decode_block(stream, name, started);
+        return;
+    }
+    if variant == "paged_decode_sycl" {
+        probe_attn_paged(stream, name, started);
         return;
     }
     if variant == "decode_q8_0" {

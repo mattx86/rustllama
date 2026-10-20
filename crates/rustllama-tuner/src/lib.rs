@@ -228,6 +228,14 @@ pub const VERDICT_ATTN_DEV_RESIDENT_BLOCK: &str = "attn:dev_resident_block";
 /// f32-KV-only at dispatch (the paged KV store is F32). Fail-closed: absent /
 /// `false` ⇒ the paged engine keeps the CPU gather attention path.
 pub const VERDICT_ATTN_PAGED_DECODE_CUDA: &str = "attn:paged_decode_cuda";
+/// GPU paged attention (Phase E — SYCL twin): the SYCL block-table flash-decode
+/// kernel (`flash_attn_decode_paged_usm`) graded vs the SAME CPU gather +
+/// flash-decode reference as the CUDA twin, over pass / SWA / soft-cap. Read by
+/// `accel::dev_attn_paged_sycl_enabled`; f32-KV-only at dispatch (the paged KV
+/// store + its USM mirror are F32, so the kernel is BIT-EXACT — no f16
+/// round-trip). Fail-closed: absent / `false` ⇒ the paged engine keeps the CPU
+/// gather attention path.
+pub const VERDICT_ATTN_PAGED_DECODE_SYCL: &str = "attn:paged_decode_sycl";
 /// SYCL (USM) twin of [`VERDICT_ATTN_DEV_RESIDENT_BLOCK`] — the #2 on-device
 /// activation-residency DECODE attention block run on the SYCL in-order queue
 /// (Feature 1a). Separate verdict because the win/loss profile is per-backend:

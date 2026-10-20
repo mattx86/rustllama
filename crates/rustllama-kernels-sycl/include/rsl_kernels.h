@@ -244,6 +244,21 @@ void rsl_flash_attn_decode_usm(rsl_stream* s,
                                int head_dim, int max_ctx, int kv_len,
                                int window, float softcap);
 
+/* GPU paged attention (Phase E): block-table flash-decode against the
+ * whole-pool F32 USM mirror. K/V are read from `kv_pool` (byte-identical
+ * geometry to the host PagedKvStore) via `block_table` (logical block ->
+ * physical page id) for ONE sequence at `layer_idx`; q/out are F32 so this is
+ * BIT-EXACT to `gqa_attention_flash_decode_capped_windowed`. `window`/`softcap`
+ * as above. `block_table` = [ceil(kv_len/page_size)] i32. */
+void rsl_flash_attn_decode_paged_usm(rsl_stream* s,
+                                     const float* q_usm,
+                                     const float* kv_pool,
+                                     const int* block_table,
+                                     float* out_usm,
+                                     int n_heads, int n_kv_heads, int head_dim,
+                                     int layer_idx, int n_layers, int page_size,
+                                     int kv_len, int window, float softcap);
+
 /* FA-v2 decode (sub-group cooperation). Same shape/semantics as the
  * v1 entry above, but each attention head is processed by a 16-WI
  * sub-group instead of a single WI; the head_dim is striped across

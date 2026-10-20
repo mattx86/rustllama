@@ -1057,6 +1057,102 @@ void rsl_flash_attn_decode_usm(rsl_stream* s,
     }).wait();
 })
 
+// GPU paged attention (Phase E — SYCL twin): block-table flash-decode. A COPY
+// of rsl_flash_attn_decode_usm's v1 one-work-item-per-head body with ONE
+// semantic change — K/V are read from the paged-pool device mirror (one
+// whole-pool USM slab, byte-identical geometry to the host PagedKvStore AND to
+// the CUDA Phase-A slab: off = page*page_stride + layer*layer_stride +
+// kv_axis*kv_stride + h*head_stride + pos_in_page*head_dim) via a per-sequence
+// block table (logical block -> physical page id), instead of a contiguous
+// [n_kv_heads, max_ctx, head_dim] cache. The pool + Q + out are F32 (not f16),
+// so this is BIT-EXACT to the CPU reference
+// gqa_attention_flash_decode_capped_windowed — the same reference the CUDA
+// twin grades against. Online softmax, SWA `window`, and Gemma2 `softcap` are
+// IDENTICAL. Offsets are `long`: page*page_stride overflows int for a big pool.
+void rsl_flash_attn_decode_paged_usm(rsl_stream* s,
+                                     const float* q_usm,
+                                     const float* kv_pool,
+                                     const int* block_table,
+                                     float* out_usm,
+                                     int n_heads, int n_kv_heads, int head_dim,
+                                     int layer_idx, int n_layers, int page_size,
+                                     int kv_len, int window,
+                                     float softcap) RSL_FFI_BODY_VOID("rsl_flash_attn_decode_paged_usm", {
+    if (s == nullptr || q_usm == nullptr || kv_pool == nullptr ||
+        block_table == nullptr || out_usm == nullptr) return;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || page_size <= 0 ||
+        n_layers <= 0 || layer_idx < 0 || layer_idx >= n_layers) return;
+    if (kv_len <= 0) {
+        // Zero the output and return (keeps the device active via the queue).
+        if (s != nullptr) {
+            auto& q = s->q;
+            std::size_t total = static_cast<std::size_t>(n_heads) * head_dim;
+            q.memset(out_usm, 0, total * sizeof(float)).wait();
+        }
+        return;
+    }
+    if ((n_heads % n_kv_heads) != 0) return;
+    if (head_dim > RSL_FLASH_MAX_HEAD_DIM) return;
+    auto& q = s->q;
+    const int n_gqa = n_heads / n_kv_heads;
+    const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
+    // Paged-pool strides (long: page*page_stride overflows int for a big pool).
+    const long head_stride = static_cast<long>(page_size) * head_dim;
+    const long kv_stride = static_cast<long>(n_kv_heads) * head_stride;  // kv_axis 1 = V
+    const long layer_stride = 2L * kv_stride;
+    const long page_stride = static_cast<long>(n_layers) * layer_stride;
+    const long layer_base = static_cast<long>(layer_idx) * layer_stride;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(round_up_to_lws(n_heads)),
+                              sycl::range<1>(RSL_LWS)),
+            [=](sycl::nd_item<1> it) {
+                const int hh = static_cast<int>(it.get_global_id(0));
+                if (hh >= n_heads) return;
+                const int kv_h = hh / n_gqa;
+                const int q_base = hh * head_dim;
+                const int out_base = hh * head_dim;
+                // f32 accumulator across the whole kv loop (head_dim <= 256).
+                float acc[RSL_FLASH_MAX_HEAD_DIM];
+                for (int i = 0; i < head_dim; ++i) acc[i] = 0.0f;
+                float m = -INFINITY;
+                float l = 0.0f;
+                for (int t = t_start; t < kv_len; ++t) {
+                    // Block-table indirection: logical pos t -> physical page slab.
+                    const int block = t / page_size;
+                    const int in_page = t - block * page_size;
+                    const int page = block_table[block];
+                    const long k_off = static_cast<long>(page) * page_stride + layer_base +
+                                       static_cast<long>(kv_h) * head_stride +
+                                       static_cast<long>(in_page) * head_dim;
+                    const long v_off = k_off + kv_stride;  // kv_axis 1 = V
+                    // Q · K row.
+                    float s_dot = 0.0f;
+                    for (int i = 0; i < head_dim; ++i) {
+                        s_dot += q_usm[q_base + i] * kv_pool[k_off + i];
+                    }
+                    s_dot *= scale;
+                    // Gemma2 attention-logit soft-cap (no-op at softcap==0).
+                    if (softcap > 0.0f) s_dot = softcap * sycl::tanh(s_dot / softcap);
+                    // Online softmax update.
+                    const float m_new = sycl::fmax(m, s_dot);
+                    const float rescale = sycl::isfinite(m) ? sycl::exp(m - m_new) : 0.0f;
+                    const float p = sycl::exp(s_dot - m_new);
+                    l = l * rescale + p;
+                    for (int i = 0; i < head_dim; ++i) {
+                        acc[i] = acc[i] * rescale + p * kv_pool[v_off + i];
+                    }
+                    m = m_new;
+                }
+                const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+                for (int i = 0; i < head_dim; ++i) {
+                    out_usm[out_base + i] = acc[i] * inv_l;
+                }
+            });
+    }).wait();
+})
+
 // ============================================================
 // FlashAttention v2 (sub-group cooperation)
 // ============================================================

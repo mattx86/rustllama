@@ -152,9 +152,18 @@ impl PagedKvStore {
         match self.data.get_mut(off..off + self.page_stride) {
             Some(dst) => {
                 dst.copy_from_slice(src);
-                // Phase A (GPU paged attention): sync the promoted page into the
-                // device KV mirror (no-op off-CUDA / when no mirror is present).
-                crate::accel::paged_mirror_write_page(page.0, src);
+                // GPU paged attention: sync the promoted page into every backend's
+                // device KV mirror (CUDA/SYCL/MLX). No-op unless a backend's paged
+                // verdict is on; byte-identical geometry means a plain offset copy.
+                crate::accel::paged_mirror_sync_page(
+                    self.total_pages,
+                    self.n_layers,
+                    self.n_kv_heads,
+                    self.page_size,
+                    self.head_dim,
+                    page.0,
+                    src,
+                );
                 true
             }
             None => false,
@@ -264,10 +273,21 @@ impl PagedKvStore {
             let dst_v = self.v_row_mut(page, layer, h, pos_in_page)?;
             dst_v.copy_from_slice(&v[h_off_src..h_off_src + hd]);
         }
-        // Phase A (GPU paged attention): sync the just-written (K, V) row into
-        // the device KV mirror. No-op off-CUDA / when no mirror is present;
-        // byte-identical geometry means a plain offset H2D copy.
-        crate::accel::paged_mirror_write_token(layer, page.0, pos_in_page, k, v);
+        // GPU paged attention: sync the just-written (K, V) row into every
+        // backend's device KV mirror (CUDA/SYCL/MLX). No-op unless a backend's
+        // paged verdict is on; byte-identical geometry means a plain offset copy.
+        crate::accel::paged_mirror_sync_row(
+            self.total_pages,
+            self.n_layers,
+            self.n_kv_heads,
+            self.page_size,
+            self.head_dim,
+            layer,
+            page.0,
+            pos_in_page,
+            k,
+            v,
+        );
         Some(())
     }
 

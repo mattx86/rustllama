@@ -55,6 +55,7 @@ EXPORTS
     rsl_add_rmsnorm_f32_usm
     rsl_decode_attn_block_usm
     rsl_flash_attn_decode_usm
+    rsl_flash_attn_decode_paged_usm
     rsl_flash_attn_decode_v2_usm
     rsl_flash_attn_decode_v3_usm
     rsl_flash_attn_prefill_usm

@@ -3130,6 +3130,7 @@ pub fn reset_device_caches_for_new_model() {
     clear_usm_attn_context();
     usm_attn_kv_epoch_bump();
     paged_mirror_reset();
+    paged_sycl_mirror_reset();
     set_moe_tier_active(false);
 }
 
@@ -3314,6 +3315,80 @@ pub fn paged_mirror_reset() {
     }
 }
 
+// ===========================================================================
+// GPU paged attention — unified mirror sync (Phases A/E/F).
+//
+// The paged KV store's write path calls these TWO functions (one per-token
+// row, one per-promoted-page); each fans out to EVERY backend's device mirror
+// of the pool: CUDA (the process-global slab from Phase A — it ignores the
+// geometry args, having been sized at load), SYCL (a per-driver-thread USM
+// slab lazily sized from the geometry on its first write — Phase E), and MLX
+// (a per-driver-thread Metal slab — Phase F). Each arm is INERT unless its
+// backend is active AND its paged-decode verdict passed, so on a box whose
+// paged kernel isn't enabled this is a cheap no-op. The geometry args are
+// byte-identical to `PagedKvStore`'s own strides, so every backend's slab is a
+// 1:1 image of the host pool.
+// ===========================================================================
+
+/// Sync one freshly-written `(K, V)` token row into every backend's paged-pool
+/// mirror. `k`/`v` are the full `n_kv_heads * head_dim` rows the store wrote at
+/// `(page, layer, pos_in_page)`. See [`PagedKvStore::write_token`].
+#[allow(clippy::too_many_arguments)]
+pub fn paged_mirror_sync_row(
+    total_pages: u32,
+    n_layers: u32,
+    n_kv_heads: u32,
+    page_size: u32,
+    head_dim: u32,
+    layer: u32,
+    page: u32,
+    pos_in_page: u32,
+    k: &[f32],
+    v: &[f32],
+) {
+    // CUDA: the process-global mirror ignores the geometry (sized at load).
+    paged_mirror_write_token(layer, page, pos_in_page, k, v);
+    // SYCL: the thread-local USM mirror lazy-inits from the geometry.
+    paged_sycl_mirror_sync_row(
+        total_pages,
+        n_layers,
+        n_kv_heads,
+        page_size,
+        head_dim,
+        layer,
+        page,
+        pos_in_page,
+        k,
+        v,
+    );
+    // MLX arm is added in Phase F (paged_mlx_mirror_sync_row).
+}
+
+/// Sync a whole promoted page (cold-tier promote via `write_page`) into every
+/// backend's paged-pool mirror. `src` is exactly `page_stride` f32s.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_mirror_sync_page(
+    total_pages: u32,
+    n_layers: u32,
+    n_kv_heads: u32,
+    page_size: u32,
+    head_dim: u32,
+    page: u32,
+    src: &[f32],
+) {
+    paged_mirror_write_page(page, src);
+    paged_sycl_mirror_sync_page(
+        total_pages,
+        n_layers,
+        n_kv_heads,
+        page_size,
+        head_dim,
+        page,
+        src,
+    );
+    // MLX arm is added in Phase F (paged_mlx_mirror_sync_page).
+}
+
 #[inline]
 fn f32_slice_as_bytes(s: &[f32]) -> &[u8] {
     // SAFETY: f32 is plain-old-data; reinterpret the slice's bytes read-only.
@@ -3442,6 +3517,365 @@ pub fn try_flash_attn_decode_paged_cuda_f32(
     let out_bytes =
         unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, nh * hd * 4) };
     m.dev_out.as_ref().unwrap().copy_to_host(out_bytes).is_ok()
+}
+
+// ===========================================================================
+// GPU paged attention — Phase E (SYCL twin): a per-driver-thread USM mirror of
+// the paged KV pool + its block-table flash-decode dispatch.
+//
+// The SYCL analogue of the CUDA `PagedKvDeviceMirror` above, with ONE structural
+// difference forced by `sk::SyclStream` being `!Send`: this mirror CANNOT live
+// behind a process-global `Mutex` like CUDA's. It is a `thread_local!` on the
+// DRIVER thread (mirroring the existing `USM_ATTN` thread-local), lazy-built on
+// the first `paged_mirror_sync_row` call — which carries the pool geometry — and
+// read by the dispatch on that same thread (the paged engine's forward pass runs
+// both the KV writes and the decode attention on one driver thread). The USM
+// slab is `SyclSharedBuffer<f32>` (USM-shared ⇒ host-mapped), so a sync is a
+// plain host slice write, no explicit H2D. BIT-EXACT f32 — byte-identical
+// geometry to the host `PagedKvStore` AND to the CUDA slab. Fully INERT unless
+// the SYCL paged verdict passed (fail-closed; no verdict ⇒ no slab, no cost).
+// ===========================================================================
+struct PagedKvSyclMirror {
+    // whole-pool F32 USM slab; byte-identical geometry to `PagedKvStore`.
+    slab: sk::SyclSharedBuffer<'static, f32>,
+    // Reusable per-decode scratch (USM-shared ⇒ host-mapped): the uploaded
+    // query, the sequence's block table (i32), and the attention output. Lazily
+    // grown; declared before `stream` so field-drop order frees them first.
+    dev_q: Option<sk::SyclSharedBuffer<'static, f32>>,
+    dev_block_table: Option<sk::SyclSharedBuffer<'static, i32>>,
+    dev_out: Option<sk::SyclSharedBuffer<'static, f32>>,
+    // Geometry mirror of `PagedKvStore` (identical strides).
+    page_stride: usize,
+    layer_stride: usize,
+    kv_stride: usize,
+    head_stride: usize,
+    head_dim: usize,
+    n_kv_heads: u32,
+    page_size: u32,
+    n_layers: u32,
+    total_pages: u32,
+    // Owning stream declared LAST: declaration-order field drop frees the
+    // buffers (which borrow it via the `'static` lifetime lie) before the stream.
+    stream: sk::SyclStream,
+}
+
+impl PagedKvSyclMirror {
+    /// Allocate the per-thread USM paged-pool mirror. `None` off-SYCL / on a
+    /// degenerate geometry / on stream or alloc failure (⇒ the caller keeps the
+    /// CPU gather path).
+    fn try_new(
+        total_pages: u32,
+        n_layers: u32,
+        n_kv_heads: u32,
+        page_size: u32,
+        head_dim: u32,
+    ) -> Option<Self> {
+        if total_pages == 0 || n_layers == 0 || n_kv_heads == 0 || page_size == 0 || head_dim == 0 {
+            return None;
+        }
+        let head_stride = (page_size as usize) * (head_dim as usize);
+        let kv_stride = (n_kv_heads as usize) * head_stride;
+        let layer_stride = 2usize * kv_stride;
+        let page_stride = (n_layers as usize) * layer_stride;
+        let total_elems = (total_pages as usize).checked_mul(page_stride)?;
+        let stream = sk::create_stream(0).ok()?;
+        let buf = sk::SyclSharedBuffer::<f32>::alloc(&stream, total_elems).ok()?;
+        // SAFETY: the `'_`→`'static` widening is the same lifetime lie the
+        // `UsmAttnContext` scratch tells — the buffer borrows `stream`, owned in
+        // this struct and declared LAST, so it outlives the buffer via field-drop
+        // order. The mirror is never moved across threads (it is a thread-local).
+        let slab = unsafe {
+            std::mem::transmute::<sk::SyclSharedBuffer<'_, f32>, sk::SyclSharedBuffer<'static, f32>>(
+                buf,
+            )
+        };
+        Some(Self {
+            slab,
+            dev_q: None,
+            dev_block_table: None,
+            dev_out: None,
+            page_stride,
+            layer_stride,
+            kv_stride,
+            head_stride,
+            head_dim: head_dim as usize,
+            n_kv_heads,
+            page_size,
+            n_layers,
+            total_pages,
+            stream,
+        })
+    }
+
+    fn geometry_matches(
+        &self,
+        total_pages: u32,
+        n_layers: u32,
+        n_kv_heads: u32,
+        page_size: u32,
+        head_dim: u32,
+    ) -> bool {
+        self.total_pages == total_pages
+            && self.n_layers == n_layers
+            && self.n_kv_heads == n_kv_heads
+            && self.page_size == page_size
+            && self.head_dim == head_dim as usize
+    }
+
+    /// Write one `(K, V)` row into the USM slab (plain host slice write — the
+    /// slab is USM-shared / host-mapped). Byte-identical geometry to the host
+    /// pool, so this is a pure offset copy.
+    fn sync_row(&mut self, layer: u32, page: u32, pos_in_page: u32, k: &[f32], v: &[f32]) {
+        if page >= self.total_pages || layer >= self.n_layers || pos_in_page >= self.page_size {
+            return;
+        }
+        let hd = self.head_dim;
+        let nkv = self.n_kv_heads as usize;
+        if k.len() != nkv * hd || v.len() != nkv * hd {
+            return;
+        }
+        let base = (page as usize) * self.page_stride + (layer as usize) * self.layer_stride;
+        let pos_off = (pos_in_page as usize) * hd;
+        let slab = self.slab.as_mut_slice();
+        for h in 0..nkv {
+            // kv_axis 0 = K, 1 = V (offset by `kv_stride`).
+            let k_off = base + h * self.head_stride + pos_off;
+            let v_off = base + self.kv_stride + h * self.head_stride + pos_off;
+            slab[k_off..k_off + hd].copy_from_slice(&k[h * hd..h * hd + hd]);
+            slab[v_off..v_off + hd].copy_from_slice(&v[h * hd..h * hd + hd]);
+        }
+    }
+
+    /// Write a whole promoted page (`src` = `page_stride` f32s) into the slab.
+    fn sync_page(&mut self, page: u32, src: &[f32]) {
+        if page >= self.total_pages || src.len() != self.page_stride {
+            return;
+        }
+        let off = (page as usize) * self.page_stride;
+        self.slab.as_mut_slice()[off..off + self.page_stride].copy_from_slice(src);
+    }
+}
+
+thread_local! {
+    /// Per-driver-thread SYCL paged-pool mirror (Phase E). Built lazily on the
+    /// first `paged_sycl_mirror_sync_row` call once the SYCL paged verdict is
+    /// enabled and the pool geometry is known; rebuilt on a geometry change.
+    /// Independent of [`USM_ATTN`] — the paged mirror is its own USM slab.
+    static PAGED_USM_MIRROR: std::cell::RefCell<Option<PagedKvSyclMirror>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Ensure `slot` holds a USM i32 buffer of at least `min_len` elements on
+/// `stream` (block-table scratch). Mirror of [`ensure_scratch_f32`] for i32.
+fn ensure_scratch_i32(
+    stream: &sk::SyclStream,
+    slot: &mut Option<sk::SyclSharedBuffer<'static, i32>>,
+    min_len: usize,
+) -> bool {
+    let needs_alloc = slot.as_ref().map_or(true, |b| b.len() < min_len);
+    if !needs_alloc {
+        return true;
+    }
+    *slot = None;
+    match sk::SyclSharedBuffer::<i32>::alloc(stream, min_len) {
+        Ok(buf) => {
+            // SAFETY: same '_→'static transmute the other USM scratch uses; the
+            // buffer borrows `stream`, owned in the mirror + dropped before it.
+            *slot = Some(unsafe {
+                std::mem::transmute::<
+                    sk::SyclSharedBuffer<'_, i32>,
+                    sk::SyclSharedBuffer<'static, i32>,
+                >(buf)
+            });
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Verdict gate for the SYCL block-table paged flash-decode (Phase E). On only
+/// when the SYCL USM path is active (`usm_attn_enabled`) AND `tune
+/// --validate-kernels` recorded a pass for `attn:paged_decode_sycl` on this
+/// machine. Cached (`OnceLock`); fail-closed (absent / false ⇒ the paged engine
+/// keeps the CPU gather path, and no USM slab is allocated at all).
+fn dev_attn_paged_sycl_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        usm_attn_enabled() && verdict_enabled(rustllama_tuner::VERDICT_ATTN_PAGED_DECODE_SYCL)
+    })
+}
+
+/// Sync one `(K, V)` row into the SYCL paged mirror (Phase E). Lazy-inits the
+/// per-thread USM slab from the pool geometry on first use. INERT when the SYCL
+/// paged verdict is off (no slab is ever allocated — fail-closed).
+#[allow(clippy::too_many_arguments)]
+fn paged_sycl_mirror_sync_row(
+    total_pages: u32,
+    n_layers: u32,
+    n_kv_heads: u32,
+    page_size: u32,
+    head_dim: u32,
+    layer: u32,
+    page: u32,
+    pos_in_page: u32,
+    k: &[f32],
+    v: &[f32],
+) {
+    if !dev_attn_paged_sycl_enabled() {
+        return;
+    }
+    PAGED_USM_MIRROR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let needs_rebuild = match slot.as_ref() {
+            Some(m) => !m.geometry_matches(total_pages, n_layers, n_kv_heads, page_size, head_dim),
+            None => true,
+        };
+        if needs_rebuild {
+            *slot =
+                PagedKvSyclMirror::try_new(total_pages, n_layers, n_kv_heads, page_size, head_dim);
+        }
+        if let Some(m) = slot.as_mut() {
+            m.sync_row(layer, page, pos_in_page, k, v);
+        }
+    });
+}
+
+/// Sync a whole promoted page into the SYCL paged mirror (Phase E). INERT when
+/// the verdict is off. Does NOT lazily allocate from a page-sync alone — a page
+/// promote only matters once rows have been mirrored, so if no mirror exists yet
+/// this is a no-op (the first row sync builds it).
+#[allow(clippy::too_many_arguments)]
+fn paged_sycl_mirror_sync_page(
+    total_pages: u32,
+    n_layers: u32,
+    n_kv_heads: u32,
+    page_size: u32,
+    head_dim: u32,
+    page: u32,
+    src: &[f32],
+) {
+    if !dev_attn_paged_sycl_enabled() {
+        return;
+    }
+    PAGED_USM_MIRROR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if let Some(m) = slot.as_mut() {
+            if m.geometry_matches(total_pages, n_layers, n_kv_heads, page_size, head_dim) {
+                m.sync_page(page, src);
+            }
+        }
+    });
+}
+
+/// Drop the SYCL paged mirror on model (re)load — the thread-local analogue of
+/// [`paged_mirror_reset`], hooked into `reset_device_caches_for_new_model`.
+pub fn paged_sycl_mirror_reset() {
+    PAGED_USM_MIRROR.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
+/// GPU paged attention (Phase E — SYCL twin): run the block-table flash-decode
+/// for ONE decode query of ONE layer against the per-thread USM pool mirror,
+/// writing `[n_heads, head_dim]` into `out`. Returns `false` (⇒ the caller keeps
+/// the CPU gather path, byte-identical) when the verdict is off / SYCL inactive /
+/// no mirror present (no rows mirrored yet) / a geometry mismatch / any alloc /
+/// launch error. `q`/`out` are host `[n_heads*head_dim]`; `block_table` is the
+/// sequence's physical page ids (`cache.pages()` as u32), covering
+/// `ceil(kv_len / page_size)` logical blocks. `window`/`softcap` match the CPU
+/// reference (0/0 = full causal, no cap). Mirror of
+/// [`try_flash_attn_decode_paged_cuda_f32`].
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_paged_sycl_f32(
+    q: &[f32],
+    out: &mut [f32],
+    block_table: &[u32],
+    layer_idx: u32,
+    kv_len: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    window: i32,
+    softcap: f32,
+) -> bool {
+    if !dev_attn_paged_sycl_enabled() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    let nh = n_heads as usize;
+    let hd = head_dim as usize;
+    if nh == 0 || hd == 0 || n_kv_heads == 0 || q.len() != nh * hd || out.len() != nh * hd {
+        return false;
+    }
+    PAGED_USM_MIRROR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(m) = slot.as_mut() else {
+            return false;
+        };
+        // Geometry must match the mirror the kernel indexes against.
+        if layer_idx >= m.n_layers
+            || hd != m.head_dim
+            || n_kv_heads != m.n_kv_heads
+            || n_heads % n_kv_heads != 0
+        {
+            return false;
+        }
+        let page_size = m.page_size as usize;
+        let num_blocks = (kv_len as usize).div_ceil(page_size.max(1));
+        if kv_len == 0 || block_table.len() < num_blocks {
+            return false;
+        }
+        // Reusable scratch (lazily grown): Q, block table (i32), output.
+        if !ensure_scratch_f32(&m.stream, &mut m.dev_q, nh * hd)
+            || !ensure_scratch_f32(&m.stream, &mut m.dev_out, nh * hd)
+            || !ensure_scratch_i32(&m.stream, &mut m.dev_block_table, num_blocks)
+        {
+            return false;
+        }
+        // Write Q + the block table directly into USM (host-mapped).
+        m.dev_q.as_mut().unwrap().as_mut_slice()[..nh * hd].copy_from_slice(q);
+        {
+            let bt = m.dev_block_table.as_mut().unwrap().as_mut_slice();
+            for (dst, &p) in bt.iter_mut().zip(block_table[..num_blocks].iter()) {
+                *dst = p as i32;
+            }
+        }
+        // Gather raw USM pointers (disjoint fields) and launch against the slab.
+        let n_layers = m.n_layers;
+        let page_size_u = m.page_size;
+        let stream = &m.stream;
+        let q_ptr = m.dev_q.as_ref().unwrap().as_ptr();
+        let pool_ptr = m.slab.as_ptr();
+        let bt_ptr = m.dev_block_table.as_ref().unwrap().as_ptr();
+        let out_ptr = m.dev_out.as_mut().unwrap().as_mut_ptr();
+        // SAFETY: all four are live USM pointers on `stream`, sized for the
+        // shapes below; the wrapper `.wait()`s before returning so the read-back
+        // does not race the kernel.
+        let launched = unsafe {
+            sk::flash_attn_decode_paged_usm(
+                stream,
+                q_ptr,
+                pool_ptr,
+                bt_ptr,
+                out_ptr,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                layer_idx,
+                n_layers,
+                page_size_u,
+                kv_len,
+                window.max(0) as u32,
+                softcap,
+            )
+        }
+        .is_ok();
+        if !launched {
+            return false;
+        }
+        // Read the attention output back into the caller's host buffer.
+        out.copy_from_slice(&m.dev_out.as_ref().unwrap().as_slice()[..nh * hd]);
+        true
+    })
 }
 
 /// `--cuda-parity` verdict-cache name for the grouped FFN kernel of `kind`, or

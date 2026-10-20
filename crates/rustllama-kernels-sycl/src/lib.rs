@@ -289,6 +289,29 @@ mod imp {
             softcap: f32,
         );
 
+        // GPU paged attention (Phase E): block-table flash-decode against the
+        // whole-pool F32 USM mirror. `block_table` = [ceil(kv_len/page_size)]
+        // i32; `kv_pool` = the mirror slab (byte-identical geometry to the host
+        // PagedKvStore). See the Rust wrapper `flash_attn_decode_paged_usm`.
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn rsl_flash_attn_decode_paged_usm(
+            s: *mut rsl_stream,
+            q_usm: *const f32,
+            kv_pool: *const f32,
+            block_table: *const c_int,
+            out_usm: *mut f32,
+            n_heads: c_int,
+            n_kv_heads: c_int,
+            head_dim: c_int,
+            layer_idx: c_int,
+            n_layers: c_int,
+            page_size: c_int,
+            kv_len: c_int,
+            // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+            window: c_int,
+            softcap: f32,
+        );
+
         // Feature 1a: device-resident DECODE attention block. See the Rust
         // wrapper `decode_attn_block_usm_raw` + the C++ `rsl_decode_attn_block_usm`.
         #[allow(clippy::too_many_arguments)]
@@ -2664,6 +2687,65 @@ mod imp {
                 softcap,
             );
         }
+        consume_error()
+    }
+
+    /// GPU paged attention (Phase E): block-table flash-decode against the
+    /// whole-pool F32 USM mirror `kv_pool`, reading each logical KV position via
+    /// `block_table` (logical block -> physical page id) for ONE sequence at
+    /// `layer_idx`. Raw-pointer forwarder for the FFI; the SyclSharedBuffer
+    /// wrapper owns sizing/lifetimes.
+    ///
+    /// # Safety
+    /// `q_usm`/`out_usm` ≥ `n_heads*head_dim` f32; `kv_pool` = the pool mirror
+    /// slab; `block_table` ≥ `ceil(kv_len/page_size)` i32 — all live USM on
+    /// `stream`. The kernel `.wait()`s before returning.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn flash_attn_decode_paged_usm(
+        stream: &SyclStream,
+        q_usm: *const f32,
+        kv_pool: *const f32,
+        block_table: *const i32,
+        out_usm: *mut f32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        layer_idx: u32,
+        n_layers: u32,
+        page_size: u32,
+        kv_len: u32,
+        // SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+        window: u32,
+        softcap: f32,
+    ) -> Result<()> {
+        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_decode_paged_usm: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}"
+            )));
+        }
+        if layer_idx >= n_layers {
+            return Err(SyclError::InvalidShape(format!(
+                "flash_attn_decode_paged_usm: layer_idx={layer_idx} >= n_layers={n_layers}"
+            )));
+        }
+        // SAFETY: pointer ownership / size is the caller's responsibility
+        // (SyclSharedBuffer). We just forward to the C ABI.
+        rsl_flash_attn_decode_paged_usm(
+            stream.raw,
+            q_usm,
+            kv_pool,
+            block_table as *const c_int,
+            out_usm,
+            n_heads as c_int,
+            n_kv_heads as c_int,
+            head_dim as c_int,
+            layer_idx as c_int,
+            n_layers as c_int,
+            page_size as c_int,
+            kv_len as c_int,
+            window as c_int,
+            softcap,
+        );
         consume_error()
     }
 
@@ -6980,6 +7062,54 @@ pub unsafe fn flash_attn_decode_usm_raw(
     imp::flash_attn_decode_usm(
         stream, q_usm, k_usm, v_usm, out_usm, n_heads, n_kv_heads, head_dim, max_ctx, kv_len, 0,
         0.0, // raw variant is full-attention/no-softcap (kept for callers)
+    )
+}
+
+/// GPU paged attention (Phase E — SYCL twin): block-table FlashAttention decode.
+/// Reads K/V from the whole-pool F32 USM mirror `kv_pool` via `block_table`
+/// (logical block -> physical page id) for ONE sequence at `layer_idx`. Matches
+/// the contiguous [`flash_attn_decode_usm`] numerics (BIT-EXACT to the CPU
+/// reference `gqa_attention_flash_decode_capped_windowed`, F32 pool — no f16
+/// round-trip), differing only in how a logical KV position maps to a USM
+/// address. Mirror of the CUDA `flash_attn_decode_paged_f32`.
+///
+/// # Safety
+/// `q`/`out` = `[n_heads, head_dim]` f32 USM; `kv_pool` = the pool mirror slab;
+/// `block_table` = `[ceil(kv_len / page_size)]` i32 USM; `n_heads % n_kv_heads ==
+/// 0`; `layer_idx < n_layers`. All on the same context as `stream`.
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_decode_paged_usm(
+    stream: &SyclStream,
+    q: *const f32,
+    kv_pool: *const f32,
+    block_table: *const i32,
+    out: *mut f32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    layer_idx: u32,
+    n_layers: u32,
+    page_size: u32,
+    kv_len: u32,
+    window: u32,
+    softcap: f32,
+) -> Result<()> {
+    imp::flash_attn_decode_paged_usm(
+        stream,
+        q,
+        kv_pool,
+        block_table,
+        out,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        layer_idx,
+        n_layers,
+        page_size,
+        kv_len,
+        window,
+        softcap,
     )
 }
 
