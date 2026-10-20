@@ -18380,30 +18380,43 @@ pub fn try_flash_attn_prefill_cuda_f32(
         {
             return false;
         }
+        // A3: upload ONLY the valid [0, kv_len) positions of each kv-head, not
+        // the whole `max_ctx`-strided cache slab (`k`/`v` are the KvCache F32
+        // backing store, laid out `[n_kv_heads, max_ctx, head_dim]`, valid only
+        // up to `kv_len_base + n_new`). The flash-prefill kernel reads each
+        // query's causal window ⊆ [0, kv_len), so the tail [kv_len, max_ctx) is
+        // never read on-device — leaving it stale is bit-exact in the output.
+        // For a short prompt on a large-ctx model (256 tokens, 32768 ctx) this
+        // cuts the per-layer H2D transfer ~100×. The device buffer stays
+        // `mirror_bytes` (full max_ctx) so the kernel's `max_ctx`-stride
+        // indexing is unchanged; only the copied range shrinks.
+        let kv_len = kv_len_base + n_new;
+        let head_stride = max_ctx * head_dim; // f32 elems per kv-head
+        let valid_elems = kv_len * head_dim; // valid f32 elems per kv-head
         {
-            let s: &[u8] =
-                unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, mirror_bytes) };
-            if ctx
-                .dev_prefill_k
-                .as_mut()
-                .unwrap()
-                .copy_from_host(s)
-                .is_err()
-            {
-                return false;
+            let buf = ctx.dev_prefill_k.as_mut().unwrap();
+            for h in 0..n_kv_heads {
+                let base = h * head_stride;
+                let src = &k[base..base + valid_elems];
+                let s: &[u8] = unsafe {
+                    std::slice::from_raw_parts(src.as_ptr() as *const u8, valid_elems * 4)
+                };
+                if buf.copy_from_host_at(base * 4, s).is_err() {
+                    return false;
+                }
             }
         }
         {
-            let s: &[u8] =
-                unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, mirror_bytes) };
-            if ctx
-                .dev_prefill_v
-                .as_mut()
-                .unwrap()
-                .copy_from_host(s)
-                .is_err()
-            {
-                return false;
+            let buf = ctx.dev_prefill_v.as_mut().unwrap();
+            for h in 0..n_kv_heads {
+                let base = h * head_stride;
+                let src = &v[base..base + valid_elems];
+                let s: &[u8] = unsafe {
+                    std::slice::from_raw_parts(src.as_ptr() as *const u8, valid_elems * 4)
+                };
+                if buf.copy_from_host_at(base * 4, s).is_err() {
+                    return false;
+                }
             }
         }
         {
