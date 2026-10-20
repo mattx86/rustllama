@@ -872,10 +872,13 @@ fn top1_agreement(a: &[u32], b: &[u32]) -> f32 {
     matches as f32 / n as f32
 }
 
-/// Drive the engine through each KV-dtype candidate. Unlike the
-/// placement / batch-size sweeps, this one reloads the model per
-/// candidate — the KV cache shape changes with dtype, so a hot
-/// reconfigure isn't possible.
+/// Drive the engine through each KV-dtype candidate. B1: the model is loaded
+/// ONCE (for the first candidate) and the KV backend is HOT-RE-INIT per
+/// subsequent candidate via [`ContiguousEngine::reinit_kv_backend`] — the
+/// weights stay resident, so an N-candidate sweep costs one full load instead of
+/// N. The first candidate stays a fresh load (F32 is always `candidates[0]`, the
+/// coherence reference — never skewed by a re-init), and a re-init failure falls
+/// back to a fresh load so a candidate is never silently skipped.
 ///
 /// `candidates` typically covers `{F32, Q8_0, Tq(1|2|4|8), Nvfp4}`;
 /// the picker selects the winner by median decode tok/s.
@@ -893,33 +896,60 @@ pub fn measure_kv_dtype_candidates(
     let mut best_dt: Option<KvDtype> = None;
     let mut total_load_ms = 0.0f64;
 
-    for &dt in candidates {
+    // B1: load the model ONCE for the first candidate and HOT-RE-INIT the KV
+    // backend for every subsequent candidate — the weights (the dominant
+    // per-candidate load cost) stay resident, cutting the sweep from N full loads
+    // to one. The FIRST candidate stays a FRESH load so the coherence reference
+    // (F32 is always candidates[0]) is never skewed by a re-init; a re-init
+    // FAILURE falls back to a fresh load so a candidate is never silently skipped.
+    let mut engine: Option<ContiguousEngine> = None;
+    for (cand_idx, &dt) in candidates.iter().enumerate() {
         let load_start = std::time::Instant::now();
-        let load_result = ContiguousEngine::load_with_options_and_layout(
-            model_path,
-            ctx_size,
-            true,
-            dt,
-            &cfg.kv_cache_layout,
-        );
-        total_load_ms += load_start.elapsed().as_secs_f64() * 1000.0;
-        let mut cpu = match load_result {
-            Ok(c) => c,
-            Err(e) => {
-                report_candidates.push(KvDtypeCandidateResult {
-                    kv_dtype: dt,
-                    warmup_ms: 0.0,
-                    median_tps: None,
-                    max_tps: None,
-                    error: Some(format!("load failed: {e}")),
-                    decode_tokens: None,
-                });
-                continue;
+        let fresh_load = |engine: &mut Option<ContiguousEngine>| -> Option<String> {
+            match ContiguousEngine::load_with_options_and_layout(
+                model_path,
+                ctx_size,
+                true,
+                dt,
+                &cfg.kv_cache_layout,
+            ) {
+                Ok(mut c) => {
+                    c.set_prefix_cache(false);
+                    c.set_flash_attention(cfg.flash_attention);
+                    c.set_n_gpu_layers(cfg.n_gpu_layers);
+                    *engine = Some(c);
+                    None
+                }
+                Err(e) => Some(format!("load failed: {e}")),
             }
         };
-        cpu.set_prefix_cache(false);
-        cpu.set_flash_attention(cfg.flash_attention);
-        cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+        let acquire_err: Option<String> = if cand_idx == 0 || engine.is_none() {
+            fresh_load(&mut engine)
+        } else if engine
+            .as_mut()
+            .unwrap()
+            .reinit_kv_backend(dt, &cfg.kv_cache_layout)
+            .is_ok()
+        {
+            None
+        } else {
+            // Re-init failed → fall back to a fresh load so this candidate is
+            // still measured (never silently skipped).
+            fresh_load(&mut engine)
+        };
+        total_load_ms += load_start.elapsed().as_secs_f64() * 1000.0;
+        if let Some(e) = acquire_err {
+            report_candidates.push(KvDtypeCandidateResult {
+                kv_dtype: dt,
+                warmup_ms: 0.0,
+                median_tps: None,
+                max_tps: None,
+                error: Some(e),
+                decode_tokens: None,
+            });
+            continue;
+        }
+        let cpu = engine.as_mut().unwrap();
 
         let vocab = cpu.vocab_size() as i32;
         let prompt_ids: Vec<i32> = (0..prompt_tokens as i32)
@@ -959,7 +989,7 @@ pub fn measure_kv_dtype_candidates(
         };
 
         let (mut runs, last_err) =
-            collect_decode_tok_s(&mut cpu, &prompt_ids, decode_tokens, repeats, &sampling);
+            collect_decode_tok_s(&mut *cpu, &prompt_ids, decode_tokens, repeats, &sampling);
         if runs.is_empty() {
             report_candidates.push(KvDtypeCandidateResult {
                 kv_dtype: dt,

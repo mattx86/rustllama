@@ -1267,6 +1267,139 @@ impl ContiguousEngine {
             .copied()
     }
 
+    /// Build the KV backend for an ALREADY-LOADED model, applying the full
+    /// KV-dtype / layout coercion chain (hybrid / SWA / softcap / MLA → f32
+    /// and/or the contiguous layout) + the hybrid sparse-keep mask, then
+    /// `from_inference_config`. Used only by the hot [`Self::reinit_kv_backend`]
+    /// (the kv-dtype autotune sweep); it MIRRORS the inline coercion chain in
+    /// [`Self::load_inner`] and must be kept in sync with it. `load_inner` keeps
+    /// its own copy deliberately — this helper is NOT on the universal load path,
+    /// so a re-init never risks the serve load. A drift here can only misrank a
+    /// sweep candidate (bounded: the sweep's coherence gate is forward-math, and
+    /// the persisted winner is re-applied by `load_inner`, never by this path).
+    /// Returns the backend + the COERCED `(kv_dtype, kv_layout)`.
+    fn build_kv_backend(
+        model: &LlamaModel,
+        ctx: usize,
+        kv_dtype: KvDtype,
+        kv_layout: &str,
+        kv_page_size: u32,
+    ) -> Result<(KvBackend, KvDtype, String)> {
+        // T3: typed `LoadOptions`-backed accel knob (env-initialized for
+        // back-compat; set by the autotune kv-dtype sweep + the serve/HTTP
+        // load when it applies a coherence-validated cache winner).
+        let hybrid_kv_any = rustllama_models::accel::hybrid_kv_any();
+        let kv_dtype = if model.weights.is_hybrid()
+            && !hybrid_kv_any
+            && kv_dtype != KvDtype::F32
+            && kv_dtype != KvDtype::Q4_0
+        {
+            tracing::warn!(
+                requested = ?kv_dtype,
+                "hybrid model: defaulting KV cache to f32 for coherence \
+                 (set RUSTLLAMA_HYBRID_KV_ANY=1 to honor a quantized \
+                 hybrid KV cache verbatim)"
+            );
+            KvDtype::F32
+        } else {
+            kv_dtype
+        };
+        // F1: the CONTIGUOUS quant-KV flash kernels carry the per-layer
+        // sliding-window span + Gemma2 softcap, so these dtypes may KEEP quant KV
+        // on an SWA/softcap model instead of coercing to F32 (f16/bf16 stay
+        // fail-closed → F32). The PAGED quant forwards still ignore window/softcap,
+        // so the `kv_layout` coercion below pins those to contiguous.
+        let quant_kv_windowed = matches!(
+            kv_dtype,
+            KvDtype::Q8_0
+                | KvDtype::Tq(_)
+                | KvDtype::Nvfp4
+                | KvDtype::Q4_0
+                | KvDtype::Mxfp4
+                | KvDtype::Mxfp6
+                | KvDtype::Mxfp8
+        );
+        // Sliding-window attention: F32 always windows; an F1 quant dtype carries
+        // the window uniform (contiguous path); every other non-F32 → F32.
+        let kv_dtype =
+            if model.cfg.sliding_window.is_some() && kv_dtype != KvDtype::F32 && !quant_kv_windowed
+            {
+                tracing::warn!(
+                    requested = ?kv_dtype,
+                    "sliding-window model: defaulting KV cache to f32 (this dtype's \
+                     windowed attention kernels are not available; F1 covers q4_0 / \
+                     q8_0 / nvfp4 / tq / mxfp4-6-8)"
+                );
+                KvDtype::F32
+            } else {
+                kv_dtype
+            };
+        // Gemma2 attention-logit soft-capping: same rule as the SWA coercion.
+        let kv_dtype = if model.cfg.attn_logit_softcapping.is_some()
+            && kv_dtype != KvDtype::F32
+            && !quant_kv_windowed
+        {
+            tracing::warn!(
+                requested = ?kv_dtype,
+                "attention-softcap model (Gemma2): defaulting KV cache to f32 (this \
+                 dtype's soft-capping attention kernels are not available; F1 covers \
+                 q4_0 / q8_0 / nvfp4 / tq / mxfp4-6-8)"
+            );
+            KvDtype::F32
+        } else {
+            kv_dtype
+        };
+        // M1: MLA (DeepSeek-V2/V3) stores a compressed latent, not per-head K/V —
+        // the paged backends have no MLA store, so MLA is fail-closed to the
+        // contiguous layout + an f32 latent (the MLA cache ignores the requested
+        // kv_dtype, but coerce it for honest logging).
+        let kv_dtype = if model.weights.is_mla() && kv_dtype != KvDtype::F32 {
+            tracing::warn!(
+                requested = ?kv_dtype,
+                "MLA model (DeepSeek-V2/V3): the compressed-latent KV cache is \
+                 f32-only — ignoring the requested KV dtype"
+            );
+            KvDtype::F32
+        } else {
+            kv_dtype
+        };
+        let swa_or_softcap =
+            model.cfg.sliding_window.is_some() || model.cfg.attn_logit_softcapping.is_some();
+        let kv_layout: &str =
+            if (model.weights.is_hybrid() || model.weights.is_mla()) && kv_layout != "contiguous" {
+                tracing::warn!(
+                    requested = %kv_layout,
+                    is_mla = model.weights.is_mla(),
+                    "hybrid / MLA model: paged KV layouts are not supported by this \
+                     forward path — coercing to contiguous for this load"
+                );
+                "contiguous"
+            } else if swa_or_softcap && kv_dtype != KvDtype::F32 && kv_layout != "contiguous" {
+                tracing::warn!(
+                    requested = %kv_layout,
+                    kv_dtype = ?kv_dtype,
+                    "sliding-window / softcap model with quant KV: coercing to the \
+                     contiguous layout (the paged quant-KV forwards do not yet carry \
+                     the window/softcap uniforms; the contiguous quant kernels do)"
+                );
+                "contiguous"
+            } else {
+                kv_layout
+            };
+        // Sparse KV for hybrid models: only full-attention layers get real slabs.
+        let kv_keep = hybrid_kv_keep_mask(model);
+        let kv_backend = KvBackend::from_inference_config_with_page_size_and_keep(
+            kv_layout,
+            &model.cfg,
+            ctx as u32,
+            kv_dtype,
+            kv_page_size,
+            kv_keep.as_deref(),
+        )
+        .map_err(|e| ContiguousEngineError::Other(format!("kv_backend init: {e}")))?;
+        Ok((kv_backend, kv_dtype, kv_layout.to_string()))
+    }
+
     fn load_inner(
         path: &Path,
         max_ctx: usize,
@@ -4134,6 +4267,49 @@ impl ContiguousEngine {
         state.pool.clear();
         state.last_ids.clear();
         state.kv_backend.reset();
+    }
+
+    /// HOT KV re-init: swap the KV backend to `kv_dtype` / `kv_layout` on an
+    /// ALREADY-LOADED engine WITHOUT reloading the model weights. The kv-dtype
+    /// autotune sweep uses this to measure every candidate after a SINGLE model
+    /// load — the weights (the per-candidate load cost) stay resident. The new
+    /// backend comes from [`Self::build_kv_backend`] (the same coercions a fresh
+    /// load applies); the device caches (matvec weight cache + flash KV mirrors +
+    /// attn contexts) are reset so the new dtype can't reuse a stale-dtype device
+    /// buffer AND the weights re-upload on the next decode exactly as a fresh load
+    /// would; and the engine state (KV, prefix pool, last_ids, DeltaNet) is
+    /// cleared. The model and every engine SETTING (n_gpu_layers / flash / spec
+    /// drivers) are untouched. Measurement fidelity: the timed decodes exclude the
+    /// one-time warmup (which absorbs the re-upload), so a re-init measures the
+    /// same steady state as a fresh load. (MoE-tier promotion, a load-time step,
+    /// is NOT re-run — a re-init is used only by the kv-dtype sweep, whose
+    /// coherence gate is forward-math and whose winner is re-applied by a real
+    /// `load_inner` at serve time, so a dense/MoE perf misrank is the worst case.)
+    pub fn reinit_kv_backend(&mut self, kv_dtype: KvDtype, kv_layout: &str) -> Result<()> {
+        let (new_backend, coerced_dtype, coerced_layout) = Self::build_kv_backend(
+            &*self.model,
+            self.max_ctx,
+            kv_dtype,
+            kv_layout,
+            self.kv_page_size,
+        )?;
+        // Reset the previous dtype's device-resident state: the matvec weight
+        // cache (→ weights re-upload on the next decode, like a fresh load) and
+        // the flash KV mirrors / attn contexts (which hold the OLD dtype's device
+        // buffers). Does NOT touch the expert registry — the model is unchanged.
+        rustllama_models::accel::reset_device_caches_for_new_model();
+        {
+            let mut s = self
+                .state
+                .lock()
+                .map_err(|_| ContiguousEngineError::Other("engine state mutex poisoned".into()))?;
+            s.kv_backend = new_backend;
+            s.pool.clear();
+            s.reset();
+        }
+        self.kv_dtype_cached = coerced_dtype;
+        self.kv_layout = coerced_layout;
+        Ok(())
     }
 
     /// Number of snapshots currently held in the pool. Test/diagnostic use.
