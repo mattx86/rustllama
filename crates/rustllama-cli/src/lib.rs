@@ -3110,6 +3110,64 @@ fn gguf_is_hybrid(model_path: &std::path::Path) -> bool {
         && g.metadata_get(&format!("{arch}.ssm.state_size")).is_some()
 }
 
+/// True when the GGUF declares a Mixture-of-Experts model — the same
+/// `{arch}.expert_count >= 2` trigger `LlamaConfig::from_gguf` uses to build the
+/// MoE config (a single "expert" is a dense FFN). Used by `tune --all` to skip
+/// the MoE-only VRAM-margin stage on a dense model (which would otherwise load
+/// the WHOLE model into a subprocess just to self-skip + persist nothing).
+fn gguf_is_moe(model_path: &std::path::Path) -> bool {
+    let Ok(g) = rustllama_gguf::Gguf::open(model_path) else {
+        return false;
+    };
+    let Some(arch) = g.architecture() else {
+        return false;
+    };
+    g.metadata_get(&format!("{arch}.expert_count"))
+        .and_then(rustllama_gguf::MetadataValue::as_u32)
+        .map(|n| n >= 2)
+        .unwrap_or(false)
+}
+
+/// True when the GGUF carries any SSM/selective-scan layers — `{arch}.ssm.state_size`
+/// present. This is a SUPERSET of [`gguf_is_hybrid`]: it holds for BOTH hybrid
+/// transformer+SSM models (qwen35 / Ornith) AND pure-SSM models (mamba / mamba2 /
+/// falcon-mamba), which `gguf_is_hybrid` excludes (no `full_attention_interval`).
+/// Used by `tune --all` to skip the SSM-prefill stages ONLY on fully dense models
+/// (where the SSM-prefill toggle is a forward-pass no-op) without ever
+/// wrongly-skipping a pure-Mamba model that genuinely benefits.
+fn gguf_has_ssm(model_path: &std::path::Path) -> bool {
+    let Ok(g) = rustllama_gguf::Gguf::open(model_path) else {
+        return false;
+    };
+    let Some(arch) = g.architecture() else {
+        return false;
+    };
+    g.metadata_get(&format!("{arch}.ssm.state_size")).is_some()
+}
+
+/// True when the GGUF declares a hybrid model that ALSO carries a NextN (MTP)
+/// head — `{arch}.nextn_predict_layers > 0`. This mirrors the engine's
+/// `model_supports_mtp()` (`is_hybrid() && nextn_head.is_some()`), whose
+/// `nextn_head` is `Some` iff `nextn_predict_layers > 0`. Used by `tune --all` to
+/// skip the MTP self-speculation stage on a model that can't do MTP (otherwise it
+/// loads the whole model just to report "not capable"). Delegates the hybrid
+/// check to [`gguf_is_hybrid`] so the two share one source of truth.
+fn gguf_supports_mtp(model_path: &std::path::Path) -> bool {
+    if !gguf_is_hybrid(model_path) {
+        return false;
+    }
+    let Ok(g) = rustllama_gguf::Gguf::open(model_path) else {
+        return false;
+    };
+    let Some(arch) = g.architecture() else {
+        return false;
+    };
+    g.metadata_get(&format!("{arch}.nextn_predict_layers"))
+        .and_then(rustllama_gguf::MetadataValue::as_u32)
+        .map(|n| n > 0)
+        .unwrap_or(false)
+}
+
 /// Parse the user's `--target <name>` string into a [`GgmlType`].
 /// Case-insensitive; accepts the canonical ggml names. Returns a
 /// clean error listing supported targets if the name doesn't match.
@@ -8713,6 +8771,23 @@ fn cmd_tune_all(
             .ok()
             .and_then(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_string))
     };
+    // Cheap GGUF capability peek (metadata only, no weights) so the sweep can
+    // skip the stages a model CANNOT use — otherwise each such stage spawns a
+    // subprocess that loads the WHOLE model just to self-skip (a full 27B load
+    // wasted per no-op stage: the Ternary-Bonsai-2-27B first load wasted one on
+    // moe-vram-margin AND one on MTP). Resolve the same model path the stage
+    // subprocesses will. A failed peek (`None`) ⇒ don't gate (run every stage),
+    // the safe fallback. Each gate's non-capable path persists nothing that
+    // `is_untuned` (placement-keyed) reads, so a skip never re-triggers tuning.
+    let model_caps: Option<(bool, bool, bool)> = {
+        let cfg = rustllama_config::load(config_path).unwrap_or_default();
+        effective_model_path(model_override.clone(), &cfg, config_path)
+            .ok()
+            .map(|p| (gguf_is_moe(&p), gguf_has_ssm(&p), gguf_supports_mtp(&p)))
+    };
+    let cap_moe = model_caps.map_or(true, |c| c.0);
+    let cap_ssm = model_caps.map_or(true, |c| c.1);
+    let cap_mtp = model_caps.map_or(true, |c| c.2);
     let has_placement = match (cached.as_ref(), tune_model_key.as_ref()) {
         (Some(t), Some(k)) => t.placement.contains_key(k),
         _ => false,
@@ -9087,7 +9162,9 @@ fn cmd_tune_all(
     println!();
     println!("Stage 5b/10: moe-vram-margin (promote the decode-optimal expert count to GPU)");
     println!("--------");
-    if skip(has_moe_vram_margin) {
+    if !cap_moe {
+        println!("(skipped: model is dense — no MoE experts to promote to VRAM)");
+    } else if skip(has_moe_vram_margin) {
         println!("(skipped: moe-vram-margin winner already cached)");
     } else {
         // Model-dependent reload-per-margin decode A/B; CUDA / dedicated-SYCL
@@ -9178,7 +9255,9 @@ fn cmd_tune_all(
     println!();
     println!("Stage 9/10: MTP self-speculation (decode tok/s)");
     println!("--------");
-    if skip(has_speculative_mtp) {
+    if !cap_mtp {
+        println!("(skipped: model has no NextN/MTP head — self-speculation N/A)");
+    } else if skip(has_speculative_mtp) {
         println!("(skipped: speculative_mtp winner already cached)");
     } else if let Err(e) = run_tune_stage_subprocess(
         config_path,
@@ -9210,7 +9289,9 @@ fn cmd_tune_all(
     println!();
     println!("Stage 10/10: chunked SSM prefill (prefill tok/s)");
     println!("--------");
-    if skip(has_ssm_prefill_chunked) {
+    if !cap_ssm {
+        println!("(skipped: model has no SSM layers — chunked SSM prefill N/A)");
+    } else if skip(has_ssm_prefill_chunked) {
         println!("(skipped: ssm_prefill_chunked winner already cached)");
     } else if let Err(e) = run_tune_stage_subprocess(
         config_path,
@@ -9262,7 +9343,9 @@ fn cmd_tune_all(
     println!();
     println!("Stage 10c/10: DeltaNet prefill chunk length (prefill tok/s)");
     println!("--------");
-    if skip(has_ssm_chunk) {
+    if !cap_ssm {
+        println!("(skipped: model has no SSM layers — DeltaNet chunk length N/A)");
+    } else if skip(has_ssm_chunk) {
         println!("(skipped: ssm_chunk winner already cached)");
     } else if let Err(e) = run_tune_stage_subprocess(
         config_path,
