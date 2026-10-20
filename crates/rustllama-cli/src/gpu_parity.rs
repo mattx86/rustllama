@@ -747,6 +747,24 @@ pub fn collect_cuda_verdicts() -> anyhow::Result<Vec<(String, Option<bool>)>> {
         .collect())
 }
 
+/// Run the Metal (MLX) kernel parity probes and return per-probe auto-enable
+/// verdicts (prints the same report as `doctor --metal-parity`). Used by
+/// `tune --validate-kernels` so metal verdicts (e.g. `attn:paged_decode_mlx`)
+/// are banked like the CUDA/SYCL ones — closing the gap where metal CORRECTNESS
+/// verdicts had no validate-kernels collector. Off Apple every probe SKIPs (no
+/// Metal device) → no verdict recorded → nothing persisted (inert). In-process
+/// (the Metal harness is not subprocessed).
+pub fn collect_metal_verdicts() -> anyhow::Result<Vec<(String, Option<bool>)>> {
+    probe_rec_begin();
+    let r = run_metal_parity();
+    let recorded = probe_rec_take();
+    r?;
+    Ok(recorded
+        .into_iter()
+        .map(|(name, status)| (name, probe_status_to_verdict(&status)))
+        .collect())
+}
+
 /// Run the SYCL XMX/DPAS GEMM parity probe and return its verdict. Empty
 /// when there is no usable SYCL device (no verdict recorded → XMX stays
 /// off). WRITE-BLIND note: in-process here (no XMX HW in play); if a real

@@ -6588,7 +6588,7 @@ pub fn persist_per_device_perf(
 fn cmd_tune_validate_kernels() -> anyhow::Result<()> {
     println!("rustllama tune --validate-kernels");
     println!(
-        "  running GPU/NPU kernel parity probes (CUDA tensor-core GEMM, SYCL XMX, NPU MatMul)…"
+        "  running GPU/NPU kernel parity probes (CUDA tensor-core GEMM, SYCL XMX, Metal/MLX, NPU MatMul)…"
     );
     println!();
 
@@ -6608,6 +6608,15 @@ fn cmd_tune_validate_kernels() -> anyhow::Result<()> {
     match crate::gpu_parity::collect_sycl_verdicts() {
         Ok(mut v) => verdicts.append(&mut v),
         Err(e) => tracing::warn!(error = %e, "SYCL kernel validation probes failed"),
+    }
+    // Metal (MLX) parity verdicts (e.g. `attn:paged_decode_mlx`, `matvec:*`).
+    // Previously the metal harness ran only under `doctor --metal-parity` and
+    // persisted nothing, so metal CORRECTNESS verdicts never auto-enabled their
+    // dispatch gates. Off Apple every probe SKIPs (no Metal device) → no verdict
+    // → nothing persisted, so this is cheap + inert on non-Apple hosts.
+    match crate::gpu_parity::collect_metal_verdicts() {
+        Ok(mut v) => verdicts.append(&mut v),
+        Err(e) => tracing::warn!(error = %e, "Metal kernel validation probes failed"),
     }
     // P5b: in-process correctness+perf collector for the GPU sampler chain (the
     // verdict replacement for the removed RUSTLLAMA_SAMPLER_GPU env gate). SKIPs
