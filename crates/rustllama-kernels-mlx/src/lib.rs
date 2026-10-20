@@ -3176,6 +3176,16 @@ pub struct MlxMatvecCache {
     out_scratch: Option<RawDevBuf>,
     used_bytes: usize,
     budget_bytes: usize,
+    // AirLLM-style layer streaming (mirror of CudaMatvecCache). `stream_window_layers
+    // == 0` (the default) keeps the legacy grow-until-budget behavior —
+    // BYTE-IDENTICAL. On Apple unified memory this caps duplicated weight bytes
+    // (the "upload" is an intra-RAM copy) rather than fitting a bigger-than-VRAM
+    // model, but it still bounds residency for a model larger than the pool.
+    stream_window_layers: u32,
+    current_layer_tag: u32,
+    tick: u64,
+    layer_keys: HashMap<u32, Vec<usize>>,
+    layer_last_used: HashMap<u32, u64>,
     stream: MlxStream,
 }
 
@@ -3190,6 +3200,11 @@ impl MlxMatvecCache {
             out_scratch: None,
             used_bytes: 0,
             budget_bytes,
+            stream_window_layers: 0,
+            current_layer_tag: 0,
+            tick: 0,
+            layer_keys: HashMap::new(),
+            layer_last_used: HashMap::new(),
             stream,
         })
     }
@@ -3212,6 +3227,58 @@ impl MlxMatvecCache {
     pub fn clear(&mut self) {
         self.weights.clear();
         self.used_bytes = 0;
+        self.layer_keys.clear();
+        self.layer_last_used.clear();
+        self.tick = 0;
+        self.stream_window_layers = 0;
+    }
+
+    /// Enable AirLLM layer streaming (`k > 0`) — `ensure_weight` then cycles whole
+    /// layers through the cache by evicting the coldest instead of declining.
+    /// `0` (default) = legacy grow-until-budget.
+    pub fn set_stream_window_layers(&mut self, k: u32) {
+        self.stream_window_layers = k;
+    }
+
+    /// Tag the layer — or `encode(layer, expert)` — whose weights the next
+    /// `ensure_weight` calls belong to (set by the dispatch bridge under the
+    /// cache lock), for whole-layer eviction + LRU aging.
+    pub fn set_layer_tag(&mut self, tag: u32) {
+        self.current_layer_tag = tag;
+    }
+
+    fn untrack_key(&mut self, key: usize) {
+        for keys in self.layer_keys.values_mut() {
+            if let Some(pos) = keys.iter().position(|&k| k == key) {
+                keys.swap_remove(pos);
+                return;
+            }
+        }
+    }
+
+    fn evict_until_fits(&mut self, need: usize, keep_a: u32, keep_b: u32) -> bool {
+        while self.used_bytes + need > self.budget_bytes {
+            let mut victim: Option<u32> = None;
+            let mut victim_tick: u64 = u64::MAX;
+            for (&t, &tick) in self.layer_last_used.iter() {
+                if t != keep_a && t != keep_b && tick < victim_tick {
+                    victim_tick = tick;
+                    victim = Some(t);
+                }
+            }
+            let Some(victim) = victim else {
+                return false;
+            };
+            if let Some(keys) = self.layer_keys.remove(&victim) {
+                for k in keys {
+                    if let Some(buf) = self.weights.remove(&k) {
+                        self.used_bytes = self.used_bytes.saturating_sub(buf.cap_bytes);
+                    }
+                }
+            }
+            self.layer_last_used.remove(&victim);
+        }
+        true
     }
 
     fn ensure_scratch(slot: &mut Option<RawDevBuf>, stream: &MlxStream, need_bytes: usize) -> bool {
@@ -3231,6 +3298,11 @@ impl MlxMatvecCache {
     /// Ensure `weight_key`'s bytes are resident; upload on first use.
     /// Returns false if over budget or an alloc/upload fails.
     fn ensure_weight(&mut self, weight_key: usize, w_bytes: &[u8]) -> bool {
+        let tag = self.current_layer_tag;
+        if self.stream_window_layers > 0 {
+            self.tick += 1;
+            self.layer_last_used.insert(tag, self.tick);
+        }
         if let Some(existing) = self.weights.get(&weight_key) {
             if existing.cap_bytes == w_bytes.len() {
                 return true;
@@ -3241,9 +3313,16 @@ impl MlxMatvecCache {
             // `clear`; this is the per-entry safety net.)
             self.used_bytes = self.used_bytes.saturating_sub(existing.cap_bytes);
             self.weights.remove(&weight_key);
+            if self.stream_window_layers > 0 {
+                self.untrack_key(weight_key);
+            }
         }
         if self.used_bytes + w_bytes.len() > self.budget_bytes {
-            return false;
+            // Over budget. Legacy: decline → caller falls back to CPU. Streaming:
+            // evict the coldest whole layer(s) to cycle the window.
+            if self.stream_window_layers == 0 || !self.evict_until_fits(w_bytes.len(), tag, tag) {
+                return false;
+            }
         }
         let Some(mut buf) = RawDevBuf::alloc(&self.stream, w_bytes.len()) else {
             return false;
@@ -3253,6 +3332,9 @@ impl MlxMatvecCache {
         }
         self.used_bytes += w_bytes.len();
         self.weights.insert(weight_key, buf);
+        if self.stream_window_layers > 0 {
+            self.layer_keys.entry(tag).or_default().push(weight_key);
+        }
         true
     }
 

@@ -2186,9 +2186,17 @@ pub fn stream_window() -> u32 {
 /// evicted — residency/perf, never the math — so it is safe lock-free of the
 /// matvec itself.
 pub fn cuda_set_layer_tag(tag: u32) {
-    // Mirror into the per-thread TLS so the SYCL/MLX caches read the same tag.
+    // Mirror into the per-thread TLS so the in-crate SYCL cache reads the same
+    // tag, and tag whichever global GPU cache is present (CUDA on an NVIDIA host,
+    // MLX on a Mac — the other is `None`, a no-op). Name kept for call-site
+    // stability; it drives ALL GPU backends.
     STREAM_LAYER_TAG.with(|c| c.set(tag));
     if let Some(cache) = cuda_cache() {
+        if let Ok(mut g) = cache.lock() {
+            g.set_layer_tag(tag);
+        }
+    }
+    if let Some(cache) = mlx_cache() {
         if let Ok(mut g) = cache.lock() {
             g.set_layer_tag(tag);
         }
@@ -2205,7 +2213,14 @@ pub fn stream_layer_tag() -> u32 {
 /// grow-until-budget to evict-coldest-layer) onto the global CUDA weight cache.
 /// Called by the engine when placement selects streaming. `0` restores legacy.
 pub fn cuda_set_stream_window(k: u32) {
+    // Flips the admission policy on whichever global GPU cache is present (CUDA
+    // or MLX — the other is `None`). Name kept for call-site stability.
     if let Some(cache) = cuda_cache() {
+        if let Ok(mut g) = cache.lock() {
+            g.set_stream_window_layers(k);
+        }
+    }
+    if let Some(cache) = mlx_cache() {
         if let Ok(mut g) = cache.lock() {
             g.set_stream_window_layers(k);
         }
