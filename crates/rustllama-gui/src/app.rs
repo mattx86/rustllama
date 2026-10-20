@@ -2450,7 +2450,11 @@ impl eframe::App for GuiApp {
                 self.spawn_tuning();
             }
         }
-        if self.tune_running {
+        // Poll tuner progress ~1 Hz while an explicit re-tune runs (Status view)
+        // OR while a Models-page load is in flight — a load of an untuned model
+        // blocks on a server-side first-load autotune, and B6 surfaces its stage
+        // bar on the Models page (gated on the server's own `active` flag there).
+        if self.tune_running || self.busy_model.is_some() {
             let prog_due = self
                 .tune_prog_last_poll
                 .map_or(true, |t| now.duration_since(t) >= Duration::from_secs(1));
@@ -2692,6 +2696,8 @@ impl eframe::App for GuiApp {
                 Action::LoadCached(name) => {
                     self.busy_model = Some(name.clone());
                     self.models_error = None;
+                    // Start the first-load tune bar clean (drop any stale frame).
+                    self.tune_progress = None;
                     self.spawn_load_cached(name);
                 }
                 Action::PickFile => self.spawn_pick_file(),
@@ -3673,6 +3679,7 @@ impl GuiApp {
         let hf_files = self.hf_files.clone();
         let hf_repo = self.hf_repo.clone();
         let busy = self.busy_model.clone();
+        let tune_prog = self.tune_progress.clone();
 
         egui::CentralPanel::default()
             .frame(
@@ -3701,6 +3708,39 @@ impl GuiApp {
                         if let Some(e) = &self.models_error {
                             ui.add_space(8.0);
                             error_banner(ui, e);
+                        }
+                        // B6: while a load is in flight, surface the server's
+                        // blocking first-load autotune as a stage bar (the load
+                        // POST blocks until the tune finishes). Gated on the
+                        // server's own `active` flag so a stale frame from a
+                        // prior tune doesn't linger.
+                        if busy.is_some() {
+                            if let Some(p) = tune_prog.as_ref().filter(|p| p.active) {
+                                ui.add_space(8.0);
+                                card(ui, |ui| {
+                                    ui.label(
+                                        RichText::new("Auto-tuning (first load)…")
+                                            .strong()
+                                            .color(TEXT),
+                                    );
+                                    ui.add_space(6.0);
+                                    let frac = (p.pct / 100.0).clamp(0.0, 1.0) as f32;
+                                    ui.add(
+                                        egui::ProgressBar::new(frac)
+                                            .desired_width(f32::INFINITY)
+                                            .fill(ACCENT)
+                                            .text(format!(
+                                                "{}/{} {}",
+                                                p.stage_idx, p.stage_total, p.stage_name
+                                            )),
+                                    );
+                                    if !p.line.is_empty() {
+                                        ui.label(
+                                            RichText::new(&p.line).color(MUTED).monospace().small(),
+                                        );
+                                    }
+                                });
+                            }
                         }
                         ui.add_space(14.0);
 
