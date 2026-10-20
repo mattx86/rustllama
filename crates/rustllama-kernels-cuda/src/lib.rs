@@ -3790,6 +3790,12 @@ pub struct CudaMatvecCache {
     // exec_update. Sized to n_layers (rebuilt on a layer-count change); dropped
     // (execs destroyed) on model reload via `clear`.
     attn_graph_exec: Vec<Option<CudaGraphExecHandle>>,
+    // A1: when set, the EAGER decode block routes its Q4_K matvecs through the
+    // lossy, verdict-gated W4A8 int8-activation kernel instead of the bit-exact
+    // f32 warp matvec. Set per-call at the top of `decode_attn_block_f32` from
+    // the caller's `q4k_w4a8_enabled()` decision; forced OFF in the graph twin
+    // (the W4A8 wrapper synchronizes, so it is not CUDA-graph-capturable).
+    q4k_w4a8: bool,
     used_bytes: usize,
     budget_bytes: usize,
     stream: CudaStream,
@@ -3814,6 +3820,7 @@ impl CudaMatvecCache {
             attn_act: None,
             attn_norms: None,
             attn_graph_exec: Vec::new(),
+            q4k_w4a8: false,
             used_bytes: 0,
             budget_bytes,
             stream,
@@ -4213,7 +4220,16 @@ impl CudaMatvecCache {
                     matvec_q8_0_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
                 }
                 CudaPackedKind::Q4_K => {
-                    matvec_q4_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                    // A1: lossy W4A8 int8-activation matvec where its verdict
+                    // enabled it (the kernel requires K % 256 == 0); else the
+                    // bit-exact f32 warp matvec. Only the eager block sets the
+                    // flag — the graph twin forces it off (W4A8 syncs internally,
+                    // so it is not capturable).
+                    if self.q4k_w4a8 && k % 256 == 0 {
+                        matvec_q4_k_w4a8(&self.stream, w_ptr as *const c_void, x_dev, out_dev, m, k)
+                    } else {
+                        matvec_q4_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
+                    }
                 }
                 CudaPackedKind::Q6_K => {
                     matvec_q6_k_packed_f32(&self.stream, w_ptr, x_dev, out_dev, m, k)
@@ -4355,7 +4371,14 @@ impl CudaMatvecCache {
         // realloc it and nothing else overwrites offset 0.
         upload_hidden: bool,
         download_hidden: bool,
+        // A1: route this block's Q4_K matvecs through the lossy, verdict-gated
+        // W4A8 int8-activation kernel (the caller passes `q4k_w4a8_enabled()`).
+        // Inert on non-Q4_K weights and on K not divisible by 256.
+        w4a8_q4k: bool,
     ) -> bool {
+        // Record the per-call W4A8 preference the matvecs below read. Eager path
+        // only — the graph twin forces this OFF (W4A8 is not capturable).
+        self.q4k_w4a8 = w4a8_q4k;
         let d_q = n_heads * head_dim;
         let d_kv = n_kv_heads * head_dim;
         let d_ff = dense_ffn.as_ref().map(|f| f.3).unwrap_or(0);
@@ -4785,6 +4808,10 @@ impl CudaMatvecCache {
         upload_hidden: bool,
         download_hidden: bool,
     ) -> bool {
+        // A1: the W4A8 matvec synchronizes internally, so it is NOT CUDA-graph
+        // capturable — force the flag off for the whole captured chain so the
+        // Q4_K matvecs stay on the bit-exact f32 warp kernel.
+        self.q4k_w4a8 = false;
         let d_q = n_heads * head_dim;
         let d_kv = n_kv_heads * head_dim;
         let d_ff = dense_ffn.as_ref().map(|f| f.3).unwrap_or(0);

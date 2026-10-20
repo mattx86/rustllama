@@ -9946,6 +9946,7 @@ pub fn try_decode_attn_block_cuda_f32(
             ffn_dev,
             upload_hidden,
             download_hidden,
+            q4k_w4a8_enabled(),
         )
     };
     if ok {
