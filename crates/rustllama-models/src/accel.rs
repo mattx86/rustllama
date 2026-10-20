@@ -2233,6 +2233,16 @@ pub fn cuda_wait_prefetch() {
     }
 }
 
+/// AirLLM Phase 5: encode a MoE `(layer, expert)` into a distinct CUDA cache
+/// layer-tag (high bit set, so it never collides with a plain dense layer
+/// index). The streaming LRU then treats each routed expert as its own eviction
+/// group: only the experts a token routes to are uploaded, and cold experts are
+/// evicted — the sparse analogue of dense layer streaming (far higher
+/// steady-state reuse, since routing revisits hot experts).
+pub fn encode_expert_tag(layer: u32, expert: u32) -> u32 {
+    0x8000_0000 | ((layer & 0x7FFF) << 16) | (expert & 0xFFFF)
+}
+
 /// Whether the GPU path is enabled for the layer that's currently
 /// being processed on this thread. Returns `true` when
 /// `current_layer_idx < n_gpu_layers`. The `try_*_usm_f32` dispatch

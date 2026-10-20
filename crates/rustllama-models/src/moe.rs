@@ -632,6 +632,17 @@ pub fn moe_ffn_one_into(
                 let w_up_e = &block.up_per_expert[*expert_idx];
                 let w_down_e = &block.down_per_expert[*expert_idx];
 
+                // AirLLM Phase 5: tag this routed expert so the CUDA streaming
+                // LRU treats it as its own eviction group (upload only routed
+                // experts; evict cold ones). Overrides the per-layer dense tag
+                // for the duration of this expert's matvecs. No-op off streaming.
+                if crate::accel::stream_window() > 0 {
+                    crate::accel::cuda_set_layer_tag(crate::accel::encode_expert_tag(
+                        crate::accel::current_layer_idx(),
+                        *expert_idx as u32,
+                    ));
+                }
+
                 // Residency-aware spill gate: sample the pin cache BEFORE the
                 // touch below pins this expert (→ makes it resident). A hot
                 // (resident) expert keeps its pages RAM-locked, so serving it
