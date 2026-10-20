@@ -4436,6 +4436,14 @@ fn mk_upload_f32<'s>(stream: &'s mk::MlxStream, data: &[f32]) -> Option<mk::MlxD
     mk::MlxDeviceBuffer::from_host(stream, bytes)
 }
 
+/// Upload an i32 slice into a fresh MLX device buffer (bytes reinterpret).
+fn mk_upload_i32<'s>(stream: &'s mk::MlxStream, data: &[i32]) -> Option<mk::MlxDeviceBuffer<'s>> {
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+    };
+    mk::MlxDeviceBuffer::from_host(stream, bytes)
+}
+
 /// Download `n` f32 from an MLX device buffer.
 fn mk_download_f32(buf: &mk::MlxDeviceBuffer<'_>, n: usize) -> Vec<f32> {
     let mut out = vec![0f32; n];
@@ -8656,6 +8664,121 @@ pub fn run_metal_parity() -> anyhow::Result<()> {
                                 "cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"
                             ),
                         );
+                    }
+                }
+            }
+
+            // attn:paged_decode_mlx (GPU paged attention, Phase F): the Metal
+            // block-table flash-decode graded vs the SAME CPU reference, with a
+            // SCATTERED block table so the page indirection is genuinely
+            // exercised (the Phase A/E/F geometry). WRITE-BLIND here (Metal is
+            // Apple-only) — validated on-device later via `--metal-parity`.
+            {
+                let (nh_p, nkv_p, hd_p, kvlen_p) = (8usize, 2usize, 64usize, 40usize);
+                let (layer_idx, n_layers, page_size) = (1usize, 3usize, 16usize);
+                let max_ctx_p = kvlen_p; // CPU reference attends [0, kv_len)
+                let num_blocks = kvlen_p.div_ceil(page_size); // ceil(40/16) = 3
+                let total_pages = 8usize;
+                // Scattered logical-block -> physical-page map (distinct pages).
+                let block_table: Vec<i32> = (0..num_blocks)
+                    .map(|i| ((i * 3 + 2) % total_pages) as i32)
+                    .collect();
+                let qd = gen_x(nh_p * hd_p, 61);
+                let kcd = gen_x(nkv_p * max_ctx_p * hd_p, 63);
+                let vcd = gen_x(nkv_p * max_ctx_p * hd_p, 67);
+                // Scatter (t, h) K/V into the physical page the block table points
+                // at, byte-identical to the host `PagedKvStore` geometry.
+                let head_stride = page_size * hd_p;
+                let kv_stride = nkv_p * head_stride;
+                let layer_stride = 2 * kv_stride;
+                let page_stride = n_layers * layer_stride;
+                let mut pool = vec![0f32; total_pages * page_stride];
+                for t in 0..kvlen_p {
+                    let page = block_table[t / page_size] as usize;
+                    let in_page = t % page_size;
+                    for h in 0..nkv_p {
+                        let src = (h * max_ctx_p + t) * hd_p;
+                        let base = page * page_stride
+                            + layer_idx * layer_stride
+                            + h * head_stride
+                            + in_page * hd_p;
+                        pool[base..base + hd_p].copy_from_slice(&kcd[src..src + hd_p]);
+                        pool[base + kv_stride..base + kv_stride + hd_p]
+                            .copy_from_slice(&vcd[src..src + hd_p]);
+                    }
+                }
+                let dec_cases: [(u32, f32); 3] = [(0, 0.0), (16, 0.0), (0, 50.0)];
+                if let (Some(qb), Some(poolb), Some(btb), Some(mut ob)) = (
+                    mk_upload_f32(&fs, &qd),
+                    mk_upload_f32(&fs, &pool),
+                    mk_upload_i32(&fs, &block_table),
+                    mk::MlxDeviceBuffer::alloc(&fs, nh_p * hd_p * 4),
+                ) {
+                    let (mut worst_cos, mut worst_rel) = (1.0f64, 0.0f64);
+                    let mut err: Option<String> = None;
+                    for (window, softcap) in dec_cases {
+                        let mut cpu = vec![0f32; nh_p * hd_p];
+                        k::gqa_attention_flash_decode_capped_windowed(
+                            &qd,
+                            &kcd,
+                            &vcd,
+                            &mut cpu,
+                            nh_p,
+                            nkv_p,
+                            hd_p,
+                            max_ctx_p,
+                            kvlen_p,
+                            window as usize,
+                            softcap,
+                        );
+                        // SAFETY: q/out [nh*hd] f32; pool = the slab; block_table =
+                        // [num_blocks] i32 — all device buffers on `fs`.
+                        let res = unsafe {
+                            mk::flash_attn_decode_paged_f32(
+                                &fs,
+                                qb.as_ptr() as *const f32,
+                                poolb.as_ptr() as *const f32,
+                                btb.as_ptr() as *const i32,
+                                ob.as_mut_ptr() as *mut f32,
+                                nh_p,
+                                nkv_p,
+                                hd_p,
+                                layer_idx,
+                                n_layers,
+                                page_size,
+                                kvlen_p,
+                                window as i32,
+                                softcap,
+                            )
+                        };
+                        if let Err(e) = res {
+                            err = Some(format!("{e:?}"));
+                            break;
+                        }
+                        let (cos, max_rel) = compare(&mk_download_f32(&ob, nh_p * hd_p), &cpu);
+                        worst_cos = worst_cos.min(cos);
+                        worst_rel = worst_rel.max(max_rel);
+                    }
+                    match err {
+                        Some(e) => {
+                            cu_emit("attn:paged_decode_mlx", "KERNEL_ERR", &e);
+                            *counts.entry("KERNEL_ERR").or_default() += 1;
+                        }
+                        None => {
+                            let key: &'static str = if worst_cos > 0.999 && worst_rel < 0.02 {
+                                "OK"
+                            } else {
+                                "MISCOMPUTE"
+                            };
+                            *counts.entry(key).or_default() += 1;
+                            cu_emit(
+                                "attn:paged_decode_mlx",
+                                key,
+                                &format!(
+                                    "cos={worst_cos:.6} max_rel={worst_rel:.4} (pass+swa16+cap50)"
+                                ),
+                            );
+                        }
                     }
                 }
             }

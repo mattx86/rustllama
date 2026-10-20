@@ -1376,6 +1376,48 @@ extern "C" int rsl_mlx_flash_attn_decode_f32(rsl_mlx_stream *s, const float *q,
     (void)s;(void)q;(void)k;(void)v;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)max_ctx;(void)kv_len;(void)window;(void)softcap; RSL_MLX_STUB_KERNEL
 #endif
 }
+// GPU paged attention (Phase F): block-table flash-decode against the whole-pool
+// F32 device mirror. `kv_pool` = the mirror slab (byte-identical geometry to the
+// host PagedKvStore); `block_table` = [ceil(kv_len/page_size)] i32 (logical block
+// -> physical page id). `window`/`softcap` passthrough as above.
+extern "C" int rsl_mlx_flash_attn_decode_paged_f32(rsl_mlx_stream *s, const float *q,
+    const float *kv_pool, const int *block_table, float *out, int n_heads, int n_kv_heads,
+    int head_dim, int layer_idx, int n_layers, int page_size, int kv_len, int window, float softcap) {
+#if RSL_MLX_HAVE_METAL
+    if (!s || !q || !kv_pool || !block_table || !out) return -1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || page_size <= 0 ||
+        n_layers <= 0 || layer_idx < 0 || layer_idx >= n_layers || kv_len <= 0) return -1;
+    if ((n_heads % n_kv_heads) != 0 || head_dim > 256) return -1;
+    size_t oq = 0, op = 0, obt = 0, oo = 0;
+    id<MTLBuffer> bq = mlx_resolve(q, &oq);
+    id<MTLBuffer> bp = mlx_resolve(kv_pool, &op);
+    id<MTLBuffer> bbt = mlx_resolve(block_table, &obt);
+    id<MTLBuffer> bo = mlx_resolve(out, &oo);
+    if (bq == nil || bp == nil || bbt == nil || bo == nil) { g_rsl_mlx_errors++; return -1; }
+    int nh = n_heads, nkv = n_kv_heads, hd = head_dim, li = layer_idx, nl = n_layers,
+        ps = page_size, kl = kv_len, win = window;
+    float sc = softcap;
+    MTLSize grid = MTLSizeMake((NSUInteger)n_heads, 1, 1);
+    MTLSize tpg = MTLSizeMake(32, 1, 1);
+    return mlx_run(s, @"rsl_mlx_flash_attn_decode_paged_f32_kernel", grid, tpg, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bq offset:oq atIndex:0];
+        [enc setBuffer:bp offset:op atIndex:1];
+        [enc setBuffer:bbt offset:obt atIndex:2];
+        [enc setBuffer:bo offset:oo atIndex:3];
+        [enc setBytes:&nh length:sizeof(int) atIndex:4];
+        [enc setBytes:&nkv length:sizeof(int) atIndex:5];
+        [enc setBytes:&hd length:sizeof(int) atIndex:6];
+        [enc setBytes:&li length:sizeof(int) atIndex:7];
+        [enc setBytes:&nl length:sizeof(int) atIndex:8];
+        [enc setBytes:&ps length:sizeof(int) atIndex:9];
+        [enc setBytes:&kl length:sizeof(int) atIndex:10];
+        [enc setBytes:&win length:sizeof(int) atIndex:11];
+        [enc setBytes:&sc length:sizeof(float) atIndex:12];
+    });
+#else
+    (void)s;(void)q;(void)kv_pool;(void)block_table;(void)out;(void)n_heads;(void)n_kv_heads;(void)head_dim;(void)layer_idx;(void)n_layers;(void)page_size;(void)kv_len;(void)window;(void)softcap; RSL_MLX_STUB_KERNEL
+#endif
+}
 // `window` / `softcap` as above; see the CPU `gqa_attention_flash_prefill_capped_windowed`.
 extern "C" int rsl_mlx_flash_attn_prefill_f32(rsl_mlx_stream *s, const float *q,
     const float *k, const float *v, float *out, int n_heads, int n_kv_heads,

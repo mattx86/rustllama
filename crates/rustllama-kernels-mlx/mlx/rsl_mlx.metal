@@ -369,6 +369,78 @@ kernel void rsl_mlx_flash_attn_decode_f32_kernel(
         out[q_base + i] = tg_acc[i] * inv_l;
 }
 
+// GPU paged attention (Phase F — MLX twin): block-table flash-decode. A COPY of
+// rsl_mlx_flash_attn_decode_f32_kernel with ONE semantic change — K/V are read
+// from the paged-pool device mirror (one whole-pool slab, byte-identical
+// geometry to the host PagedKvStore AND the CUDA/SYCL slabs: off =
+// page*page_stride + layer*layer_stride + kv_axis*kv_stride + h*head_stride +
+// pos_in_page*head_dim) via a per-sequence block table (logical block ->
+// physical page id), instead of a contiguous [n_kv_heads, max_ctx, head_dim]
+// cache. F32 pool ⇒ BIT-EXACT to the CPU reference
+// gqa_attention_flash_decode_capped_windowed — the SAME reference the CUDA/SYCL
+// twins grade against. Online softmax, SWA `window`, Gemma2 `softcap` identical.
+// Offsets are `long`: page*page_stride overflows int for a big pool.
+kernel void rsl_mlx_flash_attn_decode_paged_f32_kernel(
+    device const float *q           [[buffer(0)]],
+    device const float *kv_pool     [[buffer(1)]],
+    device const int   *block_table [[buffer(2)]],
+    device       float *out         [[buffer(3)]],
+    constant int &n_heads    [[buffer(4)]],
+    constant int &n_kv_heads [[buffer(5)]],
+    constant int &head_dim   [[buffer(6)]],
+    constant int &layer_idx  [[buffer(7)]],
+    constant int &n_layers   [[buffer(8)]],
+    constant int &page_size  [[buffer(9)]],
+    constant int &kv_len     [[buffer(10)]],
+    constant int &window     [[buffer(11)]],
+    constant float &softcap  [[buffer(12)]],
+    uint head                [[threadgroup_position_in_grid]],
+    uint lane                [[thread_position_in_threadgroup]],
+    uint lane_count          [[threads_per_threadgroup]])
+{
+    threadgroup float tg_acc[256];
+    if ((int)head >= n_heads) return;
+    const int n_gqa = n_heads / n_kv_heads;
+    const int kv_h = (int)head / n_gqa;
+    const int q_base = (int)head * head_dim;
+    const float scale = 1.0f / sqrt((float)head_dim);
+    const int t_start = (window > 0 && kv_len > window) ? (kv_len - window) : 0;
+    // Paged-pool strides (long: page*page_stride overflows int for a big pool).
+    const long head_stride = (long)page_size * head_dim;
+    const long kv_stride = (long)n_kv_heads * head_stride;   // kv_axis 1 = V
+    const long layer_stride = 2L * kv_stride;
+    const long page_stride = (long)n_layers * layer_stride;
+    const long layer_base = (long)layer_idx * layer_stride;
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count) tg_acc[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m = -INFINITY;
+    float l = 0.0f;
+    for (int t = t_start; t < kv_len; ++t) {
+        // Block-table indirection: logical pos t -> physical page slab base.
+        const int block = t / page_size;
+        const int in_page = t - block * page_size;
+        const int page = block_table[block];
+        const long k_off = (long)page * page_stride + layer_base +
+                           (long)kv_h * head_stride + (long)in_page * head_dim;
+        const long v_off = k_off + kv_stride;  // kv_axis 1 = V
+        float partial = 0.0f;
+        for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+            partial += q[q_base + i] * kv_pool[k_off + i];
+        float s_dot = simd_sum(partial) * scale;
+        if (softcap > 0.0f) s_dot = softcap * tanh(s_dot / softcap);
+        const float m_new = fmax(m, s_dot);
+        const float rescale = isfinite(m) ? exp(m - m_new) : 0.0f;
+        const float p = exp(s_dot - m_new);
+        l = l * rescale + p;
+        for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+            tg_acc[i] = tg_acc[i] * rescale + p * kv_pool[v_off + i];
+        m = m_new;
+    }
+    const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+    for (int i = (int)lane; i < head_dim; i += (int)lane_count)
+        out[q_base + i] = tg_acc[i] * inv_l;
+}
+
 // `window` (0 = full causal): a query at abs pos `P = kv_len_base + q_pos`
 // attends keys `[max(0, P-window+1), P]`; `softcap` (0 = off): Gemma2
 // attention-logit cap after the scale, before softmax. Byte-identical at 0.

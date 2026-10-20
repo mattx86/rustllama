@@ -218,6 +218,20 @@ int rsl_mlx_flash_attn_decode_f32(rsl_mlx_stream *s, const float *q,
                                   int n_heads, int n_kv_heads, int head_dim,
                                   int max_ctx, int kv_len);
 
+/* GPU paged attention (Phase F): block-table flash-decode against the whole-pool
+ * F32 device mirror. K/V read from `kv_pool` (byte-identical geometry to the host
+ * PagedKvStore) via `block_table` (logical block -> physical page id) for ONE
+ * sequence at `layer_idx`; q/out are F32 so this is BIT-EXACT to
+ * `gqa_attention_flash_decode_capped_windowed`. `block_table` =
+ * [ceil(kv_len/page_size)] i32. head_dim capped at 256; returns -1 on
+ * mis-shaped input so the caller falls back to CPU. 0 on success. */
+int rsl_mlx_flash_attn_decode_paged_f32(rsl_mlx_stream *s, const float *q,
+                                        const float *kv_pool,
+                                        const int *block_table, float *out,
+                                        int n_heads, int n_kv_heads, int head_dim,
+                                        int layer_idx, int n_layers, int page_size,
+                                        int kv_len, int window, float softcap);
+
 /* FlashAttention prefill (causal, n_new queries):
  *   q/out=[n_new,n_heads,head_dim], k/v=[n_kv_heads,max_ctx,head_dim].
  *   query q_pos attends absolute [0, kv_len_base+q_pos]. */

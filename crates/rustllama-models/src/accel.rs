@@ -3131,6 +3131,7 @@ pub fn reset_device_caches_for_new_model() {
     usm_attn_kv_epoch_bump();
     paged_mirror_reset();
     paged_sycl_mirror_reset();
+    paged_mlx_mirror_reset();
     set_moe_tier_active(false);
 }
 
@@ -3361,7 +3362,19 @@ pub fn paged_mirror_sync_row(
         k,
         v,
     );
-    // MLX arm is added in Phase F (paged_mlx_mirror_sync_row).
+    // MLX (Phase F): the thread-local Metal mirror lazy-inits from the geometry.
+    paged_mlx_mirror_sync_row(
+        total_pages,
+        n_layers,
+        n_kv_heads,
+        page_size,
+        head_dim,
+        layer,
+        page,
+        pos_in_page,
+        k,
+        v,
+    );
 }
 
 /// Sync a whole promoted page (cold-tier promote via `write_page`) into every
@@ -3386,7 +3399,15 @@ pub fn paged_mirror_sync_page(
         page,
         src,
     );
-    // MLX arm is added in Phase F (paged_mlx_mirror_sync_page).
+    paged_mlx_mirror_sync_page(
+        total_pages,
+        n_layers,
+        n_kv_heads,
+        page_size,
+        head_dim,
+        page,
+        src,
+    );
 }
 
 #[inline]
@@ -3875,6 +3896,347 @@ pub fn try_flash_attn_decode_paged_sycl_f32(
         // Read the attention output back into the caller's host buffer.
         out.copy_from_slice(&m.dev_out.as_ref().unwrap().as_slice()[..nh * hd]);
         true
+    })
+}
+
+// ===========================================================================
+// GPU paged attention — Phase F (MLX/Metal twin): a per-driver-thread Metal
+// mirror of the paged KV pool + its block-table flash-decode dispatch.
+//
+// The MLX analogue of the SYCL `PagedKvSyclMirror` above. `mk::MlxStream` is the
+// same thread-affine shape (the mirror is a `thread_local!` on the driver
+// thread, lazy-built from the pool geometry on first sync — like the contiguous
+// `MLX_ATTN`). The slab is a StorageModeShared `MlxDeviceBuffer` (F32, so a sync
+// is an offset `copy_from_host_at`). BIT-EXACT f32 — byte-identical geometry to
+// the host `PagedKvStore` AND the CUDA/SYCL slabs. Fully INERT off Apple
+// (`mlx_active()` == false ⇒ never built) and fail-closed unless the MLX paged
+// verdict passed. WRITE-BLIND here (no Mac) — validated on the user's Mac via
+// `doctor --metal-parity`.
+// ===========================================================================
+struct PagedKvMlxMirror {
+    // whole-pool F32 Metal slab; byte-identical geometry to `PagedKvStore`.
+    slab: mk::MlxDeviceBuffer<'static>,
+    // Reusable per-decode scratch: uploaded query, the sequence's block table
+    // (i32), and the attention output. Declared before `stream` so field-drop
+    // order frees them (they borrow it via the `'static` lie) before the stream.
+    dev_q: Option<mk::MlxDeviceBuffer<'static>>,
+    dev_block_table: Option<mk::MlxDeviceBuffer<'static>>,
+    dev_out: Option<mk::MlxDeviceBuffer<'static>>,
+    // Geometry mirror of `PagedKvStore` (in f32 elements).
+    page_stride: usize,
+    layer_stride: usize,
+    kv_stride: usize,
+    head_stride: usize,
+    head_dim: usize,
+    n_kv_heads: u32,
+    page_size: u32,
+    n_layers: u32,
+    total_pages: u32,
+    // Owning stream declared LAST (buffers borrow it; field-drop frees them first).
+    stream: mk::MlxStream,
+}
+
+impl PagedKvMlxMirror {
+    /// Allocate the per-thread Metal paged-pool mirror. `None` off-Apple / on a
+    /// degenerate geometry / on stream or alloc failure (⇒ the caller keeps the
+    /// CPU gather path).
+    fn try_new(
+        total_pages: u32,
+        n_layers: u32,
+        n_kv_heads: u32,
+        page_size: u32,
+        head_dim: u32,
+    ) -> Option<Self> {
+        if total_pages == 0 || n_layers == 0 || n_kv_heads == 0 || page_size == 0 || head_dim == 0 {
+            return None;
+        }
+        let head_stride = (page_size as usize) * (head_dim as usize);
+        let kv_stride = (n_kv_heads as usize) * head_stride;
+        let layer_stride = 2usize * kv_stride;
+        let page_stride = (n_layers as usize) * layer_stride;
+        let total_elems = (total_pages as usize).checked_mul(page_stride)?;
+        let n_bytes = total_elems.checked_mul(std::mem::size_of::<f32>())?;
+        let stream = mk::MlxStream::create(0)?;
+        let buf = mk::MlxDeviceBuffer::alloc(&stream, n_bytes)?;
+        // SAFETY: the `'_`→`'static` widening is the same lifetime lie the
+        // `MlxAttnContext` buffers tell — the buffer borrows `stream`, owned in
+        // this struct and declared LAST, so it outlives the buffer via field-drop
+        // order. The mirror is a thread-local; it is never moved across threads.
+        let slab = unsafe {
+            std::mem::transmute::<mk::MlxDeviceBuffer<'_>, mk::MlxDeviceBuffer<'static>>(buf)
+        };
+        Some(Self {
+            slab,
+            dev_q: None,
+            dev_block_table: None,
+            dev_out: None,
+            page_stride,
+            layer_stride,
+            kv_stride,
+            head_stride,
+            head_dim: head_dim as usize,
+            n_kv_heads,
+            page_size,
+            n_layers,
+            total_pages,
+            stream,
+        })
+    }
+
+    fn geometry_matches(
+        &self,
+        total_pages: u32,
+        n_layers: u32,
+        n_kv_heads: u32,
+        page_size: u32,
+        head_dim: u32,
+    ) -> bool {
+        self.total_pages == total_pages
+            && self.n_layers == n_layers
+            && self.n_kv_heads == n_kv_heads
+            && self.page_size == page_size
+            && self.head_dim == head_dim as usize
+    }
+
+    /// Write one `(K, V)` row into the Metal slab via per-head offset copies
+    /// (byte-identical geometry to the host pool).
+    fn sync_row(&mut self, layer: u32, page: u32, pos_in_page: u32, k: &[f32], v: &[f32]) {
+        if page >= self.total_pages || layer >= self.n_layers || pos_in_page >= self.page_size {
+            return;
+        }
+        let hd = self.head_dim;
+        let nkv = self.n_kv_heads as usize;
+        if k.len() != nkv * hd || v.len() != nkv * hd {
+            return;
+        }
+        let base = (page as usize) * self.page_stride + (layer as usize) * self.layer_stride;
+        let pos_off = (pos_in_page as usize) * hd;
+        for h in 0..nkv {
+            // kv_axis 0 = K, 1 = V (offset by `kv_stride`).
+            let k_off = base + h * self.head_stride + pos_off;
+            let v_off = base + self.kv_stride + h * self.head_stride + pos_off;
+            let _ = self
+                .slab
+                .copy_from_host_at(k_off * 4, f32_slice_as_bytes(&k[h * hd..h * hd + hd]));
+            let _ = self
+                .slab
+                .copy_from_host_at(v_off * 4, f32_slice_as_bytes(&v[h * hd..h * hd + hd]));
+        }
+    }
+
+    /// Write a whole promoted page (`src` = `page_stride` f32s) into the slab.
+    fn sync_page(&mut self, page: u32, src: &[f32]) {
+        if page >= self.total_pages || src.len() != self.page_stride {
+            return;
+        }
+        let off = (page as usize) * self.page_stride;
+        let _ = self
+            .slab
+            .copy_from_host_at(off * 4, f32_slice_as_bytes(src));
+    }
+}
+
+thread_local! {
+    /// Per-driver-thread MLX paged-pool mirror (Phase F). Built lazily on the
+    /// first `paged_mlx_mirror_sync_row` call once the MLX paged verdict is
+    /// enabled and the pool geometry is known; rebuilt on a geometry change.
+    /// Independent of [`MLX_ATTN`] — the paged mirror is its own Metal slab.
+    static PAGED_MLX_MIRROR: std::cell::RefCell<Option<PagedKvMlxMirror>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Verdict gate for the MLX block-table paged flash-decode (Phase F). On only
+/// when a Metal GPU is active (`mlx_active`) AND `tune --validate-kernels` /
+/// `doctor --metal-parity` recorded a pass for `attn:paged_decode_mlx`. Cached
+/// (`OnceLock`); fail-closed (absent / false ⇒ the paged engine keeps the CPU
+/// gather path, and no Metal slab is allocated at all).
+fn dev_attn_paged_mlx_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        mlx_active() && verdict_enabled(rustllama_tuner::VERDICT_ATTN_PAGED_DECODE_MLX)
+    })
+}
+
+/// Sync one `(K, V)` row into the MLX paged mirror (Phase F). Lazy-inits the
+/// per-thread Metal slab from the pool geometry on first use. INERT when the MLX
+/// paged verdict is off (no slab is ever allocated — fail-closed).
+#[allow(clippy::too_many_arguments)]
+fn paged_mlx_mirror_sync_row(
+    total_pages: u32,
+    n_layers: u32,
+    n_kv_heads: u32,
+    page_size: u32,
+    head_dim: u32,
+    layer: u32,
+    page: u32,
+    pos_in_page: u32,
+    k: &[f32],
+    v: &[f32],
+) {
+    if !dev_attn_paged_mlx_enabled() {
+        return;
+    }
+    PAGED_MLX_MIRROR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let needs_rebuild = match slot.as_ref() {
+            Some(m) => !m.geometry_matches(total_pages, n_layers, n_kv_heads, page_size, head_dim),
+            None => true,
+        };
+        if needs_rebuild {
+            *slot =
+                PagedKvMlxMirror::try_new(total_pages, n_layers, n_kv_heads, page_size, head_dim);
+        }
+        if let Some(m) = slot.as_mut() {
+            m.sync_row(layer, page, pos_in_page, k, v);
+        }
+    });
+}
+
+/// Sync a whole promoted page into the MLX paged mirror (Phase F). INERT when
+/// the verdict is off; a no-op if no mirror exists yet (the first row builds it).
+#[allow(clippy::too_many_arguments)]
+fn paged_mlx_mirror_sync_page(
+    total_pages: u32,
+    n_layers: u32,
+    n_kv_heads: u32,
+    page_size: u32,
+    head_dim: u32,
+    page: u32,
+    src: &[f32],
+) {
+    if !dev_attn_paged_mlx_enabled() {
+        return;
+    }
+    PAGED_MLX_MIRROR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if let Some(m) = slot.as_mut() {
+            if m.geometry_matches(total_pages, n_layers, n_kv_heads, page_size, head_dim) {
+                m.sync_page(page, src);
+            }
+        }
+    });
+}
+
+/// Drop the MLX paged mirror on model (re)load — the thread-local analogue of
+/// [`paged_mirror_reset`], hooked into `reset_device_caches_for_new_model`.
+pub fn paged_mlx_mirror_reset() {
+    PAGED_MLX_MIRROR.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
+/// GPU paged attention (Phase F — MLX twin): run the block-table flash-decode
+/// for ONE decode query of ONE layer against the per-thread Metal pool mirror,
+/// writing `[n_heads, head_dim]` into `out`. Returns `false` (⇒ the caller keeps
+/// the CPU gather path, byte-identical) when the verdict is off / MLX inactive /
+/// no mirror present / a geometry mismatch / any alloc / launch / readback error.
+/// `q`/`out` are host `[n_heads*head_dim]`; `block_table` is the sequence's
+/// physical page ids (`cache.pages()` as u32), covering `ceil(kv_len / page_size)`
+/// logical blocks. Mirror of [`try_flash_attn_decode_paged_sycl_f32`].
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_paged_mlx_f32(
+    q: &[f32],
+    out: &mut [f32],
+    block_table: &[u32],
+    layer_idx: u32,
+    kv_len: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    window: i32,
+    softcap: f32,
+) -> bool {
+    if !dev_attn_paged_mlx_enabled() || !gpu_active_for_current_layer() {
+        return false;
+    }
+    let nh = n_heads as usize;
+    let hd = head_dim as usize;
+    if nh == 0 || hd == 0 || n_kv_heads == 0 || q.len() != nh * hd || out.len() != nh * hd {
+        return false;
+    }
+    PAGED_MLX_MIRROR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(m) = slot.as_mut() else {
+            return false;
+        };
+        // Geometry must match the mirror the kernel indexes against.
+        if layer_idx >= m.n_layers
+            || hd != m.head_dim
+            || n_kv_heads != m.n_kv_heads
+            || n_heads % n_kv_heads != 0
+        {
+            return false;
+        }
+        let page_size = m.page_size as usize;
+        let num_blocks = (kv_len as usize).div_ceil(page_size.max(1));
+        if kv_len == 0 || block_table.len() < num_blocks {
+            return false;
+        }
+        // Reusable scratch (lazily grown): Q, block table (i32), output.
+        if !ensure_mlx_dev(&mut m.dev_q, &m.stream, nh * hd * 4)
+            || !ensure_mlx_dev(&mut m.dev_out, &m.stream, nh * hd * 4)
+            || !ensure_mlx_dev(&mut m.dev_block_table, &m.stream, num_blocks * 4)
+        {
+            return false;
+        }
+        // Upload Q.
+        if m.dev_q
+            .as_mut()
+            .unwrap()
+            .copy_from_host(f32_slice_as_bytes(q))
+            .is_err()
+        {
+            return false;
+        }
+        // Upload the block table (u32 page ids reinterpreted as i32 — same bytes).
+        let bt_bytes = unsafe {
+            std::slice::from_raw_parts(block_table.as_ptr() as *const u8, num_blocks * 4)
+        };
+        if m.dev_block_table
+            .as_mut()
+            .unwrap()
+            .copy_from_host(bt_bytes)
+            .is_err()
+        {
+            return false;
+        }
+        // Gather raw device pointers (disjoint fields) and launch against the slab.
+        let n_layers = m.n_layers as usize;
+        let page_size_u = m.page_size as usize;
+        let stream = &m.stream;
+        let q_ptr = m.dev_q.as_ref().unwrap().as_ptr() as *const f32;
+        let pool_ptr = m.slab.as_ptr() as *const f32;
+        let bt_ptr = m.dev_block_table.as_ref().unwrap().as_ptr() as *const i32;
+        let out_ptr = m.dev_out.as_mut().unwrap().as_mut_ptr() as *mut f32;
+        // SAFETY: all four are live device pointers on `stream`, sized for the
+        // shapes below; the wrapper synchronizes before returning so the read-back
+        // does not race the kernel.
+        let launched = unsafe {
+            mk::flash_attn_decode_paged_f32(
+                stream,
+                q_ptr,
+                pool_ptr,
+                bt_ptr,
+                out_ptr,
+                nh,
+                n_kv_heads as usize,
+                hd,
+                layer_idx as usize,
+                n_layers,
+                page_size_u,
+                kv_len as usize,
+                window,
+                softcap,
+            )
+        }
+        .is_ok();
+        if !launched || mk::consume_error_count() != 0 {
+            return false;
+        }
+        // Read the attention output back into the caller's host buffer.
+        let out_bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, nh * hd * 4) };
+        m.dev_out.as_ref().unwrap().copy_to_host(out_bytes).is_ok()
     })
 }
 

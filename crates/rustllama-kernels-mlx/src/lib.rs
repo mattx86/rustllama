@@ -808,6 +808,25 @@ extern "C" {
         window: c_int,
         softcap: f32,
     ) -> c_int;
+    // GPU paged attention (Phase F): block-table flash-decode against the
+    // whole-pool F32 device mirror. `block_table` = [ceil(kv_len/page_size)] i32.
+    fn rsl_mlx_flash_attn_decode_paged_f32(
+        s: *mut RslMlxStreamRaw,
+        q: *const f32,
+        kv_pool: *const f32,
+        block_table: *const c_int,
+        out: *mut f32,
+        n_heads: c_int,
+        n_kv_heads: c_int,
+        head_dim: c_int,
+        layer_idx: c_int,
+        n_layers: c_int,
+        page_size: c_int,
+        kv_len: c_int,
+        // SWA window (0=full causal) + Gemma2 attention-logit soft-cap (0=off).
+        window: c_int,
+        softcap: f32,
+    ) -> c_int;
     fn rsl_mlx_flash_attn_prefill_f32(
         s: *mut RslMlxStreamRaw,
         q: *const f32,
@@ -2042,6 +2061,59 @@ pub unsafe fn flash_attn_decode_f32(
         n_kv_heads as c_int,
         head_dim as c_int,
         max_ctx as c_int,
+        kv_len as c_int,
+        window as c_int,
+        softcap,
+    );
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(MlxError::Kernel(rc))
+    }
+}
+
+/// GPU paged attention (Phase F — MLX twin): block-table FlashAttention decode.
+/// Reads K/V from the whole-pool F32 device mirror `kv_pool` via `block_table`
+/// (logical block -> physical page id) for ONE sequence at `layer_idx`. Matches
+/// the contiguous [`flash_attn_decode_f32`] numerics (BIT-EXACT to the CPU
+/// reference `gqa_attention_flash_decode_capped_windowed`, F32 pool — no f16
+/// round-trip), differing only in how a logical KV position maps to a device
+/// address. Mirror of the CUDA `flash_attn_decode_paged_f32` /
+/// SYCL `flash_attn_decode_paged_usm`.
+///
+/// SAFETY: `q`/`out` = `[n_heads, head_dim]` f32; `kv_pool` = the pool mirror
+/// slab; `block_table` = `[ceil(kv_len / page_size)]` i32 — all device pointers
+/// on `stream`'s device; `n_heads % n_kv_heads == 0`; `layer_idx < n_layers`.
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_decode_paged_f32(
+    stream: &MlxStream,
+    q: *const f32,
+    kv_pool: *const f32,
+    block_table: *const i32,
+    out: *mut f32,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    layer_idx: usize,
+    n_layers: usize,
+    page_size: usize,
+    kv_len: usize,
+    window: i32,
+    softcap: f32,
+) -> Result<(), MlxError> {
+    let rc = rsl_mlx_flash_attn_decode_paged_f32(
+        stream.raw(),
+        q,
+        kv_pool,
+        block_table as *const c_int,
+        out,
+        n_heads as c_int,
+        n_kv_heads as c_int,
+        head_dim as c_int,
+        layer_idx as c_int,
+        n_layers as c_int,
+        page_size as c_int,
         kv_len as c_int,
         window as c_int,
         softcap,
