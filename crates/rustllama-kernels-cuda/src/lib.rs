@@ -4512,8 +4512,15 @@ impl CudaMatvecCache {
                 return false;
             }
         }
-        // 5. Download post-RoPE K/V (for the host KV cache) + write the new row
-        //    into the F32 mirror at `pos`, one kv-head at a time (head-major).
+        // 5. Download post-RoPE K/V into the caller's host KV-cache row, then
+        //    scatter the SAME post-RoPE device K/V into the F32 mirror at `pos`,
+        //    one kv-head at a time (head-major). A2: the mirror write is now an
+        //    on-chip DEVICE→DEVICE copy straight from the activation slab
+        //    (pk/pv) instead of re-uploading the just-downloaded host rows —
+        //    byte-identical to the old host round-trip (same source, same mirror
+        //    offsets) but without the redundant H2D re-upload. This mirrors the
+        //    graph twin's step 5. The host download stays: `k_row_out`/`v_row_out`
+        //    are the caller's output (its host KV cache).
         {
             let a = self.attn_act.as_ref().unwrap();
             let kb: &mut [u8] = unsafe {
@@ -4526,27 +4533,18 @@ impl CudaMatvecCache {
                 return false;
             }
         }
-        let row_bytes = head_dim * 4;
-        let kb = fb(k_row_out);
-        let vb = fb(v_row_out);
         {
-            let km = self.attn_k_mirror[layer_idx].as_mut().unwrap();
+            let km_base = self.attn_k_mirror[layer_idx].as_ref().unwrap().ptr as *mut f32;
+            let vm_base = self.attn_v_mirror[layer_idx].as_ref().unwrap().ptr as *mut f32;
+            let row_bytes = head_dim * 4;
             for h in 0..n_kv_heads {
-                if !km.upload_at(
-                    (h * max_ctx + pos) * row_bytes,
-                    &kb[h * row_bytes..(h + 1) * row_bytes],
-                ) {
-                    return false;
-                }
-            }
-        }
-        {
-            let vm = self.attn_v_mirror[layer_idx].as_mut().unwrap();
-            for h in 0..n_kv_heads {
-                if !vm.upload_at(
-                    (h * max_ctx + pos) * row_bytes,
-                    &vb[h * row_bytes..(h + 1) * row_bytes],
-                ) {
+                let kd = unsafe { km_base.add((h * max_ctx + pos) * head_dim) } as *mut c_void;
+                let ks = unsafe { pk.add(h * head_dim) } as *const c_void;
+                let vd = unsafe { vm_base.add((h * max_ctx + pos) * head_dim) } as *mut c_void;
+                let vs = unsafe { pv.add(h * head_dim) } as *const c_void;
+                if !unsafe { memcpy_d2d_async(&self.stream, kd, ks, row_bytes) }
+                    || !unsafe { memcpy_d2d_async(&self.stream, vd, vs, row_bytes) }
+                {
                     return false;
                 }
             }
