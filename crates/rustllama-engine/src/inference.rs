@@ -4157,26 +4157,6 @@ impl ContiguousEngine {
         self.model.cfg.moe.is_some()
     }
 
-    /// E4 phase 4c: does this engine's model carry Multi-Token
-    /// Prediction heads suitable for same-model speculative
-    /// decoding? When `true`, the streaming dispatcher can choose
-    /// the MTP-driven speculation path (via
-    /// [`forward_one_with_mtp_drafts_via_backend`] +
-    /// [`crate::speculative::MtpDrafter`] + the existing
-    /// `verify_speculation` + `accept_reject` pipeline) instead of
-    /// requiring a separate draft `Engine` to be loaded.
-    ///
-    /// Currently false for paged-KV-backed engines even when the
-    /// model declares MTP heads — the paged variant of
-    /// `forward_one_with_mtp_logits` is a follow-up.
-    pub fn supports_mtp_drafting(&self) -> bool {
-        if self.model.cfg.n_mtp_heads == 0 {
-            return false;
-        }
-        let state = self.state.lock().expect("state lock");
-        matches!(state.kv_backend, KvBackend::Contiguous(_))
-    }
-
     pub fn n_layers(&self) -> usize {
         self.model.cfg.n_layers
     }
@@ -4227,7 +4207,7 @@ impl ContiguousEngine {
                     return Err(ContiguousEngineError::Other(format!(
                         "kv_bias_path is set but the KV cache dtype is {dtype:?}; \
                          the K mean-centering bias applies to q4_0 KV only — set \
-                         [inference].kv_dtype/k_dtype/v_dtype = \"q4_0\" or unset kv_bias_path"
+                         [inference].kv_dtype (or k_dtype) = \"q4_0\" or unset kv_bias_path"
                     )));
                 }
                 p.to_path_buf()
@@ -11284,67 +11264,6 @@ fn forward_one_via_backend_hybrid(
             model.forward_one_paged_f16(token_id, pos, cache, store, logits_out);
         }
     }
-}
-
-/// E4 phase 4c: single-call forward + MTP-driven draft proposal.
-///
-/// Runs one main forward to produce `main_logits` for `token_id`
-/// at `pos`, then for each MTP head consumes the head's logit row
-/// via [`crate::speculative::MtpDrafter::propose`] to produce a
-/// `Vec<DraftToken>` (length == `cfg.n_mtp_heads`). The drafts are
-/// what the speculation verifier consumes; the main logits are
-/// the next-token distribution from which the caller commits the
-/// "anchor" token before verification proceeds.
-///
-/// Returns `(main_logits, Vec::new())` when the model has no MTP
-/// heads — callers should then fall through to the existing
-/// non-speculative or n-gram-drafter path.
-///
-/// Contiguous-only for now: paged KV doesn't yet have a paged
-/// counterpart of `LlamaModel::forward_one_with_mtp_logits`. The
-/// dispatcher fast-fails on paged with `EngineError::Unimplemented`
-/// rather than silently falling back, so the engine surface stays
-/// honest about which backend supports MTP.
-#[allow(dead_code)] // Reserved for the streaming MTP dispatch path.
-fn forward_one_with_mtp_drafts_via_backend(
-    model: &LlamaModel,
-    backend: &mut KvBackend,
-    token_id: i32,
-    pos: u32,
-    drafter: crate::speculative::MtpDrafter,
-) -> std::result::Result<(Vec<f32>, Vec<crate::speculative::DraftToken>), crate::EngineError> {
-    let cfg = &model.cfg;
-    let mut main_logits = vec![0f32; cfg.vocab_size];
-    let n_heads = cfg.n_mtp_heads as usize;
-    let mut head_logits: Vec<Vec<f32>> = (0..n_heads).map(|_| vec![0f32; cfg.vocab_size]).collect();
-
-    match backend {
-        KvBackend::Contiguous(kv) => {
-            model.forward_one_with_mtp_logits(
-                token_id,
-                pos,
-                kv,
-                &mut main_logits,
-                &mut head_logits,
-            );
-        }
-        KvBackend::Paged { .. }
-        | KvBackend::PagedQ8_0 { .. }
-        | KvBackend::PagedTQ { .. }
-        | KvBackend::PagedNvfp4 { .. }
-        | KvBackend::PagedMxfp4 { .. }
-        | KvBackend::PagedMxfp6 { .. }
-        | KvBackend::PagedMxfp8 { .. }
-        | KvBackend::PagedF16 { .. } => {
-            return Err(crate::EngineError::Unimplemented(
-                "MTP drafting on paged KV backend (forward_one_with_mtp_logits_paged is a \
-                 follow-up; use the contiguous backend for MTP-driven speculation)",
-            ));
-        }
-    }
-
-    let drafts = drafter.propose(&head_logits);
-    Ok((main_logits, drafts))
 }
 
 /// MoE tiered-expert VRAM-budget projection (P20) — the pure, unit-tested core of

@@ -32,7 +32,6 @@ pub mod prefix_cache;
 pub mod sampler_gpu;
 pub mod sampling;
 pub mod speculative;
-pub mod sycl_accel;
 pub mod sycl_resources;
 pub mod tool_grammar;
 pub mod tuner_apply;
@@ -53,6 +52,11 @@ pub use rustllama_models::accel::set_flash_v3_kv_tiles;
 /// tensor to route through the base `matvec_tensor_dispatch` hook).
 pub use rustllama_models::accel::set_fusions_disabled;
 pub use rustllama_models::accel::set_synthetic_run;
+/// P6 `kv:usm` banking probe HW gate (cli `gpu_parity::collect_kv_usm_verdict`):
+/// a dedicated SYCL GPU's VRAM proxy — `Some` only on Arc/PVC, `None` on an
+/// integrated iGPU (Iris Xe) / non-SYCL host. USM-resident KV only helps where
+/// this is `Some` (host-backed USM on an iGPU gains nothing).
+pub use rustllama_models::accel::sycl_dedicated_vram_bytes;
 pub use rustllama_models::accel::{amd_npu_perf_probe, npu_perf_probe};
 pub use rustllama_models::accel::{
     set_hybrid_kv_any, set_prefill_batched_hybrid, set_ssm_prefill_chunked, set_zerocopy_weights,
@@ -63,7 +67,6 @@ pub use rustllama_models::kv_bias;
 pub use rustllama_models::llama_arch::kv_whitening_active_for;
 pub use rustllama_models::llama_arch::KvDtype;
 pub use rustllama_models::vision_arch::PlaceholderMode;
-pub use sycl_accel::{SyclAccelError, SyclAccelerator};
 pub use sycl_resources::{SyclEngineResources, SyclResourcesError, UsmRawBuffer};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

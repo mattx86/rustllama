@@ -856,6 +856,174 @@ pub fn collect_sampler_gpu_verdict() -> Vec<(String, Option<bool>)> {
     vec![(key, Some(faster))]
 }
 
+/// P6 — bank the `kv:usm` verdict: ON only on a DEDICATED SYCL GPU (Arc/PVC)
+/// where keeping the KV cache in a persistent USM-resident buffer across
+/// decodes is BOTH correct AND faster than re-staging it from host each call.
+/// Gates `llama_arch::try_open_usm_kv_stream` (the `VERDICT_KV_USM` reader).
+///
+/// HW-gated (fail-closed): on an integrated iGPU (Iris Xe), Apple, CUDA, or no
+/// SYCL, [`rustllama_engine::sycl_dedicated_vram_bytes`] is `None` and we SKIP
+/// (no verdict) — USM there is host-backed, so there is no per-decode H2D to
+/// avoid and the host-KV path is already optimal. This is the exact reason a
+/// raw-bandwidth micro-bench was rejected: it would mis-read the win. WRITE-
+/// BLIND: no discrete Intel GPU here, so this SKIPs locally; the A/B + verdict
+/// are validated on a real Arc/PVC.
+///
+/// A/B: the SAME `flash_attn_decode_usm` kernel runs over a KV cache that is
+/// (A) allocated USM-resident ONCE and reused each iteration, vs (B) re-
+/// allocated + re-uploaded from host every iteration — so B pays the per-
+/// decode KV migration/H2D that A avoids (on a dGPU; on an iGPU shared USM is
+/// host memory, so A≈B — a second, implicit fail-closed guard under the HW
+/// gate). Correctness: A's output vs the CPU reference (cos/max_rel, as the
+/// `attn:decode_*` probes). Perf: A-loop < B-loop. Bank ON only if correct AND
+/// faster; else `Some(false)` (fail-closed).
+pub fn collect_kv_usm_verdict() -> Vec<(String, Option<bool>)> {
+    let key = rustllama_tuner::VERDICT_KV_USM.to_string();
+    // HW gate — dedicated SYCL VRAM only (Some ⇒ Arc/PVC; None ⇒ iGPU / no SYCL).
+    if rustllama_engine::sycl_dedicated_vram_bytes().is_none() {
+        return vec![(key, None)];
+    }
+    let stream = match sk::create_stream(0) {
+        Ok(s) => s,
+        Err(_) => return vec![(key, None)],
+    };
+
+    // Synthesize KV + query at the real target-model attention geometry.
+    let kv_elems = AT_KV_HEADS * AT_MAX_CTX * AT_HEAD_DIM;
+    let mut rng = XorShift(0xC0FFEE11);
+    let fill_kv = |rng: &mut XorShift| -> Vec<f32> {
+        let mut v = vec![0f32; kv_elems];
+        for h in 0..AT_KV_HEADS {
+            for t in 0..AT_KV_LEN {
+                for d in 0..AT_HEAD_DIM {
+                    v[(h * AT_MAX_CTX + t) * AT_HEAD_DIM + d] = rng.f32_pm(0.6);
+                }
+            }
+        }
+        v
+    };
+    let kcache = fill_kv(&mut rng);
+    let vcache = fill_kv(&mut rng);
+    let q: Vec<f32> = (0..AT_HEADS * AT_HEAD_DIM)
+        .map(|_| rng.f32_pm(0.6))
+        .collect();
+    // Full-attn passthrough (no window / softcap) — isolates the KV-residency
+    // effect from the windowed/softcap paths graded elsewhere.
+    let (window, softcap) = (0u32, 0.0f32);
+
+    // CPU reference.
+    let mut cpu_out = vec![0f32; AT_HEADS * AT_HEAD_DIM];
+    k::gqa_attention_one_step_capped_windowed(
+        &q,
+        &kcache,
+        &vcache,
+        &mut cpu_out,
+        AT_HEADS,
+        AT_KV_HEADS,
+        AT_HEAD_DIM,
+        AT_MAX_CTX,
+        AT_KV_LEN,
+        window as usize,
+        softcap,
+    );
+
+    // (A) persistent USM-resident buffers. q + out are reused across both
+    // loops; only KV is re-staged in (B), isolating the KV transfer cost.
+    let resident = (|| -> sk::Result<_> {
+        let qb = to_f16_buf(&stream, &q)?;
+        let kb = to_f16_buf(&stream, &kcache)?;
+        let vb = to_f16_buf(&stream, &vcache)?;
+        let ob = sk::SyclSharedBuffer::<u16>::alloc(&stream, AT_HEADS * AT_HEAD_DIM)?;
+        Ok((qb, kb, vb, ob))
+    })();
+    let (qb, kb, vb, mut ob) = match resident {
+        Ok(t) => t,
+        Err(_) => return vec![(key, None)], // can't alloc → capability SKIP
+    };
+
+    let decode = |kb: &sk::SyclSharedBuffer<u16>,
+                  vb: &sk::SyclSharedBuffer<u16>,
+                  ob: &mut sk::SyclSharedBuffer<u16>|
+     -> sk::Result<()> {
+        sk::flash_attn_decode_usm(
+            &stream,
+            &qb,
+            kb,
+            vb,
+            ob,
+            AT_HEADS as u32,
+            AT_KV_HEADS as u32,
+            AT_HEAD_DIM as u32,
+            AT_MAX_CTX as u32,
+            AT_KV_LEN as u32,
+            window,
+            softcap,
+        )
+    };
+
+    // Correctness: resident-path output vs CPU reference.
+    if let Err(e) = decode(&kb, &vb, &mut ob) {
+        emit(&key, "KERNEL_ERR", &format!("{e}"));
+        return vec![(key, Some(false))];
+    }
+    let gpu_out: Vec<f32> = ob
+        .as_slice()
+        .iter()
+        .map(|&b| half::f16::from_bits(b).to_f32())
+        .collect();
+    let (cos, max_rel) = compare(&gpu_out, &cpu_out);
+    if !(cos > 0.99 && max_rel < 0.05) {
+        emit(
+            &key,
+            "MISCOMPUTE",
+            &format!("cos={cos:.6} max_rel={max_rel:.4}"),
+        );
+        return vec![(key, Some(false))];
+    }
+
+    const ITERS: usize = 64;
+    // Warm up (first dispatch pays JIT + initial migration).
+    for _ in 0..4 {
+        let _ = decode(&kb, &vb, &mut ob);
+    }
+    // Perf A: reuse the resident KV each iteration — only the kernel runs.
+    let ta = Instant::now();
+    for _ in 0..ITERS {
+        let _ = decode(&kb, &vb, &mut ob);
+    }
+    let t_resident = ta.elapsed().as_secs_f64();
+
+    // Perf B: re-stage KV (alloc + host→USM write) each iteration, then run
+    // the same kernel — the per-decode KV transfer the resident buffer avoids.
+    let tb = Instant::now();
+    for _ in 0..ITERS {
+        let restaged = (|| -> sk::Result<_> {
+            let kb2 = to_f16_buf(&stream, &kcache)?;
+            let vb2 = to_f16_buf(&stream, &vcache)?;
+            Ok((kb2, vb2))
+        })();
+        let (kb2, vb2) = match restaged {
+            Ok(t) => t,
+            Err(_) => return vec![(key, None)],
+        };
+        let _ = decode(&kb2, &vb2, &mut ob);
+    }
+    let t_restage = tb.elapsed().as_secs_f64();
+
+    let faster = t_resident < t_restage;
+    let status = if faster { "OK" } else { "SLOW" };
+    emit(
+        &key,
+        status,
+        &format!(
+            "cos={cos:.6} resident={:.2}ms restage={:.2}ms",
+            t_resident * 1e3,
+            t_restage * 1e3
+        ),
+    );
+    vec![(key, Some(faster))]
+}
+
 /// Intel NPU compute-offload verdicts for `tune --validate-kernels`:
 ///   - `npu:matmul_f32` — CORRECTNESS: the NPU MatMul (Phase 5, OpenVINO) matched
 ///     the CPU reference (parity).

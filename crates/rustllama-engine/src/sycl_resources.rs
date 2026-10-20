@@ -45,10 +45,9 @@
 use rustllama_kernels_sycl as sk;
 use std::ptr::NonNull;
 
-/// Errors from [`SyclEngineResources`] construction. Distinct from
-/// [`crate::SyclAccelError`] because resources own the whole engine
-/// view of SYCL (not just a one-shot kernel call), so the failure
-/// modes need their own classification.
+/// Errors from [`SyclEngineResources`] construction. These own the whole
+/// engine view of SYCL (not just a one-shot kernel call), so the failure
+/// modes have their own classification.
 #[derive(Debug, thiserror::Error)]
 pub enum SyclResourcesError {
     #[error("SYCL unavailable: {0}")]

@@ -451,25 +451,18 @@ pub struct InferenceConfig {
     /// { "model_id": "qwen2.5-coder-7b", "kv_dtype": "q8_0" }
     /// ```
     pub kv_dtype: String,
-    /// Optional explicit K-cache dtype. When unset (the default),
-    /// the engine uses [`Self::kv_dtype`] for both K and V. Set this
-    /// alongside [`Self::v_dtype`] to use distinct per-channel
-    /// dtypes — e.g. `k_dtype = "tq4"`, `v_dtype = "q8_0"` (V
-    /// matters more for attention output quality, so a heavier
-    /// V dtype + lighter K dtype is a common quality/memory
-    /// trade-off).
+    /// Optional explicit KV-cache dtype override. When unset (the
+    /// default), the engine uses [`Self::kv_dtype`] for the KV cache.
+    /// When set, this overrides it — the engine couples K and V into a
+    /// single `KvLayer` variant per dtype, so this one dtype is what
+    /// reaches the attention kernels for both K and V.
     ///
-    /// **Status:** the config + GUI accept split dtypes today, but
-    /// engine storage couples K and V into a single `KvLayer` enum
-    /// variant per dtype. When the resolved K and V differ, K's
-    /// dtype is what actually reaches the attention kernels and a
-    /// `WARN` is emitted at load. Per-side KV storage (the path
-    /// that makes V's setting take effect) is a follow-up.
+    /// Per-side K/V storage (a distinct `v_dtype`) is a follow-up; until
+    /// it lands there is only this one effective KV dtype, so there is no
+    /// separate V setting to honor — `v_dtype` was removed rather than
+    /// kept as a silent no-op.
     #[serde(default)]
     pub k_dtype: Option<String>,
-    /// Optional explicit V-cache dtype. See [`Self::k_dtype`].
-    #[serde(default)]
-    pub v_dtype: Option<String>,
     /// Optional K-cache mean-centering bias sidecar (GGUF, fork
     /// `kv_bar` format — see `rustllama-models::kv_bias`). When unset,
     /// the engine auto-discovers `<model stem>.kvbias.gguf` next to
@@ -900,18 +893,14 @@ fn default_lookahead_window() -> u32 {
 }
 
 impl InferenceConfig {
-    /// Resolve the per-channel K and V dtype strings. `k_dtype` /
-    /// `v_dtype` override `kv_dtype` when explicitly set; otherwise
-    /// both fall back to `kv_dtype`. The returned strings are still
-    /// raw config strings — callers parse them via
-    /// `rustllama_engine::KvDtype::parse`. When K and V differ,
-    /// callers should warn (current engine storage couples K and V,
-    /// so K's dtype is what reaches the kernels) — see the docstring
-    /// on [`Self::k_dtype`] for the roadmap.
-    pub fn resolved_kv_dtypes(&self) -> (&str, &str) {
-        let k = self.k_dtype.as_deref().unwrap_or(self.kv_dtype.as_str());
-        let v = self.v_dtype.as_deref().unwrap_or(self.kv_dtype.as_str());
-        (k, v)
+    /// Resolve the effective KV-cache dtype string. `k_dtype` overrides
+    /// `kv_dtype` when explicitly set; otherwise falls back to `kv_dtype`.
+    /// The engine couples K and V into one `KvLayer` per dtype, so this
+    /// single dtype reaches the kernels for both. The returned string is
+    /// still a raw config string — callers parse it via
+    /// `rustllama_engine::KvDtype::parse`.
+    pub fn resolved_kv_dtype(&self) -> &str {
+        self.k_dtype.as_deref().unwrap_or(self.kv_dtype.as_str())
     }
 }
 
@@ -1063,7 +1052,6 @@ impl Default for InferenceConfig {
             // The Settings page exposes this field as a dropdown.
             kv_dtype: "f32".to_string(),
             k_dtype: None,
-            v_dtype: None,
             kv_bias_path: None,
             max_tool_iterations: 8,
             keep_quant_raw: false,
@@ -1629,21 +1617,6 @@ pub fn validate(cfg: &Config) -> Result<()> {
                 .to_string(),
         ));
     }
-    // I2: K and V cache dtypes must match. The engine's KV storage is a
-    // coupled `KvLayer` enum — one variant pairs K and V at a single dtype, so
-    // a config that sets `v_dtype != k_dtype` does NOT get per-side storage:
-    // V silently uses K's dtype and the config lies about what's running.
-    // Reject at load (the single source of truth) until per-side KV storage
-    // (M6/F4) makes distinct dtypes real.
-    let (k_dtype, v_dtype) = cfg.inference.resolved_kv_dtypes();
-    if !k_dtype.eq_ignore_ascii_case(v_dtype) {
-        return Err(ConfigError::Validation(format!(
-            "[inference].k_dtype (\"{k_dtype}\") and v_dtype (\"{v_dtype}\") differ — the \
-             engine couples K/V storage today, so distinct per-side dtypes would be \
-             silently ignored (V would use K's). Set them equal (or use the single \
-             [inference].kv_dtype) until per-side KV storage lands."
-        )));
-    }
     Ok(())
 }
 
@@ -2091,24 +2064,20 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_mismatched_kv_dtypes() {
-        // I2: distinct k_dtype / v_dtype can't be honored (engine couples
-        // K/V), so validate must reject it rather than silently use K's.
+    fn resolved_kv_dtype_overrides_and_falls_back() {
+        // `k_dtype` overrides `kv_dtype` when set; otherwise the single
+        // effective dtype falls back to `kv_dtype`. The engine couples K/V
+        // into one `KvLayer` per dtype, so this one dtype is authoritative
+        // (there is no separate `v_dtype` to reconcile anymore).
         let mut c = Config::default();
-        // Default (both None → kv_dtype for both) is fine.
-        assert!(validate(&c).is_ok());
-        // Equal explicit dtypes are fine.
-        c.inference.k_dtype = Some("q8_0".into());
-        c.inference.v_dtype = Some("q8_0".into());
-        assert!(validate(&c).is_ok());
-        // Differing dtypes are rejected.
-        c.inference.v_dtype = Some("q4_0".into());
-        assert!(validate(&c).is_err());
-        // One side set, the other falling back to kv_dtype and differing.
         c.inference.kv_dtype = "f32".into();
+        // No override → falls back to kv_dtype.
+        assert_eq!(c.inference.resolved_kv_dtype(), "f32");
+        assert!(validate(&c).is_ok());
+        // k_dtype override wins.
         c.inference.k_dtype = Some("q8_0".into());
-        c.inference.v_dtype = None;
-        assert!(validate(&c).is_err());
+        assert_eq!(c.inference.resolved_kv_dtype(), "q8_0");
+        assert!(validate(&c).is_ok());
     }
 
     #[test]

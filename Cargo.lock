@@ -4168,6 +4168,7 @@ dependencies = [
  "anyhow",
  "clap",
  "rustllama-cli",
+ "rustllama-config",
  "rustllama-gguf",
  "rustllama-gui",
  "rustllama-kernels-cuda",

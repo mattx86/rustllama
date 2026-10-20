@@ -3664,21 +3664,10 @@ fn run_placement_sweep_blocking(
         ));
     }
 
-    // Step 3: resolve the K dtype for measurement. K and V can be
-    // configured independently; today's coupled `KvLayer` storage
-    // means the engine actually uses K's dtype for both sides, so
-    // measurement does the same. A V override is logged so the user
-    // sees what landed.
-    let (k, v) = cfg.inference.resolved_kv_dtypes();
-    if k != v {
-        tracing::warn!(
-            k = k,
-            v = v,
-            "split K/V dtypes configured; measurement uses K's dtype \
-             (engine storage couples K/V today — V dtype takes effect once \
-             per-side KV storage lands)"
-        );
-    }
+    // Step 3: resolve the effective KV dtype for measurement. Today's
+    // coupled `KvLayer` storage means the engine uses one dtype for both
+    // K and V, so measurement does the same.
+    let k = cfg.inference.resolved_kv_dtype();
     let kv_dtype = rustllama_engine::KvDtype::parse(&k.to_string()).ok_or_else(|| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3818,16 +3807,7 @@ fn run_batch_size_sweep_blocking(
 ) -> std::result::Result<TuneBatchSizeResponse, (StatusCode, String)> {
     use rustllama_engine::measurement::{measure_batch_size_candidates, MeasurementConfig};
 
-    let (k, v) = cfg.inference.resolved_kv_dtypes();
-    if k != v {
-        tracing::warn!(
-            k = k,
-            v = v,
-            "split K/V dtypes configured; measurement uses K's dtype \
-             (engine storage couples K/V today — V dtype takes effect once \
-             per-side KV storage lands)"
-        );
-    }
+    let k = cfg.inference.resolved_kv_dtype();
     let kv_dtype = rustllama_engine::KvDtype::parse(&k.to_string()).ok_or_else(|| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,

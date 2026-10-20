@@ -20,11 +20,11 @@
 //!   start, installs it for the duration of the request, and the
 //!   guard's `Drop` impl tears it down on the way out.
 //!
-//! Gating: today only [`try_rmsnorm_f32`] is implemented end-to-end.
-//! The other kernels (rope, silu, softmax, gemm) have parity checks
-//! in `rustllama-engine::sycl_accel` but the forward-pass dispatch
-//! lands one kernel at a time so each can be validated independently
-//! on the user's hardware.
+//! Parity: every GPU kernel family here is validated against its CPU
+//! reference by `rustllama doctor --sycl-parity` / `--cuda-parity` /
+//! `--metal-parity` (the harnesses in `rustllama-cli::gpu_parity`), so
+//! each dispatch path can be checked independently on the user's
+//! hardware.
 
 use half::f16;
 use rustllama_kernels_cuda as ck;
@@ -5917,9 +5917,9 @@ pub fn has_sycl_stream() -> bool {
 ///
 /// Conversion: f32 inputs are quantised to f16 bit patterns for the
 /// kernel, then dequantised on output. The CPU kernel also operates
-/// on f32 with the same f16-equivalent precision; the parity check
-/// in [`rustllama_engine::SyclAccelerator::parity_check_rmsnorm`]
-/// verifies the two paths agree within ~1e-2 for d=4096.
+/// on f32 with the same f16-equivalent precision; `doctor
+/// --sycl-parity` verifies the two paths agree within ~1e-2 for
+/// d=4096.
 ///
 /// `n_rows` is implicit: the function assumes `x.len() == y.len()`
 /// and `x.len() % d == 0`, mirroring the CPU kernel's contract.

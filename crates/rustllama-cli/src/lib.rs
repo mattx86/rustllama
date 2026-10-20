@@ -2262,7 +2262,7 @@ fn cmd_tune_moe_placement(
     if repeats == 0 {
         anyhow::bail!("--moe-placement-repeats must be >= 1");
     }
-    let (k, _) = cfg.inference.resolved_kv_dtypes();
+    let k = cfg.inference.resolved_kv_dtype();
     let m_cfg = MeasurementConfig {
         kv_dtype: parse_kv_dtype(k)?,
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
@@ -3315,139 +3315,9 @@ async fn doctor(config_path: &std::path::Path, sycl_smoke: bool) -> anyhow::Resu
             SmokeResult::Fail { reason } => println!("  result   = FAIL: {reason}"),
             SmokeResult::Skipped { reason } => println!("  result   = SKIPPED ({reason})"),
         }
-
-        // Same harness via the new f32-facing SyclAccelerator wrapper.
-        // Exercises the conversion path the engine forward pass will
-        // use once kernel dispatches are wired in. Pinning parity at
-        // this layer (not just the raw FFI) is the safety gate.
-        println!();
-        println!("sycl smoke (all kernels via SyclAccelerator wrapper):");
-        match run_sycl_accel_smoke() {
-            AccelSmoke::Pass(r) => {
-                println!(
-                    "  rmsnorm  = PASS  (max |gpu - cpu| = {:.4e})",
-                    r.rmsnorm_err
-                );
-                println!(
-                    "  embed    = PASS  (max |gpu - cpu| = {:.4e})",
-                    r.embedding_err
-                );
-                println!("  silu_mul = PASS  (max |gpu - cpu| = {:.4e})", r.silu_err);
-                println!("  rope     = PASS  (max |gpu - cpu| = {:.4e})", r.rope_err);
-                println!(
-                    "  softmax  = PASS  (max |gpu - cpu| = {:.4e})",
-                    r.softmax_err
-                );
-                println!("  gemm     = PASS  (max |gpu - cpu| = {:.4e})", r.gemm_err);
-            }
-            AccelSmoke::Fail { reason } => println!("  result   = FAIL: {reason}"),
-            AccelSmoke::Skipped { reason } => {
-                println!("  result   = SKIPPED ({reason})")
-            }
-        }
     }
 
     Ok(())
-}
-
-enum AccelSmoke {
-    Pass(AccelSmokeResults),
-    Fail { reason: String },
-    Skipped { reason: String },
-}
-
-struct AccelSmokeResults {
-    rmsnorm_err: f32,
-    embedding_err: f32,
-    silu_err: f32,
-    rope_err: f32,
-    softmax_err: f32,
-    gemm_err: f32,
-}
-
-/// Exercises [`rustllama_engine::SyclAccelerator`]'s parity-check
-/// methods. These run the f32 → f16 → kernel → f16 → f32 round-trip
-/// the engine forward pass will use, so a PASS here means the wrapper
-/// + the raw FFI are both correct.
-///
-/// Tolerances are scaled to each kernel's compute depth:
-///   - rmsnorm: d=4096 reduction → ~1e-2 typical f16-accumulation error
-///   - embedding: memcpy only → ~1e-4 (single-bit f16 round-trip)
-///   - silu_mul: per-element exp/sigmoid → ~5e-3 (sigmoid is f16-sensitive)
-///   - rope: cos/sin per element → ~1e-2 (trig + f16 round-trip)
-///   - softmax_attn: max + exp + sum → ~5e-3 normalised, bounded
-///   - gemm: K=64 reduction (small), ~5e-2 (f16 mul accumulates)
-fn run_sycl_accel_smoke() -> AccelSmoke {
-    use rustllama_engine::SyclAccelerator;
-    let mut a = match SyclAccelerator::try_new(0) {
-        Ok(a) => a,
-        Err(e) => {
-            return AccelSmoke::Skipped {
-                reason: e.to_string(),
-            }
-        }
-    };
-    let rmsnorm_err = match a.parity_check_rmsnorm(2, 4096, 1e-2) {
-        Ok(e) => e,
-        Err(e) => {
-            return AccelSmoke::Fail {
-                reason: format!("rmsnorm: {e}"),
-            }
-        }
-    };
-    let embedding_err = match a.parity_check_embedding(1024, 256, 1e-4) {
-        Ok(e) => e,
-        Err(e) => {
-            return AccelSmoke::Fail {
-                reason: format!("embedding: {e}"),
-            }
-        }
-    };
-    let silu_err = match a.parity_check_silu_mul(4096, 5e-3) {
-        Ok(e) => e,
-        Err(e) => {
-            return AccelSmoke::Fail {
-                reason: format!("silu_mul: {e}"),
-            }
-        }
-    };
-    // n_heads=4, head_dim=128 covers the typical llama config; pos=17
-    // is arbitrary but non-zero so cos/sin aren't trivial.
-    let rope_err = match a.parity_check_rope(4, 128, 17, 1e-2) {
-        Ok(e) => e,
-        Err(e) => {
-            return AccelSmoke::Fail {
-                reason: format!("rope: {e}"),
-            }
-        }
-    };
-    let softmax_err = match a.parity_check_softmax_attn(2, 4, 64, 5e-3) {
-        Ok(e) => e,
-        Err(e) => {
-            return AccelSmoke::Fail {
-                reason: format!("softmax_attn: {e}"),
-            }
-        }
-    };
-    // Small GEMM — 32x32 @ 32x16. Big enough to exercise the tiled
-    // dispatch, small enough that the kernel runs in <10ms even on
-    // Iris Xe under the H2D + D2H envelope.
-    let gemm_err = match a.parity_check_gemm(32, 16, 32, 5e-2) {
-        Ok(e) => e,
-        Err(e) => {
-            return AccelSmoke::Fail {
-                reason: format!("gemm: {e}"),
-            }
-        }
-    };
-    AccelSmoke::Pass(AccelSmokeResults {
-        rmsnorm_err,
-        embedding_err,
-        silu_err,
-        rope_err,
-        softmax_err,
-        gemm_err,
-    })
 }
 
 enum SmokeResult {
@@ -4181,16 +4051,13 @@ async fn serve(
                 }
                 std::env::set_var("RUSTLLAMA_FLASH_KV_LEN_MIN", applied.to_string());
             }
-            // Resolve the per-channel K and V dtypes from config. If
-            // [inference].k_dtype / v_dtype are set they override
-            // [inference].kv_dtype; otherwise both fall back to the
-            // homogeneous value. Engine storage today is a coupled
-            // `KvLayer` enum that pairs K and V into one variant per
-            // dtype, so K's dtype is what reaches the kernel when the two
-            // differ. I2: `k_dtype != v_dtype` is now REJECTED at
-            // `rustllama_config::validate` (the single source of truth), so by
-            // the time we get here the two always agree — just resolve K.
-            let (k_str, _v_str) = cfg.inference.resolved_kv_dtypes();
+            // Resolve the effective KV dtype from config. If
+            // [inference].k_dtype is set it overrides [inference].kv_dtype;
+            // otherwise it falls back to the homogeneous value. Engine
+            // storage today is a coupled `KvLayer` enum that pairs K and V
+            // into one variant per dtype, so this single dtype reaches the
+            // kernel for both.
+            let k_str = cfg.inference.resolved_kv_dtype();
             // Tuner-cache override for kv_dtype + kv_cache_layout:
             // when the user has the corresponding auto_apply flag
             // on (default) AND a cached winner exists, use that
@@ -6329,16 +6196,8 @@ pub fn measure_placement_candidates(
         measure_placement_candidates as engine_measure_placement, MeasurementConfig,
     };
 
-    let (k, v) = cfg.inference.resolved_kv_dtypes();
-    if k != v {
-        tracing::warn!(
-            k = k,
-            v = v,
-            "split K/V dtypes configured; placement measurement uses K's dtype \
-             (engine storage couples K/V today)"
-        );
-    }
-    let kv_dtype = parse_kv_dtype(&k.to_string())?;
+    let k = cfg.inference.resolved_kv_dtype();
+    let kv_dtype = parse_kv_dtype(k)?;
     let m_cfg = MeasurementConfig {
         kv_dtype,
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
@@ -6498,7 +6357,7 @@ fn cmd_tune_per_device_perf(
     if repeats == 0 {
         anyhow::bail!("--repeats must be >= 1");
     }
-    let (k, _) = cfg.inference.resolved_kv_dtypes();
+    let k = cfg.inference.resolved_kv_dtype();
     let m_cfg = MeasurementConfig {
         kv_dtype: parse_kv_dtype(k)?,
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
@@ -6620,12 +6479,16 @@ fn cmd_tune_validate_kernels() -> anyhow::Result<()> {
     }
     // P5b: in-process correctness+perf collector for the GPU sampler chain (the
     // verdict replacement for the removed RUSTLLAMA_SAMPLER_GPU env gate). SKIPs
-    // → None off SYCL. The `kv:usm` verdict (was RUSTLLAMA_USM_KV) is left
-    // RESERVED + fail-closed OFF: a faithful perf verdict needs a decode A/B
-    // (USM KV's win is GPU-side flash-attention access, which a CPU-side
-    // micro-bench would mis-measure — it would wrongly say OFF on a dGPU), so
-    // its banking stage is a P6 follow-up rather than a misleading micro-probe.
+    // → None off SYCL.
     verdicts.extend(crate::gpu_parity::collect_sampler_gpu_verdict());
+    // P6: the `kv:usm` decode A/B (was RUSTLLAMA_USM_KV). Persistent USM-
+    // resident KV vs per-call host re-staging of the SAME flash-decode kernel —
+    // correct AND faster ⇒ ON. HW-gated to a DEDICATED SYCL GPU (Arc/PVC);
+    // SKIPs → None on an integrated iGPU / CUDA / Apple / no-SYCL (USM is host-
+    // backed there, so there's no per-decode H2D to avoid). This replaces the
+    // deferred micro-bench — the A/B captures the real GPU-side-KV-access win a
+    // CPU-side bandwidth probe would have mis-read.
+    verdicts.extend(crate::gpu_parity::collect_kv_usm_verdict());
 
     // Keep only decided verdicts (OK / MISCOMPUTE); SKIP (capability
     // absent) carries no information and is left unset.
@@ -7280,7 +7143,7 @@ fn cmd_tune_flash_attention(
         anyhow::bail!("--flash-repeats must be >= 1");
     }
 
-    let (k, _) = cfg.inference.resolved_kv_dtypes();
+    let k = cfg.inference.resolved_kv_dtype();
     let m_cfg = MeasurementConfig {
         kv_dtype: parse_kv_dtype(k)?,
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
@@ -7373,7 +7236,7 @@ fn cmd_tune_speculative_mtp(
         anyhow::bail!("--speculative-mtp-repeats must be >= 1");
     }
 
-    let (k, _) = cfg.inference.resolved_kv_dtypes();
+    let k = cfg.inference.resolved_kv_dtype();
     let m_cfg = MeasurementConfig {
         kv_dtype: parse_kv_dtype(k)?,
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
@@ -7445,7 +7308,7 @@ fn cmd_tune_tree_widths(
         anyhow::bail!("--tree-widths-repeats must be >= 1");
     }
 
-    let (k, _) = cfg.inference.resolved_kv_dtypes();
+    let k = cfg.inference.resolved_kv_dtype();
     let m_cfg = MeasurementConfig {
         kv_dtype: parse_kv_dtype(k)?,
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
@@ -7561,7 +7424,7 @@ fn cmd_tune_ssm_prefill_chunked(
         return Ok(());
     }
 
-    let (k, _) = cfg.inference.resolved_kv_dtypes();
+    let k = cfg.inference.resolved_kv_dtype();
     let m_cfg = MeasurementConfig {
         kv_dtype: parse_kv_dtype(k)?,
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
@@ -7620,7 +7483,7 @@ fn parse_u64_candidates(csv: &str, flag: &str) -> anyhow::Result<Vec<u64>> {
 fn perf_knob_measurement_cfg(
     cfg: &rustllama_config::Config,
 ) -> anyhow::Result<rustllama_engine::measurement::MeasurementConfig> {
-    let (k, _) = cfg.inference.resolved_kv_dtypes();
+    let k = cfg.inference.resolved_kv_dtype();
     Ok(rustllama_engine::measurement::MeasurementConfig {
         kv_dtype: parse_kv_dtype(k)?,
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
@@ -7853,7 +7716,7 @@ fn cmd_tune_flash_kv_min(
         anyhow::bail!("--flash-kv-min-candidates produced no values");
     }
 
-    let (k, _) = cfg.inference.resolved_kv_dtypes();
+    let k = cfg.inference.resolved_kv_dtype();
     let m_cfg = MeasurementConfig {
         kv_dtype: parse_kv_dtype(k)?,
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
@@ -7964,7 +7827,7 @@ fn cmd_tune_prefix_snapshots(
         anyhow::bail!("--prefix-snapshots-candidates produced no values");
     }
 
-    let (k, _) = cfg.inference.resolved_kv_dtypes();
+    let k = cfg.inference.resolved_kv_dtype();
     let m_cfg = MeasurementConfig {
         kv_dtype: parse_kv_dtype(k)?,
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
@@ -8083,7 +7946,7 @@ fn cmd_tune_flash_v3_kv_tile(
         }
     }
 
-    let (k, _) = cfg.inference.resolved_kv_dtypes();
+    let k = cfg.inference.resolved_kv_dtype();
     let m_cfg = MeasurementConfig {
         kv_dtype: parse_kv_dtype(k)?,
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
@@ -8216,7 +8079,7 @@ fn cmd_tune_flash_bench(
     if repeats == 0 {
         anyhow::bail!("--flash-v3-kv-tile-repeats must be >= 1");
     }
-    let (k, _) = cfg.inference.resolved_kv_dtypes();
+    let k = cfg.inference.resolved_kv_dtype();
     let m_cfg = MeasurementConfig {
         kv_dtype: parse_kv_dtype(k)?,
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
@@ -8301,7 +8164,7 @@ fn cmd_tune_kv_page_size(
         anyhow::bail!("--kv-page-size-candidates produced no values");
     }
 
-    let (k, _) = cfg.inference.resolved_kv_dtypes();
+    let k = cfg.inference.resolved_kv_dtype();
     let m_cfg = MeasurementConfig {
         kv_dtype: parse_kv_dtype(k)?,
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
@@ -8407,7 +8270,7 @@ fn cmd_tune_kv_layout(
         anyhow::bail!("--kv-layout-repeats must be >= 1");
     }
 
-    let (k, _) = cfg.inference.resolved_kv_dtypes();
+    let k = cfg.inference.resolved_kv_dtype();
     let m_cfg = MeasurementConfig {
         kv_dtype: parse_kv_dtype(k)?,
         // Overridden per candidate by the measurement loop.
@@ -10618,16 +10481,8 @@ pub fn measure_batch_size_candidates(
         measure_batch_size_candidates as engine_measure_batch, MeasurementConfig,
     };
 
-    let (k, v) = cfg.inference.resolved_kv_dtypes();
-    if k != v {
-        tracing::warn!(
-            k = k,
-            v = v,
-            "split K/V dtypes configured; batch-size measurement uses K's dtype \
-             (engine storage couples K/V today)"
-        );
-    }
-    let kv_dtype = parse_kv_dtype(&k.to_string())?;
+    let k = cfg.inference.resolved_kv_dtype();
+    let kv_dtype = parse_kv_dtype(k)?;
     let m_cfg = MeasurementConfig {
         kv_dtype,
         kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
@@ -10823,23 +10678,10 @@ fn bench(
     let model_path = effective_model_path(model_override.map(str::to_string), &cfg, config_path)?;
     let ctx_size = ctx_size_override
         .unwrap_or_else(|| resolve_config_ctx(cfg.inference.ctx_size, &model_path) as usize);
-    // Override-or-config K/V dtype. When K and V differ in config,
-    // bench uses K's dtype (matches engine storage which couples
-    // K/V today) and warns. `--kv-dtype` overrides both.
+    // Override-or-config KV dtype. `--kv-dtype` overrides the config.
     let kv_dtype_str = match kv_dtype_override {
         Some(s) => s.to_string(),
-        None => {
-            let (k, v) = cfg.inference.resolved_kv_dtypes();
-            if k != v {
-                tracing::warn!(
-                    k = k,
-                    v = v,
-                    "split K/V dtypes configured; bench uses K's dtype \
-                     (engine storage couples K/V today)"
-                );
-            }
-            k.to_string()
-        }
+        None => cfg.inference.resolved_kv_dtype().to_string(),
     };
     let kv_dtype = parse_kv_dtype(&kv_dtype_str)?;
     let flash_enabled = flash_override.unwrap_or(cfg.inference.flash_attention);

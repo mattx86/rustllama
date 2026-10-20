@@ -209,7 +209,7 @@ commands in the chat REPL/TUI mirror this verb set):
 
 - `config.toml` sections: `[model]` (path/hub, chat_template, `mmproj`, `lora`,
   `eagle_head`), `[inference]` (n_gpu_layers, ctx_size,
-  batch_size, kv_dtype/k_dtype/v_dtype, flash_attention, speculative_ngram,
+  batch_size, kv_dtype (k_dtype overrides it), flash_attention, speculative_ngram,
   moe_placement, lock_ram_mb, `[inference.placement]`), `[server]`
   (bind_addr, **port 11434** default, api_key, require_auth_loopback,
   max_loaded_models, `concurrency`, `max_pending_per_model`), `[ui]`,
@@ -415,7 +415,9 @@ ID can replace `-` later). Packaging helpers: `_release_package.ps1` (bsdtar),
   (the Iris-Xe/OpenCL garbage incident now auto-detects as MISCOMPUTE → stays
   off); mixed-precision matvec → per-dtype `matvec_f16in:<dtype>` (graded vs an
   f16-roundtrip ref AND perf-gated); GPU sampler → `sampler:gpu` (correct AND
-  faster); USM KV → `kv:usm` (perf; reserved, banking stage is P6); GPU
+  faster); USM KV → `kv:usm` (perf; banked by `collect_kv_usm_verdict` — a
+  persistent-USM-vs-host-restage decode A/B, HW-gated to a dedicated SYCL GPU,
+  write-blind off Arc/PVC); GPU
   quantize-dequant → `dequant:gpu` (the `quantize` cmd reads it and passes the
   decision into the toolchain-free gguf pipeline). `fused_out_proj_norm` is
   fail-closed OFF until its composite `fused:out_proj_norm` verdict lands (P6).

@@ -47,6 +47,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 rustllama-cli = { path = "../../crates/rustllama-cli", default-features = false }
 rustllama-runtime = { path = "../../crates/rustllama-runtime" }
+# Read `[server].port` so the GUI's embedded-server pre-flight probe and
+# HTTP client target the port the embedded `serve` actually binds.
+rustllama-config = { path = "../../crates/rustllama-config" }
 # The GUI's quantize page drives the gguf encode pipeline directly.
 rustllama-gguf = { path = "../../crates/rustllama-gguf", default-features = false }
 # Used directly by `run_gui` for the startup SYCL device-probe log

@@ -35,7 +35,7 @@ to override the planner.
 | `-fa, --flash-attn` | fused flash-attention kernel | `[inference].flash_attention` (default **on**, autotuned; `[inference].flash_attention_kv_min` sets the KV-length break-even) |
 | `-b, --batch-size N` | prompt batch size | `[inference].batch_size` (autotuned) |
 | `-t, --threads N` | CPU threads | `[inference].threads` (autotuned via `tune --threads`) |
-| `-ctk/-ctv, --cache-type-k/v` | KV-cache dtype (e.g. `q8_0`) | `[inference].kv_dtype` (both) or `k_dtype` / `v_dtype` (per-side); autotuned, with a coherence guardrail that can force `f32` |
+| `-ctk/-ctv, --cache-type-k/v` | KV-cache dtype (e.g. `q8_0`) | `[inference].kv_dtype` (`k_dtype` overrides it); autotuned, with a coherence guardrail that can force `f32`. Engine storage couples K and V into one dtype, so there is a single effective KV dtype — a distinct per-side `v_dtype` is a follow-up |
 | `--temp N` | sampling temperature | request `temperature` / `generate --temperature` (default **0.7**; `0` = greedy) |
 | `--top-k N` | keep top-K tokens | request `top_k` / `generate --top-k` (default **40**; `0` = off). *(rustllama accepts `top_k` on its OpenAI endpoint as an extension.)* |
 | `--top-p N` | nucleus sampling | request `top_p` / `generate --top-p` (default **0.95**; `1.0` = off) |

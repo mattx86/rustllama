@@ -266,7 +266,6 @@ struct SettingsDraft {
     kv_dtype: String,
     /// "" = inherit `kv_dtype` (written back as JSON null).
     k_dtype: String,
-    v_dtype: String,
     flash_attention: bool,
     speculative_ngram: bool,
     prefix_cache: bool,
@@ -4409,7 +4408,11 @@ impl GuiApp {
         let mut profile_sel = self.settings_profile_sel.clone();
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(BG).inner_margin(Margin::same(16.0)))
+            .frame(
+                egui::Frame::default()
+                    .fill(BG)
+                    .inner_margin(Margin::same(16.0)),
+            )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -4421,7 +4424,9 @@ impl GuiApp {
                             // config.toml by hand). Discards unsaved form edits.
                             if ui
                                 .add_enabled(!saving, egui::Button::new("Reload"))
-                                .on_hover_text("Re-read config.toml from disk (discards unsaved edits)")
+                                .on_hover_text(
+                                    "Re-read config.toml from disk (discards unsaved edits)",
+                                )
                                 .clicked()
                             {
                                 actions.push(Action::ReloadSettings);
@@ -4481,76 +4486,138 @@ impl GuiApp {
                             let dirty = orig.as_ref().map_or(false, |o| *draft != *o);
 
                             collapsing_section(ui, "Server", "restart", |ui| {
-                                form_text(ui, "Bind address",
+                                form_text(
+                                    ui,
+                                    "Bind address",
                                     "127.0.0.1 = localhost only · 0.0.0.0 = LAN",
-                                    &mut draft.bind_addr);
+                                    &mut draft.bind_addr,
+                                );
                                 form_text(ui, "Port", "default 11434", &mut draft.port);
-                                form_text(ui, "API key",
+                                form_text(
+                                    ui,
+                                    "API key",
                                     "Empty = no auth. Sent as `Authorization: Bearer <key>`.",
-                                    &mut draft.api_key);
-                                form_num(ui, "Max loaded models",
+                                    &mut draft.api_key,
+                                );
+                                form_num(
+                                    ui,
+                                    "Max loaded models",
                                     "Warm pool cap (LRU evicts non-default models).",
-                                    &mut draft.max_loaded_models, 1.0..=64.0);
-                                form_text(ui, "CORS origins",
+                                    &mut draft.max_loaded_models,
+                                    1.0..=64.0,
+                                );
+                                form_text(
+                                    ui,
+                                    "CORS origins",
                                     "Comma-separated. Empty = none. `*` allows any origin.",
-                                    &mut draft.cors_origins);
+                                    &mut draft.cors_origins,
+                                );
                             });
 
                             collapsing_section(ui, "Model", "reload", |ui| {
-                                form_text(ui, "GGUF path",
+                                form_text(
+                                    ui,
+                                    "GGUF path",
                                     "Absolute path. Mutually exclusive with the hub ref.",
-                                    &mut draft.model_path);
-                                form_text(ui, "Hub ref",
+                                    &mut draft.model_path,
+                                );
+                                form_text(
+                                    ui,
+                                    "Hub ref",
                                     "owner/repo:filename.gguf — resolved from the local cache.",
-                                    &mut draft.model_hub);
-                                form_text(ui, "Chat template",
+                                    &mut draft.model_hub,
+                                );
+                                form_text(
+                                    ui,
+                                    "Chat template",
                                     "auto = read from the GGUF · chatml / llama3 / inline Jinja.",
-                                    &mut draft.chat_template);
+                                    &mut draft.chat_template,
+                                );
                             });
 
                             collapsing_section(ui, "Inference", "reload", |ui| {
-                                form_num(ui, "Context size",
+                                form_num(
+                                    ui,
+                                    "Context size",
                                     "Max tokens (prompt + completion) per request.",
-                                    &mut draft.ctx_size, 512.0..=1_048_576.0);
-                                form_num(ui, "Batch size",
+                                    &mut draft.ctx_size,
+                                    512.0..=1_048_576.0,
+                                );
+                                form_num(
+                                    ui,
+                                    "Batch size",
                                     "Prefill chunk. Larger = faster but more RAM per chunk.",
-                                    &mut draft.batch_size, 1.0..=65_536.0);
-                                form_num(ui, "Threads", "0 = auto (physical cores).",
-                                    &mut draft.threads, 0.0..=256.0);
-                                form_combo(ui, "kv_dtype_combo", "KV dtype (both K and V)",
-                                    "Default for both K and V; override per-channel below to split.",
-                                    &mut draft.kv_dtype, &KV_DTYPES);
-                                form_combo(ui, "k_dtype_combo", "K dtype (override)",
-                                    "Empty = use KV dtype.",
-                                    &mut draft.k_dtype, &KV_DTYPES_OPT);
-                                form_combo(ui, "v_dtype_combo", "V dtype (override)",
-                                    "Empty = use KV dtype. V is more precision-sensitive than K.",
-                                    &mut draft.v_dtype, &KV_DTYPES_OPT);
-                                form_bool(ui, "Flash attention",
+                                    &mut draft.batch_size,
+                                    1.0..=65_536.0,
+                                );
+                                form_num(
+                                    ui,
+                                    "Threads",
+                                    "0 = auto (physical cores).",
+                                    &mut draft.threads,
+                                    0.0..=256.0,
+                                );
+                                form_combo(
+                                    ui,
+                                    "kv_dtype_combo",
+                                    "KV dtype",
+                                    "The KV-cache dtype. Lower precision cuts KV memory.",
+                                    &mut draft.kv_dtype,
+                                    &KV_DTYPES,
+                                );
+                                form_combo(
+                                    ui,
+                                    "k_dtype_combo",
+                                    "KV dtype (override)",
+                                    "Empty = use KV dtype above.",
+                                    &mut draft.k_dtype,
+                                    &KV_DTYPES_OPT,
+                                );
+                                form_bool(
+                                    ui,
+                                    "Flash attention",
                                     "Fused softmax-attention (no-op until SYCL dispatch wires up).",
-                                    &mut draft.flash_attention);
-                                form_bool(ui, "Speculative decoding (n-gram)",
+                                    &mut draft.flash_attention,
+                                );
+                                form_bool(
+                                    ui,
+                                    "Speculative decoding (n-gram)",
                                     "Prompt-lookup drafting + one batched verify per round. No \
                                      second model, zero RAM.",
-                                    &mut draft.speculative_ngram);
-                                form_bool(ui, "Prefix cache",
+                                    &mut draft.speculative_ngram,
+                                );
+                                form_bool(
+                                    ui,
+                                    "Prefix cache",
                                     "Reuse KV for shared prompt prefixes (big speedup for chat / \
                                      coding flows).",
-                                    &mut draft.prefix_cache);
-                                form_bool(ui, "Keep quant raw",
+                                    &mut draft.prefix_cache,
+                                );
+                                form_bool(
+                                    ui,
+                                    "Keep quant raw",
                                     "Skip dequant-to-F16 on small tensors. Saves 1-3 GB on a \
                                      7B-24B model; recommended on ≤16 GB hosts.",
-                                    &mut draft.keep_quant_raw);
+                                    &mut draft.keep_quant_raw,
+                                );
                             });
 
                             collapsing_section(ui, "UI", "live", |ui| {
-                                form_combo(ui, "theme_combo", "Theme",
+                                form_combo(
+                                    ui,
+                                    "theme_combo",
+                                    "Theme",
                                     "`system` follows the OS dark/light setting.",
-                                    &mut draft.theme, &THEMES);
+                                    &mut draft.theme,
+                                    &THEMES,
+                                );
                                 form_num(ui, "Font size", "", &mut draft.font_size, 8.0..=32.0);
-                                form_text(ui, "Code theme",
+                                form_text(
+                                    ui,
+                                    "Code theme",
                                     "Syntax-highlight palette name for assistant code blocks.",
-                                    &mut draft.code_theme);
+                                    &mut draft.code_theme,
+                                );
                             });
 
                             // Save bar.
@@ -4561,8 +4628,10 @@ impl GuiApp {
                                 if ui
                                     .add_enabled(
                                         dirty && !saving,
-                                        egui::Button::new(RichText::new("Save changes").color(TEXT))
-                                            .fill(ACCENT),
+                                        egui::Button::new(
+                                            RichText::new("Save changes").color(TEXT),
+                                        )
+                                        .fill(ACCENT),
                                     )
                                     .clicked()
                                 {
@@ -5737,7 +5806,6 @@ fn draft_from_config(cfg: &serde_json::Value) -> SettingsDraft {
         threads: cfg_u64(cfg, "inference", "threads", 0) as u32,
         kv_dtype: cfg_str(cfg, "inference", "kv_dtype", "f32"),
         k_dtype: cfg_str(cfg, "inference", "k_dtype", ""),
-        v_dtype: cfg_str(cfg, "inference", "v_dtype", ""),
         flash_attention: cfg_bool(cfg, "inference", "flash_attention", false),
         speculative_ngram: cfg_bool(cfg, "inference", "speculative_ngram", false),
         prefix_cache: cfg_bool(cfg, "inference", "prefix_cache", false),
@@ -5807,7 +5875,6 @@ fn apply_draft_to_config(cfg: &mut serde_json::Value, d: &SettingsDraft) {
         Value::String(d.kv_dtype.clone()),
     );
     set_path(cfg, "inference", "k_dtype", str_or_null(&d.k_dtype));
-    set_path(cfg, "inference", "v_dtype", str_or_null(&d.v_dtype));
     set_path(
         cfg,
         "inference",

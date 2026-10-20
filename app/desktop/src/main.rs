@@ -152,25 +152,41 @@ fn run_gui() -> anyhow::Result<()> {
         }
     }
 
-    // Pre-flight: if a `rustllama serve` is already running and
-    // bound to 127.0.0.1:11434, attach to it as a client instead of
+    // Resolve the port the embedded server will bind. The embedded
+    // `serve` below passes `port: None`, so it binds `[server].port`
+    // from the default (binary-relative) config — mirror that exact
+    // resolution here so the pre-flight probe and the GUI client both
+    // target the right socket (a non-default `[server].port` otherwise
+    // left the GUI polling 11434 forever, showing "offline"). On a
+    // config-load miss, fall back to the schema default (11434). Always
+    // connect over loopback regardless of `[server].bind_addr` (which
+    // may be `0.0.0.0`): the GUI talks to its own local server.
+    let server_port = rustllama_config::default_config_path()
+        .and_then(|p| rustllama_config::load(&p).ok())
+        .map(|c| c.server.port)
+        .unwrap_or(11434);
+    let loopback = format!("127.0.0.1:{server_port}");
+
+    // Pre-flight: if a `rustllama serve` is already running and bound to
+    // the loopback server port, attach to it as a client instead of
     // spawning a second server (which would fail with WSAEADDRINUSE
     // / os error 10048 and leave the GUI showing "offline"). A
     // short TCP-connect probe is enough — we don't need to hit
     // /healthz since any listener on that port is presumably ours.
     let preflight = std::net::TcpStream::connect_timeout(
-        &"127.0.0.1:11434".parse().expect("hardcoded socket addr"),
+        &loopback.parse().expect("loopback socket addr"),
         std::time::Duration::from_millis(500),
     );
     let external_server_running = preflight.is_ok();
     tracing::info!(
         external_server_running,
+        server_port,
         preflight_err = preflight.as_ref().err().map(|e| e.to_string()),
-        "pre-flight TCP probe to 127.0.0.1:11434"
+        "pre-flight TCP probe to {loopback}"
     );
     if external_server_running {
         tracing::info!(
-            "found existing rustllama server on 127.0.0.1:11434; \
+            "found existing rustllama server on {loopback}; \
              attaching as client (skipping embedded server)"
         );
     } else {
@@ -263,7 +279,7 @@ fn run_gui() -> anyhow::Result<()> {
     // on the config port; the egui app drives it over HTTP via
     // rustllama-client. The server thread keeps running until process
     // exit (the OS reaps it when the window closes).
-    let base_url = "http://127.0.0.1:11434".to_string(); // TODO: read [server].port
+    let base_url = format!("http://{loopback}");
     rustllama_gui::run_ui(base_url)?;
 
     tracing::info!("rustllama GUI exiting cleanly");
