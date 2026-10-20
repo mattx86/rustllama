@@ -3796,6 +3796,18 @@ pub struct CudaMatvecCache {
     // the caller's `q4k_w4a8_enabled()` decision; forced OFF in the graph twin
     // (the W4A8 wrapper synchronizes, so it is not CUDA-graph-capturable).
     q4k_w4a8: bool,
+    // AirLLM-style layer streaming: a bounded VRAM window that cycles whole
+    // layers' weights through the cache (admit-by-evicting the COLDEST layer)
+    // instead of declining once full. `stream_window_layers == 0` (the default)
+    // keeps the legacy grow-until-budget behavior — BYTE-IDENTICAL. The dispatch
+    // bridge calls `set_layer_tag` before a layer's (or `encode(layer,expert)`'s)
+    // matvecs so `ensure_weight` groups + ages weights by layer; these maps are
+    // keyed PARALLEL to `weights` so `RawDevBuf` is untouched.
+    stream_window_layers: u32,
+    current_layer_tag: u32,
+    tick: u64,
+    layer_keys: HashMap<u32, Vec<usize>>, // layer tag -> its resident weight keys
+    layer_last_used: HashMap<u32, u64>,   // layer tag -> last-touched tick
     used_bytes: usize,
     budget_bytes: usize,
     stream: CudaStream,
@@ -3821,6 +3833,11 @@ impl CudaMatvecCache {
             attn_norms: None,
             attn_graph_exec: Vec::new(),
             q4k_w4a8: false,
+            stream_window_layers: 0,
+            current_layer_tag: 0,
+            tick: 0,
+            layer_keys: HashMap::new(),
+            layer_last_used: HashMap::new(),
             used_bytes: 0,
             budget_bytes,
             stream,
@@ -3837,6 +3854,69 @@ impl CudaMatvecCache {
         self.used_bytes
     }
 
+    /// Enable AirLLM-style layer streaming: `k > 0` lets `ensure_weight` cycle
+    /// whole layers through the cache by evicting the coldest layer to admit a
+    /// new one (rather than declining once the budget is full). `0` (default)
+    /// keeps the legacy grow-until-budget behavior. `k` is advisory (the actual
+    /// window is byte-bounded by `budget_bytes`); it is recorded for diagnostics
+    /// and to flip the admission policy on.
+    pub fn set_stream_window_layers(&mut self, k: u32) {
+        self.stream_window_layers = k;
+    }
+
+    /// Tag the layer — or `encode(layer, expert)` for a MoE expert — whose
+    /// weights the subsequent `ensure_weight` calls belong to. The dispatch
+    /// bridge sets this (under the cache lock) before a layer's matvecs so
+    /// streaming can group weights per layer for whole-layer eviction and age
+    /// them for the LRU. A no-op effect when streaming is off.
+    pub fn set_layer_tag(&mut self, tag: u32) {
+        self.current_layer_tag = tag;
+    }
+
+    /// Remove `key` from whichever layer group currently holds it (used on the
+    /// rare stale-key re-upload path, where a host address now maps to a
+    /// different-sized weight).
+    fn untrack_key(&mut self, key: usize) {
+        for keys in self.layer_keys.values_mut() {
+            if let Some(pos) = keys.iter().position(|&k| k == key) {
+                keys.swap_remove(pos);
+                return;
+            }
+        }
+    }
+
+    /// Evict whole COLDEST layers (never `keep_tag`, the layer being admitted)
+    /// until `need` more bytes fit under `budget_bytes`. Whole-layer eviction
+    /// guarantees a layer is never left half-resident. Returns false when no
+    /// evictable layer remains (everything is the current layer) — the caller
+    /// then declines and falls back to CPU.
+    fn evict_until_fits(&mut self, need: usize, keep_tag: u32) -> bool {
+        while self.used_bytes + need > self.budget_bytes {
+            // Coldest evictable layer: lowest tick, excluding the one being
+            // admitted. (Phase 2 also excludes the prefetch target.)
+            let mut victim: Option<u32> = None;
+            let mut victim_tick: u64 = u64::MAX;
+            for (&t, &tick) in self.layer_last_used.iter() {
+                if t != keep_tag && tick < victim_tick {
+                    victim_tick = tick;
+                    victim = Some(t);
+                }
+            }
+            let Some(victim) = victim else {
+                return false;
+            };
+            if let Some(keys) = self.layer_keys.remove(&victim) {
+                for k in keys {
+                    if let Some(buf) = self.weights.remove(&k) {
+                        self.used_bytes = self.used_bytes.saturating_sub(buf.cap_bytes);
+                    }
+                }
+            }
+            self.layer_last_used.remove(&victim);
+        }
+        true
+    }
+
     /// Drop all cached weights (freeing their device buffers) and reset the
     /// byte counter; the reusable scratch buffers are kept (model-agnostic,
     /// resized on demand). Call on model reload: the weight-cache key is the
@@ -3848,6 +3928,11 @@ impl CudaMatvecCache {
     pub fn clear(&mut self) {
         self.weights.clear();
         self.used_bytes = 0;
+        // Streaming residency bookkeeping is per-model (keyed by host addr like
+        // `weights`), so it must reset on reload too.
+        self.layer_keys.clear();
+        self.layer_last_used.clear();
+        self.tick = 0;
         // Feature 1b: destroy any cached graph executables. Their captured nodes
         // reference this model's device buffers (weights/mirrors/activation slab),
         // which are now evicted; the next model re-captures + re-instantiates from
@@ -3874,8 +3959,17 @@ impl CudaMatvecCache {
     }
 
     /// Ensure `weight_key`'s bytes are resident; upload on first use.
-    /// Returns false if over budget or an alloc/upload fails.
+    /// Returns false if over budget or an alloc/upload fails. Under streaming
+    /// (`stream_window_layers > 0`) an over-budget admission EVICTS the coldest
+    /// whole layer to make room instead of declining.
     fn ensure_weight(&mut self, weight_key: usize, w_bytes: &[u8]) -> bool {
+        // Streaming: age the current layer so the LRU keeps it hot. Untouched
+        // (and the maps stay empty) when streaming is off ⇒ byte-identical.
+        let tag = self.current_layer_tag;
+        if self.stream_window_layers > 0 {
+            self.tick += 1;
+            self.layer_last_used.insert(tag, self.tick);
+        }
         if let Some(existing) = self.weights.get(&weight_key) {
             if existing.cap_bytes == w_bytes.len() {
                 return true;
@@ -3888,9 +3982,18 @@ impl CudaMatvecCache {
             // this is the per-entry safety net.)
             self.used_bytes = self.used_bytes.saturating_sub(existing.cap_bytes);
             self.weights.remove(&weight_key);
+            if self.stream_window_layers > 0 {
+                self.untrack_key(weight_key);
+            }
         }
         if self.used_bytes + w_bytes.len() > self.budget_bytes {
-            return false;
+            // Over budget. Legacy (window 0): decline → the caller falls back to
+            // CPU. Streaming: evict the coldest whole layer(s) — never the one
+            // being admitted — to cycle the window; decline only if nothing is
+            // evictable (everything is the current layer ⇒ window too small).
+            if self.stream_window_layers == 0 || !self.evict_until_fits(w_bytes.len(), tag) {
+                return false;
+            }
         }
         let Some(mut buf) = RawDevBuf::alloc(&self.stream, w_bytes.len()) else {
             return false;
@@ -3900,6 +4003,9 @@ impl CudaMatvecCache {
         }
         self.used_bytes += w_bytes.len();
         self.weights.insert(weight_key, buf);
+        if self.stream_window_layers > 0 {
+            self.layer_keys.entry(tag).or_default().push(weight_key);
+        }
         true
     }
 
