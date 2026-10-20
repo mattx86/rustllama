@@ -18836,30 +18836,40 @@ pub fn try_flash_attn_prefill_mlx_f32(
         {
             return false;
         }
+        // A3 (MLX twin): upload ONLY the valid [0, kv_len) positions of each
+        // kv-head, not the whole max_ctx-strided slab. Every MLX flash-prefill
+        // kernel bounds its t-loop at kv_len_for_q = kv_len_base + q_pos + 1 ≤
+        // kv_len (rsl_mlx.metal), so the tail is never read — bit-exact. On
+        // Apple unified memory the win is smaller (intra-RAM memcpy, not PCIe)
+        // but it still copies less. Device buffer stays full max_ctx so the
+        // kernel's stride indexing is unchanged.
+        let kv_len = kv_len_base + n_new;
+        let head_stride = max_ctx * head_dim; // f32 elems per kv-head
+        let valid_elems = kv_len * head_dim; // valid f32 elems per kv-head
         {
-            let s: &[u8] =
-                unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, mirror_bytes) };
-            if ctx
-                .dev_prefill_k
-                .as_mut()
-                .unwrap()
-                .copy_from_host(s)
-                .is_err()
-            {
-                return false;
+            let buf = ctx.dev_prefill_k.as_mut().unwrap();
+            for h in 0..n_kv_heads {
+                let base = h * head_stride;
+                let src = &k[base..base + valid_elems];
+                let s: &[u8] = unsafe {
+                    std::slice::from_raw_parts(src.as_ptr() as *const u8, valid_elems * 4)
+                };
+                if buf.copy_from_host_at(base * 4, s).is_err() {
+                    return false;
+                }
             }
         }
         {
-            let s: &[u8] =
-                unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, mirror_bytes) };
-            if ctx
-                .dev_prefill_v
-                .as_mut()
-                .unwrap()
-                .copy_from_host(s)
-                .is_err()
-            {
-                return false;
+            let buf = ctx.dev_prefill_v.as_mut().unwrap();
+            for h in 0..n_kv_heads {
+                let base = h * head_stride;
+                let src = &v[base..base + valid_elems];
+                let s: &[u8] = unsafe {
+                    std::slice::from_raw_parts(src.as_ptr() as *const u8, valid_elems * 4)
+                };
+                if buf.copy_from_host_at(base * 4, s).is_err() {
+                    return false;
+                }
             }
         }
         {
@@ -19003,53 +19013,58 @@ fn try_flash_attn_prefill_mlx_quant(
         {
             return false;
         }
-        // Upload the packed slab (+ scales) + Q verbatim. `k_packed` etc. are
-        // caller-owned slices (not `ctx` fields), so there is no aliasing
-        // with the device buffers they copy into.
-        if ctx
-            .dev_prefill_k
-            .as_mut()
-            .unwrap()
-            .copy_from_host(k_packed)
-            .is_err()
+        // A3 (MLX twin): upload only the valid [0, kv_len) positions of each
+        // kv-head (packed rows + per-row scales), not the whole max_ctx-strided
+        // slab. Every MLX quant flash-prefill kernel bounds its t-loop at
+        // kv_len_for_q ≤ kv_len (rsl_mlx.metal), so the stale tail is never
+        // dequantized — bit-exact. Device buffers stay full max_ctx stride so
+        // the kernels' `kv_h * max_ctx + t` indexing is unchanged. `k_packed`
+        // etc. are caller-owned slices (no aliasing with the device buffers).
+        let kv_len = kv_len_base + n_new;
         {
-            return false;
-        }
-        if ctx
-            .dev_prefill_v
-            .as_mut()
-            .unwrap()
-            .copy_from_host(v_packed)
-            .is_err()
-        {
-            return false;
-        }
-        if has_scales {
-            {
-                let s: &[u8] = unsafe {
-                    std::slice::from_raw_parts(k_scales.as_ptr() as *const u8, scales_bytes)
-                };
-                if ctx
-                    .dev_prefill_k_scales
-                    .as_mut()
-                    .unwrap()
-                    .copy_from_host(s)
+            let kb = ctx.dev_prefill_k.as_mut().unwrap();
+            for h in 0..n_kv_heads {
+                let base = h * max_ctx * bytes_per_row;
+                let len = kv_len * bytes_per_row;
+                if kb
+                    .copy_from_host_at(base, &k_packed[base..base + len])
                     .is_err()
                 {
                     return false;
                 }
             }
-            {
-                let s: &[u8] = unsafe {
-                    std::slice::from_raw_parts(v_scales.as_ptr() as *const u8, scales_bytes)
-                };
-                if ctx
-                    .dev_prefill_v_scales
-                    .as_mut()
-                    .unwrap()
-                    .copy_from_host(s)
+        }
+        {
+            let vb = ctx.dev_prefill_v.as_mut().unwrap();
+            for h in 0..n_kv_heads {
+                let base = h * max_ctx * bytes_per_row;
+                let len = kv_len * bytes_per_row;
+                if vb
+                    .copy_from_host_at(base, &v_packed[base..base + len])
                     .is_err()
                 {
+                    return false;
+                }
+            }
+        }
+        if has_scales {
+            let ks = ctx.dev_prefill_k_scales.as_mut().unwrap();
+            for h in 0..n_kv_heads {
+                let base = h * max_ctx; // f32 scales, one per position
+                let src = &k_scales[base..base + kv_len];
+                let s: &[u8] =
+                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, kv_len * 4) };
+                if ks.copy_from_host_at(base * 4, s).is_err() {
+                    return false;
+                }
+            }
+            let vs = ctx.dev_prefill_v_scales.as_mut().unwrap();
+            for h in 0..n_kv_heads {
+                let base = h * max_ctx;
+                let src = &v_scales[base..base + kv_len];
+                let s: &[u8] =
+                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, kv_len * 4) };
+                if vs.copy_from_host_at(base * 4, s).is_err() {
                     return false;
                 }
             }
