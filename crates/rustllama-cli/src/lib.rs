@@ -449,10 +449,7 @@ pub enum Command {
         kv_dtype: bool,
         /// KV-dtype candidates (comma-separated). Default covers every
         /// v1-supported value. Honored only with `--kv-dtype`.
-        #[arg(
-            long,
-            default_value = "f32,f16,bf16,q8_0,q4_0,tq1,tq2,tq4,tq8,nvfp4,mxfp4,mxfp6,mxfp8"
-        )]
+        #[arg(long, default_value = KV_DTYPE_FULL_GRID)]
         kv_dtype_candidates: String,
         /// Flash-attention on/off sweep. Reuses one loaded engine
         /// (flash is a hot toggle). Writes the winner under
@@ -8646,6 +8643,17 @@ fn run_tune_stage_subprocess(
     }
 }
 
+/// The full kv-dtype sweep grid. This is the `--kv-dtype-candidates` arg
+/// default (single source of truth — the arg references this const), and the
+/// sentinel `cmd_tune_all` compares against to detect "user did not override".
+pub const KV_DTYPE_FULL_GRID: &str =
+    "f32,f16,bf16,q8_0,q4_0,tq1,tq2,tq4,tq8,nvfp4,mxfp4,mxfp6,mxfp8";
+/// B3: the trimmed quick-mode kv-dtype grid — f32 + the two common coherent
+/// quants (the realistic winners). The exotic tq*/nvfp4/mxfp* quants (rare
+/// winners, always lossy) are swept only under `--thorough`. Trimming the quick
+/// first-load sweep from 13 to 4 candidates removes ~9 full model reloads.
+const KV_DTYPE_QUICK_GRID: &str = "f32,f16,q8_0,q4_0";
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_tune_all(
     config_path: &std::path::Path,
@@ -8994,6 +9002,19 @@ fn cmd_tune_all(
     if skip(has_kv_dtype) {
         println!("(skipped: kv_dtype winner already cached)");
     } else {
+        // B3: a quick first-load sweep only needs the realistic winners, so trim
+        // the full default grid to KV_DTYPE_QUICK_GRID (13 → 4 reloads). Honor
+        // the full grid under --thorough, and honor an EXPLICIT user grid
+        // verbatim (only the unmodified default is trimmed). For the user's
+        // coherence-f32-forced hybrids f32 still wins — it is in the trimmed set.
+        let kv_grid: &str = if !thorough && kv_dtype_candidates == KV_DTYPE_FULL_GRID {
+            println!(
+                "  (quick: kv-dtype grid trimmed to {KV_DTYPE_QUICK_GRID}; --thorough sweeps all)"
+            );
+            KV_DTYPE_QUICK_GRID
+        } else {
+            kv_dtype_candidates
+        };
         let args_2 = vec![
             "--prompt-tokens".to_string(),
             kv_dtype_prompt_tokens.to_string(),
@@ -9002,7 +9023,7 @@ fn cmd_tune_all(
             "--repeats".to_string(),
             kv_dtype_repeats.to_string(),
             "--kv-dtype-candidates".to_string(),
-            kv_dtype_candidates.to_string(),
+            kv_grid.to_string(),
         ];
         if let Err(e) = run_tune_stage_subprocess(
             config_path,
