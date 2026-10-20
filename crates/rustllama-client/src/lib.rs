@@ -116,6 +116,11 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repeat_penalty: Option<f32>,
+    /// OpenAI `presence_penalty`. `None` → omitted, so the server applies its
+    /// per-model recommended value (e.g. Qwen3/Qwen3.5's `1.0`, which curbs the
+    /// reasoning-model run-on / emoji spiral); `Some` is an explicit override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
     /// Fixed RNG seed for reproducible sampling. `None` → the server picks a
     /// fresh seed each request. Mirrors the web client's `seed` field (see
     /// `the retired web client's api.ts` `streamChat`), which the native GUI's sampling
@@ -2772,6 +2777,7 @@ mod tests {
             top_k: None,
             max_tokens: None,
             repeat_penalty: None,
+            presence_penalty: None,
             seed: None,
             stream: true,
             stream_options: None,
@@ -2779,6 +2785,10 @@ mod tests {
         };
         let v = serde_json::to_value(&base).unwrap();
         assert!(v.get("seed").is_none(), "unset seed must be omitted");
+        assert!(
+            v.get("presence_penalty").is_none(),
+            "unset presence_penalty must be omitted"
+        );
 
         let with_seed = ChatRequest {
             seed: Some(42),

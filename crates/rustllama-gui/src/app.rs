@@ -1569,6 +1569,9 @@ impl GuiApp {
                 top_k: None,
                 max_tokens: None,
                 repeat_penalty: None,
+                // Left None here; the GUI sampling panel doesn't expose presence
+                // penalty, so the server's per-model recommended value applies.
+                presence_penalty: None,
                 seed: None,
                 stream: true,
                 stream_options: Some(StreamOptions {

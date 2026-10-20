@@ -210,6 +210,25 @@ pub enum Command {
         /// isn't a TTY. (Built only with the `tui` feature — on by default.)
         #[arg(long, default_value_t = false)]
         tui: bool,
+        /// Initial sampling overrides. UNSET (the default) means the field is
+        /// OMITTED from the request, so the server applies its per-model
+        /// recommended sampling (e.g. Qwen3/Qwen3.5's run-on-curbing recipe) —
+        /// do NOT set these just to "use defaults". When set, each is the
+        /// session's starting value, still adjustable live via the `/temp`,
+        /// `/top_p`, `/top_k`, `/repeat_penalty`, `/presence_penalty` commands.
+        #[arg(long)]
+        temperature: Option<f32>,
+        #[arg(long)]
+        top_p: Option<f32>,
+        #[arg(long)]
+        top_k: Option<u32>,
+        #[arg(long)]
+        repeat_penalty: Option<f32>,
+        /// Presence penalty (OpenAI). The most effective knob against a
+        /// reasoning model's run-on / emoji spiral. Unset ⇒ server default
+        /// (Qwen3/Qwen3.5 recommend `1.0`).
+        #[arg(long)]
+        presence_penalty: Option<f32>,
     },
     /// One-shot embedding. Sends `input` to `POST /v1/embeddings`
     /// and prints the resulting vector. Useful for `rustllama embed
@@ -1140,7 +1159,19 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             ip,
             port,
             tui,
+            temperature,
+            top_p,
+            top_k,
+            repeat_penalty,
+            presence_penalty,
         } => {
+            let sampling = ChatSampling {
+                temperature,
+                top_p,
+                top_k,
+                repeat_penalty,
+                presence_penalty,
+            };
             // A history subcommand (`chat list` / `show` / …) manages
             // saved chats instead of starting the interactive session.
             if let Some(cmd) = history {
@@ -1174,6 +1205,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                             model,
                             base_url,
                             initial,
+                            sampling,
                         )
                         .await;
                     }
@@ -1190,7 +1222,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     );
                 }
             }
-            chat_repl(&config_path, system, model, base_url, initial).await
+            chat_repl(&config_path, system, model, base_url, initial, sampling).await
         }
         Command::Generate {
             prompt,
@@ -5030,20 +5062,34 @@ async fn unload_model(
 // ----- pull -----
 
 async fn pull(hub_ref_str: &str) -> anyhow::Result<()> {
-    use indicatif::ProgressBar;
+    use indicatif::{ProgressBar, ProgressStyle};
+    use std::time::Duration;
 
     let hub_ref = rustllama_hub::HubRef::parse(hub_ref_str)?;
     let cache_dir = rustllama_hub::default_cache_dir()
         .ok_or_else(|| anyhow::anyhow!("could not resolve cache dir"))?;
     std::fs::create_dir_all(&cache_dir)?;
 
-    // hf-hub draws its OWN byte-progress bar inside `download()` (its API is built
-    // with `.with_progress(true)` whenever we pass `Some`). A second indicatif bar
-    // here would fight it for the same stderr line — the spinner-vs-byte-bar
-    // flicker — so keep ours HIDDEN: pass `Some` only to switch hf-hub's bar ON,
-    // and still `finish`/`println!` below for the completion line.
-    let pb = ProgressBar::hidden();
+    // A single visible byte-progress bar. `download()` streams straight into
+    // `models/` (no hf-hub bar to fight anymore — the flicker is gone) and
+    // drives this bar's length (once Content-Length is known) + position per
+    // chunk; the spinner animates during connect via the steady tick.
+    let dl_bar = |msg: String| -> ProgressBar {
+        let pb = ProgressBar::new(0);
+        pb.enable_steady_tick(Duration::from_millis(120));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} {msg} [{wide_bar:.cyan/blue}] \
+                     {bytes}/{total_bytes} ({bytes_per_sec}, eta {eta})",
+                )
+                .unwrap_or_else(|_| ProgressStyle::default_bar()),
+        );
+        pb.set_message(msg);
+        pb
+    };
 
+    let pb = dl_bar(format!("downloading {}", hub_ref.filename));
     let dst = rustllama_hub::download(&hub_ref, &cache_dir, Some(&pb)).await?;
     pb.finish_and_clear();
     println!("✓ {}", dst.display());
@@ -5058,8 +5104,7 @@ async fn pull(hub_ref_str: &str) -> anyhow::Result<()> {
     match rustllama_hub::hf_repo_files(&hub_ref.repo_id()).await {
         Ok(files) => {
             for comp in rustllama_hub::companion_sidecars(&hub_ref.filename, &files) {
-                // Hidden — hf-hub draws the byte bar (see the main pull above).
-                let cpb = ProgressBar::hidden();
+                let cpb = dl_bar(format!("companion {comp}"));
                 let comp_ref = rustllama_hub::HubRef {
                     owner: hub_ref.owner.clone(),
                     repo: hub_ref.repo.clone(),
@@ -5096,8 +5141,7 @@ async fn pull(hub_ref_str: &str) -> anyhow::Result<()> {
                     || f.rfilename == "generation_config.json"
             });
             if let Some(f) = gen_cfg {
-                // Hidden — hf-hub draws the byte bar (see the main pull above).
-                let gpb = ProgressBar::hidden();
+                let gpb = dl_bar("generation_config.json".to_string());
                 let gen_ref = rustllama_hub::HubRef {
                     owner: hub_ref.owner.clone(),
                     repo: hub_ref.repo.clone(),
@@ -11902,15 +11946,29 @@ pub(crate) fn default_max_tokens(ctx_size: u32) -> u32 {
     base.min(CAP)
 }
 
+/// Initial sampling overrides from the `chat` CLI flags. Each `None` is
+/// OMITTED from the wire request so the server applies its per-model
+/// recommended sampling (e.g. Qwen3/Qwen3.5's run-on-curbing recipe); `Some`
+/// seeds the interactive session (still adjustable via the `/temp`, `/top_p`,
+/// `/top_k`, `/repeat_penalty`, `/presence_penalty` commands).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ChatSampling {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub repeat_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+}
+
 /// Build a REPL chat request. The sampling fields pass through AS-IS: `None`
 /// means the user never set that knob via a `/temp` / `/top_p` / `/top_k` /
-/// `/repeat_penalty` command, so it is OMITTED from the wire request (serde
-/// `skip_serializing_if`) and the server applies its per-model recommended
-/// sampling (or generic default); `Some` is an explicit override that wins.
-/// `max_tokens` (a hard output cap) is always sent, and `allow_clarify` is the
-/// CLARIFY opt-in (`None` when off, so the request is wire-identical to the
-/// plain path). Shared by the main "user typed a message" path and
-/// `/regenerate` so both stay in lockstep.
+/// `/repeat_penalty` / `/presence_penalty` command (or the matching CLI flag),
+/// so it is OMITTED from the wire request (serde `skip_serializing_if`) and the
+/// server applies its per-model recommended sampling (or generic default);
+/// `Some` is an explicit override that wins. `max_tokens` (a hard output cap)
+/// is always sent, and `allow_clarify` is the CLARIFY opt-in (`None` when off,
+/// so the request is wire-identical to the plain path). Shared by the main
+/// "user typed a message" path and `/regenerate` so both stay in lockstep.
 #[allow(clippy::too_many_arguments)]
 fn build_repl_request(
     model: String,
@@ -11920,6 +11978,7 @@ fn build_repl_request(
     top_k: Option<u32>,
     max_tokens: u32,
     repeat_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
     clarify_enabled: bool,
 ) -> rustllama_client::ChatRequest {
     rustllama_client::ChatRequest {
@@ -11930,6 +11989,7 @@ fn build_repl_request(
         top_k,
         max_tokens: Some(max_tokens),
         repeat_penalty,
+        presence_penalty,
         seed: None,
         stream: true,
         stream_options: Some(rustllama_client::StreamOptions {
@@ -11945,6 +12005,7 @@ async fn chat_repl(
     model: Option<String>,
     base_url: Option<String>,
     initial: Vec<rustllama_client::ChatMessage>,
+    sampling: ChatSampling,
 ) -> anyhow::Result<()> {
     use rustllama_client::{ChatMessage, Client};
 
@@ -12017,11 +12078,15 @@ async fn chat_repl(
     // `Some`, which then overrides the recommendation. `max_tokens` is a hard
     // output cap (not a sampling recommendation), so it is always sent — seeded
     // to a generous context-aware default (`/max_tokens <n>` overrides).
-    let mut temperature: Option<f32> = None;
+    // Seeded from the `chat` CLI flags (`--temperature` etc.); each stays `None`
+    // unless the flag was given, so by default the server's per-model
+    // recommendation still applies.
+    let mut temperature: Option<f32> = sampling.temperature;
     let mut max_tokens: u32 = default_max_tokens(ctx_size);
-    let mut top_p: Option<f32> = None;
-    let mut top_k: Option<u32> = None;
-    let mut repeat_penalty: Option<f32> = None;
+    let mut top_p: Option<f32> = sampling.top_p;
+    let mut top_k: Option<u32> = sampling.top_k;
+    let mut repeat_penalty: Option<f32> = sampling.repeat_penalty;
+    let mut presence_penalty: Option<f32> = sampling.presence_penalty;
     // Auto-run tools: OFF prompts approve/deny on each proposed tool call;
     // ON accepts silently. Toggled with `/auto`. (The REPL never executes
     // tools — this only gates the confirmation prompt.)
@@ -12089,7 +12154,7 @@ async fn chat_repl(
                     println!("    /chat delete <name>  delete a saved session");
                     println!("  sampling / output:");
                     println!(
-                        "    /temp <0..2>       sampling temperature (current: {})",
+                        "    /temp <0..2>       sampling temperature; alias /temperature (current: {})",
                         fmt_sampling_opt(temperature)
                     );
                     println!(
@@ -12103,6 +12168,10 @@ async fn chat_repl(
                     println!(
                         "    /repeat_penalty <0.5..2.0>  discourage repeats; 1.0 = off (current: {})",
                         fmt_sampling_opt(repeat_penalty)
+                    );
+                    println!(
+                        "    /presence_penalty <-2..2>   curb run-on/emoji spiral; unset = model default (current: {})",
+                        fmt_sampling_opt(presence_penalty)
                     );
                     println!("    /max_tokens <n>    per-turn token cap (current: {max_tokens})");
                     println!(
@@ -12158,6 +12227,7 @@ async fn chat_repl(
                         top_k,
                         max_tokens,
                         repeat_penalty,
+                        presence_penalty,
                         clarify_enabled,
                     );
                     drive_chat_stream(&client, req, &mut messages, ctx_size).await?;
@@ -12295,7 +12365,7 @@ async fn chat_repl(
                     }
                     continue;
                 }
-                "temp" => {
+                "temp" | "temperature" => {
                     match arg.parse::<f32>() {
                         Ok(t) if (0.0..=2.0).contains(&t) => {
                             temperature = Some(t);
@@ -12381,6 +12451,17 @@ async fn chat_repl(
                         }
                         Ok(_) => println!("repeat_penalty out of range [0.5, 2.0]"),
                         Err(_) => println!("usage: /repeat_penalty <0.5..2.0>"),
+                    }
+                    continue;
+                }
+                "presence_penalty" => {
+                    match arg.parse::<f32>() {
+                        Ok(pp) if (-2.0..=2.0).contains(&pp) => {
+                            presence_penalty = Some(pp);
+                            println!("[presence_penalty = {pp}]");
+                        }
+                        Ok(_) => println!("presence_penalty out of range [-2.0, 2.0]"),
+                        Err(_) => println!("usage: /presence_penalty <-2.0..2.0>"),
                     }
                     continue;
                 }
@@ -12525,6 +12606,7 @@ async fn chat_repl(
                 top_k,
                 max_tokens,
                 repeat_penalty,
+                presence_penalty,
                 clarify_enabled,
             );
             match drive_chat_stream(&client, req, &mut messages, ctx_size).await? {
@@ -13192,7 +13274,17 @@ mod tests {
         // Fresh REPL state (no /temp etc.): every sampling field is omitted so
         // the server applies its per-model recommendation; only the max_tokens
         // hard cap is sent.
-        let req = build_repl_request("m".into(), msgs.clone(), None, None, None, 512, None, true);
+        let req = build_repl_request(
+            "m".into(),
+            msgs.clone(),
+            None,
+            None,
+            None,
+            512,
+            None,
+            None,
+            true,
+        );
         assert_eq!(req.temperature, None);
         assert_eq!(req.top_p, None);
         assert_eq!(req.top_k, None);
@@ -13208,7 +13300,17 @@ mod tests {
 
         // Explicit overrides (as the /temp, /top_k commands set) ARE sent;
         // unset fields still omitted.
-        let req2 = build_repl_request("m".into(), msgs, Some(0.3), None, Some(50), 256, None, true);
+        let req2 = build_repl_request(
+            "m".into(),
+            msgs,
+            Some(0.3),
+            None,
+            Some(50),
+            256,
+            None,
+            None,
+            true,
+        );
         assert_eq!(req2.temperature, Some(0.3));
         assert_eq!(req2.top_k, Some(50));
         assert_eq!(req2.top_p, None);

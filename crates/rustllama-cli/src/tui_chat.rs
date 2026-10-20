@@ -94,6 +94,7 @@ struct App {
     top_p: Option<f32>,
     top_k: Option<u32>,
     repeat_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
     should_quit: bool,
     /// Auto-run tools: when true, proposed tool calls are accepted silently;
     /// when false (default), they raise an approve/deny prompt. Toggled with
@@ -183,6 +184,7 @@ impl App {
             top_k: self.top_k,
             max_tokens: Some(self.max_tokens),
             repeat_penalty: self.repeat_penalty,
+            presence_penalty: self.presence_penalty,
             seed: None,
             stream: true,
             stream_options: Some(rustllama_client::StreamOptions {
@@ -201,6 +203,7 @@ pub async fn run(
     model: Option<String>,
     base_url: Option<String>,
     initial: Vec<ChatMessage>,
+    sampling: crate::ChatSampling,
 ) -> Result<()> {
     let cfg = rustllama_config::load(config_path).unwrap_or_default();
     let server_url = crate::resolve_base_url(&cfg, base_url.as_deref());
@@ -245,6 +248,7 @@ pub async fn run(
         model,
         initial,
         ctx_size,
+        sampling,
     )
     .await;
 
@@ -265,6 +269,7 @@ async fn event_loop<B: Backend>(
     model: Option<String>,
     initial: Vec<ChatMessage>,
     ctx_size: u32,
+    sampling: crate::ChatSampling,
 ) -> Result<()> {
     // Seed a resumed transcript (`chat --resume`): a leading system
     // message fills the system slot when `--system` wasn't given; the
@@ -294,14 +299,17 @@ async fn event_loop<B: Backend>(
         model_id,
         server_url,
         status: "ready".into(),
-        temperature: None,
+        // Seeded from the `chat` CLI flags; each stays `None` unless its flag
+        // was given, so the server's per-model recommendation still applies.
+        temperature: sampling.temperature,
         // Generous, ctx-aware (the model's context length fetched above), so
         // normal + long replies — and a reasoning model's `<think>` block —
         // aren't truncated. `/max_tokens <n>` still overrides.
         max_tokens: crate::default_max_tokens(ctx_size),
-        top_p: None,
-        top_k: None,
-        repeat_penalty: None,
+        top_p: sampling.top_p,
+        top_k: sampling.top_k,
+        repeat_penalty: sampling.repeat_penalty,
+        presence_penalty: sampling.presence_penalty,
         should_quit: false,
         auto_tools: false,
         clarify_enabled: true,
@@ -812,13 +820,19 @@ fn handle_command(
         "model" => handle_model_command(app, &arg, client, tx),
         // `/chat …` mirrors `rustllama chat` history (sync file store).
         "chat" => handle_chat_command(app, &arg),
-        "temp" => set_f32(&mut app.temperature, &arg, &mut app.status, "temp"),
+        "temp" | "temperature" => set_f32(&mut app.temperature, &arg, &mut app.status, "temp"),
         "top_p" => set_f32(&mut app.top_p, &arg, &mut app.status, "top_p"),
         "repeat_penalty" => set_f32(
             &mut app.repeat_penalty,
             &arg,
             &mut app.status,
             "repeat_penalty",
+        ),
+        "presence_penalty" => set_f32(
+            &mut app.presence_penalty,
+            &arg,
+            &mut app.status,
+            "presence_penalty",
         ),
         "top_k" => {
             if let Ok(v) = arg.parse() {
@@ -854,14 +868,27 @@ fn handle_command(
             );
         }
         "help" => {
+            // One command per line, each with a short inline description.
             app.turns.push(Turn {
                 role: "info".into(),
-                content: "commands (mirror the CLI): /model <id|list|load <ref>|default <ref>|\
-                          unload <id>>  ·  /chat <list|save [name]|resume <name>|delete <name>>  ·  \
-                          /system <text>  /reset  /temp <f>  /top_p <f>  /top_k <n>  \
-                          /repeat_penalty <f>  /max_tokens <n>  /auto [on|off]  /clarify [on|off]  \
-                          /help  /quit   ·   keys: Enter send · PgUp/PgDn scroll · Ctrl-T auto-tools \
-                          · Ctrl-K clarify · Esc/Ctrl-C quit"
+                content: "commands (mirror the CLI):\n\
+                     \n\
+                     /model <id|list|load <ref>|default <ref>|unload <id>>   manage loaded models\n\
+                     /chat <list|save [name]|resume <name>|delete <name>>    saved-chat history\n\
+                     /system <text>          set the system prompt\n\
+                     /reset                  clear the conversation\n\
+                     /temp <f>               sampling temperature (alias: /temperature)\n\
+                     /top_p <f>              nucleus sampling cutoff\n\
+                     /top_k <n>              keep top-K tokens; 0 = full vocab\n\
+                     /repeat_penalty <f>     discourage repeats; 1.0 = off\n\
+                     /presence_penalty <f>   curb run-on / emoji spiral; unset = model default\n\
+                     /max_tokens <n>         per-turn output cap\n\
+                     /auto [on|off]          auto-run proposed tool calls\n\
+                     /clarify [on|off]       let the model ask clarifying questions\n\
+                     /help                   show this help\n\
+                     /quit                   exit the chat\n\
+                     \n\
+                     keys: Enter send · PgUp/PgDn scroll · Ctrl-T auto-tools · Ctrl-K clarify · Esc/Ctrl-C quit"
                     .into(),
             });
         }

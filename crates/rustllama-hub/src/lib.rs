@@ -462,39 +462,28 @@ pub async fn download(
     cache_dir: &Path,
     progress: Option<&ProgressBar>,
 ) -> Result<PathBuf> {
-    let dst = hub_ref.local_path(cache_dir);
-    if dst.exists() {
-        return Ok(dst);
+    // Stream straight into OUR portable cache layout
+    // (`<cache_dir>/<owner>__<repo>/<file>`) via a `.part` sibling + atomic
+    // rename — NO hf-hub round-trip through `$HOME/.cache` (a partial lands in
+    // `models/` as `<file>.part` and is renamed to `<file>` only on success).
+    // Drive the caller's indicatif bar from the byte callback: set its length
+    // once Content-Length is known, then its position per chunk. `progress`
+    // (an `Option<&ProgressBar>`) is `Copy`, so the `move` into the callback
+    // copies the reference and leaves it usable for the finish below.
+    let mut len_set = false;
+    let mut cb = move |downloaded: u64, total: u64| {
+        if let Some(pb) = progress {
+            if !len_set && total > 0 {
+                pb.set_length(total);
+                len_set = true;
+            }
+            pb.set_position(downloaded);
+        }
+    };
+    let dst = download_with_progress(hub_ref, cache_dir, &mut cb).await?;
+    if let Some(pb) = progress {
+        pb.finish_and_clear();
     }
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let api = hf_hub::api::tokio::ApiBuilder::new()
-        .with_progress(progress.is_some())
-        .build()
-        .map_err(|e| HubError::HfHub(e.to_string()))?;
-    let repo = api.model(hub_ref.repo_id());
-    let cached = repo
-        .get(&hub_ref.filename)
-        .await
-        .map_err(|e| HubError::HfHub(e.to_string()))?;
-
-    // hf-hub stores under its own cache dir; copy into our cache layout so
-    // tools and the GUI can list models predictably. Copy to a `.part` sibling
-    // then atomically rename, mirroring `download_with_progress` — an
-    // interrupted copy must never leave a partial file that the `dst.exists()`
-    // short-circuit above would later treat as a complete download.
-    let mut tmp_os = dst.clone().into_os_string();
-    tmp_os.push(".part");
-    let tmp = PathBuf::from(tmp_os);
-    std::fs::copy(&cached, &tmp)?;
-    std::fs::rename(&tmp, &dst)?;
-
-    if let Some(p) = progress {
-        p.finish_with_message(format!("downloaded {}", hub_ref.filename));
-    }
-
     Ok(dst)
 }
 
@@ -502,9 +491,12 @@ pub async fn download(
 /// the HF `resolve/main` URL, writing chunks to `cache_dir/<owner>__<repo>/
 /// <filename>` and invoking `on_progress(downloaded, total)` as bytes
 /// arrive (`total` = Content-Length, or 0 when the server doesn't send it).
-/// Downloads to a `.part` sibling and atomically renames on success so a
-/// partial file is never mistaken for complete. Skips if already present.
-/// Public repos need no auth.
+/// Downloads to a `.part` sibling under the destination (the portable
+/// `<cache_dir>/<owner>__<repo>/` folder) and atomically renames on success,
+/// so a partial file is never mistaken for complete and nothing is ever written
+/// to `$HOME/.cache`. Skips if already present. Gated repos: set `HF_TOKEN`
+/// (or `HUGGING_FACE_HUB_TOKEN`) and it rides as a bearer token; public repos
+/// need no auth.
 pub async fn download_with_progress(
     hub_ref: &HubRef,
     cache_dir: &Path,
@@ -531,8 +523,17 @@ pub async fn download_with_progress(
         .user_agent("rustllama/0.0")
         .build()
         .map_err(|e| HubError::Http(e.to_string()))?;
-    let mut resp = client
-        .get(&url)
+    let mut req = client.get(&url);
+    // Gated-repo auth, replacing hf-hub's token discovery now that we stream
+    // directly. Empty/unset ⇒ no header (public repos).
+    if let Some(tok) = std::env::var("HF_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok())
+        .filter(|t| !t.is_empty())
+    {
+        req = req.bearer_auth(tok);
+    }
+    let mut resp = req
         .send()
         .await
         .map_err(|e| HubError::Http(e.to_string()))?;
