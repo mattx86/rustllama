@@ -14009,18 +14009,18 @@ impl LlamaModel {
                     continue;
                 }
                 let kv_len = slot.pos as usize + 1;
-                // Phase D (GPU paged attention): the block-table flash-decode
-                // reads the device KV-pool mirror directly, so a hit SKIPS the
-                // host gather below. Inert / false off-CUDA or without the verdict
-                // => the gather + CPU attention path. `PageId` is
-                // repr(transparent), so `pages()` reinterprets as the `&[u32]`
-                // block table zero-copy.
+                // Phase D/E/F (GPU paged attention): the block-table flash-decode
+                // reads a device KV-pool mirror directly, so a hit SKIPS the host
+                // gather below. The combinator tiers CUDA → MLX → SYCL; inert /
+                // false off-GPU or without the per-backend verdict => the gather +
+                // CPU attention path. `PageId` is repr(transparent), so `pages()`
+                // reinterprets as the `&[u32]` block table zero-copy.
                 {
                     let pages = slot.cache.pages();
                     let block_table: &[u32] = unsafe {
                         std::slice::from_raw_parts(pages.as_ptr() as *const u32, pages.len())
                     };
-                    if crate::accel::try_flash_attn_decode_paged_cuda_f32(
+                    if crate::accel::try_flash_attn_decode_paged_gpu_f32(
                         &q_buf[i * d_q..(i + 1) * d_q],
                         &mut attn_out[i * d_q..(i + 1) * d_q],
                         block_table,
@@ -14578,18 +14578,19 @@ impl LlamaModel {
                 }
                 let base = row_off[i];
                 let kv_len = s.start_pos as usize + s.n_query;
-                // Phase D (GPU paged attention): for a DECODE row (n_query == 1),
-                // try the block-table flash-decode against the device KV-pool
+                // Phase D/E/F (GPU paged attention): for a DECODE row (n_query ==
+                // 1), try the block-table flash-decode against a device KV-pool
                 // mirror first — a hit SKIPS the host gather + CPU attention below.
-                // Inert / false off-CUDA or without the verdict => the gather +
-                // CPU path (prefill chunks, n_query > 1, always gather). `PageId`
-                // is repr(transparent) => zero-copy `&[u32]` block table.
+                // The combinator tiers CUDA → MLX → SYCL; inert / false off-GPU or
+                // without the per-backend verdict => the gather + CPU path (prefill
+                // chunks, n_query > 1, always gather). `PageId` is
+                // repr(transparent) => zero-copy `&[u32]` block table.
                 if s.n_query == 1 {
                     let pages = s.cache.pages();
                     let block_table: &[u32] = unsafe {
                         std::slice::from_raw_parts(pages.as_ptr() as *const u32, pages.len())
                     };
-                    if crate::accel::try_flash_attn_decode_paged_cuda_f32(
+                    if crate::accel::try_flash_attn_decode_paged_gpu_f32(
                         &q_buf[base * d_q..(base + 1) * d_q],
                         &mut attn_out[base * d_q..(base + 1) * d_q],
                         block_table,

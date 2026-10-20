@@ -4240,6 +4240,75 @@ pub fn try_flash_attn_decode_paged_mlx_f32(
     })
 }
 
+/// GPU paged attention: block-table flash-decode tiered CUDA → MLX → SYCL →
+/// (the caller's CPU gather path on `false`). The paged-engine analogue of
+/// [`try_flash_attn_decode_gpu_f32`] for the device-pool-mirror decode path. Each
+/// arm is self-gating (its paged verdict + its backend active + its own mirror
+/// present), so on a single-backend host the `cuda_active()` / `mlx_active()`
+/// short-circuits mean this behaves EXACTLY like calling that backend's helper
+/// directly — no regression off any one backend. The single CPU fallback lives
+/// at the call site (`if !try_flash_attn_decode_paged_gpu_f32(...) { gather+CPU }`),
+/// so all three backends are covered without duplicating it per decode site.
+#[allow(clippy::too_many_arguments)]
+pub fn try_flash_attn_decode_paged_gpu_f32(
+    q: &[f32],
+    out: &mut [f32],
+    block_table: &[u32],
+    layer_idx: u32,
+    kv_len: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    // Per-layer SWA window (0=full) + Gemma2 attention-logit soft-cap (0=off).
+    window: i32,
+    softcap: f32,
+) -> bool {
+    if cuda_active()
+        && try_flash_attn_decode_paged_cuda_f32(
+            q,
+            out,
+            block_table,
+            layer_idx,
+            kv_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            window,
+            softcap,
+        )
+    {
+        return true;
+    }
+    if mlx_active()
+        && try_flash_attn_decode_paged_mlx_f32(
+            q,
+            out,
+            block_table,
+            layer_idx,
+            kv_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            window,
+            softcap,
+        )
+    {
+        return true;
+    }
+    try_flash_attn_decode_paged_sycl_f32(
+        q,
+        out,
+        block_table,
+        layer_idx,
+        kv_len,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        window,
+        softcap,
+    )
+}
+
 /// `--cuda-parity` verdict-cache name for the grouped FFN kernel of `kind`, or
 /// `None` for a kind without a grouped kernel (only the warp-cooperative quants
 /// Q4_K/Q8_0/Q6_K have one).
