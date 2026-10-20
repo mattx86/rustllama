@@ -476,7 +476,8 @@ pub fn auto_ctx_from_train(ctx_train: u32) -> u32 {
 /// for (the caller then keeps the generic default — no behavior change).
 ///
 /// Sources for the pinned values:
-///   - `qwen3` / `qwen3moe`: Qwen3's published **non-thinking** sampling rec
+///   - `qwen3` / `qwen3moe` / `qwen35` / `qwen35moe`: Qwen3 (and the Qwen3.5
+///     Gated-DeltaNet hybrid) published **non-thinking** sampling rec
 ///     (temp 0.7, top_p 0.8, top_k 20, presence_penalty 1.0, repeat 1.0) —
 ///     the recipe Qwen ships specifically to curb repetition + language
 ///     mixing on these models.
@@ -489,7 +490,13 @@ pub fn auto_ctx_from_train(ctx_train: u32) -> u32 {
 pub fn recommended_sampling_for_arch(arch: &str) -> Option<SamplingParams> {
     let mut s = SamplingParams::default();
     match arch.trim().to_ascii_lowercase().as_str() {
-        "qwen3" | "qwen3moe" => {
+        // Qwen3 AND Qwen3.5 (`qwen35` / `qwen35moe`, the Gated-DeltaNet hybrid,
+        // e.g. the Ornith fine-tunes): same family, same published non-thinking
+        // recipe. Without this, a `qwen35` GGUF that ships no `generation_config`
+        // (common on community quants) falls to the generic default and spirals
+        // into run-on repetition + emoji spam mid-reasoning — the exact failure
+        // this recipe exists to prevent.
+        "qwen3" | "qwen3moe" | "qwen35" | "qwen35moe" => {
             s.temperature = 0.7;
             s.top_p = 0.8;
             s.top_k = 20;
@@ -1140,6 +1147,15 @@ mod recommended_sampling_tests {
         // The MoE variant and a mixed-case arch string resolve identically.
         let moe = recommended_sampling_for_arch("Qwen3MoE").expect("qwen3moe has a rec");
         assert_eq!(moe.top_k, 20);
+        // Qwen3.5 (the Gated-DeltaNet hybrid, e.g. Ornith) is the same family
+        // and MUST pin the same recipe — without it, a `qwen35` GGUF with no
+        // generation_config spirals into emoji/run-on repetition.
+        for a in ["qwen35", "qwen35moe", "Qwen35"] {
+            let q = recommended_sampling_for_arch(a).unwrap_or_else(|| panic!("{a} has a rec"));
+            assert_eq!(q.top_k, 20, "{a}");
+            assert!((q.top_p - 0.8).abs() < 1e-6, "{a}");
+            assert!((q.presence_penalty - 1.0).abs() < 1e-6, "{a}");
+        }
     }
 
     #[test]
