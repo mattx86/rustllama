@@ -12146,6 +12146,13 @@ impl LlamaModel {
             // path for layers past the `[inference].n_gpu_layers`
             // cutoff.
             crate::accel::set_current_layer_idx(layer_idx as u32);
+            // AirLLM streaming: tag the CUDA weight cache with this layer so its
+            // bounded-window LRU groups + ages this layer's weights for
+            // whole-layer eviction. Gated on `stream_window() > 0` so the normal
+            // (non-streaming) path never takes the extra cache lock.
+            if crate::accel::stream_window() > 0 {
+                crate::accel::cuda_set_layer_tag(layer_idx as u32);
+            }
             // P2: is this an F32 SWA ring layer? A ring layer's slab is
             // `cap`-strided and ring-addressed (`pos % cap`), so the
             // device-resident decode blocks + the USM/CUDA GPU flash hooks
@@ -12255,7 +12262,15 @@ impl LlamaModel {
                     // internally + returns false if a capture/launch fails, leaving
                     // the host buffers untouched — in which case the eager CUDA
                     // block (itself gated on `attn:dev_resident_block`) runs next.
-                    let (mut attn_ran, mut ffn_ran) =
+                    // AirLLM streaming: SKIP the CUDA-graph block — it caches this
+                    // layer's whole device chain with CAPTURED weight DEVICE
+                    // POINTERS, which the streaming LRU evicts + re-uploads
+                    // (pointers dangle → illegal access on replay). The eager block
+                    // below re-reads the cache's CURRENT device pointers every call,
+                    // so it is safe under eviction; fall straight through to it.
+                    let (mut attn_ran, mut ffn_ran) = if crate::accel::stream_window() > 0 {
+                        (false, false)
+                    } else {
                         crate::accel::try_decode_attn_block_cuda_graph_f32(
                             block.w_q(),
                             block.w_k(),
@@ -12287,7 +12302,8 @@ impl LlamaModel {
                             dev_softcap,
                             upload_hidden,
                             download_hidden,
-                        );
+                        )
+                    };
                     if !attn_ran {
                         let (a_eager, f_eager) = crate::accel::try_decode_attn_block_cuda_f32(
                             block.w_q(),

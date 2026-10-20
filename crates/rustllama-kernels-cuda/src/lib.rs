@@ -3933,6 +3933,9 @@ impl CudaMatvecCache {
         self.layer_keys.clear();
         self.layer_last_used.clear();
         self.tick = 0;
+        // The streaming admission policy is per-model (placement re-sets it); a
+        // new model must not inherit the previous one's window.
+        self.stream_window_layers = 0;
         // Feature 1b: destroy any cached graph executables. Their captured nodes
         // reference this model's device buffers (weights/mirrors/activation slab),
         // which are now evicted; the next model re-captures + re-instantiates from

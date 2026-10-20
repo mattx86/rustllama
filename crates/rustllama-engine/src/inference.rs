@@ -221,6 +221,13 @@ pub struct ContiguousEngine {
     /// even when SYCL is healthy — useful for debugging the GPU
     /// path or as a fallback when VRAM is exhausted.
     n_gpu_layers: u32,
+    /// AirLLM streaming window (resident layer count), `0` = off (legacy static
+    /// placement). Set from
+    /// [`crate::placement_auto::AutoPlacementDecision::stream_window`] at
+    /// placement; pushed to the per-thread `accel::set_stream_window` before each
+    /// generate (alongside `set_n_gpu_layers`) and to the global CUDA cache's
+    /// admission policy once at placement. Forks inherit it.
+    stream_window: u32,
     /// `[inference].placement.overrides` entries with
     /// `device = "cpu"`, extracted to their pattern strings.
     /// Pushed to `accel::CPU_FORCE_PATTERNS` before each generate
@@ -2129,6 +2136,7 @@ impl ContiguousEngine {
             kv_layout: kv_layout.to_string(),
             kv_page_size,
             n_gpu_layers: u32::MAX,
+            stream_window: 0,
             cpu_force_patterns: Vec::new(),
             vision: None,
             image_token_id: None,
@@ -2817,6 +2825,7 @@ impl ContiguousEngine {
             kv_layout: "contiguous".to_string(),
             kv_page_size: 0, // unused on contiguous; KvBackend defaults
             n_gpu_layers: u32::MAX,
+            stream_window: 0,
             cpu_force_patterns: Vec::new(),
             vision: None,
             image_token_id: None,
@@ -2988,6 +2997,7 @@ impl ContiguousEngine {
             kv_layout: "contiguous".to_string(),
             kv_page_size: 0, // unused on contiguous; KvBackend defaults
             n_gpu_layers: u32::MAX,
+            stream_window: 0,
             cpu_force_patterns: Vec::new(),
             vision: None,
             image_token_id: None,
@@ -4565,6 +4575,7 @@ impl ContiguousEngine {
             kv_layout: self.kv_layout.clone(),
             kv_page_size: self.kv_page_size,
             n_gpu_layers: self.n_gpu_layers,
+            stream_window: self.stream_window,
             cpu_force_patterns: self.cpu_force_patterns.clone(),
             // Forks share the parent's loaded vision tower — same
             // reasoning as the model Arc: vision inference is stateless
@@ -4740,6 +4751,11 @@ impl ContiguousEngine {
         rustllama_models::accel::set_multi_gpu_plan(None);
         let decision = self.plan_placement(opts);
         self.n_gpu_layers = decision.n_gpu_layers;
+        // AirLLM streaming: remember the window and flip the global CUDA cache's
+        // admission policy to evict-coldest-layer (0 = off, unchanged). The
+        // per-generate TLS push happens alongside `set_n_gpu_layers`.
+        self.stream_window = decision.stream_window.unwrap_or(0);
+        rustllama_models::accel::cuda_set_stream_window(self.stream_window);
         decision
     }
 
@@ -5223,6 +5239,7 @@ impl ContiguousEngine {
         let _sycl_guard = install_sycl_dispatch_if_requested();
         rustllama_models::accel::set_flash_attention(self.flash_attention);
         rustllama_models::accel::set_n_gpu_layers(self.n_gpu_layers);
+        rustllama_models::accel::set_stream_window(self.stream_window);
         rustllama_models::accel::set_cpu_force_patterns(self.cpu_force_patterns.clone());
         self.prepare_usm_for_sync_path();
         let mut state = self.state.lock().expect("state lock");
@@ -5400,6 +5417,7 @@ impl ContiguousEngine {
         let _sycl_guard = install_sycl_dispatch_if_requested();
         rustllama_models::accel::set_flash_attention(self.flash_attention);
         rustllama_models::accel::set_n_gpu_layers(self.n_gpu_layers);
+        rustllama_models::accel::set_stream_window(self.stream_window);
         rustllama_models::accel::set_cpu_force_patterns(self.cpu_force_patterns.clone());
         self.prepare_usm_for_sync_path();
 
@@ -5663,6 +5681,7 @@ impl ContiguousEngine {
         let _sycl_guard = install_sycl_dispatch_if_requested();
         rustllama_models::accel::set_flash_attention(self.flash_attention);
         rustllama_models::accel::set_n_gpu_layers(self.n_gpu_layers);
+        rustllama_models::accel::set_stream_window(self.stream_window);
         rustllama_models::accel::set_cpu_force_patterns(self.cpu_force_patterns.clone());
         self.prepare_usm_for_sync_path();
         let mut state = self.state.lock().expect("state lock");
@@ -5834,6 +5853,7 @@ impl ContiguousEngine {
         let _sycl_guard = install_sycl_dispatch_if_requested();
         rustllama_models::accel::set_flash_attention(self.flash_attention);
         rustllama_models::accel::set_n_gpu_layers(self.n_gpu_layers);
+        rustllama_models::accel::set_stream_window(self.stream_window);
         rustllama_models::accel::set_cpu_force_patterns(self.cpu_force_patterns.clone());
         self.prepare_usm_for_sync_path();
         let mut state = self.state.lock().expect("state lock");
@@ -5989,6 +6009,7 @@ impl ContiguousEngine {
         let _sycl_guard = install_sycl_dispatch_if_requested();
         rustllama_models::accel::set_flash_attention(self.flash_attention);
         rustllama_models::accel::set_n_gpu_layers(self.n_gpu_layers);
+        rustllama_models::accel::set_stream_window(self.stream_window);
         rustllama_models::accel::set_cpu_force_patterns(self.cpu_force_patterns.clone());
         self.prepare_usm_for_sync_path();
 
@@ -6302,6 +6323,7 @@ impl ContiguousEngine {
         let _sycl_guard = install_sycl_dispatch_if_requested();
         rustllama_models::accel::set_flash_attention(self.flash_attention);
         rustllama_models::accel::set_n_gpu_layers(self.n_gpu_layers);
+        rustllama_models::accel::set_stream_window(self.stream_window);
         rustllama_models::accel::set_cpu_force_patterns(self.cpu_force_patterns.clone());
         self.prepare_usm_for_sync_path();
         let tokenizer = self

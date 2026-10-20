@@ -732,6 +732,8 @@ pub fn plan_heat_placement(
         reason: plan.reason.clone(),
         placement_error: plan.placement_error.clone(),
         vram_only_noop: opts.vram_only && !host_has_dedicated_vram(opts.device_index),
+        // Heat placement installs a per-tensor plan, not a streaming window.
+        stream_window: None,
     };
 
     Some(HeatPlacementOutcome {

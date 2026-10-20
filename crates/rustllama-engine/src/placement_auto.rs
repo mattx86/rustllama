@@ -83,6 +83,13 @@ pub struct AutoPlacementOpts {
     /// caller can warn, and placement proceeds on the normal path. From
     /// `[inference].vram_only` / `RUSTLLAMA_VRAM_ONLY` / `serve --vram-only`.
     pub vram_only: bool,
+    /// AirLLM-style layer streaming. `true` (default) = when a model exceeds
+    /// VRAM, placement may choose to STREAM every layer through a bounded GPU
+    /// window (emitting [`AutoPlacementDecision::stream_window`]) instead of the
+    /// static GPU prefix + CPU-fallback. `false` = never stream (keep the legacy
+    /// prefix). Streaming only engages when `n_gpu_layers < total_layers` and the
+    /// window holds >= 2 layers; otherwise the prefix is used regardless.
+    pub streaming_allowed: bool,
 }
 
 impl Default for AutoPlacementOpts {
@@ -95,6 +102,7 @@ impl Default for AutoPlacementOpts {
             cpu_enabled: true,
             gpu_enabled: true,
             vram_only: false,
+            streaming_allowed: true,
         }
     }
 }
@@ -129,6 +137,13 @@ pub struct AutoPlacementDecision {
     /// dedicated VRAM (unified-memory GPU / CPU-only), so the flag was
     /// treated as a no-op. The caller should warn but proceed.
     pub vram_only_noop: bool,
+    /// AirLLM streaming: `Some(k)` = the model exceeds VRAM and placement chose
+    /// LAYER STREAMING with a bounded window of `k` resident layers.
+    /// `n_gpu_layers` is then set to `total_layers` (every layer GPU-eligible
+    /// just-in-time) and the CUDA cache's byte-bounded LRU cycles them. `None` =
+    /// the static-prefix placement (whole model fits, or streaming disabled /
+    /// window too small).
+    pub stream_window: Option<u32>,
 }
 
 /// Plan an `n_gpu_layers` value automatically, then apply the device-tier
@@ -194,6 +209,33 @@ pub fn auto_n_gpu_layers(
                 "; vram_only: no separate dedicated VRAM on this host \
                  (unified-memory GPU or CPU-only) — vram_only is a no-op",
             );
+        }
+    }
+
+    // AirLLM streaming: when the model doesn't fully fit VRAM (and the policy
+    // layer didn't already refuse the load), prefer STREAMING every layer through
+    // a bounded GPU window over spilling the tail to CPU. Size the window from the
+    // VRAM budget; engage only if it holds >= 2 layers (one slot is reserved for
+    // the prefetch buffer). Otherwise keep the static prefix (d unchanged).
+    if opts.streaming_allowed
+        && d.placement_error.is_none()
+        && d.n_gpu_layers < d.total_layers
+        && d.effective_budget_bytes > 0
+    {
+        let per_layer = per_layer_weight_bytes(weights, &opts.cpu_force_patterns);
+        let max_layer = per_layer.iter().copied().max().unwrap_or(0);
+        if max_layer > 0 {
+            let k_resident = (d.effective_budget_bytes / max_layer).saturating_sub(1);
+            if k_resident >= 2 {
+                d.stream_window = Some(k_resident as u32);
+                d.n_gpu_layers = d.total_layers; // every layer GPU-eligible JIT
+                d.gpu_resident_bytes = d.effective_budget_bytes; // window ~fills VRAM
+                d.reason = format!(
+                    "streaming: model exceeds VRAM — cycling all {} layers through a \
+                     {k_resident}-layer window (+1 prefetch); was [{}]",
+                    d.total_layers, d.reason
+                );
+            }
         }
     }
 
@@ -305,6 +347,7 @@ fn auto_n_gpu_layers_inner(
                 reason: "no usable SYCL or CUDA GPU; all-CPU".to_string(),
                 placement_error: None,
                 vram_only_noop: false,
+                stream_window: None,
             };
         }
     };
@@ -325,6 +368,7 @@ fn auto_n_gpu_layers_inner(
             ),
             placement_error: None,
             vram_only_noop: false,
+            stream_window: None,
         };
     }
 
@@ -368,6 +412,7 @@ fn auto_n_gpu_layers_inner(
         reason: format!("{device_src}: {reason}"),
         placement_error: None,
         vram_only_noop: false,
+        stream_window: None,
     }
 }
 

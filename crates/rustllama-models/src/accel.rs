@@ -2116,6 +2116,17 @@ thread_local! {
     /// still gets the GPU path (when SYCL is healthy and
     /// `N_GPU_LAYERS > 0`).
     static CURRENT_LAYER_IDX: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+
+    /// AirLLM-style layer streaming window (resident layer count). `0` (default)
+    /// = off: the static `N_GPU_LAYERS` prefix + CPU-fallback behavior is
+    /// byte-identical. `> 0` = stream every layer through a bounded GPU window
+    /// (the byte-bounded LRU in `CudaMatvecCache` enforces the real limit); the
+    /// engine also sets `N_GPU_LAYERS = total_layers` so every layer is
+    /// GPU-eligible just-in-time. Model-side code reads this to drive per-layer
+    /// tagging, to force the eager attention block (the CUDA-graph twin captures
+    /// weight device pointers that eviction dangles), and to fire readahead on
+    /// the decode path.
+    static STREAM_WINDOW: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Engine-side setter for `[inference].n_gpu_layers`. Called once
@@ -2144,6 +2155,45 @@ pub fn set_current_layer_idx(idx: u32) {
 /// `try_*_usm_f32` helpers + tests.
 pub fn current_layer_idx() -> u32 {
     CURRENT_LAYER_IDX.with(|c| c.get())
+}
+
+/// Engine-side setter for the AirLLM streaming window (resident layer count),
+/// set per generate alongside [`set_n_gpu_layers`]. `0` = off (byte-identical
+/// legacy placement). `> 0` = layer streaming.
+pub fn set_stream_window(k: u32) {
+    STREAM_WINDOW.with(|c| c.set(k));
+}
+
+/// Read the per-thread streaming window. `0` = off. Model-side code gates
+/// per-layer tagging / force-eager / decode readahead on `> 0`.
+pub fn stream_window() -> u32 {
+    STREAM_WINDOW.with(|c| c.get())
+}
+
+/// Tag the global CUDA weight cache with the layer (or `encode(layer, expert)`)
+/// whose weights are about to be uploaded, so the cache's streaming LRU groups
+/// + ages them per layer. Called from the forward loop ONLY under streaming
+/// (`stream_window() > 0`), so the normal path never takes this extra lock.
+/// A mis-tag (e.g. a concurrent multi-model stream) only changes WHICH layer is
+/// evicted — residency/perf, never the math — so it is safe lock-free of the
+/// matvec itself.
+pub fn cuda_set_layer_tag(tag: u32) {
+    if let Some(cache) = cuda_cache() {
+        if let Ok(mut g) = cache.lock() {
+            g.set_layer_tag(tag);
+        }
+    }
+}
+
+/// Push the streaming window (and thus flip the cache's admission policy from
+/// grow-until-budget to evict-coldest-layer) onto the global CUDA weight cache.
+/// Called by the engine when placement selects streaming. `0` restores legacy.
+pub fn cuda_set_stream_window(k: u32) {
+    if let Some(cache) = cuda_cache() {
+        if let Ok(mut g) = cache.lock() {
+            g.set_stream_window_layers(k);
+        }
+    }
 }
 
 /// Whether the GPU path is enabled for the layer that's currently
