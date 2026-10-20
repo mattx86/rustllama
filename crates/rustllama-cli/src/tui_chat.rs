@@ -1380,28 +1380,43 @@ fn ui(f: &mut Frame, app: &mut App) {
             vec![(t.content.clone(), body_style)]
         };
 
-        // Emit: the head leads the very first wrapped line; every later line is
-        // indented under the body. A turn with no body yet (the empty assistant
-        // placeholder while a reply is awaited) still shows its head.
-        let mut first_line = true;
-        for (text, seg_style) in &segments {
-            for w in wrap_text(text, body_width) {
-                if first_line {
-                    lines.push(Line::from(vec![
-                        Span::styled(head.clone(), style),
-                        Span::styled(w, *seg_style),
-                    ]));
-                    first_line = false;
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::raw(indent.clone()),
-                        Span::styled(w, *seg_style),
-                    ]));
+        if t.role == "assistant" {
+            // AI responses: put the `AI:` label on its OWN line, then render the
+            // body starting on the next line FLUSH-LEFT (no label-width indent),
+            // wrapped to the full content width. Content-intrinsic indentation
+            // (markdown lists / code blocks carry their own leading spaces) is
+            // preserved because we simply don't ADD an indent. The label line
+            // alone also covers the empty-placeholder case while a reply streams.
+            lines.push(Line::from(vec![Span::styled(head.clone(), style)]));
+            for (text, seg_style) in &segments {
+                for w in wrap_text(text, content_w) {
+                    lines.push(Line::from(vec![Span::styled(w, *seg_style)]));
                 }
             }
-        }
-        if first_line {
-            lines.push(Line::from(vec![Span::styled(head.clone(), style)]));
+        } else {
+            // Other roles (You / info / error): the head leads the first wrapped
+            // line; later lines indent under the body. A turn with no body still
+            // shows its head.
+            let mut first_line = true;
+            for (text, seg_style) in &segments {
+                for w in wrap_text(text, body_width) {
+                    if first_line {
+                        lines.push(Line::from(vec![
+                            Span::styled(head.clone(), style),
+                            Span::styled(w, *seg_style),
+                        ]));
+                        first_line = false;
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::raw(indent.clone()),
+                            Span::styled(w, *seg_style),
+                        ]));
+                    }
+                }
+            }
+            if first_line {
+                lines.push(Line::from(vec![Span::styled(head.clone(), style)]));
+            }
         }
         lines.push(Line::from("")); // blank separator between turns
     }

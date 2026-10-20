@@ -5755,6 +5755,11 @@ fn cmd_tune_threads(
         anyhow::bail!("--threads-candidates produced an empty list");
     }
 
+    // Keep this baseline cheap: the stage persists no winner (it's a tok/s
+    // reference, not a tuned value), so a handful of decode tokens is plenty
+    // — and an unbounded decode of a large model here can grind for minutes.
+    let decode_tokens = decode_tokens.min(8);
+
     println!("rustllama tune --threads");
     println!("  model         = {}", model_path.display());
     println!(
@@ -5769,10 +5774,11 @@ fn cmd_tune_threads(
     println!("  repeats       = {repeats} (median per candidate)");
     println!();
     println!("note: rayon's global pool is built once per process; this command");
-    println!("respects the FIRST candidate only. To benchmark multiple thread");
-    println!("counts cleanly, re-invoke with RAYON_NUM_THREADS=<n> per run and");
-    println!("compare. The sweep below loads the model once and records the");
-    println!("baseline tok/s with rayon's default — useful as a perf reference.");
+    println!("measures ONE representative thread count (an explicit single");
+    println!("--threads-candidates, else the host's core count). To benchmark");
+    println!("other counts cleanly, re-invoke with RAYON_NUM_THREADS=<n> per run");
+    println!("and compare. The model is loaded once and the baseline tok/s is");
+    println!("recorded as a perf reference (this stage persists no winner).");
     println!();
 
     // Use measure_placement_candidates with a single placement as the
@@ -5805,12 +5811,25 @@ fn cmd_tune_threads(
     let prompt_tokens = 32u32;
     let ctx_size = (prompt_tokens as usize + decode_tokens as usize + 8).max(128);
 
-    // Install the first candidate as the rayon pool size before any
-    // measurement. The remaining candidates print as "would-need
-    // separate invocation" — the rayon one-shot constraint is
-    // explicit in the help text above.
-    let first = candidates[0];
-    rustllama_kernels_cpu::install_thread_pool(first);
+    // Pick the thread count to actually measure at. rayon's global pool is
+    // built ONCE per process, so this stage can only time a SINGLE count,
+    // and it persists no winner (a baseline reference, per the note above).
+    // Measure at the host's REPRESENTATIVE thread count — an explicit
+    // single-candidate override if given, else the host's natural
+    // parallelism (what serve uses by default). NOT the grid minimum: the
+    // smallest auto candidate is 1, and a 1-thread all-CPU decode of a
+    // large/hybrid model (e.g. a 27B DeltaNet) is pathologically slow and,
+    // with no timeout, effectively hangs `tune --all` on this stage.
+    let ncores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let explicit_single = !candidates_csv.trim().is_empty() && candidates.len() == 1;
+    let measured = if explicit_single {
+        candidates[0]
+    } else {
+        ncores
+    };
+    rustllama_kernels_cpu::install_thread_pool(measured);
 
     let report = measure_placement_candidates(
         &model_path,
@@ -5829,15 +5848,18 @@ fn cmd_tune_threads(
         .ok_or_else(|| anyhow::anyhow!("no candidate result"))?;
     match cand.median_tps {
         Some(median) => println!(
-            "  threads={first:3}: median {median:.2} tok/s (warmup {:.0}ms)",
+            "  threads={measured:3}: median {median:.2} tok/s (warmup {:.0}ms)",
             cand.warmup_ms
         ),
         None => println!(
-            "  threads={first:3}: measurement failed: {}",
+            "  threads={measured:3}: measurement failed: {}",
             cand.error.unwrap_or_default()
         ),
     }
-    for &c in &candidates[1..] {
+    for &c in &candidates {
+        if c == measured {
+            continue;
+        }
         println!("  threads={c:3}: skipped (re-invoke with RAYON_NUM_THREADS={c} to measure)");
     }
     Ok(())
