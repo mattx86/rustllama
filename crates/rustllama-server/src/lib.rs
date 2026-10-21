@@ -3019,6 +3019,19 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
         cacheblend_ratio: Some(cacheblend_ratio),
     }
     .apply_to(&mut cpu);
+    // T5e — SuffixDecoding (head-free longest-suffix drafter) from the config
+    // flag, mirroring the CLI serve + bench paths. TODO(T5e follow-up): fold into
+    // SpecStrategy + the TunerWinners mutual-exclusion so the per-model
+    // auto-selector owns it; until then it's an independent opt-in flag (off by
+    // default), applied after the winner set.
+    if cfg_for_tuning.inference.speculative_suffix {
+        cpu.set_suffix_speculative(Some(rustllama_engine::speculative::SuffixDrafterConfig {
+            n_min_match: cfg_for_tuning.inference.suffix_n_min_match as usize,
+            n_draft: cfg_for_tuning.inference.suffix_n_draft as usize,
+            max_match: cfg_for_tuning.inference.suffix_max_match as usize,
+            q: 0.5,
+        }));
+    }
     let model_id = cpu.model_id().to_string();
     let cpu = Arc::new(cpu);
     // Pre-upload packed-quant weights to USM on a blocking-pool

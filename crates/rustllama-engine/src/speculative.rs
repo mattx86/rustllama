@@ -1194,6 +1194,157 @@ impl NgramDrafter {
 }
 
 // ============================================================
+// HistoryDrafter trait — shared draft-free drafter interface
+// ============================================================
+//
+// Both the n-gram drafter and the suffix drafter propose a run of
+// speculative tokens purely from the realized token history (no second
+// model). Abstracting the single `propose(hist)` touchpoint lets the
+// engine drive BOTH through ONE shared verify/commit stream
+// (`speculate_history_stream_from_ids`) rather than duplicating the
+// ~150-line async round loop per drafter.
+
+/// A draft-model-free drafter that proposes speculative tokens from the
+/// running token history. Implemented by [`NgramDrafter`] and
+/// [`SuffixDrafter`]; consumed by the engine's shared speculative stream.
+pub trait HistoryDrafter: Send {
+    /// Propose speculative tokens given the full token history. Empty ⇒ no
+    /// speculation this round (the driver degrades to single-token decode).
+    fn propose(&self, hist: &[u32]) -> Vec<DraftToken>;
+}
+
+impl HistoryDrafter for NgramDrafter {
+    fn propose(&self, hist: &[u32]) -> Vec<DraftToken> {
+        NgramDrafter::propose(self, hist)
+    }
+}
+
+// ============================================================
+// Suffix drafter (SuffixDecoding — longest-suffix match)
+// ============================================================
+//
+// A strict generalization of [`NgramDrafter`]: instead of matching a
+// FIXED `n_match`-token window, it finds the LONGEST suffix of the history
+// (length in `[n_min_match, max_match]`) that occurs earlier, and proposes
+// the run that followed that earlier occurrence. A longer match is a
+// stronger signal, so the draft runs longer — the SuffixDecoding insight
+// (Oliaro et al., NeurIPS 2025) that agentic / repetitive output (tool
+// calls, code edits, structured text) repeats long spans, so matching the
+// longest recurring span drafts more accepted tokens per round than a
+// fixed 3-gram. Lossless (target-verified via [`accept_reject`]) and
+// deterministic (newest-match-wins, no RNG), exactly like the n-gram path.
+//
+// v1 does a bounded longest-first backward scan (each length's slice
+// compare short-circuits on the first mismatch, so a normal history costs
+// ~O(max_match · len) quick comparisons/round). A persistent suffix-
+// automaton index (global + per-request trees) is the perf follow-up.
+
+/// Configuration knobs for [`SuffixDrafter`].
+#[derive(Debug, Clone, Copy)]
+pub struct SuffixDrafterConfig {
+    /// Shortest trailing-suffix match length to accept. Below this the
+    /// match is too weak to bother drafting. Default `2`.
+    pub n_min_match: usize,
+    /// Maximum speculative tokens proposed per round (also capped by the
+    /// post-match history available before the query). Default `8` —
+    /// longer than the n-gram drafter's `4`, since a long suffix match
+    /// accepts deeper on repetitive output.
+    pub n_draft: usize,
+    /// Longest trailing suffix considered when searching for an earlier
+    /// occurrence; bounds the scan cost. Default `64`.
+    pub max_match: usize,
+    /// Draft probability attached to each proposed token for the `p / q`
+    /// acceptance ratio in [`accept_reject`]. Same role + default as
+    /// [`NgramDrafterConfig::q`].
+    pub q: f32,
+}
+
+impl Default for SuffixDrafterConfig {
+    fn default() -> Self {
+        Self {
+            n_min_match: 2,
+            n_draft: 8,
+            max_match: 64,
+            q: 0.5,
+        }
+    }
+}
+
+/// Longest-suffix-match drafter (SuffixDecoding). See the module section.
+#[derive(Debug, Clone)]
+pub struct SuffixDrafter {
+    cfg: SuffixDrafterConfig,
+}
+
+impl SuffixDrafter {
+    pub fn new(cfg: SuffixDrafterConfig) -> Self {
+        Self { cfg }
+    }
+
+    pub fn with_defaults() -> Self {
+        Self::new(SuffixDrafterConfig::default())
+    }
+
+    pub fn config(&self) -> SuffixDrafterConfig {
+        self.cfg
+    }
+
+    /// Propose up to `n_draft` tokens from the LONGEST suffix of `hist`
+    /// (length in `[n_min_match, max_match]`) that occurs earlier in the
+    /// history; newest (closest) earlier match wins on ties. Returns empty
+    /// when no suffix of at least `n_min_match` tokens recurs — the caller
+    /// then decodes a single token, exactly like [`NgramDrafter`].
+    pub fn propose(&self, hist: &[u32]) -> Vec<DraftToken> {
+        let n_min = self.cfg.n_min_match.max(1);
+        let n_draft = self.cfg.n_draft;
+        if n_draft == 0 || hist.len() <= n_min {
+            return Vec::new();
+        }
+        // Longest suffix we can try: bounded by max_match and by leaving at
+        // least one earlier token to match against.
+        let max_len = self.cfg.max_match.min(hist.len() - 1);
+        // Longest-first: the first match length with an earlier occurrence
+        // wins (longest match); within a length, newest earlier occurrence
+        // wins (scan starts from just before the query down to 0).
+        let mut match_len = max_len;
+        while match_len >= n_min {
+            let q_start = hist.len() - match_len;
+            let query = &hist[q_start..];
+            let mut start = q_start;
+            while start > 0 {
+                start -= 1;
+                if start + match_len > q_start {
+                    // Candidate window would overlap the query itself.
+                    continue;
+                }
+                if &hist[start..start + match_len] == query {
+                    // Draft the tokens that followed the earlier match, up
+                    // to n_draft and clamped to the query start (never
+                    // propose the query's own tokens).
+                    let draft_start = start + match_len;
+                    let draft_end = (draft_start + n_draft).min(q_start);
+                    if draft_end <= draft_start {
+                        return Vec::new();
+                    }
+                    return hist[draft_start..draft_end]
+                        .iter()
+                        .map(|&id| DraftToken { id, q: self.cfg.q })
+                        .collect();
+                }
+            }
+            match_len -= 1;
+        }
+        Vec::new()
+    }
+}
+
+impl HistoryDrafter for SuffixDrafter {
+    fn propose(&self, hist: &[u32]) -> Vec<DraftToken> {
+        SuffixDrafter::propose(self, hist)
+    }
+}
+
+// ============================================================
 // F10 — Lookahead / Jacobi decoding (n-gram-pool drafter)
 // ============================================================
 //
@@ -1961,6 +2112,141 @@ mod ngram_tests {
         assert_eq!(outcome.accepted.len(), drafts.len());
         assert_eq!(outcome.accepted, vec![drafts[0].id, drafts[1].id]);
         assert_eq!(outcome.replacement, 7);
+    }
+}
+
+#[cfg(test)]
+mod suffix_tests {
+    use super::*;
+
+    fn ids(drafts: &[DraftToken]) -> Vec<u32> {
+        drafts.iter().map(|d| d.id).collect()
+    }
+
+    #[test]
+    fn empty_or_short_history_yields_empty() {
+        let d = SuffixDrafter::with_defaults(); // n_min_match = 2
+        assert!(d.propose(&[]).is_empty());
+        assert!(d.propose(&[7]).is_empty());
+    }
+
+    #[test]
+    fn no_match_yields_empty() {
+        let d = SuffixDrafter::new(SuffixDrafterConfig {
+            n_min_match: 2,
+            n_draft: 4,
+            max_match: 64,
+            q: 0.5,
+        });
+        assert!(d.propose(&[1, 2, 3, 4, 5]).is_empty());
+    }
+
+    #[test]
+    fn longest_match_beats_fixed_ngram() {
+        // History ends in [1,2,3,4]. That 4-token suffix recurs at index 0
+        // (followed by 5,6,7), while the SHORTER 2-token suffix [3,4] recurs
+        // more recently at index 9 (followed by 99,1,2). The suffix drafter
+        // matches the LONGEST (4-token) suffix → drafts the correct
+        // continuation [5,6,7]; a fixed 2-gram would match the recent short
+        // suffix → [99,1,2].
+        let hist = vec![1, 2, 3, 4, 5, 6, 7, 10, 11, 3, 4, 99, 1, 2, 3, 4];
+        let d = SuffixDrafter::new(SuffixDrafterConfig {
+            n_min_match: 2,
+            n_draft: 3,
+            max_match: 64,
+            q: 0.5,
+        });
+        assert_eq!(ids(&d.propose(&hist)), vec![5, 6, 7]);
+        assert!(d.propose(&hist).iter().all(|t| (t.q - 0.5).abs() < 1e-9));
+        // Contrast: a fixed 2-gram matches the recent short suffix instead.
+        let ng = NgramDrafter::new(NgramDrafterConfig {
+            n_match: 2,
+            n_draft: 3,
+            q: 0.5,
+        });
+        assert_eq!(ids(&ng.propose(&hist)), vec![99, 1, 2]);
+    }
+
+    #[test]
+    fn newest_match_wins_on_tie() {
+        // [1,2,3] recurs at index 0 (→ 8) and index 4 (→ 9); the trailing
+        // [1,2,3] is the query. Newest earlier occurrence (index 4) wins → [9].
+        let hist = vec![1, 2, 3, 8, 1, 2, 3, 9, 1, 2, 3];
+        let d = SuffixDrafter::new(SuffixDrafterConfig {
+            n_min_match: 2,
+            n_draft: 4,
+            max_match: 64,
+            q: 0.5,
+        });
+        assert_eq!(ids(&d.propose(&hist)), vec![9]);
+    }
+
+    #[test]
+    fn respects_n_draft_cap() {
+        // Longest match is the 4-token suffix at index 0, which is followed by
+        // 5,6,7 before the query begins; n_draft=2 clamps to [5,6].
+        let hist = vec![1, 2, 3, 4, 5, 6, 7, 10, 11, 3, 4, 99, 1, 2, 3, 4];
+        let d = SuffixDrafter::new(SuffixDrafterConfig {
+            n_min_match: 2,
+            n_draft: 2,
+            max_match: 64,
+            q: 0.5,
+        });
+        assert_eq!(ids(&d.propose(&hist)), vec![5, 6]);
+    }
+
+    #[test]
+    fn respects_max_match_cap() {
+        // Same history, but max_match=2 forbids the long 4-token match, so it
+        // falls back to the recent 2-token suffix [3,4] → [99,1,2].
+        let hist = vec![1, 2, 3, 4, 5, 6, 7, 10, 11, 3, 4, 99, 1, 2, 3, 4];
+        let d = SuffixDrafter::new(SuffixDrafterConfig {
+            n_min_match: 2,
+            n_draft: 3,
+            max_match: 2,
+            q: 0.5,
+        });
+        assert_eq!(ids(&d.propose(&hist)), vec![99, 1, 2]);
+    }
+
+    #[test]
+    fn proposals_feed_accept_reject_cleanly() {
+        let hist = vec![1, 2, 3, 4, 5, 6, 7, 10, 11, 3, 4, 99, 1, 2, 3, 4];
+        let drafter = SuffixDrafter::new(SuffixDrafterConfig {
+            n_min_match: 2,
+            n_draft: 2,
+            max_match: 64,
+            q: 0.5,
+        });
+        let drafts = drafter.propose(&hist);
+        assert_eq!(drafts.len(), 2);
+        let vocab = 128usize;
+        let mut p_vecs: Vec<Vec<f32>> = Vec::with_capacity(drafts.len() + 1);
+        for d in &drafts {
+            let mut v = vec![0f32; vocab];
+            v[d.id as usize] = 1.0;
+            p_vecs.push(v);
+        }
+        let mut bonus = vec![0f32; vocab];
+        bonus[7] = 1.0;
+        p_vecs.push(bonus);
+        let target_refs: Vec<&[f32]> = p_vecs.iter().map(|v| v.as_slice()).collect();
+        let mut rng = Rng::from_seed(42);
+        let outcome = accept_reject(&drafts, &target_refs, &mut rng);
+        assert_eq!(outcome.accepted, vec![drafts[0].id, drafts[1].id]);
+        assert_eq!(outcome.replacement, 7);
+    }
+
+    #[test]
+    fn trait_object_dispatches_to_suffix() {
+        let hist = vec![1, 2, 3, 4, 5, 6, 7, 10, 11, 3, 4, 99, 1, 2, 3, 4];
+        let d: Box<dyn HistoryDrafter + Send> = Box::new(SuffixDrafter::new(SuffixDrafterConfig {
+            n_min_match: 2,
+            n_draft: 3,
+            max_match: 64,
+            q: 0.5,
+        }));
+        assert_eq!(ids(&d.propose(&hist)), vec![5, 6, 7]);
     }
 }
 

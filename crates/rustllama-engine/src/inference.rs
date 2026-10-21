@@ -21,7 +21,8 @@ use crate::prefix_cache::PrefixCachePool;
 use crate::sampling::{compute_logprobs, Rng, Sampler};
 use crate::speculative::{
     accept_reject, accept_reject_dispatch, accept_reject_greedy, AcceptMode, DraftToken,
-    LookaheadDrafter, LookaheadDrafterConfig, MtpDrafter, NgramDrafter, NgramDrafterConfig,
+    HistoryDrafter, LookaheadDrafter, LookaheadDrafterConfig, MtpDrafter, NgramDrafter,
+    NgramDrafterConfig, SuffixDrafter, SuffixDrafterConfig,
 };
 use crate::{
     ChatMessage, Engine, GrammarKind, Metrics, RequestStats, Result as EngineResult,
@@ -110,6 +111,16 @@ pub struct ContiguousEngine {
     /// a pure win on repetitive / code-like outputs and a no-op (one
     /// token per round, same as classic decode) when nothing matches.
     ngram_spec: Option<NgramDrafterConfig>,
+    /// T5e — SuffixDecoding. When `Some`, grammar-free text generation routes
+    /// through the shared history-drafter driver with a [`SuffixDrafter`]
+    /// (longest-suffix match) instead of the classic single-token path. `None`
+    /// (default) keeps classic decode (byte-identical). Set at load from
+    /// `[inference].speculative_suffix` via [`Self::set_suffix_speculative`];
+    /// forks inherit it. Head-free like the n-gram drafter, but matches the
+    /// LONGEST recurring suffix (not a fixed window), so it drafts deeper on
+    /// agentic / repetitive output. Placed just ABOVE `ngram_spec` in dispatch
+    /// precedence (`eagle > tree > MTP > lookahead > suffix > n-gram`).
+    suffix_spec: Option<SuffixDrafterConfig>,
     /// F10 — lookahead / Jacobi decoding. When `Some`, grammar-free text
     /// generation routes through the lookahead (n-gram-pool) speculative
     /// driver ([`Self::speculate_lookahead_stream_from_ids`]) instead of
@@ -2142,6 +2153,7 @@ impl ContiguousEngine {
             image_token_id: None,
             placeholder_mode: None,
             ngram_spec: None,
+            suffix_spec: None,
             lookahead_spec: None,
             draft_spec: None,
             mtp_spec: false,
@@ -2831,6 +2843,7 @@ impl ContiguousEngine {
             image_token_id: None,
             placeholder_mode: None,
             ngram_spec: None,
+            suffix_spec: None,
             lookahead_spec: None,
             draft_spec: None,
             mtp_spec: false,
@@ -3003,6 +3016,7 @@ impl ContiguousEngine {
             image_token_id: None,
             placeholder_mode: None,
             ngram_spec: None,
+            suffix_spec: None,
             lookahead_spec: None,
             draft_spec: None,
             mtp_spec: false,
@@ -4058,6 +4072,21 @@ impl ContiguousEngine {
         self.ngram_spec
     }
 
+    /// T5e — enable / disable SuffixDecoding (longest-suffix-match) speculative
+    /// decoding for this engine's text path. `None` (default) keeps classic
+    /// single-token decode (byte-identical). When `Some`, grammar-free `chat` /
+    /// `generate` route through [`Self::speculate_suffix_stream_from_ids`] (the
+    /// shared history-drafter driver), verified by the SAME accept/reject the
+    /// n-gram path uses. Head-free, takes precedence over n-gram when both are
+    /// set. Set at load from `[inference].speculative_suffix`.
+    pub fn set_suffix_speculative(&mut self, cfg: Option<SuffixDrafterConfig>) {
+        self.suffix_spec = cfg;
+    }
+
+    pub fn suffix_speculative(&self) -> Option<SuffixDrafterConfig> {
+        self.suffix_spec
+    }
+
     /// F10 — enable / disable lookahead (Jacobi n-gram-pool) speculative
     /// decoding for this engine's text-generation path. `None` (default)
     /// keeps the classic single-token decode (byte-identical). When `Some`,
@@ -4586,6 +4615,7 @@ impl ContiguousEngine {
             placeholder_mode: self.placeholder_mode,
             // Forks inherit the parent's speculative setting (Copy).
             ngram_spec: self.ngram_spec,
+            suffix_spec: self.suffix_spec,
             lookahead_spec: self.lookahead_spec,
             draft_spec: self.draft_spec.clone(),
             // MTP self-speculation is a plain Copy bool; forks inherit it.
@@ -8510,6 +8540,13 @@ impl Engine for ContiguousEngine {
                 return self.speculate_lookahead_stream(prompt, cfg, s.clone());
             }
         }
+        // T5e — SuffixDecoding, just above plain n-gram (`… > lookahead > suffix
+        // > n-gram`): longest-suffix match drafts deeper than the fixed n-gram.
+        if let Some(cfg) = self.suffix_spec {
+            if s.grammar.is_none() && allow_spec {
+                return self.speculate_suffix_stream(prompt, cfg, s.clone());
+            }
+        }
         if let Some(cfg) = self.ngram_spec {
             if s.grammar.is_none() && allow_spec {
                 return self.speculate_ngram_stream(prompt, cfg, s.clone());
@@ -8547,6 +8584,12 @@ impl Engine for ContiguousEngine {
         if let Some(cfg) = self.lookahead_spec {
             if s.grammar.is_none() && allow_spec {
                 return self.speculate_lookahead_stream(prompt.to_string(), cfg, s.clone());
+            }
+        }
+        // T5e — SuffixDecoding, just above plain n-gram (see `generate_stream`).
+        if let Some(cfg) = self.suffix_spec {
+            if s.grammar.is_none() && allow_spec {
+                return self.speculate_suffix_stream(prompt.to_string(), cfg, s.clone());
             }
         }
         if let Some(cfg) = self.ngram_spec {
@@ -8974,9 +9017,66 @@ impl ContiguousEngine {
         cfg: NgramDrafterConfig,
         s: SamplingParams,
     ) -> EngineResult<TokenStream> {
+        self.speculate_history_stream_from_ids(
+            initial_prompt_ids,
+            Box::new(NgramDrafter::new(cfg)),
+            cfg.n_draft.max(1),
+            s,
+        )
+    }
+
+    /// T5e — text entry for SuffixDecoding speculation (mirrors
+    /// [`Self::speculate_ngram_stream`]).
+    pub fn speculate_suffix_stream(
+        &self,
+        prompt: String,
+        cfg: SuffixDrafterConfig,
+        s: SamplingParams,
+    ) -> EngineResult<TokenStream> {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
-            crate::EngineError::Unimplemented("speculate_ngram requires a tokenizer")
+            crate::EngineError::Unimplemented("speculate_suffix requires a tokenizer")
         })?;
+        let add_bos = tokenizer.add_bos_token();
+        let initial_prompt_ids: Vec<i32> = tokenizer
+            .encode(&prompt, add_bos)?
+            .into_iter()
+            .map(|t| t as i32)
+            .collect();
+        self.speculate_suffix_stream_from_ids(initial_prompt_ids, cfg, s)
+    }
+
+    /// T5e — ID-level entry for SuffixDecoding speculation (mirrors
+    /// [`Self::speculate_ngram_stream_from_ids`]).
+    pub fn speculate_suffix_stream_from_ids(
+        &self,
+        initial_prompt_ids: Vec<i32>,
+        cfg: SuffixDrafterConfig,
+        s: SamplingParams,
+    ) -> EngineResult<TokenStream> {
+        self.speculate_history_stream_from_ids(
+            initial_prompt_ids,
+            Box::new(SuffixDrafter::new(cfg)),
+            cfg.n_draft.max(1),
+            s,
+        )
+    }
+
+    /// Shared speculative-decode stream for the head-free history drafters
+    /// (n-gram, suffix). The `drafter` is the ONLY per-strategy touchpoint —
+    /// verify forward, accept/reject, commit, emit, and stats are identical.
+    /// Lossless: committed tokens are byte-identical to classic decode no matter
+    /// what the drafter proposes (the target forward verifies every token).
+    fn speculate_history_stream_from_ids(
+        &self,
+        initial_prompt_ids: Vec<i32>,
+        drafter: Box<dyn HistoryDrafter + Send>,
+        candidate_cap: usize,
+        s: SamplingParams,
+    ) -> EngineResult<TokenStream> {
+        let tokenizer = self
+            .tokenizer
+            .clone()
+            .ok_or_else(|| crate::EngineError::Unimplemented("speculate requires a tokenizer"))?;
         if initial_prompt_ids.is_empty() {
             let stream = async_stream::stream! {
                 if false { yield Ok(Token { id: 0, text: String::new(), logprobs: None }); }
@@ -8984,8 +9084,6 @@ impl ContiguousEngine {
             return Ok(Box::pin(stream));
         }
 
-        let drafter = NgramDrafter::new(cfg);
-        let candidate_cap = cfg.n_draft.max(1);
         let seed = s.seed;
         let max_tokens = s.max_tokens as usize;
         // Stop on ANY end-of-generation token (eos + the model's other
@@ -9119,7 +9217,7 @@ impl ContiguousEngine {
                         rng_slot = Some(r);
                         let _ = &rng_slot;
                         yield Err(crate::EngineError::Engine(format!(
-                            "verify_speculation (ngram): {e}"
+                            "verify_speculation (spec): {e}"
                         )));
                         return;
                     }

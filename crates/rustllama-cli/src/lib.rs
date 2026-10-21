@@ -4482,6 +4482,21 @@ async fn serve(
                 cacheblend_ratio: Some(applied_cacheblend),
             }
             .apply_to(&mut cpu);
+            // T5e — SuffixDecoding (head-free longest-suffix drafter), applied
+            // from the config flag. TODO(T5e follow-up): add SpecStrategy::Suffix
+            // + clear suffix_spec in TunerWinners mutual-exclusion so the per-model
+            // auto-selector can own it; until then it's an independent opt-in flag
+            // (default off), applied here after the winner set.
+            if cfg.inference.speculative_suffix {
+                cpu.set_suffix_speculative(Some(
+                    rustllama_engine::speculative::SuffixDrafterConfig {
+                        n_min_match: cfg.inference.suffix_n_min_match as usize,
+                        n_draft: cfg.inference.suffix_n_draft as usize,
+                        max_match: cfg.inference.suffix_max_match as usize,
+                        q: 0.5,
+                    },
+                ));
+            }
             // P10b — attach the EAGLE draft head (companion GGUF) to the FIRST
             // startup model. Load-time validated against the base; a malformed
             // head fails the load loudly (fail-closed). Takes precedence over
@@ -11190,6 +11205,16 @@ fn bench(
         cacheblend_ratio: None,
     }
     .apply_to(&mut cpu);
+    // T5e — SuffixDecoding (config flag; TODO(T5e follow-up): fold into
+    // SpecStrategy + TunerWinners mutual-exclusion). Applied after the winners.
+    if cfg.inference.speculative_suffix {
+        cpu.set_suffix_speculative(Some(rustllama_engine::speculative::SuffixDrafterConfig {
+            n_min_match: cfg.inference.suffix_n_min_match as usize,
+            n_draft: cfg.inference.suffix_n_draft as usize,
+            max_match: cfg.inference.suffix_max_match as usize,
+            q: 0.5,
+        }));
+    }
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
     println!("  load          = {load_ms:.1} ms");
     // Make the device placement explicit so a CPU-vs-GPU run is never

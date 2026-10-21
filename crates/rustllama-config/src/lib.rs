@@ -585,6 +585,25 @@ pub struct InferenceConfig {
     /// verify compute on a miss. Ignored when `speculative_ngram = false`.
     #[serde(default = "default_ngram_n_draft")]
     pub ngram_n_draft: u32,
+    /// T5e — SuffixDecoding (longest-suffix-match) speculative decoding.
+    /// Default `false`. Head-free like `speculative_ngram`, but matches the
+    /// LONGEST recurring suffix of the history (not a fixed window), so it
+    /// drafts deeper on agentic / repetitive output. Takes precedence over
+    /// `speculative_ngram` when both are set. Same raw-softmax caveat.
+    #[serde(default)]
+    pub speculative_suffix: bool,
+    /// Shortest trailing-suffix match length for `speculative_suffix`.
+    /// Default 2. Ignored when `speculative_suffix = false`.
+    #[serde(default = "default_suffix_n_min_match")]
+    pub suffix_n_min_match: u32,
+    /// Max tokens the suffix drafter proposes per round. Default 8. Ignored
+    /// when `speculative_suffix = false`.
+    #[serde(default = "default_suffix_n_draft")]
+    pub suffix_n_draft: u32,
+    /// Longest trailing suffix the suffix drafter searches for; bounds the
+    /// match-scan cost. Default 64. Ignored when `speculative_suffix = false`.
+    #[serde(default = "default_suffix_max_match")]
+    pub suffix_max_match: u32,
     /// F10 — lookahead / Jacobi decoding. Default `false`. When `true`,
     /// grammar-free requests route through the lookahead (n-gram-pool)
     /// speculative driver: an n-gram pool harvested from the realized
@@ -880,6 +899,18 @@ fn default_speculative_tree_widths() -> Vec<u32> {
     vec![2, 2, 2, 2]
 }
 
+fn default_suffix_n_min_match() -> u32 {
+    2
+}
+
+fn default_suffix_n_draft() -> u32 {
+    8
+}
+
+fn default_suffix_max_match() -> u32 {
+    64
+}
+
 fn default_ngram_n_draft() -> u32 {
     4
 }
@@ -1066,6 +1097,10 @@ impl Default for InferenceConfig {
             speculative_draft_k: default_speculative_draft_k(),
             ngram_n_match: 3,
             ngram_n_draft: 4,
+            speculative_suffix: false,
+            suffix_n_min_match: 2,
+            suffix_n_draft: 8,
+            suffix_max_match: 64,
             speculative_lookahead: false,
             lookahead_ngram: 3,
             lookahead_window: 5,
