@@ -936,11 +936,11 @@ pub struct OllamaMessage {
     pub tool_call_id: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
-    /// Ollama's `messages[].images` (vision attachments — base64 strings or
-    /// paths). We have no VLM, so a request carrying a non-empty `images`
-    /// array is rejected with 400 (see [`chat`]) instead of being silently
-    /// dropped by serde and answered text-only. Documented in the module
-    /// header as a deliberate difference from upstream Ollama.
+    /// Ollama's `messages[].images` (vision attachments — base64 strings). On a
+    /// vision-capable model these decode to `ChatMessage.images` and feed the VLM
+    /// (B3); on a text-only model a non-empty `images` array is rejected with 400
+    /// (see [`chat`]) rather than silently dropped by serde and answered
+    /// text-only.
     #[serde(default)]
     pub images: Option<Vec<Value>>,
 }
@@ -999,6 +999,53 @@ fn default_true() -> bool {
     true
 }
 
+/// B3 vision: decode one Ollama `messages[].images` entry (a base64 string, or
+/// occasionally a full `data:` URI) to raw image bytes, reusing the shared
+/// [`crate::image_url::decode_image_url`] decoder (base64 + media-type validation
+/// + SSRF policy). A bare base64 payload is wrapped as a PNG `data:` URI so the
+/// one decoder handles both shapes; the real format is sniffed later by
+/// `preprocess_image`, so the declared type only needs to pass the png/jpeg gate.
+fn decode_ollama_image(v: &Value) -> Result<Vec<u8>, crate::image_url::ImageUrlError> {
+    let s = v
+        .as_str()
+        .ok_or(crate::image_url::ImageUrlError::MalformedDataUri(
+            "ollama image entry must be a base64 string",
+        ))?;
+    if s.starts_with("data:") {
+        crate::image_url::decode_image_url(s)
+    } else {
+        let uri = format!("data:image/png;base64,{s}");
+        crate::image_url::decode_image_url(&uri)
+    }
+}
+
+/// B3 vision: convert Ollama chat messages to engine [`ChatMessage`]s, decoding
+/// each message's `images` to bytes on `ChatMessage.images` when `vision` is true
+/// (a vision-capable model is loaded). A text-only model is rejected upstream, so
+/// here `vision == false` simply drops any images (none present on that path).
+fn ollama_messages_to_engine(
+    messages: Vec<OllamaMessage>,
+    vision: bool,
+) -> Result<Vec<ChatMessage>, crate::image_url::ImageUrlError> {
+    let mut out = Vec::with_capacity(messages.len());
+    for m in messages {
+        let mut images: Vec<Vec<u8>> = Vec::new();
+        if vision {
+            if let Some(imgs) = m.images.as_ref() {
+                for v in imgs {
+                    images.push(decode_ollama_image(v)?);
+                }
+            }
+        }
+        out.push(ChatMessage {
+            role: m.role,
+            content: m.content,
+            images,
+        });
+    }
+    Ok(out)
+}
+
 pub async fn chat(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1006,23 +1053,6 @@ pub async fn chat(
 ) -> Response {
     // P14-http: parse the optional priority / deadline headers once.
     let sched = ReqSchedule::from_headers(&headers);
-    // Vision (`messages[].images`) is not supported — we have no VLM. Reject
-    // with a 400 (matching the module header) rather than letting serde drop
-    // the field and silently answering text-only.
-    if req
-        .messages
-        .iter()
-        .any(|m| m.images.as_ref().map(|i| !i.is_empty()).unwrap_or(false))
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "images (vision) are not supported by this server; \
-                          `messages[].images` cannot be served (no vision model)"
-            })),
-        )
-            .into_response();
-    }
     // P11 (Ollama LoRA): resolve supports the `model: "<base>:<adapter>"`
     // convention (via `resolve_with_lora`); `lora_model_adapter` is the adapter
     // peeled from that string, finalized below (the explicit `options.lora`
@@ -1031,6 +1061,28 @@ pub async fn chat(
     else {
         return ollama_model_not_found(req.model.as_deref());
     };
+    // B3 vision: a vision-capable model decodes `messages[].images` (Ollama
+    // base64) to bytes in the msgs build below. A text-only model still can't
+    // serve them, so reject with 400 (the long-standing behavior) rather than
+    // silently answering text-only. Checked here — before the tools branch — so a
+    // text-only model rejects images on EVERY path. (On a vision model the tools
+    // path currently drops images, like the OpenAI tools path; the tools+vision
+    // splice is a separate item.)
+    let vision = serving.engine.supports_vision();
+    let has_images = req
+        .messages
+        .iter()
+        .any(|m| m.images.as_ref().map(|i| !i.is_empty()).unwrap_or(false));
+    if has_images && !vision {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "images (vision) require a vision-capable model; this model \
+                          is text-only and cannot serve `messages[].images`"
+            })),
+        )
+            .into_response();
+    }
     // Tools present → dedicated non-streaming tool path: render the tools
     // into the prompt, engage the tool-call grammar, and return parsed
     // `message.tool_calls`. Ollama clients that send tools expect the
@@ -1057,11 +1109,16 @@ pub async fn chat(
         .model
         .clone()
         .unwrap_or_else(|| serving.model_id.clone());
-    let msgs: Vec<ChatMessage> = req
-        .messages
-        .into_iter()
-        .map(|m| ChatMessage::text(m.role, m.content))
-        .collect();
+    let msgs: Vec<ChatMessage> = match ollama_messages_to_engine(req.messages, vision) {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("messages[].images: {e}") })),
+            )
+                .into_response();
+        }
+    };
 
     let prompt_eval_count = serving
         .cpu_engine
@@ -2450,6 +2507,60 @@ mod tests {
         let default_seed = rustllama_engine::SamplingParams::default().seed;
         let sampling = sampling_from_options(Some(&opts));
         assert_eq!(sampling.seed, default_seed);
+    }
+
+    // ----- B3 vision: ollama image decode -----------------------------------
+
+    fn b64(raw: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    }
+
+    fn user_msg_with_image(b64img: String) -> super::OllamaMessage {
+        super::OllamaMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            images: Some(vec![serde_json::Value::String(b64img)]),
+        }
+    }
+
+    #[test]
+    fn ollama_decodes_bare_base64_image() {
+        let raw = b"\x89PNG\r\n\x1a\nfakebody".to_vec();
+        let v = serde_json::Value::String(b64(&raw));
+        assert_eq!(super::decode_ollama_image(&v).unwrap(), raw);
+    }
+
+    #[test]
+    fn ollama_decodes_full_data_uri_image() {
+        // Some clients send a full data: URI in the images array; the decoder
+        // must NOT double-wrap it.
+        let raw = b"jpeg-body".to_vec();
+        let v = serde_json::Value::String(format!("data:image/jpeg;base64,{}", b64(&raw)));
+        assert_eq!(super::decode_ollama_image(&v).unwrap(), raw);
+    }
+
+    #[test]
+    fn ollama_non_string_image_entry_errors() {
+        let v = serde_json::json!({ "not": "a string" });
+        assert!(super::decode_ollama_image(&v).is_err());
+    }
+
+    #[test]
+    fn ollama_messages_attach_images_only_on_vision_model() {
+        let raw = b"\x89PNG\r\n\x1a\nx".to_vec();
+        // vision=true → bytes attach.
+        let on =
+            super::ollama_messages_to_engine(vec![user_msg_with_image(b64(&raw))], true).unwrap();
+        assert_eq!(on[0].images, vec![raw.clone()]);
+        // vision=false → bytes dropped (a text-only model is rejected upstream).
+        let off =
+            super::ollama_messages_to_engine(vec![user_msg_with_image(b64(&raw))], false).unwrap();
+        assert!(off[0].images.is_empty());
+        assert_eq!(off[0].content, "hi");
     }
 
     #[test]

@@ -19,11 +19,13 @@
 //!     server-initiated abort without crashing on an unknown enum value.
 //!
 //! Audit gaps (deferred to v1.x):
-//!   - Image content blocks: parsed but rendered as a
-//!     `[image: <media_type>]` placeholder rather than fed to a VLM.
-//!     Lets multimodal SDK callers (Claude Code with image attachments)
-//!     hit our text-only models without crashing. Real VLM support is
-//!     a v1.x item.
+//!   - Image content blocks (B1): on a VISION-capable model, `image` /
+//!     `image_url` blocks decode to `ChatMessage.images` (reusing the OpenAI
+//!     `image_url` decoder) and feed the VLM splice. On a TEXT-ONLY model they
+//!     still render as a `[image: <media_type>]` placeholder so multimodal SDK
+//!     callers (Claude Code with image attachments) degrade gracefully instead
+//!     of erroring. (The tools path still flattens images to the placeholder —
+//!     tools+vision is a separate item.)
 //!   - `cache_control` (F13): `{"type":"ephemeral"}` markers on system /
 //!     message / tool blocks are honored by mapping the request to the
 //!     engine's prefix-cache (APC) boundary. The engine already caches every
@@ -217,17 +219,6 @@ pub enum ContentField {
 }
 
 impl ContentField {
-    fn into_text(self) -> String {
-        match self {
-            ContentField::Plain(s) => s,
-            ContentField::Blocks(blocks) => blocks
-                .into_iter()
-                .map(content_block_to_text)
-                .collect::<Vec<_>>()
-                .join(""),
-        }
-    }
-
     /// F13: `true` if any content block carries a `cache_control` marker
     /// (clients annotate a long context block — e.g. a codebase dump — to mark
     /// it as the cacheable prefix).
@@ -289,6 +280,88 @@ fn content_block_to_text(b: TextBlock) -> String {
         }
         _ => b.text,
     }
+}
+
+/// B1 vision: convert one Anthropic `MessageWire` to an engine [`ChatMessage`],
+/// decoding image blocks to raw bytes on `ChatMessage.images` when `vision` is
+/// true (the loaded model has a vision tower). The `[image: …]` placeholder text
+/// is ALWAYS preserved (identical to [`content_block_to_text`]'s output) so a
+/// vision engine can splice features at those positions and a text-only engine
+/// still sees a coherent prompt. When `vision` is false the bytes are dropped —
+/// the graceful text-only fallback (the engine would otherwise reject a
+/// non-empty-images message with `VisionNotSupported`).
+///
+/// Returns `Err(ImageUrlError)` on a malformed image while decoding (the handler
+/// maps it to HTTP 400), mirroring the OpenAI `try_into_with_image_bytes` path.
+fn anthropic_message_to_engine(
+    m: MessageWire,
+    vision: bool,
+) -> Result<ChatMessage, crate::image_url::ImageUrlError> {
+    match m.content {
+        ContentField::Plain(s) => Ok(ChatMessage::text(m.role, s)),
+        ContentField::Blocks(blocks) => {
+            let mut text_parts: Vec<String> = Vec::with_capacity(blocks.len());
+            let mut images: Vec<Vec<u8>> = Vec::new();
+            for b in blocks {
+                // On a vision model, decode the block's image bytes FIRST (borrows
+                // `b`), then reuse `content_block_to_text` for the placeholder /
+                // text (it consumes `b`) so the rendered prompt is byte-identical
+                // to the text-only path and there is one source of truth for the
+                // placeholder shape.
+                if vision {
+                    match b.kind.as_str() {
+                        "image" => {
+                            if let Some(bytes) = decode_anthropic_source(b.source.as_ref())? {
+                                images.push(bytes);
+                            }
+                        }
+                        "image_url" => {
+                            if let Some(iu) = b.image_url.as_ref() {
+                                if !iu.url.is_empty() {
+                                    images.push(crate::image_url::decode_image_url(&iu.url)?);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                text_parts.push(content_block_to_text(b));
+            }
+            Ok(ChatMessage {
+                role: m.role,
+                content: text_parts.join(""),
+                images,
+            })
+        }
+    }
+}
+
+/// Decode an Anthropic image-block `source` to raw bytes, reusing the shared
+/// [`crate::image_url::decode_image_url`] decoder (its base64 + media-type
+/// validation + SSRF policy). A `base64` source is wrapped as a `data:` URI so the
+/// one decoder handles both wire shapes; a `url` source is passed through (remote
+/// → rejected). `Ok(None)` when there's nothing to decode (absent/empty source).
+fn decode_anthropic_source(
+    source: Option<&ImageSource>,
+) -> Result<Option<Vec<u8>>, crate::image_url::ImageUrlError> {
+    let Some(src) = source else { return Ok(None) };
+    if !src.data.is_empty() {
+        // Wrap the base64 payload as a data: URI — the shared decoder validates
+        // the media type + base64 exactly like the OpenAI path. Default the
+        // declared type to PNG when the client omitted it (the real format is
+        // sniffed later by `preprocess_image`; the base64 decodes regardless).
+        let media = if src.media_type.is_empty() {
+            "image/png"
+        } else {
+            src.media_type.as_str()
+        };
+        let uri = format!("data:{media};base64,{}", src.data);
+        return crate::image_url::decode_image_url(&uri).map(Some);
+    }
+    if !src.url.is_empty() {
+        return crate::image_url::decode_image_url(&src.url).map(Some);
+    }
+    Ok(None)
 }
 
 // ----- response (non-streaming) ---------------------------------------------
@@ -464,23 +537,10 @@ pub async fn messages(State(state): State<AppState>, Json(req): Json<MessagesReq
             .map(tools_have_cache_control)
             .unwrap_or(false);
 
-    // Build the ChatMessage list. Anthropic's `system` is top-level; the
-    // existing chat-template renderer expects it inline as a system
-    // message (which most Jinja templates handle correctly).
-    let mut msgs: Vec<ChatMessage> = Vec::with_capacity(req_messages.len() + 1);
-    if let Some(sys) = req_system {
-        let text = sys.into_text();
-        if !text.is_empty() {
-            msgs.push(ChatMessage::text("system", text));
-        }
-    }
-    for m in req_messages {
-        // Anthropic adapter still surfaces images as placeholder text
-        // (the Anthropic `source.data` shape is base64 already; future
-        // work can attach those bytes to ChatMessage.images alongside
-        // the OpenAI image_url path landing in chat.rs).
-        msgs.push(ChatMessage::text(m.role, m.content.into_text()));
-    }
+    // The ChatMessage list is built AFTER the model resolves below, so the image
+    // decode can gate on `serving.engine.supports_vision()` (B1): a vision model
+    // gets the decoded bytes on ChatMessage.images, a text-only model keeps the
+    // `[image: …]` placeholder text and degrades gracefully.
 
     // P11 (Anthropic LoRA): the `model: "<base>:<adapter>"` convention is the
     // only natural adapter carrier on /v1/messages (there is no `lora` field).
@@ -497,6 +557,40 @@ pub async fn messages(State(state): State<AppState>, Json(req): Json<MessagesReq
     if let Some(name) = lora_model_adapter.as_deref() {
         if !serving.engine.has_lora_adapter(name) {
             return crate::lora_not_found(name);
+        }
+    }
+
+    // Build the ChatMessage list now that the model is resolved. Anthropic's
+    // `system` is top-level; the chat-template renderer expects it inline as a
+    // system message (most Jinja templates handle that). B1 vision: image blocks
+    // decode to `ChatMessage.images` ONLY when the loaded model has a vision tower
+    // (`supports_vision()`) — a text-only model keeps the `[image: …]` placeholder
+    // text and no bytes, so it degrades gracefully instead of erroring with
+    // `VisionNotSupported`. A malformed image on a vision model → HTTP 400.
+    let vision = serving.engine.supports_vision();
+    let mut msgs: Vec<ChatMessage> = Vec::with_capacity(req_messages.len() + 1);
+    if let Some(sys) = req_system {
+        let text = sys.into_text();
+        if !text.is_empty() {
+            msgs.push(ChatMessage::text("system", text));
+        }
+    }
+    for (idx, m) in req_messages.into_iter().enumerate() {
+        match anthropic_message_to_engine(m, vision) {
+            Ok(cm) => msgs.push(cm),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": format!("messages[{idx}].content image: {e}"),
+                        }
+                    })),
+                )
+                    .into_response();
+            }
         }
     }
     // Base the sampling on the resolved model's recommended profile (Qwen3's
@@ -1783,6 +1877,123 @@ mod tests {
             cache_control: None,
         };
         assert_eq!(content_block_to_text(b), "result string");
+    }
+
+    // ----- anthropic_message_to_engine (B1 vision) --------------------------
+
+    fn b64(raw: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    }
+
+    #[test]
+    fn message_plain_text_has_no_images() {
+        let m = MessageWire {
+            role: "user".into(),
+            content: ContentField::Plain("hello".into()),
+        };
+        let cm = anthropic_message_to_engine(m, true).unwrap();
+        assert_eq!(cm.content, "hello");
+        assert!(cm.images.is_empty());
+    }
+
+    #[test]
+    fn image_block_text_only_keeps_placeholder_drops_bytes() {
+        // vision=false (text-only model): the placeholder text is preserved and NO
+        // bytes attach (so the engine never rejects with VisionNotSupported), even
+        // though the base64 WOULD decode — the graceful text-only fallback.
+        let m = MessageWire {
+            role: "user".into(),
+            content: ContentField::Blocks(vec![
+                TextBlock {
+                    kind: "text".into(),
+                    text: "look: ".into(),
+                    source: None,
+                    image_url: None,
+                    cache_control: None,
+                },
+                TextBlock {
+                    kind: "image".into(),
+                    text: String::new(),
+                    source: Some(ImageSource {
+                        kind: "base64".into(),
+                        media_type: "image/png".into(),
+                        data: b64(b"\x89PNG\r\n\x1a\nfake"),
+                        url: String::new(),
+                    }),
+                    image_url: None,
+                    cache_control: None,
+                },
+            ]),
+        };
+        let cm = anthropic_message_to_engine(m, false).unwrap();
+        assert_eq!(cm.content, "look: [image: image/png]");
+        assert!(cm.images.is_empty());
+    }
+
+    #[test]
+    fn image_block_vision_decodes_base64_source_and_keeps_placeholder() {
+        let raw = b"\x89PNG\r\n\x1a\nfake-body".to_vec();
+        let m = MessageWire {
+            role: "user".into(),
+            content: ContentField::Blocks(vec![TextBlock {
+                kind: "image".into(),
+                text: String::new(),
+                source: Some(ImageSource {
+                    kind: "base64".into(),
+                    media_type: "image/png".into(),
+                    data: b64(&raw),
+                    url: String::new(),
+                }),
+                image_url: None,
+                cache_control: None,
+            }]),
+        };
+        let cm = anthropic_message_to_engine(m, true).unwrap();
+        assert_eq!(cm.content, "[image: image/png]");
+        assert_eq!(cm.images, vec![raw]);
+    }
+
+    #[test]
+    fn image_url_block_vision_decodes_data_uri() {
+        let raw = b"jpeg-body-bytes".to_vec();
+        let uri = format!("data:image/jpeg;base64,{}", b64(&raw));
+        let m = MessageWire {
+            role: "user".into(),
+            content: ContentField::Blocks(vec![TextBlock {
+                kind: "image_url".into(),
+                text: String::new(),
+                source: None,
+                image_url: Some(ImageUrl {
+                    url: uri.clone(),
+                    detail: String::new(),
+                }),
+                cache_control: None,
+            }]),
+        };
+        let cm = anthropic_message_to_engine(m, true).unwrap();
+        assert_eq!(cm.images, vec![raw]);
+        assert_eq!(cm.content, format!("[image: {uri}]"));
+    }
+
+    #[test]
+    fn image_url_block_vision_rejects_remote_url_ssrf() {
+        // A vision model still refuses a remote URL (SSRF gate) via the shared
+        // decoder — surfaced as an error the handler maps to HTTP 400.
+        let m = MessageWire {
+            role: "user".into(),
+            content: ContentField::Blocks(vec![TextBlock {
+                kind: "image_url".into(),
+                text: String::new(),
+                source: None,
+                image_url: Some(ImageUrl {
+                    url: "https://example.com/x.png".into(),
+                    detail: String::new(),
+                }),
+                cache_control: None,
+            }]),
+        };
+        assert!(anthropic_message_to_engine(m, true).is_err());
     }
 
     // ----- decide_anthropic_stop --------------------------------------------
