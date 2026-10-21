@@ -11024,13 +11024,36 @@ fn bench(
     let model_path = effective_model_path(model_override.map(str::to_string), &cfg, config_path)?;
     let ctx_size = ctx_size_override
         .unwrap_or_else(|| resolve_config_ctx(cfg.inference.ctx_size, &model_path) as usize);
-    // Override-or-config KV dtype. `--kv-dtype` overrides the config.
+
+    // T0a (measurement fairness): make `bench` measure what `serve` actually runs.
+    // `serve` force-runs the first-load autotune before load — it populates
+    // placement / kv_dtype / flash / spec winners AND the `kernel_verdicts` that
+    // gate the tensor-core / CUDA-graph / int-dot fast paths. `bench` historically
+    // skipped it, so a fresh bench measured the FAIL-CLOSED default path (all
+    // accelerated kernels OFF) — the "rustllama looks ~2x slower" trap. Mirror
+    // serve: autotune this model first (idempotent — skips when already tuned; a
+    // GGUF-less model DIRECTORY has no GGUF to tune via the subprocess path, so
+    // skip there). Explicit `--kv-dtype` / `--flash` overrides still WIN below, so
+    // an A/B of a specific setting is unaffected.
+    if !model_path.is_dir() {
+        rustllama_server::maybe_first_load_autotune(&model_path, true);
+    }
+
+    // KV dtype precedence: explicit `--kv-dtype` override → tuner-cache winner
+    // (auto_apply_kv_dtype) → config default. The cache tier is the T0a addition so
+    // bench honors the tuned winner exactly as serve does.
     let kv_dtype_str = match kv_dtype_override {
         Some(s) => s.to_string(),
-        None => cfg.inference.resolved_kv_dtype().to_string(),
+        None => kv_dtype_from_cache_or_default(cfg.tuning.auto_apply_kv_dtype)
+            .unwrap_or_else(|| cfg.inference.resolved_kv_dtype().to_string()),
     };
     let kv_dtype = parse_kv_dtype(&kv_dtype_str)?;
-    let flash_enabled = flash_override.unwrap_or(cfg.inference.flash_attention);
+    // Flash precedence mirrors kv_dtype: `--flash` override → tuner winner → config.
+    let flash_enabled = match flash_override {
+        Some(b) => b,
+        None => flash_attention_from_cache_or_default(cfg.tuning.auto_apply_flash_attention)
+            .unwrap_or(cfg.inference.flash_attention),
+    };
 
     println!("rustllama bench");
     println!("  model         = {}", model_path.display());
@@ -11040,6 +11063,27 @@ fn bench(
     println!("  prompt_tokens = {prompt_tokens}");
     println!("  decode_tokens = {decode_tokens}");
     println!("  repeats       = {repeats}");
+    // T0a self-documenting banner: how many accelerated-kernel verdicts are live
+    // for THIS build. Empty / stale ⇒ the TC / CUDA-graph / int-dot fast paths are
+    // fail-closed OFF, so the numbers below are the conservative path — re-run
+    // `tune --validate-kernels` (every rebuild re-stamps the build id).
+    if let Some(dir) = rustllama_tuner::default_cache_dir() {
+        let key = rustllama_tuner::system_fingerprint();
+        if let Ok(Some(t)) = rustllama_tuner::load_cache(&dir, &key) {
+            let passing = t.kernel_verdicts.values().filter(|v| **v).count();
+            let total = t.kernel_verdicts.len();
+            let stale = !t.kernel_verdicts.is_empty()
+                && t.kernel_build_id != rustllama_tuner::kernel_build_id();
+            let note = if stale {
+                " (STALE build-id → fast paths OFF; run `tune --validate-kernels`)"
+            } else if total == 0 {
+                " (none validated → fast paths OFF; run `tune --validate-kernels`)"
+            } else {
+                ""
+            };
+            println!("  kernel paths  = {passing}/{total} verdicts ON{note}");
+        }
+    }
     println!();
 
     // Same memory-knob promotion as `serve` — bench is the A/B tool
@@ -11105,25 +11149,47 @@ fn bench(
     }
     cpu.set_n_gpu_layers(applied_n_gpu_layers);
     cpu.set_prefix_cache(false); // bench is comparable across repeats only without prefix reuse
-    if cfg.inference.speculative_ngram {
-        cpu.set_ngram_speculative(Some(rustllama_engine::speculative::NgramDrafterConfig {
+
+    // T0a: apply the same speculative winners `serve` applies, through the shared
+    // `TunerWinners::apply_to` — the per-model best-drafter winner drives the
+    // mutual-exclusion enable/disable, with the config flags as the fallback when
+    // no cached winner exists. Draft-model spec + CacheBlend are serve-only (bench
+    // loads no second model and runs with prefix cache off), so both stay `None`.
+    let spec_ngram = cfg.inference.speculative_ngram.then(|| {
+        rustllama_engine::speculative::NgramDrafterConfig {
             n_match: cfg.inference.ngram_n_match as usize,
             n_draft: cfg.inference.ngram_n_draft as usize,
             ..Default::default()
-        }));
+        }
+    });
+    let spec_lookahead = cfg.inference.speculative_lookahead.then(|| {
+        rustllama_engine::speculative::LookaheadDrafterConfig {
+            ngram: cfg.inference.lookahead_ngram as usize,
+            window: cfg.inference.lookahead_window as usize,
+            ..Default::default()
+        }
+    });
+    let applied_mtp = if cfg.tuning.auto_apply_speculative_mtp {
+        speculative_mtp_from_cache_or_default(true).unwrap_or(cfg.inference.speculative_mtp)
+    } else {
+        cfg.inference.speculative_mtp
+    };
+    let spec_tree = cfg.inference.speculative_tree.then(|| {
+        tree_widths_from_cache_or_default(cfg.tuning.auto_apply_tree_widths)
+            .unwrap_or_else(|| cfg.inference.speculative_tree_widths.clone())
+    });
+    let spec_strategy_winner =
+        spec_strategy_from_cache_or_default(cfg.tuning.auto_apply_spec_strategy, &model_key);
+    rustllama_engine::tuner_apply::TunerWinners {
+        draft: None,
+        ngram: spec_ngram,
+        lookahead: spec_lookahead,
+        mtp: applied_mtp,
+        tree_widths: spec_tree,
+        spec_strategy: spec_strategy_winner,
+        cacheblend_ratio: None,
     }
-    // F10 — lookahead (Jacobi n-gram-pool) spec (takes precedence over n-gram).
-    if cfg.inference.speculative_lookahead {
-        cpu.set_lookahead_speculative(Some(
-            rustllama_engine::speculative::LookaheadDrafterConfig {
-                ngram: cfg.inference.lookahead_ngram as usize,
-                window: cfg.inference.lookahead_window as usize,
-                ..Default::default()
-            },
-        ));
-    }
-    // MTP / NextN self-speculation (hybrid + NextN-head models only).
-    cpu.set_mtp_speculative(cfg.inference.speculative_mtp);
+    .apply_to(&mut cpu);
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
     println!("  load          = {load_ms:.1} ms");
     // Make the device placement explicit so a CPU-vs-GPU run is never
