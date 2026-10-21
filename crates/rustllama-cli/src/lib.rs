@@ -537,6 +537,24 @@ pub enum Command {
         /// winner).
         #[arg(long, default_value_t = 3)]
         tree_widths_repeats: u32,
+        /// Best-DRAFTER sweep (Magnitude parity): measure decode tok/s for every
+        /// self-contained speculative-decoding strategy AVAILABLE on the model —
+        /// classic (no drafter), n-gram, lookahead, plus MTP + tree when the model
+        /// carries a NextN head — and pick the FASTEST. Spec decoding is lossless
+        /// (every draft is target-verified ⇒ byte-identical output), so the winner
+        /// is a pure speed argmax, no coherence gate. Subsumes `--speculative-mtp`
+        /// (its on/off arms are the MTP/None candidates). Persists PER MODEL under
+        /// `spec_strategy[<stem>]` (unlike the global MTP/tree winners), so two
+        /// models on one host keep distinct winners. Auto-applied on next load when
+        /// `[tuning].auto_apply_spec_strategy = true` (enables the winner, disables
+        /// the other drafters). The Tree candidate uses the tuned tree-width winner,
+        /// so run `--tree-widths` first (that is `tune --all`'s order).
+        #[arg(long)]
+        spec_strategy: bool,
+        /// Repeats per candidate for the best-drafter sweep (median picks the
+        /// winner).
+        #[arg(long, default_value_t = 3)]
+        spec_strategy_repeats: u32,
         /// Chunked-parallel SSM (DeltaNet) prefill A/B sweep: measure
         /// prefill tok/s with the chunked path off vs on and pick the
         /// faster arm. Hybrid models only; a non-hybrid model records
@@ -1396,6 +1414,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             speculative_mtp_repeats,
             tree_widths,
             tree_widths_repeats,
+            spec_strategy,
+            spec_strategy_repeats,
             ssm_prefill_chunked,
             ssm_prefill_chunked_repeats,
             parallel_matvec_crossover,
@@ -1498,6 +1518,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 moe_placement,
                 speculative_mtp,
                 tree_widths,
+                spec_strategy,
                 ssm_prefill_chunked,
                 parallel_matvec_crossover,
                 matvec_min_flops,
@@ -1521,6 +1542,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                      --prefix-snapshots / --kv-page-size / --flash-v3-kv-tile / \
                      --flash-bench / \
                      --moe-placement / --speculative-mtp / --tree-widths / \
+                     --spec-strategy / \
                      --ssm-prefill-chunked / --parallel-matvec-crossover / \
                      --matvec-min-flops / --ssm-chunk / \
                      --decision-calibrate / --per-device-perf / --validate-kernels / \
@@ -1654,6 +1676,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             if tree_widths {
                 return cmd_tune_tree_widths(&config_path, model, tree_widths_repeats);
+            }
+            if spec_strategy {
+                return cmd_tune_spec_strategy(&config_path, model, spec_strategy_repeats);
             }
             if ssm_prefill_chunked {
                 return cmd_tune_ssm_prefill_chunked(
@@ -4435,6 +4460,15 @@ async fn serve(
             } else {
                 None
             };
+            // Per-model best-drafter winner (Magnitude parity): when the
+            // `tune --spec-strategy` sweep has run for THIS model (keyed by stem)
+            // and auto_apply_spec_strategy is on, it drives the mutual-exclusion
+            // apply (enable the winner, disable the other self-contained drafters).
+            // `None` ⇒ the legacy per-field behavior below is used unchanged.
+            let spec_strategy_winner = spec_strategy_from_cache_or_default(
+                cfg.tuning.auto_apply_spec_strategy,
+                &model_key,
+            );
             // X1+D5: apply every speculative / CacheBlend winner through the one
             // shared function. (flash_attention / n_gpu_layers / prefix_cache
             // are NOT speculative winners and stay as their own direct calls.)
@@ -4444,6 +4478,7 @@ async fn serve(
                 lookahead: spec_lookahead_winner,
                 mtp: applied_mtp,
                 tree_widths: spec_tree_winner,
+                spec_strategy: spec_strategy_winner,
                 cacheblend_ratio: Some(applied_cacheblend),
             }
             .apply_to(&mut cpu);
@@ -6812,6 +6847,32 @@ pub fn persist_cacheblend_winner(model_key: &str, ratio: f32) -> anyhow::Result<
     Ok(())
 }
 
+/// Persist a model's best-drafter winner (keyed by file stem, like the CacheBlend
+/// ratio — NOT the global system key the legacy `speculative_mtp` / tree-width
+/// winners use), so two models on one host keep DISTINCT spec strategies. Graceful
+/// no-op when no cache dir resolves.
+pub fn persist_spec_strategy_winner(
+    model_key: &str,
+    strategy: rustllama_tuner::SpecStrategy,
+) -> anyhow::Result<()> {
+    use rustllama_tuner::{load_cache, save_cache, TuningResult};
+    let Some(cache_dir) = rustllama_tuner::default_cache_dir() else {
+        tracing::warn!("no tuner cache dir resolvable; skipping spec_strategy persistence");
+        return Ok(());
+    };
+    let (key, device) = rustllama_tuner::cache_context();
+    std::fs::create_dir_all(&cache_dir)?;
+    let mut tuning = load_cache(&cache_dir, &key)?
+        .unwrap_or_else(|| TuningResult::empty(key.clone(), device.clone()));
+    rustllama_tuner::set_spec_strategy(&mut tuning, model_key, strategy);
+    tuning.last_tuned = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| format!("{}", d.as_secs()));
+    save_cache(&cache_dir, &tuning)?;
+    Ok(())
+}
+
 /// `tune --cacheblend` (a `tune --all` sub-stage): autotune the CacheBlend
 /// recompute ratio — the SMALLEST ratio whose blended next-token distribution
 /// stays coherent (cosine ≥ 0.98) vs a full prefill on synthetic multi-chunk
@@ -7486,6 +7547,107 @@ fn cmd_tune_tree_widths(
             println!("  → pick: speculative_tree_widths = {winner:?}");
             if let Err(e) = persist_tree_widths_winner(&winner) {
                 tracing::warn!(error = %e, "failed to persist tree_widths winner");
+            }
+        }
+        None => println!("  → no candidate completed; falling back to config value"),
+    }
+    Ok(())
+}
+
+/// Best-DRAFTER sweep (`tune --spec-strategy`, a `tune --all` sub-stage): measure
+/// decode tok/s for every AVAILABLE self-contained speculative-decoding strategy
+/// (classic/None, n-gram, lookahead, + MTP and tree when the model carries a
+/// NextN head) and persist the FASTEST per model under `spec_strategy[<stem>]`.
+/// Spec decoding is lossless (every draft is target-verified ⇒ byte-identical
+/// output), so the pick is a pure decode-tok/s argmax — no coherence gate (unlike
+/// the kv-dtype sweep). The Tree candidate reuses the tuned tree-width winner (so
+/// `tune --all` runs `--tree-widths` first), and this SUBSUMES `--speculative-mtp`
+/// (its on/off arms are the MTP/None candidates). Auto-applied on next load when
+/// `[tuning].auto_apply_spec_strategy = true` (enable winner, disable the rest).
+fn cmd_tune_spec_strategy(
+    config_path: &std::path::Path,
+    model_override: Option<String>,
+    repeats: u32,
+) -> anyhow::Result<()> {
+    use rustllama_engine::measurement::{measure_spec_strategy, MeasurementConfig};
+
+    let cfg = rustllama_config::load(config_path).unwrap_or_default();
+    let model_path = effective_model_path(model_override, &cfg, config_path)?;
+    if repeats == 0 {
+        anyhow::bail!("--spec-strategy-repeats must be >= 1");
+    }
+    let model_key = model_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown-model")
+        .to_string();
+
+    let k = cfg.inference.resolved_kv_dtype();
+    let m_cfg = MeasurementConfig {
+        kv_dtype: parse_kv_dtype(k)?,
+        kv_cache_layout: cfg.inference.kv_cache_layout.clone(),
+        flash_attention: cfg.inference.flash_attention,
+        n_gpu_layers: cfg.inference.n_gpu_layers,
+        optimize_for: rustllama_tuner::OptimizeFor::Throughput,
+    };
+
+    // The Tree candidate needs a width vector: prefer the tuned tree-width winner
+    // (persisted by `--tree-widths`, which `tune --all` runs FIRST), else the
+    // configured `[inference].speculative_tree_widths`, else the harness default
+    // (the measurement picks `[2,2,2,2]` when this is `None`).
+    let tree_widths: Option<Vec<u32>> = rustllama_tuner::default_cache_dir()
+        .and_then(|dir| {
+            tree_widths_from_cache_or_default_to(&dir, &rustllama_tuner::system_fingerprint())
+        })
+        .or_else(|| {
+            let w = cfg.inference.speculative_tree_widths.clone();
+            (!w.is_empty()).then_some(w)
+        });
+
+    println!("rustllama tune --spec-strategy");
+    println!("  model       = {}", model_path.display());
+    println!("  repeats     = {repeats} (median per candidate)");
+    if let Some(w) = tree_widths.as_ref() {
+        println!("  tree widths = {w:?} (for the Tree candidate)");
+    }
+    println!();
+
+    let report = measure_spec_strategy(
+        &model_path,
+        &m_cfg,
+        tree_widths.as_deref(),
+        repeats as usize,
+    )
+    .map_err(|e| anyhow::anyhow!("spec-strategy measurement failed: {e}"))?;
+
+    let fmt = |t: Option<f64>| {
+        t.map(|v| format!("{v:.2} tps"))
+            .unwrap_or_else(|| "—".to_string())
+    };
+    println!("  {:>12}  {:>12}", "strategy", "decode tps");
+    for c in &report.candidates {
+        let mut line = format!(
+            "  {:>12}  {:>12}",
+            format!("{:?}", c.strategy),
+            fmt(c.tok_s)
+        );
+        if let Some(err) = c.error.as_ref() {
+            line.push_str(&format!("  ({err})"));
+        }
+        println!("{line}");
+    }
+    if let Some(err) = report.error.as_ref() {
+        println!("  note: {err}");
+    }
+    println!();
+
+    // Winner = the fastest measured strategy (lossless ⇒ no coherence gate; ties
+    // broken toward the cheaper drafter — see `pick_spec_strategy`).
+    match rustllama_tuner::pick_spec_strategy(&report.candidates) {
+        Some(winner) => {
+            println!("  → pick: spec_strategy[{model_key}] = {winner:?}");
+            if let Err(e) = persist_spec_strategy_winner(&model_key, winner) {
+                tracing::warn!(error = %e, "failed to persist spec_strategy winner");
             }
         }
         None => println!("  → no candidate completed; falling back to config value"),
@@ -8854,22 +9016,23 @@ fn cmd_tune_all(
                 && t.kernel_build_id == build_id
         })
         .unwrap_or(false);
-    // MTP self-speculation + chunked SSM prefill: both persist a
-    // `Some(bool)` winner (including `Some(false)` for a non-capable /
-    // non-hybrid model), so `.is_some()` is the "already tuned" probe.
-    let has_speculative_mtp = cached
-        .as_ref()
-        .map(|t| t.speculative_mtp.is_some())
-        .unwrap_or(false);
-    // Tree-width winner. Unlike MTP it does NOT persist a sentinel on a
-    // non-capable model (there is no "off" width vector) — the sweep SKIPs and
-    // writes nothing — so `is_some()` is the "already tuned" probe. A SKIPped
-    // (write-blind) model therefore re-runs the stage each `tune --all`, which is
-    // a fast capability probe + clean SKIP, never an error.
+    // Tree-width winner. It does NOT persist a sentinel on a non-capable model
+    // (there is no "off" width vector) — the sweep SKIPs and writes nothing — so
+    // `is_some()` is the "already tuned" probe. A SKIPped (write-blind) model
+    // therefore re-runs the stage each `tune --all`: a fast capability probe +
+    // clean SKIP, never an error.
     let has_tree_widths = cached
         .as_ref()
         .map(|t| t.winner_tree_widths.is_some())
         .unwrap_or(false);
+    // Best-drafter winner (the Stage 9b `--spec-strategy` sweep, which subsumes the
+    // old MTP A/B). PER-MODEL — keyed by stem like placement/cacheblend, the fix
+    // for the old system-global MTP/tree winners — so `contains_key(stem)` is the
+    // "already tuned" probe and two models on one host keep distinct winners.
+    let has_spec_strategy = match (cached.as_ref(), tune_model_key.as_ref()) {
+        (Some(t), Some(k)) => t.spec_strategy.contains_key(k),
+        _ => false,
+    };
     let has_ssm_prefill_chunked = cached
         .as_ref()
         .map(|t| t.ssm_prefill_chunked.is_some())
@@ -9274,37 +9437,45 @@ fn cmd_tune_all(
     }
 
     println!();
-    println!("Stage 9/10: MTP self-speculation (decode tok/s)");
+    println!("Stage 9/10: tree-width (branching-width tree-spec decode tok/s)");
     println!("--------");
+    // Tree spec needs a NextN head, so SKIP a non-MTP model cheaply (the stage
+    // would self-SKIP after a full model load otherwise). Run FIRST: the Stage 9b
+    // best-drafter sweep's Tree candidate reuses this winner.
     if !cap_mtp {
-        println!("(skipped: model has no NextN/MTP head — self-speculation N/A)");
-    } else if skip(has_speculative_mtp) {
-        println!("(skipped: speculative_mtp winner already cached)");
-    } else if let Err(e) = run_tune_stage_subprocess(
-        config_path,
-        &model_clone_for_stages,
-        "--speculative-mtp",
-        thorough,
-        "9 (MTP self-speculation)",
-        &[],
-    ) {
-        tracing::warn!(error = %e, "stage 9 (MTP self-speculation) failed; continuing");
-    }
-
-    println!();
-    println!("Stage 9b/10: tree-width (branching-width tree-spec decode tok/s)");
-    println!("--------");
-    if skip(has_tree_widths) {
+        println!("(skipped: model has no NextN/MTP head — tree spec N/A)");
+    } else if skip(has_tree_widths) {
         println!("(skipped: tree_widths winner already cached)");
     } else if let Err(e) = run_tune_stage_subprocess(
         config_path,
         &model_clone_for_stages,
         "--tree-widths",
         thorough,
-        "9b (tree-width)",
+        "9 (tree-width)",
         &[],
     ) {
-        tracing::warn!(error = %e, "stage 9b (tree-width) failed; continuing");
+        tracing::warn!(error = %e, "stage 9 (tree-width) failed; continuing");
+    }
+
+    println!();
+    println!("Stage 9b/10: best drafter (per-strategy decode tok/s)");
+    println!("--------");
+    // SUBSUMES the old MTP on/off A/B (None/Mtp are candidates). NOT gated on
+    // cap_mtp: n-gram + lookahead are self-contained and worth measuring on EVERY
+    // model (one may beat classic even without a NextN head); the measurement's
+    // own capability probes skip the Mtp/Tree candidates when there's no head.
+    // Per-model winner (keyed by stem), so it runs once per distinct model.
+    if skip(has_spec_strategy) {
+        println!("(skipped: spec_strategy winner already cached for this model)");
+    } else if let Err(e) = run_tune_stage_subprocess(
+        config_path,
+        &model_clone_for_stages,
+        "--spec-strategy",
+        thorough,
+        "9b (best drafter)",
+        &[],
+    ) {
+        tracing::warn!(error = %e, "stage 9b (best drafter) failed; continuing");
     }
 
     println!();
@@ -10143,6 +10314,26 @@ pub fn cacheblend_ratio_from_cache_or_default(auto_apply: bool, model_stem: &str
         .ok()
         .flatten()
         .and_then(|t| rustllama_tuner::cacheblend_ratio_for(&t, model_stem))
+}
+
+/// The autotuned best spec-decoding strategy for `model_stem` from the tuner
+/// cache, when `[tuning].auto_apply_spec_strategy` is on. `None` = untuned (the
+/// caller then falls back to the legacy per-flag drafter config + the global
+/// `speculative_mtp` / `winner_tree_widths` winners). Keyed by file stem (the
+/// per-model fix), unlike the legacy global winners.
+pub fn spec_strategy_from_cache_or_default(
+    auto_apply: bool,
+    model_stem: &str,
+) -> Option<rustllama_tuner::SpecStrategy> {
+    if !auto_apply {
+        return None;
+    }
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    rustllama_tuner::load_cache(&cache_dir, &key)
+        .ok()
+        .flatten()
+        .and_then(|t| rustllama_tuner::spec_strategy_for(&t, model_stem))
 }
 
 pub fn ssm_prefill_chunked_from_cache_or_default(auto_apply: bool) -> Option<bool> {

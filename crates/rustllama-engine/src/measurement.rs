@@ -2731,6 +2731,254 @@ pub fn measure_speculative_mtp(
     })
 }
 
+/// Median of a run list (sorted in place), or `(None, err)` when empty. Shared by
+/// the spec-strategy benches.
+fn median_of(runs: &mut [f64], last_err: Option<String>) -> (Option<f64>, Option<String>) {
+    if runs.is_empty() {
+        return (
+            None,
+            Some(last_err.unwrap_or_else(|| "every measurement run failed".into())),
+        );
+    }
+    runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = if runs.len() % 2 == 1 {
+        runs[runs.len() / 2]
+    } else {
+        (runs[runs.len() / 2 - 1] + runs[runs.len() / 2]) / 2.0
+    };
+    (Some(median), None)
+}
+
+/// Median decode tok/s for a speculative stream, timed first-token→last-token
+/// (prefill-excluded). `init` re-initializes the stream per run; it is the only
+/// strategy-specific part. One untimed warmup drain + `repeats` timed drains.
+/// Mirrors `measure_speculative_mtp`'s `bench_mtp`, generalized over the stream.
+fn bench_spec_stream<F>(repeats: usize, mut init: F) -> (Option<f64>, Option<String>)
+where
+    F: FnMut() -> crate::Result<crate::TokenStream>,
+{
+    use futures::StreamExt;
+    // Untimed warmup.
+    match init() {
+        Ok(mut stream) => {
+            let warm = futures::executor::block_on(async {
+                while let Some(item) = stream.next().await {
+                    if let Err(e) = item {
+                        return Err(e.to_string());
+                    }
+                }
+                Ok(())
+            });
+            if let Err(e) = warm {
+                return (None, Some(format!("warmup failed: {e}")));
+            }
+        }
+        Err(e) => return (None, Some(format!("warmup stream init failed: {e}"))),
+    }
+    let mut runs: Vec<f64> = Vec::with_capacity(repeats);
+    let mut last_err: Option<String> = None;
+    for _ in 0..repeats {
+        let mut stream = match init() {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(e.to_string());
+                continue;
+            }
+        };
+        let drained = futures::executor::block_on(async {
+            let mut generated = 0usize;
+            let mut t_first: Option<std::time::Instant> = None;
+            let mut t_last = std::time::Instant::now();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(_) => {
+                        let now = std::time::Instant::now();
+                        if t_first.is_none() {
+                            t_first = Some(now);
+                        }
+                        t_last = now;
+                        generated += 1;
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+            Ok((generated, t_first, t_last))
+        });
+        match drained {
+            Ok((generated, Some(t_first), t_last)) if generated >= 2 => {
+                let decode_s = (t_last - t_first).as_secs_f64();
+                if decode_s > 0.0 {
+                    runs.push((generated - 1) as f64 / decode_s);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => last_err = Some(e),
+        }
+    }
+    median_of(&mut runs, last_err)
+}
+
+/// Outcome of [`measure_spec_strategy`]: one measured decode tok/s per AVAILABLE
+/// speculative-decoding strategy. Spec decoding is LOSSLESS (every draft is
+/// target-verified), so the CLI picks the fastest via
+/// [`rustllama_tuner::pick_spec_strategy`] with NO coherence gate.
+#[derive(Debug, Clone, Default)]
+pub struct SpecStrategyReport {
+    pub candidates: Vec<rustllama_tuner::SpecStrategyMeasurement>,
+    pub error: Option<String>,
+}
+
+/// Measure decode tok/s for every self-contained speculative-decoding strategy on
+/// `model_path`, for selection by `pick_spec_strategy`. Candidates: classic
+/// `None`, `Ngram`, `Lookahead` (always available), plus `Mtp` and `Tree` when the
+/// model carries a NextN head (`Tree` uses `tree_widths`, the tuned winner). EAGLE
+/// and external-draft strategies are omitted — they need a companion model that
+/// the autotune subprocess does not load. One model load, then each candidate's
+/// own stream is drained + timed; subsumes `measure_speculative_mtp`.
+pub fn measure_spec_strategy(
+    model_path: &std::path::Path,
+    cfg: &MeasurementConfig,
+    tree_widths: Option<&[u32]>,
+    repeats: usize,
+) -> Result<SpecStrategyReport, String> {
+    use rustllama_tuner::{SpecStrategy, SpecStrategyMeasurement};
+
+    const PROMPT_TOKENS: u32 = 64;
+    const DECODE_TOKENS: u32 = 16;
+    let ctx_size = (PROMPT_TOKENS as usize + DECODE_TOKENS as usize + 8).max(128);
+
+    let mut cpu = ContiguousEngine::load_with_options_and_layout(
+        model_path,
+        ctx_size,
+        true,
+        cfg.kv_dtype,
+        &cfg.kv_cache_layout,
+    )
+    .map_err(|e| format!("load failed: {e}"))?;
+    cpu.set_prefix_cache(false);
+    cpu.set_flash_attention(cfg.flash_attention);
+    cpu.set_n_gpu_layers(cfg.n_gpu_layers);
+
+    // Capability probes (cheap flag flips on the loaded engine, reset after): the
+    // Mtp / Tree candidates only apply to a model with a NextN head.
+    cpu.set_mtp_speculative(true);
+    let mtp_capable = cpu.mtp_speculative();
+    cpu.set_mtp_speculative(false);
+    let widths_vec: Vec<u32> = tree_widths
+        .map(|w| w.to_vec())
+        .unwrap_or_else(|| vec![2, 2, 2, 2]);
+    cpu.set_tree_speculative(Some(widths_vec.clone()));
+    let tree_capable = cpu.tree_speculative();
+    cpu.set_tree_speculative(None);
+
+    let vocab = cpu.vocab_size() as i32;
+    let prompt_ids: Vec<i32> = (0..PROMPT_TOKENS as i32)
+        .map(|i| 1 + (i % vocab.max(2).saturating_sub(1)))
+        .collect();
+    let sampling = SamplingParams {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        typical_p: 1.0,
+        repeat_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        seed: 0,
+        max_tokens: DECODE_TOKENS,
+        stop: Vec::new(),
+        ..SamplingParams::default()
+    };
+
+    // `None` baseline: classic `generate_token_ids` (&mut; measured FIRST, before
+    // the &self stream closures borrow the engine).
+    let none_tps = {
+        cpu.clear_prefix_cache();
+        if let Err(e) = cpu.generate_token_ids(&prompt_ids, DECODE_TOKENS, &sampling) {
+            (None, Some(format!("warmup failed: {e}")))
+        } else {
+            let mut runs: Vec<f64> = Vec::with_capacity(repeats);
+            let mut last_err: Option<String> = None;
+            for _ in 0..repeats {
+                cpu.clear_prefix_cache();
+                match cpu.generate_token_ids(&prompt_ids, DECODE_TOKENS, &sampling) {
+                    Ok(_) => {
+                        let st = cpu.last_request_stats();
+                        if st.decode_ms > 0.0 && st.tokens_generated > 0 {
+                            runs.push((st.tokens_generated as f64) / (st.decode_ms / 1000.0));
+                        }
+                    }
+                    Err(e) => last_err = Some(e.to_string()),
+                }
+            }
+            median_of(&mut runs, last_err)
+        }
+    };
+
+    let mut candidates: Vec<SpecStrategyMeasurement> = Vec::new();
+    candidates.push(SpecStrategyMeasurement {
+        strategy: SpecStrategy::None,
+        tok_s: none_tps.0,
+        error: none_tps.1,
+    });
+
+    // Self-contained drafters (always available).
+    let ng = crate::speculative::NgramDrafterConfig::default();
+    let r = bench_spec_stream(repeats, || {
+        cpu.clear_prefix_cache();
+        cpu.speculate_ngram_stream_from_ids(prompt_ids.clone(), ng.clone(), sampling.clone())
+    });
+    candidates.push(SpecStrategyMeasurement {
+        strategy: SpecStrategy::Ngram,
+        tok_s: r.0,
+        error: r.1,
+    });
+
+    let la = crate::speculative::LookaheadDrafterConfig::default();
+    let r = bench_spec_stream(repeats, || {
+        cpu.clear_prefix_cache();
+        cpu.speculate_lookahead_stream_from_ids(prompt_ids.clone(), la.clone(), sampling.clone())
+    });
+    candidates.push(SpecStrategyMeasurement {
+        strategy: SpecStrategy::Lookahead,
+        tok_s: r.0,
+        error: r.1,
+    });
+
+    // NextN-head drafters.
+    if mtp_capable {
+        let r = bench_spec_stream(repeats, || {
+            cpu.clear_prefix_cache();
+            cpu.speculate_mtp_stream_from_ids(prompt_ids.clone(), sampling.clone(), None)
+        });
+        candidates.push(SpecStrategyMeasurement {
+            strategy: SpecStrategy::Mtp,
+            tok_s: r.0,
+            error: r.1,
+        });
+    }
+    if tree_capable {
+        let widths = widths_vec.clone();
+        let r = bench_spec_stream(repeats, || {
+            cpu.clear_prefix_cache();
+            cpu.speculate_mtp_stream_from_ids(
+                prompt_ids.clone(),
+                sampling.clone(),
+                Some(widths.clone()),
+            )
+        });
+        candidates.push(SpecStrategyMeasurement {
+            strategy: SpecStrategy::Tree,
+            tok_s: r.0,
+            error: r.1,
+        });
+    }
+
+    Ok(SpecStrategyReport {
+        candidates,
+        error: None,
+    })
+}
+
 /// Outcome of [`measure_tree_widths`].
 ///
 /// `capable` is `false` when the loaded model carries no MTP/NextN draft head,

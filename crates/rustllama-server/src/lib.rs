@@ -2999,12 +2999,23 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
         None
     }
     .unwrap_or(cfg_for_tuning.inference.cacheblend_recompute_ratio);
+    // Per-model best-drafter winner (Magnitude parity), mirroring the CLI serve
+    // load: when the `tune --spec-strategy` sweep ran for THIS model (keyed by
+    // stem) and auto_apply_spec_strategy is on, drive the mutual-exclusion apply
+    // (enable the winner, disable the other self-contained drafters). `None` ⇒ the
+    // legacy per-field drafter behavior resolved above applies unchanged.
+    let spec_strategy_winner = if cfg_for_tuning.tuning.auto_apply_spec_strategy {
+        tuner_cached_spec_strategy(&model_key)
+    } else {
+        None
+    };
     rustllama_engine::tuner_apply::TunerWinners {
         draft: None,
         ngram: ngram_winner,
         lookahead: lookahead_winner,
         mtp: applied_mtp,
         tree_widths,
+        spec_strategy: spec_strategy_winner,
         cacheblend_ratio: Some(cacheblend_ratio),
     }
     .apply_to(&mut cpu);
@@ -4132,6 +4143,17 @@ fn tuner_cached_cacheblend_ratio(model_stem: &str) -> Option<f32> {
     let key = rustllama_tuner::system_fingerprint();
     let tuning = rustllama_tuner::load_cache(&cache_dir, &key).ok()??;
     rustllama_tuner::cacheblend_ratio_for(&tuning, model_stem)
+}
+
+/// Cached best-drafter winner for `model_stem` (the `tune --spec-strategy` sweep).
+/// `None` ⇒ untuned for this model (caller keeps the legacy per-field drafter
+/// behavior). Keyed by file stem (per-model — the fix for the old system-global
+/// MTP/tree winners). Mirrors the CLI's `spec_strategy_from_cache_or_default`.
+fn tuner_cached_spec_strategy(model_stem: &str) -> Option<rustllama_tuner::SpecStrategy> {
+    let cache_dir = rustllama_tuner::default_cache_dir()?;
+    let key = rustllama_tuner::system_fingerprint();
+    let tuning = rustllama_tuner::load_cache(&cache_dir, &key).ok()??;
+    rustllama_tuner::spec_strategy_for(&tuning, model_stem)
 }
 
 // --- additional tuner-cache siblings (mirror the CLI serve load path) --------

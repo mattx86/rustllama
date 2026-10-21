@@ -472,6 +472,19 @@ pub fn set_cacheblend_ratio(result: &mut TuningResult, model_stem: &str, ratio: 
         .insert(model_stem.to_string(), ratio);
 }
 
+/// Read the autotuned best spec-decoding strategy for a model (keyed by file
+/// stem), if the `tune --spec-strategy` stage has run. `None` = untuned (the
+/// serve path then falls back to the legacy global `speculative_mtp` /
+/// `winner_tree_widths` winners).
+pub fn spec_strategy_for(result: &TuningResult, model_stem: &str) -> Option<SpecStrategy> {
+    result.spec_strategy.get(model_stem).copied()
+}
+
+/// Record a model's autotuned best spec strategy. Used by `tune --spec-strategy`.
+pub fn set_spec_strategy(result: &mut TuningResult, model_stem: &str, s: SpecStrategy) {
+    result.spec_strategy.insert(model_stem.to_string(), s);
+}
+
 // Compatibility shim: keep the original Q4_K-specific names that
 // existing tests + engine code reference. Both delegate to the new
 // kernel-agnostic helpers above.
@@ -675,6 +688,17 @@ pub struct TuningResult {
     /// (which lack the key) still load, no schema-version bump.
     #[serde(default)]
     pub winner_tree_widths: Option<Vec<u32>>,
+    /// Autotune winner: the fastest speculative-decoding DRAFTER for this model,
+    /// picked by `tune --spec-strategy` (a pure decode-tok/s argmax — spec is
+    /// LOSSLESS, so there is no coherence gate). Keyed by model file STEM
+    /// (PER-MODEL, unlike the legacy system-global `speculative_mtp` /
+    /// `winner_tree_widths` which a second model on the same host would
+    /// overwrite). Applied on load when `[tuning].auto_apply_spec_strategy` is on:
+    /// the winner's drafter is enabled and the other five disabled.
+    /// `#[serde(default)]` → old caches load, no schema bump. Empty map / missing
+    /// stem ⇒ fall back to the legacy global fields.
+    #[serde(default)]
+    pub spec_strategy: HashMap<String, SpecStrategy>,
     /// Autotune winner: use the chunked-parallel SSM prefill scan (hybrid
     /// models). Some(true)=chunked prefill was faster, None=untuned.
     #[serde(default)]
@@ -823,6 +847,7 @@ impl TuningResult {
             per_device_perf: HashMap::new(),
             kernel_verdicts: HashMap::new(),
             cacheblend_recompute_ratio: HashMap::new(),
+            spec_strategy: HashMap::new(),
             last_tuned: None,
             rustllama_version: env!("CARGO_PKG_VERSION").to_string(),
             kernel_build_id: kernel_build_id(),
@@ -1211,6 +1236,92 @@ pub fn pick_tree_widths(candidates: &[TreeWidthMeasurement]) -> Option<Vec<u32>>
         });
     }
     best.map(|(c, _, _)| c.widths.clone())
+}
+
+/// A speculative-decoding drafter strategy. The `tune --spec-strategy` stage
+/// measures each AVAILABLE strategy's decode tok/s on a model and picks the
+/// fastest. Spec decoding is LOSSLESS (every draft is target-verified, so output
+/// is byte-identical to classic decode), so the choice is a pure speed argmax —
+/// no coherence gate. Persisted per model in [`TuningResult::spec_strategy`] and
+/// auto-applied on load. Serialized as a snake_case string so it round-trips the
+/// TOML cache unchanged (same rationale as the kv_dtype winner).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpecStrategy {
+    /// Classic decode, no drafter (the baseline — wins when no drafter helps).
+    None,
+    /// Prompt-lookup n-gram drafter (self-contained, always available).
+    Ngram,
+    /// Lookahead / Jacobi drafter (self-contained, always available).
+    Lookahead,
+    /// MTP / NextN self-speculation (needs the model's own NextN head).
+    Mtp,
+    /// Tree-structured MTP speculation (needs the NextN head + tuned widths).
+    Tree,
+    /// EAGLE draft head (only when a companion head GGUF is already attached).
+    Eagle,
+    /// External paired draft model (only when a tokenizer-compatible draft is
+    /// already paired).
+    Draft,
+}
+
+impl SpecStrategy {
+    /// Complexity/cost rank for the dead-heat tie-break (lower = simpler/cheaper,
+    /// preferred when tok/s is a statistical tie): no drafter < self-contained <
+    /// NextN self-spec < companion model. This avoids paying drafter overhead +
+    /// configuration complexity unless a drafter is CLEARLY faster.
+    fn cost_rank(self) -> u8 {
+        match self {
+            SpecStrategy::None => 0,
+            SpecStrategy::Ngram => 1,
+            SpecStrategy::Lookahead => 2,
+            SpecStrategy::Mtp => 3,
+            SpecStrategy::Tree => 4,
+            SpecStrategy::Eagle => 5,
+            SpecStrategy::Draft => 6,
+        }
+    }
+}
+
+/// One strategy's measured decode tok/s from the `--spec-strategy` sweep.
+/// `tok_s == None` = the candidate failed or was skipped (not capable).
+#[derive(Debug, Clone)]
+pub struct SpecStrategyMeasurement {
+    pub strategy: SpecStrategy,
+    pub tok_s: Option<f64>,
+    pub error: Option<String>,
+}
+
+/// Epsilon (tok/s) for the spec-strategy dead-heat tie-break — same role as
+/// [`TREE_WIDTHS_TPS_EPS`].
+pub const SPEC_STRATEGY_TPS_EPS: f64 = TREE_WIDTHS_TPS_EPS;
+
+/// Pick the fastest spec strategy: MAXIMIZE measured decode tok/s. On a dead heat
+/// (within [`SPEC_STRATEGY_TPS_EPS`]) prefer the LOWER-cost strategy (see
+/// [`SpecStrategy::cost_rank`]), then the earlier candidate. `None` when no
+/// candidate produced a measurement (caller keeps the config default). Because
+/// spec is lossless, the winner is purely the fastest — no coherence check.
+pub fn pick_spec_strategy(candidates: &[SpecStrategyMeasurement]) -> Option<SpecStrategy> {
+    let mut best: Option<(SpecStrategy, f64, u8)> = None; // (strategy, tok_s, cost)
+    for cand in candidates {
+        let Some(tps) = cand.tok_s else { continue };
+        let cost = cand.strategy.cost_rank();
+        best = Some(match best {
+            None => (cand.strategy, tps, cost),
+            Some((b_s, b_tps, b_cost)) => {
+                if tps > b_tps + SPEC_STRATEGY_TPS_EPS {
+                    (cand.strategy, tps, cost)
+                } else if tps + SPEC_STRATEGY_TPS_EPS < b_tps {
+                    (b_s, b_tps, b_cost)
+                } else if cost < b_cost {
+                    (cand.strategy, tps, cost)
+                } else {
+                    (b_s, b_tps, b_cost)
+                }
+            }
+        });
+    }
+    best.map(|(s, _, _)| s)
 }
 
 /// Tok/s dead-heat threshold for [`pick_tree_widths`]'s tie-break. Two

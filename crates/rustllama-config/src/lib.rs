@@ -1375,6 +1375,17 @@ pub struct TuningConfig {
     /// `auto_apply_speculative_mtp`.
     #[serde(default = "default_true_serde")]
     pub auto_apply_tree_widths: bool,
+    /// When `true` (default), the engine applies the per-model best-drafter winner
+    /// from the `tune --spec-strategy` sweep (`TuningResult::spec_strategy[<stem>]`)
+    /// on load: it enables exactly the winning speculative-decoding strategy and
+    /// DISABLES the other drafters (the mutual exclusion a precedence-only dispatch
+    /// can't do — so a tuned winner overrides a config that independently turns a
+    /// drafter on). When off (or no per-model entry — e.g. the sweep hasn't run for
+    /// this model), the legacy per-flag drafter config + the global
+    /// `speculative_mtp` / `tree_widths` winners apply unchanged. Spec decode is
+    /// lossless, so this only changes SPEED, never output.
+    #[serde(default = "default_true_serde")]
+    pub auto_apply_spec_strategy: bool,
     #[serde(default = "default_true_serde")]
     pub auto_apply_ssm_prefill_chunked: bool,
     /// When `true` (default), the engine overrides
@@ -1474,6 +1485,7 @@ impl Default for TuningConfig {
             auto_apply_flash_attention: true,
             auto_apply_speculative_mtp: true,
             auto_apply_tree_widths: true,
+            auto_apply_spec_strategy: true,
             auto_apply_ssm_prefill_chunked: true,
             auto_apply_kv_cache_layout: true,
             auto_apply_batching: true,
