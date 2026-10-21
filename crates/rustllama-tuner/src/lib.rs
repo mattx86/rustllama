@@ -212,6 +212,12 @@ pub const VERDICT_GEMM_Q4K_W8A8_TC: &str = "gemm:q4_k_w8a8_tc";
 /// perf gate, so it auto-enables only where correct AND faster than the f32
 /// matvec. The decode twin of [`VERDICT_GEMM_Q4K_W8A8_TC`].
 pub const VERDICT_MATVEC_Q4K_W4A8: &str = "matvec:q4_k_w4a8";
+/// T3a — the Q8_0 W8A8 int-dot DECODE matvec (int8 activations, LOSSY; MMVQ-style,
+/// symmetric so no min term). On where its probe passed: graded by a FAIR W8A8
+/// reference (int8 activations) AND perf-gated vs the bit-exact f32 warp matvec,
+/// so it auto-enables only where correct AND faster. Fail-closed. The Q8_0 analog
+/// of [`VERDICT_MATVEC_Q4K_W4A8`].
+pub const VERDICT_MATVEC_Q8_0_W8A8: &str = "matvec:q8_0_w8a8";
 /// #2 on-device activation-residency DECODE attention block (whole attention
 /// block GPU-resident on one stream: rmsnorm→qkv→qk-head-norm→rope→flash→o→
 /// residual+norm, no per-op host round-trip). Unlike the other verdicts this is

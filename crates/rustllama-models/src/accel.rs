@@ -943,6 +943,38 @@ fn try_matvec_q4k_w4a8_cuda(
     guard.matvec_q4k_w4a8(weight_key, w_bytes, x, out, m, k)
 }
 
+/// **AUTOMATIC** — no env var: the Q8_0 W8A8 DECODE matvec (int8 activations,
+/// LOSSY; T3a) is on where its probe passed (`kernel_verdict("matvec:q8_0_w8a8")`),
+/// which requires both correctness (vs a fair W8A8 reference) AND beating the
+/// bit-exact f32 warp matvec on-device. So when enabled it is the fastest
+/// single-row Q8_0 DECODE path and is dispatched FIRST; otherwise the bit-exact
+/// f32 matvec runs. Fail-closed; cached. The Q8_0 analog of [`q4k_w4a8_enabled`].
+fn q8_0_w8a8_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_MATVEC_Q8_0_W8A8) && cuda_active())
+}
+
+/// Single-row Q8_0 W8A8 decode matvec via the native CUDA backend (int8
+/// activations, lossy — gated by [`q8_0_w8a8_enabled`]). Returns false on any
+/// miss so the caller falls through to the bit-exact f32 matvec. Mirrors
+/// [`try_matvec_q4k_w4a8_cuda`].
+fn try_matvec_q8_0_w8a8_cuda(
+    weight_key: usize,
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    guard.matvec_q8_0_w8a8(weight_key, w_bytes, x, out, m, k)
+}
+
 /// Batched XMX/DPAS bf16 GEMM via the USM_ATTN SYCL stream: dequantize W→f32
 /// and run the `joint_matrix` GEMM (the kernel zero-pads the M/N/K tails, so no
 /// dim alignment is required). `false` on any miss — no USM_ATTN context, the
@@ -15250,6 +15282,16 @@ pub fn try_matvec_tensor_usm_f32(
             if matches!(ck_kind, ck::CudaPackedKind::Q4_K)
                 && q4k_w4a8_enabled()
                 && try_matvec_q4k_w4a8_cuda(wb.as_ptr() as usize, wb, x, out, m, k)
+            {
+                return true;
+            }
+            // Q8_0 decode: the lossy W8A8 int8-activation matvec FIRST where its
+            // verdict+perf gate passed (T3a, MMVQ-style); a miss falls straight
+            // through to the bit-exact f32 warp matvec below. K % 32 handled by
+            // the kernel wrapper.
+            if matches!(ck_kind, ck::CudaPackedKind::Q8_0)
+                && q8_0_w8a8_enabled()
+                && try_matvec_q8_0_w8a8_cuda(wb.as_ptr() as usize, wb, x, out, m, k)
             {
                 return true;
             }
