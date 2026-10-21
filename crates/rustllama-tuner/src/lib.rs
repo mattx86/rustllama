@@ -206,6 +206,12 @@ pub const VERDICT_GEMM_Q4K_F32: &str = "gemm:q4_k_f32";
 /// wired onto the batched/prefill CUDA path ABOVE the bit-exact f32 GEMM (it is
 /// dispatched first). Graded by a FAIR W8A8 probe (int8 activations) + the perf gate.
 pub const VERDICT_GEMM_Q4K_W8A8_TC: &str = "gemm:q4_k_w8a8_tc";
+
+/// Q8_0 int8 tensor-core PREFILL GEMM (W8A8, lossy; T3c). Graded by a FAIR W8A8
+/// probe (int8 activations) + the perf gate vs the f32 batched path, so it
+/// auto-enables only where correct AND faster. The Q8_0 analog of
+/// [`VERDICT_GEMM_Q4K_W8A8_TC`].
+pub const VERDICT_GEMM_Q8_0_W8A8_TC: &str = "gemm:q8_0_w8a8_tc";
 /// Q4_K W4A8 DECODE matvec (int8 activations, LOSSY). Backs `q4k_w4a8`, wired
 /// onto the single-row CUDA decode path ABOVE the bit-exact f32 warp matvec (it
 /// is dispatched first). Graded by a FAIR W8A8 probe (int8 activations) + the

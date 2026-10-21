@@ -439,6 +439,28 @@ fn try_gemm_q4k_w8a8_tc_batched(
     guard.gemm_packed_batched_q4k_w8a8_tc(weight_key, w_bytes, x, out, m, k, n)
 }
 
+/// T3c — batched Q8_0 prefill GEMM via the native CUDA int8 tensor-core kernel
+/// (verdict `gemm:q8_0_w8a8_tc`, W8A8/lossy). Weights are the SAME packed Q8_0
+/// bytes. Mirrors [`try_gemm_q4k_w8a8_tc_batched`].
+#[allow(clippy::too_many_arguments)]
+fn try_gemm_q8_0_w8a8_tc_batched(
+    weight_key: usize,
+    w_bytes: &[u8],
+    x: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    let Some(cache) = cuda_cache() else {
+        return false;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return false;
+    };
+    guard.gemm_packed_batched_q8_0_w8a8_tc(weight_key, w_bytes, x, out, m, k, n)
+}
+
 // ------------------------------------------------------------
 // Blackwell SM12x FP4 tensor-core GEMM dispatch (opt-in)
 // ------------------------------------------------------------
@@ -909,6 +931,16 @@ fn q4k_gemm_f32_enabled() -> bool {
 fn q4k_w8a8_tc_enabled() -> bool {
     static EN: OnceLock<bool> = OnceLock::new();
     *EN.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_GEMM_Q4K_W8A8_TC) && cuda_active())
+}
+
+/// **AUTOMATIC** — the Q8_0 W8A8 int8 TC PREFILL GEMM (T3c) is on where its probe
+/// passed (`kernel_verdict("gemm:q8_0_w8a8_tc")`) — correct (vs a fair W8A8 ref)
+/// AND faster than the f32 batched path on-device. Dispatched FIRST for Q8_0
+/// prefill when enabled; otherwise the f32 batched matvec runs. Fail-closed;
+/// cached. The Q8_0 analog of [`q4k_w8a8_tc_enabled`].
+fn q8_0_w8a8_tc_enabled() -> bool {
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| kernel_verdict(rustllama_tuner::VERDICT_GEMM_Q8_0_W8A8_TC) && cuda_active())
 }
 
 /// **AUTOMATIC** — no env var: the Q4_K W4A8 DECODE matvec (int8 activations,
@@ -17751,6 +17783,18 @@ pub fn try_matvec_tensor_batched_usm_f32(
                 && n >= 16
                 && k % 256 == 0
                 && try_gemm_q4k_f32_batched(wb.as_ptr() as usize, wb, x, out, m, k, n)
+            {
+                return true;
+            }
+            // Q8_0 int8 tensor-core GEMM (W8A8, lossy; T3c) — tried for Q8_0 prefill
+            // batches; its verdict requires beating the f32 batched path on-device,
+            // so when on it is the fastest Q8_0 prefill path. A miss falls through to
+            // the batched matvec below. K % 32 (per the kernel).
+            if matches!(ck_kind, ck::CudaPackedKind::Q8_0)
+                && q8_0_w8a8_tc_enabled()
+                && n >= 16
+                && k % 32 == 0
+                && try_gemm_q8_0_w8a8_tc_batched(wb.as_ptr() as usize, wb, x, out, m, k, n)
             {
                 return true;
             }
