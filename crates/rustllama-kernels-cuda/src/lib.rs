@@ -5156,91 +5156,50 @@ impl CudaMatvecCache {
         // Run the whole device chain; accumulate success WITHOUT early-returning
         // (we must always reach `end_capture` to restore the stream). `&&`
         // short-circuits so once a step fails the rest are skipped.
-        let mut chain_ok = true;
-        // 1. attn RMSNorm.
-        chain_ok = chain_ok
-            && unsafe { rmsnorm_dev_f32(&self.stream, ph, pan, phn, 1, d_model, rms_eps).is_ok() };
-        // 2. q/k/v projections (device-I/O; weights pre-warmed so no upload).
-        chain_ok = chain_ok
-            && unsafe { self.matvec_packed_dev_io(wq.0, wq.1, wq.2, phn, pq, d_q, d_model) };
-        chain_ok = chain_ok
-            && unsafe { self.matvec_packed_dev_io(wk.0, wk.1, wk.2, phn, pk, d_kv, d_model) };
-        chain_ok = chain_ok
-            && unsafe { self.matvec_packed_dev_io(wv.0, wv.1, wv.2, phn, pv, d_kv, d_model) };
-        // 3. Qwen3 qk-head-norm (in place, device).
-        if q_norm.is_some() {
-            chain_ok = chain_ok
-                && unsafe {
-                    qk_head_norm_f32(&self.stream, pq, pqn, n_heads, head_dim, rms_eps).is_ok()
-                };
-        }
-        if k_norm.is_some() {
-            chain_ok = chain_ok
-                && unsafe {
-                    qk_head_norm_f32(&self.stream, pk, pkn, n_kv_heads, head_dim, rms_eps).is_ok()
-                };
-        }
-        // 4. RoPE (both device, in place) at absolute `pos`.
-        chain_ok =
-            chain_ok && unsafe { rope_f32(&self.stream, pq, n_heads, head_dim, pos, pif).is_ok() };
-        chain_ok = chain_ok
-            && unsafe { rope_f32(&self.stream, pk, n_kv_heads, head_dim, pos, pif).is_ok() };
-        // 5. Scatter the post-RoPE K / plain V into the F32 KV mirror at `pos`,
-        //    one kv-head at a time (head-major), via async DEVICE→DEVICE copies
-        //    (NO host round-trip — that is what makes the chain capturable). The
-        //    device→host copy for the host KV cache is deferred past the sync.
-        let row_bytes = head_dim * 4;
-        for h in 0..n_kv_heads {
-            let kd = unsafe { km_base.add((h * max_ctx + pos) * head_dim) } as *mut c_void;
-            let ks = unsafe { pk.add(h * head_dim) } as *const c_void;
-            chain_ok = chain_ok && unsafe { memcpy_d2d_async(&self.stream, kd, ks, row_bytes) };
-            let vd = unsafe { vm_base.add((h * max_ctx + pos) * head_dim) } as *mut c_void;
-            let vs = unsafe { pv.add(h * head_dim) } as *const c_void;
-            chain_ok = chain_ok && unsafe { memcpy_d2d_async(&self.stream, vd, vs, row_bytes) };
-        }
-        // 6. Flash decode over [0, pos+1) against the mirror → attn_out (device).
-        chain_ok = chain_ok
-            && unsafe {
-                flash_attn_decode_f32(
-                    &self.stream,
-                    pq,
-                    km_base as *const f32,
-                    vm_base as *const f32,
-                    pat,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    max_ctx,
-                    pos + 1,
-                    // Per-layer SWA window / Gemma2 soft-cap for this decode step.
-                    window,
-                    softcap,
-                )
-                .is_ok()
-            };
-        // 7. o projection (device-I/O); 8. fused residual + post-attn RMSNorm.
-        chain_ok = chain_ok
-            && unsafe { self.matvec_packed_dev_io(wo.0, wo.1, wo.2, pat, po, d_model, d_q) };
-        chain_ok = chain_ok
-            && unsafe {
-                add_rmsnorm_f32(&self.stream, ph, po, ppn, phn2, 1, d_model, rms_eps).is_ok()
-            };
-        // 8b. Optional dense SwiGLU FFN, device-resident (ffn_out reuses `po`).
-        if let Some((wg, wu, wd, _)) = dense_ffn {
-            chain_ok = chain_ok
-                && unsafe {
-                    self.matvec_packed_dev_io(wg.0, wg.1, wg.2, phn2, p_gate, d_ff, d_model)
-                };
-            chain_ok = chain_ok
-                && unsafe {
-                    self.matvec_packed_dev_io(wu.0, wu.1, wu.2, phn2, p_up, d_ff, d_model)
-                };
-            chain_ok = chain_ok
-                && unsafe { silu_mul_f32(&self.stream, p_gate, p_up, p_act, d_ff).is_ok() };
-            chain_ok = chain_ok
-                && unsafe { self.matvec_packed_dev_io(wd.0, wd.1, wd.2, p_act, po, d_model, d_ff) };
-            chain_ok = chain_ok && unsafe { add_f32(&self.stream, ph, po, d_model).is_ok() };
-        }
+        // Issue the whole device chain (T2: factored into `issue_layer_chain` so a
+        // whole-decode-step graph can replay the SAME chain for N layers inside one
+        // capture; here it is the N=1 case — byte-for-byte the former inline body).
+        let chain_ok = unsafe {
+            self.issue_layer_chain(
+                ph,
+                phn,
+                pq,
+                pk,
+                pv,
+                pat,
+                po,
+                phn2,
+                p_gate,
+                p_up,
+                p_act,
+                pan,
+                ppn,
+                pqn,
+                pkn,
+                pif,
+                km_base,
+                vm_base,
+                wq,
+                wk,
+                wv,
+                wo,
+                dense_ffn,
+                q_norm.is_some(),
+                k_norm.is_some(),
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                d_model,
+                d_q,
+                d_kv,
+                d_ff,
+                pos,
+                max_ctx,
+                window,
+                softcap,
+                rms_eps,
+            )
+        };
         // ================= END CAPTURE (always) =================
         let graph = graph_end_capture(&self.stream);
         let Some(graph) = graph else {
@@ -5335,6 +5294,155 @@ impl CudaMatvecCache {
             }
         }
         consume_error_count() == 0
+    }
+
+    /// T2 — issue ONE layer's captured device chain (rmsnorm → q/k/v → optional
+    /// qk-head-norm → RoPE → KV-mirror scatter → flash-decode → o-proj → fused
+    /// residual+post-norm → optional dense SwiGLU FFN) onto `self.stream`, using
+    /// device pointers the caller already copied out of the slabs/mirror (so no
+    /// slab borrow is held across the `&mut self` matvec calls). Issues NO
+    /// begin/end-capture and NO sync — so `decode_attn_block_f32_graph_impl` wraps
+    /// a single call in one capture (the N=1 case, behavior-identical to the
+    /// former inline body), and a whole-decode-step graph can issue it for every
+    /// dense layer inside ONE capture (T2 B1). Accumulates success with `&&` so a
+    /// failed op skips the rest without early-returning (the caller must still
+    /// reach `end_capture`). `has_q_norm`/`has_k_norm` replace the former
+    /// `q_norm.is_some()`/`k_norm.is_some()` checks (the caller owns the slices).
+    ///
+    /// SAFETY: every pointer must be a live device buffer on `self.stream` sized
+    /// for the (n_heads,n_kv_heads,head_dim,d_model,d_ff) dims, and `pos < max_ctx`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn issue_layer_chain(
+        &mut self,
+        ph: *mut f32,
+        phn: *mut f32,
+        pq: *mut f32,
+        pk: *mut f32,
+        pv: *mut f32,
+        pat: *mut f32,
+        po: *mut f32,
+        phn2: *mut f32,
+        p_gate: *mut f32,
+        p_up: *mut f32,
+        p_act: *mut f32,
+        pan: *mut f32,
+        ppn: *mut f32,
+        pqn: *mut f32,
+        pkn: *mut f32,
+        pif: *mut f32,
+        km_base: *mut f32,
+        vm_base: *mut f32,
+        wq: (CudaPackedKind, usize, &[u8]),
+        wk: (CudaPackedKind, usize, &[u8]),
+        wv: (CudaPackedKind, usize, &[u8]),
+        wo: (CudaPackedKind, usize, &[u8]),
+        dense_ffn: Option<(
+            (CudaPackedKind, usize, &[u8]),
+            (CudaPackedKind, usize, &[u8]),
+            (CudaPackedKind, usize, &[u8]),
+            usize,
+        )>,
+        has_q_norm: bool,
+        has_k_norm: bool,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        d_model: usize,
+        d_q: usize,
+        d_kv: usize,
+        d_ff: usize,
+        pos: usize,
+        max_ctx: usize,
+        window: i32,
+        softcap: f32,
+        rms_eps: f32,
+    ) -> bool {
+        let mut chain_ok = true;
+        // 1. attn RMSNorm.
+        chain_ok = chain_ok
+            && unsafe { rmsnorm_dev_f32(&self.stream, ph, pan, phn, 1, d_model, rms_eps).is_ok() };
+        // 2. q/k/v projections (device-I/O; weights pre-warmed so no upload).
+        chain_ok = chain_ok
+            && unsafe { self.matvec_packed_dev_io(wq.0, wq.1, wq.2, phn, pq, d_q, d_model) };
+        chain_ok = chain_ok
+            && unsafe { self.matvec_packed_dev_io(wk.0, wk.1, wk.2, phn, pk, d_kv, d_model) };
+        chain_ok = chain_ok
+            && unsafe { self.matvec_packed_dev_io(wv.0, wv.1, wv.2, phn, pv, d_kv, d_model) };
+        // 3. Qwen3 qk-head-norm (in place, device).
+        if has_q_norm {
+            chain_ok = chain_ok
+                && unsafe {
+                    qk_head_norm_f32(&self.stream, pq, pqn, n_heads, head_dim, rms_eps).is_ok()
+                };
+        }
+        if has_k_norm {
+            chain_ok = chain_ok
+                && unsafe {
+                    qk_head_norm_f32(&self.stream, pk, pkn, n_kv_heads, head_dim, rms_eps).is_ok()
+                };
+        }
+        // 4. RoPE (both device, in place) at absolute `pos`.
+        chain_ok =
+            chain_ok && unsafe { rope_f32(&self.stream, pq, n_heads, head_dim, pos, pif).is_ok() };
+        chain_ok = chain_ok
+            && unsafe { rope_f32(&self.stream, pk, n_kv_heads, head_dim, pos, pif).is_ok() };
+        // 5. Scatter the post-RoPE K / plain V into the F32 KV mirror at `pos`,
+        //    one kv-head at a time (head-major), via async DEVICE→DEVICE copies
+        //    (NO host round-trip — that is what makes the chain capturable). The
+        //    device→host copy for the host KV cache is deferred past the sync.
+        let row_bytes = head_dim * 4;
+        for h in 0..n_kv_heads {
+            let kd = unsafe { km_base.add((h * max_ctx + pos) * head_dim) } as *mut c_void;
+            let ks = unsafe { pk.add(h * head_dim) } as *const c_void;
+            chain_ok = chain_ok && unsafe { memcpy_d2d_async(&self.stream, kd, ks, row_bytes) };
+            let vd = unsafe { vm_base.add((h * max_ctx + pos) * head_dim) } as *mut c_void;
+            let vs = unsafe { pv.add(h * head_dim) } as *const c_void;
+            chain_ok = chain_ok && unsafe { memcpy_d2d_async(&self.stream, vd, vs, row_bytes) };
+        }
+        // 6. Flash decode over [0, pos+1) against the mirror → attn_out (device).
+        chain_ok = chain_ok
+            && unsafe {
+                flash_attn_decode_f32(
+                    &self.stream,
+                    pq,
+                    km_base as *const f32,
+                    vm_base as *const f32,
+                    pat,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    pos + 1,
+                    // Per-layer SWA window / Gemma2 soft-cap for this decode step.
+                    window,
+                    softcap,
+                )
+                .is_ok()
+            };
+        // 7. o projection (device-I/O); 8. fused residual + post-attn RMSNorm.
+        chain_ok = chain_ok
+            && unsafe { self.matvec_packed_dev_io(wo.0, wo.1, wo.2, pat, po, d_model, d_q) };
+        chain_ok = chain_ok
+            && unsafe {
+                add_rmsnorm_f32(&self.stream, ph, po, ppn, phn2, 1, d_model, rms_eps).is_ok()
+            };
+        // 8b. Optional dense SwiGLU FFN, device-resident (ffn_out reuses `po`).
+        if let Some((wg, wu, wd, _)) = dense_ffn {
+            chain_ok = chain_ok
+                && unsafe {
+                    self.matvec_packed_dev_io(wg.0, wg.1, wg.2, phn2, p_gate, d_ff, d_model)
+                };
+            chain_ok = chain_ok
+                && unsafe {
+                    self.matvec_packed_dev_io(wu.0, wu.1, wu.2, phn2, p_up, d_ff, d_model)
+                };
+            chain_ok = chain_ok
+                && unsafe { silu_mul_f32(&self.stream, p_gate, p_up, p_act, d_ff).is_ok() };
+            chain_ok = chain_ok
+                && unsafe { self.matvec_packed_dev_io(wd.0, wd.1, wd.2, p_act, po, d_model, d_ff) };
+            chain_ok = chain_ok && unsafe { add_f32(&self.stream, ph, po, d_model).is_ok() };
+        }
+        chain_ok
     }
 
     /// Drain the cross-layer-resident `hidden` (activation-slab offset 0) to the
