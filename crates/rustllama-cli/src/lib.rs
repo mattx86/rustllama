@@ -4497,6 +4497,16 @@ async fn serve(
                     },
                 ));
             }
+            // T5d — self-speculative / early-exit (head-free, dense-only). Engages
+            // only on a plain dense model (the engine gates on supports_self_spec).
+            // TODO(T5d follow-up): SpecStrategy::SelfSpec + TunerWinners
+            // mutual-exclusion; hybrid/MLA early-exit.
+            if cfg.inference.speculative_self {
+                cpu.set_self_speculative(Some(rustllama_engine::speculative::SelfSpecConfig {
+                    exit_layer: cfg.inference.self_exit_layer as usize,
+                    n_draft: cfg.inference.self_n_draft as usize,
+                }));
+            }
             // P10b — attach the EAGLE draft head (companion GGUF) to the FIRST
             // startup model. Load-time validated against the base; a malformed
             // head fails the load loudly (fail-closed). Takes precedence over
@@ -11213,6 +11223,14 @@ fn bench(
             n_draft: cfg.inference.suffix_n_draft as usize,
             max_match: cfg.inference.suffix_max_match as usize,
             q: 0.5,
+        }));
+    }
+    // T5d — self-speculative / early-exit (head-free, dense-only). TODO(T5d
+    // follow-up): SpecStrategy::SelfSpec + TunerWinners mutual-exclusion.
+    if cfg.inference.speculative_self {
+        cpu.set_self_speculative(Some(rustllama_engine::speculative::SelfSpecConfig {
+            exit_layer: cfg.inference.self_exit_layer as usize,
+            n_draft: cfg.inference.self_n_draft as usize,
         }));
     }
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;

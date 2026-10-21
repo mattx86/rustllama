@@ -1345,6 +1345,53 @@ impl HistoryDrafter for SuffixDrafter {
 }
 
 // ============================================================
+// T5d — Self-speculative / early-exit drafter config
+// ============================================================
+//
+// Draft-model-FREE self-speculation: the model drafts with its own FIRST
+// `exit_layer` layers (early exit → final norm → lm_head), then verifies at
+// full depth. No head, no second model — it works on any plain dense model,
+// including ones that have no trained EAGLE / MTP / DFlash head. Lossless (the
+// full-depth verify + accept/reject corrects every token), so output is
+// byte-identical to classic decode; the early-exit draft only changes SPEED.
+// Dense-only in v1: a hybrid / MLA / SSM model keeps classic decode, because a
+// partial-depth draft would desync its recurrent / compressed KV (the draft
+// only populates layers 0..L) without extra snapshot/restore bookkeeping.
+
+/// Configuration for self-speculative (early-exit) decoding.
+#[derive(Debug, Clone, Copy)]
+pub struct SelfSpecConfig {
+    /// Layer to exit at for the DRAFT forward. `0` = AUTO = half the model's
+    /// depth (resolved by [`resolve_self_exit_layer`]). A shallower exit drafts
+    /// faster but accepts less; a deeper exit drafts slower but accepts more.
+    pub exit_layer: usize,
+    /// Max draft tokens proposed per round (each an early-exit forward). Default 4.
+    pub n_draft: usize,
+}
+
+impl Default for SelfSpecConfig {
+    fn default() -> Self {
+        Self {
+            exit_layer: 0,
+            n_draft: 4,
+        }
+    }
+}
+
+/// Resolve the effective early-exit layer: `exit_layer == 0` ⇒ half depth;
+/// always clamped to `[1, n_layers-1]` so the draft runs at least one layer and
+/// never the full stack (a full-stack "draft" would just be the verify again).
+pub fn resolve_self_exit_layer(cfg: SelfSpecConfig, n_layers: usize) -> usize {
+    let raw = if cfg.exit_layer == 0 {
+        n_layers / 2
+    } else {
+        cfg.exit_layer
+    };
+    let hi = n_layers.saturating_sub(1).max(1);
+    raw.clamp(1, hi)
+}
+
+// ============================================================
 // F10 — Lookahead / Jacobi decoding (n-gram-pool drafter)
 // ============================================================
 //
@@ -2247,6 +2294,71 @@ mod suffix_tests {
             q: 0.5,
         }));
         assert_eq!(ids(&d.propose(&hist)), vec![5, 6, 7]);
+    }
+}
+
+#[cfg(test)]
+mod self_spec_tests {
+    use super::*;
+
+    #[test]
+    fn auto_exit_is_half_depth() {
+        assert_eq!(resolve_self_exit_layer(SelfSpecConfig::default(), 32), 16);
+        // Half of a 2-layer model is 1 (clamped to >= 1 anyway).
+        assert_eq!(
+            resolve_self_exit_layer(
+                SelfSpecConfig {
+                    exit_layer: 0,
+                    n_draft: 4
+                },
+                2
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn explicit_exit_is_clamped() {
+        // In-range explicit value passes through.
+        assert_eq!(
+            resolve_self_exit_layer(
+                SelfSpecConfig {
+                    exit_layer: 8,
+                    n_draft: 4
+                },
+                32
+            ),
+            8
+        );
+        // Too-deep clamps to n_layers - 1 (never the full stack).
+        assert_eq!(
+            resolve_self_exit_layer(
+                SelfSpecConfig {
+                    exit_layer: 100,
+                    n_draft: 4
+                },
+                32
+            ),
+            31
+        );
+        // Degenerate 1-layer model clamps to 1.
+        assert_eq!(
+            resolve_self_exit_layer(
+                SelfSpecConfig {
+                    exit_layer: 0,
+                    n_draft: 4
+                },
+                1
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn defaults() {
+        let d = SelfSpecConfig::default();
+        assert_eq!(d.exit_layer, 0);
+        assert_eq!(d.n_draft, 4);
     }
 }
 

@@ -3027,6 +3027,29 @@ pub fn max_layers_cap() -> Option<usize> {
     })
 }
 
+thread_local! {
+    /// T5d — early-exit draft depth for self-speculative decoding. When `Some(L)`,
+    /// the DENSE single-token forward (`forward_one_with_scratch_inner`) runs only
+    /// layers `0..L` then the usual final-norm + lm_head, producing draft logits
+    /// from an intermediate hidden. `None` (default) ⇒ full depth, byte-identical
+    /// to the classic forward. The engine sets it around each self-spec draft
+    /// phase on the worker thread and clears it immediately after, so the
+    /// full-depth verify forward (same thread, next closure) always sees `None`.
+    /// Only the dense forward reads it — hybrid / MLA forwards ignore it.
+    static EARLY_EXIT_LAYER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// T5d — set the early-exit draft depth (dense self-speculation). See
+/// [`EARLY_EXIT_LAYER`]. `None` restores full depth.
+pub fn set_early_exit_layer(layer: Option<usize>) {
+    EARLY_EXIT_LAYER.with(|c| c.set(layer));
+}
+
+/// T5d — current early-exit draft depth, or `None` for full depth.
+pub fn early_exit_layer() -> Option<usize> {
+    EARLY_EXIT_LAYER.with(|c| c.get())
+}
+
 /// MoE tiered-expert engine: `true` once experts were promoted to device memory
 /// this load (set by the trigger in the engine when `promote_experts_to_device`
 /// moved ≥1 expert). Read by MoE-aware placement (`per_layer_weight_bytes`

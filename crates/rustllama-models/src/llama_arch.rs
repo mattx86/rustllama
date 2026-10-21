@@ -12109,8 +12109,14 @@ impl LlamaModel {
         } else {
             self.weights.blocks.len()
         };
-        // Optional debug: limit to first N layers via RUSTLLAMA_MAX_LAYERS env.
-        let n_layers_used = crate::accel::max_layers_cap()
+        // Layer count for THIS forward: the T5d early-exit draft depth (set by the
+        // engine's self-speculation draft phase) takes precedence, else the
+        // optional `RUSTLLAMA_MAX_LAYERS` debug cap, else all layers. Early-exit
+        // runs layers `0..L` then the usual final-norm + lm_head below, yielding
+        // draft logits from an intermediate hidden; `None`/unset ⇒ byte-identical
+        // full-depth forward. Only this dense forward honors it.
+        let n_layers_used = crate::accel::early_exit_layer()
+            .or_else(crate::accel::max_layers_cap)
             .unwrap_or(n_blocks_total)
             .min(n_blocks_total);
 

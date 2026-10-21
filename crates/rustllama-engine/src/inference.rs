@@ -20,9 +20,9 @@ use crate::kv_backend::KvBackend;
 use crate::prefix_cache::PrefixCachePool;
 use crate::sampling::{compute_logprobs, Rng, Sampler};
 use crate::speculative::{
-    accept_reject, accept_reject_dispatch, accept_reject_greedy, AcceptMode, DraftToken,
-    HistoryDrafter, LookaheadDrafter, LookaheadDrafterConfig, MtpDrafter, NgramDrafter,
-    NgramDrafterConfig, SuffixDrafter, SuffixDrafterConfig,
+    accept_reject, accept_reject_dispatch, accept_reject_greedy, resolve_self_exit_layer,
+    AcceptMode, DraftToken, HistoryDrafter, LookaheadDrafter, LookaheadDrafterConfig, MtpDrafter,
+    NgramDrafter, NgramDrafterConfig, SelfSpecConfig, SuffixDrafter, SuffixDrafterConfig,
 };
 use crate::{
     ChatMessage, Engine, GrammarKind, Metrics, RequestStats, Result as EngineResult,
@@ -121,6 +121,14 @@ pub struct ContiguousEngine {
     /// agentic / repetitive output. Placed just ABOVE `ngram_spec` in dispatch
     /// precedence (`eagle > tree > MTP > lookahead > suffix > n-gram`).
     suffix_spec: Option<SuffixDrafterConfig>,
+    /// T5d — self-speculative / early-exit decoding. When `Some` (and the model
+    /// is plain dense — see [`Self::supports_self_spec`]), grammar-free text
+    /// generation drafts with the model's own first `exit_layer` layers and
+    /// verifies at full depth via [`Self::speculate_self_exit_stream_from_ids`].
+    /// `None` (default) keeps classic decode (byte-identical). Head-free; dispatch
+    /// precedence `eagle > tree > MTP > self-exit > lookahead > suffix > n-gram`.
+    /// Set at load from `[inference].speculative_self`; forks inherit it.
+    self_spec: Option<SelfSpecConfig>,
     /// F10 — lookahead / Jacobi decoding. When `Some`, grammar-free text
     /// generation routes through the lookahead (n-gram-pool) speculative
     /// driver ([`Self::speculate_lookahead_stream_from_ids`]) instead of
@@ -2154,6 +2162,7 @@ impl ContiguousEngine {
             placeholder_mode: None,
             ngram_spec: None,
             suffix_spec: None,
+            self_spec: None,
             lookahead_spec: None,
             draft_spec: None,
             mtp_spec: false,
@@ -2844,6 +2853,7 @@ impl ContiguousEngine {
             placeholder_mode: None,
             ngram_spec: None,
             suffix_spec: None,
+            self_spec: None,
             lookahead_spec: None,
             draft_spec: None,
             mtp_spec: false,
@@ -3017,6 +3027,7 @@ impl ContiguousEngine {
             placeholder_mode: None,
             ngram_spec: None,
             suffix_spec: None,
+            self_spec: None,
             lookahead_spec: None,
             draft_spec: None,
             mtp_spec: false,
@@ -4087,6 +4098,28 @@ impl ContiguousEngine {
         self.suffix_spec
     }
 
+    /// T5d — enable / disable self-speculative (early-exit) decoding. `None`
+    /// (default) keeps classic decode (byte-identical). When `Some` AND the model
+    /// is plain dense ([`Self::supports_self_spec`]), grammar-free `chat` /
+    /// `generate` draft with the model's own first `exit_layer` layers and verify
+    /// at full depth via [`Self::speculate_self_exit_stream_from_ids`]. Head-free;
+    /// on a non-dense model it is a silent no-op (classic/next drafter).
+    pub fn set_self_speculative(&mut self, cfg: Option<SelfSpecConfig>) {
+        self.self_spec = cfg;
+    }
+
+    pub fn self_speculative(&self) -> Option<SelfSpecConfig> {
+        self.self_spec
+    }
+
+    /// T5d — whether self-speculation can engage: plain dense transformer only
+    /// (NOT hybrid DeltaNet, NOT MLA, NOT canonical SSM/Mamba), since a
+    /// partial-depth draft would desync a recurrent / compressed KV without the
+    /// extra snapshot/restore the dense contiguous KV doesn't need.
+    fn supports_self_spec(&self) -> bool {
+        self.mamba.is_none() && !self.model.weights.is_hybrid() && !self.model.weights.is_mla()
+    }
+
     /// F10 — enable / disable lookahead (Jacobi n-gram-pool) speculative
     /// decoding for this engine's text-generation path. `None` (default)
     /// keeps the classic single-token decode (byte-identical). When `Some`,
@@ -4616,6 +4649,7 @@ impl ContiguousEngine {
             // Forks inherit the parent's speculative setting (Copy).
             ngram_spec: self.ngram_spec,
             suffix_spec: self.suffix_spec,
+            self_spec: self.self_spec,
             lookahead_spec: self.lookahead_spec,
             draft_spec: self.draft_spec.clone(),
             // MTP self-speculation is a plain Copy bool; forks inherit it.
@@ -8532,6 +8566,14 @@ impl Engine for ContiguousEngine {
             }
             mtp_fallback_log_once();
         }
+        // T5d — self-speculative / early-exit, below MTP and above lookahead
+        // (`… > MTP > self-exit > lookahead > …`): draft with the model's own
+        // early layers, verify at full depth. Dense models only (head-free).
+        if let Some(cfg) = self.self_spec {
+            if s.grammar.is_none() && allow_spec && self.supports_self_spec() {
+                return self.speculate_self_exit_stream(prompt, cfg, s.clone());
+            }
+        }
         // F10 — lookahead (Jacobi n-gram-pool) spec: just above plain n-gram
         // (`… > MTP > lookahead > n-gram`). Grammar-free only, same raw-softmax
         // caveat as the other spec paths.
@@ -8581,6 +8623,12 @@ impl Engine for ContiguousEngine {
             mtp_fallback_log_once();
         }
         // F10 — lookahead spec, just above plain n-gram (see `generate_stream`).
+        // T5d — self-speculative / early-exit (dense-only; see `generate_stream`).
+        if let Some(cfg) = self.self_spec {
+            if s.grammar.is_none() && allow_spec && self.supports_self_spec() {
+                return self.speculate_self_exit_stream(prompt.to_string(), cfg, s.clone());
+            }
+        }
         if let Some(cfg) = self.lookahead_spec {
             if s.grammar.is_none() && allow_spec {
                 return self.speculate_lookahead_stream(prompt.to_string(), cfg, s.clone());
@@ -9059,6 +9107,270 @@ impl ContiguousEngine {
             cfg.n_draft.max(1),
             s,
         )
+    }
+
+    /// T5d — text entry for self-speculative (early-exit) decoding. Tokenizes +
+    /// delegates to [`Self::speculate_self_exit_stream_from_ids`].
+    pub fn speculate_self_exit_stream(
+        &self,
+        prompt: String,
+        cfg: SelfSpecConfig,
+        s: SamplingParams,
+    ) -> EngineResult<TokenStream> {
+        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
+            crate::EngineError::Unimplemented("speculate_self_exit requires a tokenizer")
+        })?;
+        let add_bos = tokenizer.add_bos_token();
+        let initial_prompt_ids: Vec<i32> = tokenizer
+            .encode(&prompt, add_bos)?
+            .into_iter()
+            .map(|t| t as i32)
+            .collect();
+        self.speculate_self_exit_stream_from_ids(initial_prompt_ids, cfg, s)
+    }
+
+    /// T5d — ID-level self-speculative (early-exit) decode stream. Each round
+    /// DRAFTS up to `n_draft` tokens by forwarding the model at reduced depth
+    /// (layers `0..exit_layer`, via the `EARLY_EXIT_LAYER` TLS) and rolls the
+    /// partial-depth KV writes back (`set_seq_len(base)`), so the draft is
+    /// KV-TRANSPARENT — the full-depth VERIFY (the shared
+    /// [`verify_and_commit_speculation`], identical to the n-gram path) sees the
+    /// exact state a non-KV drafter would leave. Lossless: committed tokens are
+    /// byte-identical to classic decode no matter what the early-exit draft
+    /// proposed. Dense-only; the caller gates on [`Self::supports_self_spec`].
+    pub fn speculate_self_exit_stream_from_ids(
+        &self,
+        initial_prompt_ids: Vec<i32>,
+        cfg: SelfSpecConfig,
+        s: SamplingParams,
+    ) -> EngineResult<TokenStream> {
+        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
+            crate::EngineError::Unimplemented("speculate_self_exit requires a tokenizer")
+        })?;
+        if initial_prompt_ids.is_empty() {
+            let stream = async_stream::stream! {
+                if false { yield Ok(Token { id: 0, text: String::new(), logprobs: None }); }
+            };
+            return Ok(Box::pin(stream));
+        }
+
+        let vocab = self.model.cfg.vocab_size;
+        let exit_layer = resolve_self_exit_layer(cfg, self.model.cfg.n_layers);
+        let candidate_cap = cfg.n_draft.max(1);
+        let seed = s.seed;
+        let max_tokens = s.max_tokens as usize;
+        let stop_ids = build_stop_token_ids(self.model.cfg.eos_token_id, self.tokenizer.as_deref());
+        let stop_strings = s.stop.clone();
+        let greedy_spec = s.temperature <= 0.0;
+        let typical = if s.spec_typical_accept {
+            Some((s.spec_typical_epsilon, s.spec_typical_delta))
+        } else {
+            None
+        };
+        let repeat_pen = s.repeat_penalty;
+        let freq_pen = s.frequency_penalty;
+        let pres_pen = s.presence_penalty;
+
+        let model = self.model.clone();
+        let state = self.state.clone();
+        let prefix_cache = self.prefix_cache;
+        let prefill_chunk_size = self.prefill_chunk_size;
+        let max_ctx = self.max_ctx;
+        let cumulative_stats = self.cumulative_stats.clone();
+        let last_stats = self.last_stats.clone();
+        let ema_tok_s_bits = Arc::clone(&self.ema_tok_s_bits);
+        let worker = self.sycl_worker.submitter();
+        let flash_attention = self.flash_attention;
+        let n_gpu_layers = self.n_gpu_layers;
+        let cpu_force_patterns = self.cpu_force_patterns.clone();
+
+        let stream = async_stream::stream! {
+            let mut rng_slot = Some(Rng::from_seed(seed));
+            let mut current_prompt_ids: Vec<i32> = initial_prompt_ids;
+            let mut total_emitted: usize = 0;
+            let mut emitted_text = String::new();
+            let mut utf8 = Utf8Stream::default();
+            let decode_start = std::time::Instant::now();
+
+            // Install dispatch state on the worker thread + ensure USM context
+            // (once, before the round loop — mirrors the n-gram stream).
+            {
+                let model_install = model.clone();
+                let flash = flash_attention;
+                let ngl = n_gpu_layers;
+                let cpu_force = cpu_force_patterns.clone();
+                let _ = worker
+                    .run_blocking(move || {
+                        rustllama_models::accel::set_flash_attention(flash);
+                        rustllama_models::accel::set_n_gpu_layers(ngl);
+                        rustllama_models::accel::set_cpu_force_patterns(cpu_force);
+                        let cfg = &model_install.cfg;
+                        let head_dim = if cfg.head_dim > 0 {
+                            cfg.head_dim
+                        } else {
+                            cfg.d_model / cfg.n_heads.max(1)
+                        };
+                        let _ = rustllama_models::accel::prepare_usm_context(
+                            cfg.n_layers as u32,
+                            cfg.n_heads as u32,
+                            cfg.n_kv_heads as u32,
+                            head_dim as u32,
+                            max_ctx as u32,
+                        );
+                    })
+                    .await;
+            }
+
+            loop {
+                if total_emitted >= max_tokens {
+                    return;
+                }
+                let remaining = max_tokens.saturating_sub(total_emitted);
+                // Cap so committed (accepted + 1 replacement) can't overshoot.
+                let round_cap = candidate_cap.min(remaining.saturating_sub(1));
+
+                // ---- Draft: early-exit forwards on the worker, then roll KV back ----
+                let drafts: Vec<DraftToken> = if round_cap == 0 {
+                    Vec::new()
+                } else {
+                    let model_d = model.clone();
+                    let state_d = state.clone();
+                    let draft_ids = current_prompt_ids.clone();
+                    match worker
+                        .run_blocking(move || {
+                            let mut st = state_d.lock().expect("state lock");
+                            let base_seq = st.kv_backend.seq_len();
+                            // Only draft when KV is warm to exactly the pre-last-
+                            // token state (`seq_len == len - 1`). A cold round 1 or
+                            // any gap ⇒ no draft (verify still commits one token).
+                            if base_seq + 1 != draft_ids.len() {
+                                return Vec::new();
+                            }
+                            let last_tok = *draft_ids.last().expect("non-empty history");
+                            let mut logits = vec![0f32; vocab];
+                            let mut drafts: Vec<DraftToken> = Vec::with_capacity(round_cap);
+                            let mut di = last_tok;
+                            let mut pos = base_seq as u32;
+                            rustllama_models::accel::set_early_exit_layer(Some(exit_layer));
+                            for _ in 0..round_cap {
+                                let EngineState {
+                                    kv_backend,
+                                    delta_net_cache,
+                                    ..
+                                } = &mut *st;
+                                forward_one_via_backend_hybrid(
+                                    &model_d,
+                                    kv_backend,
+                                    delta_net_cache.as_mut(),
+                                    di,
+                                    pos,
+                                    &mut logits,
+                                );
+                                match MtpDrafter::default()
+                                    .propose(std::slice::from_ref(&logits))
+                                    .into_iter()
+                                    .next()
+                                {
+                                    Some(dt) => {
+                                        di = dt.id as i32;
+                                        drafts.push(dt);
+                                        pos += 1;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            // Clear early-exit BEFORE the full-depth verify (same
+                            // worker thread) and roll the partial-depth KV writes
+                            // back so verify sees the pre-draft state exactly.
+                            rustllama_models::accel::set_early_exit_layer(None);
+                            st.kv_backend.set_seq_len(base_seq);
+                            drafts
+                        })
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(_) => Vec::new(),
+                    }
+                };
+
+                // ---- Verify + commit at FULL depth (shared machinery) ----
+                let prompt_ids_for_verify = current_prompt_ids.clone();
+                let drafts_for_verify = drafts.clone();
+                let model_c = model.clone();
+                let state_c = state.clone();
+                let mut rng_c = rng_slot.take().expect("rng slot");
+                let joined = worker
+                    .run_blocking(move || {
+                        let out = verify_and_commit_speculation(
+                            model_c, state_c, prefix_cache, prefill_chunk_size, max_ctx,
+                            &prompt_ids_for_verify, &drafts_for_verify, greedy_spec,
+                            typical, &mut rng_c, repeat_pen, freq_pen, pres_pen,
+                        );
+                        (out, rng_c)
+                    })
+                    .await;
+                let outcome = match joined {
+                    Ok((Ok(o), r)) => {
+                        rng_slot = Some(r);
+                        o
+                    }
+                    Ok((Err(e), r)) => {
+                        rng_slot = Some(r);
+                        let _ = &rng_slot;
+                        yield Err(crate::EngineError::Engine(format!(
+                            "verify_speculation (self-exit): {e}"
+                        )));
+                        return;
+                    }
+                    Err(recv_err) => {
+                        yield Err(crate::EngineError::Engine(format!(
+                            "verify worker recv: {recv_err}"
+                        )));
+                        return;
+                    }
+                };
+                cumulative_stats
+                    .add_speculation(drafts.len() as u64, outcome.accepted.len() as u64);
+                let mut committed: Vec<u32> = outcome.accepted;
+                committed.push(outcome.replacement);
+
+                for &id in &committed {
+                    let text = utf8.next_text(id, |ids| {
+                        tokenizer.decode(ids, true).unwrap_or_default()
+                    });
+                    emitted_text.push_str(&text);
+                    let hit_stop = stop_strings
+                        .iter()
+                        .any(|st| !st.is_empty() && emitted_text.contains(st.as_str()));
+                    yield Ok(Token { id, text, logprobs: None });
+                    total_emitted += 1;
+                    {
+                        let elapsed_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+                        let s = RequestStats {
+                            prefill_ms: 0.0,
+                            decode_ms: elapsed_ms,
+                            tokens_prefilled: 0,
+                            cache_hit_tokens: 0,
+                            tokens_generated: total_emitted as u32,
+                            tool_call_limit_hit: false,
+                        };
+                        update_ema_tok_s(&ema_tok_s_bits, &s);
+                        *last_stats.lock().expect("last_stats") = s;
+                    }
+                    if hit_stop {
+                        return;
+                    }
+                    if stop_ids.contains(&id) {
+                        return;
+                    }
+                    if total_emitted >= max_tokens {
+                        return;
+                    }
+                }
+                current_prompt_ids.extend(committed.iter().map(|&id| id as i32));
+            }
+        };
+        Ok(Box::pin(stream))
     }
 
     /// Shared speculative-decode stream for the head-free history drafters

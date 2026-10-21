@@ -604,6 +604,21 @@ pub struct InferenceConfig {
     /// match-scan cost. Default 64. Ignored when `speculative_suffix = false`.
     #[serde(default = "default_suffix_max_match")]
     pub suffix_max_match: u32,
+    /// T5d — self-speculative / early-exit decoding. Default `false`. When `true`
+    /// (and the model is plain dense — not hybrid/MLA/SSM), grammar-free requests
+    /// draft with the model's own first `self_exit_layer` layers and verify at
+    /// full depth: head-free, no second model, byte-identical output (lossless).
+    /// Takes precedence over lookahead / suffix / n-gram when set.
+    #[serde(default)]
+    pub speculative_self: bool,
+    /// Layer to exit at for the self-speculation DRAFT forward. `0` (default) =
+    /// AUTO = half the model's depth. Ignored when `speculative_self = false`.
+    #[serde(default = "default_self_exit_layer")]
+    pub self_exit_layer: u32,
+    /// Max draft tokens the self-speculation drafter proposes per round. Default
+    /// 4. Ignored when `speculative_self = false`.
+    #[serde(default = "default_self_n_draft")]
+    pub self_n_draft: u32,
     /// F10 — lookahead / Jacobi decoding. Default `false`. When `true`,
     /// grammar-free requests route through the lookahead (n-gram-pool)
     /// speculative driver: an n-gram pool harvested from the realized
@@ -911,6 +926,14 @@ fn default_suffix_max_match() -> u32 {
     64
 }
 
+fn default_self_exit_layer() -> u32 {
+    0
+}
+
+fn default_self_n_draft() -> u32 {
+    4
+}
+
 fn default_ngram_n_draft() -> u32 {
     4
 }
@@ -1101,6 +1124,9 @@ impl Default for InferenceConfig {
             suffix_n_min_match: 2,
             suffix_n_draft: 8,
             suffix_max_match: 64,
+            speculative_self: false,
+            self_exit_layer: 0,
+            self_n_draft: 4,
             speculative_lookahead: false,
             lookahead_ngram: 3,
             lookahead_window: 5,

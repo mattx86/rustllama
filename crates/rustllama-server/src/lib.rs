@@ -3032,6 +3032,15 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
             q: 0.5,
         }));
     }
+    // T5d — self-speculative / early-exit (head-free, dense-only), mirroring the
+    // CLI serve + bench paths. TODO(T5d follow-up): SpecStrategy::SelfSpec +
+    // TunerWinners mutual-exclusion; hybrid/MLA early-exit.
+    if cfg_for_tuning.inference.speculative_self {
+        cpu.set_self_speculative(Some(rustllama_engine::speculative::SelfSpecConfig {
+            exit_layer: cfg_for_tuning.inference.self_exit_layer as usize,
+            n_draft: cfg_for_tuning.inference.self_n_draft as usize,
+        }));
+    }
     let model_id = cpu.model_id().to_string();
     let cpu = Arc::new(cpu);
     // Pre-upload packed-quant weights to USM on a blocking-pool
