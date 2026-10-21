@@ -10151,9 +10151,11 @@ fn dev_layer_cuda_graph_enabled() -> bool {
 /// [`rustllama_tuner::VERDICT_STEP_DEV_RESIDENT_CUDA_GRAPH`]. Fail-closed: OFF
 /// unless the step parity+perf probe passed. `RUSTLLAMA_DEV_STEP_GRAPH=1` force-
 /// enables it (for on-pod A/B before the verdict is banked); `=0` force-disables.
-/// The caller ([`try_decode_step_cuda_graph_f32`]) AND's this with the two
-/// per-layer graph verdicts + `cuda_active()` + `stream_window()==0`, so any
-/// unmet precondition declines to the per-layer ladder without corruption.
+/// The caller ([`try_decode_step_cuda_graph_f32`]) AND's this with `cuda_active()`
+/// + `stream_window()==0` only — the step graph is self-contained (its own probe
+/// validates the whole attn+FFN step), so it does NOT require the per-layer
+/// `attn:` / `layer:` verdicts. Any unmet precondition declines to the per-layer
+/// ladder without corruption.
 pub fn dev_step_cuda_graph_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(
@@ -10574,12 +10576,14 @@ pub fn try_decode_step_cuda_graph_f32(
     max_ctx: usize,
     rms_eps: f32,
 ) -> bool {
-    if !dev_step_cuda_graph_enabled()
-        || !dev_attn_cuda_graph_enabled()
-        || !dev_layer_cuda_graph_enabled()
-        || !cuda_active()
-        || stream_window() != 0
-    {
+    // Gate on the STEP verdict alone (+ cuda_active + not-streaming). The step
+    // graph is SELF-CONTAINED — it captures the full attn+FFN chain itself
+    // (`issue_layer_chain`) and its own `step:dev_resident_cuda_graph` parity+perf
+    // probe validates the whole step, so the separate per-layer `attn:` / `layer:`
+    // verdicts are redundant here. Requiring them also BLOCKED the on-pod A/B:
+    // `dev_layer_cuda_graph_enabled()` has no force and its FFN-in-graph verdict is
+    // fail-closed, so `RUSTLLAMA_DEV_STEP_GRAPH=1` could never actually engage.
+    if !dev_step_cuda_graph_enabled() || !cuda_active() || stream_window() != 0 {
         return false;
     }
     let Some(cache) = cuda_cache() else {
